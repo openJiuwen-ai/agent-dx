@@ -66,13 +66,20 @@ pub async fn pause_lifecycle_reporting(
     .await
 }
 
-/// Best-effort planned departure: bounded even when Coordinator is unavailable.
-/// This retires node ownership; it does not turn process restart into user deletion.
-pub async fn unregister_node(
+/// Preserve the node session unless the exit signal selected drain/departure.
+/// After drain, unregister the exact session with a bounded RPC; Coordinator
+/// transport failures are returned. Preserve sends no RPC and relies on restart
+/// within the existing heartbeat deadline for session takeover.
+pub async fn finish_shutdown(
+    mode: crate::proxy::ShutdownMode,
     coordinator: &mut Coordinator,
     registration: &pb::RegisterNodeRequest,
     timeout: Duration,
 ) -> Result<(), Status> {
+    // Use this request's explicit intent, including after an earlier failed drain.
+    if mode == crate::proxy::ShutdownMode::Preserve {
+        return Ok(());
+    }
     let mut request = Request::new(pb::UnregisterNodeRequest {
         node_id: registration.node_id.clone(),
         session_id: registration.session_id.clone(),

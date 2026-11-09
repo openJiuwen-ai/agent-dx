@@ -37,6 +37,7 @@ async fn create(session: &adx_coordinator::storage::Session, generation: u64) ->
         .unwrap();
     let mut record = running(spec("cleanup"), assignment);
     record.checkpoint = Some(RestorePoint {
+        recovery_profile: Default::default(),
         origin: None,
         id: "cp".into(),
         artifact: artifact(&format!("artifact-{generation}")),
@@ -232,6 +233,7 @@ async fn cleanup_rejects_local_snapshot_source_and_execution_artifact_aliases() 
         .unwrap();
     let mut clone = running(clone_spec, clone_assignment);
     clone.snapshot_source = Some(RestorePoint {
+        recovery_profile: Default::default(),
         origin: Some(snapshot.origin().unwrap()),
         id: snapshot.id,
         artifact: artifact.clone(),

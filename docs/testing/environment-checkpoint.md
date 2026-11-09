@@ -27,6 +27,8 @@
 
 `CheckpointAccess::seal` 是存储完成边界。对象存储在此完成上传，通过 `prepare_restore` 下载；本地/S3、缓存引用和跨节点恢复已实现，见 [存储契约](snapshot-storage.md) 与 [跨节点恢复](firecracker-cross-node.md)。
 
+跨节点 Resume/Recover 与升级迁移共用选址和兼容性准入，要求捕获时保存的 host、runtime、rootfs 证据及实际共享存储 scope；缺失或不匹配时不转移所有权。当前实测配置仅开放默认 rootfs 的同构 Linux runsc，见[节点配置](../../build/config/examples/README.md)。旧恢复点可继续本地恢复，跨节点前需重新捕获；其他运行时的历史验证不代表满足当前准入。
+
 local-only 成功表示后端已生成完整、可在本机读取的制品，并已提交恢复点元数据。adxlet 不主动对本地制品及目录执行 `fsync`；未完成的磁盘写回由操作系统和执行后端处理，不保证突然断电或宿主机崩溃后的制品完整性。该规则同样用于 workload checkpoint、本地回滚恢复点和可复用快照副本；对象存储仍等待完整上传。恢复及重启对账保留本地制品的路径、类型和长度校验，校验失败的恢复点不能用于恢复。
 
 ## 配置与部署
@@ -51,7 +53,7 @@ sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提�
 - 可复用 Snapshot 在同一次节点请求内等待 Journaled 状态达到 Published：只补交相同记录和版本，不重新运行后端 capture。等待占用该次 checkpoint 的剩余预算，后端收到扣除等待时间后的超时。真实归属／版本冲突立即返回；预算耗尽后保留待补交记录和制品引用，不把本地 journal 当作 Snapshot 成功。此规则不放宽 Coordinator 的 CAS、归属和制品引用校验。
 - checkpoint 调用前，准备失败可调用 Execd abort；调用后不再假设 checkpoint 未启动。无法确认停止／清理时保留资源占用并报告失败。
 - 发布制品失败时，从完整本地暂存尝试恢复运行，并返回暂停失败。回滚或清理失败不会伪装成暂停成功。
-- 恢复失败但清理成功时保留恢复点并释放此次资源；清理不确定时保留资源，等待处理。
+- 恢复失败但清理成功时保留恢复点并释放此次本机资源；清理不确定时保留资源，等待处理。自动跨节点恢复仅在本地容量不足、或执行准入 `prepare_execution` 尚未成功返回且报 `Unavailable`、`VolumeBusy`、`NoCapacity`（含准入超时）时保留可重试进度；Coordinator 保留 `recovery.pending` 的目标预留。临时准入错误沿用该 Assignment 重试，明确 NoCapacity 仍可按既有规则拒绝目标后重新选点。checkpoint 读取失败（含有效存储别名下对象缺失）、后端 restore 拒绝、开始 restore 后的初始化超时、readiness 或路由激活失败，在清理确认后转为 Failed，不因错误类型是 `Unavailable` 而再次执行 restore。
 - 节点重启后，从 Coordinator 获取完整目录；Paused 记录不会被当作缺失的 Running 实例重建。未持久化且不匹配的执行按既有对账原则清理。
 - 替换、过期和删除恢复点时，先提交新元数据，再清理旧制品。提交或清理失败保留待清理记录，后续同步或同操作重试继续完成清理。
 - 重启对账期间关闭准入，确认所有执行和结果已对账发布后，清理本地存储根目录中不再被引用的 UUID 制品目录。Coordinator 不可用或对账失败时不执行该清理；共享存储的目录引用与旧会话孤儿清理见 [存储契约](snapshot-storage.md)。
@@ -61,11 +63,14 @@ sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提�
 组件测试覆盖状态与资源转换、丢失提交回复、过期清理、恢复失败、回滚、真实 sandboxd 协议的 UDS 调用、Execd HTTP 身份切换和 Ingress 版本检查。Redis 集成测试使用独立真实 Redis。
 可复用 Snapshot 的真实 SQLite JournalSink 回归还覆盖暂时发布失败后成功、只 capture 一次、原预算耗尽及不重试永久冲突；组件结果不替代并发集群验收。
 
+`platform/coordinator/tests/rpc.rs` 的 `shared_checkpoint` 用例覆盖自动跨节点恢复和休眠后的 Ingress 按需恢复，使用真实 Redis、mTLS、独占 Volume 授权及内存对象存储；断言恢复后原 spec 不变、卷 UID 不变、目标执行独占卷、旧归属提交被拒绝及重复请求不重复恢复。`platform/adxlet/tests/pause_resume.rs` 另注入临时准入错误，验证保留恢复点并在错误解除后只 restore 一次；通过表驱动用例覆盖无到期时间的恢复点在 manifest/数据对象缺失、后端拒绝、restore 初始化超时或准入权限拒绝时进入 Failed，重复恢复请求不再次调用后端。授权后错误场景由真实 Coordinator 完成 Redis 授权后在测试 RPC 包装层替换回复，断言 Paused 提交立即释放独占占用、保存已释放 runtime 身份且后续授权接受该 previous runtime；它不注入调度器内部故障。协议测试单独验证 `Unauthenticated`、`PermissionDenied` 的错误码与原因保留，以及 `Internal` 保留诊断并继续映射为 `Unavailable`。这些用例的 RuntimeDriver 是夹具，不构成真实 sandboxd、共享文件系统或 Kubernetes 验收。
+
 ```bash
 cargo test -p adxlet -p adx-coordinator -p adx-core -p adx-protocol
 cargo test -p adx-execd --test control_http
 cargo test -p data-plane-gateway --test coordinator_routes
 python3 build/ci/run.py storage --jobs 2 --output out/ci/checkpoint-storage
+python3 build/ci/run.py control-rpc --jobs 2 --output out/ci/checkpoint-rpc
 ```
 
 真实 Firecracker 公共 SDK 用例见 [sdk_checkpoint.py](../../build/e2e/firecracker/sdk_checkpoint.py)。用安装了本次发布包 SDK 的 Python 执行：

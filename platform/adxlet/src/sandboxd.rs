@@ -15,6 +15,8 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
 use tower::service_fn;
 
+mod recovery;
+
 pub mod proto {
     tonic::include_proto!("runtime.v1");
 }
@@ -23,6 +25,8 @@ use proto::sandbox_service_client::SandboxServiceClient;
 #[derive(Clone)]
 pub struct Config {
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
+    /// Exact backend executable paths configured in sandboxd; never inferred from PATH.
+    pub checkpoint_runtime_binaries: BTreeMap<String, PathBuf>,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: String,
@@ -34,6 +38,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             runtime_profile: None,
+            checkpoint_runtime_binaries: BTreeMap::new(),
             command: vec!["/usr/local/bin/adx-execd".into()],
             env: HashMap::from([("EXECD_HTTP_PORT".into(), "50090".into())]),
             cwd: "/".into(),
@@ -59,6 +64,7 @@ pub struct Sandboxd {
     client: SandboxServiceClient<Channel>,
     config: Config,
     rootfs_identity: Option<crate::RuntimeRootfsIdentity>,
+    recovery_profiles: BTreeMap<String, BTreeMap<String, String>>,
     starts: Arc<Mutex<BTreeMap<String, Cell>>>,
     backend_ids: Arc<Mutex<BTreeMap<String, String>>>,
 }
@@ -126,6 +132,14 @@ pub async fn connect_when_ready(
 }
 
 impl Sandboxd {
+    /// Measured, immutable node-session evidence for declared recovery backends.
+    pub fn recovery_labels(&self) -> BTreeMap<String, String> {
+        self.recovery_profiles
+            .values()
+            .flat_map(|profile| profile.clone())
+            .collect()
+    }
+
     /// Discover live execution backends through sandboxd's Unix socket.
     pub async fn available_runtime_classes(&self) -> Result<Vec<String>> {
         let response = self
@@ -190,10 +204,18 @@ impl Sandboxd {
         // Deployment rootfs files must remain immutable for the process lifetime.
         // Hash bytes once off the async executor; a changed image requires a new session.
         let profile = config.runtime_profile.clone();
-        let rootfs_identity =
-            tokio::task::spawn_blocking(move || rootfs_identity(profile.as_ref()))
-                .await
-                .map_err(unavailable)??;
+        let binaries = config.checkpoint_runtime_binaries.clone();
+        let (rootfs_identity, recovery_profiles) = tokio::task::spawn_blocking(move || {
+            let identity = rootfs_identity(profile.as_ref())?;
+            let default_root = profile.as_ref().is_some_and(|profile| {
+                profile.bootstrap.r#type == "erofs" && profile.bootstrap.root == profile.rootfs.path
+            });
+            let profiles =
+                recovery::profiles(identity.as_ref().filter(|_| default_root), &binaries)?;
+            Ok::<_, Error>((identity, profiles))
+        })
+        .await
+        .map_err(unavailable)??;
         let channel = Endpoint::from_static("http://localhost")
             .connect_timeout(config.rpc_timeout)
             .connect_with_connector(service_fn(move |_| {
@@ -206,6 +228,7 @@ impl Sandboxd {
             client: SandboxServiceClient::new(channel),
             config,
             rootfs_identity,
+            recovery_profiles,
             starts: Arc::default(),
             backend_ids: Arc::default(),
         })
@@ -1186,6 +1209,30 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
+    fn recovery_profile(&self, spec: &EnvironmentSpec) -> Result<BTreeMap<String, String>> {
+        if !spec.image.is_empty()
+            || spec.execution.rootfs.is_some()
+            || spec
+                .runtime_profile
+                .as_ref()
+                .is_some_and(|profile| Some(profile) != self.config.runtime_profile.as_ref())
+        {
+            return Ok(BTreeMap::new());
+        }
+        let Some(published) = self.recovery_profiles.get(&spec.runtime_class) else {
+            return Ok(BTreeMap::new());
+        };
+        let rootfs = rootfs_identity(self.config.runtime_profile.as_ref())?;
+        let observed =
+            recovery::profiles(rootfs.as_ref(), &self.config.checkpoint_runtime_binaries)?;
+        if observed.get(&spec.runtime_class) != Some(published) {
+            return Err(Error::Unavailable(
+                "recovery backend or host changed; a new node session is required".into(),
+            ));
+        }
+        Ok(published.clone())
+    }
+
     async fn sandbox_id(&self, runtime_id: &str) -> Option<String> {
         self.physical_id(runtime_id).await.ok().flatten()
     }

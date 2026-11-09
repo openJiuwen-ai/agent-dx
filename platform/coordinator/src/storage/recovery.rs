@@ -1,6 +1,95 @@
 //! Atomic ownership transfer after the source execution has been invalidated.
 use super::*;
 
+/// Facts captured with the checkpoint, rather than the source node's current
+/// software after a restart or upgrade, constrain every cross-node recovery.
+pub(crate) fn recovery_profile_requirements(
+    runtime_class: &str,
+    profile: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let keys = [
+        "ADX_RECOVERY_HOST".to_string(),
+        format!("ADX_RECOVERY_RUNTIME_{runtime_class}"),
+        "ADX_RECOVERY_ROOTFS_SHA256".to_string(),
+        "ADX_RECOVERY_ROOTFS_PATH".to_string(),
+    ];
+    let mut required = BTreeMap::new();
+    for key in keys {
+        let value = profile
+            .get(&key)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                Error::Invalid("checkpoint recovery compatibility evidence is missing".into())
+            })?;
+        if key != "ADX_RECOVERY_ROOTFS_PATH"
+            && (value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        {
+            return Err(Error::Invalid(
+                "invalid checkpoint recovery fingerprint".into(),
+            ));
+        }
+        required.insert(key, value.clone());
+    }
+    if !std::path::Path::new(&required["ADX_RECOVERY_ROOTFS_PATH"]).is_absolute() {
+        return Err(Error::Invalid(
+            "invalid checkpoint recovery rootfs path".into(),
+        ));
+    }
+    Ok(required)
+}
+
+pub(crate) fn checkpoint_requirements(
+    spec: &EnvironmentSpec,
+    profile: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let required = recovery_profile_requirements(&spec.runtime_class, profile)?;
+    let path = &required["ADX_RECOVERY_ROOTFS_PATH"];
+    if !spec.image.is_empty()
+        || spec.execution.rootfs.is_some()
+        || spec.runtime_profile.as_ref().is_some_and(|runtime| {
+            runtime.rootfs.runtime_class != spec.runtime_class
+                || runtime.rootfs.r#type != "local"
+                || runtime.rootfs.path != *path
+                || runtime.bootstrap.r#type != "erofs"
+                || runtime.bootstrap.root != *path
+        })
+    {
+        return Err(Error::Invalid(
+            "checkpoint recovery requires a verified execution rootfs".into(),
+        ));
+    }
+    Ok(required)
+}
+
+pub(crate) fn validate_checkpoint_target(
+    spec: &EnvironmentSpec,
+    checkpoint: &adx_core::RestorePoint,
+    target: &StoredNode,
+) -> Result<()> {
+    let required = checkpoint_requirements(spec, &checkpoint.recovery_profile)?;
+    if checkpoint.artifact.storage == "local"
+        || checkpoint.artifact.scope.is_empty()
+        || target.checkpoint_gc_fenced
+        || !target
+            .checkpoint_scopes
+            .contains(&checkpoint.artifact.scope)
+        || target.node.labels.get("ADX_CHECKPOINT_STORAGE") != Some(&checkpoint.artifact.storage)
+        || target.node.labels.get("ADX_CHECKPOINT_SCOPE") != Some(&checkpoint.artifact.scope)
+        || !target.node.runtime_classes.contains(&spec.runtime_class)
+        || required
+            .iter()
+            .any(|(key, value)| target.node.labels.get(key) != Some(value))
+    {
+        return Err(Error::Invalid(
+            "checkpoint is incompatible with the recovery target".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl StoredEnvironment {
     pub fn resume_point(&self, now: u64) -> Option<&adx_core::RestorePoint> {
         let record = self.result.as_ref()?;
@@ -101,6 +190,21 @@ impl Session {
             let mut stored_environment: StoredEnvironment =
                 decode(environment_value.as_deref().ok_or(Error::NotFound)?)?;
             stored_environment.validate()?;
+            if planned {
+                let task = upgrade.as_ref().ok_or(Error::Conflict)?;
+                task.require_protocol()?;
+                let operation = task
+                    .migration_operation(previous, &replacement)
+                    .ok_or(Error::Conflict)?;
+                if expected_sessions
+                    != Some((
+                        operation.source_session_id.as_str(),
+                        operation.target_session_id.as_str(),
+                    ))
+                {
+                    return Err(Error::Conflict);
+                }
+            }
             if planned && volumes::has_volumes(&stored_environment.spec) {
                 return Err(Error::Invalid(
                     "planned migration of managed Volumes is not supported".into(),
@@ -159,7 +263,8 @@ impl Session {
             .clone();
             node_value.as_deref().ok_or(Error::NotFound)?;
             let target = self.get_node(&replacement.node_id).await?;
-            if planned && !checkpoint.artifact.scope.is_empty() {
+            validate_checkpoint_target(&stored_environment.spec, &checkpoint, &target)?;
+            if planned {
                 let source: StoredNode =
                     decode(source_node_value.as_deref().ok_or(Error::NotFound)?)?;
                 if !source
@@ -174,13 +279,7 @@ impl Session {
                     ));
                 }
             }
-            let canary_target = planned
-                && upgrade.as_ref().is_some_and(|task| {
-                    task.active()
-                        && !task.revoked_canaries.contains(&previous.environment_id)
-                        && task.canaries.get(&previous.environment_id) == Some(&replacement.node_id)
-                });
-            if (!target.node.available && !canary_target)
+            if !target.node.available
                 || target.shard_id != replacement.shard_id
                 || target.session.as_ref().is_some_and(|s| !s.routable)
             {

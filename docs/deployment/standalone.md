@@ -174,7 +174,7 @@ SDK 中的 runtime 及资源数值应与已准备的 sandboxd 后端匹配。例
 
 配置和证书在进程启动时读取。更新证书时，同步更新引用它的 `peers` DER 文件和必要的 CA，再按部署维护流程重启相关组件。本期没有 `adxctl restart` 子命令，也不提供证书热重载或无中断轮换保证。
 
-`adxctl stop` 会先删除本机已管理实例，提交清理结果，然后退出服务；停止 supervisor 的 SIGTERM/SIGINT 也遵守该契约。它不适合作为保留现有实例的证书更新命令。需要保留实例时，由部署环境重启选定组件，待 adxlet 完成权威对账和路由同步后恢复使用。Coordinator 不可用时，adxlet 重启只能观察实际实例，需等待 Coordinator 对账后恢复生命周期操作。
+`shutdown_mode` 默认为 `preserve`：无参数 `adxctl stop` 和 supervisor 的 SIGTERM/SIGINT 跳过 Env drain，正常停止受管进程。adxlet 收到停止信号后关闭新准入，在内嵌 Relay 排水期间继续心跳和运行时控制，排水完成后退出，不主动注销节点。需要删除本机实例时显式选择 `drain`，先提交清理结果，再退出服务。`stop --mode preserve|drain` 只覆盖单次停止；信号退出始终使用启动时加载的配置。仅重启 adxlet 的维护可使用 preserve，前提是后端执行仍存活、节点 ID 和 RPC/Relay 地址保持不变，并在心跳期限内经 Coordinator 的 GetSession 校验接续会话，随后等待权威对账和路由同步。证书变更仍须满足身份信任校验；preserve 不延长心跳期限，超时或后端停止后不能保证接续。Coordinator 不可用时，adxlet 重启只能观察实际实例，需等待 Coordinator 对账后恢复生命周期操作；preserve 本身不保证恢复结果。
 
 Kubernetes 同样在 Pod 内运行进程，但部署与验收应使用独立的 [K8s 驱动](../../build/e2e/kubernetes/README.md)；其 namespace、镜像身份、用例结果与清理记录单独保存。
 
@@ -183,6 +183,6 @@ Kubernetes 同样在 Pod 内运行进程，但部署与验收应使用独立的 
 Coordinator 服务配置 `failed_retention_seconds` 默认600秒，必须大于零。终态 Failed 在保留期后自动清理；创建失败的资源预留立即释放。正在重启／恢复的记录不按普通终态回收，清理失败继续重试。具体契约见 [Failed Environment GC](../testing/failed-environment-gc.md)。
 
 Coordinator 的 `node_retention_seconds` 默认 1800 秒，控制已失联且无 Environment
-引用的节点注册保留期，必须大于零。优雅停止通过会话校验的 `UnregisterNode` 主动下线，
+引用的节点注册保留期，必须大于零。显式 drain 后的优雅停止通过会话校验的 `UnregisterNode` 主动下线，
 排空节点无需等待该保留期。仍有执行/恢复引用时保留必要上下文，待对象退役后清理。
 具体边界见 [离线节点退役与主动注销](../testing/recovery-discovery.md#离线节点退役与主动注销)。

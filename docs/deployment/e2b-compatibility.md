@@ -67,7 +67,7 @@ Ingress 设置 `ADX_DATA_PLANE_INGRESS_E2B_ENABLED=true`、`ADX_DATA_PLANE_INGRE
 
 上述存量前向升级先更新 Coordinator，再更新 API Server 和 Ingress；旧 owner 在此阶段继续处理既有原生实例，新增 E2B 能力仍须等待相关节点全部升级后开启。控制面切换期间的请求和长连接可用性取决于副本及切换部署，不能由 guest 持续运行推导为入口零中断。
 
-节点或后端的计划升级先停止新分配，对需要保留的 Running 实例执行 Pause，确认权威 Paused 状态、恢复点可用、待补交结果已确认及活动 Runtime 已停止；其余实例迁移或删除，完成排空后再退出和升级。adxlet 收到 SIGTERM 会执行 planned unregister，使旧 owner 会话失效，不适用 crash 后未过期会话的进程接管条件。新节点注册并完成对账后，通过 Connect 恢复原 Paused 身份，必要时沿原生恢复调度重新分配。恢复节点须提供与原 Spec 一致的受信任 profile/bootstrap，并保留仍被引用的检查点和旧工件；停止控制面使 unregister 失败不属于计划滚动升级流程。
+节点或后端的计划升级先停止新分配，对需要保留的 Running 实例执行 Pause，确认权威 Paused 状态、恢复点可用、待补交结果已确认及活动 Runtime 已停止；其余实例迁移或删除，完成排空后再退出和升级。adxctl 默认 preserve 向 adxlet 发送 SIGUSR1，只关闭准入并停止进程，不主动注销；仅重启 adxlet 且后端仍存活时，可在心跳期限内经同节点 ID/RPC/Relay 地址与 GetSession 身份复核接管原执行。显式 drain 清理后发送 SIGTERM，执行 planned unregister，使旧 owner 会话失效；直接向 adxlet 发送 SIGTERM/SIGINT 也表示 planned departure。preserve 不延长期限，也不能代替后端升级前的 Pause 或排空。新节点注册并完成对账后，通过 Connect 恢复原 Paused 身份，必要时沿原生恢复调度重新分配。恢复节点须提供与原 Spec 一致的受信任 profile/bootstrap，并保留仍被引用的检查点和旧工件；停止控制面使 unregister 失败不属于计划滚动升级流程。
 
 回退 master 也需要单独验证：新 Snapshot 写入的 kind/created_at_unix_ms 字段会被旧版的严格反序列化拒绝。升级前验证备份与恢复方案；出现问题时按已验证的恢复流程或前向修复处理，不直接回退二进制并假定持久化数据兼容。
 
@@ -174,7 +174,7 @@ E2B metadata 直接映射到原生 `EnvironmentSpec.scheduling.labels`，不另�
 
 E2B 入口保留最多 128 项、键 256 bytes、值 4096 bytes、总计 64KiB 的响应大小约束；内部执行继续使用原生 labels 校验。列表复用 `EnvironmentDirectory::page`，tenant、E2B 范围、state 和 labels 在分页前过滤，目录未同步时明确失败。每页 1～100、响应约 1MiB，游标绑定 tenant/范围/state/selector。时间字段按页通过公共 `BatchGetEnvironmentControl` 批量查询，列表专用 summary 直接投影所需字段；不逐条查询 control，不构造含 token 的详情后再删除凭据。实时目录分页不保证历史快照一致性。
 
-可选 `EnvironmentSpec.run_policy` 保存默认运行时长与 Pause/Delete 动作；当前 E2B 入口填写它，原生公共 HTTP 暂不开放，未配置的原生实例无额外期限。当前 owner adxlet 在首次 Running 或恢复接管时建立单调时钟 timer。进程 crash 后，仅在旧会话未过期且未退役、相同节点 ID 与 RPC/Relay 地址通过原生身份校验并成功接管现存 Runtime 时，才按 Spec 默认时长重建 timer；先前的动态续期不跨进程保存。SIGTERM 计划退役不适用该接管条件，节点计划升级须先 Pause 或排空。频繁更新不持久化绝对 deadline。Connect 只延长至 `max(当前截止, now + timeout)`；setTimeout 替换为 `now + timeout`，0 表示立即到期，均由 owner 接受后返回。owner 串行处理续期和到期，执行前复核 runtime、assignment generation 与 timer 更新序号；到期进入既有 Pause/Delete，失败保留重试。Coordinator 不保存动态 control、续期 CAS 或到期扫描/claim。
+可选 `EnvironmentSpec.run_policy` 保存默认运行时长与 Pause/Delete 动作；当前 E2B 入口填写它，原生公共 HTTP 暂不开放，未配置的原生实例无额外期限。当前 owner adxlet 在首次 Running 或恢复接管时建立单调时钟 timer。进程 crash 或 preserve 重启后，仅在旧会话未过期且未退役、相同节点 ID 与 RPC/Relay 地址通过原生身份校验并成功接管现存 Runtime 时，才按 Spec 默认时长重建 timer；先前的动态续期不跨进程保存。显式 Drain 后的计划退役不适用该接管条件，后端计划升级须先 Pause 或排空。频繁更新不持久化绝对 deadline。Connect 只延长至 `max(当前截止, now + timeout)`；setTimeout 替换为 `now + timeout`，0 表示立即到期，均由 owner 接受后返回。owner 串行处理续期和到期，执行前复核 runtime、assignment generation 与 timer 更新序号；到期进入既有 Pause/Delete，失败保留重试。Coordinator 不保存动态 control、续期 CAS 或到期扫描/claim。
 
 显式 Pause 停止当前 timer；Resume 开始新周期。E2B Connect 对暂停态先复用原生 EnsureRunning 恢复（包括可接管的离线 owner），再为本轮运行设置请求时长；运行态 Connect 仍只延长期限。Paused Connect 的请求时长随原生恢复意图保留，并传到最终 owner，在首次建立该运行期 timer 前消费；原 owner 不可用、替代调度及后台重试沿用同一恢复意图，RPC 等待预算不作为运行时长。合并到既有恢复意图的请求不改写其初始时长，恢复后的 Connect 续期只延长、不缩短，避免重试重置 timer；Spec 默认时长不变。暂停态独立更新的 nextDuration 只在下一次运行消费一次，不跨节点进程重启保存；Snapshot 临时暂停/源恢复保留原 deadline，capture 耗时计入本轮运行。普通 Running 重报不续期。`startedAt` 复用原生 CreationSummary 的首次成功 Running 时间，Pause/Resume 后保持；运行态 `endAt` 是 owner 剩余单调时长映射到当前墙钟的估计值。Paused `endAt` 来自 RestorePoint 的真实保留期限，Forever 映射为 `9999-12-31T23:59:59Z`。
 

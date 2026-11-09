@@ -17,7 +17,8 @@ async fn paused_fixture() -> (
         generation: 1,
         devices: vec![],
     };
-    let specification = spec("sleep");
+    let mut specification = spec("sleep");
+    let profile = recovery_profile::qualify(&mut specification);
 
     session
         .reserve(specification.clone(), assignment.clone())
@@ -28,12 +29,13 @@ async fn paused_fixture() -> (
     record.resources_held = false;
     record.runtime.ip = None;
     record.checkpoint = Some(adx_core::RestorePoint {
+        recovery_profile: profile,
         id: "pause".into(),
         origin: None,
         expires_at_unix_seconds: None,
         source_runtime_id: "sleep-1".into(),
         artifact: adx_core::CheckpointArtifact {
-            scope: String::new(),
+            scope: "test-scope".into(),
             storage: "obs".into(),
             location: "artifact".into(),
             size_bytes: 8,
@@ -230,6 +232,7 @@ async fn node_loss_preserves_dormancy_and_does_not_enqueue_restore() {
     paused.resources_held = false;
     paused.runtime.ip = None;
     paused.checkpoint = Some(adx_core::RestorePoint {
+        recovery_profile: Default::default(),
         id: "pause".into(),
         origin: None,
         expires_at_unix_seconds: None,
@@ -315,19 +318,7 @@ async fn capacity_retry_round_keeps_intent_identity_and_reconsiders_nodes() {
 async fn failure_recovery_intermediate_pause_does_not_become_user_dormancy() {
     let (_rig, session, mut record) = paused_fixture().await;
     for id in ["source", "target"] {
-        session
-            .register_session(
-                node(id),
-                format!("{id}:1"),
-                format!("{id}:2"),
-                Some(adx_coordinator::storage::NodeSession {
-                    id: "boot".into(),
-                    sequence: 1,
-                    routable: true,
-                }),
-            )
-            .await
-            .unwrap();
+        maintenance_register(&session, id, "boot", 1).await;
     }
     record.state = EnvironmentState::Failed;
     record.revision += 1;
@@ -359,9 +350,15 @@ async fn maintenance_register(
     sid: &str,
     sequence: u64,
 ) -> StoredNode {
+    let mut candidate = node(id);
+    candidate.labels = recovery_profile::qualify(&mut spec("profile"));
+    candidate.labels.extend([
+        ("ADX_CHECKPOINT_STORAGE".into(), "obs".into()),
+        ("ADX_CHECKPOINT_SCOPE".into(), "test-scope".into()),
+    ]);
     session
-        .register_session(
-            node(id),
+        .register_session_with_scopes(
+            candidate,
             format!("{id}:1"),
             format!("{id}:2"),
             Some(adx_coordinator::storage::NodeSession {
@@ -369,6 +366,7 @@ async fn maintenance_register(
                 sequence,
                 routable: true,
             }),
+            ["test-scope".into()].into(),
         )
         .await
         .unwrap()
@@ -377,7 +375,7 @@ async fn maintenance_register(
 fn maintenance_task(admin_paused: bool) -> adx_coordinator::storage::UpgradeTask {
     use adx_coordinator::storage::{UpgradeNode, UpgradeTask};
     UpgradeTask {
-        protocol_version: 2,
+        protocol_version: 3,
         task_id: "upgrade".into(),
         epoch: 1,
         namespace: "test".into(),
@@ -515,10 +513,22 @@ async fn maintenance_transfer_requires_stopped_owner_and_exact_sessions() {
         });
         active.revision += 1;
         session.commit(active.clone()).await.unwrap();
-        session
-            .save_upgrade(maintenance_task(false), None)
-            .await
-            .unwrap();
+        let mut task = maintenance_task(false);
+        task.operations.insert(
+            "move".into(),
+            adx_coordinator::storage::UpgradeOperation {
+                environment_id: record.spec.id.clone(),
+                source_node_id: "source".into(),
+                target_node_id: "target".into(),
+                source_generation: record.assignment.generation,
+                source_revision: active.revision,
+                source_session_id: "source-session".into(),
+                target_session_id: "target-session".into(),
+                was_running: resume,
+                phase: "Prepared".into(),
+            },
+        );
+        session.save_upgrade(task, None).await.unwrap();
         assert!(session
             .reserve_migration(
                 &record.assignment,
@@ -556,50 +566,23 @@ async fn maintenance_transfer_requires_stopped_owner_and_exact_sessions() {
     }
 }
 
-#[tokio::test]
-#[ignore = "requires isolated real Redis"]
-async fn maintenance_revocation_survives_restart_and_legacy_tasks_remain_read_only() {
-    use adx_coordinator::storage::LocalClaim;
-    let (rig, session, _) = paused_fixture().await;
-    let id = "default-upgrade-canary-lost";
-    let mut task = maintenance_task(false);
-    task.canaries.insert(id.into(), "target".into());
-    let mut task = session.save_upgrade(task, None).await.unwrap();
-    let probe = spec(id);
-    let assignment = Assignment {
-        environment_id: id.into(),
-        node_id: "target".into(),
-        generation: 9,
-        shard_id: 0,
-        devices: vec![],
-    };
-    session
-        .reserve(probe.clone(), assignment.clone())
-        .await
-        .unwrap();
-    task.revoked_canaries.insert(id.into());
-    let task = session
-        .save_upgrade(task.clone(), Some(task.revision))
-        .await
-        .unwrap();
-    let current = rig.store().await.begin(1).await.unwrap();
-    assert!(current.reserve(probe.clone(), assignment).await.is_err());
-    assert!(current
-        .claim(
-            probe,
-            &LocalClaim {
-                request_id: "late".into(),
-                node_id: "target".into(),
-                node_session_id: "target-session".into(),
-                devices: vec![]
-            }
-        )
-        .await
-        .is_err());
-    let mut encoded = serde_json::to_value(task).unwrap();
-    encoded.as_object_mut().unwrap().remove("protocol_version");
-    let legacy: adx_coordinator::storage::UpgradeTask = serde_json::from_value(encoded).unwrap();
-    assert!(legacy.validate().is_ok());
-    assert!(legacy.fence("upgrade", 1).is_err());
-    assert!(current.save_upgrade(legacy, None).await.is_err());
+#[test]
+fn legacy_upgrade_tasks_require_settled_terminal_evidence() {
+    use adx_coordinator::storage::UpgradeTask;
+    let current = serde_json::to_value(maintenance_task(false)).unwrap();
+    assert!(serde_json::from_value::<UpgradeTask>(current.clone()).is_ok());
+    let mut legacy = current;
+    legacy["protocol_version"] = 2.into();
+    legacy["canaries"] = serde_json::json!({"old-probe":"target"});
+    legacy["revoked_canaries"] = serde_json::json!(["old-probe"]);
+    legacy["cleaned_canaries"] = serde_json::json!(["old-probe"]);
+    assert!(serde_json::from_value::<UpgradeTask>(legacy.clone()).is_err());
+    for phase in ["Completed", "Aborted"] {
+        legacy["phase"] = phase.into();
+        let decoded: UpgradeTask = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(decoded.fence("upgrade", 1).is_err());
+        legacy["cleaned_canaries"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<UpgradeTask>(legacy.clone()).is_err());
+        legacy["cleaned_canaries"] = serde_json::json!(["old-probe"]);
+    }
 }

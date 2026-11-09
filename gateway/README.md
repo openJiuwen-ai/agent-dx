@@ -114,8 +114,8 @@ An obsolete, unsent admission may retry the current route once within its origin
 deadline and authorization scope. Authorization changes are rejected; transient
 route failures return a retryable response with `requestForwarded: false`.
 Requests already sent are never replayed. Delayed revocations invalidate only
-older pool revisions. Planned node-upgrade admission closure preserves accepted
-streams until they finish; only then may Adxlet retire the binding and checkpoint it.
+older pool revisions. Planned node upgrades wait for natural stream inactivity,
+then close admission against the observed activity revision before checkpointing.
 
 The pool defaults to 64 concurrent connections per endpoint, 64 idle
 connections per endpoint, 1024 idle connections globally, a 3 second acquire
@@ -123,8 +123,9 @@ timeout, and a 5 second idle lifetime. An idle pooled HTTP connection is still
 an active Node CONNECT stream, so the short lifetime deliberately bounds how
 long pooling can defer environment idle reclamation. Continuously reused backend
 HTTP connections also have a 30 second maximum lifetime: expiry prevents reuse
-**after the current response completes**, and never truncates its body. This lets
-planned Relay draining finish under sustained short requests. A long-lived
+**after the current response completes**, and never truncates its body. This can
+expose idle gaps without closing admission while clients remain active; overlapping
+connections or continuous traffic can still prevent a planned upgrade. A long-lived
 CONNECT, upgraded session or file transfer can exceed the pause budget; the
 upgrade fails safely and reopens the source admission instead of forcibly closing
 that stream. A pause budget shorter than the pool lifetime may likewise time out.

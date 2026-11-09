@@ -1,8 +1,12 @@
 mod common;
 #[path = "rpc/environment_control.rs"]
 mod environment_control;
+#[path = "common/mounts.rs"]
+mod mounts;
 #[path = "rpc/node_retirement.rs"]
 mod node_retirement;
+#[path = "support/recovery_profile.rs"]
+mod recovery_profile;
 #[path = "rpc/snapshot_preparation.rs"]
 mod snapshot_preparation;
 #[path = "rpc/volumes.rs"]
@@ -700,7 +704,6 @@ async fn lifecycle_rpc_scenario() {
         node_session_id: String::new(),
         assignment: Some(assignment.clone()),
         caller: caller(),
-        ..Default::default()
     };
     bad_delete.caller.as_mut().unwrap().tenant_id = "other".into();
     assert_eq!(
@@ -722,7 +725,6 @@ async fn lifecycle_rpc_scenario() {
                 node_session_id: String::new(),
                 assignment: Some(stale),
                 caller: caller(),
-                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -793,7 +795,6 @@ async fn lifecycle_rpc_scenario() {
         node_session_id: String::new(),
         assignment: Some(assignment),
         caller: caller(),
-        ..Default::default()
     };
     node_frontend
         .delete_environment(delete.clone())
@@ -843,7 +844,6 @@ async fn lifecycle_rpc_scenario() {
         node_session_id: String::new(),
         assignment: Some(second.assignment.try_into().unwrap()),
         caller: caller(),
-        ..Default::default()
     };
     assert!(node_frontend
         .delete_environment(delete.clone())
@@ -896,7 +896,6 @@ async fn lifecycle_rpc_scenario() {
             node_session_id: String::new(),
             assignment: record.assignment,
             caller: caller(),
-            ..Default::default()
         })
         .await
         .unwrap();
@@ -1153,7 +1152,6 @@ async fn lifecycle_rpc_scenario() {
                                         caller: caller(),
                                         failed_revision: None,
                                         node_session_id: "boot-1".into(),
-                                        ..Default::default()
                                     })
                                     .await
                                     .unwrap();
@@ -3126,7 +3124,6 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
             node_session_id: String::new(),
             assignment: source.assignment,
             caller: caller(),
-            ..Default::default()
         })
         .await
         .unwrap();
@@ -3235,7 +3232,6 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
             node_session_id: String::new(),
             assignment: created.assignment,
             caller: caller(),
-            ..Default::default()
         })
         .await
         .unwrap();
@@ -3494,6 +3490,12 @@ async fn coordinator_restart_releases_snapshot_pins_for_lost_memory_queue_only()
 struct RecoveryBackend(Backend);
 #[async_trait::async_trait]
 impl RuntimeDriver for RecoveryBackend {
+    fn recovery_profile(
+        &self,
+        spec: &EnvironmentSpec,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        Ok(recovery_profile::qualify(&mut spec.clone()))
+    }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
         self.0.inventory().await
     }
@@ -3534,8 +3536,93 @@ impl RuntimeDriver for RecoveryBackend {
 #[tokio::test]
 #[ignore = "requires isolated Redis and mTLS certificates"]
 async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deleting_artifact() {
+    Box::pin(shared_checkpoint_recovery(false, false, false)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS certificates"]
+async fn shared_checkpoint_recovery_authorizes_exclusive_volume_on_new_node() {
+    Box::pin(shared_checkpoint_recovery(true, false, false)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS certificates"]
+async fn dormant_shared_checkpoint_resume_authorizes_exclusive_volume_on_new_node() {
+    Box::pin(shared_checkpoint_recovery(true, true, false)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS certificates"]
+async fn shared_checkpoint_recovery_releases_uncertain_authorization_before_retry() {
+    Box::pin(shared_checkpoint_recovery(true, false, true)).await;
+}
+
+// Run the real authorization RPC and observe its Redis writes, then replace
+// the first reply with the post-authorization reconciliation error. This tests
+// the client/cleanup boundary without exposing a production fault-injection hook.
+struct RecoveryVolumeService {
+    rpc: CoordinatorRpc,
+    session: Session,
+    fail_reply: bool,
+    attempts: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+#[tonic::async_trait]
+impl pb::volume_execution_service_server::VolumeExecutionService for RecoveryVolumeService {
+    async fn authorize_execution(
+        &self,
+        request: Request<pb::AuthorizeVolumeExecutionRequest>,
+    ) -> std::result::Result<tonic::Response<pb::VolumeExecutionGrant>, tonic::Status> {
+        let previous = request.get_ref().previous_runtime_id.clone();
+        let response = self.rpc.authorize_execution(request).await?;
+        let granted = response.get_ref();
+        let saved = self.session.get("held").await.unwrap();
+        let execution = saved.volume_execution.unwrap();
+        assert_eq!(execution.runtime_id, granted.runtime_id);
+        assert!(!execution.released);
+        let volume = self
+            .session
+            .get_volume("tenant", "workspace")
+            .await
+            .unwrap();
+        assert_eq!(volume.occupancy.unwrap().runtime_id, granted.runtime_id);
+        let first = {
+            let mut attempts = self.attempts.lock().unwrap();
+            attempts.push((previous, granted.runtime_id.clone()));
+            attempts.len() == 1
+        };
+        if self.fail_reply && first {
+            return Err(tonic::Status::unavailable(
+                "execution authorized; scheduler reconciliation required",
+            ));
+        }
+        Ok(response)
+    }
+
+    async fn begin_initialization(
+        &self,
+        request: Request<pb::VolumeInitializationRequest>,
+    ) -> std::result::Result<tonic::Response<pb::VolumeInitializationResponse>, tonic::Status> {
+        self.rpc.begin_initialization(request).await
+    }
+
+    async fn complete_initialization(
+        &self,
+        request: Request<pb::CompleteVolumeInitializationRequest>,
+    ) -> std::result::Result<tonic::Response<pb::DeleteVolumeResponse>, tonic::Status> {
+        self.rpc.complete_initialization(request).await
+    }
+}
+
+async fn shared_checkpoint_recovery(
+    managed_volume: bool,
+    dormant: bool,
+    fail_authorization_reply: bool,
+) {
     use adx_checkpoint_storage::{CheckpointAccess, ObjectCheckpointStore};
     use adx_core::{Assignment, EnvironmentState, RestorePoint};
+    let mut original_spec = spec("held");
+    let profile = recovery_profile::qualify(&mut original_spec);
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(2).await.unwrap();
     let test_peers = || {
@@ -3543,6 +3630,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
             (file("coordinator.der"), Principal::Coordinator),
             (file("node.der"), Principal::Node("source".into())),
             (file("apiserver.der"), Principal::Node("target".into())),
+            (file("ingress.der"), Principal::Ingress),
         ])
     };
     let rpc = CoordinatorRpc::with_heartbeat_timeout(
@@ -3555,14 +3643,84 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     )
     .await
     .unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let volume = if managed_volume {
+        use adx_core::{
+            execution::{Mount, MountSource},
+            volumes::{AccessMode, StorageDomain, VolumeRef, VolumeSource, VolumeSpec},
+        };
+        let directory = workspace.path().join("workspaces/tenant/user");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("state"), b"existing workspace").unwrap();
+        let backend = mounts::backend_id(workspace.path());
+        let domains = std::collections::BTreeMap::from([(
+            "workspace".into(),
+            StorageDomain {
+                dynamic_nodes: false,
+                backend_id: backend,
+                node_roots: [
+                    ("source".into(), workspace.path().to_str().unwrap().into()),
+                    ("target".into(), workspace.path().to_str().unwrap().into()),
+                ]
+                .into(),
+                tenant_paths: [("tenant".into(), "workspaces/tenant".into())].into(),
+            },
+        )]);
+        rpc.clone().with_volume_domains(domains.clone()).unwrap();
+        let volume = session
+            .ensure_volume(
+                VolumeSpec {
+                    tenant_id: "tenant".into(),
+                    id: "workspace".into(),
+                    source: VolumeSource::Directory {
+                        storage_domain: "workspace".into(),
+                        path: "workspaces/tenant/user".into(),
+                    },
+                    access_mode: AccessMode::Exclusive,
+                    create_if_missing: false,
+                    create_options: None,
+                },
+                &domains,
+            )
+            .await
+            .unwrap();
+        original_spec.execution.mounts.push(Mount {
+            kind: "bind".into(),
+            target: "/workspace".into(),
+            options: vec!["rw".into()],
+            source: MountSource::Volume(VolumeRef {
+                id: volume.spec.id.clone(),
+                uid: Some(volume.uid.clone()),
+            }),
+            create_if_missing: false,
+            create_options: None,
+        });
+        Some(volume)
+    } else {
+        None
+    };
     let ml = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ma = ml.local_addr().unwrap();
     let service = rpc.clone();
+    let authorization_attempts = Arc::new(Mutex::new(Vec::new()));
+    let volume_service = RecoveryVolumeService {
+        rpc: rpc.clone(),
+        session: session.clone(),
+        fail_reply: fail_authorization_reply,
+        attempts: authorization_attempts.clone(),
+    };
     let mut servers = Servers(vec![tokio::spawn(async move {
         Server::builder()
             .tls_config(server_tls("coordinator"))
             .unwrap()
-            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
+            .add_service(
+                pb::coordinator_service_server::CoordinatorServiceServer::new(service.clone()),
+            )
+            .add_service(
+                pb::volume_execution_service_server::VolumeExecutionServiceServer::new(
+                    volume_service,
+                ),
+            )
             .serve_with_incoming(TcpListenerStream::new(ml))
             .await
             .unwrap();
@@ -3638,7 +3796,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         channel(ma, "apiserver").await,
     );
     let mut source_report = pb::RegisterNodeRequest {
-        checkpoint_scopes: vec![],
+        checkpoint_scopes: vec!["test-scope".into()],
         node_id: "source".into(),
         node_address: "127.0.0.1:9001".into(),
         proxy_address: "source:9002".into(),
@@ -3649,9 +3807,16 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         ..Default::default()
     };
     let mut target_report = pb::RegisterNodeRequest {
-        checkpoint_scopes: vec![],
+        checkpoint_scopes: vec!["test-scope".into()],
         storage_mounts: Default::default(),
-        labels: [("ADX_CHECKPOINT_STORAGE".into(), "shared".into())].into(),
+        labels: profile
+            .clone()
+            .into_iter()
+            .chain([
+                ("ADX_CHECKPOINT_STORAGE".into(), "shared".into()),
+                ("ADX_CHECKPOINT_SCOPE".into(), "test-scope".into()),
+            ])
+            .collect(),
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -3690,7 +3855,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         devices: vec![],
     };
     session
-        .reserve(spec("held"), previous.clone())
+        .reserve(original_spec.clone(), previous.clone())
         .await
         .unwrap();
     let old = EnvironmentRecord {
@@ -3698,7 +3863,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         execution_artifacts: vec![],
         snapshot_source: None,
         failure: None,
-        spec: spec("held"),
+        spec: original_spec,
         assignment: previous,
         state: EnvironmentState::Running,
         revision: 2,
@@ -3708,6 +3873,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         },
         resources_held: true,
         checkpoint: Some(RestorePoint {
+            recovery_profile: profile,
             id: "pause".into(),
             artifact: artifact.clone(),
             expires_at_unix_seconds: None,
@@ -3718,7 +3884,28 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         restart_attempts: 0,
         restart_pending: false,
     };
+    if managed_volume {
+        let mut starting = old.clone();
+        starting.state = EnvironmentState::Starting;
+        starting.revision = 1;
+        starting.runtime.ip = None;
+        session
+            .authorize_volumes(&starting, "held-1", "source-boot")
+            .await
+            .unwrap();
+    }
     session.commit(old.clone()).await.unwrap();
+    if dormant {
+        let mut paused = old.clone();
+        paused.state = EnvironmentState::Paused;
+        paused.revision += 1;
+        paused.resources_held = false;
+        paused.runtime.ip = None;
+        session
+            .commit_releasing(paused, "source-boot", &["held-1".into()])
+            .await
+            .unwrap();
+    }
     tokio::time::sleep(Duration::from_millis(550)).await;
     // Keep only the target healthy; the source heartbeat expires.
     target_report.heartbeat_sequence += 1;
@@ -3738,7 +3925,50 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     target_report.accepting_allocations = true;
     target.register_node(target_report.clone()).await.unwrap();
     assert_eq!(rpc.expire_nodes().await.unwrap(), 1);
-    assert_eq!(rpc.recover_environments().await.unwrap(), 1);
+    if fail_authorization_reply {
+        assert!(matches!(
+            rpc.recover_environments().await,
+            Err(adx_core::Error::Unavailable(_))
+        ));
+        let waiting = session.get("held").await.unwrap();
+        let paused = waiting.result.as_ref().unwrap();
+        assert_eq!(paused.state, EnvironmentState::Paused);
+        assert!(waiting.recovery.as_ref().unwrap().pending);
+        assert!(!paused.resources_held);
+        assert_eq!(manager.used(), Resources::default());
+        assert_eq!(backend.0.started.load(Ordering::SeqCst), 0);
+        // Release happens with the Paused commit, without waiting for a retry.
+        let execution = waiting.volume_execution.as_ref().unwrap();
+        assert!(execution.released);
+        assert_eq!(execution.runtime_id, paused.runtime.id);
+        assert!(session
+            .get_volume("tenant", "workspace")
+            .await
+            .unwrap()
+            .occupancy
+            .is_none());
+        assert_eq!(
+            authorization_attempts.lock().unwrap()[0].1,
+            paused.runtime.id
+        );
+    }
+    if dormant {
+        pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "ingress").await)
+            .ensure_running(pb::EnsureRunningRequest {
+                run_timeout_seconds: None,
+                environment_id: "held".into(),
+                expected_runtime_id: old.runtime.id.clone(),
+                caller: Some(pb::CallerContext {
+                    tenant_id: "tenant".into(),
+                    administrator: false,
+                }),
+                timeout_seconds: 3,
+            })
+            .await
+            .unwrap();
+    } else {
+        assert_eq!(rpc.recover_environments().await.unwrap(), 1);
+    }
     let restored = session.get("held").await.unwrap();
     let result = restored.result.clone().unwrap();
     assert_eq!(result.state, EnvironmentState::Running);
@@ -3749,6 +3979,25 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     assert!(!restored.recovery.as_ref().unwrap().pending);
     assert_eq!(rpc.recover_environments().await.unwrap(), 0);
     assert_eq!(backend.0.started.load(Ordering::SeqCst), 1);
+    if let Some(volume) = &volume {
+        let stored = session.get_volume("tenant", &volume.spec.id).await.unwrap();
+        assert_eq!(stored.volume.uid, volume.uid);
+        let owner = stored.occupancy.unwrap();
+        assert_eq!(owner.assignment, result.assignment);
+        assert_eq!(owner.runtime_id, result.runtime.id);
+        assert_eq!(owner.node_session_id, "target-boot");
+        assert_eq!(
+            std::fs::read(workspace.path().join("workspaces/tenant/user/state")).unwrap(),
+            b"existing workspace"
+        );
+    }
+    if fail_authorization_reply {
+        let attempts = authorization_attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[1].0, attempts[0].1);
+        assert_ne!(attempts[1].1, attempts[0].1);
+        assert_eq!(attempts[1].1, result.runtime.id);
+    }
     let mut duplicate = result.clone();
     duplicate.state = EnvironmentState::Paused;
     duplicate.revision = 1;

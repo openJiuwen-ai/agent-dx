@@ -248,6 +248,40 @@ mod tests {
             adx_core::Error::Unavailable("control RPC unavailable".into()),
         );
     }
+
+    #[test]
+    fn dependency_status_preserves_auth_rejections_and_internal_diagnostics() {
+        for (wire_code, code) in [
+            (
+                tonic::Code::PermissionDenied,
+                adx_core::BackendFailureCode::PermissionDenied,
+            ),
+            (
+                tonic::Code::Unauthenticated,
+                adx_core::BackendFailureCode::Unauthenticated,
+            ),
+        ] {
+            let error =
+                dependency_status(tonic::Status::new(wire_code, "node credentials rejected"));
+            assert_eq!(
+                error,
+                Error::BackendFailure {
+                    code,
+                    message: "control RPC: node credentials rejected".into(),
+                }
+            );
+            let forwarded = status(error);
+            assert_eq!(forwarded.code(), wire_code);
+            assert_eq!(
+                forwarded.message(),
+                "control RPC: node credentials rejected"
+            );
+        }
+        assert_eq!(
+            dependency_status(tonic::Status::internal("volume catalog decode failed")),
+            Error::Unavailable("control RPC Internal: volume catalog decode failed".into()),
+        );
+    }
 }
 
 /// Node-local binding and activity contracts.
@@ -420,6 +454,9 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
         },
     }
 }
+/// Preserve explicit authentication/permission rejections with existing failure
+/// codes. Internal responses retain diagnostics without implying a terminal
+/// execution; the caller still decides retries from its operation stage.
 pub fn dependency_status(status: tonic::Status) -> Error {
     if let Some(capability) = unsupported_capability(&status) {
         return Error::UnsupportedCapability(capability);
@@ -446,6 +483,17 @@ pub fn dependency_status(status: tonic::Status) -> Error {
         return Error::ProbeFailed(failure);
     }
     match status.code() {
+        tonic::Code::PermissionDenied => Error::BackendFailure {
+            code: adx_core::BackendFailureCode::PermissionDenied,
+            message: format!("control RPC: {}", status.message()),
+        },
+        tonic::Code::Unauthenticated => Error::BackendFailure {
+            code: adx_core::BackendFailureCode::Unauthenticated,
+            message: format!("control RPC: {}", status.message()),
+        },
+        tonic::Code::Internal => {
+            Error::Unavailable(format!("control RPC Internal: {}", status.message()))
+        }
         tonic::Code::FailedPrecondition => Error::Conflict,
         tonic::Code::NotFound => Error::NotFound,
         tonic::Code::ResourceExhausted => Error::NoCapacity,
@@ -483,6 +531,7 @@ impl From<adx_core::RestorePoint> for control::RestorePoint {
             expires_at_unix_seconds: v.expires_at_unix_seconds,
             origin: v.origin.map(Into::into),
             source_runtime_id: v.source_runtime_id,
+            recovery_profile: v.recovery_profile.into_iter().collect(),
             artifact: Some(control::CheckpointArtifact {
                 storage: v.artifact.storage,
                 scope: v.artifact.scope,
@@ -512,6 +561,7 @@ impl TryFrom<control::RestorePoint> for adx_core::RestorePoint {
             expires_at_unix_seconds: v.expires_at_unix_seconds,
             origin: v.origin.map(TryInto::try_into).transpose()?,
             source_runtime_id: v.source_runtime_id,
+            recovery_profile: v.recovery_profile.into_iter().collect(),
             artifact: adx_core::CheckpointArtifact {
                 storage: a.storage,
                 scope: a.scope,

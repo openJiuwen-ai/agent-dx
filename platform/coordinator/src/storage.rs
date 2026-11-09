@@ -20,6 +20,7 @@ mod recovery;
 pub use observability::{
     BusinessCounters, CreationResult, CreationSummary, InterruptionSummary, RecoveryState,
 };
+pub(crate) use recovery::{checkpoint_requirements, recovery_profile_requirements};
 #[cfg(test)]
 mod checkpoint_contention_tests;
 mod resume;
@@ -55,19 +56,6 @@ pub use volumes::{
 
 const HEADER: &str = "header";
 const UPGRADE: &str = "node-upgrade";
-pub(crate) const UPGRADE_CANARY_PREFIX: &str = "default-upgrade-canary-";
-
-fn canary_creation(id: &str, raw: Option<&str>) -> Result<()> {
-    if !id.starts_with(UPGRADE_CANARY_PREFIX) {
-        return Ok(());
-    }
-    let task: UpgradeTask = decode(raw.ok_or(Error::Conflict)?)?;
-    task.require_protocol()?;
-    if !task.active() || !task.canaries.contains_key(id) || task.revoked_canaries.contains(id) {
-        return Err(Error::Conflict);
-    }
-    Ok(())
-}
 const CAS: &str = r#"
 local old = redis.call('HGET', KEYS[1], 'header')
 if ARGV[1] == '' then
@@ -2029,7 +2017,6 @@ impl Session {
                 ])
                 .await?;
             let header = self.header(&header_value)?;
-            canary_creation(&record.spec.id, upgrade_value.as_deref())?;
             if let Some(environment_value) = &environment_value {
                 let existing: StoredEnvironment = decode(environment_value)?;
                 return if existing.spec == record.spec && existing.assignment == record.assignment {
@@ -2100,7 +2087,6 @@ impl Session {
                 ])
                 .await?;
             let header = self.header(&header_value)?;
-            canary_creation(&previous.environment_id, upgrade_value.as_deref())?;
             let mut stored_environment: StoredEnvironment =
                 decode(environment_value.as_deref().ok_or(Error::NotFound)?)?;
             stored_environment.validate()?;

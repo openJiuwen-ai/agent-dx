@@ -10,6 +10,8 @@ pub mod autoscaling;
 mod journal;
 pub mod metrics;
 mod queue;
+#[cfg(test)]
+mod recovery_tests;
 pub mod routes;
 pub mod rpc;
 mod shard;
@@ -245,20 +247,11 @@ impl Coordinator {
     /// Global chooses the shard; queued Snapshots can move when a different
     /// shard has eligible capacity. The shard still owns final reservation.
     pub fn submit_recovery(&mut self, spec: EnvironmentSpec) -> Result<usize> {
+        spec.validate()?;
         self.retired.remove(&spec.id);
         if !self.requests.contains_key(&spec.id) {
-            // Global still rotates; skip shards without any live node.
-            for offset in 0..self.shards.len() {
-                let shard = (self.next_shard + offset) % self.shards.len();
-                if self
-                    .snapshot
-                    .nodes()
-                    .values()
-                    .any(|n| n.available && self.node_shards.get(&n.id) == Some(&shard))
-                {
-                    self.next_shard = shard;
-                    break;
-                }
+            if let Some(shard) = self.candidate_shard(&spec, &BTreeSet::new(), None)? {
+                self.next_shard = shard;
             }
         }
         let id = spec.id.clone();
@@ -266,6 +259,36 @@ impl Coordinator {
         self.recovery_requests.insert(id);
         Ok(shard)
     }
+
+    /// Publish the durable spec after recovery placement. Required-node filters
+    /// added for checkpoint access and source exclusion are only placement inputs;
+    /// claims and execution grants must see the unchanged Environment identity.
+    /// Reject any other spec change or a different assignment without mutation.
+    pub(crate) fn finish_recovery_placement(
+        &mut self,
+        spec: &EnvironmentSpec,
+        assignment: &Assignment,
+        hold_resources: bool,
+    ) -> Result<()> {
+        spec.validate()?;
+        let (shard, queued) = self.requests.get(&spec.id).ok_or(Error::Conflict)?;
+        if *shard != assignment.shard_id
+            || self.shards[*shard].assignment(&spec.id) != Some(assignment)
+        {
+            return Err(Error::Conflict);
+        }
+        let mut canonical = queued.clone();
+        canonical.scheduling.required_node = spec.scheduling.required_node.clone();
+        if canonical != *spec {
+            return Err(Error::Conflict);
+        }
+        self.release(assignment)?;
+        if hold_resources {
+            self.restore_assignment(spec, assignment)?;
+        }
+        Ok(())
+    }
+
     pub fn submit(&mut self, spec: EnvironmentSpec) -> Result<usize> {
         spec.validate()?;
         if self.retired.contains(&spec.id) {
@@ -303,6 +326,26 @@ impl Coordinator {
         excluded: &BTreeSet<String>,
         skip: Option<usize>,
     ) -> Result<Option<usize>> {
+        Ok(self
+            .best_candidate(spec, excluded, skip)?
+            .map(|(_, shard)| shard))
+    }
+
+    /// Advisory placement uses the same hard filters and score as recovery
+    /// submission; the selected shard must still reserve fresh capacity.
+    pub(crate) fn recovery_candidate(&mut self, spec: &EnvironmentSpec) -> Result<Option<String>> {
+        spec.validate()?;
+        Ok(self
+            .best_candidate(spec, &BTreeSet::new(), None)?
+            .map(|(node, _)| node))
+    }
+
+    fn best_candidate(
+        &mut self,
+        spec: &EnvironmentSpec,
+        excluded: &BTreeSet<String>,
+        skip: Option<usize>,
+    ) -> Result<Option<(String, usize)>> {
         let mut best: Option<(u64, String, usize)> = None;
         for (id, shard) in self.shards.iter_mut().enumerate() {
             if skip == Some(id) {
@@ -321,11 +364,14 @@ impl Coordinator {
                 }
             }
         }
-        Ok(best.map(|(_, _, id)| id))
+        Ok(best.map(|(_, node, id)| (node, id)))
     }
 
     fn defer_or_transfer(&mut self, shard: usize, entry: queue::Entry) -> Result<()> {
-        if entry.spec.snapshot_id.is_none() && !self.volume_placement.contains_key(&entry.spec.id) {
+        if entry.spec.snapshot_id.is_none()
+            && !self.volume_placement.contains_key(&entry.spec.id)
+            && !self.recovery_requests.contains(&entry.spec.id)
+        {
             self.shards[shard].defer(entry);
             return Ok(());
         }
@@ -730,5 +776,70 @@ mod tests {
 
         assert!(!coordinator.recovery_requests.contains(&spec.id));
         assert!(coordinator.submit(spec).is_ok());
+    }
+
+    #[test]
+    fn recovery_preview_and_submission_share_policy_and_recheck_capacity() {
+        use adx_core::scheduling::{LabelSelector, WeightedSelector};
+        for placement in [Placement::Pack, Placement::Spread] {
+            let mut coordinator = Coordinator::new(2, placement).unwrap();
+            let mut request = spec();
+            for id in ["a", "b"] {
+                coordinator
+                    .register(Node {
+                        id: id.into(),
+                        capacity: request.resources,
+                        available: true,
+                        labels: [("NODE_ID".into(), id.into())].into(),
+                        devices: vec![],
+                        runtime_classes: vec![request.runtime_class.clone()],
+                    })
+                    .unwrap();
+            }
+            request.scheduling.preferred_node.push(WeightedSelector {
+                selector: LabelSelector {
+                    match_labels: [("NODE_ID".into(), "b".into())].into(),
+                    ..Default::default()
+                },
+                weight: 100,
+            });
+            assert_eq!(
+                coordinator.recovery_candidate(&request).unwrap().as_deref(),
+                Some("b")
+            );
+            assert!(coordinator.snapshot.environments().is_empty());
+            let shard = coordinator.submit_recovery(request.clone()).unwrap();
+            let assignment = coordinator.schedule(shard).unwrap().unwrap();
+            assert_eq!(assignment.node_id, "b");
+            coordinator.release(&assignment).unwrap();
+
+            // A prepared migration pins its target, but does not reserve a stale preview.
+            request.scheduling.required_node.push(LabelSelector {
+                match_labels: [("NODE_ID".into(), "b".into())].into(),
+                ..Default::default()
+            });
+            let mut unavailable = coordinator.snapshot.nodes()["b"].as_ref().clone();
+            unavailable.capacity.cpu_millis = 0;
+            coordinator.register(unavailable).unwrap();
+            assert!(coordinator.recovery_candidate(&request).unwrap().is_none());
+            let shard = coordinator.submit_recovery(request.clone()).unwrap();
+            assert!(coordinator.schedule(shard).unwrap().is_none());
+            assert!(coordinator.snapshot.environments().is_empty());
+            // Capacity can return on another shard after the recovery was deferred.
+            let mut available = coordinator.snapshot.nodes()["b"].as_ref().clone();
+            available.capacity = request.resources;
+            coordinator.register(available).unwrap();
+            let mut restored = None;
+            for _ in 0..8 {
+                let Some(ready) = coordinator.take_ready_shard() else {
+                    break;
+                };
+                if let Some(assignment) = coordinator.schedule(ready).unwrap() {
+                    restored = Some(assignment);
+                    break;
+                }
+            }
+            assert_eq!(restored.unwrap().node_id, "b");
+        }
     }
 }

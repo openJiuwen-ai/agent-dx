@@ -170,22 +170,17 @@ impl UpgradeGate {
         action: &str,
         task: Option<&str>,
     ) -> bool {
-        let canary = id.starts_with("default-upgrade-canary-");
         let Some(control) = &state.control else {
-            return task.is_none() && !state.bootstrap_isolated && !canary;
+            return task.is_none() && !state.bootstrap_isolated;
         };
         if control.node_session_id != self.session || state.bootstrap_isolated {
             return false;
         }
         let phase = control.phase.as_str();
         if task.is_none() && matches!(phase, "verified" | "released") {
-            if !canary {
-                return true;
-            }
-            if phase == "released" {
-                return false;
-            }
-        } else if !matches!(phase, "verified" | "canary" | "evacuating") {
+            return true;
+        }
+        if !matches!(phase, "verified" | "evacuating") {
             return false;
         }
         if task
@@ -194,11 +189,8 @@ impl UpgradeGate {
             return false;
         }
         control.grants.iter().any(|grant| {
-            let wildcard = phase == "verified"
-                && (task.is_none() || action == "pause" && (grant.actions == ["pause"] || canary));
             grant.environment_id == id
-                && (grant.assignment_generation == generation
-                    || wildcard && grant.assignment_generation == 0)
+                && grant.assignment_generation == generation
                 && (grant.actions.iter().any(|a| a == action)
                     || task.is_none()
                         && phase != "verified"
@@ -302,11 +294,6 @@ impl UpgradeGate {
         let _transition = self.transitions.lock().await;
         validate(&control, &self.session)?;
         let open = matches!(control.phase.as_str(), "verified" | "released");
-        let authorized: std::collections::BTreeSet<_> = control
-            .grants
-            .iter()
-            .map(|grant| grant.environment_id.clone())
-            .collect();
         {
             let mut state = self.lock()?;
             let unchanged = state.control.as_ref() == Some(&control) && !state.bootstrap_isolated;
@@ -338,28 +325,25 @@ impl UpgradeGate {
                 *state = next;
             }
         }
-        // Persist revocation before waiting. Replays also wait for canary effects
-        // whose grants have already disappeared from durable authority.
-        self.wait(open.then_some(&authorized)).await
+        // Persist closed authority before waiting for already accepted effects.
+        if !open {
+            self.wait().await?;
+        }
+        Ok(())
     }
 
-    async fn wait(&self, allowed: Option<&std::collections::BTreeSet<String>>) -> Result<()> {
+    async fn wait(&self) -> Result<()> {
         loop {
             let notified = self.activity.idle.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let busy = self
+            let idle = self
                 .activity
                 .by_id
                 .lock()
                 .map_err(|_| Error::Unavailable("execution lease lock unavailable".into()))?
-                .keys()
-                .any(|id| {
-                    allowed.is_none_or(|allowed| {
-                        id.starts_with("default-upgrade-canary-") && !allowed.contains(id)
-                    })
-                });
-            if !busy {
+                .is_empty();
+            if idle {
                 return Ok(());
             }
             notified.await;
@@ -380,9 +364,9 @@ fn validate(control: &NodeControl, session: &str) -> Result<()> {
         || session.is_empty()
         || !matches!(
             control.phase.as_str(),
-            "isolated" | "evacuating" | "canary" | "quiescing" | "verified" | "released"
+            "isolated" | "evacuating" | "quiescing" | "verified" | "released"
         )
-        || (!matches!(control.phase.as_str(), "canary" | "evacuating" | "verified")
+        || (!matches!(control.phase.as_str(), "evacuating" | "verified")
             && !control.grants.is_empty())
     {
         return Err(Error::Invalid(
@@ -391,6 +375,7 @@ fn validate(control: &NodeControl, session: &str) -> Result<()> {
     }
     for grant in &control.grants {
         if grant.environment_id.trim().is_empty()
+            || grant.assignment_generation == 0
             || grant.actions.is_empty()
             || grant.actions.iter().any(|action| {
                 !matches!(
@@ -452,39 +437,6 @@ impl crate::Adxlet {
         control: NodeControl,
     ) -> Result<adx_protocol::control::NodeUpgradeInspection> {
         self.services.upgrade.apply(control).await?;
-        // A pre-revocation local claim can have lost its response. Once the
-        // reserved ID is closed and has no Controller, release only its exact
-        // tentative token; unrelated peer reservations remain untouched.
-        let reservations: Vec<_> = {
-            let environments = self
-                .environments
-                .lock()
-                .map_err(|_| Error::Unavailable("environment registry unavailable".into()))?;
-            let holds = self
-                .local_holds
-                .lock()
-                .map_err(|_| Error::Unavailable("local reservations unavailable".into()))?;
-            holds
-                .iter()
-                .filter(|(id, _)| {
-                    id.starts_with("default-upgrade-canary-")
-                        && !environments.contains_key(*id)
-                        && self.services.upgrade.check(id, 0, "create").is_err()
-                })
-                .map(|(id, hold)| {
-                    (
-                        id.clone(),
-                        crate::local::LocalReservation {
-                            token: Some(hold.token.clone()),
-                            devices: hold.devices.clone(),
-                        },
-                    )
-                })
-                .collect()
-        };
-        for (id, reservation) in reservations {
-            self.release_local(&id, &reservation)?;
-        }
         self.inspect_upgrade().await
     }
 
@@ -499,9 +451,11 @@ impl crate::Adxlet {
     ) -> Result<adx_protocol::control::NodeUpgradeInspection> {
         let _transition = self.services.upgrade.transitions.lock().await;
         let control = self.services.upgrade.control()?;
-        let quiescing = control.as_ref().is_some_and(|c| c.phase == "quiescing");
-        let _lifecycle = if quiescing {
-            self.services.upgrade.wait(None).await?;
+        let admission_closed = control
+            .as_ref()
+            .is_some_and(|c| matches!(c.phase.as_str(), "isolated" | "quiescing"));
+        let _lifecycle = if admission_closed {
+            self.services.upgrade.wait().await?;
             Some(self.lifecycle_ready.write().await)
         } else {
             None
@@ -514,7 +468,7 @@ impl crate::Adxlet {
             .filter(|(id, _)| environment.is_none_or(|expected| id.as_str() == expected))
             .map(|(_, (_, _, h))| h.clone())
             .collect();
-        if quiescing {
+        if admission_closed {
             for handle in &handles {
                 tokio::time::timeout(self.services.operation_timeout, handle.sync())
                     .await
@@ -548,7 +502,7 @@ impl crate::Adxlet {
         let used = self.used();
         let no_ledger = used == adx_core::Resources::default();
         unknown |= !self.authority_initialized.load(Ordering::Acquire);
-        let strict_empty = (quiescing || environment.is_some())
+        let strict_empty = (admission_closed || environment.is_some())
             && !unknown
             && controllers == 0
             && holds == 0
@@ -571,7 +525,7 @@ impl crate::Adxlet {
             .runtime_rootfs_identity()
             .unwrap_or_default();
         Ok(adx_protocol::control::NodeUpgradeInspection {
-            protocol_version: 2,
+            protocol_version: 3,
             runtime_rootfs_sha256: rootfs.sha256,
             runtime_rootfs_path: rootfs.path,
             task_id: control.task_id,

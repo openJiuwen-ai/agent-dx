@@ -234,6 +234,98 @@ async fn h2_liveness_healthy_idle_and_half_close_remain_usable() {
 }
 
 #[tokio::test]
+async fn idle_barrier_preserves_keepalive_and_admits_concurrent_connects() {
+    let node = gateway()
+        .with_activity_tracker(Arc::new(super::super::activity::ActivityTracker::new(
+            "proxy",
+        )))
+        .with_route_enforcement();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    node.activate_route("instance".into(), "environment".into(), address.ip())
+        .await;
+    let mut link = link(node.clone()).await;
+    let (mut first, mut first_response) = open_stream(&mut link, address).await;
+    let (mut backend, _) = listener.accept().await.unwrap();
+    let (revision, active) = node.instance_activity("instance").unwrap();
+    assert_eq!(active, 1);
+    assert!(!node
+        .set_environment_admission("instance", "environment", revision, true)
+        .unwrap());
+    let (second, second_response) = open_stream(&mut link, address).await;
+    let (second_backend, _) = listener.accept().await.unwrap();
+    first
+        .send_data(
+            Bytes::from_static(b"GET / HTTP/1.1\r\nHost: guest\r\n\r\n"),
+            false,
+        )
+        .unwrap();
+    let mut request = [0; 31];
+    timeout(TEST_TIMEOUT, backend.read_exact(&mut request))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&request, b"GET / HTTP/1.1\r\nHost: guest\r\n\r\n");
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    timeout(TEST_TIMEOUT, backend.write_all(response))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut received = Vec::new();
+    while received.len() < response.len() {
+        let bytes = timeout(TEST_TIMEOUT, first_response.data())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        first_response
+            .flow_control()
+            .release_capacity(bytes.len())
+            .unwrap();
+        received.extend_from_slice(&bytes);
+    }
+    assert_eq!(received.as_slice(), response);
+    // A completed response does not make an open reusable CONNECT idle.
+    assert!(!node
+        .set_environment_admission("instance", "environment", revision, true)
+        .unwrap());
+    first
+        .send_data(Bytes::copy_from_slice(&request), false)
+        .unwrap();
+    timeout(TEST_TIMEOUT, backend.read_exact(&mut request))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&request, b"GET / HTTP/1.1\r\nHost: guest\r\n\r\n");
+    drop((
+        first,
+        first_response,
+        second,
+        second_response,
+        backend,
+        second_backend,
+    ));
+    wait_active(&node, 0).await;
+    assert!(!node
+        .set_environment_admission("instance", "environment", revision, true)
+        .unwrap());
+    let (current, _) = node.instance_activity("instance").unwrap();
+    assert!(node
+        .set_environment_admission("instance", "environment", current, true)
+        .unwrap());
+    assert_eq!(
+        connect_stream(&mut link, address).await.1.status(),
+        StatusCode::CONFLICT
+    );
+    node.set_environment_admission("instance", "environment", 0, false)
+        .unwrap();
+    assert_eq!(
+        connect_stream(&mut link, address).await.1.status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn h2_liveness_parent_abort_cleans_half_closed_relay() {
     let node = gateway();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

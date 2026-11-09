@@ -127,8 +127,6 @@ fn assignment() -> Assignment {
 
 fn delete_request() -> Request<pb::DeleteEnvironmentRequest> {
     let mut request = Request::new(pb::DeleteEnvironmentRequest {
-        upgrade_task_id: String::new(),
-        upgrade_epoch: 0,
         expected_revision: None,
         failed_revision: None,
 
@@ -152,8 +150,6 @@ fn coordinator_delete_request(
     node_session_id: &str,
 ) -> Request<pb::DeleteEnvironmentRequest> {
     let mut request = Request::new(pb::DeleteEnvironmentRequest {
-        upgrade_task_id: String::new(),
-        upgrade_epoch: 0,
         expected_revision,
         failed_revision,
         node_session_id: node_session_id.into(),

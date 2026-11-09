@@ -16,6 +16,8 @@ use std::{
 
 #[path = "pause_resume/publication_budget.rs"]
 mod publication_budget;
+#[path = "pause_resume/upgrade_idle.rs"]
+mod upgrade_idle;
 
 #[derive(Default)]
 struct Backend {
@@ -25,6 +27,7 @@ struct Backend {
     rejected_snapshot_records: Mutex<Vec<EnvironmentRecord>>,
     checkpoint_cleanups: Mutex<Vec<adx_core::CheckpointCleanup>>,
     execution_admission_error: Mutex<Option<Error>>,
+    execution_admission_delay: Mutex<Duration>,
     sampled_runtimes: Mutex<BTreeSet<String>>,
     checkpoint_commit_failures: Mutex<usize>,
     workload_ack_failures: Mutex<usize>,
@@ -44,9 +47,13 @@ struct Backend {
     unavailable_commit: Mutex<bool>,
     unavailable_state: Mutex<Option<EnvironmentState>>,
     fail_restore: Mutex<bool>,
+    restore_delay: Mutex<Duration>,
     unsupported_checkpoint: Mutex<bool>,
     fail_start: Mutex<bool>,
     activity: Mutex<Option<(u64, u64)>>,
+    proxy_activity: Mutex<(u64, u64, bool)>,
+    idle_race: Mutex<bool>,
+    recovery_profile: Mutex<Option<BTreeMap<String, String>>>,
     fail_prepare: Mutex<bool>,
     fail_abort: Mutex<bool>,
     fail_remove: Mutex<bool>,
@@ -75,6 +82,14 @@ impl Backend {
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    fn recovery_profile(&self, _: &EnvironmentSpec) -> Result<BTreeMap<String, String>> {
+        Ok(self
+            .recovery_profile
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| BTreeMap::from([("runtime".into(), "test".into())])))
+    }
     async fn stats(&self, id: &str) -> Result<adxlet::metrics::RuntimeUsage> {
         self.sampled_runtimes.lock().unwrap().insert(id.into());
         Ok(adxlet::metrics::RuntimeUsage {
@@ -207,6 +222,10 @@ impl RuntimeDriver for Backend {
         path: &Path,
     ) -> Result<std::net::IpAddr> {
         self.event("restore");
+        let delay = *self.restore_delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         if *self.fail_restore.lock().unwrap() {
             return Err(Error::Unavailable("restore failed".into()));
         }
@@ -220,6 +239,17 @@ impl RuntimeDriver for Backend {
 }
 #[async_trait]
 impl CheckpointCooperation for Backend {
+    async fn prepare_idle(
+        &self,
+        record: &EnvironmentRecord,
+        id: &str,
+        revision: u64,
+    ) -> Result<()> {
+        if *self.activity.lock().unwrap() != Some((revision, 0)) {
+            return Err(Error::Conflict);
+        }
+        self.prepare(record, id).await
+    }
     async fn workload_status(
         &self,
         record: &EnvironmentRecord,
@@ -317,11 +347,37 @@ impl Readiness for Backend {
 }
 #[async_trait]
 impl Routes for Backend {
+    async fn drain(&self, _: &EnvironmentRecord) -> Result<()> {
+        self.proxy_activity.lock().unwrap().2 = true;
+        loop {
+            if self.proxy_activity.lock().unwrap().1 == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn activity(&self, _: &EnvironmentRecord) -> Result<(String, u64, u64)> {
-        Ok(("proxy".into(), 1, 0))
+        let activity = self.proxy_activity.lock().unwrap();
+        Ok(("proxy".into(), activity.0 + 1, activity.1))
+    }
+
+    async fn quiesce(&self, _: &EnvironmentRecord, session: &str, revision: u64) -> Result<bool> {
+        let mut activity = self.proxy_activity.lock().unwrap();
+        if session != "proxy" || revision != activity.0 + 1 || activity.1 != 0 {
+            return Ok(false);
+        }
+        activity.2 = true;
+        if std::mem::take(&mut *self.idle_race.lock().unwrap()) {
+            let mut runtime = self.activity.lock().unwrap();
+            let revision = runtime.unwrap().0;
+            *runtime = Some((revision + 1, 0));
+        }
+        Ok(true)
     }
 
     async fn activate(&self, _: &EnvironmentRecord) -> Result<()> {
+        self.proxy_activity.lock().unwrap().2 = false;
         self.event("activate");
         Ok(())
     }
@@ -337,6 +393,10 @@ impl StateSink for Backend {
         record: &EnvironmentRecord,
         _: &str,
     ) -> Result<EnvironmentSpec> {
+        let delay = *self.execution_admission_delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         if let Some(error) = self.execution_admission_error.lock().unwrap().clone() {
             return Err(error);
         }
@@ -1913,9 +1973,35 @@ async fn failed_snapshot_copy_publishes_failure_without_booting_an_image() {
 }
 
 #[tokio::test]
+async fn transferred_checkpoint_rechecks_capture_profile_before_backend_restore() {
+    for missing in [true, false] {
+        let (_temp, backend, target, mut transferred, _) = shared_recovery_fixture().await;
+        if missing {
+            let checkpoint = transferred.checkpoint.as_mut().unwrap();
+            checkpoint.recovery_profile.clear();
+        } else {
+            *backend.recovery_profile.lock().unwrap() = Some(BTreeMap::from([(
+                "runtime".into(),
+                "changed-after-assignment".into(),
+            )]));
+        }
+        let rejected = target.recover_environment(transferred).await.unwrap();
+        assert_eq!(rejected.record.state, EnvironmentState::Failed);
+        assert!(!backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "restore"));
+        assert!(backend.running.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() {
     let (_temp, backend, node, spec, mut assignment) = fixture();
     assignment.generation = 2;
+    let recovery_profile = backend.recovery_profile(&spec).unwrap();
     let record = EnvironmentRecord {
         observation: None,
         execution_artifacts: vec![],
@@ -1931,6 +2017,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
         revision: 1,
         resources_held: false,
         checkpoint: Some(adx_core::RestorePoint {
+            recovery_profile,
             id: "recovery".into(),
             source_runtime_id: "environment-1".into(),
             expires_at_unix_seconds: None,
@@ -1969,6 +2056,233 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
     );
 }
 
+async fn shared_recovery_fixture() -> (
+    tempfile::TempDir,
+    Arc<Backend>,
+    Adxlet,
+    EnvironmentRecord,
+    Arc<object_store::memory::InMemory>,
+) {
+    use adxlet::checkpoint::{CheckpointAccess, ObjectCheckpointStore};
+    let (temp, backend, _, spec, mut assignment) = fixture();
+    let remote = Arc::new(object_store::memory::InMemory::new());
+    let store = Arc::new(
+        ObjectCheckpointStore::new(
+            "shared".into(),
+            remote.clone(),
+            "test".into(),
+            temp.path().join("source"),
+            1024,
+        )
+        .unwrap(),
+    );
+    let path = store.begin_capture().await.unwrap();
+    std::fs::write(path.join("memory"), b"actual saved memory").unwrap();
+    let artifact = store.seal(&path).await.unwrap();
+    // Use a fresh target cache so missing remote objects cannot be hidden by
+    // the source's completed local capture.
+    let store = Arc::new(
+        ObjectCheckpointStore::new(
+            "shared".into(),
+            remote.clone(),
+            "test".into(),
+            temp.path().join("target"),
+            1024,
+        )
+        .unwrap(),
+    );
+    let node = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(store, backend.clone())
+    .unwrap();
+    node.update_capacity(spec.resources, Duration::from_secs(60))
+        .unwrap();
+    assignment.generation = 2;
+    let recovery_profile = backend.recovery_profile(&spec).unwrap();
+    let seed = EnvironmentRecord {
+        observation: None,
+        execution_artifacts: vec![],
+        snapshot_source: None,
+        failure: None,
+        spec,
+        assignment,
+        runtime: adx_core::Runtime {
+            id: "environment-2".into(),
+            ip: None,
+        },
+        state: EnvironmentState::Paused,
+        revision: 1,
+        resources_held: false,
+        checkpoint: Some(adx_core::RestorePoint {
+            id: "recovery".into(),
+            source_runtime_id: "environment-1".into(),
+            expires_at_unix_seconds: None,
+            origin: Some(adx_core::runtime::RuntimeIdentity {
+                environment_id: "environment".into(),
+                runtime_id: "environment-1".into(),
+                ownership_generation: 1,
+            }),
+            recovery_profile,
+            artifact,
+        }),
+        last_operation: None,
+        restart_attempts: 0,
+        restart_pending: false,
+    };
+    (temp, backend, node, seed, remote)
+}
+
+#[tokio::test]
+async fn recovery_retries_transient_execution_admission_errors() {
+    for (error, delay) in [
+        (
+            Some(Error::Unavailable(
+                "execution authorized; scheduler reconciliation required".into(),
+            )),
+            Duration::ZERO,
+        ),
+        (
+            Some(Error::VolumeBusy("workspace-uid".into())),
+            Duration::ZERO,
+        ),
+        (Some(Error::NoCapacity), Duration::ZERO),
+        // The same initialization deadline is retryable only before restore.
+        (None, Duration::from_secs(10)),
+    ] {
+        let (_temp, backend, node, seed, _) = shared_recovery_fixture().await;
+        let node = if delay.is_zero() {
+            node
+        } else {
+            node.with_operation_timeout(Duration::from_millis(250))
+                .unwrap()
+        };
+        *backend.execution_admission_error.lock().unwrap() = error.clone();
+        *backend.execution_admission_delay.lock().unwrap() = delay;
+        let expected =
+            error.unwrap_or_else(|| Error::Unavailable("restore initialization timed out".into()));
+        assert_eq!(node.recover_environment(seed.clone()).await, Err(expected));
+        let waiting = node
+            .environment(seed.spec.clone(), seed.assignment.clone())
+            .unwrap()
+            .sync()
+            .await
+            .unwrap()
+            .record;
+        assert_eq!(waiting.state, EnvironmentState::Paused);
+        assert_eq!(waiting.checkpoint, seed.checkpoint);
+        assert!(!waiting.resources_held);
+        assert_eq!(node.used(), Resources::default());
+        assert!(!backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e == "start" || e == "restore"));
+
+        *backend.execution_admission_error.lock().unwrap() = None;
+        *backend.execution_admission_delay.lock().unwrap() = Duration::ZERO;
+        let restored = node.recover_environment(waiting.clone()).await.unwrap();
+        assert_eq!(restored.record.state, EnvironmentState::Running);
+        assert_eq!(restored.record.assignment, seed.assignment);
+        assert_eq!(node.used(), seed.spec.resources);
+        assert_eq!(
+            node.recover_environment(waiting).await.unwrap().record,
+            restored.record
+        );
+        assert_eq!(
+            backend
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| *e == "restore")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn recovery_non_retryable_failures_settle_failed_without_repeating_restore() {
+    use futures_util::TryStreamExt;
+    use object_store::{ObjectStore, ObjectStoreExt};
+    #[derive(Clone, Copy, Debug)]
+    enum Failure {
+        MissingManifest,
+        MissingData,
+        Backend,
+        RestoreTimeout,
+        AdmissionDenied,
+    }
+    for failure in [
+        Failure::MissingManifest,
+        Failure::MissingData,
+        Failure::Backend,
+        Failure::RestoreTimeout,
+        Failure::AdmissionDenied,
+    ] {
+        let (_temp, backend, node, seed, remote) = shared_recovery_fixture().await;
+        let node = if matches!(failure, Failure::RestoreTimeout) {
+            node.with_operation_timeout(Duration::from_millis(250))
+                .unwrap()
+        } else {
+            node
+        };
+        match failure {
+            Failure::MissingManifest | Failure::MissingData => {
+                let objects: Vec<_> = remote.list(None).try_collect().await.unwrap();
+                let object = objects
+                    .iter()
+                    .find(|object| {
+                        object.location.as_ref().ends_with("manifest.json")
+                            == matches!(failure, Failure::MissingManifest)
+                    })
+                    .expect("published checkpoint object");
+                remote.delete(&object.location).await.unwrap();
+            }
+            Failure::Backend => *backend.fail_restore.lock().unwrap() = true,
+            Failure::RestoreTimeout => {
+                *backend.restore_delay.lock().unwrap() = Duration::from_secs(10)
+            }
+            Failure::AdmissionDenied => {
+                *backend.execution_admission_error.lock().unwrap() =
+                    Some(adx_protocol::dependency_status(
+                        tonic::Status::permission_denied("node credentials rejected"),
+                    ))
+            }
+        }
+        let result = node
+            .recover_environment(seed.clone())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{failure:?}: expected terminal recovery result, got {error}")
+            });
+        assert_eq!(result.record.state, EnvironmentState::Failed, "{failure:?}");
+        assert!(!result.record.resources_held);
+        assert_eq!(node.used(), Resources::default());
+        assert_eq!(
+            node.recover_environment(seed).await.unwrap().record,
+            result.record
+        );
+        let events = backend.events.lock().unwrap();
+        let expected_restores = usize::from(matches!(
+            failure,
+            Failure::Backend | Failure::RestoreTimeout
+        ));
+        assert_eq!(
+            events.iter().filter(|event| *event == "restore").count(),
+            expected_restores
+        );
+        assert!(!events.iter().any(|event| event == "start"));
+        assert!(backend.running.lock().unwrap().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn recovery_retries_publication_without_repeating_backend_restore() {
     use adxlet::checkpoint::{CheckpointAccess, ObjectCheckpointStore};
@@ -1999,6 +2313,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
         node.update_capacity(spec.resources, Duration::from_secs(60))
             .unwrap();
         assignment.generation = 2;
+        let recovery_profile = backend.recovery_profile(&spec).unwrap();
         let seed = EnvironmentRecord {
             observation: None,
             execution_artifacts: vec![],
@@ -2014,6 +2329,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
             revision: 1,
             resources_held: false,
             checkpoint: Some(adx_core::RestorePoint {
+                recovery_profile,
                 id: "recovery".into(),
                 source_runtime_id: "environment-1".into(),
                 expires_at_unix_seconds: None,

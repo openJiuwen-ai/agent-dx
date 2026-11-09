@@ -349,7 +349,6 @@ impl Rig {
                 node_session_id: String::new(),
                 assignment: Some(owner.clone()),
                 caller: caller(),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -376,15 +375,7 @@ async fn volume_rig_with_mode(
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o711)).unwrap();
     std::fs::write(path.join("state"), "existing").unwrap();
     let before = std::fs::metadata(&path).unwrap();
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-    let backend = mounts
-        .lines()
-        .find_map(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            (fields[4] == "/")
-                .then(|| fields[fields.iter().position(|f| *f == "-").unwrap() + 2].to_owned())
-        })
-        .unwrap();
+    let backend = mounts::backend_id(root.path());
     let domains = std::collections::BTreeMap::from([(
         "test".into(),
         StorageDomain {
@@ -809,7 +800,6 @@ async fn failed_gc_cleans_node_controller_redis_and_allows_same_name() {
         node_session_id: "boot-a".into(),
         assignment: Some(assignment.clone()),
         caller: None,
-        ..Default::default()
     };
     let replayed = rig.coordinator_nodes[0]
         .delete_environment(replay.clone())
@@ -2034,7 +2024,6 @@ async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_account
             node_session_id: String::new(),
             assignment: running.assignment,
             caller: caller(),
-            ..Default::default()
         })
         .await
         .is_err());

@@ -1,5 +1,5 @@
 use crate::{
-    config::Deployment,
+    config::{Deployment, ShutdownMode},
     supervisor::{self, Request},
     Result,
 };
@@ -46,8 +46,12 @@ pub enum Command {
     Run,
     /// Query the running deployment supervisor.
     Status,
-    /// Drain local environments and stop the supervised services.
-    Stop,
+    /// Stop supervised services using the running supervisor's shutdown mode.
+    Stop {
+        /// Override the shutdown mode for this stop request only.
+        #[arg(long, value_enum)]
+        mode: Option<ShutdownMode>,
+    },
     /// Inspect or initialize deployment configuration.
     Config {
         #[command(subcommand)]
@@ -97,8 +101,8 @@ impl Cli {
             Command::Status => {
                 print_supervisor_response(&config_path, Request::Status).await?;
             }
-            Command::Stop => {
-                print_supervisor_response(&config_path, Request::Stop).await?;
+            Command::Stop { mode } => {
+                print_supervisor_response(&config_path, Request::Stop { mode }).await?;
             }
             Command::Config {
                 command:

@@ -98,6 +98,40 @@ async fn resume(node: &Arc<Adxlet>, record: EnvironmentRecord) -> EnvironmentRec
 }
 
 #[tokio::test]
+async fn isolated_replacement_reports_strict_empty_only_after_reconciliation() {
+    let backend = Arc::new(Backend::default());
+    let directory = tempfile::tempdir().unwrap();
+    let node = manager(&backend)
+        .with_upgrade_control(directory.path().join("upgrade.json"), "replacement".into())
+        .unwrap();
+    let control = adxlet::upgrade::NodeControl {
+        task_id: "task".into(),
+        epoch: 1,
+        node_session_id: "replacement".into(),
+        revision: 1,
+        phase: "isolated".into(),
+        ..Default::default()
+    };
+    let startup = node.apply_upgrade_control(control).await.unwrap();
+    assert!(startup.unknown);
+    assert!(!startup.strict_empty);
+
+    node.reconcile(vec![]).await.unwrap();
+    let ready = node.inspect_upgrade().await.unwrap();
+    assert_eq!(ready.phase, "isolated");
+    assert_eq!(ready.node_session_id, "replacement");
+    assert!(!ready.unknown);
+    assert!(ready.strict_empty);
+    assert!(!node.accepting_allocations());
+
+    backend.actual.lock().unwrap().push(observed("unexpected"));
+    let busy = node.inspect_upgrade().await.unwrap();
+    assert_eq!(busy.backends, 1);
+    assert!(!busy.unknown);
+    assert!(!busy.strict_empty);
+}
+
+#[tokio::test]
 async fn blocked_restore_allows_repeated_catalogs_new_creation_and_other_pause_resume() {
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() =

@@ -336,8 +336,6 @@ impl Operations {
                         .rpc(
                             "apiserver.delete",
                             node.delete_environment(trace::inject(pb::DeleteEnvironmentRequest {
-                                upgrade_task_id: String::new(),
-                                upgrade_epoch: 0,
                                 expected_revision: None,
                                 failed_revision: None,
                                 node_session_id: String::new(),

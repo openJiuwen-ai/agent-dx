@@ -35,7 +35,7 @@ impl UpgradeOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
+#[serde(try_from = "UpgradeTaskWire")]
 pub struct UpgradeTask {
     pub protocol_version: u32,
     pub task_id: String,
@@ -47,19 +47,93 @@ pub struct UpgradeTask {
     pub phase: String,
     pub nodes: BTreeMap<String, UpgradeNode>,
     pub operations: BTreeMap<String, UpgradeOperation>,
-    pub canaries: BTreeMap<String, String>,
-    pub revoked_canaries: std::collections::BTreeSet<String>,
-    pub cleaned_canaries: std::collections::BTreeSet<String>,
 }
+
+// Only fully settled legacy terminal records may be replaced by a new task.
+// Their probe history is read as evidence, never carried into the v3 workflow.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UpgradeTaskWire {
+    protocol_version: u32,
+    task_id: String,
+    epoch: u64,
+    namespace: String,
+    daemonset_uid: String,
+    target_image: String,
+    revision: u64,
+    phase: String,
+    nodes: BTreeMap<String, UpgradeNode>,
+    operations: BTreeMap<String, UpgradeOperation>,
+    canaries: Option<BTreeMap<String, String>>,
+    revoked_canaries: Option<BTreeSet<String>>,
+    cleaned_canaries: Option<BTreeSet<String>>,
+}
+
+impl TryFrom<UpgradeTaskWire> for UpgradeTask {
+    type Error = String;
+    fn try_from(value: UpgradeTaskWire) -> std::result::Result<Self, Self::Error> {
+        let legacy = (
+            &value.canaries,
+            &value.revoked_canaries,
+            &value.cleaned_canaries,
+        );
+        match (value.protocol_version, legacy) {
+            (3, (None, None, None)) => (),
+            (2, (Some(canaries), Some(revoked), Some(cleaned)))
+                if matches!(value.phase.as_str(), "Completed" | "Aborted")
+                    && value.operations.values().all(UpgradeOperation::settled)
+                    && canaries
+                        .keys()
+                        .all(|id| revoked.contains(id) && cleaned.contains(id)) => {}
+            _ => {
+                return Err(
+                    "finish legacy upgrade tasks with their original version before starting v3"
+                        .into(),
+                )
+            }
+        }
+        Ok(Self {
+            protocol_version: value.protocol_version,
+            task_id: value.task_id,
+            epoch: value.epoch,
+            namespace: value.namespace,
+            daemonset_uid: value.daemonset_uid,
+            target_image: value.target_image,
+            revision: value.revision,
+            phase: value.phase,
+            nodes: value.nodes,
+            operations: value.operations,
+        })
+    }
+}
+
 impl UpgradeTask {
     pub(crate) fn require_protocol(&self) -> Result<()> {
-        if self.protocol_version != 2 {
-            return Err(Error::Invalid("upgrade task protocol version 2 required; finish legacy tasks with their original version".into()));
+        if self.protocol_version != 3 {
+            return Err(Error::Invalid("upgrade task protocol version 3 required; finish legacy tasks with their original version".into()));
         }
         Ok(())
     }
     pub fn active(&self) -> bool {
         !matches!(self.phase.as_str(), "Completed" | "Aborted")
+    }
+    pub(crate) fn migration_operation(
+        &self,
+        source: &Assignment,
+        target: &Assignment,
+    ) -> Option<&UpgradeOperation> {
+        (self.phase == "Active").then_some(())?;
+        self.operations.values().find(|operation| {
+            operation.environment_id == source.environment_id
+                && operation.source_node_id == source.node_id
+                && operation.source_generation == source.generation
+                && operation.target_node_id == target.node_id
+                && matches!(operation.phase.as_str(), "Prepared" | "Assigned")
+                && self.nodes.get(&source.node_id).is_some_and(|node| {
+                    node.phase == "evacuating"
+                        && node.node_session_id == operation.source_session_id
+                })
+        })
     }
     pub(crate) fn blocks_resume(&self, stored: &StoredEnvironment) -> bool {
         self.active()
@@ -104,16 +178,6 @@ impl UpgradeTask {
     }
 }
 impl Session {
-    /// Reserved probe names never become ordinary user creations after a task ends.
-    pub(crate) async fn check_canary_creation(&self, id: &str) -> Result<()> {
-        if !id.starts_with(UPGRADE_CANARY_PREFIX) {
-            return Ok(());
-        }
-        let [header, task] = self.store.fields([HEADER.into(), UPGRADE.into()]).await?;
-        self.header(&header)?;
-        canary_creation(id, task.as_deref())
-    }
-
     pub(crate) async fn confirmed_deletion(
         &self,
         id: &str,

@@ -15,6 +15,9 @@ pub(crate) struct LocalHold {
 }
 impl Adxlet {
     pub fn reserve_local(&self, spec: &EnvironmentSpec) -> Result<LocalReservation> {
+        if self.is_stopping() {
+            return Err(Error::Unavailable("node is stopping".into()));
+        }
         if self
             .authority_reconciling
             .load(std::sync::atomic::Ordering::Acquire)
@@ -24,11 +27,6 @@ impl Adxlet {
             ));
         }
         spec.validate()?;
-        // Probe creations need the Coordinator's durable task/ID fence. Do not
-        // leave an unconfirmed local hold when that authorization is revoked.
-        if spec.id.starts_with("default-upgrade-canary-") {
-            return Err(Error::NoCapacity);
-        }
         if self.is_draining() {
             return Err(Error::Unavailable("node draining".into()));
         }
@@ -60,8 +58,8 @@ impl Adxlet {
             .admission
             .lock()
             .expect("shared state lock poisoned");
-        // Local-first claims have no assignment yet; upgrade canaries use the
-        // Coordinator-assigned path instead of an unversioned local reservation.
+        // Local-first claims have no assignment yet; node upgrade isolation
+        // still applies to their tentative reservation.
         self.services.upgrade.record_action(&spec.id, 0, "create")?;
         let devices = select_devices(&spec.scheduling.devices, &admission.devices.available())?;
         let token = format!("local-claim:{}", uuid::Uuid::new_v4());

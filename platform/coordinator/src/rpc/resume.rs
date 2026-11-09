@@ -1,7 +1,6 @@
 //! One durable on-demand restore path for public resume and Ingress demand.
 use super::*;
 use crate::storage::ResumeAdmission;
-use adx_core::scheduling::{LabelRequirement, LabelSelector, SelectorOp};
 
 impl CoordinatorRpc {
     pub(super) async fn retire_dormant(
@@ -260,44 +259,24 @@ impl CoordinatorRpc {
                         .prepare_volumes(&stored.spec, &domains)
                         .await
                         .map_err(status)?;
-                    let mut spec = stored.spec.clone();
-                    if spec.scheduling.required_node.is_empty() {
-                        spec.scheduling.required_node.push(LabelSelector::default());
-                    }
-                    for selector in &mut spec.scheduling.required_node {
-                        let alias = stored
-                            .result
-                            .as_ref()
-                            .and_then(|r| r.checkpoint.as_ref().or(r.snapshot_source.as_ref()))
-                            .ok_or_else(|| {
-                                Status::failed_precondition("resume checkpoint missing")
-                            })?
-                            .artifact
-                            .storage
-                            .clone();
-                        selector.expressions.push(LabelRequirement {
-                            key: "ADX_CHECKPOINT_STORAGE".into(),
-                            op: SelectorOp::In,
-                            values: vec![alias],
-                        });
-                        selector.expressions.push(LabelRequirement {
-                            key: "NODE_ID".into(),
-                            op: SelectorOp::NotIn,
-                            values: stored
-                                .resume
+                    let point = stored
+                        .result
+                        .as_ref()
+                        .and_then(|record| {
+                            record
+                                .checkpoint
                                 .as_ref()
-                                .map(|r| {
-                                    r.rejected_nodes
-                                        .iter()
-                                        .cloned()
-                                        .chain(std::iter::once(stored.assignment.node_id.clone()))
-                                        .collect::<std::collections::BTreeSet<_>>()
-                                        .into_iter()
-                                        .collect()
-                                })
-                                .unwrap_or_else(|| vec![stored.assignment.node_id.clone()]),
-                        });
-                    }
+                                .or(record.snapshot_source.as_ref())
+                        })
+                        .ok_or_else(|| Status::failed_precondition("resume checkpoint missing"))?;
+                    let excluded = stored
+                        .resume
+                        .as_ref()
+                        .map(|intent| intent.rejected_nodes.clone())
+                        .unwrap_or_default();
+                    let spec =
+                        recovery::checkpoint_spec(&stored, Some(point), None, &excluded, None)
+                            .map_err(status)?;
                     if state
                         .scheduler
                         .requests

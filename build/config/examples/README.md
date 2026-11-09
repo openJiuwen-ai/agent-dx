@@ -49,7 +49,7 @@ admission. The file reader is separate from the implemented sandboxd collector a
 Node startup obtains the complete authoritative catalog before reconciling
 managed runtimes. It restores committed running Environments and cleans runtimes
 confirmed unowned or left by uncommitted starts. An unavailable Coordinator never
-means an empty catalog. Explicit CLI stop performs local Environment cleanup before service shutdown.
+means an empty catalog. Deployment examples use the default `shutdown_mode: preserve` to skip Environment drain for both plain `adxctl stop` and supervisor SIGTERM/SIGINT. `adxctl stop --mode preserve|drain` overrides one stop request; plain stop uses the running supervisor's startup configuration even if the YAML has changed. Use `adxctl stop --mode drain` for destructive cleanup. Adxctl sends SIGUSR1 to adxlet for preserve and SIGTERM after explicit drain; other services use SIGTERM. Adxlet closes new admission on shutdown, keeps heartbeats and runtime control alive throughout embedded Relay drain, then exits without unregistering the node in preserve mode. Preserve still stops supervised processes and does not itself guarantee runtime survival or recovery.
 
 
 Coordinator publishes its `advertised_address` in Redis with a renewable lease
@@ -100,6 +100,8 @@ Coordinator examples enable `autoscaling_listen: 127.0.0.1:19092` for direct HTT
 For S3-compatible, AFS, or JuiceFS checkpoint storage, replace `checkpoint_dir` with the `checkpoint_storage` object in the [checkpoint storage example](../../../docs/testing/snapshot-storage.md). Its optional `cache_max_entries` and `cache_budget_bytes` default to 500 and 53,687,091,200 (50 GiB). They bound reusable local copies; restore downloads and runtime-owned files can exceed those cache limits and still require real free disk space.
 
 Configure matching `checkpoint_reclaimers` on Coordinator for every shared storage alias. Coordinator deletes shared objects/directories; adxlet only manages local files and cache eviction. AFS requires the same DFS namespace mounted on Coordinator and workers.
+
+Cross-node Resume/Recover and planned migration require capture-time recovery evidence. In the Adxlet service's `config`, explicitly set `checkpoint_runtime_binaries: {runsc: /absolute/path/to/runsc}` to the executable actually configured in sandboxd. This opt-in currently qualifies only default-rootfs runsc on homogeneous Linux hosts: the node measures executable bytes, rootfs identity, kernel release and stable CPU identity/features; these files must remain immutable for the node session. It overwrites reserved `ADX_RECOVERY_*` and `ADX_CHECKPOINT_SCOPE` labels with measured values. Missing evidence or a changed target profile blocks cross-node recovery. Qualify the target image independently before starting maintenance. Existing checkpoints without evidence retain local recovery, and must be recaptured before cross-node recovery. Custom roots, other runtimes and heterogeneous host compatibility remain unqualified.
 
 `node-jiuwenbox.json` 是 Jiuwenbox／Conch 的 adxlet 配置示例；替换 EROFS SHA256、Conch socket、镜像绑定和证书路径后使用。Linux 前置条件、配置语义及未完成的运行时验收见 [Jiuwenbox P0](../../../docs/testing/jiuwenbox-runtime.md)。
 

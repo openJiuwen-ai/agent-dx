@@ -395,6 +395,7 @@ impl super::Controller {
             return Err(error);
         }
         self.record.snapshot_source = Some(adx_core::RestorePoint {
+            recovery_profile: Default::default(),
             id: snapshot.id.clone(),
             artifact: snapshot.artifact.clone(),
             expires_at_unix_seconds: None,

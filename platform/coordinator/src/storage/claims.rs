@@ -133,7 +133,6 @@ impl Session {
             let header = self.header(&header_value)?;
             let node = self.get_node(&candidate.node_id).await?;
             let _ = node_value;
-            canary_creation(&spec.id, upgrade_value.as_deref())?;
             if node.node.id != candidate.node_id
                 || node.shard_id >= header.shards
                 || node
@@ -338,7 +337,6 @@ impl Session {
             let mut writing_nodes = BTreeMap::new();
             for ((spec, candidate), pinned) in claims.iter().zip(&pinned) {
                 let result = (|| {
-                    canary_creation(&spec.id, upgrade.as_deref())?;
                     let node = nodes.get(&candidate.node_id).ok_or(Error::NotFound)?;
                     if node.node.id != candidate.node_id
                         || node.shard_id >= header.shards

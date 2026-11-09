@@ -15,8 +15,9 @@ service RelayService {
 message EnvironmentAdmissionRequest {
   string environment_id = 1; string runtime_id = 2; string proxy_session_id = 3;
   uint64 activity_revision = 4; bool close = 5;
-  // Planned migration: close admission even with active streams. Existing
-  // streams remain connected; the caller must await zero activity before retire.
+  // Explicit draining closes admission even with active streams. Planned
+  // migrations instead close only against an observed idle activity revision.
+  // Existing streams stay connected; await zero activity before retirement.
   bool drain = 6;
   // Fence delayed close calls after reopen and after controller reconciliation.
   uint64 sync_epoch = 7; uint64 admission_revision = 8;

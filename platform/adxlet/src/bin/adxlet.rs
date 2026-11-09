@@ -70,6 +70,8 @@ struct Config {
     #[serde(default)]
     runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     #[serde(default)]
+    checkpoint_runtime_binaries: std::collections::BTreeMap<String, PathBuf>,
+    #[serde(default)]
     execd_command: Vec<String>,
     #[serde(default)]
     execd_env: HashMap<String, String>,
@@ -129,6 +131,8 @@ fn coordinator_channel(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
+    let mut preserve =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
     if config.sandboxd_socket.is_none() && config.jiuwenbox.is_none() {
         return Err("configure sandboxd_socket and/or jiuwenbox".into());
     }
@@ -249,6 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
     let runtime_config = RuntimeConfig {
         runtime_profile: config.runtime_profile,
+        checkpoint_runtime_binaries: config.checkpoint_runtime_binaries,
         command: config.execd_command,
         env,
         cwd: "/".into(),
@@ -312,17 +317,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("configure only one of checkpoint_dir and checkpoint_storage".into())
         }
     };
-    let checkpoint_scopes = checkpoint_storage
-        .as_ref()
-        .and_then(adxlet::checkpoint::StorageConfig::shared_scope)
-        .into_iter()
-        .collect();
+    let mut checkpoint_scopes = Vec::new();
     if let Some(storage) = checkpoint_storage {
+        let storage = storage.build_for_node(config.node_id.clone(), session_id.clone())?;
+        checkpoint_scopes.extend(storage.shared_scope().map(str::to_owned));
         manager = manager
-            .with_checkpointing(
-                storage.build_for_node(config.node_id.clone(), session_id.clone())?,
-                Arc::new(control.clone()),
-            )?
+            .with_checkpointing(storage, Arc::new(control.clone()))?
             .with_snapshot_catalog(sink.clone())?;
     }
     let manager = Arc::new(manager);
@@ -344,7 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     manager.update_capacity(o.capacity, valid)?;
     manager.update_devices(o.devices.clone(), valid)?;
-    let mut embedded = if config.proxy_mode == adxlet::proxy::ProxyMode::Embedded {
+    let embedded = if config.proxy_mode == adxlet::proxy::ProxyMode::Embedded {
         adx_process::resource::raise_nofile_soft_limit_from_env()?;
         Some(
             adxlet::proxy::EmbeddedProxy::start(
@@ -357,6 +357,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut labels = config.labels;
+    labels.retain(|key, _| !key.starts_with("ADX_RECOVERY_") && key != "ADX_CHECKPOINT_SCOPE");
+    labels.extend(runtime.recovery_labels());
+    if let Some(scope) = checkpoint_scopes.first() {
+        labels.insert("ADX_CHECKPOINT_SCOPE".into(), scope.clone());
+    }
     if let Some(alias) = manager.checkpoint_storage_alias() {
         labels.insert("ADX_CHECKPOINT_STORAGE".into(), alias.into());
     }
@@ -545,26 +550,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok::<(), tonic::transport::Error>(())
     };
-    let proxy_failure = async {
-        match &mut embedded {
-            Some(proxy) => proxy.failed().await,
-            None => std::future::pending::<adx_core::Result<()>>().await,
+    let services = async {
+        tokio::select! {
+            result = control_server => result?,
+            result = &mut server => result?,
+            result = report => result?,
+            result = metrics => result?,
+            _ = claim_retries => {}
+            _ = monitoring => {}
+            _ = log_gc => {}
+            result = admin => result.map_err(|error| -> Box<dyn std::error::Error> { error })?,
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+    let shutdown = async {
+        tokio::select! {
+            _ = preserve.recv() => adxlet::proxy::ShutdownMode::Preserve,
+            _ = shutdown() => adxlet::proxy::ShutdownMode::Drain,
         }
     };
-    tokio::select! {
-        result = proxy_failure => result?,
-        result = control_server => result?,
-        result = &mut server => result?,
-        result = report => result?,
-        result = metrics => result?,
-        _ = claim_retries => {}
-        _ = monitoring => {}
-        _ = log_gc => {}
-        result = admin => result.map_err(|error| -> Box<dyn std::error::Error> { error })?,
-        _ = shutdown() => {}
-    }
-    manager.set_maintenance(true);
-    if let Err(error) = adxlet::node_reconciliation::unregister_node(
+    let mode = adxlet::proxy::serve_until_shutdown(&manager, embedded, services, shutdown).await?;
+    if let Err(error) = adxlet::node_reconciliation::finish_shutdown(
+        mode,
         &mut coordinator,
         &registration,
         timeout.min(Duration::from_secs(5)),
@@ -572,9 +579,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     {
         adx_observability::warn!(%error, "planned node departure unconfirmed; heartbeat expiry remains active");
-    }
-    if let Some(proxy) = embedded {
-        proxy.shutdown().await?;
     }
     Ok(())
 }

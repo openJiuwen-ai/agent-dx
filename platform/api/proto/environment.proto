@@ -175,9 +175,7 @@ message DeleteEnvironmentRequest {
   reserved 5;
   // Coordinator-owned preparation cleanup: exact lifecycle revision, with session fencing.
   optional uint64 expected_revision = 6;
-  // Trusted Coordinator probe cleanup only; ordinary API/GC callers leave these empty.
-  string upgrade_task_id = 7;
-  uint64 upgrade_epoch = 8;
+  reserved 7, 8;
 }
 
 message CommitEnvironmentRequest {

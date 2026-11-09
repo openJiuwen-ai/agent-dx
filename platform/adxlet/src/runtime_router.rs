@@ -16,6 +16,13 @@ pub struct RuntimeRouter {
     jiuwenbox: Option<Jiuwenbox>,
 }
 impl RuntimeRouter {
+    pub fn recovery_labels(&self) -> std::collections::BTreeMap<String, String> {
+        self.sandboxd
+            .as_ref()
+            .map(Sandboxd::recovery_labels)
+            .unwrap_or_default()
+    }
+
     pub fn new(sandboxd: Option<Sandboxd>, jiuwenbox: Option<Jiuwenbox>) -> Result<Self> {
         if sandboxd.is_none() && jiuwenbox.is_none() {
             return Err(Error::Invalid(
@@ -76,6 +83,13 @@ impl RuntimeRouter {
 
 #[async_trait]
 impl RuntimeDriver for RuntimeRouter {
+    fn recovery_profile(
+        &self,
+        spec: &EnvironmentSpec,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        self.class(&spec.runtime_class)?.recovery_profile(spec)
+    }
+
     fn runtime_rootfs_identity(&self) -> Option<crate::RuntimeRootfsIdentity> {
         self.sandboxd
             .as_ref()

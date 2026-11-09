@@ -43,6 +43,54 @@ struct Action {
 fn parse<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|_| Error::Invalid("invalid upgrade request".into()))
 }
+
+fn replacement_binding(
+    task: &UpgradeTask,
+    request: &Action,
+    current: &StoredNode,
+    observation: &pb::NodeUpgradeInspection,
+) -> Result<bool> {
+    let session = &current.session.as_ref().ok_or(Error::Conflict)?.id;
+    let previous = task.nodes.get(&request.node_id);
+    if previous
+        .is_some_and(|node| node.pod_uid == request.pod_uid && node.node_session_id == *session)
+    {
+        return Ok(false);
+    }
+    if request.delete_intent
+        || request.pod_uid.is_empty()
+        || request.node_session_id != *session
+        || observation.protocol_version != 3
+        || observation.node_session_id != *session
+        || observation.task_id != task.task_id
+        || observation.epoch != task.epoch
+        || observation.phase != "isolated"
+        || observation.unknown
+        || !observation.strict_empty
+        || !current.scheduling_paused
+        || current
+            .upgrade_pause
+            .as_ref()
+            .is_none_or(|owner| owner.task_id != task.task_id || owner.epoch != task.epoch)
+        || task.operations.values().any(|operation| {
+            !operation.settled()
+                && (operation.source_node_id == request.node_id
+                    || operation.target_node_id == request.node_id)
+        })
+        || previous.is_some_and(|node| {
+            node.phase != "quiescing"
+                || node.permit_id.is_none()
+                || node.delete_resource_version.is_none()
+                || node.pod_uid == request.pod_uid
+                || node.node_session_id == *session
+                || observation.revision < node.control_revision
+        })
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(true)
+}
+
 fn evidence(i: &pb::NodeUpgradeInspection, node: Option<&UpgradeNode>, id: &str) -> Value {
     json!({"task_id":i.task_id,"epoch":i.epoch,"node_id":id,
         "node_session_id":i.node_session_id,"pod_uid":node.map(|n| &n.pod_uid),"revision":i.revision,
@@ -90,9 +138,9 @@ impl CoordinatorRpc {
             .await
             .map_err(adx_protocol::dependency_status)?
             .into_inner();
-        if view.protocol_version != 2 || &view.node_session_id != session {
+        if view.protocol_version != 3 || &view.node_session_id != session {
             return Err(Error::Invalid(
-                "node upgrade protocol version 2 and matching process session required".into(),
+                "node upgrade protocol version 3 and matching process session required".into(),
             ));
         }
         Ok((client, view))
@@ -234,8 +282,8 @@ impl CoordinatorRpc {
                 .ok_or(Error::NotFound)?;
             if method == hyper::Method::GET && suffix == "capabilities" {
                 return Ok(
-                    json!({"version":1,"node_protocol_version":2,"planned_migration":true,"paused_transfer":true,
-                "quiesce":true,"session_isolation":true,"canary":true,"canary_cleanup":true,"runtime_rootfs_identity":true}),
+                    json!({"version":2,"node_protocol_version":3,"planned_migration":true,"paused_transfer":true,
+                "quiesce":true,"session_isolation":true,"recovery_compatibility":true,"runtime_rootfs_identity":true}),
                 );
             }
             if method == hyper::Method::GET {
@@ -255,7 +303,7 @@ impl CoordinatorRpc {
                     if task.task_id != id {
                         return Err(Error::NotFound);
                     }
-                    if task.active() && task.protocol_version == 2 {
+                    if task.active() && task.protocol_version == 3 {
                         self.observe_upgrade_operations(&mut task).await?;
                     }
                     return serde_json::to_value(task).map_err(|_| Error::Conflict);
@@ -295,7 +343,7 @@ impl CoordinatorRpc {
             task.fence(id, request.epoch)?;
             self.observe_upgrade_operations(&mut task).await?;
             if task.phase == "Aborting"
-                && !matches!(action, "abort" | "revoke-delete" | "revoke-canary")
+                && !matches!(action, "abort" | "revoke-delete")
                 && !request.rollback
             {
                 return Err(Error::Conflict);
@@ -360,8 +408,10 @@ impl CoordinatorRpc {
                     if request.rollback && task.phase != "Aborting" {
                         return Err(Error::Conflict);
                     }
-                    self.bind_node(&mut task, &request, request.rollback)
-                        .await?;
+                    let current = self.upgrade_node(&request.node_id).await?;
+                    let observation = self.node_view(&current, "").await?;
+                    let replacement = replacement_binding(&task, &request, &current, &observation)?;
+                    self.bind_node(&mut task, &request, replacement).await?;
                     self.set_upgrade_scheduling(&task, &request.node_id, true)
                         .await?;
                     if request.delete_intent {
@@ -411,144 +461,36 @@ impl CoordinatorRpc {
                     // An already cleared intent is a same-binding no-op. In
                     // particular, retain any new permit not yet confirmed for DELETE.
                 }
-                "authorize-canary" => {
-                    if request
-                        .expected_target_control_revision
-                        .is_some_and(|expected| {
-                            expected
-                                != task
-                                    .nodes
-                                    .get(&request.target_node_id)
-                                    .map_or(0, |node| node.control_revision)
-                        })
-                    {
-                        return Err(Error::Conflict);
-                    }
-                    if request.environment_id.is_empty()
-                        || request.target_node_id.is_empty()
-                        || request.target_pod_uid.is_empty()
-                        || request.environment_namespace != "default"
-                    {
-                        return Err(Error::Invalid(
-                            "canary name, SDK namespace and target identity required".into(),
-                        ));
-                    }
-                    let canonical = format!(
-                        "{}-{}",
-                        request.environment_namespace, request.environment_id
-                    );
-                    if !canonical.starts_with(crate::storage::UPGRADE_CANARY_PREFIX)
-                        || task.revoked_canaries.contains(&canonical)
-                        || task
-                            .canaries
-                            .get(&canonical)
-                            .is_some_and(|target| target != &request.target_node_id)
-                    {
-                        return Err(Error::Conflict);
-                    }
-                    let source = self.upgrade_node(&request.node_id).await?;
-                    let destination = self.upgrade_node(&request.target_node_id).await?;
-                    if request.checkpoint_storage_alias.is_empty()
-                        || request.checkpoint_storage_alias == "local"
-                        || source.node.labels.get("ADX_CHECKPOINT_STORAGE")
-                            != Some(&request.checkpoint_storage_alias)
-                        || destination.node.labels.get("ADX_CHECKPOINT_STORAGE")
-                            != Some(&request.checkpoint_storage_alias)
-                        || !shared_checkpoint_compatible(&source, &destination)
-                    {
-                        return Err(Error::Invalid(
-                            "canary requires the same shared checkpoint storage on both nodes"
-                                .into(),
-                        ));
-                    }
-                    self.require_matching_rootfs(&source, &destination, None)
-                        .await?;
-                    let target = Action {
-                        node_id: request.target_node_id.clone(),
-                        pod_uid: request.target_pod_uid.clone(),
-                        node_session_id: String::new(),
-                        ..request.clone()
-                    };
-                    self.bind_node(&mut task, &target, true).await?;
-                    self.set_upgrade_scheduling(&task, &target.node_id, true)
-                        .await?;
-
-                    task.canaries
-                        .insert(canonical.clone(), target.node_id.clone());
-                    task = self.save_task(task).await?;
-                    self.control(
-                        &mut task,
-                        &target.node_id,
-                        "canary",
-                        vec![pb::NodeUpgradeGrant {
-                            environment_id: canonical.clone(),
-                            assignment_generation: 0,
-                            actions: vec![
-                                "create".into(),
-                                "resume".into(),
-                                "recover".into(),
-                                "route".into(),
-                            ],
-                        }],
-                    )
-                    .await?;
-                    // The healthy source retains normal admission while one task-owned canary may pause.
-                    let source = self.upgrade_node(&request.node_id).await?;
-                    if source.scheduling_paused || request.node_id == target.node_id {
-                        return Err(Error::Conflict);
-                    }
-                    let phase = task
-                        .nodes
-                        .get(&request.node_id)
-                        .ok_or(Error::Conflict)?
-                        .phase
-                        .clone();
-                    self.control_with_phase(
-                        &mut task,
-                        &request.node_id,
-                        "verified",
-                        &phase,
-                        vec![pb::NodeUpgradeGrant {
-                            environment_id: canonical.clone(),
-                            assignment_generation: 0,
-                            actions: vec![
-                                "create".into(),
-                                "adopt".into(),
-                                "route".into(),
-                                "pause".into(),
-                            ],
-                        }],
-                    )
-                    .await?;
-                    return Ok(
-                        json!({"environment_id":canonical,"name":request.environment_id,"ready":true,
-                    "source_node_id":request.node_id,"checkpoint_storage_alias":request.checkpoint_storage_alias}),
-                    );
-                }
-                "revoke-canary" => {
-                    let id = &request.environment_id;
-                    if !task.canaries.contains_key(id) {
-                        return Err(Error::Conflict);
-                    }
-                    if task.revoked_canaries.contains(id) && task.cleaned_canaries.contains(id) {
-                        return Ok(
-                            json!({"environment_id":id,"revoked":true,"creation_fenced":true,"cleanup_confirmed":true}),
-                        );
-                    }
-                    if task.revoked_canaries.insert(id.clone()) {
-                        task = self.save_task(task).await?;
-                    }
-                    Box::pin(self.fence_canaries(&mut task)).await?;
-                    let cleaned = Box::pin(self.cleanup_canary(&task, id)).await?;
-                    if cleaned {
-                        task.cleaned_canaries.insert(id.clone());
-                        self.save_task(task).await?;
-                    }
-                    return Ok(json!({"environment_id":id,"revoked":true,
-                    "creation_fenced":true,"cleanup_confirmed":cleaned}));
-                }
                 "verify-node" => {
                     self.bind_node(&mut task, &request, false).await?;
+                    let target = self.upgrade_node(&request.node_id).await?;
+                    let inspection = self.node_view(&target, "").await?;
+                    let scope = target.node.labels.get("ADX_CHECKPOINT_SCOPE");
+                    if inspection.unknown
+                        || target
+                            .session
+                            .as_ref()
+                            .is_none_or(|session| !session.routable)
+                        || target.checkpoint_gc_fenced
+                        || scope.is_none_or(|scope| {
+                            scope.is_empty() || !target.checkpoint_scopes.contains(scope)
+                        })
+                        || target.node.labels.get("ADX_RECOVERY_ROOTFS_SHA256")
+                            != Some(&inspection.runtime_rootfs_sha256)
+                        || target.node.labels.get("ADX_RECOVERY_ROOTFS_PATH")
+                            != Some(&inspection.runtime_rootfs_path)
+                        || !target.node.runtime_classes.iter().any(|runtime| {
+                            crate::storage::recovery_profile_requirements(
+                                runtime,
+                                &target.node.labels,
+                            )
+                            .is_ok()
+                        })
+                    {
+                        return Err(Error::Invalid(
+                            "node recovery capabilities are unavailable or unverified".into(),
+                        ));
+                    }
                     let node = task.nodes.get(&request.node_id).ok_or(Error::Conflict)?;
                     if node.phase != "verified" {
                         if node.permit_id.as_deref() != Some(&request.permit_id)
@@ -577,29 +519,7 @@ impl CoordinatorRpc {
                 }
                 "abort" if request.stage == "freeze" => {
                     task.phase = "Aborting".into();
-                    task.revoked_canaries.extend(task.canaries.keys().cloned());
                     task = self.save_task(task).await?;
-                    if task
-                        .canaries
-                        .keys()
-                        .any(|id| !task.cleaned_canaries.contains(id))
-                    {
-                        Box::pin(self.fence_canaries(&mut task)).await?;
-                    }
-                    let candidates: Vec<_> = task
-                        .nodes
-                        .values()
-                        .filter(|node| {
-                            node.phase == "canary"
-                                && task.canaries.iter().any(|(id, target)| {
-                                    target == &node.node_id && !task.cleaned_canaries.contains(id)
-                                })
-                        })
-                        .map(|node| node.node_id.clone())
-                        .collect();
-                    for id in candidates {
-                        self.control(&mut task, &id, "quiescing", vec![]).await?;
-                    }
                     self.cancel_prepared_operations(&mut task).await?;
                 }
                 "abort" if request.stage == "restore-original" => {
@@ -718,167 +638,7 @@ impl CoordinatorRpc {
         }
         Ok(())
     }
-    // Removing a probe grant keeps healthy peers open to unrelated work. Applying
-    // the higher revision also drains that ID's previously accepted effects.
-    async fn fence_canaries(&self, task: &mut UpgradeTask) -> Result<()> {
-        for node_id in task.nodes.keys().cloned().collect::<Vec<_>>() {
-            let node = self.upgrade_node(&node_id).await?;
-            let session = node.session.as_ref().ok_or(Error::Conflict)?;
-            if session.id != task.nodes[&node_id].node_session_id {
-                return Err(Error::Conflict);
-            }
-            let current = self.node_view(&node, "").await?;
-            if current
-                .grants
-                .iter()
-                .any(|grant| task.revoked_canaries.contains(&grant.environment_id))
-                || current.revision < task.nodes[&node_id].control_revision
-            {
-                let grants = current
-                    .grants
-                    .into_iter()
-                    .filter(|grant| !task.revoked_canaries.contains(&grant.environment_id))
-                    .collect();
-                let workflow = task.nodes[&node_id].phase.clone();
-                let phase = if workflow == "quiescing"
-                    || task.nodes[&node_id].delete_resource_version.is_some()
-                {
-                    "quiescing"
-                } else {
-                    current.phase.as_str()
-                };
-                self.control_with_phase(task, &node_id, phase, &workflow, grants)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn canary_local_empty(&self, task: &UpgradeTask, id: &str) -> Result<bool> {
-        for node_id in task.nodes.keys() {
-            let node = self.upgrade_node(node_id).await?;
-            let session = node.session.as_ref().ok_or(Error::Conflict)?;
-            if session.id != task.nodes[node_id].node_session_id {
-                return Err(Error::Conflict);
-            }
-            let view = self.node_view(&node, id).await?;
-            if view.unknown || !view.strict_empty || view.environment.is_some() {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    async fn cleanup_canary(&self, task: &UpgradeTask, id: &str) -> Result<bool> {
-        let session = {
-            let mut state = self.0.state.lock().await;
-            if state.claims_in_flight.contains_key(id) {
-                return Ok(false);
-            }
-            state.session.claim_barrier().await?;
-            state.recover_authoritative_state().await?;
-            // A revoked, unassigned center request must not be requeued by a
-            // later authoritative rebuild or resumed constructor.
-            if !state.environments.contains_key(id) {
-                state.scheduler.cancel_pending(id);
-                state.specs.remove(id);
-                state.scheduling_deadlines.remove(id);
-            }
-            self.0.changed.notify_waiters();
-            state.session.clone()
-        };
-        match session.get(id).await {
-            Ok(stored) => {
-                let node = self.upgrade_node(&stored.assignment.node_id).await?;
-                let node_session = node.session.as_ref().ok_or(Error::Conflict)?.id.clone();
-                let response = self
-                    .checked_node(&node, "")
-                    .await?
-                    .0
-                    .delete_environment(pb::DeleteEnvironmentRequest {
-                        assignment: Some(stored.assignment.clone().try_into()?),
-                        caller: None,
-                        failed_revision: None,
-                        node_session_id: node_session.clone(),
-                        expected_revision: None,
-                        upgrade_task_id: task.task_id.clone(),
-                        upgrade_epoch: task.epoch,
-                    })
-                    .await;
-                match response {
-                    Ok(response) => {
-                        let result = response.into_inner();
-                        let record: EnvironmentRecord =
-                            result.record.ok_or(Error::Conflict)?.try_into()?;
-                        if result.durability != pb::Durability::Published as i32
-                            || record.assignment != stored.assignment
-                            || record.state != EnvironmentState::Deleted
-                            || record.resources_held
-                        {
-                            return Ok(false);
-                        }
-                        self.commit(record, node_session).await?;
-                    }
-                    Err(_)
-                        if stored.result.is_none() && self.canary_local_empty(task, id).await? =>
-                    {
-                        // No Controller ever accepted this pending assignment.
-                        // Its ID is durably revoked, all creation producers have
-                        // fenced, and node-local execution/hold inventory is empty.
-                        let mut record = stored.effective_record();
-                        record.state = EnvironmentState::Deleted;
-                        record.revision = 1;
-                        record.resources_held = false;
-                        record.runtime.ip = None;
-                        self.commit(record, node_session).await?;
-                    }
-                    Err(_) => return Ok(false),
-                }
-            }
-            Err(Error::NotFound) => (),
-            Err(error) => return Err(error),
-        }
-        let snapshot = session.snapshot().await?;
-        if snapshot.environments.contains_key(id) {
-            return Ok(false);
-        }
-        self.canary_local_empty(task, id).await
-    }
-
-    async fn require_canary_cleanup(&self, task: &mut UpgradeTask) -> Result<()> {
-        if task
-            .canaries
-            .keys()
-            .any(|id| !task.revoked_canaries.contains(id))
-        {
-            return Err(Error::Unavailable(
-                "canary authorization must be revoked before finalization".into(),
-            ));
-        }
-        if task
-            .canaries
-            .keys()
-            .any(|id| !task.cleaned_canaries.contains(id))
-        {
-            Box::pin(self.fence_canaries(task)).await?;
-        }
-        for id in task.canaries.keys().cloned().collect::<Vec<_>>() {
-            if task.cleaned_canaries.contains(&id) {
-                continue;
-            }
-            if !Box::pin(self.cleanup_canary(task, &id)).await? {
-                return Err(Error::Unavailable(
-                    "task canary cleanup remains unconfirmed".into(),
-                ));
-            }
-            task.cleaned_canaries.insert(id);
-            *task = self.save_task(task.clone()).await?;
-        }
-        Ok(())
-    }
-
     async fn finish_upgrade(&self, mut task: UpgradeTask, phase: &str) -> Result<UpgradeTask> {
-        Box::pin(self.require_canary_cleanup(&mut task)).await?;
         for id in task.nodes.keys().cloned().collect::<Vec<_>>() {
             let workflow = task.nodes[&id].phase.clone();
             self.control_with_phase(&mut task, &id, "released", &workflow, vec![])
@@ -911,9 +671,7 @@ impl CoordinatorRpc {
             let grants = snapshot
                 .environments
                 .values()
-                .filter(|stored| {
-                    stored.assignment.node_id == *id && !task.canaries.contains_key(&stored.spec.id)
-                })
+                .filter(|stored| stored.assignment.node_id == *id)
                 .map(|stored| pb::NodeUpgradeGrant {
                     environment_id: stored.spec.id.clone(),
                     assignment_generation: stored.assignment.generation,
@@ -927,11 +685,7 @@ impl CoordinatorRpc {
         let pending: Vec<_> = task
             .operations
             .iter()
-            .filter(|(_, op)| {
-                op.phase == "Prepared"
-                    && sources.contains(&op.source_node_id)
-                    && !task.canaries.contains_key(&op.environment_id)
-            })
+            .filter(|(_, op)| op.phase == "Prepared" && sources.contains(&op.source_node_id))
             .map(|(id, op)| (id.clone(), op.clone()))
             .collect();
         let mut changed = false;
@@ -1043,7 +797,7 @@ impl CoordinatorRpc {
             }
         }
         let task = UpgradeTask {
-            protocol_version: 2,
+            protocol_version: 3,
             task_id: request.task_id,
             epoch: request.epoch,
             namespace: request.namespace,
@@ -1053,9 +807,6 @@ impl CoordinatorRpc {
             phase: "Active".into(),
             nodes,
             operations: BTreeMap::new(),
-            canaries: BTreeMap::new(),
-            revoked_canaries: Default::default(),
-            cleaned_canaries: Default::default(),
         };
         serde_json::to_value(session.save_upgrade(task, None).await?).map_err(|_| Error::Conflict)
     }
@@ -1065,6 +816,9 @@ impl CoordinatorRpc {
         let session = current.session.as_ref().ok_or(Error::Conflict)?.id.clone();
         if r.pod_uid.is_empty() {
             return Err(Error::Invalid("Pod UID required".into()));
+        }
+        if !r.node_session_id.is_empty() && r.node_session_id != session {
+            return Err(Error::Conflict);
         }
         if let Some(entry) = task.nodes.get_mut(&r.node_id) {
             if entry.pod_uid != r.pod_uid || entry.node_session_id != session {
@@ -1080,8 +834,6 @@ impl CoordinatorRpc {
                 entry.delete_resource_version = None;
 
                 entry.control_revision = entry.control_revision.max(observation.revision);
-            } else if !r.node_session_id.is_empty() && r.node_session_id != session {
-                return Err(Error::Conflict);
             }
         } else if replacement {
             task.nodes.insert(
@@ -1215,17 +967,6 @@ impl CoordinatorRpc {
                 "migration outcome is unresolved; keep isolation".into(),
             ));
         }
-        let canaries: Vec<_> = task
-            .canaries
-            .iter()
-            .filter(|(_, target)| target.as_str() == id)
-            .map(|(canary, _)| canary.clone())
-            .collect();
-        if !canaries.is_empty() {
-            task.revoked_canaries.extend(canaries.iter().cloned());
-            *task = self.save_task(task.clone()).await?;
-            Box::pin(self.fence_canaries(task)).await?;
-        }
         let inspection = self.control(task, id, "quiescing", vec![]).await?;
         let snapshot = self.upgrade_session().await.snapshot().await?;
         if !inspection.strict_empty
@@ -1299,10 +1040,6 @@ impl CoordinatorRpc {
             }
             let session = self.upgrade_session().await;
             let mut stored = session.get(&r.environment_id).await?;
-            let is_canary = task.canaries.contains_key(&r.environment_id);
-            if is_canary && task.revoked_canaries.contains(&r.environment_id) {
-                return Err(Error::Conflict);
-            }
             if !task.operations.contains_key(&r.operation_id) {
                 let source_node = self.migration_source_node(&task, &r).await?;
                 if stored.assignment.node_id != r.node_id
@@ -1312,11 +1049,10 @@ impl CoordinatorRpc {
                 {
                     return Err(Error::Conflict);
                 }
-                if !is_canary
-                    && task
-                        .nodes
-                        .get(&r.node_id)
-                        .is_none_or(|n| n.phase != "evacuating")
+                if task
+                    .nodes
+                    .get(&r.node_id)
+                    .is_none_or(|n| n.phase != "evacuating")
                 {
                     return Err(Error::Conflict);
                 }
@@ -1335,7 +1071,7 @@ impl CoordinatorRpc {
                 {
                     return Err(Error::Conflict);
                 }
-                let target = self.migration_target(&task, &stored, &r, is_canary).await?;
+                let target = self.migration_target(&stored, &r).await?;
                 let target_node = self.upgrade_node(&target).await?;
                 self.require_matching_rootfs(&source_node, &target_node, Some(&stored.spec))
                     .await?;
@@ -1424,43 +1160,47 @@ impl CoordinatorRpc {
                 if paused.state != EnvironmentState::Paused || paused.resources_held {
                     return Err(Error::Conflict);
                 }
-                // Serialize placement against normal allocations and persist ownership before RPC.
+                // Both ordinary recovery and planned migration reserve through
+                // the same scheduler round and durable assignment path.
                 self.migration_nodes(&op).await?;
                 let mut state = self.0.state.lock().await;
                 state.recover_authoritative_state().await?;
-                let target = state
-                    .nodes
-                    .get(&op.target_node_id)
-                    .ok_or(Error::Conflict)?
-                    .clone();
-                if !is_canary
-                    && !state
-                        .scheduler
-                        .local_candidate(&stored.spec, &op.target_node_id, &[])?
+                let point = stored
+                    .result
+                    .as_ref()
+                    .and_then(|record| {
+                        record
+                            .checkpoint
+                            .as_ref()
+                            .or(record.snapshot_source.as_ref())
+                    })
+                    .ok_or(Error::Conflict)?;
+                let spec = recovery::checkpoint_spec(
+                    &stored,
+                    Some(point),
+                    None,
+                    &BTreeSet::new(),
+                    Some(&op.target_node_id),
+                )?;
+                if state
+                    .scheduler
+                    .requests
+                    .get(&stored.spec.id)
+                    .is_none_or(|(_, queued)| queued != &spec)
                 {
+                    state.scheduler.retire_claim(&stored.spec.id)?;
+                    state.scheduler.submit_recovery(spec)?;
+                }
+                for _ in 0..state.scheduler.shards.len() {
+                    state.drive().await?;
+                }
+                stored = session.get(&r.environment_id).await?;
+                if stored.assignment.node_id == op.source_node_id {
                     return Err(Error::NoCapacity);
                 }
-                // Share the epoch-scoped identity allocator with live scheduling and claims.
-                let generation = session.next_generation()?;
-                let assignment = adx_core::Assignment {
-                    environment_id: r.environment_id.clone(),
-                    node_id: op.target_node_id.clone(),
-                    shard_id: target.shard_id,
-                    generation,
-                    devices: vec![],
-                };
-                stored = session
-                    .reserve_migration(
-                        &stored.assignment,
-                        assignment.clone(),
-                        recovery::now()?,
-                        op.was_running,
-                        &op.source_session_id,
-                        &op.target_session_id,
-                    )
-                    .await?;
-                state.scheduler.generation = state.scheduler.generation.max(generation);
-                state.accept_stored_claim(stored.clone())?;
+                if stored.assignment.node_id != op.target_node_id {
+                    return Err(Error::Conflict);
+                }
                 if let Some(live) = state.live.get_mut(&op.source_node_id) {
                     live.inspected = false;
                 }
@@ -1484,19 +1224,6 @@ impl CoordinatorRpc {
                     .as_ref()
                     .is_some_and(|record| record.state == EnvironmentState::Paused)
             {
-                if is_canary {
-                    self.control(
-                        &mut task,
-                        &op.target_node_id,
-                        "canary",
-                        vec![pb::NodeUpgradeGrant {
-                            environment_id: r.environment_id.clone(),
-                            assignment_generation: stored.assignment.generation,
-                            actions: vec!["recover".into(), "resume".into(), "route".into()],
-                        }],
-                    )
-                    .await?;
-                }
                 self.await_migration_adoption(&op, &stored.assignment, false)
                     .await?;
                 let (_, node) = self.migration_nodes(&op).await?;
@@ -1608,13 +1335,7 @@ impl CoordinatorRpc {
             "durability":"Published","resources_held":stored.resources_held(),"outcome":"completed","completed":true}),
         )
     }
-    async fn migration_target(
-        &self,
-        task: &UpgradeTask,
-        stored: &StoredEnvironment,
-        r: &Action,
-        canary: bool,
-    ) -> Result<String> {
+    async fn migration_target(&self, stored: &StoredEnvironment, r: &Action) -> Result<String> {
         // Device and node-local external mounts need an explicit transferable contract.
         let local = |source: &adx_core::execution::StorageSource| {
             matches!(source, adx_core::execution::StorageSource::Local(_))
@@ -1644,92 +1365,35 @@ impl CoordinatorRpc {
                 "migration requires transferable runtime resources and shared checkpoints".into(),
             ));
         }
-        let state = self.0.state.lock().await;
+        let mut state = self.0.state.lock().await;
         let source = state.nodes.get(&r.node_id).ok_or(Error::Conflict)?;
-        let alias = source
-            .node
-            .labels
-            .get("ADX_CHECKPOINT_STORAGE")
-            .filter(|s| s.as_str() != "local")
-            .ok_or_else(|| {
-                Error::Invalid("source does not advertise shared checkpoint storage".into())
-            })?;
-        if !r.checkpoint_storage_alias.is_empty() && &r.checkpoint_storage_alias != alias {
+        if !r.checkpoint_storage_alias.is_empty()
+            && source.node.labels.get("ADX_CHECKPOINT_STORAGE") != Some(&r.checkpoint_storage_alias)
+        {
             return Err(Error::Conflict);
         }
-        let mut candidates: Vec<_> = state
-            .nodes
-            .values()
-            .filter(|n| {
-                n.node.id != r.node_id
-                    && (r.target_node_id.is_empty() || n.node.id == r.target_node_id)
-            })
-            .collect();
-        candidates.sort_by_key(|node| {
-            (
-                task.nodes
-                    .get(&node.node.id)
-                    .is_none_or(|n| n.phase != "verified"),
-                node.node.id.clone(),
-            )
-        });
-        for node in candidates {
-            if node.node.labels.get("ADX_CHECKPOINT_STORAGE") != Some(alias)
-                || !shared_checkpoint_compatible(source, node)
-                || stored
-                    .result
+        let point = stored
+            .result
+            .as_ref()
+            .filter(|record| record.state == EnvironmentState::Paused)
+            .and_then(|record| {
+                record
+                    .checkpoint
                     .as_ref()
-                    .and_then(|record| {
-                        record
-                            .checkpoint
-                            .as_ref()
-                            .or(record.snapshot_source.as_ref())
-                    })
-                    .is_some_and(|point| {
-                        !point.artifact.scope.is_empty()
-                            && !node.checkpoint_scopes.contains(&point.artifact.scope)
-                    })
-                || !node
-                    .node
-                    .runtime_classes
-                    .contains(&stored.spec.runtime_class)
-            {
-                continue;
-            }
-            let Some(live) = state.live.get(&node.node.id) else {
-                continue;
-            };
-            if live.expired || live.last_seen.elapsed() >= self.0.heartbeat_timeout {
-                continue;
-            }
-            if canary {
-                let (_, available) = state
-                    .scheduler
-                    .node_resources(&node.node.id)
-                    .ok_or(Error::Conflict)?;
-                if stored.spec.resources.fits(&available) {
-                    return Ok(node.node.id.clone());
-                }
-            } else if state
-                .scheduler
-                .local_candidate(&stored.spec, &node.node.id, &[])?
-            {
-                return Ok(node.node.id.clone());
-            }
-        }
-        Err(Error::NoCapacity)
+                    .or(record.snapshot_source.as_ref())
+            });
+        let spec = recovery::checkpoint_spec(
+            stored,
+            point,
+            Some(source),
+            &BTreeSet::new(),
+            (!r.target_node_id.is_empty()).then_some(r.target_node_id.as_str()),
+        )?;
+        state
+            .scheduler
+            .recovery_candidate(&spec)?
+            .ok_or(Error::NoCapacity)
     }
-}
-
-// Scoped stores bind the actual remote backend; an alias alone cannot qualify
-// two S3 buckets. Unscoped shared filesystems still require the C/R canary.
-fn shared_checkpoint_compatible(source: &StoredNode, target: &StoredNode) -> bool {
-    !source.checkpoint_gc_fenced
-        && !target.checkpoint_gc_fenced
-        && ((source.checkpoint_scopes.is_empty() && target.checkpoint_scopes.is_empty())
-            || !source
-                .checkpoint_scopes
-                .is_disjoint(&target.checkpoint_scopes))
 }
 
 // This admission check covers the deployment-owned local EROFS root only.
@@ -1793,4 +1457,83 @@ pub(super) fn registration_control(
         phase: "isolated".into(),
         grants: vec![],
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacement_binding_requires_a_fresh_isolated_empty_session_and_old_delete_intent() {
+        let task = UpgradeTask {
+            protocol_version: 3,
+            task_id: "task".into(),
+            epoch: 1,
+            phase: "Active".into(),
+            nodes: [(
+                "n".into(),
+                UpgradeNode {
+                    node_id: "n".into(),
+                    pod_uid: "old".into(),
+                    node_session_id: "old-session".into(),
+                    phase: "quiescing".into(),
+                    permit_id: Some("permit".into()),
+                    delete_resource_version: Some("rv".into()),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let current: StoredNode = serde_json::from_value(json!({
+            "node":{"id":"n","capacity":{"cpu_millis":100,"memory_bytes":128,"disk_bytes":0},"available":false,
+                "labels":{},"devices":[],"runtime_classes":["runsc"]},"shard_id":0,"address":"n:1","proxy_address":"n:2",
+            "session":{"id":"new-session","sequence":1,"routable":true},"scheduling_paused":true,
+            "upgrade_pause":{"task_id":"task","epoch":1,"original_paused":false}
+        })).unwrap();
+        let request = Action {
+            node_id: "n".into(),
+            pod_uid: "new".into(),
+            node_session_id: "new-session".into(),
+            ..Default::default()
+        };
+        let observation = pb::NodeUpgradeInspection {
+            protocol_version: 3,
+            task_id: "task".into(),
+            epoch: 1,
+            node_session_id: "new-session".into(),
+            phase: "isolated".into(),
+            strict_empty: true,
+            ..Default::default()
+        };
+        assert!(replacement_binding(&task, &request, &current, &observation).unwrap());
+        for fault in [
+            "delete", "permit", "busy", "unknown", "gate", "owner", "session", "uid", "phase",
+        ] {
+            let (mut task, mut request, mut current, mut observation) = (
+                task.clone(),
+                request.clone(),
+                current.clone(),
+                observation.clone(),
+            );
+            match fault {
+                "delete" => task.nodes.get_mut("n").unwrap().delete_resource_version = None,
+                "permit" => task.nodes.get_mut("n").unwrap().permit_id = None,
+                "busy" => observation.strict_empty = false,
+                "unknown" => observation.unknown = true,
+                "gate" => current.scheduling_paused = false,
+                "owner" => current.upgrade_pause = None,
+                "session" => request.node_session_id = "stale".into(),
+                "uid" => request.pod_uid = "old".into(),
+                _ => observation.phase = "verified".into(),
+            }
+            assert!(
+                replacement_binding(&task, &request, &current, &observation).is_err(),
+                "{fault}"
+            );
+        }
+        let mut added = task.clone();
+        added.nodes.clear();
+        assert!(replacement_binding(&added, &request, &current, &observation).unwrap());
+    }
 }

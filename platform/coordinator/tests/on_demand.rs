@@ -1,5 +1,9 @@
 //! Real Redis and gRPC; runtime memory and object storage are controlled fixtures.
 mod common;
+#[path = "common/mounts.rs"]
+mod mounts;
+#[path = "support/recovery_profile.rs"]
+mod recovery_profile;
 use adx_checkpoint_storage::ObjectCheckpointStore;
 use adx_coordinator::{rpc::CoordinatorRpc, storage::Session, Placement};
 use adx_core::{EnvironmentRecord, EnvironmentSpec, Resources, Result};
@@ -28,7 +32,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
 
 fn spec() -> EnvironmentSpec {
-    EnvironmentSpec {
+    let mut spec = EnvironmentSpec {
         envd: None,
         id: "sleep".into(),
         tenant_id: "tenant".into(),
@@ -54,7 +58,9 @@ fn spec() -> EnvironmentSpec {
         execution: Default::default(),
         run_policy: None,
         compatibility: None,
-    }
+    };
+    recovery_profile::qualify(&mut spec);
+    spec
 }
 fn caller() -> Option<pb::CallerContext> {
     Some(pb::CallerContext {
@@ -75,6 +81,9 @@ struct Backend {
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    fn recovery_profile(&self, spec: &EnvironmentSpec) -> Result<BTreeMap<String, String>> {
+        Ok(recovery_profile::qualify(&mut spec.clone()))
+    }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
         Ok(self.running.lock().unwrap().values().cloned().collect())
     }
@@ -294,7 +303,13 @@ async fn worker(
             capacity: Some(spec().resources.into()),
             runtime_classes: vec!["test-runtime".into()],
             checkpoint_scopes: vec!["test-shared".into()],
-            labels: [("ADX_CHECKPOINT_STORAGE".into(), "obs".into())].into(),
+            labels: recovery_profile::qualify(&mut spec())
+                .into_iter()
+                .chain([
+                    ("ADX_CHECKPOINT_STORAGE".into(), "obs".into()),
+                    ("ADX_CHECKPOINT_SCOPE".into(), "test-shared".into()),
+                ])
+                .collect(),
             session_id: session,
             heartbeat_sequence: 1,
             reconciling: true,
@@ -1685,7 +1700,6 @@ async fn delete_serializes_with_restore_and_fences_its_late_result() {
         failed_revision: None,
 
         node_session_id: String::new(),
-        ..Default::default()
     }));
     assert!(futures_util::poll!(deleting.as_mut()).is_pending());
     gate.notify_one();
@@ -1846,16 +1860,7 @@ async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
         .unwrap()
         .to_owned();
     std::fs::create_dir(directory.path().join("workspace")).unwrap();
-    let backend = std::fs::read_to_string("/proc/self/mountinfo")
-        .unwrap()
-        .lines()
-        .find_map(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            (fields[4] == "/").then(|| {
-                fields[fields.iter().position(|field| *field == "-").unwrap() + 2].to_owned()
-            })
-        })
-        .unwrap();
+    let backend = mounts::backend_id(std::path::Path::new("/"));
     let domains = BTreeMap::from([(
         "test".into(),
         StorageDomain {
@@ -2023,7 +2028,6 @@ async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
         caller: caller(),
         failed_revision: None,
         node_session_id: String::new(),
-        ..Default::default()
     })
     .await
     .unwrap();

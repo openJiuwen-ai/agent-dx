@@ -429,6 +429,8 @@ def main():
                     [
                         base / "package/bin/adxctl",
                         "stop",
+                        "--mode",
+                        "drain",
                         "--config",
                         root / node / "deployment.yaml",
                     ],
@@ -442,6 +444,8 @@ def main():
                     [
                         base / "package/bin/adxctl",
                         "stop",
+                        "--mode",
+                        "drain",
                         "--config",
                         root / "ingress2/deployment.yaml",
                     ],
@@ -451,7 +455,7 @@ def main():
                 result["cleanup_errors"].append(f"ingress2: {error}")
         try:
             call(
-                [base / "package/bin/adxctl", "stop", "--config", root / "deployment.yaml"],
+                [base / "package/bin/adxctl", "stop", "--mode", "drain", "--config", root / "deployment.yaml"],
                 timeout=90,
             )
         except Exception as error:

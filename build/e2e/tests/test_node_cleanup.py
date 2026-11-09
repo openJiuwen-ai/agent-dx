@@ -10,6 +10,13 @@ spec.loader.exec_module(node)
 
 
 class NodeCleanupTests(unittest.TestCase):
+    def test_supervisor_stop_explicitly_requests_drain(self):
+        with patch.object(node, 'command', return_value='{"ok": true}') as command:
+            self.assertEqual(node.supervisor('stop'), {'ok': True})
+        command.assert_called_once_with([
+            node.A / 'package/bin/adxctl', 'stop', '--mode', 'drain', '--config', node.P / 'deployment.yaml',
+        ])
+
     def test_stop_still_cleans_backend_when_metrics_probe_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

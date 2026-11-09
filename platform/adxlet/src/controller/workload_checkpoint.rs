@@ -167,6 +167,16 @@ impl Controller {
                 .await?;
             return Err(error);
         }
+        let recovery_profile = match self.services.runtime.recovery_profile(&self.record.spec) {
+            Ok(profile) => profile,
+            Err(error) => {
+                services
+                    .cooperation
+                    .finish_workload(&self.record, &id, Some(error.to_string()))
+                    .await?;
+                return Err(error);
+            }
+        };
         let staged = match before_deadline(
             deadline,
             "checkpoint allocation",
@@ -338,6 +348,7 @@ impl Controller {
         }
         self.record.snapshot_source = None;
         self.record.checkpoint = Some(RestorePoint {
+            recovery_profile,
             id: id.clone(),
             artifact,
             origin: None,

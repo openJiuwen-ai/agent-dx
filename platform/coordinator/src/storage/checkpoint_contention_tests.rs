@@ -163,7 +163,7 @@ async fn checked_artifact_publication_preserves_upgrade_and_header_fences() {
     // Task-owned control explicitly advances the header even though ordinary
     // checkpoint publication above does not participate in that contention.
     let task = UpgradeTask {
-        protocol_version: 2,
+        protocol_version: 3,
         task_id: "upgrade".into(),
         epoch: 1,
         namespace: "test".into(),

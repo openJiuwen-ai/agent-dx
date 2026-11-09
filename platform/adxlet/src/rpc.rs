@@ -329,7 +329,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
         let gate_started = Instant::now();
         let gate = self.manager.lifecycle_ready.read().await;
         let gate_wait_ms = gate_started.elapsed().as_secs_f64() * 1_000.0;
-        if !*gate || self.manager.is_draining() {
+        if !*gate || self.manager.is_draining() || self.manager.is_stopping() {
             return Err(Status::unavailable("node is reconciling or draining"));
         }
         let controller_started = Instant::now();
@@ -817,19 +817,8 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     return Err(Status::unavailable("node is reconciling"));
                 }
                 let r = request.into_inner();
-                let upgrade_cleanup =
-                    principal == Principal::Coordinator && !r.upgrade_task_id.is_empty();
-                let fence = if upgrade_cleanup {
-                    if r.failed_revision.is_some() || r.expected_revision.is_some() {
-                        return Err(Status::invalid_argument(
-                            "upgrade cleanup uses task authority instead of a deletion revision",
-                        ));
-                    }
-                    None
-                } else {
-                    delete_fence(principal.clone(), r.failed_revision, r.expected_revision)
-                        .map_err(status)?
-                };
+                let fence = delete_fence(principal.clone(), r.failed_revision, r.expected_revision)
+                    .map_err(status)?;
                 if principal == Principal::Coordinator
                     && (self.session_id.is_empty() || r.node_session_id != self.session_id)
                 {
@@ -841,29 +830,6 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     .try_into()
                     .map_err(status)?;
 
-                if upgrade_cleanup {
-                    let control = self
-                        .manager
-                        .services
-                        .upgrade
-                        .control()
-                        .map_err(status)?
-                        .ok_or_else(|| Status::failed_precondition("upgrade control required"))?;
-                    if control.task_id != r.upgrade_task_id
-                        || control.epoch != r.upgrade_epoch
-                        || !assignment
-                            .environment_id
-                            .starts_with("default-upgrade-canary-")
-                        || control
-                            .grants
-                            .iter()
-                            .any(|grant| grant.environment_id == assignment.environment_id)
-                    {
-                        return Err(Status::failed_precondition(
-                            "canary cleanup authorization changed",
-                        ));
-                    }
-                }
                 let managed = self
                     .manager
                     .environments

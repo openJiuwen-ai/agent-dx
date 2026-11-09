@@ -270,10 +270,44 @@ impl State {
                 .get(&spec.id)
                 .filter(|i| i.invalidated || i.resume_point(recovery_now).is_some())
                 .cloned();
-            let saved = if let Some(old) = recovery {
+            let current = self.environments.get(&spec.id).cloned();
+            let upgrade = if current.as_ref().is_some_and(|stored| {
+                !stored.invalidated
+                    && stored.resume.is_none()
+                    && stored
+                        .result
+                        .as_ref()
+                        .is_some_and(|record| record.state == EnvironmentState::Paused)
+            }) {
+                self.session.upgrade_task().await?
+            } else {
+                None
+            };
+            let migration = current.as_ref().and_then(|old| {
+                upgrade
+                    .as_ref()?
+                    .migration_operation(&old.assignment, &assignment)
+                    .cloned()
+            });
+            let saved = if let Some(operation) = migration {
+                self.session
+                    .reserve_migration(
+                        &current.as_ref().ok_or(Error::Conflict)?.assignment,
+                        assignment.clone(),
+                        recovery_now,
+                        operation.was_running,
+                        &operation.source_session_id,
+                        &operation.target_session_id,
+                    )
+                    .await
+            } else if let Some(old) = recovery {
                 self.session
                     .reserve_recovery(&old.assignment, assignment.clone(), recovery::now()?)
                     .await
+            } else if current.is_some_and(|stored| stored.result.is_some()) {
+                // A stale or aborted recovery queue must never recreate an
+                // already-published Environment as a fresh execution.
+                Err(Error::Conflict)
             } else if crate::storage::has_volumes(&spec) {
                 self.session
                     .reserve_with_request(
@@ -307,6 +341,18 @@ impl State {
             };
             match saved {
                 Ok(record) => {
+                    if record.recovery.is_some() {
+                        if let Err(error) = self.scheduler.finish_recovery_placement(
+                            &record.spec,
+                            &record.assignment,
+                            record.resources_held(),
+                        ) {
+                            // Redis already owns the new assignment. Rebuild
+                            // before accepting claims or scheduling more work.
+                            self.needs_recovery = true;
+                            return Err(error);
+                        }
+                    }
                     if let Some(source) = record
                         .recovery
                         .as_ref()
@@ -1230,11 +1276,6 @@ impl CoordinatorRpc {
                     })?;
                 continue;
             }
-            state
-                .session
-                .check_canary_creation(&spec.id)
-                .await
-                .map_err(status)?;
             if schedule_deadline.is_some_and(|deadline| {
                 tokio::time::Instant::now() >= deadline && !state.specs.contains_key(&spec.id)
             }) {
@@ -2678,6 +2719,9 @@ mod reconciliation_tests {
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 pub(crate) mod cancellation_test_redis;
+#[cfg(test)]
+#[path = "../tests/support/recovery_profile.rs"]
+pub(crate) mod recovery_test_profile;
 
 #[cfg(test)]
 mod cancellation_tests {
