@@ -49,7 +49,7 @@ admission. The file reader is separate from the implemented sandboxd collector a
 Node startup obtains the complete authoritative catalog before reconciling
 managed runtimes. It restores committed running Environments and cleans runtimes
 confirmed unowned or left by uncommitted starts. An unavailable Coordinator never
-means an empty catalog. Explicit CLI stop performs local Environment cleanup before service shutdown.
+means an empty catalog. Deployment examples use the default `shutdown_mode: preserve` to skip Environment drain for both plain `adxctl stop` and supervisor SIGTERM/SIGINT. `adxctl stop --mode preserve|drain` overrides one stop request; plain stop uses the running supervisor's startup configuration even if the YAML has changed. Use `adxctl stop --mode drain` for destructive cleanup. Adxctl sends SIGUSR1 to adxlet for preserve and SIGTERM after explicit drain; other services use SIGTERM. Adxlet closes new admission on shutdown, keeps heartbeats and runtime control alive throughout embedded Relay drain, then exits without unregistering the node in preserve mode. Preserve still stops supervised processes and does not itself guarantee runtime survival or recovery.
 
 
 Coordinator publishes its `advertised_address` in Redis with a renewable lease

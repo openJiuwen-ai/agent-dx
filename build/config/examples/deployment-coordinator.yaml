@@ -5,6 +5,7 @@ redis_url: redis://redis.internal:6379/
 namespace: adx
 restart_delay_ms: 1000
 stop_timeout_seconds: 90
+shutdown_mode: preserve
 services:
   - id: coordinator
     role: coordinator

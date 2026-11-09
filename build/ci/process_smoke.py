@@ -113,7 +113,8 @@ def main():
             def control(action):
                 return json.loads(
                     subprocess.check_output(
-                        command + [action, '--config', str(config)], stderr=subprocess.DEVNULL, text=True, timeout=15
+                        command + [action, '--config', str(config)] + (['--mode', 'drain'] if action == 'stop' else []),
+                        stderr=subprocess.DEVNULL, text=True, timeout=15
                     )
                 )
 

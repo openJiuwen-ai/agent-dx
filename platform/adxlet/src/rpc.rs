@@ -256,7 +256,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
         let gate_started = Instant::now();
         let gate = self.manager.lifecycle_ready.read().await;
         let gate_wait_ms = gate_started.elapsed().as_secs_f64() * 1_000.0;
-        if !*gate || self.manager.is_draining() {
+        if !*gate || self.manager.is_draining() || self.manager.is_stopping() {
             return Err(Status::unavailable("node is reconciling or draining"));
         }
         let controller_started = Instant::now();

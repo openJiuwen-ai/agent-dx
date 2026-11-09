@@ -15,6 +15,60 @@ services:
     config: {}
 "#;
 
+#[test]
+fn shutdown_mode_defaults_to_preserve_and_explicit_modes_survive_configuration_roundtrip() {
+    let root = tempfile::tempdir().unwrap();
+    for (name, source, expected) in [
+        ("default", MINIMAL_YAML.to_owned(), "preserve"),
+        (
+            "default-profile",
+            "schema_version: 1\nprofile: coordinator\n".to_owned(),
+            "preserve",
+        ),
+        (
+            "drain",
+            format!("{MINIMAL_YAML}\nshutdown_mode: drain\n"),
+            "drain",
+        ),
+        (
+            "preserve",
+            format!("{MINIMAL_YAML}\nshutdown_mode: preserve\n"),
+            "preserve",
+        ),
+        (
+            "profile",
+            "schema_version: 1\nprofile: coordinator\nshutdown_mode: preserve\n".to_owned(),
+            "preserve",
+        ),
+    ] {
+        let path = root.path().join(format!("{name}.yaml"));
+        std::fs::write(&path, source).unwrap();
+        let deployment = Deployment::load(&path).unwrap();
+        let effective = deployment.effective_yaml().unwrap();
+        let value: serde_json::Value = serde_saphyr::from_str(&effective).unwrap();
+        assert_eq!(value["shutdown_mode"], expected);
+        std::fs::write(&path, effective).unwrap();
+        assert_eq!(
+            Deployment::load(&path).unwrap().effective_yaml().unwrap(),
+            deployment.effective_yaml().unwrap()
+        );
+    }
+}
+
+#[test]
+fn shutdown_mode_rejects_unknown_values_in_full_and_profile_configurations() {
+    let root = tempfile::tempdir().unwrap();
+    for source in [MINIMAL_YAML, "schema_version: 1\nprofile: coordinator\n"] {
+        let path = root.path().join("invalid.yaml");
+        std::fs::write(&path, format!("{source}\nshutdown_mode: presreve\n")).unwrap();
+        let error = Deployment::load(&path).err().unwrap().to_string();
+        assert!(
+            error.contains("preserve") && error.contains("drain"),
+            "{error}"
+        );
+    }
+}
+
 fn test_deployment(root: &std::path::Path) -> Deployment {
     serde_json::from_value(json!({"schema_version":1,"package_dir":root,"state_dir":root,"redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"node","role":"adxlet","config":{"discovery":{"namespace":"wrong"},"proxy_socket":root.join("route.sock")},"env":{"ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR":root}},{"id":"coordinator","role":"coordinator","config":{}}]})).unwrap()
 }

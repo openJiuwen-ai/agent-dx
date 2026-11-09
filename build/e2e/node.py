@@ -177,7 +177,10 @@ def returning_node_status(records, current):
 
 
 def supervisor(action):
-    return json.loads(command([A / 'package/bin/adxctl', action, '--config', P / 'deployment.yaml']))
+    args = [A / 'package/bin/adxctl', action]
+    if action == 'stop':
+        args += ['--mode', 'drain']
+    return json.loads(command(args + ['--config', P / 'deployment.yaml']))
 
 
 def persisted_ownership(records, ids):
