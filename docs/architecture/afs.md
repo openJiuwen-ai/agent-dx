@@ -42,7 +42,8 @@ Meta 的 `local-file`／`memory` 路径通过 `Store::open_log` 重放确定的�
 精确未完成前缀可继续，未知或非空残留仍拒绝。已初始化目录必须有 CURRENT，
 未列入恢复／退休清单的非空 WAL 拒绝；仅允许身份与恢复 tip 精确匹配的单个空预备段。
 这能检测清单遗漏和留有新日志的回滚，不能检测整目录自洽回滚而无外部见证的情况。
-旧 JSON 快照目录拒绝自动接管；生产仅local-file／memory日志后端，旧快照／etcd／Redis适配及依赖已删除；每个 Store
+旧 JSON 快照目录拒绝自动接管；日志后端为 local-file、redis、etcd 与易失 memory（redis／etcd 只存操作日志与分块 checkpoint，
+term 与 tip 在同一服务端原子单元里比较，见 `meta::store::kv_log`）；旧快照后端已删除；每个 Store
 只选择一条权威路径，不双写。`Store::checkpoint` 可捕获同一已发布 State 及日志位置，
 在后台任务中编码自包含状态，持久安装带身份、位置、摘要及 CRC 的快照和 `CURRENT`。
 `CURRENT` 同时选择快照和连续日志段；每段头绑定原身份、起始位置及前置 hash，
@@ -83,7 +84,7 @@ Meta的watch RPC在取数前取得独立响应额度；流式队列有固定槽�
 回收任务主动释放无人读取的过期队列。尚未退出的构建请求仍保留额度，旧流不能释放新代际。
 正常EOF／取消退账，超时返回错误，不能把不完整流当成已完成批次推进游标。
 上述约束不计入Node/S3预算，也不代表整个进程、调用方已取走结果或tonic/h2缓冲的内存保证。
-历史策略配置／固定指标已接线，旧Snapshot后端及etcd／Redis适配已移除。物理掉电、
+历史策略配置／固定指标已接线，旧Snapshot后端已移除。物理掉电、
 大场景资源及完整真实产品验收仍未完成，不能宣称持续增长部署已交付。
 配置与当前限制见[部署说明](../deployment/afs.md#meta-操作日志与数据目录)。
 
@@ -1028,10 +1029,16 @@ revision 截断；快照 GC 的读视图和相关键 CAS 保留 canonical 的期
 仍待执行的撤销命令。`GET /v1/store` 提供实体数量、结果／事件数量、水位和 GC 屏障进度，
 用于观测收敛，管理端口应限制在受信网络。
 
+## POSIX 支持边界
+
+DFS 对 POSIX 与 Linux 文件操作的实际行为（支持、仅本机、不支持及 errno）逐项列在
+[AFS DFS 的 POSIX 支持边界](afs-posix-boundary.md)，每项有真实挂载用例。文件锁只在本机有效、`statfs` 显示本机盘
+是首要的已知限制。
+
 ## 后置能力
 
-当前不承诺以下能力：完整 POSIX、复杂可靠性、多 Meta、高可用、etcd/Redis
-后端验收、大规模长时间运行、RDMA 性能专项、跨节点 `fcntl/flock`、阻塞锁
+当前不承诺以下能力：完整 POSIX、复杂可靠性、多 Meta、高可用（etcd/Redis 只作日志后端）、
+大规模长时间运行、RDMA 性能专项、跨节点 `fcntl/flock`、阻塞锁
 等待取消、bind/native 与远端 FUSE 锁域协同。bind 本机 ext4 锁和单挂载
 内核回退不能宣传为分布式锁。
 

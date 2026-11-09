@@ -334,6 +334,13 @@ python3 afs/tests/run.py run --case 'ownerfs.basic.*' --case 'dfs.basic.*' \
   提交后新OPEN可见、已打开读者在提交后能看到新版本（重构决策4a将改为open到close固定版本）、
   unlink已打开文件后数据仍可读、close后他人stat立即看到新长度和mtime、fsync/fdatasync成功、
   文件锁不跨节点互斥（决策11本轮不支持）。按决策改变的断言在对应重构步骤中同步更新；不属于默认基础集合。
+- `posix-boundary`：DFS 的 POSIX 支持边界（R20），每项断言应用经真实内核挂载看到的结果，清单与归类见
+  [AFS DFS 的 POSIX 支持边界](../../docs/architecture/afs-posix-boundary.md)；不属于默认基础集合。
+
+环境变量 `AFS_E2E_META_STORE_TOML` 让每个 case 的 Meta 改用 Redis／etcd 操作日志：值是 Meta 存储的 TOML 行
+（`\n` 分隔），其中的 `{unique}` 在每个集群生成一次，使每个 case 用自己的空 key 前缀。例如
+`meta_store = "redis"\nmeta_redis_url = "redis://127.0.0.1:6381/"\nmeta_store_prefix = "afs/e2e-{unique}"`。
+服务需事先启动（Redis 须 `appendonly yes`、`appendfsync always`、`noeviction`）。未设置时仍是 `local-file`。
 
 DFS远端路径记录新鲜读者的内容/长度/哈希和 `peer_read_ranges` RPC调用增量。
 RPC计数本身包含失败，不等于服务端成功；必须结合新鲜读者、内容正确、无外部后端来解释。

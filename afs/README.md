@@ -52,7 +52,8 @@ FUSE 依赖使用根工作区声明的官方固定 `fuser =0.18.0`。
 历史结果／watch 有界不表示全部权威实体有界：旧 NodeSession 拒绝记录、未完成及失败
 命令仍保留；安全回收范围和限制见上述部署合同。
 
-Meta 默认使用唯一持久后端 `local-file`。`memory` 仅适合一次性演示；etcd／Redis适配已移除，
+Meta 默认使用持久后端 `local-file`；也可把操作日志放在 Redis 或 etcd（`meta_store = "redis"`／`"etcd"`，Meta 仍单进程，
+持久性与性能边界见[部署说明](../docs/deployment/afs.md#meta-操作日志的-redisetcd-后端)）。`memory` 仅适合一次性演示；
 多 Meta/HA、完整 POSIX、跨节点文件锁、复杂故障矩阵和性能达标不在当前承诺内。
 Operator 负责创建 namespace/root grant、配置挂载和回收引用；Environment 创建尚不会
 自动 provision/mount/reclaim AFS。
@@ -86,8 +87,9 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 - OwnerFs workspace bind mount 默认 OFF；当前实际试用场景需要显式配置 ON。
 - OwnerFs 远端 FUSE 访问和 DFS 一写多读代码路径保留，目标仓二进制需要按受影响范围补 Linux 运行证据。
 - 中心 Meta `local-file` 是当前可重启恢复基线；`memory` 只适合一次性演示。
-- etcd、Redis、多 Meta、高可用、完整 POSIX、复杂可靠性和大规模长时间测试后置。
+- 多 Meta、高可用、完整 POSIX、复杂可靠性和大规模长时间测试后置；etcd／Redis 只作操作日志后端。
 - 跨节点 `fcntl/flock`、阻塞锁取消、bind/native 与远端 FUSE 锁域协同后置，不能把本机 ext4 锁或单挂载内核回退宣传为分布式锁。
+- DFS 的 POSIX 支持边界（文件锁仅本机、`statfs` 为本机盘等）见 [AFS DFS 的 POSIX 支持边界](../docs/architecture/afs-posix-boundary.md)。
 - DFS 不能保存 1970-01-01 之前的时间戳（Meta 时间是无符号毫秒）：`utime`/`utimensat` 设这类时间返回 EINVAL，不静默存成 1970。不支持的 rename flags（`RENAME_EXCHANGE`、`RENAME_WHITEOUT`）返回 EINVAL。
 
 必要正确性边界仍需保留：读写新鲜度、close-to-open、权限和 suid/sgid 清除、错误传播、持久化屏障、direct-I/O mmap 能力协商、正常卸载和受管引用排空。
