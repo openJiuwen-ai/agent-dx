@@ -667,8 +667,8 @@ fn rmdir_root_then_recreate_same_name_succeeds() {
     assert!(second_data_dir.join("new").exists());
 }
 
-/// VC-D4：并发 rmdir 恰好一个成功，另一个在解析或缓存线性化点失败
-/// （ENOENT 或 invalid grant 错误）。
+/// VC-D4：并发 rmdir 恰好一个成功，另一个返回 ENOENT（root 已删除），
+/// 与 rmdir_root 文档声明的并发语义一致。
 #[test]
 fn concurrent_rmdir_root_single_winner() {
     let (_temp, owner, ctx, _disk) = fixture(false);
@@ -697,10 +697,7 @@ fn concurrent_rmdir_root_single_winner() {
         .map(|error| error.code())
         .collect();
     assert_eq!(loser_codes.len(), 1);
-    assert!(matches!(
-        loser_codes[0],
-        afs_error::NODE_VFS_NOT_FOUND | afs_error::NODE_OWNER_INVALID_GRANT
-    ));
+    assert_eq!(loser_codes[0], afs_error::NODE_VFS_NOT_FOUND);
     // 最终状态干净：lookup ENOENT、catalog 空。
     assert!(Backend::lookup(owner.as_ref(), &ctx, owner.root_inode(), OsStr::new("d4")).is_err());
     assert!(
@@ -714,11 +711,11 @@ fn concurrent_rmdir_root_single_winner() {
     );
 }
 
-/// VC-D6：Meta 不可达时 rmdir 返回错误；失败发生在 deactivate（delete_root
-/// 步骤 3），Meta 记录、物理目录与 catalog 记录保留，缓存移除已发生（并发
-/// 线性化点），故障恢复后状态可收敛。
+/// VC-D6：Meta 不可达时 rmdir 返回错误。失败发生在物理删除之后的
+/// `deactivate`，此时目录已删除但控制面记录（cache + catalog）保留，
+/// 删除中状态拒绝新准入；故障恢复后原地重试即可补完，无需重启。
 #[test]
-fn rmdir_root_meta_deactivate_failure_returns_error_and_keeps_state_repairable() {
+fn rmdir_root_meta_deactivate_failure_is_retryable() {
     let (temp, owner, ctx, _disk, meta) = fixture_with_meta(false);
     mkdir_root(&owner, &ctx, "d6");
     let (root_id, data_dir) = root_snapshot(&owner, temp.path(), "d6");
@@ -727,11 +724,88 @@ fn rmdir_root_meta_deactivate_failure_returns_error_and_keeps_state_repairable()
     let error = Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d6")).unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
 
-    // 失败未损毁持久状态：Meta active 仍含该 root、物理目录仍在（catalog
-    // 记录保留，否则删除流程不会停在物理目录之前）。
+    // 物理目录已删除、Meta 仍持有该 root：可见性窗口可重试，不留下 limbo。
     assert!(meta.lookup_root(&root_id).unwrap().is_some());
-    assert!(data_dir.exists());
-    // 缓存移除是并发线性化点，与 Meta 无关，必然已发生。
+    assert!(!data_dir.exists());
+    // 缓存记录保留（删除中），重试才能继续完成 Meta 宣告与本地清理。
+    let roots = owner.require_local().unwrap().roots.clone();
+    assert_eq!(roots.cached_local_roots().unwrap().len(), 1);
+    // 删除中状态不允许新准入。
+    assert!(roots.enter_root(&root_id, RootRight::Read).is_err());
+
+    meta.set_fail_deactivate(false);
+    Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d6")).unwrap();
+    assert!(meta.lookup_root(&root_id).unwrap().is_none());
+    assert!(roots.cached_local_roots().unwrap().is_empty());
+    assert!(lookup_root(&owner, &ctx, "d6").is_err());
+}
+
+/// VC-D7：非空 workspace 的 rmdir 返回 ENOTEMPTY，且失败不产生副作用：
+/// Meta 归属、授权、FUSE 条目与数据全部保留；清空后原地重试成功。
+#[test]
+fn rmdir_root_non_empty_keeps_workspace_online_and_retry_succeeds() {
+    let (temp, owner, ctx, _disk, meta) = fixture_with_meta(false);
+    let root = mkdir_root(&owner, &ctx, "d7");
+    let (root_id, data_dir) = root_snapshot(&owner, temp.path(), "d7");
+    let created = Backend::create(
+        &owner,
+        &ctx,
+        root.inode,
+        OsStr::new("keep"),
+        0o600,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    Backend::write(&owner, &ctx, created.handle, 0, b"payload").unwrap();
+    Backend::flush(&owner, &ctx, created.handle).unwrap();
+    Backend::release(&owner, &ctx, created.handle).unwrap();
+
+    let error = Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d7")).unwrap_err();
+    assert_eq!(error.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+    assert_eq!(crate::error::errno(&error), libc::ENOTEMPTY);
+
+    // POSIX rmdir 失败不改变已有状态：root 仍在、Meta 归属仍在、数据可读。
+    let entry = lookup_root(&owner, &ctx, "d7").unwrap();
+    assert_eq!(entry.inode, root.inode);
+    assert!(meta.lookup_root(&root_id).unwrap().is_some());
+    assert_eq!(
+        owner
+            .require_local()
+            .unwrap()
+            .roots
+            .cached_local_roots()
+            .unwrap()
+            .len(),
+        1
+    );
+    let existing = Backend::lookup(&owner, &ctx, entry.inode, OsStr::new("keep")).unwrap();
+    let handle = Backend::open(&owner, &ctx, existing.inode, libc::O_RDONLY).unwrap();
+    let mut buf = [0_u8; 7];
+    Backend::read(&owner, &ctx, handle, 0, &mut buf).unwrap();
+    assert_eq!(&buf, b"payload");
+    Backend::release(&owner, &ctx, handle).unwrap();
+
+    // 失败后仍可写入新数据。
+    let fresh = Backend::create(
+        &owner,
+        &ctx,
+        entry.inode,
+        OsStr::new("fresh"),
+        0o600,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    Backend::flush(&owner, &ctx, fresh.handle).unwrap();
+    Backend::release(&owner, &ctx, fresh.handle).unwrap();
+    assert!(data_dir.join("fresh").exists());
+
+    // 清空后原地重试成功。
+    Backend::unlink(&owner, &ctx, entry.inode, OsStr::new("keep")).unwrap();
+    Backend::unlink(&owner, &ctx, entry.inode, OsStr::new("fresh")).unwrap();
+    Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d7")).unwrap();
+    assert!(lookup_root(&owner, &ctx, "d7").is_err());
+    assert!(!data_dir.exists());
+    assert!(meta.lookup_root(&root_id).unwrap().is_none());
     assert!(
         owner
             .require_local()
@@ -741,12 +815,156 @@ fn rmdir_root_meta_deactivate_failure_returns_error_and_keeps_state_repairable()
             .unwrap()
             .is_empty()
     );
+}
 
-    // 故障恢复后 Meta 可正常清理，active 不再残留（状态可收敛）。
-    meta.set_fail_deactivate(false);
-    meta.deactivate_root(&root_id, 0, "node-a", "session-a")
-        .unwrap();
-    assert!(meta.lookup_root(&root_id).unwrap().is_none());
+/// VC-D8：模拟"判空预检之后、物理删除之前仍有写者"的竞态——删除流程已
+/// detach bind 且物理删除失败，此时必须恢复授权并重新请求 egress bind，
+/// workspace 的容器访问通道保持可用（而不是只剩 FUSE 路径）。
+#[test]
+fn rmdir_root_non_empty_restores_egress_mount_request() {
+    let egress = tempfile::tempdir().unwrap();
+    let (temp, owner, ctx) = fixture_with_mount_manager(egress.path().to_path_buf());
+    let owner = Arc::new(owner);
+    owner.mount_manager().unwrap().attach_owner(&owner);
+    let root = mkdir_root(&owner, &ctx, "d8");
+    let root_id = root_snapshot(&owner, temp.path(), "d8").0;
+    let manager = owner.mount_manager().unwrap();
+    assert!(manager.has_entry(&root_id));
+    // 跳过判空预检，强制复现并发写入到达原子删除的竞态。
+    owner
+        .require_local()
+        .unwrap()
+        .roots
+        .set_skip_empty_precheck(true);
+
+    let created = Backend::create(
+        owner.as_ref(),
+        &ctx,
+        root.inode,
+        OsStr::new("keep"),
+        0o600,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    Backend::flush(owner.as_ref(), &ctx, created.handle).unwrap();
+    Backend::release(owner.as_ref(), &ctx, created.handle).unwrap();
+
+    let error =
+        Backend::rmdir(owner.as_ref(), &ctx, owner.root_inode(), OsStr::new("d8")).unwrap_err();
+    assert_eq!(error.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+    // 卸载已发生，但失败回退重新登记了挂载请求。
+    assert!(manager.has_entry(&root_id));
+}
+
+/// VC-D7b：非空 root 在判空预检阶段快速失败：不关闭准入、不请求卸载
+/// egress bind；授权、缓存、Meta 归属、FUSE 条目与数据全部保持不变。
+#[test]
+fn rmdir_root_non_empty_fails_fast_before_admission_or_unmount() {
+    let egress = tempfile::tempdir().unwrap();
+    let (temp, owner, ctx) = fixture_with_mount_manager(egress.path().to_path_buf());
+    let owner = Arc::new(owner);
+    owner.mount_manager().unwrap().attach_owner(&owner);
+    let root = mkdir_root(&owner, &ctx, "fast");
+    let root_id = root_snapshot(&owner, temp.path(), "fast").0;
+    let manager = owner.mount_manager().unwrap();
+
+    let created = Backend::create(
+        owner.as_ref(),
+        &ctx,
+        root.inode,
+        OsStr::new("keep"),
+        0o600,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    Backend::flush(owner.as_ref(), &ctx, created.handle).unwrap();
+    Backend::release(owner.as_ref(), &ctx, created.handle).unwrap();
+
+    let error =
+        Backend::rmdir(owner.as_ref(), &ctx, owner.root_inode(), OsStr::new("fast")).unwrap_err();
+    assert_eq!(error.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+    assert_eq!(crate::error::errno(&error), libc::ENOTEMPTY);
+    // 快速失败发生在关闭准入与卸载 bind 之前。
+    assert_eq!(manager.unmount_requests(), 0);
+    assert!(manager.has_entry(&root_id));
+    assert!(lookup_root(&owner, &ctx, "fast").is_ok());
+}
+
+/// VC-D7/E2E：真实 egress bind 下非空 workspace 的 rmdir 在判空预检阶段
+/// 返回 ENOTEMPTY，bind 不被卸载、workspace 保持在线；清空后原地重试成功，
+/// bind、出口目录、物理目录与 FUSE 条目全部清理。
+#[test]
+#[ignore = "requires root Linux mount privileges; run explicitly"]
+fn e2e_rmdir_non_empty_keeps_bind_online_and_retry_succeeds() {
+    let retained = tempfile::tempdir().unwrap();
+    let egress_root = retained.path().join("egress");
+    std::fs::create_dir(&egress_root).unwrap();
+    let (temp, fs, ctx) = fixture_with_mount_manager(egress_root.clone());
+    let owner = Arc::new(fs);
+    owner.mount_manager().unwrap().attach_owner(&owner);
+    let root = mkdir_root(&owner, &ctx, "workspace");
+    let target = egress_root.join("workspace");
+    wait_for_egress_bind(&target);
+
+    // 经真实 bind 直写物理目录，制造非空 workspace。
+    std::fs::write(target.join("payload"), b"physical-home").unwrap();
+    let data_dir = {
+        let authority = owner
+            .native_home_export_for_current_namespace(OsStr::new("workspace"))
+            .unwrap();
+        temp.path().join(authority.data_dir().as_path())
+    };
+    assert!(data_dir.join("payload").exists());
+
+    // 非空 root 的 rmdir 必须失败、错误码为 ENOTEMPTY，且无副作用。
+    let error = Backend::rmdir(
+        owner.as_ref(),
+        &ctx,
+        owner.root_inode(),
+        OsStr::new("workspace"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+    assert_eq!(crate::error::errno(&error), libc::ENOTEMPTY);
+
+    // 判空预检失败不触碰 bind：无需重挂即可继续写穿透物理目录。
+    assert_eq!(owner.mount_manager().unwrap().unmount_requests(), 0);
+    wait_for_egress_bind(&target);
+    std::fs::write(target.join("after-rmdir"), b"still-online").unwrap();
+    assert!(data_dir.join("after-rmdir").exists());
+    let entry = lookup_root(&owner, &ctx, "workspace").unwrap();
+    assert_eq!(entry.inode, root.inode);
+    let existing =
+        Backend::lookup(owner.as_ref(), &ctx, entry.inode, OsStr::new("payload")).unwrap();
+    let handle = Backend::open(owner.as_ref(), &ctx, existing.inode, libc::O_RDONLY).unwrap();
+    let mut buf = [0_u8; 13];
+    Backend::read(owner.as_ref(), &ctx, handle, 0, &mut buf).unwrap();
+    assert_eq!(&buf, b"physical-home");
+    Backend::release(owner.as_ref(), &ctx, handle).unwrap();
+
+    // 清空后原地重试成功：bind 已 detach，出口目录、物理目录与 FUSE 条目全清。
+    Backend::unlink(owner.as_ref(), &ctx, entry.inode, OsStr::new("payload")).unwrap();
+    Backend::unlink(owner.as_ref(), &ctx, entry.inode, OsStr::new("after-rmdir")).unwrap();
+    Backend::rmdir(
+        owner.as_ref(),
+        &ctx,
+        owner.root_inode(),
+        OsStr::new("workspace"),
+    )
+    .unwrap();
+    assert!(!egress_bind_mounted(&target));
+    assert!(!target.exists());
+    assert!(!data_dir.exists());
+    assert!(lookup_root(&owner, &ctx, "workspace").is_err());
+    assert!(
+        owner
+            .require_local()
+            .unwrap()
+            .roots
+            .cached_local_roots()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

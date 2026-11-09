@@ -5033,15 +5033,18 @@ impl LocalOwnerFs {
 
     /// D4: 删除整个 root 目录（spec §5.4）。
     ///
-    /// 顺序：解析 root_id → 卸载 bind mount → RootManager::delete_root
-    /// （revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog）→
-    /// OwnerState 索引清理 → PrivateFuseCache 清理。任一步失败时后续步骤
-    /// 不再执行，残留记录由 reconcile_on_startup 的 zombie 检测在下一次
-    /// 启动时清理。
+    /// 顺序：解析 root_id → 判空预检 → 撤销准入（begin_delete）→ 卸载
+    /// bind mount → RootManager::delete_root（物理目录判空 → Meta deactivate
+    /// → catalog → 缓存移除）→ OwnerState 索引清理 → PrivateFuseCache 清理。
+    ///
+    /// 非空 workspace 在预检阶段就返回 ENOTEMPTY，不关闭准入、不卸载 bind。
+    /// 预检与物理删除之间仍可能有并发写入；此时 delete_root 恢复授权，本方法
+    /// 重新请求 egress bind 并原样返回错误，workspace 保持在线。
+    /// 删除已越过物理判定后才失败（如 Meta 不可达）时保留控制面记录，
+    /// 原地重试即可补完；残留记录仍由 reconcile_on_startup 兜底。
     fn rmdir_root(&self, name: &OsStr) -> Result<()> {
-        // 1. 解析 root_id。并发 rmdir 的第二个调用在这里已找不到 name
-        //    条目（第一个调用完成 state.remove_root 后），返回 ENOENT，
-        //    与 delete_root 的缓存移除线性化点一致。
+        // 1. 解析 root_id。并发 rmdir 的第二个调用在第一个完成
+        //    state.remove_root 后找不到 name 条目，返回 ENOENT。
         let root_id = {
             let state = self.state.lock().map_err(|_| poisoned())?;
             let inode = state.root_names.get(name).ok_or_else(|| {
@@ -5056,27 +5059,54 @@ impl LocalOwnerFs {
         };
         afs_logging::info!("ownerfs.rmdir_root.resolved"; "name" => ?name, "root_id" => ?root_id);
 
-        // 2. 卸载活跃 bind mount。detach 失败（如活跃 fd 导致 EBUSY）时
+        // 2. 快速失败：物理目录已非空时直接返回 ENOTEMPTY，不关闭准入也不
+        //    卸载 egress bind。预检排除不了并发写入，delete_root 内的原子
+        //    remove_dir 仍是权威判定点。
+        self.roots.ensure_workspace_empty(&root_id)?;
+
+        // 3. 先撤销本机 FUSE 与远端 peer 的新准入（瞬时、可靠），再卸载
+        //    可能阻塞或失败的 egress bind，保证关闭过程中没有可写入窗口。
+        self.roots.begin_delete(&root_id)?;
+        afs_logging::info!("ownerfs.rmdir_root.revoked"; "root_id" => ?root_id);
+
+        // 4. 卸载活跃 bind mount。detach 失败（如活跃 fd 导致 EBUSY）时
         //    request_unmount 记录日志并保留条目，不阻塞删除流程；物理目录
         //    删除若因残留挂载失败，由下次启动的 reconcile 重试。
-        if let Some(mm) = &self.mount_manager {
-            mm.request_unmount(&root_id)?;
+        if let Some(mm) = &self.mount_manager
+            && let Err(error) = mm.request_unmount(&root_id)
+        {
+            // 删除尚未开始：恢复准入，失败无副作用。
+            self.roots.cancel_delete(&root_id);
+            return Err(error);
         }
         afs_logging::info!("ownerfs.rmdir_root.unmounted"; "root_id" => ?root_id);
 
-        // 3. RootManager::delete_root（revoke → 缓存移除 → Meta deactivate
-        //    → 物理目录 → catalog）。
-        self.roots.delete_root(&root_id)?;
+        // 5. RootManager::delete_root（物理目录判空 → Meta deactivate →
+        //    catalog → 缓存移除）。
+        if let Err(error) = self.roots.delete_root(&root_id) {
+            // 物理删除失败时授权已恢复，重新挂载 egress bind 让 workspace
+            // 保持在线；Meta 失败发生在物理删除之后，目录已不存在，不需重挂。
+            if self.roots.root_is_active(&root_id)
+                && let Some(mm) = &self.mount_manager
+                && let Err(mount_error) = mm.request_mount(root_id.clone(), name.to_os_string())
+            {
+                afs_logging::warn!(
+                    "ownerfs.rmdir_root.remount_failed";
+                    "root_id" => ?root_id, "error" => mount_error.to_string()
+                );
+            }
+            return Err(error);
+        }
         afs_logging::info!("ownerfs.rmdir_root.root_deleted"; "root_id" => ?root_id);
 
-        // 4. 清除 OwnerState 中的 FUSE 索引。
+        // 6. 清除 OwnerState 中的 FUSE 索引。
         {
             let mut state = self.state.lock().map_err(|_| poisoned())?;
             state.remove_root(&root_id);
         }
         afs_logging::info!("ownerfs.rmdir_root.state_cleaned"; "root_id" => ?root_id);
 
-        // 5. 清除 PrivateFuseCache 中的共享缓存与 native home 索引。
+        // 7. 清除 PrivateFuseCache 中的共享缓存与 native home 索引。
         {
             let mut cache = self
                 .private_cache
