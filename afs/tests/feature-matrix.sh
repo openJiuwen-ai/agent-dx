@@ -29,6 +29,8 @@ matrix=(
   'ownerfs|--no-default-features --features ownerfs'
   'rdma|--features rdma'
   'diagnostics|--features diagnostics'
+  'meta-redis|--no-default-features --features dfs,meta-redis'
+  'meta-etcd|--no-default-features --features dfs,meta-etcd'
 )
 for entry in "${matrix[@]}"; do
   name=${entry%%|*}
@@ -39,7 +41,8 @@ for entry in "${matrix[@]}"; do
   cargo test "${jobs[@]}" --locked -p afs "${flags[@]}" --tests --no-run
 done
 
-# Single-backend builds have no other gate.
+# Single-backend builds have no other gate. They also leave out the Redis and
+# etcd Meta logs, so config_contract checks that those stores are refused.
 for fs in ownerfs dfs; do
   echo "== afs [$fs]: clippy"
   cargo clippy "${jobs[@]}" --locked -p afs --no-default-features --features "$fs" --all-targets -- -D warnings

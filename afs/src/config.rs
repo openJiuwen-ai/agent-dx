@@ -16,6 +16,7 @@ mod cross;
 mod dfs;
 mod fuse;
 mod meta;
+#[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
 pub(crate) use meta::MetaStoreTarget;
 mod ownerfs;
 mod tls;

@@ -32,6 +32,11 @@ use crate::dfs::{
     StorageDeviceDescriptor, WriteLease,
 };
 
+/// Checkpoint image bound of the etcd backend.
+pub const ETCD_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
+/// Default uncheckpointed log bound of the etcd backend (`meta_wal_max_bytes`).
+pub const ETCD_WAL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
 pub mod codec;
 #[cfg(test)]
 mod crash_tests;
@@ -39,15 +44,18 @@ mod history;
 pub(crate) use history::Limits as HistoryLimits;
 pub mod journal;
 pub use journal::MetaLog;
+#[cfg(feature = "meta-etcd")]
 pub mod etcd_log;
+#[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
 pub mod kv_log;
-#[cfg(test)]
+#[cfg(all(test, any(feature = "meta-redis", feature = "meta-etcd")))]
 mod kv_log_tests;
 pub mod local_log;
 pub mod log;
 #[cfg(test)]
 mod log_contract_tests;
 mod profile;
+#[cfg(feature = "meta-redis")]
 pub mod redis_log;
 mod state;
 use state::State;

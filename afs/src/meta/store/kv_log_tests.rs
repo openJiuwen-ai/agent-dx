@@ -3,22 +3,26 @@
 //! durability probe. Like the shared contract suite they need a dedicated
 //! service and are `#[ignore]`d; selected without an endpoint they fail.
 
+#[cfg(feature = "meta-etcd")]
+use super::log_contract_tests::{ETCD_TEST_MAX_REQUEST_BYTES, etcd_endpoints};
 use super::{
-    NodeSessionLease, RequestKey,
     journal::{LogTip, MetaLog, encode_frame, test_records},
-    kv_log::{CrashPoint, KvLog, KvService, RedisLog, arm_crash},
+    kv_log::{CrashPoint, KvLog, KvService, arm_crash},
     log::{Record, StateImage},
-    log_contract_tests::{
-        ETCD_TEST_MAX_REQUEST_BYTES, REDIS_GATE, etcd_endpoints, kv_options, redis_url,
-        unique_prefix,
-    },
+    log_contract_tests::{kv_options, padded_records, unique_prefix},
     state::State,
 };
-use std::{future::Future, pin::Pin, time::Duration};
+#[cfg(feature = "meta-redis")]
+use super::{
+    kv_log::RedisLog,
+    log_contract_tests::{REDIS_GATE, redis_url},
+};
+use std::{future::Future, pin::Pin};
 
 type Connect<S> = Box<dyn Fn() -> Pin<Box<dyn Future<Output = S> + Send>>>;
 type Open<S> = Box<dyn Fn() -> Pin<Box<dyn Future<Output = afs_error::Result<KvLog<S>>> + Send>>>;
 
+#[cfg(feature = "meta-redis")]
 fn redis_pair(
     prefix: String,
     chunk: Option<usize>,
@@ -50,6 +54,7 @@ fn redis_pair(
     (connect, open)
 }
 
+#[cfg(feature = "meta-etcd")]
 fn etcd_pair(
     prefix: String,
     max_request_bytes: usize,
@@ -134,34 +139,6 @@ async fn refuses_bad_chain_terms<S: KvService>(make: impl Fn() -> (Connect<S>, O
         assert_eq!(frames(&after), frames(&before));
         assert_eq!(frames(&after).len(), 2);
     }
-}
-
-/// Records whose framed size is about `pad` bytes each, a valid chain.
-pub(super) fn padded_records(count: usize, pad: usize) -> Vec<Record> {
-    let mut state = State::default();
-    let mut records = Vec::new();
-    for number in 0..count {
-        let (next, _, record) = state
-            .prepare_node_record(
-                RequestKey::new("kv", format!("padded-{number}")),
-                NodeSessionLease {
-                    node_id: format!("node-{number}"),
-                    session_id: format!("session-{number}"),
-                    grpc_addr: "g".repeat(pad),
-                    data_addr: "data".into(),
-                    rest_addr: "rest".into(),
-                    ownerfs_enabled: true,
-                    storage_devices: Vec::new(),
-                    lease_ttl: Duration::from_secs(30),
-                },
-                12345,
-                64 * 1024 * 1024,
-            )
-            .unwrap();
-        state = next;
-        records.push(record.unwrap().into());
-    }
-    records
 }
 
 fn image_after(records: &[Record]) -> Vec<u8> {
@@ -250,6 +227,7 @@ async fn checkpoint_chunks_and_cleanup<S: KvService>(
     assert_eq!(again.recover().await.unwrap().tip, tip);
 }
 
+#[cfg(feature = "meta-redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a dedicated Redis: set AFS_TEST_REDIS_URL and run with --ignored"]
 async fn redis_refuses_bad_chain_terms() {
@@ -257,12 +235,14 @@ async fn redis_refuses_bad_chain_terms() {
     refuses_bad_chain_terms(|| redis_pair(unique_prefix(), None)).await;
 }
 
+#[cfg(feature = "meta-etcd")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a dedicated etcd: set AFS_TEST_ETCD_ENDPOINTS and run with --ignored"]
 async fn etcd_refuses_bad_chain_terms() {
     refuses_bad_chain_terms(|| etcd_pair(unique_prefix(), ETCD_TEST_MAX_REQUEST_BYTES)).await;
 }
 
+#[cfg(feature = "meta-redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a dedicated Redis: set AFS_TEST_REDIS_URL and run with --ignored"]
 async fn redis_checkpoint_chunks_and_cleanup() {
@@ -271,6 +251,7 @@ async fn redis_checkpoint_chunks_and_cleanup() {
     checkpoint_chunks_and_cleanup(connect, open, 2048).await;
 }
 
+#[cfg(feature = "meta-etcd")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a dedicated etcd: set AFS_TEST_ETCD_ENDPOINTS and run with --ignored"]
 async fn etcd_checkpoint_chunks_and_cleanup() {
@@ -279,6 +260,7 @@ async fn etcd_checkpoint_chunks_and_cleanup() {
     checkpoint_chunks_and_cleanup(connect, open, 100 * 1024).await;
 }
 
+#[cfg(feature = "meta-redis")]
 /// Redis is refused unless an acknowledged write is durable: `appendfsync`
 /// other than `always`, an eviction policy, or a TTL on a Meta key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -520,6 +502,7 @@ async fn staged_cleanup_bounded<S: KvService>(connect: Connect<S>, open: Open<S>
     assert_eq!(log.recover().await.unwrap().records.len(), 0);
 }
 
+#[cfg(feature = "meta-redis")]
 fn redis_staged() -> (
     Connect<super::redis_log::RedisService>,
     Open<super::redis_log::RedisService>,
@@ -527,6 +510,7 @@ fn redis_staged() -> (
     redis_pair(unique_prefix(), Some(256 * 1024))
 }
 
+#[cfg(feature = "meta-etcd")]
 fn etcd_staged() -> (
     Connect<super::etcd_log::EtcdService>,
     Open<super::etcd_log::EtcdService>,
@@ -534,6 +518,7 @@ fn etcd_staged() -> (
     etcd_pair(unique_prefix(), 256 * 1024)
 }
 
+#[cfg(feature = "meta-redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a dedicated Redis: set AFS_TEST_REDIS_URL and run with --ignored"]
 async fn redis_staged_records() {
@@ -546,6 +531,7 @@ async fn redis_staged_records() {
     staged_cleanup_bounded(connect, open).await;
 }
 
+#[cfg(feature = "meta-etcd")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a dedicated etcd: set AFS_TEST_ETCD_ENDPOINTS and run with --ignored"]
 async fn etcd_staged_records() {

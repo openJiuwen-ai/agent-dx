@@ -291,44 +291,12 @@ pub async fn open_configured_store(cfg: &Config) -> Result<Option<Arc<store::Sto
                 },
             )?)
         }
+        #[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
+        MetaStoreBackend::Redis | MetaStoreBackend::Etcd => open_kv_log(cfg, &limits).await?,
+        // `meta_store_target` refuses these first; kept for direct callers.
+        #[cfg(not(any(feature = "meta-redis", feature = "meta-etcd")))]
         MetaStoreBackend::Redis | MetaStoreBackend::Etcd => {
-            let options = store::kv_log::KvLogOptions {
-                record_max_bytes: limits.record_max_bytes,
-                batch_max_bytes: limits.batch_max_bytes,
-                wal_max_bytes: limits.wal_max_bytes,
-                image_max_bytes: if cfg.meta_store == MetaStoreBackend::Etcd {
-                    // etcd keeps old and new images and MVCC history inside
-                    // its quota (default 2 GiB): half the local bound.
-                    store::kv_log::ETCD_IMAGE_MAX_BYTES
-                } else {
-                    store::journal::CheckpointLimits::default().image_max_bytes
-                },
-            };
-            match cfg.meta_store_target()? {
-                crate::config::MetaStoreTarget::Redis { url, prefix } => {
-                    afs_logging::info!("meta.store.redis"; "instance" => &cfg.id, "prefix" => &prefix);
-                    Arc::new(store::kv_log::RedisLog::open_redis(&url, &prefix, options).await?)
-                }
-                crate::config::MetaStoreTarget::Etcd {
-                    endpoints,
-                    prefix,
-                    max_request_bytes,
-                } => {
-                    afs_logging::info!("meta.store.etcd"; "instance" => &cfg.id, "prefix" => &prefix);
-                    Arc::new(
-                        store::kv_log::EtcdLog::open_etcd(
-                            &endpoints,
-                            &prefix,
-                            max_request_bytes,
-                            options,
-                        )
-                        .await?,
-                    )
-                }
-                crate::config::MetaStoreTarget::Local => {
-                    return Err("redis/etcd Meta store without its endpoint".into());
-                }
-            }
+            return Err("afs-meta was built without the meta-redis and meta-etcd features".into());
         }
         MetaStoreBackend::LocalFile => {
             let path = cfg.data_dir.join("meta-store");
@@ -355,6 +323,67 @@ pub async fn open_configured_store(cfg: &Config) -> Result<Option<Arc<store::Sto
         )
         .await?,
     )))
+}
+
+/// Opens the Redis or etcd Meta log. A backend left out of the build is
+/// refused by `meta_store_target` before this point.
+#[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
+async fn open_kv_log(
+    cfg: &Config,
+    limits: &store::local_log::LocalLogOptions,
+) -> Result<Arc<dyn store::journal::MetaLog>, BoxError> {
+    match cfg.meta_store_target()? {
+        #[cfg(feature = "meta-redis")]
+        crate::config::MetaStoreTarget::Redis { url, prefix } => {
+            afs_logging::info!("meta.store.redis"; "instance" => &cfg.id, "prefix" => &prefix);
+            let options = kv_log_options(
+                limits,
+                store::journal::CheckpointLimits::default().image_max_bytes,
+            );
+            Ok(Arc::new(
+                store::kv_log::RedisLog::open_redis(&url, &prefix, options).await?,
+            ))
+        }
+        #[cfg(feature = "meta-etcd")]
+        crate::config::MetaStoreTarget::Etcd {
+            endpoints,
+            prefix,
+            max_request_bytes,
+        } => {
+            afs_logging::info!("meta.store.etcd"; "instance" => &cfg.id, "prefix" => &prefix);
+            // etcd keeps old and new images and MVCC history inside its quota
+            // (default 2 GiB): half the local bound.
+            let options = kv_log_options(limits, store::ETCD_IMAGE_MAX_BYTES);
+            Ok(Arc::new(
+                store::kv_log::EtcdLog::open_etcd(&endpoints, &prefix, max_request_bytes, options)
+                    .await?,
+            ))
+        }
+        #[cfg(not(feature = "meta-redis"))]
+        crate::config::MetaStoreTarget::Redis { .. } => {
+            Err("afs-meta was built without the meta-redis feature".into())
+        }
+        #[cfg(not(feature = "meta-etcd"))]
+        crate::config::MetaStoreTarget::Etcd { .. } => {
+            Err("afs-meta was built without the meta-etcd feature".into())
+        }
+        crate::config::MetaStoreTarget::Local => {
+            Err("redis/etcd Meta store without its endpoint".into())
+        }
+    }
+}
+
+#[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
+fn kv_log_options(
+    limits: &store::local_log::LocalLogOptions,
+    image_max_bytes: usize,
+) -> store::kv_log::KvLogOptions {
+    store::kv_log::KvLogOptions {
+        record_max_bytes: limits.record_max_bytes,
+        batch_max_bytes: limits.batch_max_bytes,
+        wal_max_bytes: limits.wal_max_bytes,
+        image_max_bytes,
+    }
 }
 
 fn peer_identity_policy(

@@ -577,10 +577,44 @@ fn p3_settings_default_is_local_file_without_retired_endpoints() {
     assert_eq!(output["meta_etcd_max_request_bytes"], 1536 * 1024);
 }
 
+/// R16: the Redis and etcd Meta logs are the `meta-redis` / `meta-etcd`
+/// features. A Meta built without one refuses that `meta_store` when the
+/// configuration resolves, with a message naming the feature, instead of
+/// starting and failing on first use.
+#[cfg(not(all(feature = "meta-redis", feature = "meta-etcd")))]
+#[test]
+fn r16_meta_store_without_its_backend_feature_is_refused() {
+    let cases: Vec<(&str, &[&str], &str)> = vec![
+        #[cfg(not(feature = "meta-redis"))]
+        (
+            "redis",
+            &["--meta-redis-url", "redis://10.0.0.1:6379/0"],
+            "meta-redis",
+        ),
+        #[cfg(not(feature = "meta-etcd"))]
+        (
+            "etcd",
+            &["--meta-etcd-endpoints", "http://10.0.0.1:2379"],
+            "meta-etcd",
+        ),
+    ];
+    for (store, endpoint, feature) in cases {
+        let cli = Cli::parse_from(
+            ["afs-meta", "--meta-store", store]
+                .into_iter()
+                .chain(endpoint.iter().copied()),
+        );
+        let error = Config::resolve(Role::Meta, cli).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{store}");
+        assert!(error.message().contains(feature), "{store}: {error}");
+    }
+}
+
 /// R16: `redis` and `etcd` are Meta log backends, each requiring its own
 /// endpoint and rejecting the other's; the retired `etcd_endpoint` /
 /// `redis_endpoint` keys stay rejected; Nodes reject every Meta store key;
 /// printed configuration hides URL credentials.
+#[cfg(all(feature = "meta-redis", feature = "meta-etcd"))]
 #[test]
 fn r16_redis_and_etcd_backends_need_their_own_endpoint() {
     let redis = Config::resolve(

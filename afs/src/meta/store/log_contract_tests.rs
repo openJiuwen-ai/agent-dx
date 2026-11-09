@@ -11,13 +11,18 @@
 //! run them with `--ignored` and `AFS_TEST_REDIS_URL` / `AFS_TEST_ETCD_ENDPOINTS`
 //! set. A selected suite without its endpoint fails; it never passes silently.
 
+#[cfg(feature = "meta-etcd")]
+use super::kv_log::EtcdLog;
+#[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
+use super::kv_log::KvLogOptions;
+#[cfg(feature = "meta-redis")]
+use super::kv_log::RedisLog;
 use super::{
     NodeSessionLease, RequestKey,
     journal::{
         BATCH_RECORDS_MAX, LogCursor, LogStatus, LogTip, MemoryLog, MemoryLogOptions, MetaLog,
         RecoveredLog, frame_size, test_records,
     },
-    kv_log::{EtcdLog, KvLogOptions, RedisLog},
     local_log::{LOG_HEADER_BYTES, LocalLog, LocalLogOptions},
     log::{Record, StateImage},
     state::State,
@@ -92,6 +97,35 @@ fn local_fixture(limits: Option<CaseLimits>) -> Fixture<LocalLog> {
     }
 }
 
+/// Records whose framed size is about `pad` bytes each, a valid chain.
+pub(super) fn padded_records(count: usize, pad: usize) -> Vec<Record> {
+    let mut state = State::default();
+    let mut records = Vec::new();
+    for number in 0..count {
+        let (next, _, record) = state
+            .prepare_node_record(
+                RequestKey::new("kv", format!("padded-{number}")),
+                NodeSessionLease {
+                    node_id: format!("node-{number}"),
+                    session_id: format!("session-{number}"),
+                    grpc_addr: "g".repeat(pad),
+                    data_addr: "data".into(),
+                    rest_addr: "rest".into(),
+                    ownerfs_enabled: true,
+                    storage_devices: Vec::new(),
+                    lease_ttl: Duration::from_secs(30),
+                },
+                12345,
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+        state = next;
+        records.push(record.unwrap().into());
+    }
+    records
+}
+
+#[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
 /// Runs `future` to completion from a synchronous fixture closure. Needs the
 /// multi-thread test runtime.
 pub(super) fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -100,14 +134,17 @@ pub(super) fn block_on<F: std::future::Future>(future: F) -> F::Output {
 
 /// Redis tests share one instance; the probe test changes its settings, so
 /// it takes this gate exclusively while every other Redis test shares it.
+#[cfg(feature = "meta-redis")]
 pub(super) static REDIS_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
+#[cfg(feature = "meta-redis")]
 pub(super) fn redis_url() -> String {
     std::env::var("AFS_TEST_REDIS_URL").expect(
         "the Redis contract needs AFS_TEST_REDIS_URL: a dedicated Redis with appendonly yes, appendfsync always and noeviction",
     )
 }
 
+#[cfg(feature = "meta-etcd")]
 pub(super) fn etcd_endpoints() -> Vec<String> {
     std::env::var("AFS_TEST_ETCD_ENDPOINTS")
         .expect("the etcd contract needs AFS_TEST_ETCD_ENDPOINTS: a dedicated etcd")
@@ -117,14 +154,17 @@ pub(super) fn etcd_endpoints() -> Vec<String> {
 }
 
 /// etcd's default `--max-request-bytes`, the bound the etcd suite runs under.
+#[cfg(feature = "meta-etcd")]
 pub(super) const ETCD_TEST_MAX_REQUEST_BYTES: usize = 1536 * 1024;
 
 /// A fresh key prefix per fixture: every fixture starts at term 1.
+#[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
 pub(super) fn unique_prefix() -> String {
     format!("afs-contract/{}", uuid::Uuid::new_v4())
 }
 
 /// The Meta defaults; records beyond one request are staged (`kv_log`).
+#[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
 pub(super) fn kv_options(limits: Option<CaseLimits>) -> KvLogOptions {
     limits.map_or(
         KvLogOptions {
@@ -142,6 +182,7 @@ pub(super) fn kv_options(limits: Option<CaseLimits>) -> KvLogOptions {
     )
 }
 
+#[cfg(feature = "meta-redis")]
 fn redis_fixture(limits: Option<CaseLimits>) -> Fixture<RedisLog> {
     let url = redis_url();
     let prefix = unique_prefix();
@@ -176,6 +217,7 @@ fn redis_fixture(limits: Option<CaseLimits>) -> Fixture<RedisLog> {
     }
 }
 
+#[cfg(feature = "meta-etcd")]
 fn etcd_fixture(limits: Option<CaseLimits>) -> Fixture<EtcdLog> {
     let endpoints = etcd_endpoints();
     let prefix = unique_prefix();
@@ -775,6 +817,7 @@ async fn local_log_satisfies_contract() {
     contract_suite(local_fixture).await;
 }
 
+#[cfg(feature = "meta-redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a dedicated Redis: set AFS_TEST_REDIS_URL and run with --ignored"]
 async fn redis_log_satisfies_contract() {
@@ -782,6 +825,7 @@ async fn redis_log_satisfies_contract() {
     contract_suite(redis_fixture).await;
 }
 
+#[cfg(feature = "meta-etcd")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a dedicated etcd: set AFS_TEST_ETCD_ENDPOINTS and run with --ignored"]
 async fn etcd_log_satisfies_contract() {
@@ -795,7 +839,7 @@ async fn large_records<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fixture
     let fixture = make(None);
     let log = &fixture.log;
     let term = term_of(log).await;
-    let records = super::kv_log_tests::padded_records(4, 4 * 1024 * 1024);
+    let records = padded_records(4, 4 * 1024 * 1024);
     assert!(frame_size(LogTip::EMPTY.at(term), &records[0]).unwrap() > 4 * 1024 * 1024);
     let tip = log
         .append_and_sync(LogTip::EMPTY.at(term), records[..1].to_vec())

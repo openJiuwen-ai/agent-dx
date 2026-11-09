@@ -9,13 +9,17 @@ description = "Agent FS process and backend foundation"
 publish = false
 
 [features]
-default = ["ownerfs", "dfs", "node-jemalloc"]
+default = ["ownerfs", "dfs", "node-jemalloc", "meta-redis", "meta-etcd"]
 ownerfs = []
 dfs = []
 rdma = ["afs-transport/rdma"]
 # Developer diagnostics compiled out of default builds: Meta store profiling
 # (`AFS_META_PROFILE`) and namespace tracing (`AFS_META_NAMESPACE_TRACE`).
 diagnostics = []
+# Meta 操作日志的 Redis／etcd 后端（`meta/store/{redis,etcd}_log.rs`，R16）。
+# 未编入时配置 `meta_store = "redis"`／`"etcd"` 在 Meta 启动时报错。
+meta-redis = ["dep:redis"]
+meta-etcd = ["dep:etcd-client"]
 # Disable only for allocator comparisons; only afs-node installs it globally.
 node-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
@@ -54,8 +58,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 fuser = { version = "=0.18.0", default-features = false }
 
 # Meta 操作日志的 Redis／etcd 后端（`meta/store/{redis,etcd}_log.rs`，R16）。
-redis = { version = "=1.7.0", default-features = false, features = ["tokio-comp"] }
-etcd-client = { version = "=0.21.1" }
+redis = { version = "=1.7.0", default-features = false, features = ["tokio-comp"], optional = true }
+etcd-client = { version = "=0.21.1", optional = true }
 
 # Meta 服务端 RPC 计数层（`meta/rpc_metrics.rs`）。
 tower = { version = "0.5", features = ["util"] }

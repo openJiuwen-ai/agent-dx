@@ -72,10 +72,7 @@ pub(super) use staged::{part_key, part_owner_of};
 
 pub type KvFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
-/// Checkpoint image bound of the etcd backend.
-pub const ETCD_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
-/// Default uncheckpointed log bound of the etcd backend (`meta_wal_max_bytes`).
-pub const ETCD_WAL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+pub use super::{ETCD_IMAGE_MAX_BYTES, ETCD_WAL_MAX_BYTES};
 /// Frames read per request during recovery and anchor checks.
 pub(super) const FRAME_PAGE: u64 = 256;
 /// Deadline of one service request. An append that misses it has an unknown
@@ -360,10 +357,13 @@ struct KvState {
 }
 
 /// The Redis Meta log.
+#[cfg(feature = "meta-redis")]
 pub type RedisLog = KvLog<super::redis_log::RedisService>;
 /// The etcd Meta log.
+#[cfg(feature = "meta-etcd")]
 pub type EtcdLog = KvLog<super::etcd_log::EtcdService>;
 
+#[cfg(feature = "meta-redis")]
 impl RedisLog {
     pub async fn open_redis(url: &str, prefix: &str, options: KvLogOptions) -> Result<Self> {
         Self::open(
@@ -374,6 +374,7 @@ impl RedisLog {
     }
 }
 
+#[cfg(feature = "meta-etcd")]
 impl EtcdLog {
     pub async fn open_etcd(
         endpoints: &[String],
@@ -400,6 +401,7 @@ impl EtcdLog {
 /// Room etcd needs beside the log: two images (old and new during a switch),
 /// the uncheckpointed log and 1 GiB for MVCC history until compaction. A
 /// smaller quota is reported, not refused: etcd turns read-only when full.
+#[cfg(any(feature = "meta-etcd", test))]
 pub(super) fn etcd_quota_warning(quota: u64, options: KvLogOptions) -> Option<String> {
     let needed = (options.image_max_bytes as u64)
         .saturating_mul(2)

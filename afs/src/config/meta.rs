@@ -65,7 +65,7 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> MetaSettings {
             .meta_wal_max_bytes
             .or(file.meta_wal_max_bytes)
             .unwrap_or(if meta_store == MetaStoreBackend::Etcd {
-                crate::meta::store::kv_log::ETCD_WAL_MAX_BYTES
+                crate::meta::store::ETCD_WAL_MAX_BYTES
             } else {
                 log_defaults.wal_max_bytes
             }),
@@ -181,6 +181,11 @@ impl Config {
         let etcd = !self.meta_etcd_endpoints.is_empty();
         match self.meta_store {
             MetaStoreBackend::Redis => {
+                if !cfg!(feature = "meta-redis") {
+                    return Err(invalid(
+                        "meta_store = \"redis\" needs afs-meta built with the meta-redis feature",
+                    ));
+                }
                 if etcd {
                     return Err(invalid(
                         "meta_etcd_endpoints is only valid with meta_store = \"etcd\"",
@@ -195,6 +200,11 @@ impl Config {
                 })
             }
             MetaStoreBackend::Etcd => {
+                if !cfg!(feature = "meta-etcd") {
+                    return Err(invalid(
+                        "meta_store = \"etcd\" needs afs-meta built with the meta-etcd feature",
+                    ));
+                }
                 if redis.is_some() {
                     return Err(invalid(
                         "meta_redis_url is only valid with meta_store = \"redis\"",
