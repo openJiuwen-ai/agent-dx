@@ -160,11 +160,14 @@ struct Inner {
     checkpoint_install: Mutex<()>,
     _lock: File,
     state: Mutex<LocalState>,
-    /// Test-only: runs once inside the next append, after the CURRENT term
-    /// and tip checks and before any byte is written.
-    #[cfg(test)]
-    before_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
+/// Test-only hooks, by log directory: each runs once inside the next append
+/// to that directory, after the CURRENT term and tip checks and before any
+/// byte is written.
+#[cfg(test)]
+type BeforeWrite = Vec<(PathBuf, Box<dyn FnOnce() + Send>)>;
+#[cfg(test)]
+static BEFORE_WRITE: Mutex<BeforeWrite> = Mutex::new(Vec::new());
 impl Inner {
     fn ensure_owner(&self) -> Result<()> {
         if self.owner_pid != std::process::id() {
@@ -294,8 +297,6 @@ impl LocalLog {
                 checkpoint_limits,
                 checkpoint_install: Mutex::new(()),
                 _lock: lock,
-                #[cfg(test)]
-                before_write: Mutex::new(None),
                 state: Mutex::new(LocalState {
                     file: replay.file,
                     tip: replay.recovered.tip,
@@ -332,8 +333,8 @@ impl LocalLog {
     /// CURRENT term check and the first written byte.
     #[cfg(test)]
     pub(super) fn pause_next_append_before_write(&self, hook: impl FnOnce() + Send + 'static) {
-        if let Ok(mut slot) = self.inner.before_write.lock() {
-            *slot = Some(Box::new(hook));
+        if let Ok(mut hooks) = BEFORE_WRITE.lock() {
+            hooks.push((self.inner.dir.clone(), Box::new(hook)));
         }
     }
     /// Test-only: replace the active WAL descriptor with a read-only one so the
@@ -927,12 +928,12 @@ impl MetaLog for LocalLog {
                     .ok_or_else(|| invalid_log("tail generation exhausted"))?;
                 let start = state.end;
                 #[cfg(test)]
-                if let Some(hook) = inner
-                    .before_write
-                    .lock()
-                    .ok()
-                    .and_then(|mut slot| slot.take())
-                {
+                let hook = BEFORE_WRITE.lock().ok().and_then(|mut hooks| {
+                    let index = hooks.iter().position(|(dir, _)| *dir == inner.dir)?;
+                    Some(hooks.swap_remove(index).1)
+                });
+                #[cfg(test)]
+                if let Some(hook) = hook {
                     hook();
                 }
                 let result = (|| {

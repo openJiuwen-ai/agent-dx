@@ -364,8 +364,6 @@ pub struct KvLog<S: KvService> {
     state: tokio::sync::Mutex<KvState>,
     install: tokio::sync::Mutex<()>,
     poisoned: AtomicBool,
-    #[cfg(test)]
-    fail_next_append: AtomicBool,
 }
 
 impl<S: KvService> KvLog<S> {
@@ -409,8 +407,6 @@ impl<S: KvService> KvLog<S> {
             }),
             install: tokio::sync::Mutex::new(()),
             poisoned: AtomicBool::new(false),
-            #[cfg(test)]
-            fail_next_append: AtomicBool::new(false),
         })
     }
 
@@ -423,11 +419,11 @@ impl<S: KvService> KvLog<S> {
         self.term
     }
 
-    /// Test-only: the next append fails before sending anything and then
-    /// every operation fails, like a write whose outcome is unknown.
+    /// Test-only: model a write whose outcome is unknown: nothing is sent and
+    /// the next append, like every later operation, fails until reopened.
     #[cfg(test)]
     pub(super) fn inject_write_failure(&self) {
-        self.fail_next_append.store(true, Ordering::Release);
+        self.poisoned.store(true, Ordering::Release);
     }
 
     fn check_latch(&self) -> Result<()> {
@@ -800,10 +796,6 @@ impl<S: KvService> MetaLog for KvLog<S> {
                 .checked_add(bytes as u64)
                 .filter(|total| *total <= self.options.wal_max_bytes)
                 .ok_or_else(|| full("Meta log byte budget exhausted; checkpoint required"))?;
-            #[cfg(test)]
-            if self.fail_next_append.swap(false, Ordering::AcqRel) {
-                return Err(self.poison(unavailable("injected Meta log write failure")));
-            }
             let expected_tip = (expected.tip != LogTip::EMPTY).then(|| encode_tip(expected.tip));
             let outcome = timed(
                 "append",
