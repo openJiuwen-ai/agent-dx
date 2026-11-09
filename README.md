@@ -218,9 +218,8 @@ python3 build/ci/run.py afs
 `afs-check` uses default OwnerFs and DFS features. The optional all-features/RDMA lint is explicit (`ADX_AFS_ALL_FEATURES=1 make afs-lint`) and first checks for `libibverbs` development files.
 
 The subsystem responsibilities and current limits are in [architecture](docs/architecture/afs.md),
-[deployment](docs/deployment/afs.md), [testing](docs/testing/afs.md), the
-[AFS roadmap](docs/development/afs-roadmap.md), and the
-[DFS plan](docs/development/dfs-plan.md). Provenance and dated historical
+[deployment](docs/deployment/afs.md), [testing](docs/testing/afs.md), and the
+[support boundary and known limitations](docs/architecture/afs-support-boundary.md). Provenance and dated historical
 evidence remain under `docs/migration/`. The packaged configuration examples live under
 [AFS examples](build/config/examples/afs/). Ordinary release packages do not include them unless `ADX_WITH_AFS=1` is set.
 

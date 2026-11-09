@@ -427,9 +427,9 @@ pub struct Cli {
     /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
     #[arg(long, hide = true)]
     pub dfs_read_diagnostics_enabled: Option<bool>,
-    /// Remote-read body verification for native DFS gRPC: `off` (default)
-    /// delivers peer bytes unchecked; `receiver` verifies them against the
-    /// Meta-trusted CRC table. Only the reading Node's setting matters.
+    /// Remote-read body verification for native DFS gRPC: `receiver`
+    /// (default) verifies peer bytes against the Meta-trusted CRC table;
+    /// `off` delivers them unchecked. Only the reading Node's setting matters.
     #[arg(long)]
     pub dfs_read_crc_mode: Option<DfsReadCrcMode>,
     #[arg(long)]

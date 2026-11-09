@@ -1,6 +1,6 @@
 //! Registry of AFS persistent formats and versioned protocols (R17).
 //!
-//! Rules (also in `docs/architecture/afs.md`, "持久格式版本规则"):
+//! Rules (also in `docs/architecture/afs.md`, "持久格式与协议版本规则"):
 //!
 //! 1. Every persistent format or versioned protocol has exactly one
 //!    [`FormatKind`] and one current version, defined here. Readers and
