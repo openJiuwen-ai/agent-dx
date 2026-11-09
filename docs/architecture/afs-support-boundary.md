@@ -23,8 +23,8 @@ POSIX 与 Linux 文件操作的逐项行为见 [POSIX 支持边界](afs-posix-bo
 | `local-file` × 1 副本 | 全部单机 e2e 套件（`afs/tests/run.py`：`local-basic`、`s0-semantics`、`local-write-special`、`local-read-special`、`local-extended`、`local-resources`、`posix-boundary`、`local-performance`）、`fuse_contract` 真实挂载用例、性能矩阵 |
 | `local-file` × 2 副本 | `local-write-special`（`copies=2`）、多机套件（`cluster-*`）、降级写与修复故障场景（`local-fault`：`degraded_write_*`、`repair_*`、`scrub_restores_bad_replica` 等）、性能矩阵 |
 | `local-file` × S3 | 故障场景（`local-fault` 的驱动 `afs/tests/faults/harness.sh` 用 S3 模式的 MinIO：`s3_reclaim`、`s3_deleter_lost`、`s3_deleter_stuck` 等）、本地与云端性能矩阵；e2e 套件不覆盖 S3 |
-| `redis`／`etcd` × 1 副本 | `s0-semantics` 与 `local-basic` 在两个后端上各跑一次；与 `local-file` 同一组日志合同测试（`afs/src/meta/store/log_contract_tests.rs`，以 `--ignored` 连真实服务跑）；性能只有与 Meta 同机、回环连接的数字（[部署说明](../deployment/afs.md#meta-操作日志的-redisetcd-后端)） |
-| `redis`／`etcd` × S3 | 故障场景 `meta_backend_redis`、`meta_backend_etcd`（fencing、后端 `kill -9` 后已确认写不丢） |
+| `redis`／`etcd` × 1 副本 | `s0-semantics` 与 `local-basic` 在两个后端上各跑一次；与 `local-file` 同一组日志合同测试（`afs/src/meta/store/log_contract_tests.rs`，以 `--ignored` 连真实服务跑）；故障场景 `meta_backend_redis`、`meta_backend_etcd`（本地盘 1 副本、单 Node：Meta `kill -9` 后从后端恢复；误启动的第二个 Meta 打开同一后端与前缀后，旧 Meta 的写被 fencing 拒绝、其 Node 自行退出；后端 `kill -9` 前至少一条已确认写，重启后逐条校验路径与 SHA-256 并验证新写入）；性能只有与 Meta 同机、回环连接的数字（[部署说明](../deployment/afs.md#meta-操作日志的-redisetcd-后端)） |
+| `redis`／`etcd` × S3 | 无专门用例；Meta 日志后端与存储模式之间没有耦合（同一状态机与提交路径），按"支持"列出 |
 | `redis`／`etcd` × 2 副本 | 无专门用例；Meta 日志后端与存储模式之间没有耦合（同一状态机与提交路径），按"支持"列出 |
 | `memory` | 只用于可丢弃状态的测试；重启不保留，Node 默认不对它报告就绪（`allow_volatile_meta`） |
 

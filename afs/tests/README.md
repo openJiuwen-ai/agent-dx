@@ -336,10 +336,11 @@ python3 afs/tests/run.py run --case 'ownerfs.basic.*' --case 'dfs.basic.*' \
   文件锁不跨节点互斥（决策11本轮不支持）。按决策改变的断言在对应重构步骤中同步更新；不属于默认基础集合。
 - `posix-boundary`：DFS 的 POSIX 支持边界（R20），每项断言应用经真实内核挂载看到的结果，清单与归类见
   [AFS DFS 的 POSIX 支持边界](../../docs/architecture/afs-posix-boundary.md)；不属于默认基础集合。
-- `local-fault`：DFS 故障场景（S2–S4 累积的 24 个）：GC 参与者失联、S3 回收、坏副本上报与不交付、擦盘或第三节点
+- `local-fault`：DFS 故障场景（S2–S4 累积的 24 个，加 R94 的 1 个）：GC 参与者失联、S3 回收、坏副本上报与不交付、擦盘或第三节点
   上的修复、R20 rename/追加、R76 写接纳、R75 长时间直读、R72 大目录、满盘 ENOSPC、R83 关闭后立即 rename、R82 新集群
   owner 读、Q08 巡检中重启、R12 副本被杀或挂起时的降级写、R18 SDK 客户端崩溃、S4-9 S3 删除者失联或卡住、S4-10 潜伏
-  坏副本、R81 固定版本读者、S4-16 巡检、R16 Meta 在 Redis／etcd 上被杀、被 fence、后端丢失。每个用例停掉套件集群，
+  坏副本、R81 固定版本读者、S4-16 巡检、R16 Meta 在 Redis／etcd 上被杀、被 fence、后端丢失（判定见
+  `faults/meta_backend_judge.py`）、R94 读者跨本机提交与他机提交后在 GC 下仍读到推进后的版本。每个用例停掉套件集群，
   用 `faults/harness.sh` 在本机起一个短时集群（Meta 与至多两个 Node，端口 7400–7521），由 `faults/` 中的阶段脚本
   注入故障并判定；这是"复用 `Cluster`"原则的例外，因为 kill -9、擦盘、改坏副本、满盘、冻结 S3 连接不在 `Cluster`
   的能力内。需要 root；S3、Redis、etcd 场景需在环境文件写 `"fault_tools": {"minio", "redis_server", "redis_cli",
