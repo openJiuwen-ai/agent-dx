@@ -32,11 +32,12 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> MetaSettings {
     let log_defaults = crate::meta::store::local_log::LocalLogOptions::default();
     let maintenance = crate::meta::store::journal::MaintenancePolicy::default();
     let history = crate::meta::store::HistoryLimits::default();
+    let meta_store = cli
+        .meta_store
+        .or(file.meta_store)
+        .unwrap_or(MetaStoreBackend::LocalFile);
     MetaSettings {
-        meta_store: cli
-            .meta_store
-            .or(file.meta_store)
-            .unwrap_or(MetaStoreBackend::LocalFile),
+        meta_store,
         meta_redis_url: cli.meta_redis_url.clone().or(file.meta_redis_url.clone()),
         meta_etcd_endpoints: cli
             .meta_etcd_endpoints
@@ -63,7 +64,11 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> MetaSettings {
         meta_wal_max_bytes: cli
             .meta_wal_max_bytes
             .or(file.meta_wal_max_bytes)
-            .unwrap_or(log_defaults.wal_max_bytes),
+            .unwrap_or(if meta_store == MetaStoreBackend::Etcd {
+                crate::meta::store::kv_log::ETCD_WAL_MAX_BYTES
+            } else {
+                log_defaults.wal_max_bytes
+            }),
         meta_checkpoint_wal_bytes: cli
             .meta_checkpoint_wal_bytes
             .or(file.meta_checkpoint_wal_bytes)

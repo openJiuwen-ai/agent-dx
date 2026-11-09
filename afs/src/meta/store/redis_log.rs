@@ -12,7 +12,9 @@ use redis::{AsyncCommands, Value, aio::MultiplexedConnection};
 
 use super::{
     journal::{invalid_log, unavailable},
-    kv_log::{Head, KvFuture, KvService, Swap, chunk_id_of, chunk_key, frame_key},
+    kv_log::{
+        Head, KvFuture, KvService, Swap, chunk_id_of, chunk_key, frame_key, part_key, part_owner_of,
+    },
 };
 
 /// Framed bytes of one append script. Redis accepts much larger requests;
@@ -421,6 +423,57 @@ impl KvService for RedisService {
                 )
                 .await?,
             )
+        })
+    }
+
+    fn put_part<'a>(
+        &'a self,
+        term: u64,
+        sequence: u64,
+        index: u32,
+        bytes: &'a [u8],
+    ) -> KvFuture<'a, ()> {
+        Box::pin(async move {
+            let _: () = self
+                .query(
+                    redis::cmd("SET")
+                        .arg(part_key(&self.prefix, term, sequence, index))
+                        .arg(bytes),
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn part(&self, term: u64, sequence: u64, index: u32) -> KvFuture<'_, Option<Vec<u8>>> {
+        Box::pin(async move {
+            let value: Value = self
+                .query(redis::cmd("GET").arg(part_key(&self.prefix, term, sequence, index)))
+                .await?;
+            bytes_of(value)
+        })
+    }
+
+    fn part_owners(&self) -> KvFuture<'_, Vec<(u64, u64)>> {
+        Box::pin(async move {
+            let mut owners: Vec<(u64, u64)> = self
+                .scan(&self.pattern("part/*"))
+                .await?
+                .iter()
+                .filter_map(|key| part_owner_of(&self.prefix, key))
+                .collect();
+            owners.sort_unstable();
+            owners.dedup();
+            Ok(owners)
+        })
+    }
+
+    fn delete_parts(&self, term: u64, sequence: u64) -> KvFuture<'_, ()> {
+        Box::pin(async move {
+            let keys = self
+                .scan(&self.pattern(&format!("part/{term:020}/{sequence:020}/*")))
+                .await?;
+            self.unlink(&keys).await
         })
     }
 

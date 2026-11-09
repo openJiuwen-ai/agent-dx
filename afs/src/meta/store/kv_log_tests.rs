@@ -6,10 +6,10 @@
 use super::{
     NodeSessionLease, RequestKey,
     journal::{LogTip, MetaLog, encode_frame, test_records},
-    kv_log::{EtcdLog, KvLog, KvLogOptions, KvService, RedisLog},
+    kv_log::{CrashPoint, KvLog, KvService, RedisLog, arm_crash},
     log::{Record, StateImage},
     log_contract_tests::{
-        CaseLimits, ETCD_TEST_MAX_REQUEST_BYTES, REDIS_GATE, etcd_endpoints, kv_options, redis_url,
+        ETCD_TEST_MAX_REQUEST_BYTES, REDIS_GATE, etcd_endpoints, kv_options, redis_url,
         unique_prefix,
     },
     state::State,
@@ -27,7 +27,7 @@ fn redis_pair(
     Open<super::redis_log::RedisService>,
 ) {
     let url = redis_url();
-    let options = kv_options(None, 256 * 1024 * 1024);
+    let options = kv_options(None);
     let (connect_url, connect_prefix) = (url.clone(), prefix.clone());
     let connect: Connect<super::redis_log::RedisService> = Box::new(move || {
         let (url, prefix) = (connect_url.clone(), connect_prefix.clone());
@@ -58,14 +58,7 @@ fn etcd_pair(
     Open<super::etcd_log::EtcdService>,
 ) {
     let endpoints = etcd_endpoints();
-    let options = kv_options(
-        Some(CaseLimits {
-            record_max_bytes: max_request_bytes - 64 * 1024,
-            batch_max_bytes: max_request_bytes - 64 * 1024,
-            wal_max_bytes: 1024 * 1024 * 1024,
-        }),
-        max_request_bytes - 64 * 1024,
-    );
+    let options = kv_options(None);
     let (connect_endpoints, connect_prefix) = (endpoints.clone(), prefix.clone());
     let connect: Connect<super::etcd_log::EtcdService> = Box::new(move || {
         let (endpoints, prefix) = (connect_endpoints.clone(), connect_prefix.clone());
@@ -144,7 +137,7 @@ async fn refuses_bad_chain_terms<S: KvService>(make: impl Fn() -> (Connect<S>, O
 }
 
 /// Records whose framed size is about `pad` bytes each, a valid chain.
-fn padded_records(count: usize, pad: usize) -> Vec<Record> {
+pub(super) fn padded_records(count: usize, pad: usize) -> Vec<Record> {
     let mut state = State::default();
     let mut records = Vec::new();
     for number in 0..count {
@@ -162,7 +155,7 @@ fn padded_records(count: usize, pad: usize) -> Vec<Record> {
                     lease_ttl: Duration::from_secs(30),
                 },
                 12345,
-                16 * 1024 * 1024,
+                64 * 1024 * 1024,
             )
             .unwrap();
         state = next;
@@ -295,7 +288,7 @@ async fn redis_probe_refuses_settings_that_lose_acknowledged_writes() {
     let url = redis_url();
     let client = redis::Client::open(url.as_str()).unwrap();
     let mut connection = client.get_multiplexed_async_connection().await.unwrap();
-    let options = kv_options(None, 256 * 1024 * 1024);
+    let options = kv_options(None);
     for (name, unsafe_value, safe_value) in [
         ("appendfsync", "everysec", "always"),
         ("maxmemory-policy", "allkeys-lru", "noeviction"),
@@ -335,24 +328,231 @@ async fn redis_probe_refuses_settings_that_lose_acknowledged_writes() {
     assert!(error.to_string().contains("TTL"), "{error}");
 }
 
-/// The configured request bound caps the append limits.
+/// Records of about 600 KiB: staged on both test services (etcd with 256 KiB
+/// requests, Redis with 256 KiB segments).
+const STAGED_PAD: usize = 600 * 1024;
+
+async fn owners<S: KvService>(connect: &Connect<S>) -> Vec<(u64, u64)> {
+    connect().await.part_owners().await.unwrap()
+}
+
+/// A crash with one segment written, with all segments written and not
+/// committed, and after the commit: recovery shows exactly the committed
+/// records, and no uncommitted segment is ever assembled into one.
+async fn staged_crash_atomicity<S: KvService>(make: impl Fn() -> (Connect<S>, Open<S>)) {
+    for (point, committed) in [
+        (CrashPoint::PartsPartial, false),
+        (CrashPoint::PartsWritten, false),
+        (CrashPoint::AfterCommit, true),
+    ] {
+        let (connect, open) = make();
+        let records = padded_records(3, STAGED_PAD);
+        let log = open().await.unwrap();
+        let term = log.term();
+        let tip = log
+            .append_and_sync(LogTip::EMPTY.at(term), records[..1].to_vec())
+            .await
+            .unwrap();
+        arm_crash(log.identity(), point);
+        assert!(
+            log.append_and_sync(tip.at(term), records[1..2].to_vec())
+                .await
+                .is_err(),
+            "{point:?}: injected crash"
+        );
+        assert!(
+            !owners(&connect).await.is_empty(),
+            "{point:?}: segments written"
+        );
+        drop(log);
+        let reopened = open().await.unwrap();
+        let recovered = reopened.recover().await.unwrap();
+        let want = if committed { 2 } else { 1 };
+        assert_eq!(recovered.records.len(), want, "{point:?}");
+        assert_eq!(
+            recovered
+                .records
+                .iter()
+                .map(|r| serde_json::to_vec(r).unwrap())
+                .collect::<Vec<_>>(),
+            records[..want]
+                .iter()
+                .map(|r| serde_json::to_vec(r).unwrap())
+                .collect::<Vec<_>>(),
+            "{point:?}: only committed records"
+        );
+        // Uncommitted segments are gone; a committed record keeps its own.
+        let live = owners(&connect).await;
+        assert_eq!(
+            live.len(),
+            usize::from(committed) + 1,
+            "{point:?}: {live:?}"
+        );
+        // The next writer appends the same sequence with its own segments.
+        let term = reopened.term();
+        let next = records[want..].to_vec();
+        reopened
+            .append_and_sync(recovered.tip.at(term), next.clone())
+            .await
+            .unwrap();
+        drop(reopened);
+        let last = open().await.unwrap().recover().await.unwrap();
+        assert_eq!(last.records.len(), 3, "{point:?}");
+    }
+}
+
+/// An older writer that keeps staging after a newer writer took over can
+/// neither commit nor overwrite the newer writer's segments.
+async fn staged_fencing<S: KvService>(connect: Connect<S>, open: Open<S>) {
+    let records = padded_records(2, STAGED_PAD);
+    let old = open().await.unwrap();
+    let old_term = old.term();
+    let tip = old
+        .append_and_sync(LogTip::EMPTY.at(old_term), records[..1].to_vec())
+        .await
+        .unwrap();
+    let new = open().await.unwrap();
+    let term = new.term();
+    // The old writer's handle refuses before writing anything.
+    let error = old
+        .append_and_sync(tip.at(old_term), records[1..].to_vec())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::META_LOG_FENCED);
+    // An old writer racing past that check stages under its own term and
+    // then tries to commit a stub: the commit compares term and tip.
+    let service = connect().await;
+    service
+        .put_part(old_term, 2, 0, b"stale segment")
+        .await
+        .unwrap();
+    let stub = {
+        let mut bytes = b"AFSKPART".to_vec();
+        bytes.extend_from_slice(&old_term.to_be_bytes());
+        bytes.extend_from_slice(&2u64.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&13u64.to_be_bytes());
+        bytes.extend_from_slice(&[0; 32]);
+        bytes
+    };
+    let mut fake_tip = 2u64.to_be_bytes().to_vec();
+    fake_tip.extend_from_slice(&[1; 32]);
+    let outcome = service
+        .append(old_term, Some(&tip_bytes(tip)), &fake_tip, 2, &[stub])
+        .await
+        .unwrap();
+    assert_eq!(outcome, super::kv_log::Swap::Fenced(term));
+    let next = new
+        .append_and_sync(tip.at(term), records[1..].to_vec())
+        .await
+        .unwrap();
+    drop((old, new));
+    let reopened = open().await.unwrap();
+    let recovered = reopened.recover().await.unwrap();
+    assert_eq!(recovered.tip, next);
+    assert_eq!(recovered.records.len(), 2);
+    let live = owners(&connect).await;
+    // The old writer's committed record keeps its segments; its stale
+    // segment for sequence 2 is removed.
+    assert_eq!(live, vec![(old_term, 1), (term, 2)], "{live:?}");
+}
+
+/// A committed staged record with a missing or altered segment refuses
+/// recovery, naming the frame and segment.
+async fn staged_integrity<S: KvService>(make: impl Fn() -> (Connect<S>, Open<S>)) {
+    for damage in ["missing", "altered"] {
+        let (connect, open) = make();
+        let records = padded_records(1, STAGED_PAD);
+        let log = open().await.unwrap();
+        let term = log.term();
+        log.append_and_sync(LogTip::EMPTY.at(term), records.clone())
+            .await
+            .unwrap();
+        drop(log);
+        let service = connect().await;
+        let (owner, sequence) = service.part_owners().await.unwrap()[0];
+        if damage == "missing" {
+            service.delete_parts(owner, sequence).await.unwrap();
+        } else {
+            let mut part = service.part(owner, sequence, 1).await.unwrap().unwrap();
+            part[100] ^= 1;
+            service.put_part(owner, sequence, 1, &part).await.unwrap();
+        }
+        let error = open()
+            .await
+            .err()
+            .expect("damaged staged record must be refused");
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{damage}");
+        let message = error.to_string();
+        let marker = if damage == "missing" {
+            "segment 0 missing"
+        } else {
+            "do not match the recorded hash"
+        };
+        assert!(
+            message.contains("frame 1 (staged by term") && message.contains(marker),
+            "{damage}: {message}"
+        );
+    }
+}
+
+/// Crashing before the commit again and again never accumulates segments:
+/// each open removes the previous writer's uncommitted ones.
+async fn staged_cleanup_bounded<S: KvService>(connect: Connect<S>, open: Open<S>) {
+    let records = padded_records(1, STAGED_PAD);
+    for round in 0..5 {
+        let log = open().await.unwrap();
+        assert!(
+            owners(&connect).await.is_empty(),
+            "round {round}: leftovers removed at open"
+        );
+        arm_crash(log.identity(), CrashPoint::PartsWritten);
+        let term = log.term();
+        assert!(
+            log.append_and_sync(LogTip::EMPTY.at(term), records.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(owners(&connect).await.len(), 1, "round {round}");
+    }
+    let log = open().await.unwrap();
+    assert!(owners(&connect).await.is_empty());
+    assert_eq!(log.recover().await.unwrap().records.len(), 0);
+}
+
+fn redis_staged() -> (
+    Connect<super::redis_log::RedisService>,
+    Open<super::redis_log::RedisService>,
+) {
+    redis_pair(unique_prefix(), Some(256 * 1024))
+}
+
+fn etcd_staged() -> (
+    Connect<super::etcd_log::EtcdService>,
+    Open<super::etcd_log::EtcdService>,
+) {
+    etcd_pair(unique_prefix(), 256 * 1024)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a dedicated Redis: set AFS_TEST_REDIS_URL and run with --ignored"]
+async fn redis_staged_records() {
+    let _shared = REDIS_GATE.read().await;
+    staged_crash_atomicity(redis_staged).await;
+    let (connect, open) = redis_staged();
+    staged_fencing(connect, open).await;
+    staged_integrity(redis_staged).await;
+    let (connect, open) = redis_staged();
+    staged_cleanup_bounded(connect, open).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a dedicated etcd: set AFS_TEST_ETCD_ENDPOINTS and run with --ignored"]
-async fn etcd_limits_above_the_request_bound_are_refused() {
-    let options = KvLogOptions {
-        record_max_bytes: 2 * 1024 * 1024,
-        batch_max_bytes: 2 * 1024 * 1024,
-        wal_max_bytes: 1024 * 1024 * 1024,
-        image_max_bytes: 1024 * 1024 * 1024,
-    };
-    let error = EtcdLog::open_etcd(
-        &etcd_endpoints(),
-        &unique_prefix(),
-        ETCD_TEST_MAX_REQUEST_BYTES,
-        options,
-    )
-    .await
-    .err()
-    .expect("limits above the request bound must be refused");
-    assert!(error.to_string().contains("request bound"), "{error}");
+async fn etcd_staged_records() {
+    staged_crash_atomicity(etcd_staged).await;
+    let (connect, open) = etcd_staged();
+    staged_fencing(connect, open).await;
+    staged_integrity(etcd_staged).await;
+    let (connect, open) = etcd_staged();
+    staged_cleanup_bounded(connect, open).await;
 }

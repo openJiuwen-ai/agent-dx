@@ -124,11 +124,12 @@ pub(super) fn unique_prefix() -> String {
     format!("afs-contract/{}", uuid::Uuid::new_v4())
 }
 
-pub(super) fn kv_options(limits: Option<CaseLimits>, bound: usize) -> KvLogOptions {
+/// The Meta defaults; records beyond one request are staged (`kv_log`).
+pub(super) fn kv_options(limits: Option<CaseLimits>) -> KvLogOptions {
     limits.map_or(
         KvLogOptions {
-            record_max_bytes: bound.min(64 * 1024 * 1024),
-            batch_max_bytes: bound.min(128 * 1024 * 1024),
+            record_max_bytes: 64 * 1024 * 1024,
+            batch_max_bytes: 128 * 1024 * 1024,
             wal_max_bytes: 1024 * 1024 * 1024,
             image_max_bytes: 1024 * 1024 * 1024,
         },
@@ -144,7 +145,7 @@ pub(super) fn kv_options(limits: Option<CaseLimits>, bound: usize) -> KvLogOptio
 fn redis_fixture(limits: Option<CaseLimits>) -> Fixture<RedisLog> {
     let url = redis_url();
     let prefix = unique_prefix();
-    let options = kv_options(limits, 256 * 1024 * 1024);
+    let options = kv_options(limits);
     let open = {
         let (url, prefix) = (url.clone(), prefix.clone());
         move || block_on(RedisLog::open_redis(&url, &prefix, options)).unwrap()
@@ -178,7 +179,7 @@ fn redis_fixture(limits: Option<CaseLimits>) -> Fixture<RedisLog> {
 fn etcd_fixture(limits: Option<CaseLimits>) -> Fixture<EtcdLog> {
     let endpoints = etcd_endpoints();
     let prefix = unique_prefix();
-    let options = kv_options(limits, ETCD_TEST_MAX_REQUEST_BYTES - 64 * 1024);
+    let options = kv_options(limits);
     let open = {
         let (endpoints, prefix) = (endpoints.clone(), prefix.clone());
         move || {
@@ -318,6 +319,7 @@ async fn contract_suite<L: MetaLog + 'static>(make: impl Fn(Option<CaseLimits>) 
     write_failure_latch(&make).await;
     fencing(&make).await;
     status_upper_bound(&make).await;
+    large_records(&make).await;
 }
 
 /// (1) A stale or forged `expected` fails for both append and admission and
@@ -784,4 +786,51 @@ async fn redis_log_satisfies_contract() {
 #[ignore = "requires a dedicated etcd: set AFS_TEST_ETCD_ENDPOINTS and run with --ignored"]
 async fn etcd_log_satisfies_contract() {
     contract_suite(etcd_fixture).await;
+}
+
+/// (9) Records of 4 MiB (over twice etcd's default 1.5 MiB request bound),
+/// alone and in a group, append, recover and survive reconstruction byte for
+/// byte; an older writer's large append is fenced without writing a byte.
+async fn large_records<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fixture<L>) {
+    let fixture = make(None);
+    let log = &fixture.log;
+    let term = term_of(log).await;
+    let records = super::kv_log_tests::padded_records(4, 4 * 1024 * 1024);
+    assert!(frame_size(LogTip::EMPTY.at(term), &records[0]).unwrap() > 4 * 1024 * 1024);
+    let tip = log
+        .append_and_sync(LogTip::EMPTY.at(term), records[..1].to_vec())
+        .await
+        .unwrap();
+    let tip = log
+        .append_and_sync(tip.at(term), records[1..3].to_vec())
+        .await
+        .unwrap();
+    assert_eq!(tip.sequence, 3);
+    let first = log.recover().await.unwrap();
+    assert_eq!(encoded(&first.records), encoded(&records[..3]));
+    let new = (fixture.takeover)(log);
+    let current = term_of(&new).await;
+    let before = (fixture.storage)();
+    assert_fenced(
+        log.append_and_sync(tip.at(term), records[3..].to_vec())
+            .await,
+        term,
+        current,
+        "stale handle large append",
+    );
+    assert!(
+        (fixture.storage)() == before,
+        "fenced large append wrote nothing"
+    );
+    let last = new
+        .append_and_sync(tip.at(current), records[3..].to_vec())
+        .await
+        .unwrap();
+    let Fixture {
+        log, reopen, _dir, ..
+    } = fixture;
+    drop(log);
+    let again = reopen(new).recover().await.unwrap();
+    assert_eq!(again.tip, last);
+    assert_eq!(encoded(&again.records), encoded(&records));
 }

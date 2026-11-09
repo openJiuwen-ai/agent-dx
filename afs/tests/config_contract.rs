@@ -616,6 +616,9 @@ fn r16_redis_and_etcd_backends_need_their_own_endpoint() {
     assert_eq!(etcd.meta_store, MetaStoreBackend::Etcd);
     assert_eq!(etcd.meta_etcd_endpoints.len(), 2);
     assert_eq!(etcd.meta_etcd_max_request_bytes, 10 * 1024 * 1024);
+    // etcd's quota holds the log: its default WAL bound is half the local one.
+    assert_eq!(etcd.meta_wal_max_bytes, 512 * 1024 * 1024);
+    assert_eq!(redis.meta_wal_max_bytes, 1024 * 1024 * 1024);
     for args in [
         &["--meta-store", "redis"][..],
         &["--meta-store", "etcd"],

@@ -51,7 +51,7 @@ Meta 后端（`meta_store`）：
 | --- | ---: | --- |
 | `meta_record_max_bytes` | 67108864 | 含信封、结果、hash／CRC 的单帧上限，至少256、不超过u32范围 |
 | `meta_batch_max_bytes` | 134217728 | 同批完整帧总字节，不小于单帧上限 |
-| `meta_wal_max_bytes` | 1073741824 | 含4096字节头的日志总量，剩余容量须能容纳最大批次 |
+| `meta_wal_max_bytes` | 1073741824（etcd 后端 536870912） | 含4096字节头的日志总量，剩余容量须能容纳最大批次 |
 
 单记录还受独立的共享向量容量限制：实体池、变更、原结果及epoch向量共用原合计
 262144槽与按类型宽度计算的结构字节上限。写入与恢复采用同一容量规则，不能把
@@ -225,7 +225,7 @@ path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健
 - **写者互斥**：每次打开原子地取下一个 term；每次追加在同一服务端原子单元（Redis Lua 脚本、etcd 事务）里比较 term
   与 tip 后再写。第二个 Meta 打开同一前缀后，旧 Meta 的下一次写返回 `META_LOG_FENCED`，应用在该 Meta 上看到 `EBUSY`；
   旧 Meta 随即失效，它服务的 Node 心跳失败后退出，需要按正常流程重启。
-- **checkpoint**：镜像分块写入（Redis 8MiB、etcd 不超过 1MiB 与请求上限），最后一步比较 term 与旧指针后切换指针；
+- **checkpoint**：镜像分块写入（Redis 8MiB、etcd 不超过 1MiB 与请求上限；超过一个分块的记录同样分段写入，见下），最后一步比较 term 与旧指针后切换指针；
   之后删除被覆盖的记录与旧镜像分块。崩溃留下的残留在下次打开时删除；只删除更早 term 写的未选中分块，
   不会删掉更新写者正在写的分块。
 - **写失败**：一次追加或指针切换结果未知（连接断开、超时 30 秒）时，该 Meta 失败关闭，与本地盘写失败相同，需要重启 Meta。
@@ -237,13 +237,21 @@ Redis 主从复制是异步的，不提供额外保证，也不承诺故障切�
 Redis 7.2.5 在本机 ext4 上）：持续 `fsync` 写小文件时 `kill -9` Redis，重启 Redis 与 Meta 后 580 个已确认文件全部完好。
 
 **etcd 的持久性**：事务被 Raft 多数派提交并写入各成员 WAL 后才确认；单成员 etcd 等同一次本地 fsync。同样的实测下
-516 个已确认文件全部完好（etcd 3.7.3 单成员）。部署要求：
+516 个已确认文件全部完好（etcd 3.7.3 单成员）。
 
-- `meta_etcd_max_request_bytes` 与服务端 `--max-request-bytes` 一致（etcd 默认 1.5MiB）。一次追加（整组记录加比较）
-  与一个 checkpoint 分块都要放进一个请求，因此 `meta_record_max_bytes` 与 `meta_batch_max_bytes` 不能超过该值减 64KiB，
-  否则 Meta 拒绝启动；
-- `--quota-backend-bytes` 留足 checkpoint 镜像（新旧各一份）、未 checkpoint 的日志与 MVCC 历史，建议 8GiB；
-  并开启 `--auto-compaction-*`。后端不自行 compact，因为 compact 作用于整个 etcd，会影响共用它的其他应用；
+**etcd 的请求上限与大记录**：`meta_etcd_max_request_bytes` 须与服务端 `--max-request-bytes` 一致（etcd 默认 1.5MiB），
+它限制一次原子追加与一个 checkpoint 分块。Meta 的一条提交记录随文件的 extent 数线性增长（数 GiB 的大文件或碎片很多的文件
+可达数 MiB），放不进一次请求的记录先分段写到 `<prefix>/part/<term>/<序号>/<段>`（不可见），再由比较 term 与 tip 的原子追加
+写入一个固定大小的引用；恢复时拼回原记录并校验长度与 hash，缺段或不符时拒绝启动并报出记录序号与段号。崩溃或被 fence
+留下的未提交分段、被 checkpoint 覆盖的分段，在下次打开 Meta 和每次 checkpoint 选中后删除（只删更早 term 的未引用分段，
+不会删掉当前写者正在写的）。记录大小因此只受 `meta_record_max_bytes` 限制；大记录每段多一次请求。
+
+部署要求：
+
+- etcd 后端默认把 checkpoint 镜像上限与 `meta_wal_max_bytes` 各定为 512MiB（local-file 为 1GiB）；
+- `--quota-backend-bytes` 留足新旧两份镜像、未 checkpoint 的日志与 MVCC 历史，**建议 8GiB**，并开启 `--auto-compaction-*`。
+  Meta 启动时读取 etcd 的配额，低于“两份镜像 + 日志上限 + 1GiB”时打 WARN `meta.log.etcd_quota_low`（不拒绝启动）。
+  后端不自行 compact，因为 compact 作用于整个 etcd，会影响共用它的其他应用；
 - 建议独占的 etcd；共用时用不同的 `meta_store_prefix`。
 
 **性能边界**（adx-runtime 单 Node、native、4 线程，Redis／etcd 与 Meta 同机、同一块 ext4 盘、回环连接，3 轮中位数）：
@@ -275,7 +283,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `meta_store` | 产品差异 | Meta | `local-file` | Meta 权威存储：`local-file`、`redis`、`etcd` 或 `memory`；`memory` 属测试专用取值，见表后说明 |
 | `meta_redis_url` | 产品差异 | Meta | 无 | `redis` 后端的 Redis URL，仅且必须与 `meta_store = "redis"` 同用；打印配置时隐去 URL 中的口令 |
 | `meta_etcd_endpoints` | 产品差异 | Meta | 无 | `etcd` 后端的 endpoint 列表（CLI 逗号分隔），仅且必须与 `meta_store = "etcd"` 同用 |
-| `meta_etcd_max_request_bytes` | 产品差异 | Meta | `1572864` | 与 etcd 服务端 `--max-request-bytes` 一致；限制单次追加与单个 checkpoint 分块，256KiB..=1GiB |
+| `meta_etcd_max_request_bytes` | 产品差异 | Meta | `1572864` | 与 etcd 服务端 `--max-request-bytes` 一致；限制单次原子追加、checkpoint 分块与大记录分段，256KiB..=1GiB |
 | `meta_store_prefix` | 产品差异 | Meta | `afs/meta` | `redis`／`etcd` 后端的 key 前缀，1..=128 个可打印 ASCII，不含空格、`*?[]\\`，不以 `/` 结尾 |
 | `advertise_endpoint` | 产品差异 | Node | 无 | 对外发布的本 Node gRPC URI；未设时由 `grpc_listen` 推导，监听 `0.0.0.0` 时必须显式指定 |
 | `tls_encryption_enabled` | 产品差异 | 两者 | `false` | mTLS 认证之后是否加密内部流量 |

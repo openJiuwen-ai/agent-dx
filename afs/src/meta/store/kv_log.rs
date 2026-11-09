@@ -19,6 +19,18 @@
 //! | `P/wal/<seq, 20 digits>` | one framed record, exactly the local WAL frame |
 //! | `P/checkpoint` | pointer to the selected checkpoint (see `Pointer`) |
 //! | `P/chunk/<term>-<seq>/<index, 6 digits>` | checkpoint image chunks |
+//! | `P/part/<term, 20 digits>/<seq, 20 digits>/<index, 6 digits>` | segments of a staged record |
+//!
+//! A record too large for one atomic request (an etcd transaction is bounded
+//! by the server's request size) is staged: its frame is first written in
+//! segments under the writer's term, invisible, and the atomic append then
+//! stores a fixed-size stub (term, sequence, segment count, length, hash) in
+//! `P/wal/<seq>`. Recovery reassembles the frame, checks its length and hash
+//! and refuses with the frame and segment named when one is missing or
+//! differs. Segments no committed stub references (a crash before the
+//! append, a fenced writer) and segments of covered records are deleted at
+//! the next open and after each checkpoint selection; a writer never deletes
+//! segments of its own or a newer term that a live stub may still need.
 //!
 //! A checkpoint is written chunk by chunk, then selected by one atomic
 //! pointer switch that compares the term and the previous pointer. Frames the
@@ -50,6 +62,10 @@ use crate::format::{self, FormatKind};
 
 pub type KvFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+/// Checkpoint image bound of the etcd backend.
+pub const ETCD_IMAGE_MAX_BYTES: usize = 512 * 1024 * 1024;
+/// Default uncheckpointed log bound of the etcd backend (`meta_wal_max_bytes`).
+pub const ETCD_WAL_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Frames read per request during recovery and anchor checks.
 pub(super) const FRAME_PAGE: u64 = 256;
 /// Deadline of one service request. An append that misses it has an unknown
@@ -112,6 +128,18 @@ pub trait KvService: Send + Sync + 'static {
         expected: Option<&'a [u8]>,
         pointer: &'a [u8],
     ) -> KvFuture<'a, Swap>;
+    /// One segment of a staged record (not atomic with anything).
+    fn put_part<'a>(
+        &'a self,
+        term: u64,
+        sequence: u64,
+        index: u32,
+        bytes: &'a [u8],
+    ) -> KvFuture<'a, ()>;
+    fn part(&self, term: u64, sequence: u64, index: u32) -> KvFuture<'_, Option<Vec<u8>>>;
+    /// Distinct `(term, sequence)` owners of stored segments.
+    fn part_owners(&self) -> KvFuture<'_, Vec<(u64, u64)>>;
+    fn delete_parts(&self, term: u64, sequence: u64) -> KvFuture<'_, ()>;
     /// Delete every frame with sequence `<= through`.
     fn delete_frames_through(&self, through: u64) -> KvFuture<'_, ()>;
     /// Distinct checkpoint ids that have chunks.
@@ -134,7 +162,7 @@ pub struct KvLogOptions {
 }
 
 impl KvLogOptions {
-    fn validate(self, service_bound: usize) -> Result<Self> {
+    fn validate(self) -> Result<Self> {
         AppendLimits {
             record_max_bytes: self.record_max_bytes,
             batch_max_bytes: self.batch_max_bytes,
@@ -145,12 +173,6 @@ impl KvLogOptions {
             image_max_bytes: self.image_max_bytes,
         }
         .validate()?;
-        if self.batch_max_bytes > service_bound {
-            return Err(invalid_log(format!(
-                "record/batch limit {} exceeds the service's atomic request bound {service_bound}",
-                self.batch_max_bytes
-            )));
-        }
         if u64::try_from(self.batch_max_bytes).map_or(true, |batch| batch > self.wal_max_bytes) {
             return Err(invalid_log("invalid finite record/batch/WAL limits"));
         }
@@ -179,6 +201,100 @@ pub(super) fn chunk_id_of(prefix: &str, key: &str) -> Option<String> {
     let rest = key.strip_prefix(prefix)?.strip_prefix("/chunk/")?;
     let (id, _) = rest.split_once('/')?;
     Some(id.to_owned())
+}
+
+pub(super) fn part_key(prefix: &str, term: u64, sequence: u64, index: u32) -> String {
+    format!("{prefix}/part/{term:020}/{sequence:020}/{index:06}")
+}
+
+/// `P/part/<term>/<seq>/...` → `(term, seq)`.
+pub(super) fn part_owner_of(prefix: &str, key: &str) -> Option<(u64, u64)> {
+    let mut rest = key.strip_prefix(prefix)?.strip_prefix("/part/")?.split('/');
+    Some((rest.next()?.parse().ok()?, rest.next()?.parse().ok()?))
+}
+
+/// The value stored in `P/wal/<seq>` for a staged record. A frame starts with
+/// its big-endian length, so a 68-byte value starting with this magic would
+/// claim a length above 1 GiB and can never be a frame.
+const STUB_MAGIC: &[u8; 8] = b"AFSKPART";
+const STUB_BYTES: usize = 8 + 8 + 8 + 4 + 8 + 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Stub {
+    term: u64,
+    sequence: u64,
+    parts: u32,
+    length: u64,
+    hash: [u8; 32],
+}
+
+fn staged_hash(frame: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"afs.meta.kv.part.v1");
+    hash.update(frame);
+    *hash.finalize().as_bytes()
+}
+
+impl Stub {
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(STUB_BYTES);
+        bytes.extend_from_slice(STUB_MAGIC);
+        bytes.extend_from_slice(&self.term.to_be_bytes());
+        bytes.extend_from_slice(&self.sequence.to_be_bytes());
+        bytes.extend_from_slice(&self.parts.to_be_bytes());
+        bytes.extend_from_slice(&self.length.to_be_bytes());
+        bytes.extend_from_slice(&self.hash);
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != STUB_BYTES || &bytes[..8] != STUB_MAGIC {
+            return None;
+        }
+        let number = |range: std::ops::Range<usize>| -> Option<u64> {
+            Some(u64::from_be_bytes(bytes[range].try_into().ok()?))
+        };
+        let mut hash = [0; 32];
+        hash.copy_from_slice(&bytes[36..68]);
+        Some(Self {
+            term: number(8..16)?,
+            sequence: number(16..24)?,
+            parts: u32::from_be_bytes(bytes[24..28].try_into().ok()?),
+            length: number(28..36)?,
+            hash,
+        })
+    }
+}
+
+/// Test-only crash points inside a staged append, by store identity.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CrashPoint {
+    /// After the first segment of the first staged record.
+    PartsPartial,
+    /// After every segment, before the atomic append.
+    PartsWritten,
+    /// After the atomic append succeeded, before the handle records it.
+    AfterCommit,
+}
+#[cfg(test)]
+static CRASH: std::sync::Mutex<Vec<(StoreIdentity, CrashPoint)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+pub(super) fn arm_crash(identity: StoreIdentity, point: CrashPoint) {
+    if let Ok(mut armed) = CRASH.lock() {
+        armed.push((identity, point));
+    }
+}
+#[cfg(test)]
+fn crash_at(identity: StoreIdentity, point: CrashPoint) -> bool {
+    CRASH.lock().is_ok_and(|mut armed| {
+        armed
+            .iter()
+            .position(|entry| *entry == (identity, point))
+            .map(|index| armed.swap_remove(index))
+            .is_some()
+    })
 }
 
 const LAYOUT_BYTES: usize = 6 + 48;
@@ -318,6 +434,8 @@ async fn timed<T>(what: &str, future: impl Future<Output = Result<T>>) -> Result
 }
 
 struct KvState {
+    /// Committed staged records after the checkpoint.
+    staged: Staged,
     tip: LogTip,
     checkpoint: Option<Pointer>,
     /// Framed bytes after the checkpoint, exact.
@@ -347,12 +465,36 @@ impl EtcdLog {
         max_request_bytes: usize,
         options: KvLogOptions,
     ) -> Result<Self> {
-        Self::open(
-            super::etcd_log::EtcdService::connect(endpoints, prefix, max_request_bytes).await?,
-            options,
-        )
-        .await
+        let service =
+            super::etcd_log::EtcdService::connect(endpoints, prefix, max_request_bytes).await?;
+        match service.quota_bytes().await {
+            Ok(Some(quota)) => {
+                if let Some(warning) = etcd_quota_warning(quota, options) {
+                    afs_logging::warn!("meta.log.etcd_quota_low"; "detail" => warning);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => afs_logging::warn!("meta.log.etcd_quota_unknown";
+                "error" => error.to_string()),
+        }
+        Self::open(service, options).await
     }
+}
+
+/// Room etcd needs beside the log: two images (old and new during a switch),
+/// the uncheckpointed log and 1 GiB for MVCC history until compaction. A
+/// smaller quota is reported, not refused: etcd turns read-only when full.
+pub(super) fn etcd_quota_warning(quota: u64, options: KvLogOptions) -> Option<String> {
+    let needed = (options.image_max_bytes as u64)
+        .saturating_mul(2)
+        .saturating_add(options.wal_max_bytes)
+        .saturating_add(1 << 30);
+    (quota < needed).then(|| {
+        format!(
+            "etcd --quota-backend-bytes {quota} is below {needed} (two checkpoint images of {} bytes, a {}-byte log and 1 GiB of history); raise it (8 GiB recommended) and enable auto-compaction",
+            options.image_max_bytes, options.wal_max_bytes
+        )
+    })
 }
 
 /// The `MetaLog` over a key-value service.
@@ -371,7 +513,7 @@ impl<S: KvService> KvLog<S> {
     /// a crash may have left (covered frames, unselected chunks of older
     /// writers).
     pub async fn open(service: S, options: KvLogOptions) -> Result<Self> {
-        let options = options.validate(service.append_bound_bytes())?;
+        let options = options.validate()?;
         let fresh = encode_layout(StoreIdentity::new()?);
         let (stored, term) = timed("open", service.open_writer(&fresh)).await?;
         let identity = decode_layout(service.name(), &stored)?;
@@ -379,7 +521,7 @@ impl<S: KvService> KvLog<S> {
         if head.term != term {
             return Err(fenced(term, head.term));
         }
-        let (recovered, checkpoint, wal_bytes) =
+        let (recovered, checkpoint, wal_bytes, staged) =
             recover(&service, identity, term, &head, options).await?;
         if let Some(pointer) = checkpoint {
             timed(
@@ -388,6 +530,13 @@ impl<S: KvService> KvLog<S> {
             )
             .await?;
         }
+        cleanup_parts(
+            &service,
+            term,
+            &staged,
+            checkpoint.map_or(0, |pointer| pointer.covered.sequence),
+        )
+        .await?;
         let selected = checkpoint.map(|pointer| pointer.id());
         for id in timed("cleanup", service.chunk_ids()).await? {
             if Some(&id) != selected.as_ref() && chunk_term(&id).is_none_or(|owner| owner < term) {
@@ -400,6 +549,7 @@ impl<S: KvService> KvLog<S> {
             term,
             options,
             state: tokio::sync::Mutex::new(KvState {
+                staged,
                 tip: recovered.tip,
                 checkpoint,
                 wal_bytes,
@@ -452,6 +602,68 @@ impl<S: KvService> KvLog<S> {
     }
 }
 
+impl<S: KvService> KvLog<S> {
+    /// The values of one atomic append. A frame larger than one segment, or
+    /// one that no longer fits the service's request bound beside the frames
+    /// before it, is written in segments under this writer's term first and
+    /// replaced by its stub. Returns the values and the staged sequences.
+    async fn stage(&self, first: u64, frames: Vec<Vec<u8>>) -> Result<(Vec<Vec<u8>>, Vec<u64>)> {
+        let segment = self.service.chunk_bytes().max(1);
+        let bound = self
+            .service
+            .append_bound_bytes()
+            .saturating_sub(frames.len() * STUB_BYTES);
+        let mut inline = 0usize;
+        let mut values = Vec::with_capacity(frames.len());
+        let mut staged = Vec::new();
+        for (offset, frame) in frames.into_iter().enumerate() {
+            if frame.len() <= segment && inline + frame.len() <= bound {
+                inline += frame.len();
+                values.push(frame);
+                continue;
+            }
+            if staged.is_empty() {
+                // A superseded writer stages nothing.
+                self.check_term().await?;
+            }
+            let sequence = first + offset as u64;
+            let parts = u32::try_from(frame.len().div_ceil(segment))
+                .map_err(|_| invalid_log("staged record segment count overflow"))?;
+            for (index, part) in frame.chunks(segment).enumerate() {
+                let index =
+                    u32::try_from(index).map_err(|_| invalid_log("segment index overflow"))?;
+                if let Err(error) = timed(
+                    "stage",
+                    self.service.put_part(self.term, sequence, index, part),
+                )
+                .await
+                {
+                    return Err(self.poison(error));
+                }
+                #[cfg(test)]
+                if index == 0
+                    && staged.is_empty()
+                    && crash_at(self.identity, CrashPoint::PartsPartial)
+                {
+                    return Err(self.poison(unavailable("injected crash: one segment written")));
+                }
+            }
+            values.push(
+                Stub {
+                    term: self.term,
+                    sequence,
+                    parts,
+                    length: frame.len() as u64,
+                    hash: staged_hash(&frame),
+                }
+                .encode(),
+            );
+            staged.push(sequence);
+        }
+        Ok((values, staged))
+    }
+}
+
 /// Read the checkpoint (if any) and every frame after it, verifying the
 /// image digest and revision, the hash chain, terms and business revisions.
 async fn recover<S: KvService>(
@@ -460,7 +672,7 @@ async fn recover<S: KvService>(
     term: u64,
     head: &Head,
     options: KvLogOptions,
-) -> Result<(RecoveredLog, Option<Pointer>, u64)> {
+) -> Result<(RecoveredLog, Option<Pointer>, u64, Staged)> {
     let tip = decode_tip(head.tip.as_deref())?;
     let pointer = head
         .checkpoint
@@ -477,7 +689,7 @@ async fn recover<S: KvService>(
     if tip.sequence < base.sequence {
         return Err(invalid_log("tip precedes the selected checkpoint"));
     }
-    let (records, end, _, bytes) = read_chain(
+    let (records, end, _, bytes, staged) = read_chain(
         service,
         identity,
         term,
@@ -501,6 +713,7 @@ async fn recover<S: KvService>(
         },
         pointer,
         bytes,
+        staged,
     ))
 }
 
@@ -553,7 +766,8 @@ async fn read_chain<S: KvService>(
     revision: StoreRevision,
     through: u64,
     options: KvLogOptions,
-) -> Result<(Vec<Record>, LogTip, StoreRevision, u64)> {
+) -> Result<(Vec<Record>, LogTip, StoreRevision, u64, Staged)> {
+    let mut staged = Staged::new();
     let mut tip = base;
     let mut revision = revision;
     let mut chain = 0;
@@ -570,6 +784,11 @@ async fn read_chain<S: KvService>(
             let sequence = next + offset as u64;
             let frame = frame
                 .ok_or_else(|| invalid_log(format!("frame {sequence} missing before the tip")))?;
+            let (frame, owner) =
+                resolve_frame(service, sequence, frame, options.record_max_bytes).await?;
+            if let Some(owner) = owner {
+                staged.insert(sequence, owner);
+            }
             let (record, reached, found) =
                 decode_frame(identity, tip, &frame, options.record_max_bytes)?;
             chain = chain_term(chain, found, term)?;
@@ -587,7 +806,80 @@ async fn read_chain<S: KvService>(
         }
         next = last + 1;
     }
-    Ok((records, tip, revision, bytes))
+    Ok((records, tip, revision, bytes, staged))
+}
+
+/// Committed staged records after the checkpoint: sequence → writer term.
+type Staged = std::collections::BTreeMap<u64, u64>;
+
+/// The frame stored at `sequence`: the value itself, or the record its
+/// staged stub names, reassembled and checked. Returns the stub's term.
+async fn resolve_frame<S: KvService>(
+    service: &S,
+    sequence: u64,
+    value: Vec<u8>,
+    record_max: usize,
+) -> Result<(Vec<u8>, Option<u64>)> {
+    let Some(stub) = Stub::decode(&value) else {
+        return Ok((value, None));
+    };
+    let at = |detail: String| {
+        invalid_log(format!(
+            "frame {sequence} (staged by term {}, {} segments): {detail}",
+            stub.term, stub.parts
+        ))
+    };
+    if stub.sequence != sequence {
+        return Err(at(format!("stub names sequence {}", stub.sequence)));
+    }
+    let length = usize::try_from(stub.length)
+        .ok()
+        .filter(|length| *length <= record_max)
+        .ok_or_else(|| at(format!("length {} outside the record bound", stub.length)))?;
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(length)
+        .map_err(|_| Error::coded(afs_error::IO_OUT_OF_MEMORY, "staged record allocation"))?;
+    for index in 0..stub.parts {
+        let part = timed("recover", service.part(stub.term, sequence, index))
+            .await?
+            .ok_or_else(|| at(format!("segment {index} missing")))?;
+        if frame.len() + part.len() > length {
+            return Err(at(format!("segment {index} runs past the recorded length")));
+        }
+        frame.extend_from_slice(&part);
+    }
+    if frame.len() != length {
+        return Err(at(format!(
+            "segments hold {} of {length} bytes",
+            frame.len()
+        )));
+    }
+    if staged_hash(&frame) != stub.hash {
+        return Err(at("segments do not match the recorded hash".into()));
+    }
+    Ok((frame, Some(stub.term)))
+}
+
+/// Delete segments no committed stub needs: those of covered records, and
+/// unreferenced ones written by an older term (a crash before the append, a
+/// fenced writer). Unreferenced segments of `term` itself may belong to an
+/// append still in progress and are kept.
+async fn cleanup_parts<S: KvService>(
+    service: &S,
+    term: u64,
+    staged: &Staged,
+    covered: u64,
+) -> Result<usize> {
+    let mut removed = 0;
+    for (owner, sequence) in timed("cleanup", service.part_owners()).await? {
+        let live = sequence > covered && staged.get(&sequence) == Some(&owner);
+        if !live && (owner < term || sequence <= covered) {
+            timed("cleanup", service.delete_parts(owner, sequence)).await?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 impl<S: KvService> MetaLog for KvLog<S> {
@@ -699,7 +991,7 @@ impl<S: KvService> MetaLog for KvLog<S> {
                     None => Err(invalid_log("checkpoint covers no record")),
                 };
             }
-            let (_, reached, reached_revision, released) = read_chain(
+            let (_, reached, reached_revision, released, _) = read_chain(
                 &self.service,
                 self.identity,
                 self.term,
@@ -748,12 +1040,14 @@ impl<S: KvService> MetaLog for KvLog<S> {
                 // The switch may have been applied: this view is stale.
                 Err(error) => return Err(self.poison(error)),
             }
-            {
+            let staged = {
                 let mut state = self.state.lock().await;
                 state.checkpoint = Some(pointer);
                 state.wal_bytes = state.wal_bytes.saturating_sub(released);
                 state.recovered = None;
-            }
+                state.staged = state.staged.split_off(&(covered.sequence + 1));
+                state.staged.clone()
+            };
             // Selected: the covered frames and the replaced image are
             // obsolete. A failure here only leaves garbage for the next open.
             if let Err(error) = timed(
@@ -761,6 +1055,13 @@ impl<S: KvService> MetaLog for KvLog<S> {
                 self.service.delete_frames_through(covered.sequence),
             )
             .await
+            {
+                afs_logging::warn!("meta.log.cleanup_deferred";
+                    "backend" => self.service.name(),
+                    "error" => error.to_string());
+            }
+            if let Err(error) =
+                cleanup_parts(&self.service, self.term, &staged, covered.sequence).await
             {
                 afs_logging::warn!("meta.log.cleanup_deferred";
                     "backend" => self.service.name(),
@@ -796,6 +1097,12 @@ impl<S: KvService> MetaLog for KvLog<S> {
                 .checked_add(bytes as u64)
                 .filter(|total| *total <= self.options.wal_max_bytes)
                 .ok_or_else(|| full("Meta log byte budget exhausted; checkpoint required"))?;
+            let first = expected.tip.sequence + 1;
+            let (values, staged) = self.stage(first, frames).await?;
+            #[cfg(test)]
+            if !staged.is_empty() && crash_at(self.identity, CrashPoint::PartsWritten) {
+                return Err(self.poison(unavailable("injected crash: segments written")));
+            }
             let expected_tip = (expected.tip != LogTip::EMPTY).then(|| encode_tip(expected.tip));
             let outcome = timed(
                 "append",
@@ -803,13 +1110,20 @@ impl<S: KvService> MetaLog for KvLog<S> {
                     self.term,
                     expected_tip.as_deref(),
                     &encode_tip(tip),
-                    expected.tip.sequence + 1,
-                    &frames,
+                    first,
+                    &values,
                 ),
             )
             .await;
             match outcome {
                 Ok(Swap::Done) => {
+                    #[cfg(test)]
+                    if crash_at(self.identity, CrashPoint::AfterCommit) {
+                        return Err(self.poison(unavailable("injected crash: appended")));
+                    }
+                    for sequence in staged {
+                        state.staged.insert(sequence, self.term);
+                    }
                     state.tip = tip;
                     state.wal_bytes = total;
                     state.recovered = None;
@@ -862,14 +1176,46 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn options_must_fit_the_service_request_bound() {
+    fn options_validate_and_stubs_round_trip() {
         let options = KvLogOptions {
             record_max_bytes: 1024,
             batch_max_bytes: 2048,
             wal_max_bytes: 1 << 20,
             image_max_bytes: 1 << 20,
         };
-        assert!(options.validate(2048).is_ok());
-        assert!(options.validate(2047).is_err());
+        assert!(options.validate().is_ok());
+        assert!(
+            KvLogOptions {
+                wal_max_bytes: 1024,
+                ..options
+            }
+            .validate()
+            .is_err()
+        );
+        let small = KvLogOptions {
+            record_max_bytes: 1 << 20,
+            batch_max_bytes: 1 << 20,
+            wal_max_bytes: 512 << 20,
+            image_max_bytes: 512 << 20,
+        };
+        assert!(
+            etcd_quota_warning(2 << 30, small).is_some(),
+            "etcd default 2 GiB"
+        );
+        assert!(etcd_quota_warning(8 << 30, small).is_none());
+        let stub = Stub {
+            term: 3,
+            sequence: 9,
+            parts: 4,
+            length: 4 << 20,
+            hash: [7; 32],
+        };
+        assert_eq!(Stub::decode(&stub.encode()), Some(stub));
+        assert_eq!(Stub::decode(&stub.encode()[1..]), None);
+        assert_eq!(
+            part_key("p", 3, 9, 1),
+            "p/part/00000000000000000003/00000000000000000009/000001"
+        );
+        assert_eq!(part_owner_of("p", &part_key("p", 3, 9, 1)), Some((3, 9)));
     }
 }

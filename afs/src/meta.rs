@@ -296,7 +296,13 @@ pub async fn open_configured_store(cfg: &Config) -> Result<Option<Arc<store::Sto
                 record_max_bytes: limits.record_max_bytes,
                 batch_max_bytes: limits.batch_max_bytes,
                 wal_max_bytes: limits.wal_max_bytes,
-                image_max_bytes: store::journal::CheckpointLimits::default().image_max_bytes,
+                image_max_bytes: if cfg.meta_store == MetaStoreBackend::Etcd {
+                    // etcd keeps old and new images and MVCC history inside
+                    // its quota (default 2 GiB): half the local bound.
+                    store::kv_log::ETCD_IMAGE_MAX_BYTES
+                } else {
+                    store::journal::CheckpointLimits::default().image_max_bytes
+                },
             };
             match cfg.meta_store_target()? {
                 crate::config::MetaStoreTarget::Redis { url, prefix } => {
