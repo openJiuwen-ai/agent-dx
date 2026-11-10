@@ -420,7 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
         loop {
-            interval.tick().await;
+            manager.wait_for_reconciliation(&mut interval).await;
             if let Some(discovery) = &discovery {
                 match discovery.lookup().await {
                     Ok(found) if found.address != endpoint => {

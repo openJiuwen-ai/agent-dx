@@ -676,6 +676,7 @@ service_impl!(pb::node_service_server::NodeService, {
     update_environment_control(NodeUpdateEnvironmentControlRequest) -> EnvironmentControlRecord,
     apply_node_upgrade_control(NodeUpgradeControl) -> NodeUpgradeInspection,
     inspect_node_upgrade(NodeUpgradeInspectRequest) -> NodeUpgradeInspection,
+    wake_node_reconciliation(WakeNodeReconciliationRequest) -> WakeNodeReconciliationResponse,
     recover_environment(RecoverEnvironmentRequest) -> EnvironmentResult,
     get_session(GetNodeSessionRequest) -> GetNodeSessionResponse,
     create_environment(StartAssignedEnvironmentRequest) -> EnvironmentResult,

@@ -51,6 +51,9 @@ service NodeService {
   // Coordinator-only maintenance fencing. Grants are scoped to one process session.
   rpc ApplyNodeUpgradeControl(NodeUpgradeControl) returns (NodeUpgradeInspection);
   rpc InspectNodeUpgrade(NodeUpgradeInspectRequest) returns (NodeUpgradeInspection);
+  // Wake the ordinary authority comparison after a durable ownership transfer.
+  // A reply acknowledges the wake only, not a change in Environment ownership.
+  rpc WakeNodeReconciliation(WakeNodeReconciliationRequest) returns (WakeNodeReconciliationResponse);
   rpc CreateLocalEnvironment(LocalEnvironmentCreateRequest) returns (EnvironmentResult);
   rpc RecoverEnvironment(RecoverEnvironmentRequest) returns (EnvironmentResult);
   // Coordinator verifies the process currently serving an already registered address
@@ -301,6 +304,8 @@ message NodeUpgradeInspectRequest {
   string node_session_id = 3;
   string environment_id = 4;
 }
+message WakeNodeReconciliationRequest { string node_session_id = 1; }
+message WakeNodeReconciliationResponse {}
 message NodeUpgradeInspection {
   string task_id = 1;
   uint64 epoch = 2;

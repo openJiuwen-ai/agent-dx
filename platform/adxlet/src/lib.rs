@@ -520,6 +520,7 @@ pub struct Adxlet {
     environments: Arc<Mutex<EnvironmentDirectory>>,
     authority_tasks: Arc<Mutex<AuthorityTasks>>,
     authority_progress: Arc<tokio::sync::Notify>,
+    reconciliation_requested: Arc<tokio::sync::Notify>,
 }
 
 impl Adxlet {
@@ -572,6 +573,7 @@ impl Adxlet {
             environments: Arc::default(),
             authority_tasks: Arc::default(),
             authority_progress: Arc::default(),
+            reconciliation_requested: Arc::default(),
         }
     }
 

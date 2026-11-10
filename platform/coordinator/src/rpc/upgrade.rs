@@ -101,6 +101,24 @@ fn evidence(i: &pb::NodeUpgradeInspection, node: Option<&UpgradeNode>, id: &str)
         "runtime_rootfs_sha256":i.runtime_rootfs_sha256,"runtime_rootfs_path":i.runtime_rootfs_path,
         "protocol_version":i.protocol_version})
 }
+
+async fn wake_reconciliation(
+    client: &mut pb::node_service_client::NodeServiceClient<adx_transport::rpc::RpcChannel>,
+    session: &str,
+    ready: bool,
+    deadline: tokio::time::Instant,
+) {
+    if ready {
+        return;
+    }
+    let mut request = Request::new(pb::WakeNodeReconciliationRequest {
+        node_session_id: session.into(),
+    });
+    request.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
+    // The periodic comparison remains authoritative if an old or busy node cannot be woken.
+    let _ = tokio::time::timeout_at(deadline, client.wake_node_reconciliation(request)).await;
+}
+
 impl CoordinatorRpc {
     async fn upgrade_session(&self) -> Session {
         self.0.state.lock().await.session.clone()
@@ -625,7 +643,12 @@ impl CoordinatorRpc {
                 && source_matches
                 && complete
                 && self
-                    .await_migration_adoption(operation, &stored.assignment, operation.was_running)
+                    .await_migration_adoption(
+                        operation,
+                        &stored.assignment,
+                        operation.was_running,
+                        false,
+                    )
                     .await
                     .is_ok()
             {
@@ -1224,7 +1247,7 @@ impl CoordinatorRpc {
                     .as_ref()
                     .is_some_and(|record| record.state == EnvironmentState::Paused)
             {
-                self.await_migration_adoption(&op, &stored.assignment, false)
+                self.await_migration_adoption(&op, &stored.assignment, false, true)
                     .await?;
                 let (_, node) = self.migration_nodes(&op).await?;
                 self.node_view(&node, "").await?;
@@ -1244,7 +1267,7 @@ impl CoordinatorRpc {
             if stored.invalidated || stored.assignment.node_id != op.target_node_id {
                 return Err(Error::Conflict);
             }
-            self.await_migration_adoption(&op, &stored.assignment, op.was_running)
+            self.await_migration_adoption(&op, &stored.assignment, op.was_running, !op.was_running)
                 .await?;
             let result = stored.result.as_ref().ok_or(Error::Conflict)?;
             if (op.was_running
@@ -1273,8 +1296,12 @@ impl CoordinatorRpc {
         op: &UpgradeOperation,
         assignment: &adx_core::Assignment,
         running: bool,
+        mut wake_nodes: bool,
     ) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + self.0.timeout;
+        let started = tokio::time::Instant::now();
+        let deadline = started + self.0.timeout;
+        let mut source_retired_ms = None;
+        let mut target_adopted_ms = None;
         loop {
             let source = self.upgrade_node(&op.source_node_id).await?;
             let target = self.upgrade_node(&op.target_node_id).await?;
@@ -1289,9 +1316,9 @@ impl CoordinatorRpc {
             {
                 return Err(Error::Conflict);
             }
-            let (source, target) = tokio::try_join!(
-                self.node_view(&source, &assignment.environment_id),
-                self.node_view(&target, &assignment.environment_id),
+            let ((mut source_client, source), (mut target_client, target)) = tokio::try_join!(
+                self.checked_node(&source, &assignment.environment_id),
+                self.checked_node(&target, &assignment.environment_id),
             )?;
             let retired = source
                 .environment
@@ -1317,13 +1344,48 @@ impl CoordinatorRpc {
                             && record.resources_held == running
                     })
             });
-            if retired && adopted && !source.unknown && !target.unknown {
-                return Ok(());
+            let source_ready = retired && !source.unknown;
+            let target_ready = adopted && !target.unknown;
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            if source_ready {
+                source_retired_ms.get_or_insert(elapsed_ms);
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Error::Unavailable(
-                    "ownership transferred; local adoption or source retirement pending".into(),
-                ));
+            if target_ready {
+                target_adopted_ms.get_or_insert(elapsed_ms);
+            }
+            let complete = source_ready && target_ready;
+            if complete || tokio::time::Instant::now() >= deadline {
+                adx_observability::info!(event = "environment_migration_handoff",
+                    environment_id = %assignment.environment_id, generation = assignment.generation,
+                    source_node_id = %op.source_node_id, target_node_id = %op.target_node_id,
+                    running, complete, ?source_retired_ms, ?target_adopted_ms,
+                    total_ms = elapsed_ms, "observed migration handoff");
+                return if complete {
+                    Ok(())
+                } else {
+                    Err(Error::Unavailable(
+                        "ownership transferred; local adoption or source retirement pending".into(),
+                    ))
+                };
+            }
+            if wake_nodes {
+                wake_nodes = false;
+                let wake_deadline =
+                    deadline.min(tokio::time::Instant::now() + Duration::from_millis(250));
+                tokio::join!(
+                    wake_reconciliation(
+                        &mut source_client,
+                        &op.source_session_id,
+                        source_ready,
+                        wake_deadline
+                    ),
+                    wake_reconciliation(
+                        &mut target_client,
+                        &op.target_session_id,
+                        target_ready,
+                        wake_deadline
+                    ),
+                );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

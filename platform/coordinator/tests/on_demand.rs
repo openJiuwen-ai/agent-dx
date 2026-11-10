@@ -81,6 +81,12 @@ struct Backend {
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    fn runtime_rootfs_identity(&self) -> Option<adxlet::RuntimeRootfsIdentity> {
+        Some(adxlet::RuntimeRootfsIdentity {
+            path: "/runtime/rootfs".into(),
+            sha256: "c".repeat(64),
+        })
+    }
     fn recovery_profile(&self, spec: &EnvironmentSpec) -> Result<BTreeMap<String, String>> {
         Ok(recovery_profile::qualify(&mut spec.clone()))
     }
@@ -150,12 +156,18 @@ impl RuntimeDriver for Backend {
 }
 #[async_trait]
 impl Readiness for Backend {
+    async fn activity(&self, _: &EnvironmentRecord) -> Result<(u64, u64)> {
+        Ok((1, 0))
+    }
     async fn wait_ready(&self, _: &EnvironmentRecord) -> Result<()> {
         Ok(())
     }
 }
 #[async_trait]
 impl Routes for Backend {
+    async fn activity(&self, _: &EnvironmentRecord) -> Result<(String, u64, u64)> {
+        Ok(("relay".into(), 1, 0))
+    }
     async fn begin_reconcile(&self) -> Result<()> {
         let routes = self.versioned_routes.lock().unwrap().clone();
         if let Some(routes) = routes {
@@ -272,6 +284,8 @@ async fn worker(
             Arc::new(sink.clone()),
         )
         .with_checkpointing(store.clone(), backend.clone())
+        .unwrap()
+        .with_upgrade_control(dir.path().join("upgrade.json"), session.clone())
         .unwrap(),
     );
     manager
@@ -516,6 +530,180 @@ impl Rig {
         .await
         .map(tonic::Response::into_inner)
     }
+}
+
+async fn post_upgrade(
+    address: std::net::SocketAddr,
+    path: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let body = body.to_string();
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    socket
+        .write_all(
+            format!(
+                "POST /v1/node-upgrades/{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(8), socket.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = String::from_utf8(bytes).unwrap();
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    assert_eq!(headers.split_whitespace().nth(1), Some("200"), "{response}");
+    serde_json::from_str(body).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn planned_migration_wakes_both_nodes_before_the_next_periodic_reconciliation() {
+    use serde_json::json;
+    use tokio::time::{interval_at, timeout, Instant};
+
+    let mut rig = Rig::new(Duration::from_secs(4)).await;
+    let running = rig.resume(false).await.unwrap().record.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(adx_coordinator::autoscaling::serve(
+        listener,
+        rig.rpc.clone(),
+    ));
+    let task = "planned-migration";
+    let source = &rig.source.report;
+    let binding = json!({
+        "node_id": source.node_id, "node_session_id": source.session_id, "pod_uid": "source-pod"
+    });
+    post_upgrade(
+        address,
+        "tasks",
+        json!({
+            "task_id": task, "epoch": 1, "namespace": "test", "daemonset_uid": "daemonset",
+            "target_image": format!("image@sha256:{}", "d".repeat(64)), "nodes": [binding]
+        }),
+    )
+    .await;
+    post_upgrade(
+        address,
+        "tasks/planned-migration/prepare-node",
+        json!({
+            "task_id": task, "epoch": 1, "operation_id": "prepare",
+            "node_id": source.node_id, "node_session_id": source.session_id, "pod_uid": "source-pod"
+        }),
+    )
+    .await;
+    let migrate = json!({
+        "task_id": task, "epoch": 1, "operation_id": "migrate",
+        "environment_id": "sleep", "node_id": source.node_id, "node_session_id": source.session_id,
+        "pod_uid": "source-pod", "target_node_id": rig.target.report.node_id,
+        "expected_source_generation": running.assignment.unwrap().generation,
+        "expected_source_revision": running.revision, "checkpoint_storage_alias": "obs"
+    });
+    let path = "tasks/planned-migration/migrate";
+    let operation = migrate.clone();
+    let mut migration = tokio::spawn(async move { post_upgrade(address, path, operation).await });
+
+    let period = Duration::from_secs(60);
+    let next_tick = Instant::now() + period;
+    let mut source_tick = interval_at(next_tick, period);
+    let mut target_tick = interval_at(next_tick, period);
+    timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            rig.source.manager.wait_for_reconciliation(&mut source_tick),
+            rig.target.manager.wait_for_reconciliation(&mut target_tick)
+        )
+    })
+    .await
+    .expect("both ownership handoffs must be triggered before the first periodic tick");
+
+    async fn report(
+        worker: &mut Worker,
+        coordinator: &str,
+        period: Duration,
+    ) -> std::result::Result<(), tonic::Status> {
+        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            channel(coordinator, Principal::Node(worker.report.node_id.clone())).await,
+        );
+        adxlet::node_reconciliation::reconcile_node(
+            &mut client,
+            &mut worker.report,
+            &worker.manager,
+            None,
+            Duration::from_secs(2),
+            period,
+            Instant::now() + period,
+        )
+        .await
+    }
+
+    async fn reconcile(worker: &mut Worker, coordinator: &str, tick: &mut tokio::time::Interval) {
+        let period = tick.period();
+        let error = report(worker, coordinator, period).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(worker.report.reconciling);
+        timeout(
+            Duration::from_secs(1),
+            worker.manager.wait_for_reconciliation(tick),
+        )
+        .await
+        .expect("required handshake must run before the next periodic tick");
+        report(worker, coordinator, period).await.unwrap();
+    }
+
+    reconcile(&mut rig.target, &rig.address, &mut target_tick).await;
+    assert!(
+        timeout(Duration::from_millis(250), &mut migration)
+            .await
+            .is_err(),
+        "target adoption alone cannot authorize Restore"
+    );
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+    reconcile(&mut rig.source, &rig.address, &mut source_tick).await;
+    let completed = timeout(Duration::from_secs(3), &mut migration)
+        .await
+        .expect("migration should complete before the first periodic tick")
+        .unwrap();
+    assert_eq!(completed["node_id"], "b");
+    assert_eq!(completed["state"], "Running");
+    assert_eq!(post_upgrade(address, path, migrate).await, completed);
+    assert!(rig.source.backend.running.lock().unwrap().is_empty());
+    assert_eq!(
+        rig.source
+            .manager
+            .inspect_upgrade()
+            .await
+            .unwrap()
+            .controllers,
+        0
+    );
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 1);
+    let mut target = pb::node_service_client::NodeServiceClient::new(
+        channel(&rig.target.report.node_address, Principal::Coordinator).await,
+    );
+    target
+        .wake_node_reconciliation(pb::WakeNodeReconciliationRequest {
+            node_session_id: rig.target.report.session_id.clone(),
+        })
+        .await
+        .unwrap();
+    timeout(
+        Duration::from_secs(1),
+        rig.target.manager.wait_for_reconciliation(&mut target_tick),
+    )
+    .await
+    .unwrap();
+    assert!(!rig.target.report.reconciling);
+    report(&mut rig.target, &rig.address, period)
+        .await
+        .expect("a late wake on a reconciled session uses the ordinary report");
+    server.abort();
 }
 
 #[tokio::test]

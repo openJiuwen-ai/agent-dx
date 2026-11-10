@@ -9,6 +9,16 @@ use tonic::{Request, Status};
 
 type Coordinator = pb::coordinator_service_client::CoordinatorServiceClient<RpcChannel>;
 
+impl Adxlet {
+    /// Wait for the next report or an authority refresh request.
+    pub async fn wait_for_reconciliation(&self, interval: &mut tokio::time::Interval) {
+        tokio::select! {
+            _ = interval.tick() => {},
+            _ = self.reconciliation_requested.notified() => {},
+        }
+    }
+}
+
 async fn bounded_rpc<T>(
     timeout: Duration,
     future: impl Future<Output = Result<T, Status>>,
@@ -298,6 +308,7 @@ pub async fn reconcile_node(
                 manager.authority_reconciling.store(true, Ordering::Release);
                 registration.reconciling = true;
                 registration.accepting_allocations = false;
+                manager.reconciliation_requested.notify_one();
             }
         }
         return result;
@@ -346,6 +357,10 @@ pub async fn reconcile_node(
         // Coordinator restart/ownership invalidation can require a fresh
         // registration handshake, independently of local controller recovery.
         registration.reconciling = handshake || handshake_required;
+        if periodic && handshake_required {
+            // Continue a newly required handshake without waiting for the next report tick.
+            manager.reconciliation_requested.notify_one();
+        }
         if was_live
             && !catalog_received
             && result.as_ref().is_err_and(|error| {

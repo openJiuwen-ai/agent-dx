@@ -136,7 +136,11 @@ return an old isolation instruction. Source Pause grants bind the exact
 Environment generation; no reserved probe names or wildcard generations bypass
 normal execution authorization. Per-ID inspection still confirms that a migrated
 Environment's old execution retired and its new owner published the expected
-state. Shared checkpoint garbage collection retains its existing reference
+state. After transfer, Coordinator can wake the affected node processes to
+compare against the authoritative catalog before the next periodic report. A
+wake acknowledgement grants no execution authority. Completion still requires
+observed retirement and adoption, with periodic comparison available if a wake
+is unavailable. Shared checkpoint garbage collection retains its existing reference
 protection and is separate from execution cleanup.
 A `Published Failed` restore or a lost reply does not complete migration. Query
 or explicit resume uses the same operation; sources are not deleted while any

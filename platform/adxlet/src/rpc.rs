@@ -299,6 +299,20 @@ impl pb::node_service_server::NodeService for NodeRpc {
         Ok(Response::new(actual))
     }
 
+    async fn wake_node_reconciliation(
+        &self,
+        request: Request<pb::WakeNodeReconciliationRequest>,
+    ) -> std::result::Result<Response<pb::WakeNodeReconciliationResponse>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Coordinator {
+            return Err(Status::permission_denied("Coordinator identity required"));
+        }
+        if self.session_id.is_empty() || request.into_inner().node_session_id != self.session_id {
+            return Err(Status::failed_precondition("node process session changed"));
+        }
+        self.manager.reconciliation_requested.notify_one();
+        Ok(Response::new(pb::WakeNodeReconciliationResponse {}))
+    }
+
     async fn ensure_environment_running(
         &self,
         request: Request<pb::EnsureEnvironmentRunningRequest>,

@@ -53,6 +53,48 @@ fn request<T>(value: T) -> tonic::Request<T> {
     request
 }
 
+#[tokio::test(start_paused = true)]
+async fn reconciliation_wake_requires_current_coordinator_session_and_coalesces() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = checkpoint_node(&Arc::new(Backend::default()), dir.path());
+    let rpc = adxlet::rpc::NodeRpc::new(node.clone(), Peers::network(), "test-session".into());
+    let wake = |component: &'static str, session: &str| {
+        let mut request = tonic::Request::new(pb::WakeNodeReconciliationRequest {
+            node_session_id: session.into(),
+        });
+        request
+            .metadata_mut()
+            .insert("adx-component", component.parse().unwrap());
+        request
+    };
+    let mut report = tokio::time::interval(Duration::from_secs(60));
+    report.tick().await;
+    for (component, session, expected) in [
+        ("apiserver", "test-session", tonic::Code::PermissionDenied),
+        (
+            "coordinator",
+            "old-session",
+            tonic::Code::FailedPrecondition,
+        ),
+    ] {
+        let error = rpc
+            .wake_node_reconciliation(wake(component, session))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), expected);
+    }
+    assert!(futures_util::poll!(Box::pin(node.wait_for_reconciliation(&mut report))).is_pending());
+    for _ in 0..2 {
+        rpc.wake_node_reconciliation(wake("coordinator", "test-session"))
+            .await
+            .unwrap();
+    }
+    let start = tokio::time::Instant::now();
+    node.wait_for_reconciliation(&mut report).await;
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    assert!(futures_util::poll!(Box::pin(node.wait_for_reconciliation(&mut report))).is_pending());
+}
+
 async fn pause(node: &Arc<Adxlet>, record: EnvironmentRecord) -> EnvironmentRecord {
     let rpc = adxlet::rpc::NodeRpc::new(node.clone(), Peers::network(), "test-session".into());
     rpc.pause_environment(request(pb::PauseEnvironmentRequest {
