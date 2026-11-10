@@ -100,6 +100,7 @@ Nydus backend 示例（替换实际地址与具体 manifest digest）：
 ## OverlayBD 本机块设备
 
 Linux 构建可选用 `cargo build -p afs --bin afs-node --features overlaybd-connector`。
+该特性编译 `libublk` 时需要 libclang 和 Linux UAPI 头文件。
 运行时仍需显式启用：
 
 ```toml
@@ -110,11 +111,14 @@ directory = "/var/lib/afs/overlaybd"
 image = "registry.example.com/team/image@sha256:MANIFEST_DIGEST"
 ```
 
-私有目录（模式 0700）内放部署固定的 OverlayBD `image.json` 和 `global.json`。
-镜像须为只读，`repoBlobUrl` 可使用同节点
+私有目录（模式 0700）内放部署固定的 OverlayBD `image.json`。
+按底层到顶层在 `lowers` 中列出 blob 的 `digest` 和 `size`。
+reader 支持未压缩的封存 LSMT 1.1 只读层，依据 blob 自身的头和尾识别格式。
+启用重启接管时，同目录的 `global.json` 继续参与恢复配置的身份校验。
+`repoBlobUrl` 可使用同节点
 `http://AFS_NODE:7401/nydus/SOURCE/sha256:MANIFEST_DIGEST/blobs`。
-使用该 URL 时须启用 Registry blob 路由并配置对应来源。块后端和 Linux ublk 队列在
-AFS Node 进程内运行。按需填充、提交和 Peer 读由现有 AFS 负责。
+使用该 URL 时须启用 Registry blob 路由并配置对应来源。
+只读 reader 和 `libublk` 队列在 AFS Node 进程内运行。按需填充、提交和 Peer 读由现有 AFS 负责。
 
 adxlet 配置 `ADX_OVERLAYBD_ROOTFS_SOCKET=/var/lib/afs/overlaybd/connector.sock`。
 本地 socket 的 `POST /acquire` 接收 `{"runtime_id":"...","image":"...","acquire_deadline_ms":...}`，

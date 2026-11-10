@@ -1,5 +1,9 @@
-use super::OverlaybdConfig;
-use overlaybd::{ImageFile, ImageService};
+use super::{
+    OverlaybdConfig,
+    lsmt::SECTOR_SIZE,
+    reader::Image,
+    ublk::{self, Device},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -11,14 +15,9 @@ use std::{
     sync::{Arc, Weak},
     time::Duration,
 };
-use storage_util::io_ring::{IoRingHandle, spawn_io_ring_worker};
 use tokio::process::Command;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio::{sync::Mutex, task::JoinHandle};
-use uvm_ublk::{OverlaybdTarget, UVMUblkCtrlBuilder, UVMUblkDev, UVMUblkDevBuilder};
-
-type Ring = IoRingHandle<io_uring::squeue::Entry128>;
-type Device = UVMUblkDev<OverlaybdTarget>;
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const IMAGE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const ACQUIRE_MAX_AGE_MS: u64 = 120_000;
@@ -74,7 +73,6 @@ struct Released {
 
 pub(super) struct Devices {
     config: OverlaybdConfig,
-    ring: Option<Ring>,
     journal: Option<Journal>,
     owned_id: Option<u32>,
     device: Option<Device>,
@@ -82,6 +80,7 @@ pub(super) struct Devices {
     owner: Weak<Mutex<Self>>,
     monitor: Option<QueueMonitor>,
     pending_stop: Option<JoinHandle<io::Result<bool>>>,
+    pending_delete: Option<JoinHandle<io::Result<()>>>,
     released: Released,
 }
 
@@ -130,7 +129,6 @@ impl Devices {
         Ok(Self {
             config,
             released,
-            ring: None,
             journal,
             owned_id: None,
             device: None,
@@ -138,6 +136,7 @@ impl Devices {
             owner: Weak::new(),
             monitor: None,
             pending_stop: None,
+            pending_delete: None,
         })
     }
 
@@ -371,34 +370,19 @@ impl Devices {
                 Err(error) => return Err(error),
             }
         };
-        if image.num_lbas() != binding.sectors
-            || u64::from(image.block_size) != binding.block_size
+        if image.sectors() != binding.sectors
+            || SECTOR_SIZE != binding.block_size
             || self.configuration_sha256()? != binding.configuration_sha256
         {
             return Err(io::Error::other(
                 "OverlayBD recovery image geometry or configuration changed",
             ));
         }
-        let target = OverlaybdTarget::from_opened_image(
-            self.config.directory.join("image.json"),
-            Arc::new(image),
-            false,
-        )
-        .map_err(backend_error)?;
-        let ctrl = UVMUblkCtrlBuilder::new()
-            .name("afs-overlaybd")
-            .dev_id(id)
-            .build(self.control_ring())
-            .map_err(backend_error)?;
-        let device = UVMUblkDevBuilder::new(ctrl)
-            .set_target(target)
-            .recover(deadline)
-            .await
-            .map_err(backend_error)?;
-        let resumed = device.resume(deadline).await;
+        let mut device = Device::recover(id, image).await?;
+        let resumed = device.start(deadline).await;
         self.owned_id = Some(id);
         self.device = Some(device);
-        resumed.map_err(backend_error)?;
+        resumed?;
         self.publish_serving()
     }
 
@@ -412,37 +396,22 @@ impl Devices {
     }
 
     async fn stop_and_drain(&mut self, id: u32) -> io::Result<()> {
-        if let Some(device) = &self.device {
+        if let Some(device) = &mut self.device {
             // The kernel aborts requests left owned by userspace on character
             // device release. STOP can wait indefinitely for one of those
             // requests if we send it while the character device is still open.
             device
                 .stop_queue_workers(Instant::now() + QUEUE_DRAIN_TIMEOUT)
-                .await
-                .map_err(|error| {
-                    if error.is::<tokio::time::error::Elapsed>() {
-                        io::Error::new(io::ErrorKind::TimedOut, error.to_string())
-                    } else {
-                        backend_error(error)
-                    }
-                })?;
+                .await?;
         }
         if self.pending_stop.is_none() {
-            let mut control = UVMUblkCtrlBuilder::new()
-                .dev_id(id)
-                .build(self.control_ring())
-                .map_err(backend_error)?;
             self.pending_stop = Some(tokio::spawn(async move {
-                match control.stop_dev().await {
+                match ublk::stop(id).await {
                     Ok(()) => Ok(true),
-                    Err(error) => match error
-                        .root_cause()
-                        .downcast_ref::<io::Error>()
-                        .and_then(io::Error::raw_os_error)
-                    {
+                    Err(error) => match error.raw_os_error() {
                         Some(libc::ENODEV) => Ok(true),
                         Some(libc::EINVAL) => Ok(false),
-                        _ => Err(backend_error(error)),
+                        _ => Err(error),
                     },
                 }
             }));
@@ -459,35 +428,14 @@ impl Devices {
                 .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))?;
             self.pending_stop = None;
             let confirmed = result.map_err(backend_error)??;
-            if confirmed && let Some(device) = &self.device {
-                // SAFETY: stop_and_drain joined the workers and closed their
-                // character device before submitting the successful STOP.
-                unsafe { device.release_stopped_buffers() }.map_err(backend_error)?;
+            if confirmed && let Some(device) = &mut self.device {
+                device.release_stopped_buffers();
             }
         }
         Ok(())
     }
 
     fn configuration_sha256(&self) -> io::Result<String> {
-        let image_path = self.config.directory.join("image.json");
-        let config = overlaybd::config::load_image_config(&image_path).map_err(backend_error)?;
-        for layer in &config.lowers {
-            let pinned = layer.digest.strip_prefix("sha256:").is_some_and(|digest| {
-                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-            });
-            if !pinned
-                || !layer.file.is_empty()
-                || !layer.target_file.is_empty()
-                || !layer.gzip_index.is_empty()
-                || layer
-                    .effective_repo_blob_url(&config.repo_blob_url)
-                    .is_empty()
-            {
-                return Err(io::Error::other(
-                    "OverlayBD recovery requires digest-pinned remote layers",
-                ));
-            }
-        }
         let mut digest = Sha256::new();
         digest.update(Sha256::digest(self.config.image.as_bytes()));
         for name in ["image.json", "global.json"] {
@@ -496,19 +444,8 @@ impl Devices {
         Ok(format!("{:x}", digest.finalize()))
     }
 
-    async fn open_image(&self) -> io::Result<ImageFile> {
-        let image = ImageService::from_config_path(self.config.directory.join("global.json"))
-            .await
-            .map_err(backend_error)?
-            .create_image_file(self.config.directory.join("image.json"))
-            .await
-            .map_err(backend_error)?;
-        if !image.is_read_only().await {
-            return Err(io::Error::other(
-                "OverlayBD connector requires a read-only image",
-            ));
-        }
-        Ok(image)
+    async fn open_image(&self) -> io::Result<Image> {
+        Image::open(&self.config.directory.join("image.json")).await
     }
 
     async fn create(&mut self) -> io::Result<()> {
@@ -526,27 +463,10 @@ impl Devices {
         let recovery = configuration_sha256.map(|configuration_sha256| RecoveryBinding {
             configuration_sha256,
             disk_sequence: String::new(),
-            sectors: image.num_lbas(),
-            block_size: u64::from(image.block_size),
+            sectors: image.sectors(),
+            block_size: SECTOR_SIZE,
         });
-        let target = OverlaybdTarget::from_opened_image(
-            self.config.directory.join("image.json"),
-            Arc::new(image),
-            false,
-        )
-        .map_err(backend_error)?;
-        let builder = UVMUblkCtrlBuilder::new().name("afs-overlaybd");
-        let builder = if recovery.is_some() {
-            builder.recoverable()
-        } else {
-            builder
-        };
-        let ctrl = builder.build(self.control_ring()).map_err(backend_error)?;
-        let device = UVMUblkDevBuilder::new(ctrl)
-            .set_target(target)
-            .build()
-            .await
-            .map_err(backend_error)?;
+        let device = Device::create(image, recovery.is_some()).await?;
         let id = device.dev_id();
         self.device = Some(device);
         self.owned_id = Some(id);
@@ -580,10 +500,7 @@ impl Devices {
             .device
             .as_mut()
             .ok_or_else(|| io::Error::other("missing new device"))?;
-        device
-            .start(Instant::now() + RECOVERY_TIMEOUT)
-            .await
-            .map_err(backend_error)?;
+        device.start(Instant::now() + RECOVERY_TIMEOUT).await?;
         let path = device.device_path();
         for _ in 0..50 {
             if path
@@ -636,19 +553,17 @@ impl Devices {
                 self.stop_and_drain(id).await?;
                 self.device = None;
             }
-            let mut ctrl = UVMUblkCtrlBuilder::new()
-                .dev_id(id)
-                .build(self.control_ring())
-                .map_err(backend_error)?;
-            if let Err(error) = timeout(STOP_TIMEOUT, ctrl.del_dev())
+            let delete = self
+                .pending_delete
+                .get_or_insert_with(|| tokio::spawn(ublk::delete(id)));
+            let deleted = timeout(STOP_TIMEOUT, delete)
                 .await
-                .map_err(backend_error)?
-                && error
-                    .root_cause()
-                    .downcast_ref::<io::Error>()
-                    .is_none_or(|cause| cause.raw_os_error() != Some(libc::ENODEV))
+                .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))?;
+            self.pending_delete = None;
+            if let Err(error) = deleted.map_err(backend_error)?
+                && error.raw_os_error() != Some(libc::ENODEV)
             {
-                return Err(backend_error(error));
+                return Err(error);
             }
             self.owned_id = None;
         }
@@ -680,12 +595,6 @@ impl Devices {
             self.config.directory.join(format!("{name}.json")),
         )?;
         File::open(&self.config.directory)?.sync_all()
-    }
-
-    fn control_ring(&mut self) -> Ring {
-        self.ring
-            .get_or_insert_with(|| spawn_io_ring_worker(0).0)
-            .clone()
     }
 
     fn mount_path(&self) -> PathBuf {

@@ -1,5 +1,8 @@
 //! Node-local OverlayBD block export. AFS serves the backing blob ranges.
 mod device;
+mod lsmt;
+mod reader;
+mod ublk;
 
 use super::{ConnectorContext, ConnectorModule};
 use crate::node::vfs::lazy_fill::LazyFillRegistry;
