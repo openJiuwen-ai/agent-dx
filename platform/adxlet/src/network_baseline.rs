@@ -22,6 +22,7 @@ pub struct NetworkBaseline {
 
 impl NetworkBaseline {
     pub fn validate(&self) -> Result<()> {
+        validate_peer_aliases(&self.peer_aliases)?;
         self.policy.validate()?;
         let traffic = self
             .policy
@@ -70,7 +71,7 @@ impl NetworkBaseline {
             ));
         }
         for rule in &mut traffic.rules {
-            if let Some(cidr) = self.peer_aliases.get(&rule.peer.domain) {
+            if let Some(cidr) = resolve_peer_alias(&self.peer_aliases, &rule.peer.domain) {
                 rule.peer.domain.clear();
                 rule.peer.cidr = cidr.to_string();
             }
@@ -135,6 +136,38 @@ impl NetworkBaseline {
         }
         Ok(effective)
     }
+}
+
+/// Check that DNS-equivalent aliases cannot select different node addresses.
+pub fn validate_peer_aliases(aliases: &BTreeMap<String, ipnet::Ipv4Net>) -> Result<()> {
+    let mut names = BTreeMap::new();
+    for (name, cidr) in aliases {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        if name.trim().is_empty() {
+            return Err(invalid("network peer aliases require nonempty names"));
+        }
+        if names
+            .insert(name, *cidr)
+            .is_some_and(|previous| previous != *cidr)
+        {
+            return Err(invalid(
+                "equivalent network peer aliases have conflicting CIDRs",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_peer_alias(
+    aliases: &BTreeMap<String, ipnet::Ipv4Net>,
+    domain: &str,
+) -> Option<ipnet::Ipv4Net> {
+    let domain = domain.trim_end_matches('.');
+    aliases.iter().find_map(|(name, cidr)| {
+        name.trim_end_matches('.')
+            .eq_ignore_ascii_case(domain)
+            .then_some(*cidr)
+    })
 }
 
 fn invalid(message: &str) -> Error {
@@ -262,6 +295,39 @@ mod tests {
             requested.peer.port = 9090;
             assert!(baseline.enforce(Some(&policy(vec![requested]))).is_err());
         }
+    }
+
+    #[test]
+    fn peer_aliases_accept_equivalent_domain_spellings() {
+        for configured in ["node.example", "NODE.EXAMPLE."] {
+            for requested in ["node.example", "Node.Example", "node.example."] {
+                let baseline = NetworkBaseline {
+                    policy: policy(vec![rule("10.88.4.1/32", 8080, 300)]),
+                    peer_aliases: BTreeMap::from([(
+                        configured.into(),
+                        "10.88.4.1/32".parse().unwrap(),
+                    )]),
+                };
+                let mut request = rule("", 8080, 300);
+                request.peer.domain = requested.into();
+                let effective = baseline.enforce(Some(&policy(vec![request]))).unwrap();
+                let peer = &effective.traffic.unwrap().rules[0].peer;
+                assert_eq!(peer.cidr, "10.88.4.1/32");
+                assert!(peer.domain.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn peer_aliases_reject_conflicting_equivalent_names() {
+        let baseline = NetworkBaseline {
+            policy: policy(vec![]),
+            peer_aliases: BTreeMap::from([
+                ("node.example".into(), "10.88.4.1/32".parse().unwrap()),
+                ("NODE.EXAMPLE.".into(), "10.99.0.1/32".parse().unwrap()),
+            ]),
+        };
+        assert!(baseline.validate().is_err());
     }
 
     fn rule(cidr: &str, port: u32, priority: u32) -> NetworkRule {

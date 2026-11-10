@@ -148,13 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(baseline) = &config.network_baseline {
         baseline.validate()?;
     }
-    if config
-        .network_peer_aliases
-        .keys()
-        .any(|peer| peer.trim().is_empty())
-    {
-        return Err("network_peer_aliases must use nonempty logical peers".into());
-    }
+    adxlet::network_baseline::validate_peer_aliases(&config.network_peer_aliases)?;
     if config
         .platform_ingress_sources
         .as_ref()

@@ -1022,13 +1022,17 @@ pub(crate) fn environment_network_policy(
     config: &Config,
 ) -> Result<proto::NetworkPolicy> {
     use adx_core::execution as model;
+    crate::network_baseline::validate_peer_aliases(&config.network_peer_aliases)?;
     let mut resolved = value.clone();
     if let Some(traffic) = &mut resolved.traffic {
         for rule in &mut traffic.rules {
             if rule.peer.domain.is_empty() {
                 continue;
             }
-            if let Some(cidr) = config.network_peer_aliases.get(&rule.peer.domain) {
+            if let Some(cidr) = crate::network_baseline::resolve_peer_alias(
+                &config.network_peer_aliases,
+                &rule.peer.domain,
+            ) {
                 if !rule.peer.address.is_empty() || !rule.peer.cidr.is_empty() {
                     return Err(Error::Invalid(
                         "network peer alias cannot be combined with an address or CIDR".into(),
@@ -1144,10 +1148,12 @@ pub(crate) fn environment_network_policy(
                 rules.push(proto::TrafficRule {
                     action: proto::NetworkPolicyAction::Allow as i32,
                     // Execd control replies must not depend on a conntrack entry
-                    // from the previous policy generation. Stateless published
-                    // ports also need an explicit return-path rule.
-                    direction: if config.platform_ingress_sources.is_none()
-                        && (port == execd_port || traffic.mode == model::TrafficMode::Stateless)
+                    // from the previous policy generation. Configured platform
+                    // CIDRs also bound this bidirectional control-port exception.
+                    // Stateless published ports need an explicit return path.
+                    direction: if port == execd_port
+                        || (config.platform_ingress_sources.is_none()
+                            && traffic.mode == model::TrafficMode::Stateless)
                     {
                         proto::NetworkDirection::Both as i32
                     } else {
