@@ -144,10 +144,26 @@ pub struct DfsWriteSession {
 
 pub(super) struct ResolvedReadView {
     pub(super) committed: Option<FileVersionId>,
+    /// The GC reference that keeps `committed` while this read uses it (R94).
+    pub(super) base_reference: Option<Arc<crate::node::gc::GcPin>>,
     pub(super) length: u64,
     pub(super) layout: LayoutRoot,
     pub(super) frozen: Option<DirtyExtentMap>,
     pub(super) active: DirtyExtentMap,
+}
+
+/// A file version that durably incorporated a proxied handle's writes.
+#[derive(Clone, Eq, PartialEq)]
+pub(super) struct ProxiedCommit {
+    pub(super) version: FileVersionId,
+    pub(super) revision: u64,
+}
+
+#[derive(Default)]
+pub(super) struct ProxiedWriteProgress {
+    pending: bool,
+    frozen: bool,
+    committed: Option<ProxiedCommit>,
 }
 
 pub(super) struct InodeWriteState {
@@ -155,6 +171,14 @@ pub(super) struct InodeWriteState {
     pub(super) write_lease: WriteLease,
     pub(super) base_version: Option<FileVersion>,
     pub(super) base_layout: LayoutRoot,
+    /// The GC reference of `base_version` that reads through this state share,
+    /// taken by the first such read (R94). A write lease, or a writer still
+    /// open, does not keep the base: the lease can lapse while a writer is open
+    /// and this Node's next commit retires the base as head.
+    pub(super) base_read_reference: Option<(FileVersionId, Arc<crate::node::gc::GcPin>)>,
+    /// Only open proxy writers that have changed file data have an entry.
+    /// Pending mutations and the frozen commit are recorded under this lock.
+    pub(super) proxied_writes: HashMap<DfsWriteSessionId, ProxiedWriteProgress>,
     pub(super) logical_length: u64,
     pub(super) metadata_dirty: bool,
     pub(super) kill_suidgid_dirty: bool,
@@ -209,6 +233,40 @@ impl Drop for InodeOperationGuard {
 }
 
 impl InodeWriteState {
+    pub(super) fn note_proxied_write(&mut self, writer: &DfsWriteSessionId) {
+        self.proxied_writes
+            .entry(writer.clone())
+            .or_default()
+            .pending = true;
+    }
+
+    pub(super) fn freeze_proxied_writes(&mut self) {
+        for write in self.proxied_writes.values_mut() {
+            write.frozen = std::mem::take(&mut write.pending);
+        }
+    }
+
+    pub(super) fn restore_proxied_writes(&mut self) {
+        for write in self.proxied_writes.values_mut() {
+            write.pending |= std::mem::take(&mut write.frozen);
+        }
+    }
+
+    pub(super) fn commit_proxied_writes(&mut self, version: &FileVersionId, revision: u64) {
+        for write in self.proxied_writes.values_mut() {
+            if std::mem::take(&mut write.frozen) {
+                write.committed = Some(ProxiedCommit {
+                    version: version.clone(),
+                    revision,
+                });
+            }
+        }
+    }
+
+    pub(super) fn proxied_commit(&self, writer: &DfsWriteSessionId) -> Option<ProxiedCommit> {
+        self.proxied_writes.get(writer)?.committed.clone()
+    }
+
     /// Anything a Node-wide writeback pass (progress, timer, upload start,
     /// lease renewal, resource accounting) may act on or count. A state
     /// without any of these is closed and published: no pass touches it.
@@ -732,6 +790,8 @@ impl DistributedFs {
                 write_lease,
                 base_version,
                 base_layout,
+                base_read_reference: None,
+                proxied_writes: HashMap::new(),
                 logical_length,
                 metadata_dirty: false,
                 kill_suidgid_dirty: false,

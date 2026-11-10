@@ -498,7 +498,7 @@ Bao sidecar、Peer cache 条目与目录标记、外部对象 key 前缀、Owner
   `catalog.wal` 与请求摘要只由 golden 钉住。
 - **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
 - **协议**：`RegisterNodeRequest.protocol_version` 是集群线协议代际（Node↔Meta 注册、Node↔Node service
-  布局），当前为 6（5 为 `ReadDir` 分页，6 为放置快照与副本写授权携带降级策略 `DfsReplicaFailureConfig`），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
+  布局），当前为 7（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
@@ -1278,13 +1278,24 @@ Coordinator 挂载同一 namespace，统一管理共享文件的回收；节点�
 版本，写代是这一代开始时的基线版本；Create 事务里建的句柄引用、目录引用不记版本，只保 head。没有被任何一条命名的旧版本，
 即使文件仍打开也会回收，它与保留版本共享的 chunk 由可达性保留。Node 按（inode，版本）共享 `open:` 引用。
 
-**本机提交推进读句柄**（决策 4a，R94）：读句柄的版本与它的引用作为一个整体替换（`node/vfs/dfs/handles.rs` 的
-`OpenedView`），每个在途读持有它开始时的那一份，所以被替换的引用在最后一个用它的读结束后才释放。本机有写者打开时，
-该 inode 的读都走写状态，推进只记为待发布、不建引用；最后一个本机写者关闭时，为本机最新版本建一次引用（同一 Node
-各句柄共享）并发布。建引用失败时句柄不推进，继续读原版本（原引用仍在），记 `dfs.handle_view_reference_failed`
-警告，下一次读、提交或最后一个本机写者关闭时补建；已持久的提交不因此报失败。其他 Node 的提交不推进已打开的句柄。
 这一字段随 `META_RECORD_DECISION` 2、`META_STATE_IMAGE` 3 引入，旧数据目录按格式规则拒绝（`STORAGE_FORMAT_INCOMPATIBLE`），
 不会把旧引用当成“什么都不保护”。
+
+**读路径选中的版本都有引用**（决策 4a，R94）：凡是读路径能选中的已提交版本，以及在途读正在用的版本，都由 GC 引用
+保护到使用结束；写句柄仍打开、写租约看似有效都不算保护（租约可能在写者打开期间失效，本机下一次提交也会让上一个
+基线退出 head）。读句柄的版本与它的引用作为一个整体替换（`node/vfs/dfs/handles.rs` 的 `OpenedView`），每个在途读
+持有它开始时的那一份。本机有写者打开时，该 inode 的读走写状态：第一次经写状态读到某个已提交基线时为它建引用
+（`InodeWriteState.base_read_reference`，同一 Node 共享），在途读各自持有到读结束，本机下一次提交或最后一个写者
+关闭时写状态放下它；没有读的提交不建引用。句柄的推进记为待发布，最后一个本机写者关闭时为本机最新版本建一次引用
+（与写状态那份共享）并发布。建引用失败时：句柄不推进、继续读原版本（原引用仍在），记
+`dfs.handle_view_reference_failed`，下一次读、提交或最后一个写者关闭时补建；经写状态的读若没有本机未提交数据，
+改读句柄自己的版本，若有，则返回该错误（记 `dfs.write_state_read_reference_failed`），不读未受保护的基线。
+已持久的提交不因此报失败。写状态只在仍有本机写活动时缓存基线引用，最后一个写者关闭后才完成的读只自己持有引用，
+读完即释放。owner 在冻结写入批次时记录包含的代理句柄，在文件版本提交成功时把版本与这些句柄关联。
+代理同步回执保留 inode 同步屏障的当前版本，并单独携带该代理句柄最近一次实际参与的文件提交。没有新代理写的 flush
+沿用已归属的版本，始终没有写过的句柄没有归属版本。最后一个代理会话结束时，只在本 Node 最新的归属版本仍是 head 时
+推进本机已打开的读句柄。若归属版本已被取代，旧读句柄保留原受保护的视图。查询失败时关闭照常成功，下一次读只补查
+同一版本（`dfs.handle_view_refresh_failed`）。其他 Node 的提交不推进已打开的句柄。
 
 S3（外部后端）与原生共用同一套规划（`plan_collection`、写代保护、每代至多 512 个 chunk），只是执行者不同：
 对象只有一份，所以一代只等一个存活存储节点（node_id 最小者）删除，全部成功才确认，失败下一轮重试，已不

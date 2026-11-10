@@ -295,6 +295,7 @@ impl DistributedFs {
             Ok(Some(CommitAction::Send(pending)))
         } else {
             let frozen = Self::freeze_state_for_commit(&mut state);
+            state.freeze_proxied_writes();
             state.in_flight = Some(InFlightCommit::Preparing(Box::new(frozen.clone())));
             state.commit_busy = true;
             state.dirty = false;
@@ -391,6 +392,7 @@ impl DistributedFs {
                 let failed = *frozen;
                 if state.dirty_extents.is_empty() {
                     state.dirty_extents.restore_before(failed.dirty_extents);
+                    state.restore_proxied_writes();
                     state.in_flight = None;
                 } else {
                     state.in_flight = Some(InFlightCommit::Preparing(Box::new(failed)));
@@ -459,6 +461,7 @@ impl DistributedFs {
                 let definite = is_definite_commit_rejection(&error);
                 Self::record_commit_error_locked(&mut state, &error, definite);
                 if definite && let InFlightCommit::File(pending) = pending {
+                    state.restore_proxied_writes();
                     state
                         .dirty_extents
                         .restore_before(pending.frozen.dirty_extents);
@@ -580,9 +583,12 @@ impl DistributedFs {
                     Self::clear_kernel_write_privileges(updated.attributes.mode);
             }
         }
+        state.commit_proxied_writes(&version.id, updated.revision);
         state.inode = updated;
         state.base_version = Some(version);
         state.base_layout = layout;
+        // In-flight reads keep their own reference of the old base (R94).
+        let _retired_base_reference = state.base_read_reference.take();
         state.dirty = !state.dirty_extents.is_empty();
         state.durable_write_seq = through_seq;
         state.committed_write_seq = through_seq;

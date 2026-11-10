@@ -38,6 +38,7 @@ struct WriteApply<'a> {
     kill_suidgid: bool,
     target: WriteTarget,
     operation_id: OperationId,
+    proxied_writer: Option<&'a DfsWriteSessionId>,
 }
 
 impl DistributedFs {
@@ -239,6 +240,11 @@ impl DistributedFs {
             .mutation_ticket(&cell)?
             .ok_or_else(|| unavailable("native mutation ticket is missing"))?;
         let append = snapshot.flags & libc::O_APPEND != 0;
+        let proxied_writer = snapshot
+            .owner_scope
+            .as_ref()
+            .and(snapshot.write_session.as_ref())
+            .map(|session| &session.local.id);
         while *accepted < data.len() {
             self.wait_mutation_ready(&snapshot.inode_id, &cell)?;
             if pipeline.closed.load(Ordering::Acquire) {
@@ -299,6 +305,7 @@ impl DistributedFs {
                     kill_suidgid: options.kill_suidgid,
                     target,
                     operation_id,
+                    proxied_writer,
                 },
                 prepared,
                 descriptor,
@@ -517,6 +524,7 @@ impl DistributedFs {
             kill_suidgid,
             target,
             operation_id,
+            proxied_writer,
         } = write;
         let position = target.position;
         let mut state = cell
@@ -553,6 +561,11 @@ impl DistributedFs {
         state.logical_length = state.logical_length.max(position + written as u64);
         state.next_write_seq = next_seq;
         state.visible_write_seq = next_seq;
+        if written != 0
+            && let Some(writer) = proxied_writer
+        {
+            state.note_proxied_write(writer);
+        }
         state.dirty = true;
         state.metadata_dirty = true;
         let now = now_unix_ms();

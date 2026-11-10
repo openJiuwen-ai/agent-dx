@@ -166,10 +166,7 @@ async fn register_node_refuses_other_protocol_versions_before_writing() {
         store.clone(),
     ));
     let supported = afs::format::version::NODE_META_PROTOCOL;
-    assert_eq!(
-        supported, 6,
-        "generation 5 predates the replica failure contract (S4b R12)"
-    );
+    assert_eq!(supported, 7, "generation 6 lacks proxy commit attribution");
     for found in [0, 1, supported - 1, supported + 1] {
         let mut request = request("session-old");
         request.protocol_version = found;

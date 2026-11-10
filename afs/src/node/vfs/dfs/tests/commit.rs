@@ -214,6 +214,8 @@ fn synthetic_write_state(
             file_length: 0,
             inline_extents: Vec::new(),
         },
+        base_read_reference: None,
+        proxied_writes: HashMap::new(),
         logical_length: 0,
         metadata_dirty,
         kill_suidgid_dirty,

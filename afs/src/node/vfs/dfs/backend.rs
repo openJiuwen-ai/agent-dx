@@ -324,7 +324,7 @@ impl Backend for DistributedFs {
                 self.write_coordinator
                     .remote_resize(session, length, options)?
             } else {
-                self.resize_dirty_inode(&snapshot.inode_id, length, options.kill_suidgid)?
+                self.resize_dirty_inode(&snapshot.inode_id, length, options.kill_suidgid, None)?
             };
             (
                 InodeRecord::clone(&snapshot.opened_inode),
@@ -340,7 +340,7 @@ impl Backend for DistributedFs {
                 && write_lease.owner_session_id == self.identity.session_id
             {
                 self.install_write_state(record.clone(), write_lease)?;
-                self.resize_dirty_inode(&record.inode_id, length, options.kill_suidgid)?;
+                self.resize_dirty_inode(&record.inode_id, length, options.kill_suidgid, None)?;
             } else {
                 let previous_provider = self
                     .write_coordinator
@@ -546,7 +546,7 @@ impl Backend for DistributedFs {
                 }
                 if flags & libc::O_TRUNC != 0
                     && let Err(error) =
-                        self.resize_dirty_inode(&inode.inode_id, 0, options.kill_suidgid)
+                        self.resize_dirty_inode(&inode.inode_id, 0, options.kill_suidgid, None)
                 {
                     self.abandon_writer(&session.local)?;
                     return Err(error);
