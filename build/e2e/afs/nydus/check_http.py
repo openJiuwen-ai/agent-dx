@@ -18,14 +18,14 @@ BASE = "http://10.203.0.10:5000/v2/lab/nydus"
 RESULTS = []
 
 
-def request(request_url, method="GET", headers=None, data=None, *, authenticated=True):
+def request(request_url, method="GET", headers=None, data=None, *, authenticated=True, timeout=40):
     headers = dict(headers or {})
     if authenticated and urllib.parse.urlsplit(request_url).path.startswith("/nydus/"):
         token = pathlib.Path("/artifacts/afs-tls/nydus-token").read_text().strip()
         headers["Authorization"] = f"Bearer {token}"
     try:
         response = urllib.request.urlopen(
-            urllib.request.Request(request_url, data=data, method=method, headers=headers), timeout=40
+            urllib.request.Request(request_url, data=data, method=method, headers=headers), timeout=timeout
         )
     except urllib.error.HTTPError as response:
         return response.code, {k.lower(): v for k, v in response.headers.items()}, response.read()

@@ -46,16 +46,8 @@ paused = False
 with concurrent.futures.ThreadPoolExecutor(3) as pool:
     old = pool.submit(
         mgmt,
-        """import urllib.request, urllib.error
-m = (c.OUT / 'race-manifest.txt').read_text()
-r = urllib.request.Request(c.url('a', m), headers={'Range': 'bytes=1048576-1052671'})
-try:
-    response = urllib.request.urlopen(r, timeout=85)
-    status = response.status
-    body = response.read()
-except urllib.error.HTTPError as e:
-    status = e.code
-    body = e.read()
+        """m = (c.OUT / 'race-manifest.txt').read_text()
+status, _, body = c.request(c.url('a', m), headers={'Range': 'bytes=1048576-1052671'}, timeout=85)
 print(json.dumps({'status': status, 'length': len(body), 'body': body[:200].decode(errors='replace')}))
 """,
     )
