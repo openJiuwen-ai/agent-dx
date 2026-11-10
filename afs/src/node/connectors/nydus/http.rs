@@ -4,21 +4,73 @@ use afs_error::{Error, ErrorKind, Result};
 use axum::{
     Router,
     body::Body,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, Request, State},
     http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::{io::Read, net::SocketAddr, path::Path as FilePath, sync::Arc};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
-pub fn routes(service: Arc<NydusService>) -> Router {
+pub(super) fn load_token_hash(path: &FilePath) -> Result<[u8; 32]> {
+    let mut secret = String::new();
+    std::fs::File::open(path)?
+        .take(4097)
+        .read_to_string(&mut secret)?;
+    let token = secret.trim();
+    if secret.len() > 4096
+        || token.len() < 32
+        || !token.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(Error::coded(
+            afs_error::CONFIG_INVALID,
+            "Nydus HTTP token must contain 32–4096 visible ASCII bytes",
+        ));
+    }
+    Ok(Sha256::digest(token).into())
+}
+
+pub fn routes(service: Arc<NydusService>, token_hash: Option<[u8; 32]>) -> Router {
     Router::new()
         .route(
             "/nydus/{source}/{manifest}/blobs/{blob}",
             get(get_blob).head(head_blob),
         )
+        .route_layer(middleware::from_fn_with_state(token_hash, require_access))
         .with_state(service)
+}
+
+async fn require_access(
+    State(token_hash): State<Option<[u8; 32]>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let local = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|ConnectInfo(peer)| peer.ip().to_canonical().is_loopback());
+    let authorized = token_hash.is_some_and(|expected| {
+        let Some(token) = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+        else {
+            return false;
+        };
+        Sha256::digest(token)
+            .iter()
+            .zip(expected)
+            .fold(0, |different, (actual, expected)| different | (actual ^ expected))
+            == 0
+    });
+    if local || authorized {
+        next.run(request).await
+    } else {
+        StatusCode::FORBIDDEN.into_response()
+    }
 }
 
 async fn head_blob(

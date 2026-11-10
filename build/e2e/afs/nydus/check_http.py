@@ -7,6 +7,7 @@ import json
 import pathlib
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 OUT = pathlib.Path("/output")
@@ -17,10 +18,14 @@ BASE = "http://10.203.0.10:5000/v2/lab/nydus"
 RESULTS = []
 
 
-def request(request_url, method="GET", headers=None, data=None):
+def request(request_url, method="GET", headers=None, data=None, *, authenticated=True):
+    headers = dict(headers or {})
+    if authenticated and urllib.parse.urlsplit(request_url).path.startswith("/nydus/"):
+        token = pathlib.Path("/artifacts/afs-tls/nydus-token").read_text().strip()
+        headers["Authorization"] = f"Bearer {token}"
     try:
         response = urllib.request.urlopen(
-            urllib.request.Request(request_url, data=data, method=method, headers=headers or {}), timeout=40
+            urllib.request.Request(request_url, data=data, method=method, headers=headers), timeout=40
         )
     except urllib.error.HTTPError as response:
         return response.code, {k.lower(): v for k, v in response.headers.items()}, response.read()
@@ -84,6 +89,11 @@ def main():
     control()
     reference = request(BASE + "/blobs/" + BLOB["digest"])[2]
     assert "sha256:" + hashlib.sha256(reference).hexdigest() == BLOB["digest"]
+    before_requests = len(logs())
+    for method in ("HEAD", "GET"):
+        assert request(url("a"), method, authenticated=False)[0] == 403
+    assert len(logs()) == before_requests
+    result("unauthenticated_requests_do_not_prepare_image")
     before = len(bodies())
     status, headers, body = request(url("a"), "HEAD")
     assert status == 200 and int(headers["content-length"]) == len(reference) and not body, (status, headers, body)

@@ -24,6 +24,8 @@ pub struct NydusConfig {
     pub gid: u32,
     pub timeout_ms: u64,
     pub max_requests: usize,
+    /// Optional bearer token for non-loopback callers of the Nydus routes.
+    pub http_token_file: Option<PathBuf>,
     pub sources: BTreeMap<String, RegistryConfig>,
 }
 impl Default for NydusConfig {
@@ -35,6 +37,7 @@ impl Default for NydusConfig {
             gid: 0,
             timeout_ms: 30_000,
             max_requests: 16,
+            http_token_file: None,
             sources: BTreeMap::new(),
         }
     }
@@ -58,6 +61,7 @@ pub struct RegistryConfig {
 pub struct NydusConnector {
     config: NydusConfig,
     provider: Arc<registry::RegistryProvider>,
+    http_token_hash: Option<[u8; 32]>,
     service: OnceLock<Arc<service::NydusService>>,
 }
 impl NydusConnector {
@@ -72,10 +76,16 @@ impl NydusConnector {
                 "invalid Nydus sources/request limits",
             ));
         }
+        let http_token_hash = config
+            .http_token_file
+            .as_deref()
+            .map(http::load_token_hash)
+            .transpose()?;
         let provider = registry::RegistryProvider::new(&config.sources, node_id)?;
         Ok(Self {
             config,
             provider,
+            http_token_hash,
             service: OnceLock::new(),
         })
     }
@@ -98,7 +108,7 @@ impl ConnectorModule for NydusConnector {
         self.service.set(service.clone()).map_err(|_| {
             Error::coded(afs_error::CONFIG_INVALID, "Nydus routes already assembled")
         })?;
-        Ok(http::routes(service))
+        Ok(http::routes(service, self.http_token_hash))
     }
     fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {

@@ -68,12 +68,11 @@ def stop(node):
 def mount(guest, case, backend):
     cfgpath = ROOT / "artifacts/nydus-configs"
     cfgpath.mkdir(exist_ok=True)
-    ip = {"worker-1": "10.203.0.20", "worker-2": "10.203.0.21", "worker-3": "10.203.0.22", "mgmt": "10.203.0.10"}[guest]
     backendcfg = (
         {
             "type": "http-proxy",
             "http-proxy": {
-                "addr": f"http://{ip}:7401",
+                "addr": "http://127.0.0.1:7401",
                 "path": "/nydus/lab/" + (SHARED / "fixture/active-manifest.txt").read_text().strip() + "/blobs",
                 "timeout": 30,
                 "retry_limit": 0,

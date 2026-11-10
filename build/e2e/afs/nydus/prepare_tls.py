@@ -4,6 +4,7 @@
 from pathlib import Path
 import subprocess
 import argparse
+import secrets
 import shutil
 
 p = argparse.ArgumentParser(description=__doc__)
@@ -14,6 +15,9 @@ r = options.output
 if r.exists() and any(r.iterdir()):
     raise SystemExit("TLS directory exists; preserve identities until the owning run is closed and cleaned")
 r.mkdir(mode=0o700, parents=True, exist_ok=True)
+token = r / "nydus-token"
+token.touch(mode=0o600, exist_ok=False)
+token.write_text(secrets.token_hex(32) + "\n")
 
 
 OPENSSL = shutil.which("openssl")

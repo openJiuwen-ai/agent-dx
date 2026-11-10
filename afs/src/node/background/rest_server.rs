@@ -38,7 +38,9 @@ impl RestServer {
         services.spawn(async move {
             axum::serve(
                 rest,
-                api::rest::router(rest_state).merge(self.connector_routes),
+                api::rest::router(rest_state)
+                    .merge(self.connector_routes)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .with_graceful_shutdown(cancelled(stop))
             .await

@@ -41,6 +41,7 @@ uid = 0
 gid = 0
 timeout_ms = 30000
 max_requests = 16
+# http_token_file = "/etc/afs/nydus-http-token"
 
 [connectors.nydus.sources.example]
 registry = "https://registry.example.com"
@@ -52,7 +53,7 @@ repository = "team/nydus-image"
 # allow_insecure_http = true # 仅用于隔离测试的明文 Registry
 ```
 
-配置身份必须有存储目录的创建／读取权限。这些 HTTP 路由使用配置的服务身份，服务于受信任的 Nydus 客户端；本模块没有新增终端用户鉴权。部署方须限制 Node REST 的访问范围，不能把它当作公开的多租户 Registry 网关。
+配置身份必须有存储目录的创建／读取权限。Nydus 路由默认只接受来自回环连接的请求，适合 Nydus 与 AFS Node 同机运行。非回环请求需要在 Node 配置 `http_token_file`，并携带 `Authorization: Bearer …`，远程连接应由部署侧加密保护。原生 Nydus 的 `http-proxy` 配置没有自定义鉴权头，同机直接访问即可，跨机可由受信代理处理鉴权与 TLS。该令牌授予全部已配置来源的读取权限，应只交给受信客户端，且与 Registry 凭据分开。
 
 Nydus backend 示例（替换实际地址与具体 manifest digest）：
 
@@ -60,7 +61,7 @@ Nydus backend 示例（替换实际地址与具体 manifest digest）：
 {
   "type": "http-proxy",
   "http-proxy": {
-    "addr": "http://afs-node:7401",
+    "addr": "http://127.0.0.1:7401",
     "path": "/nydus/example/sha256:MANIFEST_DIGEST/blobs",
     "timeout": 30,
     "retry_limit": 0

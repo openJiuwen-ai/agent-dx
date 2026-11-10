@@ -8,7 +8,7 @@
 2. 在 Linux 构建 `cargo build -p afs --bin afs-node --bin afs-meta`，将二进制放到 `$TASK/artifacts/afs/`。构建镜像和基线规则见 [AFS 入口](../../../../afs/README.md)。
 3. 根据 [tools.json](tools.json) 下载并校验 Nydus v2.4.5 和 Registry v3.1.2 的 ARM64 发布包，把 `nydusd`、`nydusify`、`nydus-image`、`registry` 放到 `$TASK/artifacts/tools/`。这不是编译 AFS 的依赖。
 4. 将本目录 Python 脚本复制到 `$TASK/artifacts/scripts/`；四份 TOML 放到 `$TASK/artifacts/afs-configs/`，registry.yml 放到 `$TASK/artifacts/`。配置使用 CRC32C 和两个同步副本，三个 Node 都启用同一 source。
-5. 执行 `python3 prepare_tls.py "$TASK/artifacts/afs-tls"`，生成本次独立证书；脚本拒绝覆盖已有身份。创建 `$TASK/evidence`、`$TASK/artifacts/nydus-configs`。
+5. 执行 `python3 prepare_tls.py "$TASK/artifacts/afs-tls"`，生成本次独立证书和测试用 Nydus 路由令牌，脚本拒绝覆盖已有身份。管理节点的 HTTP 探针使用令牌，原生 nydusd 在 worker 内走回环。创建 `$TASK/evidence`、`$TASK/artifacts/nydus-configs`。
 
 运行节点命令通过 `adx-vm exec --session "$SESSION" --node NODE -- COMMAND...` 执行。在 mgmt 启动下面两个后台服务，保存 PID 和日志：
 
@@ -34,6 +34,7 @@ python3 run.py --workspace "$TASK" --adx-vm "$CLI" start node-c
 在 mgmt 执行 `python3 /artifacts/scripts/check_http.py`。所有断言必须成功，结果在 `/output/http-results.json`：
 
 - 首次 HEAD 只准备元数据；首次直接 GET 不依赖预准备。
+- 非回环的未授权 HEAD／GET 返回 403，且没有发起回源。
 - B 冷读由 A 回源；C 复用时没有新增源站正文请求。
 - 并发准备收敛为一个目录；同范围六个请求只有一次回源。
 - 短响应、503、超时、manifest digest 错误都不能伪装为成功，恢复后可重试。

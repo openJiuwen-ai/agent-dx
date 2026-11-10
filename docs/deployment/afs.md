@@ -435,6 +435,10 @@ AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集�
 
 正常停止应记录进程退出状态，确认 FUSE mount 和 bind mount 已卸载，UDS/PID/临时 claim 无遗留。`local-file` Meta 的恢复检查至少要覆盖写入、sync/close、正常停止、重启、重新打开和内容校验；这不等于 crash recovery、HA、多 Meta 或复杂可靠性通过。
 
+## Nydus 接入
+
+Nydus 路由默认只接受回环连接。需要从其他节点访问时，单独配置 Nydus 路由令牌并保护传输链路。Registry 使用受信来源，默认要求 HTTPS。配置和客户端部署方式见 [AFS Connectors](../../afs/CONNECTORS.md)。
+
 ## DFS 外部 S3 连接
 
 外部 S3 后端在支持矩阵内，已验证的范围（故障场景、性能矩阵；e2e 套件不覆盖）见[支持边界](../architecture/afs-support-boundary.md#支持矩阵)。对象存储服务本身的持久性由其部署保证。
