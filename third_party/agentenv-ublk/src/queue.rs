@@ -4,14 +4,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use io_uring::{opcode::UringCmd16, types::Fixed};
 use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 use std::os::fd::AsFd;
-use std::{cell::OnceCell, ops::Deref};
+use std::{cell::RefCell, ops::Deref};
 use ublk_sys::ublk_auto_buf_reg_to_sqe_addr;
 
 use crate::IOBuffer;
 use storage_util::io_ring::{AsyncIoRing, AsyncIoRingBuilder, RingFuture};
 
 thread_local! {
-    pub(crate) static UBLK_QUEUE_URING: OnceCell<AsyncIoRing> = const { OnceCell:: new() };
+    pub(crate) static UBLK_QUEUE_URING: RefCell<Option<AsyncIoRing>> = const { RefCell::new(None) };
 }
 
 // NOTE: Copy from [libublk](https://github.com/ublk-org/libublk-rs)
@@ -190,12 +190,14 @@ impl UVMUblkQueue {
                 }
             }
         });
-        if UBLK_QUEUE_URING
-            .with(|uring| uring.set(ring.clone()))
-            .is_err()
-        {
-            bail!("uring for ublk queue {queue_id} has already been initialized");
-        }
+        UBLK_QUEUE_URING.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_some() {
+                bail!("uring for ublk queue {queue_id} has already been initialized");
+            }
+            *slot = Some(ring.clone());
+            Ok(())
+        })?;
         let io_desc = UblkQueueIoDesc::new(queue_id, depth, cdev.as_fd())
             .context("mmap for ublksrv_io_dsec area")?;
         let cdev_idx = ring

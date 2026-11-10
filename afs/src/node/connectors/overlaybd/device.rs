@@ -23,6 +23,7 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const IMAGE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const ACQUIRE_MAX_AGE_MS: u64 = 120_000;
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const QUEUE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Journal {
@@ -375,7 +376,13 @@ impl Devices {
 
     async fn stop_and_drain(&mut self, id: u32) -> io::Result<()> {
         if let Some(device) = &self.device {
-            device.begin_queue_stop();
+            // The kernel aborts requests left owned by userspace on character
+            // device release. STOP can wait indefinitely for one of those
+            // requests if we send it while the character device is still open.
+            device
+                .stop_queue_workers(Instant::now() + QUEUE_DRAIN_TIMEOUT)
+                .await
+                .map_err(backend_error)?;
         }
         if self.pending_stop.is_none() {
             let mut control = UVMUblkCtrlBuilder::new()
@@ -398,14 +405,7 @@ impl Devices {
                 }
             }));
         }
-        self.await_pending_stop().await?;
-        if let Some(device) = &self.device {
-            device
-                .stop_queue_workers(Instant::now() + STOP_TIMEOUT)
-                .await
-                .map_err(backend_error)?;
-        }
-        Ok(())
+        self.await_pending_stop().await
     }
 
     async fn await_pending_stop(&mut self) -> io::Result<()> {

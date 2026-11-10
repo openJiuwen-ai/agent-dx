@@ -142,7 +142,7 @@ impl<T: UVMUblkTarget> UVMUblkDevBuilder<T> {
             tgt_name,
             params,
             inner: Arc::new(UVMUblkDevInner {
-                cdev_file: cdev,
+                cdev_file: Mutex::new(Some(cdev)),
                 queue_threads: Mutex::new(vec![]),
                 queue_stop: watch::channel(false).0,
                 queue_failed: watch::channel(false).0,
@@ -192,7 +192,7 @@ pub struct UVMUblkDev<T: UVMUblkTarget> {
 
 pub struct UVMUblkDevInner {
     /// /dev/ublkcN
-    pub cdev_file: std::fs::File,
+    cdev_file: Mutex<Option<std::fs::File>>,
     pub queue_threads: Mutex<Vec<oneshot::Receiver<Result<()>>>>,
     queue_stop: watch::Sender<bool>,
     queue_failed: watch::Sender<bool>,
@@ -410,7 +410,7 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
             .enable_all()
             .on_thread_park(move || {
                 UBLK_QUEUE_URING.with(|uring| {
-                    if let Some(uring) = uring.get() {
+                    if let Some(uring) = uring.borrow().as_ref() {
                         let _ = uring
                             .borrow()
                             .submit()
@@ -424,14 +424,20 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
             .build()
             .context("build tokio runtime when spawn queue workers")?;
         let local_set = tokio::task::LocalSet::new();
-        local_set.block_on(&rt, async {
+        let result = local_set.block_on(&rt, async {
             if *inner.queue_stop.borrow() {
                 return Ok(());
             }
-            let queue = Rc::new(
-                UVMUblkQueue::new(qid, dev_info, &inner.cdev_file)
-                    .context("create uvm ublk queue")?,
-            );
+            let queue = {
+                let file = inner
+                    .cdev_file
+                    .lock()
+                    .map_err(|_| anyhow!("ublk character device lock poisoned"))?;
+                let file = file
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("ublk character device closed"))?;
+                Rc::new(UVMUblkQueue::new(qid, dev_info, file).context("create uvm ublk queue")?)
+            };
             tgt.init(qid, &queue.ring)
                 .await
                 .context("init target for uvm ublk queue")?;
@@ -459,7 +465,12 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
                 }
             }
             first_error.map_or(Ok(()), Err)
-        })
+        });
+        // Drop the completion task and the ring (including its fixed-file
+        // reference) before reporting that the queue has stopped.
+        drop(local_set);
+        UBLK_QUEUE_URING.with(|uring| drop(uring.borrow_mut().take()));
+        result
     }
 
     async fn wait_for_queue_readiness(readiness: Vec<oneshot::Receiver<()>>) -> Result<()> {
@@ -639,7 +650,16 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
                 .lock()
                 .map_err(|_| anyhow!("ublk queue workers lock poisoned"))?
                 .pop();
-            let Some(mut task) = task else { return Ok(()) };
+            let Some(mut task) = task else {
+                drop(
+                    self.inner
+                        .cdev_file
+                        .lock()
+                        .map_err(|_| anyhow!("ublk character device lock poisoned"))?
+                        .take(),
+                );
+                return Ok(());
+            };
             match timeout_at(deadline, &mut task).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(err))) => tracing::error!(?err, "queue task failed"),
