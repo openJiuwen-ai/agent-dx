@@ -720,10 +720,10 @@ impl Config {
         cross::validate_read_crc(&cfg)?;
         cfg.meta_log_limits()?;
         cfg.meta_store_target()?;
-        if cfg.connectors.nydus.enabled
+        if cfg.connectors.enabled()
             && (role != Role::Node || !cfg.dfs || cfg.dfs_external_backend.is_some())
         {
-            return Err(invalid("Nydus connector requires a native DFS Node"));
+            return Err(invalid("Connectors require a native DFS Node"));
         }
         cfg.meta_maintenance_policy()?;
         cfg.meta_history_limits()?;

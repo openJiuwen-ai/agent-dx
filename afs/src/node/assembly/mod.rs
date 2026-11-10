@@ -120,6 +120,8 @@ pub(super) async fn run_node(
         registration.epoch,
         &mut services,
     );
+    #[cfg(feature = "dfs")]
+    backends.dfs.connectors.start().await?;
     background::RestServer::new(ingress.rest, state.clone(), connector_routes).start(&mut services);
     endpoints.into_sweeper().start(&mut services);
     // Multi-workspace bind mount is handled by MountManager via mkdir triggers.

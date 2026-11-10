@@ -1,5 +1,7 @@
 //! Optional third-party connectors. Node only assembles hooks and HTTP routes.
 pub mod nydus;
+#[cfg(all(target_os = "linux", feature = "overlaybd-connector"))]
+mod overlaybd;
 
 use super::vfs::{Backend, lazy_fill::LazyFillRegistry, types::BackendInode};
 use afs_error::Result;
@@ -11,6 +13,18 @@ use std::{future::Future, pin::Pin, sync::Arc};
 #[serde(default, deny_unknown_fields)]
 pub struct ConnectorsConfig {
     pub nydus: nydus::NydusConfig,
+    #[cfg(all(target_os = "linux", feature = "overlaybd-connector"))]
+    pub overlaybd: overlaybd::OverlaybdConfig,
+}
+
+impl ConnectorsConfig {
+    pub(crate) fn enabled(&self) -> bool {
+        #[cfg(all(target_os = "linux", feature = "overlaybd-connector"))]
+        if self.overlaybd.enabled {
+            return true;
+        }
+        self.nydus.enabled
+    }
 }
 
 #[derive(Clone)]
@@ -23,6 +37,9 @@ pub trait ConnectorModule: Send + Sync {
     fn id(&self) -> &'static str;
     fn register_lazy_handlers(&self, registry: &mut LazyFillRegistry) -> Result<()>;
     fn http_routes(&self, context: ConnectorContext) -> Result<Router>;
+    fn start(&self) -> Result<()> {
+        Ok(())
+    }
     /// Stop admission and wait for file workers, including cancelled HTTP work.
     fn stop(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }
@@ -38,6 +55,12 @@ impl ConnectorRuntime {
             connectors.push(Box::new(nydus::NydusConnector::new(
                 config.nydus.clone(),
                 node_id,
+            )?));
+        }
+        #[cfg(all(target_os = "linux", feature = "overlaybd-connector"))]
+        if config.overlaybd.enabled {
+            connectors.push(Box::new(overlaybd::OverlaybdConnector::new(
+                config.overlaybd.clone(),
             )?));
         }
         Ok(Self { connectors })
@@ -56,10 +79,27 @@ impl ConnectorRuntime {
         }
         Ok(router)
     }
-    pub async fn stop(&self) -> Result<()> {
-        for connector in self.connectors.iter().rev() {
-            connector.stop().await?;
+    pub async fn start(&self) -> Result<()> {
+        for (index, connector) in self.connectors.iter().enumerate() {
+            if let Err(error) = connector.start() {
+                for started in self.connectors[..index].iter().rev() {
+                    if let Err(stop) = started.stop().await {
+                        afs_logging::warn!("connector.start_rollback_failed"; "connector" => started.id(), "error" => stop.to_string());
+                    }
+                }
+                return Err(error);
+            }
         }
         Ok(())
+    }
+
+    pub async fn stop(&self) -> Result<()> {
+        let mut first = None;
+        for connector in self.connectors.iter().rev() {
+            if let Err(error) = connector.stop().await {
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), Err)
     }
 }
