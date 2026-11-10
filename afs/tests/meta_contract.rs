@@ -332,6 +332,43 @@ async fn dfs_gc_fence_capture_requires_a_write_reference_before_any_mutation() {
 }
 
 #[tokio::test]
+async fn dfs_write_authority_observation_does_not_acquire_expired_lease() {
+    let (store, dfs, original, backend) = lock_resolver_fixture(1).await;
+    let (_, live) = dfs
+        .resolve_write_authority(
+            "node-b".into(),
+            "session-b".into(),
+            OperationId::new("observe-live"),
+            original.inode_id.clone(),
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(live, original);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let commits = backend.observed_commit().0;
+    let error = dfs
+        .resolve_write_authority(
+            "node-b".into(),
+            "session-b".into(),
+            OperationId::new("observe-expired"),
+            original.inode_id.clone(),
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
+    assert_eq!(backend.observed_commit().0, commits);
+    assert!(store
+        .read(MetaRead::RequestOutcome(RequestKey::new("node-b", "observe-expired")))
+        .await
+        .unwrap()
+        .request_outcome
+        .is_none());
+}
+
+#[tokio::test]
 async fn dfs_write_authority_expired_lease_acquires_and_replays_exact_result() {
     let (store, dfs, original, backend) = lock_resolver_fixture(1).await;
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;

@@ -230,12 +230,18 @@ impl DistributedFs {
             }
         }
 
+        let can_fill = self.lazy_fill_registry.resolve(&source.binding.kind).is_ok();
         let mut retries = 2;
         loop {
             if Instant::now() >= deadline {
                 return Err(unavailable("lazy read deadline exceeded"));
             }
-            let (owner_inode, lease) = match self.meta.resolve_write_authority(&inode.inode_id) {
+            let authority_result = if can_fill {
+                self.meta.resolve_write_authority(&inode.inode_id)
+            } else {
+                self.meta.observe_write_authority(&inode.inode_id)
+            };
+            let (owner_inode, lease) = match authority_result {
                 Err(error) if error.code() == afs_error::META_DFS_CONFLICT && retries > 0 => {
                     retries -= 1;
                     continue;

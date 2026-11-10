@@ -1026,6 +1026,7 @@ message ResolveDfsWriteAuthorityRequest {
   string owner_session_id = 2;
   string operation_id = 3;
   string inode_id = 4;
+  // Zero observes an existing unexpired lease without acquiring or rebinding it.
   uint64 lease_seconds = 5;
 }
 

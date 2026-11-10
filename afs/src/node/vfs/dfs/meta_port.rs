@@ -39,6 +39,13 @@ pub trait DfsMeta: Send + Sync {
     fn resolve_write_authority(&self, inode_id: &InodeId) -> Result<(InodeRecord, WriteLease)> {
         self.open_write(inode_id)
     }
+    /// Observe an existing owner without any lease mutation.
+    fn observe_write_authority(&self, _inode_id: &InodeId) -> Result<(InodeRecord, WriteLease)> {
+        Err(Error::coded(
+            afs_error::NODE_VFS_UNAVAILABLE,
+            "read-only write authority resolution is unavailable",
+        ))
+    }
     /// Callable on an async worker. The default leaves the worker for the sync
     /// method; a network client overrides it with its native future.
     fn resolve_write_authority_async(

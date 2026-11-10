@@ -267,9 +267,10 @@ impl DfsService {
                 "DFS {context} authority requires a regular file"
             )));
         }
+        let observe_only = context == "write" && lease_seconds == 0;
         // Recover a lost acquire reply before reading a newer live authority.
         // Read-only resolutions have no recorded result and remain fresh reads.
-        if let Some(recorded) = recorded {
+        if let Some(recorded) = recorded.filter(|_| !observe_only) {
             if recorded.operation != StoreOperation::DfsAcquireWriteLease {
                 return Err(invalid(
                     "DFS operation_id was already used for another operation",
@@ -304,6 +305,9 @@ impl DfsService {
                 )));
             }
             if lease.expires_at_unix_ms > now_unix_ms() {
+                if observe_only {
+                    return Ok((inode, lease));
+                }
                 if context == "write"
                     && let Some(rebound) = self
                         .rebind_lazy_owner_for_peer(
@@ -324,6 +328,12 @@ impl DfsService {
                     return Ok((inode, lease));
                 }
             }
+        }
+        if observe_only {
+            return Err(Error::coded(
+                afs_error::NODE_VFS_UNAVAILABLE,
+                "DFS has no unexpired write authority to observe",
+            ));
         }
         let lease = self
             .acquire_write_lease(
