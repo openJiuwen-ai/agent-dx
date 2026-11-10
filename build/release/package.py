@@ -73,6 +73,10 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, identity, *, with_afs=
         inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
     elif runtime_root.is_file():
         inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
+    if "runtime/adx-runtime-rootfs.img" in inputs:
+        inputs["runtime/adx-runtime-rootfs.json"] = runtime_root.with_suffix(".json")
+        for name in ("source.json", "NOTICE"):
+            inputs[f"third_party/runtime-rootfs/{name}"] = ROOT / "third_party/runtime-rootfs" / name
     inputs["bin/redis-server"] = redis
     inputs["bin/redis-cli"] = redis_cli
     inputs["install.sh"] = ROOT / "build/release/install.sh"

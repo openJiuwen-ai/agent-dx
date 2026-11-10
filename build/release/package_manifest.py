@@ -78,7 +78,8 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
     }
     target = manifest.get("target", "")
     if manifest.get("profile") == "release" and "linux" in target:
-        required.add("runtime/adx-runtime-rootfs.img")
+        required.update({"runtime/adx-runtime-rootfs.img", "runtime/adx-runtime-rootfs.json",
+                         "third_party/runtime-rootfs/source.json", "third_party/runtime-rootfs/NOTICE"})
     with_sandboxd = manifest.get("with_sandboxd", False)
     if not isinstance(with_sandboxd, bool):
         raise ValueError("with_sandboxd must be a boolean")
@@ -122,6 +123,17 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
         relative = Path(name)
         if relative.is_absolute() or ".." in relative.parts or sha256(root / relative) != digest:
             raise ValueError(f"package integrity check failed: {name}")
+
+    if "runtime/adx-runtime-rootfs.img" in expected:
+        provenance = json.loads((root / "runtime/adx-runtime-rootfs.json").read_text())
+        pin = json.loads((root / "third_party/runtime-rootfs/source.json").read_text())
+        base = pin["artifacts"].get(target, {})
+        if (provenance.get("target") != target or not base
+                or provenance.get("base_sha256") != base.get("sha256")
+                or provenance.get("manifest_digest") != base.get("manifest_digest")
+                or provenance.get("execd_sha256") != files["runtime/adx-execd"]
+                or provenance.get("rootfs_sha256") != files["runtime/adx-runtime-rootfs.img"]):
+            raise ValueError("runtime rootfs provenance mismatch")
 
     if with_sandboxd:
         backend = json.loads((root / backend_prefix / "manifest.json").read_text())

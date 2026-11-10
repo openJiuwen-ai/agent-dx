@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "distribution": "openEuler",
+  "version": "24.03 LTS",
+  "image_reference": "docker.io/openeuler/openeuler:24.03-lts",
+  "artifacts": {
+    "x86_64-unknown-linux-gnu": {
+      "url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/release/runtime-rootfs/openeuler-24.03-lts/linux/amd64/6cad566c8552a7598b7549b5bf6f222c29b534ad8631cbfbf5fe662d21e94796/rootfs.tar.gz",
+      "bytes": 63666448,
+      "sha256": "6cad566c8552a7598b7549b5bf6f222c29b534ad8631cbfbf5fe662d21e94796",
+      "manifest_digest": "sha256:02532e5314c8d3a026f660b2ac0ac0cb2db84a337cf08a54d278dd7ddd864526"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/release/runtime-rootfs/openeuler-24.03-lts/linux/arm64/ff76d0a9ba04f72391efda878192b8bee878d4eca27647cdabf317f764d4e4d4/rootfs.tar.gz",
+      "bytes": 62603962,
+      "sha256": "ff76d0a9ba04f72391efda878192b8bee878d4eca27647cdabf317f764d4e4d4",
+      "manifest_digest": "sha256:7c60c594185c19269f94330e39d5cfe683896a99f40accce43215eca42f53c0e"
+    }
+  }
+}

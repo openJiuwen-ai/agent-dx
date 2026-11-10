@@ -59,7 +59,10 @@ case "$component" in
     cargo build --locked --release --target "$musl_target" -j "$jobs" \
       -p adx-execd --bin adx-execd
     cp "$CARGO_TARGET_DIR/$musl_target/release/adx-execd" "$output/adx-execd"
-    rootfs_args=(--binary "$output/adx-execd" --output "$output/adx-runtime-rootfs.img")
+    rootfs_args=(--binary "$output/adx-execd" --target "$ADX_RELEASE_TARGET" --output "$output/adx-runtime-rootfs.img")
+    if [[ -n "${ADX_RUNTIME_ROOTFS_ARCHIVE:-}" ]]; then
+      rootfs_args+=(--base-archive "$ADX_RUNTIME_ROOTFS_ARCHIVE")
+    fi
     echo "--- :package: Build pinned envd"
     envd_args=(--output "$output/envd-build" --jobs "$jobs")
     if [[ -n "${ADX_ENVD_SOURCE:-}" ]]; then envd_args+=(--source "$ADX_ENVD_SOURCE"); else envd_args+=(--obs-source); fi

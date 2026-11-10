@@ -39,6 +39,13 @@ fixture startup race separate from the production termination contract.
 Base builds publish verified candidates to OBS by default. PyPI publication remains opt-in.
 Set these variables on a Buildkite build or in that pipeline's environment settings.
 
+Both architecture Execd components use the checksum-pinned openEuler 24.03 LTS
+base in `third_party/runtime-rootfs/source.json`. The builder downloads its base
+filesystem archive from OBS, or reads `ADX_RUNTIME_ROOTFS_ARCHIVE` for an offline
+copy with the same checksum. The generated `adx-runtime-rootfs.json` travels with
+the EROFS through component verification and unified packaging. Deployment uses
+the packaged Local rootfs and does not pull the openEuler image.
+
 Both architecture Execd components include the pinned upstream envd in
 `adx-runtime-rootfs.img`. The Linux builder downloads the source archive pinned in
 `third_party/e2b/source.json` from OBS, verifies its size and SHA-256 and the

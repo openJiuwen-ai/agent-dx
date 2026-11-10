@@ -1,6 +1,6 @@
 # 内置运行环境
 
-统一部署配置的 `runtime_profile` 定义实例默认根文件系统和 bootstrap。运行环境可以来自本地 EROFS 文件，也可以来自同一个不可变 OCI image。两种来源都包含静态 Execd、基础命令、目录和 CA 证书，不包含 Python。
+统一部署配置的 `runtime_profile` 定义实例默认根文件系统和 bootstrap。运行环境可以来自本地 EROFS 文件，也可以来自同一个不可变 OCI image。Linux 发布包的默认本地 rootfs 基于 `openeuler/openeuler:24.03-lts`，保留发行版自带的 bash、GNU 工具、共享库、CA 证书及 Python，再加入静态 Execd。显式配置的 OCI 来源由部署者准备。
 
 ```json
 {
@@ -79,7 +79,11 @@ Execd 在 Linux PID 1 场景内置进程回收：单线程启动阶段 fork 实�
 
 Kata 的 PTY 同样由 guest 内的 Execd 分配。adxlet 在 Kata 创建请求中为 `/dev/pts` 添加独立的 `devpts` 挂载，由执行后端在创建容器时准备；无需在 guest 中授予 `CAP_SYS_ADMIN` 或自行执行 mount。若请求已有 `/dev/pts` 挂载，保留该配置，由配置者保证终端设备可用。其他 runtime 的终端准备保持各自后端行为。旧节点侧 `sbox exec -t` 的运行时终端路径与 Execd 原生 PTY 不同；对照及回归证据见 [Kata 定位记录](../testing/2026-10-09-h2-close-and-acl.md#kata-旧镜像对照)。
 
-发布构建需要原生 musl Rust target、musl C 工具链、`busybox-static`、`erofs-utils` 和 `readelf`。`build/runtime/rootfs.py` 拒绝带动态解释器的 Execd/BusyBox，再生成并检查 EROFS。构建示例与进程部署见 [standalone](standalone.md)。
+发布构建需要原生 musl Rust target、musl C 工具链、`curl`、`erofs-utils` 和 `readelf`。
+`build/runtime/rootfs.py` 按目标架构读取 `third_party/runtime-rootfs/source.json`，在构建时下载固定的 openEuler 文件系统归档并校验大小与 SHA256；不依赖构建机 Docker。离线构建可设置 `ADX_RUNTIME_ROOTFS_ARCHIVE` 指向同一归档的本地副本，仍执行相同校验。部署与沙箱创建直接使用随包本地 EROFS，不拉取 openEuler 镜像。
+
+发行版的目录权限、用户数据库、bash 与共享库保持原样；不会从构建宿主复制动态库。
+Execd 和可选 envd 必须为静态可执行文件。可选 envd 使用发行版 `/bin/bash`，默认用户仍由 `--envd-default-user` 指定。发布包包含 `runtime/adx-runtime-rootfs.json`，记录基础 OCI manifest、归档摘要、Execd 和最终 EROFS 摘要；包校验同时检查这些字段与目标架构。构建示例与进程部署见 [standalone](standalone.md)。
 
 使用 EROFS 配置的节点必须支持从普通文件创建只读 loop 设备并实际挂载 EROFS。`/proc/filesystems` 中出现 `erofs` 只表示驱动已登记，不足以证明该内核构建和设备路径可用；对应 preflight 会对发布包内制品执行一次真实挂载和卸载。OCI 配置不要求 EROFS，仍要求 sandboxd 能访问并解析配置的 digest 引用。Buildkite K8s 验收使用 OCI 模式；本地与 standalone 验证继续覆盖 EROFS 模式。
 

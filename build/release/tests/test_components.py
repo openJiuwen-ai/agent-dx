@@ -38,6 +38,14 @@ class ComponentManifestTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 component.create_manifest("gateway", root, "a" * 40, "x86_64-unknown-linux-gnu")
 
+    def test_execd_component_rejects_missing_rootfs_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for filename in ("adx-execd", "adx-runtime-rootfs.img"):
+                (root / filename).write_bytes(b"fixture")
+            with self.assertRaisesRegex(ValueError, "incomplete or unexpected"):
+                component.create_manifest("execd", root, "a" * 40, "x86_64-unknown-linux-gnu")
+
     def test_execd_component_accepts_complete_optional_envd_provenance(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

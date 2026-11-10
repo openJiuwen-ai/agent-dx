@@ -105,6 +105,15 @@ class PackageTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(runsc.read_bytes())
             target = "x86_64-unknown-linux-gnu"
+            rootfs_source = json.loads((pkg.ROOT / "third_party/runtime-rootfs/source.json").read_text())
+            rootfs_pin = rootfs_source["artifacts"][target]
+            rootfs_provenance = {
+                "target": target, "base_sha256": rootfs_pin["sha256"],
+                "manifest_digest": rootfs_pin["manifest_digest"],
+                "execd_sha256": pkg.sha(binaries / "adx-execd"),
+                "rootfs_sha256": pkg.sha(binaries / "adx-runtime-rootfs.img"),
+            }
+            (binaries / "adx-runtime-rootfs.json").write_text(json.dumps(rootfs_provenance))
             pin = json.loads((pkg.ROOT / "third_party/sandboxd/source.json").read_text())
             metadata = {
                 "target": target,
@@ -126,6 +135,18 @@ class PackageTests(unittest.TestCase):
             for name in ("sandboxd.service", "sandboxd.toml", "oss.json", "registry.json",
                          "oss_auths.json", "registry_auths.json"):
                 self.assertIn(f"etc/examples/sandboxd/{name}", manifest["files"])
+
+            provenance_path = output / "runtime/adx-runtime-rootfs.json"
+            original_provenance = provenance_path.read_text()
+            rootfs_provenance["target"] = "aarch64-unknown-linux-gnu"
+            provenance_path.write_text(json.dumps(rootfs_provenance))
+            manifest["files"]["runtime/adx-runtime-rootfs.json"] = pkg.sha(provenance_path)
+            (output / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "rootfs provenance mismatch"):
+                pkg.verify(output)
+            provenance_path.write_text(original_provenance)
+            manifest["files"]["runtime/adx-runtime-rootfs.json"] = pkg.sha(provenance_path)
+            (output / "manifest.json").write_text(json.dumps(manifest))
 
             packaged_runsc = output / "runtime/sandboxd/runsc"
             original_runsc = packaged_runsc.read_bytes()

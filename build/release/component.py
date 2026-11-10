@@ -28,7 +28,7 @@ COMPONENTS = BASE_COMPONENTS + OPTIONAL_COMPONENTS
 REQUIRED_FILES = {
     "platform": {"adxctl", "adx-inspect", "adx-coordinator", "adxlet"},
     "gateway": {"adx-apiserver", "adx-ingress", "adx-relay", "adx-activator"},
-    "execd": {"adx-execd", "adx-runtime-rootfs.img"},
+    "execd": {"adx-execd", "adx-runtime-rootfs.img", "adx-runtime-rootfs.json"},
     "afs": {"afs-meta", "afs-node"},
 }
 OPTIONAL_FILE_SETS = {
