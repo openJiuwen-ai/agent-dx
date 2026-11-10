@@ -4,6 +4,8 @@ mod common;
 mod mounts;
 #[path = "support/recovery_profile.rs"]
 mod recovery_profile;
+#[path = "on_demand/stream_continuity.rs"]
+mod stream_continuity;
 use adx_checkpoint_storage::ObjectCheckpointStore;
 use adx_coordinator::{rpc::CoordinatorRpc, storage::Session, Placement};
 use adx_core::{EnvironmentRecord, EnvironmentSpec, Resources, Result};
@@ -75,6 +77,7 @@ struct Backend {
     versioned_routes: Mutex<Option<Arc<adxlet::routes::UdsRoutes>>>,
     running: Mutex<BTreeMap<String, adxlet::RuntimeObservation>>,
     restored: AtomicUsize,
+    inventory_hold_ms: AtomicUsize,
     restore_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     restore_entered: tokio::sync::Notify,
     fail_after_gate: AtomicBool,
@@ -91,6 +94,10 @@ impl RuntimeDriver for Backend {
         Ok(recovery_profile::qualify(&mut spec.clone()))
     }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
+        let delay = self.inventory_hold_ms.load(Ordering::SeqCst);
+        if delay != 0 {
+            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+        }
         Ok(self.running.lock().unwrap().values().cloned().collect())
     }
     async fn start(
@@ -562,14 +569,18 @@ async fn post_upgrade(
     serde_json::from_str(body).unwrap()
 }
 
-#[tokio::test]
-#[ignore = "requires dedicated real Redis"]
-async fn planned_migration_wakes_both_nodes_before_the_next_periodic_reconciliation() {
-    use serde_json::json;
-    use tokio::time::{interval_at, timeout, Instant};
+const MIGRATE_PATH: &str = "tasks/planned-migration/migrate";
 
-    let mut rig = Rig::new(Duration::from_secs(4)).await;
-    let running = rig.resume(false).await.unwrap().record.unwrap();
+async fn prepare_migration(
+    rig: &Rig,
+    running: pb::EnvironmentRecord,
+) -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    serde_json::Value,
+) {
+    use serde_json::json;
+
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(adx_coordinator::autoscaling::serve(
@@ -606,9 +617,40 @@ async fn planned_migration_wakes_both_nodes_before_the_next_periodic_reconciliat
         "expected_source_generation": running.assignment.unwrap().generation,
         "expected_source_revision": running.revision, "checkpoint_storage_alias": "obs"
     });
-    let path = "tasks/planned-migration/migrate";
+    (address, server, migrate)
+}
+
+async fn report(
+    worker: &mut Worker,
+    coordinator: &str,
+    period: Duration,
+) -> std::result::Result<(), tonic::Status> {
+    let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(coordinator, Principal::Node(worker.report.node_id.clone())).await,
+    );
+    adxlet::node_reconciliation::reconcile_node(
+        &mut client,
+        &mut worker.report,
+        &worker.manager,
+        None,
+        Duration::from_secs(2),
+        period,
+        tokio::time::Instant::now() + period,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn planned_migration_wakes_both_nodes_before_the_next_periodic_reconciliation() {
+    use tokio::time::{interval_at, timeout, Instant};
+
+    let mut rig = Rig::new(Duration::from_secs(4)).await;
+    let running = rig.resume(false).await.unwrap().record.unwrap();
+    let (address, server, migrate) = prepare_migration(&rig, running).await;
     let operation = migrate.clone();
-    let mut migration = tokio::spawn(async move { post_upgrade(address, path, operation).await });
+    let mut migration =
+        tokio::spawn(async move { post_upgrade(address, MIGRATE_PATH, operation).await });
 
     let period = Duration::from_secs(60);
     let next_tick = Instant::now() + period;
@@ -623,41 +665,7 @@ async fn planned_migration_wakes_both_nodes_before_the_next_periodic_reconciliat
     .await
     .expect("both ownership handoffs must be triggered before the first periodic tick");
 
-    async fn report(
-        worker: &mut Worker,
-        coordinator: &str,
-        period: Duration,
-    ) -> std::result::Result<(), tonic::Status> {
-        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
-            channel(coordinator, Principal::Node(worker.report.node_id.clone())).await,
-        );
-        adxlet::node_reconciliation::reconcile_node(
-            &mut client,
-            &mut worker.report,
-            &worker.manager,
-            None,
-            Duration::from_secs(2),
-            period,
-            Instant::now() + period,
-        )
-        .await
-    }
-
-    async fn reconcile(worker: &mut Worker, coordinator: &str, tick: &mut tokio::time::Interval) {
-        let period = tick.period();
-        let error = report(worker, coordinator, period).await.unwrap_err();
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(worker.report.reconciling);
-        timeout(
-            Duration::from_secs(1),
-            worker.manager.wait_for_reconciliation(tick),
-        )
-        .await
-        .expect("required handshake must run before the next periodic tick");
-        report(worker, coordinator, period).await.unwrap();
-    }
-
-    reconcile(&mut rig.target, &rig.address, &mut target_tick).await;
+    report(&mut rig.target, &rig.address, period).await.unwrap();
     assert!(
         timeout(Duration::from_millis(250), &mut migration)
             .await
@@ -665,14 +673,17 @@ async fn planned_migration_wakes_both_nodes_before_the_next_periodic_reconciliat
         "target adoption alone cannot authorize Restore"
     );
     assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
-    reconcile(&mut rig.source, &rig.address, &mut source_tick).await;
+    report(&mut rig.source, &rig.address, period).await.unwrap();
     let completed = timeout(Duration::from_secs(3), &mut migration)
         .await
         .expect("migration should complete before the first periodic tick")
         .unwrap();
     assert_eq!(completed["node_id"], "b");
     assert_eq!(completed["state"], "Running");
-    assert_eq!(post_upgrade(address, path, migrate).await, completed);
+    assert_eq!(
+        post_upgrade(address, MIGRATE_PATH, migrate).await,
+        completed
+    );
     assert!(rig.source.backend.running.lock().unwrap().is_empty());
     assert_eq!(
         rig.source

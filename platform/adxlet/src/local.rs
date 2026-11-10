@@ -34,16 +34,19 @@ impl Adxlet {
             .environments
             .lock()
             .expect("shared state lock poisoned");
+        let mut holds = self.local_holds.lock().expect("shared state lock poisoned");
         if let Some((old, assignment, _)) = environments.get(&spec.id) {
             if old != spec {
                 return Err(Error::Conflict);
             }
+            // Paused adoption can leave the original create claim unresolved.
+            let hold = holds.get(&spec.id).filter(|hold| hold.spec == *spec);
             return Ok(LocalReservation {
-                token: None,
-                devices: assignment.devices.clone(),
+                token: hold.map(|hold| hold.token.clone()),
+                devices: hold
+                    .map_or_else(|| assignment.devices.clone(), |hold| hold.devices.clone()),
             });
         }
-        let mut holds = self.local_holds.lock().expect("shared state lock poisoned");
         if let Some(hold) = holds.get(&spec.id) {
             if hold.spec != *spec {
                 return Err(Error::Conflict);

@@ -1224,12 +1224,6 @@ impl CoordinatorRpc {
                 if stored.assignment.node_id != op.target_node_id {
                     return Err(Error::Conflict);
                 }
-                if let Some(live) = state.live.get_mut(&op.source_node_id) {
-                    live.inspected = false;
-                }
-                if let Some(live) = state.live.get_mut(&op.target_node_id) {
-                    live.inspected = false;
-                }
                 task.operations
                     .get_mut(&r.operation_id)
                     .ok_or(Error::Conflict)?
@@ -1344,8 +1338,8 @@ impl CoordinatorRpc {
                             && record.resources_held == running
                     })
             });
-            let source_ready = retired && !source.unknown;
-            let target_ready = adopted && !target.unknown;
+            let source_ready = retired && source.backends == 0 && !source.unknown;
+            let target_ready = adopted && !target.unknown && (running || target.backends == 0);
             let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
             if source_ready {
                 source_retired_ms.get_or_insert(elapsed_ms);

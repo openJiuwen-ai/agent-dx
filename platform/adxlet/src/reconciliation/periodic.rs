@@ -390,8 +390,9 @@ impl Adxlet {
                 "adopt",
             )?;
         }
-        self.adopt_local(&record.spec, &record.assignment)?;
         if record.resources_held {
+            // An unheld record leaves the tentative reservation with its claim.
+            self.adopt_local(&record.spec, &record.assignment)?;
             let mut admission = self
                 .services
                 .admission

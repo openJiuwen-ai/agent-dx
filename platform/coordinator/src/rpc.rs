@@ -287,7 +287,6 @@ impl State {
                 upgrade
                     .as_ref()?
                     .migration_operation(&old.assignment, &assignment)
-                    .cloned()
             });
             let saved = if let Some(operation) = migration {
                 self.session
@@ -356,12 +355,14 @@ impl State {
                     if let Some(source) = record
                         .recovery
                         .as_ref()
-                        .filter(|recovery| recovery.source.node_id != record.assignment.node_id)
+                        .filter(|recovery| {
+                            migration.is_none()
+                                && recovery.source.node_id != record.assignment.node_id
+                        })
                         .and_then(|recovery| self.live.get_mut(&recovery.source.node_id))
                     {
-                        // A live former owner still has a paused controller.
-                        // Require the existing closed-admission handshake to
-                        // retire it against the complete global reference catalog.
+                        // Keep the former-owner fence for ordinary recovery.
+                        // Planned transfer already fenced and stopped its source.
                         source.inspected = false;
                     }
                     self.remember_environment(record);
