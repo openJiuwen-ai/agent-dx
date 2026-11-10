@@ -433,6 +433,13 @@ fields_heap!(dfs::LayoutRoot {
     file_length,
     inline_extents
 });
+
+impl Heap for std::sync::Arc<dfs::LayoutRoot> {
+    fn heap(&self, c: &mut Charge) -> Result<()> {
+        // Keep charging the complete logical layout to each history entry.
+        self.as_ref().heap(c)
+    }
+}
 fields_heap!(dfs::ContentDigest { algorithm, bytes });
 fields_heap!(dfs::ChunkObject {
     id,

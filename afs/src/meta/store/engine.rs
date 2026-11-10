@@ -406,10 +406,22 @@ async fn persist_log_group(
                     history: Some(delta),
                     ..
                 }
+                | log::Record::AppendLayout {
+                    history: Some(delta),
+                    ..
+                }
                 | log::Record::History(delta) => delta.requests.len() as u64,
                 _ => 0,
             })
             .sum::<u64>();
+        let layout_appends = if profile::enabled() {
+            records
+                .iter()
+                .filter(|record| matches!(record, log::Record::AppendLayout { .. }))
+                .count()
+        } else {
+            0
+        };
         let append_timer = profile::Timer::start();
         match log.append_and_sync(tip, std::mem::take(records)).await {
             Ok(next) => {
@@ -450,7 +462,7 @@ async fn persist_log_group(
                 if profile::enabled() {
                     profile::record(serde_json::json!({
                         "event": "afs_meta_store_profile", "backend": "canonical_log",
-                        "bytes": framed_bytes, "records": record_count,
+                        "bytes": framed_bytes, "records": record_count, "layout_appends": layout_appends,
                         "revision": staged.revision.0,
                         "append_sync_ms": append_sync_ms, "publish_ms": publish_timer.ms()
                     }));
@@ -640,14 +652,20 @@ fn prepare_ready_item(
         ..
     } = *context;
     let (tip, grouped) = group;
-    let (mut next, outcome, record) = match operation {
+    let (mut next, outcome, record, append_base) = match operation {
         Mutation::Transaction(txn) => {
-            staged.prepare_txn_record(txn, now_unix_ms(), limits.record_max_bytes)
+            staged.prepare_txn(txn, now_unix_ms(), limits.record_max_bytes, true)?
         }
         Mutation::RegisterNode(request, lease) => {
-            staged.prepare_node_record(request, lease, now_unix_ms(), limits.record_max_bytes)
+            let (next, outcome, record) = staged.prepare_node_record(
+                request,
+                lease,
+                now_unix_ms(),
+                limits.record_max_bytes,
+            )?;
+            (next, outcome, record, None)
         }
-    }?;
+    };
     let record = match record {
         Some(decision) => {
             let cleanup = in_flight.prepare_history(&next, now_unix_ms(), history)?;
@@ -661,9 +679,16 @@ fn prepare_ready_item(
                     "protected prepared history exceeds count/byte limits",
                 ));
             }
-            Some(log::Record::Decision {
-                decision,
-                history: delta,
+            Some(match append_base {
+                Some(base) => log::Record::AppendLayout {
+                    decision,
+                    history: delta,
+                    base,
+                },
+                None => log::Record::Decision {
+                    decision,
+                    history: delta,
+                },
             })
         }
         None => None,

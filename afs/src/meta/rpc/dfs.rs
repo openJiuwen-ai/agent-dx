@@ -709,14 +709,14 @@ impl DfsMetaService for DfsMetaRpc {
         authenticated_node_id(&self.0, &request)?;
         require_text(&request.get_ref().version_id, "version_id")?;
         let (version, layout) = dfs_service(&self.0)?
-            .get_file_version(crate::dfs::FileVersionId::new(
+            .get_shared_file_version(crate::dfs::FileVersionId::new(
                 request.into_inner().version_id,
             ))
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(GetFileVersionReply {
             version: Some(wire_dfs_version(version)),
-            layout: Some(wire_dfs_layout(layout)),
+            layout: Some(wire_dfs_layout(&layout)),
         }))
     }
 

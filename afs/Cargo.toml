@@ -33,7 +33,7 @@ afs-tracing = { path = "crates/tracing", features = ["runtime"] }
 afs-transport = { path = "crates/transport", default-features = false, features = ["grpc", "shm"] }
 
 clap = { version = "4.5.51", features = ["derive"] }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0"
 im = "=15.1.0"
 crc32c = "=0.6.8"

@@ -356,6 +356,14 @@ impl DfsService {
         &self,
         version_id: FileVersionId,
     ) -> Result<(FileVersion, LayoutRoot)> {
+        let (version, layout) = self.get_shared_file_version(version_id).await?;
+        Ok((version, Arc::unwrap_or_clone(layout)))
+    }
+
+    pub(super) async fn get_shared_file_version(
+        &self,
+        version_id: FileVersionId,
+    ) -> Result<(FileVersion, Arc<LayoutRoot>)> {
         require_id(&version_id.0, "version_id")?;
         let version = match self
             .store

@@ -888,3 +888,164 @@ async fn p3_open_term_process_crash() {
         fs::remove_dir_all(directory).unwrap();
     }
 }
+
+fn r86_commit(number: u64) -> super::MetaTxn {
+    use super::{MetaEntity, MetaTxn, StoreOperation, TxnCondition, TxnMutation};
+    use crate::dfs::{ChunkId, Extent, FileVersion, FileVersionId, LayoutRoot, LayoutRootId};
+
+    let fixtures = super::codec::tests::entity_fixtures();
+    let MetaEntity::DfsInode(mut inode) = fixtures[7].clone() else {
+        panic!("expected an inode fixture");
+    };
+    let version = FileVersionId::new(format!("r86-version-{number}"));
+    let layout = LayoutRootId::new(format!("r86-layout-{number}"));
+    inode.head_version = Some(version.clone());
+    inode.revision = number;
+    let request = RequestKey::new("r86", format!("append-{number}"));
+    let operation = StoreOperation::DfsCommitFileVersion;
+    let mut txn = MetaTxn::new(request.clone(), operation);
+    txn.conditions
+        .push(TxnCondition::RequestAbsent(request.clone()));
+    txn.mutations.extend([
+        TxnMutation::Put(MetaEntity::DfsFileVersion(FileVersion {
+            id: version,
+            inode_id: inode.inode_id.clone(),
+            parent_version: (number > 1)
+                .then(|| FileVersionId::new(format!("r86-version-{}", number - 1))),
+            length: number * 4096,
+            layout_root: layout.clone(),
+            created_at_unix_ms: number,
+        })),
+        TxnMutation::Put(MetaEntity::DfsLayoutRoot(Arc::new(LayoutRoot {
+            id: layout,
+            file_length: number * 4096,
+            inline_extents: (0..number)
+                .map(|index| Extent {
+                    file_offset: index * 4096,
+                    length: 4096,
+                    chunk_id: ChunkId::new(format!("r86-chunk-{index}")),
+                    chunk_offset: 0,
+                })
+                .collect(),
+        }))),
+        TxnMutation::Put(MetaEntity::DfsInode(inode.clone())),
+        TxnMutation::RecordRequestOutcome(RequestOutcome {
+            request,
+            operation,
+            result: OperationResult::DfsInode(inode),
+        }),
+    ]);
+    txn
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r86_layout_append_process_crash() {
+    const NAME: &str = "meta::store::crash_tests::r86_layout_append_process_crash";
+
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+        let log =
+            Arc::new(LocalLog::open(directory.join("meta"), LocalLogOptions::default()).unwrap());
+        let store = Store::open_log(log.clone()).await.unwrap();
+        let point = std::env::var(POINT).unwrap();
+        assert!(matches!(
+            store.compare_and_commit(r86_commit(1)).await.unwrap(),
+            TxnOutcome::Committed { .. }
+        ));
+        if point.starts_with("checkpoint_") {
+            store.checkpoint().await.unwrap();
+            assert!(matches!(
+                store.compare_and_commit(r86_commit(2)).await.unwrap(),
+                TxnOutcome::Committed { .. }
+            ));
+            let recovered = log.recover().await.unwrap();
+            assert!(matches!(
+                recovered.records.last(),
+                Some(super::log::Record::AppendLayout { .. })
+            ));
+            fs::write(directory.join("armed"), b"append ACK complete").unwrap();
+            store.checkpoint().await.unwrap();
+        } else {
+            fs::write(directory.join("armed"), b"base ACK complete").unwrap();
+            store.compare_and_commit(r86_commit(2)).await.unwrap();
+        }
+        panic!("selected layout append crash point was not reached");
+    }
+
+    for point in [
+        "after_append_before_sync",
+        "after_sync_before_publish",
+        "checkpoint_image_installed",
+        "checkpoint_selected",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let child_log = File::create(directory.path().join("child.log")).unwrap();
+        let mut process = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env(POINT, point)
+                .env(DIRECTORY, directory.path())
+                .stdout(Stdio::from(child_log.try_clone().unwrap()))
+                .stderr(Stdio::from(child_log))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let reached = directory.path().join("reached");
+        while !reached.is_file() {
+            assert!(
+                process.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "did not reach {point}: {}",
+                fs::read_to_string(directory.path().join("child.log")).unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(fs::read_to_string(reached).unwrap().starts_with(point));
+        process.0.kill().unwrap();
+        assert_eq!(process.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        let log = Arc::new(
+            LocalLog::open(directory.path().join("meta"), LocalLogOptions::default()).unwrap(),
+        );
+        let store = Store::open_log(log.clone()).await.unwrap();
+        let recovered = log.recover().await.unwrap();
+        assert_eq!(recovered.tip.sequence, 2);
+        if !point.starts_with("checkpoint_") {
+            assert!(matches!(
+                recovered.records.last(),
+                Some(super::log::Record::AppendLayout { .. })
+            ));
+        }
+        let layout = store
+            .read(MetaRead::DfsLayoutRoot(crate::dfs::LayoutRootId::new(
+                "r86-layout-2",
+            )))
+            .await
+            .unwrap()
+            .entity
+            .unwrap();
+        let expected = r86_commit(2)
+            .mutations
+            .into_iter()
+            .find_map(|mutation| match mutation {
+                super::TxnMutation::Put(entity @ super::MetaEntity::DfsLayoutRoot(_)) => {
+                    Some(entity)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(layout, expected, "{point}");
+        for number in [1, 2] {
+            assert!(
+                store
+                    .read(MetaRead::RequestOutcome(r86_commit(number).request))
+                    .await
+                    .unwrap()
+                    .request_outcome
+                    .is_some(),
+                "{point}"
+            );
+        }
+        eprintln!("R86 recovered exact layout and outcomes after {point}");
+    }
+}

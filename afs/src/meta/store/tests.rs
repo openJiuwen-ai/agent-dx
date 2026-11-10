@@ -3264,18 +3264,21 @@ async fn p3_a27_typed_byte_limits_reject_atomically_and_reopen_controls() {
     });
     let layout = vec![
         chunk.clone(),
-        MetaEntity::DfsLayoutRoot(LayoutRoot {
-            id: LayoutRootId::new("layout"),
-            file_length: 512 * 4096,
-            inline_extents: (0..512)
-                .map(|number| Extent {
-                    file_offset: number * 4096,
-                    length: 4096,
-                    chunk_id: ChunkId::new("chunk"),
-                    chunk_offset: 0,
-                })
-                .collect(),
-        }),
+        MetaEntity::DfsLayoutRoot(
+            LayoutRoot {
+                id: LayoutRootId::new("layout"),
+                file_length: 512 * 4096,
+                inline_extents: (0..512)
+                    .map(|number| Extent {
+                        file_offset: number * 4096,
+                        length: 4096,
+                        chunk_id: ChunkId::new("chunk"),
+                        chunk_offset: 0,
+                    })
+                    .collect(),
+            }
+            .into(),
+        ),
         MetaEntity::DfsFileVersion(FileVersion {
             id: FileVersionId::new("version"),
             inode_id: InodeId::new("inode"),
@@ -5087,4 +5090,30 @@ async fn meta_background_input_cannot_take_the_whole_queue() {
     drop(background);
     drop(foreground);
     queue.admit(1000, InputPriority::Foreground).await.unwrap();
+}
+
+#[test]
+fn layout_entity_clones_share_extents() {
+    use crate::dfs::{ChunkId, Extent};
+    let layout = LayoutRoot {
+        id: LayoutRootId::new("shared-layout"),
+        file_length: 1,
+        inline_extents: vec![Extent {
+            file_offset: 0,
+            length: 1,
+            chunk_id: ChunkId::new("chunk"),
+            chunk_offset: 0,
+        }],
+    };
+    let entity = MetaEntity::DfsLayoutRoot(layout.into());
+    let MetaEntity::DfsLayoutRoot(first) = &entity else {
+        unreachable!();
+    };
+    let MetaEntity::DfsLayoutRoot(second) = entity.clone() else {
+        unreachable!();
+    };
+    assert_eq!(
+        first.inline_extents.as_ptr(),
+        second.inline_extents.as_ptr()
+    );
 }

@@ -1843,7 +1843,7 @@ async fn memory_read_authority_fixture() -> (
             layout_root: layout.id.clone(),
             created_at_unix_ms: 1,
         })),
-        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout)),
+        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout.into())),
         TxnMutation::Put(MetaEntity::DfsChunk(staged.chunk.clone())),
         TxnMutation::Put(MetaEntity::DfsCopy(copy)),
         TxnMutation::Put(MetaEntity::DfsPlacement(PlacementRecord {

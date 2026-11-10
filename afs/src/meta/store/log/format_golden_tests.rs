@@ -237,14 +237,19 @@ fn meta_store_enum_variant_indices_are_pinned() {
 fn meta_log_enum_variant_indices_are_pinned() {
     let decision = match golden_record() {
         Record::Decision { decision, .. } => decision,
-        Record::History(_) => panic!("test record is not a decision"),
+        _ => panic!("test record is not a decision"),
     };
     pin_variants!(Record {
         0: Record::Decision { .. } => Record::Decision {
-            decision,
+            decision: decision.clone(),
             history: None,
         },
         1: Record::History(_) => Record::History(history_delta()),
+        2: Record::AppendLayout { .. } => Record::AppendLayout {
+            decision,
+            history: None,
+            base: LayoutAppendBase { layout: crate::dfs::LayoutRootId::new("base"), length: 1 },
+        },
     });
     pin_variants!(Change {
         0: Change::Put { .. } => Change::Put {
