@@ -1949,9 +1949,27 @@ mod tests {
                 translated.dns.unwrap().default_action,
                 proto::NetworkPolicyAction::Deny as i32
             );
-            for rule in &traffic.rules[2..] {
-                assert_eq!(rule.direction, proto::NetworkDirection::Ingress as i32);
+            let platform_rules = &traffic.rules[2..];
+            assert_eq!(platform_rules.len(), 2);
+            assert_eq!(
+                platform_rules[0].direction,
+                proto::NetworkDirection::Both as i32
+            );
+            assert_eq!(
+                platform_rules[0].sandbox_port_range.as_ref().unwrap().first,
+                50090
+            );
+            assert_eq!(
+                platform_rules[1].direction,
+                proto::NetworkDirection::Ingress as i32
+            );
+            assert_eq!(
+                platform_rules[1].sandbox_port_range.as_ref().unwrap().first,
+                18092
+            );
+            for rule in platform_rules {
                 assert_eq!(rule.peer.as_ref().unwrap().cidr, bridge);
+                assert_eq!(rule.protocol, proto::NetworkProtocol::Tcp as i32);
             }
             assert!(optional_network_policy(None, &[], None, &config)
                 .unwrap()
@@ -1967,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn source_bounded_platform_rules_do_not_allow_outbound_source_port_bypass() {
+    fn source_bounded_workload_ports_do_not_allow_outbound_source_port_bypass() {
         use adx_core::execution::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
         let mut policy = NetworkPolicy {
             traffic: Some(TrafficPolicy {
@@ -1986,9 +2004,17 @@ mod tests {
             environment_network_policy(&policy, &[18092], Some(8766), &config).unwrap();
         let rules = translated.traffic.unwrap().rules;
         assert_eq!(rules.len(), 3);
-        for rule in rules {
-            assert_eq!(rule.direction, proto::NetworkDirection::Ingress as i32);
-            assert_eq!(rule.peer.unwrap().cidr, "10.88.4.1/32");
+        let expected = [
+            (50090, proto::NetworkDirection::Both),
+            (18092, proto::NetworkDirection::Ingress),
+            (8765, proto::NetworkDirection::Ingress),
+        ];
+        for (rule, (port, direction)) in rules.iter().zip(expected) {
+            assert_eq!(rule.direction, direction as i32);
+            assert_eq!(rule.peer.as_ref().unwrap().cidr, "10.88.4.1/32");
+            assert_eq!(rule.protocol, proto::NetworkProtocol::Tcp as i32);
+            let range = rule.sandbox_port_range.as_ref().unwrap();
+            assert_eq!((range.first, range.last), (port, port));
         }
         policy.traffic.as_mut().unwrap().mode = TrafficMode::Stateless;
         assert!(environment_network_policy(&policy, &[], None, &config).is_err());

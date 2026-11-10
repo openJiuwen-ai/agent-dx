@@ -28,7 +28,7 @@ COMPONENTS = BASE_COMPONENTS + OPTIONAL_COMPONENTS
 REQUIRED_FILES = {
     "platform": {"adxctl", "adx-inspect", "adx-coordinator", "adxlet"},
     "gateway": {"adx-apiserver", "adx-ingress", "adx-relay", "adx-activator"},
-    "execd": {"adx-execd", "adx-runtime-rootfs.img", "adx-runtime-rootfs.json"},
+    "execd": {"adx-execd", "adx-runtime-rootfs.img"},
     "afs": {"afs-meta", "afs-node"},
 }
 OPTIONAL_FILE_SETS = {
@@ -71,7 +71,14 @@ def _regular_files(directory):
     return files
 
 
-def create_manifest(component, directory, commit, target):
+def verify_rootfs_metadata(metadata, files, target):
+    if (not isinstance(metadata, dict) or metadata.get("target") != target
+            or metadata.get("execd_sha256") != files.get("adx-execd")
+            or metadata.get("rootfs_sha256") != files.get("adx-runtime-rootfs.img")):
+        raise ValueError("component rootfs provenance mismatch")
+
+
+def create_manifest(component, directory, commit, target, rootfs_metadata=None):
     if component not in COMPONENTS:
         raise ValueError("unknown component")
     _identity(commit, target)
@@ -86,6 +93,12 @@ def create_manifest(component, directory, commit, target):
         "target": target,
         "files": files,
     }
+    if rootfs_metadata is not None:
+        if component != "execd":
+            raise ValueError("rootfs provenance belongs to the Execd component")
+        metadata = json.loads(Path(rootfs_metadata).read_text())
+        verify_rootfs_metadata(metadata, files, target)
+        manifest["runtime_rootfs"] = metadata
     (directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -109,7 +122,20 @@ def verify_manifest(directory, component=None, commit=None, target=None):
         raise ValueError("component artifact file set is incomplete or unexpected")
     if manifest.get("files") != _regular_files(directory):
         raise ValueError("component artifact integrity check failed")
+    if "runtime_rootfs" in manifest:
+        if manifest["component"] != "execd":
+            raise ValueError("rootfs provenance belongs to the Execd component")
+        verify_rootfs_metadata(manifest["runtime_rootfs"], manifest["files"], manifest["target"])
     return manifest
+
+
+def write_rootfs_metadata(directory, output):
+    manifest = verify_manifest(directory, component="execd")
+    if "runtime_rootfs" not in manifest:
+        raise ValueError("Execd component rootfs provenance is missing")
+    if output.exists():
+        raise ValueError("rootfs metadata output already exists")
+    output.write_text(json.dumps(manifest["runtime_rootfs"], indent=2) + "\n")
 
 
 def _artifact(path):
@@ -244,6 +270,11 @@ def main():
     create.add_argument("--directory", type=Path, required=True)
     create.add_argument("--commit", default=None)
     create.add_argument("--target", required=True)
+    create.add_argument("--rootfs-metadata", type=Path)
+
+    rootfs = subparsers.add_parser("rootfs-metadata")
+    rootfs.add_argument("--directory", type=Path, required=True)
+    rootfs.add_argument("--output", type=Path, required=True)
 
     verify = subparsers.add_parser("verify")
     verify.add_argument("--component", choices=COMPONENTS)
@@ -277,7 +308,9 @@ def main():
     arguments = parser.parse_args()
     commit = getattr(arguments, "commit", None) or _git_commit()
     if arguments.command == "create":
-        create_manifest(arguments.component, arguments.directory, commit, arguments.target)
+        create_manifest(arguments.component, arguments.directory, commit, arguments.target, arguments.rootfs_metadata)
+    elif arguments.command == "rootfs-metadata":
+        write_rootfs_metadata(arguments.directory, arguments.output)
     elif arguments.command == "verify":
         verify_manifest(arguments.directory, arguments.component, arguments.commit, arguments.target)
     elif arguments.command == "aggregate":

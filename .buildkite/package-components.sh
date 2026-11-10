@@ -71,6 +71,9 @@ for component in "${components[@]}"; do
     ! -name manifest.json -exec cp {} "$stage/" \;
 done
 
+python3 build/release/component.py rootfs-metadata \
+  --directory out/buildkite/components/execd --output "$stage/adx-runtime-rootfs.json"
+
 echo "--- :python: Consume tested Environment SDK candidate"
 if [[ ${ADX_CANDIDATE_LOCAL:-0} != 1 ]]; then
   buildkite-agent artifact download 'out/buildkite/sdk/*' . --step sdk-package

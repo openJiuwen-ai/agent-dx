@@ -27,6 +27,9 @@ output="out/buildkite/components/$component"
 rm -rf "$output"
 mkdir -p "$output"
 jobs=${JOBS:-4}
+component_args=()
+rootfs_metadata=""
+trap '[[ -z "$rootfs_metadata" ]] || rm -f "$rootfs_metadata"' EXIT
 
 case "${ADX_COMPONENT_TESTS:-1}" in
   1) bash .buildkite/component-tests.sh "$component" ;;
@@ -71,6 +74,9 @@ case "$component" in
     cp "$output/envd-build/LICENSE" "$output/envd-LICENSE"
     rootfs_args+=(--envd-binary "$output/envd-build/envd")
     python3 build/runtime/rootfs.py "${rootfs_args[@]}"
+    rootfs_metadata=$(mktemp "${TMPDIR:-/tmp}/adx-rootfs-metadata.XXXXXX")
+    mv "$output/adx-runtime-rootfs.json" "$rootfs_metadata"
+    component_args+=(--rootfs-metadata "$rootfs_metadata")
     rm -rf "$output/envd-build"
     ;;
   afs)
@@ -97,7 +103,7 @@ python3 build/release/component.py create \
   --component "$component" \
   --directory "$output" \
   --commit "$BUILDKITE_COMMIT" \
-  --target "$ADX_RELEASE_TARGET"
+  --target "$ADX_RELEASE_TARGET" "${component_args[@]}"
 tar -czf "out/buildkite/components/$component.tar.gz" -C "$output" .
 
 if [[ ${ADX_COMPONENT_LOCAL:-0} != 1 ]]; then

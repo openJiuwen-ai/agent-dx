@@ -38,13 +38,27 @@ class ComponentManifestTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 component.create_manifest("gateway", root, "a" * 40, "x86_64-unknown-linux-gnu")
 
-    def test_execd_component_rejects_missing_rootfs_provenance(self):
+    def test_rootfs_provenance_preserves_the_existing_execd_archive_file_set(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for filename in ("adx-execd", "adx-runtime-rootfs.img"):
-                (root / filename).write_bytes(b"fixture")
-            with self.assertRaisesRegex(ValueError, "incomplete or unexpected"):
-                component.create_manifest("execd", root, "a" * 40, "x86_64-unknown-linux-gnu")
+            directory = self.write_component(root, "execd")
+            for name in component.OPTIONAL_FILE_SETS["execd"]:
+                (directory / name).write_text(name)
+            target = "x86_64-unknown-linux-gnu"
+            metadata = {"target": target, "execd_sha256": component.sha256(directory / "adx-execd"),
+                        "rootfs_sha256": component.sha256(directory / "adx-runtime-rootfs.img")}
+            source = root / "rootfs.json"
+            source.write_text(json.dumps(metadata))
+            manifest = component.create_manifest("execd", directory, "a" * 40, target, source)
+            self.assertEqual(set(manifest["files"]),
+                             {"adx-execd", "adx-runtime-rootfs.img", "envd-manifest.json", "envd-LICENSE"})
+            output = root / "restored.json"
+            component.write_rootfs_metadata(directory, output)
+            self.assertEqual(json.loads(output.read_text()), metadata)
+            manifest["runtime_rootfs"]["rootfs_sha256"] = "0" * 64
+            (directory / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "rootfs provenance mismatch"):
+                component.verify_manifest(directory)
 
     def test_execd_component_accepts_complete_optional_envd_provenance(self):
         with tempfile.TemporaryDirectory() as temporary:

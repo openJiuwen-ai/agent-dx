@@ -42,8 +42,9 @@ Set these variables on a Buildkite build or in that pipeline's environment setti
 Both architecture Execd components use the checksum-pinned openEuler 24.03 LTS
 base in `third_party/runtime-rootfs/source.json`. The builder downloads its base
 filesystem archive from OBS, or reads `ADX_RUNTIME_ROOTFS_ARCHIVE` for an offline
-copy with the same checksum. The generated `adx-runtime-rootfs.json` travels with
-the EROFS through component verification and unified packaging. Deployment uses
+copy with the same checksum. The generated rootfs provenance is embedded in the Execd component manifest,
+keeping its existing payload file set. Unified packaging restores
+`adx-runtime-rootfs.json` and verifies its bindings to Execd and EROFS. Deployment uses
 the packaged Local rootfs and does not pull the openEuler image.
 
 Both architecture Execd components include the pinned upstream envd in
