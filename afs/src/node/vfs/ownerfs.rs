@@ -714,6 +714,17 @@ impl OwnerFsPeerExecutor {
             .peer_rmdir(ctx, peer_node_id, access, path, expected, expected_parent)
     }
 
+    pub fn rmdir_root(
+        &self,
+        ctx: &RequestContext,
+        peer_node_id: &str,
+        access: &PresentedRootAccess,
+        expected_root: &files::FileIdentity,
+    ) -> Result<()> {
+        self.local
+            .peer_rmdir_root(ctx, peer_node_id, access, expected_root)
+    }
+
     // Keep the agreed peer contract explicit instead of allocating a request
     // object just to satisfy the argument-count lint on this cold operation.
     #[allow(clippy::too_many_arguments)]
@@ -3069,6 +3080,35 @@ impl LocalOwnerFs {
         Ok(())
     }
 
+    fn peer_rmdir_root(
+        &self,
+        ctx: &RequestContext,
+        peer_node_id: &str,
+        access: &PresentedRootAccess,
+        expected_root: &files::FileIdentity,
+    ) -> Result<()> {
+        self.validate_peer(access, peer_node_id, RootRight::Write)?;
+        // 与本机路径不同，数据目录缺失时不放行：此时无法校验 expected_root。入口节点上
+        // 远端 root 的 entry TTL 为 0，rmdir 前的 LOOKUP 已返回 ENOENT；残留由 Home
+        // 启动时的 zombie 检测清理。
+        let victim =
+            self.owner_entry_for_path(&access.id, StoragePath::root(), Some(expected_root))?;
+        // 节点授权只说明对端可以写这个 workspace，不说明调用者可以删除挂载根下的目录。
+        // 与其他 peer 删除一样，按 caller 重做本机 FUSE 入口由内核完成的检查：挂载根
+        // 属 root、0755，非 root 调用者被拒绝。
+        authorize_namespace_remove(ctx, &self.owner_root_attributes()?, &victim.attributes)?;
+        let (data_dir, _) = self
+            .roots
+            .local_root_data_dir(&access.id)?
+            .ok_or_else(|| Error::coded(afs_error::NODE_VFS_NOT_FOUND, "root not found on Home"))?;
+        self.ensure_root_empty(&data_dir)?;
+        afs_logging::info!(
+            "ownerfs.peer_rmdir_root.accepted";
+            "root_id" => ?access.id, "peer_node_id" => peer_node_id, "uid" => ctx.uid
+        );
+        self.delete_local_root(&access.id, Some(access.epoch), expected_root)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn peer_rename(
         &self,
@@ -4074,13 +4114,22 @@ impl LocalOwnerFs {
                     options,
                 )?;
                 let mut state = self.state.lock().map_err(|_| poisoned())?;
-                let inode = state.inode_for_path(
+                let inode = match state.inode_for_remote_path(
+                    &parent_record.version,
+                    LookupIndexMode::Ordinary,
                     created.entry.root_id.clone(),
                     child,
                     created.entry.identity.clone(),
                     created.entry.attributes.clone(),
                     created.entry.attributes.kind,
-                );
+                ) {
+                    Ok(inode) => inode,
+                    Err(error) => {
+                        drop(state);
+                        let _ = remote.files.release(&remote.grant, created.file);
+                        return Err(error);
+                    }
+                };
                 let handle = state.insert_remote_file_handle(
                     remote.grant,
                     remote.files,
@@ -4678,7 +4727,8 @@ impl LocalOwnerFs {
                         let child = parent_relative
                             .join_component(&entry.name)
                             .map_err(Error::from)?;
-                        let inode = self.insert_remote_entry(child, entry.entry.clone())?;
+                        let inode =
+                            self.insert_remote_entry(&record.version, child, entry.entry.clone())?;
                         rows.push(DirectoryEntry {
                             name: entry.name,
                             inode: backend_inode(inode),
@@ -4798,7 +4848,8 @@ impl LocalOwnerFs {
                     mode,
                     &parent_record.identity,
                 )?;
-                let inode = self.insert_remote_entry(child, entry.clone())?;
+                let inode =
+                    self.insert_remote_entry(&parent_record.version, child, entry.clone())?;
                 return Ok(Entry {
                     inode: backend_inode(inode),
                     attributes: entry.attributes,
@@ -4879,7 +4930,8 @@ impl LocalOwnerFs {
                     mode,
                     &parent_record.identity,
                 )?;
-                let inode = self.insert_remote_entry(child, entry.clone())?;
+                let inode =
+                    self.insert_remote_entry(&parent_record.version, child, entry.clone())?;
                 return Ok(Entry {
                     inode: backend_inode(inode),
                     attributes: entry.attributes,
@@ -4992,7 +5044,7 @@ impl LocalOwnerFs {
     fn rmdir(&self, ctx: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<()> {
         // D4: root 级别 rmdir 触发完整 root 删除流程。
         if parent.value == OWNERFS_ROOT_INODE {
-            return self.rmdir_root(name);
+            return self.rmdir_root(ctx, name);
         }
         let parent_record = self.directory_record(parent)?;
         let child = parent_record
@@ -5035,60 +5087,161 @@ impl LocalOwnerFs {
         Ok(())
     }
 
-    /// D4: 删除整个 root 目录（spec §5.4）。
-    ///
-    /// 顺序：解析 root_id → 卸载 bind mount → RootManager::delete_root
-    /// （revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog）→
-    /// OwnerState 索引清理 → PrivateFuseCache 清理。任一步失败时后续步骤
-    /// 不再执行，残留记录由 reconcile_on_startup 的 zombie 检测在下一次
-    /// 启动时清理。
-    fn rmdir_root(&self, name: &OsStr) -> Result<()> {
+    /// D4: 删除整个 root 目录（spec §5.4）。本机是 Home 时直接删除，否则转发给 Home。
+    fn rmdir_root(&self, ctx: &RequestContext, name: &OsStr) -> Result<()> {
         // 1. 解析 root_id。并发 rmdir 的第二个调用在这里已找不到 name
         //    条目（第一个调用完成 state.remove_root 后），返回 ENOENT，
         //    与 delete_root 的缓存移除线性化点一致。
-        let root_id = {
+        let (root_id, root_identity) = {
             let state = self.state.lock().map_err(|_| poisoned())?;
             let inode = state.root_names.get(name).ok_or_else(|| {
                 Error::coded(afs_error::NODE_VFS_NOT_FOUND, "root name not found")
             })?;
-            state
+            let record = state
                 .inodes
                 .get(inode)
-                .ok_or_else(|| stale("root inode not found"))?
-                .root_id
-                .clone()
+                .ok_or_else(|| stale("root inode not found"))?;
+            (record.root_id.clone(), record.identity.clone())
         };
         afs_logging::info!("ownerfs.rmdir_root.resolved"; "name" => ?name, "root_id" => ?root_id);
 
+        match self.roots.local_root_data_dir(&root_id)? {
+            Some((data_dir, epoch)) => {
+                // 解析出的 root_id 在同名重建后不变：先确认缓存中的版本就是内核解析到的
+                // 目录，再把该版本的 epoch 交给 delete_root 在 workspace 锁内复核。
+                match self.disk.metadata(&data_dir) {
+                    Ok(metadata) => check_expected_identity(
+                        Some(&root_identity),
+                        &identity_from_metadata(&metadata)?,
+                    )?,
+                    // 目录已不存在时交给 delete_root 收敛残留记录。
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(Error::from(error)),
+                }
+                self.ensure_root_empty(&data_dir)?;
+                self.delete_local_root(&root_id, Some(epoch), &root_identity)
+            }
+            None => self.rmdir_remote_root(ctx, &root_id, &root_identity),
+        }
+    }
+
+    /// 只结束空 workspace：`delete_root` 在 Meta deactivate 之后才删除物理目录，
+    /// 非空目录若走到那一步，ENOTEMPTY 返回时 workspace 已经下线。这里在任何删除步骤
+    /// 之前拒绝；检查与删除之间新写入的文件仍会走到上述路径。
+    /// 目录已不存在时交给 `delete_root` 收敛残留记录。
+    fn ensure_root_empty(&self, data_dir: &StoragePath) -> Result<()> {
+        match self.disk.read_dir(data_dir) {
+            Ok(entries) if !entries.is_empty() => Err(Error::coded(
+                afs_error::IO_DIRECTORY_NOT_EMPTY,
+                "workspace is not empty",
+            )),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::from(error)),
+        }
+    }
+
+    /// 非 Home 入口把删除转发给 Home。结果未知的请求不重放；只有确认删除成功或
+    /// root 已不存在时才清理本地状态，其他失败保留状态，由后续 lookup 向 Meta 确认。
+    fn rmdir_remote_root(
+        &self,
+        ctx: &RequestContext,
+        root_id: &RootId,
+        expected_root: &files::FileIdentity,
+    ) -> Result<()> {
+        // 缓存里没有、Meta 却指向本机：本机的删除已过缓存移除这个线性化点，由该次删除
+        // 负责清理状态；它在 Meta deactivate 失败时留下的残留由启动时的 zombie 检测清理。
+        if self
+            .roots
+            .lookup_root_location(root_id)?
+            .is_some_and(|location| location.home_node_id == self.roots.node_id())
+        {
+            return Err(Error::coded(
+                afs_error::NODE_VFS_NOT_FOUND,
+                "root is no longer active on this Home",
+            ));
+        }
+        let result = self
+            .acquire_remote_root(root_id, RootRight::Write)
+            .and_then(|remote| remote.files.rmdir_root(ctx, &remote.grant, expected_root));
+        // Home 先校验授权：root 已被删除时它返回授权错误而不是 NOT_FOUND。失败时只向
+        // Meta 确认 root 是否还在，不重发请求；Meta 不可达时按原错误返回。
+        let root_is_gone = match &result {
+            Ok(()) => true,
+            Err(error) => {
+                error.code() == afs_error::NODE_VFS_NOT_FOUND
+                    || matches!(self.roots.lookup_root_location(root_id), Ok(None))
+            }
+        };
+        if root_is_gone {
+            // 同名重建后 root_id 不变，此时本机可能已有新版本的记录（例如本机成为新 Home
+            // 后处理的 peer 请求），所以只回收被删版本的记录，并与新记录的发布共用 state
+            // 锁。本机不是被删版本的 Home，PrivateFuseCache 中没有它的条目。
+            self.state
+                .lock()
+                .map_err(|_| poisoned())?
+                .remove_root(root_id, expected_root, false);
+            self.invalidate_remote_root(root_id)?;
+        }
+        match result {
+            Err(error) if root_is_gone && error.code() != afs_error::NODE_VFS_NOT_FOUND => {
+                Err(Error::coded(
+                    afs_error::NODE_VFS_NOT_FOUND,
+                    "root is no longer registered in Meta",
+                ))
+            }
+            result => result,
+        }
+    }
+
+    /// 顺序：卸载 bind mount → RootManager::delete_root
+    /// （revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog）→
+    /// OwnerState 索引清理 → PrivateFuseCache 清理。任一步失败时后续步骤
+    /// 不再执行，残留记录由 reconcile_on_startup 的 zombie 检测在下一次
+    /// 启动时清理。全部步骤在 workspace 锁内执行，同名重建要等删除结束，
+    /// 卸载和索引清理因此不会作用到新 workspace。
+    fn delete_local_root(
+        &self,
+        root_id: &RootId,
+        expected_epoch: Option<u64>,
+        root_identity: &files::FileIdentity,
+    ) -> Result<()> {
         // 2. 卸载活跃 bind mount。detach 失败（如活跃 fd 导致 EBUSY）时
         //    request_unmount 记录日志并保留条目，不阻塞删除流程；物理目录
         //    删除若因残留挂载失败，由下次启动的 reconcile 重试。
-        if let Some(mm) = &self.mount_manager {
-            mm.request_unmount(&root_id)?;
-        }
-        afs_logging::info!("ownerfs.rmdir_root.unmounted"; "root_id" => ?root_id);
+        let unmount = || {
+            if let Some(mm) = &self.mount_manager {
+                mm.request_unmount(root_id)?;
+            }
+            afs_logging::info!("ownerfs.rmdir_root.unmounted"; "root_id" => ?root_id);
+            Ok(())
+        };
+
+        let clean = || {
+            // 4. 清除 OwnerState 中的 FUSE 索引。
+            {
+                let mut state = self.state.lock().map_err(|_| poisoned())?;
+                state.remove_root(root_id, root_identity, true);
+            }
+            afs_logging::info!("ownerfs.rmdir_root.state_cleaned"; "root_id" => ?root_id);
+
+            // 5. 清除 PrivateFuseCache 中的共享缓存与 native home 索引。
+            {
+                let mut cache = self
+                    .private_cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                cache.remove_root(root_id);
+            }
+            afs_logging::info!("ownerfs.rmdir_root.cache_cleaned"; "root_id" => ?root_id);
+            Ok(())
+        };
 
         // 3. RootManager::delete_root（revoke → 缓存移除 → Meta deactivate
-        //    → 物理目录 → catalog）。
-        self.roots.delete_root(&root_id)?;
+        //    → 物理目录 → catalog），第 2 步在其前、第 4、5 步在其后执行。
+        self.roots
+            .delete_root_with(root_id, expected_epoch, unmount, clean)?;
         afs_logging::info!("ownerfs.rmdir_root.root_deleted"; "root_id" => ?root_id);
-
-        // 4. 清除 OwnerState 中的 FUSE 索引。
-        {
-            let mut state = self.state.lock().map_err(|_| poisoned())?;
-            state.remove_root(&root_id);
-        }
-        afs_logging::info!("ownerfs.rmdir_root.state_cleaned"; "root_id" => ?root_id);
-
-        // 5. 清除 PrivateFuseCache 中的共享缓存与 native home 索引。
-        {
-            let mut cache = self
-                .private_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            cache.remove_root(&root_id);
-        }
-        afs_logging::info!("ownerfs.rmdir_root.cache_cleaned"; "root_id" => ?root_id);
 
         Ok(())
     }
@@ -5157,13 +5310,15 @@ impl LocalOwnerFs {
                             Some(&expected_old),
                         )?;
                         let mut state = self.state.lock().map_err(|_| poisoned())?;
-                        state.inode_for_path(
+                        state.inode_for_remote_path(
+                            &to_parent.version,
+                            LookupIndexMode::Ordinary,
                             entry.root_id,
                             to,
                             entry.identity,
                             entry.attributes.clone(),
                             entry.attributes.kind,
-                        );
+                        )?;
                     }
                 } else {
                     let mut state = self.state.lock().map_err(|_| poisoned())?;
@@ -5246,7 +5401,8 @@ impl LocalOwnerFs {
                     target,
                     &parent_record.identity,
                 )?;
-                let inode = self.insert_remote_entry(child, entry.clone())?;
+                let inode =
+                    self.insert_remote_entry(&parent_record.version, child, entry.clone())?;
                 return Ok(Entry {
                     inode: backend_inode(inode),
                     attributes: entry.attributes,
@@ -5368,7 +5524,8 @@ impl LocalOwnerFs {
                     &source_record.identity,
                     &parent_record.identity,
                 )?;
-                let inode = self.insert_remote_entry(child, entry.clone())?;
+                let inode =
+                    self.insert_remote_entry(&parent_record.version, child, entry.clone())?;
                 return Ok(Entry {
                     inode: backend_inode(inode),
                     attributes: entry.attributes,
@@ -5467,12 +5624,35 @@ impl LocalOwnerFs {
             .map_err(Error::from)?;
         let identity = identity_from_metadata(&metadata)?;
         let attributes = attributes_from_metadata(metadata)?;
+        self.publish_local_root_entry(name, id, root_use.data_dir(), identity, attributes)
+            .map(Some)
+    }
+
+    /// 发布本机 Home 上读取到的根目录。读取与发布之间，root 可能已被删除（包括其他节点
+    /// 经 `RmdirRoot` 发起的删除，本机 FUSE 的目录锁挡不住），也可能已同名重建。删除先把
+    /// root 移出 RootManager 缓存，再在 state 锁内清理索引；这里在 state 锁内确认缓存中
+    /// 仍是同一版本（数据目录相同）后才发布，否则返回 NOT_FOUND，不会恢复已删除的索引。
+    fn publish_local_root_entry(
+        &self,
+        name: &OsStr,
+        id: RootId,
+        data_dir: &StoragePath,
+        identity: files::FileIdentity,
+        attributes: FileAttributes,
+    ) -> Result<Entry> {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
+        let current = self.roots.local_root_data_dir(&id)?;
+        if current.as_ref().map(|(current, _)| current) != Some(data_dir) {
+            return Err(Error::coded(
+                afs_error::NODE_VFS_NOT_FOUND,
+                "workspace was deleted while its root was being looked up",
+            ));
+        }
         let inode = state.insert_root(name.to_os_string(), id, identity, attributes.clone());
-        Ok(Some(Entry {
+        Ok(Entry {
             inode: backend_inode(inode),
             attributes,
-        }))
+        })
     }
 
     fn acquire_remote_root(&self, id: &RootId, right: RootRight) -> Result<RemoteRoot> {
@@ -5545,33 +5725,33 @@ impl LocalOwnerFs {
         }
     }
 
-    fn insert_remote_entry(&self, relative: StoragePath, entry: files::OwnerEntry) -> Result<u64> {
-        self.insert_remote_entry_with_mode(relative, entry, LookupIndexMode::Ordinary)
+    /// `version` 是发起请求时父记录所属的 workspace 版本，见 [`OwnerState::inode_for_remote_path`]。
+    fn insert_remote_entry(
+        &self,
+        version: &files::FileIdentity,
+        relative: StoragePath,
+        entry: files::OwnerEntry,
+    ) -> Result<u64> {
+        self.insert_remote_entry_with_mode(version, relative, entry, LookupIndexMode::Ordinary)
     }
 
     fn insert_remote_entry_with_mode(
         &self,
+        version: &files::FileIdentity,
         relative: StoragePath,
         entry: files::OwnerEntry,
         mode: LookupIndexMode,
     ) -> Result<u64> {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
-        Ok(match mode {
-            LookupIndexMode::Ordinary => state.inode_for_path(
-                entry.root_id,
-                relative,
-                entry.identity,
-                entry.attributes.clone(),
-                entry.attributes.kind,
-            ),
-            LookupIndexMode::ObservedPath => state.inode_for_observed_path(
-                entry.root_id,
-                relative,
-                entry.identity,
-                entry.attributes.clone(),
-                entry.attributes.kind,
-            ),
-        })
+        state.inode_for_remote_path(
+            version,
+            mode,
+            entry.root_id,
+            relative,
+            entry.identity,
+            entry.attributes.clone(),
+            entry.attributes.kind,
+        )
     }
 
     fn lookup_selected_readdir_entry(
@@ -5605,7 +5785,12 @@ impl LocalOwnerFs {
                         Some(&parent.identity),
                     )
                 })?;
-                let inode = self.insert_remote_entry_with_mode(relative, entry.clone(), mode)?;
+                let inode = self.insert_remote_entry_with_mode(
+                    &parent.version,
+                    relative,
+                    entry.clone(),
+                    mode,
+                )?;
                 return Ok(Entry {
                     inode: backend_inode(inode),
                     attributes: entry.attributes,
@@ -5722,6 +5907,9 @@ struct NodeRecord {
     identity: files::FileIdentity,
     attributes: FileAttributes,
     kind: FileKind,
+    /// 所属 workspace 版本的根目录 identity。同名重建后 `root_id` 不变，删除时按它只回收
+    /// 被删版本的记录；为空表示创建记录时本机还没有该 root 的根目录记录。
+    version: files::FileIdentity,
 }
 
 struct OwnerState {
@@ -5789,6 +5977,7 @@ impl OwnerState {
                 NodeRecord {
                     root_id,
                     relative,
+                    version: identity.clone(),
                     identity,
                     attributes,
                     kind: FileKind::Directory,
@@ -5812,36 +6001,97 @@ impl OwnerState {
                 identity: identity.clone(),
                 attributes,
                 kind: FileKind::Directory,
+                version: identity.clone(),
             },
         );
         self.attach_path(&root_id, relative, inode);
         inode
     }
 
-    /// D4: 清除与 root 关联的全部 FUSE 索引。
+    /// D4: 清除 root 被删版本的全部 FUSE 索引，包括已解绑路径的子项记录。
     ///
+    /// 同名重建后 `root_id` 不变，本机可能已有新版本的记录，所以只回收 `version`
+    /// 等于被删版本根目录 identity 的记录；`include_unversioned` 为真时一并回收版本
+    /// 未知的记录，只能由被删版本的 Home 在 workspace 锁内使用。
     /// 已打开的 file/dir handle 不强制关闭；FUSE release/releasedir 在 fd
-    /// 关闭时正常走完。root_id 不在 state 中时是无操作。
-    fn remove_root(&mut self, root_id: &RootId) {
-        let root_inodes: Vec<u64> = self
+    /// 关闭时正常走完。没有匹配记录时是无操作。
+    fn remove_root(
+        &mut self,
+        root_id: &RootId,
+        version: &files::FileIdentity,
+        include_unversioned: bool,
+    ) {
+        let stale: HashSet<u64> = self
             .inodes
             .iter()
-            .filter(|(_, record)| &record.root_id == root_id)
+            .filter(|(_, record)| {
+                &record.root_id == root_id
+                    && (&record.version == version
+                        || (include_unversioned && record.version.0.is_empty()))
+            })
             .map(|(&inode, _)| inode)
             .collect();
-        if root_inodes.is_empty() {
+        if stale.is_empty() {
             return;
         }
-        for inode in &root_inodes {
+        for inode in &stale {
             self.inodes.remove(inode);
             self.aliases.remove(inode);
         }
-        self.root_names
-            .retain(|_, inode| !root_inodes.contains(inode));
-        self.paths.retain(|(rid, _), _| rid != root_id);
-        self.subtrees.remove(root_id);
-        self.identity_members.retain(|(rid, _), _| rid != root_id);
-        self.identities.retain(|(rid, _), _| rid != root_id);
+        self.root_names.retain(|_, inode| !stale.contains(inode));
+        self.paths.retain(|_, inode| !stale.contains(inode));
+        let paths = &self.paths;
+        if let Some(subtree) = self.subtrees.get_mut(root_id) {
+            subtree.retain(|relative| paths.contains_key(&(root_id.clone(), relative.clone())));
+            if subtree.is_empty() {
+                self.subtrees.remove(root_id);
+            }
+        }
+        self.identity_members.retain(|_, members| {
+            members.retain(|inode| !stale.contains(inode));
+            !members.is_empty()
+        });
+        self.identities.retain(|_, inode| !stale.contains(inode));
+    }
+
+    /// 发布远端结果。`version` 是发起请求时父记录所属的 workspace 版本：该版本的根目录
+    /// 记录已不在路径上（已被删除，或已被同名新版本替换）时拒绝，迟到的结果不会留下
+    /// 无法按版本回收的记录。`version` 为空（父记录版本未知）时按当前根目录记录标记。
+    #[allow(clippy::too_many_arguments)]
+    fn inode_for_remote_path(
+        &mut self,
+        version: &files::FileIdentity,
+        mode: LookupIndexMode,
+        root_id: RootId,
+        relative: StoragePath,
+        identity: files::FileIdentity,
+        attributes: FileAttributes,
+        kind: FileKind,
+    ) -> Result<u64> {
+        if !version.0.is_empty() && self.root_version(&root_id) != *version {
+            return Err(stale(
+                "workspace version was deleted before the remote result arrived",
+            ));
+        }
+        Ok(match mode {
+            LookupIndexMode::Ordinary => {
+                self.inode_for_path(root_id, relative, identity, attributes, kind)
+            }
+            LookupIndexMode::ObservedPath => {
+                self.inode_for_observed_path(root_id, relative, identity, attributes, kind)
+            }
+        })
+    }
+
+    /// 本机当前根目录记录的 identity，子项记录以它标记所属版本。
+    fn root_version(&self, root_id: &RootId) -> files::FileIdentity {
+        self.paths
+            .get(&(root_id.clone(), StoragePath::root()))
+            .and_then(|inode| self.inodes.get(inode))
+            .map_or_else(
+                || files::FileIdentity(Vec::new()),
+                |record| record.identity.clone(),
+            )
     }
 
     fn inode_for_path(
@@ -5889,6 +6139,11 @@ impl OwnerState {
             }
             return inode;
         }
+        let version = if relative == StoragePath::root() {
+            identity.clone()
+        } else {
+            self.root_version(&root_id)
+        };
         let inode = self.allocate_inode();
         self.inodes.insert(
             inode,
@@ -5898,6 +6153,7 @@ impl OwnerState {
                 identity: identity.clone(),
                 attributes,
                 kind,
+                version,
             },
         );
         self.attach_path(&root_id, relative, inode);
@@ -7753,6 +8009,7 @@ mod tests {
         root_id: RootId,
         restarted: Arc<AtomicBool>,
         acquire_calls: AtomicUsize,
+        root_removed: AtomicBool,
     }
 
     impl RestartingRemoteMeta {
@@ -7783,7 +8040,7 @@ mod tests {
         }
 
         fn lookup_root(&self, id: &RootId) -> Result<Option<root::RootLocation>> {
-            if id != &self.root_id {
+            if id != &self.root_id || self.root_removed.load(Ordering::SeqCst) {
                 return Ok(None);
             }
             Ok(Some(root::RootLocation {
@@ -7854,6 +8111,11 @@ mod tests {
         releasedir_handles: Mutex<Vec<Vec<u8>>>,
         fail_readdir_once: AtomicBool,
         fail_releasedir_once: AtomicBool,
+        rmdir_root_calls: AtomicUsize,
+        rmdir_root_expected: Mutex<Option<files::FileIdentity>>,
+        rmdir_root_error: Mutex<Option<afs_error::ErrorCode>>,
+        /// 在 Home 生成回复之后、入口处理回复之前执行，用于构造交错。
+        rmdir_root_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl RestartingRemoteFiles {
@@ -8097,6 +8359,15 @@ mod tests {
             _: &RootGrant,
             _: &OsStr,
             _: Option<&files::FileIdentity>,
+            _: &files::FileIdentity,
+        ) -> Result<()> {
+            self.unsupported()
+        }
+
+        fn rmdir_root(
+            &self,
+            _: &RequestContext,
+            _: &RootGrant,
             _: &files::FileIdentity,
         ) -> Result<()> {
             self.unsupported()
@@ -8433,6 +8704,24 @@ mod tests {
             Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
         }
 
+        fn rmdir_root(
+            &self,
+            _: &RequestContext,
+            _: &RootGrant,
+            expected_root: &files::FileIdentity,
+        ) -> Result<()> {
+            self.rmdir_root_calls.fetch_add(1, Ordering::SeqCst);
+            *self.rmdir_root_expected.lock().unwrap() = Some(expected_root.clone());
+            let reply = match *self.rmdir_root_error.lock().unwrap() {
+                Some(code) => Err(Error::coded(code, "injected Home rmdir_root failure")),
+                None => Ok(()),
+            };
+            if let Some(hook) = self.rmdir_root_hook.lock().unwrap().take() {
+                hook();
+            }
+            reply
+        }
+
         fn rename(
             &self,
             _: &RequestContext,
@@ -8633,6 +8922,7 @@ mod tests {
             root_id: root_id.clone(),
             restarted: restarted.clone(),
             acquire_calls: AtomicUsize::new(0),
+            root_removed: AtomicBool::new(false),
         });
         let remote = Arc::new(RestartingRemoteFiles {
             root_id: root_id.clone(),
@@ -8648,6 +8938,10 @@ mod tests {
             releasedir_handles: Mutex::new(Vec::new()),
             fail_readdir_once: AtomicBool::new(false),
             fail_releasedir_once: AtomicBool::new(false),
+            rmdir_root_calls: AtomicUsize::new(0),
+            rmdir_root_expected: Mutex::new(None),
+            rmdir_root_error: Mutex::new(None),
+            rmdir_root_hook: Mutex::new(None),
         });
         let roots = Arc::new(RootManager::new(
             "node-b".into(),
@@ -11661,6 +11955,457 @@ mod tests {
         assert_eq!(remote.releasedir_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// 返回 `(root_names 中有该名字, remote_roots 中有该 root 的 grant)`。
+    fn entry_knows_workspace(fs: &OwnerFs, root_id: &RootId, name: &str) -> (bool, bool) {
+        let local = fs.require_local().unwrap();
+        (
+            local
+                .state
+                .lock()
+                .unwrap()
+                .root_names
+                .contains_key(OsStr::new(name)),
+            local.remote_roots.lock().unwrap().contains_key(root_id),
+        )
+    }
+
+    #[test]
+    fn remote_workspace_rmdir_from_non_home_entry_forwards_to_home_and_forgets_root() {
+        // Issue #88: deleting a workspace through a non-Home entry must reach
+        // Home instead of failing locally with an EBUSY-mapped grant error.
+        let (_temp, fs, ctx, meta, remote, root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        assert_eq!(entry_knows_workspace(&fs, &root_id, "job-42"), (true, true));
+
+        fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap();
+
+        assert_eq!(remote.rmdir_root_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            remote.rmdir_root_expected.lock().unwrap().as_ref(),
+            Some(&remote.entry(FileKind::Directory).identity)
+        );
+        assert_eq!(
+            entry_knows_workspace(&fs, &root_id, "job-42"),
+            (false, false)
+        );
+
+        // The forgotten grant sends the next lookup to Meta, which no longer has it.
+        meta.root_removed.store(true, Ordering::SeqCst);
+        let error = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap_err();
+        assert_eq!(crate::error::errno(&error), libc::ENOENT);
+    }
+
+    #[test]
+    fn remote_workspace_rmdir_failure_is_not_replayed_and_keeps_entry_state() {
+        for (code, errno) in [
+            (afs_error::IO_DIRECTORY_NOT_EMPTY, libc::ENOTEMPTY),
+            (afs_error::CLIENT_CONNECTION_UNAVAILABLE, libc::EHOSTUNREACH),
+            (afs_error::CLIENT_DEADLINE_EXCEEDED, libc::ETIMEDOUT),
+            // Meta 仍有该 root：授权错误不能当成已删除。
+            (afs_error::NODE_OWNER_GRANT_UNAVAILABLE, libc::EHOSTUNREACH),
+        ] {
+            let (_temp, fs, ctx, _meta, remote, root_id) = remote_fixture();
+            let root = BackendInode {
+                value: OWNERFS_ROOT_INODE,
+            };
+            fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+            *remote.rmdir_root_error.lock().unwrap() = Some(code);
+
+            let error = fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap_err();
+
+            assert_eq!(error.code(), code);
+            assert_eq!(crate::error::errno(&error), errno);
+            assert_eq!(remote.rmdir_root_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(entry_knows_workspace(&fs, &root_id, "job-42"), (true, true));
+        }
+    }
+
+    #[test]
+    fn remote_workspace_rmdir_already_gone_on_home_forgets_root() {
+        // (Home 返回的错误, Meta 是否已无该 root)。root 已从 Home 缓存移除时，
+        // validate_peer 先返回 GRANT_UNAVAILABLE；NOT_FOUND 只出现在校验之后的窄窗口。
+        for (code, removed_from_meta) in [
+            (afs_error::NODE_OWNER_GRANT_UNAVAILABLE, true),
+            (afs_error::CLIENT_DEADLINE_EXCEEDED, true),
+            (afs_error::NODE_VFS_NOT_FOUND, false),
+        ] {
+            let (_temp, fs, ctx, meta, remote, root_id) = remote_fixture();
+            let root = BackendInode {
+                value: OWNERFS_ROOT_INODE,
+            };
+            fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+            *remote.rmdir_root_error.lock().unwrap() = Some(code);
+            meta.root_removed.store(removed_from_meta, Ordering::SeqCst);
+
+            let error = fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap_err();
+
+            assert_eq!(error.code(), afs_error::NODE_VFS_NOT_FOUND);
+            assert_eq!(crate::error::errno(&error), libc::ENOENT);
+            assert_eq!(remote.rmdir_root_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                entry_knows_workspace(&fs, &root_id, "job-42"),
+                (false, false)
+            );
+        }
+    }
+
+    #[test]
+    fn remote_workspace_rmdir_reply_after_same_name_recreate_keeps_new_version() {
+        // Home 已生成删除成功的回复，入口清理之前同名 workspace 已重建，本机也已有新版本
+        // 的记录（例如本机成为新 Home 后处理的 peer 请求）。入口只能清除被删版本。
+        let (_temp, fs, ctx, _meta, remote, root_id) = remote_fixture();
+        let fs = Arc::new(fs);
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let old_identity = remote.entry(FileKind::Directory).identity;
+        let attributes = remote.entry(FileKind::Directory).attributes;
+        let new_identity = files::FileIdentity(vec![0xab]);
+        // 被删版本的子项：一个已 unlink（路径已解绑、记录仍在），一个仍挂在路径上。
+        {
+            let mut state = fs.require_local().unwrap().state.lock().unwrap();
+            for (name, id) in [("old-unlinked", 0x01), ("old-attached", 0x02)] {
+                state.inode_for_path(
+                    root_id.clone(),
+                    StoragePath::root()
+                        .join_component(OsStr::new(name))
+                        .unwrap(),
+                    files::FileIdentity(vec![id]),
+                    attributes.clone(),
+                    FileKind::Regular,
+                );
+            }
+            state.remove_path(
+                &root_id,
+                StoragePath::root()
+                    .join_component(OsStr::new("old-unlinked"))
+                    .unwrap(),
+            );
+        }
+        let child = StoragePath::root()
+            .join_component(OsStr::new("new-file"))
+            .unwrap();
+        let weak = Arc::downgrade(&fs);
+        let (hook_root, hook_identity, hook_child) =
+            (root_id.clone(), new_identity.clone(), child.clone());
+        *remote.rmdir_root_hook.lock().unwrap() = Some(Box::new(move || {
+            let fs = weak.upgrade().unwrap();
+            let mut state = fs.require_local().unwrap().state.lock().unwrap();
+            state.insert_root(
+                "job-42".into(),
+                hook_root.clone(),
+                hook_identity,
+                attributes.clone(),
+            );
+            state.inode_for_path(
+                hook_root.clone(),
+                hook_child,
+                files::FileIdentity(vec![0xcd]),
+                attributes.clone(),
+                FileKind::Regular,
+            );
+            // 新版本中已 unlink、但可能仍被打开的文件，也必须保留。
+            let unlinked = StoragePath::root()
+                .join_component(OsStr::new("new-unlinked"))
+                .unwrap();
+            state.inode_for_path(
+                hook_root.clone(),
+                unlinked.clone(),
+                files::FileIdentity(vec![0xce]),
+                attributes,
+                FileKind::Regular,
+            );
+            state.remove_path(&hook_root, unlinked);
+        }));
+
+        fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap();
+
+        assert_eq!(remote.rmdir_root_calls.load(Ordering::SeqCst), 1);
+        let local = fs.require_local().unwrap();
+        let state = local.state.lock().unwrap();
+        let inode = state.root_names[OsStr::new("job-42")];
+        assert_eq!(state.inodes[&inode].identity, new_identity);
+        assert!(state.paths.contains_key(&(root_id.clone(), child)));
+        let mut identities: Vec<_> = state
+            .inodes
+            .values()
+            .filter(|record| record.root_id == root_id)
+            .map(|record| record.identity.clone())
+            .collect();
+        identities.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            identities,
+            [
+                new_identity.clone(),
+                files::FileIdentity(vec![0xcd]),
+                files::FileIdentity(vec![0xce]),
+            ]
+        );
+        assert!(!identities.contains(&old_identity));
+        drop(state);
+        assert!(!local.remote_roots.lock().unwrap().contains_key(&root_id));
+    }
+
+    #[test]
+    fn remote_workspace_rmdir_reclaims_child_records_across_rounds() {
+        // 非 Home 入口反复“创建文件 → 清空 → 删除 workspace → 同名创建”，
+        // 被删版本的子项记录必须随删除回收，记录数不随轮数增长。
+        let (_temp, fs, ctx, _meta, remote, root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let attributes = remote.entry(FileKind::Regular).attributes;
+        for round in 0..3_u8 {
+            fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+            {
+                let mut state = fs.require_local().unwrap().state.lock().unwrap();
+                let child = StoragePath::root()
+                    .join_component(OsStr::new("file"))
+                    .unwrap();
+                state.inode_for_path(
+                    root_id.clone(),
+                    child.clone(),
+                    files::FileIdentity(vec![0x10, round]),
+                    attributes.clone(),
+                    FileKind::Regular,
+                );
+                state.remove_path(&root_id, child);
+            }
+
+            fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap();
+
+            let state = fs.require_local().unwrap().state.lock().unwrap();
+            assert!(state.inodes.is_empty(), "round {round}");
+            assert!(state.paths.is_empty() && state.root_names.is_empty());
+            assert!(state.identities.is_empty() && state.identity_members.is_empty());
+        }
+    }
+
+    #[test]
+    fn remote_result_arriving_after_workspace_cleanup_is_rejected() {
+        // 子项查询在旧版本上发出，Home 已生成回复；回复到达前该版本已被删除并清理，
+        // 之后又同名重建。迟到的结果不能发布成记录，否则无法按版本回收。
+        let (_temp, fs, ctx, _meta, remote, root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let parent = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let local = fs.require_local().unwrap();
+        let old_version = local.record(parent.inode.value).unwrap().version;
+        let child = StoragePath::root()
+            .join_component(OsStr::new("late"))
+            .unwrap();
+        let late = files::OwnerEntry {
+            root_id: root_id.clone(),
+            identity: files::FileIdentity(vec![0x20]),
+            attributes: remote.entry(FileKind::Regular).attributes,
+        };
+
+        fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap();
+
+        // 清理之后到达：本机已没有该版本的根目录记录。
+        let error = local
+            .insert_remote_entry(&old_version, child.clone(), late.clone())
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert!(local.state.lock().unwrap().inodes.is_empty());
+
+        // 同名重建之后到达：根目录记录已属于新版本，旧版本的结果同样拒绝，
+        // 新版本的结果正常发布并标记为新版本。
+        let new_version = files::FileIdentity(vec![0xab]);
+        local.state.lock().unwrap().insert_root(
+            "job-42".into(),
+            root_id.clone(),
+            new_version.clone(),
+            remote.entry(FileKind::Directory).attributes,
+        );
+        let error = local
+            .insert_remote_entry(&old_version, child.clone(), late.clone())
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert_eq!(local.state.lock().unwrap().inodes.len(), 1);
+        let inode = local
+            .insert_remote_entry(&new_version, child, late)
+            .unwrap();
+        assert_eq!(local.record(inode).unwrap().version, new_version);
+    }
+
+    /// Home-side fixture: a real local workspace and the access a peer presents.
+    fn peer_rmdir_root_fixture(
+        rights: Vec<RootRight>,
+    ) -> (
+        tempfile::TempDir,
+        OwnerFs,
+        RequestContext,
+        RootId,
+        files::FileIdentity,
+        PresentedRootAccess,
+    ) {
+        let (temp, fs, ctx) = fixture_with_rights(rights);
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs
+            .mkdir(&ctx, root, OsStr::new("job-peer-rmdir"), 0o755)
+            .unwrap();
+        let record = fs
+            .require_local()
+            .unwrap()
+            .record(workspace.inode.value)
+            .unwrap();
+        let (root_id, identity) = (record.root_id.clone(), record.identity.clone());
+        let mut grant = test_grant(root_id.clone());
+        grant.epoch = fs
+            .require_local()
+            .unwrap()
+            .roots
+            .lookup_root_location(&root_id)
+            .unwrap()
+            .unwrap()
+            .epoch;
+        let access = presented(&grant);
+        // 删除挂载根下的目录需要 root 调用者（挂载根属 root、0755），与本机 FUSE 一致。
+        let ctx = RequestContext {
+            uid: 0,
+            gid: 0,
+            ..ctx
+        };
+        (temp, fs, ctx, root_id, identity, access)
+    }
+
+    fn home_data_dir(temp: &tempfile::TempDir, fs: &OwnerFs, id: &RootId) -> std::path::PathBuf {
+        let data_dir = fs
+            .require_local()
+            .unwrap()
+            .roots
+            .local_root_data_dir(id)
+            .unwrap()
+            .unwrap()
+            .0;
+        temp.path().join(data_dir.as_path())
+    }
+
+    fn assert_workspace_untouched(fs: &OwnerFs, data_dir: &std::path::Path, id: &RootId) {
+        let roots = &fs.require_local().unwrap().roots;
+        assert!(data_dir.is_dir());
+        assert!(roots.lookup_root_location(id).unwrap().is_some());
+        assert!(roots.enter_root(id, RootRight::Lookup).is_ok());
+    }
+
+    #[test]
+    fn peer_rmdir_root_deletes_empty_workspace_on_home() {
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+
+        fs.peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-b", &access, &identity)
+            .unwrap();
+
+        let roots = &fs.require_local().unwrap().roots;
+        assert!(!data_dir.exists());
+        assert!(roots.lookup_root_location(&root_id).unwrap().is_none());
+        assert!(roots.cached_local_roots().unwrap().is_empty());
+        let catalog_records = fs::read_dir(temp.path().join(".ownerfs-roots"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some(OsStr::new("json")))
+            .count();
+        assert_eq!(catalog_records, 0);
+        assert_eq!(
+            entry_knows_workspace(&fs, &root_id, "job-peer-rmdir"),
+            (false, false)
+        );
+        let mount_root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let error = fs
+            .lookup(&ctx, mount_root, OsStr::new("job-peer-rmdir"))
+            .unwrap_err();
+        assert_eq!(crate::error::errno(&error), libc::ENOENT);
+
+        fs.mkdir(&ctx, mount_root, OsStr::new("job-peer-rmdir"), 0o755)
+            .unwrap();
+        let recreated = roots.lookup_root_location(&root_id).unwrap().unwrap();
+        assert!(recreated.epoch > access.epoch);
+    }
+
+    #[test]
+    fn peer_rmdir_root_rejects_without_changing_home_state() {
+        // Stale identity: the workspace was recreated under the same name.
+        let (temp, fs, ctx, root_id, _identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+        let error = fs
+            .peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-b", &access, &files::FileIdentity(vec![0xff]))
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert_workspace_untouched(&fs, &data_dir, &root_id);
+
+        // Wrong authenticated peer: the access was issued to node-b, not node-c.
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+        let error = fs
+            .peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-c", &access, &identity)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+        assert_workspace_untouched(&fs, &data_dir, &root_id);
+
+        // Non-empty: the error comes back and Meta is not deactivated.
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+        fs::write(data_dir.join("payload"), b"x").unwrap();
+        let error = fs
+            .peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-b", &access, &identity)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+        assert_eq!(crate::error::errno(&error), libc::ENOTEMPTY);
+        assert!(data_dir.join("payload").exists());
+        assert_workspace_untouched(&fs, &data_dir, &root_id);
+
+        // The peer holds Write, but the caller it presents may not delete a directory
+        // under the root-owned mount root: Home rechecks it like the kernel does locally.
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+        let user = RequestContext {
+            uid: 1000,
+            gid: 1000,
+            ..ctx
+        };
+        let error = fs
+            .peer_executor()
+            .unwrap()
+            .rmdir_root(&user, "node-b", &access, &identity)
+            .unwrap_err();
+        assert_eq!(crate::error::errno(&error), libc::EACCES);
+        assert_workspace_untouched(&fs, &data_dir, &root_id);
+
+        // A peer holding no Write right cannot end the workspace lifecycle.
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(vec![RootRight::Lookup, RootRight::Read]);
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+        let error = fs
+            .peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-b", &access, &identity)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_RIGHT_DENIED);
+        assert_workspace_untouched(&fs, &data_dir, &root_id);
+    }
+
     #[test]
     fn local_directory_close_never_calls_remote_release() {
         let (_temp, fs, ctx, _meta, remote, _root_id) = remote_fixture();
@@ -12471,6 +13216,53 @@ mod tests {
     }
 
     #[test]
+    fn home_root_lookup_does_not_restore_workspace_deleted_by_peer() {
+        // Home 本机查询根目录读完 metadata 后，另一节点经 RmdirRoot 完成删除，查询随后
+        // 才发布：不能把已删除的根重新写回索引。之后同名重建，旧结果同样不能发布。
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let local = fs.require_local().unwrap();
+        let (data_dir, _) = local.roots.local_root_data_dir(&root_id).unwrap().unwrap();
+        let attributes = attributes_from_metadata(
+            std::fs::metadata(temp.path().join(data_dir.as_path())).unwrap(),
+        )
+        .unwrap();
+        fs.peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-b", &access, &identity)
+            .unwrap();
+
+        let name = OsStr::new("job-peer-rmdir");
+        let error = local
+            .publish_local_root_entry(
+                name,
+                root_id.clone(),
+                &data_dir,
+                identity.clone(),
+                attributes.clone(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_VFS_NOT_FOUND);
+        {
+            let state = local.state.lock().unwrap();
+            assert!(state.root_names.is_empty() && state.inodes.is_empty());
+        }
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        assert!(local.root_directory_entries().unwrap().is_empty());
+
+        let recreated = fs.mkdir(&ctx, root, name, 0o755).unwrap();
+        let error = local
+            .publish_local_root_entry(name, root_id, &data_dir, identity, attributes)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_VFS_NOT_FOUND);
+        let state = local.state.lock().unwrap();
+        assert_eq!(state.root_names[name], recreated.inode.value);
+        assert_eq!(state.inodes.len(), 1);
+    }
+
+    #[test]
     fn freshly_created_root_getattr_uses_real_directory_identity() {
         let (_temp, fs, ctx) = fixture();
         let root = BackendInode {
@@ -12965,6 +13757,10 @@ mod tests {
             releasedir_handles: Mutex::new(Vec::new()),
             fail_readdir_once: AtomicBool::new(false),
             fail_releasedir_once: AtomicBool::new(false),
+            rmdir_root_calls: AtomicUsize::new(0),
+            rmdir_root_expected: Mutex::new(None),
+            rmdir_root_error: Mutex::new(None),
+            rmdir_root_hook: Mutex::new(None),
         });
         let (remote_file, _) = remote::RemoteFiles::open(
             remote.as_ref(),
@@ -13294,7 +14090,7 @@ mod tests {
         fs.require_local()
             .unwrap()
             .roots
-            .delete_root(&binding.root_id)
+            .delete_root(&binding.root_id, None)
             .unwrap();
 
         local
@@ -13314,7 +14110,7 @@ mod tests {
         fs.require_local()
             .unwrap()
             .roots
-            .delete_root(&binding.root_id)
+            .delete_root(&binding.root_id, None)
             .unwrap();
 
         // Re-creating the workspace reuses the name-derived root id but issues a
