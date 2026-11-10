@@ -11,12 +11,15 @@ CAPACITY = 256
 CYCLES = 768
 BATCH = 128
 PROBE = (Path(__file__).resolve().parents[2] / 'tools/fd_inventory.py').read_text()
+# One file per cycle: every published chunk stays live. Rewriting one path would let GC reclaim the
+# superseded versions (R81 F2) and their cached readers with them, so the cache would not stay at its bound.
 PUBLISH = '''
 for index in range(int(sys.argv[2]),int(sys.argv[3])):
  data=hashlib.sha256(('dfs-fd-budget-'+str(index)).encode()).digest()*512
- with open(sys.argv[1],'wb') as stream:
+ path=sys.argv[1]+'.'+str(index)
+ with open(path,'wb') as stream:
   stream.write(data);stream.flush();os.fsync(stream.fileno())
- fd=os.open(sys.argv[1],os.O_RDONLY)
+ fd=os.open(path,os.O_RDONLY)
  try:
   os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED)
   with os.fdopen(os.dup(fd),'rb') as stream:got=stream.read()
@@ -27,7 +30,7 @@ print(json.dumps({'cycles':int(sys.argv[3])-int(sys.argv[2]),'bytes_per_cycle':1
 REUSE = '''
 expected=hashlib.sha256(b'dfs-fd-budget-767').digest()*512
 for _ in range(100):
- fd=os.open(sys.argv[1],os.O_RDONLY)
+ fd=os.open(sys.argv[1]+'.767',os.O_RDONLY)
  try:
   os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED)
   with os.fdopen(os.dup(fd),'rb') as stream:got=stream.read()

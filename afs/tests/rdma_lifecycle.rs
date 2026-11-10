@@ -9,12 +9,12 @@ use std::{
 };
 
 use afs::node::{
+    diagnostics::DiagnosticStorage,
     rpc::{
         control::{RDMA_HANDSHAKE_VERSION, RdmaSessionRegistry, make_control_server},
         data::make_data_server,
         peer::{DataClientOptions, DataMode, connect_data_client},
     },
-    storage::Storage,
 };
 use afs_protocol::{
     node_control::{
@@ -47,7 +47,7 @@ async fn spawn_real_rdma_node(
     tokio::task::JoinHandle<()>,
 ) {
     let temp = tempfile::tempdir().expect("temp dir");
-    let storage = Arc::new(Storage::new(temp.path()).expect("storage"));
+    let storage = Arc::new(DiagnosticStorage::new(temp.path()).expect("storage"));
     let registry = RdmaSessionRegistry::with_ttl(Some(device), ttl);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
@@ -506,7 +506,7 @@ async fn spawn_delayed_rdma_node(
 
 async fn spawn_grpc_data_only_node() -> (tempfile::TempDir, String, tokio::task::JoinHandle<()>) {
     let temp = tempfile::tempdir().expect("temp dir");
-    let storage = Arc::new(Storage::new(temp.path()).expect("storage"));
+    let storage = Arc::new(DiagnosticStorage::new(temp.path()).expect("storage"));
     let registry = RdmaSessionRegistry::new(None);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));

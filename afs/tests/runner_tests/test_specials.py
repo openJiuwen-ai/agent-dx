@@ -30,8 +30,8 @@ class ProfileTests(unittest.TestCase):
             {"copies": True}, {"copies": 3, "node_count": 2}, {"node_count": 1},
             {"write_queue_bytes": 0}, {"write_queue_bytes": 2**40 + 1},
             {"read_crc_mode": 'off"\ndata_dir="/tmp/other'},
-            {"keep_cache": "false"}, {"kernel_readahead_bytes": 2**30},
-            {"native_open_authority": "true"},
+            {"read_crc_mode": "both"},
+            {"kernel_readahead_bytes": 2**30},
             {"readahead_max_bytes": -1},
         ]:
             with self.subTest(values=values), self.assertRaises(ValueError):
@@ -40,9 +40,8 @@ class ProfileTests(unittest.TestCase):
     def test_profile_boolean_and_crc_values_are_valid_toml(self):
         import tomllib
 
-        profile = common.DfsProfile(keep_cache=False, read_crc_mode="receiver", kernel_readahead_bytes=0)
+        profile = common.DfsProfile(read_crc_mode="receiver", kernel_readahead_bytes=0)
         parsed = tomllib.loads(profile.node_config())
-        self.assertIs(parsed["dfs_fuse_keep_cache"], False)
         self.assertEqual(parsed["dfs_read_crc_mode"], "receiver")
 
     def test_explicit_two_node_case_does_not_require_an_unused_c(self):
@@ -70,8 +69,8 @@ class ProfileTests(unittest.TestCase):
         basic = common.select(cases, suite="all-basic")
         self.assertEqual(len(basic), 23)
         self.assertTrue(all(c.profile is None and c.purpose == "functional" for c in basic))
-        self.assertEqual(len(common.select(cases, suite="local-write-special")), 5)
-        self.assertEqual(len(common.select(cases, suite="cluster-read-special")), 5)
+        self.assertEqual(len(common.select(cases, suite="local-write-special")), 6)
+        self.assertEqual(len(common.select(cases, suite="cluster-read-special")), 4)
         specials = common.select(cases, suite="all-special")
         self.assertEqual(len(specials), 20)
         self.assertTrue(all(c.purpose == "functional" for c in specials))

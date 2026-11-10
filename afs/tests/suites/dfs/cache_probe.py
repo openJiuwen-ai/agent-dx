@@ -187,10 +187,10 @@ class Probe:
             evidence = emit("H2.conflict", {"open": event, "read_callbacks_before": before,
                                            "read_callbacks_after": self.counter(), "content": checked})
             assert_conflict_direct(evidence)
-            # Legacy (open-authority=false) path retains its existing uncached-tail behavior.
+            # Decision 4a (S1a-6): H1 stays pinned to V1, also for bytes it never cached.
             tail = 12 * 1024**2
-            assert os.pread(first, 4096, tail) == newer[tail:tail + 4096]
-            emit("H1.legacy_tail", {"bytes": 4096, "matches_V2": True, "snapshot_promise_added": False})
+            assert os.pread(first, 4096, tail) == body[tail:tail + 4096]
+            emit("H1.pinned_tail", {"bytes": 4096, "matches_V1": True})
             third, event = self.opened(b, "H3.V2.conflict")
             before = self.counter()
             checked = self.full(third, newer)

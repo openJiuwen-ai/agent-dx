@@ -17,7 +17,7 @@ case "$component" in
     export RUST_TEST_THREADS=1
     ;;
   afs)
-    packages=(afs afs-client afs-error afs-logging afs-metrics afs-protocol afs-tracing afs-transport)
+    packages=(afs afs-client afs-error afs-logging afs-metrics afs-protocol afs-tracing afs-transport afs-tools)
     ;;
   *) echo "unknown component: $component" >&2; exit 2 ;;
 esac

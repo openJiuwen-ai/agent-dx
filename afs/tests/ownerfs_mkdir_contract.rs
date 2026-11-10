@@ -15,11 +15,7 @@ use afs::{
         store::{Store, local_log::LocalLog},
     },
     node::{
-        rpc::{
-            control::{NodeControlService, RdmaSessionRegistry},
-            data::MtlsPeerAuthenticator,
-            meta::GrpcRootMeta,
-        },
+        rpc::{control::OwnerControlService, data::MtlsPeerAuthenticator, meta::GrpcRootMeta},
         storage::LocalFs,
         vfs::ownerfs::{
             OwnerFs,
@@ -35,7 +31,7 @@ use afs_protocol::{
         meta_client::MetaClient, meta_server::MetaServer, owner_roots_client::OwnerRootsClient,
         owner_roots_server::OwnerRootsServer,
     },
-    node_control::{PrepareOwnerRootRequest, node_control_client::NodeControlClient},
+    node_control::{PrepareOwnerRootRequest, owner_control_client::OwnerControlClient},
 };
 use afs_transport::{SecurityManager, TlsConfig};
 use tempfile::TempDir;
@@ -330,6 +326,7 @@ impl Fixture {
                     ..Default::default()
                 }),
                 lease_seconds: 300,
+                protocol_version: afs::format::version::NODE_META_PROTOCOL,
             })
             .await
             .unwrap();
@@ -373,7 +370,7 @@ impl Fixture {
             )
             .unwrap(),
         );
-        let service = NodeControlService::new(RdmaSessionRegistry::new(None))
+        let service = OwnerControlService::new(Default::default())
             .with_owner_locks(fs.peer_executor().unwrap(), authenticator)
             .into_server();
         let security = SecurityManager::new(self.certs.root_meta_tls("node-b")).unwrap();
@@ -426,14 +423,14 @@ impl Fixture {
     }
 
     async fn prepare(&self, home: &Home, node: &str, reservation: &RootReservation) {
-        NodeControlClient::new(self.certs.channel(&home.endpoint, node).await)
+        OwnerControlClient::new(self.certs.channel(&home.endpoint, node).await)
             .prepare_owner_root(self.prepare_request(reservation))
             .await
             .unwrap();
     }
 
     async fn reject_prepare(&self, home: &Home, node: &str, reservation: &RootReservation) {
-        let error = NodeControlClient::new(self.certs.channel(&home.endpoint, node).await)
+        let error = OwnerControlClient::new(self.certs.channel(&home.endpoint, node).await)
             .prepare_owner_root(self.prepare_request(reservation))
             .await
             .unwrap_err();
@@ -524,7 +521,7 @@ async fn persistent_mtls_prepare_replay_preserves_identity_and_permissions() {
             .is_none()
     );
     let unauthorized =
-        NodeControlClient::new(fixture.certs.channel(&home.endpoint, "unknown-node").await)
+        OwnerControlClient::new(fixture.certs.channel(&home.endpoint, "unknown-node").await)
             .prepare_owner_root(fixture.prepare_request(&reservation))
             .await
             .unwrap_err();
@@ -541,7 +538,7 @@ async fn persistent_mtls_prepare_replay_preserves_identity_and_permissions() {
     assert!(reused.already_reserved_by_same_intent);
     assert_eq!(reused.reservation.as_ref(), Some(&reservation));
     fixture.prepare(&home, "node-a", &reservation).await;
-    let duplicate = NodeControlClient::new(fixture.certs.channel(&home.endpoint, "node-a").await)
+    let duplicate = OwnerControlClient::new(fixture.certs.channel(&home.endpoint, "node-a").await)
         .prepare_owner_root(PrepareOwnerRootRequest {
             reservation: Some(reservation.clone()),
             name: root_name(&reservation.root_id),

@@ -1,6 +1,8 @@
 # DFS Plan
 
-- 状态：Draft for discussion
+- 状态：**历史（2026-10-27 规划草案）**。本文保留当时的主题与阶段划分，不再维护；其中多项已落地或已调整，
+  当前能力、支持矩阵与已知限制以 [支持边界与已知限制](../architecture/afs-support-boundary.md) 为准，
+  与当时规划不同之处见文末"2026-11-09 核对"。
 - 范围：AFS DistributedFs（DFS），不含 OwnerFs
 - 最后更新：2026-10-27
 - 主题矩阵见 [afs-roadmap.md](afs-roadmap.md)
@@ -184,3 +186,13 @@ AFS DFS 面向 Agent 场景的“一写多读”分布式文件。已提交数�
 - 性能：沿用现有 DFS 性能测量合同；不以单次样本或不同口径的数字宣称达标。
 - 结论分级：编译通过 ≠ 功能通过 ≠ 测量完成 ≠ 性能改善 ≠ 最终达标。
 - 证据：目标仓源码、二进制、配置、环境、用例和结果一起登记。
+
+## 2026-11-09 核对（相对上文规划，以代码 `refactor-afs-dfs` 为准）
+
+- **已落地**：etcd／Redis 作为 Meta 操作日志后端（Meta 仍单进程）；副本节点故障时的降级写与异步补齐；后台巡检读盘（scrub）；
+  S3 引用感知回收；readdir 分页（百万项）；usrbio 已在树内（含 POSIX fd 导入与客户端崩溃回收）；
+  `user.*` xattr、本机文件锁、`copy_file_range`（元数据 COW 范围克隆）、`lseek` 数据／空洞（内核回退）；
+  24 个本机故障场景入库（`afs/tests/suites/dfs/test_faults.py`，进程被杀、擦盘、满盘、对象存储挂起、Redis／etcd 被杀等，非真实网络分区）。
+- **仍未做**：跨主机三副本的真实故障域验收、Meta HA／多 Meta、24 小时长稳、元数据备份／恢复、fsck 工具链、
+  fallocate／punch hole、readdirplus、POSIX ACL、配额、快照、回收站、K8s CSI、客户端条带、多租户与审计。
+- 外部 S3 后端已在支持矩阵内，"S3 后端 Next"与"S3 外部后端（实验）"两处说法均已过期。

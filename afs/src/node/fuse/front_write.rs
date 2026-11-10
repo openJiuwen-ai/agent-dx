@@ -3,7 +3,7 @@
 use libc::{E2BIG, EAGAIN, EIO};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc, Condvar, Mutex,
+    Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -11,7 +11,52 @@ use std::thread::{self, JoinHandle};
 type Job = Box<dyn FnMut() -> Result<(), i32> + Send>;
 type Admission = Box<dyn FnOnce(Result<(), i32>) + Send>;
 type RecoveryStart = Box<dyn FnOnce(CallbackGuard) + Send>;
-const MAX_WAITING_ENTRIES: usize = 4096;
+/// Acknowledged (admitted) entries the worker may hold, including retained
+/// failures. Beyond it a write waits with its reply withheld, like a body-quota
+/// wait; it is not rejected.
+const MAX_ADMITTED_ENTRIES: usize = 4096;
+/// Hard bound on withheld entries. Each blocks one application write (or one
+/// kernel background request), so it is reached only far beyond the kernel's
+/// in-flight requests.
+const MAX_PENDING_ENTRIES: usize = 65_536;
+
+/// Admission outcomes counted per mount. `admitted` replies at once;
+/// `waited` replied after a withheld wait; the rest are rejections by reason.
+pub(super) const ADMISSION_OUTCOMES: &[&str] = &[
+    "admitted",
+    "waited",
+    "rejected_total_bytes",
+    "rejected_entries",
+    "rejected_retained_failure",
+    "rejected_file_error",
+    "rejected_too_large",
+    "rejected_closing",
+    "rejected_control",
+];
+
+#[derive(Clone, Copy)]
+enum Outcome {
+    Admitted,
+    Waited,
+    TotalBytes,
+    Entries,
+    RetainedFailure,
+    FileError,
+    TooLarge,
+    Closing,
+    Control,
+}
+
+impl Outcome {
+    fn label(self) -> &'static str {
+        ADMISSION_OUTCOMES[self as usize]
+    }
+}
+
+struct AdmissionMetrics {
+    counter: afs_metrics::IntCounterVec,
+    filesystem: &'static str,
+}
 
 struct Waiter {
     inode: u64,
@@ -34,6 +79,9 @@ struct State {
     peak_bytes: usize,
     peak_pending_bytes: usize,
     peak_entries: usize,
+    peak_pending_entries: usize,
+    /// Entries whose reply is withheld (`admission.is_some()`).
+    pending_entries: usize,
     next_sequence: u64,
     waiters: Vec<Waiter>,
     active: Option<(u64, u64)>,
@@ -46,13 +94,68 @@ struct Shared {
     changed: Condvar,
     limit: usize,
     admitted_limit: usize,
+    max_entries: usize,
+    metrics: OnceLock<AdmissionMetrics>,
 }
+
+impl Shared {
+    fn count(&self, outcome: Outcome) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .counter
+                .with_label_values(&[metrics.filesystem, outcome.label()])
+                .inc();
+        }
+    }
+}
+/// How a callback holds the gate. Shared holders of the same file (or of the
+/// namespace) overlap; an exclusive holder excludes every other holder of
+/// that file (or every holder of the mount). Waiting exclusive holders stop
+/// new shared entrants, so a stream of readers cannot starve a writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GateAccess {
+    Shared,
+    Exclusive,
+}
+
 #[derive(Default)]
 struct GateState {
+    /// Files held exclusively (writes, resizes, syncs, recoveries).
     files: HashSet<u64>,
+    /// Shared holders per file (reads and attribute queries).
+    readers: HashMap<u64, usize>,
+    /// Exclusive entrants waiting per file; they block new shared entrants.
+    exclusive_waiters: HashMap<u64, usize>,
+    /// A namespace change holds the whole mount.
     namespace: bool,
+    /// Path lookups in flight; they exclude only namespace changes.
+    namespace_readers: usize,
     namespace_waiters: usize,
     recoveries: VecDeque<(u64, RecoveryStart)>,
+}
+
+impl GateState {
+    fn file_busy(&self, file: u64) -> bool {
+        self.files.contains(&file) || self.readers.get(&file).is_some_and(|count| *count != 0)
+    }
+
+    fn any_file_holder(&self) -> bool {
+        !self.files.is_empty() || !self.readers.is_empty()
+    }
+}
+
+fn decrement(map: &mut HashMap<u64, usize>, key: u64) {
+    if let Some(count) = map.get_mut(&key) {
+        *count -= 1;
+        if *count == 0 {
+            map.remove(&key);
+        }
+    }
+}
+
+enum Held {
+    Files { files: Vec<u64>, access: GateAccess },
+    Namespace(GateAccess),
 }
 #[derive(Default)]
 struct Gates {
@@ -67,7 +170,7 @@ impl Drop for ControlLease {
 }
 pub(super) struct CallbackGuard {
     gates: Arc<Gates>,
-    files: Option<Vec<u64>>,
+    held: Held,
     _control: Option<ControlLease>,
 }
 impl Gates {
@@ -76,7 +179,7 @@ impl Gates {
         let mut index = 0;
         while index < state.recoveries.len() {
             let file = state.recoveries[index].0;
-            if !state.files.contains(&file) {
+            if !state.file_busy(file) {
                 if let Some(item) = state.recoveries.remove(index) {
                     state.files.insert(file);
                     ready.push(item);
@@ -91,7 +194,10 @@ impl Gates {
         for (inode, start) in ready {
             start(CallbackGuard {
                 gates: self.clone(),
-                files: Some(vec![inode]),
+                held: Held::Files {
+                    files: vec![inode],
+                    access: GateAccess::Exclusive,
+                },
                 _control: None,
             });
         }
@@ -112,12 +218,25 @@ impl Drop for CallbackGuard {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(files) = &self.files {
-            for file in files {
-                state.files.remove(file);
+        match &self.held {
+            Held::Files {
+                files,
+                access: GateAccess::Exclusive,
+            } => {
+                for file in files {
+                    state.files.remove(file);
+                }
             }
-        } else {
-            state.namespace = false;
+            Held::Files {
+                files,
+                access: GateAccess::Shared,
+            } => {
+                for file in files {
+                    decrement(&mut state.readers, *file);
+                }
+            }
+            Held::Namespace(GateAccess::Exclusive) => state.namespace = false,
+            Held::Namespace(GateAccess::Shared) => state.namespace_readers -= 1,
         }
         let ready = Gates::ready(&mut state);
         self.gates.changed.notify_all();
@@ -140,7 +259,15 @@ impl FrontWriteQueue {
     }
 
     fn with_limits(admitted_limit: usize, reserve: usize) -> Result<Self, i32> {
-        if admitted_limit == 0 {
+        Self::with_entry_limit(admitted_limit, reserve, MAX_ADMITTED_ENTRIES)
+    }
+
+    fn with_entry_limit(
+        admitted_limit: usize,
+        reserve: usize,
+        max_entries: usize,
+    ) -> Result<Self, i32> {
+        if admitted_limit == 0 || max_entries == 0 {
             return Err(E2BIG);
         }
         let limit = admitted_limit.checked_add(reserve).ok_or(E2BIG)?;
@@ -149,6 +276,8 @@ impl FrontWriteQueue {
             changed: Condvar::new(),
             limit,
             admitted_limit,
+            max_entries,
+            metrics: OnceLock::new(),
         });
         let work = shared.clone();
         let worker = thread::Builder::new()
@@ -162,11 +291,26 @@ impl FrontWriteQueue {
             worker: Mutex::new(Some(worker)),
         })
     }
-    /// File callbacks exclude only the same inode. Namespace operations retain
-    /// their conservative exclusive barrier; recovery bypasses that admission gate.
+    /// Count admission outcomes into the mount's FUSE metrics.
+    pub(super) fn set_metrics(
+        &self,
+        counter: afs_metrics::IntCounterVec,
+        filesystem: &'static str,
+    ) {
+        let _ = self.shared.metrics.set(AdmissionMetrics {
+            counter,
+            filesystem,
+        });
+    }
+    /// File callbacks exclude only the same inode: shared callbacks overlap,
+    /// an exclusive one excludes every other callback on that inode. A
+    /// namespace change excludes every callback on the mount; a shared
+    /// namespace callback (path lookup) excludes only namespace changes.
+    /// Recovery bypasses the namespace gate.
     pub(super) fn enter(
         &self,
         files: Option<&[u64]>,
+        access: GateAccess,
         recovery: bool,
     ) -> Result<CallbackGuard, i32> {
         let mut files = files.map(<[u64]>::to_vec);
@@ -175,36 +319,74 @@ impl FrontWriteQueue {
             files.dedup();
         }
         let mut state = self.gates.state.lock().map_err(|_| EIO)?;
-        if files.is_none() {
-            state.namespace_waiters += 1;
+        let mut waiting = true;
+        match (&files, access) {
+            (None, GateAccess::Exclusive) => state.namespace_waiters += 1,
+            (Some(files), GateAccess::Exclusive) => {
+                for file in files {
+                    *state.exclusive_waiters.entry(*file).or_default() += 1;
+                }
+            }
+            _ => waiting = false,
         }
         loop {
-            let blocked = match &files {
-                Some(files) => {
+            let namespace_closed = state.namespace || state.namespace_waiters != 0;
+            let blocked = match (&files, access) {
+                (Some(files), access) => {
                     files.iter().any(|file| {
-                        state.files.contains(file)
-                            || state.recoveries.iter().any(|(waiting, _)| waiting == file)
-                    }) || (!recovery && (state.namespace || state.namespace_waiters != 0))
+                        let recovering =
+                            state.recoveries.iter().any(|(waiting, _)| waiting == file);
+                        match access {
+                            GateAccess::Exclusive => state.file_busy(*file) || recovering,
+                            GateAccess::Shared => {
+                                state.files.contains(file)
+                                    || recovering
+                                    || state.exclusive_waiters.contains_key(file)
+                            }
+                        }
+                    }) || (!recovery && namespace_closed)
                 }
-                None => state.namespace || !state.files.is_empty(),
+                (None, GateAccess::Exclusive) => {
+                    state.namespace || state.namespace_readers != 0 || state.any_file_holder()
+                }
+                (None, GateAccess::Shared) => namespace_closed,
             };
             if !blocked {
                 break;
             }
             state = self.gates.changed.wait(state).map_err(|_| EIO)?;
         }
-        match &files {
-            Some(files) => {
-                state.files.extend(files);
+        let held = match (files, access) {
+            (Some(files), GateAccess::Exclusive) => {
+                for file in &files {
+                    if waiting {
+                        decrement(&mut state.exclusive_waiters, *file);
+                    }
+                    state.files.insert(*file);
+                }
+                Held::Files { files, access }
             }
-            None => {
+            (Some(files), GateAccess::Shared) => {
+                for file in &files {
+                    *state.readers.entry(*file).or_default() += 1;
+                }
+                Held::Files { files, access }
+            }
+            (None, GateAccess::Exclusive) => {
                 state.namespace_waiters -= 1;
                 state.namespace = true;
+                Held::Namespace(access)
             }
-        }
+            (None, GateAccess::Shared) => {
+                state.namespace_readers += 1;
+                Held::Namespace(access)
+            }
+        };
+        // Leaving the waiter set can admit blocked shared entrants.
+        self.gates.changed.notify_all();
         Ok(CallbackGuard {
             gates: self.gates.clone(),
-            files,
+            held,
             _control: None,
         })
     }
@@ -222,6 +404,7 @@ impl FrontWriteQueue {
         let lease = ControlLease(self.controls.clone());
         if previous >= 4096 && !closing {
             drop(lease);
+            self.shared.count(Outcome::Control);
             ready(None, Err(EAGAIN));
             return;
         }
@@ -299,6 +482,26 @@ impl FrontWriteQueue {
             .iter()
             .position(|entry| entry.admission.is_none() && !state.errors.contains_key(&entry.inode))
     }
+    /// Acknowledged entries held in the queue (executing entry excluded).
+    fn admitted_entries(state: &State) -> usize {
+        state.entries.len() - state.pending_entries
+    }
+    /// Whether retained failures of other files alone leave no room for
+    /// `bytes`: then draining healthy entries can never admit the write.
+    fn failures_block(shared: &Shared, state: &State, inode: u64, bytes: usize) -> bool {
+        if state.errors.keys().all(|failed| *failed == inode) {
+            return false;
+        }
+        let (mut failed_bytes, mut failed_entries) = (0usize, 0usize);
+        for entry in &state.entries {
+            if entry.admission.is_none() && state.errors.contains_key(&entry.inode) {
+                failed_bytes += entry.bytes;
+                failed_entries += 1;
+            }
+        }
+        failed_entries >= shared.max_entries
+            || bytes > shared.admitted_limit.saturating_sub(failed_bytes)
+    }
     fn admissions(shared: &Shared, state: &mut State) -> Vec<(Admission, Result<(), i32>)> {
         let mut callbacks = Vec::new();
         let mut index = 0;
@@ -310,18 +513,20 @@ impl FrontWriteQueue {
                 continue;
             }
             let error = if state.closing {
-                Some(EIO)
+                Some((Outcome::Closing, EIO))
             } else if let Some(error) = state.errors.get(&entry.inode) {
-                Some(*error)
-            } else if !state.errors.is_empty() {
-                Some(EAGAIN)
+                Some((Outcome::FileError, *error))
+            } else if Self::failures_block(shared, state, entry.inode, entry.bytes) {
+                Some((Outcome::RetainedFailure, EAGAIN))
             } else {
                 None
             };
-            if let Some(error) = error {
+            if let Some((outcome, error)) = error {
+                shared.count(outcome);
                 if let Some(mut entry) = state.entries.remove(index) {
                     let bytes = entry.bytes;
                     if let Some(callback) = entry.admission.take() {
+                        state.pending_entries -= 1;
                         callbacks.push((callback, Err(error)));
                     }
                     drop(entry);
@@ -333,9 +538,11 @@ impl FrontWriteQueue {
             let inode = entry.inode;
             if !blocked.contains(&inode)
                 && bytes <= shared.admitted_limit.saturating_sub(state.admitted_bytes)
+                && Self::admitted_entries(state) < shared.max_entries
             {
                 if let Some(callback) = state.entries[index].admission.take() {
                     state.admitted_bytes += bytes;
+                    state.pending_entries -= 1;
                     callbacks.push((callback, Ok(())));
                 }
             } else {
@@ -415,6 +622,9 @@ impl FrontWriteQueue {
         state.bytes += bytes;
         if admission.is_none() {
             state.admitted_bytes += bytes;
+        } else {
+            state.pending_entries += 1;
+            state.peak_pending_entries = state.peak_pending_entries.max(state.pending_entries);
         }
         state.peak_bytes = state.peak_bytes.max(state.bytes);
         state.peak_pending_bytes = state
@@ -444,41 +654,68 @@ impl FrontWriteQueue {
         // retain their callback until promotion. Both run outside the state lock.
         let mut callback: Option<Admission> = Some(Box::new(admitted));
         let result = (|| {
-            let mut state = self.shared.state.lock().map_err(|_| EIO)?;
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .map_err(|_| (Outcome::Closing, EIO))?;
             if state.closing || state.closed {
-                return Err(EIO);
+                return Err((Outcome::Closing, EIO));
             }
             if let Some(error) = state.errors.get(&inode) {
-                return Err(*error);
+                return Err((Outcome::FileError, *error));
             }
             if bytes > self.shared.admitted_limit {
-                return Err(E2BIG);
+                return Err((Outcome::TooLarge, E2BIG));
             }
-            if bytes > self.shared.limit.saturating_sub(state.bytes)
-                || state.entries.len() >= MAX_WAITING_ENTRIES
-            {
-                return Err(EAGAIN);
+            if bytes > self.shared.limit.saturating_sub(state.bytes) {
+                return Err((Outcome::TotalBytes, EAGAIN));
             }
             let pending = bytes
                 > self
                     .shared
                     .admitted_limit
                     .saturating_sub(state.admitted_bytes)
+                || Self::admitted_entries(&state) >= self.shared.max_entries
                 || state
                     .entries
                     .iter()
                     .any(|entry| entry.inode == inode && entry.admission.is_some());
-            if pending && !state.errors.is_empty() {
-                return Err(EAGAIN);
+            if pending && state.pending_entries >= MAX_PENDING_ENTRIES {
+                return Err((Outcome::Entries, EAGAIN));
             }
-            let job = make()?;
-            let admission = if pending { callback.take() } else { None };
+            if pending && Self::failures_block(&self.shared, &state, inode, bytes) {
+                return Err((Outcome::RetainedFailure, EAGAIN));
+            }
+            let job = make().map_err(|error| (Outcome::FileError, error))?;
+            let admission = if pending {
+                callback.take().map(|ready| {
+                    let shared = self.shared.clone();
+                    Box::new(move |result: Result<(), i32>| {
+                        if result.is_ok() {
+                            shared.count(Outcome::Waited);
+                        }
+                        ready(result);
+                    }) as Admission
+                })
+            } else {
+                None
+            };
             Self::record_entry(&mut state, inode, handle, bytes, job, admission);
             self.shared.changed.notify_all();
             Ok(())
         })();
         if let Some(callback) = callback {
-            callback(result);
+            match result {
+                Ok(()) => {
+                    self.shared.count(Outcome::Admitted);
+                    callback(Ok(()));
+                }
+                Err((outcome, error)) => {
+                    self.shared.count(outcome);
+                    callback(Err(error));
+                }
+            }
         }
     }
     #[cfg(test)]
@@ -500,7 +737,8 @@ impl FrontWriteQueue {
             if let Some(error) = state.errors.get(&inode) {
                 return Err(*error);
             }
-            if bytes <= self.shared.limit - state.bytes && state.entries.len() < MAX_WAITING_ENTRIES
+            if bytes <= self.shared.limit - state.bytes
+                && state.entries.len() < self.shared.max_entries
             {
                 break;
             }
@@ -565,6 +803,7 @@ impl FrontWriteQueue {
                 if let Some(mut entry) = state.entries.remove(index) {
                     let bytes = entry.bytes;
                     if let Some(callback) = entry.admission.take() {
+                        state.pending_entries -= 1;
                         callbacks.push((callback, Err(EIO)));
                     } else {
                         state.admitted_bytes -= bytes;
@@ -600,10 +839,12 @@ impl FrontWriteQueue {
         state.entries.clear();
         state.bytes = 0;
         state.admitted_bytes = 0;
+        state.pending_entries = 0;
         afs_logging::info!("fuse.front_write_summary";
             "peak_bytes" => state.peak_bytes as u64,
             "peak_pending_bytes" => state.peak_pending_bytes as u64,
             "peak_entries" => state.peak_entries as u64,
+            "peak_pending_entries" => state.peak_pending_entries as u64,
             "limit_bytes" => self.shared.limit as u64,
             "admitted_limit_bytes" => self.shared.admitted_limit as u64,
         );
@@ -1013,7 +1254,7 @@ mod tests {
             Err(EAGAIN)
         );
         // Neither registration nor recovery needs body capacity or another thread.
-        drop(q.enter(Some(&[1]), true).unwrap());
+        drop(q.enter(Some(&[1]), GateAccess::Exclusive, true).unwrap());
         q.wait(Some(2), true).unwrap();
         release_tx.send(()).unwrap();
         assert_eq!(
@@ -1063,7 +1304,7 @@ mod tests {
             tail_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Err(EIO)
         );
-        let _gate = q.enter(Some(&[1]), true).unwrap();
+        let _gate = q.enter(Some(&[1]), GateAccess::Exclusive, true).unwrap();
         q.wait(Some(1), true).unwrap();
         q.release_handle(1, 11, true);
         assert!(!q.has_pending());
@@ -1092,7 +1333,7 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Err(EAGAIN)
         );
-        let close = q.enter(Some(&[1]), true).unwrap();
+        let close = q.enter(Some(&[1]), GateAccess::Exclusive, true).unwrap();
         assert_eq!(q.wait(Some(1), true), Err(libc::ENOSPC));
         q.release_handle(1, 11, true);
         drop(close);
@@ -1110,19 +1351,157 @@ mod tests {
     #[test]
     fn file_gates_are_independent_and_recovery_bypasses_namespace_gate() {
         let q = FrontWriteQueue::with_limits(56, 8).unwrap();
-        let a = q.enter(Some(&[1]), false).unwrap();
-        drop(q.enter(Some(&[2]), false).unwrap());
+        let a = q.enter(Some(&[1]), GateAccess::Exclusive, false).unwrap();
+        drop(q.enter(Some(&[2]), GateAccess::Exclusive, false).unwrap());
         drop(a);
-        let namespace = q.enter(None, false).unwrap();
-        drop(q.enter(Some(&[1]), true).unwrap());
+        let namespace = q.enter(None, GateAccess::Exclusive, false).unwrap();
+        drop(q.enter(Some(&[1]), GateAccess::Exclusive, true).unwrap());
         drop(namespace);
-        drop(q.enter(Some(&[2, 1, 2]), false).unwrap());
+        drop(
+            q.enter(Some(&[2, 1, 2]), GateAccess::Exclusive, false)
+                .unwrap(),
+        );
+    }
+
+    /// Runs `enter` on another thread; `Ok(())` arrives once it is admitted.
+    fn enter_later(
+        q: &Arc<FrontWriteQueue>,
+        files: Option<Vec<u64>>,
+        access: GateAccess,
+    ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (leave_tx, leave_rx) = mpsc::channel::<()>();
+        let q = q.clone();
+        std::thread::spawn(move || {
+            let guard = q.enter(files.as_deref(), access, false).unwrap();
+            entered_tx.send(()).unwrap();
+            let _ = leave_rx.recv();
+            drop(guard);
+        });
+        (entered_rx, leave_tx)
+    }
+
+    const ADMIT: Duration = Duration::from_secs(2);
+    const HELD: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn shared_file_callbacks_overlap_on_one_inode() {
+        let q = FrontWriteQueue::with_limits(56, 8).unwrap();
+        let first = q.enter(Some(&[1]), GateAccess::Shared, false).unwrap();
+        let second = q.enter(Some(&[1]), GateAccess::Shared, false).unwrap();
+        drop((first, second));
+        drop(q.enter(Some(&[1]), GateAccess::Exclusive, false).unwrap());
+    }
+
+    #[test]
+    fn exclusive_file_callback_waits_for_readers_and_fences_new_ones() {
+        let q = Arc::new(FrontWriteQueue::with_limits(56, 8).unwrap());
+        let reader = q.enter(Some(&[1]), GateAccess::Shared, false).unwrap();
+        let (writer_in, writer_out) = enter_later(&q, Some(vec![1]), GateAccess::Exclusive);
+        assert!(
+            writer_in.recv_timeout(HELD).is_err(),
+            "writer overlapped a reader"
+        );
+        // The waiting writer fences later readers of the same inode only.
+        let (late_in, late_out) = enter_later(&q, Some(vec![1]), GateAccess::Shared);
+        assert!(
+            late_in.recv_timeout(HELD).is_err(),
+            "reader overtook a waiting writer"
+        );
+        drop(q.enter(Some(&[2]), GateAccess::Shared, false).unwrap());
+        drop(reader);
+        writer_in.recv_timeout(ADMIT).unwrap();
+        assert!(
+            late_in.recv_timeout(HELD).is_err(),
+            "reader overlapped a writer"
+        );
+        writer_out.send(()).unwrap();
+        late_in.recv_timeout(ADMIT).unwrap();
+        late_out.send(()).unwrap();
+    }
+
+    #[test]
+    fn path_lookups_overlap_file_callbacks_but_not_namespace_changes() {
+        let q = Arc::new(FrontWriteQueue::with_limits(56, 8).unwrap());
+        let file = q.enter(Some(&[1]), GateAccess::Exclusive, false).unwrap();
+        let lookup = q.enter(None, GateAccess::Shared, false).unwrap();
+        drop(q.enter(None, GateAccess::Shared, false).unwrap());
+        drop(file);
+        let (change_in, change_out) = enter_later(&q, None, GateAccess::Exclusive);
+        assert!(
+            change_in.recv_timeout(HELD).is_err(),
+            "namespace change overlapped a lookup"
+        );
+        drop(lookup);
+        change_in.recv_timeout(ADMIT).unwrap();
+        let (lookup_in, lookup_out) = enter_later(&q, None, GateAccess::Shared);
+        assert!(
+            lookup_in.recv_timeout(HELD).is_err(),
+            "lookup overlapped a namespace change"
+        );
+        change_out.send(()).unwrap();
+        lookup_in.recv_timeout(ADMIT).unwrap();
+        lookup_out.send(()).unwrap();
+    }
+
+    #[test]
+    fn waiting_namespace_change_fences_new_lookups_and_file_callbacks() {
+        let q = Arc::new(FrontWriteQueue::with_limits(56, 8).unwrap());
+        let reader = q.enter(Some(&[1]), GateAccess::Shared, false).unwrap();
+        let (change_in, change_out) = enter_later(&q, None, GateAccess::Exclusive);
+        assert!(
+            change_in.recv_timeout(HELD).is_err(),
+            "namespace change overlapped a reader"
+        );
+        let (lookup_in, lookup_out) = enter_later(&q, None, GateAccess::Shared);
+        let (other_in, other_out) = enter_later(&q, Some(vec![2]), GateAccess::Shared);
+        assert!(
+            lookup_in.recv_timeout(HELD).is_err(),
+            "lookup overtook a waiting change"
+        );
+        assert!(
+            other_in.recv_timeout(HELD).is_err(),
+            "reader overtook a waiting change"
+        );
+        drop(reader);
+        change_in.recv_timeout(ADMIT).unwrap();
+        change_out.send(()).unwrap();
+        lookup_in.recv_timeout(ADMIT).unwrap();
+        other_in.recv_timeout(ADMIT).unwrap();
+        lookup_out.send(()).unwrap();
+        other_out.send(()).unwrap();
+    }
+
+    #[test]
+    fn recovery_waits_for_readers_and_fences_new_readers() {
+        let q = FrontWriteQueue::with_limits(56, 8).unwrap();
+        let reader = q.enter(Some(&[1]), GateAccess::Shared, false).unwrap();
+        let (tx, rx) = mpsc::channel();
+        q.recover(1, false, move |guard, result| {
+            tx.send((guard, result)).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(HELD).is_err(),
+            "recovery overlapped a reader"
+        );
+        drop(reader);
+        let (guard, result) = rx.recv_timeout(ADMIT).unwrap();
+        assert_eq!(result, Ok(()));
+        let q = Arc::new(q);
+        let (late_in, late_out) = enter_later(&q, Some(vec![1]), GateAccess::Shared);
+        assert!(
+            late_in.recv_timeout(HELD).is_err(),
+            "reader overlapped a recovery"
+        );
+        drop(guard);
+        late_in.recv_timeout(ADMIT).unwrap();
+        late_out.send(()).unwrap();
     }
 
     #[test]
     fn recovery_registration_returns_while_file_gate_is_held() {
         let q = FrontWriteQueue::with_limits(56, 8).unwrap();
-        let first = q.enter(Some(&[1]), false).unwrap();
+        let first = q.enter(Some(&[1]), GateAccess::Exclusive, false).unwrap();
         let (tx, rx) = mpsc::channel();
         q.recover(1, false, move |guard, result| {
             assert!(guard.is_some());
@@ -1291,5 +1670,201 @@ mod tests {
         assert_eq!(rejected.unwrap(), Err(EAGAIN));
         assert_eq!(control_before.unwrap(), Ok(()));
         assert!(!q.has_pending());
+    }
+
+    /// Blocks the worker on a first entry of `inode` until `release` is sent.
+    fn hold_worker(q: &FrontWriteQueue, inode: u64, handle: u64) -> mpsc::Sender<()> {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        q.submit_deferred_with(
+            inode,
+            handle,
+            1,
+            || {
+                Ok(Box::new(move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                }))
+            },
+            |result| assert_eq!(result, Ok(())),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_tx
+    }
+
+    fn deferred(q: &FrontWriteQueue, inode: u64, handle: u64) -> mpsc::Receiver<Result<(), i32>> {
+        let (tx, rx) = mpsc::channel();
+        q.submit_deferred_with(
+            inode,
+            handle,
+            1,
+            || Ok(Box::new(|| Ok(()))),
+            move |result| tx.send(result).unwrap(),
+        );
+        rx
+    }
+
+    /// R76: a full entry bound withholds the reply (the application waits in
+    /// write()) and promotes once the worker drains, instead of EAGAIN.
+    #[test]
+    fn entry_bound_withholds_reply_and_promotes_instead_of_eagain() {
+        let q = FrontWriteQueue::with_entry_limit(64, 8, 2).unwrap();
+        let release = hold_worker(&q, 1, 11);
+        let first = deferred(&q, 1, 11);
+        let second = deferred(&q, 2, 22);
+        assert_eq!(first.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        assert_eq!(second.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        // Two admitted entries fill the bound: the next ones wait, unacknowledged.
+        let third = deferred(&q, 2, 22);
+        let fourth = deferred(&q, 3, 33);
+        assert!(third.try_recv().is_err(), "entry bound ACKed a write");
+        assert!(fourth.try_recv().is_err(), "entry bound ACKed a write");
+        release.send(()).unwrap();
+        assert_eq!(third.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        assert_eq!(fourth.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        q.wait(None, false).unwrap();
+        assert!(!q.has_pending());
+    }
+
+    /// Same-inode order is kept across an entry-bound wait: a later write of a
+    /// waiting inode cannot be acknowledged ahead of the waiting one.
+    #[test]
+    fn entry_bound_wait_keeps_same_inode_fifo() {
+        let q = FrontWriteQueue::with_entry_limit(64, 8, 1).unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let release = hold_worker(&q, 9, 99);
+        let mut acks = Vec::new();
+        for n in 0..4u64 {
+            let (tx, rx) = mpsc::channel();
+            let order = order.clone();
+            q.submit_deferred_with(
+                1,
+                11,
+                1,
+                move || {
+                    Ok(Box::new(move || {
+                        order.lock().unwrap().push(n);
+                        Ok(())
+                    }))
+                },
+                move |result| tx.send((n, result)).unwrap(),
+            );
+            acks.push(rx);
+        }
+        release.send(()).unwrap();
+        for (n, rx) in acks.iter().enumerate() {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                (n as u64, Ok(()))
+            );
+        }
+        q.wait(None, false).unwrap();
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    /// Another file's retained failure does not reject a wait that can still
+    /// be satisfied by draining healthy entries: the error stays with the
+    /// failed file.
+    #[test]
+    fn unrelated_retained_failure_does_not_reject_a_recoverable_wait() {
+        let q = FrontWriteQueue::with_entry_limit(64, 8, 2).unwrap();
+        submit(&q, 1, 11, 1, || Err(EIO)).unwrap();
+        assert_eq!(q.wait(Some(1), false), Err(EIO));
+        let release = hold_worker(&q, 2, 22);
+        let healthy = deferred(&q, 2, 22);
+        assert_eq!(
+            healthy.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(())
+        );
+        // Failed head + one queued healthy entry fill the bound of two (the
+        // executing entry is outside it); this write waits, then promotes.
+        let waiting = deferred(&q, 3, 33);
+        let more = deferred(&q, 3, 33);
+        assert!(waiting.try_recv().is_err());
+        release.send(()).unwrap();
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(())
+        );
+        assert_eq!(more.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        q.wait(Some(3), false).unwrap();
+        assert_eq!(q.wait(Some(1), false), Err(EIO));
+        q.release_handle(1, 11, true);
+        q.wait(None, false).unwrap();
+        assert!(!q.has_pending());
+    }
+
+    /// The remaining EAGAIN: retained failures alone fill the entry bound, so
+    /// no amount of draining can admit another file's write until the failed
+    /// file is synced, retried or closed.
+    #[test]
+    fn retained_failures_filling_the_entry_bound_still_reject_other_files() {
+        let q = FrontWriteQueue::with_entry_limit(64, 8, 2).unwrap();
+        let release = hold_worker(&q, 1, 11);
+        let failing = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let failing = failing.clone();
+            q.submit_deferred_with(
+                1,
+                11,
+                1,
+                move || {
+                    Ok(Box::new(move || {
+                        failing.fetch_add(1, Ordering::SeqCst);
+                        Err(EIO)
+                    }))
+                },
+                |result| assert_eq!(result, Ok(())),
+            );
+        }
+        release.send(()).unwrap();
+        assert_eq!(q.wait(Some(1), false), Err(EIO));
+        assert_eq!(
+            deferred(&q, 2, 22)
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Err(EAGAIN)
+        );
+        q.release_handle(1, 11, true);
+        assert_eq!(
+            deferred(&q, 2, 22)
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Ok(())
+        );
+        q.wait(None, false).unwrap();
+        assert!(!q.has_pending());
+    }
+
+    #[test]
+    fn admission_outcomes_are_counted_by_reason() {
+        let registry = afs_metrics::Registry::new();
+        let counter = afs_metrics::IntCounterVec::new(
+            afs_metrics::Opts::new("t", "t"),
+            &["filesystem", "outcome"],
+        )
+        .unwrap();
+        afs_metrics::register_collector(&registry, &counter).unwrap();
+        let q = FrontWriteQueue::with_entry_limit(64, 8, 1).unwrap();
+        q.set_metrics(counter.clone(), "dfs");
+        let release = hold_worker(&q, 1, 11);
+        assert_eq!(
+            deferred(&q, 2, 22)
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Ok(())
+        );
+        let waiting = deferred(&q, 3, 33);
+        release.send(()).unwrap();
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(())
+        );
+        q.wait(None, false).unwrap();
+        let get = |outcome: &str| counter.with_label_values(&["dfs", outcome]).get();
+        assert_eq!(get("admitted"), 2);
+        assert_eq!(get("waited"), 1);
+        assert_eq!(get("rejected_entries"), 0);
     }
 }

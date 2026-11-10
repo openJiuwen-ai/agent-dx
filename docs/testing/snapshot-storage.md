@@ -253,8 +253,8 @@ Coordinator 重启后的目录进度与排空心跳，并检查目标节点未�
 
 ## 分段 profile 与性能对比
 
-在已准备好的 Firecracker / AFS fixture 中，为 Meta 进程及其启动父进程设置
-`AFS_META_PROFILE=1` 可记录 canonical log 批次的 append＋sync 和状态发布耗时，`bytes` 是该批次的 framed 字节数。
+在已准备好的 Firecracker / AFS fixture 中，使用以 `--features diagnostics` 构建的 Meta（默认构建与发行包不编译该诊断，变量被忽略），
+为 Meta 进程及其启动父进程设置 `AFS_META_PROFILE=1` 可记录 canonical log 批次的 append＋sync 和状态发布耗时，`bytes` 是该批次的 framed 字节数。
 这些计时不包含排队、准备或完整检查点；checkpoint 与历史保留另通过 Meta 的固定指标观察。先保留整份脱敏 `export/`
 （包括两个 Ingress 的服务日志），再汇总：
 
@@ -319,7 +319,7 @@ version、chunk 与 GC 屏障，避免每次文件访问都复制整个命名空
 权限变化、名字被替换、目录新增子项、持续竞争返回 EAGAIN，以及提交成功但应答
 丢失后的幂等重放。测试不把预设返回值代替真实的 Meta 比较提交。
 
-真实 AFS/Firecracker 验证可开启 `AFS_META_NAMESPACE_TRACE=1` 关联失败条件和
+真实 AFS/Firecracker 验证可在 `diagnostics` feature 构建的 Meta 上开启 `AFS_META_NAMESPACE_TRACE=1` 关联失败条件和
 相邻写入事务；关联必须使用 inode 及版本／head，不能只凭相近时间认定竞争双方。
 删除验收还要检查私有运行文件、匿名恢复点、Meta 实体和物理数据块均已收敛。
 

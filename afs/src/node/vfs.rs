@@ -269,7 +269,7 @@ pub trait Backend: Send + Sync {
 
     /// Optional owned read response for backends that can build a private final
     /// payload without first filling a caller-owned buffer. The default keeps
-    /// legacy backends compatible by delegating to `read`.
+    /// other backends working by delegating to `read`.
     fn read_owned(
         &self,
         ctx: &types::RequestContext,
@@ -297,13 +297,13 @@ pub trait Backend: Send + Sync {
         _offset: u64,
         _size: usize,
         _deadline: std::time::Instant,
-        _lifetime: crate::node::read_pipeline::ReadLifetime,
-    ) -> Result<Option<crate::node::read_pipeline::ReadReplyFuture>> {
+        _lifetime: crate::node::read::admission::ReadLifetime,
+    ) -> Result<Option<crate::node::read::admission::ReadReplyFuture>> {
         Ok(None)
     }
 
     /// Keep private response ownership through the synchronous FUSE reply.
-    /// Legacy backends transfer their Vec allocation without copying.
+    /// By default, backends transfer their Vec allocation without copying.
     fn read_reply(
         &self,
         ctx: &types::RequestContext,
@@ -366,6 +366,17 @@ pub trait Backend: Send + Sync {
         _mode: types::SyncMode,
     ) -> Result<()> {
         Err(unsupported("fsync"))
+    }
+
+    /// 同 [`Self::fsync`]，并返回屏障提交到的版本身份与持久序号（SDK sync 的回复）。
+    fn fsync_receipt(
+        &self,
+        ctx: &types::RequestContext,
+        handle: types::FileHandle,
+        mode: types::SyncMode,
+    ) -> Result<types::SyncReceipt> {
+        self.fsync(ctx, handle, mode)?;
+        Ok(types::SyncReceipt::default())
     }
 
     /// 释放本进程的句柄；不能以 path 重新寻找被 rename/unlink 的文件。
@@ -483,7 +494,8 @@ pub trait Backend: Send + Sync {
     }
 
     /// A fixed local response which does not depend on queued write contents.
-    /// The actual operation must still validate inode identity and permissions.
+    /// The actual operation must still validate inode identity and permissions,
+    /// and must not block: the FUSE layer answers it on the receive thread.
     fn getxattr_is_fixed_local(&self, _name: &OsStr) -> bool {
         false
     }

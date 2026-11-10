@@ -18,13 +18,23 @@ DFS Peer 客户端允许接收 128 KiB HTTP/2 DATA 帧；业务消息、流控�
 
 ## 组件范围
 
-| 目录 | 内容 |
+| 目录 | 角色 |
 | --- | --- |
-| `src/` | `afs-meta`、`afs-node`、OwnerFs、DFS、Meta 后端、FUSE 适配和运行时入口 |
-| `client/` | DFS 客户端 crate |
-| `common/` | 错误、日志、指标、协议、追踪和传输等共享 crate |
-| `examples/` | crate 级示例配置；发布包示例另见 `build/config/examples/afs/` |
-| `tests/` | Cargo 绑定的单元、契约和小型集成测试 |
+| `Cargo.toml`、`src/` | 主 crate `afs`：产品二进制 `afs-meta`、`afs-node`，包含 Meta、Node、OwnerFs、DFS、FUSE 适配和运行时装配 |
+| `crates/` | AFS 域内的库 crate，被主 crate 与工具依赖；一句话职责同时写在各自 `Cargo.toml` 的 `description` |
+| `crates/client/` | `afs-client`：本机 SDK（UDS 控制 + 共享内存 usrbio）；`examples/` 只放 SDK 用法示例 |
+| `crates/error/` | `afs-error`：与协议无关的稳定错误合同（码表在 `error-codes.toml`） |
+| `crates/logging/` | `afs-logging`：进程日志 |
+| `crates/metrics/` | `afs-metrics`：Prometheus 注册表与 OpenMetrics 编码 |
+| `crates/protocol/` | `afs-protocol`：proto 定义、生成的 gRPC 代码与集群线协议版本 |
+| `crates/tracing/` | `afs-tracing`：分布式追踪上下文与进程运行时 |
+| `crates/transport/` | `afs-transport`：gRPC/TLS、共享内存、ring 与可选 RDMA |
+| `tools/` | `afs-tools`：度量工具与诊断探针，**不进发布包**，见 [tools/README.md](tools/README.md) |
+| `tests/` | 只放测试：Cargo 集成与契约测试、e2e 运行器 `run.py`、fixtures、suites |
+| `scripts/` | 开发期检查脚本（如依赖边计数） |
+| `error-codes.toml` | 错误码表，由 `afs-error` 编译期引用 |
+
+配置示例只有一份权威来源：[build/config/examples/afs/](../build/config/examples/afs/)（随 `ADX_WITH_AFS=1` 发布包分发，`tests/config_contract.rs` 直接解析它）。
 
 来源、路径映射和许可证记录保存在 `docs/migration/`；它们不定义当前运行合同。
 FUSE 依赖使用根工作区声明的官方固定 `fuser =0.18.0`。
@@ -42,7 +52,8 @@ FUSE 依赖使用根工作区声明的官方固定 `fuser =0.18.0`。
 历史结果／watch 有界不表示全部权威实体有界：旧 NodeSession 拒绝记录、未完成及失败
 命令仍保留；安全回收范围和限制见上述部署合同。
 
-Meta 默认使用唯一持久后端 `local-file`。`memory` 仅适合一次性演示；etcd／Redis适配已移除，
+Meta 默认使用持久后端 `local-file`；也可把操作日志放在 Redis 或 etcd（`meta_store = "redis"`／`"etcd"`，Meta 仍单进程，
+持久性与性能边界见[部署说明](../docs/deployment/afs.md#meta-操作日志的-redisetcd-后端)）。`memory` 仅适合一次性演示；
 多 Meta/HA、完整 POSIX、跨节点文件锁、复杂故障矩阵和性能达标不在当前承诺内。
 Operator 负责创建 namespace/root grant、配置挂载和回收引用；Environment 创建尚不会
 自动 provision/mount/reclaim AFS。
@@ -76,8 +87,10 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 - OwnerFs workspace bind mount 默认 OFF；当前实际试用场景需要显式配置 ON。
 - OwnerFs 远端 FUSE 访问和 DFS 一写多读代码路径保留，目标仓二进制需要按受影响范围补 Linux 运行证据。
 - 中心 Meta `local-file` 是当前可重启恢复基线；`memory` 只适合一次性演示。
-- etcd、Redis、多 Meta、高可用、完整 POSIX、复杂可靠性和大规模长时间测试后置。
+- 多 Meta、高可用、完整 POSIX、复杂可靠性和大规模长时间测试后置；etcd／Redis 只作操作日志后端。
 - 跨节点 `fcntl/flock`、阻塞锁取消、bind/native 与远端 FUSE 锁域协同后置，不能把本机 ext4 锁或单挂载内核回退宣传为分布式锁。
+- DFS 的支持矩阵与已知限制（local-file Meta 目录须在本机独占盘、打开着反复 fsync 的文件使 Meta 内存增长等）见 [支持边界](../docs/architecture/afs-support-boundary.md)；POSIX 逐项行为（文件锁仅本机、`statfs` 为本机盘等）见 [AFS DFS 的 POSIX 支持边界](../docs/architecture/afs-posix-boundary.md)。
+- DFS 不能保存 1970-01-01 之前的时间戳（Meta 时间是无符号毫秒）：`utime`/`utimensat` 设这类时间返回 EINVAL，不静默存成 1970。不支持的 rename flags（`RENAME_EXCHANGE`、`RENAME_WHITEOUT`）返回 EINVAL。
 
 必要正确性边界仍需保留：读写新鲜度、close-to-open、权限和 suid/sgid 清除、错误传播、持久化屏障、direct-I/O mmap 能力协商、正常卸载和受管引用排空。
 
@@ -91,15 +104,16 @@ OwnerFs 的关闭语义与上一条边界的关系需要单独说明，因为默
 - 显式 `fsync`/`fdatasync` 与 `O_SYNC`/`O_DSYNC` 句柄的持久保证不因该开关改变。
 - 跨节点可见性仍由 Meta 提交序列与 `validate_peer` 决定，不依赖 close 同步。
 
-原生DFS新open取得fresh状态，已打开读视图最多复用5秒、命中不续期；Node/session
-授权与版本视图分别检查，已知失效停止交付。A当前已验证对象单槽最多4MiB，与在途
-正文共用8MiB容量；B可显式启用可丢弃的磁盘读缓存，不新增常驻正文RAM缓存。具体期限、断链、失效与资源范围见
+原生DFS新open取得fresh状态并固定该版本直到close；读取授权快照最多复用5秒、命中不续期，
+跨过复用期的读只要Node/session授权未中断即正常交付，已知失效（停止、epoch变化）停止交付。A当前最多驻留2个已验证对象（每个至多4MiB），与在途
+正文共用16MiB容量；B可显式启用可丢弃的磁盘读缓存，不新增常驻正文RAM缓存。具体期限、断链、失效与资源范围见
 [读取上下文边界](../docs/architecture/afs.md#dfs-原生节点读取上下文)及
 [验收与指标](../docs/testing/afs.md)。这不改变成功fsync的持久要求。
 
 ## 文档入口
 
-- 演进计划、支持范围和后续验收：[docs/development/afs-roadmap.md](../docs/development/afs-roadmap.md)
+- 支持矩阵、已知限制与已知变化：[docs/architecture/afs-support-boundary.md](../docs/architecture/afs-support-boundary.md)
+- 历史规划草案（2026-10-27，已标历史）：[docs/development/afs-roadmap.md](../docs/development/afs-roadmap.md)
 - 架构边界：[docs/architecture/afs.md](../docs/architecture/afs.md)
 - 部署与配置：[docs/deployment/afs.md](../docs/deployment/afs.md)
 - 测试与验收：[docs/testing/afs.md](../docs/testing/afs.md)
@@ -113,7 +127,7 @@ OwnerFs 的关闭语义与上一条边界的关系需要单独说明，因为默
 
 ## 原生DFS CRC写入与GC保护
 
-原生DFS Node默认采用独立ID＋32KiB分段CRC32C及写入代次GC保护，保留capability本地化，省略逐chunk Meta登记。多副本写、跨节点范围读和正常副本修复保持原复制/授权/持久化合同；FullSync在相关代次有效时原子发布，无关GC变化不导致失败。CRC用于意外损坏检测，不提供Bao密码学证明或内容去重。S3仍走原路径，本次不提供旧版本兼容/迁移。
+原生DFS Node默认采用独立ID＋32KiB分段CRC32C及写入代次GC保护，保留capability本地化，省略逐chunk Meta登记。多副本写、跨节点范围读和正常副本修复保持原复制/授权/持久化合同；FullSync在相关代次有效时原子发布，无关GC变化不导致失败。CRC用于意外损坏检测，不提供Bao密码学证明或内容去重。外部S3后端固定写BLAKE3对象，不提供旧版本兼容/迁移。
 
 限定Linux验收覆盖1GiB、两份同步副本、正常修复至三份，以及空节点远端完整读回；不等于物理故障域、RDMA硬件或HA验证。配置和复现命令见[部署说明](../docs/deployment/afs.md#原生dfs分段crc32c与写入代次保护)与[验收合同](../docs/testing/afs.md#1gib多副本跨节点读与正常修复)。下述可选BLAKE3磁盘缓存不用于CRC对象。
 
@@ -122,7 +136,7 @@ OwnerFs 的关闭语义与上一条边界的关系需要单独说明，因为默
 未配置外部存储时，Node 可通过 `[dfs_peer_cache]` 指定专用目录和 `capacity_bytes`；
 省略即 OFF。容量由部署选择，256MiB只是一种配置示例。缓存按不可变 chunk 身份隔离，
 近似 LRU 淘汰；不登记持久副本，不替代 A 的权威数据，不允许据此删除唯一持久副本。
-B 命中仍取得有效 Meta grant；首次获取／身份改变完整验证可信Meta根，稳定命中完整校验本次覆盖的1MiB分段后交付授权范围。
+B 命中仍取得有效 Meta grant；首次获取／身份改变完整验证可信Meta根，稳定命中完整校验本次覆盖的32KiB覆盖组后交付授权范围。
 只有 grant 覆盖整个当前对象时才整块回填，不预读下一对象；partial／旧协议缺少范围提示
 沿用范围读取。符合runtime／窗口／原预算条件的gRPC回填复用两个256KiB私有载荷块，
 按块交接同对象接收、完整校验和私有文件写入；wire正文帧仍为64KiB，块归还后才能复用。
@@ -130,42 +144,26 @@ B 命中仍取得有效 Meta grant；首次获取／身份改变完整验证可�
 不增加持久副本或正文RAM缓存；其他适配器保留原缓冲路径。磁盘或填充失败不伪造fsync成功，权限拒绝与远端读取错误仍传播。
 配置、资源和验收出口见[部署说明](../docs/deployment/afs.md#原生-peer-可丢弃磁盘读缓存)。
 
-## DFS 外部 S3 后端（实验接入）
+## DFS 外部 S3 后端
 
 在 Meta 和所有 DFS Node 的 TOML 中显式配置相同的
-`[dfs_external_backend]`，即可选择独立的外部对象持久化路径。该策略只允许
+`[dfs_external_backend]`，即可选择外部对象持久化路径。该策略只允许
 新文件系统初始化；已有 Node 复制文件系统不能通过改配置原地切换。store_id
 和 generation 持久写入 Meta，重启不能改变。未配置时沿用原 Node 复制路径。
+支持矩阵与已验证范围见[支持边界](../docs/architecture/afs-support-boundary.md)。
 
-外部模式固定单副本配置，禁用 Node 复制及复制修复。普通 write 进入 dirty
-状态，fsync/fdatasync 等提交屏障先等待所有普通 S3 PUT 完成，再通过原 Meta
-事务发布 FileVersion、布局和对象引用。上传失败不能发布新版本；Meta 确认
-未知时保留原请求做幂等恢复，不删除可能已上传的对象。本地 chunk/catalog
-不作为该模式的耐久副本，数据可靠性取决于管理员提供的 S3 持久性合同；
-AFS Meta 的持久性仍需独立保证。
-
-S3 适配层复用一个自有 worker、runtime 和客户端，所有请求共享最多四路
-活动 PUT，完成一路即可补位。入口队列容量为1，队满等待形成回压；worker
-最多接收32个命令。外部模式顺序写的完整4MiB块可在后续 write 期间上传，
-以64MiB为一次发布单元；旧窗口冻结后，可在原预算余量内接纳下一窗口，
-普通 write 成功表示数据已接纳，不表示当前窗口已发布。fsync、fdatasync、
-可写 flush 和同步写按入口前已接纳的 inode 序号排空所有相关窗口。独立只读
-客户端只见 Meta 已提交版本。外部模式本机 dirty read 先按 inode 完成读入口前
-已接纳序号的有序发布，再从已发布版本读取；发布失败返回错误，不回退旧内容。
-该读屏障可提前发布不足64MiB的尾部，仅 open／getattr 不触发发布。
-中间版本的可见时点可滞后于普通 write，成功同步与 close-to-open 不降级。
-只有所需成功回执
-齐全且 Meta 持久确认后才能报告同步成功；未知确认精确重试，PUT 失败
-保留窗口身份和已确认回执。非阻塞收取成功 PUT 回执并核对身份后，可回收
-已上传正文；最后一个 HTTP／重试／读 pin 退出后才释放正文预算，提交描述仍
-保留到 Meta 确认。逻辑64MiB窗口不随正文回收缩小，Uploaded 状态不是空洞。
-当前窗口已满而前窗尚在提交时，先推进前窗并冻结当前窗，再接纳新数据；
-物理正文有余量也不能越过逻辑窗口边界。
-非外部 DFS 仍使用 frozen／active dirty overlay。服务端可能留下未发布对象，不能直接删除共享
-内容对象。正常退出关闭入口、排空并 join worker。
+外部模式固定单副本配置，禁用 Node 复制及复制修复。写入与原生副本模式走同一条原生写流水线
+（`dfs_write_queue_bytes`、`dfs_dirty_budget_bytes`、`dfs_unpublished_descriptors` 同样适用，
+上传并发被压到实际 PUT 许可数 4）：满 4MiB 块提前上传，S3 回执不是本机持久副本，正文保留到版本发布；
+fsync/fdatasync、可写 flush 与同步写等待所需 PUT 成功并由 Meta 事务发布 FileVersion、布局和对象引用。
+上传失败不能发布新版本；Meta 确认未知时保留原请求做幂等恢复。本节点读自己尚未提交的写入在本地完成，
+不触发提交；其他节点只见 Meta 已提交版本。本地 chunk/catalog 不作为该模式的耐久副本，数据可靠性取决于
+管理员提供的 S3 持久性合同；AFS Meta 的持久性仍需独立保证。
+S3 适配层复用一个自有 worker、runtime 和客户端，最多四路活动 PUT、32 个活动命令。
 
 每个不超过 4MiB 的不可变 chunk 对应一个原始字节对象，key 为
-`afs/v1/<store_id>/<generation>/chunks/<摘要前两位>/<ChunkId>`。
+`afs/v2/<store_id>/<generation>/chunks/<摘要前两位>/<ChunkId>`，ChunkId 为
+`blake3-v2-<写代>-<根>-<长度>`：每次写入是独立对象，相同内容不跨写入去重（COW 克隆仍共享）。
 读 Node 先取得 Meta 的独立外部读授权，再完整 GET 并验证长度和 BLAKE3，
 最后返回授权范围；不依赖写 Node 在线，不回退到 Peer。普通路径不增加
 HEAD、条件 PUT/GET 或版本 ID。内容 cache 默认 OFF，writeback OFF；
@@ -205,7 +203,8 @@ Ready候选中比较1秒单调访问时间桶，淘汰较旧桶；同桶保留�
 不记录凭据或完整S3对象路径；SDK内部连接／重试细分仍不可由这些指标推断。
 配置及验证范围见下述链接。
 S3 容量查询暂不支持，statfs 明确返回不支持，不能用 Node 空间冒充后端容量。
-删除不立即删除 S3 对象；复杂对象回收后置。
+删除、覆盖后不再引用的对象由 GC 异步回收：一代由一个存活 Node 删除，上传失败或崩溃留下的未登记对象
+由同一 Node 列举桶发现后经同一规划回收，见[架构文档](../docs/architecture/afs.md#dfs-历史与数据块回收)。
 
 SeaweedFS 等 S3 服务是外部运行依赖，其部署脚本、数据库和测试凭据不进入
 产品仓。连接方式见[部署配置](../docs/deployment/afs.md#dfs-外部-s3-连接)，
@@ -216,14 +215,14 @@ SeaweedFS 等 S3 服务是外部运行依赖，其部署脚本、数据库和测
 本地 inode owner 的普通 FUSE 写在原有顺序门禁内直接填最终可写 buffer，原提交入口消费冻结并共享
 只读正文，不新增满4MiB提交入口。`dfs_write_buffer_idle_bytes` 默认128MiB，仅限制空闲复用容量，
 不限制 live 正文；最后引用释放才归还，停止清空。Linux Node 默认使用官方 jemalloc，Meta 和其他
-ADX 进程不强制替换。S3 原窗口和预算独立保持，不新增正文 RAM 内容缓存。
+ADX 进程不强制替换。S3 模式走同一写流水线，不新增正文 RAM 内容缓存。
 具体一致性、未知提交、一次复制范围、ENOMEM/OOM和验证边界见
 [架构](../docs/architecture/afs.md#dfs-原生写正文所有权)、[配置](../docs/deployment/afs.md#原生写-buffer-与-node-allocator)
 与[测试](../docs/testing/afs.md#原生写-buffer-验证)。减少复制不自动等于性能达标。
 
 ## POSIX fd 接入本机 USRBIO
 
-主示例是 [usrbio_round_trip](client/examples/usrbio_round_trip.rs)：普通 POSIX create/open
+主示例是 [usrbio_round_trip](crates/client/examples/usrbio_round_trip.rs)：普通 POSIX create/open
 取得 fd，SDK `register_fd(file.as_fd())` 导入原打开对象，数据走持久 IOV/SQ/CQ；
 读写完成后对原对象 fsync、`unregister_fd`，再用 POSIX 读回/关闭。路径参数是完整挂载路径。
 
@@ -234,7 +233,7 @@ cargo run -p afs-client --example usrbio_round_trip -- /run/afs/node.sock /mnt/a
 同机 owner-only、DFS 普通文件、顺序交接是首版边界；SDK 数据阶段不能同时使用 POSIX
 数据 IO/mmap 或修改 fd 状态标志，注销失败不能当作已经交回缓存。原 fd 关闭后可用注册对象的 `sync_all`
 同步保留副本。O_APPEND/O_PATH、其他文件系统或错误 Node fd 明确失败。
-[usrbio_path_round_trip](client/examples/usrbio_path_round_trip.rs) 保留 SDK `open(path)`
+[usrbio_path_round_trip](crates/client/examples/usrbio_path_round_trip.rs) 保留 SDK `open(path)`
 便利方式，它会单独打开路径；不等同于导入原 fd。更多生命周期与缓存边界见
 [架构](../docs/architecture/afs.md#本机-sdk-usrbio-数据面)。
 

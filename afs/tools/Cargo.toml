@@ -1,0 +1,72 @@
+[package]
+name = "afs-tools"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AFS measurement tools and diagnostic probes; never part of a release package"
+publish = false
+# 每个工具显式声明，二进制名沿用迁入前的名字（脚本按名字调用）；
+# src/bin/entrance_probe/ 是 entrance-probe 与 usrbio-pipeline-probe 共用的子模块目录。
+autobins = false
+
+[[bin]]
+name = "afs-bench"
+path = "src/bin/afs-bench.rs"
+
+[[bin]]
+name = "afs-meta-bench"
+path = "src/bin/meta-bench.rs"
+
+[[bin]]
+name = "afs-perf-denominators"
+path = "src/bin/perf-denominators.rs"
+
+[[bin]]
+name = "afs-workspace-probe"
+path = "src/bin/workspace-probe.rs"
+
+# payload 生成器的单元测试防止周期性图案被块去重吞掉，随 `cargo test -p afs-tools` 运行。
+[[bin]]
+name = "usrbio_bench"
+path = "src/bin/usrbio-bench.rs"
+test = true
+
+# 两个探针共用 entrance_probe/native.rs（冻结的参考客户端）；迁入前作为 example 从不跑测试，
+# 这里保持不编译测试目标。
+[[bin]]
+name = "usrbio_pipeline_probe"
+path = "src/bin/usrbio-pipeline-probe.rs"
+test = false
+
+[[bin]]
+name = "entrance_probe"
+path = "src/bin/entrance-probe.rs"
+test = false
+
+[dependencies]
+afs = { path = ".." }
+afs-client = { path = "../crates/client" }
+afs-error = { path = "../crates/error" }
+afs-protocol = { path = "../crates/protocol" }
+afs-tracing = { path = "../crates/tracing" }
+afs-transport = { path = "../crates/transport", default-features = false, features = ["grpc", "shm"] }
+
+blake3 = { version = "=1.8.7", features = ["rayon"] }
+clap = { version = "4.5.51", features = ["derive"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0.16"
+tokio = { version = "1.47.1", features = ["full"] }
+tonic = { version = "0.14.6", features = ["tls-ring"] }
+tower = { version = "0.5.2", features = ["util"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

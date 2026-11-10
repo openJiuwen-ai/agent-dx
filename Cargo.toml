@@ -44,13 +44,14 @@ members = [
     "platform/deployment",
     "platform/adxlet",
     "afs",
-    "afs/client",
-    "afs/common/error",
-    "afs/common/logging",
-    "afs/common/metrics",
-    "afs/common/protocol",
-    "afs/common/tracing",
-    "afs/common/transport",
+    "afs/crates/client",
+    "afs/crates/error",
+    "afs/crates/logging",
+    "afs/crates/metrics",
+    "afs/crates/protocol",
+    "afs/crates/tracing",
+    "afs/crates/transport",
+    "afs/tools",
 ]
 
 [workspace.package]

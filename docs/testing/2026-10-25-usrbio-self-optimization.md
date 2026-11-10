@@ -85,8 +85,8 @@ separate commit. Remote CI/CLA/merge are independent of these local results.
 
 ## Reproduction and evidence
 
-Build current RAM probe on Linux with `cargo build --release -p afs --example
-usrbio_pipeline_probe`. See `afs/examples/entrance_probe/README.md` for the
+Build current RAM probe on Linux with `cargo build --release -p afs-tools --bin
+usrbio_pipeline_probe`. See `afs/tools/probes/entrance_probe.md` for the
 frozen reference and earlier diagnostic helpers. All executable probe code is
 kept out of the default release binaries.
 

@@ -257,6 +257,13 @@ pub enum SyncMode {
     Full,
 }
 
+/// 一次同步屏障的结果。默认值（空串、0）表示后端没有暴露版本身份与持久序号。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SyncReceipt {
+    pub file_version_id: String,
+    pub durable_write_seq: u64,
+}
+
 /// 除 Linux `RENAME_NOREPLACE`/`RENAME_EXCHANGE` 外的标志必须显式拒绝。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenameFlags(pub u32);

@@ -1,5 +1,7 @@
-use afs::config::{Cli, Config, MetaStoreBackend, Role};
-use clap::Parser;
+use afs::config::{
+    Cli, Config, DataMode, DfsLocalCopy, DfsReplicaFailurePolicy, MetaStoreBackend, Role,
+};
+use clap::{CommandFactory, Parser};
 
 #[test]
 fn p2_w2_native_write_limits_use_cli_file_defaults_and_bounded_resources() {
@@ -54,31 +56,25 @@ fn p2_w2_native_write_limits_use_cli_file_defaults_and_bounded_resources() {
     }
 }
 
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
 #[test]
 fn p2_w2_complete_node_examples_resolve_top_level_write_limits() {
-    for (name, contents) in [
-        ("component", include_str!("../examples/node.toml")),
-        (
-            "deployment",
-            include_str!("../../build/config/examples/afs/node.toml"),
-        ),
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("node.toml");
-        std::fs::write(&path, contents).unwrap();
-        let config = Config::resolve(
-            Role::Node,
-            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
-        )
-        .unwrap_or_else(|error| panic!("{name} complete example does not resolve: {error}"));
-        assert_eq!(config.dfs_dirty_budget_bytes, 64 * 1024 * 1024, "{name}");
-        assert_eq!(config.dfs_unpublished_descriptors, 1024, "{name}");
-        assert_eq!(config.dfs_upload_inflight_chunks, 8, "{name}");
-        assert_eq!(config.dfs_background_commit_ms, 5000, "{name}");
-        assert_eq!(config.dfs_catalog_commit_queue, 256, "{name}");
-        assert_eq!(config.trusted_node_certs.len(), 1, "{name}");
-        assert!(config.trusted_node_certs.contains_key("node-a"), "{name}");
-    }
+    let contents = include_str!("../../build/config/examples/afs/node.toml");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("node.toml");
+    std::fs::write(&path, contents).unwrap();
+    let config = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap_or_else(|error| panic!("deployment complete example does not resolve: {error}"));
+    assert_eq!(config.dfs_dirty_budget_bytes, 64 * 1024 * 1024);
+    assert_eq!(config.dfs_unpublished_descriptors, 1024);
+    assert_eq!(config.dfs_upload_inflight_chunks, 8);
+    assert_eq!(config.dfs_background_commit_ms, 5000);
+    assert_eq!(config.dfs_catalog_commit_queue, 256);
+    assert_eq!(config.trusted_node_certs.len(), 1);
+    assert!(config.trusted_node_certs.contains_key("node-a"));
 }
 
 #[test]
@@ -479,9 +475,11 @@ fn ownerfs_mkdir_load_balance_is_opt_in() {
     }
 }
 
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
 #[test]
 fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
-    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let examples =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../build/config/examples/afs");
     let meta_path = examples.join("meta.toml");
     let node_path = examples.join("node.toml");
     let meta = Config::resolve(
@@ -506,11 +504,10 @@ fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
             .starts_with("https://")
     );
     assert!(
-        node.peer_endpoint
-            .as_deref()
-            .unwrap()
-            .starts_with("https://")
+        node.non_product_options().is_empty(),
+        "the shipped examples must not start with test-only or diagnostic options"
     );
+    assert!(meta.non_product_options().is_empty());
     for tls in [meta.tls_config(), node.tls_config()] {
         assert!(matches!(
             tls,
@@ -568,77 +565,179 @@ fn invalid_limits_and_uncompiled_mode_fail() {
 }
 
 #[test]
-fn p3_cli_retired_backend_errors_explain_safe_migration() {
-    for args in [
-        vec!["--meta-store", "etcd"],
-        vec!["--meta-store=redis"],
-        vec!["--etcd-endpoint", "http://127.0.0.1:2379"],
-        vec!["--redis-endpoint=redis://127.0.0.1:6379/0"],
-    ] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_afs-meta"))
-            .args(args)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(2));
-        let text = String::from_utf8(output.stderr).unwrap();
-        assert!(
-            text.contains("retired")
-                && text.contains("empty directory")
-                && text.contains("original binary"),
-            "missing safe migration guidance: {text}"
-        );
-    }
-    for flag in ["--help", "--version"] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_afs-meta"))
-            .arg(flag)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert!(
-            !String::from_utf8(output.stderr)
-                .unwrap()
-                .contains("retired")
-        );
-    }
-}
-
-#[test]
 fn p3_settings_default_is_local_file_without_retired_endpoints() {
     let cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
     assert_eq!(cfg.meta_store, MetaStoreBackend::LocalFile);
     let output = serde_json::to_value(&cfg).unwrap();
     assert!(output.get("etcd_endpoint").is_none());
     assert!(output.get("redis_endpoint").is_none());
+    assert_eq!(output["meta_redis_url"], serde_json::Value::Null);
+    assert_eq!(output["meta_etcd_endpoints"], serde_json::json!([]));
+    assert_eq!(output["meta_store_prefix"], "afs/meta");
+    assert_eq!(output["meta_etcd_max_request_bytes"], 1536 * 1024);
 }
+
+/// R16: the Redis and etcd Meta logs are the `meta-redis` / `meta-etcd`
+/// features. A Meta built without one refuses that `meta_store` when the
+/// configuration resolves, with a message naming the feature, instead of
+/// starting and failing on first use.
+#[cfg(not(all(feature = "meta-redis", feature = "meta-etcd")))]
 #[test]
-fn p3_settings_retired_backend_selection_and_endpoints_are_rejected() {
+fn r16_meta_store_without_its_backend_feature_is_refused() {
+    let cases: Vec<(&str, &[&str], &str)> = vec![
+        #[cfg(not(feature = "meta-redis"))]
+        (
+            "redis",
+            &["--meta-redis-url", "redis://10.0.0.1:6379/0"],
+            "meta-redis",
+        ),
+        #[cfg(not(feature = "meta-etcd"))]
+        (
+            "etcd",
+            &["--meta-etcd-endpoints", "http://10.0.0.1:2379"],
+            "meta-etcd",
+        ),
+    ];
+    for (store, endpoint, feature) in cases {
+        let cli = Cli::parse_from(
+            ["afs-meta", "--meta-store", store]
+                .into_iter()
+                .chain(endpoint.iter().copied()),
+        );
+        let error = Config::resolve(Role::Meta, cli).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{store}");
+        assert!(error.message().contains(feature), "{store}: {error}");
+    }
+}
+
+/// R16: `redis` and `etcd` are Meta log backends, each requiring its own
+/// endpoint and rejecting the other's; the retired `etcd_endpoint` /
+/// `redis_endpoint` keys stay rejected; Nodes reject every Meta store key;
+/// printed configuration hides URL credentials.
+#[cfg(all(feature = "meta-redis", feature = "meta-etcd"))]
+#[test]
+fn r16_redis_and_etcd_backends_need_their_own_endpoint() {
+    let redis = Config::resolve(
+        Role::Meta,
+        Cli::parse_from([
+            "afs-meta",
+            "--meta-store",
+            "redis",
+            "--meta-redis-url",
+            "redis://:secret@10.0.0.1:6379/0",
+            "--meta-store-prefix",
+            "afs/cluster-a",
+        ]),
+    )
+    .unwrap();
+    assert_eq!(redis.meta_store, MetaStoreBackend::Redis);
+    let printed = serde_json::to_value(&redis).unwrap();
+    assert_eq!(printed["meta_redis_url"], "redis://***@10.0.0.1:6379/0");
+    assert!(!printed.to_string().contains("secret"));
+    let etcd = Config::resolve(
+        Role::Meta,
+        Cli::parse_from([
+            "afs-meta",
+            "--meta-store",
+            "etcd",
+            "--meta-etcd-endpoints",
+            "http://10.0.0.1:2379,http://10.0.0.2:2379",
+            "--meta-etcd-max-request-bytes",
+            "10485760",
+        ]),
+    )
+    .unwrap();
+    assert_eq!(etcd.meta_store, MetaStoreBackend::Etcd);
+    assert_eq!(etcd.meta_etcd_endpoints.len(), 2);
+    assert_eq!(etcd.meta_etcd_max_request_bytes, 10 * 1024 * 1024);
+    // etcd's quota holds the log: its default WAL bound is half the local one.
+    assert_eq!(etcd.meta_wal_max_bytes, 512 * 1024 * 1024);
+    assert_eq!(redis.meta_wal_max_bytes, 1024 * 1024 * 1024);
+    for args in [
+        &["--meta-store", "redis"][..],
+        &["--meta-store", "etcd"],
+        &[
+            "--meta-store",
+            "redis",
+            "--meta-etcd-endpoints",
+            "http://e:2379",
+        ],
+        &[
+            "--meta-store",
+            "etcd",
+            "--meta-redis-url",
+            "redis://r:6379/0",
+        ],
+        &["--meta-redis-url", "redis://r:6379/0"],
+        &["--meta-etcd-endpoints", "http://e:2379"],
+        &[
+            "--meta-store",
+            "etcd",
+            "--meta-etcd-endpoints",
+            "http://e:2379",
+            "--meta-etcd-max-request-bytes",
+            "1024",
+        ],
+        &[
+            "--meta-store",
+            "redis",
+            "--meta-redis-url",
+            "redis://r:6379/0",
+            "--meta-store-prefix",
+            "bad/",
+        ],
+        &[
+            "--meta-store",
+            "redis",
+            "--meta-redis-url",
+            "redis://r:6379/0",
+            "--meta-store-prefix",
+            "a*b",
+        ],
+    ] {
+        let cli = Cli::parse_from(std::iter::once("afs-meta").chain(args.iter().copied()));
+        let error = Config::resolve(Role::Meta, cli).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{args:?}");
+    }
     for (flag, value) in [
-        ("--meta-store", "etcd"),
-        ("--meta-store", "redis"),
         ("--etcd-endpoint", "http://127.0.0.1:2379"),
         ("--redis-endpoint", "redis://127.0.0.1:6379/0"),
     ] {
-        if let Ok(cli) = Cli::try_parse_from(["afs-meta", flag, value]) {
-            assert!(
-                Config::resolve(Role::Meta, cli).is_err(),
-                "retired CLI option accepted: {flag}={value}"
-            );
-        }
+        assert!(
+            Cli::try_parse_from(["afs-meta", flag, value]).is_err(),
+            "retired CLI option accepted: {flag}={value}"
+        );
     }
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("retired.toml");
-    for text in [
-        "meta_store='etcd'",
-        "meta_store='redis'",
-        "etcd_endpoint='http://127.0.0.1:2379'",
-        "redis_endpoint='redis://127.0.0.1:6379/0'",
+    let path = dir.path().join("store.toml");
+    for (text, accepted) in [
+        (
+            "meta_store='redis'\nmeta_redis_url='redis://127.0.0.1:6379/0'",
+            true,
+        ),
+        (
+            "meta_store='etcd'\nmeta_etcd_endpoints=['http://127.0.0.1:2379']",
+            true,
+        ),
+        ("meta_store='etcd'", false),
+        ("meta_store='redis'", false),
+        ("etcd_endpoint='http://127.0.0.1:2379'", false),
+        ("redis_endpoint='redis://127.0.0.1:6379/0'", false),
     ] {
         std::fs::write(&path, text).unwrap();
         let result = Config::resolve(
             Role::Meta,
             Cli::parse_from(["afs-meta", "--config", path.to_str().unwrap()]),
         );
-        assert!(result.is_err(), "retired TOML accepted: {text}");
+        assert_eq!(result.is_ok(), accepted, "{text}: {result:?}");
+    }
+    for args in [
+        &["--meta-redis-url", "redis://r:6379/0"][..],
+        &["--meta-etcd-endpoints", "http://e:2379"],
+        &["--meta-store-prefix", "p"],
+    ] {
+        let cli = Cli::parse_from(std::iter::once("afs-node").chain(args.iter().copied()));
+        assert!(Config::resolve(Role::Node, cli).is_err(), "{args:?}");
     }
 }
 #[test]
@@ -756,7 +855,7 @@ fn p3_log_limits_defaults_cli_override_and_invalid_bounds() {
             cfg.meta_wal_max_bytes,
         )
     }
-    let defaults = afs::meta::store::journal::LogLimits::default();
+    let defaults = afs::meta::store::local_log::LocalLogOptions::default();
     assert_eq!(
         limits(&Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap()),
         (
@@ -857,94 +956,25 @@ fn volatile_meta_policy_defaults_to_false_and_cli_overrides_toml() {
 }
 
 #[test]
-fn native_workspace_is_default_off_and_refuses_incomplete_or_wrong_backend() {
-    let cfg = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
-    assert!(!cfg.experimental_native_workspace);
-    assert!(cfg.native_workspace.is_none());
-    for (role, argv) in [
-        (
-            Role::Node,
-            vec!["afs-node", "--experimental-native-workspace", "true"],
-        ),
-        (
-            Role::Meta,
-            vec!["afs-meta", "--experimental-native-workspace", "true"],
-        ),
+fn removed_native_workspace_keys_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    for text in [
+        "experimental_native_workspace=false\n",
+        "[native_workspace]\ncontrol_dir='/tmp/native-control'\n",
     ] {
-        assert!(Config::resolve(role, Cli::parse_from(argv)).is_err());
+        std::fs::write(&path, text).unwrap();
+        let error = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
+    assert!(Cli::try_parse_from(["afs-node", "--experimental-native-workspace", "false"]).is_err());
 }
 
 #[cfg(feature = "ownerfs")]
-#[test]
-fn native_workspace_validates_admin_paths_and_explicit_off_override() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("node.toml");
-    let base = "fs='ownerfs'\nownerfs_mount='/tmp/owner'\nexperimental_native_workspace=true\n[native_workspace]\ncontrol_dir='/tmp/native-control'\nruntime='/usr/bin/runc'\nrootfs='/tmp/native-rootfs'\nidle_command=['/bin/view-observer','idle']\nidentity_command=['/bin/view-observer','identity']\nworkload_uid=501\nworkload_gid=501\n";
-    std::fs::write(&path, base).unwrap();
-    let cfg = Config::resolve(
-        Role::Node,
-        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
-    )
-    .unwrap();
-    assert!(cfg.experimental_native_workspace);
-    for invalid in [
-        base.replace("'/usr/bin/runc'", "'relative/runc'"),
-        base.replace("'/tmp/native-rootfs'", "'/tmp/native-control/rootfs'"),
-        base.replace("'/tmp/native-rootfs'", "'/tmp/../rootfs'"),
-        base.replace("workload_uid=501", "workload_uid=0"),
-        base.replace("'/tmp/native-control'", "'/tmp/owner/control'"),
-        base.replace("'/tmp/native-rootfs'", "'/tmp/owner/rootfs'"),
-        base.replace("workload_gid=501", "workload_gid=0"),
-        base.replace("fs='ownerfs'", "fs='dfs'"),
-        base.replace("idle_command=['/bin/view-observer','idle']\n", ""),
-        base.replace("identity_command=['/bin/view-observer','identity']\n", ""),
-        base.replace(
-            "idle_command=['/bin/view-observer','idle']",
-            "idle_command=[]",
-        ),
-        base.replace(
-            "idle_command=['/bin/view-observer','idle']",
-            "idle_command=['relative','idle']",
-        ),
-        base.replace(
-            "idle_command=['/bin/view-observer','idle']",
-            "idle_command=['/bin/../observer','idle']",
-        ),
-        base.replace(
-            "idle_command=['/bin/view-observer','idle']",
-            "idle_command=['/bin/view\u{0}observer','idle']",
-        ),
-        base.replace(
-            "idle_command=['/bin/view-observer','idle']",
-            &format!("idle_command=['/bin/view-observer','{}']", "x".repeat(4097)),
-        ),
-    ] {
-        std::fs::write(&path, invalid).unwrap();
-        assert!(
-            Config::resolve(
-                Role::Node,
-                Cli::parse_from(["afs-node", "--config", path.to_str().unwrap(),])
-            )
-            .is_err()
-        );
-    }
-    std::fs::write(&path, base).unwrap();
-    let cfg = Config::resolve(
-        Role::Node,
-        Cli::parse_from([
-            "afs-node",
-            "--config",
-            path.to_str().unwrap(),
-            "--experimental-native-workspace",
-            "false",
-        ]),
-    )
-    .unwrap();
-    assert!(!cfg.experimental_native_workspace);
-    assert!(cfg.native_workspace.is_some());
-}
-
 #[test]
 fn ownerfs_workspace_bind_is_default_off_and_refuses_incomplete_or_wrong_backend() {
     let cfg = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
@@ -1080,25 +1110,6 @@ fn ownerfs_workspace_bind_validates_workspace_name_and_explicit_off_override() {
     .unwrap();
     assert!(!cfg.experimental_ownerfs_workspace_bind);
     assert!(cfg.ownerfs_workspace_bind.is_some());
-}
-
-#[cfg(feature = "ownerfs")]
-#[test]
-fn ownerfs_workspace_bind_rejects_simultaneous_native_workspace_mode() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("node.toml");
-    std::fs::write(
-        &path,
-        "fs='ownerfs'\nownerfs_mount='/tmp/owner'\nownerfs_workspace_egress_root='/tmp/egress'\nexperimental_native_workspace=true\nexperimental_ownerfs_workspace_bind=true\n[native_workspace]\ncontrol_dir='/tmp/native-control'\nruntime='/usr/bin/runc'\nrootfs='/tmp/native-rootfs'\nidle_command=['/bin/view-observer','idle']\nidentity_command=['/bin/view-observer','identity']\nworkload_uid=501\nworkload_gid=501\n[ownerfs_workspace_bind]\nworkspace='ws'\n",
-    )
-    .unwrap();
-    assert!(
-        Config::resolve(
-            Role::Node,
-            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
-        )
-        .is_err()
-    );
 }
 
 #[cfg(feature = "dfs")]
@@ -1341,12 +1352,51 @@ fn fuse_execution_and_dfs_cache_defaults_are_explicit() {
         ("fuse_threads", serde_json::json!(4)),
         ("fuse_clone_fd", serde_json::json!(true)),
         ("fuse_workers", serde_json::json!(32)),
-        ("dfs_fuse_keep_cache", serde_json::json!(true)),
-        ("dfs_fuse_entry_ttl_ms", serde_json::json!(0)),
-        ("dfs_fuse_attr_ttl_ms", serde_json::json!(0)),
         ("fuse_max_readahead_bytes", serde_json::json!(16777216)),
     ] {
         assert_eq!(value.get(key), Some(&expected), "missing/wrong {key}");
+    }
+    // Retired switches (S1a-7): keep_cache is always on, TTLs are always 0.
+    for key in [
+        "dfs_fuse_keep_cache",
+        "dfs_fuse_entry_ttl_ms",
+        "dfs_fuse_attr_ttl_ms",
+    ] {
+        assert!(value.get(key).is_none(), "retired {key} still resolved");
+    }
+}
+
+#[test]
+fn retired_dfs_fuse_cache_switches_are_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    for line in [
+        "dfs_fuse_keep_cache=false",
+        "dfs_fuse_entry_ttl_ms=0",
+        "dfs_fuse_attr_ttl_ms=0",
+    ] {
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli {
+                    config: Some(path.clone()),
+                    ..Cli::default()
+                },
+            )
+            .is_err(),
+            "retired file key accepted: {line}"
+        );
+    }
+    for flag in [
+        "--dfs-fuse-keep-cache",
+        "--dfs-fuse-entry-ttl-ms",
+        "--dfs-fuse-attr-ttl-ms",
+    ] {
+        assert!(
+            Cli::try_parse_from(["afs-node", flag, "0"]).is_err(),
+            "retired flag accepted: {flag}"
+        );
     }
 }
 
@@ -1356,8 +1406,9 @@ fn fuse_execution_settings_merge_file_cli_and_validate_boundaries() {
     let path = root.path().join("node.toml");
     std::fs::write(
         &path,
-        "fuse_threads=1\nfuse_clone_fd=false\nfuse_workers=1\ndfs_fuse_keep_cache=false\ndfs_fuse_entry_ttl_ms=60000\ndfs_fuse_attr_ttl_ms=60000\nfuse_max_readahead_bytes=16777216\n",
-    ).unwrap();
+        "fuse_threads=1\nfuse_clone_fd=false\nfuse_workers=1\nfuse_max_readahead_bytes=16777216\n",
+    )
+    .unwrap();
     let cfg = Config::resolve(
         Role::Node,
         Cli::try_parse_from([
@@ -1368,8 +1419,6 @@ fn fuse_execution_settings_merge_file_cli_and_validate_boundaries() {
             "64",
             "--fuse-workers",
             "1024",
-            "--dfs-fuse-entry-ttl-ms",
-            "0",
         ])
         .expect("public FUSE options must be recognized"),
     )
@@ -1378,9 +1427,6 @@ fn fuse_execution_settings_merge_file_cli_and_validate_boundaries() {
     assert_eq!(value["fuse_threads"], 64);
     assert_eq!(value["fuse_workers"], 1024);
     assert_eq!(value["fuse_clone_fd"], false);
-    assert_eq!(value["dfs_fuse_keep_cache"], false);
-    assert_eq!(value["dfs_fuse_entry_ttl_ms"], 0);
-    assert_eq!(value["dfs_fuse_attr_ttl_ms"], 60000);
     assert_eq!(value["fuse_max_readahead_bytes"], 16777216);
 }
 
@@ -1393,8 +1439,6 @@ fn fuse_execution_settings_reject_out_of_range_values_before_startup() {
         ("fuse_threads", 65),
         ("fuse_workers", 0),
         ("fuse_workers", 1025),
-        ("dfs_fuse_entry_ttl_ms", 60001),
-        ("dfs_fuse_attr_ttl_ms", 60001),
         ("fuse_max_readahead_bytes", 16777217),
     ] {
         std::fs::write(&path, format!("{key}={number}\n")).unwrap();
@@ -2033,7 +2077,7 @@ fn unified_native_read_has_no_user_sync_async_switch() {
     let json = serde_json::to_value(&config).unwrap();
     assert!(json["dfs_read_pipeline"].get("enabled").is_none());
     assert!(
-        serde_json::from_value::<afs::node::read_pipeline::ReadPipelineLimits>(
+        serde_json::from_value::<afs::node::read::admission::ReadPipelineLimits>(
             serde_json::json!({"enabled":false})
         )
         .is_err()
@@ -2098,4 +2142,254 @@ fn tls_encryption_cli_file_precedence_and_identity_are_independent() {
         )
         .is_err()
     );
+}
+
+fn resolve_toml(role: Role, body: &str) -> afs_error::Result<Config> {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, body).unwrap();
+    Config::resolve(
+        role,
+        Cli::parse_from(["afs", "--config", path.to_str().unwrap()]),
+    )
+}
+
+#[test]
+fn data_mode_keeps_its_toml_cli_and_printed_names() {
+    let auto = resolve_toml(Role::Meta, "data_mode = 'auto'\n").unwrap();
+    assert_eq!(auto.data_mode, DataMode::Auto);
+    assert_eq!(serde_json::to_value(&auto).unwrap()["data_mode"], "auto");
+    let grpc = Config::resolve(Role::Meta, Cli::parse_from(["afs", "--data-mode", "grpc"]));
+    assert_eq!(grpc.unwrap().data_mode, DataMode::Grpc);
+    let default = Config::resolve(Role::Meta, Cli::default()).unwrap();
+    assert_eq!(serde_json::to_value(default).unwrap()["data_mode"], "grpc");
+
+    let rdma = Cli::parse_from(["afs", "--data-mode", "rdma"]);
+    assert_eq!(rdma.data_mode, Some(DataMode::Rdma));
+    let resolved = Config::resolve(Role::Meta, rdma);
+    if cfg!(feature = "rdma") {
+        assert_eq!(resolved.unwrap().data_mode, DataMode::Rdma);
+    } else {
+        assert_eq!(resolved.unwrap_err().code(), afs_error::CONFIG_INVALID);
+    }
+
+    let error = resolve_toml(Role::Meta, "data_mode = 'tcp'\n").unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(
+        error
+            .to_string()
+            .contains("expected one of `grpc`, `rdma`, `auto`"),
+        "{error}"
+    );
+    let error = Cli::try_parse_from(["afs", "--data-mode", "tcp"]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("[possible values: grpc, rdma, auto]"),
+        "{error}"
+    );
+}
+
+#[test]
+fn dfs_replica_failure_policy_defaults_to_degrade_with_one_copy_and_bounds_the_floor() {
+    let default = Config::resolve(Role::Meta, Cli::default()).unwrap();
+    assert_eq!(
+        default.dfs_replica_failure_policy,
+        DfsReplicaFailurePolicy::Degrade
+    );
+    assert_eq!(default.dfs_min_degraded_copies, 1);
+    for (name, value) in [
+        ("degrade", DfsReplicaFailurePolicy::Degrade),
+        ("strict", DfsReplicaFailurePolicy::Strict),
+    ] {
+        let file = resolve_toml(
+            Role::Meta,
+            &format!("dfs_replica_failure_policy = '{name}'\n"),
+        )
+        .unwrap();
+        assert_eq!(file.dfs_replica_failure_policy, value);
+        assert_eq!(
+            serde_json::to_value(&file).unwrap()["dfs_replica_failure_policy"],
+            name
+        );
+        let cli = Cli::parse_from(["afs", "--dfs-replica-failure-policy", name]);
+        assert_eq!(
+            Config::resolve(Role::Meta, cli)
+                .unwrap()
+                .dfs_replica_failure_policy,
+            value
+        );
+    }
+    let two = resolve_toml(
+        Role::Meta,
+        "dfs_desired_copies = 2\ndfs_sync_required_copies = 2\ndfs_min_degraded_copies = 2\n",
+    )
+    .unwrap();
+    assert_eq!(two.dfs_min_degraded_copies, 2);
+    for floor in [
+        "dfs_min_degraded_copies = 0\n",
+        "dfs_desired_copies = 2\ndfs_sync_required_copies = 1\ndfs_min_degraded_copies = 2\n",
+    ] {
+        let error = resolve_toml(Role::Meta, floor).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{floor}");
+    }
+}
+
+#[test]
+fn dfs_local_copy_keeps_its_toml_cli_and_printed_names() {
+    for (name, value) in [
+        ("required", DfsLocalCopy::Required),
+        ("preferred", DfsLocalCopy::Preferred),
+        ("none", DfsLocalCopy::None),
+    ] {
+        let file = resolve_toml(Role::Meta, &format!("dfs_local_copy = '{name}'\n")).unwrap();
+        assert_eq!(file.dfs_local_copy, value);
+        assert_eq!(serde_json::to_value(&file).unwrap()["dfs_local_copy"], name);
+        let cli = Cli::parse_from(["afs", "--dfs-local-copy", name]);
+        assert_eq!(
+            Config::resolve(Role::Meta, cli).unwrap().dfs_local_copy,
+            value
+        );
+    }
+    let default = Config::resolve(Role::Meta, Cli::default()).unwrap();
+    assert_eq!(default.dfs_local_copy, DfsLocalCopy::Required);
+
+    let error = resolve_toml(Role::Meta, "dfs_local_copy = 'always'\n").unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(
+        error
+            .to_string()
+            .contains("expected one of `required`, `preferred`, `none`"),
+        "{error}"
+    );
+    let error = Cli::try_parse_from(["afs", "--dfs-local-copy", "always"]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("[possible values: required, preferred, none]"),
+        "{error}"
+    );
+}
+
+#[test]
+fn test_only_and_diagnostic_flags_are_accepted_but_hidden_from_help() {
+    let mut command = Cli::command();
+    let help = command.render_long_help().to_string();
+    for flag in [
+        "allow-volatile-meta",
+        "peer-endpoint",
+        "dfs-read-diagnostics-enabled",
+    ] {
+        assert!(!help.contains(flag), "--{flag} must not be in --help");
+    }
+    assert!(help.contains("--meta-store"));
+    let cli = Cli::parse_from([
+        "afs",
+        "--allow-volatile-meta",
+        "true",
+        "--peer-endpoint",
+        "https://127.0.0.1:7500",
+        "--dfs-read-diagnostics-enabled",
+        "true",
+    ]);
+    assert_eq!(cli.allow_volatile_meta, Some(true));
+    assert_eq!(cli.peer_endpoint.as_deref(), Some("https://127.0.0.1:7500"));
+    assert_eq!(cli.dfs_read_diagnostics_enabled, Some(true));
+}
+
+#[test]
+fn non_product_options_report_exactly_what_is_enabled() {
+    let default = Config::resolve(Role::Meta, Cli::default()).unwrap();
+    assert!(default.non_product_options().is_empty());
+    let enabled = resolve_toml(
+        Role::Meta,
+        "allow_volatile_meta = true\npeer_endpoint = 'https://127.0.0.1:7500'\n\
+         dfs_read_diagnostics_enabled = true\nfs = 'dfs'\n\
+         [dfs_external_backend]\nstore_id = 's'\ngeneration = '1'\n\
+         endpoint = 'http://127.0.0.1:8333'\nbucket = 'b'\nregion = 'r'\nallow_http = true\n",
+    )
+    .unwrap();
+    assert_eq!(
+        enabled.non_product_options(),
+        [
+            ("allow_volatile_meta", "test-only"),
+            ("dfs_external_backend.allow_http", "test-only"),
+            ("peer_endpoint", "diagnostic"),
+            ("dfs_read_diagnostics_enabled", "diagnostic"),
+        ]
+    );
+}
+
+/// S4-16: background scrub defaults (on at 32 MiB/s, 300 s start delay,
+/// 24 h round interval), 0 turns it off, out-of-range values are rejected
+/// from TOML and CLI.
+#[test]
+fn s4c_scrub_settings_default_on_and_reject_out_of_range() {
+    let defaults = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(
+        (
+            defaults.dfs_scrub_bytes_per_second,
+            defaults.dfs_scrub_start_delay_seconds,
+            defaults.dfs_scrub_round_interval_seconds,
+        ),
+        (32 * 1024 * 1024, 300, 86_400)
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("scrub.toml");
+    std::fs::write(
+        &path,
+        "dfs_scrub_bytes_per_second=0\ndfs_scrub_start_delay_seconds=0\ndfs_scrub_round_interval_seconds=1\n",
+    )
+    .unwrap();
+    let off = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            off.dfs_scrub_bytes_per_second,
+            off.dfs_scrub_start_delay_seconds,
+            off.dfs_scrub_round_interval_seconds,
+        ),
+        (0, 0, 1)
+    );
+    for (key, flag, value) in [
+        (
+            "dfs_scrub_bytes_per_second",
+            "--dfs-scrub-bytes-per-second",
+            "1048575",
+        ),
+        (
+            "dfs_scrub_bytes_per_second",
+            "--dfs-scrub-bytes-per-second",
+            "1073741825",
+        ),
+        (
+            "dfs_scrub_start_delay_seconds",
+            "--dfs-scrub-start-delay-seconds",
+            "86401",
+        ),
+        (
+            "dfs_scrub_round_interval_seconds",
+            "--dfs-scrub-round-interval-seconds",
+            "0",
+        ),
+        (
+            "dfs_scrub_round_interval_seconds",
+            "--dfs-scrub-round-interval-seconds",
+            "2592001",
+        ),
+    ] {
+        std::fs::write(&path, format!("{key}={value}\n")).unwrap();
+        let error = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{key}={value}");
+        let error =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", flag, value])).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{flag} {value}");
+    }
 }

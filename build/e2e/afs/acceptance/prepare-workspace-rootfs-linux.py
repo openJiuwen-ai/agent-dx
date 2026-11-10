@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Prepare a fresh test-only rootfs from an explicitly built Cargo example.
+"""Prepare a fresh test-only rootfs from an explicitly built afs-tools binary.
 
-No Cargo build or dependency installation occurs here. Build the example with
-`cargo build --release --locked --offline -p afs --example afs-workspace-probe` first.
+No Cargo build or dependency installation occurs here. Build the probe with
+`cargo build --release --locked --offline -p afs-tools --bin afs-workspace-probe` first.
 The supplied helper/busybox digests bind inputs; resolved ldd libraries are
 recorded and copied as regular files. Nothing is added to the product package.
 """

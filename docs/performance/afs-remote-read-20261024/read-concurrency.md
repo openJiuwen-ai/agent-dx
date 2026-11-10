@@ -13,7 +13,6 @@ Example (native DFS, gRPC; resource settings are optional):
 ```toml
 fuse_workers = 1
 fuse_max_tasks = 32
-dfs_native_open_read_authority = true
 dfs_read_crc_mode = "off"
 
 [dfs_read_pipeline]
@@ -27,7 +26,7 @@ task_timeout_ms = 30000
 
 Defaults are RPC=4, reply bytes=256MiB, disk reads=2, group operations=4, pending=256, timeout=30000ms. RPC/disk/group limits must be 1..128, pending and task capacity 1..65536, reply bytes 8MiB..1GiB, timeout 1..60000ms. A and B need the same protocol capability, but their limits can differ; the sender caps a group to the advertised receiver limit. A keeps its existing eight service admissions, separate from its global disk-depth limit.
 
-The native entry covers immutable and refreshed views, multiple objects, sparse ranges, CRC off/receiver/both, the existing legacy-object disk cache and its prefetch, and dirty overlays. Cache and CRC rules themselves are preserved. A dirty read may still require the existing write-publication barrier; that write operation is adapted separately before asynchronously reading its resulting layout. Native gRPC owner-handle reads also await their transport. Genuine local file operations and external synchronous backends keep explicit synchronous adapters; native network waits do not use those adapters. Small ranges retain their actual length. An original request is published only after its complete result and final authority/handle checks.
+The native entry covers immutable and refreshed views, multiple objects, sparse ranges, CRC off/receiver/both (`both` is no longer configurable since S1a-7), the existing legacy-object disk cache and its prefetch, and dirty overlays. Cache and CRC rules themselves are preserved. A dirty read may still require the existing write-publication barrier; that write operation is adapted separately before asynchronously reading its resulting layout. Native gRPC owner-handle reads also await their transport. Genuine local file operations and external synchronous backends keep explicit synchronous adapters; native network waits do not use those adapters. Small ranges retain their actual length. An original request is published only after its complete result and final authority/handle checks.
 
 ## One request and its owners
 
@@ -74,7 +73,7 @@ Production code additionally preserves absolute deadlines, errors, original open
 
 ## Observations and acceptance
 
-`afs_dfs_read_pipeline_*{stage=...}` reports fixed-cardinality source IO, issued range RPCs, peer pending/queued tasks, owned reply capacity, A/B byte-budget and RPC-slot waits, disk admission waits, response production, admitted dispatch tasks, and completion-queue waits. `source_io` is positioned API calls, not hardware queue depth. `send_wait` covers the complete response-production scope including enqueueing; it is not pure network stall. `fuse_task` is a state observation including dispatch waiting and running work, so its duration counter is intentionally unused. Durations overlap and are not additive E2E wall time. Peaks are process-lifetime peaks; do not subtract them as if they were counts. Active byte credits and pool backing gauges describe overlapping ownership: native pool active plus idle backing capacity shares its configured total budget. Transport buffers, allocator overhead and application memory remain separate.
+`afs_dfs_read_pipeline_*{stage=...}` reports the fixed stages `range_rpc` (issued range RPCs), `reply_bytes` (owned reply capacity), `fuse_task` (admitted dispatch tasks), `completion_wait` and `reply_wait` (`afs/src/node/read/activity.rs`); the earlier `source_io`, `send_wait` and peer queue stages were removed. `fuse_task` is a state observation including dispatch waiting and running work, so its duration counter is intentionally unused. Durations overlap and are not additive E2E wall time. Peaks are process-lifetime peaks; do not subtract them as if they were counts. Active byte credits and pool backing gauges describe overlapping ownership: native pool active plus idle backing capacity shares its configured total budget. Transport buffers, allocator overhead and application memory remain separate.
 
 This candidate's validation and performance evidence is stored outside the source tree in the task ledger. Functional validation is not a performance claim; fewer RPCs or more overlapping reads do not establish stable E2E acceleration. Existing integrity/compatibility admission gaps inherited from PR95 remain listed in `read-path-update-20261025.md` and are not cleared by this refactor.
 

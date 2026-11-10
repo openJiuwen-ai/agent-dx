@@ -150,7 +150,7 @@ class RunnerError(RuntimeError):
 
 def find_repo_root(start: Path) -> Path:
     for parent in [start, *start.parents]:
-        if (parent / "Cargo.toml").is_file() and (parent / "afs" / "common" / "protocol" / "proto").is_dir():
+        if (parent / "Cargo.toml").is_file() and (parent / "afs" / "crates" / "protocol" / "proto").is_dir():
             return parent
     raise RunnerError(f"cannot find Agent DX repository root from {start}")
 
@@ -1022,7 +1022,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--grpcurl", default="grpcurl", help="grpcurl binary on meta host C for OwnerRoots.LookupRoot")
     parser.add_argument(
         "--proto-root",
-        default=str(find_repo_root(Path(__file__).resolve()) / "afs" / "common" / "protocol" / "proto"),
+        default=str(find_repo_root(Path(__file__).resolve()) / "afs" / "crates" / "protocol" / "proto"),
         help="directory containing meta.proto on node A; copied to C for grpcurl",
     )
     parser.add_argument("--expected-home-node-id", help="override expected home node id in LookupRoot")

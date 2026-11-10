@@ -156,6 +156,7 @@ class PipelineContracts(unittest.TestCase):
             "afs-protocol",
             "afs-tracing",
             "afs-transport",
+            "afs-tools",
         ):
             self.assertIn(f"--exclude {package}", makefile)
         self.assertIn("ADX_WITH_AFS ?= 0", makefile)

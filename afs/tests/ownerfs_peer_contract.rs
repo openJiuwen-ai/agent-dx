@@ -39,7 +39,7 @@ use afs::node::{
 #[cfg(feature = "rdma")]
 use afs_protocol::node_control::{
     NegotiateDataRequest, OwnerCloseDataRequest, OwnerNegotiateDataRequest,
-    node_control_client::NodeControlClient,
+    owner_control_client::OwnerControlClient,
 };
 use afs_protocol::node_data::{
     DataPlane, DataTransfer, FileIdentity, OwnerCaller, OwnerCreateRequest, OwnerGetAttrRequest,
@@ -623,7 +623,7 @@ async fn owner_rdma_fixture_with_authority(
     let metrics_registry = afs_metrics::Registry::new();
     let metrics =
         afs::node::rpc::OwnerRpcMetrics::register(&metrics_registry).expect("Owner metrics");
-    let control = afs::node::rpc::control::NodeControlService::new(RdmaSessionRegistry::new(None))
+    let control = afs::node::rpc::control::OwnerControlService::new(Default::default())
         .with_owner_locks(executor.clone(), authenticator.clone())
         .with_owner_rdma_registry(rdma_registry.clone())
         .into_server();
@@ -893,7 +893,7 @@ async fn negotiate_owner_rdma_window(
         .expect("open RDMA endpoint");
     let client_info = endpoint.info().expect("client RDMA info").to_vec();
     let capacity = endpoint.capacity();
-    let mut control = NodeControlClient::new(channel);
+    let mut control = OwnerControlClient::new(channel);
     let reply = control
         .owner_negotiate_data(tonic::Request::new(OwnerNegotiateDataRequest {
             access: Some(access),
@@ -926,7 +926,7 @@ async fn negotiate_owner_rdma_window(
 
 #[cfg(feature = "rdma")]
 async fn close_owner_rdma_window(channel: Channel, access: RootAccess, session_id: u64) {
-    NodeControlClient::new(channel)
+    OwnerControlClient::new(channel)
         .owner_close_data(tonic::Request::new(OwnerCloseDataRequest {
             access: Some(access),
             session_id,
@@ -1267,7 +1267,7 @@ async fn ownerfiles_rdma_authority_validation_may_block_on_tokio_handle() {
     let mut access = root_access_for(&fixture.grant);
     access.session_id = "session-fresh-negotiate".to_owned();
     let before = *fixture.meta.validate_calls.lock().unwrap();
-    let reply = NodeControlClient::new(fixture.channel.clone())
+    let reply = OwnerControlClient::new(fixture.channel.clone())
         .owner_negotiate_data(tonic::Request::new(OwnerNegotiateDataRequest {
             access: Some(access),
             negotiation: Some(NegotiateDataRequest {
@@ -1784,11 +1784,9 @@ async fn ownerfiles_rejects_rdma_plane_without_negotiated_owner_session_before_w
         listener.local_addr().unwrap().port()
     );
     let executor = fs.peer_executor().expect("peer executor");
-    let control = afs::node::rpc::control::NodeControlService::new(
-        afs::node::rpc::control::RdmaSessionRegistry::new(None),
-    )
-    .with_owner_locks(executor.clone(), Arc::new(RequireMtlsNodeB))
-    .into_server();
+    let control = afs::node::rpc::control::OwnerControlService::new(Default::default())
+        .with_owner_locks(executor.clone(), Arc::new(RequireMtlsNodeB))
+        .into_server();
     let handler = make_owner_files_handler(executor);
     let server_tls = ServerTlsConfig::new()
         .client_ca_root(Certificate::from_pem(CA_PEM))
@@ -1958,11 +1956,9 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
         listener.local_addr().unwrap().port()
     );
     let executor = fs.peer_executor().expect("peer executor");
-    let control = afs::node::rpc::control::NodeControlService::new(
-        afs::node::rpc::control::RdmaSessionRegistry::new(None),
-    )
-    .with_owner_locks(executor.clone(), Arc::new(RequireMtlsNodeB))
-    .into_server();
+    let control = afs::node::rpc::control::OwnerControlService::new(Default::default())
+        .with_owner_locks(executor.clone(), Arc::new(RequireMtlsNodeB))
+        .into_server();
     let handler = make_owner_files_handler(executor);
     let server_tls = ServerTlsConfig::new()
         .client_ca_root(Certificate::from_pem(CA_PEM))

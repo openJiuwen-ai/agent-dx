@@ -1,5 +1,5 @@
 use afs::meta::store::{
-    journal::{LogLimits, LogTip, RecoveredLog},
+    journal::{AppendLimits, CheckpointLimits, LogCursor, LogStatus, LogTip, RecoveredLog},
     log::Record,
 };
 use std::sync::{
@@ -54,13 +54,34 @@ impl MetaLog for SwitchableBackend {
         self.persistence
             .unwrap_or(afs::meta::store::BackendPersistence::Unknown)
     }
-    fn limits(&self) -> LogLimits {
+    fn limits(&self) -> AppendLimits {
         self.inner.limits()
     }
     fn recover(&self) -> MetaFuture<'_, RecoveredLog> {
         self.inner.recover()
     }
-    fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
+    fn checkpoint_limits(&self) -> CheckpointLimits {
+        self.inner.checkpoint_limits()
+    }
+    /// This wrapper does not forward checkpoints, so Store schedules none.
+    fn supports_checkpoint(&self) -> bool {
+        false
+    }
+    fn status(&self) -> MetaFuture<'_, LogStatus> {
+        self.inner.status()
+    }
+    fn can_append(&self, expected: LogCursor, bytes: usize) -> MetaFuture<'_, bool> {
+        self.inner.can_append(expected, bytes)
+    }
+    fn install_checkpoint(&self, _: LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
+        Box::pin(async {
+            Err(afs_error::Error::coded(
+                afs_error::IO_UNAVAILABLE,
+                "test wrapper does not install checkpoints",
+            ))
+        })
+    }
+    fn append_and_sync(&self, expected: LogCursor, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
         self.inner.append_and_sync(expected, records)
     }
     fn health(&self) -> MetaFuture<'_, ()> {
@@ -101,6 +122,7 @@ fn request(session_id: &str) -> RegisterNodeRequest {
             storage_devices: Vec::new(),
         }),
         lease_seconds: 30,
+        protocol_version: afs::format::version::NODE_META_PROTOCOL,
     }
 }
 
@@ -126,6 +148,57 @@ async fn get_json(meta: Arc<Meta>, path: &str) -> (StatusCode, Value) {
     let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
     let json = serde_json::from_slice(&body).unwrap();
     (status, json)
+}
+
+/// K4: Meta admits only Nodes speaking its Node-Meta protocol version. A
+/// missing field (0, an older Node) and any other version are refused with a
+/// structured `META_NODE_PROTOCOL_VERSION` before a session is written.
+#[tokio::test]
+async fn register_node_refuses_other_protocol_versions_before_writing() {
+    let store = Arc::new(
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
+            .await
+            .unwrap(),
+    );
+    let meta = Arc::new(Meta::with_store(
+        "meta-protocol-test".into(),
+        Observability::new().unwrap(),
+        store.clone(),
+    ));
+    let supported = afs::format::version::NODE_META_PROTOCOL;
+    assert_eq!(
+        supported, 6,
+        "generation 5 predates the replica failure contract (S4b R12)"
+    );
+    for found in [0, 1, supported - 1, supported + 1] {
+        let mut request = request("session-old");
+        request.protocol_version = found;
+        let status = MetaRpc(meta.clone())
+            .register_node(GrpcRequest::new(request))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        let error = afs_transport::grpc::error_status::status_to_error(status);
+        assert_eq!(error.code(), afs_error::META_NODE_PROTOCOL_VERSION);
+        for part in [
+            "Node-Meta protocol".to_owned(),
+            "node-a".to_owned(),
+            format!("version {found}"),
+            format!("supports version {supported}"),
+        ] {
+            assert!(error.message().contains(&part), "{part}: {error}");
+        }
+    }
+    let session = afs::meta::store::MetaStore::read(
+        store.as_ref(),
+        afs::meta::store::MetaRead::CurrentNodeSession {
+            node_id: "node-a".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(session.entity.is_none(), "a refused Node has no session");
+    assert!(register(meta, "session-current").await.lease_remaining_ms > 0);
 }
 
 #[tokio::test]

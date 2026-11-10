@@ -7,5 +7,5 @@
 pub mod local;
 pub mod rest;
 pub mod usrbio;
-#[cfg(test)]
+#[cfg(all(test, feature = "dfs"))]
 mod usrbio_e2e;

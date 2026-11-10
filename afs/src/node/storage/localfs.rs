@@ -46,6 +46,7 @@ impl LocalFs {
     /// The path-based `open_file` walks every component from the filesystem
     /// root again; callers that already hold the parent directory use this to
     /// resolve the leaf in a single step.
+    #[cfg(feature = "ownerfs")]
     pub(crate) fn open_child_in(
         directory: &LocalDirectory,
         name: &OsStr,

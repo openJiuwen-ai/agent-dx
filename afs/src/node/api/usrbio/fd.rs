@@ -142,7 +142,7 @@ impl FdBridge {
     pub(crate) fn note_fuse_data(&self, write: bool) {
         self.fuse_data[usize::from(write)].fetch_add(1, Ordering::Relaxed);
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dfs"))]
     pub(crate) fn fuse_data_counts(&self) -> [u64; 2] {
         [
             self.fuse_data[0].load(Ordering::Relaxed),
