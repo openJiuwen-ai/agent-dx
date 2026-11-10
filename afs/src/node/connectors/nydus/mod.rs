@@ -44,6 +44,9 @@ impl Default for NydusConfig {
 #[serde(deny_unknown_fields)]
 pub struct RegistryConfig {
     pub registry: String,
+    /// Only enable for a trusted development Registry on an isolated network.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
     pub repository: String,
     pub username: Option<String>,
     pub password_file: Option<PathBuf>,

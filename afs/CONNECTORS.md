@@ -49,6 +49,7 @@ repository = "team/nydus-image"
 # password_file = "/etc/afs/registry-password"
 # bearer_token_file = "/etc/afs/registry-token"
 # auth_realm = "https://auth.example.com/token"
+# allow_insecure_http = true # 仅用于隔离测试的明文 Registry
 ```
 
 配置身份必须有存储目录的创建／读取权限。这些 HTTP 路由使用配置的服务身份，服务于受信任的 Nydus 客户端；本模块没有新增终端用户鉴权。部署方须限制 Node REST 的访问范围，不能把它当作公开的多租户 Registry 网关。
@@ -77,7 +78,7 @@ Nydus backend 示例（替换实际地址与具体 manifest digest）：
 4. 故障：失败的范围不读成零；已有范围仍可复用。回源中断后请求可重试。接管遵循现有租约与 fencing，不能承诺故障后立即切换；已提交数据的可用性取决于既有持久副本，不因绑定了 Registry 就自动重建丢失的已提交 chunk。
 5. 停止：关闭 HTTP 接入，排空保留生命周期的文件工作和 lazy-fill，再执行已有 DFS 排空。删除复用 unlink/rmdir 和既有 GC；开放句柄与后台回收仍遵循 AFS 本身的合同。
 
-默认只有按需读取，没有全量后台下载或新增回源预取。没有必选分段校验清单：Provider 校验 manifest digest 与传输范围，Nydus 校验内容；完整但错误的源站正文可能先进入缓存，自动修复此类内容错误不在本版范围。首次验证不代表性能或跨物理机 HA 资格。
+默认只有按需读取。配置的 Registry 必须受信，默认使用 HTTPS，HTTPS 请求禁止降级到 HTTP。Provider 校验 manifest digest 与传输范围。首次填充的字节依赖受信 Registry 的正确性，完整 blob digest 无法独立校验单次 Range。首次验证不代表性能或跨物理机 HA 资格。
 
 ## 验证入口
 

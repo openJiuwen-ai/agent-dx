@@ -298,7 +298,8 @@ impl RegistryProvider {
                     .join(location)
                     .map_err(|_| invalid("invalid Registry redirect"))?;
                 if !matches!(next.scheme(), "http" | "https")
-                    || (original.scheme() == "https" && next.scheme() != "https")
+                    || (next.scheme() == "http"
+                        && (!source.config.allow_insecure_http || url.scheme() == "https"))
                     || !next.username().is_empty()
                     || next.password().is_some()
                 {
@@ -424,6 +425,12 @@ pub fn validate_component(value: &str) -> Result<()> {
 
 fn validate_registry(config: &RegistryConfig) -> Result<()> {
     let url = Url::parse(&config.registry).map_err(|_| invalid("invalid Registry URL"))?;
+    if url.scheme() == "http" && !config.allow_insecure_http {
+        return Err(Error::coded(
+            afs_error::CONFIG_INVALID,
+            "Nydus Registry requires HTTPS unless allow_insecure_http is enabled",
+        ));
+    }
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
         || url.password().is_some()
@@ -494,6 +501,22 @@ fn unavailable(message: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_requires_https_without_explicit_opt_in() {
+        let mut config: RegistryConfig = serde_json::from_value(serde_json::json!({
+            "registry": "http://registry.example.com",
+            "repository": "test/image"
+        }))
+        .unwrap();
+        assert!(validate_registry(&config).is_err());
+        config.allow_insecure_http = true;
+        assert!(validate_registry(&config).is_ok());
+        config.allow_insecure_http = false;
+        config.registry = "https://registry.example.com".into();
+        assert!(validate_registry(&config).is_ok());
+    }
+
     #[test]
     fn accepts_only_fixed_safe_digest_and_source_names() {
         assert_eq!(
@@ -531,6 +554,7 @@ mod tests {
         });
         let config = RegistryConfig {
             registry: registry.clone(),
+            allow_insecure_http: true,
             repository: "test/image".into(),
             username: None,
             password_file: None,
