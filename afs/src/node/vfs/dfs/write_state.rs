@@ -144,6 +144,8 @@ pub struct DfsWriteSession {
 
 pub(super) struct ResolvedReadView {
     pub(super) committed: Option<FileVersionId>,
+    /// The GC reference that keeps `committed` while this read uses it (R94).
+    pub(super) base_reference: Option<Arc<crate::node::gc::GcPin>>,
     pub(super) length: u64,
     pub(super) layout: LayoutRoot,
     pub(super) frozen: Option<DirtyExtentMap>,
@@ -155,6 +157,11 @@ pub(super) struct InodeWriteState {
     pub(super) write_lease: WriteLease,
     pub(super) base_version: Option<FileVersion>,
     pub(super) base_layout: LayoutRoot,
+    /// The GC reference of `base_version` that reads through this state share,
+    /// taken by the first such read (R94). A write lease, or a writer still
+    /// open, does not keep the base: the lease can lapse while a writer is open
+    /// and this Node's next commit retires the base as head.
+    pub(super) base_read_reference: Option<(FileVersionId, Arc<crate::node::gc::GcPin>)>,
     pub(super) logical_length: u64,
     pub(super) metadata_dirty: bool,
     pub(super) kill_suidgid_dirty: bool,
@@ -732,6 +739,7 @@ impl DistributedFs {
                 write_lease,
                 base_version,
                 base_layout,
+                base_read_reference: None,
                 logical_length,
                 metadata_dirty: false,
                 kill_suidgid_dirty: false,

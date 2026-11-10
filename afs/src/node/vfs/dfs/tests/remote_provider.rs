@@ -1236,3 +1236,109 @@ fn remote_release_capacity_rejects_new_admission_without_owner_open() {
     assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
     assert!(fs_a.handles.is_empty());
 }
+
+/// MR186 recheck P2-2: the path SDK close is flush + release. Once the owner has
+/// synced the proxied writes, a failure of only the read-view lookup that the
+/// last proxy writer's release makes for this Node's other handles is not a
+/// write error: close succeeds, the data is durable, and the open reader
+/// still reaches the proxied commit on a later read.
+#[test]
+fn proxied_close_after_owner_sync_survives_a_failed_read_view_lookup() {
+    let pair = remote_owner_pair("proxied-close-lookup.bin", 0o640, b"base-data");
+    let reader = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDONLY)
+        .unwrap();
+    let writer = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDWR)
+        .unwrap();
+    assert!(
+        pair.fs_b
+            .write_coordinator
+            .current_remote_provider(&pair.inode_id)
+            .unwrap()
+            .is_some(),
+        "the writer is proxied to the owner on node A"
+    );
+    pair.fs_b.write(&context(), writer, 0, b"PROXIED").unwrap();
+    // SDK close, step 1: flush. The owner syncs the write.
+    pair.fs_b.flush(&context(), writer).unwrap();
+    let durable = pair.meta.inode.lock().unwrap().head_version.clone();
+    // Step 2: release. Only the read-view lookup fails.
+    let lookups = pair.meta.get_inode_call_count();
+    pair.meta
+        .fail_next_get_inode_with(unavailable("injected read-view lookup failure"));
+    let released = pair.fs_b.release(&context(), writer);
+    assert_eq!(
+        pair.meta.get_inode_call_count(),
+        lookups + 1,
+        "the release made exactly the one read-view lookup"
+    );
+    assert!(released.is_ok(), "close reported {released:?}");
+    assert!(
+        pair.fs_b
+            .write_coordinator
+            .current_remote_provider(&pair.inode_id)
+            .unwrap()
+            .is_none(),
+        "the proxy provider is retired"
+    );
+    assert!(pair.fs_a.handles.is_empty(), "the owner handle is released");
+    // The proxied write is durable and the reader still reaches it.
+    assert_eq!(pair.meta.inode.lock().unwrap().head_version, durable);
+    let fresh = pair
+        .fs_a
+        .open(
+            &context(),
+            pair.fs_a.backend_inode(&pair.inode_id).unwrap(),
+            libc::O_RDONLY,
+        )
+        .unwrap();
+    assert_eq!(
+        pair.fs_a.read_owned(&context(), fresh, 0, 64).unwrap(),
+        b"PROXIEDta"
+    );
+    pair.fs_a.release(&context(), fresh).unwrap();
+    // The reader kept its protected view and moves on its next read (this
+    // pair has no peer data path, so the move is driven directly).
+    assert!(pair.fs_b.handle_view_pending(reader).unwrap());
+    pair.fs_b.retry_pending_view(reader).unwrap();
+    assert!(!pair.fs_b.handle_view_pending(reader).unwrap());
+    assert_eq!(
+        pair.fs_b
+            .handle_snapshot(reader)
+            .unwrap()
+            .opened_inode
+            .head_version,
+        durable
+    );
+    pair.fs_b.release(&context(), reader).unwrap();
+}
+
+/// Control for the test above: a real owner write error still reaches the
+/// path SDK close (flush + release) of the proxied writer.
+#[test]
+fn proxied_close_still_delivers_an_owner_write_error() {
+    let pair = remote_owner_pair("proxied-close-error.bin", 0o640, b"base-data");
+    let reader = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDONLY)
+        .unwrap();
+    let writer = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDWR)
+        .unwrap();
+    let before = pair.meta.inode.lock().unwrap().head_version.clone();
+    pair.fs_b.write(&context(), writer, 0, b"LOST").unwrap();
+    pair.meta.fail_next_commit();
+    let flushed = pair.fs_b.flush(&context(), writer);
+    let released = pair.fs_b.release(&context(), writer);
+    let closed = flushed.and(released);
+    assert!(
+        closed.is_err(),
+        "close must report the owner's failed commit"
+    );
+    assert_eq!(pair.meta.inode.lock().unwrap().head_version, before);
+    pair.fs_b.release(&context(), reader).unwrap();
+}

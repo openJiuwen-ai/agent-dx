@@ -1188,11 +1188,33 @@ impl RemoteProviderHost for DistributedFs {
 
     fn remote_provider_replaced(&self, inode_id: &InodeId, last_provider: bool) -> Result<()> {
         self.handles.mark_dynamic(inode_id)?;
-        if last_provider && !self.handles.for_inode(inode_id)?.is_empty() {
+        let handles = self.handles.for_inode(inode_id)?;
+        if last_provider && !handles.is_empty() {
             // Writes this Node proxied are visible to its handles (4a): once
             // the last proxy session ends they pin the version it produced.
-            let inode = self.validate_inode(self.meta.get_inode(inode_id)?)?;
-            self.advance_to_local_view(&inode)?;
+            // The owner has already synced them; failing to look that version
+            // up is not a write error of the closing writer, so its handles
+            // keep their protected views and the next read looks again.
+            match self
+                .meta
+                .get_inode(inode_id)
+                .and_then(|inode| self.validate_inode(inode))
+            {
+                Ok(inode) => self.advance_to_local_view(&inode)?,
+                Err(error) => {
+                    afs_logging::warn!("dfs.handle_view_refresh_failed";
+                        "inode" => inode_id.0.as_str(),
+                        "handles" => handles.len(),
+                        "error" => error.to_string());
+                    for handle in handles {
+                        handle
+                            .state
+                            .lock()
+                            .map_err(|_| unavailable("DFS handle state is poisoned"))?
+                            .refresh_view = true;
+                    }
+                }
+            }
         }
         Ok(())
     }

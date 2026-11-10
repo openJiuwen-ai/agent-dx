@@ -583,6 +583,8 @@ impl DistributedFs {
         state.inode = updated;
         state.base_version = Some(version);
         state.base_layout = layout;
+        // In-flight reads keep their own reference of the old base (R94).
+        let _retired_base_reference = state.base_read_reference.take();
         state.dirty = !state.dirty_extents.is_empty();
         state.durable_write_seq = through_seq;
         state.committed_write_seq = through_seq;

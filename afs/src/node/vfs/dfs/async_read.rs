@@ -228,6 +228,7 @@ impl DistributedFs {
                 if state.has_local_write_activity() {
                     Some(ResolvedReadView {
                         committed: state.base_version.as_ref().map(|v| v.id.clone()),
+                        base_reference: Self::cached_base_reference(&state),
                         length: state.logical_length,
                         layout: state.base_layout.clone(),
                         frozen: state
@@ -240,7 +241,34 @@ impl DistributedFs {
                     None
                 }
             };
+            let view = match view {
+                Some(mut view) => {
+                    let base = self.base_reference_async(&snapshot.inode_id, &view).await;
+                    // Unprotectable base with nothing local over it: the handle
+                    // reads its own, protected version below.
+                    self.settle_base_reference(&state, &mut view, base)?
+                        .then_some(view)
+                }
+                None => None,
+            };
             if let Some(view) = view {
+                // Held until the read ends: the base stays collectable-proof
+                // even if this Node commits again meanwhile (R94).
+                let _base_reference = view.base_reference.clone();
+                #[cfg(test)]
+                {
+                    let hook = self
+                        .hooks
+                        .write_state_read_after_view
+                        .lock()
+                        .unwrap()
+                        .take();
+                    if let Some(hook) = hook {
+                        crate::node::bridge::spawn_blocking(hook)
+                            .await
+                            .map_err(|_| unavailable("test hook panicked"))?;
+                    }
+                }
                 if offset >= view.length || size == 0 {
                     return Ok(prost::bytes::Bytes::new());
                 }

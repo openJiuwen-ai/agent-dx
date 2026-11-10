@@ -85,6 +85,9 @@ pub(super) struct HandleMut {
     /// whole: a new version is published only together with its reference.
     pub(super) opened_inode: Arc<OpenedView>,
     pub(super) pending_view: Option<PendingView>,
+    /// This Node's proxied writes ended but the inode they produced could not
+    /// be looked up: the next read looks it up and moves the handle.
+    pub(super) refresh_view: bool,
     pub(super) opened_page_identity: Option<PageCacheIdentity>,
     pub(super) native_read_view: Option<NativeReadView>,
     pub(super) native_read_generation: u64,
@@ -106,6 +109,7 @@ impl From<DfsFileHandle> for DfsHandle {
             state: Mutex::new(HandleMut {
                 opened_inode: Arc::new(OpenedView::new(opened.opened_inode, opened.gc_pin)),
                 pending_view: None,
+                refresh_view: false,
                 opened_page_identity: opened.opened_page_identity,
                 native_read_view: opened.native_read_view,
                 native_read_generation: opened.native_read_generation,
@@ -416,6 +420,7 @@ impl DistributedFs {
         }
         let undelivered = self.release_writer(&session.local)?;
         self.publish_deferred_views(&removed.inode_id)?;
+        self.retire_base_reference(&removed.inode_id)?;
         Ok(undelivered)
     }
 
@@ -504,10 +509,12 @@ impl DistributedFs {
     /// a failed reference never turns a committed write into an uncommitted one.
     ///
     /// While a local writer is open every read of the inode on this Node goes
-    /// through its write state, not a handle's view, and the newest local
-    /// version is the head under this Node's write lease. Publication then
-    /// waits as a pending view, without an admission, until the last local
-    /// writer closes (`publish_deferred_views`) or a read or commit after that.
+    /// through its write state, not a handle's view; such a read protects the
+    /// base it selects itself (`base_read_reference`), whether or not the write
+    /// lease is still valid. Publication then waits as a pending view, without
+    /// an admission, until the last local writer closes
+    /// (`publish_deferred_views`) or a read or commit after that. A commit no
+    /// read follows thus costs no admission.
     fn advance_handles(
         &self,
         inode: &InodeRecord,
@@ -598,8 +605,10 @@ impl DistributedFs {
     }
 
     /// After the last local writer of the inode closed: publish the views its
-    /// commits left pending, with one admission for the newest local version,
-    /// while that version is still the head under this Node's write lease.
+    /// commits left pending, with one admission for the newest local version
+    /// (shared with the write state's base reference when a read took one). If
+    /// that version is gone already the admission fails and the handles keep
+    /// their own, protected versions.
     pub(super) fn publish_deferred_views(&self, inode_id: &InodeId) -> Result<()> {
         if self.local_writers_open(inode_id)? {
             return Ok(());
@@ -670,12 +679,13 @@ impl DistributedFs {
         let Some(opened) = self.handles.get(handle.0)? else {
             return Ok(false);
         };
-        let pending = opened
-            .state
-            .lock()
-            .map_err(|_| unavailable("DFS handle state is poisoned"))?
-            .pending_view
-            .is_some();
+        let pending = {
+            let state = opened
+                .state
+                .lock()
+                .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+            state.pending_view.is_some() || state.refresh_view
+        };
         Ok(pending && !self.local_writers_open(&opened.inode_id)?)
     }
 
@@ -686,6 +696,35 @@ impl DistributedFs {
         let Some(opened) = self.handles.get(handle.0)? else {
             return Ok(());
         };
+        let refresh = opened
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS handle state is poisoned"))?
+            .refresh_view;
+        if refresh && !self.local_writers_open(&opened.inode_id)? {
+            match self
+                .meta
+                .get_inode(&opened.inode_id)
+                .and_then(|inode| self.validate_inode(inode))
+            {
+                Ok(inode) => {
+                    self.advance_to_local_view(&inode)?;
+                    for handle in self.handles.for_inode(&opened.inode_id)? {
+                        handle
+                            .state
+                            .lock()
+                            .map_err(|_| unavailable("DFS handle state is poisoned"))?
+                            .refresh_view = false;
+                    }
+                }
+                Err(error) => {
+                    afs_logging::debug!("dfs.handle_view_refresh_retry_failed";
+                        "inode" => opened.inode_id.0.as_str(),
+                        "error" => error.to_string());
+                    return Ok(());
+                }
+            }
+        }
         let target = {
             let mut state = opened
                 .state
@@ -744,6 +783,146 @@ impl DistributedFs {
         let replaced = Self::publish_view(&mut state, view)?;
         drop(state);
         drop(replaced);
+        Ok(())
+    }
+}
+
+/// Outcome of protecting the committed base a write-state read selected.
+pub(super) enum BaseReference {
+    /// Already protected, nothing committed, or GC references are off.
+    NotNeeded,
+    Taken(Arc<crate::node::gc::GcPin>),
+    Failed(Error),
+}
+
+impl DistributedFs {
+    /// The base reference reads through this write state already share.
+    pub(super) fn cached_base_reference(
+        state: &InodeWriteState,
+    ) -> Option<Arc<crate::node::gc::GcPin>> {
+        let base = state.base_version.as_ref()?;
+        state
+            .base_read_reference
+            .as_ref()
+            .filter(|(version, _)| *version == base.id)
+            .map(|(_, pin)| pin.clone())
+    }
+
+    fn base_reference_needed(&self, view: &ResolvedReadView) -> Option<FileVersionId> {
+        if view.base_reference.is_some() || self.gc.references.is_none() {
+            return None;
+        }
+        view.committed.clone()
+    }
+
+    /// Synchronous reads take the base reference on the calling thread.
+    pub(super) fn base_reference_sync(
+        &self,
+        inode_id: &InodeId,
+        view: &ResolvedReadView,
+    ) -> BaseReference {
+        let (Some(version), Some(references)) = (
+            self.base_reference_needed(view),
+            self.gc.references.as_ref(),
+        ) else {
+            return BaseReference::NotNeeded;
+        };
+        match references.pin(inode_id, Some(&version)) {
+            Ok(pin) => BaseReference::Taken(pin),
+            Err(error) => BaseReference::Failed(error),
+        }
+    }
+
+    /// Asynchronous reads take it on the blocking pool: the admission is a
+    /// synchronous Meta call a runtime worker must not block on.
+    pub(super) async fn base_reference_async(
+        &self,
+        inode_id: &InodeId,
+        view: &ResolvedReadView,
+    ) -> BaseReference {
+        let (Some(version), Some(references)) =
+            (self.base_reference_needed(view), self.gc.references.clone())
+        else {
+            return BaseReference::NotNeeded;
+        };
+        let inode_id = inode_id.clone();
+        match crate::node::bridge::spawn_blocking(move || references.pin(&inode_id, Some(&version)))
+            .await
+        {
+            Ok(Ok(pin)) => BaseReference::Taken(pin),
+            Ok(Err(error)) => BaseReference::Failed(error),
+            Err(_) => BaseReference::Failed(unavailable(
+                "DFS base read reference admission was cancelled",
+            )),
+        }
+    }
+
+    /// Apply `base` to `view`. `Ok(true)`: read `view`, its base protected for
+    /// the read. `Ok(false)`: the base could not be protected and nothing local
+    /// overlays it, so the caller reads the handle's own, protected version
+    /// instead (as when a handle's view cannot advance). With local data over
+    /// the base, a read without protection could lose that data, so the
+    /// admission error is returned.
+    pub(super) fn settle_base_reference(
+        &self,
+        cell: &SharedInodeWriteState,
+        view: &mut ResolvedReadView,
+        base: BaseReference,
+    ) -> Result<bool> {
+        match base {
+            BaseReference::NotNeeded => Ok(true),
+            BaseReference::Taken(pin) => {
+                let version = view.committed.clone();
+                let replaced = {
+                    let mut state = cell
+                        .lock()
+                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                    match (&version, state.base_version.as_ref()) {
+                        (Some(version), Some(base))
+                            if base.id == *version
+                                && Self::cached_base_reference(&state).is_none() =>
+                        {
+                            state
+                                .base_read_reference
+                                .replace((version.clone(), pin.clone()))
+                        }
+                        _ => None,
+                    }
+                };
+                drop(replaced);
+                view.base_reference = Some(pin);
+                Ok(true)
+            }
+            BaseReference::Failed(error) => {
+                afs_logging::warn!("dfs.write_state_read_reference_failed";
+                    "version" => view.committed.as_ref().map_or("", |version| version.0.as_str()),
+                    "error" => error.to_string());
+                let overlaid = view
+                    .frozen
+                    .as_ref()
+                    .is_some_and(|frozen| !frozen.is_empty())
+                    || !view.active.is_empty();
+                if overlaid { Err(error) } else { Ok(false) }
+            }
+        }
+    }
+
+    /// Drop the shared base reference once no local writer and no pending
+    /// write work is left: later reads use their handle's own version.
+    pub(super) fn retire_base_reference(&self, inode_id: &InodeId) -> Result<()> {
+        let Some(cell) = self.write_state(inode_id)? else {
+            return Ok(());
+        };
+        let retired = {
+            let mut state = cell
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            if state.has_local_write_activity() {
+                return Ok(());
+            }
+            state.base_read_reference.take()
+        };
+        drop(retired);
         Ok(())
     }
 }

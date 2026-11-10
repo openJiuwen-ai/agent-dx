@@ -193,6 +193,7 @@ impl DistributedFs {
                             .base_version
                             .as_ref()
                             .map(|version| version.id.clone()),
+                        base_reference: Self::cached_base_reference(&state),
                         length: state.logical_length,
                         layout: state.base_layout.clone(),
                         frozen: state
@@ -203,8 +204,13 @@ impl DistributedFs {
                     })
                 }
             };
-            if let Some(view) = view {
-                return self.read_visible_resolved(view, offset, out);
+            if let Some(mut view) = view {
+                let base = self.base_reference_sync(inode_id, &view);
+                if self.settle_base_reference(&state, &mut view, base)? {
+                    return self.read_visible_resolved(view, offset, out);
+                }
+                // The base could not be protected and nothing local overlays
+                // it: read the handle's own, protected version below.
             }
         }
 
@@ -519,6 +525,7 @@ impl DistributedFs {
             if state.write_session.is_some()
                 || state.opened_inode.kind != InodeKind::Regular
                 || state.pending_view.is_some()
+                || state.refresh_view
             {
                 return None;
             }

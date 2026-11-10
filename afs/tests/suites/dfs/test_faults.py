@@ -198,4 +198,7 @@ CASES = (
     # R94: a reader held across this Node's commit and another Node's keeps the version it moved to under GC.
     _case("local_commit_reader_under_gc", ("LF25",), scenario(
         "local-commit-reader", "phase-local-commit-reader.sh", env={"COPIES_R2": "1"})),
+    # R94 recheck: the same reader while node-a's write lease lapses with its writer still open.
+    _case("lapsed_lease_reader_under_gc", ("LF26",), scenario(
+        "lapsed-lease-reader", "phase-lapsed-lease-reader.sh", env={"COPIES_R2": "1"})),
 )

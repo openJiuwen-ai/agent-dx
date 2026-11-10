@@ -243,10 +243,8 @@ fn r94_commits_under_an_open_writer_admit_once_when_it_closes() {
         fx.fs.write(&context(), writer, 0, bytes).unwrap();
         fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
         versions.push(head(&fx.meta));
-        // The open reader sees this Node's commit through the write state ...
-        assert_eq!(read_all(&fx.fs, reader), bytes.as_slice());
     }
-    // ... and no reference is admitted while the writer is open.
+    // No read selected a new version: nothing is admitted while the writer is open.
     for version in &versions {
         assert_eq!(fx.gc.admissions(version), 0);
     }
@@ -260,6 +258,79 @@ fn r94_commits_under_an_open_writer_admit_once_when_it_closes() {
     fx.fs.release(&context(), reader).unwrap();
     fx.references.flush().unwrap();
     assert_eq!(fx.gc.live(&newest), 0);
+}
+
+#[test]
+fn r94_a_read_through_the_write_state_protects_the_base_it_selects() {
+    let fx = fixture();
+    let reader = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    let writer = fx.fs.open(&context(), fx.inode, libc::O_RDWR).unwrap();
+    let mut versions = Vec::new();
+    for bytes in [b"VERSION-TWO", b"VERSION-333"] {
+        fx.fs.write(&context(), writer, 0, bytes).unwrap();
+        fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+        let version = head(&fx.meta);
+        // The reader sees this Node's commit through the write state, and
+        // the version that read selected is referenced: an open writer (or a
+        // write lease, which can lapse while it is open) does not keep it.
+        assert_eq!(read_all(&fx.fs, reader), bytes.as_slice());
+        assert_eq!(read_all(&fx.fs, writer), bytes.as_slice());
+        fx.references.flush().unwrap();
+        assert_eq!(fx.gc.live(&version), 1, "one shared reference per version");
+        for older in &versions {
+            assert_eq!(fx.gc.live(older), 0, "a superseded base is released");
+        }
+        versions.push(version);
+    }
+    fx.fs.release(&context(), writer).unwrap();
+    let newest = versions.last().unwrap().clone();
+    assert_eq!(opened_version(&fx.fs, reader), Some(newest.clone()));
+    assert_eq!(
+        fx.gc.admissions(&newest),
+        1,
+        "the reader's view shares the reference the read took"
+    );
+    fx.fs.release(&context(), reader).unwrap();
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.live(&newest), 0);
+}
+
+#[test]
+fn r94_in_flight_write_state_read_keeps_its_base_across_the_next_local_commit() {
+    let fx = fixture();
+    let writer = fx.fs.open(&context(), fx.inode, libc::O_RDWR).unwrap();
+    fx.fs.write(&context(), writer, 0, b"VERSION-TWO").unwrap();
+    fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+    let v2 = head(&fx.meta);
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    *fx.fs.hooks.write_state_read_after_view.lock().unwrap() = Some(Box::new(move || {
+        reached_tx.send(()).unwrap();
+        go_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the test resumes the paused read");
+    }));
+    std::thread::scope(|scope| {
+        let reading = scope.spawn(|| read_all(&fx.fs, writer));
+        reached_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the read reaches the write state");
+        // Healthy lease, same Node: the next commit replaces every byte of V2
+        // while the read that selected V2 is still in flight.
+        fx.fs.write(&context(), writer, 0, b"VERSION-333").unwrap();
+        fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+        let v3 = head(&fx.meta);
+        assert_ne!(v3, v2);
+        fx.references.flush().unwrap();
+        assert_eq!(fx.gc.live(&v2), 1, "the in-flight read keeps V2");
+        go_tx.send(()).unwrap();
+        assert_eq!(reading.join().unwrap(), b"VERSION-TWO");
+    });
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.live(&v2), 0, "released once the read ended");
+    fx.fs.release(&context(), writer).unwrap();
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.live(&fx.v1), 0);
 }
 
 #[test]
@@ -290,4 +361,28 @@ fn r94_close_racing_a_pending_view_leaks_no_reference() {
     fx.references.flush().unwrap();
     assert_eq!(fx.gc.live(&fx.v1), 0);
     assert_eq!(fx.gc.admissions(&v2), 0);
+}
+
+#[test]
+fn r94_an_unprotectable_write_state_base_is_never_read_unprotected() {
+    let fx = fixture();
+    let reader = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    let writer = fx.fs.open(&context(), fx.inode, libc::O_RDWR).unwrap();
+    fx.fs.write(&context(), writer, 0, b"VERSION-TWO").unwrap();
+    fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+    let v2 = head(&fx.meta);
+    fx.gc.refuse_open.store(true, Ordering::SeqCst);
+    // Nothing local over the base: the reader falls back to its own,
+    // protected version instead of reading V2 unprotected.
+    assert_eq!(read_all(&fx.fs, reader), b"version-one");
+    assert_eq!(fx.gc.live(&v2), 0);
+    // Local data over the base: the admission error is returned rather than
+    // a read that could lose that data.
+    fx.fs.write(&context(), writer, 0, b"DIRTY").unwrap();
+    assert!(fx.fs.read_owned(&context(), writer, 0, 64).is_err());
+    fx.gc.refuse_open.store(false, Ordering::SeqCst);
+    assert_eq!(read_all(&fx.fs, writer), b"DIRTYON-TWO");
+    fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+    fx.fs.release(&context(), writer).unwrap();
+    fx.fs.release(&context(), reader).unwrap();
 }
