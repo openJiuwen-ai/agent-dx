@@ -54,8 +54,7 @@ selected source hashes, and builds with its pinned Go toolchain. A download, che
 fails the component. The component and unified release retain envd LICENSE and
 manifest; the latter records the binary SHA256, revision, version and toolchain.
 `ADX_ENVD_SOURCE` optionally supplies an existing clean checkout of that same
-revision. On the macOS ARM worker, this host directory is mounted read-only at
-`/mnt/adx-envd-source` and its path is translated for the Linux container.
+revision visible inside the selected Linux builder.
 Without an override, both architectures download the same pinned archive inside
 their Linux builder. The archive contains upstream public source and is identified
 by both the upstream revision and archive digest; updating the revision requires
@@ -68,7 +67,7 @@ The standalone `build/release/build.sh` remains opt-in through `ADX_ENVD_SOURCE`
 | `ADX_WITH_AFS` | Base/Full `1`, others `0` | Base builds AFS in each enabled architecture, adds AFS lint/UT and runs the required component/SDK smoke after public L0/auth. Full matches its candidate mode and adds the same AFS smoke after its existing public profile. Explicit `0` selects OFF packages/bundles. |
 | `ADX_ARM_BUILD` | `1` | Base: `0` defers all ARM compile, assembly, publication and index steps; x86 and shared gates still run |
 | `ADX_ARM_TESTS` | `0` | Base: `1` runs Rust component tests and install smoke on ARM, as on x86 |
-| `ADX_ARM_OBS_UPLOAD` | inherits `ADX_OBS_UPLOAD` | Base: override only ARM final OBS publication; ARM Buildkite artifacts remain available |
+| `ADX_ARM_OBS_UPLOAD` | inherits `ADX_OBS_UPLOAD` | Base: override only ARM final OBS publication; ARM diagnostics remain available |
 | `ADX_OBS_UPLOAD_CHANNEL` | `daily` | Base/SDK: `daily` or `release` |
 | `ADX_RELEASE_VERSION` | tag-derived | OBS release path version |
 | `ADX_OBS_BUCKET` / `ADX_OBS_ENDPOINT` | `agent-dx` / `obs.cn-southwest-2.myhuaweicloud.com` | OBS intermediate transport and final publication destination |
@@ -83,13 +82,14 @@ Boolean controls accept only `0` or `1`. Component transport is independent of
 final publication: `ADX_OBS_UPLOAD=0` still permits intermediate OBS transfers
 when `ADX_ARTIFACT_TRANSPORT=obs`. To build without OBS, select `buildkite` and
 set `ADX_OBS_UPLOAD=0`. Missing OBS credentials or corrupt files fail the job;
-there is no silent transport fallback. AMD64 temporary artifacts use
-`adx/ci/<build UUID>/<commit>/<component>/`, with commit/build/group and SHA256
+there is no silent transport fallback. Temporary artifacts use
+`adx/ci/<build UUID>/<commit>/<group>/`; AMD64 uses component names and ARM64
+adds `-arm64` to component and release groups. Commit/build/group and SHA256 are
 checked before extraction. Configure bucket retention for this temporary prefix
 separately from `adx/daily/` and `adx/release/`.
 
-AMD64 publication honors the same transport choice: with `obs` it consumes the
-verified staged release and the exact Execd component from this build. Small
+Both architecture publication jobs honor the same transport choice: with `obs` they consume
+the verified staged release and the exact Execd component from this build. Small
 SDK/admin candidates still come from Buildkite artifacts. Explicit `buildkite`
 retains the complete Buildkite handoff. A failed OBS transfer or identity/hash
 check stops publication without falling back to another transport.
@@ -129,32 +129,27 @@ branches or merge protection. Existing trigger callers that explicitly pass
 `ADX_WITH_AFS=0` still opt out and must be reviewed separately.
 AFS durability regressions require `strace` and child-process tracing in the
 public Rust build image; the image verifier checks this before compilation.
-ARM uses an `os=macos, arch=arm64` worker with Docker to execute native Linux ARM64.
-The current ARM pool uses one `adx/native-arm64` concurrency slot to protect
-worker checkout and Docker cache ownership; the x86 flow advances independently.
-Docker must be running and the worker must be able to pull the SWR build image.
-The ARM step maps the cluster's encrypted `ADX_SWR_PULL_CONFIG` secret to
-`SWR_DOCKER_CONFIG_JSON`; the registry wrapper creates an owner-only temporary
-Docker configuration and removes it when the job exits. Tool-only plugin
-search directories are preserved so Docker Buildx remains discoverable; host
-authentication, credential helpers and contexts are not copied. Its access policy
-must allow the exact pipeline and build branch; allowing `refactor` alone does
-not authorize a feature branch. Never pass the secret value in build parameters.
+ARM uses the existing Kubernetes agent pool tagged
+`os=linux, arch=arm64, linux_arch=arm64`. Job Pods select native ARM64 nodes
+and run the digest-pinned ARM builder directly. The cluster's `swr-pull-secret`
+provides image pull access and `obs-credentials` provides intermediate artifact
+transport. Each component has its own concurrency group and architecture-specific
+Cargo target cache; no Mac worker or Docker daemon is needed for package jobs.
 `build/images/build-environment-arm64.json` pins the ARM source and ADX builder.
 For build-image maintenance on networks that cannot reach GitHub,
 `ADX_EROFS_SOURCE_ARCHIVE` can point to a downloaded EROFS source archive.
 The build mounts it temporarily and verifies the same pinned SHA256 before use.
 `ADX_REDIS_SOURCE_ARCHIVE` provides the equivalent option for Redis sources.
 The builder supplies Rust 1.95.0, Go 1.25.5, Redis 7.2.5, musl and EROFS 1.8.10.
-Cargo source configuration remains rsproxy sparse. ARM Docker volumes are
-`adx-arm64-cargo-home`, `adx-arm64-cargo-target`, `adx-arm64-go-build` and
-`adx-arm64-go-mod`, separate from AMD64 caches.
+Cargo source configuration remains rsproxy sparse. Host caches under
+`/mnt/paas/build-cache/adx/` use component-specific `*-arm64-rust1950` target
+directories and `go-build/arm64`, separate from AMD64 compiler outputs.
 
 ARM artifacts are stored under `out/buildkite/arm64/`, and published to OBS
 `linux/arm64/`; `artifact-manifest-arm64` produces `index-arm64.html` with links
 and checksums. The `publish-arm64` job runs architecture-independent package
 verification and upload on the existing Linux Kubernetes worker, using its
-`obs-credentials` Secret. The Mac worker only needs SWR pull access. Set
+`obs-credentials` Secret. Set
 `ADX_ARM_OBS_UPLOAD=0` to validate ARM packaging without final OBS publication;
 this leaves AMD64 publication unchanged.
 
@@ -587,9 +582,10 @@ the recorded digest. Set
 `ADX_BUILD_IMAGE_CONFIG=build/images/build-environment-arm64.json` for ARM image
 maintenance on the existing native ARM worker, using the same recipe and
 verification script. The host uses Docker; build commands execute in Linux ARM64.
-The default AMD64 maintenance route remains unchanged. ARM maintenance shares
-the `adx/native-arm64` concurrency slot and registry-secret handling with ARM
-package jobs. Update the pinned ARM `ci_image` only after the pushed digest has
+The default AMD64 maintenance route remains unchanged. This explicit ARM image
+maintenance route retains its Mac Docker worker, `adx/native-arm64` concurrency
+slot and registry-secret handling; normal ARM package jobs use Linux Kubernetes.
+Update the pinned ARM `ci_image` only after the pushed digest has
 passed pull-back verification. Before image compilation the maintenance job
 checks Docker, Buildx/BuildKit, the native daemon platform, storage and access
 to the pinned source image; a failed prerequisite stops that job before build
