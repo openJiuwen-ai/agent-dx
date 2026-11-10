@@ -212,9 +212,9 @@ impl EnvironmentService {
         self.prepare_create(input, caller)
     }
 
-    /// Create admission with Workspace ownership bound to the owning node.
+    /// Create admission with the Workspace owner as a soft node preference.
     /// A missing Workspace mount leaves the request unchanged.
-    pub async fn prepare_create_bound(
+    pub async fn prepare_create_with_workspace_affinity(
         &self,
         input: Value,
         caller: &pb::CallerContext,
@@ -240,7 +240,7 @@ impl EnvironmentService {
                 return self.fall_back_without_affinity(spec, resolver, Some(&owner), error)
             }
         };
-        match workspace_affinity::enforce_node(
+        match workspace_affinity::prefer_node(
             spec.scheduling.get_or_insert_with(Default::default),
             &node_id,
         ) {
@@ -269,7 +269,7 @@ impl EnvironmentService {
         adx_observability::warn!(
             owner = owner.unwrap_or_default(),
             error = %error,
-            "Workspace affinity unavailable; scheduling without affinity"
+            "Workspace affinity skipped; scheduling without the owner preference"
         );
         Ok(spec)
     }
@@ -282,7 +282,7 @@ impl EnvironmentService {
     ) -> Result<Value, Status> {
         self.creation_metrics.embedded_request();
         let spec = self
-            .prepare_create_bound(input.clone(), caller, request_id)
+            .prepare_create_with_workspace_affinity(input.clone(), caller, request_id)
             .await
             .inspect_err(|error| self.creation_metrics.rejection(error))?;
         Box::pin(self.create(spec, input, request_id, caller)).await
