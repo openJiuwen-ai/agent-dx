@@ -28,6 +28,8 @@ pub(super) mod common;
 pub(super) mod dfs;
 mod grpc;
 #[cfg(feature = "ownerfs")]
+mod outlet;
+#[cfg(feature = "ownerfs")]
 mod ownerfs;
 mod shutdown;
 
@@ -80,6 +82,14 @@ pub(super) async fn run_node(
         common::node_state(&cfg, obs, &startup, &registration, &mounts, &mut backends);
     // 13. Services.
     let mut services = Services::new();
+    // T13a/T13b: the outlet mirror and the deferred-directory reclaim sweep.
+    // The mirror's startup gates run here, before anything is spawned, so a
+    // misconfigured name layer aborts the process instead of looping.
+    #[cfg(feature = "ownerfs")]
+    {
+        outlet::start_mirror(&cfg, &backends.ownerfs, &mut services)?;
+        outlet::start_reclaim_sweep(&cfg, &backends.ownerfs, &mut services);
+    }
     start_background(
         &cfg,
         &state,

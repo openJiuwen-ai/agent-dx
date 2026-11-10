@@ -25,6 +25,7 @@ fn fixture() -> (State, RootAccessGrant) {
         local_prepare_id: "p".into(),
         created_at_revision: StoreRevision(1),
         updated_at_revision: StoreRevision(1),
+        nfs_addr: String::new(),
     };
     let grant = RootAccessGrant {
         root_id: root.root_id.clone(),

@@ -102,7 +102,7 @@ flowchart TB
 | 本机 chunk 存储 | 暂存 → 持久化（正文、目录、catalog 屏障）→ ACK；校验读；副本生命周期（`CopyLifecycle`）；巡检读盘；服务对端读 | `node/chunk/{store,staged,catalog,catalog_commit,lifecycle,reader,scrub,peer_serve,sidecar_install}.rs` |
 | 故障层 | 修复循环（上报隔离、认领、复制、报告）、GC 回收循环、写租约续期、后台巡检、接收方校验失败的复核 | `node/fault/{repair,reaper,lease_keeper,scrub,suspect,classify}.rs` |
 | GC 执行（Node） | GC 引用（`open:`、`write:`）的建立与有界释放队列；一次回收（本机副本或 S3 对象） | `node/gc/references.rs`、`node/gc/collect.rs` |
-| 后台与装配 | 后台 tick（写回推进等，串行）；装配按后端与职责拆分，后台组件各自有名字与关闭顺序 | `node/background/tick.rs`、`node/assembly/{mod,common,dfs,ownerfs,grpc,shutdown}.rs` |
+| 后台与装配 | 后台 tick（写回推进等，串行）；装配按后端与职责拆分，后台组件各自有名字与关闭顺序 | `node/background/tick.rs`、`node/assembly/{mod,common,dfs,ownerfs,outlet,grpc,shutdown}.rs` |
 | 传输（Node） | 调 Meta 的 `DfsMeta` 客户端；对端读写的 gRPC／RDMA 客户端与连接池；服务对端的 `DfsChunks`、`DfsOwnerFiles` | `node/rpc/meta/*`、`node/rpc/peer/*`、`node/rpc/data/*` |
 | Meta 接入 | gRPC 服务、证书到 Node ID 的绑定校验 | `meta/rpc.rs`、`meta/rpc/{dfs,node}.rs` |
 | Meta DFS 状态机 | 命名空间（含 readdir 分页）、写租约、版本提交、放置与副本写授权、读授权、修复任务与巡检、GC 规划与删除者 | `meta/dfs.rs`、`meta/dfs/{namespace,write_lease,commit,placement,read_auth,repair,gc}.rs`、`meta/dfs/gc/deleter.rs` |
@@ -1077,6 +1077,32 @@ workspace 可以从任意节点的 OwnerFs FUSE 路径删除：Home 在本机执
 OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 workspace，非空返回
 `ENOTEMPTY` 且 workspace 保持可用；`rm -rf` 会先删除内容，最后才删除空的 workspace 目录。
 在 egress 路径上对 workspace 目录执行 rmdir 会被内核以 `EBUSY` 拒绝，不会删除 workspace。
+
+## 跨节点 Workspace 出口（outlet）
+
+outlet 让集群内任一节点用**同一个平坦名字**访问某 workspace，而数据权威仍在
+Home 节点的本地盘上，不做复制。每台需要读该名字视图的节点各自跑一份镜像，
+输入都是同一份 Meta 快照。
+
+**Meta 契约**：`OwnerRoots.ListActiveOutletRoots` 是 outlet 镜像面的唯一输入，
+返回全局 Active root 全量快照（`root_id`、`root_epoch`、`home_node_id`、
+`home_nfs_addr`），按 `root_id` 升序以保证 diff 可复现。调用方可携带已持有
+集合的摘要（`known_digest`），Meta 判定无变化时以 `unchanged` 短路——但语义
+上仍是全量快照：没有游标、事件或增量，快照本身就是恢复机制。该 RPC 只读，
+不签发 `RootAccess`，不改变授权语义。
+
+"Active" 在持久层等价于 Root 实体存在：`DeactivateRoot` 直接删除 Root 键，
+不存在软删除状态位，因此快照不需要额外状态过滤。名字由 `root_id` 反解
+（`root-<hex(name)>`，与 OwnerFs 命名同源），不为 outlet 新增持久字段。
+`home_nfs_addr` 来自该 Home 注册会话上报的 NFS 导出地址；为空表示未上报，
+消费方只能跳过并告警，不得猜测兜底。
+
+**节点侧（已实现）**：每节点跑一份镜像 worker：在 tmpfs 名字层收敛
+`/public/<name> -> <import_root>/<home>/users` 软链，自动维护对端（NFS）与
+本机（bind）的 import 挂载，按退役宽限期回收旧代数据目录；mountinfo 只读
+诊断随轮输出，配置硬前提（独立 tmpfs、宿主 mount namespace、`mount(2)`
+权限）在启动时 fail-closed 校验。Home 侧对外 NFS 导出（OwnerFs egress）
+不在本能力范围内，仍由部署面或独立分支提供。
 
 ## DFS 外部对象持久化边界
 

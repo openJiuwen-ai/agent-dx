@@ -341,7 +341,8 @@ fields_heap!(super::RootRecord {
     home_session_id,
     local_prepare_id,
     created_at_revision,
-    updated_at_revision
+    updated_at_revision,
+    nfs_addr
 });
 fields_heap!(super::RootReservationRecord {
     root_id,
@@ -1497,6 +1498,7 @@ mod tests {
             local_prepare_id: payload,
             created_at_revision: StoreRevision(1),
             updated_at_revision: StoreRevision(1),
+            nfs_addr: String::new(),
         });
         let event = WatchEvent {
             revision: StoreRevision(1),

@@ -98,6 +98,9 @@ service OwnerRoots {
   rpc DeactivateRoot(DeactivateRootRequest) returns (DeactivateRootReply);
   rpc LookupRoot(LookupRootRequest) returns (LookupRootReply);
   rpc ListOwnerRoots(ListOwnerRootsRequest) returns (ListOwnerRootsReply);
+  // 只读：返回全局 Active root 快照，供各节点 outlet 镜像 worker 使用。
+  // 不改变授权语义，不签发 RootAccess。
+  rpc ListActiveOutletRoots(ListActiveOutletRootsRequest) returns (ListActiveOutletRootsReply);
   rpc AcquireRoot(AcquireRootRequest) returns (AcquireRootReply);
   rpc ValidateRootAccess(ValidateRootAccessRequest) returns (ValidateRootAccessReply);
   rpc WatchRootCommands(WatchRootCommandsRequest) returns (stream RootCommand);
@@ -153,6 +156,11 @@ message RootLocation {
   reserved "mode";
   // 只供定位/故障诊断，仍不是授权。旧进程会话不能代替 RootAccess。
   string home_session_id = 5;
+  // home 节点对外提供 NFS 导出的地址（纯主机名或 IP，无 scheme、无端口）。
+  // 来自该 home 注册会话时上报的 NodeDescriptor.endpoint.data_addr，随会话
+  // 走：新增节点只需声明自己，任何既有节点都不必改配置。
+  // 为空表示该 home 没有上报，消费方不得猜测，只能跳过并告警。
+  string home_nfs_addr = 6;
 }
 
 // RootReservation 是 reserve 阶段的准备记录。Node 拿到它后只能本地 mkdir、
@@ -244,6 +252,26 @@ message ListOwnerRootsReply {
   repeated RootLocation active_roots = 1;
   repeated RootReservation pending_reservations = 2;
   uint64 authority_revision = 3;
+}
+
+// ListActiveOutletRoots 是 outlet 镜像面的唯一输入：全局 Active root 全量快照。
+// 无游标、无事件、无增量语义——全量快照即恢复机制。名字由 root_id 反解，
+// 不新增持久字段（root_id 编码为 root-<hex(name)>，见 OwnerFs root_id_from_name）。
+message ListActiveOutletRootsRequest {
+  string request_id = 1;
+  // 调用方已持有的集合摘要；空表示要求全量快照。
+  // 摘要只覆盖 (root_id, root_epoch, home_node_id)，DFS 事件、grant、
+  // session、命令的变化都不会改变它。
+  string known_digest = 2;
+}
+
+message ListActiveOutletRootsReply {
+  // unchanged 为真时 active_roots 为空，调用方必须沿用本地快照，
+  // 不得解读为"当前没有 root"。
+  repeated RootLocation active_roots = 1;
+  uint64 authority_revision = 2;
+  string digest = 3;
+  bool unchanged = 4;
 }
 
 message AcquireRootRequest {

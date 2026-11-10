@@ -371,6 +371,7 @@ async fn root_grant_read_rejects_expired_holder_session() {
         local_prepare_id: "prepare-1".into(),
         created_at_revision: StoreRevision(1),
         updated_at_revision: StoreRevision(1),
+        nfs_addr: String::new(),
     };
     let grant = grant();
     for (key, entity) in [
@@ -445,6 +446,7 @@ async fn root_grant_read_rejects_expired_home_session() {
         local_prepare_id: "prepare-1".into(),
         created_at_revision: StoreRevision(1),
         updated_at_revision: StoreRevision(1),
+        nfs_addr: String::new(),
     };
     let grant = grant();
     for (key, entity) in [
@@ -1809,6 +1811,7 @@ async fn p3_lifecycle_completed_commands_reclaimed_pending_and_failed_preserved(
             local_prepare_id: "prepare".into(),
             created_at_revision: StoreRevision(1),
             updated_at_revision: StoreRevision(1),
+            nfs_addr: String::new(),
         })),
         TxnMutation::Put(MetaEntity::RootGrant(RootAccessGrant {
             root_id: "active-root".into(),
@@ -2344,6 +2347,7 @@ async fn p3_incremental_write_does_not_reencode_untouched_authority() {
                 local_prepare_id: "old-prepare".into(),
                 created_at_revision: StoreRevision(1),
                 updated_at_revision: StoreRevision(1),
+                nfs_addr: String::new(),
             })));
     }
     txn.mutations
@@ -3085,6 +3089,7 @@ async fn p3_root_deactivation_accepts_accumulated_grants_below_byte_budget() {
                     local_prepare_id: "p".into(),
                     created_at_revision: StoreRevision(2),
                     updated_at_revision: StoreRevision(2),
+                    nfs_addr: String::new(),
                 })),
                 TxnMutation::Put(MetaEntity::RootGrant(home.clone())),
             ]);
@@ -3462,6 +3467,7 @@ async fn p3_a27_ready_group_keeps_failed_requests_out_of_durable_authority() {
         local_prepare_id: "p".into(),
         created_at_revision: StoreRevision(1),
         updated_at_revision: StoreRevision(1),
+        nfs_addr: String::new(),
     });
     let make_txn = |name: &str| {
         let request = RequestKey::new("a27-group", name);
