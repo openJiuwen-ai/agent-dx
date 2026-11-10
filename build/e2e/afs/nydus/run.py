@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Host orchestration. Only touches this project's registered session."""
 
-import argparse, json, pathlib, subprocess, time
+import argparse
+import json
+import logging
 import os
+import pathlib
 import shutil
+import subprocess
+import sys
+import time
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--workspace", required=True, type=pathlib.Path)
@@ -12,7 +18,7 @@ options, actions = parser.parse_known_args()
 ROOT = options.workspace.resolve()
 CLI = shutil.which(options.adx_vm)
 if CLI is None:
-    raise SystemExit("adx-vm executable not found")
+    parser.error("adx-vm executable not found")
 SESSION = json.loads((ROOT / "environment/open.json").read_text())["session"]
 SHARED = pathlib.Path(json.loads((ROOT / "environment/open.json").read_text())["output"])
 
@@ -68,12 +74,13 @@ def stop(node):
 def mount(guest, case, backend):
     cfgpath = ROOT / "artifacts/nydus-configs"
     cfgpath.mkdir(exist_ok=True)
+    active_manifest = SHARED / "fixture/active-manifest.txt"
     backendcfg = (
         {
             "type": "http-proxy",
             "http-proxy": {
                 "addr": "http://127.0.0.1:7401",
-                "path": "/nydus/lab/" + (SHARED / "fixture/active-manifest.txt").read_text().strip() + "/blobs",
+                "path": f"/nydus/lab/{active_manifest.read_text().strip()}/blobs",
                 "timeout": 30,
                 "retry_limit": 0,
             },
@@ -96,7 +103,8 @@ def mount(guest, case, backend):
         "rafs": {"mode": "direct", "validate": False, "batch_size": 1048576, "prefetch": {"enable": False}},
     }
     (cfgpath / (case + ".json")).write_text(json.dumps(cfg, indent=2))
-    print(
+    logging.info(
+        "%s",
         execute(
             guest,
             "bash",
@@ -108,7 +116,7 @@ def mount(guest, case, backend):
 >/output/logs/nydus-{case}.log 2>&1 </dev/null & echo $! >/workspace/nydus/{case}/pid; for i in \
 $(seq 1 30); do mountpoint -q /workspace/nydus/{case}/mnt && exit 0; sleep 1; done; tail -60 \
 /output/logs/nydus-{case}.log; exit 1""",
-        )
+        ).rstrip(),
     )
 
 
@@ -120,28 +128,31 @@ results = {}
 for name in ['startup.txt', 'hot.bin']:
     data = (p / name).read_bytes()
     h = hashlib.sha256(data).hexdigest()
-    assert h == expected[name]['sha256']
+    if h != expected[name]['sha256']:
+        raise AssertionError(f'Checksum mismatch for {name}')
     results[name] = {'size': len(data), 'sha256': h}
 results['mount'] = subprocess.check_output(['findmnt', '-rn', '-T', str(p), '-o', 'FSTYPE,SOURCE'], text=True).strip()
 print(json.dumps(results, indent=2))
 """.replace("CASE", case)
     result = execute(guest, "python3", "-c", code)
     (ROOT / "evidence" / f"{case}-read.json").write_text(result)
-    print(result)
+    logging.info("%s", result.rstrip())
 
 
 def unmount(guest, case):
-    print(
+    logging.info(
+        "%s",
         execute(
             guest,
             "bash",
             "-euc",
             f'umount /workspace/nydus/{case}/mnt; kill -TERM "$(cat /workspace/nydus/{case}/pid)" 2>/dev/null || true',
-        )
+        ).rstrip(),
     )
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     action = actions[0]
     action_args = actions[1:]
     if action == "start":

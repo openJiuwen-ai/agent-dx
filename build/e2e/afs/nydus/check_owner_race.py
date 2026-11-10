@@ -8,7 +8,9 @@ budgets set to 60 seconds for this case. Keep production lease settings unchange
 import concurrent.futures
 import importlib.util
 import json
+import logging
 import pathlib
+import sys
 import time
 
 spec = importlib.util.spec_from_file_location("lab", pathlib.Path(__file__).with_name("run.py"))
@@ -28,14 +30,15 @@ def signal_a(sig):
     lab.execute("worker-1", "bash", "-euc", f'kill -{sig} "$(cat /workspace/afs/run/pid)"')
 
 
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 manifest = mgmt(
     """c.control()
 (c.OUT / 'race-origin-start-count.txt').write_text(str(len(c.bodies())))
 m = c.publish_variant('paused-owner-race')
 (c.OUT / 'race-manifest.txt').write_text(m)
-assert c.request(c.url('a', m), 'HEAD')[0] == 200
+c.require(c.request(c.url('a', m), 'HEAD')[0] == 200, 'Initial preparation failed')
 r = c.read_range('a', 0, 4096, m)
-assert r[0] == 206, r[0]
+c.require(r[0] == 206, r[0])
 c.control(mode='hold', node='node-a')
 (c.OUT / 'release-origin').unlink(missing_ok=True)
 print(m)
@@ -66,7 +69,7 @@ print(json.dumps({'status': status, 'length': len(body), 'body': body[:200].deco
         signal_a("STOP")
         paused = True
         start = time.monotonic()
-        print("A paused inside origin; B and C now race for expired ownership", flush=True)
+        logging.info("A paused inside origin; B and C now race for expired ownership")
 
         def contender(node):
             return json.loads(
@@ -81,9 +84,9 @@ while time.monotonic() < end:
     if r[0] == 206:
         break
     time.sleep(0.5)
-assert r[0] == 206, attempts
+c.require(attempts and attempts[-1]['status'] == 206, attempts)
 expected = c.request(c.BASE + '/blobs/' + c.BLOB['digest'], headers={{'Range': 'bytes=1048576-1052671'}})[2]
-assert r[2] == expected
+c.require(r[2] == expected, 'Contender returned different bytes')
 print(json.dumps({{'node': '{node}', 'attempts': attempts}}))
 """
                 )
@@ -93,13 +96,15 @@ print(json.dumps({{'node': '{node}', 'attempts': attempts}}))
         c = pool.submit(contender, "c")
         results = [b.result(), c.result()]
         takeover_seconds = time.monotonic() - start
-        assert takeover_seconds < 55, takeover_seconds
-        print("Both contenders read valid committed bytes; resuming old A", flush=True)
+        if takeover_seconds >= 55:
+            raise AssertionError(takeover_seconds)
+        logging.info("Both contenders read valid committed bytes; resuming old A")
         (lab.SHARED / "release-origin").touch()
         signal_a("CONT")
         paused = False
         old_result = json.loads(old.result())
-        assert old_result["status"] not in (200, 206), old_result
+        if old_result["status"] in (200, 206):
+            raise AssertionError(old_result)
         verification = json.loads(
             mgmt(
                 """m = (c.OUT / 'race-manifest.txt').read_text()
@@ -108,11 +113,11 @@ c.control(mode='503')
 expected = c.request(c.BASE + '/blobs/' + c.BLOB['digest'], headers={'Range': 'bytes=1048576-1052671'})[2]
 for n in ['b', 'c']:
     r = c.read_range(n, 1048576, 4096, m)
-    assert r[0] == 206 and r[2] == expected, (n, r[0])
-assert len(c.bodies()) == before
+    c.require(r[0] == 206 and r[2] == expected, (n, r[0]))
+c.require(len(c.bodies()) == before, 'Committed range contacted Registry')
 first = int((c.OUT / 'race-origin-start-count.txt').read_text())
 rows = [r for r in c.bodies()[first:] if r.get('range') == 'bytes=1048576-1052671' and r.get('mode') != 'hold']
-assert len(rows) == 1 and rows[0]['node'] in ['node-b', 'node-c'], rows
+c.require(len(rows) == 1 and rows[0]['node'] in ['node-b', 'node-c'], rows)
 print(json.dumps({'new_owner': rows[0]['node'], 'new_owner_fetches': len(rows), 'reuse_origin_fetches': 0}))
 """
             )
@@ -126,7 +131,7 @@ print(json.dumps({'new_owner': rows[0]['node'], 'new_owner_fetches': len(rows), 
             **verification,
         )
         (lab.ROOT / "evidence/owner-race.json").write_text(json.dumps(report, indent=2))
-        print(json.dumps(report, indent=2), flush=True)
+        logging.info("%s", json.dumps(report, indent=2))
     finally:
         (lab.SHARED / "release-origin").touch()
         if paused:
