@@ -24,6 +24,7 @@ const IMAGE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const ACQUIRE_MAX_AGE_MS: u64 = 120_000;
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const QUEUE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const QUEUE_STOP_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Journal {
@@ -144,6 +145,10 @@ impl Devices {
         self.serving && self.device.as_ref().is_some_and(Device::queues_are_healthy)
     }
 
+    fn has_failed_queue_monitor(&self) -> bool {
+        self.monitor.is_some() && !self.can_serve()
+    }
+
     fn publish_serving(&mut self) -> io::Result<()> {
         let device = self
             .device
@@ -157,15 +162,44 @@ impl Devices {
             if failure.wait_for(|failed| *failed).await.is_err() {
                 return;
             }
-            if let Some(owner) = owner.upgrade() {
-                let mut devices = owner.lock().await;
-                if devices.serving && devices.owned_id == Some(id) {
-                    devices.serving = false;
-                    afs_logging::error!("overlaybd.queue_failed"; "device_id" => id);
-                    if let Err(error) = devices.stop_failed_device(id).await {
-                        afs_logging::error!("overlaybd.queue_stop_failed"; "device_id" => id, "error" => error.to_string());
+            loop {
+                {
+                    let Some(owner) = owner.upgrade() else {
+                        return;
+                    };
+                    let mut devices = owner.lock().await;
+                    if devices.owned_id != Some(id) {
+                        return;
+                    }
+                    if devices.serving {
+                        devices.serving = false;
+                        afs_logging::error!("overlaybd.queue_failed"; "device_id" => id);
+                    }
+                    match devices.stop_failed_device(id).await {
+                        Ok(()) => {
+                            if devices
+                                .journal
+                                .as_ref()
+                                .is_some_and(|entry| entry.refs.is_empty())
+                                && let Err(error) = devices.cleanup().await
+                            {
+                                afs_logging::error!("overlaybd.queue_cleanup_failed"; "device_id" => id, "error" => error.to_string());
+                            }
+                            devices.monitor = None;
+                            return;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                            afs_logging::warn!("overlaybd.queue_stop_retry"; "device_id" => id, "error" => error.to_string());
+                        }
+                        Err(error) => {
+                            afs_logging::error!("overlaybd.queue_stop_failed"; "device_id" => id, "error" => error.to_string());
+                            devices.monitor = None;
+                            return;
+                        }
                     }
                 }
+                // Let acquire reject and release persist references between attempts.
+                tokio::time::sleep(QUEUE_STOP_RETRY_DELAY).await;
             }
         })));
         self.serving = true;
@@ -198,6 +232,7 @@ impl Devices {
             .journal
             .as_ref()
             .is_some_and(|entry| entry.refs.is_empty())
+            && !self.has_failed_queue_monitor()
         {
             self.cleanup().await?;
         }
@@ -254,6 +289,7 @@ impl Devices {
                 .journal
                 .as_ref()
                 .is_some_and(|entry| entry.refs.is_empty())
+                && !self.has_failed_queue_monitor()
             {
                 self.cleanup().await?;
             }
@@ -370,6 +406,7 @@ impl Devices {
         // STOP completes queued reads with EIO. DEL can wait for the sandbox
         // to close its rootfs, so leave deletion to the last release.
         self.stop_and_drain(id).await?;
+        self.device = None;
         afs_logging::warn!("overlaybd.failed_device_stopped"; "device_id" => id);
         Ok(())
     }
@@ -382,7 +419,13 @@ impl Devices {
             device
                 .stop_queue_workers(Instant::now() + QUEUE_DRAIN_TIMEOUT)
                 .await
-                .map_err(backend_error)?;
+                .map_err(|error| {
+                    if error.is::<tokio::time::error::Elapsed>() {
+                        io::Error::new(io::ErrorKind::TimedOut, error.to_string())
+                    } else {
+                        backend_error(error)
+                    }
+                })?;
         }
         if self.pending_stop.is_none() {
             let mut control = UVMUblkCtrlBuilder::new()
@@ -411,7 +454,9 @@ impl Devices {
         if let Some(stop) = self.pending_stop.as_mut() {
             // Keep the same command and its control fd alive on timeout. The
             // next cleanup must finish it before deleting/reusing the ID.
-            let result = timeout(STOP_TIMEOUT, stop).await.map_err(backend_error)?;
+            let result = timeout(STOP_TIMEOUT, stop)
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))?;
             self.pending_stop = None;
             let confirmed = result.map_err(backend_error)??;
             if confirmed && let Some(device) = &self.device {
@@ -566,9 +611,6 @@ impl Devices {
 
     async fn cleanup(&mut self) -> io::Result<()> {
         self.serving = false;
-        // The monitor and cleanup serialize through Devices. Discard a waiter
-        // before releasing this device ID to the kernel for reuse.
-        self.monitor = None;
         self.await_pending_stop().await?;
         let mount = self.mount_path();
         if let Some(source) = mounted_source(&mount).await? {
@@ -610,6 +652,9 @@ impl Devices {
             }
             self.owned_id = None;
         }
+        // No new device can be installed while Devices is locked. Cancel the
+        // old monitor before another request can acquire a recycled ID.
+        self.monitor = None;
         match fs::remove_file(self.config.directory.join("state.json")) {
             Ok(()) => File::open(&self.config.directory)?.sync_all()?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
