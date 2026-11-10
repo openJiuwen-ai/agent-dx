@@ -228,6 +228,17 @@ impl IngressService {
         self,
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), ServiceError> {
+        let listener_addresses = self
+            .public_listeners
+            .iter()
+            .map(|(listener, options)| {
+                let scheme = if options.tls { "https" } else { "http" };
+                listener
+                    .local_addr()
+                    .map(|address| format!("{scheme}://{address}"))
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let health_address = self.health_listener.local_addr()?;
         let Self {
             config,
             public_listeners,
@@ -277,10 +288,9 @@ impl IngressService {
                 .map_err(service_error)
         });
         tracing::info!(
-            tls = %config.tls_bind,
-            plain = %config.plain_bind,
+            listeners = ?listener_addresses,
             frontend = %config.frontend_address,
-            health = %config.health_bind,
+            health = %health_address,
             "Data Plane Ingress serving"
         );
 
