@@ -236,10 +236,7 @@ fn rules_for(
                 action,
                 direction: NetworkDirection::Egress,
                 protocol: NetworkProtocol::Any,
-                peer: NetworkPeer {
-                    cidr: ipv4_cidr(value)?,
-                    ..NetworkPeer::default()
-                },
+                peer: egress_peer(value, action)?,
                 environment_port: 0,
                 environment_port_range: None,
                 priority,
@@ -248,39 +245,99 @@ fn rules_for(
         .collect()
 }
 
-fn ipv4_cidr(value: &str) -> Result<String, ConversionError> {
+fn invalid_destination() -> ConversionError {
+    ConversionError {
+        code: "invalid_request",
+        message: "invalid egress destination",
+    }
+}
+
+fn egress_peer(value: &str, action: NetworkAction) -> Result<NetworkPeer, ConversionError> {
     let value = value.trim();
-    if let Ok(IpAddr::V4(address)) = value.parse::<IpAddr>() {
-        return Ok(format!("{address}/32"));
-    }
-    if let Ok(IpAddr::V6(_)) = value.parse::<IpAddr>() {
-        return Err(unsupported("IPv6 egress rules are not supported"));
-    }
-    let Some((address, prefix)) = value.split_once('/') else {
-        return Err(unsupported(
-            "domain and wildcard egress rules are not supported",
-        ));
-    };
-    if address.parse::<Ipv4Addr>().is_err() {
-        if address.parse::<IpAddr>().is_ok() {
+    let cidr = match value.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => Some(format!("{address}/32")),
+        Ok(IpAddr::V6(_)) => {
             return Err(unsupported("IPv6 egress rules are not supported"));
         }
-        return Err(unsupported(
-            "domain and wildcard egress rules are not supported",
-        ));
-    }
-    if prefix
-        .parse::<u8>()
-        .ok()
-        .filter(|prefix| *prefix <= 32)
-        .is_none()
-    {
-        return Err(ConversionError {
-            code: "invalid_request",
-            message: "invalid IPv4 CIDR",
+        Err(_) => None,
+    };
+    if let Some(cidr) = cidr {
+        return Ok(NetworkPeer {
+            cidr,
+            ..NetworkPeer::default()
         });
     }
-    Ok(value.to_owned())
+    if let Some((address, prefix)) = value.split_once('/') {
+        if matches!(address.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
+            return Err(unsupported("IPv6 egress rules are not supported"));
+        }
+        if address.parse::<Ipv4Addr>().is_err()
+            || prefix
+                .parse::<u8>()
+                .ok()
+                .filter(|prefix| *prefix <= 32)
+                .is_none()
+        {
+            return Err(ConversionError {
+                code: "invalid_request",
+                message: "invalid IPv4 CIDR",
+            });
+        }
+        return Ok(NetworkPeer {
+            cidr: value.to_owned(),
+            ..NetworkPeer::default()
+        });
+    }
+    let domain = domain_pattern(value)?;
+    // The E2B contract only accepts domains in allowOut, even though native
+    // traffic rules can express domain denies as well.
+    if action == NetworkAction::Deny {
+        return Err(unsupported("denyOut domain rules are not supported"));
+    }
+    Ok(NetworkPeer {
+        domain,
+        ..NetworkPeer::default()
+    })
+}
+
+fn domain_pattern(value: &str) -> Result<String, ConversionError> {
+    let (wildcard, name) = value
+        .strip_prefix("*.")
+        .map_or((false, value), |name| (true, name));
+    let name = name.strip_suffix('.').unwrap_or(name);
+    // Host parsing supplies IDNA normalization. Reject URL syntax first so
+    // percent escapes, ports and paths cannot become a different destination.
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|character| character.is_whitespace() || "*?/#:@\\%".contains(character))
+    {
+        return Err(invalid_destination());
+    }
+    let url::Host::Domain(domain) = url::Host::parse(name).map_err(|_| invalid_destination())?
+    else {
+        return Err(invalid_destination());
+    };
+    if domain.len() > 253
+        || domain.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+    {
+        return Err(invalid_destination());
+    }
+    // Preserve the native leading-wildcard matcher: it matches subdomains at
+    // any depth and does not add an allow rule for the apex domain.
+    Ok(if wildcard {
+        format!("*.{domain}")
+    } else {
+        domain
+    })
 }
 
 #[cfg(test)]
@@ -383,7 +440,7 @@ mod tests {
         };
         let policy = convert_egress(
             &EgressRequest {
-                allow_out: Some(vec!["1.2.3.4".into()]),
+                allow_out: Some(vec!["*.example.test".into()]),
                 deny_out: Some(vec!["10.0.0.0/8".into()]),
                 allow_internet_access: Some(false),
             },
@@ -397,8 +454,21 @@ mod tests {
         assert_eq!(traffic.mode, TrafficMode::Stateless);
         assert_eq!(traffic.rules[0].direction, NetworkDirection::Ingress);
         assert_eq!(traffic.rules[1].priority, ALLOW_PRIORITY);
+        assert_eq!(traffic.rules[1].peer.domain, "*.example.test");
         assert_eq!(traffic.rules[2].priority, DENY_PRIORITY);
         assert_eq!(policy.dns, baseline.dns);
+        let cleared = convert_egress(
+            &EgressRequest::default(),
+            UnsupportedFeatures::default(),
+            Some(&policy),
+        )
+        .unwrap();
+        assert_eq!(cleared.dns, baseline.dns);
+        let cleared_traffic = cleared.traffic.unwrap();
+        assert_eq!(cleared_traffic.ingress_default_action, NetworkAction::Deny);
+        assert_eq!(cleared_traffic.egress_default_action, NetworkAction::Allow);
+        assert_eq!(cleared_traffic.mode, TrafficMode::Stateless);
+        assert_eq!(cleared_traffic.rules, vec![traffic.rules[0].clone()]);
     }
 
     #[test]
@@ -416,34 +486,162 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_egress_inputs_return_capability_error() {
-        let error = convert_egress(
+    fn domain_allow_rules_reuse_native_peers_with_ip_rules() {
+        let policy = convert_egress(
             &EgressRequest {
-                allow_out: Some(vec!["*.example.test".into()]),
-                ..Default::default()
+                allow_out: Some(vec![
+                    "1.2.3.4".into(),
+                    "192.0.2.0/24".into(),
+                    " API.Example.test. ".into(),
+                    "*.BÜCHER.example.".into(),
+                ]),
+                deny_out: Some(vec!["0.0.0.0/0".into()]),
+                allow_internet_access: Some(false),
             },
             UnsupportedFeatures::default(),
             None,
         )
-        .unwrap_err();
-        assert_eq!(error.code(), "capability_not_supported");
-        let error = convert_egress(
-            &EgressRequest::default(),
+        .unwrap();
+        let traffic = policy.traffic.unwrap();
+        assert_eq!(traffic.mode, TrafficMode::Stateful);
+        assert_eq!(traffic.egress_default_action, NetworkAction::Deny);
+        assert_eq!(traffic.rules.len(), 5);
+        for (rule, (cidr, domain)) in traffic.rules.iter().zip([
+            ("1.2.3.4/32", ""),
+            ("192.0.2.0/24", ""),
+            ("", "api.example.test"),
+            ("", "*.xn--bcher-kva.example"),
+            ("0.0.0.0/0", ""),
+        ]) {
+            assert_eq!(rule.peer.cidr, cidr);
+            assert_eq!(rule.peer.domain, domain);
+            assert_eq!(rule.direction, NetworkDirection::Egress);
+            assert_eq!(rule.protocol, NetworkProtocol::Any);
+            assert_eq!(rule.environment_port, 0);
+            assert_eq!(rule.environment_port_range, None);
+        }
+        for rule in &traffic.rules[..4] {
+            assert_eq!(rule.action, NetworkAction::Allow);
+            assert_eq!(rule.priority, ALLOW_PRIORITY);
+        }
+        assert_eq!(traffic.rules[4].action, NetworkAction::Deny);
+        assert_eq!(traffic.rules[4].priority, DENY_PRIORITY);
+    }
+
+    #[test]
+    fn deny_out_domains_remain_unsupported_by_the_e2b_contract() {
+        for value in ["example.test", "*.example.test"] {
+            let error = convert_egress(
+                &EgressRequest {
+                    deny_out: Some(vec![value.into()]),
+                    ..Default::default()
+                },
+                UnsupportedFeatures::default(),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "capability_not_supported");
+            assert_eq!(error.message(), "denyOut domain rules are not supported");
+        }
+    }
+
+    #[test]
+    fn invalid_egress_destinations_return_invalid_request() {
+        for value in [
+            "",
+            " ",
+            "*",
+            "*example.test",
+            "api.*.example.test",
+            "*.*.example.test",
+            "?.example.test",
+            ".example.test",
+            "example..test",
+            "-example.test",
+            "example-.test",
+            "example.test..",
+            "https://example.test",
+            "example.test/path",
+            "example.test:443",
+            "user@example.test",
+            "example.test?query",
+            "example.test#fragment",
+            "example%2etest",
+            "example test",
+            "*.1.2.3.4",
+            "999.2.3.4",
+            "1.2.3.4/33",
+            "1.2.3.4/no-prefix",
+            "example.test/24",
+        ] {
+            for allow in [true, false] {
+                let mut request = EgressRequest::default();
+                if allow {
+                    request.allow_out = Some(vec![value.into()]);
+                } else {
+                    request.deny_out = Some(vec![value.into()]);
+                }
+                let error =
+                    convert_egress(&request, UnsupportedFeatures::default(), None).unwrap_err();
+                assert_eq!(error.code(), "invalid_request", "{value:?}, allow={allow}");
+            }
+        }
+        for value in [format!("{}.test", "a".repeat(64)), "a.".repeat(128)] {
+            let error = convert_egress(
+                &EgressRequest {
+                    allow_out: Some(vec![value]),
+                    ..Default::default()
+                },
+                UnsupportedFeatures::default(),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "invalid_request");
+        }
+    }
+
+    #[test]
+    fn unsupported_egress_inputs_return_capability_error() {
+        for value in ["2001:db8::1", "2001:db8::/64"] {
+            let error = convert_egress(
+                &EgressRequest {
+                    allow_out: Some(vec![value.into()]),
+                    ..Default::default()
+                },
+                UnsupportedFeatures::default(),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "capability_not_supported");
+        }
+        for features in [
+            UnsupportedFeatures {
+                egress_proxy: true,
+                ..Default::default()
+            },
+            UnsupportedFeatures {
+                rules: true,
+                ..Default::default()
+            },
+            UnsupportedFeatures {
+                mask_request_host: true,
+                ..Default::default()
+            },
             UnsupportedFeatures {
                 https_ports: true,
                 ..Default::default()
             },
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), "capability_not_supported");
+        ] {
+            let error = convert_egress(&EgressRequest::default(), features, None).unwrap_err();
+            assert_eq!(error.code(), "capability_not_supported");
+        }
     }
 
     #[test]
     fn gateway_envd_guard_is_ingress_only_and_preserves_egress() {
         let baseline = convert_egress(
             &EgressRequest {
-                allow_out: Some(vec!["1.2.3.4".into()]),
+                allow_out: Some(vec!["*.example.test".into()]),
                 ..Default::default()
             },
             UnsupportedFeatures::default(),
@@ -457,6 +655,9 @@ mod tests {
             traffic.egress_default_action,
             baseline.traffic.unwrap().egress_default_action
         );
+        assert!(traffic.rules.iter().any(|rule| {
+            rule.direction == NetworkDirection::Egress && rule.peer.domain == "*.example.test"
+        }));
         assert!(traffic.rules.iter().any(|rule| {
             rule.direction == NetworkDirection::Ingress
                 && rule.action == NetworkAction::Deny

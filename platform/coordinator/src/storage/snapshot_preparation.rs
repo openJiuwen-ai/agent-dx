@@ -2,14 +2,14 @@
 use super::*;
 use adx_core::snapshot_preparation::{
     normalize_name, valid_preparation_id, validate_template_tenant, PreparationState,
-    SnapshotPreparation, SnapshotTemplate, SuccessfulPreparation,
+    SnapshotPreparation, SnapshotTemplate, SnapshotTemplateUsage, SuccessfulPreparation,
 };
 
 const MAX_TEMPLATES: usize = 4096;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_LIST_BYTES: usize = 16 * 1024 * 1024;
 
-fn decode_template(raw: &str) -> Result<SnapshotTemplate> {
+pub(super) fn decode_template(raw: &str) -> Result<SnapshotTemplate> {
     if raw.len() > MAX_RECORD_BYTES {
         return Err(Error::Unavailable(
             "snapshot template record exceeds limit".into(),
@@ -25,7 +25,7 @@ fn name_field(tenant: &str, name: &str) -> Result<String> {
 }
 
 impl Session {
-    fn snapshot_templates_key(&self) -> String {
+    pub(super) fn snapshot_templates_key(&self) -> String {
         format!("{}:snapshot-templates", self.store.key)
     }
 
@@ -33,7 +33,11 @@ impl Session {
         format!("{}:snapshot-template-names", self.store.key)
     }
 
-    async fn snapshot_preparation_field(&self, key: String, field: &str) -> Result<Option<String>> {
+    pub(super) async fn snapshot_preparation_field(
+        &self,
+        key: String,
+        field: &str,
+    ) -> Result<Option<String>> {
         let mut command = redis::cmd("EVAL");
         command
             .arg(
@@ -67,6 +71,51 @@ impl Session {
                 "snapshot template record exceeds 1 MiB".into(),
             ));
         }
+        // Join the snapshot inventory ordering before reading the exact bytes that
+        // will be bound. Reference mutations must not race a speculative cache update.
+        let previous = old.map(decode_template).transpose()?;
+        let first_ready = next.preparation.state == PreparationState::Ready
+            && previous
+                .as_ref()
+                .is_none_or(|previous| previous.preparation.state != PreparationState::Ready);
+        let mut inventory = if first_ready {
+            Some(self.inspection.lock().await)
+        } else {
+            None
+        };
+        let binding = if first_ready {
+            use adx_core::snapshots::{Snapshot, SnapshotKind, SnapshotState};
+            let id = next
+                .preparation
+                .snapshot_id
+                .as_ref()
+                .ok_or(Error::Conflict)?;
+            let raw = self.snapshot_raw(id).await?.ok_or(Error::Conflict)?;
+            let mut snapshot: Snapshot = decode(&raw)?;
+            snapshot.validate()?;
+            if snapshot.kind != SnapshotKind::Golden
+                || snapshot.state != SnapshotState::Ready
+                || snapshot.template.tenant_id != next.tenant_id
+                || previous
+                    .as_ref()
+                    .and_then(|previous| previous.preparation.spec.as_ref())
+                    .or(next.preparation.spec.as_ref())
+                    .is_none_or(|spec| !snapshot.matches_template(spec))
+                || snapshot
+                    .preparation_template_id
+                    .as_ref()
+                    .is_some_and(|id| id != &next.id)
+            {
+                return Err(Error::Conflict);
+            }
+            if snapshot.preparation_template_id.is_none() {
+                snapshot.preparation_template_id = Some(next.id.clone());
+                snapshot.revision = snapshot.revision.checked_add(1).ok_or(Error::Conflict)?;
+            }
+            Some((raw, snapshot))
+        } else {
+            None
+        };
         let mut command = redis::cmd("EVAL");
         command
             .arg(
@@ -77,7 +126,9 @@ impl Session {
             local indexed=redis.call('HGET',KEYS[3],ARGV[5]) or ''
             if indexed ~= ARGV[6] then return 0 end
             if old == '' and redis.call('HLEN',KEYS[2]) >= tonumber(ARGV[8]) then return 2 end
+            if ARGV[9] ~= '' and (redis.call('HGET',KEYS[4],ARGV[9]) or '') ~= ARGV[10] then return 0 end
             redis.call('HSET',KEYS[2],ARGV[2],ARGV[4])
+            if ARGV[9] ~= '' then redis.call('HSET',KEYS[4],ARGV[9],ARGV[11]) end
             if ARGV[7] == 'active' then
                 redis.call('HSET',KEYS[3],ARGV[5],ARGV[2])
             elseif indexed == ARGV[2] then
@@ -86,10 +137,11 @@ impl Session {
             return 1
         "#,
             )
-            .arg(3)
+            .arg(4)
             .arg(&self.store.key)
             .arg(self.snapshot_templates_key())
             .arg(self.snapshot_template_names_key())
+            .arg(self.snapshots_key())
             .arg(self.epoch.to_string())
             .arg(&next.id)
             .arg(old.unwrap_or(""))
@@ -97,13 +149,77 @@ impl Session {
             .arg(name_field(&next.tenant_id, &next.name)?)
             .arg(expected_name.unwrap_or(""))
             .arg(if next.deleted { "deleted" } else { "active" })
-            .arg(MAX_TEMPLATES);
-        match self.store.query::<i64>(command).await? {
+            .arg(MAX_TEMPLATES)
+            .arg(binding.as_ref().map_or("", |(_, snapshot)| snapshot.id.as_str()))
+            .arg(binding.as_ref().map_or("", |(raw, _)| raw.as_str()))
+            .arg(binding.as_ref().map(|(_, snapshot)| encode(snapshot)).transpose()?.unwrap_or_default());
+        // Taking the committed view also invalidates it if this future is
+        // cancelled while Redis may already have accepted the write.
+        let mut committed = inventory.as_mut().and_then(|inventory| inventory.take());
+        let result = self.store.query::<i64>(command).await;
+        if let Some(inventory) = &mut inventory {
+            if result.is_ok() {
+                if let (Ok(1), Some(committed), Some((_, snapshot))) =
+                    (&result, committed.as_mut(), binding)
+                {
+                    committed.snapshots.insert(snapshot.id.clone(), snapshot);
+                }
+                **inventory = committed;
+            }
+        }
+        match result? {
             1 => Ok(true),
             0 => Ok(false),
             2 => Err(Error::Invalid("snapshot template limit reached".into())),
             _ => Err(Error::Conflict),
         }
+    }
+
+    /// Derive a family write from immutable snapshot provenance. The publication
+    /// transaction compares these old bytes before writing either creation or usage.
+    pub(super) async fn snapshot_template_spawn_write(
+        &self,
+        snapshot_id: &str,
+        tenant: &str,
+        settled_at_unix_ms: u64,
+    ) -> Result<Vec<String>> {
+        let snapshot = match self.get_snapshot(snapshot_id).await {
+            Ok(snapshot) => snapshot,
+            // Legacy creation records may no longer retain their input capture.
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        if snapshot.template.tenant_id != tenant {
+            return Err(Error::Conflict);
+        }
+        let Some(id) = snapshot.preparation_template_id else {
+            return Ok(Vec::new());
+        };
+        let Some(raw) = self
+            .snapshot_preparation_field(self.snapshot_templates_key(), &id)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut family = decode_template(&raw)?;
+        if family.tenant_id != tenant {
+            return Err(Error::Conflict);
+        }
+        let Some(usage) = &mut family.usage else {
+            return Ok(Vec::new());
+        };
+        usage.spawn_count = usage.spawn_count.checked_add(1).ok_or(Error::Conflict)?;
+        usage.last_spawned_at_unix_ms = Some(
+            usage
+                .last_spawned_at_unix_ms
+                .map_or(settled_at_unix_ms, |previous| {
+                    previous.max(settled_at_unix_ms)
+                }),
+        );
+        family.revision = family.revision.checked_add(1).ok_or(Error::Conflict)?;
+        family.updated_at_unix_ms = adx_core::observation::now_millis()?;
+        family.validate()?;
+        Ok(vec![id, raw, encode(&family)?])
     }
 
     /// Register a fresh preparation while preserving an active name's family ID.
@@ -121,6 +237,7 @@ impl Session {
         let preparation = SnapshotPreparation {
             id: uuid::Uuid::new_v4().to_string(),
             created_at_unix_ms,
+            updated_at_unix_ms: created_at_unix_ms,
             resources,
             state: PreparationState::Registered,
             spec: None,
@@ -163,6 +280,11 @@ impl Session {
                     tenant_id: tenant.into(),
                     name: name.clone(),
                     created_at_unix_ms,
+                    updated_at_unix_ms: created_at_unix_ms,
+                    usage: Some(SnapshotTemplateUsage {
+                        spawn_count: 0,
+                        last_spawned_at_unix_ms: None,
+                    }),
                     revision: 0,
                     deleted: false,
                     preparation: preparation.clone(),
@@ -182,6 +304,7 @@ impl Session {
             }
             next.revision = next.revision.checked_add(1).ok_or(Error::Conflict)?;
             next.preparation = preparation.clone();
+            next.updated_at_unix_ms = adx_core::observation::now_millis()?;
             let old = existing
                 .as_ref()
                 .filter(|template| !template.deleted)
@@ -375,6 +498,9 @@ impl Session {
                 || next.name != previous.name
                 || next.created_at_unix_ms != previous.created_at_unix_ms
                 || next.revision != previous.revision
+                || next.updated_at_unix_ms != previous.updated_at_unix_ms
+                || next.usage != previous.usage
+                || next.preparation.updated_at_unix_ms != previous.preparation.updated_at_unix_ms
                 || (previous.deleted && !next.deleted)
                 || next.preparation.id != previous.preparation.id
                 || next.preparation.created_at_unix_ms != previous.preparation.created_at_unix_ms
@@ -385,6 +511,10 @@ impl Session {
                 return Err(Error::Conflict);
             }
             next.revision = next.revision.checked_add(1).ok_or(Error::Conflict)?;
+            next.updated_at_unix_ms = adx_core::observation::now_millis()?;
+            if next.preparation != previous.preparation {
+                next.preparation.updated_at_unix_ms = next.updated_at_unix_ms;
+            }
             if next.preparation.state == PreparationState::Ready {
                 let snapshot_id =
                     next.preparation.snapshot_id.clone().ok_or_else(|| {
@@ -393,6 +523,8 @@ impl Session {
                 next.latest_successful = Some(SuccessfulPreparation {
                     preparation_id: next.preparation.id.clone(),
                     snapshot_id,
+                    created_at_unix_ms: next.preparation.created_at_unix_ms,
+                    updated_at_unix_ms: next.preparation.updated_at_unix_ms,
                 });
             }
             if self

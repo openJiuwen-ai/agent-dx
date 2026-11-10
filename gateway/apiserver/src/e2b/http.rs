@@ -1,4 +1,4 @@
-use super::dto::{NetworkUpdateRequest, SandboxSummary};
+use super::dto::{NetworkUpdateRequest, ResumeRequest, SandboxSummary};
 use super::{
     ConnectRequest, CreateRequest, ErrorBody, PauseRequest, SnapshotRequest, TimeoutRequest,
     ValidationError,
@@ -592,6 +592,12 @@ async fn action(
             ))
         }
         ("POST", "v2", "connect") => connect(api, request, id, caller).await,
+        ("POST", "sandbox", "resume") => resume(api, request, id, caller).await,
+        ("GET", "template", "") => {
+            super::template_api::detail(api, id, request.uri().query().unwrap_or(""), caller)
+                .await
+                .map(|value| (200, value))
+        }
         ("DELETE", "template", "") => {
             if !super::template_api::delete(api, id, caller).await? {
                 delete_snapshot(api, id, caller).await?;
@@ -672,6 +678,75 @@ async fn connect(
         if paused { 201 } else { 200 },
         sandbox_detail(api, &control, caller).await?,
     ))
+}
+
+async fn resume(
+    api: &Api,
+    request: Request<Incoming>,
+    id: &str,
+    caller: &pb::CallerContext,
+) -> Result<(u16, Value), Status> {
+    let input: ResumeRequest = serde_json::from_value(body(request.into_body(), BODY_LIMIT).await?)
+        .map_err(|_| Status::invalid_argument("invalid resume request"))?;
+    input.validate().map_err(validation)?;
+    let owner = sandbox_owner(api, id, caller, true).await?;
+    let record = owner
+        .record
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("missing environment record"))?;
+    if let Some(auto_pause) = input.auto_pause {
+        let action = record
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.run_policy.as_ref())
+            .map(|policy| policy.action);
+        if action
+            != Some(if auto_pause {
+                pb::RunExpiryAction::Pause
+            } else {
+                pb::RunExpiryAction::Delete
+            } as i32)
+        {
+            return Err(validation(ValidationError::unsupported(
+                "changing autoPause during resume is not supported",
+            )));
+        }
+    }
+    if record.state != pb::EnvironmentState::Paused as i32 {
+        return Err(Status::failed_precondition("sandbox is not paused"));
+    }
+    let timeout = input.timeout.unwrap_or(15);
+    // Override any staged paused-state expiry until response preparation. Zero
+    // is applied below through the existing owner timer, after Ready is observed.
+    let recovery_timeout = if timeout == 0 {
+        DEFAULT_TIMEOUT_SECONDS
+    } else {
+        timeout
+    };
+    api.environment_service
+        .resume_with_run_timeout(id, caller, recovery_timeout)
+        .await?;
+    // Prepare the response before zero expiry can delete the restored execution,
+    // but do not let a response failure skip that requested expiry.
+    let response = match async {
+        let control = api.clients.environment_control(id, caller).await?;
+        sandbox_detail(api, &control, caller).await
+    }
+    .await
+    {
+        Err(error) if timeout != 0 => return Err(error),
+        response => response,
+    };
+    // The ID-based update has no run precondition. Do not retry an ambiguous
+    // reply: expiry may have paused the sandbox, and another update would stage
+    // zero for a later wake (or affect a concurrently resumed execution).
+    let control = api
+        .clients
+        .update_environment_control(id, caller, timeout, false)
+        .await?;
+    let mut response = response?;
+    response["endAt"] = json!(rfc3339(control.expires_at_unix_ms));
+    Ok((201, response))
 }
 fn snapshot_payload(input: SnapshotRequest) -> Value {
     input
@@ -841,9 +916,9 @@ pub(super) fn validation(error: ValidationError) -> Status {
 }
 fn raw(status: u16, mut value: Value) -> Response<Body> {
     let next = value
-        .get("nextToken")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+        .as_object_mut()
+        .and_then(|object| object.remove("nextToken"))
+        .and_then(|value| value.as_str().map(str::to_owned));
     let items = if value.get("snapshots").is_some() {
         "snapshots"
     } else {

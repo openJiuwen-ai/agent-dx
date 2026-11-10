@@ -69,6 +69,8 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 
 E2B 管理入口使用自己的协议错误响应。`POST /v2/sandboxes` 调用共享创建能力后，创建调用及后续控制记录/详情读取的 `Unavailable` 对外映射为 500，避免 E2B SDK 收到 503 后以新实例身份自动重建。创建前的认证、模板预检错误保留原映射；超时仍为 504，其他 E2B 路由不受影响。此规则仅作用于适配层，不改变上述原生错误合同，不增加跨请求幂等，也不因应答失败删除结果未知的实例。
 
+`POST /sandboxes` 与 `POST /v2/sandboxes` 按 snapshot ID 创建时，缺失或已逻辑删除（Deleting/Deleted）的快照源返回 E2B 404；仍存在的其他非 Ready 源返回 409。上述错误均在共享创建调用前返回，不创建实例。租户权限检查先于快照状态判断，沿用上游读取的权限错误；适配层检测到非本租户执行规格时返回 404。已注册模板没有可用 Ready build 的情况仍为 409。
+
 ### 创建超时阶段
 
 创建超时使用 HTTP 504 和 `DEADLINE_EXCEEDED`。节点确认该创建已失败时，返回
@@ -195,6 +197,14 @@ a Published terminal Failed result. It maps to retry=never/outcome=terminal; pla
 transport Unavailable or DeadlineExceeded retains outcome=unknown. API diagnostics
 export bounded labels rather than raw error messages. See the
 [Sandbox metric contract](../../../docs/testing/sandbox-observability.md).
+
+Golden snapshot preparation consumes explicit `adx-create-terminal=true` or
+`adx-backend-failure=true` statuses at the seed creation boundary, before generic
+dependency error conversion. The build enters Failed with the bounded original
+error message; subsequent reconciliation cleans its seed without retrying creation
+and preserves the family's latest successful capture. E2B build status exposes
+this as `error` with `reason.message`. Unmarked NotFound, transport errors and
+uncertain capture results retain the existing reconciliation behavior.
 
 ### Volume 管理错误
 
