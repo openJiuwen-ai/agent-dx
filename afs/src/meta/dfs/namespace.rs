@@ -219,87 +219,112 @@ impl DfsService {
     }
 
     pub async fn mkdir(&self, request: MkdirRequest) -> Result<InodeRecord> {
-        let request_digest = namespace_request_digest(&request)?;
-        let MkdirRequest {
-            caller_id,
-            operation_id,
-            namespace_id,
-            parent_inode_id,
-            name,
-            mut attributes,
-            caller,
-        } = request;
-        require_id(&caller_id, "caller_id")?;
-        require_id(&operation_id.0, "operation_id")?;
-        require_id(&namespace_id.0, "namespace_id")?;
-        require_id(&parent_inode_id.0, "parent_inode_id")?;
+        let digest = namespace_request_digest(&request)?;
+        require_id(&request.caller_id, "caller_id")?;
+        require_id(&request.operation_id.0, "operation_id")?;
+        require_id(&request.namespace_id.0, "namespace_id")?;
+        require_id(&request.parent_inode_id.0, "parent_inode_id")?;
+        let operation = StoreOperation::DfsMkdir;
         if let Some(inode) = self
-            .replayed_namespace_inode(
-                &caller_id,
-                &operation_id,
-                StoreOperation::DfsMkdir,
-                request_digest,
-            )
+            .replayed_namespace_inode(&request.caller_id, &request.operation_id, operation, digest)
             .await?
         {
             return Ok(inode);
         }
-        validate_name(&name)?;
-        let parent = self
-            .directory_for_mutation(&namespace_id, &parent_inode_id)
-            .await?;
-        if let Some(parent) = &parent {
-            ensure_directory_create_access(&caller, parent)?;
-        }
-        attributes.uid = caller.uid;
-        attributes.gid = inherited_child_gid(&caller, parent.as_ref());
-        if parent
-            .as_ref()
-            .is_some_and(|parent| parent.attributes.mode & 0o2000 != 0)
-        {
-            attributes.mode |= 0o2000;
-        }
-        attributes.nlink = 2;
-        let inode = InodeRecord {
-            namespace_id: namespace_id.clone(),
-            inode_id: namespace_inode_id(&caller_id, &operation_id),
-            kind: InodeKind::Directory,
-            attributes,
-            head_version: None,
-            symlink_target: None,
-            xattrs: Default::default(),
-            revision: 1,
-        };
+        validate_name(&request.name)?;
+        let key = RequestKey::new(request.caller_id.clone(), request.operation_id.0.clone());
+        let inode_id = namespace_inode_id(&request.caller_id, &request.operation_id);
         let dentry = Dentry {
             key: DentryKey {
-                namespace_id,
-                parent_inode_id,
-                name,
+                namespace_id: request.namespace_id.clone(),
+                parent_inode_id: request.parent_inode_id.clone(),
+                name: request.name,
             },
-            inode_id: inode.inode_id.clone(),
+            inode_id: inode_id.clone(),
         };
-        let request = RequestKey::new(caller_id, operation_id.0.clone());
-        let outcome = RequestOutcome {
-            request: request.clone(),
-            operation: StoreOperation::DfsMkdir,
-            result: namespace_result(request_digest, OperationResult::DfsInode(inode.clone())),
-        };
-        let mut txn = MetaTxn::new(request.clone(), StoreOperation::DfsMkdir);
-        txn.conditions.extend([
-            TxnCondition::RequestAbsent(request),
-            TxnCondition::Missing(MetaKey::DfsDentry(dentry.key.clone())),
-            TxnCondition::Missing(MetaKey::DfsInode(inode.inode_id.clone())),
-        ]);
-        push_parent_namespace_change(&mut txn, parent, 1);
-        txn.mutations.extend([
-            TxnMutation::Put(MetaEntity::DfsDentry(dentry)),
-            TxnMutation::Put(MetaEntity::DfsInode(inode)),
-            TxnMutation::RecordRequestOutcome(outcome),
-        ]);
-        inode_outcome(
-            validate_namespace_outcome(self.store.compare_and_commit(txn).await?, request_digest)?,
-            StoreOperation::DfsMkdir,
-        )
+        for _ in 0..NAMESPACE_MKDIR_RETRY_LIMIT {
+            let parent = self
+                .directory_for_mutation(&dentry.key.namespace_id, &dentry.key.parent_inode_id)
+                .await?;
+            if let Some(parent) = &parent {
+                ensure_directory_create_access(&request.caller, parent)?;
+            }
+            let mut attributes = request.attributes.clone();
+            attributes.uid = request.caller.uid;
+            attributes.gid = inherited_child_gid(&request.caller, parent.as_ref());
+            if parent
+                .as_ref()
+                .is_some_and(|parent| parent.attributes.mode & 0o2000 != 0)
+            {
+                attributes.mode |= 0o2000;
+            }
+            attributes.nlink = 2;
+            let inode = InodeRecord {
+                namespace_id: dentry.key.namespace_id.clone(),
+                inode_id: inode_id.clone(),
+                kind: InodeKind::Directory,
+                attributes,
+                head_version: None,
+                symlink_target: None,
+                xattrs: Default::default(),
+                revision: 1,
+            };
+            let mut txn = MetaTxn::new(key.clone(), operation);
+            txn.conditions.extend([
+                TxnCondition::RequestAbsent(key.clone()),
+                TxnCondition::Missing(MetaKey::DfsDentry(dentry.key.clone())),
+                TxnCondition::Missing(MetaKey::DfsInode(inode_id.clone())),
+            ]);
+            push_parent_namespace_change(&mut txn, parent, 1);
+            txn.mutations.extend([
+                TxnMutation::Put(MetaEntity::DfsDentry(dentry.clone())),
+                TxnMutation::Put(MetaEntity::DfsInode(inode.clone())),
+                TxnMutation::RecordRequestOutcome(RequestOutcome {
+                    request: key.clone(),
+                    operation,
+                    result: namespace_result(digest, OperationResult::DfsInode(inode)),
+                }),
+            ]);
+            let outcome =
+                validate_namespace_outcome(self.store.compare_and_commit(txn).await?, digest)?;
+            if !matches!(
+                outcome,
+                TxnOutcome::ConditionFailed {
+                    existing_outcome: None,
+                    ..
+                }
+            ) {
+                return inode_outcome(outcome, operation);
+            }
+
+            // A sibling mutation also changes the parent inode. Re-read and
+            // revalidate rather than treating every failed CAS as a collision.
+            if self
+                .store
+                .read(MetaRead::DfsDentry(dentry.key.clone()))
+                .await?
+                .entity
+                .is_some()
+            {
+                if let Some(inode) = self
+                    .replayed_namespace_inode(
+                        &request.caller_id,
+                        &request.operation_id,
+                        operation,
+                        digest,
+                    )
+                    .await?
+                {
+                    return Ok(inode);
+                }
+                return Err(already_exists("DFS mkdir target already exists"));
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(Error::coded(
+            afs_error::META_DFS_NAMESPACE_RETRY,
+            "DFS namespace changed repeatedly during bounded mkdir retry",
+        ))
     }
 
     /// Special inode bytes are interpreted by the Linux VFS, not ChunkSink.
