@@ -461,7 +461,7 @@ impl DfsReadEngine {
             copied_bytes = tracing::field::Empty,
         );
         let _entered = span.enter();
-        batch.validate_for_output(out.len(), &self.config)?;
+        batch.validate_output(out.len(), &self.config, false)?;
         let mut staged_batch = batch.clone();
         let mut length = 0;
         for op in &mut staged_batch.ops {
@@ -554,7 +554,7 @@ impl DfsReadEngine {
         batch: &ReadBatch,
         out: &mut [u8],
     ) -> Result<CurrentExternalReadOutcome> {
-        batch.validate_for_output(out.len(), &self.config)?;
+        batch.validate_output(out.len(), &self.config, false)?;
         let mut packed = batch.clone();
         let mut size = 0;
         for op in &mut packed.ops {
@@ -598,7 +598,7 @@ impl DfsReadEngine {
         if output_len as u64 > self.config.max_inflight_bytes {
             return Err(invalid("DFS owned read exceeds inflight byte budget"));
         }
-        batch.validate_for_output(output_len, &self.config)?;
+        batch.validate_output(output_len, &self.config, false)?;
         // Object-grouped fetches may reorder overlapping writes. Keep the
         // borrowed packed/scatter path for those uncommon layouts.
         for (index, op) in batch
@@ -629,7 +629,7 @@ impl DfsReadEngine {
         let Some(backend) = &self.external_backend else {
             return Ok(None);
         };
-        batch.validate_for_output(output_len, &self.config)?;
+        batch.validate_output(output_len, &self.config, false)?;
         let local = self.read_authority.snapshot()?;
         let version = batch
             .file_version_id

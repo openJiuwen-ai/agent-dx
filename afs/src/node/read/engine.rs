@@ -903,7 +903,7 @@ impl DfsReadEngine {
             external = self.external_backend.is_some(),
         );
         let _entered = span.enter();
-        batch.validate_for_output(out.len(), &self.config)?;
+        batch.validate_output(out.len(), &self.config, !self.has_external_backend())?;
         let route = self.chunk_source();
         let native_authority = if matches!(route, ChunkSource::Native(_)) {
             Some(self.capture_native_read_authority()?)

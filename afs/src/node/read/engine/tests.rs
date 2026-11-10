@@ -7423,3 +7423,28 @@ fn s1c6_read_hot_path_round(len: usize, label: &str) {
         }
     }
 }
+
+#[test]
+fn external_version_read_authorizes_thousand_cold_ranges_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+    let engine = fixture.engine(
+        Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+        fixture.empty_sources(),
+    );
+    let mut batch = fixture.batch();
+    let op = batch.ops[0].clone();
+    batch.ops = (0..1000)
+        .map(|index| ChunkReadOp {
+            output_offset: index * 2,
+            ..op.clone()
+        })
+        .collect();
+    let result = engine
+        .read_batch_external_version_owned(&crate::dfs::InodeId::new("inode"), &batch, 2000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result, b"bc".repeat(1000));
+    assert_eq!(*fixture.authorizations.lock().unwrap(), 1);
+    assert_eq!(*fixture.fetches.lock().unwrap(), 1);
+}
