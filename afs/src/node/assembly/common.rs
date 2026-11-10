@@ -171,8 +171,7 @@ pub(super) fn node_descriptor<'a>(
         let data_addr = cfg
             .outlet
             .as_ref()
-            .and_then(|outlet| outlet.dynamic_imports.as_ref())
-            .map(|dynamic| dynamic.nfs_addr.clone())
+            .map(|outlet| outlet.nfs_addr.clone())
             .unwrap_or_else(|| advertised.clone());
         let mut capabilities = Vec::new();
         if cfg.ownerfs {

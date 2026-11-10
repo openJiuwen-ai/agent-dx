@@ -22,7 +22,7 @@ mod outlet;
 mod ownerfs;
 mod tls;
 
-pub use outlet::{DynamicImports, OutletConfig};
+pub use outlet::{DEFAULT_MOUNT_OPTIONS, OutletConfig};
 
 pub use tls::read_certificate_der;
 
@@ -340,14 +340,8 @@ pub struct Cli {
     /// default 60000. Used only to validate the generation grace floor.
     #[arg(long)]
     pub outlet_max_import_actimeo_ms: Option<u64>,
-    /// Let `afs-node` mount `imports/<home>/users` itself. Default false keeps
-    /// the deployer responsible, which is how every existing deployment runs.
-    /// Turning this on means the deploy script must stop mounting them: both
-    /// sides mounting the same path races into `EBUSY`.
-    #[arg(long)]
-    pub outlet_dynamic_imports: Option<bool>,
-    /// Mount options used when `outlet_dynamic_imports` is on. Matches the
-    /// kernel defaults autofs uses today, so the data path keeps the same
+    /// Mount options for the import mounts `afs-node` performs itself. Matches
+    /// the kernel defaults autofs uses today, so the data path keeps the same
     /// semantics it has under a static mount.
     #[arg(long)]
     pub outlet_import_mount_options: Option<String>,
@@ -578,7 +572,6 @@ struct FileConfig {
     outlet_mirror_interval_ms: Option<u64>,
     outlet_generation_grace_ms: Option<u64>,
     outlet_max_import_actimeo_ms: Option<u64>,
-    outlet_dynamic_imports: Option<bool>,
     outlet_import_mount_options: Option<String>,
     outlet_users_root: Option<PathBuf>,
     outlet_nfs_addr: Option<String>,

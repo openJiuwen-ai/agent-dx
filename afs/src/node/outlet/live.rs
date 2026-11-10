@@ -473,16 +473,7 @@ impl ImportExecutor {
     }
 }
 
-pub fn converge(
-    config: &MirrorConfig,
-    meta: &dyn RootMeta,
-    cached_digest: &mut Option<String>,
-    cached_roots: &mut Vec<OutletRoot>,
-) -> Result<usize> {
-    converge_with_imports(config, meta, cached_digest, cached_roots, None)
-}
-
-/// Convergence with an optional dynamic-import executor.
+/// Convergence with an import executor.
 ///
 /// Round order is fixed and matters (design §3):
 ///
@@ -492,15 +483,12 @@ pub fn converge(
 ///    name never appears pointing at an unmounted target;
 /// 3. publish — the name layer of `mirror`;
 /// 4. orphan report — warn only, never unmount.
-///
-/// With `imports` as `None` this is exactly the previous behaviour, which is
-/// what keeps `outlet_dynamic_imports = false` a zero-change upgrade.
-pub fn converge_with_imports(
+pub fn converge_round(
     config: &MirrorConfig,
     meta: &dyn RootMeta,
     cached_digest: &mut Option<String>,
     cached_roots: &mut Vec<OutletRoot>,
-    mut imports: Option<&mut ImportExecutor>,
+    imports: &mut ImportExecutor,
 ) -> Result<usize> {
     let reply = meta.list_active_outlet_roots(cached_digest.as_deref())?;
     // H14: an `unchanged` reply carries no payload and must reuse the cache.
@@ -510,17 +498,17 @@ pub fn converge_with_imports(
     *cached_digest = Some(reply.digest.clone());
     *cached_roots = active.clone();
 
-    if let Some(executor) = imports.as_deref_mut() {
+    {
         // mountinfo 是真相源：外部 umount、进程重启但机器未重启、内存与实际
         // 不一致，都由这一次扫描纠正（设计 §4）。
         if let Ok(mountinfo) = std::fs::read("/proc/self/mountinfo") {
             let mounts = super::topology::parse(&mountinfo);
-            executor.reconcile(&mounts);
-            executor.report_orphans(&mounts);
+            imports.reconcile(&mounts);
+            imports.report_orphans(&mounts);
         }
         // 挂载失败不阻断发布：该 home 的名字仍会发布，只是暂时断链。
         // 这比"整轮放弃"好——其他 home 的名字不受影响（spec H7）。
-        if let Err(error) = executor.ensure_imports(&active) {
+        if let Err(error) = imports.ensure_imports(&active) {
             afs_logging::warn!(
                 "outlet.import.round_failed";
                 "error" => error.to_string()
@@ -549,9 +537,7 @@ pub fn converge_with_imports(
                     | mirror::Action::Remove { name }
                     | mirror::Action::Quarantine { name } => name,
                 };
-                if imports.is_some()
-                    && let Some(home) = home_of_published(name, &active)
-                {
+                if let Some(home) = home_of_published(name, &active) {
                     suspect = Some(home);
                 }
                 afs_logging::warn!(
@@ -562,8 +548,8 @@ pub fn converge_with_imports(
             }
         }
     }
-    if let (Some(executor), Some(home)) = (imports, suspect) {
-        executor.mark_access_failure(home.as_str());
+    if let Some(home) = suspect {
+        imports.mark_access_failure(home.as_str());
     }
     if applied > 0 {
         afs_logging::info!(
@@ -585,29 +571,23 @@ fn merge_reply(reply: &ActiveOutletRoots, cached: &[OutletRoot]) -> Vec<OutletRo
 /// Failures log and skip the round: the last successful snapshot keeps serving
 /// (spec H7). There is no backoff on the happy path — the loop is a fixed
 /// interval, and adding idle backoff would only increase publish latency.
-pub async fn run(
-    config: MirrorConfig,
-    meta: Arc<dyn RootMeta>,
-    shutdown: impl std::future::Future<Output = ()> + Unpin,
-) {
-    run_with_imports(config, meta, shutdown, None).await;
-}
-
-/// Same loop, optionally owning a dynamic-import executor.
 ///
 /// The executor holds per-home state and a `Send + Sync` mounter, so it moves
 /// into the blocking worker each round and comes back with its state updated.
 /// Rounds are serial, so a `&mut` round trip through the task is safe.
-pub async fn run_with_imports(
+pub async fn run(
     config: MirrorConfig,
     meta: Arc<dyn RootMeta>,
     mut shutdown: impl std::future::Future<Output = ()> + Unpin,
-    mut imports: Option<ImportExecutor>,
+    imports: ImportExecutor,
 ) {
     let mut cached_digest: Option<String> = None;
     let mut cached_roots: Vec<OutletRoot> = Vec::new();
     let mut tick = tokio::time::interval(config.interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Move slot for the executor: handed to the blocking worker each round and
+    // taken back afterwards so its per-home state survives across rounds.
+    let mut imports = Some(imports);
     loop {
         tokio::select! {
             _ = &mut shutdown => return,
@@ -621,8 +601,10 @@ pub async fn run_with_imports(
                 let result = tokio::task::spawn_blocking({
                     let config = config.clone();
                     move || {
-                        let executor = worker_imports.as_mut();
-                        let applied = converge_with_imports(
+                        let executor = worker_imports
+                            .as_mut()
+                            .expect("executor slot is only empty between rounds");
+                        let applied = converge_round(
                             &config,
                             meta.as_ref(),
                             &mut digest,
@@ -774,6 +756,24 @@ mod tests {
     use super::*;
     use crate::node::vfs::ownerfs::root::{ActiveOutletRoots, RootId};
     use std::sync::Mutex;
+
+    /// 名字层测试的入口：执行器在动态 import 成为唯一路径前就已必选，
+    /// 这里用假 mounter 造一个，让纯发布语义的测试不必关心挂载细节。
+    fn converge(
+        config: &MirrorConfig,
+        meta: &dyn RootMeta,
+        cached_digest: &mut Option<String>,
+        cached_roots: &mut Vec<OutletRoot>,
+    ) -> Result<usize> {
+        let mut executor = ImportExecutor::new(
+            PathBuf::from(&config.import_root),
+            PathBuf::from("/home/agentos/users"),
+            "vers=4.1,hard".to_owned(),
+            "node-self".to_owned(),
+            Arc::new(FakeMounter::default()),
+        );
+        converge_round(config, meta, cached_digest, cached_roots, &mut executor)
+    }
 
     /// 记录调用的假 mounter：让执行器逻辑在无 NFS 的机器上可测。
     #[derive(Default)]

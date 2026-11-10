@@ -23,23 +23,6 @@ pub struct OutletConfig {
     /// Largest actimeo on any import mount; informational, backs the grace
     /// floor check.
     pub max_import_actimeo_ms: u64,
-    /// `Some` when this node mounts the import trees itself.
-    pub dynamic_imports: Option<DynamicImports>,
-}
-
-impl OutletConfig {
-    #[must_use]
-    pub fn mirror_interval(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.mirror_interval_ms)
-    }
-}
-
-/// Self-managed import mounting (design: outlet dynamic imports).
-///
-/// Only the import side is dynamic; each home still exports its own users tree
-/// statically, because the export side belongs to the deployment.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct DynamicImports {
     /// Path of the users tree on every node, for the source `<home>:<path>`.
     pub users_root: PathBuf,
     /// Options handed to `mount(2)` for every import mount.
@@ -49,13 +32,18 @@ pub struct DynamicImports {
     pub nfs_addr: String,
 }
 
-impl DynamicImports {
-    /// Default mount options: kernel NFSv4.1 with `hard`, matching the autofs
-    /// setup in service today. `nosuid,nodev` are a security requirement, and
-    /// `hard` keeps a peer outage from turning into a silent short read.
-    pub const DEFAULT_MOUNT_OPTIONS: &'static str =
-        "vers=4.1,hard,timeo=600,retrans=2,noresvport,nosuid,nodev";
+impl OutletConfig {
+    #[must_use]
+    pub fn mirror_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.mirror_interval_ms)
+    }
 }
+
+/// Default mount options for the import mounts: kernel NFSv4.1 with `hard`,
+/// matching the autofs setup in service today. `nosuid,nodev` are a security
+/// requirement, and `hard` keeps a peer outage from turning into a silent
+/// short read.
+pub const DEFAULT_MOUNT_OPTIONS: &str = "vers=4.1,hard,timeo=600,retrans=2,noresvport,nosuid,nodev";
 
 /// Resolves the layer from CLI over TOML. `None` disables the feature.
 ///
@@ -126,65 +114,47 @@ pub(super) fn resolve(
              max(mirror interval x 10, import actimeo x 2) = {floor}ms"
         )));
     }
-    let dynamic = cli
-        .outlet_dynamic_imports
-        .or(file.outlet_dynamic_imports)
-        .unwrap_or(false);
-    let dynamic_imports = if dynamic {
-        // The mount source is `<home>:<users_root>`. Without it there is
-        // nothing to mount, so this is a config error rather than a runtime
-        // warning.
-        let users_root = cli
-            .outlet_users_root
-            .clone()
-            .or(file.outlet_users_root.clone())
-            .ok_or_else(|| {
-                invalid("outlet_users_root is required when outlet_dynamic_imports is enabled")
-            })?;
-        if !users_root.is_absolute() {
-            return Err(invalid("outlet_users_root must be absolute"));
-        }
-        let options = cli
-            .outlet_import_mount_options
-            .clone()
-            .or(file.outlet_import_mount_options.clone())
-            .unwrap_or_else(|| DynamicImports::DEFAULT_MOUNT_OPTIONS.to_owned());
-        if options.trim().is_empty() {
-            return Err(invalid("outlet_import_mount_options must not be empty"));
-        }
-        // This node's own NFS address: what peers will dial. Declared once,
-        // here, and carried to every peer through the Meta session, so adding a
-        // node never edits another node's config.
-        let nfs_addr = match cli.outlet_nfs_addr.clone().or(file.outlet_nfs_addr.clone()) {
-            Some(value) => {
-                let value = value.trim().to_owned();
-                if value.is_empty() || value.contains('/') {
-                    return Err(invalid("outlet_nfs_addr must be a host, not a URL or path"));
-                }
-                value
+    // The mount source is `<home>:<users_root>`. Without it there is nothing
+    // to mount, so this is a config error rather than a runtime warning.
+    let users_root = cli
+        .outlet_users_root
+        .clone()
+        .or(file.outlet_users_root.clone())
+        .ok_or_else(|| invalid("outlet_users_root is required"))?;
+    if !users_root.is_absolute() {
+        return Err(invalid("outlet_users_root must be absolute"));
+    }
+    let options = cli
+        .outlet_import_mount_options
+        .clone()
+        .or(file.outlet_import_mount_options.clone())
+        .unwrap_or_else(|| DEFAULT_MOUNT_OPTIONS.to_owned());
+    if options.trim().is_empty() {
+        return Err(invalid("outlet_import_mount_options must not be empty"));
+    }
+    // This node's own NFS address: what peers will dial. Declared once, here,
+    // and carried to every peer through the Meta session, so adding a node
+    // never edits another node's config.
+    let nfs_addr = match cli.outlet_nfs_addr.clone().or(file.outlet_nfs_addr.clone()) {
+        Some(value) => {
+            let value = value.trim().to_owned();
+            if value.is_empty() || value.contains('/') {
+                return Err(invalid("outlet_nfs_addr must be a host, not a URL or path"));
             }
-            None => {
-                // Same node, so the gRPC listen host is the right default; an
-                // unspecified bind gives no address to advertise.
-                let ip = grpc_listen.ip();
-                if ip.is_unspecified() {
-                    return Err(invalid(
-                        "outlet_nfs_addr is required when grpc_listen \
-                         binds an unspecified address",
-                    ));
-                }
-                ip.to_string()
+            value
+        }
+        None => {
+            // Same node, so the gRPC listen host is the right default; an
+            // unspecified bind gives no address to advertise.
+            let ip = grpc_listen.ip();
+            if ip.is_unspecified() {
+                return Err(invalid(
+                    "outlet_nfs_addr is required when grpc_listen \
+                     binds an unspecified address",
+                ));
             }
-        };
-        Some(DynamicImports {
-            users_root,
-            mount_options: options,
-            nfs_addr,
-        })
-    } else {
-        // The switch is off: any mount-option setting is inert. Rejecting it
-        // would break a config that prepares for the switch without enabling it.
-        None
+            ip.to_string()
+        }
     };
     Ok(Some(OutletConfig {
         public_root: public,
@@ -192,6 +162,8 @@ pub(super) fn resolve(
         mirror_interval_ms: interval_ms,
         generation_grace_ms: grace_ms,
         max_import_actimeo_ms: actimeo_ms,
-        dynamic_imports,
+        users_root,
+        mount_options: options,
+        nfs_addr,
     }))
 }
