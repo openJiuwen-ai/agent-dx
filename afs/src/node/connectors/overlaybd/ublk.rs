@@ -1,4 +1,7 @@
+mod control;
+
 use super::{lsmt::SECTOR_SIZE, reader::Image};
+use control::{Control, Operation};
 use futures_util::{Stream, stream::FuturesUnordered};
 use libublk::{
     BufDesc, UblkError, UblkFlags,
@@ -124,7 +127,7 @@ impl Device {
         .map_err(io::Error::other)?
     }
 
-    pub(super) async fn recover(id: u32, image: Image) -> io::Result<Self> {
+    pub(super) async fn recover(id: u32, image: Image, deadline: Instant) -> io::Result<Self> {
         spawn_blocking(move || {
             let ctrl = UblkCtrl::new(
                 Some(NAME.to_owned()),
@@ -143,7 +146,22 @@ impl Device {
                     "ublk device cannot reissue reads",
                 ));
             }
-            check_result(ctrl.start_user_recover())?;
+            let mut commands = Control::new(id, ctrl.get_driver_features())?;
+            loop {
+                match commands.execute(Operation::BeginRecovery, deadline, None) {
+                    Ok(()) => break,
+                    Err(error)
+                        if matches!(error.raw_os_error(), Some(libc::EBUSY | libc::EINTR)) =>
+                    {
+                        thread::sleep(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(std::time::Duration::from_millis(100)),
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             Self::open(image, ctrl)
         })
         .await
@@ -194,7 +212,7 @@ impl Device {
         })
     }
 
-    pub(super) async fn start(&mut self, deadline: Instant) -> io::Result<()> {
+    pub(super) async fn start(&mut self, deadline: Instant, recovering: bool) -> io::Result<()> {
         let raw = self
             .raw
             .clone()
@@ -238,17 +256,26 @@ impl Device {
             .map_err(io::Error::other)?;
 
         let control = self.control.clone();
+        let id = self.id;
+        let failure = self.failure.subscribe();
+        let params = raw.tgt.params;
         let task = self.start.insert(spawn_blocking(move || {
-            // Device creation may run on another thread. libublk's control
-            // ring has to exist on the thread that issues START.
-            ublk_init_ctrl_task_ring(|ring| {
-                if ring.is_none() {
-                    *ring = Some(io_uring::IoUring::builder().build(16)?);
-                }
-                Ok(())
-            })
-            .map_err(driver_error)?;
-            check_result(control.start_dev(&raw))
+            let op = if recovering {
+                Operation::EndRecovery
+            } else {
+                // Device creation can run on another thread. SET_PARAMS
+                // uses libublk's thread-local control ring.
+                ublk_init_ctrl_task_ring(|ring| {
+                    if ring.is_none() {
+                        *ring = Some(io_uring::IoUring::builder().build(16)?);
+                    }
+                    Ok(())
+                })
+                .map_err(driver_error)?;
+                check_result(control.set_params(&params))?;
+                Operation::Start
+            };
+            Control::new(id, control.get_driver_features())?.execute(op, deadline, Some(&failure))
         }));
         let started = timeout_at(deadline, task).await.map_err(timed_out)?;
         self.start = None;

@@ -378,8 +378,8 @@ impl Devices {
                 "OverlayBD recovery image geometry or configuration changed",
             ));
         }
-        let mut device = Device::recover(id, image).await?;
-        let resumed = device.start(deadline).await;
+        let mut device = Device::recover(id, image, deadline).await?;
+        let resumed = device.start(deadline, true).await;
         self.owned_id = Some(id);
         self.device = Some(device);
         resumed?;
@@ -500,7 +500,9 @@ impl Devices {
             .device
             .as_mut()
             .ok_or_else(|| io::Error::other("missing new device"))?;
-        device.start(Instant::now() + RECOVERY_TIMEOUT).await?;
+        device
+            .start(Instant::now() + RECOVERY_TIMEOUT, false)
+            .await?;
         let path = device.device_path();
         for _ in 0..50 {
             if path
