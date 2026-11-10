@@ -427,7 +427,10 @@ class Environment:
                 accepted; the SDK expands its effective create budget to also
                 cover runtime initialization.
             schedule_timeout: Scheduling budget in seconds (default 30).
-            env: Environment variables to set in the environment.
+            env: Environment variables to set in the environment. For fresh
+                reverse tunnels, an explicit ``ADX_TUNNEL_HTTP_TIMEOUT`` also
+                configures the local client; otherwise the SDK copies its
+                process setting (default 600 seconds) to the server.
             name: Logical name for the environment instance.
             cwd: Default command directory inside the environment. Execd creates
                 it and missing parents before reporting the environment ready.
@@ -601,6 +604,17 @@ class Environment:
                 rendered = ", ".join(str(port) for port in sorted(conflicts))
                 raise ValueError(f"reverse tunnel ports conflict with port_forwardings: {rendered}")
 
+        tunnel_http_timeout = None
+        create_env = dict(env or {})
+        if upstream is not None:
+            from .tunnel_client import HTTP_TIMEOUT_ENV, resolve_http_timeout
+
+            tunnel_http_timeout = resolve_http_timeout(create_env.get(HTTP_TIMEOUT_ENV))
+            # A restored process retains its captured configuration. Only a
+            # fresh create can initialize the server's cached timeout.
+            if snapshot_id is None:
+                create_env[HTTP_TIMEOUT_ENV] = str(tunnel_http_timeout)
+
         # ── reverse tunnel ────────────────────────────────────────────────
         self._tunnel_client = None
         self._tunnel_url = f"http://127.0.0.1:{proxy_port}"
@@ -678,8 +692,8 @@ class Environment:
         if storage_mb is not None:
             body["storageMb"] = storage_mb
         body["storage_limit_mb"] = storage_limit_mb
-        if env:
-            body["env"] = dict(env)
+        if create_env:
+            body["env"] = create_env
         placement = encode_affinities(schedule_affinities, node_id)
         if placement:
             body["scheduleAffinities"] = placement
@@ -760,13 +774,20 @@ class Environment:
                 # Only carry the JWT over a TLS tunnel. Plaintext mode is for
                 # auth-disabled local/dev frontends.
                 tunnel_token = self._client.token if tls else None
-                self._tunnel_client = TunnelClient(upstream, token=tunnel_token, environment_id=self._sid)
+                self._tunnel_client = TunnelClient(
+                    upstream,
+                    token=tunnel_token,
+                    environment_id=self._sid,
+                    http_timeout=tunnel_http_timeout,
+                )
                 logger.info(
-                    "Starting TunnelClient: environment_id=%s name=%s url=%s timeout=%.1fs",
+                    "Starting TunnelClient: environment_id=%s name=%s url=%s "
+                    "connect_timeout_seconds=%.1f http_timeout_seconds=%s",
                     safe_id,
                     name or "",
                     tunnel_ws_url,
                     connect_timeout,
+                    tunnel_http_timeout,
                 )
                 if self._tunnel_client.start(tunnel_ws_url, timeout=connect_timeout):
                     logger.info(

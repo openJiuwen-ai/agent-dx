@@ -568,6 +568,36 @@ are detected by the existing application heartbeat (20-second interval and
 local source port does not authorize new outbound connections.
 
 
+## Reverse-tunnel HTTP timeout
+
+Configure `ADX_TUNNEL_HTTP_TIMEOUT` once in the SDK process before creating a
+fresh Environment with `upstream`:
+
+```bash
+export ADX_TUNNEL_HTTP_TIMEOUT=43200
+```
+
+The SDK resolves the value once, passes it to that Environment's TunnelClient,
+and adds it to the create request's `env` for the Execd tunnel server. An explicit
+`env={"ADX_TUNNEL_HTTP_TIMEOUT": "1200"}` takes precedence for both peers.
+Other environment variables are preserved; the caller's dictionary and process
+environment are not modified. Non-tunnel creates do not inherit this setting.
+Missing or invalid values use 600 seconds. Values must be finite positive seconds
+representable by Execd (at least one nanosecond and less than 2^64 seconds).
+
+The startup log reports `connect_timeout_seconds` and `http_timeout_seconds`
+separately. `tunnel_connect_timeout` only bounds initial WebSocket connection;
+it does not control HTTP forwarding. HTTPX's timeout applies to individual
+connect/read/write/pool waits, while the Execd timeout bounds waiting for a tunnel
+response; neither is an Environment lifetime limit.
+
+Automatic server configuration applies to newly created processes. Named reuse,
+reconnecting to an existing Environment, and snapshot restore do not reconfigure
+an already running or captured server. Snapshot restore does not automatically
+inject a timeout into the captured process. Operator-provided runtime settings
+can also override the requested environment; verify the Execd startup log's
+`tunnel configured http_timeout_seconds=...` when checking the effective value.
+
 ## Connection configuration
 
 Pass an immutable `ConnectionConfig` to avoid process-global environment

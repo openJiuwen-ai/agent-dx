@@ -401,7 +401,7 @@ class LifecycleTests(unittest.TestCase):
                 return environment_id
 
         class Tunnel:
-            def __init__(self, _target, token=None, environment_id=None):
+            def __init__(self, _target, token=None, environment_id=None, http_timeout=None):
                 self.token = token
                 self.environment_id = environment_id
 
@@ -454,7 +454,7 @@ class LifecycleTests(unittest.TestCase):
                 return environment_id
 
         class Tunnel:
-            def __init__(self, _target, token=None, environment_id=None):
+            def __init__(self, _target, token=None, environment_id=None, http_timeout=None):
                 seen["token"] = token
                 seen["environment_id"] = environment_id
 
