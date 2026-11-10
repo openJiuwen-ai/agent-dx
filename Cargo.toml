@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["third_party/agentenv-ublk"]
 default-members = [
     "agent/crates/core",
     "agent/crates/store",

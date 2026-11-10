@@ -12,6 +12,7 @@ publish = false
 default = ["ownerfs", "dfs", "node-jemalloc", "meta-redis", "meta-etcd"]
 ownerfs = []
 dfs = []
+overlaybd-connector = ["dfs", "dep:io-uring", "dep:overlaybd", "dep:storage-util", "dep:uvm-ublk"]
 rdma = ["afs-transport/rdma"]
 # Developer diagnostics compiled out of default builds: Meta store profiling
 # (`AFS_META_PROFILE`) and namespace tracing (`AFS_META_NAMESPACE_TRACE`).
@@ -67,6 +68,10 @@ etcd-client = { version = "=0.21.1", optional = true }
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7.9", optional = true }
+overlaybd = { git = "https://github.com/kvcache-ai/AgentENV.git", rev = "22a386e1f5e4cdb758ae96e0ff084b8cca9f705c", optional = true }
+storage-util = { git = "https://github.com/kvcache-ai/AgentENV.git", rev = "22a386e1f5e4cdb758ae96e0ff084b8cca9f705c", optional = true }
+uvm-ublk = { path = "../third_party/agentenv-ublk", optional = true }
 tikv-jemallocator = { version = "=0.7.0", optional = true, default-features = false, features = ["background_threads_runtime_support", "stats"] }
 tikv-jemalloc-ctl = { version = "=0.7.0", optional = true, features = ["use_std", "stats"] }
 

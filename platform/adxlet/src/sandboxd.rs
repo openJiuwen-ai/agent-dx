@@ -15,6 +15,9 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
 use tower::service_fn;
 
+mod overlaybd;
+use overlaybd::OverlaybdConnector;
+
 pub mod proto {
     tonic::include_proto!("runtime.v1");
 }
@@ -60,6 +63,76 @@ pub struct Sandboxd {
     config: Config,
     starts: Arc<Mutex<BTreeMap<String, Cell>>>,
     backend_ids: Arc<Mutex<BTreeMap<String, String>>>,
+    overlaybd_connector: Option<Arc<OverlaybdConnector>>,
+}
+
+fn apply_prepared_rootfs(request: &mut proto::StartRequest, path: PathBuf) -> Result<()> {
+    if !request.inject_entrypoint.is_empty() {
+        return Err(Error::Invalid(
+            "managed OverlayBD rootfs requires an explicit startup command".into(),
+        ));
+    }
+    let path = path
+        .to_str()
+        .filter(|_| path.is_absolute())
+        .ok_or_else(|| Error::Invalid("managed rootfs path must be absolute UTF-8".into()))?;
+    let rootfs = request
+        .rootfs
+        .as_mut()
+        .ok_or_else(|| Error::Invalid("managed rootfs requires an image request".into()))?;
+    rootfs.r#type = proto::RootfsSrcType::Local as i32;
+    rootfs.source = Some(proto::rootfs_config::Source::Path(path.into()));
+    Ok(())
+}
+
+async fn overlaybd_request(
+    client: &reqwest::Client,
+    action: &str,
+    runtime_id: &str,
+    image: Option<&str>,
+    acquire_deadline_ms: Option<u64>,
+) -> Result<reqwest::Response> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "runtime_id": runtime_id,
+        "image": image,
+        "acquire_deadline_ms": acquire_deadline_ms,
+    }))
+    .map_err(unavailable)?;
+    client
+        .post(format!("http://localhost/{action}"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(unavailable)
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_overlaybd_rootfs_uses_existing_local_rpc_contract() {
+    let mut request = proto::StartRequest {
+        rootfs: Some(proto::RootfsConfig {
+            r#type: proto::RootfsSrcType::Image as i32,
+            source: Some(proto::rootfs_config::Source::ImageUrl(
+                "repo/test:v1".into(),
+            )),
+            readonly: false,
+            writable_layer_size_bytes: 1024,
+        }),
+        command: vec!["/usr/local/bin/adx-execd".into()],
+        ..Default::default()
+    };
+    apply_prepared_rootfs(&mut request, PathBuf::from("/managed/rootfs")).unwrap();
+    let rootfs = request.rootfs.unwrap();
+    assert_eq!(rootfs.r#type, proto::RootfsSrcType::Local as i32);
+    assert_eq!(
+        rootfs.source,
+        Some(proto::rootfs_config::Source::Path("/managed/rootfs".into()))
+    );
+    assert!(!rootfs.readonly);
+    assert_eq!(rootfs.writable_layer_size_bytes, 1024);
+    assert_eq!(request.command, ["/usr/local/bin/adx-execd"]);
 }
 
 fn unavailable(error: impl std::fmt::Display) -> Error {
@@ -119,6 +192,10 @@ impl Sandboxd {
     }
 
     pub async fn connect(path: PathBuf, config: Config) -> Result<Self> {
+        let overlaybd_connector = std::env::var_os("ADX_OVERLAYBD_ROOTFS_SOCKET")
+            .map(PathBuf::from)
+            .map(|path| OverlaybdConnector::new(path, config.rpc_timeout))
+            .transpose()?;
         if (config.command.is_empty() && config.runtime_profile.is_none())
             || config.rpc_timeout.is_zero()
         {
@@ -165,11 +242,15 @@ impl Sandboxd {
             }))
             .await
             .map_err(unavailable)?;
+        if let Some(connector) = &overlaybd_connector {
+            connector.start_replay();
+        }
         Ok(Self {
             client: SandboxServiceClient::new(channel),
             config,
             starts: Arc::default(),
             backend_ids: Arc::default(),
+            overlaybd_connector,
         })
     }
 
@@ -296,7 +377,7 @@ impl Sandboxd {
     async fn execute_start(
         &self,
         runtime_id: &str,
-        mut request: Request<proto::StartRequest>,
+        request: Request<proto::StartRequest>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<IpAddr> {
         let mut state = self.cell(runtime_id).lock_owned().await;
@@ -309,22 +390,38 @@ impl Sandboxd {
         if matches!(*state, StartState::Uncertain | StartState::UncertainStart) {
             return Err(unavailable("start outcome requires reconciliation"));
         }
-        if let Some(deadline) = deadline {
-            request.set_timeout(
-                adx_transport::deadline::remaining(deadline, Duration::MAX).ok_or_else(|| {
-                    Error::DeadlineExceeded(
-                        "backend preparation/runtime start deadline exceeded".into(),
-                    )
-                })?,
-            );
-        }
         *state = StartState::Failed;
         let mut client = self.client.clone();
         let backend_ids = self.backend_ids.clone();
         let logical_id = runtime_id.to_string();
+        let overlaybd_connector = self.overlaybd_connector.clone();
         // The spawned task starts with an empty task-local context; keep the
         // sandbox.create trace on the identity-mapping log emitted below.
         tokio::spawn(adx_observability::trace::with_current_context(async move {
+            let mut request = request;
+            if let (Some(connector), Some(proto::rootfs_config::Source::ImageUrl(image))) = (
+                overlaybd_connector.as_ref(),
+                request
+                    .get_ref()
+                    .rootfs
+                    .as_ref()
+                    .and_then(|rootfs| rootfs.source.as_ref()),
+            ) {
+                if let Some(path) = connector.acquire(&logical_id, image).await? {
+                    apply_prepared_rootfs(request.get_mut(), path)?;
+                }
+            }
+            if let Some(deadline) = deadline {
+                request.set_timeout(
+                    adx_transport::deadline::remaining(deadline, Duration::MAX).ok_or_else(
+                        || {
+                            Error::DeadlineExceeded(
+                                "backend preparation/runtime start deadline exceeded".into(),
+                            )
+                        },
+                    )?,
+                );
+            }
             let response = match client.start(request).await {
                 Ok(response) => response.into_inner(),
                 Err(error) => {
@@ -1395,6 +1492,9 @@ impl RuntimeDriver for Sandboxd {
             .lock()
             .expect("shared state lock poisoned")
             .remove(runtime_id);
+        if let Some(connector) = &self.overlaybd_connector {
+            connector.release_after_delete(runtime_id).await?;
+        }
         // A failed create cannot become successful through a retry of the same
         // execution. Keep its identity terminal so a later backend is cleanup-only.
         *state = if failed_start {
