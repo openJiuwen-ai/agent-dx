@@ -14,11 +14,20 @@ use std::sync::Arc;
 pub(crate) struct RestServer {
     listener: tokio::net::TcpListener,
     state: Arc<Node>,
+    connector_routes: axum::Router,
 }
 
 impl RestServer {
-    pub(crate) fn new(listener: tokio::net::TcpListener, state: Arc<Node>) -> Self {
-        Self { listener, state }
+    pub(crate) fn new(
+        listener: tokio::net::TcpListener,
+        state: Arc<Node>,
+        connector_routes: axum::Router,
+    ) -> Self {
+        Self {
+            listener,
+            state,
+            connector_routes,
+        }
     }
 
     /// Start the server as one service; it stops with `services.stop`.
@@ -27,10 +36,13 @@ impl RestServer {
         let stop = services.stop.subscribe();
         let rest_state = self.state;
         services.spawn(async move {
-            axum::serve(rest, api::rest::router(rest_state))
-                .with_graceful_shutdown(cancelled(stop))
-                .await
-                .map_err(Into::into)
+            axum::serve(
+                rest,
+                api::rest::router(rest_state).merge(self.connector_routes),
+            )
+            .with_graceful_shutdown(cancelled(stop))
+            .await
+            .map_err(Into::into)
         });
     }
 }

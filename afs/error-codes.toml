@@ -704,3 +704,11 @@ kind = "ResourceExhausted"
 component = "Runtime"
 subsystem = "Io"
 description = "文件锁或等待记录达到容量上限"
+
+[[error]]
+name = "NODE_VFS_RANGE"
+value = "0x02080006"
+kind = "OutOfRange"
+component = "Node"
+subsystem = "Vfs"
+description = "Requested file byte range is unsatisfiable"

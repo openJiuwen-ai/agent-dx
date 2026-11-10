@@ -78,5 +78,5 @@ fn service_paths_keep_the_package() {
 /// replica failure contract in placement snapshots and write grants (S4b R12).
 #[test]
 fn cluster_protocol_generation_includes_the_split_layout() {
-    assert_eq!(CLUSTER_PROTOCOL_VERSION, 6);
+    assert_eq!(CLUSTER_PROTOCOL_VERSION, 7);
 }

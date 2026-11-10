@@ -95,6 +95,9 @@ impl LocalChunkStore {
                 .ok_or_else(|| invalid("chunk catalog revision overflow"))?,
             gc_generation: generation,
             records: catalog.records.clone(),
+            cache_intents: catalog.cache_intents.clone(),
+            cache_bytes: catalog.cache_bytes,
+            cache_order: catalog.cache_order.clone(),
         };
         let mut removed = 0;
         for id in chunks {
@@ -108,7 +111,7 @@ impl LocalChunkStore {
                     Err(error) => return Err(error.into()),
                 }
             }
-            next.records.remove(id);
+            next.remove_record(id);
         }
         File::open(&self.chunks)?.sync_all()?;
         File::open(&self.outboards)?.sync_all()?;

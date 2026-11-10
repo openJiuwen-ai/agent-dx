@@ -910,7 +910,7 @@ async fn live_read_session(
     }
 }
 
-fn read_chunk_intervals(
+pub(super) fn read_chunk_intervals(
     layout: &LayoutRoot,
     chunk: &crate::dfs::ChunkObject,
 ) -> Result<Vec<(u64, u64)>> {
@@ -947,7 +947,7 @@ fn read_chunk_intervals(
         .collect())
 }
 
-fn read_range_covered(intervals: &[(u64, u64)], offset: u64, length: u64) -> bool {
+pub(super) fn read_range_covered(intervals: &[(u64, u64)], offset: u64, length: u64) -> bool {
     length != 0
         && offset.checked_add(length).is_some_and(|end| {
             intervals.iter().any(|(start, len)| {

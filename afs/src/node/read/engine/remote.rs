@@ -13,6 +13,7 @@ struct PeerRangeRound<'r> {
     candidates: &'r [Vec<SourceCandidate>],
     version: &'r FileVersionId,
     final_owned: bool,
+    deadline: Instant,
 }
 
 /// Rotation state: next candidate per operation, operations still to read
@@ -30,6 +31,7 @@ impl DfsReadEngine {
         sources: &[ChunkSources],
         out: &mut [u8],
         final_owned: bool,
+        deadline: Option<Instant>,
     ) -> Result<()> {
         let version = batch
             .file_version_id
@@ -58,6 +60,7 @@ impl DfsReadEngine {
             candidates: &candidates,
             version: &version,
             final_owned,
+            deadline: deadline.unwrap_or_else(|| Instant::now() + self.read_pipeline_timeout()),
         };
         let mut progress = PeerRangeProgress {
             next: vec![0; batch.ops.len()],
@@ -152,13 +155,21 @@ impl DfsReadEngine {
             .and_then(|set| set.chunk.as_ref())
             .filter(|chunk| chunk.is_segment_crc32c());
         let target = if direct { &mut *out } else { &mut scratch };
-        let result = if let Some(chunk) = integrity {
-            self.transfer
-                .read_crc32c_range_async(&attempt, chunk, target)
-                .await
-        } else {
-            self.transfer.read_ranges_async(&attempt, target).await
+        let fetch = async {
+            if let Some(chunk) = integrity {
+                self.transfer
+                    .read_crc32c_range_async(&attempt, chunk, target)
+                    .await
+            } else {
+                self.transfer.read_ranges_async(&attempt, target).await
+            }
         };
+        let choices = group
+            .iter()
+            .map(|&i| round.candidates[i].len() - progress.next[i])
+            .min()
+            .unwrap_or(1);
+        let result = self.try_peer_before(round.deadline, choices, fetch).await;
         match result {
             Ok(()) => {
                 if attempt
@@ -194,11 +205,40 @@ impl DfsReadEngine {
                 if let [item] = attempt.operations.as_slice() {
                     self.note_suspect_copy(&error, item);
                 }
+                if self.distribution.parallelism > 1
+                    && error.kind() == afs_error::ErrorKind::DeadlineExceeded
+                {
+                    progress.last_error = Some(error);
+                    for &index in group {
+                        progress.next[index] += 1;
+                        progress.pending.push(index);
+                    }
+                    return Ok(());
+                }
                 progress.last_error = Some(error);
                 self.retry_group_singly(round, group, &attempt, out, progress)
                     .await
             }
         }
+    }
+
+    async fn try_peer_before(
+        &self,
+        deadline: Instant,
+        choices: usize,
+        fetch: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
+        if self.distribution.parallelism <= 1 {
+            return fetch.await;
+        }
+        let budget = deadline.saturating_duration_since(Instant::now())
+            / u32::try_from(choices.max(1)).unwrap_or(u32::MAX);
+        tokio::time::timeout(budget, fetch).await.map_err(|_| {
+            Error::coded(
+                afs_error::CLIENT_DEADLINE_EXCEEDED,
+                "peer attempt exhausted its share of the read deadline",
+            )
+        })?
     }
 
     /// Queues the copy for its holder's review when its bytes failed this
@@ -249,11 +289,11 @@ impl DfsReadEngine {
                     operations: vec![single],
                 };
                 let mut single_scratch = vec![0; item.op.length as usize];
-                match self
+                let choices = round.candidates[index].len() - progress.next[index];
+                let fetch = self
                     .transfer
-                    .read_ranges_async(&single_batch, &mut single_scratch)
-                    .await
-                {
+                    .read_ranges_async(&single_batch, &mut single_scratch);
+                match self.try_peer_before(round.deadline, choices, fetch).await {
                     Ok(()) => {
                         if !self.source_matches(batch, &item.source) {
                             return Err(external_denied(

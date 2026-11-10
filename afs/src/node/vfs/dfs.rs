@@ -32,6 +32,7 @@ mod gc;
 mod handles;
 mod identity;
 mod inode_map;
+mod lazy_fill;
 mod lock_authority;
 mod lock_entry;
 mod lock_proxy_client;
@@ -148,6 +149,9 @@ pub struct DistributedFs {
     chunk_store: Arc<dyn ChunkSink>,
     read_engine: Arc<DfsReadEngine>,
     handles: DfsHandleTable,
+    lazy_fill_registry: Arc<super::lazy_fill::LazyFillRegistry>,
+    lazy_fill_budget: Arc<tokio::sync::Semaphore>,
+    lazy_fill_lifetime: Arc<tokio::sync::Semaphore>,
     /// Serves proxied RPCs for inodes this node session owns.
     owner_gateway: OwnerGateway,
     /// Proxies writes for inodes another node session owns.
@@ -171,6 +175,10 @@ const REMOTE_LOCK_SESSION_PENDING_CLOSE: usize = 0;
 const REMOTE_LOCK_SESSION_ACTIVE: usize = 1;
 
 impl DistributedFs {
+    pub(crate) fn start_distributed_cache(&self, services: &mut crate::runtime::Services) {
+        self.read_engine.start_distributed_cache(services);
+    }
+
     pub fn new(
         namespace_id: NamespaceId,
         node_id: impl Into<String>,
@@ -198,6 +206,11 @@ impl DistributedFs {
             chunk_store,
             read_engine,
             handles: DfsHandleTable::default(),
+            lazy_fill_registry: Arc::new(super::lazy_fill::LazyFillRegistry::default()),
+            lazy_fill_budget: Arc::new(tokio::sync::Semaphore::new(16)),
+            lazy_fill_lifetime: Arc::new(tokio::sync::Semaphore::new(
+                tokio::sync::Semaphore::MAX_PERMITS,
+            )),
         }
     }
 

@@ -512,6 +512,128 @@ impl DfsMetaService for DfsMetaRpc {
         Ok(Response::new(DfsListXattrReply { names }))
     }
 
+    async fn publish_read_cache(
+        &self,
+        request: Request<afs_protocol::meta::PublishDfsReadCacheRequest>,
+    ) -> Result<Response<afs_protocol::meta::PublishDfsReadCacheReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        let receipt = domain_replica_ack(
+            request
+                .receipt
+                .ok_or_else(|| invalid("read cache receipt is required"))?,
+        )?;
+        let copy = dfs_service(&self.0)?
+            .publish_read_cache(crate::dfs::PublishReadCache {
+                caller_id: request.caller_id,
+                caller_session_id: request.caller_session_id,
+                caller_node_epoch: request.caller_node_epoch,
+                operation_id: crate::dfs::OperationId::new(request.operation_id),
+                namespace_id: crate::dfs::NamespaceId::new(request.namespace_id),
+                file_version_id: crate::dfs::FileVersionId::new(request.file_version_id),
+                layout_root_id: crate::dfs::LayoutRootId::new(request.layout_root_id),
+                receipt,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::meta::PublishDfsReadCacheReply { copy_id: copy.id.0 },
+        ))
+    }
+
+    async fn retire_read_cache(
+        &self,
+        request: Request<afs_protocol::meta::RetireDfsReadCacheRequest>,
+    ) -> Result<Response<afs_protocol::meta::RetireDfsReadCacheReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        let receipt = domain_replica_ack(
+            request
+                .receipt
+                .ok_or_else(|| invalid("read cache retirement receipt is required"))?,
+        )?;
+        let copy = crate::dfs::read_cache_copy(&receipt)
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        if copy.id.0 != request.copy_id {
+            return Err(invalid("read cache retirement identity differs"));
+        }
+        dfs_service(&self.0)?
+            .retire_read_cache(crate::dfs::RetireReadCache {
+                caller_id: request.caller_id,
+                caller_session_id: request.caller_session_id,
+                caller_node_epoch: request.caller_node_epoch,
+                operation_id: crate::dfs::OperationId::new(request.operation_id),
+                copy,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::meta::RetireDfsReadCacheReply {},
+        ))
+    }
+
+    async fn restore_file_chunk(
+        &self,
+        request: Request<afs_protocol::meta::RestoreDfsFileChunkRequest>,
+    ) -> Result<Response<afs_protocol::meta::RestoreDfsFileChunkReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        dfs_service(&self.0)?
+            .restore_file_chunk(crate::dfs::RestoreFileChunk {
+                caller_id: request.caller_id,
+                operation_id: crate::dfs::OperationId::new(request.operation_id),
+                file_version_id: crate::dfs::FileVersionId::new(request.file_version_id),
+                layout_root_id: crate::dfs::LayoutRootId::new(request.layout_root_id),
+                write_lease: domain_dfs_write_lease(
+                    request
+                        .write_lease
+                        .ok_or_else(|| invalid("restore requires write lease"))?,
+                ),
+                receipt: domain_chunk_receipt(
+                    request
+                        .receipt
+                        .ok_or_else(|| invalid("restore requires receipt"))?,
+                )?,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::meta::RestoreDfsFileChunkReply {},
+        ))
+    }
+
+    async fn bind_lazy_source(
+        &self,
+        request: Request<afs_protocol::meta::DfsBindLazySourceRequest>,
+    ) -> Result<Response<DfsSetXattrReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        let inode = dfs_service(&self.0)?
+            .bind_lazy_source(crate::dfs::BindLazySourceRequest {
+                caller_id: request.caller_id,
+                caller_session_id: request.caller_session_id,
+                operation_id: crate::dfs::OperationId::new(request.operation_id),
+                inode_id: crate::dfs::InodeId::new(request.inode_id),
+                expected_inode_revision: request.expected_inode_revision,
+                source: crate::dfs::LazyFileSpec {
+                    length: request.length,
+                    binding: crate::dfs::LazyFillBinding {
+                        kind: request.kind,
+                        payload: request.binding,
+                    },
+                },
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(DfsSetXattrReply {
+            inode: Some(wire_dfs_inode(inode)),
+        }))
+    }
+
     async fn set_xattr(
         &self,
         request: Request<DfsSetXattrRequest>,

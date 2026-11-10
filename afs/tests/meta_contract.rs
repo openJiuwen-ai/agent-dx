@@ -3799,6 +3799,54 @@ async fn dfs_namespace_hardlink_symlink_and_readlink_are_metadata_operations() {
 }
 
 #[tokio::test]
+async fn dfs_generic_xattr_cannot_change_lazy_source() {
+    let dfs = memory_dfs().await;
+    let file = dfs
+        .create(Request::new(DfsCreateRequest {
+            caller_id: "node-a".into(),
+            operation_id: "create-source-boundary".into(),
+            namespace_id: "default".into(),
+            parent_inode_id: "1".into(),
+            name: b"source-boundary".to_vec(),
+            attributes: Some(test_attrs(0o640, 1)),
+            owner_session_id: "session-a".into(),
+            lease_seconds: 30,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .inode
+        .unwrap();
+    let name = b"user.afs.lazy.v1".to_vec();
+    let err = dfs
+        .set_xattr(Request::new(DfsSetXattrRequest {
+            caller_id: "node-a".into(),
+            operation_id: "set-source-marker".into(),
+            caller: Some(caller(0, 0)),
+            inode_id: file.inode_id.clone(),
+            expected_inode_revision: file.revision,
+            name: name.clone(),
+            value: b"reserved".to_vec(),
+            mode: DfsXattrSetMode::Create.into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status_errno(err), libc::EPERM);
+    let err = dfs
+        .remove_xattr(Request::new(DfsRemoveXattrRequest {
+            caller_id: "node-a".into(),
+            operation_id: "remove-source-marker".into(),
+            caller: Some(caller(0, 0)),
+            inode_id: file.inode_id,
+            expected_inode_revision: file.revision,
+            name,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status_errno(err), libc::EPERM);
+}
+
+#[tokio::test]
 async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
     let dfs = memory_dfs().await;
     let file = dfs

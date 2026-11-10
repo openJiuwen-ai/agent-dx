@@ -9,6 +9,7 @@ std::thread_local! {
 }
 
 pub(super) struct InodeWriteStateCell {
+    pub(super) lazy_fill_gate: Arc<tokio::sync::Semaphore>,
     state: Mutex<InodeWriteState>,
     pub(super) cv: Condvar,
     lock_wait: Option<Arc<InodeLockWait>>,
@@ -244,6 +245,7 @@ impl InodeWriteState {
 impl InodeWriteStateCell {
     pub(super) fn new(state: InodeWriteState) -> Self {
         Self {
+            lazy_fill_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             state: Mutex::new(state),
             cv: Condvar::new(),
             lock_wait: None,

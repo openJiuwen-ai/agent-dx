@@ -404,6 +404,10 @@ service DfsMeta {
   rpc SetInodeAttributes(DfsSetInodeAttributesRequest) returns (DfsSetInodeAttributesReply);
   rpc GetXattr(DfsGetXattrRequest) returns (DfsGetXattrReply);
   rpc ListXattr(DfsListXattrRequest) returns (DfsListXattrReply);
+  rpc PublishReadCache(PublishDfsReadCacheRequest) returns (PublishDfsReadCacheReply);
+  rpc RetireReadCache(RetireDfsReadCacheRequest) returns (RetireDfsReadCacheReply);
+  rpc RestoreFileChunk(RestoreDfsFileChunkRequest) returns (RestoreDfsFileChunkReply);
+  rpc BindLazySource(DfsBindLazySourceRequest) returns (DfsSetXattrReply);
   rpc SetXattr(DfsSetXattrRequest) returns (DfsSetXattrReply);
   rpc RemoveXattr(DfsRemoveXattrRequest) returns (DfsRemoveXattrReply);
   rpc OpenWrite(OpenDfsWriteRequest) returns (OpenDfsWriteReply);
@@ -1320,3 +1324,48 @@ message CollectDfsGarbageReply {
   // inventory on its next call. Only one Node at a time.
   bool list_external_inventory = 4;
 }
+
+// Internal Node operation. Ordinary xattr mutations cannot install a source.
+message DfsBindLazySourceRequest {
+  string caller_id = 1;
+  string caller_session_id = 2;
+  string operation_id = 3;
+  string inode_id = 4;
+  uint64 expected_inode_revision = 5;
+  uint64 length = 6;
+  string kind = 7;
+  bytes binding = 8;
+}
+
+// Complete verified read copies are disposable.
+message PublishDfsReadCacheRequest {
+  string caller_id = 1;
+  string caller_session_id = 2;
+  uint64 caller_node_epoch = 3;
+  string operation_id = 4;
+  string namespace_id = 5;
+  string file_version_id = 6;
+  string layout_root_id = 7;
+  DfsReplicaAck receipt = 8;
+}
+message PublishDfsReadCacheReply { string copy_id = 1; }
+message RetireDfsReadCacheRequest {
+  string caller_id = 1;
+  string caller_session_id = 2;
+  uint64 caller_node_epoch = 3;
+  string operation_id = 4;
+  string copy_id = 5;
+  DfsReplicaAck receipt = 6;
+}
+message RetireDfsReadCacheReply {}
+
+// Availability restoration under the current owner and unchanged committed version.
+message RestoreDfsFileChunkRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string file_version_id = 3;
+  string layout_root_id = 4;
+  DfsWriteLease write_lease = 5;
+  DfsChunkReceipt receipt = 6;
+}
+message RestoreDfsFileChunkReply {}

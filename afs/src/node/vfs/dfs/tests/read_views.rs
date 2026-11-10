@@ -518,6 +518,7 @@ fn p1_handle_table_register_snapshot_release_stress_is_bounded() {
                         .insert(
                             id,
                             DfsFileHandle {
+                                origin_fill: false,
                                 gc_pin: None,
                                 inode_id: inode.inode_id.clone(),
                                 opened_inode: inode.clone(),

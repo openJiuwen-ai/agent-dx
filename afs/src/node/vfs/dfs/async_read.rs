@@ -109,6 +109,24 @@ impl DistributedFs {
         if !self.read_engine.async_read_enabled() {
             return Ok(None);
         }
+        let snapshot = self.handle_snapshot(handle)?;
+        if lazy_fill::sealed(&snapshot.opened_inode) {
+            return Ok(Some(Box::pin(async move {
+                let worker = crate::node::bridge::spawn_blocking(move || {
+                    let _lifetime = lifetime;
+                    if Instant::now() >= deadline {
+                        return Err(unavailable("lazy read expired before dispatch"));
+                    }
+                    self.lazy_read(&snapshot, offset, size, deadline)?
+                        .ok_or_else(|| invalid("lazy file binding disappeared"))
+                });
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), worker)
+                    .await
+                    .map_err(|_| unavailable("lazy read waiter expired"))?
+                    .map_err(|e| unavailable(format!("lazy read worker failed: {e}")))?
+            })));
+        }
+
         if self.handle_view_pending(handle)? {
             // Publishing the pending view needs a Meta admission, which a
             // runtime worker must not block on (R94).
@@ -124,7 +142,6 @@ impl DistributedFs {
                 .await
             })));
         }
-        let snapshot = self.handle_snapshot(handle)?;
         Ok(Some(Box::pin(async move {
             self.read_replicated_bytes_async(handle, &snapshot, offset, size, deadline, lifetime)
                 .await

@@ -4,6 +4,30 @@ use super::*;
 
 #[cfg(feature = "dfs")]
 impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
+    fn restore_file_chunk(
+        &self,
+        request: crate::dfs::RestoreFileChunk,
+        timeout: Duration,
+    ) -> afs_error::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        crate::node::call_deadline::within(deadline, || {
+            self.run(
+                self.client()
+                    .restore_file_chunk(afs_tracing::request_with_current_context(
+                        afs_protocol::meta::RestoreDfsFileChunkRequest {
+                            caller_id: request.caller_id,
+                            operation_id: request.operation_id.0,
+                            file_version_id: request.file_version_id.0,
+                            layout_root_id: request.layout_root_id.0,
+                            write_lease: Some(wire_dfs_write_lease(request.write_lease)),
+                            receipt: Some(wire_chunk_receipt(request.receipt)),
+                        },
+                    )),
+            )
+        })?;
+        Ok(())
+    }
+
     fn lookup(
         &self,
         parent: &crate::dfs::InodeId,
@@ -541,6 +565,27 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
             )?
             .into_inner();
         Ok(reply.names)
+    }
+
+    fn bind_lazy_source(
+        &self,
+        request: crate::dfs::BindLazySourceRequest,
+    ) -> afs_error::Result<crate::dfs::InodeRecord> {
+        let reply =
+            self.run(self.client().bind_lazy_source(
+                afs_protocol::meta::DfsBindLazySourceRequest {
+                    caller_id: request.caller_id,
+                    caller_session_id: request.caller_session_id,
+                    operation_id: request.operation_id.0,
+                    inode_id: request.inode_id.0,
+                    expected_inode_revision: request.expected_inode_revision,
+                    length: request.source.length,
+                    kind: request.source.binding.kind,
+                    binding: request.source.binding.payload,
+                },
+            ))?
+            .into_inner();
+        required(reply.inode, "BindLazySource.inode").and_then(domain_dfs_inode)
     }
 
     fn set_xattr(

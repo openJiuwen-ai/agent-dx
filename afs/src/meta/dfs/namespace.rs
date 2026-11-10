@@ -1045,6 +1045,110 @@ impl DfsService {
         Ok(inode.xattrs.keys().cloned().collect())
     }
 
+    pub async fn bind_lazy_source(
+        &self,
+        request: crate::dfs::BindLazySourceRequest,
+    ) -> Result<InodeRecord> {
+        use crate::dfs::LAZY_FILE_DESCRIPTOR_XATTR;
+        let digest = namespace_request_digest(&request)?;
+        let operation = StoreOperation::DfsBindLazySource;
+        let crate::dfs::BindLazySourceRequest {
+            caller_id,
+            caller_session_id,
+            operation_id,
+            inode_id,
+            expected_inode_revision,
+            source,
+        } = request;
+        require_id(&caller_id, "caller_id")?;
+        require_id(&caller_session_id, "caller_session_id")?;
+        require_id(&operation_id.0, "operation_id")?;
+        source.validate()?;
+        if let Some(inode) = self
+            .replayed_namespace_inode(&caller_id, &operation_id, operation, digest)
+            .await?
+        {
+            return Ok(inode);
+        }
+        let bytes = serde_json::to_vec(&source).map_err(|error| invalid(error.to_string()))?;
+        let current = self.get_inode(inode_id.clone()).await?;
+        if let Some(existing) = current.xattrs.get(LAZY_FILE_DESCRIPTOR_XATTR) {
+            return if *existing == bytes {
+                Ok(current)
+            } else {
+                Err(conflict("lazy source is immutable"))
+            };
+        }
+        if current.revision != expected_inode_revision
+            || current.kind != InodeKind::Regular
+            || current.attributes.mode & 0o222 != 0
+            || current.attributes.nlink != 1
+        {
+            return Err(conflict("lazy source requires a prepared read-only inode"));
+        }
+        match current.head_version.clone() {
+            Some(id) => {
+                let (version, layout) = self.get_file_version(id).await?;
+                if version.inode_id != inode_id
+                    || layout.file_length != source.length
+                    || !layout.inline_extents.is_empty()
+                {
+                    return Err(conflict(
+                        "lazy source requires an empty committed layout of the declared length",
+                    ));
+                }
+            }
+            None if source.length == 0 => {}
+            None => return Err(conflict("lazy source requires committed length")),
+        }
+        let Some(MetaEntity::DfsWriteLease(lease)) = self
+            .store
+            .read(MetaRead::DfsWriteLease(inode_id))
+            .await?
+            .entity
+        else {
+            return Err(conflict(
+                "lazy source binding requires the current write owner",
+            ));
+        };
+        if lease.owner_node_id != caller_id
+            || lease.owner_session_id != caller_session_id
+            || lease.expires_at_unix_ms <= now_unix_ms()
+        {
+            return Err(conflict(
+                "lazy source binding requires the current write owner",
+            ));
+        }
+        let key = RequestKey::new(caller_id.clone(), operation_id.0);
+        let mut updated = current.clone();
+        updated
+            .xattrs
+            .insert(LAZY_FILE_DESCRIPTOR_XATTR.to_vec(), bytes);
+        updated.revision = updated.revision.saturating_add(1);
+        let mut txn = MetaTxn::new(key.clone(), operation);
+        txn.conditions.extend([
+            TxnCondition::RequestAbsent(key.clone()),
+            TxnCondition::EntityEquals(MetaEntity::DfsInode(current)),
+            TxnCondition::EntityEquals(MetaEntity::DfsWriteLease(lease)),
+            TxnCondition::NodeSessionCurrent {
+                node_id: caller_id,
+                session_id: caller_session_id,
+            },
+        ]);
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsInode(updated.clone())),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation,
+                result: namespace_result(digest, OperationResult::DfsInode(updated)),
+            }),
+        ]);
+        inode_outcome(
+            validate_namespace_outcome(self.store.compare_and_commit(txn).await?, digest)?,
+            operation,
+        )
+    }
+
     pub async fn set_xattr(&self, request: SetXattrRequest) -> Result<InodeRecord> {
         let SetXattrRequest {
             caller_id,
@@ -1060,6 +1164,9 @@ impl DfsService {
         require_id(&operation_id.0, "operation_id")?;
         require_id(&inode_id.0, "inode_id")?;
         let name = xattr_key(&name)?;
+        if name == crate::dfs::LAZY_FILE_DESCRIPTOR_XATTR {
+            return Err(operation_not_permitted("lazy source attribute is reserved"));
+        }
         if let Some(inode) = self
             .replayed_inode(&caller_id, &operation_id, StoreOperation::DfsSetXattr)
             .await?
@@ -1107,6 +1214,9 @@ impl DfsService {
         require_id(&operation_id.0, "operation_id")?;
         require_id(&inode_id.0, "inode_id")?;
         let name = xattr_key(&name)?;
+        if name == crate::dfs::LAZY_FILE_DESCRIPTOR_XATTR {
+            return Err(operation_not_permitted("lazy source attribute is reserved"));
+        }
         if let Some(inode) = self
             .replayed_inode(&caller_id, &operation_id, StoreOperation::DfsRemoveXattr)
             .await?

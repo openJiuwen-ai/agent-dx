@@ -980,6 +980,7 @@ fn p2_w3_reopen_syncs_complete_unsynced_wal_before_replay_ack() {
             encoding: PhysicalEncoding::Raw,
             state: LocalChunkState::Durable,
             catalog_revision: 2,
+            read_cache_epoch: 0,
         };
         let mut encoded = serde_json::to_vec(&CatalogTxn::new(2, vec![record]).unwrap()).unwrap();
         if newline {

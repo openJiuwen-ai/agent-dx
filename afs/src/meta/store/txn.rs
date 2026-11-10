@@ -179,6 +179,10 @@ pub enum StoreOperation {
     DfsCollectGarbage,
     /// Appended last: earlier variant indexes are on disk.
     DfsInitializeReplicaFailureConfig,
+    DfsBindLazySource,
+    DfsRestoreFileChunk,
+    DfsPublishReadCache,
+    DfsRetireReadCache,
 }
 
 impl StoreOperation {
@@ -206,6 +210,10 @@ impl StoreOperation {
             Self::DfsLink => "dfs_link",
             Self::DfsSymlink => "dfs_symlink",
             Self::DfsSetInodeAttributes => "dfs_set_inode_attributes",
+            Self::DfsBindLazySource => "dfs_bind_lazy_source",
+            Self::DfsRestoreFileChunk => "dfs_restore_file_chunk",
+            Self::DfsPublishReadCache => "dfs_publish_read_cache",
+            Self::DfsRetireReadCache => "dfs_retire_read_cache",
             Self::DfsSetXattr => "dfs_set_xattr",
             Self::DfsRemoveXattr => "dfs_remove_xattr",
             Self::DfsAcquireWriteLease => "dfs_acquire_write_lease",
