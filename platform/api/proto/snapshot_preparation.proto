@@ -62,9 +62,16 @@ message SnapshotPreparationView {
   Resources resources = 5;
   string snapshot_id = 7;
   string error = 8;
+  // Family creation time; preparation timestamps are separate below.
   uint64 created_at_unix_ms = 9;
   string image = 10;
   string envd_version = 11;
   SnapshotPreparationPhase phase = 15;
   bool snapshot_available = 17;
+  // Zero timestamps and absent spawn_count denote unknown historical metadata.
+  uint64 template_updated_at_unix_ms = 18;
+  uint64 preparation_created_at_unix_ms = 19;
+  uint64 preparation_updated_at_unix_ms = 20;
+  optional uint64 last_spawned_at_unix_ms = 21;
+  optional uint64 spawn_count = 22;
 }

@@ -245,17 +245,35 @@ impl Session {
                     catalog.apply_result(&record, node_session, &[])?;
                 }
             }
+            let initial_creation = next
+                .creation
+                .as_ref()
+                .is_some_and(|creation| creation.result == CreationResult::Unsettled);
             next.observe_result(&record, &mut counters.value)?;
+            // Family accounting shares the first-success transaction and its
+            // receipt/published guards. An old untracked family remains unknown.
+            let family_write = match record.spec.snapshot_id.as_deref() {
+                Some(snapshot_id) if initial_creation && !published && !pending_conflict => {
+                    let settled = next
+                        .creation
+                        .as_ref()
+                        .and_then(|creation| creation.settled_at_unix_millis)
+                        .ok_or(Error::Conflict)?;
+                    self.snapshot_template_spawn_write(snapshot_id, &record.spec.tenant_id, settled)
+                        .await?
+                }
+                _ => Vec::new(),
+            };
             next.result = Some(record.clone());
             let mut command = redis::cmd("EVAL");
             command.arg(r#"
                 if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return {-1,''} end
                 local function aliases(value)
-                    for i=5,#KEYS do
+                    for i=6,#KEYS do
                         redis.call('SET',KEYS[i],value,'NX','EX',ARGV[5])
                     end
                 end
-                for i=5,#KEYS do
+                for i=6,#KEYS do
                     local receipt = redis.call('GET',KEYS[i])
                     if receipt then
                         aliases(receipt)
@@ -271,28 +289,33 @@ impl Session {
                 end
                 if ARGV[6] == 'conflict' then return {-1,''} end
                 if ARGV[7] ~= '' and redis.call('HGET',KEYS[1],ARGV[8]) ~= ARGV[7] then return {-1,''} end
-                if ARGV[10] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[10] then return {0,''} end
+                if ARGV[11] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[11] then return {0,''} end
                 local facts = cjson.decode(ARGV[9])
                 if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return {0,''} end
+                local family = cjson.decode(ARGV[10])
+                if #family ~= 0 and (redis.call('HGET',KEYS[5],family[1]) or '') ~= family[2] then return {0,''} end
                 redis.call('HSET',KEYS[3],facts[1],facts[3])
+                if #family ~= 0 then redis.call('HSET',KEYS[5],family[1],family[3]) end
                 redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
                 redis.call('HINCRBY',KEYS[1],'node-ownership:' .. string.sub(ARGV[8],14),1)
                 aliases(ARGV[4])
-                local cursor=13
-                for _=1,tonumber(ARGV[12]) do redis.call('HSET',KEYS[4],ARGV[cursor],ARGV[cursor+1]); cursor=cursor+2 end
-                if ARGV[10] ~= '' then redis.call('HSET',KEYS[1],'header',ARGV[11]) end
+                local cursor=14
+                for _=1,tonumber(ARGV[13]) do redis.call('HSET',KEYS[4],ARGV[cursor],ARGV[cursor+1]); cursor=cursor+2 end
+                if ARGV[11] ~= '' then redis.call('HSET',KEYS[1],'header',ARGV[12]) end
                 for i=cursor,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
                 return {1,ARGV[4]}
-            "#).arg(4 + request_keys.len()).arg(&self.store.key)
+            "#).arg(5 + request_keys.len()).arg(&self.store.key)
                 .arg(format!("{}:artifacts", self.store.key))
                 .arg(format!("{}:business", self.store.key))
                 .arg(self.volumes_key())
+                .arg(self.snapshot_templates_key())
                 .arg(&request_keys)
                 .arg(self.epoch.to_string()).arg(&field).arg(old.as_deref().unwrap_or(""))
                 .arg(encode(&next)?).arg(CREATE_RECEIPT_TTL.as_secs())
                 .arg(if published { "published" } else if pending_conflict { "conflict" } else { "initial" }).arg(node_session)
                 .arg(format!("node-session:{}", record.assignment.node_id))
-                .arg(counters.argument()?);
+                .arg(counters.argument()?)
+                .arg(encode(&family_write)?);
             if let Some(catalog) = &catalog {
                 command
                     .arg(&catalog.header_value)

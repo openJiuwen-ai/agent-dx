@@ -480,6 +480,187 @@ async fn e2b_secure_false_rejects_before_template_or_create() {
 }
 
 #[tokio::test]
+async fn template_detail_reuses_owned_preparations_and_exposes_real_resources() {
+    let fixture = Fixture::new().await;
+    let path = format!("/templates/{FAMILY_ID}");
+    let response = http::request(
+        fixture.api.clone(),
+        "GET",
+        &path,
+        &[("X-API-Key", "k".repeat(32))],
+        "",
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        200,
+        "{}",
+        String::from_utf8_lossy(response.body())
+    );
+    let detail: Value = serde_json::from_slice(response.body()).unwrap();
+    assert_eq!(detail["templateID"], FAMILY_ID);
+    assert_eq!(detail["buildID"], BUILD_ID);
+    assert_eq!(detail["createdAt"], "1970-01-01T00:00:00.001Z");
+    assert_eq!(detail["updatedAt"], "1970-01-01T00:00:00.005Z");
+    assert_eq!(detail["spawnCount"], 2);
+    assert_eq!(detail["lastSpawnedAt"], "1970-01-01T00:00:00.005Z");
+    assert_eq!(detail["builds"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["builds"][0]["status"], "ready");
+    assert_eq!(detail["builds"][0]["memoryMB"], 768);
+    assert_eq!(detail["builds"][0]["envdVersion"], "0.9.0");
+    assert_eq!(detail["builds"][0]["createdAt"], "1970-01-01T00:00:00.002Z");
+    assert_eq!(detail["builds"][0]["updatedAt"], "1970-01-01T00:00:00.003Z");
+    assert!(detail.get("nextToken").is_none());
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+    for (headers, expected) in [
+        (vec![], 401),
+        (
+            vec![("X-API-Key", format!("other-{}", "k".repeat(32)))],
+            404,
+        ),
+    ] {
+        let response = http::request(fixture.api.clone(), "GET", &path, &headers, "").await;
+        assert_eq!(response.status(), expected);
+    }
+}
+
+#[tokio::test]
+async fn template_detail_pages_builds_through_response_headers() {
+    const CURRENT_ID: &str = "550e8400-e29b-41d4-a716-446655440012";
+    let fixture = Fixture::new().await;
+    *fixture.state.current_preparation.lock().unwrap() = Some(pb::SnapshotPreparationView {
+        template_id: FAMILY_ID.into(),
+        preparation_id: CURRENT_ID.into(),
+        name: "base".into(),
+        phase: pb::SnapshotPreparationPhase::Failed as i32,
+        resources: Some(pb::Resources {
+            cpu_millis: 4000,
+            memory_bytes: 1024 * 1_048_576,
+            ..Default::default()
+        }),
+        created_at_unix_ms: 1,
+        template_updated_at_unix_ms: 8,
+        preparation_created_at_unix_ms: 6,
+        preparation_updated_at_unix_ms: 8,
+        last_spawned_at_unix_ms: Some(5),
+        spawn_count: Some(2),
+        ..Default::default()
+    });
+    let headers = [("X-API-Key", "k".repeat(32))];
+    let first = http::request(
+        fixture.api.clone(),
+        "GET",
+        &format!("/templates/{FAMILY_ID}?limit=1"),
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(first.status(), 200);
+    let cursor = first.headers()["x-next-token"].to_str().unwrap();
+    assert_eq!(cursor, CURRENT_ID);
+    let first_body: Value = serde_json::from_slice(first.body()).unwrap();
+    assert!(first_body.get("nextToken").is_none());
+    assert_eq!(first_body["buildID"], BUILD_ID);
+    assert_eq!(first_body["buildStatus"], "ready");
+    assert_eq!(first_body["createdAt"], "1970-01-01T00:00:00.001Z");
+    assert_eq!(first_body["updatedAt"], "1970-01-01T00:00:00.008Z");
+    assert_eq!(first_body["spawnCount"], 2);
+    assert_eq!(first_body["lastSpawnedAt"], "1970-01-01T00:00:00.005Z");
+    assert_eq!(first_body["builds"].as_array().unwrap().len(), 1);
+    assert_eq!(first_body["builds"][0]["buildID"], CURRENT_ID);
+    assert_eq!(first_body["builds"][0]["status"], "error");
+    assert_eq!(
+        first_body["builds"][0]["createdAt"],
+        "1970-01-01T00:00:00.006Z"
+    );
+    assert_eq!(
+        first_body["builds"][0]["updatedAt"],
+        "1970-01-01T00:00:00.008Z"
+    );
+
+    let second = http::request(
+        fixture.api.clone(),
+        "GET",
+        &format!("/templates/{FAMILY_ID}?limit=1&nextToken={cursor}"),
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(second.status(), 200);
+    assert!(second.headers().get("x-next-token").is_none());
+    let second_body: Value = serde_json::from_slice(second.body()).unwrap();
+    assert!(second_body.get("nextToken").is_none());
+    assert_eq!(second_body["buildStatus"], "ready");
+    assert_eq!(second_body["updatedAt"], "1970-01-01T00:00:00.008Z");
+    assert_eq!(second_body["spawnCount"], 2);
+    assert_eq!(second_body["lastSpawnedAt"], "1970-01-01T00:00:00.005Z");
+    assert_eq!(second_body["builds"].as_array().unwrap().len(), 1);
+    assert_eq!(second_body["builds"][0]["buildID"], BUILD_ID);
+    assert_eq!(second_body["builds"][0]["status"], "ready");
+    assert_eq!(
+        second_body["builds"][0]["createdAt"],
+        "1970-01-01T00:00:00.002Z"
+    );
+    assert_eq!(
+        second_body["builds"][0]["updatedAt"],
+        "1970-01-01T00:00:00.003Z"
+    );
+}
+
+#[tokio::test]
+async fn template_detail_distinguishes_unused_templates_from_unknown_history() {
+    let fixture = Fixture::new().await;
+    let current = pb::SnapshotPreparationView {
+        template_id: FAMILY_ID.into(),
+        preparation_id: BUILD_ID.into(),
+        name: "base".into(),
+        phase: pb::SnapshotPreparationPhase::Registered as i32,
+        resources: Some(pb::Resources {
+            cpu_millis: 2000,
+            memory_bytes: 768 * 1_048_576,
+            ..Default::default()
+        }),
+        created_at_unix_ms: 1,
+        template_updated_at_unix_ms: 1,
+        preparation_created_at_unix_ms: 1,
+        preparation_updated_at_unix_ms: 1,
+        spawn_count: Some(0),
+        ..Default::default()
+    };
+    *fixture.state.current_preparation.lock().unwrap() = Some(current.clone());
+    *fixture.state.snapshot.lock().unwrap() = None;
+    let path = format!("/templates/{FAMILY_ID}");
+    let headers = [("X-API-Key", "k".repeat(32))];
+    let response = http::request(fixture.api.clone(), "GET", &path, &headers, "").await;
+    assert_eq!(response.status(), 200);
+    let detail: Value = serde_json::from_slice(response.body()).unwrap();
+    assert_eq!(detail["buildStatus"], "waiting");
+    assert_eq!(detail["createdAt"], "1970-01-01T00:00:00.001Z");
+    assert_eq!(detail["updatedAt"], "1970-01-01T00:00:00.001Z");
+    assert_eq!(detail["spawnCount"], 0);
+    assert!(detail.get("lastSpawnedAt").unwrap().is_null());
+    assert_eq!(detail["builds"][0]["createdAt"], "1970-01-01T00:00:00.001Z");
+    assert_eq!(detail["builds"][0]["updatedAt"], "1970-01-01T00:00:00.001Z");
+
+    for missing in 0..5 {
+        let mut historical = current.clone();
+        match missing {
+            0 => historical.created_at_unix_ms = 0,
+            1 => historical.template_updated_at_unix_ms = 0,
+            2 => historical.preparation_created_at_unix_ms = 0,
+            3 => historical.preparation_updated_at_unix_ms = 0,
+            _ => historical.spawn_count = None,
+        }
+        *fixture.state.current_preparation.lock().unwrap() = Some(historical);
+        let response = http::request(fixture.api.clone(), "GET", &path, &headers, "").await;
+        assert_eq!(response.status(), 409, "missing metadata case {missing}");
+        assert!(String::from_utf8_lossy(response.body())
+            .contains("historical template metadata missing"));
+    }
+}
+
+#[tokio::test]
 async fn template_alias_lookup_is_tenant_scoped_and_read_only() {
     let fixture = Fixture::new().await;
     let tenant = [("X-API-Key", "k".repeat(32))];
@@ -944,6 +1125,258 @@ async fn e2b_create_rejects_oversized_metadata_before_any_create_rpc() {
     assert_eq!(response.status().as_u16(), 400);
     assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn legacy_e2b_resume_restores_with_its_own_timeout_contract() {
+    for (body, timeout) in [("", 15), (r#"{"timeout":73}"#, 73), (r#"{"timeout":0}"#, 0)] {
+        let fixture = Fixture::new().await;
+        let headers = [("X-API-Key", "k".repeat(32))];
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            "/v2/sandboxes",
+            &headers,
+            r#"{"templateID":"base"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), 201);
+        let created: Value = serde_json::from_slice(response.body()).unwrap();
+        let id = created["sandboxID"].as_str().unwrap();
+        fixture
+            .state
+            .owners
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .record
+            .as_mut()
+            .unwrap()
+            .state = pb::EnvironmentState::Paused as i32;
+        fixture
+            .state
+            .control_owner_unavailable
+            .store(true, Ordering::SeqCst);
+        let path = format!("/sandboxes/{id}/resume");
+        let response = http::request(fixture.api.clone(), "POST", &path, &headers, body).await;
+        assert_eq!(
+            response.status(),
+            201,
+            "{}",
+            String::from_utf8_lossy(response.body())
+        );
+        let resumed: Value = serde_json::from_slice(response.body()).unwrap();
+        for key in [
+            "sandboxID",
+            "envdAccessToken",
+            "trafficAccessToken",
+            "domain",
+        ] {
+            assert_eq!(resumed[key], created[key], "{key}");
+        }
+        assert_eq!(resumed["state"], "running");
+        {
+            let updates = fixture.state.control_updates.lock().unwrap();
+            assert_eq!(updates.last().unwrap().timeout_seconds, timeout);
+            assert!(!updates.last().unwrap().extend_only);
+            let requests = fixture.state.resume_requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].run_timeout_seconds,
+                Some(if timeout == 0 { 300 } else { timeout })
+            );
+        }
+        let repeated = http::request(fixture.api.clone(), "POST", &path, &headers, "{}").await;
+        assert_eq!(
+            repeated.status(),
+            409,
+            "legacy resume is not running-state Connect"
+        );
+    }
+}
+
+async fn paused_e2b_fixture(auto_pause: bool) -> (Fixture, String) {
+    let fixture = Fixture::new().await;
+    let created = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &[("X-API-Key", "k".repeat(32))],
+        &json!({"templateID":"base","autoPause":auto_pause}).to_string(),
+    )
+    .await;
+    assert_eq!(created.status(), 201);
+    let created: Value = serde_json::from_slice(created.body()).unwrap();
+    let id = created["sandboxID"].as_str().unwrap().to_owned();
+    fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .record
+        .as_mut()
+        .unwrap()
+        .state = pb::EnvironmentState::Paused as i32;
+    (fixture, id)
+}
+
+#[tokio::test]
+async fn legacy_resume_preserves_expiry_when_response_preparation_fails() {
+    for (timeout, missing_resources, expected_status) in
+        [(0, false, 503), (0, true, 500), (73, false, 503)]
+    {
+        let (fixture, id) = paused_e2b_fixture(false).await;
+        if missing_resources {
+            fixture
+                .state
+                .missing_resume_resources
+                .store(true, Ordering::SeqCst);
+        } else {
+            fixture
+                .state
+                .next_control_read_error
+                .store(tonic::Code::Unavailable as usize, Ordering::SeqCst);
+        }
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            &format!("/sandboxes/{id}/resume"),
+            &[("X-API-Key", "k".repeat(32))],
+            &json!({"timeout":timeout}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), expected_status);
+        let control = fixture_control(&fixture.state, &id, &caller()).unwrap();
+        assert_eq!(control.expires_at_unix_ms, timeout * 1000 + 1);
+        if timeout == 0 {
+            let updates = fixture.state.control_updates.lock().unwrap();
+            assert_eq!(updates.last().unwrap().timeout_seconds, 0);
+            assert!(!updates.last().unwrap().extend_only);
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_resume_reports_unconfirmed_expiry_updates_without_repeating_them() {
+    for (timeout, error, expected_status) in [
+        (0, tonic::Code::Unavailable, 503),
+        (0, tonic::Code::DeadlineExceeded, 504),
+        (0, tonic::Code::PermissionDenied, 403),
+        (73, tonic::Code::Unavailable, 503),
+    ] {
+        let (fixture, id) = paused_e2b_fixture(false).await;
+        fixture
+            .state
+            .next_control_update_error
+            .store(error as usize, Ordering::SeqCst);
+        let headers = [("X-API-Key", "k".repeat(32))];
+        let path = format!("/sandboxes/{id}/resume");
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            &path,
+            &headers,
+            &json!({"timeout":timeout}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), expected_status);
+        let control = fixture_control(&fixture.state, &id, &caller()).unwrap();
+        let expected_timeout = if timeout == 0 { 300 } else { timeout };
+        assert_eq!(control.expires_at_unix_ms, expected_timeout * 1000 + 1);
+        let repeated = http::request(fixture.api.clone(), "POST", &path, &headers, "{}").await;
+        assert_eq!(repeated.status(), 409);
+    }
+}
+
+#[tokio::test]
+async fn legacy_zero_resume_does_not_claim_success_when_expiry_reply_is_lost() {
+    for auto_pause in [false, true] {
+        let (fixture, id) = paused_e2b_fixture(auto_pause).await;
+        fixture
+            .state
+            .lose_zero_update_reply
+            .store(true, Ordering::SeqCst);
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            &format!("/sandboxes/{id}/resume"),
+            &[("X-API-Key", "k".repeat(32))],
+            r#"{"timeout":0}"#,
+        )
+        .await;
+        assert_eq!(response.status(), 504);
+        let control = fixture_control(&fixture.state, &id, &caller()).unwrap();
+        assert_eq!(control.expires_at_unix_ms, 1);
+        assert_eq!(
+            fixture.state.owners.lock().unwrap()[&id]
+                .record
+                .as_ref()
+                .unwrap()
+                .state,
+            if auto_pause {
+                pb::EnvironmentState::Paused
+            } else {
+                pb::EnvironmentState::Deleted
+            } as i32
+        );
+        assert!(
+            fixture.state.staged_run_timeouts.lock().unwrap().is_empty(),
+            "lost replies must not expire a later wake"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_e2b_resume_rejects_unsupported_options_before_recovery() {
+    let fixture = Fixture::new().await;
+    let headers = [("X-API-Key", "k".repeat(32))];
+    let created = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &headers,
+        r#"{"templateID":"base"}"#,
+    )
+    .await;
+    let created: Value = serde_json::from_slice(created.body()).unwrap();
+    let id = created["sandboxID"].as_str().unwrap();
+    fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .get_mut(id)
+        .unwrap()
+        .record
+        .as_mut()
+        .unwrap()
+        .state = pb::EnvironmentState::Paused as i32;
+    for body in [
+        r#"{"memory":false}"#,
+        r#"{"autoPause":true}"#,
+        r#"{"timeout":86401}"#,
+        r#"{"unknown":true}"#,
+    ] {
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            &format!("/sandboxes/{id}/resume"),
+            &headers,
+            body,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            400,
+            "{body}: {}",
+            String::from_utf8_lossy(response.body())
+        );
+    }
+    assert!(fixture.state.resume_requests.lock().unwrap().is_empty());
+    assert!(fixture.state.control_updates.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

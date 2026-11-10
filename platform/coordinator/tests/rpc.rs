@@ -255,6 +255,16 @@ impl RuntimeDriver for Backend {
             tokio::time::sleep(Duration::from_millis(1200)).await;
         }
         self.running.lock().unwrap().insert(id.into());
+        if spec
+            .env
+            .get("FAIL_START")
+            .is_some_and(|v| v == "image_missing")
+        {
+            return Err(adx_core::Error::BackendFailure {
+                code: adx_core::BackendFailureCode::NotFound,
+                message: "manifest_unknown: requested image does not exist".into(),
+            });
+        }
         if spec.env.contains_key("FAIL_START") {
             return Err(adx_core::Error::Unavailable(
                 "injected runtime start failure".into(),
@@ -377,6 +387,11 @@ fn serve_lifecycle_coordinator(
         Server::builder()
             .tls_config(server_tls("coordinator"))
             .unwrap()
+            .add_service(
+                pb::snapshot_preparation_service_server::SnapshotPreparationServiceServer::new(
+                    coordinator.clone(),
+                ),
+            )
             .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(
                 coordinator.clone(),
             ))

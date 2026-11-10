@@ -15,9 +15,11 @@ ADX 在原生 Environment 生命周期上提供 E2B SDK 兼容入口。控制面
 | Snapshot 查询/删除 | `GET /snapshots` 查询 Regular；`DELETE /templates/{id}` 先解析平台模板并逻辑删除绑定，有引用时拒绝；普通运行态 snapshot ID 保留原生删除路径 |
 | 数据面 | commands、files、PTY 和应用端口经共享网关转发；网关鉴权模式增加 SDK 签名文件 URL，见下文配置与限制 |
 | Key 管理 | `POST/GET /api-keys`、`DELETE /api-keys/{uuid}` 复用原生凭据服务，具体认证差异见下文 |
-| 出站网络 | 创建和 `PUT /sandboxes/{id}/network` 支持 IPv4/CIDR 策略；真实效果依赖可执行 ACL 的后端 |
+| 出站网络 | 创建和更新支持 IPv4/CIDR；`allowOut` 还支持域名和前导 `*.`；真实效果依赖可执行 ACL 的后端 |
 
 E2B 错误使用原始 JSON `{code, message, error_code?}`，不使用 ADX data envelope。不支持能力返回明确错误；例如检查点后端不支持时为 400 / `capability_not_supported`，不按错误文本推断。
+
+两个创建入口按 snapshot ID 创建时，缺失或已进入删除流程（Deleting/Deleted）的快照返回 404，不创建实例；仍存在的其他非 Ready 状态返回 409 / `snapshot is not ready`。模板解析和快照读取沿用租户权限校验，不通过快照状态暴露其他租户的源。已注册模板暂时没有可用 Ready build 仍返回 409。
 
 模板准备仅接入 fromImage；RUN/COPY/fromTemplate/startCmd/readyCmd、私有镜像凭据、完整日志和缓存优化暂不支持，启动前明确返回 capability_not_supported。Code Interpreter、完整 Desktop/computer-use、IAM/卷/MCP、自动恢复、磁盘暂停及高级网络未接入。实验版不声明完整 E2B API/生态兼容。
 
@@ -73,7 +75,7 @@ Ingress 设置 `ADX_DATA_PLANE_INGRESS_E2B_ENABLED=true`、`ADX_DATA_PLANE_INGRE
 
 ## Python SDK 用法
 
-使用原版 `e2b==2.52.0`，在进程环境设置 ADX 的 `E2B_API_URL`、`E2B_SANDBOX_URL` 和本租户 API Key。SDK 不要求 Key 必须使用 `e2b_` 前缀；使用 ADX 正式发放的凭据。`template_id` 为本租户已 Ready 的模板 ID，其他服务的模板 ID 不会自动导入 ADX。
+使用原版 `e2b==2.52.0`，设置 ADX 的 `E2B_API_URL` 和本租户 API Key。完整数据面使用下述标准逐沙箱域名，不设置共享 `E2B_SANDBOX_URL`。SDK 不要求 Key 必须使用 `e2b_` 前缀；使用 ADX 正式发放的凭据。`template_id` 为本租户已 Ready 的模板 ID，其他服务的模板 ID 不会自动导入 ADX。
 
 ```python
 from e2b import Sandbox, SandboxQuery, SandboxState
@@ -88,9 +90,26 @@ finally:
     sandbox.kill()
 ```
 
-两个 URL 可使用同一入口。固定 `E2B_SANDBOX_URL` 时 SDK 通过 `E2b-Sandbox-Id`、`E2b-Sandbox-Port` 和访问凭据路由 envd。若入口为 `https://sandbox.example.com/agentenv`，部署层反向代理必须对管理及数据面请求统一剥离 `/agentenv` 后转发到 ADX 根路径，同时保留路由头、WebSocket 和流式响应；直连根路径不需要改写。ADX 不增加 E2B 专用前缀分派。
+管理 API 的固定地址与数据面逐沙箱域名可以指向同一个 Ingress/IP。API Server 的 `e2b.domain` 和 Ingress 的 `ADX_DATA_PLANE_INGRESS_PORT_HOST_DOMAIN` 都设置为 `sandbox.example.com`；部署者将 `*.sandbox.example.com` 的 DNS 指向该 Ingress，并为其安装匹配的 TLS 证书。创建/连接返回该 domain，原版 SDK 自动生成 `https://49983-<sandboxID>.sandbox.example.com/files?...`，应用直接使用 `download_url()` / `upload_url()` 的返回值，无需改 SDK、重组 URL 或补路由头。反向代理须保留 Host；HTTP/2 的 `:authority` 同样携带沙箱目标。ADX 不要求专用路径前缀。
 
-SDK 2.52.0 生成独立文件签名 URL 时使用根路径 `/files`，会丢弃固定入口中的路径前缀，也不会在 URL 中加入沙箱路由头。因此上述固定入口适用于普通命令、文件和 PTY 调用；直接使用 SDK 生成的独立签名 URL，需要标准的逐沙箱 Host/DNS 地址与对应 TLS 配置。不能仅凭固定入口的普通文件读写通过，就认定独立签名 URL 可用。
+显式固定 `E2B_SANDBOX_URL` 是命令、普通文件和 PTY 的另一种连接配置：SDK 用 `E2b-Sandbox-Id`、`E2b-Sandbox-Port` 路由。但 SDK 2.25.0/2.52.0 生成的独立签名 URL 不带这些头，也不含沙箱 ID；即使固定地址没有路径前缀，直接访问仍返回 Ingress 404。签名用于鉴权，不能替代目标选择。完整无感切换采用前述标准域名部署；不扫描其它沙箱的凭据来猜测目标，也不要求业务代码修改 URL。已有原生 `/{sandboxID}/49983/files?...` 转发路径保留，但不是 SDK 独立 URL 的自动生成方式。
+
+## 接口补齐方案与边界
+
+E2B 适配层只做协议转换，复用 ADX 公共查询、EnsureRunning、运行期限和网络策略；不增加 RPC、存储目录、模板管理器、生命周期状态机或 sandboxd 补丁。
+
+请求字段与默认值参照固定的 [E2B OpenAPI](https://github.com/e2b-dev/infra/blob/9ddcf8a7ed5c27f8b668f886dd8b4b6750a8aedc/spec/openapi.yml)；下面的构建历史保留和 autoPause 修改限制属于 ADX 当前支持边界。
+
+| 项目 | 修改方案 | 明确边界 |
+| --- | --- | --- |
+| `GET /templates/{templateID}` | 查询调用租户的 Snapshot Preparation 当前记录和最近可用成功记录，去重后返回 builds、状态及真实资源；顶层 buildID、buildStatus 和资源统一描述可用成功版本，无成功版本时使用当前记录并省略 buildID；返回家族及各构建的真实创建/更新时间、累计成功创建次数及最近使用时间 | 只列保留的至多两项，支持 limit/nextToken；构建列表的保留范围与 E2B 完整历史不同。缺少历史元信息的旧家族不能提供完整详情，返回明确错误；不填固定值冒充历史 |
+| `POST /sandboxes/{sandboxID}/resume` | 复用 EnsureRunning 恢复原身份和既有凭据，Ready 后更新原生运行期限；空请求默认 15 秒，显式 timeout 替换期限，0 在恢复后立即到期 | 仅 Paused 可调用，Running 重复调用返回 409；v2 Connect 保持默认 300 秒和只延长期限。memory:false 拒绝；autoPause 只能与既有到期动作一致，不在恢复时修改平台策略 |
+| SDK 独立签名 URL | 固定管理入口、逐沙箱 Host 共用一个 Ingress；部署 DNS/TLS，复用现有 Host 解析、签名校验及 Relay | 不改 SDK 或应用代码；共享固定 `E2B_SANDBOX_URL` 缺失沙箱定位信息的行为不能伪装成已支持 |
+| 网络域名规则 | allowOut 的 IP/CIDR 转为 peer.cidr，精确域名或前导 `*.` 转为 peer.domain；沿用同一创建/更新转换和后端 ACL | 按锁定 E2B 合同，denyOut 只接 IP/CIDR；不接代理、HTTPS 改写、IPv6。原生 domain 规则按 DNS 派生 IPv4 权限，不等同按 HTTP Host 隔离共享 IP 服务 |
+
+模板详情的查询不创建或唤醒沙箱，也不修改使用统计；外租户和不存在的模板返回 404。`spawnCount` 按从家族 Golden Snapshot 首次成功发布的实例累计，`lastSpawnedAt` 使用该次原生创建成功的时刻；新家族尚无成功实例时分别为 0 和 null。创建重放、恢复和删除实例不重复累计或回退计数，重建同一家族保留累计值。Golden Snapshot 的家族来源和统计复用平台目录与首次创建成功的原子提交，不依赖 E2B 身份或网关事后回写。旧记录中没有保存的构建时间和使用历史不做推算；缺少这些数据的旧家族需要新建家族才能取得完整详情，其原有沙箱和快照生命周期不受该查询限制影响。游标仅针对当前保留记录，记录变化后过期游标返回 400；分页游标只通过 `X-Next-Token` 响应头返回。运行期限为 0 时先准备成功响应所需的身份、凭据与就绪信息，再调用原生到期更新；即使准备响应失败，也尝试应用零期限。该更新未确认成功时返回错误，不因应答丢失自动重发按实例 ID 定位的更新，以免影响后续运行；正数期限保留原有行为。恢复与后续 RPC 不是原子事务，通信故障或 API 进程中断仍可能留下已恢复的实例。
+
+验证分别覆盖 HTTP/RPC 合同（权限、默认值、状态和错误）、真实 Ingress/Relay/envd 的两版 SDK 与 HTTP/1.1/HTTP/2，以及原生 DNS/ACL 的实际报文。组件验证与完整 Harbor、KVM 生命周期验收分别记录，不能相互代替。
 
 ## 镜像准备与 Golden Snapshot
 
@@ -112,6 +131,8 @@ Sandbox.create(templateID[:tag]) → Ready snapshotId → 原生从快照创建
 公共 RPC 返回真实准备阶段、资源、ID 和快照可用性；E2B waiting/building/ready/error 只在适配层转换。E2B 冒号后缀仅接受 default，buildID 用于 current/latest-success 状态查询，固定产物可直接使用 snapshotID。
 
 准备状态、输入和确定的 seed/operation/snapshot 身份持久化在平台。Coordinator 接管已登记任务并清理失败 seed；结果未知先查询既有操作，不换 ID 重拍。恢复扫描跳过正在执行的 build，并使用原生恢复同样的有界并发；不新增任务引擎。终态且清理完成后释放完整执行规格，Ready 摘要从原生 Snapshot 读取；删除目录的全部待办完成后按 epoch/CAS 回收墓碑，不删除独立 Golden。组件重启可重试已知阶段，不承诺任意构建断点精确恢复。缺少镜像 useradd 或 bash/动态依赖时明确失败，不提供完整上游 sudo 环境。
+
+seed 创建返回明确的终结失败或后端应用错误时，准备流程记录 Failed 和原始错误原因，E2B 状态返回 `error` / `reason.message`；后续扫描清理 seed，不重新创建，也不覆盖旧成功版本。未带确认标记的 NotFound、传输错误和快照结果不确定仍按既有流程对账，不能据此直接判定构建失败。
 
 ## 请求路径与鉴权
 
@@ -202,21 +223,21 @@ host/initrd/快照须与固定 sandboxd revision 和工件摘要配套。宿主�
 
 Key 管理采用 ADX 管理员认证：`X-Admin-Token` 或 `Authorization: Bearer <ADX administrator key>` 二选一，`X-Team-ID` 须等于管理员 tenant，普通 X-API-Key 不授予管理权限。这与原装 AuthProvider JWT 是明确差异，不支持跨团队管理或重命名（PATCH 为 501）。
 
-POST 只接收 `{ "name": "ci-key" }`，name 非空、最多 256 个非控制字符；同名允许，创建不幂等。201 一次性返回 `key`，列表只返回 UUID id、RFC3339 createdAt 和真实 mask，createdBy/lastUsed 为 null，成功响应 no-store。新密钥统一复用 `adx_` 加 64 个小写 hex，SDK 将其作为不透明凭据；内部不再区分 E2B KeyFormat。历史 `e2b_` 密钥仍可认证、查询和撤销，不替换前缀转换旧密钥。DELETE 为 204，缺失/已撤销/其它 tenant 为 404；tenant/UUID 校验与撤销原子执行。
+POST 只接收 `{ "name": "ci-key" }`，name 非空、最多 256 个非控制字符；同名允许，创建不幂等。201 一次性返回 `key`，列表只返回 UUID id、RFC3339 createdAt 和真实 mask，createdBy/lastUsed 为 null，成功响应 no-store。新密钥统一复用 `adx_` 加 64 个小写 hex，SDK 2.52.0 接受该格式；Harbor 固定的 SDK 2.25.0 要求 `e2b_` 加小写 hex，会在发送请求前拒绝这些新密钥，当前发钥接口不能直接用于该版本。已登记的 `e2b_` 密钥仍可认证、查询和撤销，不替换前缀转换旧密钥。DELETE 为 204，缺失/已撤销/其它 tenant 为 404；tenant/UUID 校验与撤销原子执行。
 
 撤销在下一次 E2B 管理请求实时生效，不删除沙箱，不广播断开已有连接，不撤销独立 envd/traffic token；原生入口及 Ingress 认证缓存仍按其原有合同工作。
 
 真实 ACL 要求专用 worker 开启 `[plugin.network] enable_network_acl = true`。固定 sandboxd 拒绝 runc 非空网络策略和动态更新，runsc systrap 可执行 ACL 且不需要 KVM；Firecracker 另需 KVM。核查 iptables/ip6tables/ipset、bridge netfilter、conntrack 及权限，backend、bridge/TAP、ACL hooks 和报文处于同一可管理网络命名空间。hostNetwork 不是唯一部署方式；bpfnat 另需 Linux 5.17+/TC eBPF/可写 bpffs，完整条件见固定 sandboxd 的 `doc/network-acl.md`。
 
-创建与更新共用 IPv4/CIDR 转换：创建时未提供覆盖字段才继承快照出站策略；显式 `allow_internet_access:true` 或空 `allowOut`/`denyOut` 会应用允许/清空覆盖，同时保留受保护 ingress。allow 优先级 200、deny 100，默认允许；`allow_internet_access:false` 默认拒绝，`network:{}` 保留模板 allowPublicTraffic。域名、通配符、IPv6、egressProxy/rules/maskRequestHost/httpsPorts 明确拒绝。更新是出站配置替换，`{}` 清除旧出站规则并恢复默认允许，保留原生入站、DNS 及 stateful/stateless mode，Both 只保留 Ingress 投影；不接受动态 allowPublicTraffic。仅 Running 可更新，沿同一权威 revision 调用节点，竞争为 409，执行失败不返回 204。
+创建与更新共用目的地址转换：allowOut 支持 IPv4/CIDR、精确域名及前导 `*.`，域名大小写、IDNA 和尾部点按原生规范化；`*.example.com` 不包含 `example.com`。denyOut 按锁定 E2B 合同只支持 IP/CIDR。创建时未提供覆盖字段才继承快照出站策略；显式 `allow_internet_access:true` 或空 `allowOut`/`denyOut` 会应用允许/清空覆盖，同时保留受保护 ingress。allow 优先级 200、deny 100，默认允许；`allow_internet_access:false` 默认拒绝，`network:{}` 保留模板 allowPublicTraffic。IPv6、egressProxy/rules/maskRequestHost/httpsPorts 明确拒绝。更新是出站配置替换，`{}` 清除旧出站规则并恢复默认允许，保留原生入站、DNS 及 stateful/stateless mode，Both 只保留 Ingress 投影；不接受动态 allowPublicTraffic。仅 Running 可更新，沿同一权威 revision 调用节点，竞争为 409，执行失败不返回 204。
 
 链路为 Ingress→API Server→EnvironmentService→adxlet→sandboxd，不调用 envd。保留平台控制流量例外，已有连接行为继承 backend；HTTP 204 或单元测试不是实际阻断报文的证明。
 
 ## Harbor 预置模板接入
 
-Harbor 0.25.0 使用锁定的 E2B SDK 2.25.0。将任务依赖预装入 OCI 镜像，通过 fromImage 准备 Golden Snapshot，并登记任务实际使用的精确 alias。使用管理员签发的普通 ADX key、官方 SDK 地址与 CA 配置，运行 `--env e2b --no-force-build`。未知 alias 不回退 base。
+Harbor 0.25.0 使用锁定的 E2B SDK 2.25.0。将任务依赖预装入 OCI 镜像，通过 fromImage 准备 Golden Snapshot，并登记任务实际使用的精确 alias。使用已在 ADX 登记的 `e2b_` 格式普通租户 Key、官方 SDK 地址与 CA 配置，运行 `--env e2b --no-force-build`。当前可通过 Coordinator 的 `bootstrap_credentials` 配置该格式凭据，设置 `administrator:false` 并限制有效期；只更换已有密钥的前缀不会注册新凭据。未知 alias 不回退 base。
 
-仅支持 fromImage 准备，非空构建步骤明确拒绝。保持任务原有网络要求，PUBLIC 使用默认网络策略；NO_NETWORK/IPv4 依赖支持 ACL 的后端，域名/通配符仍不支持。验证时保留 Harbor/SDK 的正常协议、secure 参数、路由和 alias，使用正式发钥接口；通过真实 provider/Oracle 检查任务执行结果和文件权限。
+仅支持 fromImage 准备，非空构建步骤明确拒绝。保持任务原有网络要求，PUBLIC 使用默认网络策略；NO_NETWORK/IPv4 和 allowOut 域名策略依赖支持 ACL 的后端。验证时保留 Harbor/SDK 的正常协议、secure 参数、路由和 alias，通过真实 provider/Oracle 检查任务执行结果和文件权限。须说明凭据来源：启动配置登记的凭据不能作为 `POST /api-keys` 对 SDK 2.25.0 兼容的证明。
 
 ## 验证入口
 

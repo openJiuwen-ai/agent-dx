@@ -44,6 +44,14 @@ fn view(
         snapshot_id: preparation.snapshot_id.clone().unwrap_or_default(),
         error: preparation.error.clone().unwrap_or_default(),
         created_at_unix_ms: template.created_at_unix_ms,
+        template_updated_at_unix_ms: template.updated_at_unix_ms,
+        preparation_created_at_unix_ms: preparation.created_at_unix_ms,
+        preparation_updated_at_unix_ms: preparation.updated_at_unix_ms,
+        last_spawned_at_unix_ms: template
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.last_spawned_at_unix_ms),
+        spawn_count: template.usage.as_ref().map(|usage| usage.spawn_count),
         image: spec.map(|spec| spec.image.clone()).unwrap_or_default(),
         envd_version: spec
             .and_then(|spec| spec.envd.as_ref())
@@ -111,7 +119,8 @@ async fn successful_view(
     }
     let build = SnapshotPreparation {
         id: completed.preparation_id.clone(),
-        created_at_unix_ms: template.created_at_unix_ms,
+        created_at_unix_ms: completed.created_at_unix_ms,
+        updated_at_unix_ms: completed.updated_at_unix_ms,
         resources: snapshot.template.resources,
         state: PreparationState::Ready,
         spec: None,
@@ -488,7 +497,7 @@ impl CoordinatorRpc {
                     }
                     stored.result.ok_or(Error::Conflict)?
                 } else {
-                    let response =
+                    let created =
                         Box::pin(self.create_from_request(pb::CreateEnvironmentRequest {
                             spec: Some(spec.clone().into()),
                             caller: Some(pb::CallerContext {
@@ -500,9 +509,24 @@ impl CoordinatorRpc {
                             create_timeout_seconds: 600,
                             ..Default::default()
                         }))
-                        .await
-                        .map_err(adx_protocol::dependency_status)?
-                        .into_inner();
+                        .await;
+                    let response = match created {
+                        Ok(response) => response.into_inner(),
+                        Err(error) if confirmed_create_failure(&error) => {
+                            // The native create boundary has already confirmed failure.
+                            // Preserve that decision before generic status conversion
+                            // can turn a missing image into a retryable NotFound.
+                            self.fail_preparation(
+                                &session,
+                                &template_id,
+                                &build_id,
+                                error.message(),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Err(error) => return Err(adx_protocol::dependency_status(error)),
+                    };
                     if response.durability != pb::Durability::Published as i32 {
                         return Err(Error::Unavailable(
                             "preparation create publication is unconfirmed".into(),
@@ -1086,6 +1110,7 @@ mod tests {
         let build = SnapshotPreparation {
             id: "00000000-0000-4000-8000-000000000001".into(),
             created_at_unix_ms: 20,
+            updated_at_unix_ms: 30,
             resources: spec.resources,
             state: PreparationState::Failed,
             spec: Some(spec),
@@ -1099,6 +1124,11 @@ mod tests {
             tenant_id: "tenant".into(),
             name: "base".into(),
             created_at_unix_ms: 10,
+            updated_at_unix_ms: 40,
+            usage: Some(adx_core::snapshot_preparation::SnapshotTemplateUsage {
+                spawn_count: 2,
+                last_spawned_at_unix_ms: Some(40),
+            }),
             revision: 1,
             deleted: false,
             preparation: build.clone(),
@@ -1113,6 +1143,12 @@ mod tests {
         );
         assert!(!result.snapshot_available);
         assert_eq!(result.error, "image preparation failed");
+        assert_eq!(result.created_at_unix_ms, 10);
+        assert_eq!(result.template_updated_at_unix_ms, 40);
+        assert_eq!(result.preparation_created_at_unix_ms, 20);
+        assert_eq!(result.preparation_updated_at_unix_ms, 30);
+        assert_eq!(result.spawn_count, Some(2));
+        assert_eq!(result.last_spawned_at_unix_ms, Some(40));
     }
 
     async fn registered(session: &Session, name: &str) -> (SnapshotTemplate, SnapshotPreparation) {
@@ -1357,6 +1393,21 @@ mod tests {
         );
         assert_eq!(result.image, source().image);
         assert!(result.snapshot_available);
+        let retained = ready.latest_successful.as_ref().unwrap();
+        let successful = successful_view(&session, &ready).await.unwrap();
+        assert_eq!(successful.created_at_unix_ms, ready.created_at_unix_ms);
+        assert_eq!(
+            successful.preparation_created_at_unix_ms,
+            retained.created_at_unix_ms
+        );
+        assert_eq!(
+            successful.preparation_updated_at_unix_ms,
+            retained.updated_at_unix_ms
+        );
+        assert_eq!(
+            successful.template_updated_at_unix_ms,
+            ready.updated_at_unix_ms
+        );
         let busy = session
             .get_snapshot_template("tenant", &builds[0].0.id)
             .await

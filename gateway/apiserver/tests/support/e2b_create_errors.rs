@@ -1,5 +1,118 @@
 use super::*;
 
+#[tokio::test]
+async fn missing_or_deleted_snapshot_source_returns_not_found_before_create() {
+    for path in ["/sandboxes", "/v2/sandboxes"] {
+        for state in [
+            None,
+            Some(pb::SnapshotState::Deleting),
+            Some(pb::SnapshotState::Deleted),
+        ] {
+            let fixture = Fixture::new().await;
+            if let Some(state) = state {
+                fixture
+                    .state
+                    .snapshot
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .state = state as i32;
+            } else {
+                *fixture.state.snapshot.lock().unwrap() = None;
+            }
+
+            let response = http::request(
+                fixture.api.clone(),
+                "POST",
+                path,
+                &[("X-API-Key", "k".repeat(32))],
+                r#"{"templateID":"base-snapshot"}"#,
+            )
+            .await;
+
+            assert_eq!(response.status(), 404, "{path}: {state:?}");
+            let body: Value = serde_json::from_slice(response.body()).unwrap();
+            assert_eq!(body["code"], 404);
+            assert_eq!(body["message"], "snapshot not found");
+            assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+            assert!(fixture.state.owners.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_ready_snapshot_source_returns_conflict_before_create() {
+    for path in ["/sandboxes", "/v2/sandboxes"] {
+        let fixture = Fixture::new().await;
+        fixture
+            .state
+            .snapshot
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .state = pb::SnapshotState::Unspecified as i32;
+
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            path,
+            &[("X-API-Key", "k".repeat(32))],
+            r#"{"templateID":"base-snapshot"}"#,
+        )
+        .await;
+
+        assert_eq!(response.status(), 409, "{path}");
+        let body: Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["code"], 409);
+        assert_eq!(body["message"], "snapshot is not ready");
+        assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+        assert!(fixture.state.owners.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn foreign_snapshot_source_is_hidden_before_create() {
+    for path in ["/sandboxes", "/v2/sandboxes"] {
+        for state in [
+            pb::SnapshotState::Ready,
+            pb::SnapshotState::Unspecified,
+            pb::SnapshotState::Deleting,
+            pb::SnapshotState::Deleted,
+        ] {
+            let fixture = Fixture::new().await;
+            fixture
+                .state
+                .snapshot
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .state = state as i32;
+
+            let response = http::request(
+                fixture.api.clone(),
+                "POST",
+                path,
+                &[("X-API-Key", format!("other-{}", "k".repeat(32)))],
+                r#"{"templateID":"base-snapshot"}"#,
+            )
+            .await;
+
+            assert_eq!(response.status(), 404, "{path}: {state:?}");
+            let body: Value = serde_json::from_slice(response.body()).unwrap();
+            assert_eq!(body["message"], "snapshot not found");
+            assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+            assert!(fixture.state.owners.lock().unwrap().is_empty());
+        }
+    }
+}
+
 async fn create_response(fixture: &Fixture) -> hyper::Response<Vec<u8>> {
     http::request(
         fixture.api.clone(),

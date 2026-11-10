@@ -65,6 +65,9 @@ pub struct Snapshot {
     /// Capture creation time, or zero when reading metadata written before it was recorded.
     #[serde(default)]
     pub created_at_unix_ms: u64,
+    /// Coordinator-owned family provenance; omitted by node wire protocols.
+    #[serde(default)]
+    pub preparation_template_id: Option<String>,
     pub template: EnvironmentSpec,
     pub source_node_id: String,
     pub source_runtime_id: String,
@@ -115,6 +118,7 @@ impl Snapshot {
             names,
             kind,
             created_at_unix_ms,
+            preparation_template_id: None,
             template,
             source_node_id,
             source_runtime_id,
@@ -131,6 +135,10 @@ impl Snapshot {
         if !valid_id(&self.id)
             || !valid_id(&self.source_node_id)
             || !valid_id(&self.source_runtime_id)
+            || self.preparation_template_id.as_ref().is_some_and(|id| {
+                !crate::snapshot_preparation::valid_preparation_id(id)
+                    || self.kind != SnapshotKind::Golden
+            })
             || self.revision == 0
             || self.artifact.storage.is_empty()
             || self.artifact.location.is_empty()

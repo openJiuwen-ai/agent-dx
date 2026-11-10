@@ -50,6 +50,15 @@ pub struct ConnectRequest {
     pub memory: Option<bool>,
 }
 
+/// The deprecated E2B resume contract differs from v2 Connect.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ResumeRequest {
+    pub timeout: Option<u64>,
+    pub memory: Option<bool>,
+    pub auto_pause: Option<bool>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PauseRequest {
@@ -282,6 +291,25 @@ impl ConnectRequest {
     }
 }
 
+impl ResumeRequest {
+    pub(super) fn validate(&self) -> Result<(), ValidationError> {
+        if self
+            .timeout
+            .is_some_and(|timeout| timeout > MAX_TIMEOUT_SECONDS)
+        {
+            return Err(ValidationError::invalid(
+                "timeout must be between 0 and 86400 seconds",
+            ));
+        }
+        if self.memory == Some(false) {
+            return Err(ValidationError::unsupported(
+                "resuming without memory is not supported by this profile",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl PauseRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.memory == Some(false) {
@@ -471,7 +499,7 @@ mod tests {
         let empty: CreateRequest = serde_json::from_value(json!({"network": {}})).unwrap();
         assert!(empty.network_configuration().unwrap().0.is_none());
         let input: CreateRequest = serde_json::from_value(json!({
-            "network": {"allowPublicTraffic": false, "allowOut": ["10.0.0.0/8"]},
+            "network": {"allowPublicTraffic": false, "allowOut": ["10.0.0.0/8", "*.example.test", "api.example.test"]},
             "allow_internet_access": false,
         }))
         .unwrap();
@@ -483,6 +511,8 @@ mod tests {
             adx_core::execution::NetworkAction::Deny
         );
         assert_eq!(traffic.rules[0].peer.cidr, "10.0.0.0/8");
+        assert_eq!(traffic.rules[1].peer.domain, "*.example.test");
+        assert_eq!(traffic.rules[2].peer.domain, "api.example.test");
     }
 
     #[test]
