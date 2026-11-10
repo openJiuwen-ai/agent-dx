@@ -8,12 +8,13 @@ use std::{
     io::{self, Write},
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 use storage_util::io_ring::{IoRingHandle, spawn_io_ring_worker};
 use tokio::process::Command;
 use tokio::time::{Instant, timeout, timeout_at};
+use tokio::{sync::Mutex, task::JoinHandle};
 use uvm_ublk::{OverlaybdTarget, UVMUblkCtrlBuilder, UVMUblkDev, UVMUblkDevBuilder};
 
 type Ring = IoRingHandle<io_uring::squeue::Entry128>;
@@ -76,11 +77,30 @@ pub(super) struct Devices {
     owned_id: Option<u32>,
     device: Option<Device>,
     serving: bool,
+    owner: Weak<Mutex<Self>>,
+    monitor: Option<QueueMonitor>,
+    pending_stop: Option<JoinHandle<io::Result<()>>>,
     released: Released,
 }
 
+struct QueueMonitor(JoinHandle<()>);
+
+impl Drop for QueueMonitor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl Devices {
-    pub(super) fn open(config: OverlaybdConfig) -> io::Result<Self> {
+    pub(super) fn shared(config: OverlaybdConfig) -> io::Result<Arc<Mutex<Self>>> {
+        let mut devices = Self::open(config)?;
+        Ok(Arc::new_cyclic(|owner| {
+            devices.owner = owner.clone();
+            Mutex::new(devices)
+        }))
+    }
+
+    fn open(config: OverlaybdConfig) -> io::Result<Self> {
         let journal = match fs::read(config.directory.join("state.json")) {
             Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -113,7 +133,42 @@ impl Devices {
             owned_id: None,
             device: None,
             serving: false,
+            owner: Weak::new(),
+            monitor: None,
+            pending_stop: None,
         })
+    }
+
+    fn can_serve(&self) -> bool {
+        self.serving && self.device.as_ref().is_some_and(Device::queues_are_healthy)
+    }
+
+    fn publish_serving(&mut self) -> io::Result<()> {
+        let device = self
+            .device
+            .as_ref()
+            .filter(|device| device.queues_are_healthy())
+            .ok_or_else(|| io::Error::other("OverlayBD queue failed before serving"))?;
+        let id = device.dev_id();
+        let mut failure = device.queue_failure();
+        let owner = self.owner.clone();
+        self.monitor = Some(QueueMonitor(tokio::spawn(async move {
+            if failure.wait_for(|failed| *failed).await.is_err() {
+                return;
+            }
+            if let Some(owner) = owner.upgrade() {
+                let mut devices = owner.lock().await;
+                if devices.serving && devices.owned_id == Some(id) {
+                    devices.serving = false;
+                    afs_logging::error!("overlaybd.queue_failed"; "device_id" => id);
+                    if let Err(error) = devices.stop_failed_device(id).await {
+                        afs_logging::error!("overlaybd.queue_stop_failed"; "device_id" => id, "error" => error.to_string());
+                    }
+                }
+            }
+        })));
+        self.serving = true;
+        Ok(())
     }
 
     pub(super) async fn acquire(
@@ -153,7 +208,7 @@ impl Devices {
             .clone()
             .ok_or_else(|| io::Error::other("missing device journal"))?;
         // The mount alone does not prove that its userspace queue is alive.
-        if !self.serving {
+        if !self.can_serve() {
             return Err(io::Error::other(
                 "OverlayBD backend has no active device; recovery pending or old instances must be released",
             ));
@@ -170,6 +225,9 @@ impl Devices {
             return Err(io::Error::other(
                 "OverlayBD acquire expired during device startup",
             ));
+        }
+        if !self.can_serve() {
+            return Err(io::Error::other("OverlayBD queue failed during acquire"));
         }
         if journal.refs.insert(runtime_id) {
             self.persist(journal)?;
@@ -230,7 +288,7 @@ impl Devices {
         if let Err(error) = self.recover_recorded_device(id, binding, deadline).await {
             // Never stop an ID that may now name a different device.
             if Self::is_recorded_device(&journal, binding).unwrap_or(false)
-                && let Err(stop) = self.stop_failed_recovery(id).await
+                && let Err(stop) = self.stop_failed_device(id).await
             {
                 return Err(io::Error::other(format!("{error}; stop failed: {stop}")));
             }
@@ -304,30 +362,60 @@ impl Devices {
         self.owned_id = Some(id);
         self.device = Some(device);
         resumed.map_err(backend_error)?;
-        self.serving = true;
+        self.publish_serving()
+    }
+
+    async fn stop_failed_device(&mut self, id: u32) -> io::Result<()> {
+        // STOP completes queued reads with EIO. DEL can wait for the sandbox
+        // to close its rootfs, so leave deletion to the last release.
+        self.stop_and_drain(id).await?;
+        afs_logging::warn!("overlaybd.failed_device_stopped"; "device_id" => id);
         Ok(())
     }
 
-    async fn stop_failed_recovery(&mut self, id: u32) -> io::Result<()> {
-        let mut control = UVMUblkCtrlBuilder::new()
-            .dev_id(id)
-            .build(self.control_ring())
-            .map_err(backend_error)?;
-        // STOP completes queued reads with EIO. DEL can wait for the sandbox
-        // to close its rootfs, so leave deletion to the last release.
-        let stop = tokio::spawn(async move { control.stop_dev().await });
-        timeout(STOP_TIMEOUT, stop)
-            .await
-            .map_err(backend_error)?
-            .map_err(backend_error)?
-            .map_err(backend_error)?;
+    async fn stop_and_drain(&mut self, id: u32) -> io::Result<()> {
+        if let Some(device) = &self.device {
+            device.begin_queue_stop();
+        }
+        if self.pending_stop.is_none() {
+            let mut control = UVMUblkCtrlBuilder::new()
+                .dev_id(id)
+                .build(self.control_ring())
+                .map_err(backend_error)?;
+            self.pending_stop = Some(tokio::spawn(async move {
+                match control.stop_dev().await {
+                    Ok(()) => Ok(()),
+                    Err(error)
+                        if error.root_cause().downcast_ref::<io::Error>().is_some_and(
+                            |cause| {
+                                matches!(cause.raw_os_error(), Some(libc::ENODEV | libc::EINVAL))
+                            },
+                        ) =>
+                    {
+                        Ok(())
+                    }
+                    Err(error) => Err(backend_error(error)),
+                }
+            }));
+        }
+        self.await_pending_stop().await?;
         if let Some(device) = &self.device {
             device
                 .stop_queue_workers(Instant::now() + STOP_TIMEOUT)
                 .await
                 .map_err(backend_error)?;
         }
-        afs_logging::warn!("overlaybd.recovery_stopped"; "device_id" => id);
+        Ok(())
+    }
+
+    async fn await_pending_stop(&mut self) -> io::Result<()> {
+        if let Some(stop) = self.pending_stop.as_mut() {
+            // Keep the same command and its control fd alive on timeout. The
+            // next cleanup must finish it before deleting/reusing the ID.
+            let result = timeout(STOP_TIMEOUT, stop).await.map_err(backend_error)?;
+            self.pending_stop = None;
+            result.map_err(backend_error)??;
+        }
         Ok(())
     }
 
@@ -413,13 +501,16 @@ impl Devices {
         let id = device.dev_id();
         self.device = Some(device);
         self.owned_id = Some(id);
-        if let Err(error) = self.activate(mount, id, recovery).await {
+        if let Err(error) = self
+            .activate(mount, id, recovery)
+            .await
+            .and_then(|()| self.publish_serving())
+        {
             if let Err(cleanup) = self.cleanup().await {
                 return Err(io::Error::other(format!("{error}; cleanup: {cleanup}")));
             }
             return Err(error);
         }
-        self.serving = true;
         Ok(())
     }
 
@@ -471,6 +562,10 @@ impl Devices {
 
     async fn cleanup(&mut self) -> io::Result<()> {
         self.serving = false;
+        // The monitor and cleanup serialize through Devices. Discard a waiter
+        // before releasing this device ID to the kernel for reuse.
+        self.monitor = None;
+        self.await_pending_stop().await?;
         let mount = self.mount_path();
         if let Some(source) = mounted_source(&mount).await? {
             let id = self.journal.as_ref().map(|journal| journal.device_id);
@@ -491,22 +586,8 @@ impl Devices {
             _ => None,
         };
         if let Some(id) = self.owned_id.or(orphan_id) {
-            if let Some(device) = &mut self.device {
-                let stop = timeout(STOP_TIMEOUT, device.ctrl.stop_dev()).await;
-                let drained = device
-                    .stop_queue_workers(Instant::now() + STOP_TIMEOUT)
-                    .await;
-                drained.map_err(backend_error)?;
-                if let Ok(Err(error)) = stop
-                    && error
-                        .root_cause()
-                        .downcast_ref::<io::Error>()
-                        .is_none_or(|cause| {
-                            !matches!(cause.raw_os_error(), Some(libc::ENODEV | libc::EINVAL))
-                        })
-                {
-                    return Err(backend_error(error));
-                }
+            if self.device.is_some() {
+                self.stop_and_drain(id).await?;
                 self.device = None;
             }
             let mut ctrl = UVMUblkCtrlBuilder::new()

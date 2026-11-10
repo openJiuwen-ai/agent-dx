@@ -111,7 +111,7 @@ impl OverlaybdConnector {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let service = Arc::new(Mutex::new(device::Devices::open(self.config.clone())?));
+        let service = device::Devices::shared(self.config.clone())?;
         let admission = Arc::new(Semaphore::new(CONTROL_CONCURRENCY));
         let listener = UnixListener::bind(&socket)?;
         let recovery = self.config.recover_on_restart.then(|| {

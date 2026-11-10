@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tokio::sync::{oneshot, watch, Notify};
+use tokio::sync::{oneshot, watch};
 use tokio::time::{timeout_at, Duration, Instant};
 
 use crate::{AutoRegBuffer, IOBuffer, UVMUblkCtrl, UVMUblkQueue, UserBuffer, UBLK_QUEUE_URING};
@@ -144,7 +144,7 @@ impl<T: UVMUblkTarget> UVMUblkDevBuilder<T> {
                 cdev_file: cdev,
                 queue_threads: Mutex::new(vec![]),
                 queue_stop: watch::channel(false).0,
-                queue_exited: Notify::new(),
+                queue_failed: watch::channel(false).0,
             }),
             tgt: Arc::new(tgt),
         })
@@ -194,7 +194,7 @@ pub struct UVMUblkDevInner {
     pub cdev_file: std::fs::File,
     pub queue_threads: Mutex<Vec<oneshot::Receiver<Result<()>>>>,
     queue_stop: watch::Sender<bool>,
-    queue_exited: Notify,
+    queue_failed: watch::Sender<bool>,
 }
 
 impl Drop for UVMUblkDevInner {
@@ -338,7 +338,9 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
             .name(format!("ublk-q-{}-{qid}", dev_info.dev_id))
             .spawn(move || {
                 let res = Self::queue_work(inner.clone(), tgt, qid, dev_info, ready);
-                inner.queue_exited.notify_one();
+                if !*inner.queue_stop.borrow() {
+                    inner.queue_failed.send_replace(true);
+                }
                 let _ = tx.send(res);
             })
             .map(|_| ())
@@ -420,9 +422,10 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
         deadline: Instant,
         control: impl std::future::Future<Output = Result<()>>,
     ) -> Result<()> {
+        let mut failure = inner.queue_failed.subscribe();
         tokio::select! {
             biased;
-            _ = inner.queue_exited.notified() => bail!("ublk queue failed during activation"),
+            _ = failure.wait_for(|failed| *failed) => bail!("ublk queue failed during activation"),
             result = timeout_at(deadline, control) => result.context("ublk queue activation deadline")?,
         }
     }
@@ -560,8 +563,21 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
         self.ctrl.dev_info.dev_id
     }
 
-    pub async fn stop_queue_workers(&self, deadline: Instant) -> Result<()> {
+    /// Sticky fault state, visible even to a subscriber installed after activation.
+    pub fn queue_failure(&self) -> watch::Receiver<bool> {
+        self.inner.queue_failed.subscribe()
+    }
+
+    pub fn queues_are_healthy(&self) -> bool {
+        !*self.inner.queue_failed.borrow() && !*self.inner.queue_stop.borrow()
+    }
+
+    pub fn begin_queue_stop(&self) {
         self.inner.queue_stop.send_replace(true);
+    }
+
+    pub async fn stop_queue_workers(&self, deadline: Instant) -> Result<()> {
+        self.begin_queue_stop();
         loop {
             let task = self
                 .inner
