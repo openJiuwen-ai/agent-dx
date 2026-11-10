@@ -230,7 +230,10 @@ impl DistributedFs {
             }
         }
 
-        let can_fill = self.lazy_fill_registry.resolve(&source.binding.kind).is_ok();
+        let can_fill = self
+            .lazy_fill_registry
+            .resolve(&source.binding.kind)
+            .is_ok();
         let mut retries = 2;
         loop {
             if Instant::now() >= deadline {

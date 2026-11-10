@@ -20,9 +20,7 @@ pub(super) fn load_token_hash(path: &FilePath) -> Result<[u8; 32]> {
         .take(4097)
         .read_to_string(&mut secret)?;
     let token = secret.trim();
-    if secret.len() > 4096
-        || token.len() < 32
-        || !token.bytes().all(|byte| byte.is_ascii_graphic())
+    if secret.len() > 4096 || token.len() < 32 || !token.bytes().all(|byte| byte.is_ascii_graphic())
     {
         return Err(Error::coded(
             afs_error::CONFIG_INVALID,
@@ -63,7 +61,9 @@ async fn require_access(
         Sha256::digest(token)
             .iter()
             .zip(expected)
-            .fold(0, |different, (actual, expected)| different | (actual ^ expected))
+            .fold(0, |different, (actual, expected)| {
+                different | (actual ^ expected)
+            })
             == 0
     });
     if local || authorized {
@@ -229,6 +229,53 @@ fn parse_range(range: Option<&str>, size: u64) -> Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Method;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn nydus_access_uses_socket_peer_and_checks_remote_token() {
+        const TOKEN: &str = "test-nydus-token-0000000000000000";
+        let routes = Router::new()
+            .route("/blob", get(|| async { StatusCode::OK }))
+            .route_layer(middleware::from_fn_with_state(
+                Some(<[u8; 32]>::from(Sha256::digest(TOKEN))),
+                require_access,
+            ));
+        for (method, peer, token, expected) in [
+            (Method::HEAD, None, None, StatusCode::FORBIDDEN),
+            (Method::GET, Some("127.0.0.1:5400"), None, StatusCode::OK),
+            (
+                Method::HEAD,
+                Some("192.0.2.1:5400"),
+                Some("invalid"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Method::GET,
+                Some("192.0.2.1:5400"),
+                Some(TOKEN),
+                StatusCode::OK,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method(method)
+                .uri("/blob")
+                .header("X-Forwarded-For", "127.0.0.1");
+            if let Some(peer) = peer {
+                request = request.extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            }
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = routes
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+    }
+
     #[test]
     fn nydus_single_range_contract() {
         assert_eq!(parse_range(None, 10).unwrap(), (0, 10));

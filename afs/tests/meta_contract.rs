@@ -360,12 +360,17 @@ async fn dfs_write_authority_observation_does_not_acquire_expired_lease() {
         .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
     assert_eq!(backend.observed_commit().0, commits);
-    assert!(store
-        .read(MetaRead::RequestOutcome(RequestKey::new("node-b", "observe-expired")))
-        .await
-        .unwrap()
-        .request_outcome
-        .is_none());
+    assert!(
+        store
+            .read(MetaRead::RequestOutcome(RequestKey::new(
+                "node-b",
+                "observe-expired"
+            )))
+            .await
+            .unwrap()
+            .request_outcome
+            .is_none()
+    );
 }
 
 #[tokio::test]
