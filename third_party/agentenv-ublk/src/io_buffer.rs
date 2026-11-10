@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use io_uring::{opcode, types};
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cell::OnceCell;
 use std::ops::Range;
 use std::rc::Rc;
@@ -128,7 +128,9 @@ impl UserBufferInner {
         if layout.size() == 0 {
             bail!("UserBufferInner size cannot be zero");
         }
-        let ptr = unsafe { alloc(layout) };
+        // SAFETY: size and alignment were validated above. Initialize all bytes
+        // before exposing the registered allocation as a Rust slice.
+        let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             bail!("allocate UserBufferInner failed, size = {size} align = {align}");
         }
@@ -151,19 +153,10 @@ impl UserBufferInner {
     /// # Panic
     /// Panic if try to access a sub slice out of range.
     ///
-    /// # Safety
-    /// Users should make sure there at most one that access the sub slice in the requested range.
-    #[allow(clippy::mut_from_ref)]
-    pub fn subslice_mut(&self, offset: u64, len: usize) -> &mut [u8] {
-        let offset = offset as usize;
-        assert!(
-            offset + len <= self.len(),
-            "offset {offset} len = {len} out of range"
-        );
-        unsafe {
-            let ptr = self.ptr.add(offset);
-            std::slice::from_raw_parts_mut(ptr, len)
-        }
+    pub fn subslice_mut(&mut self, offset: u64, len: usize) -> &mut [u8] {
+        let ptr = self.ptr_at(offset, len);
+        // SAFETY: the checked range belongs to this exclusively borrowed buffer.
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 
     /// Return a sub slice started from `offset`, span `len`.
@@ -171,19 +164,16 @@ impl UserBufferInner {
     /// # Panic
     /// Panic if try to access a sub slice out of range.
     ///
-    /// # Safety
-    /// Users should make sure there are no others that mutablely access
-    /// the requested range via [subslice_mut](Self::subslice_mut).
     pub fn subslice(&self, offset: u64, len: usize) -> &[u8] {
-        let offset = offset as usize;
-        assert!(
-            offset + len <= self.len(),
-            "offset {offset} len = {len} out of range"
-        );
-        unsafe {
-            let ptr = self.ptr.add(offset);
-            std::slice::from_raw_parts(ptr as _, len)
-        }
+        let ptr = self.ptr_at(offset, len);
+        // SAFETY: the checked range belongs to this shared buffer borrow.
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+
+    fn ptr_at(&self, offset: u64, len: usize) -> *mut u8 {
+        assert!(len <= self.len() && offset <= (self.len() - len) as u64);
+        // SAFETY: the assertion bounds the pointer and the requested range.
+        unsafe { self.ptr.add(offset as usize) }
     }
 
     pub fn len(&self) -> usize {
@@ -193,13 +183,20 @@ impl UserBufferInner {
 
 impl Drop for UserBufferInner {
     fn drop(&mut self) {
+        if let Some(&buf_idx) = self.buf_idx.get() {
+            if let Err(error) = self.ring.unregister_buffer(buf_idx) {
+                // The kernel may still have this address registered. Keep the
+                // allocation alive if unregister did not succeed.
+                tracing::error!(buf_idx, ?error, "failed to unregister ublk buffer");
+                return;
+            }
+        }
         if self.layout.size() != 0 {
+            // SAFETY: the original allocation has been unregistered. Slot
+            // teardown waits for operations using it before dropping it.
             unsafe {
                 dealloc(self.ptr, self.layout);
             }
-        }
-        if let Some(buf_idx) = self.buf_idx.get().cloned() {
-            let _ = self.ring.unregister_buffer(buf_idx);
         }
     }
 }
@@ -213,15 +210,13 @@ impl AsMut<[u8]> for UserBufferInner {
 /// A buffer that has been registered into io uring,
 /// and setup its alignment, suitable for IO request.
 pub struct UserBuffer {
-    inner: Rc<UserBufferInner>,
+    inner: UserBufferInner,
 }
 
 impl UserBuffer {
     pub async fn new(ring: AsyncIoRing, size: usize, align: usize) -> Result<Self> {
         let inner = UserBufferInner::new(ring, size, align).await?;
-        Ok(Self {
-            inner: Rc::new(inner),
-        })
+        Ok(Self { inner })
     }
 
     /// Return a **mutable** sub slice started from `offset`, and len = `len`.
@@ -229,11 +224,19 @@ impl UserBuffer {
     /// # Panic
     /// Panic if try to access a sub slice out of range.
     ///
-    /// # Safety
-    /// Users should make sure there at most one that access the sub slice in the requested range.
-    #[allow(clippy::mut_from_ref)]
-    pub fn subslice_mut(&self, offset: u64, len: usize) -> &mut [u8] {
+    /// ```compile_fail
+    /// fn borrow_through_shared_reference(buffer: &uvm_ublk::UserBuffer) -> &mut [u8] {
+    ///     buffer.subslice_mut(0, 1)
+    /// }
+    /// ```
+    pub fn subslice_mut(&mut self, offset: u64, len: usize) -> &mut [u8] {
         self.inner.subslice_mut(offset, len)
+    }
+
+    /// Raw address for a checked range. The caller must keep it alive and
+    /// arrange exclusive access for a kernel write until completion.
+    pub(crate) fn ptr_at(&self, offset: u64, len: usize) -> *mut u8 {
+        self.inner.ptr_at(offset, len)
     }
 
     /// Return a sub slice started from `offset`, span `len`.
@@ -241,9 +244,6 @@ impl UserBuffer {
     /// # Panic
     /// Panic if try to access a sub slice out of range.
     ///
-    /// # Safety
-    /// Users should make sure there are no others that mutablely access
-    /// the requested range via [subslice_mut](Self::subslice_mut).
     pub fn subslice(&self, offset: u64, len: usize) -> &[u8] {
         self.inner.subslice(offset, len)
     }
@@ -335,8 +335,8 @@ impl UserBuffer {
     /// Copy from `src` into this user buffer at `offset`.
     ///
     /// Return error if it will copy out of range.
-    pub fn copy_from(&self, src: &[u8], offset: u64) -> Result<()> {
-        if offset as usize + src.len() > self.len() {
+    pub fn copy_from(&mut self, src: &[u8], offset: u64) -> Result<()> {
+        if src.len() > self.len() || offset > (self.len() - src.len()) as u64 {
             bail!(
                 "try copy exceed the user buffer, offset = {offset}, len = {}",
                 src.len()
@@ -355,9 +355,9 @@ pub enum IOBuffer {
 }
 
 /// A subslice of the IOBuffer
-pub struct IOBufferView {
-    pub buffer: IOBuffer,
-    pub range: Range<usize>,
+pub struct IOBufferView<'a> {
+    buffer: &'a IOBuffer,
+    range: Range<usize>,
 }
 
 impl IOBuffer {
@@ -379,17 +379,6 @@ impl IOBuffer {
         }
     }
 
-    fn dup(&mut self) -> Self {
-        match self {
-            IOBuffer::AutoReg(auto_buf) => IOBuffer::AutoReg(AutoRegBuffer {
-                inner: auto_buf.inner.clone(),
-            }),
-            IOBuffer::User(user_buf) => IOBuffer::User(UserBuffer {
-                inner: user_buf.inner.clone(),
-            }),
-        }
-    }
-
     pub fn ring(&self) -> &AsyncIoRing {
         match self {
             Self::AutoReg(auto_buf) => &auto_buf.inner.ring,
@@ -401,23 +390,23 @@ impl IOBuffer {
     /// is [mid, len).
     ///
     /// Returns `None` if mid > buffer length.
-    pub fn split_at(&mut self, mid: usize) -> Option<(IOBufferView, IOBufferView)> {
+    pub fn split_at(&mut self, mid: usize) -> Option<(IOBufferView<'_>, IOBufferView<'_>)> {
         if mid > self.len() {
             return None;
         }
         let first = IOBufferView {
-            buffer: self.dup(),
+            buffer: self,
             range: (0..mid),
         };
         let second = IOBufferView {
-            buffer: self.dup(),
+            buffer: self,
             range: (mid..self.len()),
         };
         Some((first, second))
     }
 }
 
-impl IOBufferView {
+impl IOBufferView<'_> {
     pub fn io_ring(&self) -> &AsyncIoRing {
         self.buffer.ring()
     }
@@ -435,13 +424,13 @@ impl IOBufferView {
     /// is [offset, len).
     ///
     /// Returns `None` if offset >= view length.
-    pub fn split_at(self, mid: usize) -> Option<(IOBufferView, IOBufferView)> {
+    pub fn split_at(self, mid: usize) -> Option<(Self, Self)> {
         if mid > self.len() {
             return None;
         }
-        let IOBufferView { mut buffer, range } = self;
+        let IOBufferView { buffer, range } = self;
         let first = IOBufferView {
-            buffer: buffer.dup(),
+            buffer,
             range: range.start..range.start + mid,
         };
         let second = IOBufferView {
@@ -454,8 +443,12 @@ impl IOBufferView {
     /// Write the data from file into this io buffer view, filling the entire io buffer.
     /// - `io_ring_file_idx`: The index of the file registerred to io uring.
     /// - `offset`: The file offset to read, in bytes.
-    pub async fn read_all_from_fixed(
-        &self,
+    ///
+    /// # Safety
+    /// The caller must let the operation complete or drain its kernel requests
+    /// before accessing or releasing the buffer.
+    pub async unsafe fn read_all_from_fixed(
+        &mut self,
         io_ring_file_idx: u32,
         offset: u64,
     ) -> std::io::Result<usize> {
@@ -486,7 +479,11 @@ impl IOBufferView {
     /// Write the all data in this io buffer view into file.
     /// - `io_ring_file_idx`: The index of the file registerred to io uring.
     /// - `offset`: The file offset to write, in bytes.
-    pub async fn write_all_into_fixed(
+    ///
+    /// # Safety
+    /// The caller must let the operation complete or drain its kernel requests
+    /// before modifying or releasing the buffer.
+    pub async unsafe fn write_all_into_fixed(
         &self,
         io_ring_file_idx: u32,
         offset: u64,

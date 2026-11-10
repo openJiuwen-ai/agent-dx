@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use io_uring::opcode::AsyncCancel;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -9,7 +10,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::{timeout_at, Duration, Instant};
 
 use crate::{AutoRegBuffer, IOBuffer, UVMUblkCtrl, UVMUblkQueue, UserBuffer, UBLK_QUEUE_URING};
-use storage_util::io_ring::AsyncIoRing;
+use storage_util::io_ring::{AsyncIoRing, RingFuture};
 
 pub struct UVMUblkDevBuilder<T: UVMUblkTarget> {
     ctrl: UVMUblkCtrl,
@@ -203,7 +204,42 @@ impl Drop for UVMUblkDevInner {
     }
 }
 
+impl UVMUblkDevInner {
+    fn signal_queue_failure(&self) {
+        if self.queue_stop.send_if_modified(|stop| {
+            if *stop {
+                false
+            } else {
+                *stop = true;
+                true
+            }
+        }) {
+            self.queue_failed.send_replace(true);
+        }
+    }
+}
+
 impl UVMUblkQueue {
+    async fn wait_for_fetch(
+        &self,
+        mut fetch: RingFuture,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Option<i32> {
+        tokio::select! {
+            biased;
+            res = &mut fetch => (!*stop.borrow()).then_some(res),
+            _ = async { let _ = stop.wait_for(|stopping| *stopping).await; } => {
+                let cancel = AsyncCancel::new(fetch.as_user_data()).build();
+                if let Ok(cancel) = self.ring.send(cancel) {
+                    let _ = cancel.await;
+                }
+                // Keep the slot buffer until the original command completes.
+                let _ = fetch.await;
+                None
+            }
+        }
+    }
+
     /// The job for each slot within the queue.
     /// - `tag`: a slot id within the the queue (corresponding to the depth).
     async fn slot_task<T: UVMUblkTarget>(
@@ -211,7 +247,12 @@ impl UVMUblkQueue {
         tag: u16,
         tgt: Arc<T>,
         readiness: Option<Rc<QueueReadiness>>,
+        device: Arc<UVMUblkDevInner>,
     ) -> Result<()> {
+        let mut stop = device.queue_stop.subscribe();
+        if *stop.borrow() {
+            return Ok(());
+        }
         let bufsize = self.dev_info.max_io_buf_bytes;
         let mut buf = if self.is_zero_copy() {
             IOBuffer::AutoReg(
@@ -244,16 +285,24 @@ impl UVMUblkQueue {
             let remaining = readiness.remaining.get() - 1;
             readiness.remaining.set(remaining);
             if remaining == 0 {
-                self.ring
+                let submitted = self
+                    .ring
                     .borrow()
                     .submit()
-                    .context("submit recovery fetches")?;
+                    .context("submit recovery fetches");
+                if let Err(error) = submitted {
+                    device.signal_queue_failure();
+                    let _ = self.wait_for_fetch(pending, &mut stop).await;
+                    return Err(error);
+                }
                 if let Some(sender) = readiness.sender.borrow_mut().take() {
                     let _ = sender.send(());
                 }
             }
         }
-        let res = pending.await;
+        let Some(res) = self.wait_for_fetch(pending, &mut stop).await else {
+            return Ok(());
+        };
         if res < 0 {
             tracing::debug!(
                 tag,
@@ -282,10 +331,16 @@ impl UVMUblkQueue {
                     &self.ring,
                 )
                 .await;
-            let res = self
+            // Let target I/O finish without dropping its borrowed buffers.
+            if *stop.borrow() {
+                return Ok(());
+            }
+            let fetch = self
                 .submit_and_fetch_for_slot(tag, &buf, res)
-                .context("submit and fetch from ring")?
-                .await;
+                .context("submit and fetch from ring")?;
+            let Some(res) = self.wait_for_fetch(fetch, &mut stop).await else {
+                return Ok(());
+            };
             // FIXME: should we handle EINTR?
             if res < 0 {
                 tracing::debug!(
@@ -338,9 +393,7 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
             .name(format!("ublk-q-{}-{qid}", dev_info.dev_id))
             .spawn(move || {
                 let res = Self::queue_work(inner.clone(), tgt, qid, dev_info, ready);
-                if !*inner.queue_stop.borrow() {
-                    inner.queue_failed.send_replace(true);
-                }
+                inner.signal_queue_failure();
                 let _ = tx.send(res);
             })
             .map(|_| ())
@@ -371,40 +424,41 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
             .build()
             .context("build tokio runtime when spawn queue workers")?;
         let local_set = tokio::task::LocalSet::new();
-        let mut stop = inner.queue_stop.subscribe();
         local_set.block_on(&rt, async {
-            let run = async {
-                let queue = UVMUblkQueue::new(qid, dev_info, &inner.cdev_file)
-                    .context("create uvm ublk queue")?;
-                tgt.init(qid, &queue.ring)
-                    .await
-                    .context("init target for uvm ublk queue")?;
-                let queue = Rc::new(queue);
-                let readiness = ready.map(|sender| {
-                    Rc::new(QueueReadiness {
-                        remaining: Cell::new(queue.iodepth()),
-                        sender: RefCell::new(Some(sender)),
-                    })
-                });
-                let mut slots = tokio::task::JoinSet::new();
-                for tag in 0..queue.iodepth() as u16 {
-                    let tgt = tgt.clone();
-                    let queue = queue.clone();
-                    slots.spawn_local(queue.slot_task(tag, tgt, readiness.clone()));
-                }
-                drop(readiness);
-                // Dropping the JoinSet on a fatal CQE cancels sibling fetches.
-                // Leaving those fetches alive could hide the first failure.
-                while let Some(result) = slots.join_next().await {
-                    result.context("join ublk slot")??;
-                }
-                Ok(())
-            };
-            tokio::select! {
-                biased;
-                _ = stop.wait_for(|stopping| *stopping) => Ok(()),
-                result = run => result,
+            if *inner.queue_stop.borrow() {
+                return Ok(());
             }
+            let queue = Rc::new(
+                UVMUblkQueue::new(qid, dev_info, &inner.cdev_file)
+                    .context("create uvm ublk queue")?,
+            );
+            tgt.init(qid, &queue.ring)
+                .await
+                .context("init target for uvm ublk queue")?;
+            let readiness = ready.map(|sender| {
+                Rc::new(QueueReadiness {
+                    remaining: Cell::new(queue.iodepth()),
+                    sender: RefCell::new(Some(sender)),
+                })
+            });
+            let mut slots = tokio::task::JoinSet::new();
+            for tag in 0..queue.iodepth() as u16 {
+                slots.spawn_local(queue.clone().slot_task(
+                    tag,
+                    tgt.clone(),
+                    readiness.clone(),
+                    inner.clone(),
+                ));
+            }
+            drop(readiness);
+            let mut first_error = None;
+            while let Some(result) = slots.join_next().await {
+                if let Err(error) = result.context("join ublk slot").and_then(|result| result) {
+                    inner.signal_queue_failure();
+                    first_error.get_or_insert(error);
+                }
+            }
+            first_error.map_or(Ok(()), Err)
         })
     }
 

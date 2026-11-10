@@ -347,13 +347,15 @@ impl BasicCowTarget {
             match result {
                 Ok((expect, read)) => {
                     read_bytes += read;
-                    // partial read, we return immediately
+                    // Drain sibling I/O before the caller can reuse its buffer.
                     if expect != read {
+                        while futs.next().await.is_some() {}
                         return read_bytes as i32;
                     }
                 }
                 Err(err) => {
                     tracing::error!(?err, "read failed");
+                    while futs.next().await.is_some() {}
                     return -err.raw_os_error().unwrap_or(libc::EIO);
                 }
             }
@@ -387,15 +389,12 @@ impl BasicCowTarget {
                     len,
                     auto_buf.as_ublk_auto_buf_reg().index,
                 ),
-                IOBuffer::User(user_buf) => {
-                    let slice = user_buf.subslice_mut(buf_offset, len as _);
-                    opcode::ReadFixed::new(
-                        Fixed(file_idx),
-                        slice.as_mut_ptr(),
-                        len,
-                        user_buf.uring_buf_idx(),
-                    )
-                }
+                IOBuffer::User(user_buf) => opcode::ReadFixed::new(
+                    Fixed(file_idx),
+                    user_buf.ptr_at(buf_offset, len as usize),
+                    len,
+                    user_buf.uring_buf_idx(),
+                ),
             }
             .offset(start)
             .build();
@@ -462,11 +461,13 @@ impl BasicCowTarget {
                 Ok((expect, write)) => {
                     written_bytes += write;
                     if expect != write {
+                        while futs.next().await.is_some() {}
                         return written_bytes as i32;
                     }
                 }
                 Err(err) => {
                     tracing::error!(?err, "write failed");
+                    while futs.next().await.is_some() {}
                     return -err.raw_os_error().unwrap_or(libc::EIO);
                 }
             }
@@ -657,10 +658,12 @@ impl BasicCowTarget {
                 }
                 Ok(res) => {
                     tracing::error!(res, target, mark, "write to the cow file only partially");
+                    while futs.next().await.is_some() {}
                     return Err(std::io::Error::from_raw_os_error(libc::EIO));
                 }
                 Err(err) => {
                     tracing::error!(?err, target, mark, "write to the cow file failed");
+                    while futs.next().await.is_some() {}
                     return Err(err);
                 }
             }
@@ -698,15 +701,12 @@ impl BasicCowTarget {
                     len,
                     auto_buf.as_ublk_auto_buf_reg().index,
                 ),
-                IOBuffer::User(user_buf) => {
-                    let slice = user_buf.subslice_mut(buf_offset, len as _);
-                    opcode::WriteFixed::new(
-                        Fixed(file_idx),
-                        slice.as_mut_ptr(),
-                        len,
-                        user_buf.uring_buf_idx(),
-                    )
-                }
+                IOBuffer::User(user_buf) => opcode::WriteFixed::new(
+                    Fixed(file_idx),
+                    user_buf.ptr_at(buf_offset, len as usize),
+                    len,
+                    user_buf.uring_buf_idx(),
+                ),
             }
             .offset(start)
             .build();
@@ -974,7 +974,7 @@ mod test {
                 )
                 .await;
             assert_eq!(res, nr_sectors as i32 * 512);
-            let buf = match &self.buf {
+            let buf = match &mut self.buf {
                 IOBuffer::User(buf) => buf.subslice_mut(0, nr_sectors * 512),
                 _ => panic!("invalid IOBuffer type"),
             };
@@ -1042,7 +1042,7 @@ mod test {
                 let read_op = rng.random_bool(0.5);
                 if !read_op {
                     // random fill the write buffer
-                    let buf = match &env.buf {
+                    let buf = match &mut env.buf {
                         IOBuffer::User(buf) => buf.subslice_mut(0, IO_BUF_SIZE_KB << 10),
                         _ => panic!("invalid IOBuffer type"),
                     };
@@ -1093,7 +1093,7 @@ mod test {
                 let read_op = rng.random_bool(0.5);
                 if !read_op {
                     // random fill the write buffer
-                    let buf = match &env.buf {
+                    let buf = match &mut env.buf {
                         IOBuffer::User(buf) => buf.subslice_mut(0, IO_BUF_SIZE_KB << 10),
                         _ => panic!("invalid IOBuffer type"),
                     };
