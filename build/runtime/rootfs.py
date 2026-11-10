@@ -73,10 +73,12 @@ def extract_base(archive, root):
             if member.islnk():
                 target = archive_name(member.linkname)
                 visited = {name}
-                while target in indexed and indexed[target].islnk() and target not in visited:
+                target_member = indexed.get(target)
+                while target_member is not None and target_member.islnk() and target not in visited:
                     visited.add(target)
-                    target = archive_name(indexed[target].linkname)
-                if target not in indexed or not indexed[target].isfile():
+                    target = archive_name(target_member.linkname)
+                    target_member = indexed.get(target)
+                if target_member is None or not target_member.isfile():
                     raise ValueError(f'invalid base archive hardlink: {name}')
                 if any(parent in links for parent in target.parents):
                     raise ValueError(f'base archive hardlink traverses a symlink: {name}')

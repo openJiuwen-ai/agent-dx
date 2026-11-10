@@ -56,38 +56,42 @@ def fixture(base):
 class RuntimeRootfsTests(unittest.TestCase):
     def test_distribution_and_non_root_permissions_survive_builder_umask(self):
         for mask in (0o022, 0o027, 0o077):
-            with self.subTest(umask=oct(mask)), tempfile.TemporaryDirectory() as directory:
-                base = Path(directory)
-                source, archive, binary = fixture(base)
-                observed = []
+            with self.subTest(umask=oct(mask)):
+                self.check_builder_umask(mask)
 
-                def inspect_image(command, binary=binary, observed=observed, **_kwargs):
-                    if command[0] != '/mock/mkfs.erofs':
-                        return
-                    root = Path(command[-1])
-                    self.assertEqual((root / 'bin/bash').read_bytes(), b'distribution-bash')
-                    self.assertEqual((root / 'bin/chown').read_bytes(), b'distribution-chown')
-                    self.assertEqual(stat.S_IMODE((root / 'root').stat().st_mode), 0o700)
-                    for name in ['.', 'usr', 'usr/local', 'usr/local/bin', '__adx']:
-                        self.assertEqual(stat.S_IMODE((root / name).stat().st_mode), 0o755, name)
-                    self.assertEqual(stat.S_IMODE((root / 'tmp').stat().st_mode), 0o1777)
-                    self.assertEqual((root / '__adx/usr').readlink(), Path('/usr'))
-                    self.assertEqual((root / 'usr/local/bin/adx-execd').read_bytes(), binary.read_bytes())
-                    observed.append(True)
-                    Path(command[-2]).write_bytes(b'EROFS fixture')
+    def check_builder_umask(self, mask):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source, archive, binary = fixture(base)
+            observed = []
 
-                old = os.umask(mask)
-                try:
-                    with patch.object(ROOTFS, 'SOURCE', source), patch.object(ROOTFS, 'static_executable'), \
-                         patch.object(ROOTFS, '_executable', side_effect=lambda name: '/mock/' + name), \
-                         patch.object(ROOTFS.subprocess, 'run', side_effect=inspect_image):
-                        ROOTFS.build(binary, base / 'runtime.img', base_archive=archive, target=TARGET)
-                finally:
-                    os.umask(old)
-                self.assertTrue(observed)
-                metadata = json.loads((base / 'runtime.json').read_text())
-                self.assertEqual(metadata['distribution'], 'openEuler')
-                self.assertEqual(metadata['rootfs_sha256'], hashlib.sha256(b'EROFS fixture').hexdigest())
+            def inspect_image(command, **_kwargs):
+                if command[0] != '/mock/mkfs.erofs':
+                    return
+                root = Path(command[-1])
+                self.assertEqual((root / 'bin/bash').read_bytes(), b'distribution-bash')
+                self.assertEqual((root / 'bin/chown').read_bytes(), b'distribution-chown')
+                self.assertEqual(stat.S_IMODE((root / 'root').stat().st_mode), 0o700)
+                for name in ['.', 'usr', 'usr/local', 'usr/local/bin', '__adx']:
+                    self.assertEqual(stat.S_IMODE((root / name).stat().st_mode), 0o755, name)
+                self.assertEqual(stat.S_IMODE((root / 'tmp').stat().st_mode), 0o1777)
+                self.assertEqual((root / '__adx/usr').readlink(), Path('/usr'))
+                self.assertEqual((root / 'usr/local/bin/adx-execd').read_bytes(), binary.read_bytes())
+                observed.append(True)
+                Path(command[-2]).write_bytes(b'EROFS fixture')
+
+            old = os.umask(mask)
+            try:
+                with patch.object(ROOTFS, 'SOURCE', source), patch.object(ROOTFS, 'static_executable'), \
+                     patch.object(ROOTFS, '_executable', side_effect=lambda name: str(Path('/mock') / name)), \
+                     patch.object(ROOTFS.subprocess, 'run', side_effect=inspect_image):
+                    ROOTFS.build(binary, base / 'runtime.img', base_archive=archive, target=TARGET)
+            finally:
+                os.umask(old)
+            self.assertTrue(observed)
+            metadata = json.loads((base / 'runtime.json').read_text())
+            self.assertEqual(metadata['distribution'], 'openEuler')
+            self.assertEqual(metadata['rootfs_sha256'], hashlib.sha256(b'EROFS fixture').hexdigest())
 
     def test_base_checksum_is_checked_before_extracting(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -126,3 +130,38 @@ class RuntimeRootfsTests(unittest.TestCase):
                 tar.addfile(entry, io.BytesIO(b'x'))
             with self.assertRaisesRegex(ValueError, 'archive'):
                 ROOTFS.extract_base(archive, base)
+
+    def test_archive_hardlink_chain_preserves_file_contents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            archive = base / 'hardlinks.tar'
+            with tarfile.open(archive, 'w') as tar:
+                entry = tarfile.TarInfo('file')
+                entry.size = 4
+                tar.addfile(entry, io.BytesIO(b'data'))
+                for name, target in [('alias', 'file'), ('chain', 'alias')]:
+                    entry = tarfile.TarInfo(name)
+                    entry.type, entry.linkname = tarfile.LNKTYPE, target
+                    tar.addfile(entry)
+            root = base / 'root'
+            ROOTFS.extract_base(archive, root)
+            self.assertEqual((root / 'chain').read_bytes(), b'data')
+            self.assertEqual((root / 'chain').stat().st_ino, (root / 'file').stat().st_ino)
+
+    def test_archive_invalid_hardlink_targets_are_rejected_before_extraction(self):
+        cases = [('missing', [('alias', 'absent')]),
+                 ('cycle', [('alias', 'other'), ('other', 'alias')]),
+                 ('self', [('alias', 'alias')])]
+        for name, links in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                archive = base / 'hardlinks.tar'
+                with tarfile.open(archive, 'w') as tar:
+                    for link, target in links:
+                        entry = tarfile.TarInfo(link)
+                        entry.type, entry.linkname = tarfile.LNKTYPE, target
+                        tar.addfile(entry)
+                root = base / 'root'
+                with self.assertRaisesRegex(ValueError, 'invalid base archive hardlink'):
+                    ROOTFS.extract_base(archive, root)
+                self.assertFalse(root.exists())

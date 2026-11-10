@@ -6,8 +6,21 @@ from adx_environment._command_watch import _CommandWaitManager
 from adx_environment.types import ConnectionConfig
 
 
-def _manager() -> _CommandWaitManager:
-    return _CommandWaitManager(
+class CommandWatchHarness(_CommandWaitManager):
+    """Expose deterministic transport controls only to the white-box tests."""
+
+    async def run_watch(self):
+        await self._run()
+
+    def subscriptions(self):
+        return self._desired()
+
+    def notify_terminal(self, key):
+        self._notify(key)
+
+
+def _manager() -> CommandWatchHarness:
+    return CommandWatchHarness(
         ConnectionConfig(
             server_address="ingress.example:443",
             token="token",
@@ -23,11 +36,11 @@ def test_async_waiters_share_manager_without_one_blocking_thread_per_waiter():
         with patch.object(manager, "_ensure_thread_locked"):
             wait = asyncio.create_task(manager.wait_async(*key, timeout=1))
             await asyncio.sleep(0)
-            assert manager._desired() == {key}
+            assert manager.subscriptions() == {key}
 
-            manager._notify(key)
+            manager.notify_terminal(key)
             await wait
-            assert manager._desired() == set()
+            assert manager.subscriptions() == set()
 
     asyncio.run(scenario())
 
@@ -46,7 +59,7 @@ def test_async_wait_cancellation_only_removes_local_subscription():
                 pass
             else:
                 raise AssertionError("cancelled wait must propagate cancellation")
-            assert manager._desired() == set()
+            assert manager.subscriptions() == set()
 
     asyncio.run(scenario())
 
@@ -65,7 +78,7 @@ def test_command_watch_preserves_legacy_frontend_auth():
             patch("websockets.asyncio.client.connect", side_effect=connect),
         ):
             try:
-                await manager._run()
+                await manager.run_watch()
             except asyncio.CancelledError:
                 pass
         assert captured["additional_headers"] == {"Authorization": "Bearer token", "X-Auth": "token"}
@@ -75,7 +88,7 @@ def test_command_watch_preserves_legacy_frontend_auth():
 
 def test_command_watch_tls_context_preserves_verification_setting():
     async def scenario(verify_tls):
-        manager = _CommandWaitManager(
+        manager = CommandWatchHarness(
             ConnectionConfig(server_address="ingress.example:443", token="token", use_tls=True, verify_tls=verify_tls)
         )
         captured = {}
@@ -89,7 +102,7 @@ def test_command_watch_tls_context_preserves_verification_setting():
             patch("websockets.asyncio.client.connect", side_effect=connect),
         ):
             try:
-                await manager._run()
+                await manager.run_watch()
             except asyncio.CancelledError:
                 pass
         context = captured["ssl"]
@@ -140,7 +153,7 @@ def test_successful_frontend_handshake_does_not_reset_downstream_outage_budget()
             patch("adx_environment._command_watch.asyncio.sleep", side_effect=backoff),
         ):
             try:
-                await manager._run()
+                await manager.run_watch()
             except asyncio.CancelledError:
                 pass
         assert attempts == 3
@@ -190,14 +203,14 @@ def test_new_subscription_wakes_idle_receiver_without_server_message():
         ):
             tasks.append(asyncio.create_task(manager.wait_async("env", "first", 5)))
             await asyncio.sleep(0)
-            tasks.append(asyncio.create_task(manager._run()))
+            tasks.append(asyncio.create_task(manager.run_watch()))
             try:
                 await asyncio.wait_for(first_sent.wait(), 1)
                 await asyncio.wait_for(receiving.wait(), 1)
                 await asyncio.sleep(0)
                 tasks.append(asyncio.create_task(manager.wait_async("env", "second", 5)))
                 await asyncio.wait_for(second_sent.wait(), 0.15)
-                assert manager._desired() == {("env", "first"), ("env", "second")}
+                assert manager.subscriptions() == {("env", "first"), ("env", "second")}
             finally:
                 for task in tasks:
                     task.cancel()
@@ -250,7 +263,7 @@ def test_command_watch_reconnect_resubscribes_without_submitting_commands():
         ):
             waiter = asyncio.create_task(manager.wait_async("env", "stable", 3))
             await asyncio.sleep(0)
-            runner = asyncio.create_task(manager._run())
+            runner = asyncio.create_task(manager.run_watch())
             try:
                 await waiter
                 assert attempts == 2
@@ -290,13 +303,13 @@ def test_cancelling_last_waiter_unsubscribes_without_waiting_for_a_message():
         ):
             waiter = asyncio.create_task(manager.wait_async("env", "cancelled", None))
             await asyncio.sleep(0)
-            runner = asyncio.create_task(manager._run())
+            runner = asyncio.create_task(manager.run_watch())
             try:
                 await asyncio.wait_for(subscribed.wait(), 1)
                 waiter.cancel()
                 await asyncio.gather(waiter, return_exceptions=True)
                 await asyncio.wait_for(unsubscribed.wait(), 0.15)
-                assert manager._desired() == set()
+                assert manager.subscriptions() == set()
             finally:
                 runner.cancel()
                 await asyncio.gather(runner, return_exceptions=True)
@@ -337,7 +350,7 @@ def test_concurrent_waiters_share_one_transport_and_observe_missing_state():
         ):
             waits = [asyncio.create_task(manager.wait_async("env", str(i), 2)) for i in range(20)]
             await asyncio.sleep(0)
-            runner = asyncio.create_task(manager._run())
+            runner = asyncio.create_task(manager.run_watch())
             try:
                 await asyncio.gather(*waits)
                 assert connections == 1

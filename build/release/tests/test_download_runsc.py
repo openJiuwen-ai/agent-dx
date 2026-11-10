@@ -10,10 +10,13 @@ import unittest
 from unittest.mock import patch
 
 RELEASE = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(RELEASE))
-SPEC = importlib.util.spec_from_file_location("download_runsc", RELEASE / "download_runsc.py")
-runsc = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(runsc)
+MANIFEST_SPEC = importlib.util.spec_from_file_location("package_manifest", RELEASE / "package_manifest.py")
+manifest = importlib.util.module_from_spec(MANIFEST_SPEC)
+MANIFEST_SPEC.loader.exec_module(manifest)
+with patch.dict(sys.modules, {"package_manifest": manifest}):
+    SPEC = importlib.util.spec_from_file_location("download_runsc", RELEASE / "download_runsc.py")
+    runsc = importlib.util.module_from_spec(SPEC)
+    SPEC.loader.exec_module(runsc)
 
 FILES = (
     "runsc", "containerd-shim-runsc-v1", "gvisor-bin/checkpointgofer",

@@ -128,11 +128,14 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
         provenance = json.loads((root / "runtime/adx-runtime-rootfs.json").read_text())
         pin = json.loads((root / "third_party/runtime-rootfs/source.json").read_text())
         base = pin["artifacts"].get(target, {})
-        if (provenance.get("target") != target or not base
-                or provenance.get("base_sha256") != base.get("sha256")
-                or provenance.get("manifest_digest") != base.get("manifest_digest")
-                or provenance.get("execd_sha256") != files["runtime/adx-execd"]
-                or provenance.get("rootfs_sha256") != files["runtime/adx-runtime-rootfs.img"]):
+        expected_provenance = {
+            "target": target,
+            "base_sha256": base.get("sha256"),
+            "manifest_digest": base.get("manifest_digest"),
+            "execd_sha256": files["runtime/adx-execd"],
+            "rootfs_sha256": files["runtime/adx-runtime-rootfs.img"],
+        }
+        if not base or any(provenance.get(key) != value for key, value in expected_provenance.items()):
             raise ValueError("runtime rootfs provenance mismatch")
 
     if with_sandboxd:
