@@ -525,7 +525,7 @@ impl DistributedFs {
             if state.write_session.is_some()
                 || state.opened_inode.kind != InodeKind::Regular
                 || state.pending_view.is_some()
-                || state.refresh_view
+                || state.refresh_view.is_some()
             {
                 return None;
             }

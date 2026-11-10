@@ -1342,3 +1342,165 @@ fn proxied_close_still_delivers_an_owner_write_error() {
     assert_eq!(pair.meta.inode.lock().unwrap().head_version, before);
     pair.fs_b.release(&context(), reader).unwrap();
 }
+
+#[test]
+fn review_proxied_close_retry_does_not_publish_an_independent_later_commit() {
+    let pair = remote_owner_pair("review-proxy-snapshot.bin", 0o640, b"base-data");
+    let reader = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDONLY)
+        .unwrap();
+    let writer = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDWR)
+        .unwrap();
+    assert!(
+        pair.fs_b
+            .write_coordinator
+            .current_remote_provider(&pair.inode_id)
+            .unwrap()
+            .is_some()
+    );
+    pair.fs_b.write(&context(), writer, 0, b"PROXIED").unwrap();
+    pair.fs_b.flush(&context(), writer).unwrap();
+    let proxied = pair
+        .meta
+        .inode
+        .lock()
+        .unwrap()
+        .head_version
+        .clone()
+        .unwrap();
+    pair.meta
+        .fail_next_get_inode_with(unavailable("injected read-view lookup failure"));
+    pair.fs_b.release(&context(), writer).unwrap();
+    assert!(pair.fs_b.handle_view_pending(reader).unwrap());
+
+    let unrelated = publish_external_version_with_bytes(
+        &pair.meta,
+        &pair.fs_a,
+        "review-unrelated-commit",
+        b"other node's later write",
+    );
+    assert_ne!(proxied, unrelated);
+    pair.fs_b.retry_pending_view(reader).unwrap();
+    let seen = pair
+        .fs_b
+        .handle_snapshot(reader)
+        .unwrap()
+        .opened_inode
+        .head_version
+        .clone();
+    assert_ne!(
+        seen,
+        Some(unrelated),
+        "an already-open B reader must not jump to a later commit B did not proxy"
+    );
+    pair.fs_b.release(&context(), reader).unwrap();
+}
+
+fn reader_version(pair: &RemoteOwnerPair, reader: FileHandle) -> Option<FileVersionId> {
+    pair.fs_b
+        .handle_snapshot(reader)
+        .unwrap()
+        .opened_inode
+        .head_version
+        .clone()
+}
+
+/// The last proxy session's end moves this Node's open readers to the version
+/// the owner reported for the proxied writes (4a).
+#[test]
+fn proxied_close_moves_open_readers_to_the_proxied_version() {
+    let pair = remote_owner_pair("proxied-close-moves.bin", 0o640, b"base-data");
+    let reader = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDONLY)
+        .unwrap();
+    let writer = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDWR)
+        .unwrap();
+    pair.fs_b.write(&context(), writer, 0, b"PROXIED").unwrap();
+    pair.fs_b.flush(&context(), writer).unwrap();
+    let proxied = pair.meta.inode.lock().unwrap().head_version.clone();
+    pair.fs_b.release(&context(), writer).unwrap();
+    assert_eq!(reader_version(&pair, reader), proxied);
+    assert!(!pair.fs_b.handle_view_pending(reader).unwrap());
+    pair.fs_b.release(&context(), reader).unwrap();
+}
+
+/// Another Node commits after the owner synced the proxied writes and before
+/// the last proxy session ends: the open reader keeps its view; it never
+/// reaches the other Node's commit, also when the lookup itself succeeds.
+#[test]
+fn proxied_close_never_moves_readers_to_a_later_independent_commit() {
+    let pair = remote_owner_pair("proxied-close-later.bin", 0o640, b"base-data");
+    let reader = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDONLY)
+        .unwrap();
+    let opened = reader_version(&pair, reader);
+    let writer = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDWR)
+        .unwrap();
+    pair.fs_b.write(&context(), writer, 0, b"PROXIED").unwrap();
+    pair.fs_b.flush(&context(), writer).unwrap();
+    let unrelated =
+        publish_external_version_with_bytes(&pair.meta, &pair.fs_a, "later-commit", b"later");
+    pair.fs_b.release(&context(), writer).unwrap();
+    assert_ne!(reader_version(&pair, reader), Some(unrelated));
+    assert_eq!(reader_version(&pair, reader), opened);
+    assert!(!pair.fs_b.handle_view_pending(reader).unwrap());
+    pair.fs_b.release(&context(), reader).unwrap();
+}
+
+/// A failed lookup at close is retried for the proxied version only; once a
+/// later commit replaced it, the retry settles without moving the reader.
+#[test]
+fn proxied_close_retry_settles_on_the_current_view_after_a_later_commit() {
+    let pair = remote_owner_pair("proxied-close-settle.bin", 0o640, b"base-data");
+    let reader = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDONLY)
+        .unwrap();
+    let opened = reader_version(&pair, reader);
+    let writer = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDWR)
+        .unwrap();
+    pair.fs_b.write(&context(), writer, 0, b"PROXIED").unwrap();
+    pair.fs_b.flush(&context(), writer).unwrap();
+    pair.meta
+        .fail_next_get_inode_with(unavailable("injected read-view lookup failure"));
+    pair.fs_b.release(&context(), writer).unwrap();
+    assert!(pair.fs_b.handle_view_pending(reader).unwrap());
+    publish_external_version_with_bytes(&pair.meta, &pair.fs_a, "later-commit", b"later");
+    pair.fs_b.retry_pending_view(reader).unwrap();
+    assert!(!pair.fs_b.handle_view_pending(reader).unwrap(), "settled");
+    assert_eq!(reader_version(&pair, reader), opened);
+    pair.fs_b.release(&context(), reader).unwrap();
+}
+
+/// A proxy session that never synced reports no version: its end moves no
+/// reader and looks nothing up.
+#[test]
+fn proxied_close_without_a_sync_moves_no_reader() {
+    let pair = remote_owner_pair("proxied-close-unsynced.bin", 0o640, b"base-data");
+    let reader = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDONLY)
+        .unwrap();
+    let opened = reader_version(&pair, reader);
+    let writer = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDWR)
+        .unwrap();
+    let lookups = pair.meta.get_inode_call_count();
+    pair.fs_b.release(&context(), writer).unwrap();
+    assert_eq!(pair.meta.get_inode_call_count(), lookups);
+    assert_eq!(reader_version(&pair, reader), opened);
+    assert!(!pair.fs_b.handle_view_pending(reader).unwrap());
+    pair.fs_b.release(&context(), reader).unwrap();
+}

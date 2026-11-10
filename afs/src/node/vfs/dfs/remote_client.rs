@@ -38,6 +38,9 @@ pub(super) struct WriteCoordinator {
     pub(super) channel: OwnerChannel,
     remote_inode_providers: ShardedMap<InodeId, RemoteDfsWriteSession>,
     pub(super) pending_remote_releases: Mutex<PendingRemoteReleaseState>,
+    /// The version the owner reported for this Node's latest proxied sync of
+    /// each inode, consumed when the inode's last proxy session ends (R94).
+    proxied_versions: Mutex<HashMap<InodeId, FileVersionId>>,
 }
 
 #[derive(Default)]
@@ -196,7 +199,20 @@ impl WriteCoordinator {
             meta,
             remote_inode_providers: ShardedMap::default(),
             pending_remote_releases: Mutex::new(PendingRemoteReleaseState::default()),
+            proxied_versions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Takes the version the owner reported for the inode's latest proxied
+    /// sync. Replies of concurrent syncs may arrive out of order: an older
+    /// version recorded last is no longer the head, and the caller then keeps
+    /// its handles where they are.
+    pub(super) fn take_proxied_version(&self, inode_id: &InodeId) -> Result<Option<FileVersionId>> {
+        Ok(self
+            .proxied_versions
+            .lock()
+            .map_err(|_| unavailable("DFS proxied version table is poisoned"))?
+            .remove(inode_id))
     }
 
     pub(super) fn open_remote_write_session(
@@ -468,14 +484,24 @@ impl WriteCoordinator {
             .remote
             .as_ref()
             .ok_or_else(|| invalid("DFS write session is local"))?;
-        remote
+        let reply = remote
             .owner
             .sync(afs_protocol::node_data::DfsOwnerSyncRequest {
                 handle: Some(data_owner_handle(&remote.handle)),
                 operation_id: self.identity.operation_id("remote-sync").0,
                 through_write_seq: session.local.last_accepted_seq,
                 data_only: matches!(mode, SyncMode::DataOnly),
-            })
+            })?;
+        if !reply.file_version_id.is_empty() {
+            self.proxied_versions
+                .lock()
+                .map_err(|_| unavailable("DFS proxied version table is poisoned"))?
+                .insert(
+                    session.local.inode_id.clone(),
+                    FileVersionId::new(reply.file_version_id.clone()),
+                );
+        }
+        Ok(reply)
     }
 
     fn remote_release(&self, session: &DfsRemoteWriteSession) -> Result<()> {
@@ -1188,19 +1214,25 @@ impl RemoteProviderHost for DistributedFs {
 
     fn remote_provider_replaced(&self, inode_id: &InodeId, last_provider: bool) -> Result<()> {
         self.handles.mark_dynamic(inode_id)?;
+        if !last_provider {
+            return Ok(());
+        }
+        let proxied = self.write_coordinator.take_proxied_version(inode_id)?;
         let handles = self.handles.for_inode(inode_id)?;
-        if last_provider && !handles.is_empty() {
+        if let Some(version) = proxied
+            && !handles.is_empty()
+        {
             // Writes this Node proxied are visible to its handles (4a): once
-            // the last proxy session ends they pin the version it produced.
-            // The owner has already synced them; failing to look that version
-            // up is not a write error of the closing writer, so its handles
-            // keep their protected views and the next read looks again.
-            match self
-                .meta
-                .get_inode(inode_id)
-                .and_then(|inode| self.validate_inode(inode))
-            {
-                Ok(inode) => self.advance_to_local_view(&inode)?,
+            // the last proxy session ends they move to the version the owner
+            // reported for them, and only to it: another Node's later commit
+            // never reaches an open handle. If that version is no longer the
+            // head the handles keep their views. The owner has already synced
+            // the writes; failing to look the version up is not a write error
+            // of the closing writer, so the handles keep their protected views
+            // and the next read looks again for the same version.
+            match self.proxied_view(inode_id, &version) {
+                Ok(Some(inode)) => self.advance_to_local_view(&inode)?,
+                Ok(None) => {}
                 Err(error) => {
                     afs_logging::warn!("dfs.handle_view_refresh_failed";
                         "inode" => inode_id.0.as_str(),
@@ -1211,7 +1243,7 @@ impl RemoteProviderHost for DistributedFs {
                             .state
                             .lock()
                             .map_err(|_| unavailable("DFS handle state is poisoned"))?
-                            .refresh_view = true;
+                            .refresh_view = Some(version.clone());
                     }
                 }
             }

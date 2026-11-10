@@ -386,3 +386,73 @@ fn r94_an_unprotectable_write_state_base_is_never_read_unprotected() {
     fx.fs.release(&context(), writer).unwrap();
     fx.fs.release(&context(), reader).unwrap();
 }
+
+#[test]
+fn review_late_base_admission_does_not_cache_a_pin_after_the_last_writer_closed() {
+    let fx = fixture();
+    let reader = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    let writer = fx.fs.open(&context(), fx.inode, libc::O_RDWR).unwrap();
+    fx.fs.write(&context(), writer, 0, b"VERSION-TWO").unwrap();
+    fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+    let v2 = head(&fx.meta);
+    let inode_id = fx.meta.inode.lock().unwrap().inode_id.clone();
+    let cell = fx.fs.write_state(&inode_id).unwrap().unwrap();
+    let mut view = {
+        let state = cell.lock().unwrap();
+        assert!(state.has_local_write_activity());
+        ResolvedReadView {
+            committed: Some(v2.clone()),
+            base_reference: DistributedFs::cached_base_reference(&state),
+            length: state.logical_length,
+            layout: state.base_layout.clone(),
+            frozen: None,
+            active: DirtyExtentMap::default(),
+        }
+    };
+    assert!(view.base_reference.is_none());
+    let admission = fx.fs.base_reference_sync(&inode_id, &view);
+    assert!(matches!(&admission, BaseReference::Taken(_)));
+
+    // The async reader's pin RPC returned, but its continuation has not run.
+    fx.fs.release(&context(), writer).unwrap();
+    assert!(!cell.lock().unwrap().has_local_write_activity());
+    assert!(cell.lock().unwrap().base_read_reference.is_none());
+    assert!(
+        fx.fs
+            .settle_base_reference(&cell, &mut view, admission)
+            .unwrap()
+    );
+    drop(view);
+    fx.fs.release(&context(), reader).unwrap();
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.live(&v2), 0, "the final read and both handles ended");
+}
+
+/// A base reference shared while the last writer closed with data still
+/// dirty is retired by the background commit of that data, not kept.
+#[test]
+fn r94_a_shared_base_reference_ends_with_the_commit_after_a_dirty_close() {
+    let fx = fixture();
+    let reader = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    let writer = fx.fs.open(&context(), fx.inode, libc::O_RDWR).unwrap();
+    fx.fs.write(&context(), writer, 0, b"VERSION-TWO").unwrap();
+    fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+    let v2 = head(&fx.meta);
+    fx.fs.write(&context(), writer, 0, b"DIRTY").unwrap();
+    // The read selects V2 under the dirty overlay and shares its reference.
+    assert_eq!(read_all(&fx.fs, reader), b"DIRTYON-TWO");
+    fx.fs.release(&context(), writer).unwrap();
+    fx.fs.writeback_pending().unwrap();
+    let v3 = head(&fx.meta);
+    assert_ne!(v3, v2);
+    assert_eq!(read_all(&fx.fs, reader), b"DIRTYON-TWO");
+    fx.references.flush().unwrap();
+    assert_eq!(
+        fx.gc.live(&v2),
+        0,
+        "the commit retired the shared V2 reference"
+    );
+    fx.fs.release(&context(), reader).unwrap();
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.live(&v3), 0);
+}

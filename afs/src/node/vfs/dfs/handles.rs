@@ -85,9 +85,10 @@ pub(super) struct HandleMut {
     /// whole: a new version is published only together with its reference.
     pub(super) opened_inode: Arc<OpenedView>,
     pub(super) pending_view: Option<PendingView>,
-    /// This Node's proxied writes ended but the inode they produced could not
-    /// be looked up: the next read looks it up and moves the handle.
-    pub(super) refresh_view: bool,
+    /// The version this Node's proxied writes produced, when the inode could
+    /// not be looked up as they ended: the next read moves the handle to it if
+    /// it is still the head, or gives up and keeps the current view.
+    pub(super) refresh_view: Option<FileVersionId>,
     pub(super) opened_page_identity: Option<PageCacheIdentity>,
     pub(super) native_read_view: Option<NativeReadView>,
     pub(super) native_read_generation: u64,
@@ -109,7 +110,7 @@ impl From<DfsFileHandle> for DfsHandle {
             state: Mutex::new(HandleMut {
                 opened_inode: Arc::new(OpenedView::new(opened.opened_inode, opened.gc_pin)),
                 pending_view: None,
-                refresh_view: false,
+                refresh_view: None,
                 opened_page_identity: opened.opened_page_identity,
                 native_read_view: opened.native_read_view,
                 native_read_generation: opened.native_read_generation,
@@ -672,6 +673,17 @@ impl DistributedFs {
         Ok(Some(std::mem::replace(&mut state.opened_inode, view)))
     }
 
+    /// The inode record of `version` when it is still the head: the only record
+    /// that describes it. `None` when another commit replaced it since.
+    pub(super) fn proxied_view(
+        &self,
+        inode_id: &InodeId,
+        version: &FileVersionId,
+    ) -> Result<Option<InodeRecord>> {
+        let inode = self.validate_inode(self.meta.get_inode(inode_id)?)?;
+        Ok((inode.head_version.as_ref() == Some(version)).then_some(inode))
+    }
+
     /// Whether the handle has a local view a read should try to publish now:
     /// one waiting for its GC reference, with no local writer open (reads go
     /// through the write state while one is).
@@ -684,7 +696,7 @@ impl DistributedFs {
                 .state
                 .lock()
                 .map_err(|_| unavailable("DFS handle state is poisoned"))?;
-            state.pending_view.is_some() || state.refresh_view
+            state.pending_view.is_some() || state.refresh_view.is_some()
         };
         Ok(pending && !self.local_writers_open(&opened.inode_id)?)
     }
@@ -700,21 +712,27 @@ impl DistributedFs {
             .state
             .lock()
             .map_err(|_| unavailable("DFS handle state is poisoned"))?
-            .refresh_view;
-        if refresh && !self.local_writers_open(&opened.inode_id)? {
-            match self
-                .meta
-                .get_inode(&opened.inode_id)
-                .and_then(|inode| self.validate_inode(inode))
-            {
-                Ok(inode) => {
-                    self.advance_to_local_view(&inode)?;
+            .refresh_view
+            .clone();
+        if let Some(version) = refresh
+            && !self.local_writers_open(&opened.inode_id)?
+        {
+            match self.proxied_view(&opened.inode_id, &version) {
+                Ok(found) => {
+                    // Settled either way: moved to the proxied version, or
+                    // that version is no longer the head and the handle keeps
+                    // its current view (never another Node's later commit).
+                    if let Some(inode) = found {
+                        self.advance_to_local_view(&inode)?;
+                    }
                     for handle in self.handles.for_inode(&opened.inode_id)? {
-                        handle
+                        let mut state = handle
                             .state
                             .lock()
-                            .map_err(|_| unavailable("DFS handle state is poisoned"))?
-                            .refresh_view = false;
+                            .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+                        if state.refresh_view.as_ref() == Some(&version) {
+                            state.refresh_view = None;
+                        }
                     }
                 }
                 Err(error) => {
@@ -877,9 +895,14 @@ impl DistributedFs {
                     let mut state = cell
                         .lock()
                         .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                    // Shared only while local write activity can still route
+                    // reads here: once the last writer closed nothing would
+                    // retire it, and it would keep this version for ever. The
+                    // read itself keeps `pin` either way until it ends.
                     match (&version, state.base_version.as_ref()) {
                         (Some(version), Some(base))
                             if base.id == *version
+                                && state.has_local_write_activity()
                                 && Self::cached_base_reference(&state).is_none() =>
                         {
                             state
