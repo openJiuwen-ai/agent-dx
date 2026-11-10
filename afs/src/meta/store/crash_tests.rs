@@ -938,6 +938,64 @@ fn r86_commit(number: u64) -> super::MetaTxn {
     txn
 }
 
+#[tokio::test]
+async fn r86_overwrite_keeps_full_layout_between_append_records() {
+    use super::{MetaEntity, TxnMutation, log::Record};
+    use crate::dfs::ChunkId;
+
+    let directory = tempfile::tempdir().unwrap();
+    let log = Arc::new(LocalLog::open(directory.path(), LocalLogOptions::default()).unwrap());
+    let store = Store::open_log(log.clone()).await.unwrap();
+    let mut expected = Vec::new();
+    for number in 1..=4 {
+        let mut txn = r86_commit(number);
+        if number >= 3 {
+            let layout = txn
+                .mutations
+                .iter_mut()
+                .find_map(|mutation| match mutation {
+                    TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout)) => Some(layout),
+                    _ => None,
+                })
+                .unwrap();
+            Arc::make_mut(layout).inline_extents[0].chunk_id = ChunkId::new("r86-overwritten");
+            expected.push(layout.clone());
+        }
+        assert!(matches!(
+            store.compare_and_commit(txn).await.unwrap(),
+            TxnOutcome::Committed { .. }
+        ));
+    }
+    let recovered = log.recover().await.unwrap();
+    assert!(matches!(
+        recovered.records.as_slice(),
+        [
+            Record::Decision { .. },
+            Record::AppendLayout { .. },
+            Record::Decision { .. },
+            Record::AppendLayout { .. }
+        ]
+    ));
+    drop(store);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while Arc::strong_count(&log) > 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(log);
+    let log = Arc::new(LocalLog::open(directory.path(), LocalLogOptions::default()).unwrap());
+    let restored = Store::open_log(log).await.unwrap();
+    for layout in expected {
+        let actual = restored
+            .read(MetaRead::DfsLayoutRoot(layout.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(actual.entity, Some(MetaEntity::DfsLayoutRoot(layout)));
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn r86_layout_append_process_crash() {
     const NAME: &str = "meta::store::crash_tests::r86_layout_append_process_crash";
