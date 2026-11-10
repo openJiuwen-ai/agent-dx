@@ -561,15 +561,11 @@ impl DistributedFs {
             .as_ref()
             .ok_or_else(|| invalid("recovery requires committed version"))?
             .id;
-        let filling_hole = !covered(&version.layout, offset, count as u64);
-        let ids = version
-            .layout
-            .inline_extents
+        let extents = &version.layout.inline_extents;
+        let first = extents.partition_point(|e| e.file_offset.saturating_add(e.length) <= offset);
+        let ids = extents[first..]
             .iter()
-            .filter(|e| {
-                filling_hole
-                    || (e.file_offset < end && e.file_offset.saturating_add(e.length) > offset)
-            })
+            .take_while(|e| e.file_offset < end)
             .map(|e| e.chunk_id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         for id in ids {
@@ -585,14 +581,6 @@ impl DistributedFs {
             let chunk = sources
                 .chunk
                 .ok_or_else(|| invalid("recovery descriptor absent"))?;
-            let requested = version.layout.inline_extents.iter().any(|e| {
-                e.chunk_id == id
-                    && e.file_offset < end
-                    && e.file_offset.saturating_add(e.length) > offset
-            });
-            if !requested && !sources.sources.is_empty() {
-                continue;
-            }
             let mut body = vec![
                 0;
                 usize::try_from(chunk.length)

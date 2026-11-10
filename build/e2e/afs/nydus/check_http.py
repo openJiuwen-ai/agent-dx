@@ -70,6 +70,13 @@ def read_range(node, start, size, manifest=None):
     return request(url(node, manifest), headers={"Range": f"bytes={start}-{start + size - 1}"})
 
 
+def source_queries():
+    status, _, body = request("http://10.203.0.20:7401/metrics")
+    assert status == 200
+    prefix = 'afs_dfs_read_rpc_calls_total{method="get_chunk_sources"} '
+    return sum(float(line[len(prefix):]) for line in body.decode().splitlines() if line.startswith(prefix))
+
+
 def main():
     global MANIFEST
     MANIFEST = publish_variant("cold-head")
@@ -97,6 +104,22 @@ def main():
     status, _, body = read_range("b", 8192, 4096, direct)
     assert status == 206 and body == reference[8192:12288], (status, body[:300])
     result("first_GET_without_HEAD_or_prepare", manifest=direct)
+
+    sequential = publish_variant("sequential-cold-ranges")
+    assert request(url("a", sequential), "HEAD")[0] == 200
+    size = 4096
+    count = 16
+    assert len(reference) >= 2 * size * count
+    before_queries = source_queries()
+    before = len(bodies())
+    for index in range(count):
+        start = 2 * index * size
+        status, _, body = read_range("a", start, size, sequential)
+        assert status == 206 and body == reference[start : start + size], (index, status)
+    queries = source_queries() - before_queries
+    assert len(bodies()) - before == count
+    assert queries <= 2 * count, queries
+    result("sequential_cold_ranges_bound_source_queries", ranges=count, source_queries=queries)
 
     racing = publish_variant("prepare-race")
     before = len(bodies())
