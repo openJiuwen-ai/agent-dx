@@ -782,7 +782,10 @@ result = command.wait()
 
 `wait()` and `wait_async()` use one hidden multiplexed WebSocket per connection
 context as a notification channel. The final result is always read back from
-EXECD's authoritative command registry. When the wait deadline expires, they
+EXECD's authoritative command registry. Subscription changes wake the shared
+transport immediately, and an idle transport is retained for up to five seconds
+for subsequent waits. Status notifications never replace the final registry read.
+When the wait deadline expires, they
 return `CommandResult(status=RUNNING, error_code="WAIT_TIMEOUT")`; the remote
 command remains active and the handle can wait again. A client restart also
 does not terminate the remote command. `CommandHandle.kill()` and
@@ -871,3 +874,7 @@ Local artifact registered by the deployment. It is mutually exclusive with
 names fail before scheduling, with no registry fallback. The deployment must
 prepare matching artifacts and metadata on eligible nodes. Default creates
 without an image or template keep using the deployment's default rootfs.
+
+SDK 0.1.0rc6 wakes command-watch subscriptions immediately when local waiters change,
+without a periodic receive timeout. Terminal events continue to trigger an authoritative
+result read; reconnects replay current command states.
