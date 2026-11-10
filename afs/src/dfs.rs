@@ -977,6 +977,13 @@ pub struct CopyRecord {
 }
 
 impl CopyRecord {
+    pub fn is_ready_readable(&self) -> bool {
+        matches!(
+            self.role,
+            CopyRole::DurableReplica | CopyRole::VerifiedCache
+        ) && self.state.is_readable()
+    }
+
     pub fn is_ready_durable(&self) -> bool {
         self.role == CopyRole::DurableReplica && self.state.is_readable()
     }

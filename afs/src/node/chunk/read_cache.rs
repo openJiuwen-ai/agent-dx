@@ -423,7 +423,7 @@ mod tests {
             Some(&intent)
         );
         store
-            .collect_generation(1, &[staged.chunk.id.clone()])
+            .collect_generation(1, std::slice::from_ref(&staged.chunk.id))
             .unwrap();
         drop(store);
         let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
