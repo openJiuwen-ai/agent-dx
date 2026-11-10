@@ -1,6 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use io_uring::opcode::AsyncCancel;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -9,6 +8,7 @@ use std::thread;
 use tokio::sync::{oneshot, watch};
 use tokio::time::{timeout_at, Duration, Instant};
 
+use crate::io_buffer::UserBufferMemory;
 use crate::{AutoRegBuffer, IOBuffer, UVMUblkCtrl, UVMUblkQueue, UserBuffer, UBLK_QUEUE_URING};
 use storage_util::io_ring::{AsyncIoRing, RingFuture};
 
@@ -146,6 +146,7 @@ impl<T: UVMUblkTarget> UVMUblkDevBuilder<T> {
                 queue_threads: Mutex::new(vec![]),
                 queue_stop: watch::channel(false).0,
                 queue_failed: watch::channel(false).0,
+                buffers: Mutex::new(Vec::new()),
             }),
             tgt: Arc::new(tgt),
         })
@@ -196,10 +197,20 @@ pub struct UVMUblkDevInner {
     pub queue_threads: Mutex<Vec<oneshot::Receiver<Result<()>>>>,
     queue_stop: watch::Sender<bool>,
     queue_failed: watch::Sender<bool>,
+    buffers: Mutex<Vec<Arc<UserBufferMemory>>>,
 }
 
 impl Drop for UVMUblkDevInner {
     fn drop(&mut self) {
+        let buffers = self
+            .buffers
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        if !buffers.is_empty() {
+            // An unconfirmed stop can leave these addresses in kernel use.
+            // Keep those allocations until process exit.
+            std::mem::forget(std::mem::take(buffers));
+        }
         tracing::debug!("UVMUblkDevInner has dropped");
     }
 }
@@ -220,21 +231,13 @@ impl UVMUblkDevInner {
 }
 
 impl UVMUblkQueue {
-    async fn wait_for_fetch(
-        &self,
-        mut fetch: RingFuture,
-        stop: &mut watch::Receiver<bool>,
-    ) -> Option<i32> {
+    async fn wait_for_fetch(fetch: RingFuture, stop: &mut watch::Receiver<bool>) -> Option<i32> {
         tokio::select! {
             biased;
-            res = &mut fetch => (!*stop.borrow()).then_some(res),
+            res = fetch => (!*stop.borrow()).then_some(res),
             _ = async { let _ = stop.wait_for(|stopping| *stopping).await; } => {
-                let cancel = AsyncCancel::new(fetch.as_user_data()).build();
-                if let Ok(cancel) = self.ring.send(cancel) {
-                    let _ = cancel.await;
-                }
-                // Keep the slot buffer until the original command completes.
-                let _ = fetch.await;
+                // ublk commands are canceled when the queue ring closes.
+                // Their allocations stay with the device until STOP completes.
                 None
             }
         }
@@ -279,6 +282,17 @@ impl UVMUblkQueue {
             }
             None => None,
         };
+        {
+            let mut buffers = device
+                .buffers
+                .lock()
+                .map_err(|_| anyhow!("ublk retained buffers lock poisoned"))?;
+            for buffer in std::iter::once(&mut buf).chain(extra.as_mut()) {
+                if let IOBuffer::User(user) = buffer {
+                    buffers.push(user.retain_for_device());
+                }
+            }
+        }
         // FIXME: should we handle EINTR?
         let pending = self.prep_slot(tag, &buf).context("prep_slot")?;
         if let Some(readiness) = readiness {
@@ -292,7 +306,6 @@ impl UVMUblkQueue {
                     .context("submit recovery fetches");
                 if let Err(error) = submitted {
                     device.signal_queue_failure();
-                    let _ = self.wait_for_fetch(pending, &mut stop).await;
                     return Err(error);
                 }
                 if let Some(sender) = readiness.sender.borrow_mut().take() {
@@ -300,7 +313,7 @@ impl UVMUblkQueue {
                 }
             }
         }
-        let Some(res) = self.wait_for_fetch(pending, &mut stop).await else {
+        let Some(res) = Self::wait_for_fetch(pending, &mut stop).await else {
             return Ok(());
         };
         if res < 0 {
@@ -338,7 +351,7 @@ impl UVMUblkQueue {
             let fetch = self
                 .submit_and_fetch_for_slot(tag, &buf, res)
                 .context("submit and fetch from ring")?;
-            let Some(res) = self.wait_for_fetch(fetch, &mut stop).await else {
+            let Some(res) = Self::wait_for_fetch(fetch, &mut stop).await else {
                 return Ok(());
             };
             // FIXME: should we handle EINTR?
@@ -674,6 +687,20 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
                 }
             }
         }
+    }
+
+    /// Release slot allocations retained across character device close.
+    ///
+    /// # Safety
+    /// The caller must have closed the queue workers and received successful
+    /// STOP or proof from the kernel that the device no longer exists.
+    pub unsafe fn release_stopped_buffers(&self) -> Result<()> {
+        self.inner
+            .buffers
+            .lock()
+            .map_err(|_| anyhow!("ublk retained buffers lock poisoned"))?
+            .clear();
+        Ok(())
     }
 
     /// Return the device target implementation

@@ -80,7 +80,7 @@ pub(super) struct Devices {
     serving: bool,
     owner: Weak<Mutex<Self>>,
     monitor: Option<QueueMonitor>,
-    pending_stop: Option<JoinHandle<io::Result<()>>>,
+    pending_stop: Option<JoinHandle<io::Result<bool>>>,
     released: Released,
 }
 
@@ -391,17 +391,16 @@ impl Devices {
                 .map_err(backend_error)?;
             self.pending_stop = Some(tokio::spawn(async move {
                 match control.stop_dev().await {
-                    Ok(()) => Ok(()),
-                    Err(error)
-                        if error.root_cause().downcast_ref::<io::Error>().is_some_and(
-                            |cause| {
-                                matches!(cause.raw_os_error(), Some(libc::ENODEV | libc::EINVAL))
-                            },
-                        ) =>
+                    Ok(()) => Ok(true),
+                    Err(error) => match error
+                        .root_cause()
+                        .downcast_ref::<io::Error>()
+                        .and_then(io::Error::raw_os_error)
                     {
-                        Ok(())
-                    }
-                    Err(error) => Err(backend_error(error)),
+                        Some(libc::ENODEV) => Ok(true),
+                        Some(libc::EINVAL) => Ok(false),
+                        _ => Err(backend_error(error)),
+                    },
                 }
             }));
         }
@@ -414,7 +413,12 @@ impl Devices {
             // next cleanup must finish it before deleting/reusing the ID.
             let result = timeout(STOP_TIMEOUT, stop).await.map_err(backend_error)?;
             self.pending_stop = None;
-            result.map_err(backend_error)??;
+            let confirmed = result.map_err(backend_error)??;
+            if confirmed && let Some(device) = &self.device {
+                // SAFETY: stop_and_drain joined the workers and closed their
+                // character device before submitting the successful STOP.
+                unsafe { device.release_stopped_buffers() }.map_err(backend_error)?;
+            }
         }
         Ok(())
     }

@@ -4,6 +4,7 @@ use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cell::OnceCell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use storage_util::io_ring::AsyncIoRing;
 
@@ -114,9 +115,28 @@ impl AutoRegBuffer {
     }
 }
 
-pub struct UserBufferInner {
+pub(crate) struct UserBufferMemory {
     ptr: *mut u8,
     layout: Layout,
+}
+
+// SAFETY: this type owns only the allocation. The queue's UserBuffer, which
+// also owns the non-Send ring, controls access to the bytes. Other threads
+// retain an Arc solely to defer deallocation until kernel I/O has stopped.
+unsafe impl Send for UserBufferMemory {}
+// SAFETY: shared ownership exposes no access to the allocated bytes.
+unsafe impl Sync for UserBufferMemory {}
+
+impl Drop for UserBufferMemory {
+    fn drop(&mut self) {
+        // SAFETY: this is the last owner of the original allocation.
+        unsafe { dealloc(self.ptr, self.layout) };
+    }
+}
+
+pub struct UserBufferInner {
+    memory: Arc<UserBufferMemory>,
+    retained_by_device: bool,
     /// The index within io uring
     buf_idx: OnceCell<u32>,
     pub ring: AsyncIoRing,
@@ -135,8 +155,8 @@ impl UserBufferInner {
             bail!("allocate UserBufferInner failed, size = {size} align = {align}");
         }
         let mut this = Self {
-            ptr,
-            layout,
+            memory: Arc::new(UserBufferMemory { ptr, layout }),
+            retained_by_device: false,
             buf_idx: OnceCell::new(),
             ring: ring.clone(),
         };
@@ -173,11 +193,11 @@ impl UserBufferInner {
     fn ptr_at(&self, offset: u64, len: usize) -> *mut u8 {
         assert!(len <= self.len() && offset <= (self.len() - len) as u64);
         // SAFETY: the assertion bounds the pointer and the requested range.
-        unsafe { self.ptr.add(offset as usize) }
+        unsafe { self.memory.ptr.add(offset as usize) }
     }
 
     pub fn len(&self) -> usize {
-        self.layout.size()
+        self.memory.layout.size()
     }
 }
 
@@ -185,17 +205,11 @@ impl Drop for UserBufferInner {
     fn drop(&mut self) {
         if let Some(&buf_idx) = self.buf_idx.get() {
             if let Err(error) = self.ring.unregister_buffer(buf_idx) {
-                // The kernel may still have this address registered. Keep the
-                // allocation alive if unregister did not succeed.
                 tracing::error!(buf_idx, ?error, "failed to unregister ublk buffer");
-                return;
-            }
-        }
-        if self.layout.size() != 0 {
-            // SAFETY: the original allocation has been unregistered. Slot
-            // teardown waits for operations using it before dropping it.
-            unsafe {
-                dealloc(self.ptr, self.layout);
+                if !self.retained_by_device {
+                    // An independent buffer has no device shutdown to defer to.
+                    std::mem::forget(self.memory.clone());
+                }
             }
         }
     }
@@ -203,7 +217,7 @@ impl Drop for UserBufferInner {
 
 impl AsMut<[u8]> for UserBufferInner {
     fn as_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.layout.size()) }
+        self.subslice_mut(0, self.len())
     }
 }
 
@@ -217,6 +231,11 @@ impl UserBuffer {
     pub async fn new(ring: AsyncIoRing, size: usize, align: usize) -> Result<Self> {
         let inner = UserBufferInner::new(ring, size, align).await?;
         Ok(Self { inner })
+    }
+
+    pub(crate) fn retain_for_device(&mut self) -> Arc<UserBufferMemory> {
+        self.inner.retained_by_device = true;
+        self.inner.memory.clone()
     }
 
     /// Return a **mutable** sub slice started from `offset`, and len = `len`.
@@ -277,7 +296,7 @@ impl UserBuffer {
         while done < len {
             let entry = opcode::ReadFixed::new(
                 types::Fixed(io_ring_file_idx),
-                self.inner.ptr.add(buf_offset as usize + done),
+                self.inner.memory.ptr.add(buf_offset as usize + done),
                 (len - done) as _,
                 self.uring_buf_idx(),
             )
@@ -312,7 +331,7 @@ impl UserBuffer {
         while done < len {
             let entry = opcode::WriteFixed::new(
                 types::Fixed(io_ring_file_idx),
-                self.inner.ptr.add(buf_offset as usize + done),
+                self.inner.memory.ptr.add(buf_offset as usize + done),
                 (len - done) as _,
                 self.uring_buf_idx(),
             )
