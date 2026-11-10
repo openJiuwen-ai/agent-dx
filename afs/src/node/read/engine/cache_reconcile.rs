@@ -2,6 +2,7 @@
 //! crash every pending publication/retirement is reconstructed from the same WAL.
 use super::*;
 use crate::node::chunk::ReadCacheIntent;
+use std::{collections::VecDeque, ops::Range};
 
 #[derive(Default)]
 struct CacheSyncState {
@@ -182,6 +183,7 @@ pub(super) struct ReadCacheRuntime {
     capacity: u64,
     send: tokio::sync::mpsc::Sender<CacheJob>,
     receive: Mutex<Option<tokio::sync::mpsc::Receiver<CacheJob>>>,
+    partial: Mutex<VecDeque<PartialCopy>>,
 }
 
 struct CacheJob {
@@ -192,6 +194,89 @@ struct CacheJob {
     epoch: u64,
 }
 
+/// Cache copies can arrive as separate verified FUSE pages. The two-entry
+/// cap bounds unqueued body storage at 8 MiB and a fragmented read cannot
+/// retain unbounded coverage metadata. Missing bytes are never synthesized.
+const MAX_PARTIAL_COPIES: usize = 2;
+const MAX_PARTIAL_RANGES: usize = 256;
+
+struct PartialCopy {
+    job: CacheJob,
+    coverage: Vec<Range<usize>>,
+}
+
+impl PartialCopy {
+    fn copy_range(&mut self, offset: usize, data: &[u8]) -> bool {
+        let mut end = offset + data.len();
+        let mut start = offset;
+        self.job.body[start..end].copy_from_slice(data);
+        let left = self.coverage.partition_point(|range| range.end < start);
+        let mut right = left;
+        while let Some(range) = self.coverage.get(right).filter(|range| range.start <= end) {
+            start = start.min(range.start);
+            end = end.max(range.end);
+            right += 1;
+        }
+        self.coverage
+            .splice(left..right, std::iter::once(start..end));
+        matches!(self.coverage.as_slice(), [range] if range.start == 0 && range.end == self.job.body.len())
+    }
+}
+
+impl ReadCacheRuntime {
+    fn stage(
+        &self,
+        batch: &ReadBatch,
+        version: &FileVersionId,
+        chunk: &ChunkObject,
+        epoch: u64,
+        offset: usize,
+        data: &[u8],
+    ) {
+        let make_job = |body| CacheJob {
+            chunk: chunk.clone(),
+            body,
+            version: version.clone(),
+            layout: batch.layout_root_id.clone(),
+            epoch,
+        };
+        if offset == 0 && data.len() as u64 == chunk.length {
+            if let Ok(permit) = self.send.try_reserve() {
+                permit.send(make_job(data.to_vec()));
+            }
+            return;
+        }
+        let Ok(mut partial) = self.partial.try_lock() else {
+            return;
+        };
+        let position = partial.iter().position(|copy| {
+            copy.job.chunk == *chunk
+                && copy.job.version == *version
+                && copy.job.layout == batch.layout_root_id
+                && copy.job.epoch == epoch
+        });
+        let mut copy = match position.and_then(|position| partial.remove(position)) {
+            Some(copy) => copy,
+            None => {
+                if partial.len() == MAX_PARTIAL_COPIES {
+                    partial.pop_front();
+                }
+                PartialCopy {
+                    job: make_job(vec![0; chunk.length as usize]),
+                    coverage: Vec::new(),
+                }
+            }
+        };
+        if copy.copy_range(offset, data)
+            && let Ok(permit) = self.send.try_reserve()
+        {
+            permit.send(copy.job);
+        } else if copy.coverage.len() <= MAX_PARTIAL_RANGES {
+            partial.push_back(copy);
+        }
+    }
+}
+
 impl DfsReadEngine {
     pub(crate) fn with_distributed_cache(mut self, session: String, capacity: u64) -> Self {
         let (send, receive) = tokio::sync::mpsc::channel(2);
@@ -200,6 +285,7 @@ impl DfsReadEngine {
             capacity,
             send,
             receive: Mutex::new(Some(receive)),
+            partial: Mutex::new(VecDeque::new()),
         }));
         self
     }
@@ -219,38 +305,37 @@ impl DfsReadEngine {
         if authority.epoch == 0 {
             return;
         }
-        let mut seen = BTreeSet::new();
         for op in &batch.ops {
-            let Some(chunk) = sources
-                .iter()
-                .find(|set| set.chunk_id == op.chunk_id)
-                .and_then(|set| set.chunk.as_ref())
-            else {
+            let Some(set) = sources.iter().find(|set| set.chunk_id == op.chunk_id) else {
                 continue;
             };
-            if op.chunk_offset != 0
-                || op.length != chunk.length
+            let Some(chunk) = set.chunk.as_ref() else {
+                continue;
+            };
+            if op.length == 0
                 || chunk.length > crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64
                 || chunk.length.saturating_add(4096) > cache.capacity
-                || !seen.insert(&chunk.id)
+                || !range_covered(&set.allowed_ranges, 0, chunk.length)
+                || op
+                    .chunk_offset
+                    .checked_add(op.length)
+                    .is_none_or(|end| end > chunk.length)
             {
                 continue;
             }
-            let Ok(permit) = cache.send.try_reserve() else {
-                break;
-            };
             let Some(body) =
                 out.get(op.output_offset..op.output_offset.saturating_add(op.length as usize))
             else {
                 continue;
             };
-            permit.send(CacheJob {
-                chunk: chunk.clone(),
-                body: body.to_vec(),
-                version: version.clone(),
-                layout: batch.layout_root_id.clone(),
-                epoch: authority.epoch,
-            });
+            cache.stage(
+                batch,
+                version,
+                chunk,
+                authority.epoch,
+                op.chunk_offset as usize,
+                body,
+            );
         }
     }
 
@@ -316,5 +401,33 @@ impl DfsReadEngine {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distribution_cache_accumulates_out_of_order_verified_ranges_without_holes() {
+        let staged = crate::node::chunk::StagedChunk::new(
+            crate::dfs::OperationId::new("paged"),
+            b"0123456789".to_vec(),
+        );
+        let mut partial = PartialCopy {
+            job: CacheJob {
+                chunk: staged.chunk.clone(),
+                body: vec![0; 10],
+                version: FileVersionId::new("version"),
+                layout: LayoutRootId::new("layout"),
+                epoch: 1,
+            },
+            coverage: Vec::new(),
+        };
+        assert!(!partial.copy_range(7, b"789"));
+        assert!(!partial.copy_range(0, b"0123"));
+        assert!(!partial.copy_range(2, b"234"));
+        assert!(partial.copy_range(5, b"56"));
+        assert_eq!(partial.job.body, b"0123456789");
     }
 }

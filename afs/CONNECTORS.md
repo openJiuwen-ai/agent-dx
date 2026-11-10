@@ -89,7 +89,7 @@ Nydus backend 示例（替换实际地址与具体 manifest digest）：
 原生 DFS 节点可设置 `dfs_read_parallelism`（默认 1，最大 8）和
 `dfs_read_stripe_bytes`（默认 256 KiB）。同一读请求跨来源时固定文件版本，
 使用已有授权与 Peer 请求预算。启用 `dfs_read_cache_bytes`（默认 0）后，
-完整读取并验证的 chunk 可在后台落入本地目录并登记为临时供数副本。
+同一版本的已验证范围可以在有界内存中合并。完整 chunk 在后台落入本地目录并登记为临时供数副本。
 普通文件和懒文件均可使用。临时副本不计入写入持久化确认。
 该配置与 `dfs_peer_cache` 分别选择，避免为同一正文保留两份磁盘缓存。
 
