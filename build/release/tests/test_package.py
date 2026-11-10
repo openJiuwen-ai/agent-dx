@@ -100,6 +100,10 @@ class PackageTests(unittest.TestCase):
                 (backend / name).write_bytes(b"\x7fELF\x02\x01" + bytes(12) + (62).to_bytes(2, "little"))
             runsc = root / "runsc"
             runsc.write_bytes(b"\x7fELF\x02\x01" + bytes(12) + (62).to_bytes(2, "little"))
+            for name in pkg.GVISOR_BINARIES:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(runsc.read_bytes())
             target = "x86_64-unknown-linux-gnu"
             pin = json.loads((pkg.ROOT / "third_party/sandboxd/source.json").read_text())
             metadata = {
@@ -117,6 +121,8 @@ class PackageTests(unittest.TestCase):
             manifest = pkg.verify(output)
             self.assertTrue(manifest["with_sandboxd"])
             self.assertIn("lib/sandboxd_preflight.py", manifest["files"])
+            for name in pkg.GVISOR_BINARIES:
+                self.assertIn(f"runtime/sandboxd/{name}", manifest["files"])
             for name in ("sandboxd.service", "sandboxd.toml", "oss.json", "registry.json",
                          "oss_auths.json", "registry_auths.json"):
                 self.assertIn(f"etc/examples/sandboxd/{name}", manifest["files"])
@@ -140,6 +146,16 @@ class PackageTests(unittest.TestCase):
                     backend_dir=backend, runsc=runsc,
                 )
             self.assertFalse(wrong_target.exists())
+
+            helper = root / "gvisor-bin/runsc-fd-parking"
+            helper.unlink()
+            with self.assertRaisesRegex(ValueError, "required artifact"):
+                pkg.assemble(
+                    binaries, redis, redis_cli, wheel, root / "missing-helper",
+                    pkg.BuildIdentity("a" * 40, False, target, "release"),
+                    backend_dir=backend, runsc=runsc,
+                )
+            self.assertFalse((root / "missing-helper").exists())
 
     def test_legacy_manifest_cannot_silently_disable_afs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -418,6 +434,10 @@ class PackageTests(unittest.TestCase):
             }))
             runsc = root / "runsc"
             runsc.write_bytes(elf)
+            for name in pkg.GVISOR_BINARIES:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(elf)
             package = root / "package"
             pkg.assemble(
                 binaries, redis, redis_cli, wheel, package,

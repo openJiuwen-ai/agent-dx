@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from package_manifest import (  # noqa: E402
     AFS_BINARIES,
     BINARIES,
+    GVISOR_BINARIES,
     SANDBOXD_BINARIES,
     SANDBOXD_DEPLOYMENT_FILES,
 )
@@ -82,7 +83,8 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, identity, *, with_afs=
     if (backend_dir is None) != (runsc is None):
         raise ValueError("sandboxd and runsc must be packaged together")
     if backend_dir is not None:
-        inputs["runtime/sandboxd/runsc"] = runsc
+        for name in GVISOR_BINARIES:
+            inputs[f"runtime/sandboxd/{name}"] = runsc if name == "runsc" else runsc.parent / name
         inputs["lib/sandboxd_preflight.py"] = ROOT / "build/e2e/preflight.py"
         for name in (*SANDBOXD_BINARIES, "manifest.json"):
             inputs[f"runtime/sandboxd/{name}"] = backend_dir / name

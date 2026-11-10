@@ -18,6 +18,15 @@ BINARIES = (
     "adx-relay",
 )
 SANDBOXD_BINARIES = ("sandboxd", "sbox", "runc", "runc-shim", "sandbox-logger", "redis-cli")
+GVISOR_BINARIES = (
+    "runsc",
+    "containerd-shim-runsc-v1",
+    "gvisor-bin/checkpointgofer",
+    "gvisor-bin/gvisor-sentry-prewarmer",
+    "gvisor-bin/gvisor_sentry",
+    "gvisor-bin/runsc-fd-parking",
+    "gvisor-bin/runsc-metric-server",
+)
 SANDBOXD_DEPLOYMENT_FILES = (
     "sandboxd.service",
     "sandboxd.toml",
@@ -78,7 +87,8 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
     backend_files.update(
         f"etc/examples/sandboxd/{name}" for name in SANDBOXD_DEPLOYMENT_FILES
     )
-    backend_files.update({"lib/sandboxd_preflight.py", "runtime/sandboxd/runsc"})
+    backend_files.add("lib/sandboxd_preflight.py")
+    backend_files.update(backend_prefix + name for name in GVISOR_BINARIES)
     if with_sandboxd:
         required.update(backend_files)
         required.add("third_party/sandboxd/source.json")
@@ -121,7 +131,7 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
             raise ValueError("sandboxd revision or target mismatch")
         if backend["files"] != {name: files[backend_prefix + name] for name in SANDBOXD_BINARIES}:
             raise ValueError("sandboxd file hashes differ from backend manifest")
-        for name in (*SANDBOXD_BINARIES, "runsc"):
+        for name in (*SANDBOXD_BINARIES, *GVISOR_BINARIES):
             with (root / backend_prefix / name).open("rb") as binary:
                 header = binary.read(20)
             if header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[18:20], "little") != machine:
