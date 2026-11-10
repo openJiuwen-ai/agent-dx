@@ -416,7 +416,7 @@ OwnerFs workspace bind 的 3 个键目前没有启动 WARN。
 
 AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集群停机替换（OwnerFs 部署同样适用）：
 
-- **集群线协议**：Node 注册带 `protocol_version`（当前 6，`afs_protocol::CLUSTER_PROTOCOL_VERSION`），Meta 严格比较，不符（含旧 Node 缺省的 0）返回 `META_NODE_PROTOCOL_VERSION`，Node 直接启动失败；Node 之间的通道不握手，依赖经 Meta 准入的同版本部署。
+- **集群线协议**：Node 注册带 `protocol_version`（当前 7，`afs_protocol::CLUSTER_PROTOCOL_VERSION`），Meta 严格比较，不符（含旧 Node 缺省的 0）返回 `META_NODE_PROTOCOL_VERSION`，Node 直接启动失败；Node 之间的通道不握手，依赖经 Meta 准入的同版本部署。
 - **持久格式**：Meta 数据目录（`CURRENT`、WAL 信封、记录决策、状态 image 等）、Redis／etcd key 布局、Node catalog、外部对象 key 前缀，版本不符一律 `STORAGE_FORMAT_INCOMPATIBLE`，不迁移、不自动删除（[规则](../architecture/afs.md#持久格式与协议版本规则)）。
 
 步骤：
@@ -889,7 +889,7 @@ Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_rema
 需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
 不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。
 
-注册请求携带集群线协议代际 `protocol_version`（当前为 6，`afs_protocol::CLUSTER_PROTOCOL_VERSION`，涵盖 Node↔Meta 注册与 Node↔Node service
+注册请求携带集群线协议代际 `protocol_version`（当前为 7，`afs_protocol::CLUSTER_PROTOCOL_VERSION`，涵盖 Node↔Meta 注册与 Node↔Node service
 布局）。Meta 在登记会话前校验，
 不符或缺省（0，旧 Node）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition），
 不写入任何状态；该错误不属于首次注册的可重试类别，Node 直接启动失败。DFS 与 OwnerFs Node

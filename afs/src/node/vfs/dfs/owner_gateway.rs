@@ -55,7 +55,11 @@ pub(super) trait OwnerLocalFiles {
     /// The accepted write sequence of the resize.
     fn owner_resize(&self, file: FileHandle, length: u64, kill_suidgid: bool) -> Result<u64>;
     /// The handle's durable write sequence and the inode's base version id.
-    fn owner_sync(&self, file: FileHandle, mode: SyncMode) -> Result<(u64, String)>;
+    fn owner_sync(
+        &self,
+        file: FileHandle,
+        mode: SyncMode,
+    ) -> Result<(SyncReceipt, Option<ProxiedCommit>)>;
     /// Releases the handle. `Ok(Some(_))`: it is gone, and this write error had
     /// not reached any caller yet; the releasing caller is its last receiver.
     fn release_owner_handle(&self, file: FileHandle) -> Result<Option<Error>>;
@@ -709,7 +713,7 @@ impl OwnerGateway {
             OwnerOperationStart::Cached(_) => return Err(remote_operation_kind_mismatch()),
             OwnerOperationStart::Apply(claim) => claim,
         };
-        let (durable_write_seq, file_version_id) = local.owner_sync(
+        let (receipt, proxied_commit) = local.owner_sync(
             file,
             if request.data_only {
                 SyncMode::DataOnly
@@ -718,8 +722,14 @@ impl OwnerGateway {
             },
         )?;
         let reply = afs_protocol::node_data::DfsOwnerSyncReply {
-            durable_write_seq,
-            file_version_id,
+            durable_write_seq: receipt.durable_write_seq,
+            file_version_id: receipt.file_version_id,
+            proxied_commit: proxied_commit.map(|commit| {
+                afs_protocol::node_data::DfsOwnerProxiedCommit {
+                    file_version_id: commit.version.0,
+                    inode_revision: commit.revision,
+                }
+            }),
         };
         claim.complete(RemoteOperationResult::Sync {
             fingerprint,
@@ -1725,15 +1735,22 @@ impl OwnerLocalFiles for DistributedFs {
 
     fn owner_resize(&self, file: FileHandle, length: u64, kill_suidgid: bool) -> Result<u64> {
         let snapshot = self.handle_snapshot(file)?;
-        let accepted = self.resize_dirty_inode(&snapshot.inode_id, length, kill_suidgid)?;
+        let writer = snapshot
+            .write_session
+            .as_ref()
+            .map(|session| &session.local.id);
+        let accepted = self.resize_dirty_inode(&snapshot.inode_id, length, kill_suidgid, writer)?;
         self.update_handle_write_progress(file, accepted)?;
         Ok(accepted)
     }
 
-    fn owner_sync(&self, file: FileHandle, mode: SyncMode) -> Result<(u64, String)> {
+    fn owner_sync(
+        &self,
+        file: FileHandle,
+        mode: SyncMode,
+    ) -> Result<(SyncReceipt, Option<ProxiedCommit>)> {
         <Self as Backend>::fsync(self, &owner_request_context(), file, mode)?;
-        let receipt = self.local_sync_receipt(file)?;
-        Ok((receipt.durable_write_seq, receipt.file_version_id))
+        self.sync_receipt_with_proxied_commit(file)
     }
 
     fn release_owner_handle(&self, file: FileHandle) -> Result<Option<Error>> {

@@ -820,5 +820,13 @@ message DfsOwnerSyncRequest {
 }
 message DfsOwnerSyncReply {
   uint64 durable_write_seq = 1;
+  // Current committed version observed after the inode-wide barrier.
   string file_version_id = 2;
+  // Latest commit that included a data mutation accepted for this handle.
+  // Absent when this handle has never committed a data mutation.
+  DfsOwnerProxiedCommit proxied_commit = 3;
+}
+message DfsOwnerProxiedCommit {
+  string file_version_id = 1;
+  uint64 inode_revision = 2;
 }

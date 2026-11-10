@@ -88,7 +88,7 @@ pub(super) struct HandleMut {
     /// The version this Node's proxied writes produced, when the inode could
     /// not be looked up as they ended: the next read moves the handle to it if
     /// it is still the head, or gives up and keeps the current view.
-    pub(super) refresh_view: Option<FileVersionId>,
+    pub(super) refresh_view: Option<ProxiedCommit>,
     pub(super) opened_page_identity: Option<PageCacheIdentity>,
     pub(super) native_read_view: Option<NativeReadView>,
     pub(super) native_read_generation: u64,
@@ -428,26 +428,42 @@ impl DistributedFs {
     /// What a sync barrier on this local handle has reached: this handle's
     /// acknowledged sequence and the inode's committed version.
     pub(super) fn local_sync_receipt(&self, handle: FileHandle) -> Result<SyncReceipt> {
+        self.sync_receipt_with_proxied_commit(handle)
+            .map(|(receipt, _)| receipt)
+    }
+
+    pub(super) fn sync_receipt_with_proxied_commit(
+        &self,
+        handle: FileHandle,
+    ) -> Result<(SyncReceipt, Option<ProxiedCommit>)> {
         let snapshot = self.handle_snapshot(handle)?;
         let durable_write_seq = snapshot
             .write_session
             .as_ref()
             .map_or(0, |session| session.local.last_synced_seq);
-        let file_version_id = self
+        let (file_version_id, proxied_commit) = self
             .write_state(&snapshot.inode_id)?
             .and_then(|state| {
-                state.lock().ok().and_then(|state| {
-                    state
-                        .base_version
-                        .as_ref()
-                        .map(|version| version.id.0.clone())
-                })
+                let state = state.lock().ok()?;
+                let version = state
+                    .base_version
+                    .as_ref()
+                    .map_or_else(String::new, |version| version.id.0.clone());
+                let proxied_commit = snapshot
+                    .owner_scope
+                    .as_ref()
+                    .and(snapshot.write_session.as_ref())
+                    .and_then(|session| state.proxied_commit(&session.local.id));
+                Some((version, proxied_commit))
             })
             .unwrap_or_default();
-        Ok(SyncReceipt {
-            file_version_id,
-            durable_write_seq,
-        })
+        Ok((
+            SyncReceipt {
+                file_version_id,
+                durable_write_seq,
+            },
+            proxied_commit,
+        ))
     }
 
     pub(super) fn update_handle_error_cursor(&self, handle: FileHandle, cursor: u64) -> Result<()> {
@@ -714,10 +730,10 @@ impl DistributedFs {
             .map_err(|_| unavailable("DFS handle state is poisoned"))?
             .refresh_view
             .clone();
-        if let Some(version) = refresh
+        if let Some(commit) = refresh
             && !self.local_writers_open(&opened.inode_id)?
         {
-            match self.proxied_view(&opened.inode_id, &version) {
+            match self.proxied_view(&opened.inode_id, &commit.version) {
                 Ok(found) => {
                     // Settled either way: moved to the proxied version, or
                     // that version is no longer the head and the handle keeps
@@ -730,7 +746,7 @@ impl DistributedFs {
                             .state
                             .lock()
                             .map_err(|_| unavailable("DFS handle state is poisoned"))?;
-                        if state.refresh_view.as_ref() == Some(&version) {
+                        if state.refresh_view.as_ref() == Some(&commit) {
                             state.refresh_view = None;
                         }
                     }

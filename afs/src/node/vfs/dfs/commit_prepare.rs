@@ -504,6 +504,7 @@ impl DistributedFs {
         inode_id: &InodeId,
         length: u64,
         kill_suidgid: bool,
+        proxied_writer: Option<&DfsWriteSessionId>,
     ) -> Result<u64> {
         let state = self
             .write_state(inode_id)?
@@ -516,6 +517,9 @@ impl DistributedFs {
             state.dirty_extents.resize(old_length, length, write_seq)?;
             state.logical_length = length;
             state.dirty = true;
+            if let Some(writer) = proxied_writer {
+                state.note_proxied_write(writer);
+            }
         }
         state.visible_write_seq = write_seq;
         let now = now_unix_ms();
@@ -558,6 +562,7 @@ impl DistributedFs {
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
         state.open_writers = state.open_writers.saturating_sub(1);
+        state.proxied_writes.remove(&session.id);
         if state.open_writers == 0 && (state.dirty || state.metadata_dirty) {
             state.last_writer_background_requested = true;
         }

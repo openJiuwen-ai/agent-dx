@@ -1504,3 +1504,137 @@ fn proxied_close_without_a_sync_moves_no_reader() {
     assert!(!pair.fs_b.handle_view_pending(reader).unwrap());
     pair.fs_b.release(&context(), reader).unwrap();
 }
+
+#[test]
+fn review_proxy_close_flush_must_not_adopt_an_independent_owner_commit() {
+    let pair = remote_owner_pair("review-close-flush.bin", 0o640, b"base-data");
+    let reader = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDONLY)
+        .unwrap();
+    let opened = reader_version(&pair, reader);
+    let writer = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDWR)
+        .unwrap();
+    assert!(
+        pair.fs_b
+            .write_coordinator
+            .current_remote_provider(&pair.inode_id)
+            .unwrap()
+            .is_some()
+    );
+    pair.fs_b.write(&context(), writer, 0, b"PROXIED").unwrap();
+    pair.fs_b.fsync(&context(), writer, SyncMode::Full).unwrap();
+    let proxied = pair.meta.inode.lock().unwrap().head_version.clone();
+    assert_ne!(opened, proxied);
+
+    let inode_a = pair.fs_a.backend_inode(&pair.inode_id).unwrap();
+    let owner_writer = pair.fs_a.open(&context(), inode_a, libc::O_RDWR).unwrap();
+    pair.fs_a
+        .write(&context(), owner_writer, 0, b"OWNER---")
+        .unwrap();
+    pair.fs_a
+        .fsync(&context(), owner_writer, SyncMode::Full)
+        .unwrap();
+    let unrelated = pair.meta.inode.lock().unwrap().head_version.clone();
+    assert_ne!(proxied, unrelated);
+
+    // The ordinary close path flushes once more. B has done no writes since
+    // its successful fsync, so this must not adopt A's independent commit.
+    pair.fs_b.flush(&context(), writer).unwrap();
+    assert_eq!(pair.meta.inode.lock().unwrap().head_version, unrelated);
+    pair.fs_b.release(&context(), writer).unwrap();
+    assert_eq!(reader_version(&pair, reader), opened);
+    pair.fs_b.release(&context(), reader).unwrap();
+    pair.fs_a.release(&context(), owner_writer).unwrap();
+}
+
+#[test]
+fn proxied_close_keeps_newest_attributed_version_across_writers_and_background_commit() {
+    let pair = remote_owner_pair("proxied-close-background.bin", 0o640, b"base-data");
+    let reader = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDONLY)
+        .unwrap();
+    let first = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDWR)
+        .unwrap();
+    let last = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDWR)
+        .unwrap();
+
+    pair.fs_b.write(&context(), last, 0, b"BACKGROUND").unwrap();
+    assert_eq!(pair.fs_a.writeback_pending().unwrap(), 1);
+    let background = pair.meta.inode.lock().unwrap().head_version.clone();
+    pair.fs_b.write(&context(), first, 0, b"FIRST").unwrap();
+    pair.fs_b.flush(&context(), first).unwrap();
+    let latest = pair.meta.inode.lock().unwrap().head_version.clone();
+    assert_ne!(latest, background);
+    pair.fs_b.release(&context(), first).unwrap();
+
+    // This handle's first sync reports its already committed background write,
+    // but it must not displace the newer commit from the other proxy handle.
+    let session = pair
+        .fs_b
+        .handle_snapshot(last)
+        .unwrap()
+        .write_session
+        .unwrap();
+    let reply = pair
+        .fs_b
+        .write_coordinator
+        .remote_sync(&session, SyncMode::DataOnly)
+        .unwrap();
+    assert_eq!(reply.file_version_id, latest.as_ref().unwrap().0);
+    assert_eq!(
+        reply.proxied_commit.unwrap().file_version_id,
+        background.unwrap().0
+    );
+
+    pair.fs_b.release(&context(), last).unwrap();
+    assert_eq!(reader_version(&pair, reader), latest);
+    pair.fs_b.release(&context(), reader).unwrap();
+}
+
+#[test]
+fn proxied_close_attributes_truncate_but_not_open_only_flush() {
+    let pair = remote_owner_pair("proxied-close-truncate.bin", 0o640, b"base-data");
+    let reader = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDONLY)
+        .unwrap();
+    let opened = reader_version(&pair, reader);
+    let writer = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_WRONLY)
+        .unwrap();
+    let inode_a = pair.fs_a.backend_inode(&pair.inode_id).unwrap();
+    let owner_writer = pair.fs_a.open(&context(), inode_a, libc::O_RDWR).unwrap();
+    pair.fs_a
+        .write(&context(), owner_writer, 0, b"OWNER")
+        .unwrap();
+    pair.fs_a
+        .fsync(&context(), owner_writer, SyncMode::Full)
+        .unwrap();
+
+    let lookups = pair.meta.get_inode_call_count();
+    pair.fs_b.flush(&context(), writer).unwrap();
+    pair.fs_b.release(&context(), writer).unwrap();
+    assert_eq!(pair.meta.get_inode_call_count(), lookups);
+    assert_eq!(reader_version(&pair, reader), opened);
+
+    let writer = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_WRONLY | libc::O_TRUNC)
+        .unwrap();
+    pair.fs_b.flush(&context(), writer).unwrap();
+    let truncated = pair.meta.inode.lock().unwrap().head_version.clone();
+    assert_ne!(truncated, opened);
+    pair.fs_b.release(&context(), writer).unwrap();
+    assert_eq!(reader_version(&pair, reader), truncated);
+    pair.fs_b.release(&context(), reader).unwrap();
+    pair.fs_a.release(&context(), owner_writer).unwrap();
+}

@@ -11,9 +11,13 @@ use super::*;
 pub(super) trait RemoteProviderHost {
     /// Remote sessions of the handles still open on the inode, in handle order.
     fn live_remote_sessions(&self, inode_id: &InodeId) -> Result<Vec<RemoteDfsWriteSession>>;
-    /// Called after the provider table changed and before waiting for the
-    /// retired provider's in-flight IO; `last_provider` means none remains.
-    fn remote_provider_replaced(&self, inode_id: &InodeId, last_provider: bool) -> Result<()>;
+    /// Called after the provider table changed. The last provider hands over
+    /// the newest commit attributable to this Node's proxied writes, if any.
+    fn remote_provider_replaced(
+        &self,
+        inode_id: &InodeId,
+        commit: Option<ProxiedCommit>,
+    ) -> Result<()>;
 }
 
 /// Connection to remote inode owners, shared with the lock proxy client.
@@ -38,9 +42,9 @@ pub(super) struct WriteCoordinator {
     pub(super) channel: OwnerChannel,
     remote_inode_providers: ShardedMap<InodeId, RemoteDfsWriteSession>,
     pub(super) pending_remote_releases: Mutex<PendingRemoteReleaseState>,
-    /// The version the owner reported for this Node's latest proxied sync of
-    /// each inode, consumed when the inode's last proxy session ends (R94).
-    proxied_versions: Mutex<HashMap<InodeId, FileVersionId>>,
+    /// The latest attributed commit of this Node's proxy sessions per inode.
+    /// Consumed when the last proxy session ends.
+    proxied_versions: Mutex<HashMap<InodeId, ProxiedCommit>>,
 }
 
 #[derive(Default)]
@@ -201,18 +205,6 @@ impl WriteCoordinator {
             pending_remote_releases: Mutex::new(PendingRemoteReleaseState::default()),
             proxied_versions: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Takes the version the owner reported for the inode's latest proxied
-    /// sync. Replies of concurrent syncs may arrive out of order: an older
-    /// version recorded last is no longer the head, and the caller then keeps
-    /// its handles where they are.
-    pub(super) fn take_proxied_version(&self, inode_id: &InodeId) -> Result<Option<FileVersionId>> {
-        Ok(self
-            .proxied_versions
-            .lock()
-            .map_err(|_| unavailable("DFS proxied version table is poisoned"))?
-            .remove(inode_id))
     }
 
     pub(super) fn open_remote_write_session(
@@ -492,14 +484,32 @@ impl WriteCoordinator {
                 through_write_seq: session.local.last_accepted_seq,
                 data_only: matches!(mode, SyncMode::DataOnly),
             })?;
-        if !reply.file_version_id.is_empty() {
-            self.proxied_versions
+        if let Some(commit) = &reply.proxied_commit {
+            // Retiring the provider excludes late replies from a closed handle.
+            let lifecycle = remote
+                .lifecycle
+                .state
                 .lock()
-                .map_err(|_| unavailable("DFS proxied version table is poisoned"))?
-                .insert(
-                    session.local.inode_id.clone(),
-                    FileVersionId::new(reply.file_version_id.clone()),
-                );
+                .map_err(|_| unavailable("DFS remote provider lifecycle is poisoned"))?;
+            if lifecycle.live {
+                let mut versions = self
+                    .proxied_versions
+                    .lock()
+                    .map_err(|_| unavailable("DFS proxied version table is poisoned"))?;
+                let inode_id = &session.local.inode_id;
+                if versions
+                    .get(inode_id)
+                    .is_none_or(|seen| seen.revision < commit.inode_revision)
+                {
+                    versions.insert(
+                        inode_id.clone(),
+                        ProxiedCommit {
+                            version: FileVersionId::new(commit.file_version_id.clone()),
+                            revision: commit.inode_revision,
+                        },
+                    );
+                }
+            }
         }
         Ok(reply)
     }
@@ -969,9 +979,17 @@ impl WriteCoordinator {
                 providers.remove(inode_id);
             }
         }
-        let last_provider = !providers.contains_key(inode_id);
+        // Take the final commit before a new provider can be installed.
+        let commit = if providers.contains_key(inode_id) {
+            None
+        } else {
+            self.proxied_versions
+                .lock()
+                .map_err(|_| unavailable("DFS proxied version table is poisoned"))?
+                .remove(inode_id)
+        };
         drop(providers);
-        host.remote_provider_replaced(inode_id, last_provider)
+        host.remote_provider_replaced(inode_id, commit)
     }
 
     fn retire_released_remote_provider(
@@ -1212,16 +1230,17 @@ impl RemoteProviderHost for DistributedFs {
             .collect())
     }
 
-    fn remote_provider_replaced(&self, inode_id: &InodeId, last_provider: bool) -> Result<()> {
+    fn remote_provider_replaced(
+        &self,
+        inode_id: &InodeId,
+        commit: Option<ProxiedCommit>,
+    ) -> Result<()> {
         self.handles.mark_dynamic(inode_id)?;
-        if !last_provider {
+        let Some(commit) = commit else {
             return Ok(());
-        }
-        let proxied = self.write_coordinator.take_proxied_version(inode_id)?;
+        };
         let handles = self.handles.for_inode(inode_id)?;
-        if let Some(version) = proxied
-            && !handles.is_empty()
-        {
+        if !handles.is_empty() {
             // Writes this Node proxied are visible to its handles (4a): once
             // the last proxy session ends they move to the version the owner
             // reported for them, and only to it: another Node's later commit
@@ -1230,7 +1249,7 @@ impl RemoteProviderHost for DistributedFs {
             // the writes; failing to look the version up is not a write error
             // of the closing writer, so the handles keep their protected views
             // and the next read looks again for the same version.
-            match self.proxied_view(inode_id, &version) {
+            match self.proxied_view(inode_id, &commit.version) {
                 Ok(Some(inode)) => self.advance_to_local_view(&inode)?,
                 Ok(None) => {}
                 Err(error) => {
@@ -1239,11 +1258,17 @@ impl RemoteProviderHost for DistributedFs {
                         "handles" => handles.len(),
                         "error" => error.to_string());
                     for handle in handles {
-                        handle
+                        let mut state = handle
                             .state
                             .lock()
-                            .map_err(|_| unavailable("DFS handle state is poisoned"))?
-                            .refresh_view = Some(version.clone());
+                            .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+                        if state
+                            .refresh_view
+                            .as_ref()
+                            .is_none_or(|seen| seen.revision < commit.revision)
+                        {
+                            state.refresh_view = Some(commit.clone());
+                        }
                     }
                 }
             }
