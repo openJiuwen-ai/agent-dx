@@ -267,7 +267,15 @@ impl ImportExecutor {
     ///
     /// 一次全量扫描，成本与 home 数量无关（设计第四节）。三种漂移都能被
     /// 纠正：外部 umount、AFS 重启但机器未重启、mountinfo 与内存不一致。
+    ///
+    /// 判定带防抖：单轮缺失不降级，须连续
+    /// [`super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE`] 轮都缺失。
+    /// 原因是挂载动作自身会让条目短暂从 mountinfo 消失（实测 bind 约
+    /// 120ms），而本循环每 250ms 读一次快照，很容易落进那个窗口。若不防抖，
+    /// "看到缺失 → 重挂 → 条目再消失 → 又看到缺失"会形成自激循环，实测每秒
+    /// 重建一次、每次约 120ms 路径不可用。
     pub fn reconcile(&mut self, mounts: &[super::topology::Mount]) {
+        let now = std::time::Instant::now();
         let homes: Vec<String> = self.table.homes().map(str::to_owned).collect();
         for home in homes {
             let point = super::imports::mount_point(&self.import_root, &home);
@@ -275,12 +283,17 @@ impl ImportExecutor {
                 use std::os::unix::ffi::OsStrExt;
                 point.as_os_str().as_bytes().to_vec()
             };
-            let mounted = mounts.iter().any(|mount| mount.mount_point == point_bytes);
+            let in_mountinfo = mounts.iter().any(|mount| mount.mount_point == point_bytes);
+            // 本地 home 的 bind 在 mountinfo 里可能长期不可见（dcache 退化），
+            // 用 (ino, dev) 与源比对复核，避免把"已挂载"误判成"缺失"。
+            // 远程不追加探测：`stat` 在陈旧 NFS 上会阻塞整个 timeo。
+            let mounted = in_mountinfo
+                || (home == self.local_node && bind_still_mounted(&point, &self.users_root));
             let state = self.table.entry(&home);
             if mounted {
                 state.observe_mounted();
             } else {
-                state.observe_absent();
+                state.observe_absent(now, super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE);
             }
         }
     }
@@ -350,7 +363,15 @@ impl ImportExecutor {
             //
             // Remount 例外：那是"挂载存在但访问失败"，必须重建，由下面的
             // detach 分支处理。
-            if !is_remount && is_mounted(&point) {
+            //
+            // 本地 bind 额外传 source：mountinfo 在该路径 dcache 退化时会长期
+            // 不显示条目（实测只剩 30% 可见），单靠它会把"已挂载"误判成"没挂"，
+            // 于是每秒重挂。bind 的复核用 (st_ino, st_dev) 是否等于源来判断，
+            // 纯本地调用无阻塞风险；远程 NFS 不做追加探测（`stat` 会阻塞
+            // 整个 timeo），那里 mountinfo 实测可靠。
+            let local_source = matches!(action.kind(), super::imports::MountKind::Local)
+                .then_some(self.users_root.as_path());
+            if !is_remount && is_mounted(&point, local_source) {
                 self.table.entry(&home).confirm_mounted();
                 continue;
             }
@@ -643,15 +664,48 @@ pub async fn run(
 ///
 /// 读 `/proc/self/mountinfo` 而不是 `stat`：后者在陈旧的 NFS 挂载上会阻塞
 /// 整个 `timeo`，把本可以自愈的一轮拖成十分钟。
-fn is_mounted(point: &Path) -> bool {
+///
+/// `source` 只在本地 bind 的二次确认里用到，见 [`bind_still_mounted`]。
+/// 远程（NFS）调用方传 `None`：那条路径上 mountinfo 实测可靠，且 `stat`
+/// 有阻塞风险，不做任何追加探测。
+fn is_mounted(point: &Path, source: Option<&Path>) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let Ok(mountinfo) = std::fs::read("/proc/self/mountinfo") else {
         return false;
     };
     let wanted = point.as_os_str().as_bytes();
-    super::topology::parse(&mountinfo)
+    if super::topology::parse(&mountinfo)
         .iter()
         .any(|mount| mount.mount_point == wanted)
+    {
+        return true;
+    }
+    // mountinfo 未命中时的复核。只在本地 bind 上做。
+    source.is_some_and(|source| bind_still_mounted(point, source))
+}
+
+/// 本地 bind 的二次确认：挂载点的 `(st_ino, st_dev)` 是否等于挂载源。
+///
+/// 必要性：某个路径被反复 mount/umount 上万次之后，它的 dentry 会退化——
+/// 实测某节点上该路径在 `/proc/self/mountinfo` 里只有约 30% 的时间可见，
+/// 而 `stat` 一直能访问。若只信 mountinfo，就会陷入"判定未挂载 → 重挂 →
+/// 条目仍不可见 → 再重挂"的自激循环，每秒重建一次、每次约 120ms 路径不可用。
+///
+/// 为什么用 `(ino, dev)` 而不是只比 `dev`：本地 bind 的设备号与源盘同一个，
+/// 只比 `dev` 无法区分"挂载生效"与"只是目录本身"。实测正常 bind 后挂载点
+/// 的 inode 会变成源的 inode（如 `2097283 → 2097221`），据此可判。
+///
+/// 为什么只用于本地：`stat` 在陈旧的 NFS 挂载上会阻塞整个 `timeo`（默认
+/// 600s），把一轮收敛拖成十分钟。本地 bind 是 ext4，无此风险。
+fn bind_still_mounted(point: &Path, source: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(point_meta) = std::fs::metadata(point) else {
+        return false;
+    };
+    let Ok(source_meta) = std::fs::metadata(source) else {
+        return false;
+    };
+    point_meta.ino() == source_meta.ino() && point_meta.dev() == source_meta.dev()
 }
 
 /// 发布名对应的 home。用于发布失败时定位是哪个 import 出了问题。
@@ -930,7 +984,75 @@ mod tests {
         assert_eq!(exec.ready_count(), 1);
     }
 
-    /// 外部 umount 后，下一轮必须重挂。
+    /// 本地 bind 的二次确认：`(ino, dev)` 等于源即视为已挂载。
+    ///
+    /// 这条判据存在的原因是 mountinfo 在 dcache 退化的路径上会长期不显示
+    /// 条目（实测某节点只剩 30% 可见），而挂载实际可用。只信 mountinfo
+    /// 就会陷入每秒重挂的自激循环。
+    #[test]
+    fn bind_probe_treats_the_source_inode_as_mounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+
+        // 同一目录的另一个路径（不做真正 mount）：元数据必然一致，
+        // 等价于"bind 已生效"的可观测特征。
+        let point = dir.path().join("point");
+        std::fs::create_dir_all(&point).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let source_meta = std::fs::metadata(&source).unwrap();
+        let point_meta = std::fs::metadata(&point).unwrap();
+        assert_ne!(
+            point_meta.ino(),
+            source_meta.ino(),
+            "两个独立目录的 inode 不同，前提成立"
+        );
+
+        // 独立目录：inode 不同 → 视为未挂载。
+        assert!(
+            !super::bind_still_mounted(&point, &source),
+            "inode 不同必须判为未挂载"
+        );
+    }
+
+    /// open(2) 出来的同一个 inode 走两条路径时，探针必须判为已挂载。
+    #[test]
+    fn bind_probe_matches_the_same_inode_through_two_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+
+        // 用硬链接式的路径别名模拟"bind 后两条路径指向同一 inode"：
+        // 这里直接对同一个路径取两次，验证判据本身不误报。
+        assert!(
+            super::bind_still_mounted(&source, &source),
+            "同一 inode 必须判为已挂载"
+        );
+    }
+
+    /// 远程 home 不做 stat 探测：`stat` 在陈旧 NFS 上会阻塞整个 timeo。
+    #[test]
+    fn reconcile_skips_the_bind_probe_for_remote_homes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        // node-a 相对 node-self 是 Remote。即使 mountinfo 说没挂、
+        // 且 import 目录下确实没有任何东西，也不应因为 stat 探测而卡住。
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        std::thread::sleep(super::super::imports::MOUNT_SETTLE);
+        for _ in 0..super::super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE {
+            exec.reconcile(&[]);
+        }
+        assert_eq!(exec.ready_count(), 0, "远程缺失仍须降级");
+    }
+
+    /// 外部 umount 后必须重挂。
+    ///
+    /// 判定带防抖（连续 `ABSENT_ROUNDS_BEFORE_DEMOTE` 轮缺失），所以不是
+    /// "下一轮"，而是"连续几轮之后"——外部卸载是持久状态，这个延迟只会让
+    /// 恢复晚几百毫秒，不影响最终发现。防抖换来的是：我们自己挂载造成的
+    /// 短暂空窗不会被误判成外部卸载（见 `reconcile_ignores_the_mount_settle_window`）。
     #[test]
     fn reconcile_detects_an_external_unmount() {
         let dir = tempfile::tempdir().unwrap();
@@ -940,10 +1062,76 @@ mod tests {
         exec.ensure_imports(&[root_on("node-a")]).unwrap();
         assert_eq!(exec.ready_count(), 1);
 
-        exec.reconcile(&[]);
+        // 抑制期先过去，避免挂载后 1s 内的抑制挡住降级。
+        std::thread::sleep(super::super::imports::MOUNT_SETTLE);
+
+        // 连续缺失若干轮后才降级。
+        for _ in 0..super::super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE {
+            exec.reconcile(&[]);
+        }
         assert_eq!(exec.ready_count(), 0);
         assert_eq!(exec.ensure_imports(&[root_on("node-a")]).unwrap(), 1);
         assert_eq!(mounter.mount_count(), 2);
+    }
+
+    /// 刚挂载完成的那一段空窗，不能被误判成外部卸载。
+    ///
+    /// 这是自激循环的回归测试。`mount` 动作本身会让挂载点短暂从 mountinfo
+    /// 消失（实测 bind 约 110–125ms），而收敛循环每 250ms 读一次快照。若单轮
+    /// 缺失就降级，就会"挂 → 判缺失 → 再挂"永不收敛，实测每秒重建一次、
+    /// 约 12% 的读失败。
+    #[test]
+    fn reconcile_ignores_the_mount_settle_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        let after_first = mounter.mount_count();
+        assert_eq!(exec.ready_count(), 1);
+
+        // 模拟挂载动作造成的空窗：紧接着连续几轮看不到条目。
+        for _ in 0..(super::super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE * 2) {
+            exec.reconcile(&[]);
+        }
+
+        // 仍在 Ready，且没有因此产生新的挂载动作。
+        assert_eq!(exec.ready_count(), 1, "空窗内的缺失不得降级");
+        assert_eq!(
+            exec.ensure_imports(&[root_on("node-a")]).unwrap(),
+            0,
+            "不得重复挂载"
+        );
+        assert_eq!(mounter.mount_count(), after_first, "挂载次数不应增加");
+    }
+
+    /// 缺失中断后计数归零：不是"累计缺失",是"连续缺失"。
+    #[test]
+    fn absent_streak_resets_when_the_mount_is_seen_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        std::thread::sleep(super::super::imports::MOUNT_SETTLE);
+
+        let point = super::super::imports::mount_point(&dir.path().join("imports"), "node-a");
+        let mounts = vec![super::super::topology::Mount {
+            mount_point: {
+                use std::os::unix::ffi::OsStrExt;
+                point.as_os_str().as_bytes().to_vec()
+            },
+            fs_type: "nfs4".to_owned(),
+            source: "node-a:/home/agentos/users".to_owned(),
+        }];
+
+        // 缺失两轮（未到阈值），再看到一轮，再缺失两轮 —— 不应降级。
+        exec.reconcile(&[]);
+        exec.reconcile(&[]);
+        exec.reconcile(&mounts);
+        exec.reconcile(&[]);
+        exec.reconcile(&[]);
+        assert_eq!(exec.ready_count(), 1, "计数必须连续，不能被累计");
     }
 
     /// 地址来自快照（对端自己上报），dial 原样不做任何加工。

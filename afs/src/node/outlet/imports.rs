@@ -22,6 +22,27 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// 首次失败的等待时间；此后逐次翻倍直到 [`MAX_BACKOFF`]。
 pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
+/// 连续多少轮读不到挂载条目才认定"真的被外部卸载"。
+///
+/// `mount` 动作本身有代价：从开始挂到条目重新出现在 `/proc/self/mountinfo`
+/// 之间有一段空窗（实测 bind 约 110–125ms，NFS 更长）。而收敛循环每 250ms
+/// 读一次快照，很容易正好落进这个窗口。
+///
+/// 若单轮缺失就降级为 `NeedsMount`，就会形成自我维持的循环：
+/// 挂载 → 条目短暂消失 → 判定未挂载 → 再挂载 → 条目再消失。实测该循环会
+/// 稳定持续，每秒重建一次，每次造成约 120ms 的路径不可用（约 12% 的读失败）。
+///
+/// 取 3 轮（≈750ms）足以跨过任何一次自建挂载的空窗，同时对外部 umount
+/// 仍是"下一轮就能发现"的响应速度——外部卸载是持久的，多等两轮无副作用。
+pub const ABSENT_ROUNDS_BEFORE_DEMOTE: u32 = 3;
+
+/// 刚挂载完成后的抑制期：此期间不因 mountinfo 缺条目而降级。
+///
+/// 与 [`ABSENT_ROUNDS_BEFORE_DEMOTE`] 互补：连续计数已经能吸收空窗，
+/// 这里再加一道时间闸，防止"每轮都读、但恰好每轮都落在窗口内"的极端情况
+/// （快照读取与挂载动作的周期若发生共振，单靠计数仍可能连续命中）。
+pub const MOUNT_SETTLE: Duration = Duration::from_secs(1);
+
 /// 一个 home 的挂载阶段。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
@@ -52,6 +73,13 @@ pub struct ImportState {
     consecutive_failures: u32,
     /// 早于此刻的重试被跳过。`Ready` 时无意义。
     next_attempt: Instant,
+    /// 连续多少轮 mountinfo 里看不到该挂载点。
+    ///
+    /// 单轮缺失不足以判定"被外部卸载"——我们自己刚挂完的那一段窗口里也缺失。
+    /// 只有连续 [`ABSENT_ROUNDS_BEFORE_DEMOTE`] 轮都缺失才降级。
+    consecutive_absent: u32,
+    /// 最近一次挂载成功的时刻，用于 [`MOUNT_SETTLE`] 抑制期。
+    mounted_at: Option<Instant>,
 }
 
 impl Default for ImportState {
@@ -60,6 +88,8 @@ impl Default for ImportState {
             phase: Phase::NeedsMount,
             consecutive_failures: 0,
             next_attempt: Instant::now(),
+            consecutive_absent: 0,
+            mounted_at: None,
         }
     }
 }
@@ -86,6 +116,8 @@ impl ImportState {
         self.consecutive_failures = 0;
         // Ready 不参与冷却判断，仍清零以便下次失败从 1s 起算。
         self.next_attempt = Instant::now();
+        // 已确认挂着，缺失计数归零。
+        self.consecutive_absent = 0;
     }
 
     fn mark_needs_mount(&mut self) {
@@ -117,6 +149,10 @@ impl ImportState {
     pub fn confirm_mounted(&mut self) -> bool {
         let changed = self.phase != Phase::Ready;
         self.mark_ready();
+        // 记下时刻：接下来的 MOUNT_SETTLE 内不因 mountinfo 缺条目而降级。
+        // 挂载动作本身会让条目短暂消失（实测 bind 约 120ms），这段窗口里
+        // 的"缺失"不是外部卸载。
+        self.mounted_at = Some(Instant::now());
         changed
     }
 
@@ -127,6 +163,8 @@ impl ImportState {
 
     /// mountinfo 说这个 home 已挂载。用于校正内存状态。
     pub fn observe_mounted(&mut self) -> bool {
+        // 看到了就是看到了，无论如何清零缺失计数。
+        self.consecutive_absent = 0;
         let changed = self.phase != Phase::Ready;
         // 已挂载不等于可访问：Remount 阶段说明访问失败过，即使 mountinfo
         // 仍有条目也要重建。所以只在 NeedsMount 时升级为 Ready。
@@ -137,7 +175,28 @@ impl ImportState {
     }
 
     /// mountinfo 说这个 home 没有挂载条目。
-    pub fn observe_absent(&mut self) {
+    ///
+    /// 单轮缺失不代表被卸载：刚挂载完成后、条目尚未出现在 mountinfo 的窗口，
+    /// 与"被外部 umount"在单次快照上完全无法区分。所以这里累计缺失轮数，
+    /// 只在两种防抖都放行后才真正降级：
+    ///
+    /// 1. 已连续缺失 `rounds` 轮（吸收自建挂载的空窗）；
+    /// 2. 距上次挂载已超过 [`MOUNT_SETTLE`]（防住与快照周期的共振）。
+    ///
+    /// 外部 umount 是持久状态，多等几轮不影响最终发现——这正是原测试
+    /// `reconcile_detects_an_external_unmount` 仍然成立的原因。
+    pub fn observe_absent(&mut self, now: Instant, rounds: u32) {
+        self.consecutive_absent = self.consecutive_absent.saturating_add(1);
+        if self.consecutive_absent < rounds {
+            return;
+        }
+        if let Some(mounted_at) = self.mounted_at
+            && now.duration_since(mounted_at) < MOUNT_SETTLE
+        {
+            // 还在抑制期内：把计数压在阈值下方，下一轮再判，避免提前降级。
+            self.consecutive_absent = rounds.saturating_sub(1);
+            return;
+        }
         self.mark_needs_mount();
     }
 

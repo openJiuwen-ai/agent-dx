@@ -161,11 +161,18 @@ fn observed_absence_downgrades_ready_to_needs_mount() {
     table.entry("node-a").confirm_mounted();
     assert_eq!(table.entry("node-a").phase(), Phase::Ready);
 
-    let now = Instant::now();
-    table.entry("node-a").observe_absent();
+    // 降级需要连续 ABSENT_ROUNDS_BEFORE_DEMOTE 轮缺失（防抖），且跨过
+    // MOUNT_SETTLE 抑制期——单轮缺失不足以判断"被外部卸载"。
+    // 这里把观测时刻推后到抑制期之外，模拟"挂好一阵之后被外部卸掉"。
+    let later = Instant::now() + MOUNT_SETTLE;
+    for _ in 0..ABSENT_ROUNDS_BEFORE_DEMOTE {
+        table
+            .entry("node-a")
+            .observe_absent(later, ABSENT_ROUNDS_BEFORE_DEMOTE);
+    }
     assert_eq!(table.entry("node-a").phase(), Phase::NeedsMount);
     assert_eq!(
-        plan_imports(&homes(&["node-a"]), "node-b", &table, now),
+        plan_imports(&homes(&["node-a"]), "node-b", &table, later),
         vec![ImportAction::Mount {
             kind: MountKind::Remote,
             home: "node-a".into()
@@ -270,9 +277,15 @@ fn mounted_home_survives_a_round_without_its_roots() {
         "a mounted home must not be forgotten just because it has no roots right now"
     );
 
-    // 挂载被外部卸载后，仍必须产生重挂动作。
-    table.entry("node-b").observe_absent();
-    let actions = plan_imports(&homes(&["node-a"]), "node-a", &table, Instant::now());
+    // 挂载被外部卸载后，仍必须产生重挂动作（需连续缺失达到防抖阈值，
+    // 且观测时刻在 MOUNT_SETTLE 抑制期之外）。
+    let later = Instant::now() + MOUNT_SETTLE;
+    for _ in 0..ABSENT_ROUNDS_BEFORE_DEMOTE {
+        table
+            .entry("node-b")
+            .observe_absent(later, ABSENT_ROUNDS_BEFORE_DEMOTE);
+    }
+    let actions = plan_imports(&homes(&["node-a"]), "node-a", &table, later);
     let homes_in_actions: Vec<&str> = actions.iter().map(ImportAction::home).collect();
     assert!(
         homes_in_actions.contains(&"node-b"),
@@ -284,7 +297,9 @@ fn mounted_home_survives_a_round_without_its_roots() {
 #[test]
 fn never_mounted_home_is_not_retained() {
     let mut table = ImportTable::new();
-    table.entry("node-x").observe_absent();
+    table
+        .entry("node-x")
+        .observe_absent(Instant::now(), ABSENT_ROUNDS_BEFORE_DEMOTE);
     table.retain(&homes(&["node-a"]));
     assert!(table.state("node-x").is_none());
 }
