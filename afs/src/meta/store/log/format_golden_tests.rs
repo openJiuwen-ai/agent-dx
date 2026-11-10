@@ -230,6 +230,10 @@ fn meta_store_enum_variant_indices_are_pinned() {
         33: StoreOperation::DfsUpdateReference => StoreOperation::DfsUpdateReference,
         34: StoreOperation::DfsCollectGarbage => StoreOperation::DfsCollectGarbage,
         35: StoreOperation::DfsInitializeReplicaFailureConfig => StoreOperation::DfsInitializeReplicaFailureConfig,
+        36: StoreOperation::DfsBindLazySource => StoreOperation::DfsBindLazySource,
+        37: StoreOperation::DfsRestoreFileChunk => StoreOperation::DfsRestoreFileChunk,
+        38: StoreOperation::DfsPublishReadCache => StoreOperation::DfsPublishReadCache,
+        39: StoreOperation::DfsRetireReadCache => StoreOperation::DfsRetireReadCache,
     });
 }
 

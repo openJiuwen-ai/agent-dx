@@ -39,6 +39,13 @@ pub trait DfsMeta: Send + Sync {
     fn resolve_write_authority(&self, inode_id: &InodeId) -> Result<(InodeRecord, WriteLease)> {
         self.open_write(inode_id)
     }
+    /// Observe an existing owner without any lease mutation.
+    fn observe_write_authority(&self, _inode_id: &InodeId) -> Result<(InodeRecord, WriteLease)> {
+        Err(Error::coded(
+            afs_error::NODE_VFS_UNAVAILABLE,
+            "read-only write authority resolution is unavailable",
+        ))
+    }
     /// Callable on an async worker. The default leaves the worker for the sync
     /// method; a network client overrides it with its native future.
     fn resolve_write_authority_async(
@@ -115,6 +122,22 @@ pub trait DfsMeta: Send + Sync {
     fn set_inode_attributes(&self, request: SetInodeAttrRequest) -> Result<InodeRecord>;
     fn get_xattr(&self, request: GetXattrRequest) -> Result<Vec<u8>>;
     fn list_xattr(&self, request: ListXattrRequest) -> Result<Vec<Vec<u8>>>;
+    fn restore_file_chunk(
+        &self,
+        _request: crate::dfs::RestoreFileChunk,
+        _timeout: Duration,
+    ) -> Result<()> {
+        Err(Error::coded(
+            afs_error::IO_NOT_SUPPORTED,
+            "Meta does not support source restoration",
+        ))
+    }
+    fn bind_lazy_source(&self, _request: crate::dfs::BindLazySourceRequest) -> Result<InodeRecord> {
+        Err(Error::coded(
+            afs_error::IO_NOT_SUPPORTED,
+            "Meta does not support lazy source binding",
+        ))
+    }
     fn set_xattr(&self, request: SetXattrRequest) -> Result<InodeRecord>;
     fn remove_xattr(&self, request: RemoveXattrRequest) -> Result<InodeRecord>;
 }

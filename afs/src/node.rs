@@ -20,6 +20,7 @@ pub(crate) mod bridge;
 pub(crate) mod call_deadline;
 pub mod chunk;
 pub(crate) mod chunk_crc32c;
+pub mod connectors;
 pub mod diagnostics;
 #[cfg(feature = "dfs")]
 pub mod external_chunk;

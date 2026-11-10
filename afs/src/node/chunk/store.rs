@@ -101,6 +101,7 @@ impl LocalChunkStore {
             outboard_repairs: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
             catalog_path,
             catalog: Mutex::new(catalog),
+            read_cache_admission: Mutex::new(()),
             catalog_committer: CatalogCommitter::default(),
             next_staging: AtomicU64::new(1),
             #[cfg(any(feature = "dfs", test))]
@@ -416,6 +417,17 @@ impl LocalChunkStore {
         placement_revision: u64,
         placement_epoch: u64,
     ) -> Result<Vec<ReplicaAck>> {
+        self.persist_batch_kind(staged, target, placement_revision, placement_epoch, 0)
+    }
+
+    pub(super) fn persist_batch_kind(
+        &self,
+        staged: &[StagedChunk],
+        target: &ReplicaTarget,
+        placement_revision: u64,
+        placement_epoch: u64,
+        read_cache_epoch: u64,
+    ) -> Result<Vec<ReplicaAck>> {
         let _diagnostic = self.coarse_diagnostic("persist_batch", 0);
         #[cfg(any(feature = "dfs", test))]
         let batch_diagnostic = self
@@ -434,6 +446,7 @@ impl LocalChunkStore {
             target,
             placement_revision,
             placement_epoch,
+            read_cache_epoch,
             &admission,
             #[cfg(any(feature = "dfs", test))]
             batch_diagnostic,
@@ -446,12 +459,14 @@ impl LocalChunkStore {
 
     /// Admitted batch: durable bodies, one catalog commit, then the durable ACKs.
     /// Optional proof installation stays after every required durability barrier.
+    #[allow(clippy::too_many_arguments)]
     fn persist_admitted(
         &self,
         staged: &[StagedChunk],
         target: &ReplicaTarget,
         placement_revision: u64,
         placement_epoch: u64,
+        read_cache_epoch: u64,
         admission: &catalog_commit::Admission<'_>,
         #[cfg(any(feature = "dfs", test))] batch_diagnostic: Option<
             super::super::metrics::read_timing::ReadDiagnosticSpan,
@@ -472,7 +487,13 @@ impl LocalChunkStore {
         let mut records = Vec::new();
         let mut installed_chunk_ids = HashSet::new();
         for item in staged {
-            self.persist_staged_item(item, admission, &mut records, &mut installed_chunk_ids)?;
+            self.persist_staged_item(
+                item,
+                admission,
+                &mut records,
+                &mut installed_chunk_ids,
+                read_cache_epoch,
+            )?;
         }
         drop(installed_chunk_ids);
         let catalog_revision = self.commit_catalog(admission, records)?;
@@ -510,6 +531,7 @@ impl LocalChunkStore {
         admission: &catalog_commit::Admission<'_>,
         records: &mut Vec<LocalChunkRecord>,
         installed_chunk_ids: &mut HashSet<ChunkId>,
+        read_cache_epoch: u64,
     ) -> Result<()> {
         let existing = self
             .catalog
@@ -529,10 +551,28 @@ impl LocalChunkStore {
         )?;
         #[cfg(test)]
         self.test_hooks.catalog_commit_test.pause_prepare()?;
+        // An optional read copy cannot replace a required durable record.
+        if read_cache_epoch != 0
+            && existing
+                .as_ref()
+                .is_some_and(|old| old.read_cache_epoch == 0)
+        {
+            return Ok(());
+        }
         let replace_existing = match existing.as_ref() {
             Some(existing) => match self.existing_copy_needs_replacement(existing, item)? {
                 Some(replace) => replace,
-                None => return Ok(()),
+                None => {
+                    if read_cache_epoch == 0
+                        && existing.read_cache_epoch != 0
+                        && installed_chunk_ids.insert(item.chunk.id.clone())
+                    {
+                        let mut promoted = existing.clone();
+                        promoted.read_cache_epoch = 0;
+                        records.push(promoted);
+                    }
+                    return Ok(());
+                }
             },
             None => false,
         };
@@ -552,6 +592,7 @@ impl LocalChunkStore {
                 encoding: PhysicalEncoding::Raw,
                 state: LocalChunkState::Durable,
                 catalog_revision: 0,
+                read_cache_epoch,
             });
         }
         self.observe_catalog_preparing(

@@ -709,6 +709,7 @@ impl DfsService {
     ) -> Result<(Vec<TxnMutation>, Vec<TxnCondition>)> {
         if !copy_is_on_node(source_copy, &request.caller_id)
             || !copy_matches_chunk(source_copy, &request.claim.chunk)
+            || !source_copy.is_ready_durable()
             || serving_read_copy(source_copy, caller_session, now).is_none()
         {
             return Err(permission_denied(
@@ -1110,7 +1111,7 @@ impl DfsService {
         let mut source = None;
         for copy_id in &placement.copies {
             let copy = self.copy(copy_id).await?;
-            if !copy_matches_chunk(&copy, &chunk) {
+            if !copy.is_ready_durable() || !copy_matches_chunk(&copy, &chunk) {
                 continue;
             }
             if let CopyLocation::Node { node_id, .. } = &copy.location
@@ -1651,6 +1652,7 @@ pub(super) async fn live_sources_among(
             });
         }
         if let Some(MetaEntity::NodeSession(session)) = snapshot.entity
+            && copy.is_ready_durable()
             && serving_read_copy(copy, &session, now).is_some()
         {
             nodes.insert(node_id.clone());

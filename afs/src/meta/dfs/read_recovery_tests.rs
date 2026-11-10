@@ -533,6 +533,31 @@ async fn live_read_copy_allows_new_writes_above_startup_catalog_floor() {
     assert!(serving_read_copy(&fixture.copy, &session, now_unix_ms()).is_some());
 }
 
+#[tokio::test]
+async fn verified_cache_has_read_grant_only_in_its_published_session() {
+    let fixture = fixture().await;
+    let mut cache = fixture.copy.clone();
+    cache.role = CopyRole::VerifiedCache;
+    assert!(!cache.is_ready_durable());
+    overwrite_copy(&fixture.store, cache, "verified-cache-read").await;
+
+    let sources = fixture.sources().await;
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].role, CopyRole::VerifiedCache);
+    fixture.validate(&sources[0], 1).await.unwrap();
+
+    let replacement = fixture
+        .restart(fixture.local.device_descriptor().unwrap())
+        .await;
+    assert!(fixture.sources().await.is_empty());
+    assert!(
+        fixture
+            .validate(&sources[0], replacement.lease_epoch)
+            .await
+            .is_err()
+    );
+}
+
 fn repair_replication() -> ReplicationConfig {
     ReplicationConfig {
         desired_copies: 2,

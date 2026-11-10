@@ -55,6 +55,7 @@ catalog! {
     NODE_VFS_INVALID = 0x02080002 => InvalidArgument;
     NODE_VFS_UNIMPLEMENTED = 0x02080003 => Unimplemented;
     NODE_VFS_UNAVAILABLE = 0x02080004 => Unavailable;
+    NODE_VFS_RANGE = 0x02080006 => OutOfRange;
     NODE_MOUNT_CONFLICT = 0x02080005 => AlreadyExists;
     NODE_OWNER_INVALID_GRANT = 0x020b0001 => FailedPrecondition;
     NODE_OWNER_GRANT_UNAVAILABLE = 0x020b0002 => Unavailable;

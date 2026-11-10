@@ -3,6 +3,35 @@
 use super::*;
 
 impl DfsService {
+    async fn lazy_owner_session_replaced(
+        &self,
+        inode: &InodeRecord,
+        lease: &WriteLease,
+        caller_id: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        // A lazy fill can reconstruct any uncommitted bytes from its
+        // immutable source. Ordinary writes keep their existing lease window.
+        if !inode
+            .xattrs
+            .contains_key(crate::dfs::LAZY_FILE_DESCRIPTOR_XATTR)
+            || lease.owner_node_id != caller_id
+            || lease.owner_session_id == session_id
+        {
+            return Ok(false);
+        }
+        let current = self
+            .store
+            .read(MetaRead::CurrentNodeSession {
+                node_id: caller_id.to_owned(),
+            })
+            .await?;
+        Ok(
+            matches!(current.entity, Some(MetaEntity::NodeSession(session))
+            if session.session_id == session_id && session.is_live_at_unix_ms(now_unix_ms())),
+        )
+    }
+
     async fn acquire_write_lease(
         &self,
         caller_id: String,
@@ -48,7 +77,12 @@ impl DfsService {
         let same_owner =
             lease.owner_node_id == caller_id && lease.owner_session_id == owner_session_id;
         let live = lease.expires_at_unix_ms > now;
-        if live && !same_owner {
+        let replacing_lazy_owner = live
+            && !same_owner
+            && self
+                .lazy_owner_session_replaced(&inode, &lease, &caller_id, &owner_session_id)
+                .await?;
+        if live && !same_owner && !replacing_lazy_owner {
             return Err(conflict("DFS write lease is held by another live owner"));
         }
         lease.owner_node_id = caller_id.clone();
@@ -82,6 +116,15 @@ impl DfsService {
                 .conditions
                 .push(TxnCondition::Missing(MetaKey::DfsWriteLease(inode_id))),
         }
+        if replacing_lazy_owner {
+            txn.conditions.extend([
+                TxnCondition::NodeSessionCurrent {
+                    node_id: lease.owner_node_id.clone(),
+                    session_id: lease.owner_session_id.clone(),
+                },
+                TxnCondition::EntityEquals(MetaEntity::DfsInode(inode)),
+            ]);
+        }
         txn.mutations.extend([
             TxnMutation::Put(MetaEntity::DfsWriteLease(lease)),
             TxnMutation::RecordRequestOutcome(outcome),
@@ -90,6 +133,68 @@ impl DfsService {
             self.store.compare_and_commit(txn).await?,
             StoreOperation::DfsAcquireWriteLease,
         )
+    }
+
+    async fn rebind_lazy_owner_for_peer(
+        &self,
+        inode: &InodeRecord,
+        old: &WriteLease,
+        caller_id: &str,
+        caller_session_id: &str,
+        lease_seconds: u64,
+    ) -> Result<Option<WriteLease>> {
+        if old.owner_node_id == caller_id
+            || !inode
+                .xattrs
+                .contains_key(crate::dfs::LAZY_FILE_DESCRIPTOR_XATTR)
+        {
+            return Ok(None);
+        }
+        let current = self
+            .store
+            .read(MetaRead::CurrentNodeSession {
+                node_id: old.owner_node_id.clone(),
+            })
+            .await?;
+        let Some(MetaEntity::NodeSession(current)) = current.entity else {
+            return Ok(None);
+        };
+        if current.session_id == old.owner_session_id || !current.is_live_at_unix_ms(now_unix_ms())
+        {
+            return Ok(None);
+        }
+
+        let mut lease = old.clone();
+        lease.owner_session_id = current.session_id;
+        lease.lease_epoch = lease.lease_epoch.saturating_add(1);
+        lease.expires_at_unix_ms = lease_expiry(lease_seconds)?;
+        // This is an internal repair of the existing owner's authority. The
+        // peer's resolve request stays a fresh read and never acquires a lease.
+        let key = RequestKey::new(caller_id, format!("lazy-rebind-{}", uuid::Uuid::new_v4()));
+        let operation = StoreOperation::DfsAcquireWriteLease;
+        let mut txn = MetaTxn::new(key.clone(), operation);
+        txn.conditions.extend([
+            TxnCondition::RequestAbsent(key.clone()),
+            TxnCondition::EntityEquals(MetaEntity::DfsInode(inode.clone())),
+            TxnCondition::EntityEquals(MetaEntity::DfsWriteLease(old.clone())),
+            TxnCondition::NodeSessionCurrent {
+                node_id: old.owner_node_id.clone(),
+                session_id: lease.owner_session_id.clone(),
+            },
+            TxnCondition::NodeSessionCurrent {
+                node_id: caller_id.to_owned(),
+                session_id: caller_session_id.to_owned(),
+            },
+        ]);
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsWriteLease(lease.clone())),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation,
+                result: OperationResult::DfsWriteLease(lease),
+            }),
+        ]);
+        lease_outcome(self.store.compare_and_commit(txn).await?, operation).map(Some)
     }
 
     pub async fn open_write(
@@ -162,9 +267,10 @@ impl DfsService {
                 "DFS {context} authority requires a regular file"
             )));
         }
+        let observe_only = context == "write" && lease_seconds == 0;
         // Recover a lost acquire reply before reading a newer live authority.
         // Read-only resolutions have no recorded result and remain fresh reads.
-        if let Some(recorded) = recorded {
+        if let Some(recorded) = recorded.filter(|_| !observe_only) {
             if recorded.operation != StoreOperation::DfsAcquireWriteLease {
                 return Err(invalid(
                     "DFS operation_id was already used for another operation",
@@ -199,8 +305,35 @@ impl DfsService {
                 )));
             }
             if lease.expires_at_unix_ms > now_unix_ms() {
-                return Ok((inode, lease));
+                if observe_only {
+                    return Ok((inode, lease));
+                }
+                if context == "write"
+                    && let Some(rebound) = self
+                        .rebind_lazy_owner_for_peer(
+                            &inode,
+                            &lease,
+                            &caller_id,
+                            &owner_session_id,
+                            lease_seconds,
+                        )
+                        .await?
+                {
+                    return Ok((inode, rebound));
+                }
+                if !self
+                    .lazy_owner_session_replaced(&inode, &lease, &caller_id, &owner_session_id)
+                    .await?
+                {
+                    return Ok((inode, lease));
+                }
             }
+        }
+        if observe_only {
+            return Err(Error::coded(
+                afs_error::NODE_VFS_UNAVAILABLE,
+                "DFS has no unexpired write authority to observe",
+            ));
         }
         let lease = self
             .acquire_write_lease(

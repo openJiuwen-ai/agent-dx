@@ -60,6 +60,19 @@ pub(super) async fn run_node(
     // 5–9.
     let mut backends =
         common::Backends::assemble(&cfg, &obs, &startup, metrics, storage, &registration).await?;
+    #[cfg(feature = "dfs")]
+    let connector_routes = if let Some(dfs) = backends.dfs.instance.as_ref() {
+        let backend: Arc<dyn super::vfs::Backend> = dfs.clone();
+        let root = backend.root_inode();
+        backends
+            .dfs
+            .connectors
+            .http_routes(super::connectors::ConnectorContext { backend, root })?
+    } else {
+        axum::Router::new()
+    };
+    #[cfg(not(feature = "dfs"))]
+    let connector_routes = axum::Router::new();
     // 10–12.
     let (endpoints, local) = common::LocalEndpoints::serve(&cfg, &obs, &backends).await?;
     let (mounts, local) = common::FuseMounts::mount(&cfg, &backends, local).await?;
@@ -107,7 +120,7 @@ pub(super) async fn run_node(
         registration.epoch,
         &mut services,
     );
-    background::RestServer::new(ingress.rest, state.clone()).start(&mut services);
+    background::RestServer::new(ingress.rest, state.clone(), connector_routes).start(&mut services);
     endpoints.into_sweeper().start(&mut services);
     // Multi-workspace bind mount is handled by MountManager via mkdir triggers.
     // No single-workspace startup worker is needed.

@@ -35,6 +35,7 @@ fn record(id: &str, revision: u64, segment_crc: Option<CrcTable>) -> LocalChunkR
         encoding: PhysicalEncoding::Raw,
         state: LocalChunkState::Durable,
         catalog_revision: revision,
+        read_cache_epoch: 0,
         segment_crc,
     }
 }

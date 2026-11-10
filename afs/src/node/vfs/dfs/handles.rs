@@ -54,6 +54,7 @@ const PENDING_VIEW_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const PENDING_VIEW_RETRY_INTERVAL: Duration = Duration::from_millis(0);
 
 pub(super) struct DfsFileHandle {
+    pub(super) origin_fill: bool,
     pub(super) gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     pub(super) inode_id: InodeId,
     pub(super) opened_inode: InodeRecord,
@@ -67,6 +68,7 @@ pub(super) struct DfsFileHandle {
 }
 
 pub(super) struct DfsHandle {
+    pub(super) origin_fill: bool,
     pub(super) direct_prefetch:
         std::sync::OnceLock<Arc<crate::node::read::direct_prefetch::Controller>>,
     pub(super) inode_id: InodeId,
@@ -103,6 +105,7 @@ pub(super) type PinnedReadView = Result<(Arc<OpenedView>, NativeReadView)>;
 impl From<DfsFileHandle> for DfsHandle {
     fn from(opened: DfsFileHandle) -> Self {
         Self {
+            origin_fill: opened.origin_fill,
             direct_prefetch: std::sync::OnceLock::new(),
             inode_id: opened.inode_id,
             flags: opened.flags,
@@ -654,7 +657,7 @@ impl DistributedFs {
     }
 
     /// A view of `inode` protected by this Node's GC reference for its version.
-    fn protected_view(&self, inode: &InodeRecord) -> Result<Arc<OpenedView>> {
+    pub(super) fn protected_view(&self, inode: &InodeRecord) -> Result<Arc<OpenedView>> {
         let pin = match &self.gc.references {
             Some(references) => Some(references.pin(&inode.inode_id, inode.head_version.as_ref())?),
             None => None,

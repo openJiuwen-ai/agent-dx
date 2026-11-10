@@ -78,6 +78,114 @@ impl crate::node::replication::ReplicationTaskAuthority for GrpcDfsMeta {
 
 #[cfg(feature = "dfs")]
 impl crate::node::read::engine::ReadSourceProvider for GrpcDfsMeta {
+    fn publish_read_cache(
+        &self,
+        request: crate::dfs::PublishReadCache,
+        deadline: std::time::Instant,
+    ) -> crate::node::read::admission::ReadFuture<'_, crate::dfs::CopyRecord> {
+        Box::pin(async move {
+            let expected = crate::dfs::read_cache_copy(&request.receipt)?;
+            let mut client = self.client();
+            let reply = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                client.publish_read_cache(afs_tracing::request_with_current_context(
+                    afs_protocol::meta::PublishDfsReadCacheRequest {
+                        caller_id: request.caller_id,
+                        caller_session_id: request.caller_session_id,
+                        caller_node_epoch: request.caller_node_epoch,
+                        operation_id: request.operation_id.0,
+                        namespace_id: request.namespace_id.0,
+                        file_version_id: request.file_version_id.0,
+                        layout_root_id: request.layout_root_id.0,
+                        receipt: Some(wire_replica_ack(request.receipt)),
+                    },
+                )),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::NODE_TRANSFER_UNAVAILABLE,
+                    "read cache publication expired",
+                )
+            })?
+            .map_err(afs_transport::grpc::error_status::status_to_error)?
+            .into_inner();
+            if reply.copy_id != expected.id.0 {
+                return Err(afs_error::Error::coded(
+                    afs_error::CLIENT_PROTOCOL_VIOLATION,
+                    "read cache publication identity differs",
+                ));
+            }
+            Ok(expected)
+        })
+    }
+
+    fn retire_read_cache(
+        &self,
+        request: crate::dfs::RetireReadCache,
+        deadline: std::time::Instant,
+    ) -> crate::node::read::admission::ReadFuture<'_, ()> {
+        Box::pin(async move {
+            let crate::dfs::CopyLocation::Node {
+                node_id,
+                node_epoch,
+                device_id,
+                device_epoch,
+                catalog_revision,
+            } = request.copy.location
+            else {
+                return Err(afs_error::Error::coded(
+                    afs_error::IO_INVALID,
+                    "read cache retirement requires node copy",
+                ));
+            };
+            if request.copy.role != crate::dfs::CopyRole::VerifiedCache
+                || request.copy.state != crate::dfs::CopyState::Ready
+            {
+                return Err(afs_error::Error::coded(
+                    afs_error::IO_INVALID,
+                    "read cache retirement requires verified cache",
+                ));
+            }
+            let ack = crate::dfs::ReplicaAck {
+                operation_id: request.operation_id.clone(),
+                chunk_id: request.copy.chunk_id,
+                placement_revision: 0,
+                placement_epoch: 0,
+                node_id,
+                node_epoch,
+                device_id,
+                device_epoch,
+                catalog_revision,
+                persisted_bytes: request.copy.persisted_bytes,
+                verified_digest: request.copy.verified_digest,
+            };
+            let mut client = self.client();
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                client.retire_read_cache(afs_tracing::request_with_current_context(
+                    afs_protocol::meta::RetireDfsReadCacheRequest {
+                        caller_id: request.caller_id,
+                        caller_session_id: request.caller_session_id,
+                        caller_node_epoch: request.caller_node_epoch,
+                        operation_id: request.operation_id.0,
+                        copy_id: request.copy.id.0,
+                        receipt: Some(wire_replica_ack(ack)),
+                    },
+                )),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::NODE_TRANSFER_UNAVAILABLE,
+                    "read cache retirement expired",
+                )
+            })?
+            .map_err(afs_transport::grpc::error_status::status_to_error)?;
+            Ok(())
+        })
+    }
+
     fn sources_for_async(
         &self,
         request: crate::dfs::DfsChunkSourcesRequest,

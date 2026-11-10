@@ -729,6 +729,9 @@ impl LocalChunkStore {
             revision,
             records,
             checksum,
+            removed: Vec::new(),
+            cache_updates: Vec::new(),
+            cache_acks: Vec::new(),
         };
         #[cfg(test)]
         {
@@ -801,7 +804,7 @@ impl LocalChunkStore {
                 .clone());
         }
         for record in txn.records {
-            catalog.records.insert(record.chunk.id.clone(), record);
+            catalog.insert_record(record);
         }
         catalog.revision = revision;
         Ok(revision)

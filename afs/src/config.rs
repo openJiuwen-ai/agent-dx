@@ -450,6 +450,10 @@ pub struct Cli {
 #[serde(deny_unknown_fields)]
 /// TOML 输入层。拒绝未知字段，让拼错开关在启动时失败，而不是静默使用默认行为。
 struct FileConfig {
+    connectors: Option<crate::node::connectors::ConnectorsConfig>,
+    dfs_read_parallelism: Option<usize>,
+    dfs_read_stripe_bytes: Option<usize>,
+    dfs_read_cache_bytes: Option<u64>,
     id: Option<String>,
     grpc_listen: Option<SocketAddr>,
     rest_listen: Option<SocketAddr>,
@@ -573,6 +577,10 @@ impl DfsReadCrcMode {
 #[derive(Debug, Clone, Serialize)]
 /// 解析和校验后的进程配置。模块接收这个值，不各自重复读取配置文件或环境变量。
 pub struct Config {
+    pub connectors: crate::node::connectors::ConnectorsConfig,
+    pub dfs_read_parallelism: usize,
+    pub dfs_read_stripe_bytes: usize,
+    pub dfs_read_cache_bytes: u64,
     pub id: String,
     pub grpc_listen: SocketAddr,
     pub rest_listen: SocketAddr,
@@ -712,6 +720,11 @@ impl Config {
         cross::validate_read_crc(&cfg)?;
         cfg.meta_log_limits()?;
         cfg.meta_store_target()?;
+        if cfg.connectors.nydus.enabled
+            && (role != Role::Node || !cfg.dfs || cfg.dfs_external_backend.is_some())
+        {
+            return Err(invalid("Nydus connector requires a native DFS Node"));
+        }
         cfg.meta_maintenance_policy()?;
         cfg.meta_history_limits()?;
         Ok(cfg)
@@ -741,6 +754,10 @@ impl Config {
                 ([127, 0, 0, 1], if role == Role::Meta { 7401 } else { 7501 }).into()
             }),
             meta_endpoint: cli.meta_endpoint.or(file.meta_endpoint),
+            connectors: file.connectors.unwrap_or_default(),
+            dfs_read_parallelism: file.dfs_read_parallelism.unwrap_or(1),
+            dfs_read_stripe_bytes: file.dfs_read_stripe_bytes.unwrap_or(256 * 1024),
+            dfs_read_cache_bytes: file.dfs_read_cache_bytes.unwrap_or(0),
             meta_store: meta.meta_store,
             meta_redis_url: meta.meta_redis_url,
             meta_etcd_endpoints: meta.meta_etcd_endpoints,
