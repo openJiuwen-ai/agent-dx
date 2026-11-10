@@ -7,7 +7,7 @@
 use super::{Cli, FileConfig, invalid};
 use afs_error::Result;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf};
 
 /// Cross-node outlet name layer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -47,12 +47,6 @@ pub struct DynamicImports {
     /// Address peers use to reach this node's export. Advertised through the
     /// Meta session, so no peer needs to resolve this node's id.
     pub nfs_addr: String,
-    /// Explicit overrides for a peer's advertised address.
-    ///
-    /// Empty in normal operation: the snapshot carries each home's address.
-    /// Kept for multi-homed nodes and NAT, where the address a node advertises
-    /// is not the one this client must dial.
-    pub hosts: BTreeMap<String, String>,
 }
 
 impl DynamicImports {
@@ -61,30 +55,6 @@ impl DynamicImports {
     /// `hard` keeps a peer outage from turning into a silent short read.
     pub const DEFAULT_MOUNT_OPTIONS: &'static str =
         "vers=4.1,hard,timeo=600,retrans=2,noresvport,nosuid,nodev";
-}
-
-/// Parse `node-a=10.0.0.1,node-b=10.0.0.2` into a map.
-///
-/// A malformed entry fails the config rather than being skipped: a missing
-/// mapping only shows up as a peer that never mounts, which is much harder to
-/// diagnose than a startup error naming the bad entry.
-pub(super) fn parse_host_map(raw: &str) -> std::result::Result<BTreeMap<String, String>, String> {
-    let mut map = BTreeMap::new();
-    for entry in raw.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let Some((node, host)) = entry.split_once('=') else {
-            return Err(format!("expected node=host, got `{entry}`"));
-        };
-        let (node, host) = (node.trim(), host.trim());
-        if node.is_empty() || host.is_empty() {
-            return Err(format!("expected node=host, got `{entry}`"));
-        }
-        map.insert(node.to_owned(), host.to_owned());
-    }
-    Ok(map)
 }
 
 /// Resolves the layer from CLI over TOML. `None` disables the feature.
@@ -182,11 +152,6 @@ pub(super) fn resolve(
         if options.trim().is_empty() {
             return Err(invalid("outlet_import_mount_options must not be empty"));
         }
-        let hosts = cli
-            .outlet_import_hosts
-            .clone()
-            .or(file.outlet_import_hosts.clone())
-            .unwrap_or_default();
         // This node's own NFS address: what peers will dial. Declared once,
         // here, and carried to every peer through the Meta session, so adding a
         // node never edits another node's config.
@@ -215,7 +180,6 @@ pub(super) fn resolve(
             users_root,
             mount_options: options,
             nfs_addr,
-            hosts,
         })
     } else {
         // The switch is off: any mount-option setting is inert. Rejecting it

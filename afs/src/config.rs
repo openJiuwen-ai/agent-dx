@@ -365,12 +365,6 @@ pub struct Cli {
     /// node's configuration. Defaults to the host part of `grpc_listen`.
     #[arg(long)]
     pub outlet_nfs_addr: Option<String>,
-    /// Explicit node id to NFS address overrides, e.g. `node-b=192.168.2.213`.
-    /// Only needed when a peer's advertised address is wrong for this client
-    /// (multi-homed nodes, NAT). Normally empty: addresses come from the
-    /// snapshot.
-    #[arg(long, value_parser = outlet::parse_host_map)]
-    pub outlet_import_hosts: Option<std::collections::BTreeMap<String, String>>,
     #[arg(long)]
     pub dfs_mount: Option<PathBuf>,
     /// FUSE receive threads shared by OwnerFs and DFS (1..=64).
@@ -588,7 +582,6 @@ struct FileConfig {
     outlet_import_mount_options: Option<String>,
     outlet_users_root: Option<PathBuf>,
     outlet_nfs_addr: Option<String>,
-    outlet_import_hosts: Option<std::collections::BTreeMap<String, String>>,
     dfs_mount: Option<PathBuf>,
     fuse_threads: Option<u16>,
     fuse_clone_fd: Option<bool>,

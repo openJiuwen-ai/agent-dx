@@ -232,9 +232,7 @@ pub struct ImportExecutor {
     users_root: PathBuf,
     mount_options: String,
     local_node: String,
-    /// 节点 id -> NFS 地址，显式覆盖用（多网卡/NAT）。
-    hosts: std::collections::BTreeMap<String, String>,
-    /// 每轮从快照刷新的、对端自己上报的地址。常态下这是唯一来源。
+    /// 每轮从快照刷新的、对端自己上报的地址。这是唯一来源。
     advertised: std::collections::BTreeMap<String, String>,
     mounter: Arc<dyn super::mount::ImportMounter>,
     table: super::imports::ImportTable,
@@ -247,7 +245,6 @@ impl ImportExecutor {
         users_root: PathBuf,
         mount_options: String,
         local_node: String,
-        hosts: std::collections::BTreeMap<String, String>,
         mounter: Arc<dyn super::mount::ImportMounter>,
     ) -> Self {
         Self {
@@ -255,7 +252,6 @@ impl ImportExecutor {
             users_root,
             mount_options,
             local_node,
-            hosts,
             advertised: std::collections::BTreeMap::new(),
             mounter,
             table: super::imports::ImportTable::new(),
@@ -377,15 +373,7 @@ impl ImportExecutor {
                     // 地址随快照来：home 注册会话时自己上报，所以新增节点
                     // 不需要任何既有节点改配置。节点 id 是 AFS 身份、不是域名，
                     // 不能拿它去解析。
-                    //
-                    // 显式覆盖只用于多网卡/NAT——那种情况下对端上报的地址对
-                    // 本客户端不可达。
-                    let host = match self
-                        .hosts
-                        .get(&home)
-                        .cloned()
-                        .or_else(|| self.advertised.get(&home).cloned())
-                    {
+                    let host = match self.advertised.get(&home).cloned() {
                         Some(host) if !host.is_empty() => host,
                         _ => {
                             // 没有地址就不能猜，否则每轮都失败并把日志刷满。
@@ -851,26 +839,29 @@ mod tests {
     }
 
     fn executor(dir: &std::path::Path, mounter: Arc<FakeMounter>) -> ImportExecutor {
-        let mut hosts = std::collections::BTreeMap::new();
-        hosts.insert("node-a".to_owned(), "192.0.2.10".to_owned());
-        hosts.insert("node-b".to_owned(), "192.0.2.11".to_owned());
-        hosts.insert("node-c".to_owned(), "192.0.2.12".to_owned());
         ImportExecutor::new(
             dir.join("imports"),
             PathBuf::from("/home/agentos/users"),
             "vers=4.1,hard".to_owned(),
             "node-self".to_owned(),
-            hosts,
             mounter,
         )
     }
 
     fn root_on(home: &str) -> OutletRoot {
+        // 测试约定：地址随快照来。给已知 home 一个稳定地址，未知名留空
+        //（空地址即"该 home 没上报"，会被跳过）。
+        let addr = match home {
+            "node-a" => "192.0.2.10",
+            "node-b" => "192.0.2.11",
+            "node-c" => "192.0.2.12",
+            _ => "",
+        };
         OutletRoot {
             root_id: RootId("root-61".into()),
             root_epoch: 1,
             home_node_id: home.to_owned(),
-            home_nfs_addr: String::new(),
+            home_nfs_addr: addr.to_owned(),
         }
     }
 
@@ -955,21 +946,16 @@ mod tests {
         assert_eq!(mounter.mount_count(), 2);
     }
 
-    /// 地址来自快照（对端自己上报），不需要任何本地映射表。
-    ///
-    /// 这是新节点加入的正确语义：它只声明自己，既有的每个节点都从快照里
-    /// 学到它的地址，谁都不用改配置。
+    /// 地址来自快照（对端自己上报），dial 原样不做任何加工。
     #[test]
-    fn address_comes_from_the_snapshot_without_a_mapping() {
+    fn address_comes_from_the_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let mounter = Arc::new(FakeMounter::default());
-        // 故意不给任何 hosts 映射。
         let mut exec = ImportExecutor::new(
             dir.path().join("imports"),
             PathBuf::from("/home/agentos/users"),
             "vers=4.1,hard".to_owned(),
             "node-self".to_owned(),
-            std::collections::BTreeMap::new(),
             mounter.clone(),
         );
 
@@ -995,7 +981,6 @@ mod tests {
             PathBuf::from("/home/agentos/users"),
             "vers=4.1,hard".to_owned(),
             "node-self".to_owned(),
-            std::collections::BTreeMap::new(),
             mounter.clone(),
         );
 
@@ -1027,36 +1012,17 @@ mod tests {
             PathBuf::from("/home/agentos/users"),
             "vers=4.1,hard".to_owned(),
             "node-self".to_owned(),
-            std::collections::BTreeMap::new(),
             mounter.clone(),
         );
 
-        // node-a 的 root 没有地址。
-        assert_eq!(exec.ensure_imports(&[root_on("node-a")]).unwrap(), 0);
-        assert_eq!(mounter.mount_count(), 0);
-    }
-
-    /// 没有地址映射时不尝试挂载，也不反复刷日志。
-    #[test]
-    fn unmapped_home_is_reported_not_attempted() {
-        let dir = tempfile::tempdir().unwrap();
-        let mounter = Arc::new(FakeMounter::default());
-        let mut hosts = std::collections::BTreeMap::new();
-        hosts.insert("node-c".to_owned(), "192.0.2.12".to_owned());
-        let mut exec = ImportExecutor::new(
-            dir.path().join("imports"),
-            PathBuf::from("/home/agentos/users"),
-            "vers=4.1,hard".to_owned(),
-            "node-self".to_owned(),
-            hosts,
-            mounter.clone(),
+        // node-b 的 root 没有地址：不猜，也不回退到节点名解析。
+        let mut no_addr = root_on("node-b");
+        no_addr.home_nfs_addr.clear();
+        // node-c 有地址：正常挂载，说明一个缺失不影响其他 home。
+        assert_eq!(
+            exec.ensure_imports(&[no_addr, root_on("node-c")]).unwrap(),
+            1
         );
-
-        // node-a 没有映射：不挂载。
-        assert_eq!(exec.ensure_imports(&[root_on("node-a")]).unwrap(), 0);
-        assert_eq!(mounter.mount_count(), 0);
-        // node-c 有映射：正常挂载，说明一个缺失不影响其他。
-        assert_eq!(exec.ensure_imports(&[root_on("node-c")]).unwrap(), 1);
         assert_eq!(mounter.mount_count(), 1);
     }
 

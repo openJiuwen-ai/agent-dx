@@ -74,7 +74,6 @@ pub(super) fn start_mirror(
                 dynamic.users_root.clone(),
                 dynamic.mount_options.clone(),
                 cfg.id.clone(),
-                dynamic.hosts.clone(),
                 Arc::new(KernelMounter),
             ))
         }
