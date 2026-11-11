@@ -42,6 +42,7 @@ tokio-stream = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 
 [dev-dependencies]
+tracing = "0.1"
 opentelemetry = { version = "0.31", features = ["trace"] }
 opentelemetry_sdk = { version = "0.31", features = ["trace", "testing"] }
 adx-agent-api = { path = "../../agent/api" }

@@ -67,6 +67,8 @@
 
 `transport_recovery` 真实 Redis 回归使用按连接隔离的 RESP 代理，覆盖既有连接无响应而新连接健康、写入已执行但应答丢失、写入在 Redis 前迟到及调用取消。后两种场景在恢复为空目录后释放旧命令，验证其不能补写；相同 Environment ID／Request ID 重试仍只发布一个有效结果。
 
+共享 [Coordinator 发现库](../../platform/crates/discovery/README.md) 单独管理只读发现连接：瞬态连接故障在同一绝对期限内至多重读一次，旧连接的迟到错误不会清除新连接；坏记录、epoch 不匹配和永久错误仍拒绝发现。`transport_recovery` 同时覆盖其缓存代理连接断开后的当前调用恢复，以及 Redis 停机时拒绝、重启后恢复。此处的发现重读不扩展为状态写入重放。
+
 ## 本地验证入口
 
 ```sh
