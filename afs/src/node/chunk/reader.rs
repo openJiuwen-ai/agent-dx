@@ -35,20 +35,13 @@ impl PinnedChunkReader {
         out: &mut [u8],
         verify_body: bool,
     ) -> Result<Vec<usize>> {
+        // The descriptor and the chunk identity are immutable fields that
+        // `check_crc_descriptor` validated when this reader was built; only
+        // the body below can change underneath a pin.
         let table = self
             .segment_crc
             .as_ref()
             .ok_or_else(|| invalid("CRC descriptor missing"))?;
-        if let Some(metrics) = &self.read_work {
-            metrics.hash("crc_descriptor_hash", table.descriptor_input_bytes());
-        }
-        if !self.chunk.is_segment_crc32c()
-            || !self.chunk.valid_immutable_identity()
-            || !table.valid_shape(self.chunk.length)
-            || table.descriptor_digest() != self.chunk.content_digest
-        {
-            return Err(corrupt(&self.chunk.id, "CRC descriptor identity differs"));
-        }
         let before = PeerFileIdentity::read(&self.file)?;
         if before.length != self.chunk.length {
             return Err(corrupt(&self.chunk.id, "CRC body length differs"));
@@ -393,6 +386,27 @@ impl PinnedChunkReader {
             self.read_work.as_ref(),
         )
     }
+}
+
+/// Validate a segmented-CRC descriptor against its chunk identity: the format,
+/// the table shape and the table digest that the chunk identity commits to.
+/// Every `PinnedChunkReader` holding a descriptor passes this once when built.
+pub(super) fn check_crc_descriptor(
+    chunk: &ChunkObject,
+    table: &super::super::chunk_crc32c::CrcTable,
+    read_work: Option<&super::super::metrics::work::ReadWorkMetrics>,
+) -> Result<()> {
+    if let Some(metrics) = read_work {
+        metrics.hash("crc_descriptor_hash", table.descriptor_input_bytes());
+    }
+    if !chunk.is_segment_crc32c()
+        || !chunk.valid_immutable_identity()
+        || !table.valid_shape(chunk.length)
+        || table.descriptor_digest() != chunk.content_digest
+    {
+        return Err(corrupt(&chunk.id, "CRC descriptor identity differs"));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
