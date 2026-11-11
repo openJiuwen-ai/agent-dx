@@ -200,6 +200,8 @@ pub(super) struct InodeWriteState {
     pub(super) open_writers: u64,
     pub(super) last_writer_background_requested: bool,
     pub(super) background_error: Option<ObservedWriteError>,
+    pub(super) writeback_retry_at: Option<Instant>,
+    pub(super) writeback_failures: u32,
     pub(super) terminal_error: Option<Error>,
 }
 
@@ -815,6 +817,8 @@ impl DistributedFs {
                 open_writers: 0,
                 last_writer_background_requested: false,
                 background_error: None,
+                writeback_retry_at: None,
+                writeback_failures: 0,
                 terminal_error: None,
             })
             .with_lock_wait(self.writes.lock_wait.clone()),

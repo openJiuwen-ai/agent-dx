@@ -428,7 +428,18 @@ pub(crate) fn mount_with_policy(
     if let Some(bridge) = &features.fd_bridge {
         bridge.bind(&backend)?;
     }
+    let fsync_runtime = if backend.fsync_timeout().is_some() {
+        Some(tokio::runtime::Handle::try_current().map_err(|error| {
+            Error::coded(
+                afs_error::CONFIG_INVALID,
+                format!("DFS fsync requires a runtime: {error}"),
+            )
+        })?)
+    } else {
+        None
+    };
     let mut fs = AfsFuse::with_mount_options(backend, exec);
+    fs.fsync_runtime = fsync_runtime;
     fs.requests = metrics.map(|metrics| (metrics, policy.label()));
     fs.policy = policy.clone();
     fs.fd_bridge = features.fd_bridge.clone();

@@ -414,6 +414,7 @@ impl DfsAssembly {
             tokio::runtime::Handle::current(),
             Some(dfs_read_work_metrics.clone()),
         )?;
+        let fs = fs.with_write_timeout(std::time::Duration::from_millis(cfg.dfs_write_timeout_ms));
         self.instance = Some(Arc::new(fs));
         Ok(())
     }

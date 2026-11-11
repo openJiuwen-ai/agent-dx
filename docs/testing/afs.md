@@ -48,7 +48,7 @@ AFS 产品二进制只支持 ARM64，也不代表 x86_64 包或定向 Linux driv
 3. DFS 一写多读核心场景；
 4. 普通 OwnerFs 本地 FUSE 访问及性能优化。
 
-大规模、长时间、多 Meta／高可用和完整故障矩阵继续后置；etcd、Redis 已可作 Meta 操作日志后端，26 个本机故障场景见 `afs/tests/run.py --suite local-fault`。pjdfstest、固定 LTP filesystem 子集和短 FSx 用于兜底功能完备性；项目自定义 case 只补充 OwnerFs bind、远端访问、DFS 复制、Meta 恢复和权限语义。
+大规模、长时间、多 Meta／高可用和完整故障矩阵继续后置；etcd、Redis 已可作 Meta 操作日志后端，28 个本机故障场景见 `afs/tests/run.py --suite local-fault`。pjdfstest、固定 LTP filesystem 子集和短 FSx 用于兜底功能完备性；项目自定义 case 只补充 OwnerFs bind、远端访问、DFS 复制、Meta 恢复和权限语义。
 
 ## 性能目标
 

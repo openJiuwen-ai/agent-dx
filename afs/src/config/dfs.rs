@@ -191,6 +191,7 @@ pub(super) struct DfsTuning {
     pub(super) dfs_catalog_commit_queue: usize,
     pub(super) dfs_write_queue_bytes: u64,
     pub(super) dfs_dirty_budget_bytes: u64,
+    pub(super) dfs_write_timeout_ms: u64,
     pub(super) dfs_gc_grace_ms: u64,
     pub(super) dfs_unpublished_descriptors: usize,
     pub(super) dfs_upload_inflight_chunks: usize,
@@ -239,6 +240,13 @@ pub(super) fn resolve_tuning(cli: &Cli, file: &FileConfig) -> Result<DfsTuning> 
         .unwrap_or(64 * 1024 * 1024);
     if !(4 * 1024 * 1024..=64 * 1024 * 1024).contains(&dfs_dirty_budget_bytes) {
         return Err(invalid("DFS native dirty budget bytes must be 4..=64MiB"));
+    }
+    let dfs_write_timeout_ms = cli
+        .dfs_write_timeout_ms
+        .or(file.dfs_write_timeout_ms)
+        .unwrap_or(30_000);
+    if !(1..=600_000).contains(&dfs_write_timeout_ms) {
+        return Err(invalid("DFS write timeout must be 1..=600000ms"));
     }
     let dfs_gc_grace_ms = cli
         .dfs_gc_grace_ms
@@ -353,6 +361,7 @@ pub(super) fn resolve_tuning(cli: &Cli, file: &FileConfig) -> Result<DfsTuning> 
         dfs_catalog_commit_queue,
         dfs_write_queue_bytes,
         dfs_dirty_budget_bytes,
+        dfs_write_timeout_ms,
         dfs_gc_grace_ms,
         dfs_unpublished_descriptors,
         dfs_upload_inflight_chunks,

@@ -236,6 +236,8 @@ fn synthetic_write_state(
         open_writers: 0,
         last_writer_background_requested: false,
         background_error: None,
+        writeback_retry_at: None,
+        writeback_failures: 0,
         terminal_error: None,
     }))
 }
