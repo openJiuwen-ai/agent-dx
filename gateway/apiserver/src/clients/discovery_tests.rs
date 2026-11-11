@@ -196,3 +196,129 @@ async fn authentication_discovery_and_rpc_share_the_original_budget() {
     assert_eq!(error.code(), Code::DeadlineExceeded);
     assert!(started.elapsed() < Duration::from_millis(1150));
 }
+
+#[tokio::test]
+async fn hanging_discovery_preserves_http_503_and_never_calls_verify_key() {
+    let fixture = Fixture::new().await;
+    fixture.expire_endpoint().await;
+    *fixture.peer.state.reply.lock().unwrap() = redis_peer::Reply::Delay(Duration::from_secs(10));
+    let before = fixture.auth.calls.load(Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let response = fixture.request(&"a".repeat(40)).await;
+    assert_eq!(response.status(), 503);
+    let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+    assert_eq!(body["error"]["code"], "UNAVAILABLE");
+    assert_eq!(body["error"]["retry"], "after_backoff");
+    assert_eq!(fixture.auth.calls.load(Ordering::SeqCst), before);
+    assert!(started.elapsed() < Duration::from_millis(1500));
+}
+
+#[tokio::test]
+async fn hanging_auth_rpc_preserves_http_503() {
+    let fixture = Fixture::new().await;
+    fixture.auth.delay_ms.store(2000, Ordering::SeqCst);
+    let before = fixture.auth.calls.load(Ordering::SeqCst);
+    let response = fixture.request(&"a".repeat(40)).await;
+    assert_eq!(response.status(), 503);
+    let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+    assert_eq!(body["error"]["code"], "UNAVAILABLE");
+    assert_eq!(fixture.auth.calls.load(Ordering::SeqCst), before + 1);
+}
+
+#[tokio::test]
+async fn unrepresentable_authentication_budget_is_an_error_instead_of_a_panic() {
+    let fixture = Fixture::new().await;
+    let mut config = fixture.clients.config.clone();
+    config.rpc_timeout_seconds = u64::MAX;
+    let clients = Clients::new(config).unwrap();
+    let error = clients
+        .authenticate_fresh(&"a".repeat(40))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(error.message().contains("timeout is too large"));
+    let error = fixture
+        .clients
+        .rpc_with_timeout("test.unrepresentable", Duration::MAX, async {
+            Ok(Response::new(()))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(error.message().contains("timeout is too large"));
+}
+
+#[tokio::test]
+async fn rpc_and_auth_timeouts_record_failure_attribution() {
+    // Keep the single global test tracer in one test; concurrent replacements
+    // would make export assertions depend on the test runner's scheduling.
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    let fixture = Fixture::new().await;
+    let error = fixture
+        .clients
+        .rpc_with_timeout::<()>(
+            "test.timeout",
+            Duration::from_millis(20),
+            std::future::pending::<Result<Response<()>, Status>>(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::DeadlineExceeded);
+    assert!(error
+        .message()
+        .contains("control RPC response deadline exceeded"));
+
+    fixture.expire_endpoint().await;
+    *fixture.peer.state.reply.lock().unwrap() =
+        redis_peer::Reply::Delay(Duration::from_millis(600));
+    fixture.auth.delay_ms.store(600, Ordering::SeqCst);
+    let parent = trace::Trace::child("test.auth_timeout");
+    let trace_id = parent.trace_id().unwrap();
+    let error = parent
+        .run_result(fixture.clients.authenticate_fresh(&"a".repeat(40)))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::DeadlineExceeded);
+
+    provider.force_flush().unwrap();
+    let spans = exporter.get_finished_spans().unwrap();
+    for name in ["test.timeout", "apiserver.verify_key"] {
+        let span = spans
+            .iter()
+            .find(|span| {
+                span.name == name
+                    && (name == "test.timeout"
+                        || span.span_context.trace_id().to_string() == trace_id)
+            })
+            .expect("the expired RPC span must be exported");
+        assert!(
+            span.attributes.iter().any(|attribute| {
+                attribute.key.as_str() == "result" && attribute.value.to_string() == "fail"
+            }),
+            "{name}: missing failure result"
+        );
+        assert!(
+            span.attributes.iter().any(|attribute| {
+                attribute.key.as_str() == "error.code"
+                    && attribute.value.to_string() == i32::from(Code::DeadlineExceeded).to_string()
+            }),
+            "{name}: missing deadline code"
+        );
+        assert!(
+            span.attributes.iter().any(|attribute| {
+                attribute.key.as_str() == "error.message"
+                    && attribute.value.to_string().contains("deadline exceeded")
+            }),
+            "{name}: missing deadline message"
+        );
+        assert!(
+            matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+            "{name}: span not marked failed"
+        );
+    }
+    provider.shutdown().unwrap();
+}

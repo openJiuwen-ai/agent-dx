@@ -82,8 +82,14 @@ impl RedisPeer {
         }
     }
 
+    /// Closes established fixture sockets. A warm connection is required so a
+    /// missing fault target cannot silently turn a recovery test into a no-op.
     pub async fn disconnect(&self) {
-        let expected = self.state.closed.load(Ordering::SeqCst) + self.close.send(()).unwrap();
+        let expected = self.state.closed.load(Ordering::SeqCst)
+            + self
+                .close
+                .send(())
+                .expect("warm Redis connection required for fault injection");
         tokio::time::timeout(Duration::from_secs(2), async {
             while self.state.closed.load(Ordering::SeqCst) < expected {
                 self.state.observed.notified().await;

@@ -25,7 +25,10 @@ separately. Raw Redis error text, Redis URLs, record contents and API keys are
 excluded from these diagnostics.
 
 API Server's uncached credential verification applies its original RPC budget
-to discovery, channel acquisition and `VerifyApiKey` together. The HTTP boundary
+to discovery, channel acquisition and `VerifyApiKey` together. The RPC owns the
+same absolute deadline so expiry records its failure result, error code/message
+and failed trace status. Unrepresentable timeouts return a structured error.
+The HTTP boundary
 continues to reject unavailable authentication with 503 and invalid credentials
 with 401. This recovery does not replay API create, capture, restore or other
 mutations; their existing operation-identity contracts remain authoritative.
@@ -46,6 +49,11 @@ that the first authenticated `GET /api/instances` after an injected close return
 200 and reaches `VerifyApiKey`; invalid credentials remain rejected. A separate
 test consumes part of the auth budget in discovery and verifies that the RPC
 does not receive a fresh full budget.
+
+Hanging discovery and a hanging auth RPC both retain HTTP 503 with the
+`UNAVAILABLE` error code. Their tests also check that discovery expiry never
+invokes `VerifyApiKey`, an auth RPC timeout records failure attribution in its
+span, and unrepresentable budgets return errors rather than panicking.
 
 The storage suite additionally uses a real Redis process behind a
 connection-scoped proxy and verifies recovery after a Redis crash/restart:
