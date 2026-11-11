@@ -67,6 +67,8 @@ async fn live_catalog_keeps_a_durable_claim_pending_until_the_create_rpc() {
     let snapshot = rig.session.snapshot().await.unwrap();
     let node = &snapshot.nodes["a"];
     let mut registration = pb::RegisterNodeRequest {
+        pressure: None,
+        pressure_disposition: Default::default(),
         checkpoint_scopes: vec![],
         storage_mounts: Default::default(),
         node_id: "a".into(),
@@ -275,6 +277,8 @@ impl Rig {
         }));
         let mut coordinator = pb::coordinator_service_client::CoordinatorServiceClient::new(client);
         let mut register = pb::RegisterNodeRequest {
+            pressure: None,
+            pressure_disposition: Default::default(),
             checkpoint_scopes: vec![],
             storage_mounts: Default::default(),
             runtime_classes: vec![
@@ -569,6 +573,8 @@ async fn heartbeat_expiry_wakes_only_the_volume_wait_and_allows_takeover_before_
     let b = &snapshot.nodes["b"];
     rig.claimants[1]
         .register_node(pb::RegisterNodeRequest {
+            pressure: None,
+            pressure_disposition: Default::default(),
             checkpoint_scopes: vec![],
             storage_mounts: Default::default(),
             runtime_classes: b.node.runtime_classes.clone(),
@@ -914,6 +920,8 @@ async fn redis_restart_recovers_scheduler_after_failed_node_heartbeat() {
     let stored = rig.session.snapshot().await.unwrap();
     let node = &stored.nodes["a"];
     let heartbeat = pb::RegisterNodeRequest {
+        pressure: None,
+        pressure_disposition: Default::default(),
         checkpoint_scopes: vec![],
         storage_mounts: Default::default(),
         runtime_classes: vec!["runsc".into(), "runc".into()],
@@ -1302,6 +1310,8 @@ async fn environment_directory_increment_does_not_rescan_control_history() {
     let heartbeat_before = redis_command_calls(&rig._redis, "hgetall").await;
     rig.claimants[0]
         .register_node(pb::RegisterNodeRequest {
+            pressure: None,
+            pressure_disposition: Default::default(),
             checkpoint_scopes: vec![],
             storage_mounts: Default::default(),
             runtime_classes: stored.node.runtime_classes,
@@ -1833,6 +1843,8 @@ async fn prepare_http(rig: &mut Rig) {
         let node = &rig.session.snapshot().await.unwrap().nodes[if i == 0 { "a" } else { "b" }];
         rig.claimants[i]
             .register_node(pb::RegisterNodeRequest {
+                pressure: None,
+                pressure_disposition: Default::default(),
                 checkpoint_scopes: vec![],
                 storage_mounts: Default::default(),
                 runtime_classes: vec![
@@ -2104,6 +2116,8 @@ async fn ordinary_heartbeats_do_not_write_redis() {
     for sequence in 3..23 {
         rig.claimants[0]
             .register_node(pb::RegisterNodeRequest {
+                pressure: None,
+                pressure_disposition: Default::default(),
                 checkpoint_scopes: vec![],
                 storage_mounts: Default::default(),
                 node_id: "a".into(),
@@ -2310,6 +2324,8 @@ async fn coordinator_restart_reclaims_unconfirmed_runtime_before_reassignment() 
         );
         let node = &saved.nodes[id];
         let mut report = pb::RegisterNodeRequest {
+            pressure: None,
+            pressure_disposition: Default::default(),
             checkpoint_scopes: vec![],
             storage_mounts: Default::default(),
             node_id: id.into(),

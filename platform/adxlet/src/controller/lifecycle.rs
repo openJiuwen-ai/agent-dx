@@ -41,6 +41,7 @@ impl Controller {
         request: PauseRequest,
         stamp: (String, u64, u64),
         demand: u64,
+        origin: super::PauseOrigin,
     ) -> Result<()> {
         if !self
             .services
@@ -57,7 +58,11 @@ impl Controller {
             {
                 return Ok(());
             }
-            self.auto_pause_guard = Some((stamp, demand));
+            self.auto_pause_guard = Some(super::AutoPauseGuard {
+                stamp,
+                demand,
+                origin,
+            });
             let trace = adx_observability::trace::Trace::child("environment.auto_pause");
             trace.attribute("environment.id", self.record.spec.id.clone());
             trace.run_result(self.pause(request)).await.map(|_| ())
@@ -65,7 +70,13 @@ impl Controller {
         .await;
         self.auto_pause_guard = None;
         if self.record.state == EnvironmentState::Running {
-            self.services.reopen_route(&self.record).await?;
+            if let Err(error) = self.services.reopen_route(&self.record).await {
+                // The route stays quiesced while the environment keeps
+                // running. Arm the retrying admission recovery: no further
+                // high signal may ever ring once the pressure subsides.
+                self.events.reopen_idle = true;
+                return Err(error);
+            }
         }
         result
     }
@@ -292,8 +303,11 @@ impl Controller {
             .is_some_and(|timer| timer.deadline <= tokio::time::Instant::now())
         {
             adx_core::observation::OperationIntent::Policy
-        } else if self.auto_pause_guard.is_some() {
-            adx_core::observation::OperationIntent::Idle
+        } else if let Some(guard) = &self.auto_pause_guard {
+            match guard.origin {
+                super::PauseOrigin::Idle => adx_core::observation::OperationIntent::Idle,
+                super::PauseOrigin::Pressure => adx_core::observation::OperationIntent::Pressure,
+            }
         } else {
             adx_core::observation::OperationIntent::User
         }
@@ -406,7 +420,7 @@ impl Controller {
             .checkpoint
             .clone()
             .ok_or_else(|| Error::Invalid("checkpoint storage is not configured".into()))?;
-        let storage = self
+        let spec_storage = self
             .record
             .spec
             .lifecycle
@@ -414,6 +428,7 @@ impl Controller {
             .clone()
             .unwrap_or_default()
             .storage;
+        let storage = request.resolve_storage(spec_storage)?;
         services.store.validate_policy(storage)?;
         self.services
             .runtime
@@ -429,7 +444,7 @@ impl Controller {
             .await?;
         // Preparation errors can be ambiguous: abort is valid only before the backend call.
         let idle_revision =
-            idle_revision.or_else(|| self.auto_pause_guard.as_ref().map(|(stamp, _)| stamp.2));
+            idle_revision.or_else(|| self.auto_pause_guard.as_ref().map(|guard| guard.stamp.2));
         let preparation = tokio::time::timeout_at(deadline, async {
             match idle_revision {
                 Some(revision) => {
@@ -483,10 +498,10 @@ impl Controller {
             }
             return Err(error);
         }
-        if let Some((stamp, demand)) = &self.auto_pause_guard {
+        if let Some(guard) = &self.auto_pause_guard {
             let proxy = self.services.routes.activity(&self.record).await;
-            if self.demand.load(std::sync::atomic::Ordering::Acquire) != *demand
-                || !matches!(proxy, Ok((ref session, revision, 0)) if session == &stamp.0 && revision == stamp.1)
+            if self.demand.load(std::sync::atomic::Ordering::Acquire) != guard.demand
+                || !matches!(proxy, Ok((ref session, revision, 0)) if session == &guard.stamp.0 && revision == guard.stamp.1)
             {
                 let abort = services
                     .cooperation

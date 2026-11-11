@@ -112,7 +112,11 @@ preserves scalar-only behavior. See [rule semantics](../../crates/scheduling/REA
 ### Node process session and reconciliation
 
 RegisterNode includes the process session ID, a monotonic heartbeat sequence and
-reconciliation flag. Duplicate reports do not extend liveness. InspectNode reads
+reconciliation flag. Duplicate reports do not extend liveness. The heartbeat also
+carries the structured node pressure snapshot (`NodePressureReport`: per-resource
+level, percent and last transition, plus the observation stamp and consecutive
+sampling failures); the field stays absent until the first successful sample and
+feeds in-memory coordinator state only, without persistence. InspectNode reads
 the complete authoritative catalog only for the current registered session with
 allocation admission closed. Startup uses the reconciliation flag; a validated
 live session closes allocation admission for periodic inspection while preserving
