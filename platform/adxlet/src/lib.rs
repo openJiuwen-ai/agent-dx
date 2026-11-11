@@ -13,9 +13,11 @@ pub mod managed_mounts;
 pub mod metrics;
 pub mod network_baseline;
 pub mod node_reconciliation;
+pub mod pressure_pause;
 pub mod proxy;
 pub mod readiness;
 mod reconciliation;
+pub use pressure_pause::{EscalationMode, PressurePauseLedger, PressurePauseOptions};
 pub mod resources;
 pub mod routes;
 pub mod rpc;
@@ -33,8 +35,9 @@ use adx_core::{
 use async_trait::async_trait;
 pub use controller::EnvironmentHandle;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +474,10 @@ pub(crate) struct Services {
     routes: Arc<dyn Routes>,
     sink: Arc<dyn StateSink>,
     admission: Arc<Mutex<Admission>>,
+    pressure: Arc<RwLock<resources::NodePressureState>>,
+    pressure_signal: watch::Sender<()>,
+    pressure_pause_options: PressurePauseOptions,
+    pressure_pause_ledger: Arc<Mutex<PressurePauseLedger>>,
     operation_timeout: Duration,
     checkpoint: Option<Arc<checkpoint::CheckpointServices>>,
     snapshots: Option<Arc<dyn checkpoint::SnapshotCatalog>>,
@@ -516,6 +523,9 @@ pub struct Adxlet {
     lifecycle_ready: Arc<tokio::sync::RwLock<bool>>,
     authority_reconciling: Arc<std::sync::atomic::AtomicBool>,
     authority_initialized: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once at startup when node pressure sampling is configured; the
+    /// metrics gauge family exists exactly when this is set.
+    pressure_configured: Arc<std::sync::atomic::AtomicBool>,
     retired_environments: Arc<Mutex<BTreeMap<String, RetiredEnvironment>>>,
     services: Arc<Services>,
     environments: Arc<Mutex<EnvironmentDirectory>>,
@@ -547,6 +557,7 @@ impl Adxlet {
             lifecycle_ready: Arc::new(tokio::sync::RwLock::new(true)),
             authority_reconciling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authority_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pressure_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retired_environments: Arc::default(),
             services: Arc::new(Services {
                 runtime,
@@ -564,6 +575,10 @@ impl Adxlet {
                     pressure: false,
                     runtime_classes: None,
                 })),
+                pressure: Arc::new(RwLock::new(resources::NodePressureState::default())),
+                pressure_signal: watch::channel(()).0,
+                pressure_pause_options: PressurePauseOptions::default(),
+                pressure_pause_ledger: Arc::new(Mutex::new(PressurePauseLedger::default())),
                 operation_timeout: Duration::from_secs(30),
                 checkpoint: None,
                 snapshots: None,
@@ -576,6 +591,24 @@ impl Adxlet {
             authority_progress: Arc::default(),
             reconciliation_requested: Arc::default(),
         }
+    }
+
+    /// Records that node pressure sampling is configured. The metrics gauge
+    /// family exists exactly when this is set; a configured node whose
+    /// sampling keeps failing stays visible through the gauge values
+    /// (never-observed stamp plus a growing failure count) instead of
+    /// vanishing together with the series.
+    pub fn mark_pressure_configured(&self) {
+        self.pressure_configured
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Injects static admission configuration for pressure-triggered pauses.
+    pub fn with_pressure_pause_options(mut self, options: PressurePauseOptions) -> Result<Self> {
+        Arc::get_mut(&mut self.services)
+            .ok_or(Error::Conflict)?
+            .pressure_pause_options = options;
+        Ok(self)
     }
 
     pub fn with_runtime_control(
@@ -721,12 +754,40 @@ impl Adxlet {
             .maintenance = maintenance;
     }
 
-    pub fn set_pressure(&self, under_pressure: bool) {
+    /// Publishes one pressure observation round to all consumers. The
+    /// admission bit keeps the historical two-state formula, the board is
+    /// written unconditionally so it always shows the present, and the
+    /// payload-free signal rings only when either resource level is high.
+    pub fn set_pressure_state(&self, update: &resources::PressureUpdate) {
         self.services
             .admission
             .lock()
             .expect("shared state lock poisoned")
-            .pressure = under_pressure;
+            .pressure = !update.accepting;
+        *self
+            .services
+            .pressure
+            .write()
+            .expect("pressure board lock poisoned") = update.state.clone();
+        if update.state.memory.level == resources::PressureLevel::High
+            || update.state.disk.level == resources::PressureLevel::High
+        {
+            let _ = self.services.pressure_signal.send(());
+        }
+    }
+
+    /// The latest published pressure snapshot.
+    pub fn pressure_state(&self) -> resources::NodePressureState {
+        self.services
+            .pressure
+            .read()
+            .expect("pressure board lock poisoned")
+            .clone()
+    }
+
+    /// Subscribes to the high-pressure wake-up signal.
+    pub fn pressure_signal(&self) -> watch::Receiver<()> {
+        self.services.pressure_signal.subscribe()
     }
 
     pub fn accepting_allocations(&self) -> bool {

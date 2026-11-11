@@ -502,6 +502,8 @@ async fn lifecycle_rpc_scenario() {
     let mut node_coordinator =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut register = pb::RegisterNodeRequest {
+        pressure: None,
+        pressure_disposition: Default::default(),
         checkpoint_scopes: vec![],
         storage_mounts: Default::default(),
         runtime_classes: vec![
@@ -2950,6 +2952,8 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     let mut client =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut report = pb::RegisterNodeRequest {
+        pressure: None,
+        pressure_disposition: Default::default(),
         checkpoint_scopes: vec![],
         storage_mounts: Default::default(),
         runtime_classes: vec![

@@ -1694,7 +1694,10 @@ async fn periodic_catalog_retry_reports_current_admission_without_closing_on_tra
         let mut stale = record("kept", EnvironmentState::Pending);
         stale.runtime.ip = None;
         *fixture.authority.records.lock().unwrap() = vec![stale.try_into().unwrap()];
-        node.set_pressure(true);
+        node.set_pressure_state(&adxlet::resources::PressureUpdate {
+            accepting: false,
+            state: adxlet::resources::NodePressureState::default(),
+        });
         let control = fixture.authority.clone();
         control.block_inspect.store(true, Ordering::SeqCst);
         let cycle = tokio::spawn({
@@ -1705,7 +1708,10 @@ async fn periodic_catalog_retry_reports_current_admission_without_closing_on_tra
             }
         });
         control.inspect_entered.notified().await;
-        node.set_pressure(false);
+        node.set_pressure_state(&adxlet::resources::PressureUpdate {
+            accepting: true,
+            state: adxlet::resources::NodePressureState::default(),
+        });
         if mode == "unavailable" {
             control.reject_ready.store(true, Ordering::SeqCst);
         }

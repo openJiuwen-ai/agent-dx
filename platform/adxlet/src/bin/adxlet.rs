@@ -106,6 +106,42 @@ struct PressureConfig {
     disk_path: PathBuf,
     #[serde(default)]
     thresholds: PressurePolicy,
+    #[serde(default)]
+    pause: PressurePauseConfig,
+}
+#[derive(Deserialize, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct PressurePauseConfig {
+    enabled: bool,
+    min_idle_seconds: u64,
+    freshness_seconds: u64,
+    budget: u32,
+    in_flight_cap: usize,
+    escalate_checkpoint_storage: adxlet::EscalationMode,
+}
+impl Default for PressurePauseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_idle_seconds: 300,
+            freshness_seconds: 90,
+            budget: 1,
+            in_flight_cap: 1,
+            escalate_checkpoint_storage: adxlet::EscalationMode::default(),
+        }
+    }
+}
+impl From<PressurePauseConfig> for adxlet::PressurePauseOptions {
+    fn from(config: PressurePauseConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            min_idle_seconds: config.min_idle_seconds,
+            freshness_seconds: config.freshness_seconds,
+            budget: config.budget,
+            in_flight_cap: config.in_flight_cap,
+            escalate_checkpoint_storage: config.escalate_checkpoint_storage,
+        }
+    }
 }
 fn metrics_interval() -> u64 {
     15
@@ -382,6 +418,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_checkpointing(storage, Arc::new(control.clone()))?
             .with_snapshot_catalog(sink.clone())?;
     }
+    if let Some(pressure) = &config.pressure {
+        manager = manager.with_pressure_pause_options(pressure.pause.clone().into())?;
+        manager.mark_pressure_configured();
+    }
     let manager = Arc::new(manager);
     if std::env::var("ADX_NODE_UPGRADE_ISOLATED").as_deref() == Ok("true") {
         manager.isolate_upgrade_bootstrap()?;
@@ -449,6 +489,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reconciling: true,
         runtime_classes: vec![],
         checkpoint_scopes,
+        pressure: None,
+        pressure_disposition: Default::default(),
     };
     // Bind before registration so dispatch cannot race an unbound address.
     let node_rpc = NodeRpc::new(manager.clone(), peers, session_id.clone())
@@ -538,14 +580,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let (Some(config), Some(gate)) = (&config.pressure, &mut pressure_gate) {
                 let path = config.disk_path.clone();
-                let accepting =
+                let update =
                     match tokio::task::spawn_blocking(move || adxlet::resources::pressure(&path))
                         .await
                     {
                         Ok(Ok(pressure)) => gate.update(pressure),
-                        _ => false,
+                        // A failed sample closes admission for this round and
+                        // freezes the structured snapshot, growing the
+                        // failure counter instead of moving levels.
+                        _ => gate.fail(),
                     };
-                manager.set_pressure(!accepting);
+                manager.set_pressure_state(&update);
+                // Heartbeat field: direct observation-point fill, same
+                // discipline as capacity/devices/storage_mounts above. The
+                // producer holds the state it just published, so the report
+                // and the board cannot drift.
+                r.pressure = adxlet::resources::report_from(&update.state);
             }
             last = r;
             // Startup and every reporting period use the same complete authority

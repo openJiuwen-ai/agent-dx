@@ -189,6 +189,8 @@ async fn inspection_reports_latest_authorized_volume_execution() {
         .await
         .unwrap();
     let report = pb::RegisterNodeRequest {
+        pressure: None,
+        pressure_disposition: Default::default(),
         checkpoint_scopes: Default::default(),
         storage_mounts: Default::default(),
         node_id: "node".into(),

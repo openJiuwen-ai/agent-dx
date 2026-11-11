@@ -1007,11 +1007,17 @@ async fn expired_capacity_remains_usable_and_maintenance_blocks_new_admission() 
         .metrics()
         .contains("adx_node_accepting_allocations 0\n"));
     node.set_maintenance(false);
-    node.set_pressure(true);
+    node.set_pressure_state(&adxlet::resources::PressureUpdate {
+        accepting: false,
+        state: adxlet::resources::NodePressureState::default(),
+    });
     assert!(node
         .metrics()
         .contains("adx_node_accepting_allocations 0\n"));
-    node.set_pressure(false);
+    node.set_pressure_state(&adxlet::resources::PressureUpdate {
+        accepting: true,
+        state: adxlet::resources::NodePressureState::default(),
+    });
     node.update_runtime_classes(vec![]).unwrap();
     assert!(node
         .metrics()
