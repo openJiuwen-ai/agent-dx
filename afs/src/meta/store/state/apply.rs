@@ -160,6 +160,7 @@ impl State {
             grpc_addr: lease.grpc_addr,
             data_addr: lease.data_addr,
             rest_addr: lease.rest_addr,
+            nfs_addr: lease.nfs_addr,
             ownerfs_enabled: lease.ownerfs_enabled,
             storage_devices: lease.storage_devices,
             lease_epoch,

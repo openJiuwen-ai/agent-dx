@@ -71,6 +71,7 @@ impl MetaService for MetaRpc {
                     grpc_addr: endpoint.grpc_addr,
                     data_addr: endpoint.data_addr,
                     rest_addr: endpoint.rest_addr,
+                    nfs_addr: endpoint.nfs_addr,
                     ownerfs_enabled: node
                         .capabilities
                         .iter()

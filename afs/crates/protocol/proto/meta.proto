@@ -23,6 +23,11 @@ message NodeEndpoint {
   string grpc_addr = 1;
   string data_addr = 2;
   string rest_addr = 3;
+  // Address peers dial to reach this node's NFS export (outlet imports).
+  // Deliberately separate from data_addr: data_addr is the DFS data-plane
+  // endpoint that peers dial with gRPC, and an NFS address speaks its own
+  // port and protocol. Empty when the node runs no outlet.
+  string nfs_addr = 4;
 }
 
 message NodeDescriptor {

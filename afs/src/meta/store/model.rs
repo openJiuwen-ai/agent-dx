@@ -105,6 +105,11 @@ pub struct NodeSession {
     pub grpc_addr: String,
     pub data_addr: String,
     pub rest_addr: String,
+    /// Address peers dial for this node's NFS export (outlet imports). Empty
+    /// when the node runs no outlet. Kept separate from `data_addr`, which is
+    /// the DFS data-plane endpoint peers dial with gRPC.
+    #[serde(default)]
+    pub nfs_addr: String,
     pub ownerfs_enabled: bool,
     #[serde(default)]
     pub storage_devices: Vec<StorageDeviceDescriptor>,
@@ -130,6 +135,7 @@ pub struct NodeSessionLease {
     pub grpc_addr: String,
     pub data_addr: String,
     pub rest_addr: String,
+    pub nfs_addr: String,
     pub ownerfs_enabled: bool,
     pub storage_devices: Vec<StorageDeviceDescriptor>,
     pub lease_ttl: Duration,

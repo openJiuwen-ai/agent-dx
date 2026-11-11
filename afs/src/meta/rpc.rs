@@ -211,6 +211,7 @@ fn wire_node(session: super::store::NodeSession) -> NodeDescriptor {
             grpc_addr: session.grpc_addr,
             data_addr: session.data_addr,
             rest_addr: session.rest_addr,
+            nfs_addr: session.nfs_addr,
         }),
         labels: Default::default(),
         capabilities: Vec::new(),

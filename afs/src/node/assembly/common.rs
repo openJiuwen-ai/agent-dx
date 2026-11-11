@@ -163,16 +163,17 @@ pub(super) fn node_descriptor<'a>(
         let advertised = advertised
             .clone()
             .expect("needs_meta sets advertised endpoint");
-        // The address peers dial to reach this node's NFS export. Distinct from
-        // grpc_addr: NFS speaks its own port and no scheme, and a node may be
-        // multi-homed. Peers read it from the session snapshot, so a node
-        // declares only its own address and no existing config needs editing
-        // when a new node joins.
-        let data_addr = cfg
+        // The address peers dial to reach this node's NFS export, reported in
+        // its own endpoint field: `data_addr` already has a consumer (the DFS
+        // data plane dials it with gRPC), and an NFS address speaks its own
+        // port and protocol. Peers read it from the session snapshot, so a
+        // node declares only its own address and no existing config needs
+        // editing when a new node joins.
+        let nfs_addr = cfg
             .outlet
             .as_ref()
             .map(|outlet| outlet.nfs_addr.clone())
-            .unwrap_or_else(|| advertised.clone());
+            .unwrap_or_default();
         let mut capabilities = Vec::new();
         if cfg.ownerfs {
             capabilities.push("ownerfs".into());
@@ -186,8 +187,9 @@ pub(super) fn node_descriptor<'a>(
                 node_id: cfg.id.clone(),
                 endpoint: Some(afs_protocol::meta::NodeEndpoint {
                     grpc_addr: advertised.clone(),
-                    data_addr,
+                    data_addr: advertised.clone(),
                     rest_addr: format!("http://{}", cfg.rest_listen),
+                    nfs_addr,
                 }),
                 labels: std::collections::HashMap::new(),
                 capabilities,

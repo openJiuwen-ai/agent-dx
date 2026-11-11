@@ -46,6 +46,7 @@ async fn register(store: &Store, node: &str, session: &str, ttl: std::time::Dura
                 grpc_addr: format!("http://{node}:1"),
                 data_addr: format!("http://{node}:2"),
                 rest_addr: format!("http://{node}:3"),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: vec![StorageDeviceDescriptor {
                     device_id: format!("{node}-dev"),

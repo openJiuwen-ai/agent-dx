@@ -115,6 +115,7 @@ fn request(session_id: &str) -> RegisterNodeRequest {
                 grpc_addr: "http://node-a:7400".into(),
                 data_addr: "http://node-a:7500".into(),
                 rest_addr: "http://node-a:7600".into(),
+                nfs_addr: String::new(),
             }),
             labels: Default::default(),
             capabilities: Vec::new(),

@@ -10,7 +10,7 @@ pub const FRAME_OVERHEAD: usize = 40;
 /// accepts at most this many; Store gathers at most this many ready requests.
 pub const BATCH_RECORDS_MAX: usize = 64;
 /// The frame envelope version (`FormatKind::MetaWalEnvelope`); the record
-/// hash domain `afs.meta.record.v2` belongs to it.
+/// hash domain `afs.meta.record.v3` belongs to it.
 const VERSION: u16 = crate::format::version::META_WAL_ENVELOPE;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -376,7 +376,7 @@ pub(super) fn encode_frame(
             .ok_or_else(|| invalid_log("record limit too small"))?,
     )?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"afs.meta.record.v2");
+    hasher.update(b"afs.meta.record.v3");
     hasher.update(&payload);
     let hash = *hasher.finalize().as_bytes();
     let length =
@@ -442,7 +442,7 @@ pub(super) fn decode_frame(
     let body_end = frame.len() - 32;
     let payload = &frame[8..body_end];
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"afs.meta.record.v2");
+    hasher.update(b"afs.meta.record.v3");
     hasher.update(payload);
     let hash = *hasher.finalize().as_bytes();
     if frame[body_end..] != hash {
@@ -841,6 +841,7 @@ pub(super) fn test_records(count: usize) -> Vec<Record> {
                     grpc_addr: "grpc".into(),
                     data_addr: "data".into(),
                     rest_addr: "rest".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(30),
@@ -882,7 +883,7 @@ mod tests {
             // Intentionally bypass encode_frame validation: semantic damage
             // has a valid outer CRC/BLAKE3, so replay must reject its content.
             let mut hash = blake3::Hasher::new();
-            hash.update(b"afs.meta.record.v2");
+            hash.update(b"afs.meta.record.v3");
             hash.update(payload);
             let mut frame = Vec::new();
             frame.extend_from_slice(&u32::try_from(payload.len() + 32).unwrap().to_be_bytes());
@@ -1206,6 +1207,7 @@ mod tests {
                     grpc_addr: "g".repeat(1024),
                     data_addr: "data".into(),
                     rest_addr: "rest".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: std::time::Duration::from_secs(30),
@@ -1261,6 +1263,7 @@ mod tests {
                     grpc_addr: "g".repeat(pad),
                     data_addr: "data".into(),
                     rest_addr: "rest".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: std::time::Duration::from_secs(30),

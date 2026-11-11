@@ -509,6 +509,7 @@ async fn real_grpc_meta_fixture() -> (
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:1".into(),
                 rest_addr: "http://127.0.0.1:1".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: vec![local_a.device_descriptor().unwrap()],
                 lease_ttl: Duration::from_secs(30),

@@ -26,6 +26,7 @@ mod outlet_active_roots_tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: "10.0.0.9".into(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
@@ -89,6 +90,26 @@ mod outlet_active_roots_tests {
     async fn empty_store_yields_empty_snapshot() {
         let (_store, authority) = fixture().await;
         assert!(active_ids(&authority).await.is_empty());
+    }
+
+    /// Regression: the advertised NFS address used to be smuggled through the
+    /// DFS `data_addr` field, which peers dial with gRPC — enabling outlet on
+    /// a DFS node would hand NFS hostnames to the replica/read data plane.
+    /// The snapshot must expose only the dedicated session field.
+    #[tokio::test]
+    async fn snapshot_carries_the_session_nfs_addr_not_the_data_addr() {
+        let (_store, authority) = fixture().await;
+        reserve_and_activate(&authority, "root-6167", "agent1").await;
+        let output = authority
+            .list_active_outlet_roots(ListActiveOutletRootsInput { known_digest: None })
+            .await
+            .unwrap();
+        assert_eq!(output.roots.len(), 1);
+        assert_eq!(output.roots[0].nfs_addr, "10.0.0.9");
+        assert_ne!(
+            output.roots[0].nfs_addr, "d",
+            "must not fall back to data_addr"
+        );
     }
 
     #[tokio::test]
@@ -226,6 +247,7 @@ mod outlet_digest_tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: "10.0.0.9".into(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
@@ -344,6 +366,7 @@ mod outlet_digest_tests {
                     grpc_addr: "g2".into(),
                     data_addr: "d2".into(),
                     rest_addr: "r2".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
@@ -409,6 +432,7 @@ mod outlet_digest_tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),

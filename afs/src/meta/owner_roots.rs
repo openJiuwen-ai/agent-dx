@@ -706,7 +706,7 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 .entities
                 .into_iter()
                 .filter_map(|entity| match entity {
-                    MetaEntity::NodeSession(session) => Some((session.node_id, session.data_addr)),
+                    MetaEntity::NodeSession(session) => Some((session.node_id, session.nfs_addr)),
                     _ => None,
                 })
                 .collect();
@@ -1662,6 +1662,7 @@ mod retention_tests {
                     grpc_addr: "http://n:1".into(),
                     data_addr: "http://n:2".into(),
                     rest_addr: "http://n:3".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: vec![],
                     lease_ttl: std::time::Duration::from_secs(30),
@@ -1730,6 +1731,7 @@ mod retention_tests {
                         grpc_addr: "http://other:1".into(),
                         data_addr: "http://other:2".into(),
                         rest_addr: "http://other:3".into(),
+                        nfs_addr: String::new(),
                         ownerfs_enabled: true,
                         storage_devices: vec![],
                         lease_ttl: std::time::Duration::from_secs(30),
@@ -1833,6 +1835,7 @@ mod tests {
                     grpc_addr: format!("http://{node_id}:7400"),
                     data_addr: format!("http://{node_id}:7500"),
                     rest_addr: format!("http://{node_id}:7600"),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl,
@@ -2002,6 +2005,7 @@ mod tests {
                     grpc_addr: "http://node-b:7400".into(),
                     data_addr: "http://node-b:7500".into(),
                     rest_addr: "http://node-b:7600".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: false,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(60),
