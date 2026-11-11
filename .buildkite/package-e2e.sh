@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -n ${ADX_E2E_RUNSC_URL:-} ]]; then
+  printf '%s\n' 'ADX_E2E_RUNSC_URL is unsupported: use the default pinned downloader,' \
+    'ADX_E2E_RUNSC_IMAGE with a complete pinned kit, or ADX_E2E_RUNSC_BIN with adjacent gvisor-bin helpers.' >&2
+  exit 2
+fi
+if [[ -n ${ADX_E2E_RUNSC_IMAGE:-} && -n ${ADX_E2E_RUNSC_BIN:-} ]]; then
+  echo 'choose either ADX_E2E_RUNSC_IMAGE or ADX_E2E_RUNSC_BIN' >&2
+  exit 2
+fi
+if [[ -n ${ADX_E2E_RUNSC_IMAGE:-} && ! $ADX_E2E_RUNSC_IMAGE =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]; then
+  echo 'ADX_E2E_RUNSC_IMAGE requires an immutable @sha256 digest' >&2
+  exit 2
+fi
 : "${ADX_E2E_IMAGE_REPOSITORY:?set the registry repository}"
 : "${ADX_BASE_PACKAGE_BUILD_ID:?set the immutable base-package Buildkite build UUID}"
 : "${ADX_SDK_BUILD_ID:?set the immutable Environment SDK Buildkite build UUID}"
@@ -82,36 +95,27 @@ docker pull "$ADX_COLLECTOR_IMAGE"
 echo "--- :docker: Build node, EXECD and entrypoint fixture images"
 fc_args=()
 runtime_args=()
-runsc_sources=0
-for source in ADX_E2E_RUNSC_IMAGE ADX_E2E_RUNSC_URL ADX_E2E_RUNSC_BIN; do
-  [[ -z ${!source:-} ]] || ((runsc_sources+=1))
-done
-(( runsc_sources <= 1 )) || { echo 'choose one runsc image, release URL, or local binary' >&2; exit 2; }
-if [[ -n ${ADX_E2E_RUNSC_IMAGE:-} ]]; then
-  : "${ADX_E2E_RUNSC_SHA512:?a pinned runsc SHA512 is required for images}"
-  export ADX_E2E_RUNSC_BIN="$PWD/out/buildkite/runtime/runsc"
-  export ADX_E2E_RUNSC_SHA256
-  ADX_E2E_RUNSC_SHA256=$(python3 build/e2e/runsc_image.py \
-    --image "$ADX_E2E_RUNSC_IMAGE" --sha512 "$ADX_E2E_RUNSC_SHA512" \
-    --output "$ADX_E2E_RUNSC_BIN")
-elif [[ -n ${ADX_E2E_RUNSC_URL:-} ]]; then
-  : "${ADX_E2E_RUNSC_SHA512:?a pinned runsc SHA512 is required for downloads}"
-  [[ $ADX_E2E_RUNSC_URL == https://* && $ADX_E2E_RUNSC_SHA512 =~ ^[0-9a-fA-F]{128}$ ]] || {
-    echo 'runsc download requires an HTTPS URL and a 128-digit SHA512' >&2; exit 2;
-  }
+if [[ -n ${ADX_E2E_RUNSC_IMAGE:-} || -z ${ADX_E2E_RUNSC_BIN:-} ]]; then
+  # Both distribution channels must provide the same complete pinned kit.
   mkdir -p out/buildkite/runtime
-  export ADX_E2E_RUNSC_BIN="$PWD/out/buildkite/runtime/runsc"
-  curl -fSL --retry 3 --retry-delay 2 --max-time 300 "$ADX_E2E_RUNSC_URL" -o "$ADX_E2E_RUNSC_BIN"
-  printf '%s  %s\n' "$ADX_E2E_RUNSC_SHA512" "$ADX_E2E_RUNSC_BIN" | sha512sum --check -
-  chmod 0755 "$ADX_E2E_RUNSC_BIN"
+  runsc_directory=$(mktemp -d "$PWD/out/buildkite/runtime/pinned.XXXXXX")
+  export ADX_E2E_RUNSC_BIN="$runsc_directory/runsc"
   export ADX_E2E_RUNSC_SHA256
-  ADX_E2E_RUNSC_SHA256=$(sha256sum "$ADX_E2E_RUNSC_BIN" | cut -d' ' -f1)
+  if [[ -n ${ADX_E2E_RUNSC_IMAGE:-} ]]; then
+    image_args=(--image "$ADX_E2E_RUNSC_IMAGE" --target x86_64-unknown-linux-gnu --output "$ADX_E2E_RUNSC_BIN")
+    if [[ -n ${ADX_E2E_RUNSC_SHA512:-} ]]; then
+      image_args+=(--sha512 "$ADX_E2E_RUNSC_SHA512")
+    fi
+    ADX_E2E_RUNSC_SHA256=$(python3 build/e2e/runsc_image.py "${image_args[@]}")
+  else
+    python3 build/release/download_runsc.py --target x86_64-unknown-linux-gnu \
+      --output "$ADX_E2E_RUNSC_BIN"
+    ADX_E2E_RUNSC_SHA256=$(sha256sum "$ADX_E2E_RUNSC_BIN" | cut -d' ' -f1)
+  fi
 fi
-if [[ -n ${ADX_E2E_RUNSC_BIN:-} ]]; then
-  : "${ADX_E2E_RUNSC_SHA256:?a pinned runsc SHA256 is required}"
-  printf '%s  %s\n' "$ADX_E2E_RUNSC_SHA256" "$ADX_E2E_RUNSC_BIN" | sha256sum --check -
-  runtime_args=(--runsc-bin "$ADX_E2E_RUNSC_BIN")
-fi
+: "${ADX_E2E_RUNSC_SHA256:?a pinned runsc SHA256 is required}"
+printf '%s  %s\n' "$ADX_E2E_RUNSC_SHA256" "$ADX_E2E_RUNSC_BIN" | sha256sum --check -
+runtime_args=(--runsc-bin "$ADX_E2E_RUNSC_BIN")
 if [[ ${ADX_E2E_CHECKPOINT:-0} == 1 ]]; then
   if [[ -n ${ADX_FC_KIT_ARTIFACT_BUILD:-} ]]; then
     buildkite-agent artifact download 'out/buildkite/firecracker-kit/**/*' . --build "$ADX_FC_KIT_ARTIFACT_BUILD"

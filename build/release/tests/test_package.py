@@ -11,6 +11,24 @@ s = importlib.util.spec_from_file_location("package", Path(__file__).resolve().p
 pkg = importlib.util.module_from_spec(s)
 s.loader.exec_module(pkg)
 
+RUNSC_HELPERS = (
+    "checkpointgofer",
+    "gvisor-sentry-prewarmer",
+    "gvisor_sentry",
+    "runsc-fd-parking",
+    "runsc-metric-server",
+)
+
+
+def write_runsc_helpers(runsc):
+    helpers = runsc.parent / "gvisor-bin"
+    helpers.mkdir()
+    machine = runsc.read_bytes()[18:20]
+    for name in RUNSC_HELPERS:
+        helper = helpers / name
+        helper.write_bytes(b"\x7fELF\x02\x01" + bytes(12) + machine)
+        helper.chmod(0o755)
+
 
 class PackageTests(unittest.TestCase):
     def test_inspector_is_part_of_the_platform_release(self):
@@ -100,6 +118,7 @@ class PackageTests(unittest.TestCase):
                 (backend / name).write_bytes(b"\x7fELF\x02\x01" + bytes(12) + (62).to_bytes(2, "little"))
             runsc = root / "runsc"
             runsc.write_bytes(b"\x7fELF\x02\x01" + bytes(12) + (62).to_bytes(2, "little"))
+            write_runsc_helpers(runsc)
             target = "x86_64-unknown-linux-gnu"
             pin = json.loads((pkg.ROOT / "third_party/sandboxd/source.json").read_text())
             metadata = {
@@ -120,11 +139,36 @@ class PackageTests(unittest.TestCase):
             for name in ("sandboxd.service", "sandboxd.toml", "oss.json", "registry.json",
                          "oss_auths.json", "registry_auths.json"):
                 self.assertIn(f"etc/examples/sandboxd/{name}", manifest["files"])
+            for name in RUNSC_HELPERS:
+                helper = output / "runtime/sandboxd/gvisor-bin" / name
+                self.assertIn(f"runtime/sandboxd/gvisor-bin/{name}", manifest["files"])
+                self.assertTrue(helper.stat().st_mode & 0o100)
+
+            helper = output / "runtime/sandboxd/gvisor-bin/gvisor_sentry"
+            helper.chmod(0o644)
+            helper_name = "runtime/sandboxd/gvisor-bin/gvisor_sentry"
+            manifest["files"][helper_name] = pkg.sha(helper)
+            manifest_path = output / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "gVisor helper is missing or not executable"):
+                pkg.verify(output)
+            helper.chmod(0o755)
+            manifest["files"][helper_name] = pkg.sha(helper)
+            manifest_path.write_text(json.dumps(manifest))
+
+            helper.write_bytes(helper.read_bytes()[:18] + (183).to_bytes(2, "little"))
+            manifest["files"][helper_name] = pkg.sha(helper)
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "gVisor helper architecture mismatch"):
+                pkg.verify(output)
+            helper.write_bytes(b"\x7fELF\x02\x01" + bytes(12) + (62).to_bytes(2, "little"))
+            helper.chmod(0o755)
+            manifest["files"][helper_name] = pkg.sha(helper)
+            manifest_path.write_text(json.dumps(manifest))
 
             packaged_runsc = output / "runtime/sandboxd/runsc"
             original_runsc = packaged_runsc.read_bytes()
             packaged_runsc.write_bytes(original_runsc[:18] + (183).to_bytes(2, "little"))
-            manifest_path = output / "manifest.json"
             manifest["files"]["runtime/sandboxd/runsc"] = pkg.sha(packaged_runsc)
             manifest_path.write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "architecture mismatch: runsc"):
@@ -418,6 +462,7 @@ class PackageTests(unittest.TestCase):
             }))
             runsc = root / "runsc"
             runsc.write_bytes(elf)
+            write_runsc_helpers(runsc)
             package = root / "package"
             pkg.assemble(
                 binaries, redis, redis_cli, wheel, package,
