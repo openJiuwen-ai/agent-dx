@@ -516,6 +516,7 @@ pub fn converge_round(
     // This is the single place that decision is made, so no caller can mistake
     // an empty payload for "Meta has no active roots" and wipe the directory.
     let active = merge_reply(&reply, cached_roots);
+    let active = reject_unsafe_homes(active);
     *cached_digest = Some(reply.digest.clone());
     *cached_roots = active.clone();
 
@@ -585,6 +586,30 @@ pub fn converge_round(
 
 fn merge_reply(reply: &ActiveOutletRoots, cached: &[OutletRoot]) -> Vec<OutletRoot> {
     reply.merge_into(cached.to_vec())
+}
+
+/// Drop snapshot roots whose home id is unsafe to embed in a filesystem path.
+///
+/// Mount points (`<import_root>/<home>/users`) and symlink targets are built by
+/// joining the home id under a configured root, so an id containing `/`, a `..`
+/// segment or an absolute form would escape that root. Meta already rejects
+/// such ids at registration; this consumer-side filter keeps the loop safe even
+/// against a Meta that predates that check. Skipped homes are logged, never
+/// mounted or published, and the rest of the snapshot proceeds unaffected
+/// (spec H7).
+fn reject_unsafe_homes(active: Vec<OutletRoot>) -> Vec<OutletRoot> {
+    let mut kept = Vec::with_capacity(active.len());
+    for root in active {
+        if crate::config::is_safe_node_id(&root.home_node_id) {
+            kept.push(root);
+        } else {
+            afs_logging::warn!(
+                "outlet.snapshot.unsafe_home_id";
+                "home_node_id" => root.home_node_id.clone()
+            );
+        }
+    }
+    kept
 }
 
 /// Run the convergence loop until `shutdown` resolves.
@@ -902,6 +927,22 @@ mod tests {
         )
     }
 
+    /// 路径不安全的 home id 必须在收敛前被丢弃：挂载点与软链 target 都是
+    /// 按 `<root>/<home>/...` 拼出来的，带 `/`、`..` 或绝对形式的 id 会逃出
+    /// 预定目录（检视意见：挂载与名字层的边界）。
+    #[test]
+    fn unsafe_home_ids_are_dropped_from_the_snapshot() {
+        let roots = vec![
+            root_on("node-a"),
+            root_on("../escape"),
+            root_on("/etc"),
+            root_on("with.dot"),
+        ];
+        let kept = reject_unsafe_homes(roots);
+        let homes: Vec<_> = kept.iter().map(|root| root.home_node_id.as_str()).collect();
+        assert_eq!(homes, vec!["node-a"]);
+    }
+
     fn root_on(home: &str) -> OutletRoot {
         // 测试约定：地址随快照来。给已知 home 一个稳定地址，未知名留空
         //（空地址即"该 home 没上报"，会被跳过）。
@@ -979,6 +1020,7 @@ mod tests {
             },
             fs_type: "nfs4".to_owned(),
             source: "node-a:/home/agentos/users".to_owned(),
+            shared: false,
         }];
         exec.reconcile(&mounts);
         assert_eq!(exec.ready_count(), 1);
@@ -1123,6 +1165,7 @@ mod tests {
             },
             fs_type: "nfs4".to_owned(),
             source: "node-a:/home/agentos/users".to_owned(),
+            shared: false,
         }];
 
         // 缺失两轮（未到阈值），再看到一轮，再缺失两轮 —— 不应降级。

@@ -207,15 +207,21 @@ fn decode_octal(encoded: &[u8]) -> Vec<u8> {
 
 /// 启动门禁：确认本进程与宿主机共享 mount namespace。
 ///
-/// AFS 以 system service 运行时通常满足。若被 `PrivateMounts=yes` 或容器隔
-/// 离，挂载对宿主机不可见，容器仍然看不到数据——此时应在启动阶段拒绝，而
-/// 不是运行期反复挂载却无人受益。
+/// AFS 以 system service 运行时通常满足。若被隔离（`PrivateMounts=yes` 或容
+/// 器），挂载对宿主机不可见，容器仍然看不到数据——此时应在启动阶段拒绝，
+/// 而不是运行期反复挂载却无人受益。
+///
+/// 判据是根挂载 `/` 的**传播标志为 `shared:`**，而不是"存在根挂载"：容器
+/// namespace 和 `PrivateMounts=yes` 的 mountinfo 里同样有 `/`（前者是
+/// overlay 根，后者是克隆宿主得到的副本），单纯的存在性检查区分不出来。
+/// 两种隔离方式都会把全部挂载重挂成 private，所以 shared 根是
+/// "这里建挂载能传播给宿主"的可靠信号。
 #[must_use]
 pub fn shares_host_namespace(mountinfo: &[u8]) -> bool {
-    // 独立性判据：自己的命名空间里能看到宿主机根挂载（`/` 存在且不是唯一
-    // 条目）。私有 namespace 里通常只剩 AFS 自己的 tmpfs 与 proc。
     let mounts = super::topology::parse(mountinfo);
-    mounts.iter().any(|mount| mount.mount_point == b"/")
+    mounts
+        .iter()
+        .any(|mount| mount.mount_point == b"/" && mount.shared)
 }
 
 /// 启动门禁：用一次真实挂载试探本进程是否有 `mount(2)` 权限。
@@ -307,9 +313,22 @@ mod tests {
     }
 
     #[test]
-    fn host_namespace_is_detected_by_the_root_mount() {
-        let with_root = b"1 0 8:1 / / rw - ext4 /dev/vda1 rw\n2 1 0:3 / /proc rw - proc proc rw\n";
+    fn host_namespace_is_detected_by_the_shared_root_mount() {
+        // 正常宿主服务：systemd 把根挂载设为 shared。
+        let with_root =
+            b"1 0 8:1 / / rw,relatime shared:1 - ext4 /dev/vda1 rw\n2 1 0:3 / /proc rw shared:1 - proc proc rw\n";
         assert!(shares_host_namespace(with_root));
+
+        // 容器 namespace：有 overlay 根挂载但传播是 private，宿主看不到
+        // 这里建的挂载。
+        let container =
+            b"1 0 0:40 / / rw - overlay overlay rw\n2 1 0:3 / /proc rw - proc proc rw\n";
+        assert!(!shares_host_namespace(container));
+
+        // `PrivateMounts=yes`：克隆宿主 namespace（根挂载还在）但全部重挂
+        // 成 private。
+        let private_mounts = b"1 0 8:1 / / rw,relative - ext4 /dev/vda1 rw\n".to_vec();
+        assert!(!shares_host_namespace(&private_mounts));
 
         // 私有 namespace：没有根挂载。
         let isolated = b"90 80 0:40 / /run/afs rw - tmpfs tmpfs rw\n";

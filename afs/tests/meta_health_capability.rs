@@ -199,6 +199,48 @@ async fn register_node_refuses_other_protocol_versions_before_writing() {
     assert!(register(meta, "session-current").await.lease_remaining_ms > 0);
 }
 
+/// Node ids become path segments on consumers (outlet import mount points and
+/// public symlink targets). Meta must reject ids that could escape a
+/// configured root before a session is stored, so the snapshot never carries
+/// an unsafe home id (review: mount/name-layer boundary).
+#[tokio::test]
+async fn register_node_refuses_path_unsafe_node_ids() {
+    let store = Arc::new(
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
+            .await
+            .unwrap(),
+    );
+    let meta = Arc::new(Meta::with_store(
+        "meta-safe-id-test".into(),
+        Observability::new().unwrap(),
+        store.clone(),
+    ));
+    for unsafe_id in ["../escape", "/etc", "with.dot", "with/slash", ""] {
+        let mut request = request("session-unsafe");
+        if let Some(node) = request.node.as_mut() {
+            node.node_id = unsafe_id.into();
+        }
+        let status = MetaRpc(meta.clone())
+            .register_node(GrpcRequest::new(request))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "{unsafe_id}: must be refused"
+        );
+        let session = afs::meta::store::MetaStore::read(
+            store.as_ref(),
+            afs::meta::store::MetaRead::CurrentNodeSession {
+                node_id: unsafe_id.into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(session.entity.is_none(), "{unsafe_id}: no session written");
+    }
+}
+
 #[tokio::test]
 async fn memory_backend_is_healthy_but_not_persistent_ready() {
     let meta = meta_with_backend(Arc::new(MemoryLog::new(Default::default()).unwrap())).await;

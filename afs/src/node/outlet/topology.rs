@@ -11,11 +11,18 @@ use std::path::Path;
 ///
 /// `mount_point` is decoded back to bytes (octal escapes resolved) so callers can
 /// compare it against a path without re-encoding every candidate.
+///
+/// `shared` reports the `shared:` propagation flag from the optional-fields
+/// segment. A mount namespace that the host can see into keeps the root mount
+/// shared (that is what systemd sets up on a normal host); a container
+/// namespace or a `PrivateMounts=yes` unit remounts everything private, so a
+/// shared root is the signal that mounts created here propagate to the host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mount {
     pub mount_point: Vec<u8>,
     pub fs_type: String,
     pub source: String,
+    pub shared: bool,
 }
 
 /// Parse every line of a mountinfo buffer.
@@ -34,7 +41,11 @@ fn parse_line(line: &[u8]) -> Option<Mount> {
     let split = line.windows(3).position(|window| window == b" - ")?;
     let fields = &line[..split];
     let fs_fields = &line[split + 3..];
-    let encoded_point = fields.split(|byte| *byte == b' ').nth(4)?;
+    let mut field_iter = fields.split(|byte| *byte == b' ');
+    let encoded_point = field_iter.nth(4)?;
+    // Optional fields follow the mount point and precede the "-" separator.
+    // Each is a single token; `shared:<peer-group>` marks shared propagation.
+    let shared = field_iter.any(|field| field.starts_with(b"shared:"));
     let mut fs_iter = fs_fields.split(|byte| *byte == b' ');
     let fs_type = fs_iter.next()?;
     let source = fs_iter.next()?;
@@ -42,6 +53,7 @@ fn parse_line(line: &[u8]) -> Option<Mount> {
         mount_point: decode_octal(encoded_point),
         fs_type: String::from_utf8_lossy(fs_type).into_owned(),
         source: String::from_utf8_lossy(source).into_owned(),
+        shared,
     })
 }
 
@@ -200,6 +212,7 @@ mod tests {
                 mount_point: point.as_bytes().to_vec(),
                 fs_type: (*fs).to_owned(),
                 source: "src".into(),
+                shared: false,
             })
             .collect()
     }
@@ -216,6 +229,21 @@ mod tests {
         let mounts = parse(b"garbage\n36 1 0:32 / /a rw - tmpfs tmpfs rw\n\n");
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].mount_point, b"/a");
+    }
+
+    /// 传播标志取自可选字段段：`shared:<peer>` 出现即为 shared，private/
+    /// slave 或无标志都不是。这是 namespace 门禁（`shares_host_namespace`）
+    /// 依赖的解析行为。
+    #[test]
+    fn shared_propagation_is_read_from_the_optional_fields() {
+        let mounts = parse(
+            b"36 1 0:32 / / rw,relatime shared:1 - ext4 /dev/vda1 rw\n\
+              37 1 0:33 / /mnt/a rw - ext4 /dev/vda1 rw\n\
+              38 1 0:34 / /mnt/b rw master:1 - ext4 /dev/vda1 rw\n",
+        );
+        assert!(mounts[0].shared);
+        assert!(!mounts[1].shared);
+        assert!(!mounts[2].shared);
     }
 
     #[test]

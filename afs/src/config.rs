@@ -26,6 +26,23 @@ pub use outlet::{DEFAULT_MOUNT_OPTIONS, OutletConfig};
 
 pub use tls::read_certificate_der;
 
+/// Whether `id` is safe to embed in filesystem paths and request keys.
+///
+/// The rule (`1..=128` bytes of ASCII letters, digits, `_`, `-`) is the one the
+/// local node id has always been held to at config resolution. It is also
+/// applied to node ids that arrive from the cluster (Meta registration and the
+/// outlet snapshot), because consumers build mount points and symlink targets
+/// by joining the id under a configured root: an id containing `/`, `..` or an
+/// absolute path would escape that root.
+#[must_use]
+pub fn is_safe_node_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Meta,
