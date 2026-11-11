@@ -60,7 +60,10 @@ mod catalog;
 mod lifecycle;
 mod outboard_file;
 mod peer_serve;
+mod read_cache;
 mod reader;
+#[cfg(feature = "dfs")]
+pub(crate) use read_cache::ReadCacheIntent;
 #[cfg(any(feature = "dfs", test))]
 mod scrub;
 mod sidecar_install;
@@ -90,6 +93,10 @@ pub use staged::StagedChunk;
 use store::*;
 use write_buffer::*;
 pub use write_buffer::{ChunkBuilder, SharedChunkBytes, WriteBufferPool, WriteBufferPoolStats};
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
 
 const OUTBOARD_REPAIR_SHARDS: usize = 64;
 type OutboardRepairGates = [Mutex<()>; OUTBOARD_REPAIR_SHARDS];
@@ -219,6 +226,8 @@ pub struct LocalChunkRecord {
     pub encoding: PhysicalEncoding,
     pub state: LocalChunkState,
     pub catalog_revision: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    read_cache_epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) segment_crc: Option<super::chunk_crc32c::CrcTable>,
 }
@@ -238,6 +247,7 @@ mod format_golden_tests;
 
 #[derive(Debug)]
 pub struct LocalChunkStore {
+    read_cache_admission: Mutex<()>,
     node_id: String,
     device_id: String,
     device_epoch: u64,

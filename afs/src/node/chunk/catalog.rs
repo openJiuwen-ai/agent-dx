@@ -9,6 +9,12 @@ use super::*;
 pub(super) struct CatalogTxn {
     pub(super) revision: u64,
     pub(super) records: Vec<LocalChunkRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) removed: Vec<ChunkId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) cache_updates: Vec<super::read_cache::ReadCacheIntent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) cache_acks: Vec<super::read_cache::ReadCacheIntent>,
     pub(super) checksum: String,
 }
 
@@ -20,11 +26,29 @@ impl CatalogTxn {
             revision,
             records,
             checksum,
+            removed: Vec::new(),
+            cache_updates: Vec::new(),
+            cache_acks: Vec::new(),
         })
     }
 
+    pub(super) fn expected_checksum(&self) -> Result<String> {
+        if self.removed.is_empty() && self.cache_updates.is_empty() && self.cache_acks.is_empty() {
+            return catalog_checksum(self.revision, &self.records);
+        }
+        let bytes = serde_json::to_vec(&(
+            self.revision,
+            &self.records,
+            &self.removed,
+            &self.cache_updates,
+            &self.cache_acks,
+        ))
+        .map_err(|error| invalid(error.to_string()))?;
+        Ok(blake3::hash(&bytes).to_hex().to_string())
+    }
+
     fn verify(&self) -> Result<()> {
-        if self.checksum != catalog_checksum(self.revision, &self.records)? {
+        if self.checksum != self.expected_checksum()? {
             return Err(invalid("local chunk catalog transaction checksum mismatch"));
         }
         Ok(())
@@ -37,9 +61,52 @@ pub struct LocalCatalog {
     #[cfg(any(feature = "dfs", test))]
     pub(super) gc_generation: u64,
     pub(super) records: HashMap<ChunkId, LocalChunkRecord>,
+    pub(super) cache_intents:
+        std::collections::BTreeMap<ChunkId, super::read_cache::ReadCacheIntent>,
+    pub(super) cache_bytes: u64,
+    pub(super) cache_order: std::collections::BTreeSet<(u64, ChunkId)>,
 }
 
 impl LocalCatalog {
+    pub(super) fn apply_cache_sync(
+        &mut self,
+        updates: Vec<super::read_cache::ReadCacheIntent>,
+        acknowledgements: Vec<super::read_cache::ReadCacheIntent>,
+    ) {
+        for intent in acknowledgements {
+            if self.cache_intents.get(&intent.copy.chunk_id) == Some(&intent) {
+                self.cache_intents.remove(&intent.copy.chunk_id);
+            }
+        }
+        for intent in updates {
+            self.cache_intents
+                .insert(intent.copy.chunk_id.clone(), intent);
+        }
+    }
+    pub(super) fn insert_record(&mut self, record: LocalChunkRecord) {
+        self.remove_record(&record.chunk.id);
+        if record.read_cache_epoch != 0 {
+            self.cache_bytes = self
+                .cache_bytes
+                .saturating_add(record.stored_length.saturating_add(4096));
+            self.cache_order
+                .insert((record.catalog_revision, record.chunk.id.clone()));
+        }
+        self.records.insert(record.chunk.id.clone(), record);
+    }
+
+    pub(super) fn remove_record(&mut self, id: &ChunkId) {
+        if let Some(old) = self.records.remove(id)
+            && old.read_cache_epoch != 0
+        {
+            self.cache_bytes = self
+                .cache_bytes
+                .saturating_sub(old.stored_length.saturating_add(4096));
+            self.cache_order
+                .remove(&(old.catalog_revision, old.chunk.id));
+        }
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -104,12 +171,16 @@ impl LocalCatalog {
             if txn.revision != catalog.revision.saturating_add(1) {
                 return Err(invalid("local chunk catalog revision is not contiguous"));
             }
+            for id in &txn.removed {
+                catalog.remove_record(id);
+            }
             for record in txn.records {
                 if record.catalog_revision != txn.revision {
                     return Err(invalid("local chunk record has the wrong catalog revision"));
                 }
-                catalog.records.insert(record.chunk.id.clone(), record);
+                catalog.insert_record(record);
             }
+            catalog.apply_cache_sync(txn.cache_updates, txn.cache_acks);
             catalog.revision = txn.revision;
             valid_bytes = next_offset;
         }

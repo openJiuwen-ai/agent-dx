@@ -1621,6 +1621,13 @@ impl OwnerLocalFiles for DistributedFs {
         kill_suidgid: bool,
         scope: DfsOwnerHandleScope,
     ) -> Result<FileHandle> {
+        if lazy_fill::sealed(inode)
+            && (open_flags & libc::O_ACCMODE != libc::O_RDONLY
+                || open_flags & libc::O_TRUNC != 0
+                || kill_suidgid)
+        {
+            return Err(invalid("lazy peer handles are read-only"));
+        }
         self.install_write_state(inode.clone(), lease.clone())?;
         let session = self.open_write_session(inode, open_flags)?;
         if session.lease_epoch != lease.lease_epoch {
@@ -1635,6 +1642,7 @@ impl OwnerLocalFiles for DistributedFs {
             Self::apply_kernel_killpriv_to_state(&mut state);
         }
         self.allocate_handle(DfsFileHandle {
+            origin_fill: false,
             gc_pin: None,
             inode_id: inode.inode_id.clone(),
             opened_inode: inode.clone(),
@@ -1815,6 +1823,10 @@ impl DistributedFs {
         let snapshot = self.handle_snapshot(file)?;
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
+        }
+        if lazy_fill::sealed(&snapshot.opened_inode) {
+            let fs = self.clone();
+            return offload_handler(move || fs.owner_read(file, &inode_id, offset, length)).await;
         }
         let deadline = Instant::now() + self.read_engine.read_pipeline_timeout();
         let data = self

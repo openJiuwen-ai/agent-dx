@@ -2198,3 +2198,72 @@ fn chunk_store_put_microbench() {
         }
     }
 }
+
+struct R84FailingTargetPlane {
+    calls: Mutex<Vec<String>>,
+    error: afs_error::ErrorCode,
+}
+
+impl ReplicaDataPlane for R84FailingTargetPlane {
+    fn mode(&self) -> ReplicaTransferMode {
+        ReplicaTransferMode::GrpcStream
+    }
+
+    fn prepare_peer(&self, _: &ReplicaPeerOp) -> Result<()> {
+        Ok(())
+    }
+
+    fn put_peer_replica(&self, op: &ReplicaPeerOp, item: &StagedChunk) -> Result<Vec<ReplicaAck>> {
+        self.calls.lock().unwrap().push(op.target.node_id.clone());
+        if op.target.node_id == "b" {
+            return Err(Error::coded(self.error, "R84 peer failure"));
+        }
+        Ok(vec![ack_for(&op.target, op, item)])
+    }
+}
+
+#[test]
+fn r84_strict_pair_uses_an_authoritative_alternative_after_peer_failure() {
+    for error in [afs_error::NODE_TRANSFER_UNAVAILABLE, afs_error::IO_CAPACITY] {
+        let fixture = selective_fail_fixture(None, None);
+        let mut snapshot = (*fixture.store.placement.snapshot().unwrap()).clone();
+        snapshot.failure = crate::dfs::ReplicaFailureConfig::strict();
+        let mut alternative = snapshot.replica_groups[0].clone();
+        alternative.id = ReplicaGroupId::new("r84-alternative");
+        alternative.targets[1] = target("c", remote_device("c-device"));
+        snapshot.replica_groups.push(alternative);
+        let item = staged_for_group(&snapshot, 0);
+        let plane = Arc::new(R84FailingTargetPlane {
+            calls: Mutex::new(Vec::new()),
+            error,
+        });
+        let sink = DfsChunkSink::new_with_epoch(
+            "a".into(),
+            1,
+            fixture.local.clone(),
+            Arc::new(StaticPlacement {
+                snapshot: Arc::new(snapshot),
+            }),
+            plane.clone(),
+        );
+        let stored = sink
+            .put_chunks(vec![item.clone()], PutIntent::PipelineUpload)
+            .unwrap();
+        assert_eq!(*plane.calls.lock().unwrap(), ["b", "c"]);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].receipt.replica_group_id,
+            ReplicaGroupId::new("r84-alternative")
+        );
+        assert_eq!(
+            stored[0]
+                .receipt
+                .durable_acks
+                .iter()
+                .map(|ack| ack.node_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        assert!(holds(&fixture.local, &item));
+    }
+}

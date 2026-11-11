@@ -15,6 +15,7 @@ fn record(revision: u64, label: &str) -> LocalChunkRecord {
         encoding: PhysicalEncoding::Raw,
         state: LocalChunkState::Durable,
         catalog_revision: revision,
+        read_cache_epoch: 0,
     }
 }
 

@@ -4,6 +4,30 @@ use super::*;
 
 #[cfg(feature = "dfs")]
 impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
+    fn restore_file_chunk(
+        &self,
+        request: crate::dfs::RestoreFileChunk,
+        timeout: Duration,
+    ) -> afs_error::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        crate::node::call_deadline::within(deadline, || {
+            self.run(
+                self.client()
+                    .restore_file_chunk(afs_tracing::request_with_current_context(
+                        afs_protocol::meta::RestoreDfsFileChunkRequest {
+                            caller_id: request.caller_id,
+                            operation_id: request.operation_id.0,
+                            file_version_id: request.file_version_id.0,
+                            layout_root_id: request.layout_root_id.0,
+                            write_lease: Some(wire_dfs_write_lease(request.write_lease)),
+                            receipt: Some(wire_chunk_receipt(request.receipt)),
+                        },
+                    )),
+            )
+        })?;
+        Ok(())
+    }
+
     fn lookup(
         &self,
         parent: &crate::dfs::InodeId,
@@ -327,37 +351,17 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         '_,
         (crate::dfs::InodeRecord, crate::dfs::WriteLease),
     > {
-        Box::pin(async move {
-            let (diagnostic, _coarse) = self.begin_read_diagnostic(
-                crate::node::metrics::read_timing::ReadDiagnosticStage::MetaResolveWriteAuthority,
-            );
-            let result = async {
-                let reply = self
-                    .run_async(self.client().resolve_write_authority(
-                        afs_protocol::meta::ResolveDfsWriteAuthorityRequest {
-                            caller_id: self.node_id.clone(),
-                            owner_session_id: self.session_id.clone(),
-                            operation_id: self.request_id(),
-                            inode_id: inode_id.0,
-                            lease_seconds: crate::dfs::DFS_WRITE_LEASE_SECONDS,
-                        },
-                    ))
-                    .await?
-                    .into_inner();
-                Ok((
-                    domain_dfs_inode(required(reply.inode, "ResolveWriteAuthority.inode")?)?,
-                    domain_dfs_write_lease(required(
-                        reply.write_lease,
-                        "ResolveWriteAuthority.write_lease",
-                    )?),
-                ))
-            }
-            .await;
-            if let Some(diagnostic) = diagnostic {
-                diagnostic.finish(result.is_ok());
-            }
-            result
-        })
+        self.resolve_dfs_write_authority(inode_id, crate::dfs::DFS_WRITE_LEASE_SECONDS)
+    }
+
+    fn observe_write_authority(
+        &self,
+        inode_id: &crate::dfs::InodeId,
+    ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease)> {
+        crate::node::bridge::block_on(
+            &self.runtime,
+            self.resolve_dfs_write_authority(inode_id.clone(), 0),
+        )
     }
 
     fn renew_write_lease(
@@ -543,6 +547,27 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         Ok(reply.names)
     }
 
+    fn bind_lazy_source(
+        &self,
+        request: crate::dfs::BindLazySourceRequest,
+    ) -> afs_error::Result<crate::dfs::InodeRecord> {
+        let reply =
+            self.run(self.client().bind_lazy_source(
+                afs_protocol::meta::DfsBindLazySourceRequest {
+                    caller_id: request.caller_id,
+                    caller_session_id: request.caller_session_id,
+                    operation_id: request.operation_id.0,
+                    inode_id: request.inode_id.0,
+                    expected_inode_revision: request.expected_inode_revision,
+                    length: request.source.length,
+                    kind: request.source.binding.kind,
+                    binding: request.source.binding.payload,
+                },
+            ))?
+            .into_inner();
+        required(reply.inode, "BindLazySource.inode").and_then(domain_dfs_inode)
+    }
+
     fn set_xattr(
         &self,
         request: crate::dfs::SetXattrRequest,
@@ -693,5 +718,49 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
             )?
             .into_inner();
         required(reply.inode, "CommitFileVersion.inode").and_then(domain_dfs_inode)
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl GrpcDfsMeta {
+    fn resolve_dfs_write_authority(
+        &self,
+        inode_id: crate::dfs::InodeId,
+        lease_seconds: u64,
+    ) -> crate::node::read::admission::ReadFuture<
+        '_,
+        (crate::dfs::InodeRecord, crate::dfs::WriteLease),
+    > {
+        Box::pin(async move {
+            let (diagnostic, _coarse) = self.begin_read_diagnostic(
+                crate::node::metrics::read_timing::ReadDiagnosticStage::MetaResolveWriteAuthority,
+            );
+            let result = async {
+                let reply = self
+                    .run_async(self.client().resolve_write_authority(
+                        afs_protocol::meta::ResolveDfsWriteAuthorityRequest {
+                            caller_id: self.node_id.clone(),
+                            owner_session_id: self.session_id.clone(),
+                            operation_id: self.request_id(),
+                            inode_id: inode_id.0,
+                            lease_seconds,
+                        },
+                    ))
+                    .await?
+                    .into_inner();
+                Ok((
+                    domain_dfs_inode(required(reply.inode, "ResolveWriteAuthority.inode")?)?,
+                    domain_dfs_write_lease(required(
+                        reply.write_lease,
+                        "ResolveWriteAuthority.write_lease",
+                    )?),
+                ))
+            }
+            .await;
+            if let Some(diagnostic) = diagnostic {
+                diagnostic.finish(result.is_ok());
+            }
+            result
+        })
     }
 }

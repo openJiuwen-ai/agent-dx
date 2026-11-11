@@ -126,6 +126,7 @@ struct DfsTransport {
 /// Everything the DFS assembly hands to the later stages (段 8–9). The
 /// `Option` handles stay `None` when `cfg.dfs` is off.
 pub(super) struct DfsAssembly {
+    pub(super) connectors: crate::node::connectors::ConnectorRuntime,
     pub(super) storage: DfsStorage,
     pub(super) read: DfsReadAdmission,
     pub(super) meta: Option<Arc<rpc::meta::GrpcDfsMeta>>,
@@ -219,6 +220,7 @@ impl DfsAssembly {
         };
         dfs_write_buffers.register_metrics(&obs.registry)?;
         let mut assembly = Self {
+            connectors: crate::node::connectors::ConnectorRuntime::build(&cfg.connectors, &cfg.id)?,
             storage,
             read,
             meta: dfs_meta,
@@ -318,12 +320,25 @@ impl DfsAssembly {
                 dfs_rdma_pool.clone(),
             )?,
             read_config,
-        );
+        )
+        .with_distribution(read::engine::ReadDistributionConfig {
+            parallelism: cfg.dfs_read_parallelism,
+            stripe_bytes: cfg.dfs_read_stripe_bytes,
+        })?;
         let read_engine = match &dfs_read_authority {
             Some(authority) => read_engine.with_read_authority(authority.clone()),
             None => read_engine,
         };
-        let read_engine = if let Some(cache) = &cfg.dfs_peer_cache {
+        // Both features retain complete peer bodies. Prefer the catalog-backed
+        // serveable cache if configured, so there is one physical cache budget.
+        let read_engine = if cfg.dfs_read_cache_bytes != 0 {
+            if cfg.dfs_peer_cache.is_some() || external_store.is_some() {
+                return Err(
+                    "dfs_read_cache_bytes requires native DFS without dfs_peer_cache".into(),
+                );
+            }
+            read_engine.with_distributed_cache(session_id.clone(), cfg.dfs_read_cache_bytes)
+        } else if let Some(cache) = &cfg.dfs_peer_cache {
             let cache = open_peer_cache(cfg, cache, &namespace, &self.storage).await?;
             self.peer_cache = Some(cache.clone());
             read_engine.with_peer_cache(cache)
@@ -369,6 +384,7 @@ impl DfsAssembly {
             chunk_store,
             read_engine,
         )
+        .with_lazy_fill_registry(self.connectors.register_lazy_handlers()?)
         .with_gc_references(gc_references)
         .with_remote_owner_factory(remote_factory)
         .with_version_cache_capacity(cfg.dfs_version_cache_entries)
@@ -398,6 +414,7 @@ impl DfsAssembly {
             tokio::runtime::Handle::current(),
             Some(dfs_read_work_metrics.clone()),
         )?;
+        let fs = fs.with_write_timeout(std::time::Duration::from_millis(cfg.dfs_write_timeout_ms));
         self.instance = Some(Arc::new(fs));
         Ok(())
     }
@@ -495,6 +512,7 @@ pub(super) fn start_background(
         async move { reviewing.review_suspect_copies(limit).await }
     })
     .start(services);
+    dfs.start_distributed_cache(services);
     let renewing = dfs.clone();
     fault::lease_keeper::LeaseKeeper::new(move || renewing.renew_active_write_leases())
         .start(services);

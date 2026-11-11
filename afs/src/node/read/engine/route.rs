@@ -183,7 +183,10 @@ impl ReplicatedSources<'_> {
             ));
         }
         self.read_remote(&remote_batch, &sources, out, final_owned, Some(deadline))
-            .await
+            .await?;
+        self.engine
+            .cache_completed_ranges(&remote_batch, &sources, out);
+        Ok(())
     }
 
     /// Remote sources in order; the first that applies serves the batch.
@@ -210,8 +213,24 @@ impl ReplicatedSources<'_> {
         {
             return Ok(());
         }
+        if final_owned
+            && self
+                .engine
+                .read_distributed_ranges(batch, sources, out, deadline)
+                .await?
+        {
+            return Ok(());
+        }
+        let ordered = (self.engine.distribution.parallelism > 1)
+            .then(|| self.engine.distributed_sources(batch, sources));
         PeerRangeSource(self.engine)
-            .read(batch, sources, out, final_owned)
+            .read(
+                batch,
+                ordered.as_deref().unwrap_or(sources),
+                out,
+                final_owned,
+                deadline,
+            )
             .await
     }
 }
@@ -258,9 +277,10 @@ impl PeerRangeSource<'_> {
         sources: &[ChunkSources],
         out: &mut [u8],
         final_owned: bool,
+        deadline: Option<Instant>,
     ) -> Result<()> {
         self.0
-            .read_remote_ranges_async(batch, sources, out, final_owned)
+            .read_remote_ranges_async(batch, sources, out, final_owned, deadline)
             .await
     }
 }

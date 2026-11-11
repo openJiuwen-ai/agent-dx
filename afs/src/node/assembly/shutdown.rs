@@ -77,6 +77,10 @@ pub(super) async fn serve_until_shutdown(
         record_shutdown_stage("serving");
         services.run_with_shutdown(on_shutdown).await.err()
     };
+    #[cfg(feature = "dfs")]
+    if let Err(error) = backends.dfs.connectors.stop().await {
+        remember_shutdown_error(&mut shutdown_error, error.into());
+    }
     #[cfg(test)]
     record_shutdown_stage("services_stopped");
     #[cfg(feature = "ownerfs")]
@@ -151,6 +155,7 @@ fn close_admission(state: &Node, backends: &Backends) {
     #[cfg(feature = "dfs")]
     if let Some(dfs) = &state.dfs {
         dfs.close_write_admission();
+        dfs.close_lazy_fill_admission();
     }
     #[cfg(feature = "dfs")]
     if let Some(store) = &dfs_sidecar_store_for_shutdown {
@@ -198,6 +203,7 @@ async fn join_fuse(mounted: fuse::MountedFuse, shutdown_error: &mut Option<BoxEr
 /// Step 5: the shutdown passes, all attempted, first error kept.
 #[cfg(feature = "dfs")]
 async fn drain_dfs(dfs: Arc<vfs::dfs::DistributedFs>, shutdown_error: &mut Option<BoxError>) {
+    dfs.drain_lazy_fills().await;
     match crate::node::bridge::spawn_blocking(move || {
         let [committed, remote_releases, owner_handles, lock_sessions, _] =
             background::drain_all([

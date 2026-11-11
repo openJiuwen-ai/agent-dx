@@ -6,7 +6,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use afs_error::{Error, Result};
+use afs_error::{Error, ErrorKind, Result};
 
 use crate::{
     dfs::{
@@ -226,6 +226,14 @@ impl ReplicationPlan {
         }
         let group = select_replica_group(&staged.chunk.id, snapshot)
             .ok_or_else(|| invalid("placement snapshot contains no replica group"))?;
+        Self::from_group(staged, snapshot, group)
+    }
+
+    fn from_group(
+        staged: &StagedChunk,
+        snapshot: &PlacementSnapshot,
+        group: &ReplicaGroup,
+    ) -> Result<Self> {
         let ack_requirement = AckRequirement::for_writes(
             &snapshot.replication,
             snapshot.failure,
@@ -460,10 +468,81 @@ impl ReplicaChain {
         Ok((durable_acks, degraded))
     }
 
+    /// A local-head strict pair has exactly one remote hop. An alternative
+    /// group from this same Meta snapshot can replace that hop. Persisting
+    /// the same immutable chunk reuses its local body and obtains a receipt
+    /// for the replacement placement epoch.
+    fn retry_strict_pair(
+        &self,
+        snapshot: &PlacementSnapshot,
+        failed: &ReplicationPlan,
+        staged: &StagedChunk,
+        error: &Error,
+    ) -> Result<Option<(ReplicationPlan, Vec<ReplicaAck>)>> {
+        if snapshot.failure.policy != crate::dfs::ReplicaFailurePolicy::Strict
+            || !matches!(
+                error.kind(),
+                ErrorKind::Unavailable | ErrorKind::DeadlineExceeded | ErrorKind::ResourceExhausted
+            )
+            || failed.sync_target_count()? != 2
+        {
+            return Ok(None);
+        }
+        let head = &failed.ordered_targets[0];
+        let failed_peer = &failed.ordered_targets[1];
+        if head.node_id != self.node_id {
+            return Ok(None);
+        }
+        let mut last_error = None;
+        for group in &snapshot.replica_groups {
+            if !matches!(group.targets.as_slice(), [local, peer, ..]
+                if local == head && peer.node_id != failed_peer.node_id)
+            {
+                continue;
+            }
+            let plan = ReplicationPlan::from_group(staged, snapshot, group)?;
+            if plan.sync_target_count()? != 2 {
+                continue;
+            }
+            let op = self.prepare(&plan, None)?;
+            let local_ack = self
+                .persist_head(&plan, std::slice::from_ref(staged))?
+                .into_iter()
+                .next();
+            let acks = match self.forward(&plan, op.as_ref(), staged, local_ack, false) {
+                Ok((acks, _)) => acks,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::Unavailable
+                            | ErrorKind::DeadlineExceeded
+                            | ErrorKind::ResourceExhausted
+                    ) =>
+                {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            afs_logging::info!("dfs.replica_write_replaced";
+                "chunk_id" => staged.chunk.id.0.as_str(),
+                "failed_node" => failed_peer.node_id.as_str(),
+                "replacement_node" => plan.ordered_targets[1].node_id.as_str(),
+                "replica_group_id" => plan.replica_group_id.0.as_str()
+            );
+            return Ok(Some((plan, acks)));
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
+    }
+
     fn put_batch(
         &self,
         staged: Vec<StagedChunk>,
         snapshot: &PlacementSnapshot,
+        retry_strict_pair: bool,
     ) -> Result<Vec<StoredChunk>> {
         let plans = staged
             .iter()
@@ -496,9 +575,24 @@ impl ReplicaChain {
                     .chain(std::iter::repeat(None)),
             ) {
                 let plan = &plans[index];
-                let (durable_acks, this_degraded) =
-                    self.forward(plan, ops[index].as_ref(), &item, local_ack, degraded)?;
-                degraded |= this_degraded;
+                let alternate;
+                let (plan, durable_acks) =
+                    match self.forward(plan, ops[index].as_ref(), &item, local_ack, degraded) {
+                        Ok((acks, this_degraded)) => {
+                            degraded |= this_degraded;
+                            (plan, acks)
+                        }
+                        Err(error) if retry_strict_pair => {
+                            let Some((replacement, acks)) =
+                                self.retry_strict_pair(snapshot, plan, &item, &error)?
+                            else {
+                                return Err(error);
+                            };
+                            alternate = replacement;
+                            (&alternate, acks)
+                        }
+                        Err(error) => return Err(error),
+                    };
                 receipts[index] = Some(StoredChunk::unreleased(ChunkReceipt {
                     external_commit: None,
                     operation_id: item.operation_id,
@@ -667,12 +761,14 @@ impl DfsChunkSink {
         &self,
         staged: Vec<StagedChunk>,
         minimum_revision: u64,
+        intent: PutIntent,
     ) -> Result<Vec<StoredChunk>> {
         if staged.is_empty() {
             return Ok(Vec::new());
         }
         let snapshot = self.placement.refresh(minimum_revision)?;
-        self.chain.put_batch(staged, &snapshot)
+        self.chain
+            .put_batch(staged, &snapshot, intent == PutIntent::PipelineUpload)
     }
 
     fn validate_local_capacity_authority(&self, snapshot: &PlacementSnapshot) -> Result<()> {
@@ -762,7 +858,7 @@ impl ChunkSink for DfsChunkSink {
         let mut stored = if snapshot.is_local_fast_path() {
             self.local_r1.put_batch(staged, &snapshot)?
         } else {
-            self.put_replicated_batch(staged, snapshot.revision)?
+            self.put_replicated_batch(staged, snapshot.revision, intent)?
         };
         if intent == PutIntent::PipelineUpload && snapshot.local_copy.requires_local() {
             self.confirm_local_required_copies(&mut stored)?;

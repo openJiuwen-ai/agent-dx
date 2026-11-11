@@ -597,6 +597,8 @@ impl OutboardMetrics {
 struct WriteResourceMetrics {
     #[cfg(feature = "dfs")]
     native_write_resources: afs_metrics::IntGaugeVec,
+    #[cfg(feature = "dfs")]
+    native_writeback_errors: afs_metrics::IntCounter,
     catalog_commit_resources: afs_metrics::IntGaugeVec,
     sidecar_install_items: afs_metrics::IntGaugeVec,
     sidecar_install_control_bytes: afs_metrics::IntGauge,
@@ -612,6 +614,12 @@ impl WriteResourceMetrics {
                 "Native live, upload and unpublished control capacity with lifetime peaks and cumulative events; excludes S3, idle pool, allocator and RSS.",
                 &["resource"],
                 NATIVE_WRITE_RESOURCES,
+            )?,
+            #[cfg(feature = "dfs")]
+            native_writeback_errors: counter(
+                registry,
+                "afs_dfs_native_writeback_errors_total",
+                "DFS background errors retained for delivery, including repeated attempts.",
             )?,
             catalog_commit_resources: gauge_vec(
                 registry,
@@ -1239,6 +1247,11 @@ impl ReadWorkMetrics {
     }
 
     #[cfg(feature = "dfs")]
+    pub(crate) fn native_writeback_error(&self) {
+        self.write.native_writeback_errors.inc();
+    }
+
+    #[cfg(feature = "dfs")]
     pub(crate) fn native_write_resources(&self, values: &[(&str, u64)]) {
         for (resource, value) in values {
             if NATIVE_WRITE_RESOURCES.contains(resource)
@@ -1662,6 +1675,7 @@ mod tests {
         "afs_dfs_fetch_events_total",
         "afs_dfs_fetch_resources",
         "afs_dfs_native_write_resources",
+        "afs_dfs_native_writeback_errors_total",
         "afs_dfs_peer_disk_cache_events_total",
         "afs_dfs_peer_disk_cache_resources",
         "afs_dfs_read_authorization_calls_total",

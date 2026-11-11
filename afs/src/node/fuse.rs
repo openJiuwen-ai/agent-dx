@@ -132,6 +132,7 @@ pub struct AfsFuse {
     front_write: Option<Arc<front_write::FrontWriteQueue>>,
     #[cfg(feature = "dfs")]
     read_runtime: Option<tokio::runtime::Handle>,
+    fsync_runtime: Option<tokio::runtime::Handle>,
     #[cfg(feature = "dfs")]
     read_completions: Option<read_reply::ReadCompletions>,
     ingress_session_id: String,
@@ -175,6 +176,7 @@ impl AfsFuse {
             ),
             #[cfg(feature = "dfs")]
             read_runtime: None,
+            fsync_runtime: None,
             #[cfg(feature = "dfs")]
             read_completions: None,
             front_write: None,
@@ -1920,23 +1922,65 @@ impl Filesystem for AfsFuse {
         // on an O_RDONLY descriptor still flushes data dirtied by another writer of
         // the same file. This is the rule `write_admission_mode` documents for
         // writes ("anything that may wait stays on a worker") applied to fsync.
+        let deadline = backend
+            .fsync_timeout()
+            .map(|timeout| std::time::Instant::now() + timeout);
+        let reply = Arc::new(Mutex::new(Some(reply)));
+        // While queued, no backend commit has started for this call. Once the
+        // worker claims the reply, it reports the actual barrier result.
+        let timer = self
+            .fsync_runtime
+            .as_ref()
+            .zip(deadline)
+            .map(|(runtime, deadline)| {
+                let reply = reply.clone();
+                runtime.spawn(async move {
+                    tokio::time::sleep_until(deadline.into()).await;
+                    if let Some(reply) = reply
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        reply.error(fuse_errno(libc::ETIMEDOUT));
+                    }
+                })
+            });
         self.front_recover(ino, false, move |_front_guard, front_result| {
+            let claim_reply = move || {
+                let reply = reply
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(timer) = timer {
+                    timer.abort();
+                }
+                reply
+            };
             if _front_guard.is_none()
                 && let Err(error) = front_result
             {
-                reply.error(fuse_errno(error));
+                if let Some(reply) = claim_reply() {
+                    reply.error(fuse_errno(error));
+                }
                 return;
             }
             let run = move || {
                 let _front_guard = _front_guard;
+                let Some(reply) = claim_reply() else {
+                    return;
+                };
 
                 let file = state.lock().unwrap().file_handle(fh);
                 let result = file.ok_or(libc::ESTALE).and_then(|file| {
                     AfsFuse::validate_handle_inode_in(&state, ino)?;
                     Ok(backend.as_ref()).and_then(|backend| {
-                        backend
-                            .fsync(&context, file.handle, sync_mode(datasync))
-                            .map_err(errno_in(FuseOp::Fsync))
+                        let sync = || backend.fsync(&context, file.handle, sync_mode(datasync));
+                        match deadline {
+                            #[cfg(feature = "dfs")]
+                            Some(deadline) => crate::node::call_deadline::within(deadline, sync),
+                            _ => sync(),
+                        }
+                        .map_err(errno_in(FuseOp::Fsync))
                     })
                 });
 

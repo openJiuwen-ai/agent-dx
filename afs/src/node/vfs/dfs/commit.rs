@@ -259,9 +259,18 @@ impl DistributedFs {
             return Ok(None);
         }
         while state.commit_busy || wait_for_operation && state.operation_busy {
-            state = cell
-                .wait(state)
-                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            let wait = crate::node::call_deadline::remaining();
+            if wait.is_some_and(|time| time.is_zero()) {
+                return Err(Error::coded(
+                    afs_error::IO_TIMEOUT,
+                    "DFS commit turn deadline elapsed",
+                ));
+            }
+            state = match wait {
+                Some(wait) => cell.wait_timeout(state, wait),
+                None => cell.wait(state),
+            }
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
         }
         if let Some(error) = state.terminal_error.clone() {
             return Err(error);
@@ -376,9 +385,21 @@ impl DistributedFs {
                     && wait_for_operation
                     && state.operation_busy
                 {
-                    state = cell
-                        .wait(state)
-                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                    let remaining = crate::node::call_deadline::remaining();
+                    if remaining.is_some_and(|time| time.is_zero()) {
+                        state.in_flight = Some(InFlightCommit::File(Box::new(pending_file)));
+                        state.commit_busy = false;
+                        cell.notify_all();
+                        return Err(Error::coded(
+                            afs_error::IO_TIMEOUT,
+                            "DFS prepared commit deadline elapsed before send",
+                        ));
+                    }
+                    state = match remaining {
+                        Some(time) => cell.wait_timeout(state, time),
+                        None => cell.wait(state),
+                    }
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
                 }
                 state.in_flight = Some(InFlightCommit::File(Box::new(pending_file)));
                 #[cfg(test)]
@@ -413,12 +434,23 @@ impl DistributedFs {
     ) -> Result<Option<u64>> {
         let committed_kill_suidgid = matches!(&pending, InFlightCommit::File(pending) if pending.frozen.kill_suidgid_dirty)
             || matches!(&pending, InFlightCommit::Metadata(sync, _) if sync.metadata_delta.kill_suidgid);
-        let result = match &pending {
-            InFlightCommit::Preparing(_) => Err(unavailable("DFS inode commit is still preparing")),
-            InFlightCommit::File(pending) => self.send_file_commit(pending, branch),
-            InFlightCommit::Metadata(sync, through_seq) => {
-                self.send_metadata_sync(sync, *through_seq, branch)
-            }
+        // Admission expiry is safe before sending. Once sent, keep the
+        // publication RPC's usual result and exact-replay semantics.
+        let result = if crate::node::call_deadline::remaining().is_some_and(|time| time.is_zero()) {
+            Err(Error::coded(
+                afs_error::IO_TIMEOUT,
+                "DFS publication deadline elapsed before send",
+            ))
+        } else {
+            crate::node::call_deadline::without(|| match &pending {
+                InFlightCommit::Preparing(_) => {
+                    Err(unavailable("DFS inode commit is still preparing"))
+                }
+                InFlightCommit::File(pending) => self.send_file_commit(pending, branch),
+                InFlightCommit::Metadata(sync, through_seq) => {
+                    self.send_metadata_sync(sync, *through_seq, branch)
+                }
+            })
         };
 
         let mut state = cell
@@ -593,6 +625,8 @@ impl DistributedFs {
         state.durable_write_seq = through_seq;
         state.committed_write_seq = through_seq;
         state.last_writer_background_requested = false;
+        state.writeback_retry_at = None;
+        state.writeback_failures = 0;
         state.native_due = state.native_due_through > through_seq;
         if committed_full_metadata
             && state.dirty_extents.is_empty()

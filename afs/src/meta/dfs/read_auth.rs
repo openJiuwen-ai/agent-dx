@@ -130,7 +130,7 @@ impl DfsService {
                     }
                     (copy.clone(), None)
                 } else {
-                    if copy.chunk_id != chunk_id || !copy.is_ready_durable() {
+                    if copy.chunk_id != chunk_id || !copy.is_ready_readable() {
                         continue;
                     }
                     let CopyLocation::Node { node_id, .. } = &copy.location else {
@@ -795,7 +795,7 @@ impl DfsService {
                 .entity
             {
                 Some(MetaEntity::DfsCopy(value))
-                    if value.chunk_id == validation.chunk_id && value.is_ready_durable() =>
+                    if value.chunk_id == validation.chunk_id && value.is_ready_readable() =>
                 {
                     value
                 }
@@ -864,10 +864,13 @@ pub(in crate::meta) fn serving_read_copy(
     else {
         return None;
     };
-    if !copy.is_ready_durable()
+    if !copy.is_ready_readable()
         || node_id != &session.node_id
         || *node_epoch == 0
         || session.lease_epoch < *node_epoch
+        // A disposable copy must be re-verified and advertised by the new
+        // session. Only a durable replica can project its recovered epoch.
+        || (copy.role == CopyRole::VerifiedCache && session.lease_epoch != *node_epoch)
         || !session.is_live_at_unix_ms(now)
         || !session.storage_devices.iter().any(|device| {
             device.device_id == *device_id
@@ -907,7 +910,7 @@ async fn live_read_session(
     }
 }
 
-fn read_chunk_intervals(
+pub(super) fn read_chunk_intervals(
     layout: &LayoutRoot,
     chunk: &crate::dfs::ChunkObject,
 ) -> Result<Vec<(u64, u64)>> {
@@ -944,7 +947,7 @@ fn read_chunk_intervals(
         .collect())
 }
 
-fn read_range_covered(intervals: &[(u64, u64)], offset: u64, length: u64) -> bool {
+pub(super) fn read_range_covered(intervals: &[(u64, u64)], offset: u64, length: u64) -> bool {
     length != 0
         && offset.checked_add(length).is_some_and(|end| {
             intervals.iter().any(|(start, len)| {

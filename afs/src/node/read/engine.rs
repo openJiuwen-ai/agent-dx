@@ -42,12 +42,18 @@ use crate::{
 };
 
 mod authority;
+mod cache_reconcile;
+mod distribution;
+#[cfg(test)]
+mod distribution_tests;
 mod external;
 mod fanout;
 mod local;
 mod peer_cache_source;
 mod prefetch;
+mod recovery;
 mod remote;
+pub(crate) use distribution::ReadDistributionConfig;
 mod route;
 mod sources;
 pub(in crate::node) use authority::{LocalReadAuthority, NativeReadAuthoritySnapshot};
@@ -215,6 +221,22 @@ impl ReadBatch {
 
 pub trait ReadSourceProvider: Send + Sync {
     fn sources_for(&self, request: DfsChunkSourcesRequest) -> Result<DfsChunkSourcesReply>;
+
+    fn publish_read_cache(
+        &self,
+        _request: crate::dfs::PublishReadCache,
+        _deadline: Instant,
+    ) -> super::admission::ReadFuture<'_, crate::dfs::CopyRecord> {
+        Box::pin(async { Err(unavailable("read cache publication is unavailable")) })
+    }
+
+    fn retire_read_cache(
+        &self,
+        _request: crate::dfs::RetireReadCache,
+        _deadline: Instant,
+    ) -> super::admission::ReadFuture<'_, ()> {
+        Box::pin(async { Err(unavailable("read cache retirement is unavailable")) })
+    }
 
     /// Local/test providers may return immediately. Network adapters override
     /// this entry so async read preparation never hides a network block_on.
@@ -551,6 +573,9 @@ fn range_covered(ranges: &[(u64, u64)], requested_start: u64, requested_len: u64
 
 pub struct DfsReadEngine {
     namespace_id: crate::dfs::NamespaceId,
+    distribution: ReadDistributionConfig,
+    source_turn: Arc<std::sync::atomic::AtomicUsize>,
+    distributed_cache: Option<Arc<cache_reconcile::ReadCacheRuntime>>,
     reply_buffer_pool: Arc<super::buffer::ReadBufferPool>,
     read_pipeline_limits: super::admission::ReadPipelineLimits,
     reply_admission: Arc<tokio::sync::Semaphore>,
@@ -668,6 +693,9 @@ impl DfsReadEngine {
         );
         source_cache.record(&local);
         Self {
+            distribution: ReadDistributionConfig::default(),
+            source_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            distributed_cache: None,
             reply_buffer_pool: super::buffer::ReadBufferPool::new("reply"),
             read_pipeline_limits: Default::default(),
             reply_admission: Arc::new(tokio::sync::Semaphore::new(8 * 1024 * 1024)),
@@ -690,6 +718,12 @@ impl DfsReadEngine {
             fetcher: None,
             external_authority_cache: Mutex::new(ExternalAuthorityCache::default()),
         }
+    }
+
+    pub(crate) fn with_distribution(mut self, config: ReadDistributionConfig) -> Result<Self> {
+        config.validate()?;
+        self.distribution = config;
+        Ok(self)
     }
 
     /// Select external-backend-only reads. Healthy local chunks and peer
@@ -737,6 +771,9 @@ impl DfsReadEngine {
 
     fn task_reader(&self) -> Self {
         Self {
+            distribution: self.distribution,
+            source_turn: self.source_turn.clone(),
+            distributed_cache: self.distributed_cache.clone(),
             reply_buffer_pool: self.reply_buffer_pool.clone(),
             read_pipeline_limits: self.read_pipeline_limits,
             reply_admission: self.reply_admission.clone(),

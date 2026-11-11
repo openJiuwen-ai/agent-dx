@@ -332,6 +332,48 @@ async fn dfs_gc_fence_capture_requires_a_write_reference_before_any_mutation() {
 }
 
 #[tokio::test]
+async fn dfs_write_authority_observation_does_not_acquire_expired_lease() {
+    let (store, dfs, original, backend) = lock_resolver_fixture(1).await;
+    let (_, live) = dfs
+        .resolve_write_authority(
+            "node-b".into(),
+            "session-b".into(),
+            OperationId::new("observe-live"),
+            original.inode_id.clone(),
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(live, original);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let commits = backend.observed_commit().0;
+    let error = dfs
+        .resolve_write_authority(
+            "node-b".into(),
+            "session-b".into(),
+            OperationId::new("observe-expired"),
+            original.inode_id.clone(),
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
+    assert_eq!(backend.observed_commit().0, commits);
+    assert!(
+        store
+            .read(MetaRead::RequestOutcome(RequestKey::new(
+                "node-b",
+                "observe-expired"
+            )))
+            .await
+            .unwrap()
+            .request_outcome
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn dfs_write_authority_expired_lease_acquires_and_replays_exact_result() {
     let (store, dfs, original, backend) = lock_resolver_fixture(1).await;
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
@@ -3796,6 +3838,54 @@ async fn dfs_namespace_hardlink_symlink_and_readlink_are_metadata_operations() {
         .into_inner()
         .target;
     assert_eq!(readlink, b"../real-target".to_vec());
+}
+
+#[tokio::test]
+async fn dfs_generic_xattr_cannot_change_lazy_source() {
+    let dfs = memory_dfs().await;
+    let file = dfs
+        .create(Request::new(DfsCreateRequest {
+            caller_id: "node-a".into(),
+            operation_id: "create-source-boundary".into(),
+            namespace_id: "default".into(),
+            parent_inode_id: "1".into(),
+            name: b"source-boundary".to_vec(),
+            attributes: Some(test_attrs(0o640, 1)),
+            owner_session_id: "session-a".into(),
+            lease_seconds: 30,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .inode
+        .unwrap();
+    let name = b"user.afs.lazy.v1".to_vec();
+    let err = dfs
+        .set_xattr(Request::new(DfsSetXattrRequest {
+            caller_id: "node-a".into(),
+            operation_id: "set-source-marker".into(),
+            caller: Some(caller(0, 0)),
+            inode_id: file.inode_id.clone(),
+            expected_inode_revision: file.revision,
+            name: name.clone(),
+            value: b"reserved".to_vec(),
+            mode: DfsXattrSetMode::Create.into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status_errno(err), libc::EPERM);
+    let err = dfs
+        .remove_xattr(Request::new(DfsRemoveXattrRequest {
+            caller_id: "node-a".into(),
+            operation_id: "remove-source-marker".into(),
+            caller: Some(caller(0, 0)),
+            inode_id: file.inode_id,
+            expected_inode_revision: file.revision,
+            name,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status_errno(err), libc::EPERM);
 }
 
 #[tokio::test]

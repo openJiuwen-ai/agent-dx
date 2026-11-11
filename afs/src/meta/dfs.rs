@@ -36,8 +36,10 @@ mod commit;
 mod namespace;
 mod placement;
 mod read_auth;
+mod read_cache;
 mod repair;
 mod replay;
+mod restore;
 mod write_lease;
 use access::*;
 use placement::*;
@@ -71,6 +73,7 @@ pub struct DfsService {
 // contention instead of spinning without a boundary.
 const CREATE_PARENT_DRIFT_RETRY_LIMIT: usize = 64;
 const FILE_COMMIT_RETRY_LIMIT: usize = 64;
+const NAMESPACE_MKDIR_RETRY_LIMIT: usize = 64;
 const NAMESPACE_REMOVE_RETRY_LIMIT: usize = 64;
 const GC_REFERENCE_LOCK_SHARDS: usize = 64;
 

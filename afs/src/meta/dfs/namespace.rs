@@ -219,87 +219,112 @@ impl DfsService {
     }
 
     pub async fn mkdir(&self, request: MkdirRequest) -> Result<InodeRecord> {
-        let request_digest = namespace_request_digest(&request)?;
-        let MkdirRequest {
-            caller_id,
-            operation_id,
-            namespace_id,
-            parent_inode_id,
-            name,
-            mut attributes,
-            caller,
-        } = request;
-        require_id(&caller_id, "caller_id")?;
-        require_id(&operation_id.0, "operation_id")?;
-        require_id(&namespace_id.0, "namespace_id")?;
-        require_id(&parent_inode_id.0, "parent_inode_id")?;
+        let digest = namespace_request_digest(&request)?;
+        require_id(&request.caller_id, "caller_id")?;
+        require_id(&request.operation_id.0, "operation_id")?;
+        require_id(&request.namespace_id.0, "namespace_id")?;
+        require_id(&request.parent_inode_id.0, "parent_inode_id")?;
+        let operation = StoreOperation::DfsMkdir;
         if let Some(inode) = self
-            .replayed_namespace_inode(
-                &caller_id,
-                &operation_id,
-                StoreOperation::DfsMkdir,
-                request_digest,
-            )
+            .replayed_namespace_inode(&request.caller_id, &request.operation_id, operation, digest)
             .await?
         {
             return Ok(inode);
         }
-        validate_name(&name)?;
-        let parent = self
-            .directory_for_mutation(&namespace_id, &parent_inode_id)
-            .await?;
-        if let Some(parent) = &parent {
-            ensure_directory_create_access(&caller, parent)?;
-        }
-        attributes.uid = caller.uid;
-        attributes.gid = inherited_child_gid(&caller, parent.as_ref());
-        if parent
-            .as_ref()
-            .is_some_and(|parent| parent.attributes.mode & 0o2000 != 0)
-        {
-            attributes.mode |= 0o2000;
-        }
-        attributes.nlink = 2;
-        let inode = InodeRecord {
-            namespace_id: namespace_id.clone(),
-            inode_id: namespace_inode_id(&caller_id, &operation_id),
-            kind: InodeKind::Directory,
-            attributes,
-            head_version: None,
-            symlink_target: None,
-            xattrs: Default::default(),
-            revision: 1,
-        };
+        validate_name(&request.name)?;
+        let key = RequestKey::new(request.caller_id.clone(), request.operation_id.0.clone());
+        let inode_id = namespace_inode_id(&request.caller_id, &request.operation_id);
         let dentry = Dentry {
             key: DentryKey {
-                namespace_id,
-                parent_inode_id,
-                name,
+                namespace_id: request.namespace_id.clone(),
+                parent_inode_id: request.parent_inode_id.clone(),
+                name: request.name,
             },
-            inode_id: inode.inode_id.clone(),
+            inode_id: inode_id.clone(),
         };
-        let request = RequestKey::new(caller_id, operation_id.0.clone());
-        let outcome = RequestOutcome {
-            request: request.clone(),
-            operation: StoreOperation::DfsMkdir,
-            result: namespace_result(request_digest, OperationResult::DfsInode(inode.clone())),
-        };
-        let mut txn = MetaTxn::new(request.clone(), StoreOperation::DfsMkdir);
-        txn.conditions.extend([
-            TxnCondition::RequestAbsent(request),
-            TxnCondition::Missing(MetaKey::DfsDentry(dentry.key.clone())),
-            TxnCondition::Missing(MetaKey::DfsInode(inode.inode_id.clone())),
-        ]);
-        push_parent_namespace_change(&mut txn, parent, 1);
-        txn.mutations.extend([
-            TxnMutation::Put(MetaEntity::DfsDentry(dentry)),
-            TxnMutation::Put(MetaEntity::DfsInode(inode)),
-            TxnMutation::RecordRequestOutcome(outcome),
-        ]);
-        inode_outcome(
-            validate_namespace_outcome(self.store.compare_and_commit(txn).await?, request_digest)?,
-            StoreOperation::DfsMkdir,
-        )
+        for _ in 0..NAMESPACE_MKDIR_RETRY_LIMIT {
+            let parent = self
+                .directory_for_mutation(&dentry.key.namespace_id, &dentry.key.parent_inode_id)
+                .await?;
+            if let Some(parent) = &parent {
+                ensure_directory_create_access(&request.caller, parent)?;
+            }
+            let mut attributes = request.attributes.clone();
+            attributes.uid = request.caller.uid;
+            attributes.gid = inherited_child_gid(&request.caller, parent.as_ref());
+            if parent
+                .as_ref()
+                .is_some_and(|parent| parent.attributes.mode & 0o2000 != 0)
+            {
+                attributes.mode |= 0o2000;
+            }
+            attributes.nlink = 2;
+            let inode = InodeRecord {
+                namespace_id: dentry.key.namespace_id.clone(),
+                inode_id: inode_id.clone(),
+                kind: InodeKind::Directory,
+                attributes,
+                head_version: None,
+                symlink_target: None,
+                xattrs: Default::default(),
+                revision: 1,
+            };
+            let mut txn = MetaTxn::new(key.clone(), operation);
+            txn.conditions.extend([
+                TxnCondition::RequestAbsent(key.clone()),
+                TxnCondition::Missing(MetaKey::DfsDentry(dentry.key.clone())),
+                TxnCondition::Missing(MetaKey::DfsInode(inode_id.clone())),
+            ]);
+            push_parent_namespace_change(&mut txn, parent, 1);
+            txn.mutations.extend([
+                TxnMutation::Put(MetaEntity::DfsDentry(dentry.clone())),
+                TxnMutation::Put(MetaEntity::DfsInode(inode.clone())),
+                TxnMutation::RecordRequestOutcome(RequestOutcome {
+                    request: key.clone(),
+                    operation,
+                    result: namespace_result(digest, OperationResult::DfsInode(inode)),
+                }),
+            ]);
+            let outcome =
+                validate_namespace_outcome(self.store.compare_and_commit(txn).await?, digest)?;
+            if !matches!(
+                outcome,
+                TxnOutcome::ConditionFailed {
+                    existing_outcome: None,
+                    ..
+                }
+            ) {
+                return inode_outcome(outcome, operation);
+            }
+
+            // A sibling mutation also changes the parent inode. Re-read and
+            // revalidate rather than treating every failed CAS as a collision.
+            if self
+                .store
+                .read(MetaRead::DfsDentry(dentry.key.clone()))
+                .await?
+                .entity
+                .is_some()
+            {
+                if let Some(inode) = self
+                    .replayed_namespace_inode(
+                        &request.caller_id,
+                        &request.operation_id,
+                        operation,
+                        digest,
+                    )
+                    .await?
+                {
+                    return Ok(inode);
+                }
+                return Err(already_exists("DFS mkdir target already exists"));
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(Error::coded(
+            afs_error::META_DFS_NAMESPACE_RETRY,
+            "DFS namespace changed repeatedly during bounded mkdir retry",
+        ))
     }
 
     /// Special inode bytes are interpreted by the Linux VFS, not ChunkSink.
@@ -1045,6 +1070,110 @@ impl DfsService {
         Ok(inode.xattrs.keys().cloned().collect())
     }
 
+    pub async fn bind_lazy_source(
+        &self,
+        request: crate::dfs::BindLazySourceRequest,
+    ) -> Result<InodeRecord> {
+        use crate::dfs::LAZY_FILE_DESCRIPTOR_XATTR;
+        let digest = namespace_request_digest(&request)?;
+        let operation = StoreOperation::DfsBindLazySource;
+        let crate::dfs::BindLazySourceRequest {
+            caller_id,
+            caller_session_id,
+            operation_id,
+            inode_id,
+            expected_inode_revision,
+            source,
+        } = request;
+        require_id(&caller_id, "caller_id")?;
+        require_id(&caller_session_id, "caller_session_id")?;
+        require_id(&operation_id.0, "operation_id")?;
+        source.validate()?;
+        if let Some(inode) = self
+            .replayed_namespace_inode(&caller_id, &operation_id, operation, digest)
+            .await?
+        {
+            return Ok(inode);
+        }
+        let bytes = serde_json::to_vec(&source).map_err(|error| invalid(error.to_string()))?;
+        let current = self.get_inode(inode_id.clone()).await?;
+        if let Some(existing) = current.xattrs.get(LAZY_FILE_DESCRIPTOR_XATTR) {
+            return if *existing == bytes {
+                Ok(current)
+            } else {
+                Err(conflict("lazy source is immutable"))
+            };
+        }
+        if current.revision != expected_inode_revision
+            || current.kind != InodeKind::Regular
+            || current.attributes.mode & 0o222 != 0
+            || current.attributes.nlink != 1
+        {
+            return Err(conflict("lazy source requires a prepared read-only inode"));
+        }
+        match current.head_version.clone() {
+            Some(id) => {
+                let (version, layout) = self.get_file_version(id).await?;
+                if version.inode_id != inode_id
+                    || layout.file_length != source.length
+                    || !layout.inline_extents.is_empty()
+                {
+                    return Err(conflict(
+                        "lazy source requires an empty committed layout of the declared length",
+                    ));
+                }
+            }
+            None if source.length == 0 => {}
+            None => return Err(conflict("lazy source requires committed length")),
+        }
+        let Some(MetaEntity::DfsWriteLease(lease)) = self
+            .store
+            .read(MetaRead::DfsWriteLease(inode_id))
+            .await?
+            .entity
+        else {
+            return Err(conflict(
+                "lazy source binding requires the current write owner",
+            ));
+        };
+        if lease.owner_node_id != caller_id
+            || lease.owner_session_id != caller_session_id
+            || lease.expires_at_unix_ms <= now_unix_ms()
+        {
+            return Err(conflict(
+                "lazy source binding requires the current write owner",
+            ));
+        }
+        let key = RequestKey::new(caller_id.clone(), operation_id.0);
+        let mut updated = current.clone();
+        updated
+            .xattrs
+            .insert(LAZY_FILE_DESCRIPTOR_XATTR.to_vec(), bytes);
+        updated.revision = updated.revision.saturating_add(1);
+        let mut txn = MetaTxn::new(key.clone(), operation);
+        txn.conditions.extend([
+            TxnCondition::RequestAbsent(key.clone()),
+            TxnCondition::EntityEquals(MetaEntity::DfsInode(current)),
+            TxnCondition::EntityEquals(MetaEntity::DfsWriteLease(lease)),
+            TxnCondition::NodeSessionCurrent {
+                node_id: caller_id,
+                session_id: caller_session_id,
+            },
+        ]);
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsInode(updated.clone())),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation,
+                result: namespace_result(digest, OperationResult::DfsInode(updated)),
+            }),
+        ]);
+        inode_outcome(
+            validate_namespace_outcome(self.store.compare_and_commit(txn).await?, digest)?,
+            operation,
+        )
+    }
+
     pub async fn set_xattr(&self, request: SetXattrRequest) -> Result<InodeRecord> {
         let SetXattrRequest {
             caller_id,
@@ -1060,6 +1189,9 @@ impl DfsService {
         require_id(&operation_id.0, "operation_id")?;
         require_id(&inode_id.0, "inode_id")?;
         let name = xattr_key(&name)?;
+        if name == crate::dfs::LAZY_FILE_DESCRIPTOR_XATTR {
+            return Err(operation_not_permitted("lazy source attribute is reserved"));
+        }
         if let Some(inode) = self
             .replayed_inode(&caller_id, &operation_id, StoreOperation::DfsSetXattr)
             .await?
@@ -1107,6 +1239,9 @@ impl DfsService {
         require_id(&operation_id.0, "operation_id")?;
         require_id(&inode_id.0, "inode_id")?;
         let name = xattr_key(&name)?;
+        if name == crate::dfs::LAZY_FILE_DESCRIPTOR_XATTR {
+            return Err(operation_not_permitted("lazy source attribute is reserved"));
+        }
         if let Some(inode) = self
             .replayed_inode(&caller_id, &operation_id, StoreOperation::DfsRemoveXattr)
             .await?

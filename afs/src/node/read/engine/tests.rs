@@ -9,7 +9,7 @@ use std::{
 };
 
 #[derive(Default)]
-struct StaticSources {
+pub(super) struct StaticSources {
     reply: Mutex<DfsChunkSourcesReply>,
     calls: Mutex<u64>,
 }
@@ -674,7 +674,7 @@ fn ready_pipeline_rejects_reader_growth_after_exact_length() {
     assert_eq!(error.code(), afs_error::NODE_TRANSFER_CORRUPT_DATA);
 }
 
-fn source(copy: &str, chunk_id: &ChunkId, node_id: &str) -> SourceCandidate {
+pub(super) fn source(copy: &str, chunk_id: &ChunkId, node_id: &str) -> SourceCandidate {
     SourceCandidate {
         copy_id: CopyId::new(copy),
         chunk_id: chunk_id.clone(),
@@ -740,7 +740,7 @@ fn bounded_read_cache_replacement_expiry_and_clock_rollover_preserve_lru() {
     assert_eq!(cache.get(&"d"), Some(&5));
 }
 
-fn source_cache_lru_batch(chunk_id: ChunkId) -> ReadBatch {
+pub(super) fn source_cache_lru_batch(chunk_id: ChunkId) -> ReadBatch {
     ReadBatch {
         lookahead: Vec::new(),
         file_version_id: Some(FileVersionId::new("version")),

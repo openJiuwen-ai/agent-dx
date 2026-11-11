@@ -1,6 +1,16 @@
 use super::*;
 
 impl Backend for DistributedFs {
+    fn prepare_lazy_file(
+        &self,
+        ctx: &RequestContext,
+        parent: BackendInode,
+        name: &OsStr,
+        source: &super::super::lazy_fill::LazyFileSpec,
+    ) -> Result<Entry> {
+        self.prepare_lazy(ctx, parent, name, source)
+    }
+
     /// A read-only handle opened with no local write activity pins its version
     /// until close (decision 4a); FUSE must not let it share page-cache bytes
     /// with a handle pinned to another version.
@@ -208,6 +218,9 @@ impl Backend for DistributedFs {
             unix_ms_of(time)?;
         }
         let inode_id = self.inode_id(inode)?;
+        if change.size.is_some() && lazy_fill::sealed(&self.meta.get_inode(&inode_id)?) {
+            return Err(invalid("immutable-origin file length cannot change"));
+        }
         let mut change = change.clone();
         let mut killpriv_setattr = false;
         let _native_ticket = if let Some(cell) = self.write_state(&inode_id)? {
@@ -455,6 +468,7 @@ impl Backend for DistributedFs {
             write_session: Some(Self::make_local_write_session(session)),
             flags,
             owner_scope: None,
+            origin_fill: false,
         })?;
         Ok(CreatedFile {
             entry: Entry {
@@ -526,6 +540,11 @@ impl Backend for DistributedFs {
                 afs_error::IO_NOT_SUPPORTED,
                 "DFS special inode data path is handled by kernel/local device semantics",
             ));
+        }
+        if lazy_fill::sealed(&preflight)
+            && (flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_TRUNC != 0)
+        {
+            return Err(invalid("immutable-origin files only allow read opens"));
         }
         let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
         let (opened_inode, write_session) = if writable {
@@ -608,6 +627,7 @@ impl Backend for DistributedFs {
             self.check_native_read_view_for_delivery(view)?;
         }
         self.allocate_handle(DfsFileHandle {
+            origin_fill: false,
             gc_pin: None,
             inode_id: opened_inode.inode_id.clone(),
             opened_inode,
@@ -631,6 +651,15 @@ impl Backend for DistributedFs {
         let snapshot = self.read_handle_snapshot(handle)?;
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
+        }
+        if let Some(data) = self.lazy_read(
+            &snapshot,
+            offset,
+            out.len(),
+            Instant::now() + self.read_engine.read_pipeline_timeout(),
+        )? {
+            out[..data.len()].copy_from_slice(&data);
+            return Ok(data.len());
         }
         if !self.read_engine.has_external_backend() {
             let result = self.read_native_owned(handle, &snapshot, offset, out.len())?;
@@ -678,6 +707,14 @@ impl Backend for DistributedFs {
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
         }
+        if let Some(data) = self.lazy_read(
+            &snapshot,
+            offset,
+            size,
+            Instant::now() + self.read_engine.read_pipeline_timeout(),
+        )? {
+            return Ok(data);
+        }
         self.read_native_owned(handle, &snapshot, offset, size)
     }
 
@@ -691,6 +728,14 @@ impl Backend for DistributedFs {
         let snapshot = self.read_handle_snapshot(handle)?;
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
+        }
+        if let Some(data) = self.lazy_read(
+            &snapshot,
+            offset,
+            size,
+            Instant::now() + self.read_engine.read_pipeline_timeout(),
+        )? {
+            return Ok(data.to_vec());
         }
         if !self.read_engine.has_external_backend() {
             return self
@@ -775,6 +820,11 @@ impl Backend for DistributedFs {
     ) -> Result<usize> {
         self.observe_handle_error(handle)?;
         let snapshot = self.handle_snapshot(handle)?;
+        if lazy_fill::sealed(&snapshot.opened_inode) && !snapshot.handle.origin_fill {
+            return Err(invalid(
+                "immutable-origin files cannot be written by callers",
+            ));
+        }
         if snapshot.flags & libc::O_ACCMODE == libc::O_RDONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for writing"));
         }
@@ -820,6 +870,12 @@ impl Backend for DistributedFs {
     ) -> Result<u64> {
         let source = self.handle_snapshot(range.source)?;
         let destination = self.handle_snapshot(range.destination)?;
+        if lazy_fill::sealed(&source.opened_inode) || lazy_fill::sealed(&destination.opened_inode) {
+            return Err(Error::coded(
+                afs_error::IO_NOT_SUPPORTED,
+                "lazy files do not support COW range copy",
+            ));
+        }
         if source.flags & libc::O_ACCMODE == libc::O_WRONLY
             || destination.flags & libc::O_ACCMODE == libc::O_RDONLY
         {
@@ -988,24 +1044,14 @@ impl Backend for DistributedFs {
         }
     }
 
+    fn fsync_timeout(&self) -> Option<Duration> {
+        Some(self.write_timeout)
+    }
+
     fn fsync(&self, _: &RequestContext, handle: FileHandle, mode: SyncMode) -> Result<()> {
-        let snapshot = self.handle_snapshot(handle)?;
-        if let Some(session) = snapshot.write_session.as_ref()
-            && session.remote.is_some()
-        {
-            self.write_coordinator
-                .remote_sync(session, mode)
-                .map(|_| ())
-        } else {
-            self.sync_handle(
-                handle,
-                match mode {
-                    SyncMode::DataOnly => CommitReason::DATA_SYNC,
-                    SyncMode::Full => CommitReason::FULL_SYNC,
-                },
-                CommitWait::AfterOperations,
-            )
-        }
+        crate::node::call_deadline::within_timeout(self.write_timeout, || {
+            self.fsync_with_deadline(handle, mode)
+        })
     }
 
     fn fsync_receipt(
@@ -1372,5 +1418,27 @@ impl Backend for DistributedFs {
             true,
         )?;
         Ok(())
+    }
+}
+
+impl DistributedFs {
+    fn fsync_with_deadline(&self, handle: FileHandle, mode: SyncMode) -> Result<()> {
+        let snapshot = self.handle_snapshot(handle)?;
+        if let Some(session) = snapshot.write_session.as_ref()
+            && session.remote.is_some()
+        {
+            self.write_coordinator
+                .remote_sync(session, mode)
+                .map(|_| ())
+        } else {
+            self.sync_handle(
+                handle,
+                match mode {
+                    SyncMode::DataOnly => CommitReason::DATA_SYNC,
+                    SyncMode::Full => CommitReason::FULL_SYNC,
+                },
+                CommitWait::AfterOperations,
+            )
+        }
     }
 }
