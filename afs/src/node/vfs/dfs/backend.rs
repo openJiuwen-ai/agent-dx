@@ -119,13 +119,16 @@ impl Backend for DistributedFs {
     }
 
     fn lookup(&self, _: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<Entry> {
+        let parent_id = self.inode_id(parent)?;
         let inode = self.validate_inode(
             self.meta
-                .lookup(&self.inode_id(parent)?, name.as_encoded_bytes())?
+                .lookup(&parent_id, name.as_encoded_bytes())?
                 .ok_or_else(|| {
                     Error::coded(afs_error::NODE_VFS_NOT_FOUND, "DFS dentry not found")
                 })?,
         )?;
+        self.recent_names
+            .record(&inode.inode_id, &parent_id, name.as_encoded_bytes());
         Ok(Entry {
             inode: self.backend_inode(&inode.inode_id)?,
             attributes: self.visible_attributes(&inode)?,
@@ -455,6 +458,11 @@ impl Backend for DistributedFs {
             },
         )?;
         let inode = self.validate_inode(inode)?;
+        self.recent_names.record(
+            &inode.inode_id,
+            &self.inode_id(parent)?,
+            name.as_encoded_bytes(),
+        );
         self.install_write_state(inode.clone(), write_lease)?;
         let session = self.open_write_session(&inode, flags)?;
         let handle = self.allocate_handle(DfsFileHandle {
@@ -506,6 +514,11 @@ impl Backend for DistributedFs {
             },
             caller: caller_context(ctx),
         })?)?;
+        self.recent_names.record(
+            &inode.inode_id,
+            &self.inode_id(parent)?,
+            name.as_encoded_bytes(),
+        );
         Ok(Entry {
             inode: self.backend_inode(&inode.inode_id)?,
             attributes: attributes(&inode, 0, 0),
@@ -531,10 +544,7 @@ impl Backend for DistributedFs {
         } else {
             None
         };
-        let preflight =
-            self.validate_inode(self.meta.get_inode(&inode_id).inspect_err(|error| {
-                self.invalidate_native_inode_views_on_error(&inode_id, error);
-            })?)?;
+        let preflight = self.validate_inode(self.open_preflight(&inode_id)?)?;
         if matches!(preflight.kind, InodeKind::Special(_)) {
             return Err(Error::coded(
                 afs_error::IO_NOT_SUPPORTED,
@@ -1080,7 +1090,7 @@ impl Backend for DistributedFs {
 
     fn opendir(&self, _: &RequestContext, inode: BackendInode) -> Result<DirectoryHandle> {
         let inode_id = self.inode_id(inode)?;
-        let record = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
+        let record = self.validate_inode(self.open_preflight(&inode_id)?)?;
         if record.kind != InodeKind::Directory {
             return Err(Error::from(std::io::Error::from(
                 std::io::ErrorKind::NotADirectory,
@@ -1196,6 +1206,11 @@ impl Backend for DistributedFs {
             },
             caller_context(ctx),
         )?)?;
+        self.recent_names.record(
+            &inode.inode_id,
+            &self.inode_id(parent)?,
+            name.as_encoded_bytes(),
+        );
         Ok(Entry {
             inode: self.backend_inode(&inode.inode_id)?,
             attributes: attributes(&inode, 0, 0),
@@ -1203,30 +1218,30 @@ impl Backend for DistributedFs {
     }
 
     fn unlink(&self, ctx: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<()> {
-        self.refresh_inode_record(
-            self.meta.unlink(
-                &self.identity.operation_id("unlink"),
-                &self.inode_id(parent)?,
-                name.as_encoded_bytes(),
-                caller_context(ctx),
-            )?,
-            true,
-            true,
+        let parent_id = self.inode_id(parent)?;
+        let removed = self.meta.unlink(
+            &self.identity.operation_id("unlink"),
+            &parent_id,
+            name.as_encoded_bytes(),
+            caller_context(ctx),
         )?;
+        self.recent_names
+            .forget(&parent_id, name.as_encoded_bytes());
+        self.refresh_inode_record(removed, true, true)?;
         Ok(())
     }
 
     fn rmdir(&self, ctx: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<()> {
-        self.refresh_inode_record(
-            self.meta.rmdir(
-                &self.identity.operation_id("rmdir"),
-                &self.inode_id(parent)?,
-                name.as_encoded_bytes(),
-                caller_context(ctx),
-            )?,
-            true,
-            true,
+        let parent_id = self.inode_id(parent)?;
+        let removed = self.meta.rmdir(
+            &self.identity.operation_id("rmdir"),
+            &parent_id,
+            name.as_encoded_bytes(),
+            caller_context(ctx),
         )?;
+        self.recent_names
+            .forget(&parent_id, name.as_encoded_bytes());
+        self.refresh_inode_record(removed, true, true)?;
         Ok(())
     }
 
@@ -1268,6 +1283,12 @@ impl Backend for DistributedFs {
                 result => break result?,
             }
         };
+        self.recent_names.rename(
+            &old_parent,
+            from_name.as_encoded_bytes(),
+            &new_parent,
+            to_name.as_encoded_bytes(),
+        );
         self.refresh_inode_record(outcome.inode, true, true)?;
         if let Some(replaced) = outcome.replaced_inode {
             self.refresh_inode_record(replaced, true, true)?;
@@ -1301,6 +1322,11 @@ impl Backend for DistributedFs {
             },
             caller: caller_context(ctx),
         })?)?;
+        self.recent_names.record(
+            &inode.inode_id,
+            &self.inode_id(parent)?,
+            name.as_encoded_bytes(),
+        );
         Ok(Entry {
             inode: self.backend_inode(&inode.inode_id)?,
             attributes: attributes(&inode, 0, 0),
@@ -1323,19 +1349,25 @@ impl Backend for DistributedFs {
         new_name: &OsStr,
     ) -> Result<Entry> {
         let inode_id = self.inode_id(inode)?;
+        let new_parent_id = self.inode_id(new_parent)?;
         let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
         let linked = self.refresh_inode_record(
             self.meta.link(
                 &self.identity.operation_id("link"),
                 &inode_id,
                 current.revision,
-                &self.inode_id(new_parent)?,
+                &new_parent_id,
                 new_name.as_encoded_bytes(),
                 caller_context(ctx),
             )?,
             true,
             true,
         )?;
+        self.recent_names.record(
+            &linked.inode_id,
+            &new_parent_id,
+            new_name.as_encoded_bytes(),
+        );
         Ok(Entry {
             inode: self.backend_inode(&linked.inode_id)?,
             attributes: self.visible_attributes(&linked)?,

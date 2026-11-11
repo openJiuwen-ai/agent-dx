@@ -1036,7 +1036,16 @@ flush、fsync及release仍为排他屏障，后续READ不能越过。OwnerFs、S
 官方fuser默认协商buffered异步READ；本次没有额外启用ASYNC_DIO，不能将并发单测
 外推为O_DIRECT单流或整体E2E提速。
 
-DFS普通I/O沿用cached write-through，不启用writeback。默认entry/attr TTL为0；每次新open
+DFS普通I/O沿用cached write-through，不启用writeback。内核entry/attr TTL由
+`dfs_kernel_cache_ttl_ms`决定（默认1000毫秒，0为不缓存），负查找不缓存；他节点的改名、删除、
+改属性在本节点最多晚一个TTL可见，经本挂载的变化内核自己更新。open与opendir做名字校验
+（`node/vfs/dfs/recent_names.rs`）：Node记住2×TTL内交给内核的（父目录, 名字），某inode恰好
+经由一个这样的名字被打开时，预检用`Lookup(父目录, 名字)`代替`GetInode`（RPC数不变），名字已不
+指向该inode就回`ESTALE`，Linux以`LOOKUP_REVAL`重走一次路径并打开新inode；重走那次不再比对
+（每个`ESTALE`给一次豁免，一个TTL内有效；10毫秒内刚LOOKUP过的名字也不比对——内核持有的就是
+Meta刚给的inode，其后到OPEN之间的变化与不缓存时lookup和open分两次RPC是同一窗口），
+应用不会因校验看到`ESTALE`。没有记录、记录被淘汰、经多个名字访问过（硬链接）时退回只确认
+inode存在。按路径的stat与setattr不做名字校验，见支持边界已知限制第19项。每次新open
 在线观察Meta，原生只读且没有dirty/provider/外部后端时，用完整提交版本ID和已核对长度
 决定`FOPEN_KEEP_CACHE`。同inode身份完全相同才保留，缺失、变化、超限或不安全路径均不保留；
 成功数据修改撤销该inode的复用资格。身份表最多65536项、版本字符串合计1MiB，另计表结构，
@@ -1047,7 +1056,8 @@ DFS普通I/O沿用cached write-through，不启用writeback。默认entry/attr T
 表锁不跨后端I/O或等待读写锁，最后引用释放时在表锁内回收条目，避免并发获取时分裂锁身份。
 它不是跨节点读许可或撤销协议。内核已收到的页面
 没有再次进入用户态授权检查的机会，不能宣传为可立即撤回的载荷；新open和用户态交付
-仍遵循权限与授权合同。正TTL是明确的宽松路径模式，不满足严格close-to-open。
+仍遵循权限与授权合同。正TTL下同一inode的close-to-open由open时的在线观察保证；名字到inode的
+对应关系由上述名字校验保证，stat与按路径setattr在TTL内可能陈旧。
 
 DFS目录列举按页进行：`DfsMeta.ReadDir`带名字游标`after_name`（不含）与`limit`，Meta每页至多1024项
 （`READ_DIR_PAGE_MAX`），按名字顺序返回只含名字、inode id与类型的精简条目及`eof`；属性由LOOKUP/GETATTR取。

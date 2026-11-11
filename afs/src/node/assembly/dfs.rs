@@ -390,7 +390,11 @@ impl DfsAssembly {
         .with_version_cache_capacity(cfg.dfs_version_cache_entries)
         .with_version_cache_bytes(cfg.dfs_version_cache_bytes)
         .with_write_buffer_pool(dfs_write_buffers.clone())
-        .with_inode_lock_metrics(&obs.registry)?;
+        .with_inode_lock_metrics(&obs.registry)?
+        .with_open_name_check(
+            std::time::Duration::from_millis(cfg.dfs_kernel_cache_ttl_ms),
+            Some(&obs.registry),
+        )?;
         // Every DFS store, local or S3, writes through the native pipeline. S3 has
         // only `MAX_UPLOADS` concurrent PUTs; deeper native upload queues would wait
         // on those permits inside the request timeout.

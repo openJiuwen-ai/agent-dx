@@ -44,6 +44,7 @@ pub mod owner_api;
 mod owner_gateway;
 mod owner_op_table;
 mod read_view;
+mod recent_names;
 mod remote_client;
 mod sharded;
 #[cfg(test)]
@@ -157,6 +158,8 @@ pub struct DistributedFs {
     owner_gateway: OwnerGateway,
     /// Proxies writes for inodes another node session owns.
     write_coordinator: WriteCoordinator,
+    /// Names handed to the kernel recently, for the open-time name check.
+    recent_names: recent_names::RecentNames,
 }
 
 const DFS_HANDLE_SHARDS: usize = 64;
@@ -218,6 +221,7 @@ impl DistributedFs {
             lazy_fill_lifetime: Arc::new(tokio::sync::Semaphore::new(
                 tokio::sync::Semaphore::MAX_PERMITS,
             )),
+            recent_names: recent_names::RecentNames::default(),
         }
     }
 
@@ -227,6 +231,48 @@ impl DistributedFs {
     ) -> Self {
         self.gc.references = references;
         self
+    }
+
+    /// Enable the open-time name check for a mount whose kernel entry TTL is
+    /// `entry_ttl` (zero keeps the inode-only check), with its counters.
+    pub(crate) fn with_open_name_check(
+        mut self,
+        entry_ttl: Duration,
+        registry: Option<&afs_metrics::Registry>,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        let mut names =
+            recent_names::RecentNames::new(entry_ttl, recent_names::DEFAULT_NAME_RECORD_CAPACITY);
+        if let Some(registry) = registry {
+            names = names.with_metrics(recent_names::NameCheckMetrics::register(registry)?);
+        }
+        self.recent_names = names;
+        Ok(self)
+    }
+
+    /// The inode record an open starts from. When the inode was reached
+    /// through exactly one name recently handed to the kernel, ask Meta for
+    /// that name (one RPC, as `GetInode`) and answer `ESTALE` if it no longer
+    /// names this inode: Linux repeats the path walk once and opens what the
+    /// name holds now (see `recent_names`).
+    fn open_preflight(&self, inode_id: &InodeId) -> Result<InodeRecord> {
+        let on_error = |error: &Error| self.invalidate_native_inode_views_on_error(inode_id, error);
+        match self.recent_names.check(inode_id) {
+            recent_names::NameCheck::Verify { parent, name } => {
+                match self.meta.lookup(&parent, &name).inspect_err(on_error)? {
+                    Some(record) if record.inode_id == *inode_id => Ok(record),
+                    _ => {
+                        self.recent_names.mark_stale(inode_id, &parent, &name);
+                        Err(Error::coded(
+                            afs_error::NODE_DFS_STALE_NAME,
+                            "DFS name no longer names the opened inode",
+                        ))
+                    }
+                }
+            }
+            recent_names::NameCheck::Fallback(_) => {
+                self.meta.get_inode(inode_id).inspect_err(on_error)
+            }
+        }
     }
 
     /// Register inode write-state lock contention counters with the Node registry.
