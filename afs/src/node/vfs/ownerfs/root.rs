@@ -1450,11 +1450,19 @@ impl RootManager {
     /// **两条独立的回收路径**：
     ///
     /// 1. **catalog 记录的目录**：说明它曾被本节点激活、现已不活跃。
-    ///    本方法据已存在的弃用标记的 `retired_at + grace` 判断何时可以
-    ///    真正删除；首次遇到 ENOTEMPTY 时由本方法自己写入标记。
+    ///    已存在的弃用标记按 `retired_at + grace` 决定何时可以真正删除。
+    ///    **无标记的记录一律跳过**：创建中（prepare 落盘到进缓存的间隙）、
+    ///    删除中（缓存移除到 catalog 移除的间隙）与激活回复丢失恢复中都会
+    ///    短暂处于「有记录、无缓存」状态，运行期没有 Meta 视角无法区分它们
+    ///    与真残留；抢先删除轻则弄坏刚创建的 workspace，重则销毁 Meta 已
+    ///    确认 Active 的恢复证据。无标记残留的清理由启动
+    ///    [`Self::reconcile_on_startup`] 负责（它有 Meta 全量视角）。
     /// 2. **无 catalog 证据的旧代目录**：同名换代后旧代既不在缓存也不在
     ///    catalog。这类目录**只有带弃用标记才回收**；没有标记一律不动——
     ///    我们无法判断它是否仍被 NFS 客户端 bind（H23）。
+    ///
+    /// 路径 1 的每个记录在回收前取 workspace 锁（try_lock，拿不到即在
+    /// 飞行中跳过），与 prepare/delete 互斥，回收绝不与它们竞跑同一目录。
     ///
     /// 宽限期（H11）解决的是一个与时序有关的竞态：`/public` 的 symlink 换成
     /// 新代是即时的，但（a）其他节点的 symlink 更新是最终一致的，（b）NFS
@@ -1493,15 +1501,40 @@ impl RootManager {
             if cached.contains(&dir) {
                 continue;
             }
+            // 先登记 attempted：路径 2 只处理"无 catalog 证据"的目录，
+            // 这条记录无论本轮是否动手（宽限期内、in-flight、无标记），
+            // 都不能让路径 2 再碰一次。
             attempted.insert(dir.clone());
+            // 创建中/删除中的 workspace 持有这把锁；绝不与它们竞跑。
+            // try_lock 失败（含锁中毒）即为 in-flight，留给持锁方收敛。
+            let lock = self.workspace_lock(&record.id)?;
+            let Ok(_workspace) = lock.try_lock() else {
+                pending += 1;
+                continue;
+            };
             match retired_by_dir.get(&dir) {
                 // 尚未过宽限期：等。
                 Some(at) if now.saturating_sub(*at) < grace => {
                     pending += 1;
                     continue;
                 }
-                // 已过宽限期，或从未标记（旧版本遗留的记录）：直接尝试。
-                _ => {}
+                // 已过宽限期：标记时刻起算的宽限覆盖了远端 symlink 收敛
+                // 与 NFS 属性缓存，可以安全删除。
+                Some(_) => {}
+                // 无弃用标记：创建中、删除中、激活回复丢失恢复中都会短暂
+                // 处于「有记录、无缓存」状态，运行期没有 Meta 视角无法区分
+                // 它们与真残留，删掉任何一个都是销毁合法 workspace（create
+                // 窗口甚至会造成"Meta 已 Active、盘上目录已消失"的僵尸）。
+                // 物理删除权归启动 reconcile——它有 Meta 全量视角。
+                None => {
+                    pending += 1;
+                    afs_logging::warn!(
+                        "root.reclaim.unmarked_skipped";
+                        "root_id" => ?record.id,
+                        "data_dir" => dir,
+                    );
+                    continue;
+                }
             }
             match self.remove_abandoned_dir(&record.data_dir) {
                 Ok(()) => {
@@ -1513,10 +1546,8 @@ impl RootManager {
                     afs_logging::info!("root.reclaim.completed"; "data_dir" => dir);
                 }
                 Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
-                    // 对端仍持有句柄。首次遇到时标记弃用，让宽限期开始计时。
-                    if !retired_by_dir.contains_key(&dir) {
-                        self.catalog.mark_retired(&record.data_dir, now)?;
-                    }
+                    // 宽限期已过但目录仍非空：对端仍持有句柄，保持弃用标记
+                    // 继续等，不推进任何状态。
                     pending += 1;
                 }
                 Err(error) if error.code() == afs_error::IO_NOT_FOUND => {
@@ -3425,36 +3456,37 @@ mod tests {
         .unwrap();
         assert!(manager.cached_local_roots().unwrap().is_empty());
 
-        // 回收：句柄仍在 → 仍是 ENOTEMPTY，报告 pending 而不是删除条目。
-        let (removed, pending) = manager.reclaim_deferred().unwrap();
-        assert_eq!((removed, pending), (0, 1));
-        assert!(temp.path().join(data_dir.as_path()).exists());
-
-        // 对端释放句柄（目录清空）。此时仍**不能**回收：H11 宽限期从
-        // `reclaim_deferred` 首次遇到 ENOTEMPTY 并写入弃用标记起计时，默认
-        // 2 分钟内旧代必须保持可解析，否则窗口内新启动的容器会 bind 到
-        // 已消失的目录。
-        std::fs::remove_file(temp.path().join(data_dir.as_path()).join("payload")).unwrap();
+        // 回收：记录没有弃用标记，运行期一律跳过——创建中、删除中与激活
+        // 回复丢失恢复中都是「有记录、无缓存」的同一形状，运行期没有 Meta
+        // 视角无法与真残留区分。
         let (removed, pending) = manager.reclaim_deferred().unwrap();
         assert_eq!(
             (removed, pending),
             (0, 1),
-            "the grace window has not elapsed yet"
+            "an unmarked record belongs to startup reconciliation"
+        );
+        assert!(temp.path().join(data_dir.as_path()).exists());
+
+        // 目录清空后运行期仍不动它：物理删除权只在启动 reconcile 手里。
+        std::fs::remove_file(temp.path().join(data_dir.as_path()).join("payload")).unwrap();
+        let (removed, _pending) = manager.reclaim_deferred().unwrap();
+        assert_eq!(
+            removed, 0,
+            "runtime reclaim must not touch unmarked records"
         );
         assert!(temp.path().join(data_dir.as_path()).exists());
         drop(manager);
 
-        // 宽限期归零后同一目录可回收（模拟宽限期已过）。
+        // 启动 reconcile 有 Meta 全量视角：该 root 已不在 active 集合里，
+        // 目录此时为空，因此记录与目录一并收敛掉。
         let manager = RootManager::open(
             "node-a".into(),
             "session-a".into(),
             meta.clone(),
             disk.clone(),
         )
-        .unwrap()
-        .with_retirement_grace(0);
-        let (removed, _pending) = manager.reclaim_deferred().unwrap();
-        assert_eq!(removed, 1, "expired grace must reclaim the directory");
+        .unwrap();
+        assert!(manager.cached_local_roots().unwrap().is_empty());
         assert!(!temp.path().join(data_dir.as_path()).exists());
 
         drop(manager);
@@ -3463,7 +3495,7 @@ mod tests {
             .unwrap();
         assert!(
             locked.scan_roots().unwrap().is_empty(),
-            "successful reclaim must drain the catalog entry"
+            "startup reconciliation must drain the catalog entry"
         );
     }
 
@@ -3615,6 +3647,106 @@ mod tests {
         let (removed, pending) = manager.reclaim_deferred().unwrap();
         assert_eq!((removed, pending), (0, 1), "a busy directory stays pending");
         assert!(temp.path().join(data_dir.as_path()).exists());
+    }
+
+    /// 回收不得触碰无弃用标记的记录：创建中（prepare 落盘到进缓存的间隙）、
+    /// 删除中（缓存移除到 catalog 移除的间隙）与激活回复丢失恢复中都会短暂
+    /// 处于「有记录、无缓存」状态，删掉任何一个都是销毁合法 workspace。
+    #[test]
+    fn reclaim_skips_unmarked_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let name = OsStr::new("agent1");
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+
+        // 记录在 manager 打开**之后**写入：运行期的无标记记录只存在于
+        // in-flight 窗口（启动对账会把启动时就存在的无标记残留清掉，
+        // 那是有 Meta 视角的正确行为）。manager 持有 catalog 锁，
+        // 因此借它的 catalog 字段写入。
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager = RootManager::open("node-a".into(), "session-a".into(), meta, disk.clone())
+            .unwrap()
+            .with_retirement_grace(0);
+
+        manager
+            .catalog
+            .persist_prepared_root(&LocalRootRecord {
+                id: root_id_from_name(name).unwrap(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1".into(),
+            })
+            .unwrap();
+        // 关键：不写弃用标记。
+
+        let (removed, pending) = manager.reclaim_deferred().unwrap();
+        assert_eq!(
+            (removed, pending),
+            (0, 1),
+            "an unmarked record must be skipped, never deleted"
+        );
+        assert!(temp.path().join(data_dir.as_path()).exists());
+        assert_eq!(
+            manager.catalog.scan_roots().unwrap().len(),
+            1,
+            "the catalog record is the create/recovery evidence and must survive"
+        );
+    }
+
+    /// 回收与持锁方（创建/删除）互斥：workspace 锁被占即跳过，绝不竞跑。
+    #[test]
+    fn reclaim_skips_workspaces_held_by_an_inflight_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let name = OsStr::new("agent1");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager = RootManager::open("node-a".into(), "session-a".into(), meta, disk.clone())
+            .unwrap()
+            .with_retirement_grace(0);
+
+        manager
+            .catalog
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1".into(),
+            })
+            .unwrap();
+        manager
+            .catalog
+            .mark_retired(&data_dir, now_unix_ms())
+            .unwrap();
+
+        // 模拟 in-flight 的创建/删除：持有该 workspace 的锁。
+        let lock = manager.workspace_lock(&id).unwrap();
+        let _guard = lock.try_lock().unwrap();
+        let (removed, pending) = manager.reclaim_deferred().unwrap();
+        assert_eq!(
+            (removed, pending),
+            (0, 1),
+            "a locked workspace is in flight"
+        );
+        assert!(temp.path().join(data_dir.as_path()).exists());
+        drop(_guard);
+        drop(lock);
+
+        // 锁释放后，标记 + 宽限期 0 → 正常回收。
+        let (removed, _pending) = manager.reclaim_deferred().unwrap();
+        assert_eq!(
+            removed, 1,
+            "after the owner releases the lock, reclaim proceeds"
+        );
+        assert!(!temp.path().join(data_dir.as_path()).exists());
     }
 
     /// 弃用标记必须幂等且保留最早时刻：重复标记不得延长目录寿命。
