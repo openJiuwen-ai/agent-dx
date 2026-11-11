@@ -1,5 +1,13 @@
 # Environment create ownership
 
+Omit the image and rootfs source to use the deployment-owned default rootfs.
+An explicit `process.commands` starts a managed workload independently of OCI
+entrypoint inheritance, including on a local EROFS rootfs. Its optional user and
+working directory default to the Execd identity and `/`; readiness and healthcheck
+probes apply to this workload as usual. No image process metadata file is required.
+`inheritEntrypoint=true` remains the option for reading an OCI image's process
+metadata, with optional `process` overrides.
+
 `POST /api/environment/v1/environments` returns a confirmed-running result as
 JSON inside the normal response envelope, or as the final SSE event:
 
@@ -62,3 +70,30 @@ The native SDK's `wait_entrypoint()` on snapshot or `from_id()` handles discover
 entrypoint state from Execd rather than interpreting omitted create flags as
 an explicitly disabled workload. If no managed entrypoint exists, that query
 returns an error; it never starts a new process.
+
+
+## Deployment-registered Local rootfs templates
+
+Deployments may configure the same `local_rootfs_templates` map in the API Server
+and adxlet. A template contains an absolute `path`, optional `env`, and optional
+`process` (`commands`, `cwd`, `user`). Template names use 1..128 ASCII letters,
+digits, underscores or hyphens. ADX does not import Docker images or fetch an image
+for this source; the deployment prepares each artifact and its metadata.
+
+```json
+{"name":"offline-tools","rootfs":{"type":"template","name":"local-tools-v1","runtime":"runsc"}}
+```
+
+The API resolves the registered name to a Local source persisted with the Environment.
+Arbitrary public Local paths remain rejected. Unknown names and conflicting image,
+path, storage or snapshot sources fail before scheduling. Only nodes advertising
+`ADX_LOCAL_ROOTFS_<name>=ready` are eligible; adxlet validates the registered paths
+before advertising them. Artifacts must remain available for the lifetime of their
+Environments and checkpoints. Use immutable names and paths for new content.
+
+Template environment values default the request environment; explicit request values
+win, while node-owned control configuration remains authoritative. With
+`inheritEntrypoint=true`, the template process is merged with explicit process fields
+and submitted as an explicit workload; no OCI process metadata lookup is performed.
+Without inheritance, no image workload starts. Local rootfs writable-layer handling
+and the existing Execd bootstrap are unchanged.

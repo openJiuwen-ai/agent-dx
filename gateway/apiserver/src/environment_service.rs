@@ -176,10 +176,11 @@ impl EnvironmentService {
         input: Value,
         caller: &pb::CallerContext,
     ) -> Result<pb::EnvironmentSpec, Status> {
-        contract::create_spec_with_environment(
+        contract::create_spec_with_templates(
             input,
             caller,
             self.clients.config.runtime_profile.as_ref(),
+            &self.clients.config.local_rootfs_templates,
         )
     }
 

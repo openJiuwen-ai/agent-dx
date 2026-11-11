@@ -80,7 +80,7 @@ ADX Relay 的目标 CIDR 需要覆盖实际使用的地址池。私有 OCI 镜�
 如果旧 OCI 层目录以 `0700` 创建，排空节点后可将 `sandboxd.toml` 的 `[plugin.image].root`
 指向新的缓存目录，让 sandboxd 在新 umask 下重新解包同一镜像。
 自定义 ADX 安装路径时需相应调整 unit 和配置中的二进制路径。sandboxd 就绪后按下文启动
-ADX，使用 `runtime="runc"` 或 `runtime="runsc"` 创建实例。随包 runsc 采用 AKernel 适配版本，ARM64 为 20260817.0-akernel.2，x86_64 为 20260817.0-akernel.4-3-g87e8441b6db1。
+ADX，使用 `runtime="runc"` 或 `runtime="runsc"` 创建实例。随包 runsc 及配套 helper 采用 AKernel `release-20261012.0-akernel.4`，版本和摘要固定在 `third_party/sandboxd/source.json`。
 
 ## 证书与初始密钥
 

@@ -417,7 +417,7 @@ pub struct ResourceLimits {
 
 pub const WORKLOAD_PROCESS_ENV: &str = "ADX_WORKLOAD_PROCESS";
 
-/// Explicit workload overrides; unspecified fields retain the image defaults.
+/// Workload commands and identity; image inheritance may supply unspecified fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadProcess {
@@ -620,17 +620,17 @@ impl ExecutionOptions {
         }
         if let Some(process) = &self.process {
             process.validate()?;
-            if !self.inherit_entrypoint {
+            if !self.inherit_entrypoint && process.commands.is_none() {
                 return Err(Error::Invalid(
-                    "workload process requires inherit_entrypoint".into(),
+                    "explicit workload process requires commands".into(),
                 ));
             }
         }
         self.probe_config().validate()?;
         if self.readiness_probe.is_some() || self.healthcheck_probe.is_some() {
-            if !self.inherit_entrypoint {
+            if !self.inherit_entrypoint && self.process.is_none() {
                 return Err(Error::Invalid(
-                    "workload probes require inherit_entrypoint".into(),
+                    "workload probes require a workload process or inherited entrypoint".into(),
                 ));
             }
             self.probe_config().validate()?;

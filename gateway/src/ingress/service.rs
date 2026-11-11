@@ -25,10 +25,9 @@ pub type ServiceError = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct IngressService {
     config: IngressConfig,
-    tls_listener: TcpListener,
-    plain_listener: TcpListener,
+    public_listeners: Vec<(TcpListener, super::ListenerConfig)>,
     health_listener: TcpListener,
-    tls_acceptor: TlsAcceptor,
+    tls_acceptor: Option<TlsAcceptor>,
     gateway: Arc<Ingress>,
     watcher: Arc<CoordinatorConnection>,
     store: Arc<RouteStore>,
@@ -75,10 +74,18 @@ impl IngressService {
                 "Environment, Agent, Jiuwen and SSH configuration require a Gateway built with --features agent-api".into(),
             );
         }
-        let tls_listener = TcpListener::bind(config.tls_bind).await?;
-        let plain_listener = TcpListener::bind(config.plain_bind).await?;
+        let options = config.listener_options();
+        let mut public_listeners = Vec::with_capacity(options.len());
+        for option in options {
+            option.validate()?;
+            public_listeners.push((TcpListener::bind(option.listen).await?, option));
+        }
         let health_listener = TcpListener::bind(config.health_bind).await?;
-        let tls_acceptor = load_tls_acceptor(&config.tls_cert, &config.tls_key)?;
+        let tls_acceptor = if public_listeners.iter().any(|(_, option)| option.tls) {
+            Some(load_tls_acceptor(&config.tls_cert, &config.tls_key)?)
+        } else {
+            None
+        };
         let store = Arc::new(RouteStore::new());
         let route_changes = store.subscribe();
         let watcher = Arc::new(CoordinatorConnection::new(control).map_err(send_error)?);
@@ -207,8 +214,7 @@ impl IngressService {
             #[cfg(feature = "agent-api")]
             ssh,
             config,
-            tls_listener,
-            plain_listener,
+            public_listeners,
             health_listener,
             tls_acceptor,
             gateway,
@@ -222,10 +228,20 @@ impl IngressService {
         self,
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), ServiceError> {
+        let listener_addresses = self
+            .public_listeners
+            .iter()
+            .map(|(listener, options)| {
+                let scheme = if options.tls { "https" } else { "http" };
+                listener
+                    .local_addr()
+                    .map(|address| format!("{scheme}://{address}"))
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let health_address = self.health_listener.local_addr()?;
         let Self {
             config,
-            tls_listener,
-            plain_listener,
+            public_listeners,
             health_listener,
             tls_acceptor,
             gateway,
@@ -249,22 +265,21 @@ impl IngressService {
                     .map_err(|error| Box::new(error) as ServiceError)
             });
         }
-        let gateway_for_tls = gateway.clone();
-        let shutdown_for_tls = shutdown_rx.clone();
-        listeners.spawn(async move {
-            gateway_for_tls
-                .serve_http_tls(tls_listener, tls_acceptor, shutdown_for_tls)
-                .await
-                .map_err(service_error)
-        });
-        let gateway_for_plain = gateway.clone();
-        let shutdown_for_plain = shutdown_rx.clone();
-        listeners.spawn(async move {
-            gateway_for_plain
-                .serve_http(plain_listener, shutdown_for_plain)
-                .await
-                .map_err(service_error)
-        });
+        for (listener, options) in public_listeners {
+            let gateway = gateway.clone();
+            let shutdown = shutdown_rx.clone();
+            let acceptor = if options.tls {
+                tls_acceptor.clone()
+            } else {
+                None
+            };
+            listeners.spawn(async move {
+                gateway
+                    .serve_listener(listener, options, acceptor, shutdown)
+                    .await
+                    .map_err(service_error)
+            });
+        }
         let gateway_for_health = gateway.clone();
         listeners.spawn(async move {
             gateway_for_health
@@ -273,10 +288,9 @@ impl IngressService {
                 .map_err(service_error)
         });
         tracing::info!(
-            tls = %config.tls_bind,
-            plain = %config.plain_bind,
+            listeners = ?listener_addresses,
             frontend = %config.frontend_address,
-            health = %config.health_bind,
+            health = %health_address,
             "Data Plane Ingress serving"
         );
 
@@ -349,6 +363,7 @@ mod tests {
         let private_key = fixture.join("ingress-key.pem");
         let config = IngressConfig {
             etcd_endpoints: Vec::new(),
+            listeners: None,
             tls_bind: "127.0.0.1:0".parse().unwrap(),
             plain_bind: "127.0.0.1:0".parse().unwrap(),
             health_bind: "127.0.0.1:0".parse().unwrap(),
@@ -413,11 +428,32 @@ mod tests {
             auth_cache_entries: 1,
         };
 
-        IngressService::bind(config, control)
+        IngressService::bind(config.clone(), control.clone())
             .await
             .unwrap()
             .serve(async {})
             .await
             .unwrap();
+        let mut http_only = config;
+        http_only.listeners = Some(vec![
+            super::super::ListenerConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                tls: false,
+                allow_http_credentials: true,
+                allowed_routes: None,
+            },
+            super::super::ListenerConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                tls: false,
+                allow_http_credentials: true,
+                allowed_routes: Some(Vec::new()),
+            },
+        ]);
+        http_only.tls_cert.clear();
+        http_only.tls_key.clear();
+        let service = IngressService::bind(http_only, control).await.unwrap();
+        assert_eq!(service.public_listeners.len(), 2);
+        assert!(service.tls_acceptor.is_none());
+        service.serve(async {}).await.unwrap();
     }
 }

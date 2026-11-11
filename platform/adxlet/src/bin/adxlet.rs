@@ -14,7 +14,13 @@ use adxlet::{
     Adxlet,
 };
 use serde::Deserialize;
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -70,9 +76,17 @@ struct Config {
     #[serde(default)]
     runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     #[serde(default)]
+    local_rootfs_templates: BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
+    #[serde(default)]
     execd_command: Vec<String>,
     #[serde(default)]
     execd_env: HashMap<String, String>,
+    #[serde(default)]
+    network_baseline: Option<adxlet::network_baseline::NetworkBaseline>,
+    #[serde(default)]
+    network_peer_aliases: BTreeMap<String, ipnet::Ipv4Net>,
+    #[serde(default)]
+    platform_ingress_sources: Option<Vec<ipnet::Ipv4Net>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +145,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
     let mut preserve =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    if let Some(baseline) = &config.network_baseline {
+        baseline.validate()?;
+    }
+    adxlet::network_baseline::validate_peer_aliases(&config.network_peer_aliases)?;
+    if config
+        .platform_ingress_sources
+        .as_ref()
+        .is_some_and(|sources| sources.is_empty())
+    {
+        return Err("platform_ingress_sources must not be empty".into());
+    }
     if config.sandboxd_socket.is_none() && config.jiuwenbox.is_none() {
         return Err("configure sandboxd_socket and/or jiuwenbox".into());
     }
@@ -249,13 +274,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
         })
         .transpose()?;
+    let local_rootfs_labels = config
+        .local_rootfs_templates
+        .keys()
+        .map(|name| {
+            adx_core::local_rootfs::capability_label(name).map(|key| (key, "ready".to_owned()))
+        })
+        .collect::<adx_core::Result<HashMap<_, _>>>()?;
     let runtime_config = RuntimeConfig {
         runtime_profile: config.runtime_profile,
+        local_rootfs_templates: config.local_rootfs_templates,
         command: config.execd_command,
         env,
         cwd: "/".into(),
         rpc_timeout: timeout,
         runtime_logs: Some(config.runtime_logs.clone()),
+        network_baseline: config.network_baseline,
+        network_peer_aliases: config.network_peer_aliases,
+        platform_ingress_sources: config.platform_ingress_sources,
     };
     let jiuwenbox = match config.jiuwenbox {
         Some(backend) => Some(Jiuwenbox::connect(backend, runtime_config.clone()).await?),
@@ -352,6 +388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut labels = config.labels;
+    labels.extend(local_rootfs_labels);
     if let Some(alias) = manager.checkpoint_storage_alias() {
         labels.insert("ADX_CHECKPOINT_STORAGE".into(), alias.into());
     }

@@ -279,6 +279,8 @@ data_plane_ingress_http_responses_total{{class=\"other\"}} {}\n",
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngressSecurity {
     Plaintext,
+    /// Explicit listener opt-in; authentication remains mandatory on private APIs.
+    AuthenticatedHttp,
     Tls,
 }
 
@@ -837,7 +839,7 @@ impl Ingress {
         listener: TcpListener,
         shutdown: watch::Receiver<bool>,
     ) -> io::Result<()> {
-        self.serve_http_inner(listener, None, IngressSecurity::Plaintext, shutdown)
+        self.serve_http_inner(listener, None, IngressSecurity::Plaintext, None, shutdown)
             .await
     }
 
@@ -847,8 +849,47 @@ impl Ingress {
         acceptor: TlsAcceptor,
         shutdown: watch::Receiver<bool>,
     ) -> io::Result<()> {
-        self.serve_http_inner(listener, Some(acceptor), IngressSecurity::Tls, shutdown)
-            .await
+        self.serve_http_inner(
+            listener,
+            Some(acceptor),
+            IngressSecurity::Tls,
+            None,
+            shutdown,
+        )
+        .await
+    }
+
+    pub async fn serve_listener(
+        self: Arc<Self>,
+        listener: TcpListener,
+        options: super::ListenerConfig,
+        acceptor: Option<TlsAcceptor>,
+        shutdown: watch::Receiver<bool>,
+    ) -> io::Result<()> {
+        options
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if options.tls != acceptor.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "listener TLS configuration mismatch",
+            ));
+        }
+        let security = if options.tls {
+            IngressSecurity::Tls
+        } else if options.allow_http_credentials {
+            IngressSecurity::AuthenticatedHttp
+        } else {
+            IngressSecurity::Plaintext
+        };
+        self.serve_http_inner(
+            listener,
+            acceptor,
+            security,
+            Some(Arc::new(options)),
+            shutdown,
+        )
+        .await
     }
 
     async fn serve_http_inner(
@@ -856,6 +897,7 @@ impl Ingress {
         listener: TcpListener,
         tls_acceptor: Option<TlsAcceptor>,
         ingress_security: IngressSecurity,
+        options: Option<Arc<super::ListenerConfig>>,
         mut shutdown: watch::Receiver<bool>,
     ) -> io::Result<()> {
         loop {
@@ -879,17 +921,18 @@ impl Ingress {
                     }
                     let gateway = self.clone();
                     let tls_acceptor = tls_acceptor.clone();
+                    let options = options.clone();
                     tokio::spawn(async move {
                         match tls_acceptor {
                             Some(acceptor) => {
                                 if let Some(stream) = accept_ingress_tls(acceptor, stream, peer).await {
                                     gateway
-                                        .serve_http_connection(stream, peer, ingress_security)
+                                        .serve_http_connection_with_options(stream, peer, ingress_security, options)
                                         .await;
                                 }
                             }
                             None => gateway
-                                .serve_http_connection(stream, peer, ingress_security)
+                                .serve_http_connection_with_options(stream, peer, ingress_security, options)
                                 .await,
                         }
                     });
@@ -898,6 +941,7 @@ impl Ingress {
         }
     }
 
+    #[cfg(test)]
     async fn serve_http_connection<T>(
         self: Arc<Self>,
         stream: T,
@@ -906,10 +950,37 @@ impl Ingress {
     ) where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        self.serve_http_connection_with_options(stream, peer, ingress_security, None)
+            .await;
+    }
+
+    async fn serve_http_connection_with_options<T>(
+        self: Arc<Self>,
+        stream: T,
+        peer: std::net::SocketAddr,
+        ingress_security: IngressSecurity,
+        options: Option<Arc<super::ListenerConfig>>,
+    ) where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let stream = crate::common::traffic::MeteredIo::new(stream, &self.request_metrics.traffic);
         let gateway = self;
-        let service =
-            service_fn(move |request| gateway.clone().handle_http(request, ingress_security, peer));
+        let service = service_fn(move |request: Request<Incoming>| {
+            let gateway = gateway.clone();
+            let options = options.clone();
+            async move {
+                if options
+                    .as_ref()
+                    .is_some_and(|options| !options.allows(request.method(), request.uri().path()))
+                {
+                    return Ok(plain(
+                        StatusCode::FORBIDDEN,
+                        "route is not allowed on this listener",
+                    ));
+                }
+                gateway.handle_http(request, ingress_security, peer).await
+            }
+        });
         // Official E2B transports may use cleartext HTTP/2. Protocol detection
         // does not change the listener's security identity or route admission.
         if let Err(error) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
@@ -1156,7 +1227,14 @@ impl Ingress {
                         tls_required()
                     } else {
                         let route = self.application_route(&request).expect("route matched");
-                        self.reverse_proxy.proxy(request, route, peer).await
+                        self.reverse_proxy
+                            .proxy_with_tls(
+                                request,
+                                route,
+                                peer,
+                                ingress_security == IngressSecurity::Tls,
+                            )
+                            .await
                     }
                 }
                 path if self.is_control_plane_path(path) => {
@@ -1391,7 +1469,9 @@ impl Ingress {
         ingress_security: IngressSecurity,
         peer: std::net::SocketAddr,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext
+        if (ingress_security == IngressSecurity::Plaintext
+            || (ingress_security != IngressSecurity::Tls
+                && is_e2b_management_path(request.uri().path())))
             && !self.e2b_http_management_allowed(request.uri().path())
         {
             return tls_required();
@@ -1403,7 +1483,14 @@ impl Ingress {
             strip_prefix: false,
             host: None,
         };
-        self.reverse_proxy.proxy(request, &route, peer).await
+        self.reverse_proxy
+            .proxy_with_tls(
+                request,
+                &route,
+                peer,
+                ingress_security == IngressSecurity::Tls,
+            )
+            .await
     }
 
     fn health_response(&self, path: &str) -> Response<ProxyBody> {
@@ -1461,7 +1548,7 @@ impl Ingress {
         if request.method() != http::Method::GET {
             return plain(StatusCode::METHOD_NOT_ALLOWED, "command watch requires GET");
         }
-        if ingress_security != IngressSecurity::Tls {
+        if ingress_security == IngressSecurity::Plaintext {
             return tls_required();
         }
         if !request
@@ -2107,7 +2194,7 @@ impl Ingress {
         ingress_security: IngressSecurity,
         target: E2bTarget,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext && !self.e2b_http_allowed() {
+        if ingress_security != IngressSecurity::Tls && !self.e2b_http_allowed() {
             return tls_required();
         }
         let request_id = header_string(&request, "x-request-id");
@@ -2133,7 +2220,7 @@ impl Ingress {
         ingress_security: IngressSecurity,
         route: RouteHandle,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext && !self.e2b_http_allowed() {
+        if ingress_security != IngressSecurity::Tls && !self.e2b_http_allowed() {
             return tls_required();
         }
         // An opaque tunnel could carry unchecked envd control requests. Execd
@@ -2948,6 +3035,7 @@ fn should_log_access(status: StatusCode, duration_us: u64) -> bool {
 fn ingress_security_name(security: IngressSecurity) -> &'static str {
     match security {
         IngressSecurity::Plaintext => "plaintext",
+        IngressSecurity::AuthenticatedHttp => "authenticated_http",
         IngressSecurity::Tls => "tls",
     }
 }

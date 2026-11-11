@@ -160,9 +160,19 @@ impl ReverseProxy {
 
     pub async fn proxy(
         &self,
+        request: Request<Incoming>,
+        route: &ProxyRoute,
+        peer: SocketAddr,
+    ) -> Response<ProxyBody> {
+        self.proxy_with_tls(request, route, peer, true).await
+    }
+
+    pub async fn proxy_with_tls(
+        &self,
         mut request: Request<Incoming>,
         route: &ProxyRoute,
         peer: SocketAddr,
+        tls: bool,
     ) -> Response<ProxyBody> {
         // Hyper represents HTTP/2 :authority in the URI rather than a Host
         // field. Preserve that client authority before rewriting the URI to
@@ -174,9 +184,10 @@ impl ReverseProxy {
         remove_hop_headers(request.headers_mut());
         request.headers_mut().remove("forwarded");
         request.headers_mut().remove("x-forwarded-prefix");
-        request
-            .headers_mut()
-            .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        request.headers_mut().insert(
+            "x-forwarded-proto",
+            HeaderValue::from_static(if tls { "https" } else { "http" }),
+        );
         let peer_ip =
             HeaderValue::from_str(&peer.ip().to_string()).expect("IP is a valid header value");
         request
