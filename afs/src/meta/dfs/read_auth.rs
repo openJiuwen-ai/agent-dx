@@ -196,9 +196,9 @@ impl DfsService {
         caller_id: String,
         validations: Vec<crate::dfs::DfsReadValidation>,
     ) -> Result<Vec<crate::dfs::DfsExternalAuthorizedRead>> {
-        if !self.is_external_backend() || validations.is_empty() || validations.len() > 128 {
+        if !self.is_external_backend() || validations.is_empty() {
             return Err(invalid(
-                "external read authorization requires the external policy and 1..128 entries",
+                "external read authorization requires the external policy and at least one entry",
             ));
         }
         self.current_durability_policy().await?;
@@ -230,9 +230,9 @@ impl DfsService {
             .validations
             .len()
             .saturating_add(request.missing_sources.len());
-        if !self.is_external_backend() || requested_reads == 0 || requested_reads > 128 {
+        if !self.is_external_backend() || requested_reads == 0 {
             return Err(invalid(
-                "current external read requires the external policy and 1..128 entries",
+                "current external read requires the external policy and at least one entry",
             ));
         }
         require_id(&request.caller_id, "caller_id")?;
@@ -379,12 +379,9 @@ impl DfsService {
         request: crate::dfs::AuthorizeExternalVersionRead,
         now: u64,
     ) -> Result<crate::dfs::AuthorizeExternalVersionReadReply> {
-        if !self.is_external_backend()
-            || request.requests.is_empty()
-            || request.requests.len() > 128
-        {
+        if !self.is_external_backend() || request.requests.is_empty() {
             return Err(invalid(
-                "external version read requires the external policy and 1..128 entries",
+                "external version read requires the external policy and at least one entry",
             ));
         }
         require_id(&request.caller_id, "caller_id")?;

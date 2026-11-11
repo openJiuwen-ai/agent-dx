@@ -1183,7 +1183,7 @@ async fn real_grpc_unknown_file_commit_ack_blocks_inode_and_replays_exact_reques
         MetaEntity::DfsLayoutRoot(layout) => layout,
         _ => panic!("expected stored layout root"),
     };
-    assert_eq!(stored_layout, pending.batch.commit.layout_root);
+    assert_eq!(stored_layout.as_ref(), &pending.batch.commit.layout_root);
     let outcome = store
         .read(MetaRead::RequestOutcome(RequestKey::new(
             "node-a",

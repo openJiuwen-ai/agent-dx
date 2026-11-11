@@ -118,7 +118,7 @@ async fn legacy_direct_commit_fixture() -> (
     txn.mutations.extend([
         TxnMutation::Put(MetaEntity::DfsInode(inode.clone())),
         TxnMutation::Put(MetaEntity::DfsFileVersion(version.clone())),
-        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout.clone())),
+        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout.clone().into())),
         TxnMutation::RecordRequestOutcome(RequestOutcome {
             request: key.clone(),
             operation: StoreOperation::DfsCommitFileVersion,
@@ -229,7 +229,7 @@ async fn fixture_with_bytes(bytes: &[u8]) -> Fixture {
             layout_root: layout.id.clone(),
             created_at_unix_ms: 1,
         })),
-        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout)),
+        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout.into())),
         TxnMutation::Put(MetaEntity::DfsChunk(staged.chunk.clone())),
         TxnMutation::Put(MetaEntity::DfsCopy(copy.clone())),
         TxnMutation::Put(MetaEntity::DfsPlacement(PlacementRecord {
@@ -269,11 +269,14 @@ async fn replace_source_layout(f: &Fixture, extents: Vec<Extent>) {
     txn.conditions
         .push(TxnCondition::RequestAbsent(key.clone()));
     txn.mutations.extend([
-        TxnMutation::Put(MetaEntity::DfsLayoutRoot(LayoutRoot {
-            id: f.request.layout_root_id.clone(),
-            file_length: f.copy.persisted_bytes,
-            inline_extents: extents,
-        })),
+        TxnMutation::Put(MetaEntity::DfsLayoutRoot(
+            LayoutRoot {
+                id: f.request.layout_root_id.clone(),
+                file_length: f.copy.persisted_bytes,
+                inline_extents: extents,
+            }
+            .into(),
+        )),
         TxnMutation::RecordRequestOutcome(RequestOutcome {
             request: key,
             operation: StoreOperation::DfsCommitFileVersion,

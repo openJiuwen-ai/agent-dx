@@ -48,7 +48,7 @@ SDK 路径式 `close` 与 FUSE `close` 同语义（先 DataOnly 同步提交再�
 | # | 限制 | 影响 | 规避与去向 | 依据 |
 |---|---|---|---|---|
 | 1 | **`local-file` Meta 日志目录必须在本机独占盘上**（R63）。本地后端以文件锁（flock）做写者互斥、term 做兜底；把目录放在 NFS 或多台机器共用的盘上、文件锁失效时，旧写者可能覆盖新写者已确认的写，重启后这些写丢失 | **丢失已确认的写** | 每个 Meta 用本机独占盘；需要共享存储时改用 `redis`／`etcd` 后端（term 与 tip 在服务端同一原子单元里比较）；彻底修要改恢复路径，另立项 | `afs/src/meta/store/local_log.rs` 写入合同；S4c 实测 |
-| 2 | **打开着反复 fsync 的文件，Meta 内存随提交数线性增长**（R86）：每次提交写一份整表 layout，追加 4 KiB＋fsync 时约 0.6 MiB/次，约 4000 次提交后 Meta 被 3 GB cgroup 杀掉 | Meta 被杀，集群不可用 | 日志、数据库 WAL 一类"一直打开、反复追加 fsync"的负载避免长时间写同一个文件（定期换文件）；回合后第一批修 | S4b 报告 R81 F3 |
+| 2 | **Meta WAL 增量追加记录需要新版 Meta**（R86）。可证明为连续追加的提交只写新增 extent，其他提交仍写全量 layout。新版可恢复旧全量记录和混写日志 | 旧版 Meta 无法恢复含新增量记录的 WAL | 首次启用前升级所有可能接管同一存储的 Meta；回滚仅使用旧版匹配的完整恢复点 | `afs/src/meta/store/log.rs`、`afs/src/meta/store/state/replay.rs` |
 | 3 | **持续存储故障下的 DFS 写入恢复**（R84）：写入准入及 fsync 发布前等待默认限 30 秒。已接收的正文仍用于重试。后台按 inode 退避，故障解除或 Meta 提供合规副本后可继续提交 | `strict` 缺少同步副本时 fsync 可能返回对应 errno；已发出的 Meta 发布仍遵循现有确认与精确重试语义 | 调整 `dfs_write_timeout_ms` 并监控 `afs_dfs_native_writeback_errors_total` | local-fault LF27、LF28 |
 | 4 | **大批删除的回收时长**（R73）：GC 规划仍随实体总数增长；1.6 万文件约 390–440 chunk/秒，100 万文件**外推**约 40 分钟到 3 小时回收完 | 删除后空间回收慢 | 观察 `afs_meta_dfs_gc_pending_chunks` 与 `afs_meta_dfs_gc_generation_age_seconds`；按需优化 | S3a 报告 |
 | 5 | **S3 模式删除节点失联或卡住时回收延后**（S4-9）：一代只等一个删除者。失联：会话过期（约 30 秒）后剔除，剩余对象由列举对账找回，3000 个对象实测 40 秒；卡住（仍注册但 120 秒未完成）：转交下一个存活 Node，实测 141 秒。时延约为会话期限＋对象数 /（1000 × `dfs_external_gc_list_pages_per_pass`）× 5 秒，大规模按此**外推** | 回收延后，不丢数据 | 对象很多时调大 `dfs_external_gc_list_pages_per_pass` | `afs/src/meta/dfs/gc/deleter.rs`；故障场景 `s3_deleter_lost`、`s3_deleter_stuck` |

@@ -31,16 +31,19 @@ fn version(id: &str, owner: &str, chunk: &str) -> Vec<MetaEntity> {
             layout_root: LayoutRootId::new(id),
             created_at_unix_ms: 0,
         }),
-        MetaEntity::DfsLayoutRoot(LayoutRoot {
-            id: LayoutRootId::new(id),
-            file_length: 4,
-            inline_extents: vec![Extent {
-                file_offset: 0,
-                length: 4,
-                chunk_id: ChunkId::new(chunk),
-                chunk_offset: 0,
-            }],
-        }),
+        MetaEntity::DfsLayoutRoot(
+            LayoutRoot {
+                id: LayoutRootId::new(id),
+                file_length: 4,
+                inline_extents: vec![Extent {
+                    file_offset: 0,
+                    length: 4,
+                    chunk_id: ChunkId::new(chunk),
+                    chunk_offset: 0,
+                }],
+            }
+            .into(),
+        ),
     ]
 }
 fn chunk(id: &str) -> MetaEntity {

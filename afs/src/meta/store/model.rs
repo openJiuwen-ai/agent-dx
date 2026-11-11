@@ -256,7 +256,8 @@ pub enum MetaEntity {
     DfsDentry(Dentry),
     DfsInode(InodeRecord),
     DfsFileVersion(FileVersion),
-    DfsLayoutRoot(LayoutRoot),
+    // Share the immutable layout across authority, watch events and snapshots.
+    DfsLayoutRoot(Arc<LayoutRoot>),
     DfsChunk(ChunkObject),
     DfsReplicationConfig(ReplicationConfig),
     DfsDurabilityPolicy(DfsDurabilityPolicy),

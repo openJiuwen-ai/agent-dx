@@ -52,11 +52,11 @@ impl DfsService {
             .admitted_generation_references(&caller_id, &commit)
             .await?;
         let expected_base_layout = match commit.expected_head_version.as_ref() {
-            Some(version_id) => Some(self.get_file_version(version_id.clone()).await?.1),
+            Some(version_id) => Some(self.get_shared_file_version(version_id.clone()).await?.1),
             None => None,
         };
         let clone_layout = self
-            .clone_layout_for(&commit, &current, expected_base_layout.as_ref())
+            .clone_layout_for(&commit, &current, expected_base_layout.as_deref())
             .await?;
         let accepted_copies = self
             .accepted_receipt_copies(&caller_id, &commit, &replication, &durability_policy)
@@ -64,7 +64,7 @@ impl DfsService {
         validate_layout_extents(
             &commit,
             clone_layout.as_ref(),
-            expected_base_layout.as_ref(),
+            expected_base_layout.as_deref(),
         )?;
         let updated = committed_inode(&current, &commit)?;
 
@@ -111,7 +111,7 @@ impl DfsService {
         }
         self.push_receipt_mutations(&mut txn, &commit, accepted_copies, &replication);
         txn.mutations.extend([
-            TxnMutation::Put(MetaEntity::DfsLayoutRoot(commit.layout_root)),
+            TxnMutation::Put(MetaEntity::DfsLayoutRoot(commit.layout_root.into())),
             TxnMutation::Put(MetaEntity::DfsFileVersion(commit.file_version)),
             TxnMutation::Put(MetaEntity::DfsInode(updated)),
             TxnMutation::RecordRequestOutcome(outcome),
@@ -242,7 +242,7 @@ impl DfsService {
         let Some(range) = &commit.clone_source else {
             return Ok(None);
         };
-        let (source, layout) = self.get_file_version(range.version.clone()).await?;
+        let (source, layout) = self.get_shared_file_version(range.version.clone()).await?;
         let source_inode = self.get_inode(source.inode_id.clone()).await?;
         let empty = LayoutRoot {
             id: crate::dfs::LayoutRootId::new("empty"),

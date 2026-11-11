@@ -734,11 +734,14 @@ fn seed_transaction_range(
             }
             let length = dimensions.chunks_per_file * CHUNK_BYTES;
             txn.mutations
-                .push(TxnMutation::Put(MetaEntity::DfsLayoutRoot(LayoutRoot {
-                    id: layout_id.clone(),
-                    file_length: length,
-                    inline_extents: extents,
-                })));
+                .push(TxnMutation::Put(MetaEntity::DfsLayoutRoot(
+                    LayoutRoot {
+                        id: layout_id.clone(),
+                        file_length: length,
+                        inline_extents: extents,
+                    }
+                    .into(),
+                )));
             txn.mutations
                 .push(TxnMutation::Put(MetaEntity::DfsFileVersion(FileVersion {
                     id: version.clone(),

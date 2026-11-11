@@ -253,7 +253,7 @@ impl LeaseInterferenceStore {
                     };
                     inode.head_version = Some(version.id.clone());
                     mutation.mutations.extend([
-                        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout)),
+                        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout.into())),
                         TxnMutation::Put(MetaEntity::DfsFileVersion(version)),
                     ]);
                 } else {

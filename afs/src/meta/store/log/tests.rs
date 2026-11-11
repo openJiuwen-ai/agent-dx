@@ -831,13 +831,23 @@ fn p3_namespace_history_every_checkpoint_cut_replays_all_facts_and_queries() {
             result,
         }));
         txn.mutations = mutations;
-        let (next, reply, record) = states
+        let (next, reply, record, base) = states
             .last()
             .unwrap()
-            .prepare_txn_record(txn, 100 + records.len() as u64, LIMIT)
+            .prepare_txn(txn, 100 + records.len() as u64, LIMIT, true)
             .unwrap();
         assert!(matches!(reply, TxnOutcome::Committed { .. }));
-        records.push(record.unwrap().into());
+        let decision = record.unwrap();
+        if id == "publish-2" {
+            records.push(Record::AppendLayout {
+                decision,
+                history: None,
+                base: base.expect("exact append must use the delta record"),
+            });
+        } else {
+            assert!(base.is_none());
+            records.push(decision.into());
+        }
         states.push(next);
     }
     fn equivalent(expected: &State, restored: &State, queries: &[MetaRead]) {
@@ -971,7 +981,14 @@ fn p3_namespace_history_every_checkpoint_cut_replays_all_facts_and_queries() {
     version.id = FileVersionId("v2".into());
     version.layout_root = LayoutRootId("l2".into());
     version.created_at_unix_ms += 1;
-    layout.id = version.layout_root.clone();
+    let suffix = std::sync::Arc::make_mut(&mut layout);
+    suffix.id = version.layout_root.clone();
+    suffix.file_length += 1;
+    version.length = suffix.file_length;
+    let mut extent = suffix.inline_extents[0].clone();
+    extent.file_offset = 1;
+    suffix.inline_extents.push(extent);
+    suffix.inline_extents.shrink_to_fit();
     inode.head_version = Some(version.id.clone());
     inode.revision = 6;
     inode.attributes.mtime_unix_ms += 10;

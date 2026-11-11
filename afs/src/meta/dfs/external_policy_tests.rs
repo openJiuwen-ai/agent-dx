@@ -357,7 +357,7 @@ async fn external_version_read_rejects_wrong_identity_or_range() {
             1 => bad.inode_id = InodeId::new("other"),
             2 => bad.layout_root_id = LayoutRootId::new("other"),
             3 => bad.requests[0].length = 5,
-            _ => bad.requests = vec![bad.requests[0].clone(); 129],
+            _ => bad.requests.clear(),
         }
         assert!(
             f.service
@@ -950,5 +950,26 @@ async fn external_publication_has_one_external_copy_and_no_replication_debt() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn external_version_read_accepts_thousand_ranges_and_checks_last_range() {
+    let f = current_read_fixture().await;
+    let mut request = version_read_request(&f.request, 0, 4);
+    request.requests = vec![request.requests[0].clone(); 1000];
+    let reply = f
+        .service
+        .authorize_external_version_read(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(reply.authorizations.len(), 1000);
+
+    request.requests.last_mut().unwrap().chunk_offset = 4;
+    assert!(
+        f.service
+            .authorize_external_version_read(request)
+            .await
+            .is_err()
     );
 }
