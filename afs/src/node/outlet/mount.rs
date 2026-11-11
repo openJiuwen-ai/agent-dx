@@ -14,10 +14,20 @@ use std::{
 
 /// 单次挂载尝试的上限。
 ///
-/// 收敛循环每 250ms 一轮，而一次 NFS 建挂可能因对端不可达而挂住整个 `timeo`
-/// （默认 10 分钟）。把整个循环押在一次建挂上，等于在对端重启期间连发布和
-/// 自愈都停摆。这里只限制"尝试"本身：超时就当作这次失败，退避后重试。
-pub const MOUNT_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 收敛循环按 `mirror_interval_ms`（默认 50ms）驱动，而一次 NFS 建挂可能因
+/// 对端不可达而挂住整个 `timeo`（默认 10 分钟）。把整个循环押在一次建挂上，
+/// 等于在对端重启期间连发布和自愈都停摆。这里只限制"尝试"本身：超时就当作
+/// 这次失败，退避后重试。
+///
+/// 取值依据（实测）：成功的 NFS 挂载约 100ms（`outlet.import.mounted` 的
+/// `elapsed_ms`），2s 留了 20 倍余量。原先的 10s 意味着对端失联时每轮发布
+/// 被推迟 10s——实测点名到 `10069ms` 的发布延迟，正好是 10s 超时叠加正常
+/// 开销。缩短到 2s 后，最坏启发式延迟降到 2s，且多个坏 home 并行后不再叠加。
+///
+/// 失败本身就很快：`ECONNREFUSED` 立即返回，`EHOSTUNREACH` 也快。真正吃满
+/// 超时的是"包被静默丢弃"（防火墙 DROP、对端宕机），这种情形等更久也没有
+/// 收益——恢复要靠下一轮重试，而不是让当前这轮多等。
+pub const MOUNT_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 本机 home 的挂载选项标记。执行器与 mounter 共用同一个字面量，避免两边
 /// 各写一份后悄悄漂移。

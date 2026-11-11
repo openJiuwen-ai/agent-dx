@@ -17,7 +17,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// 退避上限。超过之后按固定间隔重试，避免退避把恢复时间拉得过长。
-pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
+///
+/// 取 10s 而不是原先的 60s：上限直接决定"对端恢复后多久能被重新发现"。
+/// 原先 60s 意味着一次命中退避上限的故障，恢复后最长要等 60s 才重试挂载，
+/// 而单次尝试本身只要约 100ms、失败也已被 `MOUNT_ATTEMPT_TIMEOUT`（2s）兜住，
+/// 等 60s 没有任何收益，只是把故障可见窗口拉长 6 倍。
+///
+/// 代价是稳态下每分钟最多 6 次尝试、6 条告警日志，可接受。
+pub const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
 /// 首次失败的等待时间；此后逐次翻倍直到 [`MAX_BACKOFF`]。
 pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -306,6 +313,24 @@ impl ImportTable {
             .values()
             .filter(|state| state.phase == Phase::Ready)
             .count()
+    }
+
+    /// 当前处于 `Ready` 的 home 集合，供 `mirror::plan` 决定哪些名字可以发布。
+    ///
+    /// 为什么需要这个：`mirror::plan` 原本只按 Meta 的 active 列表发布，
+    /// 与 import 挂载完全解耦，于是 home 从未挂上时仍会发布出断链。
+    /// 这里把"哪些 home 真的可用"传给发布侧，让未就绪的名字暂不出现。
+    ///
+    /// 注意 `Ready` 只表示"挂载成功过"，不代表对端此刻可达（NFS hard
+    /// 挂载失联后会阻塞而非报错）。这个语义差异已确认为可接受：已发布的
+    /// 名字保持不动（spec H7），只拦"从未挂上就发布"这一种情况。
+    #[must_use]
+    pub fn ready_homes(&self) -> BTreeSet<String> {
+        self.states
+            .iter()
+            .filter(|(_, state)| state.phase == Phase::Ready)
+            .map(|(home, _)| home.clone())
+            .collect()
     }
 }
 

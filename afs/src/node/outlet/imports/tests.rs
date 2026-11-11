@@ -112,7 +112,8 @@ fn cooling_home_produces_no_action() {
 /// 退避序列 1s→2s→…→60s 封顶，成功后归零。
 #[test]
 fn backoff_doubles_to_the_cap_and_resets_on_success() {
-    let expected = [1, 2, 4, 8, 16, 32, 60, 60, 60];
+    // 上限 10s（见 MAX_BACKOFF 的取值理由）：1→2→4→8→10→10…
+    let expected = [1, 2, 4, 8, 10, 10, 10];
     for (index, seconds) in expected.iter().enumerate() {
         let failures = u32::try_from(index + 1).unwrap();
         assert_eq!(
@@ -317,4 +318,24 @@ fn retain_keeps_mounted_homes_even_when_absent_from_snapshot() {
     // node-b 仍在：它的挂载还在内核里，仍需要被维护。
     assert_eq!(table.ready_count(), 2);
     assert!(table.state("node-b").is_some());
+}
+
+/// `ready_homes` 是发布门禁的输入：只有 Ready 的 home 才可能出现在结果里。
+#[test]
+fn ready_homes_lists_only_ready_entries() {
+    let mut table = ImportTable::new();
+    table.entry("node-a").confirm_mounted();
+    // node-b 记一次失败：处于 NeedsMount + 冷却中，不该被算作就绪。
+    table.entry("node-b").record_failure(Instant::now());
+
+    let ready = table.ready_homes();
+    assert!(ready.contains("node-a"));
+    assert!(!ready.contains("node-b"), "a failing home is not ready");
+    assert_eq!(ready.len(), 1);
+}
+
+/// 未挂载过的 home 不在表里，自然也不在 ready 集合里。
+#[test]
+fn ready_homes_is_empty_for_a_fresh_table() {
+    assert!(ImportTable::new().ready_homes().is_empty());
 }

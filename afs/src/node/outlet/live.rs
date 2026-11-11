@@ -7,9 +7,10 @@
 
 use std::{
     collections::BTreeMap,
+    io,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use afs_error::{Error, Result};
@@ -263,6 +264,15 @@ impl ImportExecutor {
         self.table.ready_count()
     }
 
+    /// 当前可用的 home 集合。给 `mirror::plan` 做发布门禁用。
+    ///
+    /// 单独暴露而不直接公开 `table`：发布侧只需要"能不能发"这一个问题，
+    /// 不该拿到可以改状态的 `&mut` 入口。
+    #[must_use]
+    pub fn ready_homes(&self) -> std::collections::BTreeSet<String> {
+        self.table.ready_homes()
+    }
+
     /// 用 mountinfo 校正内存状态：真相源是内核，不是我们记得什么。
     ///
     /// 一次全量扫描，成本与 home 数量无关（设计第四节）。三种漂移都能被
@@ -313,11 +323,22 @@ impl ImportExecutor {
     pub fn ensure_imports(&mut self, active: &[OutletRoot]) -> Result<usize> {
         // 地址跟着快照走：节点重建换 IP 后，下一轮就拿到新地址，不需要任何
         // 既有节点改配置。同一 home 的多个 root 上报同一地址，后者覆盖无妨。
-        self.advertised = active
+        let advertised: std::collections::BTreeMap<String, String> = active
             .iter()
             .filter(|root| !root.home_nfs_addr.is_empty())
             .map(|root| (root.home_node_id.clone(), root.home_nfs_addr.clone()))
             .collect();
+
+        // 只在变化时记一次：mirror 每 50ms 一轮，逐轮打印会把日志刷满；
+        // 而地址变化本身是值得留痕的事件（对端换 IP、Meta 回填异常等）。
+        if advertised != self.advertised {
+            afs_logging::info!(
+                "outlet.import.addresses";
+                "local" => self.local_node.clone(),
+                "advertised" => ?advertised
+            );
+            self.advertised = advertised;
+        }
 
         let wanted = homes_in_snapshot(active);
         self.table.retain(&wanted);
@@ -334,10 +355,45 @@ impl ImportExecutor {
             return Ok(0);
         }
 
+        // 三阶段执行：准备（串行）→ 挂载（并行）→ 应用结果（串行）。
+        //
+        // 为什么要并行：一次建挂可能因对端不可达而吃满 `MOUNT_ATTEMPT_TIMEOUT`。
+        // 串行时 N 个坏 home 的代价是 N×超时，整轮发布被推迟同样长的时间——
+        // 实测单个坏 home 就能把本机 workspace 的发布延迟从 61ms 拉到 10069ms。
+        // 并行后总代价回到单次超时。
+        //
+        // 为什么拆三步：`mount` 慢但不能持 `self.table` 的可变借用跨线程，
+        // 所以先算出每个 home 要挂什么（纯读），再并发挂载，最后串行落状态。
         let mut applied = 0;
+
+        // --- 阶段 1：准备 ---
+        enum Step {
+            /// 已经挂好了，只需把状态对齐到 Ready。
+            AlreadyMounted,
+            /// 需要真正执行挂载。
+            Mount {
+                point: PathBuf,
+                source: String,
+                options: String,
+                remount: bool,
+            },
+            /// 跳过本轮（目录建不出来，或没有可用地址）。
+            Skipped,
+        }
+
+        /// 一个 home 在本轮的完整结果：home 名、执行过的步骤，以及只有
+        /// `Step::Mount` 才有的挂载返回值（起始时刻 + 结果）。
+        type MountOutcome = (
+            String,
+            Step,
+            Option<(Instant, io::Result<super::mount::MountIdentity>)>,
+        );
+
+        let mut steps: Vec<(String, Step)> = Vec::with_capacity(actions.len());
         for action in actions {
             let home = action.home().to_owned();
             let point = super::imports::mount_point(&self.import_root, &home);
+
             // tmpfs 重启后目录消失，挂载前必须存在。
             if let Err(error) = std::fs::create_dir_all(&point) {
                 let delay = self.table.entry(&home).record_failure(now);
@@ -348,41 +404,30 @@ impl ImportExecutor {
                     "consecutive" => self.table.entry(&home).consecutive_failures(),
                     "next_retry_ms" => u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
                 );
+                steps.push((home, Step::Skipped));
                 continue;
             }
 
-            let started = std::time::Instant::now();
             let is_remount = matches!(action, super::imports::ImportAction::Remount { .. });
 
             // 挂载点已被占用：本轮什么都不做。
             //
             // 不能"摘掉再挂"。`reconcile` 在下一轮按 mountinfo 重新判定，摘掉
-            // 之后它看到的是"没挂"，于是又产生一次挂载，再摘、再挂，每 250ms
-            // 一次，永远停不下来（实测每秒一次、日志刷到 196 条）。占用即视为
-            // 已就绪，把状态对齐到 Ready，循环才会收敛。
+            // 之后它看到的是"没挂"，于是又产生一次挂载，再摘、再挂，永远停不
+            // 下来（实测每秒一次、日志刷到 196 条）。占用即视为已就绪，把状态
+            // 对齐到 Ready，循环才会收敛。
             //
-            // Remount 例外：那是"挂载存在但访问失败"，必须重建，由下面的
-            // detach 分支处理。
+            // Remount 例外：那是"挂载存在但访问失败"，必须重建。
             //
             // 本地 bind 额外传 source：mountinfo 在该路径 dcache 退化时会长期
-            // 不显示条目（实测只剩 30% 可见），单靠它会把"已挂载"误判成"没挂"，
-            // 于是每秒重挂。bind 的复核用 (st_ino, st_dev) 是否等于源来判断，
-            // 纯本地调用无阻塞风险；远程 NFS 不做追加探测（`stat` 会阻塞
-            // 整个 timeo），那里 mountinfo 实测可靠。
+            // 不显示条目（实测只剩 30% 可见），单靠它会把"已挂载"误判成"没挂"。
+            // 远程 NFS 不做追加探测（`stat` 会阻塞整个 timeo），那里 mountinfo
+            // 实测可靠。
             let local_source = matches!(action.kind(), super::imports::MountKind::Local)
                 .then_some(self.users_root.as_path());
             if !is_remount && is_mounted(&point, local_source) {
-                self.table.entry(&home).confirm_mounted();
+                steps.push((home, Step::AlreadyMounted));
                 continue;
-            }
-            if is_remount {
-                afs_logging::info!(
-                    "outlet.import.remount_started";
-                    "home" => ?home,
-                    "reason" => "access_failed"
-                );
-                // MNT_DETACH：容器可能仍持有 fd，强制 umount 会 EBUSY。
-                let _ = self.mounter.detach(&point);
             }
 
             // 本机 bind，对端 NFS。两种方式产生同一个路径形态
@@ -404,6 +449,7 @@ impl ImportExecutor {
                                 "home" => ?home,
                                 "hint" => "the home must advertise outlet_nfs_addr when it registers"
                             );
+                            steps.push((home, Step::Skipped));
                             continue;
                         }
                     };
@@ -412,46 +458,122 @@ impl ImportExecutor {
             };
             let options = match action.kind() {
                 // bind 不接受 NFS 选项。
-                super::imports::MountKind::Local => super::mount::BIND_OPTIONS,
-                super::imports::MountKind::Remote => self.mount_options.as_str(),
+                super::imports::MountKind::Local => super::mount::BIND_OPTIONS.to_owned(),
+                super::imports::MountKind::Remote => self.mount_options.clone(),
             };
-            match self.mounter.mount(&source, &point, options) {
-                Ok(identity) => {
+            steps.push((
+                home,
+                Step::Mount {
+                    point,
+                    source,
+                    options,
+                    remount: is_remount,
+                },
+            ));
+        }
+
+        // --- 阶段 2：并行挂载 ---
+        //
+        // 只做真正的挂载动作。`detach` 也放在这一步，因为它与 `mount` 一样
+        // 可能阻塞在 NFS 上，没理由让别的 home 等它。
+        let (mountable, ready): (Vec<_>, Vec<_>) = steps
+            .into_iter()
+            .partition(|(_, step)| matches!(step, Step::Mount { .. }));
+
+        // 已挂好的先收进结果，不需要并行。
+        let mut results: Vec<MountOutcome> = ready
+            .into_iter()
+            .map(|(home, step)| (home, step, None))
+            .collect();
+
+        if !mountable.is_empty() {
+            let mounter = Arc::clone(&self.mounter);
+            let outcomes: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = mountable
+                    .iter()
+                    .map(|(home, step)| {
+                        let mounter = Arc::clone(&mounter);
+                        let Step::Mount {
+                            point,
+                            source,
+                            options,
+                            remount,
+                        } = step
+                        else {
+                            unreachable!("partitioned to Step::Mount");
+                        };
+                        let point = point.clone();
+                        let source = source.clone();
+                        let options = options.clone();
+                        let remount = *remount;
+                        let home = home.clone();
+                        scope.spawn(move || {
+                            let started = Instant::now();
+                            if remount {
+                                afs_logging::info!(
+                                    "outlet.import.remount_started";
+                                    "home" => ?home,
+                                    "reason" => "access_failed"
+                                );
+                                // MNT_DETACH：容器可能仍持有 fd，强制 umount 会 EBUSY。
+                                let _ = mounter.detach(&point);
+                            }
+                            let outcome = mounter.mount(&source, &point, &options);
+                            (started, outcome)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| panic!("an import mount worker panicked"))
+                    })
+                    .collect()
+            });
+
+            for ((home, step), outcome) in mountable.into_iter().zip(outcomes) {
+                results.push((home, step, Some(outcome)));
+            }
+        }
+
+        // --- 阶段 3：落状态 ---
+        //
+        // 各 home 独立，顺序无关；排序只为日志稳定。
+        results.sort_by(|left, right| left.0.cmp(&right.0));
+        for (home, step, outcome) in results {
+            match (step, outcome) {
+                (Step::AlreadyMounted, _) => {
+                    self.table.entry(&home).confirm_mounted();
+                }
+                (Step::Skipped, _) => {}
+                (Step::Mount { .. }, None) => {
+                    unreachable!("a mount step must produce an outcome")
+                }
+                (Step::Mount { .. }, Some((started, Ok(identity)))) => {
                     self.table.entry(&home).confirm_mounted();
                     applied += 1;
                     afs_logging::info!(
                         "outlet.import.mounted";
                         "home" => ?home,
-                        "source" => source,
                         "elapsed_ms" => u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "unique_mount_id" => identity.unique_mount_id
                     );
                 }
-                Err(error) => {
+                (Step::Mount { .. }, Some((_, Err(error)))) => {
                     let delay = self.table.entry(&home).record_failure(now);
                     let consecutive = self.table.entry(&home).consecutive_failures();
                     let errno = error.raw_os_error().unwrap_or(0);
                     let next_retry_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-                    // 事件名必须是字面量，所以两条分支各自写一遍。
-                    if is_remount {
-                        afs_logging::warn!(
-                            "outlet.import.remount_failed";
-                            "home" => ?home,
-                            "errno" => errno,
-                            "error" => error.to_string(),
-                            "consecutive" => consecutive,
-                            "next_retry_ms" => next_retry_ms
-                        );
-                    } else {
-                        afs_logging::warn!(
-                            "outlet.import.mount_failed";
-                            "home" => ?home,
-                            "errno" => errno,
-                            "error" => error.to_string(),
-                            "consecutive" => consecutive,
-                            "next_retry_ms" => next_retry_ms
-                        );
-                    }
+                    afs_logging::warn!(
+                        "outlet.import.mount_failed";
+                        "home" => ?home,
+                        "errno" => errno,
+                        "error" => error.to_string(),
+                        "consecutive" => consecutive,
+                        "next_retry_ms" => next_retry_ms
+                    );
                 }
             }
         }
@@ -539,7 +661,12 @@ pub fn converge_round(
     }
 
     let present = scan_public(&config.public_root)?;
-    let actions = mirror::plan(&config.import_root, &active, &present);
+    // 哪些 home 真的可用：决定"能不能发布新名字"，不影响"已发布的名字是否保留"。
+    //
+    // 未就绪的 home 只是不发新名——已在 /public 的条目原样保留（spec H7：
+    // 一次失败不得清空已发布的名字，否则下游容器会在对端抖动时集体 bind 失败）。
+    let ready = imports.ready_homes();
+    let actions = mirror::plan(&config.import_root, &active, &ready, &present);
     let mut applied = 0;
     // 发布时访问失败是"挂载挂了但不通"的唯一发现途径（设计 §4）：不做主动
     // 探测，因为那会变成每轮对每个 peer 的持续 NFS 压力。
@@ -861,6 +988,11 @@ mod tests {
         detaches: Mutex<Vec<PathBuf>>,
         /// home 名 -> 失败次数。为 0 时成功。
         fail_for: Mutex<std::collections::HashMap<String, u32>>,
+        /// 每次挂载人为耗时，用来验证并行度。
+        delay: Mutex<Option<Duration>>,
+        /// 并发挂载的峰值（同一时刻在 mount 里的线程数），用来断言"真的并行"。
+        peak_in_flight: Mutex<usize>,
+        in_flight: Mutex<usize>,
     }
 
     impl FakeMounter {
@@ -872,6 +1004,18 @@ mod tests {
                 fail_for: Mutex::new(map),
                 ..Self::default()
             }
+        }
+
+        /// 每次 mount 睡了 `delay`，用于测量并行执行的总耗时。
+        fn with_delay(delay: Duration) -> Self {
+            Self {
+                delay: Mutex::new(Some(delay)),
+                ..Self::default()
+            }
+        }
+
+        fn peak_in_flight(&self) -> usize {
+            *self.peak_in_flight.lock().unwrap()
         }
 
         fn mount_count(&self) -> usize {
@@ -895,6 +1039,41 @@ mod tests {
             target: &std::path::Path,
             options: &str,
         ) -> std::io::Result<super::super::mount::MountIdentity> {
+            // 进出计数用来断言并发性：串行执行时峰值恒为 1。
+            {
+                let mut in_flight = self.in_flight.lock().unwrap();
+                *in_flight += 1;
+                let mut peak = self.peak_in_flight.lock().unwrap();
+                if *in_flight > *peak {
+                    *peak = *in_flight;
+                }
+            }
+            // 先把值取出来再 sleep：`if let` 会把 `MutexGuard` 的临时值生命
+            // 期延长到整个 block，sleep 期间仍持锁，其他线程就全被挡住——
+            // 这正是"并行"退化成串行的经典写法（实测 3×150ms 变 456ms）。
+            let delay = *self.delay.lock().unwrap();
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
+
+            let result = self.mount_inner(source, target, options);
+            *self.in_flight.lock().unwrap() -= 1;
+            result
+        }
+
+        fn detach(&self, target: &std::path::Path) -> std::io::Result<()> {
+            self.detaches.lock().unwrap().push(target.to_path_buf());
+            Ok(())
+        }
+    }
+
+    impl FakeMounter {
+        fn mount_inner(
+            &self,
+            source: &str,
+            target: &std::path::Path,
+            options: &str,
+        ) -> std::io::Result<super::super::mount::MountIdentity> {
             let host = source.split(':').next().unwrap_or("").to_owned();
             let mut failures = self.fail_for.lock().unwrap();
             if let Some(remaining) = failures.get_mut(&host)
@@ -909,11 +1088,6 @@ mod tests {
                 options.to_owned(),
             ));
             Ok(super::super::mount::MountIdentity { unique_mount_id: 7 })
-        }
-
-        fn detach(&self, target: &std::path::Path) -> std::io::Result<()> {
-            self.detaches.lock().unwrap().push(target.to_path_buf());
-            Ok(())
         }
     }
 
@@ -1376,7 +1550,10 @@ mod tests {
             root_id: RootId(id.to_owned()),
             root_epoch: epoch,
             home_node_id: home.to_owned(),
-            home_nfs_addr: String::new(),
+            // 必须给地址：发布门禁要求 home 先 Ready，而 Ready 需要挂载成功，
+            // 远程挂载又需要地址（没有地址会走 no_nfs_addr 分支直接跳过）。
+            // 这些用例测的是发布语义，给个假地址让 FakeMounter 正常返回即可。
+            home_nfs_addr: format!("{home}.test"),
         }
     }
 
@@ -1654,5 +1831,93 @@ mod tests {
         );
         let findings = diagnose(&config, mountinfo.as_bytes());
         assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+    }
+    /// 名字 -> root id 的测试编码（生产代码用同一规则）。
+    fn root_id(name: &str) -> String {
+        let hex: String = name
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("root-{hex}")
+    }
+
+    /// 多个 home 需要建挂时必须并行：串行时 N 个坏 home 的代价是 N×超时，
+    /// 而整轮发布被推迟同样长的时间。
+    ///
+    /// 断言两件事：耗时约等于单次延迟而不是 N 倍；峰值并发 > 1。
+    #[test]
+    fn imports_are_mounted_in_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let delay = Duration::from_millis(150);
+        let mounter = Arc::new(FakeMounter::with_delay(delay));
+        let mut executor = executor(dir.path(), Arc::clone(&mounter));
+
+        // 三个不同 home，各一个 root。名字必须可解码，否则不会产生动作。
+        let roots: Vec<_> = ["node-x", "node-y", "node-z"]
+            .iter()
+            .map(|home| node(&root_id("ws"), 1, home))
+            .collect();
+
+        let started = std::time::Instant::now();
+        executor.ensure_imports(&roots).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(mounter.mount_count(), 3, "all three homes must be mounted");
+        assert!(
+            mounter.peak_in_flight() > 1,
+            "mounts must overlap, peak was {}",
+            mounter.peak_in_flight()
+        );
+        // 三个 mount 并行时约等于单次延迟；串行会是 3 倍。
+        // 留 1.8 倍余量吸收线程创建开销，仍足以把"退化回串行"挡在门外。
+        assert!(
+            elapsed < delay * 18 / 10,
+            "three mounts took {elapsed:?}; parallel should be near {delay:?}, serial {:?}",
+            delay * 3
+        );
+    }
+
+    /// 并行不改变"失败的 home 各自独立计数"这一语义。
+    #[test]
+    fn parallel_failures_are_recorded_per_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeMounter::default();
+        // node-x 的地址（node() 里拼成 "<home>.test"）始终失败。
+        fake.fail_for
+            .lock()
+            .unwrap()
+            .insert("node-x.test".to_owned(), u32::MAX);
+        let mounter = Arc::new(fake);
+        let mut executor = executor(dir.path(), Arc::clone(&mounter));
+
+        let roots: Vec<_> = ["node-x", "node-y"]
+            .iter()
+            .map(|home| node(&root_id("ws"), 1, home))
+            .collect();
+
+        let applied = executor.ensure_imports(&roots).unwrap();
+        assert_eq!(applied, 1, "only the healthy home counts as applied");
+
+        let ready = executor.ready_homes();
+        assert!(ready.contains("node-y"));
+        assert!(!ready.contains("node-x"), "the failing home is not ready");
+    }
+
+    /// 所有 home 都必须拿到状态条目，不能因为并行丢结果。
+    #[test]
+    fn every_home_gets_a_state_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut executor = executor(dir.path(), Arc::clone(&mounter));
+
+        let roots: Vec<_> = ["node-x", "node-y", "node-z"]
+            .iter()
+            .map(|home| node(&root_id("ws"), 1, home))
+            .collect();
+
+        executor.ensure_imports(&roots).unwrap();
+        let ready = executor.ready_homes();
+        assert_eq!(ready.len(), 3, "all homes ready: {ready:?}");
     }
 }

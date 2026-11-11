@@ -73,9 +73,21 @@ const RESERVED: [&str; 2] = [".pub", ".quarantine"];
 /// [`ActiveOutletRoots::merge_into`]); this function has no notion of
 /// `unchanged` and must never be called with an empty slice that merely means
 /// "the reply carried no payload" — that would remove everything (spec H14).
+///
+/// `ready_homes` gates **publishing new names** only. A root whose home is not
+/// in the set keeps whatever entry it already has: newly created names are not
+/// published at all, while an entry published before the home broke stays put.
+///
+/// The distinction matters because the two directions have opposite failure
+/// modes. Publishing a name whose import is not mounted yields a dangling
+/// symlink that `ls` cannot distinguish from a working one — silent breakage.
+/// Withdrawing an already published name would instead make downstream
+/// containers fail to bind during a transient outage (spec H7). So: never
+/// publish into a hole, never retract a name that worked.
 pub fn plan(
     import_root: &str,
     active: &[OutletRoot],
+    ready_homes: &BTreeSet<String>,
     present: &BTreeMap<String, PresentEntry>,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
@@ -106,27 +118,43 @@ pub fn plan(
     }
 
     for (name, root) in &wanted {
+        // Every name in `wanted` counts as "should exist" for the removal pass
+        // below, so an unready home never loses an entry it already has.
+        let publishable = ready_homes.contains(&root.home_node_id);
         let target = target_path(import_root, root);
         match present.get(name) {
             Some(PresentEntry::Symlink { target: current }) if current == &target => {}
             // A wrong target is republished in place: stale after a generation
             // change, or left over from a previous import layout.
-            Some(PresentEntry::Symlink { .. }) => actions.push(Action::Publish {
-                name: name.clone(),
-                target,
-            }),
-            Some(PresentEntry::Foreign) => {
-                // Move it aside first; publishing over a real directory fails.
-                actions.push(Action::Quarantine { name: name.clone() });
-                actions.push(Action::Publish {
-                    name: name.clone(),
-                    target,
-                });
+            Some(PresentEntry::Symlink { .. }) => {
+                if publishable {
+                    actions.push(Action::Publish {
+                        name: name.clone(),
+                        target,
+                    });
+                }
             }
-            None => actions.push(Action::Publish {
-                name: name.clone(),
-                target,
-            }),
+            // A foreign entry occupies the name. Leave it alone while the home
+            // is unready: quarantining it would destroy a caller's directory
+            // for a name we cannot publish anyway.
+            Some(PresentEntry::Foreign) => {
+                if publishable {
+                    // Move it aside first; publishing over a real directory fails.
+                    actions.push(Action::Quarantine { name: name.clone() });
+                    actions.push(Action::Publish {
+                        name: name.clone(),
+                        target,
+                    });
+                }
+            }
+            None => {
+                if publishable {
+                    actions.push(Action::Publish {
+                        name: name.clone(),
+                        target,
+                    });
+                }
+            }
         }
     }
 
@@ -192,6 +220,12 @@ mod tests {
             .collect()
     }
 
+    /// 所有 home 都就绪。现有用例默认用这个，保持它们原本的语义
+    /// （发布门禁是后加的，不该改变既有行为断言）。
+    fn all_ready(homes: &[&str]) -> BTreeSet<String> {
+        homes.iter().map(|h| (*h).to_owned()).collect()
+    }
+
     fn symlink(target: &str) -> PresentEntry {
         PresentEntry::Symlink {
             target: target.to_owned(),
@@ -199,14 +233,124 @@ mod tests {
     }
 
     #[test]
+    fn unready_home_publishes_nothing() {
+        // home 从未挂上（未 Ready）→ 不发布新名字。
+        // 发布出去会是断链，而 `ls` 无法把它和正常链接区分开，属于静默失败。
+        let actions = plan(
+            "/imports",
+            &[root("root-61", 7, "node-a")],
+            &all_ready(&[]),
+            &present(&[]),
+        );
+        assert!(
+            actions.is_empty(),
+            "an unready home must not publish: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn unready_home_keeps_an_already_published_name() {
+        // 已发布的名字在 home 掉线后必须保留（spec H7）：撤掉会让下游容器
+        // 在对端抖动期间集体 bind 失败，而保留则在对端恢复后自动可用。
+        let target = "/imports/node-a/users/root-61-e7";
+        let actions = plan(
+            "/imports",
+            &[root("root-61", 7, "node-a")],
+            &all_ready(&[]),
+            &present(&[("a", symlink(target))]),
+        );
+        assert!(
+            actions.is_empty(),
+            "an already published name must survive: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn unready_home_is_not_removed_as_a_ghost() {
+        // 未就绪 home 的名字仍算"应当存在"，不能在收尾的 Remove 阶段被清掉。
+        // 这条防的是把 ready_homes 误用成 wanted 的过滤条件。
+        let target = "/imports/node-a/users/root-61-e7";
+        let actions = plan(
+            "/imports",
+            &[root("root-61", 7, "node-a")],
+            &all_ready(&[]),
+            &present(&[("a", symlink(target)), ("ghost", symlink("/elsewhere"))]),
+        );
+        assert_eq!(
+            actions,
+            vec![Action::Remove {
+                name: "ghost".into()
+            }],
+            "only the true ghost is removed"
+        );
+    }
+
+    #[test]
+    fn unready_home_does_not_quarantine_a_foreign_entry() {
+        // 未就绪时不碰占据名字的非符号链接：既发不出去，又要毁掉调用方的目录，
+        // 没有收益。
+        let actions = plan(
+            "/imports",
+            &[root("root-61", 7, "node-a")],
+            &all_ready(&[]),
+            &present(&[("a", PresentEntry::Foreign)]),
+        );
+        assert!(actions.is_empty(), "must not quarantine: {actions:?}");
+    }
+
+    #[test]
+    fn ready_home_publishes_after_recovery() {
+        // 同一份输入，home 恢复 Ready 后必须发布：这是"就绪之后挂载链接"的
+        // 正向验证。
+        let actions = plan(
+            "/imports",
+            &[root("root-61", 7, "node-a")],
+            &all_ready(&["node-a"]),
+            &present(&[]),
+        );
+        assert_eq!(
+            actions,
+            vec![Action::Publish {
+                name: "a".into(),
+                target: "/imports/node-a/users/root-61-e7".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn ready_home_repairs_a_stale_target_but_unready_does_not() {
+        let stale = "/imports/node-a/users/root-61-e6";
+        let roots = [root("root-61", 7, "node-a")];
+        let present = present(&[("a", symlink(stale))]);
+
+        assert!(
+            plan("/imports", &roots, &all_ready(&[]), &present).is_empty(),
+            "unready home must not touch a stale link either"
+        );
+        assert_eq!(
+            plan("/imports", &roots, &all_ready(&["node-a"]), &present),
+            vec![Action::Publish {
+                name: "a".into(),
+                target: "/imports/node-a/users/root-61-e7".into(),
+            }],
+            "ready home republishes with the current generation"
+        );
+    }
+
+    #[test]
     fn empty_expectation_and_empty_public_yields_no_actions() {
-        let actions = plan("/imports", &[], &present(&[]));
+        let actions = plan("/imports", &[], &all_ready(&[]), &present(&[]));
         assert!(actions.is_empty());
     }
 
     #[test]
     fn new_root_is_published_with_generation_in_target() {
-        let actions = plan("/imports", &[root("root-61", 7, "node-a")], &present(&[]));
+        let actions = plan(
+            "/imports",
+            &[root("root-61", 7, "node-a")],
+            &all_ready(&["node-a"]),
+            &present(&[]),
+        );
         assert_eq!(
             actions,
             vec![Action::Publish {
@@ -221,6 +365,7 @@ mod tests {
         let actions = plan(
             "/imports",
             &[root("root-61", 7, "node-a")],
+            &all_ready(&["node-a"]),
             &present(&[("a", symlink("/imports/node-a/users/root-61-e7"))]),
         );
         assert!(actions.is_empty(), "converged state must be a no-op");
@@ -232,6 +377,7 @@ mod tests {
         let actions = plan(
             "/imports",
             &[root("root-61", 8, "node-a")],
+            &all_ready(&["node-a"]),
             &present(&[("a", symlink("/imports/node-a/users/root-61-e7"))]),
         );
         assert_eq!(
@@ -249,6 +395,7 @@ mod tests {
         let actions = plan(
             "/imports",
             &[],
+            &all_ready(&[]),
             &present(&[("a", symlink("/imports/node-a/users/root-61-e7"))]),
         );
         assert_eq!(actions, vec![Action::Remove { name: "a".into() }]);
@@ -260,6 +407,7 @@ mod tests {
         let actions = plan(
             "/imports",
             &[root("root-61", 7, "node-a")],
+            &all_ready(&["node-a"]),
             &present(&[("a", PresentEntry::Foreign)]),
         );
         assert_eq!(
@@ -281,6 +429,7 @@ mod tests {
         let actions = plan(
             "/imports",
             &[],
+            &all_ready(&[]),
             &present(&[
                 (".pub", PresentEntry::Foreign),
                 (".quarantine", PresentEntry::Foreign),
@@ -298,7 +447,7 @@ mod tests {
             ("c", symlink("/imports/node-c/users/root-63-e1")),
             ("d", PresentEntry::Foreign),
         ]);
-        let actions = plan("/imports", &active, &start);
+        let actions = plan("/imports", &active, &all_ready(&["node-a"]), &start);
 
         // 用动作构造"执行后"的现状态：Publish 覆盖，Quarantine 后紧跟 Publish，
         // Remove 清除。
@@ -317,9 +466,9 @@ mod tests {
             }
         }
         assert!(
-            plan("/imports", &active, &after).is_empty(),
+            plan("/imports", &active, &all_ready(&["node-a"]), &after).is_empty(),
             "second pass must be a no-op, got {:?}",
-            plan("/imports", &active, &after)
+            plan("/imports", &active, &all_ready(&["node-a"]), &after)
         );
     }
 
@@ -331,8 +480,8 @@ mod tests {
             root("root-61", 1, "node-a"),
             root("root-62", 1, "node-a"),
         ];
-        let first = plan("/imports", &active, &present(&[]));
-        let second = plan("/imports", &active, &present(&[]));
+        let first = plan("/imports", &active, &all_ready(&["node-a"]), &present(&[]));
+        let second = plan("/imports", &active, &all_ready(&["node-a"]), &present(&[]));
         assert_eq!(first, second);
         let names: Vec<_> = first
             .iter()
