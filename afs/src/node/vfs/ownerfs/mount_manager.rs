@@ -28,6 +28,10 @@ pub(in crate::node) struct MountManager {
     entries: Mutex<HashMap<RootId, Arc<MountEntry>>>,
     egress_root: Option<PathBuf>,
     owner: Mutex<Weak<OwnerFs>>,
+    /// Test-only probe for the rmdir fast-fail path: proves the emptiness
+    /// pre-check returns before any unmount request is issued.
+    #[cfg(test)]
+    unmount_requests: std::sync::atomic::AtomicUsize,
 }
 
 struct MountEntry {
@@ -68,6 +72,8 @@ impl MountManager {
             entries: Mutex::new(HashMap::new()),
             egress_root,
             owner: Mutex::new(Weak::new()),
+            #[cfg(test)]
+            unmount_requests: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -116,6 +122,22 @@ impl MountManager {
         Ok(())
     }
 
+    /// Test-only probe: whether this root currently has a tracked mount entry.
+    #[cfg(test)]
+    pub(in crate::node) fn has_entry(&self, root_id: &RootId) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(root_id)
+    }
+
+    /// Test-only probe: how many unmount requests reached this manager.
+    #[cfg(test)]
+    pub(in crate::node) fn unmount_requests(&self) -> usize {
+        self.unmount_requests
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Shut down all active mounts: detach every live bind, clean up each
     /// egress target directory, and clear entries.
     ///
@@ -149,6 +171,9 @@ impl MountManager {
     /// 超时或 detach 失败时保留 entry 供后续重试并记录日志，不阻塞删除流程；
     /// 物理目录删除可能随后失败，由 reconcile_on_startup 在下次启动时重试。
     pub(in crate::node) fn request_unmount(&self, root_id: &RootId) -> Result<()> {
+        #[cfg(test)]
+        self.unmount_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let entry = {
             let entries = self.entries.lock().map_err(|_| poisoned())?;
             entries.get(root_id).cloned()

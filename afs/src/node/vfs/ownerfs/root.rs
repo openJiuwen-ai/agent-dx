@@ -296,6 +296,10 @@ struct RootRuntime {
 
 enum GrantPhase {
     Active(RootGrant),
+    /// 删除流程已封闭准入，但物理目录判定尚未完成。保留授权快照，
+    /// 使 ENOTEMPTY 等预期失败可以恢复为 [`GrantPhase::Active`]；
+    /// 判定成功后直接下线，不再恢复。
+    Deleting(RootGrant),
     Invalid,
 }
 
@@ -481,6 +485,10 @@ pub struct RootManager {
     control_valid: AtomicBool,
     roots: RwLock<HashMap<RootId, Arc<LocalRoot>>>,
     workspace_locks: Mutex<HashMap<RootId, Weak<Mutex<()>>>>,
+    /// 测试钩子：跳过 rmdir 的判空预检，用于确定性地复现"预检与物理删除
+    /// 之间仍有写入"的竞态和失败回滚路径。
+    #[cfg(test)]
+    skip_empty_precheck: AtomicBool,
 }
 
 impl RootManager {
@@ -520,6 +528,8 @@ impl RootManager {
             control_valid: AtomicBool::new(true),
             roots: RwLock::new(HashMap::new()),
             workspace_locks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            skip_empty_precheck: AtomicBool::new(false),
         };
         manager.reconcile_on_startup()?;
         Ok(manager)
@@ -1150,8 +1160,11 @@ impl RootManager {
         state: &mut RootRuntime,
         revocation: &HomeRootRevocation,
     ) -> bool {
-        let GrantPhase::Active(grant) = &state.phase else {
-            return false;
+        // 删除中（Deleting）的根同样必须响应权威撤销：此时若仍允许保留
+        // 授权快照，物理删除失败后的恢复会复活一个 Meta 已撤销的 grant。
+        let grant = match &state.phase {
+            GrantPhase::Active(grant) | GrantPhase::Deleting(grant) => grant,
+            GrantPhase::Invalid => return false,
         };
         if grant.id != revocation.root_id
             || grant.epoch != revocation.root_epoch
@@ -1226,14 +1239,19 @@ impl RootManager {
 
     /// D4: 完整删除一个 active root。
     ///
-    /// 调用顺序：revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog。
-    /// 每步幂等，部分失败可安全重试。并发 rmdir 中，缓存移除是线性化点：
-    /// 第二个调用在缓存中找不到 root，返回 invalid_grant（FUSE 层转 ENOENT）。
-    /// 物理目录删除先于 catalog 移除：非空目录使 remove_dir 返回 ENOTEMPTY 时
-    /// catalog 记录仍保留，root 可被重启 reconcile 继续收敛，不会成为
-    /// 控制面记录先于数据被清除的孤儿（review: 非空 root 删除失败会丢失控制面记录）。
-    /// Meta 不可达时在 deactivate 处失败并保持 catalog/物理目录不变，
-    /// 残留记录由 reconcile_on_startup 的 zombie 检测在下次启动时清理。
+    /// 顺序：封闭准入（Active → Deleting）→ 物理目录（内核原子判空）→
+    /// Meta deactivate → catalog → 缓存移除。
+    ///
+    /// - 物理目录删除是唯一能判定删除成败的步骤，必须先于不可逆动作：
+    ///   ENOTEMPTY 等预期失败只恢复授权并原样返回错误，Meta 归属、缓存与
+    ///   catalog 记录、物理数据全部保留，符合 POSIX「失败无副作用」。
+    /// - Meta deactivate 是全局不可逆宣告，放在物理删除之后。失败时目录
+    ///   已删除、缓存与 catalog 保留，重试从 ENOENT 继续补完。
+    /// - 缓存移除在最后：并发 rmdir 由工作区锁串行化，后到者在缓存中
+    ///   找不到 root，返回 `NODE_VFS_NOT_FOUND`（FUSE 层 ENOENT）。
+    ///
+    /// 调用方需要先撤销准入再卸载 egress bind 时，可先调用
+    /// [`RootManager::begin_delete`]；本方法同样接受 Active 状态并自行封闭。
     pub fn delete_root(&self, id: &RootId) -> Result<()> {
         afs_logging::info!("root.delete_root.start"; "root_id" => ?id);
         let result = self.delete_root_inner(id);
@@ -1246,6 +1264,102 @@ impl RootManager {
         result
     }
 
+    /// rmdir 前的廉价判空：物理 workspace 目录已有条目时立即返回
+    /// `IO_DIRECTORY_NOT_EMPTY`，调用方无需关闭准入或卸载 egress bind。
+    ///
+    /// 结果只用于快速失败：预检与物理删除之间的并发写入无法排除，
+    /// [`RootManager::delete_root`] 内物理目录的原子删除仍是权威判定点。
+    /// 目录不存在视为空，让"物理删除已成功但 Meta 失败"的重试继续补完。
+    pub fn ensure_workspace_empty(&self, id: &RootId) -> Result<()> {
+        #[cfg(test)]
+        if self.skip_empty_precheck.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let root = self.cached_root(id)?;
+        match self.disk.read_dir(&root.data_dir) {
+            Ok(entries) if !entries.is_empty() => Err(Error::coded(
+                afs_error::IO_DIRECTORY_NOT_EMPTY,
+                "workspace directory is not empty",
+            )),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::from(error)),
+        }
+    }
+
+    /// 测试钩子：跳过判空预检，模拟"预检之后、物理删除之前仍有写者"的竞态。
+    #[cfg(test)]
+    pub(crate) fn set_skip_empty_precheck(&self, skip: bool) {
+        self.skip_empty_precheck.store(skip, Ordering::Relaxed);
+    }
+
+    /// 删除流程第一阶段：在任何可能阻塞的动作（如卸载 egress bind）之前
+    /// 立即撤销本机与 peer 的新准入，并保留授权快照供失败恢复。
+    ///
+    /// 缓存未命中说明 root 已删除，返回 `NODE_VFS_NOT_FOUND`（FUSE ENOENT）。
+    pub fn begin_delete(&self, id: &RootId) -> Result<()> {
+        let root = self.cached_root(id)?;
+        let mut state = root
+            .state
+            .lock()
+            .map_err(|_| invalid_grant("root cache lock poisoned"))?;
+        let snapshot = match &state.phase {
+            GrantPhase::Active(grant) => Some(grant.clone()),
+            GrantPhase::Deleting(_) | GrantPhase::Invalid => None,
+        };
+        if let Some(grant) = snapshot {
+            state.phase = GrantPhase::Deleting(grant);
+            state.validated_peer_grants.clear();
+        }
+        Ok(())
+    }
+
+    /// 中止尚未越过后物理删除判定的删除：Deleting → Active，恢复原授权。
+    /// 已撤销（Invalid）的根不恢复，保持 fail-closed。
+    pub fn cancel_delete(&self, id: &RootId) {
+        let Ok(roots) = self.roots.read() else {
+            return;
+        };
+        let Some(root) = roots.get(id) else {
+            return;
+        };
+        let mut state = root.state.lock().unwrap_or_else(|error| error.into_inner());
+        let snapshot = match &state.phase {
+            GrantPhase::Deleting(grant) => Some(grant.clone()),
+            GrantPhase::Active(_) | GrantPhase::Invalid => None,
+        };
+        if let Some(grant) = snapshot {
+            state.phase = GrantPhase::Active(grant);
+        }
+    }
+
+    /// 删除失败后判断授权是否已恢复（仅看根运行态）。用于决定是否需要
+    /// 重新挂载 egress bind：物理删除失败会恢复 Active，Meta 失败则保持
+    /// Deleting（目录已删除，重挂没有意义）。
+    pub fn root_is_active(&self, id: &RootId) -> bool {
+        self.roots.read().is_ok_and(|roots| {
+            roots.get(id).is_some_and(|root| {
+                root.state
+                    .lock()
+                    .is_ok_and(|state| matches!(state.phase, GrantPhase::Active(_)))
+            })
+        })
+    }
+
+    fn cached_root(&self, id: &RootId) -> Result<Arc<LocalRoot>> {
+        self.roots
+            .read()
+            .map_err(|_| invalid_grant("root cache lock poisoned"))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::coded(
+                    afs_error::NODE_VFS_NOT_FOUND,
+                    "root is not cached for deletion",
+                )
+            })
+    }
+
     /// 执行步骤见 [`RootManager::delete_root`] 文档；每步成功后记录 info，
     /// 任一步失败时提前返回，统一由外层 `delete_root` 记录失败日志。
     fn delete_root_inner(&self, id: &RootId) -> Result<()> {
@@ -1253,40 +1367,80 @@ impl RootManager {
         let _guard = lock
             .lock()
             .map_err(|_| invalid_grant("workspace lock poisoned"))?;
-        // 1. revoke — 阻止新的 enter_root。
-        self.revoke_root(id);
 
-        // 2. 从缓存移除（并发 rmdir 的线性化点）。
-        {
-            let mut roots = self
-                .roots
-                .write()
-                .map_err(|_| invalid_grant("root cache lock poisoned"))?;
-            let removed = roots.remove(id);
-            if removed.is_none() {
-                return Err(invalid_grant("root not found for deletion"));
-            }
-        }
-        afs_logging::info!("root.delete_root.cache_removed"; "root_id" => ?id);
+        // 1. 缓存未命中 = 该 root 已删除（并发 rmdir 的后到者），返回 ENOENT。
+        //    工作区锁保证前一删除已完成 catalog 与缓存清理。
+        let root = self.cached_root(id)?;
 
-        // 3. Meta deactivate（epoch 从 catalog 获取）。
+        // 2. 读取 catalog 记录；失败时尚未产生任何状态变化。
         let records = self.catalog.scan_roots()?;
         let record = records
             .into_iter()
             .find(|record| &record.id == id)
             .ok_or_else(|| invalid_grant("root catalog record not found"))?;
+
+        // 3. 封闭准入并取得可恢复的授权快照。
+        let restorable = {
+            let mut state = root
+                .state
+                .lock()
+                .map_err(|_| invalid_grant("root cache lock poisoned"))?;
+            let current = match &state.phase {
+                GrantPhase::Active(grant) => Some((grant.clone(), true)),
+                // begin_delete 已完成第一阶段：快照仍可用于失败恢复。
+                GrantPhase::Deleting(grant) => Some((grant.clone(), false)),
+                // Meta 已撤销该授权，不允许恢复。
+                GrantPhase::Invalid => None,
+            };
+            current.map(|(grant, was_active)| {
+                if was_active {
+                    state.phase = GrantPhase::Deleting(grant.clone());
+                    state.validated_peer_grants.clear();
+                }
+                grant
+            })
+        };
+
+        // 4. 物理目录删除（内核原子判空）是删除成败的判定点，必须先于任何
+        //    不可逆动作。预期失败（如 ENOTEMPTY）恢复授权并原样返回错误。
+        if let Err(error) = self.remove_abandoned_dir(&record.data_dir) {
+            if let Some(grant) = restorable {
+                let mut state = root
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if matches!(&state.phase, GrantPhase::Deleting(current) if current == &grant) {
+                    state.phase = GrantPhase::Active(grant);
+                }
+            }
+            return Err(error);
+        }
+        afs_logging::info!("root.delete_root.dir_removed"; "root_id" => ?id, "data_dir" => ?record.data_dir);
+
+        // 5. Meta deactivate（幂等）。失败时缓存与 catalog 保留，重试从
+        //    物理目录 ENOENT 继续补完，不再需要回滚物理删除。
         self.meta
             .deactivate_root(id, record.epoch, &self.local_node_id, &self.session_id)?;
         afs_logging::info!("root.delete_root.meta_deactivated"; "root_id" => ?id, "epoch" => record.epoch);
 
-        // 4. 删除物理目录。先于 catalog 移除：目录删除失败（如非空）时
-        //    catalog 记录仍存在，root 可被重启 reconcile 重新收敛或继续清理。
-        self.remove_abandoned_dir(&record.data_dir)?;
-        afs_logging::info!("root.delete_root.dir_removed"; "root_id" => ?id, "data_dir" => ?record.data_dir);
-
-        // 5. 清除 catalog 条目。
+        // 6. 清除 catalog 条目。
         self.catalog.remove_prepared_root(&record)?;
         afs_logging::info!("root.delete_root.catalog_removed"; "root_id" => ?id);
+
+        // 7. 最后移除缓存条目，此时该 root 才不可逆下线。
+        {
+            let mut roots = self
+                .roots
+                .write()
+                .map_err(|_| invalid_grant("root cache lock poisoned"))?;
+            if roots
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(current, &root))
+            {
+                roots.remove(id);
+            }
+        }
+        afs_logging::info!("root.delete_root.cache_removed"; "root_id" => ?id);
 
         Ok(())
     }
@@ -2498,6 +2652,7 @@ mod tests {
         active: Option<RootLocation>,
         active_prepare_id: Option<String>,
         lose_activate_reply: bool,
+        fail_deactivate: bool,
     }
 
     #[derive(Default)]
@@ -2549,6 +2704,9 @@ mod tests {
 
         fn deactivate_root(&self, root_id: &RootId, _: u64, _: &str, _: &str) -> Result<()> {
             let mut state = self.0.lock().unwrap();
+            if state.fail_deactivate {
+                return Err(unavailable_grant("injected Meta deactivate failure"));
+            }
             if state
                 .active
                 .as_ref()
@@ -2837,9 +2995,9 @@ mod tests {
         // 3. 物理目录已删除。
         assert!(disk.metadata(&data_dir).is_err());
 
-        // 4. 并发 rmdir 线性化：第二次调用返回 invalid_grant。
+        // 4. 并发 rmdir 线性化：第二次调用返回 ENOENT（root 已删除）。
         let err = manager.delete_root(&id).unwrap_err();
-        assert_eq!(err.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+        assert_eq!(err.code(), afs_error::NODE_VFS_NOT_FOUND);
 
         // 5. catalog 无记录（manager 持有独占锁，先释放再验证）。
         drop(manager);
@@ -2900,8 +3058,16 @@ mod tests {
         assert!(locked.scan_roots().unwrap().is_empty());
     }
 
-    #[test]
-    fn delete_root_keeps_catalog_when_physical_dir_not_empty() {
+    /// 构造一个"catalog + Meta 都有记录、物理目录存在"的已激活根，
+    /// 用于删除流程测试。
+    fn active_root_fixture() -> (
+        tempfile::TempDir,
+        Arc<LocalFs>,
+        Arc<RecoveryMeta>,
+        RootManager,
+        RootId,
+        StoragePath,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
         let meta = Arc::new(RecoveryMeta::default());
@@ -2910,13 +3076,153 @@ mod tests {
         let data_dir = root_data_dir(name, 1).unwrap();
         disk.mkdir(&data_dir, 0o700).unwrap();
         disk.sync_root().unwrap();
-        meta.0.lock().unwrap().active = Some(RootLocation {
-            id: id.clone(),
-            epoch: 1,
-            home_node_id: "node-a".into(),
-            home_session_id: "session-a".into(),
-        });
-        meta.0.lock().unwrap().active_prepare_id = Some("prepare-1:session-a".into());
+        {
+            let mut state = meta.0.lock().unwrap();
+            state.active = Some(RootLocation {
+                id: id.clone(),
+                epoch: 1,
+                home_node_id: "node-a".into(),
+                home_session_id: "session-a".into(),
+            });
+            state.active_prepare_id = Some("prepare-1:session-a".into());
+        }
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1:session-a".into(),
+            })
+            .unwrap();
+        drop(locked);
+        let manager = RootManager::open(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
+        (temp, disk, meta, manager, id, data_dir)
+    }
+
+    #[test]
+    fn delete_root_enotempty_keeps_workspace_online_and_retry_succeeds() {
+        let (temp, disk, meta, manager, id, data_dir) = active_root_fixture();
+        let payload = data_dir.join_component(OsStr::new("payload")).unwrap();
+        std::fs::write(temp.path().join(payload.as_path()), b"x").unwrap();
+
+        // ENOTEMPTY 是 rmdir 的预期失败：失败不得改变已有状态。
+        let err = manager.delete_root(&id).unwrap_err();
+        assert_eq!(err.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+
+        // Meta 归属、控制面记录与物理数据保留，授权恢复后仍可访问。
+        assert!(meta.0.lock().unwrap().active.is_some());
+        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
+        assert!(manager.enter_root(&id, RootRight::Read).is_ok());
+        assert!(disk.metadata(&data_dir).is_ok());
+        assert_eq!(
+            std::fs::read(temp.path().join(payload.as_path())).unwrap(),
+            b"x"
+        );
+
+        // 清空后原地重试成功；成功后才不可逆下线。
+        std::fs::remove_file(temp.path().join(payload.as_path())).unwrap();
+        manager.delete_root(&id).unwrap();
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        assert!(meta.0.lock().unwrap().active.is_none());
+        assert!(disk.metadata(&data_dir).is_err());
+        drop(manager);
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        assert!(locked.scan_roots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ensure_workspace_empty_fails_fast_without_state_change() {
+        let (temp, _disk, meta, manager, id, data_dir) = active_root_fixture();
+        let payload = data_dir.join_component(OsStr::new("payload")).unwrap();
+        std::fs::write(temp.path().join(payload.as_path()), b"x").unwrap();
+
+        // 预检失败只返回 ENOTEMPTY：授权、缓存与 Meta 归属都不变。
+        let err = manager.ensure_workspace_empty(&id).unwrap_err();
+        assert_eq!(err.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+        assert!(manager.enter_root(&id, RootRight::Read).is_ok());
+        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
+        assert!(meta.0.lock().unwrap().active.is_some());
+
+        std::fs::remove_file(temp.path().join(payload.as_path())).unwrap();
+        manager.ensure_workspace_empty(&id).unwrap();
+
+        // 物理删除已成功、Meta 失败的重试：目录缺失视为空。
+        std::fs::remove_dir(temp.path().join(data_dir.as_path())).unwrap();
+        manager.ensure_workspace_empty(&id).unwrap();
+    }
+
+    #[test]
+    fn delete_root_meta_deactivate_failure_is_retryable() {
+        let (_temp, disk, meta, manager, id, data_dir) = active_root_fixture();
+        meta.0.lock().unwrap().fail_deactivate = true;
+
+        // 物理删除已成功、Meta 宣告失败：失败点在不可逆动作之前，重试可补完。
+        let err = manager.delete_root(&id).unwrap_err();
+        assert_eq!(err.code(), afs_error::NODE_OWNER_GRANT_UNAVAILABLE);
+        assert!(disk.metadata(&data_dir).is_err());
+        assert!(meta.0.lock().unwrap().active.is_some());
+        // 缓存记录保留，删除中状态拒绝新准入。
+        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
+        assert!(manager.enter_root(&id, RootRight::Read).is_err());
+
+        meta.0.lock().unwrap().fail_deactivate = false;
+        manager.delete_root(&id).unwrap();
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        assert!(meta.0.lock().unwrap().active.is_none());
+        drop(manager);
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        assert!(locked.scan_roots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn begin_delete_blocks_admission_until_cancelled() {
+        let (_temp, _disk, _meta, manager, id, _data_dir) = active_root_fixture();
+        manager.begin_delete(&id).unwrap();
+        assert_eq!(
+            manager
+                .enter_root(&id, RootRight::Read)
+                .err()
+                .unwrap()
+                .code(),
+            afs_error::NODE_OWNER_GRANT_UNAVAILABLE
+        );
+
+        // 物理删除前中止（如 egress bind 卸载失败）：恢复原授权。
+        manager.cancel_delete(&id);
+        assert_eq!(
+            manager
+                .enter_root(&id, RootRight::Read)
+                .unwrap()
+                .grant()
+                .epoch,
+            1
+        );
+    }
+
+    #[test]
+    fn startup_cleans_catalog_leftover_after_meta_deactivate_and_keeps_non_empty_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("job");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
         let catalog = LocalFsRootCatalog::new(disk.clone());
         let locked = catalog.lock_and_open().unwrap();
         locked
@@ -2930,33 +3236,12 @@ mod tests {
             .unwrap();
         drop(locked);
 
-        let manager = RootManager::open(
-            "node-a".into(),
-            "session-a".into(),
-            meta.clone(),
-            disk.clone(),
-        )
-        .unwrap();
-        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
-
-        // 制造非空目录：删除必然 ENOTEMPTY。
+        // 模拟 delete_root 已提交 Meta 宣告、清理被中断的残留：catalog 有
+        // 记录、Meta 无 active、物理目录非空。
         std::fs::write(temp.path().join(data_dir.as_path()).join("payload"), b"x").unwrap();
 
-        // 删除在物理目录一步失败：Meta 已 deactivate、缓存已移除，
-        // 但 catalog 记录必须保留，否则数据成为无法重新准入的孤儿。
-        let err = manager.delete_root(&id).unwrap_err();
-        assert_eq!(err.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
-
-        // catalog 记录仍在（manager 持有独占锁，先释放再验证）。
-        drop(manager);
-        let locked = LocalFsRootCatalog::new(disk.clone())
-            .lock_and_open()
-            .unwrap();
-        assert_eq!(locked.scan_roots().unwrap().len(), 1);
-        drop(locked);
-
-        // 重启 reconcile：catalog 有记录但 Meta 无 active，收敛为移除
-        // catalog 条目；非空目录被保留并告警，不阻塞启动。
+        // 启动 reconcile 把残留当作已逻辑删除：移除 catalog 条目；非空目录
+        // 保留并告警，不阻塞启动。
         let manager = RootManager::open(
             "node-a".into(),
             "session-a".into(),
@@ -2965,12 +3250,13 @@ mod tests {
         )
         .unwrap();
         assert!(manager.cached_local_roots().unwrap().is_empty());
-        assert!(meta.0.lock().unwrap().active.is_none());
         drop(manager);
         let locked = LocalFsRootCatalog::new(disk.clone())
             .lock_and_open()
             .unwrap();
         assert!(locked.scan_roots().unwrap().is_empty());
+        drop(locked);
+        assert!(disk.metadata(&data_dir).is_ok());
     }
 }
 
