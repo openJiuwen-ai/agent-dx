@@ -19,6 +19,9 @@ use std::{
 use tokio::sync::Mutex;
 use tonic::{Code, Response, Status};
 
+#[cfg(test)]
+mod discovery_tests;
+
 pub struct Clients {
     pub config: Config,
     pub workspace: Option<WorkspaceAffinityResolver>,
@@ -382,15 +385,24 @@ impl Clients {
         if !(32..=512).contains(&key.len()) {
             return Err(Status::unauthenticated("invalid API key"));
         }
-        let mut client = pb::auth_service_client::AuthServiceClient::new(self.coordinator().await?);
-        let result = self
-            .rpc(
+        // Discovery, channel acquisition and the auth RPC share this original
+        // budget. A discovery reconnect must not grant the RPC a fresh budget.
+        let deadline = tokio::time::Instant::now() + self.config.timeout();
+        let result = tokio::time::timeout_at(deadline, async {
+            let mut client =
+                pb::auth_service_client::AuthServiceClient::new(self.coordinator().await?);
+            self.rpc(
                 "apiserver.verify_key",
                 client.verify_api_key(trace::inject(pb::VerifyApiKeyRequest {
                     api_key: key.into(),
                 })),
             )
-            .await?;
+            .await
+        })
+        .await
+        .map_err(|_| {
+            Status::deadline_exceeded("apiserver.verify_key: authentication deadline exceeded")
+        })??;
         if result.expires_at_unix_seconds != 0 && result.expires_at_unix_seconds <= unix_seconds() {
             return Err(Status::unauthenticated("expired API key"));
         }

@@ -114,6 +114,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tonic 0.12.3",
+ "tracing",
  "url",
  "uuid",
 ]
@@ -229,6 +230,7 @@ name = "adx-discovery"
 version = "0.1.0"
 dependencies = [
  "adx-core",
+ "adx-observability",
  "http",
  "redis",
  "serde",
