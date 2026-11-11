@@ -72,9 +72,13 @@ def _regular_files(directory):
 
 
 def verify_rootfs_metadata(metadata, files, target):
-    if (not isinstance(metadata, dict) or metadata.get("target") != target
-            or metadata.get("execd_sha256") != files.get("adx-execd")
-            or metadata.get("rootfs_sha256") != files.get("adx-runtime-rootfs.img")):
+    if not isinstance(metadata, dict):
+        raise ValueError("component rootfs provenance mismatch")
+    if (
+        metadata.get("target") != target
+        or metadata.get("execd_sha256") != files.get("adx-execd")
+        or metadata.get("rootfs_sha256") != files.get("adx-runtime-rootfs.img")
+    ):
         raise ValueError("component rootfs provenance mismatch")
 
 
