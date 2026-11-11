@@ -290,6 +290,7 @@ service OwnerFiles {
   rpc Mknod(OwnerMknodRequest) returns (OwnerMknodReply);
   rpc Unlink(OwnerUnlinkRequest) returns (OwnerUnlinkReply);
   rpc Rmdir(OwnerRmdirRequest) returns (OwnerRmdirReply);
+  rpc RmdirRoot(OwnerRmdirRootRequest) returns (OwnerRmdirRootReply);
   rpc Rename(OwnerRenameRequest) returns (OwnerRenameReply);
   rpc Open(OwnerOpenRequest) returns (OwnerOpenReply);
   rpc Readlink(OwnerReadlinkRequest) returns (OwnerReadlinkReply);
@@ -584,6 +585,16 @@ message OwnerRmdirRequest {
 }
 
 message OwnerRmdirReply {}
+
+message OwnerRmdirRootRequest {
+  RootAccess access = 1;
+  // Required guard: Home rejects a workspace recreated under the same name.
+  FileIdentity expected_root = 2;
+  // Required caller credentials; absent credentials fail closed.
+  OwnerCaller caller = 3;
+}
+
+message OwnerRmdirRootReply {}
 
 message OwnerRenameRequest {
   RootAccess access = 1;

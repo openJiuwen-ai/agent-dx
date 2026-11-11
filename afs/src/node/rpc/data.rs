@@ -387,9 +387,10 @@ use afs_protocol::node_data::{
     OwnerReaddirRequest, OwnerReadlinkReply, OwnerReadlinkRequest, OwnerReleaseDirReply,
     OwnerReleaseDirRequest, OwnerReleaseReply, OwnerReleaseRequest, OwnerRemoveXattrReply,
     OwnerRemoveXattrRequest, OwnerRenameReply, OwnerRenameRequest, OwnerRmdirReply,
-    OwnerRmdirRequest, OwnerSetAttrReply, OwnerSetAttrRequest, OwnerSetXattrReply,
-    OwnerSetXattrRequest, OwnerStatFsReply, OwnerStatFsRequest, OwnerSymlinkReply,
-    OwnerSymlinkRequest, OwnerUnlinkReply, OwnerUnlinkRequest, OwnerWriteReply, OwnerWriteRequest,
+    OwnerRmdirRequest, OwnerRmdirRootReply, OwnerRmdirRootRequest, OwnerSetAttrReply,
+    OwnerSetAttrRequest, OwnerSetXattrReply, OwnerSetXattrRequest, OwnerStatFsReply,
+    OwnerStatFsRequest, OwnerSymlinkReply, OwnerSymlinkRequest, OwnerUnlinkReply,
+    OwnerUnlinkRequest, OwnerWriteReply, OwnerWriteRequest,
     owner_files_server::{OwnerFiles, OwnerFilesServer},
 };
 
@@ -518,6 +519,14 @@ pub trait OwnerFilesHandler: Send + Sync + 'static {
     ) -> afs_error::Result<OwnerRmdirReply> {
         let _ = (authenticated_peer_node_id, request);
         Err(owner_handler_unimplemented("OwnerFiles.Rmdir"))
+    }
+    fn rmdir_root(
+        &self,
+        authenticated_peer_node_id: &str,
+        request: OwnerRmdirRootRequest,
+    ) -> afs_error::Result<OwnerRmdirRootReply> {
+        let _ = (authenticated_peer_node_id, request);
+        Err(owner_handler_unimplemented("OwnerFiles.RmdirRoot"))
     }
     fn rename(
         &self,
@@ -1001,6 +1010,22 @@ impl OwnerFilesHandler for OwnerFsPeerHandler {
             &expected_parent,
         )?;
         Ok(OwnerRmdirReply {})
+    }
+
+    fn rmdir_root(
+        &self,
+        authenticated_peer_node_id: &str,
+        request: OwnerRmdirRootRequest,
+    ) -> afs_error::Result<OwnerRmdirRootReply> {
+        let access = presented_access(request.access)?;
+        let expected_root = required_identity(
+            request.expected_root,
+            "OwnerRmdirRootRequest missing expected_root",
+        )?;
+        let ctx = caller_context(request.caller)?;
+        self.executor
+            .rmdir_root(&ctx, authenticated_peer_node_id, &access, &expected_root)?;
+        Ok(OwnerRmdirRootReply {})
     }
 
     fn rename(
@@ -2252,6 +2277,16 @@ impl OwnerFiles for OwnerFilesService {
     ) -> Result<Response<OwnerRmdirReply>, Status> {
         self.dispatch(request, "OwnerFiles.Rmdir", |handler, peer, request| {
             handler.rmdir(&peer, request)
+        })
+        .await
+    }
+
+    async fn rmdir_root(
+        &self,
+        request: Request<OwnerRmdirRootRequest>,
+    ) -> Result<Response<OwnerRmdirRootReply>, Status> {
+        self.dispatch(request, "OwnerFiles.RmdirRoot", |handler, peer, request| {
+            handler.rmdir_root(&peer, request)
         })
         .await
     }

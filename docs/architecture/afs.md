@@ -1073,6 +1073,11 @@ DFS的版本复用与read-ahead设置不覆盖OwnerFs策略。read-ahead是向�
 bind 与远端访问共享底层文件，新打开的可见性及权限仍需按支持范围验证；
 图示不承诺已有 FD/mmap 即时撤权或跨节点锁一致性。
 
+workspace 可以从任意节点的 OwnerFs FUSE 路径删除：Home 在本机执行；非 Home 入口通过
+OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 workspace，非空返回
+`ENOTEMPTY` 且 workspace 保持可用；`rm -rf` 会先删除内容，最后才删除空的 workspace 目录。
+在 egress 路径上对 workspace 目录执行 rmdir 会被内核以 `EBUSY` 拒绝，不会删除 workspace。
+
 ## DFS 外部对象持久化边界
 
 ![DFS 外部 S3 写入发布与独立读取](../../assets/architecture/afs-dfs-s3.svg)

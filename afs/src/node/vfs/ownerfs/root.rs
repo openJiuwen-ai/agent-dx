@@ -277,6 +277,8 @@ pub struct LocalRoot {
     pub id: RootId,
     pub name: OsString,
     pub data_dir: StoragePath,
+    /// 与 `data_dir` 同一版本的 epoch；同名重建后 `id` 不变，删除时按它区分版本。
+    epoch: u64,
     state: Mutex<RootRuntime>,
     drained: Condvar,
 }
@@ -824,6 +826,7 @@ impl RootManager {
             id: grant.id.clone(),
             name,
             data_dir: prepared.data_dir.clone(),
+            epoch: grant.epoch,
             state: Mutex::new(RootRuntime {
                 phase: GrantPhase::Active(grant),
                 #[cfg(test)]
@@ -1228,15 +1231,30 @@ impl RootManager {
     ///
     /// 调用顺序：revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog。
     /// 每步幂等，部分失败可安全重试。并发 rmdir 中，缓存移除是线性化点：
-    /// 第二个调用在缓存中找不到 root，返回 invalid_grant（FUSE 层转 ENOENT）。
+    /// 第二个调用在缓存中找不到 root，返回 NODE_VFS_NOT_FOUND（FUSE 层转 ENOENT）。
     /// 物理目录删除先于 catalog 移除：非空目录使 remove_dir 返回 ENOTEMPTY 时
     /// catalog 记录仍保留，root 可被重启 reconcile 继续收敛，不会成为
     /// 控制面记录先于数据被清除的孤儿（review: 非空 root 删除失败会丢失控制面记录）。
     /// Meta 不可达时在 deactivate 处失败并保持 catalog/物理目录不变，
     /// 残留记录由 reconcile_on_startup 的 zombie 检测在下次启动时清理。
-    pub fn delete_root(&self, id: &RootId) -> Result<()> {
+    /// `expected_epoch` 为 `Some` 时，先在 workspace 锁内确认 catalog 中的 root
+    /// 仍是该 epoch：同名重建后返回 NODE_OWNER_STALE_HANDLE，不执行任何步骤。
+    pub fn delete_root(&self, id: &RootId, expected_epoch: Option<u64>) -> Result<()> {
+        self.delete_root_with(id, expected_epoch, || Ok(()), || Ok(()))
+    }
+
+    /// 与 [`RootManager::delete_root`] 相同，另在 workspace 锁内执行调用方的两个步骤：
+    /// `before` 在 epoch 检查之后、revoke 之前，`after` 在 catalog 移除之后。同名创建
+    /// 同样持有该锁，两个步骤因此只会作用于被删版本，不会影响同名重建的新 workspace。
+    pub fn delete_root_with(
+        &self,
+        id: &RootId,
+        expected_epoch: Option<u64>,
+        before: impl FnOnce() -> Result<()>,
+        after: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         afs_logging::info!("root.delete_root.start"; "root_id" => ?id);
-        let result = self.delete_root_inner(id);
+        let result = self.delete_root_inner(id, expected_epoch, before, after);
         match &result {
             Ok(()) => afs_logging::info!("root.delete_root.completed"; "root_id" => ?id),
             Err(error) => {
@@ -1246,13 +1264,42 @@ impl RootManager {
         result
     }
 
+    /// 本机是 Home 时返回 root 的数据目录及同一版本的 epoch；`None` 表示缓存中没有，
+    /// 调用方不能本地删除。按缓存成员判断而不是 `enter_root`：root 被撤销或控制会话
+    /// 失效时，后者同样返回 NODE_OWNER_GRANT_UNAVAILABLE，会让 Home 把删除转发给自己。
+    pub fn local_root_data_dir(&self, id: &RootId) -> Result<Option<(StoragePath, u64)>> {
+        Ok(self
+            .roots
+            .read()
+            .map_err(|_| invalid_grant("root cache lock poisoned"))?
+            .get(id)
+            .map(|root| (root.data_dir.clone(), root.epoch)))
+    }
+
     /// 执行步骤见 [`RootManager::delete_root`] 文档；每步成功后记录 info，
     /// 任一步失败时提前返回，统一由外层 `delete_root` 记录失败日志。
-    fn delete_root_inner(&self, id: &RootId) -> Result<()> {
+    fn delete_root_inner(
+        &self,
+        id: &RootId,
+        expected_epoch: Option<u64>,
+        before: impl FnOnce() -> Result<()>,
+        after: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let lock = self.workspace_lock(id)?;
         let _guard = lock
             .lock()
             .map_err(|_| invalid_grant("workspace lock poisoned"))?;
+        // 创建同样持有 workspace 锁，这里的 epoch 不会在删除过程中被替换。
+        if let Some(expected_epoch) = expected_epoch
+            && let Some(record) = self.catalog.lookup_root(id)?
+            && record.epoch != expected_epoch
+        {
+            return Err(Error::coded(
+                afs_error::NODE_OWNER_STALE_HANDLE,
+                "workspace was recreated after the delete request was validated",
+            ));
+        }
+        before()?;
         // 1. revoke — 阻止新的 enter_root。
         self.revoke_root(id);
 
@@ -1264,7 +1311,10 @@ impl RootManager {
                 .map_err(|_| invalid_grant("root cache lock poisoned"))?;
             let removed = roots.remove(id);
             if removed.is_none() {
-                return Err(invalid_grant("root not found for deletion"));
+                return Err(Error::coded(
+                    afs_error::NODE_VFS_NOT_FOUND,
+                    "root not found for deletion",
+                ));
             }
         }
         afs_logging::info!("root.delete_root.cache_removed"; "root_id" => ?id);
@@ -1288,7 +1338,7 @@ impl RootManager {
         self.catalog.remove_prepared_root(&record)?;
         afs_logging::info!("root.delete_root.catalog_removed"; "root_id" => ?id);
 
-        Ok(())
+        after()
     }
 
     /// 本进程会话确认失效时封闭全部根，不能继续用旧授权准入。
@@ -1475,6 +1525,7 @@ impl RootManager {
                 id: record.id.clone(),
                 name: record.name.clone(),
                 data_dir: record.data_dir.clone(),
+                epoch: record.epoch,
                 state: Mutex::new(RootRuntime {
                     phase: GrantPhase::Active(grant),
                     #[cfg(test)]
@@ -2828,7 +2879,43 @@ mod tests {
         .unwrap();
         assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
 
-        manager.delete_root(&id).unwrap();
+        // 校验时的 epoch 与锁内的 catalog 不一致（同名已重建）：不执行任何步骤，
+        // 调用方的步骤（卸载 bind 等）也不执行。
+        let err = manager
+            .delete_root_with(
+                &id,
+                Some(2),
+                || panic!("before must not run for a recreated root"),
+                || panic!("after must not run for a recreated root"),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert!(manager.has_active_local_root(&id));
+        assert!(meta.0.lock().unwrap().active.is_some());
+        assert!(disk.metadata(&data_dir).is_ok());
+
+        // 两个步骤都在 workspace 锁内执行：before 时 root 仍 active，after 时已全部删除。
+        let steps = std::cell::RefCell::new(Vec::new());
+        manager
+            .delete_root_with(
+                &id,
+                Some(1),
+                || {
+                    assert!(manager.workspace_lock(&id).unwrap().try_lock().is_err());
+                    assert!(manager.has_active_local_root(&id));
+                    steps.borrow_mut().push("before");
+                    Ok(())
+                },
+                || {
+                    assert!(manager.workspace_lock(&id).unwrap().try_lock().is_err());
+                    assert!(manager.cached_local_roots().unwrap().is_empty());
+                    assert!(meta.0.lock().unwrap().active.is_none());
+                    steps.borrow_mut().push("after");
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(*steps.borrow(), ["before", "after"]);
 
         // 1. 缓存已移除。
         assert!(manager.cached_local_roots().unwrap().is_empty());
@@ -2837,9 +2924,9 @@ mod tests {
         // 3. 物理目录已删除。
         assert!(disk.metadata(&data_dir).is_err());
 
-        // 4. 并发 rmdir 线性化：第二次调用返回 invalid_grant。
-        let err = manager.delete_root(&id).unwrap_err();
-        assert_eq!(err.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+        // 4. 并发 rmdir 线性化：第二次调用返回 NOT_FOUND（FUSE 层映射为 ENOENT）。
+        let err = manager.delete_root(&id, None).unwrap_err();
+        assert_eq!(err.code(), afs_error::NODE_VFS_NOT_FOUND);
 
         // 5. catalog 无记录（manager 持有独占锁，先释放再验证）。
         drop(manager);
@@ -2944,7 +3031,7 @@ mod tests {
 
         // 删除在物理目录一步失败：Meta 已 deactivate、缓存已移除，
         // 但 catalog 记录必须保留，否则数据成为无法重新准入的孤儿。
-        let err = manager.delete_root(&id).unwrap_err();
+        let err = manager.delete_root(&id, None).unwrap_err();
         assert_eq!(err.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
 
         // catalog 记录仍在（manager 持有独占锁，先释放再验证）。
