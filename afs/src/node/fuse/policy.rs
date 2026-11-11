@@ -48,17 +48,42 @@ pub(crate) trait FuseMountPolicy: Send + Sync + 'static {
 
     /// The kernel session exists; `_notifier` can invalidate its caches.
     fn on_mounted(&self, _notifier: Notifier) {}
+
+    /// Entry and attribute TTL for replies that carry no per-inode policy
+    /// decision (mkdir, mknod, symlink, link, setattr, and creates under the
+    /// kernel cache feature).
+    fn mount_entry_ttl(&self) -> Duration {
+        UNCACHED_TTL
+    }
 }
 
-/// DFS: no kernel entry/attr caching. DFS has no cross-node kernel
-/// invalidation, so every path lookup and getattr goes to the Node (S1a-7,
-/// F10; positive TTLs need an invalidation scheme first). Page caching is
-/// governed by [`FuseMountFeatures::kernel_cache`] plus pinned versions.
-pub(crate) struct DfsFusePolicy;
+/// DFS: one bounded kernel entry/attribute TTL (`dfs_kernel_cache_ttl_ms`,
+/// 0 = no kernel caching). DFS has no cross-node kernel invalidation, so a
+/// change made through another Node is seen here at most one TTL late;
+/// changes through this mount update the kernel's own caches. Negative
+/// lookups are never cached (an ENOENT reply carries no entry). Page caching
+/// is governed by [`FuseMountFeatures::kernel_cache`] plus pinned versions.
+pub(crate) struct DfsFusePolicy {
+    kernel_ttl: Duration,
+}
+
+impl DfsFusePolicy {
+    pub(crate) fn new(kernel_ttl: Duration) -> Self {
+        Self { kernel_ttl }
+    }
+}
 
 impl FuseMountPolicy for DfsFusePolicy {
     fn label(&self) -> &'static str {
         "dfs"
+    }
+
+    fn with_cache_policy(&self, _inode: BackendInode, reply: &mut dyn FnMut(Duration, bool)) {
+        reply(self.kernel_ttl, false);
+    }
+
+    fn mount_entry_ttl(&self) -> Duration {
+        self.kernel_ttl
     }
 }
 

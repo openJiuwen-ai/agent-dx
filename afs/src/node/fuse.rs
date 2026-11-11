@@ -355,10 +355,12 @@ impl AfsFuse {
         }
     }
 
-    /// Entry and attribute TTLs for replies the mount policy does not own
-    /// (mkdir/mknod/symlink/link): zero, see [`DfsFusePolicy`].
+    /// Entry and attribute TTLs for replies without a per-inode policy
+    /// decision (mkdir/mknod/symlink/link/setattr): the mount policy's TTL,
+    /// zero unless the policy caches (see [`DfsFusePolicy`]).
     fn entry_ttls(&self) -> (Duration, Duration) {
-        (TTL, TTL)
+        let ttl = self.policy.mount_entry_ttl();
+        (ttl, ttl)
     }
 
     fn record_request(&self, operation: &'static str) {

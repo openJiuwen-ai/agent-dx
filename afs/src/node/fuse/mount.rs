@@ -42,6 +42,8 @@ pub struct DfsMountOptions {
     pub read_pipeline: crate::node::read::admission::ReadPipelineLimits,
     /// Front-owned normal ordinary-write payload; downstream buffers are separate.
     pub write_queue_bytes: u64,
+    /// Kernel entry/attribute TTL (`dfs_kernel_cache_ttl_ms`); zero disables.
+    pub kernel_cache_ttl: std::time::Duration,
 }
 
 impl Default for FuseExecOptions {
@@ -61,6 +63,9 @@ impl Default for DfsMountOptions {
         Self {
             read_pipeline: Default::default(),
             write_queue_bytes: 2 * 1024 * 1024 * 1024,
+            kernel_cache_ttl: std::time::Duration::from_millis(
+                crate::config::DEFAULT_DFS_KERNEL_CACHE_TTL_MS,
+            ),
         }
     }
 }
@@ -78,6 +83,7 @@ impl From<&crate::config::Config> for FuseMountOptions {
             dfs: DfsMountOptions {
                 read_pipeline: config.dfs_read_pipeline,
                 write_queue_bytes: config.dfs_write_queue_bytes,
+                kernel_cache_ttl: std::time::Duration::from_millis(config.dfs_kernel_cache_ttl_ms),
             },
         }
     }
@@ -94,7 +100,7 @@ impl FuseMountOptions {
     /// Validates both parts, as a DFS mount requires.
     pub(super) fn validate(self) -> Result<Self> {
         self.dfs.read_pipeline.validate()?;
-        if !self.exec.in_bounds() || !self.dfs.write_queue_in_bounds() {
+        if !self.exec.in_bounds() || !self.dfs.options_in_bounds() {
             return Err(mount_bounds_error());
         }
         Ok(self)
@@ -126,14 +132,16 @@ impl FuseExecOptions {
 }
 
 impl DfsMountOptions {
-    fn write_queue_in_bounds(self) -> bool {
+    fn options_in_bounds(self) -> bool {
         (8 * 1024 * 1024..=1024 * 1024 * 1024 * 1024).contains(&self.write_queue_bytes)
             && usize::try_from(self.write_queue_bytes).is_ok()
+            && self.kernel_cache_ttl
+                <= std::time::Duration::from_millis(crate::config::MAX_DFS_KERNEL_CACHE_TTL_MS)
     }
 
     pub(super) fn validate(self) -> Result<Self> {
         self.read_pipeline.validate()?;
-        if self.write_queue_in_bounds() {
+        if self.options_in_bounds() {
             Ok(self)
         } else {
             Err(mount_bounds_error())
@@ -395,11 +403,12 @@ fn mount_dfs_inner(
     bridge: Option<Arc<FdBridge>>,
 ) -> Result<MountedFuse> {
     let options = options.validate()?;
+    let kernel_cache_ttl = options.dfs.kernel_cache_ttl;
     let features = FuseMountFeatures::dfs(options.dfs, bridge)?;
     mount_with_policy(
         backend,
         path,
-        Arc::new(DfsFusePolicy),
+        Arc::new(DfsFusePolicy::new(kernel_cache_ttl)),
         features,
         options.exec,
         metrics,

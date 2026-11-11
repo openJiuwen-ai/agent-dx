@@ -79,7 +79,7 @@ fn ownerfs_shared_root_is_uncached_and_direct() {
     assert_eq!(create_reply(&fs, REMOTE), (Duration::ZERO, DIRECT_IO));
     // The DFS kernel-cache feature, not the policy, bounds DFS creates.
     let mut dfs = AfsFuse::new(Arc::new(EmptyBackend));
-    dfs.policy = Arc::new(DfsFusePolicy);
+    dfs.policy = Arc::new(DfsFusePolicy::new(Duration::ZERO));
     dfs.cached_io = true;
     assert_eq!(
         create_reply(&dfs, PRIVATE_ROOT),
@@ -101,6 +101,41 @@ fn ownerfs_inline_local_only_for_read_only_local_opens_and_remembers_inodes() {
     assert_eq!(*policy.remembered.lock().unwrap(), vec![42]);
 
     let mut dfs = AfsFuse::new(Arc::new(EmptyBackend));
-    dfs.policy = Arc::new(DfsFusePolicy);
+    dfs.policy = Arc::new(DfsFusePolicy::new(Duration::from_secs(1)));
     assert!(!dfs.inline_local_open(local, libc::O_RDONLY));
+}
+
+/// A: the DFS policy hands its configured kernel TTL to lookup/getattr,
+/// to the entry replies the policy does not see per inode (mkdir, mknod,
+/// symlink, link, setattr) and, with the kernel cache feature, to create.
+#[test]
+fn dfs_policy_ttl_bounds_entry_attr_and_create_replies() {
+    let ttl = Duration::from_millis(1000);
+    let mut dfs = AfsFuse::new(Arc::new(EmptyBackend));
+    dfs.policy = Arc::new(DfsFusePolicy::new(ttl));
+    let mut seen = None;
+    dfs.with_cache_policy(BackendInode { value: 7 }, |ttl, private| {
+        seen = Some((ttl, private));
+    });
+    assert_eq!(seen, Some((ttl, false)));
+    assert_eq!(dfs.entry_ttls(), (ttl, ttl));
+    dfs.cached_io = true;
+    assert_eq!(create_reply(&dfs, 7), (ttl, FopenFlags::empty()));
+}
+
+#[test]
+fn dfs_policy_ttl_zero_restores_uncached_replies() {
+    let mut dfs = AfsFuse::new(Arc::new(EmptyBackend));
+    dfs.policy = Arc::new(DfsFusePolicy::new(Duration::ZERO));
+    dfs.cached_io = true;
+    assert_eq!(dfs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
+    assert_eq!(create_reply(&dfs, 7), (Duration::ZERO, FopenFlags::empty()));
+}
+
+#[test]
+fn non_dfs_policies_keep_uncached_entry_replies() {
+    let (fs, _) = home_fs();
+    assert_eq!(fs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
+    let fs = AfsFuse::new(Arc::new(EmptyBackend));
+    assert_eq!(fs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
 }
