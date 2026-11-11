@@ -76,6 +76,22 @@ def failed_replica(c, action):
         c.start("B")
         c.write("A", "healthy-after-close", b"healthy" * 4096)
         c.read("B", "healthy-after-close", b"healthy" * 4096)
+        # Keep B available until A's scheduled retry has published the retained
+        # bytes. Teardown stops B first, which otherwise injects a second fault.
+        result = c.python(
+            "B",
+            'from pathlib import Path\nimport time\n'
+            'path=Path(sys.argv[1]);size=int(sys.argv[2]);deadline=time.monotonic()+20\n'
+            'while time.monotonic()<deadline:\n'
+            ' try:\n'
+            '  if path.read_bytes()==b"q"*size: break\n'
+            ' except OSError: pass\n'
+            ' time.sleep(0.2)\n'
+            'else: raise AssertionError("accepted bytes never reached the recovered replica")\n'
+            'print(json.dumps({"bytes":size}))',
+            c.workspace("B") + "/retained", failed["accepted_bytes"], timeout=30,
+        )
+        c.record("write.retained_after_failed_close", json.loads(result["stdout"]))
     else:
         c.start("B")
         c.helper_signal(name, "recover", {})

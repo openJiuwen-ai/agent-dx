@@ -350,6 +350,9 @@ pub struct Cli {
     /// Native Node live write-body capacity (4..=64MiB); S3 budgets are separate.
     #[arg(long)]
     pub dfs_dirty_budget_bytes: Option<u64>,
+    /// DFS write admission and fsync deadline, in milliseconds.
+    #[arg(long)]
+    pub dfs_write_timeout_ms: Option<u64>,
     /// GC data-protection grace after a reference retires, in milliseconds
     /// (0..=600000). Governs when retired references stop protecting inodes
     /// and chunks. Reference *records* additionally linger as replay
@@ -509,6 +512,7 @@ struct FileConfig {
     dfs_catalog_commit_queue: Option<usize>,
     dfs_write_queue_bytes: Option<u64>,
     dfs_dirty_budget_bytes: Option<u64>,
+    dfs_write_timeout_ms: Option<u64>,
     dfs_gc_grace_ms: Option<u64>,
     dfs_unpublished_descriptors: Option<usize>,
     dfs_upload_inflight_chunks: Option<usize>,
@@ -638,6 +642,7 @@ pub struct Config {
     pub dfs_catalog_commit_queue: usize,
     pub dfs_write_queue_bytes: u64,
     pub dfs_dirty_budget_bytes: u64,
+    pub dfs_write_timeout_ms: u64,
     pub dfs_gc_grace_ms: u64,
     pub dfs_unpublished_descriptors: usize,
     pub dfs_upload_inflight_chunks: usize,
@@ -828,6 +833,7 @@ impl Config {
             dfs_catalog_commit_queue: tuning.dfs_catalog_commit_queue,
             dfs_write_queue_bytes: tuning.dfs_write_queue_bytes,
             dfs_dirty_budget_bytes: tuning.dfs_dirty_budget_bytes,
+            dfs_write_timeout_ms: tuning.dfs_write_timeout_ms,
             dfs_gc_grace_ms: tuning.dfs_gc_grace_ms,
             dfs_unpublished_descriptors: tuning.dfs_unpublished_descriptors,
             dfs_upload_inflight_chunks: tuning.dfs_upload_inflight_chunks,

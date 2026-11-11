@@ -142,6 +142,7 @@ pub struct DistributedFs {
     gc: GcCoordinator,
     writes: InodeWriteTable,
     write_resources: WriteResources,
+    write_timeout: Duration,
     locks: LockService,
     #[cfg(test)]
     hooks: TestHooks,
@@ -175,6 +176,11 @@ const REMOTE_LOCK_SESSION_PENDING_CLOSE: usize = 0;
 const REMOTE_LOCK_SESSION_ACTIVE: usize = 1;
 
 impl DistributedFs {
+    pub(crate) fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout;
+        self
+    }
+
     pub(crate) fn start_distributed_cache(&self, services: &mut crate::runtime::Services) {
         self.read_engine.start_distributed_cache(services);
     }
@@ -199,6 +205,7 @@ impl DistributedFs {
             gc: GcCoordinator::default(),
             writes: InodeWriteTable::default(),
             write_resources: WriteResources::default(),
+            write_timeout: Duration::from_secs(30),
             locks: LockService::default(),
             #[cfg(test)]
             hooks: TestHooks::default(),

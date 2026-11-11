@@ -1044,24 +1044,14 @@ impl Backend for DistributedFs {
         }
     }
 
+    fn fsync_timeout(&self) -> Option<Duration> {
+        Some(self.write_timeout)
+    }
+
     fn fsync(&self, _: &RequestContext, handle: FileHandle, mode: SyncMode) -> Result<()> {
-        let snapshot = self.handle_snapshot(handle)?;
-        if let Some(session) = snapshot.write_session.as_ref()
-            && session.remote.is_some()
-        {
-            self.write_coordinator
-                .remote_sync(session, mode)
-                .map(|_| ())
-        } else {
-            self.sync_handle(
-                handle,
-                match mode {
-                    SyncMode::DataOnly => CommitReason::DATA_SYNC,
-                    SyncMode::Full => CommitReason::FULL_SYNC,
-                },
-                CommitWait::AfterOperations,
-            )
-        }
+        crate::node::call_deadline::within_timeout(self.write_timeout, || {
+            self.fsync_with_deadline(handle, mode)
+        })
     }
 
     fn fsync_receipt(
@@ -1428,5 +1418,27 @@ impl Backend for DistributedFs {
             true,
         )?;
         Ok(())
+    }
+}
+
+impl DistributedFs {
+    fn fsync_with_deadline(&self, handle: FileHandle, mode: SyncMode) -> Result<()> {
+        let snapshot = self.handle_snapshot(handle)?;
+        if let Some(session) = snapshot.write_session.as_ref()
+            && session.remote.is_some()
+        {
+            self.write_coordinator
+                .remote_sync(session, mode)
+                .map(|_| ())
+        } else {
+            self.sync_handle(
+                handle,
+                match mode {
+                    SyncMode::DataOnly => CommitReason::DATA_SYNC,
+                    SyncMode::Full => CommitReason::FULL_SYNC,
+                },
+                CommitWait::AfterOperations,
+            )
+        }
     }
 }

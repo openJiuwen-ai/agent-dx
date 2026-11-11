@@ -118,12 +118,23 @@ impl DistributedFs {
                 drop(ticket);
                 return Err(unavailable("native write admission is closed"));
             }
+            if crate::node::call_deadline::remaining().is_some_and(|time| time.is_zero()) {
+                drop(state);
+                drop(ticket);
+                return Err(Error::coded(
+                    afs_error::IO_TIMEOUT,
+                    "DFS write turn deadline elapsed",
+                ));
+            }
             if state.native_queue.values.front() == Some(&id) {
                 state.native_thread = Some(std::thread::current().id());
                 break;
             }
             state = cell
-                .wait_timeout(state, Duration::from_millis(10))
+                .wait_timeout(
+                    state,
+                    crate::node::call_deadline::bounded(Duration::from_millis(10)),
+                )
                 .map_err(|_| unavailable("native mutation queue is poisoned"))?;
         }
         drop(state);
@@ -160,9 +171,16 @@ impl DistributedFs {
             if !Self::in_flight_blocks_mutation(&state.in_flight) {
                 return Ok(());
             }
+            let remaining = crate::node::call_deadline::bounded(Duration::from_millis(10));
+            if remaining.is_zero() {
+                return Err(Error::coded(
+                    afs_error::IO_TIMEOUT,
+                    "DFS write mutation deadline elapsed",
+                ));
+            }
             if state.commit_busy {
                 drop(
-                    cell.wait_timeout(state, Duration::from_millis(10))
+                    cell.wait_timeout(state, remaining)
                         .map_err(|_| unavailable("DFS inode write state is poisoned"))?,
                 );
             } else {
@@ -199,13 +217,15 @@ impl DistributedFs {
         options: WriteOptions,
     ) -> Result<usize> {
         let mut accepted = 0;
-        let result = self.pipeline_ordinary_write_inner(
-            handle,
-            snapshot,
-            cell,
-            (offset, data, options),
-            &mut accepted,
-        );
+        let result = crate::node::call_deadline::within_timeout(self.write_timeout, || {
+            self.pipeline_ordinary_write_inner(
+                handle,
+                snapshot,
+                cell,
+                (offset, data, options),
+                &mut accepted,
+            )
+        });
         match result {
             Err(error)
                 if accepted > 0
@@ -387,6 +407,7 @@ impl DistributedFs {
         request: ReservationRequest<'_>,
     ) -> Result<Reservation> {
         let turn_id = request.turn_id;
+        let deadline = Instant::now() + crate::node::call_deadline::bounded(self.write_timeout);
         let mut descriptor = None;
         {
             let mut queue = pipeline
@@ -403,6 +424,18 @@ impl DistributedFs {
             if pipeline.closed.load(Ordering::Acquire) {
                 return Err(unavailable("native write admission is closed"));
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.observe_handle_error(handle)?;
+                if request.has_accepted_prefix {
+                    return Ok(Reservation::StopAccepting);
+                }
+                return Err(Error::coded(
+                    afs_error::IO_TIMEOUT,
+                    "DFS write admission deadline elapsed",
+                ));
+            }
+            let retry_after = remaining.min(Duration::from_millis(10));
             let is_front = pipeline
                 .allocation_queue
                 .lock()
@@ -415,11 +448,9 @@ impl DistributedFs {
                     descriptor = self.reserve_descriptor(pipeline, request.operation_id)?;
                     if descriptor.is_none() {
                         self.request_pipeline_pressure(cell, true)?;
-                        self.progress_writeback()?;
+                        crate::node::call_deadline::within(deadline, || self.progress_writeback())?;
                         let epoch = pipeline.budget.snapshot().epoch;
-                        pipeline
-                            .budget
-                            .wait_for_change(epoch, Duration::from_millis(10));
+                        pipeline.budget.wait_for_change(epoch, retry_after);
                         continue;
                     }
                 }
@@ -455,17 +486,13 @@ impl DistributedFs {
                     }
                     DirtyAdmission::Wait { epoch } => {
                         self.request_pipeline_pressure(cell, false)?;
-                        self.progress_writeback()?;
-                        pipeline
-                            .budget
-                            .wait_for_change(epoch, Duration::from_millis(10));
+                        crate::node::call_deadline::within(deadline, || self.progress_writeback())?;
+                        pipeline.budget.wait_for_change(epoch, retry_after);
                     }
                 }
             } else {
                 let epoch = pipeline.budget.snapshot().epoch;
-                pipeline
-                    .budget
-                    .wait_for_change(epoch, Duration::from_millis(10));
+                pipeline.budget.wait_for_change(epoch, retry_after);
             }
             let _ = self.poll_uploads()?;
             self.observe_handle_error(handle)?;
@@ -725,7 +752,11 @@ impl DistributedFs {
         let state = cell
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-        if state.terminal_error.is_some() {
+        if state.terminal_error.is_some()
+            || state
+                .writeback_retry_at
+                .is_some_and(|at| at > Instant::now())
+        {
             return Ok(None);
         }
         for extent in state.dirty_extents.iter_extents() {
@@ -882,6 +913,9 @@ impl DistributedFs {
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
                 Self::record_background_error_locked(&mut state, error.clone());
+                if let Some(metrics) = &pipeline.metrics {
+                    metrics.native_writeback_error();
+                }
                 cell.notify_all();
             }
             let mut state = upload
@@ -1044,6 +1078,12 @@ impl DistributedFs {
                     return Err(error.clone());
                 }
             }
+            if crate::node::call_deadline::remaining().is_some_and(|time| time.is_zero()) {
+                return Err(Error::coded(
+                    afs_error::IO_TIMEOUT,
+                    "DFS upload deadline elapsed",
+                ));
+            }
             self.start_upload(upload)?;
             let state = upload
                 .state
@@ -1053,7 +1093,10 @@ impl DistributedFs {
                 drop(
                     upload
                         .cv
-                        .wait_timeout(state, Duration::from_millis(10))
+                        .wait_timeout(
+                            state,
+                            crate::node::call_deadline::bounded(Duration::from_millis(10)),
+                        )
                         .map_err(|_| unavailable("native upload state is poisoned"))?,
                 );
             }
@@ -1099,6 +1142,9 @@ impl DistributedFs {
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
                 if state.terminal_error.is_none()
+                    && state
+                        .writeback_retry_at
+                        .is_none_or(|at| at <= Instant::now())
                     && (state.native_due || state.last_writer_background_requested)
                 {
                     return Ok(true);
@@ -1124,6 +1170,9 @@ impl DistributedFs {
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
                 state.terminal_error.is_none()
+                    && state
+                        .writeback_retry_at
+                        .is_none_or(|at| at <= Instant::now())
                     && (state.native_due || state.last_writer_background_requested)
             };
             if due {

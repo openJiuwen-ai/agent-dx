@@ -13,7 +13,6 @@ BLOCKED. Cases run up to 25 minutes: use ``--case-timeout 1800``.
 
 import base64
 import io
-import json
 import tarfile
 from pathlib import Path
 
@@ -68,8 +67,10 @@ def run_fault(c, label, phase, *, mode="r2", env=None, tools=(), timeout=900, tm
     try:
         result = c.command("M", ["bash", "-c", harness], env=values, timeout=timeout, check=False)
     finally:
-        c.command("M", ["bash", "-c", 'findmnt -rn -o TARGET | grep -F "$1/" | sort -r | xargs -r -n1 umount; rm -rf "$1"',
-                        "-", root], timeout=120, check=False)
+        c.command(
+            "M", ["bash", "-c", 'findmnt -rn -o TARGET | grep -F "$1/" | sort -r | xargs -r -n1 umount; rm -rf "$1"',
+                  "-", root], timeout=120, check=False,
+        )
     summary = c.command(
         "M",
         ["bash", "-c", 'cd "$1" && for f in *.log; do [ -f "$f" ] && printf "%s %s\\n" "$f" '
@@ -201,4 +202,10 @@ CASES = (
     # R94 recheck: the same reader while node-a's write lease lapses with its writer still open.
     _case("lapsed_lease_reader_under_gc", ("LF26",), scenario(
         "lapsed-lease-reader", "phase-lapsed-lease-reader.sh", env={"COPIES_R2": "1"})),
+    _case("r84_strict_upload_failure", ("LF27",), scenario(
+        "r84-strict", "phase-r84-upload-failure.sh",
+        env={"R84_FAULT": "strict", "META_EXTRA": 'dfs_replica_failure_policy = "strict"'})),
+    _case("r84_local_upload_failure", ("LF28",), scenario(
+        "r84-local", "phase-r84-upload-failure.sh", mode="native",
+        env={"R84_FAULT": "diskfull"})),
 )

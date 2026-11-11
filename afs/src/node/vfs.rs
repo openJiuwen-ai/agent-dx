@@ -409,6 +409,11 @@ pub trait Backend: Send + Sync {
         Err(unsupported("flush"))
     }
 
+    /// Maximum wait for a filesystem durability barrier, if configured.
+    fn fsync_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// 应用显式要求的屏障；DataOnly/Full 分别对应 fdatasync/fsync。
     fn fsync(
         &self,

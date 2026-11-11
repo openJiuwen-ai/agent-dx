@@ -345,6 +345,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_catalog_commit_queue` | 调优 | Node | `256` | catalog 提交排队与执行中的请求数，1..=256 |
 | `dfs_write_queue_bytes` | 调优 | Node | `2147483648` | FUSE 前端写队列跨文件持有的载荷，8 MiB..=1 TiB |
 | `dfs_dirty_budget_bytes` | 调优 | Node | `67108864` | 写流水线活跃正文容量，4..=64 MiB |
+| `dfs_write_timeout_ms` | 调优 | Node | `30000` | DFS 写入准入和 fsync 发布前等待的上限，1..=600000 ms |
 | `dfs_gc_grace_ms` | 调优 | Meta | `1000` | 引用退役后继续保护数据的时长，0..=600000 |
 | `dfs_unpublished_descriptors` | 调优 | Node | `1024` | 已上传未发布的对象数，1..=1024 |
 | `dfs_upload_inflight_chunks` | 调优 | Node | `8` | 上传并发，1..=8；S3 模式下实际被压到 4 |
@@ -788,6 +789,7 @@ fsync依赖原持久副本与Meta屏障。S3 写入与原生共用写流水线�
 | --- | ---: | --- |
 | `dfs_write_queue_bytes` | `2147483648` | 每DFS挂载前台普通写正常正文总额，8MiB..1TiB且须能装入usize；所有文件合计，按需使用；不是Node总内存。自动额外等待空间=min(额度/8,32MiB) |
 | `dfs_dirty_budget_bytes` | `67108864` | 4..64MiB，Node实际live正文capacity，含仍被持有的已上传正文 |
+| `dfs_write_timeout_ms` | `30000` | DFS 写入准入和 fsync 发布前等待的上限，1..=600000 ms |
 | `dfs_unpublished_descriptors` | `1024` | 1..1024，且受固定4MiB元数据总额限制，不能靠增大计数绕过字节上限 |
 | `dfs_upload_inflight_chunks` | `8` | 1..8，整个Node的真实任务上限，共享live正文 |
 | `dfs_background_commit_ms` | `5000` | 1..60000ms，后台发布调度周期，非严格可见时间 |
