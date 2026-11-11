@@ -304,10 +304,14 @@ impl DistributedFs {
                     .references
                     .as_ref()
                     .map(|references| {
-                        references.pin_generation(
+                        // Only start the admission here: this is the FUSE
+                        // write thread. Uploads and the commit of this
+                        // generation wait for it (`GcPin::admitted`).
+                        references.pin_generation_deferred(
                             &snapshot.inode_id,
                             target.base.as_ref(),
                             &operation_id,
+                            &pipeline.runtime,
                         )
                     })
                     .transpose()?
@@ -833,12 +837,19 @@ impl DistributedFs {
         }
         let notify = pipeline.notify.clone();
         let finished = Arc::downgrade(upload);
+        let gc_pin = upload._gc_pin.clone();
         state.task = Some(crate::node::bridge::spawn_blocking_on(
             &pipeline.runtime,
             move || {
                 let _permit = permit;
-                let result = store
-                    .put_chunks(vec![staged], PutIntent::PipelineUpload)
+                // GC safety: no chunk of a write generation may become
+                // visible to GC (local catalog, replicas, object store)
+                // before Meta has admitted its `write:` reference. This is a
+                // blocking-pool thread, so waiting here parks no async worker.
+                let result = gc_pin
+                    .as_ref()
+                    .map_or(Ok(()), |pin| pin.admitted().map(|_| ()))
+                    .and_then(|()| store.put_chunks(vec![staged], PutIntent::PipelineUpload))
                     .and_then(|mut receipts| {
                         if receipts.len() != 1 {
                             return Err(invalid("native upload returned the wrong receipt count"));
@@ -912,7 +923,15 @@ impl DistributedFs {
                 let mut state = cell
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                Self::record_background_error_locked(&mut state, error.clone());
+                if crate::node::gc::is_permanent_admission_failure(error) {
+                    // Meta will never admit this generation's reference, so no
+                    // upload of it can ever be persisted: reject its writes
+                    // like a definite commit rejection (delivered from the
+                    // terminal state, not as a retryable background error).
+                    state.terminal_error = Some(error.clone());
+                } else {
+                    Self::record_background_error_locked(&mut state, error.clone());
+                }
                 if let Some(metrics) = &pipeline.metrics {
                     metrics.native_writeback_error();
                 }
@@ -930,6 +949,11 @@ impl DistributedFs {
             state.joining = false;
             if let Some(error) = &failure {
                 state.error = Some(error.clone());
+                if crate::node::gc::is_permanent_admission_failure(error) {
+                    // Never retried: a later attempt could only fail the same
+                    // way, and would report it to whoever writes next.
+                    state.terminal_error = Some(error.clone());
+                }
                 metadata.failed += 1;
             } else {
                 let Some(Ok(receipt)) = result.take() else {
