@@ -12,7 +12,7 @@ use super::{
 use crate::ingress::accounts::{self, BusinessAuth, Principal};
 use crate::ingress::{
     agent_service::{AgentV2Access, ServiceAccessError, ServiceSelector},
-    server::{Ingress, ProxyBody},
+    server::{AbortReason, Ingress, ProxyBody, StreamObserver, Transport},
 };
 use adx_agent_api::{managed::ManagedService, request::RequestContext, Error};
 use adx_agent_core::{Protocol, Scope};
@@ -544,15 +544,19 @@ impl DigitalMateGatewayApi {
         )));
         let access = AgentV2Access::new(self.managed.clone());
         let initialization = async {
-            let mut parameters = self.auth.model_parameters(&principal).await?;
-            parameters.extend(
-                self.config
-                    .parameters(&principal.user_id)
-                    .map_err(|_| accounts::Error::Invalid)?,
-            );
-            Ok::<_, accounts::Error>(parameters)
+            let result = async {
+                let mut parameters = self.auth.model_parameters(&principal).await?;
+                parameters.extend(
+                    self.config
+                        .parameters(&principal.user_id)
+                        .map_err(|_| accounts::Error::Invalid)?,
+                );
+                Ok::<_, accounts::Error>(parameters)
+            }
+            .await;
+            result
         };
-        let selection = match access
+        let selection = access
             .select_with_initializer(
                 context.clone(),
                 scope.clone(),
@@ -562,8 +566,8 @@ impl DigitalMateGatewayApi {
                 },
                 initialization,
             )
-            .await
-        {
+            .await;
+        let selection = match selection {
             Ok(value) => value,
             Err(crate::ingress::agent_service::InitializationError::Agent(error)) => {
                 return agent_error(error)
@@ -575,18 +579,32 @@ impl DigitalMateGatewayApi {
         let connection = match Connection::connect(&ingress, &access, selection).await {
             Ok(value) => value,
             Err(ConnectionError::Access(ServiceAccessError::Agent(e))) => return agent_error(e),
-            Err(_) => return error(StatusCode::BAD_GATEWAY, "AGENT_SERVER_UNAVAILABLE"),
+            Err(failure) => {
+                tracing::warn!(error = %failure, "Jiuwen backend connection failed");
+                return error(StatusCode::BAD_GATEWAY, "AGENT_SERVER_UNAVAILABLE");
+            }
         };
         if let Err(e) = self.auth.check(&principal).await {
             return auth_error(e);
         }
         let auth = self.auth.clone();
+        // 全流族：101 升级后外层不再包装响应体（server.rs 对带 UPGRADE 头的
+        // 请求插入观察者克隆），改由升级任务在会话结束时记录恰好一次；不在这里
+        // 取出，`full_stream{route_class=jiuwen,transport=ws}` 恒为零。
+        let stream_observer = request.extensions_mut().remove::<StreamObserver>();
         let upgrade = hyper::upgrade::on(&mut request);
         let config = self.config.clone();
         let span = tracing::info_span!("jiuwen_ws", connection_id = %uuid::Uuid::new_v4());
         let task = async move {
             let Ok(Ok(upgraded)) = tokio::time::timeout_at(context.deadline(), upgrade).await
             else {
+                if let Some(observer) = stream_observer {
+                    observer.record(
+                        Transport::Ws,
+                        adx_core::observation::Outcome::Failure,
+                        Some(AbortReason::ProtocolError),
+                    );
+                }
                 return;
             };
             let socket = WebSocketStream::from_raw_socket(
@@ -599,13 +617,29 @@ impl DigitalMateGatewayApi {
             let driver = config.driver();
             let user_id = principal.user_id.clone();
             let guard = accounts::SessionGuard { auth, principal };
-            let _ = frontend::run_authenticated(
+            let result = frontend::run_authenticated(
                 socket,
                 front,
                 |requests, output| connection.run(user_id, driver, requests, output),
                 guard,
             )
             .await;
+            if let Some(observer) = stream_observer {
+                // 正常断链不等于"完成交换"：与 reverse_proxy 的升级路径同口径，
+                // 正常结束记 unknown，拷贝/协议错误记 failure。
+                match result {
+                    Ok(()) => observer.record(
+                        Transport::Ws,
+                        adx_core::observation::Outcome::Unknown,
+                        None,
+                    ),
+                    Err(_) => observer.record(
+                        Transport::Ws,
+                        adx_core::observation::Outcome::Failure,
+                        Some(AbortReason::ProtocolError),
+                    ),
+                }
+            }
         };
         // `Instrument` carries only the tracing span, not the OTel context.
         // Forward the entry request's context so session logs stay correlated.
@@ -688,7 +722,7 @@ impl DigitalMateGatewayApi {
             principal,
         };
         let upload = Upload {
-            ingress,
+            ingress: ingress.clone(),
             context,
             tenant: scope.tenant,
             environment_id: target.current.environment_id,
@@ -696,10 +730,11 @@ impl DigitalMateGatewayApi {
             user_id,
             agent_type: self.config.jiuwen.agent_type.clone(),
         };
-        tokio::select! {
+        let (response, _upload_ok) = tokio::select! {
             response = upload.respond(request.into_body(), &content_type) => response,
-            _ = guard.watch() => error(StatusCode::UNAUTHORIZED, "SESSION_ENDED"),
-        }
+            _ = guard.watch() => (error(StatusCode::UNAUTHORIZED, "SESSION_ENDED"), false),
+        };
+        response
     }
     async fn download(
         &self,

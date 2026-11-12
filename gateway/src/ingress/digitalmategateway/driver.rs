@@ -190,8 +190,20 @@ where
                     session_id = ?log_field(prepared.envelope["session_id"].as_str()), timed,
                     "Jiuwen request mapped before backend write");
                 // After this point even a failed flush may have delivered the request.
-                tokio::time::timeout(config.write_timeout, backend.send(Message::Text(prepared.envelope.to_string())))
-                    .await.map_err(|_| DriverError::Timeout)??;
+                match tokio::time::timeout(
+                    config.write_timeout,
+                    backend.send(Message::Text(prepared.envelope.to_string())),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        return Err(error.into());
+                    }
+                    Err(_) => {
+                        return Err(DriverError::Timeout);
+                    }
+                }
                 if let Some(ack) = prepared.acknowledgement { emit(&output, ack, config.output_queue_timeout).await?; }
             }
             incoming = backend.next() => {
@@ -199,18 +211,27 @@ where
                     tracing::warn!(?last_response, pending = session.pending_len(), "Jiuwen backend EOF");
                     return Err(DriverError::Disconnected);
                 };
-                let message = message.inspect_err(|_| {
+                let message = match message.inspect_err(|_| {
                     tracing::warn!(?last_response, pending = session.pending_len(), "Jiuwen backend read failed");
-                })?;
+                }) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        return Err(error.into());
+                    }
+                };
                 last_received = Instant::now();
                 match message {
                     Message::Text(raw) => {
-                        if raw.len() > MAX_FRAME_BYTES { return Err(ProtocolError::TooLarge.into()); }
-                        let header: Value = serde_json::from_str(&raw)
-                            .map_err(|error| {
+                        if raw.len() > MAX_FRAME_BYTES {
+                            return Err(ProtocolError::TooLarge.into());
+                        }
+                        let header: Value = match serde_json::from_str(&raw) {
+                            Ok(value) => value,
+                            Err(error) => {
                                 tracing::warn!(json_category = ?error.classify(), line = error.line(), column = error.column(), "Jiuwen backend JSON decode failed");
-                                ProtocolError::Invalid("invalid AgentServer JSON")
-                            })?;
+                                return Err(ProtocolError::Invalid("invalid AgentServer JSON").into());
+                            }
+                        };
                         if header["type"] == "event" && header["event"] == "connection.ack" {
                             if !header["payload"].is_object() {
                                 return Err(ProtocolError::Invalid("invalid AgentServer connection ACK").into());
@@ -222,10 +243,24 @@ where
                             emit(&output, json!({"type":"event","event":"connection.ack","payload":header["payload"]}), config.output_queue_timeout).await?;
                             continue;
                         }
-                        if !ready { return Err(ProtocolError::Invalid("AgentServer connection ACK required").into()); }
-                        let response = Response::parse(raw.as_bytes()).inspect_err(|error| log_response_error("response_parse", &header, error))?;
+                        if !ready {
+                            return Err(ProtocolError::Invalid("AgentServer connection ACK required").into());
+                        }
+                        let response = match Response::parse(raw.as_bytes()) {
+                            Ok(response) => response,
+                            Err(error) => {
+                                log_response_error("response_parse", &header, &error);
+                                return Err(error.into());
+                            }
+                        };
                         last_response = Some((log_field(response.request_id()).unwrap_or("").to_owned(), response.sequence(), response.is_final()));
-                        let frame = session.receive(&response).inspect_err(|error| log_response_error("response_projection", &header, error))?;
+                        let frame = match session.receive(&response) {
+                            Ok(frame) => frame,
+                            Err(error) => {
+                                log_response_error("response_projection", &header, &error);
+                                return Err(error.into());
+                            }
+                        };
                         if !response.is_push() && response.is_final() {
                             if let Some(id) = response.request_id() { deadlines.remove(id); }
                         }
@@ -242,8 +277,15 @@ where
                     }
                     Message::Ping(_) => {
                         // tungstenite already queued the matching pong.
-                        tokio::time::timeout(config.write_timeout, backend.flush())
-                            .await.map_err(|_| DriverError::Timeout)??;
+                        match tokio::time::timeout(config.write_timeout, backend.flush()).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                return Err(error.into());
+                            }
+                            Err(_) => {
+                                return Err(DriverError::Timeout);
+                            }
+                        }
                     }
                     Message::Pong(_) => {},
                     Message::Close(frame) => {
@@ -251,20 +293,31 @@ where
                             pending = session.pending_len(), "Jiuwen backend peer close received");
                         return Err(DriverError::Disconnected);
                     },
-                    _ => return Err(ProtocolError::Invalid("AgentServer requires text frames").into()),
+                    _ => {
+                        return Err(ProtocolError::Invalid("AgentServer requires text frames").into());
+                    }
                 }
             }
             _ = tick.tick() => {
                 let now = Instant::now();
-                if (!ready && now.duration_since(started) >= config.idle_timeout) || now.duration_since(last_received) >= config.idle_timeout { return Err(DriverError::Timeout); }
+                if (!ready && now.duration_since(started) >= config.idle_timeout) || now.duration_since(last_received) >= config.idle_timeout {
+                    return Err(DriverError::Timeout);
+                }
                 let expired: Vec<_> = deadlines.iter().filter(|(_, deadline)| **deadline <= now).map(|(id, _)| id.clone()).collect();
                 for id in expired {
                     deadlines.remove(&id);
                     if let Some(frame) = session.timeout(&id) { emit(&output, frame, config.output_queue_timeout).await?; }
                 }
                 if now.duration_since(last_ping) >= config.ping_interval {
-                    tokio::time::timeout(config.write_timeout, backend.send(Message::Ping(Vec::new())))
-                        .await.map_err(|_| DriverError::Timeout)??;
+                    match tokio::time::timeout(config.write_timeout, backend.send(Message::Ping(Vec::new()))).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            return Err(error.into());
+                        }
+                        Err(_) => {
+                            return Err(DriverError::Timeout);
+                        }
+                    }
                     last_ping = now;
                 }
             }
