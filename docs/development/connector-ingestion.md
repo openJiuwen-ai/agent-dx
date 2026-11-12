@@ -62,3 +62,16 @@ cargo test -p data-plane-gateway --features agent-api,mock-e2e --lib ingestion::
 Windows 全 Gateway 的 Unix 依赖限制仍存在，本批改用 WSL 完整真实 Gateway target 验证，不把直接源文件模块 runner 当成完整 target 证据。部署、真实账户与业务 pipeline 验收未执行。其余说明见 [Composio Gmail 指南](composio-gmail-trusted.md)。签名依据为 [Composio receiving events](https://docs.composio.dev/docs/setting-up-triggers/subscribing-to-events)。
 
 生产者精确端口、字段和冷启动顺序见 [待实现的后台用途契约](ingestion-delivery-contract.md)。
+
+### 固定版本验证回执（2026-11-12）
+
+代码冻结点 ADX `3f3c46e19d5b28ac459cccb28e1ae92ed9f5b76c`、DigitalMate `638deccf46b6b0de18ece5f799c34eab042ac1c4`：
+
+- 真实 Gateway lib target 摄取普通用例 16 passed，显式 PostgreSQL/跨仓库进程用例 2 passed；前后 Rust、schema、Python 产品/fixture SHA 一致。
+- `cargo clippy -p data-plane-gateway --all-targets --all-features -- -D warnings` 和 `cargo clippy --workspace --all-targets --all-features -- -D warnings` 通过，后者 10m27s。不是此前独立 module runner 的结果。
+- `git -c core.autocrlf=false archive` 导出的同一提交，995 个 Rust/Cargo/rustfmt 文件与 Git blob 逐个一致，`cargo fmt --all -- --check` 通过。Windows 工作树/默认 archive 的 CRLF 诊断原样保留；没有修改全局配置或其他源文件。
+- 原 26 条 Composio 受控 HTTP 回归首次在该真实 Gateway binary 运行出现 24 passed/2 failed。保留原失败后，同 binary 做三轮配对：继承本机 proxy 环境时分别 23/26、22/26、21/26；仅测试子进程令 loopback 绕过代理时连续三轮 26/26。未改源码、生产 Client、目标限制或断言，不能把环境纠正描述为产品逻辑修复，也不把受控 upstream 称为真实 Composio 账户。
+- 受控本机 HTTP 测试应仅在该命令进程设置 `NO_PROXY=127.0.0.1,localhost`（并对齐小写 `no_proxy`），避免用户的全局代理改写 loopback 流量；不修改部署代理策略。
+- UTF-8 文档检查 195 篇/1364 链接/68 JSON 示例、diff 检查通过。GitHub 原生 CI、正式用途/订阅/启动装配和集群部署仍为独立门槛，未因本回执成为已完成项。
+
+此证据段为文档增量，运行时输入与上述代码冻结提交一致。完整命令、前后哈希、初始失败和六轮对照日志保存在本任务的私有验证归档，不包含真实凭证/邮件。
