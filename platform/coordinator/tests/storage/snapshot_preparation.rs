@@ -654,6 +654,7 @@ async fn template_usage_counts_atomic_first_success_across_replay_rebuild_and_re
     paused.runtime.ip = None;
     paused.revision += 1;
     paused.checkpoint = Some(adx_core::RestorePoint {
+        recovery_profile: Default::default(),
         id: "pause".into(),
         origin: None,
         expires_at_unix_seconds: None,

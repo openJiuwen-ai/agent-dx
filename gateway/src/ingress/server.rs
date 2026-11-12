@@ -688,30 +688,39 @@ impl Ingress {
         }
         let session_id = Uuid::new_v4();
         let (cancel, cancelled) = watch::channel(false);
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| io::Error::other("active session lock poisoned"))?;
+            // Hold the session lock across the snapshot and registration: a later
+            // revocation must not be consumed before this session becomes visible.
+            let revision = self
+                .resolver
+                .current_route_revision(&route)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, IngressOpenError::RouteChanged)
+                })?;
+            sessions.insert(
+                session_id,
+                ActiveSession {
+                    instance_id: route.target.instance_id.clone(),
+                    workload_id: route.target.workload_id.clone(),
+                    relay_address: route.relay_address.clone(),
+                    target_ip: route.target.target_ip,
+                    revision,
+                    route: route.clone(),
+                    cancel,
+                },
+            );
+            self.active_sessions.fetch_add(1, Ordering::Relaxed);
+        }
         let guard = SessionGuard {
             session_id,
             active_sessions: self.active_sessions.clone(),
             sessions: self.sessions.clone(),
         };
-        self.active_sessions.fetch_add(1, Ordering::Relaxed);
-        self.sessions.lock().unwrap().insert(
-            session_id,
-            ActiveSession {
-                instance_id: route.target.instance_id.clone(),
-                workload_id: route.target.workload_id.clone(),
-                relay_address: route.relay_address.clone(),
-                target_ip: route.target.target_ip,
-                route: route.clone(),
-                cancel,
-            },
-        );
-        if !self.resolver.route_is_current(&route) {
-            drop(guard);
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                IngressOpenError::RouteChanged,
-            ));
-        }
+
         let stream = self
             .connector
             .connect_stream_with_activity(
@@ -778,10 +787,13 @@ impl Ingress {
 
     fn apply_route_change(&self, change: super::route_store::RouteChange) {
         {
-            let mut sessions = self.sessions.lock().unwrap();
+            let sessions = self.sessions.lock().unwrap();
             for session in sessions
-                .values_mut()
-                .filter(|session| session.instance_id == change.instance_id)
+                .values()
+                // Queued events predating admission cannot revoke a newer session.
+                .filter(|session| {
+                    session.instance_id == change.instance_id && session.revision < change.revision
+                })
             {
                 let still_current = change.current.as_ref().is_some_and(|route| {
                     route.environment_status.code == 3
@@ -796,7 +808,8 @@ impl Ingress {
                 }
             }
         }
-        self.http_pool.invalidate_instance(&change.instance_id);
+        self.http_pool
+            .invalidate_instance(&change.instance_id, change.revision);
     }
 
     fn cancel_all_sessions(&self) {
@@ -2152,39 +2165,95 @@ impl Ingress {
         if let Err(error) = self.authorize(&route, &tenant_id) {
             return Ok(error_response(error));
         }
-        let route = match self.prepare_route(route, &tenant_id).await {
+        let mut route = match self.prepare_route(route, &tenant_id).await {
             Ok(route) => route,
             Err(error) => {
                 record_ingress_error(&error);
                 return Err((error_response(error), request));
             }
         };
-        if !self.resolver.route_is_current(&route) {
-            return Err((error_response(IngressOpenError::RouteChanged), request));
-        }
         strip_hop_by_hop_headers(request.headers_mut());
-        let key = BackendHttpPoolKey {
-            relay_address: route.relay_address.clone(),
-            instance_id: route.target.instance_id.clone(),
-            workload_id: route.target.workload_id.clone(),
-            target_ip: route.target.target_ip,
-            target_port: route.target.target_port,
-        };
-        match self
-            .http_pool
-            .send_recoverable(key, request, || self.open_authorized_stream(route))
-            .await
-        {
-            Ok(mut response) => {
-                response.headers_mut().remove("x-adx-error-code");
-                strip_hop_by_hop_headers(response.headers_mut());
-                Ok(response.map(|body| {
-                    body.map_err(|error| -> BoxError { Box::new(error) })
-                        .boxed_unsync()
-                }))
+        let mut retried = false;
+        loop {
+            let Some(route_revision) = self.resolver.current_route_revision(&route) else {
+                return Err((error_response(IngressOpenError::RouteChanged), request));
+            };
+            let key = BackendHttpPoolKey {
+                route_revision,
+                relay_address: route.relay_address.clone(),
+                instance_id: route.target.instance_id.clone(),
+                workload_id: route.target.workload_id.clone(),
+                target_ip: route.target.target_ip,
+                target_port: route.target.target_port,
+            };
+            match self
+                .http_pool
+                .send_recoverable(
+                    key,
+                    request,
+                    || self.open_authorized_stream(route.clone()),
+                    || {
+                        if !self.ready()
+                            || self.resolver.current_route_revision(&route) != Some(route_revision)
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotConnected,
+                                IngressOpenError::RouteChanged,
+                            ));
+                        }
+                        Ok(())
+                    },
+                )
+                .await
+            {
+                Ok(mut response) => {
+                    response.headers_mut().remove("x-adx-error-code");
+                    strip_hop_by_hop_headers(response.headers_mut());
+                    return Ok(response.map(|body| {
+                        body.map_err(|error| -> BoxError { Box::new(error) })
+                            .boxed_unsync()
+                    }));
+                }
+                Err((error, Some(unconsumed))) => {
+                    let route_changed = matches!(&error, BackendHttpPoolError::Closed)
+                        || matches!(&error, BackendHttpPoolError::Connect(error)
+                            if matches!(error.get_ref().and_then(|e| e.downcast_ref::<IngressOpenError>()),
+                                Some(IngressOpenError::RouteChanged)));
+                    if retried || !self.ready() || !route_changed {
+                        return Err((backend_pool_error_response(error), unconsumed));
+                    }
+                    // Only an untouched request can follow the current route. Keep
+                    // its authorization scope and deadline, and retry at most once.
+                    retried = true;
+                    let mut replacement = match self
+                        .resolve_route(
+                            &route.target.instance_id,
+                            route.target.target_port,
+                            route.access_kind,
+                            route.target.request_id.clone(),
+                        )
+                        .await
+                    {
+                        Ok(route) => route,
+                        Err(error) => return Err((error_response(error), unconsumed)),
+                    };
+                    if replacement.tenant_id != route.tenant_id
+                        || replacement.tunnel_security_mode != route.tunnel_security_mode
+                        || replacement.port_forward_auth_mode != route.port_forward_auth_mode
+                        || replacement.private_service_ports != route.private_service_ports
+                        || replacement.e2b != route.e2b
+                    {
+                        return Err((error_response(IngressOpenError::Forbidden), unconsumed));
+                    }
+                    replacement.processing = route.processing.clone();
+                    route = match self.prepare_route(replacement, &tenant_id).await {
+                        Ok(route) => route,
+                        Err(error) => return Err((error_response(error), unconsumed)),
+                    };
+                    request = unconsumed;
+                }
+                Err((error, None)) => return Ok(backend_pool_error_response(error)),
             }
-            Err((error, Some(request))) => Err((backend_pool_error_response(error), request)),
-            Err((error, None)) => Ok(backend_pool_error_response(error)),
         }
     }
 
@@ -2261,7 +2330,11 @@ impl Ingress {
             return proxy_http(request, stream, "envd-or-application", Some(cancelled)).await;
         }
         strip_hop_by_hop_headers(request.headers_mut());
+        let Some(route_revision) = self.resolver.current_route_revision(&route) else {
+            return error_response(IngressOpenError::RouteChanged);
+        };
         let key = BackendHttpPoolKey {
+            route_revision,
             relay_address: route.relay_address.clone(),
             instance_id: route.target.instance_id.clone(),
             workload_id: route.target.workload_id.clone(),
@@ -2270,7 +2343,22 @@ impl Ingress {
         };
         match self
             .http_pool
-            .send_recoverable(key, request, || self.open_service_http_stream(route))
+            .send_recoverable(
+                key,
+                request,
+                || self.open_service_http_stream(route.clone()),
+                || {
+                    if !self.ready()
+                        || self.resolver.current_route_revision(&route) != Some(route_revision)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            IngressOpenError::RouteChanged,
+                        ));
+                    }
+                    Ok(())
+                },
+            )
             .await
         {
             Ok(mut response) => {
@@ -2690,10 +2778,8 @@ fn backend_pool_error_response(error: BackendHttpPoolError) -> Response<ProxyBod
             StatusCode::TOO_MANY_REQUESTS,
             "environment HTTP pool is saturated",
         ),
-        BackendHttpPoolError::Closed => plain(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "environment HTTP pool is closed",
-        ),
+        // Closed is returned only before send_request, so retry is unambiguous.
+        BackendHttpPoolError::Closed => error_response(IngressOpenError::RouteChanged),
         BackendHttpPoolError::Connect(error) => error_response(IngressOpenError::Connect(error)),
         BackendHttpPoolError::Handshake(error) | BackendHttpPoolError::Request(error) => {
             plain(StatusCode::BAD_GATEWAY, &error.to_string())
@@ -2899,6 +2985,7 @@ pub enum IngressOpenError {
 }
 
 struct ActiveSession {
+    revision: u64,
     instance_id: String,
     workload_id: String,
     relay_address: String,

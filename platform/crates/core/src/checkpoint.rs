@@ -65,6 +65,9 @@ impl CheckpointCleanup {
 pub struct RestorePoint {
     #[serde(default)]
     pub origin: Option<crate::runtime::RuntimeIdentity>,
+    /// Measured capture-time host, runtime and rootfs identity for cross-node recovery.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub recovery_profile: std::collections::BTreeMap<String, String>,
     pub id: String,
     pub artifact: CheckpointArtifact,
     /// None retains the restore point until explicit deletion or replacement.

@@ -234,16 +234,22 @@ impl IngressRouteResolver {
     }
 
     pub fn route_is_current(&self, handle: &RouteHandle) -> bool {
-        self.store
-            .get(&handle.target.instance_id)
-            .is_some_and(|route| {
-                is_connectable(&route.environment_status)
-                    && route.relay_address == handle.relay_address
-                    && route.environment_id == handle.target.workload_id
-                    && route.environment_ip.parse().ok() == Some(handle.target.target_ip)
-                    && route.e2b == handle.e2b
-                    && route.private_service_ports == handle.private_service_ports
-            })
+        self.current_route_revision(handle).is_some()
+    }
+
+    pub(super) fn current_route_revision(&self, handle: &RouteHandle) -> Option<u64> {
+        let (route, revision) = self.store.get_with_revision(&handle.target.instance_id)?;
+        (is_connectable(&route.environment_status)
+            && route.tenant_id == handle.tenant_id
+            && route.tunnel_security_mode == handle.tunnel_security_mode
+            && route.port_forward_auth_mode(handle.target.target_port)
+                == handle.port_forward_auth_mode
+            && route.relay_address == handle.relay_address
+            && route.environment_id == handle.target.workload_id
+            && route.environment_ip.parse().ok() == Some(handle.target.target_ip)
+            && route.e2b == handle.e2b
+            && route.private_service_ports == handle.private_service_ports)
+            .then_some(revision)
     }
 
     /// Wait for a replacement after Relay rejects an obsolete execution.

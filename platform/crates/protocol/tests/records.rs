@@ -130,6 +130,10 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
             size_bytes: 0,
         }],
         snapshot_source: Some(adx_core::RestorePoint {
+            recovery_profile: std::collections::BTreeMap::from([(
+                "ADX_RECOVERY_HOST".into(),
+                "captured-host".into(),
+            )]),
             id: "saved".into(),
             artifact: adx_core::CheckpointArtifact {
                 scope: "capture-scope".into(),
@@ -247,6 +251,7 @@ fn capture_reservation_is_not_a_restorable_checkpoint() {
     let restored = control::CheckpointCleanup::try_from(cleanup).unwrap();
     assert_eq!(restored.artifacts, vec![artifact.clone()]);
     let point = control::RestorePoint {
+        recovery_profile: Default::default(),
         id: "capture".into(),
         artifact: Some(artifact),
         source_runtime_id: "environment-1".into(),

@@ -533,6 +533,7 @@ impl From<adx_core::RestorePoint> for control::RestorePoint {
             expires_at_unix_seconds: v.expires_at_unix_seconds,
             origin: v.origin.map(Into::into),
             source_runtime_id: v.source_runtime_id,
+            recovery_profile: v.recovery_profile.into_iter().collect(),
             artifact: Some(control::CheckpointArtifact {
                 storage: v.artifact.storage,
                 scope: v.artifact.scope,
@@ -562,6 +563,7 @@ impl TryFrom<control::RestorePoint> for adx_core::RestorePoint {
             expires_at_unix_seconds: v.expires_at_unix_seconds,
             origin: v.origin.map(TryInto::try_into).transpose()?,
             source_runtime_id: v.source_runtime_id,
+            recovery_profile: v.recovery_profile.into_iter().collect(),
             artifact: adx_core::CheckpointArtifact {
                 storage: a.storage,
                 scope: a.scope,

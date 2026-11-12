@@ -17,6 +17,7 @@ struct Manifest {
 
 pub struct FilesystemCheckpointStore {
     alias: String,
+    scope: String,
     root: PathBuf,
     mount_guard: Option<MountGuard>,
 }
@@ -69,8 +70,10 @@ impl FilesystemCheckpointStore {
         if std::fs::read_to_string(identity).map_err(io_error)? != alias {
             return Err(Error::Invalid("filesystem store identity mismatch".into()));
         }
+        let scope = namespace_scope(&root)?;
         Ok(Self {
             alias,
+            scope,
             root,
             mount_guard,
         })
@@ -79,11 +82,19 @@ impl FilesystemCheckpointStore {
         if let Some(guard) = &self.mount_guard {
             guard.verify()?;
         }
+        if read_namespace_scope(&self.root)? != self.scope {
+            return Err(Error::Invalid(
+                "filesystem namespace identity changed".into(),
+            ));
+        }
         Ok(())
     }
     fn artifact_path(&self, artifact: &CheckpointArtifact) -> Result<PathBuf> {
         self.ready()?;
-        if artifact.storage != self.alias || uuid::Uuid::parse_str(&artifact.location).is_err() {
+        if artifact.storage != self.alias
+            || (!artifact.scope.is_empty() && artifact.scope != self.scope)
+            || uuid::Uuid::parse_str(&artifact.location).is_err()
+        {
             return Err(Error::Invalid(
                 "artifact does not belong to filesystem store".into(),
             ));
@@ -131,6 +142,52 @@ impl FilesystemCheckpointStore {
         .map_err(io_error)?
     }
 }
+
+fn read_namespace_scope(root: &Path) -> Result<String> {
+    let identity = root.join("store-scope");
+    if !std::fs::symlink_metadata(&identity)
+        .map_err(io_error)?
+        .is_file()
+    {
+        return Err(Error::Invalid(
+            "filesystem scope must be a regular file".into(),
+        ));
+    }
+    let value = std::fs::read_to_string(identity).map_err(io_error)?;
+    let id = uuid::Uuid::parse_str(&value).map_err(io_error)?;
+    Ok(format!("fs:{id}"))
+}
+
+fn namespace_scope(root: &Path) -> Result<String> {
+    let identity = root.join("store-scope");
+    if !identity.try_exists().map_err(io_error)? {
+        use std::io::Write;
+        let id = uuid::Uuid::new_v4().to_string();
+        let staged = root.join(format!(".store-scope-{id}"));
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged)
+                .map_err(io_error)?;
+            file.write_all(id.as_bytes()).map_err(io_error)?;
+            file.sync_all().map_err(io_error)?;
+            // Publish complete bytes without replacing a concurrent opener's identity.
+            match std::fs::hard_link(&staged, &identity) {
+                Ok(()) => std::fs::File::open(root)
+                    .map_err(io_error)?
+                    .sync_all()
+                    .map_err(io_error),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(error) => Err(io_error(error)),
+            }
+        })();
+        let cleanup = std::fs::remove_file(staged).map_err(io_error);
+        result?;
+        cleanup?;
+    }
+    read_namespace_scope(root)
+}
 pub(crate) fn sync_inventory(
     root: &Path,
     files: &mut Vec<(PathBuf, u64)>,
@@ -161,6 +218,9 @@ impl CheckpointAccess for FilesystemCheckpointStore {
     fn storage_alias(&self) -> &str {
         &self.alias
     }
+    fn shared_scope(&self) -> Option<&str> {
+        Some(&self.scope)
+    }
     fn validate_policy(&self, policy: adx_core::lifecycle::CheckpointStorage) -> Result<()> {
         self.ready()?;
         if policy == adx_core::lifecycle::CheckpointStorage::Local {
@@ -173,7 +233,7 @@ impl CheckpointAccess for FilesystemCheckpointStore {
     fn capture_references(&self, staged: &Path) -> Result<Vec<CheckpointArtifact>> {
         Ok(vec![CheckpointArtifact {
             storage: self.alias.clone(),
-            scope: String::new(),
+            scope: self.scope.clone(),
             location: self.staged_id(staged)?,
             size_bytes: 0,
         }])
@@ -211,6 +271,7 @@ impl CheckpointAccess for FilesystemCheckpointStore {
         let staged = staged.to_owned();
         let root = self.root.clone();
         let alias = self.alias.clone();
+        let scope = self.scope.clone();
         tokio::task::spawn_blocking(move || {
             let size = scan(&staged)?;
             if size == 0 {
@@ -246,7 +307,7 @@ impl CheckpointAccess for FilesystemCheckpointStore {
             }
             Ok(CheckpointArtifact {
                 storage: alias,
-                scope: String::new(),
+                scope,
                 location: id,
                 size_bytes: size,
             })
@@ -327,6 +388,32 @@ impl CheckpointAccess for FilesystemCheckpointStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn shared_scope_binds_captures_to_the_physical_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let open = |path: &Path| {
+            FilesystemCheckpointStore::open(
+                "shared".into(),
+                path.into(),
+                "checkpoints".into(),
+                false,
+            )
+            .unwrap()
+        };
+        let first = open(root.path());
+        let reopened = open(root.path());
+        let distinct = open(other.path());
+        assert!(first.shared_scope().is_some());
+        assert_eq!(first.shared_scope(), reopened.shared_scope());
+        assert_ne!(first.shared_scope(), distinct.shared_scope());
+        let path = first.begin_capture().await.unwrap();
+        std::fs::write(path.join("memory"), b"memory").unwrap();
+        let mut artifact = first.seal(&path).await.unwrap();
+        assert_eq!(artifact.scope, first.shared_scope().unwrap());
+        artifact.scope = distinct.shared_scope().unwrap().into();
+        assert!(first.prepare_restore(&artifact).await.is_err());
+    }
     #[test]
     fn shared_filesystem_configuration_is_independent_of_mounted_implementation() {
         let config = serde_json::json!({"kind":"distributed_fs", "alias":"shared-checkpoints",

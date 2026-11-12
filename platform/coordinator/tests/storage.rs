@@ -25,6 +25,8 @@ mod publication_catalog;
 mod publication_regressions;
 #[path = "storage/receipt_expiry.rs"]
 mod receipt_expiry;
+#[path = "support/recovery_profile.rs"]
+mod recovery_profile;
 #[path = "storage/snapshot_preparation.rs"]
 mod snapshot_preparation;
 #[path = "storage/transport_recovery.rs"]
@@ -352,6 +354,7 @@ async fn invalidated_failed_collection_retains_an_expired_checkpoint_for_owner_c
         .unwrap();
     let mut record = running(spec("invalid-gc-checkpoint"), assignment);
     record.checkpoint = Some(RestorePoint {
+        recovery_profile: Default::default(),
         origin: None,
         id: "expired-checkpoint".into(),
         source_runtime_id: record.runtime.id.clone(),
@@ -593,6 +596,7 @@ async fn deleted_checkpoint_cleanup_survives_catalog_retirement_and_redis_crash(
         .unwrap();
     let mut record = running(spec("cleanup-crash"), assignment);
     record.checkpoint = Some(adx_core::RestorePoint {
+        recovery_profile: Default::default(),
         origin: None,
         id: "checkpoint".into(),
         artifact: adx_core::CheckpointArtifact {
@@ -1130,6 +1134,7 @@ async fn pause_resume_persists_recovery_point_fences_old_results_and_restores_ca
     paused.resources_held = false;
     paused.runtime.ip = None;
     paused.checkpoint = Some(RestorePoint {
+        recovery_profile: Default::default(),
         origin: None,
         id: "pause".into(),
         source_runtime_id: initial.runtime.id.clone(),
@@ -1223,6 +1228,7 @@ async fn sqlite_replays_pause_and_resume_after_redis_and_node_sink_restart() {
     paused.resources_held = false;
     paused.runtime.ip = None;
     paused.checkpoint = Some(RestorePoint {
+        recovery_profile: Default::default(),
         origin: None,
         id: "cp".into(),
         source_runtime_id: initial.runtime.id.clone(),
@@ -1466,7 +1472,24 @@ async fn recovery_assignment_is_durable_and_old_generation_cannot_publish() {
         )
         .await
         .unwrap();
-    register(&session, "target").await;
+    let mut definition = spec("held");
+    let profile = recovery_profile::qualify(&mut definition);
+    let mut target = node("target");
+    target.labels = profile.clone();
+    target.labels.extend([
+        ("ADX_CHECKPOINT_STORAGE".into(), "shared".into()),
+        ("ADX_CHECKPOINT_SCOPE".into(), "test-scope".into()),
+    ]);
+    session
+        .register_session_with_scopes(
+            target,
+            "target:1".into(),
+            "target:2".into(),
+            None,
+            ["test-scope".into()].into(),
+        )
+        .await
+        .unwrap();
     let previous = Assignment {
         environment_id: "held".into(),
         node_id: "source".into(),
@@ -1475,18 +1498,19 @@ async fn recovery_assignment_is_durable_and_old_generation_cannot_publish() {
         devices: vec![],
     };
     session
-        .reserve(spec("held"), previous.clone())
+        .reserve(definition.clone(), previous.clone())
         .await
         .unwrap();
-    let mut r = running(spec("held"), previous.clone());
+    let mut r = running(definition, previous.clone());
     r.checkpoint = Some(adx_core::RestorePoint {
+        recovery_profile: profile,
         id: "pause".into(),
         origin: None,
         expires_at_unix_seconds: None,
         source_runtime_id: "held-1".into(),
         artifact: adx_core::CheckpointArtifact {
             storage: "shared".into(),
-            scope: String::new(),
+            scope: "test-scope".into(),
             location: "artifact".into(),
             size_bytes: 8,
         },
@@ -1582,6 +1606,7 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
         let mut r = running(spec("held"), previous.clone());
         if kind != "missing" {
             r.checkpoint = Some(adx_core::RestorePoint {
+                recovery_profile: Default::default(),
                 id: "pause".into(),
                 origin: None,
                 expires_at_unix_seconds: Some(if kind == "expired" { 1 } else { u64::MAX }),

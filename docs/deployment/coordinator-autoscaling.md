@@ -14,6 +14,9 @@ RPC retains its configured transport security.
 
 [OpenAPI contract](../../platform/api/openapi/autoscaling.yaml)
 
+The same isolated listener supports [node-upgrade management](../../platform/api/http/node-upgrades.md).
+Scheduling pause remains separate from execution fencing and strict empty evidence.
+
 ## Requests
 
 | Method | Path | Purpose |

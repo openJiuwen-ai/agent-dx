@@ -20,6 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={}", proto.join(file).display());
     }
     tonic_build::configure()
+        .type_attribute(".adx.control.v1.NodeUpgradeControl", "#[derive(serde::Serialize, serde::Deserialize, Eq)] #[serde(deny_unknown_fields)]")
+        .type_attribute(".adx.control.v1.NodeUpgradeGrant", "#[derive(serde::Serialize, serde::Deserialize, Eq)] #[serde(deny_unknown_fields)]")
         // Optional workload metadata must not inflate every nested RPC future.
         .boxed(".adx.control.v1.ExecutionOptions.readiness_probe")
         .boxed(".adx.control.v1.ExecutionOptions.healthcheck_probe")

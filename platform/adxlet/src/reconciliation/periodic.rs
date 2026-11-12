@@ -381,8 +381,18 @@ impl Adxlet {
         if controller::unstarted(record) {
             return Ok(None);
         }
-        self.adopt_local(&record.spec, &record.assignment)?;
+        if terminal_without_execution(record) {
+            self.services.upgrade.record_cleanup()?;
+        } else {
+            self.services.upgrade.record_action(
+                &record.spec.id,
+                record.assignment.generation,
+                "adopt",
+            )?;
+        }
         if record.resources_held {
+            // An unheld record leaves the tentative reservation with its claim.
+            self.adopt_local(&record.spec, &record.assignment)?;
             let mut admission = self
                 .services
                 .admission

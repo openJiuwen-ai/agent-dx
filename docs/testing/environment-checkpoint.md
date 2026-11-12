@@ -27,6 +27,8 @@
 
 `CheckpointAccess::seal` 是存储完成边界。对象存储在此完成上传，通过 `prepare_restore` 下载；本地/S3、缓存引用和跨节点恢复已实现，见 [存储契约](snapshot-storage.md) 与 [跨节点恢复](firecracker-cross-node.md)。
 
+跨节点 Resume/Recover 与升级迁移共用选址和兼容性准入，要求捕获时保存的 host、runtime、rootfs 证据及实际共享存储 scope；缺失或不匹配时不转移所有权。当前实测配置仅开放默认 rootfs 的同构 Linux runsc，见[节点配置](../../build/config/examples/README.md)。旧恢复点可继续本地恢复，跨节点前需重新捕获；其他运行时的历史验证不代表满足当前准入。
+
 local-only 成功表示后端已生成完整、可在本机读取的制品，并已提交恢复点元数据。adxlet 不主动对本地制品及目录执行 `fsync`；未完成的磁盘写回由操作系统和执行后端处理，不保证突然断电或宿主机崩溃后的制品完整性。该规则同样用于 workload checkpoint、本地回滚恢复点和可复用快照副本；对象存储仍等待完整上传。恢复及重启对账保留本地制品的路径、类型和长度校验，校验失败的恢复点不能用于恢复。
 
 ## 配置与部署

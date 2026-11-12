@@ -20,11 +20,15 @@ mod recovery;
 pub use observability::{
     BusinessCounters, CreationResult, CreationSummary, InterruptionSummary, RecoveryState,
 };
+pub(crate) use recovery::{checkpoint_requirements, recovery_profile_requirements};
+pub use recovery::{LegacyCheckpointProof, LegacyCheckpointProofs};
 #[cfg(test)]
 mod checkpoint_contention_tests;
 mod resume;
+pub(crate) use resume::ResumeAdmission;
 mod snapshot_preparation;
 mod snapshots;
+mod upgrade;
 mod volumes;
 use crate::Node;
 use adx_core::{
@@ -45,12 +49,14 @@ use tokio::{
     sync::{broadcast, Mutex},
     time::timeout,
 };
+pub use upgrade::{UpgradeNode, UpgradeOperation, UpgradeTask};
 pub(crate) use volumes::has_volumes;
 pub use volumes::{
     AuthorizedExecution, Initialization, InitializationAction, InitializationOwner, StoredVolume,
 };
 
 const HEADER: &str = "header";
+const UPGRADE: &str = "node-upgrade";
 const CAS: &str = r#"
 local old = redis.call('HGET', KEYS[1], 'header')
 if ARGV[1] == '' then
@@ -146,6 +152,13 @@ pub struct NodeRetirement {
     pub unregistered: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradePause {
+    pub task_id: String,
+    pub epoch: u64,
+    pub original_paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredNode {
     #[serde(default)]
     pub retirement: Option<NodeRetirement>,
@@ -158,7 +171,7 @@ pub struct StoredNode {
     pub proxy_address: String,
     #[serde(default)]
     pub session: Option<NodeSession>,
-    /// Administrative admission override. Heartbeats cannot clear it.
+    /// Effective administrator or task-owned pause. Heartbeats cannot clear it.
     #[serde(default)]
     pub scheduling_paused: bool,
     /// Shared checkpoint backends declared by the current authenticated session.
@@ -168,11 +181,26 @@ pub struct StoredNode {
     /// before a node can perform checkpoint collection again.
     #[serde(default)]
     pub checkpoint_gc_fenced: bool,
+    /// A task-owned pause retains the administrator's latest independent intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_pause: Option<UpgradePause>,
+}
+
+fn original_pause(record: &StoredNode, task_id: &str, epoch: u64) -> Result<bool> {
+    match &record.upgrade_pause {
+        Some(owner) if owner.task_id == task_id && owner.epoch == epoch => {
+            Ok(owner.original_paused)
+        }
+        Some(_) => Err(Error::Conflict),
+        None => Ok(record.scheduling_paused),
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recovery {
     pub source: Assignment,
     pub pending: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped_source: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeIntent {
@@ -772,6 +800,16 @@ impl RedisStore {
         field: Option<(&str, Option<&str>, String)>,
         counters: Option<&CounterUpdate>,
     ) -> Result<bool> {
+        Box::pin(self.object_cas_checked(header, field, counters, &[])).await
+    }
+
+    async fn object_cas_checked(
+        &self,
+        header: &Header,
+        field: Option<(&str, Option<&str>, String)>,
+        counters: Option<&CounterUpdate>,
+        checks: &[(String, Option<String>)],
+    ) -> Result<bool> {
         let (name, old, next) = field.ok_or(Error::Conflict)?;
         let values = Self::publication_values([(name, Some(next.as_str()))])?;
         let references = if name.starts_with("environment:") {
@@ -783,9 +821,16 @@ impl RedisStore {
         } else {
             vec![]
         };
-        // Artifact-scoped exclusion protects GC and cleanup admission. The
-        // object bytes, business facts and Coordinator epoch are compared in
-        // Redis; unrelated checkpoint references do not mutate the header.
+        // Upgrade barriers and node control still share the header CAS. Artifact
+        // references use scoped exclusion so unrelated attachments can publish
+        // independently under the same Coordinator epoch.
+        let guarded_header = if checks.iter().any(|(key, _)| key == HEADER) {
+            let mut next = header.clone();
+            next.advance()?;
+            Some((encode(header)?, encode(&next)?))
+        } else {
+            None
+        };
         let _access = self.lock_artifacts(&references)?;
         let membership = if name.starts_with("environment:") {
             let environment: StoredEnvironment = decode(&next)?;
@@ -822,15 +867,24 @@ impl RedisStore {
             if not old and string.sub(ARGV[2],1,5) == 'node:' and redis.call('HEXISTS',KEYS[1],'retired-node:' .. string.sub(ARGV[2],6)) ~= 0 then return 0 end
             local facts = cjson.decode(ARGV[7])
             if facts[1] ~= '' and (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
+            if ARGV[8] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[8] then return 0 end
+            local checks = cjson.decode(ARGV[10])
+            for field,value in pairs(checks) do
+                if (redis.call('HGET',KEYS[1],field) or '') ~= value then return 0 end
+            end
             redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
+            if ARGV[8] ~= '' then redis.call('HSET',KEYS[1],'header',ARGV[9]) end
             if facts[1] ~= '' then redis.call('HSET',KEYS[3],facts[1],facts[3]) end
             if ARGV[5] ~= '' then redis.call('HSET',KEYS[1],'node-session:' .. string.sub(ARGV[2],6),ARGV[5]) end
             if ARGV[6] ~= '' then redis.call('HINCRBY',KEYS[1],ARGV[6],1) end
-            for i=8,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
+            for i=11,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
             return 1
         "#).arg(3).arg(&self.key).arg(format!("{}:artifacts", self.key)).arg(format!("{}:business", self.key))
             .arg(header.epoch.to_string()).arg(name).arg(old.unwrap_or("")).arg(next).arg(node_session).arg(membership)
-            .arg(counters.map(CounterUpdate::argument).transpose()?.unwrap_or_else(|| r#"["","",""]"#.into()));
+            .arg(counters.map(CounterUpdate::argument).transpose()?.unwrap_or_else(|| r#"["","",""]"#.into()))
+            .arg(guarded_header.as_ref().map(|pair| pair.0.as_str()).unwrap_or(""))
+            .arg(guarded_header.as_ref().map(|pair| pair.1.as_str()).unwrap_or(""))
+            .arg(encode(&checks.iter().map(|(key, value)| (key, value.as_deref().unwrap_or(""))).collect::<BTreeMap<_, _>>())?);
         for artifact in references.into_iter().filter(|a| a.storage != "local") {
             cmd.arg(artifacts::artifact_key(&artifact))
                 .arg(encode(&artifact)?);
@@ -1023,6 +1077,7 @@ impl RedisStore {
                     generations: Arc::new(AtomicU64::new(
                         h.epoch.checked_mul(1_u64 << 32).ok_or(Error::Conflict)?,
                     )),
+                    legacy_checkpoint_proofs: Default::default(),
                 };
                 // Object CAS does not advance the shared header. An old writer
                 // can therefore commit after the pre-fence scan but before the
@@ -1123,6 +1178,8 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
             out.nodes.insert(id.into(), decode(value)?);
         } else if let Some(id) = key.strip_prefix("environment:") {
             out.environments.insert(id.into(), decode(value)?);
+        } else if key == UPGRADE {
+            decode::<UpgradeTask>(value)?.validate()?;
         } else if key != HEADER
             && key != "epoch"
             && key != "claim-fence"
@@ -1150,6 +1207,7 @@ pub struct Session {
     epoch: u64,
     inspection: Arc<inspection::InspectionCache>,
     generations: Arc<AtomicU64>,
+    legacy_checkpoint_proofs: LegacyCheckpointProofs,
 }
 impl Session {
     pub(crate) fn committed_changes(&self) -> broadcast::Receiver<ControlChange> {
@@ -1362,6 +1420,7 @@ impl Session {
         {
             return;
         }
+        node.upgrade_pause = current.upgrade_pause.clone();
         node.scheduling_paused = current.scheduling_paused;
         node.node.available &= !node.scheduling_paused;
         if **current == node {
@@ -1540,6 +1599,7 @@ impl Session {
                     scheduling_paused: previous.scheduling_paused,
                     checkpoint_scopes: checkpoint_scopes.clone(),
                     checkpoint_gc_fenced,
+                    upgrade_pause: previous.upgrade_pause.clone(),
                 };
                 self.observe_node(record.clone());
                 return Ok(record);
@@ -1552,19 +1612,24 @@ impl Session {
                 &node.id,
                 session.as_ref().map_or("", |s| s.id.as_str()),
             );
-            let [header_value, node_value, retired_value, departed] = self
+            let [header_value, node_value, retired_value, departed, upgrade_value] = self
                 .store
                 .fields([
                     HEADER.into(),
                     field.clone(),
                     retired_field.clone(),
                     departed_field,
+                    UPGRADE.into(),
                 ])
                 .await?;
             if departed.is_some() {
                 return Err(Error::Conflict);
             }
             let header = self.header(&header_value)?;
+            let upgrade = upgrade_value
+                .as_deref()
+                .map(decode::<UpgradeTask>)
+                .transpose()?;
             if node_value.is_none() {
                 if let Some(raw) = retired_value.as_deref() {
                     let record = self
@@ -1625,6 +1690,7 @@ impl Session {
                         scheduling_paused: previous.scheduling_paused,
                         checkpoint_scopes: checkpoint_scopes.clone(),
                         checkpoint_gc_fenced,
+                        upgrade_pause: previous.upgrade_pause.clone(),
                     };
                     self.observe_node(record.clone());
                     return Ok(record);
@@ -1649,6 +1715,30 @@ impl Session {
                     .expect("nonempty shards");
                 (shard, false, false)
             };
+            let mut upgrade_pause = previous.as_ref().and_then(|old| old.upgrade_pause.clone());
+            if let Some(task) = upgrade.as_ref().filter(|task| task.active()) {
+                if upgrade_pause
+                    .as_ref()
+                    .is_some_and(|owner| owner.task_id != task.task_id || owner.epoch != task.epoch)
+                {
+                    return Err(Error::Conflict);
+                }
+                if previous.as_ref().is_none_or(|old| {
+                    old.session.as_ref().map(|s| &s.id) != session.as_ref().map(|s| &s.id)
+                }) {
+                    let original_paused = previous
+                        .as_ref()
+                        .map(|old| original_pause(old, &task.task_id, task.epoch))
+                        .transpose()?
+                        .unwrap_or(false);
+                    upgrade_pause = Some(UpgradePause {
+                        task_id: task.task_id.clone(),
+                        epoch: task.epoch,
+                        original_paused,
+                    });
+                }
+            }
+            let scheduling_paused = scheduling_paused || upgrade_pause.is_some();
             if scheduling_paused {
                 node.available = false;
             }
@@ -1676,6 +1766,7 @@ impl Session {
                 scheduling_paused,
                 checkpoint_scopes: checkpoint_scopes.clone(),
                 checkpoint_gc_fenced,
+                upgrade_pause,
             };
             let encoded = encode(&record)?;
             if node_value.as_ref() == Some(&encoded) {
@@ -1715,23 +1806,26 @@ impl Session {
             let expected = header_value.as_deref().ok_or(Error::Conflict)?;
             let applied = match catalog {
                 Some(catalog) => {
-                    self.control_volume_cas(
-                        expected,
-                        &catalog.advanced_header()?,
+                    Box::pin(self.control_volume_cas_checked(
+                        (expected, &catalog.advanced_header()?),
                         &fields,
                         &catalog,
                         None,
-                    )
+                        &[(UPGRADE.into(), upgrade_value.clone())],
+                    ))
                     .await?
                 }
                 None => {
-                    self.store
-                        .object_cas(
-                            expected,
-                            &header,
-                            Some((&field, node_value.as_deref(), encoded)),
-                        )
-                        .await?
+                    Box::pin(self.store.object_cas_checked(
+                        &header,
+                        Some((&field, node_value.as_deref(), encoded)),
+                        None,
+                        &[
+                            (UPGRADE.into(), upgrade_value.clone()),
+                            (HEADER.into(), header_value.clone()),
+                        ],
+                    ))
+                    .await?
                 }
             };
             if applied {
@@ -1750,32 +1844,118 @@ impl Session {
         paused: bool,
         available: bool,
     ) -> Result<StoredNode> {
+        self.update_node_scheduling(id, paused, available, None)
+            .await
+    }
+
+    /// Read administrator intent before task isolation, fenced by task and epoch.
+    pub async fn upgrade_original_paused(
+        &self,
+        task_id: &str,
+        epoch: u64,
+        id: &str,
+    ) -> Result<bool> {
+        let [header, node, upgrade] = self
+            .store
+            .fields([HEADER.into(), format!("node:{id}"), UPGRADE.into()])
+            .await?;
+        self.header(&header)?;
+        let task: UpgradeTask = decode(upgrade.as_deref().ok_or(Error::Conflict)?)?;
+        // Observation remains available for a legacy journal; mutation requires v2.
+        if task.task_id != task_id || task.epoch != epoch || !task.active() {
+            return Err(Error::Conflict);
+        }
+        let node: StoredNode = decode(node.as_deref().ok_or(Error::NotFound)?)?;
+        original_pause(&node, task_id, epoch)
+    }
+
+    /// Add/remove only this task's pause. Restore uses the latest administrator
+    /// intent, including after a lost restore response or concurrent manual pause.
+    pub async fn set_upgrade_node_scheduling(
+        &self,
+        task_id: &str,
+        epoch: u64,
+        id: &str,
+        closed: bool,
+    ) -> Result<StoredNode> {
+        self.update_node_scheduling(id, closed, !closed, Some((task_id, epoch)))
+            .await
+    }
+
+    async fn update_node_scheduling(
+        &self,
+        id: &str,
+        paused: bool,
+        available: bool,
+        owner: Option<(&str, u64)>,
+    ) -> Result<StoredNode> {
         if id.trim().is_empty() {
             return Err(Error::Invalid("node id required".into()));
         }
         let field = format!("node:{id}");
         for _ in 0..ATTEMPTS {
-            let [header_value, node_value] =
-                self.store.fields([HEADER.into(), field.clone()]).await?;
+            let [header_value, node_value, upgrade_value] = self
+                .store
+                .fields([HEADER.into(), field.clone(), UPGRADE.into()])
+                .await?;
             let header = self.header(&header_value)?;
+            let upgrade = upgrade_value
+                .as_deref()
+                .map(decode::<UpgradeTask>)
+                .transpose()?;
             node_value.as_deref().ok_or(Error::NotFound)?;
+            // Heartbeat liveness/capacity may be newer than the durable node record.
+            // Keep that overlay while fencing the write against its durable bytes.
             let mut record = self.get_node(id).await?;
-            let available = available && !paused;
-            if record.scheduling_paused == paused && record.node.available == available {
+            if owner.is_none()
+                && !paused
+                && upgrade.as_ref().is_some_and(|task| {
+                    task.active()
+                        && task.nodes.get(id).is_some_and(|node| {
+                            !matches!(
+                                node.phase.as_str(),
+                                "pending" | "verified" | "RestoredOriginal"
+                            )
+                        })
+                })
+            {
+                return Err(Error::Conflict);
+            }
+            let previous = record.clone();
+            if let Some((task_id, epoch)) = owner {
+                let task = upgrade.as_ref().ok_or(Error::Conflict)?;
+                task.fence(task_id, epoch)?;
+                let original_paused = original_pause(&record, task_id, epoch)?;
+                record.upgrade_pause = paused.then(|| UpgradePause {
+                    task_id: task_id.into(),
+                    epoch,
+                    original_paused,
+                });
+                record.scheduling_paused = paused || original_paused;
+                record.node.available = !record.scheduling_paused;
+            } else if let Some(marker) = &mut record.upgrade_pause {
+                let task = upgrade.as_ref().ok_or(Error::Conflict)?;
+                task.fence(&marker.task_id, marker.epoch)?;
+                marker.original_paused = paused;
+                record.scheduling_paused = true;
+                record.node.available = false;
+            } else {
+                record.scheduling_paused = paused;
+                record.node.available = available && !paused;
+            }
+            if record == previous {
                 return Ok(record);
             }
-            record.scheduling_paused = paused;
-            record.node.available = available;
-            if self
-                .store
-                .object_cas(
-                    header_value
-                        .as_deref()
-                        .expect("validated control header is present"),
-                    &header,
-                    Some((&field, node_value.as_deref(), encode(&record)?)),
-                )
-                .await?
+            if Box::pin(self.store.object_cas_checked(
+                &header,
+                Some((&field, node_value.as_deref(), encode(&record)?)),
+                None,
+                &[
+                    (UPGRADE.into(), upgrade_value.clone()),
+                    (HEADER.into(), header_value.clone()),
+                ],
+            ))
+            .await?
             {
                 return Ok(record);
             }
@@ -1832,12 +2012,13 @@ impl Session {
         }
         let field = format!("environment:{}", record.spec.id);
         for _ in 0..ATTEMPTS {
-            let [header_value, environment_value, node_value] = self
+            let [header_value, environment_value, node_value, upgrade_value] = self
                 .store
                 .fields([
                     HEADER.into(),
                     field.clone(),
                     format!("node:{}", record.assignment.node_id),
+                    UPGRADE.into(),
                 ])
                 .await?;
             let header = self.header(&header_value)?;
@@ -1864,9 +2045,21 @@ impl Session {
                 None
             };
 
-            if self
-                .assignment_cas(&header, None, &record, catalog.as_ref(), None)
-                .await?
+            if Box::pin(self.assignment_cas_checked(
+                &header,
+                None,
+                &record,
+                catalog.as_ref(),
+                None,
+                &[
+                    (UPGRADE.into(), upgrade_value.clone()),
+                    (
+                        format!("node:{}", record.assignment.node_id),
+                        node_value.clone(),
+                    ),
+                ],
+            ))
+            .await?
             {
                 return Ok(record);
             }
@@ -1889,12 +2082,13 @@ impl Session {
         }
         let field = format!("environment:{}", previous.environment_id);
         for _ in 0..ATTEMPTS {
-            let [header_value, environment_value, node_value] = self
+            let [header_value, environment_value, node_value, upgrade_value] = self
                 .store
                 .fields([
                     HEADER.into(),
                     field.clone(),
                     format!("node:{}", replacement.node_id),
+                    UPGRADE.into(),
                 ])
                 .await?;
             let header = self.header(&header_value)?;
@@ -1936,15 +2130,21 @@ impl Session {
                 catalog.reserve(&stored_environment, &node)?;
             }
 
-            if self
-                .assignment_cas(
-                    &header,
-                    environment_value.as_deref(),
-                    &stored_environment,
-                    catalog.as_ref(),
-                    None,
-                )
-                .await?
+            if Box::pin(self.assignment_cas_checked(
+                &header,
+                environment_value.as_deref(),
+                &stored_environment,
+                catalog.as_ref(),
+                None,
+                &[
+                    (UPGRADE.into(), upgrade_value.clone()),
+                    (
+                        format!("node:{}", stored_environment.assignment.node_id),
+                        node_value.clone(),
+                    ),
+                ],
+            ))
+            .await?
             {
                 return Ok(stored_environment);
             }

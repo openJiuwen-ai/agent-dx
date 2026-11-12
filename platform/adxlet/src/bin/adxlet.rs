@@ -76,6 +76,8 @@ struct Config {
     #[serde(default)]
     runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     #[serde(default)]
+    checkpoint_runtime_binaries: BTreeMap<String, PathBuf>,
+    #[serde(default)]
     local_rootfs_templates: BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
     #[serde(default)]
     execd_command: Vec<String>,
@@ -283,6 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<adx_core::Result<HashMap<_, _>>>()?;
     let runtime_config = RuntimeConfig {
         runtime_profile: config.runtime_profile,
+        checkpoint_runtime_binaries: config.checkpoint_runtime_binaries,
         local_rootfs_templates: config.local_rootfs_templates,
         command: config.execd_command,
         env,
@@ -337,6 +340,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_sink,
     )
     .with_runtime_control(control.clone())?
+    .with_upgrade_control(
+        config.proxy_socket.with_file_name("upgrade-control.json"),
+        session_id.clone(),
+    )?
     .with_operation_timeout(timeout)?
     .with_health_check(config.execd_health_failure_threshold)?;
     let checkpoint_storage = match (config.checkpoint_dir, config.checkpoint_storage) {
@@ -346,20 +353,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("configure only one of checkpoint_dir and checkpoint_storage".into())
         }
     };
-    let checkpoint_scopes = checkpoint_storage
-        .as_ref()
-        .and_then(adxlet::checkpoint::StorageConfig::shared_scope)
-        .into_iter()
-        .collect();
+    let mut checkpoint_scopes = Vec::new();
     if let Some(storage) = checkpoint_storage {
+        let storage = storage.build_for_node(config.node_id.clone(), session_id.clone())?;
+        checkpoint_scopes.extend(storage.shared_scope().map(str::to_owned));
         manager = manager
-            .with_checkpointing(
-                storage.build_for_node(config.node_id.clone(), session_id.clone())?,
-                Arc::new(control.clone()),
-            )?
+            .with_checkpointing(storage, Arc::new(control.clone()))?
             .with_snapshot_catalog(sink.clone())?;
     }
     let manager = Arc::new(manager);
+    if std::env::var("ADX_NODE_UPGRADE_ISOLATED").as_deref() == Ok("true") {
+        manager.isolate_upgrade_bootstrap()?;
+    }
     manager.pause_lifecycle().await;
     let (o, valid) = loop {
         match sample(&source, &runtime, timeout).await {
@@ -388,6 +393,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut labels = config.labels;
+    labels.retain(|key, _| !key.starts_with("ADX_RECOVERY_") && key != "ADX_CHECKPOINT_SCOPE");
+    labels.extend(runtime.recovery_labels());
+    if let Some(scope) = checkpoint_scopes.first() {
+        labels.insert("ADX_CHECKPOINT_SCOPE".into(), scope.clone());
+    }
     labels.extend(local_rootfs_labels);
     if let Some(alias) = manager.checkpoint_storage_alias() {
         labels.insert("ADX_CHECKPOINT_STORAGE".into(), alias.into());
@@ -447,7 +457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
         loop {
-            interval.tick().await;
+            manager.wait_for_reconciliation(&mut interval).await;
             if let Some(discovery) = &discovery {
                 match discovery.lookup().await {
                     Ok(found) if found.address != endpoint => {
