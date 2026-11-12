@@ -484,23 +484,6 @@ async fn maintenance_transfer_requires_stopped_owner_and_exact_sessions() {
             shard_id: 0,
             devices: vec![],
         };
-        for (source, target) in [("stale", "target-session"), ("source-session", "stale")] {
-            assert!(session
-                .reserve_migration(
-                    &record.assignment,
-                    replacement.clone(),
-                    1,
-                    resume,
-                    source,
-                    target
-                )
-                .await
-                .is_err());
-            assert_eq!(
-                session.get("sleep").await.unwrap().assignment,
-                record.assignment
-            );
-        }
         let mut active = record.clone();
         active.state = EnvironmentState::Running;
         active.resources_held = true;
@@ -520,7 +503,9 @@ async fn maintenance_transfer_requires_stopped_owner_and_exact_sessions() {
                 environment_id: record.spec.id.clone(),
                 source_node_id: "source".into(),
                 target_node_id: "target".into(),
+                automatic_target: false,
                 source_generation: record.assignment.generation,
+                source_stopped_revision: None,
                 source_revision: active.revision,
                 source_session_id: "source-session".into(),
                 target_session_id: "target-session".into(),
@@ -528,7 +513,7 @@ async fn maintenance_transfer_requires_stopped_owner_and_exact_sessions() {
                 phase: "Prepared".into(),
             },
         );
-        session.save_upgrade(task, None).await.unwrap();
+        let mut task = session.save_upgrade(task, None).await.unwrap();
         assert!(session
             .reserve_migration(
                 &record.assignment,
@@ -545,7 +530,50 @@ async fn maintenance_transfer_requires_stopped_owner_and_exact_sessions() {
         stopped.resources_held = false;
         stopped.runtime.ip = None;
         stopped.revision += 1;
+        let stopped_revision = stopped.revision;
         session.commit(stopped).await.unwrap();
+        for evidence in [None, Some(stopped_revision - 1)] {
+            let revision = task.revision;
+            task.operations
+                .get_mut("move")
+                .unwrap()
+                .source_stopped_revision = evidence;
+            task = session.save_upgrade(task, Some(revision)).await.unwrap();
+            assert!(session
+                .reserve_migration(
+                    &record.assignment,
+                    replacement.clone(),
+                    1,
+                    resume,
+                    "source-session",
+                    "target-session",
+                )
+                .await
+                .is_err());
+        }
+        let revision = task.revision;
+        task.operations
+            .get_mut("move")
+            .unwrap()
+            .source_stopped_revision = Some(stopped_revision);
+        session.save_upgrade(task, Some(revision)).await.unwrap();
+        for (source, target) in [("stale", "target-session"), ("source-session", "stale")] {
+            assert!(session
+                .reserve_migration(
+                    &record.assignment,
+                    replacement.clone(),
+                    1,
+                    resume,
+                    source,
+                    target,
+                )
+                .await
+                .is_err());
+            assert_eq!(
+                session.get("sleep").await.unwrap().assignment,
+                record.assignment
+            );
+        }
         let moved = session
             .reserve_migration(
                 &record.assignment,
@@ -558,7 +586,9 @@ async fn maintenance_transfer_requires_stopped_owner_and_exact_sessions() {
             .await
             .unwrap();
         assert_eq!(moved.assignment, replacement);
-        assert_eq!(moved.recovery.unwrap().pending, resume);
+        let recovery = moved.recovery.unwrap();
+        assert!(recovery.stopped_source);
+        assert_eq!(recovery.pending, resume);
         let paused = moved.result.unwrap();
         assert_eq!(paused.state, EnvironmentState::Paused);
         assert!(!paused.resources_held);

@@ -1998,6 +1998,29 @@ async fn transferred_checkpoint_rechecks_capture_profile_before_backend_restore(
 }
 
 #[tokio::test]
+async fn transferred_snapshot_source_recovers_with_verified_checkpoint_evidence() {
+    let (_temp, backend, target, mut transferred, _) = shared_recovery_fixture().await;
+    let point = transferred.checkpoint.take().unwrap();
+    transferred.spec.id = "clone".into();
+    transferred.assignment.environment_id = "clone".into();
+    transferred.runtime.id = format!("clone-{}", transferred.assignment.generation);
+    transferred.spec.snapshot_id = Some(point.id.clone());
+    transferred.snapshot_source = Some(point);
+    let result = target.recover_environment(transferred).await.unwrap();
+    assert_eq!(result.record.state, EnvironmentState::Running);
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "restore")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() {
     let (_temp, backend, node, spec, mut assignment) = fixture();
     assignment.generation = 2;

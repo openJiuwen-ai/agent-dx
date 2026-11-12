@@ -4,6 +4,10 @@ mod common;
 mod mounts;
 #[path = "support/recovery_profile.rs"]
 mod recovery_profile;
+#[path = "on_demand/retarget.rs"]
+mod retarget;
+#[path = "on_demand/source_session.rs"]
+mod source_session;
 #[path = "on_demand/stream_continuity.rs"]
 mod stream_continuity;
 use adx_checkpoint_storage::ObjectCheckpointStore;
@@ -78,6 +82,8 @@ struct Backend {
     running: Mutex<BTreeMap<String, adxlet::RuntimeObservation>>,
     restored: AtomicUsize,
     inventory_hold_ms: AtomicUsize,
+    checkpoint_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    checkpoint_entered: tokio::sync::Notify,
     restore_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     restore_entered: tokio::sync::Notify,
     fail_after_gate: AtomicBool,
@@ -130,6 +136,11 @@ impl RuntimeDriver for Backend {
         Ok(())
     }
     async fn checkpoint(&self, _: &str, path: &Path, _: Duration) -> Result<()> {
+        let gate = self.checkpoint_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            self.checkpoint_entered.notify_one();
+            gate.notified().await;
+        }
         std::fs::write(path.join("memory"), b"continued-state:42").unwrap();
         Ok(())
     }
@@ -544,14 +555,33 @@ async fn post_upgrade(
     path: &str,
     body: serde_json::Value,
 ) -> serde_json::Value {
+    upgrade_request(address, "POST", path, body.to_string()).await
+}
+
+async fn upgrade_request(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: String,
+) -> serde_json::Value {
+    let (status, body) = upgrade_response(address, method, path, body).await;
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+async fn upgrade_response(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: String,
+) -> (u16, serde_json::Value) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let body = body.to_string();
     let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
     socket
         .write_all(
             format!(
-                "POST /v1/node-upgrades/{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                "{method} /v1/node-upgrades/{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
@@ -565,8 +595,10 @@ async fn post_upgrade(
         .unwrap();
     let response = String::from_utf8(bytes).unwrap();
     let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-    assert_eq!(headers.split_whitespace().nth(1), Some("200"), "{response}");
-    serde_json::from_str(body).unwrap()
+    (
+        headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        serde_json::from_str(body).unwrap(),
+    )
 }
 
 const MIGRATE_PATH: &str = "tasks/planned-migration/migrate";
@@ -664,6 +696,17 @@ async fn planned_migration_wakes_both_nodes_before_the_next_periodic_reconciliat
     })
     .await
     .expect("both ownership handoffs must be triggered before the first periodic tick");
+
+    let (task, node) = timeout(Duration::from_millis(750), async {
+        tokio::join!(
+            upgrade_request(address, "GET", "tasks/planned-migration", String::new()),
+            upgrade_request(address, "GET", "nodes/a/inspect", String::new())
+        )
+    })
+    .await
+    .expect("read requests must finish while migration is still in progress");
+    assert_eq!(task["operations"]["migrate"]["phase"], "Assigned");
+    assert_eq!(node["node_id"], "a");
 
     report(&mut rig.target, &rig.address, period).await.unwrap();
     assert!(

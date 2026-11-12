@@ -21,8 +21,12 @@ pub struct UpgradeOperation {
     pub environment_id: String,
     pub source_node_id: String,
     pub target_node_id: String,
+    #[serde(default)]
+    pub automatic_target: bool,
     pub source_generation: u64,
     pub source_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_stopped_revision: Option<u64>,
     pub source_session_id: String,
     pub target_session_id: String,
     pub was_running: bool,
@@ -31,6 +35,16 @@ pub struct UpgradeOperation {
 impl UpgradeOperation {
     pub(crate) fn settled(&self) -> bool {
         matches!(self.phase.as_str(), "Completed" | "Cancelled")
+    }
+
+    pub(crate) fn owns_transfer(&self, stored: &StoredEnvironment) -> bool {
+        !stored.invalidated
+            && stored.assignment.node_id == self.target_node_id
+            && stored.assignment.generation > self.source_generation
+            && stored.recovery.as_ref().is_some_and(|recovery| {
+                recovery.source.node_id == self.source_node_id
+                    && recovery.source.generation == self.source_generation
+            })
     }
 }
 

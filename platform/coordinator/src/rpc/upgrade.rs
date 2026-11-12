@@ -281,7 +281,6 @@ impl CoordinatorRpc {
         path: &str,
         body: Value,
     ) -> Result<Value> {
-        let _owner = self.0.upgrade_lock.lock().await;
         // Management dispatch contains several independent gRPC workflows. Keep
         // its future off caller/runtime worker stacks as these paths grow.
         self.upgrade_http_owned(method, path, body).await
@@ -312,7 +311,7 @@ impl CoordinatorRpc {
                     return self.inspect_upgrade(id).await;
                 }
                 if let Some(id) = suffix.strip_prefix("tasks/") {
-                    let mut task = self
+                    let task = self
                         .upgrade_session()
                         .await
                         .upgrade_task()
@@ -321,15 +320,13 @@ impl CoordinatorRpc {
                     if task.task_id != id {
                         return Err(Error::NotFound);
                     }
-                    if task.active() && task.protocol_version == 3 {
-                        self.observe_upgrade_operations(&mut task).await?;
-                    }
                     return serde_json::to_value(task).map_err(|_| Error::Conflict);
                 }
             }
             if method != hyper::Method::POST {
                 return Err(Error::NotFound);
             }
+            let _owner = self.0.upgrade_lock.lock().await;
             if suffix == "tasks" {
                 return self.begin_upgrade(parse(body)?).await;
             }
@@ -428,8 +425,14 @@ impl CoordinatorRpc {
                     }
                     let current = self.upgrade_node(&request.node_id).await?;
                     let observation = self.node_view(&current, "").await?;
-                    let replacement = replacement_binding(&task, &request, &current, &observation)?;
-                    self.bind_node(&mut task, &request, replacement).await?;
+                    if !self
+                        .rebind_restarted_source(&mut task, &request, &current, &observation)
+                        .await?
+                    {
+                        let replacement =
+                            replacement_binding(&task, &request, &current, &observation)?;
+                        self.bind_node(&mut task, &request, replacement).await?;
+                    }
                     self.set_upgrade_scheduling(&task, &request.node_id, true)
                         .await?;
                     if request.delete_intent {
@@ -628,10 +631,6 @@ impl CoordinatorRpc {
                 changed = true;
                 continue;
             }
-            let source_matches = stored.recovery.as_ref().is_some_and(|recovery| {
-                recovery.source.node_id == operation.source_node_id
-                    && recovery.source.generation == operation.source_generation
-            });
             let complete = if operation.was_running {
                 record.state == EnvironmentState::Running
                     && record.resources_held
@@ -639,16 +638,10 @@ impl CoordinatorRpc {
             } else {
                 record.state == EnvironmentState::Paused && !record.resources_held
             };
-            if stored.assignment.node_id == operation.target_node_id
-                && source_matches
-                && complete
+            if complete
+                && operation.owns_transfer(&stored)
                 && self
-                    .await_migration_adoption(
-                        operation,
-                        &stored.assignment,
-                        operation.was_running,
-                        false,
-                    )
+                    .await_migration_adoption(operation, &stored, operation.was_running, false)
                     .await
                     .is_ok()
             {
@@ -691,10 +684,15 @@ impl CoordinatorRpc {
                 return Err(Error::Conflict);
             }
             let snapshot = session.snapshot().await?;
-            let grants = snapshot
+            let grants: Vec<_> = snapshot
                 .environments
                 .values()
-                .filter(|stored| stored.assignment.node_id == *id)
+                .filter(|stored| {
+                    stored.assignment.node_id == *id
+                        && stored.result.as_ref().is_none_or(|record| {
+                            record.state != EnvironmentState::Deleted || record.resources_held
+                        })
+                })
                 .map(|stored| pb::NodeUpgradeGrant {
                     environment_id: stored.spec.id.clone(),
                     assignment_generation: stored.assignment.generation,
@@ -703,7 +701,9 @@ impl CoordinatorRpc {
                 .collect();
             // Close delayed/queued task Pause calls while admitted work settles.
             // Routes remain available for a successful rollback on this source.
-            self.control(task, id, "evacuating", grants).await?;
+            if !grants.is_empty() {
+                self.control(task, id, "evacuating", grants).await?;
+            }
         }
         let pending: Vec<_> = task
             .operations
@@ -713,6 +713,10 @@ impl CoordinatorRpc {
             .collect();
         let mut changed = false;
         for (id, op) in pending {
+            let stored = session.get(&op.environment_id).await?;
+            if op.owns_transfer(&stored) {
+                continue;
+            }
             let node = self.upgrade_node(&op.source_node_id).await?;
             let binding = &task.nodes[&op.source_node_id];
             if binding.node_session_id != op.source_session_id
@@ -723,7 +727,6 @@ impl CoordinatorRpc {
             {
                 return Err(Error::Conflict);
             }
-            let stored = session.get(&op.environment_id).await?;
             let Some(record) = stored.result.as_ref() else {
                 continue;
             };
@@ -884,6 +887,67 @@ impl CoordinatorRpc {
         *task = self.save_task(task.clone()).await?;
         Ok(())
     }
+    async fn rebind_restarted_source(
+        &self,
+        task: &mut UpgradeTask,
+        request: &Action,
+        current: &StoredNode,
+        observation: &pb::NodeUpgradeInspection,
+    ) -> Result<bool> {
+        let Some(previous) = task.nodes.get(&request.node_id) else {
+            return Ok(false);
+        };
+        let session = current.session.as_ref().ok_or(Error::Conflict)?;
+        if request.pod_uid != previous.pod_uid || session.id == previous.node_session_id {
+            return Ok(false);
+        }
+        if previous.pod_uid != previous.original_pod_uid
+            || !matches!(previous.phase.as_str(), "evacuating" | "quiescing")
+            || request.delete_intent
+            || previous.delete_resource_version.is_some()
+            || request.node_session_id != session.id
+            || !session.routable
+            || !current.scheduling_paused
+            || current
+                .upgrade_pause
+                .as_ref()
+                .is_none_or(|owner| owner.task_id != task.task_id || owner.epoch != task.epoch)
+            || observation.node_session_id != session.id
+            || observation.task_id != task.task_id
+            || observation.epoch != task.epoch
+            || observation.revision <= previous.control_revision
+            || observation.phase != "isolated"
+            || observation.unknown
+            || !observation.strict_empty
+            || !observation.grants.is_empty()
+            || task.operations.values().any(|operation| {
+                !operation.settled()
+                    && (operation.source_node_id == request.node_id
+                        || operation.target_node_id == request.node_id)
+            })
+        {
+            return Err(Error::Conflict);
+        }
+        let snapshot = self.upgrade_session().await.snapshot().await?;
+        if snapshot.environments.values().any(|stored| {
+            stored.assignment.node_id == request.node_id
+                && stored.result.as_ref().is_none_or(|record| {
+                    record.state != EnvironmentState::Deleted || record.resources_held
+                })
+        }) {
+            return Err(Error::Conflict);
+        }
+        let entry = task
+            .nodes
+            .get_mut(&request.node_id)
+            .ok_or(Error::Conflict)?;
+        entry.node_session_id.clone_from(&session.id);
+        entry.control_revision = observation.revision;
+        entry.phase = "quiescing".into();
+        entry.permit_id = None;
+        *task = self.save_task(task.clone()).await?;
+        Ok(true)
+    }
     async fn register_upgrade_source(
         &self,
         task: &mut UpgradeTask,
@@ -1039,21 +1103,89 @@ impl CoordinatorRpc {
         matching_rootfs(&source, &target, spec)
     }
 
-    async fn migration_nodes(&self, op: &UpgradeOperation) -> Result<(StoredNode, StoredNode)> {
-        let source = self.upgrade_node(&op.source_node_id).await?;
+    async fn migration_target_node(&self, op: &UpgradeOperation) -> Result<StoredNode> {
         let target = self.upgrade_node(&op.target_node_id).await?;
-        if source
+        if target
             .session
             .as_ref()
-            .is_none_or(|session| session.id != op.source_session_id)
-            || target
-                .session
-                .as_ref()
-                .is_none_or(|session| session.id != op.target_session_id)
+            .is_none_or(|session| session.id != op.target_session_id)
         {
             return Err(Error::Conflict);
         }
-        Ok((source, target))
+        Ok(target)
+    }
+
+    async fn prove_migration_source_stopped(
+        &self,
+        task: &mut UpgradeTask,
+        operation_id: &str,
+        source: &StoredNode,
+        stored: &StoredEnvironment,
+    ) -> Result<()> {
+        let paused = stored.result.as_ref().ok_or(Error::Conflict)?;
+        let view = self.node_view(source, &stored.spec.id).await?;
+        let binding = task
+            .nodes
+            .get(&stored.assignment.node_id)
+            .ok_or(Error::Conflict)?;
+        let stopped = view.environment.is_some_and(|result| {
+            result.durability == pb::Durability::Published as i32
+                && result.record.is_some_and(|record| {
+                    record.state == pb::EnvironmentState::Paused as i32
+                        && !record.resources_held
+                        && record.revision == paused.revision
+                        && record.assignment.as_ref().is_some_and(|assignment| {
+                            assignment.node_id == stored.assignment.node_id
+                                && assignment.generation == stored.assignment.generation
+                        })
+                })
+        });
+        if view.unknown
+            || view.backends != 0
+            || !stopped
+            || view.task_id != task.task_id
+            || view.epoch != task.epoch
+            || view.revision != binding.control_revision
+        {
+            return Err(Error::Unavailable(
+                "source checkpoint or stop evidence is not ready".into(),
+            ));
+        }
+        let operation = task
+            .operations
+            .get_mut(operation_id)
+            .ok_or(Error::Conflict)?;
+        if operation.source_stopped_revision != Some(paused.revision) {
+            operation.source_stopped_revision = Some(paused.revision);
+            *task = self.save_task(task.clone()).await?;
+        }
+        Ok(())
+    }
+
+    async fn migration_handoff_source(
+        &self,
+        op: &UpgradeOperation,
+        stored: &StoredEnvironment,
+    ) -> Result<Option<StoredNode>> {
+        let state = self.0.state.lock().await;
+        state.healthy()?;
+        let source = state.nodes.get(&op.source_node_id).ok_or(Error::NotFound)?;
+        let session = source.session.as_ref().ok_or(Error::Conflict)?;
+        if state.live.get(&op.source_node_id).is_some_and(|live| {
+            !live.expired
+                && live.session == session.id
+                && live.last_seen.elapsed() < self.0.heartbeat_timeout
+        }) {
+            return Ok(Some(source.clone()));
+        }
+        let fenced = session.id != op.source_session_id
+            || (!session.routable && source.retirement.is_some());
+        if fenced && stored.recovery.as_ref().is_some_and(|r| r.stopped_source) {
+            return Ok(None);
+        }
+        Err(Error::Unavailable(
+            "source has no live inspection or durably fenced stop evidence".into(),
+        ))
     }
 
     fn migrate_upgrade(&self, mut task: UpgradeTask, r: Action) -> RpcFuture<'_, Value> {
@@ -1064,6 +1196,13 @@ impl CoordinatorRpc {
             let session = self.upgrade_session().await;
             let mut stored = session.get(&r.environment_id).await?;
             if !task.operations.contains_key(&r.operation_id) {
+                if task.phase != "Active"
+                    || task.operations.values().any(|operation| {
+                        operation.environment_id == r.environment_id && !operation.settled()
+                    })
+                {
+                    return Err(Error::Conflict);
+                }
                 let source_node = self.migration_source_node(&task, &r).await?;
                 if stored.assignment.node_id != r.node_id
                     || stored.invalidated
@@ -1094,7 +1233,11 @@ impl CoordinatorRpc {
                 {
                     return Err(Error::Conflict);
                 }
-                let target = self.migration_target(&stored, &r).await?;
+                let requested_target =
+                    (!r.target_node_id.is_empty()).then_some(r.target_node_id.as_str());
+                let target = self
+                    .migration_target(&stored, requested_target, &r.checkpoint_storage_alias)
+                    .await?;
                 let target_node = self.upgrade_node(&target).await?;
                 self.require_matching_rootfs(&source_node, &target_node, Some(&stored.spec))
                     .await?;
@@ -1103,30 +1246,29 @@ impl CoordinatorRpc {
                     UpgradeOperation {
                         environment_id: r.environment_id.clone(),
                         source_node_id: r.node_id.clone(),
-                        target_node_id: target.clone(),
+                        target_node_id: target,
+                        automatic_target: requested_target.is_none(),
                         source_generation: stored.assignment.generation,
                         source_revision: source.revision,
+                        source_stopped_revision: None,
                         source_session_id: source_node.session.ok_or(Error::Conflict)?.id,
-                        target_session_id: self
-                            .upgrade_node(&target)
-                            .await?
-                            .session
-                            .ok_or(Error::Conflict)?
-                            .id,
+                        target_session_id: target_node.session.ok_or(Error::Conflict)?.id,
                         was_running: source.state == EnvironmentState::Running,
                         phase: "Prepared".into(),
                     },
                 );
                 task = self.save_task(task).await?;
             }
-            let op = task
+            let mut op = task
                 .operations
                 .get(&r.operation_id)
                 .ok_or(Error::Conflict)?
                 .clone();
             if op.environment_id != r.environment_id
                 || op.source_node_id != r.node_id
-                || (!r.target_node_id.is_empty() && r.target_node_id != op.target_node_id)
+                || (!op.automatic_target
+                    && !r.target_node_id.is_empty()
+                    && r.target_node_id != op.target_node_id)
             {
                 return Err(Error::Conflict);
             }
@@ -1136,11 +1278,20 @@ impl CoordinatorRpc {
             if op.phase == "Cancelled" {
                 return Err(Error::Conflict);
             }
-            self.migration_source_node(&task, &r).await?;
-            let (source_node, target_node) = self.migration_nodes(&op).await?;
-            self.require_matching_rootfs(&source_node, &target_node, Some(&stored.spec))
-                .await?;
+            let binding = task.nodes.get(&op.source_node_id).ok_or(Error::Conflict)?;
+            if r.pod_uid != binding.pod_uid || r.node_session_id != op.source_session_id {
+                return Err(Error::Conflict);
+            }
             if stored.assignment.node_id == op.source_node_id {
+                if task.phase != "Active" {
+                    return Err(Error::Conflict);
+                }
+                let source_node = self.migration_source_node(&task, &r).await?;
+                if !op.automatic_target {
+                    let target_node = self.migration_target_node(&op).await?;
+                    self.require_matching_rootfs(&source_node, &target_node, Some(&stored.spec))
+                        .await?;
+                }
                 let source = stored.result.clone().ok_or(Error::Conflict)?;
                 if stored.assignment.generation != op.source_generation {
                     return Err(Error::Conflict);
@@ -1175,55 +1326,94 @@ impl CoordinatorRpc {
                     if record.state != EnvironmentState::Paused || record.resources_held {
                         return Err(Error::Conflict);
                     }
-                    self.commit(record, source_node.session.ok_or(Error::Conflict)?.id)
-                        .await?;
+                    self.commit(record, op.source_session_id.clone()).await?;
                     stored = session.get(&r.environment_id).await?;
                 }
                 let paused = stored.result.as_ref().ok_or(Error::Conflict)?;
                 if paused.state != EnvironmentState::Paused || paused.resources_held {
                     return Err(Error::Conflict);
                 }
-                // Both ordinary recovery and planned migration reserve through
-                // the same scheduler round and durable assignment path.
-                self.migration_nodes(&op).await?;
+                self.prove_migration_source_stopped(
+                    &mut task,
+                    &r.operation_id,
+                    &source_node,
+                    &stored,
+                )
+                .await?;
+                let candidate = if op.automatic_target {
+                    let target = self.migration_target(&stored, None, "").await?;
+                    let node = self.upgrade_node(&target).await?;
+                    self.require_matching_rootfs(&source_node, &node, Some(&stored.spec))
+                        .await?;
+                    Some((target, node.session.ok_or(Error::Conflict)?.id))
+                } else {
+                    self.migration_target_node(&op).await?;
+                    None
+                };
                 let mut state = self.0.state.lock().await;
                 state.recover_authoritative_state().await?;
-                let point = stored
-                    .result
-                    .as_ref()
-                    .and_then(|record| {
-                        record
-                            .checkpoint
-                            .as_ref()
-                            .or(record.snapshot_source.as_ref())
-                    })
-                    .ok_or(Error::Conflict)?;
-                let spec = recovery::checkpoint_spec(
-                    &stored,
-                    Some(point),
-                    None,
-                    &BTreeSet::new(),
-                    Some(&op.target_node_id),
-                )?;
-                if state
-                    .scheduler
-                    .requests
-                    .get(&stored.spec.id)
-                    .is_none_or(|(_, queued)| queued != &spec)
-                {
-                    state.scheduler.retire_claim(&stored.spec.id)?;
-                    state.scheduler.submit_recovery(spec)?;
-                }
-                for _ in 0..state.scheduler.shards.len() {
-                    state.drive().await?;
-                }
+                // The queued old choice may already have won while its replacement
+                // was being checked. Only change the target before ownership moves.
                 stored = session.get(&r.environment_id).await?;
                 if stored.assignment.node_id == op.source_node_id {
-                    return Err(Error::NoCapacity);
+                    if op.phase != "Prepared"
+                        || stored.assignment.generation != op.source_generation
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    if let Some((target, target_session)) = candidate.filter(|(target, session)| {
+                        target != &op.target_node_id || session != &op.target_session_id
+                    }) {
+                        let operation = task
+                            .operations
+                            .get_mut(&r.operation_id)
+                            .ok_or(Error::Conflict)?;
+                        operation.target_node_id = target;
+                        operation.target_session_id = target_session;
+                        op = operation.clone();
+                        task = session
+                            .save_upgrade(task.clone(), Some(task.revision))
+                            .await?;
+                    }
+                    let point = stored
+                        .result
+                        .as_ref()
+                        .and_then(|record| {
+                            record
+                                .checkpoint
+                                .as_ref()
+                                .or(record.snapshot_source.as_ref())
+                        })
+                        .ok_or(Error::Conflict)?;
+                    let spec = recovery::checkpoint_spec(
+                        &stored,
+                        Some(point),
+                        None,
+                        &BTreeSet::new(),
+                        Some(&op.target_node_id),
+                    )?;
+                    if state
+                        .scheduler
+                        .requests
+                        .get(&stored.spec.id)
+                        .is_none_or(|(_, queued)| queued != &spec)
+                    {
+                        state.scheduler.retire_claim(&stored.spec.id)?;
+                        state.scheduler.submit_recovery(spec)?;
+                    }
+                    for _ in 0..state.scheduler.shards.len() {
+                        state.drive().await?;
+                    }
+                    stored = session.get(&r.environment_id).await?;
+                    if stored.assignment.node_id == op.source_node_id {
+                        return Err(Error::NoCapacity);
+                    }
                 }
-                if stored.assignment.node_id != op.target_node_id {
-                    return Err(Error::Conflict);
-                }
+            }
+            if !op.owns_transfer(&stored) {
+                return Err(Error::Conflict);
+            }
+            if op.phase == "Prepared" {
                 task.operations
                     .get_mut(&r.operation_id)
                     .ok_or(Error::Conflict)?
@@ -1232,18 +1422,15 @@ impl CoordinatorRpc {
                     .save_upgrade(task.clone(), Some(task.revision))
                     .await?;
             }
-            if stored.assignment.node_id != op.target_node_id {
-                return Err(Error::Conflict);
-            }
             if op.was_running
                 && stored
                     .result
                     .as_ref()
                     .is_some_and(|record| record.state == EnvironmentState::Paused)
             {
-                self.await_migration_adoption(&op, &stored.assignment, false, true)
+                self.await_migration_adoption(&op, &stored, false, true)
                     .await?;
-                let (_, node) = self.migration_nodes(&op).await?;
+                let node = self.migration_target_node(&op).await?;
                 self.node_view(&node, "").await?;
                 self.recover_record(
                     node,
@@ -1258,10 +1445,10 @@ impl CoordinatorRpc {
                 .await?;
                 stored = session.get(&r.environment_id).await?;
             }
-            if stored.invalidated || stored.assignment.node_id != op.target_node_id {
+            if !op.owns_transfer(&stored) {
                 return Err(Error::Conflict);
             }
-            self.await_migration_adoption(&op, &stored.assignment, op.was_running, !op.was_running)
+            self.await_migration_adoption(&op, &stored, op.was_running, !op.was_running)
                 .await?;
             let result = stored.result.as_ref().ok_or(Error::Conflict)?;
             if (op.was_running
@@ -1288,42 +1475,44 @@ impl CoordinatorRpc {
     async fn await_migration_adoption(
         &self,
         op: &UpgradeOperation,
-        assignment: &adx_core::Assignment,
+        stored: &StoredEnvironment,
         running: bool,
         mut wake_nodes: bool,
     ) -> Result<()> {
+        let assignment = &stored.assignment;
         let started = tokio::time::Instant::now();
         let deadline = started + self.0.timeout;
         let mut source_retired_ms = None;
         let mut target_adopted_ms = None;
         loop {
-            let source = self.upgrade_node(&op.source_node_id).await?;
-            let target = self.upgrade_node(&op.target_node_id).await?;
-            if source
-                .session
-                .as_ref()
-                .is_none_or(|s| s.id != op.source_session_id)
-                || target
-                    .session
-                    .as_ref()
-                    .is_none_or(|s| s.id != op.target_session_id)
-            {
-                return Err(Error::Conflict);
-            }
-            let ((mut source_client, source), (mut target_client, target)) = tokio::try_join!(
-                self.checked_node(&source, &assignment.environment_id),
+            let source = self.migration_handoff_source(op, stored).await?;
+            let target = self.migration_target_node(op).await?;
+            let (mut source, (mut target_client, target)) = tokio::try_join!(
+                async {
+                    match source {
+                        Some(source) => self
+                            .checked_node(&source, &assignment.environment_id)
+                            .await
+                            .map(Some),
+                        None => Ok(None),
+                    }
+                },
                 self.checked_node(&target, &assignment.environment_id),
             )?;
-            let retired = source
-                .environment
-                .as_ref()
-                .and_then(|r| r.record.as_ref())
-                .is_none_or(|record| {
-                    record
-                        .assignment
+            let source_ready = source.as_ref().is_none_or(|(_, view)| {
+                !view.unknown
+                    && view.backends == 0
+                    && view
+                        .environment
                         .as_ref()
-                        .is_some_and(|a| a.generation != op.source_generation)
-                });
+                        .and_then(|r| r.record.as_ref())
+                        .is_none_or(|record| {
+                            record
+                                .assignment
+                                .as_ref()
+                                .is_some_and(|a| a.generation != op.source_generation)
+                        })
+            });
             let adopted = target.environment.as_ref().is_some_and(|result| {
                 result.durability == pb::Durability::Published as i32
                     && result.record.as_ref().is_some_and(|record| {
@@ -1338,7 +1527,6 @@ impl CoordinatorRpc {
                             && record.resources_held == running
                     })
             });
-            let source_ready = retired && source.backends == 0 && !source.unknown;
             let target_ready = adopted && !target.unknown && (running || target.backends == 0);
             let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
             if source_ready {
@@ -1367,12 +1555,17 @@ impl CoordinatorRpc {
                 let wake_deadline =
                     deadline.min(tokio::time::Instant::now() + Duration::from_millis(250));
                 tokio::join!(
-                    wake_reconciliation(
-                        &mut source_client,
-                        &op.source_session_id,
-                        source_ready,
-                        wake_deadline
-                    ),
+                    async {
+                        if let Some((client, view)) = source.as_mut() {
+                            wake_reconciliation(
+                                client,
+                                &view.node_session_id,
+                                source_ready,
+                                wake_deadline,
+                            )
+                            .await;
+                        }
+                    },
                     wake_reconciliation(
                         &mut target_client,
                         &op.target_session_id,
@@ -1391,7 +1584,12 @@ impl CoordinatorRpc {
             "durability":"Published","resources_held":stored.resources_held(),"outcome":"completed","completed":true}),
         )
     }
-    async fn migration_target(&self, stored: &StoredEnvironment, r: &Action) -> Result<String> {
+    async fn migration_target(
+        &self,
+        stored: &StoredEnvironment,
+        target: Option<&str>,
+        checkpoint_storage_alias: &str,
+    ) -> Result<String> {
         // Device and node-local external mounts need an explicit transferable contract.
         let local = |source: &adx_core::execution::StorageSource| {
             matches!(source, adx_core::execution::StorageSource::Local(_))
@@ -1422,9 +1620,17 @@ impl CoordinatorRpc {
             ));
         }
         let mut state = self.0.state.lock().await;
-        let source = state.nodes.get(&r.node_id).ok_or(Error::Conflict)?;
-        if !r.checkpoint_storage_alias.is_empty()
-            && source.node.labels.get("ADX_CHECKPOINT_STORAGE") != Some(&r.checkpoint_storage_alias)
+        let source = state
+            .nodes
+            .get(&stored.assignment.node_id)
+            .ok_or(Error::Conflict)?;
+        if !checkpoint_storage_alias.is_empty()
+            && source
+                .node
+                .labels
+                .get("ADX_CHECKPOINT_STORAGE")
+                .map(String::as_str)
+                != Some(checkpoint_storage_alias)
         {
             return Err(Error::Conflict);
         }
@@ -1438,13 +1644,8 @@ impl CoordinatorRpc {
                     .as_ref()
                     .or(record.snapshot_source.as_ref())
             });
-        let spec = recovery::checkpoint_spec(
-            stored,
-            point,
-            Some(source),
-            &BTreeSet::new(),
-            (!r.target_node_id.is_empty()).then_some(r.target_node_id.as_str()),
-        )?;
+        let spec =
+            recovery::checkpoint_spec(stored, point, Some(source), &BTreeSet::new(), target)?;
         state
             .scheduler
             .recovery_candidate(&spec)?
@@ -1518,6 +1719,114 @@ pub(super) fn registration_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires isolated Redis; set ADX_TEST_REDIS_SERVER"]
+    async fn abort_freeze_can_replay_after_source_rebind_is_persisted() {
+        let redis = crate::rpc::cancellation_test_redis::Redis::new().await;
+        let session = redis.store().await.begin(1).await.unwrap();
+        let mut task = session
+            .save_upgrade(
+                UpgradeTask {
+                    protocol_version: 3,
+                    task_id: "task".into(),
+                    epoch: 1,
+                    namespace: "test".into(),
+                    daemonset_uid: "daemonset".into(),
+                    target_image: format!("node@sha256:{}", "a".repeat(64)),
+                    phase: "Aborting".into(),
+                    nodes: [(
+                        "n".into(),
+                        UpgradeNode {
+                            node_id: "n".into(),
+                            pod_uid: "old".into(),
+                            original_pod_uid: "old".into(),
+                            node_session_id: "old-session".into(),
+                            original_session_id: "old-session".into(),
+                            phase: "evacuating".into(),
+                            permit_id: Some("stale".into()),
+                            ..Default::default()
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let rpc = CoordinatorRpc::new(
+            session.clone(),
+            Placement::Pack,
+            Peers::network(),
+            RpcClient::network(Principal::Coordinator),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let current: StoredNode = serde_json::from_value(json!({
+            "node":{"id":"n","capacity":{"cpu_millis":100,"memory_bytes":128,"disk_bytes":0},"available":false,
+                "labels":{},"devices":[],"runtime_classes":["runsc"]},"shard_id":0,"address":"n:1","proxy_address":"n:2",
+            "session":{"id":"new-session","sequence":1,"routable":true},"scheduling_paused":true,
+            "upgrade_pause":{"task_id":"task","epoch":1,"original_paused":false}
+        })).unwrap();
+        let request = Action {
+            node_id: "n".into(),
+            pod_uid: "old".into(),
+            node_session_id: "new-session".into(),
+            ..Default::default()
+        };
+        let observation = pb::NodeUpgradeInspection {
+            protocol_version: 3,
+            task_id: "task".into(),
+            epoch: 1,
+            node_session_id: "new-session".into(),
+            revision: 1,
+            phase: "isolated".into(),
+            strict_empty: true,
+            ..Default::default()
+        };
+        let delete_request = Action {
+            delete_intent: true,
+            ..request.clone()
+        };
+        assert_eq!(
+            rpc.rebind_restarted_source(&mut task, &delete_request, &current, &observation)
+                .await,
+            Err(Error::Conflict)
+        );
+        let mut confirmed = task.clone();
+        confirmed
+            .nodes
+            .get_mut("n")
+            .unwrap()
+            .delete_resource_version = Some("rv".into());
+        assert_eq!(
+            rpc.rebind_restarted_source(&mut confirmed, &request, &current, &observation)
+                .await,
+            Err(Error::Conflict)
+        );
+        assert!(rpc
+            .rebind_restarted_source(&mut task, &request, &current, &observation)
+            .await
+            .unwrap());
+
+        // Stop after committing the rebind, before sending node control.
+        rpc.upgrade_http(
+            &hyper::Method::POST,
+            "/v1/node-upgrades/tasks/task/abort",
+            json!({"task_id":"task","epoch":1,"operation_id":"freeze","stage":"freeze"}),
+        )
+        .await
+        .unwrap();
+        let persisted = session.upgrade_task().await.unwrap().unwrap();
+        let node = &persisted.nodes["n"];
+        assert_eq!(node.node_session_id, "new-session");
+        assert_eq!(node.original_session_id, "old-session");
+        assert_eq!(node.phase, "quiescing");
+        assert!(node.permit_id.is_none());
+        assert!(node.delete_resource_version.is_none());
+    }
 
     #[test]
     fn replacement_binding_requires_a_fresh_isolated_empty_session_and_old_delete_intent() {

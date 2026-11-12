@@ -51,7 +51,7 @@ separate failure cases; this protocol does not promise transparent stream migrat
 | --- | --- |
 | `GET /capabilities` | Protocol support; each original node is also probed. |
 | `POST /tasks` | Begin or replay a durable task. |
-| `GET /tasks/{task_id}` | Authoritative task, node bindings and operation progress. |
+| `GET /tasks/{task_id}` | Persisted task, node bindings and operation progress without waiting for a write operation. |
 | `GET /nodes/{node_id}/inspect` | Current session and local inventory; errors never mean empty. |
 | `POST /tasks/{task_id}/prepare-node` | Stop admission and fence execution on the source. |
 | `POST /tasks/{task_id}/migrate` | Pause, transfer ownership by CAS, adopt/restore at the target. |
@@ -64,9 +64,20 @@ separate failure cases; this protocol does not promise transparent stream migrat
 Begin takes `task_id`, positive executor `epoch`, `namespace`, `daemonset_uid`,
 `target_image` fixed by SHA-256 digest, and `nodes` containing `node_id`,
 `pod_uid`, `node_session_id`. A task ID cannot be reused for another release.
+Task queries do not reconcile operations. After an ambiguous result, retry the
+same operation ID to reconcile durable ownership and local progress.
+An Environment with an unsettled migration rejects another operation ID.
 Actions carry the same task/epoch, a stable `operation_id`, and the relevant
 Pod/session binding. Migration also carries `environment_id` and an optional
-`target_node_id`. Optional `expected_source_generation` and
+`target_node_id`. An explicit initial target stays fixed across retries.
+Automatic selection rechecks capacity and checkpoint compatibility after Pause
+and can update the Prepared target while ownership remains on the source.
+For an automatic operation the recorded selection policy takes precedence over
+any target hint sent on retry. The ownership CAS fixes the target.
+Executors must treat an automatic Prepared target as provisional and read the
+durable receipt again after retrying the same operation.
+Existing Prepared operations without a recorded selection policy keep their
+stored target. Optional `expected_source_generation` and
 `expected_source_revision` fence the initial intent before any Prepared record or
 Pause call; explicit zero is checked, not treated as absent. They do not replace
 the stored identity when continuing an existing operation ID.
@@ -81,11 +92,16 @@ separately from administrator pause intent; releasing it preserves manual pauses
 
 Before accepting a migration, the source request Pod UID and process session must
 match the task binding and the current live node.
-An unfinished operation rechecks its original source and target sessions before
-Pause, ownership transfer or Recover. The ownership CAS also checks both stored
-node sessions against that operation, so a registration change cannot silently
-redirect its transfer. A historical Completed receipt does not require its old
-source process to remain live.
+Before ownership transfer, the operation checks both sessions and records the
+source's authenticated, per-Environment stop inspection for the published Paused
+revision. The ownership CAS checks that exact revision and both stored sessions.
+After the CAS, retry with the original Pod UID and source session from the task.
+The Coordinator verifies the durable source and target generations and the
+original target session. It inspects the current source process, including a
+replacement, when live. If the source is offline, continuation requires both
+the stop evidence recorded by the CAS and durable invalidation or replacement
+of the old session. A heartbeat timeout alone grants no recovery authority.
+A historical Completed receipt does not require the source to remain live.
 
 The task uses the existing Redis header CAS, in a separate control field so
 ordinary lifecycle commits do not rewrite its journal. Migration retains the
@@ -104,9 +120,13 @@ shared filesystems are rejected. Captures record measured host/kernel/CPU,
 runtime binary and default rootfs fingerprints in `recovery_profile`. Ordinary
 cross-node recovery and upgrade migration filter against this profile and the
 checkpoint's actual backend scope, then recheck before transferring ownership.
-The destination rechecks the profile before restoring; unknown or mismatching
-evidence fails closed. A legacy point without this profile can still resume on
-its current owner, but does not qualify for cross-node recovery.
+The destination rechecks the profile before restoring. A legacy point can still
+resume on its original compatible owner. Ordinary cross-node Resume/Recover may
+qualify a legacy point using an exact audited `legacy_checkpoint_proofs` entry
+configured on Coordinator. The target still has to match the verified scope and
+profile. Planned migration requires evidence on the checkpoint itself. Follow
+the [deployment preparation steps](../../../build/config/examples/README.md)
+before updating Coordinator.
 `runtime_rootfs_identity:true` exposes the deployment default EROFS file's actual
 `runtime_rootfs_sha256` and `runtime_rootfs_path` through node inspection. Operators
 must not replace runtime inputs during the process lifetime. This flow currently
@@ -129,6 +149,14 @@ changing admission or any newer permit; an old revoke cannot clear a newer DELET
 intent. Both normal and rollback paths save UID/RV intent before asking the
 Coordinator to confirm its delete permit, so lost replies remain reconcilable.
 
+After a process restart in the same original Pod, `quiesce` can bind the new
+session once the task's operations on that node have settled. The caller supplies
+the same Pod UID and current session. The replacement process must already be
+isolated for this task and report strict empty, with no durable Environment
+assignments or outstanding delete intent. Quiesce issues a fresh permit for the
+new session. During abort, use `rollback:true`, verify the rebound session, then
+finalize with the restored template.
+
 New sessions receive isolated control in their registration response before
 catalog adoption. The response derives control after the session CAS from the
 current task and its persisted pause marker; a task that already ended cannot
@@ -141,13 +169,13 @@ that Environment. After transfer, Coordinator can wake the affected node
 processes to compare against the authoritative catalog before the
 next periodic report. Already reconciled sessions keep their other routes during
 this live comparison. A wake acknowledgement grants no execution authority.
-Completion still requires observed retirement and adoption, with periodic
-comparison available if a wake is unavailable. Shared checkpoint garbage
-collection retains its existing reference protection and is separate from
-execution cleanup.
+Completion requires source retirement or fenced durable stop evidence and target
+adoption. Periodic comparison remains available if a wake is unavailable.
+Shared checkpoint garbage collection retains its existing reference protection
+and is separate from execution cleanup.
 A `Published Failed` restore or a lost reply does not complete migration. Query
-or explicit resume uses the same operation; sources are not deleted while any
-accepted operation remains unresolved.
+the persisted receipt, then retry the migrate action with the same operation ID;
+sources are not deleted while any accepted operation remains unresolved.
 An operation's `Completed` journal entry means ownership transfer settled or an
 explicit Published deletion was confirmed, including through its durable
 deletion receipt. It is historical progress, not a guarantee that the user has
@@ -157,7 +185,9 @@ requires the expected target execution state.
 `Cancelled` is an abort-only receipt for a Prepared operation whose ownership
 never left its original source generation/session. Freeze removes new Pause
 grants while preserving business routes and waits for already admitted work.
-Cancellation then requires matching Coordinator and node-local Published
+If the CAS already moved ownership, retry the same migrate action with
+`rollback:true` to settle the existing transfer while the task is Aborting.
+Cancellation requires matching Coordinator and node-local Published
 Running state (or the original Paused state), without pending recovery or
 restart. Missing, Journaled or unknown evidence and target ownership transfer
 remain unresolved. Cancellation is not successful migration: `migrate` rejects

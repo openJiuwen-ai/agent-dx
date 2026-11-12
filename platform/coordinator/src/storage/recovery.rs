@@ -1,5 +1,53 @@
 //! Atomic ownership transfer after the source execution has been invalidated.
 use super::*;
+use std::borrow::Cow;
+
+/// Operator-audited capture facts for one immutable shared artifact.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyCheckpointProof {
+    pub artifact: adx_core::CheckpointArtifact,
+    pub runtime_class: String,
+    pub source_runtime_id: String,
+    pub recovery_profile: BTreeMap<String, String>,
+}
+
+/// Validated, immutable proofs indexed by storage alias and artifact location.
+#[derive(Clone, Default, Deserialize)]
+#[serde(try_from = "Vec<LegacyCheckpointProof>")]
+pub struct LegacyCheckpointProofs(Arc<BTreeMap<String, BTreeMap<String, LegacyCheckpointProof>>>);
+
+impl TryFrom<Vec<LegacyCheckpointProof>> for LegacyCheckpointProofs {
+    type Error = Error;
+
+    fn try_from(proofs: Vec<LegacyCheckpointProof>) -> Result<Self> {
+        let mut by_storage = BTreeMap::<String, BTreeMap<String, LegacyCheckpointProof>>::new();
+        for proof in proofs {
+            let artifact = &proof.artifact;
+            if artifact.storage.is_empty()
+                || artifact.storage == "local"
+                || artifact.scope.is_empty()
+                || artifact.location.is_empty()
+                || artifact.size_bytes == 0
+                || proof.runtime_class.is_empty()
+                || proof.source_runtime_id.is_empty()
+                || recovery_profile_requirements(&proof.runtime_class, &proof.recovery_profile)?
+                    != proof.recovery_profile
+            {
+                return Err(Error::Invalid("invalid legacy checkpoint proof".into()));
+            }
+            if by_storage
+                .entry(artifact.storage.clone())
+                .or_default()
+                .insert(artifact.location.clone(), proof)
+                .is_some()
+            {
+                return Err(Error::Invalid("duplicate legacy checkpoint proof".into()));
+            }
+        }
+        Ok(Self(Arc::new(by_storage)))
+    }
+}
 
 /// Facts captured with the checkpoint, rather than the source node's current
 /// software after a restart or upgrade, constrain every cross-node recovery.
@@ -122,6 +170,45 @@ impl StoredEnvironment {
     }
 }
 impl Session {
+    /// Load audited capture facts before serving recovery requests.
+    pub fn with_legacy_checkpoint_proofs(mut self, proofs: LegacyCheckpointProofs) -> Self {
+        self.legacy_checkpoint_proofs = proofs;
+        self
+    }
+
+    pub(crate) fn ordinary_recovery_point<'a>(
+        &self,
+        spec: &EnvironmentSpec,
+        point: &'a adx_core::RestorePoint,
+    ) -> Cow<'a, adx_core::RestorePoint> {
+        let artifact = &point.artifact;
+        if !artifact.scope.is_empty() && !point.recovery_profile.is_empty() {
+            return Cow::Borrowed(point);
+        }
+        let Some(proof) = self
+            .legacy_checkpoint_proofs
+            .0
+            .get(&artifact.storage)
+            .and_then(|locations| locations.get(&artifact.location))
+            .filter(|proof| {
+                proof.artifact.size_bytes == artifact.size_bytes
+                    && (artifact.scope.is_empty() || proof.artifact.scope == artifact.scope)
+                    && proof.runtime_class == spec.runtime_class
+                    && proof.source_runtime_id == point.source_runtime_id
+                    && (point.recovery_profile.is_empty()
+                        || proof.recovery_profile == point.recovery_profile)
+            })
+        else {
+            return Cow::Borrowed(point);
+        };
+        let mut qualified = point.clone();
+        qualified.artifact.scope.clone_from(&proof.artifact.scope);
+        qualified
+            .recovery_profile
+            .clone_from(&proof.recovery_profile);
+        Cow::Owned(qualified)
+    }
+
     pub async fn reserve_recovery(
         &self,
         previous: &Assignment,
@@ -190,7 +277,7 @@ impl Session {
             let mut stored_environment: StoredEnvironment =
                 decode(environment_value.as_deref().ok_or(Error::NotFound)?)?;
             stored_environment.validate()?;
-            if planned {
+            let stopped_revision = if planned {
                 let task = upgrade.as_ref().ok_or(Error::Conflict)?;
                 task.require_protocol()?;
                 let operation = task
@@ -204,7 +291,21 @@ impl Session {
                 {
                     return Err(Error::Conflict);
                 }
-            }
+                Some(operation.source_stopped_revision.ok_or(Error::Conflict)?)
+            } else {
+                // A queued planned request may outlive source invalidation.
+                // Only the upgrade operation can transfer its ownership.
+                if upgrade.as_ref().is_some_and(|task| {
+                    task.active()
+                        && task.operations.values().any(|operation| {
+                            operation.environment_id == stored_environment.spec.id
+                                && !operation.settled()
+                        })
+                }) {
+                    return Err(Error::Conflict);
+                }
+                None
+            };
             if planned && volumes::has_volumes(&stored_environment.spec) {
                 return Err(Error::Invalid(
                     "planned migration of managed Volumes is not supported".into(),
@@ -249,18 +350,24 @@ impl Session {
                         && r.state == EnvironmentState::Paused
                         && !r.resources_held
                         && !r.restart_pending
+                        && Some(r.revision) == stopped_revision
                 })
                 .and_then(|r| r.checkpoint.as_ref().or(r.snapshot_source.as_ref()))
                 .filter(|cp| cp.artifact.storage != "local" && !cp.expired(now));
-            let mut checkpoint = if planned {
+            let point = if planned {
                 planned_point
             } else {
                 stored_environment
                     .recovery_point(now)
                     .or_else(|| stored_environment.resume_point(now))
             }
-            .ok_or(Error::Conflict)?
-            .clone();
+            .ok_or(Error::Conflict)?;
+            let mut checkpoint = if planned {
+                point.clone()
+            } else {
+                self.ordinary_recovery_point(&stored_environment.spec, point)
+                    .into_owned()
+            };
             node_value.as_deref().ok_or(Error::NotFound)?;
             let target = self.get_node(&replacement.node_id).await?;
             validate_checkpoint_target(&stored_environment.spec, &checkpoint, &target)?;
@@ -297,10 +404,15 @@ impl Session {
                 .as_ref()
                 .ok_or(Error::Conflict)?
                 .clone();
+            let (checkpoint, snapshot_source) = if source.checkpoint.is_some() {
+                (Some(checkpoint), source.snapshot_source)
+            } else {
+                (None, Some(checkpoint))
+            };
             stored_environment.result = Some(EnvironmentRecord {
                 observation: None,
                 execution_artifacts: vec![],
-                snapshot_source: source.snapshot_source.clone(),
+                snapshot_source,
                 failure: None,
                 spec: stored_environment.spec.clone(),
                 assignment: replacement.clone(),
@@ -311,11 +423,7 @@ impl Session {
                     ip: None,
                 },
                 resources_held: false,
-                checkpoint: if source.snapshot_source.is_some() && source.checkpoint.is_none() {
-                    None
-                } else {
-                    Some(checkpoint.clone())
-                },
+                checkpoint,
                 last_operation: None,
                 restart_attempts: 0,
                 restart_pending: false,
@@ -330,6 +438,7 @@ impl Session {
             stored_environment.recovery = Some(Recovery {
                 source: previous.clone(),
                 pending: resume,
+                stopped_source: stopped_revision.is_some(),
             });
             if let Some(last) = stored_environment
                 .last_interruption

@@ -275,7 +275,11 @@ impl Adxlet {
         }
         record.spec.validate()?;
         validate_device_assignment(&record.spec.scheduling.devices, &record.assignment.devices)?;
-        let cp = record.checkpoint.as_ref().ok_or(Error::Conflict)?;
+        let cp = record
+            .checkpoint
+            .as_ref()
+            .or(record.snapshot_source.as_ref())
+            .ok_or(Error::Conflict)?;
         let origin = cp.origin.as_ref().ok_or(Error::Conflict)?;
         if record.assignment.node_id != self.node_id
             || record.assignment.environment_id != record.spec.id

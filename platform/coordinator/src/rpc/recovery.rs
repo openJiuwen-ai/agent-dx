@@ -108,17 +108,18 @@ impl CoordinatorRpc {
                 let domains = self.volume_domains(&state)?;
                 state.prepare_volumes(&stored.spec, &domains).await?;
                 let point = stored.recovery_point(now).ok_or(Error::Conflict)?;
-                let spec = match checkpoint_spec(&stored, Some(point), None, &BTreeSet::new(), None)
-                {
-                    Ok(spec) => spec,
-                    Err(error @ Error::Invalid(_)) => {
-                        adx_observability::warn!(environment_id=%stored.spec.id, error=%error,
+                let point = state.session.ordinary_recovery_point(&stored.spec, point);
+                let spec =
+                    match checkpoint_spec(&stored, Some(&point), None, &BTreeSet::new(), None) {
+                        Ok(spec) => spec,
+                        Err(error @ Error::Invalid(_)) => {
+                            adx_observability::warn!(environment_id=%stored.spec.id, error=%error,
                             "checkpoint recovery admission blocked");
-                        blocked.get_or_insert(error);
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
+                            blocked.get_or_insert(error);
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                 state.scheduler.submit_recovery(spec)?;
             }
             // Each ShardScheduler round already has its own attempt/time budget.
@@ -335,6 +336,7 @@ mod tests {
             (true, "capacity"),
             (false, "abort"),
             (true, "abort"),
+            (false, "failed-source"),
         ] {
             let (_rig, session, rpc, original, mut task) = {
                 let rig = crate::rpc::cancellation_test_redis::Redis::new().await;
@@ -396,8 +398,10 @@ mod tests {
                                     environment_id: "move".into(),
                                     source_node_id: "source".into(),
                                     target_node_id: "target".into(),
+                                    automatic_target: false,
                                     source_generation: 1,
                                     source_revision: 1,
+                                    source_stopped_revision: Some(1),
                                     source_session_id: "source-session".into(),
                                     target_session_id: "target-session".into(),
                                     was_running: resume,
@@ -450,6 +454,15 @@ mod tests {
                 state.scheduler.register(node).unwrap();
             }
             state.scheduler.submit_recovery(request).unwrap();
+            if fault == "failed-source" {
+                // The queued planned assignment must not become ordinary recovery
+                // if the original source publishes failure and is then fenced.
+                let mut failed = stored.result.clone().unwrap();
+                failed.state = EnvironmentState::Failed;
+                failed.revision += 1;
+                session.commit(failed).await.unwrap();
+                state.invalidate_node("source").await.unwrap();
+            }
             for _ in 0..state.scheduler.shards.len() {
                 state.drive().await.unwrap();
             }
@@ -491,20 +504,35 @@ mod tests {
                 );
             } else {
                 assert_eq!(current.assignment, original);
-                assert_eq!(current.result.unwrap().state, EnvironmentState::Paused);
+                assert_eq!(
+                    current.result.unwrap().state,
+                    if fault == "failed-source" {
+                        EnvironmentState::Failed
+                    } else {
+                        EnvironmentState::Paused
+                    }
+                );
             }
         }
     }
 
     #[tokio::test]
     #[ignore = "requires isolated Redis; set ADX_TEST_REDIS_SERVER"]
-    async fn missing_profile_does_not_block_another_recovery_assignment() {
+    async fn legacy_checkpoint_recovery_after_coordinator_restart_requires_exact_proof() {
         let _rig = crate::rpc::cancellation_test_redis::Redis::new().await;
-        let session = _rig.store().await.begin(2).await.unwrap();
-        let (template, point, target) = fixture();
+        let db = _rig.store().await;
+        let session = db.begin(2).await.unwrap();
+        let (template, point, mut target) = fixture();
+        target.capacity.cpu_millis *= 3;
+        target.capacity.memory_bytes *= 3;
         for id in ["source", "target"] {
             let mut node = target.clone();
             node.id = id.into();
+            if id == "source" {
+                node.labels.clear();
+                node.labels
+                    .insert("ADX_CHECKPOINT_STORAGE".into(), "shared".into());
+            }
             node.labels.insert("NODE_ID".into(), id.into());
             session
                 .register_session_with_scopes(
@@ -516,12 +544,19 @@ mod tests {
                         sequence: 1,
                         routable: true,
                     }),
-                    ["backend".into()].into(),
+                    if id == "target" {
+                        ["backend".into()].into()
+                    } else {
+                        Default::default()
+                    },
                 )
                 .await
                 .unwrap();
         }
-        for (index, id) in ["good", "bad"].into_iter().enumerate() {
+        for (index, id) in ["good", "attested", "bad", "resumable"]
+            .into_iter()
+            .enumerate()
+        {
             let mut stored = template.clone();
             stored.spec.id = id.into();
             stored.assignment.environment_id = id.into();
@@ -531,21 +566,63 @@ mod tests {
                 .await
                 .unwrap();
             let mut record = stored.effective_record();
-            record.state = EnvironmentState::Failed;
+            record.state = if id == "resumable" {
+                EnvironmentState::Paused
+            } else {
+                EnvironmentState::Failed
+            };
             record.revision = 1;
             record.resources_held = false;
             let mut captured = point.clone();
             captured.source_runtime_id = record.runtime.id.clone();
-            if id == "bad" {
+            captured.artifact.location = id.into();
+            if id != "good" {
                 captured.recovery_profile.clear();
+                captured.artifact.scope.clear();
             }
             record.checkpoint = Some(captured);
             session.commit(record).await.unwrap();
         }
-        session
-            .invalidate_node("source", "source-session")
-            .await
+        let proofs = [("attested", "attested-2"), ("resumable", "resumable-4")]
+            .into_iter()
+            .map(|(id, runtime)| crate::storage::LegacyCheckpointProof {
+                artifact: adx_core::CheckpointArtifact {
+                    location: id.into(),
+                    ..point.artifact.clone()
+                },
+                runtime_class: template.spec.runtime_class.clone(),
+                source_runtime_id: runtime.into(),
+                recovery_profile: point.recovery_profile.clone(),
+            })
+            .collect::<Vec<_>>()
+            .try_into()
             .unwrap();
+        let session = db
+            .begin(2)
+            .await
+            .unwrap()
+            .with_legacy_checkpoint_proofs(proofs);
+        let legacy = session
+            .get("attested")
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let mut wrong_size = legacy.clone();
+        wrong_size.artifact.size_bytes += 1;
+        let mut wrong_scope = legacy.clone();
+        wrong_scope.artifact.scope = "another-backend".into();
+        let mut wrong_runtime = legacy;
+        wrong_runtime.source_runtime_id = "attested-1".into();
+        for mismatch in [wrong_size, wrong_scope, wrong_runtime] {
+            let candidate = session.ordinary_recovery_point(&template.spec, &mismatch);
+            assert_eq!(candidate.as_ref(), &mismatch);
+            assert!(
+                checkpoint_spec(&template, Some(&candidate), None, &BTreeSet::new(), None).is_err()
+            );
+        }
         let rpc = CoordinatorRpc::new(
             session.clone(),
             Placement::Pack,
@@ -558,6 +635,8 @@ mod tests {
         {
             let mut state = rpc.0.state.lock().await;
             report_recovery_target(&mut state).await;
+            // The old source disappears before it can register in the new epoch.
+            state.invalidate_node("source").await.unwrap();
             // Exercise durable placement without dispatching a runtime RPC.
             state.live.insert(
                 "target".into(),
@@ -582,5 +661,29 @@ mod tests {
         let bad = session.get("bad").await.unwrap();
         assert_eq!(bad.assignment.node_id, "source");
         assert!(bad.invalidated);
+        let attested = session.get("attested").await.unwrap();
+        assert_eq!(attested.assignment.node_id, "target");
+        let checkpoint = attested.result.unwrap().checkpoint.unwrap();
+        assert_eq!(checkpoint.artifact.scope, point.artifact.scope);
+        assert_eq!(checkpoint.recovery_profile, point.recovery_profile);
+        let resume = rpc
+            .ensure_running(pb::EnsureRunningRequest {
+                environment_id: "resumable".into(),
+                caller: Some(pb::CallerContext {
+                    tenant_id: "tenant".into(),
+                    administrator: false,
+                }),
+                timeout_seconds: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(resume.code(), tonic::Code::DeadlineExceeded);
+        let resumed = session.get("resumable").await.unwrap();
+        assert_eq!(resumed.assignment.node_id, "target");
+        assert_eq!(
+            resumed.result.unwrap().checkpoint.unwrap().recovery_profile,
+            point.recovery_profile
+        );
     }
 }

@@ -21,6 +21,7 @@ pub use observability::{
     BusinessCounters, CreationResult, CreationSummary, InterruptionSummary, RecoveryState,
 };
 pub(crate) use recovery::{checkpoint_requirements, recovery_profile_requirements};
+pub use recovery::{LegacyCheckpointProof, LegacyCheckpointProofs};
 #[cfg(test)]
 mod checkpoint_contention_tests;
 mod resume;
@@ -198,6 +199,8 @@ fn original_pause(record: &StoredNode, task_id: &str, epoch: u64) -> Result<bool
 pub struct Recovery {
     pub source: Assignment,
     pub pending: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped_source: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeIntent {
@@ -1074,6 +1077,7 @@ impl RedisStore {
                     generations: Arc::new(AtomicU64::new(
                         h.epoch.checked_mul(1_u64 << 32).ok_or(Error::Conflict)?,
                     )),
+                    legacy_checkpoint_proofs: Default::default(),
                 };
                 // Object CAS does not advance the shared header. An old writer
                 // can therefore commit after the pre-fence scan but before the
@@ -1203,6 +1207,7 @@ pub struct Session {
     epoch: u64,
     inspection: Arc<inspection::InspectionCache>,
     generations: Arc<AtomicU64>,
+    legacy_checkpoint_proofs: LegacyCheckpointProofs,
 }
 impl Session {
     pub(crate) fn committed_changes(&self) -> broadcast::Receiver<ControlChange> {

@@ -269,13 +269,14 @@ impl CoordinatorRpc {
                                 .or(record.snapshot_source.as_ref())
                         })
                         .ok_or_else(|| Status::failed_precondition("resume checkpoint missing"))?;
+                    let point = state.session.ordinary_recovery_point(&stored.spec, point);
                     let excluded = stored
                         .resume
                         .as_ref()
                         .map(|intent| intent.rejected_nodes.clone())
                         .unwrap_or_default();
                     let spec =
-                        recovery::checkpoint_spec(&stored, Some(point), None, &excluded, None)
+                        recovery::checkpoint_spec(&stored, Some(&point), None, &excluded, None)
                             .map_err(status)?;
                     if state
                         .scheduler
