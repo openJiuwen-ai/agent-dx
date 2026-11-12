@@ -397,7 +397,43 @@ fn start_from_environment(manager: Arc<Manager>) {
     }
 }
 
-fn apply_identity(command: &mut Command, identity: Option<Identity>) {
+/// Apply passwd defaults only for an explicitly selected command user.
+/// Image-process startup retains its existing environment behavior.
+pub(super) fn command_user_environment(command: &mut Command, identity: &Option<Identity>) {
+    let Some(identity) = identity else {
+        return;
+    };
+    // SAFETY: passwd is a C output record and all-zero is a valid empty record.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0u8; 16 * 1024];
+    let mut result = std::ptr::null_mut();
+    // SAFETY: all output pointers and the scratch buffer remain live until strings are copied.
+    let status = unsafe {
+        libc::getpwuid_r(
+            identity.uid,
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status == 0 && !result.is_null() {
+        if !entry.pw_dir.is_null() {
+            // SAFETY: successful getpwuid_r returns NUL-terminated strings in the live buffer.
+            let home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) }.to_string_lossy();
+            command.env("HOME", home.as_ref());
+        }
+        if !entry.pw_name.is_null() {
+            // SAFETY: successful getpwuid_r returns NUL-terminated strings in the live buffer.
+            let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }.to_string_lossy();
+            command
+                .env("USER", name.as_ref())
+                .env("LOGNAME", name.as_ref());
+        }
+    }
+}
+
+pub(super) fn apply_identity(command: &mut Command, identity: Option<Identity>) {
     if let Some(identity) = identity {
         // SAFETY: the closure runs in the child immediately before exec, captures owned identity
         // data whose pointers stay valid for the call, performs no access to parent-only state,
@@ -548,13 +584,13 @@ fn validate_canonical_absolute_path(path: &Path, label: &str) -> Result<(), Stri
     Ok(())
 }
 
-struct Identity {
+pub(super) struct Identity {
     uid: libc::uid_t,
     gid: libc::gid_t,
     user_name: Option<CString>,
 }
 
-fn resolve_identity(user: &str) -> Result<Option<Identity>, String> {
+pub(super) fn resolve_identity(user: &str) -> Result<Option<Identity>, String> {
     if user.is_empty() {
         return Ok(None);
     }

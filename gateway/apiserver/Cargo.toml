@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 adx-activator = { path = "../../agent/activator" }
 adx-core = { path = "../../platform/crates/core" }
+adx-preparation-files = { path = "../../platform/crates/preparation-files" }
 adx-agent-core = { path = "../../agent/crates/core" }
 adx-protocol = { path = "../../platform/crates/protocol" }
 adx-error = { path = "../../crates/error" }

@@ -521,6 +521,7 @@ fn request_fingerprint(kw: &BTreeMap<String, Value>) -> String {
     let canonical = serde_json::json!({
         "command": cmd,
         "cwd": cwd,
+        "user": kw_str(kw, "user").unwrap_or_default(),
         "envs": envs,
         "timeout_ms": timeout_ms,
         "want_stdin": want_stdin,
@@ -804,6 +805,18 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
 
     // Reserve the stable identity before spawn. Holding the registry lock
     // serializes the PENDING -> RUNNING/FAILED transition with duplicate starts.
+    let identity =
+        match super::entrypoint::resolve_identity(&kw_str(kw, "user").unwrap_or_default()) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return map_value(vec![
+                    ("command_id", Value::from(command_id.clone())),
+                    ("pid", Value::from(-1i64)),
+                    ("error_code", Value::from("INVALID_ARGUMENT")),
+                    ("error", Value::from(error)),
+                ])
+            }
+        };
     let created_at_ms = now_ms();
     let exit = make_exit_state();
     records.insert(
@@ -827,6 +840,8 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
 
     let mut process = Command::new("/bin/sh");
     super::child_env::apply(&mut process);
+    super::entrypoint::command_user_environment(&mut process, &identity);
+    super::entrypoint::apply_identity(&mut process, identity);
     // One command owns one process group. Timeout/kill therefore terminates
     // the shell and descendants instead of leaving detached workloads alive.
     process.process_group(0);
@@ -1037,6 +1052,7 @@ pub fn cmd_capabilities(_kw: &BTreeMap<String, Value>) -> Value {
                     "multiplexed-command-watch",
                     "bounded-command-output",
                     "command-activity-lease",
+                    "per-command-user",
                 ]
                 .into_iter()
                 .map(Value::from)
@@ -1256,6 +1272,35 @@ mod tests {
             .iter()
             .find_map(|(key, value)| (key.as_str() == Some(name)).then_some(value))
             .unwrap()
+    }
+
+    #[test]
+    fn invalid_command_user_is_rejected_before_spawning() {
+        let mut input = args("prepare-invalid-user", "true");
+        input.insert(
+            "user".into(),
+            Value::from("adx_user_that_does_not_exist_93a7"),
+        );
+        let value = cmd_start(&input);
+        assert_eq!(
+            field(&value, "error_code").as_str(),
+            Some("INVALID_ARGUMENT")
+        );
+        assert_eq!(field(&value, "pid").as_i64(), Some(-1));
+    }
+
+    #[test]
+    fn command_replay_rejects_changed_user() {
+        let mut input = args("prepare-user-replay-contract", "true");
+        let first = cmd_start(&input);
+        assert!(field(&first, "pid").as_i64().is_some_and(|pid| pid > 0));
+        input.insert("user".into(), Value::from("root"));
+        let changed = cmd_start(&input);
+        assert_eq!(
+            field(&changed, "error_code").as_str(),
+            Some("COMMAND_CONFLICT")
+        );
+        let _ = cmd_wait(&args("prepare-user-replay-contract", ""));
     }
 
     #[test]

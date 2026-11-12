@@ -76,6 +76,8 @@ struct Config {
     #[serde(default)]
     runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     #[serde(default)]
+    preparation_files: Option<adx_preparation_files::FileStorageConfig>,
+    #[serde(default)]
     local_rootfs_templates: BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
     #[serde(default)]
     execd_command: Vec<String>,
@@ -339,6 +341,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_runtime_control(control.clone())?
     .with_operation_timeout(timeout)?
     .with_health_check(config.execd_health_failure_threshold)?;
+    if let Some(files) = &config.preparation_files {
+        manager = manager.with_preparation_files(files.build()?)?;
+    }
     let checkpoint_storage = match (config.checkpoint_dir, config.checkpoint_storage) {
         (Some(root), None) => Some(adxlet::checkpoint::StorageConfig::Local { root }),
         (None, storage) => storage,
@@ -389,6 +394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut labels = config.labels;
     labels.extend(local_rootfs_labels);
+    labels.insert("ADX_SOURCE_PREPARATION".into(), "1".into());
     if let Some(alias) = manager.checkpoint_storage_alias() {
         labels.insert("ADX_CHECKPOINT_STORAGE".into(), alias.into());
     }

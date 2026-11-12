@@ -361,7 +361,7 @@ message RuntimeIdentity { string environment_id = 1; string runtime_id = 2; uint
 
 message RestorePoint { RuntimeIdentity origin = 5; string id = 1; CheckpointArtifact artifact = 2; optional uint64 expires_at_unix_seconds = 3; string source_runtime_id = 4; }
 
-enum LifecycleKind { LIFECYCLE_KIND_UNSPECIFIED = 0; LIFECYCLE_KIND_PAUSE = 1; LIFECYCLE_KIND_RESUME = 2; LIFECYCLE_KIND_SNAPSHOT = 3; LIFECYCLE_KIND_NETWORK = 4; LIFECYCLE_KIND_RELOAD = 5; }
+enum LifecycleKind { LIFECYCLE_KIND_UNSPECIFIED = 0; LIFECYCLE_KIND_PAUSE = 1; LIFECYCLE_KIND_RESUME = 2; LIFECYCLE_KIND_SNAPSHOT = 3; LIFECYCLE_KIND_NETWORK = 4; LIFECYCLE_KIND_RELOAD = 5; LIFECYCLE_KIND_PREPARE = 6; }
 
 message CompletedOperation { string id = 1; LifecycleKind kind = 2; uint64 expected_revision = 3; }
 

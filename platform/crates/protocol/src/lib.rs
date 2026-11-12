@@ -15,6 +15,7 @@ pub use adx_core::valid_runtime_id;
 use adx_core::{Error, Result};
 mod execution;
 mod observation;
+mod preparation;
 mod probes;
 pub use observation::create_status;
 mod scheduling;
@@ -582,6 +583,7 @@ impl From<adx_core::CompletedOperation> for control::CompletedOperation {
                 adx_core::LifecycleKind::Snapshot => 3,
                 adx_core::LifecycleKind::Network => 4,
                 adx_core::LifecycleKind::Reload => 5,
+                adx_core::LifecycleKind::Prepare => 6,
             },
         }
     }
@@ -601,6 +603,7 @@ impl TryFrom<control::CompletedOperation> for adx_core::CompletedOperation {
                 3 => adx_core::LifecycleKind::Snapshot,
                 4 => adx_core::LifecycleKind::Network,
                 5 => adx_core::LifecycleKind::Reload,
+                6 => adx_core::LifecycleKind::Prepare,
                 _ => return Err(Error::Invalid("invalid lifecycle kind".into())),
             },
         })

@@ -440,6 +440,7 @@ impl Admission {
 pub(crate) struct Services {
     runtime: Arc<dyn RuntimeDriver>,
     runtime_control: Option<runtime_control::RuntimeControlClient>,
+    preparation_files: Option<adx_preparation_files::FileStore>,
     readiness: Arc<dyn Readiness>,
     routes: Arc<dyn Routes>,
     sink: Arc<dyn StateSink>,
@@ -500,6 +501,7 @@ impl Adxlet {
             services: Arc::new(Services {
                 runtime,
                 runtime_control: None,
+                preparation_files: None,
                 readiness,
                 routes,
                 sink,
@@ -523,6 +525,16 @@ impl Adxlet {
             authority_tasks: Arc::default(),
             authority_progress: Arc::default(),
         }
+    }
+
+    pub fn with_preparation_files(
+        mut self,
+        files: adx_preparation_files::FileStore,
+    ) -> Result<Self> {
+        Arc::get_mut(&mut self.services)
+            .ok_or(Error::Conflict)?
+            .preparation_files = Some(files);
+        Ok(self)
     }
 
     pub fn with_runtime_control(

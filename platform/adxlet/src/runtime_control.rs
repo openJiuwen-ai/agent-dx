@@ -355,6 +355,81 @@ impl RuntimeControlClient {
             connection.retire();
         }
     }
+    /// Node-owned preparation uses the existing authenticated Execd HTTP primitives.
+    /// A lost mutation response is never retried here; callers query its stable command ID.
+    pub(crate) async fn preparation_invoke(
+        &self,
+        record: &EnvironmentRecord,
+        action: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::to_vec(&serde_json::json!({"action":action,"args":args}))
+            .map_err(|_| Error::Invalid("invalid preparation command".into()))?;
+        self.preparation_http(record, "/invoke", body.into()).await
+    }
+
+    pub(crate) async fn preparation_upload(
+        &self,
+        record: &EnvironmentRecord,
+        path: &str,
+        file: &std::path::Path,
+    ) -> Result<()> {
+        let file = tokio::fs::File::open(file).await.map_err(unavailable)?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        // Staging paths contain only a generated UUID, so no query escaping is required.
+        self.preparation_http(record, &format!("/upload?type=file&path={path}"), body)
+            .await?;
+        Ok(())
+    }
+
+    async fn preparation_http(
+        &self,
+        record: &EnvironmentRecord,
+        path: &str,
+        body: reqwest::Body,
+    ) -> Result<serde_json::Value> {
+        use futures_util::StreamExt;
+        let key = self.key(record)?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(self.timeout)
+            .build()
+            .map_err(|_| unavailable("preparation transport"))?;
+        let mut request = client
+            .post(format!("http://{}{path}", key.address))
+            .header("Content-Type", "application/json")
+            .body(body);
+        if let Some(token) = &self.token {
+            request = request.header("X-Auth", token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| unavailable("preparation transport"))?;
+        let status = response.status();
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| unavailable("preparation response"))?;
+            if bytes.len().saturating_add(chunk.len()) > 4 * 1024 * 1024 {
+                return Err(unavailable("preparation response exceeds limit"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| unavailable("invalid preparation response"))?;
+        if !status.is_success()
+            || value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+        {
+            return Err(unavailable("Execd rejected preparation operation"));
+        }
+        Ok(value)
+    }
+
     async fn request(
         &self,
         record: &EnvironmentRecord,

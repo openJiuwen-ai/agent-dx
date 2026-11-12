@@ -12,6 +12,7 @@ fn preparation_phase(state: PreparationState) -> pb::SnapshotPreparationPhase {
     match state {
         PreparationState::Registered => pb::SnapshotPreparationPhase::Registered,
         PreparationState::Creating => pb::SnapshotPreparationPhase::Creating,
+        PreparationState::Preparing => pb::SnapshotPreparationPhase::Preparing,
         PreparationState::Snapshotting => pb::SnapshotPreparationPhase::Snapshotting,
         PreparationState::Cleaning => pb::SnapshotPreparationPhase::Cleaning,
         PreparationState::Ready => pb::SnapshotPreparationPhase::Ready,
@@ -52,6 +53,7 @@ fn view(
             .as_ref()
             .and_then(|usage| usage.last_spawned_at_unix_ms),
         spawn_count: template.usage.as_ref().map(|usage| usage.spawn_count),
+        source_preparation: preparation.source_preparation.clone().map(Into::into),
         image: spec.map(|spec| spec.image.clone()).unwrap_or_default(),
         envd_version: spec
             .and_then(|spec| spec.envd.as_ref())
@@ -118,6 +120,10 @@ async fn successful_view(
         ));
     }
     let build = SnapshotPreparation {
+        plan: None,
+        source_runtime_id: None,
+        source_node_session_id: None,
+        source_preparation: None,
         id: completed.preparation_id.clone(),
         created_at_unix_ms: completed.created_at_unix_ms,
         updated_at_unix_ms: completed.updated_at_unix_ms,
@@ -214,6 +220,173 @@ fn retry_preparation_error(error: &Error) -> bool {
 }
 
 impl CoordinatorRpc {
+    async fn preparation_apply(
+        &self,
+        session: &Session,
+        template: &SnapshotTemplate,
+        build: &SnapshotPreparation,
+        spec: &EnvironmentSpec,
+    ) -> Result<bool> {
+        use adx_core::snapshot_preparation::SourcePreparationStatus;
+        let plan = build
+            .plan
+            .clone()
+            .ok_or_else(|| Error::Invalid("preparation plan missing".into()))?;
+        let digest = plan.fingerprint()?;
+        let operation_id = format!("prepare-{}-{digest}", build.id);
+        let expected_runtime = build
+            .source_runtime_id
+            .as_deref()
+            .ok_or_else(|| Error::Invalid("preparation source runtime missing".into()))?;
+        let expected_revision = build
+            .expected_revision
+            .ok_or_else(|| Error::Invalid("preparation source revision missing".into()))?;
+        let (stored, mut node, node_session_id) = self.preparation_node(&spec.id).await?;
+        if build
+            .source_node_session_id
+            .as_ref()
+            .is_some_and(|session| session != &node_session_id)
+        {
+            return Err(Error::Invalid(
+                "preparation source node restarted; execution outcome cannot be replayed".into(),
+            ));
+        }
+        if build.source_node_session_id.is_none() {
+            session
+                .update_snapshot_template(&template.id, |record| {
+                    let current = preparation_mut(record, &build.id)?;
+                    if current
+                        .source_node_session_id
+                        .as_ref()
+                        .is_some_and(|old| old != &node_session_id)
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    current.source_node_session_id = Some(node_session_id.clone());
+                    Ok(())
+                })
+                .await?;
+        }
+        let record = stored
+            .result
+            .as_ref()
+            .ok_or_else(|| Error::Unavailable("preparation source is unconfirmed".into()))?;
+        if record.runtime.id != expected_runtime
+            || !preparation_seed_matches(spec, &record.spec)
+            || record.state != EnvironmentState::Running
+        {
+            return Err(Error::Invalid(
+                "preparation source execution changed".into(),
+            ));
+        }
+        let queried = if build.source_node_session_id.is_some() {
+            match node
+                .get_environment_preparation(trace::inject(pb::GetEnvironmentPreparationRequest {
+                    assignment: Some(stored.assignment.clone().try_into()?),
+                    caller: Some(pb::CallerContext {
+                        tenant_id: template.tenant_id.clone(),
+                        administrator: false,
+                    }),
+                    node_session_id: node_session_id.clone(),
+                    runtime_id: expected_runtime.into(),
+                    operation_id: operation_id.clone(),
+                    logs_offset: 0,
+                }))
+                .await
+            {
+                Ok(value) => Some(value.into_inner()),
+                Err(error) if error.code() == tonic::Code::NotFound => {
+                    return Err(Error::Invalid(
+                        "source preparation outcome is unknown; commands will not be replayed"
+                            .into(),
+                    ))
+                }
+                Err(error) => return Err(adx_protocol::dependency_status(error)),
+            }
+        } else {
+            None
+        };
+        let response = if let Some(value) = queried {
+            value
+        } else {
+            node.prepare_environment(trace::inject(pb::PrepareEnvironmentRequest {
+                assignment: Some(stored.assignment.clone().try_into()?),
+                caller: Some(pb::CallerContext {
+                    tenant_id: template.tenant_id.clone(),
+                    administrator: false,
+                }),
+                node_session_id,
+                runtime_id: expected_runtime.into(),
+                operation_id: operation_id.clone(),
+                expected_revision,
+                plan: Some(plan.into()),
+            }))
+            .await
+            .map_err(adx_protocol::dependency_status)?
+            .into_inner()
+        };
+        let result: adx_core::snapshot_preparation::SourcePreparationResult = response
+            .preparation
+            .ok_or_else(|| Error::Unavailable("preparation outcome missing".into()))?
+            .try_into()?;
+        if result.operation_id != operation_id || result.plan_sha256 != digest {
+            return Err(Error::Invalid("preparation result identity changed".into()));
+        }
+        if matches!(
+            result.status,
+            SourcePreparationStatus::Failed | SourcePreparationStatus::Unknown
+        ) {
+            let detail = result.error.clone();
+            session
+                .update_snapshot_template(&template.id, |record| {
+                    preparation_mut(record, &build.id)?.source_preparation = Some(result.clone());
+                    Ok(())
+                })
+                .await?;
+            return Err(Error::Invalid(format!(
+                "source preparation failed: {detail}"
+            )));
+        }
+        let completed_revision = if result.status == SourcePreparationStatus::Succeeded {
+            let environment = response
+                .environment
+                .ok_or_else(|| Error::Unavailable("prepared source publication missing".into()))?;
+            if environment.durability != pb::Durability::Published as i32 {
+                return Err(Error::Unavailable(
+                    "prepared source is not published".into(),
+                ));
+            }
+            let record: EnvironmentRecord = environment
+                .record
+                .ok_or_else(|| Error::Unavailable("prepared source missing".into()))?
+                .try_into()?;
+            if record.state != EnvironmentState::Running
+                || record.runtime.id != expected_runtime
+                || record.assignment != stored.assignment
+            {
+                return Err(Error::Invalid("prepared source identity changed".into()));
+            }
+            Some(record.revision)
+        } else {
+            None
+        };
+        session
+            .update_snapshot_template(&template.id, |record| {
+                let current = preparation_mut(record, &build.id)?;
+                if current.state != PreparationState::Preparing {
+                    return Err(Error::Conflict);
+                }
+                current.source_preparation = Some(result.clone());
+                if let Some(revision) = completed_revision {
+                    current.expected_revision = Some(revision);
+                    current.state = PreparationState::Snapshotting;
+                }
+                Ok(())
+            })
+            .await?;
+        Ok(completed_revision.is_some())
+    }
+
     async fn preparation_session(&self) -> Result<Session> {
         let mut state = self.0.state.lock().await;
         state.recover_authoritative_state().await?;
@@ -439,6 +612,7 @@ impl CoordinatorRpc {
             if matches!(
                 build.state,
                 PreparationState::Creating
+                    | PreparationState::Preparing
                     | PreparationState::Snapshotting
                     | PreparationState::Cleaning
             ) {
@@ -468,6 +642,7 @@ impl CoordinatorRpc {
                             current.state = PreparationState::Failed;
                         }
                         current.spec = None;
+                        current.plan = None;
                         Ok(())
                     })
                     .await?;
@@ -568,11 +743,28 @@ impl CoordinatorRpc {
                         if current.state != PreparationState::Creating {
                             return Err(Error::Conflict);
                         }
-                        current.state = PreparationState::Snapshotting;
+                        current.state = if current.plan.is_some() {
+                            PreparationState::Preparing
+                        } else {
+                            PreparationState::Snapshotting
+                        };
+                        current.source_runtime_id = Some(created.runtime.id.clone());
                         current.expected_revision = Some(created.revision);
                         Ok(())
                     })
                     .await?;
+            }
+            let preparing_template = session
+                .get_snapshot_template(&tenant_id, &template_id)
+                .await?;
+            let preparing = preparation(&preparing_template, &build_id)?;
+            if preparing.state == PreparationState::Preparing {
+                let complete = self
+                    .preparation_apply(&session, &preparing_template, preparing, &spec)
+                    .await?;
+                if !complete {
+                    return Ok(());
+                }
             }
             let current_template = session
                 .get_snapshot_template(&tenant_id, &template_id)
@@ -617,6 +809,7 @@ impl CoordinatorRpc {
                     current.state = PreparationState::Ready;
                     current.error = None;
                     current.spec = None;
+                    current.plan = None;
                     Ok(())
                 })
                 .await?;
@@ -675,6 +868,7 @@ impl CoordinatorRpc {
             if matches!(
                 build.state,
                 PreparationState::Creating
+                    | PreparationState::Preparing
                     | PreparationState::Snapshotting
                     | PreparationState::Cleaning
             ) || build.cleanup_pending
@@ -772,6 +966,22 @@ impl SnapshotPreparationService for CoordinatorRpc {
         spec.run_policy = None;
         spec.snapshot_id = None;
         spec.resources = build.resources;
+        let plan: Option<adx_core::snapshot_preparation::PreparationPlan> = request
+            .plan
+            .clone()
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(status)?;
+        if plan.is_some() {
+            if spec.scheduling.required_node.is_empty() {
+                spec.scheduling.required_node.push(Default::default());
+            }
+            for selector in &mut spec.scheduling.required_node {
+                selector
+                    .match_labels
+                    .insert("ADX_SOURCE_PREPARATION".into(), "1".into());
+            }
+        }
         spec.validate().map_err(status)?;
         if build.state != PreparationState::Registered {
             return Err(Status::invalid_argument(
@@ -788,6 +998,7 @@ impl SnapshotPreparationService for CoordinatorRpc {
                     return Err(Error::Conflict);
                 }
                 current.state = PreparationState::Creating;
+                current.plan = plan.clone();
                 current.spec = Some(spec.clone());
                 current.cleanup_pending = true;
                 Ok(())
@@ -1108,6 +1319,10 @@ mod tests {
     fn family_view_preserves_real_phase_identity_and_resources() {
         let spec = source();
         let build = SnapshotPreparation {
+            plan: None,
+            source_runtime_id: None,
+            source_node_session_id: None,
+            source_preparation: None,
             id: "00000000-0000-4000-8000-000000000001".into(),
             created_at_unix_ms: 20,
             updated_at_unix_ms: 30,

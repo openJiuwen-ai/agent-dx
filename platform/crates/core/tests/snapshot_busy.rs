@@ -40,6 +40,49 @@ fn snapshot() -> Snapshot {
 }
 
 #[test]
+fn golden_capture_drops_source_route_credentials_without_changing_regular_captures() {
+    use adx_core::{environment_control::EnvironmentCompatibility, snapshots::SnapshotKind};
+    let mut source = snapshot();
+    source.template.compatibility = Some(EnvironmentCompatibility {
+        template_id: "family".into(),
+        envd_access_token: "a".repeat(32),
+        traffic_access_token: "b".repeat(32),
+        allow_public_traffic: false,
+    });
+    for kind in [SnapshotKind::Regular, SnapshotKind::Golden] {
+        let capture = Snapshot::new_with_kind(
+            kind,
+            source.id.clone(),
+            source.names.clone(),
+            source.template.clone(),
+            source.source_node_id.clone(),
+            source.source_runtime_id.clone(),
+            source.artifact.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            capture.template.compatibility.is_none(),
+            kind == SnapshotKind::Golden
+        );
+        assert!(capture.matches_template(&source.template));
+        if kind == SnapshotKind::Golden {
+            let mut legacy = capture.clone();
+            legacy.template.compatibility = source.template.compatibility.clone();
+            assert!(!capture.same_content(&legacy));
+            assert!(!legacy.same_content(&capture));
+        }
+        let mut changed = source.template.clone();
+        changed.image = "another-image".into();
+        assert!(!capture.matches_template(&changed));
+    }
+    // Reading an older Golden retains its fixed source identity and strict comparison.
+    source.kind = SnapshotKind::Golden;
+    let mut changed = source.template.clone();
+    changed.compatibility.as_mut().unwrap().traffic_access_token = "c".repeat(32);
+    assert!(!source.matches_template(&changed));
+}
+
+#[test]
 fn busy_delete_reports_users_and_keeps_ready_revision() {
     let mut snapshot = snapshot();
     for id in ["sandbox-b", "sandbox-a"] {

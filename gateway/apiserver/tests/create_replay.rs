@@ -1512,7 +1512,12 @@ async fn legacy_e2b_resume_rejects_unsupported_options_before_recovery() {
 
 #[tokio::test]
 async fn paused_e2b_connect_carries_duration_through_recovery_and_only_extends_afterwards() {
-    for unavailable in [false, true] {
+    for (prefix, unavailable) in [
+        ("/sandboxes", false),
+        ("/sandboxes", true),
+        ("/v2/sandboxes", false),
+        ("/v2/sandboxes", true),
+    ] {
         let fixture = Fixture::new().await;
         let headers = [
             ("X-API-Key", "k".repeat(32)),
@@ -1544,7 +1549,7 @@ async fn paused_e2b_connect_carries_duration_through_recovery_and_only_extends_a
             .state
             .control_owner_unavailable
             .store(unavailable, Ordering::SeqCst);
-        let path = format!("/v2/sandboxes/{id}/connect");
+        let path = format!("{prefix}/{id}/connect");
         let response = http::request(
             fixture.api.clone(),
             "POST",
