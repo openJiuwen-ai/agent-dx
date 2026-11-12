@@ -1712,3 +1712,281 @@ fn writeback_readiness_is_true_only_when_a_pass_can_act() {
     assert_eq!(fs.progress_writeback().unwrap(), 1);
     assert!(!fs.writeback_ready().unwrap());
 }
+
+/// Meta stand-in for performance batch 1 (D): `retain_fenced` can be held
+/// closed or scripted to fail; `collect` plans like Meta (`plan_bounded`): an
+/// inventoried chunk is reclaimed unless an admitted, unreleased `write:`
+/// reference names its write generation.
+#[derive(Default)]
+struct GatedAdmissionMeta {
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+    /// Wire ids of admission attempts, in order.
+    attempts: Mutex<Vec<String>>,
+    /// Errors returned by the next attempts, front first.
+    failures: Mutex<std::collections::VecDeque<Error>>,
+    /// Stored generation ids of admitted, unreleased `write:` references.
+    admitted: Mutex<HashSet<String>>,
+    released: Mutex<Vec<String>>,
+    reclaimed: Mutex<Vec<crate::dfs::ChunkId>>,
+}
+
+impl GatedAdmissionMeta {
+    fn open_gate(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+fn stored_generation(id: &str) -> Option<String> {
+    id.strip_prefix("write:")
+        .map(|operation| ChunkObject::generation_id(&crate::dfs::OperationId::new(operation)))
+}
+
+impl crate::node::gc::GcControl for GatedAdmissionMeta {
+    fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
+        Ok(())
+    }
+    fn retain_fenced(
+        &self,
+        id: &str,
+        _: &InodeId,
+        _: Option<&FileVersionId>,
+    ) -> Result<crate::dfs::GcFence> {
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.opened.wait(open).unwrap();
+        }
+        drop(open);
+        self.attempts.lock().unwrap().push(id.into());
+        if let Some(error) = self.failures.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.admitted.lock().unwrap().extend(stored_generation(id));
+        Ok(crate::dfs::GcFence::WriteGeneration)
+    }
+    fn release(&self, ids: &[String]) -> Result<()> {
+        let mut admitted = self.admitted.lock().unwrap();
+        for id in ids {
+            if let Some(generation) = stored_generation(id) {
+                admitted.remove(&generation);
+            }
+        }
+        self.released.lock().unwrap().extend_from_slice(ids);
+        Ok(())
+    }
+    fn collect(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {
+        if inventory.is_empty() {
+            return Ok(crate::dfs::GcState {
+                generation: completed,
+                ..Default::default()
+            });
+        }
+        let admitted = self.admitted.lock().unwrap();
+        let chunks = inventory
+            .into_iter()
+            .filter(|chunk| {
+                !chunk
+                    .write_generation()
+                    .is_some_and(|generation| admitted.contains(generation))
+            })
+            .map(|chunk| chunk.id)
+            .collect::<Vec<_>>();
+        self.reclaimed
+            .lock()
+            .unwrap()
+            .extend(chunks.iter().cloned());
+        Ok(crate::dfs::GcState {
+            generation: completed + 1,
+            waiting_nodes: if chunks.is_empty() {
+                Vec::new()
+            } else {
+                vec!["node-a".into()]
+            },
+            chunks,
+        })
+    }
+}
+
+fn gated_collector(
+    control: Arc<GatedAdmissionMeta>,
+    store: &Arc<NativeFixtureStore>,
+) -> crate::node::gc::Collector {
+    let engine = Arc::new(crate::node::read::engine::DfsReadEngine::new(
+        crate::dfs::NamespaceId::new("default"),
+        "node-a".into(),
+        store.local.clone(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
+    ));
+    crate::node::gc::Collector::new(
+        crate::node::gc::GcReferences::new(control),
+        store.local.clone(),
+        engine,
+        "node-a".into(),
+    )
+}
+
+/// D (GC safety): the first write only starts the generation's admission;
+/// until Meta admits it no chunk of the generation exists anywhere GC can
+/// see, so a collection pass in that window reclaims nothing. Afterwards the
+/// upload, the commit and the read-back all succeed.
+#[test]
+fn deferred_admission_keeps_every_chunk_out_of_gc_until_admitted() {
+    let (_temp, _meta, fs, _runtime, store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    let control = Arc::new(GatedAdmissionMeta::default());
+    let references = crate::node::gc::GcReferences::new(control.clone());
+    let fs = Arc::new(fs.with_gc_references(Some(references.clone())));
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("gated"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    // A full 4 MiB builder seals and starts its upload during the write.
+    let body = (0..4 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fs.write(&context(), file.handle, 0, &body).unwrap(),
+        body.len(),
+        "the write thread must not wait for the admission"
+    );
+    let syncing = {
+        let fs = fs.clone();
+        std::thread::spawn(move || fs.fsync(&context(), file.handle, SyncMode::Full))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(control.attempts.lock().unwrap().is_empty());
+    assert!(
+        store.local.gc_inventory().unwrap().is_empty(),
+        "no chunk may be persisted before its write reference is admitted"
+    );
+    let collector = gated_collector(control.clone(), &store);
+    assert_eq!(collector.collect_once().unwrap(), 0);
+    assert!(control.reclaimed.lock().unwrap().is_empty());
+    assert!(!syncing.is_finished(), "fsync waits for the admission");
+
+    control.open_gate();
+    syncing.join().unwrap().unwrap();
+    let inventory = store.local.gc_inventory().unwrap();
+    assert!(!inventory.is_empty());
+    // The admitted, still pinned generation protects what it uploaded.
+    assert_eq!(collector.collect_once().unwrap(), 0);
+    assert!(control.reclaimed.lock().unwrap().is_empty());
+    let mut actual = vec![0; body.len()];
+    assert_eq!(
+        fs.read(&context(), file.handle, 0, &mut actual).unwrap(),
+        body.len()
+    );
+    assert_eq!(actual, body);
+    let attempts = control.attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len(), 1);
+    assert!(attempts[0].starts_with("write:"));
+}
+
+/// D: a failed admission Meta may still accept is retried once with the
+/// same reference id by the next waiter; the write publishes normally.
+#[test]
+fn transient_admission_failure_is_retried_with_the_same_reference_id() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    let control = Arc::new(GatedAdmissionMeta::default());
+    control.open_gate();
+    control
+        .failures
+        .lock()
+        .unwrap()
+        .push_back(Error::coded(afs_error::IO_UNAVAILABLE, "lost reply"));
+    let references = crate::node::gc::GcReferences::new(control.clone());
+    let fs = fs.with_gc_references(Some(references));
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("retry"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), file.handle, 0, b"retry me").unwrap();
+    fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+    let attempts = control.attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], attempts[1], "a retry reuses the reference id");
+    assert_eq!(meta.commits.lock().unwrap().len(), 1);
+}
+
+/// D: Meta refuses the admission for good (deadline passed). The accepted
+/// bytes are never persisted and never reported as durable: the refusal
+/// reaches the writer at fsync or at close (flush), and the next open for
+/// write discards the generation, queuing its reference for release.
+#[test]
+fn permanent_admission_failure_rejects_the_generation_and_releases_its_pin() {
+    let (_temp, meta, fs, _runtime, store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    let control = Arc::new(GatedAdmissionMeta::default());
+    control.open_gate();
+    for _ in 0..32 {
+        control.failures.lock().unwrap().push_back(Error::coded(
+            afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED,
+            "reference admission deadline expired",
+        ));
+    }
+    let references = crate::node::gc::GcReferences::new(control.clone());
+    let fs = fs.with_gc_references(Some(references.clone()));
+    for (name, via_fsync) in [("expired-fsync", true), ("expired-close", false)] {
+        control.attempts.lock().unwrap().clear();
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new(name),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), file.handle, 0, &vec![5; 4 * 1024 * 1024])
+            .unwrap();
+        let error = if via_fsync {
+            let error = fs
+                .fsync(&context(), file.handle, SyncMode::Full)
+                .unwrap_err();
+            let _ = fs.release(&context(), file.handle);
+            error
+        } else {
+            // close(2): FUSE FLUSH, then RELEASE.
+            let error = fs.flush(&context(), file.handle).unwrap_err();
+            let _ = fs.release(&context(), file.handle);
+            error
+        };
+        assert_eq!(
+            error.code(),
+            afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED,
+            "{name}"
+        );
+        assert!(store.local.gc_inventory().unwrap().is_empty(), "{name}");
+        assert!(meta.commits.lock().unwrap().is_empty(), "{name}");
+        let attempts = control.attempts.lock().unwrap().clone();
+        assert!(!attempts.is_empty() && attempts.iter().all(|id| id == &attempts[0]));
+        let reopened = fs.open(&context(), file.entry.inode, libc::O_RDWR).unwrap();
+        // The background pass harvests the last failed upload task, which
+        // holds the generation pin too.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !control.released.lock().unwrap().contains(&attempts[0]) && Instant::now() < deadline
+        {
+            // The pass also reports the harvested upload's error Node-wide.
+            let _ = fs.progress_writeback();
+            references.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            control.released.lock().unwrap().contains(&attempts[0]),
+            "{name}: the abandoned generation's reference is queued for release"
+        );
+        fs.release(&context(), reopened)
+            .unwrap_or_else(|error| panic!("{name}: fresh writer saw {error}"));
+    }
+}

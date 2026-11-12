@@ -42,7 +42,8 @@ impl DfsMetaService for DfsMetaRpc {
             })
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
-        // No payload is admitted by the Node until this response is received.
+        // No payload is persisted by the Node until this response is received:
+        // a write generation's chunks wait for it (Node `GcPin::admitted`).
         let gc_fence = capture.then(|| crate::dfs::GcFence::WriteGeneration.wire());
         self.0.observability.record("meta", observation, true);
         Ok(Response::new(

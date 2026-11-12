@@ -16,5 +16,5 @@ mod collect;
 mod references;
 
 pub(crate) use collect::{Collector, ExternalObjects};
-pub(crate) use references::GcReleaseMetrics;
 pub use references::{GcBatch, GcControl, GcPin, GcReferences};
+pub(crate) use references::{GcReleaseMetrics, is_permanent_admission_failure};
