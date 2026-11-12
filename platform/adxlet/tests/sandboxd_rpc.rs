@@ -430,6 +430,92 @@ fn local_bind_mount_includes_the_oci_bind_flag() {
     assert!(mount.options.iter().any(|option| option == "nosuid"));
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn explicit_runsc_handle_option_is_normalized_for_create_and_restore_only() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let mut environment = spec();
+    environment
+        .execution
+        .mounts
+        .push(adx_core::execution::Mount {
+            create_if_missing: false,
+            create_options: None,
+            kind: "bind".into(),
+            target: "/workspace".into(),
+            options: vec![
+                "rw".into(),
+                "disable_file_handle_sharing".into(),
+                "disable_file_handle_sharing".into(),
+            ],
+            source: adx_core::execution::StorageSource::Local(
+                workspace.path().to_str().unwrap().into(),
+            )
+            .into(),
+        });
+    let original = environment.execution.mounts[0].options.clone();
+    adapter
+        .start(&environment, "handle-create", 1, &[])
+        .await
+        .unwrap();
+    adapter.remove("handle-create").await.unwrap();
+    server.release.add_permits(1);
+    let checkpoint = tempfile::tempdir().unwrap();
+    adapter
+        .restore(&environment, "handle-restore", 2, &[], checkpoint.path())
+        .await
+        .unwrap();
+    adapter.remove("handle-restore").await.unwrap();
+    let starts = server.starts.lock().unwrap();
+    assert_eq!(starts.len(), 2);
+    for request in starts.iter() {
+        let mount = request
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/workspace")
+            .unwrap();
+        assert_eq!(
+            mount
+                .options
+                .iter()
+                .filter(|value| value.as_str() == "disable_file_handle_sharing")
+                .count(),
+            1
+        );
+    }
+    assert_eq!(environment.execution.mounts[0].options, original);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn explicit_runsc_handle_option_rejects_unavailable_source_before_rpc() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut environment = spec();
+    environment
+        .execution
+        .mounts
+        .push(adx_core::execution::Mount {
+            create_if_missing: false,
+            create_options: None,
+            kind: "bind".into(),
+            target: "/workspace".into(),
+            options: vec!["rw".into(), "disable_file_handle_sharing".into()],
+            source: adx_core::execution::StorageSource::Local(
+                directory.path().join("missing").to_str().unwrap().into(),
+            )
+            .into(),
+        });
+    assert!(adapter
+        .start(&environment, "handle-unavailable", 1, &[])
+        .await
+        .is_err());
+    assert!(server.starts.lock().unwrap().is_empty());
+}
+
 #[test]
 fn kata_start_preserves_explicit_terminal_mount() {
     let mut spec = spec();

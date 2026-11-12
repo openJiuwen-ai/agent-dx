@@ -15,6 +15,8 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
 use tower::service_fn;
 
+mod runsc_mounts;
+
 pub mod proto {
     tonic::include_proto!("runtime.v1");
 }
@@ -265,8 +267,9 @@ impl Sandboxd {
                     .insert("ADX_ENV_FILE".into(), info.restore_env_path);
             }
         }
-        let request = start_request(spec, runtime_id, generation, devices, &config)?;
+        let mut request = start_request(spec, runtime_id, generation, devices, &config)?;
         crate::managed_mounts::prepare(spec).await?;
+        runsc_mounts::normalize(&mut request).await?;
         Ok(self.request(request))
     }
 

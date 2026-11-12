@@ -156,6 +156,14 @@ class TypesTests(unittest.TestCase):
         self.assertEqual(mount.to_dict()["options"], ["rw"])
         self.assertEqual(Mount(target="/tool", image_url="image:v1").to_dict()["options"], ["ro"])
 
+    def test_explicit_runsc_handle_option_is_retained_for_host_and_volume_binds(self):
+        for source in ({"host_path": "/shared/user"}, {"volume_id": "workspace"}):
+            with self.subTest(source=source):
+                mount = Mount(target="/workspace", options=("rw", "disable_file_handle_sharing"), **source)
+                self.assertEqual(mount.to_dict()["options"], ["rw", "disable_file_handle_sharing"])
+        with self.assertRaises(ValueError):
+            Mount(target="/image", image_url="image:v1", options=("ro", "disable_file_handle_sharing"))
+
     def test_resources_uses_process_configuration(self):
         parameters = inspect.signature(resources).parameters
         self.assertEqual(list(parameters), ["connection"])
