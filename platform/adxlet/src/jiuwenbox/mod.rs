@@ -351,10 +351,7 @@ impl Jiuwenbox {
             .ok_or_else(|| unavailable("invalid Jiuwenbox inventory"))
     }
     fn root(&self) -> PathBuf {
-        self.config
-            .state_dir
-            .join("bootstrap")
-            .join(&self.config.bootstrap.sha256)
+        self.config.state_dir.join("bootstrap").join("current")
     }
     async fn prepare_bootstrap(&self) -> Result<PathBuf> {
         self.bootstrap_root
