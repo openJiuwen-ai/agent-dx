@@ -35,6 +35,12 @@ pub struct ImagePlan {
     pub blobs: Vec<RegistrySource>,
 }
 
+pub(super) struct RegistryManifest {
+    pub digest: String,
+    pub content_type: header::HeaderValue,
+    pub body: Bytes,
+}
+
 struct Source {
     config: RegistryConfig,
     password: Option<String>,
@@ -44,6 +50,7 @@ struct Source {
 pub struct RegistryProvider {
     client: Client,
     sources: BTreeMap<String, Source>,
+    proxy_sources: BTreeMap<String, String>,
     node_id: String,
     tokens: tokio::sync::Mutex<BTreeMap<String, (String, Instant)>>,
 }
@@ -56,9 +63,20 @@ impl RegistryProvider {
             .build()
             .map_err(|_| unavailable("cannot construct Registry HTTP client"))?;
         let mut resolved = BTreeMap::new();
+        let mut proxy_sources = BTreeMap::new();
         for (key, config) in sources {
             validate_component(key)?;
             validate_registry(config)?;
+            if config.registry_proxy
+                && proxy_sources
+                    .insert(config.repository.clone(), key.clone())
+                    .is_some()
+            {
+                return Err(Error::coded(
+                    afs_error::CONFIG_INVALID,
+                    "duplicate repository in Nydus Registry proxy sources",
+                ));
+            }
             resolved.insert(
                 key.clone(),
                 Source {
@@ -71,6 +89,7 @@ impl RegistryProvider {
         Ok(Arc::new(Self {
             client,
             sources: resolved,
+            proxy_sources,
             node_id: node_id.into(),
             tokens: Default::default(),
         }))
@@ -101,6 +120,16 @@ impl RegistryProvider {
             .ok_or_else(|| Error::coded(afs_error::IO_NOT_FOUND, "unknown Registry source key"))
     }
 
+    pub(super) fn proxy_source(&self, repository: &str) -> Result<(&str, &RegistryConfig)> {
+        let key = self.proxy_sources.get(repository).ok_or_else(|| {
+            Error::coded(
+                afs_error::IO_NOT_FOUND,
+                "repository is not configured for proxy reads",
+            )
+        })?;
+        Ok((key, &self.source(key)?.config))
+    }
+
     fn validate_blob(&self, blob: &RegistrySource) -> Result<&Source> {
         let source = self.source(&blob.source_key)?;
         if source.config.registry != blob.registry
@@ -119,22 +148,9 @@ impl RegistryProvider {
         manifest: &str,
         deadline: Instant,
     ) -> Result<ImagePlan> {
-        let source = self.source(key)?;
         let manifest = digest(manifest)?;
-        let url = format!(
-            "{}/v2/{}/manifests/{}",
-            source.config.registry.trim_end_matches('/'),
-            source.config.repository,
-            manifest
-        );
-        let response = self.request(key, &url, None, deadline).await?;
-        if response.status() != StatusCode::OK {
-            return Err(origin_status(response.status()));
-        }
-        let bytes = bounded_body(response, MANIFEST_LIMIT, deadline).await?;
-        if format!("sha256:{:x}", Sha256::digest(&bytes)) != manifest {
-            return Err(invalid("Registry manifest digest mismatch"));
-        }
+        let source = self.source(key)?;
+        let bytes = self.fetch_manifest(key, &manifest, deadline).await?.body;
         #[derive(Deserialize)]
         struct Descriptor {
             digest: String,
@@ -188,6 +204,86 @@ impl RegistryProvider {
         })
     }
 
+    pub(super) async fn fetch_manifest(
+        &self,
+        key: &str,
+        reference: &str,
+        deadline: Instant,
+    ) -> Result<RegistryManifest> {
+        if reference.contains(':') {
+            require_digest(reference)?;
+        } else if reference.len() > 128
+            || !reference
+                .as_bytes()
+                .first()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            || !reference
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+        {
+            return Err(invalid("invalid Registry manifest reference"));
+        }
+        let source = self.source(key)?;
+        let url = format!(
+            "{}/v2/{}/manifests/{reference}",
+            source.config.registry.trim_end_matches('/'),
+            source.config.repository,
+        );
+        let response = self.request(key, Method::GET, &url, None, deadline).await?;
+        if response.status() != StatusCode::OK {
+            return Err(origin_status(response.status()));
+        }
+        let headers = response.headers();
+        let claimed = headers.get("docker-content-digest").cloned();
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .cloned()
+            .unwrap_or_else(|| {
+                header::HeaderValue::from_static("application/vnd.oci.image.manifest.v1+json")
+            });
+        let body = bounded_body(response, MANIFEST_LIMIT, deadline).await?;
+        let digest = format!("sha256:{:x}", Sha256::digest(&body));
+        if reference.contains(':') && reference != digest
+            || claimed.is_some_and(|value| value != digest.as_str())
+        {
+            return Err(invalid("Registry manifest digest mismatch"));
+        }
+        Ok(RegistryManifest {
+            digest,
+            content_type,
+            body,
+        })
+    }
+
+    pub(super) async fn blob_size(&self, key: &str, blob: &str, deadline: Instant) -> Result<u64> {
+        let source = self.source(key)?;
+        let url = format!(
+            "{}/v2/{}/blobs/{blob}",
+            source.config.registry.trim_end_matches('/'),
+            source.config.repository,
+        );
+        let response = self
+            .request(key, Method::HEAD, &url, None, deadline)
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(origin_status(response.status()));
+        }
+        if response
+            .headers()
+            .get("docker-content-digest")
+            .is_some_and(|value| value != blob)
+        {
+            return Err(invalid("Registry blob digest mismatch"));
+        }
+        response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|size| *size <= i64::MAX as u64)
+            .ok_or_else(|| invalid("invalid Registry blob length"))
+    }
+
     pub async fn fetch_range(
         &self,
         blob: &RegistrySource,
@@ -208,7 +304,7 @@ impl RegistryProvider {
             blob.blob_digest
         );
         let response = self
-            .request(&blob.source_key, &url, Some(&range), deadline)
+            .request(&blob.source_key, Method::GET, &url, Some(&range), deadline)
             .await?;
         let expected = format!("bytes {offset}-{}/{}", end - 1, blob.size);
         if response.status() != StatusCode::PARTIAL_CONTENT {
@@ -236,6 +332,7 @@ impl RegistryProvider {
     async fn request(
         &self,
         key: &str,
+        method: Method,
         uri: &str,
         range: Option<&str>,
         deadline: Instant,
@@ -248,7 +345,7 @@ impl RegistryProvider {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or_else(|| unavailable("Registry deadline exceeded"))?;
-            let mut request = self.client.request(Method::GET, url.clone()).timeout(remaining)
+            let mut request = self.client.request(method.clone(), url.clone()).timeout(remaining)
                 .header(header::ACCEPT_ENCODING,"identity").header("x-afs-node", &self.node_id)
                 .header(header::ACCEPT,"application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json");
             if let Some(range) = range {
@@ -397,6 +494,13 @@ impl RegistryProvider {
     }
 }
 
+pub(super) fn require_digest(value: &str) -> Result<()> {
+    if digest(value)? != value {
+        return Err(invalid("expected canonical sha256 digest"));
+    }
+    Ok(())
+}
+
 pub fn digest(value: &str) -> Result<String> {
     let hex = value.strip_prefix("sha256:").unwrap_or(value);
     if hex.len() != 64
@@ -530,6 +634,30 @@ mod tests {
             assert!(validate_component(bad).is_err());
         }
     }
+
+    #[test]
+    fn registry_proxy_requires_an_unambiguous_configured_repository() {
+        let mut config: RegistryConfig = serde_json::from_value(serde_json::json!({
+            "registry": "https://registry.example.com",
+            "repository": "team/project/image"
+        }))
+        .unwrap();
+        let sources = |config: &RegistryConfig| BTreeMap::from([("first".into(), config.clone())]);
+        let provider = RegistryProvider::new(&sources(&config), "node-a").unwrap();
+        assert!(provider.proxy_source(&config.repository).is_err());
+
+        config.registry_proxy = true;
+        let provider = RegistryProvider::new(&sources(&config), "node-a").unwrap();
+        assert_eq!(
+            provider.proxy_source(&config.repository).unwrap().0,
+            "first"
+        );
+        assert!(provider.proxy_source("other/project/image").is_err());
+
+        let mut duplicate = sources(&config);
+        duplicate.insert("second".into(), config);
+        assert!(RegistryProvider::new(&duplicate, "node-a").is_err());
+    }
     async fn response_fixture(
         response: &'static str,
     ) -> (
@@ -556,6 +684,7 @@ mod tests {
             registry: registry.clone(),
             allow_insecure_http: true,
             repository: "test/image".into(),
+            registry_proxy: false,
             username: None,
             password_file: None,
             bearer_token_file: None,

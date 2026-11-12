@@ -1,17 +1,18 @@
 //! Nydus HEAD/GET transport. There is no mandatory management prepare endpoint.
-use super::service::NydusService;
+use super::service::{BlobStat, NydusService};
 use afs_error::{Error, ErrorKind, Result};
 use axum::{
     Router,
     body::Body,
     extract::{ConnectInfo, Path, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
 use sha2::{Digest, Sha256};
-use std::{io::Read, net::SocketAddr, path::Path as FilePath, sync::Arc};
+use std::{io::Read, net::SocketAddr, path::Path as FilePath, sync::Arc, time::Instant};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 pub(super) fn load_token_hash(path: &FilePath) -> Result<[u8; 32]> {
@@ -32,12 +33,97 @@ pub(super) fn load_token_hash(path: &FilePath) -> Result<[u8; 32]> {
 
 pub fn routes(service: Arc<NydusService>, token_hash: Option<[u8; 32]>) -> Router {
     Router::new()
+        .route("/v2/", get(registry_ping))
+        .route("/v2/{*reference}", get(registry_read).head(registry_read))
         .route(
             "/nydus/{source}/{manifest}/blobs/{blob}",
             get(get_blob).head(head_blob),
         )
         .route_layer(middleware::from_fn_with_state(token_hash, require_access))
         .with_state(service)
+}
+
+const DISTRIBUTION_VERSION: &str = "docker-distribution-api-version";
+const CONTENT_DIGEST: &str = "docker-content-digest";
+
+async fn registry_ping() -> impl IntoResponse {
+    ([(DISTRIBUTION_VERSION, "registry/2.0")], StatusCode::OK)
+}
+
+async fn registry_read(
+    State(service): State<Arc<NydusService>>,
+    Path(path): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let Some((repository, kind, reference)) = registry_reference(&path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response =
+        match serve_registry(service, repository, kind, reference, method, headers).await {
+            Ok(response) => response,
+            Err(error) => failure(error),
+        };
+    response.headers_mut().insert(
+        DISTRIBUTION_VERSION,
+        HeaderValue::from_static("registry/2.0"),
+    );
+    response
+}
+
+fn registry_reference(path: &str) -> Option<(&str, &str, &str)> {
+    let (prefix, reference) = path.rsplit_once('/')?;
+    let (repository, kind) = prefix.rsplit_once('/')?;
+    if repository.is_empty() || reference.is_empty() || !matches!(kind, "blobs" | "manifests") {
+        return None;
+    }
+    Some((repository, kind, reference))
+}
+
+async fn serve_registry(
+    service: Arc<NydusService>,
+    repository: &str,
+    kind: &str,
+    reference: &str,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let deadline = service.deadline();
+    let permit = service.admit(deadline).await?;
+    if kind == "manifests" {
+        let manifest = service
+            .registry_manifest(repository, reference, deadline)
+            .await?;
+        let length = manifest.body.len();
+        let body = if method == Method::HEAD {
+            Body::empty()
+        } else {
+            Body::from(manifest.body)
+        };
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, length)
+            .header(header::CONTENT_TYPE, manifest.content_type)
+            .header(CONTENT_DIGEST, manifest.digest)
+            .body(body)
+            .map_err(|_| invalid("cannot construct Registry manifest response"));
+    }
+    let stat = service
+        .stat_registry_blob(repository, reference, deadline, permit.clone())
+        .await?;
+    let mut reply = if method == Method::HEAD {
+        response(StatusCode::OK, Body::empty(), stat.size, None)?
+    } else {
+        read_stat(service, stat, &headers, deadline, permit).await?
+    };
+    if reply.status().is_success() {
+        reply.headers_mut().insert(
+            CONTENT_DIGEST,
+            HeaderValue::from_str(reference)
+                .map_err(|_| invalid("invalid Registry response digest"))?,
+        );
+    }
+    Ok(reply)
 }
 
 async fn require_access(
@@ -117,11 +203,31 @@ async fn read(
     let stat = service
         .stat_blob(source, manifest, blob, deadline, permit.clone())
         .await?;
+    read_stat(service, stat, &headers, deadline, permit).await
+}
+
+async fn read_stat(
+    service: Arc<NydusService>,
+    stat: BlobStat,
+    headers: &HeaderMap,
+    deadline: Instant,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Result<Response> {
     let range = headers
         .get(header::RANGE)
         .map(|v| v.to_str().map_err(|_| invalid("invalid Range header")))
         .transpose()?;
-    let (offset, length) = parse_range(range, stat.size)?;
+    let (offset, length) = match parse_range(range, stat.size) {
+        Err(error) if error.kind() == ErrorKind::OutOfRange => {
+            return response(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                Body::empty(),
+                0,
+                Some(format!("bytes */{}", stat.size)),
+            );
+        }
+        result => result?,
+    };
     let status = if range.is_some() {
         StatusCode::PARTIAL_CONTENT
     } else {
@@ -168,6 +274,7 @@ fn failure(error: Error) -> Response {
         ErrorKind::InvalidArgument => StatusCode::BAD_REQUEST,
         ErrorKind::OutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,
         ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
         ErrorKind::AlreadyExists => StatusCode::CONFLICT,
         ErrorKind::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::BAD_GATEWAY,

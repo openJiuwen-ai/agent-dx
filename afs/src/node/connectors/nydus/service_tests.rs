@@ -229,6 +229,34 @@ fn fixture() -> (Arc<LostReplyBackend>, NydusService, ImagePlan) {
     *backend.plan_bytes.lock().unwrap() = serde_json::to_vec(&plan).unwrap();
     (backend, service, plan)
 }
+
+#[tokio::test]
+async fn registry_proxy_ping_accepts_loopback_clients() {
+    use axum::{
+        body::Body,
+        extract::ConnectInfo,
+        http::{Request, StatusCode},
+    };
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    let (_, service, _) = fixture();
+    let reply = super::super::http::routes(Arc::new(service), None)
+        .oneshot(
+            Request::builder()
+                .uri("/v2/")
+                .extension(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    assert_eq!(
+        reply.headers()["docker-distribution-api-version"],
+        "registry/2.0"
+    );
+}
 #[test]
 fn publication_lost_reply_keeps_published_tree_and_confirms_identity() {
     let (_, service, plan) = fixture();
