@@ -5,8 +5,8 @@ use http::{HeaderMap, HeaderValue};
 use ring::hmac;
 use serde_json::json;
 
-const SECRET: &[u8] = b"controlled-webhook-secret";
-const NOW: u64 = 2_000_000_000;
+pub(super) const SECRET: &[u8] = b"controlled-webhook-secret";
+pub(super) const NOW: u64 = 2_000_000_000;
 
 #[test]
 fn python_standard_library_hmac_vector_is_accepted() {
@@ -25,13 +25,13 @@ fn python_standard_library_hmac_vector_is_accepted() {
         .is_ok());
 }
 
-fn body(id: &str, text: &str) -> Vec<u8> {
+pub(super) fn body(id: &str, text: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({"id":id,"type":"composio.trigger.message","metadata":{
         "trigger_id":"ti_one","trigger_slug":"GMAIL_NEW_GMAIL_MESSAGE","connected_account_id":"ca_one",
         "auth_config_id":"ac_custom","user_id":"dm_user"},"data":{"text":text}})).unwrap()
 }
 
-fn headers(raw: &[u8], seconds: u64, key: &[u8]) -> HeaderMap {
+pub(super) fn headers(raw: &[u8], seconds: u64, key: &[u8]) -> HeaderMap {
     let timestamp = seconds.to_string();
     let mut message = format!("wh_one.{timestamp}.").into_bytes();
     message.extend_from_slice(raw);
@@ -47,8 +47,13 @@ fn headers(raw: &[u8], seconds: u64, key: &[u8]) -> HeaderMap {
     headers
 }
 
-fn binding() -> SubscriptionBinding {
+pub(super) fn binding() -> SubscriptionBinding {
     SubscriptionBinding {
+        tenant: "tenant_one".into(),
+        user_id: "user_one".into(),
+        connection_id: "connection_one".into(),
+        template: "digitalmate".into(),
+        template_ref: "1".into(),
         subscription_id: "sub_one".into(),
         subscription_generation: 1,
         connection_generation: 3,

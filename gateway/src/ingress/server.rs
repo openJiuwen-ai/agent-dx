@@ -349,6 +349,8 @@ pub struct Ingress {
     #[cfg(feature = "agent-api")]
     digitalmategateway_api:
         Option<Arc<super::digitalmategateway::entrypoint::DigitalMateGatewayApi>>,
+    #[cfg(feature = "agent-api")]
+    ingestion_webhook: Option<Arc<super::digitalmategateway::ingestion::WebhookHttp>>,
     resolver: Arc<IngressRouteResolver>,
     connector: DataPlaneL4Connector,
     http_pool: BackendHttpPool,
@@ -391,6 +393,8 @@ impl Ingress {
             agent_api: None,
             #[cfg(feature = "agent-api")]
             digitalmategateway_api: None,
+            #[cfg(feature = "agent-api")]
+            ingestion_webhook: None,
             resolver,
             connector,
             http_pool: BackendHttpPool::new(BackendHttpPoolConfig::default()),
@@ -415,6 +419,15 @@ impl Ingress {
             command_watch_metrics: Arc::new(CommandWatchMetrics::default()),
             request_metrics: Arc::new(IngressRequestMetrics::default()),
         }
+    }
+
+    #[cfg(feature = "agent-api")]
+    pub fn with_ingestion_webhook(
+        mut self,
+        webhook: Arc<super::digitalmategateway::ingestion::WebhookHttp>,
+    ) -> Self {
+        self.ingestion_webhook = Some(webhook);
+        self
     }
 
     #[cfg(feature = "agent-api")]
@@ -1178,6 +1191,15 @@ impl Ingress {
             self.proxy_direct(request, ingress_security).await
         } else {
             match request.uri().path() {
+                #[cfg(feature = "agent-api")]
+                super::digitalmategateway::ingestion::WEBHOOK_PATH
+                    if self.ingestion_webhook.is_some() =>
+                {
+                    match &self.ingestion_webhook {
+                        Some(webhook) => webhook.handle(request).await,
+                        None => plain(StatusCode::NOT_FOUND, "not_found"),
+                    }
+                }
                 #[cfg(feature = "agent-api")]
                 path if super::digitalmategateway::entrypoint::DigitalMateGatewayApi::matches(
                     path,

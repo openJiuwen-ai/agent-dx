@@ -1,10 +1,22 @@
-//! Ingestion coordination preparation in the existing Gateway process.
-//! This slice binds verified envelopes and prepares bounded immutable batches.
-//! It does not acknowledge durable receipt, implement a queue, wake a sandbox,
-//! or create a second Composio client/account authorization layer.
+//! Durable provider receipt, fixed-member scheduling and fixed-generation
+//! delivery in the existing Gateway process. Identity and connection authority
+//! remain with their published owners; JSON projections alone grant no access.
 use super::composio::VerifiedWebhook;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+mod delivery;
+mod relay_delivery;
+mod runtime;
+mod store;
+mod webhook_http;
+mod worker;
+pub use delivery::{DeliveryBatch, DeliveryEvent, DurableAck};
+pub use relay_delivery::{DeliveryAuthorization, RelayDelivery};
+pub use runtime::IngestionRuntime;
+pub use store::{Inbox, InboxLimits, Lease, ReceiveReceipt};
+pub use webhook_http::{WebhookHttp, WEBHOOK_PATH};
+pub use worker::{DeliveryFailure, DeliveryPort, Worker, WorkerOutcome};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum Error {
@@ -16,13 +28,27 @@ pub enum Error {
     ConflictingInput,
     #[error("ingestion_invalid_manifest")]
     InvalidManifest,
+    #[error("ingestion_store_unavailable")]
+    Unavailable,
+    #[error("ingestion_capacity_exhausted")]
+    Capacity,
+    #[error("ingestion_lease_lost")]
+    LeaseLost,
+    #[error("ingestion_delivery_unknown")]
+    DeliveryUnknown,
 }
 
 /// Current owner-issued projection, not request JSON and not an authentication
 /// credential. Real owner reads are required at receive/claim/execute/ACK.
 /// A revoked/replaced projection must never authorize a stale queued input.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubscriptionBinding {
+    pub tenant: String,
+    pub user_id: String,
+    pub connection_id: String,
+    pub template: String,
+    pub template_ref: String,
     pub subscription_id: String,
     pub subscription_generation: u64,
     pub connection_generation: u64,
@@ -38,29 +64,70 @@ pub struct SubscriptionBinding {
     pub enabled: bool,
 }
 
+impl SubscriptionBinding {
+    /// Wire validation only; this does not authorize subscription registration.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.subscription_generation == 0
+            || self.connection_generation == 0
+            || self.subscription_generation > i64::MAX as u64
+            || self.connection_generation > i64::MAX as u64
+            || self.service_port == 0
+            || [
+                &self.subscription_id,
+                &self.tenant,
+                &self.user_id,
+                &self.connection_id,
+                &self.template,
+                &self.template_ref,
+                &self.workspace,
+                &self.binding_id,
+                &self.binding_generation,
+            ]
+            .iter()
+            .any(|value| {
+                value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+            })
+            || [
+                &self.trigger_id,
+                &self.trigger_slug,
+                &self.account_id,
+                &self.auth_config_id,
+                &self.composio_user_id,
+            ]
+            .iter()
+            .any(|value| {
+                value.is_empty()
+                    || value.len() > 256
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_-:".contains(&byte))
+            })
+            || self
+                .template_ref
+                .parse::<adx_agent_core::TemplateRef>()
+                .is_err()
+        {
+            return Err(Error::Refused);
+        }
+        Ok(())
+    }
+}
+
 /// No Debug/Serialize: the body may contain private mail. Persist through the
 /// ingestion store owner before any successful webhook acknowledgement.
 pub struct PendingInput {
     binding: SubscriptionBinding,
-    event: VerifiedWebhook,
+    source_id: String,
+    digest: String,
+    raw: Vec<u8>,
 }
 
 impl PendingInput {
     /// Caller resolves the subscription through its real owner. Signed user_id
     /// by itself does not select a workspace, binding or account permission.
     pub fn bind(event: VerifiedWebhook, current: &SubscriptionBinding) -> Result<Self, Error> {
+        current.validate()?;
         if !current.enabled
-            || current.subscription_generation == 0
-            || current.connection_generation == 0
-            || current.service_port == 0
-            || [
-                &current.subscription_id,
-                &current.workspace,
-                &current.binding_id,
-                &current.binding_generation,
-            ]
-            .iter()
-            .any(|v| v.is_empty() || v.len() > 256 || v.chars().any(char::is_control))
             || event.trigger_id() != current.trigger_id
             || event.trigger_slug() != current.trigger_slug
             || event.account_id() != current.account_id
@@ -71,18 +138,20 @@ impl PendingInput {
         }
         Ok(Self {
             binding: current.clone(),
-            event,
+            source_id: event.source_event_id().into(),
+            digest: event.digest().into(),
+            raw: event.raw_body().to_vec(),
         })
     }
 
     pub fn source_event_id(&self) -> &str {
-        self.event.source_event_id()
+        &self.source_id
     }
     pub fn digest(&self) -> &str {
-        self.event.digest()
+        &self.digest
     }
     pub fn raw_body(&self) -> &[u8] {
-        self.event.raw_body()
+        &self.raw
     }
     pub fn assert_current(&self, current: &SubscriptionBinding) -> Result<(), Error> {
         if current.enabled && current == &self.binding {
@@ -107,6 +176,7 @@ pub fn prepare_batch<'a>(
     current: &SubscriptionBinding,
     limit: usize,
 ) -> Result<BatchPlan<'a>, Error> {
+    current.validate()?;
     if !(1..=50).contains(&limit) || inputs.is_empty() || inputs.len() > 1000 {
         return Err(Error::InvalidLimit);
     }
@@ -146,6 +216,13 @@ pub fn prepare_batch<'a>(
         .collect();
     let manifest = serde_json::to_vec(&(
         "digitalmate.ingestion.batch.v1",
+        (
+            &current.tenant,
+            &current.user_id,
+            &current.connection_id,
+            &current.template,
+            &current.template_ref,
+        ),
         &current.subscription_id,
         current.subscription_generation,
         current.connection_generation,
@@ -170,5 +247,9 @@ pub fn prepare_batch<'a>(
     })
 }
 
+#[cfg(test)]
+mod persistence_tests;
+#[cfg(all(test, feature = "mock-e2e"))]
+mod relay_tests;
 #[cfg(test)]
 mod tests;

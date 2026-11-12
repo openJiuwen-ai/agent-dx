@@ -31,6 +31,7 @@ pub struct ServiceSelection {
     environment_id: String,
     generation: String,
     retried: bool,
+    fixed_generation: bool,
     parameters: Option<Vec<u8>>,
 }
 impl ServiceSelection {
@@ -79,6 +80,62 @@ impl AgentV2Access {
         self.select_with_parameters(context, scope, selector, None)
             .await
     }
+
+    /// Background delivery pins an already-authorized, existing Binding.
+    /// The published expected-generation resolve never creates a missing
+    /// binding and rejects deletion/rebuild; no WS admission reselection runs.
+    pub async fn select_existing(
+        &self,
+        context: Arc<RequestContext>,
+        scope: Scope,
+        selector: ServiceSelector,
+        expected_generation: &str,
+    ) -> Result<ServiceSelection, Error> {
+        if expected_generation.is_empty() || selector.protocol != Protocol::Http {
+            return Err(Error::Invalid(
+                "fixed background HTTP generation required".into(),
+            ));
+        }
+        let (target, port) = context
+            .run(self.managed.retry_resolve(
+                &context,
+                &scope,
+                selector.protocol,
+                selector.port,
+                expected_generation,
+            ))
+            .await?;
+        if target.binding.generation != expected_generation {
+            return Err(Error::Conflict(
+                "background Binding generation changed".into(),
+            ));
+        }
+        Ok(ServiceSelection {
+            context,
+            scope,
+            protocol: selector.protocol,
+            port,
+            requested_port: selector.port,
+            environment_id: target.binding.current.environment_id,
+            generation: target.binding.generation,
+            retried: true,
+            fixed_generation: true,
+            parameters: None,
+        })
+    }
+
+    /// Connect a fixed-generation background selection through the ordinary
+    /// authorized Ingress/Relay path; wait only for its declared port to listen.
+    pub async fn connect_existing_when_ready(
+        &self,
+        ingress: &Ingress,
+        selection: ServiceSelection,
+    ) -> Result<IngressStream, ServiceAccessError> {
+        if !selection.fixed_generation || selection.protocol != Protocol::Http {
+            return Err(Error::Invalid("fixed background HTTP selection required".into()).into());
+        }
+        self.connect_service_inner(ingress, selection, true).await
+    }
     pub async fn select_with_parameters(
         &self,
         context: Arc<RequestContext>,
@@ -105,6 +162,7 @@ impl AgentV2Access {
             environment_id: target.binding.current.environment_id,
             generation: target.binding.generation,
             retried: false,
+            fixed_generation: false,
             parameters: parameters.map(<[u8]>::to_vec),
         })
     }
@@ -261,7 +319,26 @@ impl AgentV2Access {
                 })
                 .await?;
             match result {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    if selection.fixed_generation {
+                        // Readiness may wait while the binding is deleted or
+                        // rebuilt. Recheck the actual owner before any HTTP bytes.
+                        let current = selection
+                            .context
+                            .run(self.managed.binding(&selection.context, &selection.scope))
+                            .await?;
+                        if current.generation != selection.generation
+                            || current.phase != BindingPhase::Active
+                            || current.current.environment_id != selection.environment_id
+                        {
+                            return Err(Error::Conflict(
+                                "background Binding changed during readiness".into(),
+                            )
+                            .into());
+                        }
+                    }
+                    return Ok(stream);
+                }
                 Err(error) => {
                     let retryable = !matches!(
                         error,
