@@ -68,6 +68,7 @@ fn registration_reply_uses_remaining_actual_lease_after_readiness_probe() {
         grpc_addr: String::new(),
         data_addr: String::new(),
         rest_addr: String::new(),
+        nfs_addr: String::new(),
         ownerfs_enabled: true,
         storage_devices: Vec::new(),
         lease_epoch: 7,

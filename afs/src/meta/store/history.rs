@@ -180,6 +180,7 @@ fields_heap!(super::NodeSessionLease {
     grpc_addr,
     data_addr,
     rest_addr,
+    nfs_addr,
     ownerfs_enabled,
     storage_devices,
     lease_ttl
@@ -329,6 +330,7 @@ fields_heap!(super::NodeSession {
     grpc_addr,
     data_addr,
     rest_addr,
+    nfs_addr,
     ownerfs_enabled,
     storage_devices,
     lease_epoch,
@@ -341,7 +343,8 @@ fields_heap!(super::RootRecord {
     home_session_id,
     local_prepare_id,
     created_at_revision,
-    updated_at_revision
+    updated_at_revision,
+    nfs_addr
 });
 fields_heap!(super::RootReservationRecord {
     root_id,
@@ -1206,6 +1209,7 @@ mod tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(30),
@@ -1354,6 +1358,7 @@ mod tests {
                     grpc_addr: "grpc".into(),
                     data_addr: "data".into(),
                     rest_addr: "rest".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(30),
@@ -1404,6 +1409,7 @@ mod tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(30),
@@ -1457,6 +1463,7 @@ mod tests {
             grpc_addr: address,
             data_addr: "d".into(),
             rest_addr: "r".into(),
+            nfs_addr: String::new(),
             ownerfs_enabled: true,
             storage_devices: devices,
             lease_epoch: 1,
@@ -1497,6 +1504,7 @@ mod tests {
             local_prepare_id: payload,
             created_at_revision: StoreRevision(1),
             updated_at_revision: StoreRevision(1),
+            nfs_addr: String::new(),
         });
         let event = WatchEvent {
             revision: StoreRevision(1),

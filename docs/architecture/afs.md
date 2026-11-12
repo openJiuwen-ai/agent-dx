@@ -102,7 +102,7 @@ flowchart TB
 | 本机 chunk 存储 | 暂存 → 持久化（正文、目录、catalog 屏障）→ ACK；校验读；副本生命周期（`CopyLifecycle`）；巡检读盘；服务对端读 | `node/chunk/{store,staged,catalog,catalog_commit,lifecycle,reader,scrub,peer_serve,sidecar_install}.rs` |
 | 故障层 | 修复循环（上报隔离、认领、复制、报告）、GC 回收循环、写租约续期、后台巡检、接收方校验失败的复核 | `node/fault/{repair,reaper,lease_keeper,scrub,suspect,classify}.rs` |
 | GC 执行（Node） | GC 引用（`open:`、`write:`）的建立与有界释放队列；一次回收（本机副本或 S3 对象） | `node/gc/references.rs`、`node/gc/collect.rs` |
-| 后台与装配 | 后台 tick（写回推进等，串行）；装配按后端与职责拆分，后台组件各自有名字与关闭顺序 | `node/background/tick.rs`、`node/assembly/{mod,common,dfs,ownerfs,grpc,shutdown}.rs` |
+| 后台与装配 | 后台 tick（写回推进等，串行）；装配按后端与职责拆分，后台组件各自有名字与关闭顺序 | `node/background/tick.rs`、`node/assembly/{mod,common,dfs,ownerfs,outlet,grpc,shutdown}.rs` |
 | 传输（Node） | 调 Meta 的 `DfsMeta` 客户端；对端读写的 gRPC／RDMA 客户端与连接池；服务对端的 `DfsChunks`、`DfsOwnerFiles` | `node/rpc/meta/*`、`node/rpc/peer/*`、`node/rpc/data/*` |
 | Meta 接入 | gRPC 服务、证书到 Node ID 的绑定校验 | `meta/rpc.rs`、`meta/rpc/{dfs,node}.rs` |
 | Meta DFS 状态机 | 命名空间（含 readdir 分页）、写租约、版本提交、放置与副本写授权、读授权、修复任务与巡检、GC 规划与删除者 | `meta/dfs.rs`、`meta/dfs/{namespace,write_lease,commit,placement,read_auth,repair,gc}.rs`、`meta/dfs/gc/deleter.rs` |
@@ -1079,6 +1079,60 @@ workspace 可以从任意节点的 OwnerFs FUSE 路径删除：Home 在本机执
 OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 workspace，非空返回
 `ENOTEMPTY` 且 workspace 保持可用；`rm -rf` 会先删除内容，最后才删除空的 workspace 目录。
 在 egress 路径上对 workspace 目录执行 rmdir 会被内核以 `EBUSY` 拒绝，不会删除 workspace。
+
+## 跨节点 Workspace 出口（outlet）
+
+outlet 让集群内任一节点用**同一个平坦名字**访问某 workspace，而数据权威仍在
+Home 节点的本地盘上，不做复制。每台需要读该名字视图的节点各自跑一份镜像，
+输入都是同一份 Meta 快照。
+
+**Meta 契约**：`OwnerRoots.ListActiveOutletRoots` 是 outlet 镜像面的唯一输入，
+返回全局 Active root 全量快照（`root_id`、`root_epoch`、`home_node_id`、
+`home_nfs_addr`），按 `root_id` 升序以保证 diff 可复现。调用方可携带已持有
+集合的摘要（`known_digest`），Meta 判定无变化时以 `unchanged` 短路——但语义
+上仍是全量快照：没有游标、事件或增量，快照本身就是恢复机制。该 RPC 只读，
+不签发 `RootAccess`，不改变授权语义。
+
+"Active" 在持久层等价于 Root 实体存在：`DeactivateRoot` 直接删除 Root 键，
+不存在软删除状态位，因此快照不需要额外状态过滤。名字由 `root_id` 反解
+（`root-<hex(name)>`，与 OwnerFs 命名同源），不为 outlet 新增持久字段。
+`home_nfs_addr` 来自该 Home 注册会话上报的 NFS 导出地址；为空表示未上报，
+消费方只能跳过并告警，不得猜测兜底。
+
+**节点侧（已实现）**：每节点跑一份镜像 worker：在 tmpfs 名字层收敛
+`/public/<name> -> <import_root>/<home>/users` 软链，自动维护对端（NFS）与
+本机（bind）的 import 挂载；mountinfo 只读诊断随轮输出，配置硬前提（独立
+tmpfs、宿主 mount namespace、`mount(2)` 权限）在启动时 fail-closed 校验。
+没有运行期数据回收：删除契约只在提交前检查空目录（非空返回 `ENOTEMPTY`），
+提交后删除不会留下"待回收"的目录，残余目录由启动 reconcile（有 Meta 全量
+视角）收敛，非空残余保留 catalog 记录并告警，等待人工清理。
+
+`/public` 下的 `.pub`（原子发布的暂存目录）与 `.quarantine`（消费方违约时的
+隔离区）归镜像所有，不能作为 workspace 名：创建时即拒（`EINVAL`）。快照里若
+仍有同名 root（旧版本所建），镜像也不会发布它——保留名对镜像透明，不发布、
+不删除、不隔离。允许这类名字会让发布与隔离互相搬运：暂存文件就在
+`<public_root>/.pub/`，也就是"以 workspace 名命名的目录"里，每轮重建一次并在
+tmpfs 上无限堆积隔离目录，最终 ENOSPC 让整个名字层发布失败。
+
+对端换 IP、以及"挂载在但挂错了"的发现都不依赖访问失败：镜像每轮把 mountinfo
+里 import 挂载的源与期望值比对，不一致即按 `Remount` 重建。远程比三件事——
+文件系统类型以 `nfs` 开头、源地址（仅当上报值是 IP 字面量，主机名会被
+`mount.nfs` 解析成 IP，硬比会永远不等）、导出路径等于 `users_root`；本机 bind
+比 mountinfo 第 4 列的 `root`（bind 的源目录；`source` 字段是设备名，实测
+`/dev/vda1`，比它会把每条正常挂载都判成错的）。任何一项不符都意味着"名字能
+打开、数据是错的"，而这类错误不会以访问失败或发布失败的形式暴露（`hard`
+挂载访问失效对端是阻塞而非报错，发布只写软链、从不访问 target）。源格式读不
+出来时不参与比对，避免每轮重挂。
+
+**名字按字节传递，不做 UTF-8 归一**：workspace 名是任意字节串（Linux 路径分量
+不是 UTF-8），OwnerFs 用 `root-<hex(bytes)>` 无损编码，镜像从 root id 解码后
+必须原样用于 `symlinkat`。若中间转成 `String`（例如 `to_string_lossy`），每个
+非法字节会变成 U+FFFD，既改掉调用方创建的名字，又会让两个仅差非法字节的名字
+塌成同一条（`BTreeMap` 键冲突，静默丢一个 workspace）。因此 `Action`、`present`
+表与 `scan_public` 的键都是 `OsString`，收敛判据也按字节比较。
+
+Home 侧对外 NFS 导出（OwnerFs egress）不在本能力范围内，仍由部署面或独立分支
+提供。
 
 ## DFS 外部对象持久化边界
 

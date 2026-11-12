@@ -105,6 +105,9 @@ pub(super) struct OwnerFsAssembly {
         Arc<rpc::meta::GrpcRootMeta>,
         Arc<vfs::ownerfs::root::RootManager>,
     )>,
+    /// Meta handle and root manager for the outlet mirror and the reclaim
+    /// sweep. `None` without OwnerFs: neither task has anything to work on.
+    pub(super) outlet_control: Option<super::outlet::OutletControl>,
 }
 
 /// 段 7: RootManager, RDMA probe, MountManager startup reconciliation.
@@ -118,6 +121,7 @@ pub(super) async fn assemble(
     let session_id = &startup.session_id;
     let timeout = startup.timeout;
     let mut workspace_bind_root_control = None;
+    let mut outlet_control = None;
     let ownerfs_instance = if cfg.ownerfs {
         let endpoint = meta_endpoint.expect("OwnerFs checked meta_endpoint");
         let root_meta = Arc::new(rpc::meta::GrpcRootMeta::new(
@@ -177,6 +181,9 @@ pub(super) async fn assemble(
             })
             .await??,
         );
+        outlet_control = Some(super::outlet::OutletControl {
+            meta: root_meta.clone(),
+        });
         if cfg.experimental_ownerfs_workspace_bind {
             workspace_bind_root_control = Some((root_meta, roots.clone()));
         }
@@ -225,6 +232,7 @@ pub(super) async fn assemble(
     Ok(OwnerFsAssembly {
         instance: ownerfs_instance,
         workspace_bind_root_control,
+        outlet_control,
     })
 }
 

@@ -124,6 +124,53 @@ fn root_ids_encode_names_losslessly() {
     );
 }
 
+/// `/public` 下由 outlet 自用的两个目录名不能作为 workspace 名。
+///
+/// `staging_path` 把暂存文件放进 `<public_root>/.pub/`，也就是"以 workspace 名
+/// 命名的目录"里。一旦允许 `.pub` 成为 workspace，发布就会与隔离互相搬运：
+/// 每一轮先把它挪进 `.quarantine`，发布又用 `create_dir_all` 把它建回来，
+/// `rename` 撞目录失败，下一轮重来。实测单节点 1 个隔离目录/秒、无限增长，
+/// tmpfs 堆满后整个名字层的发布一起失败。
+#[test]
+fn reserved_name_layer_directories_cannot_become_roots() {
+    for name in [".pub", ".quarantine"] {
+        let error = validate_root_name(OsStr::new(name)).unwrap_err();
+        assert_eq!(
+            error.code(),
+            afs_error::NODE_VFS_INVALID,
+            "{name} 是名字层的保留名，必须拒绝创建"
+        );
+    }
+}
+
+/// 只拒保留名，不拒所有点开头的名字：`.cache` 这类仍是合法的 workspace 名。
+#[test]
+fn a_dot_prefixed_name_that_is_not_reserved_still_works() {
+    assert!(validate_root_name(OsStr::new(".cache")).is_ok());
+    assert!(validate_root_name(OsStr::new("pub")).is_ok());
+    assert!(validate_root_name(OsStr::new("demo")).is_ok());
+}
+
+/// 保留名必须在**问 Meta 之前**就被拒掉。
+///
+/// 这条断言用错误码区分来源：夹具里的 `reserve_root` 只会返回"授权不可用"，
+/// 所以拿到 `NODE_VFS_INVALID` 就证明这次调用根本没走到 Meta。
+#[test]
+fn reserving_a_reserved_name_is_refused_before_meta_is_asked() {
+    let temp = tempfile::tempdir().unwrap();
+    let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+    let manager = RootManager::open(
+        "home".into(),
+        "home-session".into(),
+        Arc::new(Meta::default()),
+        disk,
+    )
+    .unwrap();
+
+    let error = manager.reserve_workspace(OsStr::new(".pub")).unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_VFS_INVALID);
+}
+
 impl Fixture {
     fn new(mode: u32) -> Self {
         let temp = tempfile::tempdir().unwrap();

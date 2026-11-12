@@ -30,6 +30,7 @@ fn session(node: &str) -> NodeSession {
         grpc_addr: format!("http://{node}:7000"),
         data_addr: format!("http://{node}:7001"),
         rest_addr: format!("http://{node}:7002"),
+        nfs_addr: String::new(),
         ownerfs_enabled: false,
         storage_devices: vec![StorageDeviceDescriptor {
             device_id: format!("dev-{node}"),

@@ -48,12 +48,7 @@ pub(super) fn resolve_id(role: Role, cli: &mut Cli, file: &mut FileConfig) -> Re
         }
         .into()
     });
-    if id.is_empty()
-        || id.len() > 128
-        || !id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
-    {
+    if !super::is_safe_node_id(&id) {
         return Err(invalid("id must contain 1..128 letters, digits, _ or -"));
     }
     Ok(id)
