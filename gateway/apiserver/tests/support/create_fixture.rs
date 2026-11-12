@@ -718,6 +718,8 @@ service_impl!(pb::node_service_server::NodeService, {
         }).await
     }
 }, [
+    prepare_environment(PrepareEnvironmentRequest) -> PrepareEnvironmentResponse,
+    get_environment_preparation(GetEnvironmentPreparationRequest) -> PrepareEnvironmentResponse,
     get_environment_control(NodeGetEnvironmentControlRequest) -> EnvironmentControlRecord,
     batch_get_environment_control(NodeBatchGetEnvironmentControlRequest) -> BatchGetEnvironmentControlResponse,
     update_environment_control(NodeUpdateEnvironmentControlRequest) -> EnvironmentControlRecord,

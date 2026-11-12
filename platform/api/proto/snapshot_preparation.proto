@@ -11,6 +11,7 @@ enum SnapshotPreparationPhase {
   SNAPSHOT_PREPARATION_PHASE_CLEANING = 4;
   SNAPSHOT_PREPARATION_PHASE_READY = 5;
   SNAPSHOT_PREPARATION_PHASE_FAILED = 6;
+  SNAPSHOT_PREPARATION_PHASE_PREPARING = 7;
 }
 
 // Public platform preparation operations. Protocol adapters only project these records.
@@ -32,6 +33,63 @@ message StartSnapshotPreparationRequest {
   string template_id = 2;
   string preparation_id = 3;
   EnvironmentSpec spec = 4;
+  PreparationPlan plan = 5;
+}
+
+// One concrete source-instance recipe; never captured in EnvironmentSpec.
+message PreparationPlan {
+  repeated PreparationStep steps = 1;
+  optional string start_command = 2;
+  optional string ready_command = 3;
+  uint64 timeout_seconds = 4;
+}
+message PreparationFile {
+  string scope = 1;
+  string location = 2;
+  uint64 size_bytes = 3;
+  string sha256 = 4;
+}
+message PreparationCopy {
+  PreparationFile file = 1;
+  string source = 2;
+  string destination = 3;
+  optional string user = 4;
+  optional uint32 mode = 5;
+}
+message PreparationRun { string command = 1; optional string user = 2; }
+message PreparationEnvironment { map<string,string> values = 1; }
+message PreparationStep {
+  oneof operation {
+    PreparationCopy copy = 1;
+    PreparationRun run = 2;
+    PreparationEnvironment environment = 3;
+    string user = 4;
+    string workdir = 5;
+  }
+}
+
+enum SourcePreparationStatus {
+  SOURCE_PREPARATION_STATUS_UNSPECIFIED = 0;
+  SOURCE_PREPARATION_STATUS_RUNNING = 1;
+  SOURCE_PREPARATION_STATUS_SUCCEEDED = 2;
+  SOURCE_PREPARATION_STATUS_FAILED = 3;
+  SOURCE_PREPARATION_STATUS_UNKNOWN = 4;
+}
+message PreparationLogEntry {
+  uint64 offset = 1;
+  uint64 timestamp_unix_ms = 2;
+  string level = 3;
+  string message = 4;
+}
+message SourcePreparationResult {
+  string operation_id = 1;
+  string plan_sha256 = 2;
+  SourcePreparationStatus status = 3;
+  uint32 step_index = 4;
+  string error = 5;
+  repeated PreparationLogEntry logs = 6;
+  uint64 next_offset = 7;
+  bool logs_truncated = 8;
 }
 message GetSnapshotPreparationRequest {
   CallerContext caller = 1;
@@ -74,4 +132,5 @@ message SnapshotPreparationView {
   uint64 preparation_updated_at_unix_ms = 20;
   optional uint64 last_spawned_at_unix_ms = 21;
   optional uint64 spawn_count = 22;
+  SourcePreparationResult source_preparation = 23;
 }

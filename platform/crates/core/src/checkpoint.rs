@@ -84,6 +84,7 @@ pub enum LifecycleKind {
     Snapshot,
     Network,
     Reload,
+    Prepare,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletedOperation {

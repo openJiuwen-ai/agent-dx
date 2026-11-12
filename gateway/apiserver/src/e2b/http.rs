@@ -181,10 +181,20 @@ pub async fn handle(
                     Err(Status::not_found("template route not found"))
                 }
             }
+            ("GET", _) if path.starts_with("/templates/") && path.contains("/files/") => {
+                let parts: Vec<_> = path.trim_start_matches('/').split('/').collect();
+                if parts.len() == 4 && parts[2] == "files" {
+                    super::template_api::upload_link(&api, parts[1], parts[3], &caller)
+                        .await
+                        .map(|value| (201, value))
+                } else {
+                    Err(Status::not_found("template file route not found"))
+                }
+            }
             ("GET", _) if path.starts_with("/templates/") && path.ends_with("/status") => {
                 let parts: Vec<_> = path.trim_start_matches('/').split('/').collect();
                 if parts.len() == 5 && parts[2] == "builds" {
-                    super::template_api::status(&api, parts[1], parts[3], &caller)
+                    super::template_api::status(&api, parts[1], parts[3], &caller, &query)
                         .await
                         .map(|value| (200, value))
                 } else {

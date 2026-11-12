@@ -103,7 +103,7 @@ impl Snapshot {
         kind: SnapshotKind,
         id: String,
         names: Vec<String>,
-        template: EnvironmentSpec,
+        mut template: EnvironmentSpec,
         source_node_id: String,
         source_runtime_id: String,
         artifact: CheckpointArtifact,
@@ -113,6 +113,11 @@ impl Snapshot {
             .ok()
             .and_then(|duration| u64::try_from(duration.as_millis()).ok())
             .ok_or_else(|| Error::Unavailable("snapshot capture clock unavailable".into()))?;
+        // A Golden is a reusable base, not the temporary source's SDK identity.
+        // Ordinary captures and records read from storage retain their fixed spec.
+        if kind == SnapshotKind::Golden {
+            template.compatibility = None;
+        }
         let s = Self {
             id,
             names,
@@ -256,14 +261,22 @@ impl Snapshot {
             && self.names == other.names
             && self.kind == other.kind
             && self.created_at_unix_ms == other.created_at_unix_ms
+            && self.template.compatibility == other.template.compatibility
             && self.matches_template(&other.template)
             && self.source_node_id == other.source_node_id
             && self.source_runtime_id == other.source_runtime_id
             && self.artifact == other.artifact
     }
 
-    /// Match the source spec after normalizing omitted UIDs to this snapshot's fixed identities.
+    /// Match fixed Volume identities, omitting the source's SDK route identity for
+    /// credential-free Golden captures. Legacy captures retain strict matching.
     pub fn matches_template(&self, spec: &EnvironmentSpec) -> bool {
-        spec.matches_fixed_spec(&self.template)
+        if self.kind == SnapshotKind::Golden && self.template.compatibility.is_none() {
+            let mut source = spec.clone();
+            source.compatibility = None;
+            source.matches_fixed_spec(&self.template)
+        } else {
+            spec.matches_fixed_spec(&self.template)
+        }
     }
 }

@@ -61,8 +61,32 @@ service NodeService {
   rpc UpdateNetworkPolicy(UpdateNetworkPolicyRequest) returns (EnvironmentResult);
   rpc ReloadEnvironment(ReloadEnvironmentRequest) returns (EnvironmentResult);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc PrepareEnvironment(PrepareEnvironmentRequest) returns (PrepareEnvironmentResponse);
+  rpc GetEnvironmentPreparation(GetEnvironmentPreparationRequest) returns (PrepareEnvironmentResponse);
   rpc CollectSnapshot(CollectSnapshotRequest) returns (CollectSnapshotResponse);
   rpc CollectCheckpointCleanup(CollectCheckpointCleanupRequest) returns (CollectCheckpointCleanupResponse);
+}
+
+message PrepareEnvironmentRequest {
+  Assignment assignment = 1;
+  CallerContext caller = 2;
+  string node_session_id = 3;
+  string runtime_id = 4;
+  string operation_id = 5;
+  uint64 expected_revision = 6;
+  PreparationPlan plan = 7;
+}
+message GetEnvironmentPreparationRequest {
+  Assignment assignment = 1;
+  CallerContext caller = 2;
+  string node_session_id = 3;
+  string runtime_id = 4;
+  string operation_id = 5;
+  uint64 logs_offset = 6;
+}
+message PrepareEnvironmentResponse {
+  EnvironmentResult environment = 1;
+  SourcePreparationResult preparation = 2;
 }
 
 message NodeGetEnvironmentControlRequest {

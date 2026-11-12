@@ -13,6 +13,7 @@ mod lifecycle;
 pub(super) use authority::{AuthorityCheck, AuthorityResult};
 mod monitor;
 mod observation;
+pub(crate) mod preparation;
 mod run_timer;
 mod snapshots;
 mod submission;
@@ -58,6 +59,7 @@ pub(super) fn protects_execution(record: &EnvironmentRecord, runtime_id: &str) -
 }
 
 enum Command {
+    Prepare(Box<preparation::Request>),
     RunControl(oneshot::Sender<Result<adx_core::environment_control::EnvironmentControlRecord>>),
     RunTimeout(
         u64,
@@ -115,7 +117,8 @@ impl Command {
         // reconciliation stays ordered without splitting an active restore.
         matches!(
             self,
-            Self::Pause(_)
+            Self::Prepare(_)
+                | Self::Pause(_)
                 | Self::Reload { .. }
                 | Self::Create(_)
                 | Self::Clone(_, _)
@@ -159,6 +162,7 @@ pub struct EnvironmentHandle {
     current: tokio::sync::watch::Receiver<(EnvironmentRecord, Option<Durability>)>,
     cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
     metrics_registration: crate::metrics::Registration,
+    preparation: Arc<preparation::Slot>,
 }
 
 impl EnvironmentHandle {
@@ -196,6 +200,9 @@ impl EnvironmentHandle {
         &self,
         request: super::checkpoint::SnapshotRequest,
     ) -> Result<super::checkpoint::SnapshotResult> {
+        if self.preparation.busy() {
+            return Err(Error::Conflict);
+        }
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.enqueue(Command::Snapshot(request, tx), unused).await?;
@@ -212,6 +219,9 @@ impl EnvironmentHandle {
     }
 
     async fn send(&self, command: Command) -> Result<OperationResult> {
+        if self.preparation.busy() && !matches!(command, Command::Delete | Command::DeleteAt(_)) {
+            return Err(Error::Conflict);
+        }
         let (tx, rx) = oneshot::channel();
         self.enqueue(command, tx).await?;
         rx.await
@@ -221,6 +231,9 @@ impl EnvironmentHandle {
         self.send(Command::Pause(request)).await
     }
     pub async fn resume(&self, request: ResumeRequest) -> Result<OperationResult> {
+        if self.preparation.busy() {
+            return Err(Error::Conflict);
+        }
         self.submissions
             .restore(
                 &self.tx,
@@ -238,6 +251,9 @@ impl EnvironmentHandle {
         operation_id: String,
         run_timeout_seconds: Option<u64>,
     ) -> Result<OperationResult> {
+        if self.preparation.busy() {
+            return Err(Error::Conflict);
+        }
         self.demand
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.submissions
@@ -273,6 +289,9 @@ impl EnvironmentHandle {
         .await
     }
     pub(crate) async fn recover(&self, request: ResumeRequest) -> Result<OperationResult> {
+        if self.preparation.busy() {
+            return Err(Error::Conflict);
+        }
         self.submissions
             .restore(
                 &self.tx,
@@ -309,6 +328,9 @@ impl EnvironmentHandle {
     pub async fn run_control(
         &self,
     ) -> Result<adx_core::environment_control::EnvironmentControlRecord> {
+        if self.preparation.busy() {
+            return Err(Error::Conflict);
+        }
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.enqueue(Command::RunControl(tx), unused).await?;
@@ -322,6 +344,9 @@ impl EnvironmentHandle {
         seconds: u64,
         extend_only: bool,
     ) -> Result<adx_core::environment_control::EnvironmentControlRecord> {
+        if self.preparation.busy() {
+            return Err(Error::Conflict);
+        }
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.enqueue(Command::RunTimeout(seconds, extend_only, tx), unused)
@@ -330,10 +355,15 @@ impl EnvironmentHandle {
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
     pub async fn delete(&self) -> Result<OperationResult> {
+        self.preparation.cancel.cancel();
         self.submissions.delete(&self.delete_tx).await
     }
     /// Revision-fenced cleanup must not delete a later replacement execution.
     pub async fn delete_at_revision(&self, expected_revision: u64) -> Result<OperationResult> {
+        if self.view().0.revision != expected_revision {
+            return Err(Error::Conflict);
+        }
+        self.preparation.cancel.cancel();
         self.send(Command::DeleteAt(expected_revision)).await
     }
     /// GC must not delete an execution that moved on after the candidate was read.
@@ -344,6 +374,9 @@ impl EnvironmentHandle {
         self.send(Command::Reconcile).await
     }
     pub(crate) async fn align_authority(&self, record: EnvironmentRecord) -> Result<()> {
+        if self.preparation.busy() {
+            self.preparation.cancel.cancel();
+        }
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.enqueue(Command::AlignAuthority(Box::new(record), tx), unused)
@@ -353,6 +386,13 @@ impl EnvironmentHandle {
     }
     /// Compare and clean as one serial operation, with no lifecycle command in between.
     pub(crate) async fn check_authority(&self, check: AuthorityCheck) -> Result<AuthorityResult> {
+        if self.preparation.busy() {
+            let (record, durability) = self.view();
+            if durability == Some(Durability::Published) && check.record.as_ref() == Some(&record) {
+                return Ok(AuthorityResult::Current);
+            }
+            self.preparation.cancel.cancel();
+        }
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.enqueue(Command::CheckAuthority(Box::new(check), tx), unused)
@@ -375,6 +415,9 @@ impl EnvironmentHandle {
         &self,
         references: Option<Arc<CheckpointReferences>>,
     ) -> Result<()> {
+        if self.preparation.busy() {
+            self.preparation.cancel.cancel();
+        }
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.enqueue(Command::Discard(references, tx), unused)
@@ -383,6 +426,9 @@ impl EnvironmentHandle {
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
     pub async fn expire_checkpoint(&self, now: u64) -> Result<Option<OperationResult>> {
+        if self.preparation.busy() {
+            return Ok(None);
+        }
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.enqueue(Command::Expire(now, tx), unused).await?;
@@ -402,6 +448,9 @@ impl EnvironmentHandle {
     }
 
     pub async fn tick(&self) -> Result<Option<OperationResult>> {
+        if self.preparation.busy() {
+            return Ok(None);
+        }
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.enqueue(Command::Tick(tx), unused).await?;
@@ -494,8 +543,10 @@ fn spawn_controller(
     let demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cleanup_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let metrics_registration = services.metrics.register(&record.spec.id);
+    let preparation = Arc::new(preparation::Slot::default());
     let mut controller = Controller {
         submissions: submissions.clone(),
+        preparation: preparation.clone(),
         run_timer: None,
         timer_sequence: 0,
         next_run_timeout: None,
@@ -708,12 +759,17 @@ fn spawn_controller(
         current,
         cleanup_pending,
         metrics_registration,
+        preparation,
     }
 }
 
 impl Controller {
     async fn dispatch(&mut self, command: Command, reply: Reply) {
         let command = match command {
+            Command::Prepare(request) => {
+                self.prepare_source(*request).await;
+                return;
+            }
             Command::RunControl(ack) => {
                 let result = if self.retired || self.authority_fenced {
                     Err(Error::Conflict)
@@ -896,7 +952,8 @@ impl Controller {
             self.operation_intent(adx_core::observation::OperationIntent::User);
         }
         let result = match command {
-            Command::RunControl(_)
+            Command::Prepare(_)
+            | Command::RunControl(_)
             | Command::RunTimeout(_, _, _)
             | Command::Snapshot(_, _)
             | Command::AlignAuthority(_, _)
@@ -1007,6 +1064,7 @@ impl Controller {
 
 struct Controller {
     submissions: Arc<Submissions>,
+    preparation: Arc<preparation::Slot>,
     run_timer: Option<run_timer::RunTimer>,
     timer_sequence: u64,
     next_run_timeout: Option<u64>,

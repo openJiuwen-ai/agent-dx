@@ -64,6 +64,8 @@ pub struct Config {
     #[serde(default)]
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     #[serde(default)]
+    pub preparation_files: Option<adx_preparation_files::FileStorageConfig>,
+    #[serde(default)]
     pub local_rootfs_templates:
         std::collections::BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
     pub listen: SocketAddr,
@@ -106,6 +108,9 @@ pub struct Config {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(files) = &self.preparation_files {
+            files.validate()?;
+        }
         if let Some(e2b) = &self.e2b {
             if let Err(error) = e2b.validate(self.runtime_profile.as_ref()) {
                 return Err(error.message.into());

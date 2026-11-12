@@ -1,6 +1,7 @@
 //! E2B template protocol projected onto common platform snapshot preparation.
 use super::network::configure_envd_service;
 use crate::{contract, http::Api};
+use adx_core::snapshot_preparation::{PreparationPlan, PreparationStep};
 use adx_observability::trace;
 use adx_protocol::control as pb;
 use serde::Deserialize;
@@ -29,11 +30,23 @@ pub(super) struct Build {
     from_template: Option<String>,
     from_image_registry: Option<Value>,
     #[serde(default)]
-    steps: Vec<Value>,
+    steps: Vec<BuildStep>,
     start_cmd: Option<String>,
     ready_cmd: Option<String>,
     #[serde(default)]
     force: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BuildStep {
+    #[serde(rename = "type")]
+    kind: String,
+    args: Vec<String>,
+    #[serde(default)]
+    force: bool,
+    files_hash: Option<String>,
+    force_upload: Option<bool>,
 }
 
 fn unsupported(message: &'static str) -> Status {
@@ -129,27 +142,262 @@ impl Build {
             .as_ref()
             .is_some_and(|value| !value.is_empty())
             || self.from_image_registry.is_some()
-            || !self.steps.is_empty()
-            || self
-                .start_cmd
-                .as_ref()
-                .is_some_and(|value| !value.is_empty())
-            || self
-                .ready_cmd
-                .as_ref()
-                .is_some_and(|value| !value.is_empty())
         {
             return Err(unsupported(
-                "only fromImage without build steps or start/ready commands is supported",
+                "fromTemplate and private image registries are not supported",
             ));
         }
         // Every preparation runs afresh; force does not weaken or bypass any checks.
         let _ = self.force;
+        for step in &self.steps {
+            step.validate()?;
+        }
         self.from_image
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| Status::invalid_argument("fromImage required"))
     }
+
+    async fn plan(
+        &self,
+        api: &Api,
+        template: &str,
+        build: &str,
+        caller: &pb::CallerContext,
+    ) -> Result<Option<PreparationPlan>, Status> {
+        let start_command = self.start_cmd.clone().filter(|value| !value.is_empty());
+        let ready_command = self.ready_cmd.clone().filter(|value| !value.is_empty());
+        if self.steps.is_empty() && start_command.is_none() && ready_command.is_none() {
+            return Ok(None);
+        }
+        let profile = api
+            .clients
+            .config
+            .runtime_profile
+            .as_ref()
+            .ok_or_else(|| unsupported("runtime profile required"))?;
+        let mut user = profile
+            .env
+            .get("ADX_ENVD_DEFAULT_USER")
+            .cloned()
+            .ok_or_else(|| unsupported("default build user missing"))?;
+        let mut steps = vec![
+            PreparationStep::User { user: user.clone() },
+            PreparationStep::Workdir {
+                path: profile
+                    .env
+                    .get("ADX_ENVD_DEFAULT_WORKDIR")
+                    .cloned()
+                    .ok_or_else(|| unsupported("default build directory missing"))?,
+            },
+        ];
+
+        for step in &self.steps {
+            step.validate()?;
+            let args = &step.args;
+            steps.push(match step.kind.as_str() {
+                "RUN" => PreparationStep::Run {
+                    command: args[0].clone(),
+                    user: args.get(1).filter(|value| !value.is_empty()).cloned(),
+                },
+                "USER" => {
+                    user = args[0].clone();
+                    PreparationStep::User { user: user.clone() }
+                }
+                "WORKDIR" => PreparationStep::Workdir {
+                    path: args[0].clone(),
+                },
+                "ENV" => PreparationStep::Environment {
+                    values: args
+                        .chunks_exact(2)
+                        .map(|pair| (pair[0].clone(), pair[1].clone()))
+                        .collect(),
+                },
+                "COPY" => {
+                    let hash = step
+                        .files_hash
+                        .as_deref()
+                        .ok_or_else(|| Status::invalid_argument("COPY filesHash required"))?;
+                    // Validate every step before touching object storage. Replaced by a sealed object below.
+                    let file = adx_core::snapshot_preparation::PreparationFile {
+                        scope: "pending".into(),
+                        location: format!("pending/{hash}"),
+                        size_bytes: 1,
+                        sha256: hash.to_owned(),
+                    };
+                    PreparationStep::Copy {
+                        file,
+                        source: copy_source_prefix(&args[0]),
+                        destination: args[1].clone(),
+                        user: Some(copy_owner(args.get(2).map(String::as_str), &user)),
+                        mode: args
+                            .get(3)
+                            .filter(|value| !value.is_empty())
+                            .map(|value| u32::from_str_radix(value, 8))
+                            .transpose()
+                            .map_err(|_| Status::invalid_argument("invalid COPY mode"))?,
+                    }
+                }
+                _ => return Err(unsupported("template step is not supported")),
+            });
+        }
+        let mut plan = PreparationPlan {
+            steps,
+            start_command,
+            ready_command,
+            timeout_seconds: 1800,
+        };
+        plan.validate().map_err(adx_protocol::status)?;
+        if plan
+            .steps
+            .iter()
+            .any(|v| matches!(v, PreparationStep::Copy { .. }))
+        {
+            let store = api
+                .clients
+                .config
+                .preparation_files
+                .as_ref()
+                .ok_or_else(|| unsupported("COPY requires configured preparation file storage"))?
+                .build()
+                .map_err(adx_protocol::status)?;
+            let mut sealed: std::collections::BTreeMap<
+                String,
+                adx_core::snapshot_preparation::PreparationFile,
+            > = Default::default();
+            for step in &mut plan.steps {
+                if let PreparationStep::Copy { file, .. } = step {
+                    let hash = file.sha256.clone();
+                    let value = if let Some(value) = sealed.get(&hash) {
+                        value.clone()
+                    } else {
+                        match store.seal(&caller.tenant_id, template, build, &hash).await {
+                            Ok(value) => {
+                                sealed.insert(hash.clone(), value.clone());
+                                value
+                            }
+                            Err(error) => {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(3),
+                                    async {
+                                        for value in sealed.values() {
+                                            let _ = store.remove(&caller.tenant_id, value).await;
+                                        }
+                                    },
+                                )
+                                .await;
+                                return Err(adx_protocol::status(error));
+                            }
+                        }
+                    };
+                    *file = value;
+                }
+            }
+        }
+        Ok(Some(plan))
+    }
+}
+
+// E2B COPY uses the same-named group when only an owner is supplied.
+fn copy_owner(owner: Option<&str>, current_user: &str) -> String {
+    let owner = owner
+        .filter(|value| !value.is_empty())
+        .unwrap_or(current_user);
+    if owner.contains(':') {
+        owner.to_owned()
+    } else {
+        format!("{owner}:{owner}")
+    }
+}
+
+// Upstream expands globs in the SDK, then copies the literal prefix of that selected archive.
+fn copy_source_prefix(source: &str) -> String {
+    let parts: Vec<_> = source
+        .split('/')
+        .take_while(|part| !part.contains(['*', '?', '[', '{']))
+        .collect();
+    let prefix = parts.join("/");
+    if prefix.is_empty() {
+        ".".into()
+    } else {
+        prefix
+    }
+}
+
+impl BuildStep {
+    fn validate(&self) -> Result<(), Status> {
+        let _ = (self.force, self.force_upload);
+        let valid = match self.kind.as_str() {
+            "RUN" => (1..=2).contains(&self.args.len()),
+            "COPY" => {
+                (2..=4).contains(&self.args.len())
+                    && self
+                        .files_hash
+                        .as_deref()
+                        .is_some_and(adx_preparation_files::valid_files_hash)
+            }
+            "ENV" => !self.args.is_empty() && self.args.len().is_multiple_of(2),
+            "USER" | "WORKDIR" => self.args.len() == 1,
+            _ => return Err(unsupported("template step is not supported")),
+        };
+        if !valid || self.args.iter().any(|value| value.contains('\0')) {
+            return Err(Status::invalid_argument("invalid template step arguments"));
+        }
+        let path = match self.kind.as_str() {
+            "WORKDIR" => self.args.first(),
+            "COPY" => self.args.get(1),
+            _ => None,
+        };
+        if path.is_some_and(|value| value.contains(['$', '`'])) {
+            return Err(unsupported("template path interpolation is not supported"));
+        }
+        Ok(())
+    }
+}
+
+pub(super) async fn upload_link(
+    api: &Api,
+    template: &str,
+    hash: &str,
+    caller: &pb::CallerContext,
+) -> Result<Value, Status> {
+    let mut client = pb::snapshot_preparation_service_client::SnapshotPreparationServiceClient::new(
+        api.clients.coordinator().await?,
+    );
+    let registered = api
+        .clients
+        .rpc(
+            "apiserver.resolve_upload_preparation",
+            client.resolve_snapshot_template(trace::inject(pb::ResolveSnapshotTemplateRequest {
+                caller: Some(caller.clone()),
+                reference: template.into(),
+                registration_only: true,
+            })),
+        )
+        .await?;
+    if registered.phase != pb::SnapshotPreparationPhase::Registered as i32 {
+        return Err(Status::failed_precondition(
+            "template preparation already started",
+        ));
+    }
+    let config = api
+        .clients
+        .config
+        .preparation_files
+        .as_ref()
+        .ok_or_else(|| unsupported("COPY requires configured preparation file storage"))?;
+    let url = config
+        .build()
+        .map_err(adx_protocol::status)?
+        .upload_url(
+            &caller.tenant_id,
+            &registered.template_id,
+            &registered.preparation_id,
+            hash,
+        )
+        .await
+        .map_err(adx_protocol::status)?;
+    Ok(json!({"present":false,"url":url,"headers":{}}))
 }
 
 pub(super) async fn register(
@@ -218,6 +466,12 @@ pub(super) async fn start(
         .as_ref()
         .ok_or_else(|| Status::unimplemented("E2B API is disabled"))?;
     let current = get(api, template, build, caller).await?;
+    if current.phase != pb::SnapshotPreparationPhase::Registered as i32 {
+        return Err(Status::invalid_argument(
+            "snapshot preparation has already started",
+        ));
+    }
+    let plan = input.plan(api, template, build, caller).await?;
     let resources = current
         .resources
         .ok_or_else(|| Status::data_loss("template resources missing"))?;
@@ -242,6 +496,16 @@ pub(super) async fn start(
                 .extend(config.required_node_labels.clone());
         }
     }
+    if plan.is_some() {
+        // A prepared build may start an application before capture. Reuse private
+        // routing; Golden capture removes this temporary SDK route identity.
+        spec.compatibility = Some(pb::EnvironmentCompatibility {
+            template_id: template.into(),
+            envd_access_token: uuid::Uuid::new_v4().to_string(),
+            traffic_access_token: uuid::Uuid::new_v4().to_string(),
+            allow_public_traffic: false,
+        });
+    }
     configure_envd_service(
         &mut spec,
         pb::EnvdServiceConfig {
@@ -258,6 +522,7 @@ pub(super) async fn start(
         .rpc(
             "apiserver.start_snapshot_preparation",
             client.start_snapshot_preparation(trace::inject(pb::StartSnapshotPreparationRequest {
+                plan: plan.map(Into::into),
                 caller: Some(caller.clone()),
                 template_id: template.into(),
                 preparation_id: build.into(),
@@ -272,16 +537,39 @@ fn sdk_status(phase: i32) -> Result<&'static str, Status> {
     use pb::SnapshotPreparationPhase as Phase;
     match Phase::try_from(phase) {
         Ok(Phase::Registered) => Ok("waiting"),
-        Ok(Phase::Creating | Phase::Snapshotting | Phase::Cleaning) => Ok("building"),
+        Ok(Phase::Creating | Phase::Preparing | Phase::Snapshotting | Phase::Cleaning) => {
+            Ok("building")
+        }
         Ok(Phase::Ready) => Ok("ready"),
         Ok(Phase::Failed) => Ok("error"),
         _ => Err(Status::data_loss("invalid snapshot preparation phase")),
     }
 }
 
-fn status_value(value: pb::SnapshotPreparationView) -> Result<Value, Status> {
+fn status_value_at(value: pb::SnapshotPreparationView, offset: u64) -> Result<Value, Status> {
     let mut response = json!({"templateID":value.template_id,"buildID":value.preparation_id,
         "status":sdk_status(value.phase)?,"logs":[],"logEntries":[]});
+    if let Some(preparation) = value.source_preparation {
+        let logs: Vec<_> = preparation
+            .logs
+            .into_iter()
+            .filter(|v| v.offset >= offset)
+            .take(100)
+            .map(|entry| {
+                let timestamp = i64::try_from(entry.timestamp_unix_ms)
+                    .ok()
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .map(|v| v.to_rfc3339())
+                    .unwrap_or_default();
+                json!({"timestamp":timestamp,"level":entry.level,"message":entry.message})
+            })
+            .collect();
+        response["logs"] = json!(logs
+            .iter()
+            .map(|v| v["message"].clone())
+            .collect::<Vec<_>>());
+        response["logEntries"] = json!(logs);
+    }
     if !value.error.is_empty() {
         response["reason"] = json!({"message":value.error});
     }
@@ -293,8 +581,30 @@ pub(super) async fn status(
     template: &str,
     build: &str,
     caller: &pb::CallerContext,
+    query: &str,
 ) -> Result<Value, Status> {
-    status_value(get(api, template, build, caller).await?)
+    let offset = url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == "logsOffset")
+        .map(|(_, value)| value.parse::<u64>())
+        .transpose()
+        .map_err(|_| Status::invalid_argument("invalid logsOffset"))?
+        .unwrap_or(0);
+    let view = get(api, template, build, caller).await?;
+    if matches!(
+        pb::SnapshotPreparationPhase::try_from(view.phase),
+        Ok(pb::SnapshotPreparationPhase::Ready | pb::SnapshotPreparationPhase::Failed)
+    ) {
+        if let Some(config) = &api.clients.config.preparation_files {
+            if let Ok(store) = config.build() {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    store.cleanup(&caller.tenant_id, template, build),
+                )
+                .await;
+            }
+        }
+    }
+    status_value_at(view, offset)
 }
 
 #[derive(Debug)]
@@ -583,6 +893,75 @@ mod tests {
     }
 
     #[test]
+    fn sdk_copy_globs_use_the_selected_archive_prefix() {
+        assert_eq!(copy_source_prefix("src/**/*.py"), "src");
+        assert_eq!(copy_source_prefix("*.py"), ".");
+        assert_eq!(copy_source_prefix("src/file.py"), "src/file.py");
+    }
+
+    #[test]
+    fn sdk_copy_owner_defaults_include_the_same_named_group() {
+        for (owner, expected) in [
+            (None, "builder:builder"),
+            (Some(""), "builder:builder"),
+            (Some("65534"), "65534:65534"),
+            (Some("user:other"), "user:other"),
+        ] {
+            assert_eq!(copy_owner(owner, "builder"), expected);
+        }
+    }
+
+    #[test]
+    fn interpolated_build_paths_are_rejected_before_source_creation() {
+        for step in [
+            json!({"type":"WORKDIR", "args":["$APP_DIR"]}),
+            json!({"type":"COPY", "args":["src", "${APP_DIR}/"], "filesHash":"a".repeat(64)}),
+        ] {
+            let step: BuildStep = serde_json::from_value(step).unwrap();
+            let error = step.validate().unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert!(error.message().contains("interpolation"));
+        }
+    }
+
+    #[test]
+    fn terminal_build_log_pages_are_drained_once() {
+        let value = pb::SnapshotPreparationView {
+            phase: pb::SnapshotPreparationPhase::Ready as i32,
+            source_preparation: Some(pb::SourcePreparationResult {
+                logs: (0..120)
+                    .map(|offset| pb::PreparationLogEntry {
+                        offset,
+                        timestamp_unix_ms: 1,
+                        level: "info".into(),
+                        message: format!("step {offset}"),
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            status_value_at(value.clone(), 0).unwrap()["logEntries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            100
+        );
+        assert_eq!(
+            status_value_at(value.clone(), 100).unwrap()["logEntries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            20
+        );
+        assert!(status_value_at(value, 120).unwrap()["logEntries"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn detail_does_not_publish_a_missing_snapshot_as_ready() {
         let mut current = detail_view(CURRENT_ID, pb::SnapshotPreparationPhase::Ready);
         current.snapshot_available = false;
@@ -864,15 +1243,28 @@ mod tests {
     }
 
     #[test]
+    fn dockerfile_recipe_accepts_ordered_steps_and_startup_commands() {
+        let input: Build = serde_json::from_value(json!({
+            "fromImage": "python:3.11",
+            "steps": [
+                {"type":"USER", "args":["root"], "force":false},
+                {"type":"WORKDIR", "args":["/app"], "force":false},
+                {"type":"RUN", "args":["python -c 'print(42)'"], "force":false}
+            ],
+            "startCmd": "python /app/app.py",
+            "readyCmd": "test -f /tmp/app-ready"
+        }))
+        .unwrap();
+        assert_eq!(input.image().unwrap(), "python:3.11");
+    }
+
+    #[test]
     fn from_image_accepts_empty_default_steps_and_rejects_unimplemented_operations() {
         let input: Build =
             serde_json::from_value(json!({"fromImage":"python:3.11","steps":[],"force":false}))
                 .unwrap();
         assert_eq!(input.image().unwrap(), "python:3.11");
         for extra in [
-            json!({"steps":[{"type":"RUN","args":["echo ignored"]}]}),
-            json!({"startCmd":"server"}),
-            json!({"readyCmd":"true"}),
             json!({"fromTemplate":"parent"}),
             json!({"fromImageRegistry":{}}),
         ] {

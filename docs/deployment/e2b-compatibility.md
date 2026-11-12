@@ -21,13 +21,13 @@ E2B 错误使用原始 JSON `{code, message, error_code?}`，不使用 ADX data 
 
 两个创建入口按 snapshot ID 创建时，缺失或已进入删除流程（Deleting/Deleted）的快照返回 404，不创建实例；仍存在的其他非 Ready 状态返回 409 / `snapshot is not ready`。模板解析和快照读取沿用租户权限校验，不通过快照状态暴露其他租户的源。已注册模板暂时没有可用 Ready build 仍返回 409。
 
-模板准备仅接入 fromImage；RUN/COPY/fromTemplate/startCmd/readyCmd、私有镜像凭据、完整日志和缓存优化暂不支持，启动前明确返回 capability_not_supported。Code Interpreter、完整 Desktop/computer-use、IAM/卷/MCP、自动恢复、磁盘暂停及高级网络未接入。实验版不声明完整 E2B API/生态兼容。
+模板准备接入 fromImage，以及官方 SDK 将 Dockerfile 转换后的 RUN/COPY/ENV/USER/WORKDIR 和 startCmd/readyCmd。fromTemplate、私有镜像凭据、完整日志和分层缓存暂不支持；未知步骤在启动前拒绝。Code Interpreter、完整 Desktop/computer-use、IAM/卷/MCP、自动恢复、磁盘暂停及高级网络未接入。实验版不声明完整 E2B API/生态兼容。
 
 ## 构建与配置
 
 1. Buildkite 的两种架构 Execd 组件默认在 Linux 构建器内拉取 `third_party/e2b/source.json` 固定的 infra revision，校验源码摘要后编译 envd；失败即中止构建。可用 `ADX_ENVD_SOURCE` 指定同一固定版本的干净 checkout；ARM 封装会将宿主目录只读挂入容器并转换路径。独立 `build/release/build.sh` 仍需设置此变量才编译 envd。rootfs 包含固定 envd、bash/动态库和默认 user；发布包保存 envd LICENSE、manifest 和摘要。
 2. sandboxd 使用 [固定上游 revision](../../third_party/sandboxd/source.json)。当前 AMD64 后端二进制包要求 glibc ≥ 2.34；Firecracker 的递归 virtiofs 挂载保护依赖 `mount_setattr`（Linux 5.12+ 或具有相应回移的内核），仅存在 `/dev/kvm` 不足以证明宿主可用。[后端构建器](../../build/e2e/build_backend.py) 校验来源和工件摘要；Firecracker host/initrd 与 backend 使用配套的同源工件，详见 [kit 说明](../../build/e2e/firecracker/README.md)。不承诺不匹配的工件和快照之间兼容。
-3. 使用 fromImage 在本租户登记名称并准备 Golden Snapshot；已有快照可直接按 snapshotId 创建。E2B 配置不保存第二份模板目录，也不依赖 Agent Template、Activator 或 ADX_AGENT_CONFIG。准备流程复用 Coordinator 与现有 worker，需要支持真实 Snapshot 的运行后端。
+3. 使用 fromImage 在本租户登记名称并准备 Golden Snapshot；已有快照可直接按 snapshotId 创建。E2B 配置不保存第二份模板目录，也不依赖 Agent Template、Activator 或 ADX_AGENT_CONFIG。准备流程复用 Coordinator 与现有 worker，需要支持真实 Snapshot 的运行后端；worker 必须配置可写的 `checkpoint_dir` 及对应原生 checkpoint/control 配置，不能仅开启 API。
 4. API Server 与 worker 配置相同可信 RuntimeProfile，worker 标签匹配 requiredNodeLabels。标签不安装 profile；当前每个 worker deployment 只有一个 profile。
 
 API Server `config` 示例使用支持内存 Snapshot 的 Firecracker 后端（替换域名、路径、实际 Relay 来源和工件摘要）：
@@ -96,7 +96,7 @@ finally:
 
 ## 接口补齐方案与边界
 
-E2B 适配层只做协议转换，复用 ADX 公共查询、EnsureRunning、运行期限和网络策略；不增加 RPC、存储目录、模板管理器、生命周期状态机或 sandboxd 补丁。
+E2B 适配层只做协议转换，复用 ADX 公共查询、EnsureRunning、运行期限和网络策略；不另建模板管理器、生命周期状态机或 sandboxd 补丁。准备步骤使用平台公共的节点 Prepare RPC。
 
 请求字段与默认值参照固定的 [E2B OpenAPI](https://github.com/e2b-dev/infra/blob/9ddcf8a7ed5c27f8b668f886dd8b4b6750a8aedc/spec/openapi.yml)；下面的构建历史保留和 autoPause 修改限制属于 ADX 当前支持边界。
 
@@ -116,9 +116,11 @@ E2B 适配层只做协议转换，复用 ADX 公共查询、EnsureRunning、运�
 实验模板入口采用下述固定协议；功能互通不代表完整 E2B 兼容，恢复后的时钟和网络行为仍需按部署后端单独验收。
 
 ```text
-SDK 注册名称 → 平台登记 preparation → SDK 提交 fromImage
-  → Coordinator 复用原生创建 → sandboxd 拉镜像并继承 Env → seed 配置服务 Ready
-  → 原生 Snapshot(kind=golden) → 删除 seed → Ready
+SDK 注册名称 → 平台登记 preparation → COPY 文件签名上传（如有）
+  → SDK 提交 fromImage + steps + startCmd/readyCmd
+  → Coordinator 复用原生创建 → sandboxd 拉镜像并继承 Env → seed Running
+  → 有准备步骤时：Coordinator → owner adxlet Prepare → Execd 命令/文件
+  → 原生 Snapshot(kind=golden) → 删除 seed → preparation Ready
 Sandbox.create(templateID[:tag]) → Ready snapshotId → 原生从快照创建
 ```
 
@@ -133,6 +135,49 @@ Sandbox.create(templateID[:tag]) → Ready snapshotId → 原生从快照创建
 准备状态、输入和确定的 seed/operation/snapshot 身份持久化在平台。Coordinator 接管已登记任务并清理失败 seed；结果未知先查询既有操作，不换 ID 重拍。恢复扫描跳过正在执行的 build，并使用原生恢复同样的有界并发；不新增任务引擎。终态且清理完成后释放完整执行规格，Ready 摘要从原生 Snapshot 读取；删除目录的全部待办完成后按 epoch/CAS 回收墓碑，不删除独立 Golden。组件重启可重试已知阶段，不承诺任意构建断点精确恢复。缺少镜像 useradd 或 bash/动态依赖时明确失败，不提供完整上游 sudo 环境。
 
 seed 创建返回明确的终结失败或后端应用错误时，准备流程记录 Failed 和原始错误原因，E2B 状态返回 `error` / `reason.message`；后续扫描清理 seed，不重新创建，也不覆盖旧成功版本。未带确认标记的 NotFound、传输错误和快照结果不确定仍按既有流程对账，不能据此直接判定构建失败。
+
+### Dockerfile 与构建步骤
+
+使用原版 `e2b==2.52.0`，由 SDK 解析 Dockerfile；ADX 不新增 Dockerfile 解释器：
+
+```python
+from e2b import Template
+
+Template.build(
+    Template().from_dockerfile("Dockerfile"),
+    name="my-app",
+    cpu_count=2,
+    memory_mb=1024,
+)
+```
+
+SDK 负责解析、收集本地 COPY 文件并上传。多阶段、ADD、SHELL 等复杂 Dockerfile 受该 SDK 的解析边界限制，不等同于完整 Docker/BuildKit 构建。ADX 不执行未知步骤，也不把 SDK 忽略的指令宣称为支持。仅含命令步骤时无需对象存储。
+
+COPY 需要 API Server 和 adxlet 的 `config.preparation_files` 配置相同的专用 S3/OBS 存储；平台凭据通过进程环境提供，不传入 guest。例如，在两个服务配置中分别设置：
+
+```yaml
+preparation_files:
+  bucket: adx-build-contexts
+  region: cn-north-4
+  endpoint: https://obs.cn-north-4.myhuaweicloud.com
+  prefix: source-preparation
+```
+
+SDK 调用 `GET /templates/{templateID}/files/{filesHash}`；服务校验租户和 waiting 构建后返回 201、`present=false`、PUT 签名 `url` 和 `headers={}`。每次重新上传，不提供跨构建缓存。filesHash 是 SDK 文件集合标识，不是授权凭据或压缩包摘要。构建提交时，将上传对象封存至 SDK 无写权限的新 key，并计算实际 SHA256 和长度；节点下载后复核。对象内容不经过 Coordinator。
+
+平台身份需要专用 prefix 的 Get/Put/List/Delete 权限，SDK 只有 staging 单个 key 的短期写权限。为专用 prefix 配置 **24 小时对象过期及未完成分片上传清理**（`AbortIncompleteMultipartUpload`），覆盖无人查询终态及异常退出；仅对象过期不会清理未完成的分片。终态状态查询另做有界清理。endpoint 不允许内嵌凭据、query 或 fragment；`allow_http: true` 仅用于显式测试存储。
+
+支持 tar/gzip；上限为 512 MiB 上传包、2 GiB 归档声明内容及解压读取和 100,000 条目。仅接受普通文件和目录，显式软/硬链接和设备项拒绝。SDK 已筛选通配符文件，适配层按上游规则转换为归档目录前缀，平台只处理字面路径。节点只校验归档，解包发生在 guest，使用已有必需的 bash（开启 pipefail）、GNU tar、mkdir/mv/chown/chmod。COPY 支持目录合并、文件覆盖和 owner/mode。RUN/USER/WORKDIR/ENV 复用 Execd 用户身份、命令及环境校验；构建 ENV 不成为后续所有 SDK 命令的全局环境。
+
+COPY 未指定 owner 时使用当前 USER，仅指定 owner 时按 E2B 规则补同名 group；显式 `user:group` 保留。WORKDIR 仅给本次新建的目录设置当前用户所有权，保留已有目录的属性，并解析实际目录。首版 COPY 目标和 WORKDIR 只接受字面路径；`$VAR`、`${VAR}` 或反引号插值明确返回不支持。这是 ADX 的当前边界，不是 E2B SDK 的限制；RUN、startCmd、readyCmd 仍通过 shell 使用构建 ENV。
+
+Prepare 在 seed Running 后执行，不改变 Environment 状态机；preparation 增加 Preparing 阶段，E2B 映射为 building。worker 注册 `ADX_SOURCE_PREPARATION=1`，有步骤的任务复用原生节点选择器。Execd 必须具备 `per-command-user` 能力；旧 bootstrap 明确失败，不忽略 USER。同进程重复 Prepare 读取原回执；owner 进程变化或回执丢失时失败并清理，不重放可能执行过的 RUN。
+
+有 Prepare 计划的临时 seed 使用已有私有应用路由策略，防止准备期间启动的应用通过原生或 E2B 地址匿名访问。新 Golden 不继承源实例的一次性 SDK 路由身份；普通 Snapshot 和存量 Golden 记录不改写。用户从 Golden 创建实例时，仍按现有接口生成独立凭据并应用请求的访问策略。无步骤 fromImage 沿用原有准备路径。
+
+`startCmd` 启动后执行 `readyCmd`。就绪命令已知非零时每 2 秒重试，最长 10 分钟，并受整轮 30 分钟预算约束。启动命令异常退出会失败，正常退出允许完成准备。只有 startCmd 时默认等待 20 秒，与上游一致，但不代表应用健康检查。从 Golden 创建、Pause/Connect 和克隆均不重放准备步骤。
+
+`logsOffset` 返回连续的有界分页，每页最多 100 条，终态可继续排空；最多保留 256 条、约 128 KiB 编码日志，并提示截断，不承诺完整 stdout/stderr。Preparing 期间源实例的 Pause/Snapshot 等变更返回冲突，删除取消准备并停止源实例；其他实例监控继续运行。
 
 ## 请求路径与鉴权
 
@@ -237,7 +282,7 @@ POST 只接收 `{ "name": "ci-key" }`，name 非空、最多 256 个非控制字
 
 Harbor 0.25.0 使用锁定的 E2B SDK 2.25.0。将任务依赖预装入 OCI 镜像，通过 fromImage 准备 Golden Snapshot，并登记任务实际使用的精确 alias。使用已在 ADX 登记的 `e2b_` 格式普通租户 Key、官方 SDK 地址与 CA 配置，运行 `--env e2b --no-force-build`。当前可通过 Coordinator 的 `bootstrap_credentials` 配置该格式凭据，设置 `administrator:false` 并限制有效期；只更换已有密钥的前缀不会注册新凭据。未知 alias 不回退 base。
 
-仅支持 fromImage 准备，非空构建步骤明确拒绝。保持任务原有网络要求，PUBLIC 使用默认网络策略；NO_NETWORK/IPv4 和 allowOut 域名策略依赖支持 ACL 的后端。验证时保留 Harbor/SDK 的正常协议、secure 参数、路由和 alias，通过真实 provider/Oracle 检查任务执行结果和文件权限。须说明凭据来源：启动配置登记的凭据不能作为 `POST /api-keys` 对 SDK 2.25.0 兼容的证明。
+启用 Dockerfile 准备还需配置上述构建文件存储与支持 Prepare 的 worker；仅接入本节声明的 SDK 步骤，不代表完整 Docker/BuildKit 或全部 Harbor 构建方式。保持任务原有网络要求，PUBLIC 使用默认网络策略；NO_NETWORK/IPv4 和 allowOut 域名策略依赖支持 ACL 的后端。验证时保留 Harbor/SDK 的正常协议、secure 参数、路由和 alias，通过真实 provider/Oracle 检查任务执行结果和文件权限。须说明凭据来源：启动配置登记的凭据不能作为 `POST /api-keys` 对 SDK 2.25.0 兼容的证明。
 
 ## 验证入口
 

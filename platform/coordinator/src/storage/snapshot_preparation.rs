@@ -235,6 +235,10 @@ impl Session {
         resources.validate()?;
         let created_at_unix_ms = adx_core::observation::now_millis()?;
         let preparation = SnapshotPreparation {
+            plan: None,
+            source_runtime_id: None,
+            source_node_session_id: None,
+            source_preparation: None,
             id: uuid::Uuid::new_v4().to_string(),
             created_at_unix_ms,
             updated_at_unix_ms: created_at_unix_ms,
@@ -432,6 +436,7 @@ impl Session {
                 || matches!(
                     template.preparation.state,
                     PreparationState::Creating
+                        | PreparationState::Preparing
                         | PreparationState::Snapshotting
                         | PreparationState::Cleaning
                 )

@@ -288,14 +288,19 @@ mod tests {
         let root = temp.path().join("mounted");
         fs::create_dir(&root).unwrap();
         let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
+        // TMPDIR may be a separate PVC; select the mount containing this fixture.
         let backend = mounts
             .lines()
-            .find_map(|line| {
+            .filter_map(|line| {
                 let fields: Vec<_> = line.split_whitespace().collect();
-                (fields[4] == "/")
-                    .then(|| fields[fields.iter().position(|f| *f == "-").unwrap() + 2].to_owned())
+                let mount = PathBuf::from(mount_path(fields.get(4)?));
+                let separator = fields.iter().position(|field| *field == "-")?;
+                root.starts_with(&mount)
+                    .then(|| (mount, mount_path(fields[separator + 2])))
             })
-            .unwrap();
+            .max_by_key(|(mount, _)| mount.components().count())
+            .unwrap()
+            .1;
         let configured = BTreeMap::from([
             (
                 "shared".into(),

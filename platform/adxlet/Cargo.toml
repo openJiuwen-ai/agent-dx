@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 adx-checkpoint-storage = { path = "../crates/checkpoint-storage" }
+adx-preparation-files = { path = "../crates/preparation-files" }
 adx-observability = { path = "../../crates/observability" }
 adx-transport = { path = "../../crates/transport" }
 data-plane-gateway = { path = "../../gateway" }
@@ -21,7 +22,7 @@ adx-discovery = { path = "../crates/discovery" }
 serde = { version = "1", features = ["derive"] }
 ipnet = { version = "2", features = ["serde"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
 socket2 = "0.6"
 adx-core = { path = "../crates/core" }
 adx-protocol = { path = "../crates/protocol" }
@@ -40,10 +41,13 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 libc = "0.2"
 # Use the same Ring provider as the control-plane TLS stack.
 object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
 futures-util = "0.3"
 sha2 = "0.10"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+tar = "0.4"
+tempfile = "3"
 
 [build-dependencies]
 protoc-bin-vendored = "3"
@@ -53,4 +57,3 @@ tonic-build = "0.12"
 opentelemetry = { version = "0.31", features = ["trace"] }
 opentelemetry_sdk = { version = "0.31", features = ["trace", "testing"] }
 tokio = { version = "1", features = ["test-util"] }
-tempfile = "3"

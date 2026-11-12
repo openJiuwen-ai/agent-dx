@@ -154,6 +154,83 @@ fn response(result: crate::OperationResult) -> Result<Response<pb::EnvironmentRe
 }
 #[tonic::async_trait]
 impl pb::node_service_server::NodeService for NodeRpc {
+    async fn prepare_environment(
+        &self,
+        request: Request<pb::PrepareEnvironmentRequest>,
+    ) -> std::result::Result<Response<pb::PrepareEnvironmentResponse>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Coordinator {
+            return Err(Status::permission_denied("Coordinator required"));
+        }
+        let request = request.into_inner();
+        let gate = self.manager.lifecycle_ready.read().await;
+        if !*gate {
+            return Err(Status::unavailable("node is reconciling"));
+        }
+        if self.session_id.is_empty() || request.node_session_id != self.session_id {
+            return Err(Status::failed_precondition("node process session changed"));
+        }
+        let handle = self.owned_handle(request.assignment, request.caller.as_ref())?;
+        let preparation = handle
+            .prepare_source(crate::controller::preparation::Request {
+                operation_id: request.operation_id,
+                runtime_id: request.runtime_id,
+                expected_revision: request.expected_revision,
+                plan: request
+                    .plan
+                    .ok_or_else(|| Status::invalid_argument("preparation plan required"))?
+                    .try_into()
+                    .map_err(status)?,
+            })
+            .await
+            .map_err(status)?;
+        let (record, durability) = handle.view();
+        Ok(Response::new(pb::PrepareEnvironmentResponse {
+            environment: Some(pb::EnvironmentResult {
+                record: Some(record.try_into().map_err(status)?),
+                durability: durability.map_or(0, |v| match v {
+                    Durability::Published => pb::Durability::Published as i32,
+                    Durability::Journaled => pb::Durability::Journaled as i32,
+                }),
+                ..Default::default()
+            }),
+            preparation: Some(preparation.into()),
+        }))
+    }
+    async fn get_environment_preparation(
+        &self,
+        request: Request<pb::GetEnvironmentPreparationRequest>,
+    ) -> std::result::Result<Response<pb::PrepareEnvironmentResponse>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Coordinator {
+            return Err(Status::permission_denied("Coordinator required"));
+        }
+        let request = request.into_inner();
+        if self.session_id.is_empty() || request.node_session_id != self.session_id {
+            return Err(Status::failed_precondition("node process session changed"));
+        }
+        let handle = self.owned_handle(request.assignment, request.caller.as_ref())?;
+        let (record, durability) = handle.view();
+        if record.runtime.id != request.runtime_id {
+            return Err(Status::failed_precondition("source execution changed"));
+        }
+        let mut preparation = handle.source_preparation().map_err(status)?;
+        if preparation.operation_id != request.operation_id {
+            return Err(Status::not_found("preparation not found"));
+        }
+        preparation
+            .logs
+            .retain(|entry| entry.offset >= request.logs_offset);
+        Ok(Response::new(pb::PrepareEnvironmentResponse {
+            environment: Some(pb::EnvironmentResult {
+                record: Some(record.try_into().map_err(status)?),
+                durability: durability.map_or(0, |v| match v {
+                    Durability::Published => pb::Durability::Published as i32,
+                    Durability::Journaled => pb::Durability::Journaled as i32,
+                }),
+                ..Default::default()
+            }),
+            preparation: Some(preparation.into()),
+        }))
+    }
     async fn get_environment_control(
         &self,
         request: Request<pb::NodeGetEnvironmentControlRequest>,

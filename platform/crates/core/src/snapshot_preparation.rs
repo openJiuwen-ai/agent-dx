@@ -1,6 +1,11 @@
 //! Durable registration and preparation metadata for reusable snapshot templates.
 use crate::{EnvironmentSpec, Error, Resources, Result};
 use serde::{Deserialize, Serialize};
+mod plan;
+pub use plan::{
+    PreparationFile, PreparationLog, PreparationPlan, PreparationStep, SourcePreparationResult,
+    SourcePreparationStatus,
+};
 
 pub const MAX_SNAPSHOT_TEMPLATE_NAME_BYTES: usize = 128;
 pub const MAX_PREPARATION_ERROR_BYTES: usize = 2048;
@@ -10,6 +15,7 @@ pub const MAX_PREPARATION_ERROR_BYTES: usize = 2048;
 pub enum PreparationState {
     Registered,
     Creating,
+    Preparing,
     Snapshotting,
     Cleaning,
     Ready,
@@ -29,6 +35,14 @@ pub struct SnapshotPreparation {
     pub expected_revision: Option<u64>,
     pub error: Option<String>,
     pub cleanup_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PreparationPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_preparation: Option<SourcePreparationResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +122,12 @@ impl SnapshotPreparation {
         if let Some(spec) = &self.spec {
             spec.validate()?;
         }
+        if let Some(result) = &self.source_preparation {
+            result.validate()?;
+        }
+        if let Some(plan) = &self.plan {
+            plan.validate()?;
+        }
         if !valid_preparation_id(&self.id)
             || self.created_at_unix_ms == 0
             || self.expected_revision == Some(0)
@@ -120,9 +140,14 @@ impl SnapshotPreparation {
             || (matches!(
                 self.state,
                 PreparationState::Creating
+                    | PreparationState::Preparing
                     | PreparationState::Snapshotting
                     | PreparationState::Cleaning
             ) && self.spec.is_none())
+            || (self.state == PreparationState::Preparing
+                && (self.plan.is_none()
+                    || self.source_runtime_id.is_none()
+                    || self.expected_revision.is_none()))
             || (self.state == PreparationState::Snapshotting && self.expected_revision.is_none())
             || (self.state == PreparationState::Cleaning && self.snapshot_id.is_none())
             || (self.state == PreparationState::Ready
@@ -204,6 +229,10 @@ mod tests {
             expected_revision: None,
             error: None,
             cleanup_pending: false,
+            plan: None,
+            source_runtime_id: None,
+            source_node_session_id: None,
+            source_preparation: None,
         };
         build.validate().unwrap();
         build.snapshot_id = None;
