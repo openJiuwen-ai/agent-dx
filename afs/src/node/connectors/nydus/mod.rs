@@ -51,6 +51,9 @@ pub struct RegistryConfig {
     #[serde(default)]
     pub allow_insecure_http: bool,
     pub repository: String,
+    /// Expose this configured repository at the connector's read-only `/v2/` endpoint.
+    #[serde(default)]
+    pub registry_proxy: bool,
     pub username: Option<String>,
     pub password_file: Option<PathBuf>,
     pub bearer_token_file: Option<PathBuf>,
