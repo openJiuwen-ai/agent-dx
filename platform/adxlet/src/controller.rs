@@ -15,6 +15,8 @@ mod monitor;
 mod observation;
 mod run_timer;
 mod snapshots;
+mod submission;
+use submission::{RestoreKey, Submissions};
 mod workload_checkpoint;
 use super::checkpoint::{PauseRequest, ResumeRequest};
 
@@ -106,6 +108,24 @@ enum Command {
         oneshot::Sender<Result<()>>,
     ),
 }
+
+impl Command {
+    fn is_restore_barrier(&self) -> bool {
+        // Explicit lifecycle changes separate restore demand. Periodic
+        // reconciliation stays ordered without splitting an active restore.
+        matches!(
+            self,
+            Self::Pause(_)
+                | Self::Reload { .. }
+                | Self::Create(_)
+                | Self::Clone(_, _)
+                | Self::DeleteAt(_)
+                | Self::CollectFailed(_)
+                | Self::Discard(..)
+        )
+    }
+}
+
 type Reply = oneshot::Sender<Result<OperationResult>>;
 struct Envelope {
     command: Command,
@@ -133,6 +153,8 @@ impl Envelope {
 #[derive(Clone)]
 pub struct EnvironmentHandle {
     tx: mpsc::Sender<Envelope>,
+    delete_tx: mpsc::Sender<Envelope>,
+    submissions: Arc<Submissions>,
     demand: Arc<std::sync::atomic::AtomicU64>,
     current: tokio::sync::watch::Receiver<(EnvironmentRecord, Option<Durability>)>,
     cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
@@ -176,20 +198,22 @@ impl EnvironmentHandle {
     ) -> Result<super::checkpoint::SnapshotResult> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(Command::Snapshot(request, tx), unused))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        self.enqueue(Command::Snapshot(request, tx), unused).await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
 
+    async fn enqueue(&self, command: Command, reply: Reply) -> Result<()> {
+        let restore_barrier = command.is_restore_barrier();
+        let envelope = Envelope::new(command, reply);
+        self.submissions
+            .enqueue(&self.tx, envelope, restore_barrier)
+            .await
+    }
+
     async fn send(&self, command: Command) -> Result<OperationResult> {
         let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(command, tx))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        self.enqueue(command, tx).await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
@@ -197,7 +221,13 @@ impl EnvironmentHandle {
         self.send(Command::Pause(request)).await
     }
     pub async fn resume(&self, request: ResumeRequest) -> Result<OperationResult> {
-        self.send(Command::Resume(request)).await
+        self.submissions
+            .restore(
+                &self.tx,
+                RestoreKey::Resume(request.clone()),
+                Command::Resume(request),
+            )
+            .await
     }
     pub async fn ensure_running(&self, operation_id: String) -> Result<OperationResult> {
         self.ensure_running_with_timeout(operation_id, None).await
@@ -210,7 +240,12 @@ impl EnvironmentHandle {
     ) -> Result<OperationResult> {
         self.demand
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        self.send(Command::EnsureRunning(operation_id, run_timeout_seconds))
+        self.submissions
+            .restore(
+                &self.tx,
+                RestoreKey::Ensure,
+                Command::EnsureRunning(operation_id, run_timeout_seconds),
+            )
             .await
     }
     pub async fn update_network_policy(
@@ -238,7 +273,13 @@ impl EnvironmentHandle {
         .await
     }
     pub(crate) async fn recover(&self, request: ResumeRequest) -> Result<OperationResult> {
-        self.send(Command::Recover(request)).await
+        self.submissions
+            .restore(
+                &self.tx,
+                RestoreKey::Recover(request.operation_id.clone()),
+                Command::Recover(request),
+            )
+            .await
     }
     pub async fn create_from_snapshot(
         &self,
@@ -270,10 +311,7 @@ impl EnvironmentHandle {
     ) -> Result<adx_core::environment_control::EnvironmentControlRecord> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(Command::RunControl(tx), unused))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        self.enqueue(Command::RunControl(tx), unused).await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
@@ -286,18 +324,13 @@ impl EnvironmentHandle {
     ) -> Result<adx_core::environment_control::EnvironmentControlRecord> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(
-                Command::RunTimeout(seconds, extend_only, tx),
-                unused,
-            ))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        self.enqueue(Command::RunTimeout(seconds, extend_only, tx), unused)
+            .await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
     pub async fn delete(&self) -> Result<OperationResult> {
-        self.send(Command::Delete).await
+        self.submissions.delete(&self.delete_tx).await
     }
     /// Revision-fenced cleanup must not delete a later replacement execution.
     pub async fn delete_at_revision(&self, expected_revision: u64) -> Result<OperationResult> {
@@ -313,13 +346,8 @@ impl EnvironmentHandle {
     pub(crate) async fn align_authority(&self, record: EnvironmentRecord) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(
-                Command::AlignAuthority(Box::new(record), tx),
-                unused,
-            ))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        self.enqueue(Command::AlignAuthority(Box::new(record), tx), unused)
+            .await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
@@ -327,23 +355,16 @@ impl EnvironmentHandle {
     pub(crate) async fn check_authority(&self, check: AuthorityCheck) -> Result<AuthorityResult> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(
-                Command::CheckAuthority(Box::new(check), tx),
-                unused,
-            ))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        self.enqueue(Command::CheckAuthority(Box::new(check), tx), unused)
+            .await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
     pub(crate) async fn reap_orphan(&self, runtime: crate::RuntimeObservation) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(Command::ReapOrphan(runtime, tx), unused))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        self.enqueue(Command::ReapOrphan(runtime, tx), unused)
+            .await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
@@ -356,20 +377,15 @@ impl EnvironmentHandle {
     ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(Command::Discard(references, tx), unused))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        self.enqueue(Command::Discard(references, tx), unused)
+            .await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
     pub async fn expire_checkpoint(&self, now: u64) -> Result<Option<OperationResult>> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(Command::Expire(now, tx), unused))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        self.enqueue(Command::Expire(now, tx), unused).await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
@@ -379,10 +395,8 @@ impl EnvironmentHandle {
     ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(Command::RuntimeEvent(identity, tx), unused))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        self.enqueue(Command::RuntimeEvent(identity, tx), unused)
+            .await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
@@ -390,10 +404,7 @@ impl EnvironmentHandle {
     pub async fn tick(&self) -> Result<Option<OperationResult>> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(Command::Tick(tx), unused))
-            .await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        self.enqueue(Command::Tick(tx), unused).await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
@@ -477,11 +488,14 @@ fn spawn_controller(
     authority_fenced: bool,
 ) -> EnvironmentHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(32);
+    let (delete_tx, mut delete_rx) = mpsc::channel::<Envelope>(1);
+    let submissions = Arc::new(Submissions::new());
     let (observed, current) = tokio::sync::watch::channel((record.clone(), durability));
     let demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cleanup_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let metrics_registration = services.metrics.register(&record.spec.id);
     let mut controller = Controller {
+        submissions: submissions.clone(),
         run_timer: None,
         timer_sequence: 0,
         next_run_timeout: None,
@@ -513,7 +527,12 @@ fn spawn_controller(
     controller.publish_view();
     tokio::spawn(async move {
         let mut observers = events::Observers::default();
+        let mut commands_open = true;
+        let mut deletes_open = true;
         loop {
+            if !commands_open && !deletes_open {
+                break;
+            }
             controller.publish_view();
             observers.refresh(&mut controller);
             controller.reconcile_run_timer();
@@ -527,37 +546,67 @@ fn spawn_controller(
                 && !controller.retired;
             enum Wake {
                 Command(Option<Envelope>),
+                Delete(Option<Envelope>),
                 Control(Option<adx_core::runtime::RuntimeStatus>),
                 Exit(Result<adx_core::RuntimeFailure>),
                 Proxy(Result<(String, u64, u64)>),
                 Deadline,
                 RunDeadline,
             }
+            let ordinary = async {
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        match run_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => Wake::RunDeadline,
+                    command = rx.recv(), if commands_open => Wake::Command(command),
+                    status = async {
+                        let Some(changes) = observers.control.as_mut() else {
+                            return std::future::pending().await;
+                        };
+                        if !observers.initial && changes.changed().await.is_err() {
+                            return None;
+                        }
+                        changes.borrow_and_update().clone()
+                    } => Wake::Control(status),
+                    result = async {
+                        match observers.exit.as_mut() {
+                            Some(wait) => wait.await,
+                            None => std::future::pending().await,
+                        }
+                    } => Wake::Exit(result),
+                    proxy = async {
+                        if !running || record.spec.lifecycle.idle_timeout_seconds == 0 {
+                            return std::future::pending().await;
+                        }
+                        routes.activity_changed(&record, proxy_stamp).await
+                    } => Wake::Proxy(proxy),
+                    _ = async {
+                        match deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => Wake::Deadline,
+                }
+            };
             let wake = tokio::select! {
                 biased;
-                _ = async { match run_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => Wake::RunDeadline,
-                command = rx.recv() => Wake::Command(command),
-                status = async {
-                    let Some(changes) = observers.control.as_mut() else { return std::future::pending().await; };
-                    if !observers.initial && changes.changed().await.is_err() { return None; }
-                    changes.borrow_and_update().clone()
-                } => Wake::Control(status),
-                result = async {
-                    match observers.exit.as_mut() { Some(wait) => wait.await, None => std::future::pending().await }
-                } => Wake::Exit(result),
-                proxy = async {
-                    if !running || record.spec.lifecycle.idle_timeout_seconds == 0 { return std::future::pending().await; }
-                    routes.activity_changed(&record, proxy_stamp).await
-                } => Wake::Proxy(proxy),
-                _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => Wake::Deadline,
+                command = delete_rx.recv(), if deletes_open => Wake::Delete(command),
+                wake = ordinary => wake,
             };
             let envelope = match wake {
-                Wake::Command(command) => {
-                    let Some(command) = command else {
-                        break;
-                    };
-                    command
+                Wake::Command(None) => {
+                    commands_open = false;
+                    continue;
                 }
+                Wake::Delete(None) => {
+                    deletes_open = false;
+                    continue;
+                }
+                Wake::Command(Some(command)) | Wake::Delete(Some(command)) => command,
                 Wake::Control(status) => {
                     observers.initial = false;
                     if observers
@@ -653,6 +702,8 @@ fn spawn_controller(
     });
     EnvironmentHandle {
         tx,
+        delete_tx,
+        submissions,
         demand,
         current,
         cleanup_pending,
@@ -796,14 +847,34 @@ impl Controller {
             }
             command => command,
         };
+        let user_delete = matches!(&command, Command::Delete);
         if self.retired {
+            if user_delete {
+                self.submissions.reject_delete();
+            }
             let _ = reply.send(Err(Error::Conflict));
             return;
         }
         if self.authority_fenced {
+            if user_delete {
+                self.submissions.reject_delete();
+            }
             let _ = reply.send(Err(Error::Unavailable(
                 "environment authority reconciliation pending".into(),
             )));
+            return;
+        }
+        if self.submissions.deleting()
+            && matches!(
+                &command,
+                Command::Resume(_)
+                    | Command::EnsureRunning(..)
+                    | Command::Recover(_)
+                    | Command::Create(_)
+                    | Command::Clone(_, _)
+            )
+        {
+            let _ = reply.send(Err(Error::Conflict));
             return;
         }
         let operation = match &command {
@@ -886,12 +957,12 @@ impl Controller {
                 self.create_deadline = None;
                 result
             }
-            Command::Delete => self.delete().await,
+            Command::Delete => self.delete(true).await,
             Command::DeleteAt(revision) => {
                 if self.record.revision != revision {
                     Err(Error::Conflict)
                 } else {
-                    self.delete().await
+                    self.delete(false).await
                 }
             }
             Command::CollectFailed(revision) => {
@@ -903,7 +974,7 @@ impl Controller {
                 } else {
                     // Rejected GC must not mutate a published record at the same revision.
                     self.operation_intent(adx_core::observation::OperationIntent::Policy);
-                    self.delete().await
+                    self.delete(false).await
                 }
             }
             Command::Sync => self.sync().await,
@@ -935,6 +1006,7 @@ impl Controller {
 }
 
 struct Controller {
+    submissions: Arc<Submissions>,
     run_timer: Option<run_timer::RunTimer>,
     timer_sequence: u64,
     next_run_timeout: Option<u64>,
@@ -1168,7 +1240,7 @@ impl Controller {
             }
             if cp.expired(super::checkpoint::now()?) {
                 self.operation_intent(adx_core::observation::OperationIntent::Policy);
-                return self.delete().await;
+                return self.delete(false).await;
             }
             match services.store.validate_artifact(&cp.artifact).await {
                 Ok(()) => (),
@@ -1344,6 +1416,9 @@ impl Controller {
         restore_checkpoint: bool,
         completion: Option<(String, u64, LifecycleKind)>,
     ) -> Result<OperationResult> {
+        if self.submissions.deleting() {
+            return Err(Error::Conflict);
+        }
         let previous_runtime_id = self.record.runtime.id.clone();
         let runtime_id = if restart {
             format!(
@@ -1392,7 +1467,8 @@ impl Controller {
         let mut stage = "backend preparation/runtime start";
         self.create_stage(adx_core::observation::CreateStage::RuntimePrepare);
         let operation_started = Instant::now();
-        let attempt = timeout(initialization_timeout, async {
+        let submissions = self.submissions.clone();
+        let initialization = async {
             if self
                 .create_deadline
                 .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
@@ -1527,8 +1603,16 @@ impl Controller {
                 runtime_ready_ms,
                 route_started.elapsed().as_secs_f64() * 1_000.0,
             ))
-        })
-        .await
+        };
+        let mut restore_cancelled = false;
+        let attempt = tokio::select! {
+            biased;
+            _ = submissions.cancelled(), if restore_checkpoint => {
+                restore_cancelled = true;
+                Ok(Err(Error::Unavailable("restore interrupted by accepted deletion".into())))
+            }
+            result = timeout(initialization_timeout, initialization) => result,
+        }
         .unwrap_or_else(|_| {
             Err(Error::DeadlineExceeded(format!(
                 "create deadline exceeded during {stage}"
@@ -1548,17 +1632,19 @@ impl Controller {
                 } else {
                     start_error
                 };
-                let start_error =
-                    if awaiting_readiness && self.record.spec.execution.readiness_probe.is_some() {
-                        match start_error {
-                            Error::ProbeFailed(_) => start_error,
-                            other => Error::ProbeFailed(adx_core::probes::ProbeFailure::timeout(
-                                other.to_string(),
-                            )),
-                        }
-                    } else {
-                        start_error
-                    };
+                let start_error = if !restore_cancelled
+                    && awaiting_readiness
+                    && self.record.spec.execution.readiness_probe.is_some()
+                {
+                    match start_error {
+                        Error::ProbeFailed(_) => start_error,
+                        other => Error::ProbeFailed(adx_core::probes::ProbeFailure::timeout(
+                            other.to_string(),
+                        )),
+                    }
+                } else {
+                    start_error
+                };
                 if let Error::ProbeFailed(failure) = &start_error {
                     self.record.failure = Some(failure.clone().into());
                 }
@@ -1573,7 +1659,11 @@ impl Controller {
                 self.cleanup_pending
                     .store(true, std::sync::atomic::Ordering::Release);
                 self.transition(Event::Fail)?;
-                self.release_capacity()?;
+                // A deletion-cancelled checkpoint restore retains its reservation
+                // and input files until the backend stop barrier confirms cleanup.
+                if !restore_cancelled {
+                    self.release_capacity()?;
+                }
                 self.record.restart_pending = restart
                     && !restore_checkpoint
                     && self
@@ -1605,7 +1695,7 @@ impl Controller {
                 }
                 let mut commit = self.sync().await;
                 let cleanup = self.cleanup().await;
-                if cleanup.is_ok() && !self.stopped_runtime_ids.is_empty() {
+                if cleanup.is_ok() && (restore_cancelled || !self.stopped_runtime_ids.is_empty()) {
                     // Failure publication precedes physical cleanup. Publish the
                     // completed cleanup separately before opening Volume admission.
                     commit = self.sync().await;
@@ -1693,7 +1783,7 @@ impl Controller {
         self.release_capacity()
     }
 
-    async fn delete(&mut self) -> Result<OperationResult> {
+    async fn delete(&mut self, user_delete: bool) -> Result<OperationResult> {
         let services = self.services.clone();
         let intent = self
             .record
@@ -1702,7 +1792,7 @@ impl Controller {
             .and_then(|o| o.intent)
             .unwrap_or(adx_core::observation::OperationIntent::Policy);
         let mut attempt = services.metrics.operation_attempt("delete", intent);
-        let result = self.delete_inner().await;
+        let result = self.delete_inner(user_delete).await;
         let cleared = self.clear_operation_intent().await;
         let result = match (result, cleared) {
             (Ok(value), Ok(())) => Ok(value),
@@ -1711,8 +1801,19 @@ impl Controller {
         attempt.finish(&result);
         result
     }
-    async fn delete_inner(&mut self) -> Result<OperationResult> {
-        self.publish_operation_intent().await?;
+    async fn delete_inner(&mut self, user_delete: bool) -> Result<OperationResult> {
+        if let Err(error) = self.publish_operation_intent().await {
+            if user_delete {
+                self.submissions.reject_delete();
+            }
+            return Err(error);
+        }
+        if user_delete {
+            if let Err(error) = self.submissions.accept_delete() {
+                self.submissions.reject_delete();
+                return Err(error);
+            }
+        }
         self.record.restart_pending = false;
         self.restart_after = None;
         if self.record.state == EnvironmentState::Deleted {

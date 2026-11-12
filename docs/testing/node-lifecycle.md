@@ -69,6 +69,12 @@ Environment 串行驱动；多个 Ingress、手动恢复和后台重试共用它
 RPC 超时、应答丢失和发布失败保留当前归属，避免启动第二份执行。全部节点拒绝时，
 一个容量轮次排除已经拒绝的节点，30 秒后重试资源，不在节点间持续改写归属。
 
+adxlet 在普通队列入队前合并同一 Environment 的恢复请求，等待入队、排队和执行中共用一份结果，包括失败结果。EnsureRunning 不按 operation ID 或本次运行时长拆分，首个受理请求提供执行元数据；新到的 EnsureRunning 也等待其他在途恢复。显式 Resume 仅合并完整请求相同的调用；Recover 按当前归属下的 recovery operation ID 合并，允许 Coordinator 携带更新的进度 revision。其他异键恢复返回 Conflict。单个等待者超时不会取消已受理任务；任务完成后的下一次请求仍可按既有策略重试，本次不改变 Coordinator 重试频率或退避规则。
+
+显式 `Delete` 使用独立优先通道，不等待普通队列空位；带 revision 的过期删除和失败回收仍按普通 FIFO 执行。删除意图发布前临时关闭恢复准入，意图发布失败会重新开放；发布成功即受理，之后调用方超时、清理失败或结果发布失败都不撤销门禁。恢复文件准备、执行恢复和 readiness 等待响应删除信号；同节点自动 checkpoint 故障恢复与 reload 的 checkpoint 恢复也响应该信号。尚未进入执行的恢复返回 Conflict；已经进入执行的恢复中止返回 Unavailable。删除意图发布失败前已经被信号中止的恢复不会自动续跑，由调用方重试。确认执行停止后才释放恢复占用及输入文件，删除可用同一 Environment ID 重试。
+
+删除优先不跳过安全屏障：已经开始的 checkpoint 捕获仍须完成；sandboxd 已接纳且未确定结果的 Start 由适配器等待其完成，再确认后端删除，不能把取消本地等待视为后端停止。因此删除仍可能等待一次在途操作或清理超时，但不会再排在多轮重复恢复之后。此准入屏障属于当前 Controller 的内存状态；进程重启仍依赖既有权威记录对账，不新增持久化删除意图。
+
 节点失效将 Paused 标记为归属失效并释放资源，仍保留 Paused；不进入 Running/Failed
 对象的主动故障恢复。自动故障恢复过程中的中间 Paused/recovery.pending 并非用户休眠，目标再次失效仍续走原有故障恢复。首次需求再触发休眠对象跨节点恢复。Coordinator/adxlet 重启按 Redis
 意图、generation 和节点进程会话对账，清理未提交执行后才能恢复。TTL 到期或显式
