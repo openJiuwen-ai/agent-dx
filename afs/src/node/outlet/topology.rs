@@ -19,6 +19,11 @@ use std::path::Path;
 /// shared root is the signal that mounts created here propagate to the host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mount {
+    /// mountinfo 的第 4 字段：该挂载在**源文件系统里**的根路径。
+    ///
+    /// bind 挂载时这里才是 bind 的源目录（`source` 字段是设备名，如
+    /// `/dev/vda1`）。判"本机 bind 挂的是不是自己的 users_root"只能比这个。
+    pub root: Vec<u8>,
     pub mount_point: Vec<u8>,
     pub fs_type: String,
     pub source: String,
@@ -42,7 +47,8 @@ fn parse_line(line: &[u8]) -> Option<Mount> {
     let fields = &line[..split];
     let fs_fields = &line[split + 3..];
     let mut field_iter = fields.split(|byte| *byte == b' ');
-    let encoded_point = field_iter.nth(4)?;
+    let encoded_root = field_iter.nth(3)?;
+    let encoded_point = field_iter.next()?;
     // Optional fields follow the mount point and precede the "-" separator.
     // Each is a single token; `shared:<peer-group>` marks shared propagation.
     let shared = field_iter.any(|field| field.starts_with(b"shared:"));
@@ -50,6 +56,7 @@ fn parse_line(line: &[u8]) -> Option<Mount> {
     let fs_type = fs_iter.next()?;
     let source = fs_iter.next()?;
     Some(Mount {
+        root: decode_octal(encoded_root),
         mount_point: decode_octal(encoded_point),
         fs_type: String::from_utf8_lossy(fs_type).into_owned(),
         source: String::from_utf8_lossy(source).into_owned(),
@@ -209,12 +216,35 @@ mod tests {
         pairs
             .iter()
             .map(|(point, fs)| Mount {
+                root: b"/".to_vec(),
                 mount_point: point.as_bytes().to_vec(),
                 fs_type: (*fs).to_owned(),
                 source: "src".into(),
                 shared: false,
             })
             .collect()
+    }
+
+    /// bind 挂载的源目录在 `root` 字段，`source` 是设备名。
+    ///
+    /// 两行都取自真机：本地 bind 是
+    /// `537 30 253:1 /home/.../data/ownerfs /home/.../imports/node-a/users … - ext4 /dev/vda1`，
+    /// 远程 NFS 的 root 是导出根 `/`。判"本机 bind 挂的是不是自己的
+    /// users_root"必须读 root；读 source 会拿到 `/dev/vda1`，于是每条正常
+    /// 挂载都被判成"挂错了"，每 250ms 拆一次重挂（真机上立刻暴露）。
+    #[test]
+    fn bind_mounts_expose_their_source_directory_in_the_root_field() {
+        let mounts = parse(
+            b"537 30 253:1 /home/lzq/afs-v1111/data/ownerfs /home/lzq/afs-v1111/imports/node-a/users rw,relatime shared:1 - ext4 /dev/vda1 rw\n\
+              432 30 0:52 / /home/lzq/afs-v1111/imports/node-b/users rw,relatime shared:1 - nfs4 192.168.2.213:/home/lzq/afs-v1111/data/ownerfs rw\n",
+        );
+        assert_eq!(mounts[0].root, b"/home/lzq/afs-v1111/data/ownerfs");
+        assert_eq!(mounts[0].source, "/dev/vda1");
+        assert_eq!(mounts[1].root, b"/");
+        assert_eq!(
+            mounts[1].source,
+            "192.168.2.213:/home/lzq/afs-v1111/data/ownerfs"
+        );
     }
 
     #[test]

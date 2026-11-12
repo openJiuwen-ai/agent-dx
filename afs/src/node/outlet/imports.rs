@@ -423,7 +423,7 @@ pub fn mount_source(home: &str, users_root: &Path) -> String {
     format!("{}:{}", home, users_root.display())
 }
 
-/// 从挂载源 `<host>:<path>` 取出 host 段。
+/// 把挂载源 `<host>:<path>` 拆成 `(host, 导出路径)`。
 ///
 /// NFSv4 的 mountinfo source 形如 `192.0.2.10:/home/agentos/users`；IPv6 会被
 /// 方括号包住，形如 `[fe80::1]:/home/agentos/users`，必须先按 `]:` 切，否则
@@ -431,7 +431,7 @@ pub fn mount_source(home: &str, users_root: &Path) -> String {
 /// 并重挂。bind 与块设备是纯路径，没有 host 段。返回 `None` 表示"这条挂载
 /// 读不出对端地址"，调用方据此放弃比对而不是猜——猜错会导致每轮拆一次挂载。
 #[must_use]
-pub fn mount_source_host(source: &str) -> Option<&str> {
+pub fn split_source(source: &str) -> Option<(&str, &str)> {
     let (host, path) = match source.strip_prefix('[') {
         Some(rest) => {
             let (host, path) = rest.split_once("]:")?;
@@ -447,7 +447,22 @@ pub fn mount_source_host(source: &str) -> Option<&str> {
     if host.is_empty() || !path.starts_with('/') || host.contains('/') {
         return None;
     }
-    Some(host)
+    Some((host, path))
+}
+
+/// 从挂载源 `<host>:<path>` 取出 host 段。见 [`split_source`]。
+#[must_use]
+pub fn mount_source_host(source: &str) -> Option<&str> {
+    split_source(source).map(|(host, _)| host)
+}
+
+/// 从挂载源 `<host>:<path>` 取出导出路径。见 [`split_source`]。
+///
+/// 用于核对"挂的是不是同一个导出目录"。这条比对对主机名场景同样有效，
+/// 是"同一台机器但挂错目录"的唯一检测手段。
+#[must_use]
+pub fn mount_source_path(source: &str) -> Option<&str> {
+    split_source(source).map(|(_, path)| path)
 }
 
 /// 规范化主机标识：`[fe80::1]` 与 `fe80::1` 是同一台机器。

@@ -303,6 +303,40 @@ fn normalize_host_treats_brackets_as_syntax_not_identity() {
     assert_eq!(normalize_host("192.0.2.10"), "192.0.2.10");
 }
 
+/// 导出路径与 host 来自同一段解析：两者不能各自切一遍，否则 IPv6 与
+/// 歧义写法的处理会漂移。
+#[test]
+fn mount_source_path_returns_the_export() {
+    assert_eq!(
+        mount_source_path("192.0.2.10:/home/agentos/users"),
+        Some("/home/agentos/users")
+    );
+    assert_eq!(
+        mount_source_path("[fe80::1]:/srv/users"),
+        Some("/srv/users")
+    );
+    // 纯路径没有 host 段，取不出导出——与 `mount_source_host` 一致返回 None。
+    assert_eq!(mount_source_path("/home/agentos/users"), None);
+    assert_eq!(mount_source_path("/dev/sda1"), None);
+    // 导出路径必须是绝对路径：`host:2049:/path` 这种误写要被挡掉，
+    // 否则会拿 "2049:/path" 当导出参与比对，判成"挂错"并每轮重挂。
+    assert_eq!(mount_source_path("host:2049:/path"), None);
+}
+
+/// 拆分结果的两半必须来自同一次切分。
+#[test]
+fn split_source_returns_host_and_export_together() {
+    assert_eq!(
+        split_source("[fe80::1]:/srv/users"),
+        Some(("fe80::1", "/srv/users"))
+    );
+    assert_eq!(
+        split_source("node-a.test:/home/agentos/users"),
+        Some(("node-a.test", "/home/agentos/users"))
+    );
+    assert_eq!(split_source("/home/agentos/users"), None);
+}
+
 /// 已挂载的 home 即使本轮快照里没有它的 root，也必须继续被维护。
 ///
 /// 真实故障：A 侧快照暂时只含自己托管的 root，于是 node-b 从状态表被裁掉，

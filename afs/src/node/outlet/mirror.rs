@@ -5,23 +5,34 @@
 //! 是为了让"给定期望态与该有状态，应该做什么"能被表驱动测试穷举——包括那些
 //! 在真机上极难复现的中间态（半发布、ghost 占位、换代瞬间）。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
+};
 
 use crate::node::vfs::ownerfs::root::{OutletRoot, RESERVED_ROOT_NAMES, root_name_from_id};
 
 /// One filesystem action the mirror must perform.
+///
+/// Names are [`OsString`], not `String`: a workspace name is an arbitrary byte
+/// string (Linux path components are bytes, not UTF-8), and OwnerFs encodes it
+/// losslessly as `root-<hex(bytes)>`. Converting the decoded name back to
+/// `String` would replace every invalid byte with U+FFFD, which both renames the
+/// entry the caller created and — since distinct byte sequences can collapse to
+/// the same replacement string — silently merges two workspaces into one name.
+/// The whole path from `root_id` to `symlinkat` therefore stays in bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     /// Atomically publish `name -> target`. `target` is the symlink body.
-    Publish { name: String, target: String },
+    Publish { name: OsString, target: String },
     /// Remove `name` from the public directory. Idempotent.
-    Remove { name: String },
+    Remove { name: OsString },
     /// Move a non-symlink entry out of the way so the name can be published.
     ///
     /// Only produced for entries the mirror did not create; a consumer that
     /// mkdir'd over a name would otherwise make publishing fail with EEXIST
     /// forever, because `symlinkat` cannot replace a directory.
-    Quarantine { name: String },
+    Quarantine { name: OsString },
 }
 
 /// A `/public` entry as observed on disk.
@@ -65,6 +76,11 @@ pub fn target_path(import_root: &str, root: &OutletRoot) -> String {
 /// first place. Keeping one definition is what stops the two from drifting.
 const RESERVED: [&str; 2] = RESERVED_ROOT_NAMES;
 
+/// 保留名判定按字节比较，与 `validate_root_name` 用的是同一组字面量。
+fn is_reserved(name: &OsStr) -> bool {
+    RESERVED.iter().any(|reserved| OsStr::new(reserved) == name)
+}
+
 /// Compute the actions that converge `present` onto `active`.
 ///
 /// Contract:
@@ -92,24 +108,26 @@ pub fn plan(
     import_root: &str,
     active: &[OutletRoot],
     ready_homes: &BTreeSet<String>,
-    present: &BTreeMap<String, PresentEntry>,
+    present: &BTreeMap<OsString, PresentEntry>,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
 
     // Expectation keyed by the workspace name. Meta returns at most one Active
     // record per root_id and the id is an injective encoding of the name, so
-    // two roots can never claim the same entry here.
+    // two roots can never claim the same entry here — provided the key keeps
+    // the name's bytes. `OsString`'s ordering is byte order on Unix, so this is
+    // also the deterministic ordering the logs and tests rely on.
     //
     // Publishing under the workspace name is the point of the layer: a caller
     // binds the name they created, and `root-<hex(name)>` is not something a
     // caller ever wrote. An id that fails to decode cannot be published under
     // any name a caller could use, so it is skipped rather than guessed at.
-    let mut wanted: BTreeMap<String, &OutletRoot> = BTreeMap::new();
+    let mut wanted: BTreeMap<OsString, &OutletRoot> = BTreeMap::new();
     let mut undecodable: Vec<&str> = Vec::new();
     for root in active {
         match root_name_from_id(&root.root_id) {
             Ok(name) => {
-                wanted.insert(name.to_string_lossy().into_owned(), root);
+                wanted.insert(name, root);
             }
             Err(_) => undecodable.push(root.root_id.0.as_str()),
         }
@@ -127,7 +145,7 @@ pub fn plan(
         // 创建路径已经拒了这些名字，但存量 root（旧版本建的）和别的节点建的
         // 都可能还在快照里。若在这里放行，`Quarantine` 会把它挪进隔离区、发布
         // 又把同名目录建回来（暂存目录就在 `<name>/` 里），每轮循环一次。
-        if RESERVED.contains(&name.as_str()) {
+        if is_reserved(name) {
             continue;
         }
         // Every name in `wanted` counts as "should exist" for the removal pass
@@ -170,12 +188,12 @@ pub fn plan(
         }
     }
 
-    let published: BTreeSet<&str> = wanted.keys().map(String::as_str).collect();
+    let published: BTreeSet<&OsStr> = wanted.keys().map(OsString::as_os_str).collect();
     for name in present.keys() {
-        if RESERVED.contains(&name.as_str()) {
+        if is_reserved(name) {
             continue;
         }
-        if published.contains(name.as_str()) {
+        if published.contains(name.as_os_str()) {
             continue;
         }
         // Not in the snapshot: either deactivated, or a ghost from a consumer.
@@ -225,10 +243,10 @@ mod tests {
         }
     }
 
-    fn present(entries: &[(&str, PresentEntry)]) -> BTreeMap<String, PresentEntry> {
+    fn present(entries: &[(&str, PresentEntry)]) -> BTreeMap<OsString, PresentEntry> {
         entries
             .iter()
-            .map(|(name, entry)| ((*name).to_owned(), entry.clone()))
+            .map(|(name, entry)| (OsString::from(name), entry.clone()))
             .collect()
     }
 
@@ -515,9 +533,9 @@ mod tests {
         let names: Vec<_> = first
             .iter()
             .map(|action| match action {
-                Action::Publish { name, .. } => name.as_str(),
-                Action::Remove { name } => name.as_str(),
-                Action::Quarantine { name } => name.as_str(),
+                Action::Publish { name, .. } => name.to_str().unwrap(),
+                Action::Remove { name } => name.to_str().unwrap(),
+                Action::Quarantine { name } => name.to_str().unwrap(),
             })
             .collect();
         assert_eq!(names, vec!["a", "b", "c"]);
@@ -575,5 +593,70 @@ mod tests {
             target_path("/imports/", &node),
             target_path("/imports", &node)
         );
+    }
+
+    /// 非 UTF-8 名字必须逐字节发布，两个仅差非法字节的名字不得合并。
+    ///
+    /// 旧实现用 `to_string_lossy()` 把解码后的名字转成 `String` 做键：`\xe9`
+    /// 与 `\xff` 都会变成 U+FFFD，于是两个 workspace 塌成一条（`BTreeMap`
+    /// 的 insert 覆盖其一），发布出去的也不是调用方创建的名字。真机上已实测
+    /// 该现象（两个 workspace、`/public` 只有一个 `utf8cafe\u{FFFD}`）。
+    #[test]
+    fn non_utf8_names_keep_their_bytes_and_do_not_collide() {
+        use crate::node::vfs::ownerfs::root::root_id_from_name;
+        use std::os::unix::ffi::OsStrExt;
+
+        let first = b"utf8cafe\xe9".to_vec();
+        let second = b"utf8cafe\xff".to_vec();
+        let roots: Vec<OutletRoot> = [first.clone(), second.clone()]
+            .iter()
+            .map(|name| OutletRoot {
+                root_id: root_id_from_name(OsStr::from_bytes(name))
+                    .expect("arbitrary bytes are a legal workspace name"),
+                root_epoch: 1,
+                home_node_id: "node-a".to_owned(),
+                home_nfs_addr: String::new(),
+            })
+            .collect();
+
+        let actions = plan("/imports", &roots, &all_ready(&["node-a"]), &present(&[]));
+        assert_eq!(actions.len(), 2, "两个名字必须是两条动作: {actions:?}");
+
+        let names: Vec<Vec<u8>> = actions
+            .iter()
+            .map(|action| match action {
+                Action::Publish { name, .. } => name.as_bytes().to_vec(),
+                other => panic!("expected a publish, got {other:?}"),
+            })
+            .collect();
+        // OsString 在 Unix 上按字节排序，`\xe9` < `\xff`，顺序确定。
+        assert_eq!(
+            names,
+            vec![first, second],
+            "published names must equal the bytes inside the root id"
+        );
+    }
+
+    /// 收敛判据也得按字节比：`/public` 里存在同字节的链接时不得重发。
+    #[test]
+    fn a_matching_non_utf8_symlink_is_left_alone() {
+        use crate::node::vfs::ownerfs::root::root_id_from_name;
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = b"utf8cafe\xe9".to_vec();
+        let roots = [OutletRoot {
+            root_id: root_id_from_name(OsStr::from_bytes(&raw)).unwrap(),
+            root_epoch: 4,
+            home_node_id: "node-a".to_owned(),
+            home_nfs_addr: String::new(),
+        }];
+        let mut disk = BTreeMap::new();
+        disk.insert(
+            OsString::from(OsStr::from_bytes(&raw)),
+            symlink("/imports/node-a/users/root-7574663863616665e9-e4"),
+        );
+
+        let actions = plan("/imports", &roots, &all_ready(&["node-a"]), &disk);
+        assert!(actions.is_empty(), "同字节链接必须视为已收敛: {actions:?}");
     }
 }

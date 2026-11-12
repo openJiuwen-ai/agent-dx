@@ -1112,10 +1112,22 @@ tmpfs、宿主 mount namespace、`mount(2)` 权限）在启动时 fail-closed �
 `<public_root>/.pub/`，也就是"以 workspace 名命名的目录"里，每轮重建一次并在
 tmpfs 上无限堆积隔离目录，最终 ENOSPC 让整个名字层发布失败。
 
-对端换 IP 的发现不依赖访问失败：镜像每轮把 mountinfo 里 import 挂载的源地址与
-快照上报的 `home_nfs_addr` 比对，不一致即按 `Remount` 重建（`hard` 挂载访问
-失效对端是阻塞而非报错，且发布只写软链、从不访问 target，所以"读不通"不会以
-发布失败的形式暴露）。读不出 host 的源不参与比对。
+对端换 IP、以及"挂载在但挂错了"的发现都不依赖访问失败：镜像每轮把 mountinfo
+里 import 挂载的源与期望值比对，不一致即按 `Remount` 重建。远程比三件事——
+文件系统类型以 `nfs` 开头、源地址（仅当上报值是 IP 字面量，主机名会被
+`mount.nfs` 解析成 IP，硬比会永远不等）、导出路径等于 `users_root`；本机 bind
+比 mountinfo 第 4 列的 `root`（bind 的源目录；`source` 字段是设备名，实测
+`/dev/vda1`，比它会把每条正常挂载都判成错的）。任何一项不符都意味着"名字能
+打开、数据是错的"，而这类错误不会以访问失败或发布失败的形式暴露（`hard`
+挂载访问失效对端是阻塞而非报错，发布只写软链、从不访问 target）。源格式读不
+出来时不参与比对，避免每轮重挂。
+
+**名字按字节传递，不做 UTF-8 归一**：workspace 名是任意字节串（Linux 路径分量
+不是 UTF-8），OwnerFs 用 `root-<hex(bytes)>` 无损编码，镜像从 root id 解码后
+必须原样用于 `symlinkat`。若中间转成 `String`（例如 `to_string_lossy`），每个
+非法字节会变成 U+FFFD，既改掉调用方创建的名字，又会让两个仅差非法字节的名字
+塌成同一条（`BTreeMap` 键冲突，静默丢一个 workspace）。因此 `Action`、`present`
+表与 `scan_public` 的键都是 `OsString`，收敛判据也按字节比较。
 
 Home 侧对外 NFS 导出（OwnerFs egress）不在本能力范围内，仍由部署面或独立分支
 提供。

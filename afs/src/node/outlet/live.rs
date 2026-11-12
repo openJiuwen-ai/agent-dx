@@ -7,6 +7,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -40,16 +41,17 @@ pub struct MirrorConfig {
 /// metadata call can block for the whole mount timeout and stall the loop
 /// (spec H4). Whether a target exists is the consumer's startup check, not
 /// ours.
-pub fn scan_public(root: &Path) -> Result<BTreeMap<String, PresentEntry>> {
+///
+/// Names are kept as the raw bytes the directory returned. A workspace name is
+/// an arbitrary byte string, so converting it to `String` here would both rename
+/// the entry and let two distinct names collide on the U+FFFD replacement
+/// character (`mirror::plan` documents the failure mode this caused).
+pub fn scan_public(root: &Path) -> Result<BTreeMap<OsString, PresentEntry>> {
     let entries = std::fs::read_dir(root).map_err(Error::from)?;
     let mut present = BTreeMap::new();
     for entry in entries {
         let entry = entry.map_err(Error::from)?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            // A non-UTF-8 name cannot be a workspace name (those are single
-            // path components encoded as hex), so it is not ours to manage.
-            continue;
-        };
+        let name = entry.file_name();
         let metadata = std::fs::symlink_metadata(entry.path()).map_err(Error::from)?;
         let kind = if metadata.file_type().is_symlink() {
             LstatKind::Symlink
@@ -58,7 +60,10 @@ pub fn scan_public(root: &Path) -> Result<BTreeMap<String, PresentEntry>> {
         };
         let target = if kind == LstatKind::Symlink {
             match std::fs::read_link(entry.path()) {
-                Ok(target) => Some(target.to_string_lossy().into_owned()),
+                // A body that is not valid UTF-8 cannot be one of our targets
+                // (they are built from an ASCII import root and a hex root id),
+                // so report it as unreadable rather than lossily comparing it.
+                Ok(target) => target.into_os_string().into_string().ok(),
                 // Unreadable body: treat as foreign so the mirror never deletes
                 // something it cannot prove it created.
                 Err(_) => None,
@@ -100,7 +105,7 @@ pub fn apply(root: &Path, action: &Action) -> Result<()> {
     }
 }
 
-fn staging_path(root: &Path, name: &str) -> Result<PathBuf> {
+fn staging_path(root: &Path, name: &OsStr) -> Result<PathBuf> {
     let dir = root.join(STAGING_DIR);
     std::fs::create_dir_all(&dir).map_err(Error::from)?;
     // Fixed-size staging basename: a workspace name is at most NAME_MAX bytes,
@@ -108,7 +113,8 @@ fn staging_path(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("stage-{}", fnv1a(name))))
 }
 
-fn fnv1a(value: &str) -> u64 {
+fn fnv1a(value: &OsStr) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in value.as_bytes() {
         hash ^= u64::from(*byte);
@@ -122,22 +128,28 @@ fn fnv1a(value: &str) -> u64 {
 /// Kept as evidence rather than deleted: a consumer that created a real
 /// directory under a workspace name is a contract violation, and deleting their
 /// data silently would be worse than quarantining it.
-fn quarantine(root: &Path, name: &str) -> Result<()> {
+fn quarantine(root: &Path, name: &OsStr) -> Result<()> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
     let dir = root.join(QUARANTINE_DIR);
     std::fs::create_dir_all(&dir).map_err(Error::from)?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_secs())
         .unwrap_or(0);
-    let target = dir.join(format!(
-        "{}-{}-{stamp}",
-        &name[..name.len().min(32)],
-        fnv1a(name)
-    ));
+    // 名字是任意字节，按字节截断前 32 个再拼哈希与时间戳；不经过 UTF-8，
+    // 否则隔离区里的名字会与调用方写下的名字不一致（且可能互相撞名）。
+    let bytes = name.as_bytes();
+    let prefix = &bytes[..bytes.len().min(32)];
+    // 拼在同一个文件名上：`PathBuf::push` 会加分隔符，把隔离目标变成
+    // `<name>/<suffix>`，原目录仍然占着名字，发布就永远失败。
+    let mut file_name = OsString::from_vec(prefix.to_vec());
+    file_name.push(format!("-{}-{stamp}", fnv1a(name)));
+    let target = dir.join(file_name);
     std::fs::rename(root.join(name), &target).map_err(Error::from)?;
     afs_logging::warn!(
         "outlet.mirror.quarantined";
-        "name" => name,
+        "name" => ?name,
         "to" => target.display().to_string()
     );
     Ok(())
@@ -285,47 +297,40 @@ impl ImportExecutor {
     /// "看到缺失 → 重挂 → 条目再消失 → 又看到缺失"会形成自激循环，实测每秒
     /// 重建一次、每次约 120ms 路径不可用。
     ///
-    /// **源地址也要比**：只比对挂载点在不在，会让"对端换了 IP"永久隐身——
-    /// 内核仍保留那条陈旧挂载，`hard` 下访问它是阻塞而非报错，而发布只做
-    /// `symlink` 不碰 target，所以也不会有访问失败来触发重建。地址由
-    /// [`Self::ensure_imports`] 每轮刷新，因此换 IP 的发现最多晚一轮（默认 250ms）。
+    /// **源地址与导出路径也要比**：只比对挂载点在不在，会让"对端换了 IP"
+    /// 永久隐身——内核仍保留那条陈旧挂载，`hard` 下访问它是阻塞而非报错，
+    /// 而发布只做 `symlink` 不碰 target，所以也不会有访问失败来触发重建。
+    /// 地址由 [`Self::ensure_imports`] 每轮刷新，因此换 IP 的发现最多晚一轮
+    /// （默认 250ms）。同一台机器上挂错导出目录同样能识别，见 [`mount_check`]。
     pub fn reconcile(&mut self, mounts: &[super::topology::Mount]) {
         let now = std::time::Instant::now();
         let homes: Vec<String> = self.table.homes().map(str::to_owned).collect();
         for home in homes {
             let point = super::imports::mount_point(&self.import_root, &home);
-            let point_bytes = {
-                use std::os::unix::ffi::OsStrExt;
-                point.as_os_str().as_bytes().to_vec()
-            };
-            let entry = mounts.iter().find(|mount| mount.mount_point == point_bytes);
-            // 本地 home 的 bind 在 mountinfo 里可能长期不可见（dcache 退化），
-            // 用 (ino, dev) 与源比对复核，避免把"已挂载"误判成"缺失"。
-            // 远程不追加探测：`stat` 在陈旧 NFS 上会阻塞整个 timeo。
-            let mounted = entry.is_some()
-                || (home == self.local_node && bind_still_mounted(&point, &self.users_root));
-            // 挂载还在，但源地址已经不是快照里上报的那个：这条挂载指向一个
-            // 已不存在（或已属于别人）的地址。判为"挂载可疑"，下一轮 detach
-            // 后按新地址重挂。读不出 host 的源、以及上报值不是 IP 字面量的
-            // 情况都不参与判断：mount.nfs 会把主机名解析成 IP 再挂，拿 IP 和
-            // 主机名比会永远不等，变成每轮重挂。
-            let stale_source = home != self.local_node
-                && self.advertised.get(&home).is_some_and(|expected| {
-                    super::imports::is_ip_literal(expected)
-                        && entry
-                            .and_then(|mount| super::imports::mount_source_host(&mount.source))
-                            .is_some_and(|actual| {
-                                super::imports::normalize_host(actual)
-                                    != super::imports::normalize_host(expected)
-                            })
-                });
-            let state = self.table.entry(&home);
-            if stale_source {
-                state.observe_access_failure();
-            } else if mounted {
-                state.observe_mounted();
+            let kind = if home == self.local_node {
+                super::imports::MountKind::Local
             } else {
-                state.observe_absent(now, super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE);
+                super::imports::MountKind::Remote
+            };
+            let check = mount_check(
+                mounts,
+                &point,
+                kind,
+                self.advertised.get(&home).map(String::as_str),
+                &self.users_root,
+            );
+            let state = self.table.entry(&home);
+            match check {
+                // 挂着但指向别处：当作访问失败，下一轮按 Remount 重建。
+                // 不在这里 umount——状态变更集中一处，避免在发布循环中间
+                // 插入挂载操作（设计第四节）。
+                MountCheck::Mismatched(_) => state.observe_access_failure(),
+                MountCheck::Matches => {
+                    state.observe_mounted();
+                }
+                MountCheck::Absent => {
+                    state.observe_absent(now, super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE);
+                }
             }
         }
     }
@@ -376,6 +381,9 @@ impl ImportExecutor {
         if actions.is_empty() {
             return Ok(0);
         }
+        // 只在真要动作时读一次：有动作才需要判"挂载点是不是被占着"，而
+        // 每轮都读这张表没有意义（`reconcile` 那边本来就有一份）。
+        let mounts = read_mounts();
 
         // 三阶段执行：准备（串行）→ 挂载（并行）→ 应用结果（串行）。
         //
@@ -432,24 +440,38 @@ impl ImportExecutor {
 
             let is_remount = matches!(action, super::imports::ImportAction::Remount { .. });
 
-            // 挂载点已被占用：本轮什么都不做。
+            // 挂载点已被占用：只有"挂着且指向期望的源"才算就绪。
             //
-            // 不能"摘掉再挂"。`reconcile` 在下一轮按 mountinfo 重新判定，摘掉
-            // 之后它看到的是"没挂"，于是又产生一次挂载，再摘、再挂，永远停不
-            // 下来（实测每秒一次、日志刷到 196 条）。占用即视为已就绪，把状态
-            // 对齐到 Ready，循环才会收敛。
+            // 不能"摘掉再挂"（`reconcile` 下一轮按 mountinfo 看到"没挂"，会
+            // 再产一次挂载，再摘、再挂，永远停不下来——实测每秒一次、日志刷
+            // 到 196 条），所以匹配时必须把状态对齐到 Ready 让它收敛。
             //
-            // Remount 例外：那是"挂载存在但访问失败"，必须重建。
-            //
-            // 本地 bind 额外传 source：mountinfo 在该路径 dcache 退化时会长期
-            // 不显示条目（实测只剩 30% 可见），单靠它会把"已挂载"误判成"没挂"。
-            // 远程 NFS 不做追加探测（`stat` 会阻塞整个 timeo），那里 mountinfo
-            // 实测可靠。
-            let local_source = matches!(action.kind(), super::imports::MountKind::Local)
-                .then_some(self.users_root.as_path());
-            if !is_remount && is_mounted(&point, local_source) {
+            // 但"占用"不等于"挂对了"：重启后内核仍保留退出前的挂载，其中可能
+            // 指向旧地址、错误的导出目录，或者根本不是 NFS。旧实现只判存在性，
+            // 于是第一轮就把它们当就绪并发布名字——名字打得开、数据是错的、
+            // 还不报错（见 [`mount_check`]）。判成挂错时按 Remount 走，先
+            // detach 再挂，与"访问失败"共用同一条重建路径。
+            let check = mount_check(
+                &mounts,
+                &point,
+                action.kind(),
+                self.advertised.get(&home).map(String::as_str),
+                &self.users_root,
+            );
+            let remount = is_remount || matches!(check, MountCheck::Mismatched(_));
+            if !remount && matches!(check, MountCheck::Matches) {
                 steps.push((home, Step::AlreadyMounted));
                 continue;
+            }
+            if let MountCheck::Mismatched(entry) = check {
+                afs_logging::warn!(
+                    "outlet.import.source_mismatch";
+                    "home" => ?home,
+                    "kind" => ?action.kind(),
+                    "actual_fs_type" => entry.fs_type.clone(),
+                    "actual_source" => entry.source.clone(),
+                    "expected_users_root" => self.users_root.display().to_string()
+                );
             }
 
             // 本机 bind，对端 NFS。两种方式产生同一个路径形态
@@ -489,7 +511,7 @@ impl ImportExecutor {
                     point,
                     source,
                     options,
-                    remount: is_remount,
+                    remount,
                 },
             ));
         }
@@ -708,12 +730,12 @@ pub fn converge_round(
                     | mirror::Action::Remove { name }
                     | mirror::Action::Quarantine { name } => name,
                 };
-                if let Some(home) = home_of_published(name, &active) {
+                if let Some(home) = home_of_published(name.as_os_str(), &active) {
                     suspect = Some(home);
                 }
                 afs_logging::warn!(
                     "outlet.publish.failed";
-                    "name" => name.clone(),
+                    "name" => ?name,
                     "error" => error.to_string()
                 );
             }
@@ -834,28 +856,105 @@ pub async fn run(
     }
 }
 
-/// 该路径当前是否是一个挂载点。
+/// 一条挂载点的判定结果。
+enum MountCheck<'a> {
+    /// 挂载存在，且指向期望的源。
+    Matches,
+    /// 挂着东西，但指向别处：旧地址、错误的导出目录，或者根本不是 NFS。
+    /// 携带实际条目，调用方只用于日志。
+    Mismatched(&'a super::topology::Mount),
+    /// 没有挂载。
+    Absent,
+}
+
+/// 读一次 mountinfo，供一轮内所有 home 共用。
+fn read_mounts() -> Vec<super::topology::Mount> {
+    std::fs::read("/proc/self/mountinfo")
+        .map(|buffer| super::topology::parse(&buffer))
+        .unwrap_or_default()
+}
+
+/// 判定 `point` 上的挂载是否就是我们要的那一条。
 ///
-/// 读 `/proc/self/mountinfo` 而不是 `stat`：后者在陈旧的 NFS 挂载上会阻塞
-/// 整个 `timeo`，把本可以自愈的一轮拖成十分钟。
+/// 只判"路径上有没有挂东西"在重启后有一个静默窗口：内核仍保留进程退出前
+/// 的挂载，新的一轮把它们当成就绪并发布名字，而它们可能指向旧地址、错误的
+/// 导出目录，或者根本不是 NFS（有人 bind 了一个目录过来）。这三种情况下名字
+/// 都打得开，只是读到的数据是错的，且不会有任何报错。
 ///
-/// `source` 只在本地 bind 的二次确认里用到，见 [`bind_still_mounted`]。
-/// 远程（NFS）调用方传 `None`：那条路径上 mountinfo 实测可靠，且 `stat`
-/// 有阻塞风险，不做任何追加探测。
-fn is_mounted(point: &Path, source: Option<&Path>) -> bool {
+/// 三类比对，各自都有"宁可放过、不可误杀"的取舍：
+///
+/// - `fs_type` 必须以 `nfs` 开头（仅远程）。挡住"同一路径被别的挂载占用"。
+///   本机 bind 不比：它的 fstype 就是源盘的，若 `users_root` 落在 NFS 上，
+///   bind 出来的条目同样显示 nfs，按类型判会把正常挂载判成错的。
+/// - host 只在上报值是 IP 字面量时比。`mount.nfs` 会把主机名解析成 IP 再挂，
+///   拿主机名和 IP 比永远不等，会退化成每轮拆一次挂载。
+/// - 导出路径必须等于 `users_root`。这条对主机名场景同样有效，是"同一台
+///   机器但挂错目录"的唯一检测手段。源整条解析不出来时放弃比对，与旧行为
+///   一致——宁可放过，也不自激。
+fn mount_check<'a>(
+    mounts: &'a [super::topology::Mount],
+    point: &Path,
+    kind: super::imports::MountKind,
+    expected_host: Option<&str>,
+    users_root: &Path,
+) -> MountCheck<'a> {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(mountinfo) = std::fs::read("/proc/self/mountinfo") else {
-        return false;
-    };
     let wanted = point.as_os_str().as_bytes();
-    if super::topology::parse(&mountinfo)
-        .iter()
-        .any(|mount| mount.mount_point == wanted)
-    {
-        return true;
+    let Some(entry) = mounts.iter().find(|mount| mount.mount_point == wanted) else {
+        // 本地 bind 在 dentry 退化时可能长期不出现在 mountinfo 里（实测只剩
+        // 约 30% 可见），用 (ino, dev) 复核，否则会把"已挂载"判成"缺失"。
+        // 远程 NFS 不做追加探测：`stat` 在陈旧挂载上会阻塞整个 timeo。
+        return if kind == super::imports::MountKind::Local && bind_still_mounted(point, users_root)
+        {
+            MountCheck::Matches
+        } else {
+            MountCheck::Absent
+        };
+    };
+
+    if kind == super::imports::MountKind::Local {
+        // bind 的源在 mountinfo 的 `root` 字段（第 4 列），不是 `source`——
+        // 后者是设备名（实测 `/dev/vda1`）。比 `source` 会让每条正常挂载
+        // 都判成"挂错了"，然后每 250ms 拆一次重挂（真机上立刻暴露）。
+        return if same_export(&entry.root, users_root) {
+            MountCheck::Matches
+        } else {
+            MountCheck::Mismatched(entry)
+        };
     }
-    // mountinfo 未命中时的复核。只在本地 bind 上做。
-    source.is_some_and(|source| bind_still_mounted(point, source))
+
+    if !entry.fs_type.starts_with("nfs") {
+        return MountCheck::Mismatched(entry);
+    }
+    let Some((host, path)) = super::imports::split_source(&entry.source) else {
+        return MountCheck::Matches;
+    };
+    let host_ok = expected_host.is_none_or(|expected| {
+        !super::imports::is_ip_literal(expected)
+            || super::imports::normalize_host(host) == super::imports::normalize_host(expected)
+    });
+    if host_ok && same_export(path.as_bytes(), users_root) {
+        MountCheck::Matches
+    } else {
+        MountCheck::Mismatched(entry)
+    }
+}
+
+/// 导出路径与配置的 `users_root` 是否同一个目录。
+///
+/// 只归一尾部斜杠，不做 `canonicalize`：后者会解析软链接，在陈旧的 NFS 上
+/// 可能阻塞整个 `timeo`。代价是配置里若把 `users_root` 写成软链接路径，
+/// 会判成不等并每轮重挂——部署约定要求写真实路径。
+fn same_export(actual: &[u8], expected: &Path) -> bool {
+    fn trim(value: &[u8]) -> &[u8] {
+        let mut end = value.len();
+        while end > 1 && value[end - 1] == b'/' {
+            end -= 1;
+        }
+        &value[..end]
+    }
+    use std::os::unix::ffi::OsStrExt;
+    trim(actual) == trim(expected.as_os_str().as_bytes())
 }
 
 /// 本地 bind 的二次确认：挂载点的 `(st_ino, st_dev)` 是否等于挂载源。
@@ -885,12 +984,12 @@ fn bind_still_mounted(point: &Path, source: &Path) -> bool {
 /// 发布名对应的 home。用于发布失败时定位是哪个 import 出了问题。
 ///
 /// 名字与 root id 一一对应，root 又携带 home，所以不需要额外查表。
-fn home_of_published(name: &str, active: &[OutletRoot]) -> Option<String> {
+fn home_of_published(name: &OsStr, active: &[OutletRoot]) -> Option<String> {
     active
         .iter()
         .find(|root| {
             crate::node::vfs::ownerfs::root::root_name_from_id(&root.root_id)
-                .is_ok_and(|decoded| decoded.to_string_lossy() == name)
+                .is_ok_and(|decoded| decoded.as_os_str() == name)
         })
         .map(|root| root.home_node_id.clone())
 }
@@ -1151,11 +1250,130 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let point = super::super::imports::mount_point(&dir.join("imports"), home);
         super::super::topology::Mount {
+            // NFS 导出根：root 字段永远是 `/`。
+            root: b"/".to_vec(),
             mount_point: point.as_os_str().as_bytes().to_vec(),
             fs_type: "nfs4".to_owned(),
             source: format!("{host}:/home/agentos/users"),
             shared: false,
         }
+    }
+
+    fn remote_mount(point: &str, source: &str) -> super::super::topology::Mount {
+        super::super::topology::Mount {
+            root: b"/".to_vec(),
+            mount_point: point.as_bytes().to_vec(),
+            fs_type: "nfs4".to_owned(),
+            source: source.to_owned(),
+            shared: false,
+        }
+    }
+
+    /// 本机 bind：mountinfo 的 `source` 是设备名，`root` 才是 bind 源目录
+    /// （实测 `537 30 253:1 /home/.../data/ownerfs /home/.../imports/... - ext4 /dev/vda1`）。
+    fn local_bind_mount(point: &str, source_root: &str) -> super::super::topology::Mount {
+        super::super::topology::Mount {
+            root: source_root.as_bytes().to_vec(),
+            mount_point: point.as_bytes().to_vec(),
+            fs_type: "ext4".to_owned(),
+            source: "/dev/vda1".to_owned(),
+            shared: false,
+        }
+    }
+
+    const POINT: &str = "/imports/node-a/users";
+    const USERS: &str = "/home/agentos/users";
+
+    fn check(mounts: &[super::super::topology::Mount], host: Option<&str>) -> bool {
+        matches!(
+            super::mount_check(
+                mounts,
+                std::path::Path::new(POINT),
+                super::super::imports::MountKind::Remote,
+                host,
+                std::path::Path::new(USERS)
+            ),
+            super::MountCheck::Matches
+        )
+    }
+
+    /// 同一台机器、错误的导出目录：host 一致但路径不同，必须判错。
+    ///
+    /// 这是"看到有挂载就当成挂对了"里最隐蔽的一类：地址没变，只比源地址的
+    /// 实现完全看不到它，而数据已经换成了别的目录（能打开、能读、全是错的）。
+    #[test]
+    fn a_wrong_export_path_is_detected() {
+        let mounts = vec![remote_mount(POINT, "192.0.2.10:/home/agentos/other")];
+        assert!(!check(&mounts, Some("192.0.2.10")));
+    }
+
+    /// 对端换过 IP、旧挂载还在：host 不符即判错（这条是既有行为的回归）。
+    #[test]
+    fn a_stale_host_is_detected() {
+        let mounts = vec![remote_mount(POINT, "192.0.2.99:/home/agentos/users")];
+        assert!(!check(&mounts, Some("192.0.2.10")));
+    }
+
+    /// 上报的是主机名：不参与 host 比对（mount.nfs 会解析成 IP），但导出路径
+    /// 仍然要比——否则"同机错目录"这一类会从主机名部署里漏掉。
+    #[test]
+    fn a_hostname_advertisement_still_checks_the_export_path() {
+        let wrong = vec![remote_mount(POINT, "10.0.0.7:/home/agentos/other")];
+        assert!(!check(&wrong, Some("node-a")));
+
+        let right = vec![remote_mount(POINT, "10.0.0.7:/home/agentos/users")];
+        assert!(check(&right, Some("node-a")));
+    }
+
+    /// 尾斜杠不该被当成"路径不同"，否则每轮判一次不等、每 250ms 拆挂载。
+    #[test]
+    fn a_trailing_slash_is_not_a_mismatch() {
+        let mounts = vec![remote_mount(POINT, "192.0.2.10:/home/agentos/users/")];
+        assert!(check(&mounts, Some("192.0.2.10")));
+    }
+
+    /// 本机 bind 只比 `root` 字段：它的 `source` 是设备名，fstype 是源盘的
+    /// （users_root 落在 NFS 上时同样显示 nfs），两者都判不出对错。
+    #[test]
+    fn a_local_bind_is_compared_by_its_mount_root() {
+        let good = local_bind_mount(POINT, USERS);
+        assert!(matches!(
+            super::mount_check(
+                &[good],
+                std::path::Path::new(POINT),
+                super::super::imports::MountKind::Local,
+                None,
+                std::path::Path::new(USERS)
+            ),
+            super::MountCheck::Matches
+        ));
+
+        let wrong = local_bind_mount(POINT, "/srv/elsewhere");
+        assert!(matches!(
+            super::mount_check(
+                &[wrong],
+                std::path::Path::new(POINT),
+                super::super::imports::MountKind::Local,
+                None,
+                std::path::Path::new(USERS)
+            ),
+            super::MountCheck::Mismatched(_)
+        ));
+    }
+
+    /// 挂载点空着：Absent，不是"挂错了"。
+    #[test]
+    fn an_empty_import_point_is_absent() {
+        assert!(matches!(
+            super::mount_check(
+                &[],
+                std::path::Path::new(POINT),
+                super::super::imports::MountKind::Remote,
+                Some("192.0.2.10"),
+                std::path::Path::new(USERS)
+            ),
+            super::MountCheck::Absent
+        ));
     }
 
     /// 对端换 IP：即使旧挂载还在 mountinfo 里，也必须重挂到新地址。
@@ -1254,8 +1472,10 @@ mod tests {
         assert_eq!(mounter.mount_count(), before);
     }
 
-    /// 解析不出 host 的源（例如被外部换成了别的文件系统）不参与比对：
-    /// 判不了就不动，避免每轮拆挂载。
+    /// 类型是 NFS、但源格式读不出 host/路径：判不了就不动，避免每轮拆挂载。
+    ///
+    /// 与下面那条"不是 NFS"的区别：那里类型就能定性，这里类型对、内容看不懂，
+    /// 只能放过。
     #[test]
     fn an_unparseable_source_does_not_trigger_a_remount() {
         let dir = tempfile::tempdir().unwrap();
@@ -1264,11 +1484,34 @@ mod tests {
 
         exec.ensure_imports(&[root_on("node-a")]).unwrap();
         let mut mount = mount_at(dir.path(), "node-a", "192.0.2.10");
+        mount.fs_type = "nfs".to_owned();
+        mount.source = "no-export-path-here".to_owned();
+        exec.reconcile(&[mount]);
+
+        assert_eq!(exec.ensure_imports(&[root_on("node-a")]).unwrap(), 0);
+    }
+
+    /// 挂载点被别的文件系统占着（有人 bind 了目录过来）：宁可重建也不能
+    /// 当成就绪——名字能打开，读到的却是完全无关的数据。
+    #[test]
+    fn a_non_nfs_mount_at_the_import_point_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        let before = mounter.mount_count();
+        let mut mount = mount_at(dir.path(), "node-a", "192.0.2.10");
         mount.fs_type = "ext4".to_owned();
         mount.source = "/dev/sda1".to_owned();
         exec.reconcile(&[mount]);
 
-        assert_eq!(exec.ensure_imports(&[root_on("node-a")]).unwrap(), 0);
+        assert_eq!(
+            exec.ensure_imports(&[root_on("node-a")]).unwrap(),
+            1,
+            "非 NFS 的占用必须被替换"
+        );
+        assert_eq!(mounter.mount_count(), before + 1);
     }
 
     /// 路径不安全的 home id 必须在收敛前被丢弃：挂载点与软链 target 都是
@@ -1813,6 +2056,41 @@ mod tests {
         converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
 
         assert!(dir.path().join("a").symlink_metadata().is_err());
+    }
+
+    /// 非 UTF-8 名字必须逐字节发布：真机上这条链路曾经把两个 workspace
+    /// 合并成一个带 U+FFFD 的名字（`mirror::plan` 的键曾是 `String`）。
+    #[test]
+    fn a_non_utf8_workspace_name_is_published_byte_for_byte() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path()).unwrap();
+        // hex(b"utf8cafe\xe9") = 7574663863616665e9，与 OwnerFs 的编码一致。
+        // 两轮同一份快照：第二轮用来验证收敛判据按字节比较。
+        let meta = ScriptedMeta::new(vec![
+            full("d1", vec![node("root-7574663863616665e9", 3, "node-a")]),
+            full("d2", vec![node("root-7574663863616665e9", 3, "node-a")]),
+        ]);
+        let mut digest = None;
+        let mut roots = Vec::new();
+        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+
+        let on_disk = scan_public(dir.path()).unwrap();
+        let exact = OsString::from_vec(b"utf8cafe\xe9".to_vec());
+        assert!(
+            on_disk.contains_key(&exact),
+            "原始字节的名字必须出现在 /public: {:?}",
+            on_disk.keys()
+        );
+        assert!(
+            !on_disk.contains_key(&OsString::from("utf8cafe\u{fffd}")),
+            "不得发布替换字符版本的名字"
+        );
+
+        // 第二轮必须判为已收敛：字节比较而不是 lossy 比较。
+        let applied = converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+        assert_eq!(applied, 0, "converged state must be a no-op");
     }
 
     /// ghost（真实目录占位）先隔离再发布，且原内容不丢。
