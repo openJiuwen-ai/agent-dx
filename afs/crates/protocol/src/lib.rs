@@ -2,10 +2,11 @@
 #![forbid(unsafe_code)]
 
 /// Cluster wire protocol generation: Node↔Meta registration and the Node↔Node
-/// service layout. Carried by `RegisterNodeRequest.protocol_version` and checked
-/// only by Meta's `RegisterNode`; Node↔Node channels do not negotiate it, so a
-/// layout change bumps it and old Nodes are refused at registration.
-pub const CLUSTER_PROTOCOL_VERSION: u32 = 7;
+/// service layout and message semantics. Carried by
+/// `RegisterNodeRequest.protocol_version` and checked only by Meta's
+/// `RegisterNode`; Node↔Node channels do not negotiate it, so an incompatible
+/// change bumps it and old Nodes are refused at registration.
+pub const CLUSTER_PROTOCOL_VERSION: u32 = 8;
 
 pub mod meta {
     tonic::include_proto!("afs.meta.v1");

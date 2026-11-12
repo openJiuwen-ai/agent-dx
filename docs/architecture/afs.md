@@ -500,10 +500,11 @@ Bao sidecar、Peer cache 条目与目录标记、外部对象 key 前缀、Owner
   `catalog.wal` 与请求摘要只由 golden 钉住。
 - **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
 - **协议**：`RegisterNodeRequest.protocol_version` 是集群线协议代际（Node↔Meta 注册、Node↔Node service
-  布局），当前为 7（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
+  布局），当前为 8（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本，
+  8 为 workspace 准备携带调用者身份并移除请求内 `uid`/`gid`），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
-  依赖经 Meta 准入的同版本部署，service 布局变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
+  依赖经 Meta 准入的同版本部署，service 布局或节点间消息语义变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
 
 ### OwnerFs Root 授权的代际与回收
 
@@ -1074,6 +1075,13 @@ DFS的版本复用与read-ahead设置不覆盖OwnerFs策略。read-ahead是向�
 图为逻辑时序，root/Home 查询按需发生，不承诺每次读写的固定 RPC 数。
 bind 与远端访问共享底层文件，新打开的可见性及权限仍需按支持范围验证；
 图示不承诺已有 FD/mmap 即时撤权或跨节点锁一致性。
+
+workspace 创建按原始 mkdir 调用者授权：非 Home 入口通过 OwnerFiles `PrepareOwnerRoot`
+把调用者及其 umask、附加组转给 Home，Home 在挂载根上重做与本地 FUSE mkdir 相同的
+创建权限检查，并由调用者推导 workspace 属主。节点间 mTLS 只认证发起请求的节点，
+调用者身份由入口节点转述；被攻陷的节点可以谎报本机用户，此信任边界与其余 OwnerFiles
+数据路径相同，防止该情形需要节点侧用户身份证明。检查失败时 Home 不创建目录，
+也不写 catalog 或 Meta。
 
 workspace 可以从任意节点的 OwnerFs FUSE 路径删除：Home 在本机执行；非 Home 入口通过
 OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 workspace，非空返回

@@ -1403,7 +1403,7 @@ fn path_os(path: Vec<u8>) -> OsString {
 }
 
 #[cfg(feature = "ownerfs")]
-fn caller_context(
+pub(in crate::node::rpc) fn caller_context(
     caller: Option<afs_protocol::node_data::OwnerCaller>,
 ) -> afs_error::Result<RequestContext> {
     let caller = caller.ok_or_else(|| protocol_error("OwnerFiles request missing caller"))?;

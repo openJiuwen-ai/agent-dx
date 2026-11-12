@@ -22,7 +22,10 @@ service NodeControl {
 
 // OwnerFs only; registered in `ownerfs` builds.
 service OwnerControl {
-  // Prepare and activate a durable workspace reservation on its Home.
+  // Prepare and activate a durable workspace reservation on its Home. Home
+  // derives the workspace owner from the original mkdir caller and re-checks
+  // create permission on the mount root; the node's mTLS identity alone does
+  // not authorize a namespace mutation or an arbitrary owner.
   rpc PrepareOwnerRoot(PrepareOwnerRootRequest) returns (PrepareOwnerRootReply);
   // Home owns advisory lock authority; no file payload travels here.
   rpc OwnerGetLock(OwnerGetLockRequest) returns (OwnerGetLockReply);
@@ -54,9 +57,14 @@ service DfsOwnerControl {
 message PrepareOwnerRootRequest {
   afs.meta.v1.RootReservation reservation = 1;
   bytes name = 2;
-  uint32 uid = 3;
-  uint32 gid = 4;
+  reserved 3, 4;
+  reserved "uid", "gid";
   uint32 mode = 5;
+  // Original mkdir caller. Home derives the directory owner from it and
+  // re-checks create permission on the mount root; absent caller fails closed.
+  // The entry node is trusted to report its local caller: mTLS authenticates
+  // the node, not the user.
+  afs.node.data.v1.OwnerCaller caller = 6;
 }
 
 message PrepareOwnerRootReply {}
