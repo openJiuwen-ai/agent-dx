@@ -181,6 +181,9 @@ pub struct TemplateDraft {
     pub name: String,
     pub image: String,
     pub isolation_runtime: String,
+    /// Optional reusable Platform Snapshot. Publishing a version pins this ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub resources: Resources,
@@ -210,6 +213,8 @@ pub struct TemplateVersion {
     pub version: String,
     pub image: String,
     pub isolation_runtime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub resources: Resources,
@@ -243,6 +248,7 @@ impl TemplateDraft {
             name: self.name.clone(),
             image: self.image.clone(),
             isolation_runtime: self.isolation_runtime.clone(),
+            snapshot_id: self.snapshot_id.clone(),
             env: self.env.clone(),
             resources: self.resources.clone(),
             lifecycle: self.lifecycle.clone(),
@@ -261,6 +267,7 @@ impl From<&TemplateVersion> for TemplateDraft {
             name: template.name.clone(),
             image: template.image.clone(),
             isolation_runtime: template.isolation_runtime.clone(),
+            snapshot_id: template.snapshot_id.clone(),
             env: template.env.clone(),
             resources: template.resources.clone(),
             lifecycle: template.lifecycle.clone(),
@@ -323,6 +330,18 @@ impl TemplateVersion {
             ("isolation_runtime", &self.isolation_runtime),
         ] {
             identifier(value, label)?;
+        }
+        if let Some(id) = &self.snapshot_id {
+            if id.trim() != id
+                || id.is_empty()
+                || id.len() > 256
+                || id.chars().any(char::is_control)
+            {
+                return Err("invalid snapshot_id".into());
+            }
+            if self.readiness_probe.is_some() || self.healthcheck.is_some() {
+                return Err("snapshot templates inherit the captured workload probes".into());
+            }
         }
         for (key, value) in &self.env {
             parameters::render(value, None)?;

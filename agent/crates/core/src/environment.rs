@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 pub struct ExecutionSpec {
     pub image: String,
     pub isolation_runtime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
     /// Managed Agent execution inherits the image process. Internal runtime profiles may use explicit startup.
     #[serde(default)]
     pub inherit_entrypoint: bool,
@@ -40,6 +42,7 @@ impl From<&TemplateVersion> for ExecutionSpec {
         Self {
             image: value.image.clone(),
             isolation_runtime: value.isolation_runtime.clone(),
+            snapshot_id: value.snapshot_id.clone(),
             inherit_entrypoint: true,
             entrypoint: vec![],
             working_dir: String::new(),
@@ -62,6 +65,7 @@ impl ExecutionSpec {
             version: "1".into(),
             image: self.image.clone(),
             isolation_runtime: self.isolation_runtime.clone(),
+            snapshot_id: self.snapshot_id.clone(),
             env: self.env.clone(),
             resources: self.resources.clone(),
             lifecycle: self.lifecycle.clone(),

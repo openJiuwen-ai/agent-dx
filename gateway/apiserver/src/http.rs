@@ -112,7 +112,11 @@ impl Api {
         let context = trace.scope(trace::traceparent).unwrap_or_default();
         let mut response = trace
             .run(async {
-                let mut response = Box::pin(self.handle(request)).await;
+                let mut response = if crate::golden_preparation::matches(request.uri().path()) {
+                    Box::pin(self.serve_preparation(request)).await
+                } else {
+                    Box::pin(self.handle(request)).await
+                };
                 trace::attribute(
                     "http.response.status_code",
                     response.status().as_u16().to_string(),
@@ -144,6 +148,25 @@ impl Api {
         );
         Ok(response)
     }
+
+    async fn serve_preparation(&self, request: Request<Incoming>) -> Response<Body> {
+        let request_id = RequestContext::from_headers(request.headers()).request_id;
+        let caller = match self.clients.authenticate(native_api_key(&request)).await {
+            Ok(caller) => caller,
+            Err(error) => {
+                let status = if matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded) {
+                    Status::unavailable("authentication service unavailable")
+                } else {
+                    Status::unauthenticated("authentication failed")
+                };
+                return error_response(status, &request_id, None, None, false);
+            }
+        };
+        let write = request.method() != hyper::Method::GET;
+        let result = crate::golden_preparation::handle(&self.clients, request, &caller).await;
+        response(result, &request_id, None, None, write)
+    }
+
     async fn handle(self: Arc<Self>, request: Request<Incoming>) -> Response<Body> {
         let create_route = request.method() == hyper::Method::POST
             && percent_encoding::percent_decode_str(request.uri().path())
@@ -168,12 +191,7 @@ impl Api {
         } else if e2b_route {
             header(&request, "x-api-key").unwrap_or("").trim()
         } else {
-            header(&request, "authorization")
-                .and_then(|s| s.strip_prefix("Bearer "))
-                .or_else(|| header(&request, "x-auth-token"))
-                .or_else(|| header(&request, "x-auth"))
-                .unwrap_or("")
-                .trim()
+            native_api_key(&request)
         };
         let authentication = async {
             if e2b_route {
@@ -948,6 +966,15 @@ fn instance_page_after(
     }
     Ok(Some(cursor.after))
 }
+fn native_api_key(request: &Request<Incoming>) -> &str {
+    header(request, "authorization")
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .or_else(|| header(request, "x-auth-token"))
+        .or_else(|| header(request, "x-auth"))
+        .unwrap_or("")
+        .trim()
+}
+
 fn header<'a>(request: &'a Request<Incoming>, key: &str) -> Option<&'a str> {
     request.headers().get(key).and_then(|v| v.to_str().ok())
 }
@@ -1182,6 +1209,8 @@ fn route_name(path: &str) -> &'static str {
         "/api/admin/*"
     } else if path.starts_with("/api/agent") {
         "/api/agent/*"
+    } else if crate::golden_preparation::matches(path) {
+        "/api/environment/v1/snapshot-preparations/*"
     } else if path.contains("/snapshots") {
         "/api/environment/v1/snapshots/*"
     } else if path.starts_with("/api/environment") {

@@ -1,0 +1,84 @@
+{
+  "env": {
+    "API_BASE": "${model_api_base}",
+    "API_KEY": "${model_api_key}",
+    "DIGITALMATE_BIND": "0.0.0.0",
+    "DIGITALMATE_CLIENT_AUTH": "gateway",
+    "DIGITALMATE_FREE_SEARCH_ENABLED": "true",
+    "DIGITALMATE_PORT": "18092",
+    "DIGITALMATE_WORKSPACE": "/data/state",
+    "DIGITALMATE_WORKSWARM_START_TIMEOUT": "180",
+    "HOME": "/data/state/home",
+    "MODEL_CONTEXT_WINDOW": "1048576",
+    "MODEL_NAME": "deepseek-v4.1-flash-1017",
+    "MODEL_PROVIDER": "OpenAI"
+  },
+  "image": "swr.cn-north-4.myhuaweicloud.com/openjiuwen-online-test/digitalmate:v19",
+  "init_timeout_seconds": 180,
+  "isolation_runtime": "runsc",
+  "lifecycle": {
+    "idle_action": "pause",
+    "idle_timeout_seconds": 600,
+    "pause": {
+      "retention": {
+        "kind": "forever"
+      },
+      "storage": "shared",
+      "timeout_seconds": 300
+    }
+  },
+  "mounts": [
+    {
+      "options": [
+        "rw"
+      ],
+      "target": "/data/state",
+      "type": "bind",
+      "volume_id": "digitalmate-workspace-sfs-${workspace}"
+    }
+  ],
+  "name": "digitalmate",
+  "readiness_probe": {
+    "http_get": {
+      "path": "/health/ready",
+      "port": 18092
+    },
+    "initial_delay_seconds": 0,
+    "period_seconds": 3,
+    "timeout_seconds": 2
+  },
+  "resources": {
+    "cpu_limit_millis": 2000,
+    "cpu_millis": 500,
+    "memory_limit_mib": 4096,
+    "memory_mib": 1024
+  },
+  "service": [
+    {
+      "port": 18092,
+      "protocol": "ws"
+    },
+    {
+      "port": 18092,
+      "protocol": "http"
+    }
+  ],
+  "version": "17",
+  "volumes": [
+    {
+      "access_mode": "exclusive",
+      "create_if_missing": true,
+      "create_options": {
+        "gid": 10001,
+        "mode": "0700",
+        "uid": 10001
+      },
+      "id": "digitalmate-workspace-sfs-${workspace}",
+      "source": {
+        "path": "adx-jiuwen-test/workspaces/${workspace}",
+        "storage_domain": "sfs",
+        "type": "directory"
+      }
+    }
+  ]
+}

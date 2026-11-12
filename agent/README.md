@@ -36,6 +36,14 @@ Agent 模板无需逐镜像注册预装 profile。Environment Running 仍不等�
 
 ## 自动暂停与按需恢复
 
+Template 也可通过可选的 `snapshot_id` 固定一个本租户的可复用 Platform Snapshot。
+发布后该引用与版本一起不可变；Alias 先解析成版本。创建每个 Binding 的独立
+Environment 时传 `snapshotId`，其挂载与环境参数仍由当前 Binding 渲染和准入。
+快照恢复继承捕获的 workload probes；带 `snapshot_id` 的 Template 不得配置
+`readiness_probe` 或 `healthcheck`。模板的镜像、运行时和资源应与制品匹配。
+快照缺失、不可用或不兼容时，原 Binding 走正常的错误和重试路径；
+Activator 不把恢复静默改成从镜像冷建。
+
 模板可声明 `lifecycle`，由 Activator 的 HTTP/嵌入式适配器透传至公共 Sandbox 创建接口：
 
 ```json

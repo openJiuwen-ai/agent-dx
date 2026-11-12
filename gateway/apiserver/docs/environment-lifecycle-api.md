@@ -232,6 +232,24 @@ resume the idle policy remains enabled and may pause the Environment again.
 
 ## Reusable snapshots
 
+An authenticated administrator can prepare a Golden Snapshot with a managed
+image workload using the native preparation routes. This does not change the
+E2B `fromImage` seed configuration.
+
+| Method and path | Input / result |
+| --- | --- |
+| POST `/api/environment/v1/snapshot-preparations` | Register `{"name":"digitalmate-v1","cpuMillis":1000,"memoryMib":2048}`; optional `diskMib` defaults to zero. Returns `templateId` and `preparationId`. |
+| POST `/api/environment/v1/snapshot-preparations/{templateId}/{preparationId}` | Native Environment create body for the fresh seed. Set `inheritEntrypoint: true` and a workload `readinessProbe`. Resources must match the registration. |
+| GET `/api/environment/v1/snapshot-preparations/{templateId}/{preparationId}` | Observe `phase` in the caller's tenant. The response includes `snapshotId` only when the preparation is ready and the snapshot is available. |
+
+The seed becomes eligible for capture after its configured readiness succeeds.
+The Coordinator then captures it and confirms seed cleanup before publishing the
+preparation as ready. Keep the returned IDs; after a lost start response, read
+that preparation instead of registering a second build. Exclude per-user
+credentials and mutable user files from shared seeds. Clone the ready snapshot
+through the usual Environment create route, explicitly declaring clone mounts
+and settings. The same snapshot can be used for multiple creates.
+
 Creating a reusable snapshot leaves its source environment running and requests a
 non-expiring snapshot. `name` is optional on raw HTTP; it may be absent or the
 empty string, but a supplied whitespace-only name is rejected. The resulting
