@@ -601,7 +601,7 @@ async fn action(
                 json!({"snapshotID": value["snapshotId"], "names": value["names"]}),
             ))
         }
-        ("POST", "v2", "connect") => connect(api, request, id, caller).await,
+        ("POST", "v2" | "sandbox", "connect") => connect(api, request, id, caller).await,
         ("POST", "sandbox", "resume") => resume(api, request, id, caller).await,
         ("GET", "template", "") => {
             super::template_api::detail(api, id, request.uri().query().unwrap_or(""), caller)

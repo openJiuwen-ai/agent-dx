@@ -51,6 +51,16 @@ fn gateway(allow_http: bool, frontend: String, public: bool) -> Arc<Ingress> {
 }
 
 async fn request(gateway: Arc<Ingress>, path: &str, headers: &str) -> u16 {
+    request_at(gateway, "GET", "shared.test", path, headers).await
+}
+
+async fn request_at(
+    gateway: Arc<Ingress>,
+    method: &str,
+    host: &str,
+    path: &str,
+    headers: &str,
+) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -63,7 +73,7 @@ async fn request(gateway: Arc<Ingress>, path: &str, headers: &str) -> u16 {
     socket
         .write_all(
             format!(
-                "GET {path} HTTP/1.1\r\nHost: shared.test\r\nConnection: close\r\n{headers}\r\n"
+                "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n{headers}\r\n"
             )
             .as_bytes(),
         )
@@ -138,6 +148,37 @@ async fn e2b_http_opt_in_forwards_management_authentication() {
         let status = request(gateway(true, address, true), "/sandboxes", headers).await;
         upstream.abort();
         assert_eq!(status, expected);
+    }
+}
+
+#[tokio::test]
+async fn legacy_sdk_connect_selectors_do_not_override_shared_management_routing() {
+    for (host, port, key, expected) in [
+        ("shared.test", 49983, true, 200),
+        ("shared.test", 49983, false, 401),
+        ("49983-e2b-test.sandbox.test", 49983, true, 401),
+        ("e2b-test-49983.sandbox.test", 49983, true, 401),
+        ("shared.test", 8080, true, 401),
+    ] {
+        let (address, upstream) = frontend().await;
+        let headers = format!(
+            "E2b-Sandbox-Id: e2b-test\r\nE2b-Sandbox-Port: {port}\r\nContent-Length: 0\r\n{}",
+            if key {
+                "X-API-Key: test-api-key\r\n"
+            } else {
+                ""
+            },
+        );
+        let status = request_at(
+            gateway(true, address, false),
+            "POST",
+            host,
+            "/sandboxes/e2b-test/connect",
+            &headers,
+        )
+        .await;
+        upstream.abort();
+        assert_eq!(status, expected, "host={host}, port={port}, key={key}");
     }
 }
 

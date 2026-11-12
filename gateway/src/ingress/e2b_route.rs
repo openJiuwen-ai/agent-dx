@@ -102,16 +102,24 @@ impl E2bAuthorizationError {
     }
 }
 
+/// Resolve only the explicit sandbox authority, without forwarding headers.
+pub(super) fn host_target<B>(
+    request: &Request<B>,
+    domain: &str,
+) -> Result<Option<E2bTarget>, E2bTargetError> {
+    Ok(request_host(request)
+        .map(|host| parse_host(host, domain))
+        .transpose()?
+        .flatten())
+}
+
 /// Parses the E2B host form and/or E2B forwarding headers. If both select a
 /// target, they must select precisely the same stable sandbox and port.
 pub fn parse_target<B>(
     request: &Request<B>,
     domain: &str,
 ) -> Result<Option<E2bTarget>, E2bTargetError> {
-    let from_host = request_host(request)
-        .map(|host| parse_host(host, domain))
-        .transpose()?
-        .flatten();
+    let from_host = host_target(request, domain)?;
     let from_headers = parse_headers(request.headers())?;
     match (from_host, from_headers) {
         (Some(host), Some(headers)) if host != headers => Err(E2bTargetError::ConflictingTarget),

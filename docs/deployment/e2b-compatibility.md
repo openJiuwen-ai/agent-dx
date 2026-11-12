@@ -10,7 +10,7 @@ ADX 在原生 Environment 生命周期上提供 E2B SDK 兼容入口。控制面
 | 查询与列表 | `GET /sandboxes/{id}` 返回状态、时间及凭据；`GET /v2/sandboxes` 支持 state/metadata/limit/nextToken，返回原始数组和 `X-Next-Token`；旧根路径 GET 列表未接入 |
 | 模板 alias | 裸 alias 查询本租户已注册名称，返回实际 templateID；仅 default selector 解析 latest-success，custom tag 明确拒绝。平台只保存 current 与 latest-success |
 | 删除与续期 | `DELETE /sandboxes/{id}` 复用原生删除；`POST /sandboxes/{id}/timeout` 设置从当前时刻计算的期限，0 表示立即到期 |
-| Connect | `POST /v2/sandboxes/{id}/connect` 对运行态续期，对暂停态恢复；timeout 默认 300 秒，可取 1～86400 秒 |
+| Connect | `POST /sandboxes/{id}/connect` 与 `POST /v2/sandboxes/{id}/connect` 共用处理函数，对运行态续期、对暂停态恢复；timeout 默认 300 秒，可取 1～86400 秒 |
 | Pause/Snapshot | `POST /sandboxes/{id}/pause`、`POST /sandboxes/{id}/snapshots` 支持内存模式；memory 省略或 true，false 明确拒绝；实际能力取决于 backend/checkpoint storage |
 | Snapshot 查询/删除 | `GET /snapshots` 查询 Regular；`DELETE /templates/{id}` 先解析平台模板并逻辑删除绑定，有引用时拒绝；普通运行态 snapshot ID 保留原生删除路径 |
 | 数据面 | commands、files、PTY 和应用端口经共享网关转发；网关鉴权模式增加 SDK 签名文件 URL，见下文配置与限制 |
@@ -103,7 +103,7 @@ E2B 适配层只做协议转换，复用 ADX 公共查询、EnsureRunning、运�
 | 项目 | 修改方案 | 明确边界 |
 | --- | --- | --- |
 | `GET /templates/{templateID}` | 查询调用租户的 Snapshot Preparation 当前记录和最近可用成功记录，去重后返回 builds、状态及真实资源；顶层 buildID、buildStatus 和资源统一描述可用成功版本，无成功版本时使用当前记录并省略 buildID；返回家族及各构建的真实创建/更新时间、累计成功创建次数及最近使用时间 | 只列保留的至多两项，支持 limit/nextToken；构建列表的保留范围与 E2B 完整历史不同。缺少历史元信息的旧家族不能提供完整详情，返回明确错误；不填固定值冒充历史 |
-| `POST /sandboxes/{sandboxID}/resume` | 复用 EnsureRunning 恢复原身份和既有凭据，Ready 后更新原生运行期限；空请求默认 15 秒，显式 timeout 替换期限，0 在恢复后立即到期 | 仅 Paused 可调用，Running 重复调用返回 409；v2 Connect 保持默认 300 秒和只延长期限。memory:false 拒绝；autoPause 只能与既有到期动作一致，不在恢复时修改平台策略 |
+| `POST /sandboxes/{sandboxID}/resume` | 复用 EnsureRunning 恢复原身份和既有凭据，Ready 后更新原生运行期限；空请求默认 15 秒，显式 timeout 替换期限，0 在恢复后立即到期 | 仅 Paused 可调用，Running 重复调用返回 409；两条 Connect 路径保持默认 300 秒和只延长期限。memory:false 拒绝；autoPause 只能与既有到期动作一致，不在恢复时修改平台策略 |
 | SDK 独立签名 URL | 固定管理入口、逐沙箱 Host 共用一个 Ingress；部署 DNS/TLS，复用现有 Host 解析、签名校验及 Relay | 不改 SDK 或应用代码；共享固定 `E2B_SANDBOX_URL` 缺失沙箱定位信息的行为不能伪装成已支持 |
 | 网络域名规则 | allowOut 的 IP/CIDR 转为 peer.cidr，精确域名或前导 `*.` 转为 peer.domain；沿用同一创建/更新转换和后端 ACL | 按锁定 E2B 合同，denyOut 只接 IP/CIDR；不接代理、HTTPS 改写、IPv6。原生 domain 规则按 DNS 派生 IPv4 权限，不等同按 HTTP Host 隔离共享 IP 服务 |
 
@@ -180,6 +180,8 @@ Prepare 在 seed Running 后执行，不改变 Environment 状态机；preparati
 `logsOffset` 返回连续的有界分页，每页最多 100 条，终态可继续排空；最多保留 256 条、约 128 KiB 编码日志，并提示截断，不承诺完整 stdout/stderr。Preparing 期间源实例的 Pause/Snapshot 等变更返回冲突，删除取消准备并停止源实例；其他实例监控继续运行。
 
 ## 请求路径与鉴权
+
+旧 SDK 的管理面 Connect 等请求可能附带 `E2b-Sandbox-Id` 和 `E2b-Sandbox-Port: 49983`。在共享 API 地址上，已知 E2B 管理路径仍转发 API Server 并校验 API Key；这些头不将其改成 envd 请求。显式沙箱域名、原生端口域名以及应用端口选择器仍走数据面并执行原访问策略。
 
 ```mermaid
 flowchart LR

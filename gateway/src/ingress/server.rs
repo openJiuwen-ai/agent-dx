@@ -1,8 +1,8 @@
 use super::auth::IngressAuthenticator;
 use super::connector::{DataPlaneL4Connector, H2ConnectStream};
 use super::e2b_route::{
-    is_management_path as is_e2b_management_path, parse_target as parse_e2b_target,
-    E2bAuthorizationError, E2bTarget,
+    host_target as e2b_host_target, is_management_path as is_e2b_management_path,
+    parse_target as parse_e2b_target, E2bAuthorizationError, E2bTarget,
 };
 use super::http_pool::{
     BackendHttpPool, BackendHttpPoolConfig, BackendHttpPoolError, BackendHttpPoolKey,
@@ -1421,7 +1421,20 @@ impl Ingress {
         let Some(domain) = self.port_host_domain.as_deref() else {
             return Ok(None);
         };
-        parse_e2b_target(request, domain).map_err(|_| ())
+        let target = parse_e2b_target(request, domain).map_err(|_| ())?;
+        // Older SDKs attach envd selectors to management calls such as Connect.
+        // On the shared API authority those remain API-key authenticated calls.
+        // Explicit sandbox authorities and application-port selectors stay data-plane.
+        if is_e2b_management_path(request.uri().path())
+            && target
+                .as_ref()
+                .is_some_and(|target| target.port == super::e2b_route::ENVD_PORT)
+            && self.port_host_route(request).is_none()
+            && e2b_host_target(request, domain).map_err(|_| ())?.is_none()
+        {
+            return Ok(None);
+        }
+        Ok(target)
     }
 
     fn direct_route<B>(&self, request: &Request<B>) -> Option<ParsedDirectPath> {
