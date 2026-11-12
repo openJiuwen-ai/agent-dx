@@ -3,6 +3,9 @@ use crate::{Error, Resources, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Reserved registration label for the machine identity reported by adxlet.
+pub const NODE_HOST_UUID_LABEL: &str = "ADX_NODE_HOST_UUID";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceKind {

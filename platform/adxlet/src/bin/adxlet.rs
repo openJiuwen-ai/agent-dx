@@ -1,3 +1,4 @@
+use adx_core::scheduling::NODE_HOST_UUID_LABEL;
 use adx_process::{read_config, shutdown};
 use adx_protocol::control as pb;
 use adx_transport::rpc::{RpcChannel, RpcClient};
@@ -17,10 +18,13 @@ use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
+
+const DMI_HOST_UUID_PATH: &str = "/sys/class/dmi/id/product_uuid";
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -111,6 +115,23 @@ fn runtime_ready_timeout() -> u64 {
 }
 fn execd_ready_poll_interval() -> Duration {
     Duration::from_millis(10)
+}
+
+fn read_host_uuid(path: &Path) -> std::io::Result<uuid::Uuid> {
+    let value = std::fs::read_to_string(path)?;
+    let id = value.trim().parse::<uuid::Uuid>().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed DMI product UUID",
+        )
+    })?;
+    if id.is_nil() || id.as_u128() == u128::MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "placeholder DMI product UUID",
+        ));
+    }
+    Ok(id)
 }
 async fn sample(
     source: &ResourceSource,
@@ -399,6 +420,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         labels.insert("ADX_CHECKPOINT_SCOPE".into(), scope.clone());
     }
     labels.extend(local_rootfs_labels);
+    labels.remove(NODE_HOST_UUID_LABEL);
+    match read_host_uuid(Path::new(DMI_HOST_UUID_PATH)) {
+        Ok(host_uuid) => {
+            labels.insert(NODE_HOST_UUID_LABEL.into(), host_uuid.to_string());
+        }
+        Err(error) => adx_observability::warn!(
+            node_id = %config.node_id,
+            path = DMI_HOST_UUID_PATH,
+            %error,
+            "worker host UUID unavailable; registration will preserve any existing scheduling pause"
+        ),
+    }
     if let Some(alias) = manager.checkpoint_storage_alias() {
         labels.insert("ADX_CHECKPOINT_STORAGE".into(), alias.into());
     }
@@ -623,6 +656,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dmi_host_uuid_is_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("product_uuid");
+        std::fs::write(&path, "ABCDEF12-3456-4789-ABCD-EF1234567890\n").unwrap();
+        assert_eq!(
+            read_host_uuid(&path).unwrap().to_string(),
+            "abcdef12-3456-4789-abcd-ef1234567890"
+        );
+    }
+
+    #[test]
+    fn dmi_host_uuid_distinguishes_missing_and_invalid_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("product_uuid");
+        assert_eq!(
+            read_host_uuid(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        for value in [
+            "not a UUID",
+            "00000000-0000-0000-0000-000000000000",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        ] {
+            std::fs::write(&path, value).unwrap();
+            assert_eq!(
+                read_host_uuid(&path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
 
     // A single-method service probes the production Coordinator channel without
     // requiring Redis or reproducing Coordinator scheduling in this fixture.
