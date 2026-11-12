@@ -69,7 +69,7 @@ async fn local_adapter_passes_the_public_request_and_preserves_unknown_delete() 
     assert_eq!(calls[0].0, "tenant");
     assert_eq!(
         calls[0].1,
-        json!({"namespace":"adx","name":"id","image":"app:1","runtime":"runc","inheritEntrypoint":true,"env":{"MODEL_KEY":"test-key"},"cpu":1000,"memory":512,"createTimeoutSeconds":60,"ports":[],"network":adx_activator::environment_request::network_input(&network_policy()).unwrap()})
+        json!({"namespace":"adx","name":"id","image":"app:1","runtime":"runc","inheritEntrypoint":true,"env":{"MODEL_KEY":"test-key"},"cpu":1000,"memory":512,"createTimeoutSeconds":60,"ports":[],"restartPolicy":{"maxAttempts":3,"initialBackoffSeconds":5,"maxBackoffSeconds":60},"network":adx_activator::environment_request::network_input(&network_policy()).unwrap()})
     );
     assert!(calls[0].2.starts_with("activator-create-"));
     assert!(

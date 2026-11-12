@@ -277,6 +277,26 @@ request under that identity conflicts, as does a named create already in
 flight under another identity. JSON object key order does not change the digest; omission, explicit zero and null are distinct request shapes. The cache is an HTTP create boundary, not a guarantee
 about an unknown network outcome outside API Server.
 
+Completed CREATE requests remain in a bounded 600-second cache, keyed by tenant
+and the incoming request ID. Replays read the current Env from the existing local
+directory and use the same response builder as uncached CREATE. A Running Env
+returns its current information and its original creation `requestId`, including
+after node takeover or deletion followed by same-name recreation. The returned
+creation ID does not replace the incoming request ID as the cache key.
+
+Confirmed absence or a terminal Failed/Deleted execution returns the existing
+terminal `409`. An unavailable directory or a recoverable phase returns `503`.
+A later replay can observe a recreated Running Env and return `200`; a prior
+terminal observation does not hide that new Env. Other completed errors retain
+their existing replay behavior. The Activator confirms absence and advances its
+creation request ID; unknown outcomes keep the same request ID.
+
+The cache retains `newlyCreated: true` only while returning the Env created by
+that cached request. Reusing a replacement Env returns `newlyCreated: false`.
+Each API Server reads its existing directory without an added RPC, subscription,
+cross-instance invalidation, or background scan. Directory propagation remains
+eventual; this is not a synchronous cross-replica deletion barrier.
+
 For pause, resume, reload, network replacement, and snapshot creation, malformed or missing
 lifecycle IDs and invalid local input map to `400`; downstream business
 rejection maps to `409`; API Server-to-Node transport failure maps to `503`; and

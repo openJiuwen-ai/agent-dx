@@ -27,6 +27,7 @@ fn both_transports_submit_the_public_environment_contract_without_agent_metadata
             "namespace":"adx", "name":"generation", "image":"app:1", "runtime":"runc",
             "cpu":1500, "memory":768, "inheritEntrypoint":true,
             "env":{"MODEL_KEY":"test-value"}, "createTimeoutSeconds":60,"ports":[],
+            "restartPolicy":{"maxAttempts":3,"initialBackoffSeconds":5,"maxBackoffSeconds":60},
             "network":adx_activator::environment_request::network_input(&network_policy()).unwrap()
         })
     );

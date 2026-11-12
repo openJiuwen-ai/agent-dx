@@ -6,6 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Stable public CREATE terminal reason shared by Environment API adapters.
+/// Callers must also verify the error semantics and operation identity before retrying.
+pub const CREATE_TERMINAL_MESSAGE: &str =
+    "environment create has a terminal result; query its failure";
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {

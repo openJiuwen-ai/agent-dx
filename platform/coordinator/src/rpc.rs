@@ -1,5 +1,6 @@
 //! Async RPC coordination around the synchronous scheduler and Redis repository.
 use adx_transport::rpc::RpcClient;
+
 mod artifacts;
 mod autoscaling;
 mod checkpoint_cleanup;
@@ -34,6 +35,20 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tonic::{transport::Endpoint, Request, Response, Status};
+
+impl TryFrom<&StoredEnvironment> for pb::EnvironmentRecord {
+    type Error = Error;
+
+    fn try_from(stored: &StoredEnvironment) -> Result<Self> {
+        let mut record: Self = stored.effective_record().try_into()?;
+        record.creation_request_id = stored
+            .creation
+            .as_ref()
+            .map(|creation| creation.request_id.clone())
+            .unwrap_or_default();
+        Ok(record)
+    }
+}
 
 struct LiveNode {
     expired: bool,
@@ -864,13 +879,13 @@ impl CoordinatorRpc {
             state.session.clone()
         };
         if let Some(record) = session
-            .published_request(&raw.tenant_id, &request_id)
+            .published_request_stored(&raw.tenant_id, &request_id)
             .await
             .map_err(status)?
         {
             return Ok(Response::new(pb::EnvironmentResult {
                 newly_created: false,
-                record: Some(record.try_into().map_err(status)?),
+                record: Some((&record).try_into().map_err(status)?),
                 durability: pb::Durability::Published as i32,
                 ..Default::default()
             }));
@@ -882,18 +897,19 @@ impl CoordinatorRpc {
             Ok(stored) if stored.result.is_some() => {
                 let record = stored
                     .result
+                    .clone()
                     .ok_or_else(|| Status::internal("confirmed result missing"))?;
-                let record = if record.state == EnvironmentState::Running {
+                let stored = if record.state == EnvironmentState::Running {
                     // Keep the replay transaction off the RPC future's stack.
                     Box::pin(session.publish_existing(record, &request_id))
                         .await
                         .map_err(status)?
                 } else {
-                    record
+                    stored
                 };
                 return Ok(Response::new(pb::EnvironmentResult {
                     newly_created: false,
-                    record: Some(record.try_into().map_err(status)?),
+                    record: Some((&stored).try_into().map_err(status)?),
                     durability: pb::Durability::Published as i32,
                     ..Default::default()
                 }));
@@ -1118,13 +1134,13 @@ impl CoordinatorRpc {
         let inspection = self.create_guard(format!("publication:{}", spec.id)).await;
         let session = { self.0.state.lock().await.session.clone() };
         if let Some(record) = session
-            .published_request(&spec.tenant_id, &request_id)
+            .published_request_stored(&spec.tenant_id, &request_id)
             .await
             .map_err(status)?
         {
             return Ok(pb::EnvironmentResult {
                 newly_created: false,
-                record: Some(record.try_into().map_err(status)?),
+                record: Some((&record).try_into().map_err(status)?),
                 durability: pb::Durability::Published as i32,
                 ..Default::default()
             });
@@ -1136,17 +1152,18 @@ impl CoordinatorRpc {
             Ok(stored) if stored.result.is_some() => {
                 let record = stored
                     .result
+                    .clone()
                     .ok_or_else(|| Status::internal("confirmed environment result missing"))?;
-                let record = if record.state == EnvironmentState::Running {
+                let stored = if record.state == EnvironmentState::Running {
                     Box::pin(session.publish_existing(record, &request_id))
                         .await
                         .map_err(status)?
                 } else {
-                    record
+                    stored
                 };
                 return Ok(pb::EnvironmentResult {
                     newly_created: false,
-                    record: Some(record.try_into().map_err(status)?),
+                    record: Some((&stored).try_into().map_err(status)?),
                     durability: pb::Durability::Published as i32,
                     ..Default::default()
                 });
@@ -1287,7 +1304,7 @@ impl CoordinatorRpc {
                         "existing environment requires recovery/query",
                     ));
                 }
-                if let Some(result) = stored.result {
+                if let Some(result) = &stored.result {
                     if result.state == EnvironmentState::Failed {
                         if let Some(failure) = &result.failure {
                             if failure.reason == adx_core::RuntimeFailureReason::DeadlineExceeded {
@@ -1304,7 +1321,7 @@ impl CoordinatorRpc {
                     }
                     return Ok(pb::EnvironmentResult {
                         newly_created: false,
-                        record: Some(result.try_into().map_err(status)?),
+                        record: Some((&stored).try_into().map_err(status)?),
                         durability: pb::Durability::Published as i32,
                         ..Default::default()
                     });
@@ -1358,6 +1375,11 @@ impl CoordinatorRpc {
                     }
                 };
                 let request = pb::StartAssignedEnvironmentRequest {
+                    creation_request_id: stored
+                        .creation
+                        .as_ref()
+                        .map(|creation| creation.request_id.clone())
+                        .unwrap_or_default(),
                     create_deadline_unix_millis: create_deadline.unix_millis(),
                     snapshot,
                     node_session_id: node
@@ -1373,7 +1395,7 @@ impl CoordinatorRpc {
                 request.set_timeout(adx_transport::deadline::create_response_timeout(
                     create_deadline.remaining()?,
                 ));
-                let result = match pb::node_service_client::NodeServiceClient::new(
+                let mut result = match pb::node_service_client::NodeServiceClient::new(
                     self.0.node_tls.wrap(channel),
                 )
                 .create_environment(request)
@@ -1422,15 +1444,20 @@ impl CoordinatorRpc {
                     }
                     Err(error) => return Err(error),
                 };
-                let record: EnvironmentRecord = result
+                let observed = result
                     .record
-                    .clone()
-                    .ok_or_else(|| Status::unavailable("node result missing"))?
-                    .try_into()
-                    .map_err(status)?;
+                    .as_mut()
+                    .ok_or_else(|| Status::unavailable("node result missing"))?;
+                let record: EnvironmentRecord = observed.clone().try_into().map_err(status)?;
+                let creation_request_id = stored
+                    .creation
+                    .as_ref()
+                    .map_or("", |creation| creation.request_id.as_str());
                 if record.spec != spec
                     || record.assignment != stored.assignment
                     || record.state != EnvironmentState::Running
+                    || (!observed.creation_request_id.is_empty()
+                        && observed.creation_request_id != creation_request_id)
                 {
                     return Err(Status::failed_precondition(
                         "node returned inconsistent result",
@@ -1445,6 +1472,9 @@ impl CoordinatorRpc {
                 } else if result.durability != pb::Durability::Journaled as i32 {
                     return Err(Status::unavailable("unknown result durability"));
                 }
+                // Older nodes omit this response metadata. The Coordinator owns
+                // its value; spec, assignment, state and durability remain checked.
+                observed.creation_request_id = creation_request_id.to_owned();
                 return Ok(result);
             }
             drop(state);
@@ -2480,9 +2510,8 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .nodes
                     .get(&stored.assignment.node_id)
                     .ok_or_else(|| Status::unavailable("owner node missing"))?;
-                let record = stored.effective_record();
                 Ok(Response::new(pb::GetEnvironmentResponse {
-                    record: Some(record.try_into().map_err(status)?),
+                    record: Some((&stored).try_into().map_err(status)?),
                     node_address: node.address.clone(),
                     relay_address: node.proxy_address.clone(),
                 }))

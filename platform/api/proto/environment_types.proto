@@ -240,6 +240,9 @@ enum EnvironmentState {
 }
 
 message EnvironmentRecord {
+  // Coordinator-owned response metadata: the request that created this lifetime.
+  // Node lifecycle commits do not set or replace it.
+  string creation_request_id = 16;
   ExecutionObservation observation = 15;
   EnvironmentSpec spec = 1;
   Assignment assignment = 2;
