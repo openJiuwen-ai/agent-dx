@@ -58,9 +58,16 @@ service DfsOwnerControl {
 message PrepareOwnerRootRequest {
   afs.meta.v1.RootReservation reservation = 1;
   bytes name = 2;
-  uint32 uid = 3;
-  uint32 gid = 4;
+  // Requested workspace owner. Omitted means the caller's own uid/gid. Home
+  // honors a differing owner only for a root caller, matching chown(2).
+  optional uint32 uid = 3;
+  optional uint32 gid = 4;
   uint32 mode = 5;
+  // Original mkdir caller. Home derives the default workspace owner from it
+  // and re-checks create permission on the mount root; absent caller fails
+  // closed. The entry node is trusted to report its local caller: mTLS
+  // authenticates the node, not the user.
+  afs.node.data.v1.OwnerCaller caller = 6;
 }
 
 message PrepareOwnerRootReply {}

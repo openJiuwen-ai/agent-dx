@@ -2243,7 +2243,7 @@ async fn connect_rdma(
 }
 
 #[cfg(feature = "ownerfs")]
-fn owner_caller(ctx: &RequestContext) -> afs_protocol::node_data::OwnerCaller {
+pub(super) fn owner_caller(ctx: &RequestContext) -> afs_protocol::node_data::OwnerCaller {
     afs_protocol::node_data::OwnerCaller {
         uid: ctx.uid,
         gid: ctx.gid,

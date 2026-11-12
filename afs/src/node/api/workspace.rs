@@ -42,7 +42,7 @@ use crate::node::{
                 root_id_from_name, root_name_from_id,
             },
         },
-        types::FileAttributes,
+        types::{FileAttributes, RequestContext},
     },
 };
 
@@ -402,17 +402,27 @@ impl WorkspaceApi {
             gid,
             mode: request.permissions()?,
         };
+        // The workspace API is administrator-enabled and creates workspaces for
+        // the explicitly requested owner; it acts with the node's privileged
+        // identity. Home still enforces the owner change and the actual chown.
+        let caller = RequestContext {
+            uid: 0,
+            gid: 0,
+            pid: std::process::id(),
+            umask: 0,
+            supplementary_gids: Vec::new(),
+        };
         let result = if *home == self.node.config.id {
             self.owner
                 .peer_executor()
                 .map_err(ApiError::home)?
-                .prepare_owner_root(&self.node.config.id, reservation, &params)
+                .prepare_owner_root(&self.node.config.id, &caller, reservation, &params)
         } else {
             let channel = self.channel(home, &info, deadline)?;
             bridge::block_on(&self.runtime, async {
                 tokio::time::timeout_at(
                     deadline.into(),
-                    crate::node::rpc::ownerfs::prepare_root(channel, reservation, &params),
+                    crate::node::rpc::ownerfs::prepare_root(channel, &caller, reservation, &params),
                 )
                 .await
                 .map_err(ApiError::home)

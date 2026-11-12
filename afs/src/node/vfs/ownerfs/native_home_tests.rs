@@ -1345,6 +1345,7 @@ struct RemoteCreateFixture {
     _temp: tempfile::TempDir,
     owner: Arc<OwnerFs>,
     ctx: RequestContext,
+    meta: Arc<NativeHomeMeta>,
     service: crate::node::rpc::control::OwnerControlService,
     request: afs_protocol::node_control::PrepareOwnerRootRequest,
 }
@@ -1390,13 +1391,24 @@ impl RemoteCreateFixture {
             _temp: temp,
             owner,
             ctx: ctx.clone(),
+            meta,
             service,
             request: afs_protocol::node_control::PrepareOwnerRootRequest {
                 reservation: Some(wire),
                 name: b"agent-a".to_vec(),
-                uid: ctx.uid,
-                gid: ctx.gid,
                 mode: 0o750,
+                // Creation on the mount root requires a root caller; the
+                // requested owner is the test process so an unprivileged run
+                // can chown it.
+                caller: Some(afs_protocol::node_data::OwnerCaller {
+                    uid: 0,
+                    gid: 0,
+                    pid: ctx.pid,
+                    umask: 0,
+                    supplementary_gids: Vec::new(),
+                }),
+                uid: Some(ctx.uid),
+                gid: Some(ctx.gid),
             },
         }
     }
@@ -1423,6 +1435,84 @@ impl Drop for RemoteCreateFixture {
     fn drop(&mut self) {
         self.owner.mount_manager_shutdown();
     }
+}
+
+fn assert_no_workspace_state(fixture: &RemoteCreateFixture) {
+    assert!(
+        !std::fs::read_dir(fixture._temp.path())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("root-")),
+        "a rejected caller must not leave a prepared directory"
+    );
+    let catalog_records =
+        std::fs::read_dir(fixture._temp.path().join(".ownerfs-roots")).map_or(0, |entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension() == Some(OsStr::new("json")))
+                .count()
+        });
+    assert_eq!(
+        catalog_records, 0,
+        "a rejected caller must not leave a catalog record"
+    );
+    assert!(fixture.meta.active.lock().unwrap().is_empty());
+    let id = root::root_id_from_name(OsStr::new("agent-a")).unwrap();
+    assert!(fixture.meta.pending.lock().unwrap().contains_key(&id));
+}
+
+#[tokio::test]
+async fn remote_prepare_rejects_non_root_caller_without_leaving_state() {
+    use afs_protocol::node_control::owner_control_server::OwnerControl;
+    let fixture = RemoteCreateFixture::new(None);
+    let mut request = fixture.request.clone();
+    request.caller = Some(afs_protocol::node_data::OwnerCaller {
+        uid: 4242,
+        gid: 4242,
+        pid: 4242,
+        umask: 0,
+        supplementary_gids: Vec::new(),
+    });
+    // Create as the caller itself, so the request reaches the mount-root
+    // permission check instead of failing the owner rule.
+    request.uid = None;
+    request.gid = None;
+    let error = fixture
+        .service
+        .prepare_owner_root(tonic::Request::new(request))
+        .await
+        .expect_err("only a caller holding mount-root create permission may create a workspace");
+    assert!(
+        error.message().contains("write and search permission"),
+        "expected the mount-root create check to reject: {error}"
+    );
+    assert_no_workspace_state(&fixture);
+}
+
+#[tokio::test]
+async fn remote_prepare_rejects_owner_different_from_caller_without_leaving_state() {
+    use afs_protocol::node_control::owner_control_server::OwnerControl;
+    let fixture = RemoteCreateFixture::new(None);
+    let mut request = fixture.request.clone();
+    request.caller = Some(afs_protocol::node_data::OwnerCaller {
+        uid: 4242,
+        gid: 4242,
+        pid: 4242,
+        umask: 0,
+        supplementary_gids: Vec::new(),
+    });
+    request.uid = Some(0);
+    request.gid = Some(0);
+    let error = fixture
+        .service
+        .prepare_owner_root(tonic::Request::new(request))
+        .await
+        .expect_err("a non-root caller may not create a workspace for another owner");
+    assert!(
+        error.message().contains("owner differs from the caller"),
+        "expected the owner rule to reject: {error}"
+    );
+    assert_no_workspace_state(&fixture);
 }
 
 #[tokio::test]
