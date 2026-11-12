@@ -1111,6 +1111,15 @@ root 调用者可显式指定属主，与 `chown(2)` 一致，供管理员启用
 此信任边界与其余 OwnerFiles 数据路径相同，防止该情形需要节点侧用户身份证明。
 检查失败时 Home 不创建目录，也不写 catalog 或 Meta。
 
+`O_DIRECT` 只读句柄每次 READ 都到 Home 读当前内容；Home 以普通方式打开这类
+句柄（CREATE 后的重开同样处理），由 Home 页缓存供数，与 NFS 服务端一致，因此
+不再要求读的偏移和长度对齐。可写句柄的 `O_DIRECT` 仍转发到 Home，写返回时
+数据已离开 Home 页缓存，对齐要求与本地磁盘相同。Home 处理不超过 128KiB 的
+READ 时先以 `RWF_NOWAIT` 只读页缓存，命中即在当前异步线程返回；未命中、更大的
+READ、同一句柄正被其他 READ 占用，或 peer grant 尚未缓存时转入阻塞线程池。
+快路径只使用已缓存的 grant，不在异步线程上向 Meta 校验；可写 `O_DIRECT` 句柄
+也不走该快路径，其描述符上的 `RWF_NOWAIT` 仍可能同步读盘。
+
 workspace 可以从任意节点的 OwnerFs FUSE 路径删除：Home 在本机执行；非 Home 入口通过
 OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 workspace，非空返回
 `ENOTEMPTY` 且 workspace 保持可用；`rm -rf` 会先删除内容，最后才删除空的 workspace 目录。

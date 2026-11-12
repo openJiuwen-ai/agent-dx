@@ -560,6 +560,16 @@ pub trait OwnerFilesHandler: Send + Sync + 'static {
         let _ = (authenticated_peer_node_id, request);
         Err(owner_handler_unimplemented("OwnerFiles.Read"))
     }
+    /// Serve `request` without waiting for storage, or return `Ok(None)` so
+    /// the service runs [`Self::read`] off the async worker. Must not block.
+    fn read_cached(
+        &self,
+        authenticated_peer_node_id: &str,
+        request: &OwnerReadRequest,
+    ) -> afs_error::Result<Option<OwnerReadReply>> {
+        let _ = (authenticated_peer_node_id, request);
+        Ok(None)
+    }
     fn write(
         &self,
         authenticated_peer_node_id: &str,
@@ -1124,6 +1134,33 @@ impl OwnerFilesHandler for OwnerFsPeerHandler {
             eof: read < request.length as usize,
             data_checksum: Vec::new(),
         })
+    }
+
+    fn read_cached(
+        &self,
+        authenticated_peer_node_id: &str,
+        request: &OwnerReadRequest,
+    ) -> afs_error::Result<Option<OwnerReadReply>> {
+        let access = presented_access(request.access.clone())?;
+        let handle = required_handle(request.handle.clone(), "OwnerReadRequest missing handle")?;
+        let mut out = vec![0_u8; request.length as usize];
+        let Some(read) = self.executor.read_cached(
+            authenticated_peer_node_id,
+            &access,
+            &remote_file_for_handle(&access, handle.opaque),
+            request.offset,
+            &mut out,
+        )?
+        else {
+            return Ok(None);
+        };
+        out.truncate(read);
+        Ok(Some(OwnerReadReply {
+            data: out.into(),
+            read: read as u32,
+            eof: read < request.length as usize,
+            data_checksum: Vec::new(),
+        }))
     }
 
     fn write(
@@ -1883,6 +1920,10 @@ fn verify_owner_checksum(data: &[u8], expected: &[u8]) -> Result<(), Status> {
     Ok(())
 }
 
+/// Maximum cache-only read performed on the RPC worker.
+#[cfg(feature = "ownerfs")]
+const OWNER_INLINE_READ_MAX_BYTES: u32 = 128 * 1024;
+
 #[cfg(feature = "ownerfs")]
 struct OwnerServerRdmaGuard {
     session: Arc<super::control::RdmaSession>,
@@ -2389,6 +2430,24 @@ impl OwnerFiles for OwnerFilesService {
             }));
         }
         let started = std::time::Instant::now();
+        if request.length <= OWNER_INLINE_READ_MAX_BYTES
+            && let Some(mut reply) = handler
+                .read_cached(&peer, &request)
+                .map_err(error_to_status)?
+        {
+            if reply.read as usize != reply.data.len() || reply.read > request.length {
+                return Err(coded_status(
+                    afs_error::NODE_TRANSFER_INVALID,
+                    "OwnerFiles read reply length differs from payload or exceeds request",
+                ));
+            }
+            reply.data_checksum = Vec::new();
+            if let Some(metrics) = &self.metrics {
+                metrics.record_payload("server", "read", "grpc", u64::from(reply.read));
+                metrics.observe("server", operation, started.elapsed());
+            }
+            return Ok(Response::new(reply));
+        }
         let reply = crate::node::bridge::spawn_blocking(move || {
             let mut reply = handler.read(&peer, request)?;
             if reply.read as usize != reply.data.len() {

@@ -4426,3 +4426,82 @@ async fn dfs_replica_sender_retries_receiver_backpressure_within_its_deadline() 
 
 #[cfg(feature = "dfs")]
 mod opposite_replica;
+
+#[cfg(feature = "ownerfs")]
+struct CachedOwnerReadFixture {
+    cached: bool,
+    malformed: bool,
+    thread: std::thread::ThreadId,
+}
+
+#[cfg(feature = "ownerfs")]
+impl OwnerFilesHandler for CachedOwnerReadFixture {
+    fn read_cached(
+        &self,
+        peer: &str,
+        request: &OwnerReadRequest,
+    ) -> afs_error::Result<Option<OwnerReadReply>> {
+        assert_eq!(peer, "node-b");
+        assert_eq!(std::thread::current().id(), self.thread);
+        assert!(request.length <= OWNER_INLINE_READ_MAX_BYTES);
+        Ok(self.cached.then(|| OwnerReadReply {
+            data: b"abc".to_vec().into(),
+            read: if self.malformed { 4 } else { 3 },
+            eof: true,
+            data_checksum: b"clear-inline-checksum".to_vec(),
+        }))
+    }
+
+    fn read(&self, _peer: &str, _request: OwnerReadRequest) -> afs_error::Result<OwnerReadReply> {
+        assert_ne!(std::thread::current().id(), self.thread);
+        assert!(!self.cached, "cache hits must not enter the blocking pool");
+        Ok(OwnerReadReply {
+            data: b"abc".to_vec().into(),
+            read: 3,
+            eof: true,
+            data_checksum: Vec::new(),
+        })
+    }
+}
+
+#[cfg(feature = "ownerfs")]
+#[tokio::test]
+async fn owner_read_cached_hit_stays_inline_and_miss_or_large_request_falls_back() {
+    for (cached, length) in [
+        (true, 8),
+        (false, 8),
+        (false, OWNER_INLINE_READ_MAX_BYTES + 1),
+    ] {
+        let handler = Arc::new(CachedOwnerReadFixture {
+            cached,
+            malformed: false,
+            thread: std::thread::current().id(),
+        });
+        let service = OwnerFilesService::new(handler, Arc::new(AllowOwnerTestPeer));
+        let reply = service
+            .read(Request::new(owner_read_request(length)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(&reply.data[..], b"abc");
+        assert_eq!(reply.read, 3);
+        assert!(reply.eof);
+        assert!(reply.data_checksum.is_empty());
+    }
+}
+
+#[cfg(feature = "ownerfs")]
+#[tokio::test]
+async fn owner_read_cached_hit_validates_reply_shape() {
+    let handler = Arc::new(CachedOwnerReadFixture {
+        cached: true,
+        malformed: true,
+        thread: std::thread::current().id(),
+    });
+    let service = OwnerFilesService::new(handler, Arc::new(AllowOwnerTestPeer));
+    let error = service
+        .read(Request::new(owner_read_request(8)))
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("length differs"));
+}

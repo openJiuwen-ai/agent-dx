@@ -884,6 +884,20 @@ impl OwnerFsPeerExecutor {
             .peer_read(peer_node_id, access, file, offset, out)
     }
 
+    /// Like [`Self::read`], but only from Home's page cache and never waiting
+    /// for storage; safe on an async worker. `Ok(None)`: use `read`.
+    pub fn read_cached(
+        &self,
+        peer_node_id: &str,
+        access: &PresentedRootAccess,
+        file: &files::RemoteFile,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<Option<usize>> {
+        self.local
+            .peer_read_cached(peer_node_id, access, file, offset, out)
+    }
+
     pub fn write(
         &self,
         peer_node_id: &str,
@@ -2787,9 +2801,10 @@ impl LocalOwnerFs {
         let created_metadata = create_file.metadata().map_err(Error::from)?;
         let created_identity = identity_from_metadata(&created_metadata)?;
         drop(create_file);
+        let reopen_flags = peer_open_flags(flags & !libc::O_CREAT);
         let file = self
             .disk
-            .open_file(&physical, OpenSpec::new(flags & !libc::O_CREAT, 0))
+            .open_file(&physical, OpenSpec::new(reopen_flags, 0))
             .map_err(Error::from)?;
         let reopened_identity = identity_from_metadata(&file.metadata().map_err(Error::from)?)?;
         if reopened_identity != created_identity {
@@ -2831,7 +2846,7 @@ impl LocalOwnerFs {
             },
             needs_flush,
             write_sync,
-            flags,
+            reopen_flags,
         );
         Ok(remote::RemoteCreatedFile {
             entry: files::OwnerEntry {
@@ -3525,7 +3540,7 @@ impl LocalOwnerFs {
             .data_dir()
             .join_path(&relative)
             .map_err(Error::from)?;
-        let open_flags = flags & !libc::O_TRUNC;
+        let open_flags = peer_open_flags(flags);
         let file = self
             .disk
             .open_file(&physical, OpenSpec::new(open_flags, 0))
@@ -3592,7 +3607,7 @@ impl LocalOwnerFs {
             },
             needs_flush,
             write_sync,
-            flags,
+            open_flags,
         );
         Ok((
             remote_file(access, identity, handle),
@@ -3614,6 +3629,47 @@ impl LocalOwnerFs {
         let handle = decode_file_handle(file)?;
         self.check_peer_file_handle(handle, peer_node_id, access, &file.identity)?;
         self.read(handle, offset, out)
+    }
+
+    /// [`Self::peer_read`] served only from Home's page cache. `Ok(None)`: the
+    /// caller must use `peer_read`, which may wait for storage.
+    fn peer_read_cached(
+        &self,
+        peer_node_id: &str,
+        access: &PresentedRootAccess,
+        file: &files::RemoteFile,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<Option<usize>> {
+        if self.native_home_enabled() {
+            return Ok(None);
+        }
+        if self
+            .validate_peer_cached(access, peer_node_id, RootRight::Read)?
+            .is_none()
+        {
+            // The blocking path validates against Meta and caches the grant.
+            return Ok(None);
+        }
+        check_remote_file_scope(access, file)?;
+        let handle = decode_file_handle(file)?;
+        let slot = self.open_file_handle(handle)?;
+        // A read on this handle already holds the slot: let it finish there.
+        let Ok(slot) = slot.try_lock() else {
+            return Ok(None);
+        };
+        slot.ensure_open()?;
+        slot.check_peer(peer_node_id, access, &file.identity)?;
+        match &slot.file {
+            // RWF_NOWAIT on an O_DIRECT descriptor can still wait for
+            // storage; only descriptors Home opened buffered may run inline.
+            OpenFileHandle::Local(local) if !local.o_direct => local
+                .handle
+                .file
+                .read_cached_at(offset, out)
+                .map_err(Error::from),
+            _ => Ok(None),
+        }
     }
 
     fn peer_write_with_options(
@@ -3714,11 +3770,38 @@ impl LocalOwnerFs {
         let grant = self
             .roots
             .validate_peer_root_access(access, peer_node_id, right)?;
+        self.share_peer_root(access)?;
+        Ok(grant)
+    }
+
+    /// Like [`Self::validate_peer`], but never asks Meta: an uncached grant
+    /// returns `None` so the caller falls back to the blocking path. The
+    /// inline READ probe runs on an async worker, where a synchronous Meta
+    /// call would be rejected.
+    fn validate_peer_cached(
+        &self,
+        access: &PresentedRootAccess,
+        peer_node_id: &str,
+        right: RootRight,
+    ) -> Result<Option<RootGrant>> {
+        let Some(grant) =
+            self.roots
+                .validate_peer_root_access_cached(access, peer_node_id, right)?
+        else {
+            return Ok(None);
+        };
+        self.share_peer_root(access)?;
+        Ok(Some(grant))
+    }
+
+    /// First peer admission marks the root shared and invalidates this node's
+    /// private FUSE inodes; later admissions reuse the shared bit.
+    fn share_peer_root(&self, access: &PresentedRootAccess) -> Result<()> {
         let _share = self.share_lock.lock().map_err(|_| poisoned())?;
         let (notifier, next_fuse_ino) = {
             let mut cache = self.private_cache.lock().map_err(|_| poisoned())?;
             if !cache.shared_roots.insert(access.id.clone()) {
-                return Ok(grant);
+                return Ok(());
             }
             (cache.notifier.clone(), cache.next_fuse_ino)
         };
@@ -3736,7 +3819,7 @@ impl LocalOwnerFs {
                 }
             }
         }
-        Ok(grant)
+        Ok(())
     }
 
     fn peer_authorize_transport(
@@ -4574,8 +4657,8 @@ impl LocalOwnerFs {
         let file = file.lock().map_err(|_| poisoned())?;
         file.ensure_open()?;
         match &file.file {
-            OpenFileHandle::Local(file) => {
-                file.handle.file.read_at(offset, out).map_err(Error::from)
+            OpenFileHandle::Local(local) => {
+                local.handle.file.read_at(offset, out).map_err(Error::from)
             }
             OpenFileHandle::Remote(file) => file.files.read(&file.grant, &file.handle, offset, out),
         }
@@ -7013,6 +7096,7 @@ impl OwnerState {
             write_sync,
             writable: flags_allow_write(flags),
             readable: flags & libc::O_ACCMODE != libc::O_WRONLY,
+            o_direct: flags & libc::O_DIRECT != 0,
             fatal_sync_error: None,
         }))
     }
@@ -7133,6 +7217,8 @@ struct OpenLocalFile {
     needs_flush: bool,
     write_sync: WriteSyncMode,
     writable: bool,
+    /// Opened with `O_DIRECT`: `RWF_NOWAIT` may still wait for storage.
+    o_direct: bool,
     fatal_sync_error: Option<Error>,
 }
 
@@ -7936,6 +8022,20 @@ impl WriteSyncMode {
             Self::DataOnly => file.sync_data().map_err(Error::from),
             Self::Full => file.sync_all().map_err(Error::from),
         }
+    }
+}
+
+/// Flags Home uses for a peer's OPEN and the reopen after CREATE. `O_TRUNC`
+/// is applied separately after the identity check. A read-only handle drops
+/// `O_DIRECT` so Home serves it from its page cache, the single fresh view
+/// there, as an NFS server does; a writable handle keeps it, so a returned
+/// write has left Home's page cache.
+fn peer_open_flags(flags: i32) -> i32 {
+    let flags = flags & !libc::O_TRUNC;
+    if flags & libc::O_ACCMODE == libc::O_RDONLY {
+        flags & !libc::O_DIRECT
+    } else {
+        flags
     }
 }
 
@@ -10159,6 +10259,22 @@ mod tests {
             .is_err()
         );
         fs.release(&ctx, file.handle).unwrap();
+    }
+
+    #[test]
+    fn peer_open_keeps_o_direct_only_for_writable_handles() {
+        let read_only = libc::O_RDONLY | libc::O_DIRECT | libc::O_TRUNC;
+        assert_eq!(peer_open_flags(read_only), libc::O_RDONLY);
+        for access in [libc::O_WRONLY, libc::O_RDWR] {
+            assert_eq!(
+                peer_open_flags(access | libc::O_DIRECT | libc::O_TRUNC),
+                access | libc::O_DIRECT
+            );
+        }
+        assert_eq!(
+            peer_open_flags(libc::O_RDONLY | libc::O_NOATIME),
+            libc::O_RDONLY | libc::O_NOATIME
+        );
     }
 
     fn test_grant(root_id: RootId) -> RootGrant {
@@ -14864,6 +14980,29 @@ mod tests {
             .unwrap()
     }
 
+    /// The pf1 fixture enables native Home, where peer reads never take the
+    /// OwnerFs cache path. These tests need the ordinary local path.
+    fn peer_fixture() -> (
+        tempfile::TempDir,
+        OwnerFs,
+        RequestContext,
+        Entry,
+        root::PrivateRootBinding,
+    ) {
+        let (temp, fs, ctx, _) = native_home_tests::fixture(false);
+        let directory = native_home_tests::mkdir_root(&fs, &ctx, "peer-root");
+        let id = root::root_id_from_name(OsStr::new("peer-root")).unwrap();
+        let grant = fs
+            .require_local()
+            .unwrap()
+            .roots
+            .enter_root(&id, RootRight::Lookup)
+            .unwrap();
+        let binding = root::PrivateRootBinding::from_grant(grant.grant());
+        drop(grant);
+        (temp, fs, ctx, directory, binding)
+    }
+
     #[test]
     fn n2c_pf1_01_root_use_zero_retains_real_local_file() {
         let (_temp, fs, ctx, root, binding) = pf1_fixture();
@@ -15236,6 +15375,260 @@ mod tests {
             baseline,
             "closes must drop the real fds"
         );
+    }
+
+    #[test]
+    fn peer_read_cached_rejects_foreign_released_and_revoked_handles() {
+        let (_temp, fs, ctx, root, binding) = peer_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let created = pf1_file(&fs, &ctx, &root, libc::O_RDWR);
+        fs.release(&ctx, created.handle).unwrap();
+        let executor = fs.peer_executor().unwrap();
+        let local = fs.require_local().unwrap();
+        let mut byte = [0u8; 1];
+
+        let (released, _, _) = executor
+            .open("node-b", &access, OsStr::new("file"), libc::O_RDONLY, None)
+            .unwrap();
+        let released = rpc_file(&access, &released.handle);
+
+        // The fast path repeats the blocking path's peer binding check.
+        assert!(
+            local
+                .peer_read_cached("node-c", &access, &released, 0, &mut byte)
+                .is_err(),
+            "another peer must not read this handle"
+        );
+
+        // A released handle is stale on the fast path too.
+        executor
+            .release("node-b", &access, released.clone())
+            .unwrap();
+        assert_eq!(
+            local
+                .peer_read_cached("node-b", &access, &released, 0, &mut byte)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_OWNER_STALE_HANDLE,
+            "a released handle must be stale on the fast path too"
+        );
+
+        // A revoked grant fences the fast path like the blocking path.
+        let (revoked, _, _) = executor
+            .open("node-b", &access, OsStr::new("file"), libc::O_RDONLY, None)
+            .unwrap();
+        let revoked = rpc_file(&access, &revoked.handle);
+        fs.require_local()
+            .unwrap()
+            .roots
+            .revoke_root(&binding.root_id);
+        assert_fenced(
+            local
+                .peer_read_cached("node-b", &access, &revoked, 0, &mut byte)
+                .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn peer_read_cached_skips_handles_opened_with_o_direct() {
+        let (_temp, fs, ctx, root, binding) = peer_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let created = pf1_file(&fs, &ctx, &root, libc::O_RDWR);
+        fs.release(&ctx, created.handle).unwrap();
+        let executor = fs.peer_executor().unwrap();
+        let local = fs.require_local().unwrap();
+        let mut byte = [0u8; 1];
+
+        // Home drops O_DIRECT for a read-only peer open, so the descriptor is
+        // buffered and stays eligible for the inline page-cache read.
+        let (read_only, _, _) = executor
+            .open(
+                "node-b",
+                &access,
+                OsStr::new("file"),
+                libc::O_RDONLY | libc::O_DIRECT,
+                None,
+            )
+            .unwrap();
+        let read_only = rpc_file(&access, &read_only.handle);
+        let slot = local
+            .open_file_handle(decode_file_handle(&read_only).unwrap())
+            .unwrap();
+        assert!(matches!(
+            &slot.lock().unwrap().file,
+            OpenFileHandle::Local(file) if !file.o_direct
+        ));
+
+        // A writable handle keeps O_DIRECT, where RWF_NOWAIT may still wait
+        // for storage. Set the recorded flag directly so the test does not
+        // depend on the filesystem accepting O_DIRECT.
+        let mut slot = slot.lock().unwrap();
+        match &mut slot.file {
+            OpenFileHandle::Local(file) => file.o_direct = true,
+            OpenFileHandle::Remote(_) => panic!("expected a local file handle"),
+        }
+        drop(slot);
+        assert_eq!(
+            local
+                .peer_read_cached("node-b", &access, &read_only, 0, &mut byte)
+                .unwrap(),
+            None,
+            "an O_DIRECT descriptor must not run inline"
+        );
+
+        // Where the filesystem accepts O_DIRECT, OPEN records the same flag.
+        if let Ok((direct, _, _)) = executor.open(
+            "node-b",
+            &access,
+            OsStr::new("file"),
+            libc::O_RDWR | libc::O_DIRECT,
+            None,
+        ) {
+            let direct = rpc_file(&access, &direct.handle);
+            let slot = local
+                .open_file_handle(decode_file_handle(&direct).unwrap())
+                .unwrap();
+            assert!(matches!(
+                &slot.lock().unwrap().file,
+                OpenFileHandle::Local(file) if file.o_direct
+            ));
+            executor.release("node-b", &access, direct).unwrap();
+        }
+
+        executor.release("node-b", &access, read_only).unwrap();
+    }
+
+    #[test]
+    fn peer_read_cached_falls_back_when_the_grant_cache_is_cold() {
+        let (_temp, fs, ctx, root, binding) = peer_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let created = pf1_file(&fs, &ctx, &root, libc::O_RDWR);
+        fs.release(&ctx, created.handle).unwrap();
+        let executor = fs.peer_executor().unwrap();
+        let local = fs.require_local().unwrap();
+        let (file, _, _) = executor
+            .open("node-b", &access, OsStr::new("file"), libc::O_RDONLY, None)
+            .unwrap();
+        let file = rpc_file(&access, &file.handle);
+        let mut byte = [0u8; 1];
+
+        // OPEN validated and cached the grant; drop it so the next validation
+        // would have to ask Meta.
+        local.roots.clear_peer_grants_for_test(&binding.root_id);
+        assert_eq!(
+            local
+                .peer_read_cached("node-b", &access, &file, 0, &mut byte)
+                .unwrap(),
+            None,
+            "a cold grant cache must fall back instead of probing Meta inline"
+        );
+
+        // The blocking path validates against Meta and still reads.
+        local
+            .peer_read("node-b", &access, &file, 0, &mut byte)
+            .unwrap();
+    }
+
+    #[test]
+    fn peer_create_reopens_read_only_o_direct_buffered() {
+        let (_temp, fs, ctx, root, binding) = peer_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let local = fs.require_local().unwrap();
+        let parent = local.record(root.inode.value).unwrap();
+        let created = local
+            .peer_create_with_options(
+                &ctx,
+                "node-b",
+                &access,
+                OsStr::new("created"),
+                libc::O_RDONLY | libc::O_DIRECT,
+                0o600,
+                &parent.identity,
+                OpenOptions::default(),
+            )
+            .unwrap();
+        let slot = local
+            .open_file_handle(decode_file_handle(&created.file).unwrap())
+            .unwrap();
+        assert!(matches!(
+            &slot.lock().unwrap().file,
+            OpenFileHandle::Local(file) if !file.o_direct
+        ));
+        local.peer_release("node-b", &access, created.file).unwrap();
+    }
+
+    #[test]
+    fn o_direct_write_is_visible_to_a_buffered_peer_read() {
+        let (_temp, fs, ctx, root, binding) = peer_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let created = pf1_file(&fs, &ctx, &root, libc::O_RDWR);
+        fs.release(&ctx, created.handle).unwrap();
+        let executor = fs.peer_executor().unwrap();
+
+        // A buffered write seeds Home's page cache with the old content.
+        let (writer, _, _) = executor
+            .open("node-b", &access, OsStr::new("file"), libc::O_RDWR, None)
+            .unwrap();
+        let writer = rpc_file(&access, &writer.handle);
+        let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
+        // SAFETY: the layout is non-zero, the slice is exactly that allocation,
+        // and the buffer is freed with the same layout below.
+        let raw = unsafe { std::alloc::alloc(layout) };
+        assert!(!raw.is_null());
+        // SAFETY: `raw` is the 4096-byte allocation above and stays valid until
+        // the dealloc below; the slice covers exactly that allocation.
+        let payload = unsafe { std::slice::from_raw_parts_mut(raw, 4096) };
+        payload.fill(0xAA);
+        executor
+            .write("node-b", &access, &writer, 0, payload)
+            .unwrap();
+
+        // A read-only peer handle is buffered on Home even with O_DIRECT.
+        let (reader, _, _) = executor
+            .open(
+                "node-b",
+                &access,
+                OsStr::new("file"),
+                libc::O_RDONLY | libc::O_DIRECT,
+                None,
+            )
+            .unwrap();
+        let reader = rpc_file(&access, &reader.handle);
+        let mut observed = [0u8; 4096];
+        executor
+            .read("node-b", &access, &reader, 0, &mut observed)
+            .unwrap();
+        assert!(observed.iter().all(|byte| *byte == 0xAA));
+
+        // A writable O_DIRECT handle writes through the direct path. Filesystems
+        // that reject O_DIRECT (tmpfs) skip the cache-coherence half.
+        if let Ok((direct, _, _)) = executor.open(
+            "node-b",
+            &access,
+            OsStr::new("file"),
+            libc::O_RDWR | libc::O_DIRECT,
+            None,
+        ) {
+            let direct = rpc_file(&access, &direct.handle);
+            payload.fill(0xBB);
+            executor
+                .write("node-b", &access, &direct, 0, payload)
+                .unwrap();
+
+            // Direct I/O drops the written range from Home's page cache, so
+            // the buffered reader must observe the new bytes.
+            let mut observed = [0u8; 4096];
+            executor
+                .read("node-b", &access, &reader, 0, &mut observed)
+                .unwrap();
+            assert!(observed.iter().all(|byte| *byte == 0xBB));
+            executor.release("node-b", &access, direct).unwrap();
+        }
+
+        executor.release("node-b", &access, reader).unwrap();
+        executor.release("node-b", &access, writer).unwrap();
+        // SAFETY: freed with the layout it was allocated with.
+        unsafe { std::alloc::dealloc(raw, layout) };
     }
 
     #[test]
