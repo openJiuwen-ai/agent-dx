@@ -11,6 +11,8 @@ struct RetiredNode {
     shard_id: usize,
     session: Option<NodeSession>,
     scheduling_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_uuid: Option<String>,
     unregistered: bool,
     #[serde(default)]
     upgrade_pause: Option<UpgradePause>,
@@ -73,6 +75,7 @@ impl Session {
                 shard_id: node.shard_id,
                 session: node.session.clone(),
                 scheduling_paused: node.scheduling_paused,
+                host_uuid: node.node.labels.get(NODE_HOST_UUID_LABEL).cloned(),
                 unregistered: retirement.unregistered,
                 upgrade_pause: node.upgrade_pause.clone(),
             };
@@ -152,7 +155,7 @@ impl Session {
             .as_deref()
             .map(decode::<UpgradeTask>)
             .transpose()?;
-        let upgrade_pause = match upgrade.as_ref().filter(|task| task.active()) {
+        let mut upgrade_pause = match upgrade.as_ref().filter(|task| task.active()) {
             Some(task) => Some(UpgradePause {
                 task_id: task.task_id.clone(),
                 epoch: task.epoch,
@@ -163,8 +166,21 @@ impl Session {
             }),
             None => retired.upgrade_pause.clone(),
         };
-        let scheduling_paused = retired.scheduling_paused || upgrade_pause.is_some();
         let mut node = node.clone();
+        if retired.session.as_ref().map(|s| &s.id) == session.map(|s| &s.id) {
+            preserve_registered_host_uuid(&mut node, retired.host_uuid.as_ref());
+        }
+        let host_replaced = replacement_host(
+            retired.host_uuid.as_ref(),
+            retired.session.as_ref(),
+            &node,
+            session,
+        );
+        if let Some(owner) = &mut upgrade_pause {
+            owner.original_paused &= !host_replaced;
+        }
+        let scheduling_paused =
+            upgrade_pause.is_some() || (retired.scheduling_paused && !host_replaced);
         node.available &= !scheduling_paused;
         let record = StoredNode {
             retirement: None,
@@ -220,6 +236,11 @@ impl Session {
             )],
         );
         if applied {
+            log_retained_scheduling_pause(
+                &record,
+                retired.host_uuid.as_ref(),
+                retired.session.as_ref(),
+            );
             Ok(Some(record))
         } else {
             Ok(None)

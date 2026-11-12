@@ -32,8 +32,8 @@ mod upgrade;
 mod volumes;
 use crate::Node;
 use adx_core::{
-    scheduling::validate_device_assignment, Assignment, EnvironmentRecord, EnvironmentSpec,
-    EnvironmentState, Error, Result,
+    scheduling::{validate_device_assignment, NODE_HOST_UUID_LABEL},
+    Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Result,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -145,6 +145,68 @@ pub struct NodeSession {
     pub id: String,
     pub sequence: u64,
     pub routable: bool,
+}
+
+fn host_uuid(value: Option<&String>) -> Option<uuid::Uuid> {
+    value?
+        .parse::<uuid::Uuid>()
+        .ok()
+        .filter(|id| !id.is_nil() && id.as_u128() != u128::MAX)
+}
+
+fn replacement_host(
+    previous_host: Option<&String>,
+    previous_session: Option<&NodeSession>,
+    node: &Node,
+    session: Option<&NodeSession>,
+) -> bool {
+    previous_session
+        .zip(session)
+        .is_some_and(|(old, new)| old.id != new.id)
+        && host_uuid(previous_host)
+            .zip(host_uuid(node.labels.get(NODE_HOST_UUID_LABEL)))
+            .is_some_and(|(old, new)| old != new)
+}
+
+fn log_retained_scheduling_pause(
+    record: &StoredNode,
+    previous_host: Option<&String>,
+    previous_session: Option<&NodeSession>,
+) {
+    let Some(session) = &record.session else {
+        return;
+    };
+    let administratively_paused = record
+        .upgrade_pause
+        .as_ref()
+        .map_or(record.scheduling_paused, |owner| owner.original_paused);
+    if !administratively_paused || previous_session.is_some_and(|old| old.id == session.id) {
+        return;
+    }
+    let previous_uuid_available = host_uuid(previous_host).is_some();
+    let reported_uuid_available = host_uuid(record.node.labels.get(NODE_HOST_UUID_LABEL)).is_some();
+    let reason = if previous_session.is_some() && previous_uuid_available && reported_uuid_available
+    {
+        "host_uuid_unchanged"
+    } else {
+        "host_identity_unavailable"
+    };
+    adx_observability::info!(
+        node_id = %record.node.id,
+        reason,
+        previous_uuid_available,
+        reported_uuid_available,
+        "administrative scheduling pause retained after node session change"
+    );
+}
+
+fn preserve_registered_host_uuid(node: &mut Node, previous_host: Option<&String>) {
+    if let Some(host) = previous_host {
+        node.labels
+            .insert(NODE_HOST_UUID_LABEL.into(), host.clone());
+    } else {
+        node.labels.remove(NODE_HOST_UUID_LABEL);
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRetirement {
@@ -1572,6 +1634,10 @@ impl Session {
                 && previous.proxy_address == proxy_address
                 && previous.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id)
             {
+                preserve_registered_host_uuid(
+                    &mut node,
+                    previous.node.labels.get(NODE_HOST_UUID_LABEL),
+                );
                 if let Some(current) = session.as_ref().filter(|current| {
                     current.routable && previous.session.as_ref().is_some_and(|old| !old.routable)
                 }) {
@@ -1652,11 +1718,18 @@ impl Session {
                 .as_deref()
                 .map(decode::<StoredNode>)
                 .transpose()?;
+            let mut node = node.clone();
             if let Some(previous) = &previous {
                 if previous.retirement.as_ref().is_some_and(|r| r.unregistered)
                     && previous.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id)
                 {
                     return Err(Error::Conflict);
+                }
+                if previous.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id) {
+                    preserve_registered_host_uuid(
+                        &mut node,
+                        previous.node.labels.get(NODE_HOST_UUID_LABEL),
+                    );
                 }
                 if previous.address == address
                     && previous.proxy_address == proxy_address
@@ -1696,11 +1769,19 @@ impl Session {
                     return Ok(record);
                 }
             }
+            let host_replaced = previous.as_ref().is_some_and(|old| {
+                replacement_host(
+                    old.node.labels.get(NODE_HOST_UUID_LABEL),
+                    old.session.as_ref(),
+                    &node,
+                    session.as_ref(),
+                )
+            });
             let (shard, scheduling_paused, checkpoint_gc_fenced) = if let Some(previous) = &previous
             {
                 (
                     previous.shard_id,
-                    previous.scheduling_paused,
+                    previous.scheduling_paused && !host_replaced,
                     previous.checkpoint_gc_fenced && !session.as_ref().is_some_and(|s| s.routable),
                 )
             } else {
@@ -1737,6 +1818,9 @@ impl Session {
                         original_paused,
                     });
                 }
+            }
+            if let Some(owner) = &mut upgrade_pause {
+                owner.original_paused &= !host_replaced;
             }
             let scheduling_paused = scheduling_paused || upgrade_pause.is_some();
             if scheduling_paused {
@@ -1829,6 +1913,13 @@ impl Session {
                 }
             };
             if applied {
+                if let Some(previous) = &previous {
+                    log_retained_scheduling_pause(
+                        &record,
+                        previous.node.labels.get(NODE_HOST_UUID_LABEL),
+                        previous.session.as_ref(),
+                    );
+                }
                 return Ok(record);
             }
         }
