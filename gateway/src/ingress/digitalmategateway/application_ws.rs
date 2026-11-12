@@ -1,7 +1,7 @@
 //! Session admission for a configured template reference; transport stays in shared Gateway forwarding.
 use super::entrypoint::{agent_error, auth_error, error};
 use crate::ingress::{
-    accounts::{BusinessAuth, Principal, SessionGuard},
+    accounts::SessionGuard,
     agent_service::{AgentV2Access, InitializationError, ServiceAccessError, ServiceSelector},
     server::{proxy_http, wait_for_route_cancellation, Ingress, ProxyBody},
 };
@@ -105,10 +105,12 @@ impl ApplicationWsConfig {
         mut request: Request<Incoming>,
         ingress: Arc<Ingress>,
         managed: Arc<ManagedService>,
-        auth: Arc<dyn BusinessAuth>,
-        principal: Principal,
+        guard: Arc<SessionGuard>,
         tenant: &str,
+        #[cfg(unix)] privacy: Option<std::sync::Arc<super::privacy_grants::PrivacyIdentity>>,
     ) -> Response<ProxyBody> {
+        let auth = guard.auth.clone();
+        let principal = guard.principal.clone();
         if request.method() != http::Method::GET {
             return error(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
         }
@@ -137,14 +139,12 @@ impl ApplicationWsConfig {
             self.request_timeout_seconds,
         )));
         let deadline = context.deadline();
-        let guard = Arc::new(SessionGuard {
-            auth: auth.clone(),
-            principal: principal.clone(),
-        });
         let mut session = Box::pin({
             let guard = guard.clone();
             async move { guard.watch().await }
         });
+        #[cfg(unix)]
+        let privacy_scope = scope.clone();
         let access = AgentV2Access::new(managed);
         let admission = async {
             let selection = access
@@ -223,6 +223,42 @@ impl ApplicationWsConfig {
             .collect();
         for name in names {
             request.headers_mut().remove(name);
+        }
+        #[cfg(unix)]
+        if let Some(identity) = privacy
+            .as_ref()
+            .filter(|identity| identity.targets(&self.template))
+        {
+            let workspace = match super::entrypoint::workspace_parameters(
+                tenant,
+                &self.template,
+                &principal.user_id,
+            ) {
+                Ok(values) => values,
+                Err(error) => return agent_error(error),
+            };
+            let Some(workspace) = workspace.get("workspace") else {
+                return error(StatusCode::BAD_GATEWAY, "PRIVACY_UNAVAILABLE");
+            };
+            let token = match tokio::time::timeout_at(
+                deadline,
+                identity.admit(&privacy_scope, workspace, &principal.user_id),
+            )
+            .await
+            {
+                Ok(Ok(token)) => token,
+                Ok(Err(error)) => return auth_error(error),
+                Err(_) => return error(StatusCode::GATEWAY_TIMEOUT, "PRIVACY_UNAVAILABLE"),
+            };
+            let mut header = match format!("Bearer {}", token.as_str()).parse::<http::HeaderValue>()
+            {
+                Ok(header) => header,
+                Err(_) => return error(StatusCode::BAD_GATEWAY, "PRIVACY_UNAVAILABLE"),
+            };
+            header.set_sensitive(true);
+            request
+                .headers_mut()
+                .insert(http::header::AUTHORIZATION, header);
         }
         let response = tokio::select! {
             biased;
