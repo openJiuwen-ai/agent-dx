@@ -120,7 +120,71 @@ fn dfs_policy_ttl_bounds_entry_attr_and_create_replies() {
     assert_eq!(seen, Some((ttl, false)));
     assert_eq!(dfs.entry_ttls(), (ttl, ttl));
     dfs.cached_io = true;
-    assert_eq!(create_reply(&dfs, 7), (ttl, FopenFlags::empty()));
+    // CREATE makes a regular file whose attributes are never cached, and
+    // ReplyCreate carries a single TTL.
+    assert_eq!(create_reply(&dfs, 7), (Duration::ZERO, FopenFlags::empty()));
+}
+
+fn attributes_of(kind: FileKind) -> FileAttributes {
+    FileAttributes {
+        kind,
+        size: 0,
+        blocks: 0,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        nlink: 1,
+        atime: std::time::UNIX_EPOCH,
+        mtime: std::time::UNIX_EPOCH,
+        ctime: std::time::UNIX_EPOCH,
+    }
+}
+
+const ALL_KINDS: [FileKind; 4] = [
+    FileKind::Regular,
+    FileKind::Directory,
+    FileKind::Symlink,
+    FileKind::Special(SpecialFileKind::Fifo),
+];
+
+/// A (F4): DFS caches names for every kind and attributes only for
+/// directories; LOOKUP, MKDIR, MKNOD, SYMLINK, LINK, SETATTR and GETATTR all
+/// take their TTLs from these two rules.
+#[test]
+fn dfs_caches_names_for_all_kinds_and_attributes_only_for_directories() {
+    let ttl = Duration::from_secs(1);
+    let mut dfs = AfsFuse::new(Arc::new(EmptyBackend));
+    dfs.policy = Arc::new(DfsFusePolicy::new(ttl));
+    for kind in ALL_KINDS {
+        let expected_attr = if kind == FileKind::Directory {
+            ttl
+        } else {
+            Duration::ZERO
+        };
+        assert_eq!(
+            dfs.reply_ttls(&attributes_of(kind)),
+            (ttl, expected_attr),
+            "{kind:?}"
+        );
+        assert_eq!(
+            dfs.policy.attr_ttl(kind == FileKind::Directory, ttl),
+            expected_attr,
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn non_dfs_policies_cache_attributes_like_names() {
+    let (fs, _) = home_fs();
+    let ttl = Duration::from_secs(1);
+    for kind in ALL_KINDS {
+        assert_eq!(fs.policy.attr_ttl(kind == FileKind::Directory, ttl), ttl);
+        assert_eq!(
+            fs.reply_ttls(&attributes_of(kind)),
+            (Duration::ZERO, Duration::ZERO)
+        );
+    }
 }
 
 #[test]

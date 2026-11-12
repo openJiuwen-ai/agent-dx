@@ -49,6 +49,12 @@ pub(crate) trait FuseMountPolicy: Send + Sync + 'static {
     /// The kernel session exists; `_notifier` can invalidate its caches.
     fn on_mounted(&self, _notifier: Notifier) {}
 
+    /// Attribute TTL for a reply about an inode of this kind, given the
+    /// policy's entry/attribute `ttl`. The default caches every kind alike.
+    fn attr_ttl(&self, _directory: bool, ttl: Duration) -> Duration {
+        ttl
+    }
+
     /// Entry and attribute TTL for replies that carry no per-inode policy
     /// decision (mkdir, mknod, symlink, link, setattr, and creates under the
     /// kernel cache feature).
@@ -84,6 +90,18 @@ impl FuseMountPolicy for DfsFusePolicy {
 
     fn mount_entry_ttl(&self) -> Duration {
         self.kernel_ttl
+    }
+
+    /// Only directories cache attributes. A regular file's attributes must
+    /// stay uncached: a STAT without a file handle (statx passes none) can
+    /// only be answered with the head version, while each open handle reads
+    /// the version it pinned; the kernel keeps one `i_size` per inode, so a
+    /// cached head size would make a pinned handle's READ come back short and
+    /// the page cache zero-fill the gap. Uncached, the read path refreshes the
+    /// size with the handle (today's semantics). Symlinks and special files
+    /// follow regular files; names (entry TTL) stay cached for every kind.
+    fn attr_ttl(&self, directory: bool, ttl: Duration) -> Duration {
+        if directory { ttl } else { Duration::ZERO }
     }
 }
 

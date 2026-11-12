@@ -96,7 +96,8 @@ use self::policy::{DfsFusePolicy, FuseMountFeatures};
 #[cfg(test)]
 use crate::node::vfs::PageCacheIdentity;
 #[cfg(test)]
-use crate::node::vfs::types::{FileAttributes, FileHandle, FileKind};
+use crate::node::vfs::types::FileHandle;
+use crate::node::vfs::types::{FileAttributes, FileKind};
 #[cfg(test)]
 use afs_error::Result;
 #[cfg(test)]
@@ -363,6 +364,17 @@ impl AfsFuse {
         (ttl, ttl)
     }
 
+    /// Entry and attribute TTLs for an entry reply about `attributes`: the
+    /// mount TTL for the name, the policy's per-kind TTL for the attributes.
+    fn reply_ttls(&self, attributes: &FileAttributes) -> (Duration, Duration) {
+        let (entry_ttl, attr_ttl) = self.entry_ttls();
+        (
+            entry_ttl,
+            self.policy
+                .attr_ttl(attributes.kind == FileKind::Directory, attr_ttl),
+        )
+    }
+
     fn record_request(&self, operation: &'static str) {
         if let Some((metrics, filesystem)) = &self.requests {
             metrics.record(filesystem, operation);
@@ -421,7 +433,9 @@ impl AfsFuse {
     /// TTL) and pages stay cacheable; otherwise the policy decides.
     fn create_reply_policy(&self, ttl: Duration, private: bool) -> (Duration, FopenFlags) {
         if self.cached_io {
+            // CREATE makes a regular file and ReplyCreate has one TTL.
             let (entry_ttl, attr_ttl) = self.entry_ttls();
+            let attr_ttl = self.policy.attr_ttl(false, attr_ttl);
             (entry_ttl.min(attr_ttl), open_reply_flags(false))
         } else {
             (ttl, open_reply_flags(!private))
@@ -692,7 +706,14 @@ impl Filesystem for AfsFuse {
                         // A native or remote writer may rename or unlink between
                         // opens. Apply the freshness policy to names as well as
                         // attributes so an old dentry cannot open a new alias.
-                        reply.entry(&ttl, &file_attr(ino, &entry.attributes), Generation(0));
+                        let attr_ttl = mount_policy
+                            .attr_ttl(entry.attributes.kind == FileKind::Directory, ttl);
+                        reply.entry_with_ttls(
+                            &attr_ttl,
+                            &ttl,
+                            &file_attr(ino, &entry.attributes),
+                            Generation(0),
+                        );
                     });
                 }
                 Err(error) => reply.error(fuse_errno(error)),
@@ -775,6 +796,8 @@ impl Filesystem for AfsFuse {
                             if fuse_trace_enabled() {
                                 afs_logging::warn!("fuse.ttl"; "op" => "getattr", "ino" => ino, "ttl_ms" => ttl.as_millis() as u64, "private" => private);
                             }
+                            let ttl =
+                                mount_policy.attr_ttl(attr.kind == fuser::FileType::Directory, ttl);
                             reply.attr(&ttl, &attr)
                         });
                     }
@@ -880,6 +903,7 @@ impl Filesystem for AfsFuse {
             mtime: mtime.map(time_or_now),
         };
         let (_, attr_ttl) = self.entry_ttls();
+        let setattr_policy = self.policy.clone();
         let cache_ids = self.page_cache_ids.clone();
         let run = move || {
             let _front_guard = _front_guard;
@@ -913,6 +937,8 @@ impl Filesystem for AfsFuse {
                     if let Ok(mut cache) = cache_ids.lock() {
                         cache.remove(ino);
                     }
+                    let attr_ttl =
+                        setattr_policy.attr_ttl(attributes.kind == FileKind::Directory, attr_ttl);
                     reply.attr(&attr_ttl, &file_attr(ino, &attributes));
                 }
                 Err(error) => reply.error(fuse_errno(error)),
@@ -982,7 +1008,7 @@ impl Filesystem for AfsFuse {
         match result {
             Ok(entry) => {
                 let ino = self.state.lock().unwrap().remember_lookup(&entry);
-                let (entry_ttl, attr_ttl) = self.entry_ttls();
+                let (entry_ttl, attr_ttl) = self.reply_ttls(&entry.attributes);
                 reply.entry_with_ttls(
                     &attr_ttl,
                     &entry_ttl,
@@ -1072,7 +1098,7 @@ impl Filesystem for AfsFuse {
         match result {
             Ok(entry) => {
                 let ino = self.state.lock().unwrap().remember_lookup(&entry);
-                let (entry_ttl, attr_ttl) = self.entry_ttls();
+                let (entry_ttl, attr_ttl) = self.reply_ttls(&entry.attributes);
                 reply.entry_with_ttls(
                     &attr_ttl,
                     &entry_ttl,
@@ -1161,7 +1187,7 @@ impl Filesystem for AfsFuse {
         match result {
             Ok(entry) => {
                 let ino = self.state.lock().unwrap().remember_lookup(&entry);
-                let (entry_ttl, attr_ttl) = self.entry_ttls();
+                let (entry_ttl, attr_ttl) = self.reply_ttls(&entry.attributes);
                 reply.entry_with_ttls(
                     &attr_ttl,
                     &entry_ttl,
@@ -2362,7 +2388,7 @@ impl Filesystem for AfsFuse {
             Ok(entry) => {
                 let ino = self.state.lock().unwrap().remember_lookup(&entry);
                 self.remember_cached_inode(ino);
-                let (entry_ttl, attr_ttl) = self.entry_ttls();
+                let (entry_ttl, attr_ttl) = self.reply_ttls(&entry.attributes);
                 reply.entry_with_ttls(
                     &attr_ttl,
                     &entry_ttl,

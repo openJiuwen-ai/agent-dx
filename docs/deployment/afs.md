@@ -361,7 +361,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_scrub_bytes_per_second` | 调优 | Node | `33554432` | 后台巡检限速（字节/秒），0 关闭，否则 1MiB..=1GiB；见[后台巡检](#dfs-后台巡检) |
 | `dfs_scrub_start_delay_seconds` | 调优 | Node | `300` | Node 启动后首轮巡检的延迟，0..=86400 |
 | `dfs_scrub_round_interval_seconds` | 调优 | Node | `86400` | 两轮巡检开始时间的最短间隔，1..=2592000；一轮更长时下一轮紧接开始 |
-| `dfs_kernel_cache_ttl_ms` | 调优 | Node | `1000` | DFS 挂载的内核目录项与属性缓存时长（毫秒），0..=60000；0 表示不缓存（每次路径解析与 getattr 都问 Node）。他节点的改名、删除、改权限在本机最多晚这么久可见（`open`／`opendir` 经名字校验不会打开到已被替换的旧文件，`stat` 与按路径 setattr 不校验，见[已知限制](../architecture/afs-support-boundary.md#已知限制)第 19 项）；负查找从不缓存 |
+| `dfs_kernel_cache_ttl_ms` | 调优 | Node | `1000` | DFS 挂载的内核目录项与目录属性缓存时长（毫秒），0..=60000；0 表示不缓存（每次路径解析都问 Node）。普通文件、符号链接与特殊文件的属性始终不缓存。他节点的改名、删除、改目录权限在本机最多晚这么久可见（`open`／`opendir` 经名字校验不会打开到已被替换的旧文件，按路径 setattr 不校验，见[已知限制](../architecture/afs-support-boundary.md#已知限制)第 19 项）；负查找从不缓存 |
 | `dfs_read_max_ops_per_batch` | 调优 | Node | `128` | native 单批读操作数上限。S3 读仍受读取字节和 RPC 消息大小约束，缺失的版本授权通过一次请求取得 |
 | `dfs_read_max_inflight_bytes` | 调优 | Node | `8388608` | 读在途字节上限；也决定 Peer 缓存走流式填充还是整块填充 |
 | `dfs_source_cache_max_ms` | 调优 | Node | `5000` | 副本来源缓存时长，不超过 60000；0 表示不保留 |
