@@ -6,6 +6,14 @@ Independent branch: `feat/gmail-composio-trusted`. This does not modify the
 configuration center work in [#179](https://github.com/openJiuwen-ai/agent-dx/pull/179)
 or claim that its business identity contract has been published.
 
+Delivery alignment: draft ADX #268 now carries both the trusted Composio adapter
+and the separate ingestion coordination module, in the existing DigitalMateGateway
+process outside user sandboxes. No additional service or coordinator PR is
+required by this module split. #179 remains its own configuration-center producer;
+DigitalMate #1192 remains the separate-repository consumer. The next preparation
+batch incorporates official master `f2e2c0c735f23ac16fe86a5140f1eab03602ed6b`
+without rewriting the existing branch history.
+
 ## Responsibility and public inputs
 
 `gateway/src/ingress/digitalmategateway/composio` keeps the Composio project API key
@@ -105,7 +113,7 @@ logs and adds no plaintext token/secret storage.
    configuration, never chat or committed examples. No OAuth app was registered,
    purchased or deployed by this task.
 
-The separate ingestion coordinator owns Webhook/polling due work, durable
+The separate [ingestion coordinator](connector-ingestion.md) owns Webhook/polling due work, durable
 reception, scheduling/batching, requesting ADX readiness and delivery. It may
 share the DigitalMateGateway process but is not this module. This module does
 not wake Environments, ingest whole mailboxes, send mail, report notifications,

@@ -7,6 +7,9 @@
 
 mod client;
 mod types;
+mod webhook;
+
+pub use webhook::{VerifiedWebhook, WebhookError, WebhookVerifier};
 
 pub use types::{
     Attempt, AttemptPhase, Authority, Budget, ConnectionGrant, Error, GmailRequest, Permissions,

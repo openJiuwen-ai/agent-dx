@@ -540,8 +540,10 @@ use the new configuration before using this binary.
 
 The separate [Composio Gmail module candidate](../docs/development/composio-gmail-trusted.md)
 prepares restricted authorization/read calls outside user sandboxes. It has no
-HTTP route or production identity/connection adapters yet; it does not enable
-traffic or implement background ingestion.
+HTTP route or production identity/connection adapters yet. The same draft #268
+also prepares the separate [ingestion coordinator](../docs/development/connector-ingestion.md)
+in this Gateway process; raw webhook verification and batch rules do not enable
+traffic or establish durable background ingestion.
 
 ### Transparent business WebSocket
 
