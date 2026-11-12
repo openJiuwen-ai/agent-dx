@@ -21,7 +21,23 @@ struct PeerRangeRound<'r> {
 struct PeerRangeProgress {
     next: Vec<usize>,
     pending: Vec<usize>,
-    last_error: Option<Error>,
+    errors: Vec<Option<Error>>,
+}
+
+/// Only ranges whose candidate lists were exhausted remain eligible for a
+/// fresh lookup. The rest of the private output is already complete.
+pub(super) enum RangeReadOutcome {
+    Complete,
+    Exhausted { ops: Vec<ChunkReadOp>, error: Error },
+}
+
+pub(super) fn peer_sources_unavailable(error: &Error) -> bool {
+    matches!(
+        error.kind(),
+        afs_error::ErrorKind::Unavailable
+            | afs_error::ErrorKind::NotFound
+            | afs_error::ErrorKind::DeadlineExceeded
+    )
 }
 
 impl DfsReadEngine {
@@ -32,7 +48,7 @@ impl DfsReadEngine {
         out: &mut [u8],
         final_owned: bool,
         deadline: Option<Instant>,
-    ) -> Result<()> {
+    ) -> Result<RangeReadOutcome> {
         let version = batch
             .file_version_id
             .clone()
@@ -65,33 +81,45 @@ impl DfsReadEngine {
         let mut progress = PeerRangeProgress {
             next: vec![0; batch.ops.len()],
             pending: (0..batch.ops.len()).collect(),
-            last_error: None,
+            errors: vec![None; batch.ops.len()],
         };
+        let mut exhausted = None;
         while !progress.pending.is_empty() {
-            let groups = Self::group_pending_ranges(&round, &mut progress)?;
-            progress.pending.clear();
+            let groups = Self::group_pending_ranges(&round, &mut progress, &mut exhausted)?;
             for group in groups {
                 self.read_range_group(&round, &group, out, &mut progress)
                     .await?;
             }
         }
-        Ok(())
+        Ok(
+            exhausted.map_or(RangeReadOutcome::Complete, |(ops, error)| {
+                RangeReadOutcome::Exhausted { ops, error }
+            }),
+        )
     }
 
-    /// Group pending operations by peer context. CRC-segment objects are
-    /// always read alone. An operation without a next candidate ends the read.
+    /// Group pending operations by peer context, holding exhausted ranges for
+    /// the caller's single refresh after all other ranges have been attempted.
     fn group_pending_ranges(
         round: &PeerRangeRound<'_>,
         progress: &mut PeerRangeProgress,
+        exhausted: &mut Option<(Vec<ChunkReadOp>, Error)>,
     ) -> Result<Vec<Vec<usize>>> {
         let (batch, candidates, next) = (round.batch, round.candidates, &progress.next);
         let mut groups: Vec<Vec<usize>> = Vec::new();
-        for &index in &progress.pending {
+        for index in std::mem::take(&mut progress.pending) {
             let Some(source) = candidates[index].get(next[index]) else {
-                return Err(progress
-                    .last_error
+                let error = progress.errors[index]
                     .take()
-                    .unwrap_or_else(|| corrupt("committed Chunk has no readable copy")));
+                    .unwrap_or_else(|| corrupt("committed Chunk has no readable copy"));
+                if !peer_sources_unavailable(&error) {
+                    return Err(error);
+                }
+                exhausted
+                    .get_or_insert_with(|| (Vec::new(), error))
+                    .0
+                    .push(batch.ops[index].clone());
+                continue;
             };
             if let Some(group) = groups.iter_mut().find(|group| {
                 let first = group[0];
@@ -208,14 +236,16 @@ impl DfsReadEngine {
                 if self.distribution.parallelism > 1
                     && error.kind() == afs_error::ErrorKind::DeadlineExceeded
                 {
-                    progress.last_error = Some(error);
                     for &index in group {
+                        progress.errors[index] = Some(error.clone());
                         progress.next[index] += 1;
                         progress.pending.push(index);
                     }
                     return Ok(());
                 }
-                progress.last_error = Some(error);
+                for &index in group {
+                    progress.errors[index] = Some(error.clone());
+                }
                 self.retry_group_singly(round, group, &attempt, out, progress)
                     .await
             }
@@ -228,11 +258,12 @@ impl DfsReadEngine {
         choices: usize,
         fetch: impl std::future::Future<Output = Result<()>>,
     ) -> Result<()> {
-        if self.distribution.parallelism <= 1 {
-            return fetch.await;
-        }
-        let budget = deadline.saturating_duration_since(Instant::now())
-            / u32::try_from(choices.max(1)).unwrap_or(u32::MAX);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let budget = if self.distribution.parallelism <= 1 {
+            remaining
+        } else {
+            remaining / u32::try_from(choices.max(1)).unwrap_or(u32::MAX)
+        };
         tokio::time::timeout(budget, fetch).await.map_err(|_| {
             Error::coded(
                 afs_error::CLIENT_DEADLINE_EXCEEDED,
@@ -314,7 +345,7 @@ impl DfsReadEngine {
                         }
                         self.capture_native_read_authority()?;
                         self.note_suspect_copy(&error, item);
-                        progress.last_error = Some(error);
+                        progress.errors[index] = Some(error);
                     }
                 }
             }

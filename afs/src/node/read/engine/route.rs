@@ -9,7 +9,10 @@
 //! Every source is a borrowed view of the engine with inherent methods:
 //! static dispatch, no boxing, no extra threads, queues or copies.
 
-use super::*;
+use super::{
+    remote::{RangeReadOutcome, peer_sources_unavailable},
+    *,
+};
 
 /// The operations of a batch that the local source left for remote copies.
 pub(super) struct RemoteMask(Vec<bool>);
@@ -141,6 +144,7 @@ impl ReplicatedSources<'_> {
         out: &mut [u8],
         final_owned: bool,
         deadline: Option<Instant>,
+        refresh_available: &mut bool,
     ) -> Result<()> {
         self.engine.transfer.block_on_read(Box::pin(self.read_async(
             batch,
@@ -148,6 +152,7 @@ impl ReplicatedSources<'_> {
             final_owned,
             deadline,
             Arc::new(()),
+            refresh_available,
         )))
     }
 
@@ -158,6 +163,7 @@ impl ReplicatedSources<'_> {
         final_owned: bool,
         deadline: Option<Instant>,
         lifetime: super::super::admission::ReadLifetime,
+        refresh_available: &mut bool,
     ) -> Result<()> {
         let remote = match LocalSource(self.engine).read(batch, out)? {
             SourceOutcome::Partial(remote) => remote,
@@ -182,11 +188,73 @@ impl ReplicatedSources<'_> {
                 "DFS source caller epoch differs from the registered session",
             ));
         }
-        self.read_remote(&remote_batch, &sources, out, final_owned, Some(deadline))
+        let outcome = self
+            .read_remote(&remote_batch, &sources, out, final_owned, Some(deadline))
             .await?;
+        if let RangeReadOutcome::Exhausted { ops, error } = outcome {
+            if !*refresh_available || Instant::now() >= deadline {
+                return Err(error);
+            }
+            *refresh_available = false;
+            let pending = ReadBatch {
+                ops,
+                lookahead: Vec::new(),
+                file_version_id: remote_batch.file_version_id.clone(),
+                layout_root_id: remote_batch.layout_root_id.clone(),
+            };
+            self.retry_exhausted_ranges(&pending, &sources, out, final_owned, deadline, error)
+                .await?;
+        }
         self.engine
             .cache_completed_ranges(&remote_batch, &sources, out);
         Ok(())
+    }
+
+    async fn retry_exhausted_ranges(
+        self,
+        pending: &ReadBatch,
+        old: &[ChunkSources],
+        out: &mut [u8],
+        final_owned: bool,
+        deadline: Instant,
+        error: Error,
+    ) -> Result<()> {
+        let mut fresh = self
+            .engine
+            .refresh_failed_sources(pending, deadline)
+            .await?;
+        for set in &mut fresh {
+            if let Some(previous) = old
+                .iter()
+                .find(|previous| previous.chunk_id == set.chunk_id)
+            {
+                set.sources.retain(|source| {
+                    !previous.sources.iter().any(|old| {
+                        old.copy_id == source.copy_id
+                            && old.location == source.location
+                            && old.data_endpoint == source.data_endpoint
+                    })
+                });
+            }
+            if !set
+                .sources
+                .iter()
+                .any(|source| self.engine.is_remote_candidate(source))
+            {
+                return Err(error);
+            }
+        }
+        let outcome = tokio::time::timeout_at(
+            deadline.into(),
+            self.engine
+                .read_remote_ranges_async(pending, &fresh, out, final_owned, Some(deadline)),
+        )
+        .await
+        .map_err(|_| unavailable("DFS refreshed read deadline exceeded"))??;
+        match outcome {
+            RangeReadOutcome::Complete => Ok(()),
+            RangeReadOutcome::Exhausted { error, .. } => Err(error),
+        }
     }
 
     /// Remote sources in order; the first that applies serves the batch.
@@ -197,29 +265,34 @@ impl ReplicatedSources<'_> {
         out: &mut [u8],
         final_owned: bool,
         deadline: Option<Instant>,
-    ) -> Result<()> {
-        if final_owned
-            && FanoutSource(self.engine)
+    ) -> Result<RangeReadOutcome> {
+        if final_owned {
+            match FanoutSource(self.engine)
                 .read(batch, sources, out, deadline)
-                .await?
-                .is_done()
-        {
-            return Ok(());
+                .await
+            {
+                Ok(SourceOutcome::Done) => return Ok(RangeReadOutcome::Complete),
+                Ok(_) => {}
+                Err(error) if peer_sources_unavailable(&error) => {}
+                Err(error) => return Err(error),
+            }
         }
-        if PeerCacheSource(self.engine)
+        match PeerCacheSource(self.engine)
             .read(batch, sources, out, final_owned, false)
-            .await?
-            .is_done()
+            .await
         {
-            return Ok(());
+            Ok(SourceOutcome::Done) => return Ok(RangeReadOutcome::Complete),
+            Ok(_) => {}
+            Err(error) if peer_sources_unavailable(&error) => {}
+            Err(error) => return Err(error),
         }
         if final_owned
-            && self
+            && let Some(outcome) = self
                 .engine
                 .read_distributed_ranges(batch, sources, out, deadline)
                 .await?
         {
-            return Ok(());
+            return Ok(outcome);
         }
         let ordered = (self.engine.distribution.parallelism > 1)
             .then(|| self.engine.distributed_sources(batch, sources));
@@ -278,7 +351,7 @@ impl PeerRangeSource<'_> {
         out: &mut [u8],
         final_owned: bool,
         deadline: Option<Instant>,
-    ) -> Result<()> {
+    ) -> Result<RangeReadOutcome> {
         self.0
             .read_remote_ranges_async(batch, sources, out, final_owned, deadline)
             .await

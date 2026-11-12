@@ -192,9 +192,17 @@ impl DfsReadEngine {
         lifetime: crate::node::read::admission::ReadLifetime,
     ) -> Result<()> {
         let sources = self.replicated_sources();
+        let mut refresh_available = true;
         for part in self.native_read_batches(batch) {
             sources
-                .read_async(&part, out, true, Some(deadline), lifetime.clone())
+                .read_async(
+                    &part,
+                    out,
+                    true,
+                    Some(deadline),
+                    lifetime.clone(),
+                    &mut refresh_available,
+                )
                 .await
                 .inspect_err(|error| self.invalidate_native_batch_on_error(&part, error))?;
         }

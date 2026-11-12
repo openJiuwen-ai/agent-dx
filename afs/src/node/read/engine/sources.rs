@@ -573,6 +573,22 @@ impl DfsReadEngine {
             .map_err(|e| unavailable(e.to_string()))?
     }
 
+    /// Bypass retained candidates for the failed ranges. This request is
+    /// owned by the read and is cancelled with it, with no advisory lookahead
+    /// or generation retry.
+    pub(super) async fn refresh_failed_sources(
+        &self,
+        batch: &ReadBatch,
+        deadline: Instant,
+    ) -> Result<Vec<ChunkSources>> {
+        tokio::time::timeout_at(
+            deadline.into(),
+            self.sources_for_attempt_async_unshared(batch, false),
+        )
+        .await
+        .map_err(|_| unavailable("DFS source refresh deadline exceeded"))?
+    }
+
     async fn sources_for_attempt_async_unshared(
         &self,
         batch: &ReadBatch,
