@@ -190,7 +190,7 @@ impl Controller {
     ) -> Result<Option<OperationResult>> {
         if self.record.state == EnvironmentState::Paused {
             self.operation_intent(adx_core::observation::OperationIntent::Policy);
-            return self.delete().await.map(Some);
+            return self.delete(false).await.map(Some);
         }
         if self.record.state != EnvironmentState::Running
             && self.record.state != EnvironmentState::Failed
@@ -715,7 +715,8 @@ impl Controller {
         };
         let restore_started = Instant::now();
         let mut execution_admitted = false;
-        let attempt = tokio::time::timeout(initialization_timeout, async {
+        let submissions = self.submissions.clone();
+        let initialization = async {
             self.services.readiness.expect_runtime(&self.record)?;
             let execution = self
                 .services
@@ -757,16 +758,21 @@ impl Controller {
                 "environment restore execution stages completed"
             );
             Ok(())
-        })
-        .await
-        .unwrap_or_else(|_| {
+        };
+        let attempt = tokio::select! {
+            biased;
+            _ = submissions.cancelled() => Err(ResumeFailure::from(Error::Unavailable(
+                "restore interrupted by accepted deletion".into(),
+            ))),
+            result = tokio::time::timeout(initialization_timeout, initialization) => result.unwrap_or_else(|_| {
             let error = Error::Unavailable("restore initialization timed out".into());
             Err(if execution_admitted {
                 error.into()
             } else {
                 ResumeFailure::admission(error)
             })
-        });
+            }),
+        };
         if let Err(failure) = attempt {
             let error = &failure.error;
             if let Error::ProbeFailed(failure) = error {
@@ -844,7 +850,7 @@ impl Controller {
             .as_ref()
             .is_err_and(|failure| failure.retry_admission);
         let result = attempt.map_err(|failure| failure.error);
-        if self.capture_preparation.is_some() || retry_admission {
+        if self.submissions.deleting() || self.capture_preparation.is_some() || retry_admission {
             // Retry only local capacity refusal or a temporary execution-admission
             // error before restore_from was called. Input/Running publication and
             // uncertain cleanup retain their existing state/hold protections.
@@ -927,7 +933,16 @@ impl Controller {
         let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
         let resume_started = Instant::now();
         let prepare_started = Instant::now();
-        let path = services.store.prepare_restore(&cp.artifact).await?;
+        let submissions = self.submissions.clone();
+        let path = tokio::select! {
+            biased;
+            _ = submissions.cancelled() => {
+                return Err(Error::Unavailable(
+                    "restore interrupted by accepted deletion".into(),
+                ).into());
+            }
+            path = services.store.prepare_restore(&cp.artifact) => path?,
+        };
         let prepare_restore_ms = prepare_started.elapsed().as_secs_f64() * 1_000.0;
         let input_started = Instant::now();
         let already_held = self.record.execution_artifacts.contains(&cp.artifact);

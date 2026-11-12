@@ -621,6 +621,15 @@ async fn periodic_current_spec_conflict_remains_fenced_until_authority_matches()
     *authority.authority.records.lock().unwrap() = vec![current.try_into().unwrap()];
     authority.cycle(&node).await.unwrap();
     assert_eq!(
+        handle
+            .ensure_running("wake-after-authority-recovery".into())
+            .await
+            .unwrap()
+            .record
+            .state,
+        EnvironmentState::Running
+    );
+    assert_eq!(
         handle.delete().await.unwrap().record.state,
         EnvironmentState::Deleted
     );

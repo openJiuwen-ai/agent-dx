@@ -410,6 +410,13 @@ impl DistributedFs {
                 let mut state = cell
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                if crate::node::gc::is_permanent_admission_failure(&prepare_error.error) {
+                    // Meta will never admit this generation's reference: its
+                    // writes can never publish. Report them like any definite
+                    // rejection; the state is discarded (releasing the pin) at
+                    // the next open for write.
+                    state.terminal_error = Some(prepare_error.error.clone());
+                }
                 let failed = *frozen;
                 if state.dirty_extents.is_empty() {
                     state.dirty_extents.restore_before(failed.dirty_extents);

@@ -762,6 +762,27 @@ impl LocalChunkStore {
         Ok(reader)
     }
 
+    /// Pin a local copy for range reads. A segmented-CRC copy is pinned after
+    /// its identity and descriptor checks only: every later read verifies the
+    /// CRC32C segments it covers, so the eager whole-body scan would only
+    /// detect damage outside what is read, which background scrub owns. Copies
+    /// without segment CRCs keep the eager full verification (and outboard
+    /// build) of `open_verified`.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn open_for_range_reads(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
+        let reader = self.open_cataloged(chunk_id)?;
+        if reader.segment_crc.is_some() {
+            return Ok(reader);
+        }
+        reader.verify_full_and_build().inspect_err(|error| {
+            if verified_copy_is_invalid(error) {
+                self.lifecycle()
+                    .quarantine(chunk_id, QuarantineTrigger::VerifiedOpen);
+            }
+        })?;
+        Ok(reader)
+    }
+
     /// Pin the exact receipt object without an eager full scan. Returning this
     /// descriptor is not an integrity claim: read_at/read_ranges still validate
     /// the delivered coverage groups or use the existing full-scan fallback.
@@ -787,6 +808,7 @@ impl LocalChunkStore {
         chunk: &ChunkObject,
         table: &super::super::chunk_crc32c::CrcTable,
     ) -> Result<()> {
+        check_crc_descriptor(chunk, table, None)?;
         let file = File::open(path).map_err(Error::from)?;
         let identity = PeerFileIdentity::read(&file)?;
         let reader = PinnedChunkReader {
@@ -845,11 +867,7 @@ impl LocalChunkStore {
                 .segment_crc
                 .as_ref()
                 .ok_or_else(|| corrupt(chunk_id, "CRC descriptor missing"))?;
-            if !table.valid_shape(record.chunk.length)
-                || table.descriptor_digest() != record.chunk.content_digest
-            {
-                return Err(corrupt(chunk_id, "CRC descriptor identity differs"));
-            }
+            check_crc_descriptor(&record.chunk, table, self.read_work.as_ref())?;
         }
         let proof_identity = Mutex::new(PeerFileIdentity::read(&file)?);
         Ok(PinnedChunkReader {

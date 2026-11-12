@@ -6,6 +6,8 @@ Gateway 在独立模式通过 ActivatorClient 发起 HTTP 请求，在嵌入式�
 
 Agent 的 `CreateEnvironment`/`ExecutionSpec` 在本 crate 的 `environment_request` 转成通用 Environment 创建请求；`HttpEnvironment` 与 `LocalEnvironment` 共用映射、操作 ID 和响应解释。API Server 只转换自己的 Environment 请求到 Platform EnvironmentSpec，并负责 runtime 注入。嵌入式适配通过 `EnvironmentApplication` 调用同一 `EnvironmentService.create_request()`，不依赖 Ingress mapper，也不在 Agent 层构造 Platform 类型。嵌入式配置固定创建预算为 60 秒，调用等待仍受请求剩余期限约束；提交后超时保留原 ID 并返回 OutcomeUnknown。
 
+Activator 创建请求统一携带内置 `restartPolicy`：最多重启 3 次，首次退避 5 秒、最大退避 60 秒。该策略由 Platform 执行，不增加模板字段，也不在 Binding 中复制参数或策略快照；已存在 Env 的规格不会随 Activator 升级改变。
+
 独立进程启动读取 `ADX_ACTIVATOR_CONFIG` 指向的 JSON，示例见 [local.json](examples/local.json)。入口服务凭据为 `ADX_ACTIVATOR_SERVICE_TOKEN`。`environment_url` 指向 API Server（示例端口 8081 须与其 `listen` 配置一致），`environment_api_key_envs` 将租户映射到保存该租户 Platform API Key 的环境变量名，例如 `{"tenant":"ADX_PLATFORM_TENANT_API_KEY"}`。这里的 Platform API Key 用于 Environment 管理，与最终用户的模型 API Key 无关。凭据内容不写入 JSON；未配置租户的查询返回 NotFound，创建/删除在提交请求前返回 Unavailable。每项 key 必须属于对应租户，不能使用跨租户管理员 key；现有查询响应不含租户字段，Activator 无法独立验证配置归属。HTTP 明文必须显式允许，否则客户端需要 TLS 和受信任 CA。
 
 内部端点统一为 POST `/internal/adx/v1/`：
@@ -66,7 +68,7 @@ cargo test --locked -p adx-activator --lib binding_cache_memory_profile -- --ign
 - 创建：`POST /api/environment/v1/environments`，将 `adx-<generation>` 拆为 namespace/name，保留镜像、隔离 runtime、资源、业务 env、模板 service 端口、渲染后的 mounts、模板 lifecycle、`init_timeout_seconds`、`readiness_probe` 和 `inheritEntrypoint=true`，并附加配置的 `sandbox_network` 策略。模板 readiness 支持 HTTP、TCP 或 exec 单动作，Activator 映射为公共 Environment 的 `readinessProbe`；runtime profile 由 API Server 注入。显式启动覆盖与保留环境变量在提交前拒绝。
 - 查询：`GET /api/instances?instance_id=<id>`，检查单条记录的 ID，Running 才标记 ready。没有返回的 runtime ID 不合成；404 表示当前不可见，不能确认已删除。
 - 删除：`DELETE /api/environment/v1/environments/<id>`，API Server 确认成功返回 Deleted；明确 HTTP 404 返回 NotFound，Activator 对这两种结果均按 generation 条件清理 Binding 及其 parameters。断连、超时或不完整响应保留 OutcomeUnknown，不清理绑定。
-- 删除使用由动作、tenant 和 Environment ID 确定的 `X-Request-Id`；创建还包含持久化的尝试序号，仅在确定分配前取消后推进；同一组 Activator 副本须使用一致的创建规格、`sandbox_network` 与 `request_timeout_seconds`，未完成操作期间改变请求体会被 API Server 的幂等校验拒绝。禁止重定向及自动重放。HTTP 400/409 映射 Invalid/Conflict，查询 403 映射 NotFound；创建/删除 403 和所有 401 表示上游鉴权不可用，不触发删除收尾。读响应丢失为 Unavailable，写响应丢失为 OutcomeUnknown。
+- 删除使用由动作、tenant 和 Environment ID 确定的 `X-Request-Id`；创建还包含持久化的尝试序号，仅在确定分配前取消，或 CREATE 明确终态且再次确认 Env 不存在后推进；同一组 Activator 副本须使用一致的创建规格、`sandbox_network` 与 `request_timeout_seconds`，未完成操作期间改变请求体会被 API Server 的幂等校验拒绝。禁止重定向及自动重放。HTTP 400/409 映射 Invalid/Conflict，查询 403 映射 NotFound；创建/删除 403 和所有 401 表示上游鉴权不可用，不触发删除收尾。读响应丢失为 Unavailable，写响应丢失为 OutcomeUnknown。
 
 旧配置中的 `ADX_ENVIRONMENT_SERVICE_TOKEN` 已移除；Activator 使用 API Server 管理地址与 `environment_api_key_envs`。Ingress 不再提供 `/api/environment/v2/instances`。
 
@@ -169,12 +171,20 @@ ADX_AGENT_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
 
 ### 创建排队取消与退避
 
-HTTP 与进程内 Environment 适配器保留 Platform 的 `adx_core::scheduling::SchedulingFailure`，映射为 `EnvironmentError::SchedulingCancelled`。只有结构化的确定排队取消才允许发起下一次创建尝试；HTTP 必须同时为504且包含 `DEADLINE_EXCEEDED / never / not_started / schedulingFailure`，进程内调用使用协议的取消标记。普通超时、响应丢失、未找到 Env、损坏诊断和业务启动失败均不构成推进尝试的依据。Platform 的排队超时及 API Server 的600秒完成缓存保持原行为。
+HTTP 与进程内 Environment 适配器保留 Platform 的 `adx_core::scheduling::SchedulingFailure`，映射为 `EnvironmentError::SchedulingCancelled`。确定排队取消允许发起下一次创建尝试；HTTP 必须同时为504且包含 `DEADLINE_EXCEEDED / never / not_started / schedulingFailure`，进程内调用使用协议的取消标记。HTTP 与嵌入式模式还支持下述已结束创建的重试。普通超时、响应丢失、单独的 Env 不存在、损坏诊断和任意业务启动失败均不构成推进尝试的依据。Platform 的排队超时保持原行为；API Server 的完成缓存仍保留600秒，成功重放会检查现有本地 Env 目录：当前 Running Env 返回其信息及创建 requestId；确认不存在或执行终止返回已有终态错误。
 
 Activator 将每个仍被 Binding 引用的 Env 的当前尝试序号、下次检查时间和退避秒数保存在 `creation_attempts`。收到确定取消后按 Binding generation、活动引用和原尝试元数据做 revision CAS，仅推进一次序号；同一个 Env ID、版本、规格及 Volume UID 不变。序号0保持原 Request ID，后续 Request ID由tenant、Env ID和序号派生；多副本及进程重启复用同一尝试身份。结果未知继续查询或重放原身份，不能通过新序号续开未知操作的预算。
 
 确认取消后，退避为5、10、20、40、60秒并在60秒封顶。后台将对象放回待处理队列，等待期间不占worker；元数据通知、成员变化或进程重启可能提前唤醒检查，但持久化的下次创建时间仍生效。每轮先查询候选 Env；已有 Pending/Starting、重启恢复、Paused或Failed 执行均直接观察，不再 CREATE。候选不存在且达到检查时间后，统一查询旧current Env，不区分无卷、共享卷或独占卷模板：旧Env仍在运行、启动、暂停中、恢复或失败时只延后检查，不发创建请求、不推进尝试序号；旧Env已Paused/Deleted或查询不存在时才提交候选创建。这项升级策略在候选第一次创建前即生效，也适用于后续重试；Binding首次激活current不检查旧Env。Running仅表示旧Env尚未暂停，不证明有活跃连接；该检查不主动pause旧Env，也不构成查询与创建之间的原子排空保证。仅查询不存在不授权改变Request ID，结果未知仍保留原尝试身份。
 
 Activator不读取卷occupancy；卷的实际占用、释放与准入始终由Platform判定。重试前仍按既有流程ensure并固定Volume UID，不新增卷管理接口。
+
+### 已删除 Env 的请求触发重试
+
+HTTP 模式复用线上既有 CREATE 错误协议：409 的 `message` 必须精确为 `environment create has a terminal result; query its failure`，且 `error` 为 `CONFLICT / never / not_started`，`environmentId`、`requestId` 必须与本次 CREATE 相符。此时再次查询原 Env；只有确认仍不存在，才通过已有 `creation_attempts` 的 CAS 推进序号并保存退避，返回 `CreationDeferred`。后续请求在退避结束后沿用原 Env ID、Binding generation、模板版本、参数和 Volume UID，以新序号派生 Request ID。多个副本复用同一次 CAS 结果，不建立新 Env 引用或 secondary，不清理 SFS。
+
+创建序号用于派生唯一 Request ID，覆盖此前已确认取消及删除恢复的尝试；成功后不清零，也不作为 Env 生命周期内的恢复次数上限。每次终态确认最多通过 CAS 推进一次并返回 `CreationDeferred`，后续请求仍受持久化退避和单请求 deadline 约束。退避秒数也跨删除事件累积，成功不归零：同一 Env 引用后续恢复继续按5、10、20、40、60秒封顶推进，不会每次删除都从5秒开始；只有引用退役并清除创建尝试元数据后才重置。正在删除的 Binding、当前仍存在的 Env、普通409、身份不符及未知结果不会推进序号。没有新增健康扫描或后台同版本重建控制器。嵌入式 API Server 仅为 CREATE 保留同一条精确的 FailedPrecondition 终态原因；Activator 再执行相同的当前 Env 确认及 CAS，不新增错误协议或字段。
+
+API Server 在重放 CREATE 成功缓存前校验现有本地 Env 目录，Activator 直接使用已确认的 CREATE 成功响应，不再增加成功后的 GET。该 Activator 行为需要配套 API Server 的成功缓存校验修复；终态 409 后确认原 Env 不存在的 GET 仍保留。
 
 Alias目标变化会先退役原候选；清理完成时同时移除该候选的创建尝试元数据，不改Binding generation。此机制不会改变业务请求对current的解析、主动暂停旧Env或保留休眠状态的既有灰度行为。

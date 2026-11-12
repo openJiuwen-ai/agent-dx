@@ -168,6 +168,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
             } else {
                 self.0.starts.fetch_add(1, Ordering::SeqCst);
                 let record = pb::EnvironmentRecord {
+                    creation_request_id: identity.1.clone(),
                     observation: None,
                     execution_artifacts: vec![],
             snapshot_source: None,

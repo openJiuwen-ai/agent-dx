@@ -596,6 +596,7 @@ async fn lifecycle_rpc_scenario() {
     assert_eq!(
         stale_coordinator
             .create_environment(pb::StartAssignedEnvironmentRequest {
+                creation_request_id: String::new(),
                 create_deadline_unix_millis: 0,
                 snapshot: None,
                 spec: Some(spec("late").into()),
@@ -652,6 +653,7 @@ async fn lifecycle_rpc_scenario() {
     assert_eq!(
         node_frontend
             .create_environment(pb::StartAssignedEnvironmentRequest {
+                creation_request_id: String::new(),
                 create_deadline_unix_millis: 0,
                 snapshot: None,
                 node_session_id: "boot-1".into(),

@@ -226,8 +226,19 @@ async fn receipt_follows_recovered_environment() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(old.state, EnvironmentState::Deleted);
-    assert_eq!(old.assignment, first.assignment);
+    assert_eq!(old, recreated);
+    let current = session.get("review-env").await.unwrap();
+    assert_eq!(
+        current.creation.as_ref().unwrap().request_id,
+        "new-lifetime"
+    );
+    assert_eq!(
+        session
+            .publish_initial(first, "review-request", "boot")
+            .await
+            .unwrap(),
+        recreated
+    );
     assert_eq!(
         session
             .published_request("tenant", "new-lifetime")
@@ -296,15 +307,7 @@ async fn environment_identity_precedes_new_snapshot_normalization() {
         result.is_ok(),
         "confirmed Environment ID should reuse old success: {result:?}"
     );
-    assert_eq!(
-        result
-            .unwrap()
-            .into_inner()
-            .record
-            .unwrap()
-            .spec
-            .unwrap()
-            .snapshot_id,
-        None
-    );
+    let record = result.unwrap().into_inner().record.unwrap();
+    assert_eq!(record.creation_request_id, "first-request");
+    assert_eq!(record.spec.unwrap().snapshot_id, None);
 }

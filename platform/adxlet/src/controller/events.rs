@@ -341,7 +341,7 @@ impl Controller {
                                         self.operation_intent(
                                             adx_core::observation::OperationIntent::Idle,
                                         );
-                                        self.delete().await?;
+                                        self.delete(false).await?;
                                     }
                                     Err(error) => {
                                         self.events.reopen_idle = true;

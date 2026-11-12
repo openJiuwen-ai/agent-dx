@@ -99,16 +99,128 @@ pub struct GcReferences {
     open_pins: Mutex<std::collections::HashMap<OpenPinKey, std::sync::Weak<GcPin>>>,
 }
 type OpenPinKey = (InodeId, Option<FileVersionId>);
+/// The Meta admission of a deferred `write:` pin (performance batch 1, D).
+/// The first attempt runs on a blocking pool thread; `GcPin::admitted`
+/// waits for it and, after a failure Meta may still accept, retries once on
+/// the caller's thread with the same reference id. At most one attempt is in
+/// flight; `None` in `outcome` means one is.
+struct DeferredAdmission {
+    outcome: Mutex<Option<Result<crate::dfs::GcFence>>>,
+    ready: std::sync::Condvar,
+    control: Arc<dyn GcControl>,
+    inode: InodeId,
+    version: Option<FileVersionId>,
+}
+
+impl DeferredAdmission {
+    fn attempt(&self, id: &str) -> Result<crate::dfs::GcFence> {
+        let fence = self
+            .control
+            .retain_fenced(id, &self.inode, self.version.as_ref())?;
+        if fence != crate::dfs::GcFence::WriteGeneration {
+            return Err(Error::coded(
+                afs_error::NODE_VFS_UNIMPLEMENTED,
+                "Meta did not admit the write generation",
+            ));
+        }
+        Ok(fence)
+    }
+
+    fn finish(&self, result: Result<crate::dfs::GcFence>) {
+        let mut outcome = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        *outcome = Some(result);
+        self.ready.notify_all();
+    }
+}
+
+/// Runs the first attempt of a deferred admission. If the blocking pool
+/// drops the task unrun (runtime shutdown), its drop records a retryable
+/// failure so no waiter blocks forever; the next waiter retries itself.
+struct AdmissionTask {
+    admission: Option<Arc<DeferredAdmission>>,
+    id: String,
+}
+
+impl AdmissionTask {
+    fn run(&mut self) {
+        if let Some(admission) = self.admission.take() {
+            let result = admission.attempt(&self.id);
+            admission.finish(result);
+        }
+    }
+}
+
+impl Drop for AdmissionTask {
+    fn drop(&mut self) {
+        if let Some(admission) = self.admission.take() {
+            admission.finish(Err(Error::coded(
+                afs_error::IO_UNAVAILABLE,
+                "GC admission task did not run",
+            )));
+        }
+    }
+}
+
+/// A failed admission Meta will never accept for this reference id: the
+/// write generation can never be published and its writes are rejected.
+pub(crate) fn is_permanent_admission_failure(error: &Error) -> bool {
+    matches!(
+        error.code(),
+        afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED | afs_error::NODE_VFS_UNIMPLEMENTED
+    )
+}
+
 pub struct GcPin {
     fence: Option<crate::dfs::GcFence>,
+    /// Set for a deferred `write:` pin; `fence` is then unused.
+    deferred: Option<Arc<DeferredAdmission>>,
     id: String,
     owner: Arc<GcReferences>,
     /// The inode and version it is shared under; only `open:` pins are shared.
     open_inode: Option<OpenPinKey>,
 }
 impl GcPin {
-    pub(crate) fn fence(&self) -> Option<crate::dfs::GcFence> {
-        self.fence
+    /// Wait until Meta has durably admitted this pin and return its fence.
+    /// Blocks the calling thread: call it only from blocking-pool or
+    /// synchronous callers, never from an async worker. Every chunk of a
+    /// deferred write generation is persisted only after this succeeds, so
+    /// GC can never see such a chunk before its `write:` reference exists.
+    /// A failure Meta may still accept is retried once with the same id; a
+    /// permanent one ([`is_permanent_admission_failure`]) is returned as is.
+    pub(crate) fn admitted(&self) -> Result<crate::dfs::GcFence> {
+        let Some(admission) = &self.deferred else {
+            return self.fence.ok_or_else(|| {
+                Error::coded(
+                    afs_error::NODE_VFS_UNIMPLEMENTED,
+                    "GC pin holds no write-generation fence",
+                )
+            });
+        };
+        let mut outcome = admission
+            .outcome
+            .lock()
+            .map_err(|_| Error::coded(afs_error::IO_UNAVAILABLE, "GC admission poisoned"))?;
+        loop {
+            match outcome.as_ref() {
+                None => {
+                    outcome = admission.ready.wait(outcome).map_err(|_| {
+                        Error::coded(afs_error::IO_UNAVAILABLE, "GC admission poisoned")
+                    })?;
+                }
+                Some(Ok(fence)) => return Ok(*fence),
+                Some(Err(error)) if is_permanent_admission_failure(error) => {
+                    return Err(error.clone());
+                }
+                Some(Err(_)) => {
+                    // Claim the retry; other waiters see an attempt in flight.
+                    *outcome = None;
+                    drop(outcome);
+                    let result = admission.attempt(&self.id);
+                    admission.finish(result.clone());
+                    return result;
+                }
+            }
+        }
     }
     /// Recover the immutable operation admitted by this generation pin.
     pub(crate) fn write_operation_id(&self) -> Option<crate::dfs::OperationId> {
@@ -190,6 +302,7 @@ impl GcReferences {
     ) -> Arc<GcPin> {
         Arc::new(GcPin {
             fence: None,
+            deferred: None,
             id: crate::dfs::created_handle_reference_id(operation),
             owner: self.clone(),
             open_inode: None,
@@ -218,6 +331,42 @@ impl GcReferences {
     ) -> Result<Arc<GcPin>> {
         self.pin_mode(inode, version, Some(operation))
     }
+    /// A `write:` pin whose Meta admission runs on `runtime`'s blocking pool
+    /// instead of the caller's thread (the FUSE write thread). The caller
+    /// returns at once; the generation's uploads and its commit wait for the
+    /// admission through [`GcPin::admitted`].
+    pub(crate) fn pin_generation_deferred(
+        self: &Arc<Self>,
+        inode: &InodeId,
+        version: Option<&FileVersionId>,
+        operation: &crate::dfs::OperationId,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Arc<GcPin>> {
+        if self.pending_len()? >= RELEASE_MAX_PENDING {
+            self.flush()?;
+        }
+        let admission = Arc::new(DeferredAdmission {
+            outcome: Mutex::new(None),
+            ready: std::sync::Condvar::new(),
+            control: self.control.clone(),
+            inode: inode.clone(),
+            version: version.cloned(),
+        });
+        // Queue cleanup even when an admission reply is lost.
+        let pin = Arc::new(GcPin {
+            fence: None,
+            deferred: Some(admission.clone()),
+            id: format!("write:{}", operation.0),
+            owner: self.clone(),
+            open_inode: None,
+        });
+        let mut task = AdmissionTask {
+            admission: Some(admission),
+            id: pin.id.clone(),
+        };
+        drop(runtime.spawn_blocking(move || task.run()));
+        Ok(pin)
+    }
     /// `generation` selects a fenced `write:` pin; `None` is an `open:` pin.
     fn pin_mode(
         self: &Arc<Self>,
@@ -242,6 +391,7 @@ impl GcReferences {
         // Queue cleanup even when an admission reply is lost.
         let mut pin = GcPin {
             fence: None,
+            deferred: None,
             id,
             owner: self.clone(),
             open_inode: generation

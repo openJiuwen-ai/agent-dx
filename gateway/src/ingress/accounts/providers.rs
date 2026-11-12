@@ -584,22 +584,29 @@ impl LiteLlm {
             .ok_or(Error::Unavailable)
     }
     fn quota_from_info(&self, info: &Value) -> Result<QuotaResponse> {
-        fn amount(value: &Value, factor: f64) -> Result<Option<f64>> {
+        fn amount(value: &Value, factor: f64, allow_small_negative: bool) -> Result<Option<f64>> {
             let Some(parsed) = value
                 .as_f64()
                 .or_else(|| value.as_str()?.parse().ok())
-                .filter(|value| value.is_finite() && *value >= 0.0)
+                .filter(|value| {
+                    value.is_finite() && (*value >= 0.0 || (allow_small_negative && *value > -1.0))
+                })
             else {
                 return Ok(None);
             };
-            let points = parsed * factor;
+            let points = parsed.max(0.0) * factor;
             if !points.is_finite() {
                 return Err(Error::Unavailable);
             }
             Ok(Some(points))
         }
-        let total = amount(&info["max_budget"], self.config.points_per_budget_unit)?;
-        let used = amount(&info["spend"], self.config.points_per_budget_unit)?;
+        let total = amount(
+            &info["max_budget"],
+            self.config.points_per_budget_unit,
+            false,
+        )?;
+        // LiteLLM can report tiny negative floating-point residue for unused keys.
+        let used = amount(&info["spend"], self.config.points_per_budget_unit, true)?;
         let known = total.is_some() && used.is_some();
         let balance = match (total, used) {
             (Some(total), Some(used)) => {
@@ -914,26 +921,44 @@ mod tests {
         .unwrap();
         let provider = LiteLlm::with_key(config.clone(), "admin".into()).unwrap();
         for (spend, expected, low_balance, exhausted) in [
+            (-1.01, (30.0, -1.0, 0.0), false, false),
+            (-1.0, (30.0, -1.0, 0.0), false, false),
+            (-0.9999999999999999, (30.0, 0.0, 30.0), false, false),
+            (-0.5, (30.0, 0.0, 30.0), false, false),
+            (-1.734723475976807e-18, (30.0, 0.0, 30.0), false, false),
+            (-5.19770488282245e-113, (30.0, 0.0, 30.0), false, false),
+            (0.0, (30.0, 0.0, 30.0), false, false),
             (3.75, (30.0, 7.5, 22.5), false, false),
             (13.5, (30.0, 27.0, 3.0), true, false),
             (15.0, (30.0, 30.0, 0.0), true, true),
             (16.0, (30.0, 32.0, 0.0), true, true),
             (20.0, (30.0, 40.0, 0.0), true, true),
         ] {
+            for value in [json!(spend), json!(spend.to_string())] {
+                let quota = provider
+                    .quota_from_info(&json!({
+                        "max_budget":15.0,"spend":value,
+                        "budget_duration":"1d","budget_reset_at":"2026-10-30T00:00:00+08:00"
+                    }))
+                    .unwrap();
+                assert_eq!(
+                    (quota.quota.total, quota.quota.used, quota.quota.balance),
+                    expected,
+                    "spend={value}"
+                );
+                assert_eq!(quota.quota.low_balance, low_balance);
+                assert_eq!(quota.quota.exhausted, exhausted);
+                assert_eq!(quota.quota.reset_period, "1d");
+                assert_eq!(quota.quota.reset_at, "2026-10-30T00:00:00+08:00");
+            }
+        }
+        for invalid in [json!(-1.01), json!(-1.0), json!(-0.5), json!("-0.5")] {
             let quota = provider
-                .quota_from_info(&json!({
-                    "max_budget":15.0,"spend":spend,
-                    "budget_duration":"1d","budget_reset_at":"2026-10-30T00:00:00+08:00"
-                }))
+                .quota_from_info(&json!({"max_budget":invalid,"spend":0.0}))
                 .unwrap();
-            assert_eq!(
-                (quota.quota.total, quota.quota.used, quota.quota.balance),
-                expected
-            );
-            assert_eq!(quota.quota.low_balance, low_balance);
-            assert_eq!(quota.quota.exhausted, exhausted);
-            assert_eq!(quota.quota.reset_period, "1d");
-            assert_eq!(quota.quota.reset_at, "2026-10-30T00:00:00+08:00");
+            assert_eq!(quota.quota.total, -1.0);
+            assert_eq!(quota.quota.balance, 0.0);
+            assert!(!quota.quota.exhausted);
         }
         let unknown = provider.quota_from_info(&json!({})).unwrap();
         assert_eq!(
