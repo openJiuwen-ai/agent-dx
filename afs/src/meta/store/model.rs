@@ -105,6 +105,11 @@ pub struct NodeSession {
     pub grpc_addr: String,
     pub data_addr: String,
     pub rest_addr: String,
+    /// Address peers dial for this node's NFS export (outlet imports). Empty
+    /// when the node runs no outlet. Kept separate from `data_addr`, which is
+    /// the DFS data-plane endpoint peers dial with gRPC.
+    #[serde(default)]
+    pub nfs_addr: String,
     pub ownerfs_enabled: bool,
     #[serde(default)]
     pub storage_devices: Vec<StorageDeviceDescriptor>,
@@ -130,6 +135,7 @@ pub struct NodeSessionLease {
     pub grpc_addr: String,
     pub data_addr: String,
     pub rest_addr: String,
+    pub nfs_addr: String,
     pub ownerfs_enabled: bool,
     pub storage_devices: Vec<StorageDeviceDescriptor>,
     pub lease_ttl: Duration,
@@ -149,6 +155,15 @@ pub struct RootRecord {
     pub local_prepare_id: String,
     pub created_at_revision: StoreRevision,
     pub updated_at_revision: StoreRevision,
+    /// Address the home node advertises for its NFS export.
+    ///
+    /// Carried alongside the record for the outlet snapshot only: it belongs to
+    /// the home's *session*, not to the root, so persisting it here would let a
+    /// stale address outlive the session that produced it. The snapshot fills it
+    /// from `CurrentNodeSessions` on every read, and it is skipped on serialize
+    /// so the durable format is unchanged.
+    #[serde(skip)]
+    pub nfs_addr: String,
 }
 
 /// Durable reserve-stage record for a not-yet-active OwnerFs root.
@@ -314,6 +329,11 @@ pub enum MetaRead {
         node_id: String,
     },
     CurrentNodeSessions,
+    /// 全局 Active root 全量扫描（outlet 镜像面唯一输入）。
+    ///
+    /// "Active" 在持久层等价于"Root 实体存在"：`DeactivateRoot` 直接删除
+    /// Root 键，不存在软删除状态位。因此本扫描不需要额外状态过滤。
+    ActiveRoots,
     Root {
         root_id: String,
     },

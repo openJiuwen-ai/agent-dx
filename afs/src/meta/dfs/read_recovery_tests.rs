@@ -70,6 +70,7 @@ async fn register(store: &Store, id: &str, session: &str, devices: Vec<StorageDe
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:2".into(),
                 rest_addr: "http://127.0.0.1:3".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: devices,
                 lease_ttl: std::time::Duration::from_secs(30),
@@ -898,6 +899,7 @@ async fn expired_worker_blocks_without_source_before_repair_lease_expires() {
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:2".into(),
                 rest_addr: "http://127.0.0.1:3".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: vec![fixture.local.device_descriptor().unwrap()],
                 lease_ttl: std::time::Duration::from_millis(50),
@@ -973,6 +975,7 @@ async fn lost_target_persists_repair_debt_before_replacement_is_available() {
                     grpc_addr: "http://127.0.0.1:1".into(),
                     data_addr: "http://127.0.0.1:2".into(),
                     rest_addr: "http://127.0.0.1:3".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: false,
                     storage_devices: vec![StorageDeviceDescriptor {
                         device_id: "target-device".into(),

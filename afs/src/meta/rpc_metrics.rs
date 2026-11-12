@@ -18,6 +18,7 @@ const META_RPCS: &[&str] = &[
     "afs.meta.v1.OwnerRoots/DeactivateRoot",
     "afs.meta.v1.OwnerRoots/LookupRoot",
     "afs.meta.v1.OwnerRoots/ListOwnerRoots",
+    "afs.meta.v1.OwnerRoots/ListActiveOutletRoots",
     "afs.meta.v1.OwnerRoots/AcquireRoot",
     "afs.meta.v1.OwnerRoots/ValidateRootAccess",
     "afs.meta.v1.OwnerRoots/WatchRootCommands",
