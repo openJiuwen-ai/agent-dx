@@ -1044,7 +1044,7 @@ DFS普通I/O沿用cached write-through，不启用writeback。内核目录项TTL
 自己更新。open与opendir做名字校验（`node/vfs/dfs/recent_names.rs`）：Node记住2×TTL内交给内核的
 （父目录, 名字），某inode恰好经由一个这样的名字被打开时，预检用`Lookup(父目录, 名字)`代替`GetInode`
 （RPC数不变），名字已不指向该inode就回`ESTALE`，Linux以`LOOKUP_REVAL`重走一次路径并打开新inode；重走那次
-不再比对（每个`ESTALE`给一次豁免，一个TTL内有效；10毫秒内刚LOOKUP过的名字也不比对——内核持有的就是
+不再比对（每个`ESTALE`给收到它的线程一次豁免——FUSE请求头带调用线程id，内核的重试由同一线程在同一个open里发出——一个TTL内有效；请求pid为0时退回按名字与inode计数的豁免；10毫秒内刚LOOKUP过的名字也不比对——内核持有的就是
 Meta刚给的inode，其后到OPEN之间的变化与不缓存时lookup和open分两次RPC是同一窗口），应用不会因校验看到
 `ESTALE`。没有记录、记录被淘汰、经多个名字访问过（硬链接）时退回只确认inode存在。按路径的setattr不做
 名字校验，见支持边界已知限制第19项。每次新open

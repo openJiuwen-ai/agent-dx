@@ -12,12 +12,28 @@
 //! `LOOKUP_REVAL`. A dentry looked up within the last `FRESH_LOOKUP` is not
 //! compared: the kernel holds what Meta answered a moment ago, and a change
 //! between that LOOKUP and the OPEN is the same race as with no kernel cache
-//! at all; this also covers the kernel's retry, whose LOOKUP is fresh. In
-//! addition, each `ESTALE` answered grants exactly one unchecked open
-//! to the retry (several concurrent openers each get their own), and an
-//! unused grant expires after one TTL, so the check itself never hands
-//! `ESTALE` to an application and no name bypasses it for long. Inodes with no record, an evicted record or several names
-//! (hard links) keep the inode-only check.
+//! at all; this also covers the kernel's retry, whose LOOKUP is fresh.
+//!
+//! The retry itself is never compared again, even when it reaches the OPEN
+//! late (a namespace change holding the FUSE front gate can delay it past
+//! `FRESH_LOOKUP`): each `ESTALE` grants one unchecked open to the *thread*
+//! that received it. Two kernel facts make the requesting thread the right
+//! key. FUSE stamps every request header with the calling task's pid in the
+//! mount's pid namespace, `pid_nr_ns(task_pid(current), fc->pid_ns)`
+//! (`fs/fuse/dev.c`, request initialisation): a thread id, not a process id.
+//! And the `LOOKUP_REVAL` retry is made by that same task inside the same
+//! open system call (`fs/namei.c`, `do_filp_open`: `path_openat` returning
+//! `-ESTALE` is called again with `LOOKUP_REVAL`). So the grant is bound to
+//! the pid only, not to a name or inode (the retry may resolve the path to a
+//! new inode), and is used by that pid's next OPEN; another thread's open of
+//! the same name cannot take it. If that next OPEN is not the retry (the
+//! application gave up and opened something else), the cost is one open
+//! checked by inode only; an unused grant expires after one entry TTL. A
+//! request with pid 0 (from outside the mount's pid namespace) falls back to
+//! grants counted per name and inode. The check therefore never hands
+//! `ESTALE` to an application, and no name bypasses it for long. Inodes with
+//! no record, an evicted record or several names (hard links) keep the
+//! inode-only check.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -49,6 +65,8 @@ pub(super) enum FallbackReason {
     AfterRevalidation,
     /// The name was looked up within `FRESH_LOOKUP`.
     FreshLookup,
+    /// The next open of a thread this mount answered `ESTALE`.
+    ThreadRetry,
 }
 
 impl FallbackReason {
@@ -60,6 +78,7 @@ impl FallbackReason {
             Self::MultipleNames => "multiple_names",
             Self::AfterRevalidation => "after_revalidation",
             Self::FreshLookup => "fresh_lookup",
+            Self::ThreadRetry => "thread_retry",
         }
     }
 }
@@ -163,6 +182,9 @@ struct Inner {
     /// Inodes answered `ESTALE`: a retry may reach the same inode without a
     /// LOOKUP (e.g. `/proc/self/fd`).
     revalidating_inodes: HashMap<InodeId, Grants>,
+    /// Threads (request pids) answered `ESTALE`: their next open is not
+    /// compared, until the deadline.
+    revalidating_threads: HashMap<u32, Instant>,
     evicted: HashMap<InodeId, Instant>,
 }
 
@@ -309,8 +331,9 @@ impl RecentNames {
         }
     }
 
-    /// Decide the check for an open of `inode`; consumes one-shot marks.
-    pub(super) fn check(&self, inode: &InodeId) -> NameCheck {
+    /// Decide the check for an open of `inode` by the thread `pid` (the FUSE
+    /// request pid, 0 when unknown); consumes one-shot marks.
+    pub(super) fn check(&self, inode: &InodeId, pid: u32) -> NameCheck {
         if !self.enabled() {
             return NameCheck::Fallback(FallbackReason::Disabled);
         }
@@ -319,6 +342,14 @@ impl RecentNames {
         };
         let now = Instant::now();
         self.expire(&mut inner, now);
+        if pid != 0
+            && inner
+                .revalidating_threads
+                .remove(&pid)
+                .is_some_and(|until| until > now)
+        {
+            return self.count(NameCheck::Fallback(FallbackReason::ThreadRetry));
+        }
         if inner
             .revalidating_inodes
             .get_mut(inode)
@@ -355,9 +386,10 @@ impl RecentNames {
         self.count(check)
     }
 
-    /// Meta says `name` in `parent` no longer names `inode`: this open answers
-    /// `ESTALE`, and the kernel's single retry is not checked again.
-    pub(super) fn mark_stale(&self, inode: &InodeId, parent: &InodeId, name: &[u8]) {
+    /// Meta says `name` in `parent` no longer names `inode`: this open by the
+    /// thread `pid` answers `ESTALE`, and the kernel's single retry (that
+    /// thread's next open) is not checked again.
+    pub(super) fn mark_stale(&self, inode: &InodeId, parent: &InodeId, name: &[u8], pid: u32) {
         if let Some(metrics) = &self.metrics {
             metrics.results.with_label_values(&["stale"]).inc();
         }
@@ -368,6 +400,11 @@ impl RecentNames {
         let grant = Grants::one(now + self.entry_ttl);
         let key = (parent.clone(), name.to_vec());
         Self::remove_name(&mut inner, inode, &key);
+        if pid != 0 {
+            inner.revalidating_threads.insert(pid, now + self.entry_ttl);
+            self.observe(&inner);
+            return;
+        }
         inner
             .revalidating_names
             .entry(key)
@@ -452,6 +489,7 @@ impl RecentNames {
         inner
             .revalidating_inodes
             .retain(|_, grants| grants.live(now) > 0);
+        inner.revalidating_threads.retain(|_, until| *until > now);
         inner.evicted.retain(|_, until| *until > now);
     }
 }
@@ -476,7 +514,7 @@ mod tests {
         let names = RecentNames::new(Duration::ZERO, 8).with_fresh_lookup(Duration::ZERO);
         names.record(&id("x"), &id("d"), b"f");
         assert_eq!(
-            names.check(&id("x")),
+            names.check(&id("x"), 0),
             NameCheck::Fallback(FallbackReason::Disabled)
         );
     }
@@ -485,19 +523,19 @@ mod tests {
     fn one_name_is_verified_and_several_names_fall_back() {
         let names = RecentNames::new(Duration::from_secs(1), 8).with_fresh_lookup(Duration::ZERO);
         assert_eq!(
-            names.check(&id("x")),
+            names.check(&id("x"), 0),
             NameCheck::Fallback(FallbackReason::NoRecord)
         );
         names.record(&id("x"), &id("d"), b"f");
-        assert_eq!(names.check(&id("x")), verify("d", "f"));
-        assert_eq!(names.check(&id("x")), verify("d", "f"), "not one-shot");
+        assert_eq!(names.check(&id("x"), 0), verify("d", "f"));
+        assert_eq!(names.check(&id("x"), 0), verify("d", "f"), "not one-shot");
         names.record(&id("x"), &id("e"), b"hard-link");
         assert_eq!(
-            names.check(&id("x")),
+            names.check(&id("x"), 0),
             NameCheck::Fallback(FallbackReason::MultipleNames)
         );
         names.forget(&id("e"), b"hard-link");
-        assert_eq!(names.check(&id("x")), verify("d", "f"));
+        assert_eq!(names.check(&id("x"), 0), verify("d", "f"));
     }
 
     #[test]
@@ -506,10 +544,10 @@ mod tests {
         names.record(&id("old"), &id("d"), b"f");
         names.record(&id("new"), &id("d"), b"f");
         assert_eq!(
-            names.check(&id("old")),
+            names.check(&id("old"), 0),
             NameCheck::Fallback(FallbackReason::NoRecord)
         );
-        assert_eq!(names.check(&id("new")), verify("d", "f"));
+        assert_eq!(names.check(&id("new"), 0), verify("d", "f"));
     }
 
     #[test]
@@ -517,32 +555,32 @@ mod tests {
         let ttl = Duration::from_millis(200);
         let names = RecentNames::new(ttl, 8).with_fresh_lookup(Duration::ZERO);
         names.record(&id("old"), &id("d"), b"f");
-        assert_eq!(names.check(&id("old")), verify("d", "f"));
-        names.mark_stale(&id("old"), &id("d"), b"f");
+        assert_eq!(names.check(&id("old"), 0), verify("d", "f"));
+        names.mark_stale(&id("old"), &id("d"), b"f", 0);
         // The kernel's retry: LOOKUP records the new inode, then OPEN.
         names.record(&id("new"), &id("d"), b"f");
         assert_eq!(
-            names.check(&id("new")),
+            names.check(&id("new"), 0),
             NameCheck::Fallback(FallbackReason::AfterRevalidation)
         );
-        assert_eq!(names.check(&id("new")), verify("d", "f"), "consumed");
+        assert_eq!(names.check(&id("new"), 0), verify("d", "f"), "consumed");
         // A retry that reaches the stale inode itself is not checked again,
         // once.
         assert_eq!(
-            names.check(&id("old")),
+            names.check(&id("old"), 0),
             NameCheck::Fallback(FallbackReason::AfterRevalidation)
         );
         assert_eq!(
-            names.check(&id("old")),
+            names.check(&id("old"), 0),
             NameCheck::Fallback(FallbackReason::NoRecord)
         );
         // An unconsumed mark expires after one entry TTL.
-        names.mark_stale(&id("new"), &id("d"), b"f");
+        names.mark_stale(&id("new"), &id("d"), b"f", 0);
         std::thread::sleep(ttl + Duration::from_millis(50));
         names.record(&id("newer"), &id("d"), b"f");
-        assert_eq!(names.check(&id("newer")), verify("d", "f"));
+        assert_eq!(names.check(&id("newer"), 0), verify("d", "f"));
         assert_eq!(
-            names.check(&id("new")),
+            names.check(&id("new"), 0),
             NameCheck::Fallback(FallbackReason::NoRecord)
         );
     }
@@ -553,17 +591,17 @@ mod tests {
     fn each_estale_grants_exactly_one_unchecked_retry() {
         let names = RecentNames::new(Duration::from_secs(1), 8).with_fresh_lookup(Duration::ZERO);
         names.record(&id("old"), &id("d"), b"f");
-        names.mark_stale(&id("old"), &id("d"), b"f");
-        names.mark_stale(&id("old"), &id("d"), b"f");
+        names.mark_stale(&id("old"), &id("d"), b"f", 0);
+        names.mark_stale(&id("old"), &id("d"), b"f", 0);
         names.record(&id("new"), &id("d"), b"f");
         names.record(&id("new"), &id("d"), b"f");
         for _ in 0..2 {
             assert_eq!(
-                names.check(&id("new")),
+                names.check(&id("new"), 0),
                 NameCheck::Fallback(FallbackReason::AfterRevalidation)
             );
         }
-        assert_eq!(names.check(&id("new")), verify("d", "f"));
+        assert_eq!(names.check(&id("new"), 0), verify("d", "f"));
     }
 
     /// The retry LOOKUPs the name twice and another Node replaced it in
@@ -572,14 +610,14 @@ mod tests {
     fn a_grant_follows_its_name_across_a_double_lookup() {
         let names = RecentNames::new(Duration::from_secs(1), 8).with_fresh_lookup(Duration::ZERO);
         names.record(&id("old"), &id("d"), b"f");
-        names.mark_stale(&id("old"), &id("d"), b"f");
+        names.mark_stale(&id("old"), &id("d"), b"f", 0);
         names.record(&id("y1"), &id("d"), b"f");
         names.record(&id("y2"), &id("d"), b"f");
         assert_eq!(
-            names.check(&id("y2")),
+            names.check(&id("y2"), 0),
             NameCheck::Fallback(FallbackReason::AfterRevalidation)
         );
-        assert_eq!(names.check(&id("y2")), verify("d", "f"));
+        assert_eq!(names.check(&id("y2"), 0), verify("d", "f"));
     }
 
     #[test]
@@ -588,11 +626,73 @@ mod tests {
             .with_fresh_lookup(Duration::from_millis(50));
         names.record(&id("x"), &id("d"), b"f");
         assert_eq!(
-            names.check(&id("x")),
+            names.check(&id("x"), 0),
             NameCheck::Fallback(FallbackReason::FreshLookup)
         );
         std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(names.check(&id("x")), verify("d", "f"));
+        assert_eq!(names.check(&id("x"), 0), verify("d", "f"));
+    }
+
+    /// The kernel's retry (thread 101) is delayed and another thread (202)
+    /// opens the same, re-resolved name first: the grant belongs to the
+    /// retrying thread, so the retry still passes and 202 is still compared.
+    #[test]
+    fn a_thread_grant_cannot_be_taken_by_another_thread() {
+        let names = RecentNames::new(Duration::from_secs(1), 8).with_fresh_lookup(Duration::ZERO);
+        names.record(&id("old"), &id("d"), b"f");
+        assert_eq!(names.check(&id("old"), 101), verify("d", "f"));
+        names.mark_stale(&id("old"), &id("d"), b"f", 101);
+        // The retry's LOOKUP resolves the name to a new inode.
+        names.record(&id("new"), &id("d"), b"f");
+        assert_eq!(names.check(&id("new"), 202), verify("d", "f"));
+        assert_eq!(
+            names.check(&id("new"), 101),
+            NameCheck::Fallback(FallbackReason::ThreadRetry)
+        );
+        // One-shot: the same thread's next open is compared again.
+        assert_eq!(names.check(&id("new"), 101), verify("d", "f"));
+    }
+
+    /// The grant is bound to the thread, not to an inode: the retry may
+    /// reach any inode, and a thread's grant never helps another inode's
+    /// other openers.
+    #[test]
+    fn a_thread_grant_follows_the_thread_to_whatever_inode_it_opens() {
+        let names = RecentNames::new(Duration::from_secs(1), 8).with_fresh_lookup(Duration::ZERO);
+        names.record(&id("old"), &id("d"), b"f");
+        names.record(&id("other"), &id("d"), b"g");
+        names.mark_stale(&id("old"), &id("d"), b"f", 7);
+        assert_eq!(names.check(&id("other"), 8), verify("d", "g"));
+        assert_eq!(
+            names.check(&id("other"), 7),
+            NameCheck::Fallback(FallbackReason::ThreadRetry)
+        );
+    }
+
+    #[test]
+    fn an_unused_thread_grant_expires_after_one_ttl() {
+        let ttl = Duration::from_millis(100);
+        let names = RecentNames::new(ttl, 8).with_fresh_lookup(Duration::ZERO);
+        names.record(&id("old"), &id("d"), b"f");
+        names.mark_stale(&id("old"), &id("d"), b"f", 9);
+        std::thread::sleep(ttl + Duration::from_millis(50));
+        names.record(&id("new"), &id("d"), b"f");
+        assert_eq!(names.check(&id("new"), 9), verify("d", "f"));
+    }
+
+    /// pid 0 (a request from outside the mount's pid namespace) keeps the
+    /// grants counted per name and inode.
+    #[test]
+    fn pid_zero_falls_back_to_counted_grants() {
+        let names = RecentNames::new(Duration::from_secs(1), 8).with_fresh_lookup(Duration::ZERO);
+        names.record(&id("old"), &id("d"), b"f");
+        names.mark_stale(&id("old"), &id("d"), b"f", 0);
+        names.record(&id("new"), &id("d"), b"f");
+        assert_eq!(
+            names.check(&id("new"), 0),
+            NameCheck::Fallback(FallbackReason::AfterRevalidation)
+        );
+        assert_eq!(names.check(&id("new"), 0), verify("d", "f"));
     }
 
     #[test]
@@ -601,10 +701,10 @@ mod tests {
         let names = RecentNames::new(ttl, 8).with_fresh_lookup(Duration::ZERO);
         names.record(&id("x"), &id("d"), b"f");
         std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(names.check(&id("x")), verify("d", "f"));
+        assert_eq!(names.check(&id("x"), 0), verify("d", "f"));
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(
-            names.check(&id("x")),
+            names.check(&id("x"), 0),
             NameCheck::Fallback(FallbackReason::NoRecord)
         );
     }
@@ -615,9 +715,9 @@ mod tests {
         names.record(&id("tmp"), &id("d"), b"f.tmp");
         names.record(&id("old"), &id("d"), b"f");
         names.rename(&id("d"), b"f.tmp", &id("d"), b"f");
-        assert_eq!(names.check(&id("tmp")), verify("d", "f"));
+        assert_eq!(names.check(&id("tmp"), 0), verify("d", "f"));
         assert_eq!(
-            names.check(&id("old")),
+            names.check(&id("old"), 0),
             NameCheck::Fallback(FallbackReason::NoRecord)
         );
     }
@@ -629,10 +729,10 @@ mod tests {
         names.record(&id("b"), &id("d"), b"b");
         names.record(&id("c"), &id("d"), b"c");
         assert_eq!(
-            names.check(&id("a")),
+            names.check(&id("a"), 0),
             NameCheck::Fallback(FallbackReason::Evicted)
         );
-        assert_eq!(names.check(&id("b")), verify("d", "b"));
-        assert_eq!(names.check(&id("c")), verify("d", "c"));
+        assert_eq!(names.check(&id("b"), 0), verify("d", "b"));
+        assert_eq!(names.check(&id("c"), 0), verify("d", "c"));
     }
 }

@@ -253,15 +253,17 @@ impl DistributedFs {
     /// through exactly one name recently handed to the kernel, ask Meta for
     /// that name (one RPC, as `GetInode`) and answer `ESTALE` if it no longer
     /// names this inode: Linux repeats the path walk once and opens what the
-    /// name holds now (see `recent_names`).
-    fn open_preflight(&self, inode_id: &InodeId) -> Result<InodeRecord> {
+    /// name holds now (see `recent_names`). `pid` is the FUSE request's
+    /// thread id (0 when unknown): the kernel's retry of this open comes from
+    /// the same thread and is not compared again.
+    fn open_preflight(&self, inode_id: &InodeId, pid: u32) -> Result<InodeRecord> {
         let on_error = |error: &Error| self.invalidate_native_inode_views_on_error(inode_id, error);
-        match self.recent_names.check(inode_id) {
+        match self.recent_names.check(inode_id, pid) {
             recent_names::NameCheck::Verify { parent, name } => {
                 match self.meta.lookup(&parent, &name).inspect_err(on_error)? {
                     Some(record) if record.inode_id == *inode_id => Ok(record),
                     _ => {
-                        self.recent_names.mark_stale(inode_id, &parent, &name);
+                        self.recent_names.mark_stale(inode_id, &parent, &name, pid);
                         Err(Error::coded(
                             afs_error::NODE_DFS_STALE_NAME,
                             "DFS name no longer names the opened inode",

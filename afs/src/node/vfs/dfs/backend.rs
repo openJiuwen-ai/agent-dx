@@ -531,7 +531,7 @@ impl Backend for DistributedFs {
 
     fn open_with_options(
         &self,
-        _: &RequestContext,
+        ctx: &RequestContext,
         inode: BackendInode,
         flags: i32,
         options: OpenOptions,
@@ -544,7 +544,7 @@ impl Backend for DistributedFs {
         } else {
             None
         };
-        let preflight = self.validate_inode(self.open_preflight(&inode_id)?)?;
+        let preflight = self.validate_inode(self.open_preflight(&inode_id, ctx.pid)?)?;
         if matches!(preflight.kind, InodeKind::Special(_)) {
             return Err(Error::coded(
                 afs_error::IO_NOT_SUPPORTED,
@@ -1088,9 +1088,9 @@ impl Backend for DistributedFs {
         self.release_file_handle(handle)?.map_or(Ok(()), Err)
     }
 
-    fn opendir(&self, _: &RequestContext, inode: BackendInode) -> Result<DirectoryHandle> {
+    fn opendir(&self, ctx: &RequestContext, inode: BackendInode) -> Result<DirectoryHandle> {
         let inode_id = self.inode_id(inode)?;
-        let record = self.validate_inode(self.open_preflight(&inode_id)?)?;
+        let record = self.validate_inode(self.open_preflight(&inode_id, ctx.pid)?)?;
         if record.kind != InodeKind::Directory {
             return Err(Error::from(std::io::Error::from(
                 std::io::ErrorKind::NotADirectory,
