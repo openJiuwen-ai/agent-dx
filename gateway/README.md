@@ -538,6 +538,11 @@ use the new configuration before using this binary.
 
 ## DigitalMateGateway authenticated entrypoints
 
+The separate [Composio Gmail module candidate](../docs/development/composio-gmail-trusted.md)
+prepares restricted authorization/read calls outside user sandboxes. It has no
+HTTP route or production identity/connection adapters yet; it does not enable
+traffic or implement background ingestion.
+
 ### Transparent business WebSocket
 
 The `digitalmategateway` business module loads `ADX_JIUWEN_CONFIG` with a
