@@ -1997,7 +1997,7 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
     )
     .unwrap();
     let channel = peers
-        .owner_files_channel("node-a", 1, &endpoint)
+        .owner_files_channel("node-a", 1, &endpoint, 0)
         .await
         .unwrap();
     let long_wait_channel = peers
