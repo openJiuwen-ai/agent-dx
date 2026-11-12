@@ -28,6 +28,8 @@ and remain outside that typed API.
 
 The default `activity-client` feature builds the managed Ingress and Relay entrypoints. Embedded and standalone Ingress both use `ingress::IngressService`; only the owning process changes. Standalone Ingress requires `ADX_INGRESS_CONTROL_CONFIG` pointing to [ingress-control.json](../build/config/examples/ingress-control.json). Coordinator must map the Ingress client certificate to the `ingress` role. Public listener TLS and Ingress-to-Node security remain separate settings. The optional `etcd-watch` library and legacy test fixtures are retained separately; the managed Ingress entrypoint uses the new Coordinator route service.
 
+DigitalMate 业务配置中心的部署、身份续期与回收边界见[中文部署说明](../docs/deployment/digitalmate-privacy.md)。
+
 The gateway is a member of the root Cargo workspace. Run from repository root:
 
 ```sh
