@@ -1,4 +1,5 @@
 //! Shared ADX logging, metrics, and tracing support.
+pub mod business;
 pub mod capture;
 pub mod logging;
 pub mod metrics;

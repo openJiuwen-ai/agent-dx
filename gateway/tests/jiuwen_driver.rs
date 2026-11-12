@@ -73,7 +73,7 @@ async fn one_connection_carries_requests_events_and_stops_without_replay() {
     let (socket, mut backend) = pair().await;
     let (send, requests) = mpsc::channel(4);
     let (output, mut frames) = mpsc::channel(8);
-    let task = tokio::spawn(run(socket, "user".into(), config(), requests, output));
+    let task = tokio::spawn(run(socket, "user".into(), config(), requests, output, None));
     ack(&mut backend).await;
     assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
     send.send(request("client", "chat.send")).await.unwrap();
@@ -102,7 +102,7 @@ async fn project_list_uses_the_existing_e2a_connection_without_a_gateway_ack() {
     let (socket, mut backend) = pair().await;
     let (send, requests) = mpsc::channel(2);
     let (output, mut frames) = mpsc::channel(4);
-    let task = tokio::spawn(run(socket, "user".into(), config(), requests, output));
+    let task = tokio::spawn(run(socket, "user".into(), config(), requests, output, None));
     ack(&mut backend).await;
     assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
     let request = Request::parse(
@@ -136,7 +136,7 @@ async fn legacy_agentserver_health_check_is_answered_without_model_execution() {
     let (output, mut frames) = mpsc::channel(4);
     let mut limits = config();
     limits.ping_interval = Duration::from_secs(1);
-    let task = tokio::spawn(run(socket, "user".into(), limits, requests, output));
+    let task = tokio::spawn(run(socket, "user".into(), limits, requests, output, None));
 
     legacy_ack(&mut backend).await;
     assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
@@ -171,7 +171,7 @@ async fn explicit_readiness_agentserver_receives_health_check() {
     let (socket, mut backend) = pair().await;
     let (send, requests) = mpsc::channel(2);
     let (output, mut frames) = mpsc::channel(4);
-    let task = tokio::spawn(run(socket, "user".into(), config(), requests, output));
+    let task = tokio::spawn(run(socket, "user".into(), config(), requests, output, None));
 
     ack(&mut backend).await;
     assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
@@ -201,7 +201,7 @@ async fn slow_frontend_is_bounded_and_does_not_replay_sent_request() {
     let (socket, mut backend) = pair().await;
     let (send, requests) = mpsc::channel(2);
     let (output, _frames) = mpsc::channel(1);
-    let task = tokio::spawn(run(socket, "user".into(), config(), requests, output));
+    let task = tokio::spawn(run(socket, "user".into(), config(), requests, output, None));
     ack(&mut backend).await;
     send.send(request("one", "chat.send")).await.unwrap();
     assert_eq!(text(&mut backend).await["method"], "chat.send");
@@ -220,7 +220,7 @@ async fn full_output_queue_waits_for_frontend_to_drain() {
     let (output, mut frames) = mpsc::channel(1);
     let mut limits = config();
     limits.output_queue_timeout = Duration::from_secs(5);
-    let task = tokio::spawn(run(socket, "user".into(), limits, requests, output));
+    let task = tokio::spawn(run(socket, "user".into(), limits, requests, output, None));
 
     ack(&mut backend).await;
     send.send(request("one", "chat.send")).await.unwrap();
@@ -240,7 +240,7 @@ async fn unary_timeout_retires_only_that_request_without_closing_the_connection(
     let (socket, mut backend) = pair().await;
     let (send, requests) = mpsc::channel(2);
     let (output, mut frames) = mpsc::channel(4);
-    let task = tokio::spawn(run(socket, "user".into(), config(), requests, output));
+    let task = tokio::spawn(run(socket, "user".into(), config(), requests, output, None));
     ack(&mut backend).await;
     frames.recv().await.unwrap();
     send.send(request("query", "session.get_metadata"))
@@ -274,7 +274,7 @@ async fn pong_does_not_replace_the_required_front_ack() {
             }
         }
     });
-    let mut task = tokio::spawn(run(socket, "user".into(), config, requests, output));
+    let mut task = tokio::spawn(run(socket, "user".into(), config, requests, output, None));
     let result = tokio::time::timeout(Duration::from_millis(250), &mut task).await;
     task.abort();
     peer.abort();

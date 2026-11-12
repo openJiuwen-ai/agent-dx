@@ -4,6 +4,7 @@ pub mod connector;
 pub mod coordinator_routes;
 pub mod e2b_route;
 mod e2b_signing;
+pub mod experience;
 pub mod http_pool;
 mod listener;
 pub mod path;
@@ -58,3 +59,6 @@ pub mod agent_service;
 
 #[cfg(feature = "agent-api")]
 pub mod accounts;
+
+#[cfg(feature = "agent-api")]
+pub mod observability;

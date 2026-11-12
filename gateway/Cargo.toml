@@ -33,7 +33,7 @@ default = ["activity-client"]
 activity-client = ["dep:prost", "dep:tonic", "dep:tower"]
 etcd-watch = ["dep:etcd-client"]
 mock-e2e = []
-agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:russh", "dep:reqwest", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:deadpool-postgres", "dep:webpki-roots", "dep:jsonwebtoken", "dep:zeroize"]
+agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:russh", "dep:reqwest", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:deadpool-postgres", "dep:webpki-roots", "dep:jsonwebtoken", "dep:zeroize", "dep:time"]
 
 [dependencies]
 adx-core = { path = "../platform/crates/core" }
@@ -79,9 +79,10 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 tokio-tungstenite = "0.24"
 tokio-stream = { version = "0.1", features = ["net"] }
+time = { version = "0.3", optional = true }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-tokio-postgres = { version = "0.7", optional = true }
+tokio-postgres = { version = "0.7", optional = true, features = ["with-time-0_3"] }
 tokio-postgres-rustls = { version = "0.13", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 webpki-roots = { version = "1", optional = true }

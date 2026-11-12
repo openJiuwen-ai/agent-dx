@@ -12,7 +12,7 @@ use super::{
 use crate::ingress::accounts::{self, BusinessAuth, Principal};
 use crate::ingress::{
     agent_service::{AgentV2Access, ServiceAccessError, ServiceSelector},
-    server::{Ingress, ProxyBody},
+    server::{AbortReason, Ingress, ProxyBody, StreamObserver, Transport},
 };
 use adx_agent_api::{managed::ManagedService, request::RequestContext, Error};
 use adx_agent_core::{Protocol, Scope};
@@ -305,6 +305,7 @@ impl DigitalMateGatewayApi {
         ) {
             return self.auth_request(request).await;
         }
+        let auth_started = tokio::time::Instant::now();
         let token = match accounts::bearer(request.headers()) {
             Ok(v) => v,
             Err(e) => return auth_error(e),
@@ -319,6 +320,7 @@ impl DigitalMateGatewayApi {
             Ok(Err(e)) => return auth_error(e),
             _ => return auth_error(accounts::Error::Unavailable),
         };
+        let auth_done = tokio::time::Instant::now();
         if let Some(application) = application.flatten() {
             return application
                 .handle(
@@ -385,6 +387,25 @@ impl DigitalMateGatewayApi {
         if request.uri().path() == "/file-api/upload" {
             return self.upload(request, ingress, scope, principal).await;
         }
+        // H1埋点：/ws 路径构造体验锚点并记 auth 阶段样本。认证耗时埋点
+        // 认证失败不构造（未认证请求不计业务量）；session/quota/download/upload
+        // 在此前已返回。t0 = /ws 请求进入认证流程的时刻。
+        let anchor = ingress.experience_anchor(
+            &format!(
+                "{}@{}",
+                self.config.jiuwen.template, self.config.jiuwen.version
+            ),
+            auth_started,
+            &self.config.tenant,
+            &principal.user_id,
+        );
+        if let Some(anchor) = &anchor {
+            anchor.observe_phase(
+                crate::ingress::experience::Phase::Auth,
+                adx_core::observation::Outcome::Success,
+                auth_done - auth_started,
+            );
+        }
         // Client user_id is only an ignored hint. The authenticated session owns
         // both binding selection and the user identity sent to AgentServer.
         if request.uri().query().is_some_and(|query| {
@@ -412,16 +433,37 @@ impl DigitalMateGatewayApi {
             self.config.jiuwen.request_timeout_seconds,
         )));
         let access = AgentV2Access::new(self.managed.clone());
+        // model_prepare：闭包内部计时——仅确实执行时观测。
+        let anchor_for_init = anchor.clone();
         let initialization = async {
-            let mut parameters = self.auth.model_parameters(&principal).await?;
-            parameters.extend(
-                self.config
-                    .parameters(&principal.user_id)
-                    .map_err(|_| accounts::Error::Invalid)?,
-            );
-            Ok::<_, accounts::Error>(parameters)
+            let started = tokio::time::Instant::now();
+            let result = async {
+                let mut parameters = self.auth.model_parameters(&principal).await?;
+                parameters.extend(
+                    self.config
+                        .parameters(&principal.user_id)
+                        .map_err(|_| accounts::Error::Invalid)?,
+                );
+                Ok::<_, accounts::Error>(parameters)
+            }
+            .await;
+            if let Some(anchor) = anchor_for_init.as_ref() {
+                anchor.observe_phase(
+                    crate::ingress::experience::Phase::ModelPrepare,
+                    match &result {
+                        Ok(_) => adx_core::observation::Outcome::Success,
+                        Err(_) => adx_core::observation::Outcome::Failure,
+                    },
+                    started.elapsed(),
+                );
+            }
+            result
         };
-        let selection = match access
+        // H2：binding = 用户等待环境就绪整段(含创建/恢复/复用)
+        // 定义含"创建绑定"。environment_wait/resume_wait 的真值源在
+        // agent_service 内，接入前不出样本。
+        let binding_started = tokio::time::Instant::now();
+        let selection = access
             .select_with_initializer(
                 context.clone(),
                 scope.clone(),
@@ -431,8 +473,18 @@ impl DigitalMateGatewayApi {
                 },
                 initialization,
             )
-            .await
-        {
+            .await;
+        if let Some(anchor) = &anchor {
+            anchor.observe_phase(
+                crate::ingress::experience::Phase::Binding,
+                match &selection {
+                    Ok(_) => adx_core::observation::Outcome::Success,
+                    Err(_) => adx_core::observation::Outcome::Failure,
+                },
+                binding_started.elapsed(),
+            );
+        }
+        let selection = match selection {
             Ok(value) => value,
             Err(crate::ingress::agent_service::InitializationError::Agent(error)) => {
                 return agent_error(error)
@@ -441,6 +493,15 @@ impl DigitalMateGatewayApi {
                 return auth_error(error)
             }
         };
+        // M2-4：Activator 的启动模式判定回填到锚点（直埋标签 + 事件字段）。
+        let start_mode = selection.start_mode().into();
+        // 环境身份取自已选中的服务（`ServiceSelection` 持有权威值），
+        // 不回查 Environment 状态——事件记录的是本次请求的真实选择。
+        let anchor = anchor.map(|anchor| {
+            anchor
+                .with_start_mode(start_mode)
+                .with_environment(selection.environment_id())
+        });
         let connection = match Connection::connect(&ingress, &access, selection).await {
             Ok(value) => value,
             Err(ConnectionError::Access(ServiceAccessError::Agent(e))) => return agent_error(e),
@@ -450,12 +511,23 @@ impl DigitalMateGatewayApi {
             return auth_error(e);
         }
         let auth = self.auth.clone();
+        // 全流族：101 升级后外层不再包装响应体（server.rs 对带 UPGRADE 头的
+        // 请求插入观察者克隆），改由升级任务在会话结束时记录恰好一次；不在这里
+        // 取出，`full_stream{route_class=jiuwen,transport=ws}` 恒为零。
+        let stream_observer = request.extensions_mut().remove::<StreamObserver>();
         let upgrade = hyper::upgrade::on(&mut request);
         let config = self.config.clone();
         let span = tracing::info_span!("jiuwen_ws", connection_id = %uuid::Uuid::new_v4());
         let task = async move {
             let Ok(Ok(upgraded)) = tokio::time::timeout_at(context.deadline(), upgrade).await
             else {
+                if let Some(observer) = stream_observer {
+                    observer.record(
+                        Transport::Ws,
+                        adx_core::observation::Outcome::Failure,
+                        Some(AbortReason::ProtocolError),
+                    );
+                }
                 return;
             };
             let socket = WebSocketStream::from_raw_socket(
@@ -468,13 +540,29 @@ impl DigitalMateGatewayApi {
             let driver = config.driver();
             let user_id = principal.user_id.clone();
             let guard = accounts::SessionGuard { auth, principal };
-            let _ = frontend::run_authenticated(
+            let result = frontend::run_authenticated(
                 socket,
                 front,
-                |requests, output| connection.run(user_id, driver, requests, output),
+                |requests, output| connection.run(user_id, driver, requests, output, anchor),
                 guard,
             )
             .await;
+            if let Some(observer) = stream_observer {
+                // 正常断链不等于"完成交换"：与 reverse_proxy 的升级路径同口径，
+                // 正常结束记 unknown，拷贝/协议错误记 failure。
+                match result {
+                    Ok(()) => observer.record(
+                        Transport::Ws,
+                        adx_core::observation::Outcome::Unknown,
+                        None,
+                    ),
+                    Err(_) => observer.record(
+                        Transport::Ws,
+                        adx_core::observation::Outcome::Failure,
+                        Some(AbortReason::ProtocolError),
+                    ),
+                }
+            }
         };
         // `Instrument` carries only the tracing span, not the OTel context.
         // Forward the entry request's context so session logs stay correlated.
@@ -621,12 +709,13 @@ impl DigitalMateGatewayApi {
             None => return agent_error(Error::NotFound),
         };
         let user_id = principal.user_id.clone();
+        let action_actor = user_id.clone();
         let guard = accounts::SessionGuard {
             auth: self.auth.clone(),
             principal,
         };
         let upload = Upload {
-            ingress,
+            ingress: ingress.clone(),
             context,
             tenant: scope.tenant,
             environment_id: target.current.environment_id,
@@ -634,10 +723,46 @@ impl DigitalMateGatewayApi {
             user_id,
             agent_type: self.config.jiuwen.agent_type.clone(),
         };
-        tokio::select! {
+        let response = tokio::select! {
             response = upload.respond(request.into_body(), &content_type) => response,
             _ = guard.watch() => error(StatusCode::UNAUTHORIZED, "SESSION_ENDED"),
+        };
+        // 动作事件（M2-4c）：上传结果进入 `adx_business_actions_total`。
+        if let Some(sink) = ingress.observation_sink() {
+            let release = format!(
+                "{}@{}",
+                self.config.jiuwen.template, self.config.jiuwen.version
+            );
+            let template_release =
+                (release.len() <= 96 && release.contains('@')).then_some(release);
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let outcome = if response.status().is_success() {
+                adx_observability::business::Outcome::Success
+            } else {
+                adx_observability::business::Outcome::Failure
+            };
+            sink.emit(adx_observability::business::BusinessObservation {
+                schema_version: adx_observability::business::SCHEMA_VERSION.to_owned(),
+                event_id: event_id.clone(),
+                business_type: adx_observability::business::BusinessType::Jiuwen,
+                event_type: adx_observability::business::EventType::Action,
+                action_kind: Some(adx_observability::business::ActionKind::FileUpload),
+                occurred_at: time::OffsetDateTime::now_utc(),
+                tenant_ref: self.config.tenant.clone(),
+                user_ref: Some(sink.hmac_ref(&self.config.tenant, &action_actor)),
+                session_ref: None,
+                experience_id: event_id,
+                environment_id: None,
+                template_release,
+                start_mode: None,
+                trace_id: None,
+                span_id: None,
+                outcome: Some(outcome),
+                reason_class: None,
+                duration_seconds: None,
+            });
         }
+        response
     }
     async fn download(
         &self,

@@ -68,7 +68,7 @@ impl Activator {
         mut execution: ExecutionSpec,
         volumes: &[VolumeSpec],
         deadline: u64,
-    ) -> Result<EnvironmentObservation> {
+    ) -> Result<(EnvironmentObservation, Option<EnvironmentPhase>)> {
         let deadline_at = Instant::now()
             .checked_add(Duration::from_millis(
                 deadline.saturating_sub(adx_agent_core::unix_time_millis()),
@@ -76,6 +76,8 @@ impl Activator {
             .ok_or_else(|| Error::Invalid("activation deadline is out of range".into()))?;
         let mut fixed: BTreeMap<String, String> = binding.volumes.clone();
         let mut backoff = 50_u64;
+        // 激活前的首个观察（M2-4 启动模式判定）：既有环境给出前态，新建环境为 None。
+        let mut pre_phase: Option<EnvironmentPhase> = None;
         loop {
             if !self.reference_is_active(binding, environment).await? {
                 return Err(Error::Conflict("binding changed during activation".into()));
@@ -104,6 +106,9 @@ impl Activator {
                     .get(&binding.scope.tenant, &environment.environment_id)
                     .await?
                 {
+                    if pre_phase.is_none() {
+                        pre_phase = Some(observed.phase);
+                    }
                     return Ok(CreationStep::Observed(observed));
                 }
                 if attempt.retry_after_unix_ms > adx_agent_core::unix_time_millis() {
@@ -195,7 +200,7 @@ impl Activator {
                 )
             })?;
             match result {
-                Ok(CreationStep::Observed(observed)) => return Ok(observed),
+                Ok(CreationStep::Observed(observed)) => return Ok((observed, pre_phase)),
                 Ok(CreationStep::Deferred(retry_after_unix_ms)) => {
                     return Err(Error::CreationDeferred {
                         retry_after_unix_ms,
@@ -205,6 +210,7 @@ impl Activator {
                     return self
                         .defer_creation(&saved, environment, &attempt, false)
                         .await
+                        .map(|observed| (observed, pre_phase))
                 }
                 Err(EnvironmentError::SchedulingCancelled(failure)) => {
                     tracing::debug!(
@@ -249,7 +255,8 @@ impl Activator {
                     );
                     return self
                         .defer_creation(&saved, environment, &attempt, true)
-                        .await;
+                        .await
+                        .map(|observed| (observed, pre_phase));
                 }
                 Err(EnvironmentError::Unavailable(_) | EnvironmentError::OutcomeUnknown(_)) => {
                     let remaining = deadline_at.saturating_duration_since(Instant::now());
