@@ -1,5 +1,6 @@
 //! Session admission for a configured template reference; transport stays in shared Gateway forwarding.
 use super::entrypoint::{agent_error, auth_error, error};
+use super::pool::{PoolRuntime, PrepareError};
 use crate::ingress::{
     accounts::{BusinessAuth, Principal, SessionGuard},
     agent_service::{AgentV2Access, InitializationError, ServiceAccessError, ServiceSelector},
@@ -23,6 +24,8 @@ pub struct ApplicationWsConfig {
     pub template_ref: String,
     pub backend_path: String,
     pub service_port: u16,
+    #[serde(default)]
+    pub pool: Option<super::pool::DigitalMatePoolConfig>,
 }
 
 fn invalid() -> Error {
@@ -33,6 +36,11 @@ fn invalid() -> Error {
 pub(super) enum Application {
     Orbit,
     DigitalMate,
+}
+
+pub(super) struct ApplicationContext<'a> {
+    pub tenant: &'a str,
+    pub pool: Option<Arc<PoolRuntime>>,
 }
 
 impl Application {
@@ -89,6 +97,9 @@ impl ApplicationWsConfig {
         {
             return Err(invalid());
         }
+        if let Some(pool) = &self.pool {
+            pool.validate()?;
+        }
         Ok(())
     }
 
@@ -107,7 +118,7 @@ impl ApplicationWsConfig {
         managed: Arc<ManagedService>,
         auth: Arc<dyn BusinessAuth>,
         principal: Principal,
-        tenant: &str,
+        application_context: ApplicationContext<'_>,
     ) -> Response<ProxyBody> {
         if request.method() != http::Method::GET {
             return error(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
@@ -121,7 +132,7 @@ impl ApplicationWsConfig {
         } else {
             Application::Orbit
         };
-        let scope = match self.scope(tenant, &principal.user_id, application) {
+        let scope = match self.scope(application_context.tenant, &principal.user_id, application) {
             Ok(value) => value,
             Err(e) => return agent_error(e),
         };
@@ -145,25 +156,39 @@ impl ApplicationWsConfig {
             let guard = guard.clone();
             async move { guard.watch().await }
         });
-        let access = AgentV2Access::new(managed);
+        let access = AgentV2Access::new(managed.clone());
         let admission = async {
+            if let (Application::DigitalMate, Some(runtime)) =
+                (application, application_context.pool)
+            {
+                match runtime
+                    .prepare(&context, &scope, &principal, &managed)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(PrepareError::Agent(error)) => return Err(agent_error(error)),
+                    Err(PrepareError::Account(error)) => return Err(auth_error(error)),
+                }
+            }
             let selection = access
                 .select_with_initializer(
                     context,
-                    scope,
+                    scope.clone(),
                     ServiceSelector {
                         protocol: Protocol::Ws,
                         port: Some(self.service_port),
                     },
                     async {
-                        let workspace = super::entrypoint::workspace_parameters(
-                            tenant,
-                            &self.template,
-                            &principal.user_id,
-                        )
-                        .map_err(|_| crate::ingress::accounts::Error::Invalid)?;
-                        let mut parameters = auth.model_parameters(&principal).await?;
-                        parameters.extend(workspace);
+                        let mut parameters = auth.model_parameters_for(&principal, &scope).await?;
+                        if !parameters.contains_key("workspace") {
+                            let workspace = super::entrypoint::workspace_parameters(
+                                application_context.tenant,
+                                &self.template,
+                                &principal.user_id,
+                            )
+                            .map_err(|_| crate::ingress::accounts::Error::Invalid)?;
+                            parameters.extend(workspace);
+                        }
                         Ok(parameters)
                     },
                 )
@@ -248,6 +273,7 @@ mod tests {
             template_ref: "1".into(),
             backend_path: "/ws".into(),
             service_port: 18092,
+            pool: None,
         }
     }
 

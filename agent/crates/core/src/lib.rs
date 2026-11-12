@@ -11,6 +11,7 @@ pub mod limits;
 pub mod mounts;
 pub mod network;
 pub mod parameters;
+pub mod pool;
 pub mod probes;
 pub mod target;
 pub mod transport;

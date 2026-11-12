@@ -26,6 +26,27 @@ pub trait AgcIdentityProvider: Send + Sync {
 pub trait ModelProvider: Send + Sync {
     async fn ensure(&self, user_id: &str, key: &str, key_alias: &str) -> Result<()>;
     async fn quota(&self, user_id: &str, key: &str) -> Result<QuotaResponse>;
+    /// Confirm a reserved pool key can be delivered later: it is either absent or still
+    /// held by its pool owner. Absent keys stay absent until the claim.
+    async fn ensure_pool(&self, _owner: &str, _key: &str, _key_alias: &str) -> Result<()> {
+        Err(Error::Unavailable)
+    }
+    /// Move a verified pool key to the user without touching spend or budgets.
+    async fn transfer_pool(
+        &self,
+        _from_owner: &str,
+        _key: &str,
+        _to_owner: &str,
+        _key_alias: &str,
+    ) -> Result<()> {
+        Err(Error::Unavailable)
+    }
+    /// Release a retired key from a slot that never received a Grant.
+    /// Callers must suppress this operation for every claimed slot, since LiteLLM
+    /// does not provide an atomic owner-conditional delete.
+    async fn release_pool(&self, _owner: &str, _key: &str) -> Result<()> {
+        Err(Error::Unavailable)
+    }
 }
 fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -517,7 +538,7 @@ impl LiteLlm {
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.config.management_url.trim_end_matches('/'))
     }
-    async fn key_info(&self, user_id: &str, key: &str) -> Result<Option<Value>> {
+    async fn raw_key_info(&self, key: &str) -> Result<Option<Value>> {
         // Query by hash to avoid logging the usable key in provider access URLs.
         let response = self
             .client
@@ -534,11 +555,16 @@ impl LiteLlm {
             return Err(Error::Unavailable);
         }
         let value = json_response(response).await?;
-        let info = &value["info"];
+        Ok(Some(value["info"].clone()))
+    }
+    async fn key_info(&self, user_id: &str, key: &str) -> Result<Option<Value>> {
+        let Some(info) = self.raw_key_info(key).await? else {
+            return Ok(None);
+        };
         if info["user_id"].as_str() != Some(user_id) || info["blocked"].as_bool() == Some(true) {
             return Err(Error::Forbidden);
         }
-        Ok(Some(info.clone()))
+        Ok(Some(info))
     }
     async fn user_info(&self, user_id: &str) -> Result<Option<Value>> {
         let response = self
@@ -695,6 +721,101 @@ impl ModelProvider for LiteLlm {
             .ok_or(Error::Unavailable)?;
         self.quota_from_info(&info)
     }
+
+    async fn ensure_pool(&self, owner: &str, key: &str, _key_alias: &str) -> Result<()> {
+        // LiteLLM caches key objects per worker and `/key/update` only invalidates the
+        // serving worker, so a materialized blocked key can keep failing after transfer.
+        // The key is first created by the claim, directly for the user.
+        match self.raw_key_info(key).await? {
+            None => Ok(()),
+            Some(info)
+                if info["user_id"].as_str() == Some(owner)
+                    && info["blocked"].as_bool() == Some(true) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(Error::Forbidden),
+        }
+    }
+
+    async fn transfer_pool(
+        &self,
+        from_owner: &str,
+        key: &str,
+        to_owner: &str,
+        key_alias: &str,
+    ) -> Result<()> {
+        let Some(info) = self.raw_key_info(key).await? else {
+            return self.ensure(to_owner, key, key_alias).await;
+        };
+        let current = info["user_id"].as_str().ok_or(Error::Unavailable)?;
+        if current != from_owner && current != to_owner {
+            return Err(Error::Forbidden);
+        }
+        if current == from_owner {
+            self.user(to_owner).await?;
+        }
+        let mut update = json!({
+            "key": digest(key),
+            "user_id": to_owner,
+            "key_alias": key_alias,
+            "blocked": false
+        });
+        if !has_proxy_access(&info) {
+            update["models"] = json!(["all-proxy-models"]);
+        }
+        let response = self
+            .client
+            .post(self.url("/key/update"))
+            .bearer_auth(&self.admin_key)
+            .json(&update)
+            .send()
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(Error::Unavailable);
+        }
+        match self.raw_key_info(key).await? {
+            Some(info)
+                if info["user_id"].as_str() == Some(to_owner)
+                    && info["blocked"].as_bool() != Some(true)
+                    && has_proxy_access(&info)
+                    && info["key_alias"].as_str() == Some(key_alias) =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::Unavailable),
+        }
+    }
+
+    async fn release_pool(&self, owner: &str, key: &str) -> Result<()> {
+        let Some(info) = self.raw_key_info(key).await? else {
+            return Ok(());
+        };
+        if info["user_id"].as_str() != Some(owner) {
+            // Delivered keys belong to the user and must not be deleted.
+            return Ok(());
+        }
+        let response = self
+            .client
+            .post(self.url("/key/delete"))
+            .bearer_auth(&self.admin_key)
+            .json(&json!({"keys": [key]}))
+            .send()
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
+            return Err(Error::Unavailable);
+        }
+        let _ = self
+            .client
+            .post(self.url("/user/delete"))
+            .bearer_auth(&self.admin_key)
+            .json(&json!({"user_ids": [owner]}))
+            .send()
+            .await;
+        Ok(())
+    }
 }
 
 fn has_proxy_access(info: &Value) -> bool {
@@ -744,12 +865,13 @@ mod tests {
     use axum::{
         extract::{Query, State},
         http::HeaderMap,
+        response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
     use std::sync::{
         atomic::{AtomicI64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     fn agc_token(project_id: &str, uid: &str, provider: i64) -> String {
@@ -996,5 +1118,302 @@ mod tests {
             );
             assert!(verify_claims(&parts.join("."), &verify, alg, "app").is_err());
         }
+    }
+
+    #[derive(Default)]
+    struct PoolMock {
+        keys: Mutex<std::collections::BTreeMap<String, Value>>,
+        users: Mutex<std::collections::BTreeSet<String>>,
+        updates: Mutex<Vec<Value>>,
+        deletes: Mutex<Vec<Value>>,
+        generates: Mutex<Vec<Value>>,
+    }
+
+    async fn pool_key_info(
+        State(state): State<Arc<PoolMock>>,
+        Query(query): Query<std::collections::HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let keys = state.keys.lock().unwrap();
+        match query.get("key").and_then(|digest| keys.get(digest)) {
+            Some(info) => Json(json!({"info": info})).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn pool_key_generate(
+        State(state): State<Arc<PoolMock>>,
+        Json(body): Json<Value>,
+    ) -> StatusCode {
+        state.generates.lock().unwrap().push(body.clone());
+        let key = body["key"].as_str().unwrap();
+        state.keys.lock().unwrap().insert(
+            digest(key),
+            json!({
+                "user_id": body["user_id"],
+                "key_alias": body["key_alias"],
+                "blocked": body["blocked"],
+                "models": body["models"],
+                "spend": 0.0,
+                "max_budget": body["max_budget"]
+            }),
+        );
+        StatusCode::OK
+    }
+
+    async fn pool_key_update(
+        State(state): State<Arc<PoolMock>>,
+        Json(body): Json<Value>,
+    ) -> StatusCode {
+        state.updates.lock().unwrap().push(body.clone());
+        let key = body["key"].as_str().unwrap();
+        let mut keys = state.keys.lock().unwrap();
+        let Some(info) = keys.get_mut(key) else {
+            return StatusCode::NOT_FOUND;
+        };
+        for field in ["user_id", "key_alias", "blocked", "models"] {
+            if let Some(value) = body.get(field) {
+                info[field] = value.clone();
+            }
+        }
+        StatusCode::OK
+    }
+
+    async fn pool_key_delete(
+        State(state): State<Arc<PoolMock>>,
+        Json(body): Json<Value>,
+    ) -> StatusCode {
+        state.deletes.lock().unwrap().push(body.clone());
+        let mut keys = state.keys.lock().unwrap();
+        for key in body["keys"].as_array().into_iter().flatten() {
+            if let Some(key) = key.as_str() {
+                keys.remove(&digest(key));
+            }
+        }
+        StatusCode::OK
+    }
+    async fn pool_user_info(
+        State(state): State<Arc<PoolMock>>,
+        Query(query): Query<std::collections::HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let users = state.users.lock().unwrap();
+        match query.get("user_id").filter(|user| users.contains(*user)) {
+            Some(user) => Json(json!({"user_id": user})).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+    async fn pool_user_new(
+        State(state): State<Arc<PoolMock>>,
+        Json(body): Json<Value>,
+    ) -> StatusCode {
+        state
+            .users
+            .lock()
+            .unwrap()
+            .insert(body["user_id"].as_str().unwrap().into());
+        StatusCode::OK
+    }
+    async fn pool_user_delete(Json(_body): Json<Value>) -> StatusCode {
+        StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn pool_key_is_blocked_then_transferred_without_touching_spend() {
+        let state = Arc::new(PoolMock::default());
+        let app = Router::new()
+            .route("/key/info", get(pool_key_info))
+            .route("/key/generate", post(pool_key_generate))
+            .route("/key/update", post(pool_key_update))
+            .route("/key/delete", post(pool_key_delete))
+            .route("/user/info", get(pool_user_info))
+            .route("/user/new", post(pool_user_new))
+            .route("/user/delete", post(pool_user_delete))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = LiteLlm::with_key(
+            serde_json::from_value(json!({
+                "management_url": origin,
+                "api_base": format!("{origin}/v1"),
+                "admin_key_env": "UNUSED",
+                "max_budget": 15.0,
+                "budget_duration": "1d",
+                "rpm_limit": 30,
+                "tpm_limit": 30000,
+                "allow_plaintext": true
+            }))
+            .unwrap(),
+            "admin".into(),
+        )
+        .unwrap();
+        provider
+            .ensure_pool("pool:s-1", "sk-pool", "pool-s-1")
+            .await
+            .unwrap();
+        state.keys.lock().unwrap().insert(
+            digest("sk-pool"),
+            json!({
+                "user_id": "pool:s-1",
+                "key_alias": "pool-s-1",
+                "blocked": true,
+                "models": ["all-proxy-models"],
+                "spend": 0.0
+            }),
+        );
+        provider
+            .ensure_pool("pool:s-1", "sk-pool", "pool-s-1")
+            .await
+            .unwrap();
+        assert!(state.generates.lock().unwrap().is_empty());
+        // A transfer must not reset spend or budgets; only ownership, alias and blocking change.
+        provider
+            .transfer_pool("pool:s-1", "sk-pool", "adx-user", "huawei-alice")
+            .await
+            .unwrap();
+        state
+            .keys
+            .lock()
+            .unwrap()
+            .get_mut(&digest("sk-pool"))
+            .unwrap()["spend"] = json!(3.0);
+        let updates = state.updates.lock().unwrap().clone();
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].get("spend").is_none());
+        assert!(updates[0].get("max_budget").is_none());
+        assert_eq!(updates[0]["user_id"], "adx-user");
+        assert_eq!(updates[0]["blocked"], false);
+        // Repeating the transfer is a no-op for spend and remains accepted.
+        provider
+            .transfer_pool("pool:s-1", "sk-pool", "adx-user", "huawei-alice")
+            .await
+            .unwrap();
+        assert_eq!(state.updates.lock().unwrap().len(), 2);
+        assert_eq!(state.keys.lock().unwrap()[&digest("sk-pool")]["spend"], 3.0);
+        // A key already delivered to the user is never deleted by pool cleanup.
+        provider.release_pool("pool:s-1", "sk-pool").await.unwrap();
+        assert!(state.deletes.lock().unwrap().is_empty());
+        state.keys.lock().unwrap().remove(&digest("sk-pool"));
+        provider
+            .transfer_pool("pool:s-1", "sk-pool", "adx-user", "huawei-alice")
+            .await
+            .unwrap();
+        assert_eq!(state.generates.lock().unwrap().len(), 1);
+        assert_eq!(state.generates.lock().unwrap()[0]["key"], "sk-pool");
+        assert_eq!(
+            state.keys.lock().unwrap()[&digest("sk-pool")]["user_id"],
+            "adx-user"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pool_cleanup_deletes_only_a_key_still_owned_by_the_pool() {
+        let state = Arc::new(PoolMock::default());
+        let app = Router::new()
+            .route("/key/info", get(pool_key_info))
+            .route("/key/generate", post(pool_key_generate))
+            .route("/key/update", post(pool_key_update))
+            .route("/key/delete", post(pool_key_delete))
+            .route("/user/info", get(pool_user_info))
+            .route("/user/new", post(pool_user_new))
+            .route("/user/delete", post(pool_user_delete))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = LiteLlm::with_key(
+            serde_json::from_value(json!({
+                "management_url": origin,
+                "api_base": format!("{origin}/v1"),
+                "admin_key_env": "UNUSED",
+                "max_budget": 15.0,
+                "budget_duration": "1d",
+                "rpm_limit": 30,
+                "tpm_limit": 30000,
+                "allow_plaintext": true
+            }))
+            .unwrap(),
+            "admin".into(),
+        )
+        .unwrap();
+        provider
+            .ensure_pool("pool:s-2", "sk-unclaimed", "pool-s-2")
+            .await
+            .unwrap();
+        state.keys.lock().unwrap().insert(
+            digest("sk-unclaimed"),
+            json!({"user_id": "pool:s-2", "blocked": true}),
+        );
+        provider
+            .release_pool("pool:s-2", "sk-unclaimed")
+            .await
+            .unwrap();
+        assert_eq!(state.deletes.lock().unwrap().len(), 1);
+        assert_eq!(state.deletes.lock().unwrap()[0]["keys"][0], "sk-unclaimed");
+        server.abort();
+    }
+
+    // D1 regression: LiteLLM caches a blocked key per worker for up to
+    // `user_api_key_cache_ttl`, and `/key/update` only clears the cache of the worker
+    // that served it. A warm instance probing the model before its claim must therefore
+    // never see a materialized blocked key; the claim creates it directly for the user.
+    #[tokio::test]
+    async fn unclaimed_pool_key_is_never_materialized_before_the_claim() {
+        let state = Arc::new(PoolMock::default());
+        let app = Router::new()
+            .route("/key/info", get(pool_key_info))
+            .route("/key/generate", post(pool_key_generate))
+            .route("/key/update", post(pool_key_update))
+            .route("/key/delete", post(pool_key_delete))
+            .route("/user/info", get(pool_user_info))
+            .route("/user/new", post(pool_user_new))
+            .route("/user/delete", post(pool_user_delete))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = LiteLlm::with_key(
+            serde_json::from_value(json!({
+                "management_url": origin,
+                "api_base": format!("{origin}/v1"),
+                "admin_key_env": "UNUSED",
+                "max_budget": 15.0,
+                "budget_duration": "1d",
+                "rpm_limit": 30,
+                "tpm_limit": 30000,
+                "allow_plaintext": true
+            }))
+            .unwrap(),
+            "admin".into(),
+        )
+        .unwrap();
+        provider
+            .ensure_pool("pool:s-3", "sk-fresh", "pool-s-3")
+            .await
+            .unwrap();
+        provider
+            .ensure_pool("pool:s-3", "sk-fresh", "pool-s-3")
+            .await
+            .unwrap();
+        assert!(state.generates.lock().unwrap().is_empty());
+        assert!(state.keys.lock().unwrap().is_empty());
+        provider
+            .transfer_pool("pool:s-3", "sk-fresh", "adx-user", "huawei-alice")
+            .await
+            .unwrap();
+        let generated = state.generates.lock().unwrap().clone();
+        assert_eq!(generated.len(), 1);
+        assert_eq!(generated[0]["user_id"], "adx-user");
+        assert_ne!(generated[0]["blocked"], true);
+        assert!(state.updates.lock().unwrap().is_empty());
+        state.keys.lock().unwrap().insert(
+            digest("sk-taken"),
+            json!({"user_id": "adx-other", "blocked": false, "models": ["all-proxy-models"]}),
+        );
+        assert!(provider
+            .ensure_pool("pool:s-4", "sk-taken", "pool-s-4")
+            .await
+            .is_err());
+        server.abort();
     }
 }

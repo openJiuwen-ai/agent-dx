@@ -1,4 +1,5 @@
 use adx_activator::{
+    pool::{PoolReconcileSettings, PoolReconciler},
     reconciliation::{ReconcileSettings, Reconciliation},
     registration::RegistrationConfig,
     server,
@@ -23,6 +24,8 @@ struct Settings {
     request_timeout_seconds: u64,
     #[serde(default)]
     binding_cache: CacheSettings,
+    #[serde(default)]
+    pool_reconcile: PoolReconcileSettings,
     registration: Option<RegistrationConfig>,
 }
 #[tokio::main]
@@ -71,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeout,
     )?;
     let listener = tokio::net::TcpListener::bind(settings.listen).await?;
+    let pool_reconciler = PoolReconciler::start(activator.clone(), settings.pool_reconcile).await?;
     let reconciliation = match settings.registration {
         Some(config) => Some(
             Reconciliation::start(
@@ -104,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(reconciliation) = reconciliation {
                 if let Err(error) = reconciliation.shutdown().await { tracing::warn!(%error, "Activator reconciliation shutdown failed; lease will expire"); }
             }
+            pool_reconciler.shutdown().await;
         })
         .await?;
     Ok(())

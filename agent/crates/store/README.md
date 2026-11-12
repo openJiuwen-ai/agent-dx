@@ -1,6 +1,9 @@
 # Agent 产品状态存储
 
-`AgentState` 保存不可变 Template、AliasConfig 和 AgentBinding 元数据；`Repository` 提供原子条件持久化。生产使用 Redis，`test-memory` 仅供显式启用的测试，不作为故障降级存储。
+`AgentState` 保存不可变 Template、AliasConfig、AgentBinding 以及预热池 `pool`/`pool_slot`/`pool_claim` 记录；`Repository` 提供原子条件持久化。池 Key 原文与摘要随槽位在同一事务写入，领取终态由 `claim_id` CAS 决定。生产使用 Redis，`test-memory` 仅供显式启用的测试，不作为故障降级存储。
+
+池库存变更共同推进 pool revision，reserve 在库存扫描前读取并在提交时检查该 revision。
+领取记录按 `(tenant,claim_id)` 全局唯一，原池作为索引维度；工作区占位在槽位交付后保留。
 
 AgentState 为不可变模板提供最多 1024 条 FIFO 本地缓存，键包括 tenant/name/version；克隆 AgentState 共享该缓存，同键在途加载合并。不存在和错误结果不缓存，模板发布仍执行原权威条件写。AgentBinding 查询始终访问 Repository，不使用模板缓存作为存储故障降级；Activator 自身可缓存已验证的成功激活绑定，见 [Activator](../../activator/README.md#激活缓存)。
 

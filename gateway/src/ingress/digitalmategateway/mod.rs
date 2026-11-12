@@ -8,6 +8,7 @@ pub mod download_token;
 pub mod driver;
 pub mod entrypoint;
 pub mod frontend;
+pub mod pool;
 pub mod protocol;
 pub mod response;
 pub mod session;

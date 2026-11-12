@@ -3,6 +3,7 @@ use crate::discovery::{validate_members, DiscoveryConfig};
 use crate::request::RequestContext;
 use crate::{Error, Result};
 use adx_agent_core::discovery::{ranked_endpoints, ActivatorEndpoint};
+use adx_agent_core::pool::*;
 use adx_agent_core::{activator::*, transport, AgentBinding, Scope, TemplateVersion};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
@@ -17,6 +18,13 @@ use std::{
 /// Product operations shared by the independent HTTP client and embedded Activator.
 #[async_trait]
 pub trait Control: Send + Sync {
+    async fn pool_claim_lookup(
+        &self,
+        _ctx: &RequestContext,
+        _request: &ClaimLookupRequest,
+    ) -> Result<PoolClaim> {
+        Err(Error::Unsupported("pool claim lookup unavailable".into()))
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,
@@ -80,6 +88,90 @@ pub trait Control: Send + Sync {
         }
         self.activate_with_cache(ctx, scope, expected_generation, bypass_cache)
             .await
+    }
+    async fn pool_put(
+        &self,
+        _ctx: &RequestContext,
+        _request: &PoolPutRequest,
+    ) -> Result<PoolSnapshot> {
+        Err(Error::Unsupported("pool API unavailable".into()))
+    }
+    async fn pool_get(
+        &self,
+        _ctx: &RequestContext,
+        _request: &PoolRequest,
+    ) -> Result<PoolSnapshot> {
+        Err(Error::Unsupported("pool API unavailable".into()))
+    }
+    async fn pool_status(
+        &self,
+        _ctx: &RequestContext,
+        _request: &PoolRequest,
+    ) -> Result<PoolStatus> {
+        Err(Error::Unsupported("pool API unavailable".into()))
+    }
+    async fn pool_drain(
+        &self,
+        _ctx: &RequestContext,
+        _request: &PoolRequest,
+    ) -> Result<PoolSnapshot> {
+        Err(Error::Unsupported("pool API unavailable".into()))
+    }
+    async fn pool_reserve(
+        &self,
+        _ctx: &RequestContext,
+        _request: &ReserveRequest,
+    ) -> Result<Option<ReservedSlot>> {
+        Err(Error::Unsupported("pool API unavailable".into()))
+    }
+    async fn pool_pending_keys(
+        &self,
+        _ctx: &RequestContext,
+        _request: &PendingKeysRequest,
+    ) -> Result<PendingKeyPage> {
+        Err(Error::Unsupported("pool API unavailable".into()))
+    }
+    async fn pool_key_confirmed(
+        &self,
+        _ctx: &RequestContext,
+        _request: &KeyConfirmedRequest,
+    ) -> Result<SlotView> {
+        Err(Error::Unsupported("pool API unavailable".into()))
+    }
+    async fn pool_claim(
+        &self,
+        _ctx: &RequestContext,
+        _request: &ClaimRequest,
+    ) -> Result<ClaimOutcome> {
+        Err(Error::Unsupported("pool API unavailable".into()))
+    }
+    async fn pool_commit(
+        &self,
+        _ctx: &RequestContext,
+        _request: &CommitRequest,
+    ) -> Result<ClaimOutcome> {
+        Err(Error::Unsupported("pool API unavailable".into()))
+    }
+    async fn pool_abort(
+        &self,
+        _ctx: &RequestContext,
+        _request: &AbortRequest,
+    ) -> Result<ClaimOutcome> {
+        Err(Error::Unsupported("pool API unavailable".into()))
+    }
+    async fn pool_retired(
+        &self,
+        _ctx: &RequestContext,
+        _request: &RetiredRequest,
+    ) -> Result<RetiredPage> {
+        Err(Error::Unsupported("pool API unavailable".into()))
+    }
+    async fn pool_retired_ack(
+        &self,
+        _ctx: &RequestContext,
+        _request: &AckRetiredRequest,
+    ) -> Result<()> {
+        Err(Error::Unsupported("pool API unavailable".into()))
     }
 }
 
@@ -177,14 +269,14 @@ impl ActivatorClient {
             next: AtomicUsize::new(0),
         })
     }
-    async fn request<T: Serialize + Sync, R: DeserializeOwned>(
+    async fn exchange<T: Serialize + Sync>(
         &self,
         ctx: &RequestContext,
         path: &str,
         body: &T,
         writes: bool,
         scope: Option<&Scope>,
-    ) -> Result<R> {
+    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
         let endpoints = self
             .endpoints
             .read()
@@ -253,19 +345,159 @@ impl ActivatorClient {
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            if !status.is_success() {
-                return Err(serde_json::from_slice(&bytes)
-                    .unwrap_or_else(|_| uncertain(writes, "invalid Activator error response")));
-            }
-            return serde_json::from_slice(&bytes)
-                .map_err(|_| uncertain(writes, "invalid Activator response"));
+            return Ok((status, bytes));
         }
         Err(Error::Unavailable("Activator unavailable".into()))
+    }
+
+    async fn request<T: Serialize + Sync, R: DeserializeOwned>(
+        &self,
+        ctx: &RequestContext,
+        path: &str,
+        body: &T,
+        writes: bool,
+        scope: Option<&Scope>,
+    ) -> Result<R> {
+        let (status, bytes) = self.exchange(ctx, path, body, writes, scope).await?;
+        if !status.is_success() {
+            return Err(serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| uncertain(writes, "invalid Activator error response")));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| uncertain(writes, "invalid Activator response"))
+    }
+
+    async fn request_optional<T: Serialize + Sync, R: DeserializeOwned>(
+        &self,
+        ctx: &RequestContext,
+        path: &str,
+        body: &T,
+        writes: bool,
+        scope: Option<&Scope>,
+    ) -> Result<Option<R>> {
+        let (status, bytes) = self.exchange(ctx, path, body, writes, scope).await?;
+        if status == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| uncertain(writes, "invalid Activator error response")));
+        }
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| uncertain(writes, "invalid Activator response"))
+    }
+
+    async fn request_claim<T: Serialize + Sync>(
+        &self,
+        ctx: &RequestContext,
+        path: &str,
+        body: &T,
+    ) -> Result<ClaimOutcome> {
+        let (status, bytes) = self.exchange(ctx, path, body, true, None).await?;
+        if status == reqwest::StatusCode::CONFLICT {
+            return serde_json::from_slice(&bytes)
+                .map_err(|_| Error::Conflict("invalid claim terminal response".into()));
+        }
+        if !status.is_success() {
+            return Err(serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| uncertain(true, "invalid Activator error response")));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| uncertain(true, "invalid Activator response"))
     }
 }
 
 #[async_trait]
 impl Control for ActivatorClient {
+    async fn pool_claim_lookup(
+        &self,
+        ctx: &RequestContext,
+        request: &ClaimLookupRequest,
+    ) -> Result<PoolClaim> {
+        self.request(ctx, "pools/claims/get", request, false, None)
+            .await
+    }
+    async fn pool_put(
+        &self,
+        ctx: &RequestContext,
+        request: &PoolPutRequest,
+    ) -> Result<PoolSnapshot> {
+        self.request(ctx, "pools/put", request, true, None).await
+    }
+    async fn pool_get(&self, ctx: &RequestContext, request: &PoolRequest) -> Result<PoolSnapshot> {
+        self.request(ctx, "pools/get", request, false, None).await
+    }
+    async fn pool_status(&self, ctx: &RequestContext, request: &PoolRequest) -> Result<PoolStatus> {
+        self.request(ctx, "pools/status", request, false, None)
+            .await
+    }
+    async fn pool_drain(
+        &self,
+        ctx: &RequestContext,
+        request: &PoolRequest,
+    ) -> Result<PoolSnapshot> {
+        self.request(ctx, "pools/drain", request, true, None).await
+    }
+    async fn pool_reserve(
+        &self,
+        ctx: &RequestContext,
+        request: &ReserveRequest,
+    ) -> Result<Option<ReservedSlot>> {
+        self.request_optional(ctx, "pools/reserve", request, true, None)
+            .await
+    }
+    async fn pool_pending_keys(
+        &self,
+        ctx: &RequestContext,
+        request: &PendingKeysRequest,
+    ) -> Result<PendingKeyPage> {
+        self.request(ctx, "pools/pending_keys", request, false, None)
+            .await
+    }
+    async fn pool_key_confirmed(
+        &self,
+        ctx: &RequestContext,
+        request: &KeyConfirmedRequest,
+    ) -> Result<SlotView> {
+        self.request(ctx, "pools/key_confirmed", request, true, None)
+            .await
+    }
+    async fn pool_claim(
+        &self,
+        ctx: &RequestContext,
+        request: &ClaimRequest,
+    ) -> Result<ClaimOutcome> {
+        self.request_claim(ctx, "pools/claim", request).await
+    }
+    async fn pool_commit(
+        &self,
+        ctx: &RequestContext,
+        request: &CommitRequest,
+    ) -> Result<ClaimOutcome> {
+        self.request_claim(ctx, "pools/commit", request).await
+    }
+    async fn pool_abort(
+        &self,
+        ctx: &RequestContext,
+        request: &AbortRequest,
+    ) -> Result<ClaimOutcome> {
+        self.request(ctx, "pools/abort", request, true, None).await
+    }
+    async fn pool_retired(
+        &self,
+        ctx: &RequestContext,
+        request: &RetiredRequest,
+    ) -> Result<RetiredPage> {
+        self.request(ctx, "pools/retired", request, false, None)
+            .await
+    }
+    async fn pool_retired_ack(
+        &self,
+        ctx: &RequestContext,
+        request: &AckRetiredRequest,
+    ) -> Result<()> {
+        self.request(ctx, "pools/retired/ack", request, true, None)
+            .await
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,

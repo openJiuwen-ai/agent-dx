@@ -69,9 +69,11 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures-util",
+ "hex",
  "redis",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "uuid",
 ]

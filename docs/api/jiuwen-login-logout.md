@@ -163,7 +163,7 @@ curl -i 'https://<gateway-host>/api/v1/auth/quota' \
 
 接口先验证业务会话，再查询该用户的 LiteLLM key 信息。如果用户尚无 key，首次查询会创建并保存该用户的 key，然后读取额度；**查询本身不扣除额度，也不创建 Sandbox**。已有 key 的预算规则不会因部署配置改动而自动重置。准备凭据时会将该用户 key 的模型权限更新为 `all-proxy-models`，覆盖 LiteLLM 当前及后续新增模型；Account Kit 用户的 `key_alias` 为 `huawei-<华为昵称>-<ADX用户ID前8位>`，没有可用昵称时为 `huawei-<ADX用户ID前8位>`；AGC 用户当前不导入昵称，别名为 `agc-<ADX用户ID前8位>`。昵称只保留字母、数字、中文等 Unicode 字母数字以及空格、下划线和连字符，最长 128 字符。更新只改变模型权限和显示别名，保留 key、预算、消费记录和限流。模板声明决定 Jiuwen 展示的模型列表。旧用户需再次完成华为登录才能取得此前未保存的昵称，之后查询额度或准备新绑定时同步别名；旧业务 token 也会读取账户最新昵称。暖沙箱调用不会触发别名同步。
 
-账号配置、Principal、用户表、会话表和模型凭据表均不携带 tenant。DigitalMateGateway 配置顶层的固定 tenant 用于 Agent Scope、Binding、workspace、LiteLLM owner 及模型 Key 加密上下文的稳定派生，必须保持原值。schema_version 保持 1；运行时 SQL 不检测旧列、不执行 DDL，也不按版本切换。全新环境使用 [schema.sql](../../gateway/src/ingress/accounts/schema.sql)。Key 显示名称不会自动改变 LiteLLM 原生限流错误；客户端错误使用别名需要另外配置 LiteLLM 错误回调。
+账号配置、Principal、用户表、会话表和模型凭据表均不携带 tenant。DigitalMateGateway 配置顶层的固定 tenant 用于 Agent Scope、Binding、workspace、LiteLLM owner 及模型 Key 加密上下文的稳定派生，必须保持原值。schema_version 为 2，新增按 `(tenant,template,user_id)` 隔离的 `workspace_assignments` 表，以持久保存 DigitalMate 领取的池工作区；运行时 SQL 不检测旧列、不执行 DDL，也不按版本切换。全新环境使用 [schema.sql](../../gateway/src/ingress/accounts/schema.sql)。Key 显示名称不会自动改变 LiteLLM 原生限流错误；客户端错误使用别名需要另外配置 LiteLLM 错误回调。
 
 ## 透明 WebSocket
 

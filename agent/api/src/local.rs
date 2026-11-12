@@ -5,6 +5,7 @@ use adx_activator::Activator;
 use adx_agent_core::{
     activator::{BindingList, BindingPage, Target},
     environment::Environment,
+    pool::*,
     AgentBinding, Scope, TemplateVersion,
 };
 use adx_agent_store::{AgentState, RedisRepository};
@@ -14,6 +15,7 @@ use std::{sync::Arc, time::Duration};
 pub struct LocalControl {
     activator: Arc<Activator>,
     _reconciliation: Option<adx_activator::reconciliation::Reconciliation>,
+    _pool_reconciler: Option<adx_activator::pool::PoolReconciler>,
 }
 
 impl LocalControl {
@@ -23,16 +25,27 @@ impl LocalControl {
         environment: Arc<dyn Environment>,
     ) -> Result<Self> {
         let store = RedisRepository::connect(redis_url, namespace, Duration::from_secs(3)).await?;
-        Ok(Self::new(Arc::new(Activator::new(
+        let activator = Arc::new(Activator::new(
             AgentState::new(Arc::new(store)),
             environment,
-        ))))
+        ));
+        let pool = adx_activator::pool::PoolReconciler::start(
+            activator.clone(),
+            adx_activator::pool::PoolReconcileSettings::default(),
+        )
+        .await?;
+        Ok(Self {
+            activator,
+            _reconciliation: None,
+            _pool_reconciler: Some(pool),
+        })
     }
 
     pub fn new(activator: Arc<Activator>) -> Self {
         Self {
             activator,
             _reconciliation: None,
+            _pool_reconciler: None,
         }
     }
     pub async fn connect_reconciled(
@@ -58,15 +71,118 @@ impl LocalControl {
             adx_activator::reconciliation::ReconcileSettings::default(),
         )
         .await?;
+        let pool = adx_activator::pool::PoolReconciler::start(
+            activator.clone(),
+            adx_activator::pool::PoolReconcileSettings::default(),
+        )
+        .await?;
         Ok(Self {
             activator,
             _reconciliation: Some(reconciliation),
+            _pool_reconciler: Some(pool),
         })
     }
 }
 
 #[async_trait]
 impl Control for LocalControl {
+    async fn pool_claim_lookup(
+        &self,
+        ctx: &RequestContext,
+        request: &ClaimLookupRequest,
+    ) -> Result<PoolClaim> {
+        ctx.run(self.activator.lookup_pool_claim(request)).await
+    }
+    async fn pool_put(
+        &self,
+        ctx: &RequestContext,
+        request: &PoolPutRequest,
+    ) -> Result<PoolSnapshot> {
+        ctx.start_write();
+        ctx.run(self.activator.put_pool(request)).await
+    }
+    async fn pool_get(&self, ctx: &RequestContext, request: &PoolRequest) -> Result<PoolSnapshot> {
+        ctx.run(self.activator.pool(&request.tenant, &request.pool_id))
+            .await
+    }
+    async fn pool_status(&self, ctx: &RequestContext, request: &PoolRequest) -> Result<PoolStatus> {
+        ctx.run(
+            self.activator
+                .pool_status(&request.tenant, &request.pool_id),
+        )
+        .await
+    }
+    async fn pool_drain(
+        &self,
+        ctx: &RequestContext,
+        request: &PoolRequest,
+    ) -> Result<PoolSnapshot> {
+        ctx.start_write();
+        ctx.run(self.activator.drain_pool(&request.tenant, &request.pool_id))
+            .await
+    }
+    async fn pool_reserve(
+        &self,
+        ctx: &RequestContext,
+        request: &ReserveRequest,
+    ) -> Result<Option<ReservedSlot>> {
+        ctx.start_write();
+        ctx.run(self.activator.reserve_pool_slot(request)).await
+    }
+    async fn pool_pending_keys(
+        &self,
+        ctx: &RequestContext,
+        request: &PendingKeysRequest,
+    ) -> Result<PendingKeyPage> {
+        ctx.run(self.activator.pending_pool_keys(request)).await
+    }
+    async fn pool_key_confirmed(
+        &self,
+        ctx: &RequestContext,
+        request: &KeyConfirmedRequest,
+    ) -> Result<SlotView> {
+        ctx.start_write();
+        ctx.run(self.activator.confirm_pool_key(request)).await
+    }
+    async fn pool_claim(
+        &self,
+        ctx: &RequestContext,
+        request: &ClaimRequest,
+    ) -> Result<ClaimOutcome> {
+        ctx.start_write();
+        ctx.run(self.activator.claim_pool(request)).await
+    }
+    async fn pool_commit(
+        &self,
+        ctx: &RequestContext,
+        request: &CommitRequest,
+    ) -> Result<ClaimOutcome> {
+        ctx.start_write();
+        ctx.run(self.activator.commit_pool(request)).await
+    }
+    async fn pool_abort(
+        &self,
+        ctx: &RequestContext,
+        request: &AbortRequest,
+    ) -> Result<ClaimOutcome> {
+        ctx.start_write();
+        ctx.run(self.activator.abort_pool(request)).await
+    }
+    async fn pool_retired(
+        &self,
+        ctx: &RequestContext,
+        request: &RetiredRequest,
+    ) -> Result<RetiredPage> {
+        ctx.run(self.activator.retired_pool_keys(request)).await
+    }
+    async fn pool_retired_ack(
+        &self,
+        ctx: &RequestContext,
+        request: &AckRetiredRequest,
+    ) -> Result<()> {
+        ctx.start_write();
+        ctx.run(self.activator.ack_retired_pool_key(request)).await
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,

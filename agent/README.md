@@ -5,12 +5,14 @@ Agent 层使用 Rust，产品 API 嵌入统一 Gateway。Activator 可独立部�
 | 目录 | 职责 |
 | --- | --- |
 | `crates/core` | 产品类型、协议、Environment 能力边界及通用校验 |
-| `crates/store` | Template/AliasConfig/AgentBinding 元数据、Redis 原子条件写；内存实现仅供测试 |
-| `activator` | 产品管理、稳定逻辑身份激活及别名目标态收敛；不做 Environment 健康恢复 |
+| `crates/store` | Template/AliasConfig/AgentBinding 与预热池槽位/领取记录、Redis 原子条件写；内存实现仅供测试 |
+| `activator` | 产品管理、稳定逻辑身份激活、别名目标态收敛及预热池库存推进；不做 Environment 健康恢复 |
 | `api` | Activator HTTP 客户端或本地模块调用、AgentBinding 身份选择、解析结果校验 |
 | `cli` | Rust 用户命令行 `adx`；Template 发布/查询、AgentBinding 分页查询/删除、HTTP 流式调用、SSH 交互终端 |
 
 AgentBinding 对应一个长期存在的逻辑实例；current 保存当前实际版本与 Environment ID，别名升级时可更换 Env 而保留 Binding generation。指定 AgentBinding 的首次访问会幂等创建元数据，再激活 Environment；多副本复用同一身份。无效模板或未声明的 service 不创建 AgentBinding。Environment 状态、健康、暂停/恢复与运行载体 0–1 由 Platform 保证。产品删除确认后，新访问可以重建同名 AgentBinding，generation 隔离旧生命周期。
+
+可选的预热池在请求到达前用固定模板版本创建完整 Environment。池 Key 在 `pools/reserve` 的同一事务中生成并持久化，领取前不在 LiteLLM 中创建，领取时由 Gateway 直接为用户创建；`pools/claim` 以 `claim_id` 做 CAS，`pools/commit` 把槽位提交为 AgentBinding。Claiming 槽位不回到 Ready，异常槽位隔离后只释放旧 Environment 的 Volume 关联，不删除目录数据。Platform 仍是健康、暂停/恢复、创建超时与执行替换的权威。
 
 公开 API、认证、路由和连接实现位于 Gateway。HTTP/WS/SSH 通过普通方法调用 Agent 的 `ManagedService` 选择逻辑 AgentBinding 身份，再由 Activator 统一选择实际版本并校验 service 协议和端口的唯一匹配；逻辑身份选择本身不创建元数据或 Environment。HTTP 响应头、SSH 终端提示与协议转发仍由 Gateway 处理。
 

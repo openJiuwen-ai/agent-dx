@@ -3,11 +3,11 @@ BEGIN;
 CREATE SCHEMA IF NOT EXISTS adx_accounts;
 CREATE TABLE IF NOT EXISTS adx_accounts.schema_version (version integer PRIMARY KEY);
 DO $$ BEGIN
-    IF EXISTS (SELECT 1 FROM adx_accounts.schema_version WHERE version <> 1) THEN
+    IF EXISTS (SELECT 1 FROM adx_accounts.schema_version WHERE version <> 2) THEN
         RAISE EXCEPTION 'Unsupported account schema version';
     END IF;
 END $$;
-INSERT INTO adx_accounts.schema_version VALUES (1) ON CONFLICT DO NOTHING;
+INSERT INTO adx_accounts.schema_version VALUES (2) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS adx_accounts.users (
     user_id text NOT NULL,
     provider text NOT NULL DEFAULT 'huawei',
@@ -35,6 +35,19 @@ CREATE TABLE IF NOT EXISTS adx_accounts.model_credentials (
     encrypted_key bytea NOT NULL,
     ready boolean NOT NULL DEFAULT false,
     PRIMARY KEY (user_id),
+    FOREIGN KEY (user_id) REFERENCES adx_accounts.users(user_id)
+);
+CREATE TABLE IF NOT EXISTS adx_accounts.workspace_assignments (
+    tenant text NOT NULL,
+    template text NOT NULL,
+    user_id text NOT NULL,
+    workspace text NOT NULL,
+    slot_id text NOT NULL,
+    claim_id text NOT NULL,
+    committed boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant, template, user_id),
+    UNIQUE (tenant, workspace),
     FOREIGN KEY (user_id) REFERENCES adx_accounts.users(user_id)
 );
 COMMIT;

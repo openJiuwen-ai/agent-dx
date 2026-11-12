@@ -113,6 +113,59 @@ conflicts fail immediately; transport ambiguity or a missing UID in an ensure
 success remains an unknown outcome. Volume IDs use 1–256 ASCII letters, digits,
 dots, underscores or hyphens, excluding the URL-normalized `.` and `..` segments.
 
+## 预热池
+
+`pools/*` 是内部服务接口，沿用 `/internal/adx/v1` 认证。池按
+`(tenant,template,version)` 固定一个明确模板版本；首期不接受 Alias 作为池版本。
+槽位状态为 `KeyPending → Provisioning → Ready(Running|Paused) → Claiming`，
+异常和淘汰进入 `Quarantined`/`Retiring`。`Claiming` 只能提交为 AgentBinding
+或中止后隔离，不能回到 `Ready`。
+
+`pools/reserve` 在返回前把池 Key 原文与摘要写入槽位记录；Gateway 的
+`PoolSupplier` 随后确认这把 Key 在 LiteLLM 中尚不存在（或仍由池 owner 持有并
+blocked），不预先创建，再调用
+`pools/key_confirmed`。任一副本都可以接管未完成的 KeyPending 槽位，不会生成第二把
+Key；领取时的转移才为用户创建同一把 Key。`pools/claim` 使用 `claim_id` 作为领取身份并在事务内检查 Binding 与 Alias
+revision；`pools/commit` 在同一事务中写入 AgentBinding、把 claim 置为
+`Committed` 并删除槽位记录。
+
+`PoolReconciler` 由 Redis `pool-leader` 租约选出单个执行者，只读取 Platform
+报告的 Environment 状态推进槽位，不探活、不触发恢复。清理只删除旧 Environment、
+调用 `release_volumes` 释放 owner 关联，然后写入待清理 Key 清单；不调用
+`delete_volume`，也不删除 SFS 目录。
+
+领取以 `(tenant,claim_id)` 全局定位，`pools/claims/get` 返回原领取所属池和终态。
+重连先恢复原领取，再考虑当前 Alias 和版本映射。预留及库存状态变化在事务内共同
+推进 pool revision；KeyPending/Provisioning 同时计入预期 Running 与总 Ready 容量。
+下调 `max_slots` 时优先淘汰最旧的 Paused，再淘汰其余未领取槽位，保留 Claiming。
+槽位使用完整 UUID，并永久保留跨池工作区身份占位，交付后也不重复分配该目录。
+
+待清理 Key 记录的 `preserve_key=true` 表示槽位曾授予领取；Supplier 必须跳过
+该 Key 的删除。租约在协调期间每 5 秒续租；失去租约即取消本轮协调。Platform
+创建前先保存 `creation_attempted`，之后仅查询不到 Environment 不能确认清理完成；
+必须获得 Platform 的 Deleted 确认，才释放 owner 和置 `released=true`。
+
+当前 `pools/status` 提供库存和领取终态计数。设计中的 `adx_pool_*` 与首访耗时
+Prometheus 指标尚未实现，不能用 status 计数代替时延或命中率验收。
+
+```json
+{
+  "pool_id": "digitalmate-v17",
+  "tenant": "your-tenant",
+  "template": "digitalmate",
+  "version": "17",
+  "enabled": true,
+  "min_running": 2,
+  "min_ready": 4,
+  "max_slots": 10,
+  "max_provisioning": 3,
+  "key_confirm_timeout_seconds": 60,
+  "provision_timeout_seconds": 300,
+  "claim_timeout_seconds": 30,
+  "max_ready_age_seconds": 86400
+}
+```
+
 ## 别名收敛配置
 
 独立和嵌入式 Activator 均由 `registration` 自动启用后台协调，没有单独的 `reconciliation` 配置字段或启停开关。独立模式示例见 [discovery.json](examples/discovery.json)，嵌入式模式在 `embedded` 内提供同样的 registration：

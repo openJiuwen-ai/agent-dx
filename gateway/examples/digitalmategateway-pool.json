@@ -1,0 +1,20 @@
+{
+  "tenant": "your-tenant",
+  "jiuwen": {
+    "agent_type": "assistant",
+    "template": "jiuwen",
+    "version": "1"
+  },
+  "digitalmate": {
+    "template": "digitalmate",
+    "template_ref": "production",
+    "backend_path": "/digitalmate/ws",
+    "service_port": 18092,
+    "request_timeout_seconds": 180,
+    "pool": {
+      "pools_by_version": {"17": "digitalmate-v17"},
+      "claim_budget_seconds": 10,
+      "supplier_interval_seconds": 5
+    }
+  }
+}
