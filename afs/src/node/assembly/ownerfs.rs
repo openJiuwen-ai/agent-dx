@@ -170,27 +170,19 @@ pub(super) async fn assemble(
             )),
         });
         let recovery_root_meta = root_meta.clone();
-        // H11 grace comes from configuration; `RootManager::open` keeps the
-        // spec default for every other constructor (mostly tests).
-        let retirement_grace_ms = cfg.outlet.as_ref().map(|outlet| outlet.generation_grace_ms);
         let roots = Arc::new(
             crate::node::bridge::spawn_blocking(move || {
-                let manager = vfs::ownerfs::root::RootManager::open(
+                vfs::ownerfs::root::RootManager::open(
                     recovery_node_id,
                     recovery_session_id,
                     recovery_root_meta,
                     recovery_disk,
-                )?;
-                Ok::<_, afs_error::Error>(match retirement_grace_ms {
-                    Some(grace) => manager.with_retirement_grace(grace),
-                    None => manager,
-                })
+                )
             })
             .await??,
         );
         outlet_control = Some(super::outlet::OutletControl {
             meta: root_meta.clone(),
-            roots: roots.clone(),
         });
         if cfg.experimental_ownerfs_workspace_bind {
             workspace_bind_root_control = Some((root_meta, roots.clone()));

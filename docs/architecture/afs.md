@@ -1099,9 +1099,11 @@ Home 节点的本地盘上，不做复制。每台需要读该名字视图的节
 
 **节点侧（已实现）**：每节点跑一份镜像 worker：在 tmpfs 名字层收敛
 `/public/<name> -> <import_root>/<home>/users` 软链，自动维护对端（NFS）与
-本机（bind）的 import 挂载，只回收空的旧代数据目录（非空旧代需显式弃用标记）；
-mountinfo 只读诊断随轮输出，配置硬前提（独立 tmpfs、宿主 mount namespace、
-`mount(2)` 权限）在启动时 fail-closed 校验。
+本机（bind）的 import 挂载；mountinfo 只读诊断随轮输出，配置硬前提（独立
+tmpfs、宿主 mount namespace、`mount(2)` 权限）在启动时 fail-closed 校验。
+没有运行期数据回收：删除契约只在提交前检查空目录（非空返回 `ENOTEMPTY`），
+提交后删除不会留下"待回收"的目录，残余目录由启动 reconcile（有 Meta 全量
+视角）收敛，非空残余保留 catalog 记录并告警，等待人工清理。
 
 `/public` 下的 `.pub`（原子发布的暂存目录）与 `.quarantine`（消费方违约时的
 隔离区）归镜像所有，不能作为 workspace 名：创建时即拒（`EINVAL`）。快照里若

@@ -335,10 +335,6 @@ pub struct Cli {
     /// ownerfs_mount and data_dir, required when experimental_ownerfs_workspace_bind.
     #[arg(long)]
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
-    /// Period of the OwnerFs data-root reclaim sweep, in ms (10..=3600000).
-    /// Defaults to 60000. Only swept when OwnerFs is enabled.
-    #[arg(long)]
-    pub ownerfs_reclaim_interval_ms: Option<u64>,
     /// tmpfs directory that holds the outlet public names. All outlet paths must
     /// be set together; leaving them unset disables the feature.
     #[arg(long)]
@@ -349,14 +345,6 @@ pub struct Cli {
     /// Convergence period of the outlet mirror (10..=60000ms), default 250.
     #[arg(long)]
     pub outlet_mirror_interval_ms: Option<u64>,
-    /// Minimum time a superseded data directory stays resolvable before it may
-    /// be reclaimed (1000..=604800000ms), default 120000.
-    #[arg(long)]
-    pub outlet_generation_grace_ms: Option<u64>,
-    /// Largest `actimeo` configured on any import mount (0..=3600000ms),
-    /// default 60000. Used only to validate the generation grace floor.
-    #[arg(long)]
-    pub outlet_max_import_actimeo_ms: Option<u64>,
     /// Mount options for the import mounts `afs-node` performs itself. Matches
     /// the kernel defaults autofs uses today, so the data path keeps the same
     /// semantics it has under a static mount.
@@ -583,12 +571,9 @@ struct FileConfig {
     experimental_ownerfs_workspace_bind: Option<bool>,
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     ownerfs_workspace_egress_root: Option<PathBuf>,
-    ownerfs_reclaim_interval_ms: Option<u64>,
     outlet_public_root: Option<PathBuf>,
     outlet_import_root: Option<PathBuf>,
     outlet_mirror_interval_ms: Option<u64>,
-    outlet_generation_grace_ms: Option<u64>,
-    outlet_max_import_actimeo_ms: Option<u64>,
     outlet_import_mount_options: Option<String>,
     outlet_users_root: Option<PathBuf>,
     outlet_nfs_addr: Option<String>,
@@ -722,8 +707,6 @@ pub struct Config {
     pub experimental_ownerfs_workspace_bind: bool,
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
-    /// OwnerFs data-root reclaim sweep period (10..=3600000ms).
-    pub ownerfs_reclaim_interval_ms: u64,
     /// Outlet public (name) layer. `Some` only when all outlet paths are
     /// configured; the feature is off otherwise.
     pub outlet: Option<OutletConfig>,
@@ -806,13 +789,6 @@ impl Config {
         let grpc_listen: SocketAddr = cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
             ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
         });
-        let reclaim_interval_ms = cli
-            .ownerfs_reclaim_interval_ms
-            .or(file.ownerfs_reclaim_interval_ms)
-            .unwrap_or(60_000);
-        if !(10..=3_600_000).contains(&reclaim_interval_ms) {
-            return Err(invalid("OwnerFs reclaim interval must be 10..=3600000ms"));
-        }
         let outlet = outlet::resolve(&cli, &file, grpc_listen)?;
         let resolved = Resolved {
             id,
@@ -827,7 +803,6 @@ impl Config {
             tuning,
             meta,
             grpc_listen,
-            ownerfs_reclaim_interval_ms: reclaim_interval_ms,
             outlet,
         };
         let cfg = Self::merge(role, cli, file, resolved);
@@ -865,7 +840,6 @@ impl Config {
             tuning,
             meta,
             grpc_listen,
-            ownerfs_reclaim_interval_ms,
             outlet,
         } = resolved;
         Self {
@@ -935,7 +909,6 @@ impl Config {
             ownerfs_workspace_egress_root: cli
                 .ownerfs_workspace_egress_root
                 .or(file.ownerfs_workspace_egress_root),
-            ownerfs_reclaim_interval_ms,
             outlet,
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
             fuse_threads: fuse.fuse_threads,
@@ -1020,7 +993,6 @@ struct Resolved {
     tuning: dfs::DfsTuning,
     meta: meta::MetaSettings,
     grpc_listen: SocketAddr,
-    ownerfs_reclaim_interval_ms: u64,
     outlet: Option<OutletConfig>,
 }
 

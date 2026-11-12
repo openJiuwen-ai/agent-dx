@@ -18,11 +18,6 @@ pub struct OutletConfig {
     pub import_root: PathBuf,
     /// Convergence period. Affects publish latency only, never the data path.
     pub mirror_interval_ms: u64,
-    /// H11: minimum lifetime of a superseded generation directory.
-    pub generation_grace_ms: u64,
-    /// Largest actimeo on any import mount; informational, backs the grace
-    /// floor check.
-    pub max_import_actimeo_ms: u64,
     /// Path of the users tree on every node, for the source `<home>:<path>`.
     pub users_root: PathBuf,
     /// Options handed to `mount(2)` for every import mount.
@@ -88,32 +83,6 @@ pub(super) fn resolve(
     if !(10..=60_000).contains(&interval_ms) {
         return Err(invalid("outlet mirror interval must be 10..=60000ms"));
     }
-    let grace_ms = cli
-        .outlet_generation_grace_ms
-        .or(file.outlet_generation_grace_ms)
-        .unwrap_or(120_000);
-    if !(1_000..=604_800_000).contains(&grace_ms) {
-        return Err(invalid(
-            "outlet generation grace must be 1000..=604800000ms",
-        ));
-    }
-    // H11 (spec TC18): the window must cover mirror fan-out (interval x 10) and
-    // NFS directory-cache lag (actimeo x 2). `actimeo` is not configured here —
-    // it belongs to each import mount — so the deployer supplies the largest
-    // one in use; default 60s matches the deployment examples.
-    let actimeo_ms = cli
-        .outlet_max_import_actimeo_ms
-        .or(file.outlet_max_import_actimeo_ms)
-        .unwrap_or(60_000);
-    let floor = interval_ms
-        .saturating_mul(10)
-        .max(actimeo_ms.saturating_mul(2));
-    if grace_ms < floor {
-        return Err(invalid(format!(
-            "outlet generation grace ({grace_ms}ms) must be at least \
-             max(mirror interval x 10, import actimeo x 2) = {floor}ms"
-        )));
-    }
     // The mount source is `<home>:<users_root>`. Without it there is nothing
     // to mount, so this is a config error rather than a runtime warning.
     let users_root = cli
@@ -160,8 +129,6 @@ pub(super) fn resolve(
         public_root: public,
         import_root,
         mirror_interval_ms: interval_ms,
-        generation_grace_ms: grace_ms,
-        max_import_actimeo_ms: actimeo_ms,
         users_root,
         mount_options: options,
         nfs_addr,

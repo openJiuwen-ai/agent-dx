@@ -1,7 +1,7 @@
-//! 段 13b: outlet 名字层与 OwnerFs 目录回收的后台任务。
+//! 段 13b: outlet 名字层的后台任务。
 //!
-//! 两者都在 `Services` 起跑前完成启动门禁：门禁失败必须让进程直接退出，而
-//! 不是带着一个永远发布不出名字的镜像循环继续服务。
+//! 启动门禁在 `Services` 起跑前完成：门禁失败必须让进程直接退出，而不是
+//! 带着一个永远发布不出名字的镜像循环继续服务。
 
 use super::ownerfs::OwnerFsAssembly;
 use crate::{
@@ -10,15 +10,14 @@ use crate::{
         live::{self, ImportExecutor, MirrorConfig},
         mount::{self, KernelMounter},
     },
-    node::vfs::ownerfs::root::{RootManager, RootMeta},
+    node::vfs::ownerfs::root::RootMeta,
     runtime::{BoxError, Services, cancelled},
 };
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 /// Cross-node outlet name layer.
 ///
-/// Runs before the reclaim sweep so a startup gate failure aborts before any
-/// background task is spawned.
+/// A startup gate failure aborts before any background task is spawned.
 pub(super) fn start_mirror(
     cfg: &Config,
     ownerfs: &OwnerFsAssembly,
@@ -100,66 +99,8 @@ pub(super) fn start_mirror(
     Ok(())
 }
 
-/// Periodic sweep of data directories left behind by a root deletion whose
-/// physical removal was deferred (`RootManager::reclaim_deferred`).
-///
-/// The first tick is skipped: startup reconciliation already ran, and an
-/// instant sweep would race the first mount requests.
-pub(super) fn start_reclaim_sweep(
-    cfg: &Config,
-    ownerfs: &OwnerFsAssembly,
-    services: &mut Services,
-) {
-    let Some(control) = ownerfs.outlet_control.as_ref() else {
-        return;
-    };
-    let roots = control.roots.clone();
-    let stop = services.stop.subscribe();
-    let period = Duration::from_millis(cfg.ownerfs_reclaim_interval_ms);
-    services.spawn(async move {
-        let mut tick = tokio::time::interval(period);
-        tick.tick().await;
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let shutdown = cancelled(stop);
-        tokio::pin!(shutdown);
-        loop {
-            tokio::select! {
-                _ = &mut shutdown => return Ok(()),
-                _ = tick.tick() => {
-                    let roots = roots.clone();
-                    // remove_dir is a blocking syscall; keep it off the async
-                    // workers.
-                    match tokio::task::spawn_blocking(move || roots.reclaim_deferred()).await {
-                        Ok(Ok((removed, pending))) if removed > 0 || pending > 0 => {
-                            afs_logging::info!(
-                                "ownerfs.reclaim.swept";
-                                "removed" => removed,
-                                "pending" => pending
-                            );
-                        }
-                        Ok(Ok(_)) => {}
-                        Ok(Err(error)) => {
-                            afs_logging::warn!(
-                                "ownerfs.reclaim.failed";
-                                "error" => error.to_string()
-                            );
-                        }
-                        Err(error) => {
-                            afs_logging::warn!(
-                                "ownerfs.reclaim.worker_failed";
-                                "error" => error.to_string()
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// The OwnerFs handles the two starters need. Taken from the OwnerFs construction
-/// site because `OwnerFs` itself does not expose them.
+/// The OwnerFs handles the starters need. Taken from the OwnerFs construction
+/// site because `OwnerFs` itself does not expose it.
 pub(super) struct OutletControl {
     pub(super) meta: Arc<dyn RootMeta>,
-    pub(super) roots: Arc<RootManager>,
 }
