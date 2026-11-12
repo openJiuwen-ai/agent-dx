@@ -45,6 +45,15 @@ impl MetaService for MetaRpc {
             .ok_or_else(|| invalid("node descriptor is required"))?;
         require_text(&request.request_id, "request_id")?;
         require_text(&node.node_id, "node.node_id")?;
+        // Node ids become path segments on every consumer (mount points under
+        // the import root, symlink targets under the public root). Reject ids
+        // that would escape those roots before the session is stored, so a
+        // misconfigured or malicious node cannot pollute the cluster snapshot.
+        if !crate::config::is_safe_node_id(&node.node_id) {
+            return Err(invalid(
+                "node.node_id must contain 1..128 letters, digits, _ or -",
+            ));
+        }
         if let Some(authenticated) = authenticated
             && authenticated != node.node_id
         {
@@ -71,6 +80,7 @@ impl MetaService for MetaRpc {
                     grpc_addr: endpoint.grpc_addr,
                     data_addr: endpoint.data_addr,
                     rest_addr: endpoint.rest_addr,
+                    nfs_addr: endpoint.nfs_addr,
                     ownerfs_enabled: node
                         .capabilities
                         .iter()

@@ -63,6 +63,7 @@ fn lease(session: &str) -> NodeSessionLease {
         grpc_addr: "grpc".into(),
         data_addr: "data".into(),
         rest_addr: "rest".into(),
+        nfs_addr: String::new(),
         ownerfs_enabled: true,
         storage_devices: Vec::new(),
         lease_ttl: Duration::from_secs(60),

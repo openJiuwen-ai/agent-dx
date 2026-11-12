@@ -322,6 +322,7 @@ impl Fixture {
                         grpc_addr: endpoint.into(),
                         data_addr: endpoint.into(),
                         rest_addr: "http://localhost:1".into(),
+                        nfs_addr: String::new(),
                     }),
                     ..Default::default()
                 }),

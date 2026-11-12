@@ -747,6 +747,7 @@ fn node_epochs_aliases_absolute_expiry_and_original_results_survive_replay() {
             grpc_addr: "g".into(),
             data_addr: "d".into(),
             rest_addr: "r".into(),
+            nfs_addr: String::new(),
             ownerfs_enabled: true,
             storage_devices: Vec::new(),
             lease_ttl: Duration::from_secs(300),
@@ -801,6 +802,7 @@ fn p3_namespace_history_every_checkpoint_cut_replays_all_facts_and_queries() {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
@@ -1189,6 +1191,7 @@ fn p3_checkpoint_image_preserves_alias_epochs_completion_and_watermark() {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(60),
@@ -1242,6 +1245,7 @@ fn p3_checkpoint_image_rejects_stale_current_session_alias() {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(60),
@@ -1441,15 +1445,16 @@ fn image_and_decision_versions_are_identified_before_the_full_decode() {
     // postcard: four magic bytes, then the schema varint.
     assert_eq!(image[..4], super::IMAGE_MAGIC);
     assert_eq!(u16::from(image[4]), super::IMAGE_SCHEMA);
-    // Image 2 is the pre-R81 checkpoint (GC references without a pinned
-    // version): refused, never read as "protects nothing".
-    image[4] = 2;
+    // Image 3 is the pre-outlet-nfs-address checkpoint (the session carried
+    // no dedicated NFS address field): refused, never read as "protects
+    // nothing".
+    image[4] = 3;
     image.truncate(5);
     assert_incompatible(
         super::StateImage::validate_encoded(&image, LIMIT).unwrap_err(),
         "Meta checkpoint state image",
-        "version 2",
-        "supports version 3",
+        "version 3",
+        "supports version 4",
     );
 
     let entity = root_entity();
@@ -1463,7 +1468,7 @@ fn image_and_decision_versions_are_identified_before_the_full_decode() {
         RecordDecision::decode(&bytes, LIMIT).unwrap_err(),
         "Meta WAL record decision",
         "version 1",
-        "supports version 2",
+        "supports version 3",
     );
     let mut framed = postcard::to_allocvec(&super::Record::from(record)).unwrap();
     assert_eq!((framed[0], u16::from(framed[1])), (0, super::SCHEMA));
@@ -1472,7 +1477,7 @@ fn image_and_decision_versions_are_identified_before_the_full_decode() {
         super::Record::check_schema(&framed).unwrap_err(),
         "Meta WAL record decision",
         "version 1",
-        "supports version 2",
+        "supports version 3",
     );
     super::Record::check_schema(&postcard::to_allocvec(&1u32).unwrap()).unwrap();
 }

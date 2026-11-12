@@ -25,20 +25,20 @@ use afs_protocol::meta::{
     DfsXattrSetMode as PbDfsXattrSetMode, GetDfsChunkSourcesReply, GetDfsChunkSourcesRequest,
     GetDfsInodeReply, GetDfsInodeRequest, GetDfsPlacementSnapshotReply,
     GetDfsPlacementSnapshotRequest, GetFileVersionReply, GetFileVersionRequest,
-    ListOwnerRootsReply, ListOwnerRootsRequest, LookupNodeReply, LookupNodeRequest,
-    LookupRootReply, LookupRootRequest, MetaBackendPersistence, NodeDescriptor, NodeEndpoint,
-    OpenDfsWriteReply, OpenDfsWriteRequest, PingReply, PingRequest, PollRootCommandBatchRequest,
-    PresentedRootAccess, RecoverRootReply, RecoverRootRequest, RegisterNodeReply,
-    RegisterNodeRequest, RenewDfsWriteLeaseRequest, ReserveRootReply, ReserveRootRequest,
-    ResolveDfsLockAuthorityReply, ResolveDfsLockAuthorityRequest, ResolveDfsWriteAuthorityReply,
-    ResolveDfsWriteAuthorityRequest, RootCommand, RootCommandBatchCompacted,
-    RootCommandBatchEvents, RootCommandBatchReply, RootCommandBatchUnsupported,
-    RootCommandRecoveryCursor, RootCommandRecoveryReason, RootCommandType, RootLocation,
-    RootReservation, RootRight as PbRootRight, SyncDfsInodeMetadataReply,
-    SyncDfsInodeMetadataRequest, ValidateDfsReplicaWriteReply, ValidateDfsReplicaWriteRequest,
-    ValidateRootAccessReply, ValidateRootAccessRequest, WatchRootCommandsRequest,
-    dfs_meta_server::DfsMeta as DfsMetaService, meta_server::Meta as MetaService,
-    owner_roots_server::OwnerRoots as OwnerRootsService,
+    ListActiveOutletRootsReply, ListActiveOutletRootsRequest, ListOwnerRootsReply,
+    ListOwnerRootsRequest, LookupNodeReply, LookupNodeRequest, LookupRootReply, LookupRootRequest,
+    MetaBackendPersistence, NodeDescriptor, NodeEndpoint, OpenDfsWriteReply, OpenDfsWriteRequest,
+    PingReply, PingRequest, PollRootCommandBatchRequest, PresentedRootAccess, RecoverRootReply,
+    RecoverRootRequest, RegisterNodeReply, RegisterNodeRequest, RenewDfsWriteLeaseRequest,
+    ReserveRootReply, ReserveRootRequest, ResolveDfsLockAuthorityReply,
+    ResolveDfsLockAuthorityRequest, ResolveDfsWriteAuthorityReply, ResolveDfsWriteAuthorityRequest,
+    RootCommand, RootCommandBatchCompacted, RootCommandBatchEvents, RootCommandBatchReply,
+    RootCommandBatchUnsupported, RootCommandRecoveryCursor, RootCommandRecoveryReason,
+    RootCommandType, RootLocation, RootReservation, RootRight as PbRootRight,
+    SyncDfsInodeMetadataReply, SyncDfsInodeMetadataRequest, ValidateDfsReplicaWriteReply,
+    ValidateDfsReplicaWriteRequest, ValidateRootAccessReply, ValidateRootAccessRequest,
+    WatchRootCommandsRequest, dfs_meta_server::DfsMeta as DfsMetaService,
+    meta_server::Meta as MetaService, owner_roots_server::OwnerRoots as OwnerRootsService,
 };
 use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio_stream::Stream;
@@ -200,6 +200,7 @@ fn wire_location(root: super::store::RootRecord) -> RootLocation {
         root_epoch: root.root_epoch,
         home_node_id: root.home_node_id,
         home_session_id: root.home_session_id,
+        home_nfs_addr: root.nfs_addr,
     }
 }
 
@@ -210,6 +211,7 @@ fn wire_node(session: super::store::NodeSession) -> NodeDescriptor {
             grpc_addr: session.grpc_addr,
             data_addr: session.data_addr,
             rest_addr: session.rest_addr,
+            nfs_addr: session.nfs_addr,
         }),
         labels: Default::default(),
         capabilities: Vec::new(),
@@ -559,6 +561,37 @@ impl OwnerRootsService for OwnerRootsRpc {
                 .map(wire_reservation)
                 .collect(),
             authority_revision: output.authority_revision.0,
+        }))
+    }
+
+    async fn list_active_outlet_roots(
+        &self,
+        request: Request<ListActiveOutletRootsRequest>,
+    ) -> Result<Response<ListActiveOutletRootsReply>, Status> {
+        // 只读快照：任何已认证 live 会话都可以读，不绑定 home 节点。
+        // enforce_peer_identity 开启时必须有可信 mTLS 证书（与其它 authority RPC 一致）。
+        // 返回值是调用方 node id，本 RPC 不需要它，但身份校验本身必须执行。
+        let _caller = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        require_text(&request.request_id, "request_id")?;
+        let known_digest = if request.known_digest.is_empty() {
+            None
+        } else {
+            Some(request.known_digest)
+        };
+        let output = self
+            .0
+            .owner_roots
+            .list_active_outlet_roots(super::owner_roots::ListActiveOutletRootsInput {
+                known_digest,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(ListActiveOutletRootsReply {
+            active_roots: output.roots.into_iter().map(wire_location).collect(),
+            authority_revision: output.revision.0,
+            digest: output.digest,
+            unchanged: output.unchanged,
         }))
     }
 
