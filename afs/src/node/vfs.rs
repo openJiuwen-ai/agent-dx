@@ -5,6 +5,7 @@
 
 #[cfg(feature = "dfs")]
 pub mod dfs;
+pub mod lazy_fill;
 pub mod locks;
 #[cfg(feature = "ownerfs")]
 pub mod ownerfs;
@@ -32,12 +33,62 @@ pub struct PageCacheIdentity {
     pub length: u64,
 }
 
+/// Confirmed outcome of publishing a private prepared inode without replacing
+/// another file. Errors are indeterminate: callers must retain the private tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedPublication {
+    Published,
+    Occupied,
+}
+
 /// 两种后端接收同一组文件操作；每项默认拒绝，未实现时不得报告成功。
 ///
 /// 这里仅规定入口必须提供的参数与返回值。根授权、文件身份、缓存和持久化
 /// 由具体后端决定。回调是同步的，以匹配当前 fuser 入口；后端可以用自己的
 /// I/O 执行器，但不能在锁内无限等待远端或把未完成的操作假装完成。
 pub trait Backend: Send + Sync {
+    /// Publish a fixed-length, immutable-origin file without fetching its body.
+    /// The binding and length must be durable before the final name is visible.
+    fn prepare_lazy_file(
+        &self,
+        _ctx: &types::RequestContext,
+        _parent: types::BackendInode,
+        _name: &OsStr,
+        _spec: &lazy_fill::LazyFileSpec,
+    ) -> Result<types::Entry> {
+        Err(unsupported("prepare_lazy_file"))
+    }
+
+    /// Publish within one parent; the temporary name must be private to the
+    /// caller and must identify `prepared`. A lost reply is reconciled by inode
+    /// identity. Only `Occupied` permits cleaning the losing private tree;
+    /// an error must never trigger deletion through remembered child inodes.
+    fn publish_prepared(
+        &self,
+        ctx: &types::RequestContext,
+        parent: types::BackendInode,
+        temporary: &OsStr,
+        name: &OsStr,
+        prepared: types::BackendInode,
+    ) -> Result<PreparedPublication> {
+        match self.rename(ctx, parent, temporary, parent, name, types::RenameFlags(1)) {
+            Ok(()) => Ok(PreparedPublication::Published),
+            Err(error) => {
+                if self
+                    .lookup(ctx, parent, name)
+                    .is_ok_and(|entry| entry.inode == prepared)
+                {
+                    return Ok(PreparedPublication::Published);
+                }
+                if error.kind() == afs_error::ErrorKind::AlreadyExists {
+                    Ok(PreparedPublication::Occupied)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     /// 当前 Backend 在本 mount 内的根 inode。它不是 FUSE inode，也不是跨进程身份。
     fn root_inode(&self) -> types::BackendInode;
 
@@ -269,7 +320,7 @@ pub trait Backend: Send + Sync {
 
     /// Optional owned read response for backends that can build a private final
     /// payload without first filling a caller-owned buffer. The default keeps
-    /// legacy backends compatible by delegating to `read`.
+    /// other backends working by delegating to `read`.
     fn read_owned(
         &self,
         ctx: &types::RequestContext,
@@ -297,13 +348,13 @@ pub trait Backend: Send + Sync {
         _offset: u64,
         _size: usize,
         _deadline: std::time::Instant,
-        _lifetime: crate::node::read_pipeline::ReadLifetime,
-    ) -> Result<Option<crate::node::read_pipeline::ReadReplyFuture>> {
+        _lifetime: crate::node::read::admission::ReadLifetime,
+    ) -> Result<Option<crate::node::read::admission::ReadReplyFuture>> {
         Ok(None)
     }
 
     /// Keep private response ownership through the synchronous FUSE reply.
-    /// Legacy backends transfer their Vec allocation without copying.
+    /// By default, backends transfer their Vec allocation without copying.
     fn read_reply(
         &self,
         ctx: &types::RequestContext,
@@ -358,6 +409,11 @@ pub trait Backend: Send + Sync {
         Err(unsupported("flush"))
     }
 
+    /// Maximum wait for a filesystem durability barrier, if configured.
+    fn fsync_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// 应用显式要求的屏障；DataOnly/Full 分别对应 fdatasync/fsync。
     fn fsync(
         &self,
@@ -366,6 +422,17 @@ pub trait Backend: Send + Sync {
         _mode: types::SyncMode,
     ) -> Result<()> {
         Err(unsupported("fsync"))
+    }
+
+    /// 同 [`Self::fsync`]，并返回屏障提交到的版本身份与持久序号（SDK sync 的回复）。
+    fn fsync_receipt(
+        &self,
+        ctx: &types::RequestContext,
+        handle: types::FileHandle,
+        mode: types::SyncMode,
+    ) -> Result<types::SyncReceipt> {
+        self.fsync(ctx, handle, mode)?;
+        Ok(types::SyncReceipt::default())
     }
 
     /// 释放本进程的句柄；不能以 path 重新寻找被 rename/unlink 的文件。
@@ -483,7 +550,8 @@ pub trait Backend: Send + Sync {
     }
 
     /// A fixed local response which does not depend on queued write contents.
-    /// The actual operation must still validate inode identity and permissions.
+    /// The actual operation must still validate inode identity and permissions,
+    /// and must not block: the FUSE layer answers it on the receive thread.
     fn getxattr_is_fixed_local(&self, _name: &OsStr) -> bool {
         false
     }

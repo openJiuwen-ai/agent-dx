@@ -5,7 +5,9 @@ id = "node-a"
 grpc_listen = "127.0.0.1:7500"
 rest_listen = "127.0.0.1:7501"
 meta_endpoint = "https://127.0.0.1:7400"
-peer_endpoint = "https://127.0.0.1:7500"
+# Diagnostics only: the peer that the Node REST `diagnose` route probes. Starting
+# with it set logs config.test_only_option_enabled at WARN.
+# peer_endpoint = "https://127.0.0.1:7500"
 fs = "all"
 data_mode = "grpc"
 data_dir = "/opt/adx/data/afs/node-a"
@@ -16,11 +18,8 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # fuse_threads = 4
 # fuse_clone_fd = true
 # fuse_workers = 32
-# Native DFS page reuse requires the exact fresh committed version and length.
-# Zero TTLs preserve strict close-to-open; positive TTLs explicitly relax it.
-# dfs_fuse_keep_cache = true
-# dfs_fuse_entry_ttl_ms = 0
-# dfs_fuse_attr_ttl_ms = 0
+# DFS readers pin their version open to close; kernel pages are reused only
+# across opens of the exact same version, and entry/attr TTLs are always zero.
 # Requested DFS kernel read-ahead limit; record the negotiated value in tests.
 # This does not enable next-object prefetch or change OwnerFs cache policy.
 # fuse_max_readahead_bytes = 16777216
@@ -28,47 +27,60 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # dfs_version_cache_entries = 4096
 # Cache-retained metadata estimate; active reader Arcs and Node RSS are separate.
 # Includes layout/index capacities, ID buffers and conservative cache-table overhead.
+# A DFS-capable Node rejects combinations below the table plus fixed value floor.
+# Larger layouts remain uncached when their actual retained size exceeds this limit.
 # dfs_version_cache_bytes = 33554432
-# Catalog request count, independent of body/proof budgets.
+# Shared proof work admission wait, 0..=50ms; 0 disables waiting, not validation.
+# dfs_outboard_work_wait_ms = 2
+# Optional proof installs, queued plus active; valid range 1..=64.
+# Body/catalog durability never waits for this background queue.
+# Catalog request count; a separate 1MiB control bound also applies.
 dfs_catalog_commit_queue = 256
+# dfs_sidecar_install_queue = 64
 # Bounded native cache flight records, valid range 1..=8.
 # This does not enable multiple body fills or object prefetch.
 # dfs_fetch_max_inflight_objects = 8
 # Native body readahead is opt-in; product profiles may explicitly use 8388608.
 # This is scheduling distance, sharing the existing proof/stream/disk budgets.
 # dfs_readahead_max_bytes = 0
+# Native gRPC remote-read body verification on this reading Node: "receiver"
+# (default, CRC segments checked; disables prefetch) or "off" (unchecked; a bad
+# replica is delivered as is). Serving Nodes follow each caller's mode, so
+# Nodes may differ.
+# dfs_read_crc_mode = "receiver"
 # A-side verified Peer payloads: 2 resident objects, sharing 16MiB with live frames.
 # Payload range 4..=64MiB; eviction does not refund still-referenced data.
 # dfs_peer_serve_resident_objects = 2
 # dfs_peer_serve_payload_bytes = 16777216
 # One native admission deadline; 0 disables waiting, maximum 50ms.
 # dfs_peer_serve_wait_ms = 20
+# Background scrub of local copies: bytes per second (0 off, else 1MiB..=1GiB),
+# delay after start, and minimum time between round starts.
+# dfs_scrub_bytes_per_second = 33554432
+# dfs_scrub_start_delay_seconds = 300
+# dfs_scrub_round_interval_seconds = 86400
 # Metadata-only source lookahead; no object/body prefetch. Zero max/bytes disables retention.
 # dfs_source_cache_max_ms = 5000
 # dfs_source_lookahead_chunks = 64
 # dfs_source_cache_bytes = 4194304
-# Native DFS Node defaults: independent IDs, 32KiB CRC32C and write-generation GC.
-# Replica counts/local-copy policy remain the existing filesystem policy.
-# S3 and OwnerFs-only do not enable these native defaults.
-# dfs_crc32c_writes = true
-# dfs_optimistic_gc_commit = true
+# Native DFS storage always writes independent IDs with 32KiB CRC32C and
+# write-generation GC; S3 always writes canonical BLAKE3 objects.
 timeout_ms = 5000
 log_level = "info"
 trace_enabled = false
-trace_sample_ratio = 1.0
+trace_sample_ratio = 0.01
 trace_endpoint = "http://127.0.0.1:4317"
 
-# OwnerFs workspace bind mount stays OFF. This legacy option controls only
-# the runc experiment; it does not expose a standalone host-visible bind.
-# Existing TOML/CLI names remain compatible; see docs/deployment/afs.md.
-experimental_native_workspace = false
-
-# Independent administrator-controlled host entry, also OFF by default.
+# OwnerFs workspace bind: administrator-controlled host entry, OFF by default.
 # Create and authorize the Home workspace through OwnerFs before enabling this.
 # Only one already-existing local Home workspace is supported. Stop managed
 # users before shutdown/root changes; native FDs are not instantly revocable.
-# Do not enable both experimental entries together.
+# When enabled, ownerfs_workspace_egress_root is required: an absolute native
+# path outside ownerfs_mount and data_dir whose children receive the bind
+# targets (<egress_root>/<workspace>); schedulers read the same file to mount
+# containers from that path.
 experimental_ownerfs_workspace_bind = false
+# ownerfs_workspace_egress_root = "/opt/adx/egress"
 # [ownerfs_workspace_bind]
 # workspace = "agent1"
 
@@ -79,7 +91,8 @@ tls_identity_certificate = "/opt/adx/config/afs/tls/node-a.pem"
 tls_identity_private_key = "/opt/adx/config/afs/tls/node-a-key.pem"
 tls_server_name = "afs-cluster"
 
-# Native DFS live uploads and unpublished metadata. S3 keeps its separate budgets.
+# DFS live uploads and unpublished metadata (native and S3 storage alike).
+# With S3, uploads are capped at 4 in flight.
 # Front-owned ordinary-write payload across all files; not whole-process memory.
 # Automatic waiting reserve: min(dfs_write_queue_bytes / 8, 32MiB).
 dfs_write_queue_bytes = 2147483648
@@ -121,3 +134,10 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # Distinct from kernel/B look-ahead windows; B look-ahead remains opt-in.
 # [dfs_read_pipeline]
 # max_reply_bytes = 268435456
+
+# Optional native DFS Peer disk cache; OFF when omitted, no RAM resident cache.
+# Use only without dfs_external_backend, separate from data_dir/FUSE mounts.
+# Capacity is configurable; 256MiB is only an example.
+# [dfs_peer_cache]
+# directory = "/opt/adx/cache/afs/peer"
+# capacity_bytes = 268435456

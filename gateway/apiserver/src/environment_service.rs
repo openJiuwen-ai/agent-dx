@@ -5,6 +5,7 @@ use crate::{
     metrics::Attempt,
     operations::{Kind, Operations},
     ownership::Cache,
+    workspace_affinity,
 };
 use adx_protocol::control as pb;
 use adx_transport::deadline::Deadline;
@@ -175,10 +176,11 @@ impl EnvironmentService {
         input: Value,
         caller: &pb::CallerContext,
     ) -> Result<pb::EnvironmentSpec, Status> {
-        contract::create_spec_with_environment(
+        contract::create_spec_with_templates(
             input,
             caller,
             self.clients.config.runtime_profile.as_ref(),
+            &self.clients.config.local_rootfs_templates,
         )
     }
 
@@ -211,6 +213,68 @@ impl EnvironmentService {
         self.prepare_create(input, caller)
     }
 
+    /// Create admission with the Workspace owner as a soft node preference.
+    /// A missing Workspace mount leaves the request unchanged.
+    pub async fn prepare_create_with_workspace_affinity(
+        &self,
+        input: Value,
+        caller: &pb::CallerContext,
+        request_id: &str,
+    ) -> Result<pb::EnvironmentSpec, Status> {
+        let mut spec = self.prepare_create_with_request(input, caller, request_id)?;
+        let Some(resolver) = &self.clients.workspace else {
+            return Ok(spec);
+        };
+        let mounts = spec
+            .execution
+            .as_ref()
+            .map(|execution| execution.mounts.as_slice())
+            .unwrap_or_default();
+        let owner = match workspace_affinity::derive_owner(resolver.root(), mounts) {
+            Ok(Some(owner)) => owner,
+            Ok(None) => return Ok(spec),
+            Err(error) => return self.fall_back_without_affinity(spec, resolver, None, error),
+        };
+        let node_id = match resolver.node_id(&owner).await {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                return self.fall_back_without_affinity(spec, resolver, Some(&owner), error)
+            }
+        };
+        match workspace_affinity::prefer_node(
+            spec.scheduling.get_or_insert_with(Default::default),
+            &node_id,
+        ) {
+            Ok(()) => Ok(spec),
+            Err(error) => self.fall_back_without_affinity(spec, resolver, Some(&owner), error),
+        }
+    }
+
+    /// Drop affinity and keep the caller's placement. Only `fail_closed` errors.
+    fn fall_back_without_affinity(
+        &self,
+        spec: pb::EnvironmentSpec,
+        resolver: &workspace_affinity::WorkspaceAffinityResolver,
+        owner: Option<&str>,
+        error: Status,
+    ) -> Result<pb::EnvironmentSpec, Status> {
+        if !resolver.may_fall_back(&error) {
+            adx_observability::warn!(
+                owner = owner.unwrap_or_default(),
+                error = %error,
+                "Workspace affinity rejected environment create"
+            );
+            return Err(error);
+        }
+        self.creation_metrics.workspace_affinity_fallback();
+        adx_observability::warn!(
+            owner = owner.unwrap_or_default(),
+            error = %error,
+            "Workspace affinity skipped; scheduling without the owner preference"
+        );
+        Ok(spec)
+    }
+
     pub async fn create_request(
         &self,
         input: Value,
@@ -219,7 +283,8 @@ impl EnvironmentService {
     ) -> Result<Value, Status> {
         self.creation_metrics.embedded_request();
         let spec = self
-            .prepare_create_with_request(input.clone(), caller, request_id)
+            .prepare_create_with_workspace_affinity(input.clone(), caller, request_id)
+            .await
             .inspect_err(|error| self.creation_metrics.rejection(error))?;
         Box::pin(self.create(spec, input, request_id, caller)).await
     }

@@ -4,13 +4,17 @@
 //! 当前 Ping 不修改业务状态，所以没有为它引入 Mutex 或 actor。
 //! 将来根归属/授权状态应在这里所属的领域模块实现，不能各在 REST 和 gRPC 存一份。
 //! Meta 通过统一 Store 先持久化确定变化，再发布可见权威。
-//! local-file 与显式易失 memory 使用同一操作日志合同；etcd/Redis 旧后端已退出当前交付。
+//! local-file、redis、etcd 与显式易失 memory 使用同一操作日志合同（`store::journal::MetaLog`）；
+//! redis／etcd 只存日志与 checkpoint，Meta 仍是单进程。
 //! 没有 store 时 RPC 必须失败关闭，避免把进程内判断误写成授权事实。
+//! `Meta::with_store`、`with_store_and_peer_identity` 只供集成测试和单测装配；
+//! 集成测试链接产品库时没有 `cfg(test)`，所以留在产品代码里。
 
 pub mod dfs;
 pub mod owner_roots;
 pub mod rest;
 pub mod rpc;
+mod rpc_metrics;
 pub mod store;
 mod watch;
 use crate::{
@@ -153,7 +157,7 @@ impl Meta {
             .await?;
         Ok(match snapshot.entity {
             Some(store::MetaEntity::NodeSession(session))
-                if session.is_live_at_unix_ms(store::now_unix_ms()) =>
+                if session.is_live_at_unix_ms(crate::clock::now_unix_ms()) =>
             {
                 Some(session)
             }
@@ -185,12 +189,6 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
         },
     );
     let dfs = if let Some(store) = store.as_ref() {
-        let local_copy = match cfg.dfs_local_copy.as_str() {
-            "required" => crate::dfs::LocalCopyPolicy::Required,
-            "preferred" => crate::dfs::LocalCopyPolicy::Preferred,
-            "none" => crate::dfs::LocalCopyPolicy::NotRequired,
-            _ => unreachable!("Config validates dfs_local_copy"),
-        };
         let service = dfs::DfsService::with_durability_policy(
             store.clone(),
             crate::dfs::ReplicationConfig {
@@ -198,7 +196,7 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
                 sync_required_copies: cfg.dfs_sync_required_copies,
                 min_distinct_nodes: cfg.dfs_min_distinct_nodes,
                 min_distinct_failure_domains: cfg.dfs_min_distinct_failure_domains,
-                local_copy,
+                local_copy: cfg.dfs_local_copy.into(),
             },
             cfg.dfs_external_backend.as_ref().map_or(
                 crate::dfs::DfsDurabilityPolicy::NodeReplicated,
@@ -208,7 +206,12 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
                 },
             ),
         )
+        .with_replica_failure_config(crate::dfs::ReplicaFailureConfig {
+            policy: cfg.dfs_replica_failure_policy.into(),
+            min_degraded_copies: cfg.dfs_min_degraded_copies,
+        })
         .with_gc_grace_ms(cfg.dfs_gc_grace_ms);
+        service.gc_metrics().register(&obs.registry)?;
         if cfg.dfs {
             service.initialize_replication_config().await?;
         }
@@ -243,8 +246,10 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
     let security = afs_transport::grpc::SecurityManager::new(cfg.tls_config())?;
     let incoming = security.incoming(incoming)?;
     let server = grpc_config.configure_server(tonic::transport::Server::builder());
+    let rpc_counts = rpc_metrics::MetaRpcCountLayer::register(&state.observability.registry)?;
     services.spawn(async move {
         server
+            .layer(rpc_counts)
             .layer(afs_tracing::GrpcServerTraceLayer::default())
             .add_service(meta_service)
             .add_service(owner_service)
@@ -278,17 +283,29 @@ pub async fn open_configured_store(cfg: &Config) -> Result<Option<Arc<store::Sto
     let log: Arc<dyn store::journal::MetaLog> = match cfg.meta_store {
         MetaStoreBackend::InMemory => {
             afs_logging::warn!("meta.store.memory_volatile"; "instance" => &cfg.id);
-            Arc::new(store::journal::MemoryLog::with_policy(limits, maintenance)?)
+            Arc::new(store::journal::MemoryLog::new(
+                store::journal::MemoryLogOptions {
+                    record_max_bytes: limits.record_max_bytes,
+                    batch_max_bytes: limits.batch_max_bytes,
+                    wal_max_bytes: limits.wal_max_bytes,
+                },
+            )?)
+        }
+        #[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
+        MetaStoreBackend::Redis | MetaStoreBackend::Etcd => open_kv_log(cfg, &limits).await?,
+        // `meta_store_target` refuses these first; kept for direct callers.
+        #[cfg(not(any(feature = "meta-redis", feature = "meta-etcd")))]
+        MetaStoreBackend::Redis | MetaStoreBackend::Etcd => {
+            return Err("afs-meta was built without the meta-redis and meta-etcd features".into());
         }
         MetaStoreBackend::LocalFile => {
             let path = cfg.data_dir.join("meta-store");
             Arc::new(
                 tokio::task::spawn_blocking(move || {
-                    store::local_log::LocalLog::open_with_policies(
+                    store::local_log::LocalLog::open_with_checkpoint_limits(
                         path,
                         limits,
-                        store::journal::CheckpointLimits::default(),
-                        maintenance,
+                        store::local_log::LocalCheckpointLimits::default(),
                     )
                 })
                 .await??,
@@ -296,8 +313,77 @@ pub async fn open_configured_store(cfg: &Config) -> Result<Option<Arc<store::Sto
         }
     };
     Ok(Some(Arc::new(
-        store::Store::open_log_with_history(log, history).await?,
+        store::Store::open_log_with_options(
+            log,
+            store::StoreOptions {
+                history,
+                maintenance: Some(maintenance),
+                ..store::StoreOptions::default()
+            },
+        )
+        .await?,
     )))
+}
+
+/// Opens the Redis or etcd Meta log. A backend left out of the build is
+/// refused by `meta_store_target` before this point.
+#[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
+async fn open_kv_log(
+    cfg: &Config,
+    limits: &store::local_log::LocalLogOptions,
+) -> Result<Arc<dyn store::journal::MetaLog>, BoxError> {
+    match cfg.meta_store_target()? {
+        #[cfg(feature = "meta-redis")]
+        crate::config::MetaStoreTarget::Redis { url, prefix } => {
+            afs_logging::info!("meta.store.redis"; "instance" => &cfg.id, "prefix" => &prefix);
+            let options = kv_log_options(
+                limits,
+                store::journal::CheckpointLimits::default().image_max_bytes,
+            );
+            Ok(Arc::new(
+                store::kv_log::RedisLog::open_redis(&url, &prefix, options).await?,
+            ))
+        }
+        #[cfg(feature = "meta-etcd")]
+        crate::config::MetaStoreTarget::Etcd {
+            endpoints,
+            prefix,
+            max_request_bytes,
+        } => {
+            afs_logging::info!("meta.store.etcd"; "instance" => &cfg.id, "prefix" => &prefix);
+            // etcd keeps old and new images and MVCC history inside its quota
+            // (default 2 GiB): half the local bound.
+            let options = kv_log_options(limits, store::ETCD_IMAGE_MAX_BYTES);
+            Ok(Arc::new(
+                store::kv_log::EtcdLog::open_etcd(&endpoints, &prefix, max_request_bytes, options)
+                    .await?,
+            ))
+        }
+        #[cfg(not(feature = "meta-redis"))]
+        crate::config::MetaStoreTarget::Redis { .. } => {
+            Err("afs-meta was built without the meta-redis feature".into())
+        }
+        #[cfg(not(feature = "meta-etcd"))]
+        crate::config::MetaStoreTarget::Etcd { .. } => {
+            Err("afs-meta was built without the meta-etcd feature".into())
+        }
+        crate::config::MetaStoreTarget::Local => {
+            Err("redis/etcd Meta store without its endpoint".into())
+        }
+    }
+}
+
+#[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
+fn kv_log_options(
+    limits: &store::local_log::LocalLogOptions,
+    image_max_bytes: usize,
+) -> store::kv_log::KvLogOptions {
+    store::kv_log::KvLogOptions {
+        record_max_bytes: limits.record_max_bytes,
+        batch_max_bytes: limits.batch_max_bytes,
+        wal_max_bytes: limits.wal_max_bytes,
+        image_max_bytes,
+    }
 }
 
 fn peer_identity_policy(
@@ -586,7 +672,7 @@ mod tests {
         let identity = std::fs::read(root.join("IDENTITY")).unwrap();
         let wal = root.join("wal-00000000000000000001.log");
         let bytes = std::fs::read(&wal).unwrap();
-        assert!(bytes.len() > store::journal::LOG_HEADER_BYTES as usize);
+        assert!(bytes.len() > store::local_log::LOG_HEADER_BYTES as usize);
         assert!(!root.join("wal").exists());
         assert!(!root.join("snapshot").exists());
         drop(meta);
@@ -689,7 +775,7 @@ mod tests {
         let identity = std::fs::read(root.join("IDENTITY")).unwrap();
         let wal = root.join("wal-00000000000000000001.log");
         let mut bytes = std::fs::read(&wal).unwrap();
-        bytes[store::journal::LOG_HEADER_BYTES as usize + 8] ^= 1;
+        bytes[store::local_log::LOG_HEADER_BYTES as usize + 8] ^= 1;
         std::fs::write(&wal, &bytes).unwrap();
         let error = match open_configured_store(&cfg).await {
             Err(error) => error,

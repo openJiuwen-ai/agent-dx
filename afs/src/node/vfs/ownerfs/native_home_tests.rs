@@ -25,6 +25,8 @@ struct NativeHomeMeta {
     active: Mutex<HashMap<RootId, RootLocation>>,
     fail_deactivate: AtomicBool,
     pending: Mutex<HashMap<RootId, RootReservation>>,
+    /// Meta deactivate 成功后执行，用于构造删除过程中的交错。
+    on_deactivate: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl NativeHomeMeta {
@@ -36,6 +38,7 @@ impl NativeHomeMeta {
             active: Mutex::new(HashMap::new()),
             fail_deactivate: AtomicBool::new(false),
             pending: Mutex::new(HashMap::new()),
+            on_deactivate: Mutex::new(None),
         }
     }
 
@@ -112,6 +115,9 @@ impl RootMeta for NativeHomeMeta {
             ));
         }
         self.active.lock().unwrap().remove(root_id);
+        if let Some(hook) = self.on_deactivate.lock().unwrap().take() {
+            hook();
+        }
         Ok(())
     }
 
@@ -622,6 +628,200 @@ fn rmdir_root_deletes_fuse_only_root_completely() {
     assert!(roots.cached_local_roots().unwrap().is_empty());
 }
 
+/// `rmdir` 只删除空目录：非空时必须在任何删除步骤之前拒绝，workspace 保持可用，
+/// 否则 ENOTEMPTY 之后 Meta 已 deactivate，所有节点都无法再访问这些数据。
+#[test]
+fn rmdir_root_non_empty_is_rejected_and_keeps_workspace_usable() {
+    let (temp, owner, ctx, _disk) = fixture(false);
+    let root = mkdir_root(&owner, &ctx, "d-non-empty");
+    let (root_id, data_dir) = root_snapshot(&owner, temp.path(), "d-non-empty");
+    let created = Backend::create(
+        &owner,
+        &ctx,
+        root.inode,
+        OsStr::new("file"),
+        0o600,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    Backend::flush(&owner, &ctx, created.handle).unwrap();
+
+    let error =
+        Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d-non-empty")).unwrap_err();
+
+    assert_eq!(error.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+    assert_eq!(crate::error::errno(&error), libc::ENOTEMPTY);
+    let roots = owner.require_local().unwrap().roots.clone();
+    assert!(roots.lookup_root_location(&root_id).unwrap().is_some());
+    assert_eq!(roots.cached_local_roots().unwrap().len(), 1);
+    assert!(data_dir.join("file").exists());
+    let looked_up = lookup_root(&owner, &ctx, "d-non-empty").unwrap();
+    Backend::lookup(&owner, &ctx, looked_up.inode, OsStr::new("file")).unwrap();
+
+    // 清空后可以正常删除，证明拒绝没有留下半完成状态。
+    Backend::unlink(&owner, &ctx, root.inode, OsStr::new("file")).unwrap();
+    Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d-non-empty")).unwrap();
+    assert!(!data_dir.exists());
+    assert!(roots.lookup_root_location(&root_id).unwrap().is_none());
+}
+
+/// 物理目录已不存在时，预检查不能挡住 `delete_root` 收敛残留记录。
+#[test]
+fn rmdir_root_missing_data_dir_still_converges() {
+    let (temp, owner, ctx, _disk) = fixture(false);
+    mkdir_root(&owner, &ctx, "d-missing");
+    let (root_id, data_dir) = root_snapshot(&owner, temp.path(), "d-missing");
+    std::fs::remove_dir(&data_dir).unwrap();
+
+    Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d-missing")).unwrap();
+
+    let roots = owner.require_local().unwrap().roots.clone();
+    assert!(roots.lookup_root_location(&root_id).unwrap().is_none());
+    assert!(roots.cached_local_roots().unwrap().is_empty());
+}
+
+/// 缓存已移除而 Meta 仍指向本机时返回 ENOENT，不能把删除转发给 Home 自己。
+#[test]
+fn rmdir_root_after_cache_removal_is_not_forwarded_to_self() {
+    let (_temp, owner, ctx, _disk, meta) = fixture_with_meta(false);
+    mkdir_root(&owner, &ctx, "d-self");
+    meta.set_fail_deactivate(true);
+    let error = Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d-self")).unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
+
+    let error = Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d-self")).unwrap_err();
+
+    assert_eq!(error.code(), afs_error::NODE_VFS_NOT_FOUND);
+}
+
+/// 本机 rmdir 解析出的仍是旧版本（期间旧版本被删除、同名重建）时，不能删除新 workspace。
+#[test]
+fn rmdir_root_resolved_before_same_name_recreate_keeps_new_workspace() {
+    let (temp, owner, ctx, _disk) = fixture(false);
+    let old = mkdir_root(&owner, &ctx, "d-stale");
+    let local = owner.require_local().unwrap();
+    let old_identity = local.record(old.inode.value).unwrap().identity;
+    Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d-stale")).unwrap();
+    mkdir_root(&owner, &ctx, "d-stale");
+    let (root_id, data_dir) = root_snapshot(&owner, temp.path(), "d-stale");
+    let new_epoch = local
+        .roots
+        .lookup_root_location(&root_id)
+        .unwrap()
+        .unwrap()
+        .epoch;
+    // 模拟内核在重建前已解析到旧版本：名字索引仍指向旧 identity。
+    {
+        let mut state = local.state.lock().unwrap();
+        let inode = state.root_names[OsStr::new("d-stale")];
+        state.inodes.get_mut(&inode).unwrap().identity = old_identity;
+    }
+
+    let error =
+        Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d-stale")).unwrap_err();
+
+    assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+    let location = local.roots.lookup_root_location(&root_id).unwrap().unwrap();
+    assert_eq!(location.epoch, new_epoch);
+    assert!(local.roots.has_active_local_root(&root_id));
+    assert!(data_dir.is_dir());
+}
+
+/// Home 删除过程中（Meta 已停用、本机索引尚未清理）同名 workspace 已在另一个 Home
+/// 重建，本机作为入口已经 lookup 到新版本。本机的清理只能回收被删版本的记录。
+#[test]
+fn rmdir_root_cleanup_keeps_new_version_published_during_delete() {
+    let (_temp, owner, ctx, _disk, meta) = fixture_with_meta(false);
+    let owner = Arc::new(owner);
+    let root = mkdir_root(&owner, &ctx, "d-switch");
+    let created = Backend::create(
+        &*owner,
+        &ctx,
+        root.inode,
+        OsStr::new("old-file"),
+        0o600,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    Backend::flush(&*owner, &ctx, created.handle).unwrap();
+    Backend::release(&*owner, &ctx, created.handle).unwrap();
+    Backend::unlink(&*owner, &ctx, root.inode, OsStr::new("old-file")).unwrap();
+    let local = owner.require_local().unwrap();
+    let old = local.record(root.inode.value).unwrap();
+    let root_id = old.root_id.clone();
+    let new_identity = files::FileIdentity(vec![0xab]);
+    let child = StoragePath::root()
+        .join_component(OsStr::new("new-file"))
+        .unwrap();
+    let weak = Arc::downgrade(&owner);
+    let (hook_root, hook_identity, hook_child, attributes) = (
+        root_id.clone(),
+        new_identity.clone(),
+        child.clone(),
+        old.attributes.clone(),
+    );
+    *meta.on_deactivate.lock().unwrap() = Some(Box::new(move || {
+        let owner = weak.upgrade().unwrap();
+        let mut state = owner.require_local().unwrap().state.lock().unwrap();
+        state.insert_root(
+            "d-switch".into(),
+            hook_root.clone(),
+            hook_identity,
+            attributes.clone(),
+        );
+        state.inode_for_path(
+            hook_root,
+            hook_child,
+            files::FileIdentity(vec![0xcd]),
+            attributes,
+            FileKind::Regular,
+        );
+    }));
+
+    Backend::rmdir(&*owner, &ctx, owner.root_inode(), OsStr::new("d-switch")).unwrap();
+
+    let state = local.state.lock().unwrap();
+    let inode = state.root_names[OsStr::new("d-switch")];
+    assert_eq!(state.inodes[&inode].identity, new_identity);
+    assert!(state.paths.contains_key(&(root_id.clone(), child)));
+    let remaining: Vec<_> = state
+        .inodes
+        .values()
+        .filter(|record| record.root_id == root_id)
+        .map(|record| record.identity.clone())
+        .collect();
+    assert_eq!(remaining.len(), 2);
+    assert!(!remaining.contains(&old.identity));
+}
+
+/// Home 上反复“创建文件 → 清空 → 删除 workspace → 同名创建”，记录数不随轮数增长。
+#[test]
+fn rmdir_root_reclaims_child_records_across_rounds() {
+    let (_temp, owner, ctx, _disk) = fixture(false);
+    for _ in 0..3 {
+        let root = mkdir_root(&owner, &ctx, "d-rounds");
+        let created = Backend::create(
+            &owner,
+            &ctx,
+            root.inode,
+            OsStr::new("file"),
+            0o600,
+            libc::O_RDWR,
+        )
+        .unwrap();
+        Backend::flush(&owner, &ctx, created.handle).unwrap();
+        Backend::release(&owner, &ctx, created.handle).unwrap();
+        Backend::unlink(&owner, &ctx, root.inode, OsStr::new("file")).unwrap();
+
+        Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d-rounds")).unwrap();
+
+        let state = owner.require_local().unwrap().state.lock().unwrap();
+        assert!(state.inodes.is_empty());
+        assert!(state.paths.is_empty() && state.root_names.is_empty());
+        assert!(state.identities.is_empty() && state.identity_members.is_empty());
+    }
+}
+
 /// VC-D3：删除后同名 root 可重建，新 root 有不同 epoch 且可读写。
 #[test]
 fn rmdir_root_then_recreate_same_name_succeeds() {
@@ -667,8 +867,8 @@ fn rmdir_root_then_recreate_same_name_succeeds() {
     assert!(second_data_dir.join("new").exists());
 }
 
-/// VC-D4：并发 rmdir 恰好一个成功，另一个在解析或缓存线性化点失败
-/// （ENOENT 或 invalid grant 错误）。
+/// VC-D4：并发 rmdir 恰好一个成功，另一个在解析或缓存线性化点失败，
+/// 统一返回 ENOENT。
 #[test]
 fn concurrent_rmdir_root_single_winner() {
     let (_temp, owner, ctx, _disk) = fixture(false);
@@ -697,10 +897,7 @@ fn concurrent_rmdir_root_single_winner() {
         .map(|error| error.code())
         .collect();
     assert_eq!(loser_codes.len(), 1);
-    assert!(matches!(
-        loser_codes[0],
-        afs_error::NODE_VFS_NOT_FOUND | afs_error::NODE_OWNER_INVALID_GRANT
-    ));
+    assert_eq!(loser_codes[0], afs_error::NODE_VFS_NOT_FOUND);
     // 最终状态干净：lookup ENOENT、catalog 空。
     assert!(Backend::lookup(owner.as_ref(), &ctx, owner.root_inode(), OsStr::new("d4")).is_err());
     assert!(
@@ -1113,7 +1310,7 @@ struct RemoteCreateFixture {
     _temp: tempfile::TempDir,
     owner: Arc<OwnerFs>,
     ctx: RequestContext,
-    service: crate::node::rpc::control::NodeControlService,
+    service: crate::node::rpc::control::OwnerControlService,
     request: afs_protocol::node_control::PrepareOwnerRootRequest,
 }
 
@@ -1152,10 +1349,8 @@ impl RemoteCreateFixture {
             requester_node_id: reservation.requester_node_id,
             requester_session_id: reservation.requester_session_id,
         };
-        let service = crate::node::rpc::control::NodeControlService::new(
-            crate::node::rpc::control::RdmaSessionRegistry::new(None),
-        )
-        .with_owner_locks(owner.peer_executor().unwrap(), Arc::new(RemoteCreatePeer));
+        let service = crate::node::rpc::control::OwnerControlService::new(Default::default())
+            .with_owner_locks(owner.peer_executor().unwrap(), Arc::new(RemoteCreatePeer));
         Self {
             _temp: temp,
             owner,
@@ -1172,14 +1367,14 @@ impl RemoteCreateFixture {
     }
 
     async fn prepare(&self) {
-        use afs_protocol::node_control::node_control_server::NodeControl;
+        use afs_protocol::node_control::owner_control_server::OwnerControl;
         self.service
             .prepare_owner_root(tonic::Request::new(self.request.clone()))
             .await
             .expect("creation must not depend on bind completion");
     }
     async fn reject_duplicate(&self) {
-        use afs_protocol::node_control::node_control_server::NodeControl;
+        use afs_protocol::node_control::owner_control_server::OwnerControl;
         let error = self
             .service
             .prepare_owner_root(tonic::Request::new(self.request.clone()))

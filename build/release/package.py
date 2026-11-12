@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from package_manifest import (  # noqa: E402
     AFS_BINARIES,
     BINARIES,
+    GVISOR_BINARIES,
     SANDBOXD_BINARIES,
     SANDBOXD_DEPLOYMENT_FILES,
 )
@@ -72,6 +73,10 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, identity, *, with_afs=
         inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
     elif runtime_root.is_file():
         inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
+    if "runtime/adx-runtime-rootfs.img" in inputs:
+        inputs["runtime/adx-runtime-rootfs.json"] = runtime_root.with_suffix(".json")
+        for name in ("source.json", "NOTICE"):
+            inputs[f"third_party/runtime-rootfs/{name}"] = ROOT / "third_party/runtime-rootfs" / name
     inputs["bin/redis-server"] = redis
     inputs["bin/redis-cli"] = redis_cli
     inputs["install.sh"] = ROOT / "build/release/install.sh"
@@ -82,7 +87,8 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, identity, *, with_afs=
     if (backend_dir is None) != (runsc is None):
         raise ValueError("sandboxd and runsc must be packaged together")
     if backend_dir is not None:
-        inputs["runtime/sandboxd/runsc"] = runsc
+        for name in GVISOR_BINARIES:
+            inputs[f"runtime/sandboxd/{name}"] = runsc if name == "runsc" else runsc.parent / name
         inputs["lib/sandboxd_preflight.py"] = ROOT / "build/e2e/preflight.py"
         for name in (*SANDBOXD_BINARIES, "manifest.json"):
             inputs[f"runtime/sandboxd/{name}"] = backend_dir / name

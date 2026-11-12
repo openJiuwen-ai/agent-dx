@@ -142,10 +142,12 @@ impl HomeExportAuthority {
         self.anchor.source.try_clone().map_err(Error::from)
     }
 
+    #[cfg(test)]
     pub(crate) fn grant(&self) -> &RootGrant {
         &self.grant
     }
 
+    #[cfg(test)]
     pub(crate) fn name(&self) -> &OsStr {
         &self.name
     }
@@ -154,6 +156,7 @@ impl HomeExportAuthority {
         self.source_identity
     }
 
+    #[cfg(test)]
     pub(crate) fn namespace(&self) -> NamespaceIdentity {
         self.namespace
     }

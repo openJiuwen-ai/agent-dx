@@ -14,7 +14,7 @@ struct Fixture {
 
 async fn generation_fixture() -> Fixture {
     let mut f = fixture().await;
-    f.commit.operation_id = OperationId::new(crate::meta::store::timed_request_id("generation"));
+    f.commit.operation_id = OperationId::new(crate::clock::timed_request_id("generation"));
     f.commit.chunk_receipts[0].operation_id = f.commit.operation_id.clone();
     let staged =
         StagedChunk::new_crc32c(f.commit.operation_id.clone(), f.staged.bytes().to_vec()).unwrap();
@@ -39,25 +39,24 @@ async fn generation_fixture() -> Fixture {
     f.commit.layout_root.inline_extents[0].chunk_id = staged.chunk.id.clone();
     f.staged = staged;
     f.service
-        .update_gc_reference(generation_admission(&f, false))
+        .update_gc_reference(generation_admission(&f))
         .await
         .unwrap();
     f
 }
 
-fn generation_admission(f: &Fixture, release: bool) -> crate::dfs::UpdateGcReference {
-    crate::dfs::UpdateGcReference {
-        open_read: None,
-        close_open_read: false,
+fn generation_reference_id(f: &Fixture) -> String {
+    format!("write:{}", f.commit.operation_id.0)
+}
 
+fn generation_admission(f: &Fixture) -> crate::dfs::UpdateGcReference {
+    crate::dfs::UpdateGcReference {
         node_id: "writer".into(),
         session_id: "writer-session".into(),
-        reference_id: format!("write:{}", f.commit.operation_id.0),
+        reference_id: generation_reference_id(f),
         inode_id: Some(f.commit.inode_id.clone()),
         version_id: None,
         publication: true,
-        chunks: vec![],
-        release,
         admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
     }
 }
@@ -92,7 +91,7 @@ async fn generation_commit_survives_unrelated_gc_and_reply_loss() {
     assert_eq!(committed, replay);
     assert!(
         f.service
-            .update_gc_reference(generation_admission(&f, false))
+            .update_gc_reference(generation_admission(&f))
             .await
             .is_err(),
         "finished generations cannot be readmitted"
@@ -103,7 +102,11 @@ async fn generation_commit_survives_unrelated_gc_and_reply_loss() {
 async fn generation_retirement_prevents_late_commit_and_readmission() {
     let f = generation_fixture().await;
     f.service
-        .update_gc_reference(generation_admission(&f, true))
+        .release_gc_references(
+            "writer".into(),
+            "writer-session".into(),
+            vec![generation_reference_id(&f)],
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -116,7 +119,7 @@ async fn generation_retirement_prevents_late_commit_and_readmission() {
     );
     assert!(
         f.service
-            .update_gc_reference(generation_admission(&f, false))
+            .update_gc_reference(generation_admission(&f))
             .await
             .is_err()
     );
@@ -137,15 +140,18 @@ async fn generation_retry_can_publish_retained_receipts_only_while_all_birth_gen
         let old_operation = f.commit.operation_id.clone();
         if retire_old {
             f.service
-                .update_gc_reference(generation_admission(&f, true))
+                .release_gc_references(
+                    "writer".into(),
+                    "writer-session".into(),
+                    vec![generation_reference_id(&f)],
+                )
                 .await
                 .unwrap();
         }
-        f.commit.operation_id = OperationId::new(crate::meta::store::timed_request_id(
-            "retry-with-new-writes",
-        ));
+        f.commit.operation_id =
+            OperationId::new(crate::clock::timed_request_id("retry-with-new-writes"));
         f.service
-            .update_gc_reference(generation_admission(&f, false))
+            .update_gc_reference(generation_admission(&f))
             .await
             .unwrap();
         let result = f
@@ -182,7 +188,7 @@ async fn generation_retry_can_publish_retained_receipts_only_while_all_birth_gen
 #[tokio::test]
 async fn generation_expired_identity_cannot_refresh_admission_after_tombstone_cleanup() {
     let f = fixture().await;
-    let mut request = generation_admission(&f, false);
+    let mut request = generation_admission(&f);
     request.reference_id = format!(
         "write:afs1-{}-old-generation",
         now_unix_ms().saturating_sub(60_001)
@@ -235,7 +241,11 @@ async fn generation_atomic_publication_condition_rejects_retirement_race() {
             result: OperationResult::Empty,
         }));
     f.service
-        .update_gc_reference(generation_admission(&f, true))
+        .release_gc_references(
+            "writer".into(),
+            "writer-session".into(),
+            vec![generation_reference_id(&f)],
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -296,7 +306,6 @@ async fn fixture() -> Fixture {
         })
         .await
         .unwrap();
-    let fence = service.current_gc_fence().await.unwrap();
     let operation_id = OperationId::new("publish-fenced");
     let staged = StagedChunk::new(operation_id.clone(), b"fenced body".to_vec());
     let placement = service.placement_snapshot("writer".into()).await.unwrap();
@@ -324,7 +333,7 @@ async fn fixture() -> Fixture {
         }],
     };
     let commit = CommitFileVersion {
-        gc_fence: Some(fence),
+        gc_fence: None,
         operation_id: operation_id.clone(),
         inode_id: inode.inode_id.clone(),
         write_lease,
@@ -396,45 +405,10 @@ async fn gc_fence_normal_real_persistence_commits_without_chunk_registrations() 
     assert_eq!(bytes, b"fenced body");
 }
 #[tokio::test]
-async fn gc_fence_completed_delete_cannot_reuse_old_receipt_after_list_clears() {
+async fn gc_fence_old_inflight_delete_rejected_without_a_generation_fence() {
     let f = fixture().await;
-    let batch = schedule_gc(&f).await;
-    f.local
-        .collect_generation(batch.generation, &batch.chunks)
-        .unwrap();
-    let cleared = f
-        .service
-        .collect_garbage(
-            "writer".into(),
-            "writer-session".into(),
-            batch.generation,
-            vec![],
-        )
-        .await
-        .unwrap();
-    assert!(cleared.chunks.is_empty());
-    assert_eq!(cleared.generation, batch.generation);
-    let error = f
-        .service
-        .commit_file_version("writer".into(), f.commit.clone())
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), afs_error::META_DFS_GC_CHANGED);
-    assert!(
-        f.service
-            .get_inode(f.commit.inode_id.clone())
-            .await
-            .unwrap()
-            .head_version
-            .is_none()
-    );
-}
-#[tokio::test]
-async fn gc_fence_old_inflight_delete_rejected_even_with_matching_state_version() {
-    let mut f = fixture().await;
     let _batch = schedule_gc(&f).await;
-    // Model a deletion already in flight when this write generation began.
-    f.commit.gc_fence = Some(f.service.current_gc_fence().await.unwrap());
+    // A deletion is already in flight when this commit is first evaluated.
     assert!(
         f.service
             .commit_file_version("writer".into(), f.commit.clone())
@@ -465,8 +439,7 @@ async fn gc_fence_atomic_condition_rejects_gc_between_check_and_publish() {
             operation: StoreOperation::DfsCommitFileVersion,
             result: OperationResult::Empty,
         }));
-    txn.conditions
-        .push(f.commit.gc_fence.unwrap().condition().unwrap());
+    txn.conditions.push(TxnCondition::Missing(MetaKey::DfsGc));
     txn.mutations
         .push(TxnMutation::Put(MetaEntity::DfsFileVersion(
             f.commit.file_version.clone(),
@@ -522,9 +495,14 @@ async fn gc_fence_lost_reply_replays_success_even_after_gc_state_changes() {
         )
         .await
         .unwrap();
-    assert_ne!(
-        Some(f.service.current_gc_fence().await.unwrap()),
-        f.commit.gc_fence
+    assert!(
+        f.store
+            .read(MetaRead::DfsGc)
+            .await
+            .unwrap()
+            .entity
+            .is_some(),
+        "GC state must have changed since the original commit"
     );
     let replay = f
         .service
@@ -535,10 +513,17 @@ async fn gc_fence_lost_reply_replays_success_even_after_gc_state_changes() {
 }
 #[test]
 fn gc_fence_wire_is_explicit_and_rejects_missing_kind() {
-    for fence in [GcFence::Absent, GcFence::Revision(9)] {
-        assert_eq!(GcFence::from_wire(fence.wire()).unwrap(), fence);
-    }
+    let fence = GcFence::WriteGeneration;
+    assert_eq!(GcFence::from_wire(fence.wire()).unwrap(), fence);
     assert!(GcFence::from_wire(afs_protocol::meta::DfsGcFence { kind: None }).is_err());
+    assert!(
+        GcFence::from_wire(afs_protocol::meta::DfsGcFence {
+            kind: Some(afs_protocol::meta::dfs_gc_fence::Kind::WriteGeneration(
+                false
+            )),
+        })
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -586,7 +571,11 @@ async fn late_admission_replay_after_tombstone_collection_is_rejected() {
     let mut f = generation_fixture().await;
     f.service = f.service.with_gc_grace_ms(0);
     f.service
-        .update_gc_reference(generation_admission(&f, true))
+        .release_gc_references(
+            "writer".into(),
+            "writer-session".into(),
+            vec![generation_reference_id(&f)],
+        )
         .await
         .unwrap();
     f.service
@@ -595,7 +584,7 @@ async fn late_admission_replay_after_tombstone_collection_is_rejected() {
         .unwrap();
     assert!(
         f.service
-            .update_gc_reference(generation_admission(&f, false))
+            .update_gc_reference(generation_admission(&f))
             .await
             .is_err(),
         "a collected tombstone must not let an abandoned admission resurrect an active reference while its original deadline is still valid"
@@ -607,7 +596,11 @@ async fn tombstone_retention_still_reclaims_unprotected_data_at_short_grace() {
     let mut f = generation_fixture().await;
     f.service = f.service.with_gc_grace_ms(0);
     f.service
-        .update_gc_reference(generation_admission(&f, true))
+        .release_gc_references(
+            "writer".into(),
+            "writer-session".into(),
+            vec![generation_reference_id(&f)],
+        )
         .await
         .unwrap();
     let gc = f
@@ -626,7 +619,7 @@ async fn tombstone_retention_still_reclaims_unprotected_data_at_short_grace() {
     );
     assert!(
         f.service
-            .update_gc_reference(generation_admission(&f, false))
+            .update_gc_reference(generation_admission(&f))
             .await
             .is_err(),
         "the lingering record must keep fencing the abandoned admission"
@@ -638,25 +631,25 @@ async fn new_operation_on_same_node_admits_normally_after_tombstone_collection()
     let mut f = generation_fixture().await;
     f.service = f.service.with_gc_grace_ms(0);
     f.service
-        .update_gc_reference(generation_admission(&f, true))
+        .release_gc_references(
+            "writer".into(),
+            "writer-session".into(),
+            vec![generation_reference_id(&f)],
+        )
         .await
         .unwrap();
     f.service
         .collect_garbage("writer".into(), "writer-session".into(), 0, vec![])
         .await
         .unwrap();
-    f.commit.operation_id = OperationId::new(crate::meta::store::timed_request_id("next-op"));
+    f.commit.operation_id = OperationId::new(crate::clock::timed_request_id("next-op"));
     let fresh = crate::dfs::UpdateGcReference {
-        open_read: None,
-        close_open_read: false,
         node_id: "writer".into(),
         session_id: "writer-session".into(),
         reference_id: format!("write:{}", f.commit.operation_id.0),
         inode_id: Some(f.commit.inode_id.clone()),
         version_id: None,
         publication: true,
-        chunks: vec![],
-        release: false,
         admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
     };
     assert!(

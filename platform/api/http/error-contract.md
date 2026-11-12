@@ -67,7 +67,11 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 
 内部 RPC 的连接拒绝、连接重置等传输不可用返回 HTTP 503。Tonic 在握手或重连期间将部分连接重置报告为 `Unknown / transport error` 或带有传输来源的 `Cancelled`；API Server 仅在错误来源链包含 `tonic::transport::Error` 时归一为 `Unavailable`，不会把应用返回的 `Unknown`、`Cancelled` 或 `Internal` 一律改成 503。RPC 超时归一为 504、`DEADLINE_EXCEEDED`；只有等待超时而没有确认终态时，仍使用 `outcome=unknown`、`retry=same_operation`。写请求的结果可能未知，创建重试沿用原 Request ID 和 Environment ID；尚未成功确认的执行可以重新分配 generation，并由对账回收残留。已确认成功和后续生命周期继续校验归属代次；不能因连接失败覆盖已有成功。
 
+认证依赖 Redis Coordinator 发现时，共享发现库仅对瞬态连接故障在同一绝对期限内至多重读一次幂等发现脚本。锁等待、连接建立及两次查询共用发现预算；API Server 的一次未缓存凭据验证还将发现、channel 获取和 `VerifyApiKey` 纳入同一原始 RPC 预算。坏记录、缺失记录、epoch 不匹配、Redis 认证／配置和命令错误不触发传输重读，仍拒绝认证；认证依赖不可用或预算耗尽对原生 HTTP 入口保持 503，无效 API Key 保持 401。此恢复不重放 API 写操作。连接故障阶段、错误类别、尝试次数和耗时在服务端结构化记录，不将 Redis URL、凭据或原始错误文本写入诊断；用例和执行入口见 [发现库](../../crates/discovery/README.md)。
+
 E2B 管理入口使用自己的协议错误响应。`POST /v2/sandboxes` 调用共享创建能力后，创建调用及后续控制记录/详情读取的 `Unavailable` 对外映射为 500，避免 E2B SDK 收到 503 后以新实例身份自动重建。创建前的认证、模板预检错误保留原映射；超时仍为 504，其他 E2B 路由不受影响。此规则仅作用于适配层，不改变上述原生错误合同，不增加跨请求幂等，也不因应答失败删除结果未知的实例。
+
+`POST /sandboxes` 与 `POST /v2/sandboxes` 按 snapshot ID 创建时，缺失或已逻辑删除（Deleting/Deleted）的快照源返回 E2B 404；仍存在的其他非 Ready 源返回 409。上述错误均在共享创建调用前返回，不创建实例。租户权限检查先于快照状态判断，沿用上游读取的权限错误；适配层检测到非本租户执行规格时返回 404。已注册模板没有可用 Ready build 的情况仍为 409。
 
 ### 创建超时阶段
 
@@ -195,6 +199,14 @@ a Published terminal Failed result. It maps to retry=never/outcome=terminal; pla
 transport Unavailable or DeadlineExceeded retains outcome=unknown. API diagnostics
 export bounded labels rather than raw error messages. See the
 [Sandbox metric contract](../../../docs/testing/sandbox-observability.md).
+
+Golden snapshot preparation consumes explicit `adx-create-terminal=true` or
+`adx-backend-failure=true` statuses at the seed creation boundary, before generic
+dependency error conversion. The build enters Failed with the bounded original
+error message; subsequent reconciliation cleans its seed without retrying creation
+and preserves the family's latest successful capture. E2B build status exposes
+this as `error` with `reason.message`. Unmarked NotFound, transport errors and
+uncertain capture results retain the existing reconciliation behavior.
 
 ### Volume 管理错误
 

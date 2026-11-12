@@ -1,6 +1,198 @@
 use super::*;
 
 #[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn terminal_seed_create_failure_finishes_build_and_retains_previous_success() {
+    Box::pin(terminal_seed_create_failure_scenario()).await;
+}
+
+async fn terminal_seed_create_failure_scenario() {
+    use adx_core::{snapshot_preparation::PreparationState, snapshots::Snapshot};
+
+    let redis = common::Redis::new().await;
+    let session = redis.store().await.begin(1).await.unwrap();
+    let coordinator = CoordinatorRpc::new(
+        session.clone(),
+        Placement::Pack,
+        peers(),
+        client_tls("coordinator"),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let ml = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = ml.local_addr().unwrap();
+    let publication = RoutePublisher::new(session.clone(), peers());
+    let mut servers = Servers(vec![serve_lifecycle_coordinator(
+        ml,
+        coordinator.clone(),
+        adx_coordinator::auth::AuthRpc::new(session.clone(), peers()),
+        publication,
+    )]);
+    let backend = Arc::new(Backend {
+        session: session.clone(),
+        started: AtomicUsize::new(0),
+        removed: AtomicUsize::new(0),
+        running: Mutex::default(),
+        pause_writes_after_remove: Mutex::new(None),
+    });
+    let sink = Arc::new(
+        CoordinatorStateSink::new(channel(address, "node").await, Duration::from_secs(2))
+            .unwrap()
+            .with_session("golden-boot".into()),
+    );
+    let manager = Arc::new(Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        Arc::new(LocalChecks),
+        Arc::new(LocalChecks),
+        sink,
+    ));
+    manager
+        .update_capacity(spec("capacity").resources, Duration::from_secs(60))
+        .unwrap();
+    let nl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_address = nl.local_addr().unwrap();
+    servers.0.push(serve_lifecycle_node(
+        nl,
+        NodeRpc::new(manager, peers(), "golden-boot".into()),
+    ));
+    let mut node_client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(address, "node").await,
+    );
+    let mut register = pb::RegisterNodeRequest {
+        node_id: "node".into(),
+        node_address: node_address.to_string(),
+        proxy_address: "127.0.0.1:9999".into(),
+        session_id: "golden-boot".into(),
+        heartbeat_sequence: 1,
+        reconciling: true,
+        capacity: Some(spec("capacity").resources.into()),
+        runtime_classes: vec!["runc".into()],
+        ..Default::default()
+    };
+    node_client.register_node(register.clone()).await.unwrap();
+    node_client
+        .inspect_node(pb::InspectNodeRequest {
+            node_id: "node".into(),
+            session_id: "golden-boot".into(),
+        })
+        .await
+        .unwrap();
+    register.heartbeat_sequence += 1;
+    register.reconciling = false;
+    register.accepting_allocations = true;
+    node_client.register_node(register).await.unwrap();
+    let mut templates =
+        pb::snapshot_preparation_service_client::SnapshotPreparationServiceClient::new(
+            channel(address, "apiserver").await,
+        );
+
+    for (index, failure, reason) in [
+        (0, "image_missing", "manifest_unknown"),
+        (1, "unavailable", "injected runtime start failure"),
+    ] {
+        let name = format!("golden-failure-{index}");
+        let retained_snapshot = format!("snapshot-retained-{index}");
+        let previous_spec = spec(&format!("previous-{index}"));
+        session
+            .publish_snapshot(
+                Snapshot::new_with_kind(
+                    adx_core::snapshots::SnapshotKind::Golden,
+                    retained_snapshot.clone(),
+                    vec![name.clone()],
+                    previous_spec.clone(),
+                    "node".into(),
+                    format!("previous-{index}-1"),
+                    adx_core::CheckpointArtifact {
+                        storage: "shared".into(),
+                        scope: String::new(),
+                        location: "retained-artifact".into(),
+                        size_bytes: 1,
+                    },
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (family, previous) = session
+            .register_snapshot_preparation("tenant", &name, previous_spec.resources)
+            .await
+            .unwrap();
+        session
+            .update_snapshot_template(&family.id, |template| {
+                template.preparation.state = PreparationState::Ready;
+                template.preparation.spec = Some(previous_spec.clone());
+                template.preparation.snapshot_id = Some(retained_snapshot.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut bad = spec(&format!("bad-seed-{index}"));
+        bad.env.insert("FAIL_START".into(), failure.into());
+        let (_, build) = session
+            .register_snapshot_preparation("tenant", &name, bad.resources)
+            .await
+            .unwrap();
+        session
+            .update_snapshot_template(&family.id, |template| {
+                template.preparation.state = PreparationState::Creating;
+                template.preparation.spec = Some(bad.clone());
+                template.preparation.cleanup_pending = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            coordinator.reconcile_snapshot_preparations(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let failed = templates
+            .get_snapshot_preparation(pb::GetSnapshotPreparationRequest {
+                caller: caller(),
+                template_id: family.id.clone(),
+                preparation_id: build.id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(failed.phase, pb::SnapshotPreparationPhase::Failed as i32);
+        assert!(failed.error.contains(reason), "{}", failed.error);
+        assert!(matches!(
+            session.get(&bad.id).await,
+            Err(adx_core::Error::NotFound)
+        ));
+        let retained = templates
+            .resolve_snapshot_template(pb::ResolveSnapshotTemplateRequest {
+                caller: caller(),
+                reference: name,
+                registration_only: false,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(retained.preparation_id, previous.id);
+        assert_eq!(retained.snapshot_id, retained_snapshot);
+        assert_eq!(retained.phase, pb::SnapshotPreparationPhase::Ready as i32);
+        coordinator.reconcile_snapshot_preparations().await.unwrap();
+        let cleaned = session
+            .get_snapshot_template("tenant", &family.id)
+            .await
+            .unwrap();
+        assert_eq!(cleaned.preparation.state, PreparationState::Failed);
+        assert!(!cleaned.preparation.cleanup_pending);
+        assert!(cleaned.preparation.spec.is_none());
+        assert!(session.get_snapshot(&retained_snapshot).await.is_ok());
+        assert_eq!(backend.started.load(Ordering::SeqCst), index + 1);
+        assert!(backend.running.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires isolated Redis and generated mTLS certificates"]
 async fn preparation_rpc_keeps_registration_distinct_from_ready_and_tenant_scoped() {
     let redis = common::Redis::new().await;
@@ -104,7 +296,7 @@ async fn preparation_rpc_keeps_registration_distinct_from_ready_and_tenant_scope
         .unwrap()
         .into_inner();
     assert_eq!(failed.phase, pb::SnapshotPreparationPhase::Failed as i32);
-    session
+    let missing_capture = session
         .update_snapshot_template(&first.template_id, |template| {
             let build = &mut template.preparation;
             build.state = adx_core::snapshot_preparation::PreparationState::Ready;
@@ -112,8 +304,8 @@ async fn preparation_rpc_keeps_registration_distinct_from_ready_and_tenant_scope
             build.cleanup_pending = false;
             Ok(())
         })
-        .await
-        .unwrap();
+        .await;
+    assert_eq!(missing_capture.unwrap_err(), adx_core::Error::Conflict);
     let unavailable = client
         .resolve_snapshot_template(pb::ResolveSnapshotTemplateRequest {
             caller: caller(),
@@ -140,6 +332,17 @@ async fn preparation_rpc_keeps_registration_distinct_from_ready_and_tenant_scope
     )
     .unwrap();
     session.publish_snapshot(golden).await.unwrap();
+    session
+        .update_snapshot_template(&first.template_id, |template| {
+            let build = &mut template.preparation;
+            build.state = adx_core::snapshot_preparation::PreparationState::Ready;
+            build.spec = Some(spec("source"));
+            build.snapshot_id = Some("snapshot-missing".into());
+            build.error = None;
+            Ok(())
+        })
+        .await
+        .unwrap();
     let second = client
         .register_snapshot_preparation(input.clone())
         .await

@@ -46,6 +46,18 @@ struct LiveNode {
     inspected: bool,
     report: pb::RegisterNodeRequest,
 }
+
+fn confirmed_create_failure(status: &Status) -> bool {
+    ["adx-create-terminal", "adx-backend-failure"]
+        .iter()
+        .any(|key| {
+            status
+                .metadata()
+                .get(*key)
+                .is_some_and(|value| value == "true")
+        })
+}
+
 struct State {
     session: Session,
     scheduler: Coordinator,
@@ -1445,17 +1457,10 @@ impl CoordinatorRpc {
                     }
                     Err(error)
                         if adx_protocol::deadline_failure(&error).is_none()
-                            && error
-                                .metadata()
-                                .get("adx-backend-failure")
-                                .is_none_or(|value| value != "true")
                             // A confirmed terminal create failure (for example a
                             // readiness probe failure) must not be retried as if
                             // it were a transient transport error.
-                            && error
-                                .metadata()
-                                .get("adx-create-terminal")
-                                .is_none_or(|value| value != "true")
+                            && !confirmed_create_failure(&error)
                             && matches!(
                                 error.code(),
                                 tonic::Code::Unavailable
@@ -2727,6 +2732,28 @@ pub(crate) mod recovery_test_profile;
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_create_failure_markers_confirm_a_terminal_result() {
+        for code in [
+            tonic::Code::NotFound,
+            tonic::Code::Unavailable,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Unknown,
+            tonic::Code::ResourceExhausted,
+        ] {
+            let unmarked = Status::new(code, "result unknown");
+            assert!(!confirmed_create_failure(&unmarked));
+            for key in ["adx-create-terminal", "adx-backend-failure"] {
+                for marker in ["false", "unknown", "true"] {
+                    let mut status = Status::new(code, "create failed");
+                    status.metadata_mut().insert(key, marker.parse().unwrap());
+                    assert_eq!(confirmed_create_failure(&status), marker == "true");
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     #[ignore = "requires isolated Redis; set ADX_TEST_REDIS_SERVER"]

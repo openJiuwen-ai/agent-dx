@@ -1,0 +1,37 @@
+//! Node fault layer. Normal paths only record and report (a `Result`, a
+//! `CopyLifecycle` transition, a `GcPin`); the decisions those records feed
+//! live here.
+//!
+//! - `classify`: named error classifications, one per question.
+//! - `repair`: the replication-task loop (report quarantines, claim, copy,
+//!   report).
+//! - `reaper`: the GC collection loop.
+//! - `lease_keeper`: background writer-lease renewal, plus `ensure_fresh` for
+//!   the three main paths whose contract needs a fresh lease (J4).
+//! - `scrub`: background verification of local durable copies (S4-16).
+//! - `suspect`: a reader's failed verification of a peer copy, reviewed by the
+//!   holder.
+//!
+//! Loop conventions shared by `repair`, `reaper` and `lease_keeper`: each is
+//! a named component built by the Node assembly (`node::assembly`) and
+//! started with `start(services)` as one service of the node's `Services`;
+//! it stops when `services.stop` fires, checked between passes, never inside
+//! one. Each pass runs on the blocking pool. A pass error is logged at warn
+//! and retried on the next period. A failed blocking worker is logged and
+//! retried, except in `repair`, where a panic fails the service so a
+//! duplicate worker cannot start. `node::background` states the convention
+//! for every Node background service and lists them all.
+
+pub(crate) mod classify;
+#[cfg(all(feature = "dfs", feature = "diagnostics"))]
+pub(crate) mod experiment;
+#[cfg(feature = "dfs")]
+pub(crate) mod lease_keeper;
+#[cfg(feature = "dfs")]
+pub(crate) mod reaper;
+#[cfg(feature = "dfs")]
+pub(crate) mod repair;
+#[cfg(feature = "dfs")]
+pub(crate) mod scrub;
+#[cfg(feature = "dfs")]
+pub(crate) mod suspect;

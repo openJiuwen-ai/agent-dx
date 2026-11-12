@@ -3,8 +3,8 @@
 use super::{
     MetaRead, MetaStore, NodeSessionLease, OperationResult, RequestKey, RequestOutcome, Store,
     StoreRevision, TxnOutcome, WatchBatch,
-    journal::{LogLimits, MetaLog},
-    local_log::LocalLog,
+    journal::MetaLog,
+    local_log::{LocalLog, LocalLogOptions},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -71,7 +71,7 @@ fn lease(session: &str) -> NodeSessionLease {
 async fn child(directory: &Path) {
     let root = directory.join("meta");
     let store = Store::open_log(Arc::new(
-        LocalLog::open(&root, LogLimits::default()).unwrap(),
+        LocalLog::open(&root, LocalLogOptions::default()).unwrap(),
     ))
     .await
     .unwrap();
@@ -166,7 +166,7 @@ async fn p3_process_crash_matrix() {
         let root = directory.join("meta");
         let wal = root.join("wal-00000000000000000001.log");
         let before = fs::read(&wal).unwrap();
-        let log = Arc::new(LocalLog::open(&root, LogLimits::default()).unwrap());
+        let log = Arc::new(LocalLog::open(&root, LocalLogOptions::default()).unwrap());
         let store = Store::open_log(log.clone()).await.unwrap();
         let count = if point == "partial_second" { 2 } else { 3 };
         assert_eq!(log.recover().await.unwrap().tip.sequence, count);
@@ -294,7 +294,7 @@ async fn p3_initialization_process_crash() {
     if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
         let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
         fs::write(directory.join("armed"), b"no listener or business ACK").unwrap();
-        LocalLog::open(directory.join("meta"), LogLimits::default()).unwrap();
+        LocalLog::open(directory.join("meta"), LocalLogOptions::default()).unwrap();
         panic!("initialization faultpoint was not reached");
     }
     let directory = tempfile::tempdir().unwrap().keep();
@@ -331,7 +331,7 @@ async fn p3_initialization_process_crash() {
     let root = directory.join("meta");
     let identity = fs::read(root.join("IDENTITY")).unwrap();
     assert!(root.join("INITIALIZING").exists());
-    let log = Arc::new(LocalLog::open(&root, LogLimits::default()).unwrap());
+    let log = Arc::new(LocalLog::open(&root, LocalLogOptions::default()).unwrap());
     assert_eq!(fs::read(root.join("IDENTITY")).unwrap(), identity);
     assert!(!root.join("INITIALIZING").exists());
     let store = Store::open_log(log.clone()).await.unwrap();
@@ -359,7 +359,7 @@ async fn p3_initialization_process_crash() {
     .unwrap();
     drop(log);
     let store = Store::open_log(Arc::new(
-        LocalLog::open(&root, LogLimits::default()).unwrap(),
+        LocalLog::open(&root, LocalLogOptions::default()).unwrap(),
     ))
     .await
     .unwrap();
@@ -378,8 +378,8 @@ async fn p3_initialization_process_crash() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-fn checkpoint_log_limits() -> LogLimits {
-    LogLimits {
+fn checkpoint_log_limits() -> LocalLogOptions {
+    LocalLogOptions {
         record_max_bytes: 1024,
         batch_max_bytes: 4096,
         wal_max_bytes: 128 * 1024,
@@ -388,10 +388,10 @@ fn checkpoint_log_limits() -> LogLimits {
     }
 }
 
-fn checkpoint_image_limits() -> super::journal::CheckpointLimits {
-    super::journal::CheckpointLimits {
+fn checkpoint_image_limits() -> super::local_log::LocalCheckpointLimits {
+    super::local_log::LocalCheckpointLimits {
         image_max_bytes: 64 * 1024,
-        capture_charge_max_bytes: 256 * 1024,
+        validation_charge_max_bytes: 256 * 1024,
         disk_max_bytes: 512 * 1024,
         files_max: 8,
     }
@@ -418,7 +418,10 @@ async fn checkpoint_child(directory: &Path) {
     for number in 1..=12 {
         let record = records.next().unwrap();
         state = state.replay_record(&record).unwrap();
-        tip = log.append_and_sync(tip, vec![record]).await.unwrap();
+        tip = log
+            .append_and_sync(tip.at(log.term()), vec![record])
+            .await
+            .unwrap();
         if number == 4 || number == 8 {
             log.install_checkpoint(
                 tip,
@@ -445,7 +448,7 @@ async fn checkpoint_child(directory: &Path) {
     )
     .unwrap();
     if std::env::var(POINT).unwrap().starts_with("rotation_") {
-        log.append_and_sync(tip, vec![records.next().unwrap()])
+        log.append_and_sync(tip.at(log.term()), vec![records.next().unwrap()])
             .await
             .unwrap();
     } else {
@@ -620,7 +623,7 @@ async fn p3_checkpoint_process_crash_matrix() {
         let record = super::journal::test_records(13).pop().unwrap();
         restored = restored.replay_record(&record).unwrap();
         let tip = log
-            .append_and_sync(witness.tip, vec![record])
+            .append_and_sync(witness.tip.at(log.term()), vec![record])
             .await
             .unwrap();
         log.install_checkpoint(
@@ -697,7 +700,7 @@ async fn p3_repeated_unselected_checkpoint_crashes_remain_recoverable() {
             .unwrap();
         state = state.replay_record(&record).unwrap();
         let tip = log
-            .append_and_sync(recovered.tip, vec![record])
+            .append_and_sync(recovered.tip.at(log.term()), vec![record])
             .await
             .unwrap();
         fs::write(
@@ -782,7 +785,7 @@ async fn p3_repeated_unselected_checkpoint_crashes_remain_recoverable() {
             .unwrap();
         state = state.replay_record(&record).unwrap();
         let tip = log
-            .append_and_sync(witness.tip, vec![record])
+            .append_and_sync(witness.tip.at(log.term()), vec![record])
             .await
             .unwrap();
         log.install_checkpoint(
@@ -813,4 +816,294 @@ async fn p3_repeated_unselected_checkpoint_crashes_remain_recoverable() {
         "only selected current/previous images may remain"
     );
     fs::remove_dir_all(directory).unwrap();
+}
+
+/// A writer open selects its term in CURRENT before returning. Killed before
+/// or after that CURRENT write, the next open recovers every acknowledged
+/// record and selects a term above every term ever made durable.
+#[tokio::test(flavor = "current_thread")]
+async fn p3_open_term_process_crash() {
+    const OPEN_TERM_TEST: &str = "meta::store::crash_tests::p3_open_term_process_crash";
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+        fs::write(directory.join("armed"), b"term-1 writer closed").unwrap();
+        LocalLog::open(directory.join("meta"), LocalLogOptions::default()).unwrap();
+        panic!("open term faultpoint was not reached");
+    }
+    let records = super::journal::test_records(2);
+    for (point, durable_term) in [("open_term_prepared", 1), ("open_term_selected", 2)] {
+        let directory = tempfile::tempdir().unwrap().keep();
+        eprintln!(
+            "P3 open-term crash case={point} evidence={}",
+            directory.display()
+        );
+        let root = directory.join("meta");
+        let log = LocalLog::open(&root, LocalLogOptions::default()).unwrap();
+        assert_eq!(log.term(), 1);
+        let tip = log
+            .append_and_sync(super::journal::LogTip::EMPTY.at(1), records[..1].to_vec())
+            .await
+            .unwrap();
+        drop(log);
+        let output = File::create(directory.join("child.log")).unwrap();
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", OPEN_TERM_TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env(POINT, point)
+                .env(DIRECTORY, &directory)
+                .stdout(Stdio::from(output.try_clone().unwrap()))
+                .stderr(Stdio::from(output))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !directory.join("reached").is_file() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "open-term child exited before {point}: {}",
+                fs::read_to_string(directory.join("child.log")).unwrap()
+            );
+            assert!(Instant::now() < deadline, "open-term child timeout");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        let log = LocalLog::open(&root, LocalLogOptions::default()).unwrap();
+        let recovered = log.recover().await.unwrap();
+        assert_eq!(recovered.term, durable_term + 1, "{point}");
+        assert_eq!(recovered.tip, tip, "{point}: acknowledged record kept");
+        let next = log
+            .append_and_sync(recovered.cursor(), records[1..].to_vec())
+            .await
+            .unwrap();
+        drop(log);
+        let log = LocalLog::open(&root, LocalLogOptions::default()).unwrap();
+        let again = log.recover().await.unwrap();
+        assert!(again.term > recovered.term, "{point}: term stays monotonic");
+        assert_eq!(again.tip, next);
+        assert_eq!(again.records.len(), 2);
+        drop(log);
+        drop(child);
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+fn r86_commit(number: u64) -> super::MetaTxn {
+    use super::{MetaEntity, MetaTxn, StoreOperation, TxnCondition, TxnMutation};
+    use crate::dfs::{ChunkId, Extent, FileVersion, FileVersionId, LayoutRoot, LayoutRootId};
+
+    let fixtures = super::codec::tests::entity_fixtures();
+    let MetaEntity::DfsInode(mut inode) = fixtures[7].clone() else {
+        panic!("expected an inode fixture");
+    };
+    let version = FileVersionId::new(format!("r86-version-{number}"));
+    let layout = LayoutRootId::new(format!("r86-layout-{number}"));
+    inode.head_version = Some(version.clone());
+    inode.revision = number;
+    let request = RequestKey::new("r86", format!("append-{number}"));
+    let operation = StoreOperation::DfsCommitFileVersion;
+    let mut txn = MetaTxn::new(request.clone(), operation);
+    txn.conditions
+        .push(TxnCondition::RequestAbsent(request.clone()));
+    txn.mutations.extend([
+        TxnMutation::Put(MetaEntity::DfsFileVersion(FileVersion {
+            id: version,
+            inode_id: inode.inode_id.clone(),
+            parent_version: (number > 1)
+                .then(|| FileVersionId::new(format!("r86-version-{}", number - 1))),
+            length: number * 4096,
+            layout_root: layout.clone(),
+            created_at_unix_ms: number,
+        })),
+        TxnMutation::Put(MetaEntity::DfsLayoutRoot(Arc::new(LayoutRoot {
+            id: layout,
+            file_length: number * 4096,
+            inline_extents: (0..number)
+                .map(|index| Extent {
+                    file_offset: index * 4096,
+                    length: 4096,
+                    chunk_id: ChunkId::new(format!("r86-chunk-{index}")),
+                    chunk_offset: 0,
+                })
+                .collect(),
+        }))),
+        TxnMutation::Put(MetaEntity::DfsInode(inode.clone())),
+        TxnMutation::RecordRequestOutcome(RequestOutcome {
+            request,
+            operation,
+            result: OperationResult::DfsInode(inode),
+        }),
+    ]);
+    txn
+}
+
+#[tokio::test]
+async fn r86_overwrite_keeps_full_layout_between_append_records() {
+    use super::{MetaEntity, TxnMutation, log::Record};
+    use crate::dfs::ChunkId;
+
+    let directory = tempfile::tempdir().unwrap();
+    let log = Arc::new(LocalLog::open(directory.path(), LocalLogOptions::default()).unwrap());
+    let store = Store::open_log(log.clone()).await.unwrap();
+    let mut expected = Vec::new();
+    for number in 1..=4 {
+        let mut txn = r86_commit(number);
+        if number >= 3 {
+            let layout = txn
+                .mutations
+                .iter_mut()
+                .find_map(|mutation| match mutation {
+                    TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout)) => Some(layout),
+                    _ => None,
+                })
+                .unwrap();
+            Arc::make_mut(layout).inline_extents[0].chunk_id = ChunkId::new("r86-overwritten");
+            expected.push(layout.clone());
+        }
+        assert!(matches!(
+            store.compare_and_commit(txn).await.unwrap(),
+            TxnOutcome::Committed { .. }
+        ));
+    }
+    let recovered = log.recover().await.unwrap();
+    assert!(matches!(
+        recovered.records.as_slice(),
+        [
+            Record::Decision { .. },
+            Record::AppendLayout { .. },
+            Record::Decision { .. },
+            Record::AppendLayout { .. }
+        ]
+    ));
+    drop(store);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while Arc::strong_count(&log) > 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(log);
+    let log = Arc::new(LocalLog::open(directory.path(), LocalLogOptions::default()).unwrap());
+    let restored = Store::open_log(log).await.unwrap();
+    for layout in expected {
+        let actual = restored
+            .read(MetaRead::DfsLayoutRoot(layout.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(actual.entity, Some(MetaEntity::DfsLayoutRoot(layout)));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r86_layout_append_process_crash() {
+    const NAME: &str = "meta::store::crash_tests::r86_layout_append_process_crash";
+
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+        let log =
+            Arc::new(LocalLog::open(directory.join("meta"), LocalLogOptions::default()).unwrap());
+        let store = Store::open_log(log.clone()).await.unwrap();
+        let point = std::env::var(POINT).unwrap();
+        assert!(matches!(
+            store.compare_and_commit(r86_commit(1)).await.unwrap(),
+            TxnOutcome::Committed { .. }
+        ));
+        if point.starts_with("checkpoint_") {
+            store.checkpoint().await.unwrap();
+            assert!(matches!(
+                store.compare_and_commit(r86_commit(2)).await.unwrap(),
+                TxnOutcome::Committed { .. }
+            ));
+            let recovered = log.recover().await.unwrap();
+            assert!(matches!(
+                recovered.records.last(),
+                Some(super::log::Record::AppendLayout { .. })
+            ));
+            fs::write(directory.join("armed"), b"append ACK complete").unwrap();
+            store.checkpoint().await.unwrap();
+        } else {
+            fs::write(directory.join("armed"), b"base ACK complete").unwrap();
+            store.compare_and_commit(r86_commit(2)).await.unwrap();
+        }
+        panic!("selected layout append crash point was not reached");
+    }
+
+    for point in [
+        "after_append_before_sync",
+        "after_sync_before_publish",
+        "checkpoint_image_installed",
+        "checkpoint_selected",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let child_log = File::create(directory.path().join("child.log")).unwrap();
+        let mut process = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env(POINT, point)
+                .env(DIRECTORY, directory.path())
+                .stdout(Stdio::from(child_log.try_clone().unwrap()))
+                .stderr(Stdio::from(child_log))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let reached = directory.path().join("reached");
+        while !reached.is_file() {
+            assert!(
+                process.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "did not reach {point}: {}",
+                fs::read_to_string(directory.path().join("child.log")).unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(fs::read_to_string(reached).unwrap().starts_with(point));
+        process.0.kill().unwrap();
+        assert_eq!(process.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        let log = Arc::new(
+            LocalLog::open(directory.path().join("meta"), LocalLogOptions::default()).unwrap(),
+        );
+        let store = Store::open_log(log.clone()).await.unwrap();
+        let recovered = log.recover().await.unwrap();
+        assert_eq!(recovered.tip.sequence, 2);
+        if !point.starts_with("checkpoint_") {
+            assert!(matches!(
+                recovered.records.last(),
+                Some(super::log::Record::AppendLayout { .. })
+            ));
+        }
+        let layout = store
+            .read(MetaRead::DfsLayoutRoot(crate::dfs::LayoutRootId::new(
+                "r86-layout-2",
+            )))
+            .await
+            .unwrap()
+            .entity
+            .unwrap();
+        let expected = r86_commit(2)
+            .mutations
+            .into_iter()
+            .find_map(|mutation| match mutation {
+                super::TxnMutation::Put(entity @ super::MetaEntity::DfsLayoutRoot(_)) => {
+                    Some(entity)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(layout, expected, "{point}");
+        for number in [1, 2] {
+            assert!(
+                store
+                    .read(MetaRead::RequestOutcome(r86_commit(number).request))
+                    .await
+                    .unwrap()
+                    .request_outcome
+                    .is_some(),
+                "{point}"
+            );
+        }
+        eprintln!("R86 recovered exact layout and outcomes after {point}");
+    }
 }

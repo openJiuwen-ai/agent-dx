@@ -114,12 +114,28 @@ async fn request_method(
     host: &str,
     headers: &str,
 ) -> u16 {
+    request_with_options(ingress, method, target, host, headers, None).await
+}
+
+async fn request_with_options(
+    ingress: Arc<Ingress>,
+    method: &str,
+    target: &str,
+    host: &str,
+    headers: &str,
+    options: Option<super::super::ListenerConfig>,
+) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (socket, peer) = listener.accept().await.unwrap();
+        let security = if options.is_some() {
+            IngressSecurity::AuthenticatedHttp
+        } else {
+            IngressSecurity::Tls
+        };
         ingress
-            .serve_http_connection(socket, peer, IngressSecurity::Tls)
+            .serve_http_connection_with_options(socket, peer, security, options.map(Arc::new))
             .await;
     });
     let mut socket = TcpStream::connect(address).await.unwrap();
@@ -145,6 +161,63 @@ async fn request_method(
         .unwrap()
         .parse()
         .unwrap()
+}
+
+#[tokio::test]
+async fn configured_http_listener_keeps_authentication_and_denies_unlisted_routes() {
+    let ingress = configured_named_ingress(None, true, "sandbox-a", false, None);
+    let options = super::super::ListenerConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tls: false,
+        allow_http_credentials: true,
+        allowed_routes: Some(vec![super::super::ListenerRoute {
+            method: Some("GET".into()),
+            path: "prefix:/sandbox-a".into(),
+        }]),
+    };
+    for (target, headers, expected) in [
+        (
+            "/api/admin/v1/keys",
+            "Authorization: Bearer native-key\r\n",
+            403,
+        ),
+        ("/sandbox-a/8080/hello", "", 401),
+        (
+            "/sandbox-a/8080/hello",
+            "Authorization: Bearer other-key\r\n",
+            403,
+        ),
+        (
+            "/sandbox-a/8080/hello",
+            "Authorization: Bearer native-key\r\n",
+            502,
+        ),
+    ] {
+        assert_eq!(
+            request_with_options(
+                ingress.clone(),
+                "GET",
+                target,
+                "localhost",
+                headers,
+                Some(options.clone())
+            )
+            .await,
+            expected
+        );
+    }
+    assert_eq!(
+        request_with_options(
+            ingress,
+            "POST",
+            "/sandbox-a/8080/hello",
+            "localhost",
+            "Authorization: Bearer native-key\r\n",
+            Some(options)
+        )
+        .await,
+        403
+    );
 }
 
 #[tokio::test]
@@ -693,4 +766,26 @@ async fn route_refresh_keeps_streams_but_pause_delete_and_identity_changes_cance
             assert_eq!(*cancelled.borrow(), change != "refresh", "{change}");
         }
     }
+}
+
+#[tokio::test]
+async fn authenticated_http_does_not_implicitly_enable_e2b_http() {
+    let options = super::super::ListenerConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tls: false,
+        allow_http_credentials: true,
+        allowed_routes: None,
+    };
+    assert_eq!(
+        request_with_options(
+            ingress(false),
+            "GET",
+            "/sandboxes",
+            "localhost",
+            "Authorization: Bearer native-key\r\n",
+            Some(options)
+        )
+        .await,
+        426
+    );
 }

@@ -18,6 +18,15 @@ BINARIES = (
     "adx-relay",
 )
 SANDBOXD_BINARIES = ("sandboxd", "sbox", "runc", "runc-shim", "sandbox-logger", "redis-cli")
+GVISOR_BINARIES = (
+    "runsc",
+    "containerd-shim-runsc-v1",
+    "gvisor-bin/checkpointgofer",
+    "gvisor-bin/gvisor-sentry-prewarmer",
+    "gvisor-bin/gvisor_sentry",
+    "gvisor-bin/runsc-fd-parking",
+    "gvisor-bin/runsc-metric-server",
+)
 SANDBOXD_DEPLOYMENT_FILES = (
     "sandboxd.service",
     "sandboxd.toml",
@@ -69,7 +78,8 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
     }
     target = manifest.get("target", "")
     if manifest.get("profile") == "release" and "linux" in target:
-        required.add("runtime/adx-runtime-rootfs.img")
+        required.update({"runtime/adx-runtime-rootfs.img", "runtime/adx-runtime-rootfs.json",
+                         "third_party/runtime-rootfs/source.json", "third_party/runtime-rootfs/NOTICE"})
     with_sandboxd = manifest.get("with_sandboxd", False)
     if not isinstance(with_sandboxd, bool):
         raise ValueError("with_sandboxd must be a boolean")
@@ -78,7 +88,8 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
     backend_files.update(
         f"etc/examples/sandboxd/{name}" for name in SANDBOXD_DEPLOYMENT_FILES
     )
-    backend_files.update({"lib/sandboxd_preflight.py", "runtime/sandboxd/runsc"})
+    backend_files.add("lib/sandboxd_preflight.py")
+    backend_files.update(backend_prefix + name for name in GVISOR_BINARIES)
     if with_sandboxd:
         required.update(backend_files)
         required.add("third_party/sandboxd/source.json")
@@ -113,6 +124,20 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
         if relative.is_absolute() or ".." in relative.parts or sha256(root / relative) != digest:
             raise ValueError(f"package integrity check failed: {name}")
 
+    if "runtime/adx-runtime-rootfs.img" in expected:
+        provenance = json.loads((root / "runtime/adx-runtime-rootfs.json").read_text())
+        pin = json.loads((root / "third_party/runtime-rootfs/source.json").read_text())
+        base = pin["artifacts"].get(target, {})
+        expected_provenance = {
+            "target": target,
+            "base_sha256": base.get("sha256"),
+            "manifest_digest": base.get("manifest_digest"),
+            "execd_sha256": files["runtime/adx-execd"],
+            "rootfs_sha256": files["runtime/adx-runtime-rootfs.img"],
+        }
+        if not base or any(provenance.get(key) != value for key, value in expected_provenance.items()):
+            raise ValueError("runtime rootfs provenance mismatch")
+
     if with_sandboxd:
         backend = json.loads((root / backend_prefix / "manifest.json").read_text())
         pin = json.loads((root / "third_party/sandboxd/source.json").read_text())
@@ -121,7 +146,7 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
             raise ValueError("sandboxd revision or target mismatch")
         if backend["files"] != {name: files[backend_prefix + name] for name in SANDBOXD_BINARIES}:
             raise ValueError("sandboxd file hashes differ from backend manifest")
-        for name in (*SANDBOXD_BINARIES, "runsc"):
+        for name in (*SANDBOXD_BINARIES, *GVISOR_BINARIES):
             with (root / backend_prefix / name).open("rb") as binary:
                 header = binary.read(20)
             if header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[18:20], "little") != machine:

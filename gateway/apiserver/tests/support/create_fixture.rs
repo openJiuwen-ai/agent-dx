@@ -16,6 +16,11 @@ struct State {
     control_read_calls: AtomicUsize,
     batch_control_calls: AtomicUsize,
     control_owner_unavailable: AtomicBool,
+    next_control_read_error: AtomicUsize,
+    missing_resume_resources: AtomicBool,
+    next_control_update_error: AtomicUsize,
+    lose_zero_update_reply: AtomicBool,
+    staged_run_timeouts: Mutex<HashMap<String, u64>>,
     control_updates: Mutex<Vec<pb::UpdateEnvironmentControlRequest>>,
     control_order: Mutex<Vec<&'static str>>,
     resume_requests: Mutex<Vec<pb::EnsureRunningRequest>>,
@@ -33,6 +38,7 @@ struct State {
     registered_tenant: Mutex<String>,
     resolved_snapshot_id: Mutex<String>,
     preparation_requests: Mutex<Vec<(String, String, bool)>>,
+    current_preparation: Mutex<Option<pb::SnapshotPreparationView>>,
     release: Notify,
 }
 fn fixture_control(
@@ -221,27 +227,54 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
         }
         record.state = pb::EnvironmentState::Running as i32;
         record.revision += 1;
+        if self.0.missing_resume_resources.load(Ordering::SeqCst) {
+            record.spec.as_mut().unwrap().resources = None;
+        }
         self.0.control_owner_unavailable.store(false, Ordering::SeqCst);
         Ok(Response::new(owner.clone()))
     }
     async fn update_environment_control(&self, request: Request<pb::UpdateEnvironmentControlRequest>) -> Result<Response<pb::EnvironmentControlRecord>, Status> {
         let request = request.into_inner();
         self.0.control_order.lock().unwrap().push("update");
-        let running = self.0.owners.lock().unwrap().get(&request.id)
+        let current_state = self.0.owners.lock().unwrap().get(&request.id)
             .and_then(|owner| owner.record.as_ref())
-            .is_some_and(|record| record.state == pb::EnvironmentState::Running as i32);
-        // Owner-memory timer updates require a live Running owner. A Paused
-        // invalidated/offline owner can only recover through EnsureRunning.
-        if !running || self.0.control_owner_unavailable.load(Ordering::SeqCst) {
+            .map(|record| record.state);
+        // A live Paused owner stages its next duration; an unavailable owner
+        // still requires EnsureRunning before it can process updates.
+        let live = current_state.is_some_and(|state| state == pb::EnvironmentState::Running as i32 || state == pb::EnvironmentState::Paused as i32);
+        if !live || self.0.control_owner_unavailable.load(Ordering::SeqCst) {
             return Err(Status::unavailable("timer owner unavailable before resume"));
+        }
+        let error = tonic::Code::from_i32(self.0.next_control_update_error.swap(0, Ordering::SeqCst) as i32);
+        if error != tonic::Code::Ok {
+            return Err(Status::new(error, "injected timer update failure"));
         }
         let caller = request.caller.clone().ok_or_else(|| Status::unauthenticated("caller required"))?;
         let _ = fixture_control(&self.0, &request.id, &caller).map_err(|error| *error)?;
+        if current_state == Some(pb::EnvironmentState::Paused as i32) {
+            self.0.staged_run_timeouts.lock().unwrap().insert(request.id.clone(), request.timeout_seconds);
+        }
         self.0.control_updates.lock().unwrap().push(request.clone());
-        Ok(Response::new(fixture_control(&self.0, &request.id, &caller).map_err(|error| *error)?))
+        let control = fixture_control(&self.0, &request.id, &caller).map_err(|error| *error)?;
+        if request.timeout_seconds == 0 && self.0.lose_zero_update_reply.swap(false, Ordering::SeqCst) {
+            // Model the expiry completing before its RPC reply is lost.
+            let mut owners = self.0.owners.lock().unwrap();
+            let record = owners.get_mut(&request.id).unwrap().record.as_mut().unwrap();
+            record.state = if record.spec.as_ref().unwrap().run_policy.as_ref().unwrap().action == pb::RunExpiryAction::Pause as i32 {
+                pb::EnvironmentState::Paused
+            } else {
+                pb::EnvironmentState::Deleted
+            } as i32;
+            return Err(Status::deadline_exceeded("injected lost expiry reply"));
+        }
+        Ok(Response::new(control))
     }
     async fn get_environment_control(&self, request: Request<pb::GetEnvironmentControlRequest>) -> Result<Response<pb::EnvironmentControlRecord>, Status> {
         self.0.control_read_calls.fetch_add(1, Ordering::SeqCst);
+        let error = tonic::Code::from_i32(self.0.next_control_read_error.swap(0, Ordering::SeqCst) as i32);
+        if error != tonic::Code::Ok {
+            return Err(Status::new(error, "injected response control read failure"));
+        }
         let request = request.into_inner();
         let caller = request.caller.ok_or_else(|| Status::unauthenticated("caller required"))?;
         Ok(Response::new(fixture_control(&self.0, &request.id, &caller).map_err(|error| *error)?))
@@ -382,6 +415,11 @@ service_impl!(pb::snapshot_preparation_service_server::SnapshotPreparationServic
         if (name != "base" && name != FAMILY_ID) || tenant != *self.0.registered_tenant.lock().unwrap() {
             return Err(Status::not_found("no registered preparation"));
         }
+        if request.registration_only {
+            if let Some(current) = self.0.current_preparation.lock().unwrap().clone() {
+                return Ok(Response::new(current));
+            }
+        }
         let snapshot_id = self.0.resolved_snapshot_id.lock().unwrap().clone();
         let snapshot = self.0.snapshot.lock().unwrap().clone().filter(|snapshot| {
             snapshot.id == snapshot_id && snapshot.state == pb::SnapshotState::Ready as i32
@@ -393,6 +431,14 @@ service_impl!(pb::snapshot_preparation_service_server::SnapshotPreparationServic
         Ok(Response::new(pb::SnapshotPreparationView {
             template_id: FAMILY_ID.into(), name: "base".into(), preparation_id: BUILD_ID.into(),
             phase: if snapshot.is_some() { pb::SnapshotPreparationPhase::Ready } else { pb::SnapshotPreparationPhase::Registered } as i32,
+            resources: snapshot.as_ref().and_then(|snapshot| snapshot.template.as_ref()).and_then(|spec| spec.resources),
+            created_at_unix_ms: 1,
+            template_updated_at_unix_ms: 5,
+            preparation_created_at_unix_ms: 2,
+            preparation_updated_at_unix_ms: 3,
+            last_spawned_at_unix_ms: Some(5),
+            spawn_count: Some(2),
+            envd_version: "0.9.0".into(),
             snapshot_available: snapshot.is_some(), snapshot_id, ..Default::default()
         }))
     }

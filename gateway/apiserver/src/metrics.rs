@@ -50,6 +50,7 @@ struct Completed {
     successful_creates: Histogram,
     errors: BTreeMap<(&'static str, &'static str, &'static str), u64>,
     rejections: BTreeMap<&'static str, u64>,
+    workspace_affinity_fallbacks: u64,
 }
 #[derive(Default)]
 struct Histogram {
@@ -194,6 +195,14 @@ impl CreationMetrics {
             .entry(reason)
             .or_default() += 1;
     }
+    /// A Workspace ownership lookup was unavailable and scheduling proceeded
+    /// without affinity (`workspace_affinity.on_error = fail_open`).
+    pub fn workspace_affinity_fallback(&self) {
+        self.completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .workspace_affinity_fallbacks += 1;
+    }
     pub fn http_request(&self) {
         self.http.fetch_add(1, Ordering::Relaxed);
     }
@@ -265,6 +274,10 @@ impl CreationMetrics {
                 "adx_environment_create_rejections_total{{reason=\"{reason}\"}} {count}\n"
             ));
         }
+        output.push_str(&format!(
+            "# TYPE adx_environment_create_workspace_affinity_fallbacks_total counter\nadx_environment_create_workspace_affinity_fallbacks_total {}\n",
+            completed.workspace_affinity_fallbacks
+        ));
         output
     }
 }
@@ -404,6 +417,15 @@ mod tests {
             std::fs::write(directory.join("apiserver-after.prom"), &after).unwrap();
         }
         assert!(!before.contains("outcome=\"success\",stage="));
+    }
+
+    #[test]
+    fn workspace_affinity_fallbacks_are_counted() {
+        let metrics = CreationMetrics::default();
+        let series = "adx_environment_create_workspace_affinity_fallbacks_total";
+        assert!(metrics.render().contains(&format!("{series} 0\n")));
+        metrics.workspace_affinity_fallback();
+        assert!(metrics.render().contains(&format!("{series} 1\n")));
     }
 
     #[test]

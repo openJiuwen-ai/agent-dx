@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import queue
 import ssl
 import threading
 import time
@@ -14,6 +13,7 @@ from ._command_metrics import increment
 from .types import ConnectionConfig
 
 _TERMINAL = frozenset(("SUCCEEDED", "FAILED", "TIMED_OUT", "KILLED"))
+_WAKE_STATES = _TERMINAL | {"NOT_FOUND", "EXPIRED"}
 _MANAGERS: "weakref.WeakValueDictionary[ConnectionConfig, _CommandWaitManager]" = weakref.WeakValueDictionary()
 _MANAGERS_LOCK = threading.Lock()
 
@@ -41,8 +41,10 @@ class _CommandWaitManager:
             set
         )
         self._errors: Dict[Tuple[str, str], str] = {}
-        self._changed: "queue.SimpleQueue[None]" = queue.SimpleQueue()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._changed: Optional[asyncio.Event] = None
         self._thread: Optional[threading.Thread] = None
+        self._runtime_observed = False
 
     def wait(self, environment_id: str, command_id: str, timeout: Optional[float]) -> None:
         key = (environment_id, command_id)
@@ -51,7 +53,7 @@ class _CommandWaitManager:
             self._waiters[key].add(event)
             self._errors.pop(key, None)
             self._ensure_thread_locked()
-        self._changed.put(None)
+        self._signal_change()
         try:
             if not event.wait(timeout):
                 from .commands import CommandWaitTimeout
@@ -71,7 +73,7 @@ class _CommandWaitManager:
                     if not waiters:
                         self._waiters.pop(key, None)
                         self._errors.pop(key, None)
-            self._changed.put(None)
+            self._signal_change()
 
     async def wait_async(self, environment_id: str, command_id: str, timeout: Optional[float]) -> None:
         key = (environment_id, command_id)
@@ -82,7 +84,7 @@ class _CommandWaitManager:
             self._async_waiters[key].add(async_waiter)
             self._errors.pop(key, None)
             self._ensure_thread_locked()
-        self._changed.put(None)
+        self._signal_change()
         try:
             try:
                 error = await asyncio.wait_for(future, timeout)
@@ -103,7 +105,18 @@ class _CommandWaitManager:
                         self._async_waiters.pop(key, None)
                         if key not in self._waiters:
                             self._errors.pop(key, None)
-            self._changed.put(None)
+            self._signal_change()
+
+    def _signal_change(self) -> None:
+        with self._lock:
+            loop, changed = self._loop, self._changed
+        if loop is not None and changed is not None:
+            try:
+                loop.call_soon_threadsafe(changed.set)
+            except RuntimeError:
+                # The worker's final desired-set check starts a replacement
+                # thread when a waiter arrives during loop shutdown.
+                pass
 
     def _ensure_thread_locked(self) -> None:
         if self._thread is None or not self._thread.is_alive():
@@ -146,20 +159,35 @@ class _CommandWaitManager:
                     pass
 
     async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
+        changed = asyncio.Event()
+        with self._lock:
+            self._loop, self._changed = loop, changed
+        try:
+            await self._run_loop(changed)
+        finally:
+            with self._lock:
+                if self._loop is loop:
+                    self._loop, self._changed = None, None
+
+    def _mark_runtime_observed(self) -> None:
+        self._runtime_observed = True
+
+    async def _run_loop(self, changed: asyncio.Event) -> None:
         import websockets.asyncio.client as ws_client
 
         reconnect_budget = 30.0
-        empty_since: Optional[float] = None
         unavailable_since: Optional[float] = None
         while True:
-            desired = self._desired()
-            if not desired:
-                empty_since = empty_since or time.monotonic()
-                if time.monotonic() - empty_since >= 5:
+            # Clear before reading the desired set so a concurrent change is
+            # either included in that snapshot or wakes the subsequent wait.
+            changed.clear()
+            if not self._desired():
+                try:
+                    await asyncio.wait_for(changed.wait(), timeout=5)
+                except asyncio.TimeoutError:
                     return
-                await asyncio.sleep(0.1)
                 continue
-            empty_since = None
             scheme = "wss" if self._connection.use_tls else "ws"
             uri = f"{scheme}://{self._connection.server_address}/api/environment/v1/commands/watch"
             ssl_context = None
@@ -171,6 +199,7 @@ class _CommandWaitManager:
                     ssl_context.check_hostname = False
                     ssl_context.verify_mode = ssl.CERT_NONE
             try:
+                self._runtime_observed = False
                 token = self._connection.resolved_token()
                 async with ws_client.connect(
                     uri,
@@ -180,65 +209,79 @@ class _CommandWaitManager:
                     ping_timeout=10,
                     max_size=1 << 20,
                 ) as websocket:
-                    sent: Set[Tuple[str, str]] = set()
-                    ready = False
-                    while self._desired():
-                        desired = self._desired()
-                        added = desired - sent
-                        removed = sent - desired
-                        if added:
-                            await websocket.send(
-                                json.dumps(
-                                    {
-                                        "protocolVersion": 1,
-                                        "op": "subscribe",
-                                        "commands": [
-                                            {"environmentId": sid, "commandId": cid} for sid, cid in sorted(added)
-                                        ],
-                                    }
-                                )
-                            )
-                        if removed:
-                            await websocket.send(
-                                json.dumps(
-                                    {
-                                        "op": "unsubscribe",
-                                        "commands": [
-                                            {"environmentId": sid, "commandId": cid} for sid, cid in sorted(removed)
-                                        ],
-                                    }
-                                )
-                            )
-                        sent = desired
-                        try:
-                            raw = await asyncio.wait_for(websocket.recv(), timeout=0.25)
-                        except asyncio.TimeoutError:
-                            continue
-                        state = json.loads(raw)
-                        if state.get("op") == "ready":
-                            if state.get("protocolVersion") != 1 or "multiplexed-command-watch" not in state.get(
-                                "capabilities", ()
-                            ):
-                                raise RuntimeError("server does not support command watch protocol v1")
-                            ready = True
-                            continue
-                        if not ready:
-                            raise RuntimeError("ingress sent command state before protocol negotiation")
-                        key = (str(state.get("environmentId", "")), str(state.get("commandId", "")))
-                        if state.get("status") == "REJECTED":
-                            self._notify(key, str(state.get("error", "command watch rejected")))
-                        elif str(state.get("status", "")) in _TERMINAL:
-                            unavailable_since = None
-                            self._notify(key)
-                        elif str(state.get("status", "")) in ("PENDING", "RUNNING"):
-                            # An ingress handshake alone does not prove Execd
-                            # recovered. Reset only after a real command state.
-                            unavailable_since = None
+                    await self._watch_socket(websocket, changed)
+                    return
             except Exception as error:
                 increment("command_wait_reconnect_total")
+                if self._runtime_observed:
+                    unavailable_since = None
                 unavailable_since = unavailable_since or time.monotonic()
                 if time.monotonic() - unavailable_since >= reconnect_budget:
                     for key in self._desired():
                         self._notify(key, f"command watch unavailable: {error}")
                     return
                 await asyncio.sleep(0.2)
+
+    async def _watch_socket(self, websocket, changed: asyncio.Event) -> None:
+        sent: Set[Tuple[str, str]] = set()
+        ready = False
+        idle_since: Optional[float] = None
+        receiver = asyncio.create_task(websocket.recv())
+        try:
+            while True:
+                changed.clear()
+                desired = self._desired()
+                added, removed = desired - sent, sent - desired
+                for op, commands in (("subscribe", added), ("unsubscribe", removed)):
+                    if commands:
+                        frame = {
+                            "op": op,
+                            "commands": [
+                                {"environmentId": sid, "commandId": cid} for sid, cid in sorted(commands)
+                            ],
+                        }
+                        if op == "subscribe":
+                            frame["protocolVersion"] = 1
+                        await websocket.send(json.dumps(frame))
+                sent = desired
+                if desired:
+                    idle_since = None
+                    idle_timeout = None
+                else:
+                    if idle_since is None:
+                        idle_since = time.monotonic()
+                    idle_timeout = max(0.0, 5 - (time.monotonic() - idle_since))
+                update = asyncio.create_task(changed.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        (receiver, update), timeout=idle_timeout, return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    update.cancel()
+                    await asyncio.gather(update, return_exceptions=True)
+                if not done:
+                    return
+                if receiver not in done:
+                    continue
+                state = json.loads(receiver.result())
+                receiver = asyncio.create_task(websocket.recv())
+                if state.get("op") == "ready":
+                    if state.get("protocolVersion") != 1 or "multiplexed-command-watch" not in state.get(
+                        "capabilities", ()
+                    ):
+                        raise RuntimeError("server does not support command watch protocol v1")
+                    ready = True
+                    continue
+                if not ready:
+                    raise RuntimeError("ingress sent command state before protocol negotiation")
+                key = (str(state.get("environmentId", "")), str(state.get("commandId", "")))
+                if state.get("status") == "REJECTED":
+                    self._notify(key, str(state.get("error", "command watch rejected")))
+                elif str(state.get("status", "")) in _WAKE_STATES:
+                    self._mark_runtime_observed()
+                    self._notify(key)
+                elif str(state.get("status", "")) in ("PENDING", "RUNNING"):
+                    self._mark_runtime_observed()
+        finally:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)

@@ -1,0 +1,12 @@
+txn 0: DfsClaimReplicationTask RequestKey { caller_id: "source", request_id: "claim" }
+conditions:
+  EntityEquals(DfsCopy(CopyRecord { id: CopyId("copy-source"), chunk_id: ChunkId("<chunk>"), role: DurableReplica, location: Node { node_id: "source", node_epoch: 1, device_id: "source-dev", device_epoch: 1, catalog_revision: 1 }, state: Corrupt, persisted_bytes: 13, verified_digest: ContentDigest { algorithm: Blake3, bytes: [213, 172, 52, 174, 206, 231, 68, 249, 163, 193, 137, 156, 150, 43, 220, 44, 123, 107, 169, 101, 253, 156, 7, 85, 218, 162, 138, 75, 203, 43, 36, 105] } }))
+  EntityEquals(DfsPlacement(PlacementRecord { chunk_id: ChunkId("<chunk>"), replica_group_id: ReplicaGroupId("repair-r2"), placement_epoch: 2, desired_copies: 2, copies: [CopyId("copy-source")], health: UnderReplicated }))
+  Missing(DfsReplicationTask(ReplicationTaskId("repair:<chunk>")))
+  NodeSessionCurrent { node_id: "source", session_id: "source-s1" }
+  RequestAbsent(RequestKey { caller_id: "source", request_id: "claim" })
+  RevisionEquals { key: CurrentNodeSession { node_id: "source" }, revision: StoreRevision(1) }
+mutations:
+  Put(DfsPlacement(PlacementRecord { chunk_id: ChunkId("<chunk>"), replica_group_id: ReplicaGroupId("repair-r2"), placement_epoch: 2, desired_copies: 2, copies: [CopyId("copy-source")], health: BlockedNoSource }))
+  Put(DfsReplicationTask(ReplicationTask { id: ReplicationTaskId("repair:<chunk>"), chunk_id: ChunkId("<chunk>"), placement_epoch: 2, desired_copies: 2, existing_copies: [CopyId("copy-source")], state: BlockedNoSource, attempt: 0, next_retry_unix_ms: <ms>, last_error: Some("no live source for replication repair"), claim: None }))
+  RecordRequestOutcome(RequestOutcome { request: RequestKey { caller_id: "source", request_id: "claim" }, operation: DfsClaimReplicationTask, result: DfsReplicationClaim { request_digest: <digest>, claim: None } })

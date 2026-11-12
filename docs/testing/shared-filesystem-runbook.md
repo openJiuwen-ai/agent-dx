@@ -569,7 +569,7 @@ env -u ADX_FC_JUICEFS_CONFIG -u ADX_FC_OBS_CONFIG -u ADX_STORAGE_NATIVE_XFS_ROOT
   "$ADX_RUNS/afs-trace-001" >"$ADX_RUNS/afs-trace-001.log" 2>&1
 ```
 
-它要求 COW 事件、首次触页前未全量读取源 memory、延迟触页带来新增远端读取；结果不计入性能样本。Meta profile 使用 `AFS_META_PROFILE=1`，也单独保存和分析。
+它要求 COW 事件、首次触页前未全量读取源 memory、延迟触页带来新增远端读取；结果不计入性能样本。Meta profile 使用 `AFS_META_PROFILE=1`（需以 `--features diagnostics` 构建 Meta，默认构建忽略该变量），也单独保存和分析。
 
 每次只分享 `RUN_ROOT/export/` 脱敏导出、必要的顶层日志及结果汇总。原始 `secrets/`、PostgreSQL 密码、RGW user JSON、JuiceFS 私有配置与数据库备份不作为公开测试附件；导出前仍应核对自定义凭据是否进入日志。
 

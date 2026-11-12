@@ -4,7 +4,10 @@ use std::sync::{
 };
 
 use afs::{
-    dfs::{InodeAttributes, InodeId, NamespaceId, OperationId, ReplicationConfig},
+    dfs::{
+        CallerContext, InodeAttributes, InodeId, MkdirRequest, NamespaceId, OperationId,
+        ReplicationConfig,
+    },
     meta::{
         dfs::{CreateFileRequest, DfsService},
         store::{
@@ -75,8 +78,10 @@ impl CreateParentInterferenceStore {
     }
 
     fn should_interfere(&self, txn: &MetaTxn) -> bool {
-        txn.operation == StoreOperation::DfsCreate
-            && txn.request.request_id.starts_with(self.target_prefix)
+        matches!(
+            txn.operation,
+            StoreOperation::DfsCreate | StoreOperation::DfsMkdir
+        ) && txn.request.request_id.starts_with(self.target_prefix)
             && self
                 .remaining
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -85,7 +90,7 @@ impl CreateParentInterferenceStore {
                 .is_ok()
     }
 
-    async fn mutate_parent_before_create(&self) -> afs_error::Result<()> {
+    async fn mutate_parent_before_commit(&self) -> afs_error::Result<()> {
         let snapshot = self
             .inner
             .read(MetaRead::DfsInode(InodeId::new("1")))
@@ -149,7 +154,7 @@ impl MetaStore for CreateParentInterferenceStore {
     fn compare_and_commit(&self, txn: MetaTxn) -> MetaFuture<'_, TxnOutcome> {
         Box::pin(async move {
             if self.should_interfere(&txn) {
-                self.mutate_parent_before_create().await?;
+                self.mutate_parent_before_commit().await?;
             }
             self.inner.compare_and_commit(txn).await
         })
@@ -382,5 +387,45 @@ async fn retry_reports_exhaustion_when_parent_only_drifts_every_attempt() {
         .unwrap()
         .is_none(),
         "exhausted retry must not create the target"
+    );
+}
+
+fn mkdir_request(operation: &str, name: &[u8]) -> MkdirRequest {
+    MkdirRequest {
+        caller_id: "node-a".into(),
+        operation_id: OperationId::new(operation),
+        namespace_id: NamespaceId::new("default"),
+        parent_inode_id: InodeId::new("1"),
+        name: name.to_vec(),
+        attributes: InodeAttributes {
+            mode: 0o755,
+            ..attrs()
+        },
+        caller: CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn mkdir_retries_parent_drift_and_preserves_replay_and_name_collision() {
+    let dfs = dfs_with_interference("mkdir-drift", 1, false).await;
+    let request = mkdir_request("mkdir-drift-create", b"image");
+    let created = dfs.mkdir(request.clone()).await.unwrap();
+    assert_eq!(dfs.mkdir(request).await.unwrap(), created);
+    let error = dfs
+        .mkdir(mkdir_request("mkdir-distinct-caller", b"image"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), afs_error::ErrorKind::AlreadyExists);
+    assert_eq!(
+        dfs.get_inode(InodeId::new("1"))
+            .await
+            .unwrap()
+            .attributes
+            .nlink,
+        3
     );
 }

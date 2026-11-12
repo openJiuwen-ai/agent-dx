@@ -2,12 +2,12 @@
 use afs::{
     node::{
         api::local::serve_local_api,
+        diagnostics::DiagnosticStorage,
         rpc::{
             control::RdmaSessionRegistry,
             data::make_data_server,
             peer::{DataClientOptions, DataMode, connect_data_client},
         },
-        storage::Storage,
     },
     runtime::Observability,
 };
@@ -20,7 +20,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 #[tokio::test]
 async fn tcp_peer_and_local_sdk_preserve_identical_storage_identity() {
     let temp = tempfile::tempdir().unwrap();
-    let storage = Storage::new(temp.path().join("data")).unwrap();
+    let storage = DiagnosticStorage::new(temp.path().join("data")).unwrap();
     let local = serve_local_api(storage.clone(), temp.path().join("node.sock"))
         .await
         .unwrap();

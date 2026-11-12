@@ -20,6 +20,8 @@ pub enum PreparationState {
 pub struct SnapshotPreparation {
     pub id: String,
     pub created_at_unix_ms: u64,
+    #[serde(default)]
+    pub updated_at_unix_ms: u64,
     pub resources: Resources,
     pub state: PreparationState,
     pub spec: Option<EnvironmentSpec>,
@@ -35,10 +37,22 @@ pub struct SnapshotTemplate {
     pub tenant_id: String,
     pub name: String,
     pub created_at_unix_ms: u64,
+    #[serde(default)]
+    pub updated_at_unix_ms: u64,
     pub revision: u64,
     pub deleted: bool,
     pub preparation: SnapshotPreparation,
     pub latest_successful: Option<SuccessfulPreparation>,
+    /// None denotes history written before native usage accounting existed.
+    #[serde(default)]
+    pub usage: Option<SnapshotTemplateUsage>,
+}
+
+/// Cumulative initial creations from this family, retained across rebuilds and deletions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotTemplateUsage {
+    pub spawn_count: u64,
+    pub last_spawned_at_unix_ms: Option<u64>,
 }
 
 /// The most recent completed build points to an independently retained native Golden snapshot.
@@ -46,6 +60,10 @@ pub struct SnapshotTemplate {
 pub struct SuccessfulPreparation {
     pub preparation_id: String,
     pub snapshot_id: String,
+    #[serde(default)]
+    pub created_at_unix_ms: u64,
+    #[serde(default)]
+    pub updated_at_unix_ms: u64,
 }
 
 pub fn valid_preparation_id(value: &str) -> bool {
@@ -174,6 +192,7 @@ mod tests {
         let mut build = SnapshotPreparation {
             id: "00000000-0000-4000-8000-000000000002".into(),
             created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
             resources: Resources {
                 cpu_millis: 1000,
                 memory_bytes: 1024,

@@ -374,6 +374,7 @@ class Environment:
         node_id: Optional[str] = None,
         *,
         rootfs_readonly: Optional[bool] = None,
+        rootfs_template: Optional[str] = None,
         labels: Optional[Dict[str, str]] = None,
         schedule_affinities: Optional[List[Dict[str, Any]]] = None,
         snapshot_id: Optional[str] = None,
@@ -402,6 +403,8 @@ class Environment:
         Args:
             image: Container image to use (e.g. ``"python:3.12-slim"``).
             rootfs: S3-compatible EROFS root filesystem configuration.
+            rootfs_template: Deployment-registered local rootfs name. Mutually
+                exclusive with image, rootfs and snapshot_id; no host path is accepted.
             rootfs_readonly: Optional override for the deployment rootfs
                 ``readonly`` default. Omitting it inherits the deployment
                 setting, including when replacing the source with *image* or
@@ -453,7 +456,7 @@ class Environment:
                 local anonymous checkpoint after a environment failure.
             inherit_entrypoint: Start the effective ``Entrypoint`` and ``Cmd``
                 configured by an image and manage it as the environment workload.
-                This option is valid only for image-backed fresh creates.
+                This option is valid for fresh image or registered-template creates.
             readiness_probe: One-time Execd startup check. Requires
                 ``inherit_entrypoint=True``; retries until first success or
                 ``init_timeout``. Failure raises ``EnvironmentError`` with
@@ -486,6 +489,11 @@ class Environment:
             raise TypeError("rootfs must be an S3Config")
         if image is not None and rootfs is not None:
             raise ValueError("image and rootfs are mutually exclusive")
+        if rootfs_template is not None:
+            if not isinstance(rootfs_template, str) or not rootfs_template.strip():
+                raise ValueError("rootfs_template must be a non-empty string")
+            if image is not None or rootfs is not None or snapshot_id is not None:
+                raise ValueError("rootfs_template conflicts with image, rootfs or snapshot_id")
         if rootfs_readonly is not None and not isinstance(rootfs_readonly, bool):
             raise TypeError("rootfs_readonly must be a boolean or None")
         if snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id.strip()):
@@ -507,8 +515,8 @@ class Environment:
             raise TypeError("failover must be a boolean")
         if not isinstance(inherit_entrypoint, bool):
             raise TypeError("inherit_entrypoint must be a boolean")
-        if inherit_entrypoint and image is None:
-            raise ValueError("inherit_entrypoint requires an image rootfs")
+        if inherit_entrypoint and image is None and rootfs_template is None:
+            raise ValueError("inherit_entrypoint requires an image rootfs or registered template")
         if inherit_entrypoint and snapshot_id is not None:
             raise ValueError("inherit_entrypoint cannot be combined with snapshot_id")
         for value, expected, label in (
@@ -648,6 +656,8 @@ class Environment:
                     "imageurl": image,
                 }
             )
+        elif rootfs_template:
+            body["rootfs"].update({"type": "template", "name": rootfs_template})
         elif rootfs:
             body["rootfs"].update(
                 {

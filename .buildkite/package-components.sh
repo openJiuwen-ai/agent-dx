@@ -71,6 +71,9 @@ for component in "${components[@]}"; do
     ! -name manifest.json -exec cp {} "$stage/" \;
 done
 
+python3 build/release/component.py rootfs-metadata \
+  --directory out/buildkite/components/execd --output "$stage/adx-runtime-rootfs.json"
+
 echo "--- :python: Consume tested Environment SDK candidate"
 if [[ ${ADX_CANDIDATE_LOCAL:-0} != 1 ]]; then
   buildkite-agent artifact download 'out/buildkite/sdk/*' . --step sdk-package
@@ -164,5 +167,9 @@ if [[ ${ADX_DEFER_PUBLICATION:-0} != 1 ]]; then bash .buildkite/upload-obs.sh; f
 
 if [[ ${ADX_COMPONENT_LOCAL:-0} != 1 && ${ADX_ARTIFACT_TRANSPORT:-obs} == obs ]]; then
   source .buildkite/obs-python.sh
-  "$OBS_PYTHON" build/release/ci_transfer.py upload release     out/buildkite/adx-release.tar.gz out/buildkite/adx-release.tar.gz.sha256     out/buildkite/build-manifest.json out/buildkite/backend.tar.gz
+  release_group=release
+  if [[ $ADX_BUILD_ARCH == arm64 ]]; then release_group=release-arm64; fi
+  release_files=(out/buildkite/adx-release.tar.gz out/buildkite/adx-release.tar.gz.sha256 out/buildkite/build-manifest.json)
+  if [[ ${#backend_args[@]} != 0 ]]; then release_files+=(out/buildkite/backend.tar.gz); fi
+  "$OBS_PYTHON" build/release/ci_transfer.py upload "$release_group" "${release_files[@]}"
 fi

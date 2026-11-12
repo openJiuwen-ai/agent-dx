@@ -1,5 +1,5 @@
 use afs::meta::store::{
-    journal::{LogLimits, LogTip, RecoveredLog},
+    journal::{AppendLimits, CheckpointLimits, LogCursor, LogStatus, LogTip, RecoveredLog},
     log::Record,
 };
 use std::{
@@ -44,13 +44,34 @@ impl MetaLog for SwitchableBackend {
     fn persistence(&self) -> afs::meta::store::BackendPersistence {
         self.inner.persistence()
     }
-    fn limits(&self) -> LogLimits {
+    fn limits(&self) -> AppendLimits {
         self.inner.limits()
     }
     fn recover(&self) -> MetaFuture<'_, RecoveredLog> {
         self.inner.recover()
     }
-    fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
+    fn checkpoint_limits(&self) -> CheckpointLimits {
+        self.inner.checkpoint_limits()
+    }
+    /// This wrapper does not forward checkpoints, so Store schedules none.
+    fn supports_checkpoint(&self) -> bool {
+        false
+    }
+    fn status(&self) -> MetaFuture<'_, LogStatus> {
+        self.inner.status()
+    }
+    fn can_append(&self, expected: LogCursor, bytes: usize) -> MetaFuture<'_, bool> {
+        self.inner.can_append(expected, bytes)
+    }
+    fn install_checkpoint(&self, _: LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
+        Box::pin(async {
+            Err(afs_error::Error::coded(
+                afs_error::IO_UNAVAILABLE,
+                "test wrapper does not install checkpoints",
+            ))
+        })
+    }
+    fn append_and_sync(&self, expected: LogCursor, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
         self.inner.append_and_sync(expected, records)
     }
     fn health(&self) -> MetaFuture<'_, ()> {
@@ -74,13 +95,34 @@ struct HangingBackend {
 }
 
 impl MetaLog for HangingBackend {
-    fn limits(&self) -> LogLimits {
+    fn limits(&self) -> AppendLimits {
         self.inner.limits()
     }
     fn recover(&self) -> MetaFuture<'_, RecoveredLog> {
         self.inner.recover()
     }
-    fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
+    fn checkpoint_limits(&self) -> CheckpointLimits {
+        self.inner.checkpoint_limits()
+    }
+    /// This wrapper does not forward checkpoints, so Store schedules none.
+    fn supports_checkpoint(&self) -> bool {
+        false
+    }
+    fn status(&self) -> MetaFuture<'_, LogStatus> {
+        self.inner.status()
+    }
+    fn can_append(&self, expected: LogCursor, bytes: usize) -> MetaFuture<'_, bool> {
+        self.inner.can_append(expected, bytes)
+    }
+    fn install_checkpoint(&self, _: LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
+        Box::pin(async {
+            Err(afs_error::Error::coded(
+                afs_error::IO_UNAVAILABLE,
+                "test wrapper does not install checkpoints",
+            ))
+        })
+    }
+    fn append_and_sync(&self, expected: LogCursor, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
         self.inner.append_and_sync(expected, records)
     }
     fn persistence(&self) -> afs::meta::store::BackendPersistence {

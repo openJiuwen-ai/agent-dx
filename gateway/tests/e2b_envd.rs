@@ -101,6 +101,9 @@ async fn real_envd_interop(gateway_auth: bool) {
 
     if gateway_auth {
         run_python(&python, &signed_file_script(ingress_address.port())).await;
+        if let Ok(legacy_python) = std::env::var("ADX_TEST_E2B_LEGACY_PYTHON") {
+            run_python(&legacy_python, &signed_file_script(ingress_address.port())).await;
+        }
         // This fixture runs envd directly in the test Pod, rather than creating
         // a sandbox with the production ACL. It proves the accepted in-guest
         // tokenless behavior, not cross-sandbox network isolation.
@@ -289,6 +292,7 @@ async fn run_python(python: &str, script: &str) {
                 .arg(script)
                 .env("SSL_CERT_FILE", certificate)
                 .env_remove("E2B_DEBUG")
+                .env_remove("E2B_SANDBOX_URL")
                 .output()
         }),
     )
@@ -328,7 +332,7 @@ base = 'https://localhost:{port}'
 cert = __import__('os').environ['SSL_CERT_FILE']
 headers = {{'E2b-Sandbox-Id': '{SANDBOX_ID}', 'E2b-Sandbox-Port': '49983', 'X-Access-Token': '{token}'}}
 def make_sandbox(access_token):
-    config = ConnectionConfig(sandbox_url=base, extra_sandbox_headers={{**headers, 'X-Access-Token': access_token}}, retries=0, debug=False{http_version})
+    config = ConnectionConfig(sandbox_url=base, extra_sandbox_headers={{**headers, 'X-Access-Token': access_token}}, debug=False{http_version})
     return Sandbox(sandbox_id='{SANDBOX_ID}', sandbox_domain='sandbox.test', envd_version=Version('0.9.0'), envd_access_token=access_token, traffic_access_token='{TRAFFIC_TOKEN}', connection_config=config)
 sandbox = make_sandbox('{token}')
 {availability_assertion}
@@ -348,6 +352,7 @@ fn signed_file_script(port: u16) -> String {
     format!(
         r#"{preamble}
 from urllib.parse import urlsplit, parse_qsl, urlencode
+import socket
 
 # Keep the SDK-generated path/query/signature intact; only map its authority to
 # the local TLS fixture, as the existing command/file/PTY test does.
@@ -383,6 +388,43 @@ response = httpx.get(base + '/files?path=/tmp/e2b-sdk.txt', headers=selectors, v
 assert response.status_code == 401, response.text
 response = httpx.post(base + '/process.Process/List?' + urlsplit(download).query, headers=selectors, json={{}}, verify=cert)
 assert response.status_code == 401, response.text
+
+# Model wildcard DNS in the test transport; keep SDK URLs, Host and TLS SNI intact.
+host = '49983-{SANDBOX_ID}.sandbox.test'
+resolve = socket.getaddrinfo
+def resolve_test_host(name, *args, **kwargs):
+    return resolve('127.0.0.1' if name == host else name, *args, **kwargs)
+socket.getaddrinfo = resolve_test_host
+standard = Sandbox(sandbox_id='{SANDBOX_ID}', sandbox_domain='sandbox.test:{port}',
+    envd_version=Version('0.9.0'), envd_access_token='{ENVD_TOKEN}',
+    traffic_access_token='{TRAFFIC_TOKEN}', connection_config=ConnectionConfig(debug=False))
+for http2 in (False, True):
+    with httpx.Client(http2=http2, verify=cert, trust_env=False) as client:
+        for endpoint in (base, base + '/unused-prefix'):
+            fixed = Sandbox(sandbox_id='{SANDBOX_ID}', sandbox_domain='sandbox.test',
+                envd_version=Version('0.9.0'), envd_access_token='{ENVD_TOKEN}',
+                connection_config=ConnectionConfig(sandbox_url=endpoint, debug=False))
+            fixed_url = fixed.download_url('/tmp/e2b-sdk.txt', use_signature_expiration=60)
+            assert urlsplit(fixed_url).path == '/files'
+            response = client.get(fixed_url)
+            assert response.status_code == 404 and response.text == 'route not found', response.text
+        download = standard.download_url('/tmp/e2b-sdk.txt', use_signature_expiration=60)
+        assert urlsplit(download).hostname == host
+        response = client.get(download)
+        assert response.status_code == 200 and response.text == 'file-ok', response.text
+        assert response.http_version == ('HTTP/2' if http2 else 'HTTP/1.1')
+        upload = standard.upload_url('/tmp/e2b-standalone.txt', use_signature_expiration=60)
+        response = client.post(upload, files={{'file': ('standalone.txt', b'standalone-ok')}})
+        assert response.status_code == 200, response.text
+        response = client.get(standard.download_url('/tmp/e2b-standalone.txt', use_signature_expiration=60))
+        assert response.text == 'standalone-ok', response.text
+        for invalid in (
+            standard.download_url('/tmp/e2b-sdk.txt', use_signature_expiration=-10),
+            download.replace('e2b-sdk.txt', 'other.txt'),
+            download + '&signature=bad',
+        ):
+            response = client.get(invalid)
+            assert response.status_code == 401, response.text
 "#
     )
 }

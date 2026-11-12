@@ -27,6 +27,23 @@ static COMMAND_RESULT_TRUNCATED: AtomicU64 = AtomicU64::new(0);
 static COMMAND_RECORD_EXPIRED: AtomicU64 = AtomicU64::new(0);
 static COMMAND_ID_CONFLICT: AtomicU64 = AtomicU64::new(0);
 
+// Coalesce state changes across commands. Watches replay a snapshot on subscribe,
+// then wake on these changes instead of periodically scanning the registry.
+static COMMAND_CHANGES: OnceLock<tokio::sync::watch::Sender<()>> = OnceLock::new();
+
+pub fn command_changes() -> tokio::sync::watch::Receiver<()> {
+    COMMAND_CHANGES
+        .get_or_init(|| tokio::sync::watch::channel(()).0)
+        .subscribe()
+}
+
+fn notify_state_change(exit: &ExitState) {
+    exit.cond.notify_all();
+    if let Some(changes) = COMMAND_CHANGES.get() {
+        changes.send_replace(());
+    }
+}
+
 struct ExitState {
     // Serializes child observation/reaping with signals so a completed PID can
     // never be signalled after the OS has made it reusable.
@@ -849,7 +866,7 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
             *exit.spawn_error.lock().unwrap() = Some(error.to_string());
             *exit.finished_at_ms.lock().unwrap() = Some(now_ms());
             exit.state_version.fetch_add(1, Ordering::AcqRel);
-            exit.cond.notify_all();
+            notify_state_change(&exit);
             COMMAND_COMPLETED.fetch_add(1, Ordering::Relaxed);
             drop(command_activity);
             let record = records.get(&command_id).expect("pending command exists");
@@ -882,7 +899,7 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
                     *waiter_exit.finished_at_ms.lock().unwrap() = Some(now_ms());
                     waiter_exit.state_version.fetch_add(1, Ordering::AcqRel);
                     COMMAND_COMPLETED.fetch_add(1, Ordering::Relaxed);
-                    waiter_exit.cond.notify_all();
+                    notify_state_change(&waiter_exit);
                     break;
                 }
                 Ok(None) if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
@@ -899,7 +916,7 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
                     *waiter_exit.finished_at_ms.lock().unwrap() = Some(now_ms());
                     waiter_exit.state_version.fetch_add(1, Ordering::AcqRel);
                     COMMAND_COMPLETED.fetch_add(1, Ordering::Relaxed);
-                    waiter_exit.cond.notify_all();
+                    notify_state_change(&waiter_exit);
                     break;
                 }
                 Ok(None) => {
@@ -912,7 +929,7 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
                     *waiter_exit.finished_at_ms.lock().unwrap() = Some(now_ms());
                     waiter_exit.state_version.fetch_add(1, Ordering::AcqRel);
                     COMMAND_COMPLETED.fetch_add(1, Ordering::Relaxed);
-                    waiter_exit.cond.notify_all();
+                    notify_state_change(&waiter_exit);
                     break;
                 }
             }
@@ -927,6 +944,7 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
     record.stdout = stdout;
     record.stderr = stderr;
     exit.state_version.fetch_add(1, Ordering::AcqRel);
+    notify_state_change(&exit);
 
     map_value(vec![
         ("command_id", Value::from(command_id)),

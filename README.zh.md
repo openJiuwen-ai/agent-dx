@@ -193,7 +193,7 @@ python3 build/ci/run.py afs
 
 `afs-check` 使用默认 OwnerFs 和 DFS feature。可选 all-features/RDMA lint 必须显式执行（`ADX_AFS_ALL_FEATURES=1 make afs-lint`），并先检查 `libibverbs` 开发文件。
 
-子系统职责、当前范围和真实限制见 [架构边界](docs/architecture/afs.md)、[部署说明](docs/deployment/afs.md)、[测试验收](docs/testing/afs.md)和 [AFS 演进计划](docs/development/afs-roadmap.md)。来源与带日期的历史证据保留在 `docs/migration/`；它们不定义当前运行合同。发布包配置示例位于 [AFS 示例目录](build/config/examples/afs/)。
+子系统职责、当前范围和真实限制见 [架构边界](docs/architecture/afs.md)、[部署说明](docs/deployment/afs.md)、[测试验收](docs/testing/afs.md)和 [支持边界与已知限制](docs/architecture/afs-support-boundary.md)。来源与带日期的历史证据保留在 `docs/migration/`；它们不定义当前运行合同。发布包配置示例位于 [AFS 示例目录](build/config/examples/afs/)。
 
 组件与集成测试使用 `python3 build/ci/run.py <suite>`。端到端门禁使用已安装发布包、公开 Environment SDK、Redis、Gateway、控制面、sandboxd 和 Execd。环境要求与门禁定义见[控制面 CI](docs/testing/control-plane-ci.md)和 [Kubernetes E2E 指南](build/e2e/kubernetes/README.md)。
 

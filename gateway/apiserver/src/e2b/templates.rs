@@ -54,14 +54,20 @@ pub(super) async fn create_spec(
             })),
         )
         .await?;
-    if snapshot.state != pb::SnapshotState::Ready as i32 {
-        return Err(Status::failed_precondition("snapshot is not ready"));
-    }
     let mut spec = snapshot
         .template
         .ok_or_else(|| Status::data_loss("snapshot has no execution specification"))?;
     if spec.tenant_id != caller.tenant_id {
         return Err(Status::not_found("snapshot not found"));
+    }
+    if matches!(
+        pb::SnapshotState::try_from(snapshot.state),
+        Ok(pb::SnapshotState::Deleting | pb::SnapshotState::Deleted)
+    ) {
+        return Err(Status::not_found("snapshot not found"));
+    }
+    if snapshot.state != pb::SnapshotState::Ready as i32 {
+        return Err(Status::failed_precondition("snapshot is not ready"));
     }
     let service = spec
         .envd

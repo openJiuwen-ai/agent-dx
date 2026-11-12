@@ -35,6 +35,7 @@ from .types import (
 SDK_CAPABILITIES = frozenset(
     {
         "local-close",
+        "local-rootfs-templates",
         "explicit-connection-config",
         "tunnel-proxy-port",
         "recoverable-commands",

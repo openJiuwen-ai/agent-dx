@@ -2,6 +2,7 @@ use crate::{
     config::Config,
     environment_directory::{EnvironmentDirectory, EnvironmentPage},
     ownership::Cache,
+    workspace_affinity::WorkspaceAffinityResolver,
 };
 use adx_observability::trace;
 use adx_protocol::control as pb;
@@ -12,14 +13,19 @@ use sha2::{Digest, Sha256};
 use std::{
     future::Future,
     num::NonZeroUsize,
+    pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
 use tonic::{Code, Response, Status};
 
+#[cfg(test)]
+mod discovery_tests;
+
 pub struct Clients {
     pub config: Config,
+    pub workspace: Option<WorkspaceAffinityResolver>,
     directory: Mutex<crate::directory::Directory>,
     tls: RpcClient,
     discovery: Option<adx_discovery::RedisDiscovery>,
@@ -50,8 +56,23 @@ impl Clients {
             })
             .transpose()?;
         let limit = config.cache_entries;
+        // Affinity is optional: a node without the Workspace service must still
+        // start. An unreadable token keeps the resolver so every affected create
+        // still follows the configured error policy instead of silently
+        // scheduling without affinity.
+        let workspace = config.workspace_affinity.clone().map(|affinity| {
+            let resolver = WorkspaceAffinityResolver::new(affinity);
+            if let Some(error) = resolver.init_error() {
+                adx_observability::warn!(
+                    error = %error,
+                    "Workspace affinity is unavailable; creates follow the configured error policy"
+                );
+            }
+            resolver
+        });
         let clients = Arc::new(Self {
             config,
+            workspace,
             directory: Mutex::default(),
             tls,
             discovery,
@@ -293,12 +314,23 @@ impl Clients {
         timeout: Duration,
         future: impl Future<Output = Result<Response<T>, Status>>,
     ) -> Result<T, Status> {
-        // Generated RPC futures are large. Heap-own them before the nested
-        // timeout/trace state machines on the embedded Activator's HTTP stack.
-        let future = Box::pin(future);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Status::unavailable(format!("{name}: RPC timeout is too large")))?;
+        // Heap-own generated RPC futures before constructing another async
+        // helper frame; carrying them by value can overflow normal workers.
+        self.rpc_until(name, deadline, Box::pin(future)).await
+    }
+
+    async fn rpc_until<T>(
+        &self,
+        name: &'static str,
+        deadline: tokio::time::Instant,
+        future: Pin<Box<impl Future<Output = Result<Response<T>, Status>>>>,
+    ) -> Result<T, Status> {
         trace::Trace::child(name)
             .run_result(async {
-                let result = match tokio::time::timeout(timeout, future).await {
+                let result = match tokio::time::timeout_at(deadline, future).await {
                     Ok(result) => result
                         .map_err(normalize_rpc_error)
                         .map(Response::into_inner),
@@ -365,13 +397,37 @@ impl Clients {
         if !(32..=512).contains(&key.len()) {
             return Err(Status::unauthenticated("invalid API key"));
         }
-        let mut client = pb::auth_service_client::AuthServiceClient::new(self.coordinator().await?);
+        // Discovery, channel acquisition and the auth RPC share this original
+        // budget. A discovery reconnect must not grant the RPC a fresh budget.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.config.timeout())
+            .ok_or_else(|| {
+                Status::unavailable("apiserver.verify_key: authentication timeout is too large")
+            })?;
+        let channel = tokio::time::timeout_at(deadline, self.coordinator())
+            .await
+            .map_err(|_| {
+                adx_observability::warn!(
+                    phase = "coordinator",
+                    category = "deadline",
+                    "API authentication Coordinator acquisition deadline exceeded"
+                );
+                Status::deadline_exceeded(
+                    "apiserver.verify_key: Coordinator acquisition deadline exceeded",
+                )
+            })??;
+        let mut client = pb::auth_service_client::AuthServiceClient::new(channel);
+        // Let the RPC span own its timeout and record terminal attribution;
+        // an outer timer would cancel it before those attributes are written.
         let result = self
-            .rpc(
+            .rpc_until(
                 "apiserver.verify_key",
-                client.verify_api_key(trace::inject(pb::VerifyApiKeyRequest {
-                    api_key: key.into(),
-                })),
+                deadline,
+                Box::pin(
+                    client.verify_api_key(trace::inject(pb::VerifyApiKeyRequest {
+                        api_key: key.into(),
+                    })),
+                ),
             )
             .await?;
         if result.expires_at_unix_seconds != 0 && result.expires_at_unix_seconds <= unix_seconds() {
@@ -692,52 +748,6 @@ mod tests {
         assert_eq!(normalized.code(), Code::DeadlineExceeded);
         assert!(normalized.message().contains("response deadline exceeded"));
         assert!(adx_protocol::deadline_failure(&normalized).is_none());
-    }
-
-    #[tokio::test]
-    async fn rpc_timeout_span_records_failure_attribution() {
-        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
-        opentelemetry::global::set_tracer_provider(provider.clone());
-
-        let clients = rpc_test_clients("http://127.0.0.1:1");
-        let error = clients
-            .rpc_with_timeout::<()>(
-                "test.timeout",
-                Duration::from_millis(20),
-                std::future::pending::<Result<Response<()>, Status>>(),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), Code::DeadlineExceeded);
-        assert!(error
-            .message()
-            .contains("control RPC response deadline exceeded"));
-
-        provider.force_flush().unwrap();
-        let spans = exporter.get_finished_spans().unwrap();
-        let span = spans
-            .iter()
-            .find(|span| span.name == "test.timeout")
-            .expect("timeout span must be exported");
-        assert!(span.attributes.iter().any(|attribute| {
-            attribute.key.as_str() == "result" && attribute.value.to_string() == "fail"
-        }));
-        assert!(span.attributes.iter().any(|attribute| {
-            attribute.key.as_str() == "error.code"
-                && attribute.value.to_string() == i32::from(Code::DeadlineExceeded).to_string()
-        }));
-        assert!(span.attributes.iter().any(|attribute| {
-            attribute.key.as_str() == "error.message"
-                && attribute.value.to_string().contains("deadline exceeded")
-        }));
-        assert!(matches!(
-            span.status,
-            opentelemetry::trace::Status::Error { .. }
-        ));
-        provider.shutdown().unwrap();
     }
 
     #[tokio::test]

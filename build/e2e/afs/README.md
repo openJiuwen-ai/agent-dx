@@ -11,7 +11,7 @@
 保留内容：
 
 - `acceptance/`：标准验收 runner、环境准入、driver、probe 和小规模 case 清单。
-- `ownerfs_acceptance.py`：OwnerFs 三节点/远端访问验收入口，默认从目标仓根目录定位 `afs/common/protocol/proto`。
+- `ownerfs_acceptance.py`：OwnerFs 三节点/远端访问验收入口，默认从目标仓根目录定位 `afs/crates/protocol/proto`。
   Meta固定使用local-file；准入、初启和重启共用本轮`C/meta-data`目录，配置／TLS材料仍由测试流程提供。
   旧etcd选项不再接受；旧目录须保留给原二进制，不自动导入新格式。
   `acceptance/test_ownerfs_meta_storage.py`只测参数构造和拒绝，不启动SSH／FUSE，不能代替真实恢复验收。
@@ -46,7 +46,6 @@
 python3 -m unittest discover -s build/e2e/afs/acceptance -p 'test_*.py' -v
 python3 build/e2e/afs/ownerfs_acceptance.py --help
 python3 build/e2e/afs/scripts/dfs/r1_e2e.py --help
-python3 build/e2e/afs/scripts/ownerfs/native-workspace-control.py --help
 python3 build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py --help
 ```
 
@@ -123,16 +122,16 @@ python3 build/e2e/afs/acceptance/dfs_multinode_small.py coordinator \
 
 ### 测试探针边界
 
-`afs/Cargo.toml` 中的 `afs-workspace-probe` 是 `tests/support/workspace_probe.rs` 里的 Cargo example，只供验收流程显式构建后放入测试 rootfs。`build/e2e/afs/acceptance/prepare-workspace-rootfs-linux.py` 会校验探针和 busybox 的 sha256、复制运行依赖，并输出测试 rootfs manifest。普通产品构建和试用包不依赖、也不携带该探针；OwnerFs bind 核心和宿主 bind 逻辑不调用它。
+`afs-workspace-probe` 是 `afs-tools` crate（`afs/tools/src/bin/workspace-probe.rs`）的 bin，只供验收流程显式构建（`cargo build --release --locked -p afs-tools --bin afs-workspace-probe`）后放入测试 rootfs。`build/e2e/afs/acceptance/prepare-workspace-rootfs-linux.py` 会校验探针和 busybox 的 sha256、复制运行依赖，并输出测试 rootfs manifest。普通产品构建和试用包不依赖、也不携带该探针；OwnerFs bind 核心和宿主 bind 逻辑不调用它。
 
 ## 源到目标映射
 
 | 来源路径 | 目标路径 | 处理 | 原因与影响 |
 | --- | --- | --- | --- |
 | `tests/acceptance/runner.py`、`drivers/`、`probes/`、`suites/`、`cases.json` | `build/e2e/afs/acceptance/` | 保留 | 当前标准验收和小规模回归仍读取这些入口。路径定位已调整为目标仓根目录。 |
-| `tests/ownerfs_acceptance.py` | `build/e2e/afs/ownerfs_acceptance.py` | 保留 | OwnerFs 远端/三节点验收入口，proto 默认路径已改为 `afs/common/protocol/proto`。 |
+| `tests/ownerfs_acceptance.py` | `build/e2e/afs/ownerfs_acceptance.py` | 保留 | OwnerFs 远端/三节点验收入口，proto 默认路径已改为 `afs/crates/protocol/proto`。 |
 | `scripts/dfs/r1_e2e.py` | `build/e2e/afs/scripts/dfs/r1_e2e.py` | 保留 | DFS R=1 小规模 E2E 驱动。 |
-| `scripts/ownerfs/native-workspace-control.py` | `build/e2e/afs/scripts/ownerfs/` | 保留 | OwnerFs bind/workspace 场景的测试控制工具；旧 W1/W2/S5 诊断入口已归档。 |
+| `scripts/ownerfs/native-workspace-control.py` | 已删除 | 删除 | 只服务于已删除的 `native_workspace` 受管容器实验控制器（S1e-3）；旧 W1/W2/S5 诊断入口已归档。 |
 | 来源快照的限定两节点 local-file bind ON 断言 | `build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py` | 迁移并改写 | 仅保留运行断言和证据输出；旧 `scripts/deploy/afs-trial-config`/包身份依赖被替换为目标仓二进制、脚本内临时配置和 mTLS 材料生成。 |
 | `scripts/check-rdma-cancellation.py` | `build/e2e/afs/scripts/check-rdma-cancellation.py` | 保留 | RDMA 取消路径辅助检查。 |
 | 旧 `tests/acceptance/*-linux.py` 中依赖源仓 release 包、`scripts/deploy/afs-processctl`、旧 package identity 的一次性驱动 | 未迁入 | 目标仓改由 `build/release`、部署适配和 `adxctl` 交付；这些脚本在源仓本地归档保留历史证据，不作为目标仓可运行入口。 |

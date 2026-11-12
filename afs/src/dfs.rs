@@ -6,12 +6,89 @@
 
 use std::collections::BTreeMap;
 
+/// Publish a complete verified read copy into the existing placement catalog.
+/// The local persistence receipt is evidence of bytes, not a durability promise.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PublishReadCache {
+    pub caller_id: String,
+    pub caller_session_id: String,
+    pub caller_node_epoch: u64,
+    pub operation_id: OperationId,
+    pub namespace_id: NamespaceId,
+    pub file_version_id: FileVersionId,
+    pub layout_root_id: LayoutRootId,
+    pub receipt: ReplicaAck,
+}
+
+/// Retire exactly the observed cache incarnation; stale retirement cannot
+/// remove a replacement copy or a promoted durable replica.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RetireReadCache {
+    pub caller_id: String,
+    pub caller_session_id: String,
+    pub caller_node_epoch: u64,
+    pub operation_id: OperationId,
+    pub copy: CopyRecord,
+}
+
+/// Stable per-device cache identity shared by publication and retirement.
+pub fn read_cache_copy(ack: &ReplicaAck) -> afs_error::Result<CopyRecord> {
+    let identity = serde_json::to_vec(&(
+        &ack.chunk_id,
+        &ack.node_id,
+        &ack.device_id,
+        ack.device_epoch,
+    ))
+    .map_err(|_| {
+        afs_error::Error::coded(
+            afs_error::IO_INVALID,
+            "read cache identity cannot be encoded",
+        )
+    })?;
+    Ok(CopyRecord {
+        id: CopyId::new(format!("cache:{}", blake3::hash(&identity).to_hex())),
+        chunk_id: ack.chunk_id.clone(),
+        role: CopyRole::VerifiedCache,
+        state: CopyState::Ready,
+        location: CopyLocation::Node {
+            node_id: ack.node_id.clone(),
+            node_epoch: ack.node_epoch,
+            device_id: ack.device_id.clone(),
+            device_epoch: ack.device_epoch,
+            catalog_revision: ack.catalog_revision,
+        },
+        persisted_bytes: ack.persisted_bytes,
+        verified_digest: ack.verified_digest.clone(),
+    })
+}
+
+/// Restore already committed immutable bytes using the ordinary replication receipt.
+/// This changes availability only, never the inode, FileVersion or layout.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RestoreFileChunk {
+    pub caller_id: String,
+    pub operation_id: OperationId,
+    pub file_version_id: FileVersionId,
+    pub layout_root_id: LayoutRootId,
+    pub write_lease: WriteLease,
+    pub receipt: ChunkReceipt,
+}
+
+/// Retire exactly the observed cache incarnation; stale retirement cannot
+/// remove a replacement copy or a promoted durable replica.
+mod lazy_source;
+pub(crate) use lazy_source::LAZY_FILE_DESCRIPTOR_XATTR;
+pub use lazy_source::{BindLazySourceRequest, LazyFileSpec, LazyFillBinding};
 use serde::{Deserialize, Serialize};
 
 mod cow;
 mod gc;
+mod replica_failure;
 pub use cow::clone_file_layout;
-pub use gc::{GcFence, GcReference, GcState, OpenReadIdentity, UpdateGcReference};
+pub use gc::{
+    GcFence, GcReference, GcState, OpenReadIdentity, UpdateGcReference, created_handle_reference_id,
+};
+pub use replica_failure::{ReplicaFailureConfig, ReplicaFailurePolicy};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -177,6 +254,22 @@ pub struct Dentry {
 pub struct DentryRecord {
     pub name: Vec<u8>,
     pub inode: InodeRecord,
+}
+
+/// One directory listing entry: what readdir needs, not the full inode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirEntryRecord {
+    pub name: Vec<u8>,
+    pub inode_id: InodeId,
+    pub kind: InodeKind,
+}
+
+/// One page of a directory in name order (R72).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DirPage {
+    pub entries: Vec<DirEntryRecord>,
+    /// No entry follows the last one returned.
+    pub eof: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -402,16 +495,36 @@ pub struct ChunkObject {
 }
 
 impl ChunkObject {
-    /// Birth generation of an independently named CRC object. Repairs retain it.
+    /// Birth generation of an independently named object: a CRC object
+    /// (`crc32c-v2-<generation>-<object>`) or a generational BLAKE3 object
+    /// (`blake3-v2-<generation>-<root>-<length>`, S3). Repairs retain it.
     pub fn write_generation(&self) -> Option<&str> {
-        let value = self.id.0.strip_prefix("crc32c-v2-")?;
-        let (generation, object) = value.split_once('-')?;
-        let hex = |s: &str| {
-            s.len() == 32
-                && s.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        };
-        (hex(generation) && hex(object)).then_some(generation)
+        if let Some(value) = self.id.0.strip_prefix("crc32c-v2-") {
+            let (generation, object) = value.split_once('-')?;
+            return (is_lower_hex(generation, 32) && is_lower_hex(object, 32))
+                .then_some(generation);
+        }
+        content_addressed_parts(&self.id).and_then(|parts| parts.generation)
+    }
+
+    /// The generational BLAKE3 identity of `body`'s standard root, born in the
+    /// write generation of `operation` (R05: one write's object is never
+    /// another write's, so deleting it cannot take out a re-upload).
+    pub fn generational_blake3_id(
+        operation: &OperationId,
+        root: &blake3::Hash,
+        length: u64,
+    ) -> ChunkId {
+        ChunkId::new(format!(
+            "blake3-v2-{}-{}-{length}",
+            Self::generation_id(operation),
+            root.to_hex()
+        ))
+    }
+
+    /// A generational BLAKE3 object (`blake3-v2-…`).
+    pub fn is_generational_blake3(&self) -> bool {
+        self.id.0.starts_with("blake3-v2-") && self.write_generation().is_some()
     }
 
     pub fn generation_id(operation: &OperationId) -> String {
@@ -435,7 +548,11 @@ impl ChunkObject {
     /// Other historical IDs have no content-addressed authority; callers must
     /// retain their complete verification fallback rather than infer a root.
     pub fn from_content_addressed_id(chunk_id: &ChunkId) -> Option<Self> {
-        let (hex, length) = content_addressed_parts(chunk_id)?;
+        let ContentAddressedParts {
+            digest: hex,
+            length,
+            ..
+        } = content_addressed_parts(chunk_id)?;
         let mut bytes = [0; 32];
         for (index, byte) in bytes.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
@@ -452,19 +569,42 @@ impl ChunkObject {
     }
 }
 
-fn content_addressed_parts(chunk_id: &ChunkId) -> Option<(&str, u64)> {
-    let content = chunk_id.0.strip_prefix("blake3-")?;
-    let (digest, length) = content.split_once('-')?;
-    let parsed_length = length.parse::<u64>().ok()?;
-    if digest.len() != 64
-        || !digest
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || parsed_length.to_string() != length
-    {
+}
+
+struct ContentAddressedParts<'a> {
+    generation: Option<&'a str>,
+    digest: &'a str,
+    length: u64,
+}
+
+/// `blake3-<root>-<length>` or `blake3-v2-<generation>-<root>-<length>`.
+fn content_addressed_parts(chunk_id: &ChunkId) -> Option<ContentAddressedParts<'_>> {
+    let content = chunk_id.0.strip_prefix("blake3-")?;
+    let (generation, content) = match content.strip_prefix("v2-") {
+        Some(rest) => {
+            let (generation, content) = rest.split_once('-')?;
+            if !is_lower_hex(generation, 32) {
+                return None;
+            }
+            (Some(generation), content)
+        }
+        None => (None, content),
+    };
+    let (digest, length) = content.split_once('-')?;
+    let parsed_length = length.parse::<u64>().ok()?;
+    if !is_lower_hex(digest, 64) || parsed_length.to_string() != length {
         return None;
     }
-    Some((digest, parsed_length))
+    Some(ContentAddressedParts {
+        generation,
+        digest,
+        length: parsed_length,
+    })
 }
 
 /// Immutable durability contract; external storage never counts as a Node replica.
@@ -522,11 +662,23 @@ pub fn external_object_key(
             "invalid external chunk identity",
         )
     };
-    let (digest, _) = content_addressed_parts(chunk_id).ok_or_else(invalid)?;
+    let digest = content_addressed_parts(chunk_id)
+        .ok_or_else(invalid)?
+        .digest;
     Ok(format!(
-        "afs/v1/{store_id}/{generation}/chunks/{}/{}",
+        "afs/v{}/{store_id}/{generation}/chunks/{}/{}",
+        crate::format::version::NODE_EXTERNAL_OBJECT_KEY,
         &digest[..2],
         chunk_id.0
+    ))
+}
+
+/// Key prefix of every chunk object of one store generation.
+pub fn external_chunk_prefix(store_id: &str, generation: &str) -> afs_error::Result<String> {
+    validate_external_store_identity(store_id, generation)?;
+    Ok(format!(
+        "afs/v{}/{store_id}/{generation}/chunks/",
+        crate::format::version::NODE_EXTERNAL_OBJECT_KEY
     ))
 }
 
@@ -563,12 +715,6 @@ impl ReplicationConfig {
             && self.min_distinct_failure_domains > 0
             && self.min_distinct_failure_domains <= self.desired_copies
     }
-
-    pub fn is_local_fast_path(&self) -> bool {
-        self.desired_copies == 1
-            && self.sync_required_copies == 1
-            && self.local_copy == LocalCopyPolicy::Required
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -576,6 +722,60 @@ pub enum LocalCopyPolicy {
     Required,
     Preferred,
     NotRequired,
+}
+
+/// The local-copy rule one placement actually enforces.
+///
+/// `declared` is the immutable filesystem contract in [`ReplicationConfig`];
+/// `effective` is what this placement executes. Every "must the writer hold a
+/// copy" decision reads `effective`. Today the only production constructor is
+/// [`Self::declared`], so the two are always equal and `placement_hash` output
+/// and placement epochs are unchanged.
+///
+/// Extension point: a later stage lets Meta lower `effective` when the local
+/// device is unhealthy. It stays separate from `ReplicationConfig`, which is
+/// persisted as postcard and so cannot gain a field, and it is not on the wire:
+/// a Node derives it when decoding the placement snapshot.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EffectiveLocalCopy {
+    declared: LocalCopyPolicy,
+    effective: LocalCopyPolicy,
+}
+
+impl EffectiveLocalCopy {
+    pub fn declared(config: &ReplicationConfig) -> Self {
+        Self {
+            declared: config.local_copy,
+            effective: config.local_copy,
+        }
+    }
+
+    /// A placement whose effective rule differs from the declared one. No
+    /// production path produces this yet.
+    #[cfg(all(test, feature = "dfs"))]
+    pub(crate) fn lowered_for_test(declared: LocalCopyPolicy, effective: LocalCopyPolicy) -> Self {
+        Self {
+            declared,
+            effective,
+        }
+    }
+
+    pub fn effective_policy(self) -> LocalCopyPolicy {
+        self.effective
+    }
+
+    /// The writer node must hold a durable copy of everything it writes.
+    pub fn requires_local(self) -> bool {
+        self.effective == LocalCopyPolicy::Required
+    }
+
+    /// The writer node heads the chain whenever it has a storage target.
+    pub fn prefers_local_head(self) -> bool {
+        matches!(
+            self.effective,
+            LocalCopyPolicy::Required | LocalCopyPolicy::Preferred
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -605,7 +805,20 @@ pub struct ReplicaGroup {
 pub struct PlacementSnapshot {
     pub revision: u64,
     pub replication: ReplicationConfig,
+    pub failure: ReplicaFailureConfig,
     pub replica_groups: Vec<ReplicaGroup>,
+    /// Derived, never persisted: Meta assembles it for this placement and a
+    /// Node derives it again when decoding the snapshot.
+    pub local_copy: EffectiveLocalCopy,
+}
+
+impl PlacementSnapshot {
+    /// One synchronous copy that must live on the writer: no replica chain.
+    pub fn is_local_fast_path(&self) -> bool {
+        self.replication.desired_copies == 1
+            && self.replication.sync_required_copies == 1
+            && self.local_copy.requires_local()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -642,6 +855,7 @@ pub struct ReplicaWriteGrant {
     pub replica_group_id: ReplicaGroupId,
     pub target_index: u32,
     pub replication: ReplicationConfig,
+    pub failure: ReplicaFailureConfig,
     pub replica_group: ReplicaGroup,
     pub expires_at_unix_ms: u64,
     pub fence: u64,
@@ -665,7 +879,6 @@ pub struct ReplicaAck {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CopyRole {
-    #[serde(alias = "Durable", alias = "DurableReplica")]
     #[default]
     DurableReplica,
     VerifiedCache,
@@ -674,12 +887,12 @@ pub enum CopyRole {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CopyState {
-    /// Decode-only compatibility for snapshots written before staging was
-    /// removed from the Meta catalog. New code never creates or serves this
-    /// state, so old staging records can never become readable Ready copies.
+    /// Reserved: holds postcard index 0 so the indices of the other variants
+    /// (the Meta storage format) stay unchanged. Never created or served; it
+    /// is not readable. The JSON name stays `Staging`. Removing it changes
+    /// the encoding and needs a format version bump (`crate::format`).
     #[serde(rename = "Staging")]
-    LegacyStaging,
-    #[serde(alias = "Durable", alias = "DurableReplica")]
+    Reserved0,
     #[default]
     Ready,
     Corrupt,
@@ -689,6 +902,48 @@ pub enum CopyState {
 impl CopyState {
     pub fn is_readable(self) -> bool {
         self == Self::Ready
+    }
+}
+
+/// The phase of one copy, as both Node and Meta name it. Vocabulary only: no
+/// value of this type is persisted, and each side maps its own representation.
+///
+/// | Phase | Node representation | Meta representation |
+/// |---|---|---|
+/// | `Staged` | `StagedChunk`, native upload body, `.tmp` file | none (`CopyState::Reserved0` is never created) |
+/// | `Durable` | `LocalChunkState::Durable` (+ `ReplicaAck`) | `{DurableReplica \| ExternalCommitted, Ready}` |
+/// | `VerifiedCache` | peer cache entry, S3 chunk cache | `{VerifiedCache, Ready}` |
+/// | `Quarantined` | `LocalChunkState::Quarantined` | `CopyState::Corrupt` once reported |
+/// | `Retired` | record and file removed by GC | `CopyState::Deleting`, or record removed |
+///
+/// Transitions on the Node: Staged → Durable in `persist_batch`; Durable →
+/// Quarantined and → Retired only through `CopyLifecycle`; Quarantined →
+/// Durable when `persist_batch` installs the same ID again. A Durable copy
+/// becomes published, Corrupt or Deleting only by a Meta decision.
+/// Writeback (decision 6) adds a `StagedPendingUpload` phase in stage F; S1
+/// does not introduce an unused value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopyPhase {
+    Staged,
+    Durable,
+    VerifiedCache,
+    Quarantined,
+    Retired,
+}
+
+impl CopyPhase {
+    /// The phase of a Meta copy record, for comparing the two authorities.
+    #[cfg(test)]
+    pub fn of_meta(role: CopyRole, state: CopyState) -> Self {
+        match (state, role) {
+            (CopyState::Reserved0, _) => Self::Staged,
+            (CopyState::Ready, CopyRole::VerifiedCache) => Self::VerifiedCache,
+            (CopyState::Ready, CopyRole::DurableReplica | CopyRole::ExternalCommitted) => {
+                Self::Durable
+            }
+            (CopyState::Corrupt, _) => Self::Quarantined,
+            (CopyState::Deleting, _) => Self::Retired,
+        }
     }
 }
 
@@ -722,23 +977,11 @@ pub struct CopyRecord {
 }
 
 impl CopyRecord {
-    pub fn node_location(&self) -> Option<CopyLocation> {
-        match &self.location {
-            CopyLocation::Node {
-                node_id,
-                node_epoch,
-                device_id,
-                device_epoch,
-                catalog_revision,
-            } => Some(CopyLocation::Node {
-                node_id: node_id.clone(),
-                node_epoch: *node_epoch,
-                device_id: device_id.clone(),
-                device_epoch: *device_epoch,
-                catalog_revision: *catalog_revision,
-            }),
-            CopyLocation::External { .. } => None,
-        }
+    pub fn is_ready_readable(&self) -> bool {
+        matches!(
+            self.role,
+            CopyRole::DurableReplica | CopyRole::VerifiedCache
+        ) && self.state.is_readable()
     }
 
     pub fn is_ready_durable(&self) -> bool {
@@ -758,7 +1001,6 @@ pub enum PlacementHealth {
 pub struct PlacementRecord {
     pub chunk_id: ChunkId,
     pub replica_group_id: ReplicaGroupId,
-    #[serde(alias = "epoch")]
     pub placement_epoch: u64,
     #[serde(default = "one_copy")]
     pub desired_copies: u16,
@@ -856,6 +1098,10 @@ pub struct ReportChunkCorruption {
     pub catalog_revision: u64,
 }
 
+/// Term a Node requests for a DFS writer lease; the lease keeper renews at
+/// two thirds of it.
+pub const DFS_WRITE_LEASE_SECONDS: u64 = 30;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WriteLease {
     pub inode_id: InodeId,
@@ -898,7 +1144,6 @@ pub struct DfsMissingReadSource {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DfsAuthorizedRead {
-    pub open_sources: Vec<u8>,
     pub validation: DfsReadValidation,
     pub allowed_ranges: Vec<(u64, u64)>,
     pub expires_at_unix_ms: u64,
@@ -1070,15 +1315,6 @@ pub struct SyncInodeMetadata {
     pub metadata_delta: CommitMetadataDelta,
 }
 
-/// One bounded page of file-level authorization, delivered directly by Meta to
-/// the authenticated serving Node. It is never accepted from a reading Node.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct OpenReadSource {
-    pub chunk_id: ChunkId,
-    pub copy_ids: Vec<CopyId>,
-    pub ranges: Vec<(u64, u64)>,
-}
-
 #[cfg(test)]
 mod external_identity_tests {
     use super::*;
@@ -1157,7 +1393,7 @@ mod external_identity_tests {
         let chunk = ChunkId::new(format!("blake3-{}-42", "a".repeat(64)));
         assert_eq!(
             external_object_key("filesystem", "generation-1", &chunk).unwrap(),
-            format!("afs/v1/filesystem/generation-1/chunks/aa/{}", chunk.0)
+            format!("afs/v2/filesystem/generation-1/chunks/aa/{}", chunk.0)
         );
         for segment in ["", "..", "a/b", "a b", "a%2fb"] {
             assert!(external_object_key(segment, "generation", &chunk).is_err());

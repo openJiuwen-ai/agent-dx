@@ -6,11 +6,28 @@ pub struct GcReference {
     pub session_id: String,
     pub reference_id: String,
     pub inode_id: Option<InodeId>,
+    /// Set on admitted `write:` generation references, which protect every
+    /// chunk of their generation from collection.
     pub publication: bool,
+    /// Decode only: always empty on new references. Per-chunk `publish:`
+    /// reservations were removed (R33), but this field is part of the postcard
+    /// record, so dropping it changes the WAL and checkpoint encoding and needs
+    /// a format version bump (see the format golden tests).
     pub chunks: Vec<ChunkObject>,
     pub retired_at_unix_ms: Option<u64>,
+    /// Decode only: always `None` on new references. Open-read authorization
+    /// was removed, but this field is part of the postcard record, so dropping
+    /// it changes the WAL and checkpoint encoding and needs a format version
+    /// bump (see the format golden tests).
     #[serde(default)]
     pub open_read: Option<OpenReadIdentity>,
+    /// The one version this reference keeps readable besides the head: a
+    /// reader's opened version, or the version a write generation started
+    /// from (R81 F2). `None` keeps the inode and its head only. Added with
+    /// `META_RECORD_DECISION` 2 / `META_STATE_IMAGE` 3; older stored references
+    /// carried no version and are refused with their format, never read as
+    /// "protects nothing".
+    pub pinned_version: Option<FileVersionId>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GcState {
@@ -21,25 +38,27 @@ pub struct GcState {
 
 #[derive(Clone, Debug)]
 pub struct UpdateGcReference {
-    pub open_read: Option<OpenReadIdentity>,
-    pub close_open_read: bool,
     pub node_id: String,
     pub session_id: String,
     pub reference_id: String,
     pub inode_id: Option<InodeId>,
     pub version_id: Option<FileVersionId>,
     pub publication: bool,
-    pub chunks: Vec<ChunkObject>,
-    pub release: bool,
     pub admission_deadline_unix_ms: u64,
 }
 
-/// GC state observed before a native write generation produces any receipts.
-/// Absent is explicit; an absent wire marker never means an absent GC record.
+/// The `open:` reference Meta admits inside the Create transaction, for the
+/// handle the same call opens. Create retries reuse the operation id, so a replay
+/// names the same reference.
+pub fn created_handle_reference_id(operation: &crate::dfs::OperationId) -> String {
+    format!("open:create-{}", operation.0)
+}
+
+/// How a native write generation is protected from GC while it produces receipts.
+/// Never written to the Meta log. The variant name still reaches disk through the
+/// JSON namespace request digest, so renaming it breaks replay of recorded commits.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum GcFence {
-    Absent,
-    Revision(u64),
     /// The caller's admitted write reference, independent of unrelated GC work.
     WriteGeneration,
 }
@@ -48,8 +67,6 @@ impl GcFence {
         use afs_protocol::meta::dfs_gc_fence::Kind;
         afs_protocol::meta::DfsGcFence {
             kind: Some(match self {
-                Self::Absent => Kind::Absent(true),
-                Self::Revision(value) => Kind::StateRevision(value),
                 Self::WriteGeneration => Kind::WriteGeneration(true),
             }),
         }
@@ -57,8 +74,6 @@ impl GcFence {
     pub(crate) fn from_wire(value: afs_protocol::meta::DfsGcFence) -> afs_error::Result<Self> {
         use afs_protocol::meta::dfs_gc_fence::Kind;
         match value.kind {
-            Some(Kind::Absent(true)) => Ok(Self::Absent),
-            Some(Kind::StateRevision(value)) if value > 0 => Ok(Self::Revision(value)),
             Some(Kind::WriteGeneration(true)) => Ok(Self::WriteGeneration),
             _ => Err(afs_error::Error::coded(
                 afs_error::CLIENT_ARGUMENT_INVALID,
@@ -66,21 +81,10 @@ impl GcFence {
             )),
         }
     }
-    pub(crate) fn condition(self) -> Option<crate::meta::store::TxnCondition> {
-        use crate::meta::store::{MetaKey, StoreRevision, TxnCondition};
-        match self {
-            Self::Absent => Some(TxnCondition::Missing(MetaKey::DfsGc)),
-            Self::Revision(value) => Some(TxnCondition::RevisionEquals {
-                key: MetaKey::DfsGc,
-                revision: StoreRevision(value),
-            }),
-            Self::WriteGeneration => None,
-        }
-    }
 }
 
-/// Immutable version held by one native read-only open. Closing authority does
-/// not release its GC reference while an in-flight handle user still owns it.
+/// The persisted shape of `GcReference::open_read`. Nothing creates it any more;
+/// it stays so that existing records keep decoding (see that field).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OpenReadIdentity {
     pub version_id: FileVersionId,
@@ -115,6 +119,7 @@ mod open_authority_tests {
                 chunks: vec![],
                 retired_at_unix_ms: None,
                 open_read: identity,
+                pinned_version: None,
             };
             let expected = (reference, true);
             let bytes = postcard::to_allocvec(&expected).unwrap();

@@ -9,7 +9,7 @@ use afs::{
         dfs::{CreateFileRequest, DfsService},
         store::{
             MetaRead, MetaStore, NodeSessionLease, RequestKey, Store, StoreRevision,
-            journal::LogLimits, local_log::LocalLog,
+            local_log::{LocalLog, LocalLogOptions},
         },
     },
 };
@@ -19,7 +19,7 @@ async fn open(path: &Path) -> Arc<dyn MetaStore> {
     // Only await the known channel-close/file-lock release after dropping Store.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match LocalLog::open(path, LogLimits::default()) {
+            match LocalLog::open(path, LocalLogOptions::default()) {
                 Ok(log) => {
                     break Arc::new(Store::open_log(Arc::new(log)).await.unwrap())
                         as Arc<dyn MetaStore>;
@@ -145,9 +145,13 @@ async fn p3_local_log_namespace_retry_watch_and_restart_are_equivalent() {
         "retry returns the original inode/lease, not current renamed state"
     );
     assert_eq!(dfs.rename(rename).await.unwrap(), renamed);
-    let entries = dfs.read_dir(namespace.clone(), root.clone()).await.unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, b"second");
+    let page = dfs
+        .read_dir_page(namespace.clone(), root.clone(), Vec::new(), 0)
+        .await
+        .unwrap();
+    assert!(page.eof);
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].name, b"second");
     assert_eq!(
         std::fs::read(&wal).unwrap(),
         before,
@@ -184,4 +188,92 @@ async fn p3_local_log_namespace_retry_watch_and_restart_are_equivalent() {
     assert_eq!(std::fs::read(dir.path().join("IDENTITY")).unwrap(), id);
     assert!(!dir.path().join("snapshot").exists());
     assert!(!dir.path().join("wal").exists());
+}
+
+/// R72: ReadDir pages in name order with an exclusive name cursor; eof marks
+/// the last page; a cursor naming a removed entry still continues after it.
+#[tokio::test]
+async fn read_dir_pages_follow_an_exclusive_name_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path()).await;
+    store
+        .register_node_session(
+            RequestKey::new("writer", "register"),
+            NodeSessionLease {
+                node_id: "writer".into(),
+                session_id: "writer-session".into(),
+                grpc_addr: "http://writer:7400".into(),
+                data_addr: "http://writer:7500".into(),
+                rest_addr: "http://writer:7600".into(),
+                ownerfs_enabled: true,
+                storage_devices: Vec::new(),
+                lease_ttl: Duration::from_secs(60),
+            },
+        )
+        .await
+        .unwrap();
+    let dfs = DfsService::new(store.clone());
+    dfs.initialize_replication_config().await.unwrap();
+    let namespace = NamespaceId::new("default");
+    let root = InodeId::new("1");
+    for name in ["e", "a", "d", "b", "c"] {
+        dfs.create(CreateFileRequest {
+            caller_id: "writer".into(),
+            owner_session_id: "writer-session".into(),
+            operation_id: OperationId::new(format!("create-{name}")),
+            namespace_id: namespace.clone(),
+            parent_inode_id: root.clone(),
+            name: name.as_bytes().to_vec(),
+            attributes: InodeAttributes {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                nlink: 1,
+                atime_unix_ms: 1,
+                mtime_unix_ms: 1,
+                ctime_unix_ms: 1,
+            },
+            lease_seconds: 60,
+        })
+        .await
+        .unwrap();
+    }
+    let page = |after: &str, limit| {
+        let dfs = dfs.clone();
+        let (namespace, root) = (namespace.clone(), root.clone());
+        let after = after.as_bytes().to_vec();
+        async move {
+            dfs.read_dir_page(namespace, root, after, limit)
+                .await
+                .unwrap()
+        }
+    };
+    let names = |page: &afs::dfs::DirPage| {
+        page.entries
+            .iter()
+            .map(|entry| String::from_utf8(entry.name.clone()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let first = page("", 2).await;
+    assert_eq!(
+        (names(&first), first.eof),
+        (vec!["a".into(), "b".into()], false)
+    );
+    assert_eq!(first.entries[0].kind, afs::dfs::InodeKind::Regular);
+    let second = page("b", 2).await;
+    assert_eq!(
+        (names(&second), second.eof),
+        (vec!["c".into(), "d".into()], false)
+    );
+    let last = page("d", 2).await;
+    assert_eq!((names(&last), last.eof), (vec!["e".into()], true));
+    let exact = page("c", 2).await;
+    assert_eq!(
+        (names(&exact), exact.eof),
+        (vec!["d".into(), "e".into()], true)
+    );
+    // "bb" names no entry: the page continues after where it would sort.
+    assert_eq!(names(&page("bb", 1).await), ["c"]);
+    let all = page("", 0).await;
+    assert_eq!((names(&all).len(), all.eof), (5, true));
 }

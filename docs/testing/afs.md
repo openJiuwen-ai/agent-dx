@@ -5,13 +5,13 @@
 [ADX 测试体系现状](test-strategy.md)，静态现状、缺失与优先级见 [AFS 用例盘点](afs-test-inventory.md)。
 AFS 拥有自己的 UT 和组件集成测试；部署及公共用户 E2E 统一纳入 ADX。
 三类组件集成（真实 FUSE/bind、单机多进程、跨节点）的目标统一为 `afs/tests/`；
-基础组件集成已落地 [afs/tests/run.py](../../afs/tests/README.md)，同guest与多namespace共用入口；旧外置driver保留辅助/专项用途。Buildkite真实AFS接线仍未实施。
+基础组件集成已落地 [afs/tests/run.py](../../afs/tests/README.md)，同guest与多namespace共用入口；旧外置driver保留辅助/专项用途。Buildkite已接Base默认冒烟的AFS组件5项与Full的`ci-full` 24项（见[测试体系第四步](test-strategy.html#step-4)）；特权真实后端集成链未接。
 下文旧 acceptance runner 的 ARM64/full 限制是现有工具事实，不是 ADX 共用测试的架构要求。
 
 五步原则、现状、待补与优先级统一维护在 [同页测试规范](test-strategy.html)；
 可直接定位 [单VM](test-strategy.html#step-2)、[多namespace](test-strategy.html#step-3)、
 [Buildkite](test-strategy.html#step-4) 和 [固定包验收](test-strategy.html#step-5)。
-第二/三步共用入口已实现；当前基础注册为22case。旧冻结产物20case通过只属于历史批次；
+第二/三步共用入口已实现；当前基础注册为23case（`local-basic` 14＋`cluster-manyread` 9）。旧冻结产物20case通过只属于历史批次；
 新增缓存/权限检查的实际资格以当前候选结果为准。可选SSH多VM与CI产品接线仍须独立验收。
 
 Agent FS（AFS） 在目标仓中的验收按“目标仓源码、目标仓二进制、目标仓环境证据”登记。DMS/AFS 历史证据保留来源版本、环境和判据，可用于追溯和风险判断，但不自动升级为 Agent DX 当前候选结论。
@@ -48,7 +48,7 @@ AFS 产品二进制只支持 ARM64，也不代表 x86_64 包或定向 Linux driv
 3. DFS 一写多读核心场景；
 4. 普通 OwnerFs 本地 FUSE 访问及性能优化。
 
-大规模、长时间、复杂可靠性、多 Meta、etcd、Redis 和完整故障矩阵继续后置。pjdfstest、固定 LTP filesystem 子集和短 FSx 用于兜底功能完备性；项目自定义 case 只补充 OwnerFs bind、远端访问、DFS 复制、Meta 恢复和权限语义。
+大规模、长时间、多 Meta／高可用和完整故障矩阵继续后置；etcd、Redis 已可作 Meta 操作日志后端，28 个本机故障场景见 `afs/tests/run.py --suite local-fault`。pjdfstest、固定 LTP filesystem 子集和短 FSx 用于兜底功能完备性；项目自定义 case 只补充 OwnerFs bind、远端访问、DFS 复制、Meta 恢复和权限语义。
 
 ## 性能目标
 
@@ -89,7 +89,7 @@ LOOKUP旧长度与OPEN新版本的竞争；旧READ延迟回复不污染新OPEN�
 
 ```sh
 cargo test --locked -p afs --all-features --test fuse_contract dfs_buffered_ -- --ignored --test-threads=1
-cargo test --locked -p afs --all-features --lib node::vfs::dfs::tests::p1_ -- --test-threads=1
+cargo test --locked -p afs --all-features --lib -- node::vfs::dfs::tests::read_views::p1_ node::vfs::dfs::tests::version_cache::p1_ --test-threads=1
 cargo test --locked -p afs --all-features --lib node::dfs_read::tests
 ```
 
@@ -99,13 +99,13 @@ cargo test --locked -p afs --all-features --lib node::dfs_read::tests
 
 ### 并发基准工具 afs-bench
 
-`afs/client/src/bin/afs-bench.rs` 是双臂同尺的 DFS 并发基准：FUSE 臂走挂载点（POSIX 语义），
+`afs/tools/src/bin/afs-bench.rs`（`afs-tools` crate）是双臂同尺的 DFS 并发基准：FUSE 臂走挂载点（POSIX 语义），
 SDK 臂走节点 uds（usrbio 数据面），同一确定性 payload、同口径计时，结果直接可比。首个
 workload 为多文件并发读写。工具只产生吞吐数字与校验结果；功能通过、测量完成、稳定性与
 性能达标必须分开登记，工具输出本身不构成任何验收结论。
 
 ```sh
-cargo build --locked --release -p afs-client --bin afs-bench
+cargo build --locked --release -p afs-tools --bin afs-bench
 ./target/release/afs-bench <mountpoint> --sock <node.sock> --arm fuse --mode rw \
   --files 16 --file-bytes 256M --threads 16 --rounds 3 --settle-secs 65 --json bench.json
 ```
@@ -954,7 +954,7 @@ Root命令接口契约及受影响真实gRPC丢ACK修复用例补充核对接线
 P3-6有限配置回归包括默认local-file、退役选项拒绝、TOML／CLI覆盖和非法范围。
 共享启动工厂的有限运行测试另核对实际历史条数／空闲过期、恢复后不复活、
 短周期checkpoint与WAL分段；序列化配置正确不替代运行接线证据。
-旧快照StoreBackend、etcd／Redis适配和专属测试已按clean-break移除；保留现有领域、健康故障和丢ACK重放断言并改用canonical日志。旧源码与历史结论仍按原版本保留。配置／组件通过不代表真实产品或P3-6全部完成。
+旧快照StoreBackend（整份快照单 key 的 etcd／Redis 适配）和专属测试已按clean-break移除，R16 的 redis／etcd 操作日志后端另有合同测试（`log_contract_tests`、`kv_log_tests`，`--ignored` 并指定专用实例）；保留现有领域、健康故障和丢ACK重放断言并改用canonical日志。旧源码与历史结论仍按原版本保留。配置／组件通过不代表真实产品或P3-6全部完成。
 
 ### Meta指标与旧工具接线回归
 
@@ -1051,7 +1051,7 @@ Full FSx和FUN/REL完整harness的未执行状态保持，已有标准、组件�
 
 ## 原生CRC与写入代次GC定向检查
 
-原生DFS Node默认启用CRC和写入代次保护，保留capability本地处理及省略逐chunk登记。`generation_`检查覆盖库存保护、无关GC变化、确切代次退休、检查后退休竞态、回复丢失重放、迟到准入与墓碑清理，以及重试保留旧收据时所有出生代次仍须有效。`META_DFS_GC_CHANGED`在CRC路径指相关代次缺失/退休；不再把无关全局GC变化当作失败。`meta::dfs::gc_fence_tests::`同时保留显式BLAKE3对照路径的原条件事务检查。
+原生DFS Node默认启用CRC和写入代次保护，保留capability本地处理及省略逐chunk登记。`generation_`检查覆盖库存保护、无关GC变化、确切代次退休、检查后退休竞态、回复丢失重放、迟到准入与墓碑清理，以及重试保留旧收据时所有出生代次仍须有效。`META_DFS_GC_CHANGED`在CRC路径指相关代次缺失/退休；不再把无关全局GC变化当作失败。`meta::dfs::gc_fence_tests::`同时保留BLAKE3对照路径（`gc_fence`为空）的GC版本条件事务检查。
 
 `crc32c_`检查覆盖描述及Meta wire、CRC向量/末段、独立ID、原ID复制/修复、catalog重开、跨段读取、损坏/缺表/错表/截断拒绝、局部覆盖、截短/扩容、部分成功后失败重试，以及远端Header/Completion身份和范围。all-features还核对RDMA CRC Completion与Meta绑定；这不是RDMA硬件运行。`meta_capability_`保持原inode映射及错误顺序，`pr88_fix_`保留组合开关和尾块重试检查。Rust检查只在Linux执行。
 
@@ -1096,30 +1096,27 @@ sudo unshare --mount --net --propagation private sh -c '
 cargo test --release -p afs --lib pr93_fix_ -- --test-threads=1
 ```
 
-## Experimental native gRPC read CRC modes
+## Native gRPC read CRC switch
 
-The isolated CRC read candidate adds `dfs_read_crc_mode = "both" | "receiver" | "off"` (CLI `--dfs-read-crc-mode`). Native DFS with `data_mode = "grpc"` defaults to `off`; native writes continue to generate CRC32C by default. Set `receiver` to opt in to B-side verification, or `both` for diagnostic checks at both ends. This setting affects native CRC-format peer reads over gRPC; it does not disable CRC generation, replica verification, fsync, local read verification, or recovery checks. Other backends and transports retain their existing `both` setting; explicit `off` or `receiver` overrides require native DFS and `data_mode = "grpc"`. The default data mode is already `grpc`; this change does not select a different transport.
+`dfs_read_crc_mode = "off" | "receiver"` (CLI `--dfs-read-crc-mode`) is a single on/off switch for remote-read body verification. Native DFS with `data_mode = "grpc"` defaults to `receiver`, so a corrupt remote copy is rejected and the read moves to another copy instead of returning the bad bytes; `off` is an explicit opt-out. Native writes continue to generate CRC32C. It may only be set for native DFS with `data_mode = "grpc"`; other backends and transports keep their fixed internal sender-and-receiver policy. `"both"` was removed as a configurable value in S1a-7 and is rejected. This setting affects native CRC-format peer reads over gRPC only; it does not disable CRC generation, replica verification, fsync, local read verification, or recovery checks.
 
-- `both`: A verifies stored segments; B verifies complete trusted segments. Exact boundary fragments retain the existing range checksum.
-- `receiver`: aligned complete segments are verified at B; fragments retain A covering-segment verification plus the exact-range check at B. This mode does not claim B can independently verify an incomplete stored segment.
+- `receiver`: aligned complete segments are verified at B against the Meta-trusted table; fragments retain A covering-segment verification plus the exact-range check at B. Native prefetch is not used in this mode.
 - `off`: peer-read body CRC is deliberately skipped at A and B. Corrupt stored bytes may be delivered successfully. Descriptor binding, authenticated identity, authorization, bounds, frame order, lengths, completion, resource limits and close behavior remain checked.
 
-A/B must agree via the explicit `x-afs-read-crc-mode` request metadata. New read-only completion algorithm tags prevent silent downgrade; old receivers reject unsupported modes. These tags are never accepted as stored object digests or replica durable-ACK digests. A configured mode mismatch fails before data delivery. Mixed-version rollout and non-CRC object support for the new modes are not admitted by this experiment.
-
-To enable optional B verification, set `dfs_read_crc_mode = "receiver"` on both A and B. A only needs to serve the matching policy for aligned complete segments; those segments are checked at B. A standalone B-only configuration change is not negotiated by the current implementation. Requests without the policy metadata retain the legacy `both` interpretation and therefore fail against an `off` server rather than silently changing their verification contract.
+B states its mode in the `x-afs-read-crc-mode` request metadata and A serves exactly that mode, regardless of A's own setting; A's setting only governs A's own remote reads. Nodes may therefore be configured differently. Read-only completion algorithm tags prevent silent downgrade: B rejects a completion whose tag does not match the mode it requested. These tags are never accepted as stored object digests or replica durable-ACK digests. Nodes on other transports (e.g. the gRPC fallback of `rdma`/`auto`) request the internal sender-and-receiver policy (`both`), and a request without the metadata is treated the same way.
 
 Moving detection from A to B also moves the point where a corrupted copy becomes visible. This experiment retains existing candidate fallback, but its R1 corruption test proves detection/EIO or explicit unchecked delivery, not multi-replica quarantine, repair or self-healing. Previously recorded open-handle EOF and GC qualification boundaries remain separate.
 
 
-## Experimental native readonly open authority
+## Reader semantics (decision 4a)
 
-The isolated read candidate supports `dfs_native_open_read_authority = true` only with explicit native `data_mode = "grpc"`. The switch defaults to false. Eligible regular O_RDONLY handles with no dirty/proxy view pin their opened version/layout and reuse file-scoped authorization. The ordinary lane retains its lease checks. The off-only native fast lane binds a full Meta-authorized context to a trackable mTLS connection; source-page TTL does not expire that connected open. It retains fixed range/length/resource bounds without repeating per-frame authorization. Close prevents new admission; in-flight owners keep the existing durable GC pin until their last release.
+Every DFS read handle, on native and S3 storage alike, pins the version committed at open until close (close-to-open). Commits made on other nodes reach a reader only through a new open; `getattr`, view renewal and elapsed time never move an open handle. Writes made on this Node are visible to every handle on this Node whatever the open order: while the Node has write activity on the inode (an open writer, uncommitted data or a commit in flight) all handles read the Node's own view, and when that activity ends they stay pinned at the Node's last commit. While this Node proxies writes to another owner, its handles read the owner's view. The former `dfs_native_open_read_authority` switch, its file-scoped Meta authorization and the 5 s reader refresh were removed in S1a-6; pinning relies on the inode-level GC reference every handle already holds.
 
-Native readonly handles with a known immutable version/length identity may use the kernel page cache and readahead. The FUSE open fence drains earlier read replies before making a fresh cache decision. Live cached handles for one inode share one identity; a new open for an incompatible version/length uses direct IO until those cached handles retire, so an older fixed view cannot refill the new view's shared pages. Explicit O_DIRECT, unknown native readonly identities and admission exhaustion also use direct IO. The live-handle metadata table is bounded and never evicts an active identity. `dfs_fuse_keep_cache` controls reuse across opens, not whether a newly opened eligible handle may cache pages. This provides close-to-open behavior rather than a per-fd historical length, fstat or mmap snapshot guarantee. Historical direct-only EOF measurements remain historical evidence. The new persisted GC context schema has only been checked with fresh isolated stores and same-version Meta/A/B. Migration, mixed versions and user-space prefetch/cache integration are not admitted.
+Native readonly handles with a known immutable version/length identity may use the kernel page cache and readahead. The FUSE open fence drains earlier read replies before making a fresh cache decision. Live cached handles for one inode share one identity; a new open for an incompatible version/length uses direct IO until those cached handles retire, so an older fixed view cannot refill the new view's shared pages. Explicit O_DIRECT, unknown native readonly identities and admission exhaustion also use direct IO. The live-handle metadata table is bounded and never evicts an active identity. Pages are reused across opens of the exact same version (the former `dfs_fuse_keep_cache` switch was removed in S1a-7); that does not decide whether a newly opened eligible handle may cache pages. This provides close-to-open behavior rather than a per-fd historical length, fstat or mmap snapshot guarantee. Historical direct-only EOF measurements remain historical evidence. The new persisted GC context schema has only been checked with fresh isolated stores and same-version Meta/A/B. Migration, mixed versions and user-space prefetch/cache integration are not admitted.
 
 Kernel readahead is independently requested with `fuse_max_readahead_bytes` (0..16MiB); fuser clamps it to the kernel's proposed ceiling, so the requested number is not an assertion of the effective window. Record the `dfs.fuse_cache_init` configuration and Linux BDI `read_ahead_kb`. `dfs.fuse_cache_open` records actual cached/direct admission and keep-cache choices. Native object prefetch remains controlled separately by `dfs_readahead_max_bytes`, and remains zero in the kernel-readahead comparison. Actual Linux validation must cover overwritten/truncated/extended versions on a fresh open, overlapping old/new handles and exactly-once release before any performance claim.
 
-The [remote read candidate ledger](../performance/afs-remote-read-20261024/README.md) records the exact cohorts, Linux validation, retained failures and future work. Benchmark settings explicitly enable this switch, set `dfs_fuse_keep_cache=false` and `dfs_readahead_max_bytes=0`; merely using a new binary does not activate all candidate optimizations.
+The [remote read candidate ledger](../performance/afs-remote-read-20261024/README.md) records the exact cohorts, Linux validation, retained failures and future work. Benchmark settings at the time enabled the since-removed open authority switch, set `dfs_fuse_keep_cache=false` and `dfs_readahead_max_bytes=0`; merely using a new binary does not activate all candidate optimizations.
 
 The fixed-open retirement regressions also cover durable quarantine invalidating
 cached descriptors, repairing the same object before reopening it, a missing
@@ -1251,7 +1248,8 @@ all-saturation admission.
 `tls_encryption_enabled` is a top-level Node and Meta boolean, default `false`,
 with the usual defaults < TOML < explicit CLI precedence. It applies uniformly
 to AFS internal TCP/gRPC: registration and heartbeat, filesystem Meta authority,
-node read/write, replica transfer and NodeControl. It does not introduce TLS to
+node read/write, replica transfer and the Node control services
+(`NodeControl`, `OwnerControl`, `DfsOwnerControl`). It does not introduce TLS to
 UDS, RDMA, REST or external object-store HTTPS.
 
 With all four existing `tls_*` identity fields configured, both values require

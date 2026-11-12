@@ -71,7 +71,7 @@ provide equivalent environment-veth/host-firewall isolation before enabling
 `network` mode. User NetworkPolicy must not be able to weaken that baseline.
 `ADX_DATA_PLANE_RELAY_ALLOW_ANY_INGRESS=1` /
 `ADX_DATA_PLANE_INGRESS_ALLOW_ANY_CLIENT=1` remain development-only ACL escapes.
-Ingress has separate TLS and plaintext listeners. Direct is accepted only on the
+By default, Ingress has separate TLS and plaintext listeners. Direct is accepted only on the
 TLS listener and always requires a user token. The generic relay supports anonymous tunnel and port-forwarding/SSH routes. The managed Coordinator route resolver forces token authentication for port-forwarding/SSH; such routes require TLS. A published `portForwardRoutes` entry can
 require a token for one target port; that port is then rejected on the plaintext
 listener and authenticated on the TLS listener. Plaintext requests carrying
@@ -869,3 +869,16 @@ HTTP/2. API keys, sandbox envd tokens, private-port traffic credentials, route
 fencing and Relay restrictions remain enforced. Native control/administrator,
 Execd, Agent and CONNECT policies remain unchanged. No forwarded header can
 assert this opt-in. See the [configuration and limits](../docs/deployment/e2b-compatibility.md#显式-http-入口).
+
+### Explicit ingress listeners
+
+`ADX_DATA_PLANE_INGRESS_LISTENERS` optionally replaces the default public listeners with a JSON array. Each entry has `listen`, `tls` (default false), `allow_http_credentials` (default false), and optional `allowed_routes`. With the variable absent, existing TLS/plaintext binds and certificate requirements remain unchanged. An explicit HTTP-only list does not require public TLS certificates. Internal RPC security is configured independently.
+
+```json
+[{"listen":"127.0.0.1:8080","tls":false,"allow_http_credentials":true,
+  "allowed_routes":[{"method":"GET","path":"exact:/healthz"},{"path":"prefix:/api/environment"},{"path":"prefix:/direct"}]}]
+```
+
+Credential-enabled HTTP must be explicitly selected on trusted interfaces. Authentication and tenant checks remain active. It does not enable E2B HTTP unless the E2B HTTP option is also enabled. The default plaintext listener continues rejecting credentials. HTTPS listeners cannot set `allow_http_credentials`.
+
+Route filters run before dispatch. `method` is an optional HTTP method; `path` uses existing `exact:` or segment-bounded `prefix:` syntax. Missing `allowed_routes` retains all routes; an empty list denies every route. These restrictions apply to that public listener only, including health endpoints. They do not configure host firewall or network reachability.

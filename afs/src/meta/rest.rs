@@ -5,9 +5,11 @@
 //! `/v1/ping` 复用 Meta::ping；`/metrics` 导出同一注册表。
 //! `/v1/roots/{root_id}` 是调度器查询 OwnerFs 根目录位置的管理面入口，
 //! 只能读取配置的 MetaStore，不能把当前 ping 的返回值当作节点注册/目录归属。
+use crate::clock::now_unix_ms;
+
 use super::{
     Meta,
-    store::{BackendPersistence, MetaEntity, MetaRead, now_unix_ms, unavailable_meta_store},
+    store::{BackendPersistence, MetaEntity, MetaRead, unavailable_meta_store},
 };
 use axum::{
     Json, Router,
@@ -43,7 +45,11 @@ async fn store_statistics(
     let mut statistics = view.statistics()?;
     let snapshot = view.read(MetaRead::DfsGc).await?;
     if let Some(MetaEntity::DfsGc(gc)) = snapshot.entity {
-        statistics["gc"] = json!({"generation":gc.generation,"pending_chunks":gc.chunks.len(),"waiting_nodes":gc.waiting_nodes});
+        let age = meta
+            .dfs
+            .as_ref()
+            .map_or(0, |dfs| dfs.gc_metrics().generation_age_seconds.get());
+        statistics["gc"] = json!({"generation":gc.generation,"pending_chunks":gc.chunks.len(),"waiting_nodes":gc.waiting_nodes,"generation_age_seconds":age});
     }
     Ok(Json(statistics))
 }

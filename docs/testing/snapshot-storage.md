@@ -40,7 +40,7 @@ cargo test --locked -p adx-coordinator --test storage checkpoint_publication_rou
 | --- | --- | --- | --- |
 | local only | 写节点私有目录，完成可读性校验 | 直接读取本地目录 | 原节点；不支持跨节点恢复 |
 | S3 + 本地缓存 | 写本地 staging，文件上传完成后发布 manifest | 命中缓存直接用；否则下载并校验后使用 | Coordinator 删除 S3；节点独立淘汰缓存 |
-| AFS / JuiceFS（distributed_fs） | 直接写挂载目录中的独立捕获目录，逐文件同步后发布 manifest | 直接使用同一共享路径，不预下载整个制品 | Coordinator 删除共享 manifest 和目录 |
+| AFS / JuiceFS / NFS（distributed_fs） | 直接写挂载目录中的独立捕获目录，逐文件同步后发布 manifest | 直接使用同一共享路径，不预下载整个制品 | Coordinator 删除共享 manifest 和目录 |
 
 每个共享后端使用稳定 `alias`。同一 alias 的所有节点与 Coordinator 必须配置同一
 存储 namespace。跨节点恢复同时核对 alias、实际后端 scope 和 checkpoint 捕获时的恢复证据；
@@ -70,8 +70,8 @@ S3 通过标准 AWS 环境变量/身份机制取得凭据。制品引用保存 a
 
 `distributed_fs` 是统一的目录访问接口。adxlet 和 Coordinator 不区分底层文件系统：
 前者调用捕获／恢复接口，后者调用回收接口；两者配置相同 alias、prefix 和共享 namespace。
-`checkpoint-storage` 适配层识别实际挂载的 AFS DFS 或 JuiceFS，不需要 `filesystem` 选择字段。
-Linux 上的挂载必须是 `afs-dfs` FUSE，或 `fuse.juicefs` / `JuiceFS:<volume>`。
+`checkpoint-storage` 适配层识别实际挂载的 AFS DFS、JuiceFS 或 NFS，不需要 `filesystem` 选择字段。
+Linux 上识别 `afs-dfs` FUSE、`fuse.juicefs` / `JuiceFS:<volume>`，或源为远端 `server:/path` 的 `nfs` / `nfs4` 挂载。NFS 部署须提供同步持久化的服务端导出。
 启动时固定挂载身份，每次访问检查挂载 ID、设备、来源和子目录；消失、被覆盖或重挂载时
 返回错误，不落到本地目录。重挂载后应在确认目标 namespace 正确后重启使用该挂载的 ADX 进程。
 Coordinator 也需要能访问同一 namespace；各进程可以有独立挂载路径。
@@ -255,8 +255,8 @@ Coordinator 重启后的目录进度与排空心跳，并检查目标节点未�
 
 ## 分段 profile 与性能对比
 
-在已准备好的 Firecracker / AFS fixture 中，为 Meta 进程及其启动父进程设置
-`AFS_META_PROFILE=1` 可记录 canonical log 批次的 append＋sync 和状态发布耗时，`bytes` 是该批次的 framed 字节数。
+在已准备好的 Firecracker / AFS fixture 中，使用以 `--features diagnostics` 构建的 Meta（默认构建与发行包不编译该诊断，变量被忽略），
+为 Meta 进程及其启动父进程设置 `AFS_META_PROFILE=1` 可记录 canonical log 批次的 append＋sync 和状态发布耗时，`bytes` 是该批次的 framed 字节数。
 这些计时不包含排队、准备或完整检查点；checkpoint 与历史保留另通过 Meta 的固定指标观察。先保留整份脱敏 `export/`
 （包括两个 Ingress 的服务日志），再汇总：
 
@@ -321,7 +321,7 @@ version、chunk 与 GC 屏障，避免每次文件访问都复制整个命名空
 权限变化、名字被替换、目录新增子项、持续竞争返回 EAGAIN，以及提交成功但应答
 丢失后的幂等重放。测试不把预设返回值代替真实的 Meta 比较提交。
 
-真实 AFS/Firecracker 验证可开启 `AFS_META_NAMESPACE_TRACE=1` 关联失败条件和
+真实 AFS/Firecracker 验证可在 `diagnostics` feature 构建的 Meta 上开启 `AFS_META_NAMESPACE_TRACE=1` 关联失败条件和
 相邻写入事务；关联必须使用 inode 及版本／head，不能只凭相近时间认定竞争双方。
 删除验收还要检查私有运行文件、匿名恢复点、Meta 实体和物理数据块均已收敛。
 

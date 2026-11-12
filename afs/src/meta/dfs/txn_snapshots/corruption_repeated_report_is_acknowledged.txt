@@ -1,0 +1,12 @@
+txn 0: DfsReportChunkCorruption RequestKey { caller_id: "source", request_id: "corrupt-again" }
+conditions:
+  EntityEquals(DfsChunk(ChunkObject { id: ChunkId("<chunk>"), length: 13, content_digest: ContentDigest { algorithm: Blake3, bytes: [213, 172, 52, 174, 206, 231, 68, 249, 163, 193, 137, 156, 150, 43, 220, 44, 123, 107, 169, 101, 253, 156, 7, 85, 218, 162, 138, 75, 203, 43, 36, 105] }, encoding: Raw }))
+  EntityEquals(DfsCopy(CopyRecord { id: CopyId("copy-source"), chunk_id: ChunkId("<chunk>"), role: DurableReplica, location: Node { node_id: "source", node_epoch: 1, device_id: "source-dev", device_epoch: 1, catalog_revision: 1 }, state: Corrupt, persisted_bytes: 13, verified_digest: ContentDigest { algorithm: Blake3, bytes: [213, 172, 52, 174, 206, 231, 68, 249, 163, 193, 137, 156, 150, 43, 220, 44, 123, 107, 169, 101, 253, 156, 7, 85, 218, 162, 138, 75, 203, 43, 36, 105] } }))
+  EntityEquals(DfsPlacement(PlacementRecord { chunk_id: ChunkId("<chunk>"), replica_group_id: ReplicaGroupId("repair-r2"), placement_epoch: 2, desired_copies: 2, copies: [CopyId("copy-source")], health: BlockedNoSource }))
+  EntityEquals(DfsReplicationConfig(ReplicationConfig { desired_copies: 2, sync_required_copies: 2, min_distinct_nodes: 1, min_distinct_failure_domains: 1, local_copy: Required }))
+  EntityEquals(DfsReplicationTask(ReplicationTask { id: ReplicationTaskId("repair:<chunk>"), chunk_id: ChunkId("<chunk>"), placement_epoch: 2, desired_copies: 2, existing_copies: [CopyId("copy-source")], state: BlockedNoSource, attempt: 0, next_retry_unix_ms: <ms>, last_error: Some("corruption reported by source on device source-dev at catalog revision 2"), claim: None }))
+  EntityEquals(NodeSession(NodeSession { node_id: "source", session_id: "source-s1", grpc_addr: "http://source:1", data_addr: "http://source:2", rest_addr: "http://source:3", ownerfs_enabled: false, storage_devices: [StorageDeviceDescriptor { device_id: "source-dev", device_epoch: 1, catalog_revision: 0, failure_domain: "source-fd" }], lease_epoch: 1, expires_at_unix_ms: <ms> }))
+  NodeSessionCurrent { node_id: "source", session_id: "source-s1" }
+  RequestAbsent(RequestKey { caller_id: "source", request_id: "corrupt-again" })
+mutations:
+  RecordRequestOutcome(RequestOutcome { request: RequestKey { caller_id: "source", request_id: "corrupt-again" }, operation: DfsReportChunkCorruption, result: DfsNamespace { request_digest: <digest>, result: Empty } })

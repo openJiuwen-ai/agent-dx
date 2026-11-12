@@ -6,11 +6,13 @@ import base64
 import hashlib
 import ipaddress
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import shutil
 import time
+import uuid
 
 from fixtures import singlevm, ssh, namespaces, kubernetes, docker
 from fixtures.common import (
@@ -19,6 +21,17 @@ from fixtures.common import (
 
 ROLES = ("M", "A", "B", "C")
 NAMES = {"M": "meta", "A": "node-a", "B": "node-b", "C": "node-c"}
+# R16: run the suites with Meta on a shared-service log. The variable holds
+# the Meta store TOML lines; "{unique}" becomes a fresh token per generated
+# Meta config, so each case starts on an empty key prefix.
+META_STORE_ENV = "AFS_E2E_META_STORE_TOML"
+
+
+def meta_store_config():
+    template = os.environ.get(META_STORE_ENV)
+    if not template:
+        return 'meta_store = "local-file"\n'
+    return template.replace("\\n", "\n").replace("{unique}", uuid.uuid4().hex).rstrip("\n") + "\n"
 
 
 def validate(config, cases):
@@ -120,6 +133,9 @@ class Cluster:
         self.gid = config["gid"]
         self.bind = False
         self.helpers = {}
+        # One Meta store per cluster: regenerated configs and Meta restarts
+        # within a case keep the same log (and key prefix).
+        self.meta_store_toml = meta_store_config()
 
     def record(self, name, value):
         self.evidence.append({"check": name, "value": value})
@@ -483,10 +499,7 @@ class Cluster:
             common += "trusted_node_certs = {" + trusted + "}\n"
             if role == "M":
                 policy = self.case.profile or DfsProfile()
-                config = (
-                    'id = "meta-ctl"\nfs = "all"\nmeta_store = "local-file"\n'
-                    + policy.meta_config() + common
-                )
+                config = 'id = "meta-ctl"\nfs = "all"\n' + self.meta_store_toml + policy.meta_config() + common
             else:
                 config = (
                     f'id = "{NAMES[role]}"\nfs = "{self.mode}"\n'

@@ -4,7 +4,7 @@ set -euo pipefail
 source /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 20.04 ]]
 
-for command in autoconf automake libtoolize pkg-config musl-gcc readelf busybox \
+for command in autoconf automake libtoolize pkg-config musl-gcc readelf curl busybox \
   rustc cargo rustup rustfmt clippy-driver go protoc protoc-gen-go protoc-gen-go-grpc \
   mkfs.erofs fsck.erofs redis-server redis-cli python3 strace; do
   command -v "$command" >/dev/null || { echo "missing build command: $command" >&2; exit 1; }

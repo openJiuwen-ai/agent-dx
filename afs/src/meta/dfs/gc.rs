@@ -2,11 +2,14 @@
 use super::*;
 use crate::dfs::{ChunkId, GcReference, GcState, UpdateGcReference};
 use std::{
-    collections::{BTreeSet, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
 };
 static GC_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 const MAX_CHUNKS: usize = 1024;
+/// Most references one release call retires. One call is one transaction, so
+/// this also bounds the size of its log record.
+pub const MAX_RELEASE_BATCH: usize = 1024;
 /// Maximum admission horizon update_gc_reference accepts beyond the current
 /// time (the "60s cleanup fence"). A replay of an abandoned admission can
 /// only be accepted while its original deadline is still in this window.
@@ -22,27 +25,73 @@ const ADMISSION_CLOCK_SKEW_MS: u64 = 60_000;
 /// as the configured data grace protects their content (plan_collection
 /// deletes them at max(grace, this value)), so a long grace is honored.
 const REFERENCE_RECORD_RETENTION_MS: u64 = ADMISSION_HORIZON_MS + ADMISSION_CLOCK_SKEW_MS;
+mod deleter;
+mod metrics;
+pub(crate) use deleter::DeleterWatch;
+pub(crate) use metrics::GcMetrics;
+/// Most keys one GC transaction deletes when nothing has pushed back. Equal to the
+/// default `history::Limits::cleanup_items`: a commit clears at most that many
+/// retained revisions while it is prepared, each holding at least one event of
+/// about a delete's charge, so a batch this size fits even with history at its
+/// byte limit. Smaller history limits are met by halving on rejection.
+const MAX_BATCH_KEYS: usize = 4096;
+/// References one pass retires for departed sessions.
+const MAX_RETIRED_PER_PASS: u64 = 1024;
+/// A pass stops halving here and reports the rejection.
+const MIN_BATCH_KEYS: usize = 64;
+/// Key batches one pass may commit after the first. Keys that are not chunk
+/// records need no Node acknowledgement, so one plan can clear many of them.
+const MAX_EXTRA_BATCHES_PER_PASS: usize = 15;
+/// One plan. `keys` holds the chunk records first, which must be deleted together
+/// with the barrier that names their chunks (a copy whose chunk record is gone
+/// would never be planned again). Everything after `chunk_keys` is independent:
+/// each entity is dead by reachability from live roots alone, so deleting any
+/// subset leaves the rest dead and whatever is live untouched, in any order and
+/// across restarts.
 #[derive(Default)]
 struct GcPlan {
     keys: Vec<MetaKey>,
+    chunk_keys: usize,
     chunks: Vec<ChunkId>,
+    /// Owner of each version in `keys`, for the commit condition.
+    version_owners: BTreeMap<FileVersionId, InodeId>,
 }
+#[cfg(test)]
 fn plan_collection(
     entities: &[MetaEntity],
     references: &[GcReference],
     now: u64,
     grace: u64,
 ) -> GcPlan {
-    let protected: BTreeSet<_> = references
-        .iter()
-        .filter(|reference| {
-            reference
-                .retired_at_unix_ms
-                .is_none_or(|time| time.saturating_add(grace) > now)
-        })
-        .filter_map(|reference| reference.inode_id.clone())
-        .collect();
-    let mut protected_inodes = protected;
+    plan_bounded(entities, references, now, grace, MAX_CHUNKS)
+}
+fn plan_bounded(
+    entities: &[MetaEntity],
+    references: &[GcReference],
+    now: u64,
+    grace: u64,
+    max_chunks: usize,
+) -> GcPlan {
+    // A live reference (or one still in grace) keeps its inode and that
+    // inode's head, plus the one version it names: a reader's opened version
+    // or a write generation's base (R81 F2). Earlier versions nobody names are
+    // collectable even while the file stays open; their bytes may still be
+    // shared with a kept version, which reachability below keeps.
+    let live_references = references.iter().filter(|reference| {
+        reference
+            .retired_at_unix_ms
+            .is_none_or(|time| time.saturating_add(grace) > now)
+    });
+    let mut protected_inodes = BTreeSet::new();
+    let mut pinned_versions = BTreeSet::new();
+    for reference in live_references {
+        if let Some(inode) = &reference.inode_id {
+            protected_inodes.insert(inode.clone());
+            if let Some(version) = &reference.pinned_version {
+                pinned_versions.insert((inode.clone(), version.clone()));
+            }
+        }
+    }
     for entity in entities {
         if let MetaEntity::DfsWriteLease(lease) = entity
             && lease.expires_at_unix_ms > now
@@ -65,7 +114,8 @@ fn plan_collection(
     let mut layouts = BTreeSet::new();
     for entity in entities {
         if let MetaEntity::DfsFileVersion(version) = entity
-            && (heads.contains(&version.id) || protected_inodes.contains(&version.inode_id))
+            && (heads.contains(&version.id)
+                || pinned_versions.contains(&(version.inode_id.clone(), version.id.clone())))
         {
             versions.insert(version.id.clone());
             layouts.insert(version.layout_root.clone());
@@ -92,13 +142,6 @@ fn plan_collection(
             chunks.insert(task.chunk_id.clone());
         }
     }
-    for reference in references.iter().filter(|reference| {
-        reference
-            .retired_at_unix_ms
-            .is_none_or(|time| time.saturating_add(grace) > now)
-    }) {
-        chunks.extend(reference.chunks.iter().map(|chunk| chunk.id.clone()));
-    }
     // Inventory can arrive from any replica before CommitFileVersion. One
     // admitted write generation protects all of its independently named objects.
     let generations: BTreeSet<_> = references
@@ -114,12 +157,6 @@ fn plan_collection(
                 .reference_id
                 .strip_prefix("write:")
                 .map(str::to_owned)
-                .or_else(|| {
-                    reference
-                        .reference_id
-                        .strip_prefix("publish:")
-                        .map(|operation| ChunkObject::generation_id(&OperationId::new(operation)))
-                })
         })
         .collect();
     for entity in entities {
@@ -139,13 +176,22 @@ fn plan_collection(
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .take(MAX_CHUNKS)
+        .take(max_chunks)
         .collect();
     let mut plan = GcPlan {
         keys: Vec::new(),
         chunks: reclaim.iter().cloned().collect(),
+        ..GcPlan::default()
     };
+    let mut other_keys = Vec::new();
     for entity in entities {
+        let chunk_record = matches!(
+            entity,
+            MetaEntity::DfsChunk(_)
+                | MetaEntity::DfsPlacement(_)
+                | MetaEntity::DfsCopy(_)
+                | MetaEntity::DfsReplicationTask(_)
+        );
         let dead = match entity {
             MetaEntity::DfsInode(inode) => {
                 inode.attributes.nlink == 0 && !protected_inodes.contains(&inode.inode_id)
@@ -168,9 +214,19 @@ fn plan_collection(
             _ => false,
         };
         if dead {
-            plan.keys.push(crate::meta::store::entity_key(entity));
+            if chunk_record {
+                plan.keys.push(crate::meta::store::entity_key(entity));
+            } else {
+                other_keys.push(crate::meta::store::entity_key(entity));
+                if let MetaEntity::DfsFileVersion(version) = entity {
+                    plan.version_owners
+                        .insert(version.id.clone(), version.inode_id.clone());
+                }
+            }
         }
     }
+    plan.chunk_keys = plan.keys.len();
+    plan.keys.extend(other_keys);
     plan
 }
 fn reference_entity(
@@ -188,6 +244,17 @@ fn reference_entity(
         TxnCondition::Missing(key)
     });
     Ok(snapshot.entity)
+}
+/// On the wire a `write:` reference names its timestamped operation, which fixes
+/// admission age. The stored id is the hash immutable chunk identities address.
+fn stored_reference_id(id: &str) -> String {
+    match id.strip_prefix("write:") {
+        Some(operation) => format!(
+            "write:{}",
+            ChunkObject::generation_id(&OperationId::new(operation))
+        ),
+        None => id.to_owned(),
+    }
 }
 fn ref_key(node: &str, session: &str, id: &str) -> MetaKey {
     MetaKey::DfsReference {
@@ -228,34 +295,36 @@ impl DfsService {
         self.gc_grace_ms = grace;
         self
     }
+
+    /// How long an external deleter may hold a generation before another live
+    /// participant takes it over (S4-9).
+    #[must_use]
+    pub fn with_gc_deleter_handoff(mut self, handoff: std::time::Duration) -> Self {
+        self.gc_deleter = DeleterWatch::new(handoff);
+        self
+    }
+
+    pub(crate) fn gc_metrics(&self) -> &GcMetrics {
+        &self.gc_metrics
+    }
     pub async fn update_gc_reference(&self, mut update: UpdateGcReference) -> Result<()> {
         require_id(&update.node_id, "node_id")?;
         require_id(&update.session_id, "session_id")?;
         require_id(&update.reference_id, "reference_id")?;
-        if self.is_external_backend() {
-            return Err(invalid(
-                "native GC references require NodeReplicated storage",
-            ));
-        }
         // On the wire the original timestamped operation fixes admission age.
         // Persist the hash key that immutable chunk identities can address.
         let write_operation = update
             .reference_id
             .strip_prefix("write:")
             .map(str::to_owned);
-        if let Some(operation) = &write_operation {
-            update.reference_id = format!(
-                "write:{}",
-                ChunkObject::generation_id(&OperationId::new(operation))
-            );
-        }
+        update.reference_id = stored_reference_id(&update.reference_id);
         let key = ref_key(&update.node_id, &update.session_id, &update.reference_id);
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
-        // Concurrent uploads append to one publication reference. Queue them
-        // fairly instead of making each append lose up to 64 CAS attempts.
-        // Fixed shards bound memory; durable conditions still fence GC, other
-        // service instances, session replacement and cancelled requests.
+        // Serialize updates of one reference key fairly instead of letting each
+        // lose up to 64 CAS attempts. Fixed shards bound memory; durable
+        // conditions still fence GC, other service instances, session
+        // replacement and cancelled requests.
         let shard = hasher.finish() as usize % self.gc_reference_updates.len();
         let _reference_update = self.gc_reference_updates[shard].lock().await;
         for _ in 0..64 {
@@ -277,33 +346,8 @@ impl DfsService {
                 Some(MetaEntity::DfsReference(reference)) => Some(reference),
                 _ => None,
             };
-            let mut reference = if let Some(reference) = existing {
+            let reference = if let Some(reference) = existing {
                 reference
-            } else if update.release {
-                // Persist a tombstone even when admission has not become visible.
-                // This CAS fences a queued/lost-reply retain on the same key.
-                let tombstone = GcReference {
-                    open_read: None,
-
-                    node_id: update.node_id.clone(),
-                    session_id: update.session_id.clone(),
-                    reference_id: update.reference_id.clone(),
-                    inode_id: None,
-                    publication: false,
-                    chunks: Vec::new(),
-                    retired_at_unix_ms: Some(now_unix_ms()),
-                };
-                if self
-                    .gc_commit_checked(
-                        conditions,
-                        StoreOperation::DfsUpdateReference,
-                        vec![TxnMutation::Put(MetaEntity::DfsReference(tombstone))],
-                    )
-                    .await?
-                {
-                    return Ok(());
-                }
-                continue;
             } else {
                 let now = now_unix_ms();
                 if update.admission_deadline_unix_ms <= now {
@@ -350,17 +394,6 @@ impl DfsService {
                         "open version was collected before reference admission",
                     ));
                 }
-                if let Some(identity) = &update.open_read
-                    && (identity.closed
-                        || update.publication
-                        || update.close_open_read
-                        || update.version_id.as_ref() != Some(&identity.version_id)
-                        || !matches!(view.lookup(&MetaKey::DfsFileVersion(identity.version_id.clone()))?.entity, Some(MetaEntity::DfsFileVersion(v)) if v.inode_id == inode_id && v.layout_root == identity.layout_root_id))
-                {
-                    return Err(invalid(
-                        "open read registration differs from its immutable version",
-                    ));
-                }
                 GcReference {
                     node_id: update.node_id.clone(),
                     session_id: update.session_id.clone(),
@@ -369,79 +402,23 @@ impl DfsService {
                     publication: update.publication,
                     chunks: Vec::new(),
                     retired_at_unix_ms: None,
-                    open_read: update.open_read.clone(),
+                    open_read: None,
+                    pinned_version: update.version_id.clone(),
                 }
             };
             if reference.retired_at_unix_ms.is_some() {
-                return if update.release {
-                    Ok(())
-                } else {
-                    Err(conflict("retired reference cannot be reused"))
-                };
+                return Err(conflict("retired reference cannot be reused"));
             }
-            if !update.release
-                && (update
-                    .inode_id
-                    .as_ref()
-                    .is_some_and(|inode| reference.inode_id.as_ref() != Some(inode))
-                    || update.publication != reference.publication)
+            if update
+                .inode_id
+                .as_ref()
+                .is_some_and(|inode| reference.inode_id.as_ref() != Some(inode))
+                || update.publication != reference.publication
+                || update.version_id != reference.pinned_version
             {
                 return Err(invalid("reference identity was reused for another access"));
             }
-            if update
-                .open_read
-                .as_ref()
-                .is_some_and(|identity| reference.open_read.as_ref() != Some(identity))
-            {
-                return Err(invalid("open read reference identity changed"));
-            }
-            if update.close_open_read {
-                let identity = reference
-                    .open_read
-                    .as_mut()
-                    .ok_or_else(|| invalid("reference is not an open read context"))?;
-                identity.closed = true;
-            }
-            let gc = match reference_entity(&view, MetaKey::DfsGc, &mut conditions)? {
-                Some(MetaEntity::DfsGc(gc)) => gc,
-                _ => GcState::default(),
-            };
-            if update
-                .chunks
-                .iter()
-                .any(|chunk| gc.chunks.contains(&chunk.id))
-            {
-                return Err(afs_error::Error::coded(
-                    afs_error::META_DFS_GC_BUSY,
-                    "chunk deletion must finish before publication",
-                ));
-            }
-            if !update.chunks.is_empty() && !reference.publication {
-                return Err(invalid("chunks require a publication reference"));
-            }
-            let mut mutations = Vec::new();
-            for chunk in &update.chunks {
-                if let Some(MetaEntity::DfsChunk(known)) =
-                    reference_entity(&view, MetaKey::DfsChunk(chunk.id.clone()), &mut conditions)?
-                {
-                    if &known != chunk {
-                        return Err(invalid("immutable chunk identity changed"));
-                    }
-                } else {
-                    mutations.push(TxnMutation::Put(MetaEntity::DfsChunk(chunk.clone())));
-                }
-                if let Some(known) = reference.chunks.iter().find(|known| known.id == chunk.id) {
-                    if known != chunk {
-                        return Err(invalid("publication chunk identity changed"));
-                    }
-                } else {
-                    reference.chunks.push(chunk.clone());
-                }
-            }
-            if update.release {
-                reference.retired_at_unix_ms = Some(now_unix_ms());
-            }
-            mutations.push(TxnMutation::Put(MetaEntity::DfsReference(reference)));
+            let mutations = vec![TxnMutation::Put(MetaEntity::DfsReference(reference))];
             if self
                 .gc_commit_checked(conditions, StoreOperation::DfsUpdateReference, mutations)
                 .await?
@@ -451,18 +428,82 @@ impl DfsService {
         }
         Err(conflict("GC reference admission contention"))
     }
-    async fn gc_commit(
+    /// Retires `reference_ids` of this session in one transaction: one log
+    /// record however many there are. A reference Meta has not seen gets a
+    /// tombstone that fences a queued or lost-reply admission of the same key;
+    /// one already retired stays as it is, so a retried batch is idempotent.
+    /// Keys are not shard-locked: a racing admission of the same key loses on
+    /// the per-key conditions, whichever transaction commits first.
+    pub async fn release_gc_references(
         &self,
-        revision: super::super::store::StoreRevision,
-        operation: StoreOperation,
-        mutations: Vec<TxnMutation>,
-    ) -> Result<bool> {
-        self.gc_commit_checked(
-            vec![TxnCondition::StoreRevisionEquals(revision)],
-            operation,
-            mutations,
-        )
-        .await
+        node_id: String,
+        session_id: String,
+        reference_ids: Vec<String>,
+    ) -> Result<()> {
+        require_id(&node_id, "node_id")?;
+        require_id(&session_id, "session_id")?;
+        if reference_ids.len() > MAX_RELEASE_BATCH {
+            return Err(invalid("GC release batch too large"));
+        }
+        let mut keys = BTreeSet::new();
+        for id in &reference_ids {
+            require_id(id, "reference_id")?;
+            keys.insert(ref_key(&node_id, &session_id, &stored_reference_id(id)));
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        for _ in 0..64 {
+            let view = self.store.read_view().await?;
+            let caller = view
+                .lookup(&MetaKey::CurrentNodeSession {
+                    node_id: node_id.clone(),
+                })?
+                .entity;
+            live_caller(caller.as_slice(), &node_id, &session_id)?;
+            let mut conditions = vec![TxnCondition::NodeSessionCurrent {
+                node_id: node_id.clone(),
+                session_id: session_id.clone(),
+            }];
+            let now = now_unix_ms();
+            let mut mutations = Vec::new();
+            for key in &keys {
+                let reference = match reference_entity(&view, key.clone(), &mut conditions)? {
+                    Some(MetaEntity::DfsReference(reference)) => reference,
+                    Some(_) => return Err(invalid("GC reference key holds another entity")),
+                    None => {
+                        let MetaKey::DfsReference { reference_id, .. } = key else {
+                            return Err(invalid("GC release key is not a reference"));
+                        };
+                        GcReference {
+                            open_read: None,
+                            node_id: node_id.clone(),
+                            session_id: session_id.clone(),
+                            reference_id: reference_id.clone(),
+                            inode_id: None,
+                            publication: false,
+                            chunks: Vec::new(),
+                            retired_at_unix_ms: None,
+                            pinned_version: None,
+                        }
+                    }
+                };
+                if reference.retired_at_unix_ms.is_none() {
+                    mutations.push(TxnMutation::Put(MetaEntity::DfsReference(GcReference {
+                        retired_at_unix_ms: Some(now),
+                        ..reference
+                    })));
+                }
+            }
+            if mutations.is_empty()
+                || self
+                    .gc_commit_checked(conditions, StoreOperation::DfsUpdateReference, mutations)
+                    .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(conflict("GC reference release contention"))
     }
     async fn gc_commit_checked(
         &self,
@@ -472,7 +513,7 @@ impl DfsService {
     ) -> Result<bool> {
         let key = RequestKey::new(
             "afs-meta",
-            super::super::store::timed_request_id(format!(
+            crate::clock::timed_request_id(format!(
                 "gc-{}-{}",
                 std::process::id(),
                 GC_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -489,7 +530,7 @@ impl DfsService {
         }));
         txn.mutations = mutations;
         Ok(matches!(
-            self.store.compare_and_commit(txn).await?,
+            self.store.compare_and_commit_background(txn).await?,
             TxnOutcome::Committed { .. }
         ))
     }
@@ -500,85 +541,162 @@ impl DfsService {
         completed: u64,
         inventory: Vec<ChunkObject>,
     ) -> Result<GcState> {
-        if self.is_external_backend() {
-            return Err(invalid("native collection requires NodeReplicated storage"));
+        self.gc_metrics.passes.inc();
+        let started = std::time::Instant::now();
+        let result = self
+            .collect_garbage_attempts(node, session, completed, inventory)
+            .await;
+        self.gc_metrics
+            .pass_duration
+            .observe(started.elapsed().as_secs_f64());
+        self.gc_metrics.observe_stall();
+        let gc = result?;
+        self.gc_metrics.observe(&gc);
+        Ok(gc)
+    }
+
+    /// Commits what the first batch of a plan left, while the plan stays valid.
+    /// Best effort: anything left over is planned again next pass.
+    async fn commit_remaining_keys(
+        &self,
+        since: crate::meta::store::StoreRevision,
+        entities: &[MetaEntity],
+        now: u64,
+        plan: &GcPlan,
+        mut rest: &[MetaKey],
+        batch_keys: usize,
+    ) {
+        for _ in 0..MAX_EXTRA_BATCHES_PER_PASS {
+            if rest.is_empty() {
+                break;
+            }
+            let (batch, later) = rest.split_at(rest.len().min(batch_keys));
+            rest = later;
+            let mutations = batch
+                .iter()
+                .cloned()
+                .map(TxnMutation::Delete)
+                .collect::<Vec<_>>();
+            let chunkless = GcPlan {
+                version_owners: plan.version_owners.clone(),
+                ..GcPlan::default()
+            };
+            let guard = plan_guard(since, entities, now, &chunkless, batch, &mutations);
+            match self
+                .gc_commit_checked(
+                    vec![TxnCondition::DfsGcPlanStillValid(Arc::new(guard))],
+                    StoreOperation::DfsCollectGarbage,
+                    mutations,
+                )
+                .await
+            {
+                Ok(true) => self.gc_metrics.observe_collected(),
+                Ok(false) => {
+                    self.gc_metrics.conflicts.inc();
+                    return;
+                }
+                Err(error) => {
+                    let _ = self.gc_metrics.rejected_batch(error, MIN_BATCH_KEYS);
+                    return;
+                }
+            }
         }
+        self.gc_metrics
+            .dead_keys
+            .set(i64::try_from(rest.len()).unwrap_or(i64::MAX));
+    }
+
+    /// Whether `node` should list the external object store and report a page
+    /// as inventory: one node at a time, the same one that deletes (R05).
+    pub async fn lists_external_inventory(&self, node: &str) -> Result<bool> {
+        if !self.is_external_backend() {
+            return Ok(false);
+        }
+        let sessions = self.store.read(MetaRead::CurrentNodeSessions).await?;
+        let participants = gc_participants(&sessions.entities, now_unix_ms());
+        Ok(self.gc_deleter.choose(&participants).as_deref() == Some(node))
+    }
+
+    async fn collect_garbage_attempts(
+        &self,
+        node: String,
+        session: String,
+        completed: u64,
+        inventory: Vec<ChunkObject>,
+    ) -> Result<GcState> {
         if inventory.len() > MAX_CHUNKS {
             return Err(invalid("GC inventory batch too large"));
         }
+        let mut batch_keys = MAX_BATCH_KEYS;
         for _ in 0..64 {
             let view = self.store.read_view().await?;
             let (revision, mut entities) = view.snapshot()?;
+            let mut gc_conditions = Vec::new();
+            reference_entity(&view, MetaKey::DfsGc, &mut gc_conditions)?;
+            self.gc_metrics.attempts.inc();
+            self.gc_metrics.observe_references(&entities);
             live_caller(&entities, &node, &session)?;
             let mut gc = gc_state(&entities);
-            // A new session fences the old process. Keep its pins through the old
-            // authority deadline plus the normal read-grant grace; heartbeat loss
-            // alone never retires a reader.
-            let mut mutations = Vec::new();
             let now = now_unix_ms();
-            let old_deadlines = entities
-                .iter()
-                .filter_map(|entity| match entity {
-                    MetaEntity::NodeSession(value)
-                        if value.node_id == node && value.session_id != session =>
-                    {
-                        Some((value.session_id.clone(), value.expires_at_unix_ms))
-                    }
-                    _ => None,
-                })
-                .collect::<std::collections::BTreeMap<_, _>>();
-            for entity in &mut entities {
-                if let MetaEntity::DfsReference(reference) = entity
-                    && reference.node_id == node
-                    && reference.session_id != session
-                    && reference.retired_at_unix_ms.is_none()
-                {
-                    reference.retired_at_unix_ms = Some(
-                        old_deadlines
-                            .get(&reference.session_id)
-                            .copied()
-                            .unwrap_or(now)
-                            .max(now),
-                    );
-                    mutations.push(TxnMutation::Put(entity.clone()));
-                }
-            }
+            let participants = gc_participants(&entities, now);
+            let mut mutations = Vec::new();
+            let retired = retire_departed_references(&mut entities, now, &mut mutations);
             if completed > gc.generation {
                 return Err(conflict(
                     "Meta GC generation is older than durable Node progress",
                 ));
             }
             if !gc.waiting_nodes.is_empty() {
-                if completed == gc.generation && gc.waiting_nodes.contains(&node) {
+                // A listed page is a cursor position that will not repeat soon;
+                // native inventory simply comes back next pass.
+                if self.is_external_backend() {
+                    register_inventory(&inventory, &mut entities, &mut mutations)?;
+                }
+                let waiting = gc.waiting_nodes.len();
+                gc.waiting_nodes
+                    .retain(|value| participants.contains(value));
+                let dropped = waiting - gc.waiting_nodes.len();
+                if completed == gc.generation {
                     gc.waiting_nodes.retain(|value| value != &node);
+                }
+                self.gc_deleter.finished(&node, completed);
+                let handed_over = self.is_external_backend()
+                    && self.gc_deleter.hand_over(&mut gc, &node, &participants);
+                if gc.waiting_nodes.len() != waiting || handed_over {
                     if gc.waiting_nodes.is_empty() {
                         gc.chunks.clear();
                     }
                     mutations.push(TxnMutation::Put(MetaEntity::DfsGc(gc.clone())));
                 }
-                if !mutations.is_empty()
-                    && !self
-                        .gc_commit(revision, StoreOperation::DfsCollectGarbage, mutations)
+                if !mutations.is_empty() {
+                    let guard = plan_guard(
+                        revision,
+                        &entities,
+                        now,
+                        &GcPlan::default(),
+                        &[],
+                        &mutations,
+                    );
+                    gc_conditions.push(TxnCondition::DfsGcPlanStillValid(Arc::new(guard)));
+                    if !self
+                        .gc_commit_checked(
+                            gc_conditions,
+                            StoreOperation::DfsCollectGarbage,
+                            mutations,
+                        )
                         .await?
-                {
-                    continue;
+                    {
+                        self.gc_metrics.conflicts.inc();
+                        continue;
+                    }
                 }
+                self.gc_metrics
+                    .dropped_nodes
+                    .inc_by(dropped as u64 + u64::from(handed_over));
+                self.gc_metrics.retired_references.inc_by(retired);
                 return Ok(gc);
             }
-            for chunk in &inventory {
-                if !chunk.valid_immutable_identity() {
-                    return Err(invalid(
-                        "GC inventory requires canonical content identities",
-                    ));
-                }
-                if !entities.iter().any(
-                    |entity| matches!(entity,MetaEntity::DfsChunk(value) if value.id==chunk.id),
-                ) {
-                    let value = MetaEntity::DfsChunk(chunk.clone());
-                    mutations.push(TxnMutation::Put(value.clone()));
-                    entities.push(value);
-                }
-            }
+            register_inventory(&inventory, &mut entities, &mut mutations)?;
             let references = entities
                 .iter()
                 .filter_map(|entity| match entity {
@@ -586,958 +704,244 @@ impl DfsService {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let plan = plan_collection(&entities, &references, now_unix_ms(), self.gc_grace_ms);
-            mutations.extend(plan.keys.into_iter().map(TxnMutation::Delete));
+            let plan = plan_bounded(
+                &entities,
+                &references,
+                now,
+                self.gc_grace_ms,
+                MAX_CHUNKS.min(batch_keys / 8).max(1),
+            );
+            self.gc_metrics
+                .dead_keys
+                .set(i64::try_from(plan.keys.len()).unwrap_or(i64::MAX));
+            let first = plan.keys.len().min(plan.chunk_keys.max(batch_keys));
+            let (batch, rest) = plan.keys.split_at(first);
+            mutations.extend(batch.iter().cloned().map(TxnMutation::Delete));
             if mutations.is_empty() {
+                self.gc_metrics.observe_collected();
                 return Ok(gc);
             }
             gc.generation = gc
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| conflict("GC generation exhausted"))?;
-            gc.chunks = plan.chunks;
-            if !gc.chunks.is_empty() {
-                gc.waiting_nodes = entities
-                    .iter()
-                    .filter_map(|entity| match entity {
-                        MetaEntity::NodeSession(value) => Some(value.node_id.clone()),
-                        _ => None,
-                    })
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
+            gc.chunks = plan.chunks.clone();
+            gc.waiting_nodes = if gc.chunks.is_empty() {
+                Vec::new()
+            } else if self.is_external_backend() {
+                // One copy of each object: one Node deletes. If it is lost the
+                // objects stay in the store and reconciliation finds them.
+                self.gc_deleter.choose(&participants).into_iter().collect()
+            } else {
+                participants.into_iter().collect()
+            };
+            if gc.waiting_nodes.is_empty() {
+                // No live storage node holds local copies to retire.
+                gc.chunks.clear();
             }
+            let guard = plan_guard(revision, &entities, now, &plan, batch, &mutations);
+            gc_conditions.push(TxnCondition::DfsGcPlanStillValid(Arc::new(guard)));
             mutations.push(TxnMutation::Put(MetaEntity::DfsGc(gc.clone())));
-            if self
-                .gc_commit(revision, StoreOperation::DfsCollectGarbage, mutations)
-                .await?
+            match self
+                .gc_commit_checked(gc_conditions, StoreOperation::DfsCollectGarbage, mutations)
+                .await
             {
-                return Ok(gc);
+                Ok(true) => {}
+                Ok(false) => {
+                    self.gc_metrics.conflicts.inc();
+                    continue;
+                }
+                Err(error) => {
+                    batch_keys = self.gc_metrics.rejected_batch(error, batch_keys)?;
+                    continue;
+                }
             }
+            self.gc_metrics.retired_references.inc_by(retired);
+            self.gc_metrics.observe_collected();
+            self.commit_remaining_keys(revision, &entities, now, &plan, rest, batch_keys)
+                .await;
+            return Ok(gc);
         }
+        self.gc_metrics.exhausted_passes.inc();
         Err(conflict("garbage collection contention"))
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dfs::{ChunkEncoding, ChunkId, ContentDigest, DigestAlgorithm, Extent};
-    use std::collections::BTreeMap;
-    fn inode(id: &str, nlink: u32, head: &str) -> MetaEntity {
-        MetaEntity::DfsInode(InodeRecord {
-            namespace_id: NamespaceId::new("ns"),
-            inode_id: InodeId::new(id),
-            kind: InodeKind::Regular,
-            attributes: InodeAttributes {
-                mode: 0o600,
-                uid: 0,
-                gid: 0,
-                nlink,
-                atime_unix_ms: 0,
-                mtime_unix_ms: 0,
-                ctime_unix_ms: 0,
-            },
-            head_version: Some(FileVersionId::new(head)),
-            symlink_target: None,
-            xattrs: BTreeMap::new(),
-            revision: 1,
+
+/// What the commit of `batch`, part of `plan`, must find unchanged; see
+/// `DfsGcPlanStillValid`. Only the batch's own keys matter: the rest of the plan
+/// is not being deleted by this commit.
+fn plan_guard(
+    since: crate::meta::store::StoreRevision,
+    entities: &[MetaEntity],
+    now: u64,
+    plan: &GcPlan,
+    batch: &[MetaKey],
+    mutations: &[TxnMutation],
+) -> crate::meta::store::GcPlanGuard {
+    let written_keys = mutations
+        .iter()
+        .filter_map(|mutation| match mutation {
+            TxnMutation::Put(entity) => Some(crate::meta::store::entity_key(entity)),
+            TxnMutation::Delete(key) => Some(key.clone()),
+            TxnMutation::RecordRequestOutcome(_) => None,
         })
-    }
-    fn version(id: &str, owner: &str, chunk: &str) -> Vec<MetaEntity> {
-        vec![
-            MetaEntity::DfsFileVersion(FileVersion {
-                id: FileVersionId::new(id),
-                inode_id: InodeId::new(owner),
-                parent_version: None,
-                length: 4,
-                layout_root: LayoutRootId::new(id),
-                created_at_unix_ms: 0,
-            }),
-            MetaEntity::DfsLayoutRoot(LayoutRoot {
-                id: LayoutRootId::new(id),
-                file_length: 4,
-                inline_extents: vec![Extent {
-                    file_offset: 0,
-                    length: 4,
-                    chunk_id: ChunkId::new(chunk),
-                    chunk_offset: 0,
-                }],
-            }),
-        ]
-    }
-    fn chunk(id: &str) -> MetaEntity {
-        MetaEntity::DfsChunk(ChunkObject {
-            id: ChunkId::new(id),
-            length: 4,
-            encoding: ChunkEncoding::Raw,
-            content_digest: ContentDigest {
-                algorithm: DigestAlgorithm::Blake3,
-                bytes: [0; 32],
-            },
+        .collect();
+    let chunks = plan.chunks.iter().cloned().collect::<BTreeSet<_>>();
+    let generations = entities
+        .iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::DfsChunk(chunk) if chunks.contains(&chunk.id) => chunk.write_generation(),
+            _ => None,
         })
-    }
-    fn pin(id: &str) -> GcReference {
-        GcReference {
-            open_read: None,
-
-            node_id: "reader".into(),
-            session_id: "session".into(),
-            reference_id: "open".into(),
-            inode_id: Some(InodeId::new(id)),
-            publication: false,
-            chunks: vec![],
-            retired_at_unix_ms: None,
-        }
-    }
-    #[test]
-    fn open_authority_closed_context_keeps_gc_pin_until_last_user_and_grace() {
-        let mut entities = vec![inode("mapped", 0, "v2"), chunk("old"), chunk("new")];
-        entities.extend(version("v1", "mapped", "old"));
-        entities.extend(version("v2", "mapped", "new"));
-        let mut reference = pin("mapped");
-        reference.open_read = Some(crate::dfs::OpenReadIdentity {
-            version_id: FileVersionId::new("v1"),
-            layout_root_id: LayoutRootId::new("v1"),
-            closed: true,
-        });
-        assert!(
-            plan_collection(&entities, &[reference.clone()], 100, 10)
-                .chunks
-                .is_empty()
-        );
-        reference.retired_at_unix_ms = Some(100);
-        assert!(
-            plan_collection(&entities, &[reference.clone()], 109, 10)
-                .chunks
-                .is_empty()
-        );
-        assert_eq!(
-            plan_collection(&entities, &[reference], 110, 10)
-                .chunks
-                .len(),
-            2
-        );
-    }
-    #[test]
-    fn cow_clone_retains_shared_chunks_after_source_is_unlinked() {
-        let mut entities = vec![
-            inode("source", 0, "v1"),
-            inode("clone", 1, "v2"),
-            chunk("shared"),
-            chunk("garbage"),
-        ];
-        entities.extend(version("v1", "source", "shared"));
-        entities.extend(version("v2", "clone", "shared"));
-        let plan = plan_collection(&entities, &[], 100, 10);
-        assert!(
-            plan.keys
-                .contains(&MetaKey::DfsFileVersion(FileVersionId::new("v1")))
-        );
-        assert!(
-            !plan
-                .keys
-                .contains(&MetaKey::DfsFileVersion(FileVersionId::new("v2")))
-        );
-        assert_eq!(plan.chunks, vec![ChunkId::new("garbage")]);
-    }
-    #[test]
-    fn open_inode_retains_old_versions_until_last_reference_and_grace_are_gone() {
-        let mut entities = vec![inode("mapped", 0, "v2"), chunk("old"), chunk("new")];
-        entities.extend(version("v1", "mapped", "old"));
-        entities.extend(version("v2", "mapped", "new"));
-        let mut reference = pin("mapped");
-        assert!(
-            plan_collection(&entities, &[reference.clone()], 100, 10)
-                .chunks
-                .is_empty()
-        );
-        reference.retired_at_unix_ms = Some(95);
-        assert!(
-            plan_collection(&entities, &[reference.clone()], 100, 10)
-                .chunks
-                .is_empty()
-        );
-        let plan = plan_collection(&entities, &[reference], 106, 10);
-        assert_eq!(
-            plan.chunks.len(),
-            2,
-            "both versions become unreachable only after close and grace"
-        );
-    }
-
-    fn retired_reference(id: &str, retired_at: u64) -> (MetaEntity, GcReference) {
-        let mut reference = pin("mapped");
-        reference.reference_id = id.into();
-        reference.retired_at_unix_ms = Some(retired_at);
-        (MetaEntity::DfsReference(reference.clone()), reference)
-    }
-
-    #[test]
-    fn retired_write_reference_record_outlives_grace_until_admission_window_closes() {
-        let (entity, reference) = retired_reference("write:generation-op", 100);
-        let entities = vec![entity];
-        assert!(
-            plan_collection(&entities, std::slice::from_ref(&reference), 110, 10)
-                .keys
-                .is_empty(),
-            "data grace has passed but the record stays as a tombstone fencing late admissions"
-        );
-        assert!(
-            plan_collection(
-                &entities,
-                std::slice::from_ref(&reference),
-                100 + ADMISSION_HORIZON_MS,
-                10
-            )
-            .keys
-            .is_empty(),
-            "the admission horizon alone is not enough while node clocks can skew"
-        );
-        assert_eq!(
-            plan_collection(
-                &entities,
-                &[reference],
-                100 + REFERENCE_RECORD_RETENTION_MS,
-                10
-            )
-            .keys
-            .len(),
-            1,
-            "record reclaims only after horizon + skew, when the deadline gate alone provably rejects every replay"
-        );
-    }
-
-    #[test]
-    fn long_data_grace_extends_reference_record_life_beyond_retention() {
-        let (entity, reference) = retired_reference("open:reader-1", 100);
-        let entities = vec![entity];
-        let long_grace = 300_000_u64;
-        assert!(
-            plan_collection(
-                &entities,
-                std::slice::from_ref(&reference),
-                100 + REFERENCE_RECORD_RETENTION_MS,
-                long_grace
-            )
-            .keys
-            .is_empty(),
-            "tombstone retention has elapsed but the record still protects data under the long grace"
-        );
-        assert_eq!(
-            plan_collection(&entities, &[reference], 100 + long_grace, long_grace)
-                .keys
-                .len(),
-            1,
-            "record converges only when the configured data grace also expires"
-        );
-    }
-
-    #[tokio::test]
-    async fn record_past_retention_but_still_protecting_data_survives_consecutive_collections() {
-        // Discriminating window: retirement happened 150s ago, so the 120s
-        // tombstone retention has already elapsed, but the configured 200s
-        // data grace has not. A record deleted at the fixed retention would
-        // leave the second collection blind to the still-protected data.
-        let entities_ref = vec![inode("i", 1, "v2"), chunk("old"), chunk("new")];
-        let mut entities = entities_ref;
-        entities.extend(version("v1", "i", "old"));
-        entities.extend(version("v2", "i", "new"));
-        let mut reference = pin("i");
-        reference.retired_at_unix_ms = Some(now_unix_ms().saturating_sub(150_000));
-        entities.push(MetaEntity::DfsReference(reference));
-        let (store, _) = seeded_store(entities).await;
-        let service = DfsService::new(store.clone()).with_gc_grace_ms(200_000);
-        for _ in 0..2 {
-            let gc = service
-                .collect_garbage("n".into(), "s".into(), 0, vec![])
-                .await
-                .unwrap();
-            assert!(
-                gc.chunks.is_empty(),
-                "data under the unexpired 200s grace must not reclaim"
-            );
-            let (_, snapshot) = store.read_view().await.unwrap().snapshot().unwrap();
-            assert!(
-                snapshot
-                    .iter()
-                    .any(|entity| matches!(entity, MetaEntity::DfsReference(value)
-                    if value.retired_at_unix_ms.is_some_and(|retired| {
-                        retired.saturating_add(200_000) > now_unix_ms()
-                    }))),
-                "past tombstone retention but inside the data grace, the record must survive every collection round"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn expired_replay_after_real_tombstone_deletion_is_rejected() {
-        let mut tombstone = pending_reference("late-open");
-        let aged = now_unix_ms().saturating_sub(1_000_000);
-        let MetaEntity::DfsReference(value) = &mut tombstone else {
-            unreachable!("pending_reference builds a DfsReference");
-        };
-        value.retired_at_unix_ms = Some(aged);
-        let (store, _) = seeded_store(vec![inode("i", 1, "v"), tombstone]).await;
-        let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
-        service
-            .collect_garbage("n".into(), "s".into(), 0, vec![])
-            .await
-            .unwrap();
-        let (_, snapshot) = store.read_view().await.unwrap().snapshot().unwrap();
-        assert!(
-            !snapshot
-                .iter()
-                .any(|entity| matches!(entity, MetaEntity::DfsReference(_))),
-            "the aged tombstone must be genuinely deleted before the replay"
-        );
-        let mut late = update("late-open");
-        late.admission_deadline_unix_ms = now_unix_ms().saturating_sub(1);
-        assert_eq!(
-            service.update_gc_reference(late).await.unwrap_err().code(),
-            afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED,
-            "with the record gone the deadline gate alone must reject the replay"
-        );
-    }
-
-    #[test]
-    fn write_and_read_reference_records_die_together_after_retirement() {
-        let (write_entity, write_reference) = retired_reference("write:generation-op", 100);
-        let (read_entity, read_reference) = retired_reference("open:reader-1", 100);
-        let entities = vec![write_entity, read_entity];
-        let references = vec![write_reference, read_reference];
-        assert!(
-            plan_collection(
-                &entities,
-                &references,
-                100 + REFERENCE_RECORD_RETENTION_MS - 1,
-                10
-            )
-            .keys
-            .is_empty()
-        );
-        assert_eq!(
-            plan_collection(
-                &entities,
-                &references,
-                100 + REFERENCE_RECORD_RETENTION_MS,
-                10
-            )
-            .keys
-            .len(),
-            2,
-            "write and read references retired together must be reclaimed together on the derived bound"
-        );
-    }
-
-    fn generation_chunk(operation: &str, suffix: char) -> MetaEntity {
-        let generation = blake3::hash(operation.as_bytes()).to_hex()[..32].to_string();
-        let mut staged = crate::node::chunk::StagedChunk::new_crc32c(
-            OperationId::new(operation),
-            b"uncommitted inventory".to_vec(),
-        )
-        .unwrap();
-        staged.chunk.id = ChunkId::new(format!(
-            "crc32c-v2-{generation}-{}",
-            suffix.to_string().repeat(32)
-        ));
-        MetaEntity::DfsChunk(staged.chunk)
-    }
-
-    #[test]
-    fn generation_reference_protects_unregistered_inventory_on_all_replicas() {
-        let mut reference = pin("writer");
-        reference.publication = true;
-        reference.reference_id = "publish:generation-A".into();
-        let entities = vec![
-            generation_chunk("generation-A", 'a'),
-            generation_chunk("generation-A", 'b'),
-        ];
-        let plan = plan_collection(&entities, &[reference], 100, 10);
-        assert!(
-            plan.chunks.is_empty(),
-            "one generation admission must protect new replica inventories without per-chunk registration"
-        );
-    }
-
-    #[test]
-    fn generation_reference_does_not_protect_another_write() {
-        let mut reference = pin("writer");
-        reference.publication = true;
-        reference.reference_id = "publish:generation-A".into();
-        let a = generation_chunk("generation-A", 'a');
-        let b = generation_chunk("generation-B", 'b');
-        let MetaEntity::DfsChunk(expected) = &b else {
-            unreachable!()
-        };
-        let plan = plan_collection(&[a, b.clone()], &[reference], 100, 10);
-        assert_eq!(
-            plan.chunks,
-            vec![expected.id.clone()],
-            "unrelated orphan still must be reclaimable"
-        );
-    }
-
-    #[test]
-    fn active_publication_retains_uploaded_but_uncommitted_chunks() {
-        let entities = vec![chunk("pending")];
-        let mut reference = pin("writer");
-        reference.publication = true;
-        let MetaEntity::DfsChunk(value) = chunk("pending") else {
-            unreachable!()
-        };
-        reference.chunks.push(value);
-        assert!(
-            plan_collection(&entities, &[reference], 100, 10)
-                .chunks
-                .is_empty()
-        );
-        assert_eq!(
-            plan_collection(&entities, &[], 100, 10).chunks,
-            vec![ChunkId::new("pending")]
-        );
-    }
-    async fn seeded_store(
-        entities: Vec<MetaEntity>,
-    ) -> (
-        Arc<crate::meta::store::Store>,
-        Arc<crate::meta::store::journal::MemoryLog>,
-    ) {
-        use crate::meta::store::{NodeSessionLease, Store, journal::MemoryLog};
-        let backend = Arc::new(MemoryLog::new(Default::default()).unwrap());
-        let store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
-        store
-            .register_node_session(
-                RequestKey::new("n", "session"),
-                NodeSessionLease {
-                    node_id: "n".into(),
-                    session_id: "s".into(),
-                    grpc_addr: "http://n:1".into(),
-                    data_addr: "http://n:2".into(),
-                    rest_addr: "http://n:3".into(),
-                    ownerfs_enabled: false,
-                    storage_devices: vec![],
-                    lease_ttl: std::time::Duration::from_secs(30),
-                },
-            )
-            .await
-            .unwrap();
-        let key = RequestKey::new("seed", "entities");
-        let mut txn = MetaTxn::new(key.clone(), StoreOperation::DfsCreate);
-        txn.conditions
-            .push(TxnCondition::RequestAbsent(key.clone()));
-        txn.mutations = entities.into_iter().map(TxnMutation::Put).collect();
-        txn.mutations
-            .push(TxnMutation::RecordRequestOutcome(RequestOutcome {
-                request: key,
-                operation: StoreOperation::DfsCreate,
-                result: OperationResult::Empty,
-            }));
-        store.compare_and_commit(txn).await.unwrap();
-        (store, backend)
-    }
-    fn canonical_chunk() -> ChunkObject {
-        ChunkObject::from_content_addressed_id(&ChunkId::new(format!(
-            "blake3-{}-4",
-            blake3::hash(b"data").to_hex()
-        )))
-        .unwrap()
-    }
-    fn update(id: &str) -> UpdateGcReference {
-        UpdateGcReference {
-            open_read: None,
-            close_open_read: false,
-
-            node_id: "n".into(),
-            session_id: "s".into(),
-            reference_id: id.into(),
-            inode_id: Some(InodeId::new("i")),
-            version_id: None,
-            publication: true,
-            chunks: vec![],
-            release: false,
-            admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
-        }
-    }
-    fn pending_reference(id: &str) -> MetaEntity {
-        MetaEntity::DfsReference(GcReference {
-            open_read: None,
-
-            node_id: "n".into(),
-            session_id: "s".into(),
-            reference_id: id.into(),
-            inode_id: Some(InodeId::new("i")),
-            publication: true,
-            chunks: vec![],
-            retired_at_unix_ms: None,
-        })
-    }
-    #[tokio::test]
-    async fn concurrent_publication_reservations_keep_every_chunk_without_retry_exhaustion() {
-        let (store, _) = seeded_store(vec![inode("i", 1, "v")]).await;
-        let service = DfsService::new(store.clone());
-        service
-            .update_gc_reference(update("publish:parallel"))
-            .await
-            .unwrap();
-        let start = Arc::new(tokio::sync::Barrier::new(256));
-        let mut tasks = tokio::task::JoinSet::new();
-        for index in 0..256 {
-            let service = service.clone();
-            let start = start.clone();
-            tasks.spawn(async move {
-                let bytes = format!("parallel-{index}");
-                let chunk = ChunkObject::from_content_addressed_id(&ChunkId::new(format!(
-                    "blake3-{}-{}",
-                    blake3::hash(bytes.as_bytes()).to_hex(),
-                    bytes.len()
-                )))
-                .unwrap();
-                let mut reservation = update("publish:parallel");
-                reservation.inode_id = None;
-                reservation.chunks = vec![chunk];
-                start.wait().await;
-                service.update_gc_reference(reservation).await
-            });
-        }
-        let mut errors = Vec::new();
-        while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result.unwrap() {
-                errors.push(error.to_string());
+        .map(str::to_owned)
+        .collect();
+    let (mut dead_inodes, mut protected_by_reference, mut dead_layouts) =
+        (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    for key in batch {
+        match key {
+            MetaKey::DfsInode(inode) => {
+                dead_inodes.insert(inode.clone());
+                protected_by_reference.insert(inode.clone());
             }
-        }
-        assert!(
-            errors.is_empty(),
-            "{} publication reservations failed; first: {:?}",
-            errors.len(),
-            errors.first()
-        );
-        let reference = store
-            .read_view()
-            .await
-            .unwrap()
-            .lookup(&ref_key("n", "s", "publish:parallel"))
-            .unwrap();
-        let Some(MetaEntity::DfsReference(reference)) = reference.entity else {
-            panic!("publication protection missing");
-        };
-        assert_eq!(reference.chunks.len(), 256);
-        assert_eq!(
-            reference
-                .chunks
-                .iter()
-                .map(|chunk| &chunk.id)
-                .collect::<BTreeSet<_>>()
-                .len(),
-            256,
-            "every distinct uploaded chunk must remain protected"
-        );
-    }
-    fn admission_conditions(
-        view: &crate::meta::store::MetaReadView,
-        id: &str,
-    ) -> Vec<TxnCondition> {
-        let mut conditions = vec![TxnCondition::NodeSessionCurrent {
-            node_id: "n".into(),
-            session_id: "s".into(),
-        }];
-        for key in [
-            ref_key("n", "s", id),
-            MetaKey::DfsInode(InodeId::new("i")),
-            MetaKey::DfsGc,
-        ] {
-            reference_entity(view, key, &mut conditions).unwrap();
-        }
-        conditions
-    }
-    #[tokio::test]
-    async fn reference_conditions_ignore_unrelated_commits_but_invalidate_stale_collection() {
-        let (store, _) = seeded_store(vec![inode("i", 1, "v")]).await;
-        let service = DfsService::new(store.clone());
-        let view = store.read_view().await.unwrap();
-        let conditions = admission_conditions(&view, "reader");
-        service
-            .update_gc_reference(update("unrelated-reference"))
-            .await
-            .unwrap();
-        let collection_revision = store.read_view().await.unwrap().snapshot().unwrap().0;
-        assert!(
-            service
-                .gc_commit_checked(
-                    conditions,
-                    StoreOperation::DfsUpdateReference,
-                    vec![TxnMutation::Put(pending_reference("reader"))]
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !service
-                .gc_commit(
-                    collection_revision,
-                    StoreOperation::DfsCollectGarbage,
-                    vec![TxnMutation::Delete(MetaKey::DfsInode(InodeId::new("i")))]
-                )
-                .await
-                .unwrap(),
-            "a collector prepared before admission must retry its reachability scan"
-        );
-        assert!(
-            store
-                .read(MetaRead::DfsInode(InodeId::new("i")))
-                .await
-                .unwrap()
-                .entity
-                .is_some()
-        );
-    }
-    #[tokio::test]
-    async fn reference_conditions_reject_release_collection_and_session_fences() {
-        for fence in ["release", "collection", "session"] {
-            let (store, _) = seeded_store(vec![inode("i", 0, "v")]).await;
-            let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
-            let view = store.read_view().await.unwrap();
-            let conditions = admission_conditions(&view, "late-reader");
-            match fence {
-                "release" => {
-                    let mut release = update("late-reader");
-                    release.release = true;
-                    service.update_gc_reference(release).await.unwrap();
-                }
-                "collection" => {
-                    service
-                        .collect_garbage("n".into(), "s".into(), 0, vec![])
-                        .await
-                        .unwrap();
-                }
-                _ => {
-                    store
-                        .register_node_session(
-                            RequestKey::new("n", "replace"),
-                            crate::meta::store::NodeSessionLease {
-                                node_id: "n".into(),
-                                session_id: "new-session".into(),
-                                grpc_addr: "http://n:1".into(),
-                                data_addr: "http://n:2".into(),
-                                rest_addr: "http://n:3".into(),
-                                ownerfs_enabled: false,
-                                storage_devices: vec![],
-                                lease_ttl: std::time::Duration::from_secs(30),
-                            },
-                        )
-                        .await
-                        .unwrap();
+            MetaKey::DfsFileVersion(version) => {
+                if let Some(owner) = plan.version_owners.get(version) {
+                    protected_by_reference.insert(owner.clone());
                 }
             }
-            assert!(
-                !service
-                    .gc_commit_checked(
-                        conditions,
-                        StoreOperation::DfsUpdateReference,
-                        vec![TxnMutation::Put(pending_reference("late-reader"))]
-                    )
-                    .await
-                    .unwrap(),
-                "{fence}"
-            );
+            MetaKey::DfsLayoutRoot(layout) => {
+                dead_layouts.insert(layout.clone());
+            }
+            _ => {}
         }
     }
-    #[tokio::test]
-    async fn publication_conditions_reject_reserved_chunk_reclamation() {
-        let object = canonical_chunk();
-        let (store, _) = seeded_store(vec![
-            inode("i", 1, "v"),
-            MetaEntity::DfsChunk(object.clone()),
-        ])
-        .await;
-        let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
-        let view = store.read_view().await.unwrap();
-        let mut conditions = admission_conditions(&view, "publication");
-        reference_entity(&view, MetaKey::DfsChunk(object.id.clone()), &mut conditions).unwrap();
-        let barrier = service
-            .collect_garbage("n".into(), "s".into(), 0, vec![])
-            .await
-            .unwrap();
-        assert!(barrier.chunks.contains(&object.id));
-        let mut reference = pending_reference("publication");
-        if let MetaEntity::DfsReference(value) = &mut reference {
-            value.chunks.push(object);
-        }
-        assert!(
-            !service
-                .gc_commit_checked(
-                    conditions,
-                    StoreOperation::DfsUpdateReference,
-                    vec![TxnMutation::Put(reference)]
-                )
-                .await
-                .unwrap()
-        );
-    }
-    #[tokio::test]
-    async fn reference_admission_requires_its_inode_version_and_current_session() {
-        let mut entities = vec![inode("i", 1, "v")];
-        entities.extend(version("v", "another-inode", "chunk"));
-        let (store, _) = seeded_store(entities).await;
-        let service = DfsService::new(store.clone());
-        let mut missing = update("missing-inode");
-        missing.inode_id = Some(InodeId::new("collected"));
-        assert!(service.update_gc_reference(missing).await.is_err());
-        let mut wrong_version = update("wrong-version");
-        wrong_version.version_id = Some(FileVersionId::new("v"));
-        assert!(service.update_gc_reference(wrong_version).await.is_err());
-        service
-            .update_gc_reference(update("valid-inode"))
-            .await
-            .unwrap();
-        store
-            .register_node_session(
-                RequestKey::new("n", "replace-session"),
-                crate::meta::store::NodeSessionLease {
-                    node_id: "n".into(),
-                    session_id: "s2".into(),
-                    grpc_addr: "http://n:1".into(),
-                    data_addr: "http://n:2".into(),
-                    rest_addr: "http://n:3".into(),
-                    ownerfs_enabled: false,
-                    storage_devices: vec![],
-                    lease_ttl: std::time::Duration::from_secs(30),
-                },
-            )
-            .await
-            .unwrap();
-        assert!(
-            service
-                .update_gc_reference(update("stale-session"))
-                .await
-                .is_err()
-        );
-        let mut current = update("current-session");
-        current.session_id = "s2".into();
-        service.update_gc_reference(current).await.unwrap();
-        let view = store.read_view().await.unwrap();
-        for id in ["missing-inode", "wrong-version", "stale-session"] {
-            assert!(
-                view.lookup(&ref_key("n", "s", id))
-                    .unwrap()
-                    .entity
-                    .is_none()
-            );
-        }
-    }
-    #[tokio::test]
-    async fn publication_and_lost_gc_ack_are_fenced_across_meta_reopen() {
-        use crate::meta::store::Store;
-        let chunk = canonical_chunk();
-        let (store, backend) = seeded_store(vec![inode("i", 1, "v")]).await;
-        let service = DfsService::with_replication_config(
-            store.clone(),
-            ReplicationConfig::local_single_copy(),
-        )
-        .with_gc_grace_ms(0);
-        service
-            .update_gc_reference(update("publish:p"))
-            .await
-            .unwrap();
-        let mut reserve = update("publish:p");
-        reserve.inode_id = None;
-        reserve.chunks = vec![chunk.clone()];
-        service.update_gc_reference(reserve.clone()).await.unwrap();
-        assert!(
-            service
-                .collect_garbage("n".into(), "s".into(), 0, vec![chunk.clone()])
-                .await
-                .unwrap()
-                .chunks
-                .is_empty()
-        );
-        let mut release = update("publish:p");
-        release.release = true;
-        service.update_gc_reference(release).await.unwrap();
-        let ticket = service
-            .collect_garbage("n".into(), "s".into(), 0, vec![chunk.clone()])
-            .await
-            .unwrap();
-        assert_eq!(ticket.chunks, vec![chunk.id.clone()]);
-        drop(service);
-        drop(store);
-        // The backend image includes pending deletion and reference records.
-        let reopened = Arc::new(Store::open_log(backend).await.unwrap());
-        let service =
-            DfsService::with_replication_config(reopened, ReplicationConfig::local_single_copy())
-                .with_gc_grace_ms(0);
-        service
-            .update_gc_reference(update("publish:new"))
-            .await
-            .unwrap();
-        reserve.reference_id = "publish:new".into();
-        assert_eq!(
-            service
-                .update_gc_reference(reserve.clone())
-                .await
-                .unwrap_err()
-                .code(),
-            afs_error::META_DFS_GC_BUSY
-        );
-        let repeated = service
-            .collect_garbage("n".into(), "s".into(), 0, vec![])
-            .await
-            .unwrap();
-        assert_eq!(repeated, ticket);
-        let acknowledged = service
-            .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
-            .await
-            .unwrap();
-        assert!(acknowledged.chunks.is_empty());
-        service
-            .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
-            .await
-            .unwrap();
-        service.update_gc_reference(reserve).await.unwrap();
-    }
-    #[tokio::test]
-    async fn session_replacement_retires_only_fenced_refs_after_the_old_authority_deadline() {
-        let chunk = canonical_chunk();
-        let mut reference = pin("i");
-        reference.node_id = "n".into();
-        reference.session_id = "old".into();
-        reference.chunks = vec![chunk.clone()];
-        let deadline = now_unix_ms() + 30_000;
-        let old = MetaEntity::NodeSession(NodeSession {
-            node_id: "n".into(),
-            session_id: "old".into(),
-            grpc_addr: "http://n:1".into(),
-            data_addr: "http://n:2".into(),
-            rest_addr: "http://n:3".into(),
-            ownerfs_enabled: false,
-            storage_devices: vec![],
-            lease_epoch: 0,
-            expires_at_unix_ms: deadline,
-        });
-        let (store, _) = seeded_store(vec![
-            inode("i", 0, "v"),
-            MetaEntity::DfsChunk(chunk.clone()),
-            MetaEntity::DfsReference(reference),
-            old,
-        ])
-        .await;
-        let service = DfsService::new(store.clone());
-        let ticket = service
-            .collect_garbage("n".into(), "s".into(), 0, vec![])
-            .await
-            .unwrap();
-        assert!(ticket.chunks.is_empty());
-        let (_, entities) = store.read_view().await.unwrap().snapshot().unwrap();
-        let retired = entities
-            .iter()
-            .find_map(|entity| match entity {
-                MetaEntity::DfsReference(reference) => Some(reference),
-                _ => None,
-            })
-            .unwrap();
-        assert!(retired.retired_at_unix_ms.unwrap() >= deadline);
-        assert!(
-            plan_collection(
-                &entities,
-                std::slice::from_ref(retired),
-                deadline + 59_999,
-                60_000
-            )
-            .chunks
-            .is_empty()
-        );
-        assert_eq!(
-            plan_collection(
-                &entities,
-                std::slice::from_ref(retired),
-                deadline + 60_001,
-                60_000
-            )
-            .chunks,
-            vec![chunk.id]
-        );
-        let mut wrong = update("open:stale");
-        wrong.session_id = "old".into();
-        assert!(service.update_gc_reference(wrong).await.is_err());
-    }
-    #[test]
-    fn heartbeat_expiry_without_session_replacement_never_retires_an_open_reader() {
-        let mut reference = pin("i");
-        let MetaEntity::DfsChunk(object) = chunk("live") else {
-            unreachable!()
-        };
-        reference.chunks = vec![object];
-        let entities = vec![inode("i", 0, "v"), chunk("live")];
-        assert!(
-            plan_collection(&entities, &[reference], u64::MAX - 60_000, 60_000)
-                .chunks
-                .is_empty()
-        );
-    }
-    #[tokio::test]
-    async fn release_before_delayed_admission_is_a_durable_rejection() {
-        use crate::meta::store::Store;
-        let (store, backend) = seeded_store(vec![inode("i", 1, "v")]).await;
-        let service = DfsService::new(store.clone());
-        let mut release = update("late-open");
-        release.release = true;
-        release.inode_id = None;
-        service.update_gc_reference(release).await.unwrap();
-        drop(service);
-        drop(store);
-        let service = DfsService::new(Arc::new(Store::open_log(backend).await.unwrap()));
-        assert!(
-            service
-                .update_gc_reference(update("late-open"))
-                .await
-                .is_err(),
-            "a delayed lost-reply admission cannot resurrect an already released reference"
-        );
-    }
-
-    #[tokio::test]
-    async fn expired_delayed_admission_cannot_reappear_after_tombstone_collection() {
-        let (store, _) = seeded_store(vec![inode("i", 1, "v")]).await;
-        let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
-        let mut release = update("late-open");
-        release.release = true;
-        release.inode_id = None;
-        service.update_gc_reference(release).await.unwrap();
-        service
-            .collect_garbage("n".into(), "s".into(), 0, vec![])
-            .await
-            .unwrap();
-        let (_, entities) = store.read_view().await.unwrap().snapshot().unwrap();
-        assert!(
-            entities
-                .iter()
-                .any(|entity| matches!(entity, MetaEntity::DfsReference(value)
-                if value.retired_at_unix_ms.is_some_and(|retired| {
-                    retired.saturating_add(REFERENCE_RECORD_RETENTION_MS) > now_unix_ms()
-                }))),
-            "retired tombstones must outlive the admission window instead of converging at data grace"
-        );
-        let mut late = update("late-open");
-        late.admission_deadline_unix_ms = now_unix_ms().saturating_sub(1);
-        assert!(
-            service.update_gc_reference(late).await.is_err(),
-            "an expired replay must stay rejected while the tombstone is retained"
-        );
-    }
-    #[tokio::test]
-    async fn active_publication_outlives_admission_but_cannot_change_identity() {
-        let (store, _) = seeded_store(vec![inode("i", 1, "v")]).await;
-        let service = DfsService::new(store);
-        let mut invalid = update("too-far");
-        invalid.admission_deadline_unix_ms = now_unix_ms() + 120_000;
-        assert!(service.update_gc_reference(invalid).await.is_err());
-        service.update_gc_reference(update("writer")).await.unwrap();
-        let mut chunks = update("writer");
-        chunks.inode_id = None;
-        chunks.admission_deadline_unix_ms = 0;
-        chunks.chunks = vec![canonical_chunk()];
-        service.update_gc_reference(chunks).await.unwrap();
-        let mut reused = update("writer");
-        reused.inode_id = Some(InodeId::new("different"));
-        assert!(service.update_gc_reference(reused).await.is_err());
+    crate::meta::store::GcPlanGuard {
+        since,
+        written_keys,
+        protected_by_reference,
+        dead_inodes,
+        dead_layouts,
+        chunks,
+        generations,
+        live_sessions: current_sessions(entities)
+            .into_iter()
+            .filter(|(_, session)| session.is_live_at_unix_ms(now))
+            .map(|(node, session)| (node.to_owned(), session.session_id.clone()))
+            .collect(),
     }
 }
+
+/// Registers objects a Node found that Meta does not know, so the one plan
+/// decides them (a live write generation protects them; otherwise collected).
+fn register_inventory(
+    inventory: &[ChunkObject],
+    entities: &mut Vec<MetaEntity>,
+    mutations: &mut Vec<TxnMutation>,
+) -> Result<()> {
+    if inventory.is_empty() {
+        return Ok(());
+    }
+    let known = entities
+        .iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::DfsChunk(value) => Some(value.id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for chunk in inventory {
+        if !chunk.valid_immutable_identity() {
+            return Err(invalid(
+                "GC inventory requires canonical content identities",
+            ));
+        }
+        if !known.contains(&chunk.id) {
+            let value = MetaEntity::DfsChunk(chunk.clone());
+            mutations.push(TxnMutation::Put(value.clone()));
+            entities.push(value);
+        }
+    }
+    Ok(())
+}
+
+/// Each node's current session: the highest lease epoch among its sessions.
+fn current_sessions(entities: &[MetaEntity]) -> std::collections::BTreeMap<&str, &NodeSession> {
+    let mut current = std::collections::BTreeMap::<&str, &NodeSession>::new();
+    for entity in entities {
+        if let MetaEntity::NodeSession(value) = entity {
+            let slot = current.entry(value.node_id.as_str()).or_insert(value);
+            if value.lease_epoch > slot.lease_epoch {
+                *slot = value;
+            }
+        }
+    }
+    current
+}
+
+/// The nodes a GC generation waits for (R55): a node whose current session is
+/// live at `now` and registered a storage device, the same rule as repair
+/// placement. A node that is not live has fail-closed (heartbeat loss stops it
+/// before its lease ends) and serves no copy; when it returns, its leftover
+/// files are unknown to Meta, come back through its inventory and are
+/// collected in a later generation. A node without storage (OwnerFs only) runs
+/// no Collector and is never waited for.
+fn gc_participants(entities: &[MetaEntity], now: u64) -> BTreeSet<String> {
+    current_sessions(entities)
+        .into_iter()
+        .filter(|(_, session)| {
+            session.is_live_at_unix_ms(now) && !session.storage_devices.is_empty()
+        })
+        .map(|(node, _)| node.to_owned())
+        .collect()
+}
+
+/// Retires every unretired reference whose session is no longer its node's
+/// current live session: the node restarted (the old process is fenced) or
+/// its session expired (the process fail-closed). Retirement keeps protecting
+/// the inode through the old session's deadline plus the normal read grace.
+fn retire_departed_references(
+    entities: &mut [MetaEntity],
+    now: u64,
+    mutations: &mut Vec<TxnMutation>,
+) -> u64 {
+    let live_sessions = current_sessions(entities)
+        .into_iter()
+        .filter(|(_, session)| session.is_live_at_unix_ms(now))
+        .map(|(node, session)| (node.to_owned(), session.session_id.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let deadlines = entities
+        .iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::NodeSession(value) => Some((
+                (value.node_id.clone(), value.session_id.clone()),
+                value.expires_at_unix_ms,
+            )),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut retired = 0;
+    for entity in entities {
+        if let MetaEntity::DfsReference(reference) = entity
+            && reference.retired_at_unix_ms.is_none()
+            && match live_sessions.get(&reference.node_id) {
+                Some(session) => session != &reference.session_id,
+                None => deadlines.keys().any(|(node, _)| node == &reference.node_id),
+            }
+        {
+            let deadline = deadlines
+                .get(&(reference.node_id.clone(), reference.session_id.clone()))
+                .copied()
+                .unwrap_or(now);
+            reference.retired_at_unix_ms = Some(deadline.max(now));
+            mutations.push(TxnMutation::Put(entity.clone()));
+            retired += 1;
+            // The rest stay protected and retire with a later pass.
+            if retired == MAX_RETIRED_PER_PASS {
+                break;
+            }
+        }
+    }
+    retired
+}
+
+#[cfg(test)]
+#[path = "gc_tests.rs"]
+mod tests;

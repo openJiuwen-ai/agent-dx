@@ -146,6 +146,7 @@ copy_heap!(
     dfs::DigestAlgorithm,
     dfs::ChunkEncoding,
     dfs::LocalCopyPolicy,
+    dfs::ReplicaFailureConfig,
     dfs::CopyRole,
     dfs::CopyState,
     dfs::PlacementHealth,
@@ -195,6 +196,12 @@ impl Heap for super::TxnMutation {
 impl Heap for super::TxnCondition {
     fn heap(&self, c: &mut Charge) -> Result<()> {
         match self {
+            Self::DfsGcPlanStillValid(guard) => {
+                for key in &guard.written_keys {
+                    c.value(key)?;
+                }
+                c.value(&guard.heap_bytes())
+            }
             Self::RootEpochWatermarkEquals(value) => c.value(value),
             Self::StoreRevisionEquals(value) => c.value(value),
             Self::Missing(value) => c.value(value),
@@ -426,6 +433,13 @@ fields_heap!(dfs::LayoutRoot {
     file_length,
     inline_extents
 });
+
+impl Heap for std::sync::Arc<dfs::LayoutRoot> {
+    fn heap(&self, c: &mut Charge) -> Result<()> {
+        // Keep charging the complete logical layout to each history entry.
+        self.as_ref().heap(c)
+    }
+}
 fields_heap!(dfs::ContentDigest { algorithm, bytes });
 fields_heap!(dfs::ChunkObject {
     id,
@@ -598,7 +612,9 @@ impl Heap for super::MetaKey {
             Self::DfsChunk(value) | Self::DfsPlacement(value) => c.value(value),
             Self::DfsCopy(value) => c.value(value),
             Self::DfsReplicationTask(value) => c.value(value),
-            Self::DfsReplicationConfig | Self::DfsDurabilityPolicy => Ok(()),
+            Self::DfsReplicationConfig
+            | Self::DfsDurabilityPolicy
+            | Self::DfsReplicaFailureConfig => Ok(()),
         }
     }
 }
@@ -609,6 +625,7 @@ fields_heap!(crate::dfs::OpenReadIdentity {
 });
 fields_heap!(crate::dfs::GcReference {
     open_read,
+    pinned_version,
     node_id,
     session_id,
     reference_id,
@@ -643,7 +660,8 @@ entity_heap!(
     DfsWriteLease,
     RootEpochWatermark,
     DfsReference,
-    DfsGc
+    DfsGc,
+    DfsReplicaFailureConfig
 );
 impl Heap for super::WatchChange {
     fn heap(&self, c: &mut Charge) -> Result<()> {
@@ -1261,17 +1279,20 @@ mod tests {
     #[tokio::test]
     async fn p3_history_state_log_management_advances_only_physical_sequence() {
         use super::super::{
-            journal::{LogLimits, LogTip, MemoryLog, MetaLog},
+            journal::{LogTip, MemoryLog, MetaLog},
             log::Record,
             state::State,
         };
-        let log = MemoryLog::new(LogLimits::default()).unwrap();
+        let log = MemoryLog::new(Default::default()).unwrap();
         let records = super::super::journal::test_records(3);
-        let tip = log.append_and_sync(LogTip::EMPTY, records).await.unwrap();
+        let tip = log
+            .append_and_sync(LogTip::EMPTY.at(log.term()), records)
+            .await
+            .unwrap();
         let state = authority();
         let delta = removal(&state);
         let next = log
-            .append_and_sync(tip, vec![Record::History(delta)])
+            .append_and_sync(tip.at(log.term()), vec![Record::History(delta)])
             .await
             .unwrap();
         assert_eq!(next.sequence, 4);
@@ -1290,25 +1311,28 @@ mod tests {
     async fn p3_history_state_local_checkpoint_suffix_preserves_exact_cleanup() {
         use super::super::{
             NodeSessionLease,
-            journal::{LogLimits, LogTip, MetaLog},
+            journal::{LogTip, MetaLog},
             local_log::LocalLog,
             log::{Record, StateImage},
             state::State,
         };
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), Default::default()).unwrap();
         let identity = log.identity();
         let records = super::super::journal::test_records(3);
-        let tip = log.append_and_sync(LogTip::EMPTY, records).await.unwrap();
+        let tip = log
+            .append_and_sync(LogTip::EMPTY.at(log.term()), records)
+            .await
+            .unwrap();
         let state = authority();
         let delta = removal(&state);
         let covered = log
-            .append_and_sync(tip, vec![Record::History(delta.clone())])
+            .append_and_sync(tip.at(log.term()), vec![Record::History(delta.clone())])
             .await
             .unwrap();
         drop(log);
         // First reopen must replay the management record from the real WAL.
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), Default::default()).unwrap();
         assert_eq!(log.identity(), identity);
         let recovered = log.recover().await.unwrap();
         assert!(recovered.checkpoint.is_none());
@@ -1339,13 +1363,13 @@ mod tests {
             )
             .unwrap();
         let final_tip = log
-            .append_and_sync(covered, vec![Record::from(record.unwrap())])
+            .append_and_sync(covered.at(log.term()), vec![Record::from(record.unwrap())])
             .await
             .unwrap();
         drop(log);
         // Second reopen restores the cleared set from the image, then only the
         // suffix. It must not resurrect the old request or rebase event IDs.
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), Default::default()).unwrap();
         assert_eq!(log.identity(), identity);
         let recovered = log.recover().await.unwrap();
         assert_eq!(recovered.tip, final_tip);
@@ -1771,6 +1795,37 @@ mod tests {
         assert!(
             !index.fits(all_protected),
             "protected history must backpressure its owner, not silently fit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gc_batch_charge_tests {
+    use super::*;
+    /// `MAX_BATCH_KEYS` in `meta::dfs::gc` relies on this: deleting a key charges
+    /// no more than the smallest event an old revision can hold.
+    #[test]
+    fn a_delete_event_charges_about_a_small_put() {
+        let key = |id: &str| super::super::MetaKey::DfsInode(crate::dfs::InodeId::new(id));
+        let charge = |id: &str| {
+            event_charge(&super::super::WatchEvent {
+                revision: super::super::StoreRevision(1),
+                event_index: 0,
+                key: key(id),
+                change: super::super::WatchChange::Delete,
+            })
+            .unwrap()
+        };
+        let long = "x".repeat(64);
+        println!(
+            "delete event charge: short {} long {}",
+            charge("i"),
+            charge(&long)
+        );
+        assert!(
+            charge(&long) < 2048,
+            "a delete stays small: {}",
+            charge(&long)
         );
     }
 }

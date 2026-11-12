@@ -480,6 +480,73 @@ async fn put_network_projects_egress_and_preserves_native_policy() {
 }
 
 #[tokio::test]
+async fn put_network_maps_domains_to_native_egress_peers() {
+    let fixture = Fixture::new().await;
+    let (status, response) = fixture
+        .put(r#"{"allowOut":["API.Example.test.","*.BÜCHER.example.","1.2.3.4"],"denyOut":["0.0.0.0/0"],"allow_internet_access":false}"#)
+        .await;
+    assert_eq!(status, 204, "{response}");
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.node_calls, 1);
+    let request = state.last_request.as_ref().unwrap();
+    assert_eq!(request.expected_revision, 9);
+    let policy = request.network.as_ref().unwrap();
+    let traffic = policy.traffic.as_ref().unwrap();
+    assert_eq!(traffic.mode, pb::TrafficMode::Stateless as i32);
+    assert_eq!(
+        traffic.ingress_default_action,
+        pb::NetworkAction::Allow as i32
+    );
+    assert_eq!(
+        traffic.egress_default_action,
+        pb::NetworkAction::Deny as i32
+    );
+    assert_eq!(traffic.rules.len(), 5);
+    assert_eq!(
+        traffic.rules[0].direction,
+        pb::NetworkDirection::Ingress as i32
+    );
+    for (rule, domain) in traffic.rules[1..3]
+        .iter()
+        .zip(["api.example.test", "*.xn--bcher-kva.example"])
+    {
+        assert_eq!(rule.direction, pb::NetworkDirection::Egress as i32);
+        assert_eq!(rule.action, pb::NetworkAction::Allow as i32);
+        assert_eq!(rule.priority, 200);
+        let peer = rule.peer.as_ref().unwrap();
+        assert_eq!(peer.domain, domain);
+        assert!(peer.cidr.is_empty());
+    }
+    assert_eq!(traffic.rules[3].peer.as_ref().unwrap().cidr, "1.2.3.4/32");
+    assert_eq!(traffic.rules[4].action, pb::NetworkAction::Deny as i32);
+    assert_eq!(traffic.rules[4].priority, 100);
+    assert_eq!(
+        policy.dns.as_ref().unwrap().rules[0].pattern,
+        "blocked.test"
+    );
+}
+
+#[tokio::test]
+async fn malformed_network_destinations_do_not_reach_node() {
+    for value in [
+        "*",
+        "api.*.example.test",
+        "https://example.test",
+        "example.test/path",
+        "example.test:443",
+        "example..test",
+        "1.2.3.4/33",
+    ] {
+        let fixture = Fixture::new().await;
+        let (status, response) = fixture.put(&json!({"allowOut": [value]}).to_string()).await;
+        assert_eq!(status, 400, "{value}: {response}");
+        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(body["error_code"], "invalid_request", "{value}: {response}");
+        assert_eq!(fixture.state.lock().unwrap().node_calls, 0);
+    }
+}
+
+#[tokio::test]
 async fn empty_network_clears_egress_and_false_defaults_deny() {
     let fixture = Fixture::new().await;
     assert_eq!(fixture.put("{}").await.0, 204);
@@ -529,12 +596,16 @@ async fn empty_network_clears_egress_and_false_defaults_deny() {
 async fn unsupported_network_forms_do_not_reach_node() {
     for body in [
         r#"{"egressProxy":"x"}"#,
-        r#"{"allowOut":["example.test"]}"#,
+        r#"{"rules":{}}"#,
+        r#"{"denyOut":["example.test"]}"#,
+        r#"{"denyOut":["*.example.test"]}"#,
         r#"{"denyOut":["2001:db8::1"]}"#,
     ] {
         let fixture = Fixture::new().await;
         let (status, response) = fixture.put(body).await;
         assert_eq!(status, 400, "{response}");
+        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(body["error_code"], "capability_not_supported", "{response}");
         assert_eq!(fixture.state.lock().unwrap().node_calls, 0);
     }
 }

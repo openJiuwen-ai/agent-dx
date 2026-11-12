@@ -204,3 +204,31 @@ fn old_or_unconfigured_environment_cannot_mount_arbitrary_host_files() {
     assert!(start_request(&source_drift, "i-1", 1, &[], &config).is_err());
     assert!(start_request(&spec("custom"), "i-1", 1, &[], &Config::default()).is_err());
 }
+
+#[test]
+fn registered_local_template_keeps_image_environment_and_execd_bootstrap() {
+    let template =
+        serde_json::from_value(json!({"path":"/var/lib/agentos/local-images/tools/rootfs",
+        "env":{"PATH":"/image/bin", "IMAGE_VALUE":"default"}}))
+        .unwrap();
+    let config = Config {
+        runtime_profile: Some(runtime_profile()),
+        local_rootfs_templates: [("tools".into(), template)].into_iter().collect(),
+        ..Default::default()
+    };
+    let mut wanted = spec("");
+    wanted.env.insert("IMAGE_VALUE".into(), "request".into());
+    wanted.execution.rootfs = Some(Rootfs {
+        readonly: false,
+        source: StorageSource::Local("/var/lib/agentos/local-images/tools/rootfs".into()),
+    });
+    let request = start_request(&wanted, "local-1", 1, &[], &config).unwrap();
+    assert_eq!(
+        request.rootfs.unwrap().r#type,
+        proto::RootfsSrcType::Local as i32
+    );
+    assert_eq!(request.envs["PATH"], "/image/bin");
+    assert_eq!(request.envs["IMAGE_VALUE"], "request");
+    assert!(request.mounts.iter().any(|mount| mount.target == "/__adx"));
+    assert_eq!(request.command, runtime_profile().bootstrap.entrypoint);
+}

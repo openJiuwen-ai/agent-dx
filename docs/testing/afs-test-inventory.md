@@ -132,10 +132,10 @@ Buildkite现有调用链、AFS已接/缺失，以及已有规划和待补项，
 
 资产索引（按测试名/入口核查，非运行结果）：
 
-- **U1**：[DFS VFS](../../afs/src/node/vfs/dfs.rs)、[OwnerFs VFS](../../afs/src/node/vfs/ownerfs.rs)、[DFS read](../../afs/src/node/dfs_read.rs)、[Chunk](../../afs/src/node/chunk.rs)、[ExternalChunk](../../afs/src/node/external_chunk.rs)、[Peer cache](../../afs/src/node/peer_cache.rs)、[replication](../../afs/src/node/replication.rs) 等模块测试。
+- **U1**：[DFS VFS](../../afs/src/node/vfs/dfs.rs)、[OwnerFs VFS](../../afs/src/node/vfs/ownerfs.rs)、[DFS read](../../afs/src/node/read/engine.rs)、[Chunk](../../afs/src/node/chunk.rs)、[ExternalChunk](../../afs/src/node/external_chunk.rs)、[Peer cache](../../afs/src/node/read/peer_cache.rs)、[replication](../../afs/src/node/replication.rs) 等模块测试。
 - **U2**：[配置](../../afs/tests/config_contract.rs)、[REST](../../afs/tests/rest_contract.rs)、[Node health](../../afs/tests/node_health_contract.rs)、[Meta capability](../../afs/tests/meta_health_capability.rs)、[错误](../../afs/tests/error_contract.rs)。
 - **M1**：[Meta 合同](../../afs/tests/meta_contract.rs)、[local-file](https://gitcode.com/openJiuwen/agent-dx/blob/1e9ae5f235d412b06fa4195bdbe26860bd7cd840/afs/src/meta/store/local_file.rs)、[Redis](https://gitcode.com/openJiuwen/agent-dx/blob/1e9ae5f235d412b06fa4195bdbe26860bd7cd840/afs/tests/redis_contract.rs)、[local storage](../../afs/tests/storage_localfs.rs)。
-- **P1**：[OwnerFs Peer](../../afs/tests/ownerfs_peer_contract.rs)、[RDMA lifecycle](../../afs/tests/rdma_lifecycle.rs)、[RDMA probe](../../afs/common/transport/tests/rdma_probe.rs)。
+- **P1**：[OwnerFs Peer](../../afs/tests/ownerfs_peer_contract.rs)、[RDMA lifecycle](../../afs/tests/rdma_lifecycle.rs)、[RDMA probe](../../afs/crates/transport/tests/rdma_probe.rs)。
 - **F1**：[FUSE 合同](../../afs/tests/fuse_contract.rs)；`dfs_real_nodes_cross_handle_keep_cache_and_permission` 是外部真实 DFS fixture，其他测试逐条看 backend，不混用结论。
 - **E1**：[OwnerFs bind/远端/恢复驱动](../../build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py)。
 - **E2**：[DFS 三 Node 核心驱动](../../build/e2e/afs/scripts/dfs/three_node_core.py)。
@@ -157,24 +157,24 @@ Rust 属性词法统计未展开宏/target；Python AST 统计不证明 unittest
 
 | Rust 文件 | 静态定义 | 显式 ignore | 初步责任分类（推断，须逐例看依赖） |
 | --- | ---: | ---: | --- |
-| [afs/common/error/src/lib.rs](../../afs/common/error/src/lib.rs) | 4 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/logging/src/fallback.rs](../../afs/common/logging/src/fallback.rs) | 1 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/logging/src/file_writer.rs](../../afs/common/logging/src/file_writer.rs) | 2 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/logging/src/init.rs](../../afs/common/logging/src/init.rs) | 2 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/logging/src/retention.rs](../../afs/common/logging/src/retention.rs) | 2 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/logging/tests/process_contract.rs](../../afs/common/logging/tests/process_contract.rs) | 3 | 0 | 组件集成/接口合同 |
-| [afs/common/metrics/src/lib.rs](../../afs/common/metrics/src/lib.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/protocol/tests/owner_read_payload.rs](../../afs/common/protocol/tests/owner_read_payload.rs) | 2 | 0 | 组件集成/接口合同 |
-| [afs/common/protocol/tests/owner_write_payload.rs](../../afs/common/protocol/tests/owner_write_payload.rs) | 1 | 0 | 组件集成/接口合同 |
-| [afs/common/tracing/src/context.rs](../../afs/common/tracing/src/context.rs) | 1 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/tracing/src/grpc.rs](../../afs/common/tracing/src/grpc.rs) | 1 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/tracing/src/server.rs](../../afs/common/tracing/src/server.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/transport/src/grpc/error_status.rs](../../afs/common/transport/src/grpc/error_status.rs) | 5 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/transport/src/grpc/security.rs](../../afs/common/transport/src/grpc/security.rs) | 1 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/transport/src/rdma.rs](../../afs/common/transport/src/rdma.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/transport/src/shm.rs](../../afs/common/transport/src/shm.rs) | 8 | 0 | 模块测试/私有组件集成混合 |
-| [afs/common/transport/tests/rdma_probe.rs](../../afs/common/transport/tests/rdma_probe.rs) | 5 | 5 | 组件集成/接口合同 |
-| [afs/common/transport/tests/tcp_config.rs](../../afs/common/transport/tests/tcp_config.rs) | 1 | 0 | 组件集成/接口合同 |
+| [afs/crates/error/src/lib.rs](../../afs/crates/error/src/lib.rs) | 4 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/logging/src/fallback.rs](../../afs/crates/logging/src/fallback.rs) | 1 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/logging/src/file_writer.rs](../../afs/crates/logging/src/file_writer.rs) | 2 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/logging/src/init.rs](../../afs/crates/logging/src/init.rs) | 2 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/logging/src/retention.rs](../../afs/crates/logging/src/retention.rs) | 2 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/logging/tests/process_contract.rs](../../afs/crates/logging/tests/process_contract.rs) | 3 | 0 | 组件集成/接口合同 |
+| [afs/crates/metrics/src/lib.rs](../../afs/crates/metrics/src/lib.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/protocol/tests/owner_read_payload.rs](../../afs/crates/protocol/tests/owner_read_payload.rs) | 2 | 0 | 组件集成/接口合同 |
+| [afs/crates/protocol/tests/owner_write_payload.rs](../../afs/crates/protocol/tests/owner_write_payload.rs) | 1 | 0 | 组件集成/接口合同 |
+| [afs/crates/tracing/src/context.rs](../../afs/crates/tracing/src/context.rs) | 1 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/tracing/src/grpc.rs](../../afs/crates/tracing/src/grpc.rs) | 1 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/tracing/src/server.rs](../../afs/crates/tracing/src/server.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/transport/src/grpc/error_status.rs](../../afs/crates/transport/src/grpc/error_status.rs) | 5 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/transport/src/grpc/security.rs](../../afs/crates/transport/src/grpc/security.rs) | 1 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/transport/src/rdma.rs](../../afs/crates/transport/src/rdma.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/transport/src/shm.rs](../../afs/crates/transport/src/shm.rs) | 8 | 0 | 模块测试/私有组件集成混合 |
+| [afs/crates/transport/tests/rdma_probe.rs](../../afs/crates/transport/tests/rdma_probe.rs) | 5 | 5 | 组件集成/接口合同 |
+| [afs/crates/transport/tests/tcp_config.rs](../../afs/crates/transport/tests/tcp_config.rs) | 1 | 0 | 组件集成/接口合同 |
 | [afs/src/bin/afs-node.rs](../../afs/src/bin/afs-node.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/config.rs](../../afs/src/config.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/dfs.rs](../../afs/src/dfs.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
@@ -186,17 +186,17 @@ Rust 属性词法统计未展开宏/target；Python AST 统计不证明 unittest
 | [afs/src/meta/store.rs](../../afs/src/meta/store.rs) | 24 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/meta.rs](../../afs/src/meta.rs) | 5 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/api/local.rs](../../afs/src/node/api/local.rs) | 8 | 0 | 模块测试/私有组件集成混合 |
-| [afs/src/node/chunk/native_live_tests.rs](../../afs/src/node/chunk/native_live_tests.rs) | 20 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/chunk/payload_live_tests.rs](../../afs/src/node/chunk/payload_live_tests.rs) | 20 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/chunk/outboard.rs](../../afs/src/node/chunk/outboard.rs) | 33 | 1 | 模块测试/私有组件集成混合 |
 | [afs/src/node/chunk.rs](../../afs/src/node/chunk.rs) | 114 | 3 | 模块测试/私有组件集成混合 |
-| [afs/src/node/dfs_fetch.rs](../../afs/src/node/dfs_fetch.rs) | 2 | 0 | 模块测试/私有组件集成混合 |
-| [afs/src/node/dfs_read.rs](../../afs/src/node/dfs_read.rs) | 125 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/read/object_fetch.rs](../../afs/src/node/read/object_fetch.rs) | 2 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/read/engine.rs](../../afs/src/node/read/engine.rs) | 125 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/external_chunk.rs](../../afs/src/node/external_chunk.rs) | 93 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/fuse/state.rs](../../afs/src/node/fuse/state.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/fuse.rs](../../afs/src/node/fuse.rs) | 46 | 0 | 模块测试/私有组件集成混合 |
-| [afs/src/node/native_workspace.rs](../../afs/src/node/native_workspace.rs) | 17 | 8 | 模块测试/私有组件集成混合 |
-| [afs/src/node/peer_cache.rs](../../afs/src/node/peer_cache.rs) | 54 | 0 | 模块测试/私有组件集成混合 |
-| [afs/src/node/read_work.rs](../../afs/src/node/read_work.rs) | 20 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/native_workspace.rs](https://gitcode.com/openJiuwen/agent-dx/blob/1e9ae5f235d412b06fa4195bdbe26860bd7cd840/afs/src/node/native_workspace.rs) | 17 | 8 | 模块测试/私有组件集成混合 |
+| [afs/src/node/read/peer_cache.rs](../../afs/src/node/read/peer_cache.rs) | 54 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/metrics/work.rs](../../afs/src/node/metrics/work.rs) | 20 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/replication.rs](../../afs/src/node/replication.rs) | 30 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/rpc/control.rs](../../afs/src/node/rpc/control.rs) | 14 | 1 | 模块测试/私有组件集成混合 |
 | [afs/src/node/rpc/data.rs](../../afs/src/node/rpc/data.rs) | 48 | 5 | 模块测试/私有组件集成混合 |
@@ -204,7 +204,7 @@ Rust 属性词法统计未展开宏/target；Python AST 统计不证明 unittest
 | [afs/src/node/rpc/peer.rs](../../afs/src/node/rpc/peer.rs) | 49 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/storage/localfs.rs](../../afs/src/node/storage/localfs.rs) | 1 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/storage.rs](../../afs/src/node/storage.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
-| [afs/src/node/vfs/dfs/pending_trace.rs](../../afs/src/node/vfs/dfs/pending_trace.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/vfs/dfs/pending_trace.rs](https://gitcode.com/openJiuwen/agent-dx/blob/1e9ae5f235d412b06fa4195bdbe26860bd7cd840/afs/src/node/vfs/dfs/pending_trace.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/vfs/dfs.rs](../../afs/src/node/vfs/dfs.rs) | 263 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/vfs/locks.rs](../../afs/src/node/vfs/locks.rs) | 31 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/vfs/ownerfs/bind_mount.rs](../../afs/src/node/vfs/ownerfs/bind_mount.rs) | 11 | 5 | 模块测试/私有组件集成混合 |
@@ -237,8 +237,7 @@ Rust 属性词法统计未展开宏/target；Python AST 统计不证明 unittest
 | [afs/tests/redis_contract.rs](https://gitcode.com/openJiuwen/agent-dx/blob/1e9ae5f235d412b06fa4195bdbe26860bd7cd840/afs/tests/redis_contract.rs) | 4 | 4 | 组件集成/接口合同 |
 | [afs/tests/rest_contract.rs](../../afs/tests/rest_contract.rs) | 7 | 0 | 组件集成/接口合同 |
 | [afs/tests/storage_localfs.rs](../../afs/tests/storage_localfs.rs) | 8 | 0 | 组件集成/接口合同 |
-| [afs/tests/support/perf_denominators.rs](../../afs/tests/support/perf_denominators.rs) | 4 | 0 | test support/example 内定义；不当独立业务case |
-| [afs/tests/support/root_command_meta.rs](../../afs/tests/support/root_command_meta.rs) | 4 | 0 | test support/example 内定义；不当独立业务case |
+| [afs/tools/src/bin/perf-denominators.rs](../../afs/tools/src/bin/perf-denominators.rs) | 4 | 0 | 度量工具内定义（原 `tests/support` example，S1e 迁入 `afs-tools`）；不当独立业务case |
 | [afs/tests/vfs_contract.rs](../../afs/tests/vfs_contract.rs) | 1 | 0 | 组件集成/接口合同 |
 
 | Python 工具自测文件 | 静态 test_ 定义 |
@@ -285,7 +284,7 @@ Rust 属性词法统计未展开宏/target；Python AST 统计不证明 unittest
 | [build/e2e/afs/perf/test_dfs_compare.py](../../build/e2e/afs/perf/test_dfs_compare.py) | 40 |
 | [build/e2e/afs/scripts/dfs/test_three_node_core.py](../../build/e2e/afs/scripts/dfs/test_three_node_core.py) | 1 |
 | [build/e2e/afs/scripts/ownerfs/test_bind_two_node_localfile.py](../../build/e2e/afs/scripts/ownerfs/test_bind_two_node_localfile.py) | 4 |
-| [build/e2e/afs/scripts/ownerfs/test_native_workspace_control.py](../../build/e2e/afs/scripts/ownerfs/test_native_workspace_control.py) | 3 |
+| [build/e2e/afs/scripts/ownerfs/test_native_workspace_control.py](https://gitcode.com/openJiuwen/agent-dx/blob/1e9ae5f235d412b06fa4195bdbe26860bd7cd840/build/e2e/afs/scripts/ownerfs/test_native_workspace_control.py) | 3 |
 
 ## 5. 后续使用与本轮边界
 

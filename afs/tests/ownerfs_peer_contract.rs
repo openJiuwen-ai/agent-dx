@@ -39,13 +39,13 @@ use afs::node::{
 #[cfg(feature = "rdma")]
 use afs_protocol::node_control::{
     NegotiateDataRequest, OwnerCloseDataRequest, OwnerNegotiateDataRequest,
-    node_control_client::NodeControlClient,
+    owner_control_client::OwnerControlClient,
 };
 use afs_protocol::node_data::{
     DataPlane, DataTransfer, FileIdentity, OwnerCaller, OwnerCreateRequest, OwnerGetAttrRequest,
     OwnerLookupRequest, OwnerOpenRequest, OwnerReadRequest, OwnerReleaseRequest,
-    OwnerRenameRequest, OwnerRmdirRequest, OwnerUnlinkRequest, OwnerWriteRequest, RootAccess,
-    owner_files_client::OwnerFilesClient,
+    OwnerRenameRequest, OwnerRmdirRequest, OwnerRmdirRootRequest, OwnerUnlinkRequest,
+    OwnerWriteRequest, RootAccess, owner_files_client::OwnerFilesClient,
 };
 #[cfg(feature = "rdma")]
 use afs_protocol::node_data::{
@@ -623,7 +623,7 @@ async fn owner_rdma_fixture_with_authority(
     let metrics_registry = afs_metrics::Registry::new();
     let metrics =
         afs::node::rpc::OwnerRpcMetrics::register(&metrics_registry).expect("Owner metrics");
-    let control = afs::node::rpc::control::NodeControlService::new(RdmaSessionRegistry::new(None))
+    let control = afs::node::rpc::control::OwnerControlService::new(Default::default())
         .with_owner_locks(executor.clone(), authenticator.clone())
         .with_owner_rdma_registry(rdma_registry.clone())
         .into_server();
@@ -893,7 +893,7 @@ async fn negotiate_owner_rdma_window(
         .expect("open RDMA endpoint");
     let client_info = endpoint.info().expect("client RDMA info").to_vec();
     let capacity = endpoint.capacity();
-    let mut control = NodeControlClient::new(channel);
+    let mut control = OwnerControlClient::new(channel);
     let reply = control
         .owner_negotiate_data(tonic::Request::new(OwnerNegotiateDataRequest {
             access: Some(access),
@@ -926,7 +926,7 @@ async fn negotiate_owner_rdma_window(
 
 #[cfg(feature = "rdma")]
 async fn close_owner_rdma_window(channel: Channel, access: RootAccess, session_id: u64) {
-    NodeControlClient::new(channel)
+    OwnerControlClient::new(channel)
         .owner_close_data(tonic::Request::new(OwnerCloseDataRequest {
             access: Some(access),
             session_id,
@@ -1267,7 +1267,7 @@ async fn ownerfiles_rdma_authority_validation_may_block_on_tokio_handle() {
     let mut access = root_access_for(&fixture.grant);
     access.session_id = "session-fresh-negotiate".to_owned();
     let before = *fixture.meta.validate_calls.lock().unwrap();
-    let reply = NodeControlClient::new(fixture.channel.clone())
+    let reply = OwnerControlClient::new(fixture.channel.clone())
         .owner_negotiate_data(tonic::Request::new(OwnerNegotiateDataRequest {
             access: Some(access),
             negotiation: Some(NegotiateDataRequest {
@@ -1784,11 +1784,9 @@ async fn ownerfiles_rejects_rdma_plane_without_negotiated_owner_session_before_w
         listener.local_addr().unwrap().port()
     );
     let executor = fs.peer_executor().expect("peer executor");
-    let control = afs::node::rpc::control::NodeControlService::new(
-        afs::node::rpc::control::RdmaSessionRegistry::new(None),
-    )
-    .with_owner_locks(executor.clone(), Arc::new(RequireMtlsNodeB))
-    .into_server();
+    let control = afs::node::rpc::control::OwnerControlService::new(Default::default())
+        .with_owner_locks(executor.clone(), Arc::new(RequireMtlsNodeB))
+        .into_server();
     let handler = make_owner_files_handler(executor);
     let server_tls = ServerTlsConfig::new()
         .client_ca_root(Certificate::from_pem(CA_PEM))
@@ -1958,11 +1956,9 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
         listener.local_addr().unwrap().port()
     );
     let executor = fs.peer_executor().expect("peer executor");
-    let control = afs::node::rpc::control::NodeControlService::new(
-        afs::node::rpc::control::RdmaSessionRegistry::new(None),
-    )
-    .with_owner_locks(executor.clone(), Arc::new(RequireMtlsNodeB))
-    .into_server();
+    let control = afs::node::rpc::control::OwnerControlService::new(Default::default())
+        .with_owner_locks(executor.clone(), Arc::new(RequireMtlsNodeB))
+        .into_server();
     let handler = make_owner_files_handler(executor);
     let server_tls = ServerTlsConfig::new()
         .client_ca_root(Certificate::from_pem(CA_PEM))
@@ -2074,6 +2070,30 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
         .expect_err("rmdir requires caller");
     assert!(status.message().contains("missing caller"));
     let status = raw_missing_caller
+        .rmdir_root(OwnerRmdirRootRequest {
+            access: Some(root_access_for(&grant)),
+            expected_root: parent.clone(),
+            caller: None,
+        })
+        .await
+        .expect_err("rmdir_root requires caller");
+    assert!(status.message().contains("missing caller"));
+    let status = raw_missing_caller
+        .rmdir_root(OwnerRmdirRootRequest {
+            access: Some(root_access_for(&grant)),
+            expected_root: None,
+            caller: Some(OwnerCaller {
+                uid: 0,
+                gid: 0,
+                pid: 1,
+                umask: 0,
+                supplementary_gids: Vec::new(),
+            }),
+        })
+        .await
+        .expect_err("rmdir_root requires expected_root");
+    assert!(status.message().contains("missing expected_root"));
+    let status = raw_missing_caller
         .rename(OwnerRenameRequest {
             access: Some(root_access_for(&grant)),
             old_path: b"absent".to_vec(),
@@ -2090,6 +2110,7 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
     assert!(status.message().contains("missing caller"));
     let raw_channel = channel.clone();
     let raw_grant = grant.clone();
+    let (raw_uid, raw_gid) = (ctx.uid, ctx.gid);
     let client = std::thread::spawn(move || {
         owner_files_client_from_channel(channel).with_long_wait_channel(long_wait_channel)
     })
@@ -2324,6 +2345,25 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
             .expect_err("released remote handle must be stale");
         assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
         client.release(&grant, recreated.file)?;
+
+        // Home errors cross the wire intact and leave the workspace usable: the
+        // prefetch reads below still open renamed.txt after these rejections.
+        // Deleting under the root-owned mount root needs a root caller.
+        let root_ctx = RequestContext {
+            uid: 0,
+            gid: 0,
+            ..ctx.clone()
+        };
+        let error = client
+            .rmdir_root(&root_ctx, &grant, &root_parent)
+            .expect_err("non-empty workspace must not be deleted");
+        assert_eq!(error.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+        let stale = afs::node::vfs::ownerfs::files::FileIdentity(b"stale-root".to_vec());
+        let error = client
+            .rmdir_root(&root_ctx, &grant, &stale)
+            .expect_err("stale root identity must be rejected");
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        client.lookup(&grant, OsStr::new(""), None)?;
         Ok(())
     })
     .await
@@ -2361,6 +2401,73 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
     }
 
     assert_eq!(*meta.validate_calls.lock().unwrap(), 2);
+
+    // The `rm -rf` sequence over the wire: unlink the contents, then end the
+    // workspace lifecycle on Home.
+    let data_dir = temp
+        .path()
+        .join(format!("{}-e{}", raw_grant.id.0, raw_grant.epoch));
+    let root_identity = raw
+        .lookup(OwnerLookupRequest {
+            access: Some(root_access_for(&raw_grant)),
+            path: Vec::new(),
+            expected_parent_identity: None,
+        })
+        .await
+        .expect("lookup workspace root")
+        .into_inner()
+        .attr
+        .expect("root attr")
+        .identity;
+    let caller = OwnerCaller {
+        uid: raw_uid,
+        gid: raw_gid,
+        pid: 1,
+        umask: 0,
+        supplementary_gids: Vec::new(),
+    };
+    for entry in std::fs::read_dir(&data_dir).expect("list workspace") {
+        let name = entry.expect("workspace entry").file_name();
+        raw.unlink(OwnerUnlinkRequest {
+            access: Some(root_access_for(&raw_grant)),
+            path: name.as_encoded_bytes().to_vec(),
+            expected_file_identity: None,
+            expected_parent: root_identity.clone(),
+            caller: Some(caller.clone()),
+        })
+        .await
+        .expect("unlink through OwnerFiles");
+    }
+    // A peer with a Write grant still cannot delete the workspace for a caller that
+    // the mount root's permissions would reject.
+    let user = OwnerCaller {
+        uid: 1000,
+        gid: 1000,
+        ..caller.clone()
+    };
+    let status = raw
+        .rmdir_root(OwnerRmdirRootRequest {
+            access: Some(root_access_for(&raw_grant)),
+            expected_root: root_identity.clone(),
+            caller: Some(user),
+        })
+        .await
+        .expect_err("non-root caller must not delete a workspace");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert!(data_dir.exists());
+    raw.rmdir_root(OwnerRmdirRootRequest {
+        access: Some(root_access_for(&raw_grant)),
+        expected_root: root_identity,
+        caller: Some(OwnerCaller {
+            uid: 0,
+            gid: 0,
+            ..caller
+        }),
+    })
+    .await
+    .expect("empty workspace is deleted through OwnerFiles");
+    assert!(!data_dir.exists());
+    assert!(meta.lookup_root(&raw_grant.id).unwrap().is_none());
     server.abort();
 }
 

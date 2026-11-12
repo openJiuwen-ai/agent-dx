@@ -23,7 +23,7 @@ B 在 open 固定文件版本和布局。第一次向 A 请求时建立与 mTLS 
 
 ## 当前功能边界
 
-- `dfs_native_open_read_authority` 默认 false，需显式 native `data_mode="grpc"`；快通道还要求读 CRC off 和可追踪的 mTLS 连接身份。没有这种身份走原路径。TLS 配置没有改变，也没有实现关闭 TLS 的新快通道。
+- （历史记录；该开关已在 S1a-6 删除，读者固定版本成为唯一语义）`dfs_native_open_read_authority` 默认 false，需显式 native `data_mode="grpc"`；快通道还要求读 CRC off 和可追踪的 mTLS 连接身份。没有这种身份走原路径。TLS 配置没有改变，也没有实现关闭 TLS 的新快通道。
 - 原生 gRPC 读 CRC 默认 off，写 CRC 默认 true。off 可能交付静默损坏；这次只保证已经识别并持久隔离的副本不被缓存绕过。receiver/both 保留，A/B 仍须模式一致；单独 B 协商和非对齐策略的整体准入未完成。
 - source-page TTL 不等于连接存活的 open 寿命。正常读不加回逐范围 Meta 或逐帧重复校验；关闭、Meta 准入失败及断连进入收尾或恢复。
 - 固定读句柄使用 FOPEN_DIRECT_IO。实际 Linux 的旧 fd 跨覆盖、截短、新 open、unlink 仍按旧版本 read/pread/EOF；新 open 看到新版本。fstat 仍可能报告共享 inode 的新长度，不保证逐 fd 的属性或 mmap 快照。

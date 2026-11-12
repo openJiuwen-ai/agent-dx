@@ -7,7 +7,7 @@ use adxlet::{
     Adxlet, Durability, Readiness, Routes, RuntimeDriver, StateSink,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -2221,4 +2221,81 @@ async fn periodic_inventory_preserves_create_admitted_during_catalog_read() {
         .unwrap()
         .iter()
         .any(|r| r.starts_with("delete:")));
+}
+
+#[test]
+fn independent_peer_aliases_accept_equivalent_domain_spellings() {
+    use adx_core::execution as model;
+    for configured in ["node.example", "NODE.EXAMPLE."] {
+        for requested in ["node.example", "Node.Example", "node.example."] {
+            let mut environment = spec();
+            environment.execution.network = Some(model::NetworkPolicy {
+                traffic: Some(model::TrafficPolicy {
+                    ingress_default_action: model::NetworkAction::Deny,
+                    egress_default_action: model::NetworkAction::Deny,
+                    mode: model::TrafficMode::Stateful,
+                    rules: vec![model::NetworkRule {
+                        action: model::NetworkAction::Allow,
+                        direction: model::NetworkDirection::Egress,
+                        protocol: model::NetworkProtocol::Tcp,
+                        peer: model::NetworkPeer {
+                            domain: requested.into(),
+                            port: 8080,
+                            ..Default::default()
+                        },
+                        environment_port: 0,
+                        environment_port_range: None,
+                        priority: 100,
+                    }],
+                }),
+                dns: None,
+            });
+            let config = Config {
+                network_peer_aliases: BTreeMap::from([(
+                    configured.into(),
+                    "10.88.4.1/32".parse().unwrap(),
+                )]),
+                ..Default::default()
+            };
+            let request = start_request(&environment, "alias", 1, &[], &config).unwrap();
+            let rule = &request.network_policy.unwrap().traffic.unwrap().rules[0];
+            let peer = rule.peer.as_ref().unwrap();
+            assert_eq!(peer.cidr, "10.88.4.1/32");
+            assert!(peer.domain.is_empty());
+            assert_eq!(peer.port, 8080);
+        }
+    }
+}
+
+#[test]
+fn source_bounded_execd_replies_survive_policy_replacement() {
+    use adx_core::execution as model;
+    let mut environment = spec();
+    environment.execution.network = Some(model::NetworkPolicy {
+        traffic: Some(model::TrafficPolicy {
+            ingress_default_action: model::NetworkAction::Deny,
+            egress_default_action: model::NetworkAction::Deny,
+            rules: vec![],
+            mode: model::TrafficMode::Stateful,
+        }),
+        dns: None,
+    });
+    environment.execution.ports = vec![8080];
+    let config = Config {
+        platform_ingress_sources: Some(vec!["10.88.4.1/32".parse().unwrap()]),
+        ..Default::default()
+    };
+    let request = start_request(&environment, "bounded", 1, &[], &config).unwrap();
+    let traffic = request.network_policy.unwrap().traffic.unwrap();
+    for rule in &traffic.rules {
+        let ports = rule.sandbox_port_range.as_ref().unwrap();
+        assert_eq!(rule.peer.as_ref().unwrap().cidr, "10.88.4.1/32");
+        assert_eq!(ports.first, ports.last);
+        match ports.first {
+            50090 => assert_eq!(rule.direction, NetworkDirection::Both as i32),
+            8080 => assert_eq!(rule.direction, NetworkDirection::Ingress as i32),
+            other => panic!("unexpected platform port {other}"),
+        }
+    }
+    assert_eq!(traffic.rules.len(), 2);
 }

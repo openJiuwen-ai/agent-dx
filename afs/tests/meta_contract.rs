@@ -1,9 +1,9 @@
 use afs::dfs::{
-    ChunkId, ContentDigest, DigestAlgorithm, LocalCopyPolicy, OperationId, ReplicationConfig,
-    ValidateReplicaWriteRequest,
+    ChunkId, ContentDigest, DigestAlgorithm, EffectiveLocalCopy, LocalCopyPolicy, OperationId,
+    ReplicationConfig, ValidateReplicaWriteRequest,
 };
 use afs::meta::store::{
-    journal::{LogLimits, LogTip, RecoveredLog},
+    journal::{AppendLimits, CheckpointLimits, LogCursor, LogStatus, LogTip, RecoveredLog},
     log::Record,
 };
 use afs::{
@@ -246,6 +246,130 @@ async fn dfs_write_authority_rpc_validates_fields_and_uses_new_endpoint() {
             .unwrap_err()
             .code(),
         Code::PermissionDenied
+    );
+}
+
+#[tokio::test]
+async fn dfs_gc_fence_capture_requires_a_write_reference_before_any_mutation() {
+    use afs::meta::store::NodeSessionLease;
+    use afs_protocol::meta::{UpdateDfsGcReferenceRequest, dfs_gc_fence::Kind};
+    let (store, _, lease, _) = lock_resolver_fixture(30).await;
+    store
+        .register_node_session(
+            RequestKey::new("node-a", "register-capture"),
+            NodeSessionLease {
+                node_id: "node-a".into(),
+                session_id: "session-a".into(),
+                grpc_addr: "http://127.0.0.1:1".into(),
+                data_addr: "http://127.0.0.1:2".into(),
+                rest_addr: "http://127.0.0.1:3".into(),
+                ownerfs_enabled: false,
+                storage_devices: vec![],
+                lease_ttl: std::time::Duration::from_secs(60),
+            },
+        )
+        .await
+        .unwrap();
+    let rpc = rpc::DfsMetaRpc(Arc::new(Meta::with_store(
+        "test".into(),
+        Observability::new().unwrap(),
+        store.clone(),
+    )));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let capture = |reference_id: &str| UpdateDfsGcReferenceRequest {
+        node_id: "node-a".into(),
+        session_id: "session-a".into(),
+        reference_id: reference_id.into(),
+        inode_id: lease.inode_id.0.clone(),
+        publication: true,
+        capture_gc_fence: true,
+        admission_deadline_unix_ms: now_ms + 30_000,
+        ..Default::default()
+    };
+    let error = rpc
+        .update_gc_reference(Request::new(capture("publish:other")))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument, "{error:?}");
+    // Admission has expired, so only an already retained reference could pass.
+    let mut retained = capture("publish:other");
+    retained.capture_gc_fence = false;
+    retained.admission_deadline_unix_ms = 1;
+    assert!(
+        rpc.update_gc_reference(Request::new(retained))
+            .await
+            .is_err(),
+        "a rejected capture must not retain a reference"
+    );
+    // Per-chunk publication references were removed; Meta refuses chunk lists.
+    let mut with_chunks = capture(&format!(
+        "write:{}",
+        afs::clock::timed_request_id("with-chunks")
+    ));
+    with_chunks.chunks = vec![Default::default()];
+    assert_eq!(
+        rpc.update_gc_reference(Request::new(with_chunks))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let reply = rpc
+        .update_gc_reference(Request::new(capture(&format!(
+            "write:{}",
+            afs::clock::timed_request_id("capture")
+        ))))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        reply.gc_fence.unwrap().kind,
+        Some(Kind::WriteGeneration(true))
+    );
+}
+
+#[tokio::test]
+async fn dfs_write_authority_observation_does_not_acquire_expired_lease() {
+    let (store, dfs, original, backend) = lock_resolver_fixture(1).await;
+    let (_, live) = dfs
+        .resolve_write_authority(
+            "node-b".into(),
+            "session-b".into(),
+            OperationId::new("observe-live"),
+            original.inode_id.clone(),
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(live, original);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let commits = backend.observed_commit().0;
+    let error = dfs
+        .resolve_write_authority(
+            "node-b".into(),
+            "session-b".into(),
+            OperationId::new("observe-expired"),
+            original.inode_id.clone(),
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
+    assert_eq!(backend.observed_commit().0, commits);
+    assert!(
+        store
+            .read(MetaRead::RequestOutcome(RequestKey::new(
+                "node-b",
+                "observe-expired"
+            )))
+            .await
+            .unwrap()
+            .request_outcome
+            .is_none()
     );
 }
 
@@ -852,6 +976,7 @@ async fn node_rpc_store_local_file_recovers_committed_session_and_reply() {
             storage_devices: Vec::new(),
         }),
         lease_seconds: 30,
+        protocol_version: afs::format::version::NODE_META_PROTOCOL,
     };
     let registered = rpc::MetaRpc(meta)
         .register_node(Request::new(request.clone()))
@@ -944,6 +1069,7 @@ async fn contract_rpc_does_not_issue_fake_grants_without_store() {
                 storage_devices: Vec::new(),
             }),
             lease_seconds: 30,
+            protocol_version: afs::format::version::NODE_META_PROTOCOL,
         }))
         .await
         .unwrap_err();
@@ -1040,6 +1166,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
                     storage_devices: Vec::new(),
                 }),
                 lease_seconds: 30,
+                protocol_version: afs::format::version::NODE_META_PROTOCOL,
             }))
             .await
             .unwrap()
@@ -1246,6 +1373,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
                 storage_devices: Vec::new(),
             }),
             lease_seconds: 30,
+            protocol_version: afs::format::version::NODE_META_PROTOCOL,
         }))
         .await
         .unwrap();
@@ -1333,6 +1461,7 @@ async fn owner_authority_stale_abort_cannot_delete_new_pending_reservation() {
                 storage_devices: Vec::new(),
             }),
             lease_seconds: 30,
+            protocol_version: afs::format::version::NODE_META_PROTOCOL,
         }))
         .await
         .unwrap();
@@ -1594,6 +1723,7 @@ async fn n2b1_register_node(meta_rpc: &rpc::MetaRpc) {
                 storage_devices: Vec::new(),
             }),
             lease_seconds: 30,
+            protocol_version: afs::format::version::NODE_META_PROTOCOL,
         }))
         .await
         .unwrap();
@@ -2226,6 +2356,7 @@ async fn register_dfs_storage_node_with_catalog(
             }],
         }),
         lease_seconds: 30,
+        protocol_version: afs::format::version::NODE_META_PROTOCOL,
     }))
     .await
     .unwrap();
@@ -2252,6 +2383,7 @@ async fn register_dfs_compute_node(
             storage_devices: Vec::new(),
         }),
         lease_seconds: 30,
+        protocol_version: afs::format::version::NODE_META_PROTOCOL,
     }))
     .await
     .unwrap();
@@ -2310,7 +2442,7 @@ impl MetaLog for LostCommitResultBackend {
     fn persistence(&self) -> afs::meta::store::BackendPersistence {
         self.inner.persistence()
     }
-    fn limits(&self) -> LogLimits {
+    fn limits(&self) -> AppendLimits {
         self.inner.limits()
     }
     fn health(&self) -> afs::meta::store::MetaFuture<'_, ()> {
@@ -2319,9 +2451,34 @@ impl MetaLog for LostCommitResultBackend {
     fn recover(&self) -> afs::meta::store::MetaFuture<'_, RecoveredLog> {
         self.inner.recover()
     }
+    fn checkpoint_limits(&self) -> CheckpointLimits {
+        self.inner.checkpoint_limits()
+    }
+    /// This wrapper does not forward checkpoints, so Store schedules none.
+    fn supports_checkpoint(&self) -> bool {
+        false
+    }
+    fn status(&self) -> afs::meta::store::MetaFuture<'_, LogStatus> {
+        self.inner.status()
+    }
+    fn can_append(
+        &self,
+        expected: LogCursor,
+        bytes: usize,
+    ) -> afs::meta::store::MetaFuture<'_, bool> {
+        self.inner.can_append(expected, bytes)
+    }
+    fn install_checkpoint(&self, _: LogTip, _: Vec<u8>) -> afs::meta::store::MetaFuture<'_, ()> {
+        Box::pin(async {
+            Err(afs_error::Error::coded(
+                afs_error::IO_UNAVAILABLE,
+                "test wrapper does not install checkpoints",
+            ))
+        })
+    }
     fn append_and_sync(
         &self,
-        expected: LogTip,
+        expected: LogCursor,
         records: Vec<Record>,
     ) -> afs::meta::store::MetaFuture<'_, LogTip> {
         Box::pin(async move {
@@ -2480,7 +2637,7 @@ async fn p3_supported_commit_shapes_survive_local_log_reopen() {
     use prost::Message;
     use std::time::Duration;
 
-    // The batch count is the existing NativeWriteConfig maximum, not a new cap.
+    // The batch count is the existing WritePipelineConfig maximum, not a new cap.
     // A large layout remains a single value, independently of top-level slots.
     for (name, copies, chunks, extents) in [
         ("single-copy-batch", 1, 1024, 1024),
@@ -2488,7 +2645,7 @@ async fn p3_supported_commit_shapes_survive_local_log_reopen() {
         ("fragmented-layout", 1, 1, 65537),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let log = Arc::new(LocalLog::open(dir.path(), LogLimits::default()).unwrap());
+        let log = Arc::new(LocalLog::open(dir.path(), Default::default()).unwrap());
         let store = Arc::new(Store::open_log(log.clone()).await.unwrap());
         let replication = ReplicationConfig {
             desired_copies: copies,
@@ -2555,25 +2712,22 @@ async fn p3_supported_commit_shapes_survive_local_log_reopen() {
             panic!("expected one domain decision");
         };
         let facts = decision.facts().unwrap();
-        // Publishing also releases the in-flight GC reference atomically.
-        let expected_changes = 4 + chunks * (2 + usize::from(copies));
+        // Inode, version and layout, plus each chunk's placement and copies.
+        // An unfenced commit no longer deletes a per-chunk `publish:` reference.
+        let expected_changes = 3 + chunks * (2 + usize::from(copies));
         assert_eq!(facts.events.len(), expected_changes);
-        assert_eq!(
-            facts
+        assert!(
+            !facts
                 .events
                 .iter()
-                .filter(|event| {
-                    matches!(event.key, afs::meta::store::MetaKey::DfsReference { .. })
-                        && matches!(event.change, afs::meta::store::WatchChange::Delete)
-                })
-                .count(),
-            1
+                .any(|event| matches!(event.key, afs::meta::store::MetaKey::DfsReference { .. }))
         );
         assert_eq!(facts.outcomes.len(), 1);
-        let record_bytes = decision
-            .encode(LogLimits::default().record_max_bytes)
-            .unwrap()
-            .len();
+        let record_bytes = postcard::to_allocvec(decision).unwrap().len();
+        assert!(
+            record_bytes
+                <= afs::meta::store::local_log::LocalLogOptions::default().record_max_bytes
+        );
         let expected_inode = store
             .read(MetaRead::DfsInode(inode_id.clone()))
             .await
@@ -2603,7 +2757,7 @@ async fn p3_supported_commit_shapes_survive_local_log_reopen() {
         .await
         .unwrap();
         drop(log);
-        let reopened_log = Arc::new(LocalLog::open(dir.path(), LogLimits::default()).unwrap());
+        let reopened_log = Arc::new(LocalLog::open(dir.path(), Default::default()).unwrap());
         let reopened = Arc::new(Store::open_log(reopened_log.clone()).await.unwrap());
         assert_eq!(
             reopened
@@ -2849,6 +3003,10 @@ async fn dfs_placement_uses_global_live_devices_for_required_local_copy() {
 
     let first = dfs.placement_snapshot("node-a".into()).await.unwrap();
     assert!(first.revision > 0);
+    assert_eq!(
+        first.local_copy,
+        EffectiveLocalCopy::declared(&first.replication)
+    );
     assert!(!first.replica_groups.is_empty());
     for group in &first.replica_groups {
         assert_eq!(group.targets.len(), 3);
@@ -3206,6 +3364,7 @@ async fn dfs_namespace_mkdir_readdir_and_rmdir_update_directory_links() {
         .read_dir(Request::new(DfsReadDirRequest {
             namespace_id: "default".into(),
             parent_inode_id: dir.inode_id.clone(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -3679,6 +3838,54 @@ async fn dfs_namespace_hardlink_symlink_and_readlink_are_metadata_operations() {
         .into_inner()
         .target;
     assert_eq!(readlink, b"../real-target".to_vec());
+}
+
+#[tokio::test]
+async fn dfs_generic_xattr_cannot_change_lazy_source() {
+    let dfs = memory_dfs().await;
+    let file = dfs
+        .create(Request::new(DfsCreateRequest {
+            caller_id: "node-a".into(),
+            operation_id: "create-source-boundary".into(),
+            namespace_id: "default".into(),
+            parent_inode_id: "1".into(),
+            name: b"source-boundary".to_vec(),
+            attributes: Some(test_attrs(0o640, 1)),
+            owner_session_id: "session-a".into(),
+            lease_seconds: 30,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .inode
+        .unwrap();
+    let name = b"user.afs.lazy.v1".to_vec();
+    let err = dfs
+        .set_xattr(Request::new(DfsSetXattrRequest {
+            caller_id: "node-a".into(),
+            operation_id: "set-source-marker".into(),
+            caller: Some(caller(0, 0)),
+            inode_id: file.inode_id.clone(),
+            expected_inode_revision: file.revision,
+            name: name.clone(),
+            value: b"reserved".to_vec(),
+            mode: DfsXattrSetMode::Create.into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status_errno(err), libc::EPERM);
+    let err = dfs
+        .remove_xattr(Request::new(DfsRemoveXattrRequest {
+            caller_id: "node-a".into(),
+            operation_id: "remove-source-marker".into(),
+            caller: Some(caller(0, 0)),
+            inode_id: file.inode_id,
+            expected_inode_revision: file.revision,
+            name,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status_errno(err), libc::EPERM);
 }
 
 #[tokio::test]
