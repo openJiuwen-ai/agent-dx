@@ -47,6 +47,9 @@ pub struct DigitalMateGatewayConfig {
     pub jiuwen: JiuwenTarget,
     pub orbit: Option<super::application_ws::ApplicationWsConfig>,
     pub digitalmate: Option<super::application_ws::ApplicationWsConfig>,
+    #[cfg(unix)]
+    #[serde(default)]
+    pub(crate) privacy: Option<super::privacy_runtime::PrivacyRuntimeConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -158,6 +161,15 @@ impl DigitalMateGatewayConfig {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
+        #[cfg(unix)]
+        if let Some(privacy) = &self.privacy {
+            if ![&self.orbit, &self.digitalmate].iter().any(|app| {
+                app.as_ref()
+                    .is_some_and(|app| app.template == privacy.template)
+            }) {
+                return Err(invalid());
+            }
+        }
         for (application, config) in [
             (Application::Orbit, &self.orbit),
             (Application::DigitalMate, &self.digitalmate),
@@ -216,6 +228,8 @@ pub struct DigitalMateGatewayApi {
     config: DigitalMateGatewayConfig,
     auth: Arc<dyn BusinessAuth>,
     managed: Arc<ManagedService>,
+    #[cfg(unix)]
+    privacy: Option<super::privacy_runtime::PrivacyRuntime>,
 }
 impl DigitalMateGatewayApi {
     pub fn new(
@@ -224,10 +238,37 @@ impl DigitalMateGatewayApi {
         auth: Arc<dyn BusinessAuth>,
     ) -> Result<Self, Error> {
         config.validate()?;
+        #[cfg(unix)]
+        let privacy = if let Some(settings) = config.privacy.clone() {
+            use zeroize::Zeroizing;
+            let path = std::env::var_os("ADX_CREDENTIAL_KEY_FILE").ok_or_else(invalid)?;
+            let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|_| invalid())?);
+            let bytes = Zeroizing::new(hex::decode(text.trim()).map_err(|_| invalid())?);
+            let key =
+                Zeroizing::new(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| invalid())?);
+            let store = auth.privacy_store().ok_or_else(invalid)?;
+            let reader = Arc::new(super::privacy_center::ManagedBindingReader(managed.clone()));
+            Some(
+                super::privacy_runtime::PrivacyRuntime::start(
+                    settings,
+                    store,
+                    reader,
+                    &key,
+                    &config.tenant,
+                )
+                .map_err(|_| {
+                    Error::Unavailable("DigitalMate privacy service initialization failed".into())
+                })?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             auth,
             config,
             managed,
+            #[cfg(unix)]
+            privacy,
         })
     }
     pub fn matches(path: &str) -> bool {
@@ -284,9 +325,15 @@ impl DigitalMateGatewayApi {
                     request,
                     ingress,
                     self.managed.clone(),
-                    self.auth.clone(),
-                    principal,
+                    Arc::new(accounts::SessionGuard {
+                        auth: self.auth.clone(),
+                        principal,
+                    }),
                     &self.config.tenant,
+                    #[cfg(unix)]
+                    self.privacy
+                        .as_ref()
+                        .map(|privacy| privacy.identity.clone()),
                 )
                 .await;
         }

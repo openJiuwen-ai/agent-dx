@@ -46,6 +46,7 @@ async fn anonymous_artifact_follows_environment_but_live_inputs_delay_reclamatio
     let a = artifact();
     let mut r = running(specification, assignment);
     r.checkpoint = Some(RestorePoint {
+        recovery_profile: Default::default(),
         origin: None,
         id: "pause".into(),
         artifact: a.clone(),
@@ -246,6 +247,7 @@ async fn cleanup_candidate(s: &adx_coordinator::storage::Session) -> CheckpointA
     let a = artifact();
     let mut record = running(spec("cleanup-owner"), assignment);
     record.checkpoint = Some(RestorePoint {
+        recovery_profile: Default::default(),
         origin: None,
         id: "checkpoint".into(),
         artifact: a.clone(),

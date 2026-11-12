@@ -1169,6 +1169,7 @@ async fn failed_capture_reservation_does_not_block_node_reconciliation() {
     failed.resources_held = false;
     failed.runtime.ip = None;
     failed.snapshot_source = Some(adx_core::RestorePoint {
+        recovery_profile: Default::default(),
         origin: Some(adx_core::runtime::RuntimeIdentity {
             environment_id: "source".into(),
             runtime_id: "source-6".into(),

@@ -34,6 +34,87 @@ fn spec(image: &str) -> EnvironmentSpec {
 }
 
 #[test]
+fn explicit_image_uses_request_path_before_profile_path() {
+    let mut profile = runtime_profile();
+    profile.env.insert("PATH".into(), "/profile/bin".into());
+    let mut config = Config {
+        runtime_profile: Some(profile.clone()),
+        ..Default::default()
+    };
+    let mut wanted = spec("ubuntu:24.04");
+    wanted.runtime_profile = Some(profile);
+    wanted.env.insert("PATH".into(), String::new());
+    wanted.env.insert("PLATFORM_VALUE".into(), "user".into());
+
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert_eq!(request.envs["PATH"], "");
+    assert_eq!(request.envs["PLATFORM_VALUE"], "configured");
+
+    config.env.insert("PATH".into(), "/node/bin".into());
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert_eq!(request.envs["PATH"], "/node/bin");
+
+    wanted.env.remove("PATH");
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert_eq!(request.envs["PATH"], "/node/bin");
+}
+
+#[test]
+fn custom_rootfs_without_request_path_omits_profile_path() {
+    let mut profile = runtime_profile();
+    profile.env.insert("PATH".into(), "/profile/bin".into());
+    let config = Config {
+        runtime_profile: Some(profile.clone()),
+        ..Default::default()
+    };
+    let mut wanted = spec("ubuntu:24.04");
+    wanted.runtime_profile = Some(profile);
+
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert!(!request.envs.contains_key("PATH"));
+    assert_eq!(request.envs["PLATFORM_VALUE"], "configured");
+    assert!(request.inject_entrypoint.is_empty());
+
+    wanted.execution.rootfs = Some(Rootfs {
+        readonly: false,
+        source: StorageSource::Image(std::mem::take(&mut wanted.image)),
+    });
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert!(!request.envs.contains_key("PATH"));
+
+    wanted.env.insert("PATH".into(), "/request/bin".into());
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert_eq!(request.envs["PATH"], "/request/bin");
+
+    wanted.execution.rootfs = Some(Rootfs {
+        readonly: false,
+        source: StorageSource::Local("/opt/adx/custom/rootfs.img".into()),
+    });
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert_eq!(request.envs["PATH"], "/request/bin");
+
+    wanted.env.remove("PATH");
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert!(!request.envs.contains_key("PATH"));
+}
+
+#[test]
+fn default_image_keeps_existing_profile_path_precedence() {
+    let mut profile = image_environment();
+    profile.env.insert("PATH".into(), "/profile/bin".into());
+    let config = Config {
+        runtime_profile: Some(profile.clone()),
+        ..Default::default()
+    };
+    let mut wanted = spec("");
+    wanted.runtime_profile = Some(profile);
+    wanted.env.insert("PATH".into(), "/user/bin".into());
+
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert_eq!(request.envs["PATH"], "/profile/bin");
+}
+
+#[test]
 fn default_rootfs_uses_local_artifact_without_bootstrap_mount() {
     let config = Config {
         runtime_profile: Some(runtime_profile()),
@@ -56,11 +137,14 @@ fn default_rootfs_uses_local_artifact_without_bootstrap_mount() {
 
 #[test]
 fn runtime_and_readonly_overlay_reuses_the_deployment_root_without_bootstrap_mount() {
+    let mut profile = runtime_profile();
+    profile.env.insert("PATH".into(), "/profile/bin".into());
     let config = Config {
-        runtime_profile: Some(runtime_profile()),
+        runtime_profile: Some(profile.clone()),
         ..Default::default()
     };
     let mut wanted = spec("");
+    wanted.runtime_profile = Some(profile);
     wanted.runtime_class = "firecracker".into();
     let rootfs = &mut wanted.runtime_profile.as_mut().unwrap().rootfs;
     rootfs.runtime_class = "firecracker".into();
@@ -77,6 +161,7 @@ fn runtime_and_readonly_overlay_reuses_the_deployment_root_without_bootstrap_mou
         ))
     );
     assert!(request.mounts.is_empty());
+    assert_eq!(request.envs["PATH"], "/profile/bin");
 }
 
 #[test]
@@ -165,11 +250,14 @@ fn custom_rootfs_mounts_the_oci_runtime_image_read_only() {
 fn s3_rootfs_mounts_the_configured_environment() {
     use adx_core::execution::{Rootfs, S3Source, StorageSource};
 
+    let mut profile = runtime_profile();
+    profile.env.insert("PATH".into(), "/profile/bin".into());
     let config = Config {
-        runtime_profile: Some(runtime_profile()),
+        runtime_profile: Some(profile.clone()),
         ..Default::default()
     };
     let mut wanted = spec("");
+    wanted.runtime_profile = Some(profile);
     wanted.execution.rootfs = Some(Rootfs {
         readonly: false,
         source: StorageSource::S3(S3Source {
@@ -188,6 +276,11 @@ fn s3_rootfs_mounts_the_configured_environment() {
     assert_eq!(request.mounts.len(), 1);
     assert_eq!(request.mounts[0].target, "/__adx");
     assert_eq!(request.command, runtime_profile().bootstrap.entrypoint);
+    assert!(!request.envs.contains_key("PATH"));
+
+    wanted.env.insert("PATH".into(), String::new());
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert_eq!(request.envs["PATH"], "");
 }
 
 #[test]
@@ -211,12 +304,15 @@ fn registered_local_template_keeps_image_environment_and_execd_bootstrap() {
         serde_json::from_value(json!({"path":"/var/lib/agentos/local-images/tools/rootfs",
         "env":{"PATH":"/image/bin", "IMAGE_VALUE":"default"}}))
         .unwrap();
+    let mut profile = runtime_profile();
+    profile.env.insert("PATH".into(), "/profile/bin".into());
     let config = Config {
-        runtime_profile: Some(runtime_profile()),
+        runtime_profile: Some(profile.clone()),
         local_rootfs_templates: [("tools".into(), template)].into_iter().collect(),
         ..Default::default()
     };
     let mut wanted = spec("");
+    wanted.runtime_profile = Some(profile);
     wanted.env.insert("IMAGE_VALUE".into(), "request".into());
     wanted.execution.rootfs = Some(Rootfs {
         readonly: false,
@@ -231,4 +327,8 @@ fn registered_local_template_keeps_image_environment_and_execd_bootstrap() {
     assert_eq!(request.envs["IMAGE_VALUE"], "request");
     assert!(request.mounts.iter().any(|mount| mount.target == "/__adx"));
     assert_eq!(request.command, runtime_profile().bootstrap.entrypoint);
+
+    wanted.env.insert("PATH".into(), String::new());
+    let request = start_request(&wanted, "local-1", 1, &[], &config).unwrap();
+    assert_eq!(request.envs["PATH"], "");
 }

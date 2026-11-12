@@ -14,6 +14,9 @@ RPC retains its configured transport security.
 
 [OpenAPI contract](../../platform/api/openapi/autoscaling.yaml)
 
+The same isolated listener supports [node-upgrade management](../../platform/api/http/node-upgrades.md).
+Scheduling pause remains separate from execution fencing and strict empty evidence.
+
 ## Requests
 
 | Method | Path | Purpose |
@@ -67,8 +70,43 @@ POST returns `{"status":"evicting","message":"success"}`. DELETE returns
 requested administrative state. DELETE does not override pressure, expired
 heartbeats or reconciliation admission.
 
-Administrative pause survives heartbeats. New central allocations and local-first
-ownership claims exclude the paused node. Manual resume and traffic-triggered
+Administrative pause survives heartbeats and process restarts on the same host.
+Adxlet reports a valid Linux DMI product UUID as the reserved
+`ADX_NODE_HOST_UUID` registration label. A new session with a different known
+host UUID under the same node ID clears the previous host's administrative pause.
+If either host UUID is unavailable or both UUIDs are equal, Coordinator
+preserves the existing pause.
+An upgrade task keeps its own pause until it releases the node. The normal
+heartbeat and reconciliation checks still govern admission.
+
+The identity check requires firmware or a hypervisor that supplies a unique
+SMBIOS product UUID and a Linux kernel that exposes it at
+`/sys/class/dmi/id/product_uuid`. The Linux package architecture (amd64 or arm64)
+does not by itself guarantee availability. An adxlet container must see the
+worker host's DMI sysfs entry and have permission to read it; Linux normally
+exposes this file with mode `0400`. Check visibility and permissions from the
+same execution context as adxlet before relying on automatic pause reset.
+
+On Linux amd64 ECS, validation confirmed that the worker container reads the
+same UUID as kubelet and that sampled ECS instances have distinct UUIDs. A
+historical node-name reuse had a different ECS provider ID and UUID. The Redis
+regression tests cover an adxlet process restart and replacement with a
+different UUID. Guest reboot persistence depends on the firmware or hypervisor
+and should be qualified for each deployment; the ECS tests did not reboot a VM.
+
+If the file is unreadable or its value is malformed or a placeholder, adxlet
+logs `worker host UUID unavailable` at startup and registers without the
+label. On a new session whose pause is retained, Coordinator logs
+`host_identity_unavailable` or `host_uuid_unchanged`. The latter can mean a
+restart of the same host or duplicate UUIDs. Use the infrastructure instance ID
+to distinguish them. After independently confirming the current instance is a
+replacement and has no intentional maintenance pause, use the existing DELETE
+endpoint above for that node and verify its `accepting_allocations` status with
+the Environment query. Fix unreadable sysfs or duplicate firmware identity
+before expecting automatic pause reset on future replacements.
+
+New central allocations and local-first ownership claims exclude the paused
+node. Manual resume and traffic-triggered
 wake wait while the original node is administratively paused; removing the pause
 allows the existing pending demand to proceed. Existing Running Environments
 continue serving traffic.

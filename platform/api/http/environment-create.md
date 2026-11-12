@@ -1,6 +1,11 @@
 # Environment create ownership
 
 Omit the image and rootfs source to use the deployment-owned default rootfs.
+On sandboxd, an explicitly selected rootfs skips the built-in profile's
+`PATH`. An explicit `env.PATH` sets the request value, subject to a node
+override. For an OCI image with no request or node override, sandboxd uses
+the image's `PATH` if present and otherwise its runtime template.
+
 An explicit `process.commands` starts a managed workload independently of OCI
 entrypoint inheritance, including on a local EROFS rootfs. Its optional user and
 working directory default to the Execd identity and `/`; readiness and healthcheck

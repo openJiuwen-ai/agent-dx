@@ -1,5 +1,7 @@
 # 本地双节点 Firecracker 恢复验收
 
+本页保留既有驱动与历史证据。当前通用跨节点准入要求捕获时的可验证兼容信息，现有采集仅开放默认 rootfs 的 runsc；Firecracker 尚未接入该证据采集，当前版本会安全拒绝其跨节点恢复，不能沿用下文历史通过结论作为当前准出。详见[当前配置边界](../../build/config/examples/README.md)。
+
 `build/e2e/firecracker/transfer.py` 在专用 Linux KVM 主机上启动两套独立的 sandboxd、adxlet及内嵌Relay。两节点使用独立网络命名空间、不同IP池、Unix Socket、cgroup根目录和运行目录；sandboxd具有私有挂载视图，对端运行目录被空目录遮蔽，不能直接读取源节点文件；共享Coordinator、Redis、MinIO与SDK入口。
 
 这可以验证真实执行后端的跨节点归属转移、checkpoint搬运和路由切换，但不是独立物理机/VM故障域，也不能代表正式Kubernetes验收。源节点故障通过暂停其adxlet进程注入，sandboxd及旧实例保持实际存在，随后恢复adxlet以检查旧执行清理。

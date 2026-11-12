@@ -359,7 +359,7 @@ message CheckpointArtifact { string storage = 1; string location = 2; uint64 siz
 
 message RuntimeIdentity { string environment_id = 1; string runtime_id = 2; uint64 ownership_generation = 3; }
 
-message RestorePoint { RuntimeIdentity origin = 5; string id = 1; CheckpointArtifact artifact = 2; optional uint64 expires_at_unix_seconds = 3; string source_runtime_id = 4; }
+message RestorePoint { RuntimeIdentity origin = 5; string id = 1; CheckpointArtifact artifact = 2; optional uint64 expires_at_unix_seconds = 3; string source_runtime_id = 4; map<string,string> recovery_profile = 6; }
 
 enum LifecycleKind { LIFECYCLE_KIND_UNSPECIFIED = 0; LIFECYCLE_KIND_PAUSE = 1; LIFECYCLE_KIND_RESUME = 2; LIFECYCLE_KIND_SNAPSHOT = 3; LIFECYCLE_KIND_NETWORK = 4; LIFECYCLE_KIND_RELOAD = 5; }
 

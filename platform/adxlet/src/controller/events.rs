@@ -394,7 +394,7 @@ impl Controller {
                 Error::Unavailable("idle barrier requires runtime control".into())
             })?;
         control.reopen_idle(&self.record).await?;
-        self.services.routes.reopen(&self.record).await?;
+        self.services.reopen_route(&self.record).await?;
         self.events.reopen_idle = false;
         Ok(())
     }

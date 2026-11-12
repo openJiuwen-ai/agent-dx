@@ -52,11 +52,11 @@ fn durable_recovery_spec_accepts_claim_without_changing_assignment_or_reservatio
     let placement_snapshot = coordinator.snapshot();
     assert_ne!(placement_snapshot.environments()[&spec.id].spec, spec);
     coordinator
-        .finish_recovery_placement(&spec, &assignment)
+        .finish_recovery_placement(&spec, &assignment, true)
         .unwrap();
     coordinator.accept_claim(&spec, &assignment).unwrap();
     coordinator
-        .finish_recovery_placement(&spec, &assignment)
+        .finish_recovery_placement(&spec, &assignment, true)
         .unwrap();
     assert_eq!(coordinator.snapshot().environments()[&spec.id].spec, spec);
     assert_ne!(placement_snapshot.environments()[&spec.id].spec, spec);
@@ -80,19 +80,19 @@ fn recovery_placement_rejects_changed_identity_without_mutating_reservations() {
     let mut changed_spec = spec.clone();
     changed_spec.resources.cpu_millis += 1;
     assert_eq!(
-        coordinator.finish_recovery_placement(&changed_spec, &assignment),
+        coordinator.finish_recovery_placement(&changed_spec, &assignment, true),
         Err(Error::Conflict)
     );
     changed_spec = spec.clone();
     changed_spec.image = "different-image".into();
     assert_eq!(
-        coordinator.finish_recovery_placement(&changed_spec, &assignment),
+        coordinator.finish_recovery_placement(&changed_spec, &assignment, true),
         Err(Error::Conflict)
     );
     let mut changed_assignment = assignment.clone();
     changed_assignment.generation += 1;
     assert_eq!(
-        coordinator.finish_recovery_placement(&spec, &changed_assignment),
+        coordinator.finish_recovery_placement(&spec, &changed_assignment, true),
         Err(Error::Conflict)
     );
     assert_eq!(coordinator.snapshot().revision, snapshot.revision);
@@ -106,5 +106,18 @@ fn recovery_placement_rejects_changed_identity_without_mutating_reservations() {
     assert_eq!(
         coordinator.accept_claim(&spec, &assignment),
         Err(Error::Conflict)
+    );
+}
+
+#[test]
+fn paused_recovery_releases_the_temporary_placement_reservation() {
+    let (mut coordinator, spec, assignment) = placed_recovery();
+    coordinator
+        .finish_recovery_placement(&spec, &assignment, false)
+        .unwrap();
+    assert!(!coordinator.snapshot().environments().contains_key(&spec.id));
+    assert_eq!(
+        coordinator.node_resources("target").unwrap().1,
+        spec.resources
     );
 }

@@ -4,7 +4,7 @@ use tokio_postgres::{config::SslMode, Row};
 
 #[derive(Clone)]
 pub struct AccountStore {
-    pool: Pool,
+    pub(super) pool: Pool,
 }
 pub(crate) struct CredentialRecord {
     pub encrypted_key: Vec<u8>,

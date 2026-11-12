@@ -1,7 +1,7 @@
 use adx_coordinator::{
     auth::{AuthRpc, Credential},
     rpc::CoordinatorRpc,
-    storage::RedisStore,
+    storage::{LegacyCheckpointProofs, RedisStore},
     Placement,
 };
 use adx_core::Error;
@@ -24,6 +24,8 @@ struct Config {
     storage_domains: std::collections::BTreeMap<String, adx_core::volumes::StorageDomain>,
     #[serde(default)]
     checkpoint_reclaimers: Vec<adx_checkpoint_storage::reclaim::ReclaimerConfig>,
+    #[serde(default)]
+    legacy_checkpoint_proofs: LegacyCheckpointProofs,
     listen: SocketAddr,
     #[serde(default)]
     metrics_listen: Option<SocketAddr>,
@@ -120,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => return Err(error.into()),
         }
     };
+    let session = session.with_legacy_checkpoint_proofs(config.legacy_checkpoint_proofs);
     let mut administrators = Vec::new();
     let mut tenants = Vec::new();
     for credential in config.bootstrap_credentials {

@@ -36,6 +36,9 @@ services:
         key_file: /opt/adx/data/runtime-control-key
       execd_env: {}
       checkpoint_dir: /opt/adx/data/checkpoints
+      # Cross-node recovery: declare the exact runsc executable used by sandboxd.
+      # checkpoint_runtime_binaries:
+      #   runsc: /usr/local/bin/runsc
       resource_source:
         kind: auto
         disk_path: /opt/adx/data
