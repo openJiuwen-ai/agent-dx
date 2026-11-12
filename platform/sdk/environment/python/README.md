@@ -882,3 +882,16 @@ without an image or template keep using the deployment's default rootfs.
 SDK 0.1.0rc6 wakes command-watch subscriptions immediately when local waiters change,
 without a periodic receive timeout. Terminal events continue to trigger an authoritative
 result read; reconnects replay current command states.
+
+## Portable workspace mounts
+
+For a runsc workspace backed by a host or Volume bind, callers may explicitly use
+`options=("rw", "disable_file_handle_sharing")`. ADXlet observes the prepared source
+on the execution node and normalizes only that explicitly requested option in the
+sandboxd request. Local sources retain one copy; NFS/FUSE sources let runsc append
+one copy. This temporary compatibility workaround for the pinned runsc preserves
+effective options across local-owner and remote-NFS restore without changing the
+stored Environment specification. Unmarked mounts and other runtimes are unchanged.
+Source observation failure or an unresolved autofs mount fails creation/restore;
+the node and sandboxd must share the same source-path mount view. Existing snapshots
+retain their captured options and must be checked before changing their mount policy.

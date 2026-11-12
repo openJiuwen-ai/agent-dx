@@ -431,6 +431,15 @@ Each mount requires exactly one nonempty `image_url`, `s3_config`, or `host_path
 The request maps to `StorageSource::Local`, then sandboxd HostPath, preserving mount options. The source must exist in the runtime's mount namespace with suitable permissions. This endpoint does not mount SFS, authorize per-tenant host paths, or coordinate multiple sandboxes using the same directory. Source-directory creation requires the explicit flag described below. Expose arbitrary host-path creation only to trusted management callers until deployment-specific path authorization is provided. User sandboxes do not need CAP_SYS_ADMIN for this node-side operation. Component contract tests do not establish runsc/SFS writeback or SQLite recovery guarantees.
 
 
+For runsc host/Volume bind mounts, callers may explicitly request
+`options: ["rw", "disable_file_handle_sharing"]`. ADXlet temporarily normalizes
+only this requested option in the node-to-sandboxd request: one copy for local
+sources, no input copy for NFS/FUSE where the pinned runsc automatically adds it.
+The persisted spec is unchanged. This workaround is removable once runsc's
+automatic append is idempotent; it is not enabled for unmarked mounts or other
+runtimes. Failure to observe a prepared source, including unresolved autofs,
+fails creation/restore rather than guessing its filesystem type.
+
 `create_if_missing` is an optional boolean on each mount (default `false`). It is
 accepted only for Local bind sources; other sources/types return InvalidArgument.
 Activator forwards it with the rendered path. Environment storage and RPC retain
