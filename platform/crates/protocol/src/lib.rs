@@ -374,6 +374,8 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
             adx_core::EnvironmentState::Failed => control::EnvironmentState::Failed,
         };
         Ok(Self {
+            // Filled from Coordinator-owned creation metadata on public reads/CREATE.
+            creation_request_id: String::new(),
             spec: Some(v.spec.into()),
             assignment: Some(v.assignment.try_into()?),
             state: state as i32,

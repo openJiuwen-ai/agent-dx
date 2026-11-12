@@ -282,15 +282,16 @@ impl AgentState {
         Ok(())
     }
 
-    /// Defer the saved creation attempt. Only a confirmed pre-assignment cancellation
-    /// may set `cancelled`; an active previous Env observation keeps the request identity.
+    /// Defer the saved creation attempt. Advance only after confirmed pre-assignment
+    /// cancellation, or a terminal CREATE with the old Environment confirmed absent.
+    /// An active previous Env or unknown outcome keeps the request identity.
     /// Changed lifecycles/references return Conflict; an advanced attempt is reused.
     pub async fn defer_creation(
         &self,
         saved: &AgentBinding,
         environment: &EnvironmentRef,
         expected: &adx_agent_core::CreationAttempt,
-        cancelled: bool,
+        advance_attempt: bool,
         now_unix_ms: u64,
     ) -> Result<AgentBinding> {
         let key = binding_key(&saved.scope)?;
@@ -318,7 +319,7 @@ impl AgentState {
             if current != *expected {
                 return Ok(binding);
             }
-            let number = if cancelled {
+            let number = if advance_attempt {
                 current
                     .number
                     .checked_add(1)

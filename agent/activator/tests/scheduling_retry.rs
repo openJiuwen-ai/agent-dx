@@ -19,6 +19,7 @@ struct Platform {
     records: Mutex<BTreeMap<String, EnvironmentObservation>>,
     creates: Mutex<Vec<CreateEnvironment>>,
     errors: Mutex<VecDeque<EnvironmentError>>,
+    after_create: Mutex<Option<EnvironmentObservation>>,
 }
 fn observed(id: &str, phase: EnvironmentPhase) -> EnvironmentObservation {
     EnvironmentObservation {
@@ -49,6 +50,9 @@ impl Environment for Platform {
     ) -> Result<EnvironmentObservation, EnvironmentError> {
         self.creates.lock().unwrap().push(r.clone());
         if let Some(error) = self.errors.lock().unwrap().pop_front() {
+            if let Some(record) = self.after_create.lock().unwrap().take() {
+                self.records.lock().unwrap().insert(r.id.clone(), record);
+            }
             if matches!(error, EnvironmentError::OutcomeUnknown(_)) {
                 self.records
                     .lock()
@@ -439,5 +443,54 @@ async fn candidate_creation_waits_for_previous_pause_for_every_volume_mode() {
             "waiting is not a cancelled creation"
         );
         assert_eq!(calls[0].id, f.candidate.environment_id);
+    }
+}
+
+#[tokio::test]
+async fn terminal_create_advances_only_after_confirmed_absence() {
+    for reappears in [false, true] {
+        let f = Fixture::new(Some("exclusive")).await;
+        f.platform.records.lock().unwrap().insert(
+            f.binding.current.environment_id.clone(),
+            observed(&f.binding.current.environment_id, EnvironmentPhase::Paused),
+        );
+        f.platform
+            .errors
+            .lock()
+            .unwrap()
+            .push_back(EnvironmentError::Conflict(
+                adx_error::CREATE_TERMINAL_MESSAGE.into(),
+            ));
+        if reappears {
+            *f.platform.after_create.lock().unwrap() = Some(observed(
+                &f.candidate.environment_id,
+                EnvironmentPhase::Running,
+            ));
+        }
+        let result = f.reconcile().await;
+        let saved = f.state.binding(&f.scope).await.unwrap().unwrap();
+        assert_eq!(saved.generation, f.binding.generation);
+        assert_eq!(saved.current, f.binding.current);
+        assert_eq!(saved.secondary, f.binding.secondary);
+        if reappears {
+            assert!(matches!(result, Err(Error::Conflict(_))));
+            assert!(saved.creation_attempts.is_empty());
+            continue;
+        }
+        assert!(matches!(result, Err(Error::CreationDeferred { .. })));
+        let attempt = &saved.creation_attempts[&f.candidate.environment_id];
+        assert_eq!((attempt.number, attempt.backoff_seconds), (1, 5));
+        f.due().await;
+        f.reconcile().await.unwrap();
+        let restored = f.state.binding(&f.scope).await.unwrap().unwrap();
+        assert_eq!(restored.volumes, saved.volumes);
+        let calls = f.platform.creates.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, calls[1].id);
+        assert_eq!(calls[0].execution, calls[1].execution);
+        assert_eq!(
+            (calls[0].creation_attempt, calls[1].creation_attempt),
+            (0, 1)
+        );
     }
 }

@@ -250,6 +250,17 @@ impl HttpEnvironment {
             body.extend_from_slice(&chunk);
         }
         if !status.is_success() {
+            if create && status == StatusCode::CONFLICT {
+                if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+                    let request_id =
+                        environment_request::creation_operation_id(tenant, id, creation_attempt)?;
+                    if environment_request::terminal_creation(&value, id, &request_id) {
+                        return Err(EnvironmentError::Conflict(
+                            adx_error::CREATE_TERMINAL_MESSAGE.into(),
+                        ));
+                    }
+                }
+            }
             if create && status == StatusCode::GATEWAY_TIMEOUT {
                 if let Ok(value) = serde_json::from_slice::<Value>(&body) {
                     if let Some(error) = environment_request::scheduling_cancellation(&value) {

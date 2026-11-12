@@ -156,6 +156,8 @@ message GetEnvironmentResponse {
 }
 
 message StartAssignedEnvironmentRequest {
+  // Preserve the creation identity in the node's CREATE response.
+  string creation_request_id = 6;
   ReusableSnapshot snapshot = 4;
   EnvironmentSpec spec = 1;
   Assignment assignment = 2;

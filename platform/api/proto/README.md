@@ -188,8 +188,56 @@ CreateEnvironmentRequest and ClaimEnvironmentRequest carry request_id for tenant
 identity replay. The first successful publication atomically binds the success receipt;
 ordinary central and local reservations remain in memory. EnvironmentResult.newly_created is true
 only for the actual initial start operation; replay, reuse, resume and recovery return false.
+EnvironmentRecord.creation_request_id carries the current Env's original creation
+request, from Coordinator-owned CreationSummary. CREATE, GetEnvironment and the
+existing directory stream carry it with the current record. StartAssignedEnvironmentRequest
+passes the same identity to adxlet so central and local-first CREATE return it
+without an additional lookup. Node lifecycle commits cannot replace this metadata.
+Successful receipts bind incoming request IDs to Env names; replay resolves the
+current tenant-owned record, including same-name recreation. Assignment generation
+continues to fence execution, not to classify CREATE replay as terminal.
 EnvironmentRecord.observation carries bounded initial-create stage, normal-operation intent
 and old-execution interruption evidence through journal/replay and final Running publication.
 Coordinator retains its latest interruption/recovery summary in the Redis env record.
-All participating components must use matching generated contracts. See the
+Outside the creation-ID cutover below, participating components use matching generated contracts. See the
 [metric and persistence contract](../../../docs/testing/sandbox-observability.md).
+
+## Rolling out creation request IDs
+
+The creation-ID addition supports a new Coordinator with old adxlet nodes on the
+central CREATE path. A missing node response ID is filled from the Coordinator's
+existing CreationSummary after spec, assignment, Running state and durability
+checks. A nonempty ID that differs from that summary is rejected. This adds no
+RPC. Creation IDs are derived from persisted metadata; retain Redis and node journals.
+
+Component releases are independent. A Node StatefulSet rolling update does not
+order Coordinator or API Server releases. Use this order with matching release
+artifacts, including for single-replica Recreate control-plane deployments:
+
+1. Upgrade Coordinator and wait for `kubectl rollout status deployment/coordinator`
+   to succeed. Keep API Server on its old release during this phase.
+2. Upgrade all adxlet nodes using the existing node drain/preserve procedure.
+   Wait for `kubectl rollout status statefulset/adx-node`, verify every node Pod
+   runs the target image, and verify registration and reconciliation complete.
+3. Upgrade API Server only after both gates pass; wait for
+   `kubectl rollout status deployment/apiserver`. Its local-first CREATE path
+   requires creation IDs from upgraded nodes. New API Server with old Coordinator
+   or old nodes is unsupported and can reject an empty ID with `data_loss`.
+4. Upgrade standalone Activators and verify CREATE, replay and deleted-Env recovery.
+
+Run those commands with the deployment's explicit kubeconfig, context and namespace.
+Single-replica Recreate causes a control-plane interruption; node updates also follow
+the [node lifecycle constraints](../../../docs/testing/node-lifecycle.md).
+
+If an earlier strict Coordinator rejected a node response after the Env started,
+retain the Env ID and requestId. The durable result can satisfy the same CREATE
+without starting another runtime. API Server's generic validation error remains in
+its existing 600-second cache; completing its replacement in step 3 clears that
+process-local cache. Then retry the original identity. A validation conflict is
+not the confirmed-absence terminal signal used by Activator.
+
+The Coordinator RPC regression uses real Redis/mTLS with a fixture that drops the
+new request field and omits the response ID, and also checks nonempty mismatches
+and recovery by replay. The API replay test covers service replacement after a
+cached validation error. These verify wire behavior and retry semantics, not a
+mixed-release binary deployment or Kubernetes upgrade.

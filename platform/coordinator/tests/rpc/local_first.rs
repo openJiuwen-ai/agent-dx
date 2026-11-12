@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "create_identity.rs"]
+mod create_identity;
+
 #[tokio::test]
 #[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
 async fn live_inspection_accepts_open_admission_but_requires_a_current_session() {
@@ -156,6 +159,7 @@ struct Rig {
     sinks: Vec<Arc<CoordinatorStateSink>>,
     address: std::net::SocketAddr,
     registrations: Vec<pb::RegisterNodeRequest>,
+    node_creation_identity: Arc<Mutex<Option<String>>>,
 }
 impl Rig {
     async fn new() -> Self {
@@ -219,6 +223,7 @@ impl Rig {
             sinks: vec![],
             address: ma,
             registrations: vec![],
+            node_creation_identity: Arc::default(),
         };
         for (id, cert) in [("a", "node"), ("b", "ingress")] {
             rig.add_node(id, cert).await;
@@ -255,11 +260,15 @@ impl Rig {
         self.node_rpcs.push(node.clone());
         let nl = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let na = nl.local_addr().unwrap();
+        let node = create_identity::NodeResponse {
+            node,
+            identity: self.node_creation_identity.clone(),
+        };
         self._servers.0.push(tokio::spawn(async move {
             Server::builder()
                 .tls_config(server_tls(cert))
                 .unwrap()
-                .add_service(pb::node_service_server::NodeServiceServer::new(node))
+                .add_service(node)
                 .serve_with_incoming(TcpListenerStream::new(nl))
                 .await
                 .unwrap();
@@ -1089,6 +1098,31 @@ async fn environment_directory_streams_full_then_incremental_ownership() {
     );
     assert!(!upsert.node_address.is_empty());
     assert!(!upsert.relay_address.is_empty());
+    let creator = Rig::request("directory-case", 0).create.unwrap().request_id;
+    assert_eq!(created.creation_request_id, creator);
+    assert_eq!(upsert.record.as_ref().unwrap().creation_request_id, creator);
+    let mut reuse = Rig::request("directory-case", 0);
+    reuse.create.as_mut().unwrap().request_id = "directory-reuse".into();
+    let reused = rig.nodes[0]
+        .create_local_environment(reuse)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!reused.newly_created);
+    assert_eq!(reused.record.unwrap().creation_request_id, creator);
+    let queried = rig
+        .coordinator
+        .get_environment(pb::GetEnvironmentRequest {
+            environment_id: "directory-case".into(),
+            caller: Some(pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(queried.record.unwrap().creation_request_id, creator);
 
     rig.delete(&created).await;
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -2164,6 +2198,7 @@ async fn central_requests_converge_by_request_or_environment_identity() {
         records.push(task.await.unwrap());
     }
     assert!(records.iter().all(|record| record == &records[0]));
+    assert_eq!(records[0].creation_request_id, "one-public-operation");
     let mut retry = create(&records[0].spec.as_ref().unwrap().id);
     retry.request_id = "another-public-operation".into();
     retry.spec.as_mut().unwrap().image = "different-image".into();
@@ -2323,7 +2358,7 @@ async fn coordinator_restart_reclaims_unconfirmed_runtime_before_reassignment() 
 
 #[tokio::test]
 #[ignore = "requires isolated Redis and mTLS; run control-rpc suite"]
-async fn central_recreation_retires_a_deleted_result_missing_from_its_cache() {
+async fn central_create_replay_returns_current_environment_after_same_name_recreation() {
     let mut rig = Rig::new().await;
     let mut first = create("reuse-deleted");
     first.request_id = "old-success".into();
@@ -2368,7 +2403,21 @@ async fn central_recreation_retires_a_deleted_result_missing_from_its_cache() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(old.state, adx_core::EnvironmentState::Deleted);
+    assert_eq!(old.state, adx_core::EnvironmentState::Running);
+    assert_eq!(recreated.creation_request_id, "new-success");
+    // Old and fresh caller IDs both return the current Env creation identity.
+    for request_id in ["old-success", "another-caller"] {
+        let mut request = create("reuse-deleted");
+        request.request_id = request_id.into();
+        let replay = rig
+            .coordinator
+            .create_environment(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!replay.newly_created);
+        assert_eq!(replay.record.unwrap(), recreated);
+    }
     assert_eq!(
         rig.session
             .get("reuse-deleted")

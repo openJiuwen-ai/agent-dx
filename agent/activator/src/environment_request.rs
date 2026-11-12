@@ -107,6 +107,7 @@ pub fn create_input(
         "inheritEntrypoint":true, "env":execution.env,
         "ports":execution.service.iter().map(|service| service.port.to_string()).collect::<std::collections::BTreeSet<_>>(),
         "createTimeoutSeconds":timeout.as_secs().max(1),
+        "restartPolicy":{"maxAttempts":3,"initialBackoffSeconds":5,"maxBackoffSeconds":60},
     });
     if network.runtime_policies.get(&execution.isolation_runtime)
         != Some(&RuntimeNetworkPolicy::Unrestricted)
@@ -202,6 +203,16 @@ pub(crate) fn scheduling_cancellation(value: &Value) -> Option<EnvironmentError>
     let failure: adx_core::scheduling::SchedulingFailure =
         serde_json::from_value(error.get("schedulingFailure")?.clone()).ok()?;
     Some(EnvironmentError::SchedulingCancelled(Box::new(failure)))
+}
+
+pub(crate) fn terminal_creation(value: &Value, id: &str, request_id: &str) -> bool {
+    let error = &value["error"];
+    value["message"] == adx_error::CREATE_TERMINAL_MESSAGE
+        && error["code"] == "CONFLICT"
+        && error["retry"] == "never"
+        && error["outcome"] == "not_started"
+        && error["environmentId"] == id
+        && error["requestId"] == request_id
 }
 
 pub(crate) fn created(

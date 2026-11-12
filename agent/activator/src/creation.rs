@@ -1,5 +1,5 @@
-//! Creation retries retain the saved Env identity. Only confirmed queue cancellation
-//! advances the persisted request attempt; ambiguous writes keep their original identity.
+//! Creation retries retain the saved Env identity. Confirmed queue cancellation or
+//! terminal creation plus absence advances the request; unknown outcomes retain it.
 use super::*;
 use adx_agent_core::{
     environment::{CreateEnvironment, ExecutionSpec},
@@ -39,7 +39,7 @@ impl Activator {
         binding: &AgentBinding,
         environment: &EnvironmentRef,
         attempt: &adx_agent_core::CreationAttempt,
-        cancelled: bool,
+        advance_attempt: bool,
     ) -> Result<EnvironmentObservation> {
         let saved = self
             .state
@@ -47,7 +47,7 @@ impl Activator {
                 binding,
                 environment,
                 attempt,
-                cancelled,
+                advance_attempt,
                 adx_agent_core::unix_time_millis(),
             )
             .await?;
@@ -186,6 +186,7 @@ impl Activator {
                         );
                     }
                 }
+                // The Environment API validates cached success before replaying it.
                 self.environment
                     .create(&CreateEnvironment {
                         id: environment.environment_id.clone(),
@@ -216,8 +217,46 @@ impl Activator {
                         .await
                 }
                 Err(EnvironmentError::SchedulingCancelled(failure)) => {
-                    tracing::debug!(environment_id = %environment.environment_id, attempt = attempt.number,
-                        ?failure, "creation queue cancelled before assignment; deferring the next attempt");
+                    tracing::debug!(
+                        environment_id = %environment.environment_id,
+                        attempt = attempt.number,
+                        ?failure,
+                        "creation queue cancelled before assignment; deferring the next attempt"
+                    );
+                    return self
+                        .defer_creation(&saved, environment, &attempt, true)
+                        .await;
+                }
+                Err(EnvironmentError::Conflict(reason))
+                    if reason == adx_error::CREATE_TERMINAL_MESSAGE =>
+                {
+                    // Neither GET 404 nor an arbitrary 409 permits another request.
+                    // The original CREATE must be confirmed terminal, and the
+                    // current public identity must still be absent.
+                    let confirmation = tokio::time::timeout_at(
+                        deadline_at,
+                        self.environment
+                            .get(&binding.scope.tenant, &environment.environment_id),
+                    )
+                    .await
+                    .map_err(|_| {
+                        Error::OutcomeUnknown(
+                            "terminal CREATE confirmation timed out; retain request identity"
+                                .into(),
+                        )
+                    })??;
+                    if confirmation.is_some() {
+                        return Err(Error::Conflict(
+                            "terminal CREATE still has an Env; retain request identity".into(),
+                        ));
+                    }
+                    // The persisted number identifies requests across the Env's lifetime,
+                    // including queue cancellations; it is not a recovery retry budget.
+                    tracing::warn!(
+                        environment_id = %environment.environment_id,
+                        attempt = attempt.number,
+                        "terminal CREATE confirmed and Env absent; advancing request identity"
+                    );
                     return self
                         .defer_creation(&saved, environment, &attempt, true)
                         .await;

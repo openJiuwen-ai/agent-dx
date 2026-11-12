@@ -15,12 +15,20 @@ JSON inside the normal response envelope, or as the final SSE event:
 {"environmentId":"tenant-worker","status":"running","requestId":"create-request","newlyCreated":true}
 ```
 
+`requestId` identifies the request that created the **current Env**. If R1 created
+an Env, CREATE with R2 returns the existing Env with `requestId: R1`. If the Env
+is deleted and recreated by R3, replaying R1 returns the current Env with
+`requestId: R3`. Takeover to another node preserves the Env's creation request ID.
+Error objects and the SSE `accepted` event still identify the incoming request.
+A Running result with no creation request ID is malformed and returns an internal
+data error instead of a successful response with an empty ID.
+
 `newlyCreated` comes from the node's creation result. It is true only when that
-logical create confirms a new instance, and false when an existing successful
-Environment ID or Request ID supplies a reused result. A cached response for
-the same logical request retains its original ownership bit. Recovery after a
-lost response may conservatively return false. `requestId` echoes the current
-request and is not evidence of creation ownership.
+logical create confirms a new instance, and false when reusing an existing Env.
+A cached response retains its original ownership bit while returning the same
+Env creation identity; a replacement Env returns false. Recovery after a lost
+response may conservatively return false. The creation request ID alone is not
+evidence that this caller owns initialization rollback.
 
 Clients may automatically delete during local initialization rollback only
 when `newlyCreated` is exactly boolean true. Reuse, attachment, missing or
@@ -31,8 +39,10 @@ Successful Request ID receipts are scoped to the tenant and retained in Redis fo
 600 seconds from their first publication. Replays do not extend that deadline;
 Redis and Coordinator restarts preserve it. After expiry, the Request ID alone
 no longer identifies an earlier creation. An existing Environment ID still
-reuses its current result; if the earlier Environment was deleted, a request
-after the replay window can create a new Environment. Receipt expiry does not
+reuses its current result, even when the receipt points to an older lifetime of
+the same name. While the receipt is valid, confirmed absence returns a terminal
+result and the caller uses a new request ID to create again. After expiry, the
+same request ID may create a new Environment. Receipt expiry does not
 delete an Environment or release its resources.
 
 Reusable snapshot restores inherit scheduling reservations and execution limits

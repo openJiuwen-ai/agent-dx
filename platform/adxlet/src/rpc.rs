@@ -128,6 +128,16 @@ fn creation_error(handle: &crate::EnvironmentHandle, error: Error) -> Status {
     }
     status
 }
+fn create_response(
+    result: crate::OperationResult,
+    creation_request_id: String,
+) -> Result<Response<pb::EnvironmentResult>> {
+    let mut response = response(result)?;
+    if let Some(record) = response.get_mut().record.as_mut() {
+        record.creation_request_id = creation_request_id;
+    }
+    Ok(response)
+}
 fn response(result: crate::OperationResult) -> Result<Response<pb::EnvironmentResult>> {
     adx_observability::info!(event="environment_operation_completed", traceparent=?adx_observability::trace::traceparent(), environment_id=%result.record.spec.id,
         generation=result.record.assignment.generation, revision=result.record.revision,
@@ -555,7 +565,11 @@ impl pb::node_service_server::NodeService for NodeRpc {
                         None => handle.create().await,
                     },
                 };
-                response(result.map_err(|error| creation_error(&handle, error))?).map_err(status)
+                create_response(
+                    result.map_err(|error| creation_error(&handle, error))?,
+                    r.creation_request_id,
+                )
+                .map_err(status)
             })
             .await
     }
