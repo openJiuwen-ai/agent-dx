@@ -561,6 +561,7 @@ impl IngressConfig {
             max_idle_connections_per_endpoint: self.backend_http_max_idle_connections_per_endpoint,
             idle_timeout: self.backend_http_idle_timeout,
             acquire_timeout: self.backend_http_acquire_timeout,
+            ..Default::default()
         }
     }
 

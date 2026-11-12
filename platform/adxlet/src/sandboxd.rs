@@ -15,6 +15,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
 use tower::service_fn;
 
+mod recovery;
 mod runsc_mounts;
 
 pub mod proto {
@@ -25,6 +26,8 @@ use proto::sandbox_service_client::SandboxServiceClient;
 #[derive(Clone)]
 pub struct Config {
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
+    /// Exact backend executable paths configured in sandboxd; never inferred from PATH.
+    pub checkpoint_runtime_binaries: BTreeMap<String, PathBuf>,
     pub local_rootfs_templates: BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
@@ -42,6 +45,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             runtime_profile: None,
+            checkpoint_runtime_binaries: BTreeMap::new(),
             local_rootfs_templates: BTreeMap::new(),
             command: vec!["/usr/local/bin/adx-execd".into()],
             env: HashMap::from([("EXECD_HTTP_PORT".into(), "50090".into())]),
@@ -70,8 +74,39 @@ type Cell = Arc<tokio::sync::Mutex<StartState>>;
 pub struct Sandboxd {
     client: SandboxServiceClient<Channel>,
     config: Config,
+    rootfs_identity: Option<crate::RuntimeRootfsIdentity>,
+    recovery_profiles: BTreeMap<String, BTreeMap<String, String>>,
     starts: Arc<Mutex<BTreeMap<String, Cell>>>,
     backend_ids: Arc<Mutex<BTreeMap<String, String>>>,
+}
+
+fn rootfs_identity(
+    profile: Option<&adx_core::runtime_profile::RuntimeProfile>,
+) -> Result<Option<crate::RuntimeRootfsIdentity>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let Some(profile) = profile.filter(|profile| profile.rootfs.r#type == "local") else {
+        return Ok(None);
+    };
+    let mut file = std::fs::File::open(&profile.rootfs.path).map_err(unavailable)?;
+    if !file.metadata().map_err(unavailable)?.is_file() {
+        return Err(Error::Invalid(
+            "runtime rootfs must be a regular file".into(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer).map_err(unavailable)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(Some(crate::RuntimeRootfsIdentity {
+        path: profile.rootfs.path.clone(),
+        sha256: format!("{:x}", digest.finalize()),
+    }))
 }
 
 fn unavailable(error: impl std::fmt::Display) -> Error {
@@ -108,6 +143,14 @@ pub async fn connect_when_ready(
 }
 
 impl Sandboxd {
+    /// Measured, immutable node-session evidence for declared recovery backends.
+    pub fn recovery_labels(&self) -> BTreeMap<String, String> {
+        self.recovery_profiles
+            .values()
+            .flat_map(|profile| profile.clone())
+            .collect()
+    }
+
     /// Discover live execution backends through sandboxd's Unix socket.
     pub async fn available_runtime_classes(&self) -> Result<Vec<String>> {
         let response = self
@@ -176,6 +219,21 @@ impl Sandboxd {
                 .map_err(|error| Error::Invalid(error.to_string()))?;
             crate::runtime_logs::RuntimeLogs::new(policy.clone()).map_err(unavailable)?;
         }
+        // Deployment rootfs files must remain immutable for the process lifetime.
+        // Hash bytes once off the async executor; a changed image requires a new session.
+        let profile = config.runtime_profile.clone();
+        let binaries = config.checkpoint_runtime_binaries.clone();
+        let (rootfs_identity, recovery_profiles) = tokio::task::spawn_blocking(move || {
+            let identity = rootfs_identity(profile.as_ref())?;
+            let default_root = profile.as_ref().is_some_and(|profile| {
+                profile.bootstrap.r#type == "erofs" && profile.bootstrap.root == profile.rootfs.path
+            });
+            let profiles =
+                recovery::profiles(identity.as_ref().filter(|_| default_root), &binaries)?;
+            Ok::<_, Error>((identity, profiles))
+        })
+        .await
+        .map_err(unavailable)??;
         let channel = Endpoint::from_static("http://localhost")
             .connect_timeout(config.rpc_timeout)
             .connect_with_connector(service_fn(move |_| {
@@ -187,6 +245,8 @@ impl Sandboxd {
         Ok(Self {
             client: SandboxServiceClient::new(channel),
             config,
+            rootfs_identity,
+            recovery_profiles,
             starts: Arc::default(),
             backend_ids: Arc::default(),
         })
@@ -1291,9 +1351,37 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
+    fn recovery_profile(&self, spec: &EnvironmentSpec) -> Result<BTreeMap<String, String>> {
+        if !spec.image.is_empty()
+            || spec.execution.rootfs.is_some()
+            || spec
+                .runtime_profile
+                .as_ref()
+                .is_some_and(|profile| Some(profile) != self.config.runtime_profile.as_ref())
+        {
+            return Ok(BTreeMap::new());
+        }
+        let Some(published) = self.recovery_profiles.get(&spec.runtime_class) else {
+            return Ok(BTreeMap::new());
+        };
+        let rootfs = rootfs_identity(self.config.runtime_profile.as_ref())?;
+        let observed =
+            recovery::profiles(rootfs.as_ref(), &self.config.checkpoint_runtime_binaries)?;
+        if observed.get(&spec.runtime_class) != Some(published) {
+            return Err(Error::Unavailable(
+                "recovery backend or host changed; a new node session is required".into(),
+            ));
+        }
+        Ok(published.clone())
+    }
+
     async fn sandbox_id(&self, runtime_id: &str) -> Option<String> {
         self.physical_id(runtime_id).await.ok().flatten()
     }
+    fn runtime_rootfs_identity(&self) -> Option<crate::RuntimeRootfsIdentity> {
+        self.rootfs_identity.clone()
+    }
+
     // Keep RuntimeDriver's conservative input retention: sandboxd can enable
     // runsc background page loading independently of adxlet configuration.
     // Firecracker also retains its caller-owned incremental memory base.
@@ -1778,6 +1866,14 @@ mod tests {
         assert!(!compatible.envs.contains_key("ADX_ENVD_GATEWAY_AUTH"));
         spec.runtime_profile = None;
         assert!(start_request(&spec, "missing-profile-1", 1, &[], &Config::default()).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let mut profile = config.runtime_profile.unwrap();
+        profile.rootfs.path = directory.path().join("root.img").to_string_lossy().into();
+        profile.bootstrap.root = profile.rootfs.path.clone();
+        std::fs::write(&profile.rootfs.path, b"first").unwrap();
+        let first = rootfs_identity(Some(&profile)).unwrap().unwrap();
+        std::fs::write(&profile.rootfs.path, b"second").unwrap();
+        assert_ne!(first, rootfs_identity(Some(&profile)).unwrap().unwrap());
     }
 
     #[test]

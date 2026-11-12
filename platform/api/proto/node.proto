@@ -15,10 +15,16 @@ service RelayService {
 message EnvironmentAdmissionRequest {
   string environment_id = 1; string runtime_id = 2; string proxy_session_id = 3;
   uint64 activity_revision = 4; bool close = 5;
+  // Explicit draining closes admission even with active streams. Planned
+  // migrations instead close only against an observed idle activity revision.
+  // Existing streams stay connected; await zero activity before retirement.
+  bool drain = 6;
+  // Fence delayed close calls after reopen and after controller reconciliation.
+  uint64 sync_epoch = 7; uint64 admission_revision = 8;
 }
 message EnvironmentAdmissionResponse { bool closed = 1; }
 message GetEnvironmentActivityRequest { string environment_id = 1; string runtime_id = 2; }
-message EnvironmentActivityState { string proxy_session_id = 1; uint64 activity_revision = 2; uint64 active_streams = 3; }
+message EnvironmentActivityState { string proxy_session_id = 1; uint64 activity_revision = 2; uint64 active_streams = 3; uint64 sync_epoch = 4; }
 message RuntimeTarget {
   string runtime_id = 1;
   string ip = 2;
@@ -40,8 +46,9 @@ message UpdateBindingRequest {
     Retired retired = 5;
   }
 }
-// Success acknowledges application, including retirement of the previous
-// binding. Identical retries succeed; older versions or conflicting payloads
+// Success acknowledges the new version and retirement of any replaced execution.
+// Renewing the same generation and target preserves streams and admission state.
+// Identical retries succeed; older versions or conflicting payloads
 // at the same version fail with FAILED_PRECONDITION. Receiver restart requires
 // authoritative reconciliation before it serves traffic.
 message UpdateBindingResponse {

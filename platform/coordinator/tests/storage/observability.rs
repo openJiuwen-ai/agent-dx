@@ -319,6 +319,7 @@ async fn worker_incident_counts_only_running_executions_once() {
                 result.resources_held = false;
                 result.runtime.ip = None;
                 result.checkpoint = Some(adx_core::RestorePoint {
+                    recovery_profile: Default::default(),
                     origin: None,
                     id: "paused".into(),
                     source_runtime_id: result.runtime.id.clone(),

@@ -43,8 +43,9 @@ cargo test --locked -p adx-coordinator --test storage checkpoint_publication_rou
 | AFS / JuiceFS / NFS（distributed_fs） | 直接写挂载目录中的独立捕获目录，逐文件同步后发布 manifest | 直接使用同一共享路径，不预下载整个制品 | Coordinator 删除共享 manifest 和目录 |
 
 每个共享后端使用稳定 `alias`。同一 alias 的所有节点与 Coordinator 必须配置同一
-存储 namespace。调度通过 `ADX_CHECKPOINT_STORAGE=<alias>` 选择兼容节点。
-S3 和共享文件系统支持跨节点恢复；本地恢复仍受源节点约束。
+存储 namespace。跨节点恢复同时核对 alias、实际后端 scope 和 checkpoint 捕获时的恢复证据；
+不能仅凭相同 alias 或一次测试恢复判断兼容。配置和当前运行时边界见
+[节点配置](../../build/config/examples/README.md)。本地恢复仍受源节点约束。
 
 ### adxlet 配置
 
@@ -63,7 +64,7 @@ S3 和共享文件系统支持跨节点恢复；本地恢复仍受源节点约�
 {"checkpoint_storage":{"kind":"distributed_fs","alias":"afs-checkpoints","mount_root":"/mnt/afs-dfs","prefix":"adx/checkpoints"}}
 ```
 
-S3 通过标准 AWS 环境变量/身份机制取得凭据。记录只保存 alias、制品 ID、大小，
+S3 通过标准 AWS 环境变量/身份机制取得凭据。制品引用保存 alias、scope、制品 ID、大小，
 不保存端点或密钥。缓存默认 500 条、50 GiB，活跃恢复/执行文件受到 pin 保护。
 上传完成并提交权威结果后，原 staging 直接进入缓存，不复制或重新下载。
 
@@ -74,7 +75,8 @@ Linux 上识别 `afs-dfs` FUSE、`fuse.juicefs` / `JuiceFS:<volume>`，或源为
 启动时固定挂载身份，每次访问检查挂载 ID、设备、来源和子目录；消失、被覆盖或重挂载时
 返回错误，不落到本地目录。重挂载后应在确认目标 namespace 正确后重启使用该挂载的 ADX 进程。
 Coordinator 也需要能访问同一 namespace；各进程可以有独立挂载路径。
-`store-id` 核验 prefix 与 alias 一致。
+`store-id` 核验 prefix 与 alias 一致；`store-scope` 原子保存该共享 namespace 的 UUID，
+捕获、节点注册和恢复使用同一 scope。不要复制后将两个已分离的 namespace 当作同一后端。
 
 JuiceFS 接入同样只配置共享路径，例如：
 

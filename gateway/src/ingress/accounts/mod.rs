@@ -1,5 +1,7 @@
 //! Business accounts and sessions. Independent of ADX tenant/service authentication.
 mod credentials;
+mod privacy_store;
+pub(crate) use privacy_store::{ExpectedRevision, PrivacyOwner, StoredPrivacyGrant};
 mod providers;
 mod store;
 use adx_agent_core::mounts::Parameters;
@@ -18,6 +20,8 @@ pub use store::AccountStore;
 pub enum Error {
     #[error("invalid login request")]
     Invalid,
+    #[error("privacy configuration revision conflict")]
+    Conflict,
     #[error("business session is invalid or expired")]
     Unauthorized,
     #[error("AGC access token is invalid, expired, or revoked")]
@@ -37,6 +41,7 @@ impl Error {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::Invalid => StatusCode::BAD_REQUEST,
+            Self::Conflict => StatusCode::CONFLICT,
             Self::Unauthorized | Self::InvalidAgcAccessToken => StatusCode::UNAUTHORIZED,
             Self::Forbidden | Self::AccountDisabled | Self::AgreementRequired => {
                 StatusCode::FORBIDDEN
@@ -47,6 +52,7 @@ impl Error {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Invalid => "INVALID_LOGIN_REQUEST",
+            Self::Conflict => "REVISION_CONFLICT",
             Self::Unauthorized => "UNAUTHORIZED",
             Self::InvalidAgcAccessToken => "INVALID_AGC_ACCESS_TOKEN",
             Self::Forbidden => "FORBIDDEN",
@@ -117,6 +123,10 @@ pub struct Principal {
 /// Called by DigitalMateGateway only. Production has no fixed-user or anonymous implementation.
 #[async_trait]
 pub trait BusinessAuth: Send + Sync {
+    /// Only the configured DigitalMate privacy service may reuse the account database pool.
+    fn privacy_store(&self) -> Option<AccountStore> {
+        None
+    }
     async fn login(&self, request: LoginRequest) -> Result<LoginResponse>;
     async fn agc_login(&self, _request: AgcLoginRequest) -> Result<LoginResponse> {
         Err(Error::Unavailable)
@@ -288,6 +298,9 @@ impl AccountService {
 }
 #[async_trait]
 impl BusinessAuth for AccountService {
+    fn privacy_store(&self) -> Option<AccountStore> {
+        Some(self.store.clone())
+    }
     async fn login(&self, request: LoginRequest) -> Result<LoginResponse> {
         if request.authorization_code.is_empty()
             || request.authorization_code.len() > 8192

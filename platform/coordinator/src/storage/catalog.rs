@@ -462,6 +462,7 @@ mod tests {
             epoch: 1,
             inspection,
             generations: Arc::new(AtomicU64::new(1_u64 << 32)),
+            legacy_checkpoint_proofs: Default::default(),
         }
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

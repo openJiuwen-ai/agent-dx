@@ -1,4 +1,4 @@
-use super::common;
+use super::{common, recovery_profile};
 use adx_coordinator::{
     storage::{NodeSession, Session},
     Node, Placement,
@@ -14,15 +14,22 @@ use adx_transport::rpc::RpcClient;
 use std::time::Duration;
 
 fn spec() -> EnvironmentSpec {
-    serde_json::from_value(serde_json::json!({
+    let mut specification = serde_json::from_value(serde_json::json!({
         "id":"review-env", "tenant_id":"tenant", "image":"image", "runtime_class":"runc",
         "priority":0, "resources":{"cpu_millis":100,"memory_bytes":128,"disk_bytes":0}
     }))
-    .unwrap()
+    .unwrap();
+    recovery_profile::qualify(&mut specification);
+    specification
 }
 async fn registered(session: &Session, id: &str) {
+    let mut labels = recovery_profile::qualify(&mut spec());
+    labels.extend([
+        ("ADX_CHECKPOINT_STORAGE".into(), "shared".into()),
+        ("ADX_CHECKPOINT_SCOPE".into(), "test-scope".into()),
+    ]);
     session
-        .register_session(
+        .register_session_with_scopes(
             Node {
                 id: id.into(),
                 capacity: Resources {
@@ -31,7 +38,7 @@ async fn registered(session: &Session, id: &str) {
                     disk_bytes: 0,
                 },
                 available: true,
-                labels: Default::default(),
+                labels,
                 devices: vec![],
                 runtime_classes: vec!["runc".into()],
             },
@@ -42,6 +49,7 @@ async fn registered(session: &Session, id: &str) {
                 sequence: 1,
                 routable: true,
             }),
+            ["test-scope".into()].into(),
         )
         .await
         .unwrap();
@@ -82,12 +90,13 @@ async fn receipt_follows_recovered_environment() {
     registered(&session, "target").await;
     let mut first = running();
     first.checkpoint = Some(adx_core::RestorePoint {
+        recovery_profile: recovery_profile::qualify(&mut first.spec.clone()),
         id: "pause".into(),
         origin: None,
         expires_at_unix_seconds: None,
         source_runtime_id: first.runtime.id.clone(),
         artifact: adx_core::CheckpointArtifact {
-            scope: Default::default(),
+            scope: "test-scope".into(),
             storage: "shared".into(),
             location: "artifact".into(),
             size_bytes: 8,

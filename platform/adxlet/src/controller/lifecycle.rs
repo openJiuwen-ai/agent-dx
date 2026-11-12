@@ -1,5 +1,8 @@
 use super::*;
-use crate::checkpoint::{now, validate_operation};
+use crate::{
+    checkpoint::{now, validate_operation},
+    upgrade::ExecutionLease,
+};
 use adx_core::{CompletedOperation, LifecycleKind, RestorePoint};
 use std::{path::Path, time::Duration};
 
@@ -62,7 +65,7 @@ impl Controller {
         .await;
         self.auto_pause_guard = None;
         if self.record.state == EnvironmentState::Running {
-            self.services.routes.reopen(&self.record).await?;
+            self.services.reopen_route(&self.record).await?;
         }
         result
     }
@@ -95,6 +98,7 @@ impl Controller {
         if self.record.state != EnvironmentState::Running {
             return Err(Error::Conflict);
         }
+        let _execution = self.services.execution(&self.record, "resume").await?;
         let checkpoint = self
             .record
             .checkpoint
@@ -308,6 +312,14 @@ impl Controller {
         result
     }
     async fn pause_inner(&mut self, request: PauseRequest) -> Result<OperationResult> {
+        if request.operation_id.starts_with("task:") {
+            self.services.upgrade.management_grant(
+                &self.record.spec.id,
+                self.record.assignment.generation,
+                "pause",
+                &request.operation_id,
+            )?;
+        }
         if self.replay_operation(
             &request.operation_id,
             request.expected_revision,
@@ -318,12 +330,76 @@ impl Controller {
         if self.record.state != EnvironmentState::Running {
             return Err(Error::Conflict);
         }
+        let execution = self.services.execution(&self.record, "pause").await?;
         request.retention.validate()?;
         if request.timeout_seconds == 0 || request.timeout_seconds > 3600 {
             return Err(Error::Invalid(
                 "positive checkpoint TTL and timeout (at most 3600 seconds) required".into(),
             ));
         }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(request.timeout_seconds);
+        let planned = request.operation_id.starts_with("task:");
+        let idle_revision = if planned {
+            match self.wait_upgrade_idle(deadline).await {
+                Ok(revision) => Some(revision),
+                Err(error) => {
+                    self.services.reopen_route(&self.record).await?;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let result = self
+            .pause_checkpoint(request, &execution, deadline, idle_revision)
+            .await;
+        if planned && self.record.state == EnvironmentState::Running {
+            self.services.reopen_route(&self.record).await?;
+        }
+        result
+    }
+
+    async fn wait_upgrade_idle(&mut self, deadline: tokio::time::Instant) -> Result<u64> {
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                let (runtime_revision, requests) =
+                    self.services.readiness.activity(&self.record).await?;
+                let (session, revision, streams) =
+                    self.services.routes.activity(&self.record).await?;
+                if requests == 0
+                    && streams == 0
+                    && self
+                        .services
+                        .routes
+                        .quiesce(&self.record, &session, revision)
+                        .await?
+                {
+                    return Ok(runtime_revision);
+                }
+                // Observe without closing admission: long-running clients and
+                // reusable CONNECTs must not block unrelated new requests.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            Error::Unavailable("upgrade execution did not become idle before deadline".into())
+        })?
+    }
+
+    async fn pause_checkpoint(
+        &mut self,
+        request: PauseRequest,
+        execution: &ExecutionLease,
+        deadline: tokio::time::Instant,
+        idle_revision: Option<u64>,
+    ) -> Result<OperationResult> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Unavailable(
+                "pause deadline exceeded before capture".into(),
+            ));
+        }
+        let recovery_profile = self.services.runtime.recovery_profile(&self.record.spec)?;
         let expires_at = request.retention.expires_at(now()?)?;
         let services = self
             .services
@@ -352,27 +428,38 @@ impl Controller {
             )
             .await?;
         // Preparation errors can be ambiguous: abort is valid only before the backend call.
-        let preparation = match &self.auto_pause_guard {
-            Some((stamp, _)) => {
-                services
-                    .cooperation
-                    .prepare_idle(&self.record, &request.operation_id, stamp.2)
-                    .await
+        let idle_revision =
+            idle_revision.or_else(|| self.auto_pause_guard.as_ref().map(|(stamp, _)| stamp.2));
+        let preparation = tokio::time::timeout_at(deadline, async {
+            match idle_revision {
+                Some(revision) => {
+                    services
+                        .cooperation
+                        .prepare_idle(&self.record, &request.operation_id, revision)
+                        .await
+                }
+                None => {
+                    services
+                        .cooperation
+                        .prepare(&self.record, &request.operation_id)
+                        .await
+                }
             }
-            None => {
-                services
-                    .cooperation
-                    .prepare(&self.record, &request.operation_id)
-                    .await
-            }
-        };
+        })
+        .await
+        .map_err(|_| Error::Unavailable("pause preparation timed out".into()))
+        .and_then(|result| result);
         if let Err(error) = preparation {
-            if self.auto_pause_guard.is_some() && error == Error::Conflict {
+            if idle_revision.is_some() && error == Error::Conflict {
                 // A definitive idle-barrier rejection has not changed runtime
                 // state. In particular, do not abort another workload checkpoint.
                 services.store.discard_staged(&staged).await?;
                 self.capture_preparation = None;
-                return self.sync().await;
+                return if self.auto_pause_guard.is_some() {
+                    self.sync().await
+                } else {
+                    Err(error)
+                };
             }
             let abort = services
                 .cooperation
@@ -444,7 +531,21 @@ impl Controller {
         }
         self.capture_preparation = None;
         self.transition(Event::Pause)?;
-        if let Err(error) = self.services.routes.retire(&self.record).await {
+        let retired = self
+            .services
+            .routes
+            .retire(&self.record)
+            .await
+            .and_then(|()| {
+                if tokio::time::Instant::now() >= deadline {
+                    Err(Error::Unavailable(
+                        "pause deadline exceeded before checkpoint".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = retired {
             let abort = services
                 .cooperation
                 .abort_unstarted(&self.record, &request.operation_id)
@@ -459,7 +560,7 @@ impl Controller {
                 )));
             }
             self.transition(Event::Rollback)?;
-            if let Err(activate) = self.services.routes.activate(&self.record).await {
+            if let Err(activate) = self.services.activate_route(&self.record).await {
                 self.transition(Event::Fail)?;
                 self.sync().await?;
                 return Err(activate);
@@ -474,7 +575,7 @@ impl Controller {
             .checkpoint(
                 &self.record.runtime.id,
                 &staged,
-                Duration::from_secs(request.timeout_seconds),
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await
         {
@@ -525,6 +626,7 @@ impl Controller {
                 }
                 self.record.snapshot_source = None;
                 self.record.checkpoint = Some(RestorePoint {
+                    recovery_profile: recovery_profile.clone(),
                     origin: None,
                     id: request.operation_id.clone(),
                     artifact,
@@ -541,7 +643,7 @@ impl Controller {
                     .clone();
                 let path = services.store.prepare_restore(&artifact).await?;
                 let rollback = self
-                    .restore_execution(&path)
+                    .restore_execution(&path, execution)
                     .await
                     .map_err(|failure| failure.error);
                 if self.held
@@ -566,6 +668,7 @@ impl Controller {
         }
         self.record.snapshot_source = None;
         self.record.checkpoint = Some(RestorePoint {
+            recovery_profile,
             origin: None,
             id: request.operation_id.clone(),
             artifact,
@@ -581,7 +684,13 @@ impl Controller {
         );
         self.sync().await
     }
-    async fn restore_execution(&mut self, path: &Path) -> std::result::Result<(), ResumeFailure> {
+    async fn restore_execution(
+        &mut self,
+        path: &Path,
+        _accepted: &ExecutionLease,
+    ) -> std::result::Result<(), ResumeFailure> {
+        // An admitted pause/resume settles under its original lease, including
+        // rollback after new execution grants have been revoked.
         let previous_runtime_id = self.record.runtime.id.clone();
         let next_revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         let runtime_id = format!(
@@ -639,7 +748,7 @@ impl Controller {
             self.services.readiness.wait_ready(&self.record).await?;
             let readiness_ms = ready_started.elapsed().as_secs_f64() * 1_000.0;
             let route_started = Instant::now();
-            self.services.routes.activate(&self.record).await?;
+            self.services.activate_route(&self.record).await?;
             adx_observability::info!(
                 event = "environment_restore_execution_stages",
                 environment_id = %self.record.spec.id, runtime_id = %self.record.runtime.id,
@@ -695,6 +804,11 @@ impl Controller {
         Ok(())
     }
     pub(super) async fn recover(&mut self, mut request: ResumeRequest) -> Result<OperationResult> {
+        self.services.upgrade.check(
+            &self.record.spec.id,
+            self.record.assignment.generation,
+            "recover",
+        )?;
         if matches!(
             self.record.state,
             EnvironmentState::Failed | EnvironmentState::Deleted
@@ -792,6 +906,7 @@ impl Controller {
             policy.timeout_seconds = seconds;
             policy.validate()?;
         }
+        let execution = self.services.execution(&self.record, "resume").await?;
         let cp = self
             .record
             .checkpoint
@@ -800,6 +915,20 @@ impl Controller {
             .ok_or(Error::Conflict)?;
         if cp.expired(now()?) {
             return Err(Error::Invalid("checkpoint expired".into()).into());
+        }
+        let transferred = cp.origin.as_ref().is_some_and(|origin| {
+            origin.environment_id == self.record.spec.id
+                && origin.ownership_generation != self.record.assignment.generation
+        });
+        if (transferred || !cp.recovery_profile.is_empty())
+            && (cp.recovery_profile.is_empty()
+                || self.services.runtime.recovery_profile(&self.record.spec)?
+                    != cp.recovery_profile)
+        {
+            return Err(Error::Invalid(
+                "checkpoint recovery profile is unavailable or incompatible".into(),
+            )
+            .into());
         }
         let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
         let resume_started = Instant::now();
@@ -837,7 +966,7 @@ impl Controller {
         self.capture_preparation = None;
         let input_commit_ms = input_started.elapsed().as_secs_f64() * 1_000.0;
         let execution_started = Instant::now();
-        let restored = self.restore_execution(&path).await;
+        let restored = self.restore_execution(&path, &execution).await;
         let restore_execution_ms = execution_started.elapsed().as_secs_f64() * 1_000.0;
         if matches!(&restored, Err(failure) if failure.error == Error::NoCapacity) && !already_held
         {

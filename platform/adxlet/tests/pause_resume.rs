@@ -19,6 +19,8 @@ use std::{
 
 #[path = "pause_resume/publication_budget.rs"]
 mod publication_budget;
+#[path = "pause_resume/upgrade_idle.rs"]
+mod upgrade_idle;
 
 #[derive(Default)]
 struct Backend {
@@ -41,6 +43,8 @@ struct Backend {
     snapshots: Mutex<BTreeMap<String, adx_core::snapshots::Snapshot>>,
     committed_records: Mutex<BTreeMap<String, EnvironmentRecord>>,
     fail_snapshot_publish: Mutex<bool>,
+    snapshot_publish_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    snapshot_publish_entered: tokio::sync::Notify,
     running: Mutex<BTreeSet<String>>,
     events: Mutex<Vec<String>>,
     unavailable_commit: Mutex<bool>,
@@ -54,6 +58,9 @@ struct Backend {
     unsupported_checkpoint: Mutex<bool>,
     fail_start: Mutex<bool>,
     activity: Mutex<Option<(u64, u64)>>,
+    proxy_activity: Mutex<(u64, u64, bool)>,
+    idle_race: Mutex<bool>,
+    recovery_profile: Mutex<Option<BTreeMap<String, String>>>,
     fail_prepare: Mutex<bool>,
     fail_abort: Mutex<bool>,
     fail_remove: Mutex<bool>,
@@ -82,6 +89,14 @@ impl Backend {
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    fn recovery_profile(&self, _: &EnvironmentSpec) -> Result<BTreeMap<String, String>> {
+        Ok(self
+            .recovery_profile
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| BTreeMap::from([("runtime".into(), "test".into())])))
+    }
     async fn stats(&self, id: &str) -> Result<adxlet::metrics::RuntimeUsage> {
         self.sampled_runtimes.lock().unwrap().insert(id.into());
         Ok(adxlet::metrics::RuntimeUsage {
@@ -236,6 +251,17 @@ impl RuntimeDriver for Backend {
 }
 #[async_trait]
 impl CheckpointCooperation for Backend {
+    async fn prepare_idle(
+        &self,
+        record: &EnvironmentRecord,
+        id: &str,
+        revision: u64,
+    ) -> Result<()> {
+        if *self.activity.lock().unwrap() != Some((revision, 0)) {
+            return Err(Error::Conflict);
+        }
+        self.prepare(record, id).await
+    }
     async fn workload_status(
         &self,
         record: &EnvironmentRecord,
@@ -338,11 +364,37 @@ impl Readiness for Backend {
 }
 #[async_trait]
 impl Routes for Backend {
+    async fn drain(&self, _: &EnvironmentRecord) -> Result<()> {
+        self.proxy_activity.lock().unwrap().2 = true;
+        loop {
+            if self.proxy_activity.lock().unwrap().1 == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn activity(&self, _: &EnvironmentRecord) -> Result<(String, u64, u64)> {
-        Ok(("proxy".into(), 1, 0))
+        let activity = self.proxy_activity.lock().unwrap();
+        Ok(("proxy".into(), activity.0 + 1, activity.1))
+    }
+
+    async fn quiesce(&self, _: &EnvironmentRecord, session: &str, revision: u64) -> Result<bool> {
+        let mut activity = self.proxy_activity.lock().unwrap();
+        if session != "proxy" || revision != activity.0 + 1 || activity.1 != 0 {
+            return Ok(false);
+        }
+        activity.2 = true;
+        if std::mem::take(&mut *self.idle_race.lock().unwrap()) {
+            let mut runtime = self.activity.lock().unwrap();
+            let revision = runtime.unwrap().0;
+            *runtime = Some((revision + 1, 0));
+        }
+        Ok(true)
     }
 
     async fn activate(&self, _: &EnvironmentRecord) -> Result<()> {
+        self.proxy_activity.lock().unwrap().2 = false;
         self.event("activate");
         Ok(())
     }
@@ -1308,6 +1360,11 @@ impl adxlet::checkpoint::SnapshotCatalog for Backend {
         snapshot: adx_core::snapshots::Snapshot,
         _timeout: Duration,
     ) -> Result<adx_core::snapshots::Snapshot> {
+        let gate = self.snapshot_publish_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            self.snapshot_publish_entered.notify_one();
+            gate.notified().await;
+        }
         if *self.fail_snapshot_publish.lock().unwrap() {
             return Err(Error::Unavailable("catalog unavailable".into()));
         }
@@ -1941,9 +1998,58 @@ async fn failed_snapshot_copy_publishes_failure_without_booting_an_image() {
 }
 
 #[tokio::test]
+async fn transferred_checkpoint_rechecks_capture_profile_before_backend_restore() {
+    for missing in [true, false] {
+        let (_temp, backend, target, mut transferred, _) = shared_recovery_fixture().await;
+        if missing {
+            let checkpoint = transferred.checkpoint.as_mut().unwrap();
+            checkpoint.recovery_profile.clear();
+        } else {
+            *backend.recovery_profile.lock().unwrap() = Some(BTreeMap::from([(
+                "runtime".into(),
+                "changed-after-assignment".into(),
+            )]));
+        }
+        let rejected = target.recover_environment(transferred).await.unwrap();
+        assert_eq!(rejected.record.state, EnvironmentState::Failed);
+        assert!(!backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "restore"));
+        assert!(backend.running.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn transferred_snapshot_source_recovers_with_verified_checkpoint_evidence() {
+    let (_temp, backend, target, mut transferred, _) = shared_recovery_fixture().await;
+    let point = transferred.checkpoint.take().unwrap();
+    transferred.spec.id = "clone".into();
+    transferred.assignment.environment_id = "clone".into();
+    transferred.runtime.id = format!("clone-{}", transferred.assignment.generation);
+    transferred.spec.snapshot_id = Some(point.id.clone());
+    transferred.snapshot_source = Some(point);
+    let result = target.recover_environment(transferred).await.unwrap();
+    assert_eq!(result.record.state, EnvironmentState::Running);
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "restore")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() {
     let (_temp, backend, node, spec, mut assignment) = fixture();
     assignment.generation = 2;
+    let recovery_profile = backend.recovery_profile(&spec).unwrap();
     let record = EnvironmentRecord {
         observation: None,
         execution_artifacts: vec![],
@@ -1959,6 +2065,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
         revision: 1,
         resources_held: false,
         checkpoint: Some(adx_core::RestorePoint {
+            recovery_profile,
             id: "recovery".into(),
             source_runtime_id: "environment-1".into(),
             expires_at_unix_seconds: None,
@@ -2044,6 +2151,7 @@ async fn shared_recovery_fixture() -> (
     node.update_capacity(spec.resources, Duration::from_secs(60))
         .unwrap();
     assignment.generation = 2;
+    let recovery_profile = backend.recovery_profile(&spec).unwrap();
     let seed = EnvironmentRecord {
         observation: None,
         execution_artifacts: vec![],
@@ -2067,6 +2175,7 @@ async fn shared_recovery_fixture() -> (
                 runtime_id: "environment-1".into(),
                 ownership_generation: 1,
             }),
+            recovery_profile,
             artifact,
         }),
         last_operation: None,
@@ -2252,6 +2361,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
         node.update_capacity(spec.resources, Duration::from_secs(60))
             .unwrap();
         assignment.generation = 2;
+        let recovery_profile = backend.recovery_profile(&spec).unwrap();
         let seed = EnvironmentRecord {
             observation: None,
             execution_artifacts: vec![],
@@ -2267,6 +2377,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
             revision: 1,
             resources_held: false,
             checkpoint: Some(adx_core::RestorePoint {
+                recovery_profile,
                 id: "recovery".into(),
                 source_runtime_id: "environment-1".into(),
                 expires_at_unix_seconds: None,
@@ -4164,4 +4275,55 @@ async fn snapshot_clone_keeps_probe_failure_handling_without_restarting_entrypoi
     snapshot.release(&reference).unwrap();
     snapshot.delete("tenant").unwrap();
     node.collect_snapshot(&snapshot, false).await.unwrap();
+}
+
+#[tokio::test]
+async fn upgrade_quiescing_waits_for_snapshot_publication_and_rejects_new_capture() {
+    use adxlet::checkpoint::SnapshotRequest;
+    let (state, backend, node, spec, assignment) = fixture();
+    let node = node
+        .with_upgrade_control(state.path().join("upgrade.json"), "session".into())
+        .unwrap();
+    let mut control = adxlet::upgrade::NodeControl {
+        task_id: "upgrade".into(),
+        epoch: 1,
+        node_session_id: "session".into(),
+        revision: 1,
+        phase: "verified".into(),
+        ..Default::default()
+    };
+    node.apply_upgrade_control(control.clone()).await.unwrap();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let request = SnapshotRequest {
+        kind: adx_core::snapshots::SnapshotKind::Regular,
+        operation_id: "accepted-capture".into(),
+        expected_revision: created.record.revision,
+        names: vec![],
+        timeout_seconds: 60,
+    };
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *backend.snapshot_publish_gate.lock().unwrap() = Some(gate.clone());
+    let snapshot = {
+        let handle = handle.clone();
+        let request = request.clone();
+        tokio::spawn(async move { handle.snapshot(request).await })
+    };
+    backend.snapshot_publish_entered.notified().await;
+    control.revision += 1;
+    control.phase = "quiescing".into();
+    let mut closing = Box::pin(node.apply_upgrade_control(control));
+    assert!(futures_util::poll!(closing.as_mut()).is_pending());
+    gate.notify_one();
+    snapshot.await.unwrap().unwrap();
+    let inspection = closing.await.unwrap();
+    assert!(!inspection.strict_empty);
+    assert_eq!(inspection.controllers, 1);
+    *backend.snapshot_publish_gate.lock().unwrap() = None;
+    let mut rejected = request;
+    rejected.operation_id = "revoked-capture".into();
+    rejected.expected_revision = handle.sync().await.unwrap().record.revision;
+    let before = backend.events.lock().unwrap().clone();
+    assert!(handle.snapshot(rejected).await.is_err());
+    assert_eq!(*backend.events.lock().unwrap(), before);
 }

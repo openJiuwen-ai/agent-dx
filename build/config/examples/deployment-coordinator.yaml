@@ -14,6 +14,21 @@ services:
       scheduler_shards: 1
       placement: pack
       rpc_timeout_seconds: 30
+      # Optional legacy_checkpoint_proofs entries require audited capture facts
+      # for a single immutable shared artifact. Keep absent for new deployments.
+      # legacy_checkpoint_proofs:
+      #   - artifact:
+      #       storage: shared-alias
+      #       scope: <capture-backend-namespace>
+      #       location: <capture-artifact-id>
+      #       size_bytes: 12345
+      #     runtime_class: runsc
+      #     source_runtime_id: <capture-runtime-id>
+      #     recovery_profile:
+      #       ADX_RECOVERY_HOST: <capture-host-sha256>
+      #       ADX_RECOVERY_RUNTIME_runsc: <capture-runsc-sha256>
+      #       ADX_RECOVERY_ROOTFS_SHA256: <capture-rootfs-sha256>
+      #       ADX_RECOVERY_ROOTFS_PATH: /opt/adx/current/runtime/adx-runtime-rootfs.img
       tls:
         ca: /opt/adx/config/tls/ca.pem
         certificate: /opt/adx/config/tls/coordinator.pem

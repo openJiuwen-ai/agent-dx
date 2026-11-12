@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const CLAIM_BATCH: &str = r#"
 if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
-local cursor=4
+if (redis.call('HGET',KEYS[1],'node-upgrade') or '') ~= ARGV[4] then return 0 end
+local cursor=5
 for _=1,tonumber(ARGV[3]) do
   if redis.call('HGET',KEYS[2],ARGV[cursor]) ~= ARGV[cursor+1] then return 0 end
   cursor=cursor+2
@@ -119,13 +120,14 @@ impl Session {
         validate_device_assignment(&spec.scheduling.devices, &candidate.devices)?;
         let field = format!("environment:{}", spec.id);
         for _ in 0..ATTEMPTS {
-            let [header_value, environment_value, node_value, claim_fence] = self
+            let [header_value, environment_value, node_value, claim_fence, upgrade_value] = self
                 .store
                 .fields([
                     HEADER.into(),
                     field.clone(),
                     format!("node:{}", candidate.node_id),
                     "claim-fence".into(),
+                    UPGRADE.into(),
                 ])
                 .await?;
             let header = self.header(&header_value)?;
@@ -205,6 +207,7 @@ impl Session {
                 if ARGV[5] ~= '' and redis.call('HGET', KEYS[2], ARGV[5]) ~= ARGV[6] then return 0 end
                 if (redis.call('HGET',KEYS[1],'claim-fence') or '0') ~= ARGV[7] then return 0 end
                 if redis.call('HGET',KEYS[1],ARGV[8]) ~= ARGV[9] then return 0 end
+                if (redis.call('HGET',KEYS[1],'node-upgrade') or '') ~= ARGV[10] then return 0 end
                 if redis.call('HEXISTS',KEYS[1],ARGV[3]) == 1 then return 0 end
                 redis.call('HSET', KEYS[1], ARGV[3], ARGV[4])
                 redis.call('HINCRBY',KEYS[1],'node-ownership:' .. string.sub(ARGV[8],14),1); return 1
@@ -216,7 +219,7 @@ impl Session {
                 .arg(snapshot.as_deref().unwrap_or(""))
                 .arg(claim_fence.as_deref().unwrap_or("0"))
                 .arg(format!("node-session:{}", candidate.node_id))
-                .arg(&candidate.node_session_id);
+                .arg(&candidate.node_session_id).arg(upgrade_value.as_deref().unwrap_or(""));
             let values = vec![PublicationValue::Environment(
                 record.spec.id.clone(),
                 Some(Arc::new(record.clone())),
@@ -272,11 +275,15 @@ impl Session {
             .map(|(_, candidate)| format!("node:{}", candidate.node_id))
             .collect();
         for _ in 0..ATTEMPTS {
-            let fields: Vec<_> = [HEADER.to_owned(), "claim-fence".to_owned()]
-                .into_iter()
-                .chain(environment_fields.iter().cloned())
-                .chain(node_fields.iter().cloned())
-                .collect();
+            let fields: Vec<_> = [
+                HEADER.to_owned(),
+                "claim-fence".to_owned(),
+                UPGRADE.to_owned(),
+            ]
+            .into_iter()
+            .chain(environment_fields.iter().cloned())
+            .chain(node_fields.iter().cloned())
+            .collect();
             let values = self.store.fields_vec(&fields).await?;
             let mut by_field: BTreeMap<_, _> = fields.into_iter().zip(values).collect();
             let header_value = by_field.remove(HEADER).flatten().ok_or(Error::Conflict)?;
@@ -294,6 +301,7 @@ impl Session {
             } else {
                 None
             };
+            let upgrade = by_field.remove(UPGRADE).flatten();
             let mut environments = BTreeMap::new();
             for field in &environment_fields {
                 if let Some(value) = by_field.remove(field).flatten() {
@@ -420,7 +428,8 @@ impl Session {
                 .arg(self.volumes_key())
                 .arg(self.epoch.to_string())
                 .arg(writes.len())
-                .arg(snapshot_ids.len());
+                .arg(snapshot_ids.len())
+                .arg(upgrade.as_deref().unwrap_or(""));
             for id in &snapshot_ids {
                 command.arg(id).arg(&snapshots[id].0);
             }

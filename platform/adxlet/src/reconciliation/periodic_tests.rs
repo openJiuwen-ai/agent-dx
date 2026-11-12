@@ -117,6 +117,32 @@ async fn live_catalog_defers_a_claim_before_its_create_rpc_arrives() {
 }
 
 #[tokio::test]
+async fn paused_live_adoption_does_not_leak_a_tentative_create_hold() {
+    let hooks = Arc::new(Hooks::default());
+    let node = Adxlet::new(
+        "n".into(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks,
+    );
+    let mut record = pending_record();
+    record.state = EnvironmentState::Paused;
+    record.revision = 1;
+    record.resources_held = false;
+    node.update_capacity(record.spec.resources, std::time::Duration::from_secs(60))
+        .unwrap();
+
+    let reservation = node.reserve_local(&record.spec).unwrap();
+    assert_eq!(node.used(), record.spec.resources);
+    assert!(node.adopt_comparison_record(&record).unwrap().is_some());
+    let retry = node.reserve_local(&record.spec).unwrap();
+    assert_eq!(retry.token, reservation.token);
+    node.release_local(&record.spec.id, &retry).unwrap();
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
 async fn live_comparison_preserves_an_already_registered_unstarted_create() {
     for locally_reserved in [false, true] {
         let hooks = Arc::new(Hooks::default());
