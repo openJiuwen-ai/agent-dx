@@ -2063,6 +2063,105 @@ fn diagnostic_corrupted_local_copy(warm: bool) {
     assert!(local.quarantined_chunks().unwrap().is_empty());
 }
 
+/// F-a: a segmented-CRC local copy with four 32 KiB segments whose last
+/// segment is damaged on disk. No peer exists, so any fallback is an error.
+fn segmented_local_copy_with_damaged_last_segment() -> (
+    tempfile::TempDir,
+    Arc<LocalChunkStore>,
+    DfsReadEngine,
+    ChunkId,
+    Vec<u8>,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+    let segment = 32 * 1024;
+    let bytes: Vec<u8> = (0..4 * segment).map(|i| (i % 251) as u8).collect();
+    let staged = StagedChunk::new_crc32c(OperationId::new("f-a"), bytes.clone()).unwrap();
+    let chunk_id = staged.chunk.id.clone();
+    local.put(staged).unwrap();
+    let path = temp.path().join("chunks").join(&chunk_id.0);
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    std::os::unix::fs::FileExt::write_at(
+        &file,
+        &[bytes[3 * segment + 5] ^ 0xff],
+        (3 * segment + 5) as u64,
+    )
+    .unwrap();
+    file.sync_all().unwrap();
+    let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+        revision: 1,
+        chunks: vec![ChunkSources {
+            allowed_ranges: Vec::new(),
+            chunk: None,
+            chunk_id: chunk_id.clone(),
+            sources: Vec::new(),
+        }],
+    }));
+    let engine = DfsReadEngine::new(
+        crate::dfs::NamespaceId::new("default"),
+        "node-a".into(),
+        local.clone(),
+        sources,
+        Arc::new(UnimplementedChunkTransfer),
+        DfsReadConfig::default(),
+    );
+    (temp, local, engine, chunk_id, bytes)
+}
+
+fn one_range(chunk_id: &ChunkId, chunk_offset: u64, length: u64) -> ReadBatch {
+    ReadBatch {
+        lookahead: Vec::new(),
+        file_version_id: Some(FileVersionId::new("version")),
+        layout_root_id: LayoutRootId::new("layout"),
+        ops: vec![ChunkReadOp {
+            chunk_id: chunk_id.clone(),
+            chunk_offset,
+            length,
+            output_offset: 0,
+        }],
+    }
+}
+
+#[test]
+fn segmented_local_cold_open_verifies_only_covered_segments() {
+    let (_temp, local, engine, chunk_id, bytes) = segmented_local_copy_with_damaged_last_segment();
+    // A cold first read of an undamaged segment succeeds locally: the first
+    // open no longer scans (and fails on) the unread damaged segment.
+    let mut out = vec![0; 4096];
+    engine
+        .read_batch(&one_range(&chunk_id, 100, 4096), &mut out)
+        .unwrap();
+    assert_eq!(out, bytes[100..4196]);
+    assert!(local.quarantined_chunks().unwrap().is_empty());
+    assert_eq!(engine.readers.lock().unwrap().len(), 1);
+    // Reading the damaged segment still fails closed through the existing
+    // chain: quarantine, drop the cached pin, no peer -> EIO, no output.
+    let mut out = vec![9; 64];
+    let error = engine
+        .read_batch(&one_range(&chunk_id, 3 * 32 * 1024, 64), &mut out)
+        .unwrap_err();
+    assert_eq!(crate::error::errno(&error), libc::EIO);
+    assert_eq!(out, vec![9; 64]);
+    assert_eq!(local.quarantined_chunks().unwrap().len(), 1);
+    assert!(engine.readers.lock().unwrap().is_empty());
+}
+
+#[test]
+fn segmented_local_damage_outside_read_ranges_is_found_by_scrub() {
+    let (_temp, local, engine, chunk_id, bytes) = segmented_local_copy_with_damaged_last_segment();
+    let mut out = vec![0; 2 * 32 * 1024];
+    engine
+        .read_batch(&one_range(&chunk_id, 0, 2 * 32 * 1024), &mut out)
+        .unwrap();
+    assert_eq!(out, bytes[..2 * 32 * 1024]);
+    assert!(local.quarantined_chunks().unwrap().is_empty());
+    assert_eq!(
+        local.scrub_verify(&chunk_id).unwrap(),
+        crate::node::chunk::ScrubOutcome::Quarantined
+    );
+    assert_eq!(local.quarantined_chunks().unwrap().len(), 1);
+}
+
 #[test]
 fn quarantined_local_copy_and_no_readable_peer_return_eio_without_output() {
     let temp = tempfile::tempdir().unwrap();

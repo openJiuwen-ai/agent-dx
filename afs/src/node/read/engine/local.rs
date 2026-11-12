@@ -143,7 +143,7 @@ impl DfsReadEngine {
         {
             return Ok(reader);
         }
-        let reader = Arc::new(self.local.open_verified(chunk_id)?);
+        let reader = Arc::new(self.local.open_for_range_reads(chunk_id)?);
         #[cfg(test)]
         {
             // Deterministically hold concurrent cold opens before installation.

@@ -82,7 +82,7 @@ SDK 路径式 `close` 与 FUSE `close` 同语义（先 DataOnly 同步提交再�
 | 变化 | 说明 | 依据 |
 |---|---|---|
 | **远端读默认校验正文** | `dfs_read_crc_mode` 默认 `receiver`（原 `off`）：坏副本不交给应用，换副本读，全部坏时 `EIO`。本地远端顺序读约慢 6%～9%；显式设 `off` 可关闭，但可能交付静默损坏 | `afs/src/config.rs`；S4a |
-| **预设长度文件写完马上读变慢**（F1／R87） | 文件内部的顺序小写合并成最大 4 MiB 的 chunk（Meta 实体数与 GC 量大幅下降，写吞吐提升）；读 4 MiB chunk 的首次读校验比 1 MiB chunk 每 MiB 多花约 30%–40% Node CPU。页缓存未命中、刚写完马上读时：云端 native FUSE −32.5%、r2 FUSE −35%、r2 SDK −12%、S3 FUSE −43%，本地 S3 SDK 约 −45%；同时写入 +13%～+244%；冷读（磁盘是瓶颈）无差别。修复方向：按 CRC 分段只校验请求覆盖的范围、复用读缓冲 | `afs/src/node/vfs/dfs/dirty_extents.rs`；S4b、S5a |
+| **预设长度文件写完马上读变慢**（F1／R87） | 文件内部的顺序小写合并成最大 4 MiB 的 chunk（Meta 实体数与 GC 量大幅下降，写吞吐提升）；S5a 实测（当时本地读首次打开一个 chunk 要整块 CRC 校验）：读 4 MiB chunk 的首次读校验比 1 MiB chunk 每 MiB 多花约 30%–40% Node CPU。页缓存未命中、刚写完马上读时：云端 native FUSE −32.5%、r2 FUSE −35%、r2 SDK −12%、S3 FUSE −43%，本地 S3 SDK 约 −45%；同时写入 +13%～+244%；冷读（磁盘是瓶颈）无差别。本地读已改为只校验请求覆盖的 32 KiB 段（性能专项 F-a，本地 VM 4 MiB chunk 冷读 4 KiB −90%、1 MiB −71%、整块 −41%；云端未重测）；S3 回源仍整对象 GET 并整对象校验 | `afs/src/node/vfs/dfs/dirty_extents.rs`、`afs/src/node/chunk/store.rs`（`open_for_range_reads`）；S4b、S5a、性能专项 F-a |
 | **S3 模式小文件写约慢 9%**（R90） | S3 对象可回收（R05）后，每写一个 S3 小文件多一次 GC 引用 RPC 与一条 Meta WAL 记录；同期 S3 小文件读 +21% | S5a |
 | **readdir 分页** | 目录按名字游标分页，每页至多 1024 项，百万项可列出；每次列目录的 Meta RPC 次数随目录大小增加 | `afs/src/meta/dfs/` `READ_DIR_PAGE_MAX`；S4a |
 | close 后他人立即看到新 size 与 mtime（Q03） | 重构前即如此，S0 特征测试 `dfs.semantics.close_mtime` 证实（原担心 mtime 滞后到下次后台提交，不成立）。size 由 close 的同步提交保证；mtime 由最后一个写者 release 时立即触发的元数据提交带上，见[架构边界的语义一节](afs.md#fsyncclose-与-sdk决策-512) | S0 |

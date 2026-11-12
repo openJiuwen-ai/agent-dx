@@ -226,6 +226,8 @@ Redis／etcd 在服务端同一原子单元里比较 term 与 tip，`local-file`
   顺序逐个完整校验本机持久副本，限速 `dfs_scrub_bytes_per_second`（默认 32MiB/s，0 关闭），两轮开始至少相隔
   `dfs_scrub_round_interval_seconds`（默认 86400）。坏副本走同一隔离 → 上报 → 修复链（日志 `dfs.scrub_corrupt_found`）。
   它补上"只有远端读才校验"的缺口：两副本下写入节点总在本机读，另一份副本从不被读，坏了也没人发现。
+  本机读只校验请求覆盖的 32 KiB CRC32C 段（`crc32c-v2` chunk 首次打开只核对身份与 CRC 表摘要，不整块扫描），
+  从未被读到的段上的损坏也由巡检发现；读到的坏段照样隔离、上报并换副本读。
   代码 `node/chunk/scrub.rs`、`node/fault/scrub.rs`；配置见[部署说明](../deployment/afs.md#dfs-后台巡检)。
 
 ### GC
