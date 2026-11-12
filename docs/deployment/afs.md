@@ -298,7 +298,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `tls_server_name` | 产品差异 | 两者 | 无 | 校验对端证书用的服务名 |
 | `trusted_node_certs` | 产品差异 | 两者 | `{}` | Node ID 到证书的绑定表。仅 TOML |
 | `fs` | 产品差异 | 两者 | 全部已编译后端 | `ownerfs`、`dfs` 或 `all`；`--print-config` 把它展开成 `ownerfs`、`dfs` 两个布尔值 |
-| `data_mode` | 产品差异 | Node | `grpc` | Node 间数据通道：`grpc`、`rdma` 或 `auto`；`rdma` 需要编译 `rdma` feature |
+| `data_mode` | 产品差异 | Node | `grpc` | Node 间正文通道，取值 `grpc`、`rdma`、`hixl`、`auto`。显式设备模式要求对应的编译 feature |
 | `rdma_device` | 产品差异 | Node | 无 | RDMA 设备名；OwnerFs 的 `rdma` 模式必填 |
 | `dfs_rdma_require_server_generation` | 产品差异 | Node | `false` | DFS RDMA 强围栏。开启后拒绝旧客户端请求和旧服务端返回的空代际会话。滚动升级期间允许兼容会话时，留意服务端重启后的旧会话 ID 复用风险及 `afs_dfs_rdma_unbound_sessions`、`afs_dfs_rdma_unbound_server_replies_total` |
 | `data_dir` | 产品差异 | 两者 | `/tmp/afs-<id>/data` | 数据目录，必须是绝对路径；默认值只适合临时运行 |
@@ -1138,6 +1138,131 @@ uid/gid/mode。
 
 回退：命名与旧实现不兼容，只能回退二进制并重置 AFS 环境；不要期望新二进制读取
 旧的 `root-*` 数据目录。
+
+## OwnerFs HIXL 预读窗口与目录批量
+
+`data_mode` 选择 Node 发起的远端正文通道。控制 RPC、元数据和释放回执继续使用 gRPC。
+
+| 模式 | OwnerFs 远端读 | OwnerFs 远端写 | DFS |
+| --- | --- | --- | --- |
+| `grpc`（默认） | gRPC | gRPC | gRPC |
+| `rdma` | RDMA | RDMA | RDMA |
+| `hixl` | HIXL 缓冲读 | 返回不支持 | Node 启动配置拒绝 |
+| `auto` | 符合文件策略时优先 HIXL，其后为 RDMA、gRPC | RDMA、gRPC | RDMA、gRPC |
+
+`rdma` 需要 `rdma` feature 和 `rdma_device`。`hixl` 需要 `hixl` feature、`fs = "ownerfs"`
+和显式的 `[hixl].engine_id`。HIXL 节点要求 mTLS 和非空的 `trusted_node_certs`，窗口与目录批量
+共享同一个 HIXL runtime、槽池和隔离状态。`auto` 仅尝试配置了设备且支持对应文件操作的候选。
+本地或对端明确报告不支持时可以选择下一候选。鉴权、协议、校验失败、临时资源不足和提交结果未知
+返回错误。显式 HIXL 的 OPEN 不携带 gRPC 文件正文。若 `auto` 下 gRPC 是小文件的正文通道，
+仍可使用只读 OPEN 预取。
+
+旧 `[hixl].ownerfs_read_mode` 会触发未知字段错误。旧 `off` 加 gRPC 可改为 `data_mode = "grpc"`。
+旧 `preferred` 可改为 `data_mode = "auto"` 并配置 `engine_id`，此时只在明确不支持时回退，
+也可以按需配置 RDMA 候选。旧 `required` 可改为 `data_mode = "hixl"` 和 `fs = "ownerfs"`，
+远端缓冲读走 HIXL。显式 HIXL 的远端可写打开、创建和 `O_DIRECT` 打开返回不支持。切换模式时移除旧键。
+
+`/health` 的 `checks.hixl.data_mode` 报告配置模式。`startup_fallback` 表示 Auto 已配置的 HIXL
+候选在本地报告不支持，后续正文仍按对应操作的候选选择。
+
+停机时，Home 在 gRPC 退场前停止新协商和新 Prepare，继续处理 `ReleaseHixlRead` 和 Prepare
+携带的 `prior_release`。已发布导出槽等待释放，已准入的 Prepare 等待完成或回滚。排空使用同一个
+15 秒进程预算，为现有服务停止和中止等待保留 12 秒。正常收到 SIGTERM 就开始排空时，Home 最多等待
+约 3 秒。排空超时返回 `NODE_TRANSFER_DRAIN_INCOMPLETE` 并隔离 runtime，未确认的槽保持保留。
+Node 在服务与挂载收尾后等待 native HIXL 清理。清理返回失败时记录
+`ownerfs.hixl_shutdown_failed`，停机以失败状态结束。HIXL 构建的 15 秒进程停机预算覆盖
+native 清理和 C/C++ 退出处理器，阻塞耗尽预算时以 `124` 退出。
+
+以下示例在已配置 mTLS 和 `trusted_node_certs` 的 Node 上设置 Auto。将 `engine_id` 替换为本 Node
+可达地址。
+
+```toml
+data_mode = "auto"
+
+[hixl]
+engine_id = "192.0.2.10:7920"
+window_bytes = 4194304
+receive_slots = 128
+export_slots = 128
+ownerfs_read_group_bytes = 33554432
+ownerfs_read_group_max_inflight = 2
+ownerfs_read_group_host_budget_bytes = 1073741824
+ownerfs_min_file_bytes = 1048576
+ownerfs_sessions_per_home = 2
+ownerfs_batch_read = true
+ownerfs_batch_max_file_bytes = 4194304
+```
+
+- `ownerfs_read_group_bytes`：单次取回的目标字节数，`window_bytes` 的整数倍，默认 32 MiB（八个
+  4 MiB 窗口）。配置和 Home Prepare 统一接受最多 128 MiB，128 MiB 组的硬件吞吐待验收。实际容量取
+  `min(两端 window_bytes) × min(本地 receive_slots, 对端 export_slots / ownerfs_sessions_per_home, 64)`。
+  每个打开最多占用 `组 × ownerfs_read_group_max_inflight` 的在途窗口，默认 1 GiB 预算支持约
+  16 个并发打开；并发更多时按需调大预算或缩小组。
+- `receive_slots` / `export_slots`：两端各自的 Host 槽位数，各 1..=128，默认 16。所有 device lane
+  的两个槽池合计受 `lane 数 × (receive_slots + export_slots) × window_bytes ≤ 1 GiB` 约束：单 lane
+  可用 128/128，2 lane 用 64/64，4 lane 用 32/32；默认 16/16 支持最多 8 lane，16 lane 要降到 8/8。
+  这是为后续更高带宽预留的上限，尚未实测，小规模部署维持默认即可。
+- `ownerfs_read_group_max_inflight`：1 或 2，默认 2；2 在当前窗口被消费时预取下一个。
+- `ownerfs_read_group_host_budget_bytes`：缓存窗口、在途预取和目录批量共用的进程级预算，默认
+  1 GiB。共享切片和 FUSE 回复持有的分配计费到最后一个引用释放。批量索引另受
+  `max(4 × ownerfs_read_group_bytes, 预算 / 2)` 限制。预算不足时按需单次取回仍可服务当前请求。
+- `ownerfs_min_file_bytes`：`auto` 下文件不小于该值才走窗口，默认 1 MiB。更小的文件可使用
+  目录批量，普通读路径按 RDMA、gRPC 选择。
+- `ownerfs_sessions_per_home`：每个 Home 的控制会话数，1..=4，默认 2。每个会话同时只准入一次
+  取回；成功取回的释放由同一会话的下一次 Prepare 携带，空闲 10 ms 后才单独发送。调大后每个窗口
+  可用的导出槽按比例减少，因此组大小必须满足上面的槽位约束。
+- `session_idle_ms`：reader 复用空闲会话的期限，默认 20000，范围 1..=20000。Home 会话过期仍为 30 秒。
+- `ownerfs_batch_read`：默认 `true`，把只读打开的小文件按目录批量取回；`ownerfs_batch_max_file_bytes`
+  是单文件上限（4097..=4194304，默认 4 MiB），文件不跨槽。
+- 其余 HIXL runtime 设置包括`transport`（`"roce"` 或 `"hccs-buffer-pool"`）、`device_id`、`engine_id`、
+  `device_listen_port`、`[[hixl.additional_devices]]`（最多 16 个逻辑设备）、`window_bytes`
+  （1..=4 MiB）和 buffer pool 参数。
+
+Home 在窗口和目录批量 Prepare 时，使用普通缓冲定位读，按文件偏移经页缓存填充导出槽。
+reader 仍通过 HIXL 拉取导出槽中的数据并校验槽摘要。
+
+并发目录读时按需调大 `ownerfs_read_group_host_budget_bytes`：默认 1 GiB 支持约 16 个目录各驻留
+一个 32 MiB 批量；更多目录同时读时按 `2 × 目录数 × ownerfs_read_group_bytes` 设置。会话数在
+1 MiB 档影响很小，4 MiB 及以上并发明显受益，最多 4 条。
+
+A3 双机组件基准（Home 主机，对端 reader 主机；`required`、窗口 4 MiB、收发各 32 槽、32 MiB 组、
+默认 1 GiB 预算与每 Home 2 会话；单进程按名字顺序逐文件打开、4 MiB 块读取；同会话内 HIXL 与
+gRPC 交替 3 轮，HIXL 每项只起停一次节点，sha256 只在首轮校验。读回内容全部一致，不代表多机或
+生产规模）：
+
+| MiB/s，中位 [范围]，3 轮 | HIXL | gRPC | HIXL / gRPC |
+| --- | --- | --- | --- |
+| 1 MiB × 1024 | 303 [294–327] | 159 [155–170] | 1.91× |
+| 4 MiB × 256 | 802 [662–852] | 312 [290–378] | 2.57× |
+| 8 MiB × 128 | 630 [601–640] | 489 [406–501] | 1.29× |
+| 16 MiB × 64 | 1007 [829–1019] | 491 [469–572] | 2.05× |
+| 32 MiB × 32 | 1243 [1231–1465] | 571 [439–666] | 2.18× |
+| 64 MiB × 16 | 1842 [1811–1961] | 602 [564–627] | 3.06× |
+| 128 MiB × 8 | 2512 [2254–2535] | 551 [446–588] | 4.56× |
+| 1 GiB × 1 | 3600 [1973–3999] | 579 [546–649] | 6.22× |
+
+25 MiB 以下走窗口或目录批量，固定开销占比高；8 MiB 档每文件只有两个窗口，HIXL 与 gRPC 都
+接近各自的固定开销下限，因此领先幅度最小。1 GiB 档的 HIXL 范围较宽，是单文件冷读受宿主负载
+影响的结果。整轮 24 个 HIXL 单元合计占卡约 1100 秒（每项 18～63 秒，主要是节点启动与停止）；
+gRPC 单元不打开 NPU。
+
+同一对主机上的 NFS 对照（5 轮；NFS 服务端与客户端都在各自容器内，服务端用 `rpc.nfsd` 导出、
+客户端容器挂载；该组不打开 NPU，与上表不同会话，只做量级对照）：
+
+| MiB/s，中位 [范围]，5 轮 | NFS | NFS / gRPC | HIXL / NFS |
+| --- | --- | --- | --- |
+| 1 MiB × 1024 | 614 [490–678] | 3.06× | 0.49× |
+| 4 MiB × 256 | 1024 [929–1197] | 2.85× | 0.78× |
+| 8 MiB × 128 | 986 [940–1190] | 2.07× | 0.64× |
+| 16 MiB × 64 | 1350 [1143–1616] | 2.58× | 0.75× |
+| 32 MiB × 32 | 1336 [1306–1819] | 2.19× | 0.93× |
+| 64 MiB × 16 | 1623 [1424–1843] | 2.72× | 1.13× |
+| 128 MiB × 8 | 1465 [1364–1671] | 2.21× | 1.71× |
+| 1 GiB × 1 | 1573 [1327–1824] | 2.45× | 2.29× |
+
+16 MiB 及以下 NFS 更快（HIXL 是它的 0.49～0.78 倍），32 MiB 基本持平，64 MiB 起 HIXL 反超。
+这与小文件受元数据往返、大文件受传输带宽支配的既有结论一致。NFS 服务端放在容器内与放在源主机
+宿主机上得到的结果在噪声范围内相同。
 
 ## OwnerFs 运行时开关
 

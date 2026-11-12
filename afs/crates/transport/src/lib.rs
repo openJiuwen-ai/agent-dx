@@ -6,6 +6,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod hixl;
+
 #[cfg(feature = "grpc")]
 mod error;
 #[cfg(feature = "shm")]

@@ -7,7 +7,10 @@
 
 use crate::config::Config;
 use afs_metrics::{IntCounterVec, Opts, Registry};
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 use tokio::{sync::watch, task::JoinSet};
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ServiceResult = Result<(), BoxError>;
@@ -31,7 +34,7 @@ struct ProcessSignalObserver {
 #[derive(Clone)]
 pub struct ShutdownTrigger {
     sender: std::sync::mpsc::Sender<ShutdownMessage>,
-    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    deadline: std::sync::Arc<std::sync::OnceLock<Instant>>,
     budget: Duration,
 }
 
@@ -61,7 +64,15 @@ impl ShutdownDeadline {
                             // No logging/disk flush on this thread: either could
                             // block at the boundary this guard must enforce.
                             // Exit 124 is deliberately not a clean-stop status.
+                            #[cfg(not(feature = "hixl"))]
                             std::process::exit(124);
+                            // SAFETY: `_exit` takes only an integer status and
+                            // accesses no borrowed memory. CANN exit handlers
+                            // can block on the teardown that just timed out.
+                            #[cfg(feature = "hixl")]
+                            unsafe {
+                                libc::_exit(124)
+                            };
                         }
                     }
                 }
@@ -69,7 +80,7 @@ impl ShutdownDeadline {
         Ok(Self {
             trigger: ShutdownTrigger {
                 sender,
-                armed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                deadline: std::sync::Arc::new(std::sync::OnceLock::new()),
                 budget,
             },
             worker,
@@ -151,11 +162,16 @@ impl ShutdownDeadline {
 
 impl ShutdownTrigger {
     pub fn arm(&self) {
-        if !self.armed.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            let _ = self.sender.send(ShutdownMessage::Arm(
-                std::time::Instant::now() + self.budget,
-            ));
-        }
+        self.arm_and_get_deadline();
+    }
+
+    /// Share the watchdog's original deadline with graceful stop phases.
+    pub(crate) fn arm_and_get_deadline(&self) -> Instant {
+        *self.deadline.get_or_init(|| {
+            let deadline = Instant::now() + self.budget;
+            let _ = self.sender.send(ShutdownMessage::Arm(deadline));
+            deadline
+        })
     }
 }
 #[derive(Clone)]
@@ -229,6 +245,10 @@ impl Default for Services {
     }
 }
 impl Services {
+    const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+    const ABORT_TIMEOUT: Duration = Duration::from_secs(2);
+    pub(crate) const STOP_BUDGET: Duration = Self::STOP_TIMEOUT.saturating_add(Self::ABORT_TIMEOUT);
+
     pub fn new() -> Self {
         let (stop, _) = watch::channel(false);
         Self {
@@ -245,7 +265,19 @@ impl Services {
         self.run_with_shutdown(|| {}).await
     }
 
-    pub async fn run_with_shutdown(mut self, on_shutdown: impl FnOnce()) -> ServiceResult {
+    pub async fn run_with_shutdown(self, on_shutdown: impl FnOnce()) -> ServiceResult {
+        self.run_with_pre_stop(async {
+            on_shutdown();
+            Ok(())
+        })
+        .await
+    }
+
+    /// Run the pre-stop phase while services still accept traffic.
+    pub(crate) async fn run_with_pre_stop(
+        mut self,
+        pre_stop: impl Future<Output = ServiceResult>,
+    ) -> ServiceResult {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let result = tokio::select! {
@@ -256,10 +288,10 @@ impl Services {
                 _=>Err(std::io::Error::other("service exited unexpectedly").into()),
             }
         };
-        on_shutdown();
+        let pre_stop_result = pre_stop.await;
         let _ = self.stop.send(true);
         let mut failure = None;
-        let drained = tokio::time::timeout(Duration::from_secs(10), async {
+        let drained = tokio::time::timeout(Self::STOP_TIMEOUT, async {
             while let Some(task) = self.tasks.join_next().await {
                 match task {
                     Ok(Ok(())) => {}
@@ -271,28 +303,82 @@ impl Services {
         .await;
         if drained.is_err() {
             self.tasks.abort_all();
-            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = tokio::time::timeout(Self::ABORT_TIMEOUT, async {
                 while self.tasks.join_next().await.is_some() {}
             })
             .await;
             afs_logging::error!("process.shutdown_forced");
-            return Err(std::io::Error::new(
+            return pre_stop_result.and(Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "service shutdown exceeded deadline; tasks aborted",
             )
-            .into());
+            .into()));
         }
         if let Some(error) = failure {
-            return Err(error);
+            return pre_stop_result.and(Err(error));
         }
         afs_logging::info!("services.stopped");
-        result
+        result.and(pre_stop_result)
     }
 }
 
 #[cfg(test)]
 mod shutdown_deadline_tests {
     use super::*;
+
+    #[test]
+    fn shutdown_phases_share_the_first_watchdog_deadline() {
+        let deadline = ShutdownDeadline::new(Duration::from_secs(15)).unwrap();
+        let trigger = deadline.trigger();
+        let cutoff = trigger.arm_and_get_deadline();
+        std::thread::sleep(Duration::from_millis(1));
+        assert_eq!(trigger.clone().arm_and_get_deadline(), cutoff);
+        deadline.complete();
+    }
+
+    #[tokio::test]
+    async fn shutdown_pre_stop_can_finish_work_before_service_stop() {
+        let mut services = Services::new();
+        let stop = services.stop.subscribe();
+        let worker_stop = stop.clone();
+        let (request, work) = tokio::sync::oneshot::channel();
+        let (reply, done) = tokio::sync::oneshot::channel();
+        services.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = cancelled(worker_stop.clone()) => panic!("service stopped before pre-stop work"),
+                _ = work => { reply.send(()).unwrap(); }
+            }
+            cancelled(worker_stop).await;
+            Ok(())
+        });
+        services.spawn(async { Err(std::io::Error::other("trigger shutdown").into()) });
+
+        let error = services
+            .run_with_pre_stop(async {
+                assert!(!*stop.borrow());
+                request.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), done)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!*stop.borrow());
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "trigger shutdown");
+    }
+
+    #[cfg(feature = "hixl")]
+    extern "C" fn blocking_c_atexit_handler() {
+        if let Ok(marker) = std::env::var("AFS_TEST_SHUTDOWN_ATEXIT_MARKER") {
+            let _ = std::fs::write(marker, b"handler-called");
+        }
+        loop {
+            std::thread::park();
+        }
+    }
 
     #[test]
     fn shutdown_deadline_child() {
@@ -373,6 +459,12 @@ mod shutdown_deadline_tests {
             deadline.complete();
             return;
         }
+        #[cfg(feature = "hixl")]
+        if mode == "atexit-blocked" {
+            // SAFETY: this is a no-capture `extern "C"` callback with the
+            // signature required by `atexit`; the child process is isolated.
+            assert_eq!(unsafe { libc::atexit(blocking_c_atexit_handler) }, 0);
+        }
         let deadline = ShutdownDeadline::new(Duration::from_millis(150)).unwrap();
         let trigger = deadline.trigger();
         if mode == "complete" {
@@ -425,9 +517,50 @@ mod shutdown_deadline_tests {
         }
     }
 
+    #[cfg(feature = "hixl")]
+    fn child_with_atexit_marker(mode: &str) -> (std::process::ExitStatus, Duration, bool) {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("atexit-called");
+        let start = std::time::Instant::now();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::shutdown_deadline_tests::shutdown_deadline_child",
+                "--nocapture",
+            ])
+            .env("AFS_TEST_SHUTDOWN_CHILD", mode)
+            .env("AFS_TEST_SHUTDOWN_ATEXIT_MARKER", &marker)
+            .spawn()
+            .unwrap();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if start.elapsed() > Duration::from_secs(3) {
+                // This only kills the test's isolated local subprocess.
+                child.kill().unwrap();
+                break child.wait().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        (status, start.elapsed(), marker.exists())
+    }
+
     #[test]
     fn shutdown_deadline_forces_failure_even_during_runtime_drop() {
         let (status, elapsed) = child("blocked");
+        assert_eq!(status.code(), Some(124));
+        assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[cfg(feature = "hixl")]
+    #[test]
+    fn shutdown_deadline_exit_skips_blocking_c_atexit_handlers() {
+        let (status, elapsed, handler_ran) = child_with_atexit_marker("atexit-blocked");
+        assert!(
+            !handler_ran,
+            "deadline exit invoked a blocking C atexit handler; child status {status} after {elapsed:?}"
+        );
         assert_eq!(status.code(), Some(124));
         assert!(elapsed < Duration::from_secs(2));
     }

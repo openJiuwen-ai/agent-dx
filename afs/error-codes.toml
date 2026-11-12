@@ -122,6 +122,22 @@ subsystem = "Transfer"
 description = "传输工作任务或返回长度转换失败"
 
 [[error]]
+name = "NODE_TRANSFER_RESOURCE_EXHAUSTED"
+value = "0x02040006"
+kind = "ResourceExhausted"
+component = "Node"
+subsystem = "Transfer"
+description = "传输固定内存池或会话预算已耗尽"
+
+[[error]]
+name = "NODE_TRANSFER_DRAIN_INCOMPLETE"
+value = "0x02040007"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "Transfer"
+description = "原生传输结果或排空状态未确认，相关资源代际被隔离保留"
+
+[[error]]
 name = "NODE_STORAGE_INVALID"
 value = "0x02070001"
 kind = "InvalidArgument"

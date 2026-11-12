@@ -21,6 +21,7 @@ diagnostics = []
 # 未编入时配置 `meta_store = "redis"`／`"etcd"` 在 Meta 启动时报错。
 meta-redis = ["dep:redis"]
 meta-etcd = ["dep:etcd-client"]
+hixl = ["dfs", "afs-transport/hixl"]
 # Disable only for allocator comparisons; only afs-node installs it globally.
 node-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 

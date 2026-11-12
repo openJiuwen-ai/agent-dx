@@ -27,6 +27,8 @@ pub(super) mod common;
 #[cfg(feature = "dfs")]
 pub(super) mod dfs;
 mod grpc;
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+mod hixl;
 #[cfg(feature = "ownerfs")]
 mod outlet;
 #[cfg(feature = "ownerfs")]
@@ -47,7 +49,39 @@ const DEFAULT_DFS_NAMESPACE: &str = "default";
 pub(super) async fn run_node(
     cfg: Config,
     obs: Observability,
-    on_shutdown: impl FnOnce(),
+    on_shutdown: impl Fn() -> std::time::Instant,
+) -> Result<(), BoxError> {
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    let mut hixl = hixl::Hixl::default();
+    let result = assemble_and_serve(
+        cfg,
+        obs,
+        &on_shutdown,
+        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        &mut hixl,
+    )
+    .await;
+
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    {
+        // Startup errors can bypass Services' shutdown callback. Arm the same
+        // process deadline before waiting for the native owner in that case.
+        if result.is_err() {
+            on_shutdown();
+        }
+        if let Err(error) = hixl.shutdown().await {
+            afs_logging::error!("ownerfs.hixl_shutdown_failed"; "error" => error.to_string());
+            return result.and(Err(error));
+        }
+    }
+    result
+}
+
+async fn assemble_and_serve(
+    cfg: Config,
+    obs: Observability,
+    on_shutdown: impl FnOnce() -> std::time::Instant,
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))] hixl: &mut hixl::Hixl,
 ) -> Result<(), BoxError> {
     // 1–2. Bind all TCP ingress before spawning services. A failed bind
     // cannot leave a half-ready Node. Storage opens before registration.
@@ -65,9 +99,24 @@ pub(super) async fn run_node(
     let storage = common::NodeStorage::open(&cfg, &obs)?;
     // 3–4. No FUSE mount or local API exists yet.
     let node_descriptor = common::node_descriptor(&cfg, &startup, &storage, management_labels);
+    // The shared HIXL runtime starts before registration so explicit HIXL
+    // fails startup before any mount exists.
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    hixl.start(
+        &cfg,
+        &obs,
+        &metrics.owner_rpc,
+        Duration::from_millis(cfg.timeout_ms),
+    )
+    .await?;
     let registration =
         common::InitialRegistration::register(&cfg, &startup, node_descriptor.as_ref()).await?;
     // 5–9.
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    let mut backends =
+        common::Backends::assemble(&cfg, &obs, &startup, metrics, storage, &registration, hixl)
+            .await?;
+    #[cfg(not(all(feature = "ownerfs", feature = "dfs")))]
     let mut backends =
         common::Backends::assemble(&cfg, &obs, &startup, metrics, storage, &registration).await?;
     #[cfg(feature = "dfs")]
@@ -90,6 +139,17 @@ pub(super) async fn run_node(
     // 10–12.
     let (endpoints, local) = common::LocalEndpoints::serve(&cfg, &obs, &backends).await?;
     let (mounts, local) = common::FuseMounts::mount(&cfg, &backends, local).await?;
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    let (readiness, state) = common::node_state(
+        &cfg,
+        obs,
+        &startup,
+        &registration,
+        &mounts,
+        &mut backends,
+        hixl,
+    );
+    #[cfg(not(all(feature = "ownerfs", feature = "dfs")))]
     let (readiness, state) =
         common::node_state(&cfg, obs, &startup, &registration, &mounts, &mut backends);
     // 13. Services.
@@ -117,7 +177,7 @@ pub(super) async fn run_node(
             .expect("local API task exists after startup"),
     )
     .start(&mut services);
-    grpc::start(
+    let grpc = grpc::start(
         &cfg,
         ingress.grpc,
         &state,
@@ -177,6 +237,7 @@ pub(super) async fn run_node(
         backends,
         mounts,
         local,
+        grpc,
     };
     shutdown::serve_until_shutdown(&cfg, services, resources, on_shutdown).await
 }

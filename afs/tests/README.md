@@ -6,6 +6,15 @@
 
 feature 组合门禁：在 Linux 上于仓库任意目录运行 `bash afs/tests/feature-matrix.sh`，它对默认、dfs-only、ownerfs-only、rdma、diagnostics 五种 feature 组合执行 `cargo check` 与 `--tests --no-run` 构建，并检查无后端 `afs-meta` 能构建、SDK 不启用 RDMA；并运行 ownerfs-only、dfs-only 的 `config_contract`。加 `--run-lib` 再运行这两组 lib 单测，要求 `TMPDIR` 在支持 flock 与 xattr、剩余超过 1 GiB 的原生 Linux 文件系统上；adx-vm 编译容器不满足，需用 `--lib --no-run` 编译后到运行节点执行。
 
+本地 HIXL 停机契约使用真实 `afs-node`、`afs-meta` 进程和 SDK mock。Linux 环境需设置
+`ADX_CANN_PATH`，动态链接器需能加载配套 SDK 共享库（无驱动环境可用 SDK 的 host devlib），
+并提供 `c++` 和 `openssl`。在仓库根运行 `cargo test -p afs --features hixl --test hixl_shutdown -- --ignored`。
+测试覆盖无文件流量时等待 native 清理后退出，以及 native 清理和 C 退出处理器分别阻塞时以 `124` 退出。
+三个场景都要求在发出 SIGTERM 后的 processctl 默认 20 秒等待预算内退出。
+无流量场景还检查 Home 排空先于 gRPC 退场。`cargo test -p afs --lib node::rpc::data::owner_hixl::tests::drain`
+使用内存槽验证排空时的拒绝准入、释放、在途回滚及超时隔离。
+它不需要 NPU 或 FUSE 挂载，A3 真机停机行为需另行验证。
+
 公共E2E已补测试资产交接：AFS ON时，`build/e2e/prepare.py`及K8s
 `stage_harness()`携带本目录的`run.py`、`suites/`、`fixtures/`、`tools/`及`runner_tests/`的Python文件和示例配置，
 放在测试镜像/Pod的`/opt/adx/e2e/afs-tests/`；正式产品包不包含这些测试资产。

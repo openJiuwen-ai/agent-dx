@@ -9,6 +9,7 @@ meta_endpoint = "https://127.0.0.1:7400"
 # with it set logs config.test_only_option_enabled at WARN.
 # peer_endpoint = "https://127.0.0.1:7500"
 fs = "all"
+# Payload mode: grpc, rdma, hixl, or auto. Explicit hixl requires fs = "ownerfs".
 data_mode = "grpc"
 data_dir = "/opt/adx/data/afs/node-a"
 uds_path = "/opt/adx/run/afs/node-a.sock"
@@ -166,3 +167,19 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # [dfs_peer_cache]
 # directory = "/opt/adx/cache/afs/peer"
 # capacity_bytes = 268435456
+
+[hixl]
+# HIXL is used for eligible OwnerFs reads with data_mode = "auto" and an
+# explicit engine_id, or with data_mode = "hixl". Native HIXL requires the
+# hixl build, mTLS, and administrator-managed trusted_node_certs.
+# The two Host slot pools across all device lanes may reserve 1 GiB together;
+# one lane can take 128 + 128 slots of 4 MiB windows (the largest reservation),
+# kept for future higher-bandwidth links.
+# window_bytes = 4194304
+# receive_slots = 128
+# export_slots = 128
+# ownerfs_read_group_bytes = 33554432 # default; up to 128 MiB
+# session_idle_ms = 20000 # reader session reuse limit, 1..=20000
+# transport = "hccs-buffer-pool" # default "roce"; peers must match
+# device_id = 0
+# engine_id = "192.0.2.10:7920" # replace with this node's reachable IP:port

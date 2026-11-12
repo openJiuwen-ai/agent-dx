@@ -140,6 +140,16 @@ impl SyncRuntime {
             Self::Owned(runtime) => runtime.block_on(future),
         }
     }
+
+    /// A handle whose spawned tasks progress without a caller blocking on it.
+    /// The private current-thread runtime only runs tasks inside `block_on`.
+    #[cfg(feature = "dfs")]
+    pub(crate) fn handle(&self) -> Option<Handle> {
+        match self {
+            Self::Existing(handle) => Some(handle.clone()),
+            Self::Owned(_) => None,
+        }
+    }
 }
 
 /// Drives `future` on a private current-thread runtime on a scoped thread, for

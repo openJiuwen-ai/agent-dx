@@ -82,6 +82,21 @@ python3 build/ci/run.py afs
 
 SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试只在 Linux 编译。macOS 上返回 `ShmError::Unsupported`，仅检查该不支持契约；这不代表 AFS/FUSE 在 macOS 可运行。
 
+HIXL 为 OwnerFs 提供可选的远端预读窗口和小文件目录批量。默认不编译 native HIXL；
+支持要求为 CANN ≥ 9.1.0、HDK ≥ 25.5.0，且 CANN、HDK 与设备型号需使用配套组合。在已安装匹配
+HIXL/ACL 头文件及共享库的 Linux 环境中，可运行
+`make afs-check ADX_WITH_AFS=1 ADX_AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann`。
+`data_mode = "grpc" | "rdma" | "hixl" | "auto"` 选择节点间正文通道，控制面走 gRPC，默认使用 `"grpc"`。
+`"hixl"` 用于启用了 native HIXL 的 OwnerFs-only Node，覆盖远端缓冲读。`"auto"` 在配置
+`[hixl].engine_id` 后为符合条件的 OwnerFs 读优先选择 HIXL，OwnerFs 写使用 RDMA 或 gRPC。
+DFS 读写使用各自装配的 RDMA 或 gRPC 路径。
+`[hixl].transport` 默认 `"roce"`，A3 同 super-pod 域可用 `"hccs-buffer-pool"`，
+`[[hixl.additional_devices]]` 最多配置 16 个逻辑设备。
+
+配置键、并发建议与 A3 双机读测量见
+[部署文档](../docs/deployment/afs.md#ownerfs-hixl-预读窗口与目录批量)，协议与失败语义见
+[架构说明](../docs/architecture/afs.md)。A2 RoCE、多设备吞吐、并发 reader 与故障恢复尚未验收。
+
 ## 当前能力边界
 
 - OwnerFs workspace bind mount 默认 OFF；当前实际试用场景需要显式配置 ON。

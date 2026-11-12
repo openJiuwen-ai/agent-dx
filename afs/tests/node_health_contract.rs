@@ -48,6 +48,10 @@ fn node_with_readiness(config: Config, readiness: Arc<NodeReadiness>) -> Arc<Nod
         ownerfs: None,
         #[cfg(feature = "dfs")]
         dfs: None,
+        #[cfg(feature = "dfs")]
+        hixl_runtime: None,
+        #[cfg(feature = "dfs")]
+        hixl_metrics: None,
     })
 }
 
@@ -113,6 +117,52 @@ async fn node_health_can_report_foundation_ready_without_configured_mounts() {
     assert_eq!(body["configured_filesystems_ready"], false);
     assert_eq!(body["checks"]["mounts"]["configured"], false);
     assert_eq!(body["checks"]["data_device"]["ready"], true);
+    assert_eq!(body["checks"]["hixl"]["state"], "off");
+    assert_eq!(body["checks"]["hixl"]["ready"], true);
+}
+
+#[tokio::test]
+async fn required_hixl_without_running_generation_degrades_health() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = test_config(temp.path().to_owned());
+    config.data_mode = DataMode::Hixl;
+    let readiness = Arc::new(NodeReadiness::new(
+        false,
+        None,
+        None,
+        None,
+        None,
+        DataMode::Grpc,
+        None,
+    ));
+    mark_resources_ready(&readiness);
+    let (status, body) = get_health(node_with_readiness(config, readiness)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["checks"]["hixl"]["ready"], false);
+    assert_eq!(body["checks"]["hixl"]["data_mode"], "hixl");
+}
+
+#[tokio::test]
+async fn auto_hixl_without_native_capability_reports_startup_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = test_config(temp.path().to_owned());
+    config.data_mode = DataMode::Auto;
+    config.ownerfs = true;
+    config.hixl.engine_id = "127.0.0.1:7920".into();
+    let readiness = Arc::new(NodeReadiness::new(
+        false,
+        None,
+        None,
+        None,
+        None,
+        DataMode::Grpc,
+        None,
+    ));
+    mark_resources_ready(&readiness);
+    let (status, body) = get_health(node_with_readiness(config, readiness)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["checks"]["hixl"]["state"], "unsupported");
+    assert_eq!(body["checks"]["hixl"]["startup_fallback"], true);
 }
 
 #[tokio::test]

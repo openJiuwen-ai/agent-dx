@@ -1362,3 +1362,19 @@ workload that writes progress to the same device must declare that extra I/O.
 Retain historical raw cohorts with this caveat; do not silently rewrite them,
 subtract an estimated cost, or claim all previous differences came from it.
 See [the measurement boundary](../performance/afs-write-owned-admission.md#measurement-observer-isolation).
+
+
+### OwnerFs 正文选择与 HIXL 契约
+
+Linux 组件测试覆盖显式模式、Auto 优先顺序、旧配置拒绝和健康状态，以及普通窗口与目录批量
+所用的共用拉取路径。loopback 使用内存导出槽验证取消等待、释放合并、校验错误、打开版本与
+失效和 `Bytes` 切片。组件测试也覆盖显式 HIXL 拒绝远端可写打开、尾部补读和缓存 EOF 命中的
+1 MiB 请求上限，以及窗口与目录批量 Prepare 的 128 MiB 上限。
+
+```sh
+cargo test --locked -p afs --lib owner_hixl
+cargo test --locked -p afs --lib node::data_plane
+cargo test --locked -p afs --test config_contract --test node_health_contract
+```
+
+RoCE、HCCS、多 lane、FUSE 真挂载和吞吐对比各需相应的 Linux 运行证据。组件测试范围限于软件契约。

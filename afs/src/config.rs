@@ -20,6 +20,7 @@ mod common;
 mod cross;
 mod dfs;
 mod fuse;
+mod hixl;
 mod meta;
 #[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
 pub(crate) use meta::MetaStoreTarget;
@@ -29,6 +30,9 @@ mod tls;
 
 pub use outlet::{DEFAULT_MOUNT_OPTIONS, OutletConfig};
 
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+pub(crate) use hixl::MAX_OWNERFS_HIXL_SLOTS_PER_POOL;
+pub use hixl::{HixlConfig, HixlDeviceConfig, HixlTransport};
 pub use tls::read_certificate_der;
 
 /// Whether `id` is safe to embed in filesystem paths and request keys.
@@ -72,15 +76,19 @@ pub enum MetaStoreBackend {
     #[value(name = "etcd")]
     Etcd,
 }
-/// Node-to-Node data transport. `rdma` requires the `rdma` feature; `auto`
-/// negotiates per peer and falls back to gRPC.
+/// Node-to-Node payload backend. The control plane always uses gRPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum DataMode {
     Grpc,
     Rdma,
+    Hixl,
     Auto,
 }
+
+/// Maximum OwnerFs HIXL group size accepted by configuration and Home Prepare.
+pub(crate) const MAX_OWNERFS_HIXL_READ_GROUP_BYTES: usize = 128 * 1024 * 1024;
+
 /// `dfs_local_copy`: whether the writing Node must hold a replica. Meta persists
 /// the choice as [`crate::dfs::LocalCopyPolicy`] when it initializes the filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -632,6 +640,7 @@ struct FileConfig {
     #[serde(default)]
     management: crate::management::ManagementConfig,
     connectors: Option<crate::node::connectors::ConnectorsConfig>,
+    hixl: Option<HixlConfig>,
     dfs_read_parallelism: Option<usize>,
     dfs_read_stripe_bytes: Option<usize>,
     dfs_read_cache_bytes: Option<u64>,
@@ -823,6 +832,7 @@ pub struct Config {
     pub tls_server_name: Option<String>,
     pub trusted_node_certs: HashMap<String, PathBuf>,
     pub ownerfs: bool,
+    pub hixl: HixlConfig,
     pub dfs: bool,
     pub data_mode: DataMode,
     pub rdma_device: Option<String>,
@@ -942,6 +952,7 @@ impl Config {
         dfs::validate_storage(role, &cfg)?;
         common::validate_process(&cfg)?;
         ownerfs::validate(role, &cfg)?;
+        hixl::validate(role, &cfg)?;
         cross::validate_mounts(&cfg)?;
         tls::validate(&cfg)?;
         cross::validate_read_crc(&cfg)?;
@@ -984,6 +995,7 @@ impl Config {
             .or(file.ownerfs_data_dir)
             .unwrap_or_else(|| data_dir.join("ownerfs"));
         Self {
+            hixl: file.hixl.unwrap_or_default(),
             grpc_listen,
             rest_listen: cli.rest_listen.or(file.rest_listen).unwrap_or_else(|| {
                 ([127, 0, 0, 1], if role == Role::Meta { 7401 } else { 7501 }).into()

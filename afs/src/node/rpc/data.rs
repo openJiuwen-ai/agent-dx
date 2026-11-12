@@ -79,6 +79,10 @@ mod dfs_range_stream;
 mod dfs_read_authz;
 #[cfg(feature = "dfs")]
 mod dfs_replica_authz;
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+mod hixl;
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+pub mod owner_hixl;
 #[cfg(feature = "dfs")]
 use dfs_chunks::*;
 #[cfg(feature = "dfs")]
@@ -1700,6 +1704,8 @@ pub struct OwnerFilesService {
     authenticator: Option<Arc<dyn PeerAuthenticator>>,
     metrics: Option<super::OwnerRpcMetrics>,
     rdma_sessions: Option<RdmaSessionRegistry>,
+    #[cfg(feature = "dfs")]
+    hixl: Option<Arc<owner_hixl::OwnerHixlService>>,
 }
 
 #[cfg(feature = "ownerfs")]
@@ -1714,7 +1720,18 @@ impl OwnerFilesService {
             authenticator: Some(authenticator),
             metrics: None,
             rdma_sessions: None,
+            #[cfg(feature = "dfs")]
+            hixl: None,
         }
+    }
+
+    /// Enables OwnerFs HIXL read-ahead windows. Without it the HIXL RPCs
+    /// report the capability as unsupported after authenticating the peer.
+    #[must_use]
+    #[cfg(feature = "dfs")]
+    pub fn with_hixl(mut self, hixl: Arc<owner_hixl::OwnerHixlService>) -> Self {
+        self.hixl = Some(hixl);
+        self
     }
 
     #[must_use]
@@ -2174,9 +2191,112 @@ pub fn make_owner_files_server_with_handler_metrics_and_rdma(
     )
 }
 
+#[cfg(feature = "ownerfs")]
+impl OwnerFilesService {
+    /// Authenticates before reporting capability, so an unauthenticated
+    /// caller cannot probe whether this Home enables HIXL.
+    #[cfg(feature = "dfs")]
+    fn owner_hixl<T>(
+        &self,
+        operation: &'static str,
+        request: &Request<T>,
+    ) -> Result<(String, Arc<owner_hixl::OwnerHixlService>), Status> {
+        let peer = self.owner_peer(operation, request)?;
+        let hixl = self.hixl.clone().ok_or_else(|| {
+            owner_hixl::unsupported_status("OwnerFs HIXL read-ahead capability is unavailable")
+        })?;
+        Ok((peer, hixl))
+    }
+
+    #[cfg(not(feature = "dfs"))]
+    fn owner_hixl_unsupported<T>(&self, operation: &'static str, request: &Request<T>) -> Status {
+        match self.owner_peer(operation, request) {
+            Err(status) => status,
+            Ok(_) => coded_status(
+                afs_error::NODE_TRANSFER_UNSUPPORTED,
+                "OwnerFs HIXL read-ahead capability is unavailable",
+            ),
+        }
+    }
+}
+
 #[tonic::async_trait]
 #[cfg(feature = "ownerfs")]
 impl OwnerFiles for OwnerFilesService {
+    async fn negotiate_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerNegotiateHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerNegotiateHixlReply>, Status> {
+        #[cfg(feature = "dfs")]
+        {
+            let (peer, hixl) = self.owner_hixl("OwnerFiles.NegotiateHixl", &request)?;
+            hixl.negotiate(peer, request.into_inner()).await
+        }
+        #[cfg(not(feature = "dfs"))]
+        {
+            Err(self.owner_hixl_unsupported("OwnerFiles.NegotiateHixl", &request))
+        }
+    }
+
+    async fn prepare_read_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerPrepareReadHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerPrepareReadHixlReply>, Status> {
+        #[cfg(feature = "dfs")]
+        {
+            let (peer, hixl) = self.owner_hixl("OwnerFiles.PrepareReadHixl", &request)?;
+            hixl.prepare(peer, request.into_inner()).await
+        }
+        #[cfg(not(feature = "dfs"))]
+        {
+            Err(self.owner_hixl_unsupported("OwnerFiles.PrepareReadHixl", &request))
+        }
+    }
+
+    async fn prepare_batch_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerPrepareBatchHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerPrepareBatchHixlReply>, Status> {
+        #[cfg(feature = "dfs")]
+        {
+            let (peer, hixl) = self.owner_hixl("OwnerFiles.PrepareBatchHixl", &request)?;
+            hixl.prepare_batch(peer, request.into_inner()).await
+        }
+        #[cfg(not(feature = "dfs"))]
+        {
+            Err(self.owner_hixl_unsupported("OwnerFiles.PrepareBatchHixl", &request))
+        }
+    }
+
+    async fn release_hixl_read(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerReleaseHixlReadRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerReleaseHixlReadReply>, Status> {
+        #[cfg(feature = "dfs")]
+        {
+            let (peer, hixl) = self.owner_hixl("OwnerFiles.ReleaseHixlRead", &request)?;
+            hixl.release(peer, request.into_inner()).await
+        }
+        #[cfg(not(feature = "dfs"))]
+        {
+            Err(self.owner_hixl_unsupported("OwnerFiles.ReleaseHixlRead", &request))
+        }
+    }
+
+    async fn close_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerCloseHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerCloseHixlReply>, Status> {
+        #[cfg(feature = "dfs")]
+        {
+            let (peer, hixl) = self.owner_hixl("OwnerFiles.CloseHixl", &request)?;
+            hixl.close(peer, request.into_inner()).await
+        }
+        #[cfg(not(feature = "dfs"))]
+        {
+            Err(self.owner_hixl_unsupported("OwnerFiles.CloseHixl", &request))
+        }
+    }
     async fn lookup(
         &self,
         request: Request<OwnerLookupRequest>,

@@ -277,6 +277,8 @@ pub(super) struct Backends {
     pub(super) peer_connections: Arc<rpc::peer::PeerConnectionPool>,
     #[cfg(feature = "ownerfs")]
     pub(super) ownerfs: ownerfs::OwnerFsAssembly,
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    pub(super) hixl_reader: Option<Arc<rpc::peer::owner_hixl::OwnerHixlReader>>,
     #[cfg(feature = "dfs")]
     pub(super) dfs: dfs::DfsAssembly,
 }
@@ -290,12 +292,16 @@ impl Backends {
         metrics: FsMetrics,
         storage: NodeStorage,
         registration: &InitialRegistration,
+        #[cfg(all(feature = "ownerfs", feature = "dfs"))] hixl: &super::hixl::Hixl,
     ) -> Result<Self, BoxError> {
         #[cfg(feature = "dfs")]
         let dfs_read = dfs::DfsReadAdmission::new(cfg, registration)?;
         #[cfg(any(feature = "ownerfs", feature = "dfs"))]
         let peer_connections = peer_connections(cfg, startup, &storage)?;
-        #[cfg(feature = "ownerfs")]
+        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        let ownerfs =
+            ownerfs::assemble(cfg, startup, &peer_connections, &metrics.owner_rpc, hixl).await?;
+        #[cfg(all(feature = "ownerfs", not(feature = "dfs")))]
         let ownerfs =
             ownerfs::assemble(cfg, startup, &peer_connections, &metrics.owner_rpc).await?;
         #[cfg(feature = "dfs")]
@@ -324,6 +330,8 @@ impl Backends {
             peer_connections,
             #[cfg(feature = "ownerfs")]
             ownerfs,
+            #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+            hixl_reader: hixl.reader(),
             #[cfg(feature = "dfs")]
             dfs,
         })
@@ -381,12 +389,18 @@ impl LocalEndpoints {
         let diagnostic_storage = Arc::new(diagnostics::DiagnosticStorage::new(
             cfg.data_dir.join("diagnostics"),
         )?);
-        let sessions = rpc::control::RdmaSessionRegistry::new(cfg.rdma_device.clone());
+        let rdma_device = matches!(
+            cfg.data_mode,
+            crate::config::DataMode::Rdma | crate::config::DataMode::Auto
+        )
+        .then(|| cfg.rdma_device.clone())
+        .flatten();
+        let sessions = rpc::control::RdmaSessionRegistry::new(rdma_device.clone());
         #[cfg(all(feature = "dfs", feature = "rdma"))]
         let sessions =
             sessions.with_dfs_generation_requirement(cfg.dfs_rdma_require_server_generation);
         #[cfg(feature = "ownerfs")]
-        let owner_rdma_sessions = rpc::control::RdmaSessionRegistry::new(cfg.rdma_device.clone());
+        let owner_rdma_sessions = rpc::control::RdmaSessionRegistry::new(rdma_device);
         // 本机 SDK 的数据面直接调用已装配的 DFS 后端；未启用 DFS 时保持 None，
         // 让 DfsLocalData 明确返回 UNIMPLEMENTED，而不是退回 diagnostics 目录。
         #[cfg(feature = "dfs")]
@@ -513,6 +527,7 @@ pub(super) fn node_state(
     registration: &InitialRegistration,
     mounts: &FuseMounts,
     backends: &mut Backends,
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))] hixl: &super::hixl::Hixl,
 ) -> (Arc<NodeReadiness>, Arc<Node>) {
     let needs_meta = startup.needs_meta;
     let registered_node_epoch = registration.epoch;
@@ -547,7 +562,14 @@ pub(super) fn node_state(
         ownerfs_mount_identity,
         dfs_mount_identity,
         cfg.data_mode,
-        cfg.rdma_device.as_deref(),
+        if matches!(
+            cfg.data_mode,
+            crate::config::DataMode::Rdma | crate::config::DataMode::Auto
+        ) {
+            cfg.rdma_device.as_deref()
+        } else {
+            None
+        },
     ));
     readiness.set_allow_volatile_meta(cfg.allow_volatile_meta);
     if let Some(registration) = &registered_readiness {
@@ -565,6 +587,10 @@ pub(super) fn node_state(
         ownerfs: backends.ownerfs.instance.take(),
         #[cfg(feature = "dfs")]
         dfs: backends.dfs.instance.take(),
+        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        hixl_runtime: hixl.runtime(),
+        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        hixl_metrics: hixl.metrics(),
     });
     (readiness, state)
 }

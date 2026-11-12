@@ -21,6 +21,7 @@ pub(crate) mod call_deadline;
 pub mod chunk;
 pub(crate) mod chunk_crc32c;
 pub mod connectors;
+mod data_plane;
 pub mod diagnostics;
 #[cfg(feature = "dfs")]
 pub mod external_chunk;
@@ -51,6 +52,10 @@ use crate::{
     runtime::{BoxError, Observability},
 };
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Process-wide Node shutdown budget, including services and native cleanup.
+pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(15);
 
 /// REST 持有的进程级共享对象，不是另一个 Home 服务进程。
 /// OwnerFs 和 DFS 分别绑定自己的 FUSE session；诊断 Storage 与 RDMA 会话表独立。
@@ -66,11 +71,16 @@ pub struct Node {
     pub ownerfs: Option<Arc<vfs::ownerfs::OwnerFs>>,
     #[cfg(feature = "dfs")]
     pub dfs: Option<Arc<vfs::dfs::DistributedFs>>,
+    /// Shared HIXL runtimes; `None` when HIXL is unconfigured or unavailable in auto mode.
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    pub hixl_runtime: Option<Arc<afs_transport::hixl::HixlRuntimeGroup>>,
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    pub hixl_metrics: Option<crate::node::rpc::hixl::HixlMetrics>,
 }
 
 /// 组装并持有 Node 的所有入口。启动失败清理已经建立的资源，正常退出卸载本进程挂载。
 pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
-    assembly::run_node(cfg, obs, || {}).await
+    assembly::run_node(cfg, obs, || Instant::now() + SHUTDOWN_BUDGET).await
 }
 
 pub async fn run_with_shutdown(
@@ -78,7 +88,7 @@ pub async fn run_with_shutdown(
     obs: Observability,
     shutdown: crate::runtime::ShutdownTrigger,
 ) -> Result<(), BoxError> {
-    assembly::run_node(cfg, obs, move || shutdown.arm()).await
+    assembly::run_node(cfg, obs, move || shutdown.arm_and_get_deadline()).await
 }
 
 #[cfg(all(test, feature = "dfs"))]

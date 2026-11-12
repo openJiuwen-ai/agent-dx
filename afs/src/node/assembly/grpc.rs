@@ -3,7 +3,7 @@
 //! task.
 //!
 //! T8 is fatal class: `serve_with_incoming_shutdown` returning `Err` shuts the
-//! Node down. Stop: `services.stop` drives graceful shutdown of the server.
+//! Node down. `services.stop` drives graceful shutdown after Home drains.
 
 use super::common::{Backends, LocalEndpoints};
 #[cfg(feature = "ownerfs")]
@@ -15,9 +15,31 @@ use crate::{
     node::{Node, rpc},
     runtime::{BoxError, Services, cancelled},
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 const OWNER_ONLY_TCP_MAX_FRAME_SIZE: u32 = 256 * 1024;
+
+pub(super) struct GrpcShutdown {
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    home: Option<Arc<rpc::data::owner_hixl::OwnerHixlService>>,
+}
+
+impl GrpcShutdown {
+    pub(super) async fn drain_home(self, deadline: Instant) -> Result<(), BoxError> {
+        #[cfg(not(all(feature = "ownerfs", feature = "dfs")))]
+        let _ = deadline;
+        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        if let Some(home) = self.home {
+            if let Err(status) = home.drain_until(deadline).await {
+                let error = afs_transport::grpc::error_status::status_to_error(status);
+                afs_logging::error!("ownerfs.hixl_home_drain_failed"; "error" => error.to_string());
+                return Err(error.into());
+            }
+            afs_logging::info!("ownerfs.hixl_home_drained");
+        }
+        Ok(())
+    }
+}
 
 fn configure_node_tcp_server(
     grpc_config: &afs_transport::grpc::GrpcConfig,
@@ -45,7 +67,7 @@ pub(super) fn start(
     backends: &Backends,
     registered_node_epoch: u64,
     services: &mut Services,
-) -> Result<(), BoxError> {
+) -> Result<GrpcShutdown, BoxError> {
     let sessions = &endpoints.sessions;
     #[cfg(feature = "ownerfs")]
     let owner_rdma_sessions = &endpoints.owner_rdma_sessions;
@@ -128,7 +150,40 @@ pub(super) fn start(
             )?),
         },
     );
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    let owner_hixl_source = match (
+        &state.hixl_runtime,
+        state.ownerfs.as_ref(),
+        &backends.hixl_reader,
+    ) {
+        (Some(runtime), Some(ownerfs), Some(_)) => {
+            let mut source = rpc::data::owner_hixl::OwnerHixlService::new(
+                runtime.clone(),
+                ownerfs.peer_executor()?,
+            )
+            .with_owner_metrics(backends.metrics.owner_rpc.clone());
+            if let Some(metrics) = &state.hixl_metrics {
+                source = source.with_metrics(metrics.clone());
+            }
+            Some(Arc::new(source))
+        }
+        _ => None,
+    };
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    if let Some(source) = &owner_hixl_source {
+        super::hixl::spawn_expiry(services, source.clone());
+    }
     #[cfg(feature = "ownerfs")]
+    #[cfg(feature = "dfs")]
+    let owner_files = ownerfs::owner_files_server(
+        cfg,
+        state,
+        &backends.metrics.owner_rpc,
+        owner_rdma_sessions,
+        owner_hixl_source.as_ref(),
+    )?;
+    #[cfg(feature = "ownerfs")]
+    #[cfg(not(feature = "dfs"))]
     let owner_files =
         ownerfs::owner_files_server(cfg, state, &backends.metrics.owner_rpc, owner_rdma_sessions)?;
     #[cfg(feature = "dfs")]
@@ -160,7 +215,10 @@ pub(super) fn start(
             .await
             .map_err(Into::into)
     });
-    Ok(())
+    Ok(GrpcShutdown {
+        #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+        home: owner_hixl_source,
+    })
 }
 
 #[cfg(test)]

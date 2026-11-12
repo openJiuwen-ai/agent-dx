@@ -456,6 +456,55 @@ DFS 的 `copy_file_range` 通过元数据 COW 为目标创建独立 FileVersion�
 
 文件提交和完整元数据同步遇到事务 CAS 未命中时，会重新验证 head 和写租约身份；同身份续期或并发 inode 属性变化不再永久污染 writer。换主和 head 变化仍拒绝。单次处理的持续竞争返回可重试错误，保留原 operation，避免把暂时竞争带到退出 drain。
 
+DFS FUSE 采用缓存的 write-through 模式，只读与可写打开都经过页缓存；`O_DIRECT` 打开和
+不兼容的固定打开视图仍回复 `FOPEN_DIRECT_IO`。内核预读把大的应用 read 拆成较小的请求
+（A3 实测约 1 MiB），顺序预读组把这些请求合并到组窗口。两种传输共享此策略，每个新 DFS
+请求仍重新验证相关 chunk，不跨请求缓存“验证通过”标记。入口指标
+`afs_fuse_callback_size_bytes{filesystem,operation}` 记录内核回调字节数的直方图，
+包含失败回调；其 sum 不是成功读取字节数，INIT 日志中的上限也不是实际请求分布。
+`afs_fuse_read_stage_seconds{filesystem,stage}` 按 front（回调入口到投递）、queue（等待
+dispatch 工作线程）、backend（直到回复字节就绪）、handoff（异步读等待回复线程）、reply
+（写回内核）记录每次读回调的墙钟，包含失败回调；同步读没有 handoff。front 中的写屏障
+（gate）和同步读选择投递队列（route）另行单独记录。
+
+Node 的 `data_mode` 选择正文通道，gRPC 始终承载控制 RPC。`auto` 按当前操作选已装配的候选，
+顺序为 HIXL、RDMA、gRPC。显式 HIXL 面向 OwnerFs 远端缓冲读，禁止 gRPC OPEN 携带正文。
+OwnerFs 继续通过 `RemoteFiles` 和 `OwnerPeerClient` 访问 Home。读窗口、目录批量、失效与
+释放回执属于 Owner 会话。Node 公共数据面执行一次 native 批量拉取和槽摘要校验，向 Owner 会话
+报告未提交、已完成或未知。未知结果触发隔离，并按原读取票据通知 Home 保留导出槽。停止等待的读
+仍由后台任务处理完成和释放。
+
+Node 停机在退场广播前冻结 Home HIXL 新协商和新 Prepare，gRPC 继续处理已认证的 Release 和
+Prepare 携带的 `prior_release`。Home 等待已发布的导出槽归还，并确认在途 Prepare 完成或回滚。
+Home 排空超时后隔离 runtime 并保留未确认槽，返回 `NODE_TRANSFER_DRAIN_INCOMPLETE`。
+随后 Node 在服务与挂载收尾后等待 native HIXL runtime 清理。Runtime 仍校验本地接收槽和导出槽
+的占用与隔离状态，清理错误计入停机失败。HIXL 构建的进程级看门狗覆盖 SDK 清理和 C/C++ 退出处理器。
+
+OwnerFs 远端写在 `auto` 下通过已装配的 RDMA 或 gRPC 正文适配器。显式 HIXL 的远端可写打开
+和创建返回不支持。后续 HIXL 写入预留 Writer 通过 SDK 的 native `WRITE` 向 Home 推送的方向。
+届时由 Home 授权并预留注册的目标缓冲区，Writer 提交并确认传输，Home 校验后执行文件写入。
+传输完成确认与文件写入回执各自独立，结果不确定时按各自阶段保护缓冲区和文件句柄。
+
+DFS 的 `ChunkTransfer` 和 `ReplicaDataPlane` 继续接入 gRPC/RDMA。
+窗口目标大小是 `ownerfs_read_group_bytes`（默认 32 MiB，即八个 4 MiB 窗口）。Home 在协商中公布
+各 lane 的总导出槽数，reader 按会话分摊，再与本地接收槽数和单次 64 个描述符的上限取最小值。
+实际槽大小取两端窗口大小的较小值。同一打开
+认领后复用其切片，本节点写入、setattr 或 `O_TRUNC` 打开使窗口失效。FUSE READ 完全落在窗口内时
+直接共享窗口内存，不再分配和拷贝。小文件另按目录批量取回：Home 用一次 `PrepareBatchHixl` 把
+同一目录下锚点之后的一串整文件装入导出槽（文件不跨槽），reader 按 file identity 与版本认领切片，
+认领四分之一后预取下一批。驻留批量合计不超过
+`max(4 × ownerfs_read_group_bytes, ownerfs_read_group_host_budget_bytes / 2)`：空间不足时只淘汰
+1 秒内无人读取的批量或未被认领的预取批量，不挤掉其他目录正在读的批量；被丢弃的预取批量让其目录
+回到锚点重来。已发出的共享切片仍占用进程字节预算，直到最后一个引用释放。每个 Home 默认
+2 条控制会话，每条同时只准入一次取回。reader 按 `session_idle_ms` 复用空闲会话。取回校验通过后不单独发
+`ReleaseHixlRead`：释放停放在会话上，由该会话下一次 `PrepareReadHixl`／`PrepareBatchHixl` 的
+`prior_release` 携带，Home 在准入前先释放（被拒绝的 Prepare 同样生效，重放命中释放墓碑）。
+Home 发布导出槽时再次确认 read ID 的释放历史，回滚迟到重放自己占用的槽。
+10 ms 内没有下一次 Prepare，或会话要关闭时，reader 再单独发送。传输失败、校验失败等路径仍立即
+单独释放。批量不需要时可关闭 `ownerfs_batch_read`，此时与没有批量时路径相同。
+Home 在窗口和目录批量 Prepare 时，使用普通缓冲定位读，按文件偏移经页缓存填充导出槽。
+reader 仍通过 HIXL 拉取导出槽中的数据并校验槽摘要。
+
 所有启用 OwnerFs 或 DFS 权威能力的 Meta 都要求双向证书身份认证和
 `trusted_node_certs`。CA 只证明证书链可信；Meta 还把握手得到的叶证书 DER 精确
 映射到一个 Node ID，并校验 RPC 中声明的 caller／holder／owner 身份。DFS-only
