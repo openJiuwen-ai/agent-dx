@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::node::vfs::ownerfs::root::{
     OwnerRootInventory, PresentedRootAccess, RootLocation, RootLookupState, RootMeta,
-    RootReservation,
+    RootReservation, root_id_from_name,
 };
 
 struct RejectRemoteFactory;
@@ -544,6 +544,40 @@ fn native_home_anchor_covers_only_root_metadata_until_authority_drops() {
     assert!(lookup_root(&fs, &ctx, "native").is_err());
 }
 
+/// The peer write reply is read through the `RootUse` admitted before the side
+/// effect; re-entering the root would fail once it stops being active.
+#[test]
+fn peer_reply_entry_stays_readable_after_root_revoke() {
+    let (temp, fs, ctx, _disk) = fixture(true);
+    mkdir_root(&fs, &ctx, "workspace");
+    let root_id = root_id_from_name(OsStr::new("workspace")).unwrap();
+    let admitted = fs
+        .require_local()
+        .unwrap()
+        .roots
+        .enter_root(&root_id, RootRight::Write)
+        .unwrap();
+    let relative = StoragePath::new("created").unwrap();
+    let physical = admitted.data_dir().join_path(&relative).unwrap();
+    fs::create_dir_all(temp.path().join(physical.as_path())).unwrap();
+
+    fs.require_local().unwrap().roots.revoke_root(&root_id);
+
+    let error = fs
+        .require_local()
+        .unwrap()
+        .owner_entry_for_path(&root_id, relative.clone(), None)
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_OWNER_GRANT_UNAVAILABLE);
+
+    let entry = fs
+        .require_local()
+        .unwrap()
+        .owner_entry_in_root(&root_id, admitted.data_dir(), relative, None)
+        .unwrap();
+    assert_eq!(entry.attributes.kind, FileKind::Directory);
+}
+
 #[test]
 fn native_home_stale_full_grant_is_rejected() {
     let (_temp, fs, ctx, _disk) = fixture(true);
@@ -768,6 +802,7 @@ fn rmdir_root_cleanup_keeps_new_version_published_during_delete() {
             hook_root.clone(),
             hook_identity,
             attributes.clone(),
+            None,
         );
         state.inode_for_path(
             hook_root,
