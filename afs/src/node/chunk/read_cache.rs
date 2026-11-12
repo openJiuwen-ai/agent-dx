@@ -11,11 +11,14 @@ pub(crate) struct ReadCacheIntent {
     pub(crate) copy: crate::dfs::CopyRecord,
 }
 
+// Read caching is a DFS read-engine feature; this file's own tests also use it.
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadCacheWrite {
     pub(crate) receipt: Option<ReplicaAck>,
     pub(crate) retired: Vec<crate::dfs::CopyRecord>,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl LocalChunkStore {
     pub(crate) fn persist_read_cache(
         &self,
@@ -185,6 +188,7 @@ impl LocalChunkStore {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl LocalChunkStore {
     /// Persist before sending any publication. Removing the physical record
     /// leaves this intent in the same WAL until exact retirement is acknowledged.
@@ -378,6 +382,7 @@ impl LocalChunkStore {
     }
 }
 
+#[cfg(feature = "dfs")]
 impl LocalChunkStore {
     pub(crate) fn has_durable_record(&self, id: &ChunkId) -> Result<bool> {
         Ok(self

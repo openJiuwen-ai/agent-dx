@@ -101,6 +101,7 @@ impl LocalChunkStore {
             outboard_repairs: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
             catalog_path,
             catalog: Mutex::new(catalog),
+            #[cfg(any(feature = "dfs", test))]
             read_cache_admission: Mutex::new(()),
             catalog_committer: CatalogCommitter::default(),
             next_staging: AtomicU64::new(1),
@@ -768,7 +769,7 @@ impl LocalChunkStore {
     /// detect damage outside what is read, which background scrub owns. Copies
     /// without segment CRCs keep the eager full verification (and outboard
     /// build) of `open_verified`.
-    #[cfg(any(feature = "dfs", test))]
+    #[cfg(feature = "dfs")]
     pub(crate) fn open_for_range_reads(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
         let reader = self.open_cataloged(chunk_id)?;
         if reader.segment_crc.is_some() {
