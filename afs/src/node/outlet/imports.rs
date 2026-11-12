@@ -423,5 +423,54 @@ pub fn mount_source(home: &str, users_root: &Path) -> String {
     format!("{}:{}", home, users_root.display())
 }
 
+/// 从挂载源 `<host>:<path>` 取出 host 段。
+///
+/// NFSv4 的 mountinfo source 形如 `192.0.2.10:/home/agentos/users`；IPv6 会被
+/// 方括号包住，形如 `[fe80::1]:/home/agentos/users`，必须先按 `]:` 切，否则
+/// 按第一个 `:` 切只能得到 `[fe80`，与上报地址永远不等，每轮都判"地址变了"
+/// 并重挂。bind 与块设备是纯路径，没有 host 段。返回 `None` 表示"这条挂载
+/// 读不出对端地址"，调用方据此放弃比对而不是猜——猜错会导致每轮拆一次挂载。
+#[must_use]
+pub fn mount_source_host(source: &str) -> Option<&str> {
+    let (host, path) = match source.strip_prefix('[') {
+        Some(rest) => {
+            let (host, path) = rest.split_once("]:")?;
+            if host.is_empty() {
+                return None;
+            }
+            (host, path)
+        }
+        None => source.split_once(':')?,
+    };
+    // 导出路径一定是绝对路径：这条约束顺便挡掉 `fe80::1:/path` 这种无方括号
+    // 的歧义写法（按第一个 `:` 切会得到 host `fe80`），以及误写的 `host:2049:/path`。
+    if host.is_empty() || !path.starts_with('/') || host.contains('/') {
+        return None;
+    }
+    Some(host)
+}
+
+/// 规范化主机标识：`[fe80::1]` 与 `fe80::1` 是同一台机器。
+///
+/// 配置里的 `outlet_nfs_addr` 可能是裸 IPv6，而 mountinfo 一定带方括号，
+/// 直接字符串比较会永远不等。
+#[must_use]
+pub fn normalize_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// 上报地址是否是 IP 字面量。
+///
+/// 只有 IP 才能与 mountinfo 直接比对：`mount.nfs` 会把主机名解析成 IP 再交给
+/// 内核，mountinfo 里留下的是解析结果。若上报的是主机名，把它和 IP 相比会**永远
+/// 不等**，于是每轮都判"地址变了"、每 250ms 拆挂载重挂一次——比不比对更糟。
+/// 主机名场景放弃比对，交给访问失败那条路径。
+#[must_use]
+pub fn is_ip_literal(host: &str) -> bool {
+    normalize_host(host).parse::<std::net::IpAddr>().is_ok()
+}
+
 #[cfg(test)]
 mod tests;

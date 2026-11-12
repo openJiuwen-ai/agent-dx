@@ -636,6 +636,7 @@ impl RootManager {
     /// Reserve a first-level workspace for this entry session.
     /// Same-session retries reuse a pending Home reservation.
     pub fn reserve_workspace(&self, name: &OsStr) -> Result<RootReservation> {
+        validate_root_name(name)?;
         let id = root_id_from_name(name)?;
         let create_intent_id = format!("{}:{}:{}", self.local_node_id, self.session_id, id.0);
         let reservation = self.meta.reserve_root(&id, &create_intent_id)?;
@@ -733,6 +734,9 @@ impl RootManager {
                 "workspace reservation identity is incomplete",
             ));
         }
+        // Home 侧也要拒保留名：entry 侧已经拦过一次，但 Home 收到的是对端
+        // 传来的 name，不能假定对端跑的是同一版策略。
+        validate_root_name(OsStr::from_bytes(&params.name))?;
         if root_id_from_name(OsStr::from_bytes(&params.name))? != reservation.id
             || params.mode & !0o7777 != 0
         {
@@ -2072,6 +2076,41 @@ fn invalid_grant(message: &'static str) -> Error {
 
 fn unavailable_grant(message: &'static str) -> Error {
     Error::coded(afs_error::NODE_OWNER_GRANT_UNAVAILABLE, message)
+}
+
+/// 名字层（`/public`）自己占用的目录名，不能作为 workspace 名。
+///
+/// `/public` 下这两个名字归 outlet 所有：`.pub` 是原子发布的暂存目录（暂存文件
+/// 放在 `<public_root>/.pub/`，也就是"以 workspace 名命名的目录"里），
+/// `.quarantine` 是消费方违约时的隔离区。
+///
+/// 允许它们成为 workspace 会让发布与隔离互相搬运：镜像先把 `/public/.pub`
+/// 挪进隔离区，发布时 `staging_path` 又用 `create_dir_all` 把同名目录建回来，
+/// `rename` 撞上目录失败，下一轮重来。实测单节点每轮 250ms 循环一次、隔离目录
+/// 按秒净增且无上限，tmpfs 堆满后整个名字层的发布一起失败。
+///
+/// 与 [`crate::node::outlet::mirror`] 的发布过滤共用同一份定义，两边不会漂移。
+pub const RESERVED_ROOT_NAMES: [&str; 2] = [".pub", ".quarantine"];
+
+/// 拒绝名字层的保留名。创建 workspace 的两个入口（entry 侧
+/// [`RootManager::reserve_workspace`]、Home 侧校验）都要过这一关。
+///
+/// 单独成一个函数、不塞进 [`root_id_from_name`]，是因为后者是**纯编码**，也被
+/// 用来核对存量 catalog 记录的规范性（启动 reconcile 与 prepare 都拿它比对
+/// `record.id`）。若它开始按策略拒名字，一条历史遗留的 `.pub` 记录就会让节点在
+/// 启动校验里直接失败——把名字层的策略问题升级成不可启动。
+pub fn validate_root_name(name: &OsStr) -> Result<()> {
+    let bytes = name.as_bytes();
+    if RESERVED_ROOT_NAMES
+        .iter()
+        .any(|reserved| reserved.as_bytes() == bytes)
+    {
+        return Err(Error::coded(
+            afs_error::NODE_VFS_INVALID,
+            "root name is reserved by the name layer",
+        ));
+    }
+    Ok(())
 }
 
 /// Encode arbitrary Linux root names without lossy UTF-8 conversion.

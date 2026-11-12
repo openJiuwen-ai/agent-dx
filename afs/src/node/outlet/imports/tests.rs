@@ -261,6 +261,48 @@ fn mount_source_uses_the_shared_users_root() {
     );
 }
 
+/// 挂载源解析回 host：换 IP 的判断就靠这一段。
+#[test]
+fn mount_source_host_splits_the_peer_address() {
+    assert_eq!(
+        mount_source_host("192.0.2.10:/home/agentos/users"),
+        Some("192.0.2.10")
+    );
+    assert_eq!(
+        mount_source_host("node-a.test:/home/agentos/users"),
+        Some("node-a.test")
+    );
+    // bind 与块设备的源是纯路径，没有对端地址可读。
+    assert_eq!(mount_source_host("/home/agentos/users"), None);
+    assert_eq!(mount_source_host("/dev/sda1"), None);
+    assert_eq!(mount_source_host(":/empty-host"), None);
+    assert_eq!(mount_source_host("host:"), None);
+}
+
+/// IPv6 的挂载源带方括号，必须整体取到地址而不是在第一个冒号处截断。
+///
+/// 截断会得到 `[fe80`，与上报的 `fe80::1` 永远不等 —— 每轮都判"地址变了"，
+/// 于是每 250ms 拆挂载重挂一次，把名字层访问拖成间歇失败。
+#[test]
+fn mount_source_host_handles_bracketed_ipv6() {
+    assert_eq!(
+        mount_source_host("[fe80::1]:/home/agentos/users"),
+        Some("fe80::1")
+    );
+    assert_eq!(mount_source_host("[fe80::1]:"), None);
+    assert_eq!(mount_source_host("[]:/home/agentos/users"), None);
+    // 裸 IPv6 不可能出现在 mountinfo（无方括号时无法与路径分隔），读不出即放弃比对。
+    assert_eq!(mount_source_host("fe80::1:/home/agentos/users"), None);
+}
+
+/// 配置里裸写 IPv6、mountinfo 带方括号时，两者必须判为同一个地址。
+#[test]
+fn normalize_host_treats_brackets_as_syntax_not_identity() {
+    assert_eq!(normalize_host("[fe80::1]"), "fe80::1");
+    assert_eq!(normalize_host("fe80::1"), "fe80::1");
+    assert_eq!(normalize_host("192.0.2.10"), "192.0.2.10");
+}
+
 /// 已挂载的 home 即使本轮快照里没有它的 root，也必须继续被维护。
 ///
 /// 真实故障：A 侧快照暂时只含自己托管的 root，于是 node-b 从状态表被裁掉，

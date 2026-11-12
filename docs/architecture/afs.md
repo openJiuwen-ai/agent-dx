@@ -1099,10 +1099,24 @@ Home 节点的本地盘上，不做复制。每台需要读该名字视图的节
 
 **节点侧（已实现）**：每节点跑一份镜像 worker：在 tmpfs 名字层收敛
 `/public/<name> -> <import_root>/<home>/users` 软链，自动维护对端（NFS）与
-本机（bind）的 import 挂载，按退役宽限期回收旧代数据目录；mountinfo 只读
-诊断随轮输出，配置硬前提（独立 tmpfs、宿主 mount namespace、`mount(2)`
-权限）在启动时 fail-closed 校验。Home 侧对外 NFS 导出（OwnerFs egress）
-不在本能力范围内，仍由部署面或独立分支提供。
+本机（bind）的 import 挂载，只回收空的旧代数据目录（非空旧代需显式弃用标记）；
+mountinfo 只读诊断随轮输出，配置硬前提（独立 tmpfs、宿主 mount namespace、
+`mount(2)` 权限）在启动时 fail-closed 校验。
+
+`/public` 下的 `.pub`（原子发布的暂存目录）与 `.quarantine`（消费方违约时的
+隔离区）归镜像所有，不能作为 workspace 名：创建时即拒（`EINVAL`）。快照里若
+仍有同名 root（旧版本所建），镜像也不会发布它——保留名对镜像透明，不发布、
+不删除、不隔离。允许这类名字会让发布与隔离互相搬运：暂存文件就在
+`<public_root>/.pub/`，也就是"以 workspace 名命名的目录"里，每轮重建一次并在
+tmpfs 上无限堆积隔离目录，最终 ENOSPC 让整个名字层发布失败。
+
+对端换 IP 的发现不依赖访问失败：镜像每轮把 mountinfo 里 import 挂载的源地址与
+快照上报的 `home_nfs_addr` 比对，不一致即按 `Remount` 重建（`hard` 挂载访问
+失效对端是阻塞而非报错，且发布只写软链、从不访问 target，所以"读不通"不会以
+发布失败的形式暴露）。读不出 host 的源不参与比对。
+
+Home 侧对外 NFS 导出（OwnerFs egress）不在本能力范围内，仍由部署面或独立分支
+提供。
 
 ## DFS 外部对象持久化边界
 

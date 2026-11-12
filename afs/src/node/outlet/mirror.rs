@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::node::vfs::ownerfs::root::{OutletRoot, root_name_from_id};
+use crate::node::vfs::ownerfs::root::{OutletRoot, RESERVED_ROOT_NAMES, root_name_from_id};
 
 /// One filesystem action the mirror must perform.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,7 +59,11 @@ pub fn target_path(import_root: &str, root: &OutletRoot) -> String {
 }
 
 /// Names the mirror reserves for its own bookkeeping and never publishes.
-const RESERVED: [&str; 2] = [".pub", ".quarantine"];
+///
+/// Defined by OwnerFs because the same set is rejected at workspace creation:
+/// a name the mirror would refuse to publish must never become a root in the
+/// first place. Keeping one definition is what stops the two from drifting.
+const RESERVED: [&str; 2] = RESERVED_ROOT_NAMES;
 
 /// Compute the actions that converge `present` onto `active`.
 ///
@@ -118,6 +122,14 @@ pub fn plan(
     }
 
     for (name, root) in &wanted {
+        // 保留名对镜像来说是透明的：不发布、不隔离、不删除。
+        //
+        // 创建路径已经拒了这些名字，但存量 root（旧版本建的）和别的节点建的
+        // 都可能还在快照里。若在这里放行，`Quarantine` 会把它挪进隔离区、发布
+        // 又把同名目录建回来（暂存目录就在 `<name>/` 里），每轮循环一次。
+        if RESERVED.contains(&name.as_str()) {
+            continue;
+        }
         // Every name in `wanted` counts as "should exist" for the removal pass
         // below, so an unready home never loses an entry it already has.
         let publishable = ready_homes.contains(&root.home_node_id);
@@ -436,6 +448,23 @@ mod tests {
             ]),
         );
         assert!(actions.is_empty());
+    }
+
+    /// Meta 里存在与内部目录同名的 root 时，绝不发布它。
+    ///
+    /// 旧版本允许创建 `.pub`，这类 root 会一直留在 Meta 里。镜像若继续尝试发布，
+    /// 每轮都会"隔离 → 发布时把暂存目录建回来 → 再隔离"，在 tmpfs 上无限堆积
+    /// 隔离目录。保留名对镜像来说是透明的：不发布、不删除、不隔离。
+    #[test]
+    fn a_root_named_like_an_internal_directory_is_never_published() {
+        // hex(".pub") = 2e707562，即 OwnerFs 给这个名字生成的 root id。
+        let actions = plan(
+            "/imports",
+            &[root("root-2e707562", 3, "node-a")],
+            &all_ready(&["node-a"]),
+            &present(&[(".pub", PresentEntry::Foreign)]),
+        );
+        assert!(actions.is_empty(), "保留名不得产生任何动作: {actions:?}");
     }
 
     /// plan 必须是幂等的：执行结果再算一次不应产生动作。

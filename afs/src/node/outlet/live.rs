@@ -284,6 +284,11 @@ impl ImportExecutor {
     /// 120ms），而本循环每 250ms 读一次快照，很容易落进那个窗口。若不防抖，
     /// "看到缺失 → 重挂 → 条目再消失 → 又看到缺失"会形成自激循环，实测每秒
     /// 重建一次、每次约 120ms 路径不可用。
+    ///
+    /// **源地址也要比**：只比对挂载点在不在，会让"对端换了 IP"永久隐身——
+    /// 内核仍保留那条陈旧挂载，`hard` 下访问它是阻塞而非报错，而发布只做
+    /// `symlink` 不碰 target，所以也不会有访问失败来触发重建。地址由
+    /// [`Self::ensure_imports`] 每轮刷新，因此换 IP 的发现最多晚一轮（默认 250ms）。
     pub fn reconcile(&mut self, mounts: &[super::topology::Mount]) {
         let now = std::time::Instant::now();
         let homes: Vec<String> = self.table.homes().map(str::to_owned).collect();
@@ -293,14 +298,31 @@ impl ImportExecutor {
                 use std::os::unix::ffi::OsStrExt;
                 point.as_os_str().as_bytes().to_vec()
             };
-            let in_mountinfo = mounts.iter().any(|mount| mount.mount_point == point_bytes);
+            let entry = mounts.iter().find(|mount| mount.mount_point == point_bytes);
             // 本地 home 的 bind 在 mountinfo 里可能长期不可见（dcache 退化），
             // 用 (ino, dev) 与源比对复核，避免把"已挂载"误判成"缺失"。
             // 远程不追加探测：`stat` 在陈旧 NFS 上会阻塞整个 timeo。
-            let mounted = in_mountinfo
+            let mounted = entry.is_some()
                 || (home == self.local_node && bind_still_mounted(&point, &self.users_root));
+            // 挂载还在，但源地址已经不是快照里上报的那个：这条挂载指向一个
+            // 已不存在（或已属于别人）的地址。判为"挂载可疑"，下一轮 detach
+            // 后按新地址重挂。读不出 host 的源、以及上报值不是 IP 字面量的
+            // 情况都不参与判断：mount.nfs 会把主机名解析成 IP 再挂，拿 IP 和
+            // 主机名比会永远不等，变成每轮重挂。
+            let stale_source = home != self.local_node
+                && self.advertised.get(&home).is_some_and(|expected| {
+                    super::imports::is_ip_literal(expected)
+                        && entry
+                            .and_then(|mount| super::imports::mount_source_host(&mount.source))
+                            .is_some_and(|actual| {
+                                super::imports::normalize_host(actual)
+                                    != super::imports::normalize_host(expected)
+                            })
+                });
             let state = self.table.entry(&home);
-            if mounted {
+            if stale_source {
+                state.observe_access_failure();
+            } else if mounted {
                 state.observe_mounted();
             } else {
                 state.observe_absent(now, super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE);
@@ -1101,6 +1123,154 @@ mod tests {
         )
     }
 
+    /// 名字层的两个内部目录必须都登记在保留名集合里。
+    ///
+    /// 它们在 `live.rs`（`STAGING_DIR` / `QUARANTINE_DIR`）与
+    /// `ownerfs::root::RESERVED_ROOT_NAMES` 各写了一份字面量，这条测试是唯一的
+    /// 防漂移手段：将来若给名字层加第三个内部目录却忘了登记，用户就能建出同名
+    /// workspace，把发布变成"隔离 ↔ 重建"的循环。
+    #[test]
+    fn internal_directories_are_reserved_root_names() {
+        use crate::node::vfs::ownerfs::root::{RESERVED_ROOT_NAMES, validate_root_name};
+        for dir in [STAGING_DIR, QUARANTINE_DIR] {
+            assert!(
+                RESERVED_ROOT_NAMES.contains(&dir),
+                "{dir} 是名字层的内部目录，必须登记为保留名"
+            );
+            assert!(
+                validate_root_name(std::ffi::OsStr::new(dir)).is_err(),
+                "{dir} 不得能建成 workspace"
+            );
+        }
+    }
+
+    /// 一条 mountinfo 条目：`home` 的挂载点，源是 `host:<users_root>`。
+    ///
+    /// `host` 单独给出来，是因为"源地址"正是换 IP 场景要比对的那一段。
+    fn mount_at(dir: &std::path::Path, home: &str, host: &str) -> super::super::topology::Mount {
+        use std::os::unix::ffi::OsStrExt;
+        let point = super::super::imports::mount_point(&dir.join("imports"), home);
+        super::super::topology::Mount {
+            mount_point: point.as_os_str().as_bytes().to_vec(),
+            fs_type: "nfs4".to_owned(),
+            source: format!("{host}:/home/agentos/users"),
+            shared: false,
+        }
+    }
+
+    /// 对端换 IP：即使旧挂载还在 mountinfo 里，也必须重挂到新地址。
+    ///
+    /// 这是 fail-open 的反面。`hard` 挂载访问对端已消失的 NFS 是**阻塞**而不是
+    /// ENOENT，`/public/<name>` 看上去完全正常却读不动，而 `ls -F` 也不会跟随
+    /// 那根链接。更糟的是"发布失败"这条发现途径根本不存在：`Publish` 只做
+    /// `symlink` + `rename`，从不访问 target，所以对端彻底失联也不会让发布失败。
+    /// 唯一可靠的信号是 mountinfo 里的源地址与快照上报的地址不一致。
+    #[test]
+    fn a_changed_source_host_forces_a_remount() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        assert_eq!(mounter.mounted_homes(), vec!["192.0.2.10".to_owned()]);
+
+        // 快照里已经是新地址；旧地址那条挂载仍在 mountinfo 里。
+        let mut moved = root_on("node-a");
+        moved.home_nfs_addr = "203.0.113.99".to_owned();
+        exec.ensure_imports(&[moved.clone()]).unwrap();
+        exec.reconcile(&[mount_at(dir.path(), "node-a", "192.0.2.10")]);
+
+        assert_eq!(
+            exec.ensure_imports(&[moved]).unwrap(),
+            1,
+            "源地址与上报地址不一致的挂载必须重建，而不是继续当作 Ready"
+        );
+        assert_eq!(
+            mounter.mounted_homes().last().map(String::as_str),
+            Some("203.0.113.99"),
+            "重挂必须拨新地址"
+        );
+    }
+
+    /// 源地址与上报地址一致时不得重建：否则每轮都会拆一次挂载。
+    #[test]
+    fn a_matching_source_host_keeps_the_mount_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        let before = mounter.mount_count();
+
+        for _ in 0..3 {
+            exec.reconcile(&[mount_at(dir.path(), "node-a", "192.0.2.10")]);
+            assert_eq!(
+                exec.ensure_imports(&[root_on("node-a")]).unwrap(),
+                0,
+                "地址没变就不该动挂载"
+            );
+        }
+        assert_eq!(mounter.mount_count(), before);
+    }
+
+    /// 上报主机名时不比对：`mount.nfs` 已经把名字解析成 IP，mountinfo 里没有
+    /// 主机名可比。硬比会永远不等 → 每轮拆挂载重挂，反而制造故障。
+    #[test]
+    fn a_hostname_advertisement_is_never_compared_with_the_resolved_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        let mut named = root_on("node-a");
+        named.home_nfs_addr = "node-a.test".to_owned();
+        exec.ensure_imports(&[named.clone()]).unwrap();
+        let before = mounter.mount_count();
+
+        for _ in 0..3 {
+            exec.reconcile(&[mount_at(dir.path(), "node-a", "192.0.2.10")]);
+            assert_eq!(
+                exec.ensure_imports(&[named.clone()]).unwrap(),
+                0,
+                "主机名与解析后的 IP 不可比，不得触发重挂"
+            );
+        }
+        assert_eq!(mounter.mount_count(), before);
+    }
+
+    /// IPv6 的方括号是写法不是身份：`[fe80::1]` 与 `fe80::1` 必须判为同一个地址。
+    #[test]
+    fn a_bracketed_ipv6_source_matches_the_bare_advertisement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        let mut v6 = root_on("node-a");
+        v6.home_nfs_addr = "fe80::1".to_owned();
+        exec.ensure_imports(&[v6.clone()]).unwrap();
+        let before = mounter.mount_count();
+
+        exec.reconcile(&[mount_at(dir.path(), "node-a", "[fe80::1]")]);
+        assert_eq!(exec.ensure_imports(&[v6]).unwrap(), 0, "同一个地址不得重挂");
+        assert_eq!(mounter.mount_count(), before);
+    }
+
+    /// 解析不出 host 的源（例如被外部换成了别的文件系统）不参与比对：
+    /// 判不了就不动，避免每轮拆挂载。
+    #[test]
+    fn an_unparseable_source_does_not_trigger_a_remount() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        let mut mount = mount_at(dir.path(), "node-a", "192.0.2.10");
+        mount.fs_type = "ext4".to_owned();
+        mount.source = "/dev/sda1".to_owned();
+        exec.reconcile(&[mount]);
+
+        assert_eq!(exec.ensure_imports(&[root_on("node-a")]).unwrap(), 0);
+    }
+
     /// 路径不安全的 home id 必须在收敛前被丢弃：挂载点与软链 target 都是
     /// 按 `<root>/<home>/...` 拼出来的，带 `/`、`..` 或绝对形式的 id 会逃出
     /// 预定目录（检视意见：挂载与名字层的边界）。
@@ -1186,16 +1356,7 @@ mod tests {
 
         // 先让它认识 node-a，再模拟内核说已挂载。
         exec.ensure_imports(&[root_on("node-a")]).unwrap();
-        let point = super::super::imports::mount_point(&dir.path().join("imports"), "node-a");
-        let mounts = vec![super::super::topology::Mount {
-            mount_point: {
-                use std::os::unix::ffi::OsStrExt;
-                point.as_os_str().as_bytes().to_vec()
-            },
-            fs_type: "nfs4".to_owned(),
-            source: "node-a:/home/agentos/users".to_owned(),
-            shared: false,
-        }];
+        let mounts = vec![mount_at(dir.path(), "node-a", "192.0.2.10")];
         exec.reconcile(&mounts);
         assert_eq!(exec.ready_count(), 1);
     }
@@ -1331,18 +1492,8 @@ mod tests {
         exec.ensure_imports(&[root_on("node-a")]).unwrap();
         std::thread::sleep(super::super::imports::MOUNT_SETTLE);
 
-        let point = super::super::imports::mount_point(&dir.path().join("imports"), "node-a");
-        let mounts = vec![super::super::topology::Mount {
-            mount_point: {
-                use std::os::unix::ffi::OsStrExt;
-                point.as_os_str().as_bytes().to_vec()
-            },
-            fs_type: "nfs4".to_owned(),
-            source: "node-a:/home/agentos/users".to_owned(),
-            shared: false,
-        }];
-
         // 缺失两轮（未到阈值），再看到一轮，再缺失两轮 —— 不应降级。
+        let mounts = vec![mount_at(dir.path(), "node-a", "192.0.2.10")];
         exec.reconcile(&[]);
         exec.reconcile(&[]);
         exec.reconcile(&mounts);
