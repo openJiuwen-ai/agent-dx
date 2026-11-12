@@ -163,13 +163,7 @@ impl CoordinatorRpc {
                             .get(&stored.assignment.node_id)
                             .ok_or_else(|| Status::unavailable("owner node missing"))?;
                         return Ok(pb::GetEnvironmentResponse {
-                            record: Some(
-                                stored
-                                    .result
-                                    .ok_or_else(|| Status::data_loss("result missing"))?
-                                    .try_into()
-                                    .map_err(status)?,
-                            ),
+                            record: Some((&stored).try_into().map_err(status)?),
                             node_address: node.address.clone(),
                             relay_address: node.proxy_address.clone(),
                         });
@@ -321,7 +315,7 @@ impl CoordinatorRpc {
                     && !stored.invalidated
                 {
                     return Ok(pb::GetEnvironmentResponse {
-                        record: Some(record.try_into().map_err(status)?),
+                        record: Some((&stored).try_into().map_err(status)?),
                         node_address: node.address,
                         relay_address: node.proxy_address,
                     });

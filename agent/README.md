@@ -267,4 +267,4 @@ Template 的 service 声明 HTTP/WS/SSH 协议及端口，例如 `[{"protocol":"
 运行 `make agent-test`。真实 Redis 测试将 `ADX_AGENT_TEST_REDIS_URL` 指向一次性数据库并显式使用 `--ignored`，测试会留下独立命名空间记录。组件测试只证明相应代码与 fixture 覆盖的契约。
 
 
-创建排队确认取消后的重试由Activator管理：Binding保存当前创建尝试序号及5→10→20→40→60秒封顶的退避时间，候选Env ID保持不变；每轮先查询候选Env；候选不存在时，在第一次创建及后续重试前统一检查旧Env已Paused/Deleted或不存在，不区分模板卷模式。旧Env尚未暂停只延后检查，仅确定分配前取消才推进Request ID。结果未知和已有执行的重启恢复仍保持原平台语义，见[创建排队取消与退避](activator/README.md#创建排队取消与退避)。
+创建重试由Activator管理：Binding保存当前创建尝试序号及5→10→20→40→60秒封顶的退避时间，Env ID保持不变；每轮先查询Env。升级候选不存在时，在第一次创建及后续重试前统一检查旧Env已Paused/Deleted或不存在，不区分模板卷模式。旧Env尚未暂停只延后检查。确定分配前取消可推进Request ID；HTTP与嵌入式模式也可在原CREATE明确终态且原Env再次查询确认不存在后推进。序号单调递增且成功后不清零，不作为累计恢复次数上限；退避秒数同样跨删除事件累积，成功不归零，后续恢复沿用上次退避并在60秒封顶，引用退役清除元数据后才重置；每次推进后仍按持久化退避等待后续请求。普通404/409和未知结果均不授权推进。Activator为创建请求注入统一的3次故障重启策略，由Platform执行，模板无需新增配置。详见[创建排队取消与退避](activator/README.md#创建排队取消与退避)和[已删除Env的请求触发重试](activator/README.md#已删除-env-的请求触发重试)。

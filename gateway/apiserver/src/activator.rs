@@ -79,6 +79,11 @@ fn caller(tenant: &str) -> pb::CallerContext {
     }
 }
 fn map_create_status(status: Status) -> EnvironmentError {
+    if status.code() == Code::FailedPrecondition
+        && status.message() == adx_error::CREATE_TERMINAL_MESSAGE
+    {
+        return EnvironmentError::Conflict(status.message().into());
+    }
     match adx_protocol::scheduling_failure(&status) {
         Some(failure) => EnvironmentError::SchedulingCancelled(Box::new(failure)),
         None => map_status(status, true),
@@ -125,6 +130,29 @@ fn map_status(status: Status, write: bool) -> EnvironmentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_the_explicit_terminal_create_reason_survives_the_embedded_adapter() {
+        let message = adx_error::CREATE_TERMINAL_MESSAGE;
+        assert_eq!(
+            map_create_status(Status::failed_precondition(message)),
+            EnvironmentError::Conflict(message.into())
+        );
+        for status in [
+            Status::already_exists(message),
+            Status::aborted(message),
+            Status::failed_precondition("environment specification conflict"),
+        ] {
+            assert_eq!(
+                map_create_status(status),
+                EnvironmentError::Conflict("Environment identity/specification conflict".into())
+            );
+        }
+        assert_eq!(
+            map_status(Status::failed_precondition(message), false),
+            EnvironmentError::Conflict("Environment identity/specification conflict".into()),
+            "only CREATE carries the terminal creation signal"
+        );
+    }
     #[test]
     fn only_confirmed_queue_cancellation_authorizes_another_creation_attempt() {
         let failure = adx_core::scheduling::SchedulingFailure {

@@ -22,7 +22,7 @@
 }
 ```
 
-`requestId` 始终存在并同时通过 `X-Request-Id` 返回。`operationId` 只在暂停、恢复、快照等显式生命周期操作中出现；`environmentId` 仅在请求已经具有稳定实例身份时出现。调用方不能从错误文本推断是否重试。
+错误对象的 `requestId` 标识本次入参请求，始终存在并同时通过 `X-Request-Id` 返回。CREATE 的 SSE `accepted` 事件也使用本次入参请求 ID；成功结果的 `requestId` 则是当前 Env 最初创建时的请求 ID，复用或同名重建时允许与入参不同。成功结果的创建 ID 不参与调用方的重试身份匹配。`operationId` 只在暂停、恢复、快照等显式生命周期操作中出现；`environmentId` 仅在请求已经具有稳定实例身份时出现。调用方不能从错误文本推断是否重试。
 
 SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个 `error` 对象。HTTP 连接中断且没有收到 `final` 时，SDK 按 `OUTCOME_UNKNOWN` 处理，并用原 Request ID 查询或重试。
 
