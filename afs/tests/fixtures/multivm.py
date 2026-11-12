@@ -133,6 +133,7 @@ class Cluster:
         self.gid = config["gid"]
         self.bind = False
         self.helpers = {}
+        self.effective = {}
         # One Meta store per cluster: regenerated configs and Meta restarts
         # within a case keep the same log (and key prefix).
         self.meta_store_toml = meta_store_config()
@@ -530,7 +531,7 @@ class Cluster:
             effective = self.command(
                 role, [root + "/bin/afs-" + ("meta" if role == "M" else "node"), "--config", path, "--print-config"]
             )
-            self.record("config.effective." + role, json.loads(effective["stdout"]))
+            self.effective[role] = self.record("config.effective." + role, json.loads(effective["stdout"]))
 
     def health(self, role, path="/health"):
         code = ("import urllib.request\no=urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
@@ -610,6 +611,30 @@ class Cluster:
             else:
                 assert mount["source"] == "afs-" + self.mode, mount
             self.record("topology." + role, mount)
+
+    def path_visibility_limit(self, role):
+        """Seconds a path-only query on `role` may lag another Node: the DFS
+        kernel entry/attribute TTL from its effective config plus one second."""
+        ttl_ms = self.effective.get(role, {}).get("dfs_kernel_cache_ttl_ms", 0) or 0
+        return (ttl_ms + 1000) / 1000
+
+    def poll_python(self, role, condition, *args, label, setup=""):
+        """Poll a path-only `condition` (a Python expression over `a`, the
+        string arguments) on `role` until it holds or the configured path
+        visibility limit passes, then assert it and record the delay. Use only
+        for path queries (exists, stat by path, listdir, permission checks at
+        open); what a reader does after OPEN is asserted strictly."""
+        limit = self.path_visibility_limit(role)
+        code = (
+            "import time\n" + setup + "\na=sys.argv[2:];t=time.monotonic();d=t+float(sys.argv[1])\n"
+            "while not (" + condition + ") and time.monotonic()<d:time.sleep(0.02)\n"
+            "assert (" + condition + ")\n"
+            'print(json.dumps({"ms":round((time.monotonic()-t)*1000)}))'
+        )
+        value = self.python(role, code, str(limit), *args)
+        result = {"role": role, "limit_s": limit, **json.loads(value["stdout"])}
+        self.record("path_visibility." + label, result)
+        return result
 
     def read(self, role, name, data):
         value = self.python(

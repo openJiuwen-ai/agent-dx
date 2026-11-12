@@ -798,8 +798,18 @@ fn dfs_buffered_open_after_old_lookup_size_reads_fresh_length_without_fstat() {
 #[test]
 #[ignore = "requires Linux /dev/fuse and fusermount3"]
 fn dfs_buffered_new_open_cannot_reuse_an_old_inflight_read_result() {
+    // Uncached names: the competing open's path walk itself enters FUSE.
     for workers in [1, 2, 32] {
-        assert_dfs_open_fences_inflight_read(workers);
+        assert_dfs_open_fences_inflight_read(workers, Duration::ZERO);
+    }
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_buffered_new_open_under_kernel_ttl_cannot_reuse_an_old_inflight_read_result() {
+    // Cached names: the competing open's first FUSE request is OPEN.
+    for workers in [1, 2, 32] {
+        assert_dfs_open_fences_inflight_read(workers, Duration::from_secs(1));
     }
 }
 
@@ -1015,7 +1025,7 @@ impl Drop for ParallelReadGuard<'_> {
     }
 }
 
-fn assert_dfs_open_fences_inflight_read(workers: u16) {
+fn assert_dfs_open_fences_inflight_read(workers: u16, kernel_cache_ttl: Duration) {
     let temp = tempfile::tempdir().unwrap();
     let mount = temp.path().join("mnt");
     std::fs::create_dir(&mount).unwrap();
@@ -1036,7 +1046,10 @@ fn assert_dfs_open_fences_inflight_read(workers: u16) {
                         fuse_workers: workers,
                         ..Default::default()
                     },
-                    ..Default::default()
+                    dfs: fuse::DfsMountOptions {
+                        kernel_cache_ttl,
+                        ..Default::default()
+                    },
                 },
             )
             .unwrap(),
@@ -1071,7 +1084,12 @@ fn assert_dfs_open_fences_inflight_read(workers: u16) {
     // With one worker even the competing LOOKUP must queue behind the old
     // READ. With two, require OPEN itself to reach the frontend before release.
     // Neither case requires the backend OPEN to bypass a correct local fence.
-    let competing_operation = if workers == 1 { "lookup" } else { "open" };
+    // Under a kernel TTL the path walk is cached and OPEN is the first request.
+    let competing_operation = if workers == 1 && kernel_cache_ttl.is_zero() {
+        "lookup"
+    } else {
+        "open"
+    };
     let operation_label = format!("operation=\"{competing_operation}\"");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let new_open_received = loop {
@@ -1463,6 +1481,7 @@ impl Backend for MockBackend {
             .and_then(|handle| state.file_handles.get(&handle.0).copied())
             .unwrap_or(inode.value);
         let node = state.nodes.get(&inode).ok_or_else(not_found)?;
+        self.note(format!("getattr:{inode}"));
         let call = self.getattr_calls.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(attributes(node.kind, node.data.len() as u64 + call))
     }
@@ -2191,17 +2210,28 @@ mod front_gate_ordering {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_options(fuse::FuseMountOptions::default())
+        }
+
+        /// The kernel entry/attribute TTL decides which path requests reach
+        /// FUSE at all; ordering applies to the requests that do.
+        fn with_kernel_ttl(kernel_cache_ttl: Duration) -> Self {
+            Self::with_options(fuse::FuseMountOptions {
+                dfs: fuse::DfsMountOptions {
+                    kernel_cache_ttl,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        }
+
+        fn with_options(options: fuse::FuseMountOptions) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let mount = temp.path().join("mnt");
             std::fs::create_dir(&mount).unwrap();
             let backend = Arc::new(MockBackend::default());
             backend.queued_writes.store(true, Ordering::SeqCst);
-            let session = fuse::mount_dfs_with_options(
-                backend.clone(),
-                &mount,
-                fuse::FuseMountOptions::default(),
-            )
-            .unwrap();
+            let session = fuse::mount_dfs_with_options(backend.clone(), &mount, options).unwrap();
             wait_until_mounted(&mount).unwrap();
             Self {
                 _temp: temp,
@@ -2380,7 +2410,8 @@ mod front_gate_ordering {
     #[test]
     #[ignore = "requires Linux /dev/fuse and fusermount3"]
     fn path_lookup_waits_for_acknowledged_writes() {
-        let fx = Fixture::new();
+        // Uncached names: every path walk sends LOOKUP, which must order.
+        let fx = Fixture::with_kernel_ttl(Duration::ZERO);
         let file = fx.open("a", true);
         let release = acked_blocked_write(&fx, &file);
 
@@ -2402,6 +2433,41 @@ mod front_gate_ordering {
         assert!(
             trace[finished..].iter().any(|seen| seen == "lookup:a"),
             "the path lookup never reached the backend after the write: {trace:?}"
+        );
+    }
+
+    /// With a kernel TTL the path walk may be served from the dentry cache;
+    /// whatever the path query does send to FUSE (LOOKUP or GETATTR) still
+    /// reaches the backend only after the acknowledged write.
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn path_metadata_under_kernel_ttl_waits_for_acknowledged_writes() {
+        let fx = Fixture::with_kernel_ttl(Duration::from_secs(1));
+        let file = fx.open("a", true);
+        let inode = *fx
+            .backend
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get(&(1, std::ffi::OsString::from("a")))
+            .unwrap();
+        let getattr = format!("getattr:{inode}");
+        let release = acked_blocked_write(&fx, &file);
+        let start = fx.backend.trace().len();
+        let path = fx.mount.join("a");
+        let queried = spawn(move || std::fs::metadata(path));
+        std::thread::sleep(QUIET);
+        release.send(()).unwrap();
+        queried.recv_timeout(DEADLINE).unwrap().unwrap();
+        let trace = fx.backend.trace();
+        let finished = fx.position("write:finish");
+        assert!(
+            finished >= start
+                && !trace[start..finished]
+                    .iter()
+                    .any(|seen| seen == "lookup:a" || *seen == getattr),
+            "a path request reached the backend before the acknowledged write: {trace:?}"
         );
     }
 

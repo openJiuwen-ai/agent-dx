@@ -29,6 +29,12 @@ def peer_counter(cluster, role):
     return values[0]
 
 
+READABLE = (
+    "def readable(p):\n try:open(p,\"rb\").close();return True\n"
+    " except OSError as e:\n  if e.errno!=errno.EACCES:raise\n  return False"
+)
+
+
 def read_write(c):
     readers = c.roles[2:]
     before = {r: peer_counter(c, r) for r in readers} if c.mode == "dfs" else {}
@@ -76,7 +82,8 @@ def read_write(c):
         c.workspace("A"),
     )
     for role in readers:
-        c.python(role, "assert not os.path.exists(sys.argv[1])", c.workspace(role) + "/cross.bin")
+        # Path-only query: may lag A by one kernel entry TTL (see c.poll_python).
+        c.poll_python(role, "not os.path.exists(a[0])", c.workspace(role) + "/cross.bin", label="unlink." + role)
 
 
 def namespace(c):
@@ -87,25 +94,21 @@ def namespace(c):
     c.python(
         "B", "assert os.stat(sys.argv[1]).st_size==9;os.rename(sys.argv[1],sys.argv[2])", b + "/dir/old", b + "/dir/new"
     )
+    c.poll_python("A", "not os.path.exists(a[0])", a + "/dir/old", label="rename_source_gone.A")
     c.python(
         "A",
-        (
-            'assert not os.path.exists(sys.argv[1]);f=open(sys.argv[2],"r+b");f.t'
-            "runcate(3);f.flush();os.fsync(f.fileno());f.close()"
-        ),
-        a + "/dir/old",
+        'f=open(sys.argv[1],"r+b");f.truncate(3);f.flush();os.fsync(f.fileno());f.close()',
         a + "/dir/new",
     )
     c.read("B", "dir/new", b"nam")
     c.python("B", "os.unlink(sys.argv[1]);os.rmdir(sys.argv[2])", b + "/dir/new", b + "/dir")
+    c.poll_python("A", "not os.path.exists(a[0])", a + "/dir", label="rmdir.A")
     c.python(
         "A",
         (
-            'assert not os.path.exists(sys.argv[1])\ntry:open(sys.argv[2],"rb")\nex'
-            "cept OSError as e:assert e.errno==errno.ENOENT\nelse:raise AssertionE"
-            'rror("ENOENT expected")'
+            'try:open(sys.argv[1],"rb")\nexcept OSError as e:assert e.errno==errno.ENOENT\n'
+            'else:raise AssertionError("ENOENT expected")'
         ),
-        a + "/dir",
         a + "/missing",
     )
 
@@ -124,8 +127,16 @@ def permissions(c):
         gid=c.config["other_gid"],
     )
     c.python("A", "os.chmod(sys.argv[1],0)", c.workspace("A") + "/private")
+    if c.mode == "dfs":
+        # The permission check at open uses the kernel's cached mode: another
+        # Node's chmod may take one kernel attribute TTL to apply here.
+        c.poll_python("B", "not readable(a[0])", c.workspace("B") + "/private", label="chmod_tighten.B",
+                      setup=READABLE)
     c.python("B", denied, c.workspace("B") + "/private")
     c.python("A", "os.chmod(sys.argv[1],0o600)", c.workspace("A") + "/private")
+    if c.mode == "dfs":
+        c.poll_python("B", "readable(a[0])", c.workspace("B") + "/private", label="chmod_loosen.B",
+                      setup=READABLE)
     c.read("B", "private", b"permissions")
     if c.mode == "ownerfs":
         c.python(
@@ -161,6 +172,22 @@ def visibility(c):
         # Same-version fresh OPEN must also retain the exact data.
         c.read("B", "visible", data)
     permissions(c)
+
+
+def uncached_path_visibility(c):
+    """`dfs_kernel_cache_ttl_ms = 0` restores the uncached contract: another
+    Node's unlink, rename and chmod are visible to path queries at once."""
+    a, b = c.workspace("A"), c.workspace("B")
+    c.write("A", "uncached", b"uncached")
+    c.python("B", "assert os.stat(sys.argv[1]).st_size==8", b + "/uncached")
+    c.python("A", "os.rename(sys.argv[1],sys.argv[2])", a + "/uncached", a + "/uncached-new")
+    c.python("B", "assert not os.path.exists(sys.argv[1]);assert os.path.exists(sys.argv[2])",
+             b + "/uncached", b + "/uncached-new")
+    c.python("A", "os.chmod(sys.argv[1],0)", a + "/uncached-new")
+    c.python("B", READABLE + "\nassert not readable(sys.argv[1])", b + "/uncached-new")
+    c.python("A", "os.unlink(sys.argv[1])", a + "/uncached-new")
+    c.python("B", "assert not os.path.exists(sys.argv[1])", b + "/uncached-new")
+    c.record("uncached_path_visibility", {"limit_s": c.path_visibility_limit("B")})
 
 
 def recovery(c):
