@@ -50,6 +50,8 @@ OCI 配置使用同一个 digest 引用作为默认 rootfs 和自定义镜像的
 
 `bootstrap.image_process_config` 是 guest 内的 entrypoint 元数据路径，默认配置为 `/etc/adx-image-process.json`。启用 `inherit_entrypoint` 时，adxlet 将同一个配置值写入现有 sandboxd `StartRequest.inject_entrypoint` 字段和 Execd 的 `ADX_IMAGE_PROCESS_CONFIG`。该值必须是规范的绝对路径。
 
+使用 sandboxd 启动时，`runtime_profile.env.PATH` 只应用于内置 rootfs。显式选择 OCI 镜像、S3 或已注册的 Local rootfs 时，ADX 保留请求的 `env.PATH`，包括显式空值。节点的 `execd_env.PATH` 优先于请求值。节点和请求均未设置时，sandboxd 使用 OCI 镜像的 `PATH` 或运行时模板的默认值，已注册的 Local 模板也可以提供自己的 `PATH`。其余 `runtime_profile.env` 项继续按原有顺序合并。该规则独立于 `inherit_entrypoint`。
+
 | 请求 | 行为 |
 |---|---|
 | 不传 image | 选择的内置环境直接作为 rootfs；内置 `/__adx/usr -> /usr` 等软链接保证统一入口有效。 |

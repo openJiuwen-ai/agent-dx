@@ -537,7 +537,9 @@ impl Jiuwenbox {
         }
         let mut common = self.launch.clone();
         common.runtime_logs = None;
-        let mut request = sandboxd::start_request(spec, id, generation, devices, &common)?;
+        // The backend image binding uses the runtime profile PATH.
+        let mut request =
+            sandboxd::build_start_request(spec, id, generation, devices, &common, false)?;
         request.envs.remove("ADX_CHECKPOINT_HANDOFF_FILE");
         request.envs.remove("ADX_ENV_FILE");
         request.envs.remove("ADX_EXECD_CONTROL_SOCKET_PATH");

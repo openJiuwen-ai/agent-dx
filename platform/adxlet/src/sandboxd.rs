@@ -598,6 +598,24 @@ pub fn start_request(
     devices: &[adx_core::scheduling::DeviceAllocation],
     config: &Config,
 ) -> Result<proto::StartRequest> {
+    build_start_request(
+        spec,
+        runtime_id,
+        ownership_generation,
+        devices,
+        config,
+        true,
+    )
+}
+
+pub(crate) fn build_start_request(
+    spec: &EnvironmentSpec,
+    runtime_id: &str,
+    ownership_generation: u64,
+    devices: &[adx_core::scheduling::DeviceAllocation],
+    config: &Config,
+    omit_profile_path_for_custom_rootfs: bool,
+) -> Result<proto::StartRequest> {
     spec.validate()?;
     adx_core::scheduling::validate_device_assignment(&spec.scheduling.devices, devices)?;
     if runtime_id.is_empty()
@@ -624,9 +642,16 @@ pub fn start_request(
     }
     validate_protected_ingress(spec)?;
     let environment = spec.runtime_profile.as_ref();
+    let options = &spec.execution;
+    let custom_rootfs = options.rootfs.is_some() || !spec.image.is_empty();
     let mut envs: HashMap<String, String> = spec.env.clone().into_iter().collect();
     if let Some(e) = environment {
-        envs.extend(e.env.clone());
+        for (key, value) in &e.env {
+            if key == "PATH" && custom_rootfs && omit_profile_path_for_custom_rootfs {
+                continue;
+            }
+            envs.insert(key.clone(), value.clone());
+        }
     }
     if let Some(adx_core::execution::Rootfs {
         source: adx_core::execution::StorageSource::Local(path),
@@ -719,7 +744,6 @@ pub fn start_request(
         };
         xpu.entry(kind.into()).or_default().push(d.id);
     }
-    let options = &spec.execution;
     options.validate_tunnel_network(options.network.as_ref())?;
     envs.retain(|key, _| !key.starts_with("EXECD_TUNNEL_"));
     if let Some(port) = options.tunnel_http_port {
@@ -737,7 +761,7 @@ pub fn start_request(
         .iter()
         .map(environment_mount)
         .collect::<Result<Vec<_>>>()?;
-    if options.rootfs.is_some() || !spec.image.is_empty() {
+    if custom_rootfs {
         mounts.extend(environment.map_or_else(Vec::new, |e| {
             vec![proto::Mount {
                 r#type: if e.bootstrap.r#type == "image" {
