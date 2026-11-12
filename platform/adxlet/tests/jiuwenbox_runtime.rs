@@ -324,8 +324,26 @@ fn spec(class: &str) -> EnvironmentSpec {
 async fn inherited_workload_overrides_reach_execd_for_both_jiuwenbox_runtimes() {
     for class in ["supervisor", "conch"] {
         let fixture = Fixture::new();
-        let driver = fixture.driver().await;
+        let bootstrap = &fixture.config.bootstrap;
+        let profile = serde_json::from_value(json!({
+            "rootfs":{"runtime_class":class,"type":"local","path":bootstrap.image},
+            "bootstrap":{"type":"erofs","root":bootstrap.image,"target":bootstrap.target,
+                "entrypoint":bootstrap.command},
+            "env":{"PATH":"/profile/bin"}
+        }))
+        .unwrap();
+        let launch = LaunchConfig {
+            runtime_profile: Some(profile),
+            rpc_timeout: Duration::from_millis(150),
+            env: [("EXECD_HTTP_PORT".into(), "1".into())].into(),
+            ..Default::default()
+        };
         let mut wanted = spec(class);
+        wanted.runtime_profile = launch.runtime_profile.clone();
+        wanted.env.insert("PATH".into(), "/user/bin".into());
+        let driver = Jiuwenbox::with_host(fixture.config.clone(), launch, fixture.host.clone())
+            .await
+            .unwrap();
         let process = json!({
             "commands": [["agent-server", "--port", "18092"]],
             "user": "1000:1000",
@@ -357,6 +375,7 @@ async fn inherited_workload_overrides_reach_execd_for_both_jiuwenbox_runtimes() 
                     .2,
             ] {
                 let env = &request["env"];
+                assert_eq!(env["PATH"], "/profile/bin");
                 assert_eq!(
                     serde_json::from_str::<Value>(env["ADX_WORKLOAD_PROCESS"].as_str().unwrap())
                         .unwrap(),

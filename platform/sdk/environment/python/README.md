@@ -40,6 +40,10 @@ management caller; the API does not enforce per-tenant source-path authorization
 `/tunnel/{environment}` route; the legacy `/invoke` fallback remains unavailable. See the
 [current HTTP contract](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/gateway/apiserver/docs/environment-lifecycle-api.md).
 
+On sandboxd, a custom OCI image supplies its own `PATH`. Pass
+`env={"PATH": "/opt/tools/bin:/usr/bin:/bin"}` when creating an Environment to
+set the request's `PATH` explicitly.
+
 ## OOM diagnostics
 
 Command results and background-command info preserve `exit_signal`, such as
