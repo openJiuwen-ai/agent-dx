@@ -418,7 +418,7 @@ OwnerFs workspace bind 的 3 个键目前没有启动 WARN。
 
 AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集群停机替换（OwnerFs 部署同样适用）：
 
-- **集群线协议**：Node 注册带 `protocol_version`（当前 7，`afs_protocol::CLUSTER_PROTOCOL_VERSION`），Meta 严格比较，不符（含旧 Node 缺省的 0）返回 `META_NODE_PROTOCOL_VERSION`，Node 直接启动失败；Node 之间的通道不握手，依赖经 Meta 准入的同版本部署。
+- **集群线协议**：Node 注册带 `protocol_version`（当前 8，`afs_protocol::CLUSTER_PROTOCOL_VERSION`），Meta 严格比较，不符（含旧 Node 缺省的 0）返回 `META_NODE_PROTOCOL_VERSION`，Node 直接启动失败；Node 之间的通道不握手，依赖经 Meta 准入的同版本部署。
 - **持久格式**：Meta 数据目录（`CURRENT`、WAL 信封、记录决策、状态 image 等）、Redis／etcd key 布局、Node catalog、外部对象 key 前缀，版本不符一律 `STORAGE_FORMAT_INCOMPATIBLE`，不迁移、不自动删除（[规则](../architecture/afs.md#持久格式与协议版本规则)）。
 
 步骤：
@@ -430,6 +430,27 @@ AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集�
 5. 用**同一版本**的二进制先启动 Meta，再启动全部 Node。
 
 回滚只能用旧二进制配旧的完整数据目录与旧桶，不得让旧二进制打开新目录。
+
+#### 协议 7→8（第 2 轮元数据协议）
+
+协议 8 只改线协议，本身不改 Meta 数据目录、WAL、checkpoint、Node catalog 的格式。能否保留数据目录取决于升级起点：
+- **起点已经是当前持久格式**（Meta WAL 信封 3、状态 image 4、记录决策 3）：第 3 步**保留**原数据目录与 chunk 目录，不新建；备份仍建议做。
+- **起点更早**（例如还没有 OwnerFs NFS 出口的版本，状态 image 3）：持久格式已变，第 3 步照上文新建，新 Meta 会以 `STORAGE_FORMAT_INCOMPATIBLE` 拒绝旧目录。
+
+两种情况的其余步骤都同上，**必须先停全部 Node，再停 Meta**。
+
+新 Meta 启动后，先处在 GC 的"读者重启闸门"里：不删任何 inode 与版本，只回收孤儿块。各 Node 注册后，在首个回收周期（≤5 s）或第一次打开文件时，向新 Meta 上报自己打开着的读者；全部上报后闸门打开。核对方法：
+- Meta 的 `afs_meta_dfs_gc_reader_gate_closed` 回到 0；
+- Node 的 `afs_dfs_reader_references_total{kind="soft"}` 开始增长；
+- 旧 Node 二进制若被误启动，会在注册时报 `META_NODE_PROTOCOL_VERSION` 并退出。
+
+**误操作：没停旧 Node 就换了 Meta。** 旧 Node 的心跳重注册会被拒（`META_NODE_PROTOCOL_VERSION`）。旧 Node 把这个错误当可重试处理，最多 25 s 后才失败关闭；协议 8 的 Node 收到它会立即停止。这 25 s 里，旧 Node 的其他请求仍可能打到新 Meta，最坏结果是请求被拒，不会按错误语义执行：
+- 读打开仍用持久的 `UpdateGcReference`，新 Meta 照常接纳；旧 Node 不会向新 Meta 上报读者，闸门会一直关到它的会话过期，GC 只会更保守。
+- Create 不带首个写代，按旧流程处理，写代仍由后续的引用登记接纳。
+- setattr 带客户端 revision，新 Meta 按比较并交换执行，和旧语义相同。如果某次 setattr 先由旧 Meta 执行、回复丢失，再向新 Meta 重发，新 Meta 找不到请求摘要，会以 `META_CATALOG_INVALID_REQUEST` 拒绝。这次 setattr 其实已经生效，应用却会看到报错。
+- 元数据同步：新 Meta 要求 inode revision 完全一致。旧 Node 在 revision 不符时直接报错，应用会在 fsync/close 时看到 `EBUSY`。
+
+所以误操作时，可能有少量 setattr、fsync、close 报错，不会写坏数据。
 
 ### 运维边界
 
@@ -896,7 +917,7 @@ Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_rema
 需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
 不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。
 
-注册请求携带集群线协议代际 `protocol_version`（当前为 7，`afs_protocol::CLUSTER_PROTOCOL_VERSION`，涵盖 Node↔Meta 注册与 Node↔Node service
+注册请求携带集群线协议代际 `protocol_version`（当前为 8，`afs_protocol::CLUSTER_PROTOCOL_VERSION`，涵盖 Node↔Meta 注册与 Node↔Node service
 布局）。Meta 在登记会话前校验，
 不符或缺省（0，旧 Node）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition），
 不写入任何状态；该错误不属于首次注册的可重试类别，Node 直接启动失败。DFS 与 OwnerFs Node

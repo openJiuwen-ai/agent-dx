@@ -183,6 +183,16 @@ pub(super) struct InodeWriteState {
     pub(super) logical_length: u64,
     pub(super) metadata_dirty: bool,
     pub(super) kill_suidgid_dirty: bool,
+    /// A write generation Meta admitted with the file's Create (B1): the
+    /// first write of a new file adopts it instead of admitting its own.
+    pub(super) prepared_generation: Option<(OperationId, Arc<crate::node::gc::GcPin>)>,
+    /// The mtime of the last inode record this state took from Meta, before
+    /// local write times override it: tells an explicit time set elsewhere
+    /// (Meta's mtime moved) from an unrelated inode update (B5).
+    pub(super) meta_mtime_unix_ms: u64,
+    /// Metadata-only syncs rebuilt in a row after Meta refused them on a
+    /// changed inode; bounded by `METADATA_SYNC_REBUILD_LIMIT`.
+    pub(super) metadata_sync_rebuilds: u32,
     pub(super) dirty_extents: DirtyExtentMap,
     pub(super) in_flight: Option<InFlightCommit>,
     pub(super) commit_busy: bool,
@@ -615,6 +625,7 @@ impl DistributedFs {
         base_layout: LayoutRoot,
         logical_length: u64,
     ) {
+        state.meta_mtime_unix_ms = inode.attributes.mtime_unix_ms;
         state.inode = inode;
         state.write_lease = write_lease;
         state.base_version = base_version;
@@ -650,6 +661,7 @@ impl DistributedFs {
         base_layout: LayoutRoot,
         logical_length: u64,
     ) {
+        state.meta_mtime_unix_ms = inode.attributes.mtime_unix_ms;
         state.inode = inode;
         state.base_version = base_version;
         state.base_layout = base_layout;
@@ -799,6 +811,9 @@ impl DistributedFs {
                 logical_length,
                 metadata_dirty: false,
                 kill_suidgid_dirty: false,
+                prepared_generation: None,
+                meta_mtime_unix_ms: inode.attributes.mtime_unix_ms,
+                metadata_sync_rebuilds: 0,
                 dirty_extents: DirtyExtentMap::default(),
                 in_flight: None,
                 commit_busy: false,
@@ -958,6 +973,84 @@ impl DistributedFs {
         }
     }
 
+    /// Keeps the write generation admitted with the file's Create for its
+    /// first write. Dropped (and so released) if the state already has data
+    /// or a base version: the first write then admits its own generation.
+    pub(super) fn prepare_first_generation(
+        &self,
+        inode_id: &InodeId,
+        prepared: (OperationId, Arc<crate::node::gc::GcPin>),
+    ) -> Result<()> {
+        let Some(state) = self.write_state(inode_id)? else {
+            return Ok(());
+        };
+        let mut state = state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if state.base_version.is_none() && state.dirty_extents.is_empty() && !state.dirty {
+            state.prepared_generation = Some(prepared);
+        }
+        Ok(())
+    }
+
+    /// The prepared Create generation if it fits a new generation starting
+    /// from `base`: only a new file's empty base, which is what Meta pinned.
+    pub(super) fn prepared_generation_for(
+        cell: &SharedInodeWriteState,
+        base: Option<&FileVersionId>,
+    ) -> Result<Option<(OperationId, Arc<crate::node::gc::GcPin>)>> {
+        let mut state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if base.is_some() {
+            state.prepared_generation = None;
+            return Ok(None);
+        }
+        Ok(state.prepared_generation.take())
+    }
+
+    /// The write sequence the inode's local state has made visible, if any.
+    pub(super) fn visible_write_seq(&self, inode_id: &InodeId) -> Result<Option<u64>> {
+        let Some(state) = self.write_state(inode_id)? else {
+            return Ok(None);
+        };
+        let state = state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        Ok(Some(state.visible_write_seq))
+    }
+
+    /// B5: explicit times just committed by `SetInodeAttributes` already
+    /// carry what the inode owed Meta for writes up to `observed_seq`; the
+    /// metadata-only sync (and its log record) those writes would trigger is
+    /// dropped. Kept owed whenever anything could still need it: a later
+    /// write, uncommitted data, a commit in flight or a pending privilege
+    /// clear.
+    pub(super) fn supersede_owed_timestamps(
+        &self,
+        inode_id: &InodeId,
+        observed_seq: u64,
+    ) -> Result<()> {
+        let Some(state) = self.write_state(inode_id)? else {
+            return Ok(());
+        };
+        let mut state = state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if state.metadata_dirty
+            && state.visible_write_seq == observed_seq
+            && state.committed_write_seq >= state.visible_write_seq
+            && !state.dirty
+            && state.dirty_extents.is_empty()
+            && state.in_flight.is_none()
+            && !state.commit_busy
+            && !state.kill_suidgid_dirty
+        {
+            state.metadata_dirty = false;
+        }
+        Ok(())
+    }
+
     pub(super) fn has_pending_killpriv(&self, inode_id: &InodeId) -> Result<bool> {
         let Some(state) = self.write_state(inode_id)? else {
             return Ok(false);
@@ -988,6 +1081,7 @@ impl DistributedFs {
             let mut state = state
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            state.meta_mtime_unix_ms = inode.attributes.mtime_unix_ms;
             if state.metadata_dirty {
                 if preserve_dirty_atime {
                     inode.attributes.atime_unix_ms = state.inode.attributes.atime_unix_ms;

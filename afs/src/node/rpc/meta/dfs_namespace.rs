@@ -59,6 +59,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         parent: &crate::dfs::InodeId,
         name: &[u8],
         attributes: crate::dfs::InodeAttributes,
+        first_generation: Option<&crate::dfs::OperationId>,
     ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease)> {
         self.read_diagnostic(
             crate::node::metrics::read_timing::ReadDiagnosticStage::MetaCreate,
@@ -73,6 +74,8 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                         attributes: Some(wire_dfs_attributes(attributes)),
                         owner_session_id: self.session_id.clone(),
                         lease_seconds: crate::dfs::DFS_WRITE_LEASE_SECONDS,
+                        first_generation_operation_id:
+                            first_generation.map(|generation| generation.0.clone()),
                     }))?
                     .into_inner();
                 Ok((

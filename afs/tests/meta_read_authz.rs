@@ -149,6 +149,7 @@ async fn store_with_file() -> (Arc<dyn MetaStore>, WriteLease) {
                 ctime_unix_ms: 1,
             },
             lease_seconds: 30,
+            first_generation: None,
         })
         .await
         .unwrap();

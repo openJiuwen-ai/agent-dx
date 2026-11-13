@@ -97,7 +97,7 @@ impl LeaseInterferenceStore {
                     operation_id: OperationId::new(operation),
                     caller: root_caller(),
                     inode_id: parent.inode_id,
-                    expected_inode_revision: parent.revision,
+                    expected_inode_revision: Some(parent.revision),
                     update: afs::dfs::InodeAttrUpdate {
                         mode: Some(0o555),
                         ..Default::default()
@@ -363,6 +363,7 @@ fn create_request(operation: impl Into<String>, name: impl Into<Vec<u8>>) -> Cre
         name: name.into(),
         attributes: attrs(),
         lease_seconds: 30,
+        first_generation: None,
     }
 }
 
@@ -696,7 +697,7 @@ async fn unlink_retry_rechecks_parent_permissions() {
             operation_id: OperationId::new("parent-writable"),
             caller: root_caller(),
             inode_id: parent.inode_id,
-            expected_inode_revision: parent.revision,
+            expected_inode_revision: Some(parent.revision),
             update: afs::dfs::InodeAttrUpdate {
                 mode: Some(0o777),
                 ..Default::default()

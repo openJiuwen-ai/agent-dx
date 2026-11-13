@@ -197,6 +197,7 @@ fn create_request(operation: impl Into<String>, name: impl Into<Vec<u8>>) -> Cre
         name: name.into(),
         attributes: attrs(),
         lease_seconds: 30,
+        first_generation: None,
     }
 }
 

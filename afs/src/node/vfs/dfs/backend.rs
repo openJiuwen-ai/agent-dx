@@ -275,14 +275,23 @@ impl Backend for DistributedFs {
             || change.mtime.is_some()
             || options.timestamps_now
         {
-            let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
+            // Explicit times replace the write timestamps this Node still
+            // owes Meta, unless a write lands after this point (B5).
+            let explicit_times = change.mtime.is_some() || options.timestamps_now;
+            let observed_seq = if explicit_times {
+                self.visible_write_seq(&inode_id)?
+            } else {
+                None
+            };
+            // Meta applies the change to its current inode and retries a
+            // racing inode update itself (B4): no revision read here.
             let updated = self.refresh_inode_record(
                 self.meta.set_inode_attributes(SetInodeAttrRequest {
                     caller_id: self.identity.node_id.clone(),
                     operation_id: self.identity.operation_id("setattr"),
                     caller: caller_context(ctx),
                     inode_id: inode_id.clone(),
-                    expected_inode_revision: current.revision,
+                    expected_inode_revision: None,
                     update: InodeAttrUpdate {
                         mode: change.mode,
                         uid: change.uid,
@@ -296,6 +305,9 @@ impl Backend for DistributedFs {
                 change.atime.is_none() && !options.timestamps_now,
                 change.mtime.is_none() && !options.timestamps_now,
             )?;
+            if let Some(observed_seq) = observed_seq {
+                self.supersede_owed_timestamps(&inode_id, observed_seq)?;
+            }
             if change.size.is_none() {
                 if killpriv_setattr {
                     self.commit_inode(
@@ -443,6 +455,24 @@ impl Backend for DistributedFs {
             .references
             .as_ref()
             .map(|references| references.created_handle_pin(&operation_id));
+        // B1: the first write generation of the new file is admitted with it
+        // (native write pipeline only; proxy and S3 writers keep their own
+        // admission). Built first for the same reason as `gc_pin`.
+        #[cfg(test)]
+        let create_generation = !self
+            .hooks
+            .create_admits_no_generation
+            .load(Ordering::SeqCst);
+        #[cfg(not(test))]
+        let create_generation = true;
+        let first_generation = match (&self.gc.references, &self.write_resources.pipeline) {
+            (Some(references), Some(_)) if create_generation => {
+                let generation = self.identity.operation_id("native-generation");
+                let pin = references.admitted_generation_pin(&generation);
+                Some((generation, pin))
+            }
+            _ => None,
+        };
         let (inode, write_lease) = self.meta.create(
             &operation_id,
             &self.inode_id(parent)?,
@@ -456,6 +486,7 @@ impl Backend for DistributedFs {
                 mtime_unix_ms: now,
                 ctime_unix_ms: now,
             },
+            first_generation.as_ref().map(|(generation, _)| generation),
         )?;
         let inode = self.validate_inode(inode)?;
         self.recent_names.record(
@@ -464,6 +495,9 @@ impl Backend for DistributedFs {
             name.as_encoded_bytes(),
         );
         self.install_write_state(inode.clone(), write_lease)?;
+        if let Some(prepared) = first_generation {
+            self.prepare_first_generation(&inode.inode_id, prepared)?;
+        }
         let session = self.open_write_session(&inode, flags)?;
         let handle = self.allocate_handle(DfsFileHandle {
             gc_pin,

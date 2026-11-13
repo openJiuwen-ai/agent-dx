@@ -14,6 +14,9 @@ pub(super) struct TestHooks {
     pub(super) native_read_view_ttl: Mutex<Option<Duration>>,
     /// Runs after a read through the write state resolved and protected its view.
     pub(super) write_state_read_after_view: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Create admits no first write generation (B1), so the first write takes
+    /// the per-generation admission path the D tests exercise.
+    pub(super) create_admits_no_generation: std::sync::atomic::AtomicBool,
 }
 
 impl DistributedFs {

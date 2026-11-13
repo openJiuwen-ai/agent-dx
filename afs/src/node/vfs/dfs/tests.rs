@@ -110,6 +110,11 @@ struct RecordingMeta {
     failed_commits: Mutex<Vec<CommitFileVersion>>,
     cas_failed_commits: Mutex<Vec<CommitFileVersion>>,
     metadata_syncs: Mutex<Vec<SyncInodeMetadata>>,
+    setattr_requests: Mutex<Vec<SetInodeAttrRequest>>,
+    /// Metadata syncs still to refuse as if another update had just changed
+    /// the inode on Meta (its revision moves each time).
+    metadata_sync_races: AtomicUsize,
+    created_generations: Mutex<Vec<Option<OperationId>>>,
     failed_metadata_syncs: Mutex<Vec<SyncInodeMetadata>>,
     next_commit_error: Mutex<Option<Error>>,
     commit_error_after_successes: Mutex<Option<(usize, Error)>>,
@@ -185,6 +190,9 @@ impl RecordingMeta {
             failed_commits: Mutex::new(Vec::new()),
             cas_failed_commits: Mutex::new(Vec::new()),
             metadata_syncs: Mutex::new(Vec::new()),
+            setattr_requests: Mutex::new(Vec::new()),
+            metadata_sync_races: AtomicUsize::new(0),
+            created_generations: Mutex::new(Vec::new()),
             failed_metadata_syncs: Mutex::new(Vec::new()),
             next_commit_error: Mutex::new(None),
             commit_error_after_successes: Mutex::new(None),
@@ -417,7 +425,12 @@ impl DfsMeta for RecordingMeta {
         _: &InodeId,
         _: &[u8],
         _: InodeAttributes,
+        first_generation: Option<&OperationId>,
     ) -> Result<(InodeRecord, WriteLease)> {
+        self.created_generations
+            .lock()
+            .unwrap()
+            .push(first_generation.cloned());
         Ok((
             self.inode.lock().unwrap().clone(),
             self.lease.lock().unwrap().clone(),
@@ -506,10 +519,22 @@ impl DfsMeta for RecordingMeta {
             return Err(error);
         }
         let mut inode = self.inode.lock().unwrap();
+        if self
+            .metadata_sync_races
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            inode.revision = inode.revision.saturating_add(1);
+        }
         if inode.revision != sync.expected_inode_revision
             || inode.head_version != sync.expected_head_version
         {
-            return Err(unavailable("test inode metadata CAS failed"));
+            return Err(Error::coded(
+                afs_error::META_DFS_CONFLICT,
+                "test inode metadata CAS failed",
+            ));
         }
         inode.revision = inode.revision.saturating_add(1);
         inode.attributes.mtime_unix_ms = sync.metadata_delta.mtime_unix_ms.unwrap();
@@ -677,9 +702,13 @@ impl DfsMeta for RecordingMeta {
 
     fn set_inode_attributes(&self, request: SetInodeAttrRequest) -> Result<InodeRecord> {
         let mut inode = self.inode.lock().unwrap();
-        if inode.revision != request.expected_inode_revision {
+        if request
+            .expected_inode_revision
+            .is_some_and(|expected| inode.revision != expected)
+        {
             return Err(unavailable("test setattr CAS failed"));
         }
+        self.setattr_requests.lock().unwrap().push(request.clone());
         if let Some(mode) = request.update.mode {
             inode.attributes.mode = mode;
         }

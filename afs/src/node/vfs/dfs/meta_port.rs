@@ -16,12 +16,15 @@ pub trait DfsRemoteOwnerFactory: Send + Sync {
 /// it; implementations that block read that scope on the calling thread.
 pub trait DfsMeta: Send + Sync {
     fn lookup(&self, parent: &InodeId, name: &[u8]) -> Result<Option<InodeRecord>>;
+    /// `first_generation`: admit this write generation's `write:` reference in
+    /// the same transaction (round 2 B1).
     fn create(
         &self,
         operation_id: &OperationId,
         parent: &InodeId,
         name: &[u8],
         attributes: InodeAttributes,
+        first_generation: Option<&OperationId>,
     ) -> Result<(InodeRecord, WriteLease)>;
     fn get_inode(&self, inode_id: &InodeId) -> Result<InodeRecord>;
     fn get_file_version(&self, version_id: &FileVersionId) -> Result<(FileVersion, LayoutRoot)>;

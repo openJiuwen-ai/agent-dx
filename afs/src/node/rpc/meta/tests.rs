@@ -536,6 +536,7 @@ async fn native_write_diagnostics_cover_controls_and_keep_cached_placement_local
                         mtime_unix_ms: 0,
                         ctime_unix_ms: 0,
                     },
+                    None,
                 )
                 .is_err()
             );

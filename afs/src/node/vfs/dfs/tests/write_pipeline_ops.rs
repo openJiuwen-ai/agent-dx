@@ -287,6 +287,9 @@ fn native_generation_retains_gc_reference_through_upload_and_publication() {
     let control = Arc::new(Control::default());
     let references = crate::node::gc::GcReferences::new(control.clone());
     let fs = fs.with_gc_references(Some(references.clone()));
+    fs.hooks
+        .create_admits_no_generation
+        .store(true, Ordering::SeqCst);
     let file = fs
         .create(
             &context(),
@@ -1838,6 +1841,9 @@ fn deferred_admission_keeps_every_chunk_out_of_gc_until_admitted() {
     let control = Arc::new(GatedAdmissionMeta::default());
     let references = crate::node::gc::GcReferences::new(control.clone());
     let fs = Arc::new(fs.with_gc_references(Some(references.clone())));
+    fs.hooks
+        .create_admits_no_generation
+        .store(true, Ordering::SeqCst);
     let file = fs
         .create(
             &context(),
@@ -1903,6 +1909,9 @@ fn transient_admission_failure_is_retried_with_the_same_reference_id() {
         .push_back(Error::coded(afs_error::IO_UNAVAILABLE, "lost reply"));
     let references = crate::node::gc::GcReferences::new(control.clone());
     let fs = fs.with_gc_references(Some(references));
+    fs.hooks
+        .create_admits_no_generation
+        .store(true, Ordering::SeqCst);
     let file = fs
         .create(
             &context(),
@@ -1937,6 +1946,9 @@ fn permanent_admission_failure_rejects_the_generation_and_releases_its_pin() {
     }
     let references = crate::node::gc::GcReferences::new(control.clone());
     let fs = fs.with_gc_references(Some(references.clone()));
+    fs.hooks
+        .create_admits_no_generation
+        .store(true, Ordering::SeqCst);
     for (name, via_fsync) in [("expired-fsync", true), ("expired-close", false)] {
         control.attempts.lock().unwrap().clear();
         let file = fs
@@ -1989,4 +2001,80 @@ fn permanent_admission_failure_rejects_the_generation_and_releases_its_pin() {
         fs.release(&context(), reopened)
             .unwrap_or_else(|error| panic!("{name}: fresh writer saw {error}"));
     }
+}
+
+/// Round 2 B1: Create admits the new file's first write generation, so its
+/// first write needs no admission call (the gate stays closed: any call would
+/// hang), the commit publishes that generation, and the pin is released after.
+#[test]
+fn a_created_file_writes_its_first_generation_without_an_admission_call() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    let control = Arc::new(GatedAdmissionMeta::default());
+    let references = crate::node::gc::GcReferences::new(control.clone());
+    let fs = fs.with_gc_references(Some(references.clone()));
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("created-generation"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    let generation = meta.created_generations.lock().unwrap()[0]
+        .clone()
+        .expect("Create carries the first write generation");
+    let body = vec![9; 4 * 1024 * 1024 + 17];
+    fs.write(&context(), file.handle, 0, &body).unwrap();
+    fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+    assert!(
+        control.attempts.lock().unwrap().is_empty(),
+        "no per-generation admission"
+    );
+    let commits = meta.commits.lock().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].operation_id, generation);
+    drop(commits);
+    fs.release(&context(), file.handle).unwrap();
+    references.flush().unwrap();
+    assert!(
+        control
+            .released
+            .lock()
+            .unwrap()
+            .contains(&format!("write:{}", generation.0)),
+        "the adopted pin is released like any generation pin"
+    );
+}
+
+/// B1 boundary: a created file that is never written still releases the
+/// generation Meta admitted with it.
+#[test]
+fn an_unwritten_created_file_releases_its_admitted_generation() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    let control = Arc::new(GatedAdmissionMeta::default());
+    let references = crate::node::gc::GcReferences::new(control.clone());
+    let fs = fs.with_gc_references(Some(references.clone()));
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("never-written"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    let generation = meta.created_generations.lock().unwrap()[0].clone().unwrap();
+    fs.flush(&context(), file.handle).unwrap();
+    fs.release(&context(), file.handle).unwrap();
+    // The state's pin goes with the write state; release it like the others.
+    drop(fs);
+    references.flush().unwrap();
+    assert!(
+        control
+            .released
+            .lock()
+            .unwrap()
+            .contains(&format!("write:{}", generation.0))
+    );
 }

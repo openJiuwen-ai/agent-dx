@@ -77,6 +77,17 @@ const NAMESPACE_MKDIR_RETRY_LIMIT: usize = 64;
 const NAMESPACE_REMOVE_RETRY_LIMIT: usize = 64;
 const GC_REFERENCE_LOCK_SHARDS: usize = 64;
 
+/// Attempts of one `SetInodeAttributes` without a client revision: each
+/// rebuilds the change on the inode current at that attempt.
+const SETATTR_RETRY_LIMIT: usize = 64;
+/// Plans of one rename against changed state before it reports a conflict.
+const RENAME_RETRY_LIMIT: usize = 64;
+
+enum SetAttrAttempt {
+    Applied(InodeRecord),
+    Retry,
+}
+
 enum NamespaceRemoveAttempt {
     Removed(InodeRecord),
     Retry,
@@ -97,6 +108,10 @@ pub struct CreateFileRequest {
     pub name: Vec<u8>,
     pub attributes: InodeAttributes,
     pub lease_seconds: u64,
+    /// The creator's first write generation (`write:` reference id without the
+    /// prefix), admitted in the Create transaction so the first write needs no
+    /// admission round trip (round 2 B1).
+    pub first_generation: Option<OperationId>,
 }
 
 impl DfsService {

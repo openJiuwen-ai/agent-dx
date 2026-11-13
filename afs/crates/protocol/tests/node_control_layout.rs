@@ -79,5 +79,5 @@ fn service_paths_keep_the_package() {
 /// Generation 7 adds the attributed commit to the proxy sync receipt.
 #[test]
 fn cluster_protocol_generation_includes_the_split_layout() {
-    assert_eq!(CLUSTER_PROTOCOL_VERSION, 7);
+    assert_eq!(CLUSTER_PROTOCOL_VERSION, 8);
 }

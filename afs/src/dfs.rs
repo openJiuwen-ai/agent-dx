@@ -332,7 +332,7 @@ pub struct MknodRequest {
     pub caller: CallerContext,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct InodeAttrUpdate {
     pub mode: Option<u32>,
     pub uid: Option<u32>,
@@ -344,13 +344,18 @@ pub struct InodeAttrUpdate {
     pub timestamps_now: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// One attribute change. The whole request is digested
+/// (`FormatKind::MetaRequestDigest`) so a reused operation id cannot replay
+/// another change.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SetInodeAttrRequest {
     pub caller_id: String,
     pub operation_id: OperationId,
     pub caller: CallerContext,
     pub inode_id: InodeId,
-    pub expected_inode_revision: u64,
+    /// `Some`: compare-and-set against this revision. `None`: apply to the
+    /// current inode, retrying benign revision drift inside Meta (B4).
+    pub expected_inode_revision: Option<u64>,
     pub update: InodeAttrUpdate,
 }
 

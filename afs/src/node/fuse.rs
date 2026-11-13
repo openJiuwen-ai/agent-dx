@@ -971,11 +971,19 @@ impl Filesystem for AfsFuse {
                 if handle.is_some() {
                     AfsFuse::validate_handle_inode_in(&state, ino)?;
                 }
-                let current = backend
-                    .getattr(&context, inode, handle.map(|handle| handle.handle))
-                    .map_err(errno_in(FuseOp::Setattr))?;
+                // Only a mode-only change can be the kernel's legacy privilege
+                // clear; any other setattr needs no current attributes here.
+                let kill_suidgid =
+                    if change.mode.is_some() && change.uid.is_none() && change.gid.is_none() {
+                        let current = backend
+                            .getattr(&context, inode, handle.map(|handle| handle.handle))
+                            .map_err(errno_in(FuseOp::Setattr))?;
+                        is_legacy_privilege_clear(&current, &change)
+                    } else {
+                        false
+                    };
                 let options = SetAttrOptions {
-                    kill_suidgid: is_legacy_privilege_clear(&current, &change),
+                    kill_suidgid,
                     timestamps_now,
                 };
                 Ok(backend.as_ref()).and_then(|backend| {

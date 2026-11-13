@@ -102,6 +102,9 @@ fn pr88_fix_crc32c_meta_resize_after_fullsync_keeps_fence() {
     let control = Arc::new(Pr88GcControl::default());
     let references = crate::node::gc::GcReferences::new(control.clone());
     let fs = fs.with_gc_references(Some(references.clone()));
+    fs.hooks
+        .create_admits_no_generation
+        .store(true, Ordering::SeqCst);
     let file = fs
         .create(
             &context(),
@@ -201,6 +204,9 @@ fn pr88_fix_crc32c_tail_partial_success_retry_keeps_ids_and_receipts() {
     let references = crate::node::gc::GcReferences::new(control.clone());
     let fs = distributed_fs_with_chunk_store(meta.clone(), local.clone(), store.clone())
         .with_gc_references(Some(references.clone()));
+    fs.hooks
+        .create_admits_no_generation
+        .store(true, Ordering::SeqCst);
     let file = fs
         .create(
             &context(),

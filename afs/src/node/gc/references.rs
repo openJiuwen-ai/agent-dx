@@ -323,6 +323,21 @@ impl GcReferences {
             .insert(key, Arc::downgrade(pin));
         Ok(())
     }
+    /// The pin of a write generation Meta admitted inside the Create
+    /// transaction (round 2 B1): no admission call here. Built before the
+    /// Create is sent, so a lost reply still queues its release.
+    pub(crate) fn admitted_generation_pin(
+        self: &Arc<Self>,
+        operation: &crate::dfs::OperationId,
+    ) -> Arc<GcPin> {
+        Arc::new(GcPin {
+            fence: Some(crate::dfs::GcFence::WriteGeneration),
+            deferred: None,
+            id: format!("write:{}", operation.0),
+            owner: self.clone(),
+            open_inode: None,
+        })
+    }
     pub(crate) fn pin_generation(
         self: &Arc<Self>,
         inode: &InodeId,

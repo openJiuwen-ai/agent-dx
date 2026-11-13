@@ -247,7 +247,7 @@ fn reference_entity(
 }
 /// On the wire a `write:` reference names its timestamped operation, which fixes
 /// admission age. The stored id is the hash immutable chunk identities address.
-fn stored_reference_id(id: &str) -> String {
+pub(super) fn stored_reference_id(id: &str) -> String {
     match id.strip_prefix("write:") {
         Some(operation) => format!(
             "write:{}",
@@ -256,6 +256,51 @@ fn stored_reference_id(id: &str) -> String {
         None => id.to_owned(),
     }
 }
+/// The creation time a write generation's timestamped operation identity
+/// (`afs1-<ms>-…`) carries; it bounds when the generation may be admitted.
+pub(super) fn generation_created_ms(operation: &str) -> Result<u64> {
+    operation
+        .strip_prefix("afs1-")
+        .and_then(|value| value.split_once('-'))
+        .and_then(|(time, _)| time.parse::<u64>().ok())
+        .ok_or_else(|| invalid("write generation requires a timestamped operation identity"))
+}
+
+/// A write generation admitted inside another transaction (Create, B1): the
+/// same identity and age rules as `update_gc_reference`, whose admission
+/// deadline here is the commit itself. A generation older than the admission
+/// horizon is refused, so a long-delayed request cannot admit a reference
+/// whose release tombstone may already be gone.
+pub(super) fn generation_reference_admitted_now(
+    node: &str,
+    session: &str,
+    inode: &InodeId,
+    operation: &OperationId,
+) -> Result<GcReference> {
+    let created = generation_created_ms(&operation.0)?;
+    let now = now_unix_ms();
+    if created > now.saturating_add(ADMISSION_HORIZON_MS)
+        || now > created.saturating_add(ADMISSION_HORIZON_MS)
+    {
+        return Err(afs_error::Error::coded(
+            afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED,
+            "write generation is outside its admission window",
+        ));
+    }
+    Ok(GcReference {
+        node_id: node.to_owned(),
+        session_id: session.to_owned(),
+        reference_id: stored_reference_id(&format!("write:{}", operation.0)),
+        inode_id: Some(inode.clone()),
+        publication: true,
+        chunks: Vec::new(),
+        retired_at_unix_ms: None,
+        open_read: None,
+        // A new file has no version: the generation's base is empty.
+        pinned_version: None,
+    })
+}
+
 fn ref_key(node: &str, session: &str, id: &str) -> MetaKey {
     MetaKey::DfsReference {
         node_id: node.into(),
@@ -357,13 +402,7 @@ impl DfsService {
                     ));
                 }
                 if let Some(operation) = &write_operation {
-                    let created = operation
-                        .strip_prefix("afs1-")
-                        .and_then(|value| value.split_once('-'))
-                        .and_then(|(time, _)| time.parse::<u64>().ok())
-                        .ok_or_else(|| {
-                            invalid("write generation requires a timestamped operation identity")
-                        })?;
+                    let created = generation_created_ms(operation)?;
                     if created > now.saturating_add(60_000)
                         || update.admission_deadline_unix_ms > created.saturating_add(60_000)
                     {

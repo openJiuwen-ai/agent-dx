@@ -641,6 +641,7 @@ impl CommitFixture {
                 name: b"snapshot.bin".to_vec(),
                 attributes,
                 lease_seconds: 60,
+                first_generation: None,
             })
             .await
             .unwrap();

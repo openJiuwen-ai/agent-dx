@@ -60,6 +60,7 @@ async fn renewal_fixture(lease_seconds: u64) -> (DfsService, afs::dfs::WriteLeas
                 ctime_unix_ms: 1,
             },
             lease_seconds,
+            first_generation: None,
         })
         .await
         .unwrap();
@@ -98,6 +99,7 @@ async fn lock_resolver_fixture(
                 ctime_unix_ms: 1,
             },
             lease_seconds,
+            first_generation: None,
         })
         .await
         .unwrap();
@@ -2569,6 +2571,7 @@ async fn commit_request_with_copies(
             attributes: Some(test_attrs(0o644, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -3212,6 +3215,7 @@ async fn dfs_commit_accepts_durable_ack_after_unrelated_catalog_advance() {
             attributes: Some(test_attrs(0o644, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -3442,6 +3446,7 @@ async fn dfs_namespace_unlink_removes_name_but_keeps_orphan_inode_for_open_handl
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -3499,6 +3504,7 @@ async fn dfs_namespace_rename_no_replace_and_replace_are_atomic() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -3515,6 +3521,7 @@ async fn dfs_namespace_rename_no_replace_and_replace_are_atomic() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -3681,6 +3688,7 @@ async fn dfs_namespace_errors_preserve_posix_errno() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -3774,6 +3782,7 @@ async fn dfs_namespace_hardlink_symlink_and_readlink_are_metadata_operations() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -3863,6 +3872,7 @@ async fn dfs_generic_xattr_cannot_change_lazy_source() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -3911,6 +3921,7 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -3924,7 +3935,7 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
             operation_id: "chmod-attrs".into(),
             caller: Some(caller(1000, 1000)),
             inode_id: file.inode_id.clone(),
-            expected_inode_revision: file.revision,
+            expected_inode_revision: Some(file.revision),
             update: Some(DfsInodeAttributeUpdate {
                 timestamps_now: false,
                 mode: Some(0o660),
@@ -4119,7 +4130,7 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
             operation_id: "chgrp-owner-supplementary".into(),
             caller: Some(caller_with_groups(1000, 1000, &[1000, 2000])),
             inode_id: file.inode_id.clone(),
-            expected_inode_revision: removed.revision,
+            expected_inode_revision: Some(removed.revision),
             update: Some(DfsInodeAttributeUpdate {
                 timestamps_now: false,
                 mode: Some(0o2660),
@@ -4147,7 +4158,7 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
             // after its supplementary group membership changes.
             caller: Some(caller(1000, 1000)),
             inode_id: file.inode_id.clone(),
-            expected_inode_revision: chgrp.revision,
+            expected_inode_revision: Some(chgrp.revision),
             update: Some(DfsInodeAttributeUpdate {
                 uid: Some(1000),
                 gid: Some(2000),
@@ -4168,7 +4179,7 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
             operation_id: "chown-not-root".into(),
             caller: Some(caller(1000, 1000)),
             inode_id: file.inode_id,
-            expected_inode_revision: unchanged_owner.revision,
+            expected_inode_revision: Some(unchanged_owner.revision),
             update: Some(DfsInodeAttributeUpdate {
                 timestamps_now: false,
                 mode: None,
@@ -4197,6 +4208,7 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
             attributes: Some(test_attrs(0o444, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -4209,7 +4221,7 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
             operation_id: "times-owner-without-write".into(),
             caller: Some(caller(1000, 1000)),
             inode_id: file.inode_id,
-            expected_inode_revision: file.revision,
+            expected_inode_revision: Some(file.revision),
             update: Some(DfsInodeAttributeUpdate {
                 atime_unix_ms: Some(10),
                 mtime_unix_ms: Some(20),
@@ -4230,7 +4242,7 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
             operation_id: "times-world-writable".into(),
             caller: Some(caller(0, 0)),
             inode_id: timed.inode_id.clone(),
-            expected_inode_revision: timed.revision,
+            expected_inode_revision: Some(timed.revision),
             update: Some(DfsInodeAttributeUpdate {
                 mode: Some(0o666),
                 ..Default::default()
@@ -4246,7 +4258,7 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
         operation_id: "times-nonowner-specific".into(),
         caller: Some(caller(2000, 2000)),
         inode_id: writable.inode_id.clone(),
-        expected_inode_revision: writable.revision,
+        expected_inode_revision: Some(writable.revision),
         update: Some(DfsInodeAttributeUpdate {
             atime_unix_ms: Some(30),
             mtime_unix_ms: Some(30),
@@ -4297,7 +4309,7 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
             operation_id: "chown-directory-special".into(),
             caller: Some(caller(0, 0)),
             inode_id: directory.inode_id,
-            expected_inode_revision: directory.revision,
+            expected_inode_revision: Some(directory.revision),
             update: Some(DfsInodeAttributeUpdate {
                 uid: Some(2000),
                 gid: Some(2000),
@@ -4325,6 +4337,7 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -4576,7 +4589,7 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
 }
 
 #[tokio::test]
-async fn dfs_metadata_sync_allows_metadata_revision_drift_without_losing_xattrs() {
+async fn dfs_metadata_sync_refuses_revision_drift_and_a_rebuilt_sync_keeps_xattrs() {
     let dfs = memory_dfs().await;
     let created = dfs
         .create(Request::new(DfsCreateRequest {
@@ -4588,6 +4601,7 @@ async fn dfs_metadata_sync_allows_metadata_revision_drift_without_losing_xattrs(
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -4613,6 +4627,29 @@ async fn dfs_metadata_sync_allows_metadata_revision_drift_without_losing_xattrs(
         .unwrap();
     assert_eq!(with_xattr.revision, initial.revision + 1);
 
+    // A sync built before the xattr change is refused (round 2 B5): it could
+    // otherwise land on top of an explicit utimens. The Node rebuilds it on
+    // the newer revision, which keeps the xattr.
+    let stale = dfs
+        .sync_inode_metadata(Request::new(
+            afs_protocol::meta::SyncDfsInodeMetadataRequest {
+                caller_id: "node-a".into(),
+                operation_id: "sync-drift-stale".into(),
+                inode_id: initial.inode_id.clone(),
+                write_lease: Some(lease.clone()),
+                expected_inode_revision: initial.revision,
+                expected_head_version_id: String::new(),
+                metadata_delta: Some(DfsCommitMetadataDelta {
+                    kill_suidgid: false,
+                    mode: DfsCommitMetadataMode::Full.into(),
+                    mtime_unix_ms: 77,
+                    ctime_unix_ms: 88,
+                }),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), Code::FailedPrecondition);
     let synced = dfs
         .sync_inode_metadata(Request::new(
             afs_protocol::meta::SyncDfsInodeMetadataRequest {
@@ -4620,7 +4657,7 @@ async fn dfs_metadata_sync_allows_metadata_revision_drift_without_losing_xattrs(
                 operation_id: "sync-drift".into(),
                 inode_id: initial.inode_id.clone(),
                 write_lease: Some(lease),
-                expected_inode_revision: initial.revision,
+                expected_inode_revision: with_xattr.revision,
                 expected_head_version_id: String::new(),
                 metadata_delta: Some(DfsCommitMetadataDelta {
                     kill_suidgid: false,
@@ -4673,6 +4710,7 @@ async fn dfs_write_lease_reuses_one_owner_and_fences_stale_commits() {
             }),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
         }))
         .await
         .unwrap()
@@ -4823,6 +4861,7 @@ async fn dfs_namespace_mutations_update_parent_times_and_replay_is_stable() {
             ..attrs.clone()
         },
         lease_seconds: 30,
+        first_generation: None,
     };
     dfs.create(request.clone()).await.unwrap();
     let updated = dfs.get_inode(dir.inode_id.clone()).await.unwrap();
@@ -4912,6 +4951,7 @@ async fn dfs_rename_preserves_other_hardlinks_and_same_inode_is_noop() {
                     ctime_unix_ms: 1,
                 },
                 lease_seconds: 30,
+                first_generation: None,
             })
             .await
             .unwrap();
@@ -5021,6 +5061,7 @@ async fn dfs_namespace_permissions_require_parent_write_and_search() {
             name: b"inside".to_vec(),
             attributes: attrs(0o644, 0, 0, 1),
             lease_seconds: 30,
+            first_generation: None,
         })
         .await
         .unwrap();
@@ -5034,6 +5075,7 @@ async fn dfs_namespace_permissions_require_parent_write_and_search() {
             name: b"root-file".to_vec(),
             attributes: attrs(0o644, 0, 0, 1),
             lease_seconds: 30,
+            first_generation: None,
         })
         .await
         .unwrap();
@@ -5154,6 +5196,7 @@ async fn dfs_namespace_sticky_directories_require_victim_or_directory_owner() {
             name: b"victim".to_vec(),
             attributes: attrs(0o644, 2000, 2000, 1),
             lease_seconds: 30,
+            first_generation: None,
         })
         .await
         .unwrap();
@@ -5181,6 +5224,7 @@ async fn dfs_namespace_sticky_directories_require_victim_or_directory_owner() {
             name: b"source".to_vec(),
             attributes: attrs(0o644, 3000, 3000, 1),
             lease_seconds: 30,
+            first_generation: None,
         })
         .await
         .unwrap();
@@ -5394,6 +5438,7 @@ async fn dfs_namespace_retry_binds_semantics_and_new_inode_identity_scopes_calle
             ctime_unix_ms: 1,
         },
         lease_seconds: 30,
+        first_generation: None,
     };
     let first = dfs.create(request.clone()).await.unwrap();
     assert_eq!(dfs.create(request.clone()).await.unwrap(), first);
@@ -5477,6 +5522,7 @@ async fn dfs_kernel_killpriv_commit_requires_lease_and_preserves_nonexecutable_s
                 attributes: Some(test_attrs(mode, 1)),
                 owner_session_id: "session-a".into(),
                 lease_seconds: 30,
+                first_generation_operation_id: None,
             }))
             .await
             .unwrap()

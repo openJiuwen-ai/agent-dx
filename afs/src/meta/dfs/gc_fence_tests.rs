@@ -304,6 +304,7 @@ async fn fixture() -> Fixture {
             name: b"fenced.bin".to_vec(),
             attributes,
             lease_seconds: 60,
+            first_generation: None,
         })
         .await
         .unwrap();

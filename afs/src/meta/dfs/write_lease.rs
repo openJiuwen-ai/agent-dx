@@ -509,7 +509,11 @@ impl DfsService {
         let current_lease = self
             .validate_write_lease(&caller_id, &sync.inode_id, &sync.write_lease)
             .await?;
-        if current.revision < sync.expected_inode_revision
+        // Exact revision (B5): a sync frozen before another inode update
+        // (an explicit utimens, a chmod) must not land on top of it. The
+        // Node rebuilds the sync on the newer inode, or drops it when the
+        // update already set the times.
+        if current.revision != sync.expected_inode_revision
             || current.head_version != sync.expected_head_version
         {
             return Err(conflict("DFS inode changed before metadata sync"));

@@ -497,10 +497,12 @@ Bao sidecar、Peer cache 条目与目录标记、外部对象 key 前缀、Owner
   内层完整解码之前检查。
 - **改编码必升版本**：字段或变体增删改序、serde 属性、postcard 升级、hash 域串变化，都必须同时升
   对应版本并重新生成 golden；变体下标表（G1）与 golden bytes（G2）在编码变化时失败。没有版本字段的
-  `catalog.wal` 与请求摘要只由 golden 钉住。
+  `catalog.wal` 与请求摘要只由 golden 钉住。请求摘要当前为 2（加入 setattr 请求与 create 的首个写代）；
+  它不改变升级前已落盘的记录：摘要只在同一 operation id 重试时比对，而 operation id 带 Node 的 session，
+  停机升级后所有 Node 都是新 session，旧记录不会再被重放比对。
 - **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
 - **协议**：`RegisterNodeRequest.protocol_version` 是集群线协议代际（Node↔Meta 注册、Node↔Node service
-  布局），当前为 7（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
+  布局），当前为 8（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本，8 为元数据复合操作：setattr 可不带客户端 revision、create 并入首个写代引用、复合打开），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。

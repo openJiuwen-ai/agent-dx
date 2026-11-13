@@ -780,6 +780,9 @@ message DfsCreateRequest {
   DfsInodeAttributes attributes = 6;
   string owner_session_id = 7;
   uint64 lease_seconds = 8;
+  // The creator's first write generation (timestamped operation id); when set,
+  // its `write:` GC reference is admitted in the Create transaction.
+  optional string first_generation_operation_id = 9;
 }
 
 message DfsCreateReply {
@@ -952,7 +955,9 @@ message DfsSetInodeAttributesRequest {
   string operation_id = 2;
   DfsCallerContext caller = 3;
   string inode_id = 4;
-  uint64 expected_inode_revision = 5;
+  // Set: compare-and-set against this revision. Absent: Meta applies the
+  // change to the current inode and retries benign revision drift itself.
+  optional uint64 expected_inode_revision = 5;
   DfsInodeAttributeUpdate update = 6;
 }
 

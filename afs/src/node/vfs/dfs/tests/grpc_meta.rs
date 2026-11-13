@@ -247,8 +247,16 @@ impl DfsMeta for CapturingDfsMeta {
         parent: &InodeId,
         name: &[u8],
         attributes: InodeAttributes,
+        first_generation: Option<&OperationId>,
     ) -> Result<(InodeRecord, WriteLease)> {
-        DfsMeta::create(self.inner.as_ref(), operation_id, parent, name, attributes)
+        DfsMeta::create(
+            self.inner.as_ref(),
+            operation_id,
+            parent,
+            name,
+            attributes,
+            first_generation,
+        )
     }
 
     fn get_inode(&self, inode_id: &InodeId) -> Result<InodeRecord> {

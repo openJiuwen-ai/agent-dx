@@ -147,6 +147,9 @@ impl DfsMetaService for DfsMetaRpc {
                 name: request.name,
                 attributes: domain_dfs_attributes(attributes),
                 lease_seconds: request.lease_seconds,
+                first_generation: request
+                    .first_generation_operation_id
+                    .map(crate::dfs::OperationId::new),
             })
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;

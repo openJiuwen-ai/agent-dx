@@ -1045,6 +1045,7 @@ async fn create_admits_its_handle_reference_atomically_and_a_replay_keeps_one() 
             ctime_unix_ms: 0,
         },
         lease_seconds: 30,
+        first_generation: None,
     };
     let (created, _) = service.create(request.clone()).await.unwrap();
     let key = ref_key("n", "s", &created_handle_reference_id(&operation));
@@ -1088,6 +1089,110 @@ async fn create_admits_its_handle_reference_atomically_and_a_replay_keeps_one() 
             "s".into(),
             vec![created_handle_reference_id(&operation)],
         )
+        .await
+        .unwrap();
+}
+
+/// Round 2 B1: Create admits the creator's first write generation in the same
+/// transaction. It protects the generation's chunks like an `UpdateGcReference`
+/// admission, survives a replay once, and a generation outside its admission
+/// window is refused with the whole Create.
+#[tokio::test]
+async fn create_admits_the_first_write_generation_in_its_transaction() {
+    use crate::meta::dfs::CreateFileRequest as Create;
+    let (store, _) = seeded_store(vec![MetaEntity::DfsInode(InodeRecord {
+        kind: InodeKind::Directory,
+        ..match inode("parent", 2, "v") {
+            MetaEntity::DfsInode(value) => value,
+            _ => unreachable!(),
+        }
+    })])
+    .await;
+    let service = DfsService::new(store.clone());
+    let generation = OperationId::new(format!("afs1-{}-s-native-generation-1", now_unix_ms()));
+    let request = |operation: &str, name: &[u8], generation: OperationId| Create {
+        caller_id: "n".into(),
+        owner_session_id: "s".into(),
+        operation_id: OperationId::new(operation),
+        namespace_id: NamespaceId::new("ns"),
+        parent_inode_id: InodeId::new("parent"),
+        name: name.to_vec(),
+        attributes: InodeAttributes {
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            atime_unix_ms: 0,
+            mtime_unix_ms: 0,
+            ctime_unix_ms: 0,
+        },
+        lease_seconds: 30,
+        first_generation: Some(generation),
+    };
+    let create = request("create-gen", b"file", generation.clone());
+    let (created, _) = service.create(create.clone()).await.unwrap();
+    let wire_id = format!("write:{}", generation.0);
+    let key = ref_key("n", "s", &stored_reference_id(&wire_id));
+    let (revision, entities) = store.read_view().await.unwrap().snapshot().unwrap();
+    let reference = entities
+        .iter()
+        .find_map(|entity| match entity {
+            MetaEntity::DfsReference(value) if crate::meta::store::entity_key(entity) == key => {
+                Some(value.clone())
+            }
+            _ => None,
+        })
+        .expect("the generation reference is in the create txn");
+    assert!(reference.publication);
+    assert_eq!(reference.inode_id, Some(created.inode_id.clone()));
+    assert_eq!(reference.pinned_version, None);
+    // It protects an inventoried chunk of the generation, as an admission does.
+    let generation_chunk = generation_chunk(&generation.0, 'a');
+    let mut with_chunk = entities.clone();
+    with_chunk.push(generation_chunk.clone());
+    let plan = plan_collection(
+        &with_chunk,
+        std::slice::from_ref(&reference),
+        now_unix_ms(),
+        0,
+    );
+    assert!(
+        plan.chunks.is_empty(),
+        "the admitted generation is protected"
+    );
+    // A lost-reply retry replays the outcome and writes nothing.
+    service.create(create).await.unwrap();
+    assert_eq!(
+        store.read_view().await.unwrap().snapshot().unwrap().0,
+        revision
+    );
+    // A generation outside its admission window refuses the Create itself.
+    let stale = OperationId::new(format!(
+        "afs1-{}-s-native-generation-2",
+        now_unix_ms().saturating_sub(ADMISSION_HORIZON_MS + 1_000)
+    ));
+    let error = service
+        .create(request("create-stale", b"stale", stale))
+        .await
+        .expect_err("a stale generation is refused");
+    assert_eq!(
+        error.code(),
+        afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED
+    );
+    assert!(
+        service
+            .lookup(
+                NamespaceId::new("ns"),
+                InodeId::new("parent"),
+                b"stale".to_vec()
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing of the refused Create is visible"
+    );
+    service
+        .release_gc_references("n".into(), "s".into(), vec![wire_id])
         .await
         .unwrap();
 }

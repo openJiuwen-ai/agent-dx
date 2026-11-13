@@ -48,6 +48,7 @@ async fn pending_commit(service: &DfsService) -> CommitFileVersion {
             name: b"external-file".to_vec(),
             attributes,
             lease_seconds: 60,
+            first_generation: None,
         })
         .await
         .unwrap();
