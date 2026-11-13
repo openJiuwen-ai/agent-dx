@@ -71,6 +71,15 @@ Nydus backend 示例（替换实际地址与具体 manifest digest）：
 
 请求为 `HEAD/GET /nydus/{source}/{manifest}/blobs/{blob}`。GET 支持单一字节 Range（含开放结尾、后缀范围），返回 206；无 Range 返回 200；无法满足的范围返回 416。Nydus 自行追加 blob ID。来源信息必须包含 source key 和**具体平台镜像 manifest 的 sha256 digest**；仅有 blob ID 无法推导整张镜像。tag／多平台 index 应在调用方先解析，不接受可变 tag 作为此路径的文件身份。
 
+### Registry 兼容入口
+
+在来源表项下设置 `registry_proxy = true` 后，同一 Node REST 入口提供只读 Registry 请求。sandboxd 的
+Registry proxy 可将 manifest 的 HEAD／GET、blob 的 HEAD／GET Range 交给此入口。每个启用该入口的
+仓库名对应一个配置来源。Registry 请求按来源、仓库与 blob digest 定位懒文件，允许同仓库多个镜像
+版本共享同一 blob。首次直接访问 blob 可从配置源查询长度并准备该文件。
+原生 Nydus 的 `/nydus/` 路由继续按镜像 manifest 定位文件。ADX 部署和验证见
+[Nydus 沙箱启动教程](../docs/deployment/afs-nydus-startup.md)。
+
 ## 核心流程和失败边界
 
 1. 首次 HEAD 或直接 GET：Service 查询并校验固定 manifest，预建 `.afs-nydus/images/{source}/{manifest-hex}/blobs/{blob-hex}` 以及 `descriptor.json`；不展开容器内部文件树，不下载 blob 正文。每个 blob 是一个文件。不同镜像目录下的共享 blob 尚不合并为同一个 inode。
