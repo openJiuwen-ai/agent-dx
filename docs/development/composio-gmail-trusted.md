@@ -1,10 +1,12 @@
 # Composio mail trusted module candidate
 
-Status: an explicit trusted client can mount the authorization/read adapter at
-the actual authenticated entry. Production configuration/owner/budget assembly
-and deployment remain unfinished.
-The separate ingestion module now has explicit existing-process startup assembly.
-Development baseline includes official master `d86a2ee9` and merged #179.
+Status: the existing Gateway process now prepares the configured Composio client,
+encrypted project key, shared PostgreSQL budget and actual owner/Relay adapter.
+Normal connector identities can use fixed account validation; foreground OAuth
+still requires the existing business session. Runtime task-read permission,
+subscription reconciliation, receiver/worker deployment and live mail acceptance
+remain unfinished. The separate ingestion module has its own explicit startup.
+Development baseline includes official master `52c48719` and merged #179.
 Branch: `feat/gmail-composio-trusted`. Phase B extends the existing configuration
 and identity owners in this candidate, with independent design review still required.
 
@@ -68,16 +70,50 @@ The user's first live-test selection is now managed Gmail and personal Outlook.
 Customer-owned OAuth applications remain an optional explicit configuration.
 
 Configuration never comes from request JSON, a model, sandbox or mobile client.
-The project key is imported into #179's server-only namespace. Real route and
-Authority assembly still depends on the actual Registry, Scan and permission
-owners; these constructors do not activate an HTTP authorization/read endpoint.
+The project key is imported into #179's server-only namespace. The existing
+asynchronous `DigitalMateGatewayApi::build` prepares the real client, shared budget
+and owner issuer when trusted `ADX_JIUWEN_CONFIG` enables `composio`. It requires
+matching `privacy`/`digitalmate` templates, not `ingestion`, a webhook secret, a
+background toggle or a model call. The synchronous constructor refuses this
+configuration so startup cannot silently leave the client absent.
+
+The additional configuration section is:
+
+```json
+{
+  "composio": {
+    "auth_configs": {
+      "outlook": {"id": "ac_operator_supplied", "ownership": "composio_managed"}
+    },
+    "organization": "operator-stable-organization",
+    "database": {"database_url_env": "ADX_COMPOSIO_DATABASE_URL", "database_max_connections": 4},
+    "limits": {"organization_per_minute": 60, "user_per_minute": 10}
+  }
+}
+```
+
+`gmail` uses the same optional per-provider shape. Ownership is explicitly
+`custom` or `composio_managed`; the example ID must be replaced by the operator's
+real project configuration. No API key, upstream origin or callback URL is accepted
+in this section. The key comes from existing `ComposioProjectKey` service-secret
+storage. The operator first applies [budget.sql](../../gateway/src/ingress/digitalmategateway/composio/budget.sql);
+startup uses `PostgresBudget::from_pool` and performs no schema creation. Missing
+key/schema, invalid bounds, policy mismatch or a database failure refuses startup.
+The same private bounded/TLS pool builder serves ingestion and request accounting,
+with separate caller-owned pools and schemas; neither borrows the account pool.
+
+The prepared HTTP client, connection pool and request budget are shared between
+requests. The existing request's `Arc<Ingress>` only binds the actual M44 Relay
+adapter, avoiding an API/Ingress reference cycle or a new lifecycle service.
 
 `Scope::from_authenticated_foreground` is an **internal assembly seam**, not an
 authentication implementation. The business identity owner must first validate
 tenant, user, workspace, current foreground purpose and revocation. The type has
 no Deserialize implementation and cannot be constructed by an HTTP JSON decoder.
 Merely calling its constructor or presenting a privacy/crypto bearer proves no
-authority. Background identities and organization sharing are not supported.
+authority. Normal connector workload admission is limited to account validation;
+it cannot create OAuth effects or read mail through the foreground HTTP route.
+Runtime task reads and background admission remain separate requirements.
 
 The stable `dm_` Composio user ID hashes the versioned tenant/user/workspace tuple
 with NUL separators; accepted fields contain no controls. Email is not an identity
@@ -380,3 +416,39 @@ The successful test process also emitted an existing Orbit WebSocket fixture
 SendError panic from an unchanged file while returning0; that observation is
 retained separately rather than reported as a panic-free run. Full-workspace
 Clippy, real two-side HTTPS and PG are still unrun for this new mounted source.
+
+## Formal configuration and account validation follow-up
+
+`POST /api/digitalmate/connectors/v1/composio/validate` accepts only
+`{"connection_id":"..."}`. It requires the actual normal connector-purpose
+identity and live original grant/Binding, not a phone/privacy/delivery bearer.
+The M44 adapter uses existing `connection` and `metadata` owner operations to
+check association, external custody, provider/account/subject and record generation.
+It intentionally accepts an unvalidated current account without requiring
+`usable` or calling `ensure_ready`, so the Registry's own validation cannot recurse.
+
+Gateway then verifies the fixed project/config/ownership account, online mailbox
+profile and a fixed one-ID search probe. Mail IDs/content are discarded. Current
+metadata is checked before the probe and after its result; changes are refused.
+The returned bounded proof contains the exact connection/account/subject,
+authorization generation, record revision, display email and `read_history`
+evidence. The endpoint writes no connection/capability/intent; the original M44
+Registry validates that same record and owns its subsequent CAS. Gmail first
+validation uses its online profile email; Outlook still pins its immutable Graph
+subject and can have an empty display email. Neither case enables a subscription.
+
+The formal process regression first failed on the real unknown `composio` field.
+After implementation, configuration runs once and passes; a fresh PG database
+and actual `IngressService::bind/serve` separately pass two exact startup tests:
+project key/shared budget required with ingestion off, and existing ingestion
+webhook startup/shutdown. The missing budget test proves startup creates no schema.
+The isolated process uses synthetic service/provider configuration, never a live
+Composio key, account, model or mail call.
+
+The paired validation source passes58 Composio cases and331 ordinary Gateway
+library cases, with19 ignored cases still unrun in that suite. Focused Gateway
+library Clippy passes with `-D warnings`. The unchanged Orbit WebSocket fixture's
+background SendError panic remains in the successful ordinary log. Global fmt
+on this Windows CRLF checkout reports988 newline-style diagnostics and no code
+diffs; full-workspace Clippy and actual Gateway-to-M44/Outlook/report/SFS/device
+acceptance are still open. These results do not claim deployed mail delivery.

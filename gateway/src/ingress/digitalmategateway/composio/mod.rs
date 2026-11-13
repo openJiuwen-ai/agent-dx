@@ -1,8 +1,9 @@
 //! Restricted Composio authorization and mail reads outside user sandboxes.
 //!
 //! The fixed entry can retain actual foreground sessions and call M44 through
-//! its purpose issuer and existing ADX Relay. Formal process configuration and
-//! background workload assembly remain separate integration requirements.
+//! its purpose issuer and existing ADX Relay. Explicit process configuration
+//! prepares the shared client and budget; normal workloads can only validate
+//! account references. Task reads and background assembly need their real owners.
 //! A crypto bearer or JSON scope grants no connector or mail permission.
 
 mod budget;
@@ -10,16 +11,20 @@ mod client;
 pub mod http;
 mod outlook;
 mod owner;
+#[cfg(unix)]
+mod startup;
 mod types;
 mod webhook;
 
 pub use budget::{PostgresBudget, RequestBudgetLimits};
+#[cfg(unix)]
+pub(crate) use startup::{ComposioConfig, PreparedComposio};
 pub use webhook::{VerifiedWebhook, WebhookError, WebhookVerifier};
 
 pub use types::{
-    Attempt, AttemptPhase, Authority, Budget, ConnectionGrant, Error, GmailRequest, MailAuthConfig,
-    MailAuthConfigs, MailProvider, MailRequest, OAuthAppOwnership, OutlookRequest, Permissions,
-    Scope, Started, VerifiedAccount,
+    Attempt, AttemptPhase, Authority, Budget, ConnectionGrant, ConnectionMetadata, Error,
+    GmailRequest, MailAuthConfig, MailAuthConfigs, MailProvider, MailRequest, OAuthAppOwnership,
+    OutlookRequest, Permissions, Scope, Started, VerifiedAccount,
 };
 
 use client::Client;
@@ -33,6 +38,75 @@ pub struct Composio {
 }
 
 impl Composio {
+    /// Fixed account/profile and one-ID read probe for the real M44 validator.
+    /// Returns no mail, creates no connection/consent and does not require an
+    /// already usable snapshot: the Registry owns the subsequent validation CAS.
+    pub async fn validate_account(
+        &self,
+        scope: &Scope,
+        connection_id: &str,
+    ) -> Result<serde_json::Value, Error> {
+        let current = self.authority.metadata(scope, connection_id).await?;
+        let provider = current.check(connection_id)?;
+        self.client
+            .account(scope, &current.external_account_id, None, provider)
+            .await?;
+        let profile = self
+            .client
+            .profile(scope, &current.external_account_id, provider)
+            .await?;
+        if (provider == MailProvider::Microsoft
+            && profile.subject_id != current.external_subject_id)
+            || (provider == MailProvider::Google
+                && !current.identity_user_id.is_empty()
+                && !current
+                    .identity_user_id
+                    .eq_ignore_ascii_case(&profile.email))
+        {
+            return Err(Error::AccountMismatch);
+        }
+        let request = match provider {
+            MailProvider::Google => MailRequest::Gmail(GmailRequest::Search {
+                query: String::new(),
+                limit: 1,
+                page: String::new(),
+            }),
+            MailProvider::Microsoft => MailRequest::Outlook(OutlookRequest::Search {
+                sender: String::new(),
+                since: String::new(),
+                until: String::new(),
+                limit: 1,
+                page: String::new(),
+            }),
+        };
+        // A fixed minimal permission probe, never a caller-selected mail request.
+        // Its IDs are discarded and cannot be exposed by this account endpoint.
+        let probe = ConnectionGrant {
+            provider,
+            subject_id: profile.subject_id.clone(),
+            account_id: current.external_account_id.clone(),
+            email: profile.email.clone(),
+            generation: current.authorization_generation,
+            permissions: Permissions {
+                search: true,
+                read_headers: false,
+                read_body: false,
+            },
+        };
+        if self.authority.metadata(scope, connection_id).await? != current {
+            return Err(Error::Forbidden);
+        }
+        let _ = self.client.mail(scope, &probe, request).await?;
+        if self.authority.metadata(scope, connection_id).await? != current {
+            return Err(Error::Forbidden);
+        }
+        Ok(serde_json::json!({
+            "connection_id":current.connection_id, "provider":current.provider, "backend":"composio",
+            "account_id":current.external_account_id, "subject_id":current.external_subject_id,
+            "authorization_generation":current.authorization_generation, "record_revision":current.record_revision,
+            "email":profile.email, "granted_capabilities":["read_history"]
+        }))
+    }
     /// Actual M44 HTTP/Relay assembly; all owner requests use the existing
     /// purpose issuer and the current foreground session retained by Scope.
     pub fn with_m44_configs(

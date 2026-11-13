@@ -53,6 +53,9 @@ pub struct DigitalMateGatewayConfig {
     #[cfg(unix)]
     #[serde(default)]
     pub(crate) ingestion: Option<super::ingestion::IngestionConfig>,
+    #[cfg(unix)]
+    #[serde(default)]
+    pub(crate) composio: Option<super::composio::ComposioConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -165,16 +168,22 @@ impl DigitalMateGatewayConfig {
 
     pub fn validate(&self) -> Result<(), Error> {
         #[cfg(unix)]
+        if let Some(composio) = &self.composio {
+            composio.validate().map_err(|_| invalid())?;
+        }
+        #[cfg(unix)]
         if let Some(ingestion) = &self.ingestion {
             ingestion.validate().map_err(|_| invalid())?;
-            if self
+        }
+        #[cfg(unix)]
+        if (self.ingestion.is_some() || self.composio.is_some())
+            && self
                 .privacy
                 .as_ref()
                 .zip(self.digitalmate.as_ref())
                 .is_none_or(|(privacy, app)| privacy.template != app.template)
-            {
-                return Err(invalid());
-            }
+        {
+            return Err(invalid());
         }
         #[cfg(unix)]
         if let Some(privacy) = &self.privacy {
@@ -245,6 +254,8 @@ pub struct DigitalMateGatewayApi {
     managed: Arc<ManagedService>,
     composio: Option<Arc<super::composio::Composio>>,
     #[cfg(unix)]
+    prepared_composio: Option<super::composio::PreparedComposio>,
+    #[cfg(unix)]
     privacy: Option<super::privacy_runtime::PrivacyRuntime>,
     #[cfg(unix)]
     ingestion: Option<PreparedIngestion>,
@@ -260,17 +271,34 @@ impl DigitalMateGatewayApi {
     /// Explicit trusted assembly. The caller must supply the real M44 Authority
     /// and shared budget; no user request can construct or replace this client.
     pub fn with_composio(mut self, gateway: Arc<super::composio::Composio>) -> Result<Self, Error> {
+        #[cfg(unix)]
+        if self.prepared_composio.is_some() {
+            return Err(invalid());
+        }
         self.foreground_admission().map_err(|_| invalid())?;
         self.composio = Some(gateway);
         Ok(self)
     }
 
-    pub(crate) async fn connector_request<B>(&self, request: Request<B>) -> Response<ProxyBody>
+    pub(crate) async fn connector_request<B>(
+        &self,
+        request: Request<B>,
+        ingress: Arc<Ingress>,
+    ) -> Response<ProxyBody>
     where
         B: hyper::body::Body<Data = Bytes> + Send + 'static,
         B::Error: std::error::Error + Send + Sync + 'static,
     {
-        let Some(gateway) = &self.composio else {
+        let gateway = self.composio.clone();
+        #[cfg(unix)]
+        let gateway = gateway.or_else(|| {
+            self.prepared_composio
+                .as_ref()
+                .map(|prepared| Arc::new(prepared.bind(ingress)))
+        });
+        #[cfg(not(unix))]
+        let _ = ingress;
+        let Some(gateway) = gateway else {
             return error(StatusCode::NOT_FOUND, "NOT_FOUND");
         };
         if request.uri().path() == super::composio::http::CALLBACK_PATH {
@@ -280,11 +308,13 @@ impl DigitalMateGatewayApi {
             return super::composio::http::callback_landing()
                 .map(|value| value.map_err(|never| match never {}).boxed_unsync());
         }
-        let admission = match self.foreground_admission() {
-            Ok(value) => value,
-            Err(failure) => return auth_error(failure),
-        };
-        let identity = match admission.authenticate(request.headers()).await {
+        let scope = match self
+            .connector_scope(
+                request.headers(),
+                request.uri().path() == super::composio::http::VALIDATE_PATH,
+            )
+            .await
+        {
             Ok(value) => value,
             Err(failure) => return auth_error(failure),
         };
@@ -299,23 +329,41 @@ impl DigitalMateGatewayApi {
             Ok(Err(_)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "INVALID_REQUEST"),
             Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "INVALID_REQUEST"),
         };
-        if let Err(failure) = identity.check().await {
+        if let Err(failure) = scope.check_authentication().await {
             return auth_error(failure);
         }
-        let scope = match super::composio::Scope::from_foreground_identity(identity.clone()) {
-            Ok(value) => value,
-            Err(_) => return error(StatusCode::FORBIDDEN, "FORBIDDEN"),
-        };
         let response = super::composio::http::handle(
-            gateway,
+            &gateway,
             &scope,
             Request::from_parts(parts, Full::new(bytes)),
         )
         .await;
-        if let Err(failure) = identity.check().await {
+        if let Err(failure) = scope.check_authentication().await {
             return auth_error(failure);
         }
         response.map(|value| value.map_err(|never| match never {}).boxed_unsync())
+    }
+
+    async fn connector_scope(
+        &self,
+        headers: &http::HeaderMap,
+        validation: bool,
+    ) -> accounts::Result<super::composio::Scope> {
+        if validation {
+            if !accounts::bearer(headers)?.starts_with("dm-connector-v1.") {
+                return Err(accounts::Error::Unauthorized);
+            }
+            #[cfg(unix)]
+            return super::composio::Scope::from_connector_identity(
+                self.connector_workload_identity(headers).await?,
+            )
+            .map_err(|_| accounts::Error::Forbidden);
+            #[cfg(not(unix))]
+            return Err(accounts::Error::Unavailable);
+        }
+        let identity = self.foreground_admission()?.authenticate(headers).await?;
+        super::composio::Scope::from_foreground_identity(identity)
+            .map_err(|_| accounts::Error::Forbidden)
     }
     /// Foreground connector admission uses only the configured DigitalMate
     /// application. It never falls back to Jiuwen or Orbit or reads model keys.
@@ -367,7 +415,7 @@ impl DigitalMateGatewayApi {
         auth: Arc<dyn BusinessAuth>,
     ) -> Result<Self, Error> {
         #[cfg(unix)]
-        if config.ingestion.is_some() {
+        if config.ingestion.is_some() || config.composio.is_some() {
             return Err(invalid());
         }
         Self::new_inner(
@@ -401,6 +449,37 @@ impl DigitalMateGatewayApi {
             #[cfg(unix)]
             inbox.clone(),
         )?;
+        #[cfg(unix)]
+        if let Some(settings) = &api.config.composio {
+            let privacy = api.privacy.as_ref().ok_or_else(invalid)?;
+            let bytes = privacy
+                .center
+                .service_secret(
+                    &api.config.tenant,
+                    accounts::ServiceSecretName::ComposioProjectKey,
+                )
+                .await
+                .map_err(|_| invalid())?
+                .and_then(|value| value.plaintext)
+                .ok_or_else(|| Error::Invalid("Composio project key is required".into()))?;
+            let key = std::str::from_utf8(&bytes)
+                .map_err(|_| invalid())?
+                .to_owned();
+            api.prepared_composio = Some(
+                settings
+                    .prepare(
+                        key,
+                        api.authorization_owner().map_err(|_| invalid())?,
+                        api.managed.clone(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        Error::Unavailable(
+                            "Composio client or shared accounting initialization failed".into(),
+                        )
+                    })?,
+            );
+        }
         #[cfg(unix)]
         if let Some(settings) = api.config.ingestion.clone() {
             let privacy = api.privacy.as_ref().ok_or_else(invalid)?;
@@ -479,6 +558,8 @@ impl DigitalMateGatewayApi {
             managed,
             composio: None,
             #[cfg(unix)]
+            prepared_composio: None,
+            #[cfg(unix)]
             privacy,
             #[cfg(unix)]
             ingestion: None,
@@ -550,7 +631,7 @@ impl DigitalMateGatewayApi {
         if super::composio::http::matches(request.uri().path())
             || request.uri().path() == super::composio::http::CALLBACK_PATH
         {
-            return self.connector_request(request).await;
+            return self.connector_request(request, ingress).await;
         }
         let application = match request.uri().path() {
             "/orbit/ws" => Some(self.config.orbit.as_ref()),

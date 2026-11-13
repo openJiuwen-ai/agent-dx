@@ -11,12 +11,19 @@ use zeroize::Zeroizing;
 
 pub const PREFIX: &str = "/api/digitalmate/connectors/v1/composio";
 pub const CALLBACK_PATH: &str = "/api/digitalmate/connectors/v1/composio/callback";
+pub const VALIDATE_PATH: &str = "/api/digitalmate/connectors/v1/composio/validate";
 const MAX_REQUEST_BYTES: usize = 16_384;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Registration {
     registration: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Validation {
+    connection_id: String,
 }
 
 #[derive(Deserialize)]
@@ -115,7 +122,7 @@ pub fn matches(path: &str) -> bool {
     path.strip_prefix(PREFIX).is_some_and(|suffix| {
         matches!(
             suffix,
-            "/start" | "/state" | "/confirm" | "/cancel" | "/mail"
+            "/start" | "/state" | "/confirm" | "/cancel" | "/mail" | "/validate"
         )
     })
 }
@@ -190,6 +197,13 @@ async fn dispatch(
     bytes: &[u8],
 ) -> Result<Value, Error> {
     match path.strip_prefix(PREFIX) {
+        Some("/validate") => {
+            let request: Validation = decode(bytes)?;
+            reference(&request.connection_id)?;
+            gateway
+                .validate_account(scope, &request.connection_id)
+                .await
+        }
         Some("/confirm") => {
             let request: Confirmation = decode(bytes)?;
             reference(&request.registration)?;

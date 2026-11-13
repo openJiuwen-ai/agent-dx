@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use deadpool_postgres::Pool;
 use sha2::{Digest, Sha256};
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestBudgetLimits {
     pub organization_per_minute: i64,
     pub user_per_minute: i64,

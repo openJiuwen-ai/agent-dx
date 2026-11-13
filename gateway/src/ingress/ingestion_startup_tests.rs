@@ -2,8 +2,10 @@
 //! subscription intent and upstream service endpoints are controlled fixtures.
 use super::*;
 use crate::ingress::digitalmategateway::{
-    composio::WebhookVerifier, entrypoint::DigitalMateGatewayConfig,
-    ingestion::SubscriptionBinding, server_config::import_composio_webhook_secret,
+    composio::WebhookVerifier,
+    entrypoint::DigitalMateGatewayConfig,
+    ingestion::SubscriptionBinding,
+    server_config::{import_composio_key, import_composio_webhook_secret},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use deadpool_postgres::{Manager, Pool};
@@ -18,8 +20,22 @@ fn write(path: &Path, value: serde_json::Value) {
 #[tokio::test]
 #[ignore = "requires the explicit task-owned PostgreSQL database"]
 async fn formal_ingestion_startup_requires_secret_mounts_webhook_and_stops() {
+    run_startup_case(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit task-owned PostgreSQL database"]
+async fn formal_composio_startup_requires_project_key_and_shared_budget_without_ingestion() {
+    run_startup_case(true).await;
+}
+
+async fn run_startup_case(composio_only: bool) {
     if std::env::var_os("ADX_INGESTION_STARTUP_CHILD").is_some() {
-        child().await;
+        if composio_only {
+            composio_child().await;
+        } else {
+            child().await;
+        }
         return;
     }
     let url = std::env::var("ADX_INGESTION_TEST_DATABASE_URL").unwrap();
@@ -57,16 +73,23 @@ async fn formal_ingestion_startup_requires_secret_mounts_webhook_and_stops() {
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o600)).unwrap();
     let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let gateway = directory.path().join("gateway.json");
-    write(
-        &gateway,
-        json!({
-            "tenant":"startup-test", "jiuwen":{"agent_type":"jiuwen","template":"jiuwen","version":"1"},
-            "digitalmate":{"template":"digitalmate","template_ref":"1","backend_path":"/digitalmate/ws","service_port":8080},
-            "privacy":{"listen":"127.0.0.1:0","template":"digitalmate","tls_certificate":fixture.join("ingress-cert.pem"),"tls_private_key":fixture.join("ingress-key.pem")},
-            "ingestion":{"database_url_env":"ADX_STARTUP_DB_URL","database_allow_plaintext":true,"database_max_connections":8,
-                "workers":1,"lease_seconds":30,"delivery_timeout_seconds":5,"max_pending_events":100,"max_pending_bytes":8000000,"per_subscription_events":50,"debounce_milliseconds":0,"dedupe_retention_seconds":604800},
-        }),
-    );
+    let mut settings = json!({
+        "tenant":"startup-test", "jiuwen":{"agent_type":"jiuwen","template":"jiuwen","version":"1"},
+        "digitalmate":{"template":"digitalmate","template_ref":"1","backend_path":"/digitalmate/ws","service_port":8080},
+        "privacy":{"listen":"127.0.0.1:0","template":"digitalmate","tls_certificate":fixture.join("ingress-cert.pem"),"tls_private_key":fixture.join("ingress-key.pem")},
+        "ingestion":{"database_url_env":"ADX_STARTUP_DB_URL","database_allow_plaintext":true,"database_max_connections":8,
+            "workers":1,"lease_seconds":30,"delivery_timeout_seconds":5,"max_pending_events":100,"max_pending_bytes":8000000,"per_subscription_events":50,"debounce_milliseconds":0,"dedupe_retention_seconds":604800},
+    });
+    if composio_only {
+        settings.as_object_mut().unwrap().remove("ingestion");
+        settings["composio"] = json!({
+            "auth_configs":{"outlook":{"id":"ac_startup","ownership":"composio_managed"}},
+            "organization":"startup-test",
+            "database":{"database_url_env":"ADX_STARTUP_DB_URL","database_allow_plaintext":true,"database_max_connections":2},
+            "limits":{"organization_per_minute":60,"user_per_minute":10}
+        });
+    }
+    write(&gateway, settings);
     let account = directory.path().join("account.json");
     write(
         &account,
@@ -88,11 +111,15 @@ async fn formal_ingestion_startup_requires_secret_mounts_webhook_and_stops() {
     let secret = directory.path().join("webhook.json");
     write(
         &secret,
-        json!({"webhook_secrets":["startup-signing-secret"]}),
+        if composio_only {
+            json!({"project_api_key":"startup-project-key"})
+        } else {
+            json!({"webhook_secrets":["startup-signing-secret"]})
+        },
     );
     let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
     command.env_clear().kill_on_drop(true)
-        .arg("--exact").arg("ingress::service::ingestion_startup_tests::formal_ingestion_startup_requires_secret_mounts_webhook_and_stops")
+        .arg("--exact").arg(if composio_only {"ingress::service::ingestion_startup_tests::formal_composio_startup_requires_project_key_and_shared_budget_without_ingestion"} else {"ingress::service::ingestion_startup_tests::formal_ingestion_startup_requires_secret_mounts_webhook_and_stops"})
         .arg("--ignored").arg("--nocapture").arg("--test-threads=1")
         .env("ADX_INGESTION_STARTUP_CHILD", "1").env("ADX_STARTUP_DB_URL", url)
         .env("ADX_JIUWEN_CONFIG", &gateway).env("ADX_ACCOUNT_CONFIG", account)
@@ -112,6 +139,100 @@ async fn formal_ingestion_startup_requires_secret_mounts_webhook_and_stops() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+async fn composio_child() {
+    let (mut config, control) = super::tests::settings();
+    config.listeners = Some(vec![super::super::ListenerConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tls: false,
+        allow_http_credentials: true,
+        allowed_routes: None,
+    }]);
+    assert!(
+        IngressService::bind(config.clone(), control.clone())
+            .await
+            .is_err(),
+        "project key must come from the configuration owner"
+    );
+    import_composio_key(
+        Path::new(&std::env::var("STARTUP_WEBHOOK_INPUT").unwrap()),
+        "new",
+    )
+    .await
+    .unwrap();
+    assert!(
+        IngressService::bind(config.clone(), control.clone())
+            .await
+            .is_err(),
+        "missing shared accounting must not become an unlimited local budget"
+    );
+    let pg: tokio_postgres::Config = std::env::var("ADX_STARTUP_DB_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let pool = Pool::builder(Manager::new(pg, tokio_postgres::NoTls))
+        .max_size(2)
+        .build()
+        .unwrap();
+    let database = pool.get().await.unwrap();
+    assert!(
+        database
+            .query_one(
+                "SELECT to_regclass('digitalmate_composio_budget.version')::text",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, Option<String>>(0)
+            .is_none(),
+        "formal startup must not create the budget schema"
+    );
+    // The separately applied operator migration, never application startup DDL.
+    database
+        .batch_execute(include_str!("digitalmategateway/composio/budget.sql"))
+        .await
+        .unwrap();
+    drop(database);
+    let service = IngressService::bind(config, control).await.unwrap();
+    let address = service.public_listeners[0].0.local_addr().unwrap();
+    let (shutdown, stop) = tokio::sync::oneshot::channel();
+    let running = tokio::spawn(service.serve(async {
+        let _ = stop.await;
+    }));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let callback = client.get(format!("http://{address}/api/digitalmate/connectors/v1/composio/callback?session_uri=must-not-echo")).send().await.unwrap();
+    assert_eq!(callback.status(), http::StatusCode::OK);
+    assert!(!callback.text().await.unwrap().contains("must-not-echo"));
+    let denied = client
+        .post(format!(
+            "http://{address}/api/digitalmate/connectors/v1/composio/cancel"
+        ))
+        .json(&json!({"registration":"startup"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), http::StatusCode::UNAUTHORIZED);
+    let webhook = client
+        .post(format!(
+            "http://{address}/api/digitalmate/ingestion/v1/composio/webhook"
+        ))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(webhook.status(), http::StatusCode::NOT_FOUND);
+    shutdown.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    pool.close();
 }
 
 async fn child() {

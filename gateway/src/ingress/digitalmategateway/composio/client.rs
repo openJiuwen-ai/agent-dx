@@ -72,25 +72,11 @@ impl Client {
         auth_configs: MailAuthConfigs,
         budget: Arc<dyn Budget>,
     ) -> Result<Self, Error> {
-        if api_key.is_empty() || (auth_configs.gmail.is_none() && auth_configs.outlook.is_none()) {
+        let api_key = zeroize::Zeroizing::new(api_key);
+        if api_key.is_empty() {
             return Err(Error::NotConfigured);
         }
-        for config in [&auth_configs.gmail, &auth_configs.outlook]
-            .into_iter()
-            .flatten()
-        {
-            if !super::types::identifier(&config.id, 256) || !config.id.starts_with("ac_") {
-                return Err(Error::NotConfigured);
-            }
-        }
-        if auth_configs
-            .gmail
-            .as_ref()
-            .zip(auth_configs.outlook.as_ref())
-            .is_some_and(|(a, b)| a.id == b.id)
-        {
-            return Err(Error::NotConfigured);
-        }
+        auth_configs.validate()?;
         let mut headers = HeaderMap::new();
         let mut key = HeaderValue::from_str(&api_key).map_err(|_| Error::NotConfigured)?;
         key.set_sensitive(true);
@@ -126,9 +112,9 @@ impl Client {
         body: Option<Value>,
         effect: bool,
     ) -> Result<Value, Error> {
-        scope.check_bound_foreground().await?;
+        scope.check_bound_identity().await?;
         self.budget.acquire(scope).await?;
-        scope.check_bound_foreground().await?;
+        scope.check_bound_identity().await?;
         let mut request = self.http.request(method, format!("{}{path}", self.origin));
         if let Some(value) = body {
             request = request.json(&value);
@@ -195,7 +181,7 @@ impl Client {
         if effect && !result.is_object() {
             return Err(Error::OutcomeUnknown);
         }
-        scope.check_bound_foreground().await?;
+        scope.check_bound_identity().await?;
         json_object(result)
     }
 

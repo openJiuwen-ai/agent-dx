@@ -106,6 +106,91 @@ async fn http_body_read_still_requires_actual_operation_permission() {
 }
 
 #[tokio::test]
+async fn http_account_validation_probes_mail_without_granting_or_reading_content() {
+    let f = Fixture::outlook(true).await;
+    f.authority.grant.lock().unwrap().permissions = Permissions::default();
+    f.outlook_reads(true, json!({"value":[]}));
+    let (status, proof) = http_candidate(
+        &f,
+        "/api/digitalmate/connectors/v1/composio/validate",
+        r#"{"connection_id":"connection-one"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(proof["connection_id"], "connection-one");
+    assert_eq!(proof["provider"], "microsoft");
+    assert_eq!(proof["subject_id"], OUTLOOK_SUBJECT);
+    assert_eq!(proof["granted_capabilities"], json!(["read_history"]));
+    let calls = f.state.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    let endpoint = url::Url::parse(calls[2].1["endpoint"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        endpoint.path(),
+        format!("/v1.0/users/{OUTLOOK_SUBJECT}/messages")
+    );
+    assert!(endpoint
+        .query_pairs()
+        .any(|(name, value)| name == "$top" && value == "1"));
+    assert!(endpoint
+        .query_pairs()
+        .any(|(name, value)| name == "$select" && value == "id,conversationId,webLink"));
+    assert!(f.authority.grant.lock().unwrap().permissions == Permissions::default());
+    assert_eq!(f.authority.writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn gmail_first_validation_uses_online_profile_without_preexisting_read_permission() {
+    let f = Fixture::new().await;
+    {
+        let mut grant = f.authority.grant.lock().unwrap();
+        grant.email.clear();
+        grant.permissions = Permissions::default();
+    }
+    f.reads(json!({"messages":[{"id":"probe_private_id", "threadId":"private_thread"}]}));
+    let (status, proof) = http_candidate(
+        &f,
+        http::VALIDATE_PATH,
+        r#"{"connection_id":"connection-one"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(proof["email"], "person@example.com");
+    assert!(!proof.to_string().contains("private"));
+    let calls = f.state.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    let endpoint = url::Url::parse(calls[2].1["endpoint"].as_str().unwrap()).unwrap();
+    assert!(endpoint.path().contains("person@example.com"));
+    assert!(endpoint
+        .query_pairs()
+        .any(|(name, value)| name == "maxResults" && value == "1"));
+    assert_eq!(f.authority.writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn validation_discards_late_probe_after_revocation_and_denies_body_or_account_json() {
+    let f = Fixture::outlook(true).await;
+    for raw in [
+        r#"{"connection_id":"connection-one","account_id":"ca_other"}"#,
+        r#"{"connection_id":"connection-one","request":{"body":true}}"#,
+        r#"{"connection_id":"connection-one","connection_id":"other"}"#,
+    ] {
+        assert_eq!(http_candidate(&f, http::VALIDATE_PATH, raw).await.0, 400);
+    }
+    assert!(f.state.calls.lock().unwrap().is_empty());
+    f.state.revoke_during_mail.store(true, Ordering::SeqCst);
+    f.outlook_reads(true, json!({"value":[]}));
+    let (status, value) = http_candidate(
+        &f,
+        http::VALIDATE_PATH,
+        r#"{"connection_id":"connection-one"}"#,
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert_eq!(value, json!({"error":"forbidden"}));
+    assert_eq!(f.authority.writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn confirmation_unknown_outcome_never_redeems_a_single_use_session_twice() {
     let f = Fixture::new().await;
     f.reply(503, json!({"error":"upstream failure"}));
@@ -266,6 +351,32 @@ impl ControlledAuthority {
 
 #[async_trait]
 impl Authority for ControlledAuthority {
+    async fn metadata(&self, scope: &Scope, connection: &str) -> Result<ConnectionMetadata, Error> {
+        self.check_scope(scope)?;
+        if self.revoked.load(Ordering::SeqCst) || connection != "connection-one" {
+            return Err(Error::Forbidden);
+        }
+        let grant = self.grant.lock().unwrap();
+        Ok(ConnectionMetadata {
+            connection_id: connection.into(),
+            provider: match grant.provider {
+                MailProvider::Google => "google",
+                MailProvider::Microsoft => "microsoft",
+            }
+            .into(),
+            backend: "composio".into(),
+            external_account_id: grant.account_id.clone(),
+            external_subject_id: grant.subject_id.clone(),
+            authorization_generation: grant.generation,
+            record_revision: 1,
+            created_at: 1.0,
+            identity_user_id: if grant.provider == MailProvider::Google {
+                grant.email.clone()
+            } else {
+                String::new()
+            },
+        })
+    }
     async fn attempt(&self, scope: &Scope, registration: &str) -> Result<Attempt, Error> {
         self.check_scope(scope)?;
         let attempt = self.attempt.lock().unwrap().clone();

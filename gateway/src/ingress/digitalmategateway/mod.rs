@@ -3,6 +3,7 @@ pub mod application_ws;
 pub mod composio;
 pub mod connection;
 pub mod connector_owner;
+mod database;
 pub mod download_config;
 pub mod download_http;
 pub mod download_runtime;

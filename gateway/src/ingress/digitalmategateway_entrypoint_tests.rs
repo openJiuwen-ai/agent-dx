@@ -24,6 +24,71 @@ mod foreground_admission_tests;
 fn settings() -> DigitalMateGatewayConfig {
     serde_json::from_value(json!({"tenant":"tenant","jiuwen":{"agent_type":"assistant","template":"demo","version":"1"}})).unwrap()
 }
+
+#[cfg(unix)]
+#[test]
+fn composio_process_configuration_does_not_require_ingestion_or_model_configuration() {
+    let configuration = json!({
+        "tenant":"tenant", "jiuwen":{"agent_type":"assistant","template":"demo","version":"1"},
+        "digitalmate":{"template":"digitalmate","template_ref":"production","backend_path":"/ws","service_port":18092},
+        "privacy":{"listen":"127.0.0.1:0","template":"digitalmate","tls_certificate":"/operator/cert.pem","tls_private_key":"/operator/key.pem"},
+        "composio":{
+            "auth_configs":{"outlook":{"id":"ac_outlook","ownership":"composio_managed"}},
+            "organization":"nb",
+            "database":{"database_url_env":"ADX_COMPOSIO_DATABASE_URL","database_max_connections":2},
+            "limits":{"organization_per_minute":60,"user_per_minute":10}
+        }
+    });
+    let config: DigitalMateGatewayConfig = serde_json::from_value(configuration.clone()).unwrap();
+    config.validate().unwrap();
+    assert!(config.ingestion.is_none());
+    for path in ["privacy", "digitalmate"] {
+        let mut invalid = configuration.clone();
+        invalid.as_object_mut().unwrap().remove(path);
+        let config: DigitalMateGatewayConfig = serde_json::from_value(invalid).unwrap();
+        assert!(
+            config.validate().is_err(),
+            "missing {path} must fail closed"
+        );
+    }
+    for (field, value) in [
+        ("auth_configs", json!({})),
+        (
+            "auth_configs",
+            json!({"outlook":{"id":"ca_wrong","ownership":"composio_managed"}}),
+        ),
+        (
+            "auth_configs",
+            json!({"gmail":{"id":"ac_same","ownership":"custom"},"outlook":{"id":"ac_same","ownership":"composio_managed"}}),
+        ),
+        ("organization", json!("")),
+        (
+            "database",
+            json!({"database_url_env":"3BAD","database_max_connections":2}),
+        ),
+        (
+            "database",
+            json!({"database_url_env":"ADX_COMPOSIO_DATABASE_URL","database_max_connections":0}),
+        ),
+        (
+            "limits",
+            json!({"organization_per_minute":10,"user_per_minute":11}),
+        ),
+    ] {
+        let mut invalid = configuration.clone();
+        invalid["composio"][field] = value;
+        let config: DigitalMateGatewayConfig = serde_json::from_value(invalid).unwrap();
+        assert!(
+            config.validate().is_err(),
+            "invalid {field} must fail closed"
+        );
+    }
+    for field in ["api_key", "upstream_origin", "authority", "callback_url"] {
+        let mut invalid = configuration.clone();
+        invalid["composio"][field] = json!("caller-controlled");
+        assert!(serde_json::from_value::<DigitalMateGatewayConfig>(invalid).is_err());
+    }
+}
 #[test]
 fn application_ws_configurations_are_optional_and_independent() {
     let config: DigitalMateGatewayConfig = serde_json::from_value(json!({

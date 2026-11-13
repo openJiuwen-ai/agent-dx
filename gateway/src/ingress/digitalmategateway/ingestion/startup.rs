@@ -1,10 +1,8 @@
 //! Trusted process configuration and assembly for the existing Gateway lifecycle.
+use super::super::database::DatabaseConfig;
 use super::{Error, Inbox, InboxLimits};
-use deadpool_postgres::{Manager, Pool, Runtime};
 use serde::Deserialize;
-use std::{path::Path, sync::Arc, time::Duration};
-use tokio_postgres::config::SslMode;
-use zeroize::Zeroizing;
+use std::time::Duration;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,19 +24,17 @@ pub(crate) struct IngestionConfig {
 }
 
 impl IngestionConfig {
+    fn database(&self) -> DatabaseConfig {
+        DatabaseConfig {
+            database_url_env: self.database_url_env.clone(),
+            database_max_connections: self.database_max_connections,
+            database_allow_plaintext: self.database_allow_plaintext,
+            database_ca_file: self.database_ca_file.clone(),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), Error> {
-        if self.database_url_env.is_empty()
-            || self.database_url_env.len() > 128
-            || !self
-                .database_url_env
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            || self.database_url_env.as_bytes()[0].is_ascii_digit()
-            || self
-                .database_ca_file
-                .as_ref()
-                .is_some_and(|path| !Path::new(path).is_absolute() || self.database_allow_plaintext)
-            || !(1..=32).contains(&self.database_max_connections)
+        if !self.database().valid()
             || !(1..=16).contains(&self.workers)
             || !(3..=300).contains(&self.lease_seconds)
             || !(1..=120).contains(&self.delivery_timeout_seconds)
@@ -59,44 +55,11 @@ impl IngestionConfig {
     /// Requires the separately applied ingestion schema; startup performs no DDL.
     pub(crate) async fn open(&self) -> Result<Inbox, Error> {
         self.validate()?;
-        let url =
-            Zeroizing::new(std::env::var(&self.database_url_env).map_err(|_| Error::InvalidLimit)?);
-        let mut config: tokio_postgres::Config = url.parse().map_err(|_| Error::InvalidLimit)?;
-        let timeout = Duration::from_secs(5);
-        config.connect_timeout(timeout);
-        config.options("-c statement_timeout=10000 -c lock_timeout=5000");
-        let manager = if self.database_allow_plaintext {
-            config.ssl_mode(SslMode::Disable);
-            Manager::new(config, tokio_postgres::NoTls)
-        } else {
-            config.ssl_mode(SslMode::Require);
-            let mut roots = rustls::RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            if let Some(path) = &self.database_ca_file {
-                let bytes = std::fs::read(path).map_err(|_| Error::InvalidLimit)?;
-                for certificate in rustls_pemfile::certs(&mut bytes.as_slice()) {
-                    roots
-                        .add(certificate.map_err(|_| Error::InvalidLimit)?)
-                        .map_err(|_| Error::InvalidLimit)?;
-                }
-            }
-            let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .map_err(|_| Error::InvalidLimit)?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-            Manager::new(config, tokio_postgres_rustls::MakeRustlsConnect::new(tls))
-        };
-        let pool = Pool::builder(manager)
-            .max_size(self.database_max_connections)
-            .runtime(Runtime::Tokio1)
-            .wait_timeout(Some(timeout))
-            .create_timeout(Some(timeout))
-            .recycle_timeout(Some(timeout))
-            .build()
-            .map_err(|_| Error::InvalidLimit)?;
+        let pool = self
+            .database()
+            .open()
+            .await
+            .map_err(|_| Error::Unavailable)?;
         Inbox::from_pool(
             pool,
             InboxLimits {

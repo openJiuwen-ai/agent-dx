@@ -177,6 +177,7 @@ async fn foreground_admission_does_not_fall_back_to_jiuwen_or_orbit() {
 #[tokio::test]
 async fn foreground_composio_mount_uses_actual_session_scope_and_denies_body_identity() {
     use crate::ingress::digitalmategateway::composio::{self, Scope};
+    let (ingress, _) = fixture().await;
     let (api, auth, _) = setup().await;
     let identity = api
         .foreground_admission()
@@ -199,38 +200,50 @@ async fn foreground_composio_mount_uses_actual_session_scope_and_denies_body_ide
             .unwrap()
     };
     assert_eq!(
-        api.connector_request(request(
-            "Bearer alice-session",
-            r#"{"registration":"registration-one","user_id":"bob"}"#
-        ))
+        api.connector_request(
+            request(
+                "Bearer alice-session",
+                r#"{"registration":"registration-one","user_id":"bob"}"#
+            ),
+            ingress.clone()
+        )
         .await
         .status(),
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        api.connector_request(request(
-            "Bearer bob-session",
-            r#"{"registration":"registration-one"}"#
-        ))
+        api.connector_request(
+            request(
+                "Bearer bob-session",
+                r#"{"registration":"registration-one"}"#
+            ),
+            ingress.clone()
+        )
         .await
         .status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        api.connector_request(request(
-            "Bearer alice-session",
-            r#"{"registration":"registration-one"}"#
-        ))
+        api.connector_request(
+            request(
+                "Bearer alice-session",
+                r#"{"registration":"registration-one"}"#
+            ),
+            ingress.clone()
+        )
         .await
         .status(),
         StatusCode::OK
     );
     auth.0.store(true, Ordering::SeqCst);
     assert_eq!(
-        api.connector_request(request(
-            "Bearer alice-session",
-            r#"{"registration":"registration-one"}"#
-        ))
+        api.connector_request(
+            request(
+                "Bearer alice-session",
+                r#"{"registration":"registration-one"}"#
+            ),
+            ingress
+        )
         .await
         .status(),
         StatusCode::UNAUTHORIZED
@@ -346,6 +359,22 @@ async fn foreground_composio_routes_reach_real_ingress_dispatch_without_ws_or_mo
         !String::from_utf8_lossy(&response.collect().await.unwrap().to_bytes())
             .contains("opaque-must-not-echo")
     );
+    assert_eq!(upstream.call_count(), 0);
+    let response = sender
+        .send_request(
+            Request::post(composio::http::VALIDATE_PATH)
+                .header("host", "localhost")
+                .header("authorization", "Bearer alice-session")
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"connection_id":"connection-one"}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let _ = response.collect().await.unwrap();
     assert_eq!(upstream.call_count(), 0);
     server.abort();
     client.abort();

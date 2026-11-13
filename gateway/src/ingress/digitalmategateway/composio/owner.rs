@@ -1,8 +1,10 @@
 //! Actual M44 public operations through the existing fixed-generation ADX Relay.
-use super::super::connector_owner::{OwnerAuthority, OwnerOperation, OWNER_PATH};
+use super::super::connector_owner::{
+    OwnerAuthority, OwnerAuthorization, OwnerOperation, OWNER_PATH,
+};
 use super::{
-    Attempt, AttemptPhase, Authority, ConnectionGrant, Error, MailAuthConfigs, MailProvider,
-    Permissions, Scope, Started, VerifiedAccount,
+    Attempt, AttemptPhase, Authority, ConnectionGrant, ConnectionMetadata, Error, MailAuthConfigs,
+    MailProvider, Permissions, Scope, Started, VerifiedAccount,
 };
 use crate::ingress::{
     agent_service::{AgentV2Access, ServiceSelector},
@@ -48,23 +50,37 @@ impl M44Authority {
         }
     }
 
+    async fn authorization(
+        &self,
+        scope: &Scope,
+        operation: OwnerOperation,
+        raw: &[u8],
+    ) -> Result<OwnerAuthorization, Error> {
+        if let Some(identity) = scope.workload_identity() {
+            self.issuer
+                .workload_headers(identity, operation, raw)
+                .await
+                .map_err(identity_error)
+        } else {
+            self.issuer
+                .foreground_headers(scope.foreground_identity()?, operation, raw)
+                .await
+                .map_err(identity_error)
+        }
+    }
+
     async fn send(
         &self,
         scope: &Scope,
         operation: OwnerOperation,
         body: Value,
     ) -> Result<Value, Error> {
-        let identity = scope.foreground_identity()?;
-        scope.check_foreground().await?;
+        scope.check_bound_identity().await?;
         let raw = serde_json::to_vec(&body).map_err(|_| Error::InvalidRequest)?;
         if raw.len() > 16_384 {
             return Err(Error::InvalidRequest);
         }
-        let admitted = self
-            .issuer
-            .foreground_headers(identity, operation, &raw)
-            .await
-            .map_err(identity_error)?;
+        let admitted = self.authorization(scope, operation, &raw).await?;
         let context = Arc::new(RequestContext::new(Duration::from_secs(30)));
         let selection = self
             .access
@@ -105,11 +121,7 @@ impl M44Authority {
         }));
         // Readiness can outlast the original short credential. Reissue only for
         // the exact same target and raw bytes; never reselect a rebuilt Binding.
-        let current = self
-            .issuer
-            .foreground_headers(identity, operation, &raw)
-            .await
-            .map_err(identity_error)?;
+        let current = self.authorization(scope, operation, &raw).await?;
         if current.binding_scope() != admitted.binding_scope()
             || current.generation() != admitted.generation()
             || current.environment_id() != admitted.environment_id()
@@ -152,7 +164,7 @@ impl M44Authority {
         .map_err(|_| unknown())?
         .map_err(|_| unknown())?
         .to_bytes();
-        scope.check_foreground().await?;
+        scope.check_bound_identity().await?;
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| unknown())?;
         if status != StatusCode::OK {
             return Err(match value.get("error").and_then(Value::as_str) {
@@ -284,20 +296,7 @@ struct Snapshot {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MetadataResult {
-    metadata: Metadata,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Metadata {
-    connection_id: String,
-    provider: String,
-    backend: String,
-    external_account_id: String,
-    external_subject_id: String,
-    authorization_generation: u64,
-    record_revision: u64,
-    created_at: f64,
-    identity_user_id: String,
+    metadata: ConnectionMetadata,
 }
 fn provider(value: &str) -> Result<MailProvider, Error> {
     match value {
@@ -309,6 +308,49 @@ fn provider(value: &str) -> Result<MailProvider, Error> {
 
 #[async_trait]
 impl Authority for M44Authority {
+    async fn metadata(
+        &self,
+        scope: &Scope,
+        connection_id: &str,
+    ) -> Result<ConnectionMetadata, Error> {
+        // Pure owner snapshots, including an account waiting for its first live
+        // validation. Neither operation invokes ensure_ready or implies consent.
+        let snapshot: Snapshot = decode(
+            self.send(
+                scope,
+                OwnerOperation::Connection,
+                json!({"operation":"connection", "connection_id":connection_id}),
+            )
+            .await?,
+        )?;
+        if snapshot.connection_id != connection_id
+            || snapshot.backend != "composio"
+            || snapshot.credential_custody != "external"
+            || !matches!(snapshot.state.as_str(), "current" | "unavailable")
+        {
+            return Err(Error::Forbidden);
+        }
+        let metadata: MetadataResult = decode(
+            self.send(
+                scope,
+                OwnerOperation::Metadata,
+                json!({"operation":"metadata", "connection_id":connection_id}),
+            )
+            .await?,
+        )?;
+        let metadata = metadata.metadata;
+        metadata.check(connection_id)?;
+        if metadata.provider != snapshot.provider
+            || metadata.backend != snapshot.backend
+            || metadata.external_account_id != snapshot.external_account_id
+            || metadata.external_subject_id != snapshot.external_subject_id
+            || metadata.authorization_generation != snapshot.authorization_generation
+        {
+            return Err(Error::Forbidden);
+        }
+        Ok(metadata)
+    }
+
     async fn attempt(&self, scope: &Scope, registration: &str) -> Result<Attempt, Error> {
         let current: Current = decode(
             self.send(

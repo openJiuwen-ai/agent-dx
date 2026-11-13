@@ -53,7 +53,8 @@ impl MailProvider {
 }
 
 /// App ownership is trusted deployment policy, never a user request option.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OAuthAppOwnership {
     Custom,
     ComposioManaged,
@@ -65,7 +66,8 @@ impl OAuthAppOwnership {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MailAuthConfig {
     pub id: String,
     pub ownership: OAuthAppOwnership,
@@ -88,21 +90,45 @@ impl MailAuthConfig {
 }
 
 /// Configure only providers enabled by deployment. Missing providers fail closed.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MailAuthConfigs {
     pub gmail: Option<MailAuthConfig>,
     pub outlook: Option<MailAuthConfig>,
 }
 
-/// Construct only from authenticated, foreground-purpose business authority.
+impl MailAuthConfigs {
+    pub(super) fn validate(&self) -> Result<(), Error> {
+        if self.gmail.is_none() && self.outlook.is_none() {
+            return Err(Error::NotConfigured);
+        }
+        for config in [&self.gmail, &self.outlook].into_iter().flatten() {
+            if !identifier(&config.id, 256) || !config.id.starts_with("ac_") {
+                return Err(Error::NotConfigured);
+            }
+        }
+        if self
+            .gmail
+            .as_ref()
+            .zip(self.outlook.as_ref())
+            .is_some_and(|(a, b)| a.id == b.id)
+        {
+            return Err(Error::NotConfigured);
+        }
+        Ok(())
+    }
+}
+
+/// Construct only from an actual business or connector-purpose identity owner.
 /// Deliberately not Deserialize: request JSON must never construct identity.
-/// No background purpose is accepted in this first integration candidate.
+/// A workload identity does not authorize OAuth effects or mail reads.
 #[derive(Clone)]
 pub struct Scope {
     tenant: String,
     user: String,
     workspace: String,
     foreground: Option<super::super::foreground_admission::ForegroundIdentity>,
+    workload: Option<std::sync::Arc<super::super::connector_owner::ConnectorWorkloadIdentity>>,
 }
 
 // Equality identifies an owner namespace; it never compares or grants sessions.
@@ -131,6 +157,7 @@ impl Scope {
             user,
             workspace,
             foreground: None,
+            workload: None,
         })
     }
 
@@ -155,6 +182,34 @@ impl Scope {
         self.foreground.as_ref().ok_or(Error::Forbidden)
     }
 
+    pub fn from_connector_identity(
+        identity: super::super::connector_owner::ConnectorWorkloadIdentity,
+    ) -> Result<Self, Error> {
+        let mut scope = Self::from_authenticated_foreground(
+            identity.tenant().into(),
+            identity.user_id().into(),
+            identity.workspace().into(),
+        )?;
+        scope.workload = Some(std::sync::Arc::new(identity));
+        Ok(scope)
+    }
+
+    pub(super) fn workload_identity(
+        &self,
+    ) -> Option<&super::super::connector_owner::ConnectorWorkloadIdentity> {
+        self.workload.as_deref()
+    }
+
+    pub(crate) async fn check_authentication(&self) -> crate::ingress::accounts::Result<()> {
+        if let Some(identity) = &self.foreground {
+            identity.check().await
+        } else if let Some(identity) = &self.workload {
+            identity.check().await
+        } else {
+            Err(crate::ingress::accounts::Error::Unauthorized)
+        }
+    }
+
     pub(crate) async fn check_foreground(&self) -> Result<(), Error> {
         self.foreground_identity()?
             .check()
@@ -164,9 +219,11 @@ impl Scope {
 
     // Existing explicitly trusted ports remain responsible for their own
     // admission. The mounted foreground route always attaches the real guard.
-    pub(super) async fn check_bound_foreground(&self) -> Result<(), Error> {
+    pub(super) async fn check_bound_identity(&self) -> Result<(), Error> {
         if self.foreground.is_some() {
             self.check_foreground().await?;
+        } else if let Some(identity) = &self.workload {
+            identity.check().await.map_err(|_| Error::Forbidden)?;
         }
         Ok(())
     }
@@ -296,6 +353,46 @@ pub struct ConnectionGrant {
     pub email: String,
     pub generation: u64,
     pub permissions: Permissions,
+}
+
+/// Current M44 association facts, including unvalidated accounts. No read grant.
+#[derive(Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionMetadata {
+    pub connection_id: String,
+    pub provider: String,
+    pub backend: String,
+    pub external_account_id: String,
+    pub external_subject_id: String,
+    pub authorization_generation: u64,
+    pub record_revision: u64,
+    pub created_at: f64,
+    pub identity_user_id: String,
+}
+
+impl ConnectionMetadata {
+    pub(super) fn check(&self, connection_id: &str) -> Result<MailProvider, Error> {
+        let provider = match self.provider.as_str() {
+            "google" => MailProvider::Google,
+            "microsoft" => MailProvider::Microsoft,
+            _ => return Err(Error::Forbidden),
+        };
+        if self.connection_id != connection_id
+            || self.backend != "composio"
+            || !account_id(&self.external_account_id)
+            || self.authorization_generation == 0
+            || self.record_revision == 0
+            || !self.created_at.is_finite()
+            || self.created_at <= 0.0
+            || (provider == MailProvider::Microsoft && !identifier(&self.external_subject_id, 256))
+            || (provider == MailProvider::Google
+                && !self.identity_user_id.is_empty()
+                && !email_address(&self.identity_user_id))
+        {
+            return Err(Error::Forbidden);
+        }
+        Ok(provider)
+    }
 }
 
 impl ConnectionGrant {
@@ -448,6 +545,13 @@ pub(super) fn email_address(value: &str) -> bool {
 /// No implementation/default or private-table access is supplied here.
 #[async_trait]
 pub trait Authority: Send + Sync {
+    /// Association/custody only, without requiring usable or read permission.
+    /// Must use the public owner and never refresh through ensure_ready.
+    async fn metadata(
+        &self,
+        scope: &Scope,
+        connection_id: &str,
+    ) -> Result<ConnectionMetadata, Error>;
     async fn attempt(&self, scope: &Scope, registration: &str) -> Result<Attempt, Error>;
     async fn cancel_attempt(&self, scope: &Scope, registration: &str) -> Result<(), Error>;
     /// Read an already committed proof without replaying complete_auth or a
