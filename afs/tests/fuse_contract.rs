@@ -1025,6 +1025,164 @@ impl Drop for ParallelReadGuard<'_> {
     }
 }
 
+/// A pinned-version fixture for R97/R96: `old` is what an already-open
+/// read-only handle reads; `publish` moves head without moving that handle.
+fn mount_pinned_versions(
+    old: &[u8],
+) -> (
+    tempfile::TempDir,
+    Arc<VersionedReadBackend>,
+    MountedTestBackend,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let backend = Arc::new(VersionedReadBackend::new("pinned-old", old.to_vec()));
+    backend.pin_handles.store(true, Ordering::SeqCst);
+    let session = MountedTestBackend::mount_dfs_with_options(
+        backend.clone(),
+        mount,
+        fuse::FuseMountOptions {
+            exec: fuse::FuseExecOptions {
+                fuse_workers: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    (temp, backend, session)
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_pinned_read_beyond_its_version_never_returns_kernel_zero_fill() {
+    // R97. The kernel keeps one i_size per inode. A path stat (no file handle)
+    // that reports a longer head while a pinned handle's READ is in flight
+    // makes the kernel refuse to shrink i_size on the short reply, and the
+    // zero-filled page tail reaches the application. The STAT is issued while
+    // the READ is held in the backend, so the order is deterministic.
+    let old = vec![b'o'; 1024];
+    let (_temp, backend, session) = mount_pinned_versions(&old);
+    let path = session.mount.join("file");
+    let file = std::fs::File::open(&path).unwrap();
+    let mut first = [0; 16];
+    file.read_exact_at(&mut first, 0).unwrap();
+    assert_eq!(first, [b'o'; 16]);
+
+    let mut head = old.clone();
+    head.extend(std::iter::repeat_n(b'n', 8192));
+    backend.publish("pinned-head", head);
+    let _ = std::fs::metadata(&path).unwrap();
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *backend.read_blocker.lock().unwrap() = Some(WriteBlocker {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let reader = std::thread::spawn(move || {
+        let mut bytes = vec![0xff; 64];
+        let read = file.read_at(&mut bytes, 4096)?;
+        bytes.truncate(read);
+        io::Result::Ok(bytes)
+    });
+    if entered_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        *backend.pathwise_getattr.lock().unwrap() = Some(seen_tx);
+        let stat_path = path.clone();
+        let stat = std::thread::spawn(move || std::fs::metadata(stat_path).map(|m| m.len()));
+        seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("path stat did not reach the backend while the READ was held");
+        // Let the STAT reply land in the kernel before the short READ reply.
+        stat.join().unwrap().unwrap();
+        release_tx.send(()).unwrap();
+    } else {
+        // No READ reached the backend: the kernel already knew the pinned EOF.
+        backend.read_blocker.lock().unwrap().take();
+    }
+    let bytes = reader.join().unwrap().unwrap();
+    assert!(
+        !bytes.contains(&0),
+        "pinned handle received {} kernel zero-filled bytes instead of EOF",
+        bytes.iter().filter(|byte| **byte == 0).count()
+    );
+    assert!(
+        bytes.is_empty(),
+        "pinned handle read past its version: {bytes:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_pinned_handle_fstat_matches_the_bytes_it_reads() {
+    // R96. fstat(2) reaches FUSE as GETATTR without a file handle (statx), so
+    // the size it shows must be the one the pinned handle reads to EOF.
+    let old = vec![b'o'; 1024];
+    let (_temp, backend, session) = mount_pinned_versions(&old);
+    let path = session.mount.join("file");
+    let mut file = std::fs::File::open(&path).unwrap();
+    let mut head = old.clone();
+    head.extend(std::iter::repeat_n(b'n', 8192));
+    backend.publish("fstat-head", head);
+    let fstat_len = file.metadata().unwrap().len();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, old);
+    assert_eq!(
+        fstat_len,
+        bytes.len() as u64,
+        "fstat and pinned reads disagree"
+    );
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_path_stat_follows_the_cached_version_until_its_handles_close() {
+    // R97 trade-off (D-R3-1): while a pinned version is in the page cache,
+    // path stats on this mount report its length; a newer handle still reads
+    // the whole newer version; once the pinned handles close, stats show head.
+    let old = vec![b'o'; 1024];
+    let (_temp, backend, session) = mount_pinned_versions(&old);
+    let path = session.mount.join("file");
+    let pinned = std::fs::File::open(&path).unwrap();
+    let mut first = [0; 16];
+    pinned.read_exact_at(&mut first, 0).unwrap();
+    let mut head = old.clone();
+    head.extend(std::iter::repeat_n(b'n', 8192));
+    backend.publish("stat-head", head.clone());
+
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), old.len() as u64);
+    let mut newer = std::fs::File::open(&path).unwrap();
+    let mut bytes = Vec::new();
+    newer.read_to_end(&mut bytes).unwrap();
+    assert_eq!(
+        bytes, head,
+        "a newer open must read the whole newer version"
+    );
+    // Known limitation: the newer (direct I/O) handle's fstat shows the
+    // cached version's length while the older version stays cached.
+    assert_eq!(newer.metadata().unwrap().len(), old.len() as u64);
+
+    drop(pinned);
+    drop(newer);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut reported = 0;
+    while std::time::Instant::now() < deadline {
+        reported = std::fs::metadata(&path).unwrap().len();
+        if reported == head.len() as u64 {
+            break;
+        }
+        // RELEASE is asynchronous to close(2); give it a moment.
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        reported,
+        head.len() as u64,
+        "stat must return to head after close"
+    );
+}
+
 fn assert_dfs_open_fences_inflight_read(workers: u16, kernel_cache_ttl: Duration) {
     let temp = tempfile::tempdir().unwrap();
     let mount = temp.path().join("mnt");
@@ -1160,6 +1318,11 @@ struct VersionedReadBackend {
     lookup_size_at_publication: AtomicU64,
     read_blocker: Mutex<Option<WriteBlocker>>,
     parallel_read_probe: Mutex<Option<Arc<ParallelReadProbe>>>,
+    /// Decision 4a: a read-only handle keeps the version it opened until
+    /// close, even after a fresh open of a newer head (R97/R96 cases).
+    pin_handles: std::sync::atomic::AtomicBool,
+    /// Signalled when a GETATTR without a file handle reaches the backend.
+    pathwise_getattr: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 impl VersionedReadBackend {
@@ -1186,6 +1349,8 @@ impl VersionedReadBackend {
             lookup_size_at_publication: AtomicU64::new(u64::MAX),
             read_blocker: Mutex::new(None),
             parallel_read_probe: Mutex::new(None),
+            pin_handles: std::sync::atomic::AtomicBool::new(false),
+            pathwise_getattr: Mutex::new(None),
         }
     }
 
@@ -1232,6 +1397,11 @@ impl Backend for VersionedReadBackend {
         if inode.value != 2 {
             return Err(not_found());
         }
+        if handle.is_none()
+            && let Some(seen) = self.pathwise_getattr.lock().unwrap().as_ref()
+        {
+            let _ = seen.send(());
+        }
         let state = self.state.lock().unwrap();
         let content = handle
             .and_then(|handle| state.handles.get(&handle.0))
@@ -1262,8 +1432,10 @@ impl Backend for VersionedReadBackend {
         // Native DFS fresh open invalidates existing handle views. Model the
         // resulting next-read refresh, without pinning old descriptors forever.
         // A READ that already captured its Arc still owns its prior version.
-        for opened in state.handles.values_mut() {
-            *opened = current.clone();
+        if !self.pin_handles.load(Ordering::SeqCst) {
+            for opened in state.handles.values_mut() {
+                *opened = current.clone();
+            }
         }
         state.handles.insert(handle, current);
         Ok(FileHandle(handle))
@@ -1280,6 +1452,13 @@ impl Backend for VersionedReadBackend {
 
     fn supports_parallel_reads(&self, handle: FileHandle) -> bool {
         self.state.lock().unwrap().handles.contains_key(&handle.0)
+    }
+
+    /// Pinned handles read an immutable open view, as native DFS read-only
+    /// handles do; a second version on the inode must then use direct I/O.
+    fn fixed_read_view(&self, handle: FileHandle) -> bool {
+        self.pin_handles.load(Ordering::SeqCst)
+            && self.state.lock().unwrap().handles.contains_key(&handle.0)
     }
 
     fn read(

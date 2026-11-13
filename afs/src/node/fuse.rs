@@ -684,6 +684,7 @@ impl Filesystem for AfsFuse {
         let context = Self::context(req, 0);
         let name = name.to_os_string();
         let mount_policy = self.policy.clone();
+        let cached_views = self.active_cached_views.clone();
         let run = move || {
             let _front_guard = _front_guard;
             let started = std::time::Instant::now();
@@ -711,7 +712,11 @@ impl Filesystem for AfsFuse {
                         reply.entry_with_ttls(
                             &attr_ttl,
                             &ttl,
-                            &file_attr(ino, &entry.attributes),
+                            &with_cached_view_size(
+                                &cached_views,
+                                ino,
+                                file_attr(ino, &entry.attributes),
+                            ),
                             Generation(0),
                         );
                     });
@@ -760,6 +765,7 @@ impl Filesystem for AfsFuse {
         let state = self.state.clone();
         let context = Self::context(req, 0);
         let mount_policy = self.policy.clone();
+        let cached_views = self.active_cached_views.clone();
         let entry_at = std::time::Instant::now();
         let run = move || {
             let _front_guard = _front_guard;
@@ -789,6 +795,9 @@ impl Filesystem for AfsFuse {
                 );
             }
             let backend_inode = state.lock().unwrap().backend_inode(ino);
+            // With or without a file handle: the kernel applies either reply
+            // to the inode's single i_size.
+            let result = result.map(|attr| with_cached_view_size(&cached_views, ino, attr));
             match result {
                 Ok(attr) => match backend_inode {
                     Some(inode) => {
@@ -905,6 +914,7 @@ impl Filesystem for AfsFuse {
         let (_, attr_ttl) = self.entry_ttls();
         let setattr_policy = self.policy.clone();
         let cache_ids = self.page_cache_ids.clone();
+        let cached_views = self.active_cached_views.clone();
         let run = move || {
             let _front_guard = _front_guard;
             let inode = state.lock().unwrap().backend_inode(ino);
@@ -939,7 +949,16 @@ impl Filesystem for AfsFuse {
                     }
                     let attr_ttl =
                         setattr_policy.attr_ttl(attributes.kind == FileKind::Directory, attr_ttl);
-                    reply.attr(&attr_ttl, &file_attr(ino, &attributes));
+                    let attr = file_attr(ino, &attributes);
+                    // A size change is this mount's own truncate: the kernel
+                    // resizes the inode from this reply and drops pages past
+                    // it. Other changes must not move i_size off the view.
+                    let attr = if size.is_some() {
+                        attr
+                    } else {
+                        with_cached_view_size(&cached_views, ino, attr)
+                    };
+                    reply.attr(&attr_ttl, &attr);
                 }
                 Err(error) => reply.error(fuse_errno(error)),
             }
@@ -1191,7 +1210,11 @@ impl Filesystem for AfsFuse {
                 reply.entry_with_ttls(
                     &attr_ttl,
                     &entry_ttl,
-                    &file_attr(ino, &entry.attributes),
+                    &with_cached_view_size(
+                        &self.active_cached_views,
+                        ino,
+                        file_attr(ino, &entry.attributes),
+                    ),
                     Generation(0),
                 );
             }
@@ -1358,6 +1381,13 @@ impl Filesystem for AfsFuse {
                         native_open_reply_flags(cached_io, versioned_read, flags, cache_admitted);
                     if keep {
                         reply_flags |= FopenFlags::FOPEN_KEEP_CACHE;
+                    } else if cache_admitted {
+                        // A new version entered the page cache. An attribute
+                        // reply computed before it was admitted may still be
+                        // on its way into the kernel with an older, longer
+                        // size; invalidating the attributes advances the
+                        // kernel's attr_version so that reply is discarded.
+                        mount_policy.page_cache_version_changed(ino);
                     }
                     afs_logging::info!("dfs.fuse_cache_open"; "ino" => ino, "fh" => fh, "versioned_read" => versioned_read, "cached" => !reply_flags.contains(DIRECT_IO), "keep_cache" => keep);
                     reply.opened(FuseFileHandle(fh), reply_flags);
@@ -2568,6 +2598,37 @@ impl Filesystem for AfsFuse {
     }
 }
 
+/// R97. The kernel keeps one `i_size` per inode, and its page cache holds
+/// the one version admitted to [`ActiveCachedViews`] for that inode. A reply
+/// reporting a longer head while that view is live lets a cached handle's
+/// short READ be zero-filled and handed to the application: the kernel
+/// shrinks `i_size` on a short read only when no attribute reply landed
+/// while the READ was in flight. So every attribute reply for an inode with a
+/// live cached view reports the view's length; permissions, ownership and
+/// times stay those of the reply. Without a live view the reply is unchanged.
+fn with_cached_view_size(
+    views: &Mutex<ActiveCachedViews>,
+    ino: u64,
+    mut attr: fuser::FileAttr,
+) -> fuser::FileAttr {
+    if attr.kind != fuser::FileType::RegularFile {
+        return attr;
+    }
+    // A poisoned table still holds the admitted identities; capping must not
+    // be skipped on poison, or the reply would reopen the zero-fill window.
+    let length = views
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .cached_length(ino);
+    if let Some(length) = length
+        && length != attr.size
+    {
+        attr.size = length;
+        attr.blocks = length.div_ceil(512);
+    }
+    attr
+}
+
 #[cfg(test)]
 mod mount_path_tests;
 
@@ -2582,6 +2643,9 @@ mod local_reply_tests;
 
 #[cfg(test)]
 mod policy_tests;
+
+#[cfg(test)]
+mod cached_view_size_tests;
 
 #[cfg(test)]
 mod queue_default_tests;

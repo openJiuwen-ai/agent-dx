@@ -49,6 +49,13 @@ pub(crate) trait FuseMountPolicy: Send + Sync + 'static {
     /// The kernel session exists; `_notifier` can invalidate its caches.
     fn on_mounted(&self, _notifier: Notifier) {}
 
+    /// About to reply to an OPEN that admitted a new version of `_ino` to the
+    /// kernel page cache (not a reopen of the version it already holds). A
+    /// policy whose attribute replies follow the cached view must make the
+    /// kernel discard attribute replies still in flight from before the
+    /// admission. Runs before the OPEN reply; it must not block on the network.
+    fn page_cache_version_changed(&self, _ino: u64) {}
+
     /// Attribute TTL for a reply about an inode of this kind, given the
     /// policy's entry/attribute `ttl`. The default caches every kind alike.
     fn attr_ttl(&self, _directory: bool, ttl: Duration) -> Duration {
@@ -71,11 +78,15 @@ pub(crate) trait FuseMountPolicy: Send + Sync + 'static {
 /// is governed by [`FuseMountFeatures::kernel_cache`] plus pinned versions.
 pub(crate) struct DfsFusePolicy {
     kernel_ttl: Duration,
+    notifier: std::sync::Mutex<Option<Notifier>>,
 }
 
 impl DfsFusePolicy {
     pub(crate) fn new(kernel_ttl: Duration) -> Self {
-        Self { kernel_ttl }
+        Self {
+            kernel_ttl,
+            notifier: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -102,6 +113,37 @@ impl FuseMountPolicy for DfsFusePolicy {
     /// follow regular files; names (entry TTL) stay cached for every kind.
     fn attr_ttl(&self, directory: bool, ttl: Duration) -> Duration {
         if directory { ttl } else { Duration::ZERO }
+    }
+
+    fn on_mounted(&self, notifier: Notifier) {
+        let mut slot = self
+            .notifier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(notifier);
+    }
+
+    /// R97. `inval_inode(ino, -1, 0)` only invalidates attributes: it advances
+    /// the inode's attr_version (v6.8 `fuse_reverse_inval_inode`), so the
+    /// kernel drops any attribute reply requested before it
+    /// (`fuse_change_attributes` discards replies older than attr_version).
+    /// A negative offset touches no page, so it takes no page or inode lock
+    /// and is safe before the OPEN reply. Requests after it reach the Node
+    /// after the view was admitted and are capped to the view's length.
+    fn page_cache_version_changed(&self, ino: u64) {
+        let slot = self
+            .notifier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(notifier) = slot.as_ref()
+            && let Err(error) = notifier.inval_inode(fuser::INodeNo(ino), -1, 0)
+        {
+            // The open stays valid; only the late-reply window stays open.
+            afs_logging::warn!("dfs.fuse_attr_invalidation_failed";
+                "ino" => ino,
+                "error" => error.to_string()
+            );
+        }
     }
 }
 

@@ -1040,7 +1040,11 @@ DFS普通I/O沿用cached write-through，不启用writeback。内核目录项TTL
 `dfs_kernel_cache_ttl_ms`决定（默认1000毫秒，0为不缓存），负查找不缓存；**普通文件、符号链接与特殊文件的
 属性不缓存**：不带文件句柄的stat只能按head版本回答，而每个打开的句柄读它打开时固定的版本，内核却按inode
 共享一个`i_size`——缓存head长度会让固定版本句柄的READ短读、页缓存补零；属性不缓存时读路径会带句柄刷新
-长度（与不缓存时相同）。他节点的改名、删除和目录属性变化在本节点最多晚一个TTL可见，经本挂载的变化内核
+长度（与不缓存时相同）。同一inode同一时间只有一个固定版本进入页缓存（`ActiveCachedViews`，版本不同的
+后来者走direct_io）；该版本有句柄打开期间，LOOKUP、GETATTR（带或不带句柄）、LINK与不改长度的SETATTR回复里的
+长度都改报这个版本的长度（`with_cached_view_size`），否则并发的stat回复会让内核拒绝在短读后缩回`i_size`，
+补零的页尾交给应用（R97，支持边界已知限制第20项）。新版本进入页缓存时，回复OPEN前发只作废属性的
+`inval_inode(ino,-1,0)`，让此前请求、尚未落到内核的旧属性回复因`attr_version`过旧被丢弃。他节点的改名、删除和目录属性变化在本节点最多晚一个TTL可见，经本挂载的变化内核
 自己更新。open与opendir做名字校验（`node/vfs/dfs/recent_names.rs`）：Node记住2×TTL内交给内核的
 （父目录, 名字），某inode恰好经由一个这样的名字被打开时，预检用`Lookup(父目录, 名字)`代替`GetInode`
 （RPC数不变），名字已不指向该inode就回`ESTALE`，Linux以`LOOKUP_REVAL`重走一次路径并打开新inode；重走那次
@@ -1059,7 +1063,7 @@ Meta刚给的inode，其后到OPEN之间的变化与不缓存时lookup和open分
 它不是跨节点读许可或撤销协议。内核已收到的页面
 没有再次进入用户态授权检查的机会，不能宣传为可立即撤回的载荷；新open和用户态交付
 仍遵循权限与授权合同。正TTL下普通文件的属性仍不缓存，同一inode的close-to-open（长度、mtime、内容）
-与不缓存时相同；名字到inode的对应关系由上述名字校验保证。
+与不缓存时相同（本节点开着旧版本时长度的例外见已知限制第20项）；名字到inode的对应关系由上述名字校验保证。
 
 DFS目录列举按页进行：`DfsMeta.ReadDir`带名字游标`after_name`（不含）与`limit`，Meta每页至多1024项
 （`READ_DIR_PAGE_MAX`），按名字顺序返回只含名字、inode id与类型的精简条目及`eof`；属性由LOOKUP/GETATTR取。
