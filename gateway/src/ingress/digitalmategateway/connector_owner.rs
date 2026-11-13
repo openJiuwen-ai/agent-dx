@@ -33,11 +33,16 @@ pub enum OwnerOperation {
     Connection,
     Metadata,
     Intent,
+    /// Query the real M44 task/consent owner; this is not a provider mail read.
+    Read,
 }
 
 impl OwnerOperation {
     fn workload_allowed(self) -> bool {
-        matches!(self, Self::Connection | Self::Metadata | Self::Intent)
+        matches!(
+            self,
+            Self::Connection | Self::Metadata | Self::Intent | Self::Read
+        )
     }
 }
 
@@ -342,8 +347,9 @@ impl OwnerAuthority {
     }
 
     /// Workload identity authorizes only same-workspace owner queries, never
-    /// OAuth effects or provider mail reads. The real enabled intent and exact
-    /// connection generation/revision/capability remain mandatory at that caller.
+    /// OAuth effects or provider mail reads. Read queries require actual M44
+    /// task/consent proof; background reads require actual enabled intent. The
+    /// exact connection generation/revision/capability remain caller checks.
     pub async fn workload_headers(
         &self,
         identity: &ConnectorWorkloadIdentity,

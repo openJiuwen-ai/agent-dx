@@ -722,8 +722,19 @@ OwnerOperation, raw_body)` rechecks the actual business session and current
 Binding. `connector_workload_identity(&HeaderMap)` instead verifies the existing
 connector-purpose grant, independently of phone sessions. Its
 `workload_headers(&ConnectorWorkloadIdentity, OwnerOperation, raw_body)` permits
-only `connection`, `metadata` and `intent` queries; actual connection permission,
+only `connection`, `metadata`, `intent` and `read` owner queries; actual connection permission,
 enabled intent and connection generation/revision remain the caller's checks.
+
+The `read` operation authenticates a query for current read proof. Its consumer
+must call the real M44 task/consent owner; issuer tests do not implement or
+validate that permission adapter. It binds the caller and exact owner request,
+without granting provider mail reads. Foreground permission must come from the actual running
+task/execution epoch, sources and account consent, bound to the exact mail request
+digest and connection generation/revision. Gateway callers must recheck that proof
+before and after physical reads, including after budget waits. Background reads
+still require actual enabled intent/revision. JSON task IDs or modes and the
+connector namespace alone do not establish permission. The existing v1 purpose,
+signer, routing snapshot and 30-second limit remain unchanged.
 
 Both issuers reuse the existing signer and grant/session owners. A credential
 expires within 30 seconds and fixes the actor, operation, SHA-256 of the raw HTTP

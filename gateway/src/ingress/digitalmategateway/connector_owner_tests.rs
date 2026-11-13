@@ -135,6 +135,49 @@ fn digest(body: &[u8]) -> String {
 }
 
 #[tokio::test]
+async fn owner_read_proof_is_bound_to_the_exact_owner_request_not_mail_permission() {
+    let (owner, identity, _, bindings, _) = setup();
+    let body = br#"{"operation":"read","connection_id":"connection"}"#;
+    let packet = owner
+        .foreground_headers(&identity, OwnerOperation::Read, body)
+        .await
+        .unwrap();
+    let proof = owner
+        .verify(token(&packet), OwnerOperation::Read, &digest(body), None)
+        .await
+        .unwrap();
+    assert_eq!(proof["purpose"], "connector.authorization-owner");
+    assert_eq!(proof["operation"], "read");
+    assert_eq!(proof["path"], OWNER_PATH);
+    for field in [
+        "permissions",
+        "read_history",
+        "task_verified",
+        "model_permission",
+    ] {
+        assert!(proof.get(field).is_none(), "issuer must not invent {field}");
+    }
+    assert!(owner
+        .verify(
+            token(&packet),
+            OwnerOperation::Metadata,
+            &digest(body),
+            None
+        )
+        .await
+        .is_err());
+    assert!(owner
+        .verify(token(&packet), OwnerOperation::Read, &digest(b"{}"), None)
+        .await
+        .is_err());
+    bindings.0.lock().unwrap().generation = "replaced".into();
+    assert!(owner
+        .verify(token(&packet), OwnerOperation::Read, &digest(body), None)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn delivery_bootstrap_target_requires_exact_actual_binding_and_port() {
     use super::super::ingestion::SubscriptionBinding;
     let (owner, identity, _, bindings, _) = setup();

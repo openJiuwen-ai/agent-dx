@@ -157,6 +157,7 @@ async fn owner_purpose_persisted_workload_needs_no_phone_and_rechecks_real_grant
         OwnerOperation::Connection,
         OwnerOperation::Metadata,
         OwnerOperation::Intent,
+        OwnerOperation::Read,
     ] {
         let packet = owner
             .workload_headers(&workload, operation, body)
@@ -184,6 +185,8 @@ async fn owner_purpose_persisted_workload_needs_no_phone_and_rechecks_real_grant
         assert_eq!(proof["workspace"], workspace);
         assert_eq!(proof["environment_id"], "owner-environment");
         assert_eq!(proof["operation"], serde_json::to_value(operation).unwrap());
+        assert!(proof.get("permissions").is_none());
+        assert!(proof.get("read_history").is_none());
         for path in [
             "/v1/secret/get",
             "/v1/connector/identity",
@@ -229,7 +232,7 @@ async fn owner_purpose_persisted_workload_needs_no_phone_and_rechecks_real_grant
     assert!(owner
         .verify(
             &last_token,
-            OwnerOperation::Intent,
+            OwnerOperation::Read,
             &digest(body),
             Some(&identity)
         )
@@ -250,7 +253,7 @@ async fn owner_purpose_persisted_workload_needs_no_phone_and_rechecks_real_grant
     assert!(owner
         .verify(
             &last_token,
-            OwnerOperation::Intent,
+            OwnerOperation::Read,
             &digest(body),
             Some(&identity)
         )
@@ -264,7 +267,7 @@ async fn owner_purpose_persisted_workload_needs_no_phone_and_rechecks_real_grant
             .is_err()
     );
     assert!(owner
-        .workload_headers(&workload, OwnerOperation::Intent, body)
+        .workload_headers(&workload, OwnerOperation::Read, body)
         .await
         .is_err());
 }
