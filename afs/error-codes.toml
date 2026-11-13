@@ -250,6 +250,14 @@ subsystem = "DistributedFs"
 description = "DFS 文件句柄已关闭或不属于当前挂载会话，需要重新打开"
 
 [[error]]
+name = "NODE_DFS_STALE_NAME"
+value = "0x020c0002"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "DistributedFs"
+description = "DFS 路径名称已不再指向打开时的 inode，需要重新解析路径"
+
+[[error]]
 name = "NODE_RDMA_SESSION_UNKNOWN"
 value = "0x02090001"
 kind = "FailedPrecondition"
