@@ -188,8 +188,15 @@ fn g2_subtree_index_survives_root_replacement_and_direct_rebuild() {
         root.clone(),
         identity(1),
         attrs(FileKind::Directory),
+        None,
     );
-    let second = state.insert_root(name, root.clone(), identity(2), attrs(FileKind::Directory));
+    let second = state.insert_root(
+        name,
+        root.clone(),
+        identity(2),
+        attrs(FileKind::Directory),
+        None,
+    );
 
     assert_ne!(first, second);
     assert_subtree_index(&state, &[(root.clone(), StoragePath::root())]);

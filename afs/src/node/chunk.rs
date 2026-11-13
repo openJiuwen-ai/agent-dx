@@ -247,6 +247,7 @@ mod format_golden_tests;
 
 #[derive(Debug)]
 pub struct LocalChunkStore {
+    #[cfg(any(feature = "dfs", test))]
     read_cache_admission: Mutex<()>,
     node_id: String,
     device_id: String,
