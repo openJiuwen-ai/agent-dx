@@ -140,7 +140,7 @@ pub fn parse_proxy_routes(input: &str) -> Result<Vec<ProxyRoute>, String> {
 
 #[derive(Clone)]
 pub struct ReverseProxy {
-    client: Client<HttpConnector, Incoming>,
+    client: Client<HttpConnector, ProxyBody>,
 }
 
 impl ReverseProxy {
@@ -232,7 +232,11 @@ impl ReverseProxy {
         {
             processing.forwarded();
         }
-        let mut response = match self.client.request(request).await {
+        let mut response = match self
+            .client
+            .request(super::processing::forwarding_request(request))
+            .await
+        {
             Ok(response) => response,
             Err(error) => return bad_gateway(error),
         };

@@ -74,6 +74,32 @@ async fn send_request(ingress: Arc<Ingress>, request: &str) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
+#[cfg(feature = "mock-e2e")]
+async fn read_upload(stream: &mut TcpStream, chunked: bool) -> io::Result<Vec<u8>> {
+    if !chunked {
+        let mut bytes = vec![0; 4];
+        stream.read_exact(&mut bytes).await?;
+        return Ok(bytes);
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        while !line.ends_with(b"\r\n") {
+            line.push(stream.read_u8().await?);
+        }
+        let length = usize::from_str_radix(std::str::from_utf8(&line).unwrap().trim(), 16).unwrap();
+        let start = bytes.len();
+        bytes.resize(start + length, 0);
+        stream.read_exact(&mut bytes[start..]).await?;
+        let mut delimiter = [0; 2];
+        stream.read_exact(&mut delimiter).await?;
+        assert_eq!(&delimiter, b"\r\n");
+        if length == 0 {
+            return Ok(bytes);
+        }
+    }
+}
+
 fn ingress(delay: u64) -> Arc<Ingress> {
     ingress_with_progress(delay).0
 }
@@ -174,15 +200,31 @@ async fn running_backend(
             stream.read_exact(&mut byte).await.unwrap();
             bytes.extend_from_slice(&byte);
         }
+        let headers = String::from_utf8(bytes.clone())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(!headers.contains("x-adx-processing-timeout-ms"));
+        if mode == 7 || mode == 8 {
+            executions.fetch_add(1, Ordering::SeqCst);
+            if let Ok(body) =
+                read_upload(&mut stream, headers.contains("transfer-encoding: chunked")).await
+            {
+                if mode == 8 {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+            return;
+        }
         if bytes.starts_with(b"POST ") {
             let mut body = [0; 2];
             stream.read_exact(&mut body).await.unwrap();
             assert_eq!(&body, b"{}");
         }
-        assert!(!String::from_utf8(bytes)
-            .unwrap()
-            .to_ascii_lowercase()
-            .contains("x-adx-processing-timeout-ms"));
         executions.fetch_add(1, Ordering::SeqCst);
         if mode == 1 {
             stream
@@ -307,13 +349,11 @@ async fn backend_cannot_assert_a_not_forwarded_resume_error() {
 
 #[cfg(feature = "mock-e2e")]
 #[tokio::test]
-async fn response_body_streaming_also_uses_the_original_processing_deadline() {
-    let (ingress, tasks, count) = running_backend(1).await;
-    let started = Instant::now();
-    let response = request(ingress, "X-ADX-Processing-Timeout-Ms: 120\r\n").await;
+async fn successful_response_body_streams_past_processing_deadline() {
+    let (ingress, tasks, count) = running_backend(3).await;
+    let response = request(ingress, "X-ADX-Processing-Timeout-Ms: 240\r\n").await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert!(response.ends_with('a'), "{response}");
-    assert!(started.elapsed() < std::time::Duration::from_millis(220));
+    assert!(response.ends_with("abcd"), "{response}");
     assert!(!response.contains("ENV_RESUMING"));
     assert_eq!(count.load(Ordering::SeqCst), 1);
     for task in tasks {
@@ -395,7 +435,7 @@ async fn file_download_errors_keep_processing_deadline() {
 
 #[cfg(feature = "mock-e2e")]
 #[tokio::test]
-async fn tar_download_keeps_processing_deadline() {
+async fn transfer_tar_download_survives_processing_deadline() {
     let (ingress, tasks, _) = running_backend(3).await;
     let response = download_request(
         ingress,
@@ -404,8 +444,7 @@ async fn tar_download_keeps_processing_deadline() {
     )
     .await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    let (_, body) = response.split_once("\r\n\r\n").unwrap();
-    assert!(!body.is_empty() && body.len() < 4 && "abcd".starts_with(body));
+    assert!(response.ends_with("abcd"), "{response}");
     for task in tasks {
         task.abort();
     }
@@ -413,13 +452,103 @@ async fn tar_download_keeps_processing_deadline() {
 
 #[cfg(feature = "mock-e2e")]
 #[tokio::test]
-async fn port_forwarded_download_keeps_processing_deadline() {
+async fn transfer_port_forwarded_download_survives_processing_deadline() {
     let (ingress, tasks, _) = running_backend(3).await;
     let port = ingress.default_direct_port;
     let response = send_request(ingress, &format!("GET /environment/{port}/download?type=file HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-ADX-Processing-Timeout-Ms: 240\r\n\r\n")).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    let (_, body) = response.split_once("\r\n\r\n").unwrap();
-    assert!(!body.is_empty() && body.len() < 4 && "abcd".starts_with(body));
+    assert!(response.ends_with("abcd"), "{response}");
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn transfer_upload_survives_processing_deadline() {
+    for chunked in [false, true] {
+        slow_upload(chunked).await;
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+async fn slow_upload(chunked: bool) {
+    let (ingress, tasks, count) = running_backend(7).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, peer) = listener.accept().await.unwrap();
+        ingress
+            .serve_http_connection(socket, peer, IngressSecurity::Tls)
+            .await;
+    });
+    let mut socket = TcpStream::connect(address).await.unwrap();
+    let (kind, framing) = if chunked {
+        ("tar", "Transfer-Encoding: chunked")
+    } else {
+        ("file", "Content-Length: 4")
+    };
+    socket.write_all(format!("POST /direct/environment/upload?type={kind}&path=/fixture HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{framing}\r\nX-ADX-Processing-Timeout-Ms: 240\r\n\r\n").as_bytes()).await.unwrap();
+    for byte in [b"a", b"b", b"c", b"d"] {
+        if chunked {
+            socket.write_all(b"1\r\n").await.unwrap();
+        }
+        if socket.write_all(byte).await.is_err() {
+            break;
+        }
+        if chunked {
+            socket.write_all(b"\r\n").await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    if chunked {
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
+    }
+    let mut bytes = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        socket.read_to_end(&mut bytes),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let response = String::from_utf8(bytes).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("abcd"), "{response}");
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    server.abort();
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn transfer_upload_stops_when_request_body_is_idle() {
+    let (ingress, tasks, _) = running_backend(7).await;
+    let response = send_request(ingress, "POST /direct/environment/upload?type=file&path=/fixture HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 4\r\nX-ADX-Processing-Timeout-Ms: 120\r\n\r\na").await;
+    assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+    assert!(
+        response.contains("PROCESSING_DEADLINE_EXCEEDED"),
+        "{response}"
+    );
+    assert!(response.contains("\"outcome\":\"unknown\""), "{response}");
+    assert!(response.contains("\"requestForwarded\":true"), "{response}");
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn transfer_upload_keeps_deadline_while_waiting_for_response_headers() {
+    let (ingress, tasks, _) = running_backend(8).await;
+    let response = send_request(ingress, "POST /direct/environment/upload?type=tar&path=/fixture HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 4\r\nX-ADX-Processing-Timeout-Ms: 120\r\n\r\nabcd").await;
+    assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+    assert!(
+        response.contains("PROCESSING_DEADLINE_EXCEEDED"),
+        "{response}"
+    );
     for task in tasks {
         task.abort();
     }
