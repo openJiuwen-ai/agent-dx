@@ -159,6 +159,9 @@ struct RecordingMeta {
     /// Scripted `open_file_read` answers (registered, Meta term, writer
     /// elsewhere); none left: today's resolution, nothing registered.
     open_read_replies: Mutex<VecDeque<(bool, u64, bool)>>,
+    /// Meta term with which `create_registered` registers the reader; `None`
+    /// registers nothing (and the handle pins itself).
+    create_registers: Mutex<Option<u64>>,
 }
 
 impl RecordingMeta {
@@ -226,6 +229,7 @@ impl RecordingMeta {
             rename_errors: Mutex::new(VecDeque::new()),
             rename_operations: Mutex::new(Vec::new()),
             open_read_replies: Mutex::new(VecDeque::new()),
+            create_registers: Mutex::new(None),
             file_version_loads: AtomicUsize::new(0),
             renew_calls: AtomicUsize::new(0),
             open_write_calls: AtomicUsize::new(0),
@@ -439,6 +443,21 @@ impl DfsMeta for RecordingMeta {
             self.inode.lock().unwrap().clone(),
             self.lease.lock().unwrap().clone(),
         ))
+    }
+
+    fn create_registered(
+        &self,
+        operation_id: &OperationId,
+        parent: &InodeId,
+        name: &[u8],
+        attributes: InodeAttributes,
+        first_generation: Option<&OperationId>,
+        reader: Option<u64>,
+    ) -> Result<(InodeRecord, WriteLease, Option<u64>)> {
+        let (inode, lease) =
+            self.create(operation_id, parent, name, attributes, first_generation)?;
+        let term = reader.and(*self.create_registers.lock().unwrap());
+        Ok((inode, lease, term))
     }
 
     fn open_file_read(

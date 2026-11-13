@@ -566,3 +566,54 @@ fn a_read_open_of_a_head_that_never_settles_pins_durably_and_succeeds() {
     assert_eq!(read_all(&fx.fs, handle), b"version-one");
     fx.fs.release(&context(), handle).unwrap();
 }
+
+/// R107: a created file's handle is registered in Meta's memory with the
+/// create; closing it releases a reader, never a durable `open:create-`
+/// reference (a log record per file).
+#[test]
+fn a_created_handle_is_a_soft_reader_and_closes_without_a_durable_release() {
+    let fx = fixture();
+    *fx.meta.create_registers.lock().unwrap() = Some(1);
+    let created = fx
+        .fs
+        .create(
+            &context(),
+            fx.fs.root_inode(),
+            std::ffi::OsStr::new("new"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fx.fs.release(&context(), created.handle).unwrap();
+    fx.references.flush().unwrap();
+    assert!(
+        !fx.gc
+            .released
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| id.starts_with("open:create-")),
+        "no durable create reference to release"
+    );
+    assert_eq!(fx.gc.released_readers.lock().unwrap().len(), 1);
+}
+
+/// Without a registration by Meta the created handle pins itself (soft
+/// registration if Meta takes it, here unsupported: durably), as before.
+#[test]
+fn a_created_handle_meta_did_not_register_pins_itself() {
+    let fx = fixture();
+    let before = fx.gc.retained.lock().unwrap().len();
+    let created = fx
+        .fs
+        .create(
+            &context(),
+            fx.fs.root_inode(),
+            std::ffi::OsStr::new("new"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    assert_eq!(fx.gc.retained.lock().unwrap().len(), before + 1);
+    fx.fs.release(&context(), created.handle).unwrap();
+}

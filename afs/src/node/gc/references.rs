@@ -574,11 +574,19 @@ impl GcReferences {
             "Meta writer term kept changing during a reader report",
         ))
     }
-    fn release_soft(&self) -> Result<()> {
+    /// Releases closed soft readers, at most `batches` calls of
+    /// `RELEASE_BATCH`. A failure keeps every id it did not confirm.
+    fn release_soft(&self, batches: usize) -> Result<()> {
         let released = std::mem::take(&mut self.soft()?.released);
-        for batch in released.chunks(RELEASE_BATCH) {
+        for (index, batch) in released.chunks(RELEASE_BATCH).enumerate() {
+            if index == batches {
+                let rest = released[index * RELEASE_BATCH..].to_vec();
+                self.soft()?.released.extend(rest);
+                return Ok(());
+            }
             if let Err(error) = self.control.release_readers(batch) {
-                self.soft()?.released.extend_from_slice(batch);
+                let rest = released[index * RELEASE_BATCH..].to_vec();
+                self.soft()?.released.extend(rest);
                 return Err(error);
             }
         }
@@ -728,17 +736,47 @@ impl GcReferences {
             .map_err(|_| Error::coded(afs_error::IO_UNAVAILABLE, "GC release queue poisoned"))?
             .len())
     }
-    /// Releases everything dropped so far, a batch at a time. On failure the
-    /// unconfirmed ids return to the queue: a lost release only protects longer.
+    /// Releases everything dropped so far, a batch at a time, and reports
+    /// the soft readers. On failure the unconfirmed ids return to the queue:
+    /// a lost release only protects longer. For shutdown and backpressure;
+    /// the release loop uses `release_batch` and `flush_for_collection`.
     pub fn flush(&self) -> Result<()> {
-        // Soft readers: release closed ones and reconcile the rest every
-        // pass (design §3.3 items 3 and 4); then the durable releases.
-        let soft = self.release_soft().and_then(|()| self.report_readers());
-        self.flush_durable()?;
+        let soft = self
+            .release_soft(usize::MAX)
+            .and_then(|()| self.report_readers());
+        self.flush_durable(usize::MAX)?;
         soft
     }
-    fn flush_durable(&self) -> Result<()> {
-        loop {
+    /// A wake of the release loop (`release_wanted`): one batch of each
+    /// kind, then back to waiting. Ids that drop meanwhile wait for the next
+    /// wake or pass instead of each costing a release transaction (R107).
+    pub(crate) fn release_batch(&self) -> Result<()> {
+        let soft = self.release_soft(1);
+        self.flush_durable(1)?;
+        // A wake fires when a queue reaches the threshold; one still above it
+        // after this batch would otherwise wait for the next pass.
+        if self.pending_len()? >= RELEASE_WAKE_PENDING
+            || self.soft()?.released.len() >= RELEASE_WAKE_PENDING
+        {
+            self.wake.notify_one();
+        }
+        soft
+    }
+    /// A collection pass: releases what was queued when it started, however
+    /// fast new ids arrive, and reconciles the soft readers with Meta (design
+    /// §3.3 items 3 and 4) once per pass.
+    pub(crate) fn flush_for_collection(&self) -> Result<()> {
+        let backlog = |queued: usize| queued.div_ceil(RELEASE_BATCH);
+        let soft_batches = backlog(self.soft()?.released.len());
+        let soft = self
+            .release_soft(soft_batches)
+            .and_then(|()| self.report_readers());
+        self.flush_durable(backlog(self.pending_len()?))?;
+        soft
+    }
+    /// Sends at most `batches` release calls.
+    fn flush_durable(&self, batches: usize) -> Result<()> {
+        for _ in 0..batches {
             let batch = {
                 let mut queue = self.pending.lock().map_err(|_| {
                     Error::coded(afs_error::IO_UNAVAILABLE, "GC release queue poisoned")
@@ -766,6 +804,7 @@ impl GcReferences {
                 metrics.released.inc_by(batch.len() as u64);
             }
         }
+        Ok(())
     }
 }
 
@@ -1086,5 +1125,142 @@ mod tests {
             [2]
         );
         drop(second);
+    }
+
+    /// A Meta whose release call lets more pins drop meanwhile, as creates
+    /// keep closing handles while a release is in flight (R107).
+    struct BusyMeta {
+        owner: Mutex<Option<std::sync::Weak<GcReferences>>>,
+        batches: AtomicU64,
+        /// Ids that drop during each of the first release calls.
+        arrivals: usize,
+        reports: AtomicU64,
+    }
+    impl GcControl for BusyMeta {
+        fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
+            Ok(())
+        }
+        fn release(&self, _: &[String]) -> Result<()> {
+            let call = self.batches.fetch_add(1, Ordering::SeqCst);
+            if call < 1_000
+                && let Some(owner) = self
+                    .owner
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|o| o.upgrade())
+            {
+                let mut pending = owner.pending.lock().unwrap();
+                pending.extend((0..self.arrivals).map(|i| format!("open:late-{call}-{i}")));
+            }
+            Ok(())
+        }
+        fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<GcState> {
+            Ok(GcState::default())
+        }
+        fn report_readers(&self, _: u64, _: u64, _: &[SoftReader]) -> Result<u64> {
+            self.reports.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+    fn busy(arrivals: usize) -> (Arc<BusyMeta>, Arc<GcReferences>) {
+        let meta = Arc::new(BusyMeta {
+            owner: Mutex::new(None),
+            batches: AtomicU64::new(0),
+            arrivals,
+            reports: AtomicU64::new(0),
+        });
+        let references = GcReferences::new(meta.clone());
+        *meta.owner.lock().unwrap() = Some(Arc::downgrade(&references));
+        (meta, references)
+    }
+
+    /// R107: a wake sends one batch and goes back to waiting; it does not
+    /// chase ids that drop while that batch is in flight.
+    #[test]
+    fn a_release_wake_sends_one_batch() {
+        let (meta, references) = busy(3);
+        references
+            .pending
+            .lock()
+            .unwrap()
+            .extend((0..RELEASE_WAKE_PENDING).map(|i| format!("open:{i}")));
+        references.release_batch().unwrap();
+        assert_eq!(meta.batches.load(Ordering::SeqCst), 1);
+        assert_eq!(references.pending_len().unwrap(), 3, "the late ids wait");
+        assert_eq!(
+            meta.reports.load(Ordering::SeqCst),
+            0,
+            "a wake reports nothing"
+        );
+    }
+
+    /// R107: a collection pass releases what was queued when it started,
+    /// however fast new ids arrive, and reports readers once.
+    #[test]
+    fn a_collection_pass_releases_only_what_was_queued_when_it_started() {
+        let (meta, references) = busy(3);
+        references
+            .pending
+            .lock()
+            .unwrap()
+            .extend((0..2 * RELEASE_BATCH + 5).map(|i| format!("open:{i}")));
+        references.flush_for_collection().unwrap();
+        assert_eq!(
+            meta.batches.load(Ordering::SeqCst),
+            3,
+            "the backlog, not the arrivals"
+        );
+        // The last batch carries the ids that arrived during the first two;
+        // those of the last call wait for the next wake or pass.
+        assert_eq!(references.pending_len().unwrap(), 3);
+        assert_eq!(meta.reports.load(Ordering::SeqCst), 1);
+    }
+
+    /// An explicit flush still drains everything (shutdown, backpressure).
+    #[test]
+    fn an_explicit_flush_still_drains_everything() {
+        let (meta, references) = busy(0);
+        references
+            .pending
+            .lock()
+            .unwrap()
+            .extend((0..RELEASE_BATCH + 1).map(|i| format!("open:{i}")));
+        references.flush().unwrap();
+        assert_eq!(references.pending_len().unwrap(), 0);
+        assert_eq!(meta.batches.load(Ordering::SeqCst), 2);
+    }
+
+    /// Soft releases that fail keep every id for the retry, not only the
+    /// failed batch.
+    #[test]
+    fn failed_soft_releases_keep_every_reader() {
+        struct Refusing;
+        impl GcControl for Refusing {
+            fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
+                Ok(())
+            }
+            fn release(&self, _: &[String]) -> Result<()> {
+                Ok(())
+            }
+            fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<GcState> {
+                Ok(GcState::default())
+            }
+            fn release_readers(&self, _: &[u64]) -> Result<()> {
+                Err(Error::coded(afs_error::IO_UNAVAILABLE, "lost"))
+            }
+        }
+        let references = GcReferences::new(Arc::new(Refusing));
+        references
+            .soft
+            .lock()
+            .unwrap()
+            .released
+            .extend(0..(2 * RELEASE_BATCH as u64 + 1));
+        assert!(references.flush_for_collection().is_err());
+        assert_eq!(
+            references.soft.lock().unwrap().released.len(),
+            2 * RELEASE_BATCH + 1
+        );
     }
 }

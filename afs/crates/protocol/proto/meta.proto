@@ -788,11 +788,19 @@ message DfsCreateRequest {
   // The creator's first write generation (timestamped operation id); when set,
   // its `write:` GC reference is admitted in the Create transaction.
   optional string first_generation_operation_id = 9;
+  // Register the handle this create opens as in-memory reader `reader` (round
+  // 2 C-1) instead of a durable `open:create-` reference. Requires the session
+  // to have reported its readers to this Meta (META_DFS_SESSION_NOT_REPORTED).
+  optional uint64 reader = 10;
 }
 
 message DfsCreateReply {
   DfsInodeRecord inode = 1;
   DfsWriteLease write_lease = 2;
+  // `reader` is registered, by the Meta of writer term `meta_term`. False
+  // with a reader: the Node pins the handle itself.
+  bool reader_registered = 3;
+  uint64 meta_term = 4;
 }
 
 

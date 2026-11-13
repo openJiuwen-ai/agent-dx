@@ -302,7 +302,7 @@ Running 的认领过期后可被再次认领（调用方核对工人会话）。
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Head: Create（同事务登记句柄的 open: 引用）
+    [*] --> Head: Create（句柄在 Meta 内存登记为读者；Node 未上报读者时回可重试错误）
     Head --> Head: CommitFileVersion：租约与 epoch 校验，<br/>head／revision CAS，parent_version = 旧 head<br/>（meta/dfs/commit.rs）
     Head --> Pinned: 新版本提交后，旧版本仍被某个引用的 pinned_version 命名
     Head --> Unreachable: 新版本提交后无人命名
@@ -1362,7 +1362,7 @@ Coordinator 挂载同一 namespace，统一管理共享文件的回收；节点�
 
 **哪些版本可达**（R81 F2）：inode 的 nlink 大于 0、或有未退休（或仍在宽限期内）的 GC 引用、或写租约未过期时，
 保留 inode 和它的 head；每个引用另外保留它记录的那一个版本（`GcReference.pinned_version`）：读句柄是打开时固定的
-版本，写代是这一代开始时的基线版本；Create 事务里建的句柄引用、目录引用不记版本，只保 head。没有被任何一条命名的旧版本，
+版本，写代是这一代开始时的基线版本；Create 打开的句柄（在 Create 处理里先于事务登记为内存读者）、目录引用不记版本，只保 head。没有被任何一条命名的旧版本，
 即使文件仍打开也会回收，它与保留版本共享的 chunk 由可达性保留。Node 按（inode，版本）共享 `open:` 引用。
 
 这一字段随 `META_RECORD_DECISION` 2、`META_STATE_IMAGE` 3 引入，旧数据目录按格式规则拒绝（`STORAGE_FORMAT_INCOMPATIBLE`），
@@ -1448,9 +1448,10 @@ inode、FileVersion、LayoutRoot 与数据块，两层职责不混用。
 - Node 删除块和校验旁文件，持久化 catalog 检查点及已完成代次后应答；重启或应答丢失重试不重复
   删除新上传的同内容块。catalog WAL 随检查点截断。Node 清单还会发现无主上传残留。
 
-一个计划分批提交：每批至多 4096 个 key，一次回收调用至多 16 批；每代至多 512 个 chunk，有积压时约每秒一代。chunk 与它的 placement、copy、task 同批删除；其余实体都从活根不可达，删去任何子集都不改变活数据，崩溃后重新规划即可继续。提交被容量拒绝时批大小减半，到 64 仍被拒才报错。回收停滞看 `afs_meta_dfs_gc_stalled_seconds`、`afs_meta_dfs_gc_dead_keys`、`afs_meta_dfs_gc_rejected_batches_total` 与日志 `dfs.gc_stalled`。Node 每 5 秒推进。引用释放不限速：一次 `ReleaseGcReferences` 调用在
-一个事务内退休至多 1024 个引用，每次回收调用先排空释放队列，队列积压到 256 个时唤醒回收循环只
-做释放；积压到 65536 个时，新建引用先排空队列，Meta 不接受释放就连新引用一起失败，队列因此有
+一个计划分批提交：每批至多 4096 个 key，一次回收调用至多 16 批；每代至多 512 个 chunk，有积压时约每秒一代。chunk 与它的 placement、copy、task 同批删除；其余实体都从活根不可达，删去任何子集都不改变活数据，崩溃后重新规划即可继续。提交被容量拒绝时批大小减半，到 64 仍被拒才报错。回收停滞看 `afs_meta_dfs_gc_stalled_seconds`、`afs_meta_dfs_gc_dead_keys`、`afs_meta_dfs_gc_rejected_batches_total` 与日志 `dfs.gc_stalled`。Node 每 5 秒推进。引用释放：一次 `ReleaseGcReferences` 调用在
+一个事务内退休至多 1024 个引用。每次回收调用先释放**调用开始时**已在队列里的引用，并向 Meta 对账一次软读者；
+队列积压到 256 个时唤醒回收循环，每次唤醒只发一批，不追着释放期间新进来的引用发，否则文件不断关闭时
+每两三个文件就多一个释放事务。积压到 65536 个时，新建引用先排空队列，Meta 不接受释放就连新引用一起失败，队列因此有
 界。不可达 Node 会保守阻塞当前物理删除批次，不以心跳失联推定磁盘已清空。外部对象（S3）模式一代只等一个删除者（存活
 存储 Node 中 id 最小的）：它失联后被移出等待集合，剩余对象由列举对账找回；它仍注册却 120 秒没有完成（例如对象存储挂起），
 下一个调用回收的存活 Node 接过这一代并删除同一批对象（重复删除无害，日志 `dfs.gc_deleter_handoff`，计入

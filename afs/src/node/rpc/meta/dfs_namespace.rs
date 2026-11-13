@@ -61,6 +61,26 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         attributes: crate::dfs::InodeAttributes,
         first_generation: Option<&crate::dfs::OperationId>,
     ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease)> {
+        self.create_registered(
+            operation_id,
+            parent,
+            name,
+            attributes,
+            first_generation,
+            None,
+        )
+        .map(|(inode, lease, _)| (inode, lease))
+    }
+
+    fn create_registered(
+        &self,
+        operation_id: &crate::dfs::OperationId,
+        parent: &crate::dfs::InodeId,
+        name: &[u8],
+        attributes: crate::dfs::InodeAttributes,
+        first_generation: Option<&crate::dfs::OperationId>,
+        reader: Option<u64>,
+    ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease, Option<u64>)> {
         self.read_diagnostic(
             crate::node::metrics::read_timing::ReadDiagnosticStage::MetaCreate,
             || {
@@ -76,11 +96,13 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                         lease_seconds: crate::dfs::DFS_WRITE_LEASE_SECONDS,
                         first_generation_operation_id:
                             first_generation.map(|generation| generation.0.clone()),
+                        reader,
                     }))?
                     .into_inner();
                 Ok((
                     domain_dfs_inode(required(reply.inode, "DfsCreate.inode")?)?,
                     domain_dfs_write_lease(required(reply.write_lease, "DfsCreate.write_lease")?),
+                    reply.reader_registered.then_some(reply.meta_term),
                 ))
             },
         )

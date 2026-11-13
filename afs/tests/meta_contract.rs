@@ -2572,6 +2572,7 @@ async fn commit_request_with_copies(
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -3216,6 +3217,7 @@ async fn dfs_commit_accepts_durable_ack_after_unrelated_catalog_advance() {
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -3447,6 +3449,7 @@ async fn dfs_namespace_unlink_removes_name_but_keeps_orphan_inode_for_open_handl
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -3505,6 +3508,7 @@ async fn dfs_namespace_rename_no_replace_and_replace_are_atomic() {
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -3522,6 +3526,7 @@ async fn dfs_namespace_rename_no_replace_and_replace_are_atomic() {
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -3689,6 +3694,7 @@ async fn dfs_namespace_errors_preserve_posix_errno() {
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -3783,6 +3789,7 @@ async fn dfs_namespace_hardlink_symlink_and_readlink_are_metadata_operations() {
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -3873,6 +3880,7 @@ async fn dfs_generic_xattr_cannot_change_lazy_source() {
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -3922,6 +3930,7 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -4209,6 +4218,7 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -4338,6 +4348,7 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -4602,6 +4613,7 @@ async fn dfs_metadata_sync_refuses_revision_drift_and_a_rebuilt_sync_keeps_xattr
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -4711,6 +4723,7 @@ async fn dfs_write_lease_reuses_one_owner_and_fences_stale_commits() {
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
             first_generation_operation_id: None,
+            reader: None,
         }))
         .await
         .unwrap()
@@ -5523,6 +5536,7 @@ async fn dfs_kernel_killpriv_commit_requires_lease_and_preserves_nonexecutable_s
                 owner_session_id: "session-a".into(),
                 lease_seconds: 30,
                 first_generation_operation_id: None,
+                reader: None,
             }))
             .await
             .unwrap()

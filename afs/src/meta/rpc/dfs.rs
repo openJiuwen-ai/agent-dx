@@ -253,25 +253,30 @@ impl DfsMetaService for DfsMetaRpc {
         let attributes = request
             .attributes
             .ok_or_else(|| invalid("DFS create requires attributes"))?;
-        let (inode, lease) = dfs_service(&self.0)?
-            .create(CreateFileRequest {
-                caller_id: request.caller_id,
-                owner_session_id: request.owner_session_id,
-                operation_id: crate::dfs::OperationId::new(request.operation_id),
-                namespace_id: crate::dfs::NamespaceId::new(request.namespace_id),
-                parent_inode_id: crate::dfs::InodeId::new(request.parent_inode_id),
-                name: request.name,
-                attributes: domain_dfs_attributes(attributes),
-                lease_seconds: request.lease_seconds,
-                first_generation: request
-                    .first_generation_operation_id
-                    .map(crate::dfs::OperationId::new),
-            })
+        let (inode, lease, meta_term) = dfs_service(&self.0)?
+            .create_registered(
+                CreateFileRequest {
+                    caller_id: request.caller_id,
+                    owner_session_id: request.owner_session_id,
+                    operation_id: crate::dfs::OperationId::new(request.operation_id),
+                    namespace_id: crate::dfs::NamespaceId::new(request.namespace_id),
+                    parent_inode_id: crate::dfs::InodeId::new(request.parent_inode_id),
+                    name: request.name,
+                    attributes: domain_dfs_attributes(attributes),
+                    lease_seconds: request.lease_seconds,
+                    first_generation: request
+                        .first_generation_operation_id
+                        .map(crate::dfs::OperationId::new),
+                },
+                request.reader,
+            )
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(DfsCreateReply {
             inode: Some(wire_dfs_inode(inode)),
             write_lease: Some(wire_dfs_write_lease(lease)),
+            reader_registered: meta_term.is_some(),
+            meta_term: meta_term.unwrap_or_default(),
         }))
     }
 

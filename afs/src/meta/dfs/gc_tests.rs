@@ -2642,3 +2642,78 @@ async fn an_open_whose_head_never_settles_answers_unregistered() {
         .unwrap_err();
     assert_eq!(refused.code(), afs_error::META_DFS_READER_NOT_HEAD);
 }
+
+/// R107: Create registers its handle as an in-memory reader of the new
+/// inode instead of writing a durable `open:create-` reference. The entry
+/// protects the inode once unlinked, until the reader is released; a replay
+/// registers again; an unreported session is refused.
+#[tokio::test]
+async fn create_registers_its_handle_in_memory_and_writes_no_reference() {
+    use crate::dfs::created_handle_reference_id;
+    let (store, _) = seeded_store(vec![MetaEntity::DfsInode(root_inode(NamespaceId::new(
+        "ns",
+    )))])
+    .await;
+    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    let request = || CreateFileRequest {
+        caller_id: "n".into(),
+        owner_session_id: "s".into(),
+        operation_id: OperationId::new("create-r107"),
+        namespace_id: NamespaceId::new("ns"),
+        parent_inode_id: InodeId::new("1"),
+        name: b"f".to_vec(),
+        attributes: InodeAttributes {
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            atime_unix_ms: 1,
+            mtime_unix_ms: 1,
+            ctime_unix_ms: 1,
+        },
+        // Short: the creator's write lease protects the inode too.
+        lease_seconds: 1,
+        first_generation: None,
+    };
+    let refused = service
+        .create_registered(request(), Some(7))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), afs_error::META_DFS_SESSION_NOT_REPORTED);
+    report_no_readers(&service).await;
+    let (inode, _, term) = service.create_registered(request(), Some(7)).await.unwrap();
+    assert_eq!(term, Some(store.writer_term()));
+    let operation = OperationId::new("create-r107");
+    assert!(
+        !exists(
+            &store,
+            ref_key("n", "s", &created_handle_reference_id(&operation))
+        )
+        .await,
+        "no durable handle reference"
+    );
+    assert_eq!(service.readers.len(), 1);
+    let (_, _, replayed) = service.create_registered(request(), Some(7)).await.unwrap();
+    assert_eq!(replayed, Some(store.writer_term()));
+    assert_eq!(
+        service.readers.len(),
+        1,
+        "the replay re-registers the same reader"
+    );
+    // Unlinked while open: the registration keeps the inode.
+    let mut unlinked = inode.clone();
+    unlinked.attributes.nlink = 0;
+    put_entities(&store, "unlink", vec![MetaEntity::DfsInode(unlinked)]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    service
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    assert!(exists(&store, MetaKey::DfsInode(inode.inode_id.clone())).await);
+    service.release_readers("n", "s", &[7]).unwrap();
+    service
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    assert!(!exists(&store, MetaKey::DfsInode(inode.inode_id.clone())).await);
+}

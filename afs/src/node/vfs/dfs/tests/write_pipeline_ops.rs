@@ -2036,7 +2036,16 @@ fn a_created_file_writes_its_first_generation_without_an_admission_call() {
     assert_eq!(commits[0].operation_id, generation);
     drop(commits);
     fs.release(&context(), file.handle).unwrap();
-    references.flush().unwrap();
+    // The background commit drops the generation pin on its own thread.
+    let released = format!("write:{}", generation.0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        references.flush().unwrap();
+        if control.released.lock().unwrap().contains(&released) || Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
         control
             .released

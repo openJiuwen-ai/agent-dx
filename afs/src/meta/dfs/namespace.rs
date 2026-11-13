@@ -25,6 +25,28 @@ impl DfsService {
     }
 
     pub async fn create(&self, request: CreateFileRequest) -> Result<(InodeRecord, WriteLease)> {
+        self.create_registered(request, None)
+            .await
+            .map(|(inode, lease, _)| (inode, lease))
+    }
+
+    /// `create`, with the handle it opens registered as in-memory reader
+    /// `reader` of the new inode (round 2 C-1) instead of a durable
+    /// `open:create-` reference in the Create transaction. Returns the Meta
+    /// writer term when the reader is registered; `None` asks the Node to pin
+    /// the handle itself (a replay that finds the inode already changed).
+    ///
+    /// Why this is the C-1 registration (design §3.4): the entry `(I, no
+    /// version)` is inserted before the transaction that makes `I` visible,
+    /// so it precedes every view in which `I` exists (L1); `I`'s head in the
+    /// transaction's own state is the empty version and `I` is linked, which
+    /// is exactly what the entry pins (L7). A GC plan that sees `I` read the
+    /// table after the entry was inserted, so the entry is among its inputs.
+    pub async fn create_registered(
+        &self,
+        request: CreateFileRequest,
+        reader: Option<u64>,
+    ) -> Result<(InodeRecord, WriteLease, Option<u64>)> {
         let request_digest = namespace_request_digest(&request)?;
         let CreateFileRequest {
             caller_id,
@@ -42,6 +64,12 @@ impl DfsService {
         require_id(&operation_id.0, "operation_id")?;
         require_id(&namespace_id.0, "namespace_id")?;
         require_id(&parent_inode_id.0, "parent_inode_id")?;
+        if reader.is_some() && !self.readers.is_reported(&caller_id, &owner_session_id) {
+            return Err(afs_error::Error::coded(
+                afs_error::META_DFS_SESSION_NOT_REPORTED,
+                "Node session has not reported its readers to this Meta",
+            ));
+        }
         if let Some((inode, lease)) = self
             .replayed_namespace_inode_and_lease(
                 &caller_id,
@@ -51,7 +79,15 @@ impl DfsService {
             )
             .await?
         {
-            return Ok((inode, lease));
+            // A retry after a lost reply: register as any open would.
+            let term = match reader {
+                Some(reader) => self
+                    .retain_reader(&caller_id, &owner_session_id, reader, &inode.inode_id, None)
+                    .await
+                    .ok(),
+                None => None,
+            };
+            return Ok((inode, lease, term));
         }
         validate_name(&name)?;
         let inode = InodeRecord {
@@ -107,6 +143,60 @@ impl DfsService {
                 )
             })
             .transpose()?;
+        // ② of the registration, before the transaction that creates `I`.
+        let session = lease.owner_session_id.clone();
+        let registered = reader.map(|reader| {
+            let seq = self.readers.insert(
+                &caller_id,
+                &lease.owner_session_id,
+                reader,
+                &inode.inode_id,
+                None,
+            );
+            (reader, seq)
+        });
+        let created = self
+            .create_attempts(
+                caller_id.clone(),
+                &operation_id,
+                request_digest,
+                namespace_id,
+                parent_inode_id,
+                dentry_key,
+                inode,
+                lease,
+                handle_reference,
+                generation_reference,
+                registered.is_some(),
+            )
+            .await;
+        match (created, registered) {
+            (Ok((inode, lease)), registered) => {
+                Ok((inode, lease, registered.map(|_| self.store.writer_term())))
+            }
+            (Err(error), Some((reader, seq))) => {
+                self.readers.remove_if(&caller_id, &session, reader, seq);
+                Err(error)
+            }
+            (Err(error), None) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_attempts(
+        &self,
+        caller_id: String,
+        operation_id: &OperationId,
+        request_digest: [u8; 32],
+        namespace_id: NamespaceId,
+        parent_inode_id: InodeId,
+        dentry_key: DentryKey,
+        inode: InodeRecord,
+        lease: WriteLease,
+        handle_reference: crate::dfs::GcReference,
+        generation_reference: Option<crate::dfs::GcReference>,
+        soft_handle: bool,
+    ) -> Result<(InodeRecord, WriteLease)> {
         let request = RequestKey::new(caller_id, operation_id.0.clone());
         let mut parent = self
             .directory_for_mutation(&namespace_id, &parent_inode_id)
@@ -134,10 +224,17 @@ impl DfsService {
                 TxnCondition::Missing(MetaKey::DfsDentry(dentry.key.clone())),
                 TxnCondition::Missing(MetaKey::DfsInode(inode.inode_id.clone())),
                 TxnCondition::Missing(MetaKey::DfsWriteLease(inode.inode_id.clone())),
-                TxnCondition::Missing(crate::meta::store::entity_key(&MetaEntity::DfsReference(
-                    handle_reference.clone(),
-                ))),
             ]);
+            if !soft_handle {
+                txn.conditions
+                    .push(TxnCondition::Missing(crate::meta::store::entity_key(
+                        &MetaEntity::DfsReference(handle_reference.clone()),
+                    )));
+                txn.mutations
+                    .push(TxnMutation::Put(MetaEntity::DfsReference(
+                        handle_reference.clone(),
+                    )));
+            }
             push_parent_namespace_change(&mut txn, parent.clone(), 0);
             if let Some(reference) = &generation_reference {
                 // Like `update_gc_reference`: only the creator's live session
@@ -160,7 +257,6 @@ impl DfsService {
                 TxnMutation::Put(MetaEntity::DfsDentry(dentry)),
                 TxnMutation::Put(MetaEntity::DfsInode(inode.clone())),
                 TxnMutation::Put(MetaEntity::DfsWriteLease(lease.clone())),
-                TxnMutation::Put(MetaEntity::DfsReference(handle_reference.clone())),
                 TxnMutation::RecordRequestOutcome(outcome),
             ]);
             let outcome = validate_namespace_outcome(

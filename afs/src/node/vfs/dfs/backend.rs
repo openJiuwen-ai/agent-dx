@@ -448,12 +448,21 @@ impl Backend for DistributedFs {
             mode
         };
         let operation_id = self.identity.operation_id("create");
-        // Dropped on any failure below, which queues its release: the reply may
-        // be lost after Meta already admitted the reference.
-        let gc_pin = self
+        // Round 2 C-1: the handle this create opens is registered in Meta's
+        // memory with the create (reader `reader`), not as a durable
+        // `open:create-` reference that must be released with a log record.
+        let reader = match &self.gc.references {
+            Some(references) => references.begin_reader()?,
+            None => None,
+        };
+        // Without soft registration: the durable reference Meta admits inside
+        // the Create transaction. Dropped on any failure below, which queues
+        // its release: the reply may be lost after Meta already admitted it.
+        let durable_pin = self
             .gc
             .references
             .as_ref()
+            .filter(|_| reader.is_none())
             .map(|references| references.created_handle_pin(&operation_id));
         // B1: the first write generation of the new file is admitted with it
         // (native write pipeline only; proxy and S3 writers keep their own
@@ -473,22 +482,61 @@ impl Backend for DistributedFs {
             }
             _ => None,
         };
-        let (inode, write_lease) = self.meta.create(
-            &operation_id,
-            &self.inode_id(parent)?,
-            name.as_encoded_bytes(),
-            InodeAttributes {
-                mode,
-                uid: ctx.uid,
-                gid: ctx.gid,
-                nlink: 1,
-                atime_unix_ms: now,
-                mtime_unix_ms: now,
-                ctime_unix_ms: now,
-            },
-            first_generation.as_ref().map(|(generation, _)| generation),
-        )?;
+        let parent_id = self.inode_id(parent)?;
+        let attributes_of = InodeAttributes {
+            mode,
+            uid: ctx.uid,
+            gid: ctx.gid,
+            nlink: 1,
+            atime_unix_ms: now,
+            mtime_unix_ms: now,
+            ctime_unix_ms: now,
+        };
+        let create = || {
+            self.meta.create_registered(
+                &operation_id,
+                &parent_id,
+                name.as_encoded_bytes(),
+                attributes_of.clone(),
+                first_generation.as_ref().map(|(generation, _)| generation),
+                reader,
+            )
+        };
+        let created = match create() {
+            Err(error) if error.code() == afs_error::META_DFS_SESSION_NOT_REPORTED => {
+                // This Meta has not heard from this session yet: report, then
+                // retry the same create (same operation id).
+                match self.gc.references.as_ref().map(|r| r.report_readers()) {
+                    Some(Err(report)) => Err(report),
+                    _ => create(),
+                }
+            }
+            created => created,
+        };
+        let (inode, write_lease, registered) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                if let (Some(references), Some(reader)) = (&self.gc.references, reader) {
+                    // A lost reply leaves at most a stale registration, which
+                    // the next report removes.
+                    references.finish_reader(reader, None)?;
+                }
+                return Err(error);
+            }
+        };
         let inode = self.validate_inode(inode)?;
+        let gc_pin = match (&self.gc.references, reader) {
+            (Some(references), Some(reader)) => {
+                match references
+                    .finish_reader(reader, registered.map(|term| (term, &inode.inode_id, None)))?
+                {
+                    Some(pin) => Some(pin),
+                    // Not registered (or by a replaced Meta): pin it now.
+                    None => Some(references.pin(&inode.inode_id, None)?),
+                }
+            }
+            _ => durable_pin,
+        };
         self.recent_names.record(
             &inode.inode_id,
             &self.inode_id(parent)?,
