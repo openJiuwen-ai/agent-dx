@@ -44,6 +44,10 @@ pub(crate) struct GcMetrics {
     pub(crate) stalled_seconds: afs_metrics::IntGauge,
     /// Commits refused for size; each halves the batch for the next attempt.
     pub(crate) rejected_batches: afs_metrics::IntCounter,
+    /// In-memory reader registrations (round 2 C-1) the last plan saw.
+    pub(crate) reader_registrations: afs_metrics::IntGauge,
+    /// 1 while the restart gate keeps every inode and version (C-1).
+    pub(crate) reader_gate_closed: afs_metrics::IntGauge,
     pub(super) last_collected: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     open_generation: Arc<std::sync::Mutex<Option<(u64, std::time::Instant)>>>,
 }
@@ -133,6 +137,14 @@ impl GcMetrics {
                 "afs_meta_dfs_gc_rejected_batches_total",
                 "DFS GC commits refused for size, each halving the batch",
             )?,
+            reader_registrations: afs_metrics::IntGauge::new(
+                "afs_meta_dfs_reader_registrations",
+                "In-memory DFS reader registrations the last GC plan saw",
+            )?,
+            reader_gate_closed: afs_metrics::IntGauge::new(
+                "afs_meta_dfs_gc_reader_gate_closed",
+                "1 while GC keeps every inode and version until Node sessions report their readers after a Meta restart",
+            )?,
             last_collected: Arc::new(std::sync::Mutex::new(None)),
             open_generation: Arc::new(std::sync::Mutex::new(None)),
         })
@@ -160,7 +172,15 @@ impl GcMetrics {
         afs_metrics::register_collector(registry, &self.repair_placements_checked)?;
         afs_metrics::register_collector(registry, &self.dead_keys)?;
         afs_metrics::register_collector(registry, &self.stalled_seconds)?;
-        afs_metrics::register_collector(registry, &self.rejected_batches)
+        afs_metrics::register_collector(registry, &self.rejected_batches)?;
+        afs_metrics::register_collector(registry, &self.reader_registrations)?;
+        afs_metrics::register_collector(registry, &self.reader_gate_closed)
+    }
+
+    pub(super) fn observe_readers(&self, registrations: usize, gate_closed: bool) {
+        self.reader_registrations
+            .set(i64::try_from(registrations).unwrap_or(i64::MAX));
+        self.reader_gate_closed.set(i64::from(gate_closed));
     }
 
     /// Something was collected, or nothing was dead.

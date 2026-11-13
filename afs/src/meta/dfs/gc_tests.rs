@@ -464,6 +464,7 @@ async fn a_plan_survives_unrelated_commits_and_fails_on_each_relevant_change() {
             chunks: [dead_chunk.clone()].into(),
             generations: ["00000000000000000000000000000001".to_owned()].into(),
             live_sessions: [("n".to_owned(), "s".to_owned())].into(),
+            readers: None,
         })
     };
     let reference = |id: &str, inode: &str, publication: bool, retired: Option<u64>| {
@@ -858,6 +859,8 @@ async fn collect_until_clean(
             store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
             service = DfsService::new(store.clone()).with_gc_grace_ms(0);
             // The session lease survives the reopen; the fixture is unchanged.
+            // The Node reports its (no) readers to the new term (C-1 gate).
+            report_no_readers(&service).await;
         }
     }
 }
@@ -2170,4 +2173,472 @@ async fn collect_with_acks(service: &DfsService) {
         }
         completed = gc.generation;
     }
+}
+
+// ---- Round 2 C-1: in-memory reader registrations ----
+
+async fn report_no_readers(service: &DfsService) {
+    let term = service.store.writer_term();
+    assert_eq!(
+        service
+            .report_readers("n", "s", term, 0, Vec::new())
+            .await
+            .unwrap(),
+        term
+    );
+}
+
+async fn put_entities(store: &crate::meta::store::Store, label: &str, entities: Vec<MetaEntity>) {
+    let key = RequestKey::new("fixture", label);
+    let mut txn = MetaTxn::new(key.clone(), StoreOperation::DfsCreate);
+    txn.conditions
+        .push(TxnCondition::RequestAbsent(key.clone()));
+    txn.mutations = entities.into_iter().map(TxnMutation::Put).collect();
+    txn.mutations
+        .push(TxnMutation::RecordRequestOutcome(RequestOutcome {
+            request: key,
+            operation: StoreOperation::DfsCreate,
+            result: OperationResult::Empty,
+        }));
+    assert!(matches!(
+        store.compare_and_commit(txn).await.unwrap(),
+        TxnOutcome::Committed { .. }
+    ));
+}
+
+async fn exists(store: &crate::meta::store::Store, key: MetaKey) -> bool {
+    store
+        .read_view()
+        .await
+        .unwrap()
+        .lookup(&key)
+        .unwrap()
+        .entity
+        .is_some()
+}
+
+/// L1/U1: the registration is in the table before Meta takes the view it
+/// validates against. A writer moves the head and a GC pass runs exactly in
+/// between: the pass sees the registration and keeps the old version; the
+/// validation then sees the new head and refuses (the Node pins durably).
+#[tokio::test]
+async fn a_reader_registered_before_its_view_keeps_a_version_a_racing_gc_would_delete() {
+    let mut entities = vec![inode("i", 1, "v1"), chunk("old")];
+    entities.extend(version("v1", "i", "old"));
+    let (store, _) = seeded_store(entities).await;
+    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    report_no_readers(&service).await;
+    let racing = (store.clone(), service.clone());
+    service.set_reader_hook(Some(Arc::new(move || {
+        let (store, service) = racing.clone();
+        Box::pin(async move {
+            let mut moved = vec![inode("i", 1, "v2"), chunk("new")];
+            moved.extend(version("v2", "i", "new"));
+            put_entities(&store, "rewrite", moved).await;
+            service
+                .collect_garbage("n".into(), "s".into(), 0, vec![])
+                .await
+                .unwrap();
+            assert!(
+                exists(&store, MetaKey::DfsFileVersion(FileVersionId::new("v1"))).await,
+                "the registration made before the view protects the version"
+            );
+        })
+    })));
+    let error = service
+        .retain_reader(
+            "n",
+            "s",
+            1,
+            &InodeId::new("i"),
+            Some(&FileVersionId::new("v1")),
+        )
+        .await
+        .expect_err("the version is no longer the head in the validation view");
+    assert_eq!(error.code(), afs_error::META_DFS_READER_NOT_HEAD);
+    assert_eq!(service.readers.len(), 0, "a refused registration leaves");
+    service.set_reader_hook(None);
+    service
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    assert!(!exists(&store, MetaKey::DfsFileVersion(FileVersionId::new("v1"))).await);
+}
+
+/// A registration pins only the linked head of the validation view (L7):
+/// an older version, an unlinked inode (`/proc/self/fd` reopen) and an
+/// unknown session are refused, and the replying term is the writer's.
+#[tokio::test]
+async fn a_reader_registration_pins_only_the_linked_head() {
+    let mut entities = vec![inode("i", 1, "v2"), inode("gone", 0, "g"), chunk("c")];
+    entities.extend(version("v2", "i", "c"));
+    entities.extend(version("v1", "i", "c"));
+    entities.extend(version("g", "gone", "c"));
+    let (store, _) = seeded_store(entities).await;
+    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    let unreported = service
+        .retain_reader(
+            "n",
+            "s",
+            1,
+            &InodeId::new("i"),
+            Some(&FileVersionId::new("v2")),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unreported.code(), afs_error::META_DFS_SESSION_NOT_REPORTED);
+    report_no_readers(&service).await;
+    assert_eq!(
+        service
+            .retain_reader(
+                "n",
+                "s",
+                1,
+                &InodeId::new("i"),
+                Some(&FileVersionId::new("v2"))
+            )
+            .await
+            .unwrap(),
+        store.writer_term()
+    );
+    for (inode_id, version_id) in [("i", "v1"), ("gone", "g")] {
+        let error = service
+            .retain_reader(
+                "n",
+                "s",
+                2,
+                &InodeId::new(inode_id),
+                Some(&FileVersionId::new(version_id)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            afs_error::META_DFS_READER_NOT_HEAD,
+            "{inode_id}"
+        );
+    }
+    let stranger = service
+        .retain_reader(
+            "other",
+            "s",
+            3,
+            &InodeId::new("i"),
+            Some(&FileVersionId::new("v2")),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stranger.code(), afs_error::META_DFS_SESSION_NOT_REPORTED);
+    assert_eq!(service.readers.len(), 1, "only the head registration stays");
+    service.release_readers("n", "s", &[1]).unwrap();
+    assert_eq!(service.readers.len(), 0);
+}
+
+/// U2: a GC commit is refused when a registration on one of the plan's
+/// inodes arrived after the plan read the table, and only then.
+#[tokio::test]
+async fn a_registration_after_the_plan_invalidates_a_commit_on_its_inode() {
+    let (store, _) = seeded_store(vec![inode("i", 1, "v")]).await;
+    let service = DfsService::new(store.clone());
+    report_no_readers(&service).await;
+    let revision = store.read_view().await.unwrap().snapshot().unwrap().0;
+    service
+        .retain_reader(
+            "n",
+            "s",
+            1,
+            &InodeId::new("i"),
+            Some(&FileVersionId::new("v")),
+        )
+        .await
+        .unwrap();
+    let guard = |inodes: &[&str]| {
+        TxnCondition::DfsGcPlanStillValid(Arc::new(crate::meta::store::GcPlanGuard {
+            since: revision,
+            written_keys: [MetaKey::DfsInode(InodeId::new("i"))].into(),
+            live_sessions: [("n".to_owned(), "s".to_owned())].into(),
+            readers: Some(crate::meta::store::ReaderGuard {
+                table: service.readers.clone(),
+                since: 0,
+                inodes: inodes.iter().map(|inode| InodeId::new(*inode)).collect(),
+            }),
+            ..Default::default()
+        }))
+    };
+    let delete = || vec![TxnMutation::Delete(MetaKey::DfsInode(InodeId::new("i")))];
+    assert!(
+        !service
+            .gc_commit_checked(
+                vec![guard(&["i"])],
+                StoreOperation::DfsCollectGarbage,
+                delete()
+            )
+            .await
+            .unwrap(),
+        "a reader registered after the plan on its inode voids it"
+    );
+    assert!(
+        service
+            .gc_commit_checked(
+                vec![guard(&["other"])],
+                StoreOperation::DfsCollectGarbage,
+                delete()
+            )
+            .await
+            .unwrap(),
+        "a registration elsewhere does not"
+    );
+}
+
+/// The recheck covers the whole plan (C-F19): the owner of a version that
+/// only a later batch deletes is protected while the first batch deletes
+/// its chunks.
+#[test]
+fn the_reader_recheck_covers_every_inode_of_the_plan() {
+    let mut plan = GcPlan {
+        keys: vec![
+            MetaKey::DfsChunk(ChunkId::new("c")),
+            MetaKey::DfsInode(InodeId::new("dead")),
+            MetaKey::DfsFileVersion(FileVersionId::new("old")),
+        ],
+        chunk_keys: 1,
+        ..GcPlan::default()
+    };
+    plan.version_owners
+        .insert(FileVersionId::new("old"), InodeId::new("owner"));
+    assert_eq!(
+        plan_reader_inodes(&plan),
+        [InodeId::new("dead"), InodeId::new("owner")].into()
+    );
+}
+
+/// U5: after a Meta restart (a later writer term) GC deletes no inode and no
+/// version until the live session reports to the new term; orphan chunks
+/// no version reaches are still collected. Then the usual plan applies.
+#[tokio::test]
+async fn after_a_restart_gc_keeps_every_inode_and_version_until_sessions_report() {
+    use crate::meta::store::Store;
+    let mut entities = vec![
+        inode("i", 1, "v2"),
+        inode("dead", 0, "d"),
+        chunk("old"),
+        chunk("new"),
+        chunk("dead-chunk"),
+        chunk("orphan"),
+    ];
+    entities.extend(version("v1", "i", "old"));
+    entities.extend(version("v2", "i", "new"));
+    entities.extend(version("d", "dead", "dead-chunk"));
+    let (store, backend) = seeded_store(entities).await;
+    drop(store);
+    // A restarted Meta process is a new writer of the same log.
+    let store = Arc::new(Store::open_log(Arc::new(backend.reopen())).await.unwrap());
+    assert_eq!(store.writer_term(), 2);
+    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    let ticket = service
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    assert_eq!(ticket.chunks, vec![ChunkId::new("orphan")]);
+    for key in [
+        MetaKey::DfsFileVersion(FileVersionId::new("v1")),
+        MetaKey::DfsInode(InodeId::new("dead")),
+        MetaKey::DfsFileVersion(FileVersionId::new("d")),
+    ] {
+        assert!(
+            exists(&store, key.clone()).await,
+            "{key:?} kept by the gate"
+        );
+    }
+    service
+        .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
+        .await
+        .unwrap();
+    report_no_readers(&service).await;
+    let next = service
+        .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
+        .await
+        .unwrap();
+    assert!(next.chunks.contains(&ChunkId::new("old")));
+    assert!(next.chunks.contains(&ChunkId::new("dead-chunk")));
+    assert!(!exists(&store, MetaKey::DfsFileVersion(FileVersionId::new("v1"))).await);
+    assert!(!exists(&store, MetaKey::DfsInode(InodeId::new("dead"))).await);
+}
+
+fn open_read(reader: u64, inode_id: &str, name: Option<&str>) -> crate::meta::dfs::OpenFileRead {
+    crate::meta::dfs::OpenFileRead {
+        node_id: "n".into(),
+        session_id: "s".into(),
+        reader,
+        inode_id: InodeId::new(inode_id),
+        name: name.map(|name| {
+            (
+                NamespaceId::new("ns"),
+                InodeId::new("1"),
+                name.as_bytes().to_vec(),
+            )
+        }),
+    }
+}
+
+/// B2 with L1: an open registers the head before its validation view; a
+/// head that moves in between is registered again, so the open answers the
+/// new head registered and the old one unprotected by it.
+#[tokio::test]
+async fn an_open_whose_head_moves_registers_the_new_head() {
+    let mut entities = vec![inode("i", 1, "v1"), chunk("old")];
+    entities.extend(version("v1", "i", "old"));
+    let (store, _) = seeded_store(entities).await;
+    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    report_no_readers(&service).await;
+    let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let racing = (store.clone(), moved.clone());
+    service.set_reader_hook(Some(Arc::new(move || {
+        let (store, moved) = racing.clone();
+        Box::pin(async move {
+            if !moved.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let mut rewrite = vec![inode("i", 1, "v2"), chunk("new")];
+                rewrite.extend(version("v2", "i", "new"));
+                put_entities(&store, "rewrite", rewrite).await;
+            }
+        })
+    })));
+    let opened = service
+        .open_file_read(open_read(1, "i", None))
+        .await
+        .unwrap();
+    assert!(opened.registered);
+    assert_eq!(
+        opened.inode.unwrap().head_version,
+        Some(FileVersionId::new("v2"))
+    );
+    assert_eq!(opened.meta_term, store.writer_term());
+    let references = service
+        .readers
+        .snapshot(&[("n".into(), "s".into())].into(), &BTreeMap::new(), 0, 0)
+        .references;
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].pinned_version, Some(FileVersionId::new("v2")));
+}
+
+/// B2 edges: a name that no longer names the inode answers no inode; an
+/// unlinked inode answers unregistered (the Node pins durably); a live
+/// write lease of another session is reported (D-R3-2 ③), one's own is not.
+#[tokio::test]
+async fn an_open_checks_the_name_and_reports_a_writer_elsewhere() {
+    let mut entities = vec![
+        inode("i", 1, "v"),
+        inode("gone", 0, "g"),
+        chunk("c"),
+        MetaEntity::DfsDentry(crate::dfs::Dentry {
+            key: crate::dfs::DentryKey {
+                namespace_id: NamespaceId::new("ns"),
+                parent_inode_id: InodeId::new("1"),
+                name: b"f".to_vec(),
+            },
+            inode_id: InodeId::new("i"),
+        }),
+    ];
+    entities.extend(version("v", "i", "c"));
+    entities.extend(version("g", "gone", "c"));
+    let (store, _) = seeded_store(entities).await;
+    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    let unreported = service
+        .open_file_read(open_read(1, "i", None))
+        .await
+        .unwrap_err();
+    assert_eq!(unreported.code(), afs_error::META_DFS_SESSION_NOT_REPORTED);
+    report_no_readers(&service).await;
+    let named = service
+        .open_file_read(open_read(1, "i", Some("f")))
+        .await
+        .unwrap();
+    assert!(named.registered && !named.writer_elsewhere);
+    let renamed = service
+        .open_file_read(open_read(2, "i", Some("other")))
+        .await
+        .unwrap();
+    assert_eq!(renamed.inode, None);
+    assert!(!renamed.registered);
+    let unlinked = service
+        .open_file_read(open_read(3, "gone", None))
+        .await
+        .unwrap();
+    assert!(unlinked.inode.is_some() && !unlinked.registered);
+    assert_eq!(
+        service.readers.len(),
+        1,
+        "only the linked head registration stays"
+    );
+    for (owner, elsewhere) in [("s", false), ("other-session", true)] {
+        put_entities(
+            &store,
+            &format!("lease-{owner}"),
+            vec![MetaEntity::DfsWriteLease(crate::dfs::WriteLease {
+                inode_id: InodeId::new("i"),
+                owner_node_id: "n".into(),
+                owner_session_id: owner.into(),
+                lease_epoch: 1,
+                expires_at_unix_ms: now_unix_ms() + 30_000,
+            })],
+        )
+        .await;
+        let opened = service
+            .open_file_read(open_read(4, "i", None))
+            .await
+            .unwrap();
+        assert_eq!(opened.writer_elsewhere, elsewhere, "{owner}");
+    }
+}
+
+/// A head that moves before every validation (a log or counter rewritten
+/// all the time): after its bounded re-registrations the open still
+/// succeeds, answering the newest inode unregistered, and leaves nothing in
+/// the table; the Node then pins what it opens (durably, if the head moved
+/// again).
+#[tokio::test]
+async fn an_open_whose_head_never_settles_answers_unregistered() {
+    let mut entities = vec![inode("i", 1, "v0"), chunk("c")];
+    entities.extend(version("v0", "i", "c"));
+    let (store, _) = seeded_store(entities).await;
+    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    report_no_readers(&service).await;
+    let moves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let racing = (store.clone(), moves.clone());
+    service.set_reader_hook(Some(Arc::new(move || {
+        let (store, moves) = racing.clone();
+        Box::pin(async move {
+            let n = moves.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let head = format!("v{n}");
+            let mut rewrite = vec![inode("i", 1, &head)];
+            rewrite.extend(version(&head, "i", "c"));
+            put_entities(&store, &format!("rewrite-{n}"), rewrite).await;
+        })
+    })));
+    let opened = service
+        .open_file_read(open_read(1, "i", None))
+        .await
+        .expect("a head that keeps moving never fails the open");
+    assert!(!opened.registered);
+    let moved = moves.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(moved, super::super::readers::OPEN_REGISTER_ATTEMPTS);
+    assert_eq!(
+        opened.inode.unwrap().head_version,
+        Some(FileVersionId::new(format!("v{moved}"))),
+        "the newest head is answered"
+    );
+    assert_eq!(service.readers.len(), 0);
+    // The Node's own pin of that head moves on too: Meta refuses the soft
+    // registration, and the Node's durable reference is admitted.
+    let refused = service
+        .retain_reader(
+            "n",
+            "s",
+            2,
+            &InodeId::new("i"),
+            Some(&FileVersionId::new("v1")),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), afs_error::META_DFS_READER_NOT_HEAD);
 }

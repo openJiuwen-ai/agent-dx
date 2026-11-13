@@ -156,6 +156,9 @@ struct RecordingMeta {
     rename_errors: Mutex<VecDeque<Error>>,
     /// Operation ids `rename` was called with.
     rename_operations: Mutex<Vec<OperationId>>,
+    /// Scripted `open_file_read` answers (registered, Meta term, writer
+    /// elsewhere); none left: today's resolution, nothing registered.
+    open_read_replies: Mutex<VecDeque<(bool, u64, bool)>>,
 }
 
 impl RecordingMeta {
@@ -222,6 +225,7 @@ impl RecordingMeta {
             dir_page_calls: AtomicUsize::new(0),
             rename_errors: Mutex::new(VecDeque::new()),
             rename_operations: Mutex::new(Vec::new()),
+            open_read_replies: Mutex::new(VecDeque::new()),
             file_version_loads: AtomicUsize::new(0),
             renew_calls: AtomicUsize::new(0),
             open_write_calls: AtomicUsize::new(0),
@@ -435,6 +439,30 @@ impl DfsMeta for RecordingMeta {
             self.inode.lock().unwrap().clone(),
             self.lease.lock().unwrap().clone(),
         ))
+    }
+
+    fn open_file_read(
+        &self,
+        _: u64,
+        inode_id: &InodeId,
+        _: Option<(&InodeId, &[u8])>,
+    ) -> Result<super::OpenedForRead> {
+        let Some((registered, meta_term, writer_elsewhere)) =
+            self.open_read_replies.lock().unwrap().pop_front()
+        else {
+            return Ok(super::OpenedForRead {
+                inode: Some(self.get_inode(inode_id)?),
+                registered: false,
+                meta_term: 0,
+                writer_elsewhere: false,
+            });
+        };
+        Ok(super::OpenedForRead {
+            inode: Some(self.inode.lock().unwrap().clone()),
+            registered,
+            meta_term,
+            writer_elsewhere,
+        })
     }
 
     fn get_inode(&self, _: &InodeId) -> Result<InodeRecord> {

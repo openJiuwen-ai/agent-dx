@@ -37,6 +37,8 @@ mod namespace;
 mod placement;
 mod read_auth;
 mod read_cache;
+mod readers;
+pub use readers::{OpenFileRead, OpenedForRead, ReaderEntry};
 mod repair;
 mod replay;
 mod restore;
@@ -65,6 +67,10 @@ pub struct DfsService {
     gc_metrics: gc::GcMetrics,
     gc_reference_updates: Arc<[tokio::sync::Mutex<()>; GC_REFERENCE_LOCK_SHARDS]>,
     repair_patrol: Arc<std::sync::Mutex<repair::RepairPatrol>>,
+    /// Round 2 C-1 reader registrations of this Meta process.
+    readers: Arc<readers::SoftReaders>,
+    #[cfg(test)]
+    reader_hook: Arc<std::sync::Mutex<Option<readers::BetweenInsertAndView>>>,
 }
 
 // Store batches at most 64 submitted transactions in one durable commit pass.
@@ -137,6 +143,7 @@ impl DfsService {
             .and_then(|mut file| file.read_exact(&mut key))
             .ok()
             .map(|()| key);
+        let readers = Arc::new(readers::SoftReaders::new(store.writer_term()));
         Self {
             store,
             replication,
@@ -148,6 +155,9 @@ impl DfsService {
             gc_metrics: gc::GcMetrics::new().expect("fixed GC metric descriptors are valid"),
             gc_reference_updates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
             repair_patrol: Arc::default(),
+            readers,
+            #[cfg(test)]
+            reader_hook: Arc::default(),
         }
     }
 

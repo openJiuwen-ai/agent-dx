@@ -91,7 +91,33 @@ pub struct GcPlanGuard {
     pub generations: BTreeSet<String>,
     /// `(node, session)` of the live sessions the plan saw.
     pub live_sessions: BTreeSet<(String, String)>,
+    /// In-memory reader registrations (round 2 C-1) the plan must not miss.
+    pub readers: Option<ReaderGuard>,
 }
+
+/// In-memory reader registrations a GC commit rechecks: any made after the
+/// plan read the table (`since`) on an inode of the whole plan invalidates it.
+pub trait ReaderProbe: Send + Sync + std::fmt::Debug {
+    fn registered_since(&self, since: u64, inodes: &BTreeSet<InodeId>) -> bool;
+}
+
+/// See `ReaderProbe`. Compared by identity of the table and the plan inputs.
+#[derive(Clone, Debug)]
+pub struct ReaderGuard {
+    pub table: Arc<dyn ReaderProbe>,
+    pub since: u64,
+    /// The whole plan's deleted inodes and owners of deleted versions, not
+    /// only this batch's.
+    pub inodes: BTreeSet<InodeId>,
+}
+impl PartialEq for ReaderGuard {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.table, &other.table)
+            && self.since == other.since
+            && self.inodes == other.inodes
+    }
+}
+impl Eq for ReaderGuard {}
 impl GcPlanGuard {
     pub(super) fn heap_bytes(&self) -> usize {
         fn text(value: &str) -> usize {

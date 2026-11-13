@@ -422,6 +422,10 @@ message RecoverRootReply {
 service DfsMeta {
   rpc UpdateGcReference(UpdateDfsGcReferenceRequest) returns (UpdateDfsGcReferenceReply);
   rpc ReleaseGcReferences(ReleaseDfsGcReferencesRequest) returns (ReleaseDfsGcReferencesReply);
+  rpc RetainReader(RetainDfsReaderRequest) returns (RetainDfsReaderReply);
+  rpc ReleaseReaders(ReleaseDfsReadersRequest) returns (ReleaseDfsReadersReply);
+  rpc ReportReaders(ReportDfsReadersRequest) returns (ReportDfsReadersReply);
+  rpc OpenFileRead(DfsOpenFileReadRequest) returns (DfsOpenFileReadReply);
   rpc CollectGarbage(CollectDfsGarbageRequest) returns (CollectDfsGarbageReply);
   rpc Lookup(DfsLookupRequest) returns (DfsLookupReply);
   rpc Create(DfsCreateRequest) returns (DfsCreateReply);
@@ -1349,6 +1353,67 @@ message ReleaseDfsGcReferencesRequest {
   repeated string reference_ids = 3;
 }
 message ReleaseDfsGcReferencesReply {}
+// Round 2 C-1: an in-memory reader registration (no log record). Meta keeps
+// it only if `version_id` is the linked head of `inode_id` in a view taken
+// after the registration; otherwise META_DFS_READER_NOT_HEAD and the Node
+// pins durably with UpdateGcReference.
+message RetainDfsReaderRequest {
+  string node_id = 1;
+  string session_id = 2;
+  // Node-assigned, unique and increasing within the session.
+  uint64 reader = 3;
+  string inode_id = 4;
+  // Empty: the inode has no version (a new file or a directory).
+  string version_id = 5;
+}
+// `meta_term`: the Meta writer term that answered; a Node drops replies of a
+// term lower than one it has seen.
+message RetainDfsReaderReply { uint64 meta_term = 1; }
+message ReleaseDfsReadersRequest {
+  string node_id = 1;
+  string session_id = 2;
+  repeated uint64 readers = 3;
+}
+message ReleaseDfsReadersReply {}
+message DfsReaderEntry {
+  uint64 reader = 1;
+  string inode_id = 2;
+  string version_id = 3;
+}
+// Replaces the session's readers up to `low_watermark` with `readers`.
+// `meta_term` is the term the Node believed current; the session counts as
+// reported only if it matches the replying Meta's term.
+message ReportDfsReadersRequest {
+  string node_id = 1;
+  string session_id = 2;
+  uint64 meta_term = 3;
+  uint64 low_watermark = 4;
+  repeated DfsReaderEntry readers = 5;
+}
+message ReportDfsReadersReply { uint64 meta_term = 1; }
+// Round 2 B2: a read open in one call: resolve the inode (checking the name
+// when `name_check` is set), register reader `reader` of its head as
+// RetainReader does, and tell whether another session holds a live write
+// lease on it (then the open bypasses the page cache).
+message DfsOpenFileReadRequest {
+  string node_id = 1;
+  string session_id = 2;
+  uint64 reader = 3;
+  string inode_id = 4;
+  bool name_check = 5;
+  string namespace_id = 6;
+  string parent_inode_id = 7;
+  bytes name = 8;
+}
+message DfsOpenFileReadReply {
+  // Absent: the checked name no longer names the inode.
+  DfsInodeRecord inode = 1;
+  // The head of `inode` is registered as `reader`; otherwise the Node pins
+  // what it opens itself.
+  bool registered = 2;
+  uint64 meta_term = 3;
+  bool writer_elsewhere = 4;
+}
 message CollectDfsGarbageRequest {
   string node_id = 1;
   string session_id = 2;

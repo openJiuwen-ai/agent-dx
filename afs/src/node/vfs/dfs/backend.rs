@@ -578,7 +578,18 @@ impl Backend for DistributedFs {
         } else {
             None
         };
-        let preflight = self.validate_inode(self.open_preflight(&inode_id, ctx.pid)?)?;
+        let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
+        // B2, and the preflight half of B3: one Meta call resolves the
+        // inode and registers its head as this handle's reader (C-1). A
+        // write open then resolves its authority; if that view's head
+        // differs, the handle pins its own below.
+        // D-R3-2 ③ is not acted on yet: Meta's `writer_elsewhere` counts a
+        // write lease until it expires (up to 30 s after the last writer
+        // closed; Nodes do not hand leases back), so bypassing the page
+        // cache on it would also slow every read after another Node's write.
+        let (preflight, read_pin, _writer_elsewhere) =
+            self.open_preflight_for_read(&inode_id, ctx.pid)?;
+        let preflight = self.validate_inode(preflight)?;
         if matches!(preflight.kind, InodeKind::Special(_)) {
             return Err(Error::coded(
                 afs_error::IO_NOT_SUPPORTED,
@@ -590,7 +601,6 @@ impl Backend for DistributedFs {
         {
             return Err(invalid("immutable-origin files only allow read opens"));
         }
-        let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
         let (opened_inode, write_session) = if writable {
             let (inode, write_lease) = self.meta.resolve_write_authority(&inode_id)?;
             let inode = self.validate_inode(inode)?;
@@ -670,9 +680,14 @@ impl Backend for DistributedFs {
             // period; it only needs the authority to have held (R75).
             self.check_native_read_view_for_delivery(view)?;
         }
+        // The registration made with the preflight protects the head Meta
+        // saw; a handle that ends up on another version pins its own.
+        let gc_pin = read_pin.filter(|pin| {
+            pin.opened() == Some((&opened_inode.inode_id, opened_inode.head_version.as_ref()))
+        });
         self.allocate_handle(DfsFileHandle {
             origin_fill: false,
-            gc_pin: None,
+            gc_pin,
             inode_id: opened_inode.inode_id.clone(),
             opened_inode,
             opened_page_identity,
@@ -1124,7 +1139,9 @@ impl Backend for DistributedFs {
 
     fn opendir(&self, ctx: &RequestContext, inode: BackendInode) -> Result<DirectoryHandle> {
         let inode_id = self.inode_id(inode)?;
-        let record = self.validate_inode(self.open_preflight(&inode_id, ctx.pid)?)?;
+        // B8: the preflight registers the directory as a reader (C-1).
+        let (record, registered, _) = self.open_preflight_for_read(&inode_id, ctx.pid)?;
+        let record = self.validate_inode(record)?;
         if record.kind != InodeKind::Directory {
             return Err(Error::from(std::io::Error::from(
                 std::io::ErrorKind::NotADirectory,
@@ -1132,12 +1149,15 @@ impl Backend for DistributedFs {
         }
         let id = self.handles.next_id();
         let directory = DfsDirectoryHandle {
-            _gc_pin: self
-                .gc
-                .references
-                .as_ref()
-                .map(|references| references.pin(&inode_id, None))
-                .transpose()?,
+            _gc_pin: match registered.filter(|pin| pin.opened() == Some((&inode_id, None))) {
+                Some(pin) => Some(pin),
+                None => self
+                    .gc
+                    .references
+                    .as_ref()
+                    .map(|references| references.pin(&inode_id, None))
+                    .transpose()?,
+            },
             inode_id,
             entries: Vec::new(),
             last_name: Vec::new(),

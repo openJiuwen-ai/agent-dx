@@ -426,6 +426,22 @@ subsystem = "DistributedFs"
 description = "引用准入期限过期或被非法刷新；不同于复制修复 claim 已被替换"
 
 [[error]]
+name = "META_DFS_READER_NOT_HEAD"
+value = "0x03030008"
+kind = "FailedPrecondition"
+component = "Meta"
+subsystem = "DistributedFs"
+description = "读者登记的版本已不是 inode 的 head 或 inode 已无链接；Node 改用持久 GC 引用"
+
+[[error]]
+name = "META_DFS_SESSION_NOT_REPORTED"
+value = "0x03030009"
+kind = "Unavailable"
+component = "Meta"
+subsystem = "DistributedFs"
+description = "Node 会话尚未向当前 Meta 上报读者；Node 上报后重试"
+
+[[error]]
 name = "META_OWNER_ROOT_EXISTS"
 value = "0x03040001"
 kind = "AlreadyExists"

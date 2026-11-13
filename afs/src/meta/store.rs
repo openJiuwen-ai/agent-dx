@@ -88,8 +88,8 @@ pub(crate) use model::{
 pub use read_view::MetaReadView;
 use read_view::*;
 pub use txn::{
-    GcPlanGuard, MetaTxn, OperationResult, RequestOutcome, StoreOperation, TxnCondition,
-    TxnMutation, TxnOutcome,
+    GcPlanGuard, MetaTxn, OperationResult, ReaderGuard, ReaderProbe, RequestOutcome,
+    StoreOperation, TxnCondition, TxnMutation, TxnOutcome,
 };
 
 /// Boxed only on the coarse Meta control path. Durable logs preserve results
@@ -117,6 +117,14 @@ pub trait MetaStore: Send + Sync {
     /// `RootCommandAcked` is true only for a successful ACK from the recorded
     /// current Home session for that exact command, root epoch and generation.
     fn compare_and_commit(&self, txn: MetaTxn) -> MetaFuture<'_, TxnOutcome>;
+
+    /// The writer term of the log this store appends to: monotonic across
+    /// Meta processes and never reused (`journal::LogCursor::term`). Replies
+    /// built from in-memory Meta state carry it, so a Node can drop a reply
+    /// from a replaced Meta process (round 2 C-1). 0 when unknown.
+    fn writer_term(&self) -> u64 {
+        0
+    }
 
     /// `compare_and_commit` for background work (GC batches): it queues
     /// within a sub-quota so it never takes the room foreground writes need.

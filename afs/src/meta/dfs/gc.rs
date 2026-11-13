@@ -55,6 +55,8 @@ struct GcPlan {
     chunks: Vec<ChunkId>,
     /// Owner of each version in `keys`, for the commit condition.
     version_owners: BTreeMap<FileVersionId, InodeId>,
+    /// The in-memory reader recheck every batch of the plan commits with.
+    readers: Option<crate::meta::store::ReaderGuard>,
 }
 #[cfg(test)]
 fn plan_collection(
@@ -317,7 +319,7 @@ fn gc_state(entities: &[MetaEntity]) -> GcState {
         })
         .unwrap_or_default()
 }
-fn live_caller(entities: &[MetaEntity], node: &str, session: &str) -> Result<()> {
+pub(super) fn live_caller(entities: &[MetaEntity], node: &str, session: &str) -> Result<()> {
     let current = entities
         .iter()
         .filter_map(|entity| match entity {
@@ -620,7 +622,8 @@ impl DfsService {
                 version_owners: plan.version_owners.clone(),
                 ..GcPlan::default()
             };
-            let guard = plan_guard(since, entities, now, &chunkless, batch, &mutations);
+            let mut guard = plan_guard(since, entities, now, &chunkless, batch, &mutations);
+            guard.readers = plan.readers.clone();
             match self
                 .gc_commit_checked(
                     vec![TxnCondition::DfsGcPlanStillValid(Arc::new(guard))],
@@ -736,20 +739,48 @@ impl DfsService {
                 return Ok(gc);
             }
             register_inventory(&inventory, &mut entities, &mut mutations)?;
-            let references = entities
+            let mut references = entities
                 .iter()
                 .filter_map(|entity| match entity {
                     MetaEntity::DfsReference(value) => Some(value.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let plan = plan_bounded(
+            // C-1: in-memory reader registrations are live references too,
+            // and until the restart gate opens every inode and version is.
+            let sessions = session_deadlines(&entities);
+            let current = current_sessions(&entities)
+                .into_iter()
+                .filter(|(_, session)| session.is_live_at_unix_ms(now))
+                .map(|(node, session)| (node.to_owned(), session.session_id.clone()))
+                .collect::<BTreeSet<_>>();
+            let readers = self
+                .readers
+                .snapshot(&current, &sessions, now, self.gc_grace_ms);
+            let gate_closed = self.readers.restart_gate_closed(
+                &sessions,
+                &readers.reported,
+                now,
+                self.gc_grace_ms,
+            );
+            self.gc_metrics
+                .observe_readers(readers.references.len(), gate_closed);
+            references.extend(readers.references);
+            if gate_closed {
+                references.extend(pin_everything(&entities));
+            }
+            let mut plan = plan_bounded(
                 &entities,
                 &references,
                 now,
                 self.gc_grace_ms,
                 MAX_CHUNKS.min(batch_keys / 8).max(1),
             );
+            plan.readers = Some(crate::meta::store::ReaderGuard {
+                table: self.readers.clone(),
+                since: readers.since,
+                inodes: plan_reader_inodes(&plan),
+            });
             self.gc_metrics
                 .dead_keys
                 .set(i64::try_from(plan.keys.len()).unwrap_or(i64::MAX));
@@ -778,7 +809,8 @@ impl DfsService {
                 // No live storage node holds local copies to retire.
                 gc.chunks.clear();
             }
-            let guard = plan_guard(revision, &entities, now, &plan, batch, &mutations);
+            let mut guard = plan_guard(revision, &entities, now, &plan, batch, &mutations);
+            guard.readers = plan.readers.clone();
             gc_conditions.push(TxnCondition::DfsGcPlanStillValid(Arc::new(guard)));
             mutations.push(TxnMutation::Put(MetaEntity::DfsGc(gc.clone())));
             match self
@@ -866,7 +898,64 @@ fn plan_guard(
             .filter(|(_, session)| session.is_live_at_unix_ms(now))
             .map(|(node, session)| (node.to_owned(), session.session_id.clone()))
             .collect(),
+        readers: None,
     }
+}
+
+/// Every inode a reader registered after the plan must not land on: the
+/// deleted inodes and the owners of the deleted versions of the whole plan,
+/// not only of one batch (a later batch's version owns chunks an earlier
+/// batch deletes; design C-F19).
+fn plan_reader_inodes(plan: &GcPlan) -> BTreeSet<InodeId> {
+    plan.keys
+        .iter()
+        .filter_map(|key| match key {
+            MetaKey::DfsInode(inode) => Some(inode.clone()),
+            _ => None,
+        })
+        .chain(plan.version_owners.values().cloned())
+        .collect()
+}
+
+/// Every recorded session and its deadline.
+fn session_deadlines(entities: &[MetaEntity]) -> BTreeMap<(String, String), u64> {
+    entities
+        .iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::NodeSession(value) => Some((
+                (value.node_id.clone(), value.session_id.clone()),
+                value.expires_at_unix_ms,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The restart gate (C-1): a reference on every inode and on every version,
+/// so a plan deletes neither and collects only chunks no version reaches and
+/// no write generation protects.
+fn pin_everything(entities: &[MetaEntity]) -> Vec<GcReference> {
+    let reference = |inode: &InodeId, version: Option<&FileVersionId>| GcReference {
+        node_id: String::new(),
+        session_id: String::new(),
+        reference_id: "reader-gate".into(),
+        inode_id: Some(inode.clone()),
+        publication: false,
+        chunks: Vec::new(),
+        retired_at_unix_ms: None,
+        open_read: None,
+        pinned_version: version.cloned(),
+    };
+    entities
+        .iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::DfsInode(inode) => Some(reference(&inode.inode_id, None)),
+            MetaEntity::DfsFileVersion(version) => {
+                Some(reference(&version.inode_id, Some(&version.id)))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Registers objects a Node found that Meta does not know, so the one plan

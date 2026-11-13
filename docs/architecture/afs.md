@@ -1363,6 +1363,21 @@ Coordinator 挂载同一 namespace，统一管理共享文件的回收；节点�
 这一字段随 `META_RECORD_DECISION` 2、`META_STATE_IMAGE` 3 引入，旧数据目录按格式规则拒绝（`STORAGE_FORMAT_INCOMPATIBLE`），
 不会把旧引用当成“什么都不保护”。
 
+**读者登记在 Meta 内存里**（第 2 轮 C-1，协议 8，`meta/dfs/readers.rs`、`node/gc/references.rs`）：`open:` 固定不写日志。
+- **登记**：Meta 先把（会话、读者号 c、inode、版本）放进内存读者表，**之后**才取校验视图；只有该版本在这个视图里
+  仍是 inode 的 head 且 nlink 大于 0，登记才保留。否则回 `META_DFS_READER_NOT_HEAD`，Node 改用持久的
+  `UpdateGcReference`，例如已 unlink 的 inode 经 `/proc/self/fd` 重开、或 head 已前移的版本。
+  读打开与目录打开把解析、名字校验和这次登记合成一次 `OpenFileRead`。
+- **GC**：GC 把表里的条目当作活引用；提交前在提交循环里复核，有规划之后登记、落在整个计划受保护 inode 上的条目时，
+  计划作废。离开的会话的条目保留到 `max(deadline, now) + dfs_gc_grace_ms`。
+- **Meta 重启**：表随进程丢失。Meta 不是日志的第一个写者（writer term 大于 1）时，GC 先不删任何 inode 与版本，
+  只回收孤儿块，直到每个可能还在读的会话都向本 term 上报过读者（`ReportReaders`）或已过期。
+- **Node 侧**：
+  - 回复带 Meta 的 writer term，Node 丢弃 term 低于已见最大值的登记回复；
+  - 每个回收周期释放已关闭的读者，并全量对账一次，只替换低水位以内的条目；
+  - 指标 `afs_dfs_reader_references_total{kind=soft|durable}`（Node）、`afs_meta_dfs_reader_registrations`、
+    `afs_meta_dfs_gc_reader_gate_closed`（Meta）。
+
 **读路径选中的版本都有引用**（决策 4a，R94）：凡是读路径能选中的已提交版本，以及在途读正在用的版本，都由 GC 引用
 保护到使用结束；写句柄仍打开、写租约看似有效都不算保护（租约可能在写者打开期间失效，本机下一次提交也会让上一个
 基线退出 head）。读句柄的版本与它的引用作为一个整体替换（`node/vfs/dfs/handles.rs` 的 `OpenedView`），每个在途读

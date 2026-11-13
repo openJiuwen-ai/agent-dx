@@ -208,4 +208,18 @@ CASES = (
     _case("r84_local_upload_failure", ("LF28",), scenario(
         "r84-local", "phase-r84-upload-failure.sh", mode="native",
         env={"R84_FAULT": "diskfull"})),
+    # Round 2 C-1: in-memory reader registrations. E1 open/rewrite race under GC; E2 a reader whose session
+    # lapses (stopped Node), E4 the same through a Meta partition; E3 a reader across a Meta restart; an
+    # unlinked file reopened through /proc/self/fd stays pinned durably.
+    _case("soft_reader_race", ("LF29",), scenario(
+        "soft-reader-race", "phase-soft-reader-race.sh",
+        env={"COPIES_R2": "1", "META_EXTRA": "dfs_gc_grace_ms = 0", "AFS_DIAG_READER_REGISTER_DELAY_MS": "20"})),
+    _case("reader_lease_lapse", ("LF30",), scenario(
+        "reader-lease-lapse", "phase-reader-lease-lapse.sh", env={"COPIES_R2": "1"})),
+    _case("meta_restart_reader", ("LF31",), scenario(
+        "meta-restart-reader", "phase-meta-restart-reader.sh", env={"COPIES_R2": "1"})),
+    _case("reader_partition", ("LF32",), scenario(
+        "reader-partition", "phase-reader-lease-lapse.sh", env={"COPIES_R2": "1", "READER_LAPSE": "partition"})),
+    _case("unlinked_reopen_reader", ("LF33",), scenario(
+        "unlinked-reopen", "phase-unlinked-reopen.sh", mode="native")),
 )

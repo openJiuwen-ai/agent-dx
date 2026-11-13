@@ -26,6 +26,36 @@ pub trait GcControl: Send + Sync {
     /// caller keeps them all and retries, which is idempotent.
     fn release(&self, ids: &[String]) -> Result<()>;
     fn collect(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<GcState>;
+    /// Round 2 C-1: registers reader `reader` of `version` (the head the
+    /// Node saw) in Meta's memory, without a log record, and returns the
+    /// replying Meta's writer term. `META_DFS_READER_NOT_HEAD` (and this
+    /// default) means: pin it durably with `retain` instead.
+    fn retain_reader(
+        &self,
+        _reader: u64,
+        _inode: &InodeId,
+        _version: Option<&FileVersionId>,
+    ) -> Result<u64> {
+        Err(Error::coded(
+            afs_error::NODE_VFS_UNIMPLEMENTED,
+            "in-memory reader registration is unsupported",
+        ))
+    }
+    /// Drops closed readers at Meta. A lost call only protects longer.
+    fn release_readers(&self, _readers: &[u64]) -> Result<()> {
+        Ok(())
+    }
+    /// Replaces this session's readers up to `low_watermark` at Meta;
+    /// `term` is the writer term the Node believes current. Returns the
+    /// replying Meta's term.
+    fn report_readers(
+        &self,
+        _term: u64,
+        _low_watermark: u64,
+        _readers: &[SoftReader],
+    ) -> Result<u64> {
+        Ok(0)
+    }
     /// `collect` plus the assignment to list the external object store.
     fn collect_batch(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<GcBatch> {
         Ok(GcBatch {
@@ -33,6 +63,14 @@ pub trait GcControl: Send + Sync {
             list_external_inventory: false,
         })
     }
+}
+
+/// One reader as the Node reports it to Meta (C-1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SoftReader {
+    pub reader: u64,
+    pub inode: InodeId,
+    pub version: Option<FileVersionId>,
 }
 
 /// One collection reply.
@@ -46,6 +84,9 @@ pub(crate) struct GcReleaseMetrics {
     pending: afs_metrics::IntGauge,
     released: afs_metrics::IntCounter,
     failures: afs_metrics::IntCounter,
+    /// `open:` pins made, by how Meta keeps them: `soft` (in memory, C-1)
+    /// or `durable` (a logged `UpdateGcReference`).
+    reader_references: afs_metrics::IntCounterVec,
 }
 
 impl GcReleaseMetrics {
@@ -65,10 +106,18 @@ impl GcReleaseMetrics {
                 "afs_dfs_gc_release_failures_total",
                 "GC release calls that failed and stay queued",
             )?,
+            reader_references: afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_reader_references_total",
+                    "Open pins made by this Node, by kind: soft (Meta memory) or durable (Meta log)",
+                ),
+                &["kind"],
+            )?,
         };
         afs_metrics::register_collector(registry, &metrics.pending)?;
         afs_metrics::register_collector(registry, &metrics.released)?;
         afs_metrics::register_collector(registry, &metrics.failures)?;
+        afs_metrics::register_collector(registry, &metrics.reader_references)?;
         Ok(metrics)
     }
 }
@@ -97,6 +146,52 @@ pub struct GcReferences {
     /// this bounded by open versions; in a racing open the map may briefly miss
     /// a live pin, which only costs one more reference.
     open_pins: Mutex<std::collections::HashMap<OpenPinKey, std::sync::Weak<GcPin>>>,
+    /// In-memory reader registrations of this session (C-1).
+    soft: Mutex<SoftReaders>,
+}
+
+/// Retain attempts of one soft registration (term drops, a report first)
+/// before the pin falls back to a durable reference.
+const SOFT_RETAIN_ATTEMPTS: usize = 4;
+
+/// The Node side of C-1 (design §3.3). `reader` numbers increase; a reader
+/// is "in flight" from its number until its reply is handled. A report sends
+/// every live reader up to the low watermark, the highest number below every
+/// in-flight one, so Meta can replace exactly the readers whose fate the
+/// Node knows (L3).
+#[derive(Debug)]
+struct SoftReaders {
+    next: u64,
+    in_flight: std::collections::BTreeSet<u64>,
+    live: std::collections::BTreeMap<u64, (InodeId, Option<FileVersionId>)>,
+    /// Highest Meta writer term seen. A reply of a lower term comes from a
+    /// replaced Meta and is dropped (L6).
+    seen_term: u64,
+    /// Closed readers not yet released at Meta.
+    released: Vec<u64>,
+    /// The control has no soft registration: every pin is durable.
+    unsupported: bool,
+}
+
+impl Default for SoftReaders {
+    fn default() -> Self {
+        Self {
+            next: 1,
+            in_flight: std::collections::BTreeSet::new(),
+            live: std::collections::BTreeMap::new(),
+            seen_term: 0,
+            released: Vec::new(),
+            unsupported: false,
+        }
+    }
+}
+
+impl SoftReaders {
+    fn low_watermark(&self) -> u64 {
+        self.in_flight
+            .first()
+            .map_or(self.next - 1, |first| first - 1)
+    }
 }
 type OpenPinKey = (InodeId, Option<FileVersionId>);
 /// The Meta admission of a deferred `write:` pin (performance batch 1, D).
@@ -178,6 +273,8 @@ pub struct GcPin {
     owner: Arc<GcReferences>,
     /// The inode and version it is shared under; only `open:` pins are shared.
     open_inode: Option<OpenPinKey>,
+    /// Set for a soft reader (C-1): released with `release_readers`.
+    reader: Option<u64>,
 }
 impl GcPin {
     /// Wait until Meta has durably admitted this pin and return its fence.
@@ -222,6 +319,12 @@ impl GcPin {
             }
         }
     }
+    /// The inode and version an `open:` or reader pin protects.
+    pub(crate) fn opened(&self) -> Option<(&InodeId, Option<&FileVersionId>)> {
+        self.open_inode
+            .as_ref()
+            .map(|(inode, version)| (inode, version.as_ref()))
+    }
     /// Recover the immutable operation admitted by this generation pin.
     pub(crate) fn write_operation_id(&self) -> Option<crate::dfs::OperationId> {
         self.id
@@ -231,7 +334,15 @@ impl GcPin {
 }
 impl Drop for GcPin {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.owner.pending.lock() {
+        if let Some(reader) = self.reader {
+            if let Ok(mut soft) = self.owner.soft.lock() {
+                soft.live.remove(&reader);
+                soft.released.push(reader);
+                if soft.released.len() == RELEASE_WAKE_PENDING {
+                    self.owner.wake.notify_one();
+                }
+            }
+        } else if let Ok(mut pending) = self.owner.pending.lock() {
             pending.push(self.id.clone());
             self.owner.observe_pending(pending.len());
             if pending.len() == RELEASE_WAKE_PENDING {
@@ -266,6 +377,7 @@ impl GcReferences {
             metrics,
             wake: tokio::sync::Notify::new(),
             open_pins: Mutex::default(),
+            soft: Mutex::default(),
         })
     }
     /// Resolves when enough dropped pins wait that the release loop should not
@@ -290,9 +402,187 @@ impl GcReferences {
         if let Some(shared) = self.shared_open_pin(&key)? {
             return Ok(shared);
         }
-        let pin = self.pin_mode(inode, version, None)?;
+        let pin = match self.pin_soft(inode, version)? {
+            Some(pin) => pin,
+            None => {
+                let pin = self.pin_mode(inode, version, None)?;
+                self.observe_reader("durable");
+                pin
+            }
+        };
         self.share_open_pin(key, &pin)?;
         Ok(pin)
+    }
+    fn observe_reader(&self, kind: &str) {
+        if let Some(metrics) = &self.metrics {
+            metrics.reader_references.with_label_values(&[kind]).inc();
+        }
+    }
+    fn soft(&self) -> Result<std::sync::MutexGuard<'_, SoftReaders>> {
+        self.soft
+            .lock()
+            .map_err(|_| Error::coded(afs_error::IO_UNAVAILABLE, "GC reader table poisoned"))
+    }
+    /// A soft reader pin of `version`, or `None` when Meta wants it durable
+    /// (not the linked head any more, or no soft registration).
+    fn pin_soft(
+        self: &Arc<Self>,
+        inode: &InodeId,
+        version: Option<&FileVersionId>,
+    ) -> Result<Option<Arc<GcPin>>> {
+        let reader = {
+            let mut soft = self.soft()?;
+            if soft.unsupported {
+                return Ok(None);
+            }
+            let reader = soft.next;
+            soft.next += 1;
+            soft.in_flight.insert(reader);
+            reader
+        };
+        let outcome = self.retain_soft(reader, inode, version);
+        let mut soft = self.soft()?;
+        // Live before it leaves flight: a report never misses it (L3).
+        if matches!(outcome, Ok(true)) {
+            soft.live.insert(reader, (inode.clone(), version.cloned()));
+        }
+        soft.in_flight.remove(&reader);
+        drop(soft);
+        if !outcome? {
+            return Ok(None);
+        }
+        self.observe_reader("soft");
+        Ok(Some(Arc::new(GcPin {
+            fence: None,
+            deferred: None,
+            id: format!("reader:{reader}"),
+            owner: self.clone(),
+            open_inode: Some((inode.clone(), version.cloned())),
+            reader: Some(reader),
+        })))
+    }
+    /// Round 2 B2: a reader number for a registration another call makes
+    /// (`OpenFileRead`), in flight until `finish_reader`. `None`: soft
+    /// registration is off.
+    pub(crate) fn begin_reader(&self) -> Result<Option<u64>> {
+        let mut soft = self.soft()?;
+        if soft.unsupported {
+            return Ok(None);
+        }
+        let reader = soft.next;
+        soft.next += 1;
+        soft.in_flight.insert(reader);
+        Ok(Some(reader))
+    }
+    /// Ends `begin_reader`. `registered`: Meta of `term` registered
+    /// `version` of `inode` as this reader. A reply of a term older than one
+    /// this Node has seen is dropped (L6): no pin, the caller pins anew.
+    pub(crate) fn finish_reader(
+        self: &Arc<Self>,
+        reader: u64,
+        registered: Option<(u64, &InodeId, Option<&FileVersionId>)>,
+    ) -> Result<Option<Arc<GcPin>>> {
+        let mut soft = self.soft()?;
+        let accepted = registered.filter(|(term, _, _)| *term >= soft.seen_term);
+        if let Some((term, inode, version)) = accepted {
+            soft.seen_term = term;
+            soft.live.insert(reader, (inode.clone(), version.cloned()));
+        }
+        soft.in_flight.remove(&reader);
+        drop(soft);
+        let Some((_, inode, version)) = accepted else {
+            return Ok(None);
+        };
+        self.observe_reader("soft");
+        Ok(Some(Arc::new(GcPin {
+            fence: None,
+            deferred: None,
+            id: format!("reader:{reader}"),
+            owner: self.clone(),
+            open_inode: Some((inode.clone(), version.cloned())),
+            reader: Some(reader),
+        })))
+    }
+    /// `Ok(true)`: Meta of the newest term holds the registration.
+    fn retain_soft(
+        &self,
+        reader: u64,
+        inode: &InodeId,
+        version: Option<&FileVersionId>,
+    ) -> Result<bool> {
+        for _ in 0..SOFT_RETAIN_ATTEMPTS {
+            match self.control.retain_reader(reader, inode, version) {
+                Ok(term) => {
+                    let mut soft = self.soft()?;
+                    if term < soft.seen_term {
+                        // L6: a replaced Meta answered; its memory protects
+                        // nothing the newer one knows about. Ask again.
+                        continue;
+                    }
+                    soft.seen_term = term;
+                    return Ok(true);
+                }
+                Err(error) if error.code() == afs_error::META_DFS_SESSION_NOT_REPORTED => {
+                    self.report_readers()?;
+                }
+                Err(error) if error.code() == afs_error::META_DFS_READER_NOT_HEAD => {
+                    return Ok(false);
+                }
+                Err(error) if error.code() == afs_error::NODE_VFS_UNIMPLEMENTED => {
+                    self.soft()?.unsupported = true;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+    /// Sends every live reader up to the low watermark to Meta, made with the
+    /// newest Meta term this Node has seen. A reply naming a newer term means
+    /// the report reached a Meta this Node did not know yet: the Node now
+    /// drops replies of older terms and reports again under the new term,
+    /// which is the one Meta counts (design L4).
+    pub fn report_readers(&self) -> Result<()> {
+        for _ in 0..SOFT_RETAIN_ATTEMPTS {
+            let (term, low_watermark, readers) = {
+                let soft = self.soft()?;
+                if soft.unsupported {
+                    return Ok(());
+                }
+                let low_watermark = soft.low_watermark();
+                let readers = soft
+                    .live
+                    .range(..=low_watermark)
+                    .map(|(reader, (inode, version))| SoftReader {
+                        reader: *reader,
+                        inode: inode.clone(),
+                        version: version.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                (soft.seen_term, low_watermark, readers)
+            };
+            let replied = self.control.report_readers(term, low_watermark, &readers)?;
+            let mut soft = self.soft()?;
+            if replied <= term {
+                // Counted, or an older Meta that counts for nothing.
+                return Ok(());
+            }
+            soft.seen_term = soft.seen_term.max(replied);
+        }
+        Err(Error::coded(
+            afs_error::IO_UNAVAILABLE,
+            "Meta writer term kept changing during a reader report",
+        ))
+    }
+    fn release_soft(&self) -> Result<()> {
+        let released = std::mem::take(&mut self.soft()?.released);
+        for batch in released.chunks(RELEASE_BATCH) {
+            if let Err(error) = self.control.release_readers(batch) {
+                self.soft()?.released.extend_from_slice(batch);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
     /// The pin of a handle whose reference Meta admits inside the Create
     /// transaction (`dfs::created_handle_reference_id`): no admission call here.
@@ -306,6 +596,7 @@ impl GcReferences {
             id: crate::dfs::created_handle_reference_id(operation),
             owner: self.clone(),
             open_inode: None,
+            reader: None,
         })
     }
     fn shared_open_pin(&self, key: &OpenPinKey) -> Result<Option<Arc<GcPin>>> {
@@ -336,6 +627,7 @@ impl GcReferences {
             id: format!("write:{}", operation.0),
             owner: self.clone(),
             open_inode: None,
+            reader: None,
         })
     }
     pub(crate) fn pin_generation(
@@ -374,6 +666,7 @@ impl GcReferences {
             id: format!("write:{}", operation.0),
             owner: self.clone(),
             open_inode: None,
+            reader: None,
         });
         let mut task = AdmissionTask {
             admission: Some(admission),
@@ -412,6 +705,7 @@ impl GcReferences {
             open_inode: generation
                 .is_none()
                 .then(|| (inode.clone(), version.cloned())),
+            reader: None,
         };
         pin.fence = if generation.is_some() {
             Some(self.control.retain_fenced(&pin.id, inode, version)?)
@@ -437,6 +731,13 @@ impl GcReferences {
     /// Releases everything dropped so far, a batch at a time. On failure the
     /// unconfirmed ids return to the queue: a lost release only protects longer.
     pub fn flush(&self) -> Result<()> {
+        // Soft readers: release closed ones and reconcile the rest every
+        // pass (design §3.3 items 3 and 4); then the durable releases.
+        let soft = self.release_soft().and_then(|()| self.report_readers());
+        self.flush_durable()?;
+        soft
+    }
+    fn flush_durable(&self) -> Result<()> {
         loop {
             let batch = {
                 let mut queue = self.pending.lock().map_err(|_| {
@@ -636,5 +937,154 @@ mod tests {
         control.fail_once.store(true, Ordering::Relaxed);
         assert!(references.pin(&InodeId::new("i"), None).is_err());
         assert_eq!(references.pending_len().unwrap(), RELEASE_MAX_PENDING + 1);
+    }
+
+    /// A Meta whose soft registration replies are scripted per call.
+    #[derive(Default)]
+    struct SoftMeta {
+        /// Popped per `retain_reader`: Ok(term) or an error code.
+        retains: Mutex<std::collections::VecDeque<std::result::Result<u64, afs_error::ErrorCode>>>,
+        /// The writer term `report_readers` answers with.
+        term: AtomicU64,
+        reports: Mutex<Vec<(u64, u64, Vec<SoftReader>)>>,
+        durable: Mutex<Vec<String>>,
+        released: Mutex<Vec<u64>>,
+    }
+    impl GcControl for SoftMeta {
+        fn retain(&self, id: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
+            self.durable.lock().unwrap().push(id.to_owned());
+            Ok(())
+        }
+        fn release(&self, _: &[String]) -> Result<()> {
+            Ok(())
+        }
+        fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<GcState> {
+            Ok(GcState::default())
+        }
+        fn retain_reader(&self, _: u64, _: &InodeId, _: Option<&FileVersionId>) -> Result<u64> {
+            match self.retains.lock().unwrap().pop_front() {
+                Some(Ok(term)) => Ok(term),
+                Some(Err(code)) => Err(Error::coded(code, "scripted")),
+                None => Ok(self.term.load(Ordering::Relaxed)),
+            }
+        }
+        fn release_readers(&self, readers: &[u64]) -> Result<()> {
+            self.released.lock().unwrap().extend_from_slice(readers);
+            Ok(())
+        }
+        fn report_readers(&self, term: u64, low: u64, readers: &[SoftReader]) -> Result<u64> {
+            self.reports
+                .lock()
+                .unwrap()
+                .push((term, low, readers.to_vec()));
+            Ok(self.term.load(Ordering::Relaxed))
+        }
+    }
+    fn soft_meta(term: u64) -> Arc<SoftMeta> {
+        let meta = Arc::new(SoftMeta::default());
+        meta.term.store(term, Ordering::Relaxed);
+        meta
+    }
+
+    /// L6/U4: once the Node has seen term 2, a term-1 reply (a replaced Meta
+    /// still answering) is dropped and the registration asked again.
+    #[test]
+    fn a_reply_from_an_older_meta_term_is_dropped_and_retried() {
+        let meta = soft_meta(2);
+        let references = GcReferences::new(meta.clone());
+        references.report_readers().unwrap();
+        meta.retains.lock().unwrap().extend([Ok(1), Ok(2)]);
+        let pin = references.pin(&InodeId::new("i"), None).unwrap();
+        assert_eq!(pin.reader, Some(1));
+        assert!(
+            meta.retains.lock().unwrap().is_empty(),
+            "the term-1 reply was not used"
+        );
+        assert!(meta.durable.lock().unwrap().is_empty());
+        // Only older terms answer: the pin falls back to a durable reference.
+        meta.retains
+            .lock()
+            .unwrap()
+            .extend(std::iter::repeat_n(Ok(1), SOFT_RETAIN_ATTEMPTS));
+        let durable = references.pin(&InodeId::new("j"), None).unwrap();
+        assert_eq!(durable.reader, None);
+        assert_eq!(meta.durable.lock().unwrap().len(), 1);
+    }
+
+    /// A report learning a newer term is repeated under that term, the only
+    /// one Meta counts (L4); a NotReported registration reports first.
+    #[test]
+    fn a_report_that_learns_a_newer_term_is_made_again_under_it() {
+        let meta = soft_meta(3);
+        let references = GcReferences::new(meta.clone());
+        meta.retains
+            .lock()
+            .unwrap()
+            .push_back(Err(afs_error::META_DFS_SESSION_NOT_REPORTED));
+        let pin = references.pin(&InodeId::new("i"), None).unwrap();
+        assert!(pin.reader.is_some());
+        let terms = meta
+            .reports
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(term, _, _)| *term)
+            .collect::<Vec<_>>();
+        assert_eq!(terms, [0, 3]);
+    }
+
+    /// Meta refusing the version as not the linked head (an old version, an
+    /// unlinked inode) makes the pin durable, as before C-1.
+    #[test]
+    fn a_version_that_is_not_the_linked_head_is_pinned_durably() {
+        let meta = soft_meta(1);
+        let references = GcReferences::new(meta.clone());
+        meta.retains
+            .lock()
+            .unwrap()
+            .push_back(Err(afs_error::META_DFS_READER_NOT_HEAD));
+        let pin = references
+            .pin(&InodeId::new("i"), Some(&FileVersionId::new("old")))
+            .unwrap();
+        assert_eq!(pin.reader, None);
+        assert_eq!(meta.durable.lock().unwrap().len(), 1);
+        assert!(pin.id.starts_with("open:"));
+    }
+
+    /// U3 (Node side): a report covers live readers up to the low watermark,
+    /// below the first registration still in flight; a closed reader is
+    /// released and leaves the report.
+    #[test]
+    fn a_report_stops_below_the_first_registration_in_flight() {
+        let meta = soft_meta(1);
+        let references = GcReferences::new(meta.clone());
+        let first = references.pin(&InodeId::new("a"), None).unwrap();
+        let second = references.pin(&InodeId::new("b"), None).unwrap();
+        references.soft.lock().unwrap().in_flight.insert(2_000);
+        references.soft.lock().unwrap().next = 2_001;
+        references.report_readers().unwrap();
+        let (_, low, readers) = meta.reports.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(low, 1_999);
+        assert_eq!(
+            readers
+                .iter()
+                .map(|reader| reader.reader)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        drop(first);
+        references.soft.lock().unwrap().in_flight.clear();
+        references.flush().unwrap();
+        assert_eq!(*meta.released.lock().unwrap(), [1]);
+        let (_, low, readers) = meta.reports.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(low, 2_000);
+        assert_eq!(
+            readers
+                .iter()
+                .map(|reader| reader.reader)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        drop(second);
     }
 }

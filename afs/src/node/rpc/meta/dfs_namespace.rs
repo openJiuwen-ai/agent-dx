@@ -416,6 +416,43 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         )
     }
 
+    fn open_file_read(
+        &self,
+        reader: u64,
+        inode_id: &crate::dfs::InodeId,
+        name: Option<(&crate::dfs::InodeId, &[u8])>,
+    ) -> afs_error::Result<crate::node::vfs::dfs::OpenedForRead> {
+        self.read_diagnostic(
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaGetInode,
+            || {
+                self.record_read_rpc("open_file_read");
+                let reply =
+                    self.run(self.client().open_file_read(
+                        afs_tracing::request_with_current_context(
+                            afs_protocol::meta::DfsOpenFileReadRequest {
+                                node_id: self.node_id.clone(),
+                                session_id: self.session_id.clone(),
+                                reader,
+                                inode_id: inode_id.0.clone(),
+                                name_check: name.is_some(),
+                                namespace_id: self.namespace_id.0.clone(),
+                                parent_inode_id:
+                                    name.map(|(parent, _)| parent.0.clone()).unwrap_or_default(),
+                                name: name.map(|(_, name)| name.to_vec()).unwrap_or_default(),
+                            },
+                        ),
+                    ))?
+                    .into_inner();
+                Ok(crate::node::vfs::dfs::OpenedForRead {
+                    inode: reply.inode.map(domain_dfs_inode).transpose()?,
+                    registered: reply.registered,
+                    meta_term: reply.meta_term,
+                    writer_elsewhere: reply.writer_elsewhere,
+                })
+            },
+        )
+    }
+
     fn get_file_version_async(
         &self,
         version_id: crate::dfs::FileVersionId,

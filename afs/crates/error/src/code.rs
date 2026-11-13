@@ -83,6 +83,8 @@ catalog! {
     META_DFS_NAMESPACE_RETRY = 0x03030004 => Aborted;
     META_DFS_GC_BUSY = 0x03030006 => Unavailable;
     META_DFS_REFERENCE_ADMISSION_EXPIRED = 0x03030007 => FailedPrecondition;
+    META_DFS_READER_NOT_HEAD = 0x03030008 => FailedPrecondition;
+    META_DFS_SESSION_NOT_REPORTED = 0x03030009 => Unavailable;
     META_DFS_LEASE_RETRY = 0x03030002 => Unavailable;
     META_DFS_REPAIR_SUPERSEDED = 0x03030003 => FailedPrecondition;
     META_OWNER_ROOT_EXISTS = 0x03040001 => AlreadyExists;

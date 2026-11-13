@@ -11,6 +11,12 @@ struct RecordingGc {
     refused: Mutex<Vec<String>>,
     released: Mutex<Vec<String>>,
     refuse_open: std::sync::atomic::AtomicBool,
+    /// The Meta term `report_readers` answers (round 2 C-1).
+    term: std::sync::atomic::AtomicU64,
+    released_readers: Mutex<Vec<u64>>,
+    /// Refuse every soft registration as not the head (a head that keeps
+    /// moving); otherwise soft registration is unsupported here.
+    reader_not_head: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingGc {
@@ -60,6 +66,24 @@ impl crate::node::gc::GcControl for RecordingGc {
     }
     fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {
         Ok(crate::dfs::GcState::default())
+    }
+    fn retain_reader(&self, _: u64, _: &InodeId, _: Option<&FileVersionId>) -> Result<u64> {
+        let code = if self.reader_not_head.load(Ordering::SeqCst) {
+            afs_error::META_DFS_READER_NOT_HEAD
+        } else {
+            afs_error::NODE_VFS_UNIMPLEMENTED
+        };
+        Err(Error::coded(code, "scripted"))
+    }
+    fn release_readers(&self, readers: &[u64]) -> Result<()> {
+        self.released_readers
+            .lock()
+            .unwrap()
+            .extend_from_slice(readers);
+        Ok(())
+    }
+    fn report_readers(&self, _: u64, _: u64, _: &[crate::node::gc::SoftReader]) -> Result<u64> {
+        Ok(self.term.load(Ordering::SeqCst))
     }
 }
 
@@ -455,4 +479,90 @@ fn r94_a_shared_base_reference_ends_with_the_commit_after_a_dirty_close() {
     fx.fs.release(&context(), reader).unwrap();
     fx.references.flush().unwrap();
     assert_eq!(fx.gc.live(&v3), 0);
+}
+
+/// B2: a read open whose single Meta call registered the head keeps that
+/// registration as its pin: no durable admission, released as a reader.
+#[test]
+fn a_read_open_registered_by_meta_needs_no_other_admission() {
+    let fx = fixture();
+    let before = fx.gc.admissions(&fx.v1);
+    fx.meta
+        .open_read_replies
+        .lock()
+        .unwrap()
+        .push_back((true, 1, false));
+    let handle = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    assert_eq!(read_all(&fx.fs, handle), b"version-one");
+    assert_eq!(
+        fx.gc.admissions(&fx.v1),
+        before,
+        "no durable open: reference"
+    );
+    assert!(fx.fs.page_cache_identity(handle).is_some());
+    fx.fs.release(&context(), handle).unwrap();
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.released_readers.lock().unwrap().len(), 1);
+}
+
+/// L6 at open: after this Node has seen Meta term 2, a registration
+/// answered by term 1 is not used; the handle pins itself.
+#[test]
+fn a_read_open_registered_by_an_older_meta_term_pins_again() {
+    let fx = fixture();
+    fx.gc.term.store(2, Ordering::SeqCst);
+    fx.references.report_readers().unwrap();
+    let before = fx.gc.admissions(&fx.v1);
+    fx.meta
+        .open_read_replies
+        .lock()
+        .unwrap()
+        .push_back((true, 1, false));
+    let handle = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    assert_eq!(
+        fx.gc.admissions(&fx.v1),
+        before + 1,
+        "pinned durably instead"
+    );
+    fx.fs.release(&context(), handle).unwrap();
+}
+
+/// D-R3-2 ③ is deferred: a write lease Meta reports for another session may
+/// only be waiting to expire after its writer closed, so a read open still
+/// uses the page cache (LB06).
+#[test]
+fn a_read_open_keeps_the_page_cache_while_writer_elsewhere_is_deferred() {
+    let fx = fixture();
+    fx.meta
+        .open_read_replies
+        .lock()
+        .unwrap()
+        .push_back((true, 1, true));
+    let handle = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    assert!(fx.fs.page_cache_identity(handle).is_some());
+    assert_eq!(read_all(&fx.fs, handle), b"version-one");
+    fx.fs.release(&context(), handle).unwrap();
+}
+
+/// Review condition: when Meta's open gave up registering a head that kept
+/// moving, and the head moves again before the handle's own soft
+/// registration, the open still succeeds on a durable reference, as before
+/// C-1; no error reaches the application.
+#[test]
+fn a_read_open_of_a_head_that_never_settles_pins_durably_and_succeeds() {
+    let fx = fixture();
+    fx.gc.reader_not_head.store(true, Ordering::SeqCst);
+    let before = fx.gc.admissions(&fx.v1);
+    fx.meta
+        .open_read_replies
+        .lock()
+        .unwrap()
+        .push_back((false, 1, false));
+    let handle = fx
+        .fs
+        .open(&context(), fx.inode, libc::O_RDONLY)
+        .expect("the open succeeds");
+    assert_eq!(fx.gc.admissions(&fx.v1), before + 1, "pinned durably");
+    assert_eq!(read_all(&fx.fs, handle), b"version-one");
+    fx.fs.release(&context(), handle).unwrap();
 }

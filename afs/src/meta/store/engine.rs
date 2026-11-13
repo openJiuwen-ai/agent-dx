@@ -941,6 +941,10 @@ impl MetaStore for Store {
         Box::pin(async move { self.committed().await?.watch(after_revision, limit) })
     }
 
+    fn writer_term(&self) -> u64 {
+        self.visible.committed.load().log_cursor.term
+    }
+
     fn register_node_session(
         &self,
         request: RequestKey,

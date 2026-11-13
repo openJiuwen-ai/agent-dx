@@ -67,6 +67,10 @@ impl MetaService for MetaRpc {
             .endpoint
             .ok_or_else(|| invalid("node.endpoint is required"))?;
         let ttl = Duration::from_secs(request.lease_seconds.max(1));
+        let dfs_node = node
+            .capabilities
+            .iter()
+            .any(|capability| capability == "dfs");
         let session = self
             .0
             .register_node(
@@ -100,6 +104,10 @@ impl MetaService for MetaRpc {
             )
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        // C-1 restart gate: a Node without DFS has no readers to report.
+        if let Some(dfs) = &self.0.dfs {
+            dfs.note_node_registration(&session.node_id, &session.session_id, dfs_node);
+        }
         let readiness = self
             .0
             .store
