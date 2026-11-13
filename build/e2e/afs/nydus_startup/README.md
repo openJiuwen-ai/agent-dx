@@ -28,7 +28,23 @@ python3 build/e2e/afs/nydus_startup/sample_ranges.py \
 
 清单绑定镜像 manifest digest 和启动用例，按 blob 合并重叠、相邻的正文范围。config 和 bootstrap
 留在观测文件里。范围代表该窗口的观测请求，包含运行时预取或对齐产生的请求。输出使用新文件名。
-用独立冷启动检查范围覆盖后，再将清单交给预热工具。
+用同一镜像和命令做独立冷启动，保存新的 `heldout.pcap` 和 `heldout.json`。生成实际请求范围并与冻结清单对比：
+
+```sh
+python3 build/e2e/afs/nydus_startup/sample_ranges.py \
+  manifest.json heldout.pcap heldout.json heldout-events.json
+PYTHONPATH=build/e2e/afs/nydus_startup python3 - <<'PYCODE'
+import json
+from pathlib import Path
+from sample_ranges import body, compare, read
+
+plan = read(Path("startup-plan.json"))
+observed = body(read(Path("heldout-events.json")))
+print(json.dumps(compare(plan["ranges"], observed), indent=2))
+PYCODE
+```
+
+`coverage_pct` 以独立启动的实际请求字节为分母，`missing_bytes` 和 `extra_bytes` 分别表示漏抓和多抓。
 
 ## 预热指定 worker
 
@@ -46,3 +62,26 @@ Range GET。每段检查 206、Content-Range、长度和 blob 摘要响应头，
 SHA-256。读取发生错误时退出非零，HTTP 阶段已完成的范围保留在收据里。重复运行使用新的收据文件。
 在隔离窗口比较两次收据的范围哈希和 AFS Peer 计数，确认复读没有新增跨机正文。启动对照应分别
 记录铺热耗时、SDK 提交到首条命令成功的耗时和两阶段的跨机流量。
+
+## 分批派发
+
+用 `python3 distribute.py plan.json` 执行预热命令。计划使用 `nodes`、`seeds` 和
+`waves` 描述节点、已准备的种子和批次。下面示例用 SSH 到两台目标 worker 执行各自已准备的命令。
+将主机和命令替换成你的部署。每个 `warm` 命令调用上面的预热入口并检查本地复读；接力时，`ready`
+命令检查前一批节点的对应副本能否供下游发现。
+
+```json
+{
+  "nodes": ["A", "B", "C"],
+  "seeds": ["A"],
+  "waves": [{"B": "A"}, {"C": "B"}],
+  "commands": {
+    "B": {"warm": ["ssh", "worker-b", "warm-image"], "ready": ["ssh", "worker-b", "check-image-source"]},
+    "C": {"warm": ["ssh", "worker-c", "warm-image"]}
+  }
+}
+```
+
+直供时用 `"waves": [{"B": "A", "C": "A"}]`。同一批中的命令并发执行，有命令失败时停止派发下一批。
+计划中的上游用于控制派发顺序，AFS 读取仍按现有来源视图选源。启动与流量验收见
+[部署教程](../../../../docs/deployment/afs-nydus-startup.md)。
