@@ -63,6 +63,19 @@ async fn backend_connection(
         }
         let path = head.split_whitespace().nth(1).unwrap();
         match path {
+            "/api/progress" => {
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                for byte in [b"a", b"b", b"c", b"d"] {
+                    if stream.write_all(b"1\r\n").await.is_err()
+                        || stream.write_all(byte).await.is_err()
+                        || stream.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                    sleep(Duration::from_millis(120)).await;
+                }
+                let _ = stream.write_all(b"0\r\n\r\n").await;
+            }
             "/login" => {
                 if stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /grafana/login?next=%2Fgrafana%2F\r\nSet-Cookie: session=one; Path=/grafana/; HttpOnly\r\nSet-Cookie: csrf=two; Path=/grafana/\r\nContent-Length: 0\r\n\r\n").await.is_err() { return; }
             }
@@ -100,6 +113,25 @@ async fn backend_connection(
             }
         }
     }
+}
+
+#[tokio::test]
+async fn transfer_reverse_proxy_sse_survives_processing_deadline() {
+    let mut fixture = Fixture::new(ReverseProxyConfig::default()).await;
+    let mut sender = fixture.sender().await;
+    let mut req = request("/api/progress");
+    req.headers_mut().insert(
+        "X-ADX-Processing-Timeout-Ms",
+        http::HeaderValue::from_static("240"),
+    );
+    let response = sender.send_request(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = timeout(Duration::from_secs(2), response.into_body().collect())
+        .await
+        .unwrap()
+        .expect("SSE must keep delivering while data is arriving")
+        .to_bytes();
+    assert_eq!(&body[..], b"abcd");
 }
 
 impl Fixture {

@@ -354,10 +354,13 @@ passive route subscriptions and health/metrics do not wake a paused environment.
 Requests already sent upstream are not replayed. Transient owner RPC failures
 retry on the same owner within the resume budget. A temporary wake failure before
 forwarding returns HTTP 503. A finite SDK HTTP request sends
-`X-ADX-Processing-Timeout-Ms`: authentication, route lookup, wake, route delivery,
-connection admission, forwarding and response streaming share one Ingress deadline.
-For successful native single-file downloads, the Ingress deadline ends at the
-response headers; SDK read-inactivity timeouts and Range retries still apply.
+`X-ADX-Processing-Timeout-Ms`: authentication, route lookup, wake, route delivery
+and connection admission share the initial Ingress deadline. Forwarded non-empty
+upload data renews the response-header processing window. Successful `2xx`
+responses finish that window at their headers; file/tar downloads, port-forwarded
+HTTP streams and SSE may continue past the initial deadline. Error response
+bodies retain the latest processing deadline.
+SDK read-inactivity timeouts and single-file Range retries still apply.
 The SDK defaults to 300 seconds for a data request and adds a configurable
 communication margin (30 seconds by default) to its HTTP timeout. Without the
 header, wake and route delivery share a 300-second default; existing forwarding
