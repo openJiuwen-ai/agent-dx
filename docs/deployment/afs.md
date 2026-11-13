@@ -470,6 +470,11 @@ credentials_file = "/opt/adx/config/afs/s3-credentials.json"
 改变成功 fsync 等待对象回执和 Meta 持久确认的要求。它不自动探测 SeaweedFS，
 不因 `allow_http=true` 自动启用；泛 S3 后端和既有配置保持原默认。
 
+长度不小于 256 KiB 的数据块在对象旁多存一个 BLAKE3 outboard 旁对象（键为数据对象键加 `.bao`，4 MiB 数据块约 8 KiB）。读取时只按范围取回读到的 32 KiB 分组，并用旁对象验证到数据块的内容根；没有旁对象或旁对象无效的数据块整对象读取并整块校验，结果相同。旁对象随数据对象一起回收。对按请求计费的对象存储：
+
+- PUT 次数最多为原来的 2 倍，对象数最多为 2 倍（只对不小于 256 KiB 的数据块）。
+- 未配置 `cache` 时，顺序读的 GET 次数约为原来的 1.25 倍，传输字节约为四分之一：原来每次内核读（约 1 MiB）都取回整个 4 MiB 对象，一个数据块 4 次整对象 GET；现在是 4 次范围 GET 加 1 次旁对象 GET。
+
 默认 HTTPS；`allow_http=true` 仅供隔离测试端点。外部服务的认证、bucket
 权限、数据同步落盘及数据库持久配置由管理员在服务端保证；HTTP 成功本身
 不能证明物理持久性。产品包不部署或打包 SeaweedFS、PostgreSQL 或 JuiceFS。

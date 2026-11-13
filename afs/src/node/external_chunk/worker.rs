@@ -126,7 +126,7 @@ async fn execute(
                                 .acquire()
                                 .await
                                 .map_err(|_| unavailable("S3 upload scheduler stopped"))?;
-                            put_one(backend, options, value)
+                            put_one(backend, options, value, observer)
                                 .await
                                 .map(|receipt| (index, receipt))
                         }));
@@ -162,6 +162,11 @@ async fn execute(
             }
             Request::Delete(chunks) => delete_objects(backend, options, chunks).await,
             Request::List { after, limit } => list_objects(backend, options, after, limit).await,
+            Request::ReadRanges {
+                chunk,
+                ranges,
+                sidecar,
+            } => read_ranges(backend, options, &chunk, ranges, sidecar).await,
             Request::Read(chunk) => {
                 let key = external_object_key(&options.store_id, &options.generation, &chunk.id)?;
                 // No HEAD, versionId or conditional GET in the normal data path.
@@ -231,6 +236,74 @@ async fn execute(
     }
     .instrument(span)
     .await
+}
+
+/// Fetches the planned ranges and, when asked, the sidecar object, all
+/// concurrently. Nothing here is verified: every range response must be
+/// exactly the bytes requested of an object of the chunk's length, and the
+/// caller proves the content.
+async fn read_ranges(
+    backend: &dyn ObjectStore,
+    options: &S3ChunkStoreOptions,
+    chunk: &ChunkObject,
+    ranges: Vec<std::ops::Range<u64>>,
+    sidecar: bool,
+) -> Result<Reply> {
+    let key = external_object_key(&options.store_id, &options.generation, &chunk.id)?;
+    let path = ObjectPath::from(key.as_str());
+    let parts = futures_util::future::try_join_all(ranges.into_iter().map(|range| {
+        let path = &path;
+        async move {
+            let response = backend
+                .get_opts(
+                    path,
+                    object_store::GetOptions {
+                        range: Some(object_store::GetRange::Bounded(range.clone())),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(storage_error)?;
+            if response.meta.size != chunk.length || response.range != range {
+                return Err(corrupt(
+                    "S3 range response does not match the requested Chunk range",
+                ));
+            }
+            let length = usize::try_from(range.end - range.start)
+                .map_err(|_| invalid("chunk range is too large"))?;
+            let (bytes, _) = collect_s3_body(response, length).await?;
+            Ok((range, bytes))
+        }
+    }));
+    let sidecar = async {
+        if !sidecar {
+            return Ok(None);
+        }
+        let key = external_outboard_key(&options.store_id, &options.generation, &chunk.id)?;
+        let response = match backend.get(&ObjectPath::from(key.as_str())).await {
+            Ok(response) => response,
+            Err(object_store::Error::NotFound { .. }) => return Ok(Some(SidecarFetch::Missing)),
+            Err(error) => return Err(storage_error(error)),
+        };
+        // An object that cannot be a sidecar is handed on empty: it fails
+        // validation and the chunk is read whole.
+        let size = usize::try_from(response.meta.size).unwrap_or(usize::MAX);
+        if size > crate::node::chunk::outboard::MAX_ENCODED_OUTBOARD_BYTES
+            || response.range != (0..response.meta.size)
+        {
+            return Ok(Some(SidecarFetch::Found(Vec::new())));
+        }
+        let (bytes, _) = collect_s3_body(response, size).await?;
+        Ok(Some(SidecarFetch::Found(bytes)))
+    };
+    let (parts, sidecar) = futures_util::future::try_join(parts, sidecar)
+        .instrument(tracing::info_span!(
+            "node.dfs.s3.get_ranges",
+            chunk_id = %chunk.id.0,
+            chunk_bytes = chunk.length,
+        ))
+        .await?;
+    Ok(Reply::Ranges { parts, sidecar })
 }
 
 pub(super) async fn collect_s3_body(
@@ -303,25 +376,31 @@ pub(super) async fn collect_s3_body(
     Ok((bytes, timing))
 }
 
-/// Batched delete. An object that is already gone counts as deleted, so a
-/// retried batch is idempotent; any other failure fails the batch.
+/// Batched delete of chunk objects, then of their sidecar objects: a sidecar
+/// is never deleted while its chunk object may still exist. An object that
+/// is already gone counts as deleted, so a retried batch is idempotent; any
+/// other failure fails the batch, leaving at most sidecars the next pass (or
+/// the next listing) deletes.
 async fn delete_objects(
     backend: &dyn ObjectStore,
     options: &S3ChunkStoreOptions,
     chunks: Vec<ChunkId>,
 ) -> Result<Reply> {
-    let paths = chunks
-        .iter()
-        .map(|chunk| {
-            external_object_key(&options.store_id, &options.generation, chunk)
-                .map(|key| Ok(ObjectPath::from(key.as_str())))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut results = backend.delete_stream(Box::pin(tokio_stream::iter(paths)));
-    while let Some(result) = tokio_stream::StreamExt::next(&mut results).await {
-        match result {
-            Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
-            Err(error) => return Err(storage_error(error)),
+    type KeyOf = fn(&str, &str, &ChunkId) -> Result<String>;
+    for key_of in [external_object_key as KeyOf, external_outboard_key as KeyOf] {
+        let paths = chunks
+            .iter()
+            .map(|chunk| {
+                key_of(&options.store_id, &options.generation, chunk)
+                    .map(|key| Ok(ObjectPath::from(key.as_str())))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut results = backend.delete_stream(Box::pin(tokio_stream::iter(paths)));
+        while let Some(result) = tokio_stream::StreamExt::next(&mut results).await {
+            match result {
+                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(storage_error(error)),
+            }
         }
     }
     Ok(Reply::Deleted)
@@ -356,15 +435,25 @@ async fn put_one(
     backend: &dyn ObjectStore,
     options: &S3ChunkStoreOptions,
     value: StagedChunk,
+    observer: &S3GetObserver,
 ) -> Result<ChunkReceipt> {
     let key = external_object_key(&options.store_id, &options.generation, &value.chunk.id)?;
     let payload = upload_payload(&value)?;
-    // Ordinary PUT only: key identity is content-bound and immutable.
-    async {
-        backend
-            .put(&ObjectPath::from(key.as_str()), payload)
-            .await
-            .map_err(storage_error)
+    let sidecar = sidecar_payload(options, &value)?;
+    // Ordinary PUTs only: both keys are content-bound and immutable. The
+    // sidecar goes out beside the chunk object, and the receipt waits for
+    // both, so a readable chunk's sidecar is either complete or absent.
+    let path = ObjectPath::from(key.as_str());
+    let (stored, sidecar_stored) = async {
+        tokio::join!(backend.put(&path, payload), async {
+            match sidecar {
+                Some((key, payload)) => {
+                    let path = ObjectPath::from(key.as_str());
+                    Some(backend.put(&path, payload).await)
+                }
+                None => None,
+            }
+        })
     }
     .instrument(tracing::info_span!(
         "node.dfs.s3.put",
@@ -373,7 +462,16 @@ async fn put_one(
         chunk_bytes = value.chunk.length,
         copied_bytes = 0_u64,
     ))
-    .await?;
+    .await;
+    // A failed chunk PUT fails the write; a sidecar it leaves behind is
+    // collected through the listing. A failed sidecar PUT only costs later
+    // readers the range path: the chunk itself is durable.
+    stored.map_err(storage_error)?;
+    match sidecar_stored {
+        Some(Ok(_)) => observer.observe_sidecar("put_ok"),
+        Some(Err(_)) => observer.observe_sidecar("put_failed"),
+        None => {}
+    }
     Ok(ChunkReceipt {
         operation_id: value.operation_id,
         chunk: value.chunk.clone(),
@@ -389,6 +487,26 @@ async fn put_one(
             verified_digest: value.chunk.content_digest,
         }),
     })
+}
+
+/// The sidecar object of a chunk large enough to be read by range, when
+/// sealing built its outboard.
+fn sidecar_payload(
+    options: &S3ChunkStoreOptions,
+    value: &StagedChunk,
+) -> Result<Option<(String, object_store::PutPayload)>> {
+    let Some(outboard) = value
+        .outboard()
+        .filter(|_| value.chunk.length >= SIDECAR_MIN_CHUNK_BYTES)
+        .filter(|outboard| validate_sidecar(&value.chunk, outboard.encoded()).is_ok())
+    else {
+        return Ok(None);
+    };
+    let key = external_outboard_key(&options.store_id, &options.generation, &value.chunk.id)?;
+    Ok(Some((
+        key,
+        object_store::PutPayload::from(outboard.encoded().to_vec()),
+    )))
 }
 
 fn upload_payload(value: &StagedChunk) -> Result<object_store::PutPayload> {

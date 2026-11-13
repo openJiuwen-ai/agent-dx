@@ -9,6 +9,10 @@ use super::*;
 /// failure. At most four PUTs hold immutable payload owners; typed leases stay
 /// charged until the last transport/retry owner exits. Producer payload and
 /// descriptor reservations belong to the DFS write pipeline.
+/// A chunk of at least 256 KiB is stored with a BLAKE3 outboard sidecar
+/// object (`<chunk key>.bao`); reads then fetch and prove only the groups
+/// they cover. The sidecar is optional derived data: a chunk without a
+/// usable one is read whole.
 /// Cache entries remain disposable, never durable replicas. Drop drains and
 /// joins the worker; timed-out PUTs cannot produce durability receipts.
 pub struct S3ChunkStore {
@@ -19,6 +23,9 @@ pub struct S3ChunkStore {
     pub(super) cache: Option<Arc<S3ChunkCache>>,
     pub(super) verifier: Arc<S3ChunkVerifier>,
     pub(super) observer: S3GetObserver,
+    /// Verified outboard sidecars of recently range-read chunks: a fixed
+    /// bound of 256 entries of at most 8 KiB.
+    pub(super) sidecars: SidecarCache,
 }
 
 impl S3ChunkStore {
@@ -109,6 +116,7 @@ impl S3ChunkStore {
             cache,
             verifier,
             observer,
+            sidecars: SidecarCache::default(),
         })
     }
 
@@ -203,6 +211,97 @@ impl S3ChunkStore {
         }
     }
 
+    /// Copies `ops` of one chunk into `out`, every byte verified against the
+    /// chunk identity first. A chunk with a usable sidecar object is read by
+    /// range; anything else, and any range read that fails its proof, takes
+    /// the whole object and its full BLAKE3 check, which then decides.
+    fn read_ranges_verified(
+        &self,
+        chunk: &ChunkObject,
+        ops: &[ExternalRangeCopy],
+        out: &mut [u8],
+    ) -> Result<()> {
+        validate_chunk(chunk)?;
+        // With a cache configured every miss still fetches the whole object,
+        // because that is what fills the cache.
+        let plan = if self.cache.is_some() {
+            None
+        } else {
+            plan_ranges(chunk, ops)
+        };
+        let Some(plan) = plan else {
+            return self.read_whole(chunk, ops, out, "whole");
+        };
+        let known = self.sidecars.lookup(&chunk.id);
+        if matches!(known, SidecarState::Absent) {
+            return self.read_whole(chunk, ops, out, "whole_no_sidecar");
+        }
+        let fetch_sidecar = matches!(known, SidecarState::Unknown);
+        let (parts, fetched) = match self.request(Request::ReadRanges {
+            chunk: chunk.clone(),
+            ranges: plan,
+            sidecar: fetch_sidecar,
+        })? {
+            Reply::Ranges { parts, sidecar } => (parts, sidecar),
+            _ => return Err(invalid("S3 worker returned the wrong response")),
+        };
+        let sidecar = match (known, fetched) {
+            (SidecarState::Cached(sidecar), _) => sidecar,
+            (_, Some(SidecarFetch::Found(encoded)))
+                if validate_sidecar(chunk, &encoded).is_ok() =>
+            {
+                Arc::new(encoded)
+            }
+            (_, Some(SidecarFetch::Found(_))) => {
+                self.sidecars.mark_absent(&chunk.id);
+                self.observer.observe_sidecar("get_invalid");
+                return self.read_whole(chunk, ops, out, "whole_no_sidecar");
+            }
+            (_, Some(SidecarFetch::Missing) | None) => {
+                self.sidecars.mark_absent(&chunk.id);
+                self.observer.observe_sidecar("get_missing");
+                return self.read_whole(chunk, ops, out, "whole_no_sidecar");
+            }
+        };
+        match verify_and_copy(chunk, &sidecar, &parts, ops, out) {
+            Ok(()) => {
+                if fetch_sidecar {
+                    self.sidecars.insert(&chunk.id, sidecar);
+                    self.observer.observe_sidecar("get_ok");
+                }
+                let bytes = parts.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+                self.observer.observe_read_branch("range", bytes);
+                Ok(())
+            }
+            Err(error) if error.code() == afs_error::NODE_TRANSFER_CORRUPT_DATA => {
+                // Either the data or the sidecar is damaged; a range proof
+                // cannot tell which. The whole object decides: it either
+                // verifies (the sidecar was bad) or the read fails as corrupt.
+                self.sidecars.mark_absent(&chunk.id);
+                self.observer.observe_sidecar("proof_failed");
+                self.read_whole(chunk, ops, out, "whole_after_failed_proof")
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_whole(
+        &self,
+        chunk: &ChunkObject,
+        ops: &[ExternalRangeCopy],
+        out: &mut [u8],
+        branch: &'static str,
+    ) -> Result<()> {
+        let verified = self.read_verified(chunk)?;
+        if !verified.matches(chunk) {
+            return Err(corrupt(
+                "verified external Chunk identity does not match the request",
+            ));
+        }
+        self.observer.observe_read_branch(branch, chunk.length);
+        copy_external_ranges(verified.as_slice(), ops, out)
+    }
+
     /// Deletes these chunks' objects; missing objects count as deleted.
     pub fn delete_objects(&self, chunks: &[ChunkId]) -> Result<()> {
         if chunks.is_empty() {
@@ -214,9 +313,10 @@ impl S3ChunkStore {
         }
     }
 
-    /// One page of this store's objects after `after`, as (chunk, key). A key
-    /// that does not name a generational chunk is not ours to judge and is
-    /// skipped. An empty page means the listing reached the end.
+    /// One page of this store's objects after `after`, as (chunks, last key).
+    /// A key that names neither a generational chunk nor a chunk's sidecar is
+    /// not ours to judge and is skipped. An empty page means the listing
+    /// reached the end.
     pub fn list_objects(
         &self,
         after: Option<String>,
@@ -226,13 +326,19 @@ impl S3ChunkStore {
             Reply::Listed(keys) => keys,
             _ => return Err(invalid("S3 worker returned the wrong response")),
         };
+        // A sidecar object is reported as the chunk it belongs to, so a
+        // sidecar whose chunk object is gone still reaches Meta's plan and is
+        // deleted with that chunk id. A chunk and its sidecar are one entry.
+        let mut seen = std::collections::HashSet::new();
         let chunks = keys
             .iter()
             .filter_map(|key| {
-                let id = ChunkId::new(key.rsplit('/').next()?);
+                let name = key.rsplit('/').next()?;
+                let id = ChunkId::new(name.strip_suffix(EXTERNAL_OUTBOARD_SUFFIX).unwrap_or(name));
                 ChunkObject::from_content_addressed_id(&id)
                     .filter(ChunkObject::is_generational_blake3)
             })
+            .filter(|chunk| seen.insert(chunk.id.clone()))
             .collect();
         Ok((chunks, keys.into_iter().next_back()))
     }
@@ -333,12 +439,8 @@ impl S3ChunkStore {
     }
 }
 
-impl ExternalChunkReader for S3ChunkStore {
-    fn read_chunk(
-        &self,
-        chunk: &ChunkObject,
-        source: &SourceCandidate,
-    ) -> Result<VerifiedExternalChunk> {
+impl S3ChunkStore {
+    fn validate_source(&self, chunk: &ChunkObject, source: &SourceCandidate) -> Result<()> {
         let expected =
             external_object_key(&self.options.store_id, &self.options.generation, &chunk.id)?;
         if source.chunk_id != chunk.id
@@ -352,6 +454,28 @@ impl ExternalChunkReader for S3ChunkStore {
                 "external source does not match the configured immutable object",
             ));
         }
+        Ok(())
+    }
+}
+
+impl ExternalChunkReader for S3ChunkStore {
+    fn read_chunk(
+        &self,
+        chunk: &ChunkObject,
+        source: &SourceCandidate,
+    ) -> Result<VerifiedExternalChunk> {
+        self.validate_source(chunk, source)?;
         self.read_verified(chunk)
+    }
+
+    fn read_chunk_ranges(
+        &self,
+        chunk: &ChunkObject,
+        source: &SourceCandidate,
+        ranges: &[ExternalRangeCopy],
+        out: &mut [u8],
+    ) -> Result<()> {
+        self.validate_source(chunk, source)?;
+        self.read_ranges_verified(chunk, ranges, out)
     }
 }

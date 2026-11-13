@@ -13,6 +13,9 @@ pub struct S3ChunkStoreMetrics {
     get_bytes_total: afs_metrics::IntCounterVec,
     get_failures_total: afs_metrics::IntCounterVec,
     slow_gets_total: afs_metrics::IntCounterVec,
+    read_branch_total: afs_metrics::IntCounterVec,
+    read_branch_bytes_total: afs_metrics::IntCounterVec,
+    sidecar_events_total: afs_metrics::IntCounterVec,
 }
 
 impl std::fmt::Debug for S3ChunkStoreMetrics {
@@ -96,6 +99,49 @@ impl S3ChunkStoreMetrics {
                     ),
                     &["stage", "result"],
                 )?;
+                let read_branch_total = afs_metrics::IntCounterVec::new(
+                    afs_metrics::Opts::new(
+                        "afs_dfs_s3_read_branch_total",
+                        "S3 chunk reads that missed the cache, by path: verified ranges or the whole object and why.",
+                    ),
+                    &["branch"],
+                )?;
+                let read_branch_bytes_total = afs_metrics::IntCounterVec::new(
+                    afs_metrics::Opts::new(
+                        "afs_dfs_s3_read_branch_bytes_total",
+                        "Object bytes those S3 chunk reads fetched and verified, by path.",
+                    ),
+                    &["branch"],
+                )?;
+                let sidecar_events_total = afs_metrics::IntCounterVec::new(
+                    afs_metrics::Opts::new(
+                        "afs_dfs_s3_sidecar_events_total",
+                        "BLAKE3 outboard sidecar object PUT and GET outcomes.",
+                    ),
+                    &["event"],
+                )?;
+                afs_metrics::register_collector(registry, &read_branch_total)?;
+                afs_metrics::register_collector(registry, &read_branch_bytes_total)?;
+                afs_metrics::register_collector(registry, &sidecar_events_total)?;
+                for branch in [
+                    "range",
+                    "whole",
+                    "whole_no_sidecar",
+                    "whole_after_failed_proof",
+                ] {
+                    read_branch_total.with_label_values(&[branch]);
+                    read_branch_bytes_total.with_label_values(&[branch]);
+                }
+                for event in [
+                    "put_ok",
+                    "put_failed",
+                    "get_ok",
+                    "get_missing",
+                    "get_invalid",
+                    "proof_failed",
+                ] {
+                    sidecar_events_total.with_label_values(&[event]);
+                }
                 afs_metrics::register_collector(registry, &get_stage_seconds)?;
                 afs_metrics::register_collector(registry, &verify_seconds)?;
                 afs_metrics::register_collector(registry, &verify_bytes_total)?;
@@ -120,7 +166,7 @@ impl S3ChunkStoreMetrics {
                     verify_seconds.with_label_values(&[source]);
                     verify_bytes_total.with_label_values(&[source]);
                 }
-                for operation in ["put", "read"] {
+                for operation in ["put", "read", "read_ranges"] {
                     request_reply_seconds.with_label_values(&[operation]);
                 }
                 for result in ["attempted", "no_cache"] {
@@ -152,6 +198,9 @@ impl S3ChunkStoreMetrics {
                     get_bytes_total,
                     get_failures_total,
                     slow_gets_total,
+                    read_branch_total,
+                    read_branch_bytes_total,
+                    sidecar_events_total,
                 })
             })
     }
@@ -325,6 +374,25 @@ impl S3GetObserver {
     pub(super) fn observe_get_failure(&self, stage: &'static str, result: &'static str) {
         if let Some(metrics) = &self.metrics {
             metrics.observe_get_failure(stage, result);
+        }
+    }
+
+    pub(super) fn observe_read_branch(&self, branch: &'static str, bytes: u64) {
+        if let Some(metrics) = &self.metrics {
+            metrics.read_branch_total.with_label_values(&[branch]).inc();
+            metrics
+                .read_branch_bytes_total
+                .with_label_values(&[branch])
+                .inc_by(bytes);
+        }
+    }
+
+    pub(super) fn observe_sidecar(&self, event: &'static str) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .sidecar_events_total
+                .with_label_values(&[event])
+                .inc();
         }
     }
 }

@@ -208,16 +208,12 @@ impl DfsAssembly {
                     "write buffer idle baseline does not fit this platform",
                 )
             })?;
-        let dfs_write_buffers = if cfg.dfs_external_backend.is_some() {
-            // S3 objects keep no local BLAKE3 outboard, so S3 buffers carry no
-            // outboard budget.
-            chunk::WriteBufferPool::new(dfs_write_buffer_idle_bytes)
-        } else {
-            chunk::WriteBufferPool::new_with_outboard_budget(
-                dfs_write_buffer_idle_bytes,
-                dfs_outboard_budget.clone(),
-            )
-        };
+        // Sealing builds the BLAKE3 outboard with the content root in one pass.
+        // The local store keeps it as a sidecar file, S3 as a sidecar object.
+        let dfs_write_buffers = chunk::WriteBufferPool::new_with_outboard_budget(
+            dfs_write_buffer_idle_bytes,
+            dfs_outboard_budget.clone(),
+        );
         dfs_write_buffers.register_metrics(&obs.registry)?;
         let mut assembly = Self {
             connectors: crate::node::connectors::ConnectorRuntime::build(&cfg.connectors, &cfg.id)?,

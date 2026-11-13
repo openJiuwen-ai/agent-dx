@@ -554,6 +554,22 @@ impl DfsReadEngine {
         batch: &ReadBatch,
         out: &mut [u8],
     ) -> Result<CurrentExternalReadOutcome> {
+        self.read_batch_external_version_ahead(inode_id, batch, out, &Vec::new)
+    }
+
+    /// [`Self::read_batch_external_version`] with authority read-ahead: when
+    /// this read has to ask Meta, the same request also covers the ranges
+    /// `ahead` returns (chunks that follow in the same version and layout),
+    /// so a sequential reader asks once per window, not once per chunk.
+    /// `ahead` is called only on a cache miss. Ranges it names are never
+    /// fetched here, and a refusal of them never fails this read.
+    pub fn read_batch_external_version_ahead(
+        &self,
+        inode_id: &crate::dfs::InodeId,
+        batch: &ReadBatch,
+        out: &mut [u8],
+        ahead: &dyn Fn() -> Vec<DfsMissingReadSource>,
+    ) -> Result<CurrentExternalReadOutcome> {
         batch.validate_output(out.len(), &self.config, false)?;
         let mut packed = batch.clone();
         let mut size = 0;
@@ -561,24 +577,25 @@ impl DfsReadEngine {
             op.output_offset = size;
             size += op.length as usize;
         }
-        let published = self.with_external_version_result(inode_id, &packed, size, |staged| {
-            for (original, op) in batch.ops.iter().zip(&packed.ops) {
-                let length = original.length as usize;
-                if length == 0 {
-                    continue;
+        let published =
+            self.with_external_version_result(inode_id, &packed, size, ahead, |staged| {
+                for (original, op) in batch.ops.iter().zip(&packed.ops) {
+                    let length = original.length as usize;
+                    if length == 0 {
+                        continue;
+                    }
+                    tracing::info_span!(
+                        "node.dfs.read.copy",
+                        copy_stage = "staged_to_output",
+                        requested_bytes = original.length,
+                        copied_bytes = length as u64,
+                    )
+                    .in_scope(|| {
+                        out[original.output_offset..original.output_offset + length]
+                            .copy_from_slice(&staged[op.output_offset..op.output_offset + length]);
+                    });
                 }
-                tracing::info_span!(
-                    "node.dfs.read.copy",
-                    copy_stage = "staged_to_output",
-                    requested_bytes = original.length,
-                    copied_bytes = length as u64,
-                )
-                .in_scope(|| {
-                    out[original.output_offset..original.output_offset + length]
-                        .copy_from_slice(&staged[op.output_offset..op.output_offset + length]);
-                });
-            }
-        })?;
+            })?;
         Ok(if published.is_some() {
             CurrentExternalReadOutcome::Read
         } else {
@@ -594,6 +611,18 @@ impl DfsReadEngine {
         inode_id: &crate::dfs::InodeId,
         batch: &ReadBatch,
         output_len: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        self.read_batch_external_version_owned_ahead(inode_id, batch, output_len, &Vec::new)
+    }
+
+    /// [`Self::read_batch_external_version_owned`] with authority read-ahead;
+    /// see [`Self::read_batch_external_version_ahead`].
+    pub fn read_batch_external_version_owned_ahead(
+        &self,
+        inode_id: &crate::dfs::InodeId,
+        batch: &ReadBatch,
+        output_len: usize,
+        ahead: &dyn Fn() -> Vec<DfsMissingReadSource>,
     ) -> Result<Option<Vec<u8>>> {
         if output_len as u64 > self.config.max_inflight_bytes {
             return Err(invalid("DFS owned read exceeds inflight byte budget"));
@@ -616,7 +645,7 @@ impl DfsReadEngine {
                 return Ok(None);
             }
         }
-        self.with_external_version_result(inode_id, batch, output_len, |bytes| bytes)
+        self.with_external_version_result(inode_id, batch, output_len, ahead, |bytes| bytes)
     }
 
     fn with_external_version_result<T>(
@@ -624,6 +653,7 @@ impl DfsReadEngine {
         inode_id: &crate::dfs::InodeId,
         batch: &ReadBatch,
         output_len: usize,
+        ahead: &dyn Fn() -> Vec<DfsMissingReadSource>,
         publish: impl FnOnce(Vec<u8>) -> T,
     ) -> Result<Option<T>> {
         let Some(backend) = &self.external_backend else {
@@ -671,15 +701,39 @@ impl DfsReadEngine {
         } = self.collect_cached_version_permits(inode_id, &packed, &local)?;
         span.record("auth_hits", (packed.ops.len() - misses.len()) as u64);
         span.record("auth_misses", misses.len() as u64);
-        let source_timing = self.source_cache_timing()?;
-        let new_deadline = match self.authorize_version_misses(
-            backend,
+        let ahead = if misses.is_empty() {
+            Vec::new()
+        } else {
+            self.uncached_ahead(inode_id, &packed, &local, ahead())?
+        };
+        let mut source_timing = self.source_cache_timing()?;
+        let mut authorized_ahead = Vec::new();
+        let first = self.authorize_version_misses(
             inode_id,
             &packed,
-            misses,
+            (misses.clone(), ahead.clone()),
             &mut authorizations,
+            &mut authorized_ahead,
             source_timing.sent,
-        )? {
+        );
+        let outcome = match first {
+            // Read-ahead is advisory: whatever Meta refused, ask again for
+            // exactly what this read needs and let that answer decide.
+            Err(_) if !ahead.is_empty() => {
+                source_timing = self.source_cache_timing()?;
+                authorized_ahead.clear();
+                self.authorize_version_misses(
+                    inode_id,
+                    &packed,
+                    (misses, Vec::new()),
+                    &mut authorizations,
+                    &mut authorized_ahead,
+                    source_timing.sent,
+                )?
+            }
+            other => other?,
+        };
+        let new_deadline = match outcome {
             VersionMissAuthorization::Unsupported => return Ok(None),
             VersionMissAuthorization::Authorized(deadline) => deadline,
         };
@@ -765,6 +819,16 @@ impl DfsReadEngine {
                 &mut permits,
                 cutoff,
             )?;
+            for (requested, authorization) in ahead.iter().zip(&authorized_ahead) {
+                self.install_ahead_authority(
+                    &mut cache,
+                    inode_id,
+                    &packed,
+                    &local,
+                    (requested, authorization),
+                    cutoff,
+                )?;
+            }
         }
         // Invalidation takes the same locks: transferring this private result
         // or copying into a borrowed output is the publication boundary.
@@ -816,16 +880,26 @@ impl DfsReadEngine {
     /// Fills the missing `authorizations` in order.
     fn authorize_version_misses(
         &self,
-        backend: &ExternalReadBackend,
         inode_id: &crate::dfs::InodeId,
         packed: &ReadBatch,
-        misses: Vec<DfsMissingReadSource>,
+        (mut misses, ahead): (Vec<DfsMissingReadSource>, Vec<DfsMissingReadSource>),
         authorizations: &mut [Option<DfsExternalAuthorizedRead>],
+        authorized_ahead: &mut Vec<DfsExternalAuthorizedRead>,
         rpc_started: Instant,
     ) -> Result<VersionMissAuthorization> {
+        let backend = self
+            .external_backend
+            .as_ref()
+            .ok_or_else(|| unavailable("external read backend is not configured"))?;
         if misses.is_empty() {
             return Ok(VersionMissAuthorization::Authorized(None));
         }
+        let needed = misses.len();
+        // A request widened by read-ahead proves nothing about this read when
+        // it fails: the caller repeats it without read-ahead, and only that
+        // answer may invalidate cached authority.
+        let advisory = !ahead.is_empty();
+        misses.extend(ahead);
         let version = packed
             .file_version_id
             .as_ref()
@@ -848,7 +922,7 @@ impl DfsReadEngine {
             Ok(Some(reply)) => reply,
             Ok(None) => return Ok(VersionMissAuthorization::Unsupported),
             Err(error) => {
-                if crate::node::fault::classify::read_authority_rejected(&error) {
+                if !advisory && crate::node::fault::classify::read_authority_rejected(&error) {
                     self.invalidate_external_authority(inode_id, version)?;
                 }
                 return Err(error);
@@ -858,7 +932,9 @@ impl DfsReadEngine {
             || reply.remaining_validity_ms == 0
             || reply.remaining_validity_ms > 5_000
         {
-            self.invalidate_external_authority(inode_id, version)?;
+            if !advisory {
+                self.invalidate_external_authority(inode_id, version)?;
+            }
             return Err(external_denied(
                 "external version authority reply is incomplete or expired",
             ));
@@ -871,13 +947,99 @@ impl DfsReadEngine {
                 "external version authority expired during RPC",
             ));
         }
+        // The reply is in request order: this read's misses, then read-ahead.
         let mut fresh = reply.authorizations.into_iter();
+        let mut filled = 0;
         for authorization in authorizations.iter_mut() {
-            if authorization.is_none() {
+            if authorization.is_none() && filled < needed {
                 *authorization = fresh.next();
+                filled += 1;
             }
         }
+        authorized_ahead.extend(fresh);
         Ok(VersionMissAuthorization::Authorized(Some(deadline)))
+    }
+
+    /// The read-ahead ranges worth asking Meta for: bounded, one per chunk,
+    /// not part of this read and without a usable cached authority.
+    fn uncached_ahead(
+        &self,
+        inode_id: &crate::dfs::InodeId,
+        packed: &ReadBatch,
+        local: &NativeReadAuthoritySnapshot,
+        ahead: Vec<DfsMissingReadSource>,
+    ) -> Result<Vec<DfsMissingReadSource>> {
+        if ahead.is_empty() {
+            return Ok(ahead);
+        }
+        let mut cache = self
+            .external_authority_cache
+            .lock()
+            .map_err(|_| unavailable("DFS external authority cache is poisoned"))?;
+        let mut wanted: Vec<DfsMissingReadSource> = Vec::new();
+        for range in ahead {
+            if wanted.len() == MAX_EXTERNAL_AUTHORITY_AHEAD {
+                break;
+            }
+            if range.length == 0
+                || packed.ops.iter().any(|op| op.chunk_id == range.chunk_id)
+                || wanted.iter().any(|entry| entry.chunk_id == range.chunk_id)
+            {
+                continue;
+            }
+            let key = self.external_authority_key(inode_id, packed, &range.chunk_id)?;
+            if cache
+                .lookup(&key, range.chunk_offset, range.length, local)
+                .is_none()
+            {
+                wanted.push(range);
+            }
+        }
+        Ok(wanted)
+    }
+
+    /// Retains one read-ahead authority. It was never used for a fetch, so
+    /// only what the cache key and deadline rest on is checked here; the first
+    /// read that takes it from the cache runs the full per-read validation.
+    /// An answer that does not match the request is dropped, not an error.
+    fn install_ahead_authority(
+        &self,
+        cache: &mut ExternalAuthorityCache,
+        inode_id: &crate::dfs::InodeId,
+        packed: &ReadBatch,
+        local: &NativeReadAuthoritySnapshot,
+        (requested, authorization): (&DfsMissingReadSource, &DfsExternalAuthorizedRead),
+        fresh_cutoff: Instant,
+    ) -> Result<()> {
+        let validation = &authorization.authorized.validation;
+        if authorization.chunk.id != requested.chunk_id
+            || validation.chunk_id != requested.chunk_id
+            || !matches!(authorization.location, CopyLocation::External { .. })
+            || (local.epoch != 0 && validation.grant.caller_node_epoch != local.epoch)
+            || !range_covered(
+                &authorization.authorized.allowed_ranges,
+                requested.chunk_offset,
+                requested.length,
+            )
+        {
+            return Ok(());
+        }
+        let mut permit = [None];
+        let mut one = packed.clone();
+        one.ops = vec![ChunkReadOp {
+            chunk_id: requested.chunk_id.clone(),
+            chunk_offset: requested.chunk_offset,
+            length: requested.length,
+            output_offset: 0,
+        }];
+        self.install_version_authorities(
+            cache,
+            inode_id,
+            &one,
+            std::slice::from_ref(authorization),
+            &mut permit,
+            fresh_cutoff,
+        )
     }
 
     /// Retain the freshly authorized contexts, none past `fresh_cutoff` (the
@@ -1357,42 +1519,35 @@ impl DfsReadEngine {
                     "external read authority expired before the next fetch",
                 ));
             }
-            let bytes = tracing::info_span!(
-                "node.dfs.read.external_fetch",
-                chunk_id = %chunk.id.0,
-                chunk_bytes = chunk.length,
-            )
-            .in_scope(|| backend.reader.read_chunk(chunk, &read.source))?;
-            fetched_chunks = fetched_chunks.saturating_add(1);
-            if !bytes.matches(chunk) {
-                return Err(corrupt(
-                    "verified external Chunk identity does not match the request",
-                ));
-            }
-            let bytes = bytes.as_slice();
+            let mut ranges = Vec::new();
             for op in reads
                 .iter()
                 .filter(|read| read.chunk.id == chunk.id)
                 .map(|read| &read.op)
             {
-                let start = usize::try_from(op.chunk_offset)
-                    .map_err(|_| invalid("external Chunk offset is too large"))?;
                 let length = usize::try_from(op.length)
                     .map_err(|_| invalid("external Chunk range is too large"))?;
                 copied_bytes = copied_bytes.saturating_add(length as u64);
-                tracing::info_span!(
-                    "node.dfs.read.external_copy",
-                    copy_stage = "external_to_staged",
-                    chunk_id = %chunk.id.0,
-                    chunk_offset = op.chunk_offset,
-                    requested_bytes = op.length,
-                    copied_bytes = length as u64,
-                )
-                .in_scope(|| {
-                    out[op.output_offset..op.output_offset + length]
-                        .copy_from_slice(&bytes[start..start + length]);
+                ranges.push(ExternalRangeCopy {
+                    chunk_offset: op.chunk_offset,
+                    length,
+                    output_offset: op.output_offset,
                 });
             }
+            // `out` is this read's private staging buffer: nothing in it is
+            // published unless every chunk of the batch verifies.
+            tracing::info_span!(
+                "node.dfs.read.external_fetch",
+                chunk_id = %chunk.id.0,
+                chunk_bytes = chunk.length,
+                ranges = ranges.len(),
+            )
+            .in_scope(|| {
+                backend
+                    .reader
+                    .read_chunk_ranges(chunk, &read.source, &ranges, out)
+            })?;
+            fetched_chunks = fetched_chunks.saturating_add(1);
         }
         tracing::Span::current().record("fetched_chunks", fetched_chunks);
         tracing::Span::current().record("copied_bytes", copied_bytes);
