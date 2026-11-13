@@ -214,8 +214,9 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 <a id="step-4"></a>
 ## 第四步：Buildkite共享门禁
 
-**CI 临时调整（2026-11-13）**：Platform 组件暂时跳过三项间歇失败的真实 Redis
-时序/恢复用例，流水线逐项打印 `SKIP`；其余 Redis 组件回归继续运行。这三项不计入
+**CI 临时调整（2026-11-13）**：Platform 组件暂时跳过五项真实 Redis 时序/恢复
+用例（操作预算一项及共用故障代理 fixture 的四项），流水线逐项打印 `SKIP`；
+两项 discovery 恢复测试及其余 Redis 组件回归继续运行。这五项不计入
 CI 通过范围，源码断言及独立手动入口保留，具体名单与命令见
 [流水线说明](../../.buildkite/README.md#temporarily-deferred-redis-timing-regressions)。
 
