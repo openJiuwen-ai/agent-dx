@@ -10,6 +10,7 @@ mod relay_delivery;
 mod runtime;
 mod startup;
 mod store;
+mod subscriptions;
 mod webhook_http;
 mod worker;
 pub use delivery::{DeliveryBatch, DeliveryEvent, DurableAck};
@@ -17,6 +18,10 @@ pub use relay_delivery::{DeliveryAuthorization, RelayDelivery};
 pub use runtime::IngestionRuntime;
 pub(crate) use startup::IngestionConfig;
 pub use store::{Inbox, InboxLimits, Lease, ReceiveReceipt};
+pub use subscriptions::{
+    IntentPort, ProviderTrigger, SubscriptionCoordinator, SubscriptionError, SubscriptionOutcome,
+    SubscriptionSnapshot, TriggerPort,
+};
 pub use webhook_http::{WebhookHttp, WEBHOOK_PATH};
 pub use worker::{DeliveryFailure, DeliveryPort, Worker, WorkerOutcome};
 
@@ -255,5 +260,7 @@ mod persistence_tests;
 mod relay_tests;
 #[cfg(test)]
 mod subscription_state_tests;
+#[cfg(test)]
+mod subscription_sync_tests;
 #[cfg(test)]
 mod tests;
