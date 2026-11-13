@@ -48,6 +48,39 @@ pub struct Activator {
     cache: CacheSettings,
     subscription_ready: std::sync::atomic::AtomicBool,
 }
+
+/// Whether the Environment referenced by `current_env_id` is dormant right now:
+/// Paused, Deleted, or absent. Absence counts as dormant: a removed Environment cannot
+/// serve live traffic. Identity is validated so a transport mix-up cannot be mistaken
+/// for an absent Environment. Shared by the creation gate (`creation.rs`) and the
+/// switch-time recheck (`reconcile_binding`) so both stay on one definition of "dormant".
+///
+/// A `Failed` E1 is intentionally NOT dormant: Activator does not do health recovery or
+/// second-guess Platform failure semantics, so a Failed E1 is treated as still-occupied
+/// (the active path — keep E2 Running for zero-wake switch). If E1 later recovers or is
+/// removed, the next reconcile pass re-evaluates. Paused/Deleted are the only phases that
+/// prove E1 is not serving traffic.
+async fn previous_environment_dormant(
+    environment: &dyn Environment,
+    tenant: &str,
+    current_env_id: &str,
+) -> std::result::Result<bool, EnvironmentError> {
+    match environment.get(tenant, current_env_id).await? {
+        None => Ok(true),
+        Some(previous) => {
+            if previous.id != current_env_id || previous.tenant != tenant {
+                return Err(EnvironmentError::Unavailable(
+                    "previous Environment identity mismatch".into(),
+                ));
+            }
+            Ok(matches!(
+                previous.phase,
+                EnvironmentPhase::Paused | EnvironmentPhase::Deleted
+            ))
+        }
+    }
+}
+
 impl Activator {
     pub fn new(state: AgentState, environment: Arc<dyn Environment>) -> Self {
         Self {
@@ -180,7 +213,32 @@ impl Activator {
         let observed = observed?;
         Self::validate_observation(&binding, &secondary.environment, &observed)?;
         match observed.phase {
-            EnvironmentPhase::Running if observed.ready => (),
+            EnvironmentPhase::Running if observed.ready => {
+                // A dormant previous Environment means no user is currently on E1, so
+                // the fresh candidate is checkpointed immediately instead of idling for
+                // the template's pause timeout. An active E1 keeps E2 Running so live
+                // traffic skips a wake restore on switch. Rechecked here, at the only
+                // decision point, so a user who returned during E2's boot goes active.
+                //
+                // TOCTOU: this read of E1 and the subsequent pause of E2 are not atomic.
+                // A request arriving between them can EnsureRunning E1 again; the switch
+                // still commits to a Paused E2, so that user's next request pays one wake
+                // restore. Accepted: closing the window would need cross-Environment
+                // coordination, out of scope. The convergence loop self-corrects on the
+                // next pass regardless of which side won the race.
+                if previous_environment_dormant(
+                    &*self.environment,
+                    &binding.scope.tenant,
+                    &binding.current.environment_id,
+                )
+                .await?
+                {
+                    let paused = self
+                        .checkpoint_candidate(&binding, &secondary.environment, deadline)
+                        .await?;
+                    Self::validate_observation(&binding, &secondary.environment, &paused)?;
+                }
+            }
             EnvironmentPhase::Paused => (),
             EnvironmentPhase::Failed | EnvironmentPhase::Deleted => {
                 return Err(Error::Conflict(
@@ -192,6 +250,41 @@ impl Activator {
         self.state.switch_current(&binding).await?;
         self.invalidate(scope).await;
         Ok(false)
+    }
+
+    /// Checkpoint a ready candidate to a Paused Environment before the switch. The
+    /// timeout budget is derived from the reconciliation deadline. The result must be
+    /// Paused: a non-paused reply is an unknown outcome that re-queries on the next pass.
+    async fn checkpoint_candidate(
+        &self,
+        binding: &AgentBinding,
+        environment: &EnvironmentRef,
+        deadline: u64,
+    ) -> Result<EnvironmentObservation> {
+        // Decline to pause once the step's absolute deadline has passed: an expired
+        // round must not fire a pointless capture request. pause_timeout_seconds clamps
+        // an already-expired budget back to 1s, so the check must precede it. The next
+        // reconcile pass observes the candidate's current phase and advances from there.
+        if adx_agent_core::unix_time_millis() >= deadline {
+            return Err(Error::OutcomeUnknown(
+                "checkpoint deadline expired before pause; query the same AgentBinding".into(),
+            ));
+        }
+        let timeout_seconds = environment_request::pause_timeout_seconds(deadline);
+        let paused = self
+            .environment
+            .pause(
+                &binding.scope.tenant,
+                &environment.environment_id,
+                timeout_seconds,
+            )
+            .await?;
+        if paused.phase != EnvironmentPhase::Paused {
+            return Err(Error::Unavailable(
+                "checkpoint candidate did not commit Paused".into(),
+            ));
+        }
+        Ok(paused)
     }
     pub fn ready(&self) -> bool {
         self.subscription_ready

@@ -169,6 +169,24 @@ ADX_AGENT_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
 这些测试使用模拟 Platform，不证明真实运行时、共享文件系统、连接排空或集群端到端行为。
 
 
+### 休眠沙箱升级时立即 checkpoint
+
+候选 E2 在创建门确认旧 current E1 已休眠后才创建，但 E2 从开始创建到就绪 Running 期间，新请求仍由 E1 服务，E1 可能被 Gateway 的 EnsureRunning 拉起（见 [休眠实例的解析](#休眠实例的解析)）。因此在 E2 就绪、即将 `switch_current` 之前，reconcile 在唯一决策点重新查询 E1 当前相态，按 E1 此刻是否休眠分叉：
+
+- E1 休眠（Paused/Deleted/absent）：`checkpoint_candidate` 立即把 E2 pause 成 checkpoint，再 `switch_current`。切换后 E2 仅占存储，砍掉"E2 空转到模板 pause 超时才休眠"的窗口。
+- E1 活跃（Running）：E2 保持 Running 不 pause，直接 `switch_current`。切换后流量走 E2，省掉一次唤醒恢复。
+
+该判断只读取 E1 相态、只 pause E2，不主动 pause E1，也不改变请求路径对 E1 的拉起行为。`previous_environment_dormant`（获取 E1 → 校验 tenant/id → 匹配 Paused/Deleted）是创建门与切换决策点共用的共享函数，两处共用同一份"dormant"定义。E2 就绪时若已是 Paused（创建后被外部 pause），走 `Paused => ()` 直接切换，不再发起 pause。
+
+`pause` 能力是 dormant 升级的硬依赖：`Environment::pause` 默认返回 `Unsupported`，部署的 Environment 适配器必须实现 `pause` 才能让休眠沙箱走"立即 checkpoint 再切换"路径。未实现的部署在候选就绪、E1 已休眠时，`checkpoint_candidate` 会返回 `Unsupported`，reconcile 与 `Invalid` 同等处理——记录警告后**停止主动重试**，等待外部变更（alias 改动、成员变化、进程重启）再检查，**不降级为"不 checkpoint 直接切"**。active 升级路径（E1 活跃、E2 保持 Running 切换）不调用 pause，不受此影响。
+
+### pause 超时预算与 reconcile 步骤对齐
+
+`checkpoint_candidate` 的 pause 预算取自 reconcile 步骤的剩余 deadline：`pause_timeout_seconds(deadline)` = 剩余秒数 clamp 到 `1..=3600`（与 API Server pause 契约一致）。`pause` 方法在 trait 入口校验 `timeout_seconds ∈ 1..=3600`，越界返回 `Invalid`；HTTP/嵌入式适配器的客户端等待预算就是 `timeout_seconds` 本身，**不再叠加 transport 自身的 `request_timeout_seconds`**。这样 pause 的等待上限恒等于 reconcile 步骤的剩余预算，外层 `tokio::time::timeout(request_timeout_seconds, reconcile_binding(...))` 真正 bound 住整步，不会出现"pause 客户端愿意等的时间 > 步骤剩余预算"导致外层先超时、留误导性 `OutcomeUnknown("reconciliation step timed out")` 的情况。
+
+真实 checkpoint 捕获（CRIU dump + 上传共享存储）在大内存沙箱下可能数十秒到数分钟。当 pause 实际耗时超过步骤剩余预算时，pause 返回 `OutcomeUnknown`，`switch_current` 不执行；下一轮 reconcile 查到候选已是 Paused，走 `Paused => ()` 完成切换——升级最终收敛，不会因慢捕获把候选判死。若 Platform 侧捕获失败把候选置为 Failed，下一轮命中 `Failed | Deleted => Conflict`，候选退役、升级失败，需人工排查。现有测试用内存 fake 覆盖了"慢 pause 下一轮收敛"路径，不证明真实 CRIU/共享存储时序。
+
+
 ### 创建排队取消与退避
 
 HTTP 与进程内 Environment 适配器保留 Platform 的 `adx_core::scheduling::SchedulingFailure`，映射为 `EnvironmentError::SchedulingCancelled`。确定排队取消允许发起下一次创建尝试；HTTP 必须同时为504且包含 `DEADLINE_EXCEEDED / never / not_started / schedulingFailure`，进程内调用使用协议的取消标记。HTTP 与嵌入式模式还支持下述已结束创建的重试。普通超时、响应丢失、单独的 Env 不存在、损坏诊断和任意业务启动失败均不构成推进尝试的依据。Platform 的排队超时保持原行为；API Server 的完成缓存仍保留600秒，成功重放会检查现有本地 Env 目录：当前 Running Env 返回其信息及创建 requestId；确认不存在或执行终止返回已有终态错误。

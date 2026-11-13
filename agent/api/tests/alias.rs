@@ -48,6 +48,24 @@ impl Environment for Platform {
         value.phase = EnvironmentPhase::Deleted;
         Ok(value)
     }
+    async fn pause(
+        &self,
+        _: &str,
+        id: &str,
+        _timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        let mut value = self
+            .0
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .ok_or(EnvironmentError::NotFound)?
+            .clone();
+        value.phase = EnvironmentPhase::Paused;
+        value.ready = false;
+        self.0.lock().unwrap().insert(id.into(), value.clone());
+        Ok(value)
+    }
 }
 #[tokio::test]
 async fn alias_service_validation_uses_current_version_and_prewrite_retry_uses_new_default_port() {
@@ -234,6 +252,14 @@ impl Environment for RejectDelete {
         Err(EnvironmentError::Unavailable(
             "temporary deletion failure".into(),
         ))
+    }
+    async fn pause(
+        &self,
+        tenant: &str,
+        id: &str,
+        timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.0.pause(tenant, id, timeout_seconds).await
     }
 }
 

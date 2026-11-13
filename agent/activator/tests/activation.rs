@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
 
 #[derive(Default)]
@@ -14,6 +15,11 @@ struct Platform {
     observations: Mutex<HashMap<(String, String), EnvironmentObservation>>,
     lose_create_response: AtomicBool,
     lose_delete_response: AtomicBool,
+    pause_blocks: AtomicBool,
+    pause_count: std::sync::atomic::AtomicU32,
+    // When set, `get` for this Environment id sleeps `delay` before replying. Used to let the
+    // reconciliation deadline expire between activate_environment and the checkpoint decision.
+    slow_get: Mutex<Option<(String, Duration)>>,
     create_entered: tokio::sync::Notify,
     create_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
@@ -52,6 +58,12 @@ impl Environment for Platform {
         tenant: &str,
         id: &str,
     ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
+        let slow = self.slow_get.lock().unwrap().clone();
+        if let Some((slow_id, delay)) = slow {
+            if id == slow_id {
+                tokio::time::sleep(delay).await;
+            }
+        }
         Ok(self
             .observations
             .lock()
@@ -74,6 +86,27 @@ impl Environment for Platform {
             .get_mut(&(tenant.into(), id.into()))
             .ok_or(EnvironmentError::NotFound)?;
         value.phase = EnvironmentPhase::Deleted;
+        value.ready = false;
+        Ok(value.clone())
+    }
+    async fn pause(
+        &self,
+        tenant: &str,
+        id: &str,
+        _timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.pause_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.pause_blocks.load(Ordering::SeqCst) {
+            // Capture is in flight and never completes within this step; the caller's
+            // step budget drops the call so the next pass re-queries the same ID.
+            std::future::pending::<()>().await;
+        }
+        let mut values = self.observations.lock().unwrap();
+        let value = values
+            .get_mut(&(tenant.into(), id.into()))
+            .ok_or(EnvironmentError::NotFound)?;
+        value.phase = EnvironmentPhase::Paused;
         value.ready = false;
         Ok(value.clone())
     }
@@ -591,4 +624,419 @@ async fn listing_missing_template_or_alias_preserves_not_found() {
             Err(Error::NotFound)
         ));
     }
+}
+
+/// A dormant previous Environment is checkpointed immediately when the candidate is
+/// ready, so the switched Environment is Paused (storage only, zero runtime) rather
+/// than idling until the template pause timeout fires.
+#[tokio::test]
+async fn dormant_previous_environment_checkpoints_candidate_before_switch() {
+    use adx_agent_core::alias::{AliasConfig, VersionWeight};
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let a = Activator::new(state.clone(), platform.clone());
+    let one = template();
+    let mut two = one.clone();
+    two.version = "2".into();
+    two.image = "app:2".into();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&one))
+        .await
+        .unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&two))
+        .await
+        .unwrap();
+    let mut config = AliasConfig {
+        tenant: "tenant".into(),
+        template: "app".into(),
+        alias: "production".into(),
+        seed: "stable".into(),
+        versions: vec![VersionWeight {
+            version: "1".into(),
+            weight: 1,
+        }],
+    };
+    let revision = state.put_alias(&config, None).await.unwrap();
+    let mut scope = scope("dormant-upgrade");
+    scope.template_ref = TemplateRef::Alias("production".into());
+    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let original = a.activate(&scope, None, deadline).await.unwrap().binding;
+    // The previous Environment is dormant: paused before the switch is attempted.
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
+    config.versions = vec![VersionWeight {
+        version: "2".into(),
+        weight: 1,
+    }];
+    state.put_alias(&config, Some(&revision)).await.unwrap();
+    assert!(!a.reconcile_binding(&scope, deadline).await.unwrap());
+    let switched = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(switched.generation, original.generation);
+    assert_eq!(switched.current.version, "2");
+    // The candidate was checkpointed to Paused, not left Running.
+    let observations = platform.observations.lock().unwrap();
+    assert_eq!(
+        observations[&("tenant".into(), switched.current.environment_id.clone())].phase,
+        EnvironmentPhase::Paused,
+        "dormant upgrade must checkpoint the candidate instead of leaving it idle"
+    );
+    assert!(!observations[&("tenant".into(), switched.current.environment_id.clone())].ready);
+}
+
+/// An active previous Environment keeps the candidate Running so live traffic skips a
+/// wake restore when the switch commits. This models the race where a user returns during
+/// the candidate's boot: E1 was Paused when creation was admitted, but is Running again by
+/// the time the candidate is ready.
+#[tokio::test]
+async fn active_previous_environment_keeps_candidate_running_before_switch() {
+    use adx_agent_core::alias::{AliasConfig, VersionWeight};
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let a = Activator::new(state.clone(), platform.clone());
+    let one = template();
+    let mut two = one.clone();
+    two.version = "2".into();
+    two.image = "app:2".into();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&one))
+        .await
+        .unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&two))
+        .await
+        .unwrap();
+    let mut config = AliasConfig {
+        tenant: "tenant".into(),
+        template: "app".into(),
+        alias: "production".into(),
+        seed: "stable".into(),
+        versions: vec![VersionWeight {
+            version: "1".into(),
+            weight: 1,
+        }],
+    };
+    let revision = state.put_alias(&config, None).await.unwrap();
+    let mut scope = scope("active-upgrade");
+    scope.template_ref = TemplateRef::Alias("production".into());
+    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let original = a.activate(&scope, None, deadline).await.unwrap().binding;
+    // Admit candidate creation by pausing E1, then prepare the candidate.
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
+    config.versions = vec![VersionWeight {
+        version: "2".into(),
+        weight: 1,
+    }];
+    state.put_alias(&config, Some(&revision)).await.unwrap();
+    let prepared = state.prepare_binding(&scope).await.unwrap();
+    let candidate = prepared.secondary.as_ref().unwrap().environment.clone();
+    // The candidate already exists and is Running (get-first returns it without re-gating
+    // on E1). A user returned during boot: E1 is awake again at the decision point.
+    platform.observations.lock().unwrap().insert(
+        ("tenant".into(), candidate.environment_id.clone()),
+        EnvironmentObservation {
+            id: candidate.environment_id.clone(),
+            tenant: "tenant".into(),
+            phase: EnvironmentPhase::Running,
+            ready: true,
+            runtime_id: Some("runtime".into()),
+            message: None,
+        },
+    );
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Running;
+    assert!(!a.reconcile_binding(&scope, deadline).await.unwrap());
+    let switched = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(switched.generation, original.generation);
+    assert_eq!(switched.current.version, "2");
+    assert_eq!(switched.current, candidate);
+    let observations = platform.observations.lock().unwrap();
+    assert_eq!(
+        observations[&("tenant".into(), switched.current.environment_id.clone())].phase,
+        EnvironmentPhase::Running,
+        "active upgrade must keep the candidate Running to avoid a wake restore"
+    );
+    assert!(observations[&("tenant".into(), switched.current.environment_id.clone())].ready);
+}
+
+/// A Failed previous Environment is intentionally NOT treated as dormant: Activator does
+/// not do health recovery or second-guess Platform failure semantics, so a Failed E1 takes
+/// the active path — the candidate stays Running and the switch commits without pausing it.
+/// This covers the `previous_environment_dormant` branch that Paused/Deleted matching skips.
+#[tokio::test]
+async fn failed_previous_environment_takes_the_active_path_without_checkpointing() {
+    use adx_agent_core::alias::{AliasConfig, VersionWeight};
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let a = Activator::new(state.clone(), platform.clone());
+    let one = template();
+    let mut two = one.clone();
+    two.version = "2".into();
+    two.image = "app:2".into();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&one))
+        .await
+        .unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&two))
+        .await
+        .unwrap();
+    let mut config = AliasConfig {
+        tenant: "tenant".into(),
+        template: "app".into(),
+        alias: "production".into(),
+        seed: "stable".into(),
+        versions: vec![VersionWeight {
+            version: "1".into(),
+            weight: 1,
+        }],
+    };
+    let revision = state.put_alias(&config, None).await.unwrap();
+    let mut scope = scope("failed-e1-upgrade");
+    scope.template_ref = TemplateRef::Alias("production".into());
+    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let original = a.activate(&scope, None, deadline).await.unwrap().binding;
+    // Admit candidate creation by pausing E1 first, then prepare the candidate.
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
+    config.versions = vec![VersionWeight {
+        version: "2".into(),
+        weight: 1,
+    }];
+    state.put_alias(&config, Some(&revision)).await.unwrap();
+    let prepared = state.prepare_binding(&scope).await.unwrap();
+    let candidate = prepared.secondary.as_ref().unwrap().environment.clone();
+    // Candidate exists and is Running. At the decision point E1 is Failed (not Paused).
+    platform.observations.lock().unwrap().insert(
+        ("tenant".into(), candidate.environment_id.clone()),
+        EnvironmentObservation {
+            id: candidate.environment_id.clone(),
+            tenant: "tenant".into(),
+            phase: EnvironmentPhase::Running,
+            ready: true,
+            runtime_id: Some("runtime".into()),
+            message: None,
+        },
+    );
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Failed;
+    assert!(!a.reconcile_binding(&scope, deadline).await.unwrap());
+    let switched = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(switched.current.version, "2");
+    assert_eq!(switched.current, candidate);
+    let observations = platform.observations.lock().unwrap();
+    assert_eq!(
+        observations[&("tenant".into(), switched.current.environment_id.clone())].phase,
+        EnvironmentPhase::Running,
+        "a Failed E1 takes the active path: candidate stays Running, no checkpoint"
+    );
+    assert!(observations[&("tenant".into(), switched.current.environment_id.clone())].ready);
+}
+
+/// A checkpoint capture slower than the reconciliation step budget must not strand the
+/// upgrade: `checkpoint_candidate` reports the missed step, and the next pass observes the
+/// candidate already Paused (the Platform committed it) and commits the switch. This is the
+/// convergence path review 4(b) requires: the client budget is clamped to `timeout_seconds`
+/// (the step's remaining budget), so the outer reconciliation timeout bounds the capture
+/// instead of overshooting it.
+#[tokio::test]
+async fn slow_checkpoint_converges_on_the_next_pass_after_the_step_budget_drops() {
+    use adx_agent_core::alias::{AliasConfig, VersionWeight};
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let a = Activator::new(state.clone(), platform.clone());
+    let one = template();
+    let mut two = one.clone();
+    two.version = "2".into();
+    two.image = "app:2".into();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&one))
+        .await
+        .unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&two))
+        .await
+        .unwrap();
+    let mut config = AliasConfig {
+        tenant: "tenant".into(),
+        template: "app".into(),
+        alias: "production".into(),
+        seed: "stable".into(),
+        versions: vec![VersionWeight {
+            version: "1".into(),
+            weight: 1,
+        }],
+    };
+    let revision = state.put_alias(&config, None).await.unwrap();
+    let mut scope = scope("slow-checkpoint");
+    scope.template_ref = TemplateRef::Alias("production".into());
+    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let original = a.activate(&scope, None, deadline).await.unwrap().binding;
+    // E1 is dormant: the candidate is checkpointed on the switch attempt.
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
+    config.versions = vec![VersionWeight {
+        version: "2".into(),
+        weight: 1,
+    }];
+    state.put_alias(&config, Some(&revision)).await.unwrap();
+    // The first checkpoint never completes within the step: pause blocks forever, so the
+    // step budget (the reconciliation timeout wrapping reconcile_binding, mirroring
+    // reconciliation.rs) drops the call. The Platform has, however, durably published
+    // Paused by the second pass.
+    platform.pause_blocks.store(true, Ordering::SeqCst);
+    let first = tokio::time::timeout(
+        Duration::from_millis(150),
+        a.reconcile_binding(&scope, deadline),
+    )
+    .await;
+    platform.pause_blocks.store(false, Ordering::SeqCst);
+    // The step reported the missed capture; it did not commit the switch.
+    assert!(
+        first.is_err(),
+        "a blocked checkpoint must surface as a step failure, not a silent switch: {first:?}"
+    );
+    let binding_after = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(
+        binding_after.current.version, "1",
+        "the switch must not commit while the capture is in flight"
+    );
+    let candidate = binding_after.secondary.unwrap().environment.clone();
+    // Platform committed Paused out-of-band while the step was stuck; the next pass
+    // observes the Paused candidate and commits the switch without re-attempting pause.
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), candidate.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
+    assert!(!a.reconcile_binding(&scope, deadline).await.unwrap());
+    let switched = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(switched.current.version, "2");
+    let observations = platform.observations.lock().unwrap();
+    assert_eq!(
+        observations[&("tenant".into(), switched.current.environment_id.clone())].phase,
+        EnvironmentPhase::Paused,
+        "the slow checkpoint still converges to a Paused switched Environment"
+    );
+}
+
+/// P3-b: when the reconciliation deadline has already expired by the time
+/// `checkpoint_candidate` runs, the step must NOT fire a pointless pause request.
+/// `pause_timeout_seconds` clamps an expired budget back to 1s, so an explicit
+/// `unix_time_millis() >= deadline` guard must precede it. The candidate is ready and E1 is
+/// dormant (the dormant branch is taken); the only thing that should abort the pause is the
+/// expired-deadline guard. Verified by asserting `pause_count` stays zero and the result is
+/// `OutcomeUnknown`.
+#[tokio::test]
+async fn checkpoint_is_skipped_when_the_step_deadline_already_expired() {
+    use adx_agent_core::alias::{AliasConfig, VersionWeight};
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let a = Activator::new(state.clone(), platform.clone());
+    let one = template();
+    let mut two = one.clone();
+    two.version = "2".into();
+    two.image = "app:2".into();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&one))
+        .await
+        .unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&two))
+        .await
+        .unwrap();
+    let mut config = AliasConfig {
+        tenant: "tenant".into(),
+        template: "app".into(),
+        alias: "production".into(),
+        seed: "stable".into(),
+        versions: vec![VersionWeight {
+            version: "1".into(),
+            weight: 1,
+        }],
+    };
+    let revision = state.put_alias(&config, None).await.unwrap();
+    let mut scope = scope("expired-checkpoint-deadline");
+    scope.template_ref = TemplateRef::Alias("production".into());
+    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let original = a.activate(&scope, None, deadline).await.unwrap().binding;
+    // E1 is dormant: the candidate is checkpointed on the switch attempt.
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
+    config.versions = vec![VersionWeight {
+        version: "2".into(),
+        weight: 1,
+    }];
+    state.put_alias(&config, Some(&revision)).await.unwrap();
+    let prepared = state.prepare_binding(&scope).await.unwrap();
+    let candidate = prepared.secondary.as_ref().unwrap().environment.clone();
+    // Candidate already observed as ready/Running: `activate_environment` returns its
+    // cached observation at the creation gate (creation.rs) without reaching the creation-
+    // time dormant recheck, so the slow GET below is exercised only at the switch-time
+    // `previous_environment_dormant` call (lib.rs).
+    platform.observations.lock().unwrap().insert(
+        ("tenant".into(), candidate.environment_id.clone()),
+        EnvironmentObservation {
+            id: candidate.environment_id.clone(),
+            tenant: "tenant".into(),
+            phase: EnvironmentPhase::Running,
+            ready: true,
+            runtime_id: Some("runtime".into()),
+            message: None,
+        },
+    );
+    // The switch-time dormant recheck GETs E1; make that call sleep past the step deadline so
+    // `checkpoint_candidate` observes an already-expired deadline and must skip the pause.
+    platform.slow_get.lock().unwrap().replace((
+        original.current.environment_id.clone(),
+        Duration::from_millis(250),
+    ));
+    // Comfortably after activate_environment (microseconds, in-memory) but well before the
+    // 250 ms dormant-recheck sleep completes.
+    let near_deadline = adx_agent_core::unix_time_millis() + 100;
+    let result = a.reconcile_binding(&scope, near_deadline).await;
+    assert!(
+        matches!(&result, Err(Error::OutcomeUnknown(_))),
+        "an expired checkpoint deadline must surface as OutcomeUnknown, not commit the switch: {result:?}"
+    );
+    assert_eq!(
+        platform.pause_count.load(Ordering::SeqCst),
+        0,
+        "checkpoint_candidate must not fire pause after the step deadline expired"
+    );
+    // The switch did not commit, and the candidate remains the saved secondary.
+    let binding_after = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(
+        binding_after.current.version, "1",
+        "the switch must not commit when the checkpoint deadline expired"
+    );
+    let _ = candidate; // candidate identity is the saved secondary; nothing to assert here
 }
