@@ -81,18 +81,20 @@ impl Connection {
     /// close its socket when this returns (including route revocation), releasing
     /// both channel ends and reporting unknown outcomes without replaying work.
     /// Returns driver errors or Revoked; the admission deadline no longer applies.
+    /// `anchor` 携带体验族观察锚点（详设 §6.4 M2-4a）：None 时 driver 不观察。
     pub async fn run(
         self,
         user_id: String,
         config: DriverConfig,
         requests: mpsc::Receiver<Request>,
         output: mpsc::Sender<Value>,
+        anchor: Option<crate::ingress::experience::ExperienceAnchor>,
     ) -> Result<(), ConnectionError> {
         let Self { backend, cancelled } = self;
         tokio::select! {
             biased;
             _ = wait_for_route_cancellation(Some(cancelled)) => Err(ConnectionError::Revoked),
-            result = driver::run(backend, user_id, config, requests, output) => result.map_err(ConnectionError::from),
+            result = driver::run(backend, user_id, config, requests, output, anchor) => result.map_err(ConnectionError::from),
         }
     }
 }

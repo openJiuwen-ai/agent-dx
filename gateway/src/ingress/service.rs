@@ -34,6 +34,22 @@ pub struct IngressService {
     route_changes: broadcast::Receiver<RouteChange>,
     #[cfg(feature = "agent-api")]
     ssh: Option<super::ssh::SshListener>,
+    /// 观测接收端点（M2-2，详设 §6.8）；未配置 `ADX_OBSERVABILITY_CONFIG` 时为 None。
+    #[cfg(feature = "agent-api")]
+    ingest: Option<(
+        TcpListener,
+        Arc<super::observability::IngestState>,
+        tokio::sync::mpsc::Receiver<super::observability::ingest::SpoolBatch>,
+    )>,
+    /// 单写者聚合器（M2-5，详设 §6.10）；未启用时为 None。
+    #[cfg(feature = "agent-api")]
+    observation_aggregator: Option<Arc<super::observability::Aggregator>>,
+    /// 业务事件发射器与 spool 接收端（M2-4b）；未启用时为 None。
+    #[cfg(feature = "agent-api")]
+    observation_sink: Option<(
+        Arc<super::observability::ObservationSink>,
+        tokio::sync::mpsc::Receiver<adx_observability::business::BusinessObservation>,
+    )>,
 }
 
 impl IngressService {
@@ -159,6 +175,9 @@ impl IngressService {
         } else {
             None
         };
+        // 观测链的生产者目前只有 Jiuwen 适配器；记下是否启用，供配置告警使用。
+        #[cfg(feature = "agent-api")]
+        let jiuwen_enabled = digitalmategateway_api.is_some();
         let gateway = Ingress::new(
             resolver,
             connector,
@@ -201,6 +220,84 @@ impl IngressService {
         } else {
             gateway
         };
+        // 观测链路（M2）：四段相互独立——发射不需要本地存储；接收/聚合必须有 store。
+        #[cfg(feature = "agent-api")]
+        let (ingest, observation_aggregator, observation_sink, ingest_render) =
+            if let Ok(path) = std::env::var("ADX_OBSERVABILITY_CONFIG") {
+                let settings: super::observability::ObservabilityConfig =
+                    serde_json::from_slice(&std::fs::read(path)?)
+                        .map_err(|_| "invalid observability configuration")?;
+                if !jiuwen_enabled {
+                    tracing::warn!(
+                        "ADX_OBSERVABILITY_CONFIG is set but the Jiuwen adapter is disabled \
+                         (ADX_JIUWEN_CONFIG missing): the business event chain has no producer \
+                         and will stay idle"
+                    );
+                }
+                let store = if settings.ingest.is_some()
+                    || settings
+                        .aggregator
+                        .as_ref()
+                        .is_some_and(|config| config.enabled)
+                {
+                    let store_config = settings
+                        .store
+                        .as_ref()
+                        .ok_or("observability ingest/aggregator requires store configuration")?;
+                    Some(Arc::new(
+                        super::observability::ObservationStore::connect(store_config)
+                            .await
+                            .map_err(|error| send_error(Box::new(error)))?,
+                    ))
+                } else {
+                    None
+                };
+                let observation_sink = settings
+                    .emit
+                    .as_ref()
+                    .map(super::observability::ObservationSink::new)
+                    .transpose()
+                    .map_err(|error| send_error(Box::new(error)))?;
+                let observation_aggregator = match (&settings.aggregator, &store) {
+                    (Some(config), Some(store)) if config.enabled => Some(Arc::new(
+                        super::observability::Aggregator::new(config.clone(), Arc::clone(store)),
+                    )),
+                    _ => None,
+                };
+                let ingest = match (&settings.ingest, &store) {
+                    (Some(config), Some(store)) => {
+                        let listen = config.listen;
+                        let state_store: Arc<dyn super::observability::ingest::EventStore> =
+                            store.clone();
+                        let (state, spool) =
+                            super::observability::IngestState::new(config.clone(), state_store)
+                                .map_err(|error| send_error(Box::new(error)))?;
+                        let listener = TcpListener::bind(listen).await?;
+                        tracing::info!(%listen, "Observation ingest serving");
+                        Some((listener, state, spool))
+                    }
+                    _ => None,
+                };
+                let ingest_render = ingest.as_ref().map(|(_, state, _)| Arc::clone(state));
+                (
+                    ingest,
+                    observation_aggregator,
+                    observation_sink,
+                    ingest_render,
+                )
+            } else {
+                (None, None, None, None)
+            };
+        #[cfg(feature = "agent-api")]
+        let gateway = gateway.with_observation_aggregator(observation_aggregator.clone());
+        #[cfg(feature = "agent-api")]
+        let gateway = gateway.with_observation_sink(
+            observation_sink
+                .as_ref()
+                .map(|(sink, _spool)| Arc::clone(sink)),
+        );
+        #[cfg(feature = "agent-api")]
+        let gateway = gateway.with_observation_ingest(ingest_render);
         let gateway = Arc::new(gateway);
         #[cfg(feature = "agent-api")]
         let ssh = if let Ok(path) = std::env::var("ADX_SSH_CONFIG") {
@@ -213,6 +310,12 @@ impl IngressService {
         Ok(Self {
             #[cfg(feature = "agent-api")]
             ssh,
+            #[cfg(feature = "agent-api")]
+            ingest,
+            #[cfg(feature = "agent-api")]
+            observation_aggregator,
+            #[cfg(feature = "agent-api")]
+            observation_sink,
             config,
             public_listeners,
             health_listener,
@@ -250,12 +353,37 @@ impl IngressService {
             route_changes,
             #[cfg(feature = "agent-api")]
             ssh,
+            #[cfg(feature = "agent-api")]
+            ingest,
+            #[cfg(feature = "agent-api")]
+            observation_aggregator,
+            #[cfg(feature = "agent-api")]
+            observation_sink,
         } = self;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let watcher_task = tokio::spawn(watcher.run(store));
         let route_reconciler_task =
             tokio::spawn(gateway.clone().run_route_reconciler(route_changes));
         let mut listeners = JoinSet::new();
+        #[cfg(feature = "agent-api")]
+        if let Some(aggregator) = observation_aggregator {
+            let shutdown = shutdown_rx.clone();
+            tokio::spawn(async move { aggregator.run(shutdown).await });
+        }
+        #[cfg(feature = "agent-api")]
+        if let Some((sink, spool)) = observation_sink {
+            let shutdown = shutdown_rx.clone();
+            tokio::spawn(async move { sink.run(spool, shutdown).await });
+        }
+        #[cfg(feature = "agent-api")]
+        if let Some((listener, state, spool)) = ingest {
+            let shutdown = shutdown_rx.clone();
+            listeners.spawn(async move {
+                super::observability::ingest::serve(listener, state, spool, shutdown)
+                    .await
+                    .map_err(service_error)
+            });
+        }
         #[cfg(feature = "agent-api")]
         if let Some(ssh) = ssh {
             let shutdown = shutdown_rx.clone();

@@ -89,6 +89,220 @@ impl hyper::body::Body for DeadlineBody {
     }
 }
 
+/// 全流观测的请求分类（详设 §6.2：有界枚举，值集冻结）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteClass {
+    EnvironmentApi,
+    CommandWatch,
+    Jiuwen,
+    InternalHealth,
+    Unmatched,
+}
+impl RouteClass {
+    const COUNT: usize = 5;
+    const ALL: [Self; Self::COUNT] = [
+        Self::EnvironmentApi,
+        Self::CommandWatch,
+        Self::Jiuwen,
+        Self::InternalHealth,
+        Self::Unmatched,
+    ];
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EnvironmentApi => "environment_api",
+            Self::CommandWatch => "command_watch",
+            Self::Jiuwen => "jiuwen",
+            Self::InternalHealth => "internal_health",
+            Self::Unmatched => "unmatched",
+        }
+    }
+}
+
+/// 全流观测的传输形态（`ws`/`connect` 的样本由连接生命周期挂点记录）。
+/// `pub(super)`：reverse_proxy 的升级拷贝任务需要构造取值（M1-9）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Transport {
+    Http,
+    Sse,
+    Ws,
+    Connect,
+}
+impl Transport {
+    const COUNT: usize = 4;
+    const ALL: [Self; Self::COUNT] = [Self::Http, Self::Sse, Self::Ws, Self::Connect];
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Sse => "sse",
+            Self::Ws => "ws",
+            Self::Connect => "connect",
+        }
+    }
+}
+
+/// 流中断的粗分类（详设：不设 backend_closed——无法可靠区分后端正常关闭与协议错误）。
+/// `pub(super)`：reverse_proxy 的升级拷贝任务需要构造取值（M1-9）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AbortReason {
+    ClientClosed,
+    Deadline,
+    ProtocolError,
+    Unknown,
+}
+impl AbortReason {
+    const COUNT: usize = 4;
+    const ALL: [Self; Self::COUNT] = [
+        Self::ClientClosed,
+        Self::Deadline,
+        Self::ProtocolError,
+        Self::Unknown,
+    ];
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientClosed => "client_closed",
+            Self::Deadline => "deadline",
+            Self::ProtocolError => "protocol_error",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// 一次请求的全流观察者：随所有权移动，由流的唯一所有者记录一次（详设 §6.2）。
+/// `Clone` 仅为满足 `http::Extensions::insert` 的边界；运行时始终只有一份。
+#[derive(Clone)]
+pub(super) struct StreamObserver {
+    metrics: Arc<IngressRequestMetrics>,
+    route_class: RouteClass,
+    started: Instant,
+}
+impl StreamObserver {
+    fn new(metrics: &Arc<IngressRequestMetrics>, route_class: RouteClass) -> Self {
+        Self {
+            metrics: Arc::clone(metrics),
+            route_class,
+            started: Instant::now(),
+        }
+    }
+    fn wrap_body(self, response: Response<ProxyBody>, transport: Transport) -> Response<ProxyBody> {
+        let (parts, body) = response.into_parts();
+        let body = ObservedBody {
+            body,
+            observer: Some((self, transport)),
+        }
+        .boxed_unsync();
+        Response::from_parts(parts, body)
+    }
+    pub(super) fn record(
+        self,
+        transport: Transport,
+        outcome: adx_core::observation::Outcome,
+        abort: Option<AbortReason>,
+    ) {
+        self.metrics.observe_stream(
+            self.route_class,
+            transport,
+            outcome,
+            self.started.elapsed().as_secs_f64(),
+            abort,
+        );
+    }
+}
+
+/// 全流观察体：最外层包装（在 DeadlineBody 之外），结束/错误/丢弃时恰好记录一次。
+struct ObservedBody {
+    body: ProxyBody,
+    observer: Option<(StreamObserver, Transport)>,
+}
+impl hyper::body::Body for ObservedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        let result = Pin::new(&mut self.body).poll_frame(cx);
+        match &result {
+            Poll::Ready(None) => {
+                if let Some((observer, transport)) = self.observer.take() {
+                    observer.record(transport, adx_core::observation::Outcome::Success, None);
+                }
+            }
+            // 已知长度的体（Full）在最后一帧后 is_end_stream 为真，hyper 可能不再
+            // poll 到 None——在帧成功且体已标尽时即记录，避免误记 client_closed。
+            Poll::Ready(Some(Ok(_))) if self.body.is_end_stream() => {
+                if let Some((observer, transport)) = self.observer.take() {
+                    observer.record(transport, adx_core::observation::Outcome::Success, None);
+                }
+            }
+            Poll::Ready(Some(Err(error))) => {
+                if let Some((observer, transport)) = self.observer.take() {
+                    let reason = abort_reason_of(error);
+                    observer.record(
+                        transport,
+                        adx_core::observation::Outcome::Failure,
+                        Some(reason),
+                    );
+                }
+            }
+            _ => {}
+        }
+        result
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+impl Drop for ObservedBody {
+    fn drop(&mut self) {
+        // 未记录即被丢弃：下游在流结束前断开（详设：client_closed）。
+        if let Some((observer, transport)) = self.observer.take() {
+            observer.record(
+                transport,
+                adx_core::observation::Outcome::Cancelled,
+                Some(AbortReason::ClientClosed),
+            );
+        }
+    }
+}
+
+fn abort_reason_of(error: &BoxError) -> AbortReason {
+    if error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+    {
+        AbortReason::Deadline
+    } else {
+        AbortReason::ProtocolError
+    }
+}
+
+fn transport_of(response: &Response<ProxyBody>) -> Transport {
+    let event_stream = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
+    if event_stream {
+        Transport::Sse
+    } else {
+        Transport::Http
+    }
+}
+
+/// lifecycle 请求的内层早退响应同样计入全流（观察者已从 extensions 取出）。
+fn observed(
+    observer: Option<StreamObserver>,
+    response: Response<ProxyBody>,
+) -> Response<ProxyBody> {
+    match observer {
+        Some(observer) => observer.wrap_body(response, Transport::Http),
+        None => response,
+    }
+}
+
 fn resuming_response(request_id: &str, instance_id: &str) -> Response<ProxyBody> {
     let body = serde_json::json!({"error": {
         "code": "ENV_RESUMING", "message": "Environment readiness is pending; retry the same request",
@@ -183,6 +397,15 @@ struct CommandWatchMetrics {
     downstream_streams: std::sync::atomic::AtomicU64,
 }
 
+/// 全流族存储：[route_class][transport][outcome] 的 B15 直方图＋中断计数。
+/// outcome 维度长度 4 ＝ `adx_core::observation::Outcome` 变体数（单测锁定）。
+#[derive(Default)]
+struct FullStreamMetrics {
+    duration: [[[adx_observability::metrics::AtomicHistogram<15>; 4]; Transport::COUNT];
+        RouteClass::COUNT],
+    aborted: [[AtomicU64; AbortReason::COUNT]; RouteClass::COUNT],
+}
+
 #[derive(Default)]
 struct IngressRequestMetrics {
     traffic: Arc<crate::common::traffic::TrafficMeter>,
@@ -197,6 +420,7 @@ struct IngressRequestMetrics {
     duration_us_total: AtomicU64,
     duration_buckets: [AtomicU64; REQUEST_DURATION_BUCKETS_US.len()],
     duration_overflow: AtomicU64,
+    full_stream: FullStreamMetrics,
 }
 
 impl IngressRequestMetrics {
@@ -223,12 +447,29 @@ impl IngressRequestMetrics {
         }
     }
 
-    fn prometheus(&self) -> String {
+    /// 每条流恰好一次：全流样本＋（若有）中断计数。
+    fn observe_stream(
+        &self,
+        route_class: RouteClass,
+        transport: Transport,
+        outcome: adx_core::observation::Outcome,
+        seconds: f64,
+        abort: Option<AbortReason>,
+    ) {
+        self.full_stream.duration[route_class as usize][transport as usize][outcome as usize]
+            .observe(&adx_observability::metrics::B15, seconds);
+        if let Some(reason) = abort {
+            self.full_stream.aborted[route_class as usize][reason as usize]
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn prometheus(&self, full_stream: bool) -> String {
         let total = self.total.load(Ordering::Relaxed);
         let mut output = format!(
-            "data_plane_ingress_http_requests_in_flight {}\n\
-data_plane_ingress_http_requests_total {}\n\
-data_plane_ingress_http_responses_total{{class=\"2xx\"}} {}\n\
+            "# TYPE data_plane_ingress_http_requests_in_flight gauge\ndata_plane_ingress_http_requests_in_flight {}\n\
+# TYPE data_plane_ingress_http_requests_total counter\ndata_plane_ingress_http_requests_total {}\n\
+# TYPE data_plane_ingress_http_responses_total counter\ndata_plane_ingress_http_responses_total{{class=\"2xx\"}} {}\n\
 data_plane_ingress_http_responses_total{{class=\"3xx\"}} {}\n\
 data_plane_ingress_http_responses_total{{class=\"4xx\"}} {}\n\
 data_plane_ingress_http_responses_total{{class=\"5xx\"}} {}\n\
@@ -248,6 +489,10 @@ data_plane_ingress_http_responses_total{{class=\"other\"}} {}\n",
             self.responses_1xx.load(Ordering::Relaxed)
         );
         let _ = writeln!(output, "# TYPE data_plane_ingress_frontend_bytes_total counter\ndata_plane_ingress_frontend_bytes_total{{direction=\"received\"}} {received}\ndata_plane_ingress_frontend_bytes_total{{direction=\"sent\"}} {sent}");
+        let _ = writeln!(
+            output,
+            "# TYPE data_plane_ingress_http_request_duration_seconds histogram"
+        );
         let mut cumulative = 0;
         for ((label, _), bucket) in REQUEST_DURATION_BUCKETS_US
             .iter()
@@ -272,6 +517,44 @@ data_plane_ingress_http_responses_total{{class=\"other\"}} {}\n",
             output,
             "data_plane_ingress_http_request_duration_seconds_count {total}"
         );
+        // 全流族稠密导出（含全零组合），经共享渲染器声明 HELP/TYPE。
+        // 开关关闭时不导出。
+        if full_stream {
+            let mut families = adx_observability::metrics::Text::default();
+            for route_class in RouteClass::ALL {
+                for transport in Transport::ALL {
+                    for outcome in adx_core::observation::Outcome::ALL {
+                        let snapshot = self.full_stream.duration[route_class as usize]
+                            [transport as usize][*outcome as usize]
+                            .snapshot();
+                        families.histogram(
+                            "data_plane_ingress_full_stream_duration_seconds",
+                            "Full stream lifetime from request headers to body or tunnel end",
+                            &[
+                                ("route_class", route_class.as_str().to_owned()),
+                                ("transport", transport.as_str().to_owned()),
+                                ("outcome", outcome.as_str().to_owned()),
+                            ],
+                            &adx_observability::metrics::B15,
+                            &snapshot,
+                        );
+                    }
+                }
+                for reason in AbortReason::ALL {
+                    families.counter(
+                        "data_plane_ingress_stream_aborted_total",
+                        "Streams that ended before clean completion",
+                        &[
+                            ("route_class", route_class.as_str().to_owned()),
+                            ("reason", reason.as_str().to_owned()),
+                        ],
+                        self.full_stream.aborted[route_class as usize][reason as usize]
+                            .load(Ordering::Relaxed),
+                    );
+                }
+            }
+            output.push_str(&families.finish());
+        }
         output
     }
 }
@@ -358,6 +641,8 @@ pub struct Ingress {
     port_host_domain: Option<String>,
     e2b_enabled: bool,
     e2b_allow_http: bool,
+    full_stream: bool,
+    experience_metrics: Arc<super::experience::ExperienceMetrics>,
     frontend_address: String,
     reverse_proxy: ReverseProxy,
     proxy_routes: Arc<Vec<ProxyRoute>>,
@@ -372,6 +657,15 @@ pub struct Ingress {
     command_watch_config: CommandWatchConfig,
     command_watch_metrics: Arc<CommandWatchMetrics>,
     request_metrics: Arc<IngressRequestMetrics>,
+    /// 业务观测聚合器（M2-5，§6.10）；未启用时 None。
+    #[cfg(feature = "agent-api")]
+    observation_aggregator: Option<Arc<super::observability::Aggregator>>,
+    /// 业务事件发射器（M2-4b，§6.4）；未启用时 None。
+    #[cfg(feature = "agent-api")]
+    observation_sink: Option<Arc<super::observability::ObservationSink>>,
+    /// 观测接收端点状态（M2-2）；仅用于接收质量族渲染。
+    #[cfg(feature = "agent-api")]
+    observation_ingest: Option<Arc<super::observability::IngestState>>,
 }
 
 impl Ingress {
@@ -400,6 +694,8 @@ impl Ingress {
             port_host_domain: None,
             e2b_enabled: false,
             e2b_allow_http: false,
+            full_stream: true,
+            experience_metrics: Arc::new(super::experience::ExperienceMetrics::default()),
             frontend_address: frontend_address.into(),
             reverse_proxy: ReverseProxy::new(ReverseProxyConfig::default()),
             proxy_routes: Arc::new(Vec::new()),
@@ -414,7 +710,43 @@ impl Ingress {
             command_watch_config: CommandWatchConfig::default(),
             command_watch_metrics: Arc::new(CommandWatchMetrics::default()),
             request_metrics: Arc::new(IngressRequestMetrics::default()),
+            #[cfg(feature = "agent-api")]
+            observation_aggregator: None,
+            #[cfg(feature = "agent-api")]
+            observation_sink: None,
+            #[cfg(feature = "agent-api")]
+            observation_ingest: None,
         }
+    }
+
+    /// 观测接收端点状态（M2-2）：用于 `/metrics` 的接收质量族。
+    #[cfg(feature = "agent-api")]
+    pub fn with_observation_ingest(
+        mut self,
+        ingest: Option<Arc<super::observability::IngestState>>,
+    ) -> Self {
+        self.observation_ingest = ingest;
+        self
+    }
+
+    /// 业务观测聚合器（M2-5）：启用后 `/metrics` 追加业务导出与质量族。
+    #[cfg(feature = "agent-api")]
+    pub fn with_observation_aggregator(
+        mut self,
+        aggregator: Option<Arc<super::observability::Aggregator>>,
+    ) -> Self {
+        self.observation_aggregator = aggregator;
+        self
+    }
+
+    /// 业务事件发射器（M2-4b）：挂点到 `/metrics` 的发射质量族，锚点携带。
+    #[cfg(feature = "agent-api")]
+    pub fn with_observation_sink(
+        mut self,
+        sink: Option<Arc<super::observability::ObservationSink>>,
+    ) -> Self {
+        self.observation_sink = sink;
+        self
     }
 
     #[cfg(feature = "agent-api")]
@@ -482,6 +814,71 @@ impl Ingress {
         self
     }
 
+    /// 全流观测开关；关闭时仅保留请求族计数。
+    pub fn with_full_stream_observation(mut self, enabled: bool) -> Self {
+        self.full_stream = enabled;
+        self
+    }
+
+    /// 体验族锚点；template 超基数上限由存储归 `other`。
+    /// 事件发射器（若启用）随锚点下发，`userRef` 在这里做 HMAC。
+    #[cfg(feature = "agent-api")]
+    pub(crate) fn experience_anchor(
+        &self,
+        template_release: &str,
+        started: tokio::time::Instant,
+        tenant_ref: &str,
+        user_id: &str,
+    ) -> Option<super::experience::ExperienceAnchor> {
+        Some(super::experience::ExperienceAnchor::new(
+            Arc::clone(&self.experience_metrics),
+            self.observation_sink.clone(),
+            template_release,
+            started,
+            tenant_ref,
+            user_id,
+        ))
+    }
+
+    /// 渲染体验族四族。
+    pub(crate) fn render_experience(&self) -> String {
+        let mut text = adx_observability::metrics::Text::default();
+        self.experience_metrics.render(&mut text);
+        text.finish()
+    }
+
+    /// 业务事件发射器（M2-4b/M2-4c）：适配器动作事件使用。
+    #[cfg(feature = "agent-api")]
+    pub(crate) fn observation_sink(&self) -> Option<Arc<super::observability::ObservationSink>> {
+        self.observation_sink.clone()
+    }
+
+    /// 渲染业务观测族（聚合导出 + 发射/接收质量）；未启用时返回空串。
+    #[cfg(feature = "agent-api")]
+    pub(crate) fn render_observation(&self) -> String {
+        if self.observation_aggregator.is_none()
+            && self.observation_sink.is_none()
+            && self.observation_ingest.is_none()
+        {
+            return String::new();
+        }
+        let mut text = adx_observability::metrics::Text::default();
+        if let Some(aggregator) = &self.observation_aggregator {
+            aggregator.render(&mut text);
+        }
+        if let Some(sink) = &self.observation_sink {
+            sink.render(&mut text);
+        }
+        if let Some(ingest) = &self.observation_ingest {
+            ingest.render(&mut text);
+        }
+        text.finish()
+    }
+
+    /// 资源利用率不在此导出：`adx_environment_*` 已由 Coordinator/adxlet 采集，
+    /// 目录 × 分配 × 用量的 join 由既有 Prometheus 与 `adx-environments` 看板
+    /// 完成（含 `adx_env`/`runtime_id`/`stats_age` 全键与新鲜度校验），
+    /// ingress 不再重复实现一遍。
     #[cfg(feature = "agent-api")]
     pub fn with_execd_access(mut self, access: Arc<super::environment_files::ExecdAccess>) -> Self {
         self.execd_access = Some(access);
@@ -1021,6 +1418,16 @@ impl Ingress {
                     tokio::spawn(async move {
                         let service = service_fn(move |request: Request<Incoming>| {
                             let response = gateway.health_response(request.uri().path());
+                            // health 口请求同样计入全流（internal_health / http）。
+                            let response = if gateway.full_stream {
+                                StreamObserver::new(
+                                    &gateway.request_metrics,
+                                    RouteClass::InternalHealth,
+                                )
+                                .wrap_body(response, Transport::Http)
+                            } else {
+                                response
+                            };
                             async move { Ok::<_, Infallible>(response) }
                         });
                         if let Err(error) = hyper::server::conn::http1::Builder::new()
@@ -1041,9 +1448,20 @@ impl Ingress {
         ingress_security: IngressSecurity,
         peer: std::net::SocketAddr,
     ) -> Result<Response<ProxyBody>, Infallible> {
+        let started = Instant::now();
         let processing = match ProcessingDeadline::from_headers(request.headers()) {
             Ok(deadline) => deadline,
-            Err(message) => return Ok(plain(StatusCode::BAD_REQUEST, message)),
+            Err(message) => {
+                // 早 400 也是一次请求：入口拒绝计入请求族。
+                self.request_metrics
+                    .observe(StatusCode::BAD_REQUEST, elapsed_us(started));
+                let response = plain(StatusCode::BAD_REQUEST, message);
+                let response = match self.new_stream_observer(&request) {
+                    Some(observer) => observer.wrap_body(response, Transport::Http),
+                    None => response,
+                };
+                return Ok(response);
+            }
         };
         let budgeted = request.headers().contains_key(TIMEOUT_HEADER);
         request.headers_mut().remove(TIMEOUT_HEADER);
@@ -1089,6 +1507,29 @@ impl Ingress {
         } else {
             None
         };
+        // `self` 会被下方闭包移入 handle_http_inner；出口观测点需独立持有指标句柄。
+        let request_metrics = Arc::clone(&self.request_metrics);
+        let is_connect = request.method() == http::Method::CONNECT;
+        let mut stream_observer = self.new_stream_observer(&request);
+        // WS（command-watch）与 CONNECT 的流挂在连接生命周期上：观察者随请求传入
+        // 内层处理器，由会话/隧道任务在关闭时记录（详设 §6.2 挂点表）。
+        let lifecycle_stream = is_connect
+            || stream_observer
+                .as_ref()
+                .is_some_and(|observer| observer.route_class == RouteClass::CommandWatch);
+        if lifecycle_stream {
+            if let Some(observer) = stream_observer.take() {
+                request.extensions_mut().insert(observer);
+            }
+        }
+        // 带升级头的请求：克隆一份观察者随请求传入（M1-9）。101 时外层不包体，
+        // 由升级拷贝任务记录；非 101 时外层包原件记录，extensions 份被取出后
+        // 静默丢弃——StreamObserver 无 Drop，丢弃即不记录，两路互斥、恰好一次。
+        if request.headers().contains_key(header::UPGRADE) {
+            if let Some(observer) = stream_observer.as_ref() {
+                request.extensions_mut().insert(observer.clone());
+            }
+        }
         trace
             .run(async {
                 adx_observability::trace::inject_headers(request.headers_mut());
@@ -1122,6 +1563,17 @@ impl Ingress {
                         DeadlineBody::new(body, processing.at).boxed_unsync(),
                     );
                 }
+                if let Some(observer) = stream_observer {
+                    // 101 无 body 可包：其全流样本由升级拷贝任务记录（观察者已随
+                    // extensions 传入，M1-9）；lifecycle 请求（WS/CONNECT）同样已移交。
+                    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+                        let transport = transport_of(&response);
+                        response = observer.wrap_body(response, transport);
+                    }
+                }
+                // 唯一观测点。早 400 分支在入口单独观测；其余路径——
+                // 含外层超时 504 与 ENV_RESUMING 重写后的最终状态——在此恰好一次。
+                request_metrics.observe(response.status(), elapsed_us(started));
                 adx_observability::trace::attribute(
                     "http.response.status_code",
                     response.status().as_u16().to_string(),
@@ -1267,7 +1719,7 @@ impl Ingress {
         };
         let status = response.status();
         let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        self.request_metrics.observe(status, duration_us);
+        // M0：observe 已迁往 handle_http 外层出口；此处仅供访问日志。
         let security = ingress_security_name(ingress_security);
         if should_log_access(status, duration_us) {
             tracing::info!(
@@ -1405,6 +1857,31 @@ impl Ingress {
             .unwrap_or(("unmatched", String::new(), 0))
     }
 
+    /// 全流观测的请求分类（详设 §6.2 路由分类表；与内层 dispatch 的路径判定同源）。
+    fn route_class_of<B>(&self, request: &Request<B>) -> RouteClass {
+        let path = request.uri().path();
+        if path == COMMAND_WATCH_PATH {
+            return RouteClass::CommandWatch;
+        }
+        #[cfg(feature = "agent-api")]
+        if self.digitalmategateway_api.is_some()
+            && super::digitalmategateway::entrypoint::DigitalMateGatewayApi::matches(path)
+        {
+            return RouteClass::Jiuwen;
+        }
+        if self.access_fields(request).0 == "unmatched" {
+            RouteClass::Unmatched
+        } else {
+            RouteClass::EnvironmentApi
+        }
+    }
+
+    /// 观测开启时为请求创建全流观察者；关闭时返回 None（保留请求族计数）。
+    fn new_stream_observer<B>(&self, request: &Request<B>) -> Option<StreamObserver> {
+        self.full_stream
+            .then(|| StreamObserver::new(&self.request_metrics, self.route_class_of(request)))
+    }
+
     fn port_host_route<B>(&self, request: &Request<B>) -> Option<ParsedDirectPath> {
         if request.method() == http::Method::CONNECT {
             return None;
@@ -1515,8 +1992,33 @@ impl Ingress {
                 let pool = self.http_pool.metrics();
                 // Embedded Ingress exports the API Server's owning PID only once.
                 let process_metrics = adx_observability::process::metrics();
+                let experience = self.render_experience();
+                #[cfg(feature = "agent-api")]
+                let observation = self.render_observation();
+                #[cfg(not(feature = "agent-api"))]
+                let observation = String::new();
                 format!(
-                    "data_plane_ingress_ready {}\ndata_plane_ingress_route_cache_entries {}\ndata_plane_ingress_route_watch_revision {}\ndata_plane_ingress_route_watch_lag_seconds {}\ndata_plane_ingress_route_point_get_total {}\ndata_plane_ingress_active_sessions {}\ndata_plane_ingress_h2_physical_connections {}\ndata_plane_ingress_route_forced_close_total {}\ndata_plane_ingress_backend_http_idle_connections {}\ndata_plane_ingress_backend_http_opened_total {}\ndata_plane_ingress_backend_http_reused_total {}\ndata_plane_ingress_backend_http_discarded_total {}\ndata_plane_ingress_backend_http_acquire_timeouts_total {}\n{}command_watch_connections {}\ncommand_watch_subscriptions {}\ncommand_watch_environments {}\ncommand_watch_reconnects {}\ncommand_watch_auth_failures {}\ncommand_watch_downstream_streams {}\n{process_metrics}",
+                    "data_plane_ingress_ready {}\n\
+                     data_plane_ingress_route_cache_entries {}\n\
+                     data_plane_ingress_route_watch_revision {}\n\
+                     data_plane_ingress_route_watch_lag_seconds {}\n\
+                     data_plane_ingress_route_point_get_total {}\n\
+                     data_plane_ingress_active_sessions {}\n\
+                     data_plane_ingress_h2_physical_connections {}\n\
+                     data_plane_ingress_route_forced_close_total {}\n\
+                     data_plane_ingress_backend_http_idle_connections {}\n\
+                     data_plane_ingress_backend_http_opened_total {}\n\
+                     data_plane_ingress_backend_http_reused_total {}\n\
+                     data_plane_ingress_backend_http_discarded_total {}\n\
+                     data_plane_ingress_backend_http_acquire_timeouts_total {}\n\
+                     {}command_watch_connections {}\n\
+                     command_watch_subscriptions {}\n\
+                     command_watch_environments {}\n\
+                     command_watch_reconnects {}\n\
+                     command_watch_auth_failures {}\n\
+                     command_watch_downstream_streams {}\n\
+                     {process_metrics}\n\
+                     {experience}{observation}",
                     usize::from(self.ready()),
                     self.resolver.cache_len(),
                     self.resolver.watch_revision(),
@@ -1530,14 +2032,16 @@ impl Ingress {
                     pool.reused_total,
                     pool.discarded_total,
                     pool.acquire_timeouts_total,
-                    self.request_metrics.prometheus(),
+                    self.request_metrics.prometheus(self.full_stream),
                     self.command_watch_metrics
                         .connections
                         .load(Ordering::Relaxed),
                     self.command_watch_metrics
                         .subscriptions
                         .load(Ordering::Relaxed),
-                    self.command_watch_metrics.environments.load(Ordering::Relaxed),
+                    self.command_watch_metrics
+                        .environments
+                        .load(Ordering::Relaxed),
                     self.command_watch_metrics
                         .reconnects
                         .load(Ordering::Relaxed),
@@ -1558,11 +2062,15 @@ impl Ingress {
         request: &mut Request<Incoming>,
         ingress_security: IngressSecurity,
     ) -> Response<ProxyBody> {
+        let observer = request.extensions_mut().remove::<StreamObserver>();
         if request.method() != http::Method::GET {
-            return plain(StatusCode::METHOD_NOT_ALLOWED, "command watch requires GET");
+            return observed(
+                observer,
+                plain(StatusCode::METHOD_NOT_ALLOWED, "command watch requires GET"),
+            );
         }
         if ingress_security == IngressSecurity::Plaintext {
-            return tls_required();
+            return observed(observer, tls_required());
         }
         if !request
             .headers()
@@ -1570,7 +2078,10 @@ impl Ingress {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
         {
-            return plain(StatusCode::BAD_REQUEST, "websocket upgrade is required");
+            return observed(
+                observer,
+                plain(StatusCode::BAD_REQUEST, "websocket upgrade is required"),
+            );
         }
         let key = match request
             .headers()
@@ -1578,7 +2089,12 @@ impl Ingress {
             .and_then(|value| value.to_str().ok())
         {
             Some(key) => key.to_owned(),
-            None => return plain(StatusCode::BAD_REQUEST, "missing sec-websocket-key"),
+            None => {
+                return observed(
+                    observer,
+                    plain(StatusCode::BAD_REQUEST, "missing sec-websocket-key"),
+                )
+            }
         };
         let identity = match self
             .authenticator
@@ -1590,7 +2106,7 @@ impl Ingress {
                 self.command_watch_metrics
                     .auth_failures
                     .fetch_add(1, Ordering::Relaxed);
-                return plain(error.status(), &error.to_string());
+                return observed(observer, plain(error.status(), &error.to_string()));
             }
         };
         let upgraded = hyper::upgrade::on(request);
@@ -1606,18 +2122,43 @@ impl Ingress {
                         None,
                     )
                     .await;
-                    if let Err(error) = gateway
+                    let result = gateway
                         .run_external_command_watch(
                             websocket,
                             identity.tenant_id,
                             identity.expires_at_unix,
                         )
-                        .await
-                    {
+                        .await;
+                    if let Err(error) = &result {
                         tracing::debug!(%error, "external command watch closed");
                     }
+                    if let Some(observer) = observer {
+                        // 正常关闭＝unknown（关闭套接字不是完成一次交换的证据）；
+                        // 异常关闭＝failure，中断原因不可区分记 unknown（详设挂点表）。
+                        match result {
+                            Ok(()) => observer.record(
+                                Transport::Ws,
+                                adx_core::observation::Outcome::Unknown,
+                                None,
+                            ),
+                            Err(_) => observer.record(
+                                Transport::Ws,
+                                adx_core::observation::Outcome::Failure,
+                                Some(AbortReason::Unknown),
+                            ),
+                        }
+                    }
                 }
-                Err(error) => tracing::debug!(%error, "command watch upgrade failed"),
+                Err(error) => {
+                    tracing::debug!(%error, "command watch upgrade failed");
+                    if let Some(observer) = observer {
+                        observer.record(
+                            Transport::Ws,
+                            adx_core::observation::Outcome::Failure,
+                            Some(AbortReason::ClientClosed),
+                        );
+                    }
+                }
             }
         }));
         let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
@@ -1872,9 +2413,10 @@ impl Ingress {
         match self.open_resolved_stream(route, &tenant_id).await {
             Ok(mut upstream) => {
                 let cancelled = upstream.cancelled.clone();
-                let on_upgrade = hyper::upgrade::on(request);
+                let on_upgrade = hyper::upgrade::on(&mut *request);
                 let stream_started = Instant::now();
                 let access_kind = access_kind.as_str();
+                let observer = request.extensions_mut().remove::<StreamObserver>();
                 // The CONNECT byte pump outlives the entry span; keep the
                 // captured context so the stream-close log carries trace_id.
                 tokio::spawn(adx_observability::trace::with_current_context(async move {
@@ -1897,33 +2439,52 @@ impl Ingress {
                     let duration_ms =
                         u64::try_from(stream_started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     match result {
-                        Ok((bytes_up, bytes_down)) => tracing::info!(
-                            target: "adx_access",
-                            event = "stream_close",
-                            request_id = %request_id,
-                            peer = %peer,
-                            access_kind,
-                            instance_id = %instance_id,
-                            target_port,
-                            outcome = "complete",
-                            bytes_up,
-                            bytes_down,
-                            duration_ms,
-                            "Ingress CONNECT stream closed"
-                        ),
-                        Err(error) => tracing::warn!(
-                            target: "adx_access",
-                            event = "stream_close",
-                            request_id = %request_id,
-                            peer = %peer,
-                            access_kind,
-                            instance_id = %instance_id,
-                            target_port,
-                            outcome = "error",
-                            error = %error,
-                            duration_ms,
-                            "Ingress CONNECT stream closed"
-                        ),
+                        Ok((bytes_up, bytes_down)) => {
+                            tracing::info!(
+                                target: "adx_access",
+                                event = "stream_close",
+                                request_id = %request_id,
+                                peer = %peer,
+                                access_kind,
+                                instance_id = %instance_id,
+                                target_port,
+                                outcome = "complete",
+                                bytes_up,
+                                bytes_down,
+                                duration_ms,
+                                "Ingress CONNECT stream closed"
+                            );
+                            if let Some(observer) = observer {
+                                observer.record(
+                                    Transport::Connect,
+                                    adx_core::observation::Outcome::Success,
+                                    None,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "adx_access",
+                                event = "stream_close",
+                                request_id = %request_id,
+                                peer = %peer,
+                                access_kind,
+                                instance_id = %instance_id,
+                                target_port,
+                                outcome = "error",
+                                error = %error,
+                                duration_ms,
+                                "Ingress CONNECT stream closed"
+                            );
+                            if let Some(observer) = observer {
+                                // 异常关闭＝unknown，原因不可区分（详设挂点表）。
+                                observer.record(
+                                    Transport::Connect,
+                                    adx_core::observation::Outcome::Unknown,
+                                    Some(AbortReason::Unknown),
+                                );
+                            }
+                        }
                     }
                 }));
                 empty(StatusCode::OK)
@@ -2833,6 +3394,8 @@ where
 {
     let upgrade_requested = request.headers().contains_key(header::UPGRADE);
     let downstream_upgrade = upgrade_requested.then(|| hyper::upgrade::on(&mut request));
+    // M1-9：升级请求的观察者随 extensions 传入（外层插入克隆），发出前取出。
+    let observer = request.extensions_mut().remove::<StreamObserver>();
     let (mut sender, connection) =
         match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await {
             Ok(parts) => parts,
@@ -2863,10 +3426,13 @@ where
         if let Some(downstream_upgrade) = downstream_upgrade {
             let upstream_upgrade = hyper::upgrade::on(&mut response);
             tokio::spawn(async move {
+                // 升级失败按侧别携带错误类别：下游→NotConnected（client_closed）、
+                // 上游→其他（protocol_error）；路由取消由 relay_until_cancelled 以
+                // ConnectionAborted 返回（详设 M1-9 记录规则）。
                 let relay = async move {
-                    let downstream = downstream_upgrade
-                        .await
-                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    let downstream = downstream_upgrade.await.map_err(|error| {
+                        io::Error::new(io::ErrorKind::NotConnected, error.to_string())
+                    })?;
                     let upstream = upstream_upgrade
                         .await
                         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -2880,7 +3446,35 @@ where
                     )
                     .await
                 };
-                let _ = relay_until_cancelled(relay, cancelled).await;
+                let result = relay_until_cancelled(relay, cancelled).await;
+                if let Some(observer) = observer {
+                    // 正常结束＝unknown（关 socket 不是完成交换的证据）；
+                    // success 对代理升级永不导出（详设 M1-9）。
+                    match result {
+                        Ok(_) => observer.record(
+                            Transport::Ws,
+                            adx_core::observation::Outcome::Unknown,
+                            None,
+                        ),
+                        Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => observer
+                            .record(
+                                Transport::Ws,
+                                adx_core::observation::Outcome::Failure,
+                                Some(AbortReason::Unknown),
+                            ),
+                        Err(error) if error.kind() == io::ErrorKind::NotConnected => observer
+                            .record(
+                                Transport::Ws,
+                                adx_core::observation::Outcome::Failure,
+                                Some(AbortReason::ClientClosed),
+                            ),
+                        Err(_) => observer.record(
+                            Transport::Ws,
+                            adx_core::observation::Outcome::Failure,
+                            Some(AbortReason::ProtocolError),
+                        ),
+                    }
+                }
             });
         }
     }
@@ -3267,6 +3861,10 @@ fn empty_body() -> ProxyBody {
         .boxed_unsync()
 }
 
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 fn plain(status: StatusCode, body: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
@@ -3285,6 +3883,15 @@ mod tests {
     use crate::common::protocol::ConnectTarget;
     use crate::common::route::{DataPlaneAuthMode, DataPlaneSecurityMode};
     use crate::ingress::{H2PoolConfig, RouteStore};
+
+    #[test]
+    fn full_stream_storage_dimensions_match_label_enums() {
+        // FullStreamMetrics 的数组维度与枚举值集必须一致，否则稠密导出错位。
+        assert_eq!(adx_core::observation::Outcome::ALL.len(), 4);
+        assert_eq!(Transport::COUNT, Transport::ALL.len());
+        assert_eq!(RouteClass::COUNT, RouteClass::ALL.len());
+        assert_eq!(AbortReason::COUNT, AbortReason::ALL.len());
+    }
 
     #[tokio::test]
     async fn preforward_route_change_is_retryable_but_other_connection_errors_are_not() {
@@ -3716,7 +4323,7 @@ mod tests {
         metrics.observe(StatusCode::BAD_REQUEST, 1_500);
         metrics.observe(StatusCode::SERVICE_UNAVAILABLE, 200_000);
 
-        let output = metrics.prometheus();
+        let output = metrics.prometheus(true);
         assert!(output.contains("data_plane_ingress_http_requests_total 3\n"));
         assert!(output.contains("data_plane_ingress_http_responses_total{class=\"2xx\"} 1\n"));
         assert!(output.contains("data_plane_ingress_http_responses_total{class=\"4xx\"} 1\n"));
@@ -3734,7 +4341,7 @@ mod tests {
         metrics.observe(StatusCode::OK, 2_000_000);
         metrics.observe(StatusCode::OK, 200_000_000);
 
-        let output = metrics.prometheus();
+        let output = metrics.prometheus(true);
         assert!(output
             .contains("data_plane_ingress_http_request_duration_seconds_bucket{le=\"0.250\"} 1\n"));
         assert!(output

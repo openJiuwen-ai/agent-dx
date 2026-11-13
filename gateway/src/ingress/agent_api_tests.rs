@@ -1717,6 +1717,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
         },
         requests,
         output,
+        None,
     ));
     backend.send(Message::Text(serde_json::json!({"type":"event","event":"connection.ack","payload":{"readiness":"WARMING"}}).to_string())).await.unwrap();
     assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
@@ -1738,6 +1739,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
         },
         second_requests,
         second_output,
+        None,
     ));
     second_backend.send(Message::Text(serde_json::json!({"type":"event","event":"connection.ack","payload":{"readiness":"WARMING"}}).to_string())).await.unwrap();
     assert_eq!(
@@ -1913,6 +1915,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
                     },
                     requests,
                     output,
+                    None,
                 ));
                 backend.send(Message::Text(serde_json::json!({"type":"event","event":"connection.ack","payload":{"readiness":"WARMING"}}).to_string())).await.unwrap();
                 assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");

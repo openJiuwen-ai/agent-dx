@@ -30,6 +30,8 @@ pub struct ServiceSelection {
     requested_port: Option<u16>,
     environment_id: String,
     generation: String,
+    /// 启动模式判定（Activator 回传；M2-4）。
+    start_mode: adx_agent_core::activator::ActivationKind,
     retried: bool,
     parameters: Option<Vec<u8>>,
 }
@@ -43,6 +45,16 @@ impl ServiceSelection {
             return Err(Error::Invalid("selected service is not WebSocket".into()));
         }
         Ok(self.port)
+    }
+
+    /// 启动模式判定（Activator 回传；M2-4 体验族标签）。
+    pub(crate) fn start_mode(&self) -> adx_agent_core::activator::ActivationKind {
+        self.start_mode
+    }
+
+    /// 已选中的权威环境身份（体验事件与下钻用）。
+    pub(crate) fn environment_id(&self) -> &str {
+        &self.environment_id
     }
 
     pub(crate) fn forwarding_uri(&self, backend_uri: &http::Uri) -> Result<http::Uri, Error> {
@@ -86,7 +98,7 @@ impl AgentV2Access {
         selector: ServiceSelector,
         parameters: Option<&[u8]>,
     ) -> Result<ServiceSelection, Error> {
-        let (target, port) = context
+        let (target, port, start_mode) = context
             .run(self.managed.resolve_with_parameters(
                 &context,
                 &scope,
@@ -104,6 +116,7 @@ impl AgentV2Access {
             requested_port: selector.port,
             environment_id: target.binding.current.environment_id,
             generation: target.binding.generation,
+            start_mode,
             retried: false,
             parameters: parameters.map(<[u8]>::to_vec),
         })
@@ -177,7 +190,7 @@ impl AgentV2Access {
                 }
                 // No WS handshake or business bytes have been sent. Reuse this
                 // admission's initialization input only if the Binding is missing.
-                selection
+                let (target, port, _start) = selection
                     .context
                     .run(self.managed.resolve_with_parameters(
                         &selection.context,
@@ -187,7 +200,8 @@ impl AgentV2Access {
                         selection.parameters.as_deref(),
                         true,
                     ))
-                    .await?
+                    .await?;
+                (target, port)
             }
             result => result?,
         };

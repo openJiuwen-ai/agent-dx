@@ -29,6 +29,9 @@ labels!(EvidenceSource {
     Coordinator => "coordinator", Control => "control", Unknown => "unknown",
 });
 labels!(OperationIntent { User => "user", Idle => "idle", Policy => "policy" });
+labels!(Outcome {
+    Success => "success", Failure => "failure", Cancelled => "cancelled", Unknown => "unknown",
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptionEvidence {

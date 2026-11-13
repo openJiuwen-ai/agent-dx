@@ -10,6 +10,8 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use super::server::{AbortReason, StreamObserver, Transport};
+
 type BoxError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 
@@ -232,6 +234,8 @@ impl ReverseProxy {
         {
             processing.forwarded();
         }
+        // 升级请求的观察者随 extensions 传入（外层插入克隆），发出前取出。
+        let observer = request.extensions_mut().remove::<StreamObserver>();
         let mut response = match self.client.request(request).await {
             Ok(response) => response,
             Err(error) => return bad_gateway(error),
@@ -247,16 +251,51 @@ impl ReverseProxy {
             }
             let upstream_upgrade = hyper::upgrade::on(&mut response);
             tokio::spawn(async move {
-                if let (Ok(downstream), Ok(upstream)) =
-                    tokio::join!(downstream_upgrade, upstream_upgrade)
-                {
-                    let (mut down_read, mut down_write) =
-                        tokio::io::split(TokioIo::new(downstream));
-                    let (mut up_read, mut up_write) = tokio::io::split(TokioIo::new(upstream));
-                    // WebSocket EOF/error ends the upgraded session in both directions.
-                    tokio::select! {
-                        _ = tokio::io::copy(&mut down_read, &mut up_write) => {},
-                        _ = tokio::io::copy(&mut up_read, &mut down_write) => {},
+                match tokio::join!(downstream_upgrade, upstream_upgrade) {
+                    (Ok(downstream), Ok(upstream)) => {
+                        let (mut down_read, mut down_write) =
+                            tokio::io::split(TokioIo::new(downstream));
+                        let (mut up_read, mut up_write) = tokio::io::split(TokioIo::new(upstream));
+                        // WebSocket EOF/error ends the upgraded session in both directions.
+                        // 正常结束＝unknown（关 socket 不是完成交换的证据）；success
+                        // 对代理升级永不导出；拷贝错误不按方向细分（详设 M1-9）。
+                        let result = tokio::select! {
+                            result = tokio::io::copy(&mut down_read, &mut up_write) => result,
+                            result = tokio::io::copy(&mut up_read, &mut down_write) => result,
+                        };
+                        if let Some(observer) = observer {
+                            match result {
+                                Ok(_) => observer.record(
+                                    Transport::Ws,
+                                    adx_core::observation::Outcome::Unknown,
+                                    None,
+                                ),
+                                Err(_) => observer.record(
+                                    Transport::Ws,
+                                    adx_core::observation::Outcome::Failure,
+                                    Some(AbortReason::ProtocolError),
+                                ),
+                            }
+                        }
+                    }
+                    // 升级建立前：下游断→client_closed，上游失败→protocol_error。
+                    (Err(_), _) => {
+                        if let Some(observer) = observer {
+                            observer.record(
+                                Transport::Ws,
+                                adx_core::observation::Outcome::Failure,
+                                Some(AbortReason::ClientClosed),
+                            );
+                        }
+                    }
+                    (Ok(_), Err(_)) => {
+                        if let Some(observer) = observer {
+                            observer.record(
+                                Transport::Ws,
+                                adx_core::observation::Outcome::Failure,
+                                Some(AbortReason::ProtocolError),
+                            );
+                        }
                     }
                 }
             });
