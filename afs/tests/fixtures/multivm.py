@@ -613,17 +613,21 @@ class Cluster:
             self.record("topology." + role, mount)
 
     def path_visibility_limit(self, role):
-        """Seconds a path-only query on `role` may lag another Node: the DFS
-        kernel entry/attribute TTL from its effective config plus one second."""
+        """Seconds a path-only query on `role` may lag another Node.
+
+        The DFS kernel entry/attribute TTL from its effective config plus one second.
+        """
         ttl_ms = self.effective.get(role, {}).get("dfs_kernel_cache_ttl_ms", 0) or 0
         return (ttl_ms + 1000) / 1000
 
     def poll_python(self, role, condition, *args, label, setup=""):
-        """Poll a path-only `condition` (a Python expression over `a`, the
-        string arguments) on `role` until it holds or the configured path
-        visibility limit passes, then assert it and record the delay. Use only
-        for path queries (exists, stat by path, listdir, permission checks at
-        open); what a reader does after OPEN is asserted strictly."""
+        """Poll a path-only `condition` on `role` until it holds or the path visibility limit passes.
+
+        `condition` is a Python expression over `a`, the string arguments. On
+        timeout it is asserted; the delay is recorded. Use only for path queries
+        (exists, stat by path, listdir, permission checks at open); what a reader
+        does after OPEN is asserted strictly.
+        """
         limit = self.path_visibility_limit(role)
         code = (
             "import time\n" + setup + "\na=sys.argv[2:];t=time.monotonic();d=t+float(sys.argv[1])\n"

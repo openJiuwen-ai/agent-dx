@@ -11,6 +11,7 @@ this proves cross-client semantics, not cross-VM isolation.
 """
 
 import json
+import posixpath
 import time
 
 from fixtures.common import Case, DfsProfile
@@ -45,7 +46,6 @@ def _release(c, role, name, holder):
     c.python(role, 'open(sys.argv[1],"w").write("{}")', holder + "/go.json")
     _wait_file(c, role, holder + "/done.json")
     c.channel(role).call("wait", role=name)
-    import json
     return json.loads(c.python(role, 'print(open(sys.argv[1]).read())', holder + "/done.json")["stdout"])
 
 
@@ -110,7 +110,7 @@ def close_mtime_visibility_today(c):
     """
     c.write("A", "sem-mtime", b"x")
     time.sleep(1.2)
-    path = c.workspace("B") + "/sem-mtime"
+    path = posixpath.join(c.workspace("B"), "sem-mtime")
     before = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)", path)["stdout"])
     # write without fsync, then close: FUSE flush commits DataOnly.
     c.python("A", 'f=open(sys.argv[1],"ab");f.write(b"y");f.close()', c.workspace("A") + "/sem-mtime")

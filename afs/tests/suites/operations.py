@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import posixpath
 import stat
 import time
 from fixtures.common import Blocked, is_single_host
@@ -83,7 +84,9 @@ def read_write(c):
     )
     for role in readers:
         # Path-only query: may lag A by one kernel entry TTL (see c.poll_python).
-        c.poll_python(role, "not os.path.exists(a[0])", c.workspace(role) + "/cross.bin", label="unlink." + role)
+        c.poll_python(
+            role, "not os.path.exists(a[0])", posixpath.join(c.workspace(role), "cross.bin"), label="unlink." + role
+        )
 
 
 def namespace(c):
@@ -94,7 +97,7 @@ def namespace(c):
     c.python(
         "B", "assert os.stat(sys.argv[1]).st_size==9;os.rename(sys.argv[1],sys.argv[2])", b + "/dir/old", b + "/dir/new"
     )
-    c.poll_python("A", "not os.path.exists(a[0])", a + "/dir/old", label="rename_source_gone.A")
+    c.poll_python("A", "not os.path.exists(a[0])", posixpath.join(a, "dir", "old"), label="rename_source_gone.A")
     c.python(
         "A",
         'f=open(sys.argv[1],"r+b");f.truncate(3);f.flush();os.fsync(f.fileno());f.close()',
@@ -102,7 +105,7 @@ def namespace(c):
     )
     c.read("B", "dir/new", b"nam")
     c.python("B", "os.unlink(sys.argv[1]);os.rmdir(sys.argv[2])", b + "/dir/new", b + "/dir")
-    c.poll_python("A", "not os.path.exists(a[0])", a + "/dir", label="rmdir.A")
+    c.poll_python("A", "not os.path.exists(a[0])", posixpath.join(a, "dir"), label="rmdir.A")
     c.python(
         "A",
         (
@@ -130,12 +133,12 @@ def permissions(c):
     if c.mode == "dfs":
         # The permission check at open uses the kernel's cached mode: another
         # Node's chmod may take one kernel attribute TTL to apply here.
-        c.poll_python("B", "not readable(a[0])", c.workspace("B") + "/private", label="chmod_tighten.B",
+        c.poll_python("B", "not readable(a[0])", posixpath.join(c.workspace("B"), "private"), label="chmod_tighten.B",
                       setup=READABLE)
     c.python("B", denied, c.workspace("B") + "/private")
     c.python("A", "os.chmod(sys.argv[1],0o600)", c.workspace("A") + "/private")
     if c.mode == "dfs":
-        c.poll_python("B", "readable(a[0])", c.workspace("B") + "/private", label="chmod_loosen.B",
+        c.poll_python("B", "readable(a[0])", posixpath.join(c.workspace("B"), "private"), label="chmod_loosen.B",
                       setup=READABLE)
     c.read("B", "private", b"permissions")
     if c.mode == "ownerfs":
@@ -175,18 +178,22 @@ def visibility(c):
 
 
 def uncached_path_visibility(c):
-    """`dfs_kernel_cache_ttl_ms = 0` restores the uncached contract: another
-    Node's unlink, rename and chmod are visible to path queries at once."""
+    """`dfs_kernel_cache_ttl_ms = 0` restores the uncached contract.
+
+    Another Node's unlink, rename and chmod are visible to path queries at once.
+    """
     a, b = c.workspace("A"), c.workspace("B")
     c.write("A", "uncached", b"uncached")
-    c.python("B", "assert os.stat(sys.argv[1]).st_size==8", b + "/uncached")
-    c.python("A", "os.rename(sys.argv[1],sys.argv[2])", a + "/uncached", a + "/uncached-new")
+    c.python("B", "assert os.stat(sys.argv[1]).st_size==8", posixpath.join(b, "uncached"))
+    c.python(
+        "A", "os.rename(sys.argv[1],sys.argv[2])", posixpath.join(a, "uncached"), posixpath.join(a, "uncached-new")
+    )
     c.python("B", "assert not os.path.exists(sys.argv[1]);assert os.path.exists(sys.argv[2])",
-             b + "/uncached", b + "/uncached-new")
-    c.python("A", "os.chmod(sys.argv[1],0)", a + "/uncached-new")
-    c.python("B", READABLE + "\nassert not readable(sys.argv[1])", b + "/uncached-new")
-    c.python("A", "os.unlink(sys.argv[1])", a + "/uncached-new")
-    c.python("B", "assert not os.path.exists(sys.argv[1])", b + "/uncached-new")
+             posixpath.join(b, "uncached"), posixpath.join(b, "uncached-new"))
+    c.python("A", "os.chmod(sys.argv[1],0)", posixpath.join(a, "uncached-new"))
+    c.python("B", READABLE + "\nassert not readable(sys.argv[1])", posixpath.join(b, "uncached-new"))
+    c.python("A", "os.unlink(sys.argv[1])", posixpath.join(a, "uncached-new"))
+    c.python("B", "assert not os.path.exists(sys.argv[1])", posixpath.join(b, "uncached-new"))
     c.record("uncached_path_visibility", {"limit_s": c.path_visibility_limit("B")})
 
 
