@@ -1092,7 +1092,9 @@ impl Ingress {
         trace
             .run(async {
                 adx_observability::trace::inject_headers(request.headers_mut());
-                let handled = self.handle_http_inner(request, ingress_security, peer);
+                // Embedded lifecycle calls have large futures. Keep them off the
+                // worker stack while the renewable deadline drives polling.
+                let handled = Box::pin(self.handle_http_inner(request, ingress_security, peer));
                 let (mut response, deadline_exceeded) = if budgeted {
                     match processing.until_headers(handled).await {
                         Ok(response) => (response?, false),
