@@ -101,6 +101,9 @@ impl DirtyBudget {
         state.live_peak_bytes = state.live_peak_bytes.max(state.live_bytes);
         state.leases += 1;
         if let Some(owner) = &mut owner_state {
+            if owner.live_bytes == 0 {
+                owner.held_since = Some(Instant::now());
+            }
             owner.live_bytes += bytes;
             owner.live_peak_bytes = owner.live_peak_bytes.max(owner.live_bytes);
         }
@@ -174,11 +177,31 @@ pub(crate) struct DirtyOwner {
 pub(crate) struct DirtyOwnerSnapshot {
     pub(crate) live_bytes: usize,
     pub(crate) live_peak_bytes: usize,
+    /// When this owner last went from holding nothing to holding budget.
+    pub(crate) held_since: Option<Instant>,
+}
+
+impl DirtyOwnerSnapshot {
+    fn release(&mut self, bytes: usize) {
+        self.live_bytes -= bytes;
+        if self.live_bytes == 0 {
+            self.held_since = None;
+        }
+    }
 }
 
 impl DirtyOwner {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Since when this owner has continuously held budget; `None` while it
+    /// holds none. Orders owners by age for early commit under pressure (R91).
+    pub(crate) fn held_since(&self) -> Option<Instant> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .held_since
     }
 
     #[cfg(test)]
@@ -262,7 +285,7 @@ impl DirtyLease {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            owner.live_bytes -= released;
+            owner.release(released);
         }
         self.bytes = capacity;
         state.epoch = state.epoch.wrapping_add(1);
@@ -284,7 +307,7 @@ impl Drop for DirtyLease {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            owner.live_bytes -= self.bytes;
+            owner.release(self.bytes);
         }
         state.epoch = state.epoch.wrapping_add(1);
         self.budget.changed.notify_all();

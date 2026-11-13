@@ -1990,3 +1990,96 @@ fn permanent_admission_failure_rejects_the_generation_and_releases_its_pin() {
             .unwrap_or_else(|error| panic!("{name}: fresh writer saw {error}"));
     }
 }
+
+fn r91_open_dirty(fs: &DistributedFs, name: &str) -> (FileHandle, InodeId) {
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new(name),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    // A write at the end of the file reserves a whole 4 MiB builder.
+    fs.write(&context(), file.handle, 0, b"x").unwrap();
+    (file.handle, fs.inode_id(file.entry.inode).unwrap())
+}
+
+/// R91: a write waiting for dirty budget must not wait for the periodic
+/// commit. The oldest file holding budget is committed early, which frees its
+/// builder; younger holders keep theirs.
+#[test]
+fn a_write_waiting_for_dirty_budget_commits_the_oldest_holder_early() {
+    // Budget for exactly two open dirty files.
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = Arc::new(fs.with_write_timeout(Duration::from_secs(20)));
+    let (oldest, oldest_inode) = r91_open_dirty(&fs, "r91-oldest");
+    let (younger, younger_inode) = r91_open_dirty(&fs, "r91-younger");
+    let started = Instant::now();
+    // No timer pass runs in this test: nothing calls `writeback_pending`.
+    let (third, _) = r91_open_dirty(&fs, "r91-third");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the third file's write waited {:?} for budget",
+        started.elapsed()
+    );
+    let committed = meta
+        .commits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|commit| commit.inode_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        committed,
+        vec![oldest_inode.clone()],
+        "only the oldest budget holder is committed early"
+    );
+    let dirty = |inode: &InodeId| {
+        fs.write_state(inode)
+            .unwrap()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .dirty
+    };
+    assert!(!dirty(&oldest_inode));
+    assert!(dirty(&younger_inode), "a younger holder keeps its builder");
+    for handle in [oldest, younger, third] {
+        fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+        fs.release(&context(), handle).unwrap();
+    }
+}
+
+/// R91: the early commit is asked for once per wait, not once per holder:
+/// with room for three files, the fourth and fifth each evict one.
+#[test]
+fn each_budget_wait_commits_only_as_many_holders_as_it_needs() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 12 * 1024 * 1024, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = Arc::new(fs.with_write_timeout(Duration::from_secs(20)));
+    let mut handles = Vec::new();
+    let mut inodes = Vec::new();
+    for index in 0..5 {
+        let (handle, inode) = r91_open_dirty(&fs, &format!("r91-many-{index}"));
+        handles.push(handle);
+        inodes.push(inode);
+    }
+    let committed = meta
+        .commits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|commit| commit.inode_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        committed,
+        inodes[..2].to_vec(),
+        "oldest first, one per wait"
+    );
+    for handle in handles {
+        fs.release(&context(), handle).unwrap();
+    }
+}
