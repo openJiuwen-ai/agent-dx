@@ -65,13 +65,16 @@ impl OutlookRequest {
     pub(super) fn validate(&self) -> Result<(), Error> {
         let valid = match self {
             Self::Search {
+                query,
                 sender,
                 since,
                 until,
                 limit,
                 page,
             } => {
-                (sender.is_empty() || email_address(sender))
+                bounded(query, 2048)
+                    && !query.contains(['"', '\\'])
+                    && (sender.is_empty() || email_address(sender))
                     && (since.is_empty() || utc_seconds(since))
                     && (until.is_empty() || utc_seconds(until))
                     && (since.is_empty() || until.is_empty() || since < until)
@@ -100,6 +103,7 @@ impl OutlookRequest {
             .push("messages");
         match self {
             Self::Search {
+                query,
                 sender,
                 since,
                 until,
@@ -108,7 +112,21 @@ impl OutlookRequest {
             } => {
                 url.query_pairs_mut()
                     .append_pair("$top", &limit.to_string())
-                    .append_pair("$select", LIST_FIELDS);
+                    .append_pair(
+                        "$select",
+                        if query.is_empty() {
+                            LIST_FIELDS
+                        } else {
+                            "id,conversationId,webLink,from,receivedDateTime"
+                        },
+                    );
+                if !query.is_empty() {
+                    // Graph message search cannot combine $search and $filter.
+                    // Fetch only bounded metadata for exact sender/time filtering
+                    // below; never silently widen the returned search scope.
+                    url.query_pairs_mut()
+                        .append_pair("$search", &format!("\"{query}\""));
+                }
                 let mut filters = Vec::new();
                 if !sender.is_empty() {
                     filters.push(format!("from/emailAddress/address eq '{sender}'"));
@@ -119,7 +137,7 @@ impl OutlookRequest {
                 if !until.is_empty() {
                     filters.push(format!("receivedDateTime lt {until}"));
                 }
-                if !filters.is_empty() {
+                if !filters.is_empty() && query.is_empty() {
                     url.query_pairs_mut()
                         .append_pair("$filter", &filters.join(" and "));
                 }
@@ -147,6 +165,7 @@ impl OutlookRequest {
                 project_fields(value, if *body { BODY_FIELDS } else { HEADER_FIELDS })
             }
             Self::Search {
+                query,
                 sender,
                 since,
                 until,
@@ -162,7 +181,18 @@ impl OutlookRequest {
                 }
                 let messages = values
                     .iter()
-                    .cloned()
+                    .filter_map(|item| {
+                        if query.is_empty() {
+                            return Some(Ok(item.clone()));
+                        }
+                        match keyword_scope(item, sender, since, until) {
+                            Ok(true) => Some(Ok(item.clone())),
+                            Ok(false) => None,
+                            Err(error) => Some(Err(error)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
                     .map(|item| project_fields(item, LIST_FIELDS))
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut result = Map::new();
@@ -170,6 +200,7 @@ impl OutlookRequest {
                 if let Some(page) = value.get("@odata.nextLink") {
                     let page = page.as_str().ok_or(Error::InvalidResponse)?;
                     let initial = Self::Search {
+                        query: query.clone(),
                         sender: sender.clone(),
                         since: since.clone(),
                         until: until.clone(),
@@ -184,6 +215,49 @@ impl OutlookRequest {
             }
         }
     }
+}
+
+fn keyword_scope(item: &Value, sender: &str, since: &str, until: &str) -> Result<bool, Error> {
+    if !sender.is_empty() {
+        let actual = item
+            .get("from")
+            .and_then(|v| v.get("emailAddress"))
+            .and_then(|v| v.get("address"))
+            .and_then(Value::as_str)
+            .ok_or(Error::InvalidResponse)?;
+        if !email_address(actual) {
+            return Err(Error::InvalidResponse);
+        }
+        if !sender.eq_ignore_ascii_case(actual) {
+            return Ok(false);
+        }
+    }
+    if !since.is_empty() || !until.is_empty() {
+        let actual = item
+            .get("receivedDateTime")
+            .and_then(Value::as_str)
+            .ok_or(Error::InvalidResponse)?;
+        let head = actual.get(..19).ok_or(Error::InvalidResponse)?;
+        let tail = actual.get(19..).ok_or(Error::InvalidResponse)?;
+        let fraction = tail.strip_prefix('.').and_then(|v| v.strip_suffix('Z'));
+        if tail != "Z"
+            && !fraction.is_some_and(|v| {
+                !v.is_empty() && v.len() <= 9 && v.bytes().all(|c| c.is_ascii_digit())
+            })
+        {
+            return Err(Error::InvalidResponse);
+        }
+        let seconds = format!("{head}Z");
+        if !utc_seconds(&seconds) {
+            return Err(Error::InvalidResponse);
+        }
+        if (!since.is_empty() && seconds.as_str() < since)
+            || (!until.is_empty() && seconds.as_str() >= until)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn project_fields(value: Value, fields: &str) -> Result<Value, Error> {

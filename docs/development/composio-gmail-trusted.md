@@ -2,26 +2,31 @@
 
 Status: the existing Gateway process now prepares the configured Composio client,
 encrypted project key, shared PostgreSQL budget and actual owner/Relay adapter.
-Normal connector identities can use fixed account validation; foreground OAuth
-still requires the existing business session. Runtime task-read permission,
-subscription reconciliation, receiver/worker deployment and live mail acceptance
+Normal connector identities can use fixed account validation and task-scoped mail
+reads; foreground OAuth still requires the existing business session.
+Subscription reconciliation, receiver/worker deployment and live mail acceptance
 remain unfinished. The separate ingestion module has its own explicit startup.
 Development baseline includes official master `52c48719` and merged #179.
 Branch: `feat/gmail-composio-trusted`. Phase B extends the existing configuration
 and identity owners in this candidate, with independent design review still required.
 
 The explicit `Composio::with_m44_configs` factory now binds the actual owner
-issuer and foreground session guard to M44's eight fixed public operations over
+issuer and session/workload guard to M44's nine fixed public operations over
 the existing `AgentV2Access`/Ingress Relay. It selects the existing full Binding
 generation and exact Environment/port/path, reissues only the short owner-call
 credential after readiness, and never retries a physically sent owner write.
 Metadata and current access are read from M44; only `read_history` enables
-header/search projections, and body access remains off. No second connection or
+header/search projections. Body access requires a current task/account/tool Read
+proof; subscription proofs cannot grant it. No second connection or
 authorization writer is introduced. Disconnect remains unavailable until the
 original owner publishes its fencing operation.
 
 Outlook requires its immutable online Graph subject even when M44 has no display
-email. Gmail still requires an owner-verified profile address. The Outlook
+email. Gmail still requires an owner-verified profile address. Its actual M44
+verified-effect writer additionally requires an immutable subject; the current
+Gmail profile has no such ID, so Gmail authorization remains unconnected until
+that actual proof is obtained. Email and Composio user_id are not substitutes.
+The Outlook
 regression first failed Forbidden and then passed; Gmail's negative target also
 ran once, followed by 56 passing Composio tests and one existing ignored PG test.
 Those checks compiled the actual Relay adapter but used controlled provider/
@@ -111,9 +116,18 @@ authentication implementation. The business identity owner must first validate
 tenant, user, workspace, current foreground purpose and revocation. The type has
 no Deserialize implementation and cannot be constructed by an HTTP JSON decoder.
 Merely calling its constructor or presenting a privacy/crypto bearer proves no
-authority. Normal connector workload admission is limited to account validation;
-it cannot create OAuth effects or read mail through the foreground HTTP route.
-Runtime task reads and background admission remain separate requirements.
+authority. Normal connector workloads cannot create OAuth effects. Mail requires
+typed task/epoch or current subscription-intent facts in addition to identity;
+those facts grant nothing until the actual M44 owner authorizes them.
+
+`Authority::authorize_read` uses the existing fixed Relay and the separately
+admitted `Read` owner operation. The reply must match `connector.mail.read`, the
+exact connection, raw mail-request SHA-256, task epoch or intent revision and
+current authorization generation/record revision, with an expiry within15 seconds.
+The M44 query uses the original task, sharing/tool restrictions and account consent;
+it creates no question, task or grant. Gateway rechecks after budget acquisition
+before physical mail dispatch and again after a provider result. Late revoked
+content is suppressed; no retry creates another task or account permission.
 
 The stable `dm_` Composio user ID hashes the versioned tenant/user/workspace tuple
 with NUL separators; accepted fields contain no controls. Email is not an identity
@@ -160,6 +174,12 @@ and read operations. Its provider must match the connection owner's canonical
 Google/Microsoft grant; a request selector is not permission. No arbitrary method, headers, toolkit, tool slug, Composio user/account or URL is
 accepted. Outlook nextLink is opaque pagination data checked against the exact
 verified mailbox and original bounded query before use.
+Outlook keyword search uses Graph's fixed `$search` projection over from/subject/body.
+Because Graph does not combine message `$search` and `$filter`, Gateway requests
+only IDs plus sender/time metadata and applies exact sender and UTC bounds before
+returning IDs. Empty filtered pages retain their validated continuation. The
+provider caps keyword matches at1,000; this does not prove full-history coverage.
+[Microsoft Graph search semantics](https://learn.microsoft.com/en-us/graph/search-query-parameter).
 The private client always specifies both connected_account_id and user_id and
 constructs `GET` endpoints under fixed Gmail paths. Profile uses `/users/me`;
 messages pin the owner/profile-verified email as Google's userId via encoded URL
@@ -196,16 +216,18 @@ The `composio::http` candidate adapts already-authenticated calls; it does not
 authenticate `Scope` or mount itself. The fixed prefix is
 `/api/digitalmate/connectors/v1/composio`; POST `start`, `state`, `cancel` accept
 only `registration`, and POST `confirm` additionally accepts opaque `session_uri`.
-POST `mail` accepts only `provider`, `connection_id` and a typed `request`, e.g.
-`{"provider":"outlook","connection_id":"connection-one","request":{"operation":"read","message_id":"msg_A","body":false}}`.
+POST `mail` accepts `provider`, `connection_id`, a typed `request` and `access`, e.g.
+`{"provider":"outlook","connection_id":"connection-one","request":{"operation":"read","message_id":"msg_A","body":false},"access":{"kind":"foreground","task_id":"task-one","execution_epoch":0,"authorization_generation":1,"record_revision":1}}`.
+Missing access is forbidden. JSON cannot self-report allowed/body permission.
 Requests cannot choose tenant, user, workspace, auth config, account, URL, headers
 or arbitrary tool. Extra/duplicate fields, queries, browser Origin and oversized
 bodies are refused. Replies carry no-store/no-referrer. The public callback
 landing is static and cannot activate an account or implement app handoff.
 
-The outer entry will consume #179's actual foreground identity and recheck its
-business session. No HTTP endpoint is enabled until that entry and M44's actual
-effect owner are bound. A controlled test Scope is not authentication.
+The outer entry consumes #179's actual business identity for OAuth effects and
+normal connector identity for validation/mail, rechecking the actual guard after
+I/O. Formal startup binds the actual M44 owner and existing Relay. A controlled
+test Scope is not authentication or deployed acceptance.
 
 Do not assume Feishu's ArkWeb works for every provider. In particular,
 [Google OAuth policy](https://developers.google.com/identity/protocols/oauth2/policies)

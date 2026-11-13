@@ -129,6 +129,56 @@ pub struct Scope {
     workspace: String,
     foreground: Option<super::super::foreground_admission::ForegroundIdentity>,
     workload: Option<std::sync::Arc<super::super::connector_owner::ConnectorWorkloadIdentity>>,
+    read: Option<(ReadAccess, String)>,
+}
+
+/// Request facts only. The M44 task/account owner must authorize them afresh.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ReadAccess {
+    Foreground {
+        task_id: String,
+        execution_epoch: u64,
+        authorization_generation: u64,
+        record_revision: u64,
+    },
+    Subscription {
+        authorization_generation: u64,
+        record_revision: u64,
+        intent_revision: u64,
+    },
+}
+
+impl ReadAccess {
+    fn matches(&self, grant: &ConnectionGrant) -> bool {
+        let (generation, revision) = match self {
+            Self::Foreground {
+                task_id,
+                authorization_generation,
+                record_revision,
+                ..
+            } => {
+                if !bounded(task_id, 256) || task_id.is_empty() {
+                    return false;
+                }
+                (*authorization_generation, *record_revision)
+            }
+            Self::Subscription {
+                authorization_generation,
+                record_revision,
+                intent_revision,
+            } => {
+                if *intent_revision == 0 {
+                    return false;
+                }
+                (*authorization_generation, *record_revision)
+            }
+        };
+        generation > 0
+            && revision > 0
+            && generation == grant.generation
+            && revision == grant.record_revision
+    }
 }
 
 // Equality identifies an owner namespace; it never compares or grants sessions.
@@ -141,6 +191,25 @@ impl PartialEq for Scope {
 impl Eq for Scope {}
 
 impl Scope {
+    pub(super) fn with_read_access(mut self, access: ReadAccess, digest: String) -> Self {
+        self.read = Some((access, digest));
+        self
+    }
+
+    pub(super) fn read_access(
+        &self,
+        grant: &ConnectionGrant,
+    ) -> Result<(&ReadAccess, &str), Error> {
+        let (access, digest) = self.read.as_ref().ok_or(Error::Forbidden)?;
+        if !access.matches(grant)
+            || digest.len() != 64
+            || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(Error::Forbidden);
+        }
+        Ok((access, digest))
+    }
+
     pub fn from_authenticated_foreground(
         tenant: String,
         user: String,
@@ -158,6 +227,7 @@ impl Scope {
             workspace,
             foreground: None,
             workload: None,
+            read: None,
         })
     }
 
@@ -352,6 +422,7 @@ pub struct ConnectionGrant {
     pub account_id: String,
     pub email: String,
     pub generation: u64,
+    pub record_revision: u64,
     pub permissions: Permissions,
 }
 
@@ -457,6 +528,7 @@ impl GmailRequest {
 /// Personal Microsoft mailbox only; no free-form OData, tool, URL or headers.
 pub enum OutlookRequest {
     Search {
+        query: String,
         sender: String,
         since: String,
         until: String,
@@ -545,6 +617,14 @@ pub(super) fn email_address(value: &str) -> bool {
 /// No implementation/default or private-table access is supplied here.
 #[async_trait]
 pub trait Authority: Send + Sync {
+    /// Read-only query of the actual task/account or current subscription owner.
+    /// Returns whether body reads are currently admitted; scope is not a grant.
+    async fn authorize_read(
+        &self,
+        scope: &Scope,
+        connection_id: &str,
+        grant: &ConnectionGrant,
+    ) -> Result<bool, Error>;
     /// Association/custody only, without requiring usable or read permission.
     /// Must use the public owner and never refresh through ensure_ready.
     async fn metadata(

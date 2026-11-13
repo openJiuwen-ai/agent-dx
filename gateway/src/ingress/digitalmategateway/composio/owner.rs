@@ -50,7 +50,7 @@ impl M44Authority {
         }
     }
 
-    async fn authorization(
+    pub(super) async fn authorization(
         &self,
         scope: &Scope,
         operation: OwnerOperation,
@@ -69,7 +69,7 @@ impl M44Authority {
         }
     }
 
-    async fn send(
+    pub(super) async fn send(
         &self,
         scope: &Scope,
         operation: OwnerOperation,
@@ -306,8 +306,58 @@ fn provider(value: &str) -> Result<MailProvider, Error> {
     }
 }
 
+pub(super) fn read_proof(
+    value: Value,
+    scope: &Scope,
+    connection_id: &str,
+    grant: &ConnectionGrant,
+    now: u64,
+) -> Result<bool, Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Proof {
+        purpose: String,
+        connection_id: String,
+        request_digest: String,
+        access: super::types::ReadAccess,
+        allowed: bool,
+        read_body: bool,
+        expires_at: u64,
+    }
+    let (access, digest) = scope.read_access(grant)?;
+    let proof: Proof = decode(value)?;
+    if proof.purpose != "connector.mail.read"
+        || proof.connection_id != connection_id
+        || proof.request_digest != digest
+        || &proof.access != access
+        || !proof.allowed
+        || proof.expires_at <= now
+        || proof.expires_at > now.saturating_add(15)
+        || (proof.read_body && matches!(access, super::types::ReadAccess::Subscription { .. }))
+    {
+        return Err(Error::Forbidden);
+    }
+    Ok(proof.read_body)
+}
+
 #[async_trait]
 impl Authority for M44Authority {
+    async fn authorize_read(
+        &self,
+        scope: &Scope,
+        connection_id: &str,
+        grant: &ConnectionGrant,
+    ) -> Result<bool, Error> {
+        let (access, digest) = scope.read_access(grant)?;
+        let proof = self.send(scope, OwnerOperation::Read, json!({
+            "operation":"read", "connection_id":connection_id, "request_digest":digest, "access":access
+        })).await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Error::Forbidden)?
+            .as_secs();
+        read_proof(proof, scope, connection_id, grant, now)
+    }
     async fn metadata(
         &self,
         scope: &Scope,
@@ -528,6 +578,7 @@ impl Authority for M44Authority {
                 String::new()
             },
             generation: snapshot.authorization_generation,
+            record_revision: metadata.record_revision,
             permissions: Permissions {
                 search: headers,
                 read_headers: headers,
@@ -547,6 +598,7 @@ impl Authority for M44Authority {
             || current.account_id != expected.account_id
             || current.email != expected.email
             || current.generation != expected.generation
+            || current.record_revision != expected.record_revision
             || current.permissions != expected.permissions
         {
             return Err(Error::Forbidden);

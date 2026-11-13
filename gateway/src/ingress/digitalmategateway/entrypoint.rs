@@ -311,7 +311,8 @@ impl DigitalMateGatewayApi {
         let scope = match self
             .connector_scope(
                 request.headers(),
-                request.uri().path() == super::composio::http::VALIDATE_PATH,
+                request.uri().path() == super::composio::http::VALIDATE_PATH
+                    || request.uri().path() == "/api/digitalmate/connectors/v1/composio/mail",
             )
             .await
         {

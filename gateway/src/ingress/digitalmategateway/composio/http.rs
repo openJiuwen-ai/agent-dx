@@ -1,5 +1,6 @@
 //! Bounded wire adapter. The actual authenticated entry supplies Scope and the
 //! real Authority; this module neither authenticates JSON nor creates attempts.
+use super::types::ReadAccess;
 use super::{Composio, Error, GmailRequest, MailRequest, OutlookRequest, Scope};
 use ::http::{header, Method, Request, Response, StatusCode};
 use bytes::Bytes;
@@ -7,6 +8,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Body;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 pub const PREFIX: &str = "/api/digitalmate/connectors/v1/composio";
@@ -39,10 +41,12 @@ enum Mail {
     Gmail {
         connection_id: String,
         request: Gmail,
+        access: Option<ReadAccess>,
     },
     Outlook {
         connection_id: String,
         request: Outlook,
+        access: Option<ReadAccess>,
     },
 }
 
@@ -64,6 +68,8 @@ enum Gmail {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum Outlook {
     Search {
+        #[serde(default)]
+        query: String,
         sender: String,
         since: String,
         until: String,
@@ -77,11 +83,12 @@ enum Outlook {
 }
 
 impl Mail {
-    fn into_request(self) -> (String, MailRequest) {
+    fn into_request(self) -> (String, MailRequest, Option<ReadAccess>) {
         match self {
             Self::Gmail {
                 connection_id,
                 request,
+                access,
             } => (
                 connection_id,
                 MailRequest::Gmail(match request {
@@ -90,20 +97,24 @@ impl Mail {
                     }
                     Gmail::Read { message_id, body } => GmailRequest::Read { message_id, body },
                 }),
+                access,
             ),
             Self::Outlook {
                 connection_id,
                 request,
+                access,
             } => (
                 connection_id,
                 MailRequest::Outlook(match request {
                     Outlook::Search {
+                        query,
                         sender,
                         since,
                         until,
                         limit,
                         page,
                     } => OutlookRequest::Search {
+                        query,
                         sender,
                         since,
                         until,
@@ -112,6 +123,7 @@ impl Mail {
                     },
                     Outlook::Read { message_id, body } => OutlookRequest::Read { message_id, body },
                 }),
+                access,
             ),
         }
     }
@@ -217,9 +229,15 @@ async fn dispatch(
         }
         Some("/mail") => {
             let request: Mail = decode(bytes)?;
-            let (connection_id, operation) = request.into_request();
+            let (connection_id, operation, access) = request.into_request();
             reference(&connection_id)?;
-            gateway.mail(scope, &connection_id, operation).await
+            let scope = match access {
+                Some(access) => scope
+                    .clone()
+                    .with_read_access(access, hex::encode(Sha256::digest(bytes))),
+                None => scope.clone(),
+            };
+            gateway.mail(&scope, &connection_id, operation).await
         }
         Some(operation @ ("/start" | "/state" | "/cancel")) => {
             let request: Registration = decode(bytes)?;

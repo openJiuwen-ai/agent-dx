@@ -106,6 +106,170 @@ async fn http_body_read_still_requires_actual_operation_permission() {
 }
 
 #[tokio::test]
+async fn source_read_namespace_and_connection_capability_alone_do_not_release_mail() {
+    let mut f = Fixture::new().await;
+    f.scope =
+        Scope::from_authenticated_foreground("tenant".into(), "user".into(), "workspace".into())
+            .unwrap();
+    f.reads(json!({"messages":[{"id":"private_mail", "threadId":"private_thread"}]}));
+    let (status, value) = http_candidate(&f, "/api/digitalmate/connectors/v1/composio/mail",
+        r#"{"provider":"gmail","connection_id":"connection-one","request":{"operation":"search","query":"","limit":1,"page":""}}"#).await;
+    assert_eq!(status, 403);
+    assert_eq!(value, json!({"error":"forbidden"}));
+    assert!(f.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn source_read_requires_an_owner_query_for_the_exact_request_and_task_epoch_zero() {
+    let f = Fixture::new().await;
+    f.reads(json!({"messages":[{"id":"mail_A", "threadId":"thread_A"}]}));
+    let (status, value) = http_candidate(&f, "/api/digitalmate/connectors/v1/composio/mail",
+        r#"{"provider":"gmail","connection_id":"connection-one","request":{"operation":"search","query":"","limit":1,"page":""},"access":{"kind":"foreground","task_id":"task-one","execution_epoch":0,"authorization_generation":1,"record_revision":1}}"#).await;
+    assert_eq!(status, 200);
+    assert_eq!(value["messages"][0]["id"], "mail_A");
+}
+
+#[tokio::test]
+async fn source_read_rechecks_task_after_budget_wait_and_discards_late_mail() {
+    let f = Fixture::new().await;
+    f.reads(json!({"messages":[{"id":"private_mail", "threadId":"private_thread"}]}));
+    *f.budget.refuse_read_at_dispatch.lock().unwrap() = Some(f.authority.clone());
+    assert_eq!(
+        f.gateway
+            .gmail(&f.scope, "connection-one", f.search())
+            .await
+            .err(),
+        Some(Error::Forbidden)
+    );
+    assert_eq!(
+        f.state.calls.lock().unwrap().len(),
+        2,
+        "no mail dispatch after task refusal during budget wait"
+    );
+    let late = Fixture::new().await;
+    late.reads(json!({"messages":[{"id":"late_private_mail", "threadId":"private_thread"}]}));
+    late.state
+        .refuse_read_during_mail
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        late.gateway
+            .gmail(&late.scope, "connection-one", late.search())
+            .await
+            .err(),
+        Some(Error::Forbidden)
+    );
+    assert_eq!(late.state.calls.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn source_read_owner_proof_rejects_foreign_request_epoch_generation_revision_and_expiry() {
+    let f = Fixture::new().await;
+    let grant = f.authority.grant.lock().unwrap().clone();
+    let base = json!({"purpose":"connector.mail.read", "connection_id":"connection-one",
+        "request_digest":"0".repeat(64), "allowed":true, "read_body":false, "expires_at":110,
+        "access":{"kind":"foreground","task_id":"task-one","execution_epoch":0,
+                  "authorization_generation":1,"record_revision":1}});
+    assert_eq!(
+        super::owner::read_proof(base.clone(), &f.scope, "connection-one", &grant, 100),
+        Ok(false)
+    );
+    for (field, value) in [
+        ("purpose", json!("connector.authorization-owner")),
+        ("connection_id", json!("other")),
+        ("request_digest", json!("a".repeat(64))),
+        ("allowed", json!(false)),
+        ("expires_at", json!(100)),
+        ("expires_at", json!(116)),
+        ("extra_permission", json!(true)),
+    ] {
+        let mut value_changed = base.clone();
+        value_changed[field] = value;
+        assert!(
+            super::owner::read_proof(value_changed, &f.scope, "connection-one", &grant, 100)
+                .is_err(),
+            "{field}"
+        );
+    }
+    for (field, value) in [
+        ("task_id", json!("other")),
+        ("execution_epoch", json!(1)),
+        ("authorization_generation", json!(2)),
+        ("record_revision", json!(2)),
+    ] {
+        let mut changed = base.clone();
+        changed["access"][field] = value;
+        assert!(
+            super::owner::read_proof(changed, &f.scope, "connection-one", &grant, 100).is_err(),
+            "{field}"
+        );
+    }
+    let access = super::types::ReadAccess::Subscription {
+        authorization_generation: 1,
+        record_revision: 1,
+        intent_revision: 1,
+    };
+    let scope = f
+        .scope
+        .clone()
+        .with_read_access(access.clone(), "0".repeat(64));
+    let mut background = base;
+    background["access"] = serde_json::to_value(access).unwrap();
+    assert_eq!(
+        super::owner::read_proof(background.clone(), &scope, "connection-one", &grant, 100),
+        Ok(false)
+    );
+    background["read_body"] = json!(true);
+    assert!(super::owner::read_proof(background, &scope, "connection-one", &grant, 100).is_err());
+}
+
+#[tokio::test]
+async fn outlook_keywords_keep_exact_sender_and_time_bounds_without_search_filter_combination() {
+    let request = OutlookRequest::Search {
+        query: "project update".into(),
+        sender: "sender@example.com".into(),
+        since: "2026-11-12T00:00:00Z".into(),
+        until: "2026-11-13T00:00:00Z".into(),
+        limit: 5,
+        page: String::new(),
+    };
+    let initial = request.endpoint(OUTLOOK_SUBJECT).unwrap();
+    let query: std::collections::BTreeMap<_, _> = initial.query_pairs().collect();
+    assert_eq!(query.get("$search").unwrap(), "\"project update\"");
+    assert!(!query.contains_key("$filter"));
+    assert!(!query.get("$select").unwrap().contains("body"));
+    let mut next = initial.clone();
+    next.query_pairs_mut()
+        .append_pair("$skiptoken", "controlled-page");
+    let mail = |id: &str, sender: &str, date: &str| {
+        json!({"id":id,"conversationId":"thread_one",
+        "webLink":"https://outlook.live.com/mail/id", "from":{"emailAddress":{"address":sender}},
+        "receivedDateTime":date, "body":"never release"})
+    };
+    let projected = request
+        .project(
+            json!({"value":[
+        mail("match", "SENDER@example.com", "2026-11-12T01:02:03Z"),
+        mail("wrong_sender", "other@example.com", "2026-11-12T01:02:03Z"),
+        mail("too_old", "sender@example.com", "2026-11-11T23:59:59Z"),
+        mail("exclusive_end", "sender@example.com", "2026-11-13T00:00:00Z")
+    ],"@odata.nextLink":next.as_str()}),
+            OUTLOOK_SUBJECT,
+        )
+        .unwrap();
+    assert_eq!(projected["value"].as_array().unwrap().len(), 1);
+    assert_eq!(projected["value"][0]["id"], "match");
+    assert!(projected["value"][0].get("body").is_none());
+    assert!(projected["value"][0].get("from").is_none());
+    assert_eq!(projected["@odata.nextLink"], next.as_str());
+    assert!(request
+        .project(
+            json!({"value":[{"id":"invalid_missing_scope_facts"}]}),
+            OUTLOOK_SUBJECT
+        )
+        .is_err());
+}
+
+#[tokio::test]
 async fn http_account_validation_probes_mail_without_granting_or_reading_content() {
     let f = Fixture::outlook(true).await;
     f.authority.grant.lock().unwrap().permissions = Permissions::default();
@@ -329,6 +493,7 @@ fn http_browser_landing_never_echoes_or_redeems_callback_material() {
 }
 
 struct ControlledAuthority {
+    read_refused: AtomicBool,
     scope: Scope,
     attempt: Mutex<Attempt>,
     grant: Mutex<ConnectionGrant>,
@@ -351,6 +516,19 @@ impl ControlledAuthority {
 
 #[async_trait]
 impl Authority for ControlledAuthority {
+    async fn authorize_read(
+        &self,
+        scope: &Scope,
+        connection: &str,
+        grant: &ConnectionGrant,
+    ) -> Result<bool, Error> {
+        if self.read_refused.load(Ordering::SeqCst) {
+            return Err(Error::Forbidden);
+        }
+        self.assert_connection(scope, connection, grant).await?;
+        scope.read_access(grant)?;
+        Ok(grant.permissions.read_body)
+    }
     async fn metadata(&self, scope: &Scope, connection: &str) -> Result<ConnectionMetadata, Error> {
         self.check_scope(scope)?;
         if self.revoked.load(Ordering::SeqCst) || connection != "connection-one" {
@@ -510,6 +688,7 @@ impl Authority for ControlledAuthority {
     ) -> Result<(), Error> {
         let current = self.connection(scope, connection).await?;
         if current.generation == grant.generation
+            && current.record_revision == grant.record_revision
             && current.account_id == grant.account_id
             && current.provider == grant.provider
             && current.subject_id == grant.subject_id
@@ -538,11 +717,17 @@ impl Authority for ControlledAuthority {
 struct ControlledBudget {
     calls: AtomicUsize,
     refuse: AtomicBool,
+    refuse_read_at_dispatch: Mutex<Option<Arc<ControlledAuthority>>>,
 }
 #[async_trait]
 impl Budget for ControlledBudget {
     async fn acquire(&self, _: &Scope) -> Result<(), Error> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 3 {
+            if let Some(authority) = self.refuse_read_at_dispatch.lock().unwrap().as_ref() {
+                authority.read_refused.store(true, Ordering::SeqCst);
+            }
+        }
         if self.refuse.load(Ordering::SeqCst) {
             Err(Error::RateLimited {
                 retry_after: Some(3),
@@ -560,6 +745,7 @@ struct HttpState {
     authority: Arc<ControlledAuthority>,
     revoke_during_mail: AtomicBool,
     rebind_during_mail: AtomicBool,
+    refuse_read_during_mail: AtomicBool,
 }
 
 async fn upstream(
@@ -586,6 +772,14 @@ async fn upstream(
         && state.revoke_during_mail.load(Ordering::SeqCst)
     {
         state.authority.revoked.store(true, Ordering::SeqCst);
+    }
+    if state.refuse_read_during_mail.load(Ordering::SeqCst)
+        && body
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.contains("/messages"))
+    {
+        state.authority.read_refused.store(true, Ordering::SeqCst);
     }
     state.calls.lock().unwrap().push((path, body.clone()));
     let mut response = state
@@ -644,7 +838,19 @@ impl Fixture {
         Self::with_scope(scope).await
     }
     pub(crate) async fn with_scope(scope: Scope) -> Self {
+        // Explicit controlled task owner for unit ports; production constructors
+        // have no task facts until the bounded HTTP request attaches them.
+        let scope = scope.with_read_access(
+            super::types::ReadAccess::Foreground {
+                task_id: "task-one".into(),
+                execution_epoch: 0,
+                authorization_generation: 1,
+                record_revision: 1,
+            },
+            "0".repeat(64),
+        );
         let authority = Arc::new(ControlledAuthority {
+            read_refused: AtomicBool::new(false),
             scope: scope.clone(),
             attempt: Mutex::new(Attempt {
                 provider: MailProvider::Google,
@@ -661,6 +867,7 @@ impl Fixture {
                 account_id: "ca_one".into(),
                 email: "person@example.com".into(),
                 generation: 1,
+                record_revision: 1,
                 permissions: Permissions {
                     search: true,
                     read_headers: true,
@@ -676,6 +883,7 @@ impl Fixture {
         let budget = Arc::new(ControlledBudget {
             calls: AtomicUsize::new(0),
             refuse: AtomicBool::new(false),
+            refuse_read_at_dispatch: Mutex::new(None),
         });
         let state = Arc::new(HttpState {
             replies: Mutex::new(VecDeque::new()),
@@ -683,6 +891,7 @@ impl Fixture {
             authority: authority.clone(),
             revoke_during_mail: AtomicBool::new(false),
             rebind_during_mail: AtomicBool::new(false),
+            refuse_read_during_mail: AtomicBool::new(false),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1518,6 +1727,7 @@ impl Fixture {
     }
     fn outlook_search(&self, page: &str) -> MailRequest {
         MailRequest::Outlook(OutlookRequest::Search {
+            query: String::new(),
             sender: String::new(),
             since: String::new(),
             until: String::new(),
@@ -1724,6 +1934,7 @@ async fn outlook_rebind_during_read_is_pinned_to_original_subject() {
 async fn outlook_pagination_preserves_exact_provider_next_link_and_query() {
     let f = Fixture::outlook(true).await;
     let request = OutlookRequest::Search {
+        query: String::new(),
         sender: "sender@example.com".into(),
         since: "2026-11-12T00:00:00Z".into(),
         until: "2026-11-13T00:00:00Z".into(),
@@ -1752,6 +1963,7 @@ async fn outlook_pagination_preserves_exact_provider_next_link_and_query() {
             &f.scope,
             "connection-one",
             MailRequest::Outlook(OutlookRequest::Search {
+                query: String::new(),
                 sender: "sender@example.com".into(),
                 since: "2026-11-12T00:00:00Z".into(),
                 until: "2026-11-13T00:00:00Z".into(),
@@ -1771,6 +1983,7 @@ async fn outlook_pagination_preserves_exact_provider_next_link_and_query() {
 async fn outlook_pages_cannot_change_mailbox_select_filter_or_origin() {
     let f = Fixture::outlook(true).await;
     let initial = OutlookRequest::Search {
+        query: String::new(),
         sender: String::new(),
         since: String::new(),
         until: String::new(),
@@ -1902,6 +2115,7 @@ fn outlook_search_checks_calendar_dates_ids_and_increasing_bounds() {
         "0000-01-01T00:00:00Z",
     ] {
         let request = OutlookRequest::Search {
+            query: String::new(),
             sender: String::new(),
             since: invalid.into(),
             until: String::new(),
@@ -1926,6 +2140,7 @@ fn outlook_search_checks_calendar_dates_ids_and_increasing_bounds() {
         );
     }
     assert!(OutlookRequest::Search {
+        query: String::new(),
         sender: String::new(),
         since: "2000-02-29T00:00:00Z".into(),
         until: "2000-03-01T00:00:00Z".into(),

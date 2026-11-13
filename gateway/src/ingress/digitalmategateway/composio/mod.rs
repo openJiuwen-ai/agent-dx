@@ -2,8 +2,9 @@
 //!
 //! The fixed entry can retain actual foreground sessions and call M44 through
 //! its purpose issuer and existing ADX Relay. Explicit process configuration
-//! prepares the shared client and budget; normal workloads can only validate
-//! account references. Task reads and background assembly need their real owners.
+//! prepares the shared client and budget. Normal workloads can validate account
+//! references or request mail using a fresh exact-request M44 task/intent proof.
+//! Background trigger and receiver assembly still require their real owners.
 //! A crypto bearer or JSON scope grants no connector or mail permission.
 
 mod budget;
@@ -35,6 +36,35 @@ use std::sync::Arc;
 pub struct Composio {
     client: Client,
     authority: Arc<dyn Authority>,
+}
+
+/// Kept inside the transport: an account capability never substitutes for the
+/// actual task/subscription owner after a budget wait or a late provider reply.
+pub(super) struct MailReadGuard<'a> {
+    gateway: &'a Composio,
+    scope: &'a Scope,
+    connection_id: &'a str,
+    grant: &'a ConnectionGrant,
+    body: bool,
+}
+
+impl MailReadGuard<'_> {
+    pub(super) async fn check(&self) -> Result<(), Error> {
+        self.scope.read_access(self.grant)?;
+        self.gateway
+            .authority
+            .assert_connection(self.scope, self.connection_id, self.grant)
+            .await?;
+        let body = self
+            .gateway
+            .authority
+            .authorize_read(self.scope, self.connection_id, self.grant)
+            .await?;
+        if self.body && !body {
+            return Err(Error::Forbidden);
+        }
+        self.scope.check_bound_identity().await
+    }
 }
 
 impl Composio {
@@ -72,6 +102,7 @@ impl Composio {
                 page: String::new(),
             }),
             MailProvider::Microsoft => MailRequest::Outlook(OutlookRequest::Search {
+                query: String::new(),
                 sender: String::new(),
                 since: String::new(),
                 until: String::new(),
@@ -87,6 +118,7 @@ impl Composio {
             account_id: current.external_account_id.clone(),
             email: profile.email.clone(),
             generation: current.authorization_generation,
+            record_revision: current.record_revision,
             permissions: Permissions {
                 search: true,
                 read_headers: false,
@@ -96,7 +128,7 @@ impl Composio {
         if self.authority.metadata(scope, connection_id).await? != current {
             return Err(Error::Forbidden);
         }
-        let _ = self.client.mail(scope, &probe, request).await?;
+        let _ = self.client.mail(scope, &probe, request, None).await?;
         if self.authority.metadata(scope, connection_id).await? != current {
             return Err(Error::Forbidden);
         }
@@ -303,7 +335,26 @@ impl Composio {
     ) -> Result<serde_json::Value, Error> {
         request.validate()?;
         let grant = self.authority.connection(scope, connection_id).await?;
-        grant.check(&request)?;
+        scope.read_access(&grant)?;
+        let read_body = self
+            .authority
+            .authorize_read(scope, connection_id, &grant)
+            .await?;
+        let mut effective = grant.clone();
+        effective.permissions.read_body = read_body && grant.permissions.read_headers;
+        effective.check(&request)?;
+        let body = matches!(
+            &request,
+            MailRequest::Gmail(GmailRequest::Read { body: true, .. })
+                | MailRequest::Outlook(OutlookRequest::Read { body: true, .. })
+        );
+        let guard = MailReadGuard {
+            gateway: self,
+            scope,
+            connection_id,
+            grant: &grant,
+            body,
+        };
         self.client.config(grant.provider)?;
         if let MailRequest::Outlook(request) = &request {
             request.endpoint(&grant.subject_id)?;
@@ -323,12 +374,16 @@ impl Composio {
         self.authority
             .assert_connection(scope, connection_id, &grant)
             .await?;
-        let result = self.client.mail(scope, &grant, request).await?;
+        let result = self
+            .client
+            .mail(scope, &effective, request, Some(&guard))
+            .await?;
         // Revocation cannot stop an already dispatched read, but its late
         // content must not be delivered after the local authority is fenced.
         self.authority
             .assert_connection(scope, connection_id, &grant)
             .await?;
+        guard.check().await?;
         Ok(result)
     }
 

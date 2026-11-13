@@ -104,7 +104,7 @@ impl Client {
         .ok_or(Error::NotConfigured)
     }
 
-    async fn request(
+    pub(super) async fn request(
         &self,
         scope: &Scope,
         method: Method,
@@ -112,9 +112,25 @@ impl Client {
         body: Option<Value>,
         effect: bool,
     ) -> Result<Value, Error> {
+        self.request_guarded(scope, method, path, body, effect, None)
+            .await
+    }
+
+    async fn request_guarded(
+        &self,
+        scope: &Scope,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        effect: bool,
+        guard: Option<&super::MailReadGuard<'_>>,
+    ) -> Result<Value, Error> {
         scope.check_bound_identity().await?;
         self.budget.acquire(scope).await?;
         scope.check_bound_identity().await?;
+        if let Some(guard) = guard {
+            guard.check().await?;
+        }
         let mut request = self.http.request(method, format!("{}{path}", self.origin));
         if let Some(value) = body {
             request = request.json(&value);
@@ -315,9 +331,19 @@ impl Client {
         account_id: &str,
         endpoint: String,
     ) -> Result<Value, Error> {
-        let result = self.request(scope, Method::POST, "/api/v3.1/tools/execute/proxy", Some(json!({
+        self.proxy_guarded(scope, account_id, endpoint, None).await
+    }
+
+    async fn proxy_guarded(
+        &self,
+        scope: &Scope,
+        account_id: &str,
+        endpoint: String,
+        guard: Option<&super::MailReadGuard<'_>>,
+    ) -> Result<Value, Error> {
+        let result = self.request_guarded(scope, Method::POST, "/api/v3.1/tools/execute/proxy", Some(json!({
             "connected_account_id":account_id, "user_id":scope.composio_user_id(), "method":"GET", "endpoint":endpoint,
-        })), false).await?;
+        })), false, guard).await?;
         let status = result
             .get("status")
             .and_then(Value::as_u64)
@@ -384,16 +410,17 @@ impl Client {
         scope: &Scope,
         grant: &ConnectionGrant,
         request: MailRequest,
+        guard: Option<&super::MailReadGuard<'_>>,
     ) -> Result<Value, Error> {
         match request {
             MailRequest::Gmail(request) => {
-                self.gmail(scope, &grant.account_id, &grant.email, request)
+                self.gmail(scope, &grant.account_id, &grant.email, request, guard)
                     .await
             }
             MailRequest::Outlook(request) => {
                 let endpoint = request.endpoint(&grant.subject_id)?;
                 let result = self
-                    .proxy(scope, &grant.account_id, endpoint.to_string())
+                    .proxy_guarded(scope, &grant.account_id, endpoint.to_string(), guard)
                     .await?;
                 request.project(result, &grant.subject_id)
             }
@@ -406,6 +433,7 @@ impl Client {
         id: &str,
         email: &str,
         request: GmailRequest,
+        guard: Option<&super::MailReadGuard<'_>>,
     ) -> Result<Value, Error> {
         let metadata_id = match &request {
             GmailRequest::Read {
@@ -458,7 +486,9 @@ impl Client {
                 }
             }
         }
-        let result = self.proxy(scope, id, endpoint.to_string()).await?;
+        let result = self
+            .proxy_guarded(scope, id, endpoint.to_string(), guard)
+            .await?;
         match metadata_id {
             Some(message_id) => gmail_metadata(result, &message_id),
             None => Ok(result),
