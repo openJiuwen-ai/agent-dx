@@ -15,6 +15,234 @@ use std::{
     },
 };
 
+async fn http_candidate(f: &Fixture, path: &str, raw: &str) -> (u16, Value) {
+    use http_body_util::BodyExt;
+    let request = ::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(http_body_util::Full::new(bytes::Bytes::copy_from_slice(
+            raw.as_bytes(),
+        )))
+        .unwrap();
+    let response = super::http::handle(&f.gateway, &f.scope, request).await;
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+    let status = response.status().as_u16();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn http_managed_start_uses_only_owner_selected_config() {
+    let f = Fixture::outlook(true).await;
+    f.authority.attempt.lock().unwrap().phase = AttemptPhase::Ready;
+    f.reply(201, json!({"connected_account_id":"ca_one", "redirect_url":"https://connect.composio.dev/link", "expires_at":"2026-11-13T12:00:00Z", "link_token":"never-return"}));
+    let (status, value) = http_candidate(
+        &f,
+        "/api/digitalmate/connectors/v1/composio/start",
+        r#"{"registration":"registration-one"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(value["phase"], "waiting");
+    assert_eq!(value["redirect_url"], "https://connect.composio.dev/link");
+    assert!(!value.to_string().contains("never-return"));
+    assert_eq!(
+        f.state.calls.lock().unwrap()[0].1["auth_config_id"],
+        "ac_mail_outlook"
+    );
+}
+
+#[tokio::test]
+async fn http_rejects_identity_fields_duplicate_fields_and_arbitrary_transport() {
+    let f = Fixture::new().await;
+    for raw in [
+        r#"{"registration":"registration-one","user_id":"other"}"#,
+        r#"{"registration":"registration-one","registration":"other"}"#,
+        r#"{"registration":"registration-one","auth_config_id":"other"}"#,
+    ] {
+        assert_eq!(
+            http_candidate(&f, "/api/digitalmate/connectors/v1/composio/start", raw)
+                .await
+                .0,
+            400
+        );
+    }
+    assert_eq!(http_candidate(&f, "/api/digitalmate/connectors/v1/composio/mail", r#"{"provider":"gmail","connection_id":"connection-one","request":{"operation":"read","message_id":"msg_A","body":false,"endpoint":"https://evil.test"}}"#).await.0, 400);
+    assert!(f.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_cancel_is_owned_and_stale_confirmation_never_dispatches() {
+    let f = Fixture::new().await;
+    assert_eq!(
+        http_candidate(
+            &f,
+            "/api/digitalmate/connectors/v1/composio/cancel",
+            r#"{"registration":"registration-one"}"#
+        )
+        .await,
+        (200, json!({"phase":"cancelled"}))
+    );
+    let (status, value) = http_candidate(
+        &f,
+        "/api/digitalmate/connectors/v1/composio/confirm",
+        r#"{"registration":"registration-one","session_uri":"opaque-secret"}"#,
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert_eq!(value["error"], "authorization_inactive");
+    assert!(f.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_body_read_still_requires_actual_operation_permission() {
+    let f = Fixture::new().await;
+    let (status, value) = http_candidate(&f, "/api/digitalmate/connectors/v1/composio/mail", r#"{"provider":"gmail","connection_id":"connection-one","request":{"operation":"read","message_id":"msg_A","body":true}}"#).await;
+    assert_eq!(status, 403);
+    assert_eq!(value["error"], "forbidden");
+    assert!(f.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn confirmation_unknown_outcome_never_redeems_a_single_use_session_twice() {
+    let f = Fixture::new().await;
+    f.reply(503, json!({"error":"upstream failure"}));
+    f.reply(
+        503,
+        json!({"error":"must not dispatch a second confirmation"}),
+    );
+    f.reply(
+        503,
+        json!({"error":"must not dispatch a replacement session"}),
+    );
+    for session in ["opaque-first", "opaque-first", "opaque-replacement"] {
+        assert_eq!(
+            f.gateway
+                .confirm(&f.scope, "registration-one", session)
+                .await
+                .err(),
+            Some(Error::OutcomeUnknown),
+        );
+    }
+    assert_eq!(f.state.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn http_outlook_read_keeps_subject_pin_and_header_only_projection() {
+    let f = Fixture::outlook(true).await;
+    f.outlook_reads(true, json!({"id":"message_A", "subject":"Header", "bodyPreview":"private-preview", "body":{"content":"private-body"}}));
+    let (status, value) = http_candidate(&f, "/api/digitalmate/connectors/v1/composio/mail", r#"{"provider":"outlook","connection_id":"connection-one","request":{"operation":"read","message_id":"message_A","body":false}}"#).await;
+    assert_eq!(status, 200);
+    assert!(!value.to_string().contains("private-"));
+    assert!(value.to_string().contains("Header"));
+    assert_eq!(f.state.calls.lock().unwrap().len(), 3);
+    assert!(f.state.calls.lock().unwrap()[2].1["endpoint"]
+        .as_str()
+        .unwrap()
+        .contains(OUTLOOK_SUBJECT));
+}
+
+#[tokio::test]
+async fn confirmation_invalid_input_does_not_consume_the_owner_claim() {
+    let f = Fixture::new().await;
+    for session in ["", "opaque\nsecret"] {
+        assert_eq!(
+            f.gateway
+                .confirm(&f.scope, "registration-one", session)
+                .await
+                .err(),
+            Some(Error::InvalidRequest)
+        );
+    }
+    assert!(f.authority.confirmation.lock().unwrap().is_none());
+    f.reply(503, json!({"error":"unknown upstream outcome"}));
+    assert_eq!(
+        f.gateway
+            .confirm(&f.scope, "registration-one", "opaque-valid")
+            .await
+            .err(),
+        Some(Error::OutcomeUnknown)
+    );
+    assert_eq!(f.state.calls.lock().unwrap().len(), 1);
+    assert!(!f
+        .authority
+        .confirmation
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .1
+        .contains("opaque"));
+}
+
+#[tokio::test]
+async fn http_query_origin_methods_and_body_size_fail_before_effects() {
+    let f = Fixture::new().await;
+    for (method, path, origin, raw) in [
+        (
+            "GET",
+            "/api/digitalmate/connectors/v1/composio/start",
+            false,
+            "{}".to_string(),
+        ),
+        (
+            "POST",
+            "/api/digitalmate/connectors/v1/composio/start?user_id=other",
+            false,
+            "{}".to_string(),
+        ),
+        (
+            "POST",
+            "/api/digitalmate/connectors/v1/composio/start",
+            true,
+            "{}".to_string(),
+        ),
+        (
+            "POST",
+            "/api/digitalmate/connectors/v1/composio/start",
+            false,
+            "x".repeat(16385),
+        ),
+    ] {
+        let mut builder = ::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json");
+        if origin {
+            builder = builder.header("origin", "https://evil.test");
+        }
+        let response = super::http::handle(
+            &f.gateway,
+            &f.scope,
+            builder
+                .body(http_body_util::Full::new(bytes::Bytes::from(raw)))
+                .unwrap(),
+        )
+        .await;
+        assert!(response.status().is_client_error());
+    }
+    assert!(f.state.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn http_browser_landing_never_echoes_or_redeems_callback_material() {
+    use http_body_util::BodyExt;
+    let response = super::http::callback_landing();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+    assert!(response.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("default-src 'none'"));
+    let body = response.into_body().collect();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let bytes = runtime.block_on(body).unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&bytes).contains("session_uri"));
+}
+
 struct ControlledAuthority {
     scope: Scope,
     attempt: Mutex<Attempt>,
@@ -23,6 +251,7 @@ struct ControlledAuthority {
     writes: AtomicUsize,
     replace_on_accept: AtomicBool,
     receipt: Mutex<Option<(u64, VerifiedAccount)>>,
+    confirmation: Mutex<Option<(u64, String)>>,
 }
 
 impl ControlledAuthority {
@@ -82,6 +311,35 @@ impl Authority for ControlledAuthority {
             return Err(Error::AuthorizationInactive);
         }
         current.phase = AttemptPhase::Starting;
+        Ok(())
+    }
+    async fn claim_confirmation(
+        &self,
+        scope: &Scope,
+        expected: &Attempt,
+        digest: &str,
+    ) -> Result<(), Error> {
+        self.check_scope(scope)?;
+        let current = self.attempt.lock().unwrap();
+        current.check()?;
+        if current.registration != expected.registration
+            || current.revision != expected.revision
+            || current.provider != expected.provider
+            || current.account_id != expected.account_id
+            || current.phase != AttemptPhase::Waiting
+        {
+            return Err(Error::AuthorizationInactive);
+        }
+        let mut claim = self.confirmation.lock().unwrap();
+        if claim
+            .as_ref()
+            .is_some_and(|(revision, _)| *revision == current.revision)
+        {
+            return Err(Error::OutcomeUnknown);
+        }
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|v| v.is_ascii_hexdigit()));
+        *claim = Some((current.revision, digest.into()));
         Ok(())
     }
     async fn bind_started(
@@ -299,6 +557,7 @@ impl Fixture {
             writes: AtomicUsize::new(0),
             replace_on_accept: AtomicBool::new(false),
             receipt: Mutex::new(None),
+            confirmation: Mutex::new(None),
         });
         let budget = Arc::new(ControlledBudget {
             calls: AtomicUsize::new(0),
@@ -436,10 +695,12 @@ async fn outlook_shared_mail_path_pins_provider_subject_and_metadata() {
         endpoint.path(),
         "/v1.0/users/01234567-89ab-cdef-0123-456789abcdef/messages/AAMk_message+="
     );
-    assert!(!endpoint.query_pairs().any(|(key, value)| key == "$select"
-        && value
-            .split(',')
-            .any(|field| field == "body" || field == "bodyPreview")));
+    assert!(!endpoint.query_pairs().any(|(key, value)| {
+        key == "$select"
+            && value
+                .split(',')
+                .any(|field| field == "body" || field == "bodyPreview")
+    }));
     assert_eq!(f.budget.calls.load(Ordering::SeqCst), 3);
 }
 

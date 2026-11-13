@@ -69,7 +69,7 @@ handling. The Gateway Gmail routes still need to select this owner at assembly.
 | Public call | Behavior and owner requirement |
 | --- | --- |
 | `start(scope, registration)` | Read current attempt; owner durably CAS-claims Starting before link POST; bind only the account returned from that exact POST. A lost/malformed response remains unknown and cannot trigger another blind POST. |
-| `confirm(scope, registration, session_uri)` | Reauthenticated callback context; redeem single-use session with derived user ID; require exact previously bound account and attempt alias; online verify ownership/config/provider/private/ACTIVE; read profile; owner atomically publishes verification receipt. |
+| `confirm(scope, registration, session_uri)` | Reauthenticated callback context; real owner must durably claim a domain-separated request digest before single-use redemption. Repeated unknown outcomes query the original account rather than redeem again. Require exact bound account/alias and online ownership/config/provider/private/ACTIVE, then owner publishes the verification receipt. |
 | `reconcile_authorization` | Recover a lost complete_auth reply by reading only the account already bound to this attempt; never replay the single-use session. INITIALIZING/INITIATED stays pending. |
 | Completed flow retry | `verified_receipt` reads the owner's retained current-generation proof if the response after owner commit was lost. No repeat complete_auth or receipt write; missing, cancelled or stale proof cannot fabricate success. |
 | `cancel` | Delegate local cancellation to the flow owner, which fences late completion. Pending upstream state/cleanup remains that owner's obligation. |
@@ -107,6 +107,40 @@ safe metadata; API-key headers are marked sensitive. The module emits no payload
 logs and adds no plaintext token/secret storage.
 
 ## Production prerequisites and open integration
+
+### Foreground managed Outlook first
+
+The current priority is the app's Outlook connect gesture, browser consent,
+listing and explicit reading, followed by session consumption. A real business
+login and M44 current-attempt/effect authority are required. The connect gesture
+itself has no task ID and does not require background Host admission or ingestion
+bootstrap. Mail tools separately need actual current task/operation permission.
+The simple background path is also being connected for one Outlook account and
+one new message: explicit owner enable/disable, exact event-ID dedupe, existing
+Gateway PostgreSQL staging, existing ADX readiness and the actual receiver worker.
+It does not require building a general scheduling or Host policy platform.
+
+The `composio::http` candidate adapts already-authenticated calls; it does not
+authenticate `Scope` or mount itself. The fixed prefix is
+`/api/digitalmate/connectors/v1/composio`; POST `start`, `state`, `cancel` accept
+only `registration`, and POST `confirm` additionally accepts opaque `session_uri`.
+POST `mail` accepts only `provider`, `connection_id` and a typed `request`, e.g.
+`{"provider":"outlook","connection_id":"connection-one","request":{"operation":"read","message_id":"msg_A","body":false}}`.
+Requests cannot choose tenant, user, workspace, auth config, account, URL, headers
+or arbitrary tool. Extra/duplicate fields, queries, browser Origin and oversized
+bodies are refused. Replies carry no-store/no-referrer. The public callback
+landing is static and cannot activate an account or implement app handoff.
+
+The outer entry will consume #179's actual foreground identity and recheck its
+business session. No HTTP endpoint is enabled until that entry and M44's actual
+effect owner are bound. A controlled test Scope is not authentication.
+
+Do not assume Feishu's ArkWeb works for every provider. In particular,
+[Google OAuth policy](https://developers.google.com/identity/protocols/oauth2/policies)
+prohibits a developer-controlled embedded user agent. Gmail needs a system
+browser or OS authentication session; a controlled return to the app must use
+native authenticated confirmation. No business bearer enters a web page, URL or
+JavaScript bridge. Browser return still needs actual platform verification.
 
 1. Publish/review the #179 business identity and purpose contract; provide real
    callback reauthentication and foreground tool grants. Privacy authorization
@@ -246,3 +280,25 @@ test's prerequisites; it does not remove those product authority requirements.
 Primary references: [Graph messages](https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0),
 [Graph profile](https://learn.microsoft.com/en-us/graph/api/user-get?view=graph-rest-1.0),
 [Composio Connect Link and callback identity verification](https://docs.composio.dev/reference/api-reference/connected-accounts).
+
+## HTTP adapter and single-use confirmation increment
+
+The new HTTP adapter first failed compilation because the API did not exist.
+Its first implementation compile exposed an insufficient generic Body error
+bound; correcting it to the actual existing HTTP entry's bounds produced six
+passing HTTP cases and50 total Composio cases. The single-use counterexample then
+actually executed and failed: three confirmation requests dispatched instead of
+one. The caller now requires `Authority::claim_confirmation(scope, attempt,
+session_digest)` before dispatch; no default authority implementation is added.
+Only a domain-separated digest of scope/provider/account/registration/revision
+and session reaches that port. Invalid input consumes no claim; successful retry
+reads the existing receipt, while unknown confirmation can only reconcile.
+
+The final source passes53 Composio cases and264 ordinary Gateway library cases
+(0 failures,13 ignored); the53 are included in264. Changed Rust formatting passes
+with the workspace's actual2021 edition. All1026 Rust/Cargo/SQL inputs were
+unchanged during that run. The real HTTP adapter and upstream local HTTP server
+participated; Authority/Budget/provider responses were controlled. Real M44
+durable claims, actual authenticated route mounting, real browser return and
+real Outlook mailbox delivery remain unverified. Full-workspace Clippy and PG
+were not rerun for this increment; earlier receipts retain their exact inputs.

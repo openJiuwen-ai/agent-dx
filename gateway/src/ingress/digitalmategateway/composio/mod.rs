@@ -7,6 +7,7 @@
 
 mod budget;
 mod client;
+pub mod http;
 mod outlook;
 mod types;
 mod webhook;
@@ -98,6 +99,13 @@ impl Composio {
         if attempt.phase != AttemptPhase::Waiting || attempt.account_id.is_empty() {
             return Err(Error::AuthorizationInactive);
         }
+        if session_uri.is_empty() || !types::bounded(session_uri, 8192) {
+            return Err(Error::InvalidRequest);
+        }
+        let digest = attempt.confirmation_digest(scope, session_uri);
+        self.authority
+            .claim_confirmation(scope, &attempt, &digest)
+            .await?;
         let account_id = self
             .client
             .complete(scope, session_uri, attempt.provider)

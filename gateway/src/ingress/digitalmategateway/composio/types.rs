@@ -194,6 +194,24 @@ impl Attempt {
         hash.update(self.revision.to_be_bytes());
         format!("dm_{}", hex::encode(hash.finalize()))
     }
+
+    pub(super) fn confirmation_digest(&self, scope: &Scope, session_uri: &str) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"digitalmate.composio.confirm.v1\0");
+        let user = scope.composio_user_id();
+        for part in [
+            user.as_str(),
+            self.registration.as_str(),
+            self.provider.toolkit(),
+            self.account_id.as_str(),
+        ] {
+            hash.update(part.as_bytes());
+            hash.update([0]);
+        }
+        hash.update(self.revision.to_be_bytes());
+        hash.update(session_uri.as_bytes());
+        hex::encode(hash.finalize())
+    }
 }
 
 /// Safe projection: credentials and link_token are intentionally absent.
@@ -380,6 +398,17 @@ pub trait Authority: Send + Sync {
     /// Durably mark Starting before external creation. Repeated/unknown starts
     /// require reconciliation by this owner, never another blind POST.
     async fn claim_start(&self, scope: &Scope, attempt: &Attempt) -> Result<(), Error>;
+    /// The real M44 owner durably claims the single confirmation before I/O,
+    /// atomically fencing scope/provider/account/revision, expiry and replacement.
+    /// Store only this request digest, never session_uri. An already claimed
+    /// unknown outcome (including a different session) cannot dispatch again;
+    /// reconcile the original account instead. Completed retries read the receipt.
+    async fn claim_confirmation(
+        &self,
+        scope: &Scope,
+        attempt: &Attempt,
+        session_digest: &str,
+    ) -> Result<(), Error>;
     async fn bind_started(
         &self,
         scope: &Scope,
