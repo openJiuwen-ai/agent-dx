@@ -33,11 +33,13 @@ use super::store::{
 
 mod access;
 mod commit;
+mod lease_release;
 mod namespace;
 mod placement;
 mod read_auth;
 mod read_cache;
 mod readers;
+pub use lease_release::MAX_LEASE_RELEASE_BATCH;
 pub use readers::{OpenFileRead, OpenedForRead, ReaderEntry};
 mod repair;
 mod replay;

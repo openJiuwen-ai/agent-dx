@@ -506,6 +506,11 @@ Bao sidecar、Peer cache 条目与目录标记、外部对象 key 前缀、Owner
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
+- **协议 8 已提供、Node 尚未调用的 RPC**：`DfsMeta.ReleaseWriteLeases`（`meta/dfs/lease_release.rs`）按批归还写租约。
+  只归还与 Node 出示的副本完全相同的租约：把到期时间改为当前，epoch 不变，下次取得时 epoch 加一；
+  不再相同的租约跳过、算成功。整批是一个事务，按 operation id 重放。
+  结果记在 `DfsRenewWriteLease` 操作下（归还即"续到现在"），所以 WAL 与 checkpoint 编码不变。
+  Node 侧在最后一个写者关闭时调用它，是以后的事（R106），届时不需要升协议。
 
 ### OwnerFs Root 授权的代际与回收
 

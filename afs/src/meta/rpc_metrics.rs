@@ -56,6 +56,7 @@ const META_RPCS: &[&str] = &[
     "afs.meta.v1.DfsMeta/ResolveLockAuthority",
     "afs.meta.v1.DfsMeta/ResolveWriteAuthority",
     "afs.meta.v1.DfsMeta/RenewWriteLease",
+    "afs.meta.v1.DfsMeta/ReleaseWriteLeases",
     "afs.meta.v1.DfsMeta/GetInode",
     "afs.meta.v1.DfsMeta/GetFileVersion",
     "afs.meta.v1.DfsMeta/GetPlacementSnapshot",

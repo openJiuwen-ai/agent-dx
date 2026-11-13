@@ -451,6 +451,7 @@ service DfsMeta {
   rpc ResolveLockAuthority(ResolveDfsLockAuthorityRequest) returns (ResolveDfsLockAuthorityReply);
   rpc ResolveWriteAuthority(ResolveDfsWriteAuthorityRequest) returns (ResolveDfsWriteAuthorityReply);
   rpc RenewWriteLease(RenewDfsWriteLeaseRequest) returns (DfsWriteLeaseReply);
+  rpc ReleaseWriteLeases(ReleaseDfsWriteLeasesRequest) returns (ReleaseDfsWriteLeasesReply);
   rpc GetInode(GetDfsInodeRequest) returns (GetDfsInodeReply);
   rpc GetFileVersion(GetFileVersionRequest) returns (GetFileVersionReply);
   rpc GetPlacementSnapshot(GetDfsPlacementSnapshotRequest) returns (GetDfsPlacementSnapshotReply);
@@ -1043,6 +1044,20 @@ message RenewDfsWriteLeaseRequest {
   DfsWriteLease current_lease = 4;
   uint64 lease_seconds = 5;
 }
+
+// Hands back write leases the caller no longer needs: each one still equal to
+// the presented copy ends now (its epoch unchanged, so the next acquire takes
+// the next epoch); one that changed is skipped. One transaction under
+// `operation_id`, so a retry replays. Served by Meta from protocol 8; Nodes do
+// not call it yet, and starting to needs no protocol change (R106).
+message ReleaseDfsWriteLeasesRequest {
+  string caller_id = 1;
+  string owner_session_id = 2;
+  string operation_id = 3;
+  repeated DfsWriteLease leases = 4;
+}
+// `released`: leases this call ended (0 on a replay).
+message ReleaseDfsWriteLeasesReply { uint64 released = 1; }
 
 // A fresh lock authority read; only missing/expired authority acquires a lease.
 // operation_id identifies that conditional acquire, not the read-only result.

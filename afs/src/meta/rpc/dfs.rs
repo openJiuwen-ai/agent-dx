@@ -929,6 +929,38 @@ impl DfsMetaService for DfsMetaRpc {
         }))
     }
 
+    async fn release_write_leases(
+        &self,
+        request: Request<afs_protocol::meta::ReleaseDfsWriteLeasesRequest>,
+    ) -> Result<Response<afs_protocol::meta::ReleaseDfsWriteLeasesReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        require_text(&request.owner_session_id, "owner_session_id")?;
+        require_text(&request.operation_id, "operation_id")?;
+        let released = dfs_service(&self.0)?
+            .release_write_leases(
+                request.caller_id,
+                request.owner_session_id,
+                crate::dfs::OperationId::new(request.operation_id),
+                request
+                    .leases
+                    .into_iter()
+                    .map(domain_dfs_write_lease)
+                    .collect(),
+            )
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        self.0
+            .observability
+            .record("meta", "dfs_release_write_leases", true);
+        Ok(Response::new(
+            afs_protocol::meta::ReleaseDfsWriteLeasesReply {
+                released: released as u64,
+            },
+        ))
+    }
+
     async fn get_inode(
         &self,
         request: Request<GetDfsInodeRequest>,
