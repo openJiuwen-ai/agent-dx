@@ -40,8 +40,11 @@ pub mod rpc;
 pub mod storage;
 pub mod vfs;
 
+pub(crate) use readiness::current_visible_afs_mount_id_in_mountinfo;
 pub use readiness::{AfsMountIdentity, NodeReadiness, ReadinessObservation, sample_rdma_sysfs_at};
-pub(crate) use readiness::{current_visible_afs_mount_id_in_mountinfo, parse_exact_mountinfo_line};
+// Only the OwnerFs outlet reads mountinfo lines outside `readiness`.
+#[cfg(feature = "ownerfs")]
+pub(crate) use readiness::parse_exact_mountinfo_line;
 
 use crate::{
     config::Config,
