@@ -1477,7 +1477,9 @@ async fn reusable_snapshot_waits_for_journal_publication_without_recapturing() {
         operation_id: "snapshot-journal-contention".into(),
         expected_revision: running.record.revision,
         names: vec![],
-        timeout_seconds: 2,
+        // Journal retries perform real fsyncs on shared CI storage. Allow the
+        // normal snapshot budget; deadline enforcement is covered separately.
+        timeout_seconds: 60,
     };
     let saved = handle.snapshot(request.clone()).await.unwrap();
     assert_eq!(saved.environment.durability, Durability::Published);
