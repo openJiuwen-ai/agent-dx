@@ -256,6 +256,32 @@ impl OwnerAuthority {
         Ok(binding)
     }
 
+    pub(super) async fn delivery_target(
+        &self,
+        delivery: &super::ingestion::SubscriptionBinding,
+    ) -> accounts::Result<serde_json::Value> {
+        delivery
+            .validate()
+            .map_err(|_| accounts::Error::Unauthorized)?;
+        let scope = super::privacy_grants::binding_scope(delivery)?;
+        let binding = self
+            .binding(&scope, &delivery.user_id, &delivery.workspace)
+            .await?;
+        if !delivery.enabled
+            || binding.generation != delivery.binding_generation
+            || delivery.service_port != self.application.service_port
+        {
+            return Err(accounts::Error::Unauthorized);
+        }
+        Ok(serde_json::json!({
+            "tenant":binding.scope.tenant, "user_id":delivery.user_id,
+            "workspace":delivery.workspace, "template":binding.scope.template,
+            "template_ref":binding.scope.template_ref.name(), "binding_id":binding.scope.binding_id,
+            "binding_generation":binding.generation, "environment_id":binding.current.environment_id,
+            "service_port":self.application.service_port,
+        }))
+    }
+
     fn claims(
         &self,
         binding: AgentBinding,

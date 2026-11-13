@@ -730,6 +730,25 @@ This purpose cannot decrypt privacy settings or authorize provider mail reads.
 Malformed requests return the existing account error envelope; invalid or revoked
 credentials fail closed, and unavailable identity owners return service unavailable.
 
+The existing identity HTTPS listener also accepts `POST /v1/ingestion/bootstrap`
+with a valid delivery bearer and exactly `{}`. It rechecks the persisted current
+batch, enabled subscription, existing grant and complete current Binding. The
+response contains only `purpose: "ingestion.connector-bootstrap"`, `target`
+(tenant, user, workspace, template/ref, Binding ID/generation, Environment and
+service port), `connector_token` and `expires_at`. The target must match the
+configured DigitalMate application and the batch's generation/port.
+
+The connector token reuses that grant and signing root, expires no later than the
+delivery credential, and has a signed bootstrap deadline. It cannot renew, obtain
+a privacy bearer, decrypt settings or grant task/model execution permission.
+An expired consumer must bootstrap again with a still-current delivery credential.
+Bootstrap must occur before delivery is acknowledged and completed: only a ready
+persisted batch is admitted. This exchange alone does not provide durable mail-read
+recovery after receipt when the process or short-lived credential is lost.
+Connection intent, generation/revision and `read_history` must still be checked
+by their actual owners on each receiver/read operation. Missing owner runtime
+configuration returns service unavailable; no scope is accepted from JSON.
+
 ### Existing Jiuwen protocol and accounts
 
 Build with `--features agent-api`. Configure `ADX_JIUWEN_CONFIG` using

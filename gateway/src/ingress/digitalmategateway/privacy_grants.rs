@@ -49,6 +49,9 @@ pub(crate) struct Claims {
     user: String,
     exp: i64,
     recovery_until: i64,
+    /// Delivery-derived connector access cannot acquire a renewable lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bootstrap_until: Option<i64>,
 }
 
 /// A delivery credential identifies a persisted batch, never a JSON-provided scope.
@@ -171,6 +174,13 @@ impl TokenSigner {
             || (!renewal && claims.exp <= current)
             || claims.exp > current.saturating_add(ACCESS_SECONDS + CLOCK_SKEW_SECONDS)
             || claims.exp > claims.recovery_until
+            || claims.bootstrap_until.is_some_and(|until| {
+                prefix != "dm-connector-v1"
+                    || until != claims.exp
+                    || until != claims.recovery_until
+                    || until <= current
+                    || until > current.saturating_add(DELIVERY_ACCESS_SECONDS + CLOCK_SKEW_SECONDS)
+            })
         {
             return Err(Error::Unauthorized);
         }
@@ -268,6 +278,7 @@ impl PrivacyIdentity {
             user: user.into(),
             exp: current + ACCESS_SECONDS,
             recovery_until: current + RECOVERY_SECONDS,
+            bootstrap_until: None,
         };
         claims.id = self
             .store
@@ -373,6 +384,9 @@ impl PrivacyIdentity {
 
     pub async fn renew_connector(&self, token: &str) -> Result<serde_json::Value, Error> {
         let (mut claims, _) = self.connector_grant(token, true).await?;
+        if claims.bootstrap_until.is_some() {
+            return Err(Error::Forbidden);
+        }
         let current = now()?;
         claims.exp = current + ACCESS_SECONDS;
         claims.recovery_until = current + RECOVERY_SECONDS;
@@ -453,7 +467,7 @@ fn ingestion_error(error: super::ingestion::Error) -> Error {
     }
 }
 
-fn binding_scope(binding: &SubscriptionBinding) -> Result<Scope, Error> {
+pub(super) fn binding_scope(binding: &SubscriptionBinding) -> Result<Scope, Error> {
     Ok(Scope {
         tenant: binding.tenant.clone(),
         template: binding.template.clone(),
@@ -468,6 +482,42 @@ fn binding_scope(binding: &SubscriptionBinding) -> Result<Scope, Error> {
 impl DeliveryIdentity {
     pub(crate) fn new(identity: Arc<PrivacyIdentity>, inbox: Inbox) -> Self {
         Self { identity, inbox }
+    }
+
+    /// Exchange only a currently persisted delivery for bounded connector access.
+    /// Reuses its existing grant and signer; no privacy credential is issued.
+    pub(crate) async fn bootstrap(
+        &self,
+        token: &str,
+        owner: &super::connector_owner::OwnerAuthority,
+    ) -> Result<serde_json::Value, Error> {
+        let admission = self.verify(token).await?;
+        let target = owner.delivery_target(&admission.binding).await?;
+        let expires_at = admission.claims.exp.min(now()? + DELIVERY_ACCESS_SECONDS);
+        let claims = Claims {
+            id: admission.claims.grant_id.clone(),
+            tenant: admission.binding.tenant.clone(),
+            workspace: admission.binding.workspace.clone(),
+            user: admission.binding.user_id.clone(),
+            exp: expires_at,
+            recovery_until: expires_at,
+            bootstrap_until: Some(expires_at),
+        };
+        let connector = self.identity.signer.sign_connector(&claims)?;
+        self.identity.connector_grant(&connector, false).await?;
+        if owner.delivery_target(&admission.binding).await? != target {
+            return Err(Error::Unauthorized);
+        }
+        // Last owner I/O rechecks subscription, persisted batch, grant and Binding.
+        let current = self.verify(token).await?;
+        if current.binding != admission.binding {
+            return Err(Error::Unauthorized);
+        }
+        self.identity.signer.verify_connector(&connector, false)?;
+        Ok(serde_json::json!({
+            "purpose":"ingestion.connector-bootstrap", "target":target,
+            "connector_token":connector.as_str(), "expires_at":expires_at,
+        }))
     }
 
     async fn issue(&self, batch: &DeliveryBatch) -> Result<Zeroizing<String>, Error> {
@@ -572,6 +622,7 @@ mod tests {
             user: "user".into(),
             exp: current + ACCESS_SECONDS + 30,
             recovery_until: current + 3600,
+            bootstrap_until: None,
         };
         assert!(signer.verify(&signer.sign(&claims).unwrap(), false).is_ok());
         claims.exp = current + ACCESS_SECONDS + 90;
@@ -595,6 +646,7 @@ mod tests {
             user: "user".into(),
             exp: current + 60,
             recovery_until: current + 3600,
+            bootstrap_until: None,
         };
         let token = signer.sign(&claims).unwrap();
         assert!(signer.verify(&token, false).is_ok());

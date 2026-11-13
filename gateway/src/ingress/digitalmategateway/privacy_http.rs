@@ -144,7 +144,12 @@ impl PrivacyHttp {
         }
         let path = request.uri().path().to_owned();
         let token = Zeroizing::new(
-            if path == super::connector_owner::VERIFY_PATH {
+            if matches!(
+                path.as_str(),
+                super::connector_owner::VERIFY_PATH
+                    | "/v1/connector/identity"
+                    | "/v1/connector/renew"
+            ) {
                 super::connector_owner::bearer(request.headers())?
             } else {
                 accounts::bearer(request.headers())?
@@ -210,10 +215,14 @@ impl PrivacyHttp {
                 if path == "/v1/ingestion/admit" {
                     return Ok(response(StatusCode::OK, admission.json()));
                 }
-                // Delivery grants staging only. Runtime must first publish a
-                // purpose-limited bootstrap contract that exposes no secrets.
-                // Never decrypt the user's configuration with this bearer.
-                Err(Error::Unavailable)
+                let owner = self
+                    .authorization_owner
+                    .as_ref()
+                    .ok_or(Error::Unavailable)?;
+                Ok(response(
+                    StatusCode::OK,
+                    ingestion.bootstrap(&token, owner).await?,
+                ))
             }
             "/v1/connector/identity" | "/v1/connector/renew" => {
                 if bytes.as_ref() != b"{}" {

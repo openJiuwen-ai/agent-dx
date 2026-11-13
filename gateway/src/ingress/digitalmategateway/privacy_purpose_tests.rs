@@ -2,6 +2,39 @@
 use super::*;
 
 #[test]
+fn delivery_bootstrap_connector_cannot_outlive_its_signed_deadline() {
+    let signer = TokenSigner::new(&[7; 32], "tenant");
+    let current = now().unwrap();
+    let mut claims = Claims {
+        id: "a".repeat(64),
+        tenant: "tenant".into(),
+        workspace: "workspace".into(),
+        user: "user".into(),
+        exp: current + 30,
+        recovery_until: current + 30,
+        bootstrap_until: Some(current + 30),
+    };
+    let token = signer.sign_connector(&claims).unwrap();
+    assert!(signer.verify_connector(&token, false).is_ok());
+    assert!(signer.verify(&token, false).is_err());
+    claims.exp = current + 60;
+    assert!(signer
+        .verify_connector(&signer.sign_connector(&claims).unwrap(), false)
+        .is_err());
+    claims.exp = current + 30;
+    claims.recovery_until = current + 60;
+    assert!(signer
+        .verify_connector(&signer.sign_connector(&claims).unwrap(), true)
+        .is_err());
+    claims.exp = current - 1;
+    claims.recovery_until = current - 1;
+    claims.bootstrap_until = Some(current - 1);
+    assert!(signer
+        .verify_connector(&signer.sign_connector(&claims).unwrap(), true)
+        .is_err());
+}
+
+#[test]
 fn connector_identity_cannot_be_used_as_a_privacy_bearer() {
     let signer = TokenSigner::new(&[7; 32], "tenant");
     let current = now().unwrap();
@@ -12,6 +45,7 @@ fn connector_identity_cannot_be_used_as_a_privacy_bearer() {
         user: "user".into(),
         exp: current + 60,
         recovery_until: current + 3600,
+        bootstrap_until: None,
     };
     let connector = signer.sign_connector(&claims).unwrap();
     assert!(connector.starts_with("dm-connector-v1."));

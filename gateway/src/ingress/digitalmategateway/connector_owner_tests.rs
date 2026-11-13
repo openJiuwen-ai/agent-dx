@@ -135,6 +135,63 @@ fn digest(body: &[u8]) -> String {
 }
 
 #[tokio::test]
+async fn delivery_bootstrap_target_requires_exact_actual_binding_and_port() {
+    use super::super::ingestion::SubscriptionBinding;
+    let (owner, identity, _, bindings, _) = setup();
+    let record = SubscriptionBinding {
+        tenant: "tenant".into(),
+        user_id: "alice".into(),
+        connection_id: "connection".into(),
+        template: "digitalmate".into(),
+        template_ref: "1".into(),
+        subscription_id: "subscription".into(),
+        subscription_generation: 1,
+        connection_generation: 1,
+        workspace: identity.workspace().into(),
+        binding_id: identity.binding_scope().binding_id.clone(),
+        binding_generation: "generation-one".into(),
+        service_port: 18092,
+        trigger_id: "ti_test".into(),
+        trigger_slug: "GMAIL_NEW_GMAIL_MESSAGE".into(),
+        account_id: "ca_test".into(),
+        auth_config_id: "ac_test".into(),
+        composio_user_id: "dm_test".into(),
+        enabled: true,
+    };
+    assert_eq!(
+        owner.delivery_target(&record).await.unwrap()["environment_id"],
+        "environment-one"
+    );
+    for changed in [
+        "tenant",
+        "user",
+        "workspace",
+        "template",
+        "ref",
+        "id",
+        "generation",
+        "port",
+        "disabled",
+    ] {
+        let mut other = record.clone();
+        match changed {
+            "tenant" => other.tenant = "other".into(),
+            "user" => other.user_id = "other".into(),
+            "workspace" => other.workspace = "other".into(),
+            "template" => other.template = "other".into(),
+            "ref" => other.template_ref = "2".into(),
+            "id" => other.binding_id = "other".into(),
+            "generation" => other.binding_generation = "other".into(),
+            "port" => other.service_port = 8081,
+            _ => other.enabled = false,
+        }
+        assert!(owner.delivery_target(&other).await.is_err(), "{changed}");
+    }
+    bindings.0.lock().unwrap().phase = BindingPhase::Deleting;
+    assert!(owner.delivery_target(&record).await.is_err());
+}
+
+#[tokio::test]
 async fn owner_purpose_fixes_raw_body_operation_and_actual_binding() {
     let (owner, identity, _, _, _) = setup();
     let body = br#"{"operation":"current","registration":"auth-one"}"#;

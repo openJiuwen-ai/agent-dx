@@ -38,12 +38,16 @@ ACK 只提交被领取的准确成员，不推进 sequence 高水位，A/B 处�
 
 此前跨仓库验证固定过 #1176 的公开候选（包括 `f7b930ec`）；这不是新主线或新权限端口的验收。#1192 薄适配直接调用实际 ScanRegistrations 注册/完成方法及 `ConnectionRegistry.ensure_ready/access_snapshot`，不复制私表。完整 Gateway Authority 所需物理外呼认领/回执与 Scan 当前投影仍需 owner 对齐；现有三种薄消费不能宣称已覆盖整个 Authority。快照与 `read_history` 均不授予后台订阅意图。
 
-#179 阶段 A 的配置 bearer 保持原用途。#268 阶段 B 在同一身份 owner 中增加分离的 connector/delivery 前缀及实际 issuer/introspection，不将配置 bearer 当作后台工具授权，不分发项目 Key 到用户工作区。delivery 不能解密整份用户配置；bootstrap 目前明确503，等待 Runtime/配置 owner 发布无秘密的用途限定能力。
+#179 阶段 A 的配置 bearer 保持原用途。#268 阶段 B 在同一身份 owner 中增加分离的 connector/delivery 前缀及实际 issuer/introspection，不将配置 bearer 当作后台工具授权，不分发项目 Key 到用户工作区。delivery 不能解密整份用户配置。
+
+既有身份 HTTPS 的 `POST /v1/ingestion/bootstrap` 只接受 delivery bearer 和精确 `{}`。它复核当前持久 batch、启用订阅、既有 grant 和完整 Binding，返回 `purpose: "ingestion.connector-bootstrap"`、实际 `target`、`connector_token`、`expires_at` 四个字段。target 仅含 tenant/user/workspace、template/ref、Binding ID/generation、Environment 与配置端口，必须匹配 batch 的 scope/generation/port。派生 connector 凭据复用当前 grant 和 signer，带签名 bootstrap 截止，不晚于当前 delivery 到期；禁止续期，不新增 grant，不返回 privacy bearer、用户配置或模型/项目密钥。缺失既有 owner runtime 仍返回503 `AUTH_UNAVAILABLE`。这只提供连接身份；真实启用意图、连接代次/修订与 `read_history` 仍须接收/读取端逐次核验，不代表任务或模型执行许可。
+
+冷启交换必须发生在 delivery 被 accepted 并完成之前，只有仍为 ready 的持久 batch 可被核验。receipt 完成后不能用旧 delivery 再次交换；进程丢失或凭据过期后的长期后台读取恢复，不能仅凭本接口宣称已实现。
 
 以下生产接线仍未实现，PR 保持 Draft：
 
 - 用户明确启用/撤销的持久订阅 owner，以及现有 Composio 适配器内受限 trigger 操作和未知结果恢复。`Inbox.register` 只接受已经过真实 owner 授权的投影。
-- #1192 真实 `server.py` 的冷 receiver mount/admission、Runtime 无秘密 bootstrap 及实际连接源/Session 权限；不能放行所有 internal 路由规避。
+- #1192 真实 `server.py` 的冷 receiver mount/admission、用途限定 bootstrap 的消费者及实际连接源/Session 权限；不能放行所有 internal 路由规避。
 - Gmail 授权/读取 HTTP 路由采用真实 Authority 和已实现的共享预算；独立组件通过不代表调用方已装配。
 - 真实 trigger/OAuth、暂停实例唤醒、实际 Gmail 与集群验收。
 

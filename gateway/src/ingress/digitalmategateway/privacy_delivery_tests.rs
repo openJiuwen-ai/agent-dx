@@ -1,13 +1,16 @@
 //! Real PostgreSQL and HTTP identity boundary, controlled Binding/provider input.
 use super::super::{
+    application_ws::{Application, ApplicationWsConfig},
     composio::WebhookVerifier,
+    connector_owner::{ConnectorWorkloadIdentity, OwnerAuthority, OwnerOperation},
     ingestion::{DeliveryAuthorization, Inbox, InboxLimits, SubscriptionBinding},
     privacy_center::PrivacyCenter,
     privacy_cipher::PrivacyCipher,
     privacy_http::PrivacyHttp,
 };
 use super::*;
-use adx_agent_core::{AgentBinding, EnvironmentRef, TemplateRef};
+use crate::ingress::accounts::{BusinessAuth, Principal};
+use adx_agent_core::{AgentBinding, EnvironmentRef};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use deadpool_postgres::{Manager, Pool};
@@ -30,16 +33,51 @@ impl BindingReader for CurrentBinding {
 #[tokio::test]
 #[ignore = "requires the explicit task-owned PostgreSQL database"]
 async fn persisted_batch_identity_is_current_and_cannot_read_user_configuration() {
-    exercise_delivery(false).await;
+    exercise_delivery(false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires task PostgreSQL and the exact DigitalMate Python consumer source"]
 async fn python_receiver_uses_real_https_identity_and_rejects_revoked_subscription() {
-    exercise_delivery(true).await;
+    exercise_delivery(true, false).await;
 }
 
-async fn exercise_delivery(python_receiver: bool) {
+#[tokio::test]
+#[ignore = "requires the explicit task-owned PostgreSQL database"]
+async fn delivery_bootstrap_exchanges_only_bounded_connector_identity() {
+    exercise_delivery(false, true).await;
+}
+
+struct NoSession;
+#[async_trait]
+impl BusinessAuth for NoSession {
+    async fn login(
+        &self,
+        _: crate::ingress::accounts::LoginRequest,
+    ) -> Result<crate::ingress::accounts::LoginResponse, Error> {
+        Err(Error::Unauthorized)
+    }
+    async fn authenticate(&self, _: &str) -> Result<Principal, Error> {
+        Err(Error::Unauthorized)
+    }
+    async fn check(&self, _: &Principal) -> Result<(), Error> {
+        Err(Error::Unauthorized)
+    }
+    async fn logout(&self, _: &str) -> Result<(), Error> {
+        Err(Error::Unauthorized)
+    }
+    async fn quota(&self, _: &Principal) -> Result<crate::ingress::accounts::QuotaResponse, Error> {
+        Err(Error::Unauthorized)
+    }
+    async fn model_parameters(
+        &self,
+        _: &Principal,
+    ) -> Result<adx_agent_core::mounts::Parameters, Error> {
+        panic!("delivery bootstrap cannot obtain model credentials")
+    }
+}
+
+async fn exercise_delivery(python_receiver: bool, bootstrap: bool) {
     let url = std::env::var("ADX_INGESTION_TEST_DATABASE_URL").unwrap();
     let pg: tokio_postgres::Config = url.parse().unwrap();
     assert!(pg
@@ -59,19 +97,28 @@ async fn exercise_delivery(python_receiver: bool) {
     client.execute("INSERT INTO adx_accounts.users(user_id,provider,developer_scope,client_id,union_id,agreement_version) VALUES($1,'test','delivery-test','test',$1,'1')", &[&user]).await.unwrap();
     drop(client);
     let accounts = AccountStore::from_url(&url, true, None).await.unwrap();
-    let scope = Scope {
-        tenant: "tenant-delivery".into(),
+    let application = ApplicationWsConfig {
+        request_timeout_seconds: 5,
         template: "digitalmate".into(),
-        template_ref: TemplateRef::Version("1".into()),
-        binding_id: user.clone(),
+        template_ref: "1".into(),
+        backend_path: "/ws".into(),
+        service_port: 8080,
     };
+    let scope = application
+        .scope("tenant-delivery", &user, Application::DigitalMate)
+        .unwrap();
+    let workspace =
+        super::super::entrypoint::workspace_parameters("tenant-delivery", "digitalmate", &user)
+            .unwrap()
+            .remove("workspace")
+            .unwrap();
     let current = Arc::new(CurrentBinding(Mutex::new(AgentBinding {
         scope: scope.clone(),
         generation: "generation-one".into(),
         current: EnvironmentRef::new("1".into(), "instance-one".into()),
         secondary: None,
         phase: BindingPhase::Active,
-        parameters: BTreeMap::from([("workspace".into(), "workspace-delivery".into())]),
+        parameters: BTreeMap::from([("workspace".into(), workspace.clone())]),
         volumes: BTreeMap::new(),
         creation_attempts: BTreeMap::new(),
     })));
@@ -83,7 +130,7 @@ async fn exercise_delivery(python_receiver: bool) {
         signer.clone(),
     ));
     let credentials = identity
-        .admit_workload(&scope, "workspace-delivery", &user)
+        .admit_workload(&scope, &workspace, &user)
         .await
         .unwrap();
     let cipher = PrivacyCipher::new(
@@ -91,7 +138,7 @@ async fn exercise_delivery(python_receiver: bool) {
         BTreeMap::from([("key-one".into(), [7; 32])]),
     )
     .unwrap();
-    let center = Arc::new(PrivacyCenter::new(accounts, cipher, signer));
+    let center = Arc::new(PrivacyCenter::new(accounts, cipher, signer.clone()));
     center
         .put(
             &credentials.privacy,
@@ -116,10 +163,10 @@ async fn exercise_delivery(python_receiver: bool) {
     let mut binding = SubscriptionBinding {
         tenant: scope.tenant.clone(),
         user_id: user.clone(),
-        workspace: "workspace-delivery".into(),
+        workspace: workspace.clone(),
         template: "digitalmate".into(),
         template_ref: "1".into(),
-        binding_id: user.clone(),
+        binding_id: scope.binding_id.clone(),
         binding_generation: "generation-one".into(),
         service_port: 8080,
         connection_id: user.clone(),
@@ -179,9 +226,34 @@ async fn exercise_delivery(python_receiver: bool) {
     let admission = delivery.verify(token).await.unwrap();
     assert_eq!(admission.json()["batch_id"], lease.batch.batch_id);
     assert_eq!(admission.json()["purpose"], "ingestion.delivery");
-    let http = Arc::new(
-        PrivacyHttp::new(center.clone(), identity.clone()).with_ingestion(delivery.clone()),
+    let owner = Arc::new(
+        OwnerAuthority::new(
+            "tenant-delivery".into(),
+            application,
+            signer.clone(),
+            current.clone(),
+            Arc::new(NoSession),
+        )
+        .unwrap(),
     );
+    let mut http =
+        PrivacyHttp::new(center.clone(), identity.clone()).with_ingestion(delivery.clone());
+    if bootstrap {
+        http = http.with_authorization_owner(owner.clone());
+    }
+    let http = Arc::new(http);
+    let grant_count: i64 = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT count(*) FROM adx_accounts.privacy_grants WHERE user_id=$1",
+            &[&user],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let mut bootstrap_credential = None;
     for (path, credential, body, status) in [
         (
             "/v1/ingestion/admit",
@@ -193,7 +265,11 @@ async fn exercise_delivery(python_receiver: bool) {
             "/v1/ingestion/bootstrap",
             token,
             b"{}",
-            http::StatusCode::SERVICE_UNAVAILABLE,
+            if bootstrap {
+                http::StatusCode::OK
+            } else {
+                http::StatusCode::SERVICE_UNAVAILABLE
+            },
         ),
         (
             "/v1/ingestion/admit",
@@ -236,7 +312,97 @@ async fn exercise_delivery(python_receiver: bool) {
             assert_eq!(json, serde_json::json!({"error":"AUTH_UNAVAILABLE"}));
             assert!(json.get("value").is_none());
             assert!(json.get("token").is_none());
+        } else if path.ends_with("/bootstrap") && status == http::StatusCode::OK {
+            let json: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 4);
+            assert_eq!(json["purpose"], "ingestion.connector-bootstrap");
+            assert_eq!(json["target"]["user_id"], user);
+            assert_eq!(json["target"]["workspace"], workspace);
+            assert_eq!(json["target"]["binding_id"], scope.binding_id);
+            assert_eq!(json["target"]["binding_generation"], "generation-one");
+            assert_eq!(json["target"]["environment_id"], "instance-one");
+            assert_eq!(json["target"]["service_port"], 8080);
+            assert_eq!(json["target"].as_object().unwrap().len(), 9);
+            let credential = json["connector_token"].as_str().unwrap().to_owned();
+            assert!(credential.starts_with("dm-connector-v1."));
+            let claims = signer.verify_connector(&credential, false).unwrap();
+            assert_eq!(claims.bootstrap_until, Some(claims.exp));
+            assert_eq!(claims.recovery_until, claims.exp);
+            assert!(claims.exp <= admission.claims.exp);
+            assert_eq!(json["expires_at"], claims.exp);
+            assert!(signer.verify(&credential, false).is_err());
+            bootstrap_credential = Some(credential);
         }
+    }
+    if let Some(credential) = bootstrap_credential {
+        let count: i64 = pool
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT count(*) FROM adx_accounts.privacy_grants WHERE user_id=$1",
+                &[&user],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            count, grant_count,
+            "bootstrap must reuse the existing grant"
+        );
+        assert!(identity.connector_identity(&credential).await.is_ok());
+        assert!(matches!(
+            identity.renew_connector(&credential).await,
+            Err(Error::Forbidden)
+        ));
+        let headers = http::HeaderMap::from_iter([(
+            http::header::AUTHORIZATION,
+            format!("Bearer {credential}").parse().unwrap(),
+        )]);
+        let workload = ConnectorWorkloadIdentity::authenticate(identity.clone(), &headers)
+            .await
+            .unwrap();
+        assert!(owner
+            .workload_headers(&workload, OwnerOperation::Intent, b"{}")
+            .await
+            .is_ok());
+        for (path, body, status) in [
+            (
+                "/v1/connector/identity",
+                b"{}".as_slice(),
+                http::StatusCode::OK,
+            ),
+            ("/v1/connector/renew", b"{}", http::StatusCode::FORBIDDEN),
+            (
+                "/v1/secret/get",
+                br#"{"name":"DIGITALMATE_CONFIG"}"#,
+                http::StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let request = http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(Full::new(bytes::Bytes::copy_from_slice(body)))
+                .unwrap();
+            assert_eq!(http.handle(request).await.status(), status, "{path}");
+        }
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingestion/bootstrap")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Full::new(bytes::Bytes::from_static(
+                br#"{"user_id":"forged"}"#,
+            )))
+            .unwrap();
+        assert_eq!(
+            http.handle(request).await.status(),
+            http::StatusCode::BAD_REQUEST
+        );
     }
     let mut python = if python_receiver {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -334,6 +500,9 @@ async fn exercise_delivery(python_receiver: bool) {
         Err(Error::Unauthorized)
     ));
     assert!(delivery.headers(&lease.batch).await.is_err());
+    if bootstrap {
+        assert!(delivery.bootstrap(token, &owner).await.is_err());
+    }
     if let Some((ref mut child, ref mut output, shutdown, server)) = python {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         child

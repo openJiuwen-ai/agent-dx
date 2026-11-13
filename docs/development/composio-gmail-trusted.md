@@ -237,9 +237,17 @@ Outlook, ADX deployment or Host/Session execution proof.
 
 The prototype full-configuration bootstrap has been removed from the configuration
 owner and Python consumer. Delivery cannot decrypt user model keys or obtain a
-privacy identity. `/v1/ingestion/bootstrap` validates delivery then returns503
-`AUTH_UNAVAILABLE` without value/token until Runtime publishes a purpose-limited
-secret-free contract. The same-root identity and sole existing writers are retained.
+privacy identity. `/v1/ingestion/bootstrap` accepts the current delivery bearer
+and exactly `{}`. With the existing configured owner runtime, it returns only
+`purpose: "ingestion.connector-bootstrap"`, the current `target`, a
+`connector_token` and `expires_at`. The existing grant and signer are reused;
+the signed bootstrap deadline cannot outlive delivery and `/v1/connector/renew`
+refuses this credential. The target is derived from the complete current Binding
+and configured port, matching the persisted batch scope/generation/port. Missing
+owner configuration still returns `AUTH_UNAVAILABLE`. No privacy bearer, settings,
+model keys or task/model permission is returned. Receiver intent and connection
+permission checks remain mandatory. Local producer tests do not prove a deployed
+cold receiver or live mailbox integration.
 
 Current local canonical-LF `cargo fmt --all -- --check` and the real
 `cargo clippy --workspace --all-targets --all-features -- -D warnings` both pass.
