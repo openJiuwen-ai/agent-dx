@@ -256,6 +256,22 @@ struct PreparedIngestion {
     verifier: Arc<super::composio::WebhookVerifier>,
 }
 impl DigitalMateGatewayApi {
+    /// Foreground connector admission uses only the configured DigitalMate
+    /// application. It never falls back to Jiuwen or Orbit or reads model keys.
+    pub fn foreground_admission(
+        &self,
+    ) -> accounts::Result<super::foreground_admission::ForegroundAdmission> {
+        super::foreground_admission::ForegroundAdmission::new(
+            self.config.tenant.clone(),
+            self.config
+                .digitalmate
+                .clone()
+                .ok_or(accounts::Error::Configuration)?,
+            self.managed.clone(),
+            self.auth.clone(),
+        )
+    }
+
     pub fn new(
         config: DigitalMateGatewayConfig,
         managed: Arc<ManagedService>,

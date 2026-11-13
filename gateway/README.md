@@ -691,6 +691,22 @@ session invalidation or route revocation closes the shared forwarding stream.
 Account expiry/revocation checks use the existing session guard (at most a
 30-second polling interval for revocation).
 
+### Foreground connector identity
+
+`DigitalMateGatewayApi::foreground_admission()` exposes an account-session
+admission handle for foreground connector callers. Its `authenticate(&HeaderMap)`
+returns `ForegroundIdentity` with `tenant()`, `user_id()`, `workspace()` and
+`binding_scope()` getters. `check().await` rechecks the actual account/session
+owner before subsequent operations. Neither type accepts JSON identity fields.
+
+Admission uses only the configured `digitalmate` application, the existing
+business bearer/session checks and the existing workspace derivation. An existing
+Binding must be active and have the same workspace. Missing DigitalMate config
+does not fall back to Jiuwen or Orbit. The call reads Binding metadata without
+initializing a Binding/Environment or requesting model credentials. It supplies
+no background, arbitrary-tool or model permission; connector handlers retain
+their own operation and connection checks.
+
 ### Existing Jiuwen protocol and accounts
 
 Build with `--features agent-api`. Configure `ADX_JIUWEN_CONFIG` using

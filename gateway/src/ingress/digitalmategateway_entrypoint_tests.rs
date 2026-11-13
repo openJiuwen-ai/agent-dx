@@ -18,6 +18,9 @@ use tokio_tungstenite::{
 #[path = "digitalmategateway_orbit_ws_tests.rs"]
 mod orbit_ws_tests;
 
+#[path = "digitalmategateway_foreground_admission_tests.rs"]
+mod foreground_admission_tests;
+
 fn settings() -> DigitalMateGatewayConfig {
     serde_json::from_value(json!({"tenant":"tenant","jiuwen":{"agent_type":"assistant","template":"demo","version":"1"}})).unwrap()
 }

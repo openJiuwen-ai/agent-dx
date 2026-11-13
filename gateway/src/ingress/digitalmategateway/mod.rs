@@ -8,6 +8,7 @@ pub mod download_runtime;
 pub mod download_token;
 pub mod driver;
 pub mod entrypoint;
+pub mod foreground_admission;
 pub mod frontend;
 pub mod ingestion;
 mod privacy_center;
