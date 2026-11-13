@@ -145,6 +145,10 @@ For an HTTP request carrying `X-ADX-Processing-Timeout-Ms` (one positive integer
 1–86400000 milliseconds), Ingress creates one deadline after receiving its headers.
 Authentication, route lookup, resume, committed-route delivery, pool/CONNECT
 admission, upstream processing and response streaming consume that same deadline.
+For a native Execd single-file `GET /direct/<environment>/download` returning
+`200` or `206`, the deadline ends at the response headers. Its file body may
+continue streaming beyond that deadline. Existing SDK read-inactivity timeouts
+and Range retries still apply; this does not add a separate download budget.
 The header is removed before forwarding. A cancelled or expired wake RPC returns
 HTTP 503 `ENV_RESUMING` only while application bytes have not been sent, with
 `Retry-After: 1`, a reserved `X-ADX-Error-Code` marker, and a structured error

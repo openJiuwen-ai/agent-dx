@@ -66,6 +66,10 @@ poll 等待。`shell.poll.wait_timeout` 当前不使后端阻塞。cwd 和环境
 `X-ADX-Processing-Timeout-Ms` 是 Ingress 的整条 HTTP 处理截止，和命令执行／等待
 预算分开；流式响应已开始时截止会结束流，不可能再返回新的 JSON 错误正文。
 
+原生 Execd 单文件 `GET /direct/<environment>/download` 成功返回 `200` 或 `206`
+时，该截止只约束响应头就绪前的阶段，文件正文不再受通用处理总时长限制。
+下载继续沿用 SDK 现有的读空闲超时和 Range 续传，不新增下载总预算。
+
 ## 身份、重试与错误
 
 `file.search` 在运行时匹配文件名或完整路径，区分大小写，支持 `*`、`?` 和字符类；

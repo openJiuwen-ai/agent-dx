@@ -43,6 +43,10 @@ use uuid::Uuid;
 type BoxError = Box<dyn Error + Send + Sync>;
 pub(super) type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 
+// Only the native file forwarding branch may opt out of the processing body deadline.
+#[derive(Clone, Copy)]
+struct FileDownloadResponse;
+
 struct DeadlineBody {
     body: ProxyBody,
     timer: Pin<Box<tokio::time::Sleep>>,
@@ -1111,7 +1115,12 @@ impl Ingress {
                 {
                     response = resuming_response(&request_id, &instance_id);
                 }
+                let file_download = response
+                    .extensions_mut()
+                    .remove::<FileDownloadResponse>()
+                    .is_some();
                 if budgeted
+                    && !file_download
                     && processing.is_forwarded()
                     && !deadline_exceeded
                     && response.status() != StatusCode::SWITCHING_PROTOCOLS
@@ -2067,6 +2076,15 @@ impl Ingress {
                 .proxy_service_route(request, ingress_security, route)
                 .await);
         }
+        let file_download = route.access_kind == AccessKind::Direct
+            && route.target.target_port == self.default_direct_port
+            && request.method() == http::Method::GET
+            && request.uri().path().starts_with("/direct/")
+            && parsed.stripped_path == "/download"
+            // Match the query normalization below and Execd's first type value.
+            && url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+                .find(|(key, _)| key == "type")
+                .is_none_or(|(_, kind)| kind.is_empty() || kind == "file");
         let auth_required = self.auth_required(parsed.access_kind, &route);
         if ingress_security == IngressSecurity::Plaintext && auth_required {
             return Ok(tls_required());
@@ -2209,6 +2227,16 @@ impl Ingress {
                 Ok(mut response) => {
                     response.headers_mut().remove("x-adx-error-code");
                     strip_hop_by_hop_headers(response.headers_mut());
+                    if file_download
+                        && matches!(
+                            response.status(),
+                            StatusCode::OK | StatusCode::PARTIAL_CONTENT
+                        )
+                    {
+                        // A successful file stream may outlive request processing.
+                        // The existing SDK retains its read timeout and Range recovery.
+                        response.extensions_mut().insert(FileDownloadResponse);
+                    }
                     return Ok(response.map(|body| {
                         body.map_err(|error| -> BoxError { Box::new(error) })
                             .boxed_unsync()

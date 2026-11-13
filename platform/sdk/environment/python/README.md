@@ -356,6 +356,8 @@ retry on the same owner within the resume budget. A temporary wake failure befor
 forwarding returns HTTP 503. A finite SDK HTTP request sends
 `X-ADX-Processing-Timeout-Ms`: authentication, route lookup, wake, route delivery,
 connection admission, forwarding and response streaming share one Ingress deadline.
+For successful native single-file downloads, the Ingress deadline ends at the
+response headers; SDK read-inactivity timeouts and Range retries still apply.
 The SDK defaults to 300 seconds for a data request and adds a configurable
 communication margin (30 seconds by default) to its HTTP timeout. Without the
 header, wake and route delivery share a 300-second default; existing forwarding
