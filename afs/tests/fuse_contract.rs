@@ -798,8 +798,18 @@ fn dfs_buffered_open_after_old_lookup_size_reads_fresh_length_without_fstat() {
 #[test]
 #[ignore = "requires Linux /dev/fuse and fusermount3"]
 fn dfs_buffered_new_open_cannot_reuse_an_old_inflight_read_result() {
+    // Uncached names: the competing open's path walk itself enters FUSE.
     for workers in [1, 2, 32] {
-        assert_dfs_open_fences_inflight_read(workers);
+        assert_dfs_open_fences_inflight_read(workers, Duration::ZERO);
+    }
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_buffered_new_open_under_kernel_ttl_cannot_reuse_an_old_inflight_read_result() {
+    // Cached names: the competing open's first FUSE request is OPEN.
+    for workers in [1, 2, 32] {
+        assert_dfs_open_fences_inflight_read(workers, Duration::from_secs(1));
     }
 }
 
@@ -1015,7 +1025,165 @@ impl Drop for ParallelReadGuard<'_> {
     }
 }
 
-fn assert_dfs_open_fences_inflight_read(workers: u16) {
+/// A pinned-version fixture for R97/R96: `old` is what an already-open
+/// read-only handle reads; `publish` moves head without moving that handle.
+fn mount_pinned_versions(
+    old: &[u8],
+) -> (
+    tempfile::TempDir,
+    Arc<VersionedReadBackend>,
+    MountedTestBackend,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let backend = Arc::new(VersionedReadBackend::new("pinned-old", old.to_vec()));
+    backend.pin_handles.store(true, Ordering::SeqCst);
+    let session = MountedTestBackend::mount_dfs_with_options(
+        backend.clone(),
+        mount,
+        fuse::FuseMountOptions {
+            exec: fuse::FuseExecOptions {
+                fuse_workers: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    (temp, backend, session)
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_pinned_read_beyond_its_version_never_returns_kernel_zero_fill() {
+    // R97. The kernel keeps one i_size per inode. A path stat (no file handle)
+    // that reports a longer head while a pinned handle's READ is in flight
+    // makes the kernel refuse to shrink i_size on the short reply, and the
+    // zero-filled page tail reaches the application. The STAT is issued while
+    // the READ is held in the backend, so the order is deterministic.
+    let old = vec![b'o'; 1024];
+    let (_temp, backend, session) = mount_pinned_versions(&old);
+    let path = session.mount.join("file");
+    let file = std::fs::File::open(&path).unwrap();
+    let mut first = [0; 16];
+    file.read_exact_at(&mut first, 0).unwrap();
+    assert_eq!(first, [b'o'; 16]);
+
+    let mut head = old.clone();
+    head.extend(std::iter::repeat_n(b'n', 8192));
+    backend.publish("pinned-head", head);
+    let _ = std::fs::metadata(&path).unwrap();
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *backend.read_blocker.lock().unwrap() = Some(WriteBlocker {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let reader = std::thread::spawn(move || {
+        let mut bytes = vec![0xff; 64];
+        let read = file.read_at(&mut bytes, 4096)?;
+        bytes.truncate(read);
+        io::Result::Ok(bytes)
+    });
+    if entered_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        *backend.pathwise_getattr.lock().unwrap() = Some(seen_tx);
+        let stat_path = path.clone();
+        let stat = std::thread::spawn(move || std::fs::metadata(stat_path).map(|m| m.len()));
+        seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("path stat did not reach the backend while the READ was held");
+        // Let the STAT reply land in the kernel before the short READ reply.
+        stat.join().unwrap().unwrap();
+        release_tx.send(()).unwrap();
+    } else {
+        // No READ reached the backend: the kernel already knew the pinned EOF.
+        backend.read_blocker.lock().unwrap().take();
+    }
+    let bytes = reader.join().unwrap().unwrap();
+    assert!(
+        !bytes.contains(&0),
+        "pinned handle received {} kernel zero-filled bytes instead of EOF",
+        bytes.iter().filter(|byte| **byte == 0).count()
+    );
+    assert!(
+        bytes.is_empty(),
+        "pinned handle read past its version: {bytes:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_pinned_handle_fstat_matches_the_bytes_it_reads() {
+    // R96. fstat(2) reaches FUSE as GETATTR without a file handle (statx), so
+    // the size it shows must be the one the pinned handle reads to EOF.
+    let old = vec![b'o'; 1024];
+    let (_temp, backend, session) = mount_pinned_versions(&old);
+    let path = session.mount.join("file");
+    let mut file = std::fs::File::open(&path).unwrap();
+    let mut head = old.clone();
+    head.extend(std::iter::repeat_n(b'n', 8192));
+    backend.publish("fstat-head", head);
+    let fstat_len = file.metadata().unwrap().len();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, old);
+    assert_eq!(
+        fstat_len,
+        bytes.len() as u64,
+        "fstat and pinned reads disagree"
+    );
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn dfs_path_stat_follows_the_cached_version_until_its_handles_close() {
+    // R97 trade-off (D-R3-1): while a pinned version is in the page cache,
+    // path stats on this mount report its length; a newer handle still reads
+    // the whole newer version; once the pinned handles close, stats show head.
+    let old = vec![b'o'; 1024];
+    let (_temp, backend, session) = mount_pinned_versions(&old);
+    let path = session.mount.join("file");
+    let pinned = std::fs::File::open(&path).unwrap();
+    let mut first = [0; 16];
+    pinned.read_exact_at(&mut first, 0).unwrap();
+    let mut head = old.clone();
+    head.extend(std::iter::repeat_n(b'n', 8192));
+    backend.publish("stat-head", head.clone());
+
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), old.len() as u64);
+    let mut newer = std::fs::File::open(&path).unwrap();
+    let mut bytes = Vec::new();
+    newer.read_to_end(&mut bytes).unwrap();
+    assert_eq!(
+        bytes, head,
+        "a newer open must read the whole newer version"
+    );
+    // Known limitation: the newer (direct I/O) handle's fstat shows the
+    // cached version's length while the older version stays cached.
+    assert_eq!(newer.metadata().unwrap().len(), old.len() as u64);
+
+    drop(pinned);
+    drop(newer);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut reported = 0;
+    while std::time::Instant::now() < deadline {
+        reported = std::fs::metadata(&path).unwrap().len();
+        if reported == head.len() as u64 {
+            break;
+        }
+        // RELEASE is asynchronous to close(2); give it a moment.
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        reported,
+        head.len() as u64,
+        "stat must return to head after close"
+    );
+}
+
+fn assert_dfs_open_fences_inflight_read(workers: u16, kernel_cache_ttl: Duration) {
     let temp = tempfile::tempdir().unwrap();
     let mount = temp.path().join("mnt");
     std::fs::create_dir(&mount).unwrap();
@@ -1036,7 +1204,10 @@ fn assert_dfs_open_fences_inflight_read(workers: u16) {
                         fuse_workers: workers,
                         ..Default::default()
                     },
-                    ..Default::default()
+                    dfs: fuse::DfsMountOptions {
+                        kernel_cache_ttl,
+                        ..Default::default()
+                    },
                 },
             )
             .unwrap(),
@@ -1071,7 +1242,12 @@ fn assert_dfs_open_fences_inflight_read(workers: u16) {
     // With one worker even the competing LOOKUP must queue behind the old
     // READ. With two, require OPEN itself to reach the frontend before release.
     // Neither case requires the backend OPEN to bypass a correct local fence.
-    let competing_operation = if workers == 1 { "lookup" } else { "open" };
+    // Under a kernel TTL the path walk is cached and OPEN is the first request.
+    let competing_operation = if workers == 1 && kernel_cache_ttl.is_zero() {
+        "lookup"
+    } else {
+        "open"
+    };
     let operation_label = format!("operation=\"{competing_operation}\"");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let new_open_received = loop {
@@ -1142,6 +1318,11 @@ struct VersionedReadBackend {
     lookup_size_at_publication: AtomicU64,
     read_blocker: Mutex<Option<WriteBlocker>>,
     parallel_read_probe: Mutex<Option<Arc<ParallelReadProbe>>>,
+    /// Decision 4a: a read-only handle keeps the version it opened until
+    /// close, even after a fresh open of a newer head (R97/R96 cases).
+    pin_handles: std::sync::atomic::AtomicBool,
+    /// Signalled when a GETATTR without a file handle reaches the backend.
+    pathwise_getattr: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 impl VersionedReadBackend {
@@ -1168,6 +1349,8 @@ impl VersionedReadBackend {
             lookup_size_at_publication: AtomicU64::new(u64::MAX),
             read_blocker: Mutex::new(None),
             parallel_read_probe: Mutex::new(None),
+            pin_handles: std::sync::atomic::AtomicBool::new(false),
+            pathwise_getattr: Mutex::new(None),
         }
     }
 
@@ -1214,6 +1397,11 @@ impl Backend for VersionedReadBackend {
         if inode.value != 2 {
             return Err(not_found());
         }
+        if handle.is_none()
+            && let Some(seen) = self.pathwise_getattr.lock().unwrap().as_ref()
+        {
+            let _ = seen.send(());
+        }
         let state = self.state.lock().unwrap();
         let content = handle
             .and_then(|handle| state.handles.get(&handle.0))
@@ -1244,8 +1432,10 @@ impl Backend for VersionedReadBackend {
         // Native DFS fresh open invalidates existing handle views. Model the
         // resulting next-read refresh, without pinning old descriptors forever.
         // A READ that already captured its Arc still owns its prior version.
-        for opened in state.handles.values_mut() {
-            *opened = current.clone();
+        if !self.pin_handles.load(Ordering::SeqCst) {
+            for opened in state.handles.values_mut() {
+                *opened = current.clone();
+            }
         }
         state.handles.insert(handle, current);
         Ok(FileHandle(handle))
@@ -1262,6 +1452,13 @@ impl Backend for VersionedReadBackend {
 
     fn supports_parallel_reads(&self, handle: FileHandle) -> bool {
         self.state.lock().unwrap().handles.contains_key(&handle.0)
+    }
+
+    /// Pinned handles read an immutable open view, as native DFS read-only
+    /// handles do; a second version on the inode must then use direct I/O.
+    fn fixed_read_view(&self, handle: FileHandle) -> bool {
+        self.pin_handles.load(Ordering::SeqCst)
+            && self.state.lock().unwrap().handles.contains_key(&handle.0)
     }
 
     fn read(
@@ -1463,6 +1660,7 @@ impl Backend for MockBackend {
             .and_then(|handle| state.file_handles.get(&handle.0).copied())
             .unwrap_or(inode.value);
         let node = state.nodes.get(&inode).ok_or_else(not_found)?;
+        self.note(format!("getattr:{inode}"));
         let call = self.getattr_calls.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(attributes(node.kind, node.data.len() as u64 + call))
     }
@@ -2191,17 +2389,28 @@ mod front_gate_ordering {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_options(fuse::FuseMountOptions::default())
+        }
+
+        /// The kernel entry/attribute TTL decides which path requests reach
+        /// FUSE at all; ordering applies to the requests that do.
+        fn with_kernel_ttl(kernel_cache_ttl: Duration) -> Self {
+            Self::with_options(fuse::FuseMountOptions {
+                dfs: fuse::DfsMountOptions {
+                    kernel_cache_ttl,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        }
+
+        fn with_options(options: fuse::FuseMountOptions) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let mount = temp.path().join("mnt");
             std::fs::create_dir(&mount).unwrap();
             let backend = Arc::new(MockBackend::default());
             backend.queued_writes.store(true, Ordering::SeqCst);
-            let session = fuse::mount_dfs_with_options(
-                backend.clone(),
-                &mount,
-                fuse::FuseMountOptions::default(),
-            )
-            .unwrap();
+            let session = fuse::mount_dfs_with_options(backend.clone(), &mount, options).unwrap();
             wait_until_mounted(&mount).unwrap();
             Self {
                 _temp: temp,
@@ -2236,14 +2445,6 @@ mod front_gate_ordering {
 
         fn arrived(&self, event: &str) -> bool {
             self.backend.trace().iter().any(|seen| seen == event)
-        }
-
-        fn count(&self, event: &str) -> usize {
-            self.backend
-                .trace()
-                .iter()
-                .filter(|seen| *seen == event)
-                .count()
         }
 
         fn position(&self, event: &str) -> usize {
@@ -2380,19 +2581,20 @@ mod front_gate_ordering {
     #[test]
     #[ignore = "requires Linux /dev/fuse and fusermount3"]
     fn path_lookup_waits_for_acknowledged_writes() {
-        let fx = Fixture::new();
+        // Uncached names: every path walk sends LOOKUP. The lookup may resolve
+        // the name at once, but its reply waits for the resolved inode's
+        // acknowledged body and is resolved again after it. (The mock's
+        // attribute size counts calls, so ordering is asserted on the trace.)
+        let fx = Fixture::with_kernel_ttl(Duration::ZERO);
         let file = fx.open("a", true);
         let release = acked_blocked_write(&fx, &file);
 
-        // CREATE already looked the name up once; count only later lookups.
-        let lookups = fx.count("lookup:a");
         let path = fx.mount.join("a");
         let looked_up = spawn(move || std::fs::metadata(path));
         std::thread::sleep(QUIET);
-        assert_eq!(
-            fx.count("lookup:a"),
-            lookups,
-            "LOOKUP overtook an acknowledged write"
+        assert!(
+            looked_up.try_recv().is_err(),
+            "the path query returned before the acknowledged write's body"
         );
 
         release.send(()).unwrap();
@@ -2401,13 +2603,54 @@ mod front_gate_ordering {
         let finished = fx.position("write:finish");
         assert!(
             trace[finished..].iter().any(|seen| seen == "lookup:a"),
-            "the path lookup never reached the backend after the write: {trace:?}"
+            "the reply was not resolved after the write: {trace:?}"
         );
     }
 
+    /// With a kernel TTL the path walk may be served from the dentry cache;
+    /// whatever the path query does send to FUSE (LOOKUP or GETATTR) answers
+    /// only after the acknowledged write.
     #[test]
     #[ignore = "requires Linux /dev/fuse and fusermount3"]
-    fn namespace_change_waits_for_acknowledged_writes_to_other_files() {
+    fn path_metadata_under_kernel_ttl_waits_for_acknowledged_writes() {
+        let fx = Fixture::with_kernel_ttl(Duration::from_secs(1));
+        let file = fx.open("a", true);
+        let inode = *fx
+            .backend
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get(&(1, std::ffi::OsString::from("a")))
+            .unwrap();
+        let getattr = format!("getattr:{inode}");
+        let release = acked_blocked_write(&fx, &file);
+        let start = fx.backend.trace().len();
+        let path = fx.mount.join("a");
+        let queried = spawn(move || std::fs::metadata(path));
+        std::thread::sleep(QUIET);
+        assert!(
+            queried.try_recv().is_err(),
+            "the path query returned before the acknowledged write's body"
+        );
+        release.send(()).unwrap();
+        queried.recv_timeout(DEADLINE).unwrap().unwrap();
+        let trace = fx.backend.trace();
+        let finished = fx.position("write:finish");
+        assert!(
+            finished >= start
+                && trace[finished..]
+                    .iter()
+                    .any(|seen| seen == "lookup:a" || *seen == getattr),
+            "the path reply was not produced after the acknowledged write: {trace:?}"
+        );
+    }
+
+    /// A name change orders only through the kernel's directory locks: an
+    /// acknowledged body of another file does not hold it back (R79).
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn namespace_change_does_not_wait_for_another_files_acknowledged_write() {
         let fx = Fixture::new();
         let file = fx.open("a", true);
         drop(fx.open("b", true));
@@ -2415,15 +2658,39 @@ mod front_gate_ordering {
 
         let (from, to) = (fx.mount.join("b"), fx.mount.join("c"));
         let renamed = spawn(move || std::fs::rename(from, to));
-        std::thread::sleep(QUIET);
+        renamed.recv_timeout(DEADLINE).unwrap().unwrap();
         assert!(
-            !fx.arrived("rename:start"),
-            "RENAME overtook an acknowledged write"
+            !fx.arrived("write:finish"),
+            "the unrelated body was not held"
         );
 
         release.send(()).unwrap();
+        file.sync_all().unwrap();
+        fx.assert_before("rename:finish", "write:finish");
+    }
+
+    /// Renaming the file whose acknowledged body is still queued does not lose
+    /// it: the body lands in the same inode, now under the new name. POSIX
+    /// orders writes by descriptor, not by name. The rename itself may wait
+    /// for that body: the kernel's path walk looks the source name up, and a
+    /// lookup reply includes the resolved inode's acknowledged writes.
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn renaming_a_file_with_an_acknowledged_write_keeps_the_write() {
+        let fx = Fixture::new();
+        let file = fx.open("a", true);
+        let release = acked_blocked_write(&fx, &file);
+
+        let (from, to) = (fx.mount.join("a"), fx.mount.join("c"));
+        let renamed = spawn(move || std::fs::rename(from, to));
+        std::thread::sleep(QUIET);
+        release.send(()).unwrap();
         renamed.recv_timeout(DEADLINE).unwrap().unwrap();
-        fx.assert_before("write:finish", "rename:start");
+        file.sync_all().unwrap();
+        let mut bytes = [0u8; 4];
+        assert_eq!(fx.reader("c").read_at(&mut bytes, 0).unwrap(), 4);
+        assert_eq!(&bytes, b"abcd");
+        assert!(!fx.mount.join("a").exists());
     }
 
     #[test]
@@ -2503,9 +2770,12 @@ mod front_gate_ordering {
         assert_eq!(&bytes, b"WXYZ");
     }
 
+    /// A name change does not wait for an in-flight callback of another
+    /// file, and an in-flight read of the renamed file itself completes with
+    /// the data it was reading.
     #[test]
     #[ignore = "requires Linux /dev/fuse and fusermount3"]
-    fn namespace_change_waits_for_an_in_flight_file_callback() {
+    fn namespace_change_overlaps_in_flight_file_callbacks() {
         let fx = Fixture::new();
         let file = fx.open("a", true);
         assert_eq!(file.write_at(b"abcd", 0).unwrap(), 4);
@@ -2516,27 +2786,32 @@ mod front_gate_ordering {
         let (entered, release) = blocker(&fx.backend.read_blocker);
         let read = spawn(move || {
             let mut bytes = [0u8; 4];
-            reader.read_at(&mut bytes, 0)
+            let count = reader.read_at(&mut bytes, 0)?;
+            Ok(bytes[..count].to_vec())
         });
         entered.recv_timeout(DEADLINE).unwrap();
 
         let (from, to) = (fx.mount.join("b"), fx.mount.join("c"));
-        let renamed = spawn(move || std::fs::rename(from, to));
-        std::thread::sleep(QUIET);
-        assert!(
-            !fx.arrived("rename:start"),
-            "RENAME overlapped an in-flight READ"
-        );
+        spawn(move || std::fs::rename(from, to))
+            .recv_timeout(DEADLINE)
+            .unwrap()
+            .unwrap();
+        let (from, to) = (fx.mount.join("a"), fx.mount.join("d"));
+        spawn(move || std::fs::rename(from, to))
+            .recv_timeout(DEADLINE)
+            .unwrap()
+            .unwrap();
+        assert!(!fx.arrived("read:finish"), "the read was not in flight");
 
         release.send(()).unwrap();
-        assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), 4);
-        renamed.recv_timeout(DEADLINE).unwrap().unwrap();
-        fx.assert_before("read:finish", "rename:start");
+        assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), b"abcd");
     }
 
+    /// A file callback does not wait for an in-flight name change, of
+    /// another file or of its own.
     #[test]
     #[ignore = "requires Linux /dev/fuse and fusermount3"]
-    fn file_callback_waits_for_an_in_flight_namespace_change() {
+    fn file_callbacks_overlap_an_in_flight_namespace_change() {
         let fx = Fixture::new();
         let file = fx.open("a", true);
         assert_eq!(file.write_at(b"abcd", 0).unwrap(), 4);
@@ -2544,25 +2819,47 @@ mod front_gate_ordering {
         drop(fx.open("b", true));
         let reader = fx.reader("a");
 
-        let (entered, release) = blocker(&fx.backend.rename_blocker);
-        let (from, to) = (fx.mount.join("b"), fx.mount.join("c"));
+        for (from, to) in [("b", "c"), ("a", "d")] {
+            let (entered, release) = blocker(&fx.backend.rename_blocker);
+            let (from, to) = (fx.mount.join(from), fx.mount.join(to));
+            let renamed = spawn(move || std::fs::rename(from, to));
+            entered.recv_timeout(DEADLINE).unwrap();
+
+            let reading = reader.clone();
+            let read = spawn(move || {
+                let mut bytes = [0u8; 4];
+                let count = reading.read_at(&mut bytes, 0)?;
+                Ok(bytes[..count].to_vec())
+            });
+            assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), b"abcd");
+            assert!(renamed.try_recv().is_err(), "the rename was not in flight");
+            release.send(()).unwrap();
+            renamed.recv_timeout(DEADLINE).unwrap().unwrap();
+        }
+    }
+
+    /// Writing without closing and then renaming over another name: no error,
+    /// no corruption. The descriptor keeps writing the same inode, which the
+    /// target name now addresses once the bodies land.
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn write_then_rename_over_a_target_before_close() {
+        let fx = Fixture::new();
+        drop(fx.open("target", true));
+        let file = fx.open("tmp", true);
+        let release = acked_blocked_write(&fx, &file);
+        let (from, to) = (fx.mount.join("tmp"), fx.mount.join("target"));
         let renamed = spawn(move || std::fs::rename(from, to));
-        entered.recv_timeout(DEADLINE).unwrap();
-
-        let read = spawn(move || {
-            let mut bytes = [0u8; 4];
-            reader.read_at(&mut bytes, 0)
-        });
         std::thread::sleep(QUIET);
-        assert!(
-            !fx.arrived("read:start"),
-            "READ overlapped an in-flight RENAME"
-        );
-
         release.send(()).unwrap();
         renamed.recv_timeout(DEADLINE).unwrap().unwrap();
-        assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), 4);
-        fx.assert_before("rename:finish", "read:start");
+        assert_eq!(file.write_at(b"ef", 4).unwrap(), 2);
+        file.sync_all().unwrap();
+        drop(file);
+        let mut bytes = [0u8; 6];
+        assert_eq!(fx.reader("target").read_at(&mut bytes, 0).unwrap(), 6);
+        assert_eq!(&bytes, b"abcdef");
+        assert!(!fx.mount.join("tmp").exists());
     }
 }
 

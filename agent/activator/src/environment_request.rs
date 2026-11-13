@@ -5,6 +5,7 @@ use adx_agent_core::{
     lifecycle::RetentionPolicy,
     limits,
     network::{EgressProtocol, RuntimeNetworkPolicy, SandboxNetworkPolicy},
+    transport::{capped_deadline, remaining_time},
 };
 use ipnet::IpNet;
 use serde_json::{json, Value};
@@ -256,6 +257,51 @@ pub(crate) fn observed(
         }
     };
     Ok(observation(tenant, id, phase))
+}
+
+/// Deterministic pause operation identity for a stable tenant/id. The `pause-` prefix
+/// satisfies the Platform `x-adx-request-id` lifecycle contract; the hash makes retries
+/// replay the authoritative result instead of conflicting with a prior pause.
+pub fn pause_operation_id(tenant: &str, id: &str) -> Result<String, EnvironmentError> {
+    validate_identity(tenant)?;
+    validate_identity(id)?;
+    let identity = serde_json::to_vec(&(tenant, id))
+        .map_err(|_| EnvironmentError::Invalid("invalid Environment identity".into()))?;
+    Ok(format!("pause-activator-{:x}", Sha256::digest(identity)))
+}
+
+/// Pause submits only the checkpoint capture budget. Retention is intentionally omitted so
+/// the Environment inherits the create-time template pause policy.
+pub fn pause_input(timeout_seconds: u64) -> Value {
+    json!({ "timeoutSeconds": timeout_seconds })
+}
+
+/// Remaining checkpoint capture budget before an absolute deadline, clamped to the
+/// Platform API bounds [1, 3600] seconds. A local cap keeps the request inside the API
+/// Server's own `timeout_seconds` maximum even when the caller's deadline is far away.
+pub fn pause_timeout_seconds(deadline_unix_ms: u64) -> u64 {
+    remaining_time(capped_deadline(
+        Some(deadline_unix_ms),
+        Duration::from_secs(3600),
+    ))
+    .as_secs()
+    .clamp(1, 3600)
+}
+
+/// Validate a durable Paused response. The Platform acknowledges pause only after the
+/// checkpoint is published, so a mismatched identity or non-paused state is an unknown
+/// outcome: the caller re-queries the original ID rather than assuming success.
+pub fn paused(
+    tenant: &str,
+    id: &str,
+    value: &Value,
+) -> Result<EnvironmentObservation, EnvironmentError> {
+    if value["environmentId"] != id || value["state"] != "paused" {
+        return Err(EnvironmentError::OutcomeUnknown(
+            "invalid API Server pause response".into(),
+        ));
+    }
+    Ok(observation(tenant, id, EnvironmentPhase::Paused))
 }
 
 /// Compile deployment policy to the public Environment network contract.

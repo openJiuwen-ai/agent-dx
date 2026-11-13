@@ -89,6 +89,7 @@ pub fn errno(error: &Error) -> i32 {
     }
     if error.code() == afs_error::NODE_OWNER_STALE_ACCESS
         || error.code() == afs_error::NODE_OWNER_STALE_HANDLE
+        || error.code() == afs_error::NODE_DFS_STALE_NAME
     {
         return libc::ESTALE;
     }

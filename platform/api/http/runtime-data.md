@@ -63,8 +63,15 @@ SDK `commands.run` 的默认／长等待路径和后台命令使用 `process.sta
 `shell.run.timeout` 是 SDK 发送的兼容参数，后端不执行该截止；SDK 约束自己的
 poll 等待。`shell.poll.wait_timeout` 当前不使后端阻塞。cwd 和环境变量由 SDK
 编码到 shell 命令中，持久 shell 会保留其状态；PTY 输出可能含回显与协议标记。
-`X-ADX-Processing-Timeout-Ms` 是 Ingress 的整条 HTTP 处理截止，和命令执行／等待
-预算分开；流式响应已开始时截止会结束流，不可能再返回新的 JSON 错误正文。
+`X-ADX-Processing-Timeout-Ms` 和命令执行／等待预算分开。鉴权、路由、唤醒及连接
+准入使用初始处理截止；开始向上游转发后，每个非空请求正文数据帧会刷新等待响应头
+的期限，最后一帧之后后端仍须在该窗口内返回响应头。
+
+成功的 `2xx` HTTP 响应在响应头就绪后结束处理窗口；单文件、tar、端口转发下载和
+SSE 正文可以继续传输，超过该窗口。SDK 读空闲超时及单文件 Range 续传继续生效。
+错误响应正文仍受最近的处理截止约束。
+响应头已发送后不能再返回新的 JSON 错误正文。WebSocket 升级后的会话保持独立生命周期。
+未携带该头时保持原有转发与流生命周期。
 
 ## 身份、重试与错误
 

@@ -1,7 +1,9 @@
 mod support;
 
-use adx_activator::environment_request::{create_input, operation_id};
-use adx_agent_core::environment::CreateEnvironment;
+use adx_activator::environment_request::{
+    create_input, operation_id, pause_input, pause_operation_id, pause_timeout_seconds, paused,
+};
+use adx_agent_core::environment::{CreateEnvironment, EnvironmentError, EnvironmentPhase};
 use serde_json::json;
 use std::time::Duration;
 use support::network_policy;
@@ -195,4 +197,69 @@ fn unrestricted_runtime_does_not_bypass_deployment_configuration_validation() {
         request.execution.isolation_runtime = "supervisor".into();
         assert!(create_input(&request, Duration::from_secs(180), &policy).is_err());
     }
+}
+
+#[test]
+fn pause_operation_id_is_prefixed_deterministic_and_rejects_invalid_identity() {
+    let id = pause_operation_id("tenant", "adx-id").unwrap();
+    assert!(
+        id.starts_with("pause-activator-"),
+        "Platform requires the pause- prefix on x-adx-request-id: {id}"
+    );
+    // Deterministic: the same tenant/id replays the same operation identity.
+    assert_eq!(id, pause_operation_id("tenant", "adx-id").unwrap());
+    // Distinct from a create/delete identity for the same Environment.
+    assert_ne!(id, operation_id("create", "tenant", "adx-id").unwrap());
+    assert_ne!(id, operation_id("delete", "tenant", "adx-id").unwrap());
+    for (tenant, id) in [("", "adx-id"), ("tenant", ""), ("tenant", "../bad")] {
+        assert!(matches!(
+            pause_operation_id(tenant, id),
+            Err(EnvironmentError::Invalid(_))
+        ));
+    }
+}
+
+#[test]
+fn pause_input_carries_only_the_checkpoint_budget() {
+    assert_eq!(pause_input(120), json!({"timeoutSeconds":120}));
+    // Retention is intentionally absent: the Environment inherits the template policy.
+    assert!(pause_input(120).get("retention").is_none());
+}
+
+#[test]
+fn pause_timeout_seconds_clamps_to_the_platform_api_bounds() {
+    let now = adx_agent_core::unix_time_millis();
+    // A far deadline is capped near the 3600s maximum, not an unbounded budget. The
+    // value is the elapsed-seconds remaining under the cap, so sub-second clock skew
+    // between the caller's `now` and the helper's internal read can shave one second;
+    // the contract is the bounded range [1, 3600], not an exact ceiling.
+    let far = pause_timeout_seconds(now + 10_000_000);
+    assert!(
+        (3599..=3600).contains(&far),
+        "far deadline must be capped near 3600s: {far}"
+    );
+    // A near deadline yields at least 1s so the pause is still submitted.
+    assert_eq!(pause_timeout_seconds(now + 1), 1);
+    // A past deadline is clamped to the 1s floor rather than zero.
+    assert_eq!(pause_timeout_seconds(now.saturating_sub(1000)), 1);
+}
+
+#[test]
+fn paused_response_validates_identity_and_state() {
+    let value = json!({"environmentId":"adx-id","snapshotId":"pause-activator-x","size":1024,
+        "state":"paused","expiresAt":null});
+    let observed = paused("tenant", "adx-id", &value).unwrap();
+    assert_eq!(observed.id, "adx-id");
+    assert_eq!(observed.phase, EnvironmentPhase::Paused);
+    assert!(!observed.ready);
+    // A mismatched identity or non-paused state is an unknown outcome, never success.
+    assert!(matches!(
+        paused("tenant", "other", &value),
+        Err(EnvironmentError::OutcomeUnknown(_))
+    ));
+    let running = json!({"environmentId":"adx-id","state":"running"});
+    assert!(matches!(
+        paused("tenant", "adx-id", &running),
+        Err(EnvironmentError::OutcomeUnknown(_))
+    ));
 }

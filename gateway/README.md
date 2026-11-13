@@ -142,17 +142,25 @@ ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_ACQUIRE_TIMEOUT_MS=3000
 ```
 
 For an HTTP request carrying `X-ADX-Processing-Timeout-Ms` (one positive integer,
-1–86400000 milliseconds), Ingress creates one deadline after receiving its headers.
-Authentication, route lookup, resume, committed-route delivery, pool/CONNECT
-admission, upstream processing and response streaming consume that same deadline.
+1–86400000 milliseconds), Ingress bounds authentication, route lookup, resume,
+committed-route delivery and pool/CONNECT admission by the initial deadline.
+Once forwarding starts, each non-empty request-body data frame renews the window
+for waiting for upstream response headers. After the last upload data, the
+upstream must still return its response headers within that window.
+Successful `2xx` responses finish the processing window at their response headers.
+Their file, tar, port-forwarded HTTP or SSE bodies may continue streaming beyond
+that window. SDK read-inactivity timeouts and single-file Range retries still
+apply. Error response bodies retain the latest processing deadline; WebSocket
+sessions after `101` retain their independent lifetime.
+Requests without this header retain their existing forwarding/streaming behavior.
 The header is removed before forwarding. A cancelled or expired wake RPC returns
 HTTP 503 `ENV_RESUMING` only while application bytes have not been sent, with
 `Retry-After: 1`, a reserved `X-ADX-Error-Code` marker, and a structured error
 containing `retry: same_operation`, `outcome: not_started`, `requestForwarded: false`
 and the request/Environment IDs. Ingress strips that reserved response marker
 from upstream replies. HTTP 504 after forwarding instead reports an unknown
-outcome and `retry: never`; an expired stream with already-sent response headers
-is closed. Rejected checkpoint restoration reports HTTP 409 `ENV_UNAVAILABLE`.
+outcome and `retry: never`; an expired error response stream with already-sent
+headers is closed. Rejected checkpoint restoration reports HTTP 409 `ENV_UNAVAILABLE`.
 
 A request's timeout or disconnection does not cancel a durable wake intent.
 Independent Ingress replicas coalesce through Coordinator and can deliver retries

@@ -1107,7 +1107,7 @@ impl Ingress {
                 adx_observability::trace::inject_headers(request.headers_mut());
                 let handled = self.handle_http_inner(request, ingress_security, peer);
                 let (mut response, deadline_exceeded) = if budgeted {
-                    match tokio::time::timeout_at(processing.at, handled).await {
+                    match processing.until_headers(handled).await {
                         Ok(response) => (response?, false),
                         Err(_) => (
                             processing_timeout_response(&processing, &request_id, &instance_id),
@@ -1127,12 +1127,13 @@ impl Ingress {
                 if budgeted
                     && processing.is_forwarded()
                     && !deadline_exceeded
+                    && !response.status().is_success()
                     && response.status() != StatusCode::SWITCHING_PROTOCOLS
                 {
                     let (parts, body) = response.into_parts();
                     response = Response::from_parts(
                         parts,
-                        DeadlineBody::new(body, processing.at).boxed_unsync(),
+                        DeadlineBody::new(body, processing.response_deadline()).boxed_unsync(),
                     );
                 }
                 adx_observability::trace::attribute(
@@ -2876,7 +2877,10 @@ where
     if let Some(processing) = request.extensions().get::<ProcessingDeadline>() {
         processing.forwarded();
     }
-    let mut response = match sender.send_request(request).await {
+    let mut response = match sender
+        .send_request(super::processing::forwarding_request(request))
+        .await
+    {
         Ok(response) => response,
         Err(error) => return plain(StatusCode::BAD_GATEWAY, &error.to_string()),
     };

@@ -112,26 +112,16 @@ impl Activator {
                 // Every upgrade waits for the previous execution to pause, before
                 // its first creation as well as retries, regardless of Volume mode.
                 // Platform remains authoritative for actual resource/Volume admission.
-                if binding.current != *environment {
-                    if let Some(previous) = self
-                        .environment
-                        .get(&binding.scope.tenant, &binding.current.environment_id)
-                        .await?
-                    {
-                        if previous.id != binding.current.environment_id
-                            || previous.tenant != binding.scope.tenant
-                        {
-                            return Err(EnvironmentError::Unavailable(
-                                "previous Environment identity mismatch".into(),
-                            ));
-                        }
-                        if !matches!(
-                            previous.phase,
-                            EnvironmentPhase::Paused | EnvironmentPhase::Deleted
-                        ) {
-                            return Ok(CreationStep::PreviousEnvironmentActive);
-                        }
-                    }
+                // Reuses the switch-time dormant check so both gates share one definition.
+                if binding.current != *environment
+                    && !previous_environment_dormant(
+                        &*self.environment,
+                        &binding.scope.tenant,
+                        &binding.current.environment_id,
+                    )
+                    .await?
+                {
+                    return Ok(CreationStep::PreviousEnvironmentActive);
                 }
                 for volume in volumes {
                     let reference = self

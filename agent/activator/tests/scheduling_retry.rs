@@ -79,6 +79,18 @@ impl Environment for Platform {
         self.records.lock().unwrap().remove(id);
         Ok(observed(id, EnvironmentPhase::Deleted))
     }
+    async fn pause(
+        &self,
+        _: &str,
+        id: &str,
+        _timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        let mut records = self.records.lock().unwrap();
+        let record = records.get_mut(id).ok_or(EnvironmentError::NotFound)?;
+        record.phase = EnvironmentPhase::Paused;
+        record.ready = false;
+        Ok(record.clone())
+    }
 }
 struct Fixture {
     repo: Arc<MemoryRepository>,

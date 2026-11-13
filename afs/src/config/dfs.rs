@@ -206,6 +206,7 @@ pub(super) struct DfsTuning {
     pub(super) dfs_scrub_bytes_per_second: u64,
     pub(super) dfs_scrub_start_delay_seconds: u64,
     pub(super) dfs_scrub_round_interval_seconds: u64,
+    pub(super) dfs_kernel_cache_ttl_ms: u64,
 }
 
 pub(super) fn resolve_tuning(cli: &Cli, file: &FileConfig) -> Result<DfsTuning> {
@@ -356,6 +357,13 @@ pub(super) fn resolve_tuning(cli: &Cli, file: &FileConfig) -> Result<DfsTuning> 
     if !(1..=2_592_000).contains(&dfs_scrub_round_interval_seconds) {
         return Err(invalid("DFS scrub round interval must be 1..=2592000 s"));
     }
+    let dfs_kernel_cache_ttl_ms = cli
+        .dfs_kernel_cache_ttl_ms
+        .or(file.dfs_kernel_cache_ttl_ms)
+        .unwrap_or(super::DEFAULT_DFS_KERNEL_CACHE_TTL_MS);
+    if dfs_kernel_cache_ttl_ms > super::MAX_DFS_KERNEL_CACHE_TTL_MS {
+        return Err(invalid("DFS kernel cache TTL must be 0..=60000 ms"));
+    }
     Ok(DfsTuning {
         dfs_outboard_work_wait_ms,
         dfs_catalog_commit_queue,
@@ -376,6 +384,7 @@ pub(super) fn resolve_tuning(cli: &Cli, file: &FileConfig) -> Result<DfsTuning> 
         dfs_scrub_bytes_per_second,
         dfs_scrub_start_delay_seconds,
         dfs_scrub_round_interval_seconds,
+        dfs_kernel_cache_ttl_ms,
     })
 }
 

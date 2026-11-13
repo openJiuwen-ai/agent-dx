@@ -11,6 +11,11 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
+/// Default kernel entry/attribute TTL of DFS mounts, in milliseconds.
+pub const DEFAULT_DFS_KERNEL_CACHE_TTL_MS: u64 = 1_000;
+/// Largest accepted `dfs_kernel_cache_ttl_ms`.
+pub const MAX_DFS_KERNEL_CACHE_TTL_MS: u64 = 60_000;
+
 mod common;
 mod cross;
 mod dfs;
@@ -448,6 +453,10 @@ pub struct Cli {
     /// Minimum time between the starts of two scrub rounds (1..=2592000 s).
     #[arg(long)]
     pub dfs_scrub_round_interval_seconds: Option<u64>,
+    /// Kernel entry/attribute TTL of the DFS mount (0..=60000 ms; default
+    /// 1000; 0 disables kernel caching of names and attributes).
+    #[arg(long)]
+    pub dfs_kernel_cache_ttl_ms: Option<u64>,
     /// Filesystem-wide immutable DFS replica target count. Applied by Meta at initialization.
     #[arg(long)]
     pub dfs_desired_copies: Option<u16>,
@@ -605,6 +614,7 @@ struct FileConfig {
     dfs_scrub_bytes_per_second: Option<u64>,
     dfs_scrub_start_delay_seconds: Option<u64>,
     dfs_scrub_round_interval_seconds: Option<u64>,
+    dfs_kernel_cache_ttl_ms: Option<u64>,
     dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_peer_cache: Option<DfsPeerCacheConfig>,
     dfs_write_buffer_idle_bytes: Option<u64>,
@@ -738,6 +748,7 @@ pub struct Config {
     pub dfs_scrub_bytes_per_second: u64,
     pub dfs_scrub_start_delay_seconds: u64,
     pub dfs_scrub_round_interval_seconds: u64,
+    pub dfs_kernel_cache_ttl_ms: u64,
     pub dfs_external_backend: Option<DfsExternalBackendConfig>,
     pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
     /// Reusable idle write-body capacity only, not a live-body quota.
@@ -938,6 +949,7 @@ impl Config {
             dfs_scrub_bytes_per_second: tuning.dfs_scrub_bytes_per_second,
             dfs_scrub_start_delay_seconds: tuning.dfs_scrub_start_delay_seconds,
             dfs_scrub_round_interval_seconds: tuning.dfs_scrub_round_interval_seconds,
+            dfs_kernel_cache_ttl_ms: tuning.dfs_kernel_cache_ttl_ms,
             dfs_external_backend: file.dfs_external_backend,
             dfs_peer_cache: file.dfs_peer_cache,
             dfs_write_buffer_idle_bytes: file

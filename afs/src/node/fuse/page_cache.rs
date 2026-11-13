@@ -104,6 +104,12 @@ impl ActiveCachedViews {
         true
     }
 
+    /// Length of the version whose pages the kernel may cache for `ino`, while
+    /// at least one handle of that version is open with page caching.
+    pub(super) fn cached_length(&self, ino: u64) -> Option<u64> {
+        self.inodes.get(&ino).map(|(identity, _)| identity.length)
+    }
+
     pub(super) fn release(&mut self, ino: u64, fh: u64) {
         if let Some((_, handles)) = self.inodes.get_mut(&ino) {
             self.handles -= usize::from(handles.remove(&fh));

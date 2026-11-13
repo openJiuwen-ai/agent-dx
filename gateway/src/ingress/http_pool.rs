@@ -107,7 +107,7 @@ struct EndpointPool {
 }
 
 struct IdleConnection {
-    sender: SendRequest<Incoming>,
+    sender: SendRequest<super::server::ProxyBody>,
     idle_since: Instant,
     opened_at: Instant,
 }
@@ -260,7 +260,7 @@ impl BackendHttpPool {
             processing.forwarded();
         }
         let response = sender
-            .send_request(request)
+            .send_request(super::processing::forwarding_request(request))
             .await
             .map_err(|error| (BackendHttpPoolError::Request(error), None))?;
         let response_allows_reuse = !has_connection_close(response.headers());
@@ -325,7 +325,7 @@ impl PoolInner {
     fn return_idle(
         &self,
         endpoint: &EndpointPool,
-        sender: SendRequest<Incoming>,
+        sender: SendRequest<super::server::ProxyBody>,
         opened_at: Instant,
     ) {
         // Serialize the validity check and insertion with invalidation's queue drain.
@@ -406,7 +406,7 @@ impl PoolInner {
 }
 
 struct ConnectionLease {
-    sender: Option<SendRequest<Incoming>>,
+    sender: Option<SendRequest<super::server::ProxyBody>>,
     opened_at: Instant,
     endpoint: Arc<EndpointPool>,
     pool: std::sync::Weak<PoolInner>,
