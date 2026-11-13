@@ -163,6 +163,16 @@ impl FuseState {
         }
     }
 
+    /// The node id the kernel already knows `inode` by, without taking a
+    /// lookup reference. A file the kernel never looked up has no handle and
+    /// so no queued write.
+    pub fn known_ino(&self, inode: BackendInode) -> Option<u64> {
+        if inode == self.root_inode {
+            return Some(ROOT_INO);
+        }
+        self.backend_to_fuse.get(&inode).copied()
+    }
+
     fn remember_backend_inode(&mut self, inode: BackendInode) -> u64 {
         if inode == self.root_inode {
             return ROOT_INO;

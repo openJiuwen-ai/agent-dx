@@ -159,6 +159,50 @@ def file_locks_are_local_only(c):
     assert a == '"ok"' and b == '"ok"', (a, b)
 
 
+ATOMIC_SAVE = """import os,sys
+d,name,data=sys.argv[1],sys.argv[2],bytes.fromhex(sys.argv[3])
+tmp=d+"/."+name+".tmp"
+f=open(tmp,"wb");f.write(data);f.close()
+os.rename(tmp,d+"/"+name)
+"""
+
+WRITE_RENAME_OPEN = """import os,sys
+d,name,first,second=sys.argv[1],sys.argv[2],bytes.fromhex(sys.argv[3]),bytes.fromhex(sys.argv[4])
+tmp=d+"/."+name+".tmp"
+f=open(tmp,"wb");f.write(first);f.flush()
+os.rename(tmp,d+"/"+name)
+f.write(second);f.close()
+"""
+
+
+def atomic_save_visible_to_other_node(c):
+    """An editor's atomic save on A (write a temporary file, close, rename over the target) is seen
+    whole by a new open on B right after the rename returns. Close-to-open across the rename relies on
+    FLUSH: it replies only after the inode's acknowledged bodies ran and their data was committed to
+    Meta, so the renamed inode's head already holds them; B's open of the target resolves the new name
+    (a cached dentry of the replaced file fails the open-time name check and is looked up again).
+    """
+    rounds = []
+    for index in range(8):
+        data = (b"save-%02d-" % index) * (64 + 512 * index)
+        c.python("A", ATOMIC_SAVE, c.workspace("A"), "sem-atomic-save", data.hex())
+        c.read("B", "sem-atomic-save", data)
+        rounds.append(len(data))
+    c.record("semantics.atomic_save_cross_node", {"rounds": rounds})
+
+
+def write_then_rename_before_close(c):
+    """Writing, renaming the still-open file over its target, writing again and only then closing:
+    POSIX gives no ordering between the writes and the rename, so this only requires no error and no
+    corruption; the descriptor keeps writing the same inode, which the target name now addresses.
+    """
+    first, second = b"before-rename-" * 300, b"after-rename-" * 300
+    c.write("A", "sem-write-rename", b"old")
+    c.python("A", WRITE_RENAME_OPEN, c.workspace("A"), "sem-write-rename", first.hex(), second.hex())
+    c.read("B", "sem-write-rename", first + second)
+    c.record("semantics.write_then_rename_before_close", {"bytes": len(first) + len(second)})
+
+
 CASES = (
     Case("dfs.semantics.visible_after_commit", ("s0-semantics",), "dfs", (), committed_write_visible_to_new_open),
     Case("dfs.semantics.open_reader_after_commit", ("s0-semantics",), "dfs", (), open_reader_keeps_open_time_version),
@@ -168,4 +212,7 @@ CASES = (
          profile=DfsProfile(kernel_cache_ttl_ms=0)),
     Case("dfs.semantics.fsync", ("s0-semantics",), "dfs", (), fsync_error_free_path),
     Case("dfs.semantics.locks_local_only", ("s0-semantics",), "dfs", (), file_locks_are_local_only),
+    Case("dfs.semantics.atomic_save_cross_node", ("s0-semantics",), "dfs", (), atomic_save_visible_to_other_node),
+    Case("dfs.semantics.write_then_rename_before_close", ("s0-semantics",), "dfs", (),
+         write_then_rename_before_close),
 )

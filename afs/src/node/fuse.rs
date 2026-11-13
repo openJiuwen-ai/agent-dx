@@ -228,36 +228,32 @@ impl AfsFuse {
         let Some(queue) = &self.front_write else {
             return (None, Ok(()));
         };
-        if ordering == FrontOrdering::FixedLocalReply {
+        // Path-addressed callbacks (lookup, namespace changes) take no gate:
+        // the kernel orders them by directory locks, and no change of a name
+        // needs another file's acknowledged writes to land first (writes,
+        // commits and leases address the inode, not its name).
+        let (FrontOrdering::WriteAdmission | FrontOrdering::WriteBarrier, Some(files)) =
+            (ordering, files)
+        else {
             return (None, Ok(()));
-        }
-        let guard = match queue.enter(files, access, retry) {
+        };
+        let guard = match queue.enter(files, access) {
             Ok(guard) => guard,
             Err(error) => return (None, Err(error)),
         };
         let mut result = Ok(());
         if ordering == FrontOrdering::WriteBarrier {
-            if let Some(files) = files {
-                for file in files {
-                    if let Err(error) = queue.wait(Some(*file), retry) {
-                        result = Err(error);
-                        break;
-                    }
+            for file in files {
+                if let Err(error) = queue.wait(Some(*file), retry) {
+                    result = Err(error);
+                    break;
                 }
-            } else {
-                result = queue.wait(None, false);
             }
         }
-        if let Some(files) = files {
-            if ordering == FrontOrdering::WriteAdmission || retry {
-                for file in files {
-                    self.dispatch.drain_key(*file);
-                }
+        if ordering == FrontOrdering::WriteAdmission || retry {
+            for file in files {
+                self.dispatch.drain_key(*file);
             }
-        } else if access == GateAccess::Exclusive {
-            // A namespace change waits for every in-flight callback. A path
-            // lookup only needs the acknowledged writes waited for above.
-            self.dispatch.drain();
         }
         (Some(guard), result)
     }
@@ -525,6 +521,49 @@ impl Drop for AfsFuse {
     }
 }
 
+/// Resolutions one path lookup makes at most while bodies of the inode it
+/// resolved are still settling: a name re-pointed to another inode with
+/// queued bodies between attempts gets one more pass, never an unbounded loop.
+const LOOKUP_SETTLE_ATTEMPTS: usize = 3;
+
+/// A path lookup whose reply includes the bodies this mount acknowledged for
+/// the resolved inode before the lookup arrived (`through`). Only that inode
+/// is waited for: a lookup no longer waits on every other file's queue. When
+/// a body had to settle, the name is resolved again so the attributes (size,
+/// times) come from the state after it.
+fn lookup_after_acknowledged_writes(
+    backend: &dyn Backend,
+    state: &Mutex<FuseState>,
+    front: Option<(&front_write::FrontWriteQueue, u64)>,
+    context: &RequestContext,
+    parent: BackendInode,
+    name: &OsStr,
+) -> std::result::Result<crate::node::vfs::types::Entry, i32> {
+    let resolve = || {
+        backend
+            .lookup(context, parent, name)
+            .map_err(errno_in(FuseOp::Lookup))
+    };
+    let mut entry = resolve()?;
+    let Some((queue, through)) = front else {
+        return Ok(entry);
+    };
+    for _ in 0..LOOKUP_SETTLE_ATTEMPTS {
+        let known = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .known_ino(entry.inode);
+        let Some(ino) = known else {
+            return Ok(entry);
+        };
+        if !queue.settle_through(ino, through)? {
+            return Ok(entry);
+        }
+        entry = resolve()?;
+    }
+    Ok(entry)
+}
+
 /// `AFS_FUSE_TRACE=1` enables per-request diagnostic trace logs.
 pub(super) fn fuse_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -664,12 +703,17 @@ impl Filesystem for AfsFuse {
     }
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, GateAccess::Shared, None, false);
-        if let Err(error) = front_result {
-            reply.error(fuse_errno(error));
-            return;
-        }
+        // The reply must include the bodies this mount acknowledged before
+        // the lookup arrived, but only those of the inode it resolves to.
+        let through = match self.front_write.as_ref().map(|queue| queue.through()) {
+            Some(Err(error)) => {
+                reply.error(fuse_errno(error));
+                return;
+            }
+            Some(Ok(through)) => Some(through),
+            None => None,
+        };
+        let front_write = self.front_write.clone();
         self.record_request("lookup");
         self.trace_request("lookup", parent.0, 0, &name.to_string_lossy());
         let Ok(parent_inode) = self.backend_inode(parent.0) else {
@@ -686,11 +730,15 @@ impl Filesystem for AfsFuse {
         let mount_policy = self.policy.clone();
         let cached_views = self.active_cached_views.clone();
         let run = move || {
-            let _front_guard = _front_guard;
             let started = std::time::Instant::now();
-            let result = backend
-                .lookup(&context, parent_inode, &name)
-                .map_err(errno_in(FuseOp::Lookup));
+            let result = lookup_after_acknowledged_writes(
+                backend.as_ref(),
+                &state,
+                front_write.as_deref().zip(through),
+                &context,
+                parent_inode,
+                &name,
+            );
             if fuse_trace_enabled() {
                 afs_logging::warn!(
                     "fuse.time";
@@ -1006,16 +1054,6 @@ impl Filesystem for AfsFuse {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        let (_front_guard, front_result) = self.front_callback(
-            FrontOrdering::WriteBarrier,
-            GateAccess::Exclusive,
-            None,
-            false,
-        );
-        if let Err(error) = front_result {
-            reply.error(fuse_errno(error));
-            return;
-        }
         self.record_request("mkdir");
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
@@ -1040,16 +1078,6 @@ impl Filesystem for AfsFuse {
     }
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let (_front_guard, front_result) = self.front_callback(
-            FrontOrdering::WriteBarrier,
-            GateAccess::Exclusive,
-            None,
-            false,
-        );
-        if let Err(error) = front_result {
-            reply.error(fuse_errno(error));
-            return;
-        }
         self.record_request("unlink");
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
@@ -1062,16 +1090,6 @@ impl Filesystem for AfsFuse {
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let (_front_guard, front_result) = self.front_callback(
-            FrontOrdering::WriteBarrier,
-            GateAccess::Exclusive,
-            None,
-            false,
-        );
-        if let Err(error) = front_result {
-            reply.error(fuse_errno(error));
-            return;
-        }
         self.record_request("rmdir");
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
@@ -1091,16 +1109,6 @@ impl Filesystem for AfsFuse {
         target: &Path,
         reply: ReplyEntry,
     ) {
-        let (_front_guard, front_result) = self.front_callback(
-            FrontOrdering::WriteBarrier,
-            GateAccess::Exclusive,
-            None,
-            false,
-        );
-        if let Err(error) = front_result {
-            reply.error(fuse_errno(error));
-            return;
-        }
         self.record_request("symlink");
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
@@ -1139,16 +1147,6 @@ impl Filesystem for AfsFuse {
         flags: FuseRenameFlags,
         reply: ReplyEmpty,
     ) {
-        let (_front_guard, front_result) = self.front_callback(
-            FrontOrdering::WriteBarrier,
-            GateAccess::Exclusive,
-            None,
-            false,
-        );
-        if let Err(error) = front_result {
-            reply.error(fuse_errno(error));
-            return;
-        }
         self.record_request("rename");
         afs_logging::debug!(
             "fuse.rename";
@@ -2213,16 +2211,6 @@ impl Filesystem for AfsFuse {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let (_front_guard, front_result) = self.front_callback(
-            FrontOrdering::WriteBarrier,
-            GateAccess::Exclusive,
-            None,
-            false,
-        );
-        if let Err(error) = front_result {
-            reply.error(fuse_errno(error));
-            return;
-        }
         self.record_request("create");
         afs_logging::info!("fuse.create"; "parent" => parent.0, "name" => name.to_string_lossy().into_owned());
         self.trace_request("create", parent.0, 0, &name.to_string_lossy());
@@ -2343,16 +2331,6 @@ impl Filesystem for AfsFuse {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        let (_front_guard, front_result) = self.front_callback(
-            FrontOrdering::WriteBarrier,
-            GateAccess::Exclusive,
-            None,
-            false,
-        );
-        if let Err(error) = front_result {
-            reply.error(fuse_errno(error));
-            return;
-        }
         self.record_request("mknod");
         let parent = parent.0;
         let raw_kind = mode & libc::S_IFMT;
