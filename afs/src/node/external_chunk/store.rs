@@ -2,11 +2,14 @@
 
 use super::*;
 
-/// One owned asynchronous worker serves every PUT request.
-/// All requests share four upload permits; completing one PUT immediately
-/// makes its permit available to the next chunk, including another batch.
+/// One owned runtime of `worker_threads` threads serves every request; each
+/// request and each PUT is its own task, so payload signing and checksums of
+/// concurrent PUTs run in parallel. All requests share `upload_concurrency`
+/// upload permits; completing one PUT immediately makes its permit available
+/// to the next chunk, including another batch.
 /// The bounded queue applies backpressure rather than reporting a storage
-/// failure. At most four PUTs hold immutable payload owners; typed leases stay
+/// failure. At most `upload_concurrency` PUTs hold immutable payload owners,
+/// all of them charged to the write pipeline's dirty budget; typed leases stay
 /// charged until the last transport/retry owner exits. Producer payload and
 /// descriptor reservations belong to the DFS write pipeline.
 /// A chunk of at least 256 KiB is stored with a BLAKE3 outboard sidecar
@@ -44,7 +47,7 @@ impl S3ChunkStore {
         let client = ClientOptions::new()
             .with_timeout(options.request_timeout)
             .with_connect_timeout(options.request_timeout.min(Duration::from_secs(10)))
-            .with_pool_max_idle_per_host(MAX_UPLOADS);
+            .with_pool_max_idle_per_host(options.upload_concurrency + EXTRA_IDLE_CONNECTIONS);
         let mut builder = AmazonS3Builder::new()
             .with_endpoint(&options.endpoint)
             .with_bucket_name(&options.bucket)
@@ -56,6 +59,9 @@ impl S3ChunkStore {
             .with_client_options(client)
             .with_allow_http(options.allow_http)
             .with_unsigned_payload(options.unsigned_payload);
+        if options.payload_checksum == crate::config::DfsExternalPayloadChecksum::Crc64nvme {
+            builder = builder.with_checksum_algorithm(object_store::aws::Checksum::CRC64NVME);
+        }
         if let Some(token) = credentials.session_token {
             builder = builder.with_token(token);
         }
@@ -85,18 +91,20 @@ impl S3ChunkStore {
                 )
             })
             .transpose()?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(options.worker_threads)
+            .thread_name("afs-s3-chunks")
             .enable_all()
             .build()
             .map_err(Error::from)?;
         let (sender, receiver) = mpsc::sync_channel::<Command>(1);
-        let identity = options.clone();
+        let identity = Arc::new(options.clone());
         let wake = Arc::new(tokio::sync::Notify::new());
         let worker_wake = wake.clone();
         let worker_verifier = verifier.clone();
         let worker_observer = observer.clone();
         let worker = thread::Builder::new()
-            .name("afs-s3-chunks".into())
+            .name("afs-s3-requests".into())
             .spawn(move || {
                 runtime.block_on(run_requests(
                     backend,
@@ -135,7 +143,7 @@ impl S3ChunkStore {
             operation,
             chunks,
             bytes,
-            max_uploads = MAX_UPLOADS,
+            max_uploads = self.options.upload_concurrency,
             queue_wait_us = tracing::field::Empty,
         );
         let enqueued_at = std::time::Instant::now();

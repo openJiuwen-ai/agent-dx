@@ -348,7 +348,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_write_timeout_ms` | 调优 | Node | `30000` | DFS 写入准入和 fsync 发布前等待的上限，1..=600000 ms |
 | `dfs_gc_grace_ms` | 调优 | Meta | `1000` | 引用退役后继续保护数据的时长，0..=600000 |
 | `dfs_unpublished_descriptors` | 调优 | Node | `1024` | 已上传未发布的对象数，1..=1024 |
-| `dfs_upload_inflight_chunks` | 调优 | Node | `8` | 上传并发，1..=8；S3 模式下实际被压到 4 |
+| `dfs_upload_inflight_chunks` | 调优 | Node | `8` | 上传并发，1..=8；S3 模式下再取与 `dfs_external_backend.upload_concurrency`（默认 8）的较小值 |
 | `dfs_background_commit_ms` | 调优 | Node | `5000` | 后台提交调度周期，1..=60000；不是发布期限 |
 | `dfs_sidecar_install_queue` | 调优 | Node | `64` | 可选 sidecar 安装的排队与执行数，1..=64 |
 | `dfs_external_gc_list_pages_per_pass` | 调优 | Node | `1` | S3 回收每轮（5 秒）列举的桶页数（每页 1000 个对象），1..=100；只有 Meta 指定的一个 Node 列举 |
@@ -455,7 +455,11 @@ endpoint = "https://s3.example.com"
 bucket = "afs-chunks"
 region = "us-east-1"
 allow_http = false
-unsigned_payload = false
+# Optional upload settings; the values shown are the defaults for an https endpoint.
+# unsigned_payload = true
+# payload_checksum = "crc64nvme"
+# upload_concurrency = 8
+# worker_threads = 4
 # Node-only; omit on Meta. Must be absolute, owned by the Node process UID,
 # regular file without symlink, and mode 0600 or stricter.
 credentials_file = "/opt/adx/config/afs/s3-credentials.json"
@@ -465,10 +469,18 @@ credentials_file = "/opt/adx/config/afs/s3-credentials.json"
 不在示例中提供真实凭据，不把秘密直接放 TOML 或命令行。未指定文件的 Node
 显式读取 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY` 和可选
 `AWS_SESSION_TOKEN`；缺失凭据启动失败。`--print-config` 只显示文件路径。
-默认 `unsigned_payload=false`，保留 S3 载荷签名。只有管理员确认后端和安全策略支持时才显式设置 `unsigned_payload=true`；该项仍保留 SigV4 请求
-认证，只省略 SDK 的载荷签名 SHA256，不替代 AFS 完整 BLAKE3／长度检查，也不
-改变成功 fsync 等待对象回执和 Meta 持久确认的要求。它不自动探测 SeaweedFS，
-不因 `allow_http=true` 自动启用；泛 S3 后端和既有配置保持原默认。
+上传的正文校验方式由 `unsigned_payload` 与 `payload_checksum` 决定，两项都可省略：
+
+| 端点 | `unsigned_payload` 默认 | `payload_checksum` 默认 | 含义 |
+| --- | --- | --- | --- |
+| `https://` | `true` | `"crc64nvme"` | 正文不参与 SigV4 签名（`UNSIGNED-PAYLOAD`），每个 PUT 带请求头 `x-amz-checksum-crc64nvme`，该头在签名范围内；对象存储校验不符即拒绝 |
+| `http://`（仅 `allow_http=true` 的隔离测试端点） | `false` | `"none"` | 正文 SHA-256 参与签名 |
+
+- 两种方式都保留 SigV4 请求认证，都不替代 AFS 读时的 BLAKE3／长度检查，也不改变成功 fsync 等待对象回执和 Meta 持久确认的要求。
+- 桶策略要求签名正文（条件键 `s3:x-amz-content-sha256`）时，显式设置 `unsigned_payload = false`。
+- CRC64NVME 请求头只在 MinIO 上实测过。对象存储不认这个头时，PUT 会被拒绝，写与 fsync 返回不可用错误（`IO_UNAVAILABLE`），Node 日志记 `external S3 operation failed`；这时设置 `payload_checksum = "none"`（正文在传输中的损坏改由 TLS 发现），或设置 `unsigned_payload = false` 回到签名正文。
+- 不签正文省的是 Node 侧的 CPU（实测 S3 工作线程 CPU 约减半）。对象存储侧校验 CRC64NVME 的 CPU 并不比校验 SHA-256 低（MinIO，arm64 实测）。
+- `upload_concurrency`（1–8，默认 8）是并发 PUT 数；`worker_threads`（1–8，默认取 `upload_concurrency` 与 4 的较小值）是 S3 请求线程数，签名与校验和在这些线程上计算。上传占用的正文内存计入 `dfs_dirty_budget_bytes`，不另设上限。
 
 长度不小于 256 KiB 的数据块在对象旁多存一个 BLAKE3 outboard 旁对象（键为数据对象键加 `.bao`，4 MiB 数据块约 8 KiB）。读取时只按范围取回读到的 32 KiB 分组，并用旁对象验证到数据块的内容根；没有旁对象或旁对象无效的数据块整对象读取并整块校验，结果相同。旁对象随数据对象一起回收。对按请求计费的对象存储：
 
@@ -484,8 +496,8 @@ Meta 的 `meta_store` 是独立配置：默认 `local-file`，也可选择 `redi
 对象 key 身份不允许变更后重新使用同一 Meta 数据目录；配置错误及 GET/PUT
 错误向调用方传播。正常停机仍需先排空工作负载和 FUSE 引用。
 
-S3 适配层共用一个 worker、运行时和客户端，固定最多四个实际 PUT（`MAX_UPLOADS`）、
-最多32个活动命令（`afs/src/node/external_chunk.rs`）；共享客户端最多保留四个空闲连接，
+S3 适配层共用一个运行时（`worker_threads` 个线程）和客户端，最多 `upload_concurrency` 个实际 PUT、
+最多32个活动命令（`afs/src/node/external_chunk.rs`）；共享客户端保留的空闲连接数为 `upload_concurrency` 加 8，
 空闲连接池大小本身不是并发限制。
 
 S3 模式的写入与原生副本模式走**同一条原生写流水线**（`afs/src/node/assembly/dfs.rs`）：

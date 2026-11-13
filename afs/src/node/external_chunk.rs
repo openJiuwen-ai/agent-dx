@@ -4,20 +4,17 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs::{self, DirBuilder, File, OpenOptions},
-    future::Future,
     future::poll_fn,
     io::{Read, Write},
     os::fd::AsRawFd,
     os::unix::fs::FileExt,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{
         Arc, Condvar, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    task::Poll,
     thread,
     time::Duration,
 };
@@ -61,8 +58,13 @@ use verifier::*;
 use worker::*;
 
 const MAX_BATCH: usize = 128;
-/// Concurrent object PUTs; the Node's native upload depth is capped to this.
-pub(crate) const MAX_UPLOADS: usize = 4;
+/// Upper bound of `upload_concurrency`: the native write pipeline never has
+/// more chunks in flight (`dfs_upload_inflight_chunks`).
+pub(crate) const MAX_UPLOAD_CONCURRENCY: usize = 8;
+/// Upper bound of `worker_threads`.
+pub(crate) const MAX_WORKER_THREADS: usize = 8;
+/// Idle connections kept beyond the upload depth, for reads, lists and deletes.
+const EXTRA_IDLE_CONNECTIONS: usize = 8;
 const MAX_ACTIVE_REQUESTS: usize = 32;
 const MAX_CREDENTIAL_BYTES: u64 = 16 * 1024;
 const MAX_CACHE_JOBS: usize = 128;
@@ -89,6 +91,14 @@ pub struct S3ChunkStoreOptions {
     pub generation: String,
     pub allow_http: bool,
     pub unsigned_payload: bool,
+    /// Whole-body checksum sent as a signed request header on every PUT.
+    pub payload_checksum: crate::config::DfsExternalPayloadChecksum,
+    /// Concurrent object PUTs, 1..=[`MAX_UPLOAD_CONCURRENCY`]. The Node's
+    /// native upload depth is capped to this.
+    pub upload_concurrency: usize,
+    /// Request worker threads, 1..=[`MAX_WORKER_THREADS`]. Payload signing and
+    /// checksums run on them, so one thread serializes every PUT's hashing.
+    pub worker_threads: usize,
     pub credentials: S3CredentialsSource,
     /// Deadline for a whole batch, including retry and response-body collection.
     pub request_timeout: Duration,
@@ -187,6 +197,8 @@ fn validate_options(options: &S3ChunkStoreOptions) -> Result<()> {
         || options.request_timeout.is_zero()
         || options.request_timeout > Duration::from_secs(300)
         || options.max_retries > 10
+        || !(1..=MAX_UPLOAD_CONCURRENCY).contains(&options.upload_concurrency)
+        || !(1..=MAX_WORKER_THREADS).contains(&options.worker_threads)
         || !(options.endpoint.starts_with("https://") || options.endpoint.starts_with("http://"))
         || options.endpoint.contains(['@', '?', '#'])
     {

@@ -744,7 +744,7 @@ Required 策略且同一权威 placement 的实际本机持久 ACK 已验证时�
 仍有引用不能退账。只有描述符额度压力，或无本机副本导致 live 满时，才提前后台发布。
 原生 dirty 区间仍只保留不重叠的最终范围；截断、覆盖和准备失败恢复保持引用安全。
 停止先关闭新接纳并唤醒等待者，排空已接纳上传及有序发布，再关闭 catalog 和空闲池。
-远端 owner 与 OwnerFs 保留各自调度；S3 走同一条写流水线，只是上传并发被压到 4、正文保留到发布。
+远端 owner 与 OwnerFs 保留各自调度；S3 走同一条写流水线，只是上传并发不超过 `dfs_external_backend.upload_concurrency`（默认 8）、正文保留到发布。
 Node负责运行时和后台调度；独立构造的 `DistributedFs` 需外部驱动既有写回入口。
 没有运行时／外部驱动且当前请求无法释放live或描述符额度时，返回结构化错误，不以永久等待冒充背压。
 
@@ -1171,10 +1171,11 @@ Home 侧对外 NFS 导出（OwnerFs egress）不在本能力范围内，仍由�
 外部回执的 chunk id 必须绑定本次写代（Meta 校验 `blake3-v2-<写代>-<根>-<长度>` 与回执
 `operation_id`），提交走写代 fence，GC 进行中不与提交冲突。对象回收见「DFS 历史与数据块回收」。
 
-S3 默认保留载荷签名；显式 `dfs_external_backend.unsigned_payload=true` 只将 SDK
-载荷签名策略改为 unsigned，SigV4 请求认证仍在。AFS 业务完整 BLAKE3、对象长度、
-回执身份、错误传播和发布持久屏障不变；该选项不是关闭内容校验，也不自动适配
-或部署第三方后端。
+S3 上传的正文校验：HTTPS 端点默认不让正文参与 SigV4 签名（`unsigned_payload`），
+改为每个 PUT 带签名范围内的 `x-amz-checksum-crc64nvme` 请求头（`payload_checksum`），
+对象存储校验不符即拒绝；HTTP 端点（仅隔离测试）默认保留签名正文。两项都可显式配置，
+SigV4 请求认证始终存在。AFS 读时的 BLAKE3 校验、对象长度、回执身份、错误传播和
+发布持久屏障不变；这些选项不是关闭内容校验，也不自动适配或部署第三方后端。
 
 长度不小于 256 KiB 的数据块另存一个 BLAKE3 outboard 旁对象（数据对象键加 `.bao`，
 `NodeChunkSidecar` 编码，与本地 `.bao` 旁文件相同）。它是可由数据重新算出的派生数据，
@@ -1184,7 +1185,7 @@ S3 默认保留载荷签名；显式 `dfs_external_backend.unsigned_payload=true
 
 **写入**：S3 只是原生写流水线后面的另一个 `ChunkStore`（`node/external_chunk/store.rs` 的 `S3ChunkStore`），
 与本地副本模式共用同一条写路径、同一个提交入口和同样的预算（`dfs_write_queue_bytes`、`dfs_dirty_budget_bytes`、
-`dfs_unpublished_descriptors`）；上传并发被压到实际 PUT 许可数 4（`MAX_UPLOADS`，`node/assembly/dfs.rs`）。
+`dfs_unpublished_descriptors`）；上传并发不超过实际 PUT 许可数 `dfs_external_backend.upload_concurrency`（默认 8，`node/assembly/dfs.rs`）。
 满 4MiB 块提前上传；S3 回执不是本机持久副本，所以正文保留到版本发布。本节点读自己尚未提交的写入在本地完成，
 不触发提交（与原生模式相同）；其他节点只见 Meta 已提交版本。fsync、可写 flush、同步写等待全部必需回执及
 Meta 持久确认；Meta 确认未知时保留精确请求并阻挡后续修改；PUT 失败保留脏数据，下一次屏障重传同一对象。
