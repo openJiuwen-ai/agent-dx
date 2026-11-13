@@ -140,6 +140,78 @@ impl Inbox {
         &self.limits
     }
 
+    /// Read this owner's persisted projection, not an account/intent permission.
+    /// Used to resume synchronization without creating another subscription store.
+    pub async fn subscription(&self, id: &str) -> Result<Option<SubscriptionBinding>, Error> {
+        if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+            return Err(Error::Refused);
+        }
+        let client = self.pool.get().await.map_err(unavailable)?;
+        let Some(row) = client
+            .query_opt(
+                "SELECT binding_json,enabled FROM digitalmate_ingestion.subscriptions WHERE subscription_id=$1",
+                &[&id],
+            )
+            .await
+            .map_err(unavailable)?
+        else {
+            return Ok(None);
+        };
+        let binding = decode(&row.get::<_, String>(0))?;
+        binding.validate()?;
+        if binding.subscription_id != id || binding.enabled != row.get::<_, bool>(1) {
+            return Err(Error::InvalidManifest);
+        }
+        Ok(Some(binding))
+    }
+
+    /// Fence exactly the observed registration before any provider disable I/O.
+    /// An old caller cannot stop a replacement, another account or another scope.
+    /// Retrying the same stop succeeds without inventing an intent revision.
+    pub async fn disable_subscription(&self, expected: &SubscriptionBinding) -> Result<(), Error> {
+        expected.validate()?;
+        let workspace = workspace_key(expected)?;
+        let mut client = self.pool.get().await.map_err(unavailable)?;
+        let tx = client.transaction().await.map_err(unavailable)?;
+        if tx
+            .query_opt(
+                "SELECT workspace_key FROM digitalmate_ingestion.workspaces WHERE workspace_key=$1 FOR UPDATE",
+                &[&workspace],
+            )
+            .await
+            .map_err(unavailable)?
+            .is_none()
+        {
+            return Err(Error::LeaseLost);
+        }
+        let row = tx
+            .query_opt(
+                "SELECT binding_json,enabled FROM digitalmate_ingestion.subscriptions WHERE subscription_id=$1 AND workspace_key=$2 FOR UPDATE",
+                &[&expected.subscription_id, &workspace],
+            )
+            .await
+            .map_err(unavailable)?
+            .ok_or(Error::LeaseLost)?;
+        let current = decode(&row.get::<_, String>(0))?;
+        let mut stopped = expected.clone();
+        stopped.enabled = false;
+        if current == stopped && !row.get::<_, bool>(1) {
+            return tx.commit().await.map_err(unavailable);
+        }
+        if current != *expected || current.enabled != row.get::<_, bool>(1) {
+            return Err(Error::LeaseLost);
+        }
+        retire_pending(&tx, &workspace, &expected.subscription_id).await?;
+        tx.execute(
+            "UPDATE digitalmate_ingestion.subscriptions SET binding_json=$2,enabled=false,due_at=NULL WHERE subscription_id=$1",
+            &[&expected.subscription_id, &encode(&stopped)?],
+        )
+        .await
+        .map_err(unavailable)?;
+        refresh_due(&tx, &workspace).await?;
+        tx.commit().await.map_err(unavailable)
+    }
+
     /// Only call after the real identity/connection owner authorizes this exact
     /// projection. JSON decoding alone is not authorization to register a target.
     /// One logical subscription never changes its tenant/user/workspace.
@@ -166,13 +238,7 @@ impl Inbox {
                 if decode(&row.get::<_,String>(3))?!=*binding {return Err(Error::ConflictingInput);}
                 return tx.commit().await.map_err(unavailable);
             }
-            let used=tx.query_one("SELECT count(*)::bigint,COALESCE(sum(octet_length(raw)),0)::bigint FROM digitalmate_ingestion.events WHERE subscription_id=$1 AND state IN ('pending','batched')",&[&binding.subscription_id]).await.map_err(unavailable)?;
-            tx.execute("UPDATE digitalmate_ingestion.capacity SET pending_events=pending_events-$1,pending_bytes=pending_bytes-$2 WHERE singleton=true",&[&used.get::<_,i64>(0),&used.get::<_,i64>(1)]).await.map_err(unavailable)?;
-            tx.execute("UPDATE digitalmate_ingestion.events SET state='revoked',raw=''::bytea,finished_at=clock_timestamp() WHERE subscription_id=$1 AND state IN ('pending','batched')",&[&binding.subscription_id]).await.map_err(unavailable)?;
-            tx.execute("UPDATE digitalmate_ingestion.batches SET state='revoked',payload=''::bytea,finished_at=clock_timestamp() WHERE subscription_id=$1 AND state='ready'",&[&binding.subscription_id]).await.map_err(unavailable)?;
-            // Fence only this subscription's in-flight batch, not another
-            // connection using the same workspace readiness lease.
-            tx.execute("UPDATE digitalmate_ingestion.workspaces SET active_batch=NULL,lease_until=NULL,lease_epoch=lease_epoch+1 WHERE workspace_key=$1 AND active_batch IN (SELECT batch_id FROM digitalmate_ingestion.batches WHERE subscription_id=$2)",&[&workspace,&binding.subscription_id]).await.map_err(unavailable)?;
+            retire_pending(&tx, &workspace, &binding.subscription_id).await?;
         }
         tx.execute("INSERT INTO digitalmate_ingestion.subscriptions(subscription_id,workspace_key,generation,connection_generation,trigger_id,binding_json,enabled) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(subscription_id) DO UPDATE SET generation=EXCLUDED.generation,connection_generation=EXCLUDED.connection_generation,trigger_id=EXCLUDED.trigger_id,binding_json=EXCLUDED.binding_json,enabled=EXCLUDED.enabled,due_at=NULL",&[&binding.subscription_id,&workspace,&gen,&connection_gen,&binding.trigger_id,&json,&binding.enabled]).await.map_err(unavailable)?;
         refresh_due(&tx, &workspace).await?;
@@ -360,6 +426,21 @@ impl Inbox {
         tx.commit().await.map_err(unavailable)?;
         Ok(events + batches)
     }
+}
+
+/// Keep replacement and explicit stop on the same sole-writer cleanup path.
+async fn retire_pending(
+    tx: &Transaction<'_>,
+    workspace: &str,
+    subscription: &str,
+) -> Result<(), Error> {
+    let used=tx.query_one("SELECT count(*)::bigint,COALESCE(sum(octet_length(raw)),0)::bigint FROM digitalmate_ingestion.events WHERE subscription_id=$1 AND state IN ('pending','batched')",&[&subscription]).await.map_err(unavailable)?;
+    tx.execute("UPDATE digitalmate_ingestion.capacity SET pending_events=pending_events-$1,pending_bytes=pending_bytes-$2 WHERE singleton=true",&[&used.get::<_,i64>(0),&used.get::<_,i64>(1)]).await.map_err(unavailable)?;
+    tx.execute("UPDATE digitalmate_ingestion.events SET state='revoked',raw=''::bytea,finished_at=clock_timestamp() WHERE subscription_id=$1 AND state IN ('pending','batched')",&[&subscription]).await.map_err(unavailable)?;
+    tx.execute("UPDATE digitalmate_ingestion.batches SET state='revoked',payload=''::bytea,finished_at=clock_timestamp() WHERE subscription_id=$1 AND state='ready'",&[&subscription]).await.map_err(unavailable)?;
+    // Preserve another account's active lease in the same workspace.
+    tx.execute("UPDATE digitalmate_ingestion.workspaces SET active_batch=NULL,lease_until=NULL,lease_epoch=lease_epoch+1 WHERE workspace_key=$1 AND active_batch IN (SELECT batch_id FROM digitalmate_ingestion.batches WHERE subscription_id=$2)",&[&workspace,&subscription]).await.map_err(unavailable)?;
+    Ok(())
 }
 
 async fn assert_lease(tx: &Transaction<'_>, lease: &Lease) -> Result<(), Error> {

@@ -254,4 +254,6 @@ mod persistence_tests;
 #[cfg(all(test, feature = "mock-e2e"))]
 mod relay_tests;
 #[cfg(test)]
+mod subscription_state_tests;
+#[cfg(test)]
 mod tests;
