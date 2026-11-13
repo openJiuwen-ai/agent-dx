@@ -3,9 +3,12 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "tools" / "nydus-startup"))
 
 from prewarm import read_range, validate_plan
 from sample_ranges import make_plan
