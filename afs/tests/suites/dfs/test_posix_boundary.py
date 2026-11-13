@@ -391,6 +391,30 @@ print(json.dumps({"blocks":[a.f_blocks,b.f_blocks],"bsize":[a.f_bsize,b.f_bsize]
     assert result["namemax"] == 255, result
 
 
+def supplementary_group_members_can_change_a_group_writable_directory(c):
+    """#33: a process whose only claim to a group-writable directory is a supplementary
+    group can create, link, rename and remove entries in it; a process outside the
+    group gets EACCES."""
+    let_others_traverse(c)
+    shared = path(c, "A", "px-group")
+    c.python("A", "os.mkdir(sys.argv[1]);os.chmod(sys.argv[1],0o2770)", shared)
+    code = """d=sys.argv[1];os.setgroups([int(g) for g in sys.argv[4].split(",") if g])
+os.setgid(int(sys.argv[3]));os.setuid(int(sys.argv[2]));out={}
+out["mkdir"]=err(os.mkdir,d+"/sub")
+out["create"]=err(lambda:os.close(os.open(d+"/f",os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o640)))
+out["symlink"]=err(os.symlink,"f",d+"/s")
+out["link"]=err(os.link,d+"/f",d+"/h")
+out["rename"]=err(os.rename,d+"/f",d+"/g")
+out["unlink"]=err(os.unlink,d+"/g")
+out["rmdir"]=err(os.rmdir,d+"/sub")
+print(json.dumps(out))"""
+    member = run(c, "A", code, shared, c.config["other_uid"], c.config["other_gid"], c.config["gid"], owner=False)
+    stranger = run(c, "A", code, shared, c.config["other_uid"], c.config["other_gid"], "", owner=False)
+    c.record("posix.supplementary_groups", {"member": member, "stranger": stranger})
+    assert all(value == ["ok", None] for value in member.values()), member
+    assert all(value == ["err", "EACCES"] for value in stranger.values()), stranger
+
+
 def truncate_extends_with_zeros(c):
     """#27: truncate beyond the end reads back zeros on every node."""
     c.write("A", "px-trunc", b"abc")
@@ -504,6 +528,7 @@ CASES = tuple(
         timestamps,
         ownership_and_privilege_bits,
         statfs_reports_the_local_disk,
+        supplementary_group_members_can_change_a_group_writable_directory,
         truncate_extends_with_zeros,
         name_and_path_limits,
         large_sparse_offsets,

@@ -42,6 +42,7 @@ use self::reply::{
 use self::request::{
     combine_empty_results, next_ingress_session_id, os_str_bytes, request_groups, sync_mode,
     time_or_now, timestamps_now_only, unsupported_lock_errno, validate_xattr_set,
+    with_groups_after_denial,
 };
 use self::write_admission::{
     DispatchedWrite, FrontOrdering, FrontQueuedWrite, fuse_write_admission, log_write_admission,
@@ -445,6 +446,16 @@ impl AfsFuse {
             pid: req.pid(),
             umask,
             supplementary_gids: Vec::new(),
+        }
+    }
+
+    /// The supplementary groups a refused namespace operation is sent again
+    /// with; none on a mount whose policy does not resend.
+    fn denied_caller_groups(&self, context: &RequestContext) -> Vec<u32> {
+        if self.policy.resends_denied_with_groups() {
+            request_groups(context)
+        } else {
+            Vec::new()
         }
     }
 
@@ -1057,9 +1068,12 @@ impl Filesystem for AfsFuse {
         self.record_request("mkdir");
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
-                backend
-                    .mkdir(&Self::context(req, umask), parent_inode, name, mode)
-                    .map_err(errno_in(FuseOp::Mkdir))
+                with_groups_after_denial(
+                    Self::context(req, umask),
+                    |context| self.denied_caller_groups(context),
+                    |context| backend.mkdir(context, parent_inode, name, mode),
+                )
+                .map_err(errno_in(FuseOp::Mkdir))
             })
         });
         match result {
@@ -1081,9 +1095,12 @@ impl Filesystem for AfsFuse {
         self.record_request("unlink");
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
-                backend
-                    .unlink(&Self::context(req, 0), parent_inode, name)
-                    .map_err(errno_in(FuseOp::Unlink))
+                with_groups_after_denial(
+                    Self::context(req, 0),
+                    |context| self.denied_caller_groups(context),
+                    |context| backend.unlink(context, parent_inode, name),
+                )
+                .map_err(errno_in(FuseOp::Unlink))
             })
         });
         reply_empty(reply, result);
@@ -1093,9 +1110,12 @@ impl Filesystem for AfsFuse {
         self.record_request("rmdir");
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
-                backend
-                    .rmdir(&Self::context(req, 0), parent_inode, name)
-                    .map_err(errno_in(FuseOp::Rmdir))
+                with_groups_after_denial(
+                    Self::context(req, 0),
+                    |context| self.denied_caller_groups(context),
+                    |context| backend.rmdir(context, parent_inode, name),
+                )
+                .map_err(errno_in(FuseOp::Rmdir))
             })
         });
         reply_empty(reply, result);
@@ -1112,14 +1132,12 @@ impl Filesystem for AfsFuse {
         self.record_request("symlink");
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
-                backend
-                    .symlink(
-                        &Self::context(req, 0),
-                        parent_inode,
-                        name,
-                        target.as_os_str(),
-                    )
-                    .map_err(errno_in(FuseOp::Symlink))
+                with_groups_after_denial(
+                    Self::context(req, 0),
+                    |context| self.denied_caller_groups(context),
+                    |context| backend.symlink(context, parent_inode, name, target.as_os_str()),
+                )
+                .map_err(errno_in(FuseOp::Symlink))
             })
         });
         match result {
@@ -1159,16 +1177,21 @@ impl Filesystem for AfsFuse {
         let result = self.backend_inode(parent.0).and_then(|from_parent| {
             let to_parent = self.backend_inode(newparent.0)?;
             Ok(self.backend.as_ref()).and_then(|backend| {
-                backend
-                    .rename(
-                        &Self::context(req, 0),
-                        from_parent,
-                        name,
-                        to_parent,
-                        newname,
-                        RenameFlags(flags.bits()),
-                    )
-                    .map_err(errno_in(FuseOp::Rename))
+                with_groups_after_denial(
+                    Self::context(req, 0),
+                    |context| self.denied_caller_groups(context),
+                    |context| {
+                        backend.rename(
+                            context,
+                            from_parent,
+                            name,
+                            to_parent,
+                            newname,
+                            RenameFlags(flags.bits()),
+                        )
+                    },
+                )
+                .map_err(errno_in(FuseOp::Rename))
             })
         });
         reply_empty(reply, result);
@@ -1196,9 +1219,12 @@ impl Filesystem for AfsFuse {
         let result = self.backend_inode(ino.0).and_then(|inode| {
             let parent = self.backend_inode(newparent.0)?;
             Ok(self.backend.as_ref()).and_then(|backend| {
-                backend
-                    .link(&Self::context(req, 0), inode, parent, newname)
-                    .map_err(errno_in(FuseOp::Link))
+                with_groups_after_denial(
+                    Self::context(req, 0),
+                    |context| self.denied_caller_groups(context),
+                    |context| backend.link(context, inode, parent, newname),
+                )
+                .map_err(errno_in(FuseOp::Link))
             })
         });
         match result {

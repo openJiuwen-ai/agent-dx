@@ -55,7 +55,7 @@
 | 30 | 目录 `fsync` | 成功；目录项变更本就是同步 Meta 事务 | 支持 | `directory_fsync_and_tmpfile_and_poll_and_access` |
 | 31 | `O_TMPFILE` | `EOPNOTSUPP` | 不支持 | 同上 |
 | 32 | `poll`／`select` | 普通文件立即可读可写 | 支持 | 同上 |
-| 33 | `access(2)` | 由内核按 mode 判断（`default_permissions`） | 支持 | 同上 |
+| 33 | `access(2)`、附加组 | `access` 由内核按 mode 判断（`default_permissions`）；只靠附加组才有写权限的目录里可以建、删、改名、建链接（Node 在被 Meta 拒绝后取调用进程的附加组重发一次，这类目录里每次操作多一次往返） | 支持 | 同上；`supplementary_group_members_can_change_a_group_writable_directory` |
 | 34 | `O_PATH` | 可打开、可 `fstat`，读 `EBADF` | 支持 | 同上 |
 | 35 | 符号链接／特殊文件上的 xattr | `user.*` 写 `EPERM`（内核） | 支持（同 Linux） | `xattrs_on_special_files` |
 | 36 | `bmap`、`FIEMAP`、`FICLONE` | `FIEMAP`、`FICLONE` `EOPNOTSUPP`；`cp --reflink=auto` 回退普通拷贝 | 不支持 | `unsupported_ioctls` |

@@ -24,6 +24,13 @@ pub(crate) trait FuseMountPolicy: Send + Sync + 'static {
     /// Metrics `filesystem` label; the kernel fsname is `afs-<label>`.
     fn label(&self) -> &'static str;
 
+    /// Whether a namespace operation the backend refused for lack of
+    /// permission is sent once more with the caller's supplementary groups
+    /// (a FUSE header carries only uid and primary gid). Off by default.
+    fn resends_denied_with_groups(&self) -> bool {
+        false
+    }
+
     /// A kernel inode number was handed out for `_ino`.
     fn remember_inode(&self, _ino: u64) {}
 
@@ -93,6 +100,12 @@ impl DfsFusePolicy {
 impl FuseMountPolicy for DfsFusePolicy {
     fn label(&self) -> &'static str {
         "dfs"
+    }
+
+    /// Meta checks the caller against the parent directory, and a directory
+    /// can be writable to the caller through a supplementary group only.
+    fn resends_denied_with_groups(&self) -> bool {
+        true
     }
 
     fn with_cache_policy(&self, _inode: BackendInode, reply: &mut dyn FnMut(Duration, bool)) {
