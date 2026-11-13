@@ -375,10 +375,32 @@ impl Client {
         };
         let profile = self.proxy(scope, id, endpoint).await?;
         let (email, subject_id) = match provider {
-            MailProvider::Google => (
-                profile.get("emailAddress").and_then(Value::as_str),
-                String::new(),
-            ),
+            MailProvider::Google => {
+                let email = profile
+                    .get("emailAddress")
+                    .and_then(Value::as_str)
+                    .filter(|value| email_address(value))
+                    .ok_or(Error::InvalidResponse)?;
+                // Gmail profile owns the mailbox address. OAuth2 UserInfo owns
+                // the immutable Google ID; neither email nor Composio user_id
+                // may stand in for that subject in the existing M44 receipt.
+                let identity = self.proxy(scope, id, "https://www.googleapis.com/oauth2/v2/userinfo?fields=id,email,verified_email".into()).await?;
+                let subject = identity
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|value| super::types::identifier(value, 256))
+                    .ok_or(Error::InvalidResponse)?;
+                if let Some(other) = identity.get("email") {
+                    if !other
+                        .as_str()
+                        .is_some_and(|other| email.eq_ignore_ascii_case(other))
+                        || identity.get("verified_email").and_then(Value::as_bool) != Some(true)
+                    {
+                        return Err(Error::AccountMismatch);
+                    }
+                }
+                (Some(email), subject.to_string())
+            }
             MailProvider::Microsoft => {
                 let subject = profile
                     .get("id")

@@ -455,7 +455,7 @@ impl ConnectionMetadata {
             || self.record_revision == 0
             || !self.created_at.is_finite()
             || self.created_at <= 0.0
-            || (provider == MailProvider::Microsoft && !identifier(&self.external_subject_id, 256))
+            || !identifier(&self.external_subject_id, 256)
             || (provider == MailProvider::Google
                 && !self.identity_user_id.is_empty()
                 && !email_address(&self.identity_user_id))
@@ -472,7 +472,7 @@ impl ConnectionGrant {
             || !account_id(&self.account_id)
             || (self.email.is_empty() && self.provider != MailProvider::Microsoft)
             || (!self.email.is_empty() && !email_address(&self.email))
-            || (self.provider == MailProvider::Microsoft && !identifier(&self.subject_id, 256))
+            || !identifier(&self.subject_id, 256)
         {
             return Err(Error::Forbidden);
         }

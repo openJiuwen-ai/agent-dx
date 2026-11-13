@@ -120,6 +120,72 @@ async fn source_read_namespace_and_connection_capability_alone_do_not_release_ma
 }
 
 #[tokio::test]
+async fn gmail_verified_userinfo_returns_the_actual_google_id_for_the_existing_owner_receipt() {
+    let f = Fixture::new().await;
+    f.reply(
+        200,
+        json!({"status":200,"data":{"emailAddress":"person@example.com"}}),
+    );
+    f.reply(
+        200,
+        json!({"status":200,"data":{"id":"google_subject", "email":"person@example.com",
+        "verified_email":true, "name":"not part of identity proof"}}),
+    );
+    let profile = f
+        .gateway
+        .client
+        .profile(&f.scope, "ca_one", MailProvider::Google)
+        .await
+        .unwrap();
+    assert_eq!(profile.subject_id, "google_subject");
+    assert_eq!(profile.email, "person@example.com");
+    assert_ne!(profile.subject_id, f.scope.composio_user_id());
+    let calls = f.state.calls.lock().unwrap();
+    assert_eq!(
+        calls[1].1["endpoint"],
+        "https://www.googleapis.com/oauth2/v2/userinfo?fields=id,email,verified_email"
+    );
+}
+
+#[tokio::test]
+async fn gmail_userinfo_cannot_replace_an_immutable_subject_with_email_or_unverified_profile() {
+    for data in [
+        json!({"email":"person@example.com", "verified_email":true}),
+        json!({"id":"person@example.com", "email":"person@example.com", "verified_email":true}),
+        json!({"id":"google_subject", "email":"person@example.com", "verified_email":false}),
+        json!({"id":"google_subject", "email":"person@example.com"}),
+    ] {
+        let f = Fixture::new().await;
+        f.reply(
+            200,
+            json!({"status":200,"data":{"emailAddress":"person@example.com"}}),
+        );
+        f.reply(200, json!({"status":200,"data":data}));
+        assert!(f
+            .gateway
+            .client
+            .profile(&f.scope, "ca_one", MailProvider::Google)
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn gmail_same_address_cannot_hide_a_changed_google_subject() {
+    let f = Fixture::new().await;
+    f.authority.grant.lock().unwrap().subject_id = "other_google_subject".into();
+    f.reads(json!({"messages":[{"id":"must_not_release"}]}));
+    assert_eq!(
+        f.gateway
+            .gmail(&f.scope, "connection-one", f.search())
+            .await
+            .err(),
+        Some(Error::AccountMismatch)
+    );
+    assert_eq!(f.state.calls.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn source_read_requires_an_owner_query_for_the_exact_request_and_task_epoch_zero() {
     let f = Fixture::new().await;
     f.reads(json!({"messages":[{"id":"mail_A", "threadId":"thread_A"}]}));
@@ -143,7 +209,7 @@ async fn source_read_rechecks_task_after_budget_wait_and_discards_late_mail() {
     );
     assert_eq!(
         f.state.calls.lock().unwrap().len(),
-        2,
+        3,
         "no mail dispatch after task refusal during budget wait"
     );
     let late = Fixture::new().await;
@@ -158,7 +224,7 @@ async fn source_read_rechecks_task_after_budget_wait_and_discards_late_mail() {
             .err(),
         Some(Error::Forbidden)
     );
-    assert_eq!(late.state.calls.lock().unwrap().len(), 3);
+    assert_eq!(late.state.calls.lock().unwrap().len(), 4);
 }
 
 #[tokio::test]
@@ -321,8 +387,8 @@ async fn gmail_first_validation_uses_online_profile_without_preexisting_read_per
     assert_eq!(proof["email"], "person@example.com");
     assert!(!proof.to_string().contains("private"));
     let calls = f.state.calls.lock().unwrap();
-    assert_eq!(calls.len(), 3);
-    let endpoint = url::Url::parse(calls[2].1["endpoint"].as_str().unwrap()).unwrap();
+    assert_eq!(calls.len(), 4);
+    let endpoint = url::Url::parse(calls[3].1["endpoint"].as_str().unwrap()).unwrap();
     assert!(endpoint.path().contains("person@example.com"));
     assert!(endpoint
         .query_pairs()
@@ -723,7 +789,7 @@ struct ControlledBudget {
 impl Budget for ControlledBudget {
     async fn acquire(&self, _: &Scope) -> Result<(), Error> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        if call == 3 {
+        if call == 4 {
             if let Some(authority) = self.refuse_read_at_dispatch.lock().unwrap().as_ref() {
                 authority.read_refused.store(true, Ordering::SeqCst);
             }
@@ -828,6 +894,10 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
+    fn gmail_profile(&self, email: &str) {
+        self.reply(200, json!({"status":200,"data":{"emailAddress":email}}));
+        self.reply(200, json!({"status":200,"data":{"id":"google_subject"}}));
+    }
     async fn new() -> Self {
         let scope = Scope::from_authenticated_foreground(
             "tenant".into(),
@@ -863,7 +933,7 @@ impl Fixture {
             }),
             grant: Mutex::new(ConnectionGrant {
                 provider: MailProvider::Google,
-                subject_id: String::new(),
+                subject_id: "google_subject".into(),
                 account_id: "ca_one".into(),
                 email: "person@example.com".into(),
                 generation: 1,
@@ -941,10 +1011,7 @@ impl Fixture {
     }
     fn reads(&self, data: Value) {
         self.reply(200, self.account());
-        self.reply(
-            200,
-            json!({"status":200,"data":{"emailAddress":"person@example.com"}}),
-        );
+        self.gmail_profile("person@example.com");
         self.reply(200, json!({"status":200,"data":data}));
     }
     fn search(&self) -> GmailRequest {
@@ -1046,17 +1113,17 @@ async fn restricted_search_pins_user_account_method_and_endpoint() {
         .unwrap();
     assert_eq!(result["nextPageToken"], "page-two");
     let calls = f.state.calls.lock().unwrap();
-    assert_eq!(calls.len(), 3);
-    assert_eq!(calls[2].0, "/api/v3.1/tools/execute/proxy");
-    assert_eq!(calls[2].1["method"], "GET");
-    assert_eq!(calls[2].1["connected_account_id"], "ca_one");
-    assert_eq!(calls[2].1["user_id"], f.scope.composio_user_id());
-    assert!(calls[2].1["endpoint"]
+    assert_eq!(calls.len(), 4);
+    assert_eq!(calls[3].0, "/api/v3.1/tools/execute/proxy");
+    assert_eq!(calls[3].1["method"], "GET");
+    assert_eq!(calls[3].1["connected_account_id"], "ca_one");
+    assert_eq!(calls[3].1["user_id"], f.scope.composio_user_id());
+    assert!(calls[3].1["endpoint"]
         .as_str()
         .unwrap()
         .starts_with("https://gmail.googleapis.com/gmail/v1/users/person@example.com/messages?"));
     assert!(!result.to_string().contains("never-return-this"));
-    assert_eq!(f.budget.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(f.budget.calls.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]
@@ -1135,10 +1202,7 @@ async fn account_ownership_custom_oauth_and_status_checked_online() {
 async fn mailbox_switch_cannot_silently_change_account() {
     let f = Fixture::new().await;
     f.reply(200, f.account());
-    f.reply(
-        200,
-        json!({"status":200,"data":{"emailAddress":"other@example.com"}}),
-    );
+    f.gmail_profile("other@example.com");
     assert_eq!(
         f.gateway
             .gmail(&f.scope, "connection-one", f.search())
@@ -1201,10 +1265,7 @@ async fn late_completion_rechecks_owner_revision_at_write() {
         json!({"connected_account_id":"ca_one", "toolkit_slug":"gmail"}),
     );
     f.reply(200, f.account());
-    f.reply(
-        200,
-        json!({"status":200,"data":{"emailAddress":"person@example.com"}}),
-    );
+    f.gmail_profile("person@example.com");
     assert_eq!(
         f.gateway
             .confirm(&f.scope, "registration-one", "opaque")
@@ -1359,10 +1420,7 @@ async fn success_and_lost_complete_reply_reconcile_only_bound_account() {
         json!({"connected_account_id":"ca_one", "toolkit_slug":"gmail"}),
     );
     f.reply(200, f.account());
-    f.reply(
-        200,
-        json!({"status":200,"data":{"emailAddress":"person@example.com"}}),
-    );
+    f.gmail_profile("person@example.com");
     assert_eq!(
         f.gateway
             .confirm(&f.scope, "registration-one", "opaque")
@@ -1374,10 +1432,7 @@ async fn success_and_lost_complete_reply_reconcile_only_bound_account() {
     assert_eq!(f.authority.writes.load(Ordering::SeqCst), 1);
     let f = Fixture::new().await;
     f.reply(200, f.account());
-    f.reply(
-        200,
-        json!({"status":200,"data":{"emailAddress":"person@example.com"}}),
-    );
+    f.gmail_profile("person@example.com");
     assert_eq!(
         f.gateway
             .reconcile_authorization(&f.scope, "registration-one")
@@ -1470,7 +1525,7 @@ async fn read_metadata_and_body_formats_are_explicit() {
             .await
             .unwrap();
         let calls = f.state.calls.lock().unwrap();
-        let endpoint = calls[2].1["endpoint"].as_str().unwrap();
+        let endpoint = calls[3].1["endpoint"].as_str().unwrap();
         assert!(endpoint.contains(if body {
             "format=full"
         } else {
@@ -1505,7 +1560,7 @@ async fn gmail_metadata_excludes_preview_body_and_unrequested_headers() {
         json!({"headers":[{"name":"Subject","value":"Allowed subject"}]})
     );
     let calls = f.state.calls.lock().unwrap();
-    let endpoint = reqwest::Url::parse(calls[2].1["endpoint"].as_str().unwrap()).unwrap();
+    let endpoint = reqwest::Url::parse(calls[3].1["endpoint"].as_str().unwrap()).unwrap();
     assert!(endpoint.query_pairs().any(
         |(key, value)| key == "fields" && value == "id,threadId,internalDate,payload(headers)"
     ));
@@ -1541,10 +1596,7 @@ async fn committed_receipt_survives_lost_reply_without_replaying_effects() {
         json!({"connected_account_id":"ca_one", "toolkit_slug":"gmail"}),
     );
     f.reply(200, f.account());
-    f.reply(
-        200,
-        json!({"status":200,"data":{"emailAddress":"person@example.com"}}),
-    );
+    f.gmail_profile("person@example.com");
     // Pretend the successful response never reached the sandbox consumer.
     let _ = f
         .gateway
@@ -1565,7 +1617,7 @@ async fn committed_receipt_survives_lost_reply_without_replaying_effects() {
             .email,
         recovered.email
     );
-    assert_eq!(f.state.calls.lock().unwrap().len(), 3);
+    assert_eq!(f.state.calls.lock().unwrap().len(), 4);
     assert_eq!(f.authority.writes.load(Ordering::SeqCst), 1);
     f.gateway
         .cancel(&f.scope, "registration-one")
@@ -1578,7 +1630,7 @@ async fn committed_receipt_survives_lost_reply_without_replaying_effects() {
             .err(),
         Some(Error::AuthorizationInactive)
     );
-    assert_eq!(f.state.calls.lock().unwrap().len(), 3);
+    assert_eq!(f.state.calls.lock().unwrap().len(), 4);
 }
 
 #[tokio::test]
@@ -1642,7 +1694,7 @@ async fn mailbox_rebind_between_profile_and_read_cannot_return_other_mailbox() {
         Some(Error::ConsentRequired)
     );
     let calls = f.state.calls.lock().unwrap();
-    assert!(calls[2].1["endpoint"]
+    assert!(calls[3].1["endpoint"]
         .as_str()
         .unwrap()
         .contains("/users/person@example.com/messages"));
@@ -1810,16 +1862,13 @@ async fn managed_gmail_is_an_explicit_config_choice_not_a_global_bypass() {
     let mut account = f.account();
     account["auth_config"]["is_composio_managed"] = json!(true);
     f.reply(200, account);
-    f.reply(
-        200,
-        json!({"status":200,"data":{"emailAddress":"person@example.com"}}),
-    );
+    f.gmail_profile("person@example.com");
     f.reply(200, json!({"status":200,"data":{"messages":[]}}));
     f.gateway
         .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
         .await
         .unwrap();
-    assert_eq!(f.state.calls.lock().unwrap().len(), 3);
+    assert_eq!(f.state.calls.lock().unwrap().len(), 4);
 }
 
 #[tokio::test]

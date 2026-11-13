@@ -22,13 +22,16 @@ authorization writer is introduced. Disconnect remains unavailable until the
 original owner publishes its fencing operation.
 
 Outlook requires its immutable online Graph subject even when M44 has no display
-email. Gmail still requires an owner-verified profile address. Its actual M44
-verified-effect writer additionally requires an immutable subject; the current
-Gmail profile has no such ID, so Gmail authorization remains unconnected until
-that actual proof is obtained. Email and Composio user_id are not substitutes.
-The Outlook
-regression first failed Forbidden and then passed; Gmail's negative target also
-ran once, followed by 56 passing Composio tests and one existing ignored PG test.
+email. Gmail combines its online mailbox profile with Google's fixed OAuth2 v2
+UserInfo endpoint, requesting `id,email,verified_email`. The immutable Google
+`id` is required for the original M44 verified-effect writer. An optional
+UserInfo email must match the mailbox and be verified; a profile-only response
+may supply the ID without an email. Email and Composio user_id are not substitutes.
+The existing Google profile scope supports this endpoint without requiring an
+additional OpenID scope. Actual managed-account responses remain unverified.
+The Gmail regression first failed on the missing immutable ID; the final focused
+suite has 67 passing Composio tests and one existing ignored PG test, and focused
+library Clippy passes with warnings denied.
 Those checks compiled the actual Relay adapter but used controlled provider/
 authority ports; real Rust-to-M44 composition, formal startup, persisted runtime
 connector identity, full workspace gates and real Outlook are still incomplete.
@@ -181,7 +184,8 @@ returning IDs. Empty filtered pages retain their validated continuation. The
 provider caps keyword matches at1,000; this does not prove full-history coverage.
 [Microsoft Graph search semantics](https://learn.microsoft.com/en-us/graph/search-query-parameter).
 The private client always specifies both connected_account_id and user_id and
-constructs `GET` endpoints under fixed Gmail paths. Profile uses `/users/me`;
+constructs `GET` endpoints under fixed Gmail paths plus the fixed Google UserInfo
+endpoint. Mailbox profile uses `/users/me`;
 messages pin the owner/profile-verified email as Google's userId via encoded URL
 path segments. A token rebound between profile and message dispatch cannot select
 the other mailbox through `me`. Search pages are limited to 1–100, queries/pages bounded and IDs cannot
@@ -456,7 +460,8 @@ The returned bounded proof contains the exact connection/account/subject,
 authorization generation, record revision, display email and `read_history`
 evidence. The endpoint writes no connection/capability/intent; the original M44
 Registry validates that same record and owns its subsequent CAS. Gmail first
-validation uses its online profile email; Outlook still pins its immutable Graph
+validation pins its immutable UserInfo ID and online mailbox profile email;
+Outlook still pins its immutable Graph
 subject and can have an empty display email. Neither case enables a subscription.
 
 The formal process regression first failed on the real unknown `composio` field.

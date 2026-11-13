@@ -85,8 +85,7 @@ impl Composio {
             .client
             .profile(scope, &current.external_account_id, provider)
             .await?;
-        if (provider == MailProvider::Microsoft
-            && profile.subject_id != current.external_subject_id)
+        if profile.subject_id != current.external_subject_id
             || (provider == MailProvider::Google
                 && !current.identity_user_id.is_empty()
                 && !current
@@ -367,7 +366,7 @@ impl Composio {
             .profile(scope, &grant.account_id, grant.provider)
             .await?;
         if (!grant.email.is_empty() && !grant.email.eq_ignore_ascii_case(&profile.email))
-            || (grant.provider == MailProvider::Microsoft && grant.subject_id != profile.subject_id)
+            || grant.subject_id != profile.subject_id
         {
             return Err(Error::AccountMismatch);
         }
