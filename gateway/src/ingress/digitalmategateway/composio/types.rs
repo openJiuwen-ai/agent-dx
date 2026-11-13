@@ -302,7 +302,8 @@ impl ConnectionGrant {
     pub(super) fn check(&self, request: &MailRequest) -> Result<(), Error> {
         if self.provider != request.provider()
             || !account_id(&self.account_id)
-            || !email_address(&self.email)
+            || (self.email.is_empty() && self.provider != MailProvider::Microsoft)
+            || (!self.email.is_empty() && !email_address(&self.email))
             || (self.provider == MailProvider::Microsoft && !identifier(&self.subject_id, 256))
         {
             return Err(Error::Forbidden);
@@ -395,6 +396,19 @@ impl MailRequest {
 
 pub(super) fn bounded(value: &str, max: usize) -> bool {
     value.len() <= max && !value.chars().any(char::is_control)
+}
+
+pub(super) fn link_payload(scope: &Scope, attempt: &Attempt, config: &str) -> Value {
+    serde_json::json!({"auth_config_id":config, "user_id":scope.composio_user_id(), "alias":attempt.alias()})
+}
+
+pub(super) fn link_digest(scope: &Scope, attempt: &Attempt, config: &str) -> Result<String, Error> {
+    let bytes = serde_json::to_vec(&link_payload(scope, attempt, config))
+        .map_err(|_| Error::InvalidRequest)?;
+    let mut hash = Sha256::new();
+    hash.update(b"digitalmate.composio.link.v1\0POST /api/v3.1/connected_accounts/link\0");
+    hash.update(bytes);
+    Ok(hex::encode(hash.finalize()))
 }
 
 pub(super) fn identifier(value: &str, max: usize) -> bool {

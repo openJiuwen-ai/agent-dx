@@ -1,14 +1,15 @@
 //! Restricted Composio authorization and mail reads outside user sandboxes.
 //!
-//! This is an unwired integration candidate. Authentication, purpose grants,
-//! connection/attempt authority and shared request budget must be supplied by
-//! their real owners. A crypto bearer or a JSON scope is not such a grant.
-//! No connection database, token store, ingestion scheduler or HTTP route lives here.
+//! The fixed entry can retain actual foreground sessions and call M44 through
+//! its purpose issuer and existing ADX Relay. Formal process configuration and
+//! background workload assembly remain separate integration requirements.
+//! A crypto bearer or JSON scope grants no connector or mail permission.
 
 mod budget;
 mod client;
 pub mod http;
 mod outlook;
+mod owner;
 mod types;
 mod webhook;
 
@@ -32,6 +33,24 @@ pub struct Composio {
 }
 
 impl Composio {
+    /// Actual M44 HTTP/Relay assembly; all owner requests use the existing
+    /// purpose issuer and the current foreground session retained by Scope.
+    pub fn with_m44_configs(
+        api_key: String,
+        configs: MailAuthConfigs,
+        owner: Arc<super::connector_owner::OwnerAuthority>,
+        managed: Arc<adx_agent_api::managed::ManagedService>,
+        ingress: Arc<crate::ingress::server::Ingress>,
+        budget: Arc<dyn Budget>,
+    ) -> Result<Self, Error> {
+        let authority = Arc::new(owner::M44Authority::new(
+            owner,
+            managed,
+            ingress,
+            configs.clone(),
+        ));
+        Self::with_configs(api_key, configs, authority, budget)
+    }
     /// Requires custom Gmail OAuth auth config and project callback verification.
     /// Fails closed on empty configuration, invalid key header or HTTP setup.
     pub fn new(
@@ -222,7 +241,7 @@ impl Composio {
             .client
             .profile(scope, &grant.account_id, grant.provider)
             .await?;
-        if !grant.email.eq_ignore_ascii_case(&profile.email)
+        if (!grant.email.is_empty() && !grant.email.eq_ignore_ascii_case(&profile.email))
             || (grant.provider == MailProvider::Microsoft && grant.subject_id != profile.subject_id)
         {
             return Err(Error::AccountMismatch);

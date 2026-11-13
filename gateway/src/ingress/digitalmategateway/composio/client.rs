@@ -201,9 +201,15 @@ impl Client {
 
     pub(super) async fn link(&self, scope: &Scope, attempt: &Attempt) -> Result<Started, Error> {
         let config = self.config(attempt.provider)?;
-        let response = self.request(scope, Method::POST, "/api/v3.1/connected_accounts/link", Some(json!({
-            "auth_config_id": config.id, "user_id":scope.composio_user_id(), "alias":attempt.alias(),
-        })), true).await?;
+        let response = self
+            .request(
+                scope,
+                Method::POST,
+                "/api/v3.1/connected_accounts/link",
+                Some(super::types::link_payload(scope, attempt, &config.id)),
+                true,
+            )
+            .await?;
         let link: Link = serde_json::from_value(response).map_err(|_| Error::OutcomeUnknown)?;
         let url = Url::parse(&link.redirect_url).map_err(|_| Error::OutcomeUnknown)?;
         // No browser secrets are copied or reimplemented. Composio owns the

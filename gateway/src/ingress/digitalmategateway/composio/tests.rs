@@ -1743,6 +1743,41 @@ async fn outlook_body_read_is_explicit_and_uses_same_budget() {
     assert_eq!(f.budget.calls.load(Ordering::SeqCst), 3);
 }
 
+#[tokio::test]
+async fn outlook_uses_immutable_subject_when_owner_has_no_display_email() {
+    let f = Fixture::outlook(true).await;
+    f.authority.grant.lock().unwrap().email.clear();
+    f.outlook_reads(true, json!({"id":"message_A", "subject":"Headers"}));
+    let result = f
+        .gateway
+        .mail(
+            &f.scope,
+            "connection-one",
+            MailRequest::Outlook(OutlookRequest::Read {
+                message_id: "message_A".into(),
+                body: false,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["id"], "message_A");
+    assert_eq!(f.state.calls.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn gmail_still_requires_an_owner_verified_profile_address() {
+    let f = Fixture::new().await;
+    f.authority.grant.lock().unwrap().email.clear();
+    assert_eq!(
+        f.gateway
+            .gmail(&f.scope, "connection-one", f.search())
+            .await
+            .err(),
+        Some(Error::Forbidden)
+    );
+    assert!(f.state.calls.lock().unwrap().is_empty());
+}
+
 #[test]
 fn outlook_search_checks_calendar_dates_ids_and_increasing_bounds() {
     for invalid in [

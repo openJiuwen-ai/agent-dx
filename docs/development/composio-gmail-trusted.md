@@ -8,6 +8,24 @@ Development baseline includes official master `d86a2ee9` and merged #179.
 Branch: `feat/gmail-composio-trusted`. Phase B extends the existing configuration
 and identity owners in this candidate, with independent design review still required.
 
+The explicit `Composio::with_m44_configs` factory now binds the actual owner
+issuer and foreground session guard to M44's eight fixed public operations over
+the existing `AgentV2Access`/Ingress Relay. It selects the existing full Binding
+generation and exact Environment/port/path, reissues only the short owner-call
+credential after readiness, and never retries a physically sent owner write.
+Metadata and current access are read from M44; only `read_history` enables
+header/search projections, and body access remains off. No second connection or
+authorization writer is introduced. Disconnect remains unavailable until the
+original owner publishes its fencing operation.
+
+Outlook requires its immutable online Graph subject even when M44 has no display
+email. Gmail still requires an owner-verified profile address. The Outlook
+regression first failed Forbidden and then passed; Gmail's negative target also
+ran once, followed by 56 passing Composio tests and one existing ignored PG test.
+Those checks compiled the actual Relay adapter but used controlled provider/
+authority ports; real Rust-to-M44 composition, formal startup, persisted runtime
+connector identity, full workspace gates and real Outlook are still incomplete.
+
 Delivery alignment: draft ADX #268 now carries both the trusted Composio adapter
 and the separate ingestion coordination module, in the existing DigitalMateGateway
 process outside user sandboxes. No additional service or coordinator PR is
