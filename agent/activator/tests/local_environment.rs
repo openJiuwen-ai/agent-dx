@@ -13,6 +13,7 @@ use support::network_policy;
 #[derive(Default)]
 struct Application {
     creates: Mutex<Vec<(String, Value, String)>>,
+    pauses: Mutex<Vec<(String, String, Value, String)>>,
     stall: bool,
     absent: bool,
     state: Option<&'static str>,
@@ -51,6 +52,26 @@ impl EnvironmentApplication for Application {
             Err(EnvironmentError::NotFound)
         } else {
             Err(EnvironmentError::OutcomeUnknown("not confirmed".into()))
+        }
+    }
+    async fn pause_request(
+        &self,
+        tenant: &str,
+        id: &str,
+        input: Value,
+        operation_id: &str,
+    ) -> Result<Value, EnvironmentError> {
+        self.pauses
+            .lock()
+            .unwrap()
+            .push((tenant.into(), id.into(), input, operation_id.into()));
+        if self.stall {
+            std::future::pending().await
+        } else {
+            Ok(
+                json!({"environmentId":id,"snapshotId":operation_id,"size":2048,
+                "state":"paused","expiresAt":null}),
+            )
         }
     }
 }
@@ -156,4 +177,69 @@ async fn local_creation_attempt_changes_only_the_operation_identity() {
     assert_eq!(calls[0], calls[1]);
     assert_ne!(calls[0].2, calls[2].2);
     assert_eq!(calls[0].1, calls[2].1);
+}
+
+#[tokio::test]
+async fn local_pause_forwards_prefixed_operation_id_and_budget() {
+    let app = Arc::new(Application::default());
+    let environment =
+        LocalEnvironment::new(app.clone(), Duration::from_secs(60), network_policy()).unwrap();
+    let observed = environment.pause("tenant", "adx-id", 120).await.unwrap();
+    assert_eq!(observed.id, "adx-id");
+    assert_eq!(observed.phase, EnvironmentPhase::Paused);
+    assert!(!observed.ready);
+    {
+        let calls = app.pauses.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "tenant");
+        assert_eq!(calls[0].1, "adx-id");
+        assert_eq!(calls[0].2, json!({"timeoutSeconds":120}));
+        assert!(
+            calls[0].3.starts_with("pause-activator-"),
+            "operation id must carry the pause- prefix: {}",
+            calls[0].3
+        );
+    }
+    // Replaying the same tenant/id reuses the deterministic operation identity.
+    environment.pause("tenant", "adx-id", 120).await.unwrap();
+    let calls = app.pauses.lock().unwrap();
+    assert_eq!(calls[0].3, calls[1].3);
+}
+
+#[tokio::test]
+async fn local_pause_timeout_is_unknown_so_callers_requery() {
+    let app = Arc::new(Application {
+        stall: true,
+        ..Default::default()
+    });
+    let environment =
+        LocalEnvironment::new(app, Duration::from_millis(50), network_policy()).unwrap();
+    // The application stalls past the local timeout budget; the result is unknown, not
+    // success, so the orchestrator re-queries the original ID on its next pass.
+    assert!(matches!(
+        environment.pause("tenant", "adx-id", 1).await,
+        Err(EnvironmentError::OutcomeUnknown(_))
+    ));
+}
+
+#[tokio::test]
+async fn local_pause_rejects_timeout_seconds_outside_the_api_bound() {
+    // Mirrors HttpEnvironment: the pub trait method must refuse an out-of-bound budget
+    // at the entry rather than handing it to the application or building an overflowing
+    // Duration. Bounds mirror the API Server pause contract (1..=3600).
+    let environment = LocalEnvironment::new(
+        Arc::new(Application::default()),
+        Duration::from_secs(60),
+        network_policy(),
+    )
+    .unwrap();
+    for budget in [0_u64, 3601] {
+        assert!(
+            matches!(
+                environment.pause("tenant", "adx-id", budget).await,
+                Err(EnvironmentError::Invalid(_))
+            ),
+            "budget {budget} must be rejected before the application is called"
+        );
+    }
 }
