@@ -13,6 +13,9 @@ use std::sync::{
     Mutex,
 };
 
+#[path = "connector_owner_persistence_tests.rs"]
+mod persistence_tests;
+
 struct Auth(AtomicBool);
 #[async_trait]
 impl BusinessAuth for Auth {
@@ -62,13 +65,7 @@ fn setup() -> (
     Arc<TokenSigner>,
 ) {
     let auth = Arc::new(Auth(AtomicBool::new(false)));
-    let application = ApplicationWsConfig {
-        request_timeout_seconds: 5,
-        template: "digitalmate".into(),
-        template_ref: "1".into(),
-        backend_path: "/ws".into(),
-        service_port: 18092,
-    };
+    let application = application();
     let scope = application
         .scope("tenant", "alice", Application::DigitalMate)
         .unwrap();
@@ -114,6 +111,16 @@ fn setup() -> (
         bindings,
         signer,
     )
+}
+
+fn application() -> ApplicationWsConfig {
+    ApplicationWsConfig {
+        request_timeout_seconds: 5,
+        template: "digitalmate".into(),
+        template_ref: "1".into(),
+        backend_path: "/ws".into(),
+        service_port: 18092,
+    }
 }
 
 fn token(value: &super::super::connector_owner::OwnerAuthorization) -> &str {
@@ -208,6 +215,35 @@ async fn owner_purpose_rechecks_session_and_generation_before_ack() {
             "{changed}"
         );
     }
+}
+
+#[tokio::test]
+async fn owner_purpose_rechecks_session_after_binding_io() {
+    struct RevokingBinding(Arc<Bindings>, Arc<Auth>);
+    #[async_trait]
+    impl BindingReader for RevokingBinding {
+        async fn binding(&self, scope: &Scope) -> accounts::Result<AgentBinding> {
+            self.1 .0.store(true, Ordering::SeqCst);
+            self.0.binding(scope).await
+        }
+    }
+    let (owner, identity, auth, bindings, signer) = setup();
+    let packet = owner
+        .foreground_headers(&identity, OwnerOperation::Claim, b"{}")
+        .await
+        .unwrap();
+    let owner = OwnerAuthority::new(
+        "tenant".into(),
+        application(),
+        signer,
+        Arc::new(RevokingBinding(bindings, auth.clone())),
+        auth,
+    )
+    .unwrap();
+    assert!(owner
+        .verify(token(&packet), OwnerOperation::Claim, &digest(b"{}"), None)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
