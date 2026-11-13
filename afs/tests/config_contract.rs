@@ -2393,3 +2393,40 @@ fn s4c_scrub_settings_default_on_and_reject_out_of_range() {
         assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{flag} {value}");
     }
 }
+
+/// Performance batch 1 (A): the DFS kernel entry/attribute TTL defaults to
+/// 1 s, 0 turns kernel caching off, and values above 60 s are rejected from
+/// TOML and CLI.
+#[test]
+fn dfs_kernel_cache_ttl_defaults_to_one_second_and_rejects_out_of_range() {
+    let defaults = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(defaults.dfs_kernel_cache_ttl_ms, 1_000);
+    let off = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--dfs-kernel-cache-ttl-ms", "0"]),
+    )
+    .unwrap();
+    assert_eq!(off.dfs_kernel_cache_ttl_ms, 0);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ttl.toml");
+    std::fs::write(&path, "dfs_kernel_cache_ttl_ms=60000\n").unwrap();
+    let max = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert_eq!(max.dfs_kernel_cache_ttl_ms, 60_000);
+    std::fs::write(&path, "dfs_kernel_cache_ttl_ms=60001\n").unwrap();
+    let error = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    let error = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--dfs-kernel-cache-ttl-ms", "60001"]),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+}

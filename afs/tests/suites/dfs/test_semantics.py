@@ -10,9 +10,12 @@ On a single VM the roles are separate processes and mounts on one kernel, so
 this proves cross-client semantics, not cross-VM isolation.
 """
 
+import json
+import posixpath
 import time
 
-from fixtures.common import Case
+from fixtures.common import Case, DfsProfile
+from suites.operations import uncached_path_visibility
 
 HOLDER = """import os,sys,time,json
 d=sys.argv[1];os.setgroups([]);os.setgid(int(sys.argv[4]));os.setuid(int(sys.argv[3]))
@@ -43,7 +46,6 @@ def _release(c, role, name, holder):
     c.python(role, 'open(sys.argv[1],"w").write("{}")', holder + "/go.json")
     _wait_file(c, role, holder + "/done.json")
     c.channel(role).call("wait", role=name)
-    import json
     return json.loads(c.python(role, 'print(open(sys.argv[1]).read())', holder + "/done.json")["stdout"])
 
 
@@ -96,32 +98,42 @@ def unlink_open_file_keeps_data(c):
     result = _release(c, "B", "sem-unlink-holder", holder)
     c.record("semantics.unlink_open", result)
     assert result["first"] == 700 and result["second"] == 700, result
-    c.python("B", "assert not os.path.exists(sys.argv[1])", path)
+    # Path-only query: may lag A by one kernel entry TTL.
+    c.poll_python("B", "not os.path.exists(a[0])", path, label="unlink.B")
 
 
 def close_mtime_visibility_today(c):
     """Decision 5 keeps close DataOnly. Q03 asked whether another client's stat lags; S0 measured no lag.
 
-    The FUSE close path updates size and mtime that a fresh stat on another node observes at once.
+    The FUSE close path updates size and mtime. A fresh OPEN on another node sees them at once
+    (close-to-open, asserted strictly through fstat); a path stat may lag by one kernel attribute TTL.
     """
     c.write("A", "sem-mtime", b"x")
     time.sleep(1.2)
-    before = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)",
-                            c.workspace("B") + "/sem-mtime")["stdout"])
+    path = posixpath.join(c.workspace("B"), "sem-mtime")
+    before = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)", path)["stdout"])
     # write without fsync, then close: FUSE flush commits DataOnly.
     c.python("A", 'f=open(sys.argv[1],"ab");f.write(b"y");f.close()', c.workspace("A") + "/sem-mtime")
-    after_close = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)",
-                                 c.workspace("B") + "/sem-mtime")["stdout"])
-    size_after_close = int(c.python("B", "print(os.stat(sys.argv[1]).st_size)",
-                                    c.workspace("B") + "/sem-mtime")["stdout"])
+    opened = json.loads(c.python(
+        "B",
+        'fd=os.open(sys.argv[1],os.O_RDONLY);s=os.fstat(fd);os.close(fd);'
+        'print(json.dumps({"mtime":s.st_mtime,"size":s.st_size}))',
+        path,
+    )["stdout"])
+    stat_delay = c.poll_python(
+        "B", "os.stat(a[0]).st_size==2 and os.stat(a[0]).st_mtime>float(a[1])", path, repr(before),
+        label="close_mtime_path_stat.B",
+    )
+    after_close = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)", path)["stdout"])
+    size_after_close = int(c.python("B", "print(os.stat(sys.argv[1]).st_size)", path)["stdout"])
     time.sleep(6)  # background commit period is 5 s
-    after_background = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)",
-                                      c.workspace("B") + "/sem-mtime")["stdout"])
-    evidence = {"mtime_before": before, "mtime_after_close": after_close, "size_after_close": size_after_close,
-                "mtime_after_background": after_background,
-                "mtime_lagged_after_close": after_close == before,
+    after_background = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)", path)["stdout"])
+    evidence = {"mtime_before": before, "open_fstat_mtime": opened["mtime"], "open_fstat_size": opened["size"],
+                "path_stat_delay_ms": stat_delay["ms"], "mtime_after_close": after_close,
+                "size_after_close": size_after_close, "mtime_after_background": after_background,
                 "question": "Q03", "decision": "5 (close stays DataOnly)"}
     c.record("semantics.close_mtime", evidence)
+    assert opened["size"] == 2 and opened["mtime"] > before, evidence
     assert size_after_close == 2, evidence
     assert after_close > before, evidence
 
@@ -152,6 +164,8 @@ CASES = (
     Case("dfs.semantics.open_reader_after_commit", ("s0-semantics",), "dfs", (), open_reader_keeps_open_time_version),
     Case("dfs.semantics.unlink_open_file", ("s0-semantics",), "dfs", (), unlink_open_file_keeps_data),
     Case("dfs.semantics.close_mtime", ("s0-semantics",), "dfs", (), close_mtime_visibility_today),
+    Case("dfs.semantics.uncached_path_visibility", ("s0-semantics",), "dfs", (), uncached_path_visibility,
+         profile=DfsProfile(kernel_cache_ttl_ms=0)),
     Case("dfs.semantics.fsync", ("s0-semantics",), "dfs", (), fsync_error_free_path),
     Case("dfs.semantics.locks_local_only", ("s0-semantics",), "dfs", (), file_locks_are_local_only),
 )

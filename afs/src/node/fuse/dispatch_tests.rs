@@ -140,7 +140,7 @@ fn fuse_mount_options_wire_threads_clone_and_zero_ttls() {
     assert_eq!(fs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
     let mut dfs_ttl = None;
     super::policy::with_cache_policy(
-        &super::DfsFusePolicy,
+        &super::DfsFusePolicy::new(Duration::ZERO),
         crate::node::vfs::types::BackendInode { value: 7 },
         |ttl, private| dfs_ttl = Some((ttl, private)),
     );
