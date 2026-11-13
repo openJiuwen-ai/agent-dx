@@ -36,6 +36,63 @@ pub enum Error {
     OutcomeUnknown,
 }
 
+/// Canonical connection-owner providers; toolkit names are transport details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailProvider {
+    Google,
+    Microsoft,
+}
+
+impl MailProvider {
+    pub(super) fn toolkit(self) -> &'static str {
+        match self {
+            Self::Google => "gmail",
+            Self::Microsoft => "outlook",
+        }
+    }
+}
+
+/// App ownership is trusted deployment policy, never a user request option.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum OAuthAppOwnership {
+    Custom,
+    ComposioManaged,
+}
+
+impl OAuthAppOwnership {
+    pub(super) fn is_managed(self) -> bool {
+        self == Self::ComposioManaged
+    }
+}
+
+pub struct MailAuthConfig {
+    pub id: String,
+    pub ownership: OAuthAppOwnership,
+}
+
+impl MailAuthConfig {
+    pub fn custom(id: String) -> Self {
+        Self {
+            id,
+            ownership: OAuthAppOwnership::Custom,
+        }
+    }
+
+    pub fn managed(id: String) -> Self {
+        Self {
+            id,
+            ownership: OAuthAppOwnership::ComposioManaged,
+        }
+    }
+}
+
+/// Configure only providers enabled by deployment. Missing providers fail closed.
+#[derive(Default)]
+pub struct MailAuthConfigs {
+    pub gmail: Option<MailAuthConfig>,
+    pub outlook: Option<MailAuthConfig>,
+}
+
 /// Construct only from authenticated, foreground-purpose business authority.
 /// Deliberately not Deserialize: request JSON must never construct identity.
 /// No background purpose is accepted in this first integration candidate.
@@ -102,6 +159,7 @@ pub enum AttemptPhase {
 /// Read-only snapshot from the existing authorization owner; not another table.
 #[derive(Clone)]
 pub struct Attempt {
+    pub provider: MailProvider,
     pub registration: String,
     pub revision: u64,
     pub deadline_epoch_seconds: u64,
@@ -148,11 +206,15 @@ pub struct Started {
 /// Account proof conveys identity only. It never grants read/write capabilities.
 #[derive(Clone)]
 pub struct VerifiedAccount {
+    pub provider: MailProvider,
+    /// Online immutable Graph subject for Microsoft; not an email or caller ID.
+    /// Gmail profile does not supply this proof, so its value remains empty.
+    pub subject_id: String,
     pub account_id: String,
     pub email: String,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub struct Permissions {
     pub search: bool,
     pub read_headers: bool,
@@ -161,6 +223,8 @@ pub struct Permissions {
 
 #[derive(Clone)]
 pub struct ConnectionGrant {
+    pub provider: MailProvider,
+    pub subject_id: String,
     pub account_id: String,
     pub email: String,
     pub generation: u64,
@@ -168,14 +232,25 @@ pub struct ConnectionGrant {
 }
 
 impl ConnectionGrant {
-    pub(super) fn check(&self, request: &GmailRequest) -> Result<(), Error> {
-        if !account_id(&self.account_id) || !email_address(&self.email) {
+    pub(super) fn check(&self, request: &MailRequest) -> Result<(), Error> {
+        if self.provider != request.provider()
+            || !account_id(&self.account_id)
+            || !email_address(&self.email)
+            || (self.provider == MailProvider::Microsoft && !identifier(&self.subject_id, 256))
+        {
             return Err(Error::Forbidden);
         }
         let allowed = match request {
-            GmailRequest::Search { .. } => self.permissions.search,
-            GmailRequest::Read { body: false, .. } => self.permissions.read_headers,
-            GmailRequest::Read { body: true, .. } => self.permissions.read_body,
+            MailRequest::Gmail(GmailRequest::Search { .. })
+            | MailRequest::Outlook(OutlookRequest::Search { .. }) => self.permissions.search,
+            MailRequest::Gmail(GmailRequest::Read { body: false, .. })
+            | MailRequest::Outlook(OutlookRequest::Read { body: false, .. }) => {
+                self.permissions.read_headers
+            }
+            MailRequest::Gmail(GmailRequest::Read { body: true, .. })
+            | MailRequest::Outlook(OutlookRequest::Read { body: true, .. }) => {
+                self.permissions.read_body
+            }
         };
         if allowed {
             Ok(())
@@ -210,6 +285,43 @@ impl GmailRequest {
             Ok(())
         } else {
             Err(Error::InvalidRequest)
+        }
+    }
+}
+
+/// Personal Microsoft mailbox only; no free-form OData, tool, URL or headers.
+pub enum OutlookRequest {
+    Search {
+        sender: String,
+        since: String,
+        until: String,
+        limit: u16,
+        page: String,
+    },
+    Read {
+        message_id: String,
+        body: bool,
+    },
+}
+
+/// Shared read entrance. Provider must match the current owner connection grant.
+pub enum MailRequest {
+    Gmail(GmailRequest),
+    Outlook(OutlookRequest),
+}
+
+impl MailRequest {
+    pub(super) fn provider(&self) -> MailProvider {
+        match self {
+            Self::Gmail(_) => MailProvider::Google,
+            Self::Outlook(_) => MailProvider::Microsoft,
+        }
+    }
+
+    pub(super) fn validate(&self) -> Result<(), Error> {
+        match self {
+            Self::Gmail(request) => request.validate(),
+            Self::Outlook(request) => request.validate(),
         }
     }
 }
@@ -289,6 +401,7 @@ pub trait Authority: Send + Sync {
         scope: &Scope,
         connection_id: &str,
     ) -> Result<ConnectionGrant, Error>;
+    /// Recheck provider/backend, subject, generation and current operation permissions.
     async fn assert_connection(
         &self,
         scope: &Scope,

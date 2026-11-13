@@ -1,5 +1,8 @@
 use super::types::{account_id, bounded, email_address, json_object, status_error};
-use super::{Attempt, Budget, Error, GmailRequest, Scope, Started};
+use super::{
+    Attempt, Budget, ConnectionGrant, Error, GmailRequest, MailAuthConfig, MailAuthConfigs,
+    MailProvider, MailRequest, Scope, Started, VerifiedAccount,
+};
 use reqwest::{
     header::{HeaderMap, HeaderValue},
     Method, Url,
@@ -10,11 +13,12 @@ use std::{sync::Arc, time::Duration};
 
 const MAX_RESPONSE: usize = 1_048_576;
 const GMAIL: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+const GMAIL_HEADERS: [&str; 5] = ["Subject", "From", "To", "Date", "Message-ID"];
 
 pub(super) struct Client {
     http: reqwest::Client,
     pub(super) origin: String,
-    auth_config: String,
+    auth_configs: MailAuthConfigs,
     budget: Arc<dyn Budget>,
 }
 
@@ -64,12 +68,25 @@ struct Complete {
 impl Client {
     pub(super) fn new(
         api_key: String,
-        auth_config: String,
+        auth_configs: MailAuthConfigs,
         budget: Arc<dyn Budget>,
     ) -> Result<Self, Error> {
-        if api_key.is_empty()
-            || !super::types::identifier(&auth_config, 256)
-            || !auth_config.starts_with("ac_")
+        if api_key.is_empty() || (auth_configs.gmail.is_none() && auth_configs.outlook.is_none()) {
+            return Err(Error::NotConfigured);
+        }
+        for config in [&auth_configs.gmail, &auth_configs.outlook]
+            .into_iter()
+            .flatten()
+        {
+            if !super::types::identifier(&config.id, 256) || !config.id.starts_with("ac_") {
+                return Err(Error::NotConfigured);
+            }
+        }
+        if auth_configs
+            .gmail
+            .as_ref()
+            .zip(auth_configs.outlook.as_ref())
+            .is_some_and(|(a, b)| a.id == b.id)
         {
             return Err(Error::NotConfigured);
         }
@@ -87,9 +104,17 @@ impl Client {
         Ok(Self {
             http,
             origin: "https://backend.composio.dev".into(),
-            auth_config,
+            auth_configs,
             budget,
         })
+    }
+
+    pub(super) fn config(&self, provider: MailProvider) -> Result<&MailAuthConfig, Error> {
+        match provider {
+            MailProvider::Google => self.auth_configs.gmail.as_ref(),
+            MailProvider::Microsoft => self.auth_configs.outlook.as_ref(),
+        }
+        .ok_or(Error::NotConfigured)
     }
 
     async fn request(
@@ -171,13 +196,14 @@ impl Client {
     }
 
     pub(super) async fn link(&self, scope: &Scope, attempt: &Attempt) -> Result<Started, Error> {
+        let config = self.config(attempt.provider)?;
         let response = self.request(scope, Method::POST, "/api/v3.1/connected_accounts/link", Some(json!({
-            "auth_config_id": self.auth_config, "user_id":scope.composio_user_id(), "alias":attempt.alias(),
+            "auth_config_id": config.id, "user_id":scope.composio_user_id(), "alias":attempt.alias(),
         })), true).await?;
         let link: Link = serde_json::from_value(response).map_err(|_| Error::OutcomeUnknown)?;
         let url = Url::parse(&link.redirect_url).map_err(|_| Error::OutcomeUnknown)?;
         // No browser secrets are copied or reimplemented. Composio owns the
-        // Google OAuth protocol and token exchange; callback verifier is required.
+        // provider OAuth protocol and token exchange; callback verifier is required.
         if !account_id(&link.connected_account_id)
             || url.scheme() != "https"
             || url.host_str() != Some("connect.composio.dev")
@@ -197,7 +223,13 @@ impl Client {
         })
     }
 
-    pub(super) async fn complete(&self, scope: &Scope, session_uri: &str) -> Result<String, Error> {
+    pub(super) async fn complete(
+        &self,
+        scope: &Scope,
+        session_uri: &str,
+        provider: MailProvider,
+    ) -> Result<String, Error> {
+        self.config(provider)?;
         if session_uri.is_empty() || !bounded(session_uri, 8192) {
             return Err(Error::InvalidRequest);
         }
@@ -214,7 +246,9 @@ impl Client {
             .await?;
         let complete: Complete =
             serde_json::from_value(value).map_err(|_| Error::OutcomeUnknown)?;
-        if !account_id(&complete.connected_account_id) || complete.toolkit_slug != "gmail" {
+        if !account_id(&complete.connected_account_id)
+            || complete.toolkit_slug != provider.toolkit()
+        {
             return Err(Error::AccountMismatch);
         }
         Ok(complete.connected_account_id)
@@ -225,8 +259,9 @@ impl Client {
         scope: &Scope,
         id: &str,
         alias: Option<&str>,
+        provider: MailProvider,
     ) -> Result<(), Error> {
-        let account = self.owned_account(scope, id, alias).await?;
+        let account = self.owned_account(scope, id, alias, provider).await?;
         if alias.is_some()
             && !account.is_disabled
             && !account.auth_config.is_disabled
@@ -245,7 +280,9 @@ impl Client {
         scope: &Scope,
         id: &str,
         alias: Option<&str>,
+        provider: MailProvider,
     ) -> Result<Account, Error> {
+        let config = self.config(provider)?;
         if !account_id(id) {
             return Err(Error::Forbidden);
         }
@@ -261,9 +298,9 @@ impl Client {
         let account: Account = serde_json::from_value(value).map_err(|_| Error::InvalidResponse)?;
         if account.id != id
             || account.user_id != scope.composio_user_id()
-            || account.toolkit.slug != "gmail"
-            || account.auth_config.id != self.auth_config
-            || account.auth_config.is_composio_managed
+            || account.toolkit.slug != provider.toolkit()
+            || account.auth_config.id != config.id
+            || account.auth_config.is_composio_managed != config.ownership.is_managed()
             || account.auth_config.auth_scheme != "OAUTH2"
             || alias.is_some_and(|v| v != account.alias)
             || account
@@ -302,16 +339,69 @@ impl Client {
         json_object(result.get("data").cloned().ok_or(Error::InvalidResponse)?)
     }
 
-    pub(super) async fn profile(&self, scope: &Scope, id: &str) -> Result<String, Error> {
-        let profile = self
-            .proxy(scope, id, format!("{GMAIL}/profile?fields=emailAddress"))
-            .await?;
-        let email = profile
-            .get("emailAddress")
-            .and_then(Value::as_str)
-            .filter(|v| email_address(v))
-            .ok_or(Error::InvalidResponse)?;
-        Ok(email.to_string())
+    pub(super) async fn profile(
+        &self,
+        scope: &Scope,
+        id: &str,
+        provider: MailProvider,
+    ) -> Result<VerifiedAccount, Error> {
+        let endpoint = match provider {
+            MailProvider::Google => format!("{GMAIL}/profile?fields=emailAddress"),
+            MailProvider::Microsoft => {
+                "https://graph.microsoft.com/v1.0/me?$select=id,mail,userPrincipalName".into()
+            }
+        };
+        let profile = self.proxy(scope, id, endpoint).await?;
+        let (email, subject_id) = match provider {
+            MailProvider::Google => (
+                profile.get("emailAddress").and_then(Value::as_str),
+                String::new(),
+            ),
+            MailProvider::Microsoft => {
+                let subject = profile
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|value| super::types::identifier(value, 256))
+                    .ok_or(Error::InvalidResponse)?;
+                let email = profile
+                    .get("mail")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| profile.get("userPrincipalName").and_then(Value::as_str));
+                (email, subject.to_string())
+            }
+        };
+        let email = email
+            .filter(|value| email_address(value))
+            .ok_or(Error::InvalidResponse)?
+            .to_string();
+        Ok(VerifiedAccount {
+            provider,
+            subject_id,
+            account_id: id.into(),
+            email,
+        })
+    }
+
+    pub(super) async fn mail(
+        &self,
+        scope: &Scope,
+        grant: &ConnectionGrant,
+        request: MailRequest,
+    ) -> Result<Value, Error> {
+        match request {
+            MailRequest::Gmail(request) => {
+                self.gmail(scope, &grant.account_id, &grant.email, request)
+                    .await
+            }
+            MailRequest::Outlook(request) => {
+                let endpoint = request.endpoint(&grant.subject_id)?;
+                let result = self
+                    .proxy(scope, &grant.account_id, endpoint.to_string())
+                    .await?;
+                request.project(result, &grant.subject_id)
+            }
+        }
     }
 
     pub(super) async fn gmail(
@@ -321,6 +411,13 @@ impl Client {
         email: &str,
         request: GmailRequest,
     ) -> Result<Value, Error> {
+        let metadata_id = match &request {
+            GmailRequest::Read {
+                message_id,
+                body: false,
+            } => Some(message_id.clone()),
+            _ => None,
+        };
         // Pin the verified mailbox as Google's userId. A token rebound to a
         // different mailbox between profile and dispatch cannot select `me`.
         let mut endpoint = Url::parse("https://gmail.googleapis.com/gmail/v1/users")
@@ -354,7 +451,10 @@ impl Client {
                     .query_pairs_mut()
                     .append_pair("format", if body { "full" } else { "metadata" });
                 if !body {
-                    for name in ["Subject", "From", "To", "Date", "Message-ID"] {
+                    endpoint
+                        .query_pairs_mut()
+                        .append_pair("fields", "id,threadId,internalDate,payload(headers)");
+                    for name in GMAIL_HEADERS {
                         endpoint
                             .query_pairs_mut()
                             .append_pair("metadataHeaders", name);
@@ -362,11 +462,20 @@ impl Client {
                 }
             }
         }
-        self.proxy(scope, id, endpoint.to_string()).await
+        let result = self.proxy(scope, id, endpoint.to_string()).await?;
+        match metadata_id {
+            Some(message_id) => gmail_metadata(result, &message_id),
+            None => Ok(result),
+        }
     }
 
-    pub(super) async fn revoke(&self, scope: &Scope, id: &str) -> Result<(), Error> {
-        let current = self.owned_account(scope, id, None).await?;
+    pub(super) async fn revoke(
+        &self,
+        scope: &Scope,
+        id: &str,
+        provider: MailProvider,
+    ) -> Result<(), Error> {
+        let current = self.owned_account(scope, id, None, provider).await?;
         if current.status == "REVOKED" {
             return Ok(());
         }
@@ -389,4 +498,48 @@ impl Client {
         }
         Ok(())
     }
+}
+
+// Gmail's metadata representation includes snippet by default. Select and
+// project headers explicitly so read_headers cannot disclose a body preview.
+fn gmail_metadata(value: Value, message_id: &str) -> Result<Value, Error> {
+    if value.get("id").and_then(Value::as_str) != Some(message_id) {
+        return Err(Error::InvalidResponse);
+    }
+    let mut result = json!({});
+    for field in ["id", "threadId", "internalDate"] {
+        if let Some(value) = value.get(field) {
+            result[field] = value.clone();
+        }
+    }
+    let mut headers = Vec::new();
+    if let Some(payload) = value.get("payload") {
+        let payload = payload.as_object().ok_or(Error::InvalidResponse)?;
+        if let Some(values) = payload.get("headers") {
+            let values = values
+                .as_array()
+                .filter(|values| values.len() <= 200)
+                .ok_or(Error::InvalidResponse)?;
+            for header in values {
+                let name = header
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| bounded(name, 256))
+                    .ok_or(Error::InvalidResponse)?;
+                if GMAIL_HEADERS
+                    .iter()
+                    .any(|allowed| name.eq_ignore_ascii_case(allowed))
+                {
+                    let value = header
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .filter(|value| value.len() <= 16384)
+                        .ok_or(Error::InvalidResponse)?;
+                    headers.push(json!({"name":name,"value":value}));
+                }
+            }
+        }
+    }
+    result["payload"] = json!({"headers":headers});
+    Ok(result)
 }

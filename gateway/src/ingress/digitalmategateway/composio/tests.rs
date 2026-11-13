@@ -75,7 +75,10 @@ impl Authority for ControlledAuthority {
         self.check_scope(scope)?;
         let mut current = self.attempt.lock().unwrap();
         current.check()?;
-        if current.revision != expected.revision || current.phase != AttemptPhase::Ready {
+        if current.revision != expected.revision
+            || current.provider != expected.provider
+            || current.phase != AttemptPhase::Ready
+        {
             return Err(Error::AuthorizationInactive);
         }
         current.phase = AttemptPhase::Starting;
@@ -90,7 +93,10 @@ impl Authority for ControlledAuthority {
         self.check_scope(scope)?;
         let mut current = self.attempt.lock().unwrap();
         current.check()?;
-        if current.revision != expected.revision || current.phase != AttemptPhase::Starting {
+        if current.revision != expected.revision
+            || current.provider != expected.provider
+            || current.phase != AttemptPhase::Starting
+        {
             return Err(Error::AuthorizationInactive);
         }
         current.account_id.clone_from(&started.account_id);
@@ -109,7 +115,10 @@ impl Authority for ControlledAuthority {
             current.revision += 1;
         }
         current.check()?;
-        if current.revision != expected.revision || current.phase != AttemptPhase::Waiting {
+        if current.revision != expected.revision
+            || current.provider != expected.provider
+            || current.phase != AttemptPhase::Waiting
+        {
             return Err(Error::AuthorizationInactive);
         }
         current.phase = AttemptPhase::Complete;
@@ -131,7 +140,13 @@ impl Authority for ControlledAuthority {
         grant: &ConnectionGrant,
     ) -> Result<(), Error> {
         let current = self.connection(scope, connection).await?;
-        if current.generation == grant.generation && current.account_id == grant.account_id {
+        if current.generation == grant.generation
+            && current.account_id == grant.account_id
+            && current.provider == grant.provider
+            && current.subject_id == grant.subject_id
+            && current.email == grant.email
+            && current.permissions == grant.permissions
+        {
             Ok(())
         } else {
             Err(Error::Forbidden)
@@ -260,6 +275,7 @@ impl Fixture {
         let authority = Arc::new(ControlledAuthority {
             scope: scope.clone(),
             attempt: Mutex::new(Attempt {
+                provider: MailProvider::Google,
                 registration: "registration-one".into(),
                 revision: 1,
                 deadline_epoch_seconds: u64::MAX,
@@ -268,6 +284,8 @@ impl Fixture {
                 expected_email: None,
             }),
             grant: Mutex::new(ConnectionGrant {
+                provider: MailProvider::Google,
+                subject_id: String::new(),
                 account_id: "ca_one".into(),
                 email: "person@example.com".into(),
                 generation: 1,
@@ -355,6 +373,74 @@ fn scope_mapping_is_stable_and_unambiguous() {
     assert_ne!(a.composio_user_id(), b.composio_user_id());
     assert_eq!(a.composio_user_id(), a.clone().composio_user_id());
     assert!(Scope::from_authenticated_foreground("".into(), "u".into(), "w".into()).is_err());
+}
+
+#[tokio::test]
+async fn outlook_shared_mail_path_pins_provider_subject_and_metadata() {
+    let mut f = Fixture::new().await;
+    let origin = f.gateway.client.origin.clone();
+    f.gateway = Composio::with_configs(
+        "controlled-project-key".into(),
+        MailAuthConfigs {
+            gmail: Some(MailAuthConfig::custom("ac_custom_gmail".into())),
+            outlook: Some(MailAuthConfig::custom("ac_custom_outlook".into())),
+        },
+        f.authority.clone(),
+        f.budget.clone(),
+    )
+    .unwrap();
+    f.gateway.client.origin = origin;
+    {
+        let mut grant = f.authority.grant.lock().unwrap();
+        grant.provider = MailProvider::Microsoft;
+        grant.subject_id = "01234567-89ab-cdef-0123-456789abcdef".into();
+    }
+    let mut account = f.account();
+    account["toolkit"]["slug"] = json!("outlook");
+    account["auth_config"]["id"] = json!("ac_custom_outlook");
+    f.reply(200, account);
+    f.reply(
+        200,
+        json!({"status":200,"data":{
+            "id":"01234567-89ab-cdef-0123-456789abcdef","mail":"person@example.com"
+        }}),
+    );
+    f.reply(
+        200,
+        json!({"status":200,"data":{
+            "id":"AAMk_message+=","conversationId":"AAQk_thread=",
+            "subject":"Subject","body":{"content":"must not cross metadata boundary"},
+            "bodyPreview":"must not cross metadata boundary"
+        }}),
+    );
+    let result = f
+        .gateway
+        .mail(
+            &f.scope,
+            "connection-one",
+            MailRequest::Outlook(OutlookRequest::Read {
+                message_id: "AAMk_message+=".into(),
+                body: false,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["id"], "AAMk_message+=");
+    assert!(result.get("body").is_none());
+    assert!(result.get("bodyPreview").is_none());
+    let calls = f.state.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    let endpoint = reqwest::Url::parse(calls[2].1["endpoint"].as_str().unwrap()).unwrap();
+    assert_eq!(endpoint.host_str(), Some("graph.microsoft.com"));
+    assert_eq!(
+        endpoint.path(),
+        "/v1.0/users/01234567-89ab-cdef-0123-456789abcdef/messages/AAMk_message+="
+    );
+    assert!(!endpoint.query_pairs().any(|(key, value)| key == "$select"
+        && value
+            .split(',')
+            .any(|field| field == "body" || field == "bodyPreview")));
+    assert_eq!(f.budget.calls.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]
@@ -803,6 +889,37 @@ async fn read_metadata_and_body_formats_are_explicit() {
 }
 
 #[tokio::test]
+async fn gmail_metadata_excludes_preview_body_and_unrequested_headers() {
+    let f = Fixture::new().await;
+    f.reads(json!({"id":"18abc","threadId":"18def","internalDate":"1793491200000",
+        "snippet":"private body preview", "payload":{"body":{"data":"c2VjcmV0"},
+        "parts":[{"body":{"data":"c2VjcmV0"}}], "headers":[
+            {"name":"Subject","value":"Allowed subject"}, {"name":"X-Private","value":"not requested"}]}}));
+    let result = f
+        .gateway
+        .gmail(
+            &f.scope,
+            "connection-one",
+            GmailRequest::Read {
+                message_id: "18abc".into(),
+                body: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.get("snippet").is_none());
+    assert_eq!(
+        result["payload"],
+        json!({"headers":[{"name":"Subject","value":"Allowed subject"}]})
+    );
+    let calls = f.state.calls.lock().unwrap();
+    let endpoint = reqwest::Url::parse(calls[2].1["endpoint"].as_str().unwrap()).unwrap();
+    assert!(endpoint.query_pairs().any(
+        |(key, value)| key == "fields" && value == "id,threadId,internalDate,payload(headers)"
+    ));
+}
+
+#[tokio::test]
 async fn response_size_cap_and_project_key_failure_are_safe() {
     let f = Fixture::new().await;
     f.reply(200, json!({"untrusted": "x".repeat(1_048_577)}));
@@ -879,6 +996,8 @@ async fn completed_without_current_receipt_never_fabricates_success() {
     *f.authority.receipt.lock().unwrap() = Some((
         0,
         VerifiedAccount {
+            provider: MailProvider::Google,
+            subject_id: String::new(),
             account_id: "ca_one".into(),
             email: "person@example.com".into(),
         },
@@ -935,4 +1054,466 @@ async fn mailbox_rebind_between_profile_and_read_cannot_return_other_mailbox() {
         .as_str()
         .unwrap()
         .contains("/users/person@example.com/messages"));
+}
+
+const OUTLOOK_SUBJECT: &str = "01234567-89ab-cdef-0123-456789abcdef";
+
+#[tokio::test]
+async fn missing_provider_config_does_not_claim_authorization_or_send_http() {
+    let f = Fixture::new().await;
+    {
+        let mut attempt = f.authority.attempt.lock().unwrap();
+        attempt.provider = MailProvider::Microsoft;
+        attempt.phase = AttemptPhase::Ready;
+    }
+    assert_eq!(
+        f.gateway.start(&f.scope, "registration-one").await.err(),
+        Some(Error::NotConfigured)
+    );
+    assert!(f.authority.attempt.lock().unwrap().phase == AttemptPhase::Ready);
+    assert!(f.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_provider_auth_config_is_rejected_at_construction() {
+    let f = Fixture::new().await;
+    assert!(matches!(
+        Composio::with_configs(
+            "controlled-project-key".into(),
+            MailAuthConfigs {
+                gmail: Some(MailAuthConfig::managed("ac_same".into())),
+                outlook: Some(MailAuthConfig::managed("ac_same".into())),
+            },
+            f.authority.clone(),
+            f.budget.clone()
+        ),
+        Err(Error::NotConfigured)
+    ));
+}
+
+impl Fixture {
+    async fn outlook(managed: bool) -> Self {
+        let mut f = Self::new().await;
+        let origin = f.gateway.client.origin.clone();
+        f.gateway = Composio::with_configs(
+            "controlled-project-key".into(),
+            MailAuthConfigs {
+                gmail: Some(MailAuthConfig::custom("ac_custom_gmail".into())),
+                outlook: Some(if managed {
+                    MailAuthConfig::managed("ac_mail_outlook".into())
+                } else {
+                    MailAuthConfig::custom("ac_mail_outlook".into())
+                }),
+            },
+            f.authority.clone(),
+            f.budget.clone(),
+        )
+        .unwrap();
+        f.gateway.client.origin = origin;
+        {
+            let mut grant = f.authority.grant.lock().unwrap();
+            grant.provider = MailProvider::Microsoft;
+            grant.subject_id = OUTLOOK_SUBJECT.into();
+        }
+        f.authority.attempt.lock().unwrap().provider = MailProvider::Microsoft;
+        f
+    }
+    fn outlook_account(&self, managed: bool) -> Value {
+        let mut value = self.account();
+        value["toolkit"]["slug"] = json!("outlook");
+        value["auth_config"]["id"] = json!("ac_mail_outlook");
+        value["auth_config"]["is_composio_managed"] = json!(managed);
+        value
+    }
+    fn outlook_reads(&self, managed: bool, data: Value) {
+        self.reply(200, self.outlook_account(managed));
+        self.reply(
+            200,
+            json!({"status":200,"data":{"id":OUTLOOK_SUBJECT,"mail":"person@example.com"}}),
+        );
+        self.reply(200, json!({"status":200,"data":data}));
+    }
+    fn outlook_search(&self, page: &str) -> MailRequest {
+        MailRequest::Outlook(OutlookRequest::Search {
+            sender: String::new(),
+            since: String::new(),
+            until: String::new(),
+            limit: 5,
+            page: page.into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn managed_outlook_authorization_proves_subject_without_exposing_tokens() {
+    let f = Fixture::outlook(true).await;
+    f.reply(
+        200,
+        json!({"connected_account_id":"ca_one","toolkit_slug":"outlook"}),
+    );
+    f.reply(200, f.outlook_account(true));
+    f.reply(
+        200,
+        json!({"status":200,"data":{"id":OUTLOOK_SUBJECT,"mail":"person@example.com",
+        "access_token":"not-a-profile-field"}}),
+    );
+    let proof = f
+        .gateway
+        .confirm(&f.scope, "registration-one", "opaque-session")
+        .await
+        .unwrap();
+    assert_eq!(proof.provider, MailProvider::Microsoft);
+    assert_eq!(proof.subject_id, OUTLOOK_SUBJECT);
+    assert_eq!(proof.account_id, "ca_one");
+    assert_eq!(f.authority.writes.load(Ordering::SeqCst), 1);
+    assert_eq!(f.state.calls.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn managed_link_selects_only_the_owner_provider_config() {
+    let f = Fixture::outlook(true).await;
+    f.authority.attempt.lock().unwrap().phase = AttemptPhase::Ready;
+    f.reply(
+        201,
+        json!({"connected_account_id":"ca_one","redirect_url":"https://connect.composio.dev/link",
+        "expires_at":"2026-11-13T12:00:00Z"}),
+    );
+    f.gateway.start(&f.scope, "registration-one").await.unwrap();
+    assert_eq!(
+        f.state.calls.lock().unwrap()[0].1["auth_config_id"],
+        "ac_mail_outlook"
+    );
+    assert_eq!(f.authority.attempt.lock().unwrap().account_id, "ca_one");
+}
+
+#[tokio::test]
+async fn outlook_upn_fallback_still_requires_the_exact_verified_subject() {
+    let f = Fixture::outlook(true).await;
+    f.reply(200, f.outlook_account(true));
+    f.reply(200, json!({"status":200,"data":{"id":OUTLOOK_SUBJECT,"mail":null,"userPrincipalName":"person@example.com"}}));
+    f.reply(200, json!({"status":200,"data":{"value":[]}}));
+    f.gateway
+        .mail(&f.scope, "connection-one", f.outlook_search(""))
+        .await
+        .unwrap();
+    assert_eq!(f.state.calls.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn managed_gmail_is_an_explicit_config_choice_not_a_global_bypass() {
+    let mut f = Fixture::new().await;
+    let origin = f.gateway.client.origin.clone();
+    f.gateway = Composio::with_configs(
+        "controlled-project-key".into(),
+        MailAuthConfigs {
+            gmail: Some(MailAuthConfig::managed("ac_custom_gmail".into())),
+            outlook: None,
+        },
+        f.authority.clone(),
+        f.budget.clone(),
+    )
+    .unwrap();
+    f.gateway.client.origin = origin;
+    let mut account = f.account();
+    account["auth_config"]["is_composio_managed"] = json!(true);
+    f.reply(200, account);
+    f.reply(
+        200,
+        json!({"status":200,"data":{"emailAddress":"person@example.com"}}),
+    );
+    f.reply(200, json!({"status":200,"data":{"messages":[]}}));
+    f.gateway
+        .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
+        .await
+        .unwrap();
+    assert_eq!(f.state.calls.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn provider_mismatch_and_body_permission_are_refused_before_http() {
+    let f = Fixture::outlook(true).await;
+    assert_eq!(
+        f.gateway
+            .gmail(&f.scope, "connection-one", f.search())
+            .await
+            .err(),
+        Some(Error::Forbidden)
+    );
+    assert_eq!(
+        f.gateway
+            .mail(
+                &f.scope,
+                "connection-one",
+                MailRequest::Outlook(OutlookRequest::Read {
+                    message_id: "AAMk_message+=".into(),
+                    body: true
+                })
+            )
+            .await
+            .err(),
+        Some(Error::Forbidden)
+    );
+    assert!(f.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn outlook_refuses_wrong_config_toolkit_and_oauth_ownership() {
+    for variant in ["config", "toolkit", "ownership", "user", "disabled"] {
+        let f = Fixture::outlook(true).await;
+        let mut account = f.outlook_account(true);
+        match variant {
+            "config" => account["auth_config"]["id"] = json!("ac_other"),
+            "toolkit" => account["toolkit"]["slug"] = json!("gmail"),
+            "ownership" => account["auth_config"]["is_composio_managed"] = json!(false),
+            "user" => account["user_id"] = json!("other"),
+            "disabled" => account["is_disabled"] = json!(true),
+            _ => unreachable!(),
+        }
+        f.reply(200, account);
+        assert_eq!(
+            f.gateway
+                .mail(&f.scope, "connection-one", f.outlook_search(""))
+                .await
+                .err(),
+            Some(if variant == "disabled" {
+                Error::ReauthRequired
+            } else {
+                Error::AccountMismatch
+            }),
+            "{variant}"
+        );
+        assert_eq!(f.state.calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn outlook_mailbox_subject_is_checked_before_reading_mail() {
+    let f = Fixture::outlook(true).await;
+    f.reply(200, f.outlook_account(true));
+    f.reply(
+        200,
+        json!({"status":200,"data":{"id":"another-subject","mail":"person@example.com"}}),
+    );
+    assert_eq!(
+        f.gateway
+            .mail(&f.scope, "connection-one", f.outlook_search(""))
+            .await
+            .err(),
+        Some(Error::AccountMismatch)
+    );
+    assert_eq!(f.state.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn outlook_late_read_after_revocation_is_not_returned() {
+    let f = Fixture::outlook(true).await;
+    f.state.revoke_during_mail.store(true, Ordering::SeqCst);
+    f.outlook_reads(true, json!({"value":[]}));
+    assert_eq!(
+        f.gateway
+            .mail(&f.scope, "connection-one", f.outlook_search(""))
+            .await
+            .err(),
+        Some(Error::Forbidden)
+    );
+    assert_eq!(f.state.calls.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn outlook_rebind_during_read_is_pinned_to_original_subject() {
+    let f = Fixture::outlook(true).await;
+    f.state.rebind_during_mail.store(true, Ordering::SeqCst);
+    f.outlook_reads(true, json!({"value":[]}));
+    assert_eq!(
+        f.gateway
+            .mail(&f.scope, "connection-one", f.outlook_search(""))
+            .await
+            .err(),
+        Some(Error::ConsentRequired)
+    );
+    assert!(f.state.calls.lock().unwrap()[2].1["endpoint"]
+        .as_str()
+        .unwrap()
+        .contains(OUTLOOK_SUBJECT));
+}
+
+#[tokio::test]
+async fn outlook_pagination_preserves_exact_provider_next_link_and_query() {
+    let f = Fixture::outlook(true).await;
+    let request = OutlookRequest::Search {
+        sender: "sender@example.com".into(),
+        since: "2026-11-12T00:00:00Z".into(),
+        until: "2026-11-13T00:00:00Z".into(),
+        limit: 5,
+        page: String::new(),
+    };
+    let mut next = request.endpoint(OUTLOOK_SUBJECT).unwrap();
+    next.query_pairs_mut()
+        .append_pair("$skiptoken", "opaque+token=/");
+    f.outlook_reads(
+        true,
+        json!({"value":[{"id":"AAMk_message+=","conversationId":"thread=",
+        "webLink":"https://outlook.live.com/owa/?id=1","body":"must not cross list boundary"}],
+        "@odata.nextLink":next.as_str()}),
+    );
+    let result = f
+        .gateway
+        .mail(&f.scope, "connection-one", MailRequest::Outlook(request))
+        .await
+        .unwrap();
+    assert!(result["value"][0].get("body").is_none());
+    assert_eq!(result["@odata.nextLink"], next.as_str());
+    f.outlook_reads(true, json!({"value":[]}));
+    f.gateway
+        .mail(
+            &f.scope,
+            "connection-one",
+            MailRequest::Outlook(OutlookRequest::Search {
+                sender: "sender@example.com".into(),
+                since: "2026-11-12T00:00:00Z".into(),
+                until: "2026-11-13T00:00:00Z".into(),
+                limit: 5,
+                page: next.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.state.calls.lock().unwrap()[5].1["endpoint"],
+        next.as_str()
+    );
+}
+
+#[tokio::test]
+async fn outlook_pages_cannot_change_mailbox_select_filter_or_origin() {
+    let f = Fixture::outlook(true).await;
+    let initial = OutlookRequest::Search {
+        sender: String::new(),
+        since: String::new(),
+        until: String::new(),
+        limit: 5,
+        page: String::new(),
+    }
+    .endpoint(OUTLOOK_SUBJECT)
+    .unwrap();
+    let mut valid = initial.clone();
+    valid.query_pairs_mut().append_pair("$skip", "5");
+    let cases = [
+        valid.as_str().replace("graph.microsoft.com", "evil.test"),
+        valid.as_str().replace(OUTLOOK_SUBJECT, "another-subject"),
+        valid
+            .as_str()
+            .replace("users/01234567-89ab-cdef-0123-456789abcdef", "me"),
+        format!("{valid}&$select=body"),
+        format!("{valid}&$top=100"),
+        format!("{valid}&$filter=subject%20eq%20'secret'"),
+        format!("{valid}&$expand=attachments"),
+        format!("{valid}&$skiptoken=another"),
+        format!("{valid}#fragment"),
+        valid.as_str().replace("https://", "http://"),
+        valid.as_str().replace("https://", "https://user@"),
+        valid
+            .as_str()
+            .replace("graph.microsoft.com/", "graph.microsoft.com:444/"),
+    ];
+    for page in cases {
+        assert_eq!(
+            f.gateway
+                .mail(&f.scope, "connection-one", f.outlook_search(&page))
+                .await
+                .err(),
+            Some(Error::InvalidRequest),
+            "{page}"
+        );
+    }
+    assert!(f.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn outlook_invalid_provider_next_link_is_not_returned() {
+    let f = Fixture::outlook(true).await;
+    f.outlook_reads(
+        true,
+        json!({"value":[],"@odata.nextLink":"https://evil.test/steal"}),
+    );
+    assert_eq!(
+        f.gateway
+            .mail(&f.scope, "connection-one", f.outlook_search(""))
+            .await
+            .err(),
+        Some(Error::InvalidResponse)
+    );
+}
+
+#[tokio::test]
+async fn outlook_body_read_is_explicit_and_uses_same_budget() {
+    let f = Fixture::outlook(true).await;
+    f.authority.grant.lock().unwrap().permissions.read_body = true;
+    f.outlook_reads(
+        true,
+        json!({"id":"AAMk_message+=","body":{"contentType":"text","content":"requested"},
+        "bodyPreview":"requested preview","attachments":[{"content":"not allowed"}]}),
+    );
+    let result = f
+        .gateway
+        .mail(
+            &f.scope,
+            "connection-one",
+            MailRequest::Outlook(OutlookRequest::Read {
+                message_id: "AAMk_message+=".into(),
+                body: true,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["body"]["content"], "requested");
+    assert!(result.get("attachments").is_none());
+    assert_eq!(f.budget.calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn outlook_search_checks_calendar_dates_ids_and_increasing_bounds() {
+    for invalid in [
+        "2026-02-29T00:00:00Z",
+        "2100-02-29T00:00:00Z",
+        "2026-11-31T00:00:00Z",
+        "2026-11-13T24:00:00Z",
+        "2026-11-13T00:60:00Z",
+        "2026-11-13T00:00:60Z",
+        "2026-11-13T00:00:00+00:00",
+        "0000-01-01T00:00:00Z",
+    ] {
+        let request = OutlookRequest::Search {
+            sender: String::new(),
+            since: invalid.into(),
+            until: String::new(),
+            limit: 5,
+            page: String::new(),
+        };
+        assert_eq!(
+            request.validate().err(),
+            Some(Error::InvalidRequest),
+            "{invalid}"
+        );
+    }
+    for invalid in ["../message", "message/id", "id?body=true", "id\n"] {
+        assert_eq!(
+            OutlookRequest::Read {
+                message_id: invalid.into(),
+                body: false
+            }
+            .validate()
+            .err(),
+            Some(Error::InvalidRequest)
+        );
+    }
+    assert!(OutlookRequest::Search {
+        sender: String::new(),
+        since: "2000-02-29T00:00:00Z".into(),
+        until: "2000-03-01T00:00:00Z".into(),
+        limit: 5,
+        page: String::new()
+    }
+    .validate()
+    .is_ok());
 }

@@ -1,4 +1,4 @@
-//! Restricted Composio authorization and Gmail reads outside user sandboxes.
+//! Restricted Composio authorization and mail reads outside user sandboxes.
 //!
 //! This is an unwired integration candidate. Authentication, purpose grants,
 //! connection/attempt authority and shared request budget must be supplied by
@@ -7,6 +7,7 @@
 
 mod budget;
 mod client;
+mod outlook;
 mod types;
 mod webhook;
 
@@ -14,7 +15,8 @@ pub use budget::{PostgresBudget, RequestBudgetLimits};
 pub use webhook::{VerifiedWebhook, WebhookError, WebhookVerifier};
 
 pub use types::{
-    Attempt, AttemptPhase, Authority, Budget, ConnectionGrant, Error, GmailRequest, Permissions,
+    Attempt, AttemptPhase, Authority, Budget, ConnectionGrant, Error, GmailRequest, MailAuthConfig,
+    MailAuthConfigs, MailProvider, MailRequest, OAuthAppOwnership, OutlookRequest, Permissions,
     Scope, Started, VerifiedAccount,
 };
 
@@ -36,8 +38,27 @@ impl Composio {
         authority: Arc<dyn Authority>,
         budget: Arc<dyn Budget>,
     ) -> Result<Self, Error> {
+        Self::with_configs(
+            api_key,
+            MailAuthConfigs {
+                gmail: Some(MailAuthConfig::custom(gmail_auth_config)),
+                outlook: None,
+            },
+            authority,
+            budget,
+        )
+    }
+
+    /// Exact per-provider app ownership and auth config come from deployment.
+    /// Both managed and custom OAuth still require current real owner authority.
+    pub fn with_configs(
+        api_key: String,
+        configs: MailAuthConfigs,
+        authority: Arc<dyn Authority>,
+        budget: Arc<dyn Budget>,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            client: Client::new(api_key, gmail_auth_config, budget)?,
+            client: Client::new(api_key, configs, budget)?,
             authority,
         })
     }
@@ -47,6 +68,7 @@ impl Composio {
     pub async fn start(&self, scope: &Scope, registration: &str) -> Result<Started, Error> {
         let attempt = self.authority.attempt(scope, registration).await?;
         attempt.check()?;
+        self.client.config(attempt.provider)?;
         if attempt.phase != AttemptPhase::Ready {
             return Err(Error::OutcomeUnknown);
         }
@@ -76,7 +98,10 @@ impl Composio {
         if attempt.phase != AttemptPhase::Waiting || attempt.account_id.is_empty() {
             return Err(Error::AuthorizationInactive);
         }
-        let account_id = self.client.complete(scope, session_uri).await?;
+        let account_id = self
+            .client
+            .complete(scope, session_uri, attempt.provider)
+            .await?;
         if account_id != attempt.account_id {
             return Err(Error::AccountMismatch);
         }
@@ -112,7 +137,10 @@ impl Composio {
             .verified_receipt(scope, attempt)
             .await?
             .ok_or(Error::OutcomeUnknown)?;
-        if receipt.account_id != attempt.account_id
+        if receipt.provider != attempt.provider
+            || (receipt.provider == MailProvider::Microsoft
+                && !types::identifier(&receipt.subject_id, 256))
+            || receipt.account_id != attempt.account_id
             || !types::account_id(&receipt.account_id)
             || !types::email_address(&receipt.email)
             || attempt
@@ -132,17 +160,19 @@ impl Composio {
     ) -> Result<VerifiedAccount, Error> {
         let account_id = attempt.account_id.clone();
         self.client
-            .account(scope, &account_id, Some(&attempt.alias()))
+            .account(scope, &account_id, Some(&attempt.alias()), attempt.provider)
             .await?;
-        let email = self.client.profile(scope, &account_id).await?;
+        let verified = self
+            .client
+            .profile(scope, &account_id, attempt.provider)
+            .await?;
         if attempt
             .expected_email
             .as_ref()
-            .is_some_and(|value| !value.eq_ignore_ascii_case(&email))
+            .is_some_and(|value| !value.eq_ignore_ascii_case(&verified.email))
         {
             return Err(Error::AccountMismatch);
         }
-        let verified = VerifiedAccount { account_id, email };
         self.authority
             .accept_verified(scope, attempt, &verified)
             .await?;
@@ -157,21 +187,41 @@ impl Composio {
         connection_id: &str,
         request: GmailRequest,
     ) -> Result<serde_json::Value, Error> {
+        self.mail(scope, connection_id, MailRequest::Gmail(request))
+            .await
+    }
+
+    /// Shared foreground read entrance. Request provider never grants authority.
+    /// Returns current-owner/permission failures and bounded upstream errors.
+    pub async fn mail(
+        &self,
+        scope: &Scope,
+        connection_id: &str,
+        request: MailRequest,
+    ) -> Result<serde_json::Value, Error> {
         request.validate()?;
         let grant = self.authority.connection(scope, connection_id).await?;
         grant.check(&request)?;
-        self.client.account(scope, &grant.account_id, None).await?;
-        let email = self.client.profile(scope, &grant.account_id).await?;
-        if !grant.email.eq_ignore_ascii_case(&email) {
+        self.client.config(grant.provider)?;
+        if let MailRequest::Outlook(request) = &request {
+            request.endpoint(&grant.subject_id)?;
+        }
+        self.client
+            .account(scope, &grant.account_id, None, grant.provider)
+            .await?;
+        let profile = self
+            .client
+            .profile(scope, &grant.account_id, grant.provider)
+            .await?;
+        if !grant.email.eq_ignore_ascii_case(&profile.email)
+            || (grant.provider == MailProvider::Microsoft && grant.subject_id != profile.subject_id)
+        {
             return Err(Error::AccountMismatch);
         }
         self.authority
             .assert_connection(scope, connection_id, &grant)
             .await?;
-        let result = self
-            .client
-            .gmail(scope, &grant.account_id, &grant.email, request)
-            .await?;
+        let result = self.client.mail(scope, &grant, request).await?;
         // Revocation cannot stop an already dispatched read, but its late
         // content must not be delivered after the local authority is fenced.
         self.authority
@@ -187,7 +237,9 @@ impl Composio {
             .authority
             .fence_connection(scope, connection_id)
             .await?;
-        self.client.revoke(scope, &grant.account_id).await
+        self.client
+            .revoke(scope, &grant.account_id, grant.provider)
+            .await
     }
 }
 

@@ -1,6 +1,6 @@
-# Composio Gmail trusted module candidate
+# Composio mail trusted module candidate
 
-Status: Gmail authorization/read routes remain **unwired and undeployed**.
+Status: Gmail/Outlook authorization/read routes remain **unwired and undeployed**.
 The separate ingestion module now has explicit existing-process startup assembly.
 Development baseline includes official master `d86a2ee9` and merged #179.
 Branch: `feat/gmail-composio-trusted`. Phase B extends the existing configuration
@@ -16,18 +16,25 @@ updates use ordinary merges without rewriting the branch history.
 ## Responsibility and public inputs
 
 `gateway/src/ingress/digitalmategateway/composio` keeps the Composio project API key
-outside the user sandbox and permits only Gmail authorization and fixed read
+outside the user sandbox and permits only declared Gmail/Outlook authorization and fixed read
 operations. Its parent exports the module. The current phase adds service-secret
 import and separate-purpose identity in the existing owners, plus ingestion
 startup; it does not change Environment lifecycle ownership.
 
-`Composio::new` requires a key from trusted deployment configuration, the exact
-custom Gmail auth config, a real `Authority` and a real shared `Budget`. There are
-no defaults for either authority or budget and no provider token storage. Key
-configuration is not accepted from request JSON, mobile clients, models, user
-sandboxes or template files. The operator imports it into the configuration
-center's server-only namespace. Gmail route/authority assembly still depends on
-the actual public Registry, Scan and session permission owners.
+`Composio::with_configs` requires a server-only project key, explicit per-provider
+`MailAuthConfig` entries, a real `Authority` and shared `Budget`. Each entry fixes
+an exact auth-config ID and `Custom` or `ComposioManaged` ownership; missing
+providers and reused IDs fail closed. Online account checks require that exact
+provider/config/ownership, OAuth2, PRIVATE, current user and active status.
+`Composio::new` remains the existing custom-Gmail convenience constructor.
+Neither authority nor budget has a default; no provider tokens are stored here.
+The user's first live-test selection is now managed Gmail and personal Outlook.
+Customer-owned OAuth applications remain an optional explicit configuration.
+
+Configuration never comes from request JSON, a model, sandbox or mobile client.
+The project key is imported into #179's server-only namespace. Real route and
+Authority assembly still depends on the actual Registry, Scan and permission
+owners; these constructors do not activate an HTTP authorization/read endpoint.
 
 `Scope::from_authenticated_foreground` is an **internal assembly seam**, not an
 authentication implementation. The business identity owner must first validate
@@ -62,11 +69,11 @@ handling. The Gateway Gmail routes still need to select this owner at assembly.
 | Public call | Behavior and owner requirement |
 | --- | --- |
 | `start(scope, registration)` | Read current attempt; owner durably CAS-claims Starting before link POST; bind only the account returned from that exact POST. A lost/malformed response remains unknown and cannot trigger another blind POST. |
-| `confirm(scope, registration, session_uri)` | Reauthenticated callback context; redeem single-use session with derived user ID; require exact previously bound account and attempt alias; online verify ownership/custom config/Gmail/private/ACTIVE; read profile; owner atomically publishes verification receipt. |
+| `confirm(scope, registration, session_uri)` | Reauthenticated callback context; redeem single-use session with derived user ID; require exact previously bound account and attempt alias; online verify ownership/config/provider/private/ACTIVE; read profile; owner atomically publishes verification receipt. |
 | `reconcile_authorization` | Recover a lost complete_auth reply by reading only the account already bound to this attempt; never replay the single-use session. INITIALIZING/INITIATED stays pending. |
 | Completed flow retry | `verified_receipt` reads the owner's retained current-generation proof if the response after owner commit was lost. No repeat complete_auth or receipt write; missing, cancelled or stale proof cannot fabricate success. |
 | `cancel` | Delegate local cancellation to the flow owner, which fences late completion. Pending upstream state/cleanup remains that owner's obligation. |
-| `gmail(scope, connection, request)` | Resolve current connection, generation and existing tool grant; verify account ownership and bound mailbox online; check owner again before dispatch and after response. Return no late content after disconnect. |
+| `mail(scope, connection, MailRequest)` (legacy Gmail wrapper retained) | Resolve current connection, generation and existing tool grant; verify account ownership and bound mailbox online; check owner again before dispatch and after response. Return no late content after disconnect. |
 | `disconnect` | Owner fences access first and retains a cleanup handle. Online verify the upstream account belongs to this scope, then best-effort revoke; a previously REVOKED account reconciles without another effect. Failure cannot re-enable local access or be reported as successful upstream revocation. |
 
 Flow receipts publish account identity only. The DigitalMate sandbox consumer
@@ -76,8 +83,11 @@ write. ACTIVE, requested scopes or possession of an account ID grant no tools.
 Search, read_headers and read_body are distinct owner-provided permissions;
 provider scope failure still independently refuses access.
 
-Allowed requests are typed `GmailRequest::Search` and `Read`. No user-supplied URL,
-method, headers, toolkit, tool slug, Composio user or account ID is accepted.
+The common `MailRequest` selects typed `GmailRequest` or `OutlookRequest` search
+and read operations. Its provider must match the connection owner's canonical
+Google/Microsoft grant; a request selector is not permission. No arbitrary method, headers, toolkit, tool slug, Composio user/account or URL is
+accepted. Outlook nextLink is opaque pagination data checked against the exact
+verified mailbox and original bounded query before use.
 The private client always specifies both connected_account_id and user_id and
 constructs `GET` endpoints under fixed Gmail paths. Profile uses `/users/me`;
 messages pin the owner/profile-verified email as Google's userId via encoded URL
@@ -111,14 +121,16 @@ logs and adds no plaintext token/secret storage.
    ca requires an owner-published replacement contract, not a private bypass.
 4. Supply real organization budget, trusted configuration and route assembly.
    No public Gateway URL is available from this module.
-5. Configure a custom Google OAuth application, Gmail API, `gmail.readonly`,
-   matching Composio auth config and provider redirect URI. Configure Composio's
+5. Select exact managed Gmail/Outlook auth configs for the first live test. Custom
+   applications are optional, with their appropriate provider redirect/scopes.
+   Microsoft profile verification requires delegated User.Read alongside Mail.Read.
+   Configure Composio's
    **project callback identity verifier**; it must hold connections pending until
    a signed-in matching user completes them. This is a deployment precondition,
    not something a constructor name or the controlled upstream proves. Verify
    actual OAuth protocol, callback and system-browser behavior with an account.
-6. Complete applicable Google restricted-scope verification/security assessment
-   before external release. Secrets are supplied through secure local/deployment
+6. Complete applicable provider/application release prerequisites for the selected
+   app ownership; self-owned Google verification is not a managed-test prerequisite. Secrets are supplied through secure local/deployment
    configuration, never chat or committed examples. No OAuth app was registered,
    purchased or deployed by this task.
 
@@ -193,3 +205,44 @@ Official API references checked 2026-11-12:
 [custom OAuth](https://docs.composio.dev/docs/auth-configuration/custom-auth-configs),
 [Gmail search/timezones](https://developers.google.com/workspace/gmail/api/guides/filtering)
 and [Gmail scopes](https://developers.google.com/workspace/gmail/api/auth/scopes).
+
+## Shared Outlook and managed-app increment (2026-11-13)
+
+Both providers reuse one HTTP client, current connection/attempt authority, shared
+request budget, account verification, error/unknown-outcome handling and late
+revocation fence. Provider differences remain fixed read endpoint/projection logic.
+Microsoft's online `/me` profile supplies an immutable Graph subject; owner grants
+must match both that subject and mailbox. Actual message reads use
+`/v1.0/users/{verified_subject}/messages`, not a mutable `me` selector. `User.Read`
+and `Mail.Read` are delegated personal-account permissions; there is no shared
+mailbox, app-only flow, attachment fetch or write endpoint.
+
+Outlook supports sender and canonical UTC whole-second bounds,1–100 rows, and
+opaque nextLink. Pagination cannot change origin, subject, resource, select,
+filter or top, add duplicate/extra parameters or request attachments. It preserves
+the complete provider URL after validation. List/header projections omit body and
+bodyPreview; body is explicit and still checked against the real owner grant.
+Gmail header reads likewise select/project only requested headers and suppress
+snippet and MIME body/parts, even if the upstream returned those extra fields.
+
+A real test-first compile failure recorded the missing shared API/types. The first
+43-case component pass was followed by an additional runtime RED demonstrating
+Gmail metadata snippet leakage; the final44-case focused suite passes. The same
+actual Gateway agent-api lib binary passes255 ordinary cases,0 failures,13
+explicitly ignored cases. Full-workspace fmt and all-target/all-feature clippy
+with `-D warnings` pass;1025 Rust/Cargo/SQL inputs include the new Outlook module
+and were unchanged during verification. Ignored PG/Redis/SSH/performance checks
+were not run in this increment. Local HTTP/provider/Authority/Budget fixtures do
+not prove live managed consent, mail delivery or production route assembly.
+
+Read-only NB readiness checks confirm two managed OAuth2 configurations. Its four
+Gmail connections are expired and Outlook has none; no old connection is adopted
+as product authority. No new account/trigger or project setting was written.
+Real browser consent, project verifier, M44 current-attempt proof, background
+intent/Host permission and minimal Runtime startup remain explicit integration
+requirements. Managed OAuth removes customer app registration from the first
+test's prerequisites; it does not remove those product authority requirements.
+
+Primary references: [Graph messages](https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0),
+[Graph profile](https://learn.microsoft.com/en-us/graph/api/user-get?view=graph-rest-1.0),
+[Composio Connect Link and callback identity verification](https://docs.composio.dev/reference/api-reference/connected-accounts).
