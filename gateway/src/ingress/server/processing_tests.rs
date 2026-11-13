@@ -44,6 +44,14 @@ impl DemandResolver for SlowDemand {
 }
 
 async fn request(ingress: Arc<Ingress>, headers: &str) -> String {
+    send_request(ingress, &format!("POST /direct/environment/invoke HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 2\r\nX-ADX-Request-ID: stable-request\r\n{headers}\r\n{{}}")).await
+}
+
+async fn download_request(ingress: Arc<Ingress>, query: &str, headers: &str) -> String {
+    send_request(ingress, &format!("GET /direct/environment/download?path=/fixture.bin{query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nRange: bytes=5-\r\nX-ADX-Request-ID: stable-request\r\n{headers}\r\n")).await
+}
+
+async fn send_request(ingress: Arc<Ingress>, request: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -53,7 +61,7 @@ async fn request(ingress: Arc<Ingress>, headers: &str) -> String {
             .await;
     });
     let mut socket = TcpStream::connect(address).await.unwrap();
-    socket.write_all(format!("POST /direct/environment/invoke HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 2\r\nX-ADX-Request-ID: stable-request\r\n{headers}\r\n{{}}").as_bytes()).await.unwrap();
+    socket.write_all(request.as_bytes()).await.unwrap();
     let mut bytes = Vec::new();
     let read = tokio::time::timeout(
         std::time::Duration::from_millis(700),
@@ -166,9 +174,11 @@ async fn running_backend(
             stream.read_exact(&mut byte).await.unwrap();
             bytes.extend_from_slice(&byte);
         }
-        let mut body = [0; 2];
-        stream.read_exact(&mut body).await.unwrap();
-        assert_eq!(&body, b"{}");
+        if bytes.starts_with(b"POST ") {
+            let mut body = [0; 2];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"{}");
+        }
         assert!(!String::from_utf8(bytes)
             .unwrap()
             .to_ascii_lowercase()
@@ -182,6 +192,30 @@ async fn running_backend(
         } else if mode == 2 {
             let body = "{\"error\":{\"code\":\"ENV_RESUMING\",\"requestForwarded\":false}}";
             stream.write_all(format!("HTTP/1.1 503 Unavailable\r\nX-ADX-Error-Code: ENV_RESUMING\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            return;
+        }
+        if (3..=5).contains(&mode) {
+            let head = match mode {
+                4 => "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 5-8/9\r\n\r\n",
+                5 => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\r\n",
+                _ => "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n",
+            };
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(b"a").await.unwrap();
+            for byte in [b"b", b"c", b"d"] {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                if stream.write_all(byte).await.is_err() {
+                    break;
+                }
+            }
+            return;
+        }
+        if mode == 6 {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = stream.write_all(&vec![b'x'; 1048576]).await;
             return;
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -298,4 +332,132 @@ async fn terminal_resume_failure_is_structured_and_cannot_be_retried_automatical
     assert_eq!(error["error"]["code"], "ENV_UNAVAILABLE");
     assert_eq!(error["error"]["retry"], "never");
     assert_eq!(error["error"]["requestForwarded"], false);
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn native_file_download_streams_past_processing_deadline() {
+    for (mode, query, status) in [
+        (3, "", "HTTP/1.1 200"),
+        (3, "&type=", "HTTP/1.1 200"),
+        (4, "&ty%70e=file", "HTTP/1.1 206"),
+    ] {
+        let (ingress, tasks, count) = running_backend(mode).await;
+        let response =
+            download_request(ingress, query, "X-ADX-Processing-Timeout-Ms: 240\r\n").await;
+        assert!(response.starts_with(status), "{response}");
+        assert!(response.ends_with("abcd"), "{response}");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        for task in tasks {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn file_download_headers_still_use_processing_deadline() {
+    let (ingress, tasks, count) = running_backend(0).await;
+    let response = download_request(
+        ingress,
+        "&type=file",
+        "X-ADX-Processing-Timeout-Ms: 120\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+    assert!(
+        response.contains("PROCESSING_DEADLINE_EXCEEDED"),
+        "{response}"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn file_download_errors_keep_processing_deadline() {
+    let (ingress, tasks, _) = running_backend(5).await;
+    let response = download_request(
+        ingress,
+        "&type=file",
+        "X-ADX-Processing-Timeout-Ms: 240\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 500"), "{response}");
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(!body.is_empty() && body.len() < 4 && "abcd".starts_with(body));
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn tar_download_keeps_processing_deadline() {
+    let (ingress, tasks, _) = running_backend(3).await;
+    let response = download_request(
+        ingress,
+        "&ty%70e=tar",
+        "X-ADX-Processing-Timeout-Ms: 240\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(!body.is_empty() && body.len() < 4 && "abcd".starts_with(body));
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn port_forwarded_download_keeps_processing_deadline() {
+    let (ingress, tasks, _) = running_backend(3).await;
+    let port = ingress.default_direct_port;
+    let response = send_request(ingress, &format!("GET /environment/{port}/download?type=file HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-ADX-Processing-Timeout-Ms: 240\r\n\r\n")).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(!body.is_empty() && body.len() < 4 && "abcd".starts_with(body));
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn native_file_download_survives_slow_downstream() {
+    let (ingress, tasks, _) = running_backend(6).await;
+    let (server, mut client) = tokio::io::duplex(1024);
+    let connection = tokio::spawn(async move {
+        ingress
+            .serve_http_connection(
+                server,
+                "127.0.0.1:12345".parse().unwrap(),
+                IngressSecurity::Tls,
+            )
+            .await;
+    });
+    client.write_all(b"GET /direct/environment/download?type=file HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-ADX-Processing-Timeout-Ms: 240\r\n\r\n").await.unwrap();
+    let mut response = Vec::new();
+    let mut buffer = [0; 1024];
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let count = client.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            response.extend_from_slice(&buffer[..count]);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    connection.await.unwrap();
+    let header_end = response.windows(4).position(|b| b == b"\r\n\r\n").unwrap() + 4;
+    assert_eq!(&response[header_end..], vec![b'x'; 1048576]);
+    for task in tasks {
+        task.abort();
+    }
 }
