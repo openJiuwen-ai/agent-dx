@@ -219,6 +219,7 @@ fn record(id: &str, state: EnvironmentState) -> EnvironmentRecord {
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
         spec: EnvironmentSpec {
             envd: None,
             run_policy: None,

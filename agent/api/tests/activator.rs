@@ -28,6 +28,7 @@ impl Environment for Backend {
             ready: true,
             runtime_id: None,
             message: None,
+            resume_pending: false,
         })
     }
     async fn get(
@@ -49,6 +50,7 @@ impl Environment for Backend {
             ready: false,
             runtime_id: None,
             message: None,
+            resume_pending: false,
         })
     }
 }

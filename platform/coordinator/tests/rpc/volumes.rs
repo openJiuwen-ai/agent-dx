@@ -278,6 +278,7 @@ async fn inspection_reports_latest_authorized_volume_execution() {
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
         execution_artifacts: vec![],
     };
     session

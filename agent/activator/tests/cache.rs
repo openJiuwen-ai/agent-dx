@@ -62,6 +62,7 @@ impl Environment for Platform {
             ready: true,
             runtime_id: None,
             message: None,
+            resume_pending: false,
         };
         self.records
             .lock()
@@ -95,6 +96,7 @@ impl Environment for Platform {
             ready: false,
             runtime_id: None,
             message: None,
+            resume_pending: false,
         })
     }
 }
@@ -329,6 +331,7 @@ async fn not_ready_binding_is_not_cached_and_can_become_ready() {
             ready: false,
             runtime_id: None,
             message: None,
+            resume_pending: false,
         },
     );
     let service = Activator::new(state, platform.clone());

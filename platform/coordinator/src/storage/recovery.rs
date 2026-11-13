@@ -427,6 +427,7 @@ impl Session {
                 last_operation: None,
                 restart_attempts: 0,
                 restart_pending: false,
+                resume_pending: false,
             });
             stored_environment.assignment = replacement.clone();
             stored_environment.volume_execution = None;

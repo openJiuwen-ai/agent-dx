@@ -84,6 +84,7 @@ fn running(spec: EnvironmentSpec, assignment: Assignment) -> EnvironmentRecord {
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
         runtime: adx_core::Runtime {
             id: format!("{}-{}", spec.id, assignment.generation),
             ip: Some("10.0.0.2".parse().unwrap()),

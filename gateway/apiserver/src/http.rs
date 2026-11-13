@@ -1107,6 +1107,7 @@ pub(crate) fn instance_view(
         "revision": record.revision,
         "restart_attempts": record.restart_attempts,
         "restart_pending": record.restart_pending,
+        "resume_pending": record.resume_pending,
         "runtime_id": runtime.id,
         "sandbox_ip": runtime.ip,
         "node_id": assignment.node_id,

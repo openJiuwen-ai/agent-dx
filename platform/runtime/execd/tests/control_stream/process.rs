@@ -118,6 +118,7 @@ fn record() -> EnvironmentRecord {
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
     }
 }
 struct Backend;

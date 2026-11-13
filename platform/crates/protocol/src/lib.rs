@@ -341,6 +341,7 @@ impl TryFrom<control::EnvironmentRecord> for adx_core::EnvironmentRecord {
             revision: v.revision,
             restart_attempts: v.restart_attempts,
             restart_pending: v.restart_pending,
+            resume_pending: v.resume_pending,
             runtime: adx_core::Runtime {
                 id: runtime.id,
                 ip: runtime_ip,
@@ -382,6 +383,7 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
             revision: v.revision,
             restart_attempts: v.restart_attempts,
             restart_pending: v.restart_pending,
+            resume_pending: v.resume_pending,
             failure: v.failure.map(|failure| Box::new(failure.into())),
             observation: v.observation.map(Into::into),
             runtime: Some(control::Runtime {

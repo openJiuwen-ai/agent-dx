@@ -49,6 +49,10 @@ impl TryFrom<&StoredEnvironment> for pb::EnvironmentRecord {
             .as_ref()
             .map(|creation| creation.request_id.clone())
             .unwrap_or_default();
+        // A registered wake intent is Coordinator-owned coordination metadata, not part of
+        // the Node-committed record. Surface it so callers can tell a truly idle Paused
+        // Environment from one whose EnsureRunning is queued or blocked on a Volume.
+        record.resume_pending = stored.resume.is_some();
         Ok(record)
     }
 }
@@ -2737,6 +2741,7 @@ mod reconciliation_tests {
                 last_operation: None,
                 restart_attempts: 0,
                 restart_pending: false,
+                resume_pending: false,
             }),
         };
         assert!(

@@ -259,6 +259,11 @@ message EnvironmentRecord {
   uint32 restart_attempts = 10;
   bool restart_pending = 11;
   RuntimeFailure failure = 12;
+  // A wake (EnsureRunning) intent is registered but has not completed. Set while a
+  // resume is queued, blocked on an exclusive Volume, or retrying placement. Cleared
+  // once the Environment reaches Running. Consumers use this to distinguish a Paused
+  // Environment that is truly idle from one whose wake is in flight.
+  bool resume_pending = 17;
 }
 
 message RuntimeFailure {

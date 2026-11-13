@@ -152,6 +152,7 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
         }),
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
         spec,
         assignment: Assignment {
             environment_id: "i".into(),

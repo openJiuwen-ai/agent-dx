@@ -19,6 +19,7 @@ impl Environment for Capture {
             ready: true,
             runtime_id: None,
             message: None,
+            resume_pending: false,
         })
     }
     async fn get(

@@ -64,6 +64,7 @@ impl Environment for Platform {
             ready: true,
             runtime_id: None,
             message: None,
+            resume_pending: false,
         };
         self.executions
             .lock()

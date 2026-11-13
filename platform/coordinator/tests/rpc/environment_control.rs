@@ -74,6 +74,7 @@ async fn paused_controls_use_native_creation_and_retention_when_owner_is_offline
             failure: None,
             restart_attempts: 0,
             restart_pending: false,
+            resume_pending: false,
         };
         session.commit(record.clone()).await.unwrap();
         let creation = session.get(id).await.unwrap().creation.unwrap();

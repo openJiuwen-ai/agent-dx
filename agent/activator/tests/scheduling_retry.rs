@@ -29,6 +29,7 @@ fn observed(id: &str, phase: EnvironmentPhase) -> EnvironmentObservation {
         phase,
         runtime_id: None,
         message: None,
+        resume_pending: false,
     }
 }
 #[async_trait::async_trait]
