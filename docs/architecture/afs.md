@@ -718,7 +718,10 @@ DFS FUSE 的本地 owner 普通显式偏移写进一步在前台整笔入有界�
 复制、USRBIO交接和同步先等待相关文件已接纳的正文，正文为空时保持原读并发。
 同inode门跨句柄持有至真实完成：读、getattr、getxattr/listxattr、readlink、目录读和只读open共享，
 只等该inode已接纳的正文；写、截断、同步、xattr修改等独占，等待中的独占回调挡住新的共享回调。
-namespace变更保留全挂载屏障（并等全部在途回调）；路径LOOKUP只与namespace变更互斥并等已接纳正文。
+namespace变更（create、mknod、mkdir、unlink、rmdir、symlink、rename）不进门、不等其他文件的正文或在途回调，
+同目录的变更由内核目录锁排序；路径LOOKUP不进门，解析出inode后只等该inode在LOOKUP到达前已接纳的正文，
+等过则重新解析一次，回复的属性包含这些写。close-to-open跨rename成立靠FLUSH：它等本inode已接纳的正文执行完、
+数据提交到Meta后才回复，所以"写临时文件→close→rename覆盖"之后他节点新open目标读到的是完整新内容。
 固定本地答复的getxattr（内核每次写前的`security.capability`探测）在接收线程直接回复。fsync/flush/release
 通过独立的有界恢复接纳登记续办任务，不占正文额度；正文仍是一条FIFO、一个消费者。
 写成功不表示持久化；fsync/flush/close继续执行原同步，追加、O_SYNC/O_DSYNC、

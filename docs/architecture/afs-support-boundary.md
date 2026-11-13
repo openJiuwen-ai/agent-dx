@@ -61,7 +61,7 @@ SDK 路径式 `close` 与 FUSE `close` 同语义（先 DataOnly 同步提交再�
 | 12 | **会话过期的 Node 需重启**才能重新加入：会话期限 30 秒，过期会话不能续期（`expired node session cannot be renewed`），session_id 在进程启动时生成，Node 随即退出（日志 `node.shutdown_failed`） | 网络长时间中断后需重启 Node | 进程守护自动拉起 | `afs/src/meta/store/state/apply.rs`；`afs/src/node/registration.rs` |
 | 13 | **长时间运行时元数据操作的 Meta CPU 缓慢上升**（Q09）：同一负载 12 轮，每轮 create 的 Meta CPU 由 1.31 秒升到 2.14 秒（前 10 轮），未见收敛；绝对值仍远低于重构前（约 13.5 秒起） | 长跑后元数据吞吐下降约 30% | 观察项，随 R86 的堆剖析一起查 | S5a 报告 §6.3 |
 | 14 | **owner 崩溃时未提交的写丢失，代理方不重连**（Q06）：见下文"owner 崩溃" | 未 fsync 的写丢失；新写者至多等 30 秒 | 需要持久的写 fsync 或 close 并检查返回值 | 见下文 |
-| 15 | **大量打开且有脏数据的文件让 create 偶尔等到下一个 5 秒提交节拍**（约 1/20，最长 4.9 秒；重构前即如此）（R91） | 尾延迟 | 观察项，随 R79（命名空间变更是全挂载屏障）一起处理 | S5a 报告 §6.4 |
+| 15 | **大量打开且有脏数据的文件让 create 偶尔等到下一个 5 秒提交节拍**（约 1/20，最长 4.9 秒；重构前即如此）（R91） | 尾延迟 | 观察项。R79 的全挂载屏障已去掉，create 不再等其他文件的正文；等待转到该写体之后的同文件回调（close、后续写）。原因推断为脏数据预算（新文件按 4 MiB 预留，默认预算 64 MiB），待验证 | S5a 报告 §6.4 |
 | 16 | **Meta 读接口按单一信任域授权**（M0）：受信 Node 证书即可读任意 namespace 的元数据，不绑定会话或 namespace | 多租户前需补 | — | [架构边界](afs.md#meta-与数据路径) |
 | 17 | **Meta 故障时，已打开的读句柄可能停在打开时的版本**（R94）：本机写者全部关闭时，要为本机最新版本建 GC 引用后才推进其他已打开的读句柄；经写状态读过的版本此时已有引用，推进不再需要 Meta。若该读句柄从未经写状态读到新版本、这次建引用失败（Meta 不可用），且在补建成功前该版本已被其他 Node 的提交取代并回收，句柄会一直读打开时的版本。经写状态的读若建不了基线引用：没有本机未提交数据时改读句柄自己的版本，有则返回错误 | 只在 Meta 调用失败的窗口内出现；数据不丢，已持久的提交照常成功 | 日志 `dfs.handle_view_reference_failed`、`dfs.write_state_read_reference_failed`（WARN）可查；重新打开文件即读到最新版本 | `afs/src/node/vfs/dfs/handles.rs`（`OpenedView`、`base_read_reference`、`publish_deferred_views`）；`view_references` 单测；故障场景 `local_commit_reader_under_gc`、`lapsed_lease_reader_under_gc` |
 | 18 | **RDMA 未验证**（决策 8） | — | 只保证可编译 | — |

@@ -2447,14 +2447,6 @@ mod front_gate_ordering {
             self.backend.trace().iter().any(|seen| seen == event)
         }
 
-        fn count(&self, event: &str) -> usize {
-            self.backend
-                .trace()
-                .iter()
-                .filter(|seen| *seen == event)
-                .count()
-        }
-
         fn position(&self, event: &str) -> usize {
             let trace = self.backend.trace();
             trace
@@ -2589,20 +2581,20 @@ mod front_gate_ordering {
     #[test]
     #[ignore = "requires Linux /dev/fuse and fusermount3"]
     fn path_lookup_waits_for_acknowledged_writes() {
-        // Uncached names: every path walk sends LOOKUP, which must order.
+        // Uncached names: every path walk sends LOOKUP. The lookup may resolve
+        // the name at once, but its reply waits for the resolved inode's
+        // acknowledged body and is resolved again after it. (The mock's
+        // attribute size counts calls, so ordering is asserted on the trace.)
         let fx = Fixture::with_kernel_ttl(Duration::ZERO);
         let file = fx.open("a", true);
         let release = acked_blocked_write(&fx, &file);
 
-        // CREATE already looked the name up once; count only later lookups.
-        let lookups = fx.count("lookup:a");
         let path = fx.mount.join("a");
         let looked_up = spawn(move || std::fs::metadata(path));
         std::thread::sleep(QUIET);
-        assert_eq!(
-            fx.count("lookup:a"),
-            lookups,
-            "LOOKUP overtook an acknowledged write"
+        assert!(
+            looked_up.try_recv().is_err(),
+            "the path query returned before the acknowledged write's body"
         );
 
         release.send(()).unwrap();
@@ -2611,13 +2603,13 @@ mod front_gate_ordering {
         let finished = fx.position("write:finish");
         assert!(
             trace[finished..].iter().any(|seen| seen == "lookup:a"),
-            "the path lookup never reached the backend after the write: {trace:?}"
+            "the reply was not resolved after the write: {trace:?}"
         );
     }
 
     /// With a kernel TTL the path walk may be served from the dentry cache;
-    /// whatever the path query does send to FUSE (LOOKUP or GETATTR) still
-    /// reaches the backend only after the acknowledged write.
+    /// whatever the path query does send to FUSE (LOOKUP or GETATTR) answers
+    /// only after the acknowledged write.
     #[test]
     #[ignore = "requires Linux /dev/fuse and fusermount3"]
     fn path_metadata_under_kernel_ttl_waits_for_acknowledged_writes() {
@@ -2637,22 +2629,28 @@ mod front_gate_ordering {
         let path = fx.mount.join("a");
         let queried = spawn(move || std::fs::metadata(path));
         std::thread::sleep(QUIET);
+        assert!(
+            queried.try_recv().is_err(),
+            "the path query returned before the acknowledged write's body"
+        );
         release.send(()).unwrap();
         queried.recv_timeout(DEADLINE).unwrap().unwrap();
         let trace = fx.backend.trace();
         let finished = fx.position("write:finish");
         assert!(
             finished >= start
-                && !trace[start..finished]
+                && trace[finished..]
                     .iter()
                     .any(|seen| seen == "lookup:a" || *seen == getattr),
-            "a path request reached the backend before the acknowledged write: {trace:?}"
+            "the path reply was not produced after the acknowledged write: {trace:?}"
         );
     }
 
+    /// A name change orders only through the kernel's directory locks: an
+    /// acknowledged body of another file does not hold it back (R79).
     #[test]
     #[ignore = "requires Linux /dev/fuse and fusermount3"]
-    fn namespace_change_waits_for_acknowledged_writes_to_other_files() {
+    fn namespace_change_does_not_wait_for_another_files_acknowledged_write() {
         let fx = Fixture::new();
         let file = fx.open("a", true);
         drop(fx.open("b", true));
@@ -2660,15 +2658,39 @@ mod front_gate_ordering {
 
         let (from, to) = (fx.mount.join("b"), fx.mount.join("c"));
         let renamed = spawn(move || std::fs::rename(from, to));
-        std::thread::sleep(QUIET);
+        renamed.recv_timeout(DEADLINE).unwrap().unwrap();
         assert!(
-            !fx.arrived("rename:start"),
-            "RENAME overtook an acknowledged write"
+            !fx.arrived("write:finish"),
+            "the unrelated body was not held"
         );
 
         release.send(()).unwrap();
+        file.sync_all().unwrap();
+        fx.assert_before("rename:finish", "write:finish");
+    }
+
+    /// Renaming the file whose acknowledged body is still queued does not lose
+    /// it: the body lands in the same inode, now under the new name. POSIX
+    /// orders writes by descriptor, not by name. The rename itself may wait
+    /// for that body: the kernel's path walk looks the source name up, and a
+    /// lookup reply includes the resolved inode's acknowledged writes.
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn renaming_a_file_with_an_acknowledged_write_keeps_the_write() {
+        let fx = Fixture::new();
+        let file = fx.open("a", true);
+        let release = acked_blocked_write(&fx, &file);
+
+        let (from, to) = (fx.mount.join("a"), fx.mount.join("c"));
+        let renamed = spawn(move || std::fs::rename(from, to));
+        std::thread::sleep(QUIET);
+        release.send(()).unwrap();
         renamed.recv_timeout(DEADLINE).unwrap().unwrap();
-        fx.assert_before("write:finish", "rename:start");
+        file.sync_all().unwrap();
+        let mut bytes = [0u8; 4];
+        assert_eq!(fx.reader("c").read_at(&mut bytes, 0).unwrap(), 4);
+        assert_eq!(&bytes, b"abcd");
+        assert!(!fx.mount.join("a").exists());
     }
 
     #[test]
@@ -2748,9 +2770,12 @@ mod front_gate_ordering {
         assert_eq!(&bytes, b"WXYZ");
     }
 
+    /// A name change does not wait for an in-flight callback of another
+    /// file, and an in-flight read of the renamed file itself completes with
+    /// the data it was reading.
     #[test]
     #[ignore = "requires Linux /dev/fuse and fusermount3"]
-    fn namespace_change_waits_for_an_in_flight_file_callback() {
+    fn namespace_change_overlaps_in_flight_file_callbacks() {
         let fx = Fixture::new();
         let file = fx.open("a", true);
         assert_eq!(file.write_at(b"abcd", 0).unwrap(), 4);
@@ -2761,27 +2786,32 @@ mod front_gate_ordering {
         let (entered, release) = blocker(&fx.backend.read_blocker);
         let read = spawn(move || {
             let mut bytes = [0u8; 4];
-            reader.read_at(&mut bytes, 0)
+            let count = reader.read_at(&mut bytes, 0)?;
+            Ok(bytes[..count].to_vec())
         });
         entered.recv_timeout(DEADLINE).unwrap();
 
         let (from, to) = (fx.mount.join("b"), fx.mount.join("c"));
-        let renamed = spawn(move || std::fs::rename(from, to));
-        std::thread::sleep(QUIET);
-        assert!(
-            !fx.arrived("rename:start"),
-            "RENAME overlapped an in-flight READ"
-        );
+        spawn(move || std::fs::rename(from, to))
+            .recv_timeout(DEADLINE)
+            .unwrap()
+            .unwrap();
+        let (from, to) = (fx.mount.join("a"), fx.mount.join("d"));
+        spawn(move || std::fs::rename(from, to))
+            .recv_timeout(DEADLINE)
+            .unwrap()
+            .unwrap();
+        assert!(!fx.arrived("read:finish"), "the read was not in flight");
 
         release.send(()).unwrap();
-        assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), 4);
-        renamed.recv_timeout(DEADLINE).unwrap().unwrap();
-        fx.assert_before("read:finish", "rename:start");
+        assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), b"abcd");
     }
 
+    /// A file callback does not wait for an in-flight name change, of
+    /// another file or of its own.
     #[test]
     #[ignore = "requires Linux /dev/fuse and fusermount3"]
-    fn file_callback_waits_for_an_in_flight_namespace_change() {
+    fn file_callbacks_overlap_an_in_flight_namespace_change() {
         let fx = Fixture::new();
         let file = fx.open("a", true);
         assert_eq!(file.write_at(b"abcd", 0).unwrap(), 4);
@@ -2789,25 +2819,47 @@ mod front_gate_ordering {
         drop(fx.open("b", true));
         let reader = fx.reader("a");
 
-        let (entered, release) = blocker(&fx.backend.rename_blocker);
-        let (from, to) = (fx.mount.join("b"), fx.mount.join("c"));
+        for (from, to) in [("b", "c"), ("a", "d")] {
+            let (entered, release) = blocker(&fx.backend.rename_blocker);
+            let (from, to) = (fx.mount.join(from), fx.mount.join(to));
+            let renamed = spawn(move || std::fs::rename(from, to));
+            entered.recv_timeout(DEADLINE).unwrap();
+
+            let reading = reader.clone();
+            let read = spawn(move || {
+                let mut bytes = [0u8; 4];
+                let count = reading.read_at(&mut bytes, 0)?;
+                Ok(bytes[..count].to_vec())
+            });
+            assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), b"abcd");
+            assert!(renamed.try_recv().is_err(), "the rename was not in flight");
+            release.send(()).unwrap();
+            renamed.recv_timeout(DEADLINE).unwrap().unwrap();
+        }
+    }
+
+    /// Writing without closing and then renaming over another name: no error,
+    /// no corruption. The descriptor keeps writing the same inode, which the
+    /// target name now addresses once the bodies land.
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn write_then_rename_over_a_target_before_close() {
+        let fx = Fixture::new();
+        drop(fx.open("target", true));
+        let file = fx.open("tmp", true);
+        let release = acked_blocked_write(&fx, &file);
+        let (from, to) = (fx.mount.join("tmp"), fx.mount.join("target"));
         let renamed = spawn(move || std::fs::rename(from, to));
-        entered.recv_timeout(DEADLINE).unwrap();
-
-        let read = spawn(move || {
-            let mut bytes = [0u8; 4];
-            reader.read_at(&mut bytes, 0)
-        });
         std::thread::sleep(QUIET);
-        assert!(
-            !fx.arrived("read:start"),
-            "READ overlapped an in-flight RENAME"
-        );
-
         release.send(()).unwrap();
         renamed.recv_timeout(DEADLINE).unwrap().unwrap();
-        assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), 4);
-        fx.assert_before("rename:finish", "read:start");
+        assert_eq!(file.write_at(b"ef", 4).unwrap(), 2);
+        file.sync_all().unwrap();
+        drop(file);
+        let mut bytes = [0u8; 6];
+        assert_eq!(fx.reader("target").read_at(&mut bytes, 0).unwrap(), 6);
+        assert_eq!(&bytes, b"abcdef");
+        assert!(!fx.mount.join("tmp").exists());
     }
 }
 
