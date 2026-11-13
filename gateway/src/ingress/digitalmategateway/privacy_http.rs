@@ -162,17 +162,10 @@ impl PrivacyHttp {
                 if path == "/v1/ingestion/admit" {
                     return Ok(response(StatusCode::OK, admission.json()));
                 }
-                let value = self.center.delivery_bootstrap(&admission).await?;
-                ingestion.verify(&token).await?;
-                Ok(response(
-                    StatusCode::OK,
-                    match value {
-                        Some(value) => {
-                            serde_json::json!({"revision":value.revision,"value":value.plaintext.as_ref().map(|bytes| STANDARD.encode(bytes.as_slice()))})
-                        }
-                        None => serde_json::json!({"revision":null,"value":null}),
-                    },
-                ))
+                // Delivery grants staging only. Runtime must first publish a
+                // purpose-limited bootstrap contract that exposes no secrets.
+                // Never decrypt the user's configuration with this bearer.
+                Err(Error::Unavailable)
             }
             "/v1/connector/identity" | "/v1/connector/renew" => {
                 if bytes.as_ref() != b"{}" {

@@ -152,9 +152,37 @@ interfaces and O_NOFOLLOW. No source or platform configuration was changed to
 hide that failure. A task-owned minimal Cargo validation program directly loads
 these exact module sources and runs their tests/clippy; this is module evidence,
 **not a full Gateway target PASS**. On Windows docs checking needs process-local
-`PYTHONUTF8=1`; the first default-GBK failure is retained. Applicable Linux/full
-workspace CI, independent review, real owner/HTTP assembly, deployment and device
-checks remain required before merge/activation.
+`PYTHONUTF8=1`; the first default-GBK failure is retained. The Windows failure is
+platform-specific history. Linux local verification now uses the real Gateway
+target and workspace, as recorded below. Independent review, native CI, real
+owner/provider assembly, deployment and device checks remain required.
+
+### 2026-11-13 Linux verification and delivery permission correction
+
+On official baseline plus local `89349d4d`, real Gateway ordinary tests273 and
+explicit PostgreSQL tests10 passed. The subsequent delivery-permission correction
+passed12 affected checks: actual PostgreSQL/HTTP purpose verification, real TLS
+to an independent Python receiver with SQLite staging, subscription revocation,
+duplicate POST and a second independent process reopening the same staging store,
+plus startup/entrypoint checks. Revoked retries are refused before connection
+access; a committed staging receipt is not rolled back or made execution authority.
+Binding, provider and connection facts remain controlled inputs, not live Gmail,
+Outlook, ADX deployment or Host/Session execution proof.
+
+The prototype full-configuration bootstrap has been removed from the configuration
+owner and Python consumer. Delivery cannot decrypt user model keys or obtain a
+privacy identity. `/v1/ingestion/bootstrap` validates delivery then returns503
+`AUTH_UNAVAILABLE` without value/token until Runtime publishes a purpose-limited
+secret-free contract. The same-root identity and sole existing writers are retained.
+
+Current local canonical-LF `cargo fmt --all -- --check` and the real
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` both pass.
+Source audit checks1024 Rust/Cargo/SQL inputs and8 exact imported Python inputs;
+the last test-only borrow simplification is the sole change after the12 passing
+checks. Earlier compiler, format, wrong error-code and missing fixture import-path
+failures are retained. Existing orbit_ws fixture background SendError log and AFS
+build-identity build-script notice are recorded without source/assertion changes.
+This is local checked-source evidence, not native CI or complete mail-to-report proof.
 
 Official API references checked 2026-11-12:
 [accounts and callback verification](https://docs.composio.dev/reference/api-reference/connected-accounts),

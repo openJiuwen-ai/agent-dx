@@ -38,12 +38,12 @@ ACK 只提交被领取的准确成员，不推进 sequence 高水位，A/B 处�
 
 此前跨仓库验证固定过 #1176 的公开候选（包括 `f7b930ec`）；这不是新主线或新权限端口的验收。#1192 薄适配直接调用实际 ScanRegistrations 注册/完成方法及 `ConnectionRegistry.ensure_ready/access_snapshot`，不复制私表。完整 Gateway Authority 所需物理外呼认领/回执与 Scan 当前投影仍需 owner 对齐；现有三种薄消费不能宣称已覆盖整个 Authority。快照与 `read_history` 均不授予后台订阅意图。
 
-#179 阶段 A 的配置 bearer 保持原用途。#268 阶段 B 在同一身份 owner 中增加分离的 connector/delivery 前缀、实际 issuer/introspection 和固定只读 bootstrap，不将配置 bearer 当作后台工具授权，不分发项目 Key 到用户工作区。
+#179 阶段 A 的配置 bearer 保持原用途。#268 阶段 B 在同一身份 owner 中增加分离的 connector/delivery 前缀及实际 issuer/introspection，不将配置 bearer 当作后台工具授权，不分发项目 Key 到用户工作区。delivery 不能解密整份用户配置；bootstrap 目前明确503，等待 Runtime/配置 owner 发布无秘密的用途限定能力。
 
 以下生产接线仍未实现，PR 保持 Draft：
 
 - 用户明确启用/撤销的持久订阅 owner，以及现有 Composio 适配器内受限 trigger 操作和未知结果恢复。`Inbox.register` 只接受已经过真实 owner 授权的投影。
-- #1192 真实 `server.py` 的冷 receiver mount/admission、只读 bootstrap 消费及实际 Registry/Session 权限；不能放行所有 internal 路由规避。
+- #1192 真实 `server.py` 的冷 receiver mount/admission、Runtime 无秘密 bootstrap 及实际连接源/Session 权限；不能放行所有 internal 路由规避。
 - Gmail 授权/读取 HTTP 路由采用真实 Authority 和已实现的共享预算；独立组件通过不代表调用方已装配。
 - 真实 trigger/OAuth、暂停实例唤醒、实际 Gmail 与集群验收。
 

@@ -394,13 +394,9 @@ pub(crate) struct DeliveryIdentity {
 pub(crate) struct VerifiedDelivery {
     claims: DeliveryClaims,
     binding: SubscriptionBinding,
-    grant: StoredPrivacyGrant,
 }
 
 impl VerifiedDelivery {
-    pub(super) fn grant(&self) -> &StoredPrivacyGrant {
-        &self.grant
-    }
     pub(super) fn json(&self) -> serde_json::Value {
         serde_json::json!({
             "purpose":"ingestion.delivery", "tenant":self.binding.tenant,
@@ -504,11 +500,7 @@ impl DeliveryIdentity {
         self.identity
             .current_binding(&claims.grant_id, &grant)
             .await?;
-        Ok(VerifiedDelivery {
-            claims,
-            binding,
-            grant,
-        })
+        Ok(VerifiedDelivery { claims, binding })
     }
 }
 

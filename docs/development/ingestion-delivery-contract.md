@@ -17,8 +17,9 @@
 - 新 `connector.tool`、`ingestion.delivery` 用途在既有身份框架内扩展；工具身份
   不授予连接读权限，批次身份固定目标、batch ID/digest/实际 wire size 和短 TTL。
   必须验证真实当前账号、Binding、连接及明确订阅意图，不能根据 DTO 自行签发。
-- 冷启动提议新增固定配置的只读 bootstrap，返回当前目标的 `DIGITALMATE_CONFIG`，
-  不返回 privacy bearer、写权限、mint 权限或 project Key。验用途后才 bootstrap。
+- 冷启动能力由 Runtime/配置 owner 单独提议与发布，只能提供用途限定、无秘密的
+  verifier 配置/Binding 投影及版本/有效期。delivery 身份不能读取整份
+  `DIGITALMATE_CONFIG`，包括用户模型密钥；readonly 不能替代保密性约束。
 - Scan 保持唯一授权业务 flow owner，Registry 保持唯一连接写入者。Gateway
   物理外呼效果日志只能在公开 Scan 当前投影约束下防止重复外呼，不能成为第二业务主表。
 - 正式装配仍在同一 `IngressService` / `Bridge.create_app`，沿用已有 Relay 和
@@ -50,7 +51,7 @@ grant ID、tenant、batch ID/digest/size/到期；完整接收目标从该 batch
 | `/v1/connector/identity` | connector 凭证；查询当前账号与 Binding，返回身份投影和到期，不返回工具权限。 |
 | `/v1/connector/renew` | connector 凭证；重验当前目标并仅续期 connector 凭证。 |
 | `/v1/ingestion/admit` | delivery 凭证；返回接收目标、batch ID/digest/size/到期。 |
-| `/v1/ingestion/bootstrap` | delivery 凭证；校验前后当前事实，只读取本目标固定 `DIGITALMATE_CONFIG`，返回 revision/base64 value，不返回任何新 bearer 或写能力。 |
+| `/v1/ingestion/bootstrap` | 当前验证 delivery 后明确返回503 `AUTH_UNAVAILABLE`（既有身份 owner 的错误码）。不解密用户配置、不返回 value/token；等待 Runtime/配置 owner 的无秘密窄合同。 |
 
 delivery 路由必须由真实 Inbox 显式装配，没有匿名或退回 privacy 凭证的默认路径。
 批次交付凭证不作为后续 pipeline 的会话执行、背景读取或发布权限；这些权限必须
@@ -112,12 +113,13 @@ GET 绑定同一 batch ID/digest，不可用一批的凭证查询另一批。验
    共用既有身份 owner 和信任根；不下发 root、Composio 项目 Key 或 provider Token。
 3. Gateway 经现有 Ingress/Relay 连接固定接收路由。GET/POST 都需要该证明。
 4. `server.py` 的 admission 仅允许这两个精确路由进入实际 RequestVerifier。
-   verifier 先验真实用途及当前目标，再通过 #179 既有正式方法执行受限配置 bootstrap。
-   未验用途前不能读配置、启动后台 producer、读取 Registry 或开放其他 internal 路由。
-   privacy bearer 即使作为 bootstrap 能力传递，也只传给配置 owner，不能充当交付证明。
-5. bootstrap 完成后由真实 Registry.ensure_ready/access_snapshot 提供当前连接事实，
+   verifier 先验真实用途及当前目标。Runtime 的无秘密 bootstrap 消费尚未发布，
+   不能把用户配置或 privacy bearer 交给 delivery consumer，也不开放其他 internal 路由。
+5. Runtime 正式受限装配完成后由真实 Registry.ensure_ready/access_snapshot 提供当前连接事实，
    接收端核对 connection authorization generation、账户及 read_history；订阅授权仍由
-   订阅 owner/issuer 单独证明。SQLite 提交后回 accepted，再查当前连接和证明有效期。
+   订阅 owner/issuer 单独证明。SQLite 提交后重查当前连接和实际用途 owner，再回 accepted。
+   提交后撤销返回403时，持久去重回执仍存在，不能理解成回滚；重试、状态查询、
+   重启都必须重新验用途。staging 回执不授予执行或报告发布权限。
 6. Gateway 只提交准确 ACK 对应的成员。回执丢失时先 GET 同一 batch，再决定是否 POST。
 
 生产者还必须明确当前 Binding/订阅/连接撤销与在途请求的界限。取消无法撤回已经发生的

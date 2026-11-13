@@ -29,7 +29,17 @@ impl BindingReader for CurrentBinding {
 
 #[tokio::test]
 #[ignore = "requires the explicit task-owned PostgreSQL database"]
-async fn persisted_batch_identity_and_read_only_bootstrap_are_current_and_purpose_bound() {
+async fn persisted_batch_identity_is_current_and_cannot_read_user_configuration() {
+    exercise_delivery(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires task PostgreSQL and the exact DigitalMate Python consumer source"]
+async fn python_receiver_uses_real_https_identity_and_rejects_revoked_subscription() {
+    exercise_delivery(true).await;
+}
+
+async fn exercise_delivery(python_receiver: bool) {
     let url = std::env::var("ADX_INGESTION_TEST_DATABASE_URL").unwrap();
     let pg: tokio_postgres::Config = url.parse().unwrap();
     assert!(pg
@@ -169,7 +179,9 @@ async fn persisted_batch_identity_and_read_only_bootstrap_are_current_and_purpos
     let admission = delivery.verify(token).await.unwrap();
     assert_eq!(admission.json()["batch_id"], lease.batch.batch_id);
     assert_eq!(admission.json()["purpose"], "ingestion.delivery");
-    let http = PrivacyHttp::new(center.clone(), identity.clone()).with_ingestion(delivery.clone());
+    let http = Arc::new(
+        PrivacyHttp::new(center.clone(), identity.clone()).with_ingestion(delivery.clone()),
+    );
     for (path, credential, body, status) in [
         (
             "/v1/ingestion/admit",
@@ -181,7 +193,7 @@ async fn persisted_batch_identity_and_read_only_bootstrap_are_current_and_purpos
             "/v1/ingestion/bootstrap",
             token,
             b"{}",
-            http::StatusCode::OK,
+            http::StatusCode::SERVICE_UNAVAILABLE,
         ),
         (
             "/v1/ingestion/admit",
@@ -217,17 +229,103 @@ async fn persisted_batch_identity_and_read_only_bootstrap_are_current_and_purpos
             .unwrap();
         let response = http.handle(request).await;
         assert_eq!(response.status(), status, "{path}");
-        if path.ends_with("/bootstrap") && status == http::StatusCode::OK {
+        if path.ends_with("/bootstrap") && status == http::StatusCode::SERVICE_UNAVAILABLE {
             let json: serde_json::Value =
                 serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                     .unwrap();
-            assert_eq!(
-                STANDARD.decode(json["value"].as_str().unwrap()).unwrap(),
-                br#"{"TEST_USER_SETTING":"synthetic"}"#
-            );
+            assert_eq!(json, serde_json::json!({"error":"AUTH_UNAVAILABLE"}));
+            assert!(json.get("value").is_none());
             assert!(json.get("token").is_none());
         }
     }
+    let mut python = if python_receiver {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let executable = std::env::var("DIGITALMATE_INGESTION_CLIENT_PYTHON").unwrap();
+        let source =
+            std::path::PathBuf::from(std::env::var("DIGITALMATE_INGESTION_CLIENT_SOURCE").unwrap());
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let certificate = fixture.join("ingress-cert.pem");
+        let tls = adx_transport::tls::http_server_acceptor(
+            &certificate,
+            fixture.join("ingress-key.pem"),
+            None,
+            vec![b"http/1.1".to_vec()],
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(http.clone().serve(listener, tls, receiver));
+        let mut child = tokio::process::Command::new(executable)
+            .arg("-B")
+            .arg(source.join("tests/server/ingestion_identity_process.py"))
+            .arg(format!("https://localhost:{port}"))
+            .arg(certificate)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let projected = admission.json();
+        let identity_fields = [
+            "purpose",
+            "tenant",
+            "user_id",
+            "workspace",
+            "template",
+            "template_ref",
+            "binding_id",
+            "binding_generation",
+            "service_port",
+        ];
+        let context: serde_json::Map<String, serde_json::Value> = identity_fields
+            .iter()
+            .map(|name| ((*name).to_owned(), projected[*name].clone()))
+            .collect();
+        let mut input = serde_json::to_vec(&serde_json::json!({
+            "identity": context, "token": token, "batch_id": lease.batch.batch_id,
+            "wire_base64": STANDARD.encode(serde_json::to_vec(&lease.batch).unwrap()),
+        }))
+        .unwrap();
+        input.push(b'\n');
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&input)
+            .await
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(Duration::from_secs(20), output.read_line(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        if ready.trim() != "receiver-https-committed" {
+            use tokio::io::AsyncReadExt;
+            let mut diagnostics = Vec::new();
+            if let Some(stderr) = child.stderr.take() {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    stderr.take(8192).read_to_end(&mut diagnostics),
+                )
+                .await;
+            }
+            // This child receives synthetic test records only and never prints
+            // credentials. Keep its exception so wire failures are diagnosable.
+            assert_eq!(
+                ready.trim(),
+                "receiver-https-committed",
+                "{}",
+                String::from_utf8_lossy(&diagnostics)
+            );
+        }
+        Some((child, output, shutdown, server))
+    } else {
+        None
+    };
     binding.subscription_generation += 1;
     binding.enabled = false;
     inbox.register(&binding).await.unwrap();
@@ -236,5 +334,28 @@ async fn persisted_batch_identity_and_read_only_bootstrap_are_current_and_purpos
         Err(Error::Unauthorized)
     ));
     assert!(delivery.headers(&lease.batch).await.is_err());
+    if let Some((ref mut child, ref mut output, shutdown, server)) = python {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"revoked\n")
+            .await
+            .unwrap();
+        let mut final_line = String::new();
+        tokio::time::timeout(Duration::from_secs(20), output.read_line(&mut final_line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_line.trim(), "receiver-https-revoked");
+        assert!(tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success());
+        shutdown.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
     pool.close();
 }

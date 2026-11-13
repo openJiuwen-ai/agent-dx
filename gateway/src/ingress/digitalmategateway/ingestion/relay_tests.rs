@@ -357,8 +357,10 @@ async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() 
         .await
         .unwrap_or_else(|_| panic!("real relay first delivery"));
     assert_eq!(ack.state, "accepted");
-    assert!(purpose.0.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-        "each physical receipt query and batch POST must request fresh current-purpose proof");
+    assert!(
+        purpose.0.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "each physical receipt query and batch POST must request fresh current-purpose proof"
+    );
     process.kill().await.unwrap();
     process.wait().await.unwrap();
     let (mut restarted, start) = receiver(&database, &binding_file, port).await;

@@ -281,14 +281,6 @@ impl PrivacyCenter {
         self.read_owned(&grant, name).await
     }
 
-    pub(super) async fn delivery_bootstrap(
-        &self,
-        admission: &super::privacy_grants::VerifiedDelivery,
-    ) -> Result<Option<SecretValue>, Error> {
-        self.read_owned(admission.grant(), "DIGITALMATE_CONFIG")
-            .await
-    }
-
     async fn read_owned(
         &self,
         grant: &StoredPrivacyGrant,

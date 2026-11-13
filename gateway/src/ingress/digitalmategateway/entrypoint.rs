@@ -167,11 +167,11 @@ impl DigitalMateGatewayConfig {
         #[cfg(unix)]
         if let Some(ingestion) = &self.ingestion {
             ingestion.validate().map_err(|_| invalid())?;
-            if !self
+            if self
                 .privacy
                 .as_ref()
                 .zip(self.digitalmate.as_ref())
-                .is_some_and(|(privacy, app)| privacy.template == app.template)
+                .is_none_or(|(privacy, app)| privacy.template != app.template)
             {
                 return Err(invalid());
             }
