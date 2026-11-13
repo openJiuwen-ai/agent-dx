@@ -2,6 +2,12 @@
 
 状态：可选功能的实现候选。本文描述代码和部署约束，不代表已完成真实 ADX 快照、克隆隔离或香港环境验收。
 
+2026-11-13 北京四 `adx-jiuwen-test` 已完成 2 CPU / 2 GiB 的有界端到端验证：无真实模型 Key 时 DigitalMate 就绪，Gateway 注册模型配置，DigitalMate 经配置中心 HTTPS 获取后原生重载，真实模型返回 `pong`；容器及四个应用进程 PID 不变，重连保留历史且配置 revision 不变。使用独立合成业务会话，不能代表 Huawei/AGC 登录或故障注入验收。
+
+本次 Gateway 镜像为 `swr.cn-north-4.myhuaweicloud.com/openjiuwen-online-test/adx-jiuwen-control:model-config-20261113-76e60175f566-labels1`，digest `sha256:7858924b15204f450f1ed71f490b2aced6c87d3437f4944dd32eb7478ea8159b`。配套 DigitalMate 镜像 `digitalmate-bot:model-config-20261113-7230811d6de5`，digest `sha256:8877891a822b785f00a4b64d956aa80eef5998fcda8f8fbf2ee90aeb5d9986b0`，使用独立模板 `digitalmate-model-config-test:3`。配套仓 `docs/verification/model-configuration-beijing-2cpu-2026-11-13.md` 记录完整边界和数字。
+
+性能验收尚未通过：首次真实模型配置激活的 Agent prepare 为 3350.4 ms；追加五次占位配置重载的 Agent prepare 为 3368.5–3645.7 ms，完整重载 p50 3747.9 ms，均未达到 1 秒目标。没有足够证据将瓶颈归因于 CPU 限流、runsc 或 SFS；这不是实际 snapshot 加速效果的证明。
+
 ## 职责与边界
 
 配置中心运行在 DigitalMateGateway 进程内，在账号数据库保存经过认证加密的第三方凭证。
@@ -61,7 +67,7 @@ Gateway 进程仍能接触根密钥和明文，这属于应用层加密，不提
 DigitalMate 沙箱使用 [DigitalMate 仓库的正式部署模板](https://github.com/openJiuwen-ai/DigitalMate/blob/main/harness/personal-agent/deploy/digitalmate-template.prod.json)，
 本仓库不重复维护完整业务模板。接入本功能时，在业务模板中配置 `DIGITALMATE_SECRET_STORE=privacy`、
 `DIGITALMATE_CLIENT_AUTH=gateway`，以及配置中心的 HTTPS 地址、公开 CA、租户、工作区和用途；
-具体变量见 [DigitalMate 接入说明](https://github.com/openJiuwen-ai/DigitalMate/blob/feat/connection-foundation/docs/user_guide/gateway-privacy-config.md)。
+具体变量见 [DigitalMate 接入说明](https://github.com/openJiuwen-ai/DigitalMate/blob/feat/connection-foundation/docs/guides/development/gateway-privacy-configuration.md)。
 该接入说明属于配套候选分支，不能据此声称已在主干发布。沿用既有工作区卷，不增加身份目录、`chown` 权限或扫盘进程。
 已有部署保留模板名、工作区路径及 `orbit-config` 用途；这些名称仅为已有部署和密文上下文兼容。
 
@@ -69,7 +75,7 @@ DigitalMate 沙箱使用 [DigitalMate 仓库的正式部署模板](https://githu
 CA 文件可设为 `0444`，其父目录必须允许运行用户遍历（例如 `0755`）；
 部署前须使用实际运行用户验证 TLS 加载，不能只核对证书文件本身的权限。
 
-本模式需要先接受身份握手，再达到业务就绪。接入时使用 TCP 就绪探针确认入口能够接受连接。
+未启用下述模型配置名的原 privacy 模式，需要先接受身份握手再达到业务就绪。此时使用 TCP 就绪探针确认入口能够接受连接。
 正式模板默认的 `/health/ready` HTTP 就绪探针需在该业务配置中明确调整，否则可能形成“等待身份才能就绪、就绪后才下发身份”的循环。
 这是业务启动配套，不修改 ADX 就绪机制；不应因此修改普通模板或平台生命周期策略。
 
@@ -107,3 +113,27 @@ HTTPS 接口限制请求体、连接数和处理时间，响应带 `no-store`。
 本地验证使用真实 Rust HTTPS、隔离 PostgreSQL 和实际 Python 客户端/后端；Binding 响应和飞书供应商由明确的测试替身提供。
 覆盖初始化、手机断开后续期、旧状态恢复、连续重建超过授权配额、旧请求乱序和时钟偏差。
 这些结果不等同于真实 ADX 运行时 Snapshot/Restore、克隆隔离、手机或香港环境验收；环境部署结果另行记录。
+
+## 可选模型配置注册
+
+在 `privacy` 中设置 `model_config_name`（例如 `DIGITALMATE_MODEL_CONFIG`）启用模型配置模式。
+名称遵守既有配置名规则，不能使用连接配置保留名 `DIGITALMATE_CONFIG`。配套 DigitalMate 必须使用
+同名 `DIGITALMATE_MODEL_CONFIG_NAME`、privacy 存储和 Gateway 认证；新旧部署配置须同时匹配。
+
+Gateway 对目标模板的激活初始化只提供工作区参数，不再提供 `model_api_key/model_api_base`。
+运行时就绪后，Gateway 先调用配置中心读取接口；仅在没有注册值时沿用账号模型服务取得并确认模型凭据，再调用注册接口写入
+`API_KEY/API_BASE` 字符串字典；注册成功且业务会话仍有效后才转发身份握手。
+`ConfigurationRegistry` 仅提供注册和读取方法，接收 scope、名称和值；不向调用方提供数据库或加密器。重连复用已注册值，不重新申请模型凭据。
+配置中心继续使用账号库；未来远程注册适配器须验证 Gateway 写入身份，并保持同样契约。
+
+注册首次创建，相同内容重试返回原 revision；不同内容、删除墓碑或未决事务拒绝覆盖。
+沙箱 bearer 可以通过既有 `/v1/secret/get` 读取，不能通过 stage/commit/abort 修改此名称。
+连接凭据的原有两阶段提交、取消及故障恢复不变。未新增模型专用 HTTP 接口。
+
+配套 DigitalMate 在握手前完成无真实 Key 预热，`/health/ready` 可作为此模式的运行时就绪探针；
+业务仍等待身份、配置和新 Agent 就绪。此前描述的握手前 readiness 依赖仍适用于未设置模型配置名的
+原 privacy 模式。正式模板的模型参数占位符必须移除，不能只切换 Gateway 开关而沿用旧模板。
+DigitalMate 仓库提供 `harness/personal-agent/deploy/digitalmate-template.model-config.example.json`，
+部署时填写实际 HTTPS 地址、租户及公开 CA，并保持目标模板名与 Gateway 配置一致。
+
+此能力不实现 Key 轮换或实际快照恢复；启动失败、注册冲突和配置中心不可用保持明确失败，不回退为模板注入秘密。

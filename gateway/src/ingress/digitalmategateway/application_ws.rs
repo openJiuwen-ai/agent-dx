@@ -107,7 +107,7 @@ impl ApplicationWsConfig {
         managed: Arc<ManagedService>,
         guard: Arc<SessionGuard>,
         tenant: &str,
-        #[cfg(unix)] privacy: Option<std::sync::Arc<super::privacy_grants::PrivacyIdentity>>,
+        #[cfg(unix)] privacy: Option<std::sync::Arc<super::privacy_runtime::PrivacyAccess>>,
     ) -> Response<ProxyBody> {
         let auth = guard.auth.clone();
         let principal = guard.principal.clone();
@@ -146,6 +146,15 @@ impl ApplicationWsConfig {
         #[cfg(unix)]
         let privacy_scope = scope.clone();
         let access = AgentV2Access::new(managed);
+        #[cfg(unix)]
+        let model_configuration = privacy
+            .as_ref()
+            .filter(|p| p.identity.targets(&self.template))
+            .and_then(|p| p.model_configuration.clone());
+        #[cfg(not(unix))]
+        let model_mode = false;
+        #[cfg(unix)]
+        let model_mode = model_configuration.is_some();
         let admission = async {
             let selection = access
                 .select_with_initializer(
@@ -162,7 +171,11 @@ impl ApplicationWsConfig {
                             &principal.user_id,
                         )
                         .map_err(|_| crate::ingress::accounts::Error::Invalid)?;
-                        let mut parameters = auth.model_parameters(&principal).await?;
+                        let mut parameters = if model_mode {
+                            Default::default()
+                        } else {
+                            auth.model_parameters(&principal).await?
+                        };
                         parameters.extend(workspace);
                         Ok(parameters)
                     },
@@ -227,7 +240,7 @@ impl ApplicationWsConfig {
         #[cfg(unix)]
         if let Some(identity) = privacy
             .as_ref()
-            .filter(|identity| identity.targets(&self.template))
+            .filter(|access| access.identity.targets(&self.template))
         {
             let workspace = match super::entrypoint::workspace_parameters(
                 tenant,
@@ -240,9 +253,52 @@ impl ApplicationWsConfig {
             let Some(workspace) = workspace.get("workspace") else {
                 return error(StatusCode::BAD_GATEWAY, "PRIVACY_UNAVAILABLE");
             };
+            if let Some((name, registry)) = &model_configuration {
+                let registration = async {
+                    let scope = super::privacy_center::ConfigurationScope {
+                        tenant,
+                        workspace,
+                        user: &principal.user_id,
+                    };
+                    if registry.get(scope, name).await?.is_some() {
+                        return auth.check(&principal).await;
+                    }
+                    let parameters = auth.model_parameters(&principal).await?;
+                    let value = std::collections::BTreeMap::from([
+                        (
+                            "API_KEY".into(),
+                            parameters
+                                .get("model_api_key")
+                                .ok_or(crate::ingress::accounts::Error::Unavailable)?
+                                .clone(),
+                        ),
+                        (
+                            "API_BASE".into(),
+                            parameters
+                                .get("model_api_base")
+                                .ok_or(crate::ingress::accounts::Error::Unavailable)?
+                                .clone(),
+                        ),
+                    ]);
+                    registry.register(scope, name, &value).await?;
+                    auth.check(&principal).await
+                };
+                let registration = tokio::select! {
+                    biased;
+                    why = wait_for_end(reason.clone()) => return end_response(why),
+                    result = tokio::time::timeout_at(deadline, registration) => result,
+                };
+                match registration {
+                    Ok(Ok(())) => (),
+                    Ok(Err(error)) => return auth_error(error),
+                    Err(_) => return error(StatusCode::GATEWAY_TIMEOUT, "PRIVACY_UNAVAILABLE"),
+                }
+            }
             let token = match tokio::time::timeout_at(
                 deadline,
-                identity.admit(&privacy_scope, workspace, &principal.user_id),
+                identity
+                    .identity
+                    .admit(&privacy_scope, workspace, &principal.user_id),
             )
             .await
             {

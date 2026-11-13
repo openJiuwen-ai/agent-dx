@@ -37,11 +37,46 @@ pub(crate) struct SecretValue {
     pub plaintext: Option<Zeroizing<Vec<u8>>>,
 }
 
+/// Trusted registration context. Transport adapters must authenticate the writer.
+/// Workload bearer tokens only authorize reads of registered configuration.
+#[derive(Clone, Copy)]
+pub(crate) struct ConfigurationScope<'a> {
+    pub tenant: &'a str,
+    pub workspace: &'a str,
+    pub user: &'a str,
+}
+
+pub(crate) struct RegisteredConfiguration {
+    pub revision: String,
+    pub value: std::collections::BTreeMap<String, String>,
+}
+
+#[async_trait]
+pub(crate) trait ConfigurationRegistry: Send + Sync {
+    /// Read a registered value using a trusted, authenticated caller scope.
+    /// Tombstones and pending transactions are conflicts, not missing values.
+    async fn get(
+        &self,
+        scope: ConfigurationScope<'_>,
+        name: &str,
+    ) -> Result<Option<RegisteredConfiguration>, Error>;
+
+    /// Persist a new value, or confirm the identical existing value. Never overwrite.
+    /// Conflict includes tombstones and pending transactions; unavailable is retryable.
+    async fn register(
+        &self,
+        scope: ConfigurationScope<'_>,
+        name: &str,
+        value: &std::collections::BTreeMap<String, String>,
+    ) -> Result<String, Error>;
+}
+
 pub(crate) struct PrivacyCenter {
     store: AccountStore,
     cipher: PrivacyCipher,
     signer: Arc<TokenSigner>,
     legacy: Option<PrivacyCipher>,
+    registered_name: Option<String>,
 }
 
 impl PrivacyCenter {
@@ -51,7 +86,30 @@ impl PrivacyCenter {
             cipher,
             signer,
             legacy: None,
+            registered_name: None,
         }
+    }
+
+    pub fn with_registered_name(mut self, name: Option<String>) -> Result<Self, Error> {
+        if name.as_ref().is_some_and(|name| {
+            name == "DIGITALMATE_CONFIG"
+                || name.is_empty()
+                || name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        }) {
+            return Err(Error::Configuration);
+        }
+        self.registered_name = name;
+        Ok(self)
+    }
+
+    fn require_workload_write(&self, name: &str) -> Result<(), Error> {
+        if self.registered_name.as_deref() == Some(name) {
+            return Err(Error::Forbidden);
+        }
+        Ok(())
     }
 
     pub fn with_legacy(mut self, legacy: PrivacyCipher) -> Self {
@@ -285,6 +343,7 @@ impl PrivacyCenter {
         value: Option<&[u8]>,
         expected: ExpectedRevision<'_>,
     ) -> Result<String, Error> {
+        self.require_workload_write(name)?;
         let grant = self.authorize(token).await?;
         let owner = PrivacyOwner {
             tenant: &grant.scope.tenant,
@@ -323,6 +382,7 @@ impl PrivacyCenter {
         transaction_id: &str,
         name: &str,
     ) -> Result<String, Error> {
+        self.require_workload_write(name)?;
         let grant = self.authorize(token).await?;
         let owner = PrivacyOwner {
             tenant: &grant.scope.tenant,
@@ -335,6 +395,7 @@ impl PrivacyCenter {
     }
 
     pub async fn abort(&self, token: &str, transaction_id: &str, name: &str) -> Result<(), Error> {
+        self.require_workload_write(name)?;
         let grant = self.authorize(token).await?;
         let owner = PrivacyOwner {
             tenant: &grant.scope.tenant,
@@ -362,9 +423,102 @@ impl PrivacyCenter {
     }
 }
 
+#[async_trait]
+impl ConfigurationRegistry for PrivacyCenter {
+    async fn get(
+        &self,
+        scope: ConfigurationScope<'_>,
+        name: &str,
+    ) -> Result<Option<RegisteredConfiguration>, Error> {
+        if self.registered_name.as_deref() != Some(name) {
+            return Err(Error::Forbidden);
+        }
+        let owner = PrivacyOwner {
+            tenant: scope.tenant,
+            workspace: scope.workspace,
+            user: scope.user,
+        };
+        let Some(stored) = self.store.privacy_exportable(&owner, name).await? else {
+            return Ok(None);
+        };
+        let (Some(key_id), Some(ciphertext)) = (stored.key_id, stored.ciphertext) else {
+            return Err(Error::Conflict);
+        };
+        let context = SecretContext {
+            tenant: scope.tenant,
+            workspace: scope.workspace,
+            user: scope.user,
+            name,
+        };
+        let opened = Zeroizing::new(
+            self.cipher
+                .open(&context, &EncryptedSecret { key_id, ciphertext })
+                .map_err(|_| Error::Unavailable)?,
+        );
+        Ok(Some(RegisteredConfiguration {
+            revision: stored.revision,
+            value: serde_json::from_slice(&opened).map_err(|_| Error::Unavailable)?,
+        }))
+    }
+
+    async fn register(
+        &self,
+        scope: ConfigurationScope<'_>,
+        name: &str,
+        value: &std::collections::BTreeMap<String, String>,
+    ) -> Result<String, Error> {
+        if self.registered_name.as_deref() != Some(name) {
+            return Err(Error::Forbidden);
+        }
+        let owner = PrivacyOwner {
+            tenant: scope.tenant,
+            workspace: scope.workspace,
+            user: scope.user,
+        };
+        let context = SecretContext {
+            tenant: scope.tenant,
+            workspace: scope.workspace,
+            user: scope.user,
+            name,
+        };
+        let plaintext = Zeroizing::new(serde_json::to_vec(value).map_err(|_| Error::Invalid)?);
+        if plaintext.len() > 131_072 {
+            return Err(Error::Invalid);
+        }
+        if self.store.privacy_exportable(&owner, name).await?.is_none() {
+            let sealed = self
+                .cipher
+                .seal(&context, &plaintext)
+                .map_err(|_| Error::Unavailable)?;
+            match self
+                .store
+                .privacy_put(
+                    &owner,
+                    name,
+                    &sealed.key_id,
+                    &sealed.ciphertext,
+                    ExpectedRevision::New,
+                )
+                .await
+            {
+                Ok(revision) => return Ok(revision),
+                Err(Error::Conflict) => (), // A concurrent identical registration can have won.
+                Err(error) => return Err(error),
+            }
+        }
+        let stored = ConfigurationRegistry::get(self, scope, name)
+            .await?
+            .ok_or(Error::Conflict)?;
+        if &stored.value != value {
+            return Err(Error::Conflict);
+        }
+        Ok(stored.revision)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BindingReader, PrivacyCenter};
+    use super::{BindingReader, ConfigurationRegistry, ConfigurationScope, PrivacyCenter};
     use crate::ingress::accounts::{AccountStore, Error, ExpectedRevision, PrivacyOwner};
     use crate::ingress::digitalmategateway::privacy_cipher::PrivacyCipher;
     use crate::ingress::digitalmategateway::privacy_grants::{PrivacyIdentity, TokenSigner};
@@ -489,8 +643,83 @@ mod tests {
             BTreeMap::from([("legacy-v1".into(), [9; 32])]),
         )
         .unwrap();
-        let center =
-            Arc::new(PrivacyCenter::new(store.clone(), cipher, signer.clone()).with_legacy(legacy));
+        let center = Arc::new(
+            PrivacyCenter::new(store.clone(), cipher, signer.clone())
+                .with_legacy(legacy)
+                .with_registered_name(Some("DIGITALMATE_MODEL_CONFIG".into()))
+                .unwrap(),
+        );
+        let model_value = BTreeMap::from([
+            ("API_KEY".into(), "synthetic-model".into()),
+            ("API_BASE".into(), "https://model.test/v1".into()),
+        ]);
+        let registration_scope = || ConfigurationScope {
+            tenant: "tenant-a",
+            workspace: "workspace-a",
+            user: &user,
+        };
+        assert!(ConfigurationRegistry::get(
+            center.as_ref(),
+            registration_scope(),
+            "DIGITALMATE_MODEL_CONFIG"
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let (first, second) = tokio::join!(
+            center.register(
+                registration_scope(),
+                "DIGITALMATE_MODEL_CONFIG",
+                &model_value
+            ),
+            center.register(
+                registration_scope(),
+                "DIGITALMATE_MODEL_CONFIG",
+                &model_value
+            )
+        );
+        let first = first.unwrap();
+        assert_eq!(first, second.unwrap());
+        let registered = ConfigurationRegistry::get(
+            center.as_ref(),
+            registration_scope(),
+            "DIGITALMATE_MODEL_CONFIG",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(registered.revision, first);
+        assert_eq!(registered.value, model_value);
+        let model = center
+            .get(token, "DIGITALMATE_MODEL_CONFIG")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.revision, first);
+        assert_eq!(
+            serde_json::from_slice::<BTreeMap<String, String>>(model.plaintext.unwrap().as_slice())
+                .unwrap(),
+            model_value
+        );
+        let different = BTreeMap::from([("API_KEY".into(), "different".into())]);
+        assert!(matches!(
+            center
+                .register(registration_scope(), "DIGITALMATE_MODEL_CONFIG", &different)
+                .await,
+            Err(Error::Conflict)
+        ));
+        assert!(matches!(
+            center
+                .stage(
+                    token,
+                    &uuid::Uuid::new_v4().to_string(),
+                    "DIGITALMATE_MODEL_CONFIG",
+                    None,
+                    ExpectedRevision::Existing(&first)
+                )
+                .await,
+            Err(Error::Forbidden)
+        ));
 
         // No login session exists: a valid workspace grant is sufficient for background work.
         let revision = center
@@ -642,7 +871,8 @@ mod tests {
 import os, uuid, sys
 from server_engine.credential_crypto import PrivacyClient
 client = PrivacyClient(os.environ)
-client.accept_identity(sys.stdin.readline().strip())
+identity_token = sys.stdin.readline().strip()
+client.accept_identity(identity_token)
 name = 'PYTHON_CASE'
 transaction = str(uuid.uuid4())
 revision = client.stage(transaction, name, {'DIGITALMATE_OPEN_METEO_API_KEY':'synthetic-python-token'}, None)
@@ -668,7 +898,7 @@ async def exercise_backend(workspace):
     try:
         connection = await registry.asave('feishu', 'fixture', 'user', {'app_id':'cli_fixture','app_secret':'synthetic-app-secret','user_access_token':'u-old','user_refresh_token':'old-refresh','user_token_expires_at':'1'}, '')
         expected = dict(registry.fields(connection.id))
-        await registry._asave_tokens(connection.id, expected, {'user_access_token':'u-new','user_refresh_token':'new-refresh','user_token_expires_at':'4000000000'})
+        await registry._asave_tokens(connection.id, 'feishu', expected, {'user_access_token':'u-new','user_refresh_token':'new-refresh','user_token_expires_at':'4000000000'})
         assert registry.fields(connection.id)['user_refresh_token'] == 'new-refresh'
         assert 'synthetic-app-secret' not in config.path.read_text()
         assert EngineConfiguration(workspace, env, privacy_client=client).values['DIGITALMATE_CONNECTIONS'] == config.values['DIGITALMATE_CONNECTIONS']
@@ -678,6 +908,10 @@ async def exercise_backend(workspace):
         store.close()
 with tempfile.TemporaryDirectory() as directory:
     asyncio.run(exercise_backend(Path(directory)))
+if os.environ.get('DIGITALMATE_MODEL_INTEGRATION_SCRIPT'):
+    import runpy
+    integration = runpy.run_path(os.environ['DIGITALMATE_MODEL_INTEGRATION_SCRIPT'])
+    asyncio.run(integration['exercise_model_runtime'](PrivacyClient(os.environ), identity_token))
 print('digitalmate-backend-https-ok')
 print('python-client-https-ok')
 "#).env("PYTHONPATH", source)
