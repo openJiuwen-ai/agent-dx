@@ -68,6 +68,12 @@ pub(crate) trait FuseMountPolicy: Send + Sync + 'static {
     fn mount_entry_ttl(&self) -> Duration {
         UNCACHED_TTL
     }
+
+    /// The errno a failed FUSE_CREATE with open `_flags` is answered with.
+    /// The default hands the backend's answer to the kernel unchanged.
+    fn create_failure_errno(&self, _flags: i32, errno: i32) -> i32 {
+        errno
+    }
 }
 
 /// DFS: one bounded kernel entry/attribute TTL (`dfs_kernel_cache_ttl_ms`,
@@ -101,6 +107,21 @@ impl FuseMountPolicy for DfsFusePolicy {
 
     fn mount_entry_ttl(&self) -> Duration {
         self.kernel_ttl
+    }
+
+    /// `open(O_CREAT)` without `O_EXCL` must open a file that already exists,
+    /// and on DFS another Node can create the name after this kernel's
+    /// negative lookup. The kernel sends FUSE_CREATE then and does not fall
+    /// back when the answer is EEXIST (`fuse_atomic_open`). ESTALE makes the
+    /// VFS walk the path once more with a fresh lookup, which finds the file
+    /// and opens it under the kernel's own permission, truncation and
+    /// file-type rules.
+    fn create_failure_errno(&self, flags: i32, errno: i32) -> i32 {
+        if errno == libc::EEXIST && flags & libc::O_EXCL == 0 {
+            libc::ESTALE
+        } else {
+            errno
+        }
     }
 
     /// Only directories cache attributes. A regular file's attributes must

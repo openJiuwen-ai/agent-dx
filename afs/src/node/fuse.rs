@@ -2262,7 +2262,7 @@ impl Filesystem for AfsFuse {
                     )
                 });
             }
-            Err(error) => reply.error(fuse_errno(error)),
+            Err(error) => reply.error(fuse_errno(self.policy.create_failure_errno(flags, error))),
         }
     }
 

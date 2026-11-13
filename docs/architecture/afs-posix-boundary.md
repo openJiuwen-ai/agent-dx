@@ -61,6 +61,7 @@
 | 36 | `bmap`、`FIEMAP`、`FICLONE` | `FIEMAP`、`FICLONE` `EOPNOTSUPP`；`cp --reflink=auto` 回退普通拷贝 | 不支持 | `unsupported_ioctls` |
 | 37 | `readdir` 大目录 | 按页取（R72），百万项可列出 | 支持 | `readdir_lists_every_entry_with_its_type`；S4a R72 场景 |
 | 38 | 打开中的文件被 `unlink`／`rename` 覆盖 | 旧描述符继续读打开时的版本 | 支持 | `open_file_survives_replacement`；`dfs.semantics.unlink_open_file` |
+| 39 | `open(O_CREAT)` 遇到已存在的名字 | 带 `O_EXCL`：`EEXIST`；不带：打开已有文件。名字刚被另一节点建出、本节点内核还没看到时也一样（Node 让内核重新查找一次再打开） | 支持 | `exclusive_create_of_a_taken_name_is_eexist`、`plain_create_of_a_name_that_just_appeared_opens_it` |
 
 OwnerFs 与 DFS 不同之处：`RENAME_EXCHANGE`／`WHITEOUT` 同样回 `EINVAL`（公共 FUSE 层）；远端 Home 的 xattr
 回 `ENOSYS`，内核会让该挂载的 xattr 全部失效（已登记，未改）；没有 `copy_file_range`（内核回退）；

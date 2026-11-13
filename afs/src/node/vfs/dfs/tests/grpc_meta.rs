@@ -775,6 +775,50 @@ struct InodeMutationSnapshot {
     pending_layout_id: LayoutRootId,
 }
 
+/// A create that reaches Meta for a name another create already took (the
+/// kernel's lookup lost the race, or the caller is not behind the kernel) must
+/// surface as `EEXIST`: `open(O_CREAT | O_EXCL)` callers treat `EBUSY` as a
+/// failure rather than "someone else holds the lock file".
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_grpc_create_over_an_existing_name_is_eexist() {
+    let (_temp, endpoint, _gate, server, _store, local, _backend) = real_grpc_meta_fixture().await;
+    let (_meta, _chunks, fs_raw) = grpc_dfs_test_fs(
+        "node-a",
+        "session-a",
+        &endpoint,
+        local,
+        Duration::from_secs(2),
+    )
+    .await;
+    let fs = Arc::new(fs_raw);
+    let create = |fs: Arc<DistributedFs>| {
+        run_blocking(move || {
+            fs.create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("grpc-create-exclusive.lock"),
+                0o640,
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY,
+            )
+        })
+    };
+    let created = create(fs.clone()).await.unwrap();
+    let error = match create(fs.clone()).await {
+        Ok(_) => panic!("a second create of the same name must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), afs_error::IO_ALREADY_EXISTS, "{error}");
+    assert_eq!(crate::error::errno(&error), libc::EEXIST);
+    {
+        let fs = fs.clone();
+        run_blocking(move || fs.release(&context(), created.handle))
+            .await
+            .unwrap();
+    }
+    server.abort();
+}
+
 #[cfg(feature = "dfs")]
 fn pending_file_commit_snapshot(
     fs: &DistributedFs,
