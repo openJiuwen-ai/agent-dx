@@ -379,6 +379,9 @@ impl PrivacyIdentity {
             "template":grant.scope.template, "template_ref":grant.scope.template_ref.name(),
             "binding_id":grant.scope.binding_id, "binding_generation":grant.generation,
             "expires_at":claims.exp,
+            "renewable":claims.bootstrap_until.is_none(),
+            "recovery_expires_at":claims.recovery_until,
+            "bootstrap_until":claims.bootstrap_until,
         }))
     }
 
@@ -394,7 +397,12 @@ impl PrivacyIdentity {
             .privacy_extend_grant(&claims.id, claims.recovery_until)
             .await?;
         let token = self.signer.sign_connector(&claims)?;
-        Ok(serde_json::json!({"token":token.as_str(), "expires_at":claims.exp}))
+        Ok(serde_json::json!({
+            "token":token.as_str(), "expires_at":claims.exp,
+            "renewable":claims.bootstrap_until.is_none(),
+            "recovery_expires_at":claims.recovery_until,
+            "bootstrap_until":claims.bootstrap_until,
+        }))
     }
     pub async fn renew(&self, token: &str) -> Result<serde_json::Value, Error> {
         let mut claims = self.signer.verify(token, true)?;

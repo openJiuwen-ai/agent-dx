@@ -115,6 +115,42 @@ async fn owner_purpose_persisted_workload_needs_no_phone_and_rechecks_real_grant
     )
     .await
     .is_err());
+    let proof = identity
+        .connector_identity(&credentials.connector)
+        .await
+        .unwrap();
+    assert_eq!(proof["renewable"], true);
+    assert!(proof.as_object().unwrap().contains_key("bootstrap_until"));
+    assert!(proof["bootstrap_until"].is_null());
+    assert!(proof["recovery_expires_at"].as_i64().unwrap() > proof["expires_at"].as_i64().unwrap());
+    let renewed = identity
+        .renew_connector(&credentials.connector)
+        .await
+        .unwrap();
+    assert_eq!(renewed["renewable"], true);
+    assert!(renewed.as_object().unwrap().contains_key("bootstrap_until"));
+    assert!(renewed["bootstrap_until"].is_null());
+    let renewed_token = renewed["token"].as_str().unwrap();
+    let renewed_proof = identity.connector_identity(renewed_token).await.unwrap();
+    for field in [
+        "tenant",
+        "user_id",
+        "workspace",
+        "template",
+        "template_ref",
+        "binding_id",
+        "binding_generation",
+    ] {
+        assert_eq!(proof[field], renewed_proof[field], "{field}");
+    }
+    assert_eq!(renewed["expires_at"], renewed_proof["expires_at"]);
+    assert_eq!(
+        renewed["recovery_expires_at"],
+        renewed_proof["recovery_expires_at"]
+    );
+    assert!(
+        renewed["recovery_expires_at"].as_i64().unwrap() > renewed["expires_at"].as_i64().unwrap()
+    );
     let body = br#"{"connection_id":"synthetic"}"#;
     let mut last_token = String::new();
     for operation in [
@@ -188,6 +224,8 @@ async fn owner_purpose_persisted_workload_needs_no_phone_and_rechecks_real_grant
         .await
         .unwrap();
     assert!(workload.check().await.is_err());
+    assert!(identity.connector_identity(renewed_token).await.is_err());
+    assert!(identity.renew_connector(renewed_token).await.is_err());
     assert!(owner
         .verify(
             &last_token,
@@ -207,6 +245,8 @@ async fn owner_purpose_persisted_workload_needs_no_phone_and_rechecks_real_grant
     assert!(workload.check().await.is_ok());
     bindings.0.lock().unwrap().generation = "new-generation".into();
     assert!(workload.check().await.is_err());
+    assert!(identity.connector_identity(renewed_token).await.is_err());
+    assert!(identity.renew_connector(renewed_token).await.is_err());
     assert!(owner
         .verify(
             &last_token,

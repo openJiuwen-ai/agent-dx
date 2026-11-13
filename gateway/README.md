@@ -730,6 +730,16 @@ This purpose cannot decrypt privacy settings or authorize provider mail reads.
 Malformed requests return the existing account error envelope; invalid or revoked
 credentials fail closed, and unavailable identity owners return service unavailable.
 
+The existing `/v1/connector/identity` and successful `/v1/connector/renew`
+responses also report `renewable`, `recovery_expires_at` and `bootstrap_until`,
+derived from verified signed claims and the current grant/Binding. Ordinary
+connector credentials report `renewable: true` and `bootstrap_until: null`;
+their recovery deadline is that credential's signed window, subject to the
+existing server-side renewal and revocation policy. Delivery-derived credentials
+report `renewable: false` with both deadlines equal to access expiry, and renewal
+is refused. Consumers must verify these responses through the actual authority;
+client-side token decoding or a local file is not an authorization fact.
+
 The existing identity HTTPS listener also accepts `POST /v1/ingestion/bootstrap`
 with a valid delivery bearer and exactly `{}`. It rechecks the persisted current
 batch, enabled subscription, existing grant and complete current Binding. The

@@ -352,7 +352,11 @@ async fn exercise_delivery(python_receiver: bool, bootstrap: bool) {
             count, grant_count,
             "bootstrap must reuse the existing grant"
         );
-        assert!(identity.connector_identity(&credential).await.is_ok());
+        let proof = identity.connector_identity(&credential).await.unwrap();
+        assert_eq!(proof["renewable"], false);
+        assert_eq!(proof["bootstrap_until"], proof["expires_at"]);
+        assert_eq!(proof["recovery_expires_at"], proof["expires_at"]);
+        assert!(proof["bootstrap_until"].as_i64().unwrap() <= admission.claims.exp);
         assert!(matches!(
             identity.renew_connector(&credential).await,
             Err(Error::Forbidden)

@@ -44,6 +44,8 @@ ACK 只提交被领取的准确成员，不推进 sequence 高水位，A/B 处�
 
 冷启交换必须发生在 delivery 被 accepted 并完成之前，只有仍为 ready 的持久 batch 可被核验。receipt 完成后不能用旧 delivery 再次交换；进程丢失或凭据过期后的长期后台读取恢复，不能仅凭本接口宣称已实现。
 
+现有 `/v1/connector/identity` 及成功的 `/v1/connector/renew` 响应公开已验签凭据对应的 `renewable`、`recovery_expires_at` 和 `bootstrap_until`，并沿用真实 grant/current Binding 核验。普通 connector 返回 `renewable: true`、`bootstrap_until: null`；恢复截止是该凭据签名的原续期窗口，受原服务端续期/撤销策略控制，不代表永久许可。bootstrap connector 返回 `renewable: false`，两个截止均等于 access 到期，续期仍拒绝。消费者只能依据真实 HTTPS authority 响应核验当前 scope/代次及这些字段；本地文件或自行解 token 不能产生授权事实。
+
 以下生产接线仍未实现，PR 保持 Draft：
 
 - 用户明确启用/撤销的持久订阅 owner，以及现有 Composio 适配器内受限 trigger 操作和未知结果恢复。`Inbox.register` 只接受已经过真实 owner 授权的投影。
