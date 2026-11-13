@@ -1049,6 +1049,11 @@ async fn create_admits_its_handle_reference_atomically_and_a_replay_keeps_one() 
         },
         lease_seconds: 30,
         first_generation: None,
+        caller: crate::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
     };
     let (created, _) = service.create(request.clone()).await.unwrap();
     let key = ref_key("n", "s", &created_handle_reference_id(&operation));
@@ -1131,6 +1136,11 @@ async fn create_admits_the_first_write_generation_in_its_transaction() {
         },
         lease_seconds: 30,
         first_generation: Some(generation),
+        caller: crate::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
     };
     let create = request("create-gen", b"file", generation.clone());
     let (created, _) = service.create(create.clone()).await.unwrap();
@@ -2674,6 +2684,11 @@ async fn create_registers_its_handle_in_memory_and_writes_no_reference() {
         // Short: the creator's write lease protects the inode too.
         lease_seconds: 1,
         first_generation: None,
+        caller: crate::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
     };
     let refused = service
         .create_registered(request(), Some(7))

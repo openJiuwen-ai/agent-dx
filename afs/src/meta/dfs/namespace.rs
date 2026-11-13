@@ -55,9 +55,10 @@ impl DfsService {
             namespace_id,
             parent_inode_id,
             name,
-            attributes,
+            mut attributes,
             lease_seconds,
             first_generation,
+            caller,
         } = request;
         require_id(&caller_id, "caller_id")?;
         require_id(&owner_session_id, "owner_session_id")?;
@@ -90,6 +91,20 @@ impl DfsService {
             return Ok((inode, lease, term));
         }
         validate_name(&name)?;
+        // The same rules as mkdir, mknod and symlink, checked once, on the
+        // parent as first read and before anything is registered for the new
+        // inode. A retry continues only on a parent whose timestamps and
+        // revision moved (`create_parent_retry_drift_only`); a concurrent
+        // chmod or chown of the parent races with this create as it does
+        // with any other.
+        let parent = self
+            .directory_for_mutation(&namespace_id, &parent_inode_id)
+            .await?;
+        if let Some(parent) = &parent {
+            ensure_directory_create_access(&caller, parent)?;
+        }
+        attributes.uid = caller.uid;
+        attributes.gid = inherited_child_gid(&caller, parent.as_ref());
         let inode = InodeRecord {
             namespace_id: namespace_id.clone(),
             inode_id: namespace_inode_id(&caller_id, &operation_id),
@@ -162,6 +177,7 @@ impl DfsService {
                 request_digest,
                 namespace_id,
                 parent_inode_id,
+                parent,
                 dentry_key,
                 inode,
                 lease,
@@ -190,6 +206,7 @@ impl DfsService {
         request_digest: [u8; 32],
         namespace_id: NamespaceId,
         parent_inode_id: InodeId,
+        mut parent: Option<InodeRecord>,
         dentry_key: DentryKey,
         inode: InodeRecord,
         lease: WriteLease,
@@ -198,9 +215,6 @@ impl DfsService {
         soft_handle: bool,
     ) -> Result<(InodeRecord, WriteLease)> {
         let request = RequestKey::new(caller_id, operation_id.0.clone());
-        let mut parent = self
-            .directory_for_mutation(&namespace_id, &parent_inode_id)
-            .await?;
         let max_attempts = CREATE_PARENT_DRIFT_RETRY_LIMIT;
         for attempt in 0..max_attempts {
             let outcome = RequestOutcome {

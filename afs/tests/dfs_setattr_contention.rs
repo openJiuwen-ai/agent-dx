@@ -141,6 +141,67 @@ fn caller() -> CallerContext {
     }
 }
 
+/// The namespace root is root-owned 0755, so an ordinary user cannot create
+/// in it. Fixtures that need a user-owned file directly under the root open
+/// it first, as an administrator would for a shared directory. Meta creates
+/// the root on the first namespace mutation, hence the probe directory.
+async fn let_users_create_in_root(dfs: &DfsService) {
+    dfs.mkdir(afs::dfs::MkdirRequest {
+        caller_id: "node-a".into(),
+        operation_id: afs::dfs::OperationId::new("fixture-root-probe"),
+        namespace_id: afs::dfs::NamespaceId::new("default"),
+        parent_inode_id: afs::dfs::InodeId::new("1"),
+        name: b".fixture-root-probe".to_vec(),
+        attributes: afs::dfs::InodeAttributes {
+            mode: 0o700,
+            uid: 0,
+            gid: 0,
+            nlink: 2,
+            atime_unix_ms: 1,
+            mtime_unix_ms: 1,
+            ctime_unix_ms: 1,
+        },
+        caller: afs::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+    })
+    .await
+    .unwrap();
+    dfs.rmdir(afs::dfs::RmdirRequest {
+        caller_id: "node-a".into(),
+        operation_id: afs::dfs::OperationId::new("fixture-root-probe-remove"),
+        namespace_id: afs::dfs::NamespaceId::new("default"),
+        parent_inode_id: afs::dfs::InodeId::new("1"),
+        name: b".fixture-root-probe".to_vec(),
+        caller: afs::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+    })
+    .await
+    .unwrap();
+    dfs.set_inode_attributes(afs::dfs::SetInodeAttrRequest {
+        caller_id: "node-a".into(),
+        operation_id: afs::dfs::OperationId::new("fixture-open-root"),
+        caller: afs::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+        inode_id: afs::dfs::InodeId::new("1"),
+        expected_inode_revision: None,
+        update: afs::dfs::InodeAttrUpdate {
+            mode: Some(0o1777),
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
+}
+
 /// A DFS service whose store drifts the created file `drifts` times, and
 /// that file.
 async fn fixture(drifts: usize) -> (Arc<InodeDriftStore>, DfsService, InodeRecord) {
@@ -158,6 +219,7 @@ async fn fixture(drifts: usize) -> (Arc<InodeDriftStore>, DfsService, InodeRecor
     let dfs =
         DfsService::with_replication_config(store.clone(), ReplicationConfig::local_single_copy());
     dfs.initialize_replication_config().await.unwrap();
+    let_users_create_in_root(&dfs).await;
     let (inode, _) = dfs
         .create(CreateFileRequest {
             caller_id: "node-a".into(),
@@ -177,6 +239,11 @@ async fn fixture(drifts: usize) -> (Arc<InodeDriftStore>, DfsService, InodeRecor
             },
             lease_seconds: 30,
             first_generation: None,
+            caller: CallerContext {
+                uid: 1000,
+                gid: 1000,
+                supplementary_gids: Vec::new(),
+            },
         })
         .await
         .unwrap();

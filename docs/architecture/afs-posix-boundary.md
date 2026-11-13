@@ -18,6 +18,8 @@
    用例：`statfs_reports_the_local_disk`。
 3. 跨 Node 的一致性是 close-to-open：另一 Node 要在写入方 `fsync` 或 `close` 之后**重新打开**才看到新内容；
    已打开的读者固定在打开时的版本（决策 4a）。`mmap MAP_SHARED` 同理。
+4. **只靠附加组才有写权限的目录里，每次新建文件多一次往返。** FUSE 请求头只带 uid 和主组，新建文件先按这两项发给 Meta；
+   Meta 拒绝后 Node 才读 `/proc` 取调用进程的附加组并重发一次。属主或主组就有写权限的目录不受影响。
 
 ## 清单
 
@@ -45,7 +47,7 @@
 | 20 | `copy_file_range` | 得到源内容（条件满足时元数据 COW，否则内核回退拷贝）；`flags≠0` `EINVAL` | 支持 | `copy_file_range_copies_or_falls_back` |
 | 21 | `ioctl` | 只接受 AFS 私有命令；`FS_IOC_GETFLAGS`（`lsattr`）`ENOTTY` | 不支持 | `unsupported_ioctls` |
 | 22 | `utimensat` | 毫秒精度（纳秒截断）；`UTIME_OMIT`／`UTIME_NOW`；1970 年以前 `EINVAL`（D-S4-2）；`UTIME_NOW` 取写入 Node 的时钟 | 支持 | `timestamps` |
-| 23 | `chmod`／`chown` 权限 | 非属主改 mode、非 root 改属主、改到非所属组均 `EPERM` | 支持 | `ownership_and_privilege_bits` |
+| 23 | `chmod`／`chown` 权限、新建文件的属主属组 | 非属主改 mode、非 root 改属主、改到非所属组均 `EPERM`；新建的文件与目录属主是调用者，setgid 目录下继承目录的属组；父目录无写与搜索权限时 `EACCES`（不经内核的入口由 Meta 判断） | 支持 | `ownership_and_privilege_bits`、`setgid_directory_gives_new_files_its_group` |
 | 24 | 写入／截断清 suid、sgid | 非特权写或截断清 suid 与带组执行位的 sgid；root（`CAP_FSETID`）不清 | 支持 | 同上 |
 | 25 | `FUSE_HANDLE_KILLPRIV_V2` | 不协商，清位由内核发起（第 24 项）；见下文 | 不支持（已评估） | `official_fuser_delivery_does_not_request_lock_or_killpriv_capabilities`（`node/fuse/dispatch_tests.rs`） |
 | 26 | `statfs` | 本 Node chunk 存储盘的数值，`namemax` 255 | 支持（见已知限制 2） | `statfs_reports_the_local_disk` |

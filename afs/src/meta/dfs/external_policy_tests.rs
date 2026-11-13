@@ -46,6 +46,11 @@ async fn pending_commit(service: &DfsService) -> CommitFileVersion {
             namespace_id,
             parent_inode_id: root.inode_id,
             name: b"external-file".to_vec(),
+            caller: crate::dfs::CallerContext {
+                uid: 0,
+                gid: 0,
+                supplementary_gids: Vec::new(),
+            },
             attributes,
             lease_seconds: 60,
             first_generation: None,

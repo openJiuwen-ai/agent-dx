@@ -537,6 +537,11 @@ async fn native_write_diagnostics_cover_controls_and_keep_cached_placement_local
                         ctime_unix_ms: 0,
                     },
                     None,
+                    crate::dfs::CallerContext {
+                        uid: 0,
+                        gid: 0,
+                        supplementary_gids: Vec::new(),
+                    },
                 )
                 .is_err()
             );

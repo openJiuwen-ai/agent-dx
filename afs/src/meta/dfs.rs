@@ -120,6 +120,9 @@ pub struct CreateFileRequest {
     /// prefix), admitted in the Create transaction so the first write needs no
     /// admission round trip (round 2 B1).
     pub first_generation: Option<OperationId>,
+    /// The identity creating the file: checked against the parent directory
+    /// and the source of the new inode's owner and (setgid-aware) group.
+    pub caller: CallerContext,
 }
 
 impl DfsService {

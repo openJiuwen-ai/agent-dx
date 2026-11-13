@@ -115,6 +115,8 @@ struct RecordingMeta {
     /// the inode on Meta (its revision moves each time).
     metadata_sync_races: AtomicUsize,
     created_generations: Mutex<Vec<Option<OperationId>>>,
+    /// The identity each create carried to Meta.
+    create_callers: Mutex<Vec<CallerContext>>,
     failed_metadata_syncs: Mutex<Vec<SyncInodeMetadata>>,
     next_commit_error: Mutex<Option<Error>>,
     commit_error_after_successes: Mutex<Option<(usize, Error)>>,
@@ -199,6 +201,7 @@ impl RecordingMeta {
             setattr_requests: Mutex::new(Vec::new()),
             metadata_sync_races: AtomicUsize::new(0),
             created_generations: Mutex::new(Vec::new()),
+            create_callers: Mutex::new(Vec::new()),
             failed_metadata_syncs: Mutex::new(Vec::new()),
             next_commit_error: Mutex::new(None),
             commit_error_after_successes: Mutex::new(None),
@@ -434,11 +437,13 @@ impl DfsMeta for RecordingMeta {
         _: &[u8],
         _: InodeAttributes,
         first_generation: Option<&OperationId>,
+        caller: CallerContext,
     ) -> Result<(InodeRecord, WriteLease)> {
         self.created_generations
             .lock()
             .unwrap()
             .push(first_generation.cloned());
+        self.create_callers.lock().unwrap().push(caller);
         Ok((
             self.inode.lock().unwrap().clone(),
             self.lease.lock().unwrap().clone(),
@@ -453,9 +458,16 @@ impl DfsMeta for RecordingMeta {
         attributes: InodeAttributes,
         first_generation: Option<&OperationId>,
         reader: Option<u64>,
+        caller: CallerContext,
     ) -> Result<(InodeRecord, WriteLease, Option<u64>)> {
-        let (inode, lease) =
-            self.create(operation_id, parent, name, attributes, first_generation)?;
+        let (inode, lease) = self.create(
+            operation_id,
+            parent,
+            name,
+            attributes,
+            first_generation,
+            caller,
+        )?;
         let term = reader.and(*self.create_registers.lock().unwrap());
         Ok((inode, lease, term))
     }

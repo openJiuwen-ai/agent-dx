@@ -792,6 +792,9 @@ message DfsCreateRequest {
   // 2 C-1) instead of a durable `open:create-` reference. Requires the session
   // to have reported its readers to this Meta (META_DFS_SESSION_NOT_REPORTED).
   optional uint64 reader = 10;
+  // The identity creating the file. Meta checks it against the parent
+  // directory and derives the new inode's owner and group from it.
+  DfsCallerContext caller = 11;
 }
 
 message DfsCreateReply {

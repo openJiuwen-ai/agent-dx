@@ -855,3 +855,35 @@ fn rename_conflict_retry_is_bounded_and_specific() {
     assert_eq!(error.code(), afs_error::IO_ALREADY_EXISTS);
     assert_eq!(meta.rename_operations.lock().unwrap().len(), 1);
 }
+
+/// Every entry that creates a file (FUSE, the local SDK and usrbio, lazy
+/// preparation) goes through this backend call, which hands the requesting
+/// identity to Meta with its supplementary groups.
+#[test]
+fn create_sends_the_requesting_identity_to_meta() {
+    let (_temp, meta, fs) = test_fs();
+    let ctx = RequestContext {
+        uid: 1000,
+        gid: 1001,
+        supplementary_gids: vec![2000, 3000],
+        ..context()
+    };
+    let created = fs
+        .create(
+            &ctx,
+            fs.root_inode(),
+            OsStr::new("caller-identity"),
+            0o640,
+            libc::O_WRONLY,
+        )
+        .unwrap();
+    assert_eq!(
+        *meta.create_callers.lock().unwrap(),
+        vec![CallerContext {
+            uid: 1000,
+            gid: 1001,
+            supplementary_gids: vec![2000, 3000],
+        }]
+    );
+    fs.release(&ctx, created.handle).unwrap();
+}

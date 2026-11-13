@@ -2229,9 +2229,17 @@ impl Filesystem for AfsFuse {
         let started = std::time::Instant::now();
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
-                backend
-                    .create_with_options(&context, parent_inode, name, mode, flags, options)
-                    .map_err(errno_in(FuseOp::Create))
+                create_resolving_groups(
+                    backend,
+                    context.clone(),
+                    request_groups,
+                    parent_inode,
+                    name,
+                    mode,
+                    flags,
+                    options,
+                )
+                .map_err(errno_in(FuseOp::Create))
             })
         });
         self.trace_elapsed("create", parent.0, started);
@@ -2613,6 +2621,35 @@ fn with_cached_view_size(
         attr.blocks = length.div_ceil(512);
     }
     attr
+}
+
+/// One create on behalf of the kernel caller. The backend checks the caller
+/// against the parent directory, and a FUSE header carries only uid and
+/// primary gid. Resolving supplementary groups reads /proc, so it is paid
+/// only when the backend refuses that identity: the create is then sent once
+/// more with the groups. A refusal leaves nothing behind to undo.
+#[allow(clippy::too_many_arguments)]
+fn create_resolving_groups(
+    backend: &dyn Backend,
+    mut context: RequestContext,
+    groups: impl FnOnce(&RequestContext) -> Vec<u32>,
+    parent: BackendInode,
+    name: &OsStr,
+    mode: u32,
+    flags: i32,
+    options: OpenOptions,
+) -> afs_error::Result<crate::node::vfs::types::CreatedFile> {
+    match backend.create_with_options(&context, parent, name, mode, flags, options) {
+        Err(error) if error.code() == afs_error::IO_PERMISSION_DENIED => {
+            let groups = groups(&context);
+            if groups.is_empty() {
+                return Err(error);
+            }
+            context.supplementary_gids = groups;
+            backend.create_with_options(&context, parent, name, mode, flags, options)
+        }
+        result => result,
+    }
 }
 
 #[cfg(test)]

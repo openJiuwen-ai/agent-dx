@@ -446,11 +446,11 @@ AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集�
 
 **误操作：没停旧 Node 就换了 Meta。** 旧 Node 的心跳重注册会被拒（`META_NODE_PROTOCOL_VERSION`）。旧 Node 把这个错误当可重试处理，最多 25 s 后才失败关闭；协议 8 的 Node 收到它会立即停止。这 25 s 里，旧 Node 的其他请求仍可能打到新 Meta，最坏结果是请求被拒，不会按错误语义执行：
 - 读打开仍用持久的 `UpdateGcReference`，新 Meta 照常接纳；旧 Node 不会向新 Meta 上报读者，闸门会一直关到它的会话过期，GC 只会更保守。
-- Create 不带首个写代，按旧流程处理，写代仍由后续的引用登记接纳。
+- Create 不带调用者身份，新 Meta 以 `InvalidArgument` 拒绝，应用看到建文件失败。
 - setattr 带客户端 revision，新 Meta 按比较并交换执行，和旧语义相同。如果某次 setattr 先由旧 Meta 执行、回复丢失，再向新 Meta 重发，新 Meta 找不到请求摘要，会以 `META_CATALOG_INVALID_REQUEST` 拒绝。这次 setattr 其实已经生效，应用却会看到报错。
 - 元数据同步：新 Meta 要求 inode revision 完全一致。旧 Node 在 revision 不符时直接报错，应用会在 fsync/close 时看到 `EBUSY`。
 
-所以误操作时，可能有少量 setattr、fsync、close 报错，不会写坏数据。
+所以误操作时，建文件会失败，另可能有少量 setattr、fsync、close 报错，不会写坏数据。
 
 ### 运维边界
 

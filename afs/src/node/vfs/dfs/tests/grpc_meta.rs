@@ -248,6 +248,7 @@ impl DfsMeta for CapturingDfsMeta {
         name: &[u8],
         attributes: InodeAttributes,
         first_generation: Option<&OperationId>,
+        caller: CallerContext,
     ) -> Result<(InodeRecord, WriteLease)> {
         DfsMeta::create(
             self.inner.as_ref(),
@@ -256,6 +257,7 @@ impl DfsMeta for CapturingDfsMeta {
             name,
             attributes,
             first_generation,
+            caller,
         )
     }
 
@@ -536,6 +538,64 @@ async fn real_grpc_meta_fixture() -> (
         .initialize_replication_config()
         .await
         .unwrap();
+    // These tests create as an ordinary user directly under the namespace
+    // root, which is root-owned 0755: open it as an administrator would. Meta
+    // creates the root on the first namespace mutation, hence the probe.
+    let dfs = meta.dfs.as_ref().unwrap();
+    dfs.mkdir(crate::dfs::MkdirRequest {
+        caller_id: "node-a".into(),
+        operation_id: crate::dfs::OperationId::new("fixture-root-probe"),
+        namespace_id: crate::dfs::NamespaceId::new("default"),
+        parent_inode_id: crate::dfs::InodeId::new("1"),
+        name: b".fixture-root-probe".to_vec(),
+        attributes: crate::dfs::InodeAttributes {
+            mode: 0o700,
+            uid: 0,
+            gid: 0,
+            nlink: 2,
+            atime_unix_ms: 1,
+            mtime_unix_ms: 1,
+            ctime_unix_ms: 1,
+        },
+        caller: crate::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+    })
+    .await
+    .unwrap();
+    dfs.rmdir(crate::dfs::RmdirRequest {
+        caller_id: "node-a".into(),
+        operation_id: crate::dfs::OperationId::new("fixture-root-probe-remove"),
+        namespace_id: crate::dfs::NamespaceId::new("default"),
+        parent_inode_id: crate::dfs::InodeId::new("1"),
+        name: b".fixture-root-probe".to_vec(),
+        caller: crate::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+    })
+    .await
+    .unwrap();
+    dfs.set_inode_attributes(crate::dfs::SetInodeAttrRequest {
+        caller_id: "node-a".into(),
+        operation_id: crate::dfs::OperationId::new("fixture-open-root"),
+        caller: crate::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+        inode_id: crate::dfs::InodeId::new("1"),
+        expected_inode_revision: None,
+        update: crate::dfs::InodeAttrUpdate {
+            mode: Some(0o1777),
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
     assert!(
         store
             .read(MetaRead::DfsReplicationConfig)
@@ -1401,6 +1461,87 @@ async fn real_grpc_unknown_file_commit_ack_blocks_inode_and_replays_exact_reques
         run_blocking(move || fs.release(&context(), handle_b))
             .await
             .unwrap();
+    }
+    server.abort();
+}
+
+/// Create carries the requesting identity to Meta like mkdir does: Meta, not
+/// the kernel, refuses a caller without write permission on the parent (SDK
+/// and usrbio callers never reach the kernel's check) and gives a file made in
+/// a setgid directory the directory's group.
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_grpc_create_is_checked_and_grouped_by_meta() {
+    let (_temp, endpoint, _gate, server, _store, local, _backend) = real_grpc_meta_fixture().await;
+    let (_meta, _chunks, fs_raw) = grpc_dfs_test_fs(
+        "node-a",
+        "session-a",
+        &endpoint,
+        local,
+        Duration::from_secs(2),
+    )
+    .await;
+    let fs = Arc::new(fs_raw);
+    let root = RequestContext {
+        uid: 0,
+        gid: 0,
+        ..context()
+    };
+    let member = RequestContext {
+        uid: 1000,
+        gid: 1000,
+        supplementary_gids: vec![2000],
+        ..context()
+    };
+    let stranger = RequestContext {
+        uid: 3000,
+        gid: 3000,
+        ..context()
+    };
+    let (group_owned, results) = {
+        let fs = fs.clone();
+        run_blocking(move || {
+            let shared = fs
+                .mkdir(&root, fs.root_inode(), OsStr::new("team"), 0o770)
+                .unwrap();
+            let sgid = AttributeChange {
+                mode: Some(0o2770),
+                gid: Some(2000),
+                ..AttributeChange::default()
+            };
+            fs.setattr(&root, shared.inode, None, &sgid).unwrap();
+            let create = |ctx: &RequestContext, name: &str| {
+                fs.create(ctx, shared.inode, OsStr::new(name), 0o640, libc::O_WRONLY)
+            };
+            let created = create(&member, "member.txt").unwrap();
+            let attributes = created.entry.attributes.clone();
+            fs.release(&member, created.handle).unwrap();
+            let denied = create(&stranger, "stranger.txt").map(|_| ());
+            let locked = fs
+                .mkdir(&root, fs.root_inode(), OsStr::new("locked"), 0o755)
+                .unwrap();
+            let read_only_parent = fs
+                .create(
+                    &stranger,
+                    locked.inode,
+                    OsStr::new("stranger.txt"),
+                    0o640,
+                    libc::O_WRONLY,
+                )
+                .map(|_| ());
+            (attributes, [denied, read_only_parent])
+        })
+        .await
+    };
+    assert_eq!(group_owned.uid, 1000);
+    assert_eq!(
+        group_owned.gid, 2000,
+        "a file created in a setgid directory takes the directory's group"
+    );
+    for result in results {
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED, "{error}");
+        assert_eq!(crate::error::errno(&error), libc::EACCES);
     }
     server.abort();
 }

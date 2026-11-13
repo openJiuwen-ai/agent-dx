@@ -203,3 +203,121 @@ fn non_dfs_policies_keep_uncached_entry_replies() {
     let fs = AfsFuse::new(Arc::new(EmptyBackend));
     assert_eq!(fs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
 }
+
+use crate::node::vfs::types::{CreatedFile, Entry};
+
+/// A create backend that, like Meta, admits only callers holding group 2000.
+#[derive(Default)]
+struct GroupGatedCreate {
+    seen: Mutex<Vec<Vec<u32>>>,
+}
+impl Backend for GroupGatedCreate {
+    fn root_inode(&self) -> BackendInode {
+        BackendInode { value: 1 }
+    }
+    fn create_with_options(
+        &self,
+        ctx: &RequestContext,
+        parent: BackendInode,
+        _: &OsStr,
+        _: u32,
+        _: i32,
+        _: OpenOptions,
+    ) -> afs_error::Result<CreatedFile> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(ctx.supplementary_gids.clone());
+        if ctx.gid != 2000 && !ctx.supplementary_gids.contains(&2000) {
+            return Err(Error::coded(afs_error::IO_PERMISSION_DENIED, "denied"));
+        }
+        Ok(CreatedFile {
+            entry: Entry {
+                inode: parent,
+                attributes: FileAttributes {
+                    kind: FileKind::Regular,
+                    size: 0,
+                    blocks: 0,
+                    mode: 0o640,
+                    uid: ctx.uid,
+                    gid: ctx.gid,
+                    nlink: 1,
+                    atime: UNIX_EPOCH,
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                },
+            },
+            handle: FileHandle(7),
+        })
+    }
+}
+
+fn create_context(gid: u32) -> RequestContext {
+    RequestContext {
+        uid: 1000,
+        gid,
+        pid: 1,
+        umask: 0,
+        supplementary_gids: Vec::new(),
+    }
+}
+
+fn create_through(
+    backend: &GroupGatedCreate,
+    gid: u32,
+    groups: &[u32],
+    lookups: &std::sync::atomic::AtomicUsize,
+) -> afs_error::Result<CreatedFile> {
+    create_resolving_groups(
+        backend,
+        create_context(gid),
+        |_| {
+            lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            groups.to_vec()
+        },
+        BackendInode { value: 1 },
+        OsStr::new("f"),
+        0o640,
+        libc::O_WRONLY,
+        OpenOptions {
+            kill_suidgid: false,
+        },
+    )
+}
+
+/// FUSE headers carry no supplementary groups and resolving them reads
+/// /proc. A create pays for that only when the backend refuses the caller's
+/// uid and primary gid: then it is sent once more with the groups, so a file
+/// in a directory writable through a supplementary group can still be created.
+#[test]
+fn create_resolves_supplementary_groups_only_after_a_denial() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let lookups = AtomicUsize::new(0);
+
+    let backend = GroupGatedCreate::default();
+    create_through(&backend, 2000, &[3000], &lookups).unwrap();
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        0,
+        "no /proc read on success"
+    );
+    assert_eq!(*backend.seen.lock().unwrap(), vec![Vec::<u32>::new()]);
+
+    let backend = GroupGatedCreate::default();
+    create_through(&backend, 1000, &[2000, 3000], &lookups).unwrap();
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *backend.seen.lock().unwrap(),
+        vec![Vec::new(), vec![2000, 3000]]
+    );
+
+    for groups in [vec![3000], Vec::new()] {
+        let backend = GroupGatedCreate::default();
+        let error = match create_through(&backend, 1000, &groups, &lookups) {
+            Ok(_) => panic!("a caller outside the group stays denied"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED);
+        assert!(backend.seen.lock().unwrap().len() <= 2, "at most one retry");
+    }
+}

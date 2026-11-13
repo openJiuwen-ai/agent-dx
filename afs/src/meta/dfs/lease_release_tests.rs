@@ -31,6 +31,11 @@ async fn fixture(lease_seconds: u64) -> (DfsService, InodeRecord, WriteLease) {
             },
             lease_seconds,
             first_generation: None,
+            caller: crate::dfs::CallerContext {
+                uid: 0,
+                gid: 0,
+                supplementary_gids: Vec::new(),
+            },
         })
         .await
         .unwrap();

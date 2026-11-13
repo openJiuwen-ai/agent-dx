@@ -60,6 +60,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         name: &[u8],
         attributes: crate::dfs::InodeAttributes,
         first_generation: Option<&crate::dfs::OperationId>,
+        caller: crate::dfs::CallerContext,
     ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease)> {
         self.create_registered(
             operation_id,
@@ -68,6 +69,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
             attributes,
             first_generation,
             None,
+            caller,
         )
         .map(|(inode, lease, _)| (inode, lease))
     }
@@ -80,6 +82,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         attributes: crate::dfs::InodeAttributes,
         first_generation: Option<&crate::dfs::OperationId>,
         reader: Option<u64>,
+        caller: crate::dfs::CallerContext,
     ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease, Option<u64>)> {
         self.read_diagnostic(
             crate::node::metrics::read_timing::ReadDiagnosticStage::MetaCreate,
@@ -97,6 +100,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                         first_generation_operation_id:
                             first_generation.map(|generation| generation.0.clone()),
                         reader,
+                        caller: Some(wire_dfs_caller_context(caller)),
                     }))?
                     .into_inner();
                 Ok((

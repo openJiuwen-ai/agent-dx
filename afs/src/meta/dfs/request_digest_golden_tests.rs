@@ -169,6 +169,7 @@ fn cases() -> Vec<(&'static str, String, String)> {
                 attributes: attributes(),
                 lease_seconds: 30,
                 first_generation: None,
+                caller: caller(),
             },
         ),
         case(
@@ -308,6 +309,7 @@ fn cases() -> Vec<(&'static str, String, String)> {
                 attributes: attributes(),
                 lease_seconds: 30,
                 first_generation: Some(OperationId::new("afs1-1-session-a-native-generation-1")),
+                caller: caller(),
             },
         ),
         case("set_inode_attributes_current", &set_attributes(None)),
@@ -337,8 +339,8 @@ fn set_attributes(expected_inode_revision: Option<u64>) -> SetInodeAttrRequest {
 const GOLDEN: &[(&str, &str, &str)] = &[
     (
         "create",
-        r#"{"caller_id":"node-a","owner_session_id":"session-a","operation_id":"op","namespace_id":"ns","parent_inode_id":"1","name":[102,105,108,101],"attributes":{"mode":33188,"uid":1000,"gid":1001,"nlink":1,"atime_unix_ms":11,"mtime_unix_ms":12,"ctime_unix_ms":13},"lease_seconds":30,"first_generation":null}"#,
-        "099bb2c0c27cc850e66005f9bc8ce9ed5aa9d01ba34d92acd892728cf41d203f",
+        r#"{"caller_id":"node-a","owner_session_id":"session-a","operation_id":"op","namespace_id":"ns","parent_inode_id":"1","name":[102,105,108,101],"attributes":{"mode":33188,"uid":1000,"gid":1001,"nlink":1,"atime_unix_ms":11,"mtime_unix_ms":12,"ctime_unix_ms":13},"lease_seconds":30,"first_generation":null,"caller":{"uid":1000,"gid":1001,"supplementary_gids":[10,20]}}"#,
+        "36e4c542a1412635571ccc6630a6e0e5c1af95f92c1324fc777c5a9c454bd3e0",
     ),
     (
         "mkdir",
@@ -397,8 +399,8 @@ const GOLDEN: &[(&str, &str, &str)] = &[
     ),
     (
         "create_with_first_generation",
-        r#"{"caller_id":"node-a","owner_session_id":"session-a","operation_id":"op","namespace_id":"ns","parent_inode_id":"1","name":[102,105,108,101],"attributes":{"mode":33188,"uid":1000,"gid":1001,"nlink":1,"atime_unix_ms":11,"mtime_unix_ms":12,"ctime_unix_ms":13},"lease_seconds":30,"first_generation":"afs1-1-session-a-native-generation-1"}"#,
-        "97c5f253774de9aac1d14b1db275d5e881573e5133fddd50684a14d2d3733e38",
+        r#"{"caller_id":"node-a","owner_session_id":"session-a","operation_id":"op","namespace_id":"ns","parent_inode_id":"1","name":[102,105,108,101],"attributes":{"mode":33188,"uid":1000,"gid":1001,"nlink":1,"atime_unix_ms":11,"mtime_unix_ms":12,"ctime_unix_ms":13},"lease_seconds":30,"first_generation":"afs1-1-session-a-native-generation-1","caller":{"uid":1000,"gid":1001,"supplementary_gids":[10,20]}}"#,
+        "65dd159353673cd28b7d45ca4680bdccb4f8df6200111239e4ac20874618a785",
     ),
     (
         "set_inode_attributes_current",

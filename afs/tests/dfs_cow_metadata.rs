@@ -36,6 +36,11 @@ fn create_request(operation: impl Into<String>, name: impl Into<Vec<u8>>) -> Cre
         attributes: attrs(),
         lease_seconds: 30,
         first_generation: None,
+        caller: afs::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
     }
 }
 

@@ -500,6 +500,7 @@ impl Backend for DistributedFs {
                 attributes_of.clone(),
                 first_generation.as_ref().map(|(generation, _)| generation),
                 reader,
+                caller_context(ctx),
             )
         };
         let created = match create() {

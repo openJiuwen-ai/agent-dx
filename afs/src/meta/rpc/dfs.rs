@@ -253,6 +253,9 @@ impl DfsMetaService for DfsMetaRpc {
         let attributes = request
             .attributes
             .ok_or_else(|| invalid("DFS create requires attributes"))?;
+        let caller = request
+            .caller
+            .ok_or_else(|| invalid("DFS create requires caller context"))?;
         let (inode, lease, meta_term) = dfs_service(&self.0)?
             .create_registered(
                 CreateFileRequest {
@@ -267,6 +270,7 @@ impl DfsMetaService for DfsMetaRpc {
                     first_generation: request
                         .first_generation_operation_id
                         .map(crate::dfs::OperationId::new),
+                    caller: domain_caller_context(caller),
                 },
                 request.reader,
             )

@@ -37,11 +37,13 @@ pub trait DfsMeta: Send + Sync {
         name: &[u8],
         attributes: InodeAttributes,
         first_generation: Option<&OperationId>,
+        caller: CallerContext,
     ) -> Result<(InodeRecord, WriteLease)>;
     /// `create` with the opened handle registered as in-memory reader
     /// `reader` (round 2 C-1). The third value is the Meta writer term when
     /// Meta registered it; `None`: the caller pins the handle itself. The
     /// default registers nothing.
+    #[allow(clippy::too_many_arguments)]
     fn create_registered(
         &self,
         operation_id: &OperationId,
@@ -50,9 +52,17 @@ pub trait DfsMeta: Send + Sync {
         attributes: InodeAttributes,
         first_generation: Option<&OperationId>,
         _reader: Option<u64>,
+        caller: CallerContext,
     ) -> Result<(InodeRecord, WriteLease, Option<u64>)> {
-        self.create(operation_id, parent, name, attributes, first_generation)
-            .map(|(inode, lease)| (inode, lease, None))
+        self.create(
+            operation_id,
+            parent,
+            name,
+            attributes,
+            first_generation,
+            caller,
+        )
+        .map(|(inode, lease)| (inode, lease, None))
     }
     fn get_inode(&self, inode_id: &InodeId) -> Result<InodeRecord>;
     /// Round 2 B2: resolve `inode_id` for a read open (checking that
