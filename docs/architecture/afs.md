@@ -312,7 +312,9 @@ stateDiagram-v2
 
 `InodeRecord.head_version` 指向当前版本；`FileVersion{parent_version, length, layout_root}` 只记血缘，不作为保留理由。
 写租约（`WriteLease{owner_node_id, owner_session_id, lease_epoch, expires_at}`）由 `meta/dfs/write_lease.rs` 授予：
-别人持有有效租约时冲突；换主或过期时 `lease_epoch` 加一；同主续期取较晚到期。提交还要求写代引用 `write:<代>`
+别人持有有效租约时返回对方的租约（调用方走代理）；换主或过期时 `lease_epoch` 加一；同主续期取较晚到期。
+取得租约的事务以"租约实体未变"为条件；条件失败时（GC 删掉了过期租约，或别的节点先取得）重新解析，至多 16 次，
+重读到别人的有效租约就返回它，耗尽才报 `META_DFS_CONFLICT`。过期的租约实体会被 GC 删除，删除后再取得的租约 epoch 从 1 起。提交还要求写代引用 `write:<代>`
 属于写者当前会话（写代 fence）。
 
 ### GC 引用与回收代
@@ -507,7 +509,7 @@ Bao sidecar、Peer cache 条目与目录标记、外部对象 key 前缀、Owner
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
 - **协议 8 已提供、Node 尚未调用的 RPC**：`DfsMeta.ReleaseWriteLeases`（`meta/dfs/lease_release.rs`）按批归还写租约。
-  只归还与 Node 出示的副本完全相同的租约：把到期时间改为当前，epoch 不变，下次取得时 epoch 加一；
+  只归还与 Node 出示的副本完全相同的租约：把到期时间改为当前，epoch 不变，下次取得时 epoch 加一（过期实体已被 GC 删除时从 1 起，与自然过期相同）；
   不再相同的租约跳过、算成功。整批是一个事务，按 operation id 重放。
   结果记在 `DfsRenewWriteLease` 操作下（归还即"续到现在"），所以 WAL 与 checkpoint 编码不变。
   Node 侧在最后一个写者关闭时调用它，是以后的事（R106），届时不需要升协议。

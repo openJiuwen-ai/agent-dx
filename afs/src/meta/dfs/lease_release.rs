@@ -5,8 +5,11 @@
 //! Provided by Meta from cluster protocol 8; Nodes do not call it yet (R106).
 //! Enabling the Node side later needs no protocol change. A release ends a
 //! lease by moving its expiry to now: the entity stays, its epoch unchanged,
-//! so the next acquire finds it expired and takes the next epoch (epochs are
-//! never reused; a proxy session on the old epoch is fenced). Each lease is
+//! so the next acquire finds it expired and takes the next epoch, which
+//! fences a proxy session on the old one. (GC deletes expired lease
+//! entities; an acquire after that starts again at epoch 1, as after any
+//! expiry. The fence is the owner, its session and the epoch together.) Each
+//! lease is
 //! released only if it still equals, field for field, the copy the Node
 //! presents: a renewal or re-acquire by the same owner moves the expiry and
 //! makes a late release a no-op. A lease that does not match is skipped, not
