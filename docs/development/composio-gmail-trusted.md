@@ -26,6 +26,22 @@ Those checks compiled the actual Relay adapter but used controlled provider/
 authority ports; real Rust-to-M44 composition, formal startup, persisted runtime
 connector identity, full workspace gates and real Outlook are still incomplete.
 
+The normal connector carrier is now validated across repositories against the
+actual existing HTTPS identity service and persisted PG grant. The explicitly
+run ignored test `normal_connector_recovers_over_real_https_after_access_expiry_without_mobile`
+passed once (334 filtered). The original signer constructed an access-expired
+normal credential by changing only exp on the same actually admitted grant;
+neither the service clock nor database recovery expiry was changed. Independent
+Python consumer processes renewed/verified/saved it, restarted from its private
+file, then refused it after the current Binding generation changed. Database
+assertions found zero mobile sessions and one grant. Consumer source and ADX
+inputs were hashed before/after with zero changes; the task-owned PG was stopped
+after UID/executable/data-path/PID verification.
+
+Binding observations remain controlled. This case does not contain an accepted
+ingestion batch, M44 read, actual Outlook account or report endpoint, so it does
+not close the accepted-mail-to-report recovery or production startup gates.
+
 Delivery alignment: draft ADX #268 now carries both the trusted Composio adapter
 and the separate ingestion coordination module, in the existing DigitalMateGateway
 process outside user sandboxes. No additional service or coordinator PR is

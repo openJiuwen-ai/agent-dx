@@ -30,6 +30,10 @@ mod purpose_tests;
 #[path = "privacy_delivery_tests.rs"]
 mod delivery_tests;
 
+#[cfg(all(test, unix))]
+#[path = "composio/runtime_identity_tests.rs"]
+mod runtime_identity_tests;
+
 pub(crate) fn now() -> Result<i64, Error> {
     i64::try_from(
         SystemTime::now()
