@@ -86,6 +86,24 @@ impl TokenSigner {
     fn sign_delivery(&self, claims: &DeliveryClaims) -> Result<Zeroizing<String>, Error> {
         self.sign_payload("dm-ingestion-v1", claims)
     }
+
+    pub(super) fn sign_owner(
+        &self,
+        claims: &super::connector_owner::OwnerClaims,
+    ) -> Result<Zeroizing<String>, Error> {
+        self.sign_payload(super::connector_owner::PREFIX, claims)
+    }
+
+    pub(super) fn verify_owner(
+        &self,
+        token: &str,
+    ) -> Result<super::connector_owner::OwnerClaims, Error> {
+        let bytes = self.verify_payload(token, super::connector_owner::PREFIX)?;
+        let claims: super::connector_owner::OwnerClaims =
+            serde_json::from_slice(&bytes).map_err(|_| Error::Unauthorized)?;
+        claims.validate(&self.tenant)?;
+        Ok(claims)
+    }
     fn sign_payload<T: Serialize>(
         &self,
         prefix: &str,
@@ -296,6 +314,24 @@ impl PrivacyIdentity {
         }
         self.current_binding(&claims.id, &grant).await?;
         Ok((claims, grant))
+    }
+
+    pub(super) async fn owner_connector_grant(
+        &self,
+        token: &str,
+    ) -> Result<(StoredPrivacyGrant, String, i64), Error> {
+        let (claims, grant) = self.connector_grant(token, false).await?;
+        Ok((grant, claims.id, claims.exp))
+    }
+
+    pub(super) async fn owner_grant(&self, id: &str) -> Result<StoredPrivacyGrant, Error> {
+        let grant = self
+            .store
+            .privacy_get_grant(id)
+            .await?
+            .ok_or(Error::Unauthorized)?;
+        self.current_binding(id, &grant).await?;
+        Ok(grant)
     }
 
     async fn current_binding(&self, id: &str, grant: &StoredPrivacyGrant) -> Result<(), Error> {

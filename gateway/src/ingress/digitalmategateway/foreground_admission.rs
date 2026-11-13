@@ -94,6 +94,10 @@ impl ForegroundAdmission {
 }
 
 impl ForegroundIdentity {
+    pub(super) fn principal(&self) -> &accounts::Principal {
+        &self.guard.principal
+    }
+
     pub fn tenant(&self) -> &str {
         &self.scope.tenant
     }
@@ -113,3 +117,7 @@ impl ForegroundIdentity {
         self.guard.check().await
     }
 }
+
+#[cfg(test)]
+#[path = "connector_owner_tests.rs"]
+mod owner_purpose_tests;

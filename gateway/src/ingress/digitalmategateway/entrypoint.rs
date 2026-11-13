@@ -272,6 +272,34 @@ impl DigitalMateGatewayApi {
         )
     }
 
+    /// Narrow owner-call issuer; available only with the configured existing
+    /// DigitalMate identity HTTPS service. No signing key leaves that service.
+    #[cfg(unix)]
+    pub fn authorization_owner(
+        &self,
+    ) -> accounts::Result<Arc<super::connector_owner::OwnerAuthority>> {
+        self.privacy
+            .as_ref()
+            .and_then(|runtime| runtime.authorization_owner.clone())
+            .ok_or(accounts::Error::Unavailable)
+    }
+
+    /// Authenticate the existing connector workload purpose, independently of
+    /// mobile sessions. Connection intent/read permission is not implied.
+    #[cfg(unix)]
+    pub async fn connector_workload_identity(
+        &self,
+        headers: &http::HeaderMap,
+    ) -> accounts::Result<super::connector_owner::ConnectorWorkloadIdentity> {
+        let identity = self
+            .privacy
+            .as_ref()
+            .ok_or(accounts::Error::Unavailable)?
+            .identity
+            .clone();
+        super::connector_owner::ConnectorWorkloadIdentity::authenticate(identity, headers).await
+    }
+
     pub fn new(
         config: DigitalMateGatewayConfig,
         managed: Arc<ManagedService>,
@@ -359,6 +387,14 @@ impl DigitalMateGatewayApi {
                 Zeroizing::new(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| invalid())?);
             let store = auth.privacy_store().ok_or_else(invalid)?;
             let reader = Arc::new(super::privacy_center::ManagedBindingReader(managed.clone()));
+            let owner = config
+                .digitalmate
+                .clone()
+                .filter(|application| application.template == settings.template)
+                .map(|application| super::connector_owner::OwnerRuntimeConfig {
+                    application,
+                    auth: auth.clone(),
+                });
             Some(
                 super::privacy_runtime::PrivacyRuntime::start(
                     settings,
@@ -367,6 +403,7 @@ impl DigitalMateGatewayApi {
                     &key,
                     &config.tenant,
                     inbox,
+                    owner,
                 )
                 .map_err(|_| {
                     Error::Unavailable("DigitalMate privacy service initialization failed".into())

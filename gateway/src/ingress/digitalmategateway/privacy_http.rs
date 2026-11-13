@@ -57,10 +57,18 @@ struct ExportRequest {
     revision: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerCheckRequest {
+    operation: super::connector_owner::OwnerOperation,
+    body_sha256: String,
+}
+
 pub(crate) struct PrivacyHttp {
     center: Arc<PrivacyCenter>,
     identity: Arc<super::privacy_grants::PrivacyIdentity>,
     ingestion: Option<Arc<super::privacy_grants::DeliveryIdentity>>,
+    authorization_owner: Option<Arc<super::connector_owner::OwnerAuthority>>,
 }
 impl PrivacyHttp {
     pub fn new(
@@ -71,6 +79,7 @@ impl PrivacyHttp {
             center,
             identity,
             ingestion: None,
+            authorization_owner: None,
         }
     }
 
@@ -79,6 +88,14 @@ impl PrivacyHttp {
         ingestion: Arc<super::privacy_grants::DeliveryIdentity>,
     ) -> Self {
         self.ingestion = Some(ingestion);
+        self
+    }
+
+    pub(crate) fn with_authorization_owner(
+        mut self,
+        owner: Arc<super::connector_owner::OwnerAuthority>,
+    ) -> Self {
+        self.authorization_owner = Some(owner);
         self
     }
 
@@ -125,11 +142,19 @@ impl PrivacyHttp {
         {
             return Err(Error::Invalid);
         }
-        let token = Zeroizing::new(accounts::bearer(request.headers())?.to_owned());
         let path = request.uri().path().to_owned();
+        let token = Zeroizing::new(
+            if path == super::connector_owner::VERIFY_PATH {
+                super::connector_owner::bearer(request.headers())?
+            } else {
+                accounts::bearer(request.headers())?
+            }
+            .to_owned(),
+        );
         if !matches!(
             path.as_str(),
             "/v1/secret/get"
+                | "/v1/connector/authorization-owner"
                 | "/v1/identity/renew"
                 | "/v1/connector/identity"
                 | "/v1/connector/renew"
@@ -153,6 +178,29 @@ impl PrivacyHttp {
             .map_err(|_| Error::Invalid)?
             .to_bytes();
         match path.as_str() {
+            "/v1/connector/authorization-owner" => {
+                if bytes.len() > 512 {
+                    return Err(Error::Invalid);
+                }
+                let input: OwnerCheckRequest =
+                    serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
+                if !super::connector_owner::digest_valid(&input.body_sha256) {
+                    return Err(Error::Invalid);
+                }
+                let owner = self
+                    .authorization_owner
+                    .as_ref()
+                    .ok_or(Error::Unavailable)?;
+                let checked = owner
+                    .verify(
+                        &token,
+                        input.operation,
+                        &input.body_sha256,
+                        Some(&self.identity),
+                    )
+                    .await?;
+                Ok(response(StatusCode::OK, checked))
+            }
             "/v1/ingestion/admit" | "/v1/ingestion/bootstrap" => {
                 if bytes.as_ref() != b"{}" {
                     return Err(Error::Invalid);
@@ -340,6 +388,7 @@ impl PrivacyHttp {
 
 fn operation_label(path: &str) -> &'static str {
     match path {
+        "/v1/connector/authorization-owner" => "authorization_owner",
         "/v1/identity/renew" => "renew",
         "/v1/connector/identity" => "connector_identity",
         "/v1/connector/renew" => "connector_renew",

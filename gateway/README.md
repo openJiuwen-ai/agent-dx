@@ -707,6 +707,29 @@ initializing a Binding/Environment or requesting model credentials. It supplies
 no background, arbitrary-tool or model permission; connector handlers retain
 their own operation and connection checks.
 
+On Unix, `DigitalMateGatewayApi::authorization_owner()` exposes the fixed M44
+authorization-owner issuer when the existing privacy HTTPS service is configured
+for the DigitalMate template. `foreground_headers(&ForegroundIdentity,
+OwnerOperation, raw_body)` rechecks the actual business session and current
+Binding. `connector_workload_identity(&HeaderMap)` instead verifies the existing
+connector-purpose grant, independently of phone sessions. Its
+`workload_headers(&ConnectorWorkloadIdentity, OwnerOperation, raw_body)` permits
+only `connection`, `metadata` and `intent` queries; actual connection permission,
+enabled intent and connection generation/revision remain the caller's checks.
+
+Both issuers reuse the existing signer and grant/session owners. A credential
+expires within 30 seconds and fixes the actor, operation, SHA-256 of the raw HTTP
+entity bytes, scope, workspace, Binding generation, Environment and service port.
+Send `OwnerAuthorization::headers()` only to the packet's exact routing snapshot,
+using `POST /internal/digitalmate/connectors/v1/authorization-owner`; do not retry
+a sent owner write on another route. The existing HTTPS listener verifies it at
+`POST /v1/connector/authorization-owner` with JSON
+`{"operation":"current","body_sha256":"<lowercase SHA-256 hex>"}` and rechecks
+the current session/grant and Binding before returning the verified fields.
+This purpose cannot decrypt privacy settings or authorize provider mail reads.
+Malformed requests return the existing account error envelope; invalid or revoked
+credentials fail closed, and unavailable identity owners return service unavailable.
+
 ### Existing Jiuwen protocol and accounts
 
 Build with `--features agent-api`. Configure `ADX_JIUWEN_CONFIG` using

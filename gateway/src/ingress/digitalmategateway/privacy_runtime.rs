@@ -23,6 +23,7 @@ mod implementation {
         pub identity: Arc<PrivacyIdentity>,
         pub center: Arc<PrivacyCenter>,
         pub delivery: Option<Arc<super::super::privacy_grants::DeliveryIdentity>>,
+        pub authorization_owner: Option<Arc<super::super::connector_owner::OwnerAuthority>>,
         shutdown: watch::Sender<bool>,
         listener: JoinHandle<()>,
     }
@@ -34,6 +35,7 @@ mod implementation {
             root: &[u8; 32],
             tenant: &str,
             inbox: Option<super::super::ingestion::Inbox>,
+            owner: Option<super::super::connector_owner::OwnerRuntimeConfig>,
         ) -> Result<Self, Error> {
             tokio::runtime::Handle::try_current().map_err(|_| Error::Configuration)?;
             let cipher = PrivacyCipher::new(
@@ -56,6 +58,18 @@ mod implementation {
             let listener =
                 tokio::net::TcpListener::from_std(listener).map_err(|_| Error::Unavailable)?;
             let signer = Arc::new(TokenSigner::new(root, tenant));
+            let authorization_owner = owner
+                .map(|owner| {
+                    super::super::connector_owner::OwnerAuthority::new(
+                        tenant.into(),
+                        owner.application,
+                        signer.clone(),
+                        bindings.clone(),
+                        owner.auth,
+                    )
+                    .map(Arc::new)
+                })
+                .transpose()?;
             let identity = Arc::new(PrivacyIdentity::new(
                 config.template,
                 store.clone(),
@@ -78,6 +92,9 @@ mod implementation {
             if let Some(delivery) = &delivery {
                 http = http.with_ingestion(delivery.clone());
             }
+            if let Some(owner) = &authorization_owner {
+                http = http.with_authorization_owner(owner.clone());
+            }
             let http = Arc::new(http);
             let (shutdown, receiver) = watch::channel(false);
             let listener = tokio::spawn(async move {
@@ -89,6 +106,7 @@ mod implementation {
                 identity,
                 center,
                 delivery,
+                authorization_owner,
                 shutdown,
                 listener,
             })
