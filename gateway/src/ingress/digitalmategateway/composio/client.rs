@@ -15,11 +15,12 @@ const MAX_RESPONSE: usize = 1_048_576;
 const GMAIL: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const GMAIL_HEADERS: [&str; 5] = ["Subject", "From", "To", "Date", "Message-ID"];
 
+#[derive(Clone)]
 pub(super) struct Client {
     http: reqwest::Client,
     pub(super) origin: String,
     auth_configs: MailAuthConfigs,
-    budget: Arc<dyn Budget>,
+    pub(super) budget: Arc<dyn Budget>,
 }
 
 // Only safe account metadata is deserialized. Unknown fields (including token
@@ -125,7 +126,9 @@ impl Client {
         body: Option<Value>,
         effect: bool,
     ) -> Result<Value, Error> {
+        scope.check_bound_foreground().await?;
         self.budget.acquire(scope).await?;
+        scope.check_bound_foreground().await?;
         let mut request = self.http.request(method, format!("{}{path}", self.origin));
         if let Some(value) = body {
             request = request.json(&value);
@@ -192,6 +195,7 @@ impl Client {
         if effect && !result.is_object() {
             return Err(Error::OutcomeUnknown);
         }
+        scope.check_bound_foreground().await?;
         json_object(result)
     }
 

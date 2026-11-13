@@ -1,6 +1,8 @@
 # Composio mail trusted module candidate
 
-Status: Gmail/Outlook authorization/read routes remain **unwired and undeployed**.
+Status: an explicit trusted client can mount the authorization/read adapter at
+the actual authenticated entry. Production configuration/owner/budget assembly
+and deployment remain unfinished.
 The separate ingestion module now has explicit existing-process startup assembly.
 Development baseline includes official master `d86a2ee9` and merged #179.
 Branch: `feat/gmail-composio-trusted`. Phase B extends the existing configuration
@@ -302,3 +304,37 @@ participated; Authority/Budget/provider responses were controlled. Real M44
 durable claims, actual authenticated route mounting, real browser return and
 real Outlook mailbox delivery remain unverified. Full-workspace Clippy and PG
 were not rerun for this increment; earlier receipts retain their exact inputs.
+
+## Actual foreground entry and current-session checks
+
+`DigitalMateGatewayApi::with_composio` explicitly supplies a real client built
+with Authority and shared Budget. The actual Ingress dispatcher recognizes the
+fixed connector routes; they return404 without that assembly. Admission uses
+the configured DigitalMate application and actual ForegroundAdmission, then
+reads at most16KiB within10 seconds and rechecks the session before dispatch and
+before returning. JSON cannot construct tenant/user/workspace or select config.
+
+`Scope::from_foreground_identity` retains the real session guard. Every physical
+Composio request checks it before the budget, after a possible budget wait, and
+before returning content. Real owner issuers require `foreground_identity()`;
+detached namespace fields cannot substitute for it. The public browser landing
+remains static, GET-only, no-store and performs no confirmation or echo of query
+secrets. Existing WebSocket/login routes are unchanged.
+
+The composed source includes actual identity producer71ae71b2 and its persisted
+PG/HTTPS proof252df9bb (locally952e9450/4f2e8295). With existing agent-api,mock-e2e
+test features,8 foreground cases pass,54 Composio/budget cases pass with1 ignored,
+and the same actual Gateway binary passes313 cases with16 ignored. Scope/session,
+managed target and actual dispatcher participate; account/Environment/provider
+services remain controlled. This does not establish real M44 HTTP consumption,
+App start/state/confirm, browser return, managed Outlook or deployment.
+
+An initial agent-api-only run compiled but selected0 foreground cases because
+the repository places that module under mock-e2e; it was correctly refused as
+verification. The rerun uses the existing feature rather than changing its gate.
+Its original six-file fmt check refused CRLF worktree bytes; only those line
+endings were normalized to LF and the same six-file formatter check then passes.
+The successful test process also emitted an existing Orbit WebSocket fixture
+SendError panic from an unchanged file while returning0; that observation is
+retained separately rather than reported as a panic-free run. Full-workspace
+Clippy, real two-side HTTPS and PG are still unrun for this new mounted source.

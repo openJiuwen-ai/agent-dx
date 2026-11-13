@@ -243,6 +243,7 @@ pub struct DigitalMateGatewayApi {
     config: DigitalMateGatewayConfig,
     auth: Arc<dyn BusinessAuth>,
     managed: Arc<ManagedService>,
+    composio: Option<Arc<super::composio::Composio>>,
     #[cfg(unix)]
     privacy: Option<super::privacy_runtime::PrivacyRuntime>,
     #[cfg(unix)]
@@ -256,6 +257,66 @@ struct PreparedIngestion {
     verifier: Arc<super::composio::WebhookVerifier>,
 }
 impl DigitalMateGatewayApi {
+    /// Explicit trusted assembly. The caller must supply the real M44 Authority
+    /// and shared budget; no user request can construct or replace this client.
+    pub fn with_composio(mut self, gateway: Arc<super::composio::Composio>) -> Result<Self, Error> {
+        self.foreground_admission().map_err(|_| invalid())?;
+        self.composio = Some(gateway);
+        Ok(self)
+    }
+
+    pub(crate) async fn connector_request<B>(&self, request: Request<B>) -> Response<ProxyBody>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let Some(gateway) = &self.composio else {
+            return error(StatusCode::NOT_FOUND, "NOT_FOUND");
+        };
+        if request.uri().path() == super::composio::http::CALLBACK_PATH {
+            if request.method() != http::Method::GET {
+                return error(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
+            }
+            return super::composio::http::callback_landing()
+                .map(|value| value.map_err(|never| match never {}).boxed_unsync());
+        }
+        let admission = match self.foreground_admission() {
+            Ok(value) => value,
+            Err(failure) => return auth_error(failure),
+        };
+        let identity = match admission.authenticate(request.headers()).await {
+            Ok(value) => value,
+            Err(failure) => return auth_error(failure),
+        };
+        let (parts, incoming) = request.into_parts();
+        let bytes = match tokio::time::timeout(
+            Duration::from_secs(10),
+            Limited::new(incoming, 16_384).collect(),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value.to_bytes(),
+            Ok(Err(_)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "INVALID_REQUEST"),
+            Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "INVALID_REQUEST"),
+        };
+        if let Err(failure) = identity.check().await {
+            return auth_error(failure);
+        }
+        let scope = match super::composio::Scope::from_foreground_identity(identity.clone()) {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::FORBIDDEN, "FORBIDDEN"),
+        };
+        let response = super::composio::http::handle(
+            gateway,
+            &scope,
+            Request::from_parts(parts, Full::new(bytes)),
+        )
+        .await;
+        if let Err(failure) = identity.check().await {
+            return auth_error(failure);
+        }
+        response.map(|value| value.map_err(|never| match never {}).boxed_unsync())
+    }
     /// Foreground connector admission uses only the configured DigitalMate
     /// application. It never falls back to Jiuwen or Orbit or reads model keys.
     pub fn foreground_admission(
@@ -416,6 +477,7 @@ impl DigitalMateGatewayApi {
             auth,
             config,
             managed,
+            composio: None,
             #[cfg(unix)]
             privacy,
             #[cfg(unix)]
@@ -464,25 +526,32 @@ impl DigitalMateGatewayApi {
         Ok(Some(runtime))
     }
     pub fn matches(path: &str) -> bool {
-        matches!(
-            path,
-            "/ws"
-                | "/orbit/ws"
-                | "/digitalmate/ws"
-                | "/file-api/download"
-                | "/file-api/upload"
-                | "/api/v1/auth/huawei/login"
-                | "/api/v1/auth/agc/login"
-                | "/api/v1/auth/session"
-                | "/api/v1/auth/logout"
-                | "/api/v1/auth/quota"
-        )
+        super::composio::http::matches(path)
+            || path == super::composio::http::CALLBACK_PATH
+            || matches!(
+                path,
+                "/ws"
+                    | "/orbit/ws"
+                    | "/digitalmate/ws"
+                    | "/file-api/download"
+                    | "/file-api/upload"
+                    | "/api/v1/auth/huawei/login"
+                    | "/api/v1/auth/agc/login"
+                    | "/api/v1/auth/session"
+                    | "/api/v1/auth/logout"
+                    | "/api/v1/auth/quota"
+            )
     }
     pub(crate) async fn handle(
         &self,
         mut request: Request<Incoming>,
         ingress: Arc<Ingress>,
     ) -> Response<ProxyBody> {
+        if super::composio::http::matches(request.uri().path())
+            || request.uri().path() == super::composio::http::CALLBACK_PATH
+        {
+            return self.connector_request(request).await;
+        }
         let application = match request.uri().path() {
             "/orbit/ws" => Some(self.config.orbit.as_ref()),
             "/digitalmate/ws" => Some(self.config.digitalmate.as_ref()),

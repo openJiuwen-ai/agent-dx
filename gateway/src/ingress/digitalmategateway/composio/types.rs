@@ -65,6 +65,7 @@ impl OAuthAppOwnership {
     }
 }
 
+#[derive(Clone)]
 pub struct MailAuthConfig {
     pub id: String,
     pub ownership: OAuthAppOwnership,
@@ -87,7 +88,7 @@ impl MailAuthConfig {
 }
 
 /// Configure only providers enabled by deployment. Missing providers fail closed.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MailAuthConfigs {
     pub gmail: Option<MailAuthConfig>,
     pub outlook: Option<MailAuthConfig>,
@@ -96,12 +97,22 @@ pub struct MailAuthConfigs {
 /// Construct only from authenticated, foreground-purpose business authority.
 /// Deliberately not Deserialize: request JSON must never construct identity.
 /// No background purpose is accepted in this first integration candidate.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct Scope {
     tenant: String,
     user: String,
     workspace: String,
+    foreground: Option<super::super::foreground_admission::ForegroundIdentity>,
 }
+
+// Equality identifies an owner namespace; it never compares or grants sessions.
+impl PartialEq for Scope {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.tenant, &self.user, &self.workspace)
+            == (&other.tenant, &other.user, &other.workspace)
+    }
+}
+impl Eq for Scope {}
 
 impl Scope {
     pub fn from_authenticated_foreground(
@@ -119,7 +130,45 @@ impl Scope {
             tenant,
             user,
             workspace,
+            foreground: None,
         })
+    }
+
+    /// Production foreground entry: retain the actual session owner so a slow
+    /// request or external response cannot extend an already revoked login.
+    pub fn from_foreground_identity(
+        identity: super::super::foreground_admission::ForegroundIdentity,
+    ) -> Result<Self, Error> {
+        let mut scope = Self::from_authenticated_foreground(
+            identity.tenant().into(),
+            identity.user_id().into(),
+            identity.workspace().into(),
+        )?;
+        scope.foreground = Some(identity);
+        Ok(scope)
+    }
+
+    /// Real owner issuers require this guard, not detached namespace fields.
+    pub fn foreground_identity(
+        &self,
+    ) -> Result<&super::super::foreground_admission::ForegroundIdentity, Error> {
+        self.foreground.as_ref().ok_or(Error::Forbidden)
+    }
+
+    pub(crate) async fn check_foreground(&self) -> Result<(), Error> {
+        self.foreground_identity()?
+            .check()
+            .await
+            .map_err(|_| Error::Forbidden)
+    }
+
+    // Existing explicitly trusted ports remain responsible for their own
+    // admission. The mounted foreground route always attaches the real guard.
+    pub(super) async fn check_bound_foreground(&self) -> Result<(), Error> {
+        if self.foreground.is_some() {
+            self.check_foreground().await?;
+        }
+        Ok(())
     }
 
     pub fn tenant(&self) -> &str {

@@ -25,6 +25,7 @@ use client::Client;
 use std::sync::Arc;
 
 /// Trusted configuration only; never construct from a user request or template.
+#[derive(Clone)]
 pub struct Composio {
     client: Client,
     authority: Arc<dyn Authority>,
@@ -254,4 +255,4 @@ impl Composio {
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

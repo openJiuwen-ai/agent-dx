@@ -508,8 +508,8 @@ async fn upstream(
     (response.0, headers, Json(response.1))
 }
 
-struct Fixture {
-    gateway: Composio,
+pub(crate) struct Fixture {
+    pub(crate) gateway: Composio,
     scope: Scope,
     authority: Arc<ControlledAuthority>,
     budget: Arc<ControlledBudget>,
@@ -530,6 +530,9 @@ impl Fixture {
             "workspace".into(),
         )
         .unwrap();
+        Self::with_scope(scope).await
+    }
+    pub(crate) async fn with_scope(scope: Scope) -> Self {
         let authority = Arc::new(ControlledAuthority {
             scope: scope.clone(),
             attempt: Mutex::new(Attempt {
@@ -595,12 +598,20 @@ impl Fixture {
             server,
         }
     }
-    fn reply(&self, status: u16, body: Value) {
+    pub(crate) fn reply(&self, status: u16, body: Value) {
         self.state
             .replies
             .lock()
             .unwrap()
             .push_back((StatusCode::from_u16(status).unwrap(), body));
+    }
+    #[cfg(feature = "mock-e2e")]
+    pub(crate) fn use_budget(&mut self, budget: Arc<dyn Budget>) {
+        self.gateway.client.budget = budget;
+    }
+    #[cfg(feature = "mock-e2e")]
+    pub(crate) fn call_count(&self) -> usize {
+        self.state.calls.lock().unwrap().len()
     }
     fn account(&self) -> Value {
         json!({"id":"ca_one", "user_id":self.scope.composio_user_id(), "status":"ACTIVE", "authScheme":"OAUTH2",

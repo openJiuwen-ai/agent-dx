@@ -173,3 +173,180 @@ async fn foreground_admission_does_not_fall_back_to_jiuwen_or_orbit() {
         Err(accounts::Error::Configuration)
     ));
 }
+
+#[tokio::test]
+async fn foreground_composio_mount_uses_actual_session_scope_and_denies_body_identity() {
+    use crate::ingress::digitalmategateway::composio::{self, Scope};
+    let (api, auth, _) = setup().await;
+    let identity = api
+        .foreground_admission()
+        .unwrap()
+        .authenticate(&headers("alice"))
+        .await
+        .unwrap();
+    let scope = Scope::from_foreground_identity(identity).unwrap();
+    let upstream = composio::tests::Fixture::with_scope(scope).await;
+    let api = api
+        .with_composio(Arc::new(upstream.gateway.clone()))
+        .unwrap();
+    let path = "/api/digitalmate/connectors/v1/composio/cancel";
+    assert!(DigitalMateGatewayApi::matches(path));
+    let request = |token: &str, value: &str| {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .header("authorization", token)
+            .body(Full::new(Bytes::copy_from_slice(value.as_bytes())))
+            .unwrap()
+    };
+    assert_eq!(
+        api.connector_request(request(
+            "Bearer alice-session",
+            r#"{"registration":"registration-one","user_id":"bob"}"#
+        ))
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        api.connector_request(request(
+            "Bearer bob-session",
+            r#"{"registration":"registration-one"}"#
+        ))
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        api.connector_request(request(
+            "Bearer alice-session",
+            r#"{"registration":"registration-one"}"#
+        ))
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    auth.0.store(true, Ordering::SeqCst);
+    assert_eq!(
+        api.connector_request(request(
+            "Bearer alice-session",
+            r#"{"registration":"registration-one"}"#
+        ))
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn foreground_composio_scope_carries_live_guard_without_becoming_json_identity() {
+    use crate::ingress::digitalmategateway::composio::Scope;
+    let (api, auth, _) = setup().await;
+    let identity = api
+        .foreground_admission()
+        .unwrap()
+        .authenticate(&headers("alice"))
+        .await
+        .unwrap();
+    let scope = Scope::from_foreground_identity(identity).unwrap();
+    scope.check_foreground().await.unwrap();
+    auth.0.store(true, Ordering::SeqCst);
+    assert_eq!(
+        scope.check_foreground().await.err(),
+        Some(crate::ingress::digitalmategateway::composio::Error::Forbidden)
+    );
+}
+
+#[tokio::test]
+async fn foreground_composio_revocation_during_shared_budget_wait_prevents_dispatch() {
+    use crate::ingress::digitalmategateway::composio::{self, Budget, Error, Scope};
+    struct RevokeBudget(Arc<TestAuth>);
+    #[async_trait::async_trait]
+    impl Budget for RevokeBudget {
+        async fn acquire(&self, _: &Scope) -> Result<(), Error> {
+            self.0 .0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let (api, auth, _) = setup().await;
+    let identity = api
+        .foreground_admission()
+        .unwrap()
+        .authenticate(&headers("alice"))
+        .await
+        .unwrap();
+    let scope = Scope::from_foreground_identity(identity).unwrap();
+    let mut upstream = composio::tests::Fixture::with_scope(scope.clone()).await;
+    upstream.use_budget(Arc::new(RevokeBudget(auth)));
+    assert_eq!(
+        upstream
+            .gateway
+            .reconcile_authorization(&scope, "registration-one")
+            .await
+            .err(),
+        Some(Error::Forbidden)
+    );
+    assert_eq!(upstream.call_count(), 0);
+}
+
+#[tokio::test]
+async fn foreground_composio_routes_reach_real_ingress_dispatch_without_ws_or_model() {
+    use crate::ingress::digitalmategateway::composio::{self, Scope};
+    let (api, _, _) = setup().await;
+    let identity = api
+        .foreground_admission()
+        .unwrap()
+        .authenticate(&headers("alice"))
+        .await
+        .unwrap();
+    let upstream =
+        composio::tests::Fixture::with_scope(Scope::from_foreground_identity(identity).unwrap())
+            .await;
+    let api = api
+        .with_composio(Arc::new(upstream.gateway.clone()))
+        .unwrap();
+    let (ingress, _) = fixture().await;
+    let ingress = Arc::new(
+        Arc::try_unwrap(ingress)
+            .ok()
+            .unwrap()
+            .with_digitalmategateway_api(Arc::new(api)),
+    );
+    let (mut sender, server, client) = connection(ingress, IngressSecurity::Tls).await;
+    let response = sender
+        .send_request(
+            Request::post("/api/digitalmate/connectors/v1/composio/cancel")
+                .header("host", "localhost")
+                .header("authorization", "Bearer alice-session")
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"registration":"registration-one"}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response.collect().await.unwrap().to_bytes()).unwrap(),
+        json!({"phase":"cancelled"})
+    );
+    let response = sender
+        .send_request(
+            Request::get(
+                "/api/digitalmate/connectors/v1/composio/callback?session_uri=opaque-must-not-echo",
+            )
+            .header("host", "localhost")
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !String::from_utf8_lossy(&response.collect().await.unwrap().to_bytes())
+            .contains("opaque-must-not-echo")
+    );
+    assert_eq!(upstream.call_count(), 0);
+    server.abort();
+    client.abort();
+}
