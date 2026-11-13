@@ -48,7 +48,7 @@ registry_proxy = true
 
 ## 采样、预热和对照
 
-1. **采样。** 在隔离的 worker 上从冷态启动一次。采样时允许从 Registry 或已有 AFS 副本读取。按[工具说明](../../build/e2e/afs/nydus_startup/README.md)保留 Registry 返回的原始 manifest、回环请求抓包和 SDK 时间戳。运行 `sample_ranges.py` 生成范围清单。用相同镜像、相同命令再做一次独立冷启动，将实际范围和清单比对，记录覆盖率、漏抓和多抓的字节。
+1. **采样。** 在隔离的 worker 上从冷态启动一次。采样时允许从 Registry 或已有 AFS 副本读取。按[工具说明](../../tools/nydus-startup/README.md)保留 Registry 返回的原始 manifest、回环请求抓包和 SDK 时间戳。运行 `sample_ranges.py` 生成范围清单。用相同镜像、相同命令再做一次独立冷启动，将实际范围和清单比对，记录覆盖率、漏抓和多抓的字节。
 2. **备种。** 用 `prewarm.py` 在种子 A 的本机 AFS Node 上读取清单范围。确认 A 能供数后开始计量。冷读对照让目标 worker 清空本次 AFS 测试缓存和 sandboxd 镜像缓存后直接启动。预热对照从同样冷态开始，先对目标 worker 的本机 AFS Node 执行同一清单。重复读取确认内容哈希一致，且隔离窗口的 Peer 正文字节增量为零。两组的 sandboxd bootstrap 都从冷态开始。
 3. **发压。** 用相同镜像、命令、worker 落点和资源配额重复两组。可用下面的 SDK 示例记录一条成功样本，也可在一个客户端并发发起多条。用该客户端的单调时钟，从最早的 SDK 提交算起，统计一秒内退出码和输出都正确的首条命令数。另记从开始铺热到最后一条命令成功的墙钟时间。
 4. **看流量。** 在铺热、复读和启动窗口分别取各 AFS Node `/metrics` 快照。核对种子的 `afs_dfs_payload_bytes_total{direction="send",operation="read",transport="grpc"}` 与读端的 `afs_dfs_crc32c_read_bytes_total{stage="trusted_segments_receive"}` 增量。统计实际跨宿主机的发送，单列 config、bootstrap 和 Registry manifest。热启动时如果仍有额外正文流量，记录它对应的范围。用 Registry 访问日志核对 blob 请求。测试期间只封锁正文时，应保留 manifest 的可达性。
@@ -85,7 +85,7 @@ PY
 
 ### 多 worker 分发
 
-首轮用单种子直供。双机要比较直供与接力时，可以在第一台宿主机上运行独立的种子 A 和 worker C，在第二台运行 worker B。每个 AFS Node 使用独立身份、端口和数据目录。可以用仓内 [分发工具](../../build/e2e/afs/nydus_startup/README.md#分批派发)并行派发，也可以按批次接力。接力时，上层需要确认上游节点已发布这批范围的副本，并能被下游发现。计划控制派发顺序，AFS 仍根据 Meta 的候选自主选源。要证明 B 给 C 供数，需要核对 B 发、C 收和来源记录。双机实验通过隔离网络规则约束了可达来源。
+首轮用单种子直供。双机要比较直供与接力时，可以在第一台宿主机上运行独立的种子 A 和 worker C，在第二台运行 worker B。每个 AFS Node 使用独立身份、端口和数据目录。可以用仓内 [分发工具](../../tools/nydus-startup/README.md#分批派发)并行派发，也可以按批次接力。接力时，上层需要确认上游节点已发布这批范围的副本，并能被下游发现。计划控制派发顺序，AFS 仍根据 Meta 的候选自主选源。要证明 B 给 C 供数，需要核对 B 发、C 收和来源记录。双机实验通过隔离网络规则约束了可达来源。
 
 ## 已有双机结果
 

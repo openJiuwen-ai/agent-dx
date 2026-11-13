@@ -2,7 +2,7 @@
 
 这组 Python 3.9+ 工具从一次成功的真实启动生成正文范围清单，并通过目标 worker 的 AFS Node
 按清单读取正文。工具使用标准库，可从任意目录调用。运行时需要启用 Nydus connector 的 Registry
-只读入口（通过双机验证的 AFS Node 版本含 `b3a776e3`）。sandboxd 的 Registry 代理和工具应
+只读入口。sandboxd 的 Registry 代理和工具应
 使用同一 worker 的 AFS Node、同一个已配置仓库。部署、沙箱生命周期和流量监控由调用方负责。
 
 ## 从一次冷启动采样
@@ -20,7 +20,7 @@ Ethernet pcap，要求完整请求头，遇到截断或分段请求会报错。�
   提交前及收到成功命令结果时记录两个时点。
 
 ```sh
-python3 build/e2e/afs/nydus_startup/sample_ranges.py \
+python3 tools/nydus-startup/sample_ranges.py \
   manifest.json startup.pcap startup.json events.json \
   --plan startup-plan.json --workload alpha \
   --command '/bin/sha256sum /alpha.bin' --training-run alpha-01
@@ -31,9 +31,9 @@ python3 build/e2e/afs/nydus_startup/sample_ranges.py \
 用同一镜像和命令做独立冷启动，保存新的 `heldout.pcap` 和 `heldout.json`。生成实际请求范围并与冻结清单对比：
 
 ```sh
-python3 build/e2e/afs/nydus_startup/sample_ranges.py \
+python3 tools/nydus-startup/sample_ranges.py \
   manifest.json heldout.pcap heldout.json heldout-events.json
-PYTHONPATH=build/e2e/afs/nydus_startup python3 - <<'PYCODE'
+PYTHONPATH=tools/nydus-startup python3 - <<'PYCODE'
 import json
 from pathlib import Path
 from sample_ranges import body, compare, read
@@ -49,7 +49,7 @@ PYCODE
 ## 预热指定 worker
 
 ```sh
-python3 build/e2e/afs/nydus_startup/prewarm.py \
+python3 tools/nydus-startup/prewarm.py \
   --manifest manifest.json --plan startup-plan.json \
   --workload alpha --command '/bin/sha256sum /alpha.bin' \
   --repository lab/nydus --endpoint http://127.0.0.1:7401 \
@@ -65,7 +65,7 @@ SHA-256。读取发生错误时退出非零，HTTP 阶段已完成的范围保�
 
 ## 分批派发
 
-用 `python3 distribute.py plan.json` 执行预热命令。计划使用 `nodes`、`seeds` 和
+用 `python3 tools/nydus-startup/distribute.py plan.json` 执行预热命令。计划使用 `nodes`、`seeds` 和
 `waves` 描述节点、已准备的种子和批次。下面示例用 SSH 到两台目标 worker 执行各自已准备的命令。
 将主机和命令替换成你的部署。每个 `warm` 命令调用上面的预热入口并检查本地复读；接力时，`ready`
 命令检查前一批节点的对应副本能否供下游发现。
@@ -84,4 +84,4 @@ SHA-256。读取发生错误时退出非零，HTTP 阶段已完成的范围保�
 
 直供时用 `"waves": [{"B": "A", "C": "A"}]`。同一批中的命令并发执行，有命令失败时停止派发下一批。
 计划中的上游用于控制派发顺序，AFS 读取仍按现有来源视图选源。启动与流量验收见
-[部署教程](../../../../docs/deployment/afs-nydus-startup.md)。
+[部署教程](../../docs/deployment/afs-nydus-startup.md)。
