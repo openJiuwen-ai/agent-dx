@@ -91,6 +91,46 @@ impl Inbox {
         Ok(Self { pool, limits })
     }
 
+    /// Resolve identity from this owner's exact persisted ready batch and current
+    /// subscription. Caller-supplied scope/binding fields are never consulted.
+    /// Refuses wrong digest/size, revoked/replaced subscriptions and terminal work.
+    pub async fn delivery_binding(
+        &self,
+        batch_id: &str,
+        digest: &str,
+        wire_bytes: usize,
+    ) -> Result<SubscriptionBinding, Error> {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || batch_id != format!("batch_{digest}")
+            || !(1..=2_097_152).contains(&wire_bytes)
+        {
+            return Err(Error::Refused);
+        }
+        let size = i64::try_from(wire_bytes).map_err(|_| Error::Refused)?;
+        let client = self.pool.get().await.map_err(unavailable)?;
+        let row = client.query_opt(
+            "SELECT b.payload,s.binding_json FROM digitalmate_ingestion.batches b JOIN digitalmate_ingestion.subscriptions s ON s.subscription_id=b.subscription_id AND s.workspace_key=b.workspace_key AND s.generation=b.generation WHERE b.batch_id=$1 AND b.digest=$2 AND b.state='ready' AND s.enabled AND octet_length(b.payload)::bigint=$3",
+            &[&batch_id, &digest, &size],
+        ).await.map_err(unavailable)?.ok_or(Error::Refused)?;
+        let bytes: Vec<u8> = row.get(0);
+        let batch: DeliveryBatch =
+            serde_json::from_slice(&bytes).map_err(|_| Error::InvalidManifest)?;
+        batch.validate()?;
+        let current = decode(&row.get::<_, String>(1))?;
+        current.validate()?;
+        if batch.batch_id != batch_id
+            || batch.digest != digest
+            || batch.binding != current
+            || !current.enabled
+        {
+            return Err(Error::Refused);
+        }
+        Ok(current)
+    }
+
     #[cfg(test)]
     pub(super) fn pool(&self) -> &Pool {
         &self.pool

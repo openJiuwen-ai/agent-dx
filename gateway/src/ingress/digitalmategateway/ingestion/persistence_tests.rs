@@ -49,6 +49,87 @@ async fn receive(store: &Inbox, id: &str) -> ReceiveReceipt {
     store.receive(proof).await.unwrap()
 }
 
+#[tokio::test]
+#[ignore = "requires an explicit task-owned PostgreSQL database"]
+async fn delivery_identity_resolves_only_the_current_persisted_ready_batch() {
+    let store = store().await;
+    let mut current = binding();
+    store.register(&current).await.unwrap();
+    receive(&store, "identity_A").await;
+    let lease = store.claim(Duration::from_secs(30)).await.unwrap().unwrap();
+    let batch = &lease.batch;
+    let size = serde_json::to_vec(batch).unwrap().len();
+    assert!(
+        store
+            .delivery_binding(&batch.batch_id, &batch.digest, size)
+            .await
+            .unwrap()
+            == current
+    );
+    let reopened = Inbox::from_pool(store.pool().clone(), store.limits().clone())
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .delivery_binding(&batch.batch_id, &batch.digest, size)
+            .await
+            .unwrap()
+            == current
+    );
+    assert!(matches!(
+        store
+            .delivery_binding(&batch.batch_id, &"0".repeat(64), size)
+            .await,
+        Err(Error::Refused)
+    ));
+    assert!(matches!(
+        store
+            .delivery_binding(&batch.batch_id, &batch.digest, size + 1)
+            .await,
+        Err(Error::Refused)
+    ));
+    current.subscription_generation += 1;
+    current.enabled = false;
+    store.register(&current).await.unwrap();
+    assert!(matches!(
+        store
+            .delivery_binding(&batch.batch_id, &batch.digest, size)
+            .await,
+        Err(Error::Refused)
+    ));
+    current.subscription_generation += 1;
+    current.enabled = true;
+    store.register(&current).await.unwrap();
+    receive(&store, "identity_B").await;
+    let next = store.claim(Duration::from_secs(30)).await.unwrap().unwrap();
+    let next_size = serde_json::to_vec(&next.batch).unwrap().len();
+    assert!(
+        store
+            .delivery_binding(&next.batch.batch_id, &next.batch.digest, next_size)
+            .await
+            .unwrap()
+            == current
+    );
+    store
+        .accept(
+            &next,
+            &DurableAck {
+                version: 1,
+                batch_id: next.batch.batch_id.clone(),
+                digest: next.batch.digest.clone(),
+                state: "accepted".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .delivery_binding(&next.batch.batch_id, &next.batch.digest, next_size)
+            .await,
+        Err(Error::Refused)
+    ));
+}
+
 // One test owns one schema; scenarios below intentionally share/reopen the same
 // real database to exercise commit/restart and multi-worker fences.
 #[tokio::test]

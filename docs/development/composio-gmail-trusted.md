@@ -1,32 +1,33 @@
 # Composio Gmail trusted module candidate
 
-Status: implemented module, **not wired into an HTTP entrypoint or deployed**.
-Base: official `master` at `e55b357c53ab34fdb96457b7ed5a2551ee497cc0`.
-Independent branch: `feat/gmail-composio-trusted`. This does not modify the
-configuration center work in [#179](https://github.com/openJiuwen-ai/agent-dx/pull/179)
-or claim that its business identity contract has been published.
+Status: Gmail authorization/read routes remain **unwired and undeployed**.
+The separate ingestion module now has explicit existing-process startup assembly.
+Development baseline includes official master `d86a2ee9` and merged #179.
+Branch: `feat/gmail-composio-trusted`. Phase B extends the existing configuration
+and identity owners in this candidate, with independent design review still required.
 
 Delivery alignment: draft ADX #268 now carries both the trusted Composio adapter
 and the separate ingestion coordination module, in the existing DigitalMateGateway
 process outside user sandboxes. No additional service or coordinator PR is
 required by this module split. #179 remains its own configuration-center producer;
-DigitalMate #1192 remains the separate-repository consumer. The next preparation
-batch incorporates official master `f2e2c0c735f23ac16fe86a5140f1eab03602ed6b`
-without rewriting the existing branch history.
+DigitalMate #1192 remains the separate-repository consumer. Official baseline
+updates use ordinary merges without rewriting the branch history.
 
 ## Responsibility and public inputs
 
 `gateway/src/ingress/digitalmategateway/composio` keeps the Composio project API key
 outside the user sandbox and permits only Gmail authorization and fixed read
-operations. Its parent exports the module; no route, frontend configuration,
-account login, privacy center or Environment lifecycle code is changed.
+operations. Its parent exports the module. The current phase adds service-secret
+import and separate-purpose identity in the existing owners, plus ingestion
+startup; it does not change Environment lifecycle ownership.
 
 `Composio::new` requires a key from trusted deployment configuration, the exact
 custom Gmail auth config, a real `Authority` and a real shared `Budget`. There are
 no defaults for either authority or budget and no provider token storage. Key
 configuration is not accepted from request JSON, mobile clients, models, user
-sandboxes or template files. No environment variable or reachable endpoint is
-invented by this candidate; runtime configuration assembly is pending its owner.
+sandboxes or template files. The operator imports it into the configuration
+center's server-only namespace. Gmail route/authority assembly still depends on
+the actual public Registry, Scan and session permission owners.
 
 `Scope::from_authenticated_foreground` is an **internal assembly seam**, not an
 authentication implementation. The business identity owner must first validate
@@ -47,6 +48,14 @@ fake production implementation, private owner access or second state writer.
 Composio request, including account checks and profile reads. Cluster-wide
 fairness/persistence is required of that owner; the module does not simulate it
 with an unlimited or per-process counter.
+
+`PostgresBudget` now supplies a real shared organization/user implementation.
+Database-clock fixed minute windows charge both counters atomically; denying a
+user rolls back the organization charge. A user's allowance spans workspaces.
+Replicas must use the same database and stable organization ID; mismatched limit
+configuration fails closed. Database failure never falls back to unlimited
+access. This does not reserve a minimum share per user or replace upstream 429
+handling. The Gateway Gmail routes still need to select this owner at assembly.
 
 ## Operations and observable outcomes
 

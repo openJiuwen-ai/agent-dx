@@ -1,8 +1,63 @@
-# 后台交付用途与冷启动接线契约（待生产者实现）
+# 后台交付用途与冷启动候选契约
 
-本文固定 #268/#1192 消费者的实际端口，供 #179 身份与装配 owner 实现生产者。
-它不是已上线的 issuer、验签协议或部署说明。当前 #179 `b307daba` 仅实现配置中心用途，
+本文固定 #268/#1192 端口。#268 已在既有身份 owner 中准备生产者与进程装配代码，
+#1192 的冷启动及公共底座消费仍待补齐。它不是已上线的部署说明。#179 阶段 A 仅实现配置中心用途，
 不能复用其 privacy bearer 作为后台批次授权，也不能复制私有 signer 另建 grant 系统。
+
+## 阶段 B 的开发分工（2026-11-12，提议待独立评审）
+
+#179 owner 已明确其已合入的阶段 A 保持配置 get/put/renew 与握手身份的既有范围。
+用户要求的新增用途、服务级 Composio 配置和 cold receiver 在 #268/#1192 原 PR
+范围补齐，不修改香港阶段 A 固定组合。本批实现准备不等于设计已接受或已部署。
+
+- Gateway 配置中心继续使用既有根密钥和 AEAD owner。服务级密文采用独立
+  `digitalmate_service_secret` AAD 与 `adx_accounts.service_secrets` owner 表，
+  固定 Composio project/webhook 名称、CAS revision 和删除 tombstone。
+  不通过用户 privacy API 暴露，不在模板或沙箱内放 project Key。
+- 新 `connector.tool`、`ingestion.delivery` 用途在既有身份框架内扩展；工具身份
+  不授予连接读权限，批次身份固定目标、batch ID/digest/实际 wire size 和短 TTL。
+  必须验证真实当前账号、Binding、连接及明确订阅意图，不能根据 DTO 自行签发。
+- 冷启动提议新增固定配置的只读 bootstrap，返回当前目标的 `DIGITALMATE_CONFIG`，
+  不返回 privacy bearer、写权限、mint 权限或 project Key。验用途后才 bootstrap。
+- Scan 保持唯一授权业务 flow owner，Registry 保持唯一连接写入者。Gateway
+  物理外呼效果日志只能在公开 Scan 当前投影约束下防止重复外呼，不能成为第二业务主表。
+- 正式装配仍在同一 `IngressService` / `Bridge.create_app`，沿用已有 Relay 和
+  会话入口。端侧授权入口、状态与回跳按用户要求等飞书 #1142 合入后复用，不重复实现。
+  飞书当前 ArkWeb WebView 不直接承载 Google OAuth；Google 登录使用现有系统浏览器
+  通道或系统授权会话，遵从 [Google OAuth policy](https://developers.google.com/identity/protocols/oauth2/policies)。
+
+精确 issuer/introspection 与 Scan/Registry 新端口尚待协调 owner 发布及独立评审。
+原有 privacy 凭证在上述提议接受前后都不能被解释为邮件读取或交付许可。
+
+### 已接入既有进程的身份生产者源码（候选，未部署）
+
+既有 `TokenSigner` 增加固定 `dm-connector-v1` / `dm-ingestion-v1` 前缀；
+原 `dm-privacy-v1` 的格式和范围保留。受信业务握手同一次既有身份 admission
+产生两种分离用途的凭证，不新增 grant 表。`connector.tool` 证明当前工作负载身份，
+不授予连接读取或会话执行权限；调用方仍必须查询实际 Registry/Session owner。
+
+`DeliveryIdentity` 实现实际 `DeliveryAuthorization`。签发与校验都查询 Inbox
+当前持久 ready batch、enabled subscription、代次、完整 binding、digest 和真实
+wire size，并查询既有有效账号 admission 与当前 Binding。短期签名携带既有
+grant ID、tenant、batch ID/digest/size/到期；完整接收目标从该 batch 的持久内容
+和当前 owner 记录获得，不能由请求 DTO 构造。TTL 为 60 秒，签发时钟上界容忍
+沿用身份框架的 60 秒，下界不放宽。终态或撤销后的批次不再通过这一校验。
+
+配置中心同一 HTTPS listener 的新增候选路由全部要求 POST、JSON、精确 `{}`：
+
+| 路由 | 凭证与结果 |
+| --- | --- |
+| `/v1/connector/identity` | connector 凭证；查询当前账号与 Binding，返回身份投影和到期，不返回工具权限。 |
+| `/v1/connector/renew` | connector 凭证；重验当前目标并仅续期 connector 凭证。 |
+| `/v1/ingestion/admit` | delivery 凭证；返回接收目标、batch ID/digest/size/到期。 |
+| `/v1/ingestion/bootstrap` | delivery 凭证；校验前后当前事实，只读取本目标固定 `DIGITALMATE_CONFIG`，返回 revision/base64 value，不返回任何新 bearer 或写能力。 |
+
+delivery 路由必须由真实 Inbox 显式装配，没有匿名或退回 privacy 凭证的默认路径。
+批次交付凭证不作为后续 pipeline 的会话执行、背景读取或发布权限；这些权限必须
+由相应真实 owner 单独核验。订阅写入入口与明确用户意图、公共底座 Session/Registry
+适配与冷 receiver 装配仍在开发。Gateway 正式入口现通过 `IngressService.bind/serve`
+装配受限 issuer、Webhook 和 Relay worker，随进程监督与停止。上述源码的 PG/HTTP 边界回归使用受控
+Binding 和订阅输入，不是 ADX 部署或真实 Gmail 证明。
 
 ## 生产者与消费者端口
 
@@ -73,5 +128,7 @@ GET 绑定同一 batch ID/digest，不可用一批的凭证查询另一批。验
 
 #268 已有 Gateway HTTP 入口、真实 PostgreSQL 队列和 Relay 客户端；#1192 已有独立
 SQLite receiver 与公共 Registry/Scan 适配。实际用途 producer、冷启动 verifier/装配、
-明确订阅的启停和 Composio trigger 操作尚未实现。公开注入点不代表可在生产配置中启用。
+明确订阅的启停和 Composio trigger 操作尚未实现。Gateway 侧用途生产者及正式服务
+装配已实现并通过隔离 PG/HTTP 和实际 bind/serve 回归；消费者的受限冷启动和真实
+连接/会话授权仍须补齐，尚不可据此宣称生产端到端可用。
 生产者固定后应使用同版本真实身份/持久存储重新联验，再由指定唯一部署 owner 集成香港版本。

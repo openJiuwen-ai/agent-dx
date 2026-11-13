@@ -21,6 +21,8 @@ mod implementation {
     }
     pub(crate) struct PrivacyRuntime {
         pub identity: Arc<PrivacyIdentity>,
+        pub center: Arc<PrivacyCenter>,
+        pub delivery: Option<Arc<super::super::privacy_grants::DeliveryIdentity>>,
         shutdown: watch::Sender<bool>,
         listener: JoinHandle<()>,
     }
@@ -31,6 +33,7 @@ mod implementation {
             bindings: Arc<dyn BindingReader>,
             root: &[u8; 32],
             tenant: &str,
+            inbox: Option<super::super::ingestion::Inbox>,
         ) -> Result<Self, Error> {
             tokio::runtime::Handle::try_current().map_err(|_| Error::Configuration)?;
             let cipher = PrivacyCipher::new(
@@ -64,7 +67,18 @@ mod implementation {
                 center = center
                     .with_legacy(PrivacyCipher::load(path).map_err(|_| Error::Configuration)?);
             }
-            let http = Arc::new(PrivacyHttp::new(Arc::new(center), identity.clone()));
+            let center = Arc::new(center);
+            let delivery = inbox.map(|inbox| {
+                Arc::new(super::super::privacy_grants::DeliveryIdentity::new(
+                    identity.clone(),
+                    inbox,
+                ))
+            });
+            let mut http = PrivacyHttp::new(center.clone(), identity.clone());
+            if let Some(delivery) = &delivery {
+                http = http.with_ingestion(delivery.clone());
+            }
+            let http = Arc::new(http);
             let (shutdown, receiver) = watch::channel(false);
             let listener = tokio::spawn(async move {
                 if http.serve(listener, tls, receiver).await.is_err() {
@@ -73,6 +87,8 @@ mod implementation {
             });
             Ok(Self {
                 identity,
+                center,
+                delivery,
                 shutdown,
                 listener,
             })

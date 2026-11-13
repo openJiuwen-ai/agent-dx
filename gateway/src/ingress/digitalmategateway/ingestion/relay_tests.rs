@@ -72,10 +72,11 @@ impl CredentialVerifier for Identity {
         Err(AuthError::Invalid("not a management credential".into()))
     }
 }
-struct Purpose;
+struct Purpose(std::sync::atomic::AtomicUsize);
 #[async_trait::async_trait]
 impl DeliveryAuthorization for Purpose {
     async fn headers(&self, batch: &DeliveryBatch) -> Result<http::HeaderMap, DeliveryFailure> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut result = http::HeaderMap::new();
         result.insert(
             "authorization",
@@ -275,11 +276,12 @@ async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() 
             inbox.clone(),
         ))),
     );
+    let purpose = Arc::new(Purpose(std::sync::atomic::AtomicUsize::new(0)));
     let delivery = Arc::new(
         RelayDelivery::new(
             managed.clone(),
             ingress.clone(),
-            Arc::new(Purpose),
+            purpose.clone(),
             Duration::from_secs(8),
         )
         .unwrap_or_else(|_| panic!("delivery configuration")),
@@ -355,6 +357,8 @@ async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() 
         .await
         .unwrap_or_else(|_| panic!("real relay first delivery"));
     assert_eq!(ack.state, "accepted");
+    assert!(purpose.0.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "each physical receipt query and batch POST must request fresh current-purpose proof");
     process.kill().await.unwrap();
     process.wait().await.unwrap();
     let (mut restarted, start) = receiver(&database, &binding_file, port).await;

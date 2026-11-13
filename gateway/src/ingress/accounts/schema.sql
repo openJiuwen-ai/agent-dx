@@ -86,4 +86,16 @@ CREATE TABLE IF NOT EXISTS adx_accounts.privacy_grants (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS privacy_grants_expiry ON adx_accounts.privacy_grants(expires_at);
+-- Service configuration has no user owner and is never exposed by privacy APIs.
+CREATE TABLE IF NOT EXISTS adx_accounts.service_secrets (
+    tenant_id text NOT NULL CHECK (octet_length(tenant_id) BETWEEN 1 AND 128),
+    service text NOT NULL CHECK (service = 'composio'),
+    secret_key text NOT NULL CHECK (secret_key IN ('PROJECT_API_KEY', 'WEBHOOK_SECRET')),
+    revision text NOT NULL CHECK (octet_length(revision) = 36),
+    key_id text CHECK (octet_length(key_id) BETWEEN 1 AND 128),
+    encrypted_value bytea CHECK (octet_length(encrypted_value) BETWEEN 28 AND 131100),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, service, secret_key),
+    CHECK ((key_id IS NULL) = (encrypted_value IS NULL))
+);
 COMMIT;

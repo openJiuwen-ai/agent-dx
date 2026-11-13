@@ -50,6 +50,9 @@ pub struct DigitalMateGatewayConfig {
     #[cfg(unix)]
     #[serde(default)]
     pub(crate) privacy: Option<super::privacy_runtime::PrivacyRuntimeConfig>,
+    #[cfg(unix)]
+    #[serde(default)]
+    pub(crate) ingestion: Option<super::ingestion::IngestionConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -162,6 +165,18 @@ impl DigitalMateGatewayConfig {
 
     pub fn validate(&self) -> Result<(), Error> {
         #[cfg(unix)]
+        if let Some(ingestion) = &self.ingestion {
+            ingestion.validate().map_err(|_| invalid())?;
+            if !self
+                .privacy
+                .as_ref()
+                .zip(self.digitalmate.as_ref())
+                .is_some_and(|(privacy, app)| privacy.template == app.template)
+            {
+                return Err(invalid());
+            }
+        }
+        #[cfg(unix)]
         if let Some(privacy) = &self.privacy {
             if ![&self.orbit, &self.digitalmate].iter().any(|app| {
                 app.as_ref()
@@ -230,12 +245,92 @@ pub struct DigitalMateGatewayApi {
     managed: Arc<ManagedService>,
     #[cfg(unix)]
     privacy: Option<super::privacy_runtime::PrivacyRuntime>,
+    #[cfg(unix)]
+    ingestion: Option<PreparedIngestion>,
+}
+
+#[cfg(unix)]
+struct PreparedIngestion {
+    settings: super::ingestion::IngestionConfig,
+    inbox: super::ingestion::Inbox,
+    verifier: Arc<super::composio::WebhookVerifier>,
 }
 impl DigitalMateGatewayApi {
     pub fn new(
         config: DigitalMateGatewayConfig,
         managed: Arc<ManagedService>,
         auth: Arc<dyn BusinessAuth>,
+    ) -> Result<Self, Error> {
+        #[cfg(unix)]
+        if config.ingestion.is_some() {
+            return Err(invalid());
+        }
+        Self::new_inner(
+            config,
+            managed,
+            auth,
+            #[cfg(unix)]
+            None,
+        )
+    }
+
+    /// Existing process startup: validate every dependency before mounting the
+    /// webhook or starting workers. No volatile queue or anonymous auth fallback.
+    pub async fn build(
+        config: DigitalMateGatewayConfig,
+        managed: Arc<ManagedService>,
+        auth: Arc<dyn BusinessAuth>,
+    ) -> Result<Self, Error> {
+        config.validate()?;
+        #[cfg(unix)]
+        let inbox = match &config.ingestion {
+            Some(settings) => Some(settings.open().await.map_err(|_| {
+                Error::Unavailable("DigitalMate ingestion database initialization failed".into())
+            })?),
+            None => None,
+        };
+        let mut api = Self::new_inner(
+            config,
+            managed,
+            auth,
+            #[cfg(unix)]
+            inbox.clone(),
+        )?;
+        #[cfg(unix)]
+        if let Some(settings) = api.config.ingestion.clone() {
+            let privacy = api.privacy.as_ref().ok_or_else(invalid)?;
+            let bytes = privacy
+                .center
+                .service_secret(
+                    &api.config.tenant,
+                    accounts::ServiceSecretName::ComposioWebhookSecret,
+                )
+                .await
+                .map_err(|_| invalid())?
+                .and_then(|value| value.plaintext)
+                .ok_or_else(|| {
+                    Error::Invalid("Composio webhook signing configuration is required".into())
+                })?;
+            let secrets = zeroize::Zeroizing::new(
+                serde_json::from_slice::<Vec<String>>(&bytes).map_err(|_| invalid())?,
+            );
+            let keys: Vec<_> = secrets.iter().map(|secret| secret.as_bytes()).collect();
+            let verifier =
+                Arc::new(super::composio::WebhookVerifier::new(&keys).map_err(|_| invalid())?);
+            api.ingestion = Some(PreparedIngestion {
+                settings,
+                inbox: inbox.ok_or_else(invalid)?,
+                verifier,
+            });
+        }
+        Ok(api)
+    }
+
+    fn new_inner(
+        config: DigitalMateGatewayConfig,
+        managed: Arc<ManagedService>,
+        auth: Arc<dyn BusinessAuth>,
+        #[cfg(unix)] inbox: Option<super::ingestion::Inbox>,
     ) -> Result<Self, Error> {
         config.validate()?;
         #[cfg(unix)]
@@ -255,6 +350,7 @@ impl DigitalMateGatewayApi {
                     reader,
                     &key,
                     &config.tenant,
+                    inbox,
                 )
                 .map_err(|_| {
                     Error::Unavailable("DigitalMate privacy service initialization failed".into())
@@ -269,7 +365,50 @@ impl DigitalMateGatewayApi {
             managed,
             #[cfg(unix)]
             privacy,
+            #[cfg(unix)]
+            ingestion: None,
         })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ingestion_webhook(&self) -> Option<Arc<super::ingestion::WebhookHttp>> {
+        self.ingestion.as_ref().map(|prepared| {
+            Arc::new(super::ingestion::WebhookHttp::new(
+                prepared.verifier.clone(),
+                prepared.inbox.clone(),
+            ))
+        })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn start_ingestion(
+        &self,
+        ingress: Arc<Ingress>,
+    ) -> Result<Option<super::ingestion::IngestionRuntime>, Error> {
+        let Some(prepared) = &self.ingestion else {
+            return Ok(None);
+        };
+        let identity = self
+            .privacy
+            .as_ref()
+            .and_then(|privacy| privacy.delivery.clone())
+            .ok_or_else(invalid)?;
+        let delivery = super::ingestion::RelayDelivery::new(
+            self.managed.clone(),
+            ingress,
+            identity,
+            Duration::from_secs(prepared.settings.delivery_timeout_seconds),
+        )
+        .map_err(|_| invalid())?;
+        let runtime = super::ingestion::IngestionRuntime::start(
+            prepared.inbox.clone(),
+            prepared.verifier.clone(),
+            Arc::new(delivery),
+            prepared.settings.workers,
+            Duration::from_secs(prepared.settings.lease_seconds),
+        )
+        .map_err(|_| invalid())?;
+        Ok(Some(runtime))
     }
     pub fn matches(path: &str) -> bool {
         matches!(

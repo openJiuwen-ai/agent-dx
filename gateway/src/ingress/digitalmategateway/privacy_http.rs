@@ -60,13 +60,26 @@ struct ExportRequest {
 pub(crate) struct PrivacyHttp {
     center: Arc<PrivacyCenter>,
     identity: Arc<super::privacy_grants::PrivacyIdentity>,
+    ingestion: Option<Arc<super::privacy_grants::DeliveryIdentity>>,
 }
 impl PrivacyHttp {
     pub fn new(
         center: Arc<PrivacyCenter>,
         identity: Arc<super::privacy_grants::PrivacyIdentity>,
     ) -> Self {
-        Self { center, identity }
+        Self {
+            center,
+            identity,
+            ingestion: None,
+        }
+    }
+
+    pub(crate) fn with_ingestion(
+        mut self,
+        ingestion: Arc<super::privacy_grants::DeliveryIdentity>,
+    ) -> Self {
+        self.ingestion = Some(ingestion);
+        self
     }
 
     pub async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
@@ -118,6 +131,10 @@ impl PrivacyHttp {
             path.as_str(),
             "/v1/secret/get"
                 | "/v1/identity/renew"
+                | "/v1/connector/identity"
+                | "/v1/connector/renew"
+                | "/v1/ingestion/admit"
+                | "/v1/ingestion/bootstrap"
                 | "/v1/secret/stage"
                 | "/v1/secret/commit"
                 | "/v1/secret/abort"
@@ -136,6 +153,38 @@ impl PrivacyHttp {
             .map_err(|_| Error::Invalid)?
             .to_bytes();
         match path.as_str() {
+            "/v1/ingestion/admit" | "/v1/ingestion/bootstrap" => {
+                if bytes.as_ref() != b"{}" {
+                    return Err(Error::Invalid);
+                }
+                let ingestion = self.ingestion.as_ref().ok_or(Error::Unavailable)?;
+                let admission = ingestion.verify(&token).await?;
+                if path == "/v1/ingestion/admit" {
+                    return Ok(response(StatusCode::OK, admission.json()));
+                }
+                let value = self.center.delivery_bootstrap(&admission).await?;
+                ingestion.verify(&token).await?;
+                Ok(response(
+                    StatusCode::OK,
+                    match value {
+                        Some(value) => {
+                            serde_json::json!({"revision":value.revision,"value":value.plaintext.as_ref().map(|bytes| STANDARD.encode(bytes.as_slice()))})
+                        }
+                        None => serde_json::json!({"revision":null,"value":null}),
+                    },
+                ))
+            }
+            "/v1/connector/identity" | "/v1/connector/renew" => {
+                if bytes.as_ref() != b"{}" {
+                    return Err(Error::Invalid);
+                }
+                let value = if path == "/v1/connector/identity" {
+                    self.identity.connector_identity(&token).await?
+                } else {
+                    self.identity.renew_connector(&token).await?
+                };
+                Ok(response(StatusCode::OK, value))
+            }
             "/v1/identity/renew" => {
                 if bytes.as_ref() != b"{}" {
                     return Err(Error::Invalid);
@@ -299,6 +348,10 @@ impl PrivacyHttp {
 fn operation_label(path: &str) -> &'static str {
     match path {
         "/v1/identity/renew" => "renew",
+        "/v1/connector/identity" => "connector_identity",
+        "/v1/connector/renew" => "connector_renew",
+        "/v1/ingestion/admit" => "ingestion_admit",
+        "/v1/ingestion/bootstrap" => "ingestion_bootstrap",
         "/v1/secret/get" => "get",
         "/v1/secret/stage" => "stage",
         "/v1/secret/commit" => "commit",

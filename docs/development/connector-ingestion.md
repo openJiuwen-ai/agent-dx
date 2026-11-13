@@ -1,14 +1,14 @@
 # Gateway 后台摄取协调
 
-摄取协调和 Composio 可信适配是 ADX #268 的两个职责模块，均属于既有 DigitalMateGateway 进程，部署在用户沙箱外。#179 配置中心仍为独立 PR，DigitalMate #1192 承载另一仓库的沙箱消费者；不新增服务或第二套账户注册表。
+摄取协调和 Composio 可信适配是 ADX #268 的两个职责模块，均属于既有 DigitalMateGateway 进程，设计运行于用户沙箱外。#179 已合入的配置中心作为前提，DigitalMate #1192 承载另一仓库的消费者；不新增服务或第二套账户注册表。本页描述候选源码，不代表已部署。
 
-代码基于官方 master `f2e2c0c735f23ac16fe86a5140f1eab03602ed6b`。没有复制或修改 #179 凭证私有实现，也不修改协调会话维护的总方案。
+当前开发已接入官方 master `d86a2ee9b9dfbf08d0655197ae20e7bb3e1f41a3`（含 #179 镜像）。阶段 B 在既有身份和配置 owner 内扩展分离用途及服务级密文，沿用原信任根和授权记录；不复制 signer 或另建授权系统。新增契约仍须独立设计评审后合入。
 
 ## 已实现的持久接收和调度
 
 `composio/webhook.rs` 使用可信部署提供的原始 UTF-8 secret，对未经改写的请求字节执行 HMAC-SHA256 验证。最多两个 secret 支持轮换；必要 header 禁止重复，时间窗口前后 300 秒，原始正文最多 1 MiB。只接受 V3 trigger message envelope，其他事件不会被成功回执后丢弃。
 
-固定入口为 `POST /api/digitalmate/ingestion/v1/composio/webhook`。`WebhookHttp` 通过实际 Ingress dispatcher 挂载，只有 PostgreSQL 事务提交后才返回 200。未验签为 401，订阅不匹配为 403，同 ID 不同 digest 为 409；容量不足、数据库故障和提交无法确认返回 503 与 `Retry-After: 5`，错误不含邮件正文。入口需要显式装配，现有启动配置不会自动开启。
+固定入口为 `POST /api/digitalmate/ingestion/v1/composio/webhook`。`WebhookHttp` 通过实际 Ingress dispatcher 挂载，只有 PostgreSQL 事务提交后才返回 200。未验签为 401，订阅不匹配为 403，同 ID 不同 digest 为 409；容量不足、数据库故障和提交无法确认返回 503 与 `Retry-After: 5`，错误不含邮件正文。可信 `ADX_JIUWEN_CONFIG` 显式提供 `ingestion` 才启用；缺少密文、数据库或身份依赖时拒绝启动，不静默降级。
 
 `ingestion/schema.sql` 定义专属 PostgreSQL schema，`Inbox` 是唯一写入者，不读取 account/privacy/公共连接表或其他 owner 的私有池。调用方显式提供池、待处理总数/字节数、单订阅容量和 0–30 秒聚合窗口。事件须匹配当前订阅的 tenant/user/workspace、connection、账户、auth config、trigger 和全部代次。供应商签名中的 user_id 不能自行选择工作区。
 
@@ -19,6 +19,9 @@
 ACK 只提交被领取的准确成员，不推进 sequence 高水位，A/B 处理期间到达的 C 不会被旧回执删除。旧订阅代次不能覆盖新代次；撤销围栏本订阅租约并清除待处理正文，不取消同工作区其他连接的批次。
 
 ## 沙箱就绪和交付
+
+在请求就绪前检查当前用途；就绪完成后，GET 和 POST 各自重新取得短期用途凭证。
+不复用就绪等待前的凭证，也不复用 GET 的凭证来发 POST。
 
 `AgentV2Access.select_existing` 消费已发布 `ManagedService.retry_resolve` 的 expected-generation 契约。缺失、删除或重建后的 Binding 不会被创建或换选；只接受模板声明的 HTTP port。Environment 就绪仍由 ADX Activator/Platform owner 处理，摄取不实现生命周期。端口暂未监听时等待，发送 HTTP 字节前再次读真实 Binding，核对 generation、phase 和 environment ID。
 
@@ -33,18 +36,93 @@ ACK 只提交被领取的准确成员，不推进 sequence 高水位，A/B 处�
 
 ## 真实接口与未完成接线
 
-公共底座 #1176 最新固定候选为 `4816f0ccdcc6a1c441e0a92503ef25c99fb79c4e`，包含 eb9e94c0 公共出口与客户端时钟边界；Registry/Scan/Store/server 运行时代码与已验证79a20197相同。#1192 薄适配直接调用 ScanRegistrations 的注册/完成方法及 `ConnectionRegistry.ensure_ready/access_snapshot`，不复制私表。快照不是后台订阅授权，`read_history` 不代替明确启用意图和 trigger 能力。
+此前跨仓库验证固定过 #1176 的公开候选（包括 `f7b930ec`）；这不是新主线或新权限端口的验收。#1192 薄适配直接调用实际 ScanRegistrations 注册/完成方法及 `ConnectionRegistry.ensure_ready/access_snapshot`，不复制私表。完整 Gateway Authority 所需物理外呼认领/回执与 Scan 当前投影仍需 owner 对齐；现有三种薄消费不能宣称已覆盖整个 Authority。快照与 `read_history` 均不授予后台订阅意图。
 
-#179 已发布 `b307dabae73f357463ea1bf1d98f6dacc171399f`，现有身份用途是配置中心，尚无 `ingestion.delivery` 用途、订阅投影或任意项目 Key 分发端口。本模块不将配置 bearer 当作后台工具授权。
+#179 阶段 A 的配置 bearer 保持原用途。#268 阶段 B 在同一身份 owner 中增加分离的 connector/delivery 前缀、实际 issuer/introspection 和固定只读 bootstrap，不将配置 bearer 当作后台工具授权，不分发项目 Key 到用户工作区。
 
 以下生产接线仍未实现，PR 保持 Draft：
 
 - 用户明确启用/撤销的持久订阅 owner，以及现有 Composio 适配器内受限 trigger 操作和未知结果恢复。`Inbox.register` 只接受已经过真实 owner 授权的投影。
-- 与 #179 对齐的后台用途身份和首次后台启动时的受限配置 bootstrap。现有沙箱在 WS trusted admission 前不启动 privacy，不能放行所有 internal 路由规避。
-- Gateway 进程启动配置中构造独立池、授权、入口与 worker；#1192 `server.py` 的 receiver mount/admission。公开 builder 不代表已经装配。
-- Composio 共享预算、真实 trigger/OAuth/暂停沙箱及集群验收。
+- #1192 真实 `server.py` 的冷 receiver mount/admission、只读 bootstrap 消费及实际 Registry/Session 权限；不能放行所有 internal 路由规避。
+- Gmail 授权/读取 HTTP 路由采用真实 Authority 和已实现的共享预算；独立组件通过不代表调用方已装配。
+- 真实 trigger/OAuth、暂停实例唤醒、实际 Gmail 与集群验收。
+
+Gateway 的独立池、真实用途 producer、回调入口和 worker 已接入 `IngressService.bind/serve`。
+原配置没有 `ingestion` 时保持关闭；worker 异常退出使服务失败并开始排空，正常停机
+停止 worker，不创建强引用环。正式进程测试覆盖缺密文拒绝、实际密文导入、验签
+401/持久接收 200 与停止；供应商和用户订阅输入仍为测试材料。
 
 协调不新建 SDK/client，不持项目 Key；后台补读和 trigger 管理必须通过原有可信适配器受限端口。项目 Key 留在可信适配器，provider Token 留在 Composio。
+
+## 候选启动配置与服务密文
+
+以下字段放在已有 `ADX_JIUWEN_CONFIG` 中；`privacy.template` 必须匹配
+`digitalmate.template`。沿用既有 `ADX_ACCOUNT_CONFIG` 和
+`ADX_CREDENTIAL_KEY_FILE`，不重新生成根密钥。生产者侧代码就绪不表示 #1192
+冷接收端、实际订阅权限或外部 Composio 配置已经完成。
+
+```json
+{
+  "tenant": "demo",
+  "jiuwen": {"agent_type": "assistant", "template": "jiuwen", "version": "1"},
+  "digitalmate": {"template": "digitalmate", "template_ref": "1", "backend_path": "/digitalmate/ws", "service_port": 8080},
+  "privacy": {
+    "listen": "0.0.0.0:9443", "template": "digitalmate",
+    "tls_certificate": "/run/digitalmate-privacy/server.crt",
+    "tls_private_key": "/run/digitalmate-privacy/server.key"
+  },
+  "ingestion": {
+    "database_url_env": "ADX_INGESTION_DATABASE_URL",
+    "database_max_connections": 8,
+    "database_allow_plaintext": false,
+    "workers": 2,
+    "lease_seconds": 30,
+    "delivery_timeout_seconds": 60,
+    "max_pending_events": 10000,
+    "max_pending_bytes": 67108864,
+    "per_subscription_events": 1000,
+    "debounce_milliseconds": 1000,
+    "dedupe_retention_seconds": 604800
+  }
+}
+```
+
+数据库 URL 从可信进程环境中指定名称读取，不从工作区配置或请求读取。专用池
+使用证书验证 TLS、5 秒连接/获取/回收上限与数据库语句/锁超时；自有 CA 可设置
+绝对路径 `database_ca_file`。`database_allow_plaintext` 默认 false；显式 true
+仅用于操作者明确选择的开发环境，不在 TLS 失败后回退。账号与摄取 schema
+分别由 schema owner 预先应用：
+[账号/配置](../../gateway/src/ingress/accounts/schema.sql)、
+[摄取](../../gateway/src/ingress/digitalmategateway/ingestion/schema.sql)。运行角色仅需相应 DML，启动不执行 DDL。
+
+服务级配置在 `adx_accounts.service_secrets` 中加密，使用既有 AEAD/root 和独立
+service AAD，用户配置 API 无法访问。以下是两种独立、仓库外的私有导入文件格式：
+
+```json
+{"project_api_key":"replace-with-project-key","gmail_auth_config_id":"","test_account_email":""}
+```
+
+```json
+{"webhook_secrets":["replace-with-webhook-signing-secret"]}
+```
+
+项目 Key 文件中的后两个字段是联验元数据，此命令只导入 Key；auth config 仍须在
+尚未完成的 Gmail 路由装配中显式接入，此文件不会启用读取路由。验签 secret 最多两个，用于明确轮换窗口；不能
+把项目 Key 当作验签 secret。Linux 文件必须是绝对路径、普通文件且权限不宽于
+0600，拒绝符号链接。导入沿用上述三个现有配置环境变量，在同一可执行程序中
+运行，不启动 listener、不创建新根、不访问外部 Composio：
+
+```sh
+adx-ingress import-composio-key /run/private/composio.local.json new
+adx-ingress import-composio-webhook-secret /run/private/composio-webhook.local.json new
+adx-ingress
+```
+
+导入仅输出新 revision；已有值或 tombstone 的轮换需用当前 revision 替换 `new`。
+保留根密钥和配置库备份，不可通过换根文件来“修复”解密失败。Key 仅供 Gateway
+读取，不写入模板、用户沙箱或端侧。缺少有效签名密文、必需 schema 或对应隐私
+服务时，启用摄取的 Gateway 必须拒绝启动。原配置没有 `ingestion` 时不挂载入口
+或启动 worker。
 
 ## 验证范围
 

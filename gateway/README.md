@@ -565,8 +565,11 @@ HTTP route or production identity/connection adapters yet. The same draft #268
 also implements the separate [ingestion coordinator](../docs/development/connector-ingestion.md)
 in this Gateway process; raw webhook verification and batch rules do not enable
 traffic. Durable PostgreSQL receipt, leases and fixed-generation Relay delivery
-are implemented. Production purpose authorization, trigger subscription ownership
-and startup assembly remain explicit activation gates.
+are implemented. Explicit `ingestion` configuration now assembles the dedicated
+database, server-managed signing secrets, purpose issuer, webhook and supervised
+workers through `IngressService.bind/serve`; see the coordinator guide. Receiver
+cold bootstrap, actual connection/session permissions and trigger subscription
+ownership remain activation gates. Gmail authorization/read HTTP routes remain unwired.
 
 ### Transparent business WebSocket
 

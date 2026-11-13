@@ -65,7 +65,6 @@ impl RelayDelivery {
         &self,
         batch: &DeliveryBatch,
         method: Method,
-        headers: &HeaderMap,
     ) -> Result<(StatusCode, Option<DurableAck>), DeliveryFailure> {
         let context = Arc::new(RequestContext::new(self.timeout));
         let binding = &batch.binding;
@@ -121,6 +120,9 @@ impl RelayDelivery {
             connection_task.abort();
             return Err(DeliveryFailure::Rejected);
         }
+        // Readiness may take longer than a credential's lifetime. Obtain fresh
+        // current-purpose proof after readiness for each physical HTTP request.
+        let headers = self.authorization.headers(batch).await?;
         let mut request = Request::builder()
             .method(method)
             .uri(path)
@@ -128,7 +130,7 @@ impl RelayDelivery {
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from(payload)))
             .map_err(|_| DeliveryFailure::Rejected)?;
-        for (name, value) in headers {
+        for (name, value) in &headers {
             if matches!(
                 name.as_str(),
                 "host" | "content-length" | "transfer-encoding" | "connection" | "upgrade"
@@ -185,11 +187,13 @@ impl DeliveryPort for RelayDelivery {
     async fn deliver(&self, batch: &DeliveryBatch) -> Result<DurableAck, DeliveryFailure> {
         batch.validate().map_err(|_| DeliveryFailure::Rejected)?;
         let operation = async {
-            let headers = self.authorization.headers(batch).await?;
-            if let (_, Some(ack)) = self.send(batch, Method::GET, &headers).await? {
+            // Refuse stale/revoked work before requesting platform readiness.
+            // The resulting credential is not reused after the readiness wait.
+            let _ = self.authorization.headers(batch).await?;
+            if let (_, Some(ack)) = self.send(batch, Method::GET).await? {
                 return Ok(ack);
             }
-            self.send(batch, Method::POST, &headers)
+            self.send(batch, Method::POST)
                 .await?
                 .1
                 .ok_or(DeliveryFailure::Unknown)

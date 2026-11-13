@@ -5,10 +5,12 @@
 //! their real owners. A crypto bearer or a JSON scope is not such a grant.
 //! No connection database, token store, ingestion scheduler or HTTP route lives here.
 
+mod budget;
 mod client;
 mod types;
 mod webhook;
 
+pub use budget::{PostgresBudget, RequestBudgetLimits};
 pub use webhook::{VerifiedWebhook, WebhookError, WebhookVerifier};
 
 pub use types::{
@@ -189,5 +191,7 @@ impl Composio {
     }
 }
 
+#[cfg(test)]
+mod budget_tests;
 #[cfg(test)]
 mod tests;
