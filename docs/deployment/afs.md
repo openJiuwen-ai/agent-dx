@@ -441,6 +441,8 @@ AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集�
 
 Nydus 路由默认只接受回环连接。需要从其他节点访问时，单独配置 Nydus 路由令牌并保护传输链路。Registry 使用受信来源，默认要求 HTTPS。配置和客户端部署方式见 [AFS Connectors](../../afs/CONNECTORS.md)。
 
+ADX + sandboxd 的镜像代理参数、启动范围采样、预热和双机验证见 [Nydus 沙箱启动教程](afs-nydus-startup.md)。
+
 ## DFS 外部 S3 连接
 
 外部 S3 后端在支持矩阵内，已验证的范围（故障场景、性能矩阵；e2e 套件不覆盖）见[支持边界](../architecture/afs-support-boundary.md#支持矩阵)。对象存储服务本身的持久性由其部署保证。

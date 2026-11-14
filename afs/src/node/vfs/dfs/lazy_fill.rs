@@ -187,10 +187,18 @@ impl DistributedFs {
             return Ok(Some(prost::bytes::Bytes::new()));
         }
         let count = (source.length - offset).min(size as u64) as usize;
+        let mut refresh_available = true;
         let opened = self.readonly_version_for_inode(&snapshot.opened_inode)?;
         if covered(&opened.layout, offset, count as u64) {
             let probe = Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2;
-            match self.read_lazy_committed(snapshot, &authority, &opened, offset, count, probe) {
+            match self.read_lazy_committed(
+                snapshot,
+                &authority,
+                &opened,
+                (offset, count),
+                probe,
+                &mut refresh_available,
+            ) {
                 Ok(data) => {
                     let batch = opened.read_batch(offset, count, 0)?;
                     if !self
@@ -213,8 +221,14 @@ impl DistributedFs {
             let current = self.readonly_version_for_inode(&view)?;
             if covered(&current.layout, offset, count as u64) {
                 let probe = Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2;
-                match self.read_lazy_committed(snapshot, &authority, &current, offset, count, probe)
-                {
+                match self.read_lazy_committed(
+                    snapshot,
+                    &authority,
+                    &current,
+                    (offset, count),
+                    probe,
+                    &mut refresh_available,
+                ) {
                     Ok(data) => {
                         let batch = current.read_batch(offset, count, 0)?;
                         if !self
@@ -331,7 +345,14 @@ impl DistributedFs {
                 }
                 return Ok(Some(data));
             }
-            self.fill_lazy_owned(&inode, lease, &source, offset, count, deadline)?;
+            self.fill_lazy_owned(
+                &inode,
+                lease,
+                &source,
+                (offset, count),
+                deadline,
+                &mut refresh_available,
+            )?;
             inode = self.validate_inode(self.meta.get_inode(&inode.inode_id)?)?;
             break;
         }
@@ -339,8 +360,15 @@ impl DistributedFs {
         // committed layout through only the old handle pin races DFS GC.
         let protected = self.protected_view(&inode)?;
         let committed = self.readonly_version_for_inode(&protected)?;
-        self.read_lazy_committed(snapshot, &authority, &committed, offset, count, deadline)
-            .map(Some)
+        self.read_lazy_committed(
+            snapshot,
+            &authority,
+            &committed,
+            (offset, count),
+            deadline,
+            &mut refresh_available,
+        )
+        .map(Some)
     }
 
     fn read_lazy_committed(
@@ -348,17 +376,23 @@ impl DistributedFs {
         snapshot: &DfsFileHandleSnapshot,
         authority: &NativeReadView,
         committed: &ReadOnlyVersion,
-        offset: u64,
-        count: usize,
+        range: (u64, usize),
         deadline: Instant,
+        refresh_available: &mut bool,
     ) -> Result<prost::bytes::Bytes> {
+        let (offset, count) = range;
         if !covered(&committed.layout, offset, count as u64) {
             return Err(unavailable("lazy range is not committed"));
         }
         let mut out = vec![0; count];
         let batch = committed.read_batch(offset, count, 0)?;
         self.read_engine
-            .read_batch_native_into_private_before(&batch, &mut out, Some(deadline))?;
+            .read_native_into_private_with_source_refresh(
+                &batch,
+                &mut out,
+                Some(deadline),
+                refresh_available,
+            )?;
         self.check_lazy_delivery(snapshot, authority)?;
         if Instant::now() >= deadline {
             return Err(unavailable("lazy read expired before delivery"));
@@ -395,10 +429,11 @@ impl DistributedFs {
         inode: &InodeRecord,
         lease: WriteLease,
         source: &LazyFileSpec,
-        offset: u64,
-        count: usize,
+        range: (u64, usize),
         deadline: Instant,
+        refresh_available: &mut bool,
     ) -> Result<()> {
+        let (offset, count) = range;
         // Lifetime admission counts waiters too, independently of the scarce
         // origin slots. Closing it makes shutdown race-free before any handle opens.
         let _activity = self
@@ -478,7 +513,14 @@ impl DistributedFs {
                 if version.version.is_some() {
                     let _pin = self.protected_view(&fresh)?;
                     self.recover_lazy_committed(
-                        &fresh, &session, source, &version, offset, count, deadline,
+                        &fresh,
+                        &session,
+                        source,
+                        &version,
+                        offset,
+                        count,
+                        deadline,
+                        refresh_available,
                     )?;
                 }
                 let Some((start, length)) = missing_range(&version.layout, offset, end) else {
@@ -561,6 +603,7 @@ impl DistributedFs {
         offset: u64,
         count: usize,
         deadline: Instant,
+        refresh_available: &mut bool,
     ) -> Result<()> {
         let end = offset
             .checked_add(count as u64)
@@ -609,11 +652,14 @@ impl DistributedFs {
             let probe_deadline = Instant::now()
                 + (deadline.saturating_duration_since(Instant::now()) / 3)
                     .min(Duration::from_millis(500));
-            let available = match self.read_engine.read_batch_native_into_private_before(
-                &batch,
-                &mut body,
-                Some(probe_deadline),
-            ) {
+            let available = match self
+                .read_engine
+                .read_native_into_private_with_source_refresh(
+                    &batch,
+                    &mut body,
+                    Some(probe_deadline),
+                    refresh_available,
+                ) {
                 Ok(()) => {
                     if sources.sources.iter().any(|s| matches!(&s.location, crate::dfs::CopyLocation::Node { node_id, .. } if node_id == &self.identity.node_id)) { continue; }
                     true

@@ -865,6 +865,16 @@ impl DfsReadEngine {
         out: &mut [u8],
         deadline: Option<Instant>,
     ) -> Result<()> {
+        self.read_native_into_private_with_source_refresh(batch, out, deadline, &mut true)
+    }
+
+    pub(in crate::node) fn read_native_into_private_with_source_refresh(
+        &self,
+        batch: &ReadBatch,
+        out: &mut [u8],
+        deadline: Option<Instant>,
+        refresh_available: &mut bool,
+    ) -> Result<()> {
         self.validate_native_read_plan(batch, out.len())?;
         let ChunkSource::Native(native) = self.chunk_source() else {
             return Err(Error::coded(
@@ -873,9 +883,10 @@ impl DfsReadEngine {
             ));
         };
         let authority = self.capture_native_read_authority()?;
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + self.read_pipeline_timeout());
         for part in self.native_read_batches(batch) {
             native
-                .read(&part, out, true, deadline)
+                .read(&part, out, true, Some(deadline), refresh_available)
                 .inspect_err(|error| {
                     self.invalidate_native_batch_on_error(&part, error);
                 })?;
@@ -901,7 +912,7 @@ impl DfsReadEngine {
         self.validate_private_native_ranges(batch)?;
         let authority = self.capture_native_read_authority()?;
         native
-            .read(batch, out, true, deadline)
+            .read(batch, out, true, deadline, &mut true)
             .inspect_err(|error| {
                 self.invalidate_native_batch_on_error(batch, error);
             })?;
@@ -961,7 +972,7 @@ impl DfsReadEngine {
             ChunkSource::External(source) => source.read(&staged_batch, &mut staged)?,
             ChunkSource::Native(source) => {
                 source
-                    .read(&staged_batch, &mut staged, false, None)
+                    .read(&staged_batch, &mut staged, false, None, &mut true)
                     .inspect_err(|error| {
                         self.invalidate_native_batch_on_error(batch, error);
                     })?;
@@ -1052,7 +1063,7 @@ impl DfsReadEngine {
             .reply_buffer_pool
             .take(output_len, self.local.read_work_metrics().cloned())?;
         native
-            .read(batch, &mut result, true, deadline)
+            .read(batch, &mut result, true, deadline, &mut true)
             .inspect_err(|error| {
                 self.invalidate_native_batch_on_error(batch, error);
             })?;

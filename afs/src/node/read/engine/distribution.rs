@@ -1,6 +1,6 @@
 //! Bounded range scheduling for ordinary DFS files. Plans retain one immutable
 //! version and its existing grants; no source or application-specific IO lives here.
-use super::*;
+use super::{remote::RangeReadOutcome, *};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -71,19 +71,19 @@ impl DfsReadEngine {
         sources: &[ChunkSources],
         out: &mut [u8],
         deadline: Option<Instant>,
-    ) -> Result<bool> {
+    ) -> Result<Option<RangeReadOutcome>> {
         use futures_util::{StreamExt, stream};
         if self.distribution.parallelism <= 1 || !self.async_read_enabled() {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(version) = batch.file_version_id.as_ref() else {
-            return Ok(false);
+            return Ok(None);
         };
         let mut ops = Vec::new();
         let mut available_peers = BTreeSet::new();
         for op in &batch.ops {
             let Some(set) = sources.iter().find(|s| s.chunk_id == op.chunk_id) else {
-                return Ok(false);
+                return Ok(None);
             };
             let peers: BTreeSet<_> = set
                 .sources
@@ -107,7 +107,7 @@ impl DfsReadEngine {
             let mut done = 0u64;
             while done < op.length {
                 if ops.len() == MAX_DFS_READ_OPS {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 let length = (op.length - done).min(stripe);
                 ops.push(ChunkReadOp {
@@ -129,14 +129,14 @@ impl DfsReadEngine {
             }
         }
         if ops.len() < 2 || available_peers.len() < 2 {
-            return Ok(false);
+            return Ok(None);
         }
         ops.sort_by_key(|op| op.output_offset);
         let mut end = 0usize;
         for op in &ops {
             // Preserve the old scheduler's semantics for overlapping scatter.
             if op.output_offset < end {
-                return Ok(false);
+                return Ok(None);
             }
             end = op
                 .output_offset
@@ -158,7 +158,8 @@ impl DfsReadEngine {
         for (index, mut op) in ops.into_iter().enumerate() {
             let (_, rest) = tail.split_at_mut(op.output_offset - cursor);
             let (target, rest) = rest.split_at_mut(op.length as usize);
-            cursor = op.output_offset + op.length as usize;
+            let output_offset = op.output_offset;
+            cursor = output_offset + op.length as usize;
             tail = rest;
             op.output_offset = 0;
             let candidates = ordered
@@ -189,7 +190,7 @@ impl DfsReadEngine {
                         !matches!(&source.location, CopyLocation::Node { node_id, .. } if node_id == node)
                     });
                 }
-                tokio::time::timeout_at(
+                let outcome = tokio::time::timeout_at(
                     tokio::time::Instant::from_std(deadline),
                     self.read_remote_ranges_async(
                         &child,
@@ -200,17 +201,29 @@ impl DfsReadEngine {
                     ),
                 )
                 .await
-                .map_err(|_| unavailable("distributed read deadline exceeded"))?
+                .map_err(|_| unavailable("distributed read deadline exceeded"))??;
+                Ok((output_offset, outcome))
             });
         }
-        let results: Vec<Result<()>> = stream::iter(children)
+        let results: Vec<Result<_>> = stream::iter(children)
             .buffer_unordered(self.distribution.parallelism)
             .collect()
             .await;
+        let mut exhausted = None;
         for result in results {
-            result?;
+            if let (output_offset, RangeReadOutcome::Exhausted { ops, error }) = result? {
+                let (pending, _) = exhausted.get_or_insert_with(|| (Vec::new(), error));
+                pending.extend(ops.into_iter().map(|mut op| {
+                    op.output_offset += output_offset;
+                    op
+                }));
+            }
         }
         self.check_native_read_authority(&authority)?;
-        Ok(true)
+        Ok(Some(
+            exhausted.map_or(RangeReadOutcome::Complete, |(ops, error)| {
+                RangeReadOutcome::Exhausted { ops, error }
+            }),
+        ))
     }
 }

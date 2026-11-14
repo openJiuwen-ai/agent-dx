@@ -2209,6 +2209,95 @@ fn quarantined_local_copy_and_no_readable_peer_return_eio_without_output() {
 }
 
 #[test]
+fn exhausted_cached_sources_refresh_once_without_replaying_completed_ranges() {
+    struct Transfer {
+        failed: Mutex<Vec<String>>,
+        calls: Mutex<Vec<(String, ChunkId)>>,
+    }
+
+    impl ChunkTransfer for Transfer {
+        fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+            for item in &batch.operations {
+                let CopyLocation::Node { node_id, .. } = &item.source.location else {
+                    unreachable!()
+                };
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((node_id.clone(), item.op.chunk_id.clone()));
+                if self.failed.lock().unwrap().contains(node_id) {
+                    return Err(unavailable("peer disconnected"));
+                }
+                let start = item.op.output_offset;
+                out[start..start + item.op.length as usize].fill(7);
+            }
+            Ok(())
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let first = ChunkId::new("first");
+    let second = ChunkId::new("second");
+    let set = |id: &ChunkId, peer: &str| ChunkSources {
+        chunk_id: id.clone(),
+        chunk: None,
+        allowed_ranges: Vec::new(),
+        sources: vec![source(peer, id, peer)],
+    };
+    let provider = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+        revision: 1,
+        chunks: vec![set(&first, "old"), set(&second, "healthy")],
+    }));
+    let transfer = Arc::new(Transfer {
+        failed: Mutex::new(Vec::new()),
+        calls: Mutex::new(Vec::new()),
+    });
+    let engine = DfsReadEngine::new(
+        crate::dfs::NamespaceId::new("default"),
+        "node-a".into(),
+        Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+        provider.clone(),
+        transfer.clone(),
+        DfsReadConfig::default(),
+    );
+    let mut batch = source_cache_lru_batch(first.clone());
+    batch.ops[0].length = 1;
+    batch.ops.push(ChunkReadOp {
+        chunk_id: second.clone(),
+        chunk_offset: 0,
+        length: 1,
+        output_offset: 1,
+    });
+    let mut out = [0; 2];
+    engine.read_batch(&batch, &mut out).unwrap();
+    engine.read_batch(&batch, &mut out).unwrap();
+    assert_eq!(*provider.calls.lock().unwrap(), 1);
+    transfer.calls.lock().unwrap().clear();
+    transfer.failed.lock().unwrap().push("old".into());
+    *provider.reply.lock().unwrap() = DfsChunkSourcesReply {
+        revision: 2,
+        chunks: vec![set(&first, "replacement")],
+    };
+    engine.read_batch(&batch, &mut out).unwrap();
+    assert_eq!(out, [7; 2]);
+    assert_eq!(*provider.calls.lock().unwrap(), 2);
+    assert_eq!(
+        *transfer.calls.lock().unwrap(),
+        vec![
+            ("old".into(), first.clone()),
+            ("healthy".into(), second),
+            ("replacement".into(), first)
+        ],
+    );
+
+    transfer.failed.lock().unwrap().push("replacement".into());
+    out.fill(9);
+    assert!(engine.read_batch(&batch, &mut out).is_err());
+    assert_eq!(*provider.calls.lock().unwrap(), 3);
+    assert_eq!(out, [9; 2]);
+}
+
+#[test]
 fn remote_read_uses_scratch_and_falls_back_between_sources() {
     let temp = tempfile::tempdir().unwrap();
     let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
@@ -5622,13 +5711,14 @@ fn failed_batch_retries_each_original_copy_before_advancing_candidates() {
         assert_eq!(attempts[0], vec!["a-only", "b-stale"]);
         assert_eq!(attempts[1], vec!["a-only"]);
         assert_eq!(attempts[2], vec!["b-stale"]);
+        assert_eq!(attempts.len(), 4);
+        assert_eq!(attempts[3], vec!["b-good"]);
         if all_fail {
+            // Collect all exhausted ranges before the one fresh lookup.
+            // Meta returned only the already attempted copies.
             assert!(result.is_err());
-            assert_eq!(attempts.len(), 3);
             assert_eq!(&out, b"!!");
         } else {
-            assert_eq!(attempts.len(), 4);
-            assert_eq!(attempts[3], vec!["b-good"]);
             if fallback_fails {
                 assert!(result.is_err());
                 assert_eq!(&out, b"!!", "A succeeded but B exhausted its candidates");

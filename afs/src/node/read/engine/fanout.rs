@@ -1,6 +1,6 @@
 //! `FanoutSource`: parallel verified-object fills for private multi-object reads.
 
-use super::*;
+use super::{remote::peer_sources_unavailable, *};
 
 /// Children spawned for one fan-out batch, plus why spawning stopped early.
 struct FanoutChildren {
@@ -71,22 +71,32 @@ impl DfsReadEngine {
         let mut results = Vec::with_capacity(tasks.len());
         let mut failure = None;
         for task in tasks {
-            match task.await {
-                Ok(Ok(Some(bytes))) => results.push(bytes),
-                Ok(Ok(None)) => fallback = true,
-                Ok(Err(error)) => {
-                    if failure.is_none() {
-                        failure = Some(error);
-                    }
+            let error = match task.await {
+                Ok(Ok(Some(bytes))) => {
+                    results.push(bytes);
+                    continue;
                 }
-                Err(error) => {
-                    if failure.is_none() {
-                        failure = Some(unavailable(format!("DFS fetch task failed: {error}")));
-                    }
+                Ok(Ok(None)) => {
+                    fallback = true;
+                    continue;
                 }
+                Ok(Err(error)) => error,
+                Err(error) => unavailable(format!("DFS fetch task failed: {error}")),
+            };
+            // A range fallback may recover availability failures only.
+            // A denial or integrity failure from a different child still wins.
+            if failure.as_ref().is_none_or(|earlier| {
+                peer_sources_unavailable(earlier) && !peer_sources_unavailable(&error)
+            }) {
+                failure = Some(error);
             }
         }
-        if let Some(error) = failure.or(admission_failure) {
+        if let Some(error) = admission_failure
+            && (failure.is_none() || !peer_sources_unavailable(&error))
+        {
+            failure = Some(error);
+        }
+        if let Some(error) = failure {
             return Err(error);
         }
         if fallback {

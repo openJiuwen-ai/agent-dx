@@ -7,18 +7,19 @@ use std::{
 
 use super::{
     NydusConfig, lazy_fill,
-    registry::{self, ImagePlan, RegistryProvider},
+    registry::{self, ImagePlan, RegistryManifest, RegistryProvider, RegistrySource},
 };
 use crate::node::{
     connectors::ConnectorContext,
     vfs::{
         Backend, PreparedPublication,
         lazy_fill::LazyFileSpec,
-        types::{BackendInode, Entry, FileHandle, RequestContext},
+        types::{BackendInode, Entry, FileHandle, FileKind, RequestContext},
     },
 };
 use afs_error::{Error, ErrorKind, Result};
 use prost::bytes::Bytes;
+use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 const IO_BATCH: usize = 256 * 1024;
@@ -123,6 +124,86 @@ impl NydusService {
         .await
     }
 
+    pub(super) async fn registry_manifest(
+        &self,
+        repository: &str,
+        reference: &str,
+        deadline: Instant,
+    ) -> Result<RegistryManifest> {
+        let (key, _) = self.provider.proxy_source(repository)?;
+        self.provider.fetch_manifest(key, reference, deadline).await
+    }
+
+    pub(super) async fn stat_registry_blob(
+        self: &Arc<Self>,
+        repository: &str,
+        blob: &str,
+        deadline: Instant,
+        permit: Arc<OwnedSemaphorePermit>,
+    ) -> Result<BlobStat> {
+        registry::require_digest(blob)?;
+        let (key, config) = self.provider.proxy_source(repository)?;
+        // The request identifies an immutable blob in this repository. Keep one DFS
+        // file per configured origin/repository, independent of manifest versions.
+        let scope = format!(
+            "{:x}",
+            Sha256::digest(format!("{key}\0{}\0{repository}", config.registry))
+        );
+        let scope: Arc<str> = scope.into();
+        let name = blob[7..].to_owned();
+        let this = self.clone();
+        let (lookup_scope, lookup_name, lookup_permit) =
+            (scope.clone(), name.clone(), permit.clone());
+        let entry = blocking(move || {
+            let _permit = lookup_permit;
+            check_deadline(deadline)?;
+            this.registry_blob_parent(&lookup_scope, false)
+                .and_then(|parent| {
+                    this.backend
+                        .lookup(&this.ctx, parent, OsStr::new(&lookup_name))
+                })
+        })
+        .await;
+        match entry {
+            Ok(entry) => {
+                if entry.attributes.kind != FileKind::Regular {
+                    return Err(invalid("expected a regular Registry blob file"));
+                }
+                return Ok(BlobStat {
+                    size: entry.attributes.size,
+                    entry,
+                });
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let size = self.provider.blob_size(key, blob, deadline).await?;
+        let source = RegistrySource {
+            source_key: key.to_owned(),
+            registry: config.registry.clone(),
+            repository: repository.to_owned(),
+            blob_digest: blob.to_owned(),
+            size,
+        };
+        let this = self.clone();
+        blocking(move || {
+            let _permit = permit;
+            check_deadline(deadline)?;
+            let parent = this.registry_blob_parent(&scope, true)?;
+            let entry = this.backend.prepare_lazy_file(
+                &this.ctx,
+                parent,
+                OsStr::new(&name),
+                &LazyFileSpec {
+                    length: size,
+                    binding: lazy_fill::binding(&source)?,
+                },
+            )?;
+            Ok(BlobStat { entry, size })
+        })
+        .await
+    }
+
     async fn ensure_prepared(
         self: &Arc<Self>,
         key: String,
@@ -161,8 +242,16 @@ impl NydusService {
     }
 
     fn image_parent(&self, key: &str, create: bool) -> Result<BackendInode> {
+        self.directory(&[&self.config.root_name, "images", key], create)
+    }
+
+    fn registry_blob_parent(&self, scope: &str, create: bool) -> Result<BackendInode> {
+        self.directory(&[&self.config.root_name, "registry-blobs", scope], create)
+    }
+
+    fn directory(&self, names: &[&str], create: bool) -> Result<BackendInode> {
         let mut parent = self.root;
-        for name in [&self.config.root_name, "images", key] {
+        for name in names {
             let entry = if create {
                 self.mkdir(parent, name)?
             } else {
