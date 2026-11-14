@@ -218,6 +218,38 @@ Python package. They share exactly the same package/test scripts with the base
 pipeline; they are not prerequisites for a base build. For `agent-dx-admin`, use
 this repository and `.buildkite/pipeline.yml` as the configuration entrypoint.
 
+## Temporarily deferred Redis timing regressions
+
+The Platform component explicitly skips the operation-budget regression and four
+fault-proxy regressions below while intermittent Redis operation failures in
+shared CI are investigated under
+[Issue71](https://gitcode.com/openJiuwen/agent-dx/issues/71):
+
+- `counter_compaction::configured_operation_budget_outlives_driver_default_and_remains_bounded`
+- `transport_recovery::transport_recovery_replaces_a_response_stalled_connection`
+- `transport_recovery::transport_recovery_repairs_an_applied_write_with_a_lost_response`
+- `transport_recovery::transport_recovery_fences_a_delayed_write_before_publishing_absence`
+- `transport_recovery::transport_recovery_fences_a_cancelled_write_without_waiting_for_its_timeout`
+
+The four transport-recovery cases share a fault-proxy fixture with a 250 ms
+operation budget. Defer that fixture group together; the two discovery recovery
+cases in the same module still run.
+
+`component-tests.sh` prints each case as `SKIP` and passes its full name through
+libtest's `--skip` option. The remaining counter-compaction, publication-catalog,
+transport and node-retirement tests still run. These five cases are excluded
+from the CI verdict; a passed pipeline does not validate their recovery contracts.
+The Rust tests and their assertions remain available for isolated manual runs:
+
+```sh
+ADX_TEST_REDIS_SERVER=/path/to/pinned/redis-server \
+cargo test --locked -p adx-coordinator --test storage \
+  counter_compaction::configured_operation_budget_outlives_driver_default_and_remains_bounded \
+  -- --ignored --exact --test-threads=1
+```
+
+Replace the filter with any transport-recovery case above to run it directly.
+
 ## Optional PyPI publication
 
 `admin-package` always runs the `adxadmin` unit and release tests, builds one
