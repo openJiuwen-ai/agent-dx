@@ -285,6 +285,24 @@ async fn source_read_owner_proof_rejects_foreign_request_epoch_generation_revisi
         Ok(false)
     );
     background["read_body"] = json!(true);
+    assert_eq!(
+        super::owner::read_proof(background.clone(), &scope, "connection-one", &grant, 100),
+        Ok(true),
+        "the actual current subscription owner can admit an authorized body read"
+    );
+    for (field, value) in [
+        ("authorization_generation", json!(2)),
+        ("record_revision", json!(2)),
+        ("intent_revision", json!(2)),
+    ] {
+        let mut changed = background.clone();
+        changed["access"][field] = value;
+        assert!(
+            super::owner::read_proof(changed, &scope, "connection-one", &grant, 100).is_err(),
+            "subscription body authority must match {field}"
+        );
+    }
+    background["allowed"] = json!(false);
     assert!(super::owner::read_proof(background, &scope, "connection-one", &grant, 100).is_err());
 }
 

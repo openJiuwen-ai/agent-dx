@@ -305,10 +305,11 @@ pub(super) fn read_proof(
         || !proof.allowed
         || proof.expires_at <= now
         || proof.expires_at > now.saturating_add(15)
-        || (proof.read_body && matches!(access, super::types::ReadAccess::Subscription { .. }))
     {
         return Err(Error::Forbidden);
     }
+    // The current task/intent owner decides body access. A subscription kind
+    // alone grants nothing; its exact request, revisions and expiry are checked above.
     Ok(proof.read_body)
 }
 

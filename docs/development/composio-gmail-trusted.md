@@ -103,8 +103,13 @@ must preserve its provider and original query. Search/header/body permissions
 remain distinct; current task/intent and connection facts are checked around
 budget waits and provider I/O. Late revoked results are discarded.
 
-Metadata is the default. Body access requires explicit current task permission;
-subscription proof cannot grant it. No sending or attachment tools are exposed.
+Metadata is the default. Body access requires an explicit current task or enabled
+subscription owner's read proof. The current owner verifies the actual connection,
+provider read capability and subscription intent; Gateway binds that result to
+the exact request digest, authorization/record/intent revisions and expiry.
+Request JSON or a subscription kind alone grants no body permission. Revocation,
+disabled intents, stale revisions and owner refusal remain refused. No sending
+or attachment tools are exposed.
 Outlook keyword search combines a fixed Graph search projection with exact local
 sender/UTC filtering; provider limits do not prove full-history coverage.
 
