@@ -107,6 +107,7 @@ impl LocalChunkStore {
                 // a surviving catalog entry falsely claiming a removed file is present.
                 if let Err(error) = append_catalog_txn_observed(
                     &self.catalog_path,
+                    &self.catalog_name_durable,
                     &txn,
                     self.read_work.as_ref(),
                     |_| Ok(()),
@@ -366,11 +367,13 @@ impl LocalChunkStore {
             checksum: String::new(),
         };
         txn.checksum = txn.expected_checksum()?;
-        if let Err(error) =
-            append_catalog_txn_observed(&self.catalog_path, &txn, self.read_work.as_ref(), |_| {
-                Ok(())
-            })
-        {
+        if let Err(error) = append_catalog_txn_observed(
+            &self.catalog_path,
+            &self.catalog_name_durable,
+            &txn,
+            self.read_work.as_ref(),
+            |_| Ok(()),
+        ) {
             return Err(self.catalog_committer.fail(error).as_ref().clone());
         }
         for record in txn.records {

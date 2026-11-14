@@ -115,10 +115,18 @@ pub(super) fn save_checkpoint(root: &Path, catalog: &LocalCatalog) -> Result<()>
         .write(true)
         .open(&temp)?;
     file.write_all(&bytes)?;
+    #[cfg(test)]
+    catalog_power_loss_tests::cut("checkpoint written");
     file.sync_all()?;
+    #[cfg(test)]
+    catalog_power_loss_tests::file_synced(&temp);
     drop(file);
     fs::rename(temp, root.join("catalog.snapshot"))?;
+    #[cfg(test)]
+    catalog_power_loss_tests::cut("checkpoint renamed");
     File::open(root)?.sync_all()?;
+    #[cfg(test)]
+    catalog_power_loss_tests::directory_synced(root);
     Ok(())
 }
 #[cfg(test)]
