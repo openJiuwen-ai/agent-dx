@@ -291,16 +291,75 @@ async fn same_name_contention_still_reports_one_real_target_conflict() {
     }
 
     let mut successes = 0;
-    let mut conflicts = 0;
+    let mut collisions = 0;
     for handle in handles {
         match handle.await.unwrap() {
             Ok(_) => successes += 1,
-            Err(error) if error.code() == afs_error::META_DFS_CONFLICT => conflicts += 1,
+            // The loser lost to a name that now exists: that is `EEXIST` for
+            // `O_CREAT | O_EXCL`, not a retryable condition conflict.
+            Err(error) if error.code() == afs_error::IO_ALREADY_EXISTS => collisions += 1,
             Err(error) => panic!("unexpected create result: {error}"),
         }
     }
     assert_eq!(successes, 1);
-    assert_eq!(conflicts, 1);
+    assert_eq!(collisions, 1);
+}
+
+/// A create over a name that already exists answers "already exists" (errno
+/// `EEXIST`), whatever the name is bound to; lock files and `mkstemp` depend
+/// on it. Only the very operation that created the name replays its result.
+#[tokio::test]
+async fn create_over_an_existing_name_reports_already_exists() {
+    let dfs = memory_dfs().await;
+    let first = dfs
+        .create(create_request("first-create", b"taken".to_vec()))
+        .await
+        .unwrap();
+    dfs.mkdir(MkdirRequest {
+        caller_id: "node-a".into(),
+        operation_id: OperationId::new("taken-directory"),
+        namespace_id: NamespaceId::new("default"),
+        parent_inode_id: InodeId::new("1"),
+        name: b"taken-directory".to_vec(),
+        attributes: InodeAttributes {
+            mode: 0o755,
+            ..attrs()
+        },
+        caller: CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+    })
+    .await
+    .unwrap();
+
+    for name in [b"taken".to_vec(), b"taken-directory".to_vec()] {
+        let error = dfs
+            .create(create_request("second-create", name.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            afs_error::IO_ALREADY_EXISTS,
+            "create over {:?}: {error}",
+            String::from_utf8_lossy(&name)
+        );
+        assert_eq!(error.kind(), afs_error::ErrorKind::AlreadyExists);
+    }
+    let found = dfs
+        .lookup(
+            NamespaceId::new("default"),
+            InodeId::new("1"),
+            b"taken".to_vec(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        found.inode_id, first.0.inode_id,
+        "the refused create must leave the existing file in place"
+    );
 }
 
 #[tokio::test]
