@@ -2006,6 +2006,62 @@ fn r91_open_dirty(fs: &DistributedFs, name: &str) -> (FileHandle, InodeId) {
     (file.handle, fs.inode_id(file.entry.inode).unwrap())
 }
 
+#[test]
+fn a_file_at_its_dirty_limit_does_not_commit_another_file() {
+    let chunk = COMMIT_CHUNK_BYTES as usize;
+    // With two open writers, the 32 MiB Node limit gives each 16 MiB.
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * chunk, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = fs.with_write_timeout(Duration::from_secs(1));
+    let (oldest, oldest_inode) = r91_open_dirty(&fs, "r91-owner-limit-oldest");
+    let (writer, writer_inode) = r91_open_dirty(&fs, "r91-owner-limit-writer");
+    // Leave four separate builders partially filled, with no upload ready.
+    for index in 1..4 {
+        assert_eq!(
+            fs.write(&context(), writer, index * COMMIT_CHUNK_BYTES, b"x")
+                .unwrap(),
+            1
+        );
+    }
+    let pipeline = fs.write_resources.pipeline.as_ref().unwrap();
+    let writer_cell = fs.write_state(&writer_inode).unwrap().unwrap();
+    let budget = pipeline.budget.snapshot();
+    assert_eq!(budget.limit, 8 * chunk);
+    assert_eq!(budget.live_bytes, 5 * chunk);
+    assert_eq!(
+        writer_cell
+            .lock()
+            .unwrap()
+            .native_owner
+            .snapshot()
+            .live_bytes,
+        4 * chunk
+    );
+    assert!(meta.commits.lock().unwrap().is_empty());
+
+    // The next builder fits on the Node, but exceeds this file's limit.
+    // Without a periodic pass, the original admission loop times out.
+    let result = fs.write(&context(), writer, 4 * COMMIT_CHUNK_BYTES, b"x");
+    assert!(
+        meta.commits.lock().unwrap().is_empty(),
+        "a per-file limit must not trigger an early commit"
+    );
+    assert_eq!(result.unwrap_err().code(), afs_error::IO_TIMEOUT);
+    assert!(
+        fs.write_state(&oldest_inode)
+            .unwrap()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .dirty
+    );
+
+    for handle in [oldest, writer] {
+        fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+        fs.release(&context(), handle).unwrap();
+    }
+}
+
 /// R91: a write waiting for dirty budget must not wait for the periodic
 /// commit. The oldest file holding budget is committed early, which frees its
 /// builder; younger holders keep theirs.

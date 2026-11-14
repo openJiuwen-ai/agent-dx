@@ -490,9 +490,12 @@ impl DistributedFs {
                             Err(error) => return Err(error),
                         }
                     }
-                    DirtyAdmission::Wait { epoch } => {
+                    DirtyAdmission::Wait {
+                        epoch,
+                        node_budget_short,
+                    } => {
                         self.request_pipeline_pressure(cell, false)?;
-                        if budget_stalled {
+                        if node_budget_short && budget_stalled {
                             self.relieve_stalled_dirty_budget(pipeline)?;
                         }
                         crate::node::call_deadline::within(deadline, || self.progress_writeback())?;

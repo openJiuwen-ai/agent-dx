@@ -22,7 +22,11 @@ pub(crate) struct DirtyBudgetSnapshot {
 #[derive(Debug)]
 pub(crate) enum DirtyAdmission {
     Reserved(DirtyLease),
-    Wait { epoch: u64 },
+    Wait {
+        epoch: u64,
+        /// The requested bytes exceed the remaining Node-wide capacity.
+        node_budget_short: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -90,12 +94,16 @@ impl DirtyBudget {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
-        if bytes > self.limit.saturating_sub(state.live_bytes)
+        let node_budget_short = bytes > self.limit.saturating_sub(state.live_bytes);
+        if node_budget_short
             || owner_state
                 .as_ref()
                 .is_some_and(|owner| bytes > owner_limit.saturating_sub(owner.live_bytes))
         {
-            return Ok(DirtyAdmission::Wait { epoch: state.epoch });
+            return Ok(DirtyAdmission::Wait {
+                epoch: state.epoch,
+                node_budget_short,
+            });
         }
         state.live_bytes += bytes;
         state.live_peak_bytes = state.live_peak_bytes.max(state.live_bytes);
