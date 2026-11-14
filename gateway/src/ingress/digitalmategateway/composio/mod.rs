@@ -39,6 +39,7 @@ use std::sync::Arc;
 pub struct Composio {
     client: Client,
     authority: Arc<dyn Authority>,
+    subscriptions: Option<Arc<super::ingestion::SubscriptionCoordinator>>,
 }
 
 /// Kept inside the transport: an account capability never substitutes for the
@@ -189,7 +190,35 @@ impl Composio {
         Ok(Self {
             client: Client::new(api_key, configs, budget)?,
             authority,
+            subscriptions: None,
         })
+    }
+
+    async fn synchronize_subscription(
+        &self,
+        scope: &Scope,
+        connection_id: &str,
+    ) -> Result<super::ingestion::SubscriptionOutcome, Error> {
+        use super::ingestion::{Error as IngestionError, SubscriptionError};
+        self.subscriptions
+            .as_ref()
+            .ok_or(Error::NotConfigured)?
+            .synchronize(scope, connection_id)
+            .await
+            .map_err(|failure| match failure {
+                SubscriptionError::Provider(error) => error,
+                SubscriptionError::Ingestion(error) => match error {
+                    IngestionError::Refused => Error::Forbidden,
+                    IngestionError::ConflictingInput
+                    | IngestionError::LeaseLost
+                    | IngestionError::DeliveryUnknown => Error::OutcomeUnknown,
+                    IngestionError::Capacity => Error::RateLimited { retry_after: None },
+                    IngestionError::InvalidLimit | IngestionError::InvalidManifest => {
+                        Error::InvalidResponse
+                    }
+                    IngestionError::Unavailable => Error::UpstreamUnavailable,
+                },
+            })
     }
 
     /// Claim before the POST: a lost result stays with the flow owner for

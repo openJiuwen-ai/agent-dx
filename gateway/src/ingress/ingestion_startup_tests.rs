@@ -20,19 +20,25 @@ fn write(path: &Path, value: serde_json::Value) {
 #[tokio::test]
 #[ignore = "requires the explicit task-owned PostgreSQL database"]
 async fn formal_ingestion_startup_requires_secret_mounts_webhook_and_stops() {
-    run_startup_case(false).await;
+    run_startup_case(false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit task-owned PostgreSQL database"]
 async fn formal_composio_startup_requires_project_key_and_shared_budget_without_ingestion() {
-    run_startup_case(true).await;
+    run_startup_case(true, false).await;
 }
 
-async fn run_startup_case(composio_only: bool) {
+#[tokio::test]
+#[ignore = "requires the explicit task-owned PostgreSQL database"]
+async fn formal_composio_and_ingestion_startup_share_subscription_entry_and_stop() {
+    run_startup_case(false, true).await;
+}
+
+async fn run_startup_case(composio_only: bool, combined: bool) {
     if std::env::var_os("ADX_INGESTION_STARTUP_CHILD").is_some() {
-        if composio_only {
-            composio_child().await;
+        if composio_only || combined {
+            composio_child(combined).await;
         } else {
             child().await;
         }
@@ -80,8 +86,10 @@ async fn run_startup_case(composio_only: bool) {
         "ingestion":{"database_url_env":"ADX_STARTUP_DB_URL","database_allow_plaintext":true,"database_max_connections":8,
             "workers":1,"lease_seconds":30,"delivery_timeout_seconds":5,"max_pending_events":100,"max_pending_bytes":8000000,"per_subscription_events":50,"debounce_milliseconds":0,"dedupe_retention_seconds":604800},
     });
-    if composio_only {
-        settings.as_object_mut().unwrap().remove("ingestion");
+    if composio_only || combined {
+        if composio_only {
+            settings.as_object_mut().unwrap().remove("ingestion");
+        }
         settings["composio"] = json!({
             "auth_configs":{"outlook":{"id":"ac_startup","ownership":"composio_managed"}},
             "organization":"startup-test",
@@ -111,7 +119,7 @@ async fn run_startup_case(composio_only: bool) {
     let secret = directory.path().join("webhook.json");
     write(
         &secret,
-        if composio_only {
+        if composio_only || combined {
             json!({"project_api_key":"startup-project-key"})
         } else {
             json!({"webhook_secrets":["startup-signing-secret"]})
@@ -119,7 +127,7 @@ async fn run_startup_case(composio_only: bool) {
     );
     let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
     command.env_clear().kill_on_drop(true)
-        .arg("--exact").arg(if composio_only {"ingress::service::ingestion_startup_tests::formal_composio_startup_requires_project_key_and_shared_budget_without_ingestion"} else {"ingress::service::ingestion_startup_tests::formal_ingestion_startup_requires_secret_mounts_webhook_and_stops"})
+        .arg("--exact").arg(if combined {"ingress::service::ingestion_startup_tests::formal_composio_and_ingestion_startup_share_subscription_entry_and_stop"} else if composio_only {"ingress::service::ingestion_startup_tests::formal_composio_startup_requires_project_key_and_shared_budget_without_ingestion"} else {"ingress::service::ingestion_startup_tests::formal_ingestion_startup_requires_secret_mounts_webhook_and_stops"})
         .arg("--ignored").arg("--nocapture").arg("--test-threads=1")
         .env("ADX_INGESTION_STARTUP_CHILD", "1").env("ADX_STARTUP_DB_URL", url)
         .env("ADX_JIUWEN_CONFIG", &gateway).env("ADX_ACCOUNT_CONFIG", account)
@@ -141,7 +149,7 @@ async fn run_startup_case(composio_only: bool) {
     );
 }
 
-async fn composio_child() {
+async fn composio_child(combined: bool) {
     let (mut config, control) = super::tests::settings();
     config.listeners = Some(vec![super::super::ListenerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -194,6 +202,21 @@ async fn composio_child() {
         .await
         .unwrap();
     drop(database);
+    if combined {
+        assert!(
+            IngressService::bind(config.clone(), control.clone())
+                .await
+                .is_err(),
+            "ingestion additionally requires its independently stored webhook secret"
+        );
+        let input = std::path::PathBuf::from(std::env::var("STARTUP_WEBHOOK_INPUT").unwrap())
+            .with_file_name("combined-webhook.json");
+        write(
+            &input,
+            json!({"webhook_secrets":["startup-signing-secret"]}),
+        );
+        import_composio_webhook_secret(&input, "new").await.unwrap();
+    }
     let service = IngressService::bind(config, control).await.unwrap();
     let address = service.public_listeners[0].0.local_addr().unwrap();
     let (shutdown, stop) = tokio::sync::oneshot::channel();
@@ -217,6 +240,25 @@ async fn composio_child() {
         .await
         .unwrap();
     assert_eq!(denied.status(), http::StatusCode::UNAUTHORIZED);
+    for bearer in [
+        None,
+        Some("alice-business-session"),
+        Some("dm-privacy-v1.controlled"),
+        Some("dm-ingestion-v1.controlled"),
+    ] {
+        let mut request = client
+            .post(format!(
+                "http://{address}/api/digitalmate/connectors/v1/composio/subscription"
+            ))
+            .json(&json!({"connection_id":"connection-one"}));
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            http::StatusCode::UNAUTHORIZED
+        );
+    }
     let webhook = client
         .post(format!(
             "http://{address}/api/digitalmate/ingestion/v1/composio/webhook"
@@ -225,7 +267,14 @@ async fn composio_child() {
         .send()
         .await
         .unwrap();
-    assert_eq!(webhook.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        webhook.status(),
+        if combined {
+            http::StatusCode::UNAUTHORIZED
+        } else {
+            http::StatusCode::NOT_FOUND
+        }
+    );
     shutdown.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), running)
         .await

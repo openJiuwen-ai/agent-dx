@@ -292,9 +292,16 @@ impl DigitalMateGatewayApi {
         let gateway = self.composio.clone();
         #[cfg(unix)]
         let gateway = gateway.or_else(|| {
-            self.prepared_composio
-                .as_ref()
-                .map(|prepared| Arc::new(prepared.bind(ingress)))
+            self.prepared_composio.as_ref().map(|prepared| {
+                Arc::new(
+                    prepared.bind(
+                        ingress,
+                        self.ingestion
+                            .as_ref()
+                            .map(|ingestion| ingestion.inbox.clone()),
+                    ),
+                )
+            })
         });
         #[cfg(not(unix))]
         let _ = ingress;
@@ -312,6 +319,7 @@ impl DigitalMateGatewayApi {
             .connector_scope(
                 request.headers(),
                 request.uri().path() == super::composio::http::VALIDATE_PATH
+                    || request.uri().path() == super::composio::http::SUBSCRIPTION_PATH
                     || request.uri().path() == "/api/digitalmate/connectors/v1/composio/mail",
             )
             .await

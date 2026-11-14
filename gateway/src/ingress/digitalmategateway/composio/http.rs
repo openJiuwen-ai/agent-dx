@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 pub const PREFIX: &str = "/api/digitalmate/connectors/v1/composio";
 pub const CALLBACK_PATH: &str = "/api/digitalmate/connectors/v1/composio/callback";
 pub const VALIDATE_PATH: &str = "/api/digitalmate/connectors/v1/composio/validate";
+pub const SUBSCRIPTION_PATH: &str = "/api/digitalmate/connectors/v1/composio/subscription";
 const MAX_REQUEST_BYTES: usize = 16_384;
 
 #[derive(Deserialize)]
@@ -134,7 +135,7 @@ pub fn matches(path: &str) -> bool {
     path.strip_prefix(PREFIX).is_some_and(|suffix| {
         matches!(
             suffix,
-            "/start" | "/state" | "/confirm" | "/cancel" | "/mail" | "/validate"
+            "/start" | "/state" | "/confirm" | "/cancel" | "/mail" | "/validate" | "/subscription"
         )
     })
 }
@@ -209,6 +210,21 @@ async fn dispatch(
     bytes: &[u8],
 ) -> Result<Value, Error> {
     match path.strip_prefix(PREFIX) {
+        Some("/subscription") => {
+            let request: Validation = decode(bytes)?;
+            reference(&request.connection_id)?;
+            match gateway
+                .synchronize_subscription(scope, &request.connection_id)
+                .await?
+            {
+                super::super::ingestion::SubscriptionOutcome::Enabled(binding) => {
+                    Ok(json!({"state":"enabled", "binding":binding}))
+                }
+                super::super::ingestion::SubscriptionOutcome::Disabled => {
+                    Ok(json!({"state":"disabled"}))
+                }
+            }
+        }
         Some("/validate") => {
             let request: Validation = decode(bytes)?;
             reference(&request.connection_id)?;

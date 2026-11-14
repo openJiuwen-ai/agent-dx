@@ -46,11 +46,11 @@ ACK 只提交被领取的准确成员，不推进 sequence 高水位，A/B 处�
 
 现有 `/v1/connector/identity` 及成功的 `/v1/connector/renew` 响应公开已验签凭据对应的 `renewable`、`recovery_expires_at` 和 `bootstrap_until`，并沿用真实 grant/current Binding 核验。普通 connector 返回 `renewable: true`、`bootstrap_until: null`；恢复截止是该凭据签名的原续期窗口，受原服务端续期/撤销策略控制，不代表永久许可。bootstrap connector 返回 `renewable: false`，两个截止均等于 access 到期，续期仍拒绝。消费者只能依据真实 HTTPS authority 响应核验当前 scope/代次及这些字段；本地文件或自行解 token 不能产生授权事实。
 
-以下生产接线仍未实现，PR 保持 Draft：
+当前源码接线与剩余验收边界，PR 保持 Draft：
 
-- 用户明确启用/撤销的持久订阅 owner，以及现有 Composio 适配器内受限 trigger 操作和未知结果恢复。`Inbox.register` 只接受已经过真实 owner 授权的投影。
-- #1192 真实 `server.py` 的冷 receiver mount/admission、用途限定 bootstrap 的消费者及实际连接源/Session 权限；不能放行所有 internal 路由规避。
-- Gmail 授权/读取 HTTP 路由采用真实 Authority 和已实现的共享预算；独立组件通过不代表调用方已装配。
+- 公共 M44 Registry 是明确订阅意图的唯一写入者。受限 Composio trigger 操作及正式 normal-connector `/composio/subscription` 已接同一 client、M44 proxy 和 Inbox；网络失败不当成停用，已发送效果未知时保留原目标。详见[订阅状态接口](ingestion-subscription-state.md)。
+- #1192 `create_app` 已挂载精确冷 receiver 与原共享邮件 worker，逐阶段检查用途、完整 binding、当前 intent 和读取权限，不放行所有 internal 路由、不启动模型。安装态核心90项、owner/启动组合48项通过；外部身份/Gateway/provider/report回复受控，未代替真实环境验收。
+- 正式 Gmail/Outlook 授权/读取 HTTP 采用实际 M44 Authority 和共享预算；Gmail 额外读取 Google UserInfo 不可变 ID，邮箱不替代账号身份。原生回跳和真实 owner 两侧组合仍按实际环境验收。
 - 真实 trigger/OAuth、暂停实例唤醒、实际 Gmail 与集群验收。
 
 Gateway 的独立池、真实用途 producer、回调入口和 worker 已接入 `IngressService.bind/serve`。
@@ -64,8 +64,8 @@ Gateway 的独立池、真实用途 producer、回调入口和 worker 已接入 
 
 以下字段放在已有 `ADX_JIUWEN_CONFIG` 中；`privacy.template` 必须匹配
 `digitalmate.template`。沿用既有 `ADX_ACCOUNT_CONFIG` 和
-`ADX_CREDENTIAL_KEY_FILE`，不重新生成根密钥。生产者侧代码就绪不表示 #1192
-冷接收端、实际订阅权限或外部 Composio 配置已经完成。
+`ADX_CREDENTIAL_KEY_FILE`，不重新生成根密钥。生产者侧代码和 #1192 冷接收端候选
+就绪不表示实际订阅权限、外部 Composio 配置或真实邮箱交付已经验收。
 
 ```json
 {

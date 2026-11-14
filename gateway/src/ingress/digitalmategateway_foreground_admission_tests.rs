@@ -376,6 +376,22 @@ async fn foreground_composio_routes_reach_real_ingress_dispatch_without_ws_or_mo
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let _ = response.collect().await.unwrap();
     assert_eq!(upstream.call_count(), 0);
+    let response = sender
+        .send_request(
+            Request::post("/api/digitalmate/connectors/v1/composio/subscription")
+                .header("host", "localhost")
+                .header("authorization", "Bearer alice-session")
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"connection_id":"connection-one"}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let _ = response.collect().await.unwrap();
+    assert_eq!(upstream.call_count(), 0);
     server.abort();
     client.abort();
 }

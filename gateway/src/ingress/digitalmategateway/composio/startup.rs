@@ -67,17 +67,30 @@ pub(crate) struct PreparedComposio {
 }
 
 impl PreparedComposio {
-    pub(crate) fn bind(&self, ingress: Arc<Ingress>) -> Composio {
+    pub(crate) fn bind(
+        &self,
+        ingress: Arc<Ingress>,
+        inbox: Option<super::super::ingestion::Inbox>,
+    ) -> Composio {
         // The process client, HTTP pool and PG budget are shared. Bind only the
         // existing request's Relay handle; retaining it on the API would cycle.
+        let authority = Arc::new(M44Authority::new(
+            self.owner.clone(),
+            self.managed.clone(),
+            ingress,
+            self.configs.clone(),
+        ));
+        let subscriptions = inbox.map(|inbox| {
+            Arc::new(super::subscriptions::coordinator(
+                self.client.clone(),
+                authority.clone(),
+                inbox,
+            ))
+        });
         Composio {
             client: self.client.clone(),
-            authority: Arc::new(M44Authority::new(
-                self.owner.clone(),
-                self.managed.clone(),
-                ingress,
-                self.configs.clone(),
-            )),
+            authority,
+            subscriptions,
         }
     }
 }

@@ -42,9 +42,9 @@ The coordinator compares current facts around external I/O and registration.
 It fences a stopped registration before upstream disable, retains a failed
 cleanup for restart/retry, and refuses stale epochs. The returned enabled binding
 is an existing serde projection, not new authority. The core does not hardcode
-mail providers, mail filters or toolkit slugs. The production adapter and HTTP
-mount must be supplied separately; a passing substituted-port test does not
-prove that production route is installed.
+mail providers, mail filters or toolkit slugs. The production adapter and formal
+HTTP mount are supplied by Composio's prepared process assembly; isolated
+substituted-port tests do not establish live account acceptance.
 
 Existing same-generation registration conflicts remain explicit. Restart within
 the same Binding is covered; changing the actual Binding target requires explicit
@@ -108,5 +108,39 @@ Initial transport cases failed; after adding diagnostics and explicitly excludin
 loopback from the test process proxy, all seven pass without relaxing assertions
 or production TLS. Focused library Clippy and workspace formatting pass. The
 controlled project uses a synthetic key and namespace; these tests do not prove
-actual issuer/M44 transport or real provider authorization. HTTP/Prepared mounting
-and Hong Kong acceptance remain consumer work.
+actual issuer/M44 transport or real provider authorization.
+
+## Formal subscription HTTP assembly
+
+`POST /api/digitalmate/connectors/v1/composio/subscription` accepts exactly
+`{"connection_id":"..."}` through the existing bounded JSON adapter. It requires
+the normal connector identity, with current grant/Binding checks around the
+request; business, privacy and delivery bearers cannot invoke it. JSON cannot
+set opt-in, account, target or trigger configuration. Success returns
+`{"state":"enabled","binding":...}` using the existing binding serde, or
+`{"state":"disabled"}`. Provider/owner failure remains an error, never false opt-out.
+
+`PreparedComposio::bind` shares its existing project client/budget, the same typed
+M44 proxy and `PreparedIngestion`'s already opened Inbox. It creates no second
+queue, pool, service or lifecycle owner. Without ingestion, foreground OAuth and
+reads remain available; subscription synchronization returns `not_configured`.
+Each request retains its own Relay handle without a process ownership cycle.
+
+The missing endpoint first returns404 in the RED test. The mounted ordinary
+Gateway suite passes348 cases with28 ignored. Four explicit fresh-database tests
+also pass: actual HTTP/project client/Inbox registration, repeat, failed disable
+and retry; combined process startup; Composio without ingestion; ingestion alone.
+The first PG run exposed a test expecting503 for an already dispatched effect;
+the original client correctly returns409 `outcome_unknown`. The corrected test
+asserts the exact error while retaining the local fence and same-trigger retry.
+A subsequent private-file import refusal was caused by the test TMPDIR on a
+Windows mount; native private `/tmp` fixes the fixture, without weakening the
+production permission check. Each isolated PG process is verified and stopped.
+
+Provider replies and intent are controlled in that HTTP test. The formal startup
+tests use actual configuration owners, encrypted imports, shared PostgreSQL,
+Ingress bind/serve and purpose refusal, with synthetic accounts/services. Real
+M44 transport, OAuth, trigger callbacks, wake/receiver delivery and Hong Kong/SFS
+acceptance remain separate. On consumer restart, an already deleted connection
+whose old binding is absent from its cache/queue is not automatically discovered;
+this implementation does not claim all such provider triggers were disabled.

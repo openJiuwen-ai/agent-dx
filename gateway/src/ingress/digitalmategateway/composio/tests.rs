@@ -336,6 +336,192 @@ async fn outlook_keywords_keep_exact_sender_and_time_bounds_without_search_filte
 }
 
 #[tokio::test]
+async fn http_subscription_requires_initialized_ingestion_and_rejects_enablement_json() {
+    let f = Fixture::outlook(true).await;
+    let path = "/api/digitalmate/connectors/v1/composio/subscription";
+    let (status, reply) = http_candidate(&f, path, r#"{"connection_id":"connection-one"}"#).await;
+    assert_eq!(status, 503);
+    assert_eq!(reply, json!({"error":"not_configured"}));
+    for raw in [
+        r#"{"connection_id":"connection-one","enabled":true}"#,
+        r#"{"connection_id":"connection-one","connection_id":"other"}"#,
+        r#"{"connection_id":"connection-one","binding":{}}"#,
+        r#"{"connection_id":""}"#,
+    ] {
+        assert_eq!(http_candidate(&f, path, raw).await.0, 400);
+    }
+    assert_eq!(f.call_count(), 0);
+    assert_eq!(f.authority.writes.load(Ordering::SeqCst), 0);
+}
+
+struct ControlledSubscriptionIntent {
+    current: Mutex<super::super::ingestion::SubscriptionSnapshot>,
+    unavailable: AtomicBool,
+}
+
+#[async_trait]
+impl super::super::ingestion::IntentPort for ControlledSubscriptionIntent {
+    async fn current(
+        &self,
+        _: &Scope,
+        id: &str,
+    ) -> Result<Option<super::super::ingestion::SubscriptionSnapshot>, Error> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(Error::UpstreamUnavailable);
+        }
+        let current = self.current.lock().unwrap().clone();
+        assert_eq!(id, current.connection_id);
+        Ok(Some(current))
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires explicit task-owned PostgreSQL; owner intent and provider replies are controlled"]
+async fn http_subscription_uses_real_project_client_and_inbox_then_fences_disable_failure() {
+    use super::super::ingestion::{
+        Inbox, InboxLimits, SubscriptionCoordinator, SubscriptionSnapshot,
+    };
+    use deadpool_postgres::{Manager, Pool};
+    let pg: tokio_postgres::Config = std::env::var("ADX_INGESTION_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(pg.get_dbname().unwrap().starts_with("dm_ingestion_test_"));
+    let pool = Pool::builder(Manager::new(pg, tokio_postgres::NoTls))
+        .max_size(2)
+        .build()
+        .unwrap();
+    let inbox = Inbox::initialize(
+        pool,
+        InboxLimits {
+            max_pending_events: 100,
+            max_pending_bytes: 8_000_000,
+            per_subscription_events: 50,
+            debounce: std::time::Duration::ZERO,
+            dedupe_retention: std::time::Duration::from_secs(604800),
+        },
+    )
+    .await
+    .unwrap();
+    let mut f = Fixture::outlook(true).await;
+    let connection_id = format!("connection_{}", uuid::Uuid::new_v4());
+    let intent = Arc::new(ControlledSubscriptionIntent {
+        current: Mutex::new(SubscriptionSnapshot {
+            binding_scope: adx_agent_core::Scope {
+                tenant: f.scope.tenant().into(),
+                template: "digitalmate".into(),
+                template_ref: "1".parse().unwrap(),
+                binding_id: "binding_http".into(),
+            },
+            user_id: f.scope.user_id().into(),
+            workspace: f.scope.workspace().into(),
+            binding_generation: "generation_http".into(),
+            service_port: 8080,
+            connection_id: connection_id.clone(),
+            provider: "microsoft".into(),
+            trigger_slug: "OUTLOOK_MESSAGE_TRIGGER".into(),
+            account_id: "ca_one".into(),
+            auth_config_id: "ac_mail_outlook".into(),
+            composio_user_id: f.scope.composio_user_id(),
+            connection_generation: 1,
+            record_revision: 1,
+            intent_revision: 1,
+            enabled: true,
+            usable: true,
+        }),
+        unavailable: AtomicBool::new(false),
+    });
+    f.gateway.subscriptions = Some(Arc::new(SubscriptionCoordinator::new(
+        inbox.clone(),
+        intent.clone(),
+        Arc::new(super::subscriptions::ProjectTriggers::new(
+            f.gateway.client.clone(),
+        )),
+    )));
+    let page = |disabled: bool| {
+        json!({"items":[{
+        "id":"ti_http", "connected_account_id":"ca_one", "trigger_name":"OUTLOOK_MESSAGE_TRIGGER",
+        "user_id":f.scope.composio_user_id(), "trigger_config":{},
+        "disabled_at":if disabled {json!("2026-11-14T00:00:00Z")} else {Value::Null}
+    }], "next_cursor":null})
+    };
+    let body = json!({"connection_id":connection_id}).to_string();
+    let path = "/api/digitalmate/connectors/v1/composio/subscription";
+    let mut saved = None;
+    for _ in 0..2 {
+        f.reply(200, f.outlook_account(true));
+        f.reply(200, page(false));
+        let (status, reply) = http_candidate(&f, path, &body).await;
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["state"], "enabled");
+        assert_eq!(reply.as_object().unwrap().len(), 2);
+        let binding: super::super::ingestion::SubscriptionBinding =
+            serde_json::from_value(reply["binding"].clone()).unwrap();
+        assert!(
+            inbox
+                .subscription(&binding.subscription_id)
+                .await
+                .unwrap()
+                .as_ref()
+                == Some(&binding)
+        );
+        if let Some(previous) = &saved {
+            assert!(previous == &binding);
+        }
+        saved = Some(binding);
+    }
+    let binding = saved.unwrap();
+    intent.unavailable.store(true, Ordering::SeqCst);
+    assert_eq!(http_candidate(&f, path, &body).await.0, 503);
+    assert!(
+        inbox
+            .subscription(&binding.subscription_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+    intent.unavailable.store(false, Ordering::SeqCst);
+    {
+        let mut current = intent.current.lock().unwrap();
+        current.enabled = false;
+        current.intent_revision += 1;
+    }
+    f.reply(200, page(false));
+    f.reply(503, json!({"error":"controlled_service_outage"}));
+    // The original project client fences a physically sent effect as unknown.
+    // Do not claim either success or a safe-to-repeat enable operation.
+    assert_eq!(
+        http_candidate(&f, path, &body).await,
+        (409, json!({"error":"outcome_unknown"}))
+    );
+    assert!(
+        !inbox
+            .subscription(&binding.subscription_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+    f.reply(200, page(false));
+    f.reply(200, json!({"status":"success"}));
+    assert_eq!(
+        http_candidate(&f, path, &body).await,
+        (200, json!({"state":"disabled"}))
+    );
+    assert_eq!(f.authority.writes.load(Ordering::SeqCst), 0);
+    let calls = f.state.calls.lock().unwrap();
+    let disables: Vec<_> = calls
+        .iter()
+        .filter(|(path, _)| path.contains("/manage/"))
+        .collect();
+    assert_eq!(disables.len(), 2);
+    assert!(disables.iter().all(|(path, body)| path
+        == "/api/v3.1/trigger_instances/manage/ti_http"
+        && body == &json!({"status":"disable", "user_id":f.scope.composio_user_id()})));
+}
+
+#[tokio::test]
 async fn http_account_validation_probes_mail_without_granting_or_reading_content() {
     let f = Fixture::outlook(true).await;
     f.authority.grant.lock().unwrap().permissions = Permissions::default();

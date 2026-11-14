@@ -151,7 +151,7 @@ user rolls back the organization charge. A user's allowance spans workspaces.
 Replicas must use the same database and stable organization ID; mismatched limit
 configuration fails closed. Database failure never falls back to unlimited
 access. This does not reserve a minimum share per user or replace upstream 429
-handling. The Gateway Gmail routes still need to select this owner at assembly.
+handling. The formal configured Gateway selects this same owner at assembly.
 
 ## Operations and observable outcomes
 
@@ -163,6 +163,7 @@ handling. The Gateway Gmail routes still need to select this owner at assembly.
 | Completed flow retry | `verified_receipt` reads the owner's retained current-generation proof if the response after owner commit was lost. No repeat complete_auth or receipt write; missing, cancelled or stale proof cannot fabricate success. |
 | `cancel` | Delegate local cancellation to the flow owner, which fences late completion. Pending upstream state/cleanup remains that owner's obligation. |
 | `mail(scope, connection, MailRequest)` (legacy Gmail wrapper retained) | Resolve current connection, generation and existing tool grant; verify account ownership and bound mailbox online; check owner again before dispatch and after response. Return no late content after disconnect. |
+| `POST /composio/subscription` | Normal connector identity only; consume the actual saved M44 intent, synchronize the exact configured account/trigger and register through the existing Inbox. Request JSON only supplies connection_id; it cannot enable an intent. Missing ingestion is not_configured. |
 | `disconnect` | Owner fences access first and retains a cleanup handle. Online verify the upstream account belongs to this scope, then best-effort revoke; a previously REVOKED account reconciles without another effect. Failure cannot re-enable local access or be reported as successful upstream revocation. |
 
 Flow receipts publish account identity only. The DigitalMate sandbox consumer
