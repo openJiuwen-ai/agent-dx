@@ -38,6 +38,7 @@ struct OwnerFilesFactory {
 impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
     fn prepare_root(
         &self,
+        caller: &vfs::types::RequestContext,
         reservation: &vfs::ownerfs::root::RootReservation,
         params: &vfs::ownerfs::root::RootCreateParams,
     ) -> afs_error::Result<()> {
@@ -49,7 +50,7 @@ impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
                 .await?;
             tokio::time::timeout(
                 self.timeout,
-                rpc::ownerfs::prepare_root(channel, reservation, params),
+                rpc::ownerfs::prepare_root(channel, caller, reservation, params),
             )
             .await
             .map_err(|_| {

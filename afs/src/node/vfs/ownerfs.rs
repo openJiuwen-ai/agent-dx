@@ -386,12 +386,16 @@ pub struct OwnerFsPeerExecutor {
 impl OwnerFsPeerExecutor {
     /// Prepare and activate a reserved workspace on this Home, then request
     /// the configured bind asynchronously. Bind failure does not fail creation.
+    /// The mount-root mutation is authorized by the original mkdir caller, not
+    /// by the peer node identity, as the kernel does for a local FUSE mkdir.
     pub(crate) fn prepare_owner_root(
         &self,
         requester_node_id: &str,
+        caller: &RequestContext,
         reservation: &root::RootReservation,
         params: &root::RootCreateParams,
     ) -> Result<()> {
+        authorize_create_in_directory(caller, &self.local.owner_root_attributes()?)?;
         self.local
             .prepare_workspace(requester_node_id, reservation, params)
     }
@@ -954,13 +958,16 @@ impl OwnerFsPeerExecutor {
 /// implementation. OwnerFs keeps the trait here so B-side remote dispatch does
 /// not depend on Proto/gRPC/RDMA types.
 pub trait RemoteFilesFactory: Send + Sync {
-    /// Execute a reserved creation on its selected remote Home.
+    /// Execute a reserved creation on its selected remote Home. The Home needs
+    /// the original mkdir caller to authorize the mount-root mutation and to
+    /// derive the workspace owner.
     fn prepare_root(
         &self,
+        caller: &RequestContext,
         reservation: &root::RootReservation,
         params: &root::RootCreateParams,
     ) -> Result<()> {
-        let _ = (reservation, params);
+        let _ = (caller, reservation, params);
         Err(Error::coded(
             afs_error::NODE_VFS_UNIMPLEMENTED,
             "remote workspace creation is not configured",
@@ -4931,7 +4938,7 @@ impl LocalOwnerFs {
                         "OwnerFs remote dispatch is not configured",
                     )
                 })?;
-                peers.prepare_root(&reservation, &params)?;
+                peers.prepare_root(ctx, &reservation, &params)?;
             }
             return self.lookup_root_entry(name);
         }

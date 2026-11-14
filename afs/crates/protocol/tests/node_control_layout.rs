@@ -77,7 +77,9 @@ fn service_paths_keep_the_package() {
 /// Generation 5 pages `DfsMeta.ReadDir` (S4a R72); generation 6 carries the
 /// replica failure contract in placement snapshots and write grants (S4b R12).
 /// Generation 7 adds the attributed commit to the proxy sync receipt.
+/// Generation 8 carries the original mkdir caller in workspace preparation and
+/// drops the request-supplied owner, so mixed-version nodes must not interact.
 #[test]
 fn cluster_protocol_generation_includes_the_split_layout() {
-    assert_eq!(CLUSTER_PROTOCOL_VERSION, 7);
+    assert_eq!(CLUSTER_PROTOCOL_VERSION, 8);
 }

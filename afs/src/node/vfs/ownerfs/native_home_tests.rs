@@ -1341,10 +1341,24 @@ impl crate::node::rpc::data::PeerAuthenticator for RemoteCreatePeer {
     }
 }
 
+/// Workspace creation on the mount root needs a root test process: the caller
+/// must be root to pass the create check, and Home writes the caller-derived
+/// owner with `chown(2)`, which a non-root process cannot do. Root-only tests
+/// return early so the default suite stays runnable by a normal user.
+fn skip_without_root() -> bool {
+    // SAFETY: geteuid only reads this process's effective identity.
+    if unsafe { libc::geteuid() } == 0 {
+        return false;
+    }
+    eprintln!("skipping root-only workspace creation test");
+    true
+}
+
 struct RemoteCreateFixture {
     _temp: tempfile::TempDir,
     owner: Arc<OwnerFs>,
     ctx: RequestContext,
+    meta: Arc<NativeHomeMeta>,
     service: crate::node::rpc::control::OwnerControlService,
     request: afs_protocol::node_control::PrepareOwnerRootRequest,
 }
@@ -1390,13 +1404,21 @@ impl RemoteCreateFixture {
             _temp: temp,
             owner,
             ctx: ctx.clone(),
+            meta,
             service,
             request: afs_protocol::node_control::PrepareOwnerRootRequest {
                 reservation: Some(wire),
                 name: b"agent-a".to_vec(),
-                uid: ctx.uid,
-                gid: ctx.gid,
                 mode: 0o750,
+                // Creating a workspace on the mount root is a root-only
+                // operation; the Home derives the owner from this caller.
+                caller: Some(afs_protocol::node_data::OwnerCaller {
+                    uid: 0,
+                    gid: 0,
+                    pid: ctx.pid,
+                    umask: 0,
+                    supplementary_gids: Vec::new(),
+                }),
             },
         }
     }
@@ -1423,6 +1445,47 @@ impl Drop for RemoteCreateFixture {
     fn drop(&mut self) {
         self.owner.mount_manager_shutdown();
     }
+}
+
+#[tokio::test]
+async fn remote_prepare_rejects_non_root_caller_without_leaving_state() {
+    use afs_protocol::node_control::owner_control_server::OwnerControl;
+    let fixture = RemoteCreateFixture::new(None);
+    let mut request = fixture.request.clone();
+    request.caller = Some(afs_protocol::node_data::OwnerCaller {
+        uid: 4242,
+        gid: 4242,
+        pid: 4242,
+        umask: 0,
+        supplementary_gids: Vec::new(),
+    });
+    let error = fixture
+        .service
+        .prepare_owner_root(tonic::Request::new(request))
+        .await
+        .expect_err("only a caller holding mount-root create permission may create a workspace");
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert!(
+        !std::fs::read_dir(fixture._temp.path())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("root-")),
+        "a rejected caller must not leave a prepared directory"
+    );
+    let catalog_records =
+        std::fs::read_dir(fixture._temp.path().join(".ownerfs-roots")).map_or(0, |entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension() == Some(OsStr::new("json")))
+                .count()
+        });
+    assert_eq!(
+        catalog_records, 0,
+        "a rejected caller must not leave a catalog record"
+    );
+    assert!(fixture.meta.active.lock().unwrap().is_empty());
+    let id = root::root_id_from_name(OsStr::new("agent-a")).unwrap();
+    assert!(fixture.meta.pending.lock().unwrap().contains_key(&id));
 }
 
 #[tokio::test]
@@ -1469,6 +1532,9 @@ async fn e2e_remote_prepare_automatically_binds_home_and_deduplicates() {
 
 #[tokio::test]
 async fn remote_prepare_bind_disabled_or_failed_keeps_workspace_usable() {
+    if skip_without_root() {
+        return;
+    }
     for bind_enabled in [false, true] {
         let egress = tempfile::tempdir().unwrap();
         let missing = egress.path().join("missing");

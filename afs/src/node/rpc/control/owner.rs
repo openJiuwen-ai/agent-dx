@@ -113,14 +113,16 @@ impl OwnerControl for OwnerControlService {
         })?;
         let reservation = crate::node::rpc::ownerfs::reservation_from_wire(reservation)
             .map_err(error_to_status)?;
+        let caller =
+            crate::node::rpc::data::caller_context(request.caller).map_err(error_to_status)?;
         let params = crate::node::vfs::ownerfs::root::RootCreateParams {
             name: request.name,
-            uid: request.uid,
-            gid: request.gid,
+            uid: caller.uid,
+            gid: caller.gid,
             mode: request.mode,
         };
         crate::node::bridge::spawn_blocking(move || {
-            owner.prepare_owner_root(&peer, &reservation, &params)
+            owner.prepare_owner_root(&peer, &caller, &reservation, &params)
         })
         .await
         .map_err(|error| coded_status(afs_error::IO_OTHER, error.to_string()))?

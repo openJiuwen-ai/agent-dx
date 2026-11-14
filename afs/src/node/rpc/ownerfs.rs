@@ -7,7 +7,10 @@ use afs_protocol::{
 };
 use tonic::transport::Channel;
 
-use crate::node::vfs::ownerfs::root::{RootCreateParams, RootId, RootReservation};
+use crate::node::vfs::{
+    ownerfs::root::{RootCreateParams, RootId, RootReservation},
+    types::RequestContext,
+};
 
 pub(super) fn reservation_wire(value: &RootReservation) -> WireReservation {
     WireReservation {
@@ -52,6 +55,7 @@ pub(super) fn reservation_from_wire(value: WireReservation) -> Result<RootReserv
 /// Execute one preparation call. Transport errors leave the outcome uncertain.
 pub async fn prepare_root(
     channel: Channel,
+    caller: &RequestContext,
     reservation: &RootReservation,
     params: &RootCreateParams,
 ) -> Result<()> {
@@ -59,9 +63,8 @@ pub async fn prepare_root(
         .prepare_owner_root(PrepareOwnerRootRequest {
             reservation: Some(reservation_wire(reservation)),
             name: params.name.clone(),
-            uid: params.uid,
-            gid: params.gid,
             mode: params.mode,
+            caller: Some(super::peer::owner_caller(caller)),
         })
         .await
         .map_err(afs_transport::grpc::error_status::status_to_error)?;
