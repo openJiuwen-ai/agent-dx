@@ -111,28 +111,17 @@ impl crate::ingress::accounts::BusinessAuth for Identity {
 struct Purpose(std::sync::atomic::AtomicUsize);
 #[async_trait::async_trait]
 impl DeliveryAuthorization for Purpose {
-    async fn admission(
-        &self,
-        batch: &DeliveryBatch,
-    ) -> Result<crate::ingress::agent_service::ExistingServiceAdmission, DeliveryFailure> {
-        crate::ingress::agent_service::ExistingServiceAdmission::new(
-            Scope {
-                tenant: batch.binding.tenant.clone(),
-                template: batch.binding.template.clone(),
-                template_ref: batch
-                    .binding
-                    .template_ref
-                    .parse()
-                    .map_err(|_| DeliveryFailure::Rejected)?,
-                binding_id: batch.binding.binding_id.clone(),
-            },
-            batch.binding.binding_generation.clone(),
-            crate::ingress::agent_service::ServiceSelector {
-                protocol: Protocol::Http,
-                port: Some(batch.binding.service_port),
-            },
-        )
-        .map_err(|_| DeliveryFailure::Rejected)
+    async fn scope(&self, batch: &DeliveryBatch) -> Result<Scope, DeliveryFailure> {
+        Ok(Scope {
+            tenant: batch.binding.tenant.clone(),
+            template: batch.binding.template.clone(),
+            template_ref: batch
+                .binding
+                .template_ref
+                .parse()
+                .map_err(|_| DeliveryFailure::Rejected)?,
+            binding_id: batch.binding.binding_id.clone(),
+        })
     }
     async fn headers(&self, batch: &DeliveryBatch) -> Result<http::HeaderMap, DeliveryFailure> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -207,36 +196,35 @@ async fn published_owner_refuses_missing_or_replaced_binding_without_creating_on
         template_ref: "1".parse().unwrap(),
         binding_id: "binding_one".into(),
     };
-    use crate::ingress::agent_service::{AgentV2Access, ExistingServiceAdmission, ServiceSelector};
+    use crate::ingress::agent_service::{AgentV2Access, ServiceSelector};
     let access = AgentV2Access::new(managed.clone());
-    let admit = |generation: String| {
-        ExistingServiceAdmission::new(
+    assert!(access
+        .select_with_initializer(
+            Arc::new(RequestContext::new(Duration::from_secs(3))),
             scope.clone(),
-            generation,
             ServiceSelector {
                 protocol: Protocol::Http,
-                port: Some(1234),
+                port: Some(1234)
             },
-        )
-        .unwrap()
-    };
-    assert!(access
-        .select_existing(
-            Arc::new(RequestContext::new(Duration::from_secs(3))),
-            &admit("old-generation".into()),
+            async { Err::<adx_agent_core::mounts::Parameters, _>(adx_agent_api::Error::NotFound) },
         )
         .await
         .is_err());
     assert!(state.binding(&scope).await.unwrap().is_none());
     let context = RequestContext::new(Duration::from_secs(3));
-    let (target, _) = managed
+    let (_target, _) = managed
         .resolve(&context, &scope, Protocol::Http, Some(1234))
         .await
         .unwrap();
     let mut selected = access
-        .select_existing(
+        .select_with_initializer(
             Arc::new(RequestContext::new(Duration::from_secs(3))),
-            &admit(target.binding.generation.clone()),
+            scope.clone(),
+            ServiceSelector {
+                protocol: Protocol::Http,
+                port: Some(1234),
+            },
+            async { Err::<adx_agent_core::mounts::Parameters, _>(adx_agent_api::Error::NotFound) },
         )
         .await
         .unwrap();
@@ -244,9 +232,14 @@ async fn published_owner_refuses_missing_or_replaced_binding_without_creating_on
     assert!(access.retry(&mut selected).await.is_err());
     assert!(state.binding(&scope).await.unwrap().is_none());
     assert!(access
-        .select_existing(
+        .select_with_initializer(
             Arc::new(RequestContext::new(Duration::from_secs(3))),
-            &admit(target.binding.generation.clone()),
+            scope.clone(),
+            ServiceSelector {
+                protocol: Protocol::Http,
+                port: Some(1234)
+            },
+            async { Err::<adx_agent_core::mounts::Parameters, _>(adx_agent_api::Error::NotFound) },
         )
         .await
         .is_err());
@@ -260,8 +253,7 @@ async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() 
     let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = reserved.local_addr().unwrap().port();
     drop(reserved);
-    let mut current = binding();
-    current.service_port = port;
+    let current = binding();
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let activator = Arc::new(adx_activator::Activator::new(
         state.clone(),
@@ -287,7 +279,6 @@ async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() 
         )
         .await
         .unwrap();
-    current.binding_generation = target.binding.generation.clone();
     let binding_file = temporary.path().join("binding.json");
     std::fs::write(&binding_file, serde_json::to_vec(&current).unwrap()).unwrap();
     let database = temporary.path().join("receiver.sqlite");
@@ -353,6 +344,7 @@ async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() 
             ingress.clone(),
             purpose.clone(),
             Duration::from_secs(8),
+            port,
         )
         .unwrap_or_else(|_| panic!("delivery configuration")),
     );

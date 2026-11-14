@@ -88,7 +88,8 @@ async fn owner_purpose_persisted_workload_needs_no_phone_and_rechecks_real_grant
             bindings.clone(),
             Arc::new(Auth(AtomicBool::new(true))),
         )
-        .unwrap(),
+        .unwrap()
+        .with_identity(identity.clone()),
     );
     let center = Arc::new(PrivacyCenter::new(
         store,

@@ -1,5 +1,25 @@
 use super::super::composio::{WebhookError, WebhookVerifier};
 use super::*;
+
+#[test]
+fn mail_subscription_accepts_an_owner_grant_reference_without_execution_identity() {
+    let mut wire = serde_json::to_value(binding()).unwrap();
+    let fields = wire.as_object_mut().unwrap();
+    fields.remove("binding_generation");
+    fields.remove("service_port");
+    fields.insert("authority_ref".into(), serde_json::json!("a".repeat(64)));
+    let projection = serde_json::from_value::<SubscriptionBinding>(wire.clone());
+    assert!(
+        projection.is_ok(),
+        "mail projection must accept the actual grant reference"
+    );
+    assert!(projection.unwrap().validate().is_ok());
+    for field in ["binding_generation", "service_port", "environment_id"] {
+        let mut forbidden = wire.clone();
+        forbidden[field] = serde_json::json!("not-mail-authority");
+        assert!(serde_json::from_value::<SubscriptionBinding>(forbidden).is_err());
+    }
+}
 use base64::{engine::general_purpose::STANDARD, Engine};
 use http::{HeaderMap, HeaderValue};
 use ring::hmac;
@@ -59,8 +79,7 @@ pub(super) fn binding() -> SubscriptionBinding {
         connection_generation: 3,
         workspace: "workspace_one".into(),
         binding_id: "binding_one".into(),
-        binding_generation: "binding_epoch".into(),
-        service_port: 1234,
+        authority_ref: "a".repeat(64),
         trigger_id: "ti_one".into(),
         trigger_slug: "GMAIL_NEW_GMAIL_MESSAGE".into(),
         account_id: "ca_one".into(),
@@ -280,7 +299,7 @@ fn revoked_or_replaced_subscription_and_rebuilt_binding_reject_old_input() {
             0 => changed.1.enabled = false,
             1 => changed.1.subscription_generation += 1,
             2 => changed.1.connection_generation += 1,
-            _ => changed.1.binding_generation = "rebuilt".into(),
+            _ => changed.1.authority_ref = "b".repeat(64),
         }
         assert_eq!(
             prepare_batch(&inputs, &changed.1, 50).err(),

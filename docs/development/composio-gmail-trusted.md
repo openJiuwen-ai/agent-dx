@@ -21,16 +21,15 @@ actual source change and must retain the existing invalidation behavior.
   physical request against shared organization/user windows, including profile
   and account probes. A denied user rolls back the organization charge. Database
   failures never fall back to unlimited allowance.
-- The identity owner supplies an opaque `ExistingServiceAdmission` to shared
-  `AgentV2Access::select_existing` / `connect_service_when_ready`. Shared access
-  owns generation-fenced resolution, route/open retry and the post-readiness
-  recheck. Mail adapters neither inspect Environment identity/phase nor own a
-  route-opening loop. Missing/rebuilt Bindings cannot be initialized or
-  reselected for old admitted work. Ordinary select/WS admission semantics stay
-  unchanged; an execution replacement within the admitted generation can use
-  the current route without changing the logical authorization. Refused-listener
-  waits recheck that admission even when route-store revocation lags; they retain
-  the original deadline and one pre-write route refresh budget.
+- Mail calls use ordinary `AgentV2Access::select_with_initializer` with Scope
+  and the configured selector, then `connect_service_when_ready`; a missing
+  Binding fails without initialization. There is no mail-only admission or
+  expected-generation route API. The common layer owns only its selected route.
+- Binding incarnation remains private to the identity owner. Mail persistence
+  carries the actual existing random grant ID as `authority_ref`, never a
+  generation wrapper. Original-operation credential refresh cannot select a new
+  grant after a rebuild. New batches/ACKs use wire v2; the explicit settled-only
+  operator upgrade preserves terminal history and refuses unknown work.
 - `entrypoint_runtime.rs` is the Unix runtime assembly. It reads the project Key
   through the existing configuration center, prepares one client/budget and
   binds the actual M44 adapter with each request's Relay handle. No ownership

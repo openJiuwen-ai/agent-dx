@@ -58,6 +58,12 @@ mod implementation {
             let listener =
                 tokio::net::TcpListener::from_std(listener).map_err(|_| Error::Unavailable)?;
             let signer = Arc::new(TokenSigner::new(root, tenant));
+            let identity = Arc::new(PrivacyIdentity::new(
+                config.template,
+                store.clone(),
+                bindings.clone(),
+                signer.clone(),
+            ));
             let authorization_owner = owner
                 .map(|owner| {
                     super::super::connector_owner::OwnerAuthority::new(
@@ -67,15 +73,9 @@ mod implementation {
                         bindings.clone(),
                         owner.auth,
                     )
-                    .map(Arc::new)
+                    .map(|owner| Arc::new(owner.with_identity(identity.clone())))
                 })
                 .transpose()?;
-            let identity = Arc::new(PrivacyIdentity::new(
-                config.template,
-                store.clone(),
-                bindings,
-                signer.clone(),
-            ));
             let mut center = PrivacyCenter::new(store, cipher, signer);
             if let Some(path) = &config.legacy_keyring_file {
                 center = center

@@ -4,7 +4,7 @@ use super::foreground_admission::ForegroundIdentity;
 use super::privacy_center::BindingReader;
 use super::privacy_grants::{now, PrivacyIdentity, TokenSigner};
 use crate::ingress::accounts::{self, BusinessAuth, Principal, SessionGuard};
-use crate::ingress::agent_service::{ExistingServiceAdmission, ServiceSelector};
+use crate::ingress::agent_service::ServiceSelector;
 use adx_agent_core::{AgentBinding, BindingPhase, Protocol, Scope};
 use http::{header, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -123,52 +123,20 @@ impl OwnerClaims {
     }
 }
 
-/// Logical authorization and an opaque shared-service admission. Environment
-/// selection remains private to AgentV2Access, never part of this credential.
+/// Identity-owned operation context. Business callers can only consume headers;
+/// freshness checks preserve the original actor, operation and logical authority.
 pub struct OwnerAuthorization {
     headers: HeaderMap,
     claims: OwnerClaims,
-    admission: ExistingServiceAdmission,
-    service_port: u16,
+    workload: Option<Arc<PrivacyIdentity>>,
+    refresh_until: i64,
 }
 impl OwnerAuthorization {
+    pub(super) fn scope(&self) -> &Scope {
+        &self.claims.scope
+    }
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
-    }
-    pub(crate) fn service_admission(&self) -> &ExistingServiceAdmission {
-        &self.admission
-    }
-    pub(super) fn same_logical_admission(&self, other: &Self) -> bool {
-        self.admission == other.admission
-            && self.claims.user_id == other.claims.user_id
-            && self.claims.workspace == other.claims.workspace
-            && self.claims.operation == other.claims.operation
-            && self.claims.body_sha256 == other.claims.body_sha256
-    }
-    /// Retain the published v1 durable identity/hash projection until its
-    /// separate grant-reference migration. Provider adapters do not expand it.
-    pub(super) fn subscription_snapshot(
-        &self,
-        facts: super::ingestion::SubscriptionFacts,
-    ) -> super::ingestion::SubscriptionSnapshot {
-        super::ingestion::SubscriptionSnapshot {
-            binding_scope: self.claims.scope.clone(),
-            user_id: self.claims.user_id.clone(),
-            workspace: self.claims.workspace.clone(),
-            binding_generation: self.claims.binding_generation.clone(),
-            service_port: self.service_port,
-            connection_id: facts.connection_id,
-            provider: facts.provider,
-            trigger_slug: facts.trigger_slug,
-            account_id: facts.account_id,
-            auth_config_id: facts.auth_config_id,
-            composio_user_id: facts.composio_user_id,
-            connection_generation: facts.connection_generation,
-            record_revision: facts.record_revision,
-            intent_revision: facts.intent_revision,
-            enabled: facts.enabled,
-            usable: facts.usable,
-        }
     }
 }
 
@@ -235,6 +203,7 @@ pub struct OwnerAuthority {
     signer: Arc<TokenSigner>,
     bindings: Arc<dyn BindingReader>,
     auth: Arc<dyn BusinessAuth>,
+    identity: Option<Arc<PrivacyIdentity>>,
 }
 impl OwnerAuthority {
     pub(super) fn new(
@@ -253,6 +222,73 @@ impl OwnerAuthority {
             signer,
             bindings,
             auth,
+            identity: None,
+        })
+    }
+
+    pub(super) fn with_identity(mut self, identity: Arc<PrivacyIdentity>) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    pub(super) fn service_selector(&self) -> ServiceSelector {
+        ServiceSelector {
+            protocol: Protocol::Http,
+            port: Some(self.application.service_port),
+        }
+    }
+
+    /// Refresh the original operation, never select a newer authority by Scope.
+    pub(super) async fn refresh(
+        &self,
+        original: &OwnerAuthorization,
+    ) -> accounts::Result<OwnerAuthorization> {
+        let mut claims = original.claims.clone();
+        claims.expires_at = (now()? + ACCESS_SECONDS).min(original.refresh_until);
+        self.issue(claims, original.workload.clone(), original.refresh_until)
+            .await
+    }
+
+    pub(super) async fn subscription_snapshot(
+        &self,
+        original: &OwnerAuthorization,
+        facts: super::ingestion::SubscriptionFacts,
+    ) -> accounts::Result<super::ingestion::SubscriptionSnapshot> {
+        let current = self.refresh(original).await?;
+        let claims = &current.claims;
+        let Actor::ConnectorWorkload { grant_id } = &claims.actor else {
+            return Err(accounts::Error::Forbidden);
+        };
+        let grant = self
+            .identity
+            .as_ref()
+            .ok_or(accounts::Error::Unavailable)?
+            .owner_grant(grant_id)
+            .await?;
+        if grant.scope != claims.scope
+            || grant.user != claims.user_id
+            || grant.workspace != claims.workspace
+            || grant.generation != claims.binding_generation
+        {
+            return Err(accounts::Error::Unauthorized);
+        }
+        let authority_ref = grant_id.clone();
+        Ok(super::ingestion::SubscriptionSnapshot {
+            binding_scope: claims.scope.clone(),
+            user_id: claims.user_id.clone(),
+            workspace: claims.workspace.clone(),
+            authority_ref,
+            connection_id: facts.connection_id,
+            provider: facts.provider,
+            trigger_slug: facts.trigger_slug,
+            account_id: facts.account_id,
+            auth_config_id: facts.auth_config_id,
+            composio_user_id: facts.composio_user_id,
+            connection_generation: facts.connection_generation,
+            record_revision: facts.record_revision,
+            intent_revision: facts.intent_revision,
+            enabled: facts.enabled,
+            usable: facts.usable,
         })
     }
 
@@ -289,16 +325,18 @@ impl OwnerAuthority {
         delivery
             .validate()
             .map_err(|_| accounts::Error::Unauthorized)?;
-        let scope = super::privacy_grants::binding_scope(delivery)?;
-        let binding = self
-            .binding(&scope, &delivery.user_id, &delivery.workspace)
-            .await?;
+        let identity = self.identity.as_ref().ok_or(accounts::Error::Unavailable)?;
+        let grant = identity.owner_grant(&delivery.authority_ref).await?;
         if !delivery.enabled
-            || binding.generation != delivery.binding_generation
-            || delivery.service_port != self.application.service_port
+            || grant.scope != super::privacy_grants::binding_scope(delivery)?
+            || grant.user != delivery.user_id
+            || grant.workspace != delivery.workspace
         {
             return Err(accounts::Error::Unauthorized);
         }
+        let binding = self
+            .binding(&grant.scope, &grant.user, &grant.workspace)
+            .await?;
         Ok(serde_json::json!({
             "tenant":binding.scope.tenant, "user_id":delivery.user_id,
             "workspace":delivery.workspace, "template":binding.scope.template,
@@ -361,7 +399,7 @@ impl OwnerAuthority {
             },
             (now()? + ACCESS_SECONDS).min(principal.expires_at),
         )?;
-        self.issue(claims, None).await
+        self.issue(claims, None, principal.expires_at).await
     }
 
     /// Workload identity authorizes only same-workspace owner queries, never
@@ -395,33 +433,32 @@ impl OwnerAuthority {
             },
             (now()? + ACCESS_SECONDS).min(identity.expires_at),
         )?;
-        self.issue(claims, Some(&identity.identity)).await
+        self.issue(claims, Some(identity.identity.clone()), identity.expires_at)
+            .await
     }
 
     async fn issue(
         &self,
         claims: OwnerClaims,
-        workload: Option<&PrivacyIdentity>,
+        workload: Option<Arc<PrivacyIdentity>>,
+        refresh_until: i64,
     ) -> accounts::Result<OwnerAuthorization> {
         claims.validate(&self.tenant)?;
         let token = self.signer.sign_owner(&claims)?;
-        self.verify(&token, claims.operation, &claims.body_sha256, workload)
-            .await?;
+        self.verify(
+            &token,
+            claims.operation,
+            &claims.body_sha256,
+            workload.as_deref(),
+        )
+        .await?;
         let mut header = HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
             .map_err(|_| accounts::Error::Unavailable)?;
         header.set_sensitive(true);
         Ok(OwnerAuthorization {
             headers: HeaderMap::from_iter([(header::AUTHORIZATION, header)]),
-            admission: ExistingServiceAdmission::new(
-                claims.scope.clone(),
-                claims.binding_generation.clone(),
-                ServiceSelector {
-                    protocol: Protocol::Http,
-                    port: Some(self.application.service_port),
-                },
-            )
-            .map_err(|_| accounts::Error::Unauthorized)?,
-            service_port: self.application.service_port,
+            workload,
+            refresh_until,
             claims,
         })
     }

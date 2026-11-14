@@ -460,13 +460,15 @@ scope and declared service, retaining the request deadline and binding generatio
 generation once after an unsent route/connection failure. Before any backend WS handshake or business bytes are sent, WS admission may refresh once when authoritative metadata confirms that the Binding was deleted or rebuilt, retaining its original deadline and initialization input. HTTP/SSH remain generation-fenced. Authorization failures do
 not reactivate the target. Returned streams never replay application writes.
 
-Existing identity owners can instead supply an opaque `ExistingServiceAdmission`
-to `AgentV2Access::select_existing`. The shared path never initializes or changes
-the admitted Binding generation, including on WS retries. It handles route/open
-retry, listener readiness and the final target recheck internally. Replacing only
-the Environment can resolve its current route within the same admission;
-deleting/rebuilding the Binding rejects old work. Mail adapters use this path
-without owning route/open loops or reading execution identity/phase.
+Mail callers use the same `select_with_initializer` and
+`connect_service_when_ready`, supplying only Scope and the configured selector.
+Their initializer refuses a missing Binding. Existing-Binding initialization
+uses the Agent owner's retry resolve to avoid creating a replacement after a
+concurrent deletion. Selected-route checks and pre-write retry belong to the
+ordinary shared path, not to a mail-specific generation admission. Identity
+owners independently fence the original authorization, represented in mail
+persistence by an actual existing random grant reference. See the
+[wire-v2/cutover contract](../docs/development/ingestion-delivery-contract.md).
 Ordinary managed WS uses shared selection/connection; managed HTTP shares selection/retry while retaining the
 backend HTTP pool. The Jiuwen codecs, bounded session/request state and E2A socket
 driver are implemented. Its internal connection adapter uses the shared authorized

@@ -1,4 +1,4 @@
-//! Actual M44 public operations through the existing fixed-generation ADX Relay.
+//! Actual M44 public operations through ordinary Scope-based ADX service access.
 use super::super::connector_owner::{
     OwnerAuthority, OwnerAuthorization, OwnerOperation, OWNER_PATH,
 };
@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 
 pub(super) struct M44Authority {
-    issuer: Arc<OwnerAuthority>,
+    pub(super) issuer: Arc<OwnerAuthority>,
     access: AgentV2Access,
     ingress: Arc<Ingress>,
     configs: MailAuthConfigs,
@@ -81,7 +81,14 @@ impl M44Authority {
         let context = Arc::new(RequestContext::new(Duration::from_secs(30)));
         let selection = self
             .access
-            .select_existing(context.clone(), admitted.service_admission())
+            .select_with_initializer(
+                context.clone(),
+                admitted.scope().clone(),
+                self.issuer.service_selector(),
+                async {
+                    Err::<adx_agent_core::mounts::Parameters, _>(adx_agent_api::Error::NotFound)
+                },
+            )
             .await
             .map_err(|_| Error::UpstreamUnavailable)?;
         let stream = self
@@ -97,10 +104,11 @@ impl M44Authority {
         }));
         // Readiness can outlast the original short credential. Reissue only for
         // the same logical admission and bytes; never replay a sent write.
-        let current = self.authorization(scope, operation, &raw).await?;
-        if !admitted.same_logical_admission(&current) {
-            return Err(Error::Forbidden);
-        }
+        let current = self
+            .issuer
+            .refresh(&admitted)
+            .await
+            .map_err(identity_error)?;
         let mut request = Request::builder()
             .method(Method::POST)
             .uri(OWNER_PATH)

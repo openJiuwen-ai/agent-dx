@@ -33,19 +33,25 @@ impl BindingReader for CurrentBinding {
 #[tokio::test]
 #[ignore = "requires the explicit task-owned PostgreSQL database"]
 async fn persisted_batch_identity_is_current_and_cannot_read_user_configuration() {
-    exercise_delivery(false, false).await;
+    exercise_delivery(false, false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit task-owned PostgreSQL database"]
 async fn https_client_uses_current_delivery_identity_and_rejects_revoked_subscription() {
-    exercise_delivery(true, false).await;
+    exercise_delivery(true, false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit task-owned PostgreSQL database"]
 async fn delivery_bootstrap_exchanges_only_bounded_connector_identity() {
-    exercise_delivery(false, true).await;
+    exercise_delivery(false, true, false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires task-owned PostgreSQL and the paired installed mail consumer"]
+async fn paired_installed_mail_consumer_accepts_actual_gateway_v2() {
+    exercise_delivery(true, true, true).await;
 }
 
 struct NoSession;
@@ -77,7 +83,7 @@ impl BusinessAuth for NoSession {
     }
 }
 
-async fn exercise_delivery(https_client: bool, bootstrap: bool) {
+async fn exercise_delivery(https_client: bool, bootstrap: bool, installed_consumer: bool) {
     let url = std::env::var("ADX_INGESTION_TEST_DATABASE_URL").unwrap();
     let pg: tokio_postgres::Config = url.parse().unwrap();
     assert!(pg
@@ -133,6 +139,40 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool) {
         .admit_workload(&scope, &workspace, &user)
         .await
         .unwrap();
+    // This is the real random authorization record, not an incarnation alias:
+    // reconnect reuses it; revocation rotates it without changing the Binding.
+    let first_ref = signer
+        .verify_connector(&credentials.connector, false)
+        .unwrap()
+        .id;
+    let reconnect = identity
+        .admit_workload(&scope, &workspace, &user)
+        .await
+        .unwrap();
+    assert_eq!(
+        signer
+            .verify_connector(&reconnect.connector, false)
+            .unwrap()
+            .id,
+        first_ref
+    );
+    let generation_before = current.0.lock().await.generation.clone();
+    accounts.privacy_revoke_grant(&first_ref).await.unwrap();
+    let renewed_authority = identity
+        .admit_workload(&scope, &workspace, &user)
+        .await
+        .unwrap();
+    let renewed_ref = signer
+        .verify_connector(&renewed_authority.connector, false)
+        .unwrap()
+        .id;
+    assert_ne!(renewed_ref, first_ref);
+    assert_eq!(current.0.lock().await.generation, generation_before);
+    assert!(identity
+        .connector_identity(&credentials.connector)
+        .await
+        .is_err());
+    let credentials = renewed_authority;
     let cipher = PrivacyCipher::new(
         "key-one".into(),
         BTreeMap::from([("key-one".into(), [7; 32])]),
@@ -167,8 +207,11 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool) {
         template: "digitalmate".into(),
         template_ref: "1".into(),
         binding_id: scope.binding_id.clone(),
-        binding_generation: "generation-one".into(),
-        service_port: 8080,
+        authority_ref: identity
+            .signer
+            .verify_connector(&credentials.connector, false)
+            .unwrap()
+            .id,
         connection_id: user.clone(),
         connection_generation: 1,
         subscription_id: user.clone(),
@@ -234,8 +277,43 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool) {
             current.clone(),
             Arc::new(NoSession),
         )
-        .unwrap(),
+        .unwrap()
+        .with_identity(identity.clone()),
     );
+    let normal_proof = identity
+        .connector_identity(&credentials.connector)
+        .await
+        .unwrap();
+    assert_eq!(normal_proof["grant_ref"], binding.authority_ref);
+    let target = owner.delivery_target(&binding).await.unwrap();
+    assert_eq!(target["binding_generation"], "generation-one");
+    assert!(target.get("environment_id").is_none());
+    assert!(target.get("service_port").is_none());
+    current.0.lock().await.current.environment_id = "replacement-execution".into();
+    assert_eq!(owner.delivery_target(&binding).await.unwrap(), target);
+    for field in [
+        "tenant",
+        "user",
+        "workspace",
+        "template",
+        "ref",
+        "id",
+        "authority",
+        "disabled",
+    ] {
+        let mut wrong = binding.clone();
+        match field {
+            "tenant" => wrong.tenant = "other".into(),
+            "user" => wrong.user_id = "other".into(),
+            "workspace" => wrong.workspace = "other".into(),
+            "template" => wrong.template = "other".into(),
+            "ref" => wrong.template_ref = "2".into(),
+            "id" => wrong.binding_id = "other".into(),
+            "authority" => wrong.authority_ref = "0".repeat(64),
+            _ => wrong.enabled = false,
+        }
+        assert!(owner.delivery_target(&wrong).await.is_err(), "{field}");
+    }
     let mut http =
         PrivacyHttp::new(center.clone(), identity.clone()).with_ingestion(delivery.clone());
     if bootstrap {
@@ -429,7 +507,7 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool) {
             .no_proxy()
             .timeout(Duration::from_secs(10))
             .add_root_certificate(
-                reqwest::Certificate::from_pem(&std::fs::read(certificate).unwrap()).unwrap(),
+                reqwest::Certificate::from_pem(&std::fs::read(&certificate).unwrap()).unwrap(),
             )
             .build()
             .unwrap();
@@ -443,6 +521,60 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool) {
         assert_eq!(reply.status(), http::StatusCode::OK);
         let actual: serde_json::Value = reply.json().await.unwrap();
         assert_eq!(actual, admission.json());
+        if installed_consumer {
+            use tokio::io::AsyncWriteExt;
+            let python = std::env::var("ADX_INGESTION_CONSUMER_PYTHON")
+                .expect("explicit installed consumer Python");
+            let probe = std::env::var("ADX_INGESTION_CONSUMER_PROBE")
+                .expect("explicit paired acceptance probe");
+            let scope: serde_json::Map<String, serde_json::Value> = [
+                "tenant",
+                "user_id",
+                "workspace",
+                "binding_id",
+                "template",
+                "template_ref",
+                "purpose",
+            ]
+            .into_iter()
+            .map(|key| (key.to_owned(), actual[key].clone()))
+            .collect();
+            let mut child = tokio::process::Command::new(python)
+                .arg("-B")
+                .arg(probe)
+                .env("DM_TEST_GATEWAY_ORIGIN", &origin)
+                .env("DM_TEST_CA_FILE", &certificate)
+                .env("DM_TEST_DELIVERY_TOKEN", token)
+                .env("DM_TEST_SCOPE_JSON", serde_json::to_string(&scope).unwrap())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("paired consumer process");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&serde_json::to_vec(&lease.batch).unwrap())
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "actual installed consumer rejected Gateway contract"
+            );
+            let summary: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(summary["gateway_identity"], "actual_https");
+            assert_eq!(summary["wire_version"], 2);
+            assert_eq!(summary["accepted_members"], 1);
+            assert_eq!(summary["duplicate_members"], 1);
+            println!("paired_installed_consumer: {summary}");
+        }
+
         Some((client, origin, shutdown, server))
     } else {
         None
@@ -470,5 +602,13 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool) {
         shutdown.send(true).unwrap();
         server.await.unwrap().unwrap();
     }
+    let mut active = binding.clone();
+    active.enabled = true;
+    current.0.lock().await.generation = "rebuilt-workspace".into();
+    assert!(owner.delivery_target(&active).await.is_err());
+    assert!(identity
+        .connector_identity(&credentials.connector)
+        .await
+        .is_err());
     pool.close();
 }

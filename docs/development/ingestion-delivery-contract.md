@@ -1,86 +1,86 @@
-# 后台交付身份与冷启动契约
+# 后台交付身份与 Scope 访问契约
 
-本契约描述 Gateway 已实现的身份生产者、固定目标交付及消费者要求，不代表
-真实邮箱或任意新用户冷启已验收。配置中心、Composio 与摄取位于同一 Gateway；
-Scan/Registry、接收及业务处理在用户实例。配置 bearer 不能替代工具或交付授权。
+配置中心、Composio 和摄取运行于既有 Gateway；Registry、接收和处理在用户实例。
+本契约描述候选源码，不代表新 wire 版本已在香港验收。
 
-## 身份 owner 与私有 HTTPS
+## 身份与业务引用
 
-既有 `TokenSigner` 分离 `dm-privacy-v1`、`dm-connector-v1`、`dm-ingestion-v1`
-用途，复用原 grant/current Binding，未新建授权主表。DigitalMate WS 的
-`admit_workload` 同次入场下发 privacy 和 connector 身份；后者只证明工作负载，
-不证明连接/任务/邮件权限。
+复用 #179 的 PrivacyIdentity、TokenSigner 和现有 privacy_grants。邮件不新增授权表。
+authority_ref 是现有 grant 的随机 ID；不是 Binding generation 的改名、哈希或
+序列化包装，也不是凭证。同一授权续期复用 ID；撤销或工作区重建后旧引用失效。
+generation 只由身份 owner 在 grant 与 current Binding 之间校验，邮件业务不存取它。
 
-以下路由在既有身份 HTTPS listener 上，只接受 POST、JSON、精确 `{}`：
+私有 HTTPS 路由均接受 POST、JSON 和精确 {}：
 
-| 路由 | 凭证与结果 |
+| 路由 | 契约 |
 | --- | --- |
-| `/v1/connector/identity` | connector；重验账号/grant/Binding，返回身份和期限/续期属性 |
-| `/v1/connector/renew` | 普通 connector；重验当前目标并续期同一用途 |
-| `/v1/ingestion/admit` | delivery；返回当前目标、batch ID/digest/size/到期 |
-| `/v1/ingestion/bootstrap` | delivery；复核实际批次/订阅/grant/Binding 后返回短期 connector bootstrap |
+| /v1/connector/identity | 校验 connector，返回逻辑身份、grant_ref、期限和续期属性 |
+| /v1/connector/renew | 续期同一普通 connector；bootstrap 不可续期 |
+| /v1/ingestion/admit | 校验持久批次、订阅及现有 grant，返回限定批次的 admission |
+| /v1/ingestion/bootstrap | 将有效 delivery 交换为受其截止约束的短期 connector |
 
-bootstrap 成功精确返回 `purpose: ingestion.connector-bootstrap`、`target`、
-`connector_token`、`expires_at` 四项。target 含 tenant/user/workspace、
-template/ref、Binding ID/generation，共七个逻辑身份字段；不含 Environment
-或 service_port，必须与实际 owner 相符。本地 receiver 端口由独立可信启动
-装配提供，不从 owner target 或请求中取得。截止不晚于当前 delivery；不能续期、不创建 grant、
-不返回 privacy bearer、用户配置或模型/项目 Key。未装配必需 owner 才返回
-503 `AUTH_UNAVAILABLE`，不是所有 bootstrap 都返回503。
+grant_ref 来自已验签 claims.id，不接受请求 JSON 指定。普通身份 renewable=true、
+bootstrap_until=null；正常签名、登录下发及续期协议不变。bootstrap 不创建授权、
+不能取得 privacy bearer、用户配置、模型 Key 或项目 Key。
 
-普通 connector 的已验证响应为 `renewable: true`、`bootstrap_until: null`，
-`recovery_expires_at` 是原签名恢复期限。bootstrap 为 `renewable: false`，
-恢复/签名截止均为其 access 截止。消费者以真实 HTTPS 结果核验；本地文件、
-自行解码 Token 或 DTO 字段不能产生授权事实。
+bootstrap target 仍是身份 owner 的 logical7：tenant/user/workspace、template/ref、
+Binding ID/generation。只有私有身份客户端消费它，不再将 generation 投影给邮件
+receiver、批次或 Signal scope。receiver 端口仅为可信启动装配，不是邮件身份。
 
-## 批次与接收合同
+## wire v2 与持久状态
 
-Gateway `DeliveryAuthorization::admission(batch)` 及 `headers(batch)` 必须查询实际持久 ready batch、
-启用订阅、代次、digest、真实 wire size、有效账号 grant 及当前完整 Binding。
-不能根据 `enabled: true` 或调用方 epoch 签发。delivery TTL 为60秒，签名
-时钟容忍沿用原 owner 的60秒上界；撤销、终态或旧代次不通过校验。
+DeliveryBatch.version=2，canonical manifest 域为 digitalmate.ingestion.batch.v2。
+SubscriptionBinding 包含逻辑 Scope、用户/工作区、authority_ref、连接/订阅 ID
+及其业务 revision、provider account/config/user/trigger；不含 Binding generation、
+Environment ID 或 service port。连接授权和订阅意图的 generation 仍是业务围栏。
 
-`DeliveryBatch` v1 包含固定 ID/digest、完整 SubscriptionBinding 与事件集。
-SubscriptionBinding 带 tenant/user/workspace、模板 Scope、Binding generation、
-端口、connection/subscription ID及代次、account/config/project user/trigger。
-值本身不是授权。POST wire size 是实际序列化字节数（最多2 MiB），原始事件
-总量最多1 MiB；接收端精确比较，不相信自报 header。
+POST 不超过 2 MiB，原始事件总量不超过 1 MiB。固定成员、batch ID/digest 覆盖
+实际字节；重试不另建批次。DurableAck.version=2，必须匹配原 ID/digest 和 accepted。
+DeliveryAdmission 返回 Scope6、purpose=ingestion.delivery、authority_ref、batch
+ID/digest、wire_bytes、期限；接收端同时匹配身份、引用和批次，不信 JSON 自报权限。
 
-消费者的 `DeliveryAdmission` 含真实 `ReceiverIdentity`、batch_id、digest、
-wire_bytes、expires_at。身份投影包含 tenant/user/workspace、Binding ID及代次、
-template/ref/service_port，purpose 必须为 `ingestion.delivery`。只允许身份
-owner 经验签和当前检查后构造；生产路径不信任 fixture 的 `x-test-*`。
+PostgreSQL 物理 schema 仍为1，SQLite 接收/handoff 物理 schema 仍为2，不能与
+wire 版本混淆。新业务只读写 v2 projection，没有 v1 新写入兼容别名。
 
-## 就绪、提交、重试
+## 普通公共访问
 
-1. worker 领取持久批次并检查当前用途；仅选择已有 Binding 的原 generation。
-2. 身份 owner 构造不透明的 `ExistingServiceAdmission`；业务调用公共
-   `AgentV2Access::select_existing` / `connect_service_when_ready`。公共层经原
-   Agent 接口请求就绪、共享 Ingress/Relay 建连并复核目标；同代次可更新执行
-   路由，删除或重建则拒绝。原始 deadline 限定所有预写等待，不重放已发送请求。
-3. 就绪后为每次物理 GET/POST 重新获取短期用途证明。GET 限定同一 batch/digest；
-   无已持久回执才 POST，回执丢失重查原批次。
-4. 接收端仅为精确批次路由执行 verifier，在读 body 前和回 ACK 前检查用途/期限；
-   还需真实 Registry/intent 的连接代次、账户和 `read_history` 校验。
-5. 接收持久提交后重查权限，返回准确 durable ACK。提交后撤销可能返回403，但
-   不表示已提交数据被回滚；重试及状态查询必须再次授权和判重。
-6. Gateway 仅确认匹配 ACK 的批次成员。此受理只代表 staging，后续处理、读取、
-   Signal 发布仍由各自 owner 重验，不由 delivery 身份授权。
+邮件 owner 和 Relay delivery 只传 Scope、配置的 service selector 给既有
+AgentV2Access::select_with_initializer，再调用 connect_service_when_ready。
+Binding 缺失时 initializer 返回错误；邮件不创建工作区或执行实例。
 
-取消不能撤回已发生的远端读取，但旧代次不得启动新处理或释放迟到结果。临时
-bootstrap 不能代替长期 normal 身份、用户后台意图或首次可信运行配置投影。
-任意新用户在启动前的可信 target 配置及消费者挂载由部署方单独验证，不得从
-历史用户复制身份或把配置中心整份解密交给 delivery consumer。
+已有 Binding 的公共 initializer 路径用原 Agent retry_resolve 保持选择一致，
+防止读取后删除导致意外重建。公共 transport 对所有 caller 检查自己选出的路由，
+使用原 deadline 和一次预写重试，不接受业务传来的代次；没有
+ExistingServiceAdmission、select_existing 或邮件专属连接模式。
 
-## 本轮边界与后续迁移
+OwnerAuthorization 只是身份 owner 的原操作上下文。连接完成后的 refresh 保持
+最初 actor、授权、操作和原始 body 摘要，只刷新允许范围内的短期证明，不按
+Scope 重新挑新授权。重建后旧操作失败。M44 业务不比较 Binding generation 或
+前后 admission。GET/POST 每次物理发送前获取新证明，已发送写请求不由 transport 重放。
 
-`connector.authorization-owner` 的短期票据及验权结果绑定逻辑 Scope、用户、
-workspace、Binding generation、purpose、operation、原始 body 摘要、method/path
-及期限，不再包含 Environment 或端口。环境替换不会使同代次逻辑授权失效；
-Binding 重建、会话/grant 撤销仍失效。普通 connector 签名/续期契约不变。
+接收 accepted 只代表 durable staging。读取、claim、处理、发布和 ACK 仍经实际
+Registry/intent/身份 owner 校验。匹配报告 HTTP202 后不因下游报告失败重投 Signal。
 
-本轮保留 v1 批次/订阅的 `binding_generation`、`service_port`。它们参与
-canonical manifest、batch ID/digest、PostgreSQL payload、接收身份和旧 grant
-匹配，不可在分层整理中直接删除。身份 owner 负责投影和校验这些旧协议字段，
-业务不据此选择执行体。改为不透明 incarnation/grant 引用须另定协议版本、
-存量迁移及回滚方案；此迁移尚未实现，不能将本轮称为持久身份模型已完全收敛。
+## 显式切换与恢复
+
+先停止所有旧 writer，并确认 Gateway、receiver、Signal 旧任务全部终态。ready、
+租约、未知结果、未处理输入存在时拒绝迁移；先用旧栈恢复，不重写旧 batch 摘要、
+清库、停车或重放以绕过检查。
+
+[operator工具](../../build/ops/ingestion_scope_v2.py) 仅通过可信 HTTPS 的 normal
+connector identity 获取现有 grant 引用，验证真实 logical7 和旧订阅一致，持有
+Inbox 全表事务锁，再验身份，只更新当前订阅 JSON。默认锁定校验，提交需 --apply。
+不读账户私表、不发新 grant、不改业务 revision；历史事件、ID/digest、现存回执
+及其已有字节原样保留，不能复原旧服务原本已清理的 payload。
+
+切换前专用公网代理先对 webhook 与订阅写入口返回临时503及 Retry-After；禁用
+ingestion 的程序按未配置返回404，不能把它当成维护期可靠接收。
+
+切换顺序：新版 Gateway 先禁用 ingestion 运行装配但保留 private identity；停旧
+进程及订阅同步 writer；复查 settled；运行 operator；确认消费者只读预检和 v2
+配置；最后启用摄取。仅关闭 webhook 入口不足以停止后台或订阅写入。消费者
+初始化拒绝 legacy 未终态/unknown，终态历史只保留，不解析成新任务。
+
+新 Gateway/消费者和私有配置成对部署。回滚先停写、检查是否已产生 v2 工作；
+不能只换旧镜像覆盖新 projection 或已发生状态。OAuth、正常授权、连接记录和
+source/Signal/report ID 均保留。真实邮箱、实例冷启及 SFS 故障恢复单独验收。

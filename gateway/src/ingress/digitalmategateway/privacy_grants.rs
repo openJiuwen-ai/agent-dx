@@ -4,8 +4,7 @@ use super::ingestion::{
 };
 use super::privacy_center::BindingReader;
 use crate::ingress::accounts::{AccountStore, Error, PrivacyOwner, StoredPrivacyGrant};
-use crate::ingress::agent_service::{ExistingServiceAdmission, ServiceSelector};
-use adx_agent_core::{BindingPhase, Protocol, Scope};
+use adx_agent_core::{BindingPhase, Scope};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ring::{
     hmac,
@@ -379,7 +378,7 @@ impl PrivacyIdentity {
     pub async fn connector_identity(&self, token: &str) -> Result<serde_json::Value, Error> {
         let (claims, grant) = self.connector_grant(token, false).await?;
         Ok(serde_json::json!({
-            "purpose":"connector.tool", "tenant":grant.scope.tenant,
+            "purpose":"connector.tool", "grant_ref":claims.id, "tenant":grant.scope.tenant,
             "user_id":grant.user, "workspace":grant.workspace,
             "template":grant.scope.template, "template_ref":grant.scope.template_ref.name(),
             "binding_id":grant.scope.binding_id, "binding_generation":grant.generation,
@@ -457,7 +456,6 @@ pub(crate) struct DeliveryIdentity {
 pub(crate) struct VerifiedDelivery {
     claims: DeliveryClaims,
     binding: SubscriptionBinding,
-    admission: ExistingServiceAdmission,
 }
 
 impl VerifiedDelivery {
@@ -466,8 +464,8 @@ impl VerifiedDelivery {
             "purpose":"ingestion.delivery", "tenant":self.binding.tenant,
             "user_id":self.binding.user_id, "workspace":self.binding.workspace,
             "template":self.binding.template, "template_ref":self.binding.template_ref,
-            "binding_id":self.binding.binding_id, "binding_generation":self.binding.binding_generation,
-            "service_port":self.binding.service_port, "batch_id":self.claims.batch_id,
+            "binding_id":self.binding.binding_id, "authority_ref":self.binding.authority_ref,
+            "batch_id":self.claims.batch_id,
             "digest":self.claims.digest, "wire_bytes":self.claims.wire_bytes,
             "expires_at":self.claims.exp,
         })
@@ -545,22 +543,14 @@ impl DeliveryIdentity {
         if binding != batch.binding {
             return Err(Error::Unauthorized);
         }
-        let scope = binding_scope(&binding)?;
-        let (id, grant) = self
-            .identity
-            .store
-            .privacy_current_grant(
-                &PrivacyOwner {
-                    tenant: &binding.tenant,
-                    workspace: &binding.workspace,
-                    user: &binding.user_id,
-                },
-                &scope,
-                &binding.binding_generation,
-            )
-            .await?
-            .ok_or(Error::Unauthorized)?;
-        self.identity.current_binding(&id, &grant).await?;
+        let id = binding.authority_ref.clone();
+        let grant = self.identity.owner_grant(&id).await?;
+        if grant.scope != binding_scope(&binding)?
+            || grant.user != binding.user_id
+            || grant.workspace != binding.workspace
+        {
+            return Err(Error::Unauthorized);
+        }
         let claims = DeliveryClaims {
             grant_id: id,
             tenant: binding.tenant,
@@ -592,7 +582,7 @@ impl DeliveryIdentity {
             || grant.scope != binding_scope(&binding)?
             || grant.workspace != binding.workspace
             || grant.user != binding.user_id
-            || grant.generation != binding.binding_generation
+            || claims.grant_id != binding.authority_ref
             || claims.exp > grant.expires_at
         {
             return Err(Error::Unauthorized);
@@ -600,40 +590,23 @@ impl DeliveryIdentity {
         self.identity
             .current_binding(&claims.grant_id, &grant)
             .await?;
-        let admission = ExistingServiceAdmission::new(
-            grant.scope.clone(),
-            grant.generation,
-            ServiceSelector {
-                protocol: Protocol::Http,
-                port: Some(binding.service_port),
-            },
-        )
-        .map_err(|_| Error::Unauthorized)?;
-        Ok(VerifiedDelivery {
-            claims,
-            binding,
-            admission,
-        })
+        Ok(VerifiedDelivery { claims, binding })
+    }
+}
+
+fn delivery_failure(error: Error) -> DeliveryFailure {
+    match error {
+        Error::Unavailable => DeliveryFailure::Unknown,
+        _ => DeliveryFailure::Rejected,
     }
 }
 
 #[async_trait::async_trait]
 impl DeliveryAuthorization for DeliveryIdentity {
-    async fn admission(
-        &self,
-        batch: &DeliveryBatch,
-    ) -> Result<ExistingServiceAdmission, DeliveryFailure> {
-        let token = self.issue(batch).await.map_err(|error| match error {
-            Error::Unavailable => DeliveryFailure::Unknown,
-            _ => DeliveryFailure::Rejected,
-        })?;
-        self.verify(&token)
-            .await
-            .map(|verified| verified.admission)
-            .map_err(|error| match error {
-                Error::Unavailable => DeliveryFailure::Unknown,
-                _ => DeliveryFailure::Rejected,
-            })
+    async fn scope(&self, batch: &DeliveryBatch) -> Result<Scope, DeliveryFailure> {
+        let token = self.issue(batch).await.map_err(delivery_failure)?;
+        let verified = self.verify(&token).await.map_err(delivery_failure)?;
+        binding_scope(&verified.binding).map_err(delivery_failure)
     }
     async fn headers(&self, batch: &DeliveryBatch) -> Result<http::HeaderMap, DeliveryFailure> {
         let token = self.issue(batch).await.map_err(|error| match error {

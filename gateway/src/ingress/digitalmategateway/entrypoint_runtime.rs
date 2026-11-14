@@ -269,6 +269,11 @@ impl DigitalMateGatewayApi {
             ingress,
             identity,
             Duration::from_secs(prepared.settings.delivery_timeout_seconds),
+            self.config
+                .digitalmate
+                .as_ref()
+                .ok_or_else(invalid)?
+                .service_port,
         )
         .map_err(|_| invalid())?;
         let runtime = super::super::ingestion::IngestionRuntime::start(

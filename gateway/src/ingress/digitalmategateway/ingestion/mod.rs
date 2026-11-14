@@ -1,4 +1,4 @@
-//! Durable provider receipt, fixed-member scheduling and fixed-generation
+//! Durable provider receipt, fixed-member scheduling and authority-scoped
 //! delivery in the existing Gateway process. Identity and connection authority
 //! remain with their published owners; JSON projections alone grant no access.
 use super::composio::VerifiedWebhook;
@@ -63,8 +63,7 @@ pub struct SubscriptionBinding {
     pub connection_generation: u64,
     pub workspace: String,
     pub binding_id: String,
-    pub binding_generation: String,
-    pub service_port: u16,
+    pub authority_ref: String,
     pub trigger_id: String,
     pub trigger_slug: String,
     pub account_id: String,
@@ -80,7 +79,7 @@ impl SubscriptionBinding {
             || self.connection_generation == 0
             || self.subscription_generation > i64::MAX as u64
             || self.connection_generation > i64::MAX as u64
-            || self.service_port == 0
+            || !super::connector_owner::digest_valid(&self.authority_ref)
             || [
                 &self.subscription_id,
                 &self.tenant,
@@ -90,7 +89,6 @@ impl SubscriptionBinding {
                 &self.template_ref,
                 &self.workspace,
                 &self.binding_id,
-                &self.binding_generation,
             ]
             .iter()
             .any(|value| {
@@ -224,7 +222,7 @@ pub fn prepare_batch<'a>(
         .map(|input| (input.source_event_id(), input.digest()))
         .collect();
     let manifest = serde_json::to_vec(&(
-        "digitalmate.ingestion.batch.v1",
+        "digitalmate.ingestion.batch.v2",
         (
             &current.tenant,
             &current.user_id,
@@ -237,8 +235,7 @@ pub fn prepare_batch<'a>(
         current.connection_generation,
         &current.workspace,
         &current.binding_id,
-        &current.binding_generation,
-        current.service_port,
+        &current.authority_ref,
         &current.account_id,
         &current.auth_config_id,
         &current.composio_user_id,

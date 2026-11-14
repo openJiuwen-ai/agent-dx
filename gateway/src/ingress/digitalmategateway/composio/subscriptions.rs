@@ -77,7 +77,7 @@ impl IntentPort for OwnerIntent {
     ) -> Result<Option<SubscriptionSnapshot>, Error> {
         let body = json!({"operation":"intent", "connection_id":id});
         let raw = serde_json::to_vec(&body).map_err(|_| Error::InvalidRequest)?;
-        let before = self
+        let authority = self
             .owner
             .authorization(scope, OwnerOperation::Intent, &raw)
             .await?;
@@ -118,26 +118,28 @@ impl IntentPort for OwnerIntent {
             MailProvider::Microsoft => "OUTLOOK_MESSAGE_TRIGGER",
         };
         let config = self.client.config(provider)?;
-        let after = self
-            .owner
-            .authorization(scope, OwnerOperation::Intent, &raw)
-            .await?;
-        if !before.same_logical_admission(&after) {
-            return Err(Error::Forbidden);
-        }
-        Ok(Some(after.subscription_snapshot(SubscriptionFacts {
-            connection_id: id.into(),
-            provider: intent.provider,
-            trigger_slug: slug.into(),
-            account_id: intent.external_account_id,
-            auth_config_id: config.id.clone(),
-            composio_user_id: scope.composio_user_id(),
-            connection_generation: intent.authorization_generation,
-            record_revision: metadata.record_revision,
-            intent_revision: intent.intent_revision,
-            enabled: intent.enabled,
-            usable: intent.usable && intent.state == "current",
-        })))
+        Ok(Some(
+            self.owner
+                .issuer
+                .subscription_snapshot(
+                    &authority,
+                    SubscriptionFacts {
+                        connection_id: id.into(),
+                        provider: intent.provider,
+                        trigger_slug: slug.into(),
+                        account_id: intent.external_account_id,
+                        auth_config_id: config.id.clone(),
+                        composio_user_id: scope.composio_user_id(),
+                        connection_generation: intent.authorization_generation,
+                        record_revision: metadata.record_revision,
+                        intent_revision: intent.intent_revision,
+                        enabled: intent.enabled,
+                        usable: intent.usable && intent.state == "current",
+                    },
+                )
+                .await
+                .map_err(|_| Error::Forbidden)?,
+        ))
     }
 }
 

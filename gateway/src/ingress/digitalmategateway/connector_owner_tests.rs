@@ -130,6 +130,26 @@ fn token(value: &super::super::connector_owner::OwnerAuthorization) -> &str {
         .strip_prefix("Bearer ")
         .unwrap()
 }
+
+#[tokio::test]
+async fn owner_refresh_preserves_original_authority_across_readiness() {
+    let (owner, identity, _, bindings, _) = setup();
+    let original = owner
+        .foreground_headers(&identity, OwnerOperation::Claim, b"{}")
+        .await
+        .unwrap();
+    bindings.0.lock().unwrap().current.environment_id = "new-execution".into();
+    assert!(owner.refresh(&original).await.is_ok());
+    bindings.0.lock().unwrap().generation = "rebuilt-workspace".into();
+    assert!(owner.refresh(&original).await.is_err());
+    // The same foreground session may authorize a new operation, but refreshing
+    // the already admitted old operation must not acquire its new authority.
+    assert!(owner
+        .foreground_headers(&identity, OwnerOperation::Claim, b"{}")
+        .await
+        .is_ok());
+    assert!(owner.refresh(&original).await.is_err());
+}
 fn digest(body: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(body))
 }
@@ -213,7 +233,7 @@ async fn owner_read_proof_is_bound_to_the_exact_owner_request_not_mail_permissio
 }
 
 #[tokio::test]
-async fn delivery_bootstrap_target_requires_exact_actual_binding_and_port() {
+async fn delivery_bootstrap_target_requires_the_actual_identity_owner_grant() {
     use super::super::ingestion::SubscriptionBinding;
     let (owner, identity, _, bindings, _) = setup();
     let record = SubscriptionBinding {
@@ -227,8 +247,7 @@ async fn delivery_bootstrap_target_requires_exact_actual_binding_and_port() {
         connection_generation: 1,
         workspace: identity.workspace().into(),
         binding_id: identity.binding_scope().binding_id.clone(),
-        binding_generation: "generation-one".into(),
-        service_port: 18092,
+        authority_ref: "a".repeat(64),
         trigger_id: "ti_test".into(),
         trigger_slug: "GMAIL_NEW_GMAIL_MESSAGE".into(),
         account_id: "ca_test".into(),
@@ -236,38 +255,11 @@ async fn delivery_bootstrap_target_requires_exact_actual_binding_and_port() {
         composio_user_id: "dm_test".into(),
         enabled: true,
     };
-    let target = owner.delivery_target(&record).await.unwrap();
-    assert_eq!(target.as_object().unwrap().len(), 7);
-    assert!(target.get("environment_id").is_none());
-    assert!(target.get("service_port").is_none());
-    bindings.0.lock().unwrap().current.environment_id = "environment-replacement".into();
-    assert_eq!(owner.delivery_target(&record).await.unwrap(), target);
-    for changed in [
-        "tenant",
-        "user",
-        "workspace",
-        "template",
-        "ref",
-        "id",
-        "generation",
-        "port",
-        "disabled",
-    ] {
-        let mut other = record.clone();
-        match changed {
-            "tenant" => other.tenant = "other".into(),
-            "user" => other.user_id = "other".into(),
-            "workspace" => other.workspace = "other".into(),
-            "template" => other.template = "other".into(),
-            "ref" => other.template_ref = "2".into(),
-            "id" => other.binding_id = "other".into(),
-            "generation" => other.binding_generation = "other".into(),
-            "port" => other.service_port = 8081,
-            _ => other.enabled = false,
-        }
-        assert!(owner.delivery_target(&other).await.is_err(), "{changed}");
-    }
-    bindings.0.lock().unwrap().phase = BindingPhase::Deleting;
+    // A caller-provided reference cannot select or manufacture an authorization.
+    // Positive bootstrap/target and rebuild tests use the actual PostgreSQL owner
+    // in privacy_delivery_tests, rather than a detached JSON projection.
+    assert!(owner.delivery_target(&record).await.is_err());
+    bindings.0.lock().unwrap().current.environment_id = "replacement".into();
     assert!(owner.delivery_target(&record).await.is_err());
 }
 
@@ -280,11 +272,12 @@ async fn owner_purpose_fixes_raw_body_operation_and_actual_binding() {
         .await
         .unwrap();
     assert!(issued.headers()[http::header::AUTHORIZATION].is_sensitive());
-    let fresh = owner
-        .foreground_headers(&identity, OwnerOperation::Current, body)
+    let fresh = owner.refresh(&issued).await.unwrap();
+    let refreshed = owner
+        .verify(token(&fresh), OwnerOperation::Current, &digest(body), None)
         .await
         .unwrap();
-    assert!(issued.same_logical_admission(&fresh));
+    assert_eq!(refreshed["binding_generation"], "generation-one");
     let verified = owner
         .verify(token(&issued), OwnerOperation::Current, &digest(body), None)
         .await

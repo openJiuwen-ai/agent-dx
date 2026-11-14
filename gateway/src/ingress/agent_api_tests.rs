@@ -209,19 +209,19 @@ async fn remote_control(
 
 #[tokio::test]
 #[cfg(feature = "mock-e2e")]
-async fn admitted_service_uses_current_execution_without_replaying_or_rebuilding_old_work() {
-    admitted_service_during_refused_listener(false).await;
+async fn service_readiness_uses_current_execution_without_replaying_or_rebuilding_old_work() {
+    service_readiness_during_refused_listener(false).await;
 }
 
 #[tokio::test]
 #[cfg(feature = "mock-e2e")]
-async fn admitted_service_rejects_rebuilt_binding_during_refused_listener() {
-    admitted_service_during_refused_listener(true).await;
+async fn service_readiness_rejects_rebuilt_binding_during_refused_listener() {
+    service_readiness_during_refused_listener(true).await;
 }
 
 #[cfg(feature = "mock-e2e")]
-async fn admitted_service_during_refused_listener(rebuilt: bool) {
-    use crate::ingress::agent_service::{AgentV2Access, ExistingServiceAdmission, ServiceSelector};
+async fn service_readiness_during_refused_listener(rebuilt: bool) {
+    use crate::ingress::agent_service::{AgentV2Access, ServiceSelector};
     use crate::{common::protocol::GatewayPolicy, node::Relay};
     use adx_agent_api::{local::LocalControl, managed::ManagedService, request::RequestContext};
     use adx_agent_core::{Protocol, Scope, TemplateRef};
@@ -284,20 +284,16 @@ async fn admitted_service_during_refused_listener(rebuilt: bool) {
         )
         .await
         .unwrap();
-    let admission = ExistingServiceAdmission::new(
-        scope.clone(),
-        first.binding.generation.clone(),
-        ServiceSelector {
-            protocol: Protocol::Http,
-            port: Some(port),
-        },
-    )
-    .unwrap();
     let access = AgentV2Access::new(managed.clone());
     let old_selection = access
-        .select_existing(
+        .select_with_initializer(
             Arc::new(RequestContext::new(Duration::from_secs(3))),
-            &admission,
+            scope.clone(),
+            ServiceSelector {
+                protocol: Protocol::Http,
+                port: Some(port),
+            },
+            async { Err::<adx_agent_core::mounts::Parameters, _>(adx_agent_api::Error::NotFound) },
         )
         .await
         .unwrap();
@@ -452,9 +448,14 @@ async fn admitted_service_during_refused_listener(rebuilt: bool) {
     activator.delete_binding(&scope).await.unwrap();
     let before = backend.0.lock().unwrap().len();
     assert!(access
-        .select_existing(
+        .select_with_initializer(
             Arc::new(RequestContext::new(Duration::from_secs(3))),
-            &admission
+            scope.clone(),
+            ServiceSelector {
+                protocol: Protocol::Http,
+                port: Some(port)
+            },
+            async { Err::<adx_agent_core::mounts::Parameters, _>(adx_agent_api::Error::NotFound) },
         )
         .await
         .is_err());
@@ -472,12 +473,17 @@ async fn admitted_service_during_refused_listener(rebuilt: bool) {
     assert_ne!(fresh.binding.generation, first.binding.generation);
     let before = backend.0.lock().unwrap().len();
     assert!(access
-        .select_existing(
+        .select_with_initializer(
             Arc::new(RequestContext::new(Duration::from_secs(3))),
-            &admission
+            scope.clone(),
+            ServiceSelector {
+                protocol: Protocol::Http,
+                port: Some(port)
+            },
+            async { Err::<adx_agent_core::mounts::Parameters, _>(adx_agent_api::Error::NotFound) },
         )
         .await
-        .is_err());
+        .is_ok());
     assert_eq!(
         state.binding(&scope).await.unwrap().unwrap().generation,
         fresh.binding.generation

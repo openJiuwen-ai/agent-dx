@@ -221,11 +221,7 @@ impl Inbox {
         let workspace = workspace_key(binding)?;
         let gen = generation(binding.subscription_generation)?;
         let connection_gen = generation(binding.connection_generation)?;
-        if gen <= 0
-            || connection_gen <= 0
-            || binding.subscription_id.is_empty()
-            || binding.service_port == 0
-        {
+        if gen <= 0 || connection_gen <= 0 || binding.subscription_id.is_empty() {
             return Err(Error::Refused);
         }
         let mut client = self.pool.get().await.map_err(unavailable)?;
@@ -388,7 +384,7 @@ impl Inbox {
     }
 
     pub async fn accept(&self, lease: &Lease, ack: &DurableAck) -> Result<(), Error> {
-        if ack.version != 1
+        if ack.version != 2
             || ack.batch_id != lease.batch.batch_id
             || ack.digest != lease.batch.digest
             || ack.state != "accepted"

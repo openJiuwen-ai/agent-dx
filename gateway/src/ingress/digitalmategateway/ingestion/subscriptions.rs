@@ -8,14 +8,13 @@ use std::sync::Arc;
 
 /// An authenticated owner's current facts, never a request JSON authority.
 /// The production adapter must match Connection/Metadata/Intent and obtain the
-/// routing tuple from the actual issuer/Binding, not a sandbox-supplied target.
+/// Scope and opaque grant reference from the actual identity owner, never a request target.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SubscriptionSnapshot {
     pub binding_scope: adx_agent_core::Scope,
     pub user_id: String,
     pub workspace: String,
-    pub binding_generation: String,
-    pub service_port: u16,
+    pub authority_ref: String,
     pub connection_id: String,
     pub provider: String,
     /// Selected by trusted provider configuration, never the request body.
@@ -30,7 +29,7 @@ pub struct SubscriptionSnapshot {
     pub usable: bool,
 }
 
-/// Provider/account facts supplied to the identity owner's v1 projection.
+/// Provider/account facts supplied to the identity owner's current grant projection.
 pub(crate) struct SubscriptionFacts {
     pub connection_id: String,
     pub provider: String,
@@ -182,7 +181,7 @@ impl SubscriptionCoordinator {
                 !value.enabled
                     || value.intent_revision != expected.intent_revision
                     || value.connection_generation != expected.connection_generation
-                    || value.binding_generation != expected.binding_generation
+                    || value.authority_ref != expected.authority_ref
             }) {
                 // CAS never stops a replacement that another synchronizer committed.
                 match self.inbox.disable_subscription(&binding).await {
@@ -229,8 +228,7 @@ impl SubscriptionSnapshot {
             || self.user_id != scope.user_id()
             || self.workspace != scope.workspace()
             || self.binding_scope.validate().is_err()
-            || !bounded(&self.binding_generation)
-            || self.service_port == 0
+            || !super::super::connector_owner::digest_valid(&self.authority_ref)
             || !identifier(&self.provider)
             || !identifier(&self.trigger_slug)
         {
@@ -265,8 +263,7 @@ impl SubscriptionSnapshot {
             connection_generation: self.connection_generation,
             workspace: self.workspace.clone(),
             binding_id: self.binding_scope.binding_id.clone(),
-            binding_generation: self.binding_generation.clone(),
-            service_port: self.service_port,
+            authority_ref: self.authority_ref.clone(),
             trigger_id,
             trigger_slug: self.trigger_slug.clone(),
             account_id: self.account_id.clone(),

@@ -41,7 +41,7 @@ def main():
 
         def ack(accepted_id, accepted_digest):
             return reply(200, {
-                "version": 1, "batch_id": accepted_id, "digest": accepted_digest, "state": "accepted",
+                "version": 2, "batch_id": accepted_id, "digest": accepted_digest, "state": "accepted",
             })
 
         batch_id = environment.get("HTTP_X_TEST_BATCH_ID", "")
@@ -63,7 +63,7 @@ def main():
             return reply(400, {})
         raw = environment["wsgi.input"].read(size)
         value = json.loads(raw)
-        if value["version"] != 1 or value["binding"] != binding:
+        if value["version"] != 2 or value["binding"] != binding:
             return reply(403, {})
         if value["batch_id"] != batch_id or value["digest"] != digest:
             return reply(403, {})

@@ -21,8 +21,9 @@ The disabled projection is retained for retrying an unknown provider disable.
 
 `SubscriptionCoordinator::synchronize(scope, connection_id)` reads actual owner
 facts through `IntentPort`, invokes restricted `TriggerPort`, then writes through
-Inbox. M44 Connection/Metadata/Intent and issuer routing must agree before/after
-I/O. Typed deletion is opt-out; HTTP404, temporary unusability and transport
+Inbox. M44 Connection/Metadata/Intent must agree before/after I/O. The identity owner
+produces the actual existing authority_ref; business code does not compare Binding
+incarnations or persist execution ports. Typed deletion is opt-out; HTTP404, temporary unusability and transport
 failure are not. Local stop fences before provider disable; failed cleanup stays
 retryable. Existing same-generation conflicts require explicit rebind.
 

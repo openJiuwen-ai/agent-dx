@@ -189,42 +189,6 @@ impl AccountStore {
         .transpose()
     }
 
-    /// Find an existing admitted identity for this exact current target. This
-    /// read does not create a grant or authorize connector/subscription access.
-    pub(crate) async fn privacy_current_grant(
-        &self,
-        owner: &PrivacyOwner<'_>,
-        scope: &adx_agent_core::Scope,
-        generation: &str,
-    ) -> Result<Option<(String, StoredPrivacyGrant)>> {
-        owner.validate("DIGITALMATE_CONFIG")?;
-        scope.validate().map_err(|_| Error::Invalid)?;
-        if scope.tenant != owner.tenant || generation.is_empty() || generation.len() > 256 {
-            return Err(Error::Invalid);
-        }
-        let scope_json = serde_json::to_string(scope).map_err(|_| Error::Invalid)?;
-        let client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
-        let row = client.query_opt(
-            "SELECT g.token_digest FROM adx_accounts.privacy_grants g JOIN adx_accounts.users u ON u.user_id=g.user_id WHERE g.tenant_id=$1 AND g.workspace_id=$2 AND g.user_id=$3 AND g.scope_json=$4 AND g.binding_generation=$5 AND g.revoked_at IS NULL AND g.expires_at>EXTRACT(EPOCH FROM clock_timestamp())::bigint AND u.status='active' ORDER BY g.expires_at DESC LIMIT 1",
-            &[&owner.tenant, &owner.workspace, &owner.user, &scope_json, &generation],
-        ).await.map_err(|_| Error::Unavailable)?;
-        drop(client);
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let id: String = row.get(0);
-        let grant = self.privacy_get_grant(&id).await?;
-        Ok(grant
-            .filter(|grant| {
-                !grant.revoked
-                    && grant.scope == *scope
-                    && grant.generation == generation
-                    && grant.workspace == owner.workspace
-                    && grant.user == owner.user
-            })
-            .map(|grant| (id, grant)))
-    }
-
     pub(crate) async fn privacy_extend_grant(&self, digest: &str, expires_at: i64) -> Result<()> {
         if !valid_digest(digest) {
             return Err(Error::Invalid);

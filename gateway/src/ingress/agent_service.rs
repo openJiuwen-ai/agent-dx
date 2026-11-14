@@ -5,38 +5,10 @@ use adx_agent_api::{managed::ManagedService, request::RequestContext, Error};
 use adx_agent_core::{BindingPhase, Protocol, Scope};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 pub struct ServiceSelector {
     pub protocol: Protocol,
     pub port: Option<u16>,
-}
-
-/// An existing product admission, not a route or a credential. Identity owners
-/// construct it after validating their grant; callers cannot inspect execution
-/// identity or turn a retry into creation of a different logical Binding.
-#[derive(Clone, Eq, PartialEq)]
-pub struct ExistingServiceAdmission {
-    scope: Scope,
-    generation: String,
-    selector: ServiceSelector,
-}
-
-impl ExistingServiceAdmission {
-    pub(crate) fn new(
-        scope: Scope,
-        generation: String,
-        selector: ServiceSelector,
-    ) -> Result<Self, Error> {
-        scope.validate().map_err(Error::Invalid)?;
-        if generation.is_empty() || selector.port == Some(0) {
-            return Err(Error::Invalid("existing service admission required".into()));
-        }
-        Ok(Self {
-            scope,
-            generation,
-            selector,
-        })
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,7 +32,6 @@ pub struct ServiceSelection {
     generation: String,
     retried: bool,
     parameters: Option<Vec<u8>>,
-    existing_only: bool,
 }
 impl ServiceSelection {
     pub(crate) fn deadline(&self) -> tokio::time::Instant {
@@ -82,6 +53,7 @@ impl ServiceSelection {
 }
 
 /// Preserve a business initializer's authentication errors without coupling shared activation to it.
+#[derive(Debug)]
 pub enum InitializationError<E> {
     Agent(Error),
     Source(E),
@@ -135,41 +107,6 @@ impl AgentV2Access {
             generation: target.binding.generation,
             retried: false,
             parameters: parameters.map(<[u8]>::to_vec),
-            existing_only: false,
-        })
-    }
-
-    /// Resolve only the incarnation already admitted by the identity owner.
-    /// Missing/replaced Bindings fail inside the Agent owner, without an
-    /// initializer, a creation fallback or a business-owned Environment route.
-    pub(crate) async fn select_existing(
-        &self,
-        context: Arc<RequestContext>,
-        admission: &ExistingServiceAdmission,
-    ) -> Result<ServiceSelection, Error> {
-        let (target, port) = context
-            .run(self.managed.retry_resolve(
-                &context,
-                &admission.scope,
-                admission.selector.protocol,
-                admission.selector.port,
-                &admission.generation,
-            ))
-            .await?;
-        if target.binding.generation != admission.generation {
-            return Err(Error::Conflict("admitted Binding changed".into()));
-        }
-        Ok(ServiceSelection {
-            context,
-            scope: admission.scope.clone(),
-            protocol: admission.selector.protocol,
-            port,
-            requested_port: admission.selector.port,
-            environment_id: target.binding.current.environment_id,
-            generation: admission.generation.clone(),
-            retried: false,
-            parameters: None,
-            existing_only: true,
         })
     }
 
@@ -185,7 +122,31 @@ impl AgentV2Access {
         F: std::future::Future<Output = Result<adx_agent_core::mounts::Parameters, E>>,
     {
         let parameters = match context.run(self.managed.binding(&context, &scope)).await {
-            Ok(_) => None,
+            Ok(binding) => {
+                // The shared initializer contract must not create a replacement
+                // if the Binding disappears between the metadata and resolve calls.
+                let (target, port) = context
+                    .run(self.managed.retry_resolve(
+                        &context,
+                        &scope,
+                        selector.protocol,
+                        selector.port,
+                        &binding.generation,
+                    ))
+                    .await
+                    .map_err(InitializationError::Agent)?;
+                return Ok(ServiceSelection {
+                    context,
+                    scope,
+                    protocol: selector.protocol,
+                    port,
+                    requested_port: selector.port,
+                    environment_id: target.binding.current.environment_id,
+                    generation: target.binding.generation,
+                    retried: false,
+                    parameters: None,
+                });
+            }
             Err(Error::NotFound) => {
                 let values = tokio::time::timeout_at(context.deadline(), initializer)
                     .await
@@ -222,9 +183,7 @@ impl AgentV2Access {
             ))
             .await;
         let (target, port) = match resolved {
-            Err(error @ Error::Conflict(_))
-                if selection.protocol == Protocol::Ws && !selection.existing_only =>
-            {
+            Err(error @ Error::Conflict(_)) if selection.protocol == Protocol::Ws => {
                 let changed = match selection
                     .context
                     .run(self.managed.binding(&selection.context, &selection.scope))
@@ -257,9 +216,6 @@ impl AgentV2Access {
             }
             result => result?,
         };
-        if selection.existing_only && target.binding.generation != selection.generation {
-            return Err(Error::Conflict("admitted Binding changed".into()));
-        }
         selection.environment_id = target.binding.current.environment_id;
         selection.generation = target.binding.generation;
         selection.port = port;
@@ -290,22 +246,21 @@ impl AgentV2Access {
         self.connect_service_inner(ingress, selection, true).await
     }
 
-    async fn revalidate_existing(
+    async fn check_selected_route(
         &self,
         selection: &ServiceSelection,
-    ) -> Result<(), ServiceAccessError> {
+    ) -> Result<(), IngressOpenError> {
         let current = selection
             .context
             .run(self.managed.binding(&selection.context, &selection.scope))
-            .await?;
+            .await
+            .map_err(|_| IngressOpenError::RouteChanged)?;
         if current.scope != selection.scope
-            || current.generation != selection.generation
             || current.phase != BindingPhase::Active
+            || current.generation != selection.generation
+            || current.current.environment_id != selection.environment_id
         {
-            return Err(Error::Conflict("admitted Binding changed during readiness".into()).into());
-        }
-        if current.current.environment_id != selection.environment_id {
-            return Err(IngressOpenError::RouteChanged.into());
+            return Err(IngressOpenError::RouteChanged);
         }
         Ok(())
     }
@@ -337,49 +292,43 @@ impl AgentV2Access {
                                 && matches!(&opened, Err(IngressOpenError::Connect(error))
                                     if error.kind() == std::io::ErrorKind::ConnectionRefused)
                             {
-                                // Route-store revocation can lag the logical owner. Existing
-                                // admissions follow same-incarnation execution replacement,
-                                // and reject rebuilt/deleted work even while a port refuses.
-                                if selection.existing_only {
-                                    self.revalidate_existing(&selection).await?;
-                                }
-                                // A port that is merely starting keeps its route. The
-                                // surrounding original context also bounds this sleep.
+                                // A route may outlive its selected target in discovery.
+                                // Ordinary readiness follows the same pre-write retry contract.
+                                self.check_selected_route(&selection).await?;
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                                 continue;
                             }
-                            return opened.map_err(ServiceAccessError::from);
+                            return opened;
                         }
                     }
                     .await;
                     Ok(attempt)
                 })
                 .await?;
-            let error = match result {
-                Ok(stream) if selection.existing_only => {
-                    match self.revalidate_existing(&selection).await {
-                        Ok(()) => return Ok(stream),
-                        Err(ServiceAccessError::Ingress(error)) => {
-                            drop(stream);
-                            error
+            match result {
+                Ok(stream) => match self.check_selected_route(&selection).await {
+                    Ok(()) => return Ok(stream),
+                    Err(error) => {
+                        drop(stream);
+                        if self.retry(&mut selection).await? {
+                            continue;
                         }
-                        Err(error) => return Err(error),
+                        return Err(error.into());
                     }
+                },
+                Err(error) => {
+                    let retryable = !matches!(
+                        error,
+                        IngressOpenError::Forbidden
+                            | IngressOpenError::Auth(_)
+                            | IngressOpenError::Draining
+                    ) && !matches!(&error, IngressOpenError::Connect(error) if error.kind() == std::io::ErrorKind::PermissionDenied);
+                    if retryable && self.retry(&mut selection).await? {
+                        continue;
+                    }
+                    return Err(error.into());
                 }
-                Ok(stream) => return Ok(stream),
-                Err(ServiceAccessError::Ingress(error)) => error,
-                Err(error) => return Err(error),
-            };
-            let retryable = !matches!(
-                error,
-                IngressOpenError::Forbidden
-                    | IngressOpenError::Auth(_)
-                    | IngressOpenError::Draining
-            ) && !matches!(&error, IngressOpenError::Connect(error) if error.kind() == std::io::ErrorKind::PermissionDenied);
-            if retryable && self.retry(&mut selection).await? {
-                continue;
             }
-            return Err(error.into());
         }
     }
 }

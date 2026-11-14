@@ -40,7 +40,7 @@ impl DeliveryBatch {
     ) -> Result<Self, Error> {
         let plan = prepare_batch(inputs, binding, 50)?;
         Ok(Self {
-            version: 1,
+            version: 2,
             batch_id: plan.batch_id,
             digest: plan.digest,
             binding: binding.clone(),
@@ -57,7 +57,7 @@ impl DeliveryBatch {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != 1 || self.events.is_empty() || self.events.len() > 50 {
+        if self.version != 2 || self.events.is_empty() || self.events.len() > 50 {
             return Err(Error::InvalidManifest);
         }
         let mut inputs = Vec::new();
