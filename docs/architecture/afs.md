@@ -1176,6 +1176,12 @@ S3 默认保留载荷签名；显式 `dfs_external_backend.unsigned_payload=true
 回执身份、错误传播和发布持久屏障不变；该选项不是关闭内容校验，也不自动适配
 或部署第三方后端。
 
+长度不小于 256 KiB 的数据块另存一个 BLAKE3 outboard 旁对象（数据对象键加 `.bao`，
+`NodeChunkSidecar` 编码，与本地 `.bao` 旁文件相同）。它是可由数据重新算出的派生数据，
+不进 Meta：读取时按范围取回 32 KiB 分组并验证到 Meta 记录的内容根，旁对象本身不被信任；
+缺失或无效时整对象读取并整块校验。GC 列举把旁对象归到所属数据块，删除时先删数据对象、
+后删旁对象。
+
 **写入**：S3 只是原生写流水线后面的另一个 `ChunkStore`（`node/external_chunk/store.rs` 的 `S3ChunkStore`），
 与本地副本模式共用同一条写路径、同一个提交入口和同样的预算（`dfs_write_queue_bytes`、`dfs_dirty_budget_bytes`、
 `dfs_unpublished_descriptors`）；上传并发被压到实际 PUT 许可数 4（`MAX_UPLOADS`，`node/assembly/dfs.rs`）。
@@ -1188,7 +1194,12 @@ S3 桥接复用一个自有线程、runtime 和客户端，worker 最多持有 3
 B 在每次 open 在线观察最新已发布 head，建立一致的版本／布局／长度视图。
 外部读使用 `AuthorizeExternalVersionRead` 从当前 Meta 状态验证版本归属、
 reader session／epoch、对象身份和合法范围，不以旧 MAC 作为续期凭据。
-每块完整校验，在最终返回前再次检查期限及已知失效。该路径不伪装
+授权缓存未命中时，同一个请求还带上同一版本布局里其后至多 16 个数据块（64MiB）的范围，
+顺序读因此每个窗口或每 5 秒询问一次 Meta；预取的授权在首次使用时仍做完整的逐读校验，
+带预取的请求被拒时原样重发不带预取的请求，由它决定这次读的成败。
+未开启 cache 时，带旁对象的数据块按范围读取：只取回读到的 32KiB 分组，逐组验证到 Meta
+记录的内容根后才复制到输出；覆盖达到数据块一半、范围过于分散、没有可用旁对象或范围验证失败时，
+整对象读取并完整校验，由它判定数据是否损坏。在最终返回前再次检查期限及已知失效。该路径不伪装
 Peer 接收者，也不依赖原 writer session。内容 cache 默认 OFF；可选 Node
 本地有界异步 cache，以 store/generation/chunk 身份隔离。完整校验后的内容
 先进入有界 pending，再由单后台线程写入临时文件并 rename；正常退出排空。

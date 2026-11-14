@@ -181,6 +181,13 @@ impl StagedChunk {
         &self.bytes
     }
 
+    /// The BLAKE3 outboard built while sealing, when the buffer pool carried
+    /// an outboard budget and it had room.
+    #[cfg(feature = "dfs")]
+    pub(in crate::node) fn outboard(&self) -> Option<&SharedOutboard> {
+        self.outboard.as_ref()
+    }
+
     /// Content proof only: operation identity, authorization and persistence
     /// still require their own checks. No mutable payload is exposed.
     #[cfg(feature = "dfs")]

@@ -133,6 +133,9 @@ pub mod version {
     pub const NODE_CHUNK_CATALOG_WAL: u32 = 2;
     pub const NODE_CHUNK_CATALOG_SNAPSHOT: u32 = 2;
     pub const NODE_CRC_SEGMENT_TABLE: u32 = 1;
+    /// Also the encoding of the optional S3 sidecar object `<chunk key>.bao`
+    /// (`dfs::external_outboard_key`); the object key layout itself is
+    /// `NODE_EXTERNAL_OBJECT_KEY`.
     pub const NODE_CHUNK_SIDECAR: u16 = 1;
     pub const NODE_PEER_CACHE_ENTRY: u32 = 2;
     pub const NODE_PEER_CACHE_MARKER: u32 = 1;

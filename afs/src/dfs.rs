@@ -673,6 +673,23 @@ pub fn external_object_key(
     ))
 }
 
+/// Suffix of the optional BLAKE3 outboard sidecar object stored beside a
+/// chunk object.
+pub const EXTERNAL_OUTBOARD_SUFFIX: &str = ".bao";
+
+/// Key of a chunk's optional BLAKE3 outboard sidecar: the chunk object's key
+/// plus [`EXTERNAL_OUTBOARD_SUFFIX`]. The sidecar is derived data in the
+/// `NodeChunkSidecar` encoding; it is listed and deleted with its chunk.
+pub fn external_outboard_key(
+    store_id: &str,
+    generation: &str,
+    chunk_id: &ChunkId,
+) -> afs_error::Result<String> {
+    let mut key = external_object_key(store_id, generation, chunk_id)?;
+    key.push_str(EXTERNAL_OUTBOARD_SUFFIX);
+    Ok(key)
+}
+
 /// Key prefix of every chunk object of one store generation.
 pub fn external_chunk_prefix(store_id: &str, generation: &str) -> afs_error::Result<String> {
     validate_external_store_identity(store_id, generation)?;

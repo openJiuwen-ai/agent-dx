@@ -72,6 +72,9 @@ pub const MAX_DFS_READ_BYTES: u64 = 8 * 1024 * 1024;
 /// the requested range budget. This matches the producer's staged chunk limit.
 pub const MAX_DFS_EXTERNAL_CHUNK_BYTES: u64 = crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64;
 const MAX_EXTERNAL_AUTH_CACHE_ENTRIES: usize = 128;
+/// Chunks one external authorization request may cover beyond the read that
+/// caused it: 64 MiB of 4 MiB chunks.
+pub(crate) const MAX_EXTERNAL_AUTHORITY_AHEAD: usize = 16;
 const MAX_EXTERNAL_AUTH_CACHE_BYTES: usize = 1024 * 1024;
 const MAX_SOURCE_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const SOURCE_GRANT_SAFETY_MS: u64 = 1_000;
@@ -282,6 +285,54 @@ pub trait ExternalChunkReader: Send + Sync {
         chunk: &ChunkObject,
         source: &SourceCandidate,
     ) -> Result<VerifiedExternalChunk>;
+
+    /// Copy `ranges` of one chunk into `out`. Every byte copied is verified
+    /// against the chunk's content identity first, and `out` is private to
+    /// the caller until this returns `Ok`. The default fetches and verifies
+    /// the whole chunk; a store may fetch only the ranges when it can still
+    /// prove them against the same identity.
+    fn read_chunk_ranges(
+        &self,
+        chunk: &ChunkObject,
+        source: &SourceCandidate,
+        ranges: &[ExternalRangeCopy],
+        out: &mut [u8],
+    ) -> Result<()> {
+        let verified = self.read_chunk(chunk, source)?;
+        if !verified.matches(chunk) {
+            return Err(corrupt(
+                "verified external Chunk identity does not match the request",
+            ));
+        }
+        copy_external_ranges(verified.as_slice(), ranges, out)
+    }
+}
+
+/// One range of an external chunk and where it lands in the caller's output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalRangeCopy {
+    pub chunk_offset: u64,
+    pub length: usize,
+    pub output_offset: usize,
+}
+
+/// Copies `ranges` of a whole verified chunk body into `out`.
+pub(in crate::node) fn copy_external_ranges(
+    body: &[u8],
+    ranges: &[ExternalRangeCopy],
+    out: &mut [u8],
+) -> Result<()> {
+    for range in ranges {
+        let source = usize::try_from(range.chunk_offset)
+            .ok()
+            .and_then(|start| body.get(start..start.checked_add(range.length)?))
+            .ok_or_else(|| invalid("external Chunk range exceeds the Chunk"))?;
+        out.get_mut(range.output_offset..)
+            .and_then(|out| out.get_mut(..range.length))
+            .ok_or_else(|| invalid("external Chunk range exceeds the output buffer"))?
+            .copy_from_slice(source);
+    }
+    Ok(())
 }
 
 /// Every operation keeps its own physical copy. A batch shares only the peer

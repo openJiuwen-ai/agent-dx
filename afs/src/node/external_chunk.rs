@@ -35,23 +35,27 @@ use crate::{
     config::MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES,
     dfs::{
         ChunkId, ChunkObject, ChunkReceipt, CopyLocation, CopyRole, CopyState,
-        ExternalCommitReceipt, OperationId, ReplicaGroupId, SourceCandidate, external_chunk_prefix,
-        external_object_key,
+        EXTERNAL_OUTBOARD_SUFFIX, ExternalCommitReceipt, OperationId, ReplicaGroupId,
+        SourceCandidate, external_chunk_prefix, external_object_key, external_outboard_key,
     },
     node::{
         chunk::{ChunkSink, MAX_STAGED_CHUNK_BYTES, PutIntent, StagedChunk, StoredChunk},
-        read::engine::{ExternalChunkReader, VerifiedExternalChunk},
+        read::engine::{
+            ExternalChunkReader, ExternalRangeCopy, VerifiedExternalChunk, copy_external_ranges,
+        },
     },
 };
 
 mod cache;
 mod metrics;
+mod range;
 mod store;
 mod verifier;
 mod worker;
 use cache::*;
 pub use metrics::S3ChunkStoreMetrics;
 use metrics::*;
+use range::*;
 pub use store::S3ChunkStore;
 use verifier::*;
 use worker::*;
@@ -114,15 +118,36 @@ struct Credentials {
 enum Request {
     Put(Vec<StagedChunk>),
     Read(ChunkObject),
+    /// Group-aligned ranges of one chunk and, when `sidecar` is set, its
+    /// outboard sidecar object.
+    ReadRanges {
+        chunk: ChunkObject,
+        ranges: Vec<std::ops::Range<u64>>,
+        sidecar: bool,
+    },
     Delete(Vec<ChunkId>),
-    List { after: Option<String>, limit: usize },
+    List {
+        after: Option<String>,
+        limit: usize,
+    },
 }
 
 enum Reply {
     Put(Vec<ChunkReceipt>),
     Read(VerifiedExternalChunk),
+    /// Unverified: the caller proves the parts against the chunk identity.
+    Ranges {
+        parts: Vec<(std::ops::Range<u64>, Vec<u8>)>,
+        sidecar: Option<SidecarFetch>,
+    },
     Deleted,
     Listed(Vec<String>),
+}
+
+/// The outcome of fetching a sidecar object; its content is untrusted.
+enum SidecarFetch {
+    Found(Vec<u8>),
+    Missing,
 }
 
 struct Command {
@@ -142,6 +167,13 @@ fn request_summary(request: &Request) -> (&'static str, usize, u64) {
                 .fold(0_u64, |sum, value| sum.saturating_add(value.chunk.length)),
         ),
         Request::Read(chunk) => ("read", 1, chunk.length),
+        Request::ReadRanges { ranges, .. } => (
+            "read_ranges",
+            ranges.len(),
+            ranges.iter().fold(0_u64, |sum, range| {
+                sum.saturating_add(range.end - range.start)
+            }),
+        ),
         Request::Delete(chunks) => ("delete", chunks.len(), 0),
         Request::List { limit, .. } => ("list", *limit, 0),
     }
