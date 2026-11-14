@@ -36,6 +36,8 @@ pub(super) struct PipelineMetadataState {
     pub(super) failed: u64,
     pub(super) pressure_descriptor: u64,
     pub(super) pressure_live: u64,
+    /// Early commits requested because a write waited on a stalled budget (R91).
+    pub(super) pressure_budget: u64,
 }
 
 pub(super) struct PipelineMetadataBudget {
@@ -324,6 +326,7 @@ impl WritePipeline {
                 ("upload_limit", self.metadata.upload_limit as u64),
                 ("pressure_descriptor", state.pressure_descriptor),
                 ("pressure_live", state.pressure_live),
+                ("pressure_budget", state.pressure_budget),
                 ("completed_uploads", state.completed),
                 ("failed_uploads", state.failed),
             ]);
