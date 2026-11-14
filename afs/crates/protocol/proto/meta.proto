@@ -1406,7 +1406,7 @@ message DfsReaderEntry {
   string inode_id = 2;
   string version_id = 3;
 }
-// Replaces the session's readers up to `low_watermark` with `readers`.
+// Restores all live `readers`; removes absent entries only up to `low_watermark`.
 // `meta_term` is the term the Node believed current; the session counts as
 // reported only if it matches the replying Meta's term.
 message ReportDfsReadersRequest {

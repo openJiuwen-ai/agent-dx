@@ -1393,7 +1393,8 @@ Coordinator 挂载同一 namespace，统一管理共享文件的回收；节点�
   只回收孤儿块，直到每个可能还在读的会话都向本 term 上报过读者（`ReportReaders`）或已过期。
 - **Node 侧**：
   - 回复带 Meta 的 writer term，Node 丢弃 term 低于已见最大值的登记回复；
-  - 每个回收周期释放已关闭的读者，并全量对账一次，只替换低水位以内的条目；
+  - 每个回收周期释放已关闭的读者，并上报全部活跃读者，包括编号高于低水位的条目，以便 Meta 重启后完整恢复；
+    低水位只限制删除范围：仅删除编号不超过低水位且本次未上报的条目，保留状态尚未确定的在途登记；
   - 指标 `afs_dfs_reader_references_total{kind=soft|durable}`（Node）、`afs_meta_dfs_reader_registrations`、
     `afs_meta_dfs_gc_reader_gate_closed`（Meta）。
 

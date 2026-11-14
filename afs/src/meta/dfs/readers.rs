@@ -184,10 +184,10 @@ impl SoftReaders {
         }
     }
 
-    /// Replaces the session's entries up to `low_watermark` with `entries`
-    /// and keeps the later ones (opens whose reply the Node had not processed
-    /// when it built the report). Marks the session reported when `term` is
-    /// this writer's term.
+    /// Restores every reported live reader, including those above `low_watermark`.
+    /// Removes absent entries only up to the watermark, keeping later opens whose
+    /// reply the Node may not have processed. Marks the session reported only
+    /// after restoration when the report uses this writer's term.
     pub(super) fn report(
         &self,
         node: &str,
@@ -210,7 +210,7 @@ impl SoftReaders {
             inner.remove(&key);
         }
         drop(inner);
-        for entry in entries.iter().filter(|entry| entry.reader <= low_watermark) {
+        for entry in entries {
             self.insert(
                 node,
                 session,
@@ -638,9 +638,10 @@ impl DfsService {
         Ok(())
     }
 
-    /// The Node's full list of readers up to `low_watermark`, made while it
-    /// believed `term` is the writer term. Returns this writer's term; the
-    /// session counts as reported only when the two match.
+    /// The Node's full list of live readers, made while it believed `term` is
+    /// the writer term. `low_watermark` bounds removal of absent readers only.
+    /// Returns this writer's term; the session counts as reported only when
+    /// the two terms match.
     pub async fn report_readers(
         &self,
         node: &str,
@@ -687,22 +688,29 @@ mod tests {
         }
     }
 
-    /// U3: a report replaces only readers up to its low watermark; a reader
-    /// whose open reply the Node had not handled yet (above it) survives.
+    /// U3: a report restores all listed readers, but removes absent ones only
+    /// up to its low watermark; an in-flight open above it survives.
     #[test]
     fn a_report_replaces_only_readers_up_to_its_low_watermark() {
         let table = SoftReaders::new(1);
         for reader in [1, 2, 5] {
             table.insert("n", "s", reader, &InodeId::new("i"), None);
         }
-        table.report("n", "s", 3, &[entry(1, "i", "v")], true);
+        table.report("n", "s", 3, &[entry(1, "i", "v"), entry(7, "i", "v")], true);
         let readers = table
             .snapshot(&[("n".into(), "s".into())].into(), &BTreeMap::new(), 0, 0)
             .references
             .into_iter()
             .map(|reference| reference.reference_id)
             .collect::<Vec<_>>();
-        assert_eq!(readers, ["reader:1", "reader:5"]);
+        assert_eq!(readers, ["reader:1", "reader:5", "reader:7"]);
+        // Above-watermark entries missing from the report may still be in flight.
+        // Once the watermark advances, their absence permits removal.
+        table.report("n", "s", 7, &[entry(7, "i", "v")], true);
+        let inner = table.lock();
+        assert_eq!(inner.entries.len(), 1);
+        assert!(inner.entries.contains_key(&("n".into(), "s".into(), 7)));
+        drop(inner);
         assert!(table.is_reported("n", "s"));
         // A report made under another term changes entries but not the gate.
         table.report("n", "t", 0, &[], false);

@@ -45,9 +45,9 @@ pub trait GcControl: Send + Sync {
     fn release_readers(&self, _readers: &[u64]) -> Result<()> {
         Ok(())
     }
-    /// Replaces this session's readers up to `low_watermark` at Meta;
-    /// `term` is the writer term the Node believes current. Returns the
-    /// replying Meta's term.
+    /// Reports all live readers at Meta; only absent readers at or below
+    /// `low_watermark` may be removed. `term` is the writer term the Node
+    /// believes current. Returns the replying Meta's term.
     fn report_readers(
         &self,
         _term: u64,
@@ -156,9 +156,9 @@ const SOFT_RETAIN_ATTEMPTS: usize = 4;
 
 /// The Node side of C-1 (design §3.3). `reader` numbers increase; a reader
 /// is "in flight" from its number until its reply is handled. A report sends
-/// every live reader up to the low watermark, the highest number below every
-/// in-flight one, so Meta can replace exactly the readers whose fate the
-/// Node knows (L3).
+/// every live reader, including those above the low watermark. The watermark
+/// is the highest number below every in-flight one, so Meta removes absent
+/// readers only where the Node knows their fate (L3).
 #[derive(Debug)]
 struct SoftReaders {
     next: u64,
@@ -537,8 +537,9 @@ impl GcReferences {
         }
         Ok(false)
     }
-    /// Sends every live reader up to the low watermark to Meta, made with the
-    /// newest Meta term this Node has seen. A reply naming a newer term means
+    /// Sends every live reader to Meta, including those above the low watermark,
+    /// with the newest Meta term this Node has seen. The watermark bounds only
+    /// removal of absent readers. A reply naming a newer term means
     /// the report reached a Meta this Node did not know yet: the Node now
     /// drops replies of older terms and reports again under the new term,
     /// which is the one Meta counts (design L4).
@@ -552,7 +553,7 @@ impl GcReferences {
                 let low_watermark = soft.low_watermark();
                 let readers = soft
                     .live
-                    .range(..=low_watermark)
+                    .iter()
                     .map(|(reader, (inode, version))| SoftReader {
                         reader: *reader,
                         inode: inode.clone(),
@@ -1090,9 +1091,8 @@ mod tests {
         assert!(pin.id.starts_with("open:"));
     }
 
-    /// U3 (Node side): a report covers live readers up to the low watermark,
-    /// below the first registration still in flight; a closed reader is
-    /// released and leaves the report.
+    /// U3 (Node side): the removal watermark stays below the first registration
+    /// still in flight; a closed reader is released and leaves the report.
     #[test]
     fn a_report_stops_below_the_first_registration_in_flight() {
         let meta = soft_meta(1);
@@ -1125,6 +1125,38 @@ mod tests {
             [2]
         );
         drop(second);
+    }
+
+    /// Completed opens above an earlier in-flight open still reach Meta.
+    #[test]
+    fn a_report_includes_live_readers_above_its_low_watermark() {
+        let meta = soft_meta(1);
+        let references = GcReferences::new(meta.clone());
+        let pending = references.begin_reader().unwrap().unwrap();
+        let completed = references.begin_reader().unwrap().unwrap();
+        let inode = InodeId::new("i");
+        let version = FileVersionId::new("v");
+        let pin = references
+            .finish_reader(completed, Some((1, &inode, Some(&version))))
+            .unwrap()
+            .unwrap();
+        references.report_readers().unwrap();
+        let (_, low, readers) = meta.reports.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(low, pending - 1);
+        assert_eq!(
+            readers,
+            vec![SoftReader {
+                reader: completed,
+                inode,
+                version: Some(version)
+            }]
+        );
+        drop(pin);
+        references.finish_reader(pending, None).unwrap();
+        references.report_readers().unwrap();
+        let (_, low, readers) = meta.reports.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(low, completed);
+        assert!(readers.is_empty());
     }
 
     /// A Meta whose release call lets more pins drop meanwhile, as creates

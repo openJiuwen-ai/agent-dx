@@ -2891,3 +2891,128 @@ async fn create_registers_its_handle_in_memory_and_writes_no_reference() {
         .unwrap();
     assert!(!exists(&store, MetaKey::DfsInode(inode.inode_id.clone())).await);
 }
+
+/// Cross the actual Node reporting path with a reopened Meta store. A transport
+/// delay keeps one low-numbered open reply in flight while a second is delivered.
+#[tokio::test]
+async fn a_restart_preserves_a_live_reader_above_the_report_watermark() {
+    use crate::node::gc::{GcControl, GcReferences, SoftReader};
+
+    struct ReportToMeta {
+        runtime: tokio::runtime::Handle,
+        meta: std::sync::Mutex<DfsService>,
+    }
+    impl GcControl for ReportToMeta {
+        fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
+            unreachable!("this test uses real soft opens")
+        }
+
+        fn release(&self, _: &[String]) -> Result<()> {
+            Ok(())
+        }
+
+        fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<GcState> {
+            unreachable!("the test collects from Meta directly")
+        }
+
+        fn report_readers(&self, term: u64, low: u64, entries: &[SoftReader]) -> Result<u64> {
+            let entries = entries
+                .iter()
+                .map(|entry| crate::meta::dfs::ReaderEntry {
+                    reader: entry.reader,
+                    inode_id: entry.inode.clone(),
+                    version_id: entry.version.clone(),
+                })
+                .collect();
+            let meta = self.meta.lock().unwrap().clone();
+            self.runtime
+                .block_on(meta.report_readers("n", "s", term, low, entries))
+        }
+    }
+
+    let mut first = vec![inode("i", 1, "v1"), chunk("old")];
+    first.extend(version("v1", "i", "old"));
+    let (store, log) = seeded_store(first).await;
+    let meta = DfsService::new(store.clone());
+    report_no_readers(&meta).await;
+
+    let control = Arc::new(ReportToMeta {
+        runtime: tokio::runtime::Handle::current(),
+        meta: std::sync::Mutex::new(meta.clone()),
+    });
+    let references = GcReferences::new(control.clone());
+    let delayed = references.begin_reader().unwrap().unwrap();
+    let _delayed_reply = meta
+        .open_file_read(open_read(delayed, "i", None))
+        .await
+        .unwrap();
+    let delivered = references.begin_reader().unwrap().unwrap();
+    let reply = meta
+        .open_file_read(open_read(delivered, "i", None))
+        .await
+        .unwrap();
+    assert!(reply.registered);
+    let opened = reply.inode.unwrap();
+    let handle_pin = references
+        .finish_reader(
+            delivered,
+            Some((
+                reply.meta_term,
+                &opened.inode_id,
+                opened.head_version.as_ref(),
+            )),
+        )
+        .unwrap()
+        .expect("Node has accepted the second open");
+
+    let mut moved = vec![inode("i", 1, "v2"), chunk("new")];
+    moved.extend(version("v2", "i", "new"));
+    put_entities(&store, "restart-regression-new-head", moved).await;
+    let store = Arc::new(
+        crate::meta::store::Store::open_log(Arc::new(log.reopen()))
+            .await
+            .unwrap(),
+    );
+    let new_meta = DfsService::new(store.clone());
+    assert!(store.writer_term() > reply.meta_term);
+    *control.meta.lock().unwrap() = new_meta.clone();
+    drop(meta);
+    let before = new_meta
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    assert!(!before.chunks.contains(&ChunkId::new("old")));
+    assert!(exists(&store, MetaKey::DfsFileVersion(FileVersionId::new("v1"))).await);
+
+    let reporting = references.clone();
+    tokio::task::spawn_blocking(move || reporting.report_readers())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(new_meta.readers.is_reported("n", "s"));
+    assert_eq!(
+        new_meta.readers.len(),
+        1,
+        "the delivered reader must be restored"
+    );
+    let after = new_meta
+        .collect_garbage("n".into(), "s".into(), before.generation, vec![])
+        .await
+        .unwrap();
+    assert!(!after.chunks.contains(&ChunkId::new("old")));
+    assert!(exists(&store, MetaKey::DfsFileVersion(FileVersionId::new("v1"))).await);
+    assert!(exists(&store, MetaKey::DfsChunk(ChunkId::new("old"))).await);
+    drop(handle_pin);
+    references.finish_reader(delayed, None).unwrap();
+    let reporting = references.clone();
+    tokio::task::spawn_blocking(move || reporting.report_readers())
+        .await
+        .unwrap()
+        .unwrap();
+    let closed = new_meta
+        .collect_garbage("n".into(), "s".into(), after.generation, vec![])
+        .await
+        .unwrap();
+    assert!(closed.chunks.contains(&ChunkId::new("old")));
+    assert!(!exists(&store, MetaKey::DfsFileVersion(FileVersionId::new("v1"))).await);
+}
