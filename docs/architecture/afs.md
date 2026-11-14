@@ -98,7 +98,7 @@ flowchart TB
 | 文件层 | `Backend` 实现、句柄与读视图、写流水线（唯一写路径）、唯一提交入口、后台写回、版本缓存 | `node/vfs/dfs.rs`（`DistributedFs`，13 个按职责的字段）、`node/vfs/dfs/{backend,handles,read_view,write_pipeline,write_pipeline_ops,dirty_extents,write_state,commit,commit_prepare,writeback,meta_port,version_cache}.rs` |
 | 写代理 | 写租约在别的节点时，代理侧经 `DfsOwnerFiles` 把写交给 owner；owner 侧幂等表与回收 | `node/vfs/dfs/remote_client.rs`（`WriteCoordinator`）、`node/vfs/dfs/owner_gateway.rs`（`OwnerGateway`）、`node/vfs/dfs/owner_op_table.rs` |
 | 读引擎 | 固定版本读：本机副本 → 扇出 → Peer 缓存 → 远端范围读；S3 外部读 | `node/read/engine.rs`、`node/read/engine/*`、`node/read/peer_cache/` |
-| 写下沉 | `ChunkSink`：本机快路径、副本链（链头持久化后转发、收对端持久 ACK、降级写）、S3 上传 | `node/replication.rs`、`node/replication/acks.rs`、`node/external_chunk.rs`、`node/external_chunk/{store,worker,cache,verifier}.rs` |
+| 写下沉 | `ChunkSink`：本机快路径、副本链（链头落盘与转发、收持久 ACK、降级写）、S3 上传 | `node/replication.rs`、`node/replication/acks.rs`、`node/external_chunk.rs`、`node/external_chunk/{store,worker,cache,verifier}.rs` |
 | 本机 chunk 存储 | 暂存 → 持久化（正文、目录、catalog 屏障）→ ACK；校验读；副本生命周期（`CopyLifecycle`）；巡检读盘；服务对端读 | `node/chunk/{store,staged,catalog,catalog_commit,lifecycle,reader,scrub,peer_serve,sidecar_install}.rs` |
 | 故障层 | 修复循环（上报隔离、认领、复制、报告）、GC 回收循环、写租约续期、后台巡检、接收方校验失败的复核 | `node/fault/{repair,reaper,lease_keeper,scrub,suspect,classify}.rs` |
 | GC 执行（Node） | GC 引用（`open:`、`write:`）的建立与有界释放队列；一次回收（本机副本或 S3 对象） | `node/gc/references.rs`、`node/gc/collect.rs` |
@@ -196,7 +196,7 @@ errno 映射（`afs/src/error.rs`）：`ResourceExhausted` 中 `IO_CAPACITY` 为
 | 存储模式 | fsync／close 成功时数据在哪里 | 代码 |
 | --- | --- | --- |
 | 本地盘 1 副本 | 本机 chunk 正文、目录与 catalog 均已 fsync | `node/chunk/store.rs`（`persist_batch`） |
-| 本地盘多副本 | 链头持久化后转发，收到 `dfs_sync_required_copies` 份持久 ACK；`degrade` 下不少于 `dfs_min_degraded_copies` 份也成功，缺的副本同事务登记待修复 | `node/replication.rs`、`meta/dfs/commit.rs` |
+| 本地盘多副本 | 单块原生上传使用 gRPC、由本节点担任链头且同步两份时，本地落盘与转发并行。两边完成后按原回执规则判定。其他路径保持链头先落盘。严格写要求 `dfs_sync_required_copies` 份持久 ACK，`degrade` 允许满足 `dfs_min_degraded_copies` 下限的副本提交，缺失副本同事务登记待修复 | `node/replication.rs`、`meta/dfs/commit.rs` |
 | S3（外部后端） | S3 PUT 成功且回执经长度与 BLAKE3 校验；本地盘只是缓存 | `node/external_chunk/` |
 
 Meta 状态的持久性取决于 Meta 后端：`local-file` 到本机盘 fsync；`redis` 要求单实例 `appendonly yes`＋`appendfsync always`；

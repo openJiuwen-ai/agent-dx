@@ -48,6 +48,29 @@ impl CatalogCommitTestControl {
 }
 
 impl LocalChunkStore {
+    #[cfg(test)]
+    pub(crate) fn fail_next_catalog_wal_after_sync(&self) {
+        self.test_hooks
+            .catalog_commit_test
+            .fail_wal_step
+            .store(3, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_catalog_wal(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        self.test_hooks
+            .catalog_commit_test
+            .before_wal
+            .lock()
+            .unwrap()
+            .push_back((entered, release));
+        (waiting, resume)
+    }
+
     pub fn open(root: impl AsRef<Path>, node_id: impl Into<String>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let chunks = root.join("chunks");
