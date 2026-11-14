@@ -1,6 +1,9 @@
 use super::*;
 use crate::dfs::{CopyId, DfsReadGrant, FileVersionId, LayoutRootId, NamespaceId};
-use std::{io::Write, net::TcpListener, os::unix::fs::PermissionsExt};
+use std::{io::Write, net::TcpListener, os::unix::fs::PermissionsExt, pin::Pin, task::Poll};
+
+/// `options().upload_concurrency`.
+const TEST_UPLOADS: usize = 4;
 
 fn options() -> S3ChunkStoreOptions {
     S3ChunkStoreOptions {
@@ -11,6 +14,9 @@ fn options() -> S3ChunkStoreOptions {
         generation: "generation-1".into(),
         allow_http: true,
         unsigned_payload: false,
+        payload_checksum: crate::config::DfsExternalPayloadChecksum::None,
+        upload_concurrency: TEST_UPLOADS,
+        worker_threads: 2,
         credentials: S3CredentialsSource::Environment,
         request_timeout: Duration::from_secs(2),
         max_retries: 0,
@@ -44,10 +50,23 @@ struct CapturedPut {
 }
 
 fn put_against_http_fixture(unsigned_payload: bool, status: &'static [u8]) -> CapturedPut {
+    put_against_http_fixture_with(
+        unsigned_payload,
+        crate::config::DfsExternalPayloadChecksum::None,
+        status,
+    )
+}
+
+fn put_against_http_fixture_with(
+    unsigned_payload: bool,
+    payload_checksum: crate::config::DfsExternalPayloadChecksum,
+    status: &'static [u8],
+) -> CapturedPut {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut config = options();
     config.unsigned_payload = unsigned_payload;
+    config.payload_checksum = payload_checksum;
     config.endpoint = format!("http://{}", listener.local_addr().unwrap());
     let dir = tempfile::tempdir().unwrap();
     let credentials = dir.path().join("credentials.json");
@@ -442,6 +461,8 @@ struct PutActivity {
     retained_payloads: Mutex<Vec<object_store::PutPayload>>,
     hold: std::sync::atomic::AtomicBool,
     hold_first: std::sync::atomic::AtomicBool,
+    /// Runtime threads that polled a PUT.
+    threads: Mutex<std::collections::HashSet<thread::ThreadId>>,
 }
 
 struct ActivePut<'a>(&'a PutActivity);
@@ -489,6 +510,11 @@ impl ObjectStore for ObservedStore {
     ) -> object_store::Result<object_store::PutResult> {
         use std::sync::atomic::Ordering::SeqCst;
         let tag = payload.iter().next().unwrap()[0];
+        self.activity
+            .threads
+            .lock()
+            .unwrap()
+            .insert(thread::current().id());
         self.activity
             .payload_addresses
             .lock()
@@ -896,7 +922,7 @@ fn concurrent_puts_share_four_slots_and_replace_completed_uploads() {
         backend.activity.started.load(SeqCst) >= 5,
         "completed PUT must admit another chunk while the first PUT is held"
     );
-    assert_eq!(backend.activity.maximum.load(SeqCst), MAX_UPLOADS);
+    assert_eq!(backend.activity.maximum.load(SeqCst), TEST_UPLOADS);
     backend.activity.hold_first.store(false, SeqCst);
     let mut operations: Vec<_> = writers
         .into_iter()
@@ -918,7 +944,7 @@ fn concurrent_puts_share_four_slots_and_replace_completed_uploads() {
 #[test]
 fn upload_queue_backpressure_waits_without_a_false_storage_error() {
     // More concurrent writers than active request slots: the surplus waits
-    // instead of failing, and only MAX_UPLOADS PUTs ever run at once.
+    // instead of failing, and only TEST_UPLOADS PUTs ever run at once.
     use std::sync::atomic::Ordering::SeqCst;
     let backend = ObservedStore::new(None, Duration::from_millis(1));
     backend.activity.hold.store(true, SeqCst);
@@ -931,13 +957,13 @@ fn upload_queue_backpressure_waits_without_a_false_storage_error() {
         })
         .collect();
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while backend.activity.started.load(SeqCst) < MAX_UPLOADS
+    while backend.activity.started.load(SeqCst) < TEST_UPLOADS
         && std::time::Instant::now() < deadline
     {
         thread::sleep(Duration::from_millis(1));
     }
     thread::sleep(Duration::from_millis(50));
-    assert_eq!(backend.activity.maximum.load(SeqCst), MAX_UPLOADS);
+    assert_eq!(backend.activity.maximum.load(SeqCst), TEST_UPLOADS);
     assert!(writers.iter().all(|writer| !writer.is_finished()));
     backend.activity.hold.store(false, SeqCst);
     for writer in writers {
@@ -3236,6 +3262,81 @@ fn s3_put_can_use_unsigned_payload_without_dropping_sigv4_or_receipt_checks() {
         external.object_key,
         external_object_key("filesystem-a", "generation-1", &captured.chunk.id).unwrap()
     );
+}
+
+#[test]
+fn s3_put_sends_a_signed_crc64nvme_header_with_or_without_a_signed_payload() {
+    for unsigned_payload in [true, false] {
+        let captured = put_against_http_fixture_with(
+            unsigned_payload,
+            crate::config::DfsExternalPayloadChecksum::Crc64nvme,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"immutable\"\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(captured.body, b"payload");
+        // CRC-64/NVME of "payload", big-endian, base64.
+        assert_eq!(
+            header_value(&captured.header, "x-amz-checksum-crc64nvme"),
+            "mUWPHDji6s0="
+        );
+        assert_eq!(
+            header_value(&captured.header, "x-amz-content-sha256") == "UNSIGNED-PAYLOAD",
+            unsigned_payload
+        );
+        // The checksum header is covered by the request signature, so it
+        // cannot be replaced in transit without invalidating the request.
+        assert!(
+            header_value(&captured.header, "authorization").contains("x-amz-checksum-crc64nvme"),
+            "checksum header must be a signed header"
+        );
+        assert!(captured.result.unwrap().external_commit.is_some());
+    }
+}
+
+#[test]
+fn s3_put_sends_no_checksum_header_by_default() {
+    let captured = put_against_http_fixture(
+        true,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"immutable\"\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        !captured
+            .header
+            .to_ascii_lowercase()
+            .contains("x-amz-checksum-")
+    );
+}
+
+#[test]
+fn options_reject_unbounded_upload_concurrency_and_worker_threads() {
+    for (uploads, workers) in [(0, 1), (9, 1), (1, 0), (1, 9)] {
+        let mut config = options();
+        config.upload_concurrency = uploads;
+        config.worker_threads = workers;
+        let Err(error) =
+            S3ChunkStore::with_backend(config, ObservedStore::new(None, Duration::ZERO))
+        else {
+            panic!("upload_concurrency={uploads} worker_threads={workers} must be rejected");
+        };
+        assert_eq!(error.code(), afs_error::IO_INVALID);
+    }
+}
+
+#[test]
+fn upload_concurrency_bounds_parallel_puts_on_several_worker_threads() {
+    // Blocking 20 ms inside each PUT stands in for payload hashing: with one
+    // worker thread nine PUTs would take 180 ms; eight permits on four
+    // threads overlap them.
+    use std::sync::atomic::Ordering::SeqCst;
+    let backend = ObservedStore::new(None, Duration::from_millis(20));
+    let mut config = options();
+    config.upload_concurrency = 8;
+    config.worker_threads = 4;
+    let store = S3ChunkStore::with_backend(config, backend.clone()).unwrap();
+    assert_eq!(store.put_batch(upload_batch(24, 1024)).unwrap().len(), 24);
+    assert_eq!(backend.activity.maximum.load(SeqCst), 8);
+    assert_eq!(backend.activity.active.load(SeqCst), 0);
+    let threads = backend.activity.threads.lock().unwrap().len();
+    assert!(threads > 1, "PUT tasks ran on {threads} worker thread(s)");
 }
 
 #[test]

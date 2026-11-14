@@ -139,11 +139,32 @@ pub struct DfsExternalBackendConfig {
     pub region: String,
     #[serde(default)]
     pub allow_http: bool,
-    #[serde(default)]
-    pub unsigned_payload: bool,
+    /// `false` signs every PUT body with SHA-256 (SigV4 signed payload);
+    /// `true` sends `UNSIGNED-PAYLOAD`. Request authentication is SigV4 either
+    /// way. Default: unsigned for an `https` endpoint, signed for `http`.
+    pub unsigned_payload: Option<bool>,
+    /// Whole-body checksum sent as a signed request header on every PUT. The
+    /// store rejects a body that does not match it. Default: `crc64nvme` when
+    /// the payload is unsigned, otherwise `none`.
+    pub payload_checksum: Option<DfsExternalPayloadChecksum>,
+    /// Concurrent object PUTs, 1..=8 (default 8).
+    pub upload_concurrency: Option<usize>,
+    /// Request worker threads, 1..=8 (default: `upload_concurrency`, at most 4).
+    pub worker_threads: Option<usize>,
     pub credentials_file: Option<PathBuf>,
     /// Optional disposable content cache; omission preserves backend-only reads.
     pub cache: Option<DfsExternalCacheConfig>,
+}
+
+/// `dfs_external_backend.payload_checksum`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DfsExternalPayloadChecksum {
+    /// No checksum header; only a signed payload lets the store detect a
+    /// body damaged in transit.
+    None,
+    /// `x-amz-checksum-crc64nvme`.
+    Crc64nvme,
 }
 
 pub(crate) const MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES: u64 = 1 << 40;
@@ -170,6 +191,47 @@ pub struct DfsPeerCacheConfig {
 }
 
 impl DfsExternalBackendConfig {
+    /// Whether PUT bodies go out unsigned, after defaults. Over TLS the
+    /// transport already authenticates the body, and the checksum header
+    /// lets the store reject a damaged one; a plaintext endpoint keeps the
+    /// signed payload.
+    pub fn effective_unsigned_payload(&self) -> bool {
+        self.unsigned_payload
+            .unwrap_or_else(|| self.endpoint.starts_with("https://"))
+    }
+
+    /// The PUT checksum header after defaults.
+    pub fn effective_payload_checksum(&self) -> DfsExternalPayloadChecksum {
+        self.payload_checksum
+            .unwrap_or(if self.effective_unsigned_payload() {
+                DfsExternalPayloadChecksum::Crc64nvme
+            } else {
+                DfsExternalPayloadChecksum::None
+            })
+    }
+
+    /// This configuration with every defaulted upload setting made explicit,
+    /// as `--print-config` shows it.
+    #[must_use]
+    pub fn with_defaults(mut self) -> Self {
+        self.unsigned_payload = Some(self.effective_unsigned_payload());
+        self.payload_checksum = Some(self.effective_payload_checksum());
+        self.upload_concurrency = Some(self.effective_upload_concurrency());
+        self.worker_threads = Some(self.effective_worker_threads());
+        self
+    }
+
+    /// Concurrent object PUTs after defaults.
+    pub fn effective_upload_concurrency(&self) -> usize {
+        self.upload_concurrency.unwrap_or(8)
+    }
+
+    /// Request worker threads after defaults.
+    pub fn effective_worker_threads(&self) -> usize {
+        self.worker_threads
+            .unwrap_or_else(|| self.effective_upload_concurrency().min(4))
+    }
+
     /// Reject ambiguous namespaces, implicit plaintext and relative secret paths.
     pub fn validate(&self) -> Result<()> {
         for value in [&self.store_id, &self.generation, &self.bucket, &self.region] {
@@ -200,6 +262,17 @@ impl DfsExternalBackendConfig {
         {
             return Err(invalid(
                 "external backend requires an explicit HTTPS origin, or allow_http=true for an isolated test endpoint",
+            ));
+        }
+        if self
+            .upload_concurrency
+            .is_some_and(|value| !(1..=8).contains(&value))
+            || self
+                .worker_threads
+                .is_some_and(|value| !(1..=8).contains(&value))
+        {
+            return Err(invalid(
+                "external backend upload_concurrency and worker_threads must be 1..=8",
             ));
         }
         if self
@@ -950,7 +1023,9 @@ impl Config {
             dfs_scrub_start_delay_seconds: tuning.dfs_scrub_start_delay_seconds,
             dfs_scrub_round_interval_seconds: tuning.dfs_scrub_round_interval_seconds,
             dfs_kernel_cache_ttl_ms: tuning.dfs_kernel_cache_ttl_ms,
-            dfs_external_backend: file.dfs_external_backend,
+            dfs_external_backend: file
+                .dfs_external_backend
+                .map(DfsExternalBackendConfig::with_defaults),
             dfs_peer_cache: file.dfs_peer_cache,
             dfs_write_buffer_idle_bytes: file
                 .dfs_write_buffer_idle_bytes
@@ -1082,31 +1157,108 @@ mod certificate_tests {
     }
 
     #[test]
-    fn dfs_external_backend_unsigned_payload_defaults_false_and_accepts_true() {
-        let default: DfsExternalBackendConfig = toml::from_str(
-            r#"
-store_id = "filesystem-a"
-generation = "generation-1"
-endpoint = "https://s3.example.invalid"
-bucket = "chunks"
-region = "us-east-1"
-"#,
-        )
-        .unwrap();
-        assert!(!default.unsigned_payload);
+    fn dfs_external_backend_payload_defaults_follow_the_endpoint_scheme() {
+        use DfsExternalPayloadChecksum::{Crc64nvme, None as NoChecksum};
+        let parse = |endpoint: &str, extra: &str| -> DfsExternalBackendConfig {
+            toml::from_str(&format!(
+                "store_id = \"filesystem-a\"\ngeneration = \"generation-1\"\nendpoint = \"{endpoint}\"\nbucket = \"chunks\"\nregion = \"us-east-1\"\nallow_http = true\n{extra}"
+            ))
+            .unwrap()
+        };
+        // (endpoint, explicit settings) -> (unsigned payload, checksum header)
+        for (endpoint, extra, unsigned, checksum) in [
+            // TLS: unsigned body, CRC64NVME header.
+            ("https://s3.example.invalid", "", true, Crc64nvme),
+            // Plaintext: the signed payload stays.
+            ("http://127.0.0.1:9000", "", false, NoChecksum),
+            // Explicit settings win in both directions.
+            (
+                "https://s3.example.invalid",
+                "unsigned_payload = false\n",
+                false,
+                NoChecksum,
+            ),
+            (
+                "http://127.0.0.1:9000",
+                "unsigned_payload = true\n",
+                true,
+                Crc64nvme,
+            ),
+            (
+                "https://s3.example.invalid",
+                "payload_checksum = \"none\"\n",
+                true,
+                NoChecksum,
+            ),
+            (
+                "https://s3.example.invalid",
+                "unsigned_payload = false\npayload_checksum = \"crc64nvme\"\n",
+                false,
+                Crc64nvme,
+            ),
+        ] {
+            let config = parse(endpoint, extra);
+            config.validate().unwrap();
+            assert_eq!(
+                config.effective_unsigned_payload(),
+                unsigned,
+                "{endpoint} {extra}"
+            );
+            assert_eq!(
+                config.effective_payload_checksum(),
+                checksum,
+                "{endpoint} {extra}"
+            );
+            let explicit = config.with_defaults();
+            assert_eq!(explicit.unsigned_payload, Some(unsigned));
+            assert_eq!(explicit.payload_checksum, Some(checksum));
+            assert_eq!(explicit.upload_concurrency, Some(8));
+            assert_eq!(explicit.worker_threads, Some(4));
+        }
+    }
 
-        let explicit: DfsExternalBackendConfig = toml::from_str(
-            r#"
+    #[test]
+    fn dfs_external_backend_upload_settings_default_and_validate() {
+        let base = r#"
 store_id = "filesystem-a"
 generation = "generation-1"
 endpoint = "https://s3.example.invalid"
 bucket = "chunks"
 region = "us-east-1"
-unsigned_payload = true
-"#,
-        )
+"#;
+        let default: DfsExternalBackendConfig = toml::from_str(base).unwrap();
+        default.validate().unwrap();
+        assert_eq!(default.effective_upload_concurrency(), 8);
+        assert_eq!(default.effective_worker_threads(), 4);
+
+        let explicit: DfsExternalBackendConfig = toml::from_str(&format!(
+            "{base}payload_checksum = \"crc64nvme\"\nupload_concurrency = 2\n"
+        ))
         .unwrap();
-        assert!(explicit.unsigned_payload);
+        explicit.validate().unwrap();
+        assert_eq!(
+            explicit.payload_checksum,
+            Some(DfsExternalPayloadChecksum::Crc64nvme)
+        );
+        assert_eq!(explicit.effective_upload_concurrency(), 2);
+        assert_eq!(explicit.effective_worker_threads(), 2);
+
+        for line in [
+            "upload_concurrency = 0",
+            "upload_concurrency = 9",
+            "worker_threads = 0",
+            "worker_threads = 9",
+        ] {
+            let invalid: DfsExternalBackendConfig =
+                toml::from_str(&format!("{base}{line}\n")).unwrap();
+            assert!(invalid.validate().is_err(), "{line} must be rejected");
+        }
+        assert!(
+            toml::from_str::<DfsExternalBackendConfig>(&format!(
+                "{base}payload_checksum = \"md5\"\n"
+            ))
+            .is_err()
+        );
     }
 }
 
