@@ -2003,6 +2003,216 @@ fn permanent_admission_failure_rejects_the_generation_and_releases_its_pin() {
     }
 }
 
+fn r91_open_dirty(fs: &DistributedFs, name: &str) -> (FileHandle, InodeId) {
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new(name),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    // A write at the end of the file reserves a whole 4 MiB builder.
+    fs.write(&context(), file.handle, 0, b"x").unwrap();
+    (file.handle, fs.inode_id(file.entry.inode).unwrap())
+}
+
+#[test]
+fn a_file_at_its_dirty_limit_does_not_commit_another_file() {
+    let chunk = COMMIT_CHUNK_BYTES as usize;
+    // With two open writers, the 32 MiB Node limit gives each 16 MiB.
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * chunk, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = fs.with_write_timeout(Duration::from_secs(1));
+    let (oldest, oldest_inode) = r91_open_dirty(&fs, "r91-owner-limit-oldest");
+    let (writer, writer_inode) = r91_open_dirty(&fs, "r91-owner-limit-writer");
+    // Leave four separate builders partially filled, with no upload ready.
+    for index in 1..4 {
+        assert_eq!(
+            fs.write(&context(), writer, index * COMMIT_CHUNK_BYTES, b"x")
+                .unwrap(),
+            1
+        );
+    }
+    let pipeline = fs.write_resources.pipeline.as_ref().unwrap();
+    let writer_cell = fs.write_state(&writer_inode).unwrap().unwrap();
+    let budget = pipeline.budget.snapshot();
+    assert_eq!(budget.limit, 8 * chunk);
+    assert_eq!(budget.live_bytes, 5 * chunk);
+    assert_eq!(
+        writer_cell
+            .lock()
+            .unwrap()
+            .native_owner
+            .snapshot()
+            .live_bytes,
+        4 * chunk
+    );
+    assert!(meta.commits.lock().unwrap().is_empty());
+
+    // The next builder fits on the Node, but exceeds this file's limit.
+    // Without a periodic pass, the original admission loop times out.
+    let result = fs.write(&context(), writer, 4 * COMMIT_CHUNK_BYTES, b"x");
+    assert!(
+        meta.commits.lock().unwrap().is_empty(),
+        "a per-file limit must not trigger an early commit"
+    );
+    assert_eq!(result.unwrap_err().code(), afs_error::IO_TIMEOUT);
+    assert!(
+        fs.write_state(&oldest_inode)
+            .unwrap()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .dirty
+    );
+
+    for handle in [oldest, writer] {
+        fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+        fs.release(&context(), handle).unwrap();
+    }
+}
+
+/// R91: a write waiting for dirty budget must not wait for the periodic
+/// commit. The oldest file holding budget is committed early, which frees its
+/// builder; younger holders keep theirs.
+#[test]
+fn a_write_waiting_for_dirty_budget_commits_the_oldest_holder_early() {
+    // Budget for exactly two open dirty files.
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = Arc::new(fs.with_write_timeout(Duration::from_secs(20)));
+    let (oldest, oldest_inode) = r91_open_dirty(&fs, "r91-oldest");
+    let (younger, younger_inode) = r91_open_dirty(&fs, "r91-younger");
+    let started = Instant::now();
+    // No timer pass runs in this test: nothing calls `writeback_pending`.
+    let (third, _) = r91_open_dirty(&fs, "r91-third");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the third file's write waited {:?} for budget",
+        started.elapsed()
+    );
+    let committed = meta
+        .commits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|commit| commit.inode_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        committed,
+        vec![oldest_inode.clone()],
+        "only the oldest budget holder is committed early"
+    );
+    let dirty = |inode: &InodeId| {
+        fs.write_state(inode)
+            .unwrap()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .dirty
+    };
+    assert!(!dirty(&oldest_inode));
+    assert!(dirty(&younger_inode), "a younger holder keeps its builder");
+    for handle in [oldest, younger, third] {
+        fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+        fs.release(&context(), handle).unwrap();
+    }
+}
+
+/// R91: the early commit is asked for once per wait, not once per holder:
+/// with room for three files, the fourth and fifth each evict one.
+#[test]
+fn each_budget_wait_commits_only_as_many_holders_as_it_needs() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 12 * 1024 * 1024, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = Arc::new(fs.with_write_timeout(Duration::from_secs(20)));
+    let mut handles = Vec::new();
+    let mut inodes = Vec::new();
+    for index in 0..5 {
+        let (handle, inode) = r91_open_dirty(&fs, &format!("r91-many-{index}"));
+        handles.push(handle);
+        inodes.push(inode);
+    }
+    let committed = meta
+        .commits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|commit| commit.inode_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        committed,
+        inodes[..2].to_vec(),
+        "oldest first, one per wait"
+    );
+    for handle in handles {
+        fs.release(&context(), handle).unwrap();
+    }
+}
+
+#[test]
+fn a_holder_synced_during_selection_does_not_block_later_budget_relief() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = Arc::new(fs.with_write_timeout(Duration::from_secs(20)));
+    let (oldest, oldest_inode) = r91_open_dirty(&fs, "r91-synced");
+    let (younger, younger_inode) = r91_open_dirty(&fs, "r91-still-dirty");
+    let oldest_cell = fs.write_state(&oldest_inode).unwrap().unwrap();
+    let younger_cell = fs.write_state(&younger_inode).unwrap().unwrap();
+    let held_since = |cell: &SharedInodeWriteState| cell.lock().unwrap().native_owner.held_since();
+    assert!(held_since(&oldest_cell).unwrap() < held_since(&younger_cell).unwrap());
+    let committed_inodes = || {
+        meta.commits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|commit| commit.inode_id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Let fsync finish on another thread after the budget waiter has picked
+    // this holder. Keep the synced file open and listed for writeback.
+    let sync_fs = fs.clone();
+    *fs.hooks.dirty_budget_before_mark_due.lock().unwrap() = Some(Box::new(move || {
+        std::thread::spawn(move || sync_fs.fsync(&context(), oldest, SyncMode::Full))
+            .join()
+            .unwrap()
+            .unwrap();
+    }));
+    let (third, _) = r91_open_dirty(&fs, "r91-uses-released-budget");
+    assert!(
+        fs.hooks
+            .dirty_budget_before_mark_due
+            .lock()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(committed_inodes(), vec![oldest_inode.clone()]);
+    assert!(younger_cell.lock().unwrap().dirty);
+    {
+        let state = oldest_cell.lock().unwrap();
+        assert_eq!(state.open_writers, 1);
+        assert!(!state.dirty);
+        assert!(state.native_owner.held_since().is_none());
+        assert!(
+            !state.native_due,
+            "fsync already cleaned the selected holder"
+        );
+    }
+
+    // The third write used the space freed by fsync. The fourth must commit
+    // the next holder to get capacity. No periodic writeback runs here.
+    let (fourth, _) = r91_open_dirty(&fs, "r91-needs-early-commit");
+    assert_eq!(committed_inodes(), vec![oldest_inode, younger_inode]);
+
+    for handle in [oldest, younger, third, fourth] {
+        fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+        fs.release(&context(), handle).unwrap();
+    }
+}
+
 /// Round 2 B1: Create admits the new file's first write generation, so its
 /// first write needs no admission call (the gate stays closed: any call would
 /// hang), the commit publishes that generation, and the pin is released after.

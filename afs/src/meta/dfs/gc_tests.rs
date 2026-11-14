@@ -943,6 +943,165 @@ fn any_subset_of_a_plan_leaves_the_rest_dead_and_chunk_records_stay_together() {
     }
 }
 
+/// A plan larger than one batch: the reader's old version `zz-old` waits in a
+/// later batch while its only chunk leaves with the first one, and the first
+/// batch names no version of the reader's inode.
+async fn plan_whose_first_batch_deletes_a_later_batch_versions_chunk() -> (
+    Arc<crate::meta::store::Store>,
+    crate::meta::store::StoreRevision,
+    Vec<MetaEntity>,
+    u64,
+    GcPlan,
+) {
+    let mut seeded = vec![inode("owner", 1, "zz-head"), chunk("live-chunk")];
+    seeded.extend(version("zz-head", "owner", "live-chunk"));
+    // Dead versions of another inode, sorted before "zz-old", share the live
+    // chunk: they add only version and layout keys.
+    for index in 0..MAX_BATCH_KEYS {
+        seeded.extend(version(
+            &format!("aa-dead-{index:05}"),
+            "filler",
+            "live-chunk",
+        ));
+    }
+    seeded.extend(version("zz-old", "owner", "old-chunk"));
+    seeded.push(chunk("old-chunk"));
+    let (store, _) = seeded_store(seeded).await;
+    let (since, entities) = store.read_view().await.unwrap().snapshot().unwrap();
+    let now = now_unix_ms();
+    let plan = plan_bounded(&entities, &[], now, 0, MAX_CHUNKS.min(MAX_BATCH_KEYS / 8));
+    assert!(plan.chunks.contains(&ChunkId::new("old-chunk")));
+    (store, since, entities, now, plan)
+}
+
+/// A reader admitted after planning pins `zz-old` (it still exists, so
+/// admission succeeds; Meta does not require it to be the head).
+async fn pin_old_version_after_planning(service: &DfsService) {
+    service
+        .update_gc_reference(UpdateGcReference {
+            node_id: "n".into(),
+            session_id: "s".into(),
+            reference_id: "open:late-reader".into(),
+            inode_id: Some(InodeId::new("owner")),
+            version_id: Some(FileVersionId::new("zz-old")),
+            publication: false,
+            admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
+        })
+        .await
+        .unwrap();
+}
+
+/// The chunk records leave with the first batch of a plan. A reader admitted
+/// after planning that pins an old version whose own key waits in a later
+/// batch must still invalidate the first batch: it deletes that version's
+/// only chunk, and the reader would read EIO.
+#[tokio::test]
+async fn a_reader_admitted_after_planning_protects_a_chunk_of_a_later_batch_version() {
+    let (store, since, entities, now, plan) =
+        plan_whose_first_batch_deletes_a_later_batch_versions_chunk().await;
+    let service = DfsService::new(store.clone());
+    let first = plan.keys.len().min(plan.chunk_keys.max(MAX_BATCH_KEYS));
+    let (batch, rest) = plan.keys.split_at(first);
+    assert!(
+        batch.contains(&MetaKey::DfsChunk(ChunkId::new("old-chunk"))),
+        "precondition: the first batch deletes the old version's chunk"
+    );
+    assert!(
+        rest.contains(&MetaKey::DfsFileVersion(FileVersionId::new("zz-old"))),
+        "precondition: the old version itself waits for a later batch"
+    );
+    assert!(
+        !batch
+            .iter()
+            .any(|key| matches!(key, MetaKey::DfsFileVersion(id)
+            if plan.version_owners.get(id) == Some(&InodeId::new("owner")))),
+        "precondition: no version of the reader's inode is in the first batch"
+    );
+    let mutations = batch
+        .iter()
+        .cloned()
+        .map(TxnMutation::Delete)
+        .collect::<Vec<_>>();
+    let guard = plan_guard(since, &entities, now, &plan, batch, &mutations);
+    pin_old_version_after_planning(&service).await;
+    let committed = service
+        .gc_commit_checked(
+            vec![TxnCondition::DfsGcPlanStillValid(Arc::new(guard))],
+            StoreOperation::DfsCollectGarbage,
+            mutations,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !committed,
+        "the first batch deleted the only chunk of a version a reader pinned after planning"
+    );
+    let (_, after) = store.read_view().await.unwrap().snapshot().unwrap();
+    assert!(
+        after.iter().any(
+            |entity| matches!(entity, MetaEntity::DfsChunk(chunk) if chunk.id.0 == "old-chunk")
+        ),
+        "the pinned version's chunk must survive the refused batch"
+    );
+}
+
+/// Every batch of a plan is rechecked against the whole plan, not only its own
+/// keys: a later batch that names no version of the reader's inode is refused
+/// too once a reader pins a version the plan still deletes. What is left is
+/// planned again with the reader among its inputs.
+#[tokio::test]
+async fn a_later_batch_is_rechecked_against_the_whole_plan() {
+    let (store, since, entities, now, plan) =
+        plan_whose_first_batch_deletes_a_later_batch_versions_chunk().await;
+    let service = DfsService::new(store.clone());
+    let first = plan.keys.len().min(plan.chunk_keys.max(MAX_BATCH_KEYS));
+    let rest = &plan.keys[first..];
+    // A later batch, built as `commit_remaining_keys` builds it, that deletes
+    // nothing of the reader's inode.
+    let batch = rest
+        .iter()
+        .filter(|key| match key {
+            MetaKey::DfsFileVersion(id) => {
+                plan.version_owners.get(id) != Some(&InodeId::new("owner"))
+            }
+            MetaKey::DfsLayoutRoot(id) => id.0 != "zz-old",
+            _ => false,
+        })
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(batch.len(), 8, "precondition: the plan has a later batch");
+    let mutations = batch
+        .iter()
+        .cloned()
+        .map(TxnMutation::Delete)
+        .collect::<Vec<_>>();
+    let chunkless = GcPlan {
+        version_owners: plan.version_owners.clone(),
+        ..GcPlan::default()
+    };
+    let guard = plan_guard(since, &entities, now, &chunkless, &batch, &mutations);
+    assert!(
+        guard
+            .protected_by_reference
+            .contains(&InodeId::new("owner")),
+        "a later batch must be rechecked for readers of every version the plan deletes"
+    );
+    pin_old_version_after_planning(&service).await;
+    let committed = service
+        .gc_commit_checked(
+            vec![TxnCondition::DfsGcPlanStillValid(Arc::new(guard))],
+            StoreOperation::DfsCollectGarbage,
+            mutations,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !committed,
+        "a batch of a plan a late reader invalidated must not commit"
+    );
+}
+
 #[tokio::test]
 async fn a_commit_refused_for_size_halves_the_batch_and_is_counted() {
     use crate::meta::store::{Store, journal::MemoryLog};

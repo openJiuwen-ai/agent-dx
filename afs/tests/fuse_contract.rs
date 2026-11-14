@@ -434,6 +434,56 @@ fn fuse_mount_dispatches_real_backend_and_preserves_open_handle_identity() {
         .status();
 }
 
+/// On a DFS mount `open(O_CREAT)` without `O_EXCL` on a name that appeared after
+/// the kernel's lookup opens the existing file: the create collides, the kernel is told to
+/// look again, and the application never sees EEXIST. With `O_EXCL` the
+/// collision is the answer.
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn fuse_open_creat_without_excl_opens_a_name_that_appeared_after_lookup() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let backend = Arc::new(MockBackend::default());
+    let session =
+        fuse::mount_dfs_with_options(backend.clone(), &mount, fuse::FuseMountOptions::default())
+            .unwrap();
+    wait_until_mounted(&mount).unwrap();
+
+    let path = mount.join("raced");
+    std::fs::write(&path, b"theirs").unwrap();
+    let hide = |backend: &MockBackend| {
+        backend.appearing_names.lock().unwrap().push("raced".into());
+    };
+
+    hide(&backend);
+    let mut opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap();
+    let mut contents = Vec::new();
+    opened.read_to_end(&mut contents).unwrap();
+    assert_eq!(contents, b"theirs", "the existing file was opened");
+    drop(opened);
+
+    hide(&backend);
+    let exclusive = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap_err();
+    assert_eq!(exclusive.raw_os_error(), Some(libc::EEXIST));
+
+    session.join().unwrap();
+    let _ = std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg(&mount)
+        .status();
+}
+
 #[test]
 #[ignore = "requires Linux /dev/fuse, fusermount3 and python3 mmap"]
 fn fuse_direct_io_open_allows_basic_shared_mmap() {
@@ -1552,6 +1602,9 @@ struct MockBackend {
     getattr_calls: AtomicU64,
     read_calls: AtomicU64,
     root_mkdir_parent: AtomicU64,
+    /// Names whose next lookup misses although the entry exists, as when
+    /// another node creates the name right after this kernel looked it up.
+    appearing_names: Mutex<Vec<std::ffi::OsString>>,
 }
 
 #[derive(Debug)]
@@ -1607,6 +1660,13 @@ impl Backend for MockBackend {
         name: &OsStr,
     ) -> afs_error::Result<Entry> {
         self.note(format!("lookup:{}", name.to_string_lossy()));
+        {
+            let mut appearing = self.appearing_names.lock().unwrap();
+            if let Some(index) = appearing.iter().position(|hidden| hidden == name) {
+                appearing.remove(index);
+                return Err(not_found());
+            }
+        }
         let state = self.state.lock().unwrap();
         let inode = state
             .entries
@@ -1685,7 +1745,7 @@ impl Backend for MockBackend {
             .contains_key(&(parent.value, name.to_os_string()))
         {
             return Err(afs_error::Error::coded(
-                afs_error::NODE_MOUNT_CONFLICT,
+                afs_error::IO_ALREADY_EXISTS,
                 "entry already exists",
             ));
         }

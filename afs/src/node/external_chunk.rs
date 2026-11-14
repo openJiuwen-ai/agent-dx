@@ -4,20 +4,17 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs::{self, DirBuilder, File, OpenOptions},
-    future::Future,
     future::poll_fn,
     io::{Read, Write},
     os::fd::AsRawFd,
     os::unix::fs::FileExt,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{
         Arc, Condvar, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    task::Poll,
     thread,
     time::Duration,
 };
@@ -35,30 +32,39 @@ use crate::{
     config::MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES,
     dfs::{
         ChunkId, ChunkObject, ChunkReceipt, CopyLocation, CopyRole, CopyState,
-        ExternalCommitReceipt, OperationId, ReplicaGroupId, SourceCandidate, external_chunk_prefix,
-        external_object_key,
+        EXTERNAL_OUTBOARD_SUFFIX, ExternalCommitReceipt, OperationId, ReplicaGroupId,
+        SourceCandidate, external_chunk_prefix, external_object_key, external_outboard_key,
     },
     node::{
         chunk::{ChunkSink, MAX_STAGED_CHUNK_BYTES, PutIntent, StagedChunk, StoredChunk},
-        read::engine::{ExternalChunkReader, VerifiedExternalChunk},
+        read::engine::{
+            ExternalChunkReader, ExternalRangeCopy, VerifiedExternalChunk, copy_external_ranges,
+        },
     },
 };
 
 mod cache;
 mod metrics;
+mod range;
 mod store;
 mod verifier;
 mod worker;
 use cache::*;
 pub use metrics::S3ChunkStoreMetrics;
 use metrics::*;
+use range::*;
 pub use store::S3ChunkStore;
 use verifier::*;
 use worker::*;
 
 const MAX_BATCH: usize = 128;
-/// Concurrent object PUTs; the Node's native upload depth is capped to this.
-pub(crate) const MAX_UPLOADS: usize = 4;
+/// Upper bound of `upload_concurrency`: the native write pipeline never has
+/// more chunks in flight (`dfs_upload_inflight_chunks`).
+pub(crate) const MAX_UPLOAD_CONCURRENCY: usize = 8;
+/// Upper bound of `worker_threads`.
+pub(crate) const MAX_WORKER_THREADS: usize = 8;
+/// Idle connections kept beyond the upload depth, for reads, lists and deletes.
+const EXTRA_IDLE_CONNECTIONS: usize = 8;
 const MAX_ACTIVE_REQUESTS: usize = 32;
 const MAX_CREDENTIAL_BYTES: u64 = 16 * 1024;
 const MAX_CACHE_JOBS: usize = 128;
@@ -85,6 +91,14 @@ pub struct S3ChunkStoreOptions {
     pub generation: String,
     pub allow_http: bool,
     pub unsigned_payload: bool,
+    /// Whole-body checksum sent as a signed request header on every PUT.
+    pub payload_checksum: crate::config::DfsExternalPayloadChecksum,
+    /// Concurrent object PUTs, 1..=[`MAX_UPLOAD_CONCURRENCY`]. The Node's
+    /// native upload depth is capped to this.
+    pub upload_concurrency: usize,
+    /// Request worker threads, 1..=[`MAX_WORKER_THREADS`]. Payload signing and
+    /// checksums run on them, so one thread serializes every PUT's hashing.
+    pub worker_threads: usize,
     pub credentials: S3CredentialsSource,
     /// Deadline for a whole batch, including retry and response-body collection.
     pub request_timeout: Duration,
@@ -114,15 +128,36 @@ struct Credentials {
 enum Request {
     Put(Vec<StagedChunk>),
     Read(ChunkObject),
+    /// Group-aligned ranges of one chunk and, when `sidecar` is set, its
+    /// outboard sidecar object.
+    ReadRanges {
+        chunk: ChunkObject,
+        ranges: Vec<std::ops::Range<u64>>,
+        sidecar: bool,
+    },
     Delete(Vec<ChunkId>),
-    List { after: Option<String>, limit: usize },
+    List {
+        after: Option<String>,
+        limit: usize,
+    },
 }
 
 enum Reply {
     Put(Vec<ChunkReceipt>),
     Read(VerifiedExternalChunk),
+    /// Unverified: the caller proves the parts against the chunk identity.
+    Ranges {
+        parts: Vec<(std::ops::Range<u64>, Vec<u8>)>,
+        sidecar: Option<SidecarFetch>,
+    },
     Deleted,
     Listed(Vec<String>),
+}
+
+/// The outcome of fetching a sidecar object; its content is untrusted.
+enum SidecarFetch {
+    Found(Vec<u8>),
+    Missing,
 }
 
 struct Command {
@@ -142,6 +177,13 @@ fn request_summary(request: &Request) -> (&'static str, usize, u64) {
                 .fold(0_u64, |sum, value| sum.saturating_add(value.chunk.length)),
         ),
         Request::Read(chunk) => ("read", 1, chunk.length),
+        Request::ReadRanges { ranges, .. } => (
+            "read_ranges",
+            ranges.len(),
+            ranges.iter().fold(0_u64, |sum, range| {
+                sum.saturating_add(range.end - range.start)
+            }),
+        ),
         Request::Delete(chunks) => ("delete", chunks.len(), 0),
         Request::List { limit, .. } => ("list", *limit, 0),
     }
@@ -155,6 +197,8 @@ fn validate_options(options: &S3ChunkStoreOptions) -> Result<()> {
         || options.request_timeout.is_zero()
         || options.request_timeout > Duration::from_secs(300)
         || options.max_retries > 10
+        || !(1..=MAX_UPLOAD_CONCURRENCY).contains(&options.upload_concurrency)
+        || !(1..=MAX_WORKER_THREADS).contains(&options.worker_threads)
         || !(options.endpoint.starts_with("https://") || options.endpoint.starts_with("http://"))
         || options.endpoint.contains(['@', '?', '#'])
     {

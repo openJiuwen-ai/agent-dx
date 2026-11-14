@@ -1,6 +1,9 @@
 use super::*;
 use crate::dfs::{CopyId, DfsReadGrant, FileVersionId, LayoutRootId, NamespaceId};
-use std::{io::Write, net::TcpListener, os::unix::fs::PermissionsExt};
+use std::{io::Write, net::TcpListener, os::unix::fs::PermissionsExt, pin::Pin, task::Poll};
+
+/// `options().upload_concurrency`.
+const TEST_UPLOADS: usize = 4;
 
 fn options() -> S3ChunkStoreOptions {
     S3ChunkStoreOptions {
@@ -11,6 +14,9 @@ fn options() -> S3ChunkStoreOptions {
         generation: "generation-1".into(),
         allow_http: true,
         unsigned_payload: false,
+        payload_checksum: crate::config::DfsExternalPayloadChecksum::None,
+        upload_concurrency: TEST_UPLOADS,
+        worker_threads: 2,
         credentials: S3CredentialsSource::Environment,
         request_timeout: Duration::from_secs(2),
         max_retries: 0,
@@ -44,10 +50,23 @@ struct CapturedPut {
 }
 
 fn put_against_http_fixture(unsigned_payload: bool, status: &'static [u8]) -> CapturedPut {
+    put_against_http_fixture_with(
+        unsigned_payload,
+        crate::config::DfsExternalPayloadChecksum::None,
+        status,
+    )
+}
+
+fn put_against_http_fixture_with(
+    unsigned_payload: bool,
+    payload_checksum: crate::config::DfsExternalPayloadChecksum,
+    status: &'static [u8],
+) -> CapturedPut {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut config = options();
     config.unsigned_payload = unsigned_payload;
+    config.payload_checksum = payload_checksum;
     config.endpoint = format!("http://{}", listener.local_addr().unwrap());
     let dir = tempfile::tempdir().unwrap();
     let credentials = dir.path().join("credentials.json");
@@ -442,6 +461,8 @@ struct PutActivity {
     retained_payloads: Mutex<Vec<object_store::PutPayload>>,
     hold: std::sync::atomic::AtomicBool,
     hold_first: std::sync::atomic::AtomicBool,
+    /// Runtime threads that polled a PUT.
+    threads: Mutex<std::collections::HashSet<thread::ThreadId>>,
 }
 
 struct ActivePut<'a>(&'a PutActivity);
@@ -489,6 +510,11 @@ impl ObjectStore for ObservedStore {
     ) -> object_store::Result<object_store::PutResult> {
         use std::sync::atomic::Ordering::SeqCst;
         let tag = payload.iter().next().unwrap()[0];
+        self.activity
+            .threads
+            .lock()
+            .unwrap()
+            .insert(thread::current().id());
         self.activity
             .payload_addresses
             .lock()
@@ -800,6 +826,7 @@ fn valid_but_replaced_public_identity_does_not_replace_content_proof() {
         cache: None,
         verifier: S3ChunkVerifier::new().unwrap(),
         observer: S3GetObserver::new(None),
+        sidecars: SidecarCache::default(),
     };
     let mut original =
         StagedChunk::new_generational(OperationId::new("producer"), b"original".to_vec());
@@ -895,7 +922,7 @@ fn concurrent_puts_share_four_slots_and_replace_completed_uploads() {
         backend.activity.started.load(SeqCst) >= 5,
         "completed PUT must admit another chunk while the first PUT is held"
     );
-    assert_eq!(backend.activity.maximum.load(SeqCst), MAX_UPLOADS);
+    assert_eq!(backend.activity.maximum.load(SeqCst), TEST_UPLOADS);
     backend.activity.hold_first.store(false, SeqCst);
     let mut operations: Vec<_> = writers
         .into_iter()
@@ -917,7 +944,7 @@ fn concurrent_puts_share_four_slots_and_replace_completed_uploads() {
 #[test]
 fn upload_queue_backpressure_waits_without_a_false_storage_error() {
     // More concurrent writers than active request slots: the surplus waits
-    // instead of failing, and only MAX_UPLOADS PUTs ever run at once.
+    // instead of failing, and only TEST_UPLOADS PUTs ever run at once.
     use std::sync::atomic::Ordering::SeqCst;
     let backend = ObservedStore::new(None, Duration::from_millis(1));
     backend.activity.hold.store(true, SeqCst);
@@ -930,13 +957,13 @@ fn upload_queue_backpressure_waits_without_a_false_storage_error() {
         })
         .collect();
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while backend.activity.started.load(SeqCst) < MAX_UPLOADS
+    while backend.activity.started.load(SeqCst) < TEST_UPLOADS
         && std::time::Instant::now() < deadline
     {
         thread::sleep(Duration::from_millis(1));
     }
     thread::sleep(Duration::from_millis(50));
-    assert_eq!(backend.activity.maximum.load(SeqCst), MAX_UPLOADS);
+    assert_eq!(backend.activity.maximum.load(SeqCst), TEST_UPLOADS);
     assert!(writers.iter().all(|writer| !writer.is_finished()));
     backend.activity.hold.store(false, SeqCst);
     for writer in writers {
@@ -998,6 +1025,7 @@ fn empty_batch_needs_no_worker_and_nonempty_batches_keep_validation() {
         cache: None,
         verifier: S3ChunkVerifier::new().unwrap(),
         observer: S3GetObserver::new(None),
+        sidecars: SidecarCache::default(),
     };
     assert!(store.put_batch(Vec::new()).unwrap().is_empty());
 
@@ -3237,6 +3265,81 @@ fn s3_put_can_use_unsigned_payload_without_dropping_sigv4_or_receipt_checks() {
 }
 
 #[test]
+fn s3_put_sends_a_signed_crc64nvme_header_with_or_without_a_signed_payload() {
+    for unsigned_payload in [true, false] {
+        let captured = put_against_http_fixture_with(
+            unsigned_payload,
+            crate::config::DfsExternalPayloadChecksum::Crc64nvme,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"immutable\"\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(captured.body, b"payload");
+        // CRC-64/NVME of "payload", big-endian, base64.
+        assert_eq!(
+            header_value(&captured.header, "x-amz-checksum-crc64nvme"),
+            "mUWPHDji6s0="
+        );
+        assert_eq!(
+            header_value(&captured.header, "x-amz-content-sha256") == "UNSIGNED-PAYLOAD",
+            unsigned_payload
+        );
+        // The checksum header is covered by the request signature, so it
+        // cannot be replaced in transit without invalidating the request.
+        assert!(
+            header_value(&captured.header, "authorization").contains("x-amz-checksum-crc64nvme"),
+            "checksum header must be a signed header"
+        );
+        assert!(captured.result.unwrap().external_commit.is_some());
+    }
+}
+
+#[test]
+fn s3_put_sends_no_checksum_header_by_default() {
+    let captured = put_against_http_fixture(
+        true,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"immutable\"\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        !captured
+            .header
+            .to_ascii_lowercase()
+            .contains("x-amz-checksum-")
+    );
+}
+
+#[test]
+fn options_reject_unbounded_upload_concurrency_and_worker_threads() {
+    for (uploads, workers) in [(0, 1), (9, 1), (1, 0), (1, 9)] {
+        let mut config = options();
+        config.upload_concurrency = uploads;
+        config.worker_threads = workers;
+        let Err(error) =
+            S3ChunkStore::with_backend(config, ObservedStore::new(None, Duration::ZERO))
+        else {
+            panic!("upload_concurrency={uploads} worker_threads={workers} must be rejected");
+        };
+        assert_eq!(error.code(), afs_error::IO_INVALID);
+    }
+}
+
+#[test]
+fn upload_concurrency_bounds_parallel_puts_on_several_worker_threads() {
+    // Blocking 20 ms inside each PUT stands in for payload hashing: with one
+    // worker thread nine PUTs would take 180 ms; eight permits on four
+    // threads overlap them.
+    use std::sync::atomic::Ordering::SeqCst;
+    let backend = ObservedStore::new(None, Duration::from_millis(20));
+    let mut config = options();
+    config.upload_concurrency = 8;
+    config.worker_threads = 4;
+    let store = S3ChunkStore::with_backend(config, backend.clone()).unwrap();
+    assert_eq!(store.put_batch(upload_batch(24, 1024)).unwrap().len(), 24);
+    assert_eq!(backend.activity.maximum.load(SeqCst), 8);
+    assert_eq!(backend.activity.active.load(SeqCst), 0);
+    let threads = backend.activity.threads.lock().unwrap().len();
+    assert!(threads > 1, "PUT tasks ran on {threads} worker thread(s)");
+}
+
+#[test]
 fn unsigned_payload_put_failure_returns_no_external_receipt() {
     let captured = put_against_http_fixture(
         true,
@@ -3664,4 +3767,647 @@ fn listing_pages_through_chunks_and_skips_foreign_keys() {
     }
     assert_eq!(found, expected);
     assert!(pages >= 3);
+}
+
+// ---- Range reads against the outboard sidecar object (F-b) ----
+
+/// An object store that records every GET and DELETE and can damage or
+/// refuse individual objects.
+#[derive(Debug, Default)]
+struct RangeFixture {
+    inner: object_store::memory::InMemory,
+    /// `(key, range)` of every GET, in arrival order.
+    gets: Mutex<Vec<(String, Option<std::ops::Range<u64>>)>>,
+    /// Keys in deletion order.
+    deletes: Mutex<Vec<String>>,
+    /// PUTs of keys with this suffix fail.
+    fail_put_suffix: Mutex<Option<&'static str>>,
+    /// Deletes of keys with this suffix fail.
+    fail_delete_suffix: Mutex<Option<&'static str>>,
+}
+
+impl RangeFixture {
+    fn gets(&self) -> Vec<(String, Option<std::ops::Range<u64>>)> {
+        std::mem::take(&mut self.gets.lock().unwrap())
+    }
+
+    fn keys(&self) -> Vec<String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut listed = self.inner.list(None);
+            let mut keys = Vec::new();
+            while let Some(meta) = tokio_stream::StreamExt::next(&mut listed).await {
+                keys.push(meta.unwrap().location.to_string());
+            }
+            keys.sort();
+            keys
+        })
+    }
+
+    fn body(&self, key: &str) -> Vec<u8> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            self.inner
+                .get(&ObjectPath::from(key))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .to_vec()
+        })
+    }
+
+    fn replace(&self, key: &str, body: Vec<u8>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            self.inner
+                .put(&ObjectPath::from(key), body.into())
+                .await
+                .unwrap();
+        });
+    }
+
+    fn remove(&self, key: &str) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            self.inner.delete(&ObjectPath::from(key)).await.unwrap();
+        });
+    }
+}
+
+impl std::fmt::Display for RangeFixture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "range test store")
+    }
+}
+
+fn injected(message: &'static str) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "range test store",
+        source: std::io::Error::other(message).into(),
+    }
+}
+
+#[tonic::async_trait]
+impl ObjectStore for RangeFixture {
+    async fn put_opts(
+        &self,
+        location: &ObjectPath,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        let refused = *self.fail_put_suffix.lock().unwrap();
+        if refused.is_some_and(|suffix| location.as_ref().ends_with(suffix)) {
+            return Err(injected("injected PUT failure"));
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectPath,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectPath,
+        opts: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let range = match &opts.range {
+            Some(object_store::GetRange::Bounded(range)) => Some(range.clone()),
+            Some(other) => panic!("unexpected GET range {other:?}"),
+            None => None,
+        };
+        self.gets
+            .lock()
+            .unwrap()
+            .push((location.to_string(), range));
+        self.inner.get_opts(location, opts).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: TestStream<object_store::Result<ObjectPath>>,
+    ) -> TestStream<object_store::Result<ObjectPath>> {
+        let refused = *self.fail_delete_suffix.lock().unwrap();
+        let inner = self.inner.clone();
+        let deletes: *const Mutex<Vec<String>> = &self.deletes;
+        // SAFETY: the stream is consumed inside the store's own request while
+        // the store (which owns this fixture through an Arc) is alive.
+        let deletes = unsafe { &*deletes };
+        Box::pin(tokio_stream::StreamExt::then(locations, move |location| {
+            let inner = inner.clone();
+            async move {
+                let location = location?;
+                if refused.is_some_and(|suffix| location.as_ref().ends_with(suffix)) {
+                    return Err(injected("injected DELETE failure"));
+                }
+                deletes.lock().unwrap().push(location.to_string());
+                inner.delete(&location).await.map(|()| location)
+            }
+        }))
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> TestStream<object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+const MIB: usize = 1024 * 1024;
+
+fn patterned(length: usize, seed: u8) -> Vec<u8> {
+    (0..length)
+        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed) ^ (index >> 11) as u8)
+        .collect()
+}
+
+/// A chunk sealed the way the write pipeline seals it: in a pooled buffer
+/// whose pool carries an outboard budget, so sealing builds the outboard.
+pub(super) fn sealed_with_outboard(operation: &str, body: &[u8]) -> StagedChunk {
+    let pool = crate::node::chunk::WriteBufferPool::new_with_outboard_budget(
+        0,
+        crate::node::chunk::OutboardBudget::new(MIB),
+    );
+    let mut builder =
+        crate::node::chunk::ChunkBuilder::with_pool(pool.clone(), body.len()).unwrap();
+    builder.write_at(0, body).unwrap();
+    StagedChunk::from_shared_generational(OperationId::new(operation), builder.freeze())
+}
+
+fn range_store(backend: &Arc<RangeFixture>) -> S3ChunkStore {
+    S3ChunkStore::with_backend(options(), backend.clone()).unwrap()
+}
+
+fn keys_of(chunk: &ChunkObject) -> (String, String) {
+    (
+        external_object_key("filesystem-a", "generation-1", &chunk.id).unwrap(),
+        external_outboard_key("filesystem-a", "generation-1", &chunk.id).unwrap(),
+    )
+}
+
+fn read_range(
+    store: &S3ChunkStore,
+    chunk: &ChunkObject,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>> {
+    let (key, _) = keys_of(chunk);
+    let mut out = vec![0xEE; length];
+    store.read_chunk_ranges(
+        chunk,
+        &source(chunk, key),
+        &[ExternalRangeCopy {
+            chunk_offset: offset,
+            length,
+            output_offset: 0,
+        }],
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+#[test]
+fn sidecar_key_is_the_chunk_key_plus_a_suffix() {
+    let chunk = StagedChunk::new_generational(OperationId::new("key"), vec![1; 16]).chunk;
+    let (key, sidecar) = keys_of(&chunk);
+    assert_eq!(sidecar, format!("{key}.bao"));
+    assert!(external_outboard_key("../x", "generation-1", &chunk.id).is_err());
+}
+
+#[test]
+fn a_large_chunk_is_stored_with_its_sidecar_and_a_small_one_without() {
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    let large = sealed_with_outboard("large", &patterned(MIB, 1));
+    let small = sealed_with_outboard("small", &patterned(SIDECAR_MIN_CHUNK_BYTES as usize - 1, 2));
+    // Sealed without an outboard budget: no outboard, so no sidecar either.
+    let unbudgeted = StagedChunk::new_generational(OperationId::new("plain"), patterned(MIB, 3));
+    let (large_key, large_sidecar) = keys_of(&large.chunk);
+    let expected_sidecar = range::test_support::sidecar_for(large.bytes());
+    store
+        .put_batch(vec![large.clone(), small.clone(), unbudgeted.clone()])
+        .unwrap();
+    let mut expected = vec![
+        large_key,
+        large_sidecar.clone(),
+        keys_of(&small.chunk).0,
+        keys_of(&unbudgeted.chunk).0,
+    ];
+    expected.sort();
+    assert_eq!(backend.keys(), expected);
+    assert_eq!(backend.body(&large_sidecar), expected_sidecar);
+}
+
+#[test]
+fn a_failed_sidecar_put_still_returns_the_receipt_and_reads_fall_back() {
+    let backend = Arc::new(RangeFixture::default());
+    *backend.fail_put_suffix.lock().unwrap() = Some(".bao");
+    let store = range_store(&backend);
+    let body = patterned(MIB, 4);
+    let staged = sealed_with_outboard("sidecar-fails", &body);
+    let receipt = store.put(staged.clone()).unwrap();
+    assert_eq!(receipt.chunk, staged.chunk);
+    assert_eq!(backend.keys(), vec![keys_of(&staged.chunk).0]);
+
+    assert_eq!(
+        read_range(&store, &staged.chunk, 5000, 100).unwrap(),
+        body[5000..5100]
+    );
+    let (key, sidecar) = keys_of(&staged.chunk);
+    // First read: the planned range and the sidecar probe, then the whole object.
+    assert_eq!(
+        backend.gets(),
+        vec![
+            (key.clone(), Some(0..32 * 1024)),
+            (sidecar, None),
+            (key.clone(), None)
+        ]
+    );
+    // The absence is remembered: later reads go straight to the whole object.
+    assert_eq!(
+        read_range(&store, &staged.chunk, 0, 10).unwrap(),
+        body[..10]
+    );
+    assert_eq!(backend.gets(), vec![(key, None)]);
+}
+
+#[test]
+fn a_failed_chunk_put_returns_no_receipt_even_when_the_sidecar_was_stored() {
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    let staged = sealed_with_outboard("data-fails", &patterned(MIB, 5));
+    let (key, sidecar) = keys_of(&staged.chunk);
+    // Only the chunk object's own key ends with the chunk id.
+    let suffix: &'static str = Box::leak(key.clone().into_boxed_str());
+    *backend.fail_put_suffix.lock().unwrap() = Some(suffix);
+    assert!(store.put(staged).is_err());
+    // The orphan sidecar is what the listing must hand to collection.
+    assert_eq!(backend.keys(), vec![sidecar]);
+}
+
+#[test]
+fn a_small_read_fetches_one_group_and_the_sidecar_once() {
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    let body = patterned(4 * MIB, 6);
+    let staged = sealed_with_outboard("range", &body);
+    store.put(staged.clone()).unwrap();
+    let (key, sidecar) = keys_of(&staged.chunk);
+
+    assert_eq!(
+        read_range(&store, &staged.chunk, 70_000, 4096).unwrap(),
+        body[70_000..74_096]
+    );
+    assert_eq!(
+        backend.gets(),
+        vec![(key.clone(), Some(65_536..98_304)), (sidecar, None)]
+    );
+
+    // The verified sidecar is kept: the next read is one range GET.
+    assert_eq!(
+        read_range(&store, &staged.chunk, 3 * MIB as u64, 65_536).unwrap(),
+        body[3 * MIB..3 * MIB + 65_536]
+    );
+    assert_eq!(
+        backend.gets(),
+        vec![(key.clone(), Some(3 * MIB as u64..3 * MIB as u64 + 65_536))]
+    );
+
+    // The last, short group ends at the object length.
+    let odd = patterned(MIB + 7, 7);
+    let staged = sealed_with_outboard("odd", &odd);
+    store.put(staged.clone()).unwrap();
+    assert_eq!(
+        read_range(&store, &staged.chunk, MIB as u64 + 2, 5).unwrap(),
+        odd[MIB + 2..]
+    );
+    let gets = backend.gets();
+    assert!(gets.contains(&(keys_of(&staged.chunk).0, Some(MIB as u64..MIB as u64 + 7))));
+}
+
+#[test]
+fn reads_that_cover_half_the_chunk_or_a_small_chunk_take_the_whole_object() {
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    let body = patterned(4 * MIB, 8);
+    let staged = sealed_with_outboard("wide", &body);
+    let small_body = patterned(100_000, 9);
+    let small = sealed_with_outboard("small-read", &small_body);
+    store
+        .put_batch(vec![staged.clone(), small.clone()])
+        .unwrap();
+
+    assert_eq!(
+        read_range(&store, &staged.chunk, MIB as u64, 2 * MIB).unwrap(),
+        body[MIB..3 * MIB]
+    );
+    assert_eq!(backend.gets(), vec![(keys_of(&staged.chunk).0, None)]);
+    assert_eq!(
+        read_range(&store, &small.chunk, 10, 10).unwrap(),
+        small_body[10..20]
+    );
+    assert_eq!(backend.gets(), vec![(keys_of(&small.chunk).0, None)]);
+}
+
+#[test]
+fn an_old_chunk_without_a_sidecar_is_read_whole() {
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    let body = patterned(MIB, 10);
+    let staged = StagedChunk::new_generational(OperationId::new("old"), body.clone());
+    store.put(staged.clone()).unwrap();
+    assert_eq!(
+        read_range(&store, &staged.chunk, 123, 456).unwrap(),
+        body[123..579]
+    );
+    assert_eq!(read_range(&store, &staged.chunk, 0, 1).unwrap(), body[..1]);
+    let (key, sidecar) = keys_of(&staged.chunk);
+    assert_eq!(
+        backend.gets(),
+        vec![
+            (key.clone(), Some(0..32 * 1024)),
+            (sidecar, None),
+            (key.clone(), None),
+            (key, None)
+        ]
+    );
+}
+
+#[test]
+fn a_damaged_sidecar_falls_back_to_the_whole_object_and_still_returns_the_data() {
+    let body = patterned(MIB, 11);
+    for damage in ["header", "parent", "truncated", "oversized", "other-chunk"] {
+        let backend = Arc::new(RangeFixture::default());
+        let store = range_store(&backend);
+        let staged = sealed_with_outboard("bad-sidecar", &body);
+        store.put(staged.clone()).unwrap();
+        let (key, sidecar) = keys_of(&staged.chunk);
+        let mut encoded = backend.body(&sidecar);
+        match damage {
+            "header" => encoded[30] ^= 1,
+            // The first parent pair is the root's children: on every proof path.
+            "parent" => encoded[64] ^= 1,
+            "truncated" => encoded.truncate(100),
+            "oversized" => encoded.resize(9000, 0),
+            _ => encoded = range::test_support::sidecar_for(&patterned(MIB, 12)),
+        }
+        backend.replace(&sidecar, encoded);
+        assert_eq!(
+            read_range(&store, &staged.chunk, 40_000, 1000).unwrap(),
+            body[40_000..41_000],
+            "{damage}"
+        );
+        let gets = backend.gets();
+        assert_eq!(gets.last(), Some(&(key.clone(), None)), "{damage}");
+        // Remembered: no further sidecar or range GETs for this chunk.
+        assert_eq!(
+            read_range(&store, &staged.chunk, 0, 10).unwrap(),
+            body[..10]
+        );
+        assert_eq!(backend.gets(), vec![(key, None)], "{damage}");
+    }
+}
+
+#[test]
+fn damaged_data_fails_the_read_as_corrupt_and_publishes_nothing() {
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    let body = patterned(MIB, 13);
+    let staged = sealed_with_outboard("bad-data", &body);
+    store.put(staged.clone()).unwrap();
+    let (key, _) = keys_of(&staged.chunk);
+    let mut damaged = body.clone();
+    damaged[40_500] ^= 1;
+    backend.replace(&key, damaged);
+
+    let mut out = vec![0xEE; 1000];
+    let error = store
+        .read_chunk_ranges(
+            &staged.chunk,
+            &source(&staged.chunk, key.clone()),
+            &[ExternalRangeCopy {
+                chunk_offset: 40_000,
+                length: 1000,
+                output_offset: 0,
+            }],
+            &mut out,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_TRANSFER_CORRUPT_DATA);
+    assert_eq!(out, vec![0xEE; 1000], "nothing was copied out");
+    // The range proof failed first; the whole object confirmed the damage.
+    assert_eq!(backend.gets().last(), Some(&(key.clone(), None)));
+
+    // A group this read does not touch is not this read's business: the
+    // proof covers exactly what is handed out.
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    store.put(staged.clone()).unwrap();
+    let mut damaged = body.clone();
+    damaged[900_000] ^= 1;
+    backend.replace(&key, damaged);
+    assert_eq!(
+        read_range(&store, &staged.chunk, 40_000, 1000).unwrap(),
+        body[40_000..41_000]
+    );
+    assert_eq!(
+        read_range(&store, &staged.chunk, 899_000, 2000)
+            .unwrap_err()
+            .code(),
+        afs_error::NODE_TRANSFER_CORRUPT_DATA
+    );
+}
+
+#[test]
+fn data_and_sidecar_replaced_together_by_other_content_fail_as_corrupt() {
+    // Review condition 1: a self-consistent pair for different content. The
+    // trust anchor is the chunk identity's root, not the sidecar's header.
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    let body = patterned(MIB, 14);
+    let other = patterned(MIB, 15);
+    let staged = sealed_with_outboard("pair", &body);
+    store.put(staged.clone()).unwrap();
+    let (key, sidecar) = keys_of(&staged.chunk);
+    backend.replace(&key, other.clone());
+    backend.replace(&sidecar, range::test_support::sidecar_for(&other));
+    assert_eq!(
+        read_range(&store, &staged.chunk, 0, 100)
+            .unwrap_err()
+            .code(),
+        afs_error::NODE_TRANSFER_CORRUPT_DATA
+    );
+
+    // The same pair with the header forged to name the expected root.
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    store.put(staged.clone()).unwrap();
+    let mut forged = range::test_support::sidecar_for(&other);
+    forged[..64].copy_from_slice(&backend.body(&sidecar)[..64]);
+    backend.replace(&key, other);
+    backend.replace(&sidecar, forged);
+    assert_eq!(
+        read_range(&store, &staged.chunk, 0, 100)
+            .unwrap_err()
+            .code(),
+        afs_error::NODE_TRANSFER_CORRUPT_DATA
+    );
+}
+
+#[test]
+fn a_missing_chunk_object_is_not_found_even_when_its_sidecar_exists() {
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    let staged = sealed_with_outboard("orphan", &patterned(MIB, 16));
+    store.put(staged.clone()).unwrap();
+    let (key, sidecar) = keys_of(&staged.chunk);
+    backend.remove(&key);
+    assert_eq!(backend.keys(), vec![sidecar]);
+    assert_eq!(
+        read_range(&store, &staged.chunk, 0, 100)
+            .unwrap_err()
+            .code(),
+        afs_error::IO_NOT_FOUND
+    );
+}
+
+#[test]
+fn a_configured_cache_keeps_whole_object_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(RangeFixture::default());
+    let mut config = options();
+    config.cache = Some(cache_options(dir.path(), 16 * MIB as u64));
+    let store = S3ChunkStore::with_backend(config, backend.clone()).unwrap();
+    // A full-sized write is not admitted to the cache (`cache_large_write`
+    // is off), so this read misses it.
+    let body = patterned(4 * MIB, 17);
+    let staged = sealed_with_outboard("cached", &body);
+    store.put(staged.clone()).unwrap();
+    assert_eq!(
+        read_range(&store, &staged.chunk, 10, 10).unwrap(),
+        body[10..20]
+    );
+    assert_eq!(backend.gets(), vec![(keys_of(&staged.chunk).0, None)]);
+}
+
+#[test]
+fn listing_reports_a_sidecar_as_its_chunk_and_each_chunk_once() {
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    let with_sidecar = sealed_with_outboard("listed", &patterned(MIB, 18));
+    let orphan = sealed_with_outboard("listed-orphan", &patterned(MIB, 19));
+    let plain = StagedChunk::new_generational(OperationId::new("listed-plain"), vec![7; 64]);
+    store
+        .put_batch(vec![with_sidecar.clone(), orphan.clone(), plain.clone()])
+        .unwrap();
+    backend.remove(&keys_of(&orphan.chunk).0);
+    // A foreign key in the prefix is still skipped.
+    backend.replace(
+        "afs/v2/filesystem-a/generation-1/chunks/zz/not-a-chunk.bao",
+        vec![1],
+    );
+    assert_eq!(backend.keys().len(), 5);
+
+    let (chunks, last) = store.list_objects(None, 1000).unwrap();
+    let mut listed: Vec<_> = chunks.iter().map(|chunk| chunk.id.0.clone()).collect();
+    listed.sort();
+    let mut expected = vec![
+        with_sidecar.chunk.id.0.clone(),
+        orphan.chunk.id.0.clone(),
+        plain.chunk.id.0.clone(),
+    ];
+    expected.sort();
+    assert_eq!(listed, expected);
+    assert!(
+        chunks.contains(&orphan.chunk),
+        "the orphan sidecar names its full chunk identity"
+    );
+    assert_eq!(last.as_deref(), backend.keys().last().map(String::as_str));
+}
+
+#[test]
+fn deletion_removes_chunk_objects_before_sidecars_and_is_retryable() {
+    let backend = Arc::new(RangeFixture::default());
+    let store = range_store(&backend);
+    let first = sealed_with_outboard("delete-1", &patterned(MIB, 20));
+    let second = sealed_with_outboard("delete-2", &patterned(MIB, 21));
+    let small = StagedChunk::new_generational(OperationId::new("delete-3"), vec![3; 64]);
+    store
+        .put_batch(vec![first.clone(), second.clone(), small.clone()])
+        .unwrap();
+    let ids = vec![
+        first.chunk.id.clone(),
+        second.chunk.id.clone(),
+        small.chunk.id.clone(),
+    ];
+
+    // The sidecar pass fails: every chunk object is already gone, no sidecar
+    // was touched, and the batch is not acknowledged.
+    *backend.fail_delete_suffix.lock().unwrap() = Some(".bao");
+    assert!(store.delete_objects(&ids).is_err());
+    let mut left = vec![keys_of(&first.chunk).1, keys_of(&second.chunk).1];
+    left.sort();
+    assert_eq!(backend.keys(), left);
+
+    // The retry finishes; chunk objects that are already gone count as deleted.
+    *backend.fail_delete_suffix.lock().unwrap() = None;
+    store.delete_objects(&ids).unwrap();
+    assert!(backend.keys().is_empty());
+    let deletes = backend.deletes.lock().unwrap().clone();
+    let first_sidecar = deletes
+        .iter()
+        .position(|key| key.ends_with(".bao"))
+        .unwrap();
+    for id in &ids {
+        let data = external_object_key("filesystem-a", "generation-1", id).unwrap();
+        let position = deletes.iter().position(|key| key == &data).unwrap();
+        assert!(
+            position < first_sidecar,
+            "{data} was deleted after a sidecar"
+        );
+    }
+
+    // A failed chunk-object pass never reaches the sidecars.
+    let staged = sealed_with_outboard("delete-4", &patterned(MIB, 22));
+    store.put(staged.clone()).unwrap();
+    let (key, sidecar) = keys_of(&staged.chunk);
+    let suffix: &'static str = Box::leak(key.clone().into_boxed_str());
+    *backend.fail_delete_suffix.lock().unwrap() = Some(suffix);
+    assert!(
+        store
+            .delete_objects(std::slice::from_ref(&staged.chunk.id))
+            .is_err()
+    );
+    assert_eq!(backend.keys(), vec![key, sidecar]);
 }

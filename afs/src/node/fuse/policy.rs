@@ -24,6 +24,13 @@ pub(crate) trait FuseMountPolicy: Send + Sync + 'static {
     /// Metrics `filesystem` label; the kernel fsname is `afs-<label>`.
     fn label(&self) -> &'static str;
 
+    /// Whether a namespace operation the backend refused for lack of
+    /// permission is sent once more with the caller's supplementary groups
+    /// (a FUSE header carries only uid and primary gid). Off by default.
+    fn resends_denied_with_groups(&self) -> bool {
+        false
+    }
+
     /// A kernel inode number was handed out for `_ino`.
     fn remember_inode(&self, _ino: u64) {}
 
@@ -68,6 +75,12 @@ pub(crate) trait FuseMountPolicy: Send + Sync + 'static {
     fn mount_entry_ttl(&self) -> Duration {
         UNCACHED_TTL
     }
+
+    /// The errno a failed FUSE_CREATE with open `_flags` is answered with.
+    /// The default hands the backend's answer to the kernel unchanged.
+    fn create_failure_errno(&self, _flags: i32, errno: i32) -> i32 {
+        errno
+    }
 }
 
 /// DFS: one bounded kernel entry/attribute TTL (`dfs_kernel_cache_ttl_ms`,
@@ -95,12 +108,33 @@ impl FuseMountPolicy for DfsFusePolicy {
         "dfs"
     }
 
+    /// Meta checks the caller against the parent directory, and a directory
+    /// can be writable to the caller through a supplementary group only.
+    fn resends_denied_with_groups(&self) -> bool {
+        true
+    }
+
     fn with_cache_policy(&self, _inode: BackendInode, reply: &mut dyn FnMut(Duration, bool)) {
         reply(self.kernel_ttl, false);
     }
 
     fn mount_entry_ttl(&self) -> Duration {
         self.kernel_ttl
+    }
+
+    /// `open(O_CREAT)` without `O_EXCL` must open a file that already exists,
+    /// and on DFS another Node can create the name after this kernel's
+    /// negative lookup. The kernel sends FUSE_CREATE then and does not fall
+    /// back when the answer is EEXIST (`fuse_atomic_open`). ESTALE makes the
+    /// VFS walk the path once more with a fresh lookup, which finds the file
+    /// and opens it under the kernel's own permission, truncation and
+    /// file-type rules.
+    fn create_failure_errno(&self, flags: i32, errno: i32) -> i32 {
+        if errno == libc::EEXIST && flags & libc::O_EXCL == 0 {
+            libc::ESTALE
+        } else {
+            errno
+        }
     }
 
     /// Only directories cache attributes. A regular file's attributes must

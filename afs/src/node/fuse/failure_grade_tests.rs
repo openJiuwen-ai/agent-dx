@@ -282,3 +282,49 @@ fn unsupported_rename_flags_reply_einval_without_error_grade() {
         Fault
     );
 }
+
+/// On a DFS mount `open(O_CREAT)` without `O_EXCL` must open a file another
+/// Node created after this kernel's lookup. The kernel does not fall back
+/// when FUSE_CREATE is answered EEXIST (fs/fuse/dir.c `fuse_atomic_open`), so
+/// such a create is answered ESTALE: the VFS then walks the path again with a
+/// fresh lookup and opens the file under its usual rules.
+#[test]
+fn a_dfs_create_that_lost_to_an_existing_name_is_retried_by_the_kernel_unless_exclusive() {
+    use super::policy::{DfsFusePolicy, FuseMountPolicy};
+    let dfs = DfsFusePolicy::new(std::time::Duration::ZERO);
+    let plain = libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC;
+    assert_eq!(dfs.create_failure_errno(plain, libc::EEXIST), libc::ESTALE);
+    assert_eq!(
+        dfs.create_failure_errno(plain | libc::O_EXCL, libc::EEXIST),
+        libc::EEXIST,
+        "an exclusive create reports the collision"
+    );
+    for errno in [libc::EACCES, libc::EBUSY, libc::ENOSPC, libc::ESTALE] {
+        assert_eq!(dfs.create_failure_errno(plain, errno), errno);
+        assert_eq!(dfs.create_failure_errno(plain | libc::O_EXCL, errno), errno);
+    }
+}
+
+/// The rewrite belongs to the DFS mount policy alone: every other mount
+/// (OwnerFs, the test mount) keeps answering what its backend answered.
+#[test]
+fn other_mounts_answer_a_create_collision_unchanged() {
+    use super::policy::{DefaultFusePolicy, FuseMountPolicy};
+    struct KeepsDefaults;
+    impl FuseMountPolicy for KeepsDefaults {
+        fn label(&self) -> &'static str {
+            "ownerfs"
+        }
+    }
+    let plain = libc::O_CREAT | libc::O_WRONLY;
+    for policy in [&DefaultFusePolicy as &dyn FuseMountPolicy, &KeepsDefaults] {
+        assert_eq!(
+            policy.create_failure_errno(plain, libc::EEXIST),
+            libc::EEXIST
+        );
+        assert_eq!(
+            policy.create_failure_errno(plain | libc::O_EXCL, libc::EEXIST),
+            libc::EEXIST
+        );
+    }
+}

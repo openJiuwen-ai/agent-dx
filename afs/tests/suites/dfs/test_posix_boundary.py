@@ -414,6 +414,32 @@ print(json.dumps({"blocks":[a.f_blocks,b.f_blocks],"bsize":[a.f_bsize,b.f_bsize]
     assert result["namemax"] == 255, result
 
 
+def supplementary_group_members_can_change_a_group_writable_directory(c):
+    """
+    #33: a process whose only claim to a group-writable directory is a supplementary
+    group can create, link, rename and remove entries in it; a process outside the
+    group gets EACCES.
+    """
+    let_others_traverse(c)
+    shared = path(c, "A", "px-group")
+    c.python("A", "os.mkdir(sys.argv[1]);os.chmod(sys.argv[1],0o2770)", shared)
+    code = """d=sys.argv[1];os.setgroups([int(g) for g in sys.argv[4].split(",") if g])
+os.setgid(int(sys.argv[3]));os.setuid(int(sys.argv[2]));out={}
+out["mkdir"]=err(os.mkdir,d+"/sub")
+out["create"]=err(lambda:os.close(os.open(d+"/f",os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o640)))
+out["symlink"]=err(os.symlink,"f",d+"/s")
+out["link"]=err(os.link,d+"/f",d+"/h")
+out["rename"]=err(os.rename,d+"/f",d+"/g")
+out["unlink"]=err(os.unlink,d+"/g")
+out["rmdir"]=err(os.rmdir,d+"/sub")
+print(json.dumps(out))"""
+    member = run(c, "A", code, shared, c.config["other_uid"], c.config["other_gid"], c.config["gid"], owner=False)
+    stranger = run(c, "A", code, shared, c.config["other_uid"], c.config["other_gid"], "", owner=False)
+    c.record("posix.supplementary_groups", {"member": member, "stranger": stranger})
+    assert all(value == ["ok", None] for value in member.values()), member
+    assert all(value == ["err", "EACCES"] for value in stranger.values()), stranger
+
+
 def truncate_extends_with_zeros(c):
     """#27: truncate beyond the end reads back zeros on every node."""
     c.write("A", "px-trunc", b"abc")
@@ -506,6 +532,80 @@ def open_file_survives_replacement(c):
     c.read("B", "px-held", b"newer")
 
 
+EXCLUSIVE_CREATOR = HELPER_IMPORTS + """d=sys.argv[1];target=sys.argv[2];start=float(sys.argv[3]);out={}
+while time.time()<start: time.sleep(0.0005)
+for i in range(int(sys.argv[4])):
+    try:
+        os.close(os.open("%s/x-%04d"%(target,i),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600));r="created"
+    except FileExistsError: r="EEXIST"
+    except OSError as e: r=errno.errorcode.get(e.errno,str(e.errno))
+    out[r]=out.get(r,0)+1
+open(d+"/done.json","w").write(json.dumps(out))
+"""
+
+
+def exclusive_create_of_a_taken_name_is_eexist(c):
+    """
+    #39: `O_CREAT|O_EXCL` over an existing name is EEXIST (`FileExistsError`), also
+    when another node created the name after this node's kernel looked it up: lock
+    files and mkstemp retry on EEXIST and fail on anything else.
+    """
+    c.write("A", "px-excl", b"x")
+    seen = run(c, "B", "print(json.dumps(err(os.open,sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)))",
+               path(c, "B", "px-excl"))
+    assert seen == ["err", "EEXIST"], seen
+    run(c, "A", "os.mkdir(sys.argv[1]);print(json.dumps(0))", path(c, "A", "px-excl-race"))
+    count = 300
+    start = run(c, "A", "print(json.dumps(time.time()+3))")
+    for role in ("A", "B"):
+        c.spawn_python(role, "excl-" + role.lower(), EXCLUSIVE_CREATOR, path(c, role, "px-excl-race"), start, count)
+    done = {}
+    for role in ("A", "B"):
+        done[role] = c.await_helper_signal("excl-" + role.lower(), "done")
+        c.wait_helper("excl-" + role.lower())
+    c.record("posix.exclusive_create", done)
+    for value in done.values():
+        assert set(value) <= {"created", "EEXIST"}, done
+    assert sum(value.get("created", 0) for value in done.values()) == count, done
+    assert sum(value.get("EEXIST", 0) for value in done.values()) == count, done
+
+
+PLAIN_CREATOR = HELPER_IMPORTS + (
+    "d=sys.argv[1];target=sys.argv[2];start=float(sys.argv[3]);"
+    """tag=sys.argv[5].encode();out={}
+while time.time()<start: time.sleep(0.0005)
+for i in range(int(sys.argv[4])):
+    try:
+        f=os.open("%s/p-%04d"%(target,i),os.O_CREAT|os.O_WRONLY|os.O_APPEND,0o600);os.write(f,tag);os.close(f);r="ok"
+    except OSError as e: r=errno.errorcode.get(e.errno,str(e.errno))
+    out[r]=out.get(r,0)+1
+open(d+"/done.json","w").write(json.dumps(out))
+"""
+)
+
+
+def plain_create_of_a_name_that_just_appeared_opens_it(c):
+    """
+    #39: `open(O_CREAT)` without O_EXCL never fails because the name exists. Two nodes
+    create and append to the same names at the same time; every open succeeds on both,
+    whichever node's create reached Meta first.
+    """
+    run(c, "A", "os.mkdir(sys.argv[1]);print(json.dumps(0))", path(c, "A", "px-creat-race"))
+    count = 300
+    start = run(c, "A", "print(json.dumps(time.time()+3))")
+    for role in ("A", "B"):
+        c.spawn_python(role, "creat-" + role.lower(), PLAIN_CREATOR, path(c, role, "px-creat-race"), start, count,
+                       role.lower())
+    done = {}
+    for role in ("A", "B"):
+        done[role] = c.await_helper_signal("creat-" + role.lower(), "done")
+        c.wait_helper("creat-" + role.lower())
+    listed = run(c, "A", "print(json.dumps(len(os.listdir(sys.argv[1]))))", path(c, "A", "px-creat-race"))
+    c.record("posix.plain_create_race", {"results": done, "names": listed})
+    assert done == {"A": {"ok": count}, "B": {"ok": count}}, done
+    assert listed == count, listed
+
+
 CASES = tuple(
     Case("dfs.posix." + fn.__name__, TAGS, "dfs", (), fn)
     for fn in (
@@ -528,11 +628,14 @@ CASES = tuple(
         ownership_and_privilege_bits,
         setgid_directory_gives_new_files_its_group,
         statfs_reports_the_local_disk,
+        supplementary_group_members_can_change_a_group_writable_directory,
         truncate_extends_with_zeros,
         name_and_path_limits,
         large_sparse_offsets,
         directory_fsync_and_tmpfile_and_poll_and_access,
         xattrs_on_special_files,
         open_file_survives_replacement,
+        exclusive_create_of_a_taken_name_is_eexist,
+        plain_create_of_a_name_that_just_appeared_opens_it,
     )
 )

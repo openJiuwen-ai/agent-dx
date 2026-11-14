@@ -362,19 +362,23 @@ async fn inherited_workload_overrides_reach_execd_for_both_jiuwenbox_runtimes() 
             .unwrap();
         {
             let calls = fixture.backend.calls.lock().unwrap();
-            for request in [
-                &calls
-                    .iter()
-                    .find(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
-                    .unwrap()
-                    .2,
-                &calls
-                    .iter()
-                    .find(|(_, p, _)| p.ends_with("/exec_background"))
-                    .unwrap()
-                    .2,
-            ] {
-                let env = &request["env"];
+            let create = &calls
+                .iter()
+                .find(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
+                .unwrap()
+                .2;
+            assert!(create.get("env").is_none());
+            let create_env = if class == "conch" {
+                &create["policy"]["conch"]["env"]
+            } else {
+                &create["policy"]["environment"]
+            };
+            let exec_env = &calls
+                .iter()
+                .find(|(_, p, _)| p.ends_with("/exec_background"))
+                .unwrap()
+                .2["env"];
+            for env in [create_env, exec_env] {
                 assert_eq!(env["PATH"], "/profile/bin");
                 assert_eq!(
                     serde_json::from_str::<Value>(env["ADX_WORKLOAD_PROCESS"].as_str().unwrap())
@@ -1625,7 +1629,10 @@ async fn supervisor_tunnel_acl_survives_create_and_routed_policy_update() {
         .unwrap()
         .2;
     let update = &calls.iter().find(|(m, _, _)| m == "PUT").unwrap().2;
-    assert_eq!(create["env"]["EXECD_TUNNEL_WS_PORT"], "18765");
+    assert_eq!(
+        create["policy"]["environment"]["EXECD_TUNNEL_WS_PORT"],
+        "18765"
+    );
     for request in [create, update] {
         let network = &request["policy"]["network"];
         assert_eq!(network["ingress"]["allowed_ports"], json!([1, 18765]));
@@ -1767,4 +1774,92 @@ async fn supervisor_rejects_unknown_cgroup_selector() {
             json!({"cgroup":{"backend":mode}});
         assert!(fixture.config.validate().is_err());
     }
+}
+
+async fn check_creation_uses_policy_environment(class: &str) {
+    let mut fixture = Fixture::new();
+    let policy_env = json!({"POLICY_ONLY":"policy-default","SHARED":"policy-default"});
+    if class == "conch" {
+        fixture.config.classes.get_mut(class).unwrap().policy = json!({"conch":{"env":policy_env}});
+    } else {
+        fixture.config.classes.get_mut(class).unwrap().policy = json!({"environment":policy_env});
+    }
+    let launch = LaunchConfig {
+        env: [
+            ("EXECD_HTTP_PORT".into(), "1".into()),
+            ("SHARED".into(), "launch-default".into()),
+            ("LAUNCH_ONLY".into(), "launch-default".into()),
+        ]
+        .into(),
+        rpc_timeout: Duration::from_millis(150),
+        ..Default::default()
+    };
+    let driver = Jiuwenbox::with_host(fixture.config.clone(), launch, fixture.host.clone())
+        .await
+        .unwrap();
+    let mut wanted = spec(class);
+    wanted.env.insert("SHARED".into(), "runtime-value".into());
+    wanted
+        .env
+        .insert("JIUWENSWARM_HOME".into(), "/home/agentos".into());
+    wanted
+        .env
+        .insert("TEST_SECRET".into(), "test-only-secret".into());
+    wanted
+        .env
+        .insert("RUNTIME_ONLY".into(), "runtime-value".into());
+    driver
+        .start_with_deadline(
+            &wanted,
+            "tenant-agent-7",
+            7,
+            &[],
+            Instant::now() + CREATE_BUDGET,
+        )
+        .await
+        .unwrap();
+    {
+        let calls = fixture.backend.calls.lock().unwrap();
+        let create = &calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
+            .unwrap()
+            .2;
+        assert!(
+            create.get("env").is_none(),
+            "create API env must stay empty for sandbox ls"
+        );
+        let env = if class == "conch" {
+            &create["policy"]["conch"]["env"]
+        } else {
+            &create["policy"]["environment"]
+        };
+        assert_eq!(env["POLICY_ONLY"], "policy-default");
+        assert_eq!(env["SHARED"], "launch-default");
+        assert_eq!(env["LAUNCH_ONLY"], "launch-default");
+        assert_eq!(env["JIUWENSWARM_HOME"], "/home/agentos");
+        assert_eq!(env["TEST_SECRET"], "test-only-secret");
+        assert_eq!(env["RUNTIME_ONLY"], "runtime-value");
+        assert_eq!(env["ADX_RUNTIME_ID"], "tenant-agent-7");
+        assert_eq!(env["ADX_OWNERSHIP_GENERATION"], "7");
+        let exec = &calls
+            .iter()
+            .find(|(_, p, _)| p.ends_with("/exec_background"))
+            .unwrap()
+            .2;
+        let mut runtime_env = env.as_object().unwrap().clone();
+        runtime_env.remove("POLICY_ONLY");
+        assert_eq!(exec["env"], Value::Object(runtime_env));
+    }
+    driver.remove("tenant-agent-7").await.unwrap();
+}
+
+#[tokio::test]
+async fn supervisor_creation_uses_policy_environment() {
+    check_creation_uses_policy_environment("supervisor").await;
+}
+
+#[tokio::test]
+async fn conch_creation_uses_policy_environment() {
+    check_creation_uses_policy_environment("conch").await;
 }

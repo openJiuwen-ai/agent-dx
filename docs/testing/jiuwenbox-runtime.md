@@ -69,6 +69,11 @@ template_name 或 template_id 之一；模板名须由部署约束为不可变�
 process 定义继承镜像启动时的 argv/cwd/user，ADX 将生成 Execd
 既有 ProcessSpec 配置并独立只读挂载。业务镜像无需预装 Execd。入口配置通过只读 `/__adx_launch` 挂载；Conch 的 `/run`、`/proc`、`/sys`、`/dev` 及其子目录不接受 volume 目标。
 
+创建环境变量与元戎执行器使用同一通道：Supervisor 放入 `policy.environment`，Conch 放入
+`policy.conch.env`，不发送创建 API 顶层 `env`。保留配置中的 policy 环境变量，并由原有
+启动流程合并后的运行时环境覆盖同名值；Execd 的 exec 请求环境保持原样。因此新建沙箱的
+`sandbox ls` 不展示这些变量，policy 查询仍能查看实际配置。已有沙箱的创建元数据不自动迁移。
+
 class.policy 是可信节点配置，使用现有 append policy 模式合并到 Jiuwenbox 基础 policy。
 ADX 接管 cgroup、网络、bootstrap、声明的工作目录挂载和执行身份。
 Jiuwenbox 基础 policy 的网络默认应允许所需数据面和控制流量，bind 目标不得与 ADX 保留路径冲突；基础 policy 中保留的限制仍会生效。

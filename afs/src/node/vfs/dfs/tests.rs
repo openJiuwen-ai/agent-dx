@@ -105,6 +105,9 @@ impl RenewPause {
 
 struct RecordingMeta {
     inode: Mutex<InodeRecord>,
+    /// `Some`: every `create` makes its own inode (named after the file) and
+    /// commits address it by id. `None`: the single-inode fixture.
+    files: Mutex<Option<HashMap<InodeId, InodeRecord>>>,
     lease: Mutex<WriteLease>,
     commits: Mutex<Vec<CommitFileVersion>>,
     failed_commits: Mutex<Vec<CommitFileVersion>>,
@@ -187,6 +190,7 @@ impl RecordingMeta {
                 xattrs: std::collections::BTreeMap::new(),
                 revision: 1,
             }),
+            files: Mutex::new(None),
             lease: Mutex::new(WriteLease {
                 inode_id: InodeId::new("inode:test"),
                 owner_node_id: "node-a".into(),
@@ -434,7 +438,7 @@ impl DfsMeta for RecordingMeta {
         &self,
         _: &OperationId,
         _: &InodeId,
-        _: &[u8],
+        name: &[u8],
         _: InodeAttributes,
         first_generation: Option<&OperationId>,
         caller: CallerContext,
@@ -444,6 +448,14 @@ impl DfsMeta for RecordingMeta {
             .unwrap()
             .push(first_generation.cloned());
         self.create_callers.lock().unwrap().push(caller);
+        if let Some(files) = self.files.lock().unwrap().as_mut() {
+            let mut inode = self.inode.lock().unwrap().clone();
+            inode.inode_id = InodeId::new(format!("inode:{}", String::from_utf8_lossy(name)));
+            let mut lease = self.lease.lock().unwrap().clone();
+            lease.inode_id = inode.inode_id.clone();
+            files.insert(inode.inode_id.clone(), inode.clone());
+            return Ok((inode, lease));
+        }
         Ok((
             self.inode.lock().unwrap().clone(),
             self.lease.lock().unwrap().clone(),
@@ -496,7 +508,10 @@ impl DfsMeta for RecordingMeta {
         })
     }
 
-    fn get_inode(&self, _: &InodeId) -> Result<InodeRecord> {
+    fn get_inode(&self, id: &InodeId) -> Result<InodeRecord> {
+        if let Some(inode) = self.files.lock().unwrap().as_ref().and_then(|f| f.get(id)) {
+            return Ok(inode.clone());
+        }
         self.get_inode_calls.fetch_add(1, Ordering::SeqCst);
         let error = self.next_get_inode_error.lock().unwrap().take();
         let pause = self.next_get_inode_pause.lock().unwrap().take();
@@ -577,7 +592,12 @@ impl DfsMeta for RecordingMeta {
             self.failed_metadata_syncs.lock().unwrap().push(sync);
             return Err(error);
         }
-        let mut inode = self.inode.lock().unwrap();
+        let mut files = self.files.lock().unwrap();
+        let mut single = self.inode.lock().unwrap();
+        let inode = match files.as_mut().and_then(|f| f.get_mut(&sync.inode_id)) {
+            Some(inode) => inode,
+            None => &mut *single,
+        };
         if self
             .metadata_sync_races
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -633,7 +653,12 @@ impl DfsMeta for RecordingMeta {
             *self.commit_pause.lock().unwrap() = None;
             pause.block();
         }
-        let mut inode = self.inode.lock().unwrap();
+        let mut files = self.files.lock().unwrap();
+        let mut single = self.inode.lock().unwrap();
+        let inode = match files.as_mut().and_then(|f| f.get_mut(&commit.inode_id)) {
+            Some(inode) => inode,
+            None => &mut *single,
+        };
         if inode.revision != commit.expected_inode_revision
             || inode.head_version != commit.expected_head_version
         {

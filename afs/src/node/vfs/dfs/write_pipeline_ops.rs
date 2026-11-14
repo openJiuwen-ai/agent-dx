@@ -426,6 +426,8 @@ impl DistributedFs {
         let turn_id = request.turn_id;
         let deadline = Instant::now() + crate::node::call_deadline::bounded(self.write_timeout);
         let mut descriptor = None;
+        // Whether the previous wait for body budget ended with nothing freed.
+        let mut budget_stalled = false;
         {
             let mut queue = pipeline
                 .allocation_queue
@@ -501,10 +503,17 @@ impl DistributedFs {
                             Err(error) => return Err(error),
                         }
                     }
-                    DirtyAdmission::Wait { epoch } => {
+                    DirtyAdmission::Wait {
+                        epoch,
+                        node_budget_short,
+                    } => {
                         self.request_pipeline_pressure(cell, false)?;
+                        if node_budget_short && budget_stalled {
+                            self.relieve_stalled_dirty_budget(pipeline)?;
+                        }
                         crate::node::call_deadline::within(deadline, || self.progress_writeback())?;
-                        pipeline.budget.wait_for_change(epoch, retry_after);
+                        budget_stalled =
+                            pipeline.budget.wait_for_change(epoch, retry_after).epoch == epoch;
                     }
                 }
             } else {
@@ -659,6 +668,93 @@ impl DistributedFs {
             }
         }
         pipeline.notify.notify_one();
+        Ok(())
+    }
+
+    /// A write has waited for body budget and nothing was freed (R91). When
+    /// no upload is running or startable either, the budget is held by
+    /// builders of files nobody is committing, and only the periodic commit
+    /// would free it. Make the file that has held budget longest due now; the
+    /// caller's next writeback pass commits it. One file per call, and none
+    /// while a due commit is already on its way, so a stream of large writes
+    /// that waits for its own uploads never triggers this.
+    fn relieve_stalled_dirty_budget(&self, pipeline: &WritePipeline) -> Result<()> {
+        if !pipeline
+            .tasks
+            .lock()
+            .map_err(|_| unavailable("native upload task table is poisoned"))?
+            .is_empty()
+            || self.next_upload()?.is_some()
+        {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let mut oldest: Option<(Instant, SharedInodeWriteState)> = None;
+        for (_, cell) in self.pending_write_states()? {
+            let since = {
+                let state = cell
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                if state.terminal_error.is_some()
+                    || state.writeback_retry_at.is_some_and(|at| at > now)
+                {
+                    continue;
+                }
+                if state.native_due || state.commit_busy {
+                    return Ok(());
+                }
+                if !state.dirty || state.in_flight.is_some() {
+                    continue;
+                }
+                state.native_owner.held_since()
+            };
+            if let Some(since) = since
+                && oldest.as_ref().is_none_or(|(other, _)| since < *other)
+            {
+                oldest = Some((since, cell));
+            }
+        }
+        if let Some((since, cell)) = oldest {
+            #[cfg(test)]
+            {
+                let hook = self
+                    .hooks
+                    .dirty_budget_before_mark_due
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            let mut state = cell
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            // A concurrent commit may have cleaned this holder since the scan.
+            // Mark only the same budget holding while it still has work to commit.
+            if !state.dirty
+                || state.native_due
+                || state.commit_busy
+                || state.in_flight.is_some()
+                || state.terminal_error.is_some()
+                || state
+                    .writeback_retry_at
+                    .is_some_and(|at| at > Instant::now())
+                || state.native_owner.held_since() != Some(since)
+            {
+                return Ok(());
+            }
+            state.native_due = true;
+            state.native_due_through = state.native_due_through.max(state.visible_write_seq);
+            drop(state);
+            pipeline
+                .metadata
+                .state
+                .lock()
+                .map_err(|_| unavailable("native metadata budget is poisoned"))?
+                .pressure_budget += 1;
+            pipeline.notify.notify_one();
+        }
         Ok(())
     }
 

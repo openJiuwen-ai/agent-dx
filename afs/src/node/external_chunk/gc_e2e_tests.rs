@@ -153,6 +153,9 @@ impl Cluster {
                     generation: "generation-1".into(),
                     allow_http: true,
                     unsigned_payload: false,
+                    payload_checksum: crate::config::DfsExternalPayloadChecksum::None,
+                    upload_concurrency: 4,
+                    worker_threads: 2,
                     credentials: S3CredentialsSource::Environment,
                     request_timeout: Duration::from_secs(10),
                     max_retries: 0,
@@ -201,6 +204,14 @@ impl Cluster {
                 None,
             )
             .unwrap()
+            // As in production: sealing builds the outboard, so every chunk
+            // of at least 256 KiB is stored with its sidecar object.
+            .with_write_buffer_pool(
+                crate::node::chunk::WriteBufferPool::new_with_outboard_budget(
+                    0,
+                    crate::node::chunk::OutboardBudget::new(1024 * 1024),
+                ),
+            )
             .with_gc_references(Some(references)),
         );
         Self {
@@ -221,6 +232,18 @@ impl Cluster {
             keys.push(meta.unwrap().location.to_string());
         }
         keys
+    }
+
+    /// Chunk objects, without their sidecars.
+    async fn chunk_objects(&self) -> usize {
+        self.objects_by_kind().await.0
+    }
+
+    /// Chunk objects only, and sidecar objects only.
+    async fn objects_by_kind(&self) -> (usize, usize) {
+        let keys = self.objects().await;
+        let sidecars = keys.iter().filter(|key| key.ends_with(".bao")).count();
+        (keys.len() - sidecars, sidecars)
     }
 
     async fn meta_chunks(&self) -> usize {
@@ -332,10 +355,10 @@ async fn deleting_a_file_leaves_no_object_and_no_meta_record() {
             fs.release(&context(), file.handle).unwrap();
         })
         .await;
-    assert_eq!(cluster.objects().await.len(), 3);
+    assert_eq!(cluster.chunk_objects().await, 3);
     cluster.settle().await;
     assert_eq!(
-        cluster.objects().await.len(),
+        cluster.chunk_objects().await,
         3,
         "a linked file keeps its data"
     );
@@ -370,7 +393,7 @@ async fn overwriting_reclaims_the_uploaded_block_and_the_old_version() {
         })
         .await;
     for _ in 0..200 {
-        if cluster.objects().await.len() >= 2 {
+        if cluster.chunk_objects().await >= 2 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -384,7 +407,11 @@ async fn overwriting_reclaims_the_uploaded_block_and_the_old_version() {
         .await;
     cluster.expire_write_leases().await;
     cluster.settle().await;
-    assert_eq!(cluster.objects().await.len(), 1, "only the head's object");
+    assert_eq!(
+        cluster.objects_by_kind().await,
+        (1, 1),
+        "only the head's object and its sidecar"
+    );
     assert_eq!(cluster.meta_chunks().await, 1);
     let body = cluster
         .with_fs(move |fs| {
@@ -410,7 +437,7 @@ async fn an_object_no_write_owns_is_found_by_listing_and_reclaimed() {
         .unwrap();
     })
     .await;
-    assert_eq!(cluster.objects().await.len(), 1);
+    assert_eq!(cluster.chunk_objects().await, 1);
     cluster.settle().await;
     assert!(cluster.objects().await.is_empty());
     assert_eq!(cluster.meta_chunks().await, 0);
@@ -445,7 +472,7 @@ async fn an_uploaded_uncommitted_write_survives_collection() {
         }
     })
     .await;
-    assert_eq!(cluster.objects().await.len(), 1);
+    assert_eq!(cluster.chunk_objects().await, 1);
     let body = cluster
         .with_fs(move |fs| {
             fs.fsync(&context(), handle, types::SyncMode::Full).unwrap();
@@ -474,7 +501,7 @@ async fn deleting_old_content_cannot_take_out_a_rewrite_of_the_same_content() {
             fs.release(&context(), old.handle).unwrap();
         })
         .await;
-    assert_eq!(cluster.objects().await.len(), 1);
+    assert_eq!(cluster.chunk_objects().await, 1);
     // 新写者已经上传了相同内容，尚未提交；此时删除旧文件并回收。
     let second = body.clone();
     let (inode, handle) = cluster
@@ -488,13 +515,13 @@ async fn deleting_old_content_cannot_take_out_a_rewrite_of_the_same_content() {
         })
         .await;
     for _ in 0..200 {
-        if cluster.objects().await.len() == 2 {
+        if cluster.chunk_objects().await == 2 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(
-        cluster.objects().await.len(),
+        cluster.chunk_objects().await,
         2,
         "same content, two objects"
     );
@@ -507,7 +534,7 @@ async fn deleting_old_content_cannot_take_out_a_rewrite_of_the_same_content() {
         }
     })
     .await;
-    assert_eq!(cluster.objects().await.len(), 1, "the old object is gone");
+    assert_eq!(cluster.chunk_objects().await, 1, "the old object is gone");
     let read = cluster
         .with_fs(move |fs| {
             fs.fsync(&context(), handle, types::SyncMode::Full).unwrap();
@@ -543,7 +570,7 @@ async fn an_unlinked_open_file_stays_readable_until_it_is_closed() {
     cluster.expire_write_leases().await;
     cluster.settle().await;
     assert_eq!(
-        cluster.objects().await.len(),
+        cluster.chunk_objects().await,
         1,
         "the open reference protects it"
     );
@@ -556,4 +583,116 @@ async fn an_unlinked_open_file_stays_readable_until_it_is_closed() {
     cluster.settle().await;
     assert!(cluster.objects().await.is_empty());
     assert_eq!(cluster.meta_chunks().await, 0);
+}
+
+/// 旁对象随数据对象存在与回收：活文件的旁对象不被回收，按范围读可用；删文件后两者都清空。
+#[tokio::test]
+async fn sidecars_live_and_die_with_their_chunk_objects() {
+    let cluster = Cluster::new().await;
+    let body = (0..2 * CHUNK + 300 * 1024)
+        .map(|i| (i % 251) as u8 ^ (i / CHUNK) as u8)
+        .collect::<Vec<_>>();
+    let written = body.clone();
+    let inode = cluster
+        .with_fs(move |fs| {
+            let file = create(fs, "ranged.bin");
+            fs.write(&context(), file.handle, 0, &written).unwrap();
+            fs.fsync(&context(), file.handle, types::SyncMode::Full)
+                .unwrap();
+            fs.release(&context(), file.handle).unwrap();
+            file.entry.inode
+        })
+        .await;
+    // Two full chunks and a 300 KiB tail, each with its sidecar.
+    assert_eq!(cluster.objects_by_kind().await, (3, 3));
+    cluster.expire_write_leases().await;
+    cluster.settle().await;
+    assert_eq!(
+        cluster.objects_by_kind().await,
+        (3, 3),
+        "collection keeps a live chunk's sidecar"
+    );
+    let offset = CHUNK + 70_000;
+    let read = cluster
+        .with_fs(move |fs| {
+            let handle = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+            let mut out = vec![0; 4096];
+            let read = fs
+                .read(&context(), handle, offset as u64, &mut out)
+                .unwrap();
+            fs.release(&context(), handle).unwrap();
+            out.truncate(read);
+            out
+        })
+        .await;
+    assert_eq!(read, body[offset..offset + 4096]);
+    cluster
+        .with_fs(|fs| {
+            fs.unlink(&context(), fs.root_inode(), OsStr::new("ranged.bin"))
+                .unwrap();
+        })
+        .await;
+    cluster.settle().await;
+    assert!(cluster.objects().await.is_empty());
+    assert_eq!(cluster.meta_chunks().await, 0);
+}
+
+/// 只剩旁对象（数据 PUT 失败或删除中断留下）：列举把它报成所属 chunk，Meta 登记后回收，不成孤儿。
+#[tokio::test]
+async fn a_sidecar_whose_chunk_object_is_gone_is_found_by_listing_and_reclaimed() {
+    let cluster = Cluster::new().await;
+    let s3 = cluster.s3.clone();
+    let staged = super::tests::sealed_with_outboard("half-written", &vec![5; 1024 * 1024]);
+    let key = external_object_key("filesystem-a", "generation-1", &staged.chunk.id).unwrap();
+    on_plain_thread(move || {
+        s3.put(staged).unwrap();
+    })
+    .await;
+    assert_eq!(cluster.objects_by_kind().await, (1, 1));
+    cluster
+        .backend
+        .delete(&object_store::path::Path::from(key.as_str()))
+        .await
+        .unwrap();
+    assert_eq!(cluster.objects_by_kind().await, (0, 1));
+    cluster.settle().await;
+    assert!(cluster.objects().await.is_empty());
+    assert_eq!(cluster.meta_chunks().await, 0);
+}
+
+/// 进行中的写：数据对象与旁对象都已上传、未提交，写代引用同时保护两者。
+#[tokio::test]
+async fn an_uncommitted_write_keeps_its_sidecar_through_collection() {
+    let cluster = Cluster::new().await;
+    let handle = cluster
+        .with_fs(|fs| {
+            let file = create(fs, "inflight-sidecar.bin");
+            fs.write(&context(), file.handle, 0, &vec![8; CHUNK])
+                .unwrap();
+            fs.writeback_pending().unwrap();
+            file.handle
+        })
+        .await;
+    for _ in 0..200 {
+        if cluster.objects_by_kind().await == (1, 1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    cluster.expire_write_leases().await;
+    let collector = cluster.collector.clone();
+    on_plain_thread(move || {
+        for _ in 0..12 {
+            collector.collect_once().unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    })
+    .await;
+    assert_eq!(cluster.objects_by_kind().await, (1, 1));
+    cluster
+        .with_fs(move |fs| {
+            fs.fsync(&context(), handle, types::SyncMode::Full).unwrap();
+            fs.release(&context(), handle).unwrap();
+        })
+        .await;
 }

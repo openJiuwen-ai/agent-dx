@@ -154,7 +154,7 @@ B 命中仍取得有效 Meta grant；首次获取／身份改变完整验证可�
 
 外部模式固定单副本配置，禁用 Node 复制及复制修复。写入与原生副本模式走同一条原生写流水线
 （`dfs_write_queue_bytes`、`dfs_dirty_budget_bytes`、`dfs_unpublished_descriptors` 同样适用，
-上传并发被压到实际 PUT 许可数 4）：满 4MiB 块提前上传，S3 回执不是本机持久副本，正文保留到版本发布；
+上传并发不超过 `dfs_external_backend.upload_concurrency`，默认 8）：满 4MiB 块提前上传，S3 回执不是本机持久副本，正文保留到版本发布；
 fsync/fdatasync、可写 flush 与同步写等待所需 PUT 成功并由 Meta 事务发布 FileVersion、布局和对象引用。
 上传失败不能发布新版本；Meta 确认未知时保留原请求做幂等恢复。本节点读自己尚未提交的写入在本地完成，
 不触发提交；其他节点只见 Meta 已提交版本。本地 chunk/catalog 不作为该模式的耐久副本，数据可靠性取决于

@@ -839,8 +839,10 @@ impl DfsService {
 }
 
 /// What the commit of `batch`, part of `plan`, must find unchanged; see
-/// `DfsGcPlanStillValid`. Only the batch's own keys matter: the rest of the plan
-/// is not being deleted by this commit.
+/// `DfsGcPlanStillValid`. Keys are checked per batch, except that a new
+/// reference or write lease is checked against every version the plan deletes:
+/// the chunk records leave with the first batch, so a version whose own key
+/// waits for a later batch has already lost its chunks by then.
 fn plan_guard(
     since: crate::meta::store::StoreRevision,
     entities: &[MetaEntity],
@@ -874,17 +876,13 @@ fn plan_guard(
                 dead_inodes.insert(inode.clone());
                 protected_by_reference.insert(inode.clone());
             }
-            MetaKey::DfsFileVersion(version) => {
-                if let Some(owner) = plan.version_owners.get(version) {
-                    protected_by_reference.insert(owner.clone());
-                }
-            }
             MetaKey::DfsLayoutRoot(layout) => {
                 dead_layouts.insert(layout.clone());
             }
             _ => {}
         }
     }
+    protected_by_reference.extend(plan.version_owners.values().cloned());
     crate::meta::store::GcPlanGuard {
         since,
         written_keys,

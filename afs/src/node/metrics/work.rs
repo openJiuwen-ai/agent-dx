@@ -103,6 +103,7 @@ const NATIVE_WRITE_RESOURCES: &[&str] = &[
     "pending_generations",
     "pressure_descriptor",
     "pressure_live",
+    "pressure_budget",
     "completed_uploads",
     "failed_uploads",
     "metadata_limit_bytes",

@@ -26,6 +26,7 @@ def ordering(c):
         [
             "fuse_ftruncate_on_same_handle_waits_for_prior_write",
             "dfs_buffered_reopen_refreshes_growth_and_truncation_with_new_heads",
+            "fuse_open_creat_without_excl_opens_a_name_that_appeared_after_lookup",
         ]
         + ["front_gate_ordering::" + name for name in FRONT_GATE_ORDERING],
     )

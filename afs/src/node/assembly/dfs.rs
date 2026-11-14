@@ -208,16 +208,12 @@ impl DfsAssembly {
                     "write buffer idle baseline does not fit this platform",
                 )
             })?;
-        let dfs_write_buffers = if cfg.dfs_external_backend.is_some() {
-            // S3 objects keep no local BLAKE3 outboard, so S3 buffers carry no
-            // outboard budget.
-            chunk::WriteBufferPool::new(dfs_write_buffer_idle_bytes)
-        } else {
-            chunk::WriteBufferPool::new_with_outboard_budget(
-                dfs_write_buffer_idle_bytes,
-                dfs_outboard_budget.clone(),
-            )
-        };
+        // Sealing builds the BLAKE3 outboard with the content root in one pass.
+        // The local store keeps it as a sidecar file, S3 as a sidecar object.
+        let dfs_write_buffers = chunk::WriteBufferPool::new_with_outboard_budget(
+            dfs_write_buffer_idle_bytes,
+            dfs_outboard_budget.clone(),
+        );
         dfs_write_buffers.register_metrics(&obs.registry)?;
         let mut assembly = Self {
             connectors: crate::node::connectors::ConnectorRuntime::build(&cfg.connectors, &cfg.id)?,
@@ -396,11 +392,11 @@ impl DfsAssembly {
             Some(&obs.registry),
         )?;
         // Every DFS store, local or S3, writes through the native pipeline. S3 has
-        // only `MAX_UPLOADS` concurrent PUTs; deeper native upload queues would wait
-        // on those permits inside the request timeout.
-        let upload_inflight_chunks = if cfg.dfs_external_backend.is_some() {
+        // only `upload_concurrency` concurrent PUTs; deeper native upload queues
+        // would wait on those permits inside the request timeout.
+        let upload_inflight_chunks = if let Some(backend) = &cfg.dfs_external_backend {
             cfg.dfs_upload_inflight_chunks
-                .min(external_chunk::MAX_UPLOADS)
+                .min(backend.effective_upload_concurrency())
         } else {
             cfg.dfs_upload_inflight_chunks
         };
@@ -446,7 +442,10 @@ async fn open_external_store(
             store_id: backend.store_id.clone(),
             generation: backend.generation.clone(),
             allow_http: backend.allow_http,
-            unsigned_payload: backend.unsigned_payload,
+            unsigned_payload: backend.effective_unsigned_payload(),
+            payload_checksum: backend.effective_payload_checksum(),
+            upload_concurrency: backend.effective_upload_concurrency(),
+            worker_threads: backend.effective_worker_threads(),
             credentials: backend.credentials_file.clone().map_or(
                 external_chunk::S3CredentialsSource::Environment,
                 external_chunk::S3CredentialsSource::File,

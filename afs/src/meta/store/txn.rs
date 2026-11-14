@@ -81,7 +81,8 @@ pub struct GcPlanGuard {
     pub since: StoreRevision,
     /// Every key the transaction writes: its deletions and its Puts.
     pub written_keys: BTreeSet<MetaKey>,
-    /// Inodes being deleted and the owners of versions being deleted.
+    /// Inodes this commit deletes and the owners of every version its plan
+    /// deletes, in this commit or another one.
     pub protected_by_reference: BTreeSet<InodeId>,
     /// Inodes being deleted.
     pub dead_inodes: BTreeSet<InodeId>,

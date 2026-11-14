@@ -431,7 +431,8 @@ impl DistributedFs {
         if covered != out.len() as u64 || ops.is_empty() {
             return Ok(CurrentExternalReadOutcome::Unsupported);
         }
-        self.read_engine.read_batch_external_version(
+        let end = offset.saturating_add(out.len() as u64);
+        self.read_engine.read_batch_external_version_ahead(
             inode_id,
             &ReadBatch {
                 lookahead: Vec::new(),
@@ -440,6 +441,7 @@ impl DistributedFs {
                 ops,
             },
             out,
+            &|| external_authority_ahead(cached, end),
         )
     }
 
@@ -455,7 +457,8 @@ impl DistributedFs {
             return Ok(Some(Vec::new()));
         }
         let ops = cached.ops(offset, length)?;
-        self.read_engine.read_batch_external_version_owned(
+        let end = offset.saturating_add(length as u64);
+        self.read_engine.read_batch_external_version_owned_ahead(
             inode_id,
             &ReadBatch {
                 lookahead: Vec::new(),
@@ -464,6 +467,7 @@ impl DistributedFs {
                 ops,
             },
             length,
+            &|| external_authority_ahead(cached, end),
         )
     }
 
@@ -560,4 +564,31 @@ impl DistributedFs {
             .ok_or_else(|| stale("DFS file handle is no longer open"))?;
         DfsFileHandleSnapshot::from_handle(&handle)
     }
+}
+
+/// The visible ranges of the chunks that follow file offset `end` in this
+/// version: what a sequential reader will need authority for next. Bounded to
+/// the window the read engine accepts.
+fn external_authority_ahead(
+    cached: &ReadOnlyVersion,
+    end: u64,
+) -> Vec<crate::dfs::DfsMissingReadSource> {
+    const WINDOW: usize = crate::node::read::engine::MAX_EXTERNAL_AUTHORITY_AHEAD
+        * crate::node::chunk::MAX_STAGED_CHUNK_BYTES;
+    let remaining = cached.layout.file_length.saturating_sub(end);
+    let length = usize::try_from(remaining).map_or(WINDOW, |remaining| remaining.min(WINDOW));
+    if length == 0 {
+        return Vec::new();
+    }
+    // Read-ahead is advisory: a layout this cannot be computed for has none.
+    cached
+        .ops(end, length)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|op| crate::dfs::DfsMissingReadSource {
+            chunk_id: op.chunk_id,
+            chunk_offset: op.chunk_offset,
+            length: op.length,
+        })
+        .collect()
 }

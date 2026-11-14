@@ -214,6 +214,12 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 <a id="step-4"></a>
 ## 第四步：Buildkite共享门禁
 
+**CI 临时调整（2026-11-13）**：Platform 组件暂时跳过五项真实 Redis 时序/恢复
+用例（操作预算一项及共用故障代理 fixture 的四项），流水线逐项打印 `SKIP`；
+两项 discovery 恢复测试及其余 Redis 组件回归继续运行。这五项不计入
+CI 通过范围，源码断言及独立手动入口保留，具体名单与命令见
+[流水线说明](../../.buildkite/README.md#temporarily-deferred-redis-timing-regressions)。
+
 **本步原则、现状与优先级**：复用ADX既有目标K8s和部署入口，不调用个人VM；Base保留原冒烟，Full明确扩展基础功能。CI0–CI4与默认ON已合入，合入前Full90已通过；合入后Base232失败保留；envd工具修复候选Base235已首次通过新包/默认冒烟，正常Full91也已通过。MR131已合入；master Base236一次原条件重试后默认冒烟通过，PK0非K8s组件四例也已通过。优先级P1：产品拿包Full和专项；线上事件触发/强制合入策略分别核实，不从流水线通过推断。
 
 **状态**：五步总体逻辑已确认；以下目录/命令中标注目标或待补者尚未实施。

@@ -316,6 +316,9 @@ impl DfsService {
         unreachable!("bounded DFS create retry loop returns on every outcome")
     }
 
+    /// Decides what a failed create condition means: `IO_ALREADY_EXISTS` when
+    /// the name is taken, the current parent when only its timestamps or
+    /// revision drifted (retry), `None` for any other change (conflict).
     async fn retryable_create_parent_drift(
         &self,
         namespace_id: &NamespaceId,
@@ -324,18 +327,24 @@ impl DfsService {
         inode_id: &InodeId,
         previous_parent: Option<&InodeRecord>,
     ) -> Result<Option<InodeRecord>> {
+        // The name is taken, and not by this operation (the caller checked for
+        // its own recorded outcome first): the answer `O_CREAT | O_EXCL`
+        // callers act on, not a condition conflict.
         if self
             .store
             .read(MetaRead::DfsDentry(dentry_key.clone()))
             .await?
             .entity
             .is_some()
-            || self
-                .store
-                .read(MetaRead::DfsInode(inode_id.clone()))
-                .await?
-                .entity
-                .is_some()
+        {
+            return Err(already_exists("DFS create target already exists"));
+        }
+        if self
+            .store
+            .read(MetaRead::DfsInode(inode_id.clone()))
+            .await?
+            .entity
+            .is_some()
             || self
                 .store
                 .read(MetaRead::DfsWriteLease(inode_id.clone()))
