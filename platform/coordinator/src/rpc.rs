@@ -26,7 +26,7 @@ use crate::{
 use adx_core::{EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Result};
 use adx_protocol::{
     auth::{tenant, Peers, Principal},
-    control as pb, status,
+    control as pb, not_accepted, status,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -461,6 +461,7 @@ struct Inner {
     claim_sender: mpsc::Sender<PendingClaim>,
     changed: Notify,
     closing: watch::Sender<bool>,
+    draining: watch::Sender<bool>,
     peers: Peers,
     node_tls: RpcClient,
     timeout: Duration,
@@ -628,7 +629,7 @@ impl CoordinatorRpc {
         if timeout.is_zero() || heartbeat_timeout.is_zero() {
             return Err(Error::Invalid("RPC timeout must be positive".into()));
         }
-        let mut saved = session.snapshot().await?;
+        let saved = session.snapshot().await?;
         session.refresh_inspection_inventory().await?;
         // The pending queues are intentionally memory-only. Release their old
         // source pins after a new Coordinator epoch has fenced all previous writers.
@@ -641,29 +642,16 @@ impl CoordinatorRpc {
                 }
             }
         }
-        // Persist unreachability before exposing a recovered routing snapshot.
-        for node in saved.nodes.values_mut() {
-            node.node.available = false;
-            node.session
-                .get_or_insert(NodeSession {
-                    id: String::new(),
-                    sequence: 0,
-                    routable: false,
-                })
-                .routable = false;
-            if node.retirement.as_ref().is_some_and(|r| r.unregistered) {
-                continue;
-            }
-            *node = session
-                .register_session_with_scopes(
-                    node.node.clone(),
-                    node.address.clone(),
-                    node.proxy_address.clone(),
-                    node.session.clone(),
-                    node.checkpoint_scopes.clone(),
-                )
-                .await?;
-        }
+        // Handover preserves valid routes: stored node sessions keep their
+        // identity, sequence, and routability, so `Snapshot::routes()` stays
+        // non-empty and Ingress keeps forwarding through the primary change.
+        // A node that did not restart continues under its stored session
+        // (see `register_node`); a node that actually restarts registers a
+        // new session id and reconciles as before. Monotonic heartbeat
+        // timestamps cannot survive a process restart, so every recovered
+        // node gets one bounded registration grace instead — a node that
+        // stays silent past it expires exactly like a node dying while the
+        // primary is up.
         let mut scheduler = Coordinator::restore(&saved, placement)?;
         scheduler.use_generation_source(session.clone());
         let specs = saved
@@ -671,8 +659,6 @@ impl CoordinatorRpc {
             .iter()
             .map(|(id, i)| (id.clone(), i.spec.clone()))
             .collect();
-        // Monotonic heartbeat timestamps cannot survive a process restart. Give
-        // recovered nodes one bounded registration grace, with routes kept closed.
         let now = tokio::time::Instant::now();
         let recovering = saved.nodes.keys().map(|id| (id.clone(), now)).collect();
         let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
@@ -735,6 +721,7 @@ impl CoordinatorRpc {
             claim_sender,
             changed: Notify::new(),
             closing: watch::channel(false).0,
+            draining: watch::channel(false).0,
             peers,
             node_tls,
             timeout,
@@ -771,6 +758,27 @@ impl CoordinatorRpc {
     /// subscribers blocked on a full response channel.
     pub fn close_subscriptions(&self) {
         self.0.closing.send_replace(true);
+    }
+    /// Stop admitting new mutating work (handover drain): in-flight
+    /// operations keep running and the lease keeps being renewed while they
+    /// finish, so the process stays primary — and its storage writes stay
+    /// authoritative — until it releases the lease.
+    pub fn begin_drain(&self) {
+        self.0.draining.send_replace(true);
+    }
+    /// Handover admission gate: while draining, new mutating operations are
+    /// rejected as a structured "not accepted" (guaranteed not enqueued, so
+    /// the same request may be retried against the next primary). Read
+    /// paths and already-admitted in-flight work stay served.
+    #[allow(clippy::result_large_err)] // Preserve tonic Status at the RPC admission boundary.
+    fn admission(&self) -> std::result::Result<(), Status> {
+        if *self.0.draining.borrow() {
+            Err(not_accepted(
+                "Coordinator handover in progress; operation not accepted",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn with_reclaimers(self, reclaimers: adx_checkpoint_storage::reclaim::Reclaimers) -> Self {
@@ -1410,6 +1418,7 @@ impl CoordinatorRpc {
                     continue;
                 }
                 let snapshot = prepared_snapshot.clone();
+                let coordinator_epoch = state.session.epoch();
                 drop(state);
                 let endpoint = self
                     .0
@@ -1448,6 +1457,7 @@ impl CoordinatorRpc {
                         .clone(),
                     spec: Some(spec.clone().into()),
                     assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
+                    coordinator_epoch,
                 };
                 let mut request = adx_observability::trace::inject(request);
                 request.set_timeout(adx_transport::deadline::create_response_timeout(
@@ -1910,6 +1920,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::GetEnvironmentRequest>,
     ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
+        self.admission()?;
         if self.0.peers.authenticate(&request)? != Principal::ApiServer {
             return Err(Status::permission_denied("API Server required"));
         }
@@ -1921,6 +1932,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::EnsureRunningRequest>,
     ) -> std::result::Result<Response<pb::GetEnvironmentResponse>, Status> {
+        self.admission()?;
         if !matches!(
             self.0.peers.authenticate(&request)?,
             Principal::ApiServer | Principal::Ingress
@@ -2070,6 +2082,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::SetNodeSchedulingRequest>,
     ) -> std::result::Result<Response<pb::NodeSchedulingState>, Status> {
+        self.admission()?;
         let r = request.into_inner();
         if r.node_id.trim().is_empty() {
             return Err(Status::invalid_argument("node_id required"));
@@ -2118,6 +2131,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::LocalEnvironmentCreateRequest>,
     ) -> std::result::Result<Response<pb::PreparedEnvironment>, Status> {
+        self.admission()?;
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Adxlet required"));
         };
@@ -2131,6 +2145,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
     ) -> std::result::Result<Response<pb::ClaimEnvironmentResponse>, Status> {
         let trace =
             adx_observability::trace::Trace::rpc("coordinator.reserve_local_environment", &request);
+        self.admission()?;
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Adxlet required"));
         };
@@ -2150,6 +2165,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         request: Request<pb::ClaimEnvironmentRequest>,
     ) -> std::result::Result<Response<pb::ClaimEnvironmentResponse>, Status> {
         let trace = adx_observability::trace::Trace::rpc("coordinator.claim_environment", &request);
+        self.admission()?;
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Adxlet required"));
         };
@@ -2169,6 +2185,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         request: Request<pb::LocalEnvironmentCreateRequest>,
     ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
         let trace = adx_observability::trace::Trace::rpc("coordinator.forward_create", &request);
+        self.admission()?;
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Adxlet required"));
         };
@@ -2310,6 +2327,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::UnregisterNodeRequest>,
     ) -> std::result::Result<Response<pb::UnregisterNodeResponse>, Status> {
+        self.admission()?;
         // Once accepted, complete the ownership transition even if the
         // departing process disconnects or its bounded wait expires.
         let service = self.clone();
@@ -2322,6 +2340,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::RegisterNodeRequest>,
     ) -> std::result::Result<Response<pb::RegisterNodeResponse>, Status> {
+        self.admission()?;
         // Periodic registration/heartbeats do not create request traces.
         let principal = self.0.peers.authenticate(&request)?;
         let r = request.into_inner();
@@ -2412,6 +2431,61 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     return Err(Status::failed_precondition(
                         "another node process is still registered",
                     ));
+                }
+            } else if let Some(stored) = state
+                .nodes
+                .get(&r.node_id)
+                .and_then(|node| node.session.as_ref())
+                .filter(|session| session.routable && session.id == r.session_id)
+            {
+                // Continuation through a primary change: no live entry yet,
+                // but the stored session is this same node process in good
+                // standing. The monotonic sequence under the same session
+                // identity proves the node never restarted, so it continues
+                // serving without a full reconciliation — the Redis record is
+                // authoritative and routes stay open through the handover.
+                match r.heartbeat_sequence.cmp(&stored.sequence) {
+                    std::cmp::Ordering::Greater => inspected = true,
+                    std::cmp::Ordering::Equal => {
+                        // A retry of the report whose registration was
+                        // already persisted (the reply was lost across the
+                        // primary change): answer from the stored record
+                        // without writing — but rebuild the in-memory
+                        // heartbeat entry, so inspection and heartbeat
+                        // supervision on this primary treat the node as
+                        // live again instead of rejecting it until the next
+                        // heartbeat advances the sequence. The retried
+                        // answer carries the same registration upgrade
+                        // control a fresh registration would deliver.
+                        let shard_id = state.nodes[&r.node_id].shard_id as u32;
+                        let upgrade_control = current_registration_control(
+                            &state.session,
+                            &state.nodes[&r.node_id],
+                            &r,
+                        )
+                        .await
+                        .map_err(status)?;
+                        state.live.insert(
+                            r.node_id.clone(),
+                            LiveNode {
+                                expired: false,
+                                session: r.session_id.clone(),
+                                sequence: r.heartbeat_sequence,
+                                last_seen: tokio::time::Instant::now(),
+                                inspected: true,
+                                report: r.clone(),
+                            },
+                        );
+                        service.0.changed.notify_waiters();
+                        return Ok(Response::new(pb::RegisterNodeResponse {
+                            shard_id,
+                            coordinator_epoch: state.session.epoch(),
+                            upgrade_control,
+                        }));
+                    }
+                    std::cmp::Ordering::Less => {
+                        return Err(Status::failed_precondition("stale heartbeat"));
+                    }
                 }
             }
             if !r.reconciling && !inspected {
@@ -2522,6 +2596,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         }
         trace
             .run_result(async {
+                self.admission()?;
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("Frontend caller required"));
                 }
@@ -2598,6 +2673,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             adx_observability::trace::Trace::rpc("coordinator.commit_environment", &request);
         trace
             .run_result(async {
+                self.admission()?;
                 let principal = self.0.peers.authenticate(&request)?;
                 let r = request.into_inner();
                 let record: EnvironmentRecord = r

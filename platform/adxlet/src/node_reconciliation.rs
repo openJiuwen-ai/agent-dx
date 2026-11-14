@@ -115,7 +115,9 @@ async fn report(
     request.set_timeout(timeout);
     let result = match bounded_rpc(timeout, coordinator.register_node(request)).await {
         Ok(response) => {
-            if let Some(control) = response.into_inner().upgrade_control {
+            let response = response.into_inner();
+            manager.observe_coordinator_epoch(response.coordinator_epoch);
+            if let Some(control) = response.upgrade_control {
                 manager
                     .apply_registration_upgrade_control(control)
                     .await
@@ -136,6 +138,7 @@ async fn report(
 }
 
 async fn inspect(
+    manager: &Adxlet,
     coordinator: &mut Coordinator,
     registration: &pb::RegisterNodeRequest,
     timeout: Duration,
@@ -145,9 +148,11 @@ async fn inspect(
         session_id: registration.session_id.clone(),
     });
     request.set_timeout(timeout);
-    Ok(bounded_rpc(timeout, coordinator.inspect_node(request))
+    let catalog = bounded_rpc(timeout, coordinator.inspect_node(request))
         .await?
-        .into_inner())
+        .into_inner();
+    manager.observe_coordinator_epoch(catalog.coordinator_epoch);
+    Ok(catalog)
 }
 
 /// Compare a complete current catalog without closing healthy live admission.
@@ -203,7 +208,7 @@ pub async fn reconcile_node(
         } else {
             None
         };
-        let mut catalog = inspect(coordinator, registration, timeout).await?;
+        let mut catalog = inspect(manager, coordinator, registration, timeout).await?;
         catalog_received = true;
         if let Some(journal) = journal.filter(|_| !periodic) {
             let records = catalog
@@ -216,7 +221,7 @@ pub async fn reconcile_node(
             journal.recover(&records).await.map_err(status)?;
             // Replay may change execution/checkpoint ownership. Recover both
             // from the same fresh complete Coordinator snapshot.
-            catalog = inspect(coordinator, registration, timeout).await?;
+            catalog = inspect(manager, coordinator, registration, timeout).await?;
         }
         let records = catalog
             .records

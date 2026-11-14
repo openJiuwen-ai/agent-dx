@@ -14,6 +14,9 @@ fn poll() -> u64 {
 fn unknown_create_retention() -> u64 {
     600
 }
+fn shutdown_timeout_seconds() -> u64 {
+    15
+}
 #[derive(Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CreateMode {
@@ -70,6 +73,12 @@ pub struct Config {
     /// Private Prometheus listener, independent of the public HTTP API.
     #[serde(default)]
     pub metrics_listen: Option<SocketAddr>,
+    /// Optional plain-HTTP `/readyz` listener for kubelet probes, for mtls
+    /// deployments where the main listener requires client certificates an
+    /// httpGet probe cannot present. Serves the same admission semantics as
+    /// the main listener's `/readyz`.
+    #[serde(default)]
+    pub readiness_listen: Option<SocketAddr>,
     #[serde(default)]
     pub create_mode: CreateMode,
     /// Persist a pre-execution Claim when local-first placement is enabled.
@@ -95,6 +104,11 @@ pub struct Config {
     #[serde(default = "unknown_create_retention")]
     pub create_unknown_retention_seconds: u64,
     pub auth_cache_ttl_seconds: u64,
+    /// Graceful shutdown budget for in-flight management HTTP connections
+    /// and (embedded) the joint Ingress/Activator drain. Must be set to
+    /// cover the embedded Ingress `drain_timeout` in co-process deployments.
+    #[serde(default = "shutdown_timeout_seconds")]
+    pub shutdown_timeout_seconds: u64,
     #[serde(default)]
     pub agent_address: String,
     #[serde(default)]
@@ -125,6 +139,7 @@ impl Config {
             || self.auth_cache_ttl_seconds == 0
             || self.cache_entries == 0
             || self.create_unknown_retention_seconds == 0
+            || self.shutdown_timeout_seconds == 0
             || self.discovery.as_ref().is_some_and(|d| d.poll_seconds == 0)
         {
             return Err("positive RPC/cache bounds, TLS name and exactly one Coordinator discovery source required".into());
@@ -174,5 +189,8 @@ impl Config {
     }
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(self.rpc_timeout_seconds)
+    }
+    pub fn shutdown_timeout(&self) -> Duration {
+        Duration::from_secs(self.shutdown_timeout_seconds)
     }
 }

@@ -169,6 +169,7 @@ fn rpc_request(
         cleanup: Some(cleanup.try_into().expect("test cleanup is valid")),
         node_session_id: session.into(),
         delegated: true,
+        coordinator_epoch: 0,
     })
 }
 

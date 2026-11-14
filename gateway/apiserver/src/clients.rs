@@ -14,7 +14,10 @@ use std::{
     future::Future,
     num::NonZeroUsize,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
@@ -33,6 +36,12 @@ pub struct Clients {
     channels: Mutex<Cache<String, RpcChannel>>,
     auth: Mutex<Cache<[u8; 32], pb::CallerContext>>,
     environments: Mutex<EnvironmentDirectory>,
+    /// Readiness: set once the environment/node directory watches have each
+    /// delivered their first frame. `/readyz` reflects this so a probe can
+    /// distinguish "initial sync not complete" from a running request. A
+    /// transient watch reconnect does NOT flip this false, avoiding flap.
+    env_synced: Arc<AtomicBool>,
+    nodes_synced: Arc<AtomicBool>,
 }
 impl Clients {
     pub fn new(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
@@ -80,6 +89,8 @@ impl Clients {
             channels: Mutex::new(Cache::new(limit)),
             auth: Mutex::new(Cache::new(limit)),
             environments: Mutex::default(),
+            env_synced: Arc::new(AtomicBool::new(false)),
+            nodes_synced: Arc::new(AtomicBool::new(false)),
         });
         let weak = Arc::downgrade(&clients);
         tokio::spawn(async move {
@@ -95,6 +106,10 @@ impl Clients {
                 }) {
                     clients.environments.lock().await.clear();
                 }
+                // The stream ended: the primary it was pinned to is gone or
+                // draining for handover, so re-resolve before reconnecting
+                // instead of waiting out the endpoint cache TTL.
+                clients.invalidate_coordinator().await;
                 drop(clients);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -104,12 +119,28 @@ impl Clients {
             while let Some(clients) = weak.upgrade() {
                 let _ = clients.watch_directory().await;
                 clients.directory.lock().await.clear();
+                clients.invalidate_coordinator().await;
                 drop(clients);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
         Ok(clients)
     }
+    /// Whether the API Server has completed its initial directory sync and is
+    /// ready to serve management requests. Probes read this via `/readyz`.
+    /// A transient watch reconnect does not flip this false, avoiding flap.
+    pub fn ready(&self) -> bool {
+        self.env_synced.load(Ordering::Acquire) && self.nodes_synced.load(Ordering::Acquire)
+    }
+
+    fn mark_env_synced(&self) {
+        self.env_synced.store(true, Ordering::Release);
+    }
+
+    fn mark_nodes_synced(&self) {
+        self.nodes_synced.store(true, Ordering::Release);
+    }
+
     async fn watch_environments(&self) -> Result<(), Status> {
         let mut client =
             pb::environment_directory_service_client::EnvironmentDirectoryServiceClient::new(
@@ -124,6 +155,7 @@ impl Clients {
             .await?;
         while let Some(frame) = stream.message().await? {
             self.environments.lock().await.update(frame)?;
+            self.mark_env_synced();
         }
         Err(Status::unavailable("environment directory closed"))
     }
@@ -143,6 +175,7 @@ impl Clients {
                 .map_err(|_| Status::unavailable("node directory expired"))??
                 .ok_or_else(|| Status::unavailable("node directory closed"))?;
             self.directory.lock().await.update(frame)?;
+            self.mark_nodes_synced();
         }
     }
     pub async fn create_environment(
@@ -207,16 +240,35 @@ impl Clients {
             }
             drop(select);
         }
-        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
-            self.coordinator().await?,
-        );
-        let mut request = trace::inject(request);
-        request.set_timeout(budget);
-        self.rpc_with_timeout(
-            "apiserver.create",
-            budget,
-            client.create_environment(request),
-        )
+        self.create_via_coordinator(request, budget).await
+    }
+    /// Central create, retried across a primary change: a structured "not
+    /// accepted" rejection from a draining primary guarantees nothing was
+    /// enqueued, so the same request identity is retried against the next
+    /// primary within the original budget. Any other failure (including a
+    /// plain Unavailable, which may follow an applied write) surfaces
+    /// untouched for the unknown-outcome query path.
+    async fn create_via_coordinator(
+        &self,
+        request: pb::CreateEnvironmentRequest,
+        budget: Duration,
+    ) -> Result<(pb::EnvironmentResult, &'static str), Status> {
+        self.with_primary_retry(budget, false, |timeout| {
+            let request = request.clone();
+            async move {
+                let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+                    self.coordinator().await?,
+                );
+                let mut request = trace::inject(request);
+                request.set_timeout(timeout);
+                self.rpc_with_timeout(
+                    "apiserver.create",
+                    timeout,
+                    client.create_environment(request),
+                )
+                .await
+            }
+        })
         .await
         .map(|result| (result, "central"))
     }
@@ -228,13 +280,17 @@ impl Clients {
             .ok_or_else(|| Status::unavailable("node directory unavailable"))
     }
     pub async fn scheduling_queue(&self) -> Result<pb::GetSchedulingQueueResponse, Status> {
-        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
-            self.coordinator().await?,
-        );
-        self.rpc(
-            "apiserver.get_scheduling_queue",
-            client.get_scheduling_queue(trace::inject(pb::GetSchedulingQueueRequest {})),
-        )
+        self.with_primary_retry(self.config.timeout(), true, |timeout| async move {
+            let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+                self.coordinator().await?,
+            );
+            self.rpc_with_timeout(
+                "apiserver.get_scheduling_queue",
+                timeout,
+                client.get_scheduling_queue(trace::inject(pb::GetSchedulingQueueRequest {})),
+            )
+            .await
+        })
         .await
     }
     pub async fn set_node_scheduling(
@@ -242,16 +298,23 @@ impl Clients {
         node_id: String,
         accepting_allocations: bool,
     ) -> Result<pb::NodeSchedulingState, Status> {
-        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
-            self.coordinator().await?,
-        );
-        self.rpc(
-            "apiserver.set_node_scheduling",
-            client.set_node_scheduling(trace::inject(pb::SetNodeSchedulingRequest {
-                node_id,
-                accepting_allocations,
-            })),
-        )
+        self.with_primary_retry(self.config.timeout(), false, |timeout| {
+            let node_id = node_id.clone();
+            async move {
+                let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+                    self.coordinator().await?,
+                );
+                self.rpc_with_timeout(
+                    "apiserver.set_node_scheduling",
+                    timeout,
+                    client.set_node_scheduling(trace::inject(pb::SetNodeSchedulingRequest {
+                        node_id,
+                        accepting_allocations,
+                    })),
+                )
+                .await
+            }
+        })
         .await
     }
     pub async fn coordinator(&self) -> Result<RpcChannel, Status> {
@@ -281,6 +344,67 @@ impl Clients {
             self.config.coordinator_address.clone()
         };
         self.channel(&address).await
+    }
+    /// Drop the cached Coordinator primary endpoint and its channel so the
+    /// next call re-resolves the primary through discovery. Called
+    /// whenever a stream or call suggests the cached primary is gone or
+    /// draining for handover.
+    async fn invalidate_coordinator(&self) {
+        let address = self.endpoint.lock().await.get(&());
+        self.endpoint.lock().await.remove(&());
+        if let Some(address) = address {
+            self.channels.lock().await.remove(&address);
+        }
+    }
+    /// Retry a Coordinator call through a primary change, within `budget`.
+    /// A structured "not accepted" rejection guarantees nothing was
+    /// enqueued, so the same request may be retried against the next
+    /// primary with the same identity; `retry_plain_unavailable`
+    /// additionally retries a plain Unavailable, which is safe only for
+    /// side-effect-free reads. Every retry re-resolves the primary through
+    /// discovery — the cached one is stale, gone, or draining — after a
+    /// capped, jittered backoff. Failures that may follow an applied write
+    /// (deadline exceeded, other statuses) are never retried here: they
+    /// surface as outcome-unknown for the query path.
+    async fn with_primary_retry<T, F>(
+        &self,
+        budget: Duration,
+        retry_plain_unavailable: bool,
+        mut call: impl FnMut(Duration) -> F,
+    ) -> Result<T, Status>
+    where
+        F: std::future::Future<Output = Result<T, Status>>,
+    {
+        let deadline = tokio::time::Instant::now().checked_add(budget).ok_or_else(|| {
+            Status::unavailable("coordinator call timeout is too large")
+        })?;
+        let mut backoff = Duration::from_millis(200);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let result = call(remaining).await;
+            let retry = match &result {
+                Ok(_) => false,
+                Err(status) => {
+                    adx_protocol::not_accepted_status(status)
+                        || (retry_plain_unavailable && status.code() == tonic::Code::Unavailable)
+                }
+            };
+            if !retry {
+                return result;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let delay = jittered(backoff.min(remaining));
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || delay > remaining {
+                return result;
+            }
+            adx_observability::warn!(
+                "coordinator primary change suspected; re-resolving and retrying"
+            );
+            self.invalidate_coordinator().await;
+            tokio::time::sleep(delay).await;
+            backoff = (backoff * 2).min(Duration::from_secs(2));
+        }
     }
     pub async fn channel(&self, address: &str) -> Result<RpcChannel, Status> {
         let mut channels = self.channels.lock().await;
@@ -397,38 +521,45 @@ impl Clients {
         if !(32..=512).contains(&key.len()) {
             return Err(Status::unauthenticated("invalid API key"));
         }
-        // Discovery, channel acquisition and the auth RPC share this original
-        // budget. A discovery reconnect must not grant the RPC a fresh budget.
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.config.timeout())
-            .ok_or_else(|| {
-                Status::unavailable("apiserver.verify_key: authentication timeout is too large")
-            })?;
-        let channel = tokio::time::timeout_at(deadline, self.coordinator())
-            .await
-            .map_err(|_| {
-                adx_observability::warn!(
-                    phase = "coordinator",
-                    category = "deadline",
-                    "API authentication Coordinator acquisition deadline exceeded"
-                );
-                Status::deadline_exceeded(
-                    "apiserver.verify_key: Coordinator acquisition deadline exceeded",
-                )
-            })??;
-        let mut client = pb::auth_service_client::AuthServiceClient::new(channel);
-        // Let the RPC span own its timeout and record terminal attribution;
-        // an outer timer would cancel it before those attributes are written.
+        // Retry against a re-resolved coordinator primary: during a warm
+        // standby takeover the cached channel may point at the departing
+        // primary, and the verify must not fail the request outright.
+        // Discovery, channel acquisition and the auth RPC share the budget
+        // of each attempt; a discovery reconnect must not grant the RPC a
+        // fresh budget.
         let result = self
-            .rpc_until(
-                "apiserver.verify_key",
-                deadline,
-                Box::pin(
+            .with_primary_retry(self.config.timeout(), true, |timeout| async move {
+                let deadline = tokio::time::Instant::now().checked_add(timeout).ok_or_else(
+                    || {
+                        Status::unavailable(
+                            "apiserver.verify_key: authentication timeout is too large",
+                        )
+                    },
+                )?;
+                let channel = tokio::time::timeout_at(deadline, self.coordinator())
+                    .await
+                    .map_err(|_| {
+                        adx_observability::warn!(
+                            phase = "coordinator",
+                            category = "deadline",
+                            "API authentication Coordinator acquisition deadline exceeded"
+                        );
+                        Status::deadline_exceeded(
+                            "apiserver.verify_key: Coordinator acquisition deadline exceeded",
+                        )
+                    })??;
+                let mut client = pb::auth_service_client::AuthServiceClient::new(channel);
+                let remaining =
+                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                self.rpc_with_timeout(
+                    "apiserver.verify_key",
+                    remaining,
                     client.verify_api_key(trace::inject(pb::VerifyApiKeyRequest {
                         api_key: key.into(),
                     })),
-                ),
-            )
+                )
+                .await
+            })
             .await?;
         if result.expires_at_unix_seconds != 0 && result.expires_at_unix_seconds <= unix_seconds() {
             return Err(Status::unauthenticated("expired API key"));
@@ -504,17 +635,21 @@ impl Clients {
             authorize(caller, value.record.as_ref())?;
             return Ok(value);
         }
-        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
-            self.coordinator().await?,
-        );
         let v = self
-            .rpc(
-                "apiserver.get_environment",
-                client.get_environment(trace::inject(pb::GetEnvironmentRequest {
-                    environment_id: id.into(),
-                    caller: Some(caller.clone()),
-                })),
-            )
+            .with_primary_retry(self.config.timeout(), false, |timeout| async move {
+                let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+                    self.coordinator().await?,
+                );
+                self.rpc_with_timeout(
+                    "apiserver.get_environment",
+                    timeout,
+                    client.get_environment(trace::inject(pb::GetEnvironmentRequest {
+                        environment_id: id.into(),
+                        caller: Some(caller.clone()),
+                    })),
+                )
+                .await
+            })
             .await?;
         authorize(caller, v.record.as_ref())?;
         if v.record
@@ -564,6 +699,22 @@ impl Clients {
     pub async fn put_owner(&self, value: pb::GetEnvironmentResponse) -> Result<(), Status> {
         self.environments.lock().await.put(value)
     }
+}
+
+// Half-to-full jitter of a retry backoff: bounded randomization avoids
+// synchronized retry storms across API Server replicas after a Coordinator
+// primary change.
+fn jittered(backoff: Duration) -> Duration {
+    let millis = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
+    if millis == 0 {
+        return backoff;
+    }
+    let half = millis / 2;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    Duration::from_millis(half + nanos % (half + 1))
 }
 
 // Tonic reports a connection reset during handshake/reconnect as Unknown or Cancelled,
@@ -748,6 +899,118 @@ mod tests {
         assert_eq!(normalized.code(), Code::DeadlineExceeded);
         assert!(normalized.message().contains("response deadline exceeded"));
         assert!(adx_protocol::deadline_failure(&normalized).is_none());
+    }
+
+    #[test]
+    fn jitter_stays_within_half_to_full_of_the_backoff() {
+        for _ in 0..64 {
+            let jitter = jittered(Duration::from_millis(200));
+            assert!(jitter >= Duration::from_millis(100));
+            assert!(jitter <= Duration::from_millis(200));
+        }
+        assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_not_accepted_rejection_is_retried_through_a_fresh_primary() {
+        let clients = rpc_test_clients("http://127.0.0.1:1");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A draining primary rejects the create as "not accepted" —
+        // nothing was enqueued — so the same identity is retried against
+        // the next primary within the original budget.
+        let counter = attempts.clone();
+        let result: Result<usize, Status> = clients
+            .with_primary_retry(Duration::from_millis(600), false, move |_timeout| {
+                let counter = counter.clone();
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(adx_protocol::not_accepted(
+                            "Coordinator handover in progress; operation not accepted",
+                        ))
+                    } else {
+                        Ok(7)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_plain_unavailable_is_never_retried_for_writes() {
+        let clients = rpc_test_clients("http://127.0.0.1:1");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A plain Unavailable may follow an applied write, so a mutating
+        // call surfaces it immediately for the unknown-outcome query path.
+        let counter = attempts.clone();
+        let result: Result<usize, Status> = clients
+            .with_primary_retry(Duration::from_millis(300), false, move |_timeout| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err(Status::unavailable("connection reset"))
+                }
+            })
+            .await;
+        assert_eq!(result.unwrap_err().code(), Code::Unavailable);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_plain_unavailable_is_retried_for_reads() {
+        let clients = rpc_test_clients("http://127.0.0.1:1");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A read has no side effects, so a plain Unavailable (including a
+        // draining primary that has not answered yet) is retried.
+        let counter = attempts.clone();
+        let result: Result<usize, Status> = clients
+            .with_primary_retry(Duration::from_millis(600), true, move |_timeout| {
+                let counter = counter.clone();
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(Status::unavailable("connection reset"))
+                    } else {
+                        Ok(9)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(result.unwrap(), 9);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_stop_when_the_budget_is_exhausted() {
+        let clients = rpc_test_clients("http://127.0.0.1:1");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let result: Result<usize, Status> = clients
+            .with_primary_retry(Duration::from_millis(400), false, move |_timeout| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err(adx_protocol::not_accepted("handover in progress"))
+                }
+            })
+            .await;
+        // The original failure surfaces once the budget ends, after at
+        // least one bounded-backoff retry.
+        assert_eq!(result.unwrap_err().code(), Code::Unavailable);
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "at least one retry must happen"
+        );
+        // Half-to-full jitter over the capped backoff consumes at least half
+        // of the remaining budget per retry, so a 400ms budget allows ~11
+        // attempts in the adversarial low-draw tail — still two orders of
+        // magnitude below a no-backoff spin (thousands of attempts). The
+        // bound separates exponential backoff from a spin with margin.
+        assert!(
+            attempts.load(Ordering::SeqCst) <= 16,
+            "bounded backoff must not spin the budget away: {}",
+            attempts.load(Ordering::SeqCst)
+        );
     }
 
     #[tokio::test]
