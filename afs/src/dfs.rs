@@ -499,17 +499,21 @@ pub struct ChunkObject {
     pub encoding: ChunkEncoding,
 }
 
+impl ChunkId {
+    pub(crate) fn crc32c_write_generation(&self) -> Option<&str> {
+        let (generation, object) = self.0.strip_prefix("crc32c-v2-")?.split_once('-')?;
+        (is_lower_hex(generation, 32) && is_lower_hex(object, 32)).then_some(generation)
+    }
+}
+
 impl ChunkObject {
     /// Birth generation of an independently named object: a CRC object
     /// (`crc32c-v2-<generation>-<object>`) or a generational BLAKE3 object
     /// (`blake3-v2-<generation>-<root>-<length>`, S3). Repairs retain it.
     pub fn write_generation(&self) -> Option<&str> {
-        if let Some(value) = self.id.0.strip_prefix("crc32c-v2-") {
-            let (generation, object) = value.split_once('-')?;
-            return (is_lower_hex(generation, 32) && is_lower_hex(object, 32))
-                .then_some(generation);
-        }
-        content_addressed_parts(&self.id).and_then(|parts| parts.generation)
+        self.id
+            .crc32c_write_generation()
+            .or_else(|| content_addressed_parts(&self.id).and_then(|parts| parts.generation))
     }
 
     /// The generational BLAKE3 identity of `body`'s standard root, born in the

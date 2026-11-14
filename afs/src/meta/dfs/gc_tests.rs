@@ -377,6 +377,96 @@ fn generation_reference_does_not_protect_another_write() {
     );
 }
 
+#[tokio::test]
+async fn crc_orphan_inventory_protects_live_write_then_retires_files() {
+    use crate::node::chunk::{LocalChunkStore, StagedChunk};
+    use std::{fs, io::Write};
+
+    let root = tempfile::tempdir().unwrap();
+    let local = LocalChunkStore::open(root.path(), "n").unwrap();
+    let chunks = root.path().join("chunks");
+    let mut orphans = Vec::new();
+    for operation in ["live", "live", "unreferenced"] {
+        let item =
+            StagedChunk::new_crc32c(OperationId::new(operation), b"payload".to_vec()).unwrap();
+        let staged = root.path().join("staging/pending");
+        let mut body = fs::File::create(&staged).unwrap();
+        body.write_all(item.bytes()).unwrap();
+        body.sync_all().unwrap();
+        let path = chunks.join(&item.chunk.id.0);
+        fs::hard_link(&staged, &path).unwrap();
+        fs::remove_file(staged).unwrap();
+        orphans.push((item.chunk, path));
+    }
+    fs::File::open(&chunks).unwrap().sync_all().unwrap();
+    drop(local);
+    let local = LocalChunkStore::open(root.path(), "n").unwrap();
+    assert_eq!(local.recover().unwrap().orphan_files, 3);
+    let inventory = local.gc_inventory().unwrap();
+    assert_eq!(inventory.len(), 3);
+    for (chunk, _) in &orphans {
+        assert!(inventory.contains(chunk));
+    }
+
+    let reference = write_reference("live");
+    let (store, _) = seeded_store(vec![MetaEntity::DfsReference(GcReference {
+        open_read: None,
+        node_id: "n".into(),
+        session_id: "s".into(),
+        reference_id: reference.clone(),
+        inode_id: Some(InodeId::new("i")),
+        publication: true,
+        chunks: vec![],
+        retired_at_unix_ms: None,
+        pinned_version: None,
+    })])
+    .await;
+    let service = gc_service(store);
+    let ticket = service
+        .collect_garbage("n".into(), "s".into(), 0, inventory)
+        .await
+        .unwrap();
+    assert_eq!(ticket.chunks, vec![orphans[2].0.id.clone()]);
+    assert_eq!(ticket.waiting_nodes, vec!["n".to_owned()]);
+    assert_eq!(
+        local
+            .lifecycle()
+            .retire_generation(ticket.generation, &ticket.chunks)
+            .unwrap(),
+        1
+    );
+    assert!(orphans[0].1.exists() && orphans[1].1.exists());
+    assert!(!orphans[2].1.exists());
+    service
+        .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
+        .await
+        .unwrap();
+
+    service
+        .release_gc_references("n".into(), "s".into(), vec!["write:live".into()])
+        .await
+        .unwrap();
+    let next = service
+        .collect_garbage(
+            "n".into(),
+            "s".into(),
+            ticket.generation,
+            local.gc_inventory().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.chunks.len(), 2);
+    assert_eq!(
+        local
+            .lifecycle()
+            .retire_generation(next.generation, &next.chunks)
+            .unwrap(),
+        2
+    );
+    assert!(orphans.iter().all(|(_, path)| !path.exists()));
+    assert!(local.gc_inventory().unwrap().is_empty());
+}
+
 fn storage_device(node: &str) -> crate::dfs::StorageDeviceDescriptor {
     crate::dfs::StorageDeviceDescriptor {
         device_id: format!("{node}-device"),

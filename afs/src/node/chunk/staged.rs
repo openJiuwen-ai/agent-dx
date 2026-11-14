@@ -3,7 +3,7 @@
 use super::*;
 
 /// Shared producer/replica budget per immutable staged chunk, never a file limit.
-#[cfg(feature = "dfs")]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) const MAX_STAGED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
