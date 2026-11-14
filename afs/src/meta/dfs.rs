@@ -33,10 +33,14 @@ use super::store::{
 
 mod access;
 mod commit;
+mod lease_release;
 mod namespace;
 mod placement;
 mod read_auth;
 mod read_cache;
+mod readers;
+pub use lease_release::MAX_LEASE_RELEASE_BATCH;
+pub use readers::{OpenFileRead, OpenedForRead, ReaderEntry};
 mod repair;
 mod replay;
 mod restore;
@@ -65,6 +69,10 @@ pub struct DfsService {
     gc_metrics: gc::GcMetrics,
     gc_reference_updates: Arc<[tokio::sync::Mutex<()>; GC_REFERENCE_LOCK_SHARDS]>,
     repair_patrol: Arc<std::sync::Mutex<repair::RepairPatrol>>,
+    /// Round 2 C-1 reader registrations of this Meta process.
+    readers: Arc<readers::SoftReaders>,
+    #[cfg(test)]
+    reader_hook: Arc<std::sync::Mutex<Option<readers::BetweenInsertAndView>>>,
 }
 
 // Store batches at most 64 submitted transactions in one durable commit pass.
@@ -76,6 +84,17 @@ const FILE_COMMIT_RETRY_LIMIT: usize = 64;
 const NAMESPACE_MKDIR_RETRY_LIMIT: usize = 64;
 const NAMESPACE_REMOVE_RETRY_LIMIT: usize = 64;
 const GC_REFERENCE_LOCK_SHARDS: usize = 64;
+
+/// Attempts of one `SetInodeAttributes` without a client revision: each
+/// rebuilds the change on the inode current at that attempt.
+const SETATTR_RETRY_LIMIT: usize = 64;
+/// Plans of one rename against changed state before it reports a conflict.
+const RENAME_RETRY_LIMIT: usize = 64;
+
+enum SetAttrAttempt {
+    Applied(InodeRecord),
+    Retry,
+}
 
 enum NamespaceRemoveAttempt {
     Removed(InodeRecord),
@@ -97,6 +116,13 @@ pub struct CreateFileRequest {
     pub name: Vec<u8>,
     pub attributes: InodeAttributes,
     pub lease_seconds: u64,
+    /// The creator's first write generation (`write:` reference id without the
+    /// prefix), admitted in the Create transaction so the first write needs no
+    /// admission round trip (round 2 B1).
+    pub first_generation: Option<OperationId>,
+    /// The identity creating the file: checked against the parent directory
+    /// and the source of the new inode's owner and (setgid-aware) group.
+    pub caller: CallerContext,
 }
 
 impl DfsService {
@@ -122,6 +148,7 @@ impl DfsService {
             .and_then(|mut file| file.read_exact(&mut key))
             .ok()
             .map(|()| key);
+        let readers = Arc::new(readers::SoftReaders::new(store.writer_term()));
         Self {
             store,
             replication,
@@ -133,6 +160,9 @@ impl DfsService {
             gc_metrics: gc::GcMetrics::new().expect("fixed GC metric descriptors are valid"),
             gc_reference_updates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
             repair_patrol: Arc::default(),
+            readers,
+            #[cfg(test)]
+            reader_hook: Arc::default(),
         }
     }
 

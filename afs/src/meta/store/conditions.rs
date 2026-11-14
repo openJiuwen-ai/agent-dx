@@ -233,6 +233,13 @@ fn dfs_gc_plan_still_valid(state: &State, guard: &super::GcPlanGuard) -> bool {
     if sessions_changed {
         return false;
     }
+    if let Some(readers) = &guard.readers
+        && readers
+            .table
+            .registered_since(readers.since, &readers.inodes)
+    {
+        return false;
+    }
     !state.events.since(guard.since).any(|event| {
         if guard.written_keys.contains(&event.key) {
             return true;

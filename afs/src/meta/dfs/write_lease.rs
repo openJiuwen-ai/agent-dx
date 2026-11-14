@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Attempts of one lease acquire against a lease entity that keeps changing
+/// (the bound of `renew_write_lease`).
+const LEASE_ACQUIRE_RETRY_LIMIT: usize = 16;
+
+/// The bounded acquire retry ran out: the conflict an unretried race gave.
+fn lease_acquire_contended() -> Error {
+    conflict("DFS metadata condition changed during lease update")
+}
+
 impl DfsService {
     async fn lazy_owner_session_replaced(
         &self,
@@ -32,6 +41,12 @@ impl DfsService {
         )
     }
 
+    /// One attempt to take the write lease of `inode_id` for the caller.
+    /// `None`: the lease changed under the attempt (another owner holds it
+    /// live, or the entity changed between the read and the commit, e.g. GC
+    /// deleted the expired lease). The caller resolves the authority again:
+    /// it returns a live lease of another owner as is, and plans a new
+    /// acquire otherwise.
     async fn acquire_write_lease(
         &self,
         caller_id: String,
@@ -39,7 +54,7 @@ impl DfsService {
         operation_id: OperationId,
         inode_id: InodeId,
         lease_seconds: u64,
-    ) -> Result<WriteLease> {
+    ) -> Result<Option<WriteLease>> {
         require_id(&caller_id, "caller_id")?;
         require_id(&owner_session_id, "owner_session_id")?;
         require_id(&operation_id.0, "operation_id")?;
@@ -52,7 +67,7 @@ impl DfsService {
             )
             .await?
         {
-            return Ok(lease);
+            return Ok(Some(lease));
         }
         let inode = self.get_inode(inode_id.clone()).await?;
         if inode.kind != InodeKind::Regular {
@@ -83,7 +98,8 @@ impl DfsService {
                 .lazy_owner_session_replaced(&inode, &lease, &caller_id, &owner_session_id)
                 .await?;
         if live && !same_owner && !replacing_lazy_owner {
-            return Err(conflict("DFS write lease is held by another live owner"));
+            // Taken since the caller looked: it is the caller's to return.
+            return Ok(None);
         }
         lease.owner_node_id = caller_id.clone();
         lease.owner_session_id = owner_session_id;
@@ -129,10 +145,13 @@ impl DfsService {
             TxnMutation::Put(MetaEntity::DfsWriteLease(lease)),
             TxnMutation::RecordRequestOutcome(outcome),
         ]);
-        lease_outcome(
-            self.store.compare_and_commit(txn).await?,
-            StoreOperation::DfsAcquireWriteLease,
-        )
+        match self.store.compare_and_commit(txn).await? {
+            TxnOutcome::ConditionFailed {
+                existing_outcome: None,
+                ..
+            } => Ok(None),
+            outcome => lease_outcome(outcome, StoreOperation::DfsAcquireWriteLease).map(Some),
+        }
     }
 
     async fn rebind_lazy_owner_for_peer(
@@ -205,29 +224,39 @@ impl DfsService {
         inode_id: InodeId,
         lease_seconds: u64,
     ) -> Result<(InodeRecord, WriteLease)> {
-        let inode = self.get_inode(inode_id.clone()).await?;
-        let snapshot = self
-            .store
-            .read(MetaRead::DfsWriteLease(inode_id.clone()))
-            .await?;
-        if let Some(MetaEntity::DfsWriteLease(lease)) = snapshot.entity
-            && lease.expires_at_unix_ms > now_unix_ms()
-            && (lease.owner_node_id != caller_id || lease.owner_session_id != owner_session_id)
-        {
-            return Ok((inode, lease));
+        for _ in 0..LEASE_ACQUIRE_RETRY_LIMIT {
+            let inode = self.get_inode(inode_id.clone()).await?;
+            let snapshot = self
+                .store
+                .read(MetaRead::DfsWriteLease(inode_id.clone()))
+                .await?;
+            if let Some(MetaEntity::DfsWriteLease(lease)) = snapshot.entity
+                && lease.expires_at_unix_ms > now_unix_ms()
+                && (lease.owner_node_id != caller_id || lease.owner_session_id != owner_session_id)
+            {
+                return Ok((inode, lease));
+            }
+            if let Some(lease) = self
+                .acquire_write_lease(
+                    caller_id.clone(),
+                    owner_session_id.clone(),
+                    operation_id.clone(),
+                    inode_id.clone(),
+                    lease_seconds,
+                )
+                .await?
+            {
+                return Ok((inode, lease));
+            }
         }
-        let lease = self
-            .acquire_write_lease(
-                caller_id,
-                owner_session_id,
-                operation_id,
-                inode_id,
-                lease_seconds,
-            )
-            .await?;
-        Ok((inode, lease))
+        Err(lease_acquire_contended())
     }
 
+    /// Resolves the write (or lock) authority of `inode_id`: a live lease
+    /// of another owner is returned as is; otherwise the caller acquires it.
+    /// An acquire that loses a race on the lease entity (R108: GC deleting
+    /// the expired lease, another Node taking it) resolves again, a bounded
+    /// number of times, instead of failing the open.
     async fn resolve_fresh_write_authority(
         &self,
         caller_id: String,
@@ -237,6 +266,39 @@ impl DfsService {
         lease_seconds: u64,
         context: &'static str,
     ) -> Result<(InodeRecord, WriteLease)> {
+        for _ in 0..LEASE_ACQUIRE_RETRY_LIMIT {
+            if let Some(resolved) = self
+                .resolve_fresh_write_authority_attempt(
+                    &caller_id,
+                    &owner_session_id,
+                    &operation_id,
+                    &inode_id,
+                    lease_seconds,
+                    context,
+                )
+                .await?
+            {
+                return Ok(resolved);
+            }
+        }
+        Err(lease_acquire_contended())
+    }
+
+    async fn resolve_fresh_write_authority_attempt(
+        &self,
+        caller_id: &str,
+        owner_session_id: &str,
+        operation_id: &OperationId,
+        inode_id: &InodeId,
+        lease_seconds: u64,
+        context: &'static str,
+    ) -> Result<Option<(InodeRecord, WriteLease)>> {
+        let (caller_id, owner_session_id, operation_id, inode_id) = (
+            caller_id.to_owned(),
+            owner_session_id.to_owned(),
+            operation_id.clone(),
+            inode_id.clone(),
+        );
         require_id(&caller_id, "caller_id")?;
         require_id(&owner_session_id, "owner_session_id")?;
         require_id(&operation_id.0, "operation_id")?;
@@ -283,7 +345,7 @@ impl DfsService {
                         && lease.owner_session_id == owner_session_id
                         && lease.lease_epoch != 0 =>
                 {
-                    Ok((inode, lease))
+                    Ok(Some((inode, lease)))
                 }
                 _ => Err(invalid(format!(
                     "DFS {context} acquire replay does not match caller and inode"
@@ -306,7 +368,7 @@ impl DfsService {
             }
             if lease.expires_at_unix_ms > now_unix_ms() {
                 if observe_only {
-                    return Ok((inode, lease));
+                    return Ok(Some((inode, lease)));
                 }
                 if context == "write"
                     && let Some(rebound) = self
@@ -319,13 +381,13 @@ impl DfsService {
                         )
                         .await?
                 {
-                    return Ok((inode, rebound));
+                    return Ok(Some((inode, rebound)));
                 }
                 if !self
                     .lazy_owner_session_replaced(&inode, &lease, &caller_id, &owner_session_id)
                     .await?
                 {
-                    return Ok((inode, lease));
+                    return Ok(Some((inode, lease)));
                 }
             }
         }
@@ -335,7 +397,7 @@ impl DfsService {
                 "DFS has no unexpired write authority to observe",
             ));
         }
-        let lease = self
+        let Some(lease) = self
             .acquire_write_lease(
                 caller_id.clone(),
                 owner_session_id.clone(),
@@ -343,7 +405,10 @@ impl DfsService {
                 inode_id,
                 lease_seconds,
             )
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
         if lease.inode_id != inode.inode_id
             || lease.owner_node_id != caller_id
             || lease.owner_session_id != owner_session_id
@@ -353,7 +418,7 @@ impl DfsService {
                 "DFS {context} acquire result does not match caller and inode"
             )));
         }
-        Ok((inode, lease))
+        Ok(Some((inode, lease)))
     }
 
     pub async fn resolve_lock_authority(
@@ -509,7 +574,11 @@ impl DfsService {
         let current_lease = self
             .validate_write_lease(&caller_id, &sync.inode_id, &sync.write_lease)
             .await?;
-        if current.revision < sync.expected_inode_revision
+        // Exact revision (B5): a sync frozen before another inode update
+        // (an explicit utimens, a chmod) must not land on top of it. The
+        // Node rebuilds the sync on the newer inode, or drops it when the
+        // update already set the times.
+        if current.revision != sync.expected_inode_revision
             || current.head_version != sync.expected_head_version
         {
             return Err(conflict("DFS inode changed before metadata sync"));

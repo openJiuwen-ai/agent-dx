@@ -380,6 +380,32 @@ print(json.dumps(oct(os.stat(p).st_mode&0o7777)))""", path(c, "A", "px-priv"), o
     assert denied["returncode"] != 0 and "Operation not permitted" in denied["stderr"], denied
 
 
+def setgid_directory_gives_new_files_its_group(c):
+    """
+    #23: a file or directory created in a setgid directory takes the directory's
+    group, on the creating node and on the other one; without setgid it takes the
+    caller's group.
+    """
+    let_others_traverse(c)
+    made = path(c, "A", "px-sgid")
+    c.python("A", "os.mkdir(sys.argv[1]);"
+             "os.chown(sys.argv[1],int(sys.argv[2]),int(sys.argv[3]));os.chmod(sys.argv[1],0o2770)",
+             made, c.config["uid"], c.config["other_gid"], owner=False)
+    code = """d=sys.argv[1]
+os.close(os.open(d+"/f",os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o640));os.mkdir(d+"/sub")
+os.close(os.open(sys.argv[2],os.O_CREAT|os.O_WRONLY,0o640))
+print(json.dumps({"file":os.stat(d+"/f").st_gid,"dir":os.stat(d+"/sub").st_gid,
+"dir_sgid":bool(os.stat(d+"/sub").st_mode&0o2000),"plain":os.stat(sys.argv[2]).st_gid,"uid":os.stat(d+"/f").st_uid}))"""
+    result = run(c, "A", code, made, path(c, "A", "px-sgid-plain"))
+    seen = run(c, "B", "print(json.dumps([os.stat(sys.argv[1]+'/f').st_gid,os.stat(sys.argv[1]+'/sub').st_gid]))",
+               path(c, "B", "px-sgid"), owner=False)
+    c.record("posix.setgid_inherit", {"creator": result, "other_node": seen})
+    other, own = int(c.config["other_gid"]), int(c.config["gid"])
+    assert result["file"] == other and result["dir"] == other and result["dir_sgid"], result
+    assert result["plain"] == own and result["uid"] == int(c.config["uid"]), result
+    assert seen == [other, other], seen
+
+
 def statfs_reports_the_local_disk(c):
     """#26: statfs reports the Node's own chunk-store disk, not cluster capacity."""
     data = c.role_dir("A") + "/state"
@@ -603,6 +629,7 @@ CASES = tuple(
         unsupported_ioctls,
         timestamps,
         ownership_and_privilege_bits,
+        setgid_directory_gives_new_files_its_group,
         statfs_reports_the_local_disk,
         supplementary_group_members_can_change_a_group_writable_directory,
         truncate_extends_with_zeros,

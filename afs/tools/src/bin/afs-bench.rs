@@ -2435,6 +2435,7 @@ const COST_METRICS: &[(&str, &str)] = &[
     ("node", "afs_dfs_read_copy_bytes_total"),
     ("node", "afs_dfs_inode_lock_contended_total"),
     ("node", "afs_dfs_inode_lock_wait_nanoseconds_total"),
+    ("node", "afs_dfs_reader_references_total"),
 ];
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -2479,6 +2480,12 @@ impl CostSnapshot {
                     .0
                     .entry(format!("{name}{{method={method}}}"))
                     .or_default() += value;
+            }
+            // Open pins by kind (round 2 C-1): soft (Meta memory) or durable.
+            if name == "afs_dfs_reader_references_total"
+                && let Some(kind) = label_value(line, "kind")
+            {
+                *self.0.entry(format!("{name}{{kind={kind}}}")).or_default() += value;
             }
         }
     }
@@ -2560,7 +2567,17 @@ mod tests {
              afs_meta_wal_records_total 7\n\
              afs_meta_revision 99\n",
         );
-        snapshot.absorb("node", "afs_dfs_write_buffer_input_copy_bytes_total 4096\n");
+        snapshot.absorb(
+            "node",
+            "afs_dfs_write_buffer_input_copy_bytes_total 4096\n\
+             afs_dfs_reader_references_total{kind=\"soft\"} 5\n\
+             afs_dfs_reader_references_total{kind=\"durable\"} 2\n",
+        );
+        assert_eq!(
+            snapshot.0["afs_dfs_reader_references_total{kind=soft}"],
+            5.0
+        );
+        assert_eq!(snapshot.0["afs_dfs_reader_references_total"], 7.0);
         // Node metrics under a Meta source are ignored, and vice versa.
         snapshot.absorb("node", "afs_meta_wal_records_total 100\n");
         assert_eq!(snapshot.0["afs_meta_rpc_requests_total"], 4.0);

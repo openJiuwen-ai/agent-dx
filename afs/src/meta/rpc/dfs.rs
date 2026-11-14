@@ -66,6 +66,122 @@ impl DfsMetaService for DfsMetaRpc {
             afs_protocol::meta::ReleaseDfsGcReferencesReply {},
         ))
     }
+    async fn retain_reader(
+        &self,
+        request: Request<afs_protocol::meta::RetainDfsReaderRequest>,
+    ) -> Result<Response<afs_protocol::meta::RetainDfsReaderReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.node_id)?;
+        require_text(&request.inode_id, "inode_id")?;
+        let version = optional_id(request.version_id).map(crate::dfs::FileVersionId::new);
+        let meta_term = dfs_service(&self.0)?
+            .retain_reader(
+                &request.node_id,
+                &request.session_id,
+                request.reader,
+                &crate::dfs::InodeId::new(request.inode_id),
+                version.as_ref(),
+            )
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        self.0
+            .observability
+            .record("meta", "dfs_reader_retain", true);
+        Ok(Response::new(afs_protocol::meta::RetainDfsReaderReply {
+            meta_term,
+        }))
+    }
+    async fn release_readers(
+        &self,
+        request: Request<afs_protocol::meta::ReleaseDfsReadersRequest>,
+    ) -> Result<Response<afs_protocol::meta::ReleaseDfsReadersReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.node_id)?;
+        dfs_service(&self.0)?
+            .release_readers(&request.node_id, &request.session_id, &request.readers)
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        self.0
+            .observability
+            .record("meta", "dfs_reader_release", true);
+        Ok(Response::new(afs_protocol::meta::ReleaseDfsReadersReply {}))
+    }
+    async fn report_readers(
+        &self,
+        request: Request<afs_protocol::meta::ReportDfsReadersRequest>,
+    ) -> Result<Response<afs_protocol::meta::ReportDfsReadersReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.node_id)?;
+        let entries = request
+            .readers
+            .into_iter()
+            .map(|entry| {
+                require_text(&entry.inode_id, "readers.inode_id")?;
+                Ok(crate::meta::dfs::ReaderEntry {
+                    reader: entry.reader,
+                    inode_id: crate::dfs::InodeId::new(entry.inode_id),
+                    version_id: optional_id(entry.version_id).map(crate::dfs::FileVersionId::new),
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let meta_term = dfs_service(&self.0)?
+            .report_readers(
+                &request.node_id,
+                &request.session_id,
+                request.meta_term,
+                request.low_watermark,
+                entries,
+            )
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        self.0
+            .observability
+            .record("meta", "dfs_reader_report", true);
+        Ok(Response::new(afs_protocol::meta::ReportDfsReadersReply {
+            meta_term,
+        }))
+    }
+    async fn open_file_read(
+        &self,
+        request: Request<afs_protocol::meta::DfsOpenFileReadRequest>,
+    ) -> Result<Response<afs_protocol::meta::DfsOpenFileReadReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.node_id)?;
+        require_text(&request.inode_id, "inode_id")?;
+        let name = if request.name_check {
+            require_text(&request.namespace_id, "namespace_id")?;
+            require_text(&request.parent_inode_id, "parent_inode_id")?;
+            Some((
+                crate::dfs::NamespaceId::new(request.namespace_id),
+                crate::dfs::InodeId::new(request.parent_inode_id),
+                request.name,
+            ))
+        } else {
+            None
+        };
+        let opened = dfs_service(&self.0)?
+            .open_file_read(crate::meta::dfs::OpenFileRead {
+                node_id: request.node_id,
+                session_id: request.session_id,
+                reader: request.reader,
+                inode_id: crate::dfs::InodeId::new(request.inode_id),
+                name,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        self.0
+            .observability
+            .record("meta", "dfs_open_file_read", true);
+        Ok(Response::new(afs_protocol::meta::DfsOpenFileReadReply {
+            inode: opened.inode.map(wire_dfs_inode),
+            registered: opened.registered,
+            meta_term: opened.meta_term,
+            writer_elsewhere: opened.writer_elsewhere,
+        }))
+    }
     async fn collect_garbage(
         &self,
         request: Request<afs_protocol::meta::CollectDfsGarbageRequest>,
@@ -137,22 +253,34 @@ impl DfsMetaService for DfsMetaRpc {
         let attributes = request
             .attributes
             .ok_or_else(|| invalid("DFS create requires attributes"))?;
-        let (inode, lease) = dfs_service(&self.0)?
-            .create(CreateFileRequest {
-                caller_id: request.caller_id,
-                owner_session_id: request.owner_session_id,
-                operation_id: crate::dfs::OperationId::new(request.operation_id),
-                namespace_id: crate::dfs::NamespaceId::new(request.namespace_id),
-                parent_inode_id: crate::dfs::InodeId::new(request.parent_inode_id),
-                name: request.name,
-                attributes: domain_dfs_attributes(attributes),
-                lease_seconds: request.lease_seconds,
-            })
+        let caller = request
+            .caller
+            .ok_or_else(|| invalid("DFS create requires caller context"))?;
+        let (inode, lease, meta_term) = dfs_service(&self.0)?
+            .create_registered(
+                CreateFileRequest {
+                    caller_id: request.caller_id,
+                    owner_session_id: request.owner_session_id,
+                    operation_id: crate::dfs::OperationId::new(request.operation_id),
+                    namespace_id: crate::dfs::NamespaceId::new(request.namespace_id),
+                    parent_inode_id: crate::dfs::InodeId::new(request.parent_inode_id),
+                    name: request.name,
+                    attributes: domain_dfs_attributes(attributes),
+                    lease_seconds: request.lease_seconds,
+                    first_generation: request
+                        .first_generation_operation_id
+                        .map(crate::dfs::OperationId::new),
+                    caller: domain_caller_context(caller),
+                },
+                request.reader,
+            )
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(DfsCreateReply {
             inode: Some(wire_dfs_inode(inode)),
             write_lease: Some(wire_dfs_write_lease(lease)),
+            reader_registered: meta_term.is_some(),
+            meta_term: meta_term.unwrap_or_default(),
         }))
     }
 
@@ -808,6 +936,38 @@ impl DfsMetaService for DfsMetaRpc {
         Ok(Response::new(DfsWriteLeaseReply {
             write_lease: Some(wire_dfs_write_lease(lease)),
         }))
+    }
+
+    async fn release_write_leases(
+        &self,
+        request: Request<afs_protocol::meta::ReleaseDfsWriteLeasesRequest>,
+    ) -> Result<Response<afs_protocol::meta::ReleaseDfsWriteLeasesReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        require_text(&request.owner_session_id, "owner_session_id")?;
+        require_text(&request.operation_id, "operation_id")?;
+        let released = dfs_service(&self.0)?
+            .release_write_leases(
+                request.caller_id,
+                request.owner_session_id,
+                crate::dfs::OperationId::new(request.operation_id),
+                request
+                    .leases
+                    .into_iter()
+                    .map(domain_dfs_write_lease)
+                    .collect(),
+            )
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        self.0
+            .observability
+            .record("meta", "dfs_release_write_leases", true);
+        Ok(Response::new(
+            afs_protocol::meta::ReleaseDfsWriteLeasesReply {
+                released: released as u64,
+            },
+        ))
     }
 
     async fn get_inode(

@@ -302,7 +302,7 @@ Running 的认领过期后可被再次认领（调用方核对工人会话）。
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Head: Create（同事务登记句柄的 open: 引用）
+    [*] --> Head: Create（句柄在 Meta 内存登记为读者；Node 未上报读者时回可重试错误）
     Head --> Head: CommitFileVersion：租约与 epoch 校验，<br/>head／revision CAS，parent_version = 旧 head<br/>（meta/dfs/commit.rs）
     Head --> Pinned: 新版本提交后，旧版本仍被某个引用的 pinned_version 命名
     Head --> Unreachable: 新版本提交后无人命名
@@ -312,7 +312,9 @@ stateDiagram-v2
 
 `InodeRecord.head_version` 指向当前版本；`FileVersion{parent_version, length, layout_root}` 只记血缘，不作为保留理由。
 写租约（`WriteLease{owner_node_id, owner_session_id, lease_epoch, expires_at}`）由 `meta/dfs/write_lease.rs` 授予：
-别人持有有效租约时冲突；换主或过期时 `lease_epoch` 加一；同主续期取较晚到期。提交还要求写代引用 `write:<代>`
+别人持有有效租约时返回对方的租约（调用方走代理）；换主或过期时 `lease_epoch` 加一；同主续期取较晚到期。
+取得租约的事务以"租约实体未变"为条件；条件失败时（GC 删掉了过期租约，或别的节点先取得）重新解析，至多 16 次，
+重读到别人的有效租约就返回它，耗尽才报 `META_DFS_CONFLICT`。过期的租约实体会被 GC 删除，删除后再取得的租约 epoch 从 1 起。提交还要求写代引用 `write:<代>`
 属于写者当前会话（写代 fence）。
 
 ### GC 引用与回收代
@@ -497,13 +499,20 @@ Bao sidecar、Peer cache 条目与目录标记、外部对象 key 前缀、Owner
   内层完整解码之前检查。
 - **改编码必升版本**：字段或变体增删改序、serde 属性、postcard 升级、hash 域串变化，都必须同时升
   对应版本并重新生成 golden；变体下标表（G1）与 golden bytes（G2）在编码变化时失败。没有版本字段的
-  `catalog.wal` 与请求摘要只由 golden 钉住。
+  `catalog.wal` 与请求摘要只由 golden 钉住。请求摘要当前为 2（加入 setattr 请求与 create 的首个写代）；
+  它不改变升级前已落盘的记录：摘要只在同一 operation id 重试时比对，而 operation id 带 Node 的 session，
+  停机升级后所有 Node 都是新 session，旧记录不会再被重放比对。
 - **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
 - **协议**：`RegisterNodeRequest.protocol_version` 是集群线协议代际（Node↔Meta 注册、Node↔Node service
-  布局），当前为 7（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
+  布局），当前为 8（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本，8 为元数据复合操作：setattr 可不带客户端 revision、create 并入首个写代引用、复合打开），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
+- **协议 8 已提供、Node 尚未调用的 RPC**：`DfsMeta.ReleaseWriteLeases`（`meta/dfs/lease_release.rs`）按批归还写租约。
+  只归还与 Node 出示的副本完全相同的租约：把到期时间改为当前，epoch 不变，下次取得时 epoch 加一（过期实体已被 GC 删除时从 1 起，与自然过期相同）；
+  不再相同的租约跳过、算成功。整批是一个事务，按 operation id 重放。
+  结果记在 `DfsRenewWriteLease` 操作下（归还即"续到现在"），所以 WAL 与 checkpoint 编码不变。
+  Node 侧在最后一个写者关闭时调用它，是以后的事（R106），届时不需要升协议。
 
 ### OwnerFs Root 授权的代际与回收
 
@@ -1367,11 +1376,27 @@ Coordinator 挂载同一 namespace，统一管理共享文件的回收；节点�
 
 **哪些版本可达**（R81 F2）：inode 的 nlink 大于 0、或有未退休（或仍在宽限期内）的 GC 引用、或写租约未过期时，
 保留 inode 和它的 head；每个引用另外保留它记录的那一个版本（`GcReference.pinned_version`）：读句柄是打开时固定的
-版本，写代是这一代开始时的基线版本；Create 事务里建的句柄引用、目录引用不记版本，只保 head。没有被任何一条命名的旧版本，
+版本，写代是这一代开始时的基线版本；Create 打开的句柄（在 Create 处理里先于事务登记为内存读者）、目录引用不记版本，只保 head。没有被任何一条命名的旧版本，
 即使文件仍打开也会回收，它与保留版本共享的 chunk 由可达性保留。Node 按（inode，版本）共享 `open:` 引用。
 
 这一字段随 `META_RECORD_DECISION` 2、`META_STATE_IMAGE` 3 引入，旧数据目录按格式规则拒绝（`STORAGE_FORMAT_INCOMPATIBLE`），
 不会把旧引用当成“什么都不保护”。
+
+**读者登记在 Meta 内存里**（第 2 轮 C-1，协议 8，`meta/dfs/readers.rs`、`node/gc/references.rs`）：`open:` 固定不写日志。
+- **登记**：Meta 先把（会话、读者号 c、inode、版本）放进内存读者表，**之后**才取校验视图；只有该版本在这个视图里
+  仍是 inode 的 head 且 nlink 大于 0，登记才保留。否则回 `META_DFS_READER_NOT_HEAD`，Node 改用持久的
+  `UpdateGcReference`，例如已 unlink 的 inode 经 `/proc/self/fd` 重开、或 head 已前移的版本。
+  读打开与目录打开把解析、名字校验和这次登记合成一次 `OpenFileRead`。
+- **GC**：GC 把表里的条目当作活引用；提交前在提交循环里复核，有规划之后登记、落在整个计划受保护 inode 上的条目时，
+  计划作废。离开的会话的条目保留到 `max(deadline, now) + dfs_gc_grace_ms`。
+- **Meta 重启**：表随进程丢失。Meta 不是日志的第一个写者（writer term 大于 1）时，GC 先不删任何 inode 与版本，
+  只回收孤儿块，直到每个可能还在读的会话都向本 term 上报过读者（`ReportReaders`）或已过期。
+- **Node 侧**：
+  - 回复带 Meta 的 writer term，Node 丢弃 term 低于已见最大值的登记回复；
+  - 每个回收周期释放已关闭的读者，并上报全部活跃读者，包括编号高于低水位的条目，以便 Meta 重启后完整恢复；
+    低水位只限制删除范围：仅删除编号不超过低水位且本次未上报的条目，保留状态尚未确定的在途登记；
+  - 指标 `afs_dfs_reader_references_total{kind=soft|durable}`（Node）、`afs_meta_dfs_reader_registrations`、
+    `afs_meta_dfs_gc_reader_gate_closed`（Meta）。
 
 **读路径选中的版本都有引用**（决策 4a，R94）：凡是读路径能选中的已提交版本，以及在途读正在用的版本，都由 GC 引用
 保护到使用结束；写句柄仍打开、写租约看似有效都不算保护（租约可能在写者打开期间失效，本机下一次提交也会让上一个
@@ -1438,9 +1463,10 @@ inode、FileVersion、LayoutRoot 与数据块，两层职责不混用。
 - Node 删除块和校验旁文件，持久化 catalog 检查点及已完成代次后应答；重启或应答丢失重试不重复
   删除新上传的同内容块。catalog WAL 随检查点截断。Node 清单还会发现无主上传残留。
 
-一个计划分批提交：每批至多 4096 个 key，一次回收调用至多 16 批；每代至多 512 个 chunk，有积压时约每秒一代。chunk 与它的 placement、copy、task 同批删除；其余实体都从活根不可达，删去任何子集都不改变活数据，崩溃后重新规划即可继续。提交被容量拒绝时批大小减半，到 64 仍被拒才报错。回收停滞看 `afs_meta_dfs_gc_stalled_seconds`、`afs_meta_dfs_gc_dead_keys`、`afs_meta_dfs_gc_rejected_batches_total` 与日志 `dfs.gc_stalled`。Node 每 5 秒推进。引用释放不限速：一次 `ReleaseGcReferences` 调用在
-一个事务内退休至多 1024 个引用，每次回收调用先排空释放队列，队列积压到 256 个时唤醒回收循环只
-做释放；积压到 65536 个时，新建引用先排空队列，Meta 不接受释放就连新引用一起失败，队列因此有
+一个计划分批提交：每批至多 4096 个 key，一次回收调用至多 16 批；每代至多 512 个 chunk，有积压时约每秒一代。chunk 与它的 placement、copy、task 同批删除；其余实体都从活根不可达，删去任何子集都不改变活数据，崩溃后重新规划即可继续。提交被容量拒绝时批大小减半，到 64 仍被拒才报错。回收停滞看 `afs_meta_dfs_gc_stalled_seconds`、`afs_meta_dfs_gc_dead_keys`、`afs_meta_dfs_gc_rejected_batches_total` 与日志 `dfs.gc_stalled`。Node 每 5 秒推进。引用释放：一次 `ReleaseGcReferences` 调用在
+一个事务内退休至多 1024 个引用。每次回收调用先释放**调用开始时**已在队列里的引用，并向 Meta 对账一次软读者；
+队列积压到 256 个时唤醒回收循环，每次唤醒只发一批，不追着释放期间新进来的引用发，否则文件不断关闭时
+每两三个文件就多一个释放事务。积压到 65536 个时，新建引用先排空队列，Meta 不接受释放就连新引用一起失败，队列因此有
 界。不可达 Node 会保守阻塞当前物理删除批次，不以心跳失联推定磁盘已清空。外部对象（S3）模式一代只等一个删除者（存活
 存储 Node 中 id 最小的）：它失联后被移出等待集合，剩余对象由列举对账找回；它仍注册却 120 秒没有完成（例如对象存储挂起），
 下一个调用回收的存活 Node 接过这一代并删除同一批对象（重复删除无害，日志 `dfs.gc_deleter_handoff`，计入

@@ -168,6 +168,8 @@ fn cases() -> Vec<(&'static str, String, String)> {
                 name: b"file".to_vec(),
                 attributes: attributes(),
                 lease_seconds: 30,
+                first_generation: None,
+                caller: caller(),
             },
         ),
         case(
@@ -295,14 +297,50 @@ fn cases() -> Vec<(&'static str, String, String)> {
                 }),
             ),
         ),
+        case(
+            "create_with_first_generation",
+            &CreateFileRequest {
+                caller_id: "node-a".into(),
+                owner_session_id: "session-a".into(),
+                operation_id: OperationId::new("op"),
+                namespace_id: NamespaceId::new("ns"),
+                parent_inode_id: InodeId::new("1"),
+                name: b"file".to_vec(),
+                attributes: attributes(),
+                lease_seconds: 30,
+                first_generation: Some(OperationId::new("afs1-1-session-a-native-generation-1")),
+                caller: caller(),
+            },
+        ),
+        case("set_inode_attributes_current", &set_attributes(None)),
+        case("set_inode_attributes_compare", &set_attributes(Some(6))),
     ]
+}
+
+fn set_attributes(expected_inode_revision: Option<u64>) -> SetInodeAttrRequest {
+    SetInodeAttrRequest {
+        caller_id: "node-a".into(),
+        operation_id: OperationId::new("op"),
+        caller: caller(),
+        inode_id: InodeId::new("inode"),
+        expected_inode_revision,
+        update: crate::dfs::InodeAttrUpdate {
+            mode: Some(0o100600),
+            uid: None,
+            gid: Some(1001),
+            atime_unix_ms: Some(11),
+            mtime_unix_ms: Some(12),
+            ctime_unix_ms: Some(13),
+            timestamps_now: false,
+        },
+    }
 }
 
 const GOLDEN: &[(&str, &str, &str)] = &[
     (
         "create",
-        r#"{"caller_id":"node-a","owner_session_id":"session-a","operation_id":"op","namespace_id":"ns","parent_inode_id":"1","name":[102,105,108,101],"attributes":{"mode":33188,"uid":1000,"gid":1001,"nlink":1,"atime_unix_ms":11,"mtime_unix_ms":12,"ctime_unix_ms":13},"lease_seconds":30}"#,
-        "da0f3d62ec19e3adbea045e87d1ecc510f3e40b6337601c68ff62908774b9978",
+        r#"{"caller_id":"node-a","owner_session_id":"session-a","operation_id":"op","namespace_id":"ns","parent_inode_id":"1","name":[102,105,108,101],"attributes":{"mode":33188,"uid":1000,"gid":1001,"nlink":1,"atime_unix_ms":11,"mtime_unix_ms":12,"ctime_unix_ms":13},"lease_seconds":30,"first_generation":null,"caller":{"uid":1000,"gid":1001,"supplementary_gids":[10,20]}}"#,
+        "36e4c542a1412635571ccc6630a6e0e5c1af95f92c1324fc777c5a9c454bd3e0",
     ),
     (
         "mkdir",
@@ -358,6 +396,21 @@ const GOLDEN: &[(&str, &str, &str)] = &[
         "commit_with_generation_fence_and_clone",
         r#"{"gc_fence":"WriteGeneration","operation_id":"op","inode_id":"inode","write_lease":{"inode_id":"inode","owner_node_id":"node-a","owner_session_id":"session-a","lease_epoch":2,"expires_at_unix_ms":99},"expected_inode_revision":6,"expected_head_version":"v0","file_version":{"id":"v1","inode_id":"inode","parent_version":"v0","length":42,"layout_root":"layout","created_at_unix_ms":8},"layout_root":{"id":"layout","file_length":42,"inline_extents":[{"file_offset":0,"length":42,"chunk_id":"blake3-abababababababababababababababababababababababababababababababab-42","chunk_offset":0}]},"chunk_receipts":[{"operation_id":"op","chunk":{"id":"blake3-abababababababababababababababababababababababababababababababab-42","length":42,"content_digest":{"algorithm":"Blake3","bytes":[171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171]},"encoding":"Raw"},"placement_revision":7,"placement_epoch":3,"replica_group_id":"group","durable_acks":[{"operation_id":"op","chunk_id":"blake3-abababababababababababababababababababababababababababababababab-42","placement_revision":7,"placement_epoch":3,"node_id":"node-a","node_epoch":2,"device_id":"dev-a","device_epoch":4,"catalog_revision":5,"persisted_bytes":42,"verified_digest":{"algorithm":"Blake3","bytes":[171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171]}}]}],"clone_source":{"version":"source","source_offset":1,"destination_offset":2,"length":3},"metadata_delta":{"mode":"Full","mtime_unix_ms":12,"ctime_unix_ms":13,"kill_suidgid":true}}"#,
         "739958aee8058c6c338e96a3914fc7ff32db90e4a3db6b184fd097f8a7739e13",
+    ),
+    (
+        "create_with_first_generation",
+        r#"{"caller_id":"node-a","owner_session_id":"session-a","operation_id":"op","namespace_id":"ns","parent_inode_id":"1","name":[102,105,108,101],"attributes":{"mode":33188,"uid":1000,"gid":1001,"nlink":1,"atime_unix_ms":11,"mtime_unix_ms":12,"ctime_unix_ms":13},"lease_seconds":30,"first_generation":"afs1-1-session-a-native-generation-1","caller":{"uid":1000,"gid":1001,"supplementary_gids":[10,20]}}"#,
+        "65dd159353673cd28b7d45ca4680bdccb4f8df6200111239e4ac20874618a785",
+    ),
+    (
+        "set_inode_attributes_current",
+        r#"{"caller_id":"node-a","operation_id":"op","caller":{"uid":1000,"gid":1001,"supplementary_gids":[10,20]},"inode_id":"inode","expected_inode_revision":null,"update":{"mode":33152,"uid":null,"gid":1001,"atime_unix_ms":11,"mtime_unix_ms":12,"ctime_unix_ms":13,"timestamps_now":false}}"#,
+        "b9460d0ce1e9d93d06f2eec72bff4d0310748bdae6a8d8f29f8a366ee263dafd",
+    ),
+    (
+        "set_inode_attributes_compare",
+        r#"{"caller_id":"node-a","operation_id":"op","caller":{"uid":1000,"gid":1001,"supplementary_gids":[10,20]},"inode_id":"inode","expected_inode_revision":6,"update":{"mode":33152,"uid":null,"gid":1001,"atime_unix_ms":11,"mtime_unix_ms":12,"ctime_unix_ms":13,"timestamps_now":false}}"#,
+        "e21e44a25f130983402035835b5a95e637c085ea182aff3723cfabc4f9e84b9c",
     ),
 ];
 

@@ -7,6 +7,18 @@ pub struct DfsNodeLocation {
     pub data_endpoint: String,
 }
 
+/// Round 2 B2: what one `OpenFileRead` call answers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenedForRead {
+    /// `None`: the checked name no longer names the inode.
+    pub inode: Option<InodeRecord>,
+    /// Meta registered the inode's head as the reader the call named.
+    pub registered: bool,
+    pub meta_term: u64,
+    /// Another session holds a live write lease on the inode (D-R3-2 ③).
+    pub writer_elsewhere: bool,
+}
+
 pub trait DfsRemoteOwnerFactory: Send + Sync {
     fn connect(&self, location: DfsNodeLocation) -> Result<Arc<dyn RemoteDfsOwner>>;
 }
@@ -16,14 +28,66 @@ pub trait DfsRemoteOwnerFactory: Send + Sync {
 /// it; implementations that block read that scope on the calling thread.
 pub trait DfsMeta: Send + Sync {
     fn lookup(&self, parent: &InodeId, name: &[u8]) -> Result<Option<InodeRecord>>;
+    /// `first_generation`: admit this write generation's `write:` reference in
+    /// the same transaction (round 2 B1).
     fn create(
         &self,
         operation_id: &OperationId,
         parent: &InodeId,
         name: &[u8],
         attributes: InodeAttributes,
+        first_generation: Option<&OperationId>,
+        caller: CallerContext,
     ) -> Result<(InodeRecord, WriteLease)>;
+    /// `create` with the opened handle registered as in-memory reader
+    /// `reader` (round 2 C-1). The third value is the Meta writer term when
+    /// Meta registered it; `None`: the caller pins the handle itself. The
+    /// default registers nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn create_registered(
+        &self,
+        operation_id: &OperationId,
+        parent: &InodeId,
+        name: &[u8],
+        attributes: InodeAttributes,
+        first_generation: Option<&OperationId>,
+        _reader: Option<u64>,
+        caller: CallerContext,
+    ) -> Result<(InodeRecord, WriteLease, Option<u64>)> {
+        self.create(
+            operation_id,
+            parent,
+            name,
+            attributes,
+            first_generation,
+            caller,
+        )
+        .map(|(inode, lease)| (inode, lease, None))
+    }
     fn get_inode(&self, inode_id: &InodeId) -> Result<InodeRecord>;
+    /// Round 2 B2: resolve `inode_id` for a read open (checking that
+    /// `name` still names it), register reader `reader` of its head and
+    /// learn whether another session writes it, in one call. The default is
+    /// today's resolution with nothing registered.
+    fn open_file_read(
+        &self,
+        _reader: u64,
+        inode_id: &InodeId,
+        name: Option<(&InodeId, &[u8])>,
+    ) -> Result<OpenedForRead> {
+        let inode = match name {
+            Some((parent, name)) => self
+                .lookup(parent, name)?
+                .filter(|record| record.inode_id == *inode_id),
+            None => Some(self.get_inode(inode_id)?),
+        };
+        Ok(OpenedForRead {
+            inode,
+            registered: false,
+            meta_term: 0,
+            writer_elsewhere: false,
+        })
+    }
     fn get_file_version(&self, version_id: &FileVersionId) -> Result<(FileVersion, LayoutRoot)>;
     fn get_file_version_async(
         &self,

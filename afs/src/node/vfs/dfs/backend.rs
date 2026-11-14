@@ -275,14 +275,23 @@ impl Backend for DistributedFs {
             || change.mtime.is_some()
             || options.timestamps_now
         {
-            let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
+            // Explicit times replace the write timestamps this Node still
+            // owes Meta, unless a write lands after this point (B5).
+            let explicit_times = change.mtime.is_some() || options.timestamps_now;
+            let observed_seq = if explicit_times {
+                self.visible_write_seq(&inode_id)?
+            } else {
+                None
+            };
+            // Meta applies the change to its current inode and retries a
+            // racing inode update itself (B4): no revision read here.
             let updated = self.refresh_inode_record(
                 self.meta.set_inode_attributes(SetInodeAttrRequest {
                     caller_id: self.identity.node_id.clone(),
                     operation_id: self.identity.operation_id("setattr"),
                     caller: caller_context(ctx),
                     inode_id: inode_id.clone(),
-                    expected_inode_revision: current.revision,
+                    expected_inode_revision: None,
                     update: InodeAttrUpdate {
                         mode: change.mode,
                         uid: change.uid,
@@ -296,6 +305,9 @@ impl Backend for DistributedFs {
                 change.atime.is_none() && !options.timestamps_now,
                 change.mtime.is_none() && !options.timestamps_now,
             )?;
+            if let Some(observed_seq) = observed_seq {
+                self.supersede_owed_timestamps(&inode_id, observed_seq)?;
+            }
             if change.size.is_none() {
                 if killpriv_setattr {
                     self.commit_inode(
@@ -436,34 +448,105 @@ impl Backend for DistributedFs {
             mode
         };
         let operation_id = self.identity.operation_id("create");
-        // Dropped on any failure below, which queues its release: the reply may
-        // be lost after Meta already admitted the reference.
-        let gc_pin = self
+        // Round 2 C-1: the handle this create opens is registered in Meta's
+        // memory with the create (reader `reader`), not as a durable
+        // `open:create-` reference that must be released with a log record.
+        let reader = match &self.gc.references {
+            Some(references) => references.begin_reader()?,
+            None => None,
+        };
+        // Without soft registration: the durable reference Meta admits inside
+        // the Create transaction. Dropped on any failure below, which queues
+        // its release: the reply may be lost after Meta already admitted it.
+        let durable_pin = self
             .gc
             .references
             .as_ref()
+            .filter(|_| reader.is_none())
             .map(|references| references.created_handle_pin(&operation_id));
-        let (inode, write_lease) = self.meta.create(
-            &operation_id,
-            &self.inode_id(parent)?,
-            name.as_encoded_bytes(),
-            InodeAttributes {
-                mode,
-                uid: ctx.uid,
-                gid: ctx.gid,
-                nlink: 1,
-                atime_unix_ms: now,
-                mtime_unix_ms: now,
-                ctime_unix_ms: now,
-            },
-        )?;
+        // B1: the first write generation of the new file is admitted with it
+        // (native write pipeline only; proxy and S3 writers keep their own
+        // admission). Built first for the same reason as `gc_pin`.
+        #[cfg(test)]
+        let create_generation = !self
+            .hooks
+            .create_admits_no_generation
+            .load(Ordering::SeqCst);
+        #[cfg(not(test))]
+        let create_generation = true;
+        let first_generation = match (&self.gc.references, &self.write_resources.pipeline) {
+            (Some(references), Some(_)) if create_generation => {
+                let generation = self.identity.operation_id("native-generation");
+                let pin = references.admitted_generation_pin(&generation);
+                Some((generation, pin))
+            }
+            _ => None,
+        };
+        let parent_id = self.inode_id(parent)?;
+        let attributes_of = InodeAttributes {
+            mode,
+            uid: ctx.uid,
+            gid: ctx.gid,
+            nlink: 1,
+            atime_unix_ms: now,
+            mtime_unix_ms: now,
+            ctime_unix_ms: now,
+        };
+        let create = || {
+            self.meta.create_registered(
+                &operation_id,
+                &parent_id,
+                name.as_encoded_bytes(),
+                attributes_of.clone(),
+                first_generation.as_ref().map(|(generation, _)| generation),
+                reader,
+                caller_context(ctx),
+            )
+        };
+        let created = match create() {
+            Err(error) if error.code() == afs_error::META_DFS_SESSION_NOT_REPORTED => {
+                // This Meta has not heard from this session yet: report, then
+                // retry the same create (same operation id).
+                match self.gc.references.as_ref().map(|r| r.report_readers()) {
+                    Some(Err(report)) => Err(report),
+                    _ => create(),
+                }
+            }
+            created => created,
+        };
+        let (inode, write_lease, registered) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                if let (Some(references), Some(reader)) = (&self.gc.references, reader) {
+                    // A lost reply leaves at most a stale registration, which
+                    // the next report removes.
+                    references.finish_reader(reader, None)?;
+                }
+                return Err(error);
+            }
+        };
         let inode = self.validate_inode(inode)?;
+        let gc_pin = match (&self.gc.references, reader) {
+            (Some(references), Some(reader)) => {
+                match references
+                    .finish_reader(reader, registered.map(|term| (term, &inode.inode_id, None)))?
+                {
+                    Some(pin) => Some(pin),
+                    // Not registered (or by a replaced Meta): pin it now.
+                    None => Some(references.pin(&inode.inode_id, None)?),
+                }
+            }
+            _ => durable_pin,
+        };
         self.recent_names.record(
             &inode.inode_id,
             &self.inode_id(parent)?,
             name.as_encoded_bytes(),
         );
         self.install_write_state(inode.clone(), write_lease)?;
+        if let Some(prepared) = first_generation {
+            self.prepare_first_generation(&inode.inode_id, prepared)?;
+        }
         let session = self.open_write_session(&inode, flags)?;
         let handle = self.allocate_handle(DfsFileHandle {
             gc_pin,
@@ -544,7 +627,18 @@ impl Backend for DistributedFs {
         } else {
             None
         };
-        let preflight = self.validate_inode(self.open_preflight(&inode_id, ctx.pid)?)?;
+        let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
+        // B2, and the preflight half of B3: one Meta call resolves the
+        // inode and registers its head as this handle's reader (C-1). A
+        // write open then resolves its authority; if that view's head
+        // differs, the handle pins its own below.
+        // D-R3-2 ③ is not acted on yet: Meta's `writer_elsewhere` counts a
+        // write lease until it expires (up to 30 s after the last writer
+        // closed; Nodes do not hand leases back), so bypassing the page
+        // cache on it would also slow every read after another Node's write.
+        let (preflight, read_pin, _writer_elsewhere) =
+            self.open_preflight_for_read(&inode_id, ctx.pid)?;
+        let preflight = self.validate_inode(preflight)?;
         if matches!(preflight.kind, InodeKind::Special(_)) {
             return Err(Error::coded(
                 afs_error::IO_NOT_SUPPORTED,
@@ -556,7 +650,6 @@ impl Backend for DistributedFs {
         {
             return Err(invalid("immutable-origin files only allow read opens"));
         }
-        let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
         let (opened_inode, write_session) = if writable {
             let (inode, write_lease) = self.meta.resolve_write_authority(&inode_id)?;
             let inode = self.validate_inode(inode)?;
@@ -636,9 +729,14 @@ impl Backend for DistributedFs {
             // period; it only needs the authority to have held (R75).
             self.check_native_read_view_for_delivery(view)?;
         }
+        // The registration made with the preflight protects the head Meta
+        // saw; a handle that ends up on another version pins its own.
+        let gc_pin = read_pin.filter(|pin| {
+            pin.opened() == Some((&opened_inode.inode_id, opened_inode.head_version.as_ref()))
+        });
         self.allocate_handle(DfsFileHandle {
             origin_fill: false,
-            gc_pin: None,
+            gc_pin,
             inode_id: opened_inode.inode_id.clone(),
             opened_inode,
             opened_page_identity,
@@ -1090,7 +1188,9 @@ impl Backend for DistributedFs {
 
     fn opendir(&self, ctx: &RequestContext, inode: BackendInode) -> Result<DirectoryHandle> {
         let inode_id = self.inode_id(inode)?;
-        let record = self.validate_inode(self.open_preflight(&inode_id, ctx.pid)?)?;
+        // B8: the preflight registers the directory as a reader (C-1).
+        let (record, registered, _) = self.open_preflight_for_read(&inode_id, ctx.pid)?;
+        let record = self.validate_inode(record)?;
         if record.kind != InodeKind::Directory {
             return Err(Error::from(std::io::Error::from(
                 std::io::ErrorKind::NotADirectory,
@@ -1098,12 +1198,15 @@ impl Backend for DistributedFs {
         }
         let id = self.handles.next_id();
         let directory = DfsDirectoryHandle {
-            _gc_pin: self
-                .gc
-                .references
-                .as_ref()
-                .map(|references| references.pin(&inode_id, None))
-                .transpose()?,
+            _gc_pin: match registered.filter(|pin| pin.opened() == Some((&inode_id, None))) {
+                Some(pin) => Some(pin),
+                None => self
+                    .gc
+                    .references
+                    .as_ref()
+                    .map(|references| references.pin(&inode_id, None))
+                    .transpose()?,
+            },
             inode_id,
             entries: Vec::new(),
             last_name: Vec::new(),

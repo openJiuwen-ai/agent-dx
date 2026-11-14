@@ -25,6 +25,28 @@ impl DfsService {
     }
 
     pub async fn create(&self, request: CreateFileRequest) -> Result<(InodeRecord, WriteLease)> {
+        self.create_registered(request, None)
+            .await
+            .map(|(inode, lease, _)| (inode, lease))
+    }
+
+    /// `create`, with the handle it opens registered as in-memory reader
+    /// `reader` of the new inode (round 2 C-1) instead of a durable
+    /// `open:create-` reference in the Create transaction. Returns the Meta
+    /// writer term when the reader is registered; `None` asks the Node to pin
+    /// the handle itself (a replay that finds the inode already changed).
+    ///
+    /// Why this is the C-1 registration (design §3.4): the entry `(I, no
+    /// version)` is inserted before the transaction that makes `I` visible,
+    /// so it precedes every view in which `I` exists (L1); `I`'s head in the
+    /// transaction's own state is the empty version and `I` is linked, which
+    /// is exactly what the entry pins (L7). A GC plan that sees `I` read the
+    /// table after the entry was inserted, so the entry is among its inputs.
+    pub async fn create_registered(
+        &self,
+        request: CreateFileRequest,
+        reader: Option<u64>,
+    ) -> Result<(InodeRecord, WriteLease, Option<u64>)> {
         let request_digest = namespace_request_digest(&request)?;
         let CreateFileRequest {
             caller_id,
@@ -33,14 +55,22 @@ impl DfsService {
             namespace_id,
             parent_inode_id,
             name,
-            attributes,
+            mut attributes,
             lease_seconds,
+            first_generation,
+            caller,
         } = request;
         require_id(&caller_id, "caller_id")?;
         require_id(&owner_session_id, "owner_session_id")?;
         require_id(&operation_id.0, "operation_id")?;
         require_id(&namespace_id.0, "namespace_id")?;
         require_id(&parent_inode_id.0, "parent_inode_id")?;
+        if reader.is_some() && !self.readers.is_reported(&caller_id, &owner_session_id) {
+            return Err(afs_error::Error::coded(
+                afs_error::META_DFS_SESSION_NOT_REPORTED,
+                "Node session has not reported its readers to this Meta",
+            ));
+        }
         if let Some((inode, lease)) = self
             .replayed_namespace_inode_and_lease(
                 &caller_id,
@@ -50,9 +80,31 @@ impl DfsService {
             )
             .await?
         {
-            return Ok((inode, lease));
+            // A retry after a lost reply: register as any open would.
+            let term = match reader {
+                Some(reader) => self
+                    .retain_reader(&caller_id, &owner_session_id, reader, &inode.inode_id, None)
+                    .await
+                    .ok(),
+                None => None,
+            };
+            return Ok((inode, lease, term));
         }
         validate_name(&name)?;
+        // The same rules as mkdir, mknod and symlink, checked once, on the
+        // parent as first read and before anything is registered for the new
+        // inode. A retry continues only on a parent whose timestamps and
+        // revision moved (`create_parent_retry_drift_only`); a concurrent
+        // chmod or chown of the parent races with this create as it does
+        // with any other.
+        let parent = self
+            .directory_for_mutation(&namespace_id, &parent_inode_id)
+            .await?;
+        if let Some(parent) = &parent {
+            ensure_directory_create_access(&caller, parent)?;
+        }
+        attributes.uid = caller.uid;
+        attributes.gid = inherited_child_gid(&caller, parent.as_ref());
         let inode = InodeRecord {
             namespace_id: namespace_id.clone(),
             inode_id: namespace_inode_id(&caller_id, &operation_id),
@@ -91,10 +143,78 @@ impl DfsService {
             // A new file has no version yet; its creator reads its own writes.
             pinned_version: None,
         };
+        // B1: the creator's first write generation is admitted with the
+        // file, so its first write needs no admission round trip. Its chunks
+        // reach no GC-visible place before this transaction is durable: the
+        // creator uploads only after the reply.
+        let generation_reference = first_generation
+            .as_ref()
+            .map(|generation| {
+                super::gc::generation_reference_admitted_now(
+                    &caller_id,
+                    &lease.owner_session_id,
+                    &inode.inode_id,
+                    generation,
+                )
+            })
+            .transpose()?;
+        // ② of the registration, before the transaction that creates `I`.
+        let session = lease.owner_session_id.clone();
+        let registered = reader.map(|reader| {
+            let seq = self.readers.insert(
+                &caller_id,
+                &lease.owner_session_id,
+                reader,
+                &inode.inode_id,
+                None,
+            );
+            (reader, seq)
+        });
+        let created = self
+            .create_attempts(
+                caller_id.clone(),
+                &operation_id,
+                request_digest,
+                namespace_id,
+                parent_inode_id,
+                parent,
+                dentry_key,
+                inode,
+                lease,
+                handle_reference,
+                generation_reference,
+                registered.is_some(),
+            )
+            .await;
+        match (created, registered) {
+            (Ok((inode, lease)), registered) => {
+                Ok((inode, lease, registered.map(|_| self.store.writer_term())))
+            }
+            (Err(error), Some((reader, seq))) => {
+                self.readers.remove_if(&caller_id, &session, reader, seq);
+                Err(error)
+            }
+            (Err(error), None) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_attempts(
+        &self,
+        caller_id: String,
+        operation_id: &OperationId,
+        request_digest: [u8; 32],
+        namespace_id: NamespaceId,
+        parent_inode_id: InodeId,
+        mut parent: Option<InodeRecord>,
+        dentry_key: DentryKey,
+        inode: InodeRecord,
+        lease: WriteLease,
+        handle_reference: crate::dfs::GcReference,
+        generation_reference: Option<crate::dfs::GcReference>,
+        soft_handle: bool,
+    ) -> Result<(InodeRecord, WriteLease)> {
         let request = RequestKey::new(caller_id, operation_id.0.clone());
-        let mut parent = self
-            .directory_for_mutation(&namespace_id, &parent_inode_id)
-            .await?;
         let max_attempts = CREATE_PARENT_DRIFT_RETRY_LIMIT;
         for attempt in 0..max_attempts {
             let outcome = RequestOutcome {
@@ -118,16 +238,39 @@ impl DfsService {
                 TxnCondition::Missing(MetaKey::DfsDentry(dentry.key.clone())),
                 TxnCondition::Missing(MetaKey::DfsInode(inode.inode_id.clone())),
                 TxnCondition::Missing(MetaKey::DfsWriteLease(inode.inode_id.clone())),
-                TxnCondition::Missing(crate::meta::store::entity_key(&MetaEntity::DfsReference(
-                    handle_reference.clone(),
-                ))),
             ]);
+            if !soft_handle {
+                txn.conditions
+                    .push(TxnCondition::Missing(crate::meta::store::entity_key(
+                        &MetaEntity::DfsReference(handle_reference.clone()),
+                    )));
+                txn.mutations
+                    .push(TxnMutation::Put(MetaEntity::DfsReference(
+                        handle_reference.clone(),
+                    )));
+            }
             push_parent_namespace_change(&mut txn, parent.clone(), 0);
+            if let Some(reference) = &generation_reference {
+                // Like `update_gc_reference`: only the creator's live session
+                // admits, and an id already used (or tombstoned) is refused.
+                txn.conditions.extend([
+                    TxnCondition::NodeSessionCurrent {
+                        node_id: reference.node_id.clone(),
+                        session_id: reference.session_id.clone(),
+                    },
+                    TxnCondition::Missing(crate::meta::store::entity_key(
+                        &MetaEntity::DfsReference(reference.clone()),
+                    )),
+                ]);
+                txn.mutations
+                    .push(TxnMutation::Put(MetaEntity::DfsReference(
+                        reference.clone(),
+                    )));
+            }
             txn.mutations.extend([
                 TxnMutation::Put(MetaEntity::DfsDentry(dentry)),
                 TxnMutation::Put(MetaEntity::DfsInode(inode.clone())),
                 TxnMutation::Put(MetaEntity::DfsWriteLease(lease.clone())),
-                TxnMutation::Put(MetaEntity::DfsReference(handle_reference.clone())),
                 TxnMutation::RecordRequestOutcome(outcome),
             ]);
             let outcome = validate_namespace_outcome(
@@ -509,7 +652,22 @@ impl DfsService {
         .await
     }
 
+    /// One rename. A commit that lost a race on any inode or dentry it read
+    /// (a commit or metadata sync of the source or the replaced file, a sibling
+    /// change of a parent) is planned again here against the current state,
+    /// rechecking every rule, up to `RENAME_RETRY_LIMIT` attempts (round 2 B6):
+    /// the Node no longer has to resend it.
     pub async fn rename(&self, request: RenameRequest) -> Result<RenameOutcome> {
+        for _ in 0..RENAME_RETRY_LIMIT {
+            if let Some(outcome) = self.rename_attempt(request.clone()).await? {
+                return Ok(outcome);
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(conflict("DFS metadata condition changed during rename"))
+    }
+
+    async fn rename_attempt(&self, request: RenameRequest) -> Result<Option<RenameOutcome>> {
         let request_digest = namespace_request_digest(&request)?;
         let RenameRequest {
             caller_id,
@@ -536,7 +694,7 @@ impl DfsService {
             )
             .await?
         {
-            return Ok(outcome);
+            return Ok(Some(outcome));
         }
         validate_name(&old_name)?;
         validate_name(&new_name)?;
@@ -575,7 +733,8 @@ impl DfsService {
                     source_inode,
                     request_digest,
                 )
-                .await;
+                .await
+                .map(Some);
         }
         if source_inode.kind == InodeKind::Directory
             && directory_is_descendant_or_same(
@@ -613,7 +772,8 @@ impl DfsService {
                             source_inode,
                             request_digest,
                         )
-                        .await;
+                        .await
+                        .map(Some);
                 }
                 RenameTargetRule::Replace {
                     target_inode,
@@ -646,10 +806,18 @@ impl DfsService {
             },
         )
         .await?;
-        rename_outcome(
-            validate_namespace_outcome(self.store.compare_and_commit(txn).await?, request_digest)?,
-            StoreOperation::DfsRename,
-        )
+        match self.store.compare_and_commit(txn).await? {
+            // Lost a race on something it read: plan again (the caller retries).
+            TxnOutcome::ConditionFailed {
+                existing_outcome: None,
+                ..
+            } => Ok(None),
+            outcome => rename_outcome(
+                validate_namespace_outcome(outcome, request_digest)?,
+                StoreOperation::DfsRename,
+            )
+            .map(Some),
+        }
     }
 
     /// Reads both parent directories (old first) and checks create access on
@@ -994,7 +1162,36 @@ impl DfsService {
             .ok_or_else(|| invalid("DFS symlink inode is missing target metadata"))
     }
 
+    /// Applies one attribute change. Without a client revision the change is
+    /// rebuilt on the current inode and a commit that lost a race with another
+    /// inode update (a background metadata sync, a commit) is retried here,
+    /// up to `SETATTR_RETRY_LIMIT` attempts, instead of failing the caller
+    /// with a conflict it cannot act on.
     pub async fn set_inode_attributes(&self, request: SetInodeAttrRequest) -> Result<InodeRecord> {
+        require_id(&request.caller_id, "caller_id")?;
+        require_id(&request.operation_id.0, "operation_id")?;
+        require_id(&request.inode_id.0, "inode_id")?;
+        let request_digest = namespace_request_digest(&request)?;
+        for _ in 0..SETATTR_RETRY_LIMIT {
+            match self
+                .set_inode_attributes_attempt(&request, request_digest)
+                .await?
+            {
+                SetAttrAttempt::Applied(inode) => return Ok(inode),
+                SetAttrAttempt::Retry => tokio::task::yield_now().await,
+            }
+        }
+        Err(Error::coded(
+            afs_error::META_DFS_NAMESPACE_RETRY,
+            "DFS inode changed repeatedly during bounded setattr retry",
+        ))
+    }
+
+    async fn set_inode_attributes_attempt(
+        &self,
+        request: &SetInodeAttrRequest,
+        request_digest: [u8; 32],
+    ) -> Result<SetAttrAttempt> {
         let SetInodeAttrRequest {
             caller_id,
             operation_id,
@@ -1003,24 +1200,22 @@ impl DfsService {
             expected_inode_revision,
             update,
         } = request;
-        require_id(&caller_id, "caller_id")?;
-        require_id(&operation_id.0, "operation_id")?;
-        require_id(&inode_id.0, "inode_id")?;
         if let Some(inode) = self
-            .replayed_inode(
-                &caller_id,
-                &operation_id,
+            .replayed_namespace_inode(
+                caller_id,
+                operation_id,
                 StoreOperation::DfsSetInodeAttributes,
+                request_digest,
             )
             .await?
         {
-            return Ok(inode);
+            return Ok(SetAttrAttempt::Applied(inode));
         }
         let current = self.get_inode(inode_id.clone()).await?;
-        if current.revision != expected_inode_revision {
+        if expected_inode_revision.is_some_and(|expected| current.revision != expected) {
             return Err(conflict("DFS inode revision changed before setattr"));
         }
-        validate_attr_update_permission(&caller, &current, &update)?;
+        validate_attr_update_permission(caller, &current, update)?;
         let mut updated = current.clone();
         let ownership_changed = update.uid.is_some() || update.gid.is_some();
         if let Some(mode) = update.mode {
@@ -1052,14 +1247,34 @@ impl DfsService {
         }
         updated.attributes.ctime_unix_ms = attr_now;
         updated.revision = updated.revision.saturating_add(1);
-        self.commit_inode_metadata_mutation(
-            caller_id,
-            operation_id,
-            StoreOperation::DfsSetInodeAttributes,
-            current,
-            updated,
-        )
-        .await
+        let applied = updated.clone();
+        let key = RequestKey::new(caller_id.clone(), operation_id.0.clone());
+        let mut txn = MetaTxn::new(key.clone(), StoreOperation::DfsSetInodeAttributes);
+        txn.conditions.extend([
+            TxnCondition::RequestAbsent(key.clone()),
+            TxnCondition::EntityEquals(MetaEntity::DfsInode(current)),
+        ]);
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsInode(updated.clone())),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation: StoreOperation::DfsSetInodeAttributes,
+                result: namespace_result(request_digest, OperationResult::DfsInode(updated)),
+            }),
+        ]);
+        match self.store.compare_and_commit(txn).await? {
+            TxnOutcome::Committed { .. } => Ok(SetAttrAttempt::Applied(applied)),
+            // A lost reply's retry, or another request committing this id
+            // first, is answered from the recorded outcome next attempt.
+            TxnOutcome::ConditionFailed {
+                existing_outcome: Some(_),
+                ..
+            } => Ok(SetAttrAttempt::Retry),
+            TxnOutcome::ConditionFailed { .. } if expected_inode_revision.is_some() => {
+                Err(conflict("DFS metadata condition changed during commit"))
+            }
+            TxnOutcome::ConditionFailed { .. } => Ok(SetAttrAttempt::Retry),
+        }
     }
 
     pub async fn get_xattr(&self, request: GetXattrRequest) -> Result<Vec<u8>> {

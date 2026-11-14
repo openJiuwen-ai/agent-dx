@@ -38,6 +38,71 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
         ))?;
         Ok(())
     }
+    fn retain_reader(
+        &self,
+        reader: u64,
+        inode: &crate::dfs::InodeId,
+        version: Option<&crate::dfs::FileVersionId>,
+    ) -> Result<u64> {
+        let mut client =
+            afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone());
+        Ok(self
+            .run(
+                client.retain_reader(afs_protocol::meta::RetainDfsReaderRequest {
+                    node_id: self.node_id.clone(),
+                    session_id: self.session_id.clone(),
+                    reader,
+                    inode_id: inode.0.clone(),
+                    version_id: version.map(|id| id.0.clone()).unwrap_or_default(),
+                }),
+            )?
+            .into_inner()
+            .meta_term)
+    }
+    fn release_readers(&self, readers: &[u64]) -> Result<()> {
+        let mut client =
+            afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone());
+        self.run(
+            client.release_readers(afs_protocol::meta::ReleaseDfsReadersRequest {
+                node_id: self.node_id.clone(),
+                session_id: self.session_id.clone(),
+                readers: readers.to_vec(),
+            }),
+        )?;
+        Ok(())
+    }
+    fn report_readers(
+        &self,
+        term: u64,
+        low_watermark: u64,
+        readers: &[crate::node::gc::SoftReader],
+    ) -> Result<u64> {
+        let mut client =
+            afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone());
+        Ok(self
+            .run(
+                client.report_readers(afs_protocol::meta::ReportDfsReadersRequest {
+                    node_id: self.node_id.clone(),
+                    session_id: self.session_id.clone(),
+                    meta_term: term,
+                    low_watermark,
+                    readers: readers
+                        .iter()
+                        .map(|reader| afs_protocol::meta::DfsReaderEntry {
+                            reader: reader.reader,
+                            inode_id: reader.inode.0.clone(),
+                            version_id: reader
+                                .version
+                                .as_ref()
+                                .map(|id| id.0.clone())
+                                .unwrap_or_default(),
+                        })
+                        .collect(),
+                }),
+            )?
+            .into_inner()
+            .meta_term)
+    }
     fn collect(
         &self,
         completed: u64,

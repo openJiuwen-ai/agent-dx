@@ -55,6 +55,8 @@ struct GcPlan {
     chunks: Vec<ChunkId>,
     /// Owner of each version in `keys`, for the commit condition.
     version_owners: BTreeMap<FileVersionId, InodeId>,
+    /// The in-memory reader recheck every batch of the plan commits with.
+    readers: Option<crate::meta::store::ReaderGuard>,
 }
 #[cfg(test)]
 fn plan_collection(
@@ -247,7 +249,7 @@ fn reference_entity(
 }
 /// On the wire a `write:` reference names its timestamped operation, which fixes
 /// admission age. The stored id is the hash immutable chunk identities address.
-fn stored_reference_id(id: &str) -> String {
+pub(super) fn stored_reference_id(id: &str) -> String {
     match id.strip_prefix("write:") {
         Some(operation) => format!(
             "write:{}",
@@ -256,6 +258,51 @@ fn stored_reference_id(id: &str) -> String {
         None => id.to_owned(),
     }
 }
+/// The creation time a write generation's timestamped operation identity
+/// (`afs1-<ms>-…`) carries; it bounds when the generation may be admitted.
+pub(super) fn generation_created_ms(operation: &str) -> Result<u64> {
+    operation
+        .strip_prefix("afs1-")
+        .and_then(|value| value.split_once('-'))
+        .and_then(|(time, _)| time.parse::<u64>().ok())
+        .ok_or_else(|| invalid("write generation requires a timestamped operation identity"))
+}
+
+/// A write generation admitted inside another transaction (Create, B1): the
+/// same identity and age rules as `update_gc_reference`, whose admission
+/// deadline here is the commit itself. A generation older than the admission
+/// horizon is refused, so a long-delayed request cannot admit a reference
+/// whose release tombstone may already be gone.
+pub(super) fn generation_reference_admitted_now(
+    node: &str,
+    session: &str,
+    inode: &InodeId,
+    operation: &OperationId,
+) -> Result<GcReference> {
+    let created = generation_created_ms(&operation.0)?;
+    let now = now_unix_ms();
+    if created > now.saturating_add(ADMISSION_HORIZON_MS)
+        || now > created.saturating_add(ADMISSION_HORIZON_MS)
+    {
+        return Err(afs_error::Error::coded(
+            afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED,
+            "write generation is outside its admission window",
+        ));
+    }
+    Ok(GcReference {
+        node_id: node.to_owned(),
+        session_id: session.to_owned(),
+        reference_id: stored_reference_id(&format!("write:{}", operation.0)),
+        inode_id: Some(inode.clone()),
+        publication: true,
+        chunks: Vec::new(),
+        retired_at_unix_ms: None,
+        open_read: None,
+        // A new file has no version: the generation's base is empty.
+        pinned_version: None,
+    })
+}
+
 fn ref_key(node: &str, session: &str, id: &str) -> MetaKey {
     MetaKey::DfsReference {
         node_id: node.into(),
@@ -272,7 +319,7 @@ fn gc_state(entities: &[MetaEntity]) -> GcState {
         })
         .unwrap_or_default()
 }
-fn live_caller(entities: &[MetaEntity], node: &str, session: &str) -> Result<()> {
+pub(super) fn live_caller(entities: &[MetaEntity], node: &str, session: &str) -> Result<()> {
     let current = entities
         .iter()
         .filter_map(|entity| match entity {
@@ -357,13 +404,7 @@ impl DfsService {
                     ));
                 }
                 if let Some(operation) = &write_operation {
-                    let created = operation
-                        .strip_prefix("afs1-")
-                        .and_then(|value| value.split_once('-'))
-                        .and_then(|(time, _)| time.parse::<u64>().ok())
-                        .ok_or_else(|| {
-                            invalid("write generation requires a timestamped operation identity")
-                        })?;
+                    let created = generation_created_ms(operation)?;
                     if created > now.saturating_add(60_000)
                         || update.admission_deadline_unix_ms > created.saturating_add(60_000)
                     {
@@ -581,7 +622,8 @@ impl DfsService {
                 version_owners: plan.version_owners.clone(),
                 ..GcPlan::default()
             };
-            let guard = plan_guard(since, entities, now, &chunkless, batch, &mutations);
+            let mut guard = plan_guard(since, entities, now, &chunkless, batch, &mutations);
+            guard.readers = plan.readers.clone();
             match self
                 .gc_commit_checked(
                     vec![TxnCondition::DfsGcPlanStillValid(Arc::new(guard))],
@@ -697,20 +739,48 @@ impl DfsService {
                 return Ok(gc);
             }
             register_inventory(&inventory, &mut entities, &mut mutations)?;
-            let references = entities
+            let mut references = entities
                 .iter()
                 .filter_map(|entity| match entity {
                     MetaEntity::DfsReference(value) => Some(value.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let plan = plan_bounded(
+            // C-1: in-memory reader registrations are live references too,
+            // and until the restart gate opens every inode and version is.
+            let sessions = session_deadlines(&entities);
+            let current = current_sessions(&entities)
+                .into_iter()
+                .filter(|(_, session)| session.is_live_at_unix_ms(now))
+                .map(|(node, session)| (node.to_owned(), session.session_id.clone()))
+                .collect::<BTreeSet<_>>();
+            let readers = self
+                .readers
+                .snapshot(&current, &sessions, now, self.gc_grace_ms);
+            let gate_closed = self.readers.restart_gate_closed(
+                &sessions,
+                &readers.reported,
+                now,
+                self.gc_grace_ms,
+            );
+            self.gc_metrics
+                .observe_readers(readers.references.len(), gate_closed);
+            references.extend(readers.references);
+            if gate_closed {
+                references.extend(pin_everything(&entities));
+            }
+            let mut plan = plan_bounded(
                 &entities,
                 &references,
                 now,
                 self.gc_grace_ms,
                 MAX_CHUNKS.min(batch_keys / 8).max(1),
             );
+            plan.readers = Some(crate::meta::store::ReaderGuard {
+                table: self.readers.clone(),
+                since: readers.since,
+                inodes: plan_reader_inodes(&plan),
+            });
             self.gc_metrics
                 .dead_keys
                 .set(i64::try_from(plan.keys.len()).unwrap_or(i64::MAX));
@@ -739,7 +809,8 @@ impl DfsService {
                 // No live storage node holds local copies to retire.
                 gc.chunks.clear();
             }
-            let guard = plan_guard(revision, &entities, now, &plan, batch, &mutations);
+            let mut guard = plan_guard(revision, &entities, now, &plan, batch, &mutations);
+            guard.readers = plan.readers.clone();
             gc_conditions.push(TxnCondition::DfsGcPlanStillValid(Arc::new(guard)));
             mutations.push(TxnMutation::Put(MetaEntity::DfsGc(gc.clone())));
             match self
@@ -825,7 +896,64 @@ fn plan_guard(
             .filter(|(_, session)| session.is_live_at_unix_ms(now))
             .map(|(node, session)| (node.to_owned(), session.session_id.clone()))
             .collect(),
+        readers: None,
     }
+}
+
+/// Every inode a reader registered after the plan must not land on: the
+/// deleted inodes and the owners of the deleted versions of the whole plan,
+/// not only of one batch (a later batch's version owns chunks an earlier
+/// batch deletes; design C-F19).
+fn plan_reader_inodes(plan: &GcPlan) -> BTreeSet<InodeId> {
+    plan.keys
+        .iter()
+        .filter_map(|key| match key {
+            MetaKey::DfsInode(inode) => Some(inode.clone()),
+            _ => None,
+        })
+        .chain(plan.version_owners.values().cloned())
+        .collect()
+}
+
+/// Every recorded session and its deadline.
+fn session_deadlines(entities: &[MetaEntity]) -> BTreeMap<(String, String), u64> {
+    entities
+        .iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::NodeSession(value) => Some((
+                (value.node_id.clone(), value.session_id.clone()),
+                value.expires_at_unix_ms,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The restart gate (C-1): a reference on every inode and on every version,
+/// so a plan deletes neither and collects only chunks no version reaches and
+/// no write generation protects.
+fn pin_everything(entities: &[MetaEntity]) -> Vec<GcReference> {
+    let reference = |inode: &InodeId, version: Option<&FileVersionId>| GcReference {
+        node_id: String::new(),
+        session_id: String::new(),
+        reference_id: "reader-gate".into(),
+        inode_id: Some(inode.clone()),
+        publication: false,
+        chunks: Vec::new(),
+        retired_at_unix_ms: None,
+        open_read: None,
+        pinned_version: version.cloned(),
+    };
+    entities
+        .iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::DfsInode(inode) => Some(reference(&inode.inode_id, None)),
+            MetaEntity::DfsFileVersion(version) => {
+                Some(reference(&version.inode_id, Some(&version.id)))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Registers objects a Node found that Meta does not know, so the one plan

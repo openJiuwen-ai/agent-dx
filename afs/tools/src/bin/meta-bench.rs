@@ -1159,6 +1159,12 @@ async fn service_smoke(store: Arc<Store>) -> BenchResult<Value> {
         name: b"service-smoke".to_vec(),
         attributes: attributes(),
         lease_seconds: 30,
+        first_generation: None,
+        caller: afs::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
     };
     let start = Instant::now();
     let (file, lease) = service.create(request.clone()).await?;

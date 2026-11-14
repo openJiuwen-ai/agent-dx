@@ -105,8 +105,14 @@ impl Fixture {
                 namespace_id: NamespaceId::new("default"),
                 parent_inode_id: root.inode_id,
                 name: b"degraded.bin".to_vec(),
+                caller: crate::dfs::CallerContext {
+                    uid: 0,
+                    gid: 0,
+                    supplementary_gids: Vec::new(),
+                },
                 attributes,
                 lease_seconds: 60,
+                first_generation: None,
             })
             .await
             .unwrap();

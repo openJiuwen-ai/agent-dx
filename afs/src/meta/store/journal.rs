@@ -621,7 +621,7 @@ impl MemoryLog {
     /// Test-only: a new writer over the same volatile records with the next
     /// term, modelling a reopen or takeover. Every older handle is fenced.
     #[cfg(test)]
-    pub(super) fn reopen(&self) -> Self {
+    pub(crate) fn reopen(&self) -> Self {
         let mut state = self
             .state
             .lock()

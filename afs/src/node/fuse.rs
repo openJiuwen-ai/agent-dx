@@ -982,11 +982,19 @@ impl Filesystem for AfsFuse {
                 if handle.is_some() {
                     AfsFuse::validate_handle_inode_in(&state, ino)?;
                 }
-                let current = backend
-                    .getattr(&context, inode, handle.map(|handle| handle.handle))
-                    .map_err(errno_in(FuseOp::Setattr))?;
+                // Only a mode-only change can be the kernel's legacy privilege
+                // clear; any other setattr needs no current attributes here.
+                let kill_suidgid =
+                    if change.mode.is_some() && change.uid.is_none() && change.gid.is_none() {
+                        let current = backend
+                            .getattr(&context, inode, handle.map(|handle| handle.handle))
+                            .map_err(errno_in(FuseOp::Setattr))?;
+                        is_legacy_privilege_clear(&current, &change)
+                    } else {
+                        false
+                    };
                 let options = SetAttrOptions {
-                    kill_suidgid: is_legacy_privilege_clear(&current, &change),
+                    kill_suidgid,
                     timestamps_now,
                 };
                 Ok(backend.as_ref()).and_then(|backend| {
@@ -2247,9 +2255,18 @@ impl Filesystem for AfsFuse {
         let started = std::time::Instant::now();
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
-                backend
-                    .create_with_options(&context, parent_inode, name, mode, flags, options)
-                    .map_err(errno_in(FuseOp::Create))
+                create_resolving_groups(
+                    self.policy.as_ref(),
+                    backend,
+                    context.clone(),
+                    request_groups,
+                    parent_inode,
+                    name,
+                    mode,
+                    flags,
+                    options,
+                )
+                .map_err(errno_in(FuseOp::Create))
             })
         });
         self.trace_elapsed("create", parent.0, started);
@@ -2631,6 +2648,40 @@ fn with_cached_view_size(
         attr.blocks = length.div_ceil(512);
     }
     attr
+}
+
+/// One create on behalf of the kernel caller. The backend checks the caller
+/// against the parent directory, and a FUSE header carries only uid and
+/// primary gid. Only the DFS mount policy enables a retry after permission
+/// denial, when Meta has left nothing behind to undo. Resolving supplementary
+/// groups reads /proc, so it is paid only then. Other mounts keep the first
+/// backend result without resolving groups or retrying.
+#[allow(clippy::too_many_arguments)]
+fn create_resolving_groups(
+    policy: &dyn FuseMountPolicy,
+    backend: &dyn Backend,
+    mut context: RequestContext,
+    groups: impl FnOnce(&RequestContext) -> Vec<u32>,
+    parent: BackendInode,
+    name: &OsStr,
+    mode: u32,
+    flags: i32,
+    options: OpenOptions,
+) -> afs_error::Result<crate::node::vfs::types::CreatedFile> {
+    match backend.create_with_options(&context, parent, name, mode, flags, options) {
+        Err(error)
+            if error.code() == afs_error::IO_PERMISSION_DENIED
+                && policy.resends_denied_with_groups() =>
+        {
+            let groups = groups(&context);
+            if groups.is_empty() {
+                return Err(error);
+            }
+            context.supplementary_gids = groups;
+            backend.create_with_options(&context, parent, name, mode, flags, options)
+        }
+        result => result,
+    }
 }
 
 #[cfg(test)]

@@ -422,6 +422,10 @@ message RecoverRootReply {
 service DfsMeta {
   rpc UpdateGcReference(UpdateDfsGcReferenceRequest) returns (UpdateDfsGcReferenceReply);
   rpc ReleaseGcReferences(ReleaseDfsGcReferencesRequest) returns (ReleaseDfsGcReferencesReply);
+  rpc RetainReader(RetainDfsReaderRequest) returns (RetainDfsReaderReply);
+  rpc ReleaseReaders(ReleaseDfsReadersRequest) returns (ReleaseDfsReadersReply);
+  rpc ReportReaders(ReportDfsReadersRequest) returns (ReportDfsReadersReply);
+  rpc OpenFileRead(DfsOpenFileReadRequest) returns (DfsOpenFileReadReply);
   rpc CollectGarbage(CollectDfsGarbageRequest) returns (CollectDfsGarbageReply);
   rpc Lookup(DfsLookupRequest) returns (DfsLookupReply);
   rpc Create(DfsCreateRequest) returns (DfsCreateReply);
@@ -447,6 +451,7 @@ service DfsMeta {
   rpc ResolveLockAuthority(ResolveDfsLockAuthorityRequest) returns (ResolveDfsLockAuthorityReply);
   rpc ResolveWriteAuthority(ResolveDfsWriteAuthorityRequest) returns (ResolveDfsWriteAuthorityReply);
   rpc RenewWriteLease(RenewDfsWriteLeaseRequest) returns (DfsWriteLeaseReply);
+  rpc ReleaseWriteLeases(ReleaseDfsWriteLeasesRequest) returns (ReleaseDfsWriteLeasesReply);
   rpc GetInode(GetDfsInodeRequest) returns (GetDfsInodeReply);
   rpc GetFileVersion(GetFileVersionRequest) returns (GetFileVersionReply);
   rpc GetPlacementSnapshot(GetDfsPlacementSnapshotRequest) returns (GetDfsPlacementSnapshotReply);
@@ -780,11 +785,25 @@ message DfsCreateRequest {
   DfsInodeAttributes attributes = 6;
   string owner_session_id = 7;
   uint64 lease_seconds = 8;
+  // The creator's first write generation (timestamped operation id); when set,
+  // its `write:` GC reference is admitted in the Create transaction.
+  optional string first_generation_operation_id = 9;
+  // Register the handle this create opens as in-memory reader `reader` (round
+  // 2 C-1) instead of a durable `open:create-` reference. Requires the session
+  // to have reported its readers to this Meta (META_DFS_SESSION_NOT_REPORTED).
+  optional uint64 reader = 10;
+  // The identity creating the file. Meta checks it against the parent
+  // directory and derives the new inode's owner and group from it.
+  DfsCallerContext caller = 11;
 }
 
 message DfsCreateReply {
   DfsInodeRecord inode = 1;
   DfsWriteLease write_lease = 2;
+  // `reader` is registered, by the Meta of writer term `meta_term`. False
+  // with a reader: the Node pins the handle itself.
+  bool reader_registered = 3;
+  uint64 meta_term = 4;
 }
 
 
@@ -952,7 +971,9 @@ message DfsSetInodeAttributesRequest {
   string operation_id = 2;
   DfsCallerContext caller = 3;
   string inode_id = 4;
-  uint64 expected_inode_revision = 5;
+  // Set: compare-and-set against this revision. Absent: Meta applies the
+  // change to the current inode and retries benign revision drift itself.
+  optional uint64 expected_inode_revision = 5;
   DfsInodeAttributeUpdate update = 6;
 }
 
@@ -1034,6 +1055,20 @@ message RenewDfsWriteLeaseRequest {
   DfsWriteLease current_lease = 4;
   uint64 lease_seconds = 5;
 }
+
+// Hands back write leases the caller no longer needs: each one still equal to
+// the presented copy ends now (its epoch unchanged, so the next acquire takes
+// the next epoch); one that changed is skipped. One transaction under
+// `operation_id`, so a retry replays. Served by Meta from protocol 8; Nodes do
+// not call it yet, and starting to needs no protocol change (R106).
+message ReleaseDfsWriteLeasesRequest {
+  string caller_id = 1;
+  string owner_session_id = 2;
+  string operation_id = 3;
+  repeated DfsWriteLease leases = 4;
+}
+// `released`: leases this call ended (0 on a replay).
+message ReleaseDfsWriteLeasesReply { uint64 released = 1; }
 
 // A fresh lock authority read; only missing/expired authority acquires a lease.
 // operation_id identifies that conditional acquire, not the read-only result.
@@ -1344,6 +1379,67 @@ message ReleaseDfsGcReferencesRequest {
   repeated string reference_ids = 3;
 }
 message ReleaseDfsGcReferencesReply {}
+// Round 2 C-1: an in-memory reader registration (no log record). Meta keeps
+// it only if `version_id` is the linked head of `inode_id` in a view taken
+// after the registration; otherwise META_DFS_READER_NOT_HEAD and the Node
+// pins durably with UpdateGcReference.
+message RetainDfsReaderRequest {
+  string node_id = 1;
+  string session_id = 2;
+  // Node-assigned, unique and increasing within the session.
+  uint64 reader = 3;
+  string inode_id = 4;
+  // Empty: the inode has no version (a new file or a directory).
+  string version_id = 5;
+}
+// `meta_term`: the Meta writer term that answered; a Node drops replies of a
+// term lower than one it has seen.
+message RetainDfsReaderReply { uint64 meta_term = 1; }
+message ReleaseDfsReadersRequest {
+  string node_id = 1;
+  string session_id = 2;
+  repeated uint64 readers = 3;
+}
+message ReleaseDfsReadersReply {}
+message DfsReaderEntry {
+  uint64 reader = 1;
+  string inode_id = 2;
+  string version_id = 3;
+}
+// Restores all live `readers`; removes absent entries only up to `low_watermark`.
+// `meta_term` is the term the Node believed current; the session counts as
+// reported only if it matches the replying Meta's term.
+message ReportDfsReadersRequest {
+  string node_id = 1;
+  string session_id = 2;
+  uint64 meta_term = 3;
+  uint64 low_watermark = 4;
+  repeated DfsReaderEntry readers = 5;
+}
+message ReportDfsReadersReply { uint64 meta_term = 1; }
+// Round 2 B2: a read open in one call: resolve the inode (checking the name
+// when `name_check` is set), register reader `reader` of its head as
+// RetainReader does, and tell whether another session holds a live write
+// lease on it (then the open bypasses the page cache).
+message DfsOpenFileReadRequest {
+  string node_id = 1;
+  string session_id = 2;
+  uint64 reader = 3;
+  string inode_id = 4;
+  bool name_check = 5;
+  string namespace_id = 6;
+  string parent_inode_id = 7;
+  bytes name = 8;
+}
+message DfsOpenFileReadReply {
+  // Absent: the checked name no longer names the inode.
+  DfsInodeRecord inode = 1;
+  // The head of `inode` is registered as `reader`; otherwise the Node pins
+  // what it opens itself.
+  bool registered = 2;
+  uint64 meta_term = 3;
+  bool writer_elsewhere = 4;
+}
 message CollectDfsGarbageRequest {
   string node_id = 1;
   string session_id = 2;

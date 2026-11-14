@@ -232,6 +232,12 @@ impl MetaHeartbeat {
 }
 
 fn heartbeat_error_is_retryable(error: &afs_error::Error) -> bool {
+    // A Meta of another cluster protocol generation will not accept this
+    // Node however often it asks: stop now instead of serving old-generation
+    // requests to it for the rest of the fail-closed window (round 2 §4.4).
+    if error.code() == afs_error::META_NODE_PROTOCOL_VERSION {
+        return false;
+    }
     !matches!(
         error.kind(),
         afs_error::ErrorKind::InvalidArgument
@@ -286,6 +292,28 @@ mod tests {
     }
 
     use std::time::Duration;
+
+    /// Round 2 §4.4: a protocol generation mismatch is final, also after the
+    /// gRPC round trip (its FailedPrecondition class alone would be retried).
+    #[test]
+    fn heartbeat_stops_at_once_on_a_protocol_generation_mismatch() {
+        let refused = afs_error::Error::coded(
+            afs_error::META_NODE_PROTOCOL_VERSION,
+            "node protocol 7 is not supported (current 8)",
+        );
+        assert!(!super::heartbeat_error_is_retryable(&refused));
+        let over_the_wire = afs_transport::grpc::error_status::status_to_error(
+            afs_transport::grpc::error_status::error_to_status(refused),
+        );
+        assert_eq!(over_the_wire.code(), afs_error::META_NODE_PROTOCOL_VERSION);
+        assert!(!super::heartbeat_error_is_retryable(&over_the_wire));
+        assert!(super::heartbeat_error_is_retryable(
+            &afs_error::Error::coded(
+                afs_error::META_OWNER_ROOT_BUSY,
+                "other FailedPrecondition-class errors keep their retry",
+            )
+        ));
+    }
 
     #[test]
     fn heartbeat_retries_transport_failure_but_stops_expired_session() {

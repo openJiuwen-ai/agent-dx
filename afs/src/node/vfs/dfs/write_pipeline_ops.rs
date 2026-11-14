@@ -273,9 +273,20 @@ impl DistributedFs {
             let _ = self.poll_uploads()?;
             self.observe_handle_error(handle)?;
             let target = Self::write_target(&cell, append, offset, data, *accepted)?;
+            // A new file's first generation was admitted with its Create (B1).
+            let created_generation = if target.generation.is_none() {
+                Self::prepared_generation_for(&cell, target.base.as_ref())?
+            } else {
+                None
+            };
             let operation_id = target
                 .generation
                 .clone()
+                .or_else(|| {
+                    created_generation
+                        .as_ref()
+                        .map(|(generation, _)| generation.clone())
+                })
                 .unwrap_or_else(|| self.identity.operation_id("native-generation"));
             let (prepared, descriptor) = if target.selection.is_none() {
                 match self.reserve_dirty_builder(
@@ -299,7 +310,9 @@ impl DistributedFs {
             } else {
                 (None, None)
             };
-            let gc_pin = if target.generation.is_none() {
+            let gc_pin = if let Some((_, pin)) = created_generation {
+                Some(pin)
+            } else if target.generation.is_none() {
                 self.gc
                     .references
                     .as_ref()

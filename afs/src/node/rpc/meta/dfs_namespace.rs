@@ -59,7 +59,31 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         parent: &crate::dfs::InodeId,
         name: &[u8],
         attributes: crate::dfs::InodeAttributes,
+        first_generation: Option<&crate::dfs::OperationId>,
+        caller: crate::dfs::CallerContext,
     ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease)> {
+        self.create_registered(
+            operation_id,
+            parent,
+            name,
+            attributes,
+            first_generation,
+            None,
+            caller,
+        )
+        .map(|(inode, lease, _)| (inode, lease))
+    }
+
+    fn create_registered(
+        &self,
+        operation_id: &crate::dfs::OperationId,
+        parent: &crate::dfs::InodeId,
+        name: &[u8],
+        attributes: crate::dfs::InodeAttributes,
+        first_generation: Option<&crate::dfs::OperationId>,
+        reader: Option<u64>,
+        caller: crate::dfs::CallerContext,
+    ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease, Option<u64>)> {
         self.read_diagnostic(
             crate::node::metrics::read_timing::ReadDiagnosticStage::MetaCreate,
             || {
@@ -73,11 +97,16 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                         attributes: Some(wire_dfs_attributes(attributes)),
                         owner_session_id: self.session_id.clone(),
                         lease_seconds: crate::dfs::DFS_WRITE_LEASE_SECONDS,
+                        first_generation_operation_id:
+                            first_generation.map(|generation| generation.0.clone()),
+                        reader,
+                        caller: Some(wire_dfs_caller_context(caller)),
                     }))?
                     .into_inner();
                 Ok((
                     domain_dfs_inode(required(reply.inode, "DfsCreate.inode")?)?,
                     domain_dfs_write_lease(required(reply.write_lease, "DfsCreate.write_lease")?),
+                    reply.reader_registered.then_some(reply.meta_term),
                 ))
             },
         )
@@ -409,6 +438,43 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                     )?
                     .into_inner();
                 required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
+            },
+        )
+    }
+
+    fn open_file_read(
+        &self,
+        reader: u64,
+        inode_id: &crate::dfs::InodeId,
+        name: Option<(&crate::dfs::InodeId, &[u8])>,
+    ) -> afs_error::Result<crate::node::vfs::dfs::OpenedForRead> {
+        self.read_diagnostic(
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaGetInode,
+            || {
+                self.record_read_rpc("open_file_read");
+                let reply =
+                    self.run(self.client().open_file_read(
+                        afs_tracing::request_with_current_context(
+                            afs_protocol::meta::DfsOpenFileReadRequest {
+                                node_id: self.node_id.clone(),
+                                session_id: self.session_id.clone(),
+                                reader,
+                                inode_id: inode_id.0.clone(),
+                                name_check: name.is_some(),
+                                namespace_id: self.namespace_id.0.clone(),
+                                parent_inode_id:
+                                    name.map(|(parent, _)| parent.0.clone()).unwrap_or_default(),
+                                name: name.map(|(_, name)| name.to_vec()).unwrap_or_default(),
+                            },
+                        ),
+                    ))?
+                    .into_inner();
+                Ok(crate::node::vfs::dfs::OpenedForRead {
+                    inode: reply.inode.map(domain_dfs_inode).transpose()?,
+                    registered: reply.registered,
+                    meta_term: reply.meta_term,
+                    writer_elsewhere: reply.writer_elsewhere,
+                })
             },
         )
     }

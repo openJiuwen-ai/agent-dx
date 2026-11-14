@@ -113,6 +113,13 @@ struct RecordingMeta {
     failed_commits: Mutex<Vec<CommitFileVersion>>,
     cas_failed_commits: Mutex<Vec<CommitFileVersion>>,
     metadata_syncs: Mutex<Vec<SyncInodeMetadata>>,
+    setattr_requests: Mutex<Vec<SetInodeAttrRequest>>,
+    /// Metadata syncs still to refuse as if another update had just changed
+    /// the inode on Meta (its revision moves each time).
+    metadata_sync_races: AtomicUsize,
+    created_generations: Mutex<Vec<Option<OperationId>>>,
+    /// The identity each create carried to Meta.
+    create_callers: Mutex<Vec<CallerContext>>,
     failed_metadata_syncs: Mutex<Vec<SyncInodeMetadata>>,
     next_commit_error: Mutex<Option<Error>>,
     commit_error_after_successes: Mutex<Option<(usize, Error)>>,
@@ -154,6 +161,12 @@ struct RecordingMeta {
     rename_errors: Mutex<VecDeque<Error>>,
     /// Operation ids `rename` was called with.
     rename_operations: Mutex<Vec<OperationId>>,
+    /// Scripted `open_file_read` answers (registered, Meta term, writer
+    /// elsewhere); none left: today's resolution, nothing registered.
+    open_read_replies: Mutex<VecDeque<(bool, u64, bool)>>,
+    /// Meta term with which `create_registered` registers the reader; `None`
+    /// registers nothing (and the handle pins itself).
+    create_registers: Mutex<Option<u64>>,
 }
 
 impl RecordingMeta {
@@ -189,6 +202,10 @@ impl RecordingMeta {
             failed_commits: Mutex::new(Vec::new()),
             cas_failed_commits: Mutex::new(Vec::new()),
             metadata_syncs: Mutex::new(Vec::new()),
+            setattr_requests: Mutex::new(Vec::new()),
+            metadata_sync_races: AtomicUsize::new(0),
+            created_generations: Mutex::new(Vec::new()),
+            create_callers: Mutex::new(Vec::new()),
             failed_metadata_syncs: Mutex::new(Vec::new()),
             next_commit_error: Mutex::new(None),
             commit_error_after_successes: Mutex::new(None),
@@ -218,6 +235,8 @@ impl RecordingMeta {
             dir_page_calls: AtomicUsize::new(0),
             rename_errors: Mutex::new(VecDeque::new()),
             rename_operations: Mutex::new(Vec::new()),
+            open_read_replies: Mutex::new(VecDeque::new()),
+            create_registers: Mutex::new(None),
             file_version_loads: AtomicUsize::new(0),
             renew_calls: AtomicUsize::new(0),
             open_write_calls: AtomicUsize::new(0),
@@ -421,7 +440,14 @@ impl DfsMeta for RecordingMeta {
         _: &InodeId,
         name: &[u8],
         _: InodeAttributes,
+        first_generation: Option<&OperationId>,
+        caller: CallerContext,
     ) -> Result<(InodeRecord, WriteLease)> {
+        self.created_generations
+            .lock()
+            .unwrap()
+            .push(first_generation.cloned());
+        self.create_callers.lock().unwrap().push(caller);
         if let Some(files) = self.files.lock().unwrap().as_mut() {
             let mut inode = self.inode.lock().unwrap().clone();
             inode.inode_id = InodeId::new(format!("inode:{}", String::from_utf8_lossy(name)));
@@ -434,6 +460,52 @@ impl DfsMeta for RecordingMeta {
             self.inode.lock().unwrap().clone(),
             self.lease.lock().unwrap().clone(),
         ))
+    }
+
+    fn create_registered(
+        &self,
+        operation_id: &OperationId,
+        parent: &InodeId,
+        name: &[u8],
+        attributes: InodeAttributes,
+        first_generation: Option<&OperationId>,
+        reader: Option<u64>,
+        caller: CallerContext,
+    ) -> Result<(InodeRecord, WriteLease, Option<u64>)> {
+        let (inode, lease) = self.create(
+            operation_id,
+            parent,
+            name,
+            attributes,
+            first_generation,
+            caller,
+        )?;
+        let term = reader.and(*self.create_registers.lock().unwrap());
+        Ok((inode, lease, term))
+    }
+
+    fn open_file_read(
+        &self,
+        _: u64,
+        inode_id: &InodeId,
+        _: Option<(&InodeId, &[u8])>,
+    ) -> Result<super::OpenedForRead> {
+        let Some((registered, meta_term, writer_elsewhere)) =
+            self.open_read_replies.lock().unwrap().pop_front()
+        else {
+            return Ok(super::OpenedForRead {
+                inode: Some(self.get_inode(inode_id)?),
+                registered: false,
+                meta_term: 0,
+                writer_elsewhere: false,
+            });
+        };
+        Ok(super::OpenedForRead {
+            inode: Some(self.inode.lock().unwrap().clone()),
+            registered,
+            meta_term,
+            writer_elsewhere,
+        })
     }
 
     fn get_inode(&self, id: &InodeId) -> Result<InodeRecord> {
@@ -526,10 +598,22 @@ impl DfsMeta for RecordingMeta {
             Some(inode) => inode,
             None => &mut *single,
         };
+        if self
+            .metadata_sync_races
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            inode.revision = inode.revision.saturating_add(1);
+        }
         if inode.revision != sync.expected_inode_revision
             || inode.head_version != sync.expected_head_version
         {
-            return Err(unavailable("test inode metadata CAS failed"));
+            return Err(Error::coded(
+                afs_error::META_DFS_CONFLICT,
+                "test inode metadata CAS failed",
+            ));
         }
         inode.revision = inode.revision.saturating_add(1);
         inode.attributes.mtime_unix_ms = sync.metadata_delta.mtime_unix_ms.unwrap();
@@ -702,9 +786,13 @@ impl DfsMeta for RecordingMeta {
 
     fn set_inode_attributes(&self, request: SetInodeAttrRequest) -> Result<InodeRecord> {
         let mut inode = self.inode.lock().unwrap();
-        if inode.revision != request.expected_inode_revision {
+        if request
+            .expected_inode_revision
+            .is_some_and(|expected| inode.revision != expected)
+        {
             return Err(unavailable("test setattr CAS failed"));
         }
+        self.setattr_requests.lock().unwrap().push(request.clone());
         if let Some(mode) = request.update.mode {
             inode.attributes.mode = mode;
         }

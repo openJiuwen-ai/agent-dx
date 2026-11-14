@@ -129,7 +129,9 @@ pub mod version {
     pub const META_CHECKPOINT_FILE: u16 = 1;
     pub const META_STATE_IMAGE: u16 = 4;
     pub const META_RECORD_DECISION: u16 = 3;
-    pub const META_REQUEST_DIGEST: u32 = 1;
+    /// 2: `SetInodeAttrRequest` is digested (optional client revision) and
+    /// `CreateFileRequest` names the first write generation (round 2 B1/B4).
+    pub const META_REQUEST_DIGEST: u32 = 2;
     pub const NODE_CHUNK_CATALOG_WAL: u32 = 2;
     pub const NODE_CHUNK_CATALOG_SNAPSHOT: u32 = 2;
     pub const NODE_CRC_SEGMENT_TABLE: u32 = 1;

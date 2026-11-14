@@ -66,7 +66,7 @@ use identity::*;
 use inode_map::*;
 use lock_authority::*;
 use lock_proxy_client::*;
-pub use meta_port::{DfsMeta, DfsNodeLocation, DfsRemoteOwnerFactory};
+pub use meta_port::{DfsMeta, DfsNodeLocation, DfsRemoteOwnerFactory, OpenedForRead};
 use owner_api::RemoteDfsOwner;
 use owner_gateway::*;
 use owner_op_table::*;
@@ -274,6 +274,81 @@ impl DistributedFs {
             recent_names::NameCheck::Fallback(_) => {
                 self.meta.get_inode(inode_id).inspect_err(on_error)
             }
+        }
+    }
+
+    /// Round 2 B2: the read-open preflight of `open_preflight` in one Meta
+    /// call that also registers the opened head as an in-memory reader
+    /// (C-1) and says whether another session writes the inode (D-R3-2 ③).
+    /// Returns the inode, the reader pin when Meta registered one, and that
+    /// flag. Without GC references (or with reader pins switched off) it is
+    /// `open_preflight`.
+    pub(super) fn open_preflight_for_read(
+        &self,
+        inode_id: &InodeId,
+        pid: u32,
+    ) -> Result<(InodeRecord, Option<Arc<crate::node::gc::GcPin>>, bool)> {
+        #[cfg(feature = "diagnostics")]
+        let unpinned_reader = crate::node::fault::experiment::reader_pin_off();
+        #[cfg(not(feature = "diagnostics"))]
+        let unpinned_reader = false;
+        let Some(references) = self.gc.references.as_ref().filter(|_| !unpinned_reader) else {
+            return Ok((self.open_preflight(inode_id, pid)?, None, false));
+        };
+        let on_error = |error: &Error| self.invalidate_native_inode_views_on_error(inode_id, error);
+        let name = match self.recent_names.check(inode_id, pid) {
+            recent_names::NameCheck::Verify { parent, name } => Some((parent, name)),
+            recent_names::NameCheck::Fallback(_) => None,
+        };
+        let mut reported = false;
+        loop {
+            let Some(reader) = references.begin_reader()? else {
+                return Ok((self.open_preflight(inode_id, pid)?, None, false));
+            };
+            let opened = self.meta.open_file_read(
+                reader,
+                inode_id,
+                name.as_ref()
+                    .map(|(parent, name)| (parent, name.as_slice())),
+            );
+            let opened = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    references.finish_reader(reader, None)?;
+                    if error.code() == afs_error::META_DFS_SESSION_NOT_REPORTED && !reported {
+                        // This Meta has not heard from this session yet.
+                        references.report_readers()?;
+                        reported = true;
+                        continue;
+                    }
+                    on_error(&error);
+                    return Err(error);
+                }
+            };
+            let pin = references.finish_reader(
+                reader,
+                opened
+                    .inode
+                    .as_ref()
+                    .filter(|_| opened.registered)
+                    .map(|inode| {
+                        (
+                            opened.meta_term,
+                            &inode.inode_id,
+                            inode.head_version.as_ref(),
+                        )
+                    }),
+            )?;
+            let Some(inode) = opened.inode else {
+                if let Some((parent, name)) = &name {
+                    self.recent_names.mark_stale(inode_id, parent, name, pid);
+                }
+                return Err(Error::coded(
+                    afs_error::NODE_DFS_STALE_NAME,
+                    "DFS name no longer names the opened inode",
+                ));
+            };
+            return Ok((inode, pin, opened.writer_elsewhere));
         }
     }
 
