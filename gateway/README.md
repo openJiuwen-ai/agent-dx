@@ -567,17 +567,25 @@ use the new configuration before using this binary.
 
 ## DigitalMateGateway authenticated entrypoints
 
-The separate [Composio Gmail module candidate](../docs/development/composio-gmail-trusted.md)
-prepares restricted authorization/read calls outside user sandboxes. It has no
-HTTP route or production identity/connection adapters yet. The same draft #268
-also implements the separate [ingestion coordinator](../docs/development/connector-ingestion.md)
-in this Gateway process; raw webhook verification and batch rules do not enable
-traffic. Durable PostgreSQL receipt, leases and fixed-generation Relay delivery
-are implemented. Explicit `ingestion` configuration now assembles the dedicated
-database, server-managed signing secrets, purpose issuer, webhook and supervised
-workers through `IngressService.bind/serve`; see the coordinator guide. Receiver
-cold bootstrap, actual connection/session permissions and trigger subscription
-ownership remain activation gates. Gmail authorization/read HTTP routes remain unwired.
+The [Composio mail entry](../docs/development/composio-gmail-trusted.md) implements
+fixed Gmail/Outlook authorization, account validation, mail reads and subscription
+synchronization outside user sandboxes. Trusted `composio` configuration prepares
+the encrypted project Key, shared PostgreSQL budget and actual M44 owner adapter.
+The [ingestion coordinator](../docs/development/connector-ingestion.md) in the same
+process verifies signed Webhooks, persists bounded queues and delivers fixed
+batches through existing Ingress/Relay. The DigitalMate module owns dispatch and
+worker supervision; shared service code only spawns its background future and
+supplies shutdown. No additional server, lifecycle owner or common forwarding
+branch is introduced. Live OAuth/mailbox and consumer deployment remain separate
+acceptance checks; implemented routes are not a claim of live acceptance.
+
+With a configured DigitalMate privacy owner, business WS admission now issues
+privacy and connector-purpose credentials on the same existing grant. Gateway
+strips caller-provided internal identity headers and injects
+`x-digitalmate-connector-identity` for the selected user instance. The connector
+identity does not authorize mail reads; M44 still checks current connection and
+task/intent permissions. This admission change applies to the existing
+DigitalMate WS path and is covered by its authentication/forwarding regressions.
 
 ### Transparent business WebSocket
 

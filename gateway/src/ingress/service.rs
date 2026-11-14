@@ -35,7 +35,7 @@ pub struct IngressService {
     #[cfg(feature = "agent-api")]
     ssh: Option<super::ssh::SshListener>,
     #[cfg(all(feature = "agent-api", unix))]
-    ingestion: Option<super::digitalmategateway::ingestion::IngestionRuntime>,
+    digitalmate_background: Option<super::digitalmategateway::ingestion::BackgroundService>,
 }
 
 impl IngressService {
@@ -197,20 +197,14 @@ impl IngressService {
         };
         #[cfg(feature = "agent-api")]
         let gateway = if let Some(api) = &digitalmategateway_api {
-            let gateway = gateway.with_digitalmategateway_api(api.clone());
-            #[cfg(unix)]
-            let gateway = match api.ingestion_webhook() {
-                Some(webhook) => gateway.with_ingestion_webhook(webhook),
-                None => gateway,
-            };
-            gateway
+            gateway.with_digitalmategateway_api(api.clone())
         } else {
             gateway
         };
         let gateway = Arc::new(gateway);
         #[cfg(all(feature = "agent-api", unix))]
-        let ingestion = match &digitalmategateway_api {
-            Some(api) => api.start_ingestion(gateway.clone())?,
+        let digitalmate_background = match &digitalmategateway_api {
+            Some(api) => api.background_service(gateway.clone())?,
             None => None,
         };
         #[cfg(feature = "agent-api")]
@@ -225,7 +219,7 @@ impl IngressService {
             #[cfg(feature = "agent-api")]
             ssh,
             #[cfg(all(feature = "agent-api", unix))]
-            ingestion,
+            digitalmate_background,
             config,
             public_listeners,
             health_listener,
@@ -264,7 +258,7 @@ impl IngressService {
             #[cfg(feature = "agent-api")]
             ssh,
             #[cfg(all(feature = "agent-api", unix))]
-            ingestion,
+            digitalmate_background,
         } = self;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let watcher_task = tokio::spawn(watcher.run(store));
@@ -272,20 +266,8 @@ impl IngressService {
             tokio::spawn(gateway.clone().run_route_reconciler(route_changes));
         let mut listeners = JoinSet::new();
         #[cfg(all(feature = "agent-api", unix))]
-        if let Some(runtime) = ingestion {
-            let mut stop = shutdown_rx.clone();
-            listeners.spawn(async move {
-                loop {
-                    if !runtime.healthy() { return Err("DigitalMate ingestion worker stopped".into()); }
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
-                        changed = stop.changed() => {
-                            let requested = changed.is_err() || *stop.borrow();
-                            if requested { return runtime.stop().await.map_err(|error| Box::new(error) as ServiceError); }
-                        },
-                    }
-                }
-            });
+        if let Some(background) = digitalmate_background {
+            listeners.spawn(background.serve(shutdown_rx.clone()));
         }
         #[cfg(feature = "agent-api")]
         if let Some(ssh) = ssh {
@@ -378,8 +360,8 @@ fn listener_failure(result: Option<Result<Result<(), ServiceError>, JoinError>>)
 }
 
 #[cfg(all(test, unix, feature = "agent-api"))]
-#[path = "ingestion_startup_tests.rs"]
-mod ingestion_startup_tests;
+#[path = "digitalmategateway_startup_tests.rs"]
+mod digitalmategateway_startup_tests;
 
 #[cfg(test)]
 mod tests {

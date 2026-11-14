@@ -1,4 +1,4 @@
-//! Actual PG grants and existing TLS service -> independent Python runtime carrier.
+//! Actual PG grants and existing TLS service with an in-repository protocol client.
 //! Binding observations are controlled; no phone, provider, mailbox or report participates.
 use super::super::{
     privacy_center::{BindingReader, PrivacyCenter},
@@ -25,32 +25,9 @@ impl BindingReader for Bindings {
     }
 }
 
-async fn python(script: &Path, command: &str, config: &Path) {
-    let interpreter = std::env::var("ADX_CONNECTOR_TEST_PYTHON").expect("explicit Python runtime");
-    let output = tokio::time::timeout(
-        Duration::from_secs(30),
-        tokio::process::Command::new(interpreter)
-            .kill_on_drop(true)
-            .arg("-B")
-            .arg(script)
-            .arg(command)
-            .arg(config)
-            .output(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(
-        output.status.success(),
-        "Python runtime failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), command);
-}
-
 #[tokio::test]
-#[ignore = "requires task-owned PostgreSQL and actual DigitalMate Python consumer"]
-async fn normal_connector_recovers_over_real_https_after_access_expiry_without_mobile() {
+#[ignore = "requires the explicit task-owned PostgreSQL database"]
+async fn normal_connector_renews_over_real_https_after_access_expiry_without_mobile() {
     let url = std::env::var("ADX_INGESTION_TEST_DATABASE_URL").unwrap();
     let pg: tokio_postgres::Config = url.parse().unwrap();
     assert!(pg
@@ -115,8 +92,8 @@ async fn normal_connector_recovers_over_real_https_after_access_expiry_without_m
     let http = Arc::new(PrivacyHttp::new(center, identity));
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let tls = adx_transport::tls::http_server_acceptor(
-        &fixture.join("ingress-cert.pem"),
-        &fixture.join("ingress-key.pem"),
+        fixture.join("ingress-cert.pem"),
+        fixture.join("ingress-key.pem"),
         None,
         vec![b"http/1.1".to_vec()],
     )
@@ -125,27 +102,69 @@ async fn normal_connector_recovers_over_real_https_after_access_expiry_without_m
     let address = listener.local_addr().unwrap();
     let (shutdown, stop) = tokio::sync::watch::channel(false);
     let serving = tokio::spawn(http.serve(listener, tls, stop));
-    let directory = tempfile::tempdir().unwrap();
-    let config = directory.path().join("consumer.json");
-    std::fs::create_dir(directory.path().join("workspace")).unwrap();
-    std::fs::write(&config, serde_json::to_vec(&json!({
-        "origin":format!("https://{address}"), "ca":fixture.join("ingress-cert.pem"),
-        "workspace_path":directory.path().join("workspace"), "identity_path":directory.path().join("connector.token"),
-        "token":token.as_str(), "target":{"tenant":"tenant","user_id":user,"workspace":workspace,
-        "template":"digitalmate","template_ref":"1","binding_id":scope.binding_id,
-        "binding_generation":"consumer-generation","environment_id":"consumer-environment","service_port":18092}
-    })).unwrap()).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let script = std::env::var("ADX_CONNECTOR_TEST_SCRIPT").unwrap();
-    python(Path::new(&script), "restore-expired", &config).await;
-    python(Path::new(&script), "restart-existing", &config).await;
-    // No phone session or second grant was created during the two processes.
+    let http_client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(
+                &std::fs::read(fixture.join("ingress-cert.pem")).unwrap(),
+            )
+            .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let origin = format!("https://{address}");
+    let expired = http_client
+        .post(format!("{origin}/v1/connector/identity"))
+        .bearer_auth(token.as_str())
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), http::StatusCode::UNAUTHORIZED);
+    let renewed = http_client
+        .post(format!("{origin}/v1/connector/renew"))
+        .bearer_auth(token.as_str())
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(renewed.status(), http::StatusCode::OK);
+    let renewed: serde_json::Value = renewed.json().await.unwrap();
+    assert_eq!(renewed["renewable"], true);
+    assert_eq!(renewed["bootstrap_until"], serde_json::Value::Null);
+    assert!(
+        renewed["recovery_expires_at"].as_i64().unwrap() > renewed["expires_at"].as_i64().unwrap()
+    );
+    let current_token = renewed["token"].as_str().unwrap();
+    let current = http_client
+        .post(format!("{origin}/v1/connector/identity"))
+        .bearer_auth(current_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(current.status(), http::StatusCode::OK);
+    let current: serde_json::Value = current.json().await.unwrap();
+    assert_eq!(current["purpose"], "connector.tool");
+    assert_eq!(current["user_id"], user);
+    assert_eq!(current["workspace"], workspace);
+    assert_eq!(current["binding_generation"], "consumer-generation");
+    // Renewal does not create a phone session or a second grant.
     let counts = client.query_one("SELECT (SELECT count(*) FROM adx_accounts.sessions WHERE user_id=$1), (SELECT count(*) FROM adx_accounts.privacy_grants WHERE user_id=$1)", &[&user]).await.unwrap();
     assert_eq!(counts.get::<_, i64>(0), 0);
     assert_eq!(counts.get::<_, i64>(1), 1);
     bindings.0.lock().unwrap().generation = "replaced-generation".into();
-    python(Path::new(&script), "refuse-replaced", &config).await;
+    for path in ["/v1/connector/identity", "/v1/connector/renew"] {
+        let replaced = http_client
+            .post(format!("{origin}{path}"))
+            .bearer_auth(current_token)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replaced.status(), http::StatusCode::UNAUTHORIZED);
+    }
     shutdown.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(5), serving)
         .await

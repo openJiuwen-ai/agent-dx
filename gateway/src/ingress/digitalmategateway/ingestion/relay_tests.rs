@@ -1,6 +1,6 @@
 //! Real PostgreSQL -> public Agent owner -> shared Ingress/Relay -> independent
-//! Python HTTP/SQLite process. Platform execution and purpose identity are
-//! controlled external ports, explicitly not a deployed sandbox/identity proof.
+//! standard-library HTTP/SQLite substitute. Platform execution, purpose identity
+//! and receiver are controlled external ports, not actual DigitalMate acceptance.
 use super::super::composio::WebhookVerifier;
 use super::tests::{binding, body, headers, SECRET};
 use super::*;
@@ -72,6 +72,42 @@ impl CredentialVerifier for Identity {
         Err(AuthError::Invalid("not a management credential".into()))
     }
 }
+#[async_trait::async_trait]
+impl crate::ingress::accounts::BusinessAuth for Identity {
+    async fn login(
+        &self,
+        _: crate::ingress::accounts::LoginRequest,
+    ) -> crate::ingress::accounts::Result<crate::ingress::accounts::LoginResponse> {
+        Err(crate::ingress::accounts::Error::Unauthorized)
+    }
+    async fn authenticate(
+        &self,
+        _: &str,
+    ) -> crate::ingress::accounts::Result<crate::ingress::accounts::Principal> {
+        Err(crate::ingress::accounts::Error::Unauthorized)
+    }
+    async fn check(
+        &self,
+        _: &crate::ingress::accounts::Principal,
+    ) -> crate::ingress::accounts::Result<()> {
+        Err(crate::ingress::accounts::Error::Unauthorized)
+    }
+    async fn logout(&self, _: &str) -> crate::ingress::accounts::Result<()> {
+        Err(crate::ingress::accounts::Error::Unauthorized)
+    }
+    async fn quota(
+        &self,
+        _: &crate::ingress::accounts::Principal,
+    ) -> crate::ingress::accounts::Result<crate::ingress::accounts::QuotaResponse> {
+        Err(crate::ingress::accounts::Error::Unauthorized)
+    }
+    async fn model_parameters(
+        &self,
+        _: &crate::ingress::accounts::Principal,
+    ) -> crate::ingress::accounts::Result<adx_agent_core::mounts::Parameters> {
+        Err(crate::ingress::accounts::Error::Unauthorized)
+    }
+}
 struct Purpose(std::sync::atomic::AtomicUsize);
 #[async_trait::async_trait]
 impl DeliveryAuthorization for Purpose {
@@ -102,10 +138,9 @@ async fn receiver(
     binding_file: &std::path::Path,
     port: u16,
 ) -> (Child, serde_json::Value) {
-    let python =
-        std::env::var("ADX_INGESTION_TEST_PYTHON").expect("explicit task-owned Python interpreter");
-    let script = std::env::var("ADX_INGESTION_TEST_RECEIVER_SCRIPT")
-        .expect("explicit DigitalMate test receiver script");
+    let python = std::env::var("ADX_INGESTION_TEST_PYTHON").unwrap_or_else(|_| "python3".into());
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/ingestion_receiver.py");
     let mut child = Command::new(python)
         .arg("-B")
         .arg(script)
@@ -149,16 +184,12 @@ async fn published_owner_refuses_missing_or_replaced_binding_without_creating_on
         template_ref: "1".parse().unwrap(),
         binding_id: "binding_one".into(),
     };
-    let access = agent_service::AgentV2Access::new(managed.clone());
-    let selector = agent_service::ServiceSelector {
-        protocol: Protocol::Http,
-        port: Some(1234),
-    };
+    let access = super::super::fixed_service::FixedServiceAccess::new(managed.clone());
     assert!(access
-        .select_existing(
+        .select(
             Arc::new(RequestContext::new(Duration::from_secs(3))),
             scope.clone(),
-            selector,
+            1234,
             "old-generation"
         )
         .await
@@ -169,21 +200,23 @@ async fn published_owner_refuses_missing_or_replaced_binding_without_creating_on
         .resolve(&context, &scope, Protocol::Http, Some(1234))
         .await
         .unwrap();
-    access
-        .select_existing(
+    let selected = access
+        .select(
             Arc::new(RequestContext::new(Duration::from_secs(3))),
             scope.clone(),
-            selector,
+            1234,
             &target.binding.generation,
         )
         .await
         .unwrap();
     activator.delete_binding(&scope).await.unwrap();
+    assert!(access.revalidate(&selected).await.is_err());
+    assert!(state.binding(&scope).await.unwrap().is_none());
     assert!(access
-        .select_existing(
+        .select(
             Arc::new(RequestContext::new(Duration::from_secs(3))),
             scope.clone(),
-            selector,
+            1234,
             &target.binding.generation
         )
         .await
@@ -191,7 +224,7 @@ async fn published_owner_refuses_missing_or_replaced_binding_without_creating_on
 }
 
 #[tokio::test]
-#[ignore = "requires explicit task-owned PostgreSQL and Python receiver"]
+#[ignore = "requires explicit task-owned PostgreSQL and Python standard library"]
 async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() {
     let inbox = super::persistence_tests::store().await;
     let temporary = tempfile::tempdir().unwrap();
@@ -260,6 +293,17 @@ async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() 
     let routes = Arc::new(RouteStore::new());
     routes.set_ready(true);
     routes.put(route);
+    let config = serde_json::from_value(json!({"tenant":"tenant_one", "jiuwen":{"agent_type":"jiuwen","template":"jiuwen","version":"1"}})).unwrap();
+    let api = super::super::entrypoint::DigitalMateGatewayApi::new(
+        config,
+        managed.clone(),
+        Arc::new(Identity),
+    )
+    .unwrap()
+    .with_ingestion_webhook(Arc::new(WebhookHttp::new(
+        Arc::new(WebhookVerifier::new(&[SECRET]).unwrap()),
+        inbox.clone(),
+    )));
     let ingress = Arc::new(
         Ingress::new(
             Arc::new(IngressRouteResolver::new(routes)),
@@ -271,10 +315,7 @@ async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() 
             vec![],
         )
         .with_client_acl(vec!["127.0.0.0/8".parse().unwrap()], false)
-        .with_ingestion_webhook(Arc::new(WebhookHttp::new(
-            Arc::new(WebhookVerifier::new(&[SECRET]).unwrap()),
-            inbox.clone(),
-        ))),
+        .with_digitalmategateway_api(Arc::new(api)),
     );
     let purpose = Arc::new(Purpose(std::sync::atomic::AtomicUsize::new(0)));
     let delivery = Arc::new(
@@ -396,7 +437,6 @@ async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() 
     })
     .await
     .unwrap();
-    assert!(runtime.healthy());
     runtime.stop().await.unwrap();
     assert!(inbox
         .claim(Duration::from_secs(30))

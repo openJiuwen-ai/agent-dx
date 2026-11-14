@@ -2,19 +2,16 @@
 use super::super::connector_owner::{
     OwnerAuthority, OwnerAuthorization, OwnerOperation, OWNER_PATH,
 };
+use super::super::fixed_service::FixedServiceAccess;
 use super::{
     Attempt, AttemptPhase, Authority, ConnectionGrant, ConnectionMetadata, Error, MailAuthConfigs,
     MailProvider, Permissions, Scope, Started, VerifiedAccount,
 };
-use crate::ingress::{
-    agent_service::{AgentV2Access, ServiceSelector},
-    server::Ingress,
-};
+use crate::ingress::server::Ingress;
 use adx_agent_api::{managed::ManagedService, request::RequestContext};
-use adx_agent_core::Protocol;
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{Method, Request, StatusCode, Uri};
+use http::{Method, Request, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
@@ -23,7 +20,7 @@ use std::{sync::Arc, time::Duration};
 
 pub(super) struct M44Authority {
     issuer: Arc<OwnerAuthority>,
-    access: AgentV2Access,
+    access: FixedServiceAccess,
     ingress: Arc<Ingress>,
     configs: MailAuthConfigs,
 }
@@ -44,7 +41,7 @@ impl M44Authority {
     ) -> Self {
         Self {
             issuer,
-            access: AgentV2Access::new(managed),
+            access: FixedServiceAccess::new(managed),
             ingress,
             configs,
         }
@@ -84,35 +81,26 @@ impl M44Authority {
         let context = Arc::new(RequestContext::new(Duration::from_secs(30)));
         let selection = self
             .access
-            .select_existing(
+            .select(
                 context.clone(),
                 admitted.binding_scope().clone(),
-                ServiceSelector {
-                    protocol: Protocol::Http,
-                    port: Some(admitted.service_port()),
-                },
+                admitted.service_port(),
                 admitted.generation(),
             )
             .await
             .map_err(|_| Error::UpstreamUnavailable)?;
-        let actual = selection
-            .forwarding_uri(&Uri::from_static(OWNER_PATH))
-            .map_err(|_| Error::Forbidden)?;
-        if actual.path()
-            != format!(
-                "/{}/{}{}",
-                admitted.environment_id(),
-                admitted.service_port(),
-                OWNER_PATH
-            )
-        {
+        if !selection.matches_target(admitted.environment_id(), admitted.service_port()) {
             return Err(Error::Forbidden);
         }
         let stream = self
             .access
-            .connect_existing_when_ready(&self.ingress, selection)
+            .connect(&self.ingress, &selection)
             .await
             .map_err(|_| Error::UpstreamUnavailable)?;
+        self.access
+            .revalidate(&selection)
+            .await
+            .map_err(|_| Error::Forbidden)?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|_| Error::UpstreamUnavailable)?;

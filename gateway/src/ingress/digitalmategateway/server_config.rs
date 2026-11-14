@@ -12,6 +12,39 @@ use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 use zeroize::{Zeroize, Zeroizing};
 
+/// Existing operator command grammar, kept outside the shared service main.
+/// `None` means ordinary no-argument service startup; imports are never HTTP routes.
+pub async fn run_cli(
+    arguments: Vec<std::ffi::OsString>,
+) -> Option<Result<(), Box<dyn std::error::Error>>> {
+    if arguments.is_empty() {
+        return None;
+    }
+    Some(run_import_cli(&arguments).await)
+}
+
+async fn run_import_cli(
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.len() != 3
+        || !matches!(
+            arguments[0].to_str(),
+            Some("import-composio-key" | "import-composio-webhook-secret")
+        )
+    {
+        return Err("usage: adx-ingress [import-composio-key|import-composio-webhook-secret <private-input.json> <new|revision>]".into());
+    }
+    let expected = arguments[2].to_str().ok_or("invalid secret revision")?;
+    let path = Path::new(&arguments[1]);
+    let revision = if arguments[0] == "import-composio-key" {
+        import_composio_key(path, expected).await?
+    } else {
+        import_composio_webhook_secret(path, expected).await?
+    };
+    println!("Composio service secret imported; revision={revision}");
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ComposioImport {
@@ -148,6 +181,26 @@ async fn import_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cli_routes_only_the_explicit_operator_commands() {
+        assert!(run_cli(Vec::new()).await.is_none());
+        for arguments in [
+            vec!["--help"],
+            vec!["unknown", "input", "new"],
+            vec!["import-composio-key", "input"],
+        ] {
+            let result = run_cli(
+                arguments
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_err());
+        }
+    }
 
     #[test]
     fn webhook_import_has_a_distinct_bounded_secret_set() {

@@ -142,7 +142,7 @@ fn scope() -> Scope {
         .unwrap()
 }
 fn account() -> Value {
-    json!({"id":"ca_fixture", "user_id":scope().composio_user_id(), "status":"ACTIVE", "toolkit":{"slug":"outlook"},
+    json!({"id":"ca_fixture", "user_id":scope().composio_user_id(), "status":"ACTIVE", "experimental":{"account_type":"PRIVATE"}, "toolkit":{"slug":"outlook"},
         "auth_config":{"id":"ac_fixture", "auth_scheme":"OAUTH2", "is_composio_managed":false}})
 }
 fn trigger(id: &str, disabled: bool) -> Value {

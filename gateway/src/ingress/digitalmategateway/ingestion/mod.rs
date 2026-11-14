@@ -15,6 +15,7 @@ mod webhook_http;
 mod worker;
 pub use delivery::{DeliveryBatch, DeliveryEvent, DurableAck};
 pub use relay_delivery::{DeliveryAuthorization, RelayDelivery};
+pub(crate) use runtime::BackgroundService;
 pub use runtime::IngestionRuntime;
 pub(crate) use startup::IngestionConfig;
 pub use store::{Inbox, InboxLimits, Lease, ReceiveReceipt};

@@ -1,12 +1,10 @@
 //! Fixed-generation readiness and HTTP delivery over the actual shared ADX
 //! Ingress/Relay stream. No direct node address, alternate lifecycle or URL proxy.
+use super::super::fixed_service::FixedServiceAccess;
 use super::{DeliveryBatch, DeliveryFailure, DeliveryPort, DurableAck};
-use crate::ingress::{
-    agent_service::{AgentV2Access, ServiceSelector},
-    server::Ingress,
-};
+use crate::ingress::server::Ingress;
 use adx_agent_api::{managed::ManagedService, request::RequestContext};
-use adx_agent_core::{Protocol, Scope};
+use adx_agent_core::Scope;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, StatusCode};
@@ -37,7 +35,7 @@ pub trait DeliveryAuthorization: Send + Sync {
 }
 
 pub struct RelayDelivery {
-    access: AgentV2Access,
+    access: FixedServiceAccess,
     ingress: Arc<Ingress>,
     authorization: Arc<dyn DeliveryAuthorization>,
     timeout: Duration,
@@ -54,7 +52,7 @@ impl RelayDelivery {
             return Err(DeliveryFailure::Rejected);
         }
         Ok(Self {
-            access: AgentV2Access::new(managed),
+            access: FixedServiceAccess::new(managed),
             ingress,
             authorization,
             timeout,
@@ -79,13 +77,10 @@ impl RelayDelivery {
         };
         let selection = self
             .access
-            .select_existing(
+            .select(
                 context.clone(),
                 scope,
-                ServiceSelector {
-                    protocol: Protocol::Http,
-                    port: Some(binding.service_port),
-                },
+                binding.service_port,
                 &binding.binding_generation,
             )
             .await
@@ -97,9 +92,13 @@ impl RelayDelivery {
             })?;
         let stream = self
             .access
-            .connect_existing_when_ready(&self.ingress, selection)
+            .connect(&self.ingress, &selection)
             .await
             .map_err(|_| DeliveryFailure::Unknown)?;
+        self.access
+            .revalidate(&selection)
+            .await
+            .map_err(|_| DeliveryFailure::Rejected)?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|_| DeliveryFailure::Unknown)?;

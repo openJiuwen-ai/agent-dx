@@ -30,6 +30,10 @@ use tokio_tungstenite::{
 };
 use tracing::Instrument;
 
+#[cfg(unix)]
+#[path = "entrypoint_runtime.rs"]
+mod unix;
+
 /// Select how a trusted business identity maps to a pre-mounted workspace.
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -167,33 +171,7 @@ impl DigitalMateGatewayConfig {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        #[cfg(unix)]
-        if let Some(composio) = &self.composio {
-            composio.validate().map_err(|_| invalid())?;
-        }
-        #[cfg(unix)]
-        if let Some(ingestion) = &self.ingestion {
-            ingestion.validate().map_err(|_| invalid())?;
-        }
-        #[cfg(unix)]
-        if (self.ingestion.is_some() || self.composio.is_some())
-            && self
-                .privacy
-                .as_ref()
-                .zip(self.digitalmate.as_ref())
-                .is_none_or(|(privacy, app)| privacy.template != app.template)
-        {
-            return Err(invalid());
-        }
-        #[cfg(unix)]
-        if let Some(privacy) = &self.privacy {
-            if ![&self.orbit, &self.digitalmate].iter().any(|app| {
-                app.as_ref()
-                    .is_some_and(|app| app.template == privacy.template)
-            }) {
-                return Err(invalid());
-            }
-        }
+        self.validate_connectors()?;
         for (application, config) in [
             (Application::Orbit, &self.orbit),
             (Application::DigitalMate, &self.digitalmate),
@@ -253,26 +231,16 @@ pub struct DigitalMateGatewayApi {
     auth: Arc<dyn BusinessAuth>,
     managed: Arc<ManagedService>,
     composio: Option<Arc<super::composio::Composio>>,
+    webhook: Option<Arc<super::ingestion::WebhookHttp>>,
     #[cfg(unix)]
-    prepared_composio: Option<super::composio::PreparedComposio>,
-    #[cfg(unix)]
-    privacy: Option<super::privacy_runtime::PrivacyRuntime>,
-    #[cfg(unix)]
-    ingestion: Option<PreparedIngestion>,
+    runtime: unix::Runtime,
 }
 
-#[cfg(unix)]
-struct PreparedIngestion {
-    settings: super::ingestion::IngestionConfig,
-    inbox: super::ingestion::Inbox,
-    verifier: Arc<super::composio::WebhookVerifier>,
-}
 impl DigitalMateGatewayApi {
     /// Explicit trusted assembly. The caller must supply the real M44 Authority
     /// and shared budget; no user request can construct or replace this client.
     pub fn with_composio(mut self, gateway: Arc<super::composio::Composio>) -> Result<Self, Error> {
-        #[cfg(unix)]
-        if self.prepared_composio.is_some() {
+        if self.has_prepared_composio() {
             return Err(invalid());
         }
         self.foreground_admission().map_err(|_| invalid())?;
@@ -289,22 +257,7 @@ impl DigitalMateGatewayApi {
         B: hyper::body::Body<Data = Bytes> + Send + 'static,
         B::Error: std::error::Error + Send + Sync + 'static,
     {
-        let gateway = self.composio.clone();
-        #[cfg(unix)]
-        let gateway = gateway.or_else(|| {
-            self.prepared_composio.as_ref().map(|prepared| {
-                Arc::new(
-                    prepared.bind(
-                        ingress,
-                        self.ingestion
-                            .as_ref()
-                            .map(|ingestion| ingestion.inbox.clone()),
-                    ),
-                )
-            })
-        });
-        #[cfg(not(unix))]
-        let _ = ingress;
+        let gateway = self.connector_gateway(ingress);
         let Some(gateway) = gateway else {
             return error(StatusCode::NOT_FOUND, "NOT_FOUND");
         };
@@ -362,13 +315,10 @@ impl DigitalMateGatewayApi {
             if !accounts::bearer(headers)?.starts_with("dm-connector-v1.") {
                 return Err(accounts::Error::Unauthorized);
             }
-            #[cfg(unix)]
             return super::composio::Scope::from_connector_identity(
                 self.connector_workload_identity(headers).await?,
             )
             .map_err(|_| accounts::Error::Forbidden);
-            #[cfg(not(unix))]
-            return Err(accounts::Error::Unavailable);
         }
         let identity = self.foreground_admission()?.authenticate(headers).await?;
         super::composio::Scope::from_foreground_identity(identity)
@@ -390,233 +340,16 @@ impl DigitalMateGatewayApi {
         )
     }
 
-    /// Narrow owner-call issuer; available only with the configured existing
-    /// DigitalMate identity HTTPS service. No signing key leaves that service.
-    #[cfg(unix)]
-    pub fn authorization_owner(
-        &self,
-    ) -> accounts::Result<Arc<super::connector_owner::OwnerAuthority>> {
-        self.privacy
-            .as_ref()
-            .and_then(|runtime| runtime.authorization_owner.clone())
-            .ok_or(accounts::Error::Unavailable)
-    }
-
-    /// Authenticate the existing connector workload purpose, independently of
-    /// mobile sessions. Connection intent/read permission is not implied.
-    #[cfg(unix)]
-    pub async fn connector_workload_identity(
-        &self,
-        headers: &http::HeaderMap,
-    ) -> accounts::Result<super::connector_owner::ConnectorWorkloadIdentity> {
-        let identity = self
-            .privacy
-            .as_ref()
-            .ok_or(accounts::Error::Unavailable)?
-            .identity
-            .clone();
-        super::connector_owner::ConnectorWorkloadIdentity::authenticate(identity, headers).await
-    }
-
-    pub fn new(
-        config: DigitalMateGatewayConfig,
-        managed: Arc<ManagedService>,
-        auth: Arc<dyn BusinessAuth>,
-    ) -> Result<Self, Error> {
-        #[cfg(unix)]
-        if config.ingestion.is_some() || config.composio.is_some() {
-            return Err(invalid());
-        }
-        Self::new_inner(
-            config,
-            managed,
-            auth,
-            #[cfg(unix)]
-            None,
-        )
-    }
-
-    /// Existing process startup: validate every dependency before mounting the
-    /// webhook or starting workers. No volatile queue or anonymous auth fallback.
-    pub async fn build(
-        config: DigitalMateGatewayConfig,
-        managed: Arc<ManagedService>,
-        auth: Arc<dyn BusinessAuth>,
-    ) -> Result<Self, Error> {
-        config.validate()?;
-        #[cfg(unix)]
-        let inbox = match &config.ingestion {
-            Some(settings) => Some(settings.open().await.map_err(|_| {
-                Error::Unavailable("DigitalMate ingestion database initialization failed".into())
-            })?),
-            None => None,
-        };
-        let mut api = Self::new_inner(
-            config,
-            managed,
-            auth,
-            #[cfg(unix)]
-            inbox.clone(),
-        )?;
-        #[cfg(unix)]
-        if let Some(settings) = &api.config.composio {
-            let privacy = api.privacy.as_ref().ok_or_else(invalid)?;
-            let bytes = privacy
-                .center
-                .service_secret(
-                    &api.config.tenant,
-                    accounts::ServiceSecretName::ComposioProjectKey,
-                )
-                .await
-                .map_err(|_| invalid())?
-                .and_then(|value| value.plaintext)
-                .ok_or_else(|| Error::Invalid("Composio project key is required".into()))?;
-            let key = std::str::from_utf8(&bytes)
-                .map_err(|_| invalid())?
-                .to_owned();
-            api.prepared_composio = Some(
-                settings
-                    .prepare(
-                        key,
-                        api.authorization_owner().map_err(|_| invalid())?,
-                        api.managed.clone(),
-                    )
-                    .await
-                    .map_err(|_| {
-                        Error::Unavailable(
-                            "Composio client or shared accounting initialization failed".into(),
-                        )
-                    })?,
-            );
-        }
-        #[cfg(unix)]
-        if let Some(settings) = api.config.ingestion.clone() {
-            let privacy = api.privacy.as_ref().ok_or_else(invalid)?;
-            let bytes = privacy
-                .center
-                .service_secret(
-                    &api.config.tenant,
-                    accounts::ServiceSecretName::ComposioWebhookSecret,
-                )
-                .await
-                .map_err(|_| invalid())?
-                .and_then(|value| value.plaintext)
-                .ok_or_else(|| {
-                    Error::Invalid("Composio webhook signing configuration is required".into())
-                })?;
-            let secrets = zeroize::Zeroizing::new(
-                serde_json::from_slice::<Vec<String>>(&bytes).map_err(|_| invalid())?,
-            );
-            let keys: Vec<_> = secrets.iter().map(|secret| secret.as_bytes()).collect();
-            let verifier =
-                Arc::new(super::composio::WebhookVerifier::new(&keys).map_err(|_| invalid())?);
-            api.ingestion = Some(PreparedIngestion {
-                settings,
-                inbox: inbox.ok_or_else(invalid)?,
-                verifier,
-            });
-        }
-        Ok(api)
-    }
-
-    fn new_inner(
-        config: DigitalMateGatewayConfig,
-        managed: Arc<ManagedService>,
-        auth: Arc<dyn BusinessAuth>,
-        #[cfg(unix)] inbox: Option<super::ingestion::Inbox>,
-    ) -> Result<Self, Error> {
-        config.validate()?;
-        #[cfg(unix)]
-        let privacy = if let Some(settings) = config.privacy.clone() {
-            use zeroize::Zeroizing;
-            let path = std::env::var_os("ADX_CREDENTIAL_KEY_FILE").ok_or_else(invalid)?;
-            let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|_| invalid())?);
-            let bytes = Zeroizing::new(hex::decode(text.trim()).map_err(|_| invalid())?);
-            let key =
-                Zeroizing::new(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| invalid())?);
-            let store = auth.privacy_store().ok_or_else(invalid)?;
-            let reader = Arc::new(super::privacy_center::ManagedBindingReader(managed.clone()));
-            let owner = config
-                .digitalmate
-                .clone()
-                .filter(|application| application.template == settings.template)
-                .map(|application| super::connector_owner::OwnerRuntimeConfig {
-                    application,
-                    auth: auth.clone(),
-                });
-            Some(
-                super::privacy_runtime::PrivacyRuntime::start(
-                    settings,
-                    store,
-                    reader,
-                    &key,
-                    &config.tenant,
-                    inbox,
-                    owner,
-                )
-                .map_err(|_| {
-                    Error::Unavailable("DigitalMate privacy service initialization failed".into())
-                })?,
-            )
-        } else {
-            None
-        };
-        Ok(Self {
-            auth,
-            config,
-            managed,
-            composio: None,
-            #[cfg(unix)]
-            prepared_composio: None,
-            #[cfg(unix)]
-            privacy,
-            #[cfg(unix)]
-            ingestion: None,
-        })
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn ingestion_webhook(&self) -> Option<Arc<super::ingestion::WebhookHttp>> {
-        self.ingestion.as_ref().map(|prepared| {
-            Arc::new(super::ingestion::WebhookHttp::new(
-                prepared.verifier.clone(),
-                prepared.inbox.clone(),
-            ))
-        })
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn start_ingestion(
-        &self,
-        ingress: Arc<Ingress>,
-    ) -> Result<Option<super::ingestion::IngestionRuntime>, Error> {
-        let Some(prepared) = &self.ingestion else {
-            return Ok(None);
-        };
-        let identity = self
-            .privacy
-            .as_ref()
-            .and_then(|privacy| privacy.delivery.clone())
-            .ok_or_else(invalid)?;
-        let delivery = super::ingestion::RelayDelivery::new(
-            self.managed.clone(),
-            ingress,
-            identity,
-            Duration::from_secs(prepared.settings.delivery_timeout_seconds),
-        )
-        .map_err(|_| invalid())?;
-        let runtime = super::ingestion::IngestionRuntime::start(
-            prepared.inbox.clone(),
-            prepared.verifier.clone(),
-            Arc::new(delivery),
-            prepared.settings.workers,
-            Duration::from_secs(prepared.settings.lease_seconds),
-        )
-        .map_err(|_| invalid())?;
-        Ok(Some(runtime))
+    pub(crate) fn with_ingestion_webhook(
+        mut self,
+        webhook: Arc<super::ingestion::WebhookHttp>,
+    ) -> Self {
+        self.webhook = Some(webhook);
+        self
     }
     pub fn matches(path: &str) -> bool {
-        super::composio::http::matches(path)
+        path == super::ingestion::WEBHOOK_PATH
+            || super::composio::http::matches(path)
             || path == super::composio::http::CALLBACK_PATH
             || matches!(
                 path,
@@ -637,6 +370,12 @@ impl DigitalMateGatewayApi {
         mut request: Request<Incoming>,
         ingress: Arc<Ingress>,
     ) -> Response<ProxyBody> {
+        if request.uri().path() == super::ingestion::WEBHOOK_PATH {
+            return match self.webhook.clone() {
+                Some(webhook) => webhook.handle(request).await,
+                None => error(StatusCode::NOT_FOUND, "NOT_FOUND"),
+            };
+        }
         if super::composio::http::matches(request.uri().path())
             || request.uri().path() == super::composio::http::CALLBACK_PATH
         {
@@ -682,7 +421,8 @@ impl DigitalMateGatewayApi {
                     }),
                     &self.config.tenant,
                     #[cfg(unix)]
-                    self.privacy
+                    self.runtime
+                        .privacy
                         .as_ref()
                         .map(|privacy| privacy.identity.clone()),
                 )
@@ -1104,4 +844,48 @@ pub(super) fn error(status: StatusCode, code: &str) -> Response<ProxyBody> {
             serde_json::json!({"error":code,"code":code}).to_string(),
         )))
         .expect("fixed error response headers are valid")
+}
+
+#[cfg(not(unix))]
+impl DigitalMateGatewayConfig {
+    fn validate_connectors(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+impl DigitalMateGatewayApi {
+    fn has_prepared_composio(&self) -> bool {
+        false
+    }
+    fn connector_gateway(&self, _ingress: Arc<Ingress>) -> Option<Arc<super::composio::Composio>> {
+        self.composio.clone()
+    }
+    pub async fn connector_workload_identity(
+        &self,
+        _headers: &http::HeaderMap,
+    ) -> accounts::Result<super::connector_owner::ConnectorWorkloadIdentity> {
+        Err(accounts::Error::Unavailable)
+    }
+    pub fn new(
+        config: DigitalMateGatewayConfig,
+        managed: Arc<ManagedService>,
+        auth: Arc<dyn BusinessAuth>,
+    ) -> Result<Self, Error> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            managed,
+            auth,
+            composio: None,
+            webhook: None,
+        })
+    }
+    pub async fn build(
+        config: DigitalMateGatewayConfig,
+        managed: Arc<ManagedService>,
+        auth: Arc<dyn BusinessAuth>,
+    ) -> Result<Self, Error> {
+        Self::new(config, managed, auth)
+    }
 }

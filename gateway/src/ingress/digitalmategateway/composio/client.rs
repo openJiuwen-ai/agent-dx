@@ -274,8 +274,7 @@ impl Client {
         provider: MailProvider,
     ) -> Result<(), Error> {
         let account = self.owned_account(scope, id, alias, provider).await?;
-        if alias.is_some()
-            && !account.is_disabled
+        if !account.is_disabled
             && !account.auth_config.is_disabled
             && matches!(account.status.as_str(), "INITIALIZING" | "INITIATED")
         {
@@ -318,7 +317,7 @@ impl Client {
             || account
                 .experimental
                 .as_ref()
-                .is_some_and(|v| v.account_type != "PRIVATE")
+                .is_none_or(|v| v.account_type != "PRIVATE")
         {
             return Err(Error::AccountMismatch);
         }

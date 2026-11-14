@@ -12,6 +12,33 @@ use deadpool_postgres::{Manager, Pool};
 use serde_json::json;
 use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
+static STARTUP_ENVIRONMENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+struct ScopedEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+impl ScopedEnvironment {
+    fn set<const N: usize>(values: [(&'static str, std::ffi::OsString); N]) -> Self {
+        Self(
+            values
+                .into_iter()
+                .map(|(name, value)| {
+                    let previous = std::env::var_os(name);
+                    std::env::set_var(name, value);
+                    (name, previous)
+                })
+                .collect(),
+        )
+    }
+}
+impl Drop for ScopedEnvironment {
+    fn drop(&mut self) {
+        for (name, value) in self.0.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 fn write(path: &Path, value: serde_json::Value) {
     std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -36,14 +63,9 @@ async fn formal_composio_and_ingestion_startup_share_subscription_entry_and_stop
 }
 
 async fn run_startup_case(composio_only: bool, combined: bool) {
-    if std::env::var_os("ADX_INGESTION_STARTUP_CHILD").is_some() {
-        if composio_only || combined {
-            composio_child(combined).await;
-        } else {
-            child().await;
-        }
-        return;
-    }
+    // These external-database tests run serially; restore every changed process
+    // setting, including after panic. Ordinary parallel tests do not mutate them.
+    let _serial = STARTUP_ENVIRONMENT.lock().await;
     let url = std::env::var("ADX_INGESTION_TEST_DATABASE_URL").unwrap();
     let pg: tokio_postgres::Config = url.parse().unwrap();
     assert!(pg
@@ -125,28 +147,35 @@ async fn run_startup_case(composio_only: bool, combined: bool) {
             json!({"webhook_secrets":["startup-signing-secret"]})
         },
     );
-    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
-    command.env_clear().kill_on_drop(true)
-        .arg("--exact").arg(if combined {"ingress::service::ingestion_startup_tests::formal_composio_and_ingestion_startup_share_subscription_entry_and_stop"} else if composio_only {"ingress::service::ingestion_startup_tests::formal_composio_startup_requires_project_key_and_shared_budget_without_ingestion"} else {"ingress::service::ingestion_startup_tests::formal_ingestion_startup_requires_secret_mounts_webhook_and_stops"})
-        .arg("--ignored").arg("--nocapture").arg("--test-threads=1")
-        .env("ADX_INGESTION_STARTUP_CHILD", "1").env("ADX_STARTUP_DB_URL", url)
-        .env("ADX_JIUWEN_CONFIG", &gateway).env("ADX_ACCOUNT_CONFIG", account)
-        .env("ADX_AGENT_CONFIG", agent).env("ADX_ENVIRONMENT_FILES_CONFIG", files)
-        .env("ADX_CREDENTIAL_KEY_FILE", root).env("STARTUP_WEBHOOK_INPUT", secret)
-        .env("HUAWEI_OAUTH_CLIENT_ID", "synthetic-client").env("HUAWEI_OAUTH_CLIENT_SECRET", "synthetic-secret")
-        .env("STARTUP_MODEL_KEY", "synthetic-model-key").env("STARTUP_ACTIVATOR_TOKEN", "synthetic-activator-token-fixture-at-least-32-bytes")
-        .env("STARTUP_EXECD_TOKEN", "synthetic-execd-token-fixture-at-least-32-bytes").env("STARTUP_FILE_KEY", "synthetic-file-key-fixture-at-least-32-bytes")
-        .env("NO_PROXY", "127.0.0.1,localhost").env("no_proxy", "127.0.0.1,localhost");
-    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "child startup verification failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let _environment = ScopedEnvironment::set([
+        ("ADX_STARTUP_DB_URL", std::ffi::OsString::from(url)),
+        ("ADX_JIUWEN_CONFIG", gateway.into_os_string()),
+        ("ADX_ACCOUNT_CONFIG", account.into_os_string()),
+        ("ADX_AGENT_CONFIG", agent.into_os_string()),
+        ("ADX_ENVIRONMENT_FILES_CONFIG", files.into_os_string()),
+        ("ADX_CREDENTIAL_KEY_FILE", root.into_os_string()),
+        ("STARTUP_WEBHOOK_INPUT", secret.into_os_string()),
+        ("HUAWEI_OAUTH_CLIENT_ID", "synthetic-client".into()),
+        ("HUAWEI_OAUTH_CLIENT_SECRET", "synthetic-secret".into()),
+        ("STARTUP_MODEL_KEY", "synthetic-model-key".into()),
+        (
+            "STARTUP_ACTIVATOR_TOKEN",
+            "synthetic-activator-token-fixture-at-least-32-bytes".into(),
+        ),
+        (
+            "STARTUP_EXECD_TOKEN",
+            "synthetic-execd-token-fixture-at-least-32-bytes".into(),
+        ),
+        (
+            "STARTUP_FILE_KEY",
+            "synthetic-file-key-fixture-at-least-32-bytes".into(),
+        ),
+    ]);
+    if composio_only || combined {
+        composio_child(combined).await;
+    } else {
+        child().await;
+    }
 }
 
 async fn composio_child(combined: bool) {

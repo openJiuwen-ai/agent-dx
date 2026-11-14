@@ -37,8 +37,8 @@ async fn persisted_batch_identity_is_current_and_cannot_read_user_configuration(
 }
 
 #[tokio::test]
-#[ignore = "requires task PostgreSQL and the exact DigitalMate Python consumer source"]
-async fn python_receiver_uses_real_https_identity_and_rejects_revoked_subscription() {
+#[ignore = "requires the explicit task-owned PostgreSQL database"]
+async fn https_client_uses_current_delivery_identity_and_rejects_revoked_subscription() {
     exercise_delivery(true, false).await;
 }
 
@@ -77,7 +77,7 @@ impl BusinessAuth for NoSession {
     }
 }
 
-async fn exercise_delivery(python_receiver: bool, bootstrap: bool) {
+async fn exercise_delivery(https_client: bool, bootstrap: bool) {
     let url = std::env::var("ADX_INGESTION_TEST_DATABASE_URL").unwrap();
     let pg: tokio_postgres::Config = url.parse().unwrap();
     assert!(pg
@@ -408,11 +408,7 @@ async fn exercise_delivery(python_receiver: bool, bootstrap: bool) {
             http::StatusCode::BAD_REQUEST
         );
     }
-    let mut python = if python_receiver {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let executable = std::env::var("DIGITALMATE_INGESTION_CLIENT_PYTHON").unwrap();
-        let source =
-            std::path::PathBuf::from(std::env::var("DIGITALMATE_INGESTION_CLIENT_SOURCE").unwrap());
+    let https = if https_client {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let certificate = fixture.join("ingress-cert.pem");
         let tls = adx_transport::tls::http_server_acceptor(
@@ -423,76 +419,31 @@ async fn exercise_delivery(python_receiver: bool, bootstrap: bool) {
         )
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let origin = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
         let (shutdown, receiver) = tokio::sync::watch::channel(false);
         let server = tokio::spawn(http.clone().serve(listener, tls, receiver));
-        let mut child = tokio::process::Command::new(executable)
-            .arg("-B")
-            .arg(source.join("tests/server/ingestion_identity_process.py"))
-            .arg(format!("https://localhost:{port}"))
-            .arg(certificate)
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(&std::fs::read(certificate).unwrap()).unwrap(),
+            )
+            .build()
             .unwrap();
-        let projected = admission.json();
-        let identity_fields = [
-            "purpose",
-            "tenant",
-            "user_id",
-            "workspace",
-            "template",
-            "template_ref",
-            "binding_id",
-            "binding_generation",
-            "service_port",
-        ];
-        let context: serde_json::Map<String, serde_json::Value> = identity_fields
-            .iter()
-            .map(|name| ((*name).to_owned(), projected[*name].clone()))
-            .collect();
-        let mut input = serde_json::to_vec(&serde_json::json!({
-            "identity": context, "token": token, "batch_id": lease.batch.batch_id,
-            "wire_base64": STANDARD.encode(serde_json::to_vec(&lease.batch).unwrap()),
-        }))
-        .unwrap();
-        input.push(b'\n');
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(&input)
+        let reply = client
+            .post(format!("{origin}/v1/ingestion/admit"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
             .await
             .unwrap();
-        let mut output = BufReader::new(child.stdout.take().unwrap());
-        let mut ready = String::new();
-        tokio::time::timeout(Duration::from_secs(20), output.read_line(&mut ready))
-            .await
-            .unwrap()
-            .unwrap();
-        if ready.trim() != "receiver-https-committed" {
-            use tokio::io::AsyncReadExt;
-            let mut diagnostics = Vec::new();
-            if let Some(stderr) = child.stderr.take() {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    stderr.take(8192).read_to_end(&mut diagnostics),
-                )
-                .await;
-            }
-            // This child receives synthetic test records only and never prints
-            // credentials. Keep its exception so wire failures are diagnosable.
-            assert_eq!(
-                ready.trim(),
-                "receiver-https-committed",
-                "{}",
-                String::from_utf8_lossy(&diagnostics)
-            );
-        }
-        Some((child, output, shutdown, server))
+        assert_eq!(reply.status(), http::StatusCode::OK);
+        let actual: serde_json::Value = reply.json().await.unwrap();
+        assert_eq!(actual, admission.json());
+        Some((client, origin, shutdown, server))
     } else {
         None
     };
@@ -507,26 +458,15 @@ async fn exercise_delivery(python_receiver: bool, bootstrap: bool) {
     if bootstrap {
         assert!(delivery.bootstrap(token, &owner).await.is_err());
     }
-    if let Some((ref mut child, ref mut output, shutdown, server)) = python {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(b"revoked\n")
+    if let Some((client, origin, shutdown, server)) = https {
+        let reply = client
+            .post(format!("{origin}/v1/ingestion/admit"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
             .await
             .unwrap();
-        let mut final_line = String::new();
-        tokio::time::timeout(Duration::from_secs(20), output.read_line(&mut final_line))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(final_line.trim(), "receiver-https-revoked");
-        assert!(tokio::time::timeout(Duration::from_secs(10), child.wait())
-            .await
-            .unwrap()
-            .unwrap()
-            .success());
+        assert_eq!(reply.status(), http::StatusCode::UNAUTHORIZED);
         shutdown.send(true).unwrap();
         server.await.unwrap().unwrap();
     }

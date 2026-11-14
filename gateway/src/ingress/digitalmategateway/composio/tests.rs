@@ -1190,7 +1190,7 @@ impl Fixture {
         self.state.calls.lock().unwrap().len()
     }
     fn account(&self) -> Value {
-        json!({"id":"ca_one", "user_id":self.scope.composio_user_id(), "status":"ACTIVE", "authScheme":"OAUTH2",
+        json!({"id":"ca_one", "user_id":self.scope.composio_user_id(), "status":"ACTIVE", "experimental":{"account_type":"PRIVATE"}, "authScheme":"OAUTH2",
             "alias":self.authority.attempt.lock().unwrap().alias(), "toolkit":{"slug":"gmail"},
             "auth_config":{"id":"ac_custom_gmail","auth_scheme":"OAUTH2","is_composio_managed":false,"is_disabled":false},
             "is_disabled":false, "state":{"val":{"access_token":"never-return-this", "refresh_token":"never-return-this"}}})
@@ -1650,6 +1650,52 @@ async fn mismatched_attempt_alias_is_not_authorization_proof() {
         Some(Error::AccountMismatch)
     );
     assert_eq!(f.authority.writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn read_path_reports_pending_without_restarting_authorization() {
+    for status in ["INITIALIZING", "INITIATED"] {
+        let f = Fixture::new().await;
+        let mut account = f.account();
+        account["experimental"] = json!({"account_type":"PRIVATE"});
+        account["status"] = json!(status);
+        f.reply(200, account);
+        assert_eq!(
+            f.gateway
+                .client
+                .account(&f.scope, "ca_one", None, MailProvider::Google)
+                .await
+                .err(),
+            Some(Error::AuthorizationPending)
+        );
+        assert_eq!(f.state.calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn private_account_requires_positive_provider_evidence() {
+    for evidence in [
+        None,
+        Some(Value::Null),
+        Some(json!({"account_type":"SHARED"})),
+    ] {
+        let f = Fixture::new().await;
+        let mut account = f.account();
+        account.as_object_mut().unwrap().remove("experimental");
+        if let Some(value) = evidence {
+            account["experimental"] = value;
+        }
+        f.reply(200, account);
+        assert_eq!(
+            f.gateway
+                .client
+                .account(&f.scope, "ca_one", None, MailProvider::Google)
+                .await
+                .err(),
+            Some(Error::AccountMismatch)
+        );
+        assert_eq!(f.state.calls.lock().unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]
