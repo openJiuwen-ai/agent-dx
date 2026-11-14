@@ -46,6 +46,7 @@ impl Environment for Platform {
                 ready: true,
                 runtime_id: Some("runtime".into()),
                 message: None,
+                resume_pending: false,
             })
             .clone();
         if self.lose_create_response.swap(false, Ordering::SeqCst) {
@@ -748,6 +749,7 @@ async fn active_previous_environment_keeps_candidate_running_before_switch() {
             ready: true,
             runtime_id: Some("runtime".into()),
             message: None,
+            resume_pending: false,
         },
     );
     platform
@@ -769,6 +771,175 @@ async fn active_previous_environment_keeps_candidate_running_before_switch() {
         "active upgrade must keep the candidate Running to avoid a wake restore"
     );
     assert!(observations[&("tenant".into(), switched.current.environment_id.clone())].ready);
+}
+
+/// A Paused E1 whose wake is in flight (`resume_pending`) is NOT dormant: a user has already
+/// arrived and is waiting (queued or blocked on an exclusive Volume). Checkpointing the
+/// candidate would force that user through an extra wake restore after the switch, so the
+/// active path must keep E2 Running. This is the resume-aware refinement of the dormant
+/// check: phase is Paused, but a wake intent is registered, so the candidate is not paused.
+#[tokio::test]
+async fn paused_previous_environment_with_pending_resume_takes_the_active_path() {
+    use adx_agent_core::alias::{AliasConfig, VersionWeight};
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let a = Activator::new(state.clone(), platform.clone());
+    let one = template();
+    let mut two = one.clone();
+    two.version = "2".into();
+    two.image = "app:2".into();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&one))
+        .await
+        .unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&two))
+        .await
+        .unwrap();
+    let mut config = AliasConfig {
+        tenant: "tenant".into(),
+        template: "app".into(),
+        alias: "production".into(),
+        seed: "stable".into(),
+        versions: vec![VersionWeight {
+            version: "1".into(),
+            weight: 1,
+        }],
+    };
+    let revision = state.put_alias(&config, None).await.unwrap();
+    let mut scope = scope("paused-e1-resume-pending");
+    scope.template_ref = TemplateRef::Alias("production".into());
+    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let original = a.activate(&scope, None, deadline).await.unwrap().binding;
+    // E1 is Paused (so creation gate admits the candidate), but a wake is in flight: a user
+    // has arrived and Platform has a registered resume intent (queued or blocked on a Volume).
+    {
+        let mut observations = platform.observations.lock().unwrap();
+        let e1 = observations
+            .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+            .unwrap();
+        e1.phase = EnvironmentPhase::Paused;
+        e1.resume_pending = true;
+    }
+    config.versions = vec![VersionWeight {
+        version: "2".into(),
+        weight: 1,
+    }];
+    state.put_alias(&config, Some(&revision)).await.unwrap();
+    let prepared = state.prepare_binding(&scope).await.unwrap();
+    let candidate = prepared.secondary.as_ref().unwrap().environment.clone();
+    platform.observations.lock().unwrap().insert(
+        ("tenant".into(), candidate.environment_id.clone()),
+        EnvironmentObservation {
+            id: candidate.environment_id.clone(),
+            tenant: "tenant".into(),
+            phase: EnvironmentPhase::Running,
+            ready: true,
+            runtime_id: Some("runtime".into()),
+            message: None,
+            resume_pending: false,
+        },
+    );
+    assert!(!a.reconcile_binding(&scope, deadline).await.unwrap());
+    let switched = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(switched.current.version, "2");
+    assert_eq!(switched.current, candidate);
+    let observations = platform.observations.lock().unwrap();
+    assert_eq!(
+        observations[&("tenant".into(), switched.current.environment_id.clone())].phase,
+        EnvironmentPhase::Running,
+        "a Paused E1 with a pending wake takes the active path: candidate stays Running"
+    );
+    assert!(
+        observations[&("tenant".into(), switched.current.environment_id.clone())].ready,
+        "the candidate must NOT be checkpointed when a wake for E1 is in flight"
+    );
+    // pause_count stays zero: checkpoint_candidate was skipped because E1 is not dormant.
+    assert_eq!(
+        platform.pause_count.load(Ordering::SeqCst),
+        0,
+        "no pause must be issued while E1 has a pending wake"
+    );
+}
+
+/// The creation gate treats a Paused E1 with `resume_pending` as Stopped-dormant, NOT Idle:
+/// a Paused E1 has already released its runtime, so a wake in flight must not block candidate
+/// creation. This is the resume-aware refinement that keeps `resume_pending` out of the
+/// creation gate (creation.rs) and confined to the switch-time checkpoint decision (lib.rs).
+///
+/// Unlike `paused_previous_environment_with_pending_resume_takes_the_active_path`, this test
+/// does NOT pre-save the candidate via `prepare_binding`, so `reconcile_binding` drives the
+/// full creation path and the creation gate fires. A regression that put `resume_pending` back
+/// into the creation gate would defer creation here (PreviousEnvironmentActive) and the switch
+/// would not commit in this pass.
+#[tokio::test]
+async fn paused_previous_environment_with_pending_resume_does_not_block_creation() {
+    use adx_agent_core::alias::{AliasConfig, VersionWeight};
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let a = Activator::new(state.clone(), platform.clone());
+    let one = template();
+    let mut two = one.clone();
+    two.version = "2".into();
+    two.image = "app:2".into();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&one))
+        .await
+        .unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&two))
+        .await
+        .unwrap();
+    let mut config = AliasConfig {
+        tenant: "tenant".into(),
+        template: "app".into(),
+        alias: "production".into(),
+        seed: "stable".into(),
+        versions: vec![VersionWeight {
+            version: "1".into(),
+            weight: 1,
+        }],
+    };
+    let revision = state.put_alias(&config, None).await.unwrap();
+    let mut scope = scope("creation-gate-pending-resume");
+    scope.template_ref = TemplateRef::Alias("production".into());
+    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let original = a.activate(&scope, None, deadline).await.unwrap().binding;
+    // E1 is Paused (so the creation gate's Stopped check admits it) but a wake is in flight.
+    // The creation gate must NOT treat `resume_pending` as active: a Paused E1 has released its
+    // runtime, so candidate creation proceeds regardless of an in-flight wake for E1.
+    {
+        let mut observations = platform.observations.lock().unwrap();
+        let e1 = observations
+            .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+            .unwrap();
+        e1.phase = EnvironmentPhase::Paused;
+        e1.resume_pending = true;
+    }
+    config.versions = vec![VersionWeight {
+        version: "2".into(),
+        weight: 1,
+    }];
+    state.put_alias(&config, Some(&revision)).await.unwrap();
+    // Full path: reconcile creates the candidate through the creation gate, then the switch-time
+    // decision point runs in the same pass. The switch commits because the gate admitted E2.
+    assert!(!a.reconcile_binding(&scope, deadline).await.unwrap());
+    let switched = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(switched.generation, original.generation);
+    assert_eq!(switched.current.version, "2");
+    // The decision point then sees E1 as Paused + resume_pending = NOT Idle-dormant, so it keeps
+    // the candidate Running (the active path) instead of checkpointing it.
+    let observations = platform.observations.lock().unwrap();
+    assert_eq!(
+        observations[&("tenant".into(), switched.current.environment_id.clone())].phase,
+        EnvironmentPhase::Running,
+        "creation must not be deferred by E1's pending wake"
+    );
+    assert!(
+        observations[&("tenant".into(), switched.current.environment_id.clone())].ready,
+        "the candidate must be created and ready in this pass"
+    );
+    assert_eq!(
+        platform.pause_count.load(Ordering::SeqCst),
+        0,
+        "no checkpoint: E1 has a pending wake, so the decision point takes the active path"
+    );
 }
 
 /// A Failed previous Environment is intentionally NOT treated as dormant: Activator does
@@ -831,6 +1002,7 @@ async fn failed_previous_environment_takes_the_active_path_without_checkpointing
             ready: true,
             runtime_id: Some("runtime".into()),
             message: None,
+            resume_pending: false,
         },
     );
     platform
@@ -1011,6 +1183,7 @@ async fn checkpoint_is_skipped_when_the_step_deadline_already_expired() {
             ready: true,
             runtime_id: Some("runtime".into()),
             message: None,
+            resume_pending: false,
         },
     );
     // The switch-time dormant recheck GETs E1; make that call sleep past the step deadline so

@@ -428,6 +428,7 @@ pub(crate) fn spawn(
             failure: None,
             restart_attempts: 0,
             restart_pending: false,
+            resume_pending: false,
             spec,
             assignment,
             runtime: adx_core::Runtime {

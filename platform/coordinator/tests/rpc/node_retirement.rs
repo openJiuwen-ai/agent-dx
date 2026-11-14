@@ -330,6 +330,7 @@ async fn unregister_node_preserves_recovery_context_until_failed_environment_is_
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
         spec: spec("held"),
         assignment,
         state: adx_core::EnvironmentState::Running,

@@ -49,21 +49,37 @@ pub struct Activator {
     subscription_ready: std::sync::atomic::AtomicBool,
 }
 
-/// Whether the Environment referenced by `current_env_id` is dormant right now:
-/// Paused, Deleted, or absent. Absence counts as dormant: a removed Environment cannot
-/// serve live traffic. Identity is validated so a transport mix-up cannot be mistaken
-/// for an absent Environment. Shared by the creation gate (`creation.rs`) and the
-/// switch-time recheck (`reconcile_binding`) so both stay on one definition of "dormant".
+/// How strictly to treat "dormant" for the previous Environment. The two gates share
+/// one read of E1 but answer different questions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dormancy {
+    /// E1 is physically Paused/Deleted/absent — it is not occupying a runtime, so the
+    /// candidate can be created. Used by the creation gate. A wake in flight does NOT
+    /// block creation: E1 stays Paused while its resume is queued or blocked on a Volume,
+    /// and that must not defer candidate creation or bind upgrade progress to E1's wake.
+    Stopped,
+    /// E1 is stopped AND no wake is in flight (no EnsureRunning queued or blocked on a
+    /// Volume). Used by the switch-time checkpoint decision: a pending wake means a user
+    /// is already waiting, so checkpointing the candidate would cost them an extra wake
+    /// restore after the switch. A Paused E1 with `resume_pending` is treated as active.
+    Idle,
+}
+
+/// Whether the Environment referenced by `current_env_id` is dormant right now, under the
+/// given `Dormancy`. Paused, Deleted, or absent counts as stopped; `Idle` additionally
+/// requires no registered wake intent. Absence counts as dormant: a removed Environment
+/// cannot serve live traffic. Identity is validated so a transport mix-up cannot be
+/// mistaken for an absent Environment. Shared by the creation gate (`creation.rs`) and
+/// the switch-time recheck (`reconcile_binding`) so both stay on one read of E1.
 ///
 /// A `Failed` E1 is intentionally NOT dormant: Activator does not do health recovery or
-/// second-guess Platform failure semantics, so a Failed E1 is treated as still-occupied
-/// (the active path — keep E2 Running for zero-wake switch). If E1 later recovers or is
-/// removed, the next reconcile pass re-evaluates. Paused/Deleted are the only phases that
-/// prove E1 is not serving traffic.
+/// second-guess Platform failure semantics, so a Failed E1 is treated as still-occupied.
+/// If E1 later recovers or is removed, the next reconcile pass re-evaluates.
 async fn previous_environment_dormant(
     environment: &dyn Environment,
     tenant: &str,
     current_env_id: &str,
+    dormancy: Dormancy,
 ) -> std::result::Result<bool, EnvironmentError> {
     match environment.get(tenant, current_env_id).await? {
         None => Ok(true),
@@ -73,10 +89,16 @@ async fn previous_environment_dormant(
                     "previous Environment identity mismatch".into(),
                 ));
             }
-            Ok(matches!(
+            let stopped = matches!(
                 previous.phase,
                 EnvironmentPhase::Paused | EnvironmentPhase::Deleted
-            ))
+            );
+            Ok(match dormancy {
+                Dormancy::Stopped => stopped,
+                // `resume_pending` is only meaningful for Paused; a non-Paused E1 is already
+                // not stopped, so this branch is reached only when `stopped` is true.
+                Dormancy::Idle => stopped && !previous.resume_pending,
+            })
         }
     }
 }
@@ -230,6 +252,7 @@ impl Activator {
                     &*self.environment,
                     &binding.scope.tenant,
                     &binding.current.environment_id,
+                    Dormancy::Idle,
                 )
                 .await?
                 {

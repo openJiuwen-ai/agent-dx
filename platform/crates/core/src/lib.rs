@@ -383,6 +383,11 @@ pub struct EnvironmentRecord {
     pub restart_attempts: u32,
     #[serde(default)]
     pub restart_pending: bool,
+    /// A wake intent is registered but has not completed (queued, blocked on an exclusive
+    /// Volume, or retrying placement). Cleared once the Environment reaches Running.
+    /// Coordinator-owned like `creation_request_id`; Node lifecycle commits leave it unset.
+    #[serde(default)]
+    pub resume_pending: bool,
     pub spec: EnvironmentSpec,
     pub assignment: Assignment,
     pub state: EnvironmentState,

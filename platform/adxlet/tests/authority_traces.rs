@@ -123,6 +123,7 @@ async fn authority_cycles_are_silent_until_cleanup_failure_or_state_change() {
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
     };
     let handle = node
         .environment(

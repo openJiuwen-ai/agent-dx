@@ -112,12 +112,15 @@ impl Activator {
                 // Every upgrade waits for the previous execution to pause, before
                 // its first creation as well as retries, regardless of Volume mode.
                 // Platform remains authoritative for actual resource/Volume admission.
-                // Reuses the switch-time dormant check so both gates share one definition.
+                // Reuses the switch-time dormant check so both gates share one read of E1.
+                // Stopped, not Idle: a Paused E1 with a wake in flight still releases its
+                // runtime, so candidate creation must not block on E1's resume progress.
                 if binding.current != *environment
                     && !previous_environment_dormant(
                         &*self.environment,
                         &binding.scope.tenant,
                         &binding.current.environment_id,
+                        Dormancy::Stopped,
                     )
                     .await?
                 {

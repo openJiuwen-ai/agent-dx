@@ -471,6 +471,7 @@ mod tests {
             failure: None,
             restart_attempts: 0,
             restart_pending: false,
+            resume_pending: false,
         }
     }
     fn register(metrics: &Metrics, record: &EnvironmentRecord) -> Registration {

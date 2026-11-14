@@ -143,6 +143,12 @@ pub struct EnvironmentObservation {
     pub ready: bool,
     pub runtime_id: Option<String>,
     pub message: Option<String>,
+    /// A wake (EnsureRunning) intent is registered but has not completed. Only meaningful
+    /// for a `Paused` Environment: it distinguishes truly idle from one whose wake is
+    /// queued or blocked on an exclusive Volume. Default false for backends that do not
+    /// report it; absence is treated as "no pending wake" so existing flows are unchanged.
+    #[serde(default)]
+    pub resume_pending: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]

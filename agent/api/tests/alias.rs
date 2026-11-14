@@ -34,6 +34,7 @@ impl Environment for Platform {
             ready: true,
             runtime_id: None,
             message: None,
+            resume_pending: false,
         };
         self.0.lock().unwrap().insert(r.id.clone(), value.clone());
         Ok(value)

@@ -38,6 +38,7 @@ pub(crate) fn observation(
         phase,
         runtime_id: None,
         message: None,
+        resume_pending: false,
     }
 }
 pub fn validate_timeout(timeout: Duration) -> Result<(), EnvironmentError> {
@@ -256,7 +257,15 @@ pub(crate) fn observed(
             ));
         }
     };
-    Ok(observation(tenant, id, phase))
+    let mut observed = observation(tenant, id, phase);
+    // A Paused Environment with a registered wake intent is not truly idle: a request is
+    // queued or blocked on an exclusive Volume. The flag is optional on the wire; absence
+    // means "no pending wake reported", preserving existing behavior.
+    observed.resume_pending = row
+        .get("resume_pending")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(observed)
 }
 
 /// Deterministic pause operation identity for a stable tenant/id. The `pause-` prefix

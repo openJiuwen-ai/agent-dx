@@ -642,6 +642,7 @@ mod tests {
             last_operation: None,
             restart_attempts: 0,
             restart_pending: false,
+            resume_pending: false,
         };
         (
             record,
