@@ -14,11 +14,16 @@ This is implemented code; real-provider OAuth/mailbox acceptance is separate.
   physical request against shared organization/user windows, including profile
   and account probes. A denied user rolls back the organization charge. Database
   failures never fall back to unlimited allowance.
-- `fixed_service.rs` is component-local composition of published
-  `ManagedService::retry_resolve` and `binding`. It selects only an existing
-  generation and declared HTTP port, uses ordinary Ingress/Relay forwarding,
-  and exposes an explicit post-readiness target recheck to each caller. Shared
-  AgentV2Access and other products' forwarding paths do not change.
+- The identity owner supplies an opaque `ExistingServiceAdmission` to shared
+  `AgentV2Access::select_existing` / `connect_service_when_ready`. Shared access
+  owns generation-fenced resolution, route/open retry and the post-readiness
+  recheck. Mail adapters neither inspect Environment identity/phase nor own a
+  route-opening loop. Missing/rebuilt Bindings cannot be initialized or
+  reselected for old admitted work. Ordinary select/WS admission semantics stay
+  unchanged; an execution replacement within the admitted generation can use
+  the current route without changing the logical authorization. Refused-listener
+  waits recheck that admission even when route-store revocation lags; they retain
+  the original deadline and one pre-write route refresh budget.
 - `entrypoint_runtime.rs` is the Unix runtime assembly. It reads the project Key
   through the existing configuration center, prepares one client/budget and
   binds the actual M44 adapter with each request's Relay handle. No ownership

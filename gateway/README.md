@@ -459,7 +459,15 @@ scope and declared service, retaining the request deadline and binding generatio
 `connect_service` opens an authorized Relay stream and can refresh the same
 generation once after an unsent route/connection failure. Before any backend WS handshake or business bytes are sent, WS admission may refresh once when authoritative metadata confirms that the Binding was deleted or rebuilt, retaining its original deadline and initialization input. HTTP/SSH remain generation-fenced. Authorization failures do
 not reactivate the target. Returned streams never replay application writes.
-Managed WS uses this path; managed HTTP shares selection/retry while retaining the
+
+Existing identity owners can instead supply an opaque `ExistingServiceAdmission`
+to `AgentV2Access::select_existing`. The shared path never initializes or changes
+the admitted Binding generation, including on WS retries. It handles route/open
+retry, listener readiness and the final target recheck internally. Replacing only
+the Environment can resolve its current route within the same admission;
+deleting/rebuilding the Binding rejects old work. Mail adapters use this path
+without owning route/open loops or reading execution identity/phase.
+Ordinary managed WS uses shared selection/connection; managed HTTP shares selection/retry while retaining the
 backend HTTP pool. The Jiuwen codecs, bounded session/request state and E2A socket
 driver are implemented. Its internal connection adapter uses the shared authorized
 Relay stream, bounds the WS handshake by the original admission deadline, and
@@ -742,12 +750,14 @@ digest and connection generation/revision. Gateway callers must recheck that pro
 before and after physical reads, including after budget waits. Background reads
 still require actual enabled intent/revision. JSON task IDs or modes and the
 connector namespace alone do not establish permission. The existing v1 purpose,
-signer, routing snapshot and 30-second limit remain unchanged.
+signer, logical admission and 30-second limit remain unchanged.
 
 Both issuers reuse the existing signer and grant/session owners. A credential
 expires within 30 seconds and fixes the actor, operation, SHA-256 of the raw HTTP
-entity bytes, scope, workspace, Binding generation, Environment and service port.
-Send `OwnerAuthorization::headers()` only to the packet's exact routing snapshot,
+entity bytes, scope, workspace and Binding generation. Environment identity and
+service port are absent from both signed owner claims and public owner proofs.
+The identity owner also supplies a non-serialized shared service admission.
+Send fresh `OwnerAuthorization::headers()` only over that admitted service,
 using `POST /internal/digitalmate/connectors/v1/authorization-owner`; do not retry
 a sent owner write on another route. The existing HTTPS listener verifies it at
 `POST /v1/connector/authorization-owner` with JSON
@@ -771,8 +781,8 @@ The existing identity HTTPS listener also accepts `POST /v1/ingestion/bootstrap`
 with a valid delivery bearer and exactly `{}`. It rechecks the persisted current
 batch, enabled subscription, existing grant and complete current Binding. The
 response contains only `purpose: "ingestion.connector-bootstrap"`, `target`
-(tenant, user, workspace, template/ref, Binding ID/generation, Environment and
-service port), `connector_token` and `expires_at`. The target must match the
+(tenant, user, workspace, template/ref, Binding ID/generation: seven logical
+fields), `connector_token` and `expires_at`. The target must match the
 configured DigitalMate application and the batch's generation/port.
 
 The connector token reuses that grant and signing root, expires no later than the

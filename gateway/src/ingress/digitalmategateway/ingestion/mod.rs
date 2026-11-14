@@ -19,6 +19,7 @@ pub(crate) use runtime::BackgroundService;
 pub use runtime::IngestionRuntime;
 pub(crate) use startup::IngestionConfig;
 pub use store::{Inbox, InboxLimits, Lease, ReceiveReceipt};
+pub(crate) use subscriptions::SubscriptionFacts;
 pub use subscriptions::{
     IntentPort, ProviderTrigger, SubscriptionCoordinator, SubscriptionError, SubscriptionOutcome,
     SubscriptionSnapshot, TriggerPort,

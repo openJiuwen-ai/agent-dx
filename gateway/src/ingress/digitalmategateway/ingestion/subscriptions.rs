@@ -30,6 +30,21 @@ pub struct SubscriptionSnapshot {
     pub usable: bool,
 }
 
+/// Provider/account facts supplied to the identity owner's v1 projection.
+pub(crate) struct SubscriptionFacts {
+    pub connection_id: String,
+    pub provider: String,
+    pub trigger_slug: String,
+    pub account_id: String,
+    pub auth_config_id: String,
+    pub composio_user_id: String,
+    pub connection_generation: u64,
+    pub record_revision: u64,
+    pub intent_revision: u64,
+    pub enabled: bool,
+    pub usable: bool,
+}
+
 /// Metadata returned only after the project client verifies the exact account,
 /// configured auth config, immutable mapped user and configured trigger type.
 pub struct ProviderTrigger {

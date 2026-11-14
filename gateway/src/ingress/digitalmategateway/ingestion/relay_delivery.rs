@@ -1,10 +1,9 @@
 //! Fixed-generation readiness and HTTP delivery over the actual shared ADX
 //! Ingress/Relay stream. No direct node address, alternate lifecycle or URL proxy.
-use super::super::fixed_service::FixedServiceAccess;
 use super::{DeliveryBatch, DeliveryFailure, DeliveryPort, DurableAck};
+use crate::ingress::agent_service::{AgentV2Access, ExistingServiceAdmission, ServiceAccessError};
 use crate::ingress::server::Ingress;
 use adx_agent_api::{managed::ManagedService, request::RequestContext};
-use adx_agent_core::Scope;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, StatusCode};
@@ -31,11 +30,17 @@ impl Drop for AbortConnection {
 /// its published implementation; this module never mints another identity.
 #[async_trait]
 pub trait DeliveryAuthorization: Send + Sync {
+    /// Identity owner validates the persisted work and admits only its existing
+    /// logical workspace. The returned value exposes no Environment route.
+    async fn admission(
+        &self,
+        batch: &DeliveryBatch,
+    ) -> Result<ExistingServiceAdmission, DeliveryFailure>;
     async fn headers(&self, batch: &DeliveryBatch) -> Result<HeaderMap, DeliveryFailure>;
 }
 
 pub struct RelayDelivery {
-    access: FixedServiceAccess,
+    access: AgentV2Access,
     ingress: Arc<Ingress>,
     authorization: Arc<dyn DeliveryAuthorization>,
     timeout: Duration,
@@ -52,7 +57,7 @@ impl RelayDelivery {
             return Err(DeliveryFailure::Rejected);
         }
         Ok(Self {
-            access: FixedServiceAccess::new(managed),
+            access: AgentV2Access::new(managed),
             ingress,
             authorization,
             timeout,
@@ -63,26 +68,12 @@ impl RelayDelivery {
         &self,
         batch: &DeliveryBatch,
         method: Method,
+        admission: &ExistingServiceAdmission,
     ) -> Result<(StatusCode, Option<DurableAck>), DeliveryFailure> {
         let context = Arc::new(RequestContext::new(self.timeout));
-        let binding = &batch.binding;
-        let scope = Scope {
-            tenant: binding.tenant.clone(),
-            template: binding.template.clone(),
-            template_ref: binding
-                .template_ref
-                .parse()
-                .map_err(|_| DeliveryFailure::Rejected)?,
-            binding_id: binding.binding_id.clone(),
-        };
         let selection = self
             .access
-            .select(
-                context.clone(),
-                scope,
-                binding.service_port,
-                &binding.binding_generation,
-            )
+            .select_existing(context.clone(), admission)
             .await
             .map_err(|error| match error {
                 adx_agent_api::Error::Conflict(_)
@@ -92,13 +83,16 @@ impl RelayDelivery {
             })?;
         let stream = self
             .access
-            .connect(&self.ingress, &selection)
+            .connect_service_when_ready(&self.ingress, selection)
             .await
-            .map_err(|_| DeliveryFailure::Unknown)?;
-        self.access
-            .revalidate(&selection)
-            .await
-            .map_err(|_| DeliveryFailure::Rejected)?;
+            .map_err(|error| match error {
+                ServiceAccessError::Agent(
+                    adx_agent_api::Error::Conflict(_)
+                    | adx_agent_api::Error::NotFound
+                    | adx_agent_api::Error::Invalid(_),
+                ) => DeliveryFailure::Rejected,
+                _ => DeliveryFailure::Unknown,
+            })?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|_| DeliveryFailure::Unknown)?;
@@ -188,11 +182,11 @@ impl DeliveryPort for RelayDelivery {
         let operation = async {
             // Refuse stale/revoked work before requesting platform readiness.
             // The resulting credential is not reused after the readiness wait.
-            let _ = self.authorization.headers(batch).await?;
-            if let (_, Some(ack)) = self.send(batch, Method::GET).await? {
+            let admission = self.authorization.admission(batch).await?;
+            if let (_, Some(ack)) = self.send(batch, Method::GET, &admission).await? {
                 return Ok(ack);
             }
-            self.send(batch, Method::POST)
+            self.send(batch, Method::POST, &admission)
                 .await?
                 .1
                 .ok_or(DeliveryFailure::Unknown)

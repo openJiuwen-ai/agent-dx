@@ -322,9 +322,9 @@ async fn exercise_delivery(https_client: bool, bootstrap: bool) {
             assert_eq!(json["target"]["workspace"], workspace);
             assert_eq!(json["target"]["binding_id"], scope.binding_id);
             assert_eq!(json["target"]["binding_generation"], "generation-one");
-            assert_eq!(json["target"]["environment_id"], "instance-one");
-            assert_eq!(json["target"]["service_port"], 8080);
-            assert_eq!(json["target"].as_object().unwrap().len(), 9);
+            assert!(json["target"].get("environment_id").is_none());
+            assert!(json["target"].get("service_port").is_none());
+            assert_eq!(json["target"].as_object().unwrap().len(), 7);
             let credential = json["connector_token"].as_str().unwrap().to_owned();
             assert!(credential.starts_with("dm-connector-v1."));
             let claims = signer.verify_connector(&credential, false).unwrap();

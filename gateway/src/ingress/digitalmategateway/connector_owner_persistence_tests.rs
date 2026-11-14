@@ -183,7 +183,8 @@ async fn owner_purpose_persisted_workload_needs_no_phone_and_rechecks_real_grant
         assert_eq!(proof["actor"], "connector_workload");
         assert_eq!(proof["user_id"], user);
         assert_eq!(proof["workspace"], workspace);
-        assert_eq!(proof["environment_id"], "owner-environment");
+        assert!(proof.get("environment_id").is_none());
+        assert!(proof.get("service_port").is_none());
         assert_eq!(proof["operation"], serde_json::to_value(operation).unwrap());
         assert!(proof.get("permissions").is_none());
         assert!(proof.get("read_history").is_none());

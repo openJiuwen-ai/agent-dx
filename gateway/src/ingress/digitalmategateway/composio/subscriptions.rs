@@ -1,8 +1,8 @@
 //! The existing M44 owner and project client implement the ingestion ports.
-use super::super::connector_owner::{OwnerAuthority, OwnerAuthorization, OwnerOperation};
+use super::super::connector_owner::{OwnerAuthority, OwnerOperation};
 use super::super::ingestion::{
     Inbox, IntentPort, ProviderTrigger, SubscriptionBinding, SubscriptionCoordinator,
-    SubscriptionSnapshot, TriggerPort,
+    SubscriptionFacts, SubscriptionSnapshot, TriggerPort,
 };
 use super::client::Client;
 use super::owner::M44Authority;
@@ -122,15 +122,10 @@ impl IntentPort for OwnerIntent {
             .owner
             .authorization(scope, OwnerOperation::Intent, &raw)
             .await?;
-        if !same_route(&before, &after) {
+        if !before.same_logical_admission(&after) {
             return Err(Error::Forbidden);
         }
-        Ok(Some(SubscriptionSnapshot {
-            binding_scope: after.binding_scope().clone(),
-            user_id: scope.user_id().into(),
-            workspace: scope.workspace().into(),
-            binding_generation: after.generation().into(),
-            service_port: after.service_port(),
+        Ok(Some(after.subscription_snapshot(SubscriptionFacts {
             connection_id: id.into(),
             provider: intent.provider,
             trigger_slug: slug.into(),
@@ -142,15 +137,8 @@ impl IntentPort for OwnerIntent {
             intent_revision: intent.intent_revision,
             enabled: intent.enabled,
             usable: intent.usable && intent.state == "current",
-        }))
+        })))
     }
-}
-
-fn same_route(before: &OwnerAuthorization, after: &OwnerAuthorization) -> bool {
-    before.binding_scope() == after.binding_scope()
-        && before.generation() == after.generation()
-        && before.environment_id() == after.environment_id()
-        && before.service_port() == after.service_port()
 }
 
 #[cfg(test)]

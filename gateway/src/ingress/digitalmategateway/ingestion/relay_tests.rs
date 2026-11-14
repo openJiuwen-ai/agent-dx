@@ -111,6 +111,29 @@ impl crate::ingress::accounts::BusinessAuth for Identity {
 struct Purpose(std::sync::atomic::AtomicUsize);
 #[async_trait::async_trait]
 impl DeliveryAuthorization for Purpose {
+    async fn admission(
+        &self,
+        batch: &DeliveryBatch,
+    ) -> Result<crate::ingress::agent_service::ExistingServiceAdmission, DeliveryFailure> {
+        crate::ingress::agent_service::ExistingServiceAdmission::new(
+            Scope {
+                tenant: batch.binding.tenant.clone(),
+                template: batch.binding.template.clone(),
+                template_ref: batch
+                    .binding
+                    .template_ref
+                    .parse()
+                    .map_err(|_| DeliveryFailure::Rejected)?,
+                binding_id: batch.binding.binding_id.clone(),
+            },
+            batch.binding.binding_generation.clone(),
+            crate::ingress::agent_service::ServiceSelector {
+                protocol: Protocol::Http,
+                port: Some(batch.binding.service_port),
+            },
+        )
+        .map_err(|_| DeliveryFailure::Rejected)
+    }
     async fn headers(&self, batch: &DeliveryBatch) -> Result<http::HeaderMap, DeliveryFailure> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut result = http::HeaderMap::new();
@@ -184,13 +207,23 @@ async fn published_owner_refuses_missing_or_replaced_binding_without_creating_on
         template_ref: "1".parse().unwrap(),
         binding_id: "binding_one".into(),
     };
-    let access = super::super::fixed_service::FixedServiceAccess::new(managed.clone());
-    assert!(access
-        .select(
-            Arc::new(RequestContext::new(Duration::from_secs(3))),
+    use crate::ingress::agent_service::{AgentV2Access, ExistingServiceAdmission, ServiceSelector};
+    let access = AgentV2Access::new(managed.clone());
+    let admit = |generation: String| {
+        ExistingServiceAdmission::new(
             scope.clone(),
-            1234,
-            "old-generation"
+            generation,
+            ServiceSelector {
+                protocol: Protocol::Http,
+                port: Some(1234),
+            },
+        )
+        .unwrap()
+    };
+    assert!(access
+        .select_existing(
+            Arc::new(RequestContext::new(Duration::from_secs(3))),
+            &admit("old-generation".into()),
         )
         .await
         .is_err());
@@ -200,24 +233,20 @@ async fn published_owner_refuses_missing_or_replaced_binding_without_creating_on
         .resolve(&context, &scope, Protocol::Http, Some(1234))
         .await
         .unwrap();
-    let selected = access
-        .select(
+    let mut selected = access
+        .select_existing(
             Arc::new(RequestContext::new(Duration::from_secs(3))),
-            scope.clone(),
-            1234,
-            &target.binding.generation,
+            &admit(target.binding.generation.clone()),
         )
         .await
         .unwrap();
     activator.delete_binding(&scope).await.unwrap();
-    assert!(access.revalidate(&selected).await.is_err());
+    assert!(access.retry(&mut selected).await.is_err());
     assert!(state.binding(&scope).await.unwrap().is_none());
     assert!(access
-        .select(
+        .select_existing(
             Arc::new(RequestContext::new(Duration::from_secs(3))),
-            scope.clone(),
-            1234,
-            &target.binding.generation
+            &admit(target.binding.generation.clone()),
         )
         .await
         .is_err());

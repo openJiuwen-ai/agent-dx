@@ -17,11 +17,13 @@ Composio 签名/时间戳校验后，精确匹配当前注册的 trigger/account
 worker 领取有界租约并续租，失败或结果未知重试原批次，不重新生成业务身份。
 终态清理由模块内维护任务执行。
 
-`fixed_service.rs` 在 DigitalMate 模块内组合公开的
-`ManagedService::retry_resolve/binding`。仅对已有 Binding 的指定 generation
-请求就绪，校验声明 HTTP port；不会创建缺失 Binding 或换选新代次。
-经现有 Ingress/Relay 等待端口监听后，调用方显式复核 generation、phase 和
-Environment，再签发新鲜用途凭据并发送 HTTP。没有共享转发循环专属分支。
+身份 owner 先核验实际持久工作及 grant，再提供不透明的
+`ExistingServiceAdmission`。邮件交付调用公共
+`AgentV2Access::select_existing` / `connect_service_when_ready`；公共层通过
+既有 Agent 接口请求就绪、等待监听并复核目标，业务层不解析 Environment、
+phase，也不另建路由或重试循环。旧工作不创建缺失 Binding、不改选新代次；
+同代次替换执行体由公共层解析当前路由。就绪后重新取得短期用途凭据，原始
+deadline 限定所有预写等待。已发送 HTTP 不重放，普通 WS 入场行为不变。
 
 交付前先 GET 同批回执，缺失才 POST；只提交匹配 batch ID/digest/实际字节数
 的 durable ACK。接收端持久受理不代表分类、最终 Signal 或报告完成。

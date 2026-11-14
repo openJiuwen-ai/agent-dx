@@ -22,8 +22,9 @@ Scan/Registry、接收及业务处理在用户实例。配置 bearer 不能替�
 
 bootstrap 成功精确返回 `purpose: ingestion.connector-bootstrap`、`target`、
 `connector_token`、`expires_at` 四项。target 含 tenant/user/workspace、
-template/ref、Binding ID/generation、Environment、service_port；必须与持久
-批次及实际 owner 相符。截止不晚于当前 delivery；不能续期、不创建 grant、
+template/ref、Binding ID/generation，共七个逻辑身份字段；不含 Environment
+或 service_port，必须与实际 owner 相符。本地 receiver 端口由独立可信启动
+装配提供，不从 owner target 或请求中取得。截止不晚于当前 delivery；不能续期、不创建 grant、
 不返回 privacy bearer、用户配置或模型/项目 Key。未装配必需 owner 才返回
 503 `AUTH_UNAVAILABLE`，不是所有 bootstrap 都返回503。
 
@@ -34,7 +35,7 @@ template/ref、Binding ID/generation、Environment、service_port；必须与持
 
 ## 批次与接收合同
 
-Gateway `DeliveryAuthorization::headers(batch)` 必须查询实际持久 ready batch、
+Gateway `DeliveryAuthorization::admission(batch)` 及 `headers(batch)` 必须查询实际持久 ready batch、
 启用订阅、代次、digest、真实 wire size、有效账号 grant 及当前完整 Binding。
 不能根据 `enabled: true` 或调用方 epoch 签发。delivery TTL 为60秒，签名
 时钟容忍沿用原 owner 的60秒上界；撤销、终态或旧代次不通过校验。
@@ -53,8 +54,10 @@ owner 经验签和当前检查后构造；生产路径不信任 fixture 的 `x-t
 ## 就绪、提交、重试
 
 1. worker 领取持久批次并检查当前用途；仅选择已有 Binding 的原 generation。
-2. DigitalMate 内部 adapter 通过正式 ManagedService 请求就绪、共享 Ingress/Relay
-   建连；调用方显式复核目标。原始 deadline 限定所有预写等待，不重放已发送请求。
+2. 身份 owner 构造不透明的 `ExistingServiceAdmission`；业务调用公共
+   `AgentV2Access::select_existing` / `connect_service_when_ready`。公共层经原
+   Agent 接口请求就绪、共享 Ingress/Relay 建连并复核目标；同代次可更新执行
+   路由，删除或重建则拒绝。原始 deadline 限定所有预写等待，不重放已发送请求。
 3. 就绪后为每次物理 GET/POST 重新获取短期用途证明。GET 限定同一 batch/digest；
    无已持久回执才 POST，回执丢失重查原批次。
 4. 接收端仅为精确批次路由执行 verifier，在读 body 前和回 ACK 前检查用途/期限；
@@ -68,3 +71,16 @@ owner 经验签和当前检查后构造；生产路径不信任 fixture 的 `x-t
 bootstrap 不能代替长期 normal 身份、用户后台意图或首次可信运行配置投影。
 任意新用户在启动前的可信 target 配置及消费者挂载由部署方单独验证，不得从
 历史用户复制身份或把配置中心整份解密交给 delivery consumer。
+
+## 本轮边界与后续迁移
+
+`connector.authorization-owner` 的短期票据及验权结果绑定逻辑 Scope、用户、
+workspace、Binding generation、purpose、operation、原始 body 摘要、method/path
+及期限，不再包含 Environment 或端口。环境替换不会使同代次逻辑授权失效；
+Binding 重建、会话/grant 撤销仍失效。普通 connector 签名/续期契约不变。
+
+本轮保留 v1 批次/订阅的 `binding_generation`、`service_port`。它们参与
+canonical manifest、batch ID/digest、PostgreSQL payload、接收身份和旧 grant
+匹配，不可在分层整理中直接删除。身份 owner 负责投影和校验这些旧协议字段，
+业务不据此选择执行体。改为不透明 incarnation/grant 引用须另定协议版本、
+存量迁移及回滚方案；此迁移尚未实现，不能将本轮称为持久身份模型已完全收敛。

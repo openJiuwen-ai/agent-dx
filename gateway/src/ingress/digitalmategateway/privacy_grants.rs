@@ -4,7 +4,8 @@ use super::ingestion::{
 };
 use super::privacy_center::BindingReader;
 use crate::ingress::accounts::{AccountStore, Error, PrivacyOwner, StoredPrivacyGrant};
-use adx_agent_core::{BindingPhase, Scope};
+use crate::ingress::agent_service::{ExistingServiceAdmission, ServiceSelector};
+use adx_agent_core::{BindingPhase, Protocol, Scope};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ring::{
     hmac,
@@ -456,6 +457,7 @@ pub(crate) struct DeliveryIdentity {
 pub(crate) struct VerifiedDelivery {
     claims: DeliveryClaims,
     binding: SubscriptionBinding,
+    admission: ExistingServiceAdmission,
 }
 
 impl VerifiedDelivery {
@@ -598,12 +600,41 @@ impl DeliveryIdentity {
         self.identity
             .current_binding(&claims.grant_id, &grant)
             .await?;
-        Ok(VerifiedDelivery { claims, binding })
+        let admission = ExistingServiceAdmission::new(
+            grant.scope.clone(),
+            grant.generation,
+            ServiceSelector {
+                protocol: Protocol::Http,
+                port: Some(binding.service_port),
+            },
+        )
+        .map_err(|_| Error::Unauthorized)?;
+        Ok(VerifiedDelivery {
+            claims,
+            binding,
+            admission,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl DeliveryAuthorization for DeliveryIdentity {
+    async fn admission(
+        &self,
+        batch: &DeliveryBatch,
+    ) -> Result<ExistingServiceAdmission, DeliveryFailure> {
+        let token = self.issue(batch).await.map_err(|error| match error {
+            Error::Unavailable => DeliveryFailure::Unknown,
+            _ => DeliveryFailure::Rejected,
+        })?;
+        self.verify(&token)
+            .await
+            .map(|verified| verified.admission)
+            .map_err(|error| match error {
+                Error::Unavailable => DeliveryFailure::Unknown,
+                _ => DeliveryFailure::Rejected,
+            })
+    }
     async fn headers(&self, batch: &DeliveryBatch) -> Result<http::HeaderMap, DeliveryFailure> {
         let token = self.issue(batch).await.map_err(|error| match error {
             Error::Unavailable => DeliveryFailure::Unknown,

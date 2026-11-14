@@ -4,7 +4,8 @@ use super::foreground_admission::ForegroundIdentity;
 use super::privacy_center::BindingReader;
 use super::privacy_grants::{now, PrivacyIdentity, TokenSigner};
 use crate::ingress::accounts::{self, BusinessAuth, Principal, SessionGuard};
-use adx_agent_core::{AgentBinding, BindingPhase, Scope};
+use crate::ingress::agent_service::{ExistingServiceAdmission, ServiceSelector};
+use adx_agent_core::{AgentBinding, BindingPhase, Protocol, Scope};
 use http::{header, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -65,8 +66,6 @@ pub(super) struct OwnerClaims {
     pub user_id: String,
     pub workspace: String,
     pub binding_generation: String,
-    pub environment_id: String,
-    pub service_port: u16,
     pub operation: OwnerOperation,
     pub body_sha256: String,
     pub audience: String,
@@ -94,8 +93,6 @@ impl OwnerClaims {
             || !bounded(&self.user_id)
             || !bounded(&self.workspace)
             || !bounded(&self.binding_generation)
-            || !bounded(&self.environment_id)
-            || self.service_port == 0
             || !digest_valid(&self.body_sha256)
             || self.audience != OWNER_PATH
             || self.method != "POST"
@@ -126,27 +123,52 @@ impl OwnerClaims {
     }
 }
 
-/// Routing and headers are one snapshot. Send only to this exact admitted Binding
-/// generation, Environment, port and OWNER_PATH; never replay a sent owner write.
+/// Logical authorization and an opaque shared-service admission. Environment
+/// selection remains private to AgentV2Access, never part of this credential.
 pub struct OwnerAuthorization {
     headers: HeaderMap,
     claims: OwnerClaims,
+    admission: ExistingServiceAdmission,
+    service_port: u16,
 }
 impl OwnerAuthorization {
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
-    pub fn binding_scope(&self) -> &Scope {
-        &self.claims.scope
+    pub(crate) fn service_admission(&self) -> &ExistingServiceAdmission {
+        &self.admission
     }
-    pub fn generation(&self) -> &str {
-        &self.claims.binding_generation
+    pub(super) fn same_logical_admission(&self, other: &Self) -> bool {
+        self.admission == other.admission
+            && self.claims.user_id == other.claims.user_id
+            && self.claims.workspace == other.claims.workspace
+            && self.claims.operation == other.claims.operation
+            && self.claims.body_sha256 == other.claims.body_sha256
     }
-    pub fn environment_id(&self) -> &str {
-        &self.claims.environment_id
-    }
-    pub fn service_port(&self) -> u16 {
-        self.claims.service_port
+    /// Retain the published v1 durable identity/hash projection until its
+    /// separate grant-reference migration. Provider adapters do not expand it.
+    pub(super) fn subscription_snapshot(
+        &self,
+        facts: super::ingestion::SubscriptionFacts,
+    ) -> super::ingestion::SubscriptionSnapshot {
+        super::ingestion::SubscriptionSnapshot {
+            binding_scope: self.claims.scope.clone(),
+            user_id: self.claims.user_id.clone(),
+            workspace: self.claims.workspace.clone(),
+            binding_generation: self.claims.binding_generation.clone(),
+            service_port: self.service_port,
+            connection_id: facts.connection_id,
+            provider: facts.provider,
+            trigger_slug: facts.trigger_slug,
+            account_id: facts.account_id,
+            auth_config_id: facts.auth_config_id,
+            composio_user_id: facts.composio_user_id,
+            connection_generation: facts.connection_generation,
+            record_revision: facts.record_revision,
+            intent_revision: facts.intent_revision,
+            enabled: facts.enabled,
+            usable: facts.usable,
+        }
     }
 }
 
@@ -254,7 +276,6 @@ impl OwnerAuthority {
             || binding.phase != BindingPhase::Active
             || binding.parameters.get("workspace").map(String::as_str) != Some(workspace)
             || !bounded(&binding.generation)
-            || !bounded(&binding.current.environment_id)
         {
             return Err(accounts::Error::Unauthorized);
         }
@@ -282,8 +303,7 @@ impl OwnerAuthority {
             "tenant":binding.scope.tenant, "user_id":delivery.user_id,
             "workspace":delivery.workspace, "template":binding.scope.template,
             "template_ref":binding.scope.template_ref.name(), "binding_id":binding.scope.binding_id,
-            "binding_generation":binding.generation, "environment_id":binding.current.environment_id,
-            "service_port":self.application.service_port,
+            "binding_generation":binding.generation,
         }))
     }
 
@@ -304,8 +324,6 @@ impl OwnerAuthority {
             user_id: identity.0.into(),
             workspace: identity.1.into(),
             binding_generation: binding.generation,
-            environment_id: binding.current.environment_id,
-            service_port: self.application.service_port,
             operation,
             body_sha256: hex::encode(Sha256::digest(body)),
             audience: OWNER_PATH.into(),
@@ -394,6 +412,16 @@ impl OwnerAuthority {
         header.set_sensitive(true);
         Ok(OwnerAuthorization {
             headers: HeaderMap::from_iter([(header::AUTHORIZATION, header)]),
+            admission: ExistingServiceAdmission::new(
+                claims.scope.clone(),
+                claims.binding_generation.clone(),
+                ServiceSelector {
+                    protocol: Protocol::Http,
+                    port: Some(self.application.service_port),
+                },
+            )
+            .map_err(|_| accounts::Error::Unauthorized)?,
+            service_port: self.application.service_port,
             claims,
         })
     }
@@ -414,10 +442,7 @@ impl OwnerAuthority {
         let binding = self
             .binding(&claims.scope, &claims.user_id, &claims.workspace)
             .await?;
-        if binding.generation != claims.binding_generation
-            || binding.current.environment_id != claims.environment_id
-            || claims.service_port != self.application.service_port
-        {
+        if binding.generation != claims.binding_generation {
             return Err(accounts::Error::Unauthorized);
         }
         self.check_actor(&claims, workload).await?;
@@ -428,7 +453,6 @@ impl OwnerAuthority {
             "tenant":claims.scope.tenant, "user_id":claims.user_id, "workspace":claims.workspace,
             "template":claims.scope.template, "template_ref":claims.scope.template_ref.name(),
             "binding_id":claims.scope.binding_id, "binding_generation":claims.binding_generation,
-            "environment_id":claims.environment_id, "service_port":claims.service_port,
             "operation":claims.operation, "body_sha256":claims.body_sha256, "expires_at":claims.expires_at,
             "method":"POST", "path":OWNER_PATH }),
         )

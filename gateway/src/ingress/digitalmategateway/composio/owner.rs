@@ -2,11 +2,11 @@
 use super::super::connector_owner::{
     OwnerAuthority, OwnerAuthorization, OwnerOperation, OWNER_PATH,
 };
-use super::super::fixed_service::FixedServiceAccess;
 use super::{
     Attempt, AttemptPhase, Authority, ConnectionGrant, ConnectionMetadata, Error, MailAuthConfigs,
     MailProvider, Permissions, Scope, Started, VerifiedAccount,
 };
+use crate::ingress::agent_service::AgentV2Access;
 use crate::ingress::server::Ingress;
 use adx_agent_api::{managed::ManagedService, request::RequestContext};
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ use std::{sync::Arc, time::Duration};
 
 pub(super) struct M44Authority {
     issuer: Arc<OwnerAuthority>,
-    access: FixedServiceAccess,
+    access: AgentV2Access,
     ingress: Arc<Ingress>,
     configs: MailAuthConfigs,
 }
@@ -41,7 +41,7 @@ impl M44Authority {
     ) -> Self {
         Self {
             issuer,
-            access: FixedServiceAccess::new(managed),
+            access: AgentV2Access::new(managed),
             ingress,
             configs,
         }
@@ -81,26 +81,14 @@ impl M44Authority {
         let context = Arc::new(RequestContext::new(Duration::from_secs(30)));
         let selection = self
             .access
-            .select(
-                context.clone(),
-                admitted.binding_scope().clone(),
-                admitted.service_port(),
-                admitted.generation(),
-            )
+            .select_existing(context.clone(), admitted.service_admission())
             .await
             .map_err(|_| Error::UpstreamUnavailable)?;
-        if !selection.matches_target(admitted.environment_id(), admitted.service_port()) {
-            return Err(Error::Forbidden);
-        }
         let stream = self
             .access
-            .connect(&self.ingress, &selection)
+            .connect_service_when_ready(&self.ingress, selection)
             .await
             .map_err(|_| Error::UpstreamUnavailable)?;
-        self.access
-            .revalidate(&selection)
-            .await
-            .map_err(|_| Error::Forbidden)?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|_| Error::UpstreamUnavailable)?;
@@ -108,13 +96,9 @@ impl M44Authority {
             let _ = connection.await;
         }));
         // Readiness can outlast the original short credential. Reissue only for
-        // the exact same target and raw bytes; never reselect a rebuilt Binding.
+        // the same logical admission and bytes; never replay a sent write.
         let current = self.authorization(scope, operation, &raw).await?;
-        if current.binding_scope() != admitted.binding_scope()
-            || current.generation() != admitted.generation()
-            || current.environment_id() != admitted.environment_id()
-            || current.service_port() != admitted.service_port()
-        {
+        if !admitted.same_logical_admission(&current) {
             return Err(Error::Forbidden);
         }
         let mut request = Request::builder()

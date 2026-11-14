@@ -10,7 +10,6 @@ pub mod download_runtime;
 pub mod download_token;
 pub mod driver;
 pub mod entrypoint;
-mod fixed_service;
 pub mod foreground_admission;
 pub mod frontend;
 pub mod ingestion;

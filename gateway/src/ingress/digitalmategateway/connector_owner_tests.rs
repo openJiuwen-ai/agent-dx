@@ -135,6 +135,41 @@ fn digest(body: &[u8]) -> String {
 }
 
 #[tokio::test]
+async fn owner_authority_proof_contains_logical_target_without_execution_route() {
+    let (owner, identity, _, _, _) = setup();
+    let packet = owner
+        .foreground_headers(&identity, OwnerOperation::Read, b"{}")
+        .await
+        .unwrap();
+    let proof = owner
+        .verify(token(&packet), OwnerOperation::Read, &digest(b"{}"), None)
+        .await
+        .unwrap();
+    assert!(proof.get("environment_id").is_none());
+    assert!(proof.get("service_port").is_none());
+    assert_eq!(proof["binding_generation"], "generation-one");
+}
+
+#[tokio::test]
+async fn owner_authority_survives_execution_replacement_but_not_binding_rebuild() {
+    let (owner, identity, _, bindings, _) = setup();
+    let packet = owner
+        .foreground_headers(&identity, OwnerOperation::Read, b"{}")
+        .await
+        .unwrap();
+    bindings.0.lock().unwrap().current.environment_id = "environment-replacement".into();
+    assert!(owner
+        .verify(token(&packet), OwnerOperation::Read, &digest(b"{}"), None)
+        .await
+        .is_ok());
+    bindings.0.lock().unwrap().generation = "binding-replacement".into();
+    assert!(owner
+        .verify(token(&packet), OwnerOperation::Read, &digest(b"{}"), None)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn owner_read_proof_is_bound_to_the_exact_owner_request_not_mail_permission() {
     let (owner, identity, _, bindings, _) = setup();
     let body = br#"{"operation":"read","connection_id":"connection"}"#;
@@ -201,10 +236,12 @@ async fn delivery_bootstrap_target_requires_exact_actual_binding_and_port() {
         composio_user_id: "dm_test".into(),
         enabled: true,
     };
-    assert_eq!(
-        owner.delivery_target(&record).await.unwrap()["environment_id"],
-        "environment-one"
-    );
+    let target = owner.delivery_target(&record).await.unwrap();
+    assert_eq!(target.as_object().unwrap().len(), 7);
+    assert!(target.get("environment_id").is_none());
+    assert!(target.get("service_port").is_none());
+    bindings.0.lock().unwrap().current.environment_id = "environment-replacement".into();
+    assert_eq!(owner.delivery_target(&record).await.unwrap(), target);
     for changed in [
         "tenant",
         "user",
@@ -243,10 +280,11 @@ async fn owner_purpose_fixes_raw_body_operation_and_actual_binding() {
         .await
         .unwrap();
     assert!(issued.headers()[http::header::AUTHORIZATION].is_sensitive());
-    assert_eq!(issued.generation(), "generation-one");
-    assert_eq!(issued.environment_id(), "environment-one");
-    assert_eq!(issued.service_port(), 18092);
-    assert_eq!(issued.binding_scope(), identity.binding_scope());
+    let fresh = owner
+        .foreground_headers(&identity, OwnerOperation::Current, body)
+        .await
+        .unwrap();
+    assert!(issued.same_logical_admission(&fresh));
     let verified = owner
         .verify(token(&issued), OwnerOperation::Current, &digest(body), None)
         .await
@@ -294,11 +332,10 @@ async fn owner_purpose_rechecks_session_and_generation_before_ack() {
         .is_err());
     auth.0.store(false, Ordering::SeqCst);
     let original = bindings.0.lock().unwrap().clone();
-    for changed in ["generation", "environment", "workspace", "deleting"] {
+    for changed in ["generation", "workspace", "deleting"] {
         let mut binding = original.clone();
         match changed {
             "generation" => binding.generation = "generation-two".into(),
-            "environment" => binding.current.environment_id = "environment-two".into(),
             "workspace" => {
                 binding
                     .parameters
@@ -355,8 +392,6 @@ async fn owner_purpose_rejects_expired_wrong_audience_and_actor_escalation() {
         user_id: identity.user_id().into(),
         workspace: identity.workspace().into(),
         binding_generation: binding.generation,
-        environment_id: binding.current.environment_id,
-        service_port: 18092,
         operation: OwnerOperation::Metadata,
         body_sha256: digest(b"{}"),
         audience: OWNER_PATH.into(),
