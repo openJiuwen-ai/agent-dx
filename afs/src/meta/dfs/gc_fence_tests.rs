@@ -99,6 +99,52 @@ async fn generation_commit_survives_unrelated_gc_and_reply_loss() {
 }
 
 #[tokio::test]
+async fn crc_orphan_inventory_does_not_override_the_published_descriptor() {
+    let f = generation_fixture().await;
+    let root = tempfile::tempdir().unwrap();
+    let stray = LocalChunkStore::open(root.path(), "stray").unwrap();
+    std::fs::write(
+        root.path().join("chunks").join(&f.staged.chunk.id.0),
+        b"same ID with different bytes",
+    )
+    .unwrap();
+    let inventory = stray.gc_inventory().unwrap();
+    assert_eq!(inventory.len(), 1);
+    assert_ne!(inventory[0].content_digest, f.staged.chunk.content_digest);
+    let id = &f.staged.chunk.id;
+    let gc = f
+        .service
+        .collect_garbage(
+            "writer".into(),
+            "writer-session".into(),
+            0,
+            inventory.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(!gc.chunks.contains(id));
+    assert_eq!(f.service.chunk(id).await.unwrap(), inventory[0]);
+
+    f.service
+        .commit_file_version("writer".into(), f.commit.clone())
+        .await
+        .unwrap();
+    assert_eq!(f.service.chunk(id).await.unwrap(), f.staged.chunk);
+    let gc = f
+        .service
+        .collect_garbage(
+            "writer".into(),
+            "writer-session".into(),
+            gc.generation,
+            inventory,
+        )
+        .await
+        .unwrap();
+    assert!(!gc.chunks.contains(id));
+    assert_eq!(f.service.chunk(id).await.unwrap(), f.staged.chunk);
+}
+
+#[tokio::test]
 async fn generation_retirement_prevents_late_commit_and_readmission() {
     let f = generation_fixture().await;
     f.service

@@ -265,6 +265,8 @@ pub struct LocalChunkStore {
     next_staging: AtomicU64,
     #[cfg(any(feature = "dfs", test))]
     gc_inventory_cursor: AtomicU64,
+    #[cfg(any(feature = "dfs", test))]
+    gc_crc_inventory_cursor: AtomicU64,
     /// This Node's own remote-read policy as a reader. Served peer requests
     /// follow the caller's requested mode instead.
     #[cfg(any(feature = "dfs", test))]
