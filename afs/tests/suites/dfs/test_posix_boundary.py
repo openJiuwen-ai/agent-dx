@@ -392,9 +392,11 @@ print(json.dumps({"blocks":[a.f_blocks,b.f_blocks],"bsize":[a.f_bsize,b.f_bsize]
 
 
 def supplementary_group_members_can_change_a_group_writable_directory(c):
-    """#33: a process whose only claim to a group-writable directory is a supplementary
+    """
+    #33: a process whose only claim to a group-writable directory is a supplementary
     group can create, link, rename and remove entries in it; a process outside the
-    group gets EACCES."""
+    group gets EACCES.
+    """
     let_others_traverse(c)
     shared = path(c, "A", "px-group")
     c.python("A", "os.mkdir(sys.argv[1]);os.chmod(sys.argv[1],0o2770)", shared)
