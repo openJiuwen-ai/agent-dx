@@ -35,7 +35,7 @@ pub struct IngressService {
     #[cfg(feature = "agent-api")]
     ssh: Option<super::ssh::SshListener>,
     #[cfg(all(feature = "agent-api", unix))]
-    digitalmate_background: Option<super::digitalmategateway::ingestion::BackgroundService>,
+    digitalmate_background: Option<super::digitalmategateway::ingestion::IngestionRuntime>,
 }
 
 impl IngressService {
@@ -267,7 +267,13 @@ impl IngressService {
         let mut listeners = JoinSet::new();
         #[cfg(all(feature = "agent-api", unix))]
         if let Some(background) = digitalmate_background {
-            listeners.spawn(background.serve(shutdown_rx.clone()));
+            let shutdown = shutdown_rx.clone();
+            listeners.spawn(async move {
+                background
+                    .serve(shutdown)
+                    .await
+                    .map_err(|error| Box::new(error) as ServiceError)
+            });
         }
         #[cfg(feature = "agent-api")]
         if let Some(ssh) = ssh {

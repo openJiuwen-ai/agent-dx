@@ -43,6 +43,7 @@ impl DigitalMateGatewayConfig {
 }
 
 impl DigitalMateGatewayApi {
+    #[cfg(test)]
     pub(super) fn has_prepared_composio(&self) -> bool {
         self.runtime.prepared_composio.is_some()
     }
@@ -51,18 +52,20 @@ impl DigitalMateGatewayApi {
         &self,
         ingress: Arc<Ingress>,
     ) -> Option<Arc<super::super::composio::Composio>> {
-        self.composio.clone().or_else(|| {
-            self.runtime.prepared_composio.as_ref().map(|prepared| {
-                Arc::new(
-                    prepared.bind(
-                        ingress,
-                        self.runtime
-                            .ingestion
-                            .as_ref()
-                            .map(|value| value.inbox.clone()),
-                    ),
-                )
-            })
+        #[cfg(test)]
+        if let Some(gateway) = &self.composio {
+            return Some(gateway.clone());
+        }
+        self.runtime.prepared_composio.as_ref().map(|prepared| {
+            Arc::new(
+                prepared.bind(
+                    ingress,
+                    self.runtime
+                        .ingestion
+                        .as_ref()
+                        .map(|value| value.inbox.clone()),
+                ),
+            )
         })
     }
     /// Narrow owner-call issuer; available only with the configured existing
@@ -177,9 +180,12 @@ impl DigitalMateGatewayApi {
                 verifier,
             });
         }
-        if let Some(webhook) = api.ingestion_webhook() {
-            api = api.with_ingestion_webhook(webhook);
-        }
+        api.webhook = api.runtime.ingestion.as_ref().map(|prepared| {
+            Arc::new(super::super::ingestion::WebhookHttp::new(
+                prepared.verifier.clone(),
+                prepared.inbox.clone(),
+            ))
+        });
         Ok(api)
     }
 
@@ -232,6 +238,7 @@ impl DigitalMateGatewayApi {
             auth,
             config,
             managed,
+            #[cfg(test)]
             composio: None,
             webhook: None,
             runtime: Runtime {
@@ -242,19 +249,10 @@ impl DigitalMateGatewayApi {
         })
     }
 
-    pub(super) fn ingestion_webhook(&self) -> Option<Arc<super::super::ingestion::WebhookHttp>> {
-        self.runtime.ingestion.as_ref().map(|prepared| {
-            Arc::new(super::super::ingestion::WebhookHttp::new(
-                prepared.verifier.clone(),
-                prepared.inbox.clone(),
-            ))
-        })
-    }
-
     pub(crate) fn background_service(
         &self,
         ingress: Arc<Ingress>,
-    ) -> Result<Option<super::super::ingestion::BackgroundService>, Error> {
+    ) -> Result<Option<super::super::ingestion::IngestionRuntime>, Error> {
         let Some(prepared) = &self.runtime.ingestion else {
             return Ok(None);
         };
@@ -276,16 +274,13 @@ impl DigitalMateGatewayApi {
                 .service_port,
         )
         .map_err(|_| invalid())?;
-        let runtime = super::super::ingestion::IngestionRuntime::start(
+        super::super::ingestion::IngestionRuntime::start(
             prepared.inbox.clone(),
-            prepared.verifier.clone(),
             Arc::new(delivery),
             prepared.settings.workers,
             Duration::from_secs(prepared.settings.lease_seconds),
         )
-        .map_err(|_| invalid())?;
-        Ok(Some(super::super::ingestion::BackgroundService::new(
-            runtime,
-        )))
+        .map(Some)
+        .map_err(|_| invalid())
     }
 }

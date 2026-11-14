@@ -73,6 +73,7 @@ pub struct MailAuthConfig {
     pub ownership: OAuthAppOwnership,
 }
 
+#[cfg(test)]
 impl MailAuthConfig {
     pub fn custom(id: String) -> Self {
         Self {
@@ -341,7 +342,6 @@ pub struct Attempt {
     pub deadline_epoch_seconds: u64,
     pub phase: AttemptPhase,
     pub account_id: String,
-    pub expected_email: Option<String>,
 }
 
 impl Attempt {
@@ -401,8 +401,7 @@ pub struct Started {
 #[derive(Clone)]
 pub struct VerifiedAccount {
     pub provider: MailProvider,
-    /// Online immutable Graph subject for Microsoft; not an email or caller ID.
-    /// Gmail profile does not supply this proof, so its value remains empty.
+    /// Online immutable Google/Graph subject; never an email or caller ID.
     pub subject_id: String,
     pub account_id: String,
     pub email: String,
@@ -415,7 +414,7 @@ pub struct Permissions {
     pub read_body: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ConnectionGrant {
     pub provider: MailProvider,
     pub subject_id: String,
@@ -497,6 +496,8 @@ impl ConnectionGrant {
 }
 
 /// No arbitrary method, URL, toolkit, user ID, account ID, tool or headers.
+#[derive(serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GmailRequest {
     Search {
         query: String,
@@ -526,8 +527,11 @@ impl GmailRequest {
 }
 
 /// Personal Microsoft mailbox only; no free-form OData, tool, URL or headers.
+#[derive(serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OutlookRequest {
     Search {
+        #[serde(default)]
         query: String,
         sender: String,
         since: String,
@@ -684,13 +688,6 @@ pub trait Authority: Send + Sync {
         connection_id: &str,
         grant: &ConnectionGrant,
     ) -> Result<(), Error>;
-    /// Disable access before returning; repeated calls retain a cleanup handle
-    /// so an upstream revoke failure can be retried without re-enabling access.
-    async fn fence_connection(
-        &self,
-        scope: &Scope,
-        connection_id: &str,
-    ) -> Result<ConnectionGrant, Error>;
 }
 
 /// Shared organization/per-user budget owner, charged for every physical call.

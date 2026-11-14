@@ -41,45 +41,13 @@ struct Confirmation {
 enum Mail {
     Gmail {
         connection_id: String,
-        request: Gmail,
+        request: GmailRequest,
         access: Option<ReadAccess>,
     },
     Outlook {
         connection_id: String,
-        request: Outlook,
+        request: OutlookRequest,
         access: Option<ReadAccess>,
-    },
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
-enum Gmail {
-    Search {
-        query: String,
-        limit: u16,
-        page: String,
-    },
-    Read {
-        message_id: String,
-        body: bool,
-    },
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
-enum Outlook {
-    Search {
-        #[serde(default)]
-        query: String,
-        sender: String,
-        since: String,
-        until: String,
-        limit: u16,
-        page: String,
-    },
-    Read {
-        message_id: String,
-        body: bool,
     },
 }
 
@@ -90,42 +58,12 @@ impl Mail {
                 connection_id,
                 request,
                 access,
-            } => (
-                connection_id,
-                MailRequest::Gmail(match request {
-                    Gmail::Search { query, limit, page } => {
-                        GmailRequest::Search { query, limit, page }
-                    }
-                    Gmail::Read { message_id, body } => GmailRequest::Read { message_id, body },
-                }),
-                access,
-            ),
+            } => (connection_id, MailRequest::Gmail(request), access),
             Self::Outlook {
                 connection_id,
                 request,
                 access,
-            } => (
-                connection_id,
-                MailRequest::Outlook(match request {
-                    Outlook::Search {
-                        query,
-                        sender,
-                        since,
-                        until,
-                        limit,
-                        page,
-                    } => OutlookRequest::Search {
-                        query,
-                        sender,
-                        since,
-                        until,
-                        limit,
-                        page,
-                    },
-                    Outlook::Read { message_id, body } => OutlookRequest::Read { message_id, body },
-                }),
-                access,
-            ),
+            } => (connection_id, MailRequest::Outlook(request), access),
         }
     }
 }

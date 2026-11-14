@@ -3,11 +3,7 @@ use super::*;
 
 #[test]
 fn mail_subscription_accepts_an_owner_grant_reference_without_execution_identity() {
-    let mut wire = serde_json::to_value(binding()).unwrap();
-    let fields = wire.as_object_mut().unwrap();
-    fields.remove("binding_generation");
-    fields.remove("service_port");
-    fields.insert("authority_ref".into(), serde_json::json!("a".repeat(64)));
+    let wire = serde_json::to_value(binding()).unwrap();
     let projection = serde_json::from_value::<SubscriptionBinding>(wire.clone());
     assert!(
         projection.is_ok(),

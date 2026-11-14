@@ -15,6 +15,19 @@ use std::{
     },
 };
 
+fn configured(
+    api_key: String,
+    configs: MailAuthConfigs,
+    authority: Arc<dyn Authority>,
+    budget: Arc<dyn Budget>,
+) -> Result<Composio, Error> {
+    Ok(Composio {
+        client: super::client::Client::new(api_key, configs, budget)?,
+        authority,
+        subscriptions: None,
+    })
+}
+
 async fn http_candidate(f: &Fixture, path: &str, raw: &str) -> (u16, Value) {
     use http_body_util::BodyExt;
     let request = ::http::Request::builder()
@@ -94,6 +107,53 @@ async fn http_cancel_is_owned_and_stale_confirmation_never_dispatches() {
     assert_eq!(status, 409);
     assert_eq!(value["error"], "authorization_inactive");
     assert!(f.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_mail_wire_rejects_cross_provider_fields_duplicates_and_wrong_types() {
+    let f = Fixture::new().await;
+    for raw in [
+        r#"{"provider":"gmail","connection_id":"connection-one","request":{"operation":"search","query":"","limit":1,"page":"","sender":"other@example.com"}}"#,
+        r#"{"provider":"gmail","connection_id":"connection-one","request":{"operation":"search","query":"","query":"other","limit":1,"page":""}}"#,
+        r#"{"provider":"outlook","connection_id":"connection-one","request":{"operation":"search","sender":"","since":"","until":"","limit":1,"page":"","page":"other"}}"#,
+        r#"{"provider":"outlook","connection_id":"connection-one","request":{"operation":"read","message_id":"message_A","body":"false"}}"#,
+        r#"{"provider":"gmail","connection_id":"connection-one","request":{"operation":"read","message_id":"message_A"}}"#,
+        r#"{"provider":"outlook","connection_id":"connection-one","request":{"operation":"read","message_id":"message_A","body":false,"endpoint":"https://evil.test"}}"#,
+    ] {
+        assert_eq!(
+            http_candidate(&f, "/api/digitalmate/connectors/v1/composio/mail", raw)
+                .await
+                .0,
+            400,
+            "{raw}"
+        );
+    }
+    assert!(f.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_outlook_search_accepts_the_actual_consumer_without_optional_query() {
+    let f = Fixture::outlook(true).await;
+    f.outlook_reads(true, json!({"value":[]}));
+    let (status, value) = http_candidate(
+        &f,
+        "/api/digitalmate/connectors/v1/composio/mail",
+        r#"{"provider":"outlook","connection_id":"connection-one","request":{"operation":"search","sender":"","since":"","until":"","limit":1,"page":""},"access":{"kind":"foreground","task_id":"task-one","execution_epoch":0,"authorization_generation":1,"record_revision":1}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(value, json!({"value":[]}));
+    let calls = f.state.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    let endpoint = reqwest::Url::parse(calls[2].1["endpoint"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        endpoint.path(),
+        format!("/v1.0/users/{OUTLOOK_SUBJECT}/messages")
+    );
+    assert!(!endpoint.query_pairs().any(|(key, _)| key == "$search"));
+    assert!(endpoint
+        .query_pairs()
+        .any(|(key, value)| key == "$top" && value == "1"));
 }
 
 #[tokio::test]
@@ -177,7 +237,7 @@ async fn gmail_same_address_cannot_hide_a_changed_google_subject() {
     f.reads(json!({"messages":[{"id":"must_not_release"}]}));
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
+            .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::AccountMismatch)
@@ -202,7 +262,7 @@ async fn source_read_rechecks_task_after_budget_wait_and_discards_late_mail() {
     *f.budget.refuse_read_at_dispatch.lock().unwrap() = Some(f.authority.clone());
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
+            .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::Forbidden)
@@ -219,7 +279,11 @@ async fn source_read_rechecks_task_after_budget_wait_and_discards_late_mail() {
         .store(true, Ordering::SeqCst);
     assert_eq!(
         late.gateway
-            .gmail(&late.scope, "connection-one", late.search())
+            .mail(
+                &late.scope,
+                "connection-one",
+                MailRequest::Gmail(late.search())
+            )
             .await
             .err(),
         Some(Error::Forbidden)
@@ -956,30 +1020,11 @@ impl Authority for ControlledAuthority {
         grant: &ConnectionGrant,
     ) -> Result<(), Error> {
         let current = self.connection(scope, connection).await?;
-        if current.generation == grant.generation
-            && current.record_revision == grant.record_revision
-            && current.account_id == grant.account_id
-            && current.provider == grant.provider
-            && current.subject_id == grant.subject_id
-            && current.email == grant.email
-            && current.permissions == grant.permissions
-        {
+        if current == *grant {
             Ok(())
         } else {
             Err(Error::Forbidden)
         }
-    }
-    async fn fence_connection(
-        &self,
-        scope: &Scope,
-        connection: &str,
-    ) -> Result<ConnectionGrant, Error> {
-        self.check_scope(scope)?;
-        if connection != "connection-one" {
-            return Err(Error::Forbidden);
-        }
-        self.revoked.store(true, Ordering::SeqCst);
-        Ok(self.grant.lock().unwrap().clone())
     }
 }
 
@@ -1132,7 +1177,6 @@ impl Fixture {
                 deadline_epoch_seconds: u64::MAX,
                 phase: AttemptPhase::Waiting,
                 account_id: "ca_one".into(),
-                expected_email: None,
             }),
             grant: Mutex::new(ConnectionGrant {
                 provider: MailProvider::Google,
@@ -1174,9 +1218,12 @@ impl Fixture {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let mut gateway = Composio::new(
+        let mut gateway = configured(
             "controlled-project-key".into(),
-            "ac_custom_gmail".into(),
+            MailAuthConfigs {
+                gmail: Some(MailAuthConfig::custom("ac_custom_gmail".into())),
+                outlook: None,
+            },
             authority.clone(),
             budget.clone(),
         )
@@ -1239,7 +1286,7 @@ fn scope_mapping_is_stable_and_unambiguous() {
 async fn outlook_shared_mail_path_pins_provider_subject_and_metadata() {
     let mut f = Fixture::new().await;
     let origin = f.gateway.client.origin.clone();
-    f.gateway = Composio::with_configs(
+    f.gateway = configured(
         "controlled-project-key".into(),
         MailAuthConfigs {
             gmail: Some(MailAuthConfig::custom("ac_custom_gmail".into())),
@@ -1315,7 +1362,7 @@ async fn restricted_search_pins_user_account_method_and_endpoint() {
     f.reads(json!({"messages":[{"id":"18abc","threadId":"18def"}],"nextPageToken":"page-two"}));
     let result = f
         .gateway
-        .gmail(&f.scope, "connection-one", f.search())
+        .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
         .await
         .unwrap();
     assert_eq!(result["nextPageToken"], "page-two");
@@ -1341,14 +1388,14 @@ async fn other_scope_and_other_connection_rejected_without_http() {
             .unwrap();
     assert_eq!(
         f.gateway
-            .gmail(&other, "connection-one", f.search())
+            .mail(&other, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::Forbidden)
     );
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-other", f.search())
+            .mail(&f.scope, "connection-other", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::Forbidden)
@@ -1361,13 +1408,13 @@ async fn active_does_not_grant_body_permission() {
     let f = Fixture::new().await;
     assert_eq!(
         f.gateway
-            .gmail(
+            .mail(
                 &f.scope,
                 "connection-one",
-                GmailRequest::Read {
+                MailRequest::Gmail(GmailRequest::Read {
                     message_id: "18abc".into(),
                     body: true
-                }
+                })
             )
             .await
             .err(),
@@ -1396,7 +1443,7 @@ async fn account_ownership_custom_oauth_and_status_checked_online() {
         f.reply(200, account);
         assert!(
             f.gateway
-                .gmail(&f.scope, "connection-one", f.search())
+                .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
                 .await
                 .is_err(),
             "{variant}"
@@ -1412,7 +1459,7 @@ async fn mailbox_switch_cannot_silently_change_account() {
     f.gmail_profile("other@example.com");
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
+            .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::AccountMismatch)
@@ -1484,33 +1531,13 @@ async fn late_completion_rechecks_owner_revision_at_write() {
 }
 
 #[tokio::test]
-async fn disconnect_fences_access_even_when_remote_revoke_fails() {
-    let f = Fixture::new().await;
-    f.reply(200, f.account());
-    f.reply(500, json!({"error":"secret body must never escape"}));
-    assert!(f
-        .gateway
-        .disconnect(&f.scope, "connection-one")
-        .await
-        .is_err());
-    assert_eq!(
-        f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
-            .await
-            .err(),
-        Some(Error::Forbidden)
-    );
-    assert_eq!(f.state.calls.lock().unwrap().len(), 2);
-}
-
-#[tokio::test]
 async fn midflight_disconnect_suppresses_late_content() {
     let f = Fixture::new().await;
     f.state.revoke_during_mail.store(true, Ordering::SeqCst);
     f.reads(json!({"messages":[{"id":"18abc","threadId":"18def"}]}));
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
+            .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::Forbidden)
@@ -1523,7 +1550,7 @@ async fn budget_refusal_never_dispatches_http() {
     f.budget.refuse.store(true, Ordering::SeqCst);
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
+            .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::RateLimited {
@@ -1539,7 +1566,7 @@ async fn rate_limit_and_upstream_scope_failures_remain_distinct() {
     f.reply(429, json!({"error":"sensitive"}));
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
+            .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::RateLimited {
@@ -1554,7 +1581,7 @@ async fn rate_limit_and_upstream_scope_failures_remain_distinct() {
     );
     let error = f
         .gateway
-        .gmail(&f.scope, "connection-one", f.search())
+        .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
         .await
         .err()
         .unwrap();
@@ -1578,7 +1605,7 @@ async fn invalid_message_id_and_page_size_do_not_dispatch() {
     ] {
         assert_eq!(
             f.gateway
-                .gmail(&f.scope, "connection-one", request)
+                .mail(&f.scope, "connection-one", MailRequest::Gmail(request))
                 .await
                 .err(),
             Some(Error::InvalidRequest)
@@ -1747,33 +1774,19 @@ async fn pending_authorization_is_not_a_read_grant_or_reauth_error() {
 }
 
 #[tokio::test]
-async fn already_revoked_reconciles_without_repeating_effect() {
-    let f = Fixture::new().await;
-    let mut account = f.account();
-    account["status"] = json!("REVOKED");
-    f.reply(200, account);
-    f.gateway
-        .disconnect(&f.scope, "connection-one")
-        .await
-        .unwrap();
-    assert!(f.authority.revoked.load(Ordering::SeqCst));
-    assert_eq!(f.state.calls.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
 async fn read_metadata_and_body_formats_are_explicit() {
     for body in [false, true] {
         let f = Fixture::new().await;
         f.authority.grant.lock().unwrap().permissions.read_body = true;
         f.reads(json!({"id":"18abc"}));
         f.gateway
-            .gmail(
+            .mail(
                 &f.scope,
                 "connection-one",
-                GmailRequest::Read {
+                MailRequest::Gmail(GmailRequest::Read {
                     message_id: "18abc".into(),
                     body,
-                },
+                }),
             )
             .await
             .unwrap();
@@ -1797,13 +1810,13 @@ async fn gmail_metadata_excludes_preview_body_and_unrequested_headers() {
             {"name":"Subject","value":"Allowed subject"}, {"name":"X-Private","value":"not requested"}]}}));
     let result = f
         .gateway
-        .gmail(
+        .mail(
             &f.scope,
             "connection-one",
-            GmailRequest::Read {
+            MailRequest::Gmail(GmailRequest::Read {
                 message_id: "18abc".into(),
                 body: false,
-            },
+            }),
         )
         .await
         .unwrap();
@@ -1825,7 +1838,7 @@ async fn response_size_cap_and_project_key_failure_are_safe() {
     f.reply(200, json!({"untrusted": "x".repeat(1_048_577)}));
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
+            .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::ResponseTooLarge)
@@ -1834,7 +1847,7 @@ async fn response_size_cap_and_project_key_failure_are_safe() {
     f.reply(401, json!({"error":"project-key-secret"}));
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
+            .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::NotConfigured)
@@ -1911,11 +1924,8 @@ async fn completed_without_current_receipt_never_fabricates_success() {
 
 #[tokio::test]
 async fn malformed_success_for_effect_is_unknown_not_a_clean_failure() {
-    for action in ["link", "complete", "revoke"] {
+    for action in ["link", "complete"] {
         let f = Fixture::new().await;
-        if action == "revoke" {
-            f.reply(200, f.account());
-        }
         f.reply(200, json!([]));
         let error = match action {
             "link" => {
@@ -1927,7 +1937,6 @@ async fn malformed_success_for_effect_is_unknown_not_a_clean_failure() {
                 .confirm(&f.scope, "registration-one", "opaque")
                 .await
                 .err(),
-            "revoke" => f.gateway.disconnect(&f.scope, "connection-one").await.err(),
             _ => unreachable!(),
         };
         assert_eq!(error, Some(Error::OutcomeUnknown), "{action}");
@@ -1941,7 +1950,7 @@ async fn mailbox_rebind_between_profile_and_read_cannot_return_other_mailbox() {
     f.reads(json!({"messages":[]}));
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
+            .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::ConsentRequired)
@@ -1975,7 +1984,7 @@ async fn missing_provider_config_does_not_claim_authorization_or_send_http() {
 async fn duplicate_provider_auth_config_is_rejected_at_construction() {
     let f = Fixture::new().await;
     assert!(matches!(
-        Composio::with_configs(
+        configured(
             "controlled-project-key".into(),
             MailAuthConfigs {
                 gmail: Some(MailAuthConfig::managed("ac_same".into())),
@@ -1992,7 +2001,7 @@ impl Fixture {
     async fn outlook(managed: bool) -> Self {
         let mut f = Self::new().await;
         let origin = f.gateway.client.origin.clone();
-        f.gateway = Composio::with_configs(
+        f.gateway = configured(
             "controlled-project-key".into(),
             MailAuthConfigs {
                 gmail: Some(MailAuthConfig::custom("ac_custom_gmail".into())),
@@ -2101,7 +2110,7 @@ async fn outlook_upn_fallback_still_requires_the_exact_verified_subject() {
 async fn managed_gmail_is_an_explicit_config_choice_not_a_global_bypass() {
     let mut f = Fixture::new().await;
     let origin = f.gateway.client.origin.clone();
-    f.gateway = Composio::with_configs(
+    f.gateway = configured(
         "controlled-project-key".into(),
         MailAuthConfigs {
             gmail: Some(MailAuthConfig::managed("ac_custom_gmail".into())),
@@ -2129,7 +2138,7 @@ async fn provider_mismatch_and_body_permission_are_refused_before_http() {
     let f = Fixture::outlook(true).await;
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
+            .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::Forbidden)
@@ -2396,7 +2405,7 @@ async fn gmail_still_requires_an_owner_verified_profile_address() {
     f.authority.grant.lock().unwrap().email.clear();
     assert_eq!(
         f.gateway
-            .gmail(&f.scope, "connection-one", f.search())
+            .mail(&f.scope, "connection-one", MailRequest::Gmail(f.search()))
             .await
             .err(),
         Some(Error::Forbidden)

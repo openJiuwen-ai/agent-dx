@@ -2,6 +2,7 @@
 use super::super::connector_owner::{
     OwnerAuthority, OwnerAuthorization, OwnerOperation, OWNER_PATH,
 };
+use super::super::ConnectionTask;
 use super::{
     Attempt, AttemptPhase, Authority, ConnectionGrant, ConnectionMetadata, Error, MailAuthConfigs,
     MailProvider, Permissions, Scope, Started, VerifiedAccount,
@@ -23,13 +24,6 @@ pub(super) struct M44Authority {
     access: AgentV2Access,
     ingress: Arc<Ingress>,
     configs: MailAuthConfigs,
-}
-
-struct ConnectionTask(tokio::task::JoinHandle<()>);
-impl Drop for ConnectionTask {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 impl M44Authority {
@@ -413,7 +407,6 @@ impl Authority for M44Authority {
             deadline_epoch_seconds: current.deadline_epoch_seconds,
             phase,
             account_id: current.account_id,
-            expected_email: None,
         })
     }
     async fn cancel_attempt(&self, scope: &Scope, registration: &str) -> Result<(), Error> {
@@ -574,21 +567,9 @@ impl Authority for M44Authority {
         expected: &ConnectionGrant,
     ) -> Result<(), Error> {
         let current = self.connection(scope, connection_id).await?;
-        if current.provider != expected.provider
-            || current.subject_id != expected.subject_id
-            || current.account_id != expected.account_id
-            || current.email != expected.email
-            || current.generation != expected.generation
-            || current.record_revision != expected.record_revision
-            || current.permissions != expected.permissions
-        {
+        if current != *expected {
             return Err(Error::Forbidden);
         }
         Ok(())
-    }
-    async fn fence_connection(&self, _: &Scope, _: &str) -> Result<ConnectionGrant, Error> {
-        // The frozen owner contract has no remove/cleanup-receipt operation.
-        // Never imitate that writer or revoke first without its local fence.
-        Err(Error::NotConfigured)
     }
 }

@@ -431,14 +431,8 @@ async fn postgres_worker_delivers_over_real_relay_and_recovers_python_restart() 
         .retry(&lease, Duration::ZERO, "delivery_unknown")
         .await
         .unwrap();
-    let runtime = IngestionRuntime::start(
-        inbox.clone(),
-        Arc::new(WebhookVerifier::new(&[SECRET]).unwrap()),
-        delivery,
-        2,
-        Duration::from_secs(30),
-    )
-    .unwrap();
+    let runtime =
+        IngestionRuntime::start(inbox.clone(), delivery, 2, Duration::from_secs(30)).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let client = inbox.pool().get().await.unwrap();

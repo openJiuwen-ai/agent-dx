@@ -758,10 +758,11 @@ Both issuers reuse the existing signer and grant/session owners. A credential
 expires within 30 seconds and fixes the actor, operation, SHA-256 of the raw HTTP
 entity bytes, scope, workspace and Binding generation. Environment identity and
 service port are absent from both signed owner claims and public owner proofs.
-The identity owner also supplies a non-serialized shared service admission.
-Send fresh `OwnerAuthorization::headers()` only over that admitted service,
-using `POST /internal/digitalmate/connectors/v1/authorization-owner`; do not retry
-a sent owner write on another route. The existing HTTPS listener verifies it at
+The identity owner retains the original operation in `OwnerAuthorization`.
+The caller selects and connects using its logical Scope and configured selector,
+then refreshes that same authorization after readiness before sending its headers
+to `POST /internal/digitalmate/connectors/v1/authorization-owner`. A sent owner
+write is never retried on another route. The existing HTTPS listener verifies it at
 `POST /v1/connector/authorization-owner` with JSON
 `{"operation":"current","body_sha256":"<lowercase SHA-256 hex>"}` and rechecks
 the current session/grant and Binding before returning the verified fields.
@@ -785,7 +786,9 @@ batch, enabled subscription, existing grant and complete current Binding. The
 response contains only `purpose: "ingestion.connector-bootstrap"`, `target`
 (tenant, user, workspace, template/ref, Binding ID/generation: seven logical
 fields), `connector_token` and `expires_at`. The target must match the
-configured DigitalMate application and the batch's generation/port.
+configured DigitalMate application and the persisted batch's original authority.
+Binding generation is resolved privately by the identity owner; receiver port is
+separate trusted startup configuration, never a batch identity field.
 
 The connector token reuses that grant and signing root, expires no later than the
 delivery credential, and has a signed bootstrap deadline. It cannot renew, obtain

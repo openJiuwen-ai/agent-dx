@@ -1,5 +1,5 @@
 //! The existing M44 owner and project client implement the ingestion ports.
-use super::super::connector_owner::{OwnerAuthority, OwnerOperation};
+use super::super::connector_owner::OwnerOperation;
 use super::super::ingestion::{
     Inbox, IntentPort, ProviderTrigger, SubscriptionBinding, SubscriptionCoordinator,
     SubscriptionFacts, SubscriptionSnapshot, TriggerPort,
@@ -7,30 +7,12 @@ use super::super::ingestion::{
 use super::client::Client;
 use super::owner::M44Authority;
 use super::types::identifier;
-use super::{Authority, Composio, Error, MailAuthConfigs, MailProvider, Scope};
-use crate::ingress::server::Ingress;
-use adx_agent_api::managed::ManagedService;
+use super::{Authority, Error, MailProvider, Scope};
 use async_trait::async_trait;
 use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, sync::Arc};
-
-impl Composio {
-    /// Request-scoped production composition. The issuer, Relay, client, budget,
-    /// configurations and Inbox retain their existing state owners.
-    pub fn subscriptions(
-        &self,
-        inbox: Inbox,
-        issuer: Arc<OwnerAuthority>,
-        managed: Arc<ManagedService>,
-        ingress: Arc<Ingress>,
-        configs: MailAuthConfigs,
-    ) -> SubscriptionCoordinator {
-        let owner = Arc::new(M44Authority::new(issuer, managed, ingress, configs.clone()));
-        coordinator(self.client.clone(), owner, inbox)
-    }
-}
 
 /// The prepared client and exact same typed M44 proxy can be shared by assembly.
 pub(super) fn coordinator(

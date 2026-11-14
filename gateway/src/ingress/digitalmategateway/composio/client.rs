@@ -516,36 +516,6 @@ impl Client {
             None => Ok(result),
         }
     }
-
-    pub(super) async fn revoke(
-        &self,
-        scope: &Scope,
-        id: &str,
-        provider: MailProvider,
-    ) -> Result<(), Error> {
-        let current = self.owned_account(scope, id, None, provider).await?;
-        if current.status == "REVOKED" {
-            return Ok(());
-        }
-        let result = self
-            .request(
-                scope,
-                Method::POST,
-                &format!("/api/v3.1/connected_accounts/{id}/revoke"),
-                None,
-                true,
-            )
-            .await?;
-        let account = result
-            .get("connected_account")
-            .ok_or(Error::OutcomeUnknown)?;
-        if account.get("id").and_then(Value::as_str) != Some(id)
-            || account.get("status").and_then(Value::as_str) != Some("REVOKED")
-        {
-            return Err(Error::OutcomeUnknown);
-        }
-        Ok(())
-    }
 }
 
 // Gmail's metadata representation includes snippet by default. Select and

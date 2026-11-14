@@ -171,7 +171,6 @@ impl SubscriptionCoordinator {
         }
         self.assert_current(scope, connection_id, &current).await?;
         let binding = expected.binding(id, trigger.trigger_id);
-        binding.validate()?;
         self.inbox.register(&binding).await?;
         // A revocation may race the short cross-owner commit. The receiver also
         // reads live owner intent; a stale registration alone cannot authorize it.

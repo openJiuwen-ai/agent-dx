@@ -35,6 +35,13 @@ actual source change and must retain the existing invalidation behavior.
   binds the actual M44 adapter with each request's Relay handle. No ownership
   cycle, additional service or new Environment lifecycle implementation is added.
 
+Query intent and pagination orchestration belong to the user instance. The Key
+holder encodes the bounded provider request, verifies account/cursor scope and
+projects only permitted response fields. Sender/time matching preserves the
+requested query; it is not a background mail-classification policy. The instance
+owns MIME/HTML parsing, normalization, domain filtering, Signal publication and
+report processing. The coordinator never fetches message bodies for filtering.
+
 ## Trusted configuration
 
 `ADX_JIUWEN_CONFIG` may contain:
@@ -79,8 +86,8 @@ and oversized bodies are rejected. Responses use no-store/no-referrer.
 
 GET `callback` is a static landing page. It does not authorize an account or
 perform native App handoff. A privacy or delivery bearer cannot perform these
-normal-workload calls. `Scope::from_authenticated_foreground` is an internal
-assembly seam, not authentication.
+normal-workload calls. Foreground Scope is admitted through the configured
+DigitalMate application and its actual business session; JSON cannot create it.
 
 Start/confirm CAS-claim the actual attempt before physical effects. Unknown
 outcomes reconcile the account already bound to that attempt; no blind repeated

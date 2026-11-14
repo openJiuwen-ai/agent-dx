@@ -1,30 +1,10 @@
 //! Bounded worker lifecycle owned by the existing Gateway process.
-use super::super::composio::WebhookVerifier;
-use super::{DeliveryPort, Error, Inbox, WebhookHttp, Worker};
+use super::{DeliveryPort, Error, Inbox, Worker};
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::watch, task::JoinSet};
 
-/// Opaque product task: the shared service only spawns and supplies shutdown.
-pub(crate) struct BackgroundService(IngestionRuntime);
-
-impl BackgroundService {
-    pub(crate) fn new(runtime: IngestionRuntime) -> Self {
-        Self(runtime)
-    }
-
-    pub(crate) async fn serve(
-        self,
-        shutdown: watch::Receiver<bool>,
-    ) -> Result<(), crate::ingress::service::ServiceError> {
-        self.0
-            .serve(shutdown)
-            .await
-            .map_err(|error| Box::new(error) as crate::ingress::service::ServiceError)
-    }
-}
-
-pub struct IngestionRuntime {
-    pub webhook: Arc<WebhookHttp>,
+/// Product task owned by the existing service's shutdown and task supervision.
+pub(crate) struct IngestionRuntime {
     shutdown: watch::Sender<bool>,
     tasks: JoinSet<Result<(), Error>>,
 }
@@ -32,9 +12,8 @@ pub struct IngestionRuntime {
 impl IngestionRuntime {
     /// All dependencies are real, initialized owners. No empty delivery,
     /// anonymous authorization or volatile queue fallback is installed.
-    pub fn start(
+    pub(crate) fn start(
         inbox: Inbox,
-        verifier: Arc<WebhookVerifier>,
         delivery: Arc<dyn DeliveryPort>,
         workers: usize,
         lease: Duration,
@@ -64,15 +43,11 @@ impl IngestionRuntime {
                 }
             }
         });
-        Ok(Self {
-            webhook: Arc::new(WebhookHttp::new(verifier, inbox)),
-            shutdown,
-            tasks,
-        })
+        Ok(Self { shutdown, tasks })
     }
 
     /// Completion is observed directly, without shared-layer health polling.
-    pub async fn serve(mut self, mut shutdown: watch::Receiver<bool>) -> Result<(), Error> {
+    pub(crate) async fn serve(mut self, mut shutdown: watch::Receiver<bool>) -> Result<(), Error> {
         if *shutdown.borrow() {
             return self.stop().await;
         }
@@ -83,7 +58,7 @@ impl IngestionRuntime {
         }
     }
 
-    pub async fn stop(mut self) -> Result<(), Error> {
+    pub(crate) async fn stop(mut self) -> Result<(), Error> {
         let _ = self.shutdown.send(true);
         let mut result = Ok(());
         while let Some(task) = self.tasks.join_next().await {

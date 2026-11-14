@@ -418,23 +418,7 @@ impl PrivacyIdentity {
         if !self.targets(&grant.scope.template) || !TokenSigner::matches(&claims, &grant) {
             return Err(Error::Unauthorized);
         }
-        let binding = match self.bindings.binding(&grant.scope).await {
-            Ok(binding) => binding,
-            Err(Error::Unauthorized) => {
-                self.store.privacy_revoke_grant(&claims.id).await?;
-                return Err(Error::Unauthorized);
-            }
-            Err(error) => return Err(error),
-        };
-        if binding.scope != grant.scope
-            || binding.phase != BindingPhase::Active
-            || binding.generation != grant.generation
-            || binding.parameters.get("workspace").map(String::as_str)
-                != Some(grant.workspace.as_str())
-        {
-            self.store.privacy_revoke_grant(&claims.id).await?;
-            return Err(Error::Unauthorized);
-        }
+        self.current_binding(&claims.id, &grant).await?;
         let current = now()?;
         claims.exp = current + ACCESS_SECONDS;
         claims.recovery_until = current + RECOVERY_SECONDS;
@@ -609,10 +593,7 @@ impl DeliveryAuthorization for DeliveryIdentity {
         binding_scope(&verified.binding).map_err(delivery_failure)
     }
     async fn headers(&self, batch: &DeliveryBatch) -> Result<http::HeaderMap, DeliveryFailure> {
-        let token = self.issue(batch).await.map_err(|error| match error {
-            Error::Unavailable => DeliveryFailure::Unknown,
-            _ => DeliveryFailure::Rejected,
-        })?;
+        let token = self.issue(batch).await.map_err(delivery_failure)?;
         let mut value: http::HeaderValue = format!("Bearer {}", token.as_str())
             .parse()
             .map_err(|_| DeliveryFailure::Rejected)?;

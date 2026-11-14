@@ -211,14 +211,17 @@ impl PrivacyHttp {
                     return Err(Error::Invalid);
                 }
                 let ingestion = self.ingestion.as_ref().ok_or(Error::Unavailable)?;
-                let admission = ingestion.verify(&token).await?;
                 if path == "/v1/ingestion/admit" {
+                    let admission = ingestion.verify(&token).await?;
                     return Ok(response(StatusCode::OK, admission.json()));
                 }
-                let owner = self
-                    .authorization_owner
-                    .as_ref()
-                    .ok_or(Error::Unavailable)?;
+                let Some(owner) = self.authorization_owner.as_ref() else {
+                    // Preserve authentication failure precedence even when the
+                    // bootstrap owner is not configured. Configured bootstrap
+                    // performs its own initial and final verification.
+                    ingestion.verify(&token).await?;
+                    return Err(Error::Unavailable);
+                };
                 Ok(response(
                     StatusCode::OK,
                     ingestion.bootstrap(&token, owner).await?,

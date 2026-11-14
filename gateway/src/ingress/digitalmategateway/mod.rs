@@ -24,5 +24,14 @@ pub mod server_config;
 pub mod session;
 pub mod upload_http;
 
+/// Cancel the HTTP connection driver on completion, error or caller cancellation.
+struct ConnectionTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ConnectionTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[cfg(test)]
 mod download_http_tests;

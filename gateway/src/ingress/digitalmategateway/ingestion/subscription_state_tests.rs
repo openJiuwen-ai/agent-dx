@@ -80,7 +80,7 @@ async fn subscription_state_stop_only_retires_its_account_and_preserves_another_
         .accept(
             &active,
             &DurableAck {
-                version: 1,
+                version: 2,
                 batch_id: active.batch.batch_id.clone(),
                 digest: active.batch.digest.clone(),
                 state: "accepted".into(),

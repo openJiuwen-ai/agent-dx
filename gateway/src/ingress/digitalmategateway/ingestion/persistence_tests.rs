@@ -114,7 +114,7 @@ async fn delivery_identity_resolves_only_the_current_persisted_ready_batch() {
         .accept(
             &next,
             &DurableAck {
-                version: 1,
+                version: 2,
                 batch_id: next.batch.batch_id.clone(),
                 digest: next.batch.digest.clone(),
                 state: "accepted".into(),
@@ -154,7 +154,7 @@ async fn durable_receive_restart_multi_worker_and_lost_ack_contract() {
     assert_eq!(first.batch.events.len(), 2);
     receive(&store, "msg_C").await; // Must survive ACK of the fixed A/B set.
     let ack = DurableAck {
-        version: 1,
+        version: 2,
         batch_id: first.batch.batch_id.clone(),
         digest: first.batch.digest.clone(),
         state: "accepted".into(),
@@ -186,7 +186,7 @@ async fn durable_receive_restart_multi_worker_and_lost_ack_contract() {
             .accept(
                 &next,
                 &DurableAck {
-                    version: 1,
+                    version: 2,
                     batch_id: next.batch.batch_id.clone(),
                     digest: next.batch.digest.clone(),
                     state: "accepted".into()
@@ -256,7 +256,7 @@ async fn durable_receive_restart_multi_worker_and_lost_ack_contract() {
         Some(Error::LeaseLost)
     );
     let ack = DurableAck {
-        version: 1,
+        version: 2,
         batch_id: resumed.batch.batch_id.clone(),
         digest: resumed.batch.digest.clone(),
         state: "accepted".into(),

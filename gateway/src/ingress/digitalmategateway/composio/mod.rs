@@ -4,7 +4,7 @@
 //! its purpose issuer and existing ADX Relay. Explicit process configuration
 //! prepares the shared client and budget. Normal workloads can validate account
 //! references or request mail using a fresh exact-request M44 task/intent proof.
-//! Background trigger and receiver assembly still require their real owners.
+//! Background subscriptions and delivery retain their existing real owners.
 //! A crypto bearer or JSON scope grants no connector or mail permission.
 
 mod budget;
@@ -142,58 +142,6 @@ impl Composio {
             "email":profile.email, "granted_capabilities":["read_history"]
         }))
     }
-    /// Actual M44 HTTP/Relay assembly; all owner requests use the existing
-    /// purpose issuer and the current foreground session retained by Scope.
-    pub fn with_m44_configs(
-        api_key: String,
-        configs: MailAuthConfigs,
-        owner: Arc<super::connector_owner::OwnerAuthority>,
-        managed: Arc<adx_agent_api::managed::ManagedService>,
-        ingress: Arc<crate::ingress::server::Ingress>,
-        budget: Arc<dyn Budget>,
-    ) -> Result<Self, Error> {
-        let authority = Arc::new(owner::M44Authority::new(
-            owner,
-            managed,
-            ingress,
-            configs.clone(),
-        ));
-        Self::with_configs(api_key, configs, authority, budget)
-    }
-    /// Requires custom Gmail OAuth auth config and project callback verification.
-    /// Fails closed on empty configuration, invalid key header or HTTP setup.
-    pub fn new(
-        api_key: String,
-        gmail_auth_config: String,
-        authority: Arc<dyn Authority>,
-        budget: Arc<dyn Budget>,
-    ) -> Result<Self, Error> {
-        Self::with_configs(
-            api_key,
-            MailAuthConfigs {
-                gmail: Some(MailAuthConfig::custom(gmail_auth_config)),
-                outlook: None,
-            },
-            authority,
-            budget,
-        )
-    }
-
-    /// Exact per-provider app ownership and auth config come from deployment.
-    /// Both managed and custom OAuth still require current real owner authority.
-    pub fn with_configs(
-        api_key: String,
-        configs: MailAuthConfigs,
-        authority: Arc<dyn Authority>,
-        budget: Arc<dyn Budget>,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            client: Client::new(api_key, configs, budget)?,
-            authority,
-            subscriptions: None,
-        })
-    }
-
     async fn synchronize_subscription(
         &self,
         scope: &Scope,
@@ -308,10 +256,6 @@ impl Composio {
             || receipt.account_id != attempt.account_id
             || !types::account_id(&receipt.account_id)
             || !types::email_address(&receipt.email)
-            || attempt
-                .expected_email
-                .as_ref()
-                .is_some_and(|v| !v.eq_ignore_ascii_case(&receipt.email))
         {
             return Err(Error::AccountMismatch);
         }
@@ -331,29 +275,10 @@ impl Composio {
             .client
             .profile(scope, &account_id, attempt.provider)
             .await?;
-        if attempt
-            .expected_email
-            .as_ref()
-            .is_some_and(|value| !value.eq_ignore_ascii_case(&verified.email))
-        {
-            return Err(Error::AccountMismatch);
-        }
         self.authority
             .accept_verified(scope, attempt, &verified)
             .await?;
         Ok(verified)
-    }
-
-    /// Only declared read operations; the owner supplies current generation,
-    /// mailbox identity and existing tool permissions. ACTIVE grants no tool.
-    pub async fn gmail(
-        &self,
-        scope: &Scope,
-        connection_id: &str,
-        request: GmailRequest,
-    ) -> Result<serde_json::Value, Error> {
-        self.mail(scope, connection_id, MailRequest::Gmail(request))
-            .await
     }
 
     /// Shared foreground read entrance. Request provider never grants authority.
@@ -411,23 +336,8 @@ impl Composio {
             .await?;
         // Revocation cannot stop an already dispatched read, but its late
         // content must not be delivered after the local authority is fenced.
-        self.authority
-            .assert_connection(scope, connection_id, &grant)
-            .await?;
         guard.check().await?;
         Ok(result)
-    }
-
-    /// Fence local access first. Report remote revoke independently; a network
-    /// failure never re-enables this connection or means revocation succeeded.
-    pub async fn disconnect(&self, scope: &Scope, connection_id: &str) -> Result<(), Error> {
-        let grant = self
-            .authority
-            .fence_connection(scope, connection_id)
-            .await?;
-        self.client
-            .revoke(scope, &grant.account_id, grant.provider)
-            .await
     }
 }
 

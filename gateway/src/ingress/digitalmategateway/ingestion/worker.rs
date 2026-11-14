@@ -8,9 +8,9 @@ pub enum DeliveryFailure {
     Rejected,
 }
 
-/// Production port must ensure the exact existing Binding generation through
-/// the published ADX access owner, then authenticated Relay delivery. A request
-/// timeout is unknown: the same persisted batch ID/digest must be retried.
+/// Production delivery validates the persisted authority with its identity owner,
+/// then connects by logical Scope through the shared ADX access interface. A
+/// request timeout is unknown: retry the same persisted batch ID/digest.
 #[async_trait]
 pub trait DeliveryPort: Send + Sync {
     async fn deliver(&self, batch: &DeliveryBatch) -> Result<DurableAck, DeliveryFailure>;

@@ -56,9 +56,9 @@ fn workspace_key(binding: &SubscriptionBinding) -> Result<String, Error> {
 }
 
 impl Inbox {
-    /// Explicit operator startup against a dedicated bounded ingestion pool.
-    /// Pool construction/TLS/credentials belong to trusted runtime configuration.
-    pub async fn initialize(pool: Pool, limits: InboxLimits) -> Result<Self, Error> {
+    /// Test fixture only; production checks a pre-applied schema in `from_pool`.
+    #[cfg(test)]
+    pub(crate) async fn initialize(pool: Pool, limits: InboxLimits) -> Result<Self, Error> {
         let client = pool.get().await.map_err(unavailable)?;
         client
             .batch_execute(include_str!("schema.sql"))
@@ -68,7 +68,7 @@ impl Inbox {
         Self::from_pool(pool, limits).await
     }
 
-    pub async fn from_pool(pool: Pool, limits: InboxLimits) -> Result<Self, Error> {
+    pub(super) async fn from_pool(pool: Pool, limits: InboxLimits) -> Result<Self, Error> {
         if limits.max_pending_events <= 0
             || limits.max_pending_bytes < 1_048_576
             || limits.per_subscription_events <= 0
@@ -221,9 +221,6 @@ impl Inbox {
         let workspace = workspace_key(binding)?;
         let gen = generation(binding.subscription_generation)?;
         let connection_gen = generation(binding.connection_generation)?;
-        if gen <= 0 || connection_gen <= 0 || binding.subscription_id.is_empty() {
-            return Err(Error::Refused);
-        }
         let mut client = self.pool.get().await.map_err(unavailable)?;
         let tx = client.transaction().await.map_err(unavailable)?;
         tx.execute("INSERT INTO digitalmate_ingestion.workspaces(workspace_key) VALUES($1) ON CONFLICT DO NOTHING",&[&workspace]).await.map_err(unavailable)?;

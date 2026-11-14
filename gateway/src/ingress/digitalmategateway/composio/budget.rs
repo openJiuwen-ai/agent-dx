@@ -49,9 +49,9 @@ fn identity(namespace: &[u8], parts: &[&str]) -> String {
 }
 
 impl PostgresBudget {
-    /// Explicit startup with a dedicated, bounded, trusted TLS pool.
-    /// Returns NotConfigured for invalid policy and UpstreamUnavailable for DB failure.
-    pub async fn initialize(
+    /// Test-only schema fixture; formal startup uses the operator-applied schema.
+    #[cfg(test)]
+    pub(super) async fn initialize(
         pool: Pool,
         organization: String,
         limits: RequestBudgetLimits,

@@ -230,6 +230,7 @@ pub struct DigitalMateGatewayApi {
     config: DigitalMateGatewayConfig,
     auth: Arc<dyn BusinessAuth>,
     managed: Arc<ManagedService>,
+    #[cfg(test)]
     composio: Option<Arc<super::composio::Composio>>,
     webhook: Option<Arc<super::ingestion::WebhookHttp>>,
     #[cfg(unix)]
@@ -237,9 +238,12 @@ pub struct DigitalMateGatewayApi {
 }
 
 impl DigitalMateGatewayApi {
-    /// Explicit trusted assembly. The caller must supply the real M44 Authority
-    /// and shared budget; no user request can construct or replace this client.
-    pub fn with_composio(mut self, gateway: Arc<super::composio::Composio>) -> Result<Self, Error> {
+    /// Test-only upstream injection; production uses its prepared client and owner.
+    #[cfg(test)]
+    pub(crate) fn with_composio(
+        mut self,
+        gateway: Arc<super::composio::Composio>,
+    ) -> Result<Self, Error> {
         if self.has_prepared_composio() {
             return Err(invalid());
         }
@@ -340,6 +344,7 @@ impl DigitalMateGatewayApi {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_ingestion_webhook(
         mut self,
         webhook: Arc<super::ingestion::WebhookHttp>,
@@ -855,11 +860,19 @@ impl DigitalMateGatewayConfig {
 
 #[cfg(not(unix))]
 impl DigitalMateGatewayApi {
+    #[cfg(test)]
     fn has_prepared_composio(&self) -> bool {
         false
     }
     fn connector_gateway(&self, _ingress: Arc<Ingress>) -> Option<Arc<super::composio::Composio>> {
-        self.composio.clone()
+        #[cfg(test)]
+        {
+            self.composio.clone()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
     }
     pub async fn connector_workload_identity(
         &self,
@@ -877,6 +890,7 @@ impl DigitalMateGatewayApi {
             config,
             managed,
             auth,
+            #[cfg(test)]
             composio: None,
             webhook: None,
         })
