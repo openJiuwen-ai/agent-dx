@@ -1,7 +1,9 @@
 """Operator migration contracts; PostgreSQL cases require a fresh disposable DB."""
 
 import copy
+from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 
@@ -49,6 +52,41 @@ def identity():
 
 
 class IdentityTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX descriptor ownership required")
+    def test_descriptors_close_after_success_and_each_read_failure(self):
+        real_open, real_close = os.open, os.close
+        live = set()
+
+        def track_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            live.add(descriptor)
+            return descriptor
+
+        def track_close(descriptor):
+            real_close(descriptor)
+            live.discard(descriptor)
+
+        with tempfile.TemporaryDirectory() as directory:
+            secret = Path(directory) / "normal-token"
+            cases = [(b"example\n", 0o600, False), (b"\xff", 0o600, True), (b"example", 0o644, True)]
+            for content, mode, refused in cases:
+                with self.subTest(content=content, mode=mode):
+                    secret.write_bytes(content)
+                    secret.chmod(mode)
+                    with mock.patch.object(os, "open", side_effect=track_open):
+                        with mock.patch.object(os, "close", side_effect=track_close):
+                            if refused:
+                                with self.assertRaises(MIGRATION.MigrationError):
+                                    MIGRATION.private_text(secret)
+                            else:
+                                self.assertEqual(MIGRATION.private_text(secret), "example")
+                    self.assertEqual(live, set())
+            with mock.patch.object(os, "open", side_effect=track_open):
+                with mock.patch.object(os, "close", side_effect=track_close):
+                    with self.assertRaises(MIGRATION.MigrationError):
+                        MIGRATION.private_text(Path(directory) / "missing-parent" / "normal-token")
+            self.assertEqual(live, set())
+
     @unittest.skipUnless(os.name == "posix", "POSIX openat/link semantics required")
     def test_any_ancestor_symlink_is_refused_without_reading_secret(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -173,6 +211,46 @@ class ProjectionTests(unittest.TestCase):
                             "subscription_generation": True}.items():
             with self.assertRaises(MIGRATION.MigrationError):
                 MIGRATION.project_subscription({**subscription(), name: value}, TARGET, GRANT)
+
+
+class CommandOutputTests(unittest.TestCase):
+    """The operator keeps one JSON line on the intended stream and hides driver details."""
+
+    @staticmethod
+    def invoke(migrate):
+        arguments = [
+            "--dsn-file", "dsn", "--connector-token-file", "token", "--target-file", "target",
+            "--gateway-origin", "https://gateway.example", "--ca-file", "ca",
+        ]
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.dict(sys.modules, {"psycopg": mock.MagicMock()}):
+            with mock.patch.object(MIGRATION, "private_text", return_value=json.dumps(TARGET)):
+                with mock.patch.object(MIGRATION, "identity_reader", return_value=identity):
+                    with mock.patch.object(MIGRATION, "migrate", migrate):
+                        with redirect_stdout(output), redirect_stderr(errors):
+                            status = MIGRATION.main(arguments)
+        return status, output.getvalue(), errors.getvalue()
+
+    def test_success_json_stays_on_stdout_without_duplicate_handlers(self):
+        result = {"applied": False, "matched": 1, "updated": 1, "physical_schema": 1, "wire_version": 2}
+        for _ in range(2):
+            status, output, errors = self.invoke(mock.Mock(return_value=result))
+            self.assertEqual(status, 0)
+            self.assertEqual(output, json.dumps(result, separators=(",", ":")) + "\n")
+            self.assertEqual(errors, "")
+
+    def test_errors_stay_on_stderr_as_one_secret_free_json_line(self):
+        cases = [
+            (MIGRATION.MigrationError("normal_connector_required"), "normal_connector_required"),
+            (ImportError("private-driver-location"), "psycopg3_required"),
+            (RuntimeError("secret-dsn-and-bearer"), "migration_unavailable"),
+        ]
+        for failure, code in cases:
+            with self.subTest(code=code):
+                status, output, errors = self.invoke(mock.Mock(side_effect=failure))
+                self.assertEqual(status, 1)
+                self.assertEqual(output, "")
+                self.assertEqual(errors, json.dumps({"error": code}, separators=(",", ":")) + "\n")
 
 
 class QuietHandler(WSGIRequestHandler):

@@ -7,6 +7,7 @@ authentication. Actual DigitalMate receiver acceptance is deployment evidence.
 import hashlib
 from http import HTTPStatus
 import json
+import logging
 from pathlib import Path
 import sqlite3
 import sys
@@ -83,7 +84,9 @@ def main():
     counts = []
     for table in ["batches", "events"]:
         counts.append(store.execute("SELECT count(*) FROM " + table).fetchone()[0])
-    print(json.dumps({"port": server.server_port, "counts": counts}), flush=True)
+    ready_log = logging.Logger(__name__, level=logging.INFO)
+    ready_log.addHandler(logging.StreamHandler(sys.stdout))
+    ready_log.info("%s", json.dumps({"port": server.server_port, "counts": counts}))
     try:
         server.serve_forever()
     finally:

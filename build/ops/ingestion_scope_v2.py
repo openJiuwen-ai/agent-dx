@@ -16,7 +16,9 @@ stable reason codes: neither DSN, bearer, grant reference nor response is logged
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, ExitStack
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -25,7 +27,7 @@ import stat
 import sys
 import time
 import unicodedata
-from urllib import error, parse, request
+from urllib import parse, request
 
 
 LOGICAL_FIELDS = frozenset({
@@ -63,7 +65,7 @@ def decode_json(raw):
 
     try:
         return json.loads(raw, object_pairs_hook=unique)
-    except (ValueError, UnicodeError, RecursionError) as exc:
+    except (ValueError, RecursionError) as exc:
         raise MigrationError("invalid_json") from exc
 
 
@@ -108,6 +110,16 @@ def validate_identity(proof, target):
     return reference
 
 
+@contextmanager
+def private_descriptor(path, flags, mode, *, dir_fd=None):
+    """Keep each read-only descriptor paired with its close on every exit path."""
+    descriptor = os.open(path, flags, mode=mode, dir_fd=dir_fd)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
 def private_text(path):
     """Read a bounded owner-only regular file without following any symlink.
 
@@ -121,36 +133,33 @@ def private_text(path):
     if ".." in components:
         raise MigrationError("private_file_parent_traversal_refused")
     components = Path(os.path.abspath(path)).parts
-    directory = None
-    descriptor = None
     try:
-        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        directory = os.open(components[0], directory_flags)
-        # Walk using pinned directory descriptors. A path replacement cannot
-        # redirect a later lookup, and no ancestor is resolved through a link.
-        for component in components[1:-1]:
-            next_directory = os.open(component, directory_flags, dir_fd=directory)
-            os.close(directory)
-            directory = next_directory
-        descriptor = os.open(components[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
-            raise MigrationError("private_file_required")
-        if stat.S_IMODE(metadata.st_mode) & 0o077 or metadata.st_size > MAX_FILE:
-            raise MigrationError("private_file_required")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
-            descriptor = None
-            value = stream.read(MAX_FILE + 1)
-        if len(value) > MAX_FILE:
-            raise MigrationError("private_file_required")
-        return value.strip()
+        with ExitStack() as descriptors:
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            directory = descriptors.enter_context(private_descriptor(components[0], directory_flags, 0o700))
+            # Pin every ancestor without following links. Modes are explicit;
+            # these read-only opens never create a file or change its permissions.
+            for component in components[1:-1]:
+                directory = descriptors.enter_context(
+                    private_descriptor(component, directory_flags, 0o700, dir_fd=directory)
+                )
+            descriptor = descriptors.enter_context(private_descriptor(
+                components[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory,
+            ))
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+                raise MigrationError("private_file_required")
+            if stat.S_IMODE(metadata.st_mode) & 0o077 or metadata.st_size > MAX_FILE:
+                raise MigrationError("private_file_required")
+            # The stream borrows the descriptor. ExitStack remains its sole owner,
+            # including when stream construction or UTF-8 decoding fails.
+            with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as stream:
+                value = stream.read(MAX_FILE + 1)
+            if len(value) > MAX_FILE:
+                raise MigrationError("private_file_required")
+            return value.strip()
     except (OSError, UnicodeError) as exc:
         raise MigrationError("private_file_unavailable") from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        if directory is not None:
-            os.close(directory)
 
 
 def identity_url(origin):
@@ -189,7 +198,7 @@ def identity_reader(origin, ca_file, token):
         opener = request.build_opener(
             request.ProxyHandler({}), request.HTTPSHandler(context=context), RejectRedirect(),
         )
-    except (OSError, ssl.SSLError) as exc:
+    except OSError as exc:
         raise MigrationError("trusted_ca_unavailable") from exc
 
     def read():
@@ -204,7 +213,7 @@ def identity_reader(origin, ca_file, token):
                 if len(raw) > MAX_FILE:
                     raise MigrationError("identity_response_too_large")
                 return decode_json(raw)
-        except (error.URLError, OSError, TimeoutError) as exc:
+        except OSError as exc:
             raise MigrationError("identity_unavailable") from exc
 
     return read
@@ -335,20 +344,24 @@ def main(argv=None):
     parser.add_argument("--ca-file", type=Path, required=True)
     parser.add_argument("--apply", action="store_true")
     settings = parser.parse_args(argv)
+    result_log = logging.Logger(__name__ + ".result", level=logging.INFO)
+    result_log.addHandler(logging.StreamHandler(sys.stdout))
+    error_log = logging.Logger(__name__ + ".error", level=logging.ERROR)
+    error_log.addHandler(logging.StreamHandler(sys.stderr))
     try:
         import psycopg  # pylint: disable=import-outside-toplevel
         target = validate_target(decode_json(private_text(settings.target_file)))
         reader = identity_reader(settings.gateway_origin, settings.ca_file, private_text(settings.connector_token_file))
         with psycopg.connect(private_text(settings.dsn_file), connect_timeout=5) as connection:
             result = migrate(connection, target, reader, apply=settings.apply)
-        print(json.dumps(result, separators=(",", ":")))
+        result_log.info("%s", json.dumps(result, separators=(",", ":")))
         return 0
     except MigrationError as exc:
-        print(json.dumps({"error": str(exc)}, separators=(",", ":")), file=sys.stderr)
+        error_log.error("%s", json.dumps({"error": str(exc)}, separators=(",", ":")))
     except ImportError:
-        print('{"error":"psycopg3_required"}', file=sys.stderr)
+        error_log.error('{"error":"psycopg3_required"}')
     except Exception:  # noqa: BLE001 -- never expose a DSN, bearer or driver diagnostic
-        print('{"error":"migration_unavailable"}', file=sys.stderr)
+        error_log.error('{"error":"migration_unavailable"}')
     return 1
 
 
