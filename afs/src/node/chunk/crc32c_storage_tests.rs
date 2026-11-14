@@ -117,7 +117,7 @@ fn crc32c_retry_adopts_synced_orphan_and_replays_durable_object() {
     assert_eq!(store.gc_inventory().unwrap().len(), 1);
 }
 #[test]
-fn crc32c_rejects_corrupt_orphan_without_catalog_publication() {
+fn crc32c_corrupt_orphan_is_reported_for_gc_without_catalog_publication() {
     let temp = tempfile::tempdir().unwrap();
     let item = staged();
     let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
@@ -127,7 +127,11 @@ fn crc32c_rejects_corrupt_orphan_without_catalog_publication() {
     )
     .unwrap();
     assert!(store.put(item.clone()).is_err());
-    assert!(store.gc_inventory().unwrap().is_empty());
+    assert!(store.peer_catalog_record(&item.chunk.id).is_err());
+    let inventory = store.gc_inventory().unwrap();
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].id, item.chunk.id);
+    assert_ne!(inventory[0].content_digest, item.chunk.content_digest);
 }
 #[test]
 fn crc32c_missing_or_damaged_descriptor_and_body_fail_closed() {

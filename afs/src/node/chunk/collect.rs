@@ -4,6 +4,48 @@
 //! on `LocalChunkStore` internals. Progress persists through
 //! `checkpoint::save_checkpoint`.
 use super::{checkpoint::save_checkpoint, *};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
+};
+
+const INVENTORY_PAGE: usize = 1024;
+// Orphan IDs do not carry a digest. Bound the number of full block reads
+// per pass independently of the regular inventory page (32 MiB at most).
+const CRC_ORPHANS_PER_PASS: usize = 8;
+
+fn crc_orphan_inventory_entry(path: &Path, id: &ChunkId) -> Result<Option<ChunkObject>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    let maximum = staged::MAX_STAGED_CHUNK_BYTES;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > maximum as u64 {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take(maximum as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() {
+        return Ok(None);
+    }
+    let table = super::super::chunk_crc32c::CrcTable::build(&bytes)?;
+    // This observation is only for GC. It does not establish a readable copy
+    // or replace the descriptor from a committed receipt.
+    Ok(Some(ChunkObject {
+        id: id.clone(),
+        length: table.length,
+        content_digest: table.descriptor_digest(),
+        encoding: ChunkEncoding::Raw,
+    }))
+}
+
 impl LocalChunkStore {
     pub(crate) fn gc_generation(&self) -> Result<u64> {
         Ok(self
@@ -13,37 +55,69 @@ impl LocalChunkStore {
             .gc_generation)
     }
     pub(crate) fn gc_inventory(&self) -> Result<Vec<ChunkObject>> {
-        let catalog = self
+        let mut chunks = self
             .catalog
             .lock()
-            .map_err(|_| invalid("chunk catalog poisoned"))?;
-        let mut chunks = catalog
+            .map_err(|_| invalid("chunk catalog poisoned"))?
             .records
             .values()
             .map(|record| (record.chunk.id.clone(), record.chunk.clone()))
-            .collect::<std::collections::BTreeMap<_, _>>();
+            .collect::<BTreeMap<_, _>>();
+        let mut crc_orphans = BTreeSet::new();
         for entry in fs::read_dir(&self.chunks)? {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
-                let id = ChunkId::new(entry.file_name().to_string_lossy().into_owned());
-                if let Some(chunk) = ChunkObject::from_content_addressed_id(&id) {
-                    chunks.entry(id).or_insert(chunk);
-                }
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let id = ChunkId::new(entry.file_name().to_string_lossy().into_owned());
+            if let Some(chunk) = ChunkObject::from_content_addressed_id(&id) {
+                chunks.entry(id).or_insert(chunk);
+            } else if id.crc32c_write_generation().is_some() && !chunks.contains_key(&id) {
+                crc_orphans.insert(id);
             }
         }
-        let count = chunks.len();
-        if count == 0 {
-            return Ok(Vec::new());
+        let mut inventory = Vec::new();
+        if !crc_orphans.is_empty() {
+            let count = crc_orphans.len();
+            let limit = count.min(CRC_ORPHANS_PER_PASS);
+            let start = self
+                .gc_crc_inventory_cursor
+                .fetch_add(limit as u64, Ordering::Relaxed) as usize
+                % count;
+            let observed: Vec<_> = crc_orphans
+                .iter()
+                .cycle()
+                .skip(start)
+                .take(limit)
+                .filter_map(|id| match crc_orphan_inventory_entry(&self.chunk_path(id), id) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        tracing::warn!(chunk_id = %id.0, %error, "cannot inspect CRC orphan for GC");
+                        None
+                    }
+                })
+                .collect();
+            let catalog = self
+                .catalog
+                .lock()
+                .map_err(|_| invalid("chunk catalog poisoned"))?;
+            inventory.extend(observed.into_iter().map(|chunk| {
+                catalog
+                    .records
+                    .get(&chunk.id)
+                    .map_or(chunk, |record| record.chunk.clone())
+            }));
         }
-        let start = self.gc_inventory_cursor.fetch_add(1024, Ordering::Relaxed) as usize % count;
-        let chunks = chunks.into_values().collect::<Vec<_>>();
-        Ok(chunks
-            .iter()
-            .cycle()
-            .skip(start)
-            .take(count.min(1024))
-            .cloned()
-            .collect())
+        let count = chunks.len();
+        if count != 0 {
+            let limit = count.min(INVENTORY_PAGE - inventory.len());
+            let start = self
+                .gc_inventory_cursor
+                .fetch_add(limit as u64, Ordering::Relaxed) as usize
+                % count;
+            inventory.extend(chunks.values().cycle().skip(start).take(limit).cloned());
+        }
+        Ok(inventory)
     }
     pub(crate) fn collect_generation(&self, generation: u64, chunks: &[ChunkId]) -> Result<usize> {
         // Drain installs and exclude new catalog publications through checkpoint + WAL rotation.
@@ -132,6 +206,33 @@ impl LocalChunkStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crc_inventory_advances_past_rejected_orphans() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(root.path(), "n").unwrap();
+        let generation = ChunkObject::generation_id(&OperationId::new("inventory paging"));
+        for index in 0..CRC_ORPHANS_PER_PASS {
+            fs::write(
+                store
+                    .chunks
+                    .join(format!("crc32c-v2-{generation}-{index:032x}")),
+                [],
+            )
+            .unwrap();
+        }
+        let id = ChunkId::new(format!("crc32c-v2-{generation}-{}", "f".repeat(32)));
+        fs::write(store.chunk_path(&id), b"recoverable").unwrap();
+        fs::write(
+            store.chunks.join(format!("crc32c-v2-{generation}-invalid")),
+            b"bad id",
+        )
+        .unwrap();
+        assert!(store.gc_inventory().unwrap().is_empty());
+        let next = store.gc_inventory().unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].id, id);
+    }
     #[test]
     fn gc_waits_for_inflight_catalog_installation() {
         let root = tempfile::tempdir().unwrap();

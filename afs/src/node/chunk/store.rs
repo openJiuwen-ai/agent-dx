@@ -108,6 +108,8 @@ impl LocalChunkStore {
             #[cfg(any(feature = "dfs", test))]
             gc_inventory_cursor: AtomicU64::new(0),
             #[cfg(any(feature = "dfs", test))]
+            gc_crc_inventory_cursor: AtomicU64::new(0),
+            #[cfg(any(feature = "dfs", test))]
             peer_read_crc_mode: crate::config::DfsReadCrcMode::Both,
             read_work: None,
             sidecar_installer: SidecarInstaller::default(),
