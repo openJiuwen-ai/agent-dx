@@ -6,7 +6,7 @@
 
 在部署配置的每个服务 `env` 中设置 `ADX_LOG_FORMAT=json`。Coordinator、adxlet、Ingress、Relay、转发进程和 API Server 支持此开关，默认保持 text。默认共进程部署中，Ingress 与 API Server 共享 `apiserver` 服务日志，Relay 与 adxlet 共享 `adxlet` 服务日志；显式分进程时才分别产生 `ingress` 或 `relay` 服务日志。Rust 日志支持 `RUST_LOG` 级别过滤。Gateway 使用 JSON 时保持 `ADX_DATA_PLANE_LOG_DIR` 未配置，由 Supervisor 接管 stdout；现有 access/audit 开关仍有效。
 
-Rust 输出包括时间、级别、target 和 fields；Rust API Server 输出时间、级别、event 和 HTTP 路由模板、方法、状态、耗时。Collector 将日志解析为结构化 body，并附加 `service.name`（Supervisor 服务 ID）、`adx.node.id` 和文件路径。Redis 等纯文本仍可采集，保留原文。
+Rust 日志格式化统一关闭 ANSI 颜色和样式，终端、stdout 和组件文件日志采用相同规则，无需设置 `NO_COLOR`。Rust 输出包括时间、级别、target 和 fields；Rust API Server 输出时间、级别、event 和 HTTP 路由模板、方法、状态、耗时。Collector 将日志解析为结构化 body，并附加 `service.name`（Supervisor 服务 ID）、`adx.node.id` 和文件路径。Redis 等纯文本仍可采集，保留原文。
 
 adxlet 的 `environment_operation_completed` 事件记录 environment_id、generation、revision 和操作返回时的状态。API 请求日志只记录路由模板，不记录 URL 查询参数、Authorization、正文和用户文件。开启Trace后，API请求日志包含Trace ID与Span ID，adxlet操作完成日志记录traceparent；接线与采样配置见[跨组件Trace](distributed-traces.md)。
 
