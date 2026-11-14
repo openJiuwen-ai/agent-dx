@@ -4,7 +4,8 @@ use super::*;
 struct WriteTarget {
     position: u64,
     selection: Option<(usize, usize, usize)>,
-    capacity: usize,
+    allocation: Option<usize>,
+    growable_eof: bool,
     generation: Option<OperationId>,
     /// The committed version this write builds on; a new generation keeps it
     /// from collection until the generation's commit is applied (R81 F2).
@@ -19,6 +20,7 @@ struct ReservationRequest<'a> {
     owner: &'a Arc<DirtyOwner>,
     capacity: usize,
     has_accepted_prefix: bool,
+    needs_descriptor: bool,
 }
 
 enum Reservation {
@@ -272,7 +274,7 @@ impl DistributedFs {
             }
             let _ = self.poll_uploads()?;
             self.observe_handle_error(handle)?;
-            let target = Self::write_target(&cell, append, offset, data, *accepted)?;
+            let target = self.write_target(&cell, append, offset, data, *accepted)?;
             // A new file's first generation was admitted with its Create (B1).
             let created_generation = if target.generation.is_none() {
                 Self::prepared_generation_for(&cell, target.base.as_ref())?
@@ -288,7 +290,7 @@ impl DistributedFs {
                         .map(|(generation, _)| generation.clone())
                 })
                 .unwrap_or_else(|| self.identity.operation_id("native-generation"));
-            let (prepared, descriptor) = if target.selection.is_none() {
+            let (prepared, descriptor) = if let Some(capacity) = target.allocation {
                 match self.reserve_dirty_builder(
                     handle,
                     &cell,
@@ -297,8 +299,9 @@ impl DistributedFs {
                         turn_id: ticket.id,
                         operation_id: &operation_id,
                         owner: &target.owner,
-                        capacity: target.capacity,
+                        capacity,
                         has_accepted_prefix: *accepted > 0,
+                        needs_descriptor: target.selection.is_none(),
                     },
                 )? {
                     Reservation::Reserved {
@@ -372,6 +375,7 @@ impl DistributedFs {
     /// Read where the next unaccepted bytes land. Admission runs unlocked after
     /// this, so `apply_pipeline_write` revalidates the result under the same lock.
     fn write_target(
+        &self,
         cell: &SharedInodeWriteState,
         append: bool,
         offset: u64,
@@ -395,15 +399,35 @@ impl DistributedFs {
             .checked_add((data.len() - accepted) as u64)
             .ok_or_else(file_too_large)?;
         let selection = state.dirty_extents.native_selection(position);
-        let capacity = state.dirty_extents.native_capacity(
-            position,
-            data.len() - accepted,
-            state.logical_length,
-        );
+        let remaining = data.len() - accepted;
+        let growable_eof = self.crc32c_writes() && position >= state.logical_length;
+        let allocation = if let Some((index, source, available)) = selection {
+            let builder = &state.dirty_extents.builders[index].builder;
+            let required = source + remaining.min(available);
+            (required > builder.capacity()).then(|| {
+                required
+                    .next_power_of_two()
+                    .min(builder.writable_capacity())
+            })
+        } else if growable_eof {
+            Some(
+                remaining
+                    .min(COMMIT_CHUNK_BYTES as usize)
+                    .max(4096)
+                    .next_power_of_two(),
+            )
+        } else {
+            Some(
+                state
+                    .dirty_extents
+                    .native_capacity(position, remaining, state.logical_length),
+            )
+        };
         Ok(WriteTarget {
             position,
             selection,
-            capacity,
+            allocation,
+            growable_eof,
             generation: state.dirty_extents.native_operation_id.clone(),
             base: state
                 .base_version
@@ -463,7 +487,7 @@ impl DistributedFs {
                 .front()
                 == Some(&turn_id);
             if is_front {
-                if descriptor.is_none() {
+                if request.needs_descriptor && descriptor.is_none() {
                     descriptor = self.reserve_descriptor(pipeline, request.operation_id)?;
                     if descriptor.is_none() {
                         self.request_pipeline_pressure(cell, true)?;
@@ -564,7 +588,7 @@ impl DistributedFs {
     fn apply_pipeline_write(
         cell: &SharedInodeWriteState,
         write: WriteApply<'_>,
-        prepared: Option<ChunkBuilder>,
+        mut prepared: Option<ChunkBuilder>,
         descriptor: Option<Arc<Mutex<PipelineMetadataLease>>>,
         gc_pin: Option<Arc<crate::node::gc::GcPin>>,
         operation: InodeOperationGuard,
@@ -597,6 +621,17 @@ impl DistributedFs {
             drop(operation);
             drop(prepared);
             return Ok(None);
+        }
+        if let Some((index, _, _)) = target.selection {
+            if let Some(replacement) = prepared.take() {
+                state.dirty_extents.builders[index]
+                    .builder
+                    .replace_native_storage(replacement);
+            }
+        } else if target.growable_eof
+            && let Some(builder) = &mut prepared
+        {
+            builder.allow_native_growth(COMMIT_CHUNK_BYTES as usize);
         }
         let next_seq = state.next_write_seq.saturating_add(1);
         if state.dirty_extents.native_operation_id.is_none() {

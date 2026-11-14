@@ -666,18 +666,18 @@ fn p2_w2_actual_cross_block_allocation_failure_returns_the_visible_prefix() {
             libc::O_RDWR,
         )
         .unwrap();
-    fs.write(&context(), file.handle, 0, &vec![1; 1024 * 1024])
+    fs.write(&context(), file.handle, 0, &vec![1; 3 * 1024 * 1024])
         .unwrap();
     fs.write_resources.buffer_pool.fail_next_allocation();
     assert_eq!(
         fs.write(
             &context(),
             file.handle,
-            1024 * 1024,
+            3 * 1024 * 1024,
             &vec![2; 4 * 1024 * 1024]
         )
         .unwrap(),
-        3 * 1024 * 1024
+        1024 * 1024
     );
     assert!(meta.commits.lock().unwrap().is_empty());
     fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
@@ -706,9 +706,11 @@ fn p2_w2_budget_waiter_fifo_does_not_block_timer_or_the_following_sync() {
         )
         .unwrap();
     let other = fs.open(&context(), file.entry.inode, libc::O_RDWR).unwrap();
-    fs.write(&context(), file.handle, 0, b"a").unwrap();
+    fs.write(&context(), file.handle, 0, &vec![b'a'; 3 * 1024 * 1024])
+        .unwrap();
     let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || worker_fs.write(&context(), other, 4096, b"b"));
+    let worker =
+        std::thread::spawn(move || worker_fs.write(&context(), other, COMMIT_CHUNK_BYTES, b"b"));
     let deadline = Instant::now() + Duration::from_secs(5);
     while fs
         .write_resources
@@ -964,10 +966,17 @@ fn p2_w2_upload_error_is_owned_by_its_inode_while_drain_still_aggregates() {
         .unwrap();
     let body = vec![0x64; 4 * 1024 * 1024];
     a_store.fail_next.store(true, Ordering::SeqCst);
-    assert_eq!(
-        a_fs.write(&context(), a.handle, 0, &body).unwrap(),
-        body.len()
-    );
+    for (index, part) in body.chunks(1024 * 1024).enumerate() {
+        assert_eq!(
+            a_fs.write(&context(), a.handle, (index * part.len()) as u64, part)
+                .unwrap(),
+            part.len()
+        );
+        if index == 0 {
+            assert_eq!(pipeline.budget.snapshot().live_bytes, part.len());
+        }
+    }
+    assert_eq!(pipeline.budget.snapshot().live_bytes, body.len());
     let upload = pipeline.tasks.lock().unwrap()[0].clone();
     let operation = upload.operation_id.clone();
     let chunk = upload.chunk.clone();
@@ -1025,6 +1034,8 @@ fn p2_w2_upload_error_is_owned_by_its_inode_while_drain_still_aggregates() {
         assert_eq!(commits[0].chunk_receipts[0].chunk, chunk);
     }
     drop(upload);
+    assert_eq!(pipeline.budget.snapshot().live_bytes, 0);
+    assert!(pipeline.budget.snapshot().live_peak_bytes <= 16 * 1024 * 1024);
     // B has its own unpublished tail. Drain must publish B successfully,
     // but retain A's error even if B's preparation would harvest that task.
     b_fs.write(&context(), b.handle, 7, b"!").unwrap();
@@ -1430,7 +1441,10 @@ fn native_builder_commit_planner_keeps_two_bodies_and_small_followup_patch() {
     }
     assert_eq!(meta.commit_count(), 0);
     assert_eq!(pool.snapshot().copied_bytes, expected.len() as u64);
-    assert_eq!(pool.snapshot().allocations, 2);
+    let buffers = pool.snapshot();
+    // First block checks out 1, 2 and 4 MiB; the tail needs 1 and 2 MiB
+    // and may reuse the storage returned by the first block.
+    assert_eq!(buffers.allocations + buffers.reuses, 5);
     fs.fsync(&context(), created.handle, SyncMode::Full)
         .unwrap();
     let first = meta.commits.lock().unwrap()[0].clone();
@@ -2013,8 +2027,9 @@ fn r91_open_dirty(fs: &DistributedFs, name: &str) -> (FileHandle, InodeId) {
             libc::O_RDWR,
         )
         .unwrap();
-    // A write at the end of the file reserves a whole 4 MiB builder.
-    fs.write(&context(), file.handle, 0, b"x").unwrap();
+    // Round up to one full allocation, without giving the uploader a full block.
+    let body = vec![b'x'; COMMIT_CHUNK_BYTES as usize / 2 + 1];
+    fs.write(&context(), file.handle, 0, &body).unwrap();
     (file.handle, fs.inode_id(file.entry.inode).unwrap())
 }
 
@@ -2028,11 +2043,12 @@ fn a_file_at_its_dirty_limit_does_not_commit_another_file() {
     let (oldest, oldest_inode) = r91_open_dirty(&fs, "r91-owner-limit-oldest");
     let (writer, writer_inode) = r91_open_dirty(&fs, "r91-owner-limit-writer");
     // Leave four separate builders partially filled, with no upload ready.
+    let body = vec![b'x'; chunk / 2 + 1];
     for index in 1..4 {
         assert_eq!(
-            fs.write(&context(), writer, index * COMMIT_CHUNK_BYTES, b"x")
+            fs.write(&context(), writer, index * COMMIT_CHUNK_BYTES, &body)
                 .unwrap(),
-            1
+            body.len()
         );
     }
     let pipeline = fs.write_resources.pipeline.as_ref().unwrap();
@@ -2053,7 +2069,7 @@ fn a_file_at_its_dirty_limit_does_not_commit_another_file() {
 
     // The next builder fits on the Node, but exceeds this file's limit.
     // Without a periodic pass, the original admission loop times out.
-    let result = fs.write(&context(), writer, 4 * COMMIT_CHUNK_BYTES, b"x");
+    let result = fs.write(&context(), writer, 4 * COMMIT_CHUNK_BYTES, &body);
     assert!(
         meta.commits.lock().unwrap().is_empty(),
         "a per-file limit must not trigger an early commit"

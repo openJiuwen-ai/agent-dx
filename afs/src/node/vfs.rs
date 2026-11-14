@@ -106,6 +106,17 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Under write-buffer pressure, return a score for a sequential write
+    /// that advances an existing block. This is only a scheduling hint.
+    fn queued_write_completion(
+        &self,
+        _handle: types::FileHandle,
+        _offset: u64,
+        _length: usize,
+    ) -> Option<usize> {
+        None
+    }
+
     /// Local capability query after a successful fresh open. `None` requires
     /// discarding pages; implementations must not perform RPCs from this hook.
     fn page_cache_identity(&self, _handle: types::FileHandle) -> Option<PageCacheIdentity> {

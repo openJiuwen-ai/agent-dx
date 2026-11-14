@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 
 type Job = Box<dyn FnMut() -> Result<(), i32> + Send>;
 type Admission = Box<dyn FnOnce(Result<(), i32>) + Send>;
+type CompletionHint = Box<dyn Fn() -> Option<usize> + Send>;
 type RecoveryStart = Box<dyn FnOnce(CallbackGuard) + Send>;
 /// Acknowledged (admitted) entries the worker may hold, including retained
 /// failures. Beyond it a write waits with its reply withheld, like a body-quota
@@ -19,6 +20,8 @@ const MAX_ADMITTED_ENTRIES: usize = 4096;
 /// kernel background request), so it is reached only far beyond the kernel's
 /// in-flight requests.
 const MAX_PENDING_ENTRIES: usize = 65_536;
+/// Limit the number of other files allowed to pass the oldest ready write.
+const MAX_HEAD_BYPASSES: u8 = 16;
 
 /// Admission outcomes counted per mount. `admitted` replies at once;
 /// `waited` replied after a withheld wait; the rest are rejections by reason.
@@ -70,6 +73,7 @@ struct Entry {
     bytes: usize,
     job: Job,
     admission: Option<Admission>,
+    completion_hint: Option<CompletionHint>,
 }
 #[derive(Default)]
 struct State {
@@ -83,6 +87,7 @@ struct State {
     /// Entries whose reply is withheld (`admission.is_some()`).
     pending_entries: usize,
     next_sequence: u64,
+    head_bypasses: u8,
     waiters: Vec<Waiter>,
     active: Option<(u64, u64)>,
     errors: HashMap<u64, i32>,
@@ -425,11 +430,42 @@ impl FrontWriteQueue {
         }
         callbacks
     }
-    fn runnable(state: &State) -> Option<usize> {
-        state
-            .entries
-            .iter()
-            .position(|entry| entry.admission.is_none() && !state.errors.contains_key(&entry.inode))
+    fn runnable(state: &mut State) -> Option<usize> {
+        let ready =
+            |entry: &Entry| entry.admission.is_none() && !state.errors.contains_key(&entry.inode);
+        let head = state.entries.iter().position(ready)?;
+        if state.head_bypasses == MAX_HEAD_BYPASSES {
+            state.head_bypasses = 0;
+            return Some(head);
+        }
+        let Some(mut score) = state.entries[head]
+            .completion_hint
+            .as_ref()
+            .and_then(|hint| hint())
+        else {
+            state.head_bypasses = 0;
+            return Some(head);
+        };
+        let mut best = head;
+        let mut seen = HashSet::new();
+        seen.insert(state.entries[head].inode);
+        // Bound the lookahead. Consider only the first write of each file.
+        for (index, entry) in state.entries.iter().enumerate().skip(head + 1).take(128) {
+            if seen.insert(entry.inode)
+                && ready(entry)
+                && let Some(candidate) = entry.completion_hint.as_ref().and_then(|hint| hint())
+                && candidate > score
+            {
+                best = index;
+                score = candidate;
+            }
+        }
+        if best == head {
+            state.head_bypasses = 0;
+        } else {
+            state.head_bypasses += 1;
+        }
+        Some(best)
     }
     /// Acknowledged entries held in the queue (executing entry excluded).
     fn admitted_entries(state: &State) -> usize {
@@ -523,7 +559,7 @@ impl FrontWriteQueue {
             if state.closed {
                 return;
             }
-            let Some(index) = Self::runnable(&state) else {
+            let Some(index) = Self::runnable(&mut state) else {
                 drop(
                     shared
                         .changed
@@ -566,6 +602,7 @@ impl FrontWriteQueue {
         bytes: usize,
         job: Job,
         admission: Option<Admission>,
+        completion_hint: Option<CompletionHint>,
     ) {
         state.next_sequence = state.next_sequence.saturating_add(1);
         state.bytes += bytes;
@@ -586,16 +623,30 @@ impl FrontWriteQueue {
             bytes,
             job,
             admission,
+            completion_hint,
         });
         state.peak_entries = state.peak_entries.max(state.entries.len());
     }
     /// The receiver never waits for body quota. A pending entry owns its input,
     /// but ACK is withheld until normal admission. Full reserve fails pre-ACK.
+    #[cfg(test)]
     pub(super) fn submit_deferred_with(
         &self,
         inode: u64,
         handle: u64,
         bytes: usize,
+        make: impl FnOnce() -> Result<Job, i32>,
+        admitted: impl FnOnce(Result<(), i32>) + Send + 'static,
+    ) {
+        self.submit_deferred_ranked(inode, handle, bytes, None, make, admitted);
+    }
+
+    pub(super) fn submit_deferred_ranked(
+        &self,
+        inode: u64,
+        handle: u64,
+        bytes: usize,
+        completion_hint: Option<CompletionHint>,
         make: impl FnOnce() -> Result<Job, i32>,
         admitted: impl FnOnce(Result<(), i32>) + Send + 'static,
     ) {
@@ -650,7 +701,15 @@ impl FrontWriteQueue {
             } else {
                 None
             };
-            Self::record_entry(&mut state, inode, handle, bytes, job, admission);
+            Self::record_entry(
+                &mut state,
+                inode,
+                handle,
+                bytes,
+                job,
+                admission,
+                completion_hint,
+            );
             self.shared.changed.notify_all();
             Ok(())
         })();
@@ -696,7 +755,7 @@ impl FrontWriteQueue {
             }
             state = self.shared.changed.wait(state).map_err(|_| EIO)?;
         }
-        Self::record_entry(&mut state, inode, handle, bytes, make()?, None);
+        Self::record_entry(&mut state, inode, handle, bytes, make()?, None, None);
         self.shared.changed.notify_all();
         Ok(())
     }
@@ -1028,6 +1087,33 @@ mod tests {
         }
         q.wait(None, false).unwrap();
         assert!(!q.has_pending());
+    }
+
+    #[test]
+    fn r113_completion_priority_cannot_starve_queue_head_or_skip_an_inode_prefix() {
+        let mut state = State::default();
+        let enqueue = |state: &mut State, inode, score| {
+            FrontWriteQueue::record_entry(
+                state,
+                inode,
+                inode,
+                1,
+                Box::new(|| Ok(())),
+                None,
+                Some(Box::new(move || Some(score))),
+            );
+        };
+        enqueue(&mut state, 1, 0);
+        // This high score may not let inode 1's second write pass its first.
+        enqueue(&mut state, 1, usize::MAX);
+        for _ in 0..MAX_HEAD_BYPASSES {
+            enqueue(&mut state, 2, 1);
+            let next = FrontWriteQueue::runnable(&mut state).unwrap();
+            assert_eq!(state.entries.remove(next).unwrap().inode, 2);
+        }
+        enqueue(&mut state, 2, 1);
+        assert_eq!(FrontWriteQueue::runnable(&mut state), Some(0));
+        assert_eq!(state.entries[0].sequence, 1);
     }
 
     #[test]

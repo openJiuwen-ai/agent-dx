@@ -899,6 +899,50 @@ impl Backend for DistributedFs {
             })
     }
 
+    fn queued_write_completion(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        length: usize,
+    ) -> Option<usize> {
+        if !self.crc32c_writes() {
+            return None;
+        }
+        let budget = self.write_resources.pipeline.as_ref()?.budget.snapshot();
+        // Keep enough space to grow a near-full block before the whole
+        // working set is made up of partial blocks.
+        if budget.live_bytes < budget.limit - budget.limit / 4 {
+            return None;
+        }
+        let handle = self.handles.get(handle.0).ok()??;
+        let cell = self.write_state(&handle.inode_id).ok()??;
+        let state = cell.try_lock().ok()?;
+        if state.in_flight.is_some() || state.terminal_error.is_some() {
+            return Some(0);
+        }
+        let score =
+            state
+                .dirty_extents
+                .native_selection(offset)
+                .map_or(0, |(index, source, available)| {
+                    let builder = &state.dirty_extents.builders[index].builder;
+                    if offset != state.logical_length || source != builder.len() {
+                        return 0;
+                    }
+                    let end = source + length.min(available);
+                    // Growth checks out a new buffer while the old one is
+                    // live. Do not favor a write that cannot fit right now.
+                    if end > builder.capacity()
+                        && end.next_power_of_two().min(builder.writable_capacity())
+                            > budget.limit - budget.live_bytes
+                    {
+                        return 0;
+                    }
+                    end
+                });
+        Some(score)
+    }
+
     fn write_admission_mode(&self, handle: FileHandle) -> WriteAdmissionMode {
         // Native admission may wait for mutation/publication or shared body
         // capacity. Keep those waits on a worker so the FUSE receiver can
