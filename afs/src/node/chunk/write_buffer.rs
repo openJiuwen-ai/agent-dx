@@ -586,8 +586,8 @@ impl Deref for SharedChunkBytes {
     }
 }
 
-/// One mutable final payload allocation. Pooled builders are fixed capacity;
-/// the unpooled Default builder remains fallibly growable for other callers.
+/// One mutable payload allocation. Native builders grow only by exchanging
+/// separately admitted buffers. Unpooled builders can allocate on write.
 #[derive(Debug)]
 pub struct ChunkBuilder {
     pub(super) buffer: ChunkBuffer,
@@ -641,6 +641,21 @@ impl ChunkBuilder {
     pub fn writable_capacity(&self) -> usize {
         self.fixed_capacity.unwrap_or_else(|| self.capacity())
     }
+    #[cfg(feature = "dfs")]
+    pub(crate) fn allow_native_growth(&mut self, chunk_limit: usize) {
+        self.fixed_capacity = Some(chunk_limit);
+    }
+
+    /// The caller has admitted both allocations before copying. Keep the
+    /// logical block limit while the old allocation returns its charge.
+    #[cfg(feature = "dfs")]
+    pub(crate) fn replace_native_storage(&mut self, mut replacement: Self) {
+        debug_assert!(replacement.capacity() >= self.len());
+        replacement.buffer.bytes.extend_from_slice(self.as_bytes());
+        replacement.fixed_capacity = self.fixed_capacity;
+        *self = replacement;
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.buffer.bytes
     }
@@ -651,8 +666,8 @@ impl ChunkBuilder {
         self.buffer.allocation_id
     }
 
-    /// Copy accepted input directly to the final storage. Fixed builders never
-    /// reallocate; allocation errors leave the previous bytes and length intact.
+    /// Copy accepted input to admitted storage. Fixed builders never allocate
+    /// here; allocation errors leave the previous bytes and length intact.
     pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize> {
         if data.is_empty() {
             return Ok(0);
@@ -661,7 +676,10 @@ impl ChunkBuilder {
         let end = offset
             .checked_add(data.len())
             .ok_or_else(|| invalid("chunk write range overflow"))?;
-        if self.fixed_capacity.is_some_and(|capacity| end > capacity) {
+        if self
+            .fixed_capacity
+            .is_some_and(|capacity| end > capacity.min(self.capacity()))
+        {
             return Err(write_allocation_error());
         }
         if end > self.buffer.bytes.capacity() {
