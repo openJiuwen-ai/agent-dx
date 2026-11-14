@@ -450,6 +450,29 @@ Meta WAL 预算枚举与退休回收允许并发：只对 CURRENT 已持久退�
 
 OwnerFs 面向小规模 Agent workspace。Home 节点把 workspace 保存为普通本地目录；远端节点通过受控 peer 回到 Home 访问文件。远端传输会话本身不授予文件访问权限，每次打开、读写、flush、sync 和 close 都必须校验授权、句柄、权限、root grant、session、Home session 和 fence。
 
+OwnerFs 可通过 `[ownerfs_workspace_api]` 启用独立 HTTP 管理入口，默认关闭，不要求逐 workspace egress bind。创建复用 ReserveRoot → Home PrepareOwnerRoot → ActivateRoot，省略的 uid/gid 由 Home 解析；已有目录核对实际属性及 Home 默认值，一致才作为幂等成功。激活响应丢失时依据原 epoch、catalog 和 Meta 授权恢复 Home 缓存。返回前只等待入口自己的 outlet：软链与 RootId/epoch/Home、import 来源、目录属性和守护进程读写探针均须匹配。现有镜像继续管理名字和按 Home 共享的 bind/NFS import。
+
+workspace 的正常路径为 `<data_dir>/ownerfs/root-<hex>-e<epoch>`。API 返回 epoch；DELETE 的 epoch 参数可选，不带时删除当前代次，单个请求绑定 API 节点读到的 epoch，带上时与当前代次不符返回 409。本机和远端删除统一进入 Home 执行路径；远端请求绑定认证节点的当前 Meta 会话。Home 在 workspace 锁内核对 Meta 归属、catalog 和规范路径，先将旧目录原子 rename 到存储根内的 `<data_dir>/ownerfs/.ownerfs-trash/`（root 0700），同步存储根，再撤下本机准入、条件注销 Meta 并移除 catalog。rename 前的确定失败不改动 workspace；rename 后只向前完成，失败返回 503，由重试或后台维护收敛。Meta 不增加删除状态。
+
+隔离后到注销前，Meta 仍保留原归属；Home 以 catalog 与同 epoch trash 的位置识别已隔离代次，拒绝缓存补齐、远端访问和同名核对，不重新开放。Home 重启后会话变化时先换绑当前会话再注销，不安装缓存。原目录与 trash 都不存在时同样完成注销。DELETE 成功表示旧代次已逻辑删除，同名可创建新 epoch；物理回收不在请求期限内，仅在 Meta 确认该 epoch 已结束且 catalog 不再引用后执行，失败保留并重试。调用方须先停止环境并释放已有 fd/bind/NFS 使用；ext4/NFS 不经过 FUSE，rename 不撤销已有引用，未排空的写入只会推迟 trash 回收，outlet 软链撤下按快照最终收敛。
+
+Meta 只区分有归属和无归属，不增加删除状态；下图的“已隔离”是 Home 按目录位置判定的本地阶段。
+
+```mermaid
+stateDiagram-v2
+    state "正常（Meta 有归属，目录在原路径）" as Active
+    state "已隔离（Home 本地：Meta 仍有归属，目录在 trash）" as Isolated
+    state "已删除（Meta 无归属，catalog 已移除）" as Deleted
+    Active --> Isolated: Home rename 到 trash 并同步
+    Isolated --> Isolated: 注销失败，重试/后台/重启恢复
+    Isolated --> Deleted: Meta 条件注销
+    Deleted --> [*]: 后台回收旧 epoch 数据
+```
+
+FUSE rmdir 保持空目录限制，`rm -rf` 仍逐项 unlink/rmdir；非空 workspace 管理删除只由 Home 控制面执行。POST 准备成功后核对 reservation 的 epoch 和 Home，不能接受并发重建的新代次。
+
+查询和运维列表复用 Meta 的只读归属快照及 LookupNode；地址和属性补全共用预算，保留不带筛选的全部归属记录；IP 筛选只比较发布地址中的 IP 字面量，遇到主机名或地址补全失败时 complete=false；本机和远端属性读取均受剩余预算约束，不可用时为 null。只有入口路径探针按 Home 限制并发（每个 Home 2 个），避免故障 Home 的 hard NFS 阻塞拖住整个 API；其他操作不限并发。强制删除仅在 Meta 事务确认同一 root 未变且 Home 无有效会话时清归属，返回 data_lost=true；Home 会话已失效，不下发撤销命令；Home 有效时仍走普通删除，失败不会降级为只清记录。HTTP 无鉴权，内部 RPC 保留 mTLS 身份绑定，部署须限制入口网络范围。配置与请求示例见[Workspace API 部署](../deployment/afs.md#ownerfs-workspace-api)。
+
 DFS 把已提交数据表示为不可变 chunk。普通写入先进入 inode 的 dirty 状态；sync、同步写标志、close-time flush 或后台策略触发提交，形成新的 `FileVersion`。复制发生在文件布局之下，Meta 只在收到可验证持久 receipt 后提交新版本和副本目录。验证缓存不能自动算作持久副本。
 
 DFS 的 `copy_file_range` 通过元数据 COW 为目标创建独立 FileVersion，重映射指定源范围的不可变 chunk；不读取或重新上传源数据。范围覆盖保留目标其它区域和源稀疏空洞。Meta 核验源与目标属于同一 namespace、布局严格对应声明范围，重试沿用原操作身份。后续写入提交独立 chunk，源目录删除不会使已提交副本失去数据。
@@ -504,7 +527,7 @@ Bao sidecar、Peer cache 条目与目录标记、外部对象 key 前缀、Owner
   停机升级后所有 Node 都是新 session，旧记录不会再被重放比对。
 - **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
 - **协议**：`RegisterNodeRequest.protocol_version` 是集群线协议代际（Node↔Meta 注册、Node↔Node service
-  布局），当前为 8（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本，8 为元数据复合操作：setattr 可不带客户端 revision、create 并入首个写代引用、复合打开），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
+  布局），当前为 9（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本，8 为元数据复合操作：setattr 可不带客户端 revision、create 并入首个写代引用、复合打开，9 为 Workspace API 的内部属主与删除协议），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。

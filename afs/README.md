@@ -14,7 +14,7 @@ DFS Peer 客户端允许接收 128 KiB HTTP/2 DATA 帧；业务消息、流控�
 
 ![AFS 架构总览](../assets/architecture/afs.svg)
 
-详细路径见[AFS 架构与时序图](../docs/architecture/afs.md)。
+详细路径见[AFS 架构与时序图](../docs/architecture/afs.md)。OwnerFs 可选的 [Workspace HTTP API](../docs/deployment/afs.md#ownerfs-workspace-api) 提供创建、查询、列表和递归删除，接口与 #85 一致。创建成功后返回入口节点已就绪的 outlet 路径。未配置 API 时不监听，配置合法即启用；沿用现有 OwnerFs 存储布局。
 
 ## 组件范围
 

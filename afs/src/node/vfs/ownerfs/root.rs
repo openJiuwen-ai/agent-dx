@@ -28,6 +28,9 @@ use super::catalog::{
 };
 use crate::node::storage::{DirectoryHandle, FileStore, LocalFs, StoragePath};
 
+/// 已隔离旧代次的回收目录，位于 OwnerFs 存储根内，仅 root 可访问。
+const TRASH_DIR: &str = ".ownerfs-trash";
+
 /// Meta 使用的稳定根身份；与 FUSE inode、磁盘目录名均不同。
 ///
 /// 一级目录名可以包含非 UTF-8 字节。未来从 `OsStr` 生成这个字符串时
@@ -363,6 +366,15 @@ enum GrantPhase {
     Invalid,
 }
 
+/// 一个代次的数据目录位置：原路径、同 epoch trash、两处都没有或两处冲突。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Placement {
+    Live,
+    Isolated,
+    Missing,
+    Conflict,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PeerGrantKey {
     holder_node_id: String,
@@ -553,6 +565,177 @@ impl RootManager {
         &self.local_node_id
     }
 
+    /// 存储根内的 trash：与 workspace 同一目录树，rename 不会跨挂载点。
+    fn trash_path(&self) -> std::path::PathBuf {
+        self.disk.root_path().join(TRASH_DIR)
+    }
+
+    /// 由原目录与同 epoch trash 的位置判断该代次是否已隔离。
+    fn placement(&self, record: &LocalRootRecord) -> Result<Placement> {
+        let directory = |path: std::path::PathBuf| match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(Some(metadata.is_dir())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Error::from(error)),
+        };
+        let live = directory(self.disk.root_path().join(record.data_dir.as_path()))?;
+        let trash = directory(self.trash_path().join(record.data_dir.as_path()))?;
+        Ok(match (live, trash) {
+            (Some(true), None) => Placement::Live,
+            (None, Some(true)) => Placement::Isolated,
+            (None, None) => Placement::Missing,
+            _ => Placement::Conflict,
+        })
+    }
+
+    /// rename 本身失败时原目录不动；调用方已确认 trash 中没有同 epoch 目录。
+    fn rename_to_trash(&self, record: &LocalRootRecord) -> Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        let trash = self.trash_path();
+        match std::fs::DirBuilder::new().mode(0o700).create(&trash) {
+            Ok(()) => self.disk.sync_root()?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let source = self.disk.root_path().join(record.data_dir.as_path());
+        if std::fs::symlink_metadata(&source)?.dev() != std::fs::metadata(&trash)?.dev() {
+            return Err(invalid_grant(
+                "trash must be a directory on the same filesystem",
+            ));
+        }
+        std::fs::rename(&source, trash.join(record.data_dir.as_path()))?;
+        Ok(())
+    }
+
+    /// 已隔离或目录已缺失的代次只向前完成：同步目录、撤下本机准入，
+    /// 会话变化时先换绑当前会话（不安装缓存），再条件注销并移除 catalog。
+    fn finish_isolated(&self, record: &LocalRootRecord) -> Result<()> {
+        match std::fs::File::open(self.trash_path()) {
+            Ok(trash) => trash.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.disk.sync_root()?;
+        {
+            let mut roots = self
+                .roots
+                .write()
+                .map_err(|_| invalid_grant("root cache lock poisoned"))?;
+            if roots
+                .get(&record.id)
+                .is_some_and(|root| root.epoch == record.epoch)
+                && let Some(root) = roots.remove(&record.id)
+            {
+                let mut state = root.state.lock().unwrap_or_else(|error| error.into_inner());
+                state.phase = GrantPhase::Invalid;
+                state.validated_peer_grants.clear();
+            }
+        }
+        match self.meta.lookup_root(&record.id)? {
+            Some(location)
+                if location.epoch == record.epoch
+                    && location.home_node_id == self.local_node_id =>
+            {
+                if location.home_session_id != self.session_id {
+                    self.meta.recover_root(record, &self.session_id)?;
+                }
+                self.meta.deactivate_root(
+                    &record.id,
+                    record.epoch,
+                    &self.local_node_id,
+                    &self.session_id,
+                )?;
+            }
+            Some(location) if location.epoch <= record.epoch => {
+                return Err(invalid_grant("Meta root does not match the isolated epoch"));
+            }
+            _ => {}
+        }
+        self.catalog.remove_prepared_root(record)
+    }
+
+    fn trash_entries(&self) -> Result<Vec<(RootId, u64, StoragePath)>> {
+        let trash = self.trash_path();
+        if !trash.try_exists()? {
+            return Ok(Vec::new());
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&trash)? {
+            let name = entry?.file_name();
+            let Some((id, epoch)) = name.to_str().and_then(|name| name.rsplit_once("-e")) else {
+                continue;
+            };
+            let Ok(epoch) = epoch.parse::<u64>() else {
+                continue;
+            };
+            let id = RootId(id.into());
+            let Ok(owner) = root_name_from_id(&id) else {
+                continue;
+            };
+            let path = root_data_dir(&owner, epoch)?;
+            if path.as_path().as_os_str() == name && epoch != 0 {
+                entries.push((id, epoch, path));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// 后台重试已隔离代次的注销；返回已移除 catalog 的代次，供调用方清理索引。
+    pub(crate) fn finish_isolated_roots(&self) -> Result<Vec<(RootId, u64)>> {
+        let mut completed = Vec::new();
+        for (id, epoch, _) in self.trash_entries()? {
+            let lock = self.workspace_lock(&id)?;
+            let _guard = lock
+                .lock()
+                .map_err(|_| invalid_grant("workspace lock poisoned"))?;
+            let Some(record) = self.catalog.lookup_root(&id)? else {
+                continue;
+            };
+            if record.epoch != epoch || self.placement(&record)? != Placement::Isolated {
+                continue;
+            }
+            match self.finish_isolated(&record) {
+                Ok(()) => completed.push((id, epoch)),
+                Err(error) => {
+                    afs_logging::warn!("ownerfs.delete_retry_failed"; "root_id" => ?id, "epoch" => epoch, "error" => error.to_string());
+                }
+            }
+        }
+        Ok(completed)
+    }
+
+    /// 递归清理 Meta 已不再持有该 epoch、且 catalog 已不引用的 trash 目录。
+    pub(crate) fn collect_trash(&self) -> Result<usize> {
+        let entries = self.trash_entries()?;
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let disk = LocalFs::open(self.trash_path())?;
+        let mut removed = 0;
+        for (id, epoch, path) in entries {
+            if self
+                .meta
+                .lookup_root(&id)?
+                .is_some_and(|root| root.epoch <= epoch)
+                || self
+                    .catalog
+                    .lookup_root(&id)?
+                    .is_some_and(|record| record.epoch == epoch)
+            {
+                continue;
+            }
+            match disk.remove_tree(&path) {
+                Ok(()) => {
+                    disk.sync_root()?;
+                    removed += 1;
+                }
+                Err(error) => {
+                    afs_logging::warn!("ownerfs.trash_cleanup_failed"; "path" => ?path, "error" => error.to_string())
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     /// Open the production root manager, hold the local catalog lock for the
     /// process lifetime, and recover all durable local roots through Meta before
     /// the VFS is mounted. Any invalid durable root fails closed by returning an
@@ -723,6 +906,8 @@ impl RootManager {
         validate_root_name(OsStr::from_bytes(&params.name))?;
         if root_id_from_name(OsStr::from_bytes(&params.name))? != reservation.id
             || params.mode & !0o7777 != 0
+            || params.uid == u32::MAX
+            || params.gid == u32::MAX
         {
             return Err(invalid_grant("workspace name or permissions are invalid"));
         }
@@ -751,7 +936,7 @@ impl RootManager {
             && record.epoch < reservation.epoch
         {
             // The current reservation was verified under the workspace lock.
-            // Remove only an obsolete, canonical directory without a local runtime.
+            // Retire only a fenced, canonical generation without a local runtime.
             if record.epoch == 0
                 || record.name != name
                 || root_id_from_name(&record.name)? != record.id
@@ -767,22 +952,7 @@ impl RootManager {
                     "conflicting local catalog record already exists",
                 ));
             }
-            // The current reservation was verified under the workspace lock.
-            // Two cases for an obsolete generation:
-            //
-            //  * empty -> delete it and drop the record; the rebuild is clean.
-            //  * non-empty -> refuse. Nothing can legitimately hold files in a
-            //    superseded generation any more: the delete contract rejects
-            //    non-empty workspaces up front, so a leftover directory here
-            //    has no owner and no retirement marker to defer on. Silently
-            //    dropping a directory we cannot explain is worse than failing;
-            //    the startup reconcile surfaces it to an operator instead.
-            match self.remove_abandoned_dir(&record.data_dir) {
-                Ok(()) => {
-                    self.catalog.remove_prepared_root(record)?;
-                }
-                Err(error) => return Err(error),
-            }
+            self.retire_fenced_root(record)?;
             local_record = None;
         }
         if let Some(record) = local_record {
@@ -889,8 +1059,21 @@ impl RootManager {
             return Err(invalid_grant("prepared root is not a directory"));
         }
         let grant = self.meta.activate_root(prepared)?;
-        if grant.id != prepared.reservation.id
-            || grant.epoch != prepared.reservation.epoch
+        self.cache_local_root(
+            &LocalRootRecord {
+                id: prepared.reservation.id.clone(),
+                name,
+                epoch: prepared.reservation.epoch,
+                data_dir: prepared.data_dir.clone(),
+                local_prepare_id: prepared.local_prepare_id.clone(),
+            },
+            grant,
+        )
+    }
+
+    fn cache_local_root(&self, record: &LocalRootRecord, grant: RootGrant) -> Result<()> {
+        if grant.id != record.id
+            || grant.epoch != record.epoch
             || grant.home_node_id != self.local_node_id
             || grant.home_session_id != self.session_id
             || grant.holder_node_id != self.local_node_id
@@ -899,14 +1082,14 @@ impl RootManager {
             || grant.fencing_token.is_empty()
         {
             return Err(invalid_grant(
-                "activated root grant does not match local reservation",
+                "Home grant does not match local durable record",
             ));
         }
         let root = Arc::new(LocalRoot {
-            id: grant.id.clone(),
-            name,
-            data_dir: prepared.data_dir.clone(),
-            epoch: grant.epoch,
+            id: record.id.clone(),
+            name: record.name.clone(),
+            data_dir: record.data_dir.clone(),
+            epoch: record.epoch,
             state: Mutex::new(RootRuntime {
                 phase: GrantPhase::Active(grant),
                 #[cfg(test)]
@@ -933,6 +1116,49 @@ impl RootManager {
         }
         roots.insert(root.id.clone(), root);
         Ok(())
+    }
+
+    /// Restore only the requested durable epoch after an uncertain activation.
+    pub(crate) fn recover_local_root(&self, id: &RootId, epoch: u64) -> Result<()> {
+        if !self.control_valid.load(Ordering::Acquire) {
+            return Err(unavailable_grant("Meta control session is invalid"));
+        }
+        if self.local_root_data_dir(id)?.is_some() {
+            return Ok(());
+        }
+        let lock = self.workspace_lock(id)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| invalid_grant("workspace lock poisoned"))?;
+        if self.local_root_data_dir(id)?.is_some() {
+            return Ok(());
+        }
+        let record = self
+            .catalog
+            .lookup_root(id)?
+            .ok_or_else(|| invalid_grant("local root catalog record not found"))?;
+        if record.id != *id
+            || record.epoch != epoch
+            || epoch == 0
+            || root_id_from_name(&record.name)? != record.id
+            || root_data_dir(&record.name, record.epoch)? != record.data_dir
+            || record.local_prepare_id.is_empty()
+        {
+            return Err(invalid_grant(
+                "local root catalog does not match requested epoch",
+            ));
+        }
+        match self.placement(&record)? {
+            Placement::Live => {}
+            Placement::Isolated | Placement::Conflict => return Err(isolated()),
+            Placement::Missing => {
+                return Err(invalid_grant(
+                    "local root catalog does not match requested epoch",
+                ));
+            }
+        }
+        let grant = self.meta.recover_root(&record, &self.session_id)?;
+        self.cache_local_root(&record, grant)
     }
 
     /// 根内热路径：按已解析 RootId 查缓存并短锁准入，不访问 Meta。
@@ -1017,6 +1243,7 @@ impl RootManager {
         if !self.control_valid.load(Ordering::Acquire) {
             return Err(unavailable_grant("Meta control session is invalid"));
         }
+        self.recover_local_root(&presented.id, presented.epoch)?;
         let root = self
             .roots
             .read()
@@ -1307,34 +1534,29 @@ impl RootManager {
         }
     }
 
-    /// D4: 完整删除一个 active root。
-    ///
-    /// 调用顺序：revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog。
-    /// 每步幂等，部分失败可安全重试。并发 rmdir 中，缓存移除是线性化点：
-    /// 第二个调用在缓存中找不到 root，返回 NODE_VFS_NOT_FOUND（FUSE 层转 ENOENT）。
-    /// 物理目录删除先于 catalog 移除：非空目录使 remove_dir 返回 ENOTEMPTY 时
-    /// catalog 记录仍保留，root 可被重启 reconcile 继续收敛，不会成为
-    /// 控制面记录先于数据被清除的孤儿（review: 非空 root 删除失败会丢失控制面记录）。
-    /// Meta 不可达时在 deactivate 处失败并保持 catalog/物理目录不变，
-    /// 残留记录由 reconcile_on_startup 的 zombie 检测在下次启动时清理。
-    /// `expected_epoch` 为 `Some` 时，先在 workspace 锁内确认 catalog 中的 root
-    /// 仍是该 epoch：同名重建后返回 NODE_OWNER_STALE_HANDLE，不执行任何步骤。
+    /// D4: 删除空 root；递归删除由 `delete_root_with` 的 `recursive` 参数指定。
+    /// 空目录删除沿用 revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog。
+    /// 递归删除先 rename 到 trash 隔离，再撤销准入并条件注销归属；物理回收在后台执行。
+    /// 隔离后的失败保留 trash 与 catalog，供同一代重试。全部步骤持有 workspace 锁。
+    /// `expected_epoch` 不匹配时返回 NODE_OWNER_STALE_HANDLE，不执行删除。
     pub fn delete_root(&self, id: &RootId, expected_epoch: Option<u64>) -> Result<()> {
-        self.delete_root_with(id, expected_epoch, || Ok(()), || Ok(()))
+        self.delete_root_with(id, expected_epoch, false, || Ok(()), || Ok(()))
     }
 
     /// 与 [`RootManager::delete_root`] 相同，另在 workspace 锁内执行调用方的两个步骤：
-    /// `before` 在 epoch 检查之后、revoke 之前，`after` 在 catalog 移除之后。同名创建
+    /// `before` 在 epoch 检查之后、目录移除之前（递归删除时在目录隔离成功之后），
+    /// `after` 在 catalog 移除之后。同名创建
     /// 同样持有该锁，两个步骤因此只会作用于被删版本，不会影响同名重建的新 workspace。
     pub fn delete_root_with(
         &self,
         id: &RootId,
         expected_epoch: Option<u64>,
+        recursive: bool,
         before: impl FnOnce() -> Result<()>,
         after: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         afs_logging::info!("root.delete_root.start"; "root_id" => ?id);
-        let result = self.delete_root_inner(id, expected_epoch, before, after);
+        let result = self.delete_root_inner(id, expected_epoch, recursive, before, after);
         match &result {
             Ok(()) => afs_logging::info!("root.delete_root.completed"; "root_id" => ?id),
             Err(error) => {
@@ -1362,6 +1584,7 @@ impl RootManager {
         &self,
         id: &RootId,
         expected_epoch: Option<u64>,
+        recursive: bool,
         before: impl FnOnce() -> Result<()>,
         after: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
@@ -1379,11 +1602,28 @@ impl RootManager {
                 "workspace was recreated after the delete request was validated",
             ));
         }
+        if recursive {
+            return self.isolate_and_deactivate(id, before, after);
+        }
+        if !self
+            .roots
+            .read()
+            .map_err(|_| invalid_grant("root cache lock poisoned"))?
+            .contains_key(id)
+        {
+            return Err(Error::coded(
+                afs_error::NODE_VFS_NOT_FOUND,
+                "root not found for deletion",
+            ));
+        }
+        let record = self
+            .catalog
+            .lookup_root(id)?
+            .ok_or_else(|| invalid_grant("root catalog record not found"))?;
         before()?;
-        // 1. revoke — 阻止新的 enter_root。
         self.revoke_root(id);
 
-        // 2. 从缓存移除（并发 rmdir 的线性化点）。
+        // 空目录删除先从缓存移除。
         {
             let mut roots = self
                 .roots
@@ -1399,19 +1639,12 @@ impl RootManager {
         }
         afs_logging::info!("root.delete_root.cache_removed"; "root_id" => ?id);
 
-        let records = self.catalog.scan_roots()?;
-        let record = records
-            .into_iter()
-            .find(|record| &record.id == id)
-            .ok_or_else(|| invalid_grant("root catalog record not found"))?;
-
-        // 3. Meta deactivate（epoch 从 catalog 获取）。
+        // 空目录删除沿用先注销 Meta、再移除目录的顺序。
         self.meta
             .deactivate_root(id, record.epoch, &self.local_node_id, &self.session_id)?;
         afs_logging::info!("root.delete_root.meta_deactivated"; "root_id" => ?id, "epoch" => record.epoch);
 
-        // 4. 删除物理目录。先于 catalog 移除：目录删除失败（如非空）时
-        //    catalog 记录仍存在，root 可被重启 reconcile 重新收敛或继续清理。
+        // 目录清理完成后才移除 catalog。
         self.remove_abandoned_dir(&record.data_dir)?;
         afs_logging::info!("root.delete_root.dir_removed"; "root_id" => ?id, "data_dir" => ?record.data_dir);
 
@@ -1420,6 +1653,73 @@ impl RootManager {
         afs_logging::info!("root.delete_root.catalog_removed"; "root_id" => ?id);
 
         after()
+    }
+
+    /// 递归删除：workspace 锁内核对 Meta 与 catalog，rename 到 trash 隔离后
+    /// 只向前完成注销。rename 之前的确定失败保持原 workspace 可用；之后的失败
+    /// 统一为可重试错误，由同 epoch 重试或后台维护收敛。
+    fn isolate_and_deactivate(
+        &self,
+        id: &RootId,
+        detach: impl FnOnce() -> Result<()>,
+        after: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if !self.control_valid.load(Ordering::Acquire) {
+            return Err(unavailable_grant("Meta control session is invalid"));
+        }
+        let Some(record) = self.catalog.lookup_root(id)? else {
+            return if self.meta.lookup_root(id)?.is_none() {
+                after()
+            } else {
+                Err(invalid_grant("root catalog record not found"))
+            };
+        };
+        if root_id_from_name(&record.name)? != record.id
+            || root_data_dir(&record.name, record.epoch)? != record.data_dir
+        {
+            return Err(invalid_grant(
+                "local root catalog identity is not canonical",
+            ));
+        }
+        match self.placement(&record)? {
+            Placement::Live => {
+                if !self.meta.lookup_root(id)?.is_some_and(|location| {
+                    location.epoch == record.epoch
+                        && location.home_node_id == self.local_node_id
+                        && location.home_session_id == self.session_id
+                }) {
+                    return Err(Error::coded(
+                        afs_error::NODE_OWNER_STALE_HANDLE,
+                        "Meta root does not match the local Home epoch",
+                    ));
+                }
+                self.rename_to_trash(&record)?;
+                afs_logging::info!("root.delete_root.isolated"; "root_id" => ?id, "epoch" => record.epoch);
+            }
+            Placement::Isolated => {}
+            Placement::Missing => {
+                afs_logging::warn!("root.delete_root.data_dir_missing"; "root_id" => ?id, "epoch" => record.epoch);
+            }
+            Placement::Conflict => {
+                return Err(invalid_grant(
+                    "both live and trash paths exist or trash is invalid",
+                ));
+            }
+        }
+        // Detach only after isolation: a failed rename must leave the workspace usable.
+        detach()
+            .and_then(|()| self.finish_isolated(&record))
+            .and_then(|()| after())
+            .map_err(|error| {
+                if error.kind() == afs_error::ErrorKind::Unavailable {
+                    error
+                } else {
+                    Error::coded(
+                        afs_error::IO_UNAVAILABLE,
+                        format!("workspace is isolated; deletion is pending: {error}"),
+                    )
+                }
+            })
     }
 
     /// 本进程会话确认失效时封闭全部根，不能继续用旧授权准入。
@@ -1533,27 +1833,17 @@ impl RootManager {
             self.remove_abandoned_dir(&data_dir)?;
             if let Some(record) = records.remove(&reservation.id) {
                 if record.epoch < reservation.epoch {
-                    self.remove_abandoned_dir(&record.data_dir)?;
+                    self.retire_fenced_root(&record)?;
+                } else {
+                    self.catalog.remove_prepared_root(&record)?;
                 }
-                self.catalog.remove_prepared_root(&record)?;
             }
         }
 
         for record in records.into_values() {
             let Some(location) = active.get(&record.id) else {
-                // 两种来源：(1) Abort CAS 后崩溃、本地清理前的 pending reservation；
-                // (2) delete_root 已提交 Meta deactivate 但物理目录/catalog 清理被
-                // 中断（含非空目录删除失败）。两者都表示该 root 已逻辑删除：
-                // 收敛为移除 catalog 条目；物理目录非空（ENOTEMPTY）时记录警告
-                // 并保留，等待人工清理，不阻塞启动（review: 非空 root 删除失败
-                // 会丢失控制面记录）。
-                //
-                // **非空时必须保留 catalog 条目**：它是"该目录曾被本节点激活、
-                // 现在需要人工清理"的唯一持久证据。丢弃条目会让目录失去归属——
-                // 启动 reconcile 不再有全量上下文，目录就永远无法与同名重建的
-                // 新代区分，误删会销毁仍可能被 NFS 客户端 bind 的旧代数据。
-                // 运行期没有回收路径：删除契约只在提交前检查空目录，提交后
-                // ENOTEMPTY 直接抛错，不存在"已提交但待回收"的目录。
+                // Meta no longer exposes this generation. Keep nonempty data
+                // and its catalog evidence until a newer reservation retires it.
                 match self.remove_abandoned_dir(&record.data_dir) {
                     Ok(()) => {
                         self.catalog.remove_prepared_root(&record)?;
@@ -1575,6 +1865,19 @@ impl RootManager {
                     "active Meta root does not match local durable root",
                 ));
             }
+            match self.placement(&record)? {
+                Placement::Isolated => {
+                    if let Err(error) = self.finish_isolated(&record) {
+                        afs_logging::warn!("ownerfs.delete_recovery_pending"; "root_id" => ?record.id, "error" => error.to_string());
+                    }
+                    continue;
+                }
+                Placement::Conflict => {
+                    afs_logging::warn!("root.reconcile.isolation_conflict"; "root_id" => ?record.id, "data_dir" => ?record.data_dir);
+                    continue;
+                }
+                Placement::Live | Placement::Missing => {}
+            }
             // Zombie root detection (spec §4.2): catalog 和 Meta 都有记录，
             // 但物理目录已不存在时，执行完整清理而不是启动失败。
             if !self
@@ -1588,6 +1891,7 @@ impl RootManager {
                     "root_id" => ?record.id,
                     "data_dir" => ?record.data_dir,
                 );
+                self.meta.recover_root(&record, &self.session_id)?;
                 self.meta.deactivate_root(
                     &record.id,
                     record.epoch,
@@ -1598,40 +1902,22 @@ impl RootManager {
                 continue;
             }
             let grant = self.meta.recover_root(&record, &self.session_id)?;
-            if grant.id != record.id
-                || grant.epoch != record.epoch
-                || grant.home_node_id != self.local_node_id
-                || grant.home_session_id != self.session_id
-                || grant.holder_node_id != self.local_node_id
-                || grant.session_id != self.session_id
-                || grant.access_generation == 0
-                || grant.fencing_token.is_empty()
-            {
-                return Err(invalid_grant(
-                    "recovered root grant does not match local durable record",
-                ));
-            }
-            let root = Arc::new(LocalRoot {
-                id: record.id.clone(),
-                name: record.name.clone(),
-                data_dir: record.data_dir.clone(),
-                epoch: record.epoch,
-                state: Mutex::new(RootRuntime {
-                    phase: GrantPhase::Active(grant),
-                    #[cfg(test)]
-                    pf1_refusal: None,
-                    in_flight: 0,
-                    validated_peer_grants: HashMap::new(),
-                    fenced_peer_sessions: HashSet::new(),
-                }),
-                drained: Condvar::new(),
-            });
-            self.roots
-                .write()
-                .map_err(|_| invalid_grant("root cache lock poisoned"))?
-                .insert(record.id, root);
+            self.cache_local_root(&record, grant)?;
         }
         Ok(())
+    }
+
+    fn retire_fenced_root(&self, record: &LocalRootRecord) -> Result<()> {
+        match self.remove_abandoned_dir(&record.data_dir) {
+            Ok(()) => {}
+            Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
+                afs_logging::warn!("root.retire.retained_data";
+                    "root_id" => ?record.id, "epoch" => record.epoch,
+                    "data_dir" => ?record.data_dir);
+            }
+            Err(error) => return Err(error),
+        }
+        self.catalog.remove_prepared_root(record)
     }
 
     fn remove_abandoned_dir(&self, data_dir: &StoragePath) -> Result<()> {
@@ -1868,6 +2154,13 @@ pub trait RootLifecycle: Send + Sync {
 
 fn invalid_grant(message: &'static str) -> Error {
     Error::coded(afs_error::NODE_OWNER_INVALID_GRANT, message)
+}
+
+fn isolated() -> Error {
+    Error::coded(
+        afs_error::META_OWNER_ROOT_BUSY,
+        "workspace is isolated for deletion",
+    )
 }
 
 fn unavailable_grant(message: &'static str) -> Error {
@@ -2777,6 +3070,7 @@ mod tests {
         active: Option<RootLocation>,
         active_prepare_id: Option<String>,
         lose_activate_reply: bool,
+        fail_deactivate: bool,
     }
 
     #[derive(Default)]
@@ -2814,7 +3108,9 @@ mod tests {
             if state.lose_activate_reply {
                 return Err(unavailable_grant("injected lost Activate reply"));
             }
-            Ok(recovery_grant(reservation.id.clone(), "old-session"))
+            let mut grant = recovery_grant(reservation.id.clone(), "old-session");
+            grant.epoch = reservation.epoch;
+            Ok(grant)
         }
 
         fn abort_root(&self, reservation: &RootReservation) -> Result<()> {
@@ -2826,8 +3122,25 @@ mod tests {
             Ok(())
         }
 
-        fn deactivate_root(&self, root_id: &RootId, _: u64, _: &str, _: &str) -> Result<()> {
+        fn deactivate_root(
+            &self,
+            root_id: &RootId,
+            epoch: u64,
+            home: &str,
+            session: &str,
+        ) -> Result<()> {
             let mut state = self.0.lock().unwrap();
+            if std::mem::take(&mut state.fail_deactivate) {
+                return Err(invalid_grant("injected deactivation failure"));
+            }
+            if state.active.as_ref().is_some_and(|location| {
+                location.id == *root_id
+                    && (location.epoch != epoch
+                        || location.home_node_id != home
+                        || location.home_session_id != session)
+            }) {
+                return Err(invalid_grant("deactivate identity mismatch"));
+            }
             if state
                 .active
                 .as_ref()
@@ -2959,6 +3272,215 @@ mod tests {
         }
     }
 
+    fn prepared_job(manager: &RootManager, root: &std::path::Path) -> (RootId, std::path::PathBuf) {
+        let owner = std::fs::metadata(root).unwrap();
+        let reservation = manager.reserve_workspace(OsStr::new("job")).unwrap();
+        manager
+            .prepare_owner_root(
+                "node-a",
+                &reservation,
+                &RootCreateParams {
+                    name: b"job".to_vec(),
+                    uid: owner.uid(),
+                    gid: owner.gid(),
+                    mode: 0o700,
+                },
+            )
+            .unwrap();
+        let path = root.join(root_data_dir(OsStr::new("job"), 1).unwrap().as_path());
+        std::fs::write(path.join("payload"), b"a").unwrap();
+        (reservation.id, path)
+    }
+
+    #[test]
+    fn isolated_epoch_is_not_reopened_and_finishes_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        let (id, path) = prepared_job(&manager, temp.path());
+        let trash_root = temp.path().join(TRASH_DIR);
+        let trash = trash_root.join(path.file_name().unwrap());
+        meta.0.lock().unwrap().fail_deactivate = true;
+        let error = manager
+            .delete_root_with(&id, Some(1), true, || Ok(()), || Ok(()))
+            .unwrap_err();
+        assert_eq!(error.kind(), afs_error::ErrorKind::Unavailable);
+        assert!(!path.exists());
+        assert!(trash.join("payload").exists());
+        assert_eq!(
+            std::fs::metadata(&trash_root).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert!(meta.lookup_root(&id).unwrap().is_some());
+        assert!(manager.enter_root(&id, RootRight::Read).is_err());
+        assert_eq!(
+            manager.recover_local_root(&id, 1).unwrap_err().code(),
+            afs_error::META_OWNER_ROOT_BUSY
+        );
+        assert_eq!(manager.collect_trash().unwrap(), 0);
+        drop(manager);
+
+        let manager =
+            RootManager::open("node-a".into(), "new-session".into(), meta.clone(), disk).unwrap();
+        assert!(meta.lookup_root(&id).unwrap().is_none());
+        assert!(manager.recovered_roots().is_empty());
+        assert_eq!(manager.collect_trash().unwrap(), 1);
+        assert!(!trash.exists());
+    }
+
+    #[test]
+    fn isolated_epoch_retry_finishes_without_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        let (id, _) = prepared_job(&manager, temp.path());
+        let delete = || manager.delete_root_with(&id, Some(1), true, || Ok(()), || Ok(()));
+        meta.0.lock().unwrap().fail_deactivate = true;
+        assert!(delete().is_err());
+        delete().unwrap();
+        assert!(meta.lookup_root(&id).unwrap().is_none());
+        delete().unwrap();
+        assert_eq!(manager.collect_trash().unwrap(), 1);
+
+        let (id, _) = prepared_job(&manager, temp.path());
+        meta.0.lock().unwrap().fail_deactivate = true;
+        assert!(
+            manager
+                .delete_root_with(&id, Some(1), true, || Ok(()), || Ok(()))
+                .is_err()
+        );
+        assert_eq!(
+            manager.finish_isolated_roots().unwrap(),
+            vec![(id.clone(), 1)]
+        );
+        assert!(meta.lookup_root(&id).unwrap().is_none());
+        assert_eq!(manager.collect_trash().unwrap(), 1);
+    }
+
+    #[test]
+    fn failed_isolation_keeps_the_workspace_and_its_bind() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        let (id, path) = prepared_job(&manager, temp.path());
+        // A dangling trash link keeps the workspace live but fails the isolation step.
+        std::os::unix::fs::symlink(temp.path().join("missing"), temp.path().join(TRASH_DIR))
+            .unwrap();
+        let detached = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            manager
+                .delete_root_with(
+                    &id,
+                    Some(1),
+                    true,
+                    || {
+                        detached.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    || Ok(())
+                )
+                .is_err()
+        );
+        assert!(!detached.load(Ordering::SeqCst));
+        assert!(path.join("payload").exists());
+        assert!(manager.enter_root(&id, RootRight::Read).is_ok());
+        assert!(meta.lookup_root(&id).unwrap().is_some());
+    }
+
+    #[test]
+    fn preflight_failure_keeps_workspace_accessible() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        let (id, path) = prepared_job(&manager, temp.path());
+        meta.0
+            .lock()
+            .unwrap()
+            .active
+            .as_mut()
+            .unwrap()
+            .home_session_id = "other".into();
+        let error = manager
+            .delete_root_with(&id, Some(1), true, || Ok(()), || Ok(()))
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert!(path.join("payload").exists());
+        assert!(manager.enter_root(&id, RootRight::Read).is_ok());
+        assert!(meta.lookup_root(&id).unwrap().is_some());
+    }
+
+    #[test]
+    fn missing_workspace_directories_still_release_the_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        let (id, path) = prepared_job(&manager, temp.path());
+        std::fs::remove_dir_all(&path).unwrap();
+        manager
+            .delete_root_with(&id, Some(1), true, || Ok(()), || Ok(()))
+            .unwrap();
+        assert!(meta.lookup_root(&id).unwrap().is_none());
+        assert!(manager.enter_root(&id, RootRight::Read).is_err());
+    }
+
+    #[test]
+    fn activate_reply_loss_recovers_original_epoch_without_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        meta.0.lock().unwrap().lose_activate_reply = true;
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        let owner = std::fs::metadata(temp.path()).unwrap();
+        let params = RootCreateParams {
+            name: b"job".to_vec(),
+            uid: owner.uid(),
+            gid: owner.gid(),
+            mode: 0o700,
+        };
+        let reservation = manager.reserve_workspace(OsStr::new("job")).unwrap();
+        let error = manager
+            .prepare_owner_root("node-a", &reservation, &params)
+            .unwrap_err();
+        assert_eq!(error.message(), "injected lost Activate reply");
+        assert!(
+            manager
+                .enter_root(
+                    &root_id_from_name(OsStr::new("job")).unwrap(),
+                    RootRight::Read
+                )
+                .is_err()
+        );
+        let id = root_id_from_name(OsStr::new("job")).unwrap();
+        assert!(manager.recover_local_root(&id, 2).is_err());
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        manager.recover_local_root(&id, 1).unwrap();
+        manager.recover_local_root(&id, 1).unwrap();
+        let grant = manager.enter_root(&id, RootRight::Read).unwrap();
+        assert_eq!(grant.grant().epoch, 1);
+        assert_eq!(grant.grant().home_session_id, "old-session");
+    }
+
     #[test]
     fn activate_reply_loss_keeps_catalog_for_recovery() {
         let temp = tempfile::tempdir().unwrap();
@@ -3031,6 +3553,75 @@ mod tests {
             RootManager::open("node-a".into(), "new-session".into(), meta, disk.clone()).unwrap();
         assert!(manager.cached_local_roots().unwrap().is_empty());
         assert!(disk.metadata(&data_dir).is_err());
+    }
+
+    #[test]
+    fn fenced_nonempty_epoch_does_not_block_same_home_recreation() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("job");
+        let id = root_id_from_name(name).unwrap();
+        let old_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&old_dir, 0o700).unwrap();
+        let payload = temp.path().join(old_dir.as_path()).join("payload");
+        std::fs::write(&payload, b"old data").unwrap();
+        let mut deep = temp.path().join(old_dir.as_path());
+        for _ in 0..260 {
+            deep = deep.join("d");
+            std::fs::create_dir(&deep).unwrap();
+        }
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: old_dir.clone(),
+                local_prepare_id: "prepare-1:old-session".into(),
+            })
+            .unwrap();
+        drop(locked);
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        let mut reservation = manager.reserve_workspace(name).unwrap();
+        reservation.epoch = 2;
+        meta.0.lock().unwrap().pending = Some(reservation.clone());
+        let owner = std::fs::metadata(temp.path()).unwrap();
+        manager
+            .prepare_owner_root(
+                "node-a",
+                &reservation,
+                &RootCreateParams {
+                    name: b"job".to_vec(),
+                    uid: owner.uid(),
+                    gid: owner.gid(),
+                    mode: 0o700,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .enter_root(&id, RootRight::Read)
+                .unwrap()
+                .grant()
+                .epoch,
+            2
+        );
+        assert_eq!(std::fs::read(&payload).unwrap(), b"old data");
+        assert!(deep.is_dir());
+        assert!(
+            disk.metadata(&root_data_dir(name, 2).unwrap())
+                .unwrap()
+                .is_dir()
+        );
     }
 
     #[test]
@@ -3113,6 +3704,7 @@ mod tests {
             .delete_root_with(
                 &id,
                 Some(2),
+                false,
                 || panic!("before must not run for a recreated root"),
                 || panic!("after must not run for a recreated root"),
             )
@@ -3128,6 +3720,7 @@ mod tests {
             .delete_root_with(
                 &id,
                 Some(1),
+                false,
                 || {
                     assert!(manager.workspace_lock(&id).unwrap().try_lock().is_err());
                     assert!(manager.has_active_local_root(&id));
@@ -3166,53 +3759,51 @@ mod tests {
 
     #[test]
     fn startup_cleans_zombie_root_with_missing_physical_dir() {
-        let temp = tempfile::tempdir().unwrap();
-        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
-        let meta = Arc::new(RecoveryMeta::default());
-        let name = OsStr::new("job");
-        let id = root_id_from_name(name).unwrap();
-        let data_dir = root_data_dir(name, 1).unwrap();
-        // catalog 持久化要求 data_dir 存在：先建目录，持久化后再删除，
-        // 构造"目录已被删除但 catalog/Meta 仍记录"的 zombie root。
-        disk.mkdir(&data_dir, 0o700).unwrap();
-        disk.sync_root().unwrap();
-        meta.0.lock().unwrap().active = Some(RootLocation {
-            id: id.clone(),
-            epoch: 1,
-            home_node_id: "node-a".into(),
-            home_session_id: "session-a".into(),
-        });
-        meta.0.lock().unwrap().active_prepare_id = Some("prepare-1:session-a".into());
-        let catalog = LocalFsRootCatalog::new(disk.clone());
-        let locked = catalog.lock_and_open().unwrap();
-        locked
-            .persist_prepared_root(&LocalRootRecord {
+        for session in ["session-a", "session-b"] {
+            let temp = tempfile::tempdir().unwrap();
+            let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+            let meta = Arc::new(RecoveryMeta::default());
+            let name = OsStr::new("job");
+            let id = root_id_from_name(name).unwrap();
+            let data_dir = root_data_dir(name, 1).unwrap();
+            // catalog 持久化要求 data_dir 存在：先建目录，持久化后再删除，
+            // 构造"目录已被删除但 catalog/Meta 仍记录"的 zombie root。
+            disk.mkdir(&data_dir, 0o700).unwrap();
+            disk.sync_root().unwrap();
+            meta.0.lock().unwrap().active = Some(RootLocation {
                 id: id.clone(),
-                name: name.into(),
                 epoch: 1,
-                data_dir: data_dir.clone(),
-                local_prepare_id: "prepare-1:session-a".into(),
-            })
-            .unwrap();
-        drop(locked);
-        disk.remove_dir(&data_dir).unwrap();
+                home_node_id: "node-a".into(),
+                home_session_id: "session-a".into(),
+            });
+            meta.0.lock().unwrap().active_prepare_id = Some("prepare-1:session-a".into());
+            let catalog = LocalFsRootCatalog::new(disk.clone());
+            let locked = catalog.lock_and_open().unwrap();
+            locked
+                .persist_prepared_root(&LocalRootRecord {
+                    id: id.clone(),
+                    name: name.into(),
+                    epoch: 1,
+                    data_dir: data_dir.clone(),
+                    local_prepare_id: "prepare-1:session-a".into(),
+                })
+                .unwrap();
+            drop(locked);
+            disk.remove_dir(&data_dir).unwrap();
 
-        // 启动不再失败：zombie 被 deactivate + 清 catalog。
-        let manager = RootManager::open(
-            "node-a".into(),
-            "session-a".into(),
-            meta.clone(),
-            disk.clone(),
-        )
-        .unwrap();
-        assert!(manager.cached_local_roots().unwrap().is_empty());
-        assert!(meta.0.lock().unwrap().active.is_none());
-        // catalog 无记录（manager 持有独占锁，先释放再验证）。
-        drop(manager);
-        let locked = LocalFsRootCatalog::new(disk.clone())
-            .lock_and_open()
-            .unwrap();
-        assert!(locked.scan_roots().unwrap().is_empty());
+            // 启动不再失败：zombie 被 deactivate + 清 catalog。
+            let manager =
+                RootManager::open("node-a".into(), session.into(), meta.clone(), disk.clone())
+                    .unwrap();
+            assert!(manager.cached_local_roots().unwrap().is_empty());
+            assert!(meta.0.lock().unwrap().active.is_none());
+            // catalog 无记录（manager 持有独占锁，先释放再验证）。
+            drop(manager);
+            let locked = LocalFsRootCatalog::new(disk.clone())
+                .lock_and_open()
+                .unwrap();
+            assert!(locked.scan_roots().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -3290,9 +3881,6 @@ mod tests {
         )
         .unwrap();
         assert!(manager.cached_local_roots().unwrap().is_empty());
-        // 运行期没有任何回收路径：删除契约只在提交前检查空目录，提交后
-        // ENOTEMPTY 直接抛错，不存在"已提交但待回收"的目录，因此残余目录
-        // 的物理删除权只在启动 reconcile 手里（它有 Meta 全量视角）。
         assert!(temp.path().join(data_dir.as_path()).exists());
 
         // 启动 reconcile 有 Meta 全量视角：该 root 已不在 active 集合里。

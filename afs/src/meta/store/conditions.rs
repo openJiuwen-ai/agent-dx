@@ -76,6 +76,8 @@ pub(super) fn condition_matches(state: &State, condition: &TxnCondition) -> bool
             node_id,
             session_id,
         } => !current_session_matches(state, node_id, session_id),
+        TxnCondition::NodeSessionUnavailable { node_id } => !state.entities.get(&MetaKey::CurrentNodeSession { node_id: node_id.clone() })
+            .is_some_and(|entity| matches!(&entity.entity, MetaEntity::NodeSession(session) if session.is_live_at_unix_ms(now_unix_ms()))),
         TxnCondition::RootEpochEquals {
             root_id,
             root_epoch,

@@ -90,6 +90,40 @@ impl OwnerControlService {
 
 #[tonic::async_trait]
 impl OwnerControl for OwnerControlService {
+    async fn delete_workspace(
+        &self,
+        request: Request<afs_protocol::node_control::DeleteWorkspaceRequest>,
+    ) -> Result<Response<afs_protocol::node_control::DeleteWorkspaceReply>, Status> {
+        self.dispatch_owner_lock(request, false, move |handler, peer, body| {
+            handler.delete_workspace(
+                &peer,
+                &body.requester_session_id,
+                &crate::node::vfs::ownerfs::root::RootId(body.root_id),
+                body.expected_epoch,
+            )?;
+            Ok(afs_protocol::node_control::DeleteWorkspaceReply {})
+        })
+        .await
+    }
+
+    async fn workspace_defaults(
+        &self,
+        request: Request<afs_protocol::node_control::WorkspaceDefaultsRequest>,
+    ) -> Result<Response<afs_protocol::node_control::WorkspaceDefaultsReply>, Status> {
+        let owner = self
+            .owner_locks
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("OwnerFs is disabled"))?;
+        let authenticator = self.owner_authenticator.as_ref().ok_or_else(|| {
+            Status::permission_denied("workspace defaults require authenticated peer")
+        })?;
+        authenticate_peer(authenticator.as_ref(), &request)?;
+        let (uid, gid) = owner.workspace_defaults();
+        Ok(Response::new(
+            afs_protocol::node_control::WorkspaceDefaultsReply { uid, gid },
+        ))
+    }
+
     async fn prepare_owner_root(
         &self,
         request: Request<afs_protocol::node_control::PrepareOwnerRootRequest>,
@@ -113,10 +147,11 @@ impl OwnerControl for OwnerControlService {
         })?;
         let reservation = crate::node::rpc::ownerfs::reservation_from_wire(reservation)
             .map_err(error_to_status)?;
+        let (uid, gid) = owner.workspace_defaults();
         let params = crate::node::vfs::ownerfs::root::RootCreateParams {
             name: request.name,
-            uid: request.uid,
-            gid: request.gid,
+            uid: request.uid.unwrap_or(uid),
+            gid: request.gid.unwrap_or(gid),
             mode: request.mode,
         };
         crate::node::bridge::spawn_blocking(move || {

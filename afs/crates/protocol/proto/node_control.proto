@@ -24,6 +24,8 @@ service NodeControl {
 service OwnerControl {
   // Prepare and activate a durable workspace reservation on its Home.
   rpc PrepareOwnerRoot(PrepareOwnerRootRequest) returns (PrepareOwnerRootReply);
+  rpc WorkspaceDefaults(WorkspaceDefaultsRequest) returns (WorkspaceDefaultsReply);
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceReply);
   // Home owns advisory lock authority; no file payload travels here.
   rpc OwnerGetLock(OwnerGetLockRequest) returns (OwnerGetLockReply);
   rpc OwnerSetLock(OwnerSetLockRequest) returns (OwnerSetLockReply);
@@ -54,12 +56,18 @@ service DfsOwnerControl {
 message PrepareOwnerRootRequest {
   afs.meta.v1.RootReservation reservation = 1;
   bytes name = 2;
-  uint32 uid = 3;
-  uint32 gid = 4;
+  optional uint32 uid = 3;
+  optional uint32 gid = 4;
   uint32 mode = 5;
 }
 
 message PrepareOwnerRootReply {}
+
+message WorkspaceDefaultsRequest {}
+message WorkspaceDefaultsReply { uint32 uid = 1; uint32 gid = 2; }
+
+message DeleteWorkspaceRequest { string root_id = 1; uint64 expected_epoch = 2; string requester_session_id = 3; }
+message DeleteWorkspaceReply {}
 
 message NegotiateDataRequest {
   bytes client_info = 1;

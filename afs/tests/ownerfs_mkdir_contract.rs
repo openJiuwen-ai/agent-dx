@@ -417,8 +417,8 @@ impl Fixture {
         PrepareOwnerRootRequest {
             reservation: Some(reservation.clone()),
             name: root_name(&reservation.root_id),
-            uid: owner.uid(),
-            gid: owner.gid(),
+            uid: Some(owner.uid()),
+            gid: Some(owner.gid()),
             mode: 0o750,
         }
     }
@@ -543,8 +543,8 @@ async fn persistent_mtls_prepare_replay_preserves_identity_and_permissions() {
         .prepare_owner_root(PrepareOwnerRootRequest {
             reservation: Some(reservation.clone()),
             name: root_name(&reservation.root_id),
-            uid: 1,
-            gid: 1,
+            uid: Some(1),
+            gid: Some(1),
             mode: 0o777,
         })
         .await
