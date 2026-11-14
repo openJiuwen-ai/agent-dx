@@ -67,6 +67,13 @@ impl LocalFs {
         &self.root_path
     }
 
+    #[cfg(feature = "ownerfs")]
+    pub(crate) fn remove_tree(&self, path: &StoragePath) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let (parent, name) = self.open_parent(path)?;
+        remove_tree_child(&parent, &name, parent.metadata()?.dev(), 0)
+    }
+
     pub fn statvfs(&self) -> io::Result<FilesystemCapacity> {
         capacity_from_statvfs_fd(&self.root)
     }
@@ -102,6 +109,35 @@ impl LocalFs {
         }
         self.open_dir_components(&split_components(path)?)
     }
+}
+
+#[cfg(feature = "ownerfs")]
+fn remove_tree_child(parent: &File, name: &OsStr, device: u64, depth: usize) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if depth > 256 {
+        return Err(io::Error::other(
+            "recursive deletion nesting limit exceeded",
+        ));
+    }
+    let path = proc_child(parent, name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return fs::remove_file(path);
+    }
+    let directory = open_child_dir(parent, name)?;
+    if directory.metadata()?.dev() != device {
+        return Err(io::Error::other(
+            "refusing to cross a filesystem during recursive deletion",
+        ));
+    }
+    for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
+        remove_tree_child(&directory, &entry?.file_name(), device, depth + 1)?;
+    }
+    fs::remove_dir(path)
 }
 
 #[allow(unsafe_code)]

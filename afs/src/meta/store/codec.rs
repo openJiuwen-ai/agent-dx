@@ -60,7 +60,7 @@ pub(super) mod tests {
         let fixtures = vec![
             json!({"NodeSession":{"node_id":"a","session_id":"s","grpc_addr":"g","data_addr":"d","rest_addr":"r","ownerfs_enabled":true,"storage_devices":[],"lease_epoch":1,"expires_at_unix_ms":42}}),
             json!({"RootReservation":{"root_id":"r","root_epoch":1,"home_node_id":"a","home_session_id":"s","create_intent_id":"c","prepare_token":"p","requester_node_id":"a","requester_session_id":"s","created_at_revision":2}}),
-            json!({"Root":{"root_id":"r","root_epoch":1,"home_node_id":"a","home_session_id":"s","local_prepare_id":"p","created_at_revision":2,"updated_at_revision":3}}),
+            json!({"Root":{"deleting":false,"root_id":"r","root_epoch":1,"home_node_id":"a","home_session_id":"s","local_prepare_id":"p","created_at_revision":2,"updated_at_revision":3}}),
             json!({"RootGrant":{"root_id":"r","root_epoch":1,"home_node_id":"a","home_session_id":"s","holder_node_id":"b","holder_session_id":"t","access_generation":2,"rights":["Read","Write"],"fencing_token":"f","issued_at_revision":3}}),
             json!({"RootCommand":{"command_id":"c","home_node_id":"a","home_session_id":"s","root_id":"r","root_epoch":1,"old_access_generation":2,"command_type":"InvalidateCache"}}),
             json!({"RootCommandAck":{"command_id":"c","node_id":"a","session_id":"s","root_id":"r","root_epoch":1,"access_generation":2,"success":false,"message":"rejected"}}),

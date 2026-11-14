@@ -291,6 +291,7 @@ impl RootMeta for ContractMeta {
             .as_ref()
             .filter(|grant| &grant.id == id)
             .map(|grant| RootLocation {
+                deleting: false,
                 id: grant.id.clone(),
                 epoch: grant.epoch,
                 home_node_id: grant.home_node_id.clone(),
@@ -306,6 +307,7 @@ impl RootMeta for ContractMeta {
                 .as_ref()
                 .filter(|grant| &grant.id == id)
                 .map(|grant| RootLocation {
+                    deleting: false,
                     id: grant.id.clone(),
                     epoch: grant.epoch,
                     home_node_id: grant.home_node_id.clone(),
@@ -327,6 +329,7 @@ impl RootMeta for ContractMeta {
                 .as_ref()
                 .filter(|grant| grant.home_node_id == home_node_id)
                 .map(|grant| RootLocation {
+                    deleting: false,
                     id: grant.id.clone(),
                     epoch: grant.epoch,
                     home_node_id: grant.home_node_id.clone(),

@@ -127,8 +127,8 @@ pub mod version {
     pub const META_IDENTITY: u16 = 1;
     pub const META_CURRENT: u16 = 3;
     pub const META_CHECKPOINT_FILE: u16 = 1;
-    pub const META_STATE_IMAGE: u16 = 4;
-    pub const META_RECORD_DECISION: u16 = 3;
+    pub const META_STATE_IMAGE: u16 = 5;
+    pub const META_RECORD_DECISION: u16 = 4;
     pub const META_REQUEST_DIGEST: u32 = 1;
     pub const NODE_CHUNK_CATALOG_WAL: u32 = 2;
     pub const NODE_CHUNK_CATALOG_SNAPSHOT: u32 = 2;
@@ -335,13 +335,10 @@ mod tests {
                 version::NODE_CHUNK_SIDECAR,
                 version::OWNERFS_ROOT_RECORD,
             ),
-            // State image 4 and decision 3: the node session carries a
-            // dedicated NFS address field (outlet import addressing); GC
-            // references name their pinned version, and R12's replica failure
-            // entity and keys (S4b).
+            // State image 5 and decision 4 persist workspace deletion state.
             // Chunk catalog snapshot 2: the append layout is persisted
             // incrementally, so the snapshot shape changed as well.
-            (3, 4, 3, 2, 1, 1, 1)
+            (3, 5, 4, 2, 1, 1, 1)
         );
     }
 

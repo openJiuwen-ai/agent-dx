@@ -80,6 +80,7 @@ impl RootMeta for NativeHomeMeta {
         self.active.lock().unwrap().insert(
             reservation.id.clone(),
             RootLocation {
+                deleting: false,
                 id: reservation.id.clone(),
                 epoch: reservation.epoch,
                 home_node_id: self.node_id.clone(),
@@ -1394,8 +1395,8 @@ impl RemoteCreateFixture {
             request: afs_protocol::node_control::PrepareOwnerRootRequest {
                 reservation: Some(wire),
                 name: b"agent-a".to_vec(),
-                uid: ctx.uid,
-                gid: ctx.gid,
+                uid: Some(ctx.uid),
+                gid: Some(ctx.gid),
                 mode: 0o750,
             },
         }

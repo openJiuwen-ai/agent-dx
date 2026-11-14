@@ -1454,7 +1454,7 @@ fn image_and_decision_versions_are_identified_before_the_full_decode() {
         super::StateImage::validate_encoded(&image, LIMIT).unwrap_err(),
         "Meta checkpoint state image",
         "version 3",
-        "supports version 4",
+        "supports version 5",
     );
 
     let entity = root_entity();
@@ -1468,7 +1468,7 @@ fn image_and_decision_versions_are_identified_before_the_full_decode() {
         RecordDecision::decode(&bytes, LIMIT).unwrap_err(),
         "Meta WAL record decision",
         "version 1",
-        "supports version 3",
+        "supports version 4",
     );
     let mut framed = postcard::to_allocvec(&super::Record::from(record)).unwrap();
     assert_eq!((framed[0], u16::from(framed[1])), (0, super::SCHEMA));
@@ -1477,7 +1477,7 @@ fn image_and_decision_versions_are_identified_before_the_full_decode() {
         super::Record::check_schema(&framed).unwrap_err(),
         "Meta WAL record decision",
         "version 1",
-        "supports version 3",
+        "supports version 4",
     );
     super::Record::check_schema(&postcard::to_allocvec(&1u32).unwrap()).unwrap();
 }

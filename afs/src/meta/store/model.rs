@@ -148,6 +148,7 @@ pub struct NodeSessionLease {
 /// management tools that should not receive fencing tokens.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RootRecord {
+    pub deleting: bool,
     pub root_id: String,
     pub root_epoch: u64,
     pub home_node_id: String,

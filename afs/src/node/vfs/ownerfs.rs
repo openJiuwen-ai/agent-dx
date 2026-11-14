@@ -78,6 +78,7 @@ const OWNERFS_ROOT_INODE: u64 = 1;
 /// current VFS bootstrap; `new_local()` is the real local implementation used
 /// by tests and later Node startup wiring.
 pub struct OwnerFs {
+    workspace_defaults: (u32, u32),
     local: Option<Arc<LocalOwnerFs>>,
     private_cache: Arc<Mutex<PrivateFuseCache>>,
     mount_manager: Option<Arc<mount_manager::MountManager>>,
@@ -138,9 +139,65 @@ impl Default for OwnerFs {
 }
 
 impl OwnerFs {
+    pub(crate) fn with_workspace_defaults(mut self, defaults: (u32, u32)) -> Self {
+        self.workspace_defaults = defaults;
+        self
+    }
+
+    pub(crate) fn workspace_defaults(&self) -> (u32, u32) {
+        self.workspace_defaults
+    }
+
+    pub(crate) fn reserve_workspace(&self, name: &OsStr) -> Result<root::RootReservation> {
+        self.require_local()?.roots.reserve_workspace(name)
+    }
+
+    pub(crate) fn workspace_attributes(
+        &self,
+        location: &root::RootLocation,
+    ) -> Result<FileAttributes> {
+        let local = self.require_local()?;
+        if location.home_node_id == local.roots.node_id() {
+            local
+                .roots
+                .recover_local_root(&location.id, location.epoch)?;
+        }
+        let _access = local.roots.enter_root(&location.id, RootRight::Lookup)?;
+        if let Some((path, epoch)) = local.roots.local_root_data_dir(&location.id)? {
+            if epoch != location.epoch {
+                return Err(stale("workspace epoch changed"));
+            }
+            return attributes_from_metadata(local.disk.metadata(&path)?);
+        }
+        Err(stale("workspace is offline on Home"))
+    }
+
+    pub(crate) fn maintain_workspace_deletions(&self) -> Result<()> {
+        let local = self.require_local()?;
+        for location in local.roots.pending_deletions()? {
+            if let Err(error) = local.delete_workspace(&location) {
+                afs_logging::warn!("ownerfs.delete_retry_failed"; "root_id" => ?location.id, "error" => error.to_string());
+            }
+        }
+        for (id, epoch) in local.roots.reconcile_completed_deletions()? {
+            local
+                .state
+                .lock()
+                .map_err(|_| poisoned())?
+                .remove_root_epoch(&id, Some(epoch));
+        }
+        local.roots.collect_trash()?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_workspace(&self, location: &root::RootLocation) -> Result<()> {
+        self.require_local()?.delete_workspace(location)
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
+            workspace_defaults: (1000, 1000),
             local: None,
             private_cache: Arc::new(Mutex::new(PrivateFuseCache::new())),
             mount_manager: None,
@@ -198,6 +255,7 @@ impl OwnerFs {
         )));
         let mount_manager = Arc::new(mount_manager::MountManager::new(Some(egress_root)));
         Self {
+            workspace_defaults: (1000, 1000),
             local: Some(Arc::new(LocalOwnerFs::new(
                 roots,
                 disk,
@@ -220,6 +278,7 @@ impl OwnerFs {
             native_home_eligible,
         )));
         Self {
+            workspace_defaults: (1000, 1000),
             local: Some(Arc::new(LocalOwnerFs::new(
                 roots,
                 disk,
@@ -363,7 +422,10 @@ impl OwnerFs {
                 "OwnerFs local file operations are not wired in this VFS instance",
             )
         })?;
-        Ok(OwnerFsPeerExecutor { local })
+        Ok(OwnerFsPeerExecutor {
+            local,
+            workspace_defaults: self.workspace_defaults,
+        })
     }
 
     #[cfg(test)]
@@ -380,10 +442,52 @@ impl OwnerFs {
 /// afs-node process session. They become stale after release or process restart.
 #[derive(Clone)]
 pub struct OwnerFsPeerExecutor {
+    workspace_defaults: (u32, u32),
     local: Arc<LocalOwnerFs>,
 }
 
 impl OwnerFsPeerExecutor {
+    pub(crate) fn try_delete_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.local.roots.try_delete_permit()
+    }
+
+    pub(crate) fn delete_workspace(
+        &self,
+        peer: &str,
+        session: &str,
+        id: &RootId,
+        expected_epoch: u64,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
+        if session.is_empty()
+            || self.local.roots.current_node_session(peer)?.as_deref() != Some(session)
+        {
+            return Err(Error::coded(
+                afs_error::IO_PERMISSION_DENIED,
+                "requester Meta session is not current",
+            ));
+        }
+        if id.0.is_empty() || expected_epoch == 0 {
+            return Err(Error::coded(
+                afs_error::CLIENT_ARGUMENT_INVALID,
+                "workspace epoch must be positive",
+            ));
+        }
+        let location = self
+            .local
+            .roots
+            .lookup_root_location(id)?
+            .ok_or_else(|| stale("workspace is no longer registered"))?;
+        if location.epoch != expected_epoch {
+            return Err(stale("workspace epoch changed"));
+        }
+        self.local.delete_workspace_with_permit(&location, permit)
+    }
+
+    pub(crate) fn workspace_defaults(&self) -> (u32, u32) {
+        self.workspace_defaults
+    }
+
     /// Prepare and activate a reserved workspace on this Home, then request
     /// the configured bind asynchronously. Bind failure does not fail creation.
     pub(crate) fn prepare_owner_root(
@@ -1512,6 +1616,36 @@ fn owner_peer_lock_scope(peer: &str, access: &PresentedRootAccess, raw: &str) ->
 }
 
 impl LocalOwnerFs {
+    fn delete_workspace(&self, location: &root::RootLocation) -> Result<()> {
+        let permit = self.roots.try_delete_permit()?;
+        self.delete_workspace_with_permit(location, permit)
+    }
+
+    fn delete_workspace_with_permit(
+        &self,
+        location: &root::RootLocation,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
+        if location.home_node_id != self.roots.node_id() {
+            return Err(stale("workspace belongs to another Home"));
+        }
+        self.roots
+            .recover_local_root(&location.id, location.epoch)?;
+        let (path, epoch) = self
+            .roots
+            .local_root_data_dir(&location.id)?
+            .ok_or_else(|| stale("workspace is offline on Home"))?;
+        if epoch != location.epoch {
+            return Err(stale("workspace epoch changed"));
+        }
+        let identity = match self.disk.metadata(&path) {
+            Ok(metadata) => Some(identity_from_metadata(&metadata)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        self.delete_local_root(&location.id, Some(epoch), identity.as_ref(), true)
+    }
+
     fn lock_target(
         &self,
         handle: FileHandle,
@@ -3169,7 +3303,7 @@ impl LocalOwnerFs {
             "ownerfs.peer_rmdir_root.accepted";
             "root_id" => ?access.id, "peer_node_id" => peer_node_id, "uid" => ctx.uid
         );
-        self.delete_local_root(&access.id, Some(access.epoch), expected_root)
+        self.delete_local_root(&access.id, Some(access.epoch), Some(expected_root), false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5251,7 +5385,7 @@ impl LocalOwnerFs {
                     Err(error) => return Err(Error::from(error)),
                 }
                 self.ensure_root_empty(&data_dir)?;
-                self.delete_local_root(&root_id, Some(epoch), &root_identity)
+                self.delete_local_root(&root_id, Some(epoch), Some(&root_identity), false)
             }
             None => self.rmdir_remote_root(ctx, &root_id, &root_identity),
         }
@@ -5326,17 +5460,13 @@ impl LocalOwnerFs {
         }
     }
 
-    /// 顺序：卸载 bind mount → RootManager::delete_root
-    /// （revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog）→
-    /// OwnerState 索引清理 → PrivateFuseCache 清理。任一步失败时后续步骤
-    /// 不再执行，残留记录由 reconcile_on_startup 的 zombie 检测在下一次
-    /// 启动时清理。全部步骤在 workspace 锁内执行，同名重建要等删除结束，
-    /// 卸载和索引清理因此不会作用到新 workspace。
+    /// 在 workspace 锁内卸载 bind、删除该 epoch，再清理对应的 inode/cache 状态。
     fn delete_local_root(
         &self,
         root_id: &RootId,
         expected_epoch: Option<u64>,
-        root_identity: &files::FileIdentity,
+        root_identity: Option<&files::FileIdentity>,
+        recursive: bool,
     ) -> Result<()> {
         // 2. 卸载活跃 bind mount。detach 失败（如活跃 fd 导致 EBUSY）时
         //    request_unmount 记录日志并保留条目，不阻塞删除流程；物理目录
@@ -5353,7 +5483,13 @@ impl LocalOwnerFs {
             // 4. 清除 OwnerState 中的 FUSE 索引。
             {
                 let mut state = self.state.lock().map_err(|_| poisoned())?;
-                state.remove_root(root_id, root_identity, true);
+                if let Some(identity) = root_identity {
+                    state.remove_root(root_id, identity, true);
+                } else {
+                    state.remove_root_epoch(root_id, expected_epoch);
+                    state.remove_root_epoch(root_id, None);
+                    state.root_epochs.remove(root_id);
+                }
             }
             afs_logging::info!("ownerfs.rmdir_root.state_cleaned"; "root_id" => ?root_id);
 
@@ -5369,10 +5505,9 @@ impl LocalOwnerFs {
             Ok(())
         };
 
-        // 3. RootManager::delete_root（revoke → 缓存移除 → Meta deactivate
-        //    → 物理目录 → catalog），第 2 步在其前、第 4、5 步在其后执行。
+        // RootManager 在清理物理目录及控制记录之后执行索引回收。
         self.roots
-            .delete_root_with(root_id, expected_epoch, unmount, clean)?;
+            .delete_root_with(root_id, expected_epoch, recursive, unmount, clean)?;
         afs_logging::info!("ownerfs.rmdir_root.root_deleted"; "root_id" => ?root_id);
 
         Ok(())
@@ -8266,6 +8401,7 @@ mod tests {
             self.active.lock().unwrap().insert(
                 reservation.id.clone(),
                 root::RootLocation {
+                    deleting: false,
                     id: reservation.id.clone(),
                     epoch: reservation.epoch,
                     home_node_id: self.node_id.clone(),
@@ -8377,6 +8513,7 @@ mod tests {
             self.active.lock().unwrap().insert(
                 record.id.clone(),
                 root::RootLocation {
+                    deleting: false,
                     id: record.id.clone(),
                     epoch: record.epoch,
                     home_node_id: self.node_id.clone(),
@@ -8444,6 +8581,7 @@ mod tests {
                 return Ok(None);
             }
             Ok(Some(root::RootLocation {
+                deleting: false,
                 id: id.clone(),
                 epoch: self.epoch.load(Ordering::SeqCst),
                 home_node_id: "node-a".to_owned(),
@@ -13381,6 +13519,17 @@ mod tests {
             .unwrap();
         let recreated = roots.lookup_root_location(&root_id).unwrap().unwrap();
         assert!(recreated.epoch > access.epoch);
+    }
+
+    #[test]
+    fn workspace_delete_rejects_a_foreign_home() {
+        let (_temp, fs, _ctx, meta, remote, root_id) = remote_fixture();
+        let location = meta.lookup_root(&root_id).unwrap().unwrap();
+        assert_eq!(
+            fs.delete_workspace(&location).unwrap_err().code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+        assert_eq!(remote.rmdir_root_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

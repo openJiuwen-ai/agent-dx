@@ -196,6 +196,7 @@ fn wire_access(grant: RootAccessGrant) -> afs_protocol::meta::RootAccess {
 
 fn wire_location(root: super::store::RootRecord) -> RootLocation {
     RootLocation {
+        deleting: root.deleting,
         root_id: root.root_id,
         root_epoch: root.root_epoch,
         home_node_id: root.home_node_id,
@@ -462,6 +463,37 @@ impl OwnerRootsService for OwnerRootsRpc {
         Ok(Response::new(AbortRootReply {}))
     }
 
+    async fn begin_root_deletion(
+        &self,
+        request: Request<RecoverRootRequest>,
+    ) -> Result<Response<DeactivateRootReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        if authenticated
+            .as_ref()
+            .is_some_and(|node| node != &request.home_node_id)
+        {
+            return Err(permission_denied(
+                "deletion Home does not match authenticated node",
+            ));
+        }
+        require_text(&request.request_id, "request_id")?;
+        require_text(&request.local_prepare_id, "local_prepare_id")?;
+        self.0
+            .owner_roots
+            .begin_root_deletion(super::owner_roots::RecoverRootInput {
+                request_id: request.request_id,
+                root_id: request.root_id,
+                expected_root_epoch: request.expected_root_epoch,
+                home_node_id: request.home_node_id,
+                home_session_id: request.home_session_id,
+                local_prepare_id: request.local_prepare_id,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(DeactivateRootReply {}))
+    }
+
     async fn deactivate_root(
         &self,
         request: Request<DeactivateRootRequest>,
@@ -482,6 +514,39 @@ impl OwnerRootsService for OwnerRootsRpc {
                 home_session_id: request.home_session_id,
                 reason: request.reason,
                 authenticated_home_node_id: authenticated,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(DeactivateRootReply {}))
+    }
+
+    async fn force_deactivate_root(
+        &self,
+        request: Request<afs_protocol::meta::ForceDeactivateRootRequest>,
+    ) -> Result<Response<DeactivateRootReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        require_text(&request.requester_node_id, "requester_node_id")?;
+        require_text(&request.requester_session_id, "requester_session_id")?;
+        let root = request
+            .root
+            .ok_or_else(|| Status::invalid_argument("root is required"))?;
+        require_text(&root.request_id, "request_id")?;
+        require_text(&root.root_id, "root_id")?;
+        self.0
+            .owner_roots
+            .force_deactivate_root(super::owner_roots::ForceDeactivateRootInput {
+                root: super::owner_roots::DeactivateRootInput {
+                    request_id: root.request_id,
+                    root_id: root.root_id,
+                    root_epoch: root.root_epoch,
+                    home_node_id: root.home_node_id,
+                    home_session_id: root.home_session_id,
+                    reason: root.reason,
+                    authenticated_home_node_id: authenticated,
+                },
+                requester_node_id: request.requester_node_id,
+                requester_session_id: request.requester_session_id,
             })
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;

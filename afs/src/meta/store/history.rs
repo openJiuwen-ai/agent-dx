@@ -211,6 +211,7 @@ impl Heap for super::TxnCondition {
                 c.value(revision)
             }
             Self::EntityEquals(value) => c.value(value),
+            Self::NodeSessionUnavailable { node_id } => c.value(node_id),
             Self::NodeSessionCurrent {
                 node_id,
                 session_id,
@@ -337,6 +338,7 @@ fields_heap!(super::NodeSession {
     expires_at_unix_ms
 });
 fields_heap!(super::RootRecord {
+    deleting,
     root_id,
     root_epoch,
     home_node_id,
@@ -1497,6 +1499,7 @@ mod tests {
         payload.push('x');
         let minimum = payload.capacity();
         let entity = MetaEntity::Root(RootRecord {
+            deleting: false,
             root_id: "root".into(),
             root_epoch: 1,
             home_node_id: "node".into(),

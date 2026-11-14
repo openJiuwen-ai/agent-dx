@@ -33,6 +33,9 @@ pub enum TxnCondition {
         node_id: String,
         session_id: String,
     },
+    NodeSessionUnavailable {
+        node_id: String,
+    },
     RootEpochEquals {
         root_id: String,
         root_epoch: u64,
@@ -183,6 +186,7 @@ pub enum StoreOperation {
     DfsRestoreFileChunk,
     DfsPublishReadCache,
     DfsRetireReadCache,
+    BeginRootDeletion,
 }
 
 impl StoreOperation {
@@ -190,6 +194,7 @@ impl StoreOperation {
         match self {
             Self::CleanupRootGrants => "cleanup_root_grants",
             Self::CleanupRootCommands => "cleanup_root_commands",
+            Self::BeginRootDeletion => "begin_root_deletion",
             Self::RegisterNode => "register_node",
             Self::ReserveRoot => "reserve_root",
             Self::AbortRoot => "abort_root",

@@ -278,6 +278,38 @@ fn node_session_liveness_uses_strict_expiry_boundary() {
 }
 
 #[test]
+fn force_delete_condition_rechecks_the_current_home_incarnation() {
+    let mut state = MemoryState::default();
+    let condition = TxnCondition::NodeSessionUnavailable {
+        node_id: "home".into(),
+    };
+    assert!(condition_matches(&state, &condition));
+    let key = MetaKey::CurrentNodeSession {
+        node_id: "home".into(),
+    };
+    state.entities.insert(
+        key.clone(),
+        VersionedEntity {
+            revision: StoreRevision(1),
+            entity: MetaEntity::NodeSession(session("home", "old", 0)),
+        },
+    );
+    assert!(condition_matches(&state, &condition));
+    state.entities.insert(
+        key,
+        VersionedEntity {
+            revision: StoreRevision(2),
+            entity: MetaEntity::NodeSession(session(
+                "home",
+                "restarted",
+                now_unix_ms().saturating_add(60_000),
+            )),
+        },
+    );
+    assert!(!condition_matches(&state, &condition));
+}
+
+#[test]
 fn snapshot_bytes_are_independent_of_hash_map_insertion_order() {
     fn state_in_order(nodes: &[&str]) -> StoreState {
         let mut state = MemoryState {
@@ -365,6 +397,7 @@ async fn root_grant_read_rejects_expired_holder_session() {
         ..MemoryState::default()
     };
     let root = RootRecord {
+        deleting: false,
         root_id: "workspace-1".into(),
         root_epoch: 7,
         home_node_id: "node-a".into(),
@@ -440,6 +473,7 @@ async fn root_grant_read_rejects_expired_home_session() {
         ..MemoryState::default()
     };
     let root = RootRecord {
+        deleting: false,
         root_id: "workspace-1".into(),
         root_epoch: 7,
         home_node_id: "node-a".into(),
@@ -1807,6 +1841,7 @@ async fn p3_lifecycle_completed_commands_reclaimed_pending_and_failed_preserved(
         TxnMutation::Put(MetaEntity::RootCommand(active_command)),
         TxnMutation::Put(MetaEntity::RootCommandAck(active_ack)),
         TxnMutation::Put(MetaEntity::Root(RootRecord {
+            deleting: false,
             root_id: "active-root".into(),
             root_epoch: 7,
             home_node_id: "old-home".into(),
@@ -2343,6 +2378,7 @@ async fn p3_incremental_write_does_not_reencode_untouched_authority() {
     for number in 0..2000 {
         txn.mutations
             .push(TxnMutation::Put(MetaEntity::Root(RootRecord {
+                deleting: false,
                 root_id: format!("unchanged-root-{number:04}"),
                 root_epoch: 1,
                 home_node_id: "old-home".into(),
@@ -3088,6 +3124,7 @@ async fn p3_root_deactivation_accepts_accumulated_grants_below_byte_budget() {
         if batch == 0 {
             txn.mutations.extend([
                 TxnMutation::Put(MetaEntity::Root(RootRecord {
+                    deleting: false,
                     root_id: "r".into(),
                     root_epoch: 1,
                     home_node_id: "a".into(),
@@ -3466,6 +3503,7 @@ async fn p3_a27_ready_group_keeps_failed_requests_out_of_durable_authority() {
     });
     let store = Store::open_log(backend.clone()).await.unwrap();
     let root = MetaEntity::Root(RootRecord {
+        deleting: false,
         root_id: "rejected-root".into(),
         root_epoch: 1,
         home_node_id: "a".into(),

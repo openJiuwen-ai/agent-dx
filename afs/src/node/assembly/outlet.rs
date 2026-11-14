@@ -102,5 +102,5 @@ pub(super) fn start_mirror(
 /// The OwnerFs handles the starters need. Taken from the OwnerFs construction
 /// site because `OwnerFs` itself does not expose it.
 pub(super) struct OutletControl {
-    pub(super) meta: Arc<dyn RootMeta>,
+    pub(super) meta: Arc<crate::node::rpc::meta::GrpcRootMeta>,
 }

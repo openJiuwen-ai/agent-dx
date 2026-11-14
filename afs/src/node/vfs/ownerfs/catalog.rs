@@ -36,6 +36,7 @@ static NEXT_TEMP_RECORD: AtomicU64 = AtomicU64::new(0);
 /// 只有 Meta 确认它是当前 Home 且 epoch 相同，才允许恢复。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalRootRecord {
+    pub deleting: bool,
     pub id: RootId,
     pub name: OsString,
     pub epoch: u64,
@@ -58,6 +59,15 @@ pub trait LockedLocalRootCatalog: Send + Sync {
     /// 删除失败时调用方应 fail-closed；留下的记录会在下次启动恢复时被 Meta 判定。
     fn remove_prepared_root(&self, record: &LocalRootRecord) -> Result<()>;
 
+    /// Durably fence this epoch before any recursive deletion.
+    fn mark_deleting(&self, record: &LocalRootRecord) -> Result<LocalRootRecord> {
+        let _ = record;
+        Err(Error::coded(
+            afs_error::IO_UNAVAILABLE,
+            "durable deletion intent is not wired",
+        ))
+    }
+
     fn scan_roots(&self) -> Result<Vec<LocalRootRecord>>;
 
     /// Read one canonical root record without scanning unrelated records.
@@ -75,7 +85,7 @@ pub trait LocalRootCatalog: Send + Sync {
 
 /// LocalFs-backed root catalog used by production OwnerFs.
 ///
-/// It intentionally stores only root identity and prepare evidence. It does not
+/// It stores root identity, prepare evidence and deletion intent. It does not
 /// store per-file metadata, open handles, or cache state; those are rebuilt from
 /// ordinary files plus Meta grants after restart.
 pub struct LocalFsRootCatalog {
@@ -202,7 +212,9 @@ impl LockedLocalFsRootCatalog {
                 crate::node::storage::RenameMode::Replace,
             )
             .map_err(Error::from)?;
-        self.disk.sync_root().map_err(Error::from)
+        File::open(self.disk.root_path().join(CATALOG_DIR))
+            .and_then(|directory| directory.sync_all())
+            .map_err(Error::from)
     }
 }
 
@@ -213,12 +225,34 @@ mod tests {
     fn record(name: &str) -> LocalRootRecord {
         let id = RootId(format!("root-{}", hex(name.as_bytes())));
         LocalRootRecord {
+            deleting: false,
             data_dir: StoragePath::new(format!("{}-e1", id.0)).unwrap(),
             id,
             name: OsString::from(name),
             epoch: 1,
             local_prepare_id: "prepare".into(),
         }
+    }
+
+    #[test]
+    fn deletion_intent_survives_reopen_and_cannot_be_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        let record = record("deleting");
+        disk.mkdir(&record.data_dir, 0o700).unwrap();
+        locked.persist_prepared_root(&record).unwrap();
+        let deleting = locked.mark_deleting(&record).unwrap();
+        assert!(deleting.deleting);
+        assert_eq!(locked.mark_deleting(&deleting).unwrap(), deleting);
+        assert!(locked.persist_prepared_root(&record).is_err());
+        let mut changed = deleting.clone();
+        changed.epoch += 1;
+        assert!(locked.mark_deleting(&changed).is_err());
+        drop(locked);
+        let locked = catalog.lock_and_open().unwrap();
+        assert_eq!(locked.lookup_root(&record.id).unwrap(), Some(deleting));
     }
 
     #[test]
@@ -271,6 +305,7 @@ mod tests {
         disk.mkdir(&data_dir, 0o700).unwrap();
         let session = "12345678-1234-1234-1234-123456789abc";
         let record = LocalRootRecord {
+            deleting: false,
             id: id.clone(),
             name: OsString::from(name),
             epoch: 1,
@@ -367,6 +402,25 @@ impl LockedLocalRootCatalog for LockedLocalFsRootCatalog {
         }
     }
 
+    fn mark_deleting(&self, record: &LocalRootRecord) -> Result<LocalRootRecord> {
+        let _mutation = self.mutation.lock().map_err(|_| {
+            Error::coded(
+                afs_error::NODE_OWNER_INVALID_GRANT,
+                "root catalog lock poisoned",
+            )
+        })?;
+        let mut current = self.read_record(&Self::record_path(&record.id)?)?;
+        if current != *record {
+            return Err(Error::coded(
+                afs_error::NODE_OWNER_INVALID_GRANT,
+                "root changed before deletion",
+            ));
+        }
+        current.deleting = true;
+        self.write_record(&current)?;
+        Ok(current)
+    }
+
     fn scan_roots(&self) -> Result<Vec<LocalRootRecord>> {
         self.ensure_dir()?;
         let dir = StoragePath::new(CATALOG_DIR).map_err(Error::from)?;
@@ -401,6 +455,8 @@ impl LockedLocalRootCatalog for LockedLocalFsRootCatalog {
 
 #[derive(Deserialize, Serialize)]
 struct WireRootRecord {
+    #[serde(default)]
+    deleting: bool,
     version: u32,
     root_id: String,
     name_hex: String,
@@ -412,6 +468,7 @@ struct WireRootRecord {
 impl WireRootRecord {
     fn from_record(record: &LocalRootRecord) -> Self {
         Self {
+            deleting: record.deleting,
             version: RECORD_VERSION,
             root_id: record.id.0.clone(),
             name_hex: hex(record.name.as_bytes()),
@@ -434,6 +491,7 @@ impl WireRootRecord {
             ));
         }
         Ok(LocalRootRecord {
+            deleting: self.deleting,
             id: RootId(self.root_id),
             name: OsString::from_vec(unhex(&self.name_hex)?),
             epoch: self.epoch,

@@ -9,7 +9,7 @@ use tonic::transport::Channel;
 
 use crate::node::vfs::ownerfs::root::{RootCreateParams, RootId, RootReservation};
 
-pub(super) fn reservation_wire(value: &RootReservation) -> WireReservation {
+pub(crate) fn reservation_wire(value: &RootReservation) -> WireReservation {
     WireReservation {
         root_id: value.id.0.clone(),
         root_epoch: value.epoch,
@@ -59,8 +59,8 @@ pub async fn prepare_root(
         .prepare_owner_root(PrepareOwnerRootRequest {
             reservation: Some(reservation_wire(reservation)),
             name: params.name.clone(),
-            uid: params.uid,
-            gid: params.gid,
+            uid: Some(params.uid),
+            gid: Some(params.gid),
             mode: params.mode,
         })
         .await

@@ -1551,6 +1551,7 @@ async fn owner_authority_stale_abort_cannot_delete_new_pending_reservation() {
 #[test]
 fn owner_root_messages_keep_location_reservation_and_access_separate() {
     let location = RootLocation {
+        deleting: false,
         root_id: "workspace-a".into(),
         root_epoch: 7,
         home_node_id: "node-a".into(),

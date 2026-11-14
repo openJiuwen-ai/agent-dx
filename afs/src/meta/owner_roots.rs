@@ -19,7 +19,13 @@ pub trait OwnerRootAuthority: Send + Sync {
     fn reserve_root(&self, input: ReserveRootInput) -> MetaFuture<'_, ReserveRootOutput>;
     fn activate_root(&self, input: ActivateRootInput) -> MetaFuture<'_, RootAccessGrant>;
     fn abort_root(&self, input: AbortRootInput) -> MetaFuture<'_, ()>;
+    fn begin_root_deletion(&self, _input: RecoverRootInput) -> MetaFuture<'_, ()> {
+        Box::pin(async { Err(unavailable_meta_store()) })
+    }
     fn deactivate_root(&self, input: DeactivateRootInput) -> MetaFuture<'_, ()>;
+    fn force_deactivate_root(&self, _input: ForceDeactivateRootInput) -> MetaFuture<'_, ()> {
+        Box::pin(async { Err(unavailable_meta_store()) })
+    }
     fn lookup_root(&self, input: LookupRootInput) -> MetaFuture<'_, RootLookupState>;
     fn list_owner_roots(&self, input: ListOwnerRootsInput) -> MetaFuture<'_, ListOwnerRootsOutput>;
     /// 全局 Active root 快照，供各节点 outlet 镜像 worker 使用。
@@ -144,6 +150,126 @@ impl StoreOwnerRootAuthority {
         }
     }
 
+    fn deactivate(
+        &self,
+        input: DeactivateRootInput,
+        force: Option<(String, String)>,
+    ) -> MetaFuture<'_, ()> {
+        Box::pin(async move {
+            let snapshot = self
+                .store
+                .read(MetaRead::Root {
+                    root_id: input.root_id.clone(),
+                })
+                .await?;
+            let Some(MetaEntity::Root(root)) = snapshot.entity else {
+                // 幂等：root 已不在 Meta active 列表。
+                return Ok(());
+            };
+            if root.root_epoch != input.root_epoch {
+                return Err(invalid("deactivate root epoch does not match durable root"));
+            }
+            if root.home_node_id != input.home_node_id
+                || root.home_session_id != input.home_session_id
+            {
+                return Err(invalid("deactivate caller does not match durable root"));
+            }
+            let (caller_node, caller_session) = force
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| (root.home_node_id.clone(), root.home_session_id.clone()));
+            if let Some(authenticated) = &input.authenticated_home_node_id
+                && authenticated != &caller_node
+            {
+                return Err(permission_denied(format!(
+                    "authenticated node {authenticated} does not match caller {caller_node}"
+                )));
+            }
+            let home_grant = if root.deleting {
+                None
+            } else {
+                let home = self
+                    .store
+                    .read(MetaRead::RootGrantByHolder {
+                        root_id: root.root_id.clone(),
+                        holder_node_id: root.home_node_id.clone(),
+                        holder_session_id: root.home_session_id.clone(),
+                    })
+                    .await?;
+                let Some(MetaEntity::RootGrant(home_grant)) = home.entity else {
+                    return Err(invalid("current Home grant is missing during deactivation"));
+                };
+                if home_grant.root_epoch != root.root_epoch
+                    || home_grant.home_node_id != root.home_node_id
+                    || home_grant.home_session_id != root.home_session_id
+                    || home_grant.access_generation == 0
+                {
+                    return Err(invalid(
+                        "current Home grant does not match deactivated Root",
+                    ));
+                }
+                Some(home_grant)
+            };
+            let key = request_key(
+                if force.is_some() {
+                    format!("force:{caller_node}/{caller_session}")
+                } else {
+                    format!("{caller_node}/{caller_session}")
+                },
+                input.request_id.clone(),
+            );
+            let mut txn = MetaTxn::new(key.clone(), StoreOperation::DeactivateRoot);
+            if force.is_some() {
+                txn.conditions.push(TxnCondition::NodeSessionUnavailable {
+                    node_id: root.home_node_id.clone(),
+                });
+            }
+            txn.conditions.extend([
+                TxnCondition::RequestAbsent(key),
+                TxnCondition::NodeSessionCurrent {
+                    node_id: caller_node,
+                    session_id: caller_session,
+                },
+                TxnCondition::EntityEquals(MetaEntity::Root(root.clone())),
+            ]);
+            txn.mutations.push(TxnMutation::Delete(MetaKey::Root {
+                root_id: root.root_id.clone(),
+            }));
+            // Root absence fences every old grant in the authoritative view.
+            // Physical grant removal is bounded background work, not part of this ACK.
+            if let Some(home_grant) = home_grant {
+                let access_generation = home_grant.access_generation;
+                txn.conditions
+                    .push(TxnCondition::EntityEquals(MetaEntity::RootGrant(
+                        home_grant,
+                    )));
+                txn.mutations.push(TxnMutation::Put(MetaEntity::RootCommand(
+                    RootCommandRecord {
+                        command_id: format!(
+                            "deactivate:{}:{}:{}",
+                            root.root_id, root.root_epoch, input.request_id
+                        ),
+                        home_node_id: root.home_node_id.clone(),
+                        home_session_id: root.home_session_id.clone(),
+                        root_id: root.root_id.clone(),
+                        root_epoch: root.root_epoch,
+                        old_access_generation: access_generation,
+                        command_type: RootCommandType::RevokeAccess,
+                    },
+                )));
+            }
+            txn.mutations.push(TxnMutation::RecordRequestOutcome(
+                super::store::RequestOutcome {
+                    request: txn.request.clone(),
+                    operation: txn.operation,
+                    result: OperationResult::Empty,
+                },
+            ));
+            let _ = commit_or_replay(self.store.as_ref(), txn).await?;
+            Ok(())
+        })
+    }
+
     // Commands and the resume cursor come from the same pinned authority view.
     // A revocation that fell out of Watch history must still be delivered.
     async fn resynchronize_commands(
@@ -172,6 +298,79 @@ impl StoreOwnerRootAuthority {
 }
 
 impl OwnerRootAuthority for StoreOwnerRootAuthority {
+    fn begin_root_deletion(&self, input: RecoverRootInput) -> MetaFuture<'_, ()> {
+        Box::pin(async move {
+            let snapshot = self
+                .store
+                .read(MetaRead::Root {
+                    root_id: input.root_id.clone(),
+                })
+                .await?;
+            let Some(MetaEntity::Root(mut root)) = snapshot.entity else {
+                return Err(invalid("root was not found"));
+            };
+            if root.home_node_id != input.home_node_id
+                || root.root_epoch != input.expected_root_epoch
+                || root.local_prepare_id != input.local_prepare_id
+            {
+                return Err(invalid("deletion request does not match durable root"));
+            }
+            let old_home = self
+                .store
+                .read(MetaRead::RootGrantByHolder {
+                    root_id: root.root_id.clone(),
+                    holder_node_id: root.home_node_id.clone(),
+                    holder_session_id: root.home_session_id.clone(),
+                })
+                .await?;
+            let command = match old_home.entity {
+                Some(MetaEntity::RootGrant(grant)) => Some(RootCommandRecord {
+                    command_id: format!(
+                        "delete:{}:{}:{}",
+                        root.root_id, root.root_epoch, input.request_id
+                    ),
+                    root_id: root.root_id.clone(),
+                    root_epoch: root.root_epoch,
+                    home_node_id: root.home_node_id.clone(),
+                    home_session_id: root.home_session_id.clone(),
+                    old_access_generation: grant.access_generation,
+                    command_type: RootCommandType::RevokeAccess,
+                }),
+                _ => None,
+            };
+            let previous = root.clone();
+            root.deleting = true;
+            root.home_session_id = input.home_session_id.clone();
+            let key = request_key(
+                format!("{}/{}", input.home_node_id, input.home_session_id),
+                input.request_id,
+            );
+            let mut txn = MetaTxn::new(key.clone(), StoreOperation::BeginRootDeletion);
+            txn.conditions.extend([
+                TxnCondition::RequestAbsent(key),
+                TxnCondition::NodeSessionCurrent {
+                    node_id: input.home_node_id,
+                    session_id: input.home_session_id,
+                },
+                TxnCondition::EntityEquals(MetaEntity::Root(previous)),
+            ]);
+            txn.mutations.extend([
+                TxnMutation::Put(MetaEntity::Root(root)),
+                TxnMutation::RecordRequestOutcome(super::store::RequestOutcome {
+                    request: txn.request.clone(),
+                    operation: txn.operation,
+                    result: OperationResult::Empty,
+                }),
+            ]);
+            if let Some(command) = command {
+                txn.mutations
+                    .push(TxnMutation::Put(MetaEntity::RootCommand(command)));
+            }
+            commit_or_replay(self.store.as_ref(), txn).await?;
+            Ok(())
+        })
+    }
+
     fn reserve_root(&self, input: ReserveRootInput) -> MetaFuture<'_, ReserveRootOutput> {
         Box::pin(async move {
             if input.root_id.is_empty()
@@ -448,6 +647,7 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 return Err(invalid("reservation does not match durable reserve record"));
             }
             let root = RootRecord {
+                deleting: false,
                 root_id: record.root_id.clone(),
                 root_epoch: record.root_epoch,
                 home_node_id: record.home_node_id.clone(),
@@ -503,32 +703,38 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
             let Some(MetaEntity::RootReservation(reservation)) = snapshot.entity else {
                 return Err(invalid("root reservation was not found"));
             };
-            if reservation.home_session_id != input.session_id {
-                return Err(invalid("abort session does not match durable reservation"));
+            let caller = input
+                .authenticated_home_node_id
+                .as_deref()
+                .unwrap_or(&reservation.home_node_id);
+            let home = caller == reservation.home_node_id
+                && input.session_id == reservation.home_session_id;
+            let requester = caller == reservation.requester_node_id
+                && input.session_id == reservation.requester_session_id;
+            if !home && !requester {
+                return Err(permission_denied(
+                    "abort caller does not match reservation Home or requester",
+                ));
             }
+            let caller = caller.to_owned();
             if reservation.root_epoch != input.root_epoch
                 || reservation.create_intent_id != input.create_intent_id
                 || reservation.prepare_token != input.prepare_token
             {
                 return Err(invalid("abort request does not match durable reservation"));
             }
-            if let Some(authenticated) = &input.authenticated_home_node_id
-                && authenticated != &reservation.home_node_id
-            {
-                return Err(permission_denied(format!(
-                    "authenticated node {authenticated} does not match reservation home {}",
-                    reservation.home_node_id
-                )));
-            }
-            let key = request_key(
-                format!("{}/{}", reservation.home_node_id, input.session_id),
-                input.request_id,
-            );
+            let key = request_key(format!("{}/{}", caller, input.session_id), input.request_id);
             let mut txn = MetaTxn::new(key.clone(), StoreOperation::AbortRoot);
             txn.conditions.extend([
                 TxnCondition::RequestAbsent(key),
                 TxnCondition::EntityEquals(MetaEntity::RootReservation(reservation)),
             ]);
+            if !home {
+                txn.conditions.push(TxnCondition::NodeSessionCurrent {
+                    node_id: caller,
+                    session_id: input.session_id,
+                });
+            }
             txn.mutations.extend([
                 TxnMutation::Delete(MetaKey::RootReservation {
                     root_id: input.root_id,
@@ -545,97 +751,14 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
     }
 
     fn deactivate_root(&self, input: DeactivateRootInput) -> MetaFuture<'_, ()> {
-        Box::pin(async move {
-            let snapshot = self
-                .store
-                .read(MetaRead::Root {
-                    root_id: input.root_id.clone(),
-                })
-                .await?;
-            let Some(MetaEntity::Root(root)) = snapshot.entity else {
-                // 幂等：root 已不在 Meta active 列表。
-                return Ok(());
-            };
-            if root.root_epoch != input.root_epoch {
-                return Err(invalid("deactivate root epoch does not match durable root"));
-            }
-            if root.home_node_id != input.home_node_id
-                || root.home_session_id != input.home_session_id
-            {
-                return Err(invalid("deactivate caller does not match durable root"));
-            }
-            if let Some(authenticated) = &input.authenticated_home_node_id
-                && authenticated != &root.home_node_id
-            {
-                return Err(permission_denied(format!(
-                    "authenticated node {authenticated} does not match root home {}",
-                    root.home_node_id
-                )));
-            }
-            let home = self
-                .store
-                .read(MetaRead::RootGrantByHolder {
-                    root_id: root.root_id.clone(),
-                    holder_node_id: root.home_node_id.clone(),
-                    holder_session_id: root.home_session_id.clone(),
-                })
-                .await?;
-            let Some(MetaEntity::RootGrant(home_grant)) = home.entity else {
-                return Err(invalid("current Home grant is missing during deactivation"));
-            };
-            if home_grant.root_epoch != root.root_epoch
-                || home_grant.home_node_id != root.home_node_id
-                || home_grant.home_session_id != root.home_session_id
-                || home_grant.access_generation == 0
-            {
-                return Err(invalid(
-                    "current Home grant does not match deactivated Root",
-                ));
-            }
-            let access_generation = home_grant.access_generation;
-            let key = request_key(
-                format!("{}/{}", root.home_node_id, root.home_session_id),
-                input.request_id.clone(),
-            );
-            let mut txn = MetaTxn::new(key.clone(), StoreOperation::DeactivateRoot);
-            txn.conditions.extend([
-                TxnCondition::RequestAbsent(key),
-                TxnCondition::NodeSessionCurrent {
-                    node_id: root.home_node_id.clone(),
-                    session_id: root.home_session_id.clone(),
-                },
-                TxnCondition::EntityEquals(MetaEntity::Root(root.clone())),
-                TxnCondition::EntityEquals(MetaEntity::RootGrant(home_grant)),
-            ]);
-            txn.mutations.push(TxnMutation::Delete(MetaKey::Root {
-                root_id: root.root_id.clone(),
-            }));
-            // Root absence fences every old grant in the authoritative view.
-            // Physical grant removal is bounded background work, not part of this ACK.
-            txn.mutations.push(TxnMutation::Put(MetaEntity::RootCommand(
-                RootCommandRecord {
-                    command_id: format!(
-                        "deactivate:{}:{}:{}",
-                        root.root_id, root.root_epoch, input.request_id
-                    ),
-                    home_node_id: root.home_node_id.clone(),
-                    home_session_id: root.home_session_id.clone(),
-                    root_id: root.root_id.clone(),
-                    root_epoch: root.root_epoch,
-                    old_access_generation: access_generation,
-                    command_type: RootCommandType::RevokeAccess,
-                },
-            )));
-            txn.mutations.push(TxnMutation::RecordRequestOutcome(
-                super::store::RequestOutcome {
-                    request: txn.request.clone(),
-                    operation: txn.operation,
-                    result: OperationResult::Empty,
-                },
-            ));
-            let _ = commit_or_replay(self.store.as_ref(), txn).await?;
-            Ok(())
-        })
+        self.deactivate(input, None)
+    }
+
+    fn force_deactivate_root(&self, input: ForceDeactivateRootInput) -> MetaFuture<'_, ()> {
+        self.deactivate(
+            input.root,
+            Some((input.requester_node_id, input.requester_session_id)),
+        )
     }
 
     fn lookup_root(&self, input: LookupRootInput) -> MetaFuture<'_, RootLookupState> {
@@ -688,7 +811,7 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 .entities
                 .into_iter()
                 .filter_map(|entity| match entity {
-                    MetaEntity::Root(root) => Some(root),
+                    MetaEntity::Root(root) if !root.deleting => Some(root),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -754,9 +877,13 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
             let Some(MetaEntity::Root(root)) = root.entity else {
                 return Err(invalid("root was not found"));
             };
+            if root.deleting {
+                return Err(invalid("workspace is deleting"));
+            }
             if input.expected_root_epoch != 0 && input.expected_root_epoch != root.root_epoch {
                 return Err(invalid("root epoch changed"));
             }
+            let original_root = root.clone();
             let home_grant = self
                 .store
                 .read(MetaRead::RootGrantByHolder {
@@ -825,10 +952,7 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                     node_id: holder_node_id.clone(),
                     session_id: holder_session_id.clone(),
                 },
-                TxnCondition::RootEpochEquals {
-                    root_id: grant.root_id.clone(),
-                    root_epoch: grant.root_epoch,
-                },
+                TxnCondition::EntityEquals(MetaEntity::Root(original_root)),
             ]);
             if let Some(revision) = existing_holder_revision {
                 txn.conditions.push(TxnCondition::RevisionEquals {
@@ -1051,6 +1175,10 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
             let Some(MetaEntity::Root(mut root)) = root.entity else {
                 return Err(invalid("root was not found"));
             };
+            if root.deleting {
+                return Err(invalid("workspace is deleting"));
+            }
+            let original_root = root.clone();
             if root.home_node_id != input.home_node_id
                 || root.root_epoch != input.expected_root_epoch
                 || root.local_prepare_id != input.local_prepare_id
@@ -1082,10 +1210,7 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                     node_id: root.home_node_id.clone(),
                     session_id: root.home_session_id.clone(),
                 },
-                TxnCondition::RootEpochEquals {
-                    root_id: root.root_id.clone(),
-                    root_epoch: root.root_epoch,
-                },
+                TxnCondition::EntityEquals(MetaEntity::Root(original_root)),
             ]);
             txn.mutations.extend([
                 TxnMutation::Put(MetaEntity::Root(root)),
@@ -1271,6 +1396,12 @@ pub struct DeactivateRootInput {
     pub authenticated_home_node_id: Option<String>,
 }
 
+pub struct ForceDeactivateRootInput {
+    pub root: DeactivateRootInput,
+    pub requester_node_id: String,
+    pub requester_session_id: String,
+}
+
 pub struct LookupRootInput {
     pub root_id: String,
 }
@@ -1319,6 +1450,7 @@ mod digest_tests {
 
     fn root(id: &str, home: &str, addr: &str) -> RootRecord {
         RootRecord {
+            deleting: false,
             root_id: id.to_owned(),
             root_epoch: 1,
             home_node_id: home.to_owned(),

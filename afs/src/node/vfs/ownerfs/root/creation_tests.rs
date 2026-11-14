@@ -29,6 +29,7 @@ impl RootMeta for Meta {
         }
         let reservation = state.pending.take().unwrap();
         state.active = Some(RootLocation {
+            deleting: false,
             id: reservation.id.clone(),
             epoch: reservation.epoch,
             home_node_id: reservation.home_node_id.clone(),
@@ -410,21 +411,27 @@ fn replacement_preserves_nonempty_obsolete_preparation() {
     let mut fixture = Fixture::new(0o750);
     fixture.meta.0.lock().unwrap().fail_before_activate = true;
     assert!(fixture.prepare().is_err());
-    let records = fixture.manager.catalog.scan_roots().unwrap();
     std::fs::write(fixture.path().join("payload"), b"keep").unwrap();
     fixture.reservation.epoch += 1;
     fixture.reservation.prepare_token = "replacement-token".into();
     fixture.meta.0.lock().unwrap().pending = Some(fixture.reservation.clone());
 
-    assert_eq!(
-        fixture.prepare().unwrap_err().code(),
-        afs_error::IO_DIRECTORY_NOT_EMPTY
-    );
+    fixture.meta.0.lock().unwrap().fail_before_activate = false;
+    fixture.prepare().unwrap();
     assert_eq!(
         std::fs::read(fixture.path().join("payload")).unwrap(),
         b"keep"
     );
-    assert_eq!(fixture.manager.catalog.scan_roots().unwrap(), records);
+    let records = fixture.manager.catalog.scan_roots().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].epoch, fixture.reservation.epoch);
+    assert!(
+        fixture
+            .temp
+            .path()
+            .join(records[0].data_dir.as_path())
+            .is_dir()
+    );
 }
 
 #[test]
@@ -502,7 +509,6 @@ fn startup_preserves_nonempty_replaced_preparation() {
     let fixture = Fixture::new(0o750);
     fixture.meta.0.lock().unwrap().fail_before_activate = true;
     assert!(fixture.prepare().is_err());
-    let records = fixture.manager.catalog.scan_roots().unwrap();
     let payload = fixture.path().join("payload");
     std::fs::write(&payload, b"keep").unwrap();
     let mut replacement = fixture.reservation.clone();
@@ -512,16 +518,13 @@ fn startup_preserves_nonempty_replaced_preparation() {
     drop(fixture.manager);
 
     let disk = Arc::new(LocalFs::open(fixture.temp.path()).unwrap());
-    let error = RootManager::open(
+    let manager = RootManager::open(
         "home".into(),
         "new-home-session".into(),
         fixture.meta,
         disk.clone(),
     )
-    .err()
-    .expect("nonempty obsolete preparation must not be removed");
-    assert_eq!(error.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+    .expect("fenced nonempty preparation must not block startup");
     assert_eq!(std::fs::read(payload).unwrap(), b"keep");
-    let catalog = LocalFsRootCatalog::new(disk).lock_and_open().unwrap();
-    assert_eq!(catalog.scan_roots().unwrap(), records);
+    assert!(manager.catalog.scan_roots().unwrap().is_empty());
 }

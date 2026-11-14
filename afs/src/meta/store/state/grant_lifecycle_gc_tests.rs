@@ -18,6 +18,7 @@ fn fixture() -> (State, RootAccessGrant) {
         ..Default::default()
     };
     let root = RootRecord {
+        deleting: false,
         root_id: "workspace".into(),
         root_epoch: 7,
         home_node_id: "home".into(),

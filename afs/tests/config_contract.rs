@@ -4,6 +4,43 @@ use afs::config::{
 use clap::{CommandFactory, Parser};
 
 #[test]
+fn workspace_api_requires_node_mount_and_outlet() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("workspace.toml");
+    let resolve = |role, text: &str| {
+        std::fs::write(&path, text).unwrap();
+        Config::resolve(
+            role,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+    };
+    let outlet = "fs='ownerfs'\nownerfs_mount='/mnt/ownerfs'\noutlet_public_root='/opt/adx/workspaces'\noutlet_import_root='/opt/adx/imports'\noutlet_users_root='/opt/adx/nfs/users'\noutlet_nfs_addr='10.0.0.1'\n";
+    let api = "[ownerfs_workspace_api]\nlisten='127.0.0.1:18889'\n";
+    assert!(
+        resolve(Role::Node, "")
+            .unwrap()
+            .ownerfs_workspace_api
+            .is_none()
+    );
+    assert!(resolve(Role::Node, api).is_err());
+    assert!(resolve(Role::Meta, &format!("{outlet}{api}")).is_err());
+    assert!(
+        resolve(Role::Node, &format!("{outlet}{api}"))
+            .unwrap()
+            .ownerfs_workspace_api
+            .is_some()
+    );
+    assert!(
+        resolve(
+            Role::Node,
+            &format!("grpc_listen='127.0.0.1:18889'\n{outlet}{api}")
+        )
+        .is_err()
+    );
+    assert!(resolve(Role::Node, "ownerfs_workspace_default_uid=4294967295\n").is_err());
+}
+
+#[test]
 fn p2_w2_native_write_limits_use_cli_file_defaults_and_bounded_resources() {
     fn limits(config: &Config) -> (u64, usize, usize, u64) {
         (
