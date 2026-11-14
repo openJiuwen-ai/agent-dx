@@ -5,6 +5,13 @@ validation, fixed mail reads and subscription synchronization. The project Key
 stays outside user sandboxes, encrypted by the existing configuration center.
 This is implemented code; real-provider OAuth/mailbox acceptance is separate.
 
+Metadata and body reads retain the provider's message version: Gmail `historyId`
+and Outlook `changeKey`. These fields are explicitly selected and retained by the
+metadata projection without exposing a snippet or body. Consumers use one version
+for both representations; opening a search result must not invalidate its own
+task merely because the body is now present. A provider version change remains an
+actual source change and must retain the existing invalidation behavior.
+
 ## Ownership and assembly
 
 - M44 Scan/Registry remains the only authorization-attempt, connection and intent

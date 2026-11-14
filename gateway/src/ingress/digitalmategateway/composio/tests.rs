@@ -1252,7 +1252,7 @@ async fn outlook_shared_mail_path_pins_provider_subject_and_metadata() {
         200,
         json!({"status":200,"data":{
             "id":"AAMk_message+=","conversationId":"AAQk_thread=",
-            "subject":"Subject","body":{"content":"must not cross metadata boundary"},
+            "changeKey":"stable-provider-version","subject":"Subject","body":{"content":"must not cross metadata boundary"},
             "bodyPreview":"must not cross metadata boundary"
         }}),
     );
@@ -1269,12 +1269,16 @@ async fn outlook_shared_mail_path_pins_provider_subject_and_metadata() {
         .await
         .unwrap();
     assert_eq!(result["id"], "AAMk_message+=");
+    assert_eq!(result["changeKey"], "stable-provider-version");
     assert!(result.get("body").is_none());
     assert!(result.get("bodyPreview").is_none());
     let calls = f.state.calls.lock().unwrap();
     assert_eq!(calls.len(), 3);
     let endpoint = reqwest::Url::parse(calls[2].1["endpoint"].as_str().unwrap()).unwrap();
     assert_eq!(endpoint.host_str(), Some("graph.microsoft.com"));
+    assert!(endpoint.query_pairs().any(|(key, value)| {
+        key == "$select" && value.split(',').any(|field| field == "changeKey")
+    }));
     assert_eq!(
         endpoint.path(),
         "/v1.0/users/01234567-89ab-cdef-0123-456789abcdef/messages/AAMk_message+="
@@ -1770,7 +1774,7 @@ async fn read_metadata_and_body_formats_are_explicit() {
 #[tokio::test]
 async fn gmail_metadata_excludes_preview_body_and_unrequested_headers() {
     let f = Fixture::new().await;
-    f.reads(json!({"id":"18abc","threadId":"18def","internalDate":"1793491200000",
+    f.reads(json!({"id":"18abc","threadId":"18def","internalDate":"1793491200000","historyId":"12345",
         "snippet":"private body preview", "payload":{"body":{"data":"c2VjcmV0"},
         "parts":[{"body":{"data":"c2VjcmV0"}}], "headers":[
             {"name":"Subject","value":"Allowed subject"}, {"name":"X-Private","value":"not requested"}]}}));
@@ -1787,15 +1791,15 @@ async fn gmail_metadata_excludes_preview_body_and_unrequested_headers() {
         .await
         .unwrap();
     assert!(result.get("snippet").is_none());
+    assert_eq!(result["historyId"], "12345");
     assert_eq!(
         result["payload"],
         json!({"headers":[{"name":"Subject","value":"Allowed subject"}]})
     );
     let calls = f.state.calls.lock().unwrap();
     let endpoint = reqwest::Url::parse(calls[3].1["endpoint"].as_str().unwrap()).unwrap();
-    assert!(endpoint.query_pairs().any(
-        |(key, value)| key == "fields" && value == "id,threadId,internalDate,payload(headers)"
-    ));
+    assert!(endpoint.query_pairs().any(|(key, value)| key == "fields"
+        && value == "id,threadId,internalDate,historyId,payload(headers)"));
 }
 
 #[tokio::test]

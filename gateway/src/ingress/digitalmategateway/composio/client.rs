@@ -496,9 +496,10 @@ impl Client {
                     .query_pairs_mut()
                     .append_pair("format", if body { "full" } else { "metadata" });
                 if !body {
-                    endpoint
-                        .query_pairs_mut()
-                        .append_pair("fields", "id,threadId,internalDate,payload(headers)");
+                    endpoint.query_pairs_mut().append_pair(
+                        "fields",
+                        "id,threadId,internalDate,historyId,payload(headers)",
+                    );
                     for name in GMAIL_HEADERS {
                         endpoint
                             .query_pairs_mut()
@@ -554,7 +555,7 @@ fn gmail_metadata(value: Value, message_id: &str) -> Result<Value, Error> {
         return Err(Error::InvalidResponse);
     }
     let mut result = json!({});
-    for field in ["id", "threadId", "internalDate"] {
+    for field in ["id", "threadId", "internalDate", "historyId"] {
         if let Some(value) = value.get(field) {
             result[field] = value.clone();
         }

@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 
 const LIST_FIELDS: &str = "id,conversationId,webLink";
 const HEADER_FIELDS: &str =
-    "id,conversationId,webLink,subject,sender,toRecipients,receivedDateTime";
+    "id,conversationId,webLink,subject,sender,toRecipients,receivedDateTime,changeKey";
 const BODY_FIELDS: &str =
-    "id,conversationId,webLink,subject,sender,toRecipients,receivedDateTime,body,bodyPreview";
+    "id,conversationId,webLink,subject,sender,toRecipients,receivedDateTime,changeKey,body,bodyPreview";
 
 pub(super) fn message_id(value: &str) -> bool {
     !value.is_empty()
