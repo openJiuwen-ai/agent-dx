@@ -698,10 +698,36 @@ impl DistributedFs {
                 oldest = Some((since, cell));
             }
         }
-        if let Some((_, cell)) = oldest {
+        if let Some((since, cell)) = oldest {
+            #[cfg(test)]
+            {
+                let hook = self
+                    .hooks
+                    .dirty_budget_before_mark_due
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             let mut state = cell
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            // A concurrent commit may have cleaned this holder since the scan.
+            // Mark only the same budget holding while it still has work to commit.
+            if !state.dirty
+                || state.native_due
+                || state.commit_busy
+                || state.in_flight.is_some()
+                || state.terminal_error.is_some()
+                || state
+                    .writeback_retry_at
+                    .is_some_and(|at| at > Instant::now())
+                || state.native_owner.held_since() != Some(since)
+            {
+                return Ok(());
+            }
             state.native_due = true;
             state.native_due_through = state.native_due_through.max(state.visible_write_seq);
             drop(state);

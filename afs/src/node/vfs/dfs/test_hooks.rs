@@ -10,6 +10,8 @@ pub(super) struct TestHooks {
     pub(super) handle_registration_after_route_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub(super) readonly_version_before_install: Mutex<Option<Arc<std::sync::Barrier>>>,
     pub(super) writeback_after_prepare_pause: Mutex<Option<Duration>>,
+    /// Runs after selecting a holder for early commit, before relocking it.
+    pub(super) dirty_budget_before_mark_due: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Shorter read-view reuse period, so a test read can cross it.
     pub(super) native_read_view_ttl: Mutex<Option<Duration>>,
     /// Runs after a read through the write state resolved and protected its view.

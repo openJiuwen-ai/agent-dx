@@ -2083,3 +2083,64 @@ fn each_budget_wait_commits_only_as_many_holders_as_it_needs() {
         fs.release(&context(), handle).unwrap();
     }
 }
+
+#[test]
+fn a_holder_synced_during_selection_does_not_block_later_budget_relief() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = Arc::new(fs.with_write_timeout(Duration::from_secs(20)));
+    let (oldest, oldest_inode) = r91_open_dirty(&fs, "r91-synced");
+    let (younger, younger_inode) = r91_open_dirty(&fs, "r91-still-dirty");
+    let oldest_cell = fs.write_state(&oldest_inode).unwrap().unwrap();
+    let younger_cell = fs.write_state(&younger_inode).unwrap().unwrap();
+    let held_since = |cell: &SharedInodeWriteState| cell.lock().unwrap().native_owner.held_since();
+    assert!(held_since(&oldest_cell).unwrap() < held_since(&younger_cell).unwrap());
+    let committed_inodes = || {
+        meta.commits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|commit| commit.inode_id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Let fsync finish on another thread after the budget waiter has picked
+    // this holder. Keep the synced file open and listed for writeback.
+    let sync_fs = fs.clone();
+    *fs.hooks.dirty_budget_before_mark_due.lock().unwrap() = Some(Box::new(move || {
+        std::thread::spawn(move || sync_fs.fsync(&context(), oldest, SyncMode::Full))
+            .join()
+            .unwrap()
+            .unwrap();
+    }));
+    let (third, _) = r91_open_dirty(&fs, "r91-uses-released-budget");
+    assert!(
+        fs.hooks
+            .dirty_budget_before_mark_due
+            .lock()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(committed_inodes(), vec![oldest_inode.clone()]);
+    assert!(younger_cell.lock().unwrap().dirty);
+    {
+        let state = oldest_cell.lock().unwrap();
+        assert_eq!(state.open_writers, 1);
+        assert!(!state.dirty);
+        assert!(state.native_owner.held_since().is_none());
+        assert!(
+            !state.native_due,
+            "fsync already cleaned the selected holder"
+        );
+    }
+
+    // The third write used the space freed by fsync. The fourth must commit
+    // the next holder to get capacity. No periodic writeback runs here.
+    let (fourth, _) = r91_open_dirty(&fs, "r91-needs-early-commit");
+    assert_eq!(committed_inodes(), vec![oldest_inode, younger_inode]);
+
+    for handle in [oldest, younger, third, fourth] {
+        fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+        fs.release(&context(), handle).unwrap();
+    }
+}
