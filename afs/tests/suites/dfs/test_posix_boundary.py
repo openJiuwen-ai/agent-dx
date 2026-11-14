@@ -496,9 +496,11 @@ open(d+"/done.json","w").write(json.dumps(out))
 
 
 def exclusive_create_of_a_taken_name_is_eexist(c):
-    """#39: `O_CREAT|O_EXCL` over an existing name is EEXIST (`FileExistsError`), also
+    """
+    #39: `O_CREAT|O_EXCL` over an existing name is EEXIST (`FileExistsError`), also
     when another node created the name after this node's kernel looked it up: lock
-    files and mkstemp retry on EEXIST and fail on anything else."""
+    files and mkstemp retry on EEXIST and fail on anything else.
+    """
     c.write("A", "px-excl", b"x")
     seen = run(c, "B", "print(json.dumps(err(os.open,sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)))",
                path(c, "B", "px-excl"))
@@ -515,11 +517,13 @@ def exclusive_create_of_a_taken_name_is_eexist(c):
     c.record("posix.exclusive_create", done)
     for value in done.values():
         assert set(value) <= {"created", "EEXIST"}, done
-    assert done["A"].get("created", 0) + done["B"].get("created", 0) == count, done
-    assert done["A"].get("EEXIST", 0) + done["B"].get("EEXIST", 0) == count, done
+    assert sum(value.get("created", 0) for value in done.values()) == count, done
+    assert sum(value.get("EEXIST", 0) for value in done.values()) == count, done
 
 
-PLAIN_CREATOR = HELPER_IMPORTS + """d=sys.argv[1];target=sys.argv[2];start=float(sys.argv[3]);tag=sys.argv[5].encode();out={}
+PLAIN_CREATOR = HELPER_IMPORTS + (
+    "d=sys.argv[1];target=sys.argv[2];start=float(sys.argv[3]);"
+    """tag=sys.argv[5].encode();out={}
 while time.time()<start: time.sleep(0.0005)
 for i in range(int(sys.argv[4])):
     try:
@@ -528,12 +532,15 @@ for i in range(int(sys.argv[4])):
     out[r]=out.get(r,0)+1
 open(d+"/done.json","w").write(json.dumps(out))
 """
+)
 
 
 def plain_create_of_a_name_that_just_appeared_opens_it(c):
-    """#39: `open(O_CREAT)` without O_EXCL never fails because the name exists. Two nodes
+    """
+    #39: `open(O_CREAT)` without O_EXCL never fails because the name exists. Two nodes
     create and append to the same names at the same time; every open succeeds on both,
-    whichever node's create reached Meta first."""
+    whichever node's create reached Meta first.
+    """
     run(c, "A", "os.mkdir(sys.argv[1]);print(json.dumps(0))", path(c, "A", "px-creat-race"))
     count = 300
     start = run(c, "A", "print(json.dumps(time.time()+3))")
