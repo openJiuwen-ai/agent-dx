@@ -50,12 +50,6 @@ pub(super) fn coordinator(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IntentReply {
-    subscription_intent: Intent,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Intent {
     connection_id: String,
     provider: String,
@@ -87,10 +81,11 @@ impl IntentPort for OwnerIntent {
             .owner
             .authorization(scope, OwnerOperation::Intent, &raw)
             .await?;
-        let reply: IntentReply =
+        // The M44 owner HTTP operation returns the snapshot directly; the
+        // client-facing connector.subscription.get envelope is not used here.
+        let intent: Intent =
             serde_json::from_value(self.owner.send(scope, OwnerOperation::Intent, body).await?)
                 .map_err(|_| Error::InvalidResponse)?;
-        let intent = reply.subscription_intent;
         if intent.connection_id != id {
             return Err(Error::AccountMismatch);
         }
@@ -156,6 +151,33 @@ fn same_route(before: &OwnerAuthorization, after: &OwnerAuthorization) -> bool {
         && before.generation() == after.generation()
         && before.environment_id() == after.environment_id()
         && before.service_port() == after.service_port()
+}
+
+#[cfg(test)]
+mod intent_contract_tests {
+    use super::*;
+
+    #[test]
+    fn m44_owner_intent_response_is_the_direct_snapshot() {
+        // owner_http._dispatch("intent") returns SubscriptionIntent.model_dump;
+        // connector.subscription.get is a different, client-facing envelope.
+        let wire = json!({
+            "connection_id":"connection-fixture", "provider":"microsoft", "backend":"composio",
+            "external_account_id":"ca_fixture", "external_subject_id":"subject-fixture",
+            "authorization_generation":1, "enabled":true, "intent_revision":1,
+            "usable":true, "state":"current"
+        });
+        let reply: Intent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(reply.connection_id, "connection-fixture");
+        assert!(reply.enabled);
+        assert!(serde_json::from_value::<Intent>(json!({"subscription_intent":wire})).is_err());
+        let mut extra = wire.clone();
+        extra["untrusted"] = json!(true);
+        assert!(serde_json::from_value::<Intent>(extra).is_err());
+        let mut wrong_type = wire;
+        wrong_type["enabled"] = json!("true");
+        assert!(serde_json::from_value::<Intent>(wrong_type).is_err());
+    }
 }
 
 pub(super) struct ProjectTriggers {

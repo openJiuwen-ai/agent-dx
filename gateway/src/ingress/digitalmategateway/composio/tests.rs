@@ -350,7 +350,7 @@ async fn http_subscription_requires_initialized_ingestion_and_rejects_enablement
     ] {
         assert_eq!(http_candidate(&f, path, raw).await.0, 400);
     }
-    assert_eq!(f.call_count(), 0);
+    assert!(f.state.calls.lock().unwrap().is_empty());
     assert_eq!(f.authority.writes.load(Ordering::SeqCst), 0);
 }
 
