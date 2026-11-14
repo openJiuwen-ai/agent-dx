@@ -264,7 +264,7 @@ impl ApplicationWsConfig {
             biased;
             why = wait_for_end(reason.clone()) => end_response(why),
             _ = tokio::time::sleep_until(deadline) => error(StatusCode::GATEWAY_TIMEOUT, "AGENT_SERVER_UNAVAILABLE"),
-            response = proxy_http(request, stream, "environment", Some(cancelled)) => response,
+            response = proxy_http(request, stream, "environment", Some(cancelled), ingress.frontend_work_handle()) => response,
         };
         if *reason.borrow() != End::Active {
             return end_response(*reason.borrow());

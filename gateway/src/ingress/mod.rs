@@ -33,7 +33,7 @@ pub use server::{
     StaticRoute,
 };
 #[cfg(feature = "activity-client")]
-pub use service::IngressService;
+pub use service::{IngressReadiness, IngressService};
 
 #[cfg(feature = "agent-api")]
 pub mod environment_files;

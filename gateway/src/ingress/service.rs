@@ -183,7 +183,8 @@ impl IngressService {
         .with_client_acl(
             config.allowed_client_networks.clone(),
             config.allow_any_client,
-        );
+        )
+        .with_ws_drain_mode(config.ws_drain_mode);
         #[cfg(feature = "agent-api")]
         let gateway = match file_access {
             Some(access) => gateway.with_execd_access(access),
@@ -222,6 +223,16 @@ impl IngressService {
             store,
             route_changes,
         })
+    }
+
+    /// Narrow readiness view of the bound (not yet served) Ingress, for
+    /// hosts that must fold the Ingress's admission state into their own
+    /// probe — e.g. the API Server embedding the Ingress reports
+    /// `/readyz = directory sync && embedded Ingress readiness`.
+    pub fn readiness(&self) -> IngressReadiness {
+        IngressReadiness {
+            gateway: self.gateway.clone(),
+        }
     }
 
     pub async fn serve(
@@ -301,10 +312,9 @@ impl IngressService {
         };
         gateway.start_drain();
         let _ = shutdown_tx.send(true);
-        let deadline = tokio::time::Instant::now() + config.drain_timeout;
-        while gateway.active_sessions() > 0 && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        gateway
+            .wait_drained(tokio::time::Instant::now() + config.drain_timeout)
+            .await;
         watcher_task.abort();
         route_reconciler_task.abort();
         if failure.is_some() {
@@ -327,6 +337,21 @@ fn load_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, Ser
         None,
         vec![b"h2".to_vec(), b"http/1.1".to_vec()],
     )
+}
+
+/// Readiness handle to a bound Ingress service, valid before and after
+/// `serve` consumes the service (the handle clones the gateway Arc).
+#[derive(Clone)]
+pub struct IngressReadiness {
+    gateway: Arc<Ingress>,
+}
+
+impl IngressReadiness {
+    /// The Ingress's own admission readiness: route store synchronized,
+    /// enabled entry paths initialized, and not draining.
+    pub fn ready(&self) -> bool {
+        self.gateway.ready()
+    }
 }
 
 fn send_error(error: Box<dyn std::error::Error>) -> ServiceError {
@@ -398,6 +423,7 @@ mod tests {
             backend_http_idle_timeout: Duration::from_secs(1),
             backend_http_acquire_timeout: Duration::from_secs(1),
             drain_timeout: Duration::from_millis(10),
+            ws_drain_mode: crate::config::WsDrainMode::ContinueUntilDeadline,
             allowed_client_networks: vec!["127.0.0.1/32".parse().unwrap()],
             allow_any_client: false,
             command_watch_max_subscriptions: 1,
