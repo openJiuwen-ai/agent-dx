@@ -105,11 +105,16 @@ pub fn create_input(
     let mut input = json!({
         "namespace":"adx", "name":name, "image":execution.image, "runtime":execution.isolation_runtime,
         "cpu":execution.resources.cpu_millis, "memory":execution.resources.memory_mib,
-        "inheritEntrypoint":true, "env":execution.env,
+        "env":execution.env,
         "ports":execution.service.iter().map(|service| service.port.to_string()).collect::<std::collections::BTreeSet<_>>(),
         "createTimeoutSeconds":timeout.as_secs().max(1),
         "restartPolicy":{"maxAttempts":3,"initialBackoffSeconds":5,"maxBackoffSeconds":60},
     });
+    if let Some(id) = &execution.snapshot_id {
+        input["snapshotId"] = json!(id);
+    } else {
+        input["inheritEntrypoint"] = json!(true);
+    }
     if network.runtime_policies.get(&execution.isolation_runtime)
         != Some(&RuntimeNetworkPolicy::Unrestricted)
     {

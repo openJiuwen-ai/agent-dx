@@ -20,5 +20,6 @@ pub mod workspace_affinity;
 
 mod directory;
 mod environment_directory;
+mod golden_preparation;
 
 mod volumes;
