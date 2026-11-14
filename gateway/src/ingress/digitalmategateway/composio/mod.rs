@@ -14,6 +14,9 @@ mod outlook;
 mod owner;
 #[cfg(unix)]
 mod startup;
+#[cfg(test)]
+mod subscription_tests;
+mod subscriptions;
 mod types;
 mod webhook;
 

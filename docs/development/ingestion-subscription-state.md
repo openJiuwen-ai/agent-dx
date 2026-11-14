@@ -76,3 +76,37 @@ removes the coordinator implementation; the initial compile also found an invali
 `TemplateRef` conversion, which was fixed before the isolated missing-constructor
 RED was rerun. No assertion or production owner was weakened. These cases do not
 prove provider OAuth, actual M44 transport, HTTP mount or Hong Kong acceptance.
+
+## Composio production adapters
+
+`composio/subscriptions.rs` implements both ports using the existing M44 proxy,
+project client, configured auth configs and PostgreSQL request budget. Assembly
+can call its component-local `coordinator(client, typed_owner, inbox)` and reuse
+the same typed M44 proxy. `Composio::subscriptions` is the explicit public
+composition entry. Neither starts another service or accepts a caller's key,
+namespace, upstream URL, trigger type or filter configuration.
+
+Intent reads use the existing signed `Intent` operation. Connection/Metadata and
+Intent must agree, and issuer routing before/after the owner reads must match.
+A generic HTTP404/transport failure is not interpreted as user opt-out; only the
+typed owner's explicit deleted state yields `None`.
+
+Provider operations use the [v3.1 trigger API](https://docs.composio.dev/reference/api-reference/triggers).
+The client lists with exact account/auth-config/user/type filters, checks every
+returned item, follows bounded cursors, and refuses ambiguous matches. The
+same-configuration upsert always names the connected account, then its returned
+trigger ID is independently resolved before registration. Lost completion is
+reconciled through listing, not blind creation. Disable preserves its target for
+retries. The basic Outlook profile watches the default inbox without sender,
+recipient, subject, importance or attachment filtering; another filtered trigger
+is never silently reused. Documented materialized inbox/null defaults are accepted.
+
+Seven actual loopback project-HTTP cases pass with synthetic provider responses,
+including exact-account creation, repeat/unknown reconciliation, wrong-user
+refusal, paginated ambiguity and avoiding filters that drop ordinary mail.
+Initial transport cases failed; after adding diagnostics and explicitly excluding
+loopback from the test process proxy, all seven pass without relaxing assertions
+or production TLS. Focused library Clippy and workspace formatting pass. The
+controlled project uses a synthetic key and namespace; these tests do not prove
+actual issuer/M44 transport or real provider authorization. HTTP/Prepared mounting
+and Hong Kong acceptance remain consumer work.
