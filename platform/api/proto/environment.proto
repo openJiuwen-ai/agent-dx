@@ -122,6 +122,43 @@ message RegisterNodeRequest {
   map<string, StorageMount> storage_mounts = 12;
   // Stable non-secret identities of configured shared checkpoint backends.
   repeated string checkpoint_scopes = 13;
+  // Structured node pressure snapshot; in-memory coordinator state only.
+  NodePressureReport pressure = 14;
+  // Node-level pressure disposal state; see NodePressureDisposition.
+  // v1: never set by adxlet, never read by the coordinator.
+  NodePressureDisposition pressure_disposition = 15;
+}
+
+// Node-local resource pressure snapshot from local hysteresis. The level is
+// authoritative state; percent is the observation that derived it. The
+// report is in-memory coordinator state only and is omitted while the node
+// has no successful sample (unconfigured or never observed).
+message NodePressureReport {
+  NodePressureResource memory = 1;
+  NodePressureResource disk = 2;
+  // Unix seconds of the last successful sample. Omitted (field absent) when
+  // zero: absent means "no trustworthy observation", never "observed at epoch".
+  uint64 observed_at_unix_seconds = 3;
+  // Consecutive failed samples since the last success.
+  uint32 consecutive_failures = 4;
+}
+message NodePressureResource {
+  NodePressureLevel level = 1;
+  // Last successful observation, 0-100.
+  uint32 percent = 2;
+  // Unix seconds of the last level transition; 0 = never transitioned.
+  uint64 last_transition_unix_seconds = 3;
+}
+enum NodePressureLevel { NODE_PRESSURE_LEVEL_NORMAL = 0; NODE_PRESSURE_LEVEL_HIGH = 1; }
+
+// Disposition of node-local pressure disposal. LOCAL = the local pause loop
+// is keeping up with pressure; RELOCATION = local disposal is exhausted and
+// the node requests central evacuation (v2; the coordinator then uses the
+// existing recovery path). v1 never sets this field (proto3 default NONE).
+enum NodePressureDisposition {
+  NODE_PRESSURE_DISPOSITION_NONE = 0;
+  NODE_PRESSURE_DISPOSITION_LOCAL = 1;
+  NODE_PRESSURE_DISPOSITION_RELOCATION = 2;
 }
 
 message StorageMount {

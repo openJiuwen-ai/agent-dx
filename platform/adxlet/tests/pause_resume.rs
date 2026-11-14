@@ -549,6 +549,7 @@ fn pause(revision: u64) -> PauseRequest {
         expected_revision: revision,
         retention: adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds: 600 },
         timeout_seconds: 60,
+        storage: None,
     }
 }
 fn resume(revision: u64) -> ResumeRequest {
@@ -1636,6 +1637,7 @@ async fn snapshot_publication_timeout_retry(runtime_class: &str, workload_pendin
                 expected_revision: flushed.record.revision,
                 retention: adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds: 60 },
                 timeout_seconds: 1,
+                storage: None,
             })
             .await
             .unwrap_err(),

@@ -28,7 +28,7 @@ labels!(EvidenceSource {
     BackendExit => "backend_exit", Probe => "probe", Reconcile => "reconcile",
     Coordinator => "coordinator", Control => "control", Unknown => "unknown",
 });
-labels!(OperationIntent { User => "user", Idle => "idle", Policy => "policy" });
+labels!(OperationIntent { User => "user", Idle => "idle", Policy => "policy", Pressure => "pressure" });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptionEvidence {

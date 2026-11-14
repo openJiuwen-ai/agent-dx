@@ -550,6 +550,8 @@ fn spawn_controller(
                 Control(Option<adx_core::runtime::RuntimeStatus>),
                 Exit(Result<adx_core::RuntimeFailure>),
                 Proxy(Result<(String, u64, u64)>),
+                /// A pressure observation round reported High pressure.
+                Pressure,
                 Deadline,
                 RunDeadline,
             }
@@ -584,6 +586,17 @@ fn spawn_controller(
                         }
                         routes.activity_changed(&record, proxy_stamp).await
                     } => Wake::Proxy(proxy),
+                    _ = async {
+                        // Subscribe wide, act narrow: every environment wakes on
+                        // a High round; the board verdict decides inside the
+                        // handler, so future scope changes touch one place.
+                        let Some(signal) = observers.pressure_signal.as_mut() else {
+                            return std::future::pending().await;
+                        };
+                        if signal.changed().await.is_err() {
+                            std::future::pending::<()>().await
+                        }
+                    } => Wake::Pressure,
                     _ = async {
                         match deadline {
                             Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -636,6 +649,21 @@ fn spawn_controller(
                 }
                 Wake::Proxy(status) => {
                     controller.proxy_observed(status);
+                    continue;
+                }
+                Wake::Pressure => {
+                    // The bell only wakes; the board read and the verdict
+                    // happen inside consider_pressure_pause. A failure warns
+                    // without backoff: the budget slot is spent and the next
+                    // High round naturally re-evaluates. A failed reopen
+                    // arms the retrying admission recovery, so a stranded
+                    // quiesced route also converges after the pressure
+                    // subsides.
+                    let result = controller.consider_pressure_pause().await;
+                    controller.trace_observation_error("pressure.pause", &result);
+                    if let Err(error) = result {
+                        adx_observability::warn!(%error, "pressure pause incomplete");
+                    }
                     continue;
                 }
                 Wake::RunDeadline => {
@@ -1005,6 +1033,23 @@ impl Controller {
     }
 }
 
+/// Attribution source of an automatic pause: natural idleness or node
+/// pressure. The guard records it so the operation metrics family can
+/// attribute the pause to the trigger that actually started it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PauseOrigin {
+    Idle,
+    Pressure,
+}
+
+/// In-flight bookkeeping for one automatic pause: the activity stamp and
+/// demand it was admitted against, plus the origin that triggered it.
+pub(super) struct AutoPauseGuard {
+    pub stamp: (String, u64, u64),
+    pub demand: u64,
+    pub origin: PauseOrigin,
+}
+
 struct Controller {
     submissions: Arc<Submissions>,
     run_timer: Option<run_timer::RunTimer>,
@@ -1016,7 +1061,7 @@ struct Controller {
     capture_preparation: Option<(adx_core::CompletedOperation, std::path::PathBuf)>,
     snapshot_publication: Option<snapshots::SnapshotPublication>,
     create_deadline: Option<tokio::time::Instant>,
-    auto_pause_guard: Option<((String, u64, u64), u64)>,
+    auto_pause_guard: Option<AutoPauseGuard>,
     demand: Arc<std::sync::atomic::AtomicU64>,
     observed_demand: u64,
     recovery_files: Option<crate::checkpoint::RestoreAccess>,

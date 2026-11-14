@@ -61,7 +61,13 @@ unknown、失败和取消不进入成功耗时样本；后续确认成功不补�
 | `adx_environment_recovery_results_total` | counter/恢复裁定 | 新增 result=recovered、unrecoverable、closed_by_user | Coordinator 与 env 结果同 Redis CAS |
 | `adx_environment_unrecovered` | gauge/env | 新增 state=waiting、recovering、unrecoverable；当前保留摘要 | Coordinator 当前目录 |
 | `adx_environment_operation_unknown` | gauge/env | 新增；操作意图已发布、节点随后失联的当前对象 | Coordinator 当前目录 |
-| `adx_environment_lifecycle_operations_total` | counter/操作调用 | 新增 operation=reload、delete、pause；intent=user、idle、policy；outcome=success、failure、unknown、cancelled | adxlet 操作结束 |
+| `adx_environment_lifecycle_operations_total` | counter/操作调用 | 新增 operation=reload、delete、pause；intent=user、idle、pressure、policy；outcome=success、failure、unknown、cancelled | adxlet 操作结束 |
+| `adx_node_pressure_pause_skipped_total` | counter/次评估 | 新增 reason=budget_exhausted、in_flight_exhausted、window_too_young；启动即导出零基线 | adxlet 压力暂停评估被拒或豁免 |
+| `adx_node_pressure_level` | gauge/等级 | 新增 resource=memory、disk；0=Normal、1=High；仅压力采样已配置的节点导出 | adxlet 当前板值 |
+| `adx_node_pressure_percent` | gauge/百分比 | 新增 resource=memory、disk；0-100 | adxlet 当前板值 |
+| `adx_node_pressure_last_transition_unix_seconds` | gauge/Unix 秒 | 新增 resource=memory、disk；从未观测时为 0 | adxlet 当前板值 |
+| `adx_node_pressure_observed_at_unix_seconds` | gauge/Unix 秒 | 新增；从未成功采样时为 0，该组 gauge 仅在配置压力采样的节点存在 | adxlet 当前板值 |
+| `adx_node_pressure_consecutive_failures` | gauge/轮数 | 新增；连续采样失败轮数，成功采样归零；等级冻结仍可见 | adxlet 当前板值 |
 | `adx_observability_snapshot_age_seconds` | gauge/秒 | 新增；距成功读取持久化累计数的本地时间 | Coordinator，约每秒刷新 |
 | `adx_observability_history_known` | gauge/布尔 | 新增；是否具有可信统计覆盖起点，尚未确认起点时为 0 | Coordinator |
 | `adx_observability_started_timestamp_seconds` | gauge/Unix 秒 | 新增；可信统计覆盖起点，未知时不导出 | Coordinator |
@@ -70,8 +76,10 @@ unknown、失败和取消不进入成功耗时样本；后续确认成功不补�
 API errors/rejections and adxlet lifecycle-operation producers export bounded
 zero-valued label tuples from startup, allowing `increase()` to observe their
 first event after a prior scrape. Lifecycle baselines include reload/user,
-pause/user-or-idle, and delete/user-or-idle-or-policy; raw error details never
-become labels. Events before the first scrape remain outside this guarantee.
+pause/user-idle-or-pressure, and delete/user-idle-or-policy; raw error details
+never become labels. Events before the first scrape remain outside this
+guarantee. The pressure-pause skip counter follows the same discipline with
+one baseline per reason.
 
 API/adxlet counter 为进程内计数，重启归零；取消计数不等于用户主动取消，也不等于平台失败。
 Coordinator 业务累计数与权威状态原子写入 Redis，重连、普通重启及回放不归零。

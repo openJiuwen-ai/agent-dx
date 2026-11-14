@@ -9,6 +9,29 @@ pub struct PauseRequest {
     pub expected_revision: u64,
     pub retention: adx_core::lifecycle::RetentionPolicy,
     pub timeout_seconds: u64,
+    /// Single-shot storage override. `None` keeps the Spec's pause policy
+    /// storage; only `Shared` may override, because an automatic pause must
+    /// not weaken a Spec's stronger storage requirement.
+    pub storage: Option<adx_core::lifecycle::CheckpointStorage>,
+}
+impl PauseRequest {
+    /// Resolve the effective checkpoint storage against the Spec's pause
+    /// policy storage. Explicit `Shared` overrides; anything other than
+    /// `None` or `Shared` is rejected as an invalid override direction.
+    pub fn resolve_storage(
+        &self,
+        spec_storage: adx_core::lifecycle::CheckpointStorage,
+    ) -> Result<adx_core::lifecycle::CheckpointStorage> {
+        match self.storage {
+            None => Ok(spec_storage),
+            Some(adx_core::lifecycle::CheckpointStorage::Shared) => {
+                Ok(adx_core::lifecycle::CheckpointStorage::Shared)
+            }
+            Some(_) => Err(Error::Invalid(
+                "pause storage override only allows shared".into(),
+            )),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeRequest {
@@ -159,4 +182,46 @@ impl CheckpointCooperation for crate::runtime_control::RuntimeControlClient {
 pub(crate) struct CheckpointServices {
     pub store: std::sync::Arc<dyn CheckpointAccess>,
     pub cooperation: std::sync::Arc<dyn CheckpointCooperation>,
+}
+
+#[cfg(test)]
+mod pause_request_storage_tests {
+    use super::*;
+    use adx_core::lifecycle::{CheckpointStorage, RetentionPolicy};
+
+    fn request(storage: Option<CheckpointStorage>) -> PauseRequest {
+        PauseRequest {
+            operation_id: "pause-1".into(),
+            expected_revision: 1,
+            retention: RetentionPolicy::Ttl { ttl_seconds: 60 },
+            timeout_seconds: 30,
+            storage,
+        }
+    }
+
+    #[test]
+    fn no_override_keeps_the_spec_storage() {
+        let request = request(None);
+        for spec in [CheckpointStorage::Configured, CheckpointStorage::Local] {
+            assert_eq!(request.resolve_storage(spec), Ok(spec));
+        }
+    }
+
+    #[test]
+    fn shared_override_wins_over_any_spec_storage() {
+        let request = request(Some(CheckpointStorage::Shared));
+        for spec in [CheckpointStorage::Configured, CheckpointStorage::Local] {
+            assert_eq!(request.resolve_storage(spec), Ok(CheckpointStorage::Shared));
+        }
+    }
+
+    #[test]
+    fn weaker_override_directions_are_rejected() {
+        for storage in [CheckpointStorage::Local, CheckpointStorage::Configured] {
+            let request = request(Some(storage));
+            for spec in [CheckpointStorage::Configured, CheckpointStorage::Local] {
+                assert!(request.resolve_storage(spec).is_err());
+            }
+        }
+    }
 }

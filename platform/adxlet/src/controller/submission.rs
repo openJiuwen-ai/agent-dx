@@ -324,6 +324,7 @@ mod tests {
             expected_revision: 1,
             retention: adx_core::lifecycle::RetentionPolicy::default(),
             timeout_seconds: 60,
+            storage: None,
         }))
     }
 
