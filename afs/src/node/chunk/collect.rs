@@ -113,19 +113,32 @@ impl LocalChunkStore {
             }
             next.remove_record(id);
         }
+        #[cfg(test)]
+        catalog_power_loss_tests::cut("GC unlinked chunks");
         File::open(&self.chunks)?.sync_all()?;
+        #[cfg(test)]
+        catalog_power_loss_tests::directory_synced(&self.chunks);
         File::open(&self.outboards)?.sync_all()?;
         // Persist progress before ACK, and before removing any covered journal.
         // A crash before this point leaves Meta's deletion barrier in place.
         save_checkpoint(&self.root, &next)?;
         *catalog = next;
-        OpenOptions::new()
+        let wal = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&self.catalog_path)?
-            .sync_all()?;
+            .open(&self.catalog_path)?;
+        #[cfg(test)]
+        catalog_power_loss_tests::cut("GC truncated WAL");
+        wal.sync_all()?;
+        drop(wal);
+        #[cfg(test)]
+        catalog_power_loss_tests::file_synced(&self.catalog_path);
         self.root_dir.sync_all()?;
+        #[cfg(test)]
+        catalog_power_loss_tests::directory_synced(&self.root);
+        // Truncation preserves the name and can also create the first WAL.
+        self.catalog_name_durable.store(true, Ordering::Relaxed);
         Ok(removed)
     }
 }

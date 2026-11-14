@@ -84,7 +84,8 @@ impl LocalChunkStore {
         // A prior failed sync may have left a complete transaction in the OS
         // cache. Validate first, then persist both WAL and its name before a
         // reopened store may issue a healthy replay ACK.
-        if catalog_path.exists() {
+        let catalog_name_durable = catalog_path.exists();
+        if catalog_name_durable {
             sync_store_catalog(&catalog_path)?;
             sync_store_directory(&root)?;
         }
@@ -100,6 +101,7 @@ impl LocalChunkStore {
             outboard_budget: OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES),
             outboard_repairs: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
             catalog_path,
+            catalog_name_durable: AtomicBool::new(catalog_name_durable),
             catalog: Mutex::new(catalog),
             #[cfg(any(feature = "dfs", test))]
             read_cache_admission: Mutex::new(()),
@@ -665,6 +667,8 @@ impl LocalChunkStore {
         {
             let _diagnostic = self.coarse_diagnostic("persist_body_sync", item.chunk.length);
             file.sync_all().map_err(Error::from)?;
+            #[cfg(test)]
+            catalog_power_loss_tests::file_synced(&temp_path);
         }
         let final_path = self.chunk_path(&item.chunk.id);
         if replace_existing {
@@ -690,6 +694,8 @@ impl LocalChunkStore {
             }
             fs::remove_file(&temp_path).map_err(Error::from)?;
         }
+        #[cfg(test)]
+        catalog_power_loss_tests::cut("chunk installed");
         Ok((temp_path, final_path))
     }
 
