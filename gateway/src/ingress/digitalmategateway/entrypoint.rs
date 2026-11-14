@@ -331,9 +331,7 @@ impl DigitalMateGatewayApi {
                     }),
                     &self.config.tenant,
                     #[cfg(unix)]
-                    self.privacy
-                        .as_ref()
-                        .map(|privacy| privacy.identity.clone()),
+                    self.privacy.as_ref().map(|privacy| privacy.access.clone()),
                 )
                 .await;
         }
