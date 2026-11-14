@@ -2254,7 +2254,7 @@ fn owner_caller(ctx: &RequestContext) -> afs_protocol::node_data::OwnerCaller {
 }
 
 #[cfg(feature = "ownerfs")]
-fn root_access(grant: &RootGrant) -> RootAccess {
+pub(crate) fn root_access(grant: &RootGrant) -> RootAccess {
     RootAccess {
         root_id: grant.id.0.clone(),
         root_epoch: grant.epoch,
@@ -2337,7 +2337,10 @@ fn remote_file(
 }
 
 #[cfg(feature = "ownerfs")]
-fn owner_entry(grant: &RootGrant, attr: Option<OwnerFileAttr>) -> afs_error::Result<OwnerEntry> {
+pub(crate) fn owner_entry(
+    grant: &RootGrant,
+    attr: Option<OwnerFileAttr>,
+) -> afs_error::Result<OwnerEntry> {
     let attr = attr.ok_or_else(|| protocol_error("OwnerFileAttr missing"))?;
     let identity = attr
         .identity

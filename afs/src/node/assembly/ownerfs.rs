@@ -202,7 +202,7 @@ pub(super) async fn assemble(
         } else {
             vfs::ownerfs::OwnerFs::new_local_with_remote(roots, disk, remote_factory)
         };
-        let owner = Arc::new(owner);
+        let owner = Arc::new(owner.with_workspace_defaults(cfg.workspace_default_identity()?));
         if let Some(mm) = owner.mount_manager() {
             mm.attach_owner(&owner);
             // Startup egress reconciliation (D4 §4.4): detach residual bind
@@ -347,6 +347,25 @@ impl OwnerPeerReaper {
 
     /// Start the reaper as one service; it stops with `services.stop`.
     pub(super) fn start(self, services: &mut Services) {
+        let deletion_fs = self.ownerfs.clone();
+        let deletion_stop = services.stop.subscribe();
+        services.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            let shutdown = cancelled(deletion_stop);
+            tokio::pin!(shutdown);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    _ = tick.tick() => {
+                        let fs = deletion_fs.clone();
+                        match crate::node::bridge::spawn_blocking(move || fs.maintain_workspace_deletions()).await {
+                            Ok(Ok(())) => {},
+                            result => afs_logging::warn!("ownerfs.deletion_maintenance_retry"; "result" => ?result),
+                        }
+                    }
+                }
+            }
+        });
         let ownerfs = self.ownerfs;
         let stop = services.stop.subscribe();
         services.spawn(async move {

@@ -278,6 +278,38 @@ fn node_session_liveness_uses_strict_expiry_boundary() {
 }
 
 #[test]
+fn force_delete_condition_rechecks_the_current_home_incarnation() {
+    let mut state = MemoryState::default();
+    let condition = TxnCondition::NodeSessionUnavailable {
+        node_id: "home".into(),
+    };
+    assert!(condition_matches(&state, &condition));
+    let key = MetaKey::CurrentNodeSession {
+        node_id: "home".into(),
+    };
+    state.entities.insert(
+        key.clone(),
+        VersionedEntity {
+            revision: StoreRevision(1),
+            entity: MetaEntity::NodeSession(session("home", "old", 0)),
+        },
+    );
+    assert!(condition_matches(&state, &condition));
+    state.entities.insert(
+        key,
+        VersionedEntity {
+            revision: StoreRevision(2),
+            entity: MetaEntity::NodeSession(session(
+                "home",
+                "restarted",
+                now_unix_ms().saturating_add(60_000),
+            )),
+        },
+    );
+    assert!(!condition_matches(&state, &condition));
+}
+
+#[test]
 fn snapshot_bytes_are_independent_of_hash_map_insertion_order() {
     fn state_in_order(nodes: &[&str]) -> StoreState {
         let mut state = MemoryState {

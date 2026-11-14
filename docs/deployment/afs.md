@@ -389,6 +389,87 @@ OwnerFs workspace bind 的 3 个键目前没有启动 WARN。
 
 **Meta 专用键写在 Node 配置里**。`meta_*` 13 个调优键、`dfs_desired_copies`、`dfs_sync_required_copies`、`dfs_min_distinct_nodes`、`dfs_min_distinct_failure_domains`、`dfs_local_copy`、`dfs_replica_failure_policy`、`dfs_min_degraded_copies`、`dfs_gc_grace_ms` 写在 Node 配置里不会报错：Node 只解析和校验，不使用这些值，修改它们不会改变 Meta 的行为，副本策略以 Meta 配置为准。配置了 `dfs_external_backend` 时，Node 还会校验那 4 个副本计数都是 `1`、`dfs_local_copy` 是 `required`，否则启动失败。`meta_store` 写成 `local-file` 或 `memory` 时在 Node 配置里同样不生效，Node 通过注册结果判断 Meta 的持久能力；写成 `redis` 或 `etcd` 时 Node 一定启动失败（这两个取值要求的 `meta_redis_url`／`meta_etcd_endpoints` 在 Node 上被拒绝）。例外共 5 个键，写在 Node 配置里（TOML 或 CLI）会启动失败（`CONFIG_INVALID`）：`ownerfs_mkdir_load_balance`、`meta_redis_url`、`meta_etcd_endpoints`、`meta_etcd_max_request_bytes`、`meta_store_prefix`（`afs/src/config/common.rs`）。Node 专用键写在 Meta 配置里也只解析和校验，例外是 `experimental_ownerfs_workspace_bind = true` 与 `dfs_peer_cache`，在 Meta 上会启动失败（`afs/src/config/dfs.rs`）。
 
+## OwnerFs Workspace API
+
+AFS 仍需 `ADX_WITH_AFS=1` 显式构建。未配置 `[ownerfs_workspace_api]` 时不监听，配置合法即启用，无额外开关；启用时必须使用 Node、OwnerFs FUSE 挂载及 outlet，不要求 `experimental_ownerfs_workspace_bind`。配置示例中其他 TLS、Meta 和节点参数仍须填写：
+
+```toml
+fs = "ownerfs"
+data_dir = "/opt/adx/data/afs/node"
+ownerfs_mount = "/mnt/adx/ownerfs"
+outlet_public_root = "/opt/adx/workspaces"
+outlet_import_root = "/opt/adx/imports"
+outlet_users_root = "/opt/adx/data/afs/node/ownerfs"
+outlet_nfs_addr = "192.168.2.10"
+# 可省略：Home 启动时查询 agentos；账号不存在回落到 1000。
+ownerfs_workspace_default_user = "agentos"
+# 显式 uid/gid 分别覆盖账号查询结果。
+# ownerfs_workspace_default_uid = 1000
+# ownerfs_workspace_default_gid = 1000
+[ownerfs_workspace_api]
+listen = "127.0.0.1:18889"
+```
+
+API 为明文 HTTP、无鉴权，应通过主机防火墙或受控代理限制到 Gateway、resolver 与运维网络。监听不得与 Node gRPC、REST 地址冲突。内部 RPC 的 mTLS 与证书到 Node ID 绑定继续必需。AFS Node `id` 必须与同主机 adxlet `node_id` 相同，ADX resolver 的 Workspace API endpoint 指向该监听；本次不修改 ADX 组件。
+
+所有节点使用相同的 public root 和 users root 路径。afs-node 必须处在宿主挂载命名空间并有挂载权限；public root 提前挂为独立 tmpfs。数据布局为：
+
+```text
+<data_dir>/
+├── ownerfs/                        # 正常导出根
+│   ├── root-<hex(owner)>-e<epoch>/
+│   ├── .ownerfs-roots/              # catalog
+│   ├── .ownerfs-root-catalog.lock
+│   └── .ownerfs-trash/              # 待回收旧代次，root 0700
+```
+
+默认 NFS import 使用 `noresvport`，服务端导出须允许受信节点的非特权源端口（exports 的 `insecure`）；限制客户端地址，不能照搬到任意来源的导出。
+
+各节点 data_dir 使用同一路径，`outlet_users_root` 直接指向现有真实 `<data_dir>/ownerfs`。import 挂载点中的 `users/` 是既有名称，不表示物理存储多一层目录。现有 outlet 在二次 bind 导出别名时会误判本机 import 来源并反复重挂，因此使用真实路径直接导出；该根包含 catalog 和 trash（均为 root 0700），本次不增加导出隔离保证，仅限受信节点访问。NFS 服务端和访问控制由部署方准备，Node 维护本机 bind/远端 NFS import。
+
+创建的就绪检查以 afs-node 凭据写临时探针，导出策略必须允许该凭据写入 workspace；root_squash 后的匿名身份可能无法写入默认 0700 目录。返回成功不授予调用方额外权限，调用方须匹配 uid/gid/mode。线协议为 9，Meta 与 Node 同版本升级；Meta 持久格式不变。
+
+| 请求 | 当前行为 |
+| --- | --- |
+| `POST /v1/workspaces` | JSON owner、可选 uid/gid、八进制字符串 mode（默认 0700）；新建 201/created=true，已有且属性一致 200/created=false，漂移 409；只等待入口 outlet 可读写 |
+| `GET /v1/workspaces/{owner}` | 返回 owner、epoch、node_id、node_ip、uid、gid、mode、state=ready、access_path=`<outlet_public_root>/<owner>`；Home 不可达时属性为 null；不存在或已隔离待注销时 404 |
+| `GET /v1/workspaces?node_ip=<IP>` | 运维列表，items、total、complete；全局 Active 快照在入口按 IP 值过滤；地址和属性补全共用预算，无法补全时为 null；IP 筛选遇到 Home 会话过期或地址未知时 complete=false |
+| `DELETE /v1/workspaces/{owner}[?epoch=N]` | 删除 owner 当前的 workspace；带 epoch 时与当前代次不符返回 409；Home 将该 epoch 移出正常路径并完成 Meta 注销后返回 200；磁盘空间后台回收；已删或不存在均返回 200，响应体为 `{"owner":"<owner>"}` |
+| `DELETE /v1/workspaces/{owner}?force=true[&epoch=N]` | Home 会话有效仍走普通删除，data_lost=false；失效后由 Meta 条件清归属，data_lost=true；不存在 404 |
+| `GET /healthz` | 当前 Node Meta 会话有效返回 200；无法确认返回 503 |
+
+owner 为 1～64 字节 ASCII，首字母或数字，其余可含 `._-`；uid/gid 小于 4294967295，mode 为 0000～7777 的八进制字符串。force 接受 true/false/1/0。DELETE 的 epoch 参数可选：不带时与 #85 一致，删除当前 workspace，单个请求绑定 API 节点读到的 epoch，但超时后的重试删除重试时的当前 workspace；带上创建或查询返回的 epoch 时，与当前代次不符返回 409，重试不会误删同名重建的新 workspace；epoch 必须为正整数。非法参数 400；创建和删除的权限错误 403、状态冲突 409、内部错误 500，均不带 Retry-After。Meta、Home 不可达、路径未就绪或操作超时为 503，并带 Retry-After: 1。错误 JSON 为 code/message，message 保留 AFS 错误码。
+
+```bash
+curl -sS -H 'Content-Type: application/json' -d '{"owner":"alice"}' http://127.0.0.1:18889/v1/workspaces
+curl -fsS http://127.0.0.1:18889/v1/workspaces/alice
+curl -sS -X DELETE http://127.0.0.1:18889/v1/workspaces/alice
+```
+
+POST 成功只保证入口的这代路径就绪；超时后 workspace 可能已激活，可重试核对属性。激活响应丢失导致 Home 缓存缺失时，POST 和 DELETE 按原 epoch、catalog 身份及 Meta 当前授权恢复，无需重启 Home。新建 POST 在准备成功后核对 reservation 的 epoch 和 Home，期间被同名重建替换则返回 409。
+
+入口路径探针要访问远端 Home 的 NFS（`hard` 挂载），Home 宕机时会阻塞且超时无法取消。每个 API 节点对同一 Home 最多同时执行 2 个探针，名额用完的创建请求立即返回 503，不影响其他 Home、`/healthz` 和删除收尾；请求开始执行前已超过截止时间的直接返回 503。其他操作不限并发，与 #85 一致。
+
+列表地址与归属不保证来自同一原子快照。地址及属性补全的截止时间为请求进入后的 `timeout_ms / 2`，本机属性读取和远端 RPC 都受剩余时间约束；失败或预算耗尽后保留不带筛选的全部归属记录，未补全的地址或属性为 null。
+
+`node_ip` 返回 gRPC 发布地址中的 host。IP 筛选只匹配 IP 字面量，不执行 DNS 查询；地址未确认或为主机名的 Home 不返回，并标记 complete=false。不带筛选时返回全部归属，complete=true。total 为本次返回条目数，complete 不表示属性完整。
+
+远端属性读取需从 Meta 申请 Lookup 授权，会写入授权及请求结果记录；查询不修改 workspace 归属和目录内容。已隔离待注销的代次在 GET 中返回 404，在列表中属性为 null，同名 POST 返回 503 claim_conflict。创建、查询和列表的 state 恒为 ready：接口是同步语义，没有中间状态，该字段只为兼容 #85 客户端保留（ADX 亲和 resolver 只接受 ready，其他取值会使亲和失效或在 fail_closed 下创建失败）。access_path 恒为 `<outlet_public_root>/<owner>`；只有 POST 在返回前确认入口节点上的该路径可读写，查询和列表不执行入口探针。
+
+DELETE 前调用方必须停止使用该 workspace 的环境并排空 fd/bind/NFS 访问。本机 ext4 和远端 NFS 不经过 FUSE，rename 不撤销已有 fd、bind 或 NFS 句柄；接口不承诺强制中断既有访问，也不等待全部节点的软链同步撤下。未排空的写入不会使删除失败，只会让 trash 回收遇到 `ENOTEMPTY` 并推迟空间回收。
+
+本机和远端删除走同一执行路径；远端请求校验证书对应节点的当前 Meta 会话。Home 在 workspace 锁内核对 Meta 归属、epoch 和 catalog 路径，将目录原子 rename 到存储根内的 `<data_dir>/ownerfs/.ownerfs-trash/` 并同步存储根，再撤销本机准入、条件注销 Meta、移除缓存和 catalog，才返回成功。rename 前的确定失败（含 Meta 预检失败）保留正常访问；rename 后的失败返回 503，不恢复原路径，按原 epoch 重试或由后台维护完成注销，注销后同名创建使用新 epoch。
+
+注销完成前 Meta 仍保留原归属，outlet 名字可能仍在但指向的目录已移走。Home 按 catalog 与 trash 位置识别已隔离代次，不为它补齐缓存或接受远端访问；启动恢复同样只向前完成注销，会话变化时先换绑当前会话。原目录与 trash 都不存在时直接完成注销。后台维护每 10 秒运行，重试已隔离代次的注销，并只清理 Meta 已无该 epoch 或已出现更新 epoch、且 catalog 不再引用的 trash 项；清理失败保留垃圾项并告警，不恢复原路径、不影响新代次。
+
+trash 位于存储根内，rename 不跨文件系统或挂载点，不需要额外的同盘约束。
+
+force 清归属不确认旧盘删除，原 Home 数据保留；同名重建使用新 epoch 和独立目录；新 reservation 已隔离的旧代次非空目录保留供人工清理，不阻塞重建。
+
+API 操作和内部 RPC 复用 `timeout_ms`（默认 5000 毫秒）。超时返回 503 不表示删除未提交，操作及后台收尾可能继续，可直接重试。普通删除成功表示逻辑删除完成，不表示磁盘空间已回收。后台清理复用本地安全递归删除：不跟随符号链接，不递归到不同 st_dev，嵌套超过 256 层则保留垃圾项并告警；同设备 bind 不在此检测范围。
+
+通过 Node REST `/metrics` 观察 `afs_workspace_api_requests_total`、`afs_workspace_api_duration_seconds`、`afs_workspace_outlet_wait_seconds`。
+
 ## OwnerFs workspace bind ON
 
 普通发行默认关闭 workspace bind。当前实际试用场景需要显式开启，示例字段以 `build/config/examples/afs/node.toml` 为准。
@@ -430,6 +511,10 @@ AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集�
 5. 用**同一版本**的二进制先启动 Meta，再启动全部 Node。
 
 回滚只能用旧二进制配旧的完整数据目录与旧桶，不得让旧二进制打开新目录。
+
+#### 协议 8→9（OwnerFs Workspace API）
+
+协议 9 只改线协议：`PrepareOwnerRoot` 的 uid、gid 改为可选，并新增 `WorkspaceDefaults`、`DeleteWorkspace`、`ForceDeactivateRoot`。Meta 数据目录、WAL、checkpoint、Node catalog 的格式都不变，第 3 步保留原数据目录与 chunk 目录。必须先停全部 Node，再停 Meta，然后用同一版本先启动 Meta、再启动 Node。版本 8 的 Node 会在注册时被拒（`META_NODE_PROTOCOL_VERSION`），避免旧 Node 显式传入的 uid/gid 0 被新 Home 当成"未指定"而改用默认属主。
 
 #### 协议 7→8（第 2 轮元数据协议）
 
