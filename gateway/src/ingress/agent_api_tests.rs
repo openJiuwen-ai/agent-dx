@@ -206,6 +206,291 @@ async fn remote_control(
     adx_agent_api::activator::ActivatorClient::new(vec![url], token.into(), timeout, None, true)
         .unwrap()
 }
+
+#[tokio::test]
+#[cfg(feature = "mock-e2e")]
+async fn service_readiness_uses_current_execution_without_replaying_or_rebuilding_old_work() {
+    service_readiness_during_refused_listener(false).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "mock-e2e")]
+async fn service_readiness_rejects_rebuilt_binding_during_refused_listener() {
+    service_readiness_during_refused_listener(true).await;
+}
+
+#[cfg(feature = "mock-e2e")]
+async fn service_readiness_during_refused_listener(rebuilt: bool) {
+    use crate::ingress::agent_service::{AgentV2Access, ServiceSelector};
+    use crate::{common::protocol::GatewayPolicy, node::Relay};
+    use adx_agent_api::{local::LocalControl, managed::ManagedService, request::RequestContext};
+    use adx_agent_core::{Protocol, Scope, TemplateRef};
+    use adx_agent_store::{Check, Key, Put, Record, Repository, Transaction};
+    use http::Method;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let receiver = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = receiver.local_addr().unwrap().port();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let observed = writes.clone();
+    let receiving = tokio::spawn(async move {
+        let (mut socket, _) = receiver.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+            let mut bytes = [0; 1024];
+            let count = socket.read(&mut bytes).await.unwrap();
+            assert_ne!(count, 0);
+            request.extend_from_slice(&bytes[..count]);
+            assert!(request.len() <= 8192);
+        }
+        observed.fetch_add(1, Ordering::SeqCst);
+        // The application has consumed a write, but loses its response.
+        // Neither the returned common stream nor its caller may replay it.
+        socket.shutdown().await.unwrap();
+    });
+    let repository = Arc::new(MemoryRepository::default());
+    let state = AgentState::new(repository.clone());
+    let backend = Arc::new(Backend::default());
+    let activator = Arc::new(adx_activator::Activator::new(
+        state.clone(),
+        backend.clone(),
+    ));
+    let managed = Arc::new(ManagedService::new(Arc::new(LocalControl::new(
+        activator.clone(),
+    ))));
+    let draft = serde_json::from_value(serde_json::json!({
+        "name":"admitted", "image":"app:1", "isolation_runtime":"runc",
+        "resources":{"cpu_millis":250,"memory_mib":256},
+        "service":[{"protocol":"http","port":port}]
+    }))
+    .unwrap();
+    activator.publish("tenant", &draft).await.unwrap();
+    let scope = Scope {
+        tenant: "tenant".into(),
+        template: "admitted".into(),
+        template_ref: TemplateRef::Version("1".into()),
+        binding_id: "alice".into(),
+    };
+    let (first, _) = managed
+        .resolve(
+            &RequestContext::new(Duration::from_secs(3)),
+            &scope,
+            Protocol::Http,
+            Some(port),
+        )
+        .await
+        .unwrap();
+    let access = AgentV2Access::new(managed.clone());
+    let old_selection = access
+        .select_with_initializer(
+            Arc::new(RequestContext::new(Duration::from_secs(3))),
+            scope.clone(),
+            ServiceSelector {
+                protocol: Protocol::Http,
+                port: Some(port),
+            },
+            async { Err::<adx_agent_core::mounts::Parameters, _>(adx_agent_api::Error::NotFound) },
+        )
+        .await
+        .unwrap();
+
+    // The same logical Binding can move to another execution. The identity
+    // admission stays valid, while the shared access layer resolves its route.
+    let mut replacement = first.binding.clone();
+    replacement.current.environment_id = uuid::Uuid::new_v4().to_string();
+    if rebuilt {
+        replacement.generation = uuid::Uuid::new_v4().to_string();
+    }
+    let mut observation = backend
+        .0
+        .lock()
+        .unwrap()
+        .get(&(
+            scope.tenant.clone(),
+            first.binding.current.environment_id.clone(),
+        ))
+        .unwrap()
+        .clone();
+    observation
+        .id
+        .clone_from(&replacement.current.environment_id);
+    backend
+        .0
+        .lock()
+        .unwrap()
+        .insert((scope.tenant.clone(), observation.id.clone()), observation);
+    let key = Key::new(
+        "binding",
+        &[
+            &scope.tenant,
+            &scope.template,
+            scope.template_ref.kind(),
+            scope.template_ref.name(),
+            &scope.binding_id,
+        ],
+    )
+    .unwrap();
+    let old = repository.get(&key).await.unwrap().unwrap();
+    let relay = Arc::new(
+        Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
+            .parse()
+            .unwrap()]))
+        .with_route_enforcement(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let serving = relay.clone();
+    let relay_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let serving = serving.clone();
+            tokio::spawn(async move {
+                let _ = serving.serve_h2(stream).await;
+            });
+        }
+    });
+    let route:crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({
+        "instanceID":replacement.current.environment_id, "instanceStatus":{"code":3},
+        "tenantID":"tenant", "environmentID":"replacement-runtime", "environmentIP":"127.0.0.1", "nodeProxyAddress":address.to_string()
+    })).unwrap();
+    relay
+        .activate_route(
+            route.instance_id.clone(),
+            route.environment_id.clone(),
+            route.environment_ip.parse().unwrap(),
+        )
+        .await;
+    let (gateway, _, routes) = fixture_with_routes().await;
+    routes.put(route);
+    // Route-store revocation may lag the Agent owner. Keep the old route
+    // present, but its receiver refuses connections throughout this test.
+    let old_route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({
+        "instanceID":first.binding.current.environment_id, "instanceStatus":{"code":3},
+        "tenantID":"tenant", "environmentID":"old-runtime", "environmentIP":"127.0.0.2", "nodeProxyAddress":address.to_string()
+    })).unwrap();
+    relay
+        .activate_route(
+            old_route.instance_id.clone(),
+            old_route.environment_id.clone(),
+            old_route.environment_ip.parse().unwrap(),
+        )
+        .await;
+    routes.put(old_route);
+    let watching = relay.clone();
+    let changing_repository = repository.clone();
+    let changed_binding = replacement.clone();
+    let changing = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while watching.metrics().connect_errors == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(changing_repository
+            .commit(
+                &Transaction::new(
+                    vec![Check {
+                        key: key.clone(),
+                        expected: Some(old.revision)
+                    }],
+                    vec![Put {
+                        key,
+                        record: Record::new(&changed_binding).unwrap()
+                    }]
+                )
+                .unwrap()
+            )
+            .await
+            .unwrap());
+    });
+    let connected = access
+        .connect_service_when_ready(&gateway, old_selection)
+        .await;
+    changing.await.unwrap();
+    if rebuilt {
+        assert!(matches!(
+            connected,
+            Err(crate::ingress::agent_service::ServiceAccessError::Agent(
+                adx_agent_api::Error::Conflict(_)
+            ))
+        ));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.0.lock().unwrap().len(), 2);
+        assert_eq!(
+            state.binding(&scope).await.unwrap().unwrap().generation,
+            replacement.generation
+        );
+        receiving.abort();
+        relay_task.abort();
+        return;
+    }
+    let stream = connected.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    let connection_task = tokio::spawn(connection);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/owner")
+        .header("host", "owner")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    assert!(sender.send_request(request).await.is_err());
+    receiving.await.unwrap();
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    connection_task.abort();
+
+    activator.delete_binding(&scope).await.unwrap();
+    let before = backend.0.lock().unwrap().len();
+    assert!(access
+        .select_with_initializer(
+            Arc::new(RequestContext::new(Duration::from_secs(3))),
+            scope.clone(),
+            ServiceSelector {
+                protocol: Protocol::Http,
+                port: Some(port)
+            },
+            async { Err::<adx_agent_core::mounts::Parameters, _>(adx_agent_api::Error::NotFound) },
+        )
+        .await
+        .is_err());
+    assert!(state.binding(&scope).await.unwrap().is_none());
+    assert_eq!(backend.0.lock().unwrap().len(), before);
+    let (fresh, _) = managed
+        .resolve(
+            &RequestContext::new(Duration::from_secs(3)),
+            &scope,
+            Protocol::Http,
+            Some(port),
+        )
+        .await
+        .unwrap();
+    assert_ne!(fresh.binding.generation, first.binding.generation);
+    let before = backend.0.lock().unwrap().len();
+    assert!(access
+        .select_with_initializer(
+            Arc::new(RequestContext::new(Duration::from_secs(3))),
+            scope.clone(),
+            ServiceSelector {
+                protocol: Protocol::Http,
+                port: Some(port)
+            },
+            async { Err::<adx_agent_core::mounts::Parameters, _>(adx_agent_api::Error::NotFound) },
+        )
+        .await
+        .is_ok());
+    assert_eq!(
+        state.binding(&scope).await.unwrap().unwrap().generation,
+        fresh.binding.generation
+    );
+    assert_eq!(backend.0.lock().unwrap().len(), before);
+    relay_task.abort();
+}
 fn control_context() -> adx_agent_api::request::RequestContext {
     adx_agent_api::request::RequestContext::new(adx_agent_core::limits::AGENT_REQUEST_TIMEOUT)
 }

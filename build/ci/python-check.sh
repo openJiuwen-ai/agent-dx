@@ -34,6 +34,7 @@ check_status=0
 uv tool run --from ruff==0.11.13 ruff check \
     --config build/ci/ruff-codecheck.toml "${files[@]}" || check_status=1
 uv tool run --from pylint==3.3.8 pylint --rcfile=/dev/null \
-    --disable=all --enable=redefined-outer-name,duplicate-except \
+    --load-plugins=pylint.extensions.overlapping_exceptions \
+    --disable=all --enable=redefined-outer-name,duplicate-except,overlapping-except \
     --score=n --persistent=n "${files[@]}" || check_status=1
 exit "$check_status"

@@ -1,9 +1,12 @@
 //! DigitalMate privacy operations, authenticated independently of mobile sessions.
 
-use super::privacy_cipher::{EncryptedSecret, LegacyEnvelope, PrivacyCipher, SecretContext};
+use super::privacy_cipher::{
+    EncryptedSecret, LegacyEnvelope, PrivacyCipher, SecretContext, ServiceSecretContext,
+};
 use super::privacy_grants::TokenSigner;
 use crate::ingress::accounts::{
-    AccountStore, Error, ExpectedRevision, PrivacyOwner, StoredPrivacyGrant,
+    AccountStore, Error, ExpectedRevision, PrivacyOwner, ServiceSecretName, StoredPrivacyGrant,
+    StoredServiceSecret,
 };
 use adx_agent_api::{managed::ManagedService, request::RequestContext};
 use adx_agent_core::{AgentBinding, Scope};
@@ -57,6 +60,78 @@ impl PrivacyCenter {
     pub fn with_legacy(mut self, legacy: PrivacyCipher) -> Self {
         self.legacy = Some(legacy);
         self
+    }
+
+    /// Server-only configuration port. No user token or user-selected secret name.
+    pub(crate) async fn service_secret(
+        &self,
+        tenant: &str,
+        name: ServiceSecretName,
+    ) -> Result<Option<SecretValue>, Error> {
+        let Some(StoredServiceSecret {
+            revision,
+            key_id,
+            ciphertext,
+        }) = self.store.service_secret_get(tenant, name).await?
+        else {
+            return Ok(None);
+        };
+        let plaintext = match (key_id, ciphertext) {
+            (Some(key_id), Some(ciphertext)) => Some(
+                self.cipher
+                    .open_service(
+                        &ServiceSecretContext {
+                            tenant,
+                            service: name.service(),
+                            name: name.key(),
+                        },
+                        &EncryptedSecret { key_id, ciphertext },
+                    )
+                    .map_err(|_| Error::Unavailable)?,
+            ),
+            (None, None) => None,
+            _ => return Err(Error::Unavailable),
+        };
+        Ok(Some(SecretValue {
+            revision,
+            plaintext,
+        }))
+    }
+
+    /// Trusted operator import/rotation only; deliberately absent from PrivacyHttp.
+    pub(crate) async fn put_service_secret(
+        &self,
+        tenant: &str,
+        name: ServiceSecretName,
+        plaintext: Option<&[u8]>,
+        expected: ExpectedRevision<'_>,
+    ) -> Result<String, Error> {
+        if plaintext.is_some_and(|value| value.is_empty() || value.len() > 65_536) {
+            return Err(Error::Invalid);
+        }
+        let sealed = plaintext
+            .map(|value| {
+                self.cipher.seal_service(
+                    &ServiceSecretContext {
+                        tenant,
+                        service: name.service(),
+                        name: name.key(),
+                    },
+                    value,
+                )
+            })
+            .transpose()
+            .map_err(|_| Error::Invalid)?;
+        self.store
+            .service_secret_put(
+                tenant,
+                name,
+                sealed
+                    .as_ref()
+                    .map(|secret| (secret.key_id.as_str(), secret.ciphertext.as_slice())),
+                expected,
+            )
+            .await
     }
 
     /// Import the former workspace envelope once; never overwrite newer or revoked data.
@@ -203,6 +278,14 @@ impl PrivacyCenter {
 
     pub async fn get(&self, token: &str, name: &str) -> Result<Option<SecretValue>, Error> {
         let grant = self.authorize(token).await?;
+        self.read_owned(&grant, name).await
+    }
+
+    async fn read_owned(
+        &self,
+        grant: &StoredPrivacyGrant,
+        name: &str,
+    ) -> Result<Option<SecretValue>, Error> {
         let owner = PrivacyOwner {
             tenant: &grant.scope.tenant,
             workspace: &grant.workspace,
@@ -365,7 +448,9 @@ impl PrivacyCenter {
 #[cfg(test)]
 mod tests {
     use super::{BindingReader, PrivacyCenter};
-    use crate::ingress::accounts::{AccountStore, Error, ExpectedRevision, PrivacyOwner};
+    use crate::ingress::accounts::{
+        AccountStore, Error, ExpectedRevision, PrivacyOwner, ServiceSecretName,
+    };
     use crate::ingress::digitalmategateway::privacy_cipher::PrivacyCipher;
     use crate::ingress::digitalmategateway::privacy_grants::{PrivacyIdentity, TokenSigner};
     use crate::ingress::digitalmategateway::privacy_http::PrivacyHttp;
@@ -457,11 +542,22 @@ mod tests {
             signer.clone(),
         ));
         let admission_scope = bindings.0.lock().await.scope.clone();
-        let token_secret = identity
-            .admit(&admission_scope, "workspace-a", &user)
+        let credentials = identity
+            .admit_workload(&admission_scope, "workspace-a", &user)
             .await
             .unwrap();
+        let token_secret = credentials.privacy;
+        let connector_secret = credentials.connector;
         let token = token_secret.as_str();
+        let connector = connector_secret.as_str();
+        let connector_context = identity.connector_identity(connector).await.unwrap();
+        assert_eq!(connector_context["purpose"], "connector.tool");
+        assert_eq!(connector_context["workspace"], "workspace-a");
+        assert_eq!(connector_context["binding_generation"], "generation-a");
+        assert!(matches!(
+            identity.connector_identity(token).await,
+            Err(Error::Unauthorized)
+        ));
         let digest = signer.verify(token, false).unwrap().id;
         // Many reconnects reuse one business grant, rather than exhausting the quota.
         for _ in 0..70 {
@@ -492,6 +588,49 @@ mod tests {
         let center =
             Arc::new(PrivacyCenter::new(store.clone(), cipher, signer.clone()).with_legacy(legacy));
 
+        // Server configuration remains unreachable through this user's real grant.
+        let previous = center
+            .service_secret("tenant-a", ServiceSecretName::ComposioProjectKey)
+            .await
+            .unwrap();
+        let expected = previous
+            .as_ref()
+            .map(|value| ExpectedRevision::Existing(value.revision.as_str()))
+            .unwrap_or(ExpectedRevision::New);
+        let server_revision = center
+            .put_service_secret(
+                "tenant-a",
+                ServiceSecretName::ComposioProjectKey,
+                Some(b"synthetic-server-project-key"),
+                expected,
+            )
+            .await
+            .unwrap();
+        let opened_server = center
+            .service_secret("tenant-a", ServiceSecretName::ComposioProjectKey)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened_server.revision, server_revision);
+        assert_eq!(
+            opened_server.plaintext.unwrap().as_slice(),
+            b"synthetic-server-project-key"
+        );
+        let stored_server = store
+            .service_secret_get("tenant-a", ServiceSecretName::ComposioProjectKey)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            stored_server.ciphertext.unwrap().as_slice(),
+            b"synthetic-server-project-key"
+        );
+        assert!(center
+            .get(token, "PROJECT_API_KEY")
+            .await
+            .unwrap()
+            .is_none());
+
         // No login session exists: a valid workspace grant is sufficient for background work.
         let revision = center
             .put(
@@ -506,6 +645,10 @@ mod tests {
         bindings.1.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(matches!(
             identity.renew(token).await,
+            Err(Error::Unavailable)
+        ));
+        assert!(matches!(
+            identity.connector_identity(connector).await,
             Err(Error::Unavailable)
         ));
         let opened = center.get(token, "FEISHU_TOKEN").await.unwrap().unwrap();
@@ -527,6 +670,10 @@ mod tests {
             Err(Error::Unauthorized)
         ));
         assert!(matches!(
+            identity.connector_identity(connector).await,
+            Err(Error::Unauthorized)
+        ));
+        assert!(matches!(
             identity.renew(token).await,
             Err(Error::Unauthorized)
         ));
@@ -544,6 +691,79 @@ mod tests {
             b"synthetic-privacy-value"
         );
         let http = PrivacyHttp::new(center.clone(), identity.clone());
+        for (path, credential, status) in [
+            ("/v1/connector/identity", connector, http::StatusCode::OK),
+            (
+                "/v1/connector/identity",
+                token,
+                http::StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "/v1/identity/renew",
+                connector,
+                http::StatusCode::UNAUTHORIZED,
+            ),
+            ("/v1/connector/renew", connector, http::StatusCode::OK),
+            ("/v1/connector/renew", token, http::StatusCode::UNAUTHORIZED),
+        ] {
+            let request = http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(http_body_util::Full::new(bytes::Bytes::from_static(b"{}")))
+                .unwrap();
+            assert_eq!(http.handle(request).await.status(), status);
+        }
+        let server_request = http::Request::builder()
+            .method("POST")
+            .uri("/v1/secret/get")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from_static(
+                br#"{"name":"PROJECT_API_KEY"}"#,
+            )))
+            .unwrap();
+        let server_response = http.handle(server_request).await;
+        assert_eq!(server_response.status(), http::StatusCode::OK);
+        let server_body = http_body_util::BodyExt::collect(server_response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let server_json: serde_json::Value = serde_json::from_slice(&server_body).unwrap();
+        assert!(server_json["value"].is_null() && server_json["revision"].is_null());
+        // A same-named user value remains a different record and AEAD context.
+        center
+            .put(
+                token,
+                "PROJECT_API_KEY",
+                b"synthetic-user-configuration",
+                ExpectedRevision::New,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            center
+                .get(token, "PROJECT_API_KEY")
+                .await
+                .unwrap()
+                .unwrap()
+                .plaintext
+                .unwrap()
+                .as_slice(),
+            b"synthetic-user-configuration"
+        );
+        assert_eq!(
+            center
+                .service_secret("tenant-a", ServiceSecretName::ComposioProjectKey)
+                .await
+                .unwrap()
+                .unwrap()
+                .plaintext
+                .unwrap()
+                .as_slice(),
+            b"synthetic-server-project-key"
+        );
         let request = http::Request::builder()
             .method("POST")
             .uri("/v1/secret/get")

@@ -30,6 +30,10 @@ use tokio_tungstenite::{
 };
 use tracing::Instrument;
 
+#[cfg(unix)]
+#[path = "entrypoint_runtime.rs"]
+mod unix;
+
 /// Select how a trusted business identity maps to a pre-mounted workspace.
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +54,12 @@ pub struct DigitalMateGatewayConfig {
     #[cfg(unix)]
     #[serde(default)]
     pub(crate) privacy: Option<super::privacy_runtime::PrivacyRuntimeConfig>,
+    #[cfg(unix)]
+    #[serde(default)]
+    pub(crate) ingestion: Option<super::ingestion::IngestionConfig>,
+    #[cfg(unix)]
+    #[serde(default)]
+    pub(crate) composio: Option<super::composio::ComposioConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -161,15 +171,7 @@ impl DigitalMateGatewayConfig {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        #[cfg(unix)]
-        if let Some(privacy) = &self.privacy {
-            if ![&self.orbit, &self.digitalmate].iter().any(|app| {
-                app.as_ref()
-                    .is_some_and(|app| app.template == privacy.template)
-            }) {
-                return Err(invalid());
-            }
-        }
+        self.validate_connectors()?;
         for (application, config) in [
             (Application::Orbit, &self.orbit),
             (Application::DigitalMate, &self.digitalmate),
@@ -228,69 +230,162 @@ pub struct DigitalMateGatewayApi {
     config: DigitalMateGatewayConfig,
     auth: Arc<dyn BusinessAuth>,
     managed: Arc<ManagedService>,
+    #[cfg(test)]
+    composio: Option<Arc<super::composio::Composio>>,
+    webhook: Option<Arc<super::ingestion::WebhookHttp>>,
     #[cfg(unix)]
-    privacy: Option<super::privacy_runtime::PrivacyRuntime>,
+    runtime: unix::Runtime,
 }
+
 impl DigitalMateGatewayApi {
-    pub fn new(
-        config: DigitalMateGatewayConfig,
-        managed: Arc<ManagedService>,
-        auth: Arc<dyn BusinessAuth>,
+    /// Test-only upstream injection; production uses its prepared client and owner.
+    #[cfg(test)]
+    pub(crate) fn with_composio(
+        mut self,
+        gateway: Arc<super::composio::Composio>,
     ) -> Result<Self, Error> {
-        config.validate()?;
-        #[cfg(unix)]
-        let privacy = if let Some(settings) = config.privacy.clone() {
-            use zeroize::Zeroizing;
-            let path = std::env::var_os("ADX_CREDENTIAL_KEY_FILE").ok_or_else(invalid)?;
-            let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|_| invalid())?);
-            let bytes = Zeroizing::new(hex::decode(text.trim()).map_err(|_| invalid())?);
-            let key =
-                Zeroizing::new(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| invalid())?);
-            let store = auth.privacy_store().ok_or_else(invalid)?;
-            let reader = Arc::new(super::privacy_center::ManagedBindingReader(managed.clone()));
-            Some(
-                super::privacy_runtime::PrivacyRuntime::start(
-                    settings,
-                    store,
-                    reader,
-                    &key,
-                    &config.tenant,
-                )
-                .map_err(|_| {
-                    Error::Unavailable("DigitalMate privacy service initialization failed".into())
-                })?,
-            )
-        } else {
-            None
+        if self.has_prepared_composio() {
+            return Err(invalid());
+        }
+        self.foreground_admission().map_err(|_| invalid())?;
+        self.composio = Some(gateway);
+        Ok(self)
+    }
+
+    pub(crate) async fn connector_request<B>(
+        &self,
+        request: Request<B>,
+        ingress: Arc<Ingress>,
+    ) -> Response<ProxyBody>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let gateway = self.connector_gateway(ingress);
+        let Some(gateway) = gateway else {
+            return error(StatusCode::NOT_FOUND, "NOT_FOUND");
         };
-        Ok(Self {
-            auth,
-            config,
-            managed,
-            #[cfg(unix)]
-            privacy,
-        })
+        if request.uri().path() == super::composio::http::CALLBACK_PATH {
+            if request.method() != http::Method::GET {
+                return error(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
+            }
+            return super::composio::http::callback_landing()
+                .map(|value| value.map_err(|never| match never {}).boxed_unsync());
+        }
+        let scope = match self
+            .connector_scope(
+                request.headers(),
+                request.uri().path() == super::composio::http::VALIDATE_PATH
+                    || request.uri().path() == super::composio::http::SUBSCRIPTION_PATH
+                    || request.uri().path() == "/api/digitalmate/connectors/v1/composio/mail",
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(failure) => return auth_error(failure),
+        };
+        let (parts, incoming) = request.into_parts();
+        let bytes = match tokio::time::timeout(
+            Duration::from_secs(10),
+            Limited::new(incoming, 16_384).collect(),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value.to_bytes(),
+            Ok(Err(_)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "INVALID_REQUEST"),
+            Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "INVALID_REQUEST"),
+        };
+        if let Err(failure) = scope.check_authentication().await {
+            return auth_error(failure);
+        }
+        let response = super::composio::http::handle(
+            &gateway,
+            &scope,
+            Request::from_parts(parts, Full::new(bytes)),
+        )
+        .await;
+        if let Err(failure) = scope.check_authentication().await {
+            return auth_error(failure);
+        }
+        response.map(|value| value.map_err(|never| match never {}).boxed_unsync())
+    }
+
+    async fn connector_scope(
+        &self,
+        headers: &http::HeaderMap,
+        validation: bool,
+    ) -> accounts::Result<super::composio::Scope> {
+        if validation {
+            if !accounts::bearer(headers)?.starts_with("dm-connector-v1.") {
+                return Err(accounts::Error::Unauthorized);
+            }
+            return super::composio::Scope::from_connector_identity(
+                self.connector_workload_identity(headers).await?,
+            )
+            .map_err(|_| accounts::Error::Forbidden);
+        }
+        let identity = self.foreground_admission()?.authenticate(headers).await?;
+        super::composio::Scope::from_foreground_identity(identity)
+            .map_err(|_| accounts::Error::Forbidden)
+    }
+    /// Foreground connector admission uses only the configured DigitalMate
+    /// application. It never falls back to Jiuwen or Orbit or reads model keys.
+    pub fn foreground_admission(
+        &self,
+    ) -> accounts::Result<super::foreground_admission::ForegroundAdmission> {
+        super::foreground_admission::ForegroundAdmission::new(
+            self.config.tenant.clone(),
+            self.config
+                .digitalmate
+                .clone()
+                .ok_or(accounts::Error::Configuration)?,
+            self.managed.clone(),
+            self.auth.clone(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ingestion_webhook(
+        mut self,
+        webhook: Arc<super::ingestion::WebhookHttp>,
+    ) -> Self {
+        self.webhook = Some(webhook);
+        self
     }
     pub fn matches(path: &str) -> bool {
-        matches!(
-            path,
-            "/ws"
-                | "/orbit/ws"
-                | "/digitalmate/ws"
-                | "/file-api/download"
-                | "/file-api/upload"
-                | "/api/v1/auth/huawei/login"
-                | "/api/v1/auth/agc/login"
-                | "/api/v1/auth/session"
-                | "/api/v1/auth/logout"
-                | "/api/v1/auth/quota"
-        )
+        path == super::ingestion::WEBHOOK_PATH
+            || super::composio::http::matches(path)
+            || path == super::composio::http::CALLBACK_PATH
+            || matches!(
+                path,
+                "/ws"
+                    | "/orbit/ws"
+                    | "/digitalmate/ws"
+                    | "/file-api/download"
+                    | "/file-api/upload"
+                    | "/api/v1/auth/huawei/login"
+                    | "/api/v1/auth/agc/login"
+                    | "/api/v1/auth/session"
+                    | "/api/v1/auth/logout"
+                    | "/api/v1/auth/quota"
+            )
     }
     pub(crate) async fn handle(
         &self,
         mut request: Request<Incoming>,
         ingress: Arc<Ingress>,
     ) -> Response<ProxyBody> {
+        if request.uri().path() == super::ingestion::WEBHOOK_PATH {
+            return match self.webhook.clone() {
+                Some(webhook) => webhook.handle(request).await,
+                None => error(StatusCode::NOT_FOUND, "NOT_FOUND"),
+            };
+        }
+        if super::composio::http::matches(request.uri().path())
+            || request.uri().path() == super::composio::http::CALLBACK_PATH
+        {
+            return self.connector_request(request, ingress).await;
+        }
         let application = match request.uri().path() {
             "/orbit/ws" => Some(self.config.orbit.as_ref()),
             "/digitalmate/ws" => Some(self.config.digitalmate.as_ref()),
@@ -331,7 +426,8 @@ impl DigitalMateGatewayApi {
                     }),
                     &self.config.tenant,
                     #[cfg(unix)]
-                    self.privacy
+                    self.runtime
+                        .privacy
                         .as_ref()
                         .map(|privacy| privacy.identity.clone()),
                 )
@@ -753,4 +849,57 @@ pub(super) fn error(status: StatusCode, code: &str) -> Response<ProxyBody> {
             serde_json::json!({"error":code,"code":code}).to_string(),
         )))
         .expect("fixed error response headers are valid")
+}
+
+#[cfg(not(unix))]
+impl DigitalMateGatewayConfig {
+    fn validate_connectors(&self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+impl DigitalMateGatewayApi {
+    #[cfg(test)]
+    fn has_prepared_composio(&self) -> bool {
+        false
+    }
+    fn connector_gateway(&self, _ingress: Arc<Ingress>) -> Option<Arc<super::composio::Composio>> {
+        #[cfg(test)]
+        {
+            self.composio.clone()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+    pub async fn connector_workload_identity(
+        &self,
+        _headers: &http::HeaderMap,
+    ) -> accounts::Result<super::connector_owner::ConnectorWorkloadIdentity> {
+        Err(accounts::Error::Unavailable)
+    }
+    pub fn new(
+        config: DigitalMateGatewayConfig,
+        managed: Arc<ManagedService>,
+        auth: Arc<dyn BusinessAuth>,
+    ) -> Result<Self, Error> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            managed,
+            auth,
+            #[cfg(test)]
+            composio: None,
+            webhook: None,
+        })
+    }
+    pub async fn build(
+        config: DigitalMateGatewayConfig,
+        managed: Arc<ManagedService>,
+        auth: Arc<dyn BusinessAuth>,
+    ) -> Result<Self, Error> {
+        Self::new(config, managed, auth)
+    }
 }

@@ -216,7 +216,12 @@ impl ApplicationWsConfig {
                 name.as_str().starts_with("x-adx-")
                     || matches!(
                         name.as_str(),
-                        "authorization" | "proxy-authorization" | "cookie" | "x-auth" | "x-user-id"
+                        "authorization"
+                            | "proxy-authorization"
+                            | "cookie"
+                            | "x-auth"
+                            | "x-user-id"
+                            | "x-digitalmate-connector-identity"
                     )
             })
             .cloned()
@@ -240,17 +245,18 @@ impl ApplicationWsConfig {
             let Some(workspace) = workspace.get("workspace") else {
                 return error(StatusCode::BAD_GATEWAY, "PRIVACY_UNAVAILABLE");
             };
-            let token = match tokio::time::timeout_at(
+            let credentials = match tokio::time::timeout_at(
                 deadline,
-                identity.admit(&privacy_scope, workspace, &principal.user_id),
+                identity.admit_workload(&privacy_scope, workspace, &principal.user_id),
             )
             .await
             {
-                Ok(Ok(token)) => token,
+                Ok(Ok(credentials)) => credentials,
                 Ok(Err(error)) => return auth_error(error),
                 Err(_) => return error(StatusCode::GATEWAY_TIMEOUT, "PRIVACY_UNAVAILABLE"),
             };
-            let mut header = match format!("Bearer {}", token.as_str()).parse::<http::HeaderValue>()
+            let mut header = match format!("Bearer {}", credentials.privacy.as_str())
+                .parse::<http::HeaderValue>()
             {
                 Ok(header) => header,
                 Err(_) => return error(StatusCode::BAD_GATEWAY, "PRIVACY_UNAVAILABLE"),
@@ -259,6 +265,16 @@ impl ApplicationWsConfig {
             request
                 .headers_mut()
                 .insert(http::header::AUTHORIZATION, header);
+            let mut connector = match format!("Bearer {}", credentials.connector.as_str())
+                .parse::<http::HeaderValue>()
+            {
+                Ok(header) => header,
+                Err(_) => return error(StatusCode::BAD_GATEWAY, "PRIVACY_UNAVAILABLE"),
+            };
+            connector.set_sensitive(true);
+            request
+                .headers_mut()
+                .insert("x-digitalmate-connector-identity", connector);
         }
         let response = tokio::select! {
             biased;

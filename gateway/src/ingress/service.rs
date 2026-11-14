@@ -34,6 +34,8 @@ pub struct IngressService {
     route_changes: broadcast::Receiver<RouteChange>,
     #[cfg(feature = "agent-api")]
     ssh: Option<super::ssh::SshListener>,
+    #[cfg(all(feature = "agent-api", unix))]
+    digitalmate_background: Option<super::digitalmategateway::ingestion::IngestionRuntime>,
 }
 
 impl IngressService {
@@ -151,11 +153,9 @@ impl IngressService {
             let auth = Arc::new(
                 super::accounts::AccountService::connect(account_config, &settings.tenant).await?,
             );
-            Some(Arc::new(DigitalMateGatewayApi::new(
-                settings,
-                agent.managed.clone(),
-                auth,
-            )?))
+            Some(Arc::new(
+                DigitalMateGatewayApi::build(settings, agent.managed.clone(), auth).await?,
+            ))
         } else {
             None
         };
@@ -196,12 +196,17 @@ impl IngressService {
             gateway
         };
         #[cfg(feature = "agent-api")]
-        let gateway = if let Some(api) = digitalmategateway_api {
-            gateway.with_digitalmategateway_api(api)
+        let gateway = if let Some(api) = &digitalmategateway_api {
+            gateway.with_digitalmategateway_api(api.clone())
         } else {
             gateway
         };
         let gateway = Arc::new(gateway);
+        #[cfg(all(feature = "agent-api", unix))]
+        let digitalmate_background = match &digitalmategateway_api {
+            Some(api) => api.background_service(gateway.clone())?,
+            None => None,
+        };
         #[cfg(feature = "agent-api")]
         let ssh = if let Ok(path) = std::env::var("ADX_SSH_CONFIG") {
             let settings = serde_json::from_slice(&std::fs::read(path)?)
@@ -213,6 +218,8 @@ impl IngressService {
         Ok(Self {
             #[cfg(feature = "agent-api")]
             ssh,
+            #[cfg(all(feature = "agent-api", unix))]
+            digitalmate_background,
             config,
             public_listeners,
             health_listener,
@@ -250,12 +257,24 @@ impl IngressService {
             route_changes,
             #[cfg(feature = "agent-api")]
             ssh,
+            #[cfg(all(feature = "agent-api", unix))]
+            digitalmate_background,
         } = self;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let watcher_task = tokio::spawn(watcher.run(store));
         let route_reconciler_task =
             tokio::spawn(gateway.clone().run_route_reconciler(route_changes));
         let mut listeners = JoinSet::new();
+        #[cfg(all(feature = "agent-api", unix))]
+        if let Some(background) = digitalmate_background {
+            let shutdown = shutdown_rx.clone();
+            listeners.spawn(async move {
+                background
+                    .serve(shutdown)
+                    .await
+                    .map_err(|error| Box::new(error) as ServiceError)
+            });
+        }
         #[cfg(feature = "agent-api")]
         if let Some(ssh) = ssh {
             let shutdown = shutdown_rx.clone();
@@ -346,6 +365,10 @@ fn listener_failure(result: Option<Result<Result<(), ServiceError>, JoinError>>)
     }
 }
 
+#[cfg(all(test, unix, feature = "agent-api"))]
+#[path = "digitalmategateway_startup_tests.rs"]
+mod digitalmategateway_startup_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,8 +379,7 @@ mod tests {
     use adx_transport::tls::TlsFiles;
     use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-    #[tokio::test]
-    async fn shared_service_binds_and_stops_cleanly() {
+    pub(super) fn settings() -> (IngressConfig, ControlConfig) {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let certificate = fixture.join("ingress-cert.pem");
         let private_key = fixture.join("ingress-key.pem");
@@ -428,6 +450,12 @@ mod tests {
             auth_cache_entries: 1,
         };
 
+        (config, control)
+    }
+
+    #[tokio::test]
+    async fn shared_service_binds_and_stops_cleanly() {
+        let (config, control) = settings();
         IngressService::bind(config.clone(), control.clone())
             .await
             .unwrap()

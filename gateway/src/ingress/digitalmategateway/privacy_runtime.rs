@@ -21,6 +21,9 @@ mod implementation {
     }
     pub(crate) struct PrivacyRuntime {
         pub identity: Arc<PrivacyIdentity>,
+        pub center: Arc<PrivacyCenter>,
+        pub delivery: Option<Arc<super::super::privacy_grants::DeliveryIdentity>>,
+        pub authorization_owner: Option<Arc<super::super::connector_owner::OwnerAuthority>>,
         shutdown: watch::Sender<bool>,
         listener: JoinHandle<()>,
     }
@@ -31,6 +34,8 @@ mod implementation {
             bindings: Arc<dyn BindingReader>,
             root: &[u8; 32],
             tenant: &str,
+            inbox: Option<super::super::ingestion::Inbox>,
+            owner: Option<super::super::connector_owner::OwnerRuntimeConfig>,
         ) -> Result<Self, Error> {
             tokio::runtime::Handle::try_current().map_err(|_| Error::Configuration)?;
             let cipher = PrivacyCipher::new(
@@ -56,15 +61,41 @@ mod implementation {
             let identity = Arc::new(PrivacyIdentity::new(
                 config.template,
                 store.clone(),
-                bindings,
+                bindings.clone(),
                 signer.clone(),
             ));
+            let authorization_owner = owner
+                .map(|owner| {
+                    super::super::connector_owner::OwnerAuthority::new(
+                        tenant.into(),
+                        owner.application,
+                        signer.clone(),
+                        bindings.clone(),
+                        owner.auth,
+                    )
+                    .map(|owner| Arc::new(owner.with_identity(identity.clone())))
+                })
+                .transpose()?;
             let mut center = PrivacyCenter::new(store, cipher, signer);
             if let Some(path) = &config.legacy_keyring_file {
                 center = center
                     .with_legacy(PrivacyCipher::load(path).map_err(|_| Error::Configuration)?);
             }
-            let http = Arc::new(PrivacyHttp::new(Arc::new(center), identity.clone()));
+            let center = Arc::new(center);
+            let delivery = inbox.map(|inbox| {
+                Arc::new(super::super::privacy_grants::DeliveryIdentity::new(
+                    identity.clone(),
+                    inbox,
+                ))
+            });
+            let mut http = PrivacyHttp::new(center.clone(), identity.clone());
+            if let Some(delivery) = &delivery {
+                http = http.with_ingestion(delivery.clone());
+            }
+            if let Some(owner) = &authorization_owner {
+                http = http.with_authorization_owner(owner.clone());
+            }
+            let http = Arc::new(http);
             let (shutdown, receiver) = watch::channel(false);
             let listener = tokio::spawn(async move {
                 if http.serve(listener, tls, receiver).await.is_err() {
@@ -73,6 +104,9 @@ mod implementation {
             });
             Ok(Self {
                 identity,
+                center,
+                delivery,
+                authorization_owner,
                 shutdown,
                 listener,
             })

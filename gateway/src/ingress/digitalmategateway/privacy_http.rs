@@ -57,16 +57,46 @@ struct ExportRequest {
     revision: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerCheckRequest {
+    operation: super::connector_owner::OwnerOperation,
+    body_sha256: String,
+}
+
 pub(crate) struct PrivacyHttp {
     center: Arc<PrivacyCenter>,
     identity: Arc<super::privacy_grants::PrivacyIdentity>,
+    ingestion: Option<Arc<super::privacy_grants::DeliveryIdentity>>,
+    authorization_owner: Option<Arc<super::connector_owner::OwnerAuthority>>,
 }
 impl PrivacyHttp {
     pub fn new(
         center: Arc<PrivacyCenter>,
         identity: Arc<super::privacy_grants::PrivacyIdentity>,
     ) -> Self {
-        Self { center, identity }
+        Self {
+            center,
+            identity,
+            ingestion: None,
+            authorization_owner: None,
+        }
+    }
+
+    pub(crate) fn with_ingestion(
+        mut self,
+        ingestion: Arc<super::privacy_grants::DeliveryIdentity>,
+    ) -> Self {
+        self.ingestion = Some(ingestion);
+        self
+    }
+
+    pub(crate) fn with_authorization_owner(
+        mut self,
+        owner: Arc<super::connector_owner::OwnerAuthority>,
+    ) -> Self {
+        self.authorization_owner = Some(owner);
+        self
     }
 
     pub async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
@@ -112,12 +142,29 @@ impl PrivacyHttp {
         {
             return Err(Error::Invalid);
         }
-        let token = Zeroizing::new(accounts::bearer(request.headers())?.to_owned());
         let path = request.uri().path().to_owned();
+        let token = Zeroizing::new(
+            if matches!(
+                path.as_str(),
+                super::connector_owner::VERIFY_PATH
+                    | "/v1/connector/identity"
+                    | "/v1/connector/renew"
+            ) {
+                super::connector_owner::bearer(request.headers())?
+            } else {
+                accounts::bearer(request.headers())?
+            }
+            .to_owned(),
+        );
         if !matches!(
             path.as_str(),
             "/v1/secret/get"
+                | "/v1/connector/authorization-owner"
                 | "/v1/identity/renew"
+                | "/v1/connector/identity"
+                | "/v1/connector/renew"
+                | "/v1/ingestion/admit"
+                | "/v1/ingestion/bootstrap"
                 | "/v1/secret/stage"
                 | "/v1/secret/commit"
                 | "/v1/secret/abort"
@@ -136,6 +183,61 @@ impl PrivacyHttp {
             .map_err(|_| Error::Invalid)?
             .to_bytes();
         match path.as_str() {
+            "/v1/connector/authorization-owner" => {
+                if bytes.len() > 512 {
+                    return Err(Error::Invalid);
+                }
+                let input: OwnerCheckRequest =
+                    serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
+                if !super::connector_owner::digest_valid(&input.body_sha256) {
+                    return Err(Error::Invalid);
+                }
+                let owner = self
+                    .authorization_owner
+                    .as_ref()
+                    .ok_or(Error::Unavailable)?;
+                let checked = owner
+                    .verify(
+                        &token,
+                        input.operation,
+                        &input.body_sha256,
+                        Some(&self.identity),
+                    )
+                    .await?;
+                Ok(response(StatusCode::OK, checked))
+            }
+            "/v1/ingestion/admit" | "/v1/ingestion/bootstrap" => {
+                if bytes.as_ref() != b"{}" {
+                    return Err(Error::Invalid);
+                }
+                let ingestion = self.ingestion.as_ref().ok_or(Error::Unavailable)?;
+                if path == "/v1/ingestion/admit" {
+                    let admission = ingestion.verify(&token).await?;
+                    return Ok(response(StatusCode::OK, admission.json()));
+                }
+                let Some(owner) = self.authorization_owner.as_ref() else {
+                    // Preserve authentication failure precedence even when the
+                    // bootstrap owner is not configured. Configured bootstrap
+                    // performs its own initial and final verification.
+                    ingestion.verify(&token).await?;
+                    return Err(Error::Unavailable);
+                };
+                Ok(response(
+                    StatusCode::OK,
+                    ingestion.bootstrap(&token, owner).await?,
+                ))
+            }
+            "/v1/connector/identity" | "/v1/connector/renew" => {
+                if bytes.as_ref() != b"{}" {
+                    return Err(Error::Invalid);
+                }
+                let value = if path == "/v1/connector/identity" {
+                    self.identity.connector_identity(&token).await?
+                } else {
+                    self.identity.renew_connector(&token).await?
+                };
+                Ok(response(StatusCode::OK, value))
+            }
             "/v1/identity/renew" => {
                 if bytes.as_ref() != b"{}" {
                     return Err(Error::Invalid);
@@ -298,7 +400,12 @@ impl PrivacyHttp {
 
 fn operation_label(path: &str) -> &'static str {
     match path {
+        "/v1/connector/authorization-owner" => "authorization_owner",
         "/v1/identity/renew" => "renew",
+        "/v1/connector/identity" => "connector_identity",
+        "/v1/connector/renew" => "connector_renew",
+        "/v1/ingestion/admit" => "ingestion_admit",
+        "/v1/ingestion/bootstrap" => "ingestion_bootstrap",
         "/v1/secret/get" => "get",
         "/v1/secret/stage" => "stage",
         "/v1/secret/commit" => "commit",

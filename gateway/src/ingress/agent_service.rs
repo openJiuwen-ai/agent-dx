@@ -53,6 +53,7 @@ impl ServiceSelection {
 }
 
 /// Preserve a business initializer's authentication errors without coupling shared activation to it.
+#[derive(Debug)]
 pub enum InitializationError<E> {
     Agent(Error),
     Source(E),
@@ -121,7 +122,31 @@ impl AgentV2Access {
         F: std::future::Future<Output = Result<adx_agent_core::mounts::Parameters, E>>,
     {
         let parameters = match context.run(self.managed.binding(&context, &scope)).await {
-            Ok(_) => None,
+            Ok(binding) => {
+                // The shared initializer contract must not create a replacement
+                // if the Binding disappears between the metadata and resolve calls.
+                let (target, port) = context
+                    .run(self.managed.retry_resolve(
+                        &context,
+                        &scope,
+                        selector.protocol,
+                        selector.port,
+                        &binding.generation,
+                    ))
+                    .await
+                    .map_err(InitializationError::Agent)?;
+                return Ok(ServiceSelection {
+                    context,
+                    scope,
+                    protocol: selector.protocol,
+                    port,
+                    requested_port: selector.port,
+                    environment_id: target.binding.current.environment_id,
+                    generation: target.binding.generation,
+                    retried: false,
+                    parameters: None,
+                });
+            }
             Err(Error::NotFound) => {
                 let values = tokio::time::timeout_at(context.deadline(), initializer)
                     .await
@@ -221,6 +246,25 @@ impl AgentV2Access {
         self.connect_service_inner(ingress, selection, true).await
     }
 
+    async fn check_selected_route(
+        &self,
+        selection: &ServiceSelection,
+    ) -> Result<(), IngressOpenError> {
+        let current = selection
+            .context
+            .run(self.managed.binding(&selection.context, &selection.scope))
+            .await
+            .map_err(|_| IngressOpenError::RouteChanged)?;
+        if current.scope != selection.scope
+            || current.phase != BindingPhase::Active
+            || current.generation != selection.generation
+            || current.current.environment_id != selection.environment_id
+        {
+            return Err(IngressOpenError::RouteChanged);
+        }
+        Ok(())
+    }
+
     async fn connect_service_inner(
         &self,
         ingress: &Ingress,
@@ -248,8 +292,9 @@ impl AgentV2Access {
                                 && matches!(&opened, Err(IngressOpenError::Connect(error))
                                     if error.kind() == std::io::ErrorKind::ConnectionRefused)
                             {
-                                // No route refresh or activation for a port that is merely
-                                // starting. The surrounding context also bounds this sleep.
+                                // A route may outlive its selected target in discovery.
+                                // Ordinary readiness follows the same pre-write retry contract.
+                                self.check_selected_route(&selection).await?;
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                                 continue;
                             }
@@ -261,7 +306,16 @@ impl AgentV2Access {
                 })
                 .await?;
             match result {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => match self.check_selected_route(&selection).await {
+                    Ok(()) => return Ok(stream),
+                    Err(error) => {
+                        drop(stream);
+                        if self.retry(&mut selection).await? {
+                            continue;
+                        }
+                        return Err(error.into());
+                    }
+                },
                 Err(error) => {
                     let retryable = !matches!(
                         error,

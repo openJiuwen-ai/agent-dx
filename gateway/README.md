@@ -459,7 +459,17 @@ scope and declared service, retaining the request deadline and binding generatio
 `connect_service` opens an authorized Relay stream and can refresh the same
 generation once after an unsent route/connection failure. Before any backend WS handshake or business bytes are sent, WS admission may refresh once when authoritative metadata confirms that the Binding was deleted or rebuilt, retaining its original deadline and initialization input. HTTP/SSH remain generation-fenced. Authorization failures do
 not reactivate the target. Returned streams never replay application writes.
-Managed WS uses this path; managed HTTP shares selection/retry while retaining the
+
+Mail callers use the same `select_with_initializer` and
+`connect_service_when_ready`, supplying only Scope and the configured selector.
+Their initializer refuses a missing Binding. Existing-Binding initialization
+uses the Agent owner's retry resolve to avoid creating a replacement after a
+concurrent deletion. Selected-route checks and pre-write retry belong to the
+ordinary shared path, not to a mail-specific generation admission. Identity
+owners independently fence the original authorization, represented in mail
+persistence by an actual existing random grant reference. See the
+[wire-v2/cutover contract](../docs/development/ingestion-delivery-contract.md).
+Ordinary managed WS uses shared selection/connection; managed HTTP shares selection/retry while retaining the
 backend HTTP pool. The Jiuwen codecs, bounded session/request state and E2A socket
 driver are implemented. Its internal connection adapter uses the shared authorized
 Relay stream, bounds the WS handshake by the original admission deadline, and
@@ -566,6 +576,26 @@ There is no old `spec.env` credential fallback; all participating processes must
 use the new configuration before using this binary.
 
 ## DigitalMateGateway authenticated entrypoints
+
+The [Composio mail entry](../docs/development/composio-gmail-trusted.md) implements
+fixed Gmail/Outlook authorization, account validation, mail reads and subscription
+synchronization outside user sandboxes. Trusted `composio` configuration prepares
+the encrypted project Key, shared PostgreSQL budget and actual M44 owner adapter.
+The [ingestion coordinator](../docs/development/connector-ingestion.md) in the same
+process verifies signed Webhooks, persists bounded queues and delivers fixed
+batches through existing Ingress/Relay. The DigitalMate module owns dispatch and
+worker supervision; shared service code only spawns its background future and
+supplies shutdown. No additional server, lifecycle owner or common forwarding
+branch is introduced. Live OAuth/mailbox and consumer deployment remain separate
+acceptance checks; implemented routes are not a claim of live acceptance.
+
+With a configured DigitalMate privacy owner, business WS admission now issues
+privacy and connector-purpose credentials on the same existing grant. Gateway
+strips caller-provided internal identity headers and injects
+`x-digitalmate-connector-identity` for the selected user instance. The connector
+identity does not authorize mail reads; M44 still checks current connection and
+task/intent permissions. This admission change applies to the existing
+DigitalMate WS path and is covered by its authentication/forwarding regressions.
 
 ### Transparent business WebSocket
 
@@ -686,6 +716,90 @@ revocation returns `502 ROUTE_REVOKED`; backend admission failure returns
 session invalidation or route revocation closes the shared forwarding stream.
 Account expiry/revocation checks use the existing session guard (at most a
 30-second polling interval for revocation).
+
+### Foreground connector identity
+
+`DigitalMateGatewayApi::foreground_admission()` exposes an account-session
+admission handle for foreground connector callers. Its `authenticate(&HeaderMap)`
+returns `ForegroundIdentity` with `tenant()`, `user_id()`, `workspace()` and
+`binding_scope()` getters. `check().await` rechecks the actual account/session
+owner before subsequent operations. Neither type accepts JSON identity fields.
+
+Admission uses only the configured `digitalmate` application, the existing
+business bearer/session checks and the existing workspace derivation. An existing
+Binding must be active and have the same workspace. Missing DigitalMate config
+does not fall back to Jiuwen or Orbit. The call reads Binding metadata without
+initializing a Binding/Environment or requesting model credentials. It supplies
+no background, arbitrary-tool or model permission; connector handlers retain
+their own operation and connection checks.
+
+On Unix, `DigitalMateGatewayApi::authorization_owner()` exposes the fixed M44
+authorization-owner issuer when the existing privacy HTTPS service is configured
+for the DigitalMate template. `foreground_headers(&ForegroundIdentity,
+OwnerOperation, raw_body)` rechecks the actual business session and current
+Binding. `connector_workload_identity(&HeaderMap)` instead verifies the existing
+connector-purpose grant, independently of phone sessions. Its
+`workload_headers(&ConnectorWorkloadIdentity, OwnerOperation, raw_body)` permits
+only `connection`, `metadata`, `intent` and `read` owner queries; actual connection permission,
+enabled intent and connection generation/revision remain the caller's checks.
+
+The `read` operation authenticates a query for current read proof. Its consumer
+must call the real M44 task/consent owner; issuer tests do not implement or
+validate that permission adapter. It binds the caller and exact owner request,
+without granting provider mail reads. Foreground permission must come from the actual running
+task/execution epoch, sources and account consent, bound to the exact mail request
+digest and connection generation/revision. Gateway callers must recheck that proof
+before and after physical reads, including after budget waits. Background reads
+still require actual enabled intent/revision. JSON task IDs or modes and the
+connector namespace alone do not establish permission. The existing v1 purpose,
+signer, logical admission and 30-second limit remain unchanged.
+
+Both issuers reuse the existing signer and grant/session owners. A credential
+expires within 30 seconds and fixes the actor, operation, SHA-256 of the raw HTTP
+entity bytes, scope, workspace and Binding generation. Environment identity and
+service port are absent from both signed owner claims and public owner proofs.
+The identity owner retains the original operation in `OwnerAuthorization`.
+The caller selects and connects using its logical Scope and configured selector,
+then refreshes that same authorization after readiness before sending its headers
+to `POST /internal/digitalmate/connectors/v1/authorization-owner`. A sent owner
+write is never retried on another route. The existing HTTPS listener verifies it at
+`POST /v1/connector/authorization-owner` with JSON
+`{"operation":"current","body_sha256":"<lowercase SHA-256 hex>"}` and rechecks
+the current session/grant and Binding before returning the verified fields.
+This purpose cannot decrypt privacy settings or authorize provider mail reads.
+Malformed requests return the existing account error envelope; invalid or revoked
+credentials fail closed, and unavailable identity owners return service unavailable.
+
+The existing `/v1/connector/identity` and successful `/v1/connector/renew`
+responses also report `renewable`, `recovery_expires_at` and `bootstrap_until`,
+derived from verified signed claims and the current grant/Binding. Ordinary
+connector credentials report `renewable: true` and `bootstrap_until: null`;
+their recovery deadline is that credential's signed window, subject to the
+existing server-side renewal and revocation policy. Delivery-derived credentials
+report `renewable: false` with both deadlines equal to access expiry, and renewal
+is refused. Consumers must verify these responses through the actual authority;
+client-side token decoding or a local file is not an authorization fact.
+
+The existing identity HTTPS listener also accepts `POST /v1/ingestion/bootstrap`
+with a valid delivery bearer and exactly `{}`. It rechecks the persisted current
+batch, enabled subscription, existing grant and complete current Binding. The
+response contains only `purpose: "ingestion.connector-bootstrap"`, `target`
+(tenant, user, workspace, template/ref, Binding ID/generation: seven logical
+fields), `connector_token` and `expires_at`. The target must match the
+configured DigitalMate application and the persisted batch's original authority.
+Binding generation is resolved privately by the identity owner; receiver port is
+separate trusted startup configuration, never a batch identity field.
+
+The connector token reuses that grant and signing root, expires no later than the
+delivery credential, and has a signed bootstrap deadline. It cannot renew, obtain
+a privacy bearer, decrypt settings or grant task/model execution permission.
+An expired consumer must bootstrap again with a still-current delivery credential.
+Bootstrap must occur before delivery is acknowledged and completed: only a ready
+persisted batch is admitted. This exchange alone does not provide durable mail-read
+recovery after receipt when the process or short-lived credential is lost.
+Connection intent, generation/revision and `read_history` must still be checked
+by their actual owners on each receiver/read operation. Missing owner runtime
+configuration returns service unavailable; no scope is accepted from JSON.
 
 ### Existing Jiuwen protocol and accounts
 
