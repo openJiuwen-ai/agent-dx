@@ -381,12 +381,15 @@ print(json.dumps(oct(os.stat(p).st_mode&0o7777)))""", path(c, "A", "px-priv"), o
 
 
 def setgid_directory_gives_new_files_its_group(c):
-    """#23: a file or directory created in a setgid directory takes the directory's
+    """
+    #23: a file or directory created in a setgid directory takes the directory's
     group, on the creating node and on the other one; without setgid it takes the
-    caller's group."""
+    caller's group.
+    """
     let_others_traverse(c)
     made = path(c, "A", "px-sgid")
-    c.python("A", "os.mkdir(sys.argv[1]);os.chown(sys.argv[1],int(sys.argv[2]),int(sys.argv[3]));os.chmod(sys.argv[1],0o2770)",
+    c.python("A", "os.mkdir(sys.argv[1]);"
+             "os.chown(sys.argv[1],int(sys.argv[2]),int(sys.argv[3]));os.chmod(sys.argv[1],0o2770)",
              made, c.config["uid"], c.config["other_gid"], owner=False)
     code = """d=sys.argv[1]
 os.close(os.open(d+"/f",os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o640));os.mkdir(d+"/sub")

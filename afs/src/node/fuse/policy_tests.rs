@@ -268,7 +268,24 @@ fn create_through(
     groups: &[u32],
     lookups: &std::sync::atomic::AtomicUsize,
 ) -> afs_error::Result<CreatedFile> {
+    create_through_policy(
+        &DfsFusePolicy::new(Duration::ZERO),
+        backend,
+        gid,
+        groups,
+        lookups,
+    )
+}
+
+fn create_through_policy(
+    policy: &dyn FuseMountPolicy,
+    backend: &GroupGatedCreate,
+    gid: u32,
+    groups: &[u32],
+    lookups: &std::sync::atomic::AtomicUsize,
+) -> afs_error::Result<CreatedFile> {
     create_resolving_groups(
+        policy,
         backend,
         create_context(gid),
         |_| {
@@ -318,6 +335,45 @@ fn create_resolves_supplementary_groups_only_after_a_denial() {
             Err(error) => error,
         };
         assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED);
-        assert!(backend.seen.lock().unwrap().len() <= 2, "at most one retry");
+        assert_eq!(
+            backend.seen.lock().unwrap().len(),
+            if groups.is_empty() { 1 } else { 2 },
+            "retry exactly once only when supplementary groups are available"
+        );
+    }
+}
+
+/// OwnerFs and default mounts keep the first backend result, even when
+/// supplementary groups could turn a permission denial into a successful create.
+#[test]
+fn non_dfs_create_does_not_resolve_groups_or_retry() {
+    use super::policy::DefaultFusePolicy;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let home = HomeLikePolicy::default();
+    let default = DefaultFusePolicy;
+    for policy in [&home as &dyn FuseMountPolicy, &default] {
+        let lookups = AtomicUsize::new(0);
+        let backend = GroupGatedCreate::default();
+        create_through_policy(policy, &backend, 2000, &[3000], &lookups).unwrap();
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(*backend.seen.lock().unwrap(), vec![Vec::<u32>::new()]);
+
+        let backend = GroupGatedCreate::default();
+        let error = match create_through_policy(policy, &backend, 1000, &[2000], &lookups) {
+            Ok(_) => panic!("a non-DFS mount must keep the first permission denial"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED);
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            0,
+            "no supplementary group lookup"
+        );
+        assert_eq!(
+            *backend.seen.lock().unwrap(),
+            vec![Vec::<u32>::new()],
+            "one backend call"
+        );
     }
 }

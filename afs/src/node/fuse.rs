@@ -2256,6 +2256,7 @@ impl Filesystem for AfsFuse {
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
                 create_resolving_groups(
+                    self.policy.as_ref(),
                     backend,
                     context.clone(),
                     request_groups,
@@ -2651,11 +2652,13 @@ fn with_cached_view_size(
 
 /// One create on behalf of the kernel caller. The backend checks the caller
 /// against the parent directory, and a FUSE header carries only uid and
-/// primary gid. Resolving supplementary groups reads /proc, so it is paid
-/// only when the backend refuses that identity: the create is then sent once
-/// more with the groups. A refusal leaves nothing behind to undo.
+/// primary gid. Only the DFS mount policy enables a retry after permission
+/// denial, when Meta has left nothing behind to undo. Resolving supplementary
+/// groups reads /proc, so it is paid only then. Other mounts keep the first
+/// backend result without resolving groups or retrying.
 #[allow(clippy::too_many_arguments)]
 fn create_resolving_groups(
+    policy: &dyn FuseMountPolicy,
     backend: &dyn Backend,
     mut context: RequestContext,
     groups: impl FnOnce(&RequestContext) -> Vec<u32>,
@@ -2666,7 +2669,10 @@ fn create_resolving_groups(
     options: OpenOptions,
 ) -> afs_error::Result<crate::node::vfs::types::CreatedFile> {
     match backend.create_with_options(&context, parent, name, mode, flags, options) {
-        Err(error) if error.code() == afs_error::IO_PERMISSION_DENIED => {
+        Err(error)
+            if error.code() == afs_error::IO_PERMISSION_DENIED
+                && policy.resends_denied_with_groups() =>
+        {
             let groups = groups(&context);
             if groups.is_empty() {
                 return Err(error);
