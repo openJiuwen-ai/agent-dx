@@ -1,0 +1,24 @@
+{{- if eq .Values.deployment_component "adx-node" }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: adx-node-control-egress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels: {app: adx-node}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {app: redis}
+      ports: [{protocol: TCP, port: 6379}]
+    - to:
+        - podSelector:
+            matchLabels: {app: coordinator}
+      ports: [{protocol: TCP, port: 17000}]
+    - to:
+        - podSelector:
+            matchLabels: {app: apiserver}
+      ports: [{protocol: TCP, port: 8888}]
+{{- end }}

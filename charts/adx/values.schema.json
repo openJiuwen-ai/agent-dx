@@ -1,0 +1,288 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "images",
+    "components",
+    "secrets",
+    "dependencies",
+    "node",
+    "node_identities",
+    "sandbox_network",
+    "resource_quota",
+    "scheduling",
+    "namespace",
+    "tenant",
+    "platform_namespace",
+    "agent_namespace",
+    "deployment_component",
+    "kubernetes_scheduling",
+    "managed_dependencies",
+    "runtime_payload_path"
+  ],
+  "properties": {
+    "images": {
+      "type": "object",
+      "required": [
+        "coordinator",
+        "apiserver",
+        "activator",
+        "ingress",
+        "adx-node"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "coordinator": {
+          "type": "string",
+          "pattern": "^[^\\s]+@sha256:[0-9a-f]{64}$"
+        },
+        "apiserver": {
+          "type": "string",
+          "pattern": "^[^\\s]+@sha256:[0-9a-f]{64}$"
+        },
+        "activator": {
+          "type": "string",
+          "pattern": "^[^\\s]+@sha256:[0-9a-f]{64}$"
+        },
+        "ingress": {
+          "type": "string",
+          "pattern": "^[^\\s]+@sha256:[0-9a-f]{64}$"
+        },
+        "adx-node": {
+          "type": "string",
+          "pattern": "^[^\\s]+@sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "components": {
+      "type": "object"
+    },
+    "secrets": {
+      "type": "object",
+      "required": [
+        "runtime",
+        "registry",
+        "obs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "minLength": 1
+        },
+        "registry": {
+          "type": "string",
+          "minLength": 1
+        },
+        "obs": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "required": [
+        "redis_host"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "redis_host": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "jiuwen": false,
+    "accounts": false,
+    "node": {
+      "type": "object",
+      "required": [
+        "runtime_control_port",
+        "sfs",
+        "checkpoint_storage",
+        "pvc_size",
+        "storage_class",
+        "dns_address",
+        "sandbox_gateway_cidr",
+        "sandbox_target_cidr",
+        "max_sandboxes",
+        "filestore_size",
+        "sandbox_rootfs_size",
+        "dns_options"
+      ],
+      "properties": {
+        "runtime_control_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "not": {
+            "enum": [
+              17001,
+              17091,
+              18081,
+              18443,
+              19443,
+              16061
+            ]
+          }
+        },
+        "start_ordinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "data_storage": {
+          "enum": [
+            "pvc",
+            "emptyDir"
+          ]
+        }
+      }
+    },
+    "node_identities": {
+      "type": "object",
+      "required": [
+        "capacity",
+        "private_secret",
+        "public_secret"
+      ],
+      "properties": {
+        "capacity": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "private_secret": {
+          "type": "string",
+          "minLength": 1
+        },
+        "public_secret": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "sandbox_network": {
+      "type": "object"
+    },
+    "resource_quota": {
+      "type": "object"
+    },
+    "scheduling": {
+      "type": "object"
+    },
+    "namespace": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tenant": {
+      "type": "string",
+      "minLength": 1
+    },
+    "platform_namespace": {
+      "type": "string",
+      "minLength": 1
+    },
+    "agent_namespace": {
+      "type": "string",
+      "minLength": 1
+    },
+    "deployment_component": {
+      "enum": [
+        "coordinator",
+        "apiserver",
+        "activator",
+        "ingress",
+        "adx-node",
+        "budget",
+        "dependencies"
+      ]
+    },
+    "kubernetes_scheduling": {
+      "type": "object",
+      "properties": {
+        "node_names": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "required": [
+        "node_names"
+      ]
+    },
+    "managed_dependencies": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "redis"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "redis": {
+          "type": "object",
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "use_image_entrypoint": {
+              "type": "boolean"
+            },
+            "image": {
+              "type": "string",
+              "pattern": "^[^\\s]+@sha256:[0-9a-f]{64}$"
+            },
+            "resources": {
+              "type": "object"
+            },
+            "secret": {
+              "type": "string",
+              "minLength": 1
+            },
+            "storage_class": {
+              "type": "string"
+            },
+            "pvc_size": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "image",
+                  "resources",
+                  "secret",
+                  "storage_class",
+                  "pvc_size"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "runtime_payload_path": {
+      "type": "string",
+      "pattern": "^/opt/adx/runtime/[0-9a-f]{64}\\.erofs$"
+    },
+    "orbit": false,
+    "digitalmate": false
+  }
+}
