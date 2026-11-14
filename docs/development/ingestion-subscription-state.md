@@ -144,3 +144,10 @@ M44 transport, OAuth, trigger callbacks, wake/receiver delivery and Hong Kong/SF
 acceptance remain separate. On consumer restart, an already deleted connection
 whose old binding is absent from its cache/queue is not automatically discovered;
 this implementation does not claim all such provider triggers were disabled.
+
+Final source verification uses merge `d8c4743eceedefd87370ce97651ca55eb43459a6`,
+including official `18f9c673812dbc988185136011023ea28bdd38f7` and its processing
+deadline polling fix. That combination again passes348 ordinary cases/28 ignored,
+the same four explicit fresh-database cases, and focused library Clippy with
+warnings denied. Explicit seven-file formatting and documentation checks pass.
+Full-workspace gates and real cloud/provider acceptance are not claimed.

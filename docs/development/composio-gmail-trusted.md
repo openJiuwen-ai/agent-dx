@@ -480,3 +480,20 @@ background SendError panic remains in the successful ordinary log. Global fmt
 on this Windows CRLF checkout reports988 newline-style diagnostics and no code
 diffs; full-workspace Clippy and actual Gateway-to-M44/Outlook/report/SFS/device
 acceptance are still open. These results do not claim deployed mail delivery.
+
+## Formal subscription synchronization follow-up
+
+`POST /api/digitalmate/connectors/v1/composio/subscription` now consumes the real
+normal connector identity and a strict connection-only body. Prepared startup
+shares the typed M44 authority, project client/budget and existing ingestion
+Inbox; no second queue, connection writer, pool or lifecycle service is created.
+Without ingestion, OAuth and mail still work while synchronization fails closed.
+See the [subscription contract and exact verification scope](ingestion-subscription-state.md#formal-subscription-http-assembly).
+
+HTTP/Prepared increment `ebc2932970eb5c7a14fa35aea88d90c06295eac0` is combined
+with official master `18f9c673812dbc988185136011023ea28bdd38f7` in
+`d8c4743eceedefd87370ce97651ca55eb43459a6`. The merged source passes348 ordinary
+Gateway cases/28 ignored, four additional explicit PostgreSQL/actual startup
+cases, focused library Clippy, explicit changed-file formatting and docs checks.
+The HTTP/PG case uses the actual project client and Inbox but controlled intent
+and provider replies; real M44, OAuth, callbacks and HK/SFS remain unaccepted.
