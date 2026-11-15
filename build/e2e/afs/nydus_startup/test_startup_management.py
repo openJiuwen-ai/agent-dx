@@ -2,9 +2,11 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "tools" / "nydus-startup"))
-from startup import choose_targets, warm_payload
+from startup import choose_targets, run_job, warm_payload
 
 
 class StartupManagementTests(unittest.TestCase):
@@ -40,3 +42,20 @@ class StartupManagementTests(unittest.TestCase):
         plan["manifest"] = "sha256:other"
         with self.assertRaisesRegex(ValueError, "manifest"):
             warm_payload(image, plan, "request")
+
+    def test_job_restarts_on_accepting_node_with_same_request_id(self):
+        node = {"node_id": "afs-b", "management_rest_addr": "https://b.example.test"}
+        payload = {"request_id": "worker-request"}
+        missing = HTTPError(node["management_rest_addr"], 404, "restarted", {}, None)
+        with patch("startup.secret", return_value="token"), patch("startup.time.sleep"):
+            with patch("startup.admin") as admin:
+                admin.side_effect = [
+                    {"job_id": "first", "state": "queued"}, missing,
+                    {"job_id": "second", "state": "queued"}, {"job_id": "second", "state": "ready"},
+                ]
+                reply = run_job(node, "prewarm", payload, {})
+        self.assertEqual(reply["node_id"], "afs-b")
+        self.assertEqual(reply["job_id"], "second")
+        self.assertEqual([call.args[0] for call in admin.call_args_list], [node["management_rest_addr"]] * 4)
+        self.assertEqual(admin.call_args_list[0], admin.call_args_list[2])
+        self.assertEqual(admin.call_args_list[3].args[1], "/v1/admin/nydus/prewarm-jobs/second")
