@@ -34,6 +34,38 @@ pub fn router(meta: Arc<Meta>) -> Router {
         .route("/metrics", get(metrics))
         .with_state(meta)
 }
+pub(super) fn discovery_router(meta: Arc<Meta>, token: crate::management::AdminToken) -> Router {
+    Router::new()
+        .route("/v1/admin/nodes", get(list_nodes))
+        .route_layer(axum::middleware::from_fn_with_state(token, crate::management::require_admin))
+        .with_state(meta)
+}
+
+async fn list_nodes(State(meta): State<Arc<Meta>>) -> Result<Json<Value>, crate::error::RestError> {
+    let store = meta.store.as_deref().ok_or_else(|| crate::error::RestError(unavailable_meta_store()))?;
+    let snapshot = store.read(MetaRead::CurrentNodeSessions).await?;
+    let now = now_unix_ms();
+    let advertisements = meta.management_nodes.read()
+        .map_err(|_| crate::error::RestError(unavailable_meta_store()))?;
+    let nodes = snapshot.entities.into_iter().filter_map(|entity| {
+        let MetaEntity::NodeSession(session) = entity else { return None; };
+        let advertisement = advertisements.get(&session.node_id)
+            .filter(|(epoch, id, _)| *epoch == session.lease_epoch && *id == session.session_id)
+            .map(|(_, _, advertisement)| advertisement);
+        Some(json!({
+            "node_id": session.node_id,
+            "online": session.is_live_at_unix_ms(now),
+            "has_dfs_storage": !session.storage_devices.is_empty(),
+            "management_rest_addr": advertisement.map(|value| &value.management_rest_addr),
+            "connectors": advertisement.map_or(&[][..], |value| value.connectors.as_slice()),
+            "deployment": advertisement.map(|value| &value.deployment),
+            "role": advertisement.map(|value| if value.adx_worker_id.is_some() {"worker"} else {"seed"}),
+            "adx_worker_id": advertisement.and_then(|value| value.adx_worker_id.as_ref()),
+        }))
+    }).collect::<Vec<_>>();
+    Ok(Json(json!({"snapshot_revision": snapshot.revision.0, "nodes": nodes})))
+}
+
 async fn store_statistics(
     State(meta): State<Arc<Meta>>,
 ) -> Result<Json<Value>, crate::error::RestError> {
@@ -286,4 +318,23 @@ async fn chunk_replication(
         response["backend_reachability"] = json!("not_probed");
     }
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn node_discovery_requires_management_authentication() {
+        let meta = Arc::new(Meta::new("test".into(), crate::runtime::Observability::new().unwrap()));
+        let app = router(meta.clone()).merge(discovery_router(
+            meta, crate::management::test_token("0123456789abcdef0123456789abcdef"),
+        ));
+        let response = app.oneshot(
+            Request::builder().uri("/v1/admin/nodes").body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }

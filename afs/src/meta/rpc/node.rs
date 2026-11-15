@@ -63,6 +63,8 @@ impl MetaService for MetaRpc {
             )));
         }
         require_text(&node.session_id, "node.session_id")?;
+        let advertisement = crate::management::NodeAdvertisement::from_registration(&node.labels, &node.capabilities)
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
         let endpoint = node
             .endpoint
             .ok_or_else(|| invalid("node.endpoint is required"))?;
@@ -104,6 +106,17 @@ impl MetaService for MetaRpc {
             )
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        {
+            let mut nodes = self.0.management_nodes.write()
+                .map_err(|_| Status::internal("management advertisement lock poisoned"))?;
+            if !nodes.get(&session.node_id).is_some_and(|(epoch, _, _)| *epoch > session.lease_epoch) {
+                if let Some(advertisement) = advertisement {
+                    nodes.insert(session.node_id.clone(), (session.lease_epoch, session.session_id.clone(), advertisement));
+                } else {
+                    nodes.remove(&session.node_id);
+                }
+            }
+        }
         // C-1 restart gate: a Node without DFS has no readers to report.
         if let Some(dfs) = &self.0.dfs {
             dfs.note_node_registration(&session.node_id, &session.session_id, dfs_node);

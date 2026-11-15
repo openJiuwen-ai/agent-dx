@@ -51,12 +51,13 @@ pub(super) async fn run_node(
 ) -> Result<(), BoxError> {
     // 1–2. Bind all TCP ingress before spawning services. A failed bind
     // cannot leave a half-ready Node. Storage opens before registration.
+    let management_labels = cfg.management.registration_labels()?;
     let metrics = common::FsMetrics::register(&obs)?;
     let ingress = common::TcpIngress::bind(&cfg).await?;
     let startup = common::Startup::resolve(&cfg)?;
     let storage = common::NodeStorage::open(&cfg, &obs)?;
     // 3–4. No FUSE mount or local API exists yet.
-    let node_descriptor = common::node_descriptor(&cfg, &startup, &storage);
+    let node_descriptor = common::node_descriptor(&cfg, &startup, &storage, management_labels);
     let registration =
         common::InitialRegistration::register(&cfg, &startup, node_descriptor.as_ref()).await?;
     // 5–9.
