@@ -127,6 +127,12 @@ pub struct WorkspaceBindConfig {
     pub workspace: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceApiConfig {
+    pub listen: SocketAddr,
+}
+
 /// External object storage durability. Deployment of the S3 service is external
 /// to AFS. Credentials remain in the process environment or an administrator file.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -652,6 +658,10 @@ struct FileConfig {
     ownerfs_mount: Option<PathBuf>,
     experimental_ownerfs_workspace_bind: Option<bool>,
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
+    ownerfs_workspace_api: Option<WorkspaceApiConfig>,
+    ownerfs_workspace_default_user: Option<String>,
+    ownerfs_workspace_default_uid: Option<u32>,
+    ownerfs_workspace_default_gid: Option<u32>,
     ownerfs_workspace_egress_root: Option<PathBuf>,
     outlet_public_root: Option<PathBuf>,
     outlet_import_root: Option<PathBuf>,
@@ -789,6 +799,10 @@ pub struct Config {
     pub ownerfs_mount: Option<PathBuf>,
     pub experimental_ownerfs_workspace_bind: bool,
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
+    pub ownerfs_workspace_api: Option<WorkspaceApiConfig>,
+    pub ownerfs_workspace_default_user: String,
+    pub ownerfs_workspace_default_uid: Option<u32>,
+    pub ownerfs_workspace_default_gid: Option<u32>,
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
     /// Outlet public (name) layer. `Some` only when all outlet paths are
     /// configured; the feature is off otherwise.
@@ -990,6 +1004,12 @@ impl Config {
                 .or(file.experimental_ownerfs_workspace_bind)
                 .unwrap_or(false),
             ownerfs_workspace_bind: file.ownerfs_workspace_bind,
+            ownerfs_workspace_api: file.ownerfs_workspace_api,
+            ownerfs_workspace_default_user: file
+                .ownerfs_workspace_default_user
+                .unwrap_or_else(|| "agentos".into()),
+            ownerfs_workspace_default_uid: file.ownerfs_workspace_default_uid,
+            ownerfs_workspace_default_gid: file.ownerfs_workspace_default_gid,
             ownerfs_workspace_egress_root: cli
                 .ownerfs_workspace_egress_root
                 .or(file.ownerfs_workspace_egress_root),

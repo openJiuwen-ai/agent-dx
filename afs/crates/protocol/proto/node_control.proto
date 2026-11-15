@@ -24,6 +24,10 @@ service NodeControl {
 service OwnerControl {
   // Prepare and activate a durable workspace reservation on its Home.
   rpc PrepareOwnerRoot(PrepareOwnerRootRequest) returns (PrepareOwnerRootReply);
+  rpc WorkspaceDefaults(WorkspaceDefaultsRequest) returns (WorkspaceDefaultsReply);
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceReply);
+  // Read a workspace root's owner and mode on its Home without peer admission.
+  rpc WorkspaceAttributes(WorkspaceAttributesRequest) returns (WorkspaceAttributesReply);
   // Home owns advisory lock authority; no file payload travels here.
   rpc OwnerGetLock(OwnerGetLockRequest) returns (OwnerGetLockReply);
   rpc OwnerSetLock(OwnerSetLockRequest) returns (OwnerSetLockReply);
@@ -60,6 +64,15 @@ message PrepareOwnerRootRequest {
 }
 
 message PrepareOwnerRootReply {}
+
+message WorkspaceDefaultsRequest {}
+message WorkspaceDefaultsReply { uint32 uid = 1; uint32 gid = 2; }
+
+message DeleteWorkspaceRequest { string root_id = 1; uint64 expected_epoch = 2; string requester_session_id = 3; }
+message DeleteWorkspaceReply {}
+
+message WorkspaceAttributesRequest { string root_id = 1; uint64 epoch = 2; }
+message WorkspaceAttributesReply { uint32 uid = 1; uint32 gid = 2; uint32 mode = 3; }
 
 message NegotiateDataRequest {
   bytes client_info = 1;

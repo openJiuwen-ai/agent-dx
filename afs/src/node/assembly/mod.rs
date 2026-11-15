@@ -130,6 +130,24 @@ pub(super) async fn run_node(
         &mut services,
     );
     background::RestServer::new(ingress.rest, state.clone(), connector_routes).start(&mut services);
+    #[cfg(feature = "ownerfs")]
+    if let Some(listener) = ingress.workspace {
+        let control = backends.ownerfs.outlet_control.as_ref().ok_or_else(|| {
+            afs_error::Error::coded(afs_error::CONFIG_INVALID, "Workspace API requires Meta")
+        })?;
+        let api = crate::node::api::workspace::WorkspaceApi::new(
+            state.clone(),
+            control.meta.clone(),
+            backends.peer_connections.clone(),
+        )?;
+        let stop = services.stop.subscribe();
+        services.spawn(async move {
+            axum::serve(listener, api.router())
+                .with_graceful_shutdown(crate::runtime::cancelled(stop))
+                .await
+                .map_err(Into::into)
+        });
+    }
     endpoints.into_sweeper().start(&mut services);
     // Multi-workspace bind mount is handled by MountManager via mkdir triggers.
     // No single-workspace startup worker is needed.

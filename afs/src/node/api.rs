@@ -9,3 +9,5 @@ pub mod rest;
 pub mod usrbio;
 #[cfg(all(test, feature = "dfs"))]
 mod usrbio_e2e;
+#[cfg(feature = "ownerfs")]
+pub(crate) mod workspace;
