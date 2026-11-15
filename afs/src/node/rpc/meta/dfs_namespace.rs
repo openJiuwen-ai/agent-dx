@@ -419,6 +419,24 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         )
     }
 
+    fn release_write_leases(
+        &self,
+        operation: &crate::dfs::OperationId,
+        leases: &[crate::dfs::WriteLease],
+    ) -> afs_error::Result<u64> {
+        let reply = self
+            .run(self.client().release_write_leases(
+                afs_protocol::meta::ReleaseDfsWriteLeasesRequest {
+                    caller_id: self.node_id.clone(),
+                    owner_session_id: self.session_id.clone(),
+                    operation_id: operation.0.clone(),
+                    leases: leases.iter().cloned().map(wire_dfs_write_lease).collect(),
+                },
+            ))?
+            .into_inner();
+        Ok(reply.released)
+    }
+
     fn get_inode(
         &self,
         inode_id: &crate::dfs::InodeId,

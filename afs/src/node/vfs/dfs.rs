@@ -33,6 +33,7 @@ mod handles;
 mod identity;
 mod inode_map;
 mod lazy_fill;
+mod lease_handoff;
 mod lock_authority;
 mod lock_entry;
 mod lock_proxy_client;
@@ -64,6 +65,7 @@ use gc::*;
 use handles::*;
 use identity::*;
 use inode_map::*;
+use lease_handoff::LeaseHandoff;
 use lock_authority::*;
 use lock_proxy_client::*;
 pub use meta_port::{DfsMeta, DfsNodeLocation, DfsRemoteOwnerFactory, OpenedForRead};
@@ -142,6 +144,7 @@ pub struct DistributedFs {
     versions: VersionCache,
     gc: GcCoordinator,
     writes: InodeWriteTable,
+    lease_handoff: LeaseHandoff,
     write_resources: WriteResources,
     write_timeout: Duration,
     locks: LockService,
@@ -207,6 +210,7 @@ impl DistributedFs {
             versions: VersionCache::default(),
             gc: GcCoordinator::default(),
             writes: InodeWriteTable::default(),
+            lease_handoff: LeaseHandoff::default(),
             write_resources: WriteResources::default(),
             write_timeout: Duration::from_secs(30),
             locks: LockService::default(),

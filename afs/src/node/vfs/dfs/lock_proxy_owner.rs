@@ -158,8 +158,9 @@ impl DistributedFs {
         peer: &str,
         authority: afs_protocol::node_control::DfsOwnerLockAuthority,
     ) -> Result<(InodeId, Arc<DfsLockAuthority>)> {
+        let inode_id = InodeId::new(authority.inode_id.clone());
+        let _lease_admission = self.lease_admission(&inode_id)?;
         let lease = self.validate_lock_authority(peer, &authority)?;
-        let inode_id = InodeId::new(authority.inode_id);
         Ok((
             inode_id.clone(),
             self.local_lock_authority(&inode_id, lease)?,

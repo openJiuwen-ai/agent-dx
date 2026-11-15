@@ -414,7 +414,12 @@ impl DfsAssembly {
             tokio::runtime::Handle::current(),
             Some(dfs_read_work_metrics.clone()),
         )?;
-        let fs = fs.with_write_timeout(std::time::Duration::from_millis(cfg.dfs_write_timeout_ms));
+        let fs = fs
+            .with_write_timeout(std::time::Duration::from_millis(cfg.dfs_write_timeout_ms))
+            .with_write_handoff_prototype(
+                std::env::var_os("AFS_DFS_WRITE_HANDOFF_PROTOTYPE")
+                    .is_some_and(|value| value == "1"),
+            );
         self.instance = Some(Arc::new(fs));
         Ok(())
     }
@@ -517,8 +522,12 @@ pub(super) fn start_background(
     .start(services);
     dfs.start_distributed_cache(services);
     let renewing = dfs.clone();
-    fault::lease_keeper::LeaseKeeper::new(move || renewing.renew_active_write_leases())
-        .start(services);
+    fault::lease_keeper::LeaseKeeper::new(move || {
+        let renewals = renewing.renew_active_write_leases();
+        let releases = renewing.release_idle_leases();
+        renewals.and_then(|renewed| releases.map(|released| renewed + released))
+    })
+    .start(services);
     background::tick::DfsBackgroundTick::new(
         dfs,
         std::time::Duration::from_millis(cfg.dfs_background_commit_ms),

@@ -882,6 +882,7 @@ impl DistributedFs {
         })?;
         state.open_writers = state.open_writers.saturating_add(1);
         state.last_writer_background_requested = false;
+        self.cancel_idle_lease(&inode.inode_id)?;
         let session_id = DfsWriteSessionId::new(format!(
             "{}-write-session-{}",
             self.identity.session_id,

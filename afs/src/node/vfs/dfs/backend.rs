@@ -221,6 +221,11 @@ impl Backend for DistributedFs {
             unix_ms_of(time)?;
         }
         let inode_id = self.inode_id(inode)?;
+        let _lease_admission = if handle.is_none() || options.kill_suidgid {
+            self.lease_admission(&inode_id)?
+        } else {
+            None
+        };
         if change.size.is_some() && lazy_fill::sealed(&self.meta.get_inode(&inode_id)?) {
             return Err(invalid("immutable-origin file length cannot change"));
         }
@@ -359,36 +364,58 @@ impl Backend for DistributedFs {
                 Some((handle, accepted_seq)),
             )
         } else {
-            let (record, write_lease) = self.meta.open_write(&inode_id)?;
-            let mut record = self.validate_inode(record)?;
-            if record.kind != InodeKind::Regular {
-                return Err(Error::from(std::io::Error::from_raw_os_error(libc::EISDIR)));
-            }
-            if write_lease.owner_node_id == self.identity.node_id
-                && write_lease.owner_session_id == self.identity.session_id
-            {
-                self.install_write_state(record.clone(), write_lease)?;
-                self.resize_dirty_inode(&record.inode_id, length, options.kill_suidgid, None)?;
-            } else {
-                let previous_provider = self
-                    .write_coordinator
-                    .current_remote_provider(&record.inode_id)?;
-                let mut session = self.open_remote_write_session(
-                    &record,
-                    &write_lease,
-                    libc::O_WRONLY,
-                    OpenOptions {
-                        kill_suidgid: options.kill_suidgid,
-                    },
-                )?;
-                match self
-                    .write_coordinator
-                    .remote_resize(&session, length, options)
+            let mut retry_handoff = self.lease_handoff.enabled;
+            loop {
+                let (record, write_lease) = self.meta.open_write(&inode_id)?;
+                let mut record = self.validate_inode(record)?;
+                if record.kind != InodeKind::Regular {
+                    return Err(Error::from(std::io::Error::from_raw_os_error(libc::EISDIR)));
+                }
+                if write_lease.owner_node_id == self.identity.node_id
+                    && write_lease.owner_session_id == self.identity.session_id
                 {
-                    Ok(accepted_seq) => {
-                        session.local.last_accepted_seq = accepted_seq;
+                    self.install_write_state(record.clone(), write_lease)?;
+                    self.resize_dirty_inode(&record.inode_id, length, options.kill_suidgid, None)?;
+                } else {
+                    let previous_provider = self
+                        .write_coordinator
+                        .current_remote_provider(&record.inode_id)?;
+                    let mut session = match self.open_remote_write_session(
+                        &record,
+                        &write_lease,
+                        libc::O_WRONLY,
+                        OpenOptions {
+                            kill_suidgid: options.kill_suidgid,
+                        },
+                    ) {
+                        Ok(session) => session,
+                        Err(error)
+                            if retry_handoff
+                                && error.code() == afs_error::NODE_DFS_STALE_HANDLE =>
+                        {
+                            retry_handoff = false;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    match self
+                        .write_coordinator
+                        .remote_resize(&session, length, options)
+                    {
+                        Ok(accepted_seq) => {
+                            session.local.last_accepted_seq = accepted_seq;
+                        }
+                        Err(error) => {
+                            let _ = self.close_temporary_remote_write_session(
+                                &record.inode_id,
+                                &session,
+                                previous_provider.clone(),
+                            );
+                            return Err(error);
+                        }
                     }
-                    Err(error) => {
+                    if let Err(error) = self.write_coordinator.remote_sync(&session, SyncMode::Full)
+                    {
                         let _ = self.close_temporary_remote_write_session(
                             &record.inode_id,
                             &session,
@@ -396,23 +423,15 @@ impl Backend for DistributedFs {
                         );
                         return Err(error);
                     }
-                }
-                if let Err(error) = self.write_coordinator.remote_sync(&session, SyncMode::Full) {
-                    let _ = self.close_temporary_remote_write_session(
+                    self.close_temporary_remote_write_session(
                         &record.inode_id,
                         &session,
-                        previous_provider.clone(),
-                    );
-                    return Err(error);
+                        previous_provider,
+                    )?;
+                    record = self.observe_inode_record(self.meta.get_inode(&inode_id)?)?;
                 }
-                self.close_temporary_remote_write_session(
-                    &record.inode_id,
-                    &session,
-                    previous_provider,
-                )?;
-                record = self.observe_inode_record(self.meta.get_inode(&inode_id)?)?;
+                break (record, None);
             }
-            (record, None)
         };
         if let Some((handle, accepted_seq)) = accepted_seq {
             self.update_handle_write_progress(handle, accepted_seq)?;
@@ -651,55 +670,74 @@ impl Backend for DistributedFs {
             return Err(invalid("immutable-origin files only allow read opens"));
         }
         let (opened_inode, write_session) = if writable {
-            let (inode, write_lease) = self.meta.resolve_write_authority(&inode_id)?;
-            let inode = self.validate_inode(inode)?;
-            let session = if write_lease.owner_node_id == self.identity.node_id
-                && write_lease.owner_session_id == self.identity.session_id
-            {
-                self.install_write_state(inode.clone(), write_lease.clone())?;
-                let session = self.open_write_session(&inode, flags)?;
-                let session = Self::make_local_write_session(session);
-                if options.kill_suidgid {
-                    let state = self
-                        .write_state(&inode.inode_id)?
-                        .ok_or_else(|| stale("DFS write state is no longer open"))?;
-                    let mut state = self.lock_for_mutation(&inode.inode_id, &state)?;
-                    Self::apply_kernel_killpriv_to_state(&mut state);
-                }
-                if flags & libc::O_TRUNC != 0
-                    && let Err(error) =
-                        self.resize_dirty_inode(&inode.inode_id, 0, options.kill_suidgid, None)
+            let mut retry_handoff = self.lease_handoff.enabled;
+            loop {
+                let lease_admission = self.lease_admission(&inode_id)?;
+                let (inode, write_lease) = self.meta.resolve_write_authority(&inode_id)?;
+                let inode = self.validate_inode(inode)?;
+                let session = if write_lease.owner_node_id == self.identity.node_id
+                    && write_lease.owner_session_id == self.identity.session_id
                 {
-                    self.abandon_writer(&session.local)?;
-                    return Err(error);
-                }
-                session
-            } else {
-                let previous_provider = self
-                    .write_coordinator
-                    .current_remote_provider(&inode.inode_id)?;
-                let session =
-                    self.open_remote_write_session(&inode, &write_lease, flags, options)?;
-                if flags & libc::O_TRUNC != 0
-                    && let Err(error) = self.write_coordinator.remote_resize(
-                        &session,
-                        0,
-                        SetAttrOptions {
-                            kill_suidgid: options.kill_suidgid,
-                            timestamps_now: false,
-                        },
-                    )
-                {
-                    let _ = self.close_temporary_remote_write_session(
-                        &inode.inode_id,
-                        &session,
-                        previous_provider,
-                    );
-                    return Err(error);
-                }
-                session
-            };
-            (inode, Some(session))
+                    self.install_write_state(inode.clone(), write_lease.clone())?;
+                    let session = self.open_write_session(&inode, flags)?;
+                    let session = Self::make_local_write_session(session);
+                    if options.kill_suidgid {
+                        let state = self
+                            .write_state(&inode.inode_id)?
+                            .ok_or_else(|| stale("DFS write state is no longer open"))?;
+                        let mut state = self.lock_for_mutation(&inode.inode_id, &state)?;
+                        Self::apply_kernel_killpriv_to_state(&mut state);
+                    }
+                    if flags & libc::O_TRUNC != 0
+                        && let Err(error) =
+                            self.resize_dirty_inode(&inode.inode_id, 0, options.kill_suidgid, None)
+                    {
+                        self.abandon_writer(&session.local)?;
+                        return Err(error);
+                    }
+                    session
+                } else {
+                    drop(lease_admission);
+                    let previous_provider = self
+                        .write_coordinator
+                        .current_remote_provider(&inode.inode_id)?;
+                    let session = match self.open_remote_write_session(
+                        &inode,
+                        &write_lease,
+                        flags,
+                        options,
+                    ) {
+                        Ok(session) => session,
+                        Err(error)
+                            if retry_handoff
+                                && error.code() == afs_error::NODE_DFS_STALE_HANDLE =>
+                        {
+                            retry_handoff = false;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if flags & libc::O_TRUNC != 0
+                        && let Err(error) = self.write_coordinator.remote_resize(
+                            &session,
+                            0,
+                            SetAttrOptions {
+                                kill_suidgid: options.kill_suidgid,
+                                timestamps_now: false,
+                            },
+                        )
+                    {
+                        let _ = self.close_temporary_remote_write_session(
+                            &inode.inode_id,
+                            &session,
+                            previous_provider,
+                        );
+                        return Err(error);
+                    }
+                    session
+                };
+                break (inode, Some(session));
+            }
         } else {
             let inode = if self.read_engine.has_external_backend() {
                 self.refresh_inode_record(preflight, true, true)?
