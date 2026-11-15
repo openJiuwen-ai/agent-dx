@@ -61,15 +61,17 @@ async fn list_nodes(State(meta): State<Arc<Meta>>) -> Result<Json<Value>, crate:
             continue;
         };
         let online = session.is_live_at_unix_ms(now);
-        let announcement = advertisements.get(&session.node_id)
-            .filter(|record| record.epoch == session.lease_epoch && record.id == session.session_id);
+        let announcement = advertisements.get(&session.node_id).filter(|record| {
+            record.epoch == session.lease_epoch && record.id == session.session_id
+        });
         if online && announcement.is_none() {
             // Durable sessions can survive a Meta restart. Wait for those
             // sessions to renew instead of silently omitting workers from all.
             return Err(afs_error::Error::coded(
                 afs_error::NODE_VFS_UNAVAILABLE,
                 "waiting for live Node management announcements to renew",
-            ).into());
+            )
+            .into());
         }
         let advertisement = announcement.and_then(|record| record.management.as_ref());
         nodes.push(json!({
@@ -405,7 +407,10 @@ mod placement_tests {
             .await
             .unwrap();
         let response = list_nodes(State(meta.clone())).await.err().unwrap();
-        assert_eq!(crate::error::http_status(response.0.kind()), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            crate::error::http_status(response.0.kind()),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         meta.management_nodes.write().unwrap().insert(
             session.node_id,
             super::super::AdvertisedSession {
@@ -414,9 +419,10 @@ mod placement_tests {
                 management: None,
             },
         );
-        let Json(snapshot) = list_nodes(State(meta)).await.unwrap_or_else(|_| panic!("discovery unavailable"));
+        let Json(snapshot) = list_nodes(State(meta))
+            .await
+            .unwrap_or_else(|_| panic!("discovery unavailable"));
         assert_eq!(snapshot["nodes"][0]["node_id"], "worker");
         assert_eq!(snapshot["nodes"][0]["online"], true);
     }
-
 }

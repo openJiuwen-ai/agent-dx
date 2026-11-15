@@ -404,7 +404,13 @@ async fn explicit_placement_adds_only_the_named_node_after_policy_is_satisfied()
         chunk_id: before.chunk_id.clone(),
         target_node_id: "target".into(),
     };
-    assert!(!fixture.service.ensure_replica_placement(ensure.clone()).await.unwrap());
+    assert!(
+        !fixture
+            .service
+            .ensure_replica_placement(ensure.clone())
+            .await
+            .unwrap()
+    );
     let claim = fixture
         .service
         .claim_replication_task(ClaimReplicationTask {
@@ -418,37 +424,57 @@ async fn explicit_placement_adds_only_the_named_node_after_policy_is_satisfied()
         .unwrap()
         .unwrap();
     assert_eq!(
-        claim.replica_group.targets.iter().map(|target| target.node_id.as_str()).collect::<Vec<_>>(),
+        claim
+            .replica_group
+            .targets
+            .iter()
+            .map(|target| target.node_id.as_str())
+            .collect::<Vec<_>>(),
         ["writer", "target"],
     );
-    let durable_acks = claim.replica_group.targets.iter().map(|target| ReplicaAck {
-        operation_id: claim.operation_id.clone(),
-        chunk_id: claim.chunk.id.clone(),
-        placement_revision: claim.placement_revision,
-        placement_epoch: claim.replica_group.placement_epoch,
-        node_id: target.node_id.clone(),
-        node_epoch: target.node_epoch,
-        device_id: target.device.device_id.clone(),
-        device_epoch: target.device.device_epoch,
-        catalog_revision: target.device.catalog_revision,
-        persisted_bytes: claim.chunk.length,
-        verified_digest: claim.chunk.content_digest.clone(),
-    }).collect();
+    let durable_acks = claim
+        .replica_group
+        .targets
+        .iter()
+        .map(|target| ReplicaAck {
+            operation_id: claim.operation_id.clone(),
+            chunk_id: claim.chunk.id.clone(),
+            placement_revision: claim.placement_revision,
+            placement_epoch: claim.replica_group.placement_epoch,
+            node_id: target.node_id.clone(),
+            node_epoch: target.node_epoch,
+            device_id: target.device.device_id.clone(),
+            device_epoch: target.device.device_epoch,
+            catalog_revision: target.device.catalog_revision,
+            persisted_bytes: claim.chunk.length,
+            verified_digest: claim.chunk.content_digest.clone(),
+        })
+        .collect();
     let claim_epoch = claim.replica_group.placement_epoch;
-    let task = fixture.service.report_replication_task(ReportReplicationTask {
-        caller_id: "writer".into(),
-        caller_session_id: "writer-s1".into(),
-        caller_node_epoch: writer_epoch,
-        operation_id: OperationId::new("report-target"),
-        claim,
-        durable_acks,
-        error: None,
-        source_invalid: false,
-    }).await.unwrap();
+    let task = fixture
+        .service
+        .report_replication_task(ReportReplicationTask {
+            caller_id: "writer".into(),
+            caller_session_id: "writer-s1".into(),
+            caller_node_epoch: writer_epoch,
+            operation_id: OperationId::new("report-target"),
+            claim,
+            durable_acks,
+            error: None,
+            source_invalid: false,
+        })
+        .await
+        .unwrap();
     assert_eq!(task.placement_epoch, claim_epoch);
     assert_eq!(task.desired_copies, 2);
     ensure.operation_id = OperationId::new("confirm-target");
-    assert!(fixture.service.ensure_replica_placement(ensure).await.unwrap());
+    assert!(
+        fixture
+            .service
+            .ensure_replica_placement(ensure)
+            .await
+            .unwrap()
+    );
     let after = fixture.placement().await;
     assert_eq!(after.desired_copies, before.desired_copies);
     assert_eq!(after.replica_group_id, before.replica_group_id);
