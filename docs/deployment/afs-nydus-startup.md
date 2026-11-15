@@ -96,3 +96,26 @@ PY
 - 两个目标 worker 每批各启动 6 个沙箱，直供和接力各做两批，四批均在一秒内完成 **12/12** 条首命令。直供最慢 worker 热好用 **9.62–10.22 s**，含铺热的总时间 **18.11–18.47 s**。接力用 **15.74–19.50 s**，含铺热的总时间 **24.13–27.93 s**。种子发送量约减半；该拓扑种子与其中一个 worker 同机，物理跨机流量由 **21.40–22.48 MB** 增至 **46.78–47.43 MB**。总时间包含热好后约 **7.6 s** 的实验取证和调度。5000 个首条命令同一秒成功仍需在更大的环境验收。
 
 回退时停止新的预热批次，把 sandboxd 的 Registry proxy 恢复到之前的配置，用一条真实冷启动确认后再恢复批量发压。
+
+## 管理任务部署
+
+需要动态发现、完整铺种和逐台预热时，在 Meta 与提供管理任务的 Node 配置各自的管理 token 文件。Meta 复用当前会话列表提供节点发现，节点续租会刷新部署信息。部署方为 worker 设置当前 adxlet 的 `config.node_id`。AFS 节点 ID 独立取自 AFS Node TOML。
+
+```toml
+# Meta
+[management]
+token_file = "/run/secrets/afs-meta-admin"
+```
+
+```toml
+# 任一提供 Nydus 管理任务的 AFS Node
+[management]
+token_file = "/run/secrets/afs-node-admin"
+advertised_endpoint = "https://afs-worker-b-admin.example.com"
+deployment = "adx-prod"
+adx_worker_id = "worker-b" # 种子专用节点可省略
+```
+
+为工具配置能访问这些地址的鉴权 TLS 管理入口。sandboxd 原本的 Registry proxy 仍在本机。现有 Nydus 来源须保持一致，完整铺种使用原生 DFS 存储。工具及参数见 [管理工具](../../tools/nydus-startup/README.md#使用管理接口准备镜像)。
+
+Meta 的 `GET /v1/admin/nodes` 返回节点快照。Nydus connector 在各 Node 上提供 `POST /v1/admin/nydus/seed-jobs`、`POST /v1/admin/nydus/prewarm-jobs` 和各自的 `GET /{job_id}` 后缀。客户端把来源别名和固定 manifest digest 传给接收 Node。铺种额外传显式 `node_ids`，预热额外传采样得到的 blob 范围。工具生成 `request_id` 并轮询 POST 返回的 `job_id`。任务记录属于接收 Node，重启后可按相同请求重提，DFS 依据实际持久副本和缓存判断已完成工作。

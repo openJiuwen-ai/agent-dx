@@ -85,3 +85,44 @@ SHA-256。读取发生错误时退出非零，HTTP 阶段已完成的范围保�
 直供时用 `"waves": [{"B": "A", "C": "A"}]`。同一批中的命令并发执行，有命令失败时停止派发下一批。
 计划中的上游用于控制派发顺序，AFS 读取仍按现有来源视图选源。启动与流量验收见
 [部署教程](../../docs/deployment/afs-nydus-startup.md)。
+
+## 使用管理接口准备镜像
+
+`startup.py` 使用部署提供的管理地址和凭据。启用节点发现和任务接口后，工具可自动发现节点、完整铺种并向 worker 逐台下发启动范围。
+
+以下是工具配置 JSON。Registry 上传凭据由 nydusify 获取。受限 Registry 读取 manifest 时可增加 `registry_token_file`。管理 token 文件由运维部署，和 Registry 凭据分开。
+
+```json
+{
+  "meta_admin_url": "https://afs-meta-admin.example.com",
+  "meta_admin_token_file": "/run/secrets/afs-meta-admin",
+  "node_admin_token_file": "/run/secrets/afs-node-admin",
+  "deployment": "adx-prod",
+  "source": "startup",
+  "publish_target": "registry.example.com/team/rafs:startup",
+  "platform": "linux/amd64",
+  "seed_node_ids": ["seed-a"]
+}
+```
+
+`source` 必须对应节点上已启用 Registry proxy 的来源。该来源必须能够读取已发布镜像所在仓库。测试可在部署时配置临时 Registry。若上传和读取使用不同地址，`manifest_registry_url` 指定 SDK 也会访问的同一仓库读取地址。明文实验 Registry 需在隔离环境配置 `plain_http: true`。
+
+```sh
+startup() { python3 tools/nydus-startup/startup.py --config deployment.json "$@"; }
+
+startup convert --image registry.example.com/team/oci:app --output prepared
+startup discover
+startup seed --image prepared/image.json --node-id seed-a
+startup prewarm --image prepared/image.json --plan startup-plan.json
+```
+
+`convert` 输出具体平台的 `image.json` 和 Registry 原始 `manifest.json`。输出的 digest 引用可交给原版 ADX SDK。未给 `--node-id` 时，`seed` 使用配置的 `seed_node_ids`，或把发现时在线且有 DFS 存储的集群节点全部作为目标。工具只向一台可受理铺种的 Nydus Node 提交，并轮询该 Node 的任务。预热默认选当前部署中注册了 ADX worker ID 且启用 Nydus 的在线节点，逐台提交并检查本机缓存。
+
+也可在隔离的冷采样 worker 内直接运行下面的命令。该 worker 与其 sandboxd 和 AFS Node 共用网络命名空间，工具需访问现有 ADX SDK、`tcpdump`、`nydusify` 和管理入口。ADX 连接沿用 SDK 环境变量。采样绑定部署注册的 ADX worker ID，先运行真实命令校验内容，再为已发现的 worker 预热。
+
+```sh
+startup prepare --image registry.example.com/team/oci:app --output prepared \
+  --sample-worker afs-worker-b --expect-stdout "$EXPECTED_STDOUT" -- /bin/sha256sum /startup.txt
+```
+
+`ready` 在铺种时表示指定持久副本已在 Meta 登记，在预热时表示任务完成时范围已可在对应 worker 本机读出。长时间后的缓存状态随容量和淘汰变化。
