@@ -6,14 +6,11 @@
 //! Enabling the Node side later needs no protocol change. A release ends a
 //! lease by moving its expiry to now: the entity stays, its epoch unchanged,
 //! so the next acquire finds it expired and takes the next epoch, which
-//! fences a proxy session on the old one. (GC deletes expired lease
-//! entities; an acquire after that starts again at epoch 1, as after any
-//! expiry. The fence is the owner, its session and the epoch together.) Each
-//! lease is
-//! released only if it still equals, field for field, the copy the Node
-//! presents: a renewal or re-acquire by the same owner moves the expiry and
-//! makes a late release a no-op. A lease that does not match is skipped, not
-//! an error: it is no longer the lease the Node meant to hand back.
+//! fences a proxy session on the old one. GC keeps the expired row until the
+//! inode is gone. Each lease is released only if it still equals, field for
+//! field, the copy the Node presents: a renewal or re-acquire by the same
+//! owner moves the expiry and makes a late release a no-op. A lease that does
+//! not match is skipped, since it is no longer the lease presented by the Node.
 //!
 //! The batch commits as one transaction recorded under the caller's
 //! operation id, so a retry after a lost reply replays instead of releasing a

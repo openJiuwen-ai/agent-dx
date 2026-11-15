@@ -1106,6 +1106,130 @@ async fn real_grpc_writable_reopen_resolves_write_authority_without_meta_mutatio
 
 #[cfg(feature = "dfs")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r110_grpc_reopen_preserves_write_epoch_across_gc() {
+    use crate::meta::{
+        dfs::DfsService,
+        store::{MetaEntity, MetaRead},
+    };
+    let (_temp, endpoint, _gate, server, store, local, _backend) = real_grpc_meta_fixture().await;
+    let (_meta, _chunks, fs) = grpc_dfs_test_fs(
+        "node-a",
+        "session-a",
+        &endpoint,
+        local,
+        Duration::from_secs(2),
+    )
+    .await;
+    let fs = Arc::new(fs);
+    let creating = fs.clone();
+    let created = run_blocking(move || {
+        creating.create(
+            &context(),
+            creating.root_inode(),
+            OsStr::new("r110-reopen"),
+            0o640,
+            libc::O_RDWR,
+        )
+    })
+    .await
+    .unwrap();
+    let inode = created.entry.inode;
+    let inode_id = fs.inode_id(inode).unwrap();
+    let read_lease = || async {
+        let entity = store
+            .read(MetaRead::DfsWriteLease(inode_id.clone()))
+            .await
+            .unwrap()
+            .entity;
+        match entity {
+            Some(MetaEntity::DfsWriteLease(lease)) => Some(lease),
+            None => None,
+            _ => panic!("unexpected entity for write lease key"),
+        }
+    };
+    let first = read_lease().await.unwrap();
+    assert_eq!(first.lease_epoch, 1);
+    let closing = fs.clone();
+    run_blocking(move || closing.release(&context(), created.handle))
+        .await
+        .unwrap();
+
+    let service = DfsService::new(store.clone());
+    // Release clamps expiry to now without removing the row. Use the same
+    // lease expiry predicate as natural expiry without a wall-clock sleep.
+    assert_eq!(
+        service
+            .release_write_leases(
+                "node-a".into(),
+                "session-a".into(),
+                OperationId::new("r110-expire-first"),
+                vec![first.clone()],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let opening = fs.clone();
+    let second_handle = run_blocking(move || opening.open(&context(), inode, libc::O_RDWR))
+        .await
+        .unwrap();
+    let second = read_lease().await.unwrap();
+    assert_eq!(second.lease_epoch, 2);
+    let closing = fs.clone();
+    run_blocking(move || closing.release(&context(), second_handle))
+        .await
+        .unwrap();
+    let cell = fs.write_state(&inode_id).unwrap().unwrap();
+    assert_eq!(cell.lock().unwrap().write_lease.lease_epoch, 2);
+    assert_eq!(
+        service
+            .release_write_leases(
+                "node-a".into(),
+                "session-a".into(),
+                OperationId::new("r110-expire-second"),
+                vec![second.clone()],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+
+    service
+        .collect_garbage("node-a".into(), "session-a".into(), 0, Vec::new())
+        .await
+        .unwrap();
+    let retained = read_lease().await.expect("linked inode keeps its epoch");
+    assert_eq!(retained.lease_epoch, second.lease_epoch);
+    assert!(retained.expires_at_unix_ms <= now_unix_ms());
+
+    let opening = fs.clone();
+    let handle = run_blocking(move || opening.open(&context(), inode, libc::O_RDWR))
+        .await
+        .expect("Node must accept the next epoch after GC");
+    let reissued = read_lease().await.unwrap();
+    assert_eq!(reissued.lease_epoch, 3);
+    assert_eq!(reissued.owner_node_id, second.owner_node_id);
+    assert_eq!(reissued.owner_session_id, second.owner_session_id);
+    assert!(reissued.expires_at_unix_ms > now_unix_ms());
+    assert_eq!(cell.lock().unwrap().write_lease, reissued);
+
+    let writing = fs.clone();
+    run_blocking(move || {
+        let payload = b"write after lease GC";
+        assert_eq!(
+            writing.write(&context(), handle, 0, payload).unwrap(),
+            payload.len()
+        );
+        assert_eq!(read_exact_from(&writing, handle, 0, payload.len()), payload);
+        writing.release(&context(), handle).unwrap();
+    })
+    .await;
+    eprintln!("r110: Meta and Node advanced to epoch 3; reopen and write succeeded");
+    server.abort();
+}
+
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_grpc_write_authority_foreign_owner_does_not_take_over_or_mutate() {
     use crate::meta::store::{MetaEntity, MetaRead, RequestKey};
     let (_temp, endpoint, _gate, server, store, local, backend) = real_grpc_meta_fixture().await;

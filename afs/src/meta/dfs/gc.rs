@@ -94,11 +94,16 @@ fn plan_bounded(
             }
         }
     }
+    let mut existing_inodes = BTreeSet::new();
     for entity in entities {
-        if let MetaEntity::DfsWriteLease(lease) = entity
-            && lease.expires_at_unix_ms > now
-        {
-            protected_inodes.insert(lease.inode_id.clone());
+        match entity {
+            MetaEntity::DfsInode(inode) => {
+                existing_inodes.insert(&inode.inode_id);
+            }
+            MetaEntity::DfsWriteLease(lease) if lease.expires_at_unix_ms > now => {
+                protected_inodes.insert(lease.inode_id.clone());
+            }
+            _ => {}
         }
     }
     let heads: BTreeSet<_> = entities
@@ -204,7 +209,12 @@ fn plan_bounded(
             MetaEntity::DfsPlacement(placement) => reclaim.contains(&placement.chunk_id),
             MetaEntity::DfsCopy(copy) => reclaim.contains(&copy.chunk_id),
             MetaEntity::DfsReplicationTask(task) => reclaim.contains(&task.chunk_id),
-            MetaEntity::DfsWriteLease(lease) => lease.expires_at_unix_ms <= now,
+            // An expired row remembers the last epoch while its inode exists.
+            // Wait until the inode is gone in the snapshot, so separate GC
+            // batches cannot remove the epoch before the inode.
+            MetaEntity::DfsWriteLease(lease) => {
+                lease.expires_at_unix_ms <= now && !existing_inodes.contains(&lease.inode_id)
+            }
             MetaEntity::DfsReference(reference) => {
                 reference.retired_at_unix_ms.is_some_and(|time| {
                     // The record must live as long as it still protects data
