@@ -55,22 +55,34 @@ async fn list_nodes(State(meta): State<Arc<Meta>>) -> Result<Json<Value>, crate:
         .management_nodes
         .read()
         .map_err(|_| crate::error::RestError(unavailable_meta_store()))?;
-    let nodes = snapshot.entities.into_iter().filter_map(|entity| {
-        let MetaEntity::NodeSession(session) = entity else { return None; };
-        let advertisement = advertisements.get(&session.node_id)
-            .filter(|(epoch, id, _)| *epoch == session.lease_epoch && *id == session.session_id)
-            .map(|(_, _, advertisement)| advertisement);
-        Some(json!({
+    let mut nodes = Vec::new();
+    for entity in snapshot.entities {
+        let MetaEntity::NodeSession(session) = entity else {
+            continue;
+        };
+        let online = session.is_live_at_unix_ms(now);
+        let announcement = advertisements.get(&session.node_id)
+            .filter(|record| record.epoch == session.lease_epoch && record.id == session.session_id);
+        if online && announcement.is_none() {
+            // Durable sessions can survive a Meta restart. Wait for those
+            // sessions to renew instead of silently omitting workers from all.
+            return Err(afs_error::Error::coded(
+                afs_error::NODE_VFS_UNAVAILABLE,
+                "waiting for live Node management announcements to renew",
+            ).into());
+        }
+        let advertisement = announcement.and_then(|record| record.management.as_ref());
+        nodes.push(json!({
             "node_id": session.node_id,
-            "online": session.is_live_at_unix_ms(now),
+            "online": online,
             "has_dfs_storage": !session.storage_devices.is_empty(),
             "management_rest_addr": advertisement.map(|value| &value.management_rest_addr),
             "connectors": advertisement.map_or(&[][..], |value| value.connectors.as_slice()),
             "deployment": advertisement.map(|value| &value.deployment),
             "role": advertisement.map(|value| if value.adx_worker_id.is_some() {"worker"} else {"seed"}),
             "adx_worker_id": advertisement.and_then(|value| value.adx_worker_id.as_ref()),
-        }))
-    }).collect::<Vec<_>>();
+        }));
+    }
     Ok(Json(
         json!({"snapshot_revision": snapshot.revision.0, "nodes": nodes}),
     ))
@@ -360,4 +372,51 @@ mod placement_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
+
+    #[tokio::test]
+    async fn node_discovery_waits_for_announcements_after_meta_restart() {
+        use crate::meta::store::{NodeSessionLease, RequestKey, Store, journal::MemoryLog};
+
+        let store = Arc::new(
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
+                .await
+                .unwrap(),
+        );
+        let meta = Arc::new(Meta::with_store(
+            "test".into(),
+            crate::runtime::Observability::new().unwrap(),
+            store,
+        ));
+        let session = meta
+            .register_node(
+                RequestKey::new("worker", "register"),
+                NodeSessionLease {
+                    node_id: "worker".into(),
+                    session_id: "worker-session".into(),
+                    grpc_addr: "http://worker:7400".into(),
+                    data_addr: "http://worker:7400".into(),
+                    rest_addr: "http://127.0.0.1:7401".into(),
+                    nfs_addr: String::new(),
+                    ownerfs_enabled: false,
+                    storage_devices: Vec::new(),
+                    lease_ttl: Duration::from_secs(60),
+                },
+            )
+            .await
+            .unwrap();
+        let response = list_nodes(State(meta.clone())).await.err().unwrap();
+        assert_eq!(crate::error::http_status(response.0.kind()), StatusCode::SERVICE_UNAVAILABLE);
+        meta.management_nodes.write().unwrap().insert(
+            session.node_id,
+            super::super::AdvertisedSession {
+                epoch: session.lease_epoch,
+                id: session.session_id,
+                management: None,
+            },
+        );
+        let Json(snapshot) = list_nodes(State(meta)).await.unwrap_or_else(|_| panic!("discovery unavailable"));
+        assert_eq!(snapshot["nodes"][0]["node_id"], "worker");
+        assert_eq!(snapshot["nodes"][0]["online"], true);
+    }
+
 }

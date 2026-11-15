@@ -115,22 +115,12 @@ impl MetaService for MetaRpc {
                 .management_nodes
                 .write()
                 .map_err(|_| Status::internal("management advertisement lock poisoned"))?;
-            if !nodes
-                .get(&session.node_id)
-                .is_some_and(|(epoch, _, _)| *epoch > session.lease_epoch)
-            {
-                if let Some(advertisement) = advertisement {
-                    nodes.insert(
-                        session.node_id.clone(),
-                        (
-                            session.lease_epoch,
-                            session.session_id.clone(),
-                            advertisement,
-                        ),
-                    );
-                } else {
-                    nodes.remove(&session.node_id);
-                }
+            if nodes.get(&session.node_id).is_none_or(|old| old.epoch <= session.lease_epoch) {
+                nodes.insert(session.node_id.clone(), super::super::AdvertisedSession {
+                    epoch: session.lease_epoch,
+                    id: session.session_id.clone(),
+                    management: advertisement,
+                });
             }
         }
         // C-1 restart gate: a Node without DFS has no readers to report.

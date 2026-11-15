@@ -99,7 +99,7 @@ PY
 
 ## 管理任务部署
 
-需要动态发现、完整铺种和逐台预热时，在 Meta 与提供管理任务的 Node 配置各自的管理 token 文件。Meta 复用当前会话列表提供节点发现，节点续租会刷新部署信息。部署方为 worker 设置当前 adxlet 的 `config.node_id`。AFS 节点 ID 独立取自 AFS Node TOML。
+需要动态发现、完整铺种和逐台预热时，在 Meta 与提供管理任务的 Node 配置各自的管理 token 文件。Meta 复用当前会话列表提供节点发现，节点续租会刷新部署信息。Meta 重启后，发现接口等待存活会话刷新通告再返回名单，工具会重试临时的 503。部署方为 worker 设置当前 adxlet 的 `config.node_id`。AFS 节点 ID 独立取自 AFS Node TOML。
 
 ```toml
 # Meta

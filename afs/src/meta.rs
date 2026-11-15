@@ -38,10 +38,14 @@ pub struct Meta {
     pub trusted_nodes_by_der: Arc<HashMap<Vec<u8>, String>>,
     pub enforce_peer_identity: bool,
     watch_budget: Arc<watch::Budget>,
-    management_nodes: Arc<
-        std::sync::RwLock<HashMap<String, (u64, String, crate::management::NodeAdvertisement)>>,
-    >,
+    management_nodes: Arc<std::sync::RwLock<HashMap<String, AdvertisedSession>>>,
 }
+struct AdvertisedSession {
+    epoch: u64,
+    id: String,
+    management: Option<crate::management::NodeAdvertisement>,
+}
+
 impl Meta {
     pub fn new(id: String, observability: Observability) -> Self {
         Self {

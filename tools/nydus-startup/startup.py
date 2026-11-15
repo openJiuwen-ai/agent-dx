@@ -81,7 +81,15 @@ def admin(endpoint, path, token, payload=None):
 
 
 def discover(config):
-    return admin(config["meta_admin_url"], "/v1/admin/nodes", secret(config, "meta_admin_token_file"))
+    token = secret(config, "meta_admin_token_file")
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            return admin(config["meta_admin_url"], "/v1/admin/nodes", token)
+        except HTTPError as error:
+            if error.code != 503 or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.5)
 
 
 def choose_targets(snapshot, deployment, purpose, explicit=None):
