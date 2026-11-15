@@ -657,10 +657,14 @@ struct ReadEngineTestHooks {
     pub(super) local_reader_install_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     pub(super) peer_cache_recheck_hook: Mutex<Option<PeerCacheRecheckHook>>,
     pub(super) prefetch_attempt_hook: Mutex<Option<PrefetchAttemptHook>>,
+    pub(super) after_prefetch_resident_check: Mutex<Option<AfterPrefetchResidentCheck>>,
 }
 
 #[cfg(test)]
 type PrefetchAttemptHook = Arc<dyn Fn(usize, &ChunkId) + Send + Sync>;
+
+#[cfg(test)]
+type AfterPrefetchResidentCheck = Arc<dyn Fn(&ChunkId) + Send + Sync>;
 
 impl Drop for DfsReadEngine {
     fn drop(&mut self) {

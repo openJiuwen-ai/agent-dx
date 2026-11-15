@@ -120,4 +120,4 @@ adx_worker_id = "worker-b" # 种子专用节点可省略
 
 Meta 的 `GET /v1/admin/nodes` 返回节点快照。Nydus connector 在各 Node 上提供 `POST /v1/admin/nydus/seed-jobs`、`POST /v1/admin/nydus/prewarm-jobs` 和各自的 `GET /{job_id}` 后缀。客户端把来源别名和固定 manifest digest 传给接收 Node。铺种额外传显式 `node_ids`，预热额外传采样得到的 blob 范围。工具生成 `request_id` 并轮询 POST 返回的 `job_id`。任务记录属于接收 Node，重启后可按相同请求重提，DFS 依据实际持久副本和缓存判断已完成工作。
 
-预热任务由 DFS 按已提交布局找到所需 Chunk。远端取回的完整 Chunk 直接进入 DFS 读缓存安装队列，重叠任务共享同一 Chunk 的安装结果。任务完成时，请求涉及的 Chunk 都可从接收节点读取。缓存容量须覆盖这些 Chunk 的完整大小和每个 Chunk 的缓存开销。容量不足时任务以明确错误失败。缓存继续受正常淘汰策略管理。
+预热任务由 DFS 按已提交布局找到所需 Chunk。远端取回的完整 Chunk 直接进入 DFS 读缓存安装队列，重叠任务共享同一 Chunk 的安装结果。DFS 在同一个本地 Chunk 目录视图中确认整份清单仍可读，再报告预热就绪。缓存容量须覆盖这些 Chunk 的完整大小和每个 Chunk 的缓存开销。容量不足时任务以明确错误失败。缓存继续受正常淘汰策略管理。

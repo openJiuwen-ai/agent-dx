@@ -3216,6 +3216,93 @@ async fn management_prefetch_installs_one_fetch_for_two_ordinary_file_requests()
     assert_eq!(local.read_cache_intents().unwrap().len(), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn management_prefetch_rejects_eviction_between_resident_checks() {
+    let temp = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+    let capacity = 2 * LocalChunkStore::read_cache_charge(4).unwrap();
+    let mut planned = [
+        StagedChunk::new(OperationId::new("one"), b"one!".to_vec()),
+        StagedChunk::new(OperationId::new("two"), b"two!".to_vec()),
+    ];
+    // The DFS checks Chunks in ID order. Install in that order so the first
+    // checked Chunk is also the oldest cache entry.
+    planned.sort_by(|a, b| a.chunk.id.cmp(&b.chunk.id));
+    for chunk in &planned {
+        assert!(
+            local
+                .persist_read_cache(chunk, 1, capacity)
+                .unwrap()
+                .receipt
+                .is_some()
+        );
+    }
+    let chunks = || {
+        planned
+            .iter()
+            .map(|chunk| {
+                let id = chunk.chunk.id.clone();
+                let request = PrefetchChunk {
+                    batch: source_cache_lru_batch(id.clone()),
+                    pin: Arc::new(()),
+                };
+                (id, request)
+            })
+            .collect()
+    };
+    let engine = DfsReadEngine::new(
+        crate::dfs::NamespaceId::new("default"),
+        "node-a".into(),
+        local.clone(),
+        Arc::new(StaticSources::default()),
+        Arc::new(RecordingTransfer::default()),
+        DfsReadConfig::default(),
+    )
+    .with_distributed_cache("prefetch-session".into(), capacity);
+    let budget = Duration::from_secs(10);
+    engine
+        .prefetch_committed(chunks(), Instant::now() + budget)
+        .await
+        .unwrap();
+
+    let first = planned[0].chunk.id.clone();
+    let second = planned[1].chunk.id.clone();
+    let store = local.clone();
+    let (checked, start_eviction) = std::sync::mpsc::channel();
+    let (evicted, wait_for_eviction) = std::sync::mpsc::channel();
+    let eviction = std::thread::spawn(move || {
+        start_eviction.recv_timeout(budget).unwrap();
+        let replacement = StagedChunk::new(OperationId::new("other"), b"else".to_vec());
+        let write = store.persist_read_cache(&replacement, 1, capacity).unwrap();
+        assert!(write.receipt.is_some());
+        assert!(store.check_cache_resident(&first).is_err());
+        assert!(store.check_cache_resident(&second).is_ok());
+        evicted.send(()).unwrap();
+    });
+    let first = planned[0].chunk.id.clone();
+    let wait_for_eviction = Mutex::new(wait_for_eviction);
+    *engine
+        .test_hooks
+        .after_prefetch_resident_check
+        .lock()
+        .unwrap() = Some(Arc::new(move |id| {
+        if id == &first {
+            checked.send(()).unwrap();
+            wait_for_eviction
+                .lock()
+                .unwrap()
+                .recv_timeout(budget)
+                .unwrap();
+        }
+    }));
+
+    let result = engine
+        .prefetch_committed(chunks(), Instant::now() + budget)
+        .await;
+    eviction.join().unwrap();
+    assert_eq!(result.unwrap_err().code(), afs_error::IO_CAPACITY);
+}
+
 struct NativeCacheFixture {
     _temp: tempfile::TempDir,
     engine: DfsReadEngine,

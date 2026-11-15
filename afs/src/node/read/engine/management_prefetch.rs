@@ -55,14 +55,39 @@ impl DfsReadEngine {
             self.prefetch_chunk(object, request, deadline).await?;
         }
         self.check_native_read_authority(&authority)?;
-        for id in chunks.keys() {
-            if crate::node::bridge::local_io(|| self.local.check_cache_resident(id)).is_err() {
-                return Err(Error::coded(
-                    afs_error::IO_CAPACITY,
-                    "requested Chunks did not remain in the DFS read cache",
-                ));
+        let no_longer_resident = || {
+            Error::coded(
+                afs_error::IO_CAPACITY,
+                "requested Chunks did not remain in the DFS read cache",
+            )
+        };
+        crate::node::bridge::local_io(|| {
+            let mut checked = Vec::with_capacity(chunks.len());
+            for id in chunks.keys() {
+                let revision = self
+                    .local
+                    .check_cache_resident(id)
+                    .map_err(|_| no_longer_resident())?;
+                checked.push((id, revision));
+                #[cfg(test)]
+                {
+                    let hook = self
+                        .test_hooks
+                        .after_prefetch_resident_check
+                        .lock()
+                        .unwrap()
+                        .clone();
+                    if let Some(hook) = hook {
+                        hook(id);
+                    }
+                }
             }
-        }
+            if self.local.confirm_cache_resident(&checked)? {
+                Ok(())
+            } else {
+                Err(no_longer_resident())
+            }
+        })?;
         if Instant::now() >= deadline {
             return Err(unavailable("DFS range prefetch expired"));
         }

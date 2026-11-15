@@ -389,14 +389,28 @@ impl LocalChunkStore {
 
 #[cfg(feature = "dfs")]
 impl LocalChunkStore {
-    /// Recheck a previously verified copy after installation. Normal delivery
-    /// still verifies the body; readiness checks only the cataloged file.
-    pub(crate) fn check_cache_resident(&self, id: &ChunkId) -> Result<()> {
-        let reader = self.open_cataloged(id)?;
+    /// Check the cataloged file without rereading its body. Return the exact
+    /// record revision so the batch can confirm that this copy is still current.
+    pub(crate) fn check_cache_resident(&self, id: &ChunkId) -> Result<u64> {
+        let (reader, revision) = self.open_cataloged_with_revision(id)?;
         if reader.file.metadata()?.len() != reader.chunk.length {
             return Err(corrupt(id, "cached Chunk file length changed"));
         }
-        Ok(())
+        Ok(revision)
+    }
+
+    /// Confirm the checked records together under the existing catalog lock.
+    /// Unrelated catalog changes do not invalidate the batch.
+    pub(crate) fn confirm_cache_resident(&self, checked: &[(&ChunkId, u64)]) -> Result<bool> {
+        let catalog = self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("chunk catalog poisoned"))?;
+        Ok(checked.iter().all(|(id, revision)| {
+            catalog.records.get(*id).is_some_and(|record| {
+                record.state == LocalChunkState::Durable && record.catalog_revision == *revision
+            })
+        }))
     }
 
     pub(crate) fn has_durable_record(&self, id: &ChunkId) -> Result<bool> {
