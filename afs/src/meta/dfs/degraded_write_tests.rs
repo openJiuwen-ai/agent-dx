@@ -375,3 +375,80 @@ async fn a_floor_above_the_synchronous_count_is_refused() {
         .with_replica_failure_config(degrade(3));
     assert!(service.initialize_replication_config().await.is_err());
 }
+
+#[tokio::test]
+async fn explicit_placement_adds_only_the_named_node_after_policy_is_satisfied() {
+    let mut fixture = Fixture::new(
+        ReplicationConfig {
+            desired_copies: 1,
+            sync_required_copies: 1,
+            min_distinct_nodes: 1,
+            min_distinct_failure_domains: 1,
+            local_copy: LocalCopyPolicy::Required,
+        },
+        ReplicaFailureConfig::strict(),
+        &["other", "target"],
+        LIVE,
+    )
+    .await;
+    fixture.receipt_from(&["writer"]).await;
+    fixture.commit().await.unwrap();
+    let before = fixture.placement().await;
+    let writer_epoch = fixture.epoch("writer").await;
+    let mut ensure = crate::dfs::EnsureReplicaPlacement {
+        caller_id: "writer".into(),
+        caller_session_id: "writer-s1".into(),
+        caller_node_epoch: writer_epoch,
+        operation_id: OperationId::new("ensure-target"),
+        file_version_id: fixture.commit.file_version.id.clone(),
+        chunk_id: before.chunk_id.clone(),
+        target_node_id: "target".into(),
+    };
+    assert!(!fixture.service.ensure_replica_placement(ensure.clone()).await.unwrap());
+    let claim = fixture
+        .service
+        .claim_replication_task(ClaimReplicationTask {
+            caller_id: "writer".into(),
+            caller_session_id: "writer-s1".into(),
+            caller_node_epoch: writer_epoch,
+            operation_id: OperationId::new("claim-target"),
+            lease_seconds: 30,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.replica_group.targets.iter().map(|target| target.node_id.as_str()).collect::<Vec<_>>(),
+        ["writer", "target"],
+    );
+    let durable_acks = claim.replica_group.targets.iter().map(|target| ReplicaAck {
+        operation_id: claim.operation_id.clone(),
+        chunk_id: claim.chunk.id.clone(),
+        placement_revision: claim.placement_revision,
+        placement_epoch: claim.replica_group.placement_epoch,
+        node_id: target.node_id.clone(),
+        node_epoch: target.node_epoch,
+        device_id: target.device.device_id.clone(),
+        device_epoch: target.device.device_epoch,
+        catalog_revision: target.device.catalog_revision,
+        persisted_bytes: claim.chunk.length,
+        verified_digest: claim.chunk.content_digest.clone(),
+    }).collect();
+    fixture.service.report_replication_task(ReportReplicationTask {
+        caller_id: "writer".into(),
+        caller_session_id: "writer-s1".into(),
+        caller_node_epoch: writer_epoch,
+        operation_id: OperationId::new("report-target"),
+        claim,
+        durable_acks,
+        error: None,
+        source_invalid: false,
+    }).await.unwrap();
+    ensure.operation_id = OperationId::new("confirm-target");
+    assert!(fixture.service.ensure_replica_placement(ensure).await.unwrap());
+    let after = fixture.placement().await;
+    assert_eq!(after.desired_copies, before.desired_copies);
+    assert_eq!(after.replica_group_id, before.replica_group_id);
+    assert_eq!(after.placement_epoch, before.placement_epoch);
+    assert_eq!(after.copies.len(), 2);
+}

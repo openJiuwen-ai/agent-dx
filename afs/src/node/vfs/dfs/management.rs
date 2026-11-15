@@ -82,7 +82,9 @@ impl DistributedFs {
             let snapshot = self.handle_snapshot(handle)?;
             let view = self.readonly_version_for_inode(&snapshot.opened_inode)?;
             if lazy_fill::sealed(&snapshot.opened_inode)
-                && ranges.iter().any(|range| !lazy_fill::covered(&view.layout, range.start, range.end - range.start))
+                && ranges.iter().any(|range| {
+                    !lazy_fill::covered(&view.layout, range.start, range.end - range.start)
+                })
             {
                 return Err(unavailable("lazy file ranges were not committed"));
             }
@@ -127,7 +129,9 @@ impl DistributedFs {
                 }
             }
             if !self.verify_prefetched_chunks(&chunks) {
-                return Err(unavailable("requested Chunks no longer fit in the DFS cache"));
+                return Err(unavailable(
+                    "requested Chunks no longer fit in the DFS cache",
+                ));
             }
             Ok(chunks)
         })
