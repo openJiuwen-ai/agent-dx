@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -274,13 +275,16 @@ def sample(config, snapshot, image, output, worker, workload, command, expected)
     command = shlex.join(command)
     capture = output / "startup.pcap"
     log = output / "tcpdump.log"
+    tcpdump = shutil.which("tcpdump")
+    if not tcpdump:
+        raise RuntimeError("tcpdump is required on the cold sampling worker")
     connection = ConnectionConfig.from_env(
         server_address=config.get("adx_server_address"), token=secret(config, "adx_token_file"),
         verify_tls=config.get("adx_verify_tls", True),
     )
     with log.open("xb") as stderr:
         sniffer = subprocess.Popen(
-            ["tcpdump", "-i", "lo", "-s", "0", "-U", "-w", str(capture),
+            [str(Path(tcpdump).resolve()), "-i", "lo", "-s", "0", "-U", "-w", str(capture),
              *(["-Z", "root"] if os.geteuid() == 0 else []),
              f"ip and tcp dst port {int(config.get('sampling_proxy_port', 7401))}"],
             stdout=subprocess.DEVNULL, stderr=stderr, env=dict(os.environ, LC_ALL="C"),
@@ -369,8 +373,11 @@ def main():
             if image["source"] != config["source"]:
                 raise ValueError("image source key differs from deployment configuration")
             snapshot = discover(config)
-            result = (seed(config, snapshot, image, args.node_id) if args.action == "seed"
-                      else prewarm(config, snapshot, image, args.image.with_name("manifest.json"), read_json(args.plan)))
+            if args.action == "seed":
+                result = seed(config, snapshot, image, args.node_id)
+            else:
+                manifest = args.image.with_name("manifest.json")
+                result = prewarm(config, snapshot, image, manifest, read_json(args.plan))
         print(json.dumps(result, indent=2))
         return int(result.get("state") == "failed")
     except (AssertionError, KeyError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
