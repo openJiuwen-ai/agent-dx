@@ -582,7 +582,7 @@ impl NydusService {
         request: super::jobs::WarmRequest,
         deadline: Instant,
     ) -> Result<usize> {
-        use std::collections::{BTreeMap, BTreeSet};
+        use std::collections::BTreeMap;
         let plan = self
             .provider
             .describe(&request.source, &request.manifest_digest, deadline)
@@ -606,23 +606,17 @@ impl NydusService {
                 .push(range.offset..end);
         }
         let count = ranges.len();
-        let mut installed = BTreeSet::new();
+        let mut files = Vec::with_capacity(count);
         for (blob_id, spans) in ranges {
             let permit = self.admit(deadline).await?;
             let stat = self
                 .stat_registry_blob(&plan.repository, &blob_id, deadline, permit)
                 .await?;
-            let dfs = dfs.clone();
-            let ctx = self.ctx.clone();
-            let chunks =
-                blocking(move || dfs.prefetch_ranges(&ctx, stat.entry.inode, &spans, deadline))
-                    .await?;
-            installed.extend(chunks);
+            files.push((stat.entry.inode, spans));
         }
         let dfs = dfs.clone();
-        if !blocking(move || Ok(dfs.verify_prefetched_chunks(&installed))).await? {
-            return Err(unavailable("warm ranges no longer fit in local DFS cache"));
-        }
+        let ctx = self.ctx.clone();
+        blocking(move || dfs.prefetch_ranges(&ctx, &files, deadline)).await?;
         Ok(count)
     }
 }

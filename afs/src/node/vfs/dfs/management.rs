@@ -1,9 +1,10 @@
 //! File-level management operations using the ordinary committed DFS view.
+use super::version_cache::ReadOnlyVersion;
 use super::*;
-use crate::dfs::{ChunkId, EnsureReplicaPlacement};
+use crate::dfs::EnsureReplicaPlacement;
+use crate::node::read::engine::PrefetchChunk;
 use std::ops::Range;
 
-const READ_SLICE: u64 = 256 * 1024;
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 impl DistributedFs {
@@ -63,84 +64,89 @@ impl DistributedFs {
         Ok(())
     }
 
+    /// Warm file ranges at the current node using the native DFS read cache.
+    /// Every requested Chunk must be locally readable when the job completes.
     pub(crate) fn prefetch_ranges(
         &self,
         ctx: &RequestContext,
-        inode: BackendInode,
-        ranges: &[Range<u64>],
+        files: &[(BackendInode, Vec<Range<u64>>)],
         deadline: Instant,
-    ) -> Result<BTreeSet<ChunkId>> {
-        // Ordinary reads first fill missing lazy ranges, keeping Registry
-        // interpretation in the connector and existing owner hook.
-        self.with_prefetch_handle(ctx, inode, |handle| {
-            for range in ranges {
-                self.read_management_range(ctx, handle, range.clone(), deadline)?;
-            }
-            Ok(())
-        })?;
-        self.with_prefetch_handle(ctx, inode, |handle| {
-            let snapshot = self.handle_snapshot(handle)?;
-            let view = self.readonly_version_for_inode(&snapshot.opened_inode)?;
-            if lazy_fill::sealed(&snapshot.opened_inode)
-                && ranges.iter().any(|range| {
-                    !lazy_fill::covered(&view.layout, range.start, range.end - range.start)
+    ) -> Result<()> {
+        let mut chunks = BTreeMap::new();
+        for (inode, ranges) in files {
+            check_management_deadline(deadline)?;
+            crate::node::call_deadline::within(deadline, || {
+                self.with_prefetch_handle(ctx, *inode, |handle| {
+                    let snapshot = self.read_handle_snapshot(handle)?;
+                    let (opened, view) = self.prefetch_view(&snapshot, ranges, deadline)?;
+                    for range in ranges {
+                        check_management_deadline(deadline)?;
+                        let length = usize::try_from(range.end - range.start)
+                            .map_err(|_| invalid("DFS prefetch range length overflow"))?;
+                        for op in view.ops(range.start, length)? {
+                            chunks
+                                .entry(op.chunk_id.clone())
+                                .or_insert_with(|| PrefetchChunk {
+                                    batch: ReadBatch {
+                                        file_version_id: view
+                                            .version
+                                            .as_ref()
+                                            .map(|v| v.id.clone()),
+                                        layout_root_id: view.layout.id.clone(),
+                                        ops: vec![op],
+                                        lookahead: Vec::new(),
+                                    },
+                                    pin: opened.clone(),
+                                });
+                        }
+                    }
+                    Ok(())
                 })
-            {
-                return Err(unavailable("lazy file ranges were not committed"));
-            }
-            let chunks = view
-                .layout
-                .inline_extents
-                .iter()
-                .filter(|extent| ranges.iter().any(|range| overlaps(extent, range)))
-                .map(|extent| extent.chunk_id.clone())
-                .collect::<BTreeSet<_>>();
-
-            // Ordinary cache admission is best-effort. A management job
-            // retries an individual missing Chunk until verified local data
-            // is visible; it never reports the read's completion as readiness.
-            for chunk in &chunks {
-                while !self.read_engine.has_local_chunk(chunk) {
-                    check_management_deadline(deadline)?;
-                    if !self.read_engine.prefetch_cache_enabled() {
-                        return Err(unavailable("native DFS read cache is disabled"));
-                    }
-                    for extent in view
-                        .layout
-                        .inline_extents
-                        .iter()
-                        .filter(|extent| &extent.chunk_id == chunk)
-                    {
-                        self.read_management_range(
-                            ctx,
-                            handle,
-                            extent.file_offset..extent.file_offset + extent.length,
-                            deadline,
-                        )?;
-                    }
-                    // Allow the ordinary installer to drain before retrying
-                    // an admission rejected by its bounded queue.
-                    let settle = Instant::now() + Duration::from_millis(200);
-                    while Instant::now() < settle.min(deadline)
-                        && !self.read_engine.has_local_chunk(chunk)
-                    {
-                        std::thread::sleep(RETRY_INTERVAL);
-                    }
-                }
-            }
-            if !self.verify_prefetched_chunks(&chunks) {
-                return Err(unavailable(
-                    "requested Chunks no longer fit in the DFS cache",
-                ));
-            }
-            Ok(chunks)
-        })
+            })?;
+        }
+        self.read_engine.run_sync_boundary(Box::pin(
+            self.read_engine.prefetch_committed(chunks, deadline),
+        ))
     }
 
-    pub(crate) fn verify_prefetched_chunks(&self, chunks: &BTreeSet<ChunkId>) -> bool {
-        chunks
-            .iter()
-            .all(|chunk| self.read_engine.has_local_chunk(chunk))
+    fn prefetch_view(
+        &self,
+        snapshot: &DfsFileHandleSnapshot,
+        ranges: &[Range<u64>],
+        deadline: Instant,
+    ) -> Result<(Arc<OpenedView>, Arc<ReadOnlyVersion>)> {
+        let mut opened = snapshot.opened_inode.clone();
+        let mut view = self.readonly_version_for_inode(&opened)?;
+        let source = lazy_fill::descriptor(&opened)?;
+        for range in ranges {
+            let length = source
+                .as_ref()
+                .map_or(view.layout.file_length, |source| source.length);
+            if range.start > range.end || range.end > length {
+                return Err(invalid("DFS prefetch range falls outside the file"));
+            }
+            if source.is_none() {
+                continue; // Ordinary sparse ranges without extents need no cache.
+            }
+            while let Some((offset, count)) =
+                lazy_fill::missing_range(&view.layout, range.start, range.end)
+            {
+                check_management_deadline(deadline)?;
+                // Only genuinely uncommitted ranges use the legacy owner fill.
+                // Committed data goes directly into the acknowledged Chunk path.
+                self.lazy_read(snapshot, offset, count, deadline)?;
+                let inode = self.validate_inode(self.meta.get_inode(&snapshot.inode_id)?)?;
+                if lazy_fill::descriptor(&inode)? != source {
+                    return Err(stale("lazy file source changed during prefetch"));
+                }
+                opened = self.protected_view(&inode)?;
+                view = self.readonly_version_for_inode(&opened)?;
+                if !lazy_fill::covered(&view.layout, offset, count as u64) {
+                    return Err(unavailable("lazy prefetch range was not committed"));
+                }
+            }
+        }
+        Ok((opened, view))
     }
 
     fn with_prefetch_handle<T>(
@@ -154,32 +160,6 @@ impl DistributedFs {
         let released = self.release(ctx, handle);
         outcome.and_then(|result| released.map(|()| result))
     }
-
-    fn read_management_range(
-        &self,
-        ctx: &RequestContext,
-        handle: FileHandle,
-        range: Range<u64>,
-        deadline: Instant,
-    ) -> Result<()> {
-        let mut offset = range.start;
-        while offset < range.end {
-            check_management_deadline(deadline)?;
-            let count = (range.end - offset).min(READ_SLICE) as usize;
-            let data = crate::node::call_deadline::within(deadline, || {
-                self.read_reply(ctx, handle, offset, count)
-            })?;
-            if data.len() != count {
-                return Err(invalid("short read during DFS range prefetch"));
-            }
-            offset += count as u64;
-        }
-        Ok(())
-    }
-}
-
-fn overlaps(extent: &Extent, range: &Range<u64>) -> bool {
-    extent.file_offset < range.end && range.start < extent.file_offset.saturating_add(extent.length)
 }
 
 fn check_management_deadline(deadline: Instant) -> Result<()> {

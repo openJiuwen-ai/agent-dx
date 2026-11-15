@@ -43,6 +43,10 @@ use crate::{
 
 mod authority;
 mod cache_reconcile;
+#[cfg(feature = "dfs")]
+mod management_prefetch;
+#[cfg(feature = "dfs")]
+pub(in crate::node) use management_prefetch::PrefetchChunk;
 mod distribution;
 #[cfg(test)]
 mod distribution_tests;
@@ -786,18 +790,6 @@ impl DfsReadEngine {
     ) -> Self {
         self.external_backend = Some(ExternalReadBackend { reader, authorizer });
         self
-    }
-
-    /// Disposable local storage for already verified native Peer objects.
-    /// Cache contents never supply grant, Node/session or file-view authority.
-    #[cfg(feature = "dfs")]
-    pub(in crate::node) fn prefetch_cache_enabled(&self) -> bool {
-        self.distributed_cache.is_some()
-    }
-
-    #[cfg(feature = "dfs")]
-    pub(in crate::node) fn has_local_chunk(&self, chunk: &crate::dfs::ChunkId) -> bool {
-        self.local.open_for_range_reads(chunk).is_ok()
     }
 
     pub(in crate::node) fn with_peer_cache(mut self, cache: Arc<DiskPeerCache>) -> Self {

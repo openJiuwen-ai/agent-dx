@@ -119,3 +119,5 @@ adx_worker_id = "worker-b" # 种子专用节点可省略
 为工具配置能访问这些地址的鉴权 TLS 管理入口。sandboxd 原本的 Registry proxy 仍在本机。现有 Nydus 来源须保持一致，完整铺种使用原生 DFS 存储。工具及参数见 [管理工具](../../tools/nydus-startup/README.md#使用管理接口准备镜像)。
 
 Meta 的 `GET /v1/admin/nodes` 返回节点快照。Nydus connector 在各 Node 上提供 `POST /v1/admin/nydus/seed-jobs`、`POST /v1/admin/nydus/prewarm-jobs` 和各自的 `GET /{job_id}` 后缀。客户端把来源别名和固定 manifest digest 传给接收 Node。铺种额外传显式 `node_ids`，预热额外传采样得到的 blob 范围。工具生成 `request_id` 并轮询 POST 返回的 `job_id`。任务记录属于接收 Node，重启后可按相同请求重提，DFS 依据实际持久副本和缓存判断已完成工作。
+
+预热任务由 DFS 按已提交布局找到所需 Chunk。远端取回的完整 Chunk 直接进入 DFS 读缓存安装队列，重叠任务共享同一 Chunk 的安装结果。任务完成时，请求涉及的 Chunk 都可从接收节点读取。缓存容量须覆盖这些 Chunk 的完整大小和每个 Chunk 的缓存开销。容量不足时任务以明确错误失败。缓存继续受正常淘汰策略管理。

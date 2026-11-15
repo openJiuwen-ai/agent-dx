@@ -20,6 +20,12 @@ pub(crate) struct ReadCacheWrite {
 
 #[cfg(any(feature = "dfs", test))]
 impl LocalChunkStore {
+    pub(crate) fn read_cache_charge(length: u64) -> Result<u64> {
+        length
+            .checked_add(4096)
+            .ok_or_else(|| invalid("read cache capacity overflow"))
+    }
+
     pub(crate) fn persist_read_cache(
         &self,
         staged: &StagedChunk,
@@ -30,11 +36,7 @@ impl LocalChunkStore {
             receipt: None,
             retired: Vec::new(),
         };
-        let charge = staged
-            .chunk
-            .length
-            .checked_add(4096)
-            .ok_or_else(|| invalid("read cache capacity overflow"))?;
+        let charge = Self::read_cache_charge(staged.chunk.length)?;
         if capacity == 0 || charge > capacity {
             return Ok(result);
         }

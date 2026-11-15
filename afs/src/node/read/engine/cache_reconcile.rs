@@ -3,6 +3,11 @@
 use super::*;
 use crate::node::chunk::ReadCacheIntent;
 use std::{collections::VecDeque, ops::Range};
+use tokio::sync::{oneshot, watch};
+
+type InstallOutcome = Option<Result<()>>;
+pub(super) type InstallWaiter = watch::Receiver<InstallOutcome>;
+pub(super) type InstallLeader = watch::Sender<InstallOutcome>;
 
 #[derive(Default)]
 struct CacheSyncState {
@@ -184,14 +189,17 @@ pub(super) struct ReadCacheRuntime {
     send: tokio::sync::mpsc::Sender<CacheJob>,
     receive: Mutex<Option<tokio::sync::mpsc::Receiver<CacheJob>>>,
     partial: Mutex<VecDeque<PartialCopy>>,
+    #[cfg(feature = "dfs")]
+    prefetch: Mutex<HashMap<ChunkId, InstallWaiter>>,
 }
 
-struct CacheJob {
-    chunk: ChunkObject,
-    body: Vec<u8>,
-    version: FileVersionId,
-    layout: LayoutRootId,
-    epoch: u64,
+pub(super) struct CacheJob {
+    pub(super) chunk: ChunkObject,
+    pub(super) body: Vec<u8>,
+    pub(super) version: FileVersionId,
+    pub(super) layout: LayoutRootId,
+    pub(super) epoch: u64,
+    explicit: Option<(Instant, oneshot::Sender<Result<()>>)>,
 }
 
 /// Cache copies can arrive as separate verified FUSE pages. The two-entry
@@ -224,6 +232,64 @@ impl PartialCopy {
 }
 
 impl ReadCacheRuntime {
+    fn new(session: String, capacity: u64) -> Self {
+        let (send, receive) = tokio::sync::mpsc::channel(2);
+        Self {
+            session,
+            capacity,
+            send,
+            receive: Mutex::new(Some(receive)),
+            partial: Mutex::new(VecDeque::new()),
+            #[cfg(feature = "dfs")]
+            prefetch: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(super) fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// Keep the first request's fetch and installation shared, including errors.
+    /// A waiter has its own deadline and cannot drop the fetch for other waiters.
+    #[cfg(feature = "dfs")]
+    pub(super) fn prefetch_flight(
+        &self,
+        chunk: &ChunkId,
+    ) -> Result<(InstallWaiter, Option<InstallLeader>)> {
+        let mut active = self
+            .prefetch
+            .lock()
+            .map_err(|_| unavailable("DFS prefetch coordination poisoned"))?;
+        active.retain(|_, waiter| waiter.borrow().is_none() && waiter.has_changed().is_ok());
+        if let Some(waiter) = active.get(chunk) {
+            return Ok((waiter.clone(), None));
+        }
+        if active.len() >= 128 {
+            return Err(Error::coded(
+                afs_error::IO_CAPACITY,
+                "too many distinct DFS Chunks being prefetched",
+            ));
+        }
+        let (leader, waiter) = watch::channel(None);
+        active.insert(chunk.clone(), waiter.clone());
+        Ok((waiter, Some(leader)))
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(super) async fn enqueue_prefetch(
+        &self,
+        deadline: Instant,
+    ) -> Result<tokio::sync::mpsc::Permit<'_, CacheJob>> {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.send.reserve(),
+        )
+        .await
+        .map_err(|_| unavailable("DFS prefetch cache admission expired"))?
+        .map_err(|_| unavailable("DFS read cache installer stopped"))
+    }
+
     fn stage(
         &self,
         batch: &ReadBatch,
@@ -239,6 +305,7 @@ impl ReadCacheRuntime {
             version: version.clone(),
             layout: batch.layout_root_id.clone(),
             epoch,
+            explicit: None,
         };
         if offset == 0 && data.len() as u64 == chunk.length {
             if let Ok(permit) = self.send.try_reserve() {
@@ -279,14 +346,7 @@ impl ReadCacheRuntime {
 
 impl DfsReadEngine {
     pub(crate) fn with_distributed_cache(mut self, session: String, capacity: u64) -> Self {
-        let (send, receive) = tokio::sync::mpsc::channel(2);
-        self.distributed_cache = Some(Arc::new(ReadCacheRuntime {
-            session,
-            capacity,
-            send,
-            receive: Mutex::new(Some(receive)),
-            partial: Mutex::new(VecDeque::new()),
-        }));
+        self.distributed_cache = Some(Arc::new(ReadCacheRuntime::new(session, capacity)));
         self
     }
 
@@ -373,40 +433,114 @@ impl DfsReadEngine {
                         }
                     }
                     job = receive.recv() => {
-                        let Some(job) = job else { return Ok(()) };
-                        let local = engine.local.clone();
-                        let namespace = engine.namespace_id.clone();
-                        let result = crate::node::bridge::spawn_blocking(move || {
-                            let item = crate::node::chunk::StagedChunk::from_replica(
-                                crate::dfs::OperationId::new("read-cache"),
-                                &job.chunk,
-                                job.body,
-                            )?;
-                            if let Some(receipt) = local.persist_read_cache(&item, job.epoch, capacity)?.receipt {
-                                local.track_read_cache(ReadCacheIntent {
-                                    namespace_id: namespace,
-                                    file_version_id: job.version,
-                                    layout_root_id: job.layout,
-                                    copy: crate::dfs::read_cache_copy(&receipt)?,
-                                })?;
+                        let Some(mut job) = job else { return Ok(()) };
+                        let explicit = job.explicit.take();
+                        let result = match &explicit {
+                            Some((deadline, _)) if Instant::now() >= *deadline => {
+                                Err(unavailable("DFS prefetch cache installation expired"))
                             }
-                            Ok::<(), Error>(())
-                        }).await;
-                        match result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => afs_logging::warn!("dfs.read_cache_install_failed"; "error" => error.to_string()),
-                            Err(error) => afs_logging::warn!("dfs.read_cache_worker_failed"; "error" => error.to_string()),
+                            Some(_) => engine.capture_native_read_authority().and_then(|authority| {
+                                if authority.epoch == job.epoch {
+                                    Ok(())
+                                } else {
+                                    Err(external_denied("DFS prefetch cache installer epoch changed"))
+                                }
+                            }),
+                            None => Ok(()),
+                        };
+                        let result = match result {
+                            Ok(()) => {
+                                let installer = engine.clone();
+                                let required = explicit.is_some();
+                                crate::node::bridge::spawn_blocking(move || {
+                                    installer.install_read_cache(job, capacity, required)
+                                }).await.map_err(|error| {
+                                    unavailable(format!("DFS read cache worker failed: {error}"))
+                                }).and_then(|result| result)
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if let Some((_, completed)) = explicit {
+                            let _ = completed.send(result);
+                        } else if let Err(error) = result {
+                            afs_logging::warn!("dfs.read_cache_install_failed"; "error" => error.to_string());
                         }
                     }
                 }
             }
         });
     }
+
+    fn install_read_cache(&self, job: CacheJob, capacity: u64, required: bool) -> Result<()> {
+        let item = crate::node::chunk::StagedChunk::from_replica(
+            crate::dfs::OperationId::new("read-cache"),
+            &job.chunk,
+            job.body,
+        )?;
+        if let Some(receipt) = self
+            .local
+            .persist_read_cache(&item, job.epoch, capacity)?
+            .receipt
+        {
+            self.local.track_read_cache(ReadCacheIntent {
+                namespace_id: self.namespace_id.clone(),
+                file_version_id: job.version,
+                layout_root_id: job.layout,
+                copy: crate::dfs::read_cache_copy(&receipt)?,
+            })?;
+        } else if required && self.local.open_for_range_reads(&job.chunk.id).is_err() {
+            return Err(Error::coded(
+                afs_error::IO_CAPACITY,
+                "DFS read cache could not install requested Chunk",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl CacheJob {
+    pub(super) fn explicit(mut self, deadline: Instant) -> (Self, oneshot::Receiver<Result<()>>) {
+        let (complete, result) = oneshot::channel();
+        self.explicit = Some((deadline, complete));
+        (self, result)
+    }
+
+    pub(super) fn new(
+        chunk: ChunkObject,
+        body: Vec<u8>,
+        version: FileVersionId,
+        layout: LayoutRootId,
+        epoch: u64,
+    ) -> Self {
+        Self {
+            chunk,
+            body,
+            version,
+            layout,
+            epoch,
+            explicit: None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn management_prefetch_shares_install_outcome_and_reopens_after_failure() {
+        let cache = ReadCacheRuntime::new("session".into(), 1024);
+        let chunk = ChunkId::new("one");
+        let (_, leader) = cache.prefetch_flight(&chunk).unwrap();
+        let follower = cache.prefetch_flight(&chunk).unwrap();
+        assert!(follower.1.is_none());
+        let capacity = Error::coded(afs_error::IO_CAPACITY, "cache full");
+        leader.unwrap().send_replace(Some(Err(capacity.clone())));
+        assert_eq!(*follower.0.borrow(), Some(Err(capacity)));
+        assert!(cache.prefetch_flight(&chunk).unwrap().1.is_some());
+    }
 
     #[test]
     fn distribution_cache_accumulates_out_of_order_verified_ranges_without_holes() {
@@ -421,6 +555,7 @@ mod tests {
                 version: FileVersionId::new("version"),
                 layout: LayoutRootId::new("layout"),
                 epoch: 1,
+                explicit: None,
             },
             coverage: Vec::new(),
         };
