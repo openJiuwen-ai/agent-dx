@@ -189,16 +189,15 @@ pub(super) struct ReadCacheRuntime {
     send: tokio::sync::mpsc::Sender<CacheJob>,
     receive: Mutex<Option<tokio::sync::mpsc::Receiver<CacheJob>>>,
     partial: Mutex<VecDeque<PartialCopy>>,
-    #[cfg(feature = "dfs")]
     prefetch: Mutex<HashMap<ChunkId, InstallWaiter>>,
 }
 
 pub(super) struct CacheJob {
-    pub(super) chunk: ChunkObject,
-    pub(super) body: Vec<u8>,
-    pub(super) version: FileVersionId,
-    pub(super) layout: LayoutRootId,
-    pub(super) epoch: u64,
+    chunk: ChunkObject,
+    body: Vec<u8>,
+    version: FileVersionId,
+    layout: LayoutRootId,
+    epoch: u64,
     explicit: Option<(Instant, oneshot::Sender<Result<()>>)>,
 }
 
@@ -240,19 +239,16 @@ impl ReadCacheRuntime {
             send,
             receive: Mutex::new(Some(receive)),
             partial: Mutex::new(VecDeque::new()),
-            #[cfg(feature = "dfs")]
             prefetch: Mutex::new(HashMap::new()),
         }
     }
 
-    #[cfg(feature = "dfs")]
     pub(super) fn capacity(&self) -> u64 {
         self.capacity
     }
 
     /// Keep the first request's fetch and installation shared, including errors.
     /// A waiter has its own deadline and cannot drop the fetch for other waiters.
-    #[cfg(feature = "dfs")]
     pub(super) fn prefetch_flight(
         &self,
         chunk: &ChunkId,
@@ -276,7 +272,6 @@ impl ReadCacheRuntime {
         Ok((waiter, Some(leader)))
     }
 
-    #[cfg(feature = "dfs")]
     pub(super) async fn enqueue_prefetch(
         &self,
         deadline: Instant,
@@ -488,7 +483,7 @@ impl DfsReadEngine {
                 layout_root_id: job.layout,
                 copy: crate::dfs::read_cache_copy(&receipt)?,
             })?;
-        } else if required && self.local.open_for_range_reads(&job.chunk.id).is_err() {
+        } else if required && self.local.check_cache_resident(&job.chunk.id).is_err() {
             return Err(Error::coded(
                 afs_error::IO_CAPACITY,
                 "DFS read cache could not install requested Chunk",
@@ -498,7 +493,6 @@ impl DfsReadEngine {
     }
 }
 
-#[cfg(feature = "dfs")]
 impl CacheJob {
     pub(super) fn explicit(mut self, deadline: Instant) -> (Self, oneshot::Receiver<Result<()>>) {
         let (complete, result) = oneshot::channel();
@@ -528,7 +522,6 @@ impl CacheJob {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "dfs")]
     #[test]
     fn management_prefetch_shares_install_outcome_and_reopens_after_failure() {
         let cache = ReadCacheRuntime::new("session".into(), 1024);

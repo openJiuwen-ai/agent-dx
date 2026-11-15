@@ -389,6 +389,16 @@ impl LocalChunkStore {
 
 #[cfg(feature = "dfs")]
 impl LocalChunkStore {
+    /// Recheck a previously verified copy after installation. Normal delivery
+    /// still verifies the body; readiness checks only the cataloged file.
+    pub(crate) fn check_cache_resident(&self, id: &ChunkId) -> Result<()> {
+        let reader = self.open_cataloged(id)?;
+        if reader.file.metadata()?.len() != reader.chunk.length {
+            return Err(corrupt(id, "cached Chunk file length changed"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn has_durable_record(&self, id: &ChunkId) -> Result<bool> {
         Ok(self
             .catalog

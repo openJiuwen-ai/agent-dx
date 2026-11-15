@@ -43,9 +43,7 @@ use crate::{
 
 mod authority;
 mod cache_reconcile;
-#[cfg(feature = "dfs")]
 mod management_prefetch;
-#[cfg(feature = "dfs")]
 pub(in crate::node) use management_prefetch::PrefetchChunk;
 mod distribution;
 #[cfg(test)]

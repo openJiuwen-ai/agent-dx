@@ -56,7 +56,7 @@ impl DfsReadEngine {
         }
         self.check_native_read_authority(&authority)?;
         for id in chunks.keys() {
-            if self.local.open_for_range_reads(id).is_err() {
+            if crate::node::bridge::local_io(|| self.local.check_cache_resident(id)).is_err() {
                 return Err(Error::coded(
                     afs_error::IO_CAPACITY,
                     "requested Chunks did not remain in the DFS read cache",

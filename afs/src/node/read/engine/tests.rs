@@ -3152,6 +3152,70 @@ impl ChunkTransfer for NativeCacheTransfer {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn management_prefetch_installs_one_fetch_for_two_ordinary_file_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let body = b"management prefetch".to_vec();
+    let staged = StagedChunk::new(OperationId::new("prefetch"), body.clone());
+    let id = staged.chunk.id.clone();
+    let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+        revision: 1,
+        chunks: vec![ChunkSources {
+            chunk_id: id.clone(),
+            allowed_ranges: vec![(0, staged.chunk.length)],
+            chunk: Some(staged.chunk.clone()),
+            sources: vec![source("b", &id, "node-b")],
+        }],
+    }));
+    let transfer = Arc::new(NativeCacheTransfer {
+        bytes: Mutex::new(body.clone()),
+        batches: Mutex::new(Vec::new()),
+        corrupt: AtomicBool::new(false),
+        delay: Duration::from_millis(25),
+    });
+    let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let engine = Arc::new(
+        DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            local.clone(),
+            sources,
+            transfer.clone(),
+            DfsReadConfig::default(),
+        )
+        .with_read_authority(Arc::new(LocalReadAuthority::new(1, deadline)))
+        .with_distributed_cache("prefetch-session".into(), 8192),
+    );
+    let mut services = crate::runtime::Services::new();
+    engine.start_distributed_cache(&mut services);
+    let mut batch = source_cache_lru_batch(id.clone());
+    batch.ops[0].chunk_offset = 1;
+    batch.ops[0].length = 1;
+    let requested = || {
+        BTreeMap::from([(
+            id.clone(),
+            PrefetchChunk {
+                batch: batch.clone(),
+                pin: Arc::new(()),
+            },
+        )])
+    };
+    let (first, second) = tokio::join!(
+        engine.prefetch_committed(requested(), deadline),
+        engine.prefetch_committed(requested(), deadline),
+    );
+    first.unwrap();
+    second.unwrap();
+    let mut actual = vec![0; body.len()];
+    assert_eq!(local.read_at(&id, 0, &mut actual).unwrap(), body.len());
+    assert_eq!(actual, body);
+    let fetched = transfer.batches.lock().unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].operations[0].op.length, staged.chunk.length);
+    assert_eq!(local.read_cache_intents().unwrap().len(), 1);
+}
+
 struct NativeCacheFixture {
     _temp: tempfile::TempDir,
     engine: DfsReadEngine,
