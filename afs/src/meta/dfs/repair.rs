@@ -892,7 +892,9 @@ impl DfsService {
             updated_placement.health = PlacementHealth::Satisfied;
         }
         updated_task.state = ReplicationTaskState::Completed;
-        updated_task.placement_epoch = updated_placement.placement_epoch;
+        // The worker verifies its receipt against the exact claim. An
+        // explicit task's grant epoch is distinct from the ordinary placement.
+        updated_task.placement_epoch = request.claim.replica_group.placement_epoch;
         mutations.push(TxnMutation::Put(MetaEntity::DfsPlacement(
             updated_placement,
         )));

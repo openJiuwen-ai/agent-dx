@@ -434,7 +434,8 @@ async fn explicit_placement_adds_only_the_named_node_after_policy_is_satisfied()
         persisted_bytes: claim.chunk.length,
         verified_digest: claim.chunk.content_digest.clone(),
     }).collect();
-    fixture.service.report_replication_task(ReportReplicationTask {
+    let claim_epoch = claim.replica_group.placement_epoch;
+    let task = fixture.service.report_replication_task(ReportReplicationTask {
         caller_id: "writer".into(),
         caller_session_id: "writer-s1".into(),
         caller_node_epoch: writer_epoch,
@@ -444,6 +445,8 @@ async fn explicit_placement_adds_only_the_named_node_after_policy_is_satisfied()
         error: None,
         source_invalid: false,
     }).await.unwrap();
+    assert_eq!(task.placement_epoch, claim_epoch);
+    assert_eq!(task.desired_copies, 2);
     ensure.operation_id = OperationId::new("confirm-target");
     assert!(fixture.service.ensure_replica_placement(ensure).await.unwrap());
     let after = fixture.placement().await;
