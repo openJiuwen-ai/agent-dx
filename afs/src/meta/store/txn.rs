@@ -213,6 +213,7 @@ pub enum StoreOperation {
     DfsRestoreFileChunk,
     DfsPublishReadCache,
     DfsRetireReadCache,
+    DfsEnsureReplicaPlacement,
 }
 
 impl StoreOperation {
@@ -244,6 +245,7 @@ impl StoreOperation {
             Self::DfsRestoreFileChunk => "dfs_restore_file_chunk",
             Self::DfsPublishReadCache => "dfs_publish_read_cache",
             Self::DfsRetireReadCache => "dfs_retire_read_cache",
+            Self::DfsEnsureReplicaPlacement => "dfs_ensure_replica_placement",
             Self::DfsSetXattr => "dfs_set_xattr",
             Self::DfsRemoveXattr => "dfs_remove_xattr",
             Self::DfsAcquireWriteLease => "dfs_acquire_write_lease",

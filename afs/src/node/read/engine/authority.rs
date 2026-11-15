@@ -9,6 +9,9 @@ pub(in crate::node) struct NativeReadAuthoritySnapshot {
 }
 
 impl NativeReadAuthoritySnapshot {
+    pub(in crate::node) fn epoch(&self) -> u64 {
+        self.epoch
+    }
     pub(in crate::node) fn expires_at(&self) -> Option<Instant> {
         self.expires_at
     }

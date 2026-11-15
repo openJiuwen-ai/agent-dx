@@ -1,5 +1,7 @@
 //! Nydus HTTP backend connector. Registry semantics stay inside this package.
 mod http;
+#[cfg(feature = "dfs")]
+mod jobs;
 mod lazy_fill;
 mod registry;
 mod service;
@@ -66,6 +68,8 @@ pub struct NydusConnector {
     provider: Arc<registry::RegistryProvider>,
     http_token_hash: Option<[u8; 32]>,
     service: OnceLock<Arc<service::NydusService>>,
+    #[cfg(feature = "dfs")]
+    jobs: OnceLock<Arc<jobs::Jobs>>,
 }
 impl NydusConnector {
     pub fn new(config: NydusConfig, node_id: &str) -> Result<Self> {
@@ -90,6 +94,8 @@ impl NydusConnector {
             provider,
             http_token_hash,
             service: OnceLock::new(),
+            #[cfg(feature = "dfs")]
+            jobs: OnceLock::new(),
         })
     }
 }
@@ -103,6 +109,8 @@ impl ConnectorModule for NydusConnector {
         registry.register(lazy_fill::PLAN_KIND, handler)
     }
     fn http_routes(&self, context: ConnectorContext) -> Result<Router> {
+        #[cfg(feature = "dfs")]
+        let admin = context.admin.clone();
         let service = Arc::new(service::NydusService::new(
             context,
             self.config.clone(),
@@ -111,10 +119,23 @@ impl ConnectorModule for NydusConnector {
         self.service.set(service.clone()).map_err(|_| {
             Error::coded(afs_error::CONFIG_INVALID, "Nydus routes already assembled")
         })?;
-        Ok(http::routes(service, self.http_token_hash))
+        let router = http::routes(service.clone(), self.http_token_hash);
+        #[cfg(feature = "dfs")]
+        if let Some((dfs, token)) = admin {
+            let jobs = Arc::new(jobs::Jobs::new(service, dfs));
+            self.jobs.set(jobs.clone()).map_err(|_| {
+                Error::coded(afs_error::CONFIG_INVALID, "Nydus administration already assembled")
+            })?;
+            return Ok(router.merge(jobs::routes(jobs, token)));
+        }
+        Ok(router)
     }
     fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
+            #[cfg(feature = "dfs")]
+            if let Some(jobs) = self.jobs.get() {
+                jobs.stop().await;
+            }
             if let Some(service) = self.service.get() {
                 service.stop().await;
             }

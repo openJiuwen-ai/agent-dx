@@ -516,3 +516,87 @@ fn unavailable(message: &str) -> Error {
 #[cfg(test)]
 #[path = "service_tests.rs"]
 mod tests;
+
+#[cfg(feature = "dfs")]
+impl NydusService {
+    pub(super) fn check_management_source(&self, source: &str) -> Result<()> {
+        self.provider.check_management_source(source)
+    }
+
+    pub(super) async fn seed(
+        self: &Arc<Self>,
+        dfs: &Arc<crate::node::vfs::dfs::DistributedFs>,
+        request: super::jobs::SeedRequest,
+        deadline: Instant,
+        progress: impl Fn(usize),
+    ) -> Result<usize> {
+        let plan = self.provider.describe(&request.source, &request.manifest_digest, deadline).await?;
+        let targets = Arc::new(request.node_ids);
+        for (index, blob) in plan.blobs.iter().enumerate() {
+            let permit = self.admit(deadline).await?;
+            let stat = self.stat_registry_blob(
+                &plan.repository, &blob.blob_digest, deadline, permit.clone(),
+            ).await?;
+            if stat.size != blob.size {
+                return Err(invalid("Registry blob size differs from manifest"));
+            }
+            let mut body = self.read_blob(stat.entry.clone(), 0, stat.size, deadline, permit).await?;
+            let mut length = 0_u64;
+            let mut hash = Sha256::new();
+            while let Some(piece) = body.recv().await {
+                let piece = piece?;
+                length += piece.len() as u64;
+                hash.update(piece);
+            }
+            if length != blob.size || format!("sha256:{:x}", hash.finalize()) != blob.blob_digest {
+                return Err(invalid("full Registry blob checksum differs from manifest"));
+            }
+            let dfs = dfs.clone();
+            let ctx = self.ctx.clone();
+            let targets = targets.clone();
+            blocking(move || {
+                let handle = dfs.open(&ctx, stat.entry.inode, libc::O_RDONLY)?;
+                let result = dfs.ensure_replicas(handle, &targets, deadline);
+                let released = dfs.release(&ctx, handle);
+                result.and(released)
+            }).await?;
+            progress(index + 1);
+        }
+        Ok(plan.blobs.len())
+    }
+
+    pub(super) async fn prewarm(
+        self: &Arc<Self>,
+        dfs: &Arc<crate::node::vfs::dfs::DistributedFs>,
+        request: super::jobs::WarmRequest,
+        deadline: Instant,
+    ) -> Result<usize> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let plan = self.provider.describe(&request.source, &request.manifest_digest, deadline).await?;
+        let mut ranges = BTreeMap::<String, Vec<std::ops::Range<u64>>>::new();
+        for range in request.ranges {
+            let end = range.offset.checked_add(range.length).ok_or_else(|| invalid("blob range overflow"))?;
+            if !plan.blobs.iter().any(|blob| blob.blob_digest == range.blob_digest && end <= blob.size) {
+                return Err(invalid("range does not fit a blob in the manifest"));
+            }
+            ranges.entry(range.blob_digest).or_default().push(range.offset..end);
+        }
+        let count = ranges.len();
+        let mut installed = BTreeSet::new();
+        for (blob_id, spans) in ranges {
+            let permit = self.admit(deadline).await?;
+            let stat = self.stat_registry_blob(&plan.repository, &blob_id, deadline, permit).await?;
+            let dfs = dfs.clone();
+            let ctx = self.ctx.clone();
+            let chunks = blocking(move || {
+                dfs.prefetch_ranges(&ctx, stat.entry.inode, &spans, deadline)
+            }).await?;
+            installed.extend(chunks);
+        }
+        let dfs = dfs.clone();
+        if !blocking(move || Ok(dfs.verify_prefetched_chunks(&installed))).await? {
+            return Err(unavailable("warm ranges no longer fit in local DFS cache"));
+        }
+        Ok(count)
+    }
+}

@@ -234,6 +234,7 @@ fn meta_store_enum_variant_indices_are_pinned() {
         37: StoreOperation::DfsRestoreFileChunk => StoreOperation::DfsRestoreFileChunk,
         38: StoreOperation::DfsPublishReadCache => StoreOperation::DfsPublishReadCache,
         39: StoreOperation::DfsRetireReadCache => StoreOperation::DfsRetireReadCache,
+        40: StoreOperation::DfsEnsureReplicaPlacement => StoreOperation::DfsEnsureReplicaPlacement,
     });
 }
 

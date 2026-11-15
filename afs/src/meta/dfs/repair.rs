@@ -137,6 +137,84 @@ impl DfsService {
         Ok(None)
     }
 
+    /// Request a durable copy at a named Node, even if the ordinary replica
+    /// policy is already satisfied. The normal repair workers drive the copy
+    /// from a verified source. Polling succeeds only after Meta sees the copy.
+    pub async fn ensure_replica_placement(
+        &self,
+        request: crate::dfs::EnsureReplicaPlacement,
+    ) -> Result<bool> {
+        if self.is_external_backend() {
+            return Err(invalid("explicit Node placement requires native DFS storage"));
+        }
+        validate_repair_caller(
+            &request.caller_id, &request.caller_session_id, &request.operation_id,
+            request.caller_node_epoch,
+        )?;
+        if !crate::config::is_safe_node_id(&request.target_node_id) {
+            return Err(invalid("invalid explicit target Node ID"));
+        }
+        let now = now_unix_ms();
+        self.current_session(
+            &request.caller_id, request.caller_node_epoch, Some(&request.caller_session_id), now,
+        ).await?;
+        let target = self.current_live_session(&request.target_node_id, now).await?;
+        if target.storage_devices.is_empty() {
+            return Err(conflict("explicit target has no registered DFS storage"));
+        }
+        let (version, layout) = self.get_shared_file_version(request.file_version_id.clone()).await?;
+        if !layout.inline_extents.iter().any(|extent| extent.chunk_id == request.chunk_id) {
+            return Err(invalid("explicit placement chunk is not in the committed file version"));
+        }
+        let chunk = self.chunk(&request.chunk_id).await?;
+        let placement = self.placement(&request.chunk_id).await?;
+        for copy_id in &placement.copies {
+            let copy = self.copy(copy_id).await?;
+            if copy.is_ready_durable() && copy_matches_chunk(&copy, &chunk)
+                && serving_read_copy(&copy, &target, now).is_some()
+            {
+                return Ok(true);
+            }
+        }
+        let id = explicit_task_id(&request.chunk_id, &request.target_node_id);
+        let mut pending = pending_repair_task(
+            &request.chunk_id, placement.placement_epoch, 2, placement.copies.clone(), now,
+        );
+        pending.id = id.clone();
+        let task_condition = match self.store.read(MetaRead::DfsReplicationTask(id.clone())).await?.entity {
+            Some(MetaEntity::DfsReplicationTask(task)) if task.state == ReplicationTaskState::Completed => {
+                pending.attempt = task.attempt;
+                TxnCondition::EntityEquals(MetaEntity::DfsReplicationTask(task))
+            }
+            Some(MetaEntity::DfsReplicationTask(_)) => return Ok(false),
+            _ => TxnCondition::Missing(MetaKey::DfsReplicationTask(id)),
+        };
+        let key = RequestKey::new(request.caller_id.clone(), request.operation_id.0.clone());
+        let operation = StoreOperation::DfsEnsureReplicaPlacement;
+        let mut txn = MetaTxn::new(key.clone(), operation);
+        txn.conditions.extend([
+            TxnCondition::RequestAbsent(key.clone()),
+            task_condition,
+            TxnCondition::EntityEquals(MetaEntity::DfsPlacement(placement)),
+            TxnCondition::EntityEquals(MetaEntity::DfsChunk(chunk)),
+            TxnCondition::EntityEquals(MetaEntity::DfsFileVersion(version)),
+            caller_session_current(&request.caller_id, &request.caller_session_id),
+            caller_session_current(&target.node_id, &target.session_id),
+        ]);
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsReplicationTask(pending.clone())),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation,
+                result: namespace_result(
+                    namespace_request_digest(&request)?, OperationResult::DfsReplicationTask(pending),
+                ),
+            }),
+        ]);
+        self.store.compare_and_commit(txn).await?;
+        Ok(false)
+    }
+
     async fn repair_worker_session(
         &self,
         request: &ClaimReplicationTask,
@@ -394,6 +472,9 @@ impl DfsService {
         };
         let sources = self.live_sources(&placement, now, None).await?;
         if sources.count == 0 {
+            if explicit_target(&task.id).is_some() {
+                return Ok(None);
+            }
             if task.state != ReplicationTaskState::BlockedNoSource
                 || placement.health != PlacementHealth::BlockedNoSource
             {
@@ -423,7 +504,7 @@ impl DfsService {
             // Repair debt exists independently of eligible replacement
             // capacity. A completed (or absent) task must not hide a lost
             // replica while there are too few nodes to issue a claim.
-            if task.state != ReplicationTaskState::Pending {
+            if task.state != ReplicationTaskState::Pending || explicit_target(&task.id).is_some() {
                 return Ok(None);
             }
             return self
@@ -770,19 +851,17 @@ impl DfsService {
             }
             mutations.push(TxnMutation::Put(MetaEntity::DfsCopy(copy)));
         }
-        mutations.push(TxnMutation::Put(MetaEntity::DfsPlacement(
-            PlacementRecord {
-                chunk_id: placement.chunk_id.clone(),
-                replica_group_id: request.claim.replica_group.id.clone(),
-                placement_epoch: request.claim.replica_group.placement_epoch,
-                desired_copies: request.claim.replication.desired_copies,
-                copies: copy_ids.clone(),
-                health: PlacementHealth::Satisfied,
-            },
-        )));
+        let mut updated_placement = placement.clone();
+        updated_placement.copies = copy_ids.clone();
+        if explicit_target(&updated_task.id).is_none() {
+            updated_placement.replica_group_id = request.claim.replica_group.id.clone();
+            updated_placement.placement_epoch = request.claim.replica_group.placement_epoch;
+            updated_placement.desired_copies = request.claim.replication.desired_copies;
+            updated_placement.health = PlacementHealth::Satisfied;
+        }
         updated_task.state = ReplicationTaskState::Completed;
-        updated_task.placement_epoch = request.claim.replica_group.placement_epoch;
-        updated_task.desired_copies = request.claim.replication.desired_copies;
+        updated_task.placement_epoch = updated_placement.placement_epoch;
+        mutations.push(TxnMutation::Put(MetaEntity::DfsPlacement(updated_placement)));
         updated_task.existing_copies = copy_ids;
         updated_task.claim = None;
         updated_task.last_error = None;
@@ -1105,7 +1184,11 @@ impl DfsService {
             Ok(placement) => placement,
             Err(_) => return Ok(None),
         };
-        if placement.placement_epoch != task.placement_epoch {
+        let explicit = explicit_target(&task.id);
+        if placement.placement_epoch != task.placement_epoch && explicit.is_none() {
+            return Ok(None);
+        }
+        if explicit.is_some_and(|target| target == request.caller_id) {
             return Ok(None);
         }
         let mut source = None;
@@ -1130,13 +1213,23 @@ impl DfsService {
         let mut repair_replication = replication.clone();
         repair_replication.sync_required_copies = repair_replication.desired_copies;
         repair_replication.local_copy = LocalCopyPolicy::Required;
+        if explicit.is_some() {
+            repair_replication = ReplicationConfig {
+                desired_copies: 2,
+                sync_required_copies: 2,
+                min_distinct_nodes: 2,
+                min_distinct_failure_domains: 1,
+                local_copy: LocalCopyPolicy::Required,
+            };
+        }
         let sessions_snapshot = self.store.read(MetaRead::CurrentNodeSessions).await?;
         let mut storage_sessions = sessions_snapshot
             .entities
             .into_iter()
             .filter_map(|entity| match entity {
                 MetaEntity::NodeSession(session)
-                    if session.is_live_at_unix_ms(now) && !session.storage_devices.is_empty() =>
+                    if session.is_live_at_unix_ms(now) && !session.storage_devices.is_empty()
+                        && explicit.is_none_or(|target| session.node_id == target || session.node_id == request.caller_id) =>
                 {
                     Some(session)
                 }
@@ -1522,6 +1615,14 @@ fn task_is_claimable(task: &ReplicationTask, now: u64) -> bool {
     }
 }
 
+fn explicit_task_id(chunk_id: &crate::dfs::ChunkId, node_id: &str) -> ReplicationTaskId {
+    ReplicationTaskId::new(format!("explicit:{}:{node_id}", chunk_id.0))
+}
+
+fn explicit_target(task_id: &ReplicationTaskId) -> Option<&str> {
+    task_id.0.strip_prefix("explicit:")?.rsplit_once(':').map(|(_, target)| target)
+}
+
 pub(super) fn repair_task_id(chunk_id: &crate::dfs::ChunkId) -> ReplicationTaskId {
     ReplicationTaskId::new(format!("repair:{}", chunk_id.0))
 }
@@ -1662,4 +1763,18 @@ pub(super) async fn live_sources_among(
         count: nodes.len(),
         evidence,
     })
+}
+
+#[cfg(test)]
+mod explicit_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_repair_targets_are_independent_of_ordinary_repair() {
+        let chunk = crate::dfs::ChunkId::new("chunk:with:separators");
+        let task = explicit_task_id(&chunk, "node-b");
+        assert_ne!(task, repair_task_id(&chunk));
+        assert_eq!(explicit_target(&task), Some("node-b"));
+        assert_eq!(explicit_target(&repair_task_id(&chunk)), None);
+    }
 }

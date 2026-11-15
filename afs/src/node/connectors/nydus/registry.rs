@@ -120,6 +120,15 @@ impl RegistryProvider {
             .ok_or_else(|| Error::coded(afs_error::IO_NOT_FOUND, "unknown Registry source key"))
     }
 
+    #[cfg(feature = "dfs")]
+    pub(super) fn check_management_source(&self, key: &str) -> Result<()> {
+        let source = self.source(key)?;
+        if self.proxy_sources.get(&source.config.repository).is_none_or(|actual| actual != key) {
+            return Err(invalid("management source must be configured for Registry proxy reads"));
+        }
+        Ok(())
+    }
+
     pub(super) fn proxy_source(&self, repository: &str) -> Result<(&str, &RegistryConfig)> {
         let key = self.proxy_sources.get(repository).ok_or_else(|| {
             Error::coded(

@@ -52,6 +52,8 @@ pub(super) async fn run_node(
     // 1–2. Bind all TCP ingress before spawning services. A failed bind
     // cannot leave a half-ready Node. Storage opens before registration.
     let management_labels = cfg.management.registration_labels()?;
+    #[cfg(feature = "dfs")]
+    let admin_token = cfg.management.token_file.as_deref().map(crate::management::load_token).transpose()?;
     let metrics = common::FsMetrics::register(&obs)?;
     let ingress = common::TcpIngress::bind(&cfg).await?;
     let startup = common::Startup::resolve(&cfg)?;
@@ -70,7 +72,9 @@ pub(super) async fn run_node(
         backends
             .dfs
             .connectors
-            .http_routes(super::connectors::ConnectorContext { backend, root })?
+            .http_routes(super::connectors::ConnectorContext {
+                backend, root, admin: admin_token.map(|token| (dfs.clone(), token)),
+            })?
     } else {
         axum::Router::new()
     };

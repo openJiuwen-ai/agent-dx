@@ -790,6 +790,10 @@ impl DfsReadEngine {
 
     /// Disposable local storage for already verified native Peer objects.
     /// Cache contents never supply grant, Node/session or file-view authority.
+    pub(in crate::node) fn has_local_chunk(&self, chunk: &crate::dfs::ChunkId) -> bool {
+        self.local.open_for_range_reads(chunk).is_ok()
+    }
+
     pub(in crate::node) fn with_peer_cache(mut self, cache: Arc<DiskPeerCache>) -> Self {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             self.fetcher = match super::object_fetch::ObjectFetcher::new(

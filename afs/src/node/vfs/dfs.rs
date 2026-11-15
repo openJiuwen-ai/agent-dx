@@ -40,6 +40,7 @@ mod lock_proxy_client;
 mod lock_proxy_owner;
 mod lock_sessions;
 mod lock_wire;
+mod management;
 mod meta_port;
 pub mod owner_api;
 mod owner_gateway;

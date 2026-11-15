@@ -416,6 +416,24 @@ impl GrpcDfsMeta {
             .map(Some)
     }
 
+    pub fn ensure_replica_placement(
+        &self,
+        request: crate::dfs::EnsureReplicaPlacement,
+    ) -> afs_error::Result<bool> {
+        let reply = self.run(self.client().ensure_replica_placement(
+            afs_protocol::meta::EnsureDfsReplicaPlacementRequest {
+                caller_id: request.caller_id,
+                caller_session_id: request.caller_session_id,
+                caller_node_epoch: request.caller_node_epoch,
+                operation_id: request.operation_id.0,
+                file_version_id: request.file_version_id.0,
+                chunk_id: request.chunk_id.0,
+                target_node_id: request.target_node_id,
+            },
+        ))?.into_inner();
+        Ok(reply.ready)
+    }
+
     pub fn report_replication_task(
         &self,
         request: crate::dfs::ReportReplicationTask,

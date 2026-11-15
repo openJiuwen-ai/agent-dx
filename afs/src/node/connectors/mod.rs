@@ -17,6 +17,8 @@ pub struct ConnectorsConfig {
 pub struct ConnectorContext {
     pub backend: Arc<dyn Backend>,
     pub root: BackendInode,
+    #[cfg(feature = "dfs")]
+    pub(crate) admin: Option<(Arc<super::vfs::dfs::DistributedFs>, crate::management::AdminToken)>,
 }
 
 pub trait ConnectorModule: Send + Sync {

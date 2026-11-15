@@ -207,6 +207,8 @@ fn fixture() -> (Arc<LostReplyBackend>, NydusService, ImagePlan) {
     let provider = RegistryProvider::new(&config.sources, "test").unwrap();
     let service = NydusService::new(
         ConnectorContext {
+            #[cfg(feature = "dfs")]
+            admin: None,
             backend: backend.clone(),
             root: backend.root_inode(),
         },

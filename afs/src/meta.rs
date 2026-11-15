@@ -230,6 +230,7 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
         owner_roots,
         dfs,
         watch_budget: watch::Budget::standard(),
+        management_nodes: Default::default(),
         trusted_nodes_by_der: Arc::new(trusted_nodes_by_der),
         enforce_peer_identity,
     });

@@ -4,6 +4,13 @@ use super::*;
 
 #[cfg(feature = "dfs")]
 impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
+    fn ensure_replica_placement(
+        &self,
+        request: crate::dfs::EnsureReplicaPlacement,
+    ) -> afs_error::Result<bool> {
+        GrpcDfsMeta::ensure_replica_placement(self, request)
+    }
+
     fn restore_file_chunk(
         &self,
         request: crate::dfs::RestoreFileChunk,
