@@ -292,7 +292,7 @@ def sample(config, snapshot, image, output, worker, workload, command, expected)
     )
     with log.open("xb") as stderr:
         sniffer = subprocess.Popen(
-            [str(Path(tcpdump).resolve()), "-i", "lo", "-s", "0", "-U", "-w", str(capture),
+            [str(Path(tcpdump).resolve()), "--immediate-mode", "-i", "lo", "-s", "0", "-U", "-w", str(capture),
              *(["-Z", "root"] if os.geteuid() == 0 else []),
              f"ip and tcp dst port {int(config.get('sampling_proxy_port', 7401))}"],
             stdout=subprocess.DEVNULL, stderr=stderr, env=dict(os.environ, LC_ALL="C"),
