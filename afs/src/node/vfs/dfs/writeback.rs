@@ -38,11 +38,14 @@ impl DistributedFs {
         let mut examined = 0;
         let mut renewed_count = 0;
         let mut first_error = None;
-        for (_, cell) in entries {
+        for (inode_id, cell) in entries {
             if Instant::now() >= deadline {
                 break;
             }
             examined += 1;
+            let Ok(_lease_admission) = self.lease_admission(&inode_id) else {
+                continue;
+            };
             let lease = {
                 let Ok(state) = cell.try_lock() else {
                     continue;

@@ -285,6 +285,10 @@ impl DfsMeta for CapturingDfsMeta {
         DfsMeta::renew_write_lease(self.inner.as_ref(), lease)
     }
 
+    fn release_write_leases(&self, operation: &OperationId, leases: &[WriteLease]) -> Result<u64> {
+        DfsMeta::release_write_leases(self.inner.as_ref(), operation, leases)
+    }
+
     fn sync_inode_metadata(&self, sync: SyncInodeMetadata) -> Result<InodeRecord> {
         DfsMeta::sync_inode_metadata(self.inner.as_ref(), sync)
     }
@@ -1225,6 +1229,95 @@ async fn r110_grpc_reopen_preserves_write_epoch_across_gc() {
     })
     .await;
     eprintln!("r110: Meta and Node advanced to epoch 3; reopen and write succeeded");
+    server.abort();
+}
+
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r106_handoff_respects_active_node_lock_authority() {
+    use crate::meta::store::{MetaEntity, MetaRead};
+    let (_temp, endpoint, _gate, server, store, local, _backend) = real_grpc_meta_fixture().await;
+    let (_meta, _chunks, fs) = grpc_dfs_test_fs(
+        "node-a",
+        "session-a",
+        &endpoint,
+        local,
+        Duration::from_secs(2),
+    )
+    .await;
+    let fs = Arc::new(fs.with_write_handoff_prototype(true));
+    let probe = fs.clone();
+    let locked = run_blocking(move || {
+        [FileLockKind::Flock, FileLockKind::Posix].map(|kind| {
+            let name = format!("r106-locked-{kind:?}");
+            let created = probe
+                .create(
+                    &context(),
+                    probe.root_inode(),
+                    OsStr::new(&name),
+                    0o640,
+                    libc::O_RDWR,
+                )
+                .unwrap();
+            let inode = created.entry.inode;
+            probe.release(&context(), created.handle).unwrap();
+            let reader = probe.open(&context(), inode, libc::O_RDONLY).unwrap();
+            let request = LockRequest::read(
+                kind,
+                lock_owner("mount-a", 10),
+                100,
+                lock_range(0, u64::MAX),
+            );
+            probe
+                .setlk(&context(), inode, reader, request.clone(), None)
+                .unwrap();
+            let id = probe.inode_id(inode).unwrap();
+            let state = probe.write_state(&id).unwrap().unwrap();
+            let state = state.lock().unwrap();
+            assert_eq!(state.open_writers, 0, "only the lock protects the lease");
+            let epoch = state.write_lease.lease_epoch;
+            (id, epoch, inode, reader, request)
+        })
+    })
+    .await;
+
+    let probe = fs.clone();
+    let targets = locked
+        .each_ref()
+        .map(|(id, epoch, _, _, _)| (id.clone(), *epoch));
+    run_blocking(move || {
+        for (id, epoch) in targets {
+            assert!(!probe.expedite_idle_lease(&id, epoch).unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(probe.release_idle_leases().unwrap(), 0);
+    })
+    .await;
+    for (id, epoch, _, _, _) in &locked {
+        let snapshot = store
+            .read(MetaRead::DfsWriteLease(id.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            snapshot.entity,
+            Some(MetaEntity::DfsWriteLease(lease))
+                if lease.lease_epoch == *epoch && lease.expires_at_unix_ms > now_unix_ms()
+        ));
+    }
+
+    let probe = fs.clone();
+    run_blocking(move || {
+        for (_, _, inode, reader, mut request) in locked {
+            request.lock_type = FileLockType::Unlock;
+            probe
+                .setlk(&context(), inode, reader, request, None)
+                .unwrap();
+            probe.release(&context(), reader).unwrap();
+        }
+        probe.reclaim_idle_lock_authorities().unwrap();
+        assert_eq!(probe.release_idle_leases().unwrap(), 2);
+    })
+    .await;
     server.abort();
 }
 

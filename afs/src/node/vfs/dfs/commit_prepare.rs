@@ -541,6 +541,9 @@ impl DistributedFs {
         if state.open_writers == 0 && (state.dirty || state.metadata_dirty) {
             state.last_writer_background_requested = true;
         }
+        if state.open_writers == 0 {
+            self.queue_idle_lease(inode_id)?;
+        }
         Ok(state.visible_write_seq)
     }
 
@@ -574,6 +577,9 @@ impl DistributedFs {
         state.proxied_writes.remove(&session.id);
         if state.open_writers == 0 && (state.dirty || state.metadata_dirty) {
             state.last_writer_background_requested = true;
+        }
+        if state.open_writers == 0 {
+            self.queue_idle_lease(&session.inode_id)?;
         }
         Ok(deliver
             .then(|| Self::take_undelivered_error(&mut state, session.error_cursor))

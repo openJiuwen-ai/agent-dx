@@ -22,7 +22,7 @@ impl<K: Eq + Hash, V> Default for ShardedMap<K, V> {
 }
 
 impl<K: Eq + Hash, V> ShardedMap<K, V> {
-    fn shard(key: &K) -> usize {
+    pub(super) fn shard(key: &K) -> usize {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut hash);
         hash.finish() as usize % DFS_HANDLE_SHARDS

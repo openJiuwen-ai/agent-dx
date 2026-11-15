@@ -121,6 +121,16 @@ pub trait DfsMeta: Send + Sync {
         })
     }
     fn renew_write_lease(&self, lease: WriteLease) -> Result<WriteLease>;
+    fn release_write_leases(
+        &self,
+        _operation: &OperationId,
+        _leases: &[WriteLease],
+    ) -> Result<u64> {
+        Err(Error::coded(
+            afs_error::IO_NOT_SUPPORTED,
+            "Meta does not support write lease release",
+        ))
+    }
     fn sync_inode_metadata(&self, sync: SyncInodeMetadata) -> Result<InodeRecord>;
     fn commit_file_version(&self, commit: CommitFileVersion) -> Result<InodeRecord>;
     fn lookup_node_location(&self, node_id: &str) -> Result<Option<DfsNodeLocation>>;
