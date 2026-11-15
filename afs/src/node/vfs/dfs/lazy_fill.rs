@@ -21,7 +21,7 @@ pub(super) fn sealed(inode: &InodeRecord) -> bool {
     inode.xattrs.contains_key(DESCRIPTOR_XATTR)
 }
 
-fn covered(layout: &LayoutRoot, offset: u64, length: u64) -> bool {
+pub(super) fn covered(layout: &LayoutRoot, offset: u64, length: u64) -> bool {
     let Some(end) = offset.checked_add(length) else {
         return false;
     };

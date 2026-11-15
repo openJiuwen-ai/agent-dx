@@ -123,8 +123,14 @@ impl RegistryProvider {
     #[cfg(feature = "dfs")]
     pub(super) fn check_management_source(&self, key: &str) -> Result<()> {
         let source = self.source(key)?;
-        if self.proxy_sources.get(&source.config.repository).is_none_or(|actual| actual != key) {
-            return Err(invalid("management source must be configured for Registry proxy reads"));
+        if self
+            .proxy_sources
+            .get(&source.config.repository)
+            .is_none_or(|actual| actual != key)
+        {
+            return Err(invalid(
+                "management source must be configured for Registry proxy reads",
+            ));
         }
         Ok(())
     }

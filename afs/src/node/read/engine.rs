@@ -790,6 +790,12 @@ impl DfsReadEngine {
 
     /// Disposable local storage for already verified native Peer objects.
     /// Cache contents never supply grant, Node/session or file-view authority.
+    #[cfg(feature = "dfs")]
+    pub(in crate::node) fn prefetch_cache_enabled(&self) -> bool {
+        self.distributed_cache.is_some()
+    }
+
+    #[cfg(feature = "dfs")]
     pub(in crate::node) fn has_local_chunk(&self, chunk: &crate::dfs::ChunkId) -> bool {
         self.local.open_for_range_reads(chunk).is_ok()
     }

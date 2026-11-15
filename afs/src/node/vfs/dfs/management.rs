@@ -15,12 +15,24 @@ impl DistributedFs {
     ) -> Result<()> {
         let snapshot = self.handle_snapshot(handle)?;
         let view = self.readonly_version_for_inode(&snapshot.opened_inode)?;
-        let Some(version) = view.version.as_ref() else { return Ok(()); };
-        let chunks: BTreeSet<_> = view.layout.inline_extents.iter()
-            .map(|extent| &extent.chunk_id).collect();
-        let mut pending = chunks.into_iter().flat_map(|chunk| {
-            target_nodes.iter().map(move |target| (chunk, target))
-        }).collect::<Vec<_>>();
+        if let Some(source) = lazy_fill::descriptor(&snapshot.opened_inode)?
+            && !lazy_fill::covered(&view.layout, 0, source.length)
+        {
+            return Err(unavailable("lazy file has uncommitted replica ranges"));
+        }
+        let Some(version) = view.version.as_ref() else {
+            return Ok(());
+        };
+        let chunks: BTreeSet<_> = view
+            .layout
+            .inline_extents
+            .iter()
+            .map(|extent| &extent.chunk_id)
+            .collect();
+        let mut pending = chunks
+            .into_iter()
+            .flat_map(|chunk| target_nodes.iter().map(move |target| (chunk, target)))
+            .collect::<Vec<_>>();
         while !pending.is_empty() {
             let epoch = self.read_engine.capture_native_read_authority()?.epoch();
             let mut retry = Vec::new();
@@ -43,7 +55,9 @@ impl DistributedFs {
             }
             pending = retry;
             if !pending.is_empty() {
-                std::thread::sleep(RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+                std::thread::sleep(
+                    RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
         }
         Ok(())
@@ -67,35 +81,62 @@ impl DistributedFs {
         self.with_prefetch_handle(ctx, inode, |handle| {
             let snapshot = self.handle_snapshot(handle)?;
             let view = self.readonly_version_for_inode(&snapshot.opened_inode)?;
-            let chunks = view.layout.inline_extents.iter()
-                .filter(|extent| {
-                    ranges.iter().any(|range| overlaps(extent, range))
-                })
-                .map(|extent| extent.chunk_id.clone()).collect::<BTreeSet<_>>();
+            if lazy_fill::sealed(&snapshot.opened_inode)
+                && ranges.iter().any(|range| !lazy_fill::covered(&view.layout, range.start, range.end - range.start))
+            {
+                return Err(unavailable("lazy file ranges were not committed"));
+            }
+            let chunks = view
+                .layout
+                .inline_extents
+                .iter()
+                .filter(|extent| ranges.iter().any(|range| overlaps(extent, range)))
+                .map(|extent| extent.chunk_id.clone())
+                .collect::<BTreeSet<_>>();
 
-            // The native disk cache installs a verified Chunk. Read its mapped
-            // extents to complete the object when a requested range was partial.
-            let missing = chunks.iter().filter(|chunk| !self.read_engine.has_local_chunk(chunk))
-                .cloned().collect::<BTreeSet<_>>();
-            for extent in &view.layout.inline_extents {
-                if missing.contains(&extent.chunk_id) {
-                    self.read_management_range(
-                        ctx, handle, extent.file_offset..extent.file_offset + extent.length, deadline,
-                    )?;
+            // Ordinary cache admission is best-effort. A management job
+            // retries an individual missing Chunk until verified local data
+            // is visible; it never reports the read's completion as readiness.
+            for chunk in &chunks {
+                while !self.read_engine.has_local_chunk(chunk) {
+                    check_management_deadline(deadline)?;
+                    if !self.read_engine.prefetch_cache_enabled() {
+                        return Err(unavailable("native DFS read cache is disabled"));
+                    }
+                    for extent in view
+                        .layout
+                        .inline_extents
+                        .iter()
+                        .filter(|extent| &extent.chunk_id == chunk)
+                    {
+                        self.read_management_range(
+                            ctx,
+                            handle,
+                            extent.file_offset..extent.file_offset + extent.length,
+                            deadline,
+                        )?;
+                    }
+                    // Allow the ordinary installer to drain before retrying
+                    // an admission rejected by its bounded queue.
+                    let settle = Instant::now() + Duration::from_millis(200);
+                    while Instant::now() < settle.min(deadline)
+                        && !self.read_engine.has_local_chunk(chunk)
+                    {
+                        std::thread::sleep(RETRY_INTERVAL);
+                    }
                 }
             }
-            loop {
-                check_management_deadline(deadline)?;
-                if self.verify_prefetched_chunks(&chunks) {
-                    return Ok(chunks);
-                }
-                std::thread::sleep(RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+            if !self.verify_prefetched_chunks(&chunks) {
+                return Err(unavailable("requested Chunks no longer fit in the DFS cache"));
             }
+            Ok(chunks)
         })
     }
 
     pub(crate) fn verify_prefetched_chunks(&self, chunks: &BTreeSet<ChunkId>) -> bool {
-        chunks.iter().all(|chunk| self.read_engine.has_local_chunk(chunk))
+        chunks
+            .iter()
+            .all(|chunk| self.read_engine.has_local_chunk(chunk))
     }
 
     fn with_prefetch_handle<T>(

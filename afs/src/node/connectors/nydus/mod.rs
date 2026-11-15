@@ -124,7 +124,10 @@ impl ConnectorModule for NydusConnector {
         if let Some((dfs, token)) = admin {
             let jobs = Arc::new(jobs::Jobs::new(service, dfs));
             self.jobs.set(jobs.clone()).map_err(|_| {
-                Error::coded(afs_error::CONFIG_INVALID, "Nydus administration already assembled")
+                Error::coded(
+                    afs_error::CONFIG_INVALID,
+                    "Nydus administration already assembled",
+                )
             })?;
             return Ok(router.merge(jobs::routes(jobs, token)));
         }

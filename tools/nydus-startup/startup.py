@@ -276,6 +276,7 @@ def sample(config, snapshot, image, output, worker, workload, command, expected)
     log = output / "tcpdump.log"
     connection = ConnectionConfig.from_env(
         server_address=config.get("adx_server_address"), token=secret(config, "adx_token_file"),
+        verify_tls=config.get("adx_verify_tls", True),
     )
     with log.open("xb") as stderr:
         sniffer = subprocess.Popen(

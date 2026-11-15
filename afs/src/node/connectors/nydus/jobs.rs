@@ -92,7 +92,9 @@ pub(super) struct Jobs {
 impl Jobs {
     pub(super) fn new(service: Arc<NydusService>, dfs: Arc<DistributedFs>) -> Self {
         Self {
-            service, dfs, records: Mutex::new(HashMap::new()),
+            service,
+            dfs,
+            records: Mutex::new(HashMap::new()),
             running: Arc::new(Semaphore::new(MAX_RUNNING)),
         }
     }
@@ -105,12 +107,21 @@ impl Jobs {
     }
 
     fn submit(self: &Arc<Self>, request: Request) -> Result<Status> {
-        let mut records = self.records.lock().map_err(|_| busy("Nydus job table poisoned"))?;
-        records.retain(|_, job| job.finished.is_none_or(|done| done.elapsed() < RETAIN_FINISHED));
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| busy("Nydus job table poisoned"))?;
+        records.retain(|_, job| {
+            job.finished
+                .is_none_or(|done| done.elapsed() < RETAIN_FINISHED)
+        });
         let (source, manifest, id, nodes) = request.validate()?;
         if let Some(previous) = records.values().find(|job| job.request.id() == id) {
             if previous.request != request {
-                return Err(Error::coded(afs_error::IO_ALREADY_EXISTS, "request_id already identifies another job"));
+                return Err(Error::coded(
+                    afs_error::IO_ALREADY_EXISTS,
+                    "request_id already identifies another job",
+                ));
             }
             return Ok(previous.status.clone());
         }
@@ -118,14 +129,28 @@ impl Jobs {
             return Err(busy("Nydus retained job limit reached"));
         }
         self.service.check_management_source(source)?;
-        let permit = self.running.clone().try_acquire_owned()
+        let permit = self
+            .running
+            .clone()
+            .try_acquire_owned()
             .map_err(|_| busy("Nydus management job limit reached"))?;
         let job_id = Uuid::new_v4();
         let status = Status {
-            job_id: job_id.to_string(), state: JobState::Queued, manifest_digest: manifest.to_owned(),
-            node_ids: nodes.to_vec(), completed_blobs: 0, error: None,
+            job_id: job_id.to_string(),
+            state: JobState::Queued,
+            manifest_digest: manifest.to_owned(),
+            node_ids: nodes.to_vec(),
+            completed_blobs: 0,
+            error: None,
         };
-        records.insert(job_id, Job { request: request.clone(), status: status.clone(), finished: None });
+        records.insert(
+            job_id,
+            Job {
+                request: request.clone(),
+                status: status.clone(),
+                finished: None,
+            },
+        );
         let this = self.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -133,9 +158,11 @@ impl Jobs {
             let deadline = Instant::now() + JOB_TIMEOUT;
             let result = match request {
                 Request::Seed(request) => {
-                    this.service.seed(&this.dfs, request, deadline, |count| {
-                        this.update(job_id, |job| job.status.completed_blobs = count);
-                    }).await
+                    this.service
+                        .seed(&this.dfs, request, deadline, |count| {
+                            this.update(job_id, |job| job.status.completed_blobs = count);
+                        })
+                        .await
                 }
                 Request::Warm(request) => this.service.prewarm(&this.dfs, request, deadline).await,
             };
@@ -157,7 +184,9 @@ impl Jobs {
     }
 
     fn update(&self, job_id: Uuid, update: impl FnOnce(&mut Job)) {
-        if let Ok(mut records) = self.records.lock() && let Some(job) = records.get_mut(&job_id) {
+        if let Ok(mut records) = self.records.lock()
+            && let Some(job) = records.get_mut(&job_id)
+        {
             update(job);
         }
     }
@@ -166,8 +195,10 @@ impl Jobs {
         let records = self.records.lock().ok()?;
         let job = records.get(&id)?;
         (matches!(job.request, Request::Seed(_)) == seed
-            && job.finished.is_none_or(|done| done.elapsed() < RETAIN_FINISHED))
-            .then(|| job.status.clone())
+            && job
+                .finished
+                .is_none_or(|done| done.elapsed() < RETAIN_FINISHED))
+        .then(|| job.status.clone())
     }
 }
 
@@ -182,13 +213,26 @@ impl Request {
     fn validate(&self) -> Result<(&str, &str, &str, &[String])> {
         let (source, manifest, nodes) = match self {
             Self::Seed(request) => {
-                if request.node_ids.is_empty() || request.node_ids.len() > 4096
-                    || request.node_ids.iter().any(|node| !crate::config::is_safe_node_id(node))
-                    || request.node_ids.iter().collect::<std::collections::HashSet<_>>().len() != request.node_ids.len()
+                if request.node_ids.is_empty()
+                    || request.node_ids.len() > 4096
+                    || request
+                        .node_ids
+                        .iter()
+                        .any(|node| !crate::config::is_safe_node_id(node))
+                    || request
+                        .node_ids
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        != request.node_ids.len()
                 {
                     return Err(invalid("node_ids requires unique valid AFS Node IDs"));
                 }
-                (&request.source, &request.manifest_digest, request.node_ids.as_slice())
+                (
+                    &request.source,
+                    &request.manifest_digest,
+                    request.node_ids.as_slice(),
+                )
             }
             Self::Warm(request) => {
                 if request.ranges.is_empty() || request.ranges.len() > 8192 {
@@ -218,32 +262,45 @@ pub(super) fn routes(jobs: Arc<Jobs>, token: AdminToken) -> Router {
         .route("/v1/admin/nydus/seed-jobs/{job_id}", get(seed_status))
         .route("/v1/admin/nydus/prewarm-jobs", post(warm))
         .route("/v1/admin/nydus/prewarm-jobs/{job_id}", get(warm_status))
-        .route_layer(middleware::from_fn_with_state(token, crate::management::require_admin))
+        .route_layer(middleware::from_fn_with_state(
+            token,
+            crate::management::require_admin,
+        ))
         .with_state(jobs)
 }
 
-async fn seed(State(jobs): State<Arc<Jobs>>, Json(request): Json<SeedRequest>)
-    -> std::result::Result<(StatusCode, Json<Status>), crate::error::RestError>
-{
-    Ok((StatusCode::ACCEPTED, Json(jobs.submit(Request::Seed(request))?)))
+async fn seed(
+    State(jobs): State<Arc<Jobs>>,
+    Json(request): Json<SeedRequest>,
+) -> std::result::Result<(StatusCode, Json<Status>), crate::error::RestError> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(jobs.submit(Request::Seed(request))?),
+    ))
 }
 
-async fn warm(State(jobs): State<Arc<Jobs>>, Json(request): Json<WarmRequest>)
-    -> std::result::Result<(StatusCode, Json<Status>), crate::error::RestError>
-{
-    Ok((StatusCode::ACCEPTED, Json(jobs.submit(Request::Warm(request))?)))
+async fn warm(
+    State(jobs): State<Arc<Jobs>>,
+    Json(request): Json<WarmRequest>,
+) -> std::result::Result<(StatusCode, Json<Status>), crate::error::RestError> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(jobs.submit(Request::Warm(request))?),
+    ))
 }
 
-async fn seed_status(State(jobs): State<Arc<Jobs>>, Path(id): Path<String>)
-    -> std::result::Result<Json<Status>, StatusCode>
-{
+async fn seed_status(
+    State(jobs): State<Arc<Jobs>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Status>, StatusCode> {
     let id = Uuid::parse_str(&id).map_err(|_| StatusCode::NOT_FOUND)?;
     Ok(Json(jobs.status(id, true).ok_or(StatusCode::NOT_FOUND)?))
 }
 
-async fn warm_status(State(jobs): State<Arc<Jobs>>, Path(id): Path<String>)
-    -> std::result::Result<Json<Status>, StatusCode>
-{
+async fn warm_status(
+    State(jobs): State<Arc<Jobs>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Status>, StatusCode> {
     let id = Uuid::parse_str(&id).map_err(|_| StatusCode::NOT_FOUND)?;
     Ok(Json(jobs.status(id, false).ok_or(StatusCode::NOT_FOUND)?))
 }

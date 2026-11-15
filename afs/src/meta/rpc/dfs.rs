@@ -1084,7 +1084,9 @@ impl DfsMetaService for DfsMetaRpc {
             })
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
-        Ok(Response::new(afs_protocol::meta::EnsureDfsReplicaPlacementReply { ready }))
+        Ok(Response::new(
+            afs_protocol::meta::EnsureDfsReplicaPlacementReply { ready },
+        ))
     }
 
     async fn report_replication_task(

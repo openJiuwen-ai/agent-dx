@@ -9,6 +9,7 @@ pub(in crate::node) struct NativeReadAuthoritySnapshot {
 }
 
 impl NativeReadAuthoritySnapshot {
+    #[cfg(feature = "dfs")]
     pub(in crate::node) fn epoch(&self) -> u64 {
         self.epoch
     }

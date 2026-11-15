@@ -145,10 +145,14 @@ impl DfsService {
         request: crate::dfs::EnsureReplicaPlacement,
     ) -> Result<bool> {
         if self.is_external_backend() {
-            return Err(invalid("explicit Node placement requires native DFS storage"));
+            return Err(invalid(
+                "explicit Node placement requires native DFS storage",
+            ));
         }
         validate_repair_caller(
-            &request.caller_id, &request.caller_session_id, &request.operation_id,
+            &request.caller_id,
+            &request.caller_session_id,
+            &request.operation_id,
             request.caller_node_epoch,
         )?;
         if !crate::config::is_safe_node_id(&request.target_node_id) {
@@ -156,21 +160,36 @@ impl DfsService {
         }
         let now = now_unix_ms();
         self.current_session(
-            &request.caller_id, request.caller_node_epoch, Some(&request.caller_session_id), now,
-        ).await?;
-        let target = self.current_live_session(&request.target_node_id, now).await?;
+            &request.caller_id,
+            request.caller_node_epoch,
+            Some(&request.caller_session_id),
+            now,
+        )
+        .await?;
+        let target = self
+            .current_live_session(&request.target_node_id, now)
+            .await?;
         if target.storage_devices.is_empty() {
             return Err(conflict("explicit target has no registered DFS storage"));
         }
-        let (version, layout) = self.get_shared_file_version(request.file_version_id.clone()).await?;
-        if !layout.inline_extents.iter().any(|extent| extent.chunk_id == request.chunk_id) {
-            return Err(invalid("explicit placement chunk is not in the committed file version"));
+        let (version, layout) = self
+            .get_shared_file_version(request.file_version_id.clone())
+            .await?;
+        if !layout
+            .inline_extents
+            .iter()
+            .any(|extent| extent.chunk_id == request.chunk_id)
+        {
+            return Err(invalid(
+                "explicit placement chunk is not in the committed file version",
+            ));
         }
         let chunk = self.chunk(&request.chunk_id).await?;
         let placement = self.placement(&request.chunk_id).await?;
         for copy_id in &placement.copies {
             let copy = self.copy(copy_id).await?;
-            if copy.is_ready_durable() && copy_matches_chunk(&copy, &chunk)
+            if copy.is_ready_durable()
+                && copy_matches_chunk(&copy, &chunk)
                 && serving_read_copy(&copy, &target, now).is_some()
             {
                 return Ok(true);
@@ -178,11 +197,22 @@ impl DfsService {
         }
         let id = explicit_task_id(&request.chunk_id, &request.target_node_id);
         let mut pending = pending_repair_task(
-            &request.chunk_id, placement.placement_epoch, 2, placement.copies.clone(), now,
+            &request.chunk_id,
+            placement.placement_epoch,
+            2,
+            placement.copies.clone(),
+            now,
         );
         pending.id = id.clone();
-        let task_condition = match self.store.read(MetaRead::DfsReplicationTask(id.clone())).await?.entity {
-            Some(MetaEntity::DfsReplicationTask(task)) if task.state == ReplicationTaskState::Completed => {
+        let task_condition = match self
+            .store
+            .read(MetaRead::DfsReplicationTask(id.clone()))
+            .await?
+            .entity
+        {
+            Some(MetaEntity::DfsReplicationTask(task))
+                if task.state == ReplicationTaskState::Completed =>
+            {
                 pending.attempt = task.attempt;
                 TxnCondition::EntityEquals(MetaEntity::DfsReplicationTask(task))
             }
@@ -207,7 +237,8 @@ impl DfsService {
                 request: key,
                 operation,
                 result: namespace_result(
-                    namespace_request_digest(&request)?, OperationResult::DfsReplicationTask(pending),
+                    namespace_request_digest(&request)?,
+                    OperationResult::DfsReplicationTask(pending),
                 ),
             }),
         ]);
@@ -857,11 +888,14 @@ impl DfsService {
             updated_placement.replica_group_id = request.claim.replica_group.id.clone();
             updated_placement.placement_epoch = request.claim.replica_group.placement_epoch;
             updated_placement.desired_copies = request.claim.replication.desired_copies;
+            updated_task.desired_copies = updated_placement.desired_copies;
             updated_placement.health = PlacementHealth::Satisfied;
         }
         updated_task.state = ReplicationTaskState::Completed;
         updated_task.placement_epoch = updated_placement.placement_epoch;
-        mutations.push(TxnMutation::Put(MetaEntity::DfsPlacement(updated_placement)));
+        mutations.push(TxnMutation::Put(MetaEntity::DfsPlacement(
+            updated_placement,
+        )));
         updated_task.existing_copies = copy_ids;
         updated_task.claim = None;
         updated_task.last_error = None;
@@ -1228,8 +1262,11 @@ impl DfsService {
             .into_iter()
             .filter_map(|entity| match entity {
                 MetaEntity::NodeSession(session)
-                    if session.is_live_at_unix_ms(now) && !session.storage_devices.is_empty()
-                        && explicit.is_none_or(|target| session.node_id == target || session.node_id == request.caller_id) =>
+                    if session.is_live_at_unix_ms(now)
+                        && !session.storage_devices.is_empty()
+                        && explicit.is_none_or(|target| {
+                            session.node_id == target || session.node_id == request.caller_id
+                        }) =>
                 {
                     Some(session)
                 }
@@ -1620,7 +1657,11 @@ fn explicit_task_id(chunk_id: &crate::dfs::ChunkId, node_id: &str) -> Replicatio
 }
 
 fn explicit_target(task_id: &ReplicationTaskId) -> Option<&str> {
-    task_id.0.strip_prefix("explicit:")?.rsplit_once(':').map(|(_, target)| target)
+    task_id
+        .0
+        .strip_prefix("explicit:")?
+        .rsplit_once(':')
+        .map(|(_, target)| target)
 }
 
 pub(super) fn repair_task_id(chunk_id: &crate::dfs::ChunkId) -> ReplicationTaskId {

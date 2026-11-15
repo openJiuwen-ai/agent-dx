@@ -53,7 +53,12 @@ pub(super) async fn run_node(
     // cannot leave a half-ready Node. Storage opens before registration.
     let management_labels = cfg.management.registration_labels()?;
     #[cfg(feature = "dfs")]
-    let admin_token = cfg.management.token_file.as_deref().map(crate::management::load_token).transpose()?;
+    let admin_token = cfg
+        .management
+        .token_file
+        .as_deref()
+        .map(crate::management::load_token)
+        .transpose()?;
     let metrics = common::FsMetrics::register(&obs)?;
     let ingress = common::TcpIngress::bind(&cfg).await?;
     let startup = common::Startup::resolve(&cfg)?;
@@ -73,7 +78,9 @@ pub(super) async fn run_node(
             .dfs
             .connectors
             .http_routes(super::connectors::ConnectorContext {
-                backend, root, admin: admin_token.map(|token| (dfs.clone(), token)),
+                backend,
+                root,
+                admin: admin_token.map(|token| (dfs.clone(), token)),
             })?
     } else {
         axum::Router::new()

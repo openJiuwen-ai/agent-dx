@@ -38,7 +38,9 @@ pub struct Meta {
     pub trusted_nodes_by_der: Arc<HashMap<Vec<u8>, String>>,
     pub enforce_peer_identity: bool,
     watch_budget: Arc<watch::Budget>,
-    management_nodes: Arc<std::sync::RwLock<HashMap<String, (u64, String, crate::management::NodeAdvertisement)>>>,
+    management_nodes: Arc<
+        std::sync::RwLock<HashMap<String, (u64, String, crate::management::NodeAdvertisement)>>,
+    >,
 }
 impl Meta {
     pub fn new(id: String, observability: Observability) -> Self {
@@ -236,7 +238,12 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
     });
     let grpc = tokio::net::TcpListener::bind(cfg.grpc_listen).await?;
     let rest = tokio::net::TcpListener::bind(cfg.rest_listen).await?;
-    let admin_token = cfg.management.token_file.as_deref().map(crate::management::load_token).transpose()?;
+    let admin_token = cfg
+        .management
+        .token_file
+        .as_deref()
+        .map(crate::management::load_token)
+        .transpose()?;
     let mut services = Services::new();
     let stop = services.stop.subscribe();
     let grpc_config = afs_transport::grpc::GrpcConfig::default();
