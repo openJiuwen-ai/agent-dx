@@ -71,6 +71,20 @@ trace_enabled = false
 trace_sample_ratio = 0.01
 trace_endpoint = "http://127.0.0.1:4317"
 
+# Optional Workspace HTTP API: requires ownerfs_mount and the complete outlet
+# configuration; independent of the per-workspace bind below. Plain HTTP with
+# no authentication: restrict network access. Uses the existing OwnerFs data root.
+# outlet_public_root = "/opt/adx/workspaces" # pre-mounted independent tmpfs
+# outlet_import_root = "/opt/adx/imports"
+# outlet_users_root = "/opt/adx/data/afs/node-a/ownerfs" # actual data path; same on every Node
+# outlet_nfs_addr = "192.168.2.10"
+# Home resolves omitted uid/gid from this account, falling back to 1000.
+# ownerfs_workspace_default_user = "agentos"
+# ownerfs_workspace_default_uid = 1000
+# ownerfs_workspace_default_gid = 1000
+# [ownerfs_workspace_api]
+# listen = "127.0.0.1:18889"
+
 # OwnerFs workspace bind: administrator-controlled host entry, OFF by default.
 # Create and authorize the Home workspace through OwnerFs before enabling this.
 # Only one already-existing local Home workspace is supported. Stop managed

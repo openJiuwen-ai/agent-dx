@@ -202,7 +202,9 @@ impl LockedLocalFsRootCatalog {
                 crate::node::storage::RenameMode::Replace,
             )
             .map_err(Error::from)?;
-        self.disk.sync_root().map_err(Error::from)
+        File::open(self.disk.root_path().join(CATALOG_DIR))
+            .and_then(|directory| directory.sync_all())
+            .map_err(Error::from)
     }
 }
 

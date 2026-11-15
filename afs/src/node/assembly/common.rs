@@ -56,6 +56,8 @@ impl FsMetrics {
 pub(super) struct TcpIngress {
     pub(super) grpc: tokio::net::TcpListener,
     pub(super) rest: tokio::net::TcpListener,
+    #[cfg(feature = "ownerfs")]
+    pub(super) workspace: Option<tokio::net::TcpListener>,
 }
 
 impl TcpIngress {
@@ -63,7 +65,17 @@ impl TcpIngress {
         // Bind all TCP ingress before spawning services. A failed bind cannot leave a half-ready Node.
         let grpc = tokio::net::TcpListener::bind(cfg.grpc_listen).await?;
         let rest = tokio::net::TcpListener::bind(cfg.rest_listen).await?;
-        Ok(Self { grpc, rest })
+        #[cfg(feature = "ownerfs")]
+        let workspace = match &cfg.ownerfs_workspace_api {
+            Some(api) => Some(tokio::net::TcpListener::bind(api.listen).await?),
+            None => None,
+        };
+        Ok(Self {
+            grpc,
+            rest,
+            #[cfg(feature = "ownerfs")]
+            workspace,
+        })
     }
 }
 
@@ -258,7 +270,7 @@ pub(super) struct Backends {
     /// Held until the Node exits, as the pool was before the split; the
     /// backends dial through their own clones.
     #[cfg(any(feature = "ownerfs", feature = "dfs"))]
-    _peer_connections: Arc<rpc::peer::PeerConnectionPool>,
+    pub(super) peer_connections: Arc<rpc::peer::PeerConnectionPool>,
     #[cfg(feature = "ownerfs")]
     pub(super) ownerfs: ownerfs::OwnerFsAssembly,
     #[cfg(feature = "dfs")]
@@ -305,7 +317,7 @@ impl Backends {
             #[cfg(feature = "dfs")]
             timeout: startup.timeout,
             #[cfg(any(feature = "ownerfs", feature = "dfs"))]
-            _peer_connections: peer_connections,
+            peer_connections,
             #[cfg(feature = "ownerfs")]
             ownerfs,
             #[cfg(feature = "dfs")]

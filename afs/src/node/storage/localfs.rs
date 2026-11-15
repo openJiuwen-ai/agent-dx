@@ -67,6 +67,13 @@ impl LocalFs {
         &self.root_path
     }
 
+    #[cfg(feature = "ownerfs")]
+    pub(crate) fn remove_tree(&self, path: &StoragePath) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let (parent, name) = self.open_parent(path)?;
+        remove_tree_child(&parent, &name, parent.metadata()?.dev(), 0)
+    }
+
     pub fn statvfs(&self) -> io::Result<FilesystemCapacity> {
         capacity_from_statvfs_fd(&self.root)
     }
@@ -101,6 +108,45 @@ impl LocalFs {
             return result;
         }
         self.open_dir_components(&split_components(path)?)
+    }
+}
+
+#[cfg(feature = "ownerfs")]
+fn remove_tree_child(parent: &File, name: &OsStr, device: u64, depth: usize) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if depth > 256 {
+        return Err(io::Error::other(
+            "recursive deletion nesting limit exceeded",
+        ));
+    }
+    let path = proc_child(parent, name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return fs::remove_file(path);
+    }
+    let directory = open_child_dir(parent, name)?;
+    if directory.metadata()?.dev() != device {
+        return Err(io::Error::other(
+            "refusing to cross a filesystem during recursive deletion",
+        ));
+    }
+    // Keep deleting siblings after a failure, so one unremovable branch (too deep,
+    // another filesystem) does not leave the rest of the tree behind.
+    let mut failure = None;
+    for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
+        let removed = entry
+            .and_then(|entry| remove_tree_child(&directory, &entry.file_name(), device, depth + 1));
+        if let Err(error) = removed {
+            failure.get_or_insert(error);
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => fs::remove_dir(path),
     }
 }
 

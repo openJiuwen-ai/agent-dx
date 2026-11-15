@@ -77,6 +77,190 @@ fn deactivate(epoch: u64) -> DeactivateRootInput {
         authenticated_home_node_id: Some("home".into()),
     }
 }
+
+#[tokio::test]
+async fn force_deactivation_requires_an_unavailable_home_and_current_requester() {
+    let (store, _, authority) = fixture().await;
+    store
+        .register_node_session(
+            RequestKey::new("entry", "register"),
+            NodeSessionLease {
+                node_id: "entry".into(),
+                session_id: "entry-session".into(),
+                grpc_addr: "g".into(),
+                data_addr: "d".into(),
+                rest_addr: "r".into(),
+                nfs_addr: String::new(),
+                ownerfs_enabled: true,
+                storage_devices: Vec::new(),
+                lease_ttl: Duration::from_secs(300),
+            },
+        )
+        .await
+        .unwrap();
+    let reservation = reserve(&authority, "force").await;
+    activate(&authority, &reservation).await;
+    let force = || ForceDeactivateRootInput {
+        root: DeactivateRootInput {
+            authenticated_home_node_id: Some("entry".into()),
+            ..deactivate(reservation.root_epoch)
+        },
+        requester_node_id: "entry".into(),
+        requester_session_id: "entry-session".into(),
+    };
+    assert!(authority.force_deactivate_root(force()).await.is_err());
+    assert!(
+        authority
+            .lookup_root(LookupRootInput {
+                root_id: "workspace".into()
+            })
+            .await
+            .unwrap()
+            .root
+            .is_some()
+    );
+    store
+        .register_node_session(
+            RequestKey::new("home", "expire"),
+            NodeSessionLease {
+                node_id: "home".into(),
+                session_id: "s".into(),
+                grpc_addr: "g".into(),
+                data_addr: "d".into(),
+                rest_addr: "r".into(),
+                nfs_addr: String::new(),
+                ownerfs_enabled: true,
+                storage_devices: Vec::new(),
+                lease_ttl: Duration::from_millis(1),
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut stale = force();
+    stale.requester_session_id = "stale".into();
+    assert!(authority.force_deactivate_root(stale).await.is_err());
+    let mut stale = force();
+    stale.root.root_epoch += 1;
+    assert!(authority.force_deactivate_root(stale).await.is_err());
+    authority.force_deactivate_root(force()).await.unwrap();
+    assert!(
+        authority
+            .lookup_root(LookupRootInput {
+                root_id: "workspace".into()
+            })
+            .await
+            .unwrap()
+            .root
+            .is_none()
+    );
+    // The dead Home session can never ACK, so force leaves no revocation behind.
+    let view = store.committed().await.unwrap();
+    assert!(
+        !view
+            .entities
+            .values()
+            .any(|entry| matches!(&entry.entity, MetaEntity::RootCommand(command) if command.root_id == "workspace"))
+    );
+}
+
+#[tokio::test]
+async fn requester_abort_and_home_activation_cannot_both_win() {
+    let (store, _, _) = fixture().await;
+    store
+        .register_node_session(
+            RequestKey::new("entry", "register"),
+            NodeSessionLease {
+                node_id: "entry".into(),
+                session_id: "entry-session".into(),
+                grpc_addr: "g".into(),
+                data_addr: "d".into(),
+                rest_addr: "r".into(),
+                nfs_addr: String::new(),
+                ownerfs_enabled: true,
+                storage_devices: Vec::new(),
+                lease_ttl: Duration::from_secs(300),
+            },
+        )
+        .await
+        .unwrap();
+    let authority = StoreOwnerRootAuthority::with_load_balancing(store, true);
+    let mut selected = None;
+    for i in 0..64 {
+        let reservation = authority
+            .reserve_root(ReserveRootInput {
+                request_id: format!("entry-{i}"),
+                root_id: format!("root-{i}"),
+                preferred_home_node_id: "entry".into(),
+                session_id: "entry-session".into(),
+                rights: vec![RootRight::Write],
+                expected_root_epoch: 0,
+                create_intent_id: format!("intent-{i}"),
+            })
+            .await
+            .unwrap()
+            .reservation;
+        if reservation.home_node_id == "home" {
+            selected = Some(reservation);
+            break;
+        }
+    }
+    let reservation = selected.expect("fixture must select a remote Home");
+    let abort = |session: &str, node: &str| AbortRootInput {
+        request_id: format!("abort-{node}-{session}"),
+        root_id: reservation.root_id.clone(),
+        root_epoch: reservation.root_epoch,
+        session_id: session.into(),
+        create_intent_id: reservation.create_intent_id.clone(),
+        prepare_token: reservation.prepare_token.clone(),
+        authenticated_home_node_id: Some(node.into()),
+    };
+    assert!(
+        authority
+            .abort_root(abort("entry-session", "other"))
+            .await
+            .is_err()
+    );
+    assert!(
+        authority
+            .abort_root(abort("old-session", "entry"))
+            .await
+            .is_err()
+    );
+    authority
+        .abort_root(abort("entry-session", "entry"))
+        .await
+        .unwrap();
+    assert!(
+        authority
+            .activate_root(ActivateRootInput {
+                request_id: "late-activate".into(),
+                local_prepare_id: "prepared".into(),
+                reservation: WireRootReservation {
+                    root_id: reservation.root_id.clone(),
+                    root_epoch: reservation.root_epoch,
+                    home_node_id: reservation.home_node_id,
+                    session_id: reservation.home_session_id,
+                    create_intent_id: reservation.create_intent_id,
+                    prepare_token: reservation.prepare_token,
+                    requester_node_id: reservation.requester_node_id,
+                    requester_session_id: reservation.requester_session_id,
+                },
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        authority
+            .lookup_root(LookupRootInput {
+                root_id: reservation.root_id
+            })
+            .await
+            .unwrap()
+            .root
+            .is_none()
+    );
+}
 #[tokio::test]
 async fn root_epoch_is_not_reused_after_abort_and_reopen() {
     let (_store, log, authority) = fixture().await;
@@ -400,6 +584,59 @@ async fn grant_lifecycle_background_cleanup_local_wal_and_checkpoint_recovery() 
                 holder_session_id: old.holder_session_id,
                 access_generation: old.access_generation,
                 fencing_token: old.fencing_token
+            })
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn restarted_home_aborts_old_reservation_without_reviving_its_session() {
+    let (store, _, authority) = fixture().await;
+    let first = reserve(&authority, "before-restart").await;
+    store
+        .register_node_session(
+            RequestKey::new("home", "restart"),
+            NodeSessionLease {
+                node_id: "home".into(),
+                session_id: "s2".into(),
+                grpc_addr: "g".into(),
+                data_addr: "d".into(),
+                rest_addr: "r".into(),
+                nfs_addr: String::new(),
+                ownerfs_enabled: true,
+                storage_devices: Vec::new(),
+                lease_ttl: Duration::from_secs(300),
+            },
+        )
+        .await
+        .unwrap();
+    let abort = |session: &str| AbortRootInput {
+        request_id: format!("restart-abort-{session}"),
+        root_id: first.root_id.clone(),
+        root_epoch: first.root_epoch,
+        session_id: session.into(),
+        create_intent_id: first.create_intent_id.clone(),
+        prepare_token: first.prepare_token.clone(),
+        authenticated_home_node_id: Some("home".into()),
+    };
+    assert!(authority.abort_root(abort("s2")).await.is_err());
+    authority.abort_root(abort("s")).await.unwrap();
+    assert!(
+        authority
+            .activate_root(ActivateRootInput {
+                request_id: "late-activate-after-abort".into(),
+                local_prepare_id: "prepared".into(),
+                reservation: WireRootReservation {
+                    root_id: first.root_id,
+                    root_epoch: first.root_epoch,
+                    home_node_id: first.home_node_id,
+                    session_id: first.home_session_id,
+                    create_intent_id: first.create_intent_id,
+                    prepare_token: first.prepare_token,
+                    requester_node_id: first.requester_node_id,
+                    requester_session_id: first.requester_session_id,
+                },
             })
             .await
             .is_err()
