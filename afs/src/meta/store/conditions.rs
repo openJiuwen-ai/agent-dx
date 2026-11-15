@@ -76,6 +76,7 @@ pub(super) fn condition_matches(state: &State, condition: &TxnCondition) -> bool
             node_id,
             session_id,
         } => !current_session_matches(state, node_id, session_id),
+        TxnCondition::NodeSessionUnavailable { node_id } => !node_has_live_session(state, node_id),
         TxnCondition::RootEpochEquals {
             root_id,
             root_epoch,
@@ -330,6 +331,22 @@ fn dfs_parent_of(state: &State, namespace_id: &NamespaceId, inode_id: &InodeId) 
         Some(MetaEntity::DfsDentry(dentry)) => Some(dentry.key.parent_inode_id.clone()),
         _ => None,
     }
+}
+
+/// Whether the node currently holds any live session, regardless of which one.
+fn node_has_live_session(state: &State, node_id: &str) -> bool {
+    let now_ms = now_unix_ms();
+    state
+        .entities
+        .get(&MetaKey::CurrentNodeSession {
+            node_id: node_id.to_owned(),
+        })
+        .is_some_and(|entity| {
+            matches!(
+                &entity.entity,
+                MetaEntity::NodeSession(session) if session.is_live_at_unix_ms(now_ms)
+            )
+        })
 }
 
 pub(super) fn current_session_matches(state: &State, node_id: &str, session_id: &str) -> bool {

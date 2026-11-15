@@ -33,6 +33,9 @@ pub enum TxnCondition {
         node_id: String,
         session_id: String,
     },
+    NodeSessionUnavailable {
+        node_id: String,
+    },
     RootEpochEquals {
         root_id: String,
         root_epoch: u64,

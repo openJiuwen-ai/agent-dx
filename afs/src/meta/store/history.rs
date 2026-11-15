@@ -211,6 +211,7 @@ impl Heap for super::TxnCondition {
                 c.value(revision)
             }
             Self::EntityEquals(value) => c.value(value),
+            Self::NodeSessionUnavailable { node_id } => c.value(node_id),
             Self::NodeSessionCurrent {
                 node_id,
                 session_id,

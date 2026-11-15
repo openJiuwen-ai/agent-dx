@@ -90,6 +90,69 @@ impl OwnerControlService {
 
 #[tonic::async_trait]
 impl OwnerControl for OwnerControlService {
+    async fn delete_workspace(
+        &self,
+        request: Request<afs_protocol::node_control::DeleteWorkspaceRequest>,
+    ) -> Result<Response<afs_protocol::node_control::DeleteWorkspaceReply>, Status> {
+        self.dispatch_owner_lock(request, false, move |handler, peer, body| {
+            handler.delete_workspace(
+                &peer,
+                &body.requester_session_id,
+                &crate::node::vfs::ownerfs::root::RootId(body.root_id),
+                body.expected_epoch,
+            )?;
+            Ok(afs_protocol::node_control::DeleteWorkspaceReply {})
+        })
+        .await
+    }
+
+    async fn workspace_attributes(
+        &self,
+        request: Request<afs_protocol::node_control::WorkspaceAttributesRequest>,
+    ) -> Result<Response<afs_protocol::node_control::WorkspaceAttributesReply>, Status> {
+        let owner = self
+            .owner_locks
+            .clone()
+            .ok_or_else(|| Status::unimplemented("OwnerFs is disabled"))?;
+        let authenticator = self.owner_authenticator.as_ref().ok_or_else(|| {
+            Status::permission_denied("workspace attributes require authenticated peer")
+        })?;
+        authenticate_peer(authenticator.as_ref(), &request)?;
+        let request = request.into_inner();
+        let id = crate::node::vfs::ownerfs::root::RootId(request.root_id);
+        let attributes = crate::node::bridge::spawn_blocking(move || {
+            owner.workspace_attributes(&id, request.epoch)
+        })
+        .await
+        .map_err(|error| coded_status(afs_error::IO_OTHER, error.to_string()))?
+        .map_err(error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::node_control::WorkspaceAttributesReply {
+                uid: attributes.uid,
+                gid: attributes.gid,
+                mode: attributes.mode,
+            },
+        ))
+    }
+
+    async fn workspace_defaults(
+        &self,
+        request: Request<afs_protocol::node_control::WorkspaceDefaultsRequest>,
+    ) -> Result<Response<afs_protocol::node_control::WorkspaceDefaultsReply>, Status> {
+        let owner = self
+            .owner_locks
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("OwnerFs is disabled"))?;
+        let authenticator = self.owner_authenticator.as_ref().ok_or_else(|| {
+            Status::permission_denied("workspace defaults require authenticated peer")
+        })?;
+        authenticate_peer(authenticator.as_ref(), &request)?;
+        let (uid, gid) = owner.workspace_defaults();
+        Ok(Response::new(
+            afs_protocol::node_control::WorkspaceDefaultsReply { uid, gid },
+        ))
+    }
+
     async fn prepare_owner_root(
         &self,
         request: Request<afs_protocol::node_control::PrepareOwnerRootRequest>,
