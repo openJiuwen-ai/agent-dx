@@ -133,14 +133,15 @@ impl DfsService {
                 .push(TxnCondition::Missing(MetaKey::DfsWriteLease(inode_id))),
         }
         if replacing_lazy_owner {
-            txn.conditions.extend([
-                TxnCondition::NodeSessionCurrent {
-                    node_id: lease.owner_node_id.clone(),
-                    session_id: lease.owner_session_id.clone(),
-                },
-                TxnCondition::EntityEquals(MetaEntity::DfsInode(inode)),
-            ]);
+            txn.conditions.push(TxnCondition::NodeSessionCurrent {
+                node_id: lease.owner_node_id.clone(),
+                session_id: lease.owner_session_id.clone(),
+            });
         }
+        // GC can remove the inode in an earlier batch than the expired lease.
+        // Matching the old lease alone does not prove the file still exists.
+        txn.conditions
+            .push(TxnCondition::EntityEquals(MetaEntity::DfsInode(inode)));
         txn.mutations.extend([
             TxnMutation::Put(MetaEntity::DfsWriteLease(lease)),
             TxnMutation::RecordRequestOutcome(outcome),

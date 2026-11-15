@@ -1939,6 +1939,125 @@ fn gc_service(store: Arc<crate::meta::store::Store>) -> DfsService {
         .with_gc_grace_ms(0)
 }
 
+#[tokio::test]
+async fn r110_gc_reclaims_expired_write_lease_only_after_inode_deletion() {
+    async fn expire(
+        store: &crate::meta::store::Store,
+        label: &str,
+        mut lease: WriteLease,
+    ) -> MetaEntity {
+        // Backdate only the expiration of a lease issued by open_write.
+        lease.expires_at_unix_ms = 0;
+        let entity = MetaEntity::DfsWriteLease(lease);
+        put_entities(store, label, vec![entity.clone()]).await;
+        entity
+    }
+
+    let namespace_id = NamespaceId::new("ns");
+    let parent_inode_id = InodeId::new("1");
+    let inode_id = InodeId::new("i");
+    let dentry = Dentry {
+        key: DentryKey {
+            namespace_id: namespace_id.clone(),
+            parent_inode_id: parent_inode_id.clone(),
+            name: b"f".to_vec(),
+        },
+        inode_id: inode_id.clone(),
+    };
+    let MetaEntity::DfsInode(mut empty) = inode("i", 1, "v") else {
+        unreachable!("inode builds a DfsInode");
+    };
+    empty.head_version = None;
+    let (store, _) = seeded_store(vec![
+        MetaEntity::DfsInode(root_inode(namespace_id.clone())),
+        MetaEntity::DfsInode(empty),
+        MetaEntity::DfsDentry(dentry),
+    ])
+    .await;
+    let service = gc_service(store.clone());
+    report_no_readers(&service).await;
+    let open = |operation: &str| {
+        service.open_write(
+            "n".into(),
+            "s".into(),
+            OperationId::new(operation),
+            inode_id.clone(),
+            60,
+        )
+    };
+    let read_lease = || store.read(MetaRead::DfsWriteLease(inode_id.clone()));
+    let collect = |completed| service.collect_garbage("n".into(), "s".into(), completed, vec![]);
+
+    let (linked, first) = open("open-first").await.unwrap();
+    assert_eq!(first.lease_epoch, 1);
+    expire(&store, "expire-first", first).await;
+    let (_, before_gc) = open("open-before-gc").await.unwrap();
+    assert_eq!(before_gc.lease_epoch, 2);
+    let expired = expire(&store, "expire-second", before_gc).await;
+    let linked_gc = collect(0).await.unwrap();
+    assert_eq!(
+        read_lease().await.unwrap().entity,
+        Some(expired),
+        "the expired lease still carries the epoch of the linked inode"
+    );
+    assert_eq!(
+        service
+            .lookup(namespace_id.clone(), parent_inode_id.clone(), b"f".to_vec())
+            .await
+            .unwrap(),
+        Some(linked)
+    );
+
+    let (_, after_gc) = open("open-after-gc").await.unwrap();
+    assert_eq!(after_gc.lease_epoch, 3);
+    assert_eq!(after_gc.owner_node_id, "n");
+    assert_eq!(after_gc.owner_session_id, "s");
+    let unlinked = service
+        .unlink(UnlinkRequest {
+            caller_id: "n".into(),
+            operation_id: OperationId::new("unlink"),
+            namespace_id,
+            parent_inode_id,
+            name: b"f".to_vec(),
+            caller: CallerContext {
+                uid: 0,
+                gid: 0,
+                supplementary_gids: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(unlinked.attributes.nlink, 0);
+    let expired = expire(&store, "expire-third", after_gc).await;
+
+    let inode_gc = collect(linked_gc.generation).await.unwrap();
+    assert_eq!(inode_gc.generation, linked_gc.generation + 1);
+    assert!(inode_gc.waiting_nodes.is_empty());
+    assert!(!exists(&store, MetaKey::DfsInode(inode_id.clone())).await);
+    assert_eq!(
+        read_lease().await.unwrap().entity,
+        Some(expired),
+        "the pass that reclaims the inode keeps its lease row"
+    );
+
+    assert!(open("open-between-gc-passes").await.is_err());
+    assert!(
+        matches!(
+            read_lease().await.unwrap().entity,
+            Some(MetaEntity::DfsWriteLease(lease)) if lease.expires_at_unix_ms == 0
+        ),
+        "reopening a collected inode must not reactivate the orphan lease"
+    );
+
+    let lease_gc = collect(inode_gc.generation).await.unwrap();
+    assert_eq!(lease_gc.generation, inode_gc.generation + 1);
+    assert!(read_lease().await.unwrap().entity.is_none());
+    eprintln!(
+        "R110 Meta: epochs=1/2/3, linked_lease_retained=true, inode_removed_generation={}, orphan_lease_removed_generation={}",
+        inode_gc.generation, lease_gc.generation,
+    );
+}
+
 const SHORT_LEASE: std::time::Duration = std::time::Duration::from_millis(150);
 const PAST_SHORT_LEASE: std::time::Duration = std::time::Duration::from_millis(200);
 
