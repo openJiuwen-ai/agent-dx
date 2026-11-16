@@ -114,7 +114,8 @@ impl ChunkSink for NativeFixtureStore {
             return self.local.put_chunks(staged, intent);
         }
         self.calls.fetch_add(staged.len(), Ordering::SeqCst);
-        if let Some(pause) = self.pause.lock().unwrap().take() {
+        let pause = self.pause.lock().unwrap().take();
+        if let Some(pause) = pause {
             pause.block();
         }
         if self.fail_next.swap(false, Ordering::SeqCst) {
@@ -2313,3 +2314,5 @@ fn an_unwritten_created_file_releases_its_admitted_generation() {
             .contains(&format!("write:{}", generation.0))
     );
 }
+
+mod unlinked;

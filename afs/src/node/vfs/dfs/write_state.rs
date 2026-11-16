@@ -18,6 +18,9 @@ pub(super) struct InodeWriteStateCell {
     /// Whether `pending` currently lists this inode. Changed only while
     /// `state` is held, so listing and unlisting follow the inode's order.
     listed: AtomicBool,
+    /// Detached from the tables. Checked by stale references and by upload
+    /// admission, which serializes with detachment via the upload task table.
+    retired: AtomicBool,
 }
 
 /// Inodes that may have pending write work, the only ones a Node-wide
@@ -321,7 +324,19 @@ impl InodeWriteStateCell {
             lock_wait: None,
             pending: std::sync::OnceLock::new(),
             listed: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
         }
+    }
+
+    pub(super) fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    fn require_live(&self) -> Result<()> {
+        if self.is_retired() {
+            return Err(stale("DFS write state was retired"));
+        }
+        Ok(())
     }
 
     fn with_lock_wait(mut self, lock_wait: Option<Arc<InodeLockWait>>) -> Self {
@@ -390,7 +405,10 @@ impl InodeWriteStateCell {
         let Some(entry) = self.pending.get() else {
             return;
         };
-        if self.listed.load(Ordering::Relaxed) || !state.has_pending_write_work() {
+        if self.is_retired()
+            || self.listed.load(Ordering::Relaxed)
+            || !state.has_pending_write_work()
+        {
             return;
         }
         // A poisoned shard leaves the inode unlisted; that shard's other
@@ -412,6 +430,9 @@ impl InodeWriteStateCell {
             // Busy or poisoned: keep it listed; the pass reports poison itself.
             Err(_) => return Ok(false),
         };
+        if self.is_retired() {
+            return Ok(true);
+        }
         if state.has_pending_write_work() {
             return Ok(false);
         }
@@ -497,6 +518,74 @@ impl DistributedFs {
 
     pub(super) fn write_state(&self, inode_id: &InodeId) -> Result<Option<SharedInodeWriteState>> {
         self.writes.get(inode_id)
+    }
+
+    pub(super) fn retire_unlinked_terminal_write(&self, inode_id: &InodeId) -> Result<()> {
+        if let Some(cell) = self.write_state(inode_id)? {
+            self.retire_unlinked_terminal_cell(&cell)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn retire_unlinked_terminal_cell(&self, cell: &SharedInodeWriteState) -> Result<()> {
+        let state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if cell.is_retired()
+            || state.inode.attributes.nlink != 0
+            || !state
+                .terminal_error
+                .as_ref()
+                .is_some_and(is_definite_commit_rejection)
+            || state.open_writers != 0
+            || state.commit_busy
+            || state.operation_busy
+            || state.in_flight.is_some()
+            || !state.native_queue.values.is_empty()
+            || state.native_thread.is_some()
+        {
+            return Ok(());
+        }
+        // Keep the inode state stable while excluding new users and upload
+        // starts. Registration and upload starts never take the state lock
+        // under either of their indexes.
+        let inode_id = &state.inode.inode_id;
+        self.handles.without_file_users(inode_id, || {
+            let tasks = self
+                .write_resources
+                .pipeline
+                .as_ref()
+                .map(|pipeline| pipeline.tasks.lock())
+                .transpose()
+                .map_err(|_| unavailable("native upload task table is poisoned"))?;
+            let owner = Arc::downgrade(cell);
+            if tasks
+                .as_ref()
+                .is_some_and(|tasks| tasks.iter().any(|upload| upload.owner.ptr_eq(&owner)))
+            {
+                return Ok(());
+            }
+            let mut states = self
+                .writes
+                .states
+                .write(inode_id)
+                .map_err(|_| unavailable("DFS inode write table is poisoned"))?;
+            if !states
+                .get(inode_id)
+                .is_some_and(|current| Arc::ptr_eq(current, cell))
+            {
+                return Ok(());
+            }
+            let mut pending = self
+                .writes
+                .pending
+                .write(inode_id)
+                .map_err(|_| unavailable("DFS pending write index is poisoned"))?;
+            cell.retired.store(true, Ordering::Release);
+            pending.remove(inode_id);
+            states.remove(inode_id);
+            Ok(())
+        })
     }
 
     // The three predicates below deliberately ignore `background_error`: they
@@ -739,6 +828,7 @@ impl DistributedFs {
         let mut state = existing
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        existing.require_live()?;
         if !same_lease_identity(&write_lease, &fresh_lease) || should_renew(&fresh_lease) {
             return Err(stale(
                 "DFS recovery did not obtain a fresh lease for this write authority",
@@ -779,6 +869,7 @@ impl DistributedFs {
                 let mut state = existing
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                existing.require_live()?;
                 if Self::rejected_and_idle(&state) {
                     return self.recover_rejected_write_state(&existing, state, inode, write_lease);
                 }
@@ -802,6 +893,7 @@ impl DistributedFs {
             let mut state = existing
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            existing.require_live()?;
             if same_lease_identity(&state.write_lease, &write_lease) {
                 state.write_lease = merge_same_identity_lease(&state.write_lease, write_lease);
                 return Ok(());
@@ -908,10 +1000,11 @@ impl DistributedFs {
         inode: &InodeRecord,
         open_flags: i32,
     ) -> Result<DfsWriteSession> {
-        let state = self.ensure_inode_write_state(inode)?;
-        let mut state = state
+        let cell = self.ensure_inode_write_state(inode)?;
+        let mut state = cell
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        cell.require_live()?;
         // J4: a fresh lease is part of this call's contract (see fault::lease_keeper).
         ensure_fresh(&mut state.write_lease, |lease| {
             self.meta.renew_write_lease(lease)
@@ -1136,6 +1229,9 @@ impl DistributedFs {
                 inode.attributes.mode = state.inode.attributes.mode;
             }
             state.inode = inode.clone();
+        }
+        if inode.attributes.nlink == 0 {
+            self.retire_unlinked_terminal_write(&inode.inode_id)?;
         }
         // Open handles keep their pinned version (decision 4a).
         Ok(inode)

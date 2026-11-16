@@ -950,7 +950,12 @@ impl DistributedFs {
             .tasks
             .lock()
             .map_err(|_| unavailable("native upload task table is poisoned"))?;
-        if task_table.len() >= pipeline.metadata.upload_limit {
+        if task_table.len() >= pipeline.metadata.upload_limit
+            || upload
+                .owner
+                .upgrade()
+                .is_none_or(|owner| owner.is_retired())
+        {
             return Ok(false);
         }
         {
@@ -1000,6 +1005,9 @@ impl DistributedFs {
                         }
                         Ok(receipts.remove(0))
                     });
+                // The result is the handoff to the harvester. The upload
+                // itself still owns the pin until installation or retirement.
+                drop(gc_pin);
                 // Hand the result to whoever harvests first: a barrier waiting
                 // on `cv`, or the next background pass (notified below).
                 if let Some(upload) = finished.upgrade() {
@@ -1202,6 +1210,9 @@ impl DistributedFs {
                 }
                 if let Some(error) = installed? {
                     first_error.get_or_insert(error);
+                }
+                if let Some(owner) = upload.owner.upgrade() {
+                    self.retire_unlinked_terminal_cell(&owner)?;
                 }
             }
         }

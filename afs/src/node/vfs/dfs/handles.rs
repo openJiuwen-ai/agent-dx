@@ -130,6 +130,33 @@ impl From<DfsFileHandle> for DfsHandle {
 type HandleShard = RwLock<HashMap<u64, Arc<DfsHandle>>>;
 type InodeHandleIndex = Mutex<HashMap<InodeId, HashMap<u64, Weak<DfsHandle>>>>;
 
+/// Admission spans Meta preflight and handle registration. It owns no lock
+/// while the open is in flight, including when a peer open is offloaded.
+pub(super) struct FileOpenAdmission<F: std::ops::Deref<Target = DistributedFs>> {
+    fs: F,
+    inode_id: InodeId,
+}
+
+impl<F: std::ops::Deref<Target = DistributedFs>> Drop for FileOpenAdmission<F> {
+    fn drop(&mut self) {
+        let result = self
+            .fs
+            .handles
+            .finish_open(&self.inode_id)
+            .and_then(|empty| {
+                if empty {
+                    self.fs.retire_unlinked_terminal_write(&self.inode_id)?;
+                }
+                Ok(())
+            });
+        if let Err(error) = result {
+            afs_logging::warn!("dfs.open_retirement_failed";
+                "inode_id" => self.inode_id.0.as_str(), "error" => error.to_string()
+            );
+        }
+    }
+}
+
 /// Structural locks protect Arc registration only. Registration/removal takes
 /// the inode index before the handle shard; callers drop both before HandleMut,
 /// inode write state, or RPCs. No HandleMut guard may cross an RPC or acquire an
@@ -141,6 +168,9 @@ type InodeHandleIndex = Mutex<HashMap<InodeId, HashMap<u64, Weak<DfsHandle>>>>;
 pub(super) struct DfsHandleTable {
     shards: [HandleShard; DFS_HANDLE_SHARDS],
     by_inode: [InodeHandleIndex; DFS_HANDLE_SHARDS],
+    // A writer must be able to publish its routing while another open is
+    // registering a handle. Only retirement takes the two indexes together.
+    opening: ShardedMap<InodeId, usize>,
     next_handle: AtomicU64,
     pub(super) directories: Mutex<HashMap<u64, Arc<Mutex<DfsDirectoryHandle>>>>,
 }
@@ -150,6 +180,7 @@ impl Default for DfsHandleTable {
         Self {
             shards: std::array::from_fn(|_| RwLock::new(HashMap::new())),
             by_inode: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            opening: ShardedMap::default(),
             next_handle: AtomicU64::new(1),
             directories: Mutex::new(HashMap::new()),
         }
@@ -166,6 +197,59 @@ impl DfsHandleTable {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         inode_id.hash(&mut hash);
         (hash.finish() as usize) % DFS_HANDLE_SHARDS
+    }
+
+    fn start_open(&self, inode_id: &InodeId) -> Result<()> {
+        *self
+            .opening
+            .write(inode_id)
+            .map_err(|_| unavailable("DFS open admission index is poisoned"))?
+            .entry(inode_id.clone())
+            .or_default() += 1;
+        Ok(())
+    }
+
+    fn finish_open(&self, inode_id: &InodeId) -> Result<bool> {
+        let mut opening = self
+            .opening
+            .write(inode_id)
+            .map_err(|_| unavailable("DFS open admission index is poisoned"))?;
+        let count = opening
+            .get_mut(inode_id)
+            .ok_or_else(|| unavailable("DFS file open admission is missing"))?;
+        *count -= 1;
+        if *count != 0 {
+            return Ok(false);
+        }
+        opening.remove(inode_id);
+        drop(opening);
+        let index = self.by_inode[Self::inode_shard(inode_id)]
+            .lock()
+            .map_err(|_| unavailable("DFS inode handle index is poisoned"))?;
+        Ok(!index.contains_key(inode_id))
+    }
+
+    /// Keep opens and handle registration out for a short retirement attempt.
+    /// The closure must not take the inode state lock or do I/O.
+    pub(super) fn without_file_users(
+        &self,
+        inode_id: &InodeId,
+        retire: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let opening = self
+            .opening
+            .read(inode_id)
+            .map_err(|_| unavailable("DFS open admission index is poisoned"))?;
+        if opening.contains_key(inode_id) {
+            return Ok(());
+        }
+        let index = self.by_inode[Self::inode_shard(inode_id)]
+            .lock()
+            .map_err(|_| unavailable("DFS inode handle index is poisoned"))?;
+        if !index.contains_key(inode_id) {
+            retire()?;
+        }
+        Ok(())
     }
 
     pub(super) fn get(&self, id: u64) -> Result<Option<Arc<DfsHandle>>> {
@@ -303,6 +387,14 @@ pub(super) struct DfsDirectoryHandle {
 }
 
 impl DistributedFs {
+    pub(super) fn admit_file_open<F: std::ops::Deref<Target = Self>>(
+        fs: F,
+        inode_id: InodeId,
+    ) -> Result<FileOpenAdmission<F>> {
+        fs.handles.start_open(&inode_id)?;
+        Ok(FileOpenAdmission { fs, inode_id })
+    }
+
     pub(super) fn allocate_handle(&self, mut handle: DfsFileHandle) -> Result<FileHandle> {
         let id = self.handles.next_id();
         let inode_id = handle.inode_id.clone();
@@ -415,16 +507,20 @@ impl DistributedFs {
             .map_err(|_| unavailable("DFS handle state is poisoned"))?
             .write_session
             .clone();
-        let Some(session) = session else {
-            return Ok(None);
+        let undelivered = match session {
+            Some(session) if session.remote.is_some() => {
+                self.close_remote_write_session(&removed.inode_id, &session)?;
+                None
+            }
+            Some(session) => {
+                let undelivered = self.release_writer(&session.local)?;
+                self.publish_deferred_views(&removed.inode_id)?;
+                self.retire_base_reference(&removed.inode_id)?;
+                undelivered
+            }
+            None => None,
         };
-        if session.remote.is_some() {
-            self.close_remote_write_session(&removed.inode_id, &session)?;
-            return Ok(None);
-        }
-        let undelivered = self.release_writer(&session.local)?;
-        self.publish_deferred_views(&removed.inode_id)?;
-        self.retire_base_reference(&removed.inode_id)?;
+        self.retire_unlinked_terminal_write(&removed.inode_id)?;
         Ok(undelivered)
     }
 

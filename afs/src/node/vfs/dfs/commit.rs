@@ -276,6 +276,9 @@ impl DistributedFs {
             }
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
         }
+        if cell.is_retired() {
+            return Ok(None);
+        }
         if let Some(error) = state.terminal_error.clone() {
             return Err(error);
         }
@@ -535,6 +538,11 @@ impl DistributedFs {
             }
         };
         cell.notify_all();
+        let terminal = state.terminal_error.is_some();
+        drop(state);
+        if terminal && let Err(error) = self.retire_unlinked_terminal_cell(&cell) {
+            afs_logging::warn!("dfs.commit_retirement_failed"; "error" => error.to_string());
+        }
         outcome
     }
 
