@@ -35,6 +35,7 @@ def distribute(plan, warm, await_source):
 def main():
     import argparse
     import json
+    import logging
     from pathlib import Path
     import subprocess
     import sys
@@ -48,6 +49,7 @@ def main():
     if args.timeout <= 0:
         parser.error("timeout must be positive")
     commands = plan["commands"]
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s")
 
     def call(action, node, source=None):
         command = commands[node][action]
@@ -58,8 +60,7 @@ def main():
         record = {"node": node, "upstream": source, "action": action,
                   "started_ns": start, "finished_ns": time.monotonic_ns(),
                   "exit_code": result.returncode}
-        sys.stdout.write(f"{json.dumps(record)}\n")
-        sys.stdout.flush()
+        logging.info("%s", json.dumps(record))
         result.check_returncode()
         return record
 

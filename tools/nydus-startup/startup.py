@@ -394,8 +394,9 @@ def main():
             else:
                 manifest = args.image.with_name("manifest.json")
                 result = prewarm(config, snapshot, image, manifest, read_json(args.plan))
-        json.dump(result, sys.stdout, indent=2)
-        sys.stdout.write("\n")
+        output = json.dumps(result, indent=2)
+        logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s", force=True)
+        logging.info("%s", output)
         return int(result.get("state") == "failed")
     except (AssertionError, KeyError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
