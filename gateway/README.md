@@ -712,6 +712,23 @@ user access token for the same kind of business session. First registration thro
 either provider requires `agreementVersion`; clients never submit an external UID,
 phone number, ADX user ID, tenant, or project.
 
+When `privacy.model_config_name` is enabled, both login endpoints register the
+current account model configuration after authentication and before returning the
+business token. Authentication and registration share the 45-second login deadline.
+Registration failures do not return a successful login or token; Gateway attempts
+to revoke the newly created, undisclosed business session within five seconds.
+A timed-out registration may have committed; a new login retries idempotently.
+WebSocket connections, reconnects and session checks do not register model
+configuration. New Binding initialization continues to supply `model_api_key`,
+`model_api_base` and `workspace` even when login registration is enabled; existing
+Bindings skip that lazy initialization on reconnect. Keep the old injection template
+until operations have backfilled and verified all required existing users, then switch
+to a new template that reads configuration. Model names do not impose separate read/write
+permissions: scoped privacy HTTP transactions can update them like other secrets.
+DigitalMate still loads the configuration only on its first identity initialization;
+this does not implement live key rotation. See the
+[privacy configuration contract](../docs/deployment/digitalmate-privacy.md#可选模型配置注册).
+
 AGC verification is enabled by the optional `accounts.agc` block. The checked-in example
 uses the Jiuwen CN project and reads the API client secret from
 `ADX_AGC_API_CLIENT_SECRET`. `api_client_id` and that secret are server REST credentials,
