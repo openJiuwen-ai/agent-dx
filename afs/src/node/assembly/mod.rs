@@ -51,12 +51,20 @@ pub(super) async fn run_node(
 ) -> Result<(), BoxError> {
     // 1–2. Bind all TCP ingress before spawning services. A failed bind
     // cannot leave a half-ready Node. Storage opens before registration.
+    let management_labels = cfg.management.registration_labels()?;
+    #[cfg(feature = "dfs")]
+    let admin_token = cfg
+        .management
+        .token_file
+        .as_deref()
+        .map(crate::management::load_token)
+        .transpose()?;
     let metrics = common::FsMetrics::register(&obs)?;
     let ingress = common::TcpIngress::bind(&cfg).await?;
     let startup = common::Startup::resolve(&cfg)?;
     let storage = common::NodeStorage::open(&cfg, &obs)?;
     // 3–4. No FUSE mount or local API exists yet.
-    let node_descriptor = common::node_descriptor(&cfg, &startup, &storage);
+    let node_descriptor = common::node_descriptor(&cfg, &startup, &storage, management_labels);
     let registration =
         common::InitialRegistration::register(&cfg, &startup, node_descriptor.as_ref()).await?;
     // 5–9.
@@ -69,7 +77,11 @@ pub(super) async fn run_node(
         backends
             .dfs
             .connectors
-            .http_routes(super::connectors::ConnectorContext { backend, root })?
+            .http_routes(super::connectors::ConnectorContext {
+                backend,
+                root,
+                admin: admin_token.map(|token| (dfs.clone(), token)),
+            })?
     } else {
         axum::Router::new()
     };

@@ -21,7 +21,7 @@ pub(super) fn sealed(inode: &InodeRecord) -> bool {
     inode.xattrs.contains_key(DESCRIPTOR_XATTR)
 }
 
-fn covered(layout: &LayoutRoot, offset: u64, length: u64) -> bool {
+pub(super) fn covered(layout: &LayoutRoot, offset: u64, length: u64) -> bool {
     let Some(end) = offset.checked_add(length) else {
         return false;
     };
@@ -40,7 +40,7 @@ fn covered(layout: &LayoutRoot, offset: u64, length: u64) -> bool {
 
 /// Find only absent bytes inside the caller's requested range. Do not prefetch
 /// neighbors or overwrite already committed bytes.
-fn missing_range(layout: &LayoutRoot, offset: u64, end: u64) -> Option<(u64, usize)> {
+pub(super) fn missing_range(layout: &LayoutRoot, offset: u64, end: u64) -> Option<(u64, usize)> {
     let mut cursor = offset;
     for extent in &layout.inline_extents {
         if cursor >= end {

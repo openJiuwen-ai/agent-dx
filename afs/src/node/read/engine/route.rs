@@ -167,8 +167,24 @@ impl ReplicatedSources<'_> {
         let deadline =
             deadline.unwrap_or_else(|| Instant::now() + self.engine.read_pipeline_timeout());
         let sources = self
+            .checked_sources(&remote_batch, deadline, lifetime)
+            .await?;
+        self.read_remote(&remote_batch, &sources, out, final_owned, Some(deadline))
+            .await?;
+        self.engine
+            .cache_completed_ranges(&remote_batch, &sources, out);
+        Ok(())
+    }
+
+    pub(super) async fn checked_sources(
+        self,
+        batch: &ReadBatch,
+        deadline: Instant,
+        lifetime: super::super::admission::ReadLifetime,
+    ) -> Result<Vec<ChunkSources>> {
+        let sources = self
             .engine
-            .sources_for_attempt_async(&remote_batch, true, deadline, lifetime)
+            .sources_for_attempt_async(batch, true, deadline, lifetime)
             .await?;
         let authority = self.engine.capture_native_read_authority()?;
         if authority.epoch != 0
@@ -182,15 +198,11 @@ impl ReplicatedSources<'_> {
                 "DFS source caller epoch differs from the registered session",
             ));
         }
-        self.read_remote(&remote_batch, &sources, out, final_owned, Some(deadline))
-            .await?;
-        self.engine
-            .cache_completed_ranges(&remote_batch, &sources, out);
-        Ok(())
+        Ok(sources)
     }
 
     /// Remote sources in order; the first that applies serves the batch.
-    async fn read_remote(
+    pub(super) async fn read_remote(
         self,
         batch: &ReadBatch,
         sources: &[ChunkSources],

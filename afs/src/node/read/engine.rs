@@ -43,6 +43,8 @@ use crate::{
 
 mod authority;
 mod cache_reconcile;
+mod management_prefetch;
+pub(in crate::node) use management_prefetch::PrefetchChunk;
 mod distribution;
 #[cfg(test)]
 mod distribution_tests;
@@ -655,10 +657,14 @@ struct ReadEngineTestHooks {
     pub(super) local_reader_install_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     pub(super) peer_cache_recheck_hook: Mutex<Option<PeerCacheRecheckHook>>,
     pub(super) prefetch_attempt_hook: Mutex<Option<PrefetchAttemptHook>>,
+    pub(super) after_prefetch_resident_check: Mutex<Option<AfterPrefetchResidentCheck>>,
 }
 
 #[cfg(test)]
 type PrefetchAttemptHook = Arc<dyn Fn(usize, &ChunkId) + Send + Sync>;
+
+#[cfg(test)]
+type AfterPrefetchResidentCheck = Arc<dyn Fn(&ChunkId) + Send + Sync>;
 
 impl Drop for DfsReadEngine {
     fn drop(&mut self) {
@@ -788,8 +794,6 @@ impl DfsReadEngine {
         self
     }
 
-    /// Disposable local storage for already verified native Peer objects.
-    /// Cache contents never supply grant, Node/session or file-view authority.
     pub(in crate::node) fn with_peer_cache(mut self, cache: Arc<DiskPeerCache>) -> Self {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             self.fetcher = match super::object_fetch::ObjectFetcher::new(

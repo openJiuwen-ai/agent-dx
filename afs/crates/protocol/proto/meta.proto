@@ -465,6 +465,7 @@ service DfsMeta {
   rpc ValidateReplicaWrite(ValidateDfsReplicaWriteRequest) returns (ValidateDfsReplicaWriteReply);
   rpc ClaimReplicationTask(ClaimDfsReplicationTaskRequest) returns (ClaimDfsReplicationTaskReply);
   rpc ReportReplicationTask(ReportDfsReplicationTaskRequest) returns (ReportDfsReplicationTaskReply);
+  rpc EnsureReplicaPlacement(EnsureDfsReplicaPlacementRequest) returns (EnsureDfsReplicaPlacementReply);
   rpc ReportChunkCorruption(ReportDfsChunkCorruptionRequest) returns (ReportDfsChunkCorruptionReply);
   rpc GetChunkSources(GetDfsChunkSourcesRequest) returns (GetDfsChunkSourcesReply);
   rpc ValidateReadGrants(ValidateDfsReadGrantsRequest) returns (ValidateDfsReadGrantsReply);
@@ -621,6 +622,20 @@ message ClaimDfsReplicationTaskRequest {
 message ClaimDfsReplicationTaskReply {
   bool claimed = 1;
   DfsReplicationClaim claim = 2;
+}
+
+message EnsureDfsReplicaPlacementRequest {
+  string caller_id = 1;
+  string caller_session_id = 2;
+  uint64 caller_node_epoch = 3;
+  string operation_id = 4;
+  string file_version_id = 5;
+  string chunk_id = 6;
+  string target_node_id = 7;
+}
+
+message EnsureDfsReplicaPlacementReply {
+  bool ready = 1;
 }
 
 message ReportDfsReplicationTaskRequest {

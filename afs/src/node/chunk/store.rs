@@ -859,6 +859,14 @@ impl LocalChunkStore {
     }
 
     pub(super) fn open_cataloged(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
+        self.open_cataloged_with_revision(chunk_id)
+            .map(|(reader, _)| reader)
+    }
+
+    pub(super) fn open_cataloged_with_revision(
+        &self,
+        chunk_id: &ChunkId,
+    ) -> Result<(PinnedChunkReader, u64)> {
         #[cfg(feature = "dfs")]
         self.record_read_check(super::super::metrics::work::ReadCheck::CatalogOpen);
         let record = self
@@ -902,7 +910,7 @@ impl LocalChunkStore {
             check_crc_descriptor(&record.chunk, table, self.read_work.as_ref())?;
         }
         let proof_identity = Mutex::new(PeerFileIdentity::read(&file)?);
-        Ok(PinnedChunkReader {
+        let reader = PinnedChunkReader {
             verify_crc_body: true,
             segment_crc: record.segment_crc.clone(),
             file,
@@ -915,7 +923,8 @@ impl LocalChunkStore {
             outboard: Mutex::new(None),
             chunk: record.chunk,
             read_work: self.read_work.clone(),
-        })
+        };
+        Ok((reader, record.catalog_revision))
     }
 }
 

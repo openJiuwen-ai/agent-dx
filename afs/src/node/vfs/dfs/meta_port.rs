@@ -27,6 +27,14 @@ pub trait DfsRemoteOwnerFactory: Send + Sync {
 /// budget wraps a call in `crate::node::call_deadline`, which may only shorten
 /// it; implementations that block read that scope on the calling thread.
 pub trait DfsMeta: Send + Sync {
+    fn ensure_replica_placement(
+        &self,
+        _request: crate::dfs::EnsureReplicaPlacement,
+    ) -> Result<bool> {
+        Err(crate::node::vfs::unsupported(
+            "explicit DFS replica placement",
+        ))
+    }
     fn lookup(&self, parent: &InodeId, name: &[u8]) -> Result<Option<InodeRecord>>;
     /// `first_generation`: admit this write generation's `write:` reference in
     /// the same transaction (round 2 B1).

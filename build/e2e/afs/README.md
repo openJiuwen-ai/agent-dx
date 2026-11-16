@@ -18,6 +18,8 @@
 - `scripts/dfs/r1_e2e.py`：DFS R=1 小规模本地 E2E 驱动。
 - `scripts/ownerfs/`：OwnerFs workspace 控制，以及 bind ON 两节点 local-file 恢复验证入口。
 - `scripts/check-rdma-cancellation.py`：RDMA 取消路径辅助检查。
+- `nydus_startup/` 包含 [Nydus 启动工具](../../../tools/nydus-startup/README.md)的回归测试。
+  在仓库根目录运行 `python3 -m unittest discover -s build/e2e/afs/nydus_startup -v`。
 
 不保留内容：
 

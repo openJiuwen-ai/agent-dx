@@ -1101,6 +1101,17 @@ pub struct ClaimReplicationTask {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EnsureReplicaPlacement {
+    pub caller_id: String,
+    pub caller_session_id: String,
+    pub caller_node_epoch: u64,
+    pub operation_id: OperationId,
+    pub file_version_id: FileVersionId,
+    pub chunk_id: ChunkId,
+    pub target_node_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReportReplicationTask {
     pub caller_id: String,
     pub caller_session_id: String,

@@ -168,6 +168,7 @@ pub(super) fn node_descriptor<'a>(
     cfg: &Config,
     startup: &Startup<'a>,
     storage: &NodeStorage,
+    management_labels: std::collections::HashMap<String, String>,
 ) -> Option<(&'a str, afs_protocol::meta::NodeDescriptor)> {
     let session_id = &startup.session_id;
     let advertised = &startup.advertised;
@@ -193,6 +194,9 @@ pub(super) fn node_descriptor<'a>(
         if cfg.dfs {
             capabilities.push("dfs".into());
         }
+        if cfg.dfs && cfg.connectors.nydus.enabled && cfg.management.token_file.is_some() {
+            capabilities.push("connector:nydus".into());
+        }
         (
             endpoint,
             afs_protocol::meta::NodeDescriptor {
@@ -203,7 +207,7 @@ pub(super) fn node_descriptor<'a>(
                     rest_addr: format!("http://{}", cfg.rest_listen),
                     nfs_addr,
                 }),
-                labels: std::collections::HashMap::new(),
+                labels: management_labels,
                 capabilities,
                 session_id: session_id.clone(),
                 storage_devices: storage.storage_devices(),

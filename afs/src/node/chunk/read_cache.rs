@@ -20,6 +20,12 @@ pub(crate) struct ReadCacheWrite {
 
 #[cfg(any(feature = "dfs", test))]
 impl LocalChunkStore {
+    pub(crate) fn read_cache_charge(length: u64) -> Result<u64> {
+        length
+            .checked_add(4096)
+            .ok_or_else(|| invalid("read cache capacity overflow"))
+    }
+
     pub(crate) fn persist_read_cache(
         &self,
         staged: &StagedChunk,
@@ -30,11 +36,7 @@ impl LocalChunkStore {
             receipt: None,
             retired: Vec::new(),
         };
-        let charge = staged
-            .chunk
-            .length
-            .checked_add(4096)
-            .ok_or_else(|| invalid("read cache capacity overflow"))?;
+        let charge = Self::read_cache_charge(staged.chunk.length)?;
         if capacity == 0 || charge > capacity {
             return Ok(result);
         }
@@ -387,6 +389,30 @@ impl LocalChunkStore {
 
 #[cfg(feature = "dfs")]
 impl LocalChunkStore {
+    /// Check the cataloged file without rereading its body. Return the exact
+    /// record revision so the batch can confirm that this copy is still current.
+    pub(crate) fn check_cache_resident(&self, id: &ChunkId) -> Result<u64> {
+        let (reader, revision) = self.open_cataloged_with_revision(id)?;
+        if reader.file.metadata()?.len() != reader.chunk.length {
+            return Err(corrupt(id, "cached Chunk file length changed"));
+        }
+        Ok(revision)
+    }
+
+    /// Confirm the checked records together under the existing catalog lock.
+    /// Unrelated catalog changes do not invalidate the batch.
+    pub(crate) fn confirm_cache_resident(&self, checked: &[(&ChunkId, u64)]) -> Result<bool> {
+        let catalog = self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("chunk catalog poisoned"))?;
+        Ok(checked.iter().all(|(id, revision)| {
+            catalog.records.get(*id).is_some_and(|record| {
+                record.state == LocalChunkState::Durable && record.catalog_revision == *revision
+            })
+        }))
+    }
+
     pub(crate) fn has_durable_record(&self, id: &ChunkId) -> Result<bool> {
         Ok(self
             .catalog

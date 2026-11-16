@@ -90,7 +90,7 @@ fn node_shutdown_stops_admission_then_fuse_then_drains_before_chunk_store_exit()
     if std::env::var_os(ROLE_ENV).is_some() {
         return;
     }
-    run_scenario("dfs");
+    run_scenario("dfs", false);
 }
 
 #[cfg(feature = "ownerfs")]
@@ -99,10 +99,18 @@ fn node_shutdown_order_holds_with_both_backends() {
     if std::env::var_os(ROLE_ENV).is_some() {
         return;
     }
-    run_scenario("all");
+    run_scenario("all", false);
 }
 
-fn run_scenario(fs: &str) {
+#[test]
+fn node_shutdown_drains_dfs_while_seed_registry_is_stalled() {
+    if std::env::var_os(ROLE_ENV).is_some() {
+        return;
+    }
+    run_scenario("dfs", true);
+}
+
+fn run_scenario(fs: &str, stalled_seed: bool) {
     let ownerfs = fs == "all";
     let fuse = fuse_usable();
     if !fuse {
@@ -160,6 +168,27 @@ fn run_scenario(fs: &str) {
         ),
     )
     .unwrap();
+    let registry = stalled_seed.then(|| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let registry = listener.local_addr().unwrap();
+        let token_path = root.join("management-token");
+        std::fs::write(&token_path, MANAGEMENT_TOKEN).unwrap();
+        use std::io::Write;
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&node_config)
+            .unwrap();
+        write!(
+            config,
+            "\n[management]\ntoken_file = \"{}\"\n\
+             [connectors.nydus]\nenabled = true\n\
+             [connectors.nydus.sources.lab]\nregistry = \"http://{registry}\"\n\
+             allow_insecure_http = true\nrepository = \"lab/test\"\nregistry_proxy = true\n",
+            token_path.display(),
+        )
+        .unwrap();
+        listener
+    });
 
     let trace = root.join("trace");
     let mut meta = Reaped(spawn_child(root, "meta", &meta_config, None));
@@ -184,15 +213,22 @@ fn run_scenario(fs: &str) {
         // Real client traffic before the stop, so shutdown does not run on an idle Node.
         std::fs::write(dfs_mount.join("written"), vec![7_u8; 64 * 1024]).unwrap();
     }
+    // Keep the upstream connection open without ever answering the manifest GET.
+    let _stalled_origin = registry.map(|listener| start_stalled_seed(node_rest, listener));
 
     let pid = node.0.id().to_string();
     let started = Instant::now();
+    let timeout = if stalled_seed {
+        Duration::from_secs(8)
+    } else {
+        SHUTDOWN_TIMEOUT
+    };
     let status = loop {
         if let Some(status) = node.0.try_wait().unwrap() {
             break status;
         }
         assert!(
-            started.elapsed() < SHUTDOWN_TIMEOUT,
+            started.elapsed() < timeout,
             "Node did not exit; stages {:?}\n{}",
             read_trace(&trace),
             logs(root)
@@ -202,6 +238,57 @@ fn run_scenario(fs: &str) {
     };
     assert!(status.success(), "Node shutdown failed\n{}", logs(root));
     assert_eq!(read_trace(&trace), expected_stages(ownerfs, fuse));
+}
+
+const MANAGEMENT_TOKEN: &str = "test-only-nydus-management-token";
+
+fn start_stalled_seed(node_rest: SocketAddr, registry: TcpListener) -> std::net::TcpStream {
+    use std::io::{BufRead, BufReader};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("http://{node_rest}/v1/admin/nydus/seed-jobs"))
+            .bearer_auth(MANAGEMENT_TOKEN)
+            .timeout(Duration::from_secs(5))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "source": "lab",
+                    "manifest_digest": format!("sha256:{}", "a".repeat(64)),
+                    "node_ids": ["node-a"],
+                    "request_id": "11111111-1111-4111-8111-111111111111",
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+
+        registry.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(registry).unwrap();
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let stream = stream.into_std().unwrap();
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        assert!(request.starts_with("GET /v2/lab/test/manifests/sha256:"));
+        stream
+    })
 }
 
 /// Kills a leftover child when the test unwinds, so no process outlives a failure.
