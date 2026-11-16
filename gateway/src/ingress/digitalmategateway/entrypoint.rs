@@ -163,6 +163,10 @@ impl DigitalMateGatewayConfig {
     pub fn validate(&self) -> Result<(), Error> {
         #[cfg(unix)]
         if let Some(privacy) = &self.privacy {
+            super::privacy_center::validate_model_configuration_name(privacy.model_config_name.as_deref())
+                .map_err(|_| Error::Invalid(
+                    "privacy.model_config_name must contain 1-128 ASCII letters, digits, '_', '-' or '.'".into(),
+                ))?;
             if ![&self.orbit, &self.digitalmate].iter().any(|app| {
                 app.as_ref()
                     .is_some_and(|app| app.template == privacy.template)
@@ -303,7 +307,27 @@ impl DigitalMateGatewayApi {
             request.uri().path(),
             "/api/v1/auth/huawei/login" | "/api/v1/auth/agc/login" | "/api/v1/auth/logout"
         ) {
-            return self.auth_request(request).await;
+            return auth_request(
+                self.auth.as_ref(),
+                request,
+                #[cfg(unix)]
+                self.privacy
+                    .as_ref()
+                    .zip(self.config.privacy.as_ref())
+                    .and_then(|(runtime, settings)| {
+                        runtime
+                            .access
+                            .model_configuration
+                            .as_ref()
+                            .map(|(name, registry)| ModelRegistration {
+                                tenant: &self.config.tenant,
+                                template: &settings.template,
+                                name,
+                                registry: registry.as_ref(),
+                            })
+                    }),
+            )
+            .await;
         }
         let token = match accounts::bearer(request.headers()) {
             Ok(v) => v,
@@ -331,9 +355,7 @@ impl DigitalMateGatewayApi {
                     }),
                     &self.config.tenant,
                     #[cfg(unix)]
-                    self.privacy
-                        .as_ref()
-                        .map(|privacy| privacy.identity.clone()),
+                    self.privacy.as_ref().map(|privacy| privacy.access.clone()),
                 )
                 .await;
         }
@@ -483,75 +505,6 @@ impl DigitalMateGatewayApi {
         ));
         let (parts, _) = response.into_parts();
         Response::from_parts(parts, body(Bytes::new()))
-    }
-    async fn auth_request(&self, request: Request<Incoming>) -> Response<ProxyBody> {
-        if request.method() != http::Method::POST {
-            return error(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
-        }
-        if request.uri().query().is_some() {
-            return error(StatusCode::BAD_REQUEST, "INVALID_QUERY");
-        }
-        if request.uri().path() == "/api/v1/auth/logout" {
-            let token = match accounts::bearer(request.headers()) {
-                Ok(v) => v,
-                Err(e) => return auth_error(e),
-            };
-            return match tokio::time::timeout(Duration::from_secs(15), self.auth.logout(token))
-                .await
-            {
-                Ok(Ok(())) => Response::builder()
-                    .status(StatusCode::NO_CONTENT)
-                    .header("cache-control", "no-store")
-                    .body(body(Bytes::new()))
-                    .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "RESPONSE_ERROR")),
-                Ok(Err(e)) => auth_error(e),
-                Err(_) => auth_error(accounts::Error::Unavailable),
-            };
-        }
-        if request
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_none_or(|v| v.split(';').next() != Some("application/json"))
-        {
-            return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "JSON_REQUIRED");
-        }
-        let agc = request.uri().path() == "/api/v1/auth/agc/login";
-        let bytes = match tokio::time::timeout(
-            Duration::from_secs(10),
-            Limited::new(request.into_body(), 16384).collect(),
-        )
-        .await
-        {
-            Ok(Ok(v)) => v.to_bytes(),
-            _ => return error(StatusCode::BAD_REQUEST, "INVALID_LOGIN_REQUEST"),
-        };
-        let result = if agc {
-            let input: accounts::AgcLoginRequest = match serde_json::from_slice(&bytes) {
-                Ok(value) => value,
-                Err(_) => return auth_error(accounts::Error::Invalid),
-            };
-            tokio::time::timeout(Duration::from_secs(45), self.auth.agc_login(input)).await
-        } else {
-            let input: accounts::LoginRequest = match serde_json::from_slice(&bytes) {
-                Ok(value) => value,
-                Err(_) => return auth_error(accounts::Error::Invalid),
-            };
-            tokio::time::timeout(Duration::from_secs(45), self.auth.login(input)).await
-        };
-        match result {
-            Ok(Ok(value)) => match serde_json::to_vec(&value) {
-                Ok(bytes) => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .header("cache-control", "no-store")
-                    .body(body(Bytes::from(bytes)))
-                    .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "RESPONSE_ERROR")),
-                Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "RESPONSE_ERROR"),
-            },
-            Ok(Err(e)) => auth_error(e),
-            Err(_) => auth_error(accounts::Error::Unavailable),
-        }
     }
     async fn upload(
         &self,
@@ -754,3 +707,160 @@ pub(super) fn error(status: StatusCode, code: &str) -> Response<ProxyBody> {
         )))
         .expect("fixed error response headers are valid")
 }
+
+#[cfg(unix)]
+struct ModelRegistration<'a> {
+    tenant: &'a str,
+    template: &'a str,
+    name: &'a str,
+    registry: &'a dyn super::privacy_center::ConfigurationRegistry,
+}
+
+#[cfg(unix)]
+impl ModelRegistration<'_> {
+    async fn register(
+        &self,
+        auth: &dyn BusinessAuth,
+        login: &accounts::LoginResponse,
+    ) -> accounts::Result<()> {
+        let principal = auth.authenticate(&login.token).await?;
+        if principal.user_id != login.user_id {
+            return Err(accounts::Error::Unauthorized);
+        }
+        let workspace = workspace_parameters(self.tenant, self.template, &principal.user_id)
+            .map_err(|_| accounts::Error::Invalid)?;
+        let workspace = workspace
+            .get("workspace")
+            .ok_or(accounts::Error::Unavailable)?;
+        let parameters = auth.model_parameters(&principal).await?;
+        let value = std::collections::BTreeMap::from([
+            (
+                "API_KEY".into(),
+                parameters
+                    .get("model_api_key")
+                    .ok_or(accounts::Error::Unavailable)?
+                    .clone(),
+            ),
+            (
+                "API_BASE".into(),
+                parameters
+                    .get("model_api_base")
+                    .ok_or(accounts::Error::Unavailable)?
+                    .clone(),
+            ),
+        ]);
+        self.registry
+            .register(
+                super::privacy_center::ConfigurationScope {
+                    tenant: self.tenant,
+                    workspace,
+                    user: &principal.user_id,
+                },
+                self.name,
+                &value,
+            )
+            .await?;
+        auth.check(&principal).await
+    }
+}
+
+async fn auth_request(
+    auth: &dyn BusinessAuth,
+    request: Request<Incoming>,
+    #[cfg(unix)] registration: Option<ModelRegistration<'_>>,
+) -> Response<ProxyBody> {
+    if request.method() != http::Method::POST {
+        return error(StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
+    }
+    if request.uri().query().is_some() {
+        return error(StatusCode::BAD_REQUEST, "INVALID_QUERY");
+    }
+    if request.uri().path() == "/api/v1/auth/logout" {
+        let token = match accounts::bearer(request.headers()) {
+            Ok(v) => v,
+            Err(e) => return auth_error(e),
+        };
+        return match tokio::time::timeout(Duration::from_secs(15), auth.logout(token)).await {
+            Ok(Ok(())) => Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header("cache-control", "no-store")
+                .body(body(Bytes::new()))
+                .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "RESPONSE_ERROR")),
+            Ok(Err(e)) => auth_error(e),
+            Err(_) => auth_error(accounts::Error::Unavailable),
+        };
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|v| v.split(';').next() != Some("application/json"))
+    {
+        return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "JSON_REQUIRED");
+    }
+    let agc = request.uri().path() == "/api/v1/auth/agc/login";
+    let bytes = match tokio::time::timeout(
+        Duration::from_secs(10),
+        Limited::new(request.into_body(), 16384).collect(),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v.to_bytes(),
+        _ => return error(StatusCode::BAD_REQUEST, "INVALID_LOGIN_REQUEST"),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let result = if agc {
+        let input: accounts::AgcLoginRequest = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => return auth_error(accounts::Error::Invalid),
+        };
+        tokio::time::timeout_at(deadline, auth.agc_login(input)).await
+    } else {
+        let input: accounts::LoginRequest = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => return auth_error(accounts::Error::Invalid),
+        };
+        tokio::time::timeout_at(deadline, auth.login(input)).await
+    };
+    let value = match result {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => return auth_error(error),
+        Err(_) => return auth_error(accounts::Error::Unavailable),
+    };
+    #[cfg(unix)]
+    if let Some(registration) = registration {
+        let result = tokio::time::timeout_at(deadline, registration.register(auth, &value))
+            .await
+            .unwrap_or(Err(accounts::Error::Unavailable));
+        if let Err(error) = result {
+            // Authentication already persisted a session, but its token has not been disclosed.
+            // The configuration write may have committed: keep it for an idempotent login retry.
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(5), auth.logout(&value.token)).await,
+                Ok(Ok(()))
+            ) {
+                tracing::warn!(
+                    "Could not revoke an undisclosed login session after model registration failed"
+                );
+            }
+            return auth_error(error);
+        }
+    }
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("cache-control", "no-store")
+            .body(body(Bytes::from(bytes)))
+            .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "RESPONSE_ERROR")),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "RESPONSE_ERROR"),
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "login_registration_tests.rs"]
+mod login_registration_tests;
+
+#[cfg(all(test, unix))]
+#[path = "configuration_tests.rs"]
+mod configuration_tests;
