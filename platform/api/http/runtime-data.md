@@ -53,6 +53,15 @@ SDK `commands.run` 的默认／长等待路径和后台命令使用 `process.sta
 `process.exec`，其启动失败用 `exit_code=-1` 和 stderr 表示。两种原语的响应不能混用。
 
 `process.exec.timeout` 是执行预算，省略无限等待，零立即到期。
+`process.exec` 及其同步执行别名在启动进程前校验参数。`args` 省略时使用空对象，
+显式提供时必须为对象；未知参数、错误类型、负数或不能表示为执行期限的 timeout
+返回 HTTP 400，不启动命令。错误信息指出对应字段，字段校验失败使用
+`error_code=INVALID_ARGUMENT`。所有显式提供的别名均须通过校验，不能以另一个
+有效别名掩盖错误。保留现有别名选取顺序：`cmd`／`command`、`cwd`／`working_dir`、
+`envs`／`env`。命令省略或为空字符串仍执行空命令；cwd、envs 及其别名允许 null，
+环境变量对象的值必须全部为字符串。timeout 不接受 null、布尔值或数字字符串。
+合法请求的非零退出码、启动失败与执行超时仍使用原有命令结果，不作为参数类型错误。
+
 `process.start.timeout` 省略或零不设置执行截止；正值到期终止进程组。
 `process.wait.timeout` 只约束本次等待，不杀进程；到期仍返回 HTTP 200：
 
