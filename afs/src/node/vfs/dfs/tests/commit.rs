@@ -890,3 +890,149 @@ fn a_few_refused_metadata_syncs_are_rebuilt_until_one_lands() {
         .unwrap();
     assert_eq!(meta.metadata_syncs.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn data_only_replay_after_last_writer_close_persists_mtime_across_setxattr() {
+    let (_temp, meta, fs) = test_fs();
+    assert!(fs.write_resources.pipeline.is_some());
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("native-data-only-replay"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"base").unwrap();
+    // An ambiguous DataOnly outcome retains the exact request for retry.
+    meta.fail_next_commit_with(unavailable("injected DataOnly timeout"));
+    assert!(fs.flush(&context(), created.handle).is_err());
+    let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+    let cell = fs.write_state(&inode_id).unwrap().unwrap();
+    assert!(cell.lock().unwrap().in_flight.is_some());
+    fs.release(&context(), created.handle).unwrap();
+    assert!(cell.lock().unwrap().last_writer_background_requested);
+    assert_eq!(fs.progress_writeback().unwrap(), 1);
+    let (pending_mtime, marker_after_replay) = {
+        let state = cell.lock().unwrap();
+        assert!(state.metadata_dirty && !state.dirty && state.in_flight.is_none());
+        assert_eq!(state.open_writers, 0);
+        (
+            state.inode.attributes.mtime_unix_ms,
+            state.last_writer_background_requested,
+        )
+    };
+    fs.setxattr(
+        &context(),
+        created.entry.inode,
+        OsStr::new("user.replay"),
+        b"fresh",
+        0,
+    )
+    .unwrap();
+    // A normal background tick must make progress with metadata alone.
+    let metadata_progress = fs.progress_writeback().unwrap();
+    let state = cell.lock().unwrap();
+    let persisted_mtime = meta.inode.lock().unwrap().attributes.mtime_unix_ms;
+    assert!(!state.metadata_dirty);
+    assert!(!state.last_writer_background_requested);
+    assert_eq!(
+        persisted_mtime, pending_mtime,
+        "the accepted write's mtime must be persisted by the background flush"
+    );
+    assert_eq!(
+        meta.inode
+            .lock()
+            .unwrap()
+            .xattrs
+            .get(b"user.replay".as_slice())
+            .unwrap(),
+        b"fresh"
+    );
+    drop(state);
+    assert!(marker_after_replay);
+    assert_eq!(metadata_progress, 1);
+    assert!(!fs.writeback_ready().unwrap());
+    let failed = &meta.failed_commits.lock().unwrap()[0];
+    let commits = meta.commits.lock().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].metadata_delta.mode, CommitMetadataMode::DataOnly);
+    assert_eq!(commits[0].operation_id, failed.operation_id);
+    assert_eq!(commits[0].file_version.id, failed.file_version.id);
+    drop(commits);
+    let reader = fs
+        .open(&context(), created.entry.inode, libc::O_RDONLY)
+        .unwrap();
+    let mut data = [0; 4];
+    assert_eq!(fs.read(&context(), reader, 0, &mut data).unwrap(), 4);
+    assert_eq!(&data, b"base");
+    fs.release(&context(), reader).unwrap();
+}
+
+#[test]
+fn full_file_replay_after_last_writer_close_clears_writeback_request() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("native-full-file-replay"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"base").unwrap();
+    meta.fail_next_commit();
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap_err();
+    let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+    let cell = fs.write_state(&inode_id).unwrap().unwrap();
+    fs.release(&context(), created.handle).unwrap();
+    assert!(cell.lock().unwrap().last_writer_background_requested);
+    assert_eq!(fs.progress_writeback().unwrap(), 1);
+    {
+        let state = cell.lock().unwrap();
+        assert!(!state.metadata_dirty);
+        assert!(!state.last_writer_background_requested);
+    }
+    assert_eq!(fs.progress_writeback().unwrap(), 0);
+    assert!(!fs.writeback_ready().unwrap());
+    assert_eq!(meta.commit_count(), 1);
+    assert!(meta.metadata_syncs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn explicit_mtime_after_data_only_replay_clears_writeback_request() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("explicit-mtime-after-replay"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"data").unwrap();
+    meta.fail_next_commit();
+    fs.flush(&context(), created.handle).unwrap_err();
+    fs.release(&context(), created.handle).unwrap();
+    assert_eq!(fs.progress_writeback().unwrap(), 1);
+    assert!(fs.writeback_ready().unwrap());
+    let explicit = UNIX_EPOCH + Duration::from_millis(42);
+    fs.setattr(
+        &context(),
+        created.entry.inode,
+        None,
+        &AttributeChange {
+            mtime: Some(explicit),
+            ..AttributeChange::default()
+        },
+    )
+    .unwrap();
+    assert!(!fs.writeback_ready().unwrap());
+    assert_eq!(fs.progress_writeback().unwrap(), 0);
+    assert!(meta.metadata_syncs.lock().unwrap().is_empty());
+    assert_eq!(meta.inode.lock().unwrap().attributes.mtime_unix_ms, 42);
+}
