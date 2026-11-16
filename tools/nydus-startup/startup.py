@@ -397,7 +397,7 @@ def main():
         json.dump(result, sys.stdout, indent=2)
         sys.stdout.write("\n")
         return int(result.get("state") == "failed")
-    except (KeyError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+    except (AssertionError, KeyError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
         logging.error("nydus-startup: %s", error)
         return 1

@@ -35,10 +35,10 @@ impl DistributedFs {
             .flat_map(|chunk| target_nodes.iter().map(move |target| (chunk, target)))
             .collect::<Vec<_>>();
         while !pending.is_empty() {
-            let epoch = self.read_engine.capture_native_read_authority()?.epoch();
             let mut retry = Vec::new();
             for (chunk, target) in pending {
                 check_management_deadline(deadline)?;
+                let epoch = self.read_engine.capture_native_read_authority()?.epoch();
                 let ready = crate::node::call_deadline::within(deadline, || {
                     self.meta.ensure_replica_placement(EnsureReplicaPlacement {
                         caller_id: self.identity.node_id.clone(),

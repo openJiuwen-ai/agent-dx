@@ -135,12 +135,16 @@ impl ConnectorModule for NydusConnector {
     }
     fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
+            if let Some(service) = self.service.get() {
+                service.close_admission();
+            }
+            self.provider.stop();
             #[cfg(feature = "dfs")]
             if let Some(jobs) = self.jobs.get() {
                 jobs.stop().await;
             }
             if let Some(service) = self.service.get() {
-                service.stop().await;
+                service.drain().await;
             }
             Ok(())
         })

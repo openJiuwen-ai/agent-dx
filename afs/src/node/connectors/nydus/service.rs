@@ -60,8 +60,10 @@ impl NydusService {
             config,
         }
     }
-    pub async fn stop(&self) {
+    pub(super) fn close_admission(&self) {
         self.requests.close();
+    }
+    pub(super) async fn drain(&self) {
         while self.requests.available_permits() != self.config.max_requests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

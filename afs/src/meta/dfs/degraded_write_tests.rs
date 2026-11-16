@@ -481,3 +481,58 @@ async fn explicit_placement_adds_only_the_named_node_after_policy_is_satisfied()
     assert_eq!(after.placement_epoch, before.placement_epoch);
     assert_eq!(after.copies.len(), 2);
 }
+
+#[tokio::test]
+async fn unavailable_seed_does_not_block_ordinary_replica_repair() {
+    let short_lease = std::time::Duration::from_secs(2);
+    let mut fixture = Fixture::new(two_copies(), degrade(1), &["peer"], short_lease).await;
+    fixture.receipt_from(&["writer", "peer"]).await;
+    fixture.commit().await.unwrap();
+    let placement = fixture.placement().await;
+    assert_eq!(placement.health, PlacementHealth::Satisfied);
+    assert!(fixture.debt().await.is_none());
+
+    register(&fixture.store, "spare", "spare-s1", LIVE).await;
+    register(&fixture.store, "seed", "seed-s1", short_lease).await;
+    let writer_epoch = fixture.epoch("writer").await;
+    assert!(
+        !fixture
+            .service
+            .ensure_replica_placement(crate::dfs::EnsureReplicaPlacement {
+                caller_id: "writer".into(),
+                caller_session_id: "writer-s1".into(),
+                caller_node_epoch: writer_epoch,
+                operation_id: OperationId::new("ensure-seed"),
+                file_version_id: fixture.commit.file_version.id.clone(),
+                chunk_id: placement.chunk_id.clone(),
+                target_node_id: "seed".into(),
+            })
+            .await
+            .unwrap()
+    );
+
+    // Both the original replica and the requested seed stop renewing.
+    tokio::time::sleep(short_lease + std::time::Duration::from_millis(20)).await;
+    let claim = fixture
+        .service
+        .claim_replication_task(ClaimReplicationTask {
+            caller_id: "writer".into(),
+            caller_session_id: "writer-s1".into(),
+            caller_node_epoch: writer_epoch,
+            operation_id: OperationId::new("claim-ordinary"),
+            lease_seconds: 30,
+        })
+        .await
+        .unwrap()
+        .expect("the surviving writer should be able to repair onto the spare Node");
+    assert_eq!(claim.task_id, repair_task_id(&placement.chunk_id));
+    assert_eq!(
+        claim
+            .replica_group
+            .targets
+            .iter()
+            .map(|target| target.node_id.as_str())
+            .collect::<Vec<_>>(),
+        ["writer", "spare"]
+    );
+}

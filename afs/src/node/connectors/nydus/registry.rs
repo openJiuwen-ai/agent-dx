@@ -1,6 +1,7 @@
 //! OCI Registry protocol and immutable source metadata. No AFS dependency.
 use std::{
     collections::BTreeMap,
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,6 +11,7 @@ use prost::bytes::Bytes;
 use reqwest::{Client, Method, Response, StatusCode, Url, header};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 
 use super::RegistryConfig;
 
@@ -53,6 +55,7 @@ pub struct RegistryProvider {
     proxy_sources: BTreeMap<String, String>,
     node_id: String,
     tokens: tokio::sync::Mutex<BTreeMap<String, (String, Instant)>>,
+    stopping: watch::Sender<bool>,
 }
 
 impl RegistryProvider {
@@ -92,7 +95,23 @@ impl RegistryProvider {
             proxy_sources,
             node_id: node_id.into(),
             tokens: Default::default(),
+            stopping: watch::channel(false).0,
         }))
+    }
+
+    pub(super) fn stop(&self) {
+        self.stopping.send_replace(true);
+    }
+
+    // Registry I/O can be cancelled before bytes reach DFS. File operations and
+    // handle releases still run to completion under their existing admission.
+    async fn while_running<T>(&self, request: impl Future<Output = Result<T>>) -> Result<T> {
+        let mut stopping = self.stopping.subscribe();
+        tokio::select! {
+            biased;
+            _ = stopping.wait_for(|stopping| *stopping) => Err(unavailable("Nydus Registry is stopping")),
+            result = request => result,
+        }
     }
 
     pub fn validate_plan(&self, plan: &ImagePlan, key: &str, manifest: &str) -> Result<()> {
@@ -256,7 +275,9 @@ impl RegistryProvider {
             .unwrap_or_else(|| {
                 header::HeaderValue::from_static("application/vnd.oci.image.manifest.v1+json")
             });
-        let body = bounded_body(response, MANIFEST_LIMIT, deadline).await?;
+        let body = self
+            .while_running(bounded_body(response, MANIFEST_LIMIT, deadline))
+            .await?;
         let digest = format!("sha256:{:x}", Sha256::digest(&body));
         if reference.contains(':') && reference != digest
             || claimed.is_some_and(|value| value != digest.as_str())
@@ -337,7 +358,9 @@ impl RegistryProvider {
         {
             return Err(invalid("Registry did not honor the exact byte range"));
         }
-        let body = bounded_body(response, length, deadline).await?;
+        let body = self
+            .while_running(bounded_body(response, length, deadline))
+            .await?;
         if body.len() != length {
             return Err(invalid("short Registry range response"));
         }
@@ -381,10 +404,14 @@ impl RegistryProvider {
                     request = request.basic_auth(user, source.password.as_ref());
                 }
             }
-            let response = request
-                .send()
-                .await
-                .map_err(|_| unavailable("Registry request failed"))?;
+            let response = self
+                .while_running(async {
+                    request
+                        .send()
+                        .await
+                        .map_err(|_| unavailable("Registry request failed"))
+                })
+                .await?;
             if response.status() == StatusCode::UNAUTHORIZED
                 && !challenged
                 && url.origin() == original.origin()
@@ -470,10 +497,14 @@ impl RegistryProvider {
         {
             request = request.basic_auth(user, source.password.as_ref());
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| unavailable("Registry token request failed"))?;
+        let response = self
+            .while_running(async {
+                request
+                    .send()
+                    .await
+                    .map_err(|_| unavailable("Registry token request failed"))
+            })
+            .await?;
         if response.status() != StatusCode::OK {
             return Err(origin_status(response.status()));
         }
@@ -483,9 +514,11 @@ impl RegistryProvider {
             access_token: Option<String>,
             expires_in: Option<u64>,
         }
-        let token: Token =
-            serde_json::from_slice(&bounded_body(response, 64 * 1024, deadline).await?)
-                .map_err(|_| invalid("invalid Registry token response"))?;
+        let body = self
+            .while_running(bounded_body(response, 64 * 1024, deadline))
+            .await?;
+        let token: Token = serde_json::from_slice(&body)
+            .map_err(|_| invalid("invalid Registry token response"))?;
         let value = token
             .token
             .or(token.access_token)

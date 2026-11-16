@@ -286,11 +286,12 @@ impl DfsService {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        // Debt already recorded in the store, versus chunks this pass merely
-        // offers. A chunk can arrive twice in one pass (waiting list, then the
-        // patrol page); only recorded debt may leave the waiting list (Q08).
+        // Only ordinary repair tasks record replica policy debt. An explicit
+        // target can be unavailable while another Node can repair the policy.
+        // A chunk can also appear in both the waiting list and patrol page.
         let recorded = candidates
             .iter()
+            .filter(|task| explicit_target(&task.id).is_none())
             .map(|task| task.chunk_id.clone())
             .collect::<HashSet<_>>();
         let mut offered = HashSet::new();
