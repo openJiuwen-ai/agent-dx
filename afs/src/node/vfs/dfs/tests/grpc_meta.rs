@@ -1403,6 +1403,90 @@ async fn real_grpc_write_authority_foreign_owner_does_not_take_over_or_mutate() 
 
 #[cfg(feature = "dfs")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_grpc_data_only_replay_after_close_publishes_mtime() {
+    let (_temp, endpoint, gate, server, _store, local, _backend) = real_grpc_meta_fixture().await;
+    let (meta, _chunks, fs) = grpc_dfs_test_fs(
+        "node-a",
+        "session-a",
+        &endpoint,
+        local,
+        Duration::from_secs(2),
+    )
+    .await;
+    let fs = Arc::new(fs);
+    let (inode, inode_id, mtime) = {
+        let fs = fs.clone();
+        run_blocking(move || {
+            let file = fs
+                .create(
+                    &context(),
+                    fs.root_inode(),
+                    OsStr::new("data-only-lost-reply"),
+                    0o640,
+                    libc::O_RDWR,
+                )
+                .unwrap();
+            let inode = file.entry.inode;
+            fs.setattr(
+                &context(),
+                inode,
+                Some(file.handle),
+                &AttributeChange {
+                    mtime: Some(std::time::UNIX_EPOCH + Duration::from_millis(42)),
+                    ..AttributeChange::default()
+                },
+            )
+            .unwrap();
+            fs.write(&context(), file.handle, 0, b"body").unwrap();
+            // Meta applies the file commit, but the client times out waiting
+            // for the reply and has to replay the same operation.
+            let error = fs.flush(&context(), file.handle).unwrap_err();
+            assert_eq!(error.code(), afs_error::CLIENT_DEADLINE_EXCEEDED);
+            let inode_id = fs.inode_id(inode).unwrap();
+            let cell = fs.write_state(&inode_id).unwrap().unwrap();
+            let mtime = cell.lock().unwrap().inode.attributes.mtime_unix_ms;
+            fs.release(&context(), file.handle).unwrap();
+            (inode, inode_id, mtime)
+        })
+        .await
+    };
+    gate.wait_first_committed(Duration::from_secs(1)).await;
+    gate.release_second();
+
+    run_blocking(move || {
+        let original = meta.get_inode(&inode_id).unwrap();
+        assert!(original.head_version.is_some());
+        assert_eq!(original.attributes.mtime_unix_ms, 42);
+        assert_ne!(mtime, original.attributes.mtime_unix_ms);
+
+        assert_eq!(fs.progress_writeback().unwrap(), 1);
+        fs.setxattr(&context(), inode, OsStr::new("user.replay"), b"kept", 0)
+            .unwrap();
+        assert_eq!(fs.progress_writeback().unwrap(), 1);
+        assert!(!fs.writeback_ready().unwrap());
+
+        let final_inode = meta.get_inode(&inode_id).unwrap();
+        assert_eq!(final_inode.head_version, original.head_version);
+        assert_eq!(final_inode.attributes.mtime_unix_ms, mtime);
+        assert_eq!(
+            final_inode.xattrs.get(b"user.replay".as_slice()).unwrap(),
+            b"kept",
+        );
+        let commits = meta.commits();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].metadata_delta.mode, CommitMetadataMode::DataOnly);
+        assert_eq!(commits[0].operation_id, commits[1].operation_id);
+        assert_eq!(commits[0].file_version.id, commits[1].file_version.id);
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert_eq!(read_exact_from(&fs, reader, 0, 4), b"body");
+        fs.release(&context(), reader).unwrap();
+    })
+    .await;
+    server.abort();
+}
+
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_grpc_unknown_file_commit_ack_blocks_inode_and_replays_exact_request() {
     use crate::meta::store::{MetaEntity, MetaRead, OperationResult, RequestKey, StoreOperation};
 

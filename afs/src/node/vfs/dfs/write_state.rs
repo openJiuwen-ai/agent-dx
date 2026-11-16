@@ -1084,6 +1084,7 @@ impl DistributedFs {
             && !state.kill_suidgid_dirty
         {
             state.metadata_dirty = false;
+            state.last_writer_background_requested = false;
         }
         Ok(())
     }

@@ -657,7 +657,6 @@ impl DistributedFs {
         state.dirty = !state.dirty_extents.is_empty();
         state.durable_write_seq = through_seq;
         state.committed_write_seq = through_seq;
-        state.last_writer_background_requested = false;
         state.writeback_retry_at = None;
         state.writeback_failures = 0;
         state.native_due = state.native_due_through > through_seq;
@@ -670,6 +669,10 @@ impl DistributedFs {
         if committed_kill_suidgid && !has_later_dirty {
             state.kill_suidgid_dirty = false;
         }
+        // A close-triggered writeback must still publish metadata left by a
+        // DataOnly replay. Clear the request only after settling the commit.
+        state.last_writer_background_requested &=
+            state.dirty || state.metadata_dirty || state.kill_suidgid_dirty;
     }
 
     /// A metadata-only sync lost to a newer inode on Meta (B5). When Meta's
