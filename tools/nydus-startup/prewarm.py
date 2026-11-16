@@ -6,6 +6,7 @@ import hashlib
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
 import json
 from pathlib import Path
+from posixpath import join as join_url_path
 import re
 import time
 from urllib.parse import quote, urlsplit
@@ -25,8 +26,9 @@ def validate_plan(manifest_path, plan, workload, command):
         raise ValueError("plan does not match the workload and command")
     manifest = json.loads(raw)
     metadata = {manifest["config"]["digest"]}
-    metadata.update(layer["digest"] for layer in manifest["layers"] if layer.get(
-        "annotations", {}).get("containerd.io/snapshot/nydus-bootstrap") == "true")
+    for layer in manifest["layers"]:
+        if layer.get("annotations", {}).get("containerd.io/snapshot/nydus-bootstrap") == "true":
+            metadata.add(layer["digest"])
     sizes = {layer["digest"]: layer["size"] for layer in manifest["layers"] if layer["digest"] not in metadata}
     ranges = plan["ranges"]
     if not ranges:
@@ -61,7 +63,10 @@ def read_range(connection, path, span, size, token):
             raise ValueError(f"unexpected Docker-Content-Digest for {span['blob']}")
         digest = hashlib.sha256()
         received = 0
-        while chunk := response.read(min(256 * 1024, length - received + 1)):
+        while True:
+            chunk = response.read(min(256 * 1024, length - received + 1))
+            if not chunk:
+                break
             received += len(chunk)
             if received > length:
                 raise ValueError(f"oversized body for {span['blob']}")
@@ -86,7 +91,7 @@ def prewarm(args):
         raise ValueError("timeout must be positive")
     token = args.token_file.read_text().strip() if args.token_file else None
     connection_type = HTTPSConnection if endpoint.scheme == "https" else HTTPConnection
-    base_path = "/v2/" + quote(args.repository, safe="/") + "/blobs/"
+    base_path = join_url_path("/v2", quote(args.repository, safe="/"), "blobs")
     result = {"manifest": plan["manifest"], "workload": plan["workload"], "repository": args.repository,
               "endpoint": args.endpoint, "plan_sha256": hashlib.sha256(raw).hexdigest(), "ok": False,
               "started_monotonic_ns": time.monotonic_ns(), "reads": []}
@@ -96,7 +101,7 @@ def prewarm(args):
                 for span in plan["ranges"]:
                     started = time.monotonic_ns()
                     blob = span["blob"]
-                    digest = read_range(connection, base_path + blob, span, sizes[blob], token)
+                    digest = read_range(connection, join_url_path(base_path, blob), span, sizes[blob], token)
                     result["reads"].append(dict(span, sha256=digest, elapsed_ns=time.monotonic_ns() - started))
             result["ok"] = True
         except (HTTPException, OSError, ValueError) as error:

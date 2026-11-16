@@ -19,7 +19,11 @@ def distribute(plan, warm, await_source):
     outcomes = {}
     for wave in waves:
         for source in set(wave.values()) - ready:
-            await_source(source, outcomes[source])
+            try:
+                receipt = outcomes[source]
+            except KeyError as error:
+                raise ValueError(f"missing prewarm receipt for {source}") from error
+            await_source(source, receipt)
             ready.add(source)
         with ThreadPoolExecutor(max_workers=len(wave)) as pool:
             pending = {target: pool.submit(warm, target, source) for target, source in wave.items()}
@@ -33,6 +37,7 @@ def main():
     import json
     from pathlib import Path
     import subprocess
+    import sys
     import time
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -53,7 +58,8 @@ def main():
         record = {"node": node, "upstream": source, "action": action,
                   "started_ns": start, "finished_ns": time.monotonic_ns(),
                   "exit_code": result.returncode}
-        print(json.dumps(record), flush=True)
+        sys.stdout.write(f"{json.dumps(record)}\n")
+        sys.stdout.flush()
         result.check_returncode()
         return record
 

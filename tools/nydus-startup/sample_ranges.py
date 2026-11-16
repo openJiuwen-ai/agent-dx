@@ -20,12 +20,15 @@ def packets(path):
             b"\xd4\xc3\xb2\xa1": ("<", 1000), b"\xa1\xb2\xc3\xd4": (">", 1000),
             b"\x4d\x3c\xb2\xa1": ("<", 1), b"\xa1\xb2\x3c\x4d": (">", 1),
         }[header[:4]]
-        assert struct.unpack_from(endian + "I", header, 20)[0] == 1, "capture must use Ethernet framing"
-        while record := pcap.read(16):
+        if struct.unpack_from(endian + "I", header, 20)[0] != 1:
+            raise ValueError("capture must use Ethernet framing")
+        for record in iter(lambda: pcap.read(16), b""):
             sec, fraction, size, wire = struct.unpack(endian + "IIII", record)
             data = pcap.read(size)
-            assert len(data) == size == wire, "truncated capture packet"
-            assert data[12:14] == b"\x08\x00" and data[23] == 6, "expected IPv4 TCP"
+            if len(data) != size or size != wire:
+                raise ValueError("truncated capture packet")
+            if len(data) < 34 or data[12:14] != b"\x08\x00" or data[23] != 6:
+                raise ValueError("expected IPv4 TCP")
             ip_size = int.from_bytes(data[16:18], "big")
             tcp = 14 + (data[14] & 15) * 4
             payload = data[tcp + (data[tcp + 12] >> 4) * 4:14 + ip_size]
@@ -37,10 +40,12 @@ def packets(path):
 
 def observe(path, manifest, sdk):
     sample, = sdk["samples"]
-    assert sample["ok"] and sample["exit_code"] == 0
+    if not sample["ok"] or sample["exit_code"] != 0:
+        raise ValueError("sampling command failed")
     start, end = sample["submit_wall_ns"], sample["command_wall_ns"]
     monotonic = sample["command_ns"] - sample["submit_ns"]
-    assert abs(end - start - monotonic) < 10_000_000, "worker realtime changed during the run"
+    if abs(end - start - monotonic) >= 10_000_000:
+        raise ValueError("worker realtime changed during the run")
     layers = {layer["digest"]: (layer["size"], "bootstrap" if layer.get("annotations", {}).get(
         "containerd.io/snapshot/nydus-bootstrap") == "true" else "body") for layer in manifest["layers"]}
     config = manifest["config"]
@@ -56,10 +61,12 @@ def observe(path, manifest, sdk):
         # Fail rather than silently dropping a split request or unknown payload.
         while payload:
             headers, marker, payload = payload.partition(b"\r\n\r\n")
-            assert marker, "split HTTP header in capture"
+            if not marker:
+                raise ValueError("split HTTP header in capture")
             line, *fields = headers.split(b"\r\n")
             match = REQUEST.fullmatch(line)
-            assert match, "unknown HTTP request payload"
+            if not match:
+                raise ValueError("unknown HTTP request payload")
             method, target = (part.decode("ascii") for part in match.groups())
             match = BLOB.fullmatch(urlsplit(target).path) if method != "CONNECT" else None
             digest = match[1] if match else None
@@ -73,11 +80,13 @@ def observe(path, manifest, sdk):
                     if ranges:
                         value, = ranges
                         span = re.fullmatch(rb"bytes=([0-9]+)-([0-9]*)", value)
-                        assert span, "unsupported Range"
+                        if not span:
+                            raise ValueError("unsupported Range")
                         lo, hi = int(span[1]), min(int(span[2]) + 1, size) if span[2] else size
                     else:
                         lo, hi = 0, size
-                    assert 0 <= lo < hi <= size
+                    if not 0 <= lo < hi <= size:
+                        raise ValueError("Range is outside the blob")
                     event.update(offset=lo, length=hi - lo)
             events.append(event)
     return events
@@ -101,8 +110,11 @@ def coverage(entries):
 
 
 def body(events):
-    return coverage(event for event in events if event["in_window"] and event["kind"] == "body"
-                    and event["method"] == "GET")
+    body_reads = []
+    for event in events:
+        if event["in_window"] and event["kind"] == "body" and event["method"] == "GET":
+            body_reads.append(event)
+    return coverage(body_reads)
 
 
 def make_plan(image, workload, command, training_run, events):
@@ -114,7 +126,8 @@ def make_plan(image, workload, command, training_run, events):
 
 
 def compare(planned, actual):
-    assert actual, "no startup body ranges in the validation run"
+    if not actual:
+        raise ValueError("no startup body ranges in the validation run")
     plan_bytes = sum(row["length"] for row in planned)
     actual_bytes = sum(row["length"] for row in actual)
     hit = 0
@@ -141,7 +154,8 @@ def dump(path, data):
 def analyze(manifest_path, pcap, sdk):
     raw = manifest_path.read_bytes()
     image = "sha256:" + hashlib.sha256(raw).hexdigest()
-    assert sdk["digest"] == image
+    if sdk["digest"] != image:
+        raise ValueError("SDK sample does not match the manifest digest")
     return image, observe(pcap, json.loads(raw), sdk)
 
 
@@ -164,7 +178,7 @@ def main():
         dump(args.events, observed)
         if args.plan:
             dump(args.plan, plan)
-    except (AssertionError, KeyError, OSError, ValueError, struct.error) as error:
+    except (KeyError, OSError, ValueError, struct.error) as error:
         parser.exit(1, f"sampling failed: {error}\n")
 
 

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "tools" / "nydus-startup"))
+sys.path.append(str(Path(__file__).resolve().parents[4] / "tools" / "nydus-startup"))
 
 from prewarm import read_range, validate_plan
 from sample_ranges import make_plan
@@ -53,7 +53,7 @@ class StartupRangesTest(unittest.TestCase):
             "Content-Length": "3",
             "Docker-Content-Digest": self.blob,
         }
-        path = "/v2/test/image/blobs/" + self.blob
+        path = f"/v2/test/image/blobs/{self.blob}"
         span = {"blob": self.blob, "offset": 1, "length": 3}
         for status, content_range, data, error in (
             (206, "bytes 1-3/8", b"abc", None),

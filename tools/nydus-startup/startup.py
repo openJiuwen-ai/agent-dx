@@ -4,9 +4,11 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import platform
+from posixpath import join as join_url_path
 import shlex
 import shutil
 import signal
@@ -56,8 +58,9 @@ def secret(config, name):
 
 def request(endpoint, path, *, token=None, payload=None, accept=None):
     url = urlsplit(endpoint)
-    if (url.scheme not in {"http", "https"} or url.hostname is None
-            or url.username is not None or url.path not in {"", "/"} or url.query or url.fragment):
+    if url.scheme not in {"http", "https"} or url.hostname is None or url.username is not None:
+        raise ValueError("endpoint must be an HTTP(S) origin")
+    if url.path not in {"", "/"} or url.query or url.fragment:
         raise ValueError("endpoint must be an HTTP(S) origin")
     headers = {"Accept": accept or "application/json"}
     body = None
@@ -97,11 +100,10 @@ def choose_targets(snapshot, deployment, purpose, explicit=None):
     if purpose == "seed":
         candidates = [node for node in online if node["has_dfs_storage"]]
     elif purpose == "prewarm":
-        candidates = [
-            node for node in online
-            if node["deployment"] == deployment and node["role"] == "worker"
-            and "nydus" in node["connectors"]
-        ]
+        candidates = []
+        for node in online:
+            if node["deployment"] == deployment and node["role"] == "worker" and "nydus" in node["connectors"]:
+                candidates.append(node)
     else:
         raise ValueError("unknown target selection purpose")
     indexed = {node["node_id"]: node for node in candidates}
@@ -116,11 +118,12 @@ def choose_targets(snapshot, deployment, purpose, explicit=None):
 
 
 def seed_coordinator(snapshot, deployment):
-    candidates = [
-        node for node in snapshot["nodes"]
-        if node["online"] and node["deployment"] == deployment
-        and "nydus" in node["connectors"] and node["management_rest_addr"]
-    ]
+    candidates = []
+    for node in snapshot["nodes"]:
+        if not node["online"] or node["deployment"] != deployment:
+            continue
+        if "nydus" in node["connectors"] and node["management_rest_addr"]:
+            candidates.append(node)
     if not candidates:
         raise ValueError("no Nydus job endpoint in the selected deployment")
     return min(candidates, key=lambda node: (node["role"] != "seed", node["node_id"]))
@@ -204,11 +207,13 @@ def prewarm(config, snapshot, image, manifest_path, plan):
 
 
 def registry_manifest(endpoint, repository, reference, token):
-    path = "/v2/" + quote(repository, safe="/") + "/manifests/" + quote(reference, safe=":")
+    path = join_url_path("/v2", quote(repository, safe="/"), "manifests", quote(reference, safe=":"))
     raw, headers = request(endpoint, path, token=token, accept=MANIFEST_ACCEPT)
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     declared = headers.get("Docker-Content-Digest")
-    if (declared and digest != declared) or (reference.startswith("sha256:") and reference != digest):
+    if declared and digest != declared:
+        raise ValueError("Registry manifest digest mismatch")
+    if reference.startswith("sha256:") and reference != digest:
         raise ValueError("Registry manifest digest mismatch")
     return raw, digest
 
@@ -229,8 +234,9 @@ def resolve_manifest(endpoint, repository, tag, target_platform, token):
     matches = []
     for descriptor in index:
         descriptor_platform = descriptor.get("platform", {})
-        if (descriptor_platform.get("os") != system or descriptor_platform.get("architecture") != arch
-                or (variant and descriptor_platform.get("variant") != variant[0])):
+        if descriptor_platform.get("os") != system or descriptor_platform.get("architecture") != arch:
+            continue
+        if variant and descriptor_platform.get("variant") != variant[0]:
             continue
         candidate = registry_manifest(endpoint, repository, descriptor["digest"], token)
         if is_nydus(candidate[0]):
@@ -244,7 +250,9 @@ def convert(config, input_image, target, output):
     target = target or config["publish_target"]
     authority, _, path = target.partition("/")
     repository, colon, tag = path.rpartition(":")
-    if not authority or not repository or not colon or "/" in tag or "@" in path:
+    if not all((authority, repository, colon)):
+        raise ValueError("publish target must be a Registry repository with an explicit tag")
+    if "/" in tag or "@" in path:
         raise ValueError("publish target must be a Registry repository with an explicit tag")
     if "publish_target" in config:
         configured = config["publish_target"].rsplit(":", 1)[0]
@@ -322,7 +330,7 @@ def sample(config, snapshot, image, output, worker, workload, command, expected)
     evidence = output / "startup.json"
     receipt = {"digest": image["manifest_digest"], "samples": [data]}
     write_json(evidence, receipt)
-    if not data["ok"]:
+    if not data.get("ok"):
         raise RuntimeError(f"sampling command failed validation, see {evidence}")
     digest, observed = analyze(output / "manifest.json", capture, receipt)
     write_json(output / "events.json", observed)
@@ -386,10 +394,12 @@ def main():
             else:
                 manifest = args.image.with_name("manifest.json")
                 result = prewarm(config, snapshot, image, manifest, read_json(args.plan))
-        print(json.dumps(result, indent=2))
+        json.dump(result, sys.stdout, indent=2)
+        sys.stdout.write("\n")
         return int(result.get("state") == "failed")
-    except (AssertionError, KeyError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
-        print(f"nydus-startup: {error}", file=sys.stderr)
+    except (KeyError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        logging.error("nydus-startup: %s", error)
         return 1
 
 

@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "tools" / "nydus-startup"))
+sys.path.append(str(Path(__file__).resolve().parents[4] / "tools" / "nydus-startup"))
 from startup import choose_targets, run_job, warm_payload
 
 
