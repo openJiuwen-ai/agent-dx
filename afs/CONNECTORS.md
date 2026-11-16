@@ -96,3 +96,47 @@ Nydus backend 示例（替换实际地址与具体 manifest digest）：
 该配置与 `dfs_peer_cache` 分别选择，避免为同一正文保留两份磁盘缓存。
 
 来源恢复仅重新安装与已提交 chunk 相同的字节。校验或身份冲突时返回读取错误。
+
+## OverlayBD 本机块设备
+
+Linux 构建可选用 `cargo build -p afs --bin afs-node --features overlaybd-connector`。
+该特性编译 `libublk` 时需要 libclang 和 Linux UAPI 头文件。
+运行时仍需显式启用：
+
+```toml
+[connectors.overlaybd]
+enabled = true
+recover_on_restart = false
+directory = "/var/lib/afs/overlaybd"
+image = "registry.example.com/team/image@sha256:MANIFEST_DIGEST"
+```
+
+私有目录（模式 0700）内放部署固定的 OverlayBD `image.json`。
+按底层到顶层在 `lowers` 中列出 blob 的 `digest` 和 `size`。
+reader 支持未压缩的封存 LSMT 1.1 只读层，依据 blob 自身的头和尾识别格式。
+启用重启接管时，同目录的 `global.json` 继续参与恢复配置的身份校验。
+`repoBlobUrl` 可使用同节点
+`http://AFS_NODE:7401/nydus/SOURCE/sha256:MANIFEST_DIGEST/blobs`。
+使用该 URL 时须启用 Registry blob 路由并配置对应来源。
+只读 reader 和 `libublk` 队列在 AFS Node 进程内运行。按需填充、提交和 Peer 读由现有 AFS 负责。
+
+adxlet 配置 `ADX_OVERLAYBD_ROOTFS_SOCKET=/var/lib/afs/overlaybd/connector.sock`。
+本地 socket 的 `POST /acquire` 接收 `{"runtime_id":"...","image":"...","acquire_deadline_ms":...}`，
+返回 JSON 挂载路径，其他镜像返回 `null`，沿用现有启动路径。
+借盘截止时间使用本机启动时钟，释放记录在其有效窗口内拒绝迟到请求，跨进程重启有效。
+`POST /release` 接收 `{"runtime_id":"..."}`，在 sandboxd 确认实例删除后调用。
+adxlet 在 socket 同目录的 `.adxlet-overlaybd-refs` 记录持有和待释放的引用。
+connector 暂时离线时，已落盘的待释放引用在 adxlet 重启后继续重试。
+服务身份要能管理 ublk 设备和 ext4 挂载。AFS Node 与 sandboxd 必须看到同一挂载。
+同镜像共享只读挂载，实例写层由 sandboxd/gVisor 管理。
+
+引用保存在本机。启用 `recover_on_restart` 后，新建只读设备要求内核支持
+`USER_RECOVERY` 和 `USER_RECOVERY_REISSUE`，镜像层须由远端 digest 固定。
+新 Node 在同一次宿主机启动内核对原设备、原挂载及镜像配置，再重新打开镜像层和
+ublk 队列。用户态等待队列提交，并监听启动期间的队列错误。接管共享 60 秒预算，重试镜像打开和内核队列暂不可用，成功后继续原盘读。
+确认原盘身份且无法接管时，先停止供数设备以结束等待的 I/O，最后一个实例释放引用时清理。
+接管中断后的再次接管依赖 Linux 6.15 或发行版的等效修复。
+
+懒文件补冷范围时，Meta 可把有效旧租约交给原节点的新注册 session。
+其他节点先读也可触发这次交接，租约持有节点仍是原节点，epoch 递增，旧提交被拒绝。
+没有来源绑定的普通文件沿用原租约规则。

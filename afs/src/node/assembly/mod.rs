@@ -129,6 +129,8 @@ pub(super) async fn run_node(
         registration.epoch,
         &mut services,
     );
+    #[cfg(feature = "dfs")]
+    backends.dfs.connectors.start().await?;
     background::RestServer::new(ingress.rest, state.clone(), connector_routes).start(&mut services);
     #[cfg(feature = "ownerfs")]
     if let Some(listener) = ingress.workspace {

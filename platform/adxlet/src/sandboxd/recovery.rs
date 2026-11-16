@@ -202,6 +202,7 @@ mod tests {
             recovery_profiles: published,
             starts: Default::default(),
             backend_ids: Default::default(),
+            overlaybd_connector: None,
         };
         let spec = serde_json::from_value(serde_json::json!({
             "id":"environment", "tenant_id":"tenant", "runtime_class":"runsc", "image":"",
