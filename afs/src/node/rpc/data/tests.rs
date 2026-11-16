@@ -3413,6 +3413,8 @@ fn dfs_reuse_test_service(
         replica_authorizer: Arc::new(DenyDfsReplicaAuthorizer),
         replica_data_plane: None,
         replica_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+        replica_forward_permits: Arc::new(tokio::sync::Semaphore::new(7)),
+        replica_authorization_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         replica_timeout: std::time::Duration::from_secs(30),
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
@@ -4043,6 +4045,8 @@ async fn dfs_range_service_requires_authority_and_streams_bounded_frames() {
         replica_authorizer: Arc::new(DenyDfsReplicaAuthorizer),
         replica_data_plane: None,
         replica_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+        replica_forward_permits: Arc::new(tokio::sync::Semaphore::new(7)),
+        replica_authorization_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         replica_timeout: std::time::Duration::from_secs(30),
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
@@ -4062,6 +4066,8 @@ async fn dfs_range_service_requires_authority_and_streams_bounded_frames() {
         replica_authorizer: Arc::new(DenyDfsReplicaAuthorizer),
         replica_data_plane: None,
         replica_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+        replica_forward_permits: Arc::new(tokio::sync::Semaphore::new(7)),
+        replica_authorization_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         replica_timeout: std::time::Duration::from_secs(30),
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
@@ -4248,6 +4254,8 @@ async fn dfs_replica_receive_admission_waits_for_a_slot_until_the_deadline() {
         replica_authorizer: Arc::new(FixtureReplicaGrant(op.clone())),
         replica_data_plane: None,
         replica_permits: permits.clone(),
+        replica_forward_permits: Arc::new(tokio::sync::Semaphore::new(7)),
+        replica_authorization_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         replica_timeout: std::time::Duration::from_millis(1500),
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
@@ -4361,6 +4369,8 @@ async fn dfs_replica_sender_retries_receiver_backpressure_within_its_deadline() 
         replica_authorizer: Arc::new(FixtureReplicaGrant(op.clone())),
         replica_data_plane: None,
         replica_permits: permits.clone(),
+        replica_forward_permits: Arc::new(tokio::sync::Semaphore::new(7)),
+        replica_authorization_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         replica_timeout: std::time::Duration::from_millis(200),
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
@@ -4413,3 +4423,6 @@ async fn dfs_replica_sender_retries_receiver_backpressure_within_its_deadline() 
     assert!(rejected >= 1, "the receiver never pushed back:\n{text}");
     server.abort();
 }
+
+#[cfg(feature = "dfs")]
+mod opposite_replica;
