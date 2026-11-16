@@ -71,7 +71,7 @@ Gateway 进程仍能接触根密钥和明文，这属于应用层加密，不提
 ## 模板、回收与快照
 
 Composio 与后台摄取配套的账号新增表、摄取 schema 升级、旧订阅投影切换及发布顺序，
-见[连接器配套部署与数据库切换](digitalmate-connectors-cutover.md)。账号 schema 版本与
+见 DigitalMate 仓库的[连接器配套部署与数据库切换](https://github.com/openJiuwen-ai/DigitalMate/blob/main/docs/guides/operations/connectors-cutover-and-database.md)。账号 schema 版本与
 摄取 schema、batch wire 版本独立，本次复用工作负载凭证不新增身份数据库或 SQL 升级。
 
 DigitalMate 沙箱使用 [DigitalMate 仓库的正式部署模板](https://github.com/openJiuwen-ai/DigitalMate/blob/main/harness/personal-agent/deploy/digitalmate-template.prod.json)，

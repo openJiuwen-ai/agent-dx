@@ -29,8 +29,8 @@ and remain outside that typed API.
 The default `activity-client` feature builds the managed Ingress and Relay entrypoints. Embedded and standalone Ingress both use `ingress::IngressService`; only the owning process changes. Standalone Ingress requires `ADX_INGRESS_CONTROL_CONFIG` pointing to [ingress-control.json](../build/config/examples/ingress-control.json). Coordinator must map the Ingress client certificate to the `ingress` role. Public listener TLS and Ingress-to-Node security remain separate settings. The optional `etcd-watch` library and legacy test fixtures are retained separately; the managed Ingress entrypoint uses the new Coordinator route service.
 
 DigitalMate 业务配置中心的部署、身份续期与回收边界见[中文部署说明](../docs/deployment/digitalmate-privacy.md)。
-配置中心与 Composio/摄取的数据库版本、凭证用途和发布切换步骤见
-[连接器配套部署说明](../docs/deployment/digitalmate-connectors-cutover.md)。
+配置中心与 Composio/摄取的数据库版本、凭证用途和发布切换步骤见 DigitalMate 仓库的
+[连接器配套部署说明](https://github.com/openJiuwen-ai/DigitalMate/blob/main/docs/guides/operations/connectors-cutover-and-database.md)。
 
 The gateway is a member of the root Cargo workspace. Run from repository root:
 
@@ -470,7 +470,7 @@ concurrent deletion. Selected-route checks and pre-write retry belong to the
 ordinary shared path, not to a mail-specific generation admission. Identity
 owners independently fence the original authorization, represented in mail
 persistence by an actual existing random grant reference. See the
-[wire-v2/cutover contract](../docs/development/ingestion-delivery-contract.md).
+[wire-v2/cutover contract](https://github.com/openJiuwen-ai/DigitalMate/blob/main/docs/implementations/contracts/ingestion-delivery-contract.md).
 Ordinary managed WS uses shared selection/connection; managed HTTP shares selection/retry while retaining the
 backend HTTP pool. The Jiuwen codecs, bounded session/request state and E2A socket
 driver are implemented. Its internal connection adapter uses the shared authorized
@@ -579,11 +579,11 @@ use the new configuration before using this binary.
 
 ## DigitalMateGateway authenticated entrypoints
 
-The [Composio mail entry](../docs/development/composio-gmail-trusted.md) implements
+The [Composio mail entry](https://github.com/openJiuwen-ai/DigitalMate/blob/main/docs/implementations/contracts/composio-gmail-trusted-entry.md) implements
 fixed Gmail/Outlook authorization, account validation, mail reads and subscription
 synchronization outside user sandboxes. Trusted `composio` configuration prepares
 the encrypted project Key, shared PostgreSQL budget and actual M44 owner adapter.
-The [ingestion coordinator](../docs/development/connector-ingestion.md) in the same
+The [ingestion coordinator](https://github.com/openJiuwen-ai/DigitalMate/blob/main/docs/implementations/contracts/connector-ingestion-gateway.md) in the same
 process verifies signed Webhooks, persists bounded queues and delivers fixed
 batches through existing Ingress/Relay. The DigitalMate module owns dispatch and
 worker supervision; shared service code only spawns its background future and
