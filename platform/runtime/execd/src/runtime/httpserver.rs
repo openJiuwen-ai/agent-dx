@@ -489,6 +489,10 @@ async fn handle_one_request(
             .to_string();
         if let Some(operation) = super::dispatch::normalize_environment_action(&action) {
             adx_observability::trace::attribute("rpc.method", operation.to_owned());
+            if operation == "cmd_run" && parsed.get("args").is_some_and(|args| !args.is_object()) {
+                let error = super::dispatch::exec_argument_error("args must be an object".into());
+                return write_resp(sock, 400, &rmpv_to_json(&error).to_string()).await;
+            }
         }
         let kw = json_args_to_kwargs(parsed.get("args"));
         let request_id = request_id_from(&head, &parsed);
@@ -2129,6 +2133,105 @@ mod tests {
         drop(client);
         server.await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_process_exec_rejects_invalid_arguments_before_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("executed");
+        let command = format!("touch {}", marker.display());
+        for (field, value) in [
+            ("cmd", serde_json::json!(123)),
+            ("cmd", serde_json::Value::Null),
+            ("cmd", serde_json::json!(["true"])),
+            ("command", serde_json::json!(123)),
+            ("cwd", serde_json::json!(123)),
+            ("working_dir", serde_json::json!(false)),
+            ("envs", serde_json::json!("not-object")),
+            ("env", serde_json::json!([])),
+            ("envs", serde_json::json!({"VALUE": 123})),
+            ("env", serde_json::json!({"VALUE": null})),
+            ("timeout", serde_json::json!("abc")),
+            ("timeout", serde_json::json!(-1)),
+            ("timeout", serde_json::json!(true)),
+            ("timeout", serde_json::Value::Null),
+            ("timeout", serde_json::json!(f64::MAX)),
+            ("timeout", serde_json::json!(9.3e18)),
+            ("timeuot", serde_json::json!(1)),
+        ] {
+            let mut args = serde_json::json!({"cmd": command});
+            args[field] = value;
+            let response = invoke_over_http_status("process.exec", args, 400).await;
+            assert!(response["error"].as_str().unwrap().contains(field));
+            assert_eq!(response["error_code"], "INVALID_ARGUMENT");
+            assert!(response.get("exit_code").is_none());
+            assert!(!marker.exists(), "invalid {field} started a command");
+        }
+        for action in ["process.exec", "process.run", "cmd.run", "cmd_run", "exec"] {
+            for args in [
+                serde_json::Value::Null,
+                serde_json::json!([]),
+                serde_json::json!("bad"),
+                serde_json::json!(123),
+                serde_json::json!(false),
+            ] {
+                let response = invoke_over_http_status(action, args, 400).await;
+                assert_eq!(response["error"], "args must be an object");
+                assert_eq!(response["error_code"], "INVALID_ARGUMENT");
+                assert!(response.get("exit_code").is_none());
+                assert!(!marker.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_process_exec_preserves_empty_commands_aliases_and_execution_results() {
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"cmd": ""}),
+            serde_json::json!({"command": "", "cwd": null, "envs": null}),
+        ] {
+            let response = invoke_over_http("process.exec", args).await;
+            assert_eq!(response["exit_code"], 0);
+            assert_eq!(response["stdout"], "");
+            assert!(response.get("error").is_none());
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let response = invoke_over_http(
+            "process.exec",
+            serde_json::json!({
+                "command": "printf '%s' \"$VALUE\"; pwd; exit 7",
+                "working_dir": directory.path(), "env": {"VALUE": "alias-"},
+                "timeout": 2.0,
+            }),
+        )
+        .await;
+        assert_eq!(response["exit_code"], 7);
+        assert_eq!(
+            response["stdout"],
+            format!(
+                "alias-{}\n",
+                directory.path().canonicalize().unwrap().display()
+            )
+        );
+        let response = invoke_over_http(
+            "cmd.run",
+            serde_json::json!({
+                "cmd": "printf '%s' \"$VALUE\"", "command": "exit 9",
+                "cwd": directory.path(), "working_dir": "/does-not-exist",
+                "envs": {"VALUE": "primary"}, "env": {"VALUE": "secondary"},
+            }),
+        )
+        .await;
+        assert_eq!(response["stdout"], "primary");
+        assert_eq!(response["exit_code"], 0);
+        let response = invoke_over_http(
+            "process.exec",
+            serde_json::json!({"cmd": "exec sleep 10", "timeout": 0}),
+        )
+        .await;
+        assert_eq!(response["exit_code"], -1);
+        assert!(response["stderr"].as_str().unwrap().contains("timed out"));
     }
 
     #[tokio::test]

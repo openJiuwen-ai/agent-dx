@@ -161,14 +161,82 @@ fn command_result(stdout: String, stderr: String, exit_code: i64) -> rmpv::Value
     ])
 }
 
-fn command_timeout(kw: &std::collections::BTreeMap<String, rmpv::Value>) -> Option<f64> {
-    let timeout = kw.get("timeout").and_then(|value| {
-        value
-            .as_f64()
-            .or_else(|| value.as_i64().map(|v| v as f64))
-            .or_else(|| value.as_u64().map(|v| v as f64))
-    })?;
-    (timeout.is_finite() && timeout >= 0.0).then_some(timeout)
+struct ExecArgs<'a> {
+    cmd: &'a str,
+    cwd: Option<&'a str>,
+    envs: Option<&'a rmpv::Value>,
+    timeout: Option<Duration>,
+}
+
+pub(super) fn exec_argument_error(message: String) -> rmpv::Value {
+    codec::map_value(vec![
+        ("error", message.into()),
+        ("error_code", "INVALID_ARGUMENT".into()),
+    ])
+}
+
+fn exec_args(kw: &std::collections::BTreeMap<String, rmpv::Value>) -> Result<ExecArgs<'_>, String> {
+    for key in kw.keys() {
+        if !matches!(
+            key.as_str(),
+            "cmd" | "command" | "cwd" | "working_dir" | "envs" | "env" | "timeout"
+        ) {
+            return Err(format!("unknown process.exec argument: args.{key}"));
+        }
+    }
+    for key in ["cmd", "command", "cwd", "working_dir"] {
+        if let Some(value) = kw.get(key) {
+            let nullable = matches!(key, "cwd" | "working_dir");
+            if value.as_str().is_none() && !(nullable && matches!(value, rmpv::Value::Nil)) {
+                let expected = if nullable {
+                    "a string or null"
+                } else {
+                    "a string"
+                };
+                return Err(format!("args.{key} must be {expected}"));
+            }
+        }
+    }
+    for key in ["envs", "env"] {
+        if let Some(value) = kw.get(key) {
+            let valid = match value {
+                rmpv::Value::Nil => true,
+                rmpv::Value::Map(entries) => entries
+                    .iter()
+                    .all(|(k, v)| k.as_str().is_some() && v.as_str().is_some()),
+                _ => false,
+            };
+            if !valid {
+                return Err(format!(
+                    "args.{key} must be an object with string keys and values or null"
+                ));
+            }
+        }
+    }
+    let timeout = kw
+        .get("timeout")
+        .map(|value| {
+            let seconds = value
+                .as_f64()
+                .or_else(|| value.as_i64().map(|v| v as f64))
+                .or_else(|| value.as_u64().map(|v| v as f64))
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                .ok_or_else(|| {
+                    "args.timeout must be a finite number greater than or equal to 0".to_owned()
+                })?;
+            Duration::try_from_secs_f64(seconds)
+                .map_err(|_| "args.timeout exceeds the supported execution deadline".to_owned())
+        })
+        .transpose()?;
+    let string = |key| kw.get(key).and_then(rmpv::Value::as_str);
+    Ok(ExecArgs {
+        cmd: string("cmd")
+            .or_else(|| string("command"))
+            .unwrap_or_default(),
+        cwd: string("cwd").or_else(|| string("working_dir")),
+        envs: kw.get("envs").or_else(|| kw.get("env")),
+        timeout,
+    })
 }
 
 fn read_command_output(file: &mut std::fs::File) -> String {
@@ -242,7 +310,7 @@ fn run_command(
     cmd: &str,
     cwd: Option<&str>,
     envs: Option<&rmpv::Value>,
-    timeout_seconds: Option<f64>,
+    timeout: Option<Duration>,
     trace_id: &str,
 ) -> rmpv::Value {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -290,9 +358,20 @@ fn run_command(
     }
 
     let started = Instant::now();
-    let timeout_label = timeout_seconds
-        .map(|timeout| timeout.to_string())
+    let timeout_label = timeout
+        .map(|timeout| timeout.as_secs_f64().to_string())
         .unwrap_or_else(|| "none".to_string());
+    let deadline = match timeout {
+        Some(timeout) => match started.checked_add(timeout) {
+            Some(deadline) => Some(deadline),
+            None => {
+                return exec_argument_error(
+                    "args.timeout exceeds the supported execution deadline".into(),
+                )
+            }
+        },
+        None => None,
+    };
     execd_info!(
         "[execd-command] phase=spawn_start traceid={} timeout_seconds={}",
         sanitize_log_field(trace_id),
@@ -316,7 +395,6 @@ fn run_command(
         pid
     );
 
-    let deadline = timeout_seconds.map(|timeout| started + Duration::from_secs_f64(timeout));
     let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
@@ -483,16 +561,15 @@ pub(crate) fn dispatch_runtime_action_with_trace(
             })
         }
         "cmd_run" => {
-            let cmd = codec::kw_str(kw, "cmd")
-                .or_else(|| codec::kw_str(kw, "command"))
-                .unwrap_or_default();
-            let cwd = codec::kw_str(kw, "cwd").or_else(|| codec::kw_str(kw, "working_dir"));
-            let envs = kw.get("envs").or_else(|| kw.get("env"));
+            let args = match exec_args(kw) {
+                Ok(args) => args,
+                Err(error) => return Some(exec_argument_error(error)),
+            };
             Some(run_command(
-                &cmd,
-                cwd.as_deref(),
-                envs,
-                command_timeout(kw),
+                args.cmd,
+                args.cwd,
+                args.envs,
+                args.timeout,
                 trace_id,
             ))
         }
