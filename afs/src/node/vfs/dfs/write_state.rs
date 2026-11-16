@@ -575,9 +575,8 @@ impl DistributedFs {
 
     /// Meta definitively rejected this state's writes and every writer has left:
     /// they can never commit, and the failure was already returned or is retained
-    /// for the next writer. A state in this condition is discarded at the next
-    /// open for write (as Linux drops dirty pages after a reported writeback
-    /// failure); until then readers keep the Node's view.
+    /// for the next writer. A writable reopen discards this state only after
+    /// obtaining a fresh lease. Until then readers keep the Node's view.
     fn rejected_and_idle(state: &InodeWriteState) -> bool {
         state.terminal_error.is_some()
             && state.open_writers == 0
@@ -586,13 +585,6 @@ impl DistributedFs {
             && state.in_flight.is_none()
             && state.native_queue.values.is_empty()
             && state.native_thread.is_none()
-    }
-
-    fn write_state_is_rejected_and_idle(cell: &SharedInodeWriteState) -> Result<bool> {
-        let state = cell
-            .lock()
-            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-        Ok(Self::rejected_and_idle(&state))
     }
 
     fn discard_rejected_writes(state: &mut InodeWriteState) {
@@ -715,6 +707,67 @@ impl DistributedFs {
         Ok(())
     }
 
+    fn recover_rejected_write_state(
+        &self,
+        existing: &InodeWriteStateCell,
+        state: InodeWriteStateGuard<'_>,
+        inode: InodeRecord,
+        write_lease: WriteLease,
+    ) -> Result<()> {
+        if write_lease.inode_id != inode.inode_id
+            || Self::incoming_write_lease_is_older(&state, &write_lease)
+            || inode.revision < state.inode.revision
+            || (inode.revision == state.inode.revision
+                && inode.head_version != state.inode.head_version)
+        {
+            return Err(stale(
+                "DFS rejected write state has newer authority or file head",
+            ));
+        }
+        let previous_lease = state.write_lease.clone();
+        let previous_revision = state.inode.revision;
+        let previous_head = state.inode.head_version.clone();
+        let previous_sequence = state.next_write_seq;
+        let previous_error = state.terminal_error.clone();
+        drop(state);
+
+        let (base_version, base_layout) = self.load_version(inode.head_version.as_ref())?;
+        let logical_length = base_version.as_ref().map_or(0, |version| version.length);
+        let mut fresh_lease = write_lease.clone();
+        ensure_fresh(&mut fresh_lease, |lease| self.meta.renew_write_lease(lease))?;
+
+        let mut state = existing
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if !same_lease_identity(&write_lease, &fresh_lease) || should_renew(&fresh_lease) {
+            return Err(stale(
+                "DFS recovery did not obtain a fresh lease for this write authority",
+            ));
+        }
+        // A concurrent reopen or commit can advance this state while the RPC
+        // is in flight. Only clear the rejection that we took the snapshot of.
+        if !Self::rejected_and_idle(&state)
+            || state.write_lease != previous_lease
+            || state.inode.revision != previous_revision
+            || state.inode.head_version != previous_head
+            || state.next_write_seq != previous_sequence
+            || state.terminal_error != previous_error
+        {
+            return Err(stale("DFS rejected write state changed while recovering"));
+        }
+        Self::discard_rejected_writes(&mut state);
+        Self::apply_clean_fresh_write_state(
+            &mut state,
+            inode,
+            fresh_lease,
+            base_version,
+            base_layout,
+            logical_length,
+        );
+        existing.notify_all();
+        Ok(())
+    }
+
     pub(super) fn install_write_state(
         &self,
         inode: InodeRecord,
@@ -722,30 +775,13 @@ impl DistributedFs {
     ) -> Result<()> {
         self.ensure_local_write_owner(&write_lease)?;
         if let Some(existing) = self.write_state(&inode.inode_id)? {
-            if Self::write_state_is_rejected_and_idle(&existing)? {
-                let (base_version, base_layout) = self.load_version(inode.head_version.as_ref())?;
-                let logical_length = base_version.as_ref().map_or(0, |version| version.length);
-                let mut state = existing
-                    .lock()
-                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                if Self::rejected_and_idle(&state) {
-                    Self::discard_rejected_writes(&mut state);
-                    Self::apply_clean_fresh_write_state(
-                        &mut state,
-                        inode,
-                        write_lease,
-                        base_version,
-                        base_layout,
-                        logical_length,
-                    );
-                    existing.notify_all();
-                    return Ok(());
-                }
-            }
             {
                 let mut state = existing
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                if Self::rejected_and_idle(&state) {
+                    return self.recover_rejected_write_state(&existing, state, inode, write_lease);
+                }
                 if same_lease_identity(&state.write_lease, &write_lease) {
                     state.write_lease = merge_same_identity_lease(&state.write_lease, write_lease);
                     return Ok(());

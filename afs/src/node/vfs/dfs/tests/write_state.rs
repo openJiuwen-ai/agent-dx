@@ -917,3 +917,226 @@ fn dirty_write_state_rejects_fresh_epoch_without_losing_dirty_data() {
     assert!(state.dirty);
     assert_eq!(state.dirty_extents.dirty_data_bytes(), 5);
 }
+
+const REJECTED_WRITE_FILE: &str = "failed-writable-reopen";
+
+fn reject_closed_writer(fs: &DistributedFs, meta: &RecordingMeta) -> BackendInode {
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new(REJECTED_WRITE_FILE),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"kept").unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"rejected")
+        .unwrap();
+    meta.fail_next_commit_with(Error::coded(
+        afs_error::META_DFS_CONFLICT,
+        "rejected commit",
+    ));
+    fs.writeback_pending().unwrap();
+    assert_eq!(
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap_err()
+            .code(),
+        afs_error::META_DFS_CONFLICT,
+    );
+    let _ = fs.release(&context(), created.handle);
+    created.entry.inode
+}
+
+#[test]
+fn failed_writable_reopen_preserves_rejected_state() {
+    let (_temp, meta, fs) = test_fs();
+    let inode = reject_closed_writer(&fs, &meta);
+    let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+    let cell = fs.write_state(&inode_id).unwrap().unwrap();
+    let snapshot = || {
+        let state = cell.lock().unwrap();
+        (
+            state.write_lease.clone(),
+            state.terminal_error.clone(),
+            state.dirty_extents.dirty_data_bytes(),
+        )
+    };
+    let before = snapshot();
+    assert!(before.1.is_some());
+    assert_eq!(before.2, b"rejected".len() as u64);
+    {
+        let mut reply = meta.lease.lock().unwrap();
+        reply.lease_epoch = before.0.lease_epoch + 1;
+        reply.expires_at_unix_ms = now_unix_ms().saturating_sub(1);
+    }
+    meta.fail_next_renew_with(Error::coded(
+        afs_error::META_DFS_CONFLICT,
+        "renew rejected: grant expired in transit",
+    ));
+    let err = fs.open(&context(), inode, libc::O_RDWR).unwrap_err();
+    assert_eq!(err.code(), afs_error::META_DFS_CONFLICT);
+    assert!(err.message().contains("grant expired in transit"));
+    assert_eq!(snapshot(), before);
+
+    let expired = meta.lease.lock().unwrap().clone();
+    let mut wrong_epoch = expired.clone();
+    wrong_epoch.expires_at_unix_ms = now_unix_ms() + 30_000;
+    wrong_epoch.lease_epoch += 1;
+    for invalid in [expired.clone(), wrong_epoch] {
+        meta.queue_renew_result(Ok(invalid));
+        let err = fs.open(&context(), inode, libc::O_RDWR).unwrap_err();
+        assert_eq!(err.code(), afs_error::NODE_DFS_STALE_HANDLE);
+        assert_eq!(snapshot(), before);
+    }
+
+    let fresh = meta.lease_with_expiry(now_unix_ms() + 30_000);
+    meta.queue_renew_result(Ok(fresh.clone()));
+    let renews = meta.renew_call_count();
+    let handle = fs.open(&context(), inode, libc::O_RDWR).unwrap();
+    assert_eq!(meta.renew_call_count(), renews + 1);
+    assert_eq!(snapshot(), (fresh.clone(), None, 0));
+    *meta.lease.lock().unwrap() = fresh;
+    let mut body = [0; 4];
+    assert_eq!(fs.read(&context(), handle, 0, &mut body).unwrap(), 4);
+    assert_eq!(&body, b"kept");
+    fs.write(&context(), handle, 0, b"next").unwrap();
+    fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+    fs.release(&context(), handle).unwrap();
+
+    let renews = meta.renew_call_count();
+    let handle = fs.open(&context(), inode, libc::O_RDWR).unwrap();
+    assert_eq!(meta.renew_call_count(), renews);
+    assert_eq!(fs.read(&context(), handle, 0, &mut body).unwrap(), 4);
+    assert_eq!(&body, b"next");
+    fs.release(&context(), handle).unwrap();
+}
+
+#[test]
+fn delayed_reopen_renewal_cannot_overwrite_concurrent_recovery() {
+    let (_temp, meta, fs) = test_fs();
+    let inode = reject_closed_writer(&fs, &meta);
+
+    let delayed_lease = {
+        let mut lease = meta.lease.lock().unwrap();
+        lease.lease_epoch += 1;
+        lease.expires_at_unix_ms = now_unix_ms() + 1_000;
+        let mut delayed = lease.clone();
+        delayed.expires_at_unix_ms = now_unix_ms() + 30_000;
+        delayed
+    };
+    meta.queue_renew_result(Ok(delayed_lease.clone()));
+    let pause = meta.pause_next_renew();
+
+    std::thread::scope(|scope| {
+        let pending = scope.spawn(|| fs.open(&context(), inode, libc::O_RDWR));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pause.was_reached() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if !pause.was_reached() {
+            pause.release();
+            panic!("reopen did not reach lease renewal");
+        }
+
+        let current_lease = {
+            let mut lease = meta.lease.lock().unwrap();
+            lease.lease_epoch = delayed_lease.lease_epoch + 1;
+            lease.expires_at_unix_ms = now_unix_ms() + 30_000;
+            lease.clone()
+        };
+        let (send, receive) = std::sync::mpsc::channel();
+        scope.spawn({
+            let fs = &fs;
+            move || {
+                let handle = fs.open(&context(), inode, libc::O_RDWR).unwrap();
+                fs.write(&context(), handle, 0, b"winner").unwrap();
+                fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+                fs.release(&context(), handle).unwrap();
+                send.send(()).unwrap();
+            }
+        });
+        let concurrent = receive.recv_timeout(Duration::from_secs(5));
+        pause.release();
+        let delayed = pending.join().unwrap();
+
+        concurrent.expect("a new writer must progress while the earlier renewal is paused");
+        assert_eq!(
+            delayed.unwrap_err().code(),
+            afs_error::NODE_DFS_STALE_HANDLE,
+        );
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        assert_eq!(cell.lock().unwrap().write_lease, current_lease);
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let mut body = [0; 6];
+        assert_eq!(fs.read(&context(), reader, 0, &mut body).unwrap(), 6);
+        assert_eq!(&body, b"winner");
+        fs.release(&context(), reader).unwrap();
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires Linux /dev/fuse and fusermount3"]
+fn fuse_failed_writable_reopen_keeps_state_and_a_new_reopen_recovers() {
+    use std::{fs::OpenOptions, os::unix::fs::FileExt};
+
+    let (temp, meta, fs) = test_fs();
+    reject_closed_writer(&fs, &meta);
+    let mut root = meta.inode.lock().unwrap().clone();
+    let cell = fs.write_state(&root.inode_id).unwrap().unwrap();
+    let old_lease = cell.lock().unwrap().write_lease.clone();
+    root.inode_id = fs.inode_id(fs.root_inode()).unwrap();
+    root.kind = InodeKind::Directory;
+    root.head_version = None;
+    root.attributes.mode = 0o755;
+    root.attributes.nlink = 2;
+    *meta.files.lock().unwrap() = Some(HashMap::from([(root.inode_id.clone(), root)]));
+    let mount = temp.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _runtime_guard = runtime.enter();
+    let session = crate::node::fuse::mount_dfs(Arc::new(fs), &mount).unwrap();
+    let path = mount.join(REJECTED_WRITE_FILE);
+    let open = || OpenOptions::new().read(true).write(true).open(&path);
+
+    let mut current = old_lease.clone();
+    current.lease_epoch += 1;
+    current.expires_at_unix_ms = now_unix_ms().saturating_sub(1);
+    *meta.lease.lock().unwrap() = current.clone();
+    meta.fail_next_renew_with(Error::coded(
+        afs_error::IO_TIMEOUT,
+        "injected reopen renewal timeout",
+    ));
+    let renews = meta.renew_call_count();
+    assert_eq!(open().unwrap_err().raw_os_error(), Some(libc::ETIMEDOUT));
+    assert_eq!(meta.renew_call_count(), renews + 1);
+    {
+        let state = cell.lock().unwrap();
+        assert_eq!(state.write_lease, old_lease);
+        assert!(state.terminal_error.is_some());
+        assert_eq!(
+            state.dirty_extents.dirty_data_bytes(),
+            b"rejected".len() as u64,
+        );
+    }
+
+    current.expires_at_unix_ms = now_unix_ms() + 30_000;
+    *meta.lease.lock().unwrap() = current;
+    let file = open().unwrap();
+    let mut body = [0; 4];
+    file.read_exact_at(&mut body, 0).unwrap();
+    assert_eq!(&body, b"kept");
+    file.write_all_at(b"next", 0).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert_eq!(std::fs::read(&path).unwrap(), b"next");
+    session.join().unwrap();
+}
