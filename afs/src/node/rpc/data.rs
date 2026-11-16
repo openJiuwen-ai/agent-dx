@@ -1688,6 +1688,80 @@ impl PeerAuthenticator for MtlsPeerAuthenticator {
     }
 }
 
+/// Temporary-validation peer identity: the source address stands for the Node.
+///
+/// Used only by `tls_mode = "insecure"`, where no certificate identity exists.
+/// The map is the configured `trusted_node_ips`; a connection whose source IP
+/// is not listed fails closed exactly like an unknown certificate DER does in
+/// [`MtlsPeerAuthenticator`]. This is weaker than a certificate: any process on
+/// a listed host can claim that Node id, and a listed address can be spoofed
+/// from the same network segment. That is why the mode is a non-product option.
+#[derive(Clone, Debug)]
+pub struct IpPeerAuthenticator {
+    node_id_by_ip: Arc<HashMap<std::net::IpAddr, String>>,
+}
+
+impl IpPeerAuthenticator {
+    pub fn new<I>(trusted_node_ips: I) -> afs_error::Result<Self>
+    where
+        I: IntoIterator<Item = (String, std::net::IpAddr)>,
+    {
+        let mut node_id_by_ip = HashMap::new();
+        for (node_id, address) in trusted_node_ips {
+            if node_id.is_empty() {
+                return Err(afs_error::Error::coded(
+                    afs_error::CLIENT_ARGUMENT_INVALID,
+                    "trusted node address node_id is empty",
+                ));
+            }
+            if address.is_ipv6() {
+                return Err(afs_error::Error::coded(
+                    afs_error::CLIENT_ARGUMENT_INVALID,
+                    format!("trusted node address for {node_id} must be IPv4"),
+                ));
+            }
+            if let Some(previous) = node_id_by_ip.insert(address, node_id.clone()) {
+                return Err(afs_error::Error::coded(
+                    afs_error::CLIENT_ARGUMENT_INVALID,
+                    format!("the same address is configured for both {previous} and {node_id}"),
+                ));
+            }
+        }
+        Ok(Self {
+            node_id_by_ip: Arc::new(node_id_by_ip),
+        })
+    }
+}
+
+impl PeerAuthenticator for IpPeerAuthenticator {
+    fn authenticate(
+        &self,
+        metadata: &MetadataMap,
+        remote_addr: Option<SocketAddr>,
+        peer_cert_der: Option<&[u8]>,
+    ) -> afs_error::Result<String> {
+        let _ = (metadata, peer_cert_der);
+        // A missing address is not "trusted": tonic keeps the peer address on
+        // both the TLS and the plaintext incoming stream, so it should always
+        // be present. Treat its absence as a refused peer, never a pass.
+        let Some(remote_addr) = remote_addr else {
+            return Err(afs_error::Error::coded(
+                afs_error::NODE_OWNER_INVALID_GRANT,
+                "peer connection has no observable source address",
+            ));
+        };
+        self.node_id_by_ip
+            .get(&remote_addr.ip())
+            .cloned()
+            .ok_or_else(|| {
+                afs_error::Error::coded(
+                    afs_error::NODE_OWNER_INVALID_GRANT,
+                    "peer source address is not a configured node",
+                )
+            })
+    }
+}
+
 /// OwnerFs 远端文件数据面入口。
 ///
 /// 无 handler 的默认实例继续返回 UNIMPLEMENTED，避免把 diagnostics 的 Storage
@@ -2636,6 +2710,107 @@ mod owner_tests {
             .authenticate(&MetadataMap::new(), None, None)
             .expect_err("OwnerFiles must not accept unauthenticated peers");
         assert_eq!(error.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+    }
+
+    #[test]
+    fn ip_authenticator_binds_peer_identity_to_the_source_address() {
+        let authenticator = IpPeerAuthenticator::new(vec![(
+            "node-b".to_owned(),
+            "192.168.2.213".parse().unwrap(),
+        )])
+        .expect("trusted address config should be valid");
+        let authenticated = authenticator
+            .authenticate(
+                &MetadataMap::new(),
+                Some("192.168.2.213:40000".parse().unwrap()),
+                None,
+            )
+            .expect("a listed source address should authenticate");
+        assert_eq!(authenticated, "node-b");
+    }
+
+    #[test]
+    fn ip_authenticator_ignores_the_port_and_accepts_any_local_port() {
+        let authenticator = IpPeerAuthenticator::new(vec![(
+            "node-b".to_owned(),
+            "192.168.2.213".parse().unwrap(),
+        )])
+        .expect("trusted address config should be valid");
+        for port in [1_u16, 40_000, 65_535] {
+            let authenticated = authenticator
+                .authenticate(
+                    &MetadataMap::new(),
+                    Some(format!("192.168.2.213:{port}").parse().unwrap()),
+                    None,
+                )
+                .expect("the port is not part of the identity");
+            assert_eq!(authenticated, "node-b");
+        }
+    }
+
+    #[test]
+    fn ip_authenticator_fails_closed_for_unknown_or_absent_addresses() {
+        let authenticator = IpPeerAuthenticator::new(vec![(
+            "node-b".to_owned(),
+            "192.168.2.213".parse().unwrap(),
+        )])
+        .expect("trusted address config should be valid");
+        // An address that is not configured must be refused, not defaulted.
+        let unknown = authenticator
+            .authenticate(
+                &MetadataMap::new(),
+                Some("192.168.2.99:40000".parse().unwrap()),
+                None,
+            )
+            .expect_err("an unlisted source address must not authenticate");
+        assert_eq!(unknown.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+        // A missing address is not "trusted by default" either.
+        let absent = authenticator
+            .authenticate(&MetadataMap::new(), None, None)
+            .expect_err("a peer without an observable address must not authenticate");
+        assert_eq!(absent.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+    }
+
+    #[test]
+    fn ip_authenticator_does_not_accept_a_certificate_as_identity() {
+        // The two authenticators must not silently stand in for each other:
+        // in insecure mode a valid-looking DER confers no identity.
+        let authenticator = IpPeerAuthenticator::new(vec![(
+            "node-b".to_owned(),
+            "192.168.2.213".parse().unwrap(),
+        )])
+        .expect("trusted address config should be valid");
+        let error = authenticator
+            .authenticate(
+                &MetadataMap::new(),
+                Some("192.168.2.99:40000".parse().unwrap()),
+                Some(&[1, 2, 3]),
+            )
+            .expect_err("a certificate must not substitute for the source address");
+        assert_eq!(error.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+    }
+
+    #[test]
+    fn ip_authenticator_rejects_ambiguous_address_config() {
+        let duplicate = IpPeerAuthenticator::new(vec![
+            ("node-a".to_owned(), "192.168.2.213".parse().unwrap()),
+            ("node-b".to_owned(), "192.168.2.213".parse().unwrap()),
+        ])
+        .expect_err("one address cannot identify two nodes");
+        assert_eq!(duplicate.code(), afs_error::CLIENT_ARGUMENT_INVALID);
+
+        let empty =
+            IpPeerAuthenticator::new(vec![(String::new(), "192.168.2.213".parse().unwrap())])
+                .expect_err("an empty node id is never valid");
+        assert_eq!(empty.code(), afs_error::CLIENT_ARGUMENT_INVALID);
+    }
+
+    #[test]
+    fn ip_authenticator_rejects_ipv6_like_the_rest_of_the_deployment_boundary() {
+        let error =
+            IpPeerAuthenticator::new(vec![("node-b".to_owned(), "2001:db8::1".parse().unwrap())])
+                .expect_err("the deployment boundary is IPv4");
+        assert_eq!(error.code(), afs_error::CLIENT_ARGUMENT_INVALID);
     }
 
     #[test]

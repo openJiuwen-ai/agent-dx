@@ -118,6 +118,9 @@ impl Config {
         if self.dfs_read_diagnostics_enabled {
             options.push(("dfs_read_diagnostics_enabled", "diagnostic"));
         }
+        if self.tls_mode == super::TlsMode::Insecure {
+            options.push(("tls_mode=insecure", "insecure"));
+        }
         options
     }
 

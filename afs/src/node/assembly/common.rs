@@ -134,7 +134,40 @@ impl<'a> Startup<'a> {
     }
 }
 
-/// Storage opened before registration (段 2).
+/// The one place a Node decides how a peer proves which Node it is.
+///
+/// `Mutual` binds a verified certificate leaf DER to a Node id from
+/// `trusted_node_certs`. `Insecure` binds the connection source IP to a Node id
+/// from `trusted_node_ips`; it exists only for temporary validation
+/// deployments without certificate distribution and is a non-product option.
+/// Both are constructed once and shared by every peer-facing service so the
+/// five injection points cannot disagree.
+pub(super) fn peer_authenticator(
+    cfg: &Config,
+) -> Result<Arc<dyn crate::node::rpc::data::PeerAuthenticator>, BoxError> {
+    match cfg.tls_mode {
+        crate::config::TlsMode::Insecure => {
+            Ok(Arc::new(crate::node::rpc::data::IpPeerAuthenticator::new(
+                cfg.trusted_node_ips
+                    .iter()
+                    .map(|(node_id, address)| (node_id.clone(), *address)),
+            )?))
+        }
+        crate::config::TlsMode::Mutual => {
+            let trusted = cfg
+                .trusted_node_certs
+                .iter()
+                .map(|(node_id, path)| {
+                    Ok((node_id.clone(), crate::config::read_certificate_der(path)?))
+                })
+                .collect::<afs_error::Result<Vec<_>>>()?;
+            Ok(Arc::new(
+                crate::node::rpc::data::MtlsPeerAuthenticator::new(trusted)?,
+            ))
+        }
+    }
+}
+
 pub(super) struct NodeStorage {
     #[cfg(feature = "dfs")]
     pub(super) dfs: dfs::DfsStorage,

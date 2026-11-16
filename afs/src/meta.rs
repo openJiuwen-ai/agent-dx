@@ -389,6 +389,20 @@ fn kv_log_options(
 fn peer_identity_policy(
     cfg: &Config,
 ) -> Result<(HashMap<Vec<u8>, String>, bool), afs_error::Error> {
+    // `insecure` carries no certificate identity. Meta then trusts the node id
+    // a request declares, exactly as `authenticated_node_id` already does when
+    // `enforce_peer_identity` is false; the source-IP allow-list is enforced by
+    // the Node-side peer authenticator, which is the only place a peer address
+    // is observable. Startup still refuses to serve a filesystem authority
+    // without a configured Node set.
+    if cfg.tls_mode == crate::config::TlsMode::Insecure {
+        if !cfg.trusted_node_certs.is_empty() {
+            return Err(config_invalid(
+                "tls_mode = \"insecure\" cannot be combined with trusted_node_certs",
+            ));
+        }
+        return Ok((HashMap::new(), false));
+    }
     let trusted_nodes_by_der = load_trusted_node_certs(&cfg.trusted_node_certs)?;
     let enforce_peer_identity = cfg.ownerfs || cfg.dfs;
     if enforce_peer_identity && trusted_nodes_by_der.is_empty() {
@@ -868,6 +882,82 @@ mod tests {
             assert!(coded.to_string().contains("mTLS transport"));
             assert!(!dir.path().join("must-not-be-created").exists());
         }
+    }
+
+    #[test]
+    fn insecure_authority_skips_certificate_identity_instead_of_requiring_it() {
+        // The two anti-patterns above stay refused, but the explicit
+        // `insecure` mode is not a half-configured mTLS: it deliberately has
+        // no certificate identity, so Meta approves the policy and turns
+        // enforcement off. `authenticated_node_id` then returns no identity,
+        // and every authority RPC trusts the node id declared in the request.
+        for (ownerfs, dfs) in [(true, false), (false, true), (true, true)] {
+            let mut cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
+            cfg.ownerfs = ownerfs;
+            cfg.dfs = dfs;
+            cfg.tls_mode = crate::config::TlsMode::Insecure;
+
+            let (trusted, enforced) = peer_identity_policy(&cfg).unwrap();
+            assert!(
+                trusted.is_empty(),
+                "no certificate table exists in this mode"
+            );
+            assert!(!enforced, "there is no certificate identity to enforce");
+        }
+    }
+
+    #[test]
+    fn insecure_authority_still_rejects_a_certificate_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("node.der");
+        std::fs::write(&cert, [1, 2, 3, 4]).unwrap();
+        let mut cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
+        cfg.dfs = true;
+        cfg.tls_mode = crate::config::TlsMode::Insecure;
+        cfg.trusted_node_certs.insert("node-a".into(), cert);
+
+        let error = peer_identity_policy(&cfg).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+        assert!(error.to_string().contains("trusted_node_certs"));
+    }
+
+    #[tokio::test]
+    async fn insecure_meta_opens_its_backend_and_listeners_without_certificates() {
+        // The end-to-end claim for P2: a certificate-free Meta actually
+        // reaches service startup instead of failing the identity policy.
+        let dir = tempfile::tempdir().unwrap();
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let grpc_listen = occupied.local_addr().unwrap();
+        drop(occupied);
+        let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest_listen = rest.local_addr().unwrap();
+        drop(rest);
+
+        let mut cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
+        cfg.ownerfs = true;
+        cfg.dfs = true;
+        cfg.tls_mode = crate::config::TlsMode::Insecure;
+        cfg.grpc_listen = grpc_listen;
+        cfg.rest_listen = rest_listen;
+        cfg.meta_store = MetaStoreBackend::LocalFile;
+        cfg.data_dir = dir.path().join("data");
+
+        // `run` serves until shutdown; reaching the store means the identity
+        // policy and transport setup both succeeded. Bound it so the test
+        // cannot hang on a successful server.
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(500),
+            run(cfg, Observability::new().unwrap()),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "insecure Meta should keep serving, not exit: {outcome:?}"
+        );
+        assert!(
+            dir.path().join("data").join("meta-store").exists(),
+            "the durable backend must have been opened"
+        );
     }
 
     #[test]

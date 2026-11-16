@@ -81,6 +81,24 @@ pub enum DataMode {
     Rdma,
     Auto,
 }
+/// Internal transport trust mode.
+///
+/// `Mutual` is the product mode: every internal TCP/gRPC relation verifies a
+/// mutual TLS certificate and binds the leaf DER to one Node id through
+/// `trusted_node_certs`.
+///
+/// `Insecure` exists for temporary validation deployments that have no
+/// certificate distribution yet. It disables certificate identity entirely and
+/// resolves a peer Node id from the source IP in `trusted_node_ips`. It is a
+/// non-product option: it is logged, listed by
+/// [`Config::non_product_options`], and cannot be combined with any `tls_*`
+/// field, `trusted_node_certs`, or `tls_encryption_enabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    Mutual,
+    Insecure,
+}
 /// `dfs_local_copy`: whether the writing Node must hold a replica. Meta persists
 /// the choice as [`crate::dfs::LocalCopyPolicy`] when it initializes the filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -389,6 +407,10 @@ pub struct Cli {
     /// 对外发布的本 Node gRPC URI；监听 0.0.0.0 时必须显式指定。
     #[arg(long)]
     pub advertise_endpoint: Option<String>,
+    /// Internal transport trust mode: `mutual` (default, certificates) or
+    /// `insecure` (temporary validation only, source-IP peer identity).
+    #[arg(long, value_enum)]
+    pub tls_mode: Option<TlsMode>,
     /// Encrypt AFS internal traffic after mutual certificate authentication (default false).
     #[arg(long)]
     pub tls_encryption_enabled: Option<bool>,
@@ -643,6 +665,7 @@ struct FileConfig {
     ownerfs_mkdir_load_balance: Option<bool>,
     peer_endpoint: Option<String>,
     advertise_endpoint: Option<String>,
+    tls_mode: Option<TlsMode>,
     tls_encryption_enabled: Option<bool>,
     tls_ca_certificate: Option<PathBuf>,
     tls_identity_certificate: Option<PathBuf>,
@@ -650,6 +673,10 @@ struct FileConfig {
     tls_server_name: Option<String>,
     /// TLS 验证后再用证书 DER 的完整字节绑定 Node ID；仅由受信管理配置设置。
     trusted_node_certs: Option<HashMap<String, PathBuf>>,
+    /// `tls_mode = "insecure"` only: Node id -> the source IP that Node dials
+    /// from. Replaces `trusted_node_certs`; the two tables are mutually
+    /// exclusive. Only TOML.
+    trusted_node_ips: Option<HashMap<String, std::net::IpAddr>>,
     fs: Option<String>,
     data_mode: Option<DataMode>,
     rdma_device: Option<String>,
@@ -784,12 +811,15 @@ pub struct Config {
     pub ownerfs_mkdir_load_balance: bool,
     pub peer_endpoint: Option<String>,
     pub advertise_endpoint: Option<String>,
+    pub tls_mode: TlsMode,
     pub tls_encryption_enabled: bool,
     pub tls_ca_certificate: Option<PathBuf>,
     pub tls_identity_certificate: Option<PathBuf>,
     pub tls_identity_private_key: Option<PathBuf>,
     pub tls_server_name: Option<String>,
     pub trusted_node_certs: HashMap<String, PathBuf>,
+    /// `tls_mode = "insecure"` only; empty in every other mode.
+    pub trusted_node_ips: HashMap<String, std::net::IpAddr>,
     pub ownerfs: bool,
     pub dfs: bool,
     pub data_mode: DataMode,
@@ -888,6 +918,9 @@ impl Config {
             ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
         });
         let outlet = outlet::resolve(&cli, &file, grpc_listen)?;
+        // Hoisted like `grpc_listen`: the mode decides which of the two
+        // trusted-peer tables is meaningful, and `merge` consumes `cli`/`file`.
+        let tls_mode = tls::resolve_mode(&cli, &file);
         let resolved = Resolved {
             id,
             ownerfs,
@@ -903,12 +936,12 @@ impl Config {
             grpc_listen,
             outlet,
         };
-        let cfg = Self::merge(role, cli, file, resolved);
+        let cfg = Self::merge(role, cli, file, resolved, tls_mode);
         dfs::validate_storage(role, &cfg)?;
         common::validate_process(&cfg)?;
         ownerfs::validate(role, &cfg)?;
         cross::validate_mounts(&cfg)?;
-        tls::validate(&cfg)?;
+        tls::validate(role, &cfg)?;
         cross::validate_read_crc(&cfg)?;
         cfg.meta_log_limits()?;
         cfg.meta_store_target()?;
@@ -924,7 +957,13 @@ impl Config {
 
     /// The configuration literal: CLI over TOML over defaults for the plain
     /// values, the domain results for the rest. Pure; no check runs here.
-    fn merge(role: Role, cli: Cli, file: FileConfig, resolved: Resolved) -> Self {
+    fn merge(
+        role: Role,
+        cli: Cli,
+        file: FileConfig,
+        resolved: Resolved,
+        tls_mode: TlsMode,
+    ) -> Self {
         let Resolved {
             id,
             ownerfs,
@@ -972,6 +1011,7 @@ impl Config {
             ownerfs_mkdir_load_balance: meta.ownerfs_mkdir_load_balance,
             peer_endpoint: cli.peer_endpoint.or(file.peer_endpoint),
             advertise_endpoint: cli.advertise_endpoint.or(file.advertise_endpoint),
+            tls_mode,
             tls_encryption_enabled: cli
                 .tls_encryption_enabled
                 .or(file.tls_encryption_enabled)
@@ -985,6 +1025,7 @@ impl Config {
                 .or(file.tls_identity_private_key),
             tls_server_name: cli.tls_server_name.or(file.tls_server_name),
             trusted_node_certs: file.trusted_node_certs.unwrap_or_default(),
+            trusted_node_ips: file.trusted_node_ips.unwrap_or_default(),
             data_dir: cli
                 .data_dir
                 .or(file.data_dir)

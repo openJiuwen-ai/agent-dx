@@ -273,7 +273,7 @@ pub(super) async fn mount_fuse(
 /// The `OwnerControl` gRPC service: OwnerFs locks and RDMA registry (段 18).
 pub(super) fn owner_control_server(
     state: &Node,
-    dfs_trusted: &[(String, Vec<u8>)],
+    peer_identity: &Arc<dyn rpc::data::PeerAuthenticator>,
     owner_rdma_sessions: &rpc::control::RdmaSessionRegistry,
     lock_waits: rpc::control::BlockingLockWaits,
 ) -> Result<
@@ -285,10 +285,7 @@ pub(super) fn owner_control_server(
     let control = rpc::control::OwnerControlService::new(lock_waits);
     let control = if let Some(owner) = state.ownerfs.as_ref() {
         control
-            .with_owner_locks(
-                owner.peer_executor()?,
-                Arc::new(rpc::data::MtlsPeerAuthenticator::new(dfs_trusted.to_vec())?),
-            )
+            .with_owner_locks(owner.peer_executor()?, peer_identity.clone())
             .with_owner_rdma_registry(owner_rdma_sessions.clone())
     } else {
         control
@@ -307,14 +304,7 @@ pub(super) fn owner_files_server(
     BoxError,
 > {
     let owner_files = if let Some(ownerfs) = state.ownerfs.as_ref() {
-        let trusted = cfg
-            .trusted_node_certs
-            .iter()
-            .map(|(node_id, path)| {
-                Ok((node_id.clone(), crate::config::read_certificate_der(path)?))
-            })
-            .collect::<afs_error::Result<Vec<_>>>()?;
-        let authenticator = Arc::new(rpc::data::MtlsPeerAuthenticator::new(trusted)?);
+        let authenticator = super::common::peer_authenticator(cfg)?;
         let handler = rpc::data::make_owner_files_handler(ownerfs.peer_executor()?);
         rpc::data::make_owner_files_server_with_handler_metrics_and_rdma(
             handler,
