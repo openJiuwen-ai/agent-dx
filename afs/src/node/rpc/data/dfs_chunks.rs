@@ -2,7 +2,14 @@
 
 use super::*;
 
-// Draft data.rs additions, keeping transport resources inside the existing RPC module.
+#[cfg(feature = "dfs")]
+const REPLICA_RECEIVE_SLOTS: usize = 8;
+
+#[cfg(feature = "dfs")]
+struct ReplicaAdmission {
+    _receive: tokio::sync::OwnedSemaphorePermit,
+    _forward: Option<tokio::sync::OwnedSemaphorePermit>,
+}
 #[cfg(feature = "dfs")]
 #[derive(Clone)]
 pub struct DfsPayloadMetrics {
@@ -77,6 +84,8 @@ pub struct DfsChunksService {
     pub(super) replica_authorizer: Arc<dyn DfsReplicaAuthorizer>,
     pub(super) replica_data_plane: Option<Arc<dyn crate::node::replication::ReplicaDataPlane>>,
     pub(super) replica_permits: Arc<tokio::sync::Semaphore>,
+    pub(super) replica_forward_permits: Arc<tokio::sync::Semaphore>,
+    pub(super) replica_authorization_permits: Arc<tokio::sync::Semaphore>,
     pub(super) read_permits: Arc<tokio::sync::Semaphore>,
     pub(super) replica_timeout: std::time::Duration,
     pub(super) rdma_sessions: super::super::control::RdmaSessionRegistry,
@@ -139,7 +148,9 @@ pub fn make_dfs_chunks_server_with_transport(
         authorizer,
         replica_authorizer,
         replica_data_plane,
-        replica_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+        replica_permits: Arc::new(tokio::sync::Semaphore::new(REPLICA_RECEIVE_SLOTS)),
+        replica_forward_permits: Arc::new(tokio::sync::Semaphore::new(REPLICA_RECEIVE_SLOTS - 1)),
+        replica_authorization_permits: Arc::new(tokio::sync::Semaphore::new(REPLICA_RECEIVE_SLOTS)),
         read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         replica_timeout,
         rdma_sessions: resources.rdma_sessions,
@@ -150,31 +161,71 @@ pub fn make_dfs_chunks_server_with_transport(
 
 #[cfg(feature = "dfs")]
 impl DfsChunksService {
-    /// Replica receive admission: take a slot at once, else queue until
-    /// `deadline` (R71b). Two writers sharing a target can exceed its slots;
-    /// that is backpressure, not an error. While queued, the sender's stream
-    /// waits on HTTP/2 flow control. Repair transfers share the same FIFO
-    /// semaphore, so neither side starves.
+    /// Authorize the hop before deciding whether it can use the slot reserved
+    /// for a terminal hop. Bound blocking authorization independently of the
+    /// receive path, including detached work after the caller times out.
+    async fn authorize_replica(
+        &self,
+        peer: String,
+        header: afs_protocol::node_data::DfsPutReplicaHeader,
+        deadline: tokio::time::Instant,
+    ) -> Result<AuthorizedReplicaWrite, Status> {
+        tokio::time::timeout_at(deadline, async {
+            let slot = self
+                .replica_authorization_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| Status::unavailable("DFS replica authorization is closed"))?;
+            let authorizer = self.replica_authorizer.clone();
+            crate::node::bridge::spawn_blocking(move || {
+                let _slot = slot;
+                authorizer.authorize(&peer, &header)
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .map_err(error_to_status)
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("DFS replica authorization deadline exceeded"))?
+    }
+
+    /// A forwarding hop can keep a receive slot while waiting for its peer.
+    /// Leave one slot available to terminal hops and queue before taking a
+    /// receive slot. All admission uses the original transfer deadline.
     async fn admit_replica(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        grant: &AuthorizedReplicaWrite,
+    ) -> Result<ReplicaAdmission, Status> {
+        let admission = async {
+            let (forward, forward_waited) = if grant.op.chain_tail.is_empty() {
+                (None, false)
+            } else {
+                let (permit, waited) =
+                    Self::take_replica_slot(&self.replica_forward_permits).await?;
+                (Some(permit), waited)
+            };
+            let (receive, receive_waited) = Self::take_replica_slot(&self.replica_permits).await?;
+            Ok((
+                ReplicaAdmission {
+                    _receive: receive,
+                    _forward: forward,
+                },
+                forward_waited || receive_waited,
+            ))
+        };
         let count = |outcome| {
             if let Some(metrics) = &self.payload_metrics {
                 metrics.admission("replica", outcome);
             }
         };
-        if let Ok(permit) = self.replica_permits.clone().try_acquire_owned() {
-            count("immediate");
-            return Ok(permit);
-        }
-        match tokio::time::timeout_at(deadline, self.replica_permits.clone().acquire_owned()).await
-        {
-            Ok(Ok(permit)) => {
-                count("waited");
-                Ok(permit)
+        match tokio::time::timeout_at(deadline, admission).await {
+            Ok(Ok((admission, waited))) => {
+                count(if waited { "waited" } else { "immediate" });
+                Ok(admission)
             }
-            Ok(Err(_)) => Err(Status::unavailable("DFS replica admission is closed")),
+            Ok(Err(error)) => Err(error),
             Err(_) => {
                 count("rejected");
                 Err(Status::resource_exhausted(
@@ -182,6 +233,20 @@ impl DfsChunksService {
                 ))
             }
         }
+    }
+
+    async fn take_replica_slot(
+        slots: &Arc<tokio::sync::Semaphore>,
+    ) -> Result<(tokio::sync::OwnedSemaphorePermit, bool), Status> {
+        if let Ok(permit) = slots.clone().try_acquire_owned() {
+            return Ok((permit, false));
+        }
+        slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map(|permit| (permit, true))
+            .map_err(|_| Status::unavailable("DFS replica admission is closed"))
     }
 }
 
@@ -199,40 +264,34 @@ impl DfsChunks for DfsChunksService {
         let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
         // One absolute deadline covers queueing and the transfer.
         let deadline = tokio::time::Instant::now() + self.replica_timeout;
-        let permit = self.admit_replica(deadline).await?;
         let local = self
             .local_chunks
             .clone()
             .ok_or_else(|| Status::failed_precondition("local chunk store is not configured"))?;
-        let authorizer = self.replica_authorizer.clone();
         let plane = self.replica_data_plane.clone();
         let metrics = self.payload_metrics.clone();
         let mut stream = request.into_inner();
-        tokio::time::timeout_at(deadline, async move {
+        let header = tokio::time::timeout_at(deadline, async {
             let first = stream
                 .message()
                 .await?
                 .ok_or_else(|| Status::invalid_argument("replica stream requires a header"))?;
-            let header = match first.body {
-                Some(Body::Header(header)) => header,
-                _ => {
-                    return Err(Status::invalid_argument(
-                        "first replica frame must be the header",
-                    ));
-                }
-            };
-            let digest = replica_header_digest(&header).map_err(error_to_status)?;
-            let auth_header = header.clone();
-            // The permit follows blocking work: cancellation cannot release a
-            // slot while its unabortable authority/persistence task is running.
-            let (grant, permit) = crate::node::bridge::spawn_blocking(move || {
-                authorizer
-                    .authorize(&peer, &auth_header)
-                    .map(|grant| (grant, permit))
-            })
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
-            .map_err(error_to_status)?;
+            match first.body {
+                Some(Body::Header(header)) => Ok(header),
+                _ => Err(Status::invalid_argument(
+                    "first replica frame must be the header",
+                )),
+            }
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("DFS replica header deadline exceeded"))??;
+        let digest = replica_header_digest(&header).map_err(error_to_status)?;
+        let grant = self
+            .authorize_replica(peer, header.clone(), deadline)
+            .await?;
+        let admission = self.admit_replica(deadline, &grant).await?;
+        ensure_replica_grant_live(grant.expires_at_unix_ms).map_err(error_to_status)?;
+        tokio::time::timeout_at(deadline, async move {
             let mut bytes = Vec::with_capacity(header.chunk_length as usize);
             while let Some(frame) = stream.message().await? {
                 match frame.body {
@@ -277,7 +336,7 @@ impl DfsChunks for DfsChunksService {
                 ));
             }
             let acks = crate::node::bridge::spawn_blocking(move || {
-                let _permit = permit;
+                let _admission = admission;
                 persist_dfs_replica(&local, plane, grant, staged)
             })
             .await
@@ -318,21 +377,14 @@ impl DfsChunks for DfsChunksService {
                 ));
             }
             let deadline = tokio::time::Instant::now() + self.replica_timeout;
-            let permit = self.admit_replica(deadline).await?;
             let local = self
                 .local_chunks
                 .clone()
                 .ok_or_else(|| Status::failed_precondition("local ChunkStore is absent"))?;
-            let authorizer = self.replica_authorizer.clone();
-            let auth_header = header.clone();
-            let (grant, permit) = crate::node::bridge::spawn_blocking(move || {
-                authorizer
-                    .authorize(&peer, &auth_header)
-                    .map(|grant| (grant, permit))
-            })
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
-            .map_err(error_to_status)?;
+            let grant = self
+                .authorize_replica(peer, header.clone(), deadline)
+                .await?;
+            let admission = self.admit_replica(deadline, &grant).await?;
             let identity = super::super::control::PeerSessionIdentity::new(
                 if grant.op.target_index == 0 {
                     grant.op.initiator_node_id.clone()
@@ -353,7 +405,7 @@ impl DfsChunks for DfsChunksService {
             let acks = tokio::time::timeout_at(
                 deadline,
                 crate::node::bridge::spawn_blocking(move || {
-                    let _permit = permit;
+                    let _admission = admission;
                     ensure_replica_grant_live(grant.expires_at_unix_ms)?;
                     let bytes = {
                         let mut endpoint = session.endpoint.blocking_lock();
