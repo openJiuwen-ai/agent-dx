@@ -9,8 +9,8 @@ use super::ownerfs::{reservation_from_wire, reservation_wire};
 use crate::node::vfs::ownerfs::{
     catalog::LocalRootRecord,
     root::{
-        OwnerRootInventory, PreparedRoot, PresentedRootAccess, RootGrant, RootId, RootLocation,
-        RootLookupState, RootMeta, RootReservation, RootRight,
+        ActiveOutletRoots, OutletRoot, OwnerRootInventory, PreparedRoot, PresentedRootAccess,
+        RootGrant, RootId, RootLocation, RootLookupState, RootMeta, RootReservation, RootRight,
     },
 };
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
@@ -21,9 +21,9 @@ use afs_error::{
 #[cfg(feature = "ownerfs")]
 use afs_protocol::meta::{
     AbortRootRequest, AcquireRootRequest, ActivateRootRequest, DeactivateRootRequest,
-    ListOwnerRootsRequest, LookupNodeRequest, LookupRootRequest, PollRootCommandBatchRequest,
-    RecoverRootRequest, ReserveConflictPolicy, ReserveRootRequest, ValidateRootAccessRequest,
-    owner_roots_client::OwnerRootsClient,
+    ListActiveOutletRootsRequest, ListOwnerRootsRequest, LookupNodeRequest, LookupRootRequest,
+    PollRootCommandBatchRequest, RecoverRootRequest, ReserveConflictPolicy, ReserveRootRequest,
+    ValidateRootAccessRequest, owner_roots_client::OwnerRootsClient,
 };
 use afs_protocol::meta::{
     MetaBackendPersistence, PingRequest, RegisterNodeReply, RegisterNodeRequest,
@@ -151,20 +151,13 @@ impl GrpcRootMeta {
 
     /// Returns the registered endpoint and Node incarnation for connection reuse.
     pub fn lookup_node_location(&self, node_id: &str) -> Result<(String, u64)> {
-        let mut client = MetaClient::new(self.channel.clone());
-        let reply = self
-            .run(client.lookup_node(LookupNodeRequest {
-                request_id: self.request_id(),
-                node_id: node_id.to_owned(),
-            }))?
-            .into_inner();
+        let reply = self.workspace_node(node_id)?;
         if !reply.found {
             return Err(Error::coded(
                 afs_error::NODE_VFS_NOT_FOUND,
                 "Home Node is not registered",
             ));
         }
-        let node_epoch = reply.lease_epoch;
         let node = required(reply.node, "LookupNode.node")?;
         let endpoint = required(node.endpoint, "LookupNode.node.endpoint")?.grpc_addr;
         if endpoint.is_empty() {
@@ -173,15 +166,67 @@ impl GrpcRootMeta {
                 "Home Node has no gRPC endpoint",
             ));
         }
-        Ok((endpoint, node_epoch))
+        Ok((endpoint, reply.lease_epoch))
+    }
+
+    pub(crate) fn workspace_node(
+        &self,
+        node_id: &str,
+    ) -> Result<afs_protocol::meta::LookupNodeReply> {
+        self.workspace_node_with_timeout(node_id, self.timeout)
+    }
+
+    pub(crate) fn workspace_node_with_timeout(
+        &self,
+        node_id: &str,
+        timeout: Duration,
+    ) -> Result<afs_protocol::meta::LookupNodeReply> {
+        let mut client = MetaClient::new(self.channel.clone());
+        let reply = self
+            .run_with_timeout(
+                timeout,
+                client.lookup_node(LookupNodeRequest {
+                    request_id: self.request_id(),
+                    node_id: node_id.to_owned(),
+                }),
+            )?
+            .into_inner();
+        Ok(reply)
+    }
+
+    pub(crate) fn force_deactivate_workspace(&self, location: &RootLocation) -> Result<()> {
+        let mut client = self.client();
+        self.run(
+            client.force_deactivate_root(afs_protocol::meta::ForceDeactivateRootRequest {
+                root: Some(DeactivateRootRequest {
+                    request_id: self.request_id(),
+                    root_id: location.id.0.clone(),
+                    root_epoch: location.epoch,
+                    home_node_id: location.home_node_id.clone(),
+                    home_session_id: location.home_session_id.clone(),
+                    reason: "workspace Home unavailable".into(),
+                }),
+                requester_node_id: self.node_id.clone(),
+                requester_session_id: self.session_id.clone(),
+            }),
+        )?;
+        Ok(())
     }
 
     fn run<T>(
         &self,
         future: impl std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     ) -> Result<T> {
+        self.run_with_timeout(self.timeout, future)
+    }
+
+    fn run_with_timeout<T>(
+        &self,
+        timeout: Duration,
+        future: impl std::future::Future<Output = std::result::Result<T, tonic::Status>>,
+    ) -> Result<T> {
         crate::node::bridge::block_on(&self.runtime, async {
-            tokio::time::timeout(self.timeout, future)
+            tokio::time::timeout(timeout.min(self.timeout), future)
                 .await
                 .map_err(|_| {
                     Error::coded(
@@ -339,7 +384,11 @@ impl RootMeta for GrpcRootMeta {
             request_id: self.request_id(),
             root_id: reservation.id.0.clone(),
             root_epoch: reservation.epoch,
-            session_id: reservation.session_id.clone(),
+            session_id: if self.node_id == reservation.home_node_id {
+                reservation.session_id.clone()
+            } else {
+                self.session_id.clone()
+            },
             create_intent_id: reservation.create_intent_id.clone(),
             reason: "local root preparation failed".into(),
             prepare_token: reservation.prepare_token.clone(),
@@ -384,6 +433,32 @@ impl RootMeta for GrpcRootMeta {
             home_node_id: value.home_node_id,
             home_session_id: value.home_session_id,
         }))
+    }
+
+    fn list_active_outlet_roots(&self, known_digest: Option<&str>) -> Result<ActiveOutletRoots> {
+        let mut client = self.client();
+        let reply = self
+            .run(
+                client.list_active_outlet_roots(ListActiveOutletRootsRequest {
+                    request_id: self.request_id(),
+                    known_digest: known_digest.unwrap_or_default().to_owned(),
+                }),
+            )?
+            .into_inner();
+        Ok(ActiveOutletRoots {
+            roots: reply
+                .active_roots
+                .into_iter()
+                .map(|value| OutletRoot {
+                    root_id: RootId(value.root_id),
+                    root_epoch: value.root_epoch,
+                    home_node_id: value.home_node_id,
+                    home_nfs_addr: value.home_nfs_addr,
+                })
+                .collect(),
+            digest: reply.digest,
+            unchanged: reply.unchanged,
+        })
     }
 
     fn list_owner_roots(&self, home_node_id: &str) -> Result<OwnerRootInventory> {

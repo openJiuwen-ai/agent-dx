@@ -53,6 +53,7 @@ impl State {
             MetaRead::DfsOpenReplicationTasks => self.read_dfs_open_replication_tasks(),
             MetaRead::DfsReplicationTasks => self.read_dfs_replication_tasks(),
             MetaRead::RootGrants { root_id } => self.read_root_grants(root_id),
+            MetaRead::ActiveRoots => self.read_active_roots(),
             _ => (
                 // A conditional update compares the entity's mod revision,
                 // not the store-wide revision of unrelated later writes.
@@ -91,7 +92,9 @@ impl State {
                     node_id: node_id.clone(),
                 })
             }
-            MetaRead::CurrentNodeSessions | MetaRead::RootState { .. } => None,
+            MetaRead::CurrentNodeSessions | MetaRead::RootState { .. } | MetaRead::ActiveRoots => {
+                None
+            }
             MetaRead::Root { root_id } => state.entities.get(&MetaKey::Root {
                 root_id: root_id.clone(),
             }),
@@ -272,6 +275,37 @@ impl State {
             sessions
                 .into_iter()
                 .map(|(_, _, versioned)| versioned.entity)
+                .collect(),
+        )
+    }
+
+    /// 全量 Active root 扫描：outlet 镜像面的唯一输入。
+    ///
+    /// "Active" 在持久层等价于"Root 实体存在"（`DeactivateRoot` 直接删除 Root
+    /// 键），因此这里不需要额外的状态过滤。结果按 `root_id` 升序，保证镜像
+    /// 端的 diff 可复现。
+    fn read_active_roots(&self) -> (StoreRevision, Vec<MetaEntity>) {
+        let state = self;
+        let mut roots = state
+            .entities
+            .starting_at(MetaKey::Root {
+                root_id: String::new(),
+            })
+            .take_while(|(key, _)| matches!(key, MetaKey::Root { .. }))
+            .filter_map(|(_, versioned)| match &versioned.entity {
+                MetaEntity::Root(root) => Some((root.root_id.clone(), versioned.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        roots.sort_by(|left, right| left.0.cmp(&right.0));
+        let revision = roots
+            .iter()
+            .fold(state.revision, |max, (_, entity)| max.max(entity.revision));
+        (
+            revision,
+            roots
+                .into_iter()
+                .map(|(_, versioned)| versioned.entity)
                 .collect(),
         )
     }

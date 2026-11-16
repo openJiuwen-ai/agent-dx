@@ -1,6 +1,43 @@
 //! Canonical record preparation and replay decisions.
 
+use super::super::log::{
+    DecidedFacts, LayoutAppendBase, Record, RecordDecision, valid_layout_suffix,
+};
 use super::*;
+use crate::dfs::{FileVersion, InodeRecord, LayoutRoot};
+
+/// Identify the single layout, its new version, and the corresponding head update.
+fn append_entities(events: &[WatchEvent]) -> Option<(&LayoutRoot, &FileVersion, &InodeRecord)> {
+    let mut layout = None;
+    let mut version = None;
+    let mut inode = None;
+    for event in events {
+        match &event.change {
+            WatchChange::Put(MetaEntity::DfsLayoutRoot(value)) if layout.is_none() => {
+                layout = Some(value.as_ref());
+            }
+            WatchChange::Put(MetaEntity::DfsFileVersion(value)) if version.is_none() => {
+                version = Some(value);
+            }
+            WatchChange::Put(MetaEntity::DfsInode(value)) if inode.is_none() => {
+                inode = Some(value);
+            }
+            WatchChange::Put(
+                MetaEntity::DfsLayoutRoot(_)
+                | MetaEntity::DfsFileVersion(_)
+                | MetaEntity::DfsInode(_),
+            )
+            | WatchChange::Delete => return None,
+            _ => {}
+        }
+    }
+    let (layout, version, inode) = (layout?, version?, inode?);
+    (version.layout_root == layout.id
+        && version.length == layout.file_length
+        && version.inode_id == inode.inode_id
+        && inode.head_version.as_ref() == Some(&version.id))
+    .then_some((layout, version, inode))
+}
 
 // Prepare privately; only Store publishes after its selected log acknowledges.
 impl State {
@@ -17,8 +54,111 @@ impl State {
                     None => Ok(next),
                 }
             }
-            super::super::log::Record::History(history) => self.apply_history(history),
+            Record::AppendLayout {
+                decision,
+                history,
+                base,
+            } => {
+                let mut facts = decision.facts()?;
+                let layout = self.expand_layout_append(&facts.events, base)?;
+                for event in &mut facts.events {
+                    if matches!(event.change, WatchChange::Put(MetaEntity::DfsLayoutRoot(_))) {
+                        event.change = WatchChange::Put(MetaEntity::DfsLayoutRoot(layout.clone()));
+                    }
+                }
+                let next = self.replay_facts(facts)?;
+                match history {
+                    Some(history) => next.apply_history(history),
+                    None => Ok(next),
+                }
+            }
+            Record::History(history) => self.apply_history(history),
         }
+    }
+
+    fn predecessor_layout(&self, version: &FileVersion) -> Option<&LayoutRoot> {
+        let parent = version.parent_version.as_ref()?;
+        let MetaEntity::DfsInode(inode) = &self
+            .entities
+            .get(&MetaKey::DfsInode(version.inode_id.clone()))?
+            .entity
+        else {
+            return None;
+        };
+        if inode.head_version.as_ref() != Some(parent)
+            || self
+                .entities
+                .get(&MetaKey::DfsFileVersion(version.id.clone()))
+                .is_some()
+            || self
+                .entities
+                .get(&MetaKey::DfsLayoutRoot(version.layout_root.clone()))
+                .is_some()
+        {
+            return None;
+        }
+        let MetaEntity::DfsFileVersion(previous) = &self
+            .entities
+            .get(&MetaKey::DfsFileVersion(parent.clone()))?
+            .entity
+        else {
+            return None;
+        };
+        let MetaEntity::DfsLayoutRoot(layout) = &self
+            .entities
+            .get(&MetaKey::DfsLayoutRoot(previous.layout_root.clone()))?
+            .entity
+        else {
+            return None;
+        };
+        (previous.inode_id == version.inode_id
+            && previous.length == layout.file_length
+            && previous.layout_root == layout.id)
+            .then_some(layout)
+    }
+
+    fn layout_append_base(&self, events: &[WatchEvent]) -> Option<LayoutAppendBase> {
+        let (layout, version, _) = append_entities(events)?;
+        let base = self.predecessor_layout(version)?;
+        let suffix = layout
+            .inline_extents
+            .strip_prefix(base.inline_extents.as_slice())?;
+        valid_layout_suffix(base.file_length, layout, suffix).then(|| LayoutAppendBase {
+            layout: base.id.clone(),
+            length: base.file_length,
+        })
+    }
+
+    fn expand_layout_append(
+        &self,
+        events: &[WatchEvent],
+        base: &LayoutAppendBase,
+    ) -> Result<Arc<LayoutRoot>> {
+        let (suffix, version, _) = append_entities(events).ok_or_else(|| {
+            invalid_contract("append replay requires one layout, version and inode")
+        })?;
+        let previous = self
+            .predecessor_layout(version)
+            .filter(|layout| layout.id == base.layout && layout.file_length == base.length)
+            .ok_or_else(|| invalid_contract("append replay predecessor mismatch"))?;
+        let mut extents = Vec::new();
+        extents
+            .try_reserve_exact(
+                previous
+                    .inline_extents
+                    .len()
+                    .saturating_add(suffix.inline_extents.len()),
+            )
+            .map_err(|_| {
+                afs_error::Error::coded(afs_error::IO_OUT_OF_MEMORY, "allocate replay layout")
+            })?;
+        extents.extend_from_slice(&previous.inline_extents);
+        extents.extend_from_slice(&suffix.inline_extents);
+        Ok(Arc::new(LayoutRoot {
+            id: suffix.id.clone(),
+            file_length: suffix.file_length,
+            inline_extents: extents,
+        }))
     }
 
     pub(in crate::meta::store) fn prepare_txn_record(
@@ -27,7 +167,24 @@ impl State {
         completed_at: u64,
         byte_limit: usize,
     ) -> Result<(Self, TxnOutcome, Option<super::super::log::RecordDecision>)> {
-        use super::super::log::{DecisionInput, RecordDecision};
+        let (state, outcome, record, _) = self.prepare_txn(txn, completed_at, byte_limit, false)?;
+        Ok((state, outcome, record))
+    }
+
+    pub(in crate::meta::store) fn prepare_txn(
+        &self,
+        txn: MetaTxn,
+        completed_at: u64,
+        byte_limit: usize,
+        append_enabled: bool,
+    ) -> Result<(
+        Self,
+        TxnOutcome,
+        Option<RecordDecision>,
+        Option<LayoutAppendBase>,
+    )> {
+        use super::super::log::DecisionInput;
+        let mut base = None;
         let request = txn.request.clone();
         let operation = txn.operation;
         let outcomes = txn
@@ -49,7 +206,10 @@ impl State {
             let events = (self.events.len()..prepared.events.len())
                 .map(|index| prepared.events.0[index].as_ref().clone())
                 .collect::<Vec<_>>();
-            let record = RecordDecision::new(
+            if append_enabled && operation == StoreOperation::DfsCommitFileVersion {
+                base = self.layout_append_base(&events);
+            }
+            let record = RecordDecision::new_with_append(
                 DecisionInput {
                     request,
                     operation,
@@ -62,6 +222,7 @@ impl State {
                     node_epochs: Vec::new(),
                 },
                 byte_limit,
+                base.as_ref(),
             )?;
             for outcome in &outcomes {
                 prepared.request_completion.insert(
@@ -85,7 +246,7 @@ impl State {
         } else {
             None
         };
-        Ok((prepared, outcome, record))
+        Ok((prepared, outcome, record, base))
     }
 
     pub(in crate::meta::store) fn prepare_node_record(
@@ -160,7 +321,10 @@ impl State {
         &self,
         record: &super::super::log::RecordDecision,
     ) -> Result<Self> {
-        let facts = record.facts()?;
+        self.replay_facts(record.facts()?)
+    }
+
+    fn replay_facts(&self, facts: DecidedFacts) -> Result<Self> {
         if facts.revision_before != self.revision {
             return Err(invalid_contract(
                 "canonical replay revision does not follow current state",

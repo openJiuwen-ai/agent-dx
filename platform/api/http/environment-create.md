@@ -1,5 +1,18 @@
 # Environment create ownership
 
+Omit the image and rootfs source to use the deployment-owned default rootfs.
+On sandboxd, an explicitly selected rootfs skips the built-in profile's
+`PATH`. An explicit `env.PATH` sets the request value, subject to a node
+override. For an OCI image with no request or node override, sandboxd uses
+the image's `PATH` if present and otherwise its runtime template.
+
+An explicit `process.commands` starts a managed workload independently of OCI
+entrypoint inheritance, including on a local EROFS rootfs. Its optional user and
+working directory default to the Execd identity and `/`; readiness and healthcheck
+probes apply to this workload as usual. No image process metadata file is required.
+`inheritEntrypoint=true` remains the option for reading an OCI image's process
+metadata, with optional `process` overrides.
+
 `POST /api/environment/v1/environments` returns a confirmed-running result as
 JSON inside the normal response envelope, or as the final SSE event:
 
@@ -7,12 +20,20 @@ JSON inside the normal response envelope, or as the final SSE event:
 {"environmentId":"tenant-worker","status":"running","requestId":"create-request","newlyCreated":true}
 ```
 
+`requestId` identifies the request that created the **current Env**. If R1 created
+an Env, CREATE with R2 returns the existing Env with `requestId: R1`. If the Env
+is deleted and recreated by R3, replaying R1 returns the current Env with
+`requestId: R3`. Takeover to another node preserves the Env's creation request ID.
+Error objects and the SSE `accepted` event still identify the incoming request.
+A Running result with no creation request ID is malformed and returns an internal
+data error instead of a successful response with an empty ID.
+
 `newlyCreated` comes from the node's creation result. It is true only when that
-logical create confirms a new instance, and false when an existing successful
-Environment ID or Request ID supplies a reused result. A cached response for
-the same logical request retains its original ownership bit. Recovery after a
-lost response may conservatively return false. `requestId` echoes the current
-request and is not evidence of creation ownership.
+logical create confirms a new instance, and false when reusing an existing Env.
+A cached response retains its original ownership bit while returning the same
+Env creation identity; a replacement Env returns false. Recovery after a lost
+response may conservatively return false. The creation request ID alone is not
+evidence that this caller owns initialization rollback.
 
 Clients may automatically delete during local initialization rollback only
 when `newlyCreated` is exactly boolean true. Reuse, attachment, missing or
@@ -23,8 +44,10 @@ Successful Request ID receipts are scoped to the tenant and retained in Redis fo
 600 seconds from their first publication. Replays do not extend that deadline;
 Redis and Coordinator restarts preserve it. After expiry, the Request ID alone
 no longer identifies an earlier creation. An existing Environment ID still
-reuses its current result; if the earlier Environment was deleted, a request
-after the replay window can create a new Environment. Receipt expiry does not
+reuses its current result, even when the receipt points to an older lifetime of
+the same name. While the receipt is valid, confirmed absence returns a terminal
+result and the caller uses a new request ID to create again. After expiry, the
+same request ID may create a new Environment. Receipt expiry does not
 delete an Environment or release its resources.
 
 Reusable snapshot restores inherit scheduling reservations and execution limits
@@ -62,3 +85,30 @@ The native SDK's `wait_entrypoint()` on snapshot or `from_id()` handles discover
 entrypoint state from Execd rather than interpreting omitted create flags as
 an explicitly disabled workload. If no managed entrypoint exists, that query
 returns an error; it never starts a new process.
+
+
+## Deployment-registered Local rootfs templates
+
+Deployments may configure the same `local_rootfs_templates` map in the API Server
+and adxlet. A template contains an absolute `path`, optional `env`, and optional
+`process` (`commands`, `cwd`, `user`). Template names use 1..128 ASCII letters,
+digits, underscores or hyphens. ADX does not import Docker images or fetch an image
+for this source; the deployment prepares each artifact and its metadata.
+
+```json
+{"name":"offline-tools","rootfs":{"type":"template","name":"local-tools-v1","runtime":"runsc"}}
+```
+
+The API resolves the registered name to a Local source persisted with the Environment.
+Arbitrary public Local paths remain rejected. Unknown names and conflicting image,
+path, storage or snapshot sources fail before scheduling. Only nodes advertising
+`ADX_LOCAL_ROOTFS_<name>=ready` are eligible; adxlet validates the registered paths
+before advertising them. Artifacts must remain available for the lifetime of their
+Environments and checkpoints. Use immutable names and paths for new content.
+
+Template environment values default the request environment; explicit request values
+win, while node-owned control configuration remains authoritative. With
+`inheritEntrypoint=true`, the template process is merged with explicit process fields
+and submitted as an explicit workload; no OCI process metadata lookup is performed.
+Without inheritance, no image workload starts. Local rootfs writable-layer handling
+and the existing Execd bootstrap are unchanged.

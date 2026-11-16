@@ -56,6 +56,18 @@ impl Environment for Platform {
         record.ready = false;
         Ok(record.clone())
     }
+    async fn pause(
+        &self,
+        _tenant: &str,
+        id: &str,
+        _timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        let mut records = self.0.lock().unwrap();
+        let record = records.get_mut(id).ok_or(EnvironmentError::NotFound)?;
+        record.phase = EnvironmentPhase::Paused;
+        record.ready = false;
+        Ok(record.clone())
+    }
 }
 fn settings() -> ReconcileSettings {
     ReconcileSettings {
@@ -405,6 +417,14 @@ impl Environment for CancelledPlatform {
         id: &str,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
         self.inner.delete(tenant, id).await
+    }
+    async fn pause(
+        &self,
+        tenant: &str,
+        id: &str,
+        timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.inner.pause(tenant, id, timeout_seconds).await
     }
 }
 

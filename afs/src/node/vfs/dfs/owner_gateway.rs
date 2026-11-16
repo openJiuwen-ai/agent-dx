@@ -55,7 +55,11 @@ pub(super) trait OwnerLocalFiles {
     /// The accepted write sequence of the resize.
     fn owner_resize(&self, file: FileHandle, length: u64, kill_suidgid: bool) -> Result<u64>;
     /// The handle's durable write sequence and the inode's base version id.
-    fn owner_sync(&self, file: FileHandle, mode: SyncMode) -> Result<(u64, String)>;
+    fn owner_sync(
+        &self,
+        file: FileHandle,
+        mode: SyncMode,
+    ) -> Result<(SyncReceipt, Option<ProxiedCommit>)>;
     /// Releases the handle. `Ok(Some(_))`: it is gone, and this write error had
     /// not reached any caller yet; the releasing caller is its last receiver.
     fn release_owner_handle(&self, file: FileHandle) -> Result<Option<Error>>;
@@ -331,13 +335,16 @@ pub(super) enum DfsOwnerOpenAdmissionStart {
 impl OwnerGateway {
     pub(super) fn owner_open(
         &self,
-        local: &dyn OwnerLocalFiles,
+        local: &DistributedFs,
         peer: &str,
         request: afs_protocol::node_control::DfsOwnerOpenRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerOpenReply> {
         self.check_owner_open_target(&request)?;
         let current = self.meta.current_node_session(peer)?;
         Self::check_owner_open_caller_session(current, &request)?;
+        if local.lease_handoff.enabled {
+            return self.owner_open_with_handoff(local, peer, request);
+        }
         let admission = match self.admit_owner_open(peer, &request)? {
             ControlFlow::Continue(admission) => admission,
             ControlFlow::Break(reply) => return Ok(reply),
@@ -345,6 +352,45 @@ impl OwnerGateway {
         let inode_id = InodeId::new(request.inode_id.clone());
         let authority = self.meta.resolve_write_authority(&inode_id);
         self.apply_owner_open(local, peer, request, admission, authority)
+    }
+
+    fn owner_open_with_handoff(
+        &self,
+        local: &DistributedFs,
+        peer: &str,
+        request: afs_protocol::node_control::DfsOwnerOpenRequest,
+    ) -> Result<afs_protocol::node_control::DfsOwnerOpenReply> {
+        let inode_id = InodeId::new(request.inode_id.clone());
+        let admission = match self.admit_owner_open(peer, &request)? {
+            ControlFlow::Continue(admission) => admission,
+            ControlFlow::Break(reply) => return Ok(reply),
+        };
+        let result = (|| {
+            if request.open_flags & libc::O_ACCMODE != libc::O_RDONLY
+                && local.expedite_idle_lease(&inode_id, request.lease_epoch)?
+            {
+                return Err(stale("DFS owner released the write lease"));
+            }
+            local.lease_admission(&inode_id)
+        })();
+        match result {
+            Ok(_admission_guard) => {
+                // A delayed proxy open must not reacquire a released lease
+                // on behalf of the previous owner.
+                let authority = self
+                    .meta
+                    .observe_write_authority(&inode_id)
+                    .map_err(|error| {
+                        if error.code() == afs_error::NODE_VFS_UNAVAILABLE {
+                            stale("DFS owner write lease is no longer live")
+                        } else {
+                            error
+                        }
+                    });
+                self.apply_owner_open(local, peer, request, admission, authority)
+            }
+            Err(error) => self.apply_owner_open(local, peer, request, admission, Err(error)),
+        }
     }
 
     fn check_owner_open_target(
@@ -709,7 +755,7 @@ impl OwnerGateway {
             OwnerOperationStart::Cached(_) => return Err(remote_operation_kind_mismatch()),
             OwnerOperationStart::Apply(claim) => claim,
         };
-        let (durable_write_seq, file_version_id) = local.owner_sync(
+        let (receipt, proxied_commit) = local.owner_sync(
             file,
             if request.data_only {
                 SyncMode::DataOnly
@@ -718,8 +764,14 @@ impl OwnerGateway {
             },
         )?;
         let reply = afs_protocol::node_data::DfsOwnerSyncReply {
-            durable_write_seq,
-            file_version_id,
+            durable_write_seq: receipt.durable_write_seq,
+            file_version_id: receipt.file_version_id,
+            proxied_commit: proxied_commit.map(|commit| {
+                afs_protocol::node_data::DfsOwnerProxiedCommit {
+                    file_version_id: commit.version.0,
+                    inode_revision: commit.revision,
+                }
+            }),
         };
         claim.complete(RemoteOperationResult::Sync {
             fingerprint,
@@ -1351,6 +1403,13 @@ impl owner_api::DfsOwnerLifecycleHandler for DistributedFs {
                 .current_node_session_async(peer.clone())
                 .await?;
             OwnerGateway::check_owner_open_caller_session(current, &request)?;
+            if self.lease_handoff.enabled {
+                return offload_handler(move || {
+                    self.owner_gateway
+                        .owner_open_with_handoff(&self, &peer, request)
+                })
+                .await;
+            }
             let admission = match gateway.admit_owner_open(&peer, &request)? {
                 ControlFlow::Continue(admission) => admission,
                 ControlFlow::Break(reply) => return Ok(reply),
@@ -1733,15 +1792,22 @@ impl OwnerLocalFiles for DistributedFs {
 
     fn owner_resize(&self, file: FileHandle, length: u64, kill_suidgid: bool) -> Result<u64> {
         let snapshot = self.handle_snapshot(file)?;
-        let accepted = self.resize_dirty_inode(&snapshot.inode_id, length, kill_suidgid)?;
+        let writer = snapshot
+            .write_session
+            .as_ref()
+            .map(|session| &session.local.id);
+        let accepted = self.resize_dirty_inode(&snapshot.inode_id, length, kill_suidgid, writer)?;
         self.update_handle_write_progress(file, accepted)?;
         Ok(accepted)
     }
 
-    fn owner_sync(&self, file: FileHandle, mode: SyncMode) -> Result<(u64, String)> {
+    fn owner_sync(
+        &self,
+        file: FileHandle,
+        mode: SyncMode,
+    ) -> Result<(SyncReceipt, Option<ProxiedCommit>)> {
         <Self as Backend>::fsync(self, &owner_request_context(), file, mode)?;
-        let receipt = self.local_sync_receipt(file)?;
-        Ok((receipt.durable_write_seq, receipt.file_version_id))
+        self.sync_receipt_with_proxied_commit(file)
     }
 
     fn release_owner_handle(&self, file: FileHandle) -> Result<Option<Error>> {

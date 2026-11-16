@@ -79,6 +79,9 @@ impl Controller {
             return Err(Error::Conflict);
         }
         let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds);
+        // A snapshot may outlive runtime capture while publishing its artifact.
+        // Keep accepted work visible to quiescing through the final commit.
+        let _execution = self.services.execution(&self.record, "pause").await?;
         let services = self
             .services
             .checkpoint
@@ -392,6 +395,7 @@ impl super::Controller {
             return Err(error);
         }
         self.record.snapshot_source = Some(adx_core::RestorePoint {
+            recovery_profile: Default::default(),
             id: snapshot.id.clone(),
             artifact: snapshot.artifact.clone(),
             expires_at_unix_seconds: None,

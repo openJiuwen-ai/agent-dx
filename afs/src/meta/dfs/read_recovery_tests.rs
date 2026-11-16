@@ -70,6 +70,7 @@ async fn register(store: &Store, id: &str, session: &str, devices: Vec<StorageDe
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:2".into(),
                 rest_addr: "http://127.0.0.1:3".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: devices,
                 lease_ttl: std::time::Duration::from_secs(30),
@@ -118,7 +119,7 @@ async fn legacy_direct_commit_fixture() -> (
     txn.mutations.extend([
         TxnMutation::Put(MetaEntity::DfsInode(inode.clone())),
         TxnMutation::Put(MetaEntity::DfsFileVersion(version.clone())),
-        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout.clone())),
+        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout.clone().into())),
         TxnMutation::RecordRequestOutcome(RequestOutcome {
             request: key.clone(),
             operation: StoreOperation::DfsCommitFileVersion,
@@ -229,7 +230,7 @@ async fn fixture_with_bytes(bytes: &[u8]) -> Fixture {
             layout_root: layout.id.clone(),
             created_at_unix_ms: 1,
         })),
-        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout)),
+        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout.into())),
         TxnMutation::Put(MetaEntity::DfsChunk(staged.chunk.clone())),
         TxnMutation::Put(MetaEntity::DfsCopy(copy.clone())),
         TxnMutation::Put(MetaEntity::DfsPlacement(PlacementRecord {
@@ -269,11 +270,14 @@ async fn replace_source_layout(f: &Fixture, extents: Vec<Extent>) {
     txn.conditions
         .push(TxnCondition::RequestAbsent(key.clone()));
     txn.mutations.extend([
-        TxnMutation::Put(MetaEntity::DfsLayoutRoot(LayoutRoot {
-            id: f.request.layout_root_id.clone(),
-            file_length: f.copy.persisted_bytes,
-            inline_extents: extents,
-        })),
+        TxnMutation::Put(MetaEntity::DfsLayoutRoot(
+            LayoutRoot {
+                id: f.request.layout_root_id.clone(),
+                file_length: f.copy.persisted_bytes,
+                inline_extents: extents,
+            }
+            .into(),
+        )),
         TxnMutation::RecordRequestOutcome(RequestOutcome {
             request: key,
             operation: StoreOperation::DfsCommitFileVersion,
@@ -895,6 +899,7 @@ async fn expired_worker_blocks_without_source_before_repair_lease_expires() {
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:2".into(),
                 rest_addr: "http://127.0.0.1:3".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: vec![fixture.local.device_descriptor().unwrap()],
                 lease_ttl: std::time::Duration::from_millis(50),
@@ -970,6 +975,7 @@ async fn lost_target_persists_repair_debt_before_replacement_is_available() {
                     grpc_addr: "http://127.0.0.1:1".into(),
                     data_addr: "http://127.0.0.1:2".into(),
                     rest_addr: "http://127.0.0.1:3".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: false,
                     storage_devices: vec![StorageDeviceDescriptor {
                         device_id: "target-device".into(),

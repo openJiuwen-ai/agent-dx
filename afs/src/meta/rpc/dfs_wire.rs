@@ -153,17 +153,17 @@ pub(super) fn domain_dfs_version(
     }
 }
 
-pub(super) fn wire_dfs_layout(layout: crate::dfs::LayoutRoot) -> PbDfsLayoutRoot {
+pub(super) fn wire_dfs_layout(layout: &crate::dfs::LayoutRoot) -> PbDfsLayoutRoot {
     PbDfsLayoutRoot {
-        layout_root_id: layout.id.0,
+        layout_root_id: layout.id.0.clone(),
         file_length: layout.file_length,
         inline_extents: layout
             .inline_extents
-            .into_iter()
+            .iter()
             .map(|extent| afs_protocol::meta::DfsExtent {
                 file_offset: extent.file_offset,
                 length: extent.length,
-                chunk_id: extent.chunk_id.0,
+                chunk_id: extent.chunk_id.0.clone(),
                 chunk_offset: extent.chunk_offset,
             })
             .collect(),

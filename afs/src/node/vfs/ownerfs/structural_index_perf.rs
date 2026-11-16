@@ -374,9 +374,15 @@ fn g2_structural_root_reincarnation_preserves_canonical_root_identity() {
         root.clone(),
         root_identity.clone(),
         root_attrs.clone(),
+        None,
     );
-    let reincarnated =
-        state.insert_root(root_name, root.clone(), root_identity.clone(), root_attrs);
+    let reincarnated = state.insert_root(
+        root_name,
+        root.clone(),
+        root_identity.clone(),
+        root_attrs,
+        None,
+    );
 
     assert_eq!(original, reincarnated);
     assert_eq!(

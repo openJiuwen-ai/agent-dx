@@ -1,7 +1,7 @@
 # sandboxd protocol
 
 - Repository: https://github.com/inclusionAI/sandboxd
-- Pinned head: `b5dab2958183faa8bcf04955eef7b0ae1c9b10ef`
+- Pinned head: `03ea0a4db807c1d5dac4b11d02f2ec238083a8ae`
 - ADX builds this revision without downstream source patches. Rootfs defaults,
   bootstrap mounts and managed-file paths are adapted by the control plane to
   the published sandboxd protocol.
@@ -22,7 +22,7 @@ revision as `source.json`.
 The archive contains sandboxd, sbox, runc, runc-shim, sandbox-logger, redis-cli
 and their backend manifest. It contains no ADX platform or Execd binaries.
 
-The current AMD64 executables require glibc 2.34 or newer. Firecracker uses
+The AMD64 and ARM64 bundles are built with Go 1.25.5 against Ubuntu 20.04 glibc 2.31, with libseccomp 2.5.5 linked statically. Both architectures are loader-tested on glibc 2.31; no backend executable requires a newer GLIBC symbol version. Firecracker uses
 `mount_setattr` for recursive virtiofs export protection, requiring Linux 5.12
 or a kernel with that feature backported. An available `/dev/kvm` alone does
 not establish host compatibility.
@@ -37,7 +37,7 @@ Both bundles are built from the clean pinned sandboxd revision using
 `build/e2e/build_backend.py`. Updating this dependency requires matching source
 and verified archive pins. To include the backend in the ADX release, build with
 `ADX_WITH_SANDBOXD=1 make platform-release`. This adds the backend to
-`runtime/sandboxd/`, includes architecture-pinned AKernel runsc builds,
+`runtime/sandboxd/`, includes the complete architecture-pinned AKernel gVisor `release-20261012.0-akernel.4` bundles (runsc, containerd shim, and adjacent `gvisor-bin` helpers),
 and ships the systemd unit and example configuration described
 in the [standalone deployment guide](../../docs/deployment/standalone.md#使用随包的-sandboxd).
 

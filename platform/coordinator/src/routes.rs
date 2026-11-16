@@ -448,7 +448,7 @@ fn published_environment(
 ) -> Result<pb::PublishedEnvironment> {
     Ok(pb::PublishedEnvironment {
         compatibility: route_compatibility(environment),
-        record: Some(environment.effective_record().try_into()?),
+        record: Some(environment.try_into()?),
         node_address: node.address.clone(),
         relay_address: node.proxy_address.clone(),
     })

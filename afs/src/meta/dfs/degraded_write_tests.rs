@@ -46,6 +46,7 @@ async fn register(store: &Store, node: &str, session: &str, ttl: std::time::Dura
                 grpc_addr: format!("http://{node}:1"),
                 data_addr: format!("http://{node}:2"),
                 rest_addr: format!("http://{node}:3"),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: vec![StorageDeviceDescriptor {
                     device_id: format!("{node}-dev"),
@@ -104,8 +105,14 @@ impl Fixture {
                 namespace_id: NamespaceId::new("default"),
                 parent_inode_id: root.inode_id,
                 name: b"degraded.bin".to_vec(),
+                caller: crate::dfs::CallerContext {
+                    uid: 0,
+                    gid: 0,
+                    supplementary_gids: Vec::new(),
+                },
                 attributes,
                 lease_seconds: 60,
+                first_generation: None,
             })
             .await
             .unwrap();

@@ -146,9 +146,8 @@ impl State {
             .nodes
             .get(&stored.assignment.node_id)
             .ok_or(Error::NotFound)?;
-        let record = stored.effective_record();
         Ok(pb::GetEnvironmentResponse {
-            record: Some(record.try_into()?),
+            record: Some(stored.try_into()?),
             node_address: node.address.clone(),
             relay_address: node.proxy_address.clone(),
         })
@@ -255,7 +254,7 @@ impl CoordinatorRpc {
             cached
         };
         let published = match session
-            .published_request(&spec.tenant_id, &request_id)
+            .published_request_stored(&spec.tenant_id, &request_id)
             .await
             .map_err(status)?
         {
@@ -264,27 +263,28 @@ impl CoordinatorRpc {
                 Some(stored) if stored.spec.tenant_id != spec.tenant_id => {
                     return Err(Status::not_found("environment not found"));
                 }
-                Some(stored) => stored.result,
+                Some(stored) => stored.result.is_some().then_some(stored),
                 None => None,
             },
         };
-        if let Some(record) = published {
-            let record = if record.state == EnvironmentState::Running {
+        if let Some(stored) = published {
+            let record = stored.effective_record();
+            let stored = if record.state == EnvironmentState::Running {
                 session
                     .publish_existing(record, &request_id)
                     .await
                     .map_err(status)?
             } else {
-                record
+                stored
             };
             let state = self.0.state.lock().await;
             let owner = state
                 .nodes
-                .get(&record.assignment.node_id)
+                .get(&stored.assignment.node_id)
                 .ok_or_else(|| Status::unavailable("confirmed owner is unavailable"))?;
             return Ok(pb::ClaimEnvironmentResponse {
                 outcome: Some(Outcome::Existing(Box::new(pb::GetEnvironmentResponse {
-                    record: Some(record.try_into().map_err(status)?),
+                    record: Some((&stored).try_into().map_err(status)?),
                     node_address: owner.address.clone(),
                     relay_address: owner.proxy_address.clone(),
                 }))),
@@ -436,6 +436,7 @@ impl CoordinatorRpc {
             return Ok(pb::ClaimEnvironmentResponse {
                 outcome: Some(Outcome::Owned(Box::new(
                     pb::StartAssignedEnvironmentRequest {
+                        creation_request_id: candidate.request_id.clone(),
                         create_deadline_unix_millis: deadline.unix_millis(),
                         spec: Some(spec.into()),
                         assignment: Some(assignment.try_into().map_err(status)?),
@@ -496,6 +497,11 @@ impl CoordinatorRpc {
         let outcome = match outcome {
             ClaimOutcome::Owned(_) => {
                 Outcome::Owned(Box::new(pb::StartAssignedEnvironmentRequest {
+                    creation_request_id: record
+                        .creation
+                        .as_ref()
+                        .map(|creation| creation.request_id.clone())
+                        .unwrap_or_default(),
                     create_deadline_unix_millis: deadline
                         .map_or(0, |deadline| deadline.unix_millis()),
                     spec: Some(record.spec.into()),

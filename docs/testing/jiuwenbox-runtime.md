@@ -32,10 +32,19 @@ Jiuwenbox/conchd 一致。容器部署还需要正确的挂载传播，不能仅
 看到 bootstrap。Conch guest 必须包含现有 virtiofs volume 支持。
 
 bootstrap.image 是独立 Execd EROFS，sha256 必须替换为安装产物的真实摘要，不能使用
-示例中的零值。启动入口必须位于 bootstrap.target 下。ADX 检查内容摘要和 EROFS magic，
-只读挂载后再次确认 loop backing image；再转换为 supervisor bind 或 Conch volume。
-同一驱动按摘要首次使用时校验并挂载，后续创建直接复用；环境归零及驱动退出后仍保留
-EROFS 挂载，重启复用时重新校验。旧制品挂载的维护回收由运维在确认不再使用后执行。
+示例中的零值。启动入口必须位于 bootstrap.target 下。Jiuwenbox 驱动初始化时检查
+当前镜像的内容摘要和 EROFS magic，再准备只读挂载并转换为 supervisor bind 或 Conch volume。
+已有 EROFS 挂载按实际挂载设备的内容摘要判断能否复用，不要求 backing file 与当前发布包
+位于同一路径。内容不一致时，先正常卸载再挂载当前镜像；卸载失败（包括 target is busy）
+会保留旧挂载并返回错误，不执行强制、懒卸载或叠加挂载。部署升级流程须先停止使用该
+挂载的旧沙箱。挂载目标固定为 `state_dir/bootstrap/current`，同一驱动进程内后续创建
+复用已准备目录；环境归零及驱动退出后保留这一处挂载供重启复用，升级不新增版本挂载点。
+首次切换会先正常卸载同一 bootstrap 目录下旧版 64 位 SHA 命名的 EROFS 挂载，再删除
+对应空目录；旧挂载卸载失败只记录告警，继续准备固定的 current 挂载，下次启动再尝试
+清理，不阻塞当前运行。其他目录不参与清理。新挂载操作或挂载后校验
+失败时尝试回滚该次新挂载，清理失败会记录明确告警并返回原始错误。`mount -o loop`
+创建的 loop 设备在卸载且最后一个引用释放后由内核自动回收；部署须保证旧沙箱已停止。
+此准备逻辑仅属于 Jiuwenbox adapter，不改变 sandboxd 等其他后端的启动行为。
 
 Supervisor 的可选配置位于 `jiuwenbox.classes.supervisor.policy.cgroup.backend`：
 
@@ -59,6 +68,11 @@ template_name 或 template_id 之一；模板名须由部署约束为不可变�
 模板。ADX 只向 Jiuwenbox 发送选中的字段；只接受 template_id 的交付包应配置内容 ID。
 process 定义继承镜像启动时的 argv/cwd/user，ADX 将生成 Execd
 既有 ProcessSpec 配置并独立只读挂载。业务镜像无需预装 Execd。入口配置通过只读 `/__adx_launch` 挂载；Conch 的 `/run`、`/proc`、`/sys`、`/dev` 及其子目录不接受 volume 目标。
+
+创建环境变量与元戎执行器使用同一通道：Supervisor 放入 `policy.environment`，Conch 放入
+`policy.conch.env`，不发送创建 API 顶层 `env`。保留配置中的 policy 环境变量，并由原有
+启动流程合并后的运行时环境覆盖同名值；Execd 的 exec 请求环境保持原样。因此新建沙箱的
+`sandbox ls` 不展示这些变量，policy 查询仍能查看实际配置。已有沙箱的创建元数据不自动迁移。
 
 class.policy 是可信节点配置，使用现有 append policy 模式合并到 Jiuwenbox 基础 policy。
 ADX 接管 cgroup、网络、bootstrap、声明的工作目录挂载和执行身份。

@@ -816,7 +816,20 @@ pub enum Record {
         history: Option<super::history::Delta>,
     },
     History(super::history::Delta),
+    /// A DFS commit whose sole layout value stores only the appended extents.
+    AppendLayout {
+        decision: RecordDecision,
+        history: Option<super::history::Delta>,
+        base: LayoutAppendBase,
+    },
 }
+/// Identifies the exact predecessor, independently of the new layout key.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LayoutAppendBase {
+    pub(super) layout: crate::dfs::LayoutRootId,
+    pub(super) length: u64,
+}
+
 impl From<RecordDecision> for Record {
     fn from(decision: RecordDecision) -> Self {
         Self::Decision {
@@ -832,7 +845,7 @@ impl Record {
     /// is left to the full decode.
     pub(super) fn check_schema(encoded: &[u8]) -> Result<()> {
         match postcard::take_from_bytes::<u32>(encoded) {
-            Ok((0, decision)) => {
+            Ok((0 | 2, decision)) => {
                 format::check_postcard_u16(FormatKind::MetaRecordDecision, "record", decision)
             }
             _ => Ok(()),
@@ -840,7 +853,13 @@ impl Record {
     }
     pub(super) fn validate(&self) -> Result<()> {
         match self {
-            Self::Decision { decision, history } => {
+            Self::Decision { decision, history }
+            | Self::AppendLayout {
+                decision, history, ..
+            } => {
+                if let Self::AppendLayout { base, .. } = self {
+                    decision.validate_layout_append(base)?;
+                }
                 decision.validate()?;
                 if let Some(history) = history {
                     history.validate()?;
@@ -855,13 +874,17 @@ impl Record {
     }
     pub(super) fn revision_before(&self) -> StoreRevision {
         match self {
-            Self::Decision { decision, .. } => decision.revision_before(),
+            Self::Decision { decision, .. } | Self::AppendLayout { decision, .. } => {
+                decision.revision_before()
+            }
             Self::History(history) => history.revision,
         }
     }
     pub(super) fn revision_after(&self) -> StoreRevision {
         match self {
-            Self::Decision { decision, .. } => decision.revision_after(),
+            Self::Decision { decision, .. } | Self::AppendLayout { decision, .. } => {
+                decision.revision_after()
+            }
             Self::History(history) => history.revision,
         }
     }
@@ -872,6 +895,14 @@ impl RecordDecision {
     /// complete state. `node_epochs` contains only explicit high-water changes.
     /// Oversize or inconsistent input is rejected before any durable append.
     pub fn new(input: DecisionInput<'_>, byte_limit: usize) -> Result<Self> {
+        Self::new_with_append(input, byte_limit, None)
+    }
+
+    pub(super) fn new_with_append(
+        input: DecisionInput<'_>,
+        byte_limit: usize,
+        base: Option<&LayoutAppendBase>,
+    ) -> Result<Self> {
         let DecisionInput {
             request,
             operation,
@@ -911,6 +942,24 @@ impl RecordDecision {
                     if !matches_key(&event.key, entity) {
                         return Err(invalid_contract("canonical put key/value mismatch"));
                     }
+                    let suffix;
+                    let entity =
+                        if let (Some(base), MetaEntity::DfsLayoutRoot(layout)) = (base, entity) {
+                            let first = layout
+                                .inline_extents
+                                .partition_point(|extent| extent.file_offset < base.length);
+                            suffix = MetaEntity::DfsLayoutRoot(
+                                crate::dfs::LayoutRoot {
+                                    id: layout.id.clone(),
+                                    file_length: layout.file_length,
+                                    inline_extents: layout.inline_extents[first..].to_vec(),
+                                }
+                                .into(),
+                            );
+                            &suffix
+                        } else {
+                            entity
+                        };
                     Change::Put {
                         key: event.key.clone(),
                         value: pool.insert(entity)?,
@@ -946,6 +995,9 @@ impl RecordDecision {
             node_epochs,
         };
         record.validate()?;
+        if let Some(base) = base {
+            record.validate_layout_append(base)?;
+        }
         // Count all envelope/descriptor overhead, not only entity payloads.
         let length = codec::encoded_size(&record)?;
         if length > byte_limit {
@@ -1106,6 +1158,27 @@ impl RecordDecision {
         Ok(())
     }
 
+    fn validate_layout_append(&self, base: &LayoutAppendBase) -> Result<()> {
+        let mut suffix = None;
+        for change in &self.changes {
+            if let Change::Put { value, .. } = change
+                && let MetaEntity::DfsLayoutRoot(layout) = self.entity(*value)?
+                && suffix.replace(layout).is_some()
+            {
+                return Err(invalid_contract("append decision has multiple layouts"));
+            }
+        }
+        let suffix = suffix.ok_or_else(|| invalid_contract("append decision lacks layout"))?;
+        if self.operation != StoreOperation::DfsCommitFileVersion
+            || base.layout.0.is_empty()
+            || base.layout == suffix.id
+            || !valid_layout_suffix(base.length, &suffix, &suffix.inline_extents)
+        {
+            return Err(invalid_contract("invalid append decision layout"));
+        }
+        Ok(())
+    }
+
     /// Derives events and original responses; it does not consult current
     /// entities, the wall clock, Node, S3 or any other external service.
     pub fn facts(&self) -> Result<DecidedFacts> {
@@ -1152,6 +1225,28 @@ impl RecordDecision {
             node_epochs: self.node_epochs.clone(),
         })
     }
+}
+
+/// The appended part is a contiguous nonempty extension of the old EOF.
+pub(super) fn valid_layout_suffix(
+    base_length: u64,
+    layout: &crate::dfs::LayoutRoot,
+    suffix: &[crate::dfs::Extent],
+) -> bool {
+    let mut end = base_length;
+    for extent in suffix {
+        if extent.file_offset != end
+            || extent.length == 0
+            || extent.chunk_offset.checked_add(extent.length).is_none()
+        {
+            return false;
+        }
+        let Some(next) = end.checked_add(extent.length) else {
+            return false;
+        };
+        end = next;
+    }
+    end > base_length && end == layout.file_length
 }
 
 fn matches_key(key: &MetaKey, entity: &MetaEntity) -> bool {

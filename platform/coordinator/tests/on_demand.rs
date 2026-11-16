@@ -2,6 +2,14 @@
 mod common;
 #[path = "common/mounts.rs"]
 mod mounts;
+#[path = "support/recovery_profile.rs"]
+mod recovery_profile;
+#[path = "on_demand/retarget.rs"]
+mod retarget;
+#[path = "on_demand/source_session.rs"]
+mod source_session;
+#[path = "on_demand/stream_continuity.rs"]
+mod stream_continuity;
 use adx_checkpoint_storage::ObjectCheckpointStore;
 use adx_coordinator::{rpc::CoordinatorRpc, storage::Session, Placement};
 use adx_core::{EnvironmentRecord, EnvironmentSpec, Resources, Result};
@@ -30,7 +38,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
 
 fn spec() -> EnvironmentSpec {
-    EnvironmentSpec {
+    let mut spec = EnvironmentSpec {
         envd: None,
         id: "sleep".into(),
         tenant_id: "tenant".into(),
@@ -56,7 +64,9 @@ fn spec() -> EnvironmentSpec {
         execution: Default::default(),
         run_policy: None,
         compatibility: None,
-    }
+    };
+    recovery_profile::qualify(&mut spec);
+    spec
 }
 fn caller() -> Option<pb::CallerContext> {
     Some(pb::CallerContext {
@@ -71,13 +81,29 @@ struct Backend {
     versioned_routes: Mutex<Option<Arc<adxlet::routes::UdsRoutes>>>,
     running: Mutex<BTreeMap<String, adxlet::RuntimeObservation>>,
     restored: AtomicUsize,
+    inventory_hold_ms: AtomicUsize,
+    checkpoint_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    checkpoint_entered: tokio::sync::Notify,
     restore_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     restore_entered: tokio::sync::Notify,
     fail_after_gate: AtomicBool,
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    fn runtime_rootfs_identity(&self) -> Option<adxlet::RuntimeRootfsIdentity> {
+        Some(adxlet::RuntimeRootfsIdentity {
+            path: "/runtime/rootfs".into(),
+            sha256: "c".repeat(64),
+        })
+    }
+    fn recovery_profile(&self, spec: &EnvironmentSpec) -> Result<BTreeMap<String, String>> {
+        Ok(recovery_profile::qualify(&mut spec.clone()))
+    }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
+        let delay = self.inventory_hold_ms.load(Ordering::SeqCst);
+        if delay != 0 {
+            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+        }
         Ok(self.running.lock().unwrap().values().cloned().collect())
     }
     async fn start(
@@ -110,6 +136,11 @@ impl RuntimeDriver for Backend {
         Ok(())
     }
     async fn checkpoint(&self, _: &str, path: &Path, _: Duration) -> Result<()> {
+        let gate = self.checkpoint_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            self.checkpoint_entered.notify_one();
+            gate.notified().await;
+        }
         std::fs::write(path.join("memory"), b"continued-state:42").unwrap();
         Ok(())
     }
@@ -143,12 +174,18 @@ impl RuntimeDriver for Backend {
 }
 #[async_trait]
 impl Readiness for Backend {
+    async fn activity(&self, _: &EnvironmentRecord) -> Result<(u64, u64)> {
+        Ok((1, 0))
+    }
     async fn wait_ready(&self, _: &EnvironmentRecord) -> Result<()> {
         Ok(())
     }
 }
 #[async_trait]
 impl Routes for Backend {
+    async fn activity(&self, _: &EnvironmentRecord) -> Result<(String, u64, u64)> {
+        Ok(("relay".into(), 1, 0))
+    }
     async fn begin_reconcile(&self) -> Result<()> {
         let routes = self.versioned_routes.lock().unwrap().clone();
         if let Some(routes) = routes {
@@ -265,6 +302,8 @@ async fn worker(
             Arc::new(sink.clone()),
         )
         .with_checkpointing(store.clone(), backend.clone())
+        .unwrap()
+        .with_upgrade_control(dir.path().join("upgrade.json"), session.clone())
         .unwrap(),
     );
     manager
@@ -296,7 +335,13 @@ async fn worker(
             capacity: Some(spec().resources.into()),
             runtime_classes: vec!["test-runtime".into()],
             checkpoint_scopes: vec!["test-shared".into()],
-            labels: [("ADX_CHECKPOINT_STORAGE".into(), "obs".into())].into(),
+            labels: recovery_profile::qualify(&mut spec())
+                .into_iter()
+                .chain([
+                    ("ADX_CHECKPOINT_STORAGE".into(), "obs".into()),
+                    ("ADX_CHECKPOINT_SCOPE".into(), "test-shared".into()),
+                ])
+                .collect(),
             session_id: session,
             heartbeat_sequence: 1,
             reconciling: true,
@@ -503,6 +548,216 @@ impl Rig {
         .await
         .map(tonic::Response::into_inner)
     }
+}
+
+async fn post_upgrade(
+    address: std::net::SocketAddr,
+    path: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    upgrade_request(address, "POST", path, body.to_string()).await
+}
+
+async fn upgrade_request(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: String,
+) -> serde_json::Value {
+    let (status, body) = upgrade_response(address, method, path, body).await;
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+async fn upgrade_response(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: String,
+) -> (u16, serde_json::Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    socket
+        .write_all(
+            format!(
+                "{method} /v1/node-upgrades/{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(8), socket.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = String::from_utf8(bytes).unwrap();
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    (
+        headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        serde_json::from_str(body).unwrap(),
+    )
+}
+
+const MIGRATE_PATH: &str = "tasks/planned-migration/migrate";
+
+async fn prepare_migration(
+    rig: &Rig,
+    running: pb::EnvironmentRecord,
+) -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    serde_json::Value,
+) {
+    use serde_json::json;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(adx_coordinator::autoscaling::serve(
+        listener,
+        rig.rpc.clone(),
+    ));
+    let task = "planned-migration";
+    let source = &rig.source.report;
+    let binding = json!({
+        "node_id": source.node_id, "node_session_id": source.session_id, "pod_uid": "source-pod"
+    });
+    post_upgrade(
+        address,
+        "tasks",
+        json!({
+            "task_id": task, "epoch": 1, "namespace": "test", "daemonset_uid": "daemonset",
+            "target_image": format!("image@sha256:{}", "d".repeat(64)), "nodes": [binding]
+        }),
+    )
+    .await;
+    post_upgrade(
+        address,
+        "tasks/planned-migration/prepare-node",
+        json!({
+            "task_id": task, "epoch": 1, "operation_id": "prepare",
+            "node_id": source.node_id, "node_session_id": source.session_id, "pod_uid": "source-pod"
+        }),
+    )
+    .await;
+    let migrate = json!({
+        "task_id": task, "epoch": 1, "operation_id": "migrate",
+        "environment_id": "sleep", "node_id": source.node_id, "node_session_id": source.session_id,
+        "pod_uid": "source-pod", "target_node_id": rig.target.report.node_id,
+        "expected_source_generation": running.assignment.unwrap().generation,
+        "expected_source_revision": running.revision, "checkpoint_storage_alias": "obs"
+    });
+    (address, server, migrate)
+}
+
+async fn report(
+    worker: &mut Worker,
+    coordinator: &str,
+    period: Duration,
+) -> std::result::Result<(), tonic::Status> {
+    let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(coordinator, Principal::Node(worker.report.node_id.clone())).await,
+    );
+    adxlet::node_reconciliation::reconcile_node(
+        &mut client,
+        &mut worker.report,
+        &worker.manager,
+        None,
+        Duration::from_secs(2),
+        period,
+        tokio::time::Instant::now() + period,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn planned_migration_wakes_both_nodes_before_the_next_periodic_reconciliation() {
+    use tokio::time::{interval_at, timeout, Instant};
+
+    let mut rig = Rig::new(Duration::from_secs(4)).await;
+    let running = rig.resume(false).await.unwrap().record.unwrap();
+    let (address, server, migrate) = prepare_migration(&rig, running).await;
+    let operation = migrate.clone();
+    let mut migration =
+        tokio::spawn(async move { post_upgrade(address, MIGRATE_PATH, operation).await });
+
+    let period = Duration::from_secs(60);
+    let next_tick = Instant::now() + period;
+    let mut source_tick = interval_at(next_tick, period);
+    let mut target_tick = interval_at(next_tick, period);
+    timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            rig.source.manager.wait_for_reconciliation(&mut source_tick),
+            rig.target.manager.wait_for_reconciliation(&mut target_tick)
+        )
+    })
+    .await
+    .expect("both ownership handoffs must be triggered before the first periodic tick");
+
+    let (task, node) = timeout(Duration::from_millis(750), async {
+        tokio::join!(
+            upgrade_request(address, "GET", "tasks/planned-migration", String::new()),
+            upgrade_request(address, "GET", "nodes/a/inspect", String::new())
+        )
+    })
+    .await
+    .expect("read requests must finish while migration is still in progress");
+    assert_eq!(task["operations"]["migrate"]["phase"], "Assigned");
+    assert_eq!(node["node_id"], "a");
+
+    report(&mut rig.target, &rig.address, period).await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(250), &mut migration)
+            .await
+            .is_err(),
+        "target adoption alone cannot authorize Restore"
+    );
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+    report(&mut rig.source, &rig.address, period).await.unwrap();
+    let completed = timeout(Duration::from_secs(3), &mut migration)
+        .await
+        .expect("migration should complete before the first periodic tick")
+        .unwrap();
+    assert_eq!(completed["node_id"], "b");
+    assert_eq!(completed["state"], "Running");
+    assert_eq!(
+        post_upgrade(address, MIGRATE_PATH, migrate).await,
+        completed
+    );
+    assert!(rig.source.backend.running.lock().unwrap().is_empty());
+    assert_eq!(
+        rig.source
+            .manager
+            .inspect_upgrade()
+            .await
+            .unwrap()
+            .controllers,
+        0
+    );
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 1);
+    let mut target = pb::node_service_client::NodeServiceClient::new(
+        channel(&rig.target.report.node_address, Principal::Coordinator).await,
+    );
+    target
+        .wake_node_reconciliation(pb::WakeNodeReconciliationRequest {
+            node_session_id: rig.target.report.session_id.clone(),
+        })
+        .await
+        .unwrap();
+    timeout(
+        Duration::from_secs(1),
+        rig.target.manager.wait_for_reconciliation(&mut target_tick),
+    )
+    .await
+    .unwrap();
+    assert!(!rig.target.report.reconciling);
+    report(&mut rig.target, &rig.address, period)
+        .await
+        .expect("a late wake on a reconciled session uses the ordinary report");
+    server.abort();
 }
 
 #[tokio::test]

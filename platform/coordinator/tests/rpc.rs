@@ -5,6 +5,8 @@ mod environment_control;
 mod mounts;
 #[path = "rpc/node_retirement.rs"]
 mod node_retirement;
+#[path = "support/recovery_profile.rs"]
+mod recovery_profile;
 #[path = "rpc/snapshot_preparation.rs"]
 mod snapshot_preparation;
 #[path = "rpc/volumes.rs"]
@@ -594,6 +596,7 @@ async fn lifecycle_rpc_scenario() {
     assert_eq!(
         stale_coordinator
             .create_environment(pb::StartAssignedEnvironmentRequest {
+                creation_request_id: String::new(),
                 create_deadline_unix_millis: 0,
                 snapshot: None,
                 spec: Some(spec("late").into()),
@@ -650,6 +653,7 @@ async fn lifecycle_rpc_scenario() {
     assert_eq!(
         node_frontend
             .create_environment(pb::StartAssignedEnvironmentRequest {
+                creation_request_id: String::new(),
                 create_deadline_unix_millis: 0,
                 snapshot: None,
                 node_session_id: "boot-1".into(),
@@ -737,7 +741,7 @@ async fn lifecycle_rpc_scenario() {
 
                 node_session_id: String::new(),
                 assignment: Some(stale),
-                caller: caller()
+                caller: caller(),
             })
             .await
             .unwrap_err()
@@ -3503,6 +3507,12 @@ async fn coordinator_restart_releases_snapshot_pins_for_lost_memory_queue_only()
 struct RecoveryBackend(Backend);
 #[async_trait::async_trait]
 impl RuntimeDriver for RecoveryBackend {
+    fn recovery_profile(
+        &self,
+        spec: &EnvironmentSpec,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        Ok(recovery_profile::qualify(&mut spec.clone()))
+    }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
         self.0.inventory().await
     }
@@ -3628,6 +3638,8 @@ async fn shared_checkpoint_recovery(
 ) {
     use adx_checkpoint_storage::{CheckpointAccess, ObjectCheckpointStore};
     use adx_core::{Assignment, EnvironmentState, RestorePoint};
+    let mut original_spec = spec("held");
+    let profile = recovery_profile::qualify(&mut original_spec);
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(2).await.unwrap();
     let test_peers = || {
@@ -3649,7 +3661,6 @@ async fn shared_checkpoint_recovery(
     .await
     .unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let mut original_spec = spec("held");
     let volume = if managed_volume {
         use adx_core::{
             execution::{Mount, MountSource},
@@ -3802,7 +3813,7 @@ async fn shared_checkpoint_recovery(
         channel(ma, "apiserver").await,
     );
     let mut source_report = pb::RegisterNodeRequest {
-        checkpoint_scopes: vec![],
+        checkpoint_scopes: vec!["test-scope".into()],
         node_id: "source".into(),
         node_address: "127.0.0.1:9001".into(),
         proxy_address: "source:9002".into(),
@@ -3813,9 +3824,16 @@ async fn shared_checkpoint_recovery(
         ..Default::default()
     };
     let mut target_report = pb::RegisterNodeRequest {
-        checkpoint_scopes: vec![],
+        checkpoint_scopes: vec!["test-scope".into()],
         storage_mounts: Default::default(),
-        labels: [("ADX_CHECKPOINT_STORAGE".into(), "shared".into())].into(),
+        labels: profile
+            .clone()
+            .into_iter()
+            .chain([
+                ("ADX_CHECKPOINT_STORAGE".into(), "shared".into()),
+                ("ADX_CHECKPOINT_SCOPE".into(), "test-scope".into()),
+            ])
+            .collect(),
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -3872,6 +3890,7 @@ async fn shared_checkpoint_recovery(
         },
         resources_held: true,
         checkpoint: Some(RestorePoint {
+            recovery_profile: profile,
             id: "pause".into(),
             artifact: artifact.clone(),
             expires_at_unix_seconds: None,

@@ -31,9 +31,15 @@ directory reads, getxattr/listxattr and read-only opens share it and wait only
 for that inode's admitted bodies; writes, resizes, syncs, xattr changes and the
 remaining file callbacks hold it exclusively, and a waiting exclusive callback
 fences new readers. Same-inode dispatcher turns include deferred read completion
-across handles. Namespace changes retain a conservative mount-wide barrier that
-also drains dispatched callbacks; a path LOOKUP excludes only namespace changes and
-waits for admitted bodies, not for in-flight callbacks. Gates survive the real
+across handles. Path-addressed callbacks take no gate: namespace changes (create,
+mknod, mkdir, unlink, rmdir, symlink, rename) wait for no other file's bodies or
+in-flight callbacks, and changes in one directory are ordered by the kernel's
+directory locks. A path LOOKUP resolves the name, then waits only for the bodies of
+the resolved inode admitted before it arrived, and resolves again if it waited, so
+its reply includes them. Close-to-open across a rename relies on FLUSH, which
+replies only after the inode's admitted bodies ran and their data was committed to
+Meta: after "write a temporary file, close, rename over the target", a new open of
+the target on another node reads the whole new content. Gates survive the real
 dispatched operation, rather than just its enqueue. Fixed local replies retain
 validation without acquiring these body/dispatcher barriers; a fixed local
 getxattr (the kernel's per-write `security.capability` probe) is answered on the

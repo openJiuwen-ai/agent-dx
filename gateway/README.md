@@ -28,6 +28,8 @@ and remain outside that typed API.
 
 The default `activity-client` feature builds the managed Ingress and Relay entrypoints. Embedded and standalone Ingress both use `ingress::IngressService`; only the owning process changes. Standalone Ingress requires `ADX_INGRESS_CONTROL_CONFIG` pointing to [ingress-control.json](../build/config/examples/ingress-control.json). Coordinator must map the Ingress client certificate to the `ingress` role. Public listener TLS and Ingress-to-Node security remain separate settings. The optional `etcd-watch` library and legacy test fixtures are retained separately; the managed Ingress entrypoint uses the new Coordinator route service.
 
+DigitalMate 业务配置中心的部署、身份续期与回收边界见[中文部署说明](../docs/deployment/digitalmate-privacy.md)。
+
 The gateway is a member of the root Cargo workspace. Run from repository root:
 
 ```sh
@@ -71,7 +73,7 @@ provide equivalent environment-veth/host-firewall isolation before enabling
 `network` mode. User NetworkPolicy must not be able to weaken that baseline.
 `ADX_DATA_PLANE_RELAY_ALLOW_ANY_INGRESS=1` /
 `ADX_DATA_PLANE_INGRESS_ALLOW_ANY_CLIENT=1` remain development-only ACL escapes.
-Ingress has separate TLS and plaintext listeners. Direct is accepted only on the
+By default, Ingress has separate TLS and plaintext listeners. Direct is accepted only on the
 TLS listener and always requires a user token. The generic relay supports anonymous tunnel and port-forwarding/SSH routes. The managed Coordinator route resolver forces token authentication for port-forwarding/SSH; such routes require TLS. A published `portForwardRoutes` entry can
 require a token for one target port; that port is then rejected on the plaintext
 listener and authenticated on the TLS listener. Plaintext requests carrying
@@ -100,17 +102,36 @@ creating a physical connection; reused connections do not repeat the check.
 
 Ordinary Direct HTTP requests use a bounded keep-alive pool keyed by the full
 endpoint identity `(node, instance, workload, environment IP, port)`.
-Consequently, a connection can never move between environments or survive an
-route change. WebSocket/Upgrade and raw CONNECT traffic remain
-one logical H2 stream per client connection. Route changes and explicit Node
-Proxy retirement,
-and drain immediately invalidate matching idle HTTP connections.
+Consequently, a connection never moves between environments or execution bindings.
+WebSocket/Upgrade and raw CONNECT traffic remain one logical H2 stream per client
+connection. Route changes and Ingress drain invalidate matching idle HTTP
+connections. Active sessions record the route-store revision at admission;
+queued events from before admission cannot cancel a newly opened download.
+Later revocations still close old sessions, including when an identical endpoint
+is subsequently restored. HTTP pool keys include that instance's revision so a
+new request cannot reuse a connection admitted before revocation; changes to
+other instances do not change its pool key. Requests waiting for a connection
+recheck the admitted revision and authorization metadata before forwarding.
+An obsolete, unsent admission may retry the current route once within its original
+deadline and authorization scope. Authorization changes are rejected; transient
+route failures return a retryable response with `requestForwarded: false`.
+Requests already sent are never replayed. Delayed revocations invalidate only
+older pool revisions. Planned node upgrades wait for natural stream inactivity,
+then close admission against the observed activity revision before checkpointing.
 
 The pool defaults to 64 concurrent connections per endpoint, 64 idle
 connections per endpoint, 1024 idle connections globally, a 3 second acquire
 timeout, and a 5 second idle lifetime. An idle pooled HTTP connection is still
 an active Node CONNECT stream, so the short lifetime deliberately bounds how
-long pooling can defer environment idle reclamation. These settings are tunable:
+long pooling can defer environment idle reclamation. Continuously reused backend
+HTTP connections also have a 30 second maximum lifetime: expiry prevents reuse
+**after the current response completes**, and never truncates its body. This can
+expose idle gaps without closing admission while clients remain active; overlapping
+connections or continuous traffic can still prevent a planned upgrade. A long-lived
+CONNECT, upgraded session or file transfer can exceed the pause budget; the
+upgrade fails safely and reopens the source admission instead of forcibly closing
+that stream. A pause budget shorter than the pool lifetime may likewise time out.
+The connection and idle limits are tunable:
 
 ```text
 ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_MAX_CONNECTIONS_PER_ENDPOINT=64
@@ -121,17 +142,25 @@ ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_ACQUIRE_TIMEOUT_MS=3000
 ```
 
 For an HTTP request carrying `X-ADX-Processing-Timeout-Ms` (one positive integer,
-1–86400000 milliseconds), Ingress creates one deadline after receiving its headers.
-Authentication, route lookup, resume, committed-route delivery, pool/CONNECT
-admission, upstream processing and response streaming consume that same deadline.
+1–86400000 milliseconds), Ingress bounds authentication, route lookup, resume,
+committed-route delivery and pool/CONNECT admission by the initial deadline.
+Once forwarding starts, each non-empty request-body data frame renews the window
+for waiting for upstream response headers. After the last upload data, the
+upstream must still return its response headers within that window.
+Successful `2xx` responses finish the processing window at their response headers.
+Their file, tar, port-forwarded HTTP or SSE bodies may continue streaming beyond
+that window. SDK read-inactivity timeouts and single-file Range retries still
+apply. Error response bodies retain the latest processing deadline; WebSocket
+sessions after `101` retain their independent lifetime.
+Requests without this header retain their existing forwarding/streaming behavior.
 The header is removed before forwarding. A cancelled or expired wake RPC returns
 HTTP 503 `ENV_RESUMING` only while application bytes have not been sent, with
 `Retry-After: 1`, a reserved `X-ADX-Error-Code` marker, and a structured error
 containing `retry: same_operation`, `outcome: not_started`, `requestForwarded: false`
 and the request/Environment IDs. Ingress strips that reserved response marker
 from upstream replies. HTTP 504 after forwarding instead reports an unknown
-outcome and `retry: never`; an expired stream with already-sent response headers
-is closed. Rejected checkpoint restoration reports HTTP 409 `ENV_UNAVAILABLE`.
+outcome and `retry: never`; an expired error response stream with already-sent
+headers is closed. Rejected checkpoint restoration reports HTTP 409 `ENV_UNAVAILABLE`.
 
 A request's timeout or disconnection does not cancel a durable wake intent.
 Independent Ingress replicas coalesce through Coordinator and can deliver retries
@@ -850,3 +879,16 @@ HTTP/2. API keys, sandbox envd tokens, private-port traffic credentials, route
 fencing and Relay restrictions remain enforced. Native control/administrator,
 Execd, Agent and CONNECT policies remain unchanged. No forwarded header can
 assert this opt-in. See the [configuration and limits](../docs/deployment/e2b-compatibility.md#显式-http-入口).
+
+### Explicit ingress listeners
+
+`ADX_DATA_PLANE_INGRESS_LISTENERS` optionally replaces the default public listeners with a JSON array. Each entry has `listen`, `tls` (default false), `allow_http_credentials` (default false), and optional `allowed_routes`. With the variable absent, existing TLS/plaintext binds and certificate requirements remain unchanged. An explicit HTTP-only list does not require public TLS certificates. Internal RPC security is configured independently.
+
+```json
+[{"listen":"127.0.0.1:8080","tls":false,"allow_http_credentials":true,
+  "allowed_routes":[{"method":"GET","path":"exact:/healthz"},{"path":"prefix:/api/environment"},{"path":"prefix:/direct"}]}]
+```
+
+Credential-enabled HTTP must be explicitly selected on trusted interfaces. Authentication and tenant checks remain active. It does not enable E2B HTTP unless the E2B HTTP option is also enabled. The default plaintext listener continues rejecting credentials. HTTPS listeners cannot set `allow_http_credentials`.
+
+Route filters run before dispatch. `method` is an optional HTTP method; `path` uses existing `exact:` or segment-bounded `prefix:` syntax. Missing `allowed_routes` retains all routes; an empty list denies every route. These restrictions apply to that public listener only, including health endpoints. They do not configure host firewall or network reachability.

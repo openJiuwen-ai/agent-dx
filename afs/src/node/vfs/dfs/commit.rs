@@ -116,6 +116,10 @@ impl InFlightCommit {
     }
 }
 
+/// Metadata-only syncs one inode rebuilds in a row after Meta refused them on
+/// a changed inode (B5) before the refusal becomes a terminal error.
+const METADATA_SYNC_REBUILD_LIMIT: u32 = 4;
+
 impl DistributedFs {
     /// Barrier: commit until every write this handle's inode had accepted when
     /// the call started is committed (and, for fsync, its metadata synced).
@@ -259,9 +263,18 @@ impl DistributedFs {
             return Ok(None);
         }
         while state.commit_busy || wait_for_operation && state.operation_busy {
-            state = cell
-                .wait(state)
-                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            let wait = crate::node::call_deadline::remaining();
+            if wait.is_some_and(|time| time.is_zero()) {
+                return Err(Error::coded(
+                    afs_error::IO_TIMEOUT,
+                    "DFS commit turn deadline elapsed",
+                ));
+            }
+            state = match wait {
+                Some(wait) => cell.wait_timeout(state, wait),
+                None => cell.wait(state),
+            }
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
         }
         if let Some(error) = state.terminal_error.clone() {
             return Err(error);
@@ -295,6 +308,7 @@ impl DistributedFs {
             Ok(Some(CommitAction::Send(pending)))
         } else {
             let frozen = Self::freeze_state_for_commit(&mut state);
+            state.freeze_proxied_writes();
             state.in_flight = Some(InFlightCommit::Preparing(Box::new(frozen.clone())));
             state.commit_busy = true;
             state.dirty = false;
@@ -375,9 +389,21 @@ impl DistributedFs {
                     && wait_for_operation
                     && state.operation_busy
                 {
-                    state = cell
-                        .wait(state)
-                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                    let remaining = crate::node::call_deadline::remaining();
+                    if remaining.is_some_and(|time| time.is_zero()) {
+                        state.in_flight = Some(InFlightCommit::File(Box::new(pending_file)));
+                        state.commit_busy = false;
+                        cell.notify_all();
+                        return Err(Error::coded(
+                            afs_error::IO_TIMEOUT,
+                            "DFS prepared commit deadline elapsed before send",
+                        ));
+                    }
+                    state = match remaining {
+                        Some(time) => cell.wait_timeout(state, time),
+                        None => cell.wait(state),
+                    }
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
                 }
                 state.in_flight = Some(InFlightCommit::File(Box::new(pending_file)));
                 #[cfg(test)]
@@ -388,9 +414,17 @@ impl DistributedFs {
                 let mut state = cell
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                if crate::node::gc::is_permanent_admission_failure(&prepare_error.error) {
+                    // Meta will never admit this generation's reference: its
+                    // writes can never publish. Report them like any definite
+                    // rejection; the state is discarded (releasing the pin) at
+                    // the next open for write.
+                    state.terminal_error = Some(prepare_error.error.clone());
+                }
                 let failed = *frozen;
                 if state.dirty_extents.is_empty() {
                     state.dirty_extents.restore_before(failed.dirty_extents);
+                    state.restore_proxied_writes();
                     state.in_flight = None;
                 } else {
                     state.in_flight = Some(InFlightCommit::Preparing(Box::new(failed)));
@@ -411,18 +445,48 @@ impl DistributedFs {
     ) -> Result<Option<u64>> {
         let committed_kill_suidgid = matches!(&pending, InFlightCommit::File(pending) if pending.frozen.kill_suidgid_dirty)
             || matches!(&pending, InFlightCommit::Metadata(sync, _) if sync.metadata_delta.kill_suidgid);
-        let result = match &pending {
-            InFlightCommit::Preparing(_) => Err(unavailable("DFS inode commit is still preparing")),
-            InFlightCommit::File(pending) => self.send_file_commit(pending, branch),
-            InFlightCommit::Metadata(sync, through_seq) => {
-                self.send_metadata_sync(sync, *through_seq, branch)
-            }
+        // Admission expiry is safe before sending. Once sent, keep the
+        // publication RPC's usual result and exact-replay semantics.
+        let result = if crate::node::call_deadline::remaining().is_some_and(|time| time.is_zero()) {
+            Err(Error::coded(
+                afs_error::IO_TIMEOUT,
+                "DFS publication deadline elapsed before send",
+            ))
+        } else {
+            crate::node::call_deadline::without(|| match &pending {
+                InFlightCommit::Preparing(_) => {
+                    Err(unavailable("DFS inode commit is still preparing"))
+                }
+                InFlightCommit::File(pending) => self.send_file_commit(pending, branch),
+                InFlightCommit::Metadata(sync, through_seq) => {
+                    self.send_metadata_sync(sync, *through_seq, branch)
+                }
+            })
         };
 
+        // B5: Meta refuses a metadata-only sync whose inode changed after it
+        // was frozen. Read the inode again (outside the state lock) and let
+        // `settle_metadata_sync_conflict` drop or rebuild the sync.
+        let conflict_current = match (&result, &pending) {
+            (Err(error), InFlightCommit::Metadata(sync, _))
+                if error.code() == afs_error::META_DFS_CONFLICT =>
+            {
+                Some(self.validate_inode(self.meta.get_inode(&sync.inode_id)?)?)
+            }
+            _ => None,
+        };
         let mut state = cell
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
         state.commit_busy = false;
+        if let (Some(current), InFlightCommit::Metadata(sync, through_seq)) =
+            (conflict_current, &pending)
+            && state.metadata_sync_rebuilds < METADATA_SYNC_REBUILD_LIMIT
+        {
+            Self::settle_metadata_sync_conflict(&mut state, sync, *through_seq, current);
+            cell.notify_all();
+            return Ok(None);
+        }
         let outcome = match result {
             Ok(AppliedCommit::File {
                 through_seq,
@@ -447,6 +511,8 @@ impl DistributedFs {
                 updated,
             }) => {
                 state.in_flight = None;
+                state.meta_mtime_unix_ms = updated.attributes.mtime_unix_ms;
+                state.metadata_sync_rebuilds = 0;
                 state.inode = updated;
                 state.metadata_dirty = false;
                 state.kill_suidgid_dirty = false;
@@ -459,6 +525,7 @@ impl DistributedFs {
                 let definite = is_definite_commit_rejection(&error);
                 Self::record_commit_error_locked(&mut state, &error, definite);
                 if definite && let InFlightCommit::File(pending) = pending {
+                    state.restore_proxied_writes();
                     state
                         .dirty_extents
                         .restore_before(pending.frozen.dirty_extents);
@@ -567,6 +634,7 @@ impl DistributedFs {
         mut updated: InodeRecord,
     ) {
         state.in_flight = None;
+        state.meta_mtime_unix_ms = updated.attributes.mtime_unix_ms;
         if !committed_full_metadata {
             updated.attributes.mtime_unix_ms = state.inode.attributes.mtime_unix_ms;
             updated.attributes.ctime_unix_ms = state.inode.attributes.ctime_unix_ms;
@@ -580,13 +648,17 @@ impl DistributedFs {
                     Self::clear_kernel_write_privileges(updated.attributes.mode);
             }
         }
+        state.commit_proxied_writes(&version.id, updated.revision);
         state.inode = updated;
         state.base_version = Some(version);
         state.base_layout = layout;
+        // In-flight reads keep their own reference of the old base (R94).
+        let _retired_base_reference = state.base_read_reference.take();
         state.dirty = !state.dirty_extents.is_empty();
         state.durable_write_seq = through_seq;
         state.committed_write_seq = through_seq;
-        state.last_writer_background_requested = false;
+        state.writeback_retry_at = None;
+        state.writeback_failures = 0;
         state.native_due = state.native_due_through > through_seq;
         if committed_full_metadata
             && state.dirty_extents.is_empty()
@@ -597,6 +669,56 @@ impl DistributedFs {
         if committed_kill_suidgid && !has_later_dirty {
             state.kill_suidgid_dirty = false;
         }
+        // A close-triggered writeback must still publish metadata left by a
+        // DataOnly replay. Clear the request only after settling the commit.
+        state.last_writer_background_requested &=
+            state.dirty || state.metadata_dirty || state.kill_suidgid_dirty;
+    }
+
+    /// A metadata-only sync lost to a newer inode on Meta (B5). When Meta's
+    /// mtime moved since this state last took it, the newer update set the
+    /// times explicitly (utimens on any node): it supersedes the write times
+    /// owed for writes up to `through_seq`, so they are dropped, unless the
+    /// sync also carries a privilege clear or a write came later. Otherwise
+    /// the update was unrelated (a chmod): the owed times are kept and the
+    /// next sync is built on the newer revision.
+    ///
+    /// Known limit, accepted: Meta's refusal does not say which update won,
+    /// so an explicit utimens that sets exactly the mtime this state last took
+    /// from Meta reads as "unrelated", and the rebuilt sync then writes the
+    /// write time over it. Rebuilds in a row are bounded by
+    /// `METADATA_SYNC_REBUILD_LIMIT`; past it the refusal takes the terminal
+    /// error path like any definite commit rejection.
+    fn settle_metadata_sync_conflict(
+        state: &mut InodeWriteState,
+        sync: &SyncInodeMetadata,
+        through_seq: u64,
+        current: InodeRecord,
+    ) {
+        state.in_flight = None;
+        let times_set_elsewhere = current.attributes.mtime_unix_ms != state.meta_mtime_unix_ms;
+        let meta_mtime = current.attributes.mtime_unix_ms;
+        if times_set_elsewhere
+            && !sync.metadata_delta.kill_suidgid
+            && state.visible_write_seq <= through_seq
+        {
+            state.inode = current;
+            state.metadata_dirty = false;
+            state.last_writer_background_requested = false;
+        } else {
+            state.metadata_sync_rebuilds = state.metadata_sync_rebuilds.saturating_add(1);
+            let mut rebuilt = current;
+            rebuilt.attributes.mtime_unix_ms = state.inode.attributes.mtime_unix_ms;
+            rebuilt.attributes.ctime_unix_ms = rebuilt
+                .attributes
+                .ctime_unix_ms
+                .max(state.inode.attributes.ctime_unix_ms);
+            if state.kill_suidgid_dirty {
+                rebuilt.attributes.mode = state.inode.attributes.mode;
+            }
+            state.inode = rebuilt;
+        }
+        state.meta_mtime_unix_ms = meta_mtime;
     }
 
     /// A definite rejection is terminal for the inode; anything else leaves the

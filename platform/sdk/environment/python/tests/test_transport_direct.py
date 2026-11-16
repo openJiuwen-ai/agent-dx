@@ -1618,6 +1618,68 @@ def test_resumable_download_continues_from_part_file():
     print("ok: resumable download continues from .part")
 
 
+def _check_copy_to_local_resumes_interrupted_body(*, exhaust_retries: bool):
+    calls = []
+
+    class InterruptedDownload(httpx.SyncByteStream):
+        def __init__(self, chunk: bytes):
+            self.chunk = chunk
+
+        def __iter__(self):
+            yield self.chunk
+            raise httpx.ReadError("download interrupted after partial body")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/invoke"):
+            return httpx.Response(200, json={
+                "name": "out.bin", "path": "/tmp/out.bin", "type": "file", "size": 8,
+                "permissions": "", "modified_time": 0,
+            })
+        _check(request.method == "GET", f"download method: {request.method}")
+        _check(request.url.path == "/direct/environment-demo/download", f"download path: {request.url.path}")
+        _check(request.url.params.get("path") == "/tmp/out.bin", f"download params: {request.url.params}")
+        calls.append(request.headers.get("range"))
+        if len(calls) == 1:
+            _check(calls == [None], f"initial download range: {calls}")
+            return httpx.Response(200, stream=InterruptedDownload(b"abcd"))
+        _check(calls == [None, "bytes=4-"], f"resume requests: {calls}")
+        if exhaust_retries:
+            return httpx.Response(206, headers={"Content-Range": "bytes 4-7/8"},
+                                  stream=InterruptedDownload(b"ef"))
+        return httpx.Response(206, headers={"Content-Range": "bytes 4-7/8"}, content=b"efgh")
+
+    with patch.dict(os.environ, {"ADX_RESUME_MAX_RETRIES": "1"}):
+        client = _make_client(handler)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "out.bin"
+            part = Path(f"{target}.part")
+            try:
+                Filesystem(client, "environment-demo").copy_to_local("/tmp/out.bin", str(target))
+            except EnvironmentError as error:
+                _check(exhaust_retries, f"resumable download failed: {error}")
+                _check(isinstance(error.__cause__, httpx.ReadError), f"download error cause: {error.__cause__}")
+            else:
+                _check(not exhaust_retries, "exhausted download must fail")
+            _check(calls == [None, "bytes=4-"], f"download retry budget: {calls}")
+            if exhaust_retries:
+                _check(not target.exists(), "partial download must not be published")
+                _check(part.read_bytes() == b"abcdef", "interrupted download did not retain partial bytes")
+            else:
+                _check(target.read_bytes() == b"abcdefgh", "resumed download bytes mismatch")
+                _check(not part.exists(), "successful download left a partial file")
+    finally:
+        client.close()
+
+
+def test_copy_to_local_resumes_after_partial_body_read_error():
+    _check_copy_to_local_resumes_interrupted_body(exhaust_retries=False)
+
+
+def test_copy_to_local_retry_exhaustion_does_not_publish_partial_file():
+    _check_copy_to_local_resumes_interrupted_body(exhaust_retries=True)
+
+
 def test_tunnel_client_keeps_http_req_dedup_cache():
     import adx_environment.tunnel_client as tunnel_client
 
@@ -1960,6 +2022,8 @@ if __name__ == "__main__":
     test_copy_to_local_file_uses_direct_download()
     test_direct_invoke_sends_request_id_header_and_body()
     test_resumable_download_continues_from_part_file()
+    test_copy_to_local_resumes_after_partial_body_read_error()
+    test_copy_to_local_retry_exhaustion_does_not_publish_partial_file()
     test_tunnel_client_keeps_http_req_dedup_cache()
     test_direct_entry_uses_server_and_ignores_plain_gateway_entry()
     test_copy_from_local_dir_streams_direct_tar_upload()

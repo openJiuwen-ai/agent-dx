@@ -105,6 +105,9 @@ pub(super) struct OwnerFsAssembly {
         Arc<rpc::meta::GrpcRootMeta>,
         Arc<vfs::ownerfs::root::RootManager>,
     )>,
+    /// Meta handle and root manager for the outlet mirror and the reclaim
+    /// sweep. `None` without OwnerFs: neither task has anything to work on.
+    pub(super) outlet_control: Option<super::outlet::OutletControl>,
 }
 
 /// 段 7: RootManager, RDMA probe, MountManager startup reconciliation.
@@ -118,6 +121,7 @@ pub(super) async fn assemble(
     let session_id = &startup.session_id;
     let timeout = startup.timeout;
     let mut workspace_bind_root_control = None;
+    let mut outlet_control = None;
     let ownerfs_instance = if cfg.ownerfs {
         let endpoint = meta_endpoint.expect("OwnerFs checked meta_endpoint");
         let root_meta = Arc::new(rpc::meta::GrpcRootMeta::new(
@@ -177,6 +181,9 @@ pub(super) async fn assemble(
             })
             .await??,
         );
+        outlet_control = Some(super::outlet::OutletControl {
+            meta: root_meta.clone(),
+        });
         if cfg.experimental_ownerfs_workspace_bind {
             workspace_bind_root_control = Some((root_meta, roots.clone()));
         }
@@ -195,7 +202,7 @@ pub(super) async fn assemble(
         } else {
             vfs::ownerfs::OwnerFs::new_local_with_remote(roots, disk, remote_factory)
         };
-        let owner = Arc::new(owner);
+        let owner = Arc::new(owner.with_workspace_defaults(cfg.workspace_default_identity()?));
         if let Some(mm) = owner.mount_manager() {
             mm.attach_owner(&owner);
             // Startup egress reconciliation (D4 §4.4): detach residual bind
@@ -225,6 +232,7 @@ pub(super) async fn assemble(
     Ok(OwnerFsAssembly {
         instance: ownerfs_instance,
         workspace_bind_root_control,
+        outlet_control,
     })
 }
 
@@ -339,6 +347,25 @@ impl OwnerPeerReaper {
 
     /// Start the reaper as one service; it stops with `services.stop`.
     pub(super) fn start(self, services: &mut Services) {
+        let deletion_fs = self.ownerfs.clone();
+        let deletion_stop = services.stop.subscribe();
+        services.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            let shutdown = cancelled(deletion_stop);
+            tokio::pin!(shutdown);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    _ = tick.tick() => {
+                        let fs = deletion_fs.clone();
+                        match crate::node::bridge::spawn_blocking(move || fs.maintain_workspace_deletions()).await {
+                            Ok(Ok(())) => {},
+                            result => afs_logging::warn!("ownerfs.deletion_maintenance_retry"; "result" => ?result),
+                        }
+                    }
+                }
+            }
+        });
         let ownerfs = self.ownerfs;
         let stop = services.stop.subscribe();
         services.spawn(async move {

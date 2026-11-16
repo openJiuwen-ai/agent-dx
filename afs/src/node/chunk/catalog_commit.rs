@@ -709,6 +709,8 @@ impl LocalChunkStore {
             File::open(&self.chunks)
                 .and_then(|directory| directory.sync_all())
                 .map_err(Error::from)?;
+            #[cfg(test)]
+            catalog_power_loss_tests::directory_synced(&self.chunks);
         }
         let checksum_input = serde_json::to_vec(&(revision, &records))
             .map_err(|error| invalid(format!("cannot checksum local chunk catalog: {error}")))?;
@@ -769,6 +771,7 @@ impl LocalChunkStore {
         }
         let result = append_catalog_txn_observed(
             &self.catalog_path,
+            &self.catalog_name_durable,
             &txn,
             self.read_work.as_ref(),
             |capacity| {

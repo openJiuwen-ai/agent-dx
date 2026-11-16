@@ -214,9 +214,14 @@ fn synthetic_write_state(
             file_length: 0,
             inline_extents: Vec::new(),
         },
+        base_read_reference: None,
+        proxied_writes: HashMap::new(),
         logical_length: 0,
         metadata_dirty,
         kill_suidgid_dirty,
+        prepared_generation: None,
+        meta_mtime_unix_ms: 0,
+        metadata_sync_rebuilds: 0,
         dirty_extents: DirtyExtentMap::default(),
         in_flight: None,
         commit_busy: false,
@@ -234,6 +239,8 @@ fn synthetic_write_state(
         open_writers: 0,
         last_writer_background_requested: false,
         background_error: None,
+        writeback_retry_at: None,
+        writeback_failures: 0,
         terminal_error: None,
     }))
 }
@@ -612,4 +619,420 @@ fn unknown_commit_ack_replays_original_request_after_namespace_revision_change()
     );
     assert_eq!(failed.file_version.id, cas_failed[0].file_version.id);
     assert_eq!(failed.layout_root.id, cas_failed[0].layout_root.id);
+}
+
+/// B4: a setattr without a size reads no inode from Meta first: Meta applies
+/// the change to its current inode and retries drift itself.
+#[test]
+fn setattr_sends_no_client_revision_and_reads_no_inode_first() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("setattr-no-read.bin"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    let reads = meta.get_inode_call_count();
+    fs.setattr(
+        &context(),
+        created.entry.inode,
+        None,
+        &AttributeChange {
+            mode: Some(libc::S_IFREG | 0o600),
+            ..AttributeChange::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(meta.get_inode_call_count(), reads, "no revision read");
+    let requests = meta.setattr_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].expected_inode_revision, None);
+}
+
+/// B5: explicit times set after the data was committed supersede the write
+/// timestamps the inode still owed Meta: no metadata-only sync follows, and
+/// the explicit mtime is not overwritten.
+#[test]
+fn explicit_times_after_a_data_commit_supersede_the_owed_metadata_sync() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("utimens-after-close.bin"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"data").unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+        .unwrap();
+    let explicit = UNIX_EPOCH + std::time::Duration::from_millis(42);
+    fs.setattr(
+        &context(),
+        created.entry.inode,
+        Some(created.handle),
+        &AttributeChange {
+            atime: Some(explicit),
+            mtime: Some(explicit),
+            ..AttributeChange::default()
+        },
+    )
+    .unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap();
+    assert!(
+        meta.metadata_syncs.lock().unwrap().is_empty(),
+        "the explicit times already reached Meta"
+    );
+    assert_eq!(meta.inode.lock().unwrap().attributes.mtime_unix_ms, 42);
+}
+
+/// B5 boundary: a write after the explicit times owes Meta its own mtime.
+#[test]
+fn a_write_after_explicit_times_still_syncs_its_mtime() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("write-after-utimens.bin"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"data").unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+        .unwrap();
+    let explicit = UNIX_EPOCH + std::time::Duration::from_millis(42);
+    fs.setattr(
+        &context(),
+        created.entry.inode,
+        Some(created.handle),
+        &AttributeChange {
+            atime: Some(explicit),
+            mtime: Some(explicit),
+            ..AttributeChange::default()
+        },
+    )
+    .unwrap();
+    fs.write(&context(), created.handle, 4, b"more").unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap();
+    let commits = meta.commits.lock().unwrap();
+    let last = commits.last().unwrap();
+    assert_eq!(last.metadata_delta.mode, CommitMetadataMode::Full);
+    assert!(last.metadata_delta.mtime_unix_ms.unwrap() > 42);
+}
+
+/// B5: a metadata-only sync that reaches Meta after an explicit time set on
+/// Meta (utimens from any node) fails there and is dropped by the Node: the
+/// explicit mtime stays and no error reaches the application.
+#[test]
+fn a_late_metadata_sync_never_overwrites_an_explicit_mtime_set_on_meta() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("late-sync-utimens.bin"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"data").unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+        .unwrap();
+    // Another node's utimens lands on Meta first.
+    {
+        let mut inode = meta.inode.lock().unwrap();
+        inode.attributes.mtime_unix_ms = 42;
+        inode.revision = inode.revision.saturating_add(1);
+    }
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .expect("a superseded timestamp sync is not an error");
+    assert_eq!(meta.inode.lock().unwrap().attributes.mtime_unix_ms, 42);
+    assert!(meta.metadata_syncs.lock().unwrap().is_empty());
+}
+
+/// B5 boundary: an unrelated inode update (chmod) on Meta makes the late sync
+/// fail too, but the owed write mtime is then synced on the newer revision.
+#[test]
+fn a_late_metadata_sync_after_an_unrelated_update_is_rebuilt_not_lost() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("late-sync-chmod.bin"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"data").unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+        .unwrap();
+    let write_mtime = {
+        let state = fs
+            .write_state(&meta.inode.lock().unwrap().inode_id)
+            .unwrap()
+            .unwrap();
+        state.lock().unwrap().inode.attributes.mtime_unix_ms
+    };
+    {
+        let mut inode = meta.inode.lock().unwrap();
+        inode.attributes.mode = libc::S_IFREG | 0o600;
+        inode.revision = inode.revision.saturating_add(1);
+    }
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap();
+    let inode = meta.inode.lock().unwrap();
+    assert_eq!(inode.attributes.mtime_unix_ms, write_mtime);
+    assert_eq!(inode.attributes.mode & 0o777, 0o600, "the chmod is kept");
+    assert_eq!(meta.metadata_syncs.lock().unwrap().len(), 1);
+}
+
+/// B5 known limit (documented on `settle_metadata_sync_conflict`): a utimens
+/// that sets exactly the mtime the Node last took from Meta cannot be told
+/// from an unrelated update, so the rebuilt sync writes the write time over it.
+#[test]
+fn a_utimens_to_the_last_seen_meta_mtime_reads_as_unrelated_and_is_overwritten() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("same-mtime.bin"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"data").unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+        .unwrap();
+    let (seen, write_mtime) = {
+        let state = fs
+            .write_state(&meta.inode.lock().unwrap().inode_id)
+            .unwrap()
+            .unwrap();
+        let state = state.lock().unwrap();
+        (
+            state.meta_mtime_unix_ms,
+            state.inode.attributes.mtime_unix_ms,
+        )
+    };
+    {
+        let mut inode = meta.inode.lock().unwrap();
+        inode.attributes.mtime_unix_ms = seen;
+        inode.revision = inode.revision.saturating_add(1);
+    }
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap();
+    assert_eq!(
+        meta.inode.lock().unwrap().attributes.mtime_unix_ms,
+        write_mtime,
+        "accepted limit: the explicit time equal to the last seen one is lost"
+    );
+}
+
+/// B5: rebuilding a refused metadata sync is bounded; past the limit the
+/// refusal is a terminal error, never an endless loop.
+#[test]
+fn metadata_sync_rebuilds_are_bounded() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("rebuild-storm.bin"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"data").unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+        .unwrap();
+    meta.metadata_sync_races
+        .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+    let error = fs
+        .fsync(&context(), created.handle, SyncMode::Full)
+        .expect_err("a sync refused on every attempt must stop");
+    assert_eq!(error.code(), afs_error::META_DFS_CONFLICT);
+    meta.metadata_sync_races
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    // Bounded: exactly the limit's rebuilds, then the terminal path.
+    assert!(meta.metadata_syncs.lock().unwrap().is_empty());
+}
+
+/// B5: a few refusals in a row (another node keeps changing the inode) are
+/// absorbed by rebuilding; the write mtime still reaches Meta.
+#[test]
+fn a_few_refused_metadata_syncs_are_rebuilt_until_one_lands() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("rebuild-few.bin"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"data").unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+        .unwrap();
+    meta.metadata_sync_races
+        .store(3, std::sync::atomic::Ordering::SeqCst);
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap();
+    assert_eq!(meta.metadata_syncs.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn data_only_replay_after_last_writer_close_persists_mtime_across_setxattr() {
+    let (_temp, meta, fs) = test_fs();
+    assert!(fs.write_resources.pipeline.is_some());
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("native-data-only-replay"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"base").unwrap();
+    // An ambiguous DataOnly outcome retains the exact request for retry.
+    meta.fail_next_commit_with(unavailable("injected DataOnly timeout"));
+    assert!(fs.flush(&context(), created.handle).is_err());
+    let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+    let cell = fs.write_state(&inode_id).unwrap().unwrap();
+    assert!(cell.lock().unwrap().in_flight.is_some());
+    fs.release(&context(), created.handle).unwrap();
+    assert!(cell.lock().unwrap().last_writer_background_requested);
+    assert_eq!(fs.progress_writeback().unwrap(), 1);
+    let (pending_mtime, marker_after_replay) = {
+        let state = cell.lock().unwrap();
+        assert!(state.metadata_dirty && !state.dirty && state.in_flight.is_none());
+        assert_eq!(state.open_writers, 0);
+        (
+            state.inode.attributes.mtime_unix_ms,
+            state.last_writer_background_requested,
+        )
+    };
+    fs.setxattr(
+        &context(),
+        created.entry.inode,
+        OsStr::new("user.replay"),
+        b"fresh",
+        0,
+    )
+    .unwrap();
+    // A normal background tick must make progress with metadata alone.
+    let metadata_progress = fs.progress_writeback().unwrap();
+    let state = cell.lock().unwrap();
+    let persisted_mtime = meta.inode.lock().unwrap().attributes.mtime_unix_ms;
+    assert!(!state.metadata_dirty);
+    assert!(!state.last_writer_background_requested);
+    assert_eq!(
+        persisted_mtime, pending_mtime,
+        "the accepted write's mtime must be persisted by the background flush"
+    );
+    assert_eq!(
+        meta.inode
+            .lock()
+            .unwrap()
+            .xattrs
+            .get(b"user.replay".as_slice())
+            .unwrap(),
+        b"fresh"
+    );
+    drop(state);
+    assert!(marker_after_replay);
+    assert_eq!(metadata_progress, 1);
+    assert!(!fs.writeback_ready().unwrap());
+    let failed = &meta.failed_commits.lock().unwrap()[0];
+    let commits = meta.commits.lock().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].metadata_delta.mode, CommitMetadataMode::DataOnly);
+    assert_eq!(commits[0].operation_id, failed.operation_id);
+    assert_eq!(commits[0].file_version.id, failed.file_version.id);
+    drop(commits);
+    let reader = fs
+        .open(&context(), created.entry.inode, libc::O_RDONLY)
+        .unwrap();
+    let mut data = [0; 4];
+    assert_eq!(fs.read(&context(), reader, 0, &mut data).unwrap(), 4);
+    assert_eq!(&data, b"base");
+    fs.release(&context(), reader).unwrap();
+}
+
+#[test]
+fn full_file_replay_after_last_writer_close_clears_writeback_request() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("native-full-file-replay"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"base").unwrap();
+    meta.fail_next_commit();
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap_err();
+    let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+    let cell = fs.write_state(&inode_id).unwrap().unwrap();
+    fs.release(&context(), created.handle).unwrap();
+    assert!(cell.lock().unwrap().last_writer_background_requested);
+    assert_eq!(fs.progress_writeback().unwrap(), 1);
+    {
+        let state = cell.lock().unwrap();
+        assert!(!state.metadata_dirty);
+        assert!(!state.last_writer_background_requested);
+    }
+    assert_eq!(fs.progress_writeback().unwrap(), 0);
+    assert!(!fs.writeback_ready().unwrap());
+    assert_eq!(meta.commit_count(), 1);
+    assert!(meta.metadata_syncs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn explicit_mtime_after_data_only_replay_clears_writeback_request() {
+    let (_temp, meta, fs) = test_fs();
+    let created = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("explicit-mtime-after-replay"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"data").unwrap();
+    meta.fail_next_commit();
+    fs.flush(&context(), created.handle).unwrap_err();
+    fs.release(&context(), created.handle).unwrap();
+    assert_eq!(fs.progress_writeback().unwrap(), 1);
+    assert!(fs.writeback_ready().unwrap());
+    let explicit = UNIX_EPOCH + Duration::from_millis(42);
+    fs.setattr(
+        &context(),
+        created.entry.inode,
+        None,
+        &AttributeChange {
+            mtime: Some(explicit),
+            ..AttributeChange::default()
+        },
+    )
+    .unwrap();
+    assert!(!fs.writeback_ready().unwrap());
+    assert_eq!(fs.progress_writeback().unwrap(), 0);
+    assert!(meta.metadata_syncs.lock().unwrap().is_empty());
+    assert_eq!(meta.inode.lock().unwrap().attributes.mtime_unix_ms, 42);
 }

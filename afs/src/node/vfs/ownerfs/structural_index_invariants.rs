@@ -141,12 +141,14 @@ fn g2_structural_root_reincarnation_replaces_active_root_alias() {
         root.clone(),
         first_identity.clone(),
         attrs(FileKind::Directory),
+        None,
     );
     let second = state.insert_root(
         name,
         root.clone(),
         second_identity.clone(),
         attrs(FileKind::Directory),
+        None,
     );
 
     assert_ne!(first, second);

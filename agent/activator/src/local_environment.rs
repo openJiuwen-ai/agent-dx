@@ -39,6 +39,23 @@ pub trait EnvironmentApplication: Send + Sync {
         input: Value,
         operation_id: &str,
     ) -> Result<(), EnvironmentError>;
+    /// Pause a Running Environment. The embedding application owns durable publication;
+    /// a returned value must already reflect a committed Paused state. `operation_id`
+    /// carries the deterministic `pause-activator-<sha256>` identity for replay.
+    ///
+    /// This is a required method, not an opt-in capability: `LocalEnvironment::pause` always
+    /// routes here for an embedded deployment, and the upgrade fork pauses the candidate
+    /// before every switch when the previous Environment is dormant. A missing implementation
+    /// therefore fails at compile time rather than degrading to a permanently blocked
+    /// reconciliation. Contrast `Environment::pause`, whose default `Unsupported` body remains
+    /// the opt-out for the many `impl Environment` test fakes that never reach the fork.
+    async fn pause_request(
+        &self,
+        tenant: &str,
+        id: &str,
+        input: Value,
+        operation_id: &str,
+    ) -> Result<Value, EnvironmentError>;
 }
 
 pub struct LocalEnvironment {
@@ -161,5 +178,33 @@ impl Environment for LocalEnvironment {
             id,
             EnvironmentPhase::Deleted,
         ))
+    }
+    async fn pause(
+        &self,
+        tenant: &str,
+        id: &str,
+        timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        environment_request::validate_identity(tenant)?;
+        environment_request::validate_identity(id)?;
+        if !(1..=3600).contains(&timeout_seconds) {
+            return Err(EnvironmentError::Invalid(
+                "pause timeout_seconds out of API bounds 1..=3600".into(),
+            ));
+        }
+        let operation_id = environment_request::pause_operation_id(tenant, id)?;
+        let input = environment_request::pause_input(timeout_seconds);
+        let value = tokio::time::timeout(
+            Duration::from_secs(timeout_seconds),
+            self.application
+                .pause_request(tenant, id, input, &operation_id),
+        )
+        .await
+        .map_err(|_| {
+            EnvironmentError::OutcomeUnknown(
+                "Environment pause timed out; query the original ID".into(),
+            )
+        })??;
+        environment_request::paused(tenant, id, &value)
     }
 }

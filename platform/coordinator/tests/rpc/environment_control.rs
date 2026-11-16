@@ -84,6 +84,7 @@ async fn paused_controls_use_native_creation_and_retention_when_owner_is_offline
         record.resources_held = false;
         record.runtime.ip = None;
         record.checkpoint = Some(adx_core::RestorePoint {
+            recovery_profile: Default::default(),
             id: format!("pause-{id}"),
             origin: None,
             expires_at_unix_seconds: expiry,

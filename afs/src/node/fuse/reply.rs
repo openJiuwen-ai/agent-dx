@@ -429,6 +429,9 @@ pub(super) fn fuse_failure_grade(op: FuseOp, errno: i32, error: &Error) -> Failu
         // is an AFS credential fault, not a permission answer.
         libc::EACCES if error.kind() == ErrorKind::Unauthenticated => Fault,
         libc::EACCES | libc::EPERM => Warn,
+        // Performance batch 1 (A): the open-time name check's ESTALE is
+        // expected under concurrent renames; the kernel retries it once.
+        libc::ESTALE if error.code() == afs_error::NODE_DFS_STALE_NAME => Debug,
         libc::ESTALE => Warn,
         _ => Fault,
     }

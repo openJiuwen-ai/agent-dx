@@ -48,6 +48,29 @@ impl CatalogCommitTestControl {
 }
 
 impl LocalChunkStore {
+    #[cfg(test)]
+    pub(crate) fn fail_next_catalog_wal_after_sync(&self) {
+        self.test_hooks
+            .catalog_commit_test
+            .fail_wal_step
+            .store(3, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_catalog_wal(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        self.test_hooks
+            .catalog_commit_test
+            .before_wal
+            .lock()
+            .unwrap()
+            .push_back((entered, release));
+        (waiting, resume)
+    }
+
     pub fn open(root: impl AsRef<Path>, node_id: impl Into<String>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let chunks = root.join("chunks");
@@ -84,7 +107,8 @@ impl LocalChunkStore {
         // A prior failed sync may have left a complete transaction in the OS
         // cache. Validate first, then persist both WAL and its name before a
         // reopened store may issue a healthy replay ACK.
-        if catalog_path.exists() {
+        let catalog_name_durable = catalog_path.exists();
+        if catalog_name_durable {
             sync_store_catalog(&catalog_path)?;
             sync_store_directory(&root)?;
         }
@@ -100,12 +124,16 @@ impl LocalChunkStore {
             outboard_budget: OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES),
             outboard_repairs: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
             catalog_path,
+            catalog_name_durable: AtomicBool::new(catalog_name_durable),
             catalog: Mutex::new(catalog),
+            #[cfg(any(feature = "dfs", test))]
             read_cache_admission: Mutex::new(()),
             catalog_committer: CatalogCommitter::default(),
             next_staging: AtomicU64::new(1),
             #[cfg(any(feature = "dfs", test))]
             gc_inventory_cursor: AtomicU64::new(0),
+            #[cfg(any(feature = "dfs", test))]
+            gc_crc_inventory_cursor: AtomicU64::new(0),
             #[cfg(any(feature = "dfs", test))]
             peer_read_crc_mode: crate::config::DfsReadCrcMode::Both,
             read_work: None,
@@ -664,6 +692,8 @@ impl LocalChunkStore {
         {
             let _diagnostic = self.coarse_diagnostic("persist_body_sync", item.chunk.length);
             file.sync_all().map_err(Error::from)?;
+            #[cfg(test)]
+            catalog_power_loss_tests::file_synced(&temp_path);
         }
         let final_path = self.chunk_path(&item.chunk.id);
         if replace_existing {
@@ -689,6 +719,8 @@ impl LocalChunkStore {
             }
             fs::remove_file(&temp_path).map_err(Error::from)?;
         }
+        #[cfg(test)]
+        catalog_power_loss_tests::cut("chunk installed");
         Ok((temp_path, final_path))
     }
 
@@ -762,6 +794,27 @@ impl LocalChunkStore {
         Ok(reader)
     }
 
+    /// Pin a local copy for range reads. A segmented-CRC copy is pinned after
+    /// its identity and descriptor checks only: every later read verifies the
+    /// CRC32C segments it covers, so the eager whole-body scan would only
+    /// detect damage outside what is read, which background scrub owns. Copies
+    /// without segment CRCs keep the eager full verification (and outboard
+    /// build) of `open_verified`.
+    #[cfg(feature = "dfs")]
+    pub(crate) fn open_for_range_reads(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
+        let reader = self.open_cataloged(chunk_id)?;
+        if reader.segment_crc.is_some() {
+            return Ok(reader);
+        }
+        reader.verify_full_and_build().inspect_err(|error| {
+            if verified_copy_is_invalid(error) {
+                self.lifecycle()
+                    .quarantine(chunk_id, QuarantineTrigger::VerifiedOpen);
+            }
+        })?;
+        Ok(reader)
+    }
+
     /// Pin the exact receipt object without an eager full scan. Returning this
     /// descriptor is not an integrity claim: read_at/read_ranges still validate
     /// the delivered coverage groups or use the existing full-scan fallback.
@@ -787,6 +840,7 @@ impl LocalChunkStore {
         chunk: &ChunkObject,
         table: &super::super::chunk_crc32c::CrcTable,
     ) -> Result<()> {
+        check_crc_descriptor(chunk, table, None)?;
         let file = File::open(path).map_err(Error::from)?;
         let identity = PeerFileIdentity::read(&file)?;
         let reader = PinnedChunkReader {
@@ -845,11 +899,7 @@ impl LocalChunkStore {
                 .segment_crc
                 .as_ref()
                 .ok_or_else(|| corrupt(chunk_id, "CRC descriptor missing"))?;
-            if !table.valid_shape(record.chunk.length)
-                || table.descriptor_digest() != record.chunk.content_digest
-            {
-                return Err(corrupt(chunk_id, "CRC descriptor identity differs"));
-            }
+            check_crc_descriptor(&record.chunk, table, self.read_work.as_ref())?;
         }
         let proof_identity = Mutex::new(PeerFileIdentity::read(&file)?);
         Ok(PinnedChunkReader {

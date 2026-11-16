@@ -4,6 +4,43 @@ use afs::config::{
 use clap::{CommandFactory, Parser};
 
 #[test]
+fn workspace_api_requires_node_mount_and_outlet() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("workspace.toml");
+    let resolve = |role, text: &str| {
+        std::fs::write(&path, text).unwrap();
+        Config::resolve(
+            role,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+    };
+    let outlet = "fs='ownerfs'\nownerfs_mount='/mnt/ownerfs'\noutlet_public_root='/opt/adx/workspaces'\noutlet_import_root='/opt/adx/imports'\noutlet_users_root='/opt/adx/nfs/users'\noutlet_nfs_addr='10.0.0.1'\n";
+    let api = "[ownerfs_workspace_api]\nlisten='127.0.0.1:18889'\n";
+    assert!(
+        resolve(Role::Node, "")
+            .unwrap()
+            .ownerfs_workspace_api
+            .is_none()
+    );
+    assert!(resolve(Role::Node, api).is_err());
+    assert!(resolve(Role::Meta, &format!("{outlet}{api}")).is_err());
+    assert!(
+        resolve(Role::Node, &format!("{outlet}{api}"))
+            .unwrap()
+            .ownerfs_workspace_api
+            .is_some()
+    );
+    assert!(
+        resolve(
+            Role::Node,
+            &format!("grpc_listen='127.0.0.1:18889'\n{outlet}{api}")
+        )
+        .is_err()
+    );
+    assert!(resolve(Role::Node, "ownerfs_workspace_default_uid=4294967295\n").is_err());
+}
+
+#[test]
 fn p2_w2_native_write_limits_use_cli_file_defaults_and_bounded_resources() {
     fn limits(config: &Config) -> (u64, usize, usize, u64) {
         (
@@ -2392,4 +2429,41 @@ fn s4c_scrub_settings_default_on_and_reject_out_of_range() {
             Config::resolve(Role::Node, Cli::parse_from(["afs-node", flag, value])).unwrap_err();
         assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{flag} {value}");
     }
+}
+
+/// Performance batch 1 (A): the DFS kernel entry/attribute TTL defaults to
+/// 1 s, 0 turns kernel caching off, and values above 60 s are rejected from
+/// TOML and CLI.
+#[test]
+fn dfs_kernel_cache_ttl_defaults_to_one_second_and_rejects_out_of_range() {
+    let defaults = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(defaults.dfs_kernel_cache_ttl_ms, 1_000);
+    let off = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--dfs-kernel-cache-ttl-ms", "0"]),
+    )
+    .unwrap();
+    assert_eq!(off.dfs_kernel_cache_ttl_ms, 0);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ttl.toml");
+    std::fs::write(&path, "dfs_kernel_cache_ttl_ms=60000\n").unwrap();
+    let max = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert_eq!(max.dfs_kernel_cache_ttl_ms, 60_000);
+    std::fs::write(&path, "dfs_kernel_cache_ttl_ms=60001\n").unwrap();
+    let error = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    let error = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--dfs-kernel-cache-ttl-ms", "60001"]),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
 }

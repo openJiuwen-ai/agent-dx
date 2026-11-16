@@ -7,7 +7,7 @@ use adxlet::{
     Adxlet, Durability, Readiness, Routes, RuntimeDriver, StateSink,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -428,6 +428,92 @@ fn local_bind_mount_includes_the_oci_bind_flag() {
         .any(|option| option == "bind" || option == "rbind"));
     assert!(mount.options.iter().any(|option| option == "rw"));
     assert!(mount.options.iter().any(|option| option == "nosuid"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn explicit_runsc_handle_option_is_normalized_for_create_and_restore_only() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let mut environment = spec();
+    environment
+        .execution
+        .mounts
+        .push(adx_core::execution::Mount {
+            create_if_missing: false,
+            create_options: None,
+            kind: "bind".into(),
+            target: "/workspace".into(),
+            options: vec![
+                "rw".into(),
+                "disable_file_handle_sharing".into(),
+                "disable_file_handle_sharing".into(),
+            ],
+            source: adx_core::execution::StorageSource::Local(
+                workspace.path().to_str().unwrap().into(),
+            )
+            .into(),
+        });
+    let original = environment.execution.mounts[0].options.clone();
+    adapter
+        .start(&environment, "handle-create", 1, &[])
+        .await
+        .unwrap();
+    adapter.remove("handle-create").await.unwrap();
+    server.release.add_permits(1);
+    let checkpoint = tempfile::tempdir().unwrap();
+    adapter
+        .restore(&environment, "handle-restore", 2, &[], checkpoint.path())
+        .await
+        .unwrap();
+    adapter.remove("handle-restore").await.unwrap();
+    let starts = server.starts.lock().unwrap();
+    assert_eq!(starts.len(), 2);
+    for request in starts.iter() {
+        let mount = request
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/workspace")
+            .unwrap();
+        assert_eq!(
+            mount
+                .options
+                .iter()
+                .filter(|value| value.as_str() == "disable_file_handle_sharing")
+                .count(),
+            1
+        );
+    }
+    assert_eq!(environment.execution.mounts[0].options, original);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn explicit_runsc_handle_option_rejects_unavailable_source_before_rpc() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut environment = spec();
+    environment
+        .execution
+        .mounts
+        .push(adx_core::execution::Mount {
+            create_if_missing: false,
+            create_options: None,
+            kind: "bind".into(),
+            target: "/workspace".into(),
+            options: vec!["rw".into(), "disable_file_handle_sharing".into()],
+            source: adx_core::execution::StorageSource::Local(
+                directory.path().join("missing").to_str().unwrap().into(),
+            )
+            .into(),
+        });
+    assert!(adapter
+        .start(&environment, "handle-unavailable", 1, &[])
+        .await
+        .is_err());
+    assert!(server.starts.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2221,4 +2307,81 @@ async fn periodic_inventory_preserves_create_admitted_during_catalog_read() {
         .unwrap()
         .iter()
         .any(|r| r.starts_with("delete:")));
+}
+
+#[test]
+fn independent_peer_aliases_accept_equivalent_domain_spellings() {
+    use adx_core::execution as model;
+    for configured in ["node.example", "NODE.EXAMPLE."] {
+        for requested in ["node.example", "Node.Example", "node.example."] {
+            let mut environment = spec();
+            environment.execution.network = Some(model::NetworkPolicy {
+                traffic: Some(model::TrafficPolicy {
+                    ingress_default_action: model::NetworkAction::Deny,
+                    egress_default_action: model::NetworkAction::Deny,
+                    mode: model::TrafficMode::Stateful,
+                    rules: vec![model::NetworkRule {
+                        action: model::NetworkAction::Allow,
+                        direction: model::NetworkDirection::Egress,
+                        protocol: model::NetworkProtocol::Tcp,
+                        peer: model::NetworkPeer {
+                            domain: requested.into(),
+                            port: 8080,
+                            ..Default::default()
+                        },
+                        environment_port: 0,
+                        environment_port_range: None,
+                        priority: 100,
+                    }],
+                }),
+                dns: None,
+            });
+            let config = Config {
+                network_peer_aliases: BTreeMap::from([(
+                    configured.into(),
+                    "10.88.4.1/32".parse().unwrap(),
+                )]),
+                ..Default::default()
+            };
+            let request = start_request(&environment, "alias", 1, &[], &config).unwrap();
+            let rule = &request.network_policy.unwrap().traffic.unwrap().rules[0];
+            let peer = rule.peer.as_ref().unwrap();
+            assert_eq!(peer.cidr, "10.88.4.1/32");
+            assert!(peer.domain.is_empty());
+            assert_eq!(peer.port, 8080);
+        }
+    }
+}
+
+#[test]
+fn source_bounded_execd_replies_survive_policy_replacement() {
+    use adx_core::execution as model;
+    let mut environment = spec();
+    environment.execution.network = Some(model::NetworkPolicy {
+        traffic: Some(model::TrafficPolicy {
+            ingress_default_action: model::NetworkAction::Deny,
+            egress_default_action: model::NetworkAction::Deny,
+            rules: vec![],
+            mode: model::TrafficMode::Stateful,
+        }),
+        dns: None,
+    });
+    environment.execution.ports = vec![8080];
+    let config = Config {
+        platform_ingress_sources: Some(vec!["10.88.4.1/32".parse().unwrap()]),
+        ..Default::default()
+    };
+    let request = start_request(&environment, "bounded", 1, &[], &config).unwrap();
+    let traffic = request.network_policy.unwrap().traffic.unwrap();
+    for rule in &traffic.rules {
+        let ports = rule.sandbox_port_range.as_ref().unwrap();
+        assert_eq!(rule.peer.as_ref().unwrap().cidr, "10.88.4.1/32");
+        assert_eq!(ports.first, ports.last);
+        match ports.first {
+            50090 => assert_eq!(rule.direction, NetworkDirection::Both as i32),
+            8080 => assert_eq!(rule.direction, NetworkDirection::Ingress as i32),
+            other => panic!("unexpected platform port {other}"),
+        }
+    }
+    assert_eq!(traffic.rules.len(), 2);
 }

@@ -1050,6 +1050,100 @@ fn holds(store: &LocalChunkStore, item: &StagedChunk) -> bool {
 }
 
 #[test]
+fn pipeline_pair_transfers_before_local_wal_and_waits_for_both_acks() {
+    use std::{sync::mpsc, time::Duration};
+
+    struct ObservedPeer {
+        peer: Arc<LocalChunkStore>,
+        durable: mpsc::Sender<()>,
+    }
+
+    impl ReplicaDataPlane for ObservedPeer {
+        fn mode(&self) -> ReplicaTransferMode {
+            ReplicaTransferMode::GrpcStream
+        }
+
+        fn prepare_peer(&self, _: &ReplicaPeerOp) -> Result<()> {
+            Ok(())
+        }
+
+        fn put_peer_replica(
+            &self,
+            op: &ReplicaPeerOp,
+            item: &StagedChunk,
+        ) -> Result<Vec<ReplicaAck>> {
+            let ack =
+                self.peer
+                    .persist(item, &op.target, op.placement_revision, op.placement_epoch)?;
+            self.durable.send(()).unwrap();
+            Ok(vec![ack])
+        }
+    }
+
+    let f = selective_fail_fixture(None, None);
+    let (at_local_wal, resume_local) = f.local.pause_next_catalog_wal();
+    let (durable, at_peer) = mpsc::channel();
+    let sink = DfsChunkSink::new_with_epoch(
+        "a".into(),
+        1,
+        f.local.clone(),
+        f.store.placement.clone(),
+        Arc::new(ObservedPeer {
+            peer: f.plane.peer.clone(),
+            durable,
+        }),
+    );
+    let item = staged("pipeline pair overlap");
+    let (finished, result) = mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            finished
+                .send(sink.put_chunks(vec![item.clone()], PutIntent::PipelineUpload))
+                .unwrap();
+        });
+        let local = at_local_wal.recv_timeout(Duration::from_secs(3));
+        let peer = at_peer.recv_timeout(Duration::from_secs(3));
+        let premature_result = result.try_recv();
+        // Always release the paused write, including on the serial baseline.
+        drop(resume_local);
+        assert!(local.is_ok(), "head did not reach its local WAL");
+        assert!(
+            peer.is_ok(),
+            "tail did not commit while head WAL was paused"
+        );
+        assert!(matches!(premature_result, Err(mpsc::TryRecvError::Empty)));
+        let receipts = result
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipts[0].receipt.durable_acks.len(), 2);
+        assert_eq!(receipts[0].body_release, BodyRelease::ReleaseAfterUpload);
+        assert!(holds(&f.local, &item));
+        assert!(holds(&f.plane.peer, &item));
+    });
+}
+
+#[test]
+fn pipeline_pair_never_acknowledges_a_peer_only_copy_after_head_failure() {
+    let f = selective_fail_fixture(None, None);
+    f.local.fail_next_catalog_wal_after_sync();
+    let item = staged("peer-only orphan");
+    let error = f
+        .store
+        .put_chunks(vec![item.clone()], PutIntent::PipelineUpload)
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::IO_OTHER);
+    assert!(
+        error
+            .to_string()
+            .contains("injected catalog write/sync/parent barrier failure 3")
+    );
+    assert_eq!(*f.plane.sent.lock().unwrap(), vec![item.chunk.id.clone()]);
+    assert!(!holds(&f.local, &item));
+    assert!(holds(&f.plane.peer, &item));
+}
+
+#[test]
 fn characterize_write_batch_one_failed_hop_fails_whole_batch_without_rollback() {
     let items = [staged("batch-1"), staged("batch-2"), staged("batch-3")];
     let f = selective_fail_fixture(None, Some(items[1].chunk.id.clone()));
@@ -2196,5 +2290,74 @@ fn chunk_store_put_microbench() {
                 );
             }
         }
+    }
+}
+
+struct R84FailingTargetPlane {
+    calls: Mutex<Vec<String>>,
+    error: afs_error::ErrorCode,
+}
+
+impl ReplicaDataPlane for R84FailingTargetPlane {
+    fn mode(&self) -> ReplicaTransferMode {
+        ReplicaTransferMode::GrpcStream
+    }
+
+    fn prepare_peer(&self, _: &ReplicaPeerOp) -> Result<()> {
+        Ok(())
+    }
+
+    fn put_peer_replica(&self, op: &ReplicaPeerOp, item: &StagedChunk) -> Result<Vec<ReplicaAck>> {
+        self.calls.lock().unwrap().push(op.target.node_id.clone());
+        if op.target.node_id == "b" {
+            return Err(Error::coded(self.error, "R84 peer failure"));
+        }
+        Ok(vec![ack_for(&op.target, op, item)])
+    }
+}
+
+#[test]
+fn r84_strict_pair_uses_an_authoritative_alternative_after_peer_failure() {
+    for error in [afs_error::NODE_TRANSFER_UNAVAILABLE, afs_error::IO_CAPACITY] {
+        let fixture = selective_fail_fixture(None, None);
+        let mut snapshot = (*fixture.store.placement.snapshot().unwrap()).clone();
+        snapshot.failure = crate::dfs::ReplicaFailureConfig::strict();
+        let mut alternative = snapshot.replica_groups[0].clone();
+        alternative.id = ReplicaGroupId::new("r84-alternative");
+        alternative.targets[1] = target("c", remote_device("c-device"));
+        snapshot.replica_groups.push(alternative);
+        let item = staged_for_group(&snapshot, 0);
+        let plane = Arc::new(R84FailingTargetPlane {
+            calls: Mutex::new(Vec::new()),
+            error,
+        });
+        let sink = DfsChunkSink::new_with_epoch(
+            "a".into(),
+            1,
+            fixture.local.clone(),
+            Arc::new(StaticPlacement {
+                snapshot: Arc::new(snapshot),
+            }),
+            plane.clone(),
+        );
+        let stored = sink
+            .put_chunks(vec![item.clone()], PutIntent::PipelineUpload)
+            .unwrap();
+        assert_eq!(*plane.calls.lock().unwrap(), ["b", "c"]);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].receipt.replica_group_id,
+            ReplicaGroupId::new("r84-alternative")
+        );
+        assert_eq!(
+            stored[0]
+                .receipt
+                .durable_acks
+                .iter()
+                .map(|ack| ack.node_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        assert!(holds(&fixture.local, &item));
     }
 }

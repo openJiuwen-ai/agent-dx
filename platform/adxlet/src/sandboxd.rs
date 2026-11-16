@@ -16,6 +16,8 @@ use tonic::{Code, Request};
 use tower::service_fn;
 
 mod overlaybd;
+mod recovery;
+mod runsc_mounts;
 use overlaybd::OverlaybdConnector;
 
 pub mod proto {
@@ -26,22 +28,35 @@ use proto::sandbox_service_client::SandboxServiceClient;
 #[derive(Clone)]
 pub struct Config {
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
+    /// Exact backend executable paths configured in sandboxd; never inferred from PATH.
+    pub checkpoint_runtime_binaries: BTreeMap<String, PathBuf>,
+    pub local_rootfs_templates: BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: String,
     pub rpc_timeout: Duration,
     pub runtime_logs: Option<crate::runtime_logs::RuntimeLogPolicy>,
+    pub network_baseline: Option<crate::network_baseline::NetworkBaseline>,
+    /// Resolve traffic peers on the destination node, independently of policy ceilings.
+    pub network_peer_aliases: BTreeMap<String, ipnet::Ipv4Net>,
+    /// None keeps legacy exceptions; configured CIDRs constrain host-originated control traffic.
+    pub platform_ingress_sources: Option<Vec<ipnet::Ipv4Net>>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             runtime_profile: None,
+            checkpoint_runtime_binaries: BTreeMap::new(),
+            local_rootfs_templates: BTreeMap::new(),
             command: vec!["/usr/local/bin/adx-execd".into()],
             env: HashMap::from([("EXECD_HTTP_PORT".into(), "50090".into())]),
             cwd: "/".into(),
             rpc_timeout: Duration::from_secs(30),
             runtime_logs: None,
+            network_baseline: None,
+            network_peer_aliases: BTreeMap::new(),
+            platform_ingress_sources: None,
         }
     }
 }
@@ -61,6 +76,8 @@ type Cell = Arc<tokio::sync::Mutex<StartState>>;
 pub struct Sandboxd {
     client: SandboxServiceClient<Channel>,
     config: Config,
+    rootfs_identity: Option<crate::RuntimeRootfsIdentity>,
+    recovery_profiles: BTreeMap<String, BTreeMap<String, String>>,
     starts: Arc<Mutex<BTreeMap<String, Cell>>>,
     backend_ids: Arc<Mutex<BTreeMap<String, String>>>,
     overlaybd_connector: Option<Arc<OverlaybdConnector>>,
@@ -135,6 +152,35 @@ fn prepared_overlaybd_rootfs_uses_existing_local_rpc_contract() {
     assert_eq!(request.command, ["/usr/local/bin/adx-execd"]);
 }
 
+fn rootfs_identity(
+    profile: Option<&adx_core::runtime_profile::RuntimeProfile>,
+) -> Result<Option<crate::RuntimeRootfsIdentity>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let Some(profile) = profile.filter(|profile| profile.rootfs.r#type == "local") else {
+        return Ok(None);
+    };
+    let mut file = std::fs::File::open(&profile.rootfs.path).map_err(unavailable)?;
+    if !file.metadata().map_err(unavailable)?.is_file() {
+        return Err(Error::Invalid(
+            "runtime rootfs must be a regular file".into(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer).map_err(unavailable)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(Some(crate::RuntimeRootfsIdentity {
+        path: profile.rootfs.path.clone(),
+        sha256: format!("{:x}", digest.finalize()),
+    }))
+}
+
 fn unavailable(error: impl std::fmt::Display) -> Error {
     Error::Unavailable(format!("sandboxd: {error}"))
 }
@@ -169,6 +215,14 @@ pub async fn connect_when_ready(
 }
 
 impl Sandboxd {
+    /// Measured, immutable node-session evidence for declared recovery backends.
+    pub fn recovery_labels(&self) -> BTreeMap<String, String> {
+        self.recovery_profiles
+            .values()
+            .flat_map(|profile| profile.clone())
+            .collect()
+    }
+
     /// Discover live execution backends through sandboxd's Unix socket.
     pub async fn available_runtime_classes(&self) -> Result<Vec<String>> {
         let response = self
@@ -203,6 +257,13 @@ impl Sandboxd {
                 "sandboxd command and positive RPC timeout are required".into(),
             ));
         }
+        for (name, template) in &config.local_rootfs_templates {
+            adx_core::local_rootfs::capability_label(name)?;
+            template.validate()?;
+            std::fs::metadata(&template.path).map_err(|error| {
+                Error::Invalid(format!("local rootfs template {name}: {error}"))
+            })?;
+        }
         if let Some(e) = &config.runtime_profile {
             e.validate()?;
             let paths = if e.rootfs.r#type == "local" {
@@ -234,6 +295,21 @@ impl Sandboxd {
                 .map_err(|error| Error::Invalid(error.to_string()))?;
             crate::runtime_logs::RuntimeLogs::new(policy.clone()).map_err(unavailable)?;
         }
+        // Deployment rootfs files must remain immutable for the process lifetime.
+        // Hash bytes once off the async executor; a changed image requires a new session.
+        let profile = config.runtime_profile.clone();
+        let binaries = config.checkpoint_runtime_binaries.clone();
+        let (rootfs_identity, recovery_profiles) = tokio::task::spawn_blocking(move || {
+            let identity = rootfs_identity(profile.as_ref())?;
+            let default_root = profile.as_ref().is_some_and(|profile| {
+                profile.bootstrap.r#type == "erofs" && profile.bootstrap.root == profile.rootfs.path
+            });
+            let profiles =
+                recovery::profiles(identity.as_ref().filter(|_| default_root), &binaries)?;
+            Ok::<_, Error>((identity, profiles))
+        })
+        .await
+        .map_err(unavailable)??;
         let channel = Endpoint::from_static("http://localhost")
             .connect_timeout(config.rpc_timeout)
             .connect_with_connector(service_fn(move |_| {
@@ -248,6 +324,8 @@ impl Sandboxd {
         Ok(Self {
             client: SandboxServiceClient::new(channel),
             config,
+            rootfs_identity,
+            recovery_profiles,
             starts: Arc::default(),
             backend_ids: Arc::default(),
             overlaybd_connector,
@@ -329,8 +407,9 @@ impl Sandboxd {
                     .insert("ADX_ENV_FILE".into(), info.restore_env_path);
             }
         }
-        let request = start_request(spec, runtime_id, generation, devices, &config)?;
+        let mut request = start_request(spec, runtime_id, generation, devices, &config)?;
         crate::managed_mounts::prepare(spec).await?;
+        runsc_mounts::normalize(&mut request).await?;
         Ok(self.request(request))
     }
 
@@ -678,6 +757,24 @@ pub fn start_request(
     devices: &[adx_core::scheduling::DeviceAllocation],
     config: &Config,
 ) -> Result<proto::StartRequest> {
+    build_start_request(
+        spec,
+        runtime_id,
+        ownership_generation,
+        devices,
+        config,
+        true,
+    )
+}
+
+pub(crate) fn build_start_request(
+    spec: &EnvironmentSpec,
+    runtime_id: &str,
+    ownership_generation: u64,
+    devices: &[adx_core::scheduling::DeviceAllocation],
+    config: &Config,
+    omit_profile_path_for_custom_rootfs: bool,
+) -> Result<proto::StartRequest> {
     spec.validate()?;
     adx_core::scheduling::validate_device_assignment(&spec.scheduling.devices, devices)?;
     if runtime_id.is_empty()
@@ -704,9 +801,32 @@ pub fn start_request(
     }
     validate_protected_ingress(spec)?;
     let environment = spec.runtime_profile.as_ref();
+    let options = &spec.execution;
+    let custom_rootfs = options.rootfs.is_some() || !spec.image.is_empty();
     let mut envs: HashMap<String, String> = spec.env.clone().into_iter().collect();
     if let Some(e) = environment {
-        envs.extend(e.env.clone());
+        for (key, value) in &e.env {
+            if key == "PATH" && custom_rootfs && omit_profile_path_for_custom_rootfs {
+                continue;
+            }
+            envs.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(adx_core::execution::Rootfs {
+        source: adx_core::execution::StorageSource::Local(path),
+        ..
+    }) = &spec.execution.rootfs
+    {
+        let template = config
+            .local_rootfs_templates
+            .values()
+            .find(|value| &value.path == path);
+        if let Some(template) = template {
+            template.validate()?;
+            for (key, value) in &template.env {
+                envs.insert(key.clone(), spec.env.get(key).unwrap_or(value).clone());
+            }
+        }
     }
     // Deployment configuration owns control ports, tokens, and execution identity.
     envs.extend(config.env.clone());
@@ -783,7 +903,6 @@ pub fn start_request(
         };
         xpu.entry(kind.into()).or_default().push(d.id);
     }
-    let options = &spec.execution;
     options.validate_tunnel_network(options.network.as_ref())?;
     envs.retain(|key, _| !key.starts_with("EXECD_TUNNEL_"));
     if let Some(port) = options.tunnel_http_port {
@@ -801,7 +920,7 @@ pub fn start_request(
         .iter()
         .map(environment_mount)
         .collect::<Result<Vec<_>>>()?;
-    if options.rootfs.is_some() || !spec.image.is_empty() {
+    if custom_rootfs {
         mounts.extend(environment.map_or_else(Vec::new, |e| {
             vec![proto::Mount {
                 r#type: if e.bootstrap.r#type == "image" {
@@ -949,13 +1068,12 @@ pub fn start_request(
         ]),
         writable_layer_limit_bytes: disk_limit,
         extra_config: options.extra_config.clone(),
-        network_policy: options
-            .network
-            .as_ref()
-            .map(|policy| {
-                environment_network_policy(policy, &options.ports, options.tunnel_http_port, config)
-            })
-            .transpose()?,
+        network_policy: optional_network_policy(
+            options.network.as_ref(),
+            &options.ports,
+            options.tunnel_http_port,
+            config,
+        )?,
         inject_entrypoint: if options.inherit_entrypoint {
             image_process_config.into()
         } else {
@@ -1062,6 +1180,24 @@ fn environment_mount(value: &adx_core::execution::Mount) -> Result<proto::Mount>
     })
 }
 
+fn optional_network_policy(
+    value: Option<&adx_core::execution::NetworkPolicy>,
+    ports: &[u16],
+    tunnel_http_port: Option<u16>,
+    config: &Config,
+) -> Result<Option<proto::NetworkPolicy>> {
+    match (value, config.network_baseline.as_ref()) {
+        (Some(value), _) => {
+            environment_network_policy(value, ports, tunnel_http_port, config).map(Some)
+        }
+        (None, Some(baseline)) => {
+            environment_network_policy(&baseline.enforce(None)?, ports, tunnel_http_port, config)
+                .map(Some)
+        }
+        (None, None) => Ok(None),
+    }
+}
+
 pub(crate) fn environment_network_policy(
     value: &adx_core::execution::NetworkPolicy,
     ports: &[u16],
@@ -1069,6 +1205,52 @@ pub(crate) fn environment_network_policy(
     config: &Config,
 ) -> Result<proto::NetworkPolicy> {
     use adx_core::execution as model;
+    crate::network_baseline::validate_peer_aliases(&config.network_peer_aliases)?;
+    let mut resolved = value.clone();
+    if let Some(traffic) = &mut resolved.traffic {
+        for rule in &mut traffic.rules {
+            if rule.peer.domain.is_empty() {
+                continue;
+            }
+            if let Some(cidr) = crate::network_baseline::resolve_peer_alias(
+                &config.network_peer_aliases,
+                &rule.peer.domain,
+            ) {
+                if !rule.peer.address.is_empty() || !rule.peer.cidr.is_empty() {
+                    return Err(Error::Invalid(
+                        "network peer alias cannot be combined with an address or CIDR".into(),
+                    ));
+                }
+                rule.peer.domain.clear();
+                rule.peer.cidr = cidr.to_string();
+            }
+        }
+    }
+    let enforced = config
+        .network_baseline
+        .as_ref()
+        .map(|baseline| baseline.enforce(Some(&resolved)))
+        .transpose()?;
+    let value = enforced.as_ref().unwrap_or(&resolved);
+    if config
+        .platform_ingress_sources
+        .as_ref()
+        .is_some_and(|sources| sources.is_empty())
+    {
+        return Err(Error::Invalid(
+            "platform_ingress_sources must not be empty".into(),
+        ));
+    }
+    if config.platform_ingress_sources.is_some()
+        && value
+            .traffic
+            .as_ref()
+            .is_none_or(|traffic| traffic.mode != model::TrafficMode::Stateful)
+    {
+        return Err(Error::Invalid(
+            "source-bounded platform exceptions require stateful traffic policy".into(),
+        ));
+    }
     model::ExecutionOptions {
         tunnel_http_port,
         ports: ports.to_vec(),
@@ -1132,46 +1314,66 @@ pub(crate) fn environment_network_policy(
         // Control traffic and declared public ports remain reachable under a
         // deny-by-default user policy. UINT32_MAX is reserved by the public
         // contract for these platform-owned rules.
+        let sources = config.platform_ingress_sources.as_ref().map_or_else(
+            || vec![proto::NetworkEndpoint::default()],
+            |sources| {
+                sources
+                    .iter()
+                    .map(|source| proto::NetworkEndpoint {
+                        cidr: source.to_string(),
+                        ..Default::default()
+                    })
+                    .collect()
+            },
+        );
         for port in std::iter::once(execd_port).chain(ports.iter().copied()) {
-            rules.push(proto::TrafficRule {
-                action: proto::NetworkPolicyAction::Allow as i32,
-                // Execd control replies must not depend on a conntrack entry
-                // from the previous policy generation. Stateless published
-                // ports also need an explicit return-path rule.
-                direction: if port == execd_port || traffic.mode == model::TrafficMode::Stateless {
-                    proto::NetworkDirection::Both as i32
-                } else {
-                    proto::NetworkDirection::Ingress as i32
-                },
-                protocol: proto::NetworkProtocol::Tcp as i32,
-                peer: Some(proto::NetworkEndpoint::default()),
-                // sandboxd schema v2 forbids the legacy scalar
-                // `sandbox_port`. An exact port is represented as a one-value
-                // range, including platform-owned EXECD and published-port
-                // exceptions.
-                sandbox_port_range: Some(proto::PortRange {
-                    first: u32::from(port),
-                    last: u32::from(port),
-                }),
-                priority: u32::MAX,
-                ..Default::default()
-            });
+            for source in &sources {
+                rules.push(proto::TrafficRule {
+                    action: proto::NetworkPolicyAction::Allow as i32,
+                    // Execd control replies must not depend on a conntrack entry
+                    // from the previous policy generation. Configured platform
+                    // CIDRs also bound this bidirectional control-port exception.
+                    // Stateless published ports need an explicit return path.
+                    direction: if port == execd_port
+                        || (config.platform_ingress_sources.is_none()
+                            && traffic.mode == model::TrafficMode::Stateless)
+                    {
+                        proto::NetworkDirection::Both as i32
+                    } else {
+                        proto::NetworkDirection::Ingress as i32
+                    },
+                    protocol: proto::NetworkProtocol::Tcp as i32,
+                    peer: Some(source.clone()),
+                    // sandboxd schema v2 forbids the legacy scalar
+                    // `sandbox_port`. An exact port is represented as a one-value
+                    // range, including platform-owned EXECD and published-port
+                    // exceptions.
+                    sandbox_port_range: Some(proto::PortRange {
+                        first: u32::from(port),
+                        last: u32::from(port),
+                    }),
+                    priority: u32::MAX,
+                    ..Default::default()
+                });
+            }
         }
         // Only a new inbound handshake may establish the tunnel return path.
         // A Both rule would allow arbitrary outbound TCP with this source port.
         if let Some(port) = tunnel_http_port {
-            rules.push(proto::TrafficRule {
-                action: proto::NetworkPolicyAction::Allow as i32,
-                direction: proto::NetworkDirection::Ingress as i32,
-                protocol: proto::NetworkProtocol::Tcp as i32,
-                peer: Some(proto::NetworkEndpoint::default()),
-                sandbox_port_range: Some(proto::PortRange {
-                    first: u32::from(port - 1),
-                    last: u32::from(port - 1),
-                }),
-                priority: u32::MAX,
-                ..Default::default()
-            });
+            for source in &sources {
+                rules.push(proto::TrafficRule {
+                    action: proto::NetworkPolicyAction::Allow as i32,
+                    direction: proto::NetworkDirection::Ingress as i32,
+                    protocol: proto::NetworkProtocol::Tcp as i32,
+                    peer: Some(source.clone()),
+                    sandbox_port_range: Some(proto::PortRange {
+                        first: u32::from(port - 1),
+                        last: u32::from(port - 1),
+                    }),
+                    priority: u32::MAX,
+                    ..Default::default()
+                });
+            }
         }
         // Execd initiates this connection. Preserve only the node-owned TCP
         // endpoint, including its replies under stateless policies. User env
@@ -1245,9 +1447,37 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
+    fn recovery_profile(&self, spec: &EnvironmentSpec) -> Result<BTreeMap<String, String>> {
+        if !spec.image.is_empty()
+            || spec.execution.rootfs.is_some()
+            || spec
+                .runtime_profile
+                .as_ref()
+                .is_some_and(|profile| Some(profile) != self.config.runtime_profile.as_ref())
+        {
+            return Ok(BTreeMap::new());
+        }
+        let Some(published) = self.recovery_profiles.get(&spec.runtime_class) else {
+            return Ok(BTreeMap::new());
+        };
+        let rootfs = rootfs_identity(self.config.runtime_profile.as_ref())?;
+        let observed =
+            recovery::profiles(rootfs.as_ref(), &self.config.checkpoint_runtime_binaries)?;
+        if observed.get(&spec.runtime_class) != Some(published) {
+            return Err(Error::Unavailable(
+                "recovery backend or host changed; a new node session is required".into(),
+            ));
+        }
+        Ok(published.clone())
+    }
+
     async fn sandbox_id(&self, runtime_id: &str) -> Option<String> {
         self.physical_id(runtime_id).await.ok().flatten()
     }
+    fn runtime_rootfs_identity(&self) -> Option<crate::RuntimeRootfsIdentity> {
+        self.rootfs_identity.clone()
+    }
+
     // Keep RuntimeDriver's conservative input retention: sandboxd can enable
     // runsc background page loading independently of adxlet configuration.
     // Firecracker also retains its caller-owned incremental memory base.
@@ -1402,16 +1632,15 @@ impl RuntimeDriver for Sandboxd {
         let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
         self.client
             .clone()
-            .set_network_policy(
-                self.request(proto::SetNetworkPolicyRequest {
-                    sandbox_id: id,
-                    network_policy: policy
-                        .map(|value| {
-                            environment_network_policy(value, ports, tunnel_http_port, &self.config)
-                        })
-                        .transpose()?,
-                }),
-            )
+            .set_network_policy(self.request(proto::SetNetworkPolicyRequest {
+                sandbox_id: id,
+                network_policy: optional_network_policy(
+                    policy,
+                    ports,
+                    tunnel_http_port,
+                    &self.config,
+                )?,
+            }))
             .await
             .map_err(unavailable)?;
         Ok(())
@@ -1608,6 +1837,77 @@ mod tests {
     }
 
     #[test]
+    fn default_local_rootfs_keeps_explicit_workload_without_image_injection() {
+        let profile: adx_core::runtime_profile::RuntimeProfile =
+            serde_json::from_value(serde_json::json!({
+                "rootfs":{"runtime_class":"runsc","type":"local","path":"/opt/adx/runtime.img"},
+                "bootstrap":{"type":"erofs","root":"/opt/adx/runtime.img",
+                    "target":"/__adx","entrypoint":["/__adx/usr/local/bin/adx-execd"]}
+            }))
+            .unwrap();
+        let process = adx_core::execution::WorkloadProcess {
+            commands: Some(vec![vec![
+                "/opt/python/bin/python".into(),
+                "-m".into(),
+                "agentserver".into(),
+            ]]),
+            cwd: Some("/home/agentos".into()),
+            ..Default::default()
+        };
+        let spec = EnvironmentSpec {
+            id: "local-workload".into(),
+            tenant_id: "tenant".into(),
+            image: String::new(),
+            runtime_class: "runsc".into(),
+            runtime_profile: Some(profile.clone()),
+            run_policy: None,
+            envd: None,
+            compatibility: None,
+            snapshot_id: None,
+            lifecycle: Default::default(),
+            env: Default::default(),
+            scheduling: Default::default(),
+            resources: adx_core::Resources {
+                cpu_millis: 1000,
+                memory_bytes: 512 * 1024 * 1024,
+                disk_bytes: 0,
+            },
+            priority: 0,
+            execution: adx_core::execution::ExecutionOptions {
+                process: Some(process.clone()),
+                ..Default::default()
+            },
+        };
+        let request = start_request(
+            &spec,
+            "local-workload-1",
+            1,
+            &[],
+            &Config {
+                runtime_profile: Some(profile),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(request.runtime, "runsc");
+        assert_eq!(
+            request.rootfs.unwrap().source,
+            Some(proto::rootfs_config::Source::Path(
+                "/opt/adx/runtime.img".into()
+            ))
+        );
+        assert!(request.inject_entrypoint.is_empty());
+        assert!(!request.envs.contains_key("ADX_IMAGE_PROCESS_CONFIG"));
+        assert_eq!(
+            serde_json::from_str::<adx_core::execution::WorkloadProcess>(
+                &request.envs[adx_core::execution::WORKLOAD_PROCESS_ENV]
+            )
+            .unwrap(),
+            process
+        );
+    }
+
+    #[test]
     fn deployment_envd_payload_is_enabled_without_compatibility_identity() {
         let profile: adx_core::runtime_profile::RuntimeProfile = serde_json::from_value(serde_json::json!({
             "rootfs":{"runtime_class":"runc","type":"local","path":"/opt/adx/runtime.img","readonly":false},
@@ -1665,6 +1965,14 @@ mod tests {
         assert!(!compatible.envs.contains_key("ADX_ENVD_GATEWAY_AUTH"));
         spec.runtime_profile = None;
         assert!(start_request(&spec, "missing-profile-1", 1, &[], &Config::default()).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let mut profile = config.runtime_profile.unwrap();
+        profile.rootfs.path = directory.path().join("root.img").to_string_lossy().into();
+        profile.bootstrap.root = profile.rootfs.path.clone();
+        std::fs::write(&profile.rootfs.path, b"first").unwrap();
+        let first = rootfs_identity(Some(&profile)).unwrap().unwrap();
+        std::fs::write(&profile.rootfs.path, b"second").unwrap();
+        assert_ne!(first, rootfs_identity(Some(&profile)).unwrap().unwrap());
     }
 
     #[test]
@@ -1749,6 +2057,10 @@ mod tests {
         };
         let default_request = start_request(&spec, "i-7", 7, &[], &Config::default()).unwrap();
         assert!(!default_request.envs.contains_key("EXECD_HTTP_ONLY"));
+        assert!(
+            default_request.ports.is_empty(),
+            "ADX forwarding must not publish host DNAT ports"
+        );
         assert_eq!(default_request.envs["EXECD_HTTP_PORT"], "50090");
         let config = Config {
             env: HashMap::from([
@@ -1779,6 +2091,156 @@ mod tests {
             request.rootfs.unwrap().source,
             Some(proto::rootfs_config::Source::ImageUrl("image:tag".into()))
         );
+    }
+
+    #[test]
+    fn node_peer_aliases_preserve_requested_access_without_a_ceiling() {
+        use adx_core::execution::{
+            DnsPolicy, NetworkAction, NetworkDirection, NetworkPeer, NetworkPolicy,
+            NetworkProtocol, NetworkRule, TrafficMode, TrafficPolicy,
+        };
+        let policy = NetworkPolicy {
+            traffic: Some(TrafficPolicy {
+                ingress_default_action: NetworkAction::Deny,
+                egress_default_action: NetworkAction::Deny,
+                mode: TrafficMode::Stateful,
+                rules: vec![
+                    NetworkRule {
+                        action: NetworkAction::Allow,
+                        direction: NetworkDirection::Egress,
+                        protocol: NetworkProtocol::Tcp,
+                        peer: NetworkPeer {
+                            domain: "ingress.node.invalid".into(),
+                            port: 8080,
+                            ..Default::default()
+                        },
+                        environment_port: 0,
+                        environment_port_range: None,
+                        priority: 300,
+                    },
+                    NetworkRule {
+                        action: NetworkAction::Allow,
+                        direction: NetworkDirection::Egress,
+                        protocol: NetworkProtocol::Tcp,
+                        peer: NetworkPeer {
+                            domain: "model.example".into(),
+                            port: 18046,
+                            ..Default::default()
+                        },
+                        environment_port: 0,
+                        environment_port_range: None,
+                        priority: 300,
+                    },
+                ],
+            }),
+            dns: Some(DnsPolicy {
+                default_action: NetworkAction::Deny,
+                rules: Vec::new(),
+            }),
+        };
+        for bridge in ["10.88.4.1/32", "10.99.0.1/32"] {
+            let config = Config {
+                network_peer_aliases: BTreeMap::from([(
+                    "ingress.node.invalid".into(),
+                    bridge.parse().unwrap(),
+                )]),
+                platform_ingress_sources: Some(vec![bridge.parse().unwrap()]),
+                ..Default::default()
+            };
+            // Creation and policy updates share this translation; replay on a new
+            // node must use that node's address without changing the stored spec.
+            let translated = environment_network_policy(&policy, &[18092], None, &config).unwrap();
+            let traffic = translated.traffic.unwrap();
+            assert_eq!(
+                traffic.egress_default_action,
+                proto::NetworkPolicyAction::Deny as i32
+            );
+            assert_eq!(
+                traffic.ingress_default_action,
+                proto::NetworkPolicyAction::Deny as i32
+            );
+            let ingress = traffic.rules[0].peer.as_ref().unwrap();
+            assert_eq!(ingress.cidr, bridge);
+            assert!(ingress.domain.is_empty());
+            assert_eq!(ingress.port, 8080);
+            let model = traffic.rules[1].peer.as_ref().unwrap();
+            assert_eq!(model.domain, "model.example");
+            assert_eq!(model.port, 18046);
+            assert_eq!(traffic.rules[1].priority, 300);
+            assert_eq!(
+                translated.dns.unwrap().default_action,
+                proto::NetworkPolicyAction::Deny as i32
+            );
+            let platform_rules = &traffic.rules[2..];
+            assert_eq!(platform_rules.len(), 2);
+            assert_eq!(
+                platform_rules[0].direction,
+                proto::NetworkDirection::Both as i32
+            );
+            assert_eq!(
+                platform_rules[0].sandbox_port_range.as_ref().unwrap().first,
+                50090
+            );
+            assert_eq!(
+                platform_rules[1].direction,
+                proto::NetworkDirection::Ingress as i32
+            );
+            assert_eq!(
+                platform_rules[1].sandbox_port_range.as_ref().unwrap().first,
+                18092
+            );
+            for rule in platform_rules {
+                assert_eq!(rule.peer.as_ref().unwrap().cidr, bridge);
+                assert_eq!(rule.protocol, proto::NetworkProtocol::Tcp as i32);
+            }
+            assert!(optional_network_policy(None, &[], None, &config)
+                .unwrap()
+                .is_none());
+            let mut malformed = policy.clone();
+            malformed.traffic.as_mut().unwrap().rules[0].peer.cidr = "192.0.2.0/24".into();
+            assert!(environment_network_policy(&malformed, &[], None, &config).is_err());
+        }
+        assert_eq!(
+            policy.traffic.unwrap().rules[0].peer.domain,
+            "ingress.node.invalid"
+        );
+    }
+
+    #[test]
+    fn source_bounded_workload_ports_do_not_allow_outbound_source_port_bypass() {
+        use adx_core::execution::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
+        let mut policy = NetworkPolicy {
+            traffic: Some(TrafficPolicy {
+                ingress_default_action: NetworkAction::Deny,
+                egress_default_action: NetworkAction::Deny,
+                rules: Vec::new(),
+                mode: TrafficMode::Stateful,
+            }),
+            dns: None,
+        };
+        let config = Config {
+            platform_ingress_sources: Some(vec!["10.88.4.1/32".parse().unwrap()]),
+            ..Default::default()
+        };
+        let translated =
+            environment_network_policy(&policy, &[18092], Some(8766), &config).unwrap();
+        let rules = translated.traffic.unwrap().rules;
+        assert_eq!(rules.len(), 3);
+        let expected = [
+            (50090, proto::NetworkDirection::Both),
+            (18092, proto::NetworkDirection::Ingress),
+            (8765, proto::NetworkDirection::Ingress),
+        ];
+        for (rule, (port, direction)) in rules.iter().zip(expected) {
+            assert_eq!(rule.direction, direction as i32);
+            assert_eq!(rule.peer.as_ref().unwrap().cidr, "10.88.4.1/32");
+            assert_eq!(rule.protocol, proto::NetworkProtocol::Tcp as i32);
+            let range = rule.sandbox_port_range.as_ref().unwrap();
+            assert_eq!((range.first, range.last), (port, port));
+        }
+        policy.traffic.as_mut().unwrap().mode = TrafficMode::Stateless;
+        assert!(environment_network_policy(&policy, &[], None, &config).is_err());
+        assert!(environment_network_policy(&policy, &[], None, &Config::default()).is_ok());
     }
     #[test]
     fn runtime_control_credentials_are_scoped_and_host_secret_is_not_injected() {

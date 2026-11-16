@@ -98,11 +98,11 @@ flowchart TB
 | 文件层 | `Backend` 实现、句柄与读视图、写流水线（唯一写路径）、唯一提交入口、后台写回、版本缓存 | `node/vfs/dfs.rs`（`DistributedFs`，13 个按职责的字段）、`node/vfs/dfs/{backend,handles,read_view,write_pipeline,write_pipeline_ops,dirty_extents,write_state,commit,commit_prepare,writeback,meta_port,version_cache}.rs` |
 | 写代理 | 写租约在别的节点时，代理侧经 `DfsOwnerFiles` 把写交给 owner；owner 侧幂等表与回收 | `node/vfs/dfs/remote_client.rs`（`WriteCoordinator`）、`node/vfs/dfs/owner_gateway.rs`（`OwnerGateway`）、`node/vfs/dfs/owner_op_table.rs` |
 | 读引擎 | 固定版本读：本机副本 → 扇出 → Peer 缓存 → 远端范围读；S3 外部读 | `node/read/engine.rs`、`node/read/engine/*`、`node/read/peer_cache/` |
-| 写下沉 | `ChunkSink`：本机快路径、副本链（链头持久化后转发、收对端持久 ACK、降级写）、S3 上传 | `node/replication.rs`、`node/replication/acks.rs`、`node/external_chunk.rs`、`node/external_chunk/{store,worker,cache,verifier}.rs` |
+| 写下沉 | `ChunkSink`：本机快路径、副本链（链头落盘与转发、收持久 ACK、降级写）、S3 上传 | `node/replication.rs`、`node/replication/acks.rs`、`node/external_chunk.rs`、`node/external_chunk/{store,worker,cache,verifier}.rs` |
 | 本机 chunk 存储 | 暂存 → 持久化（正文、目录、catalog 屏障）→ ACK；校验读；副本生命周期（`CopyLifecycle`）；巡检读盘；服务对端读 | `node/chunk/{store,staged,catalog,catalog_commit,lifecycle,reader,scrub,peer_serve,sidecar_install}.rs` |
 | 故障层 | 修复循环（上报隔离、认领、复制、报告）、GC 回收循环、写租约续期、后台巡检、接收方校验失败的复核 | `node/fault/{repair,reaper,lease_keeper,scrub,suspect,classify}.rs` |
 | GC 执行（Node） | GC 引用（`open:`、`write:`）的建立与有界释放队列；一次回收（本机副本或 S3 对象） | `node/gc/references.rs`、`node/gc/collect.rs` |
-| 后台与装配 | 后台 tick（写回推进等，串行）；装配按后端与职责拆分，后台组件各自有名字与关闭顺序 | `node/background/tick.rs`、`node/assembly/{mod,common,dfs,ownerfs,grpc,shutdown}.rs` |
+| 后台与装配 | 后台 tick（写回推进等，串行）；装配按后端与职责拆分，后台组件各自有名字与关闭顺序 | `node/background/tick.rs`、`node/assembly/{mod,common,dfs,ownerfs,outlet,grpc,shutdown}.rs` |
 | 传输（Node） | 调 Meta 的 `DfsMeta` 客户端；对端读写的 gRPC／RDMA 客户端与连接池；服务对端的 `DfsChunks`、`DfsOwnerFiles` | `node/rpc/meta/*`、`node/rpc/peer/*`、`node/rpc/data/*` |
 | Meta 接入 | gRPC 服务、证书到 Node ID 的绑定校验 | `meta/rpc.rs`、`meta/rpc/{dfs,node}.rs` |
 | Meta DFS 状态机 | 命名空间（含 readdir 分页）、写租约、版本提交、放置与副本写授权、读授权、修复任务与巡检、GC 规划与删除者 | `meta/dfs.rs`、`meta/dfs/{namespace,write_lease,commit,placement,read_auth,repair,gc}.rs`、`meta/dfs/gc/deleter.rs` |
@@ -196,7 +196,7 @@ errno 映射（`afs/src/error.rs`）：`ResourceExhausted` 中 `IO_CAPACITY` 为
 | 存储模式 | fsync／close 成功时数据在哪里 | 代码 |
 | --- | --- | --- |
 | 本地盘 1 副本 | 本机 chunk 正文、目录与 catalog 均已 fsync | `node/chunk/store.rs`（`persist_batch`） |
-| 本地盘多副本 | 链头持久化后转发，收到 `dfs_sync_required_copies` 份持久 ACK；`degrade` 下不少于 `dfs_min_degraded_copies` 份也成功，缺的副本同事务登记待修复 | `node/replication.rs`、`meta/dfs/commit.rs` |
+| 本地盘多副本 | 单块原生上传使用 gRPC、由本节点担任链头且同步两份时，本地落盘与转发并行。两边完成后按原回执规则判定。其他路径保持链头先落盘。严格写要求 `dfs_sync_required_copies` 份持久 ACK，`degrade` 允许满足 `dfs_min_degraded_copies` 下限的副本提交，缺失副本同事务登记待修复 | `node/replication.rs`、`meta/dfs/commit.rs` |
 | S3（外部后端） | S3 PUT 成功且回执经长度与 BLAKE3 校验；本地盘只是缓存 | `node/external_chunk/` |
 
 Meta 状态的持久性取决于 Meta 后端：`local-file` 到本机盘 fsync；`redis` 要求单实例 `appendonly yes`＋`appendfsync always`；
@@ -226,6 +226,8 @@ Redis／etcd 在服务端同一原子单元里比较 term 与 tip，`local-file`
   顺序逐个完整校验本机持久副本，限速 `dfs_scrub_bytes_per_second`（默认 32MiB/s，0 关闭），两轮开始至少相隔
   `dfs_scrub_round_interval_seconds`（默认 86400）。坏副本走同一隔离 → 上报 → 修复链（日志 `dfs.scrub_corrupt_found`）。
   它补上"只有远端读才校验"的缺口：两副本下写入节点总在本机读，另一份副本从不被读，坏了也没人发现。
+  本机读只校验请求覆盖的 32 KiB CRC32C 段（`crc32c-v2` chunk 首次打开只核对身份与 CRC 表摘要，不整块扫描），
+  从未被读到的段上的损坏也由巡检发现；读到的坏段照样隔离、上报并换副本读。
   代码 `node/chunk/scrub.rs`、`node/fault/scrub.rs`；配置见[部署说明](../deployment/afs.md#dfs-后台巡检)。
 
 ### GC
@@ -300,7 +302,7 @@ Running 的认领过期后可被再次认领（调用方核对工人会话）。
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Head: Create（同事务登记句柄的 open: 引用）
+    [*] --> Head: Create（句柄在 Meta 内存登记为读者；Node 未上报读者时回可重试错误）
     Head --> Head: CommitFileVersion：租约与 epoch 校验，<br/>head／revision CAS，parent_version = 旧 head<br/>（meta/dfs/commit.rs）
     Head --> Pinned: 新版本提交后，旧版本仍被某个引用的 pinned_version 命名
     Head --> Unreachable: 新版本提交后无人命名
@@ -310,7 +312,9 @@ stateDiagram-v2
 
 `InodeRecord.head_version` 指向当前版本；`FileVersion{parent_version, length, layout_root}` 只记血缘，不作为保留理由。
 写租约（`WriteLease{owner_node_id, owner_session_id, lease_epoch, expires_at}`）由 `meta/dfs/write_lease.rs` 授予：
-别人持有有效租约时冲突；换主或过期时 `lease_epoch` 加一；同主续期取较晚到期。提交还要求写代引用 `write:<代>`
+别人持有有效租约时返回对方的租约（调用方走代理）；换主或过期时 `lease_epoch` 加一；同主续期取较晚到期。
+取得租约的事务以"租约实体未变"为条件；条件失败时（GC 删掉了过期租约，或别的节点先取得）重新解析，至多 16 次，
+重读到别人的有效租约就返回它，耗尽才报 `META_DFS_CONFLICT`。过期的租约实体会被 GC 删除，删除后再取得的租约 epoch 从 1 起。提交还要求写代引用 `write:<代>`
 属于写者当前会话（写代 fence）。
 
 ### GC 引用与回收代
@@ -495,13 +499,20 @@ Bao sidecar、Peer cache 条目与目录标记、外部对象 key 前缀、Owner
   内层完整解码之前检查。
 - **改编码必升版本**：字段或变体增删改序、serde 属性、postcard 升级、hash 域串变化，都必须同时升
   对应版本并重新生成 golden；变体下标表（G1）与 golden bytes（G2）在编码变化时失败。没有版本字段的
-  `catalog.wal` 与请求摘要只由 golden 钉住。
+  `catalog.wal` 与请求摘要只由 golden 钉住。请求摘要当前为 2（加入 setattr 请求与 create 的首个写代）；
+  它不改变升级前已落盘的记录：摘要只在同一 operation id 重试时比对，而 operation id 带 Node 的 session，
+  停机升级后所有 Node 都是新 session，旧记录不会再被重放比对。
 - **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
 - **协议**：`RegisterNodeRequest.protocol_version` 是集群线协议代际（Node↔Meta 注册、Node↔Node service
-  布局），当前为 6（5 为 `ReadDir` 分页，6 为放置快照与副本写授权携带降级策略 `DfsReplicaFailureConfig`），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
+  布局），当前为 8（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本，8 为元数据复合操作：setattr 可不带客户端 revision、create 并入首个写代引用、复合打开），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
+- **协议 8 已提供、Node 尚未调用的 RPC**：`DfsMeta.ReleaseWriteLeases`（`meta/dfs/lease_release.rs`）按批归还写租约。
+  只归还与 Node 出示的副本完全相同的租约：把到期时间改为当前，epoch 不变，下次取得时 epoch 加一（过期实体已被 GC 删除时从 1 起，与自然过期相同）；
+  不再相同的租约跳过、算成功。整批是一个事务，按 operation id 重放。
+  结果记在 `DfsRenewWriteLease` 操作下（归还即"续到现在"），所以 WAL 与 checkpoint 编码不变。
+  Node 侧在最后一个写者关闭时调用它，是以后的事（R106），届时不需要升协议。
 
 ### OwnerFs Root 授权的代际与回收
 
@@ -716,7 +727,10 @@ DFS FUSE 的本地 owner 普通显式偏移写进一步在前台整笔入有界�
 复制、USRBIO交接和同步先等待相关文件已接纳的正文，正文为空时保持原读并发。
 同inode门跨句柄持有至真实完成：读、getattr、getxattr/listxattr、readlink、目录读和只读open共享，
 只等该inode已接纳的正文；写、截断、同步、xattr修改等独占，等待中的独占回调挡住新的共享回调。
-namespace变更保留全挂载屏障（并等全部在途回调）；路径LOOKUP只与namespace变更互斥并等已接纳正文。
+namespace变更（create、mknod、mkdir、unlink、rmdir、symlink、rename）不进门、不等其他文件的正文或在途回调，
+同目录的变更由内核目录锁排序；路径LOOKUP不进门，解析出inode后只等该inode在LOOKUP到达前已接纳的正文，
+等过则重新解析一次，回复的属性包含这些写。close-to-open跨rename成立靠FLUSH：它等本inode已接纳的正文执行完、
+数据提交到Meta后才回复，所以"写临时文件→close→rename覆盖"之后他节点新open目标读到的是完整新内容。
 固定本地答复的getxattr（内核每次写前的`security.capability`探测）在接收线程直接回复。fsync/flush/release
 通过独立的有界恢复接纳登记续办任务，不占正文额度；正文仍是一条FIFO、一个消费者。
 写成功不表示持久化；fsync/flush/close继续执行原同步，追加、O_SYNC/O_DSYNC、
@@ -739,7 +753,7 @@ Required 策略且同一权威 placement 的实际本机持久 ACK 已验证时�
 仍有引用不能退账。只有描述符额度压力，或无本机副本导致 live 满时，才提前后台发布。
 原生 dirty 区间仍只保留不重叠的最终范围；截断、覆盖和准备失败恢复保持引用安全。
 停止先关闭新接纳并唤醒等待者，排空已接纳上传及有序发布，再关闭 catalog 和空闲池。
-远端 owner 与 OwnerFs 保留各自调度；S3 走同一条写流水线，只是上传并发被压到 4、正文保留到发布。
+远端 owner 与 OwnerFs 保留各自调度；S3 走同一条写流水线，只是上传并发不超过 `dfs_external_backend.upload_concurrency`（默认 8）、正文保留到发布。
 Node负责运行时和后台调度；独立构造的 `DistributedFs` 需外部驱动既有写回入口。
 没有运行时／外部驱动且当前请求无法释放live或描述符额度时，返回结构化错误，不以永久等待冒充背压。
 
@@ -1034,7 +1048,22 @@ flush、fsync及release仍为排他屏障，后续READ不能越过。OwnerFs、S
 官方fuser默认协商buffered异步READ；本次没有额外启用ASYNC_DIO，不能将并发单测
 外推为O_DIRECT单流或整体E2E提速。
 
-DFS普通I/O沿用cached write-through，不启用writeback。默认entry/attr TTL为0；每次新open
+DFS普通I/O沿用cached write-through，不启用writeback。内核目录项TTL（所有类型）与目录属性TTL由
+`dfs_kernel_cache_ttl_ms`决定（默认1000毫秒，0为不缓存），负查找不缓存；**普通文件、符号链接与特殊文件的
+属性不缓存**：不带文件句柄的stat只能按head版本回答，而每个打开的句柄读它打开时固定的版本，内核却按inode
+共享一个`i_size`——缓存head长度会让固定版本句柄的READ短读、页缓存补零；属性不缓存时读路径会带句柄刷新
+长度（与不缓存时相同）。同一inode同一时间只有一个固定版本进入页缓存（`ActiveCachedViews`，版本不同的
+后来者走direct_io）；该版本有句柄打开期间，LOOKUP、GETATTR（带或不带句柄）、LINK与不改长度的SETATTR回复里的
+长度都改报这个版本的长度（`with_cached_view_size`），否则并发的stat回复会让内核拒绝在短读后缩回`i_size`，
+补零的页尾交给应用（R97，支持边界已知限制第20项）。新版本进入页缓存时，回复OPEN前发只作废属性的
+`inval_inode(ino,-1,0)`，让此前请求、尚未落到内核的旧属性回复因`attr_version`过旧被丢弃。他节点的改名、删除和目录属性变化在本节点最多晚一个TTL可见，经本挂载的变化内核
+自己更新。open与opendir做名字校验（`node/vfs/dfs/recent_names.rs`）：Node记住2×TTL内交给内核的
+（父目录, 名字），某inode恰好经由一个这样的名字被打开时，预检用`Lookup(父目录, 名字)`代替`GetInode`
+（RPC数不变），名字已不指向该inode就回`ESTALE`，Linux以`LOOKUP_REVAL`重走一次路径并打开新inode；重走那次
+不再比对（每个`ESTALE`给收到它的线程一次豁免——FUSE请求头带调用线程id，内核的重试由同一线程在同一个open里发出——一个TTL内有效；请求pid为0时退回按名字与inode计数的豁免；10毫秒内刚LOOKUP过的名字也不比对——内核持有的就是
+Meta刚给的inode，其后到OPEN之间的变化与不缓存时lookup和open分两次RPC是同一窗口），应用不会因校验看到
+`ESTALE`。没有记录、记录被淘汰、经多个名字访问过（硬链接）时退回只确认inode存在。按路径的setattr不做
+名字校验，见支持边界已知限制第19项。每次新open
 在线观察Meta，原生只读且没有dirty/provider/外部后端时，用完整提交版本ID和已核对长度
 决定`FOPEN_KEEP_CACHE`。同inode身份完全相同才保留，缺失、变化、超限或不安全路径均不保留；
 成功数据修改撤销该inode的复用资格。身份表最多65536项、版本字符串合计1MiB，另计表结构，
@@ -1045,7 +1074,8 @@ DFS普通I/O沿用cached write-through，不启用writeback。默认entry/attr T
 表锁不跨后端I/O或等待读写锁，最后引用释放时在表锁内回收条目，避免并发获取时分裂锁身份。
 它不是跨节点读许可或撤销协议。内核已收到的页面
 没有再次进入用户态授权检查的机会，不能宣传为可立即撤回的载荷；新open和用户态交付
-仍遵循权限与授权合同。正TTL是明确的宽松路径模式，不满足严格close-to-open。
+仍遵循权限与授权合同。正TTL下普通文件的属性仍不缓存，同一inode的close-to-open（长度、mtime、内容）
+与不缓存时相同（本节点开着旧版本时长度的例外见已知限制第20项）；名字到inode的对应关系由上述名字校验保证。
 
 DFS目录列举按页进行：`DfsMeta.ReadDir`带名字游标`after_name`（不含）与`limit`，Meta每页至多1024项
 （`READ_DIR_PAGE_MAX`），按名字顺序返回只含名字、inode id与类型的精简条目及`eof`；属性由LOOKUP/GETATTR取。
@@ -1073,6 +1103,65 @@ DFS的版本复用与read-ahead设置不覆盖OwnerFs策略。read-ahead是向�
 bind 与远端访问共享底层文件，新打开的可见性及权限仍需按支持范围验证；
 图示不承诺已有 FD/mmap 即时撤权或跨节点锁一致性。
 
+workspace 可以从任意节点的 OwnerFs FUSE 路径删除：Home 在本机执行；非 Home 入口通过
+OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 workspace，非空返回
+`ENOTEMPTY` 且 workspace 保持可用；`rm -rf` 会先删除内容，最后才删除空的 workspace 目录。
+在 egress 路径上对 workspace 目录执行 rmdir 会被内核以 `EBUSY` 拒绝，不会删除 workspace。
+
+## 跨节点 Workspace 出口（outlet）
+
+outlet 让集群内任一节点用**同一个平坦名字**访问某 workspace，而数据权威仍在
+Home 节点的本地盘上，不做复制。每台需要读该名字视图的节点各自跑一份镜像，
+输入都是同一份 Meta 快照。
+
+**Meta 契约**：`OwnerRoots.ListActiveOutletRoots` 是 outlet 镜像面的唯一输入，
+返回全局 Active root 全量快照（`root_id`、`root_epoch`、`home_node_id`、
+`home_nfs_addr`），按 `root_id` 升序以保证 diff 可复现。调用方可携带已持有
+集合的摘要（`known_digest`），Meta 判定无变化时以 `unchanged` 短路——但语义
+上仍是全量快照：没有游标、事件或增量，快照本身就是恢复机制。该 RPC 只读，
+不签发 `RootAccess`，不改变授权语义。
+
+"Active" 在持久层等价于 Root 实体存在：`DeactivateRoot` 直接删除 Root 键，
+不存在软删除状态位，因此快照不需要额外状态过滤。名字由 `root_id` 反解
+（`root-<hex(name)>`，与 OwnerFs 命名同源），不为 outlet 新增持久字段。
+`home_nfs_addr` 来自该 Home 注册会话上报的 NFS 导出地址；为空表示未上报，
+消费方只能跳过并告警，不得猜测兜底。
+
+**节点侧（已实现）**：每节点跑一份镜像 worker：在 tmpfs 名字层收敛
+`/public/<name> -> <import_root>/<home>/users` 软链，自动维护对端（NFS）与
+本机（bind）的 import 挂载；mountinfo 只读诊断随轮输出，配置硬前提（独立
+tmpfs、宿主 mount namespace、`mount(2)` 权限）在启动时 fail-closed 校验。
+没有运行期数据回收：删除契约只在提交前检查空目录（非空返回 `ENOTEMPTY`），
+提交后删除不会留下"待回收"的目录，残余目录由启动 reconcile（有 Meta 全量
+视角）收敛，非空残余保留 catalog 记录并告警，等待人工清理。
+
+`/public` 下的 `.pub`（原子发布的暂存目录）与 `.quarantine`（消费方违约时的
+隔离区）归镜像所有，不能作为 workspace 名：创建时即拒（`EINVAL`）。快照里若
+仍有同名 root（旧版本所建），镜像也不会发布它——保留名对镜像透明，不发布、
+不删除、不隔离。允许这类名字会让发布与隔离互相搬运：暂存文件就在
+`<public_root>/.pub/`，也就是"以 workspace 名命名的目录"里，每轮重建一次并在
+tmpfs 上无限堆积隔离目录，最终 ENOSPC 让整个名字层发布失败。
+
+对端换 IP、以及"挂载在但挂错了"的发现都不依赖访问失败：镜像每轮把 mountinfo
+里 import 挂载的源与期望值比对，不一致即按 `Remount` 重建。远程比三件事——
+文件系统类型以 `nfs` 开头、源地址（仅当上报值是 IP 字面量，主机名会被
+`mount.nfs` 解析成 IP，硬比会永远不等）、导出路径等于 `users_root`；本机 bind
+比 mountinfo 第 4 列的 `root`（bind 的源目录；`source` 字段是设备名，实测
+`/dev/vda1`，比它会把每条正常挂载都判成错的）。任何一项不符都意味着"名字能
+打开、数据是错的"，而这类错误不会以访问失败或发布失败的形式暴露（`hard`
+挂载访问失效对端是阻塞而非报错，发布只写软链、从不访问 target）。源格式读不
+出来时不参与比对，避免每轮重挂。
+
+**名字按字节传递，不做 UTF-8 归一**：workspace 名是任意字节串（Linux 路径分量
+不是 UTF-8），OwnerFs 用 `root-<hex(bytes)>` 无损编码，镜像从 root id 解码后
+必须原样用于 `symlinkat`。若中间转成 `String`（例如 `to_string_lossy`），每个
+非法字节会变成 U+FFFD，既改掉调用方创建的名字，又会让两个仅差非法字节的名字
+塌成同一条（`BTreeMap` 键冲突，静默丢一个 workspace）。因此 `Action`、`present`
+表与 `scan_public` 的键都是 `OsString`，收敛判据也按字节比较。
+
+Home 侧对外 NFS 导出（OwnerFs egress）不在本能力范围内，仍由部署面或独立分支
+提供。
+
 ## DFS 外部对象持久化边界
 
 ![DFS 外部 S3 写入发布与独立读取](../../assets/architecture/afs-dfs-s3.svg)
@@ -1091,14 +1180,21 @@ bind 与远端访问共享底层文件，新打开的可见性及权限仍需按
 外部回执的 chunk id 必须绑定本次写代（Meta 校验 `blake3-v2-<写代>-<根>-<长度>` 与回执
 `operation_id`），提交走写代 fence，GC 进行中不与提交冲突。对象回收见「DFS 历史与数据块回收」。
 
-S3 默认保留载荷签名；显式 `dfs_external_backend.unsigned_payload=true` 只将 SDK
-载荷签名策略改为 unsigned，SigV4 请求认证仍在。AFS 业务完整 BLAKE3、对象长度、
-回执身份、错误传播和发布持久屏障不变；该选项不是关闭内容校验，也不自动适配
-或部署第三方后端。
+S3 上传的正文校验：HTTPS 端点默认不让正文参与 SigV4 签名（`unsigned_payload`），
+改为每个 PUT 带签名范围内的 `x-amz-checksum-crc64nvme` 请求头（`payload_checksum`），
+对象存储校验不符即拒绝；HTTP 端点（仅隔离测试）默认保留签名正文。两项都可显式配置，
+SigV4 请求认证始终存在。AFS 读时的 BLAKE3 校验、对象长度、回执身份、错误传播和
+发布持久屏障不变；这些选项不是关闭内容校验，也不自动适配或部署第三方后端。
+
+长度不小于 256 KiB 的数据块另存一个 BLAKE3 outboard 旁对象（数据对象键加 `.bao`，
+`NodeChunkSidecar` 编码，与本地 `.bao` 旁文件相同）。它是可由数据重新算出的派生数据，
+不进 Meta：读取时按范围取回 32 KiB 分组并验证到 Meta 记录的内容根，旁对象本身不被信任；
+缺失或无效时整对象读取并整块校验。GC 列举把旁对象归到所属数据块，删除时先删数据对象、
+后删旁对象。
 
 **写入**：S3 只是原生写流水线后面的另一个 `ChunkStore`（`node/external_chunk/store.rs` 的 `S3ChunkStore`），
 与本地副本模式共用同一条写路径、同一个提交入口和同样的预算（`dfs_write_queue_bytes`、`dfs_dirty_budget_bytes`、
-`dfs_unpublished_descriptors`）；上传并发被压到实际 PUT 许可数 4（`MAX_UPLOADS`，`node/assembly/dfs.rs`）。
+`dfs_unpublished_descriptors`）；上传并发不超过实际 PUT 许可数 `dfs_external_backend.upload_concurrency`（默认 8，`node/assembly/dfs.rs`）。
 满 4MiB 块提前上传；S3 回执不是本机持久副本，所以正文保留到版本发布。本节点读自己尚未提交的写入在本地完成，
 不触发提交（与原生模式相同）；其他节点只见 Meta 已提交版本。fsync、可写 flush、同步写等待全部必需回执及
 Meta 持久确认；Meta 确认未知时保留精确请求并阻挡后续修改；PUT 失败保留脏数据，下一次屏障重传同一对象。
@@ -1108,7 +1204,12 @@ S3 桥接复用一个自有线程、runtime 和客户端，worker 最多持有 3
 B 在每次 open 在线观察最新已发布 head，建立一致的版本／布局／长度视图。
 外部读使用 `AuthorizeExternalVersionRead` 从当前 Meta 状态验证版本归属、
 reader session／epoch、对象身份和合法范围，不以旧 MAC 作为续期凭据。
-每块完整校验，在最终返回前再次检查期限及已知失效。该路径不伪装
+授权缓存未命中时，同一个请求还带上同一版本布局里其后至多 16 个数据块（64MiB）的范围，
+顺序读因此每个窗口或每 5 秒询问一次 Meta；预取的授权在首次使用时仍做完整的逐读校验，
+带预取的请求被拒时原样重发不带预取的请求，由它决定这次读的成败。
+未开启 cache 时，带旁对象的数据块按范围读取：只取回读到的 32KiB 分组，逐组验证到 Meta
+记录的内容根后才复制到输出；覆盖达到数据块一半、范围过于分散、没有可用旁对象或范围验证失败时，
+整对象读取并完整校验，由它判定数据是否损坏。在最终返回前再次检查期限及已知失效。该路径不伪装
 Peer 接收者，也不依赖原 writer session。内容 cache 默认 OFF；可选 Node
 本地有界异步 cache，以 store/generation/chunk 身份隔离。完整校验后的内容
 先进入有界 pending，再由单后台线程写入临时文件并 rename；正常退出排空。
@@ -1275,16 +1376,43 @@ Coordinator 挂载同一 namespace，统一管理共享文件的回收；节点�
 
 **哪些版本可达**（R81 F2）：inode 的 nlink 大于 0、或有未退休（或仍在宽限期内）的 GC 引用、或写租约未过期时，
 保留 inode 和它的 head；每个引用另外保留它记录的那一个版本（`GcReference.pinned_version`）：读句柄是打开时固定的
-版本，写代是这一代开始时的基线版本；Create 事务里建的句柄引用、目录引用不记版本，只保 head。没有被任何一条命名的旧版本，
+版本，写代是这一代开始时的基线版本；Create 打开的句柄（在 Create 处理里先于事务登记为内存读者）、目录引用不记版本，只保 head。没有被任何一条命名的旧版本，
 即使文件仍打开也会回收，它与保留版本共享的 chunk 由可达性保留。Node 按（inode，版本）共享 `open:` 引用。
 
-**本机提交推进读句柄**（决策 4a，R94）：读句柄的版本与它的引用作为一个整体替换（`node/vfs/dfs/handles.rs` 的
-`OpenedView`），每个在途读持有它开始时的那一份，所以被替换的引用在最后一个用它的读结束后才释放。本机有写者打开时，
-该 inode 的读都走写状态，推进只记为待发布、不建引用；最后一个本机写者关闭时，为本机最新版本建一次引用（同一 Node
-各句柄共享）并发布。建引用失败时句柄不推进，继续读原版本（原引用仍在），记 `dfs.handle_view_reference_failed`
-警告，下一次读、提交或最后一个本机写者关闭时补建；已持久的提交不因此报失败。其他 Node 的提交不推进已打开的句柄。
 这一字段随 `META_RECORD_DECISION` 2、`META_STATE_IMAGE` 3 引入，旧数据目录按格式规则拒绝（`STORAGE_FORMAT_INCOMPATIBLE`），
 不会把旧引用当成“什么都不保护”。
+
+**读者登记在 Meta 内存里**（第 2 轮 C-1，协议 8，`meta/dfs/readers.rs`、`node/gc/references.rs`）：`open:` 固定不写日志。
+- **登记**：Meta 先把（会话、读者号 c、inode、版本）放进内存读者表，**之后**才取校验视图；只有该版本在这个视图里
+  仍是 inode 的 head 且 nlink 大于 0，登记才保留。否则回 `META_DFS_READER_NOT_HEAD`，Node 改用持久的
+  `UpdateGcReference`，例如已 unlink 的 inode 经 `/proc/self/fd` 重开、或 head 已前移的版本。
+  读打开与目录打开把解析、名字校验和这次登记合成一次 `OpenFileRead`。
+- **GC**：GC 把表里的条目当作活引用；提交前在提交循环里复核，有规划之后登记、落在整个计划受保护 inode 上的条目时，
+  计划作废。离开的会话的条目保留到 `max(deadline, now) + dfs_gc_grace_ms`。
+- **Meta 重启**：表随进程丢失。Meta 不是日志的第一个写者（writer term 大于 1）时，GC 先不删任何 inode 与版本，
+  只回收孤儿块，直到每个可能还在读的会话都向本 term 上报过读者（`ReportReaders`）或已过期。
+- **Node 侧**：
+  - 回复带 Meta 的 writer term，Node 丢弃 term 低于已见最大值的登记回复；
+  - 每个回收周期释放已关闭的读者，并上报全部活跃读者，包括编号高于低水位的条目，以便 Meta 重启后完整恢复；
+    低水位只限制删除范围：仅删除编号不超过低水位且本次未上报的条目，保留状态尚未确定的在途登记；
+  - 指标 `afs_dfs_reader_references_total{kind=soft|durable}`（Node）、`afs_meta_dfs_reader_registrations`、
+    `afs_meta_dfs_gc_reader_gate_closed`（Meta）。
+
+**读路径选中的版本都有引用**（决策 4a，R94）：凡是读路径能选中的已提交版本，以及在途读正在用的版本，都由 GC 引用
+保护到使用结束；写句柄仍打开、写租约看似有效都不算保护（租约可能在写者打开期间失效，本机下一次提交也会让上一个
+基线退出 head）。读句柄的版本与它的引用作为一个整体替换（`node/vfs/dfs/handles.rs` 的 `OpenedView`），每个在途读
+持有它开始时的那一份。本机有写者打开时，该 inode 的读走写状态：第一次经写状态读到某个已提交基线时为它建引用
+（`InodeWriteState.base_read_reference`，同一 Node 共享），在途读各自持有到读结束，本机下一次提交或最后一个写者
+关闭时写状态放下它；没有读的提交不建引用。句柄的推进记为待发布，最后一个本机写者关闭时为本机最新版本建一次引用
+（与写状态那份共享）并发布。建引用失败时：句柄不推进、继续读原版本（原引用仍在），记
+`dfs.handle_view_reference_failed`，下一次读、提交或最后一个写者关闭时补建；经写状态的读若没有本机未提交数据，
+改读句柄自己的版本，若有，则返回该错误（记 `dfs.write_state_read_reference_failed`），不读未受保护的基线。
+已持久的提交不因此报失败。写状态只在仍有本机写活动时缓存基线引用，最后一个写者关闭后才完成的读只自己持有引用，
+读完即释放。owner 在冻结写入批次时记录包含的代理句柄，在文件版本提交成功时把版本与这些句柄关联。
+代理同步回执保留 inode 同步屏障的当前版本，并单独携带该代理句柄最近一次实际参与的文件提交。没有新代理写的 flush
+沿用已归属的版本，始终没有写过的句柄没有归属版本。最后一个代理会话结束时，只在本 Node 最新的归属版本仍是 head 时
+推进本机已打开的读句柄。若归属版本已被取代，旧读句柄保留原受保护的视图。查询失败时关闭照常成功，下一次读只补查
+同一版本（`dfs.handle_view_refresh_failed`）。其他 Node 的提交不推进已打开的句柄。
 
 S3（外部后端）与原生共用同一套规划（`plan_collection`、写代保护、每代至多 512 个 chunk），只是执行者不同：
 对象只有一份，所以一代只等一个存活存储节点（node_id 最小者）删除，全部成功才确认，失败下一轮重试，已不
@@ -1335,9 +1463,10 @@ inode、FileVersion、LayoutRoot 与数据块，两层职责不混用。
 - Node 删除块和校验旁文件，持久化 catalog 检查点及已完成代次后应答；重启或应答丢失重试不重复
   删除新上传的同内容块。catalog WAL 随检查点截断。Node 清单还会发现无主上传残留。
 
-一个计划分批提交：每批至多 4096 个 key，一次回收调用至多 16 批；每代至多 512 个 chunk，有积压时约每秒一代。chunk 与它的 placement、copy、task 同批删除；其余实体都从活根不可达，删去任何子集都不改变活数据，崩溃后重新规划即可继续。提交被容量拒绝时批大小减半，到 64 仍被拒才报错。回收停滞看 `afs_meta_dfs_gc_stalled_seconds`、`afs_meta_dfs_gc_dead_keys`、`afs_meta_dfs_gc_rejected_batches_total` 与日志 `dfs.gc_stalled`。Node 每 5 秒推进。引用释放不限速：一次 `ReleaseGcReferences` 调用在
-一个事务内退休至多 1024 个引用，每次回收调用先排空释放队列，队列积压到 256 个时唤醒回收循环只
-做释放；积压到 65536 个时，新建引用先排空队列，Meta 不接受释放就连新引用一起失败，队列因此有
+一个计划分批提交：每批至多 4096 个 key，一次回收调用至多 16 批；每代至多 512 个 chunk，有积压时约每秒一代。chunk 与它的 placement、copy、task 同批删除；其余实体都从活根不可达，删去任何子集都不改变活数据，崩溃后重新规划即可继续。提交被容量拒绝时批大小减半，到 64 仍被拒才报错。回收停滞看 `afs_meta_dfs_gc_stalled_seconds`、`afs_meta_dfs_gc_dead_keys`、`afs_meta_dfs_gc_rejected_batches_total` 与日志 `dfs.gc_stalled`。Node 每 5 秒推进。引用释放：一次 `ReleaseGcReferences` 调用在
+一个事务内退休至多 1024 个引用。每次回收调用先释放**调用开始时**已在队列里的引用，并向 Meta 对账一次软读者；
+队列积压到 256 个时唤醒回收循环，每次唤醒只发一批，不追着释放期间新进来的引用发，否则文件不断关闭时
+每两三个文件就多一个释放事务。积压到 65536 个时，新建引用先排空队列，Meta 不接受释放就连新引用一起失败，队列因此有
 界。不可达 Node 会保守阻塞当前物理删除批次，不以心跳失联推定磁盘已清空。外部对象（S3）模式一代只等一个删除者（存活
 存储 Node 中 id 最小的）：它失联后被移出等待集合，剩余对象由列举对账找回；它仍注册却 120 秒没有完成（例如对象存储挂起），
 下一个调用回收的存活 Node 接过这一代并删除同一批对象（重复删除无害，日志 `dfs.gc_deleter_handoff`，计入

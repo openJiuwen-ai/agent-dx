@@ -44,6 +44,12 @@ pub(crate) fn within_timeout<T>(timeout: Duration, work: impl FnOnce() -> T) -> 
     }
 }
 
+/// Preserve the client's normal result handling once publication starts.
+pub(crate) fn without<T>(work: impl FnOnce() -> T) -> T {
+    let _restore = RestoreOuter(CALL_DEADLINE.replace(None));
+    work()
+}
+
 /// Time left in the current scope, or `None` outside any scope.
 pub(crate) fn remaining() -> Option<Duration> {
     CALL_DEADLINE

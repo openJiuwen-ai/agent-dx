@@ -176,10 +176,11 @@ impl EnvironmentService {
         input: Value,
         caller: &pb::CallerContext,
     ) -> Result<pb::EnvironmentSpec, Status> {
-        contract::create_spec_with_environment(
+        contract::create_spec_with_templates(
             input,
             caller,
             self.clients.config.runtime_profile.as_ref(),
+            &self.clients.config.local_rootfs_templates,
         )
     }
 
@@ -212,9 +213,9 @@ impl EnvironmentService {
         self.prepare_create(input, caller)
     }
 
-    /// Create admission with Workspace ownership bound to the owning node.
+    /// Create admission with the Workspace owner as a soft node preference.
     /// A missing Workspace mount leaves the request unchanged.
-    pub async fn prepare_create_bound(
+    pub async fn prepare_create_with_workspace_affinity(
         &self,
         input: Value,
         caller: &pb::CallerContext,
@@ -240,7 +241,7 @@ impl EnvironmentService {
                 return self.fall_back_without_affinity(spec, resolver, Some(&owner), error)
             }
         };
-        match workspace_affinity::enforce_node(
+        match workspace_affinity::prefer_node(
             spec.scheduling.get_or_insert_with(Default::default),
             &node_id,
         ) {
@@ -269,7 +270,7 @@ impl EnvironmentService {
         adx_observability::warn!(
             owner = owner.unwrap_or_default(),
             error = %error,
-            "Workspace affinity unavailable; scheduling without affinity"
+            "Workspace affinity skipped; scheduling without the owner preference"
         );
         Ok(spec)
     }
@@ -282,7 +283,7 @@ impl EnvironmentService {
     ) -> Result<Value, Status> {
         self.creation_metrics.embedded_request();
         let spec = self
-            .prepare_create_bound(input.clone(), caller, request_id)
+            .prepare_create_with_workspace_affinity(input.clone(), caller, request_id)
             .await
             .inspect_err(|error| self.creation_metrics.rejection(error))?;
         Box::pin(self.create(spec, input, request_id, caller)).await
@@ -395,7 +396,43 @@ impl EnvironmentService {
         };
         let mut operation = operation.lock_owned().await;
         if let Some(result) = &operation.result {
-            return result.clone();
+            if result.as_ref().is_err_and(|error| {
+                error.code() != Code::FailedPrecondition
+                    || error.message() != adx_error::CREATE_TERMINAL_MESSAGE
+            }) {
+                return result.clone();
+            }
+            // Cache the request identity, then project the current Env through
+            // the same response builder as an uncached CREATE. This is a local
+            // directory read, including after a previous replay observed deletion.
+            let id = operation
+                .assignment
+                .as_ref()
+                .map_or(operation.spec.id.as_str(), |assignment| {
+                    assignment.environment_id.as_str()
+                });
+            let owner = self
+                .clients
+                .owner(id, caller, false)
+                .await
+                .map_err(|error| {
+                    if error.code() == Code::NotFound {
+                        Status::failed_precondition(adx_error::CREATE_TERMINAL_MESSAGE)
+                    } else {
+                        error
+                    }
+                })?;
+            let record = owner
+                .record
+                .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
+            let mut response = existing_running_response(&input, &record)?;
+            if let Ok(previous) = result {
+                response["newlyCreated"] = Value::Bool(
+                    previous["requestId"] == response["requestId"]
+                        && previous["newlyCreated"] == true,
+                );
+            }
+            return Ok(response);
         }
         let competing_create = {
             let mut names = self.names.lock().await;
@@ -502,7 +539,7 @@ impl EnvironmentService {
                     )
                 {
                     write_create_target(&record, "replay");
-                    return existing_running_response(spec, input, request_id, &record);
+                    return existing_running_response(input, &record);
                 }
                 let assignment = record
                     .assignment
@@ -544,7 +581,8 @@ impl EnvironmentService {
         let source = if retry_pending { "replay" } else { source };
         write_create_target(&record, source);
         write_retry_result_attributes(&result);
-        let mut response = existing_running_response(spec, input, request_id, &record)?;
+        *expected_assignment = record.assignment.clone();
+        let mut response = existing_running_response(input, &record)?;
         // This bit comes from the node's creation result, never requestId echo
         // or a pre-create existence query. Cached retries retain the same bit.
         response["newlyCreated"] = Value::Bool(result.newly_created);
@@ -586,9 +624,7 @@ impl EnvironmentService {
 }
 
 fn existing_running_response(
-    _spec: &pb::EnvironmentSpec,
     input: &Value,
-    request_id: &str,
     record: &pb::EnvironmentRecord,
 ) -> Result<Value, Status> {
     let confirmed_spec = record
@@ -617,15 +653,18 @@ fn existing_running_response(
                 || record.state == pb::EnvironmentState::Deleted as i32)
         {
             return Err(Status::failed_precondition(
-                "environment create has a terminal result; query its failure",
+                adx_error::CREATE_TERMINAL_MESSAGE,
             ));
         }
         return Err(Status::unavailable("environment create is not yet running"));
     }
+    if record.creation_request_id.is_empty() {
+        return Err(Status::data_loss("environment creation request ID missing"));
+    }
     let mut response = json!({
         "environmentId": confirmed_spec.id,
         "status": "running",
-        "requestId": request_id,
+        "requestId": record.creation_request_id,
         "newlyCreated": false,
     });
     if input.pointer("/tunnel/enabled").and_then(Value::as_bool) == Some(true) {
@@ -945,25 +984,39 @@ mod tests {
             snapshot_source: None,
             failure: None,
             spec: Some(spec.clone()),
+            creation_request_id: "create-a".into(),
             state: pb::EnvironmentState::Running as i32,
             ..Default::default()
         };
-        let response = existing_running_response(&spec, &json!({}), "create-a", &record).unwrap();
+        let response = existing_running_response(&json!({}), &record).unwrap();
         assert_eq!(response["environmentId"], "tenant-worker");
         assert_eq!(response["requestId"], "create-a");
 
-        let mut different = spec.clone();
-        different.runtime_class = "firecracker".into();
-        let replay =
-            existing_running_response(&different, &json!({}), "create-b", &record).unwrap();
-        assert_eq!(replay["environmentId"], "tenant-worker");
         let mut pending = record;
         pending.state = pb::EnvironmentState::Starting as i32;
         assert_eq!(
-            existing_running_response(&spec, &json!({}), "create-c", &pending)
+            existing_running_response(&json!({}), &pending)
                 .unwrap_err()
                 .code(),
             Code::Unavailable
+        );
+    }
+
+    #[test]
+    fn running_create_rejects_missing_creation_identity() {
+        let record = pb::EnvironmentRecord {
+            spec: Some(pb::EnvironmentSpec {
+                id: "worker".into(),
+                ..Default::default()
+            }),
+            state: pb::EnvironmentState::Running as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            existing_running_response(&json!({}), &record)
+                .unwrap_err()
+                .code(),
+            Code::DataLoss
         );
     }
 
@@ -987,13 +1040,12 @@ mod tests {
             snapshot_source: None,
             failure: None,
             spec: Some(spec.clone()),
+            creation_request_id: "create-a".into(),
             state: pb::EnvironmentState::Running as i32,
             ..Default::default()
         };
         let response = existing_running_response(
-            &spec,
             &json!({"tunnel":{"enabled":true,"proxyPort":18766}}),
-            "create-a",
             &record,
         )
         .unwrap();

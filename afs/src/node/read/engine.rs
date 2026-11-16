@@ -72,6 +72,9 @@ pub const MAX_DFS_READ_BYTES: u64 = 8 * 1024 * 1024;
 /// the requested range budget. This matches the producer's staged chunk limit.
 pub const MAX_DFS_EXTERNAL_CHUNK_BYTES: u64 = crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64;
 const MAX_EXTERNAL_AUTH_CACHE_ENTRIES: usize = 128;
+/// Chunks one external authorization request may cover beyond the read that
+/// caused it: 64 MiB of 4 MiB chunks.
+pub(crate) const MAX_EXTERNAL_AUTHORITY_AHEAD: usize = 16;
 const MAX_EXTERNAL_AUTH_CACHE_BYTES: usize = 1024 * 1024;
 const MAX_SOURCE_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const SOURCE_GRANT_SAFETY_MS: u64 = 1_000;
@@ -141,12 +144,21 @@ pub struct ReadBatch {
 
 impl ReadBatch {
     pub fn validate_for_output(&self, output_len: usize, config: &DfsReadConfig) -> Result<()> {
+        self.validate_output(output_len, config, true)
+    }
+
+    fn validate_output(
+        &self,
+        output_len: usize,
+        config: &DfsReadConfig,
+        enforce_batch_limit: bool,
+    ) -> Result<()> {
         config.validate()?;
         self.validate_lookahead()?;
         if self.layout_root_id.0.is_empty() {
             return Err(invalid("DFS read batch has no LayoutRoot"));
         }
-        if self.ops.len() > config.max_ops_per_batch {
+        if enforce_batch_limit && self.ops.len() > config.max_ops_per_batch {
             return Err(invalid("DFS read batch contains too many ranges"));
         }
         let mut total = 0_u64;
@@ -273,6 +285,54 @@ pub trait ExternalChunkReader: Send + Sync {
         chunk: &ChunkObject,
         source: &SourceCandidate,
     ) -> Result<VerifiedExternalChunk>;
+
+    /// Copy `ranges` of one chunk into `out`. Every byte copied is verified
+    /// against the chunk's content identity first, and `out` is private to
+    /// the caller until this returns `Ok`. The default fetches and verifies
+    /// the whole chunk; a store may fetch only the ranges when it can still
+    /// prove them against the same identity.
+    fn read_chunk_ranges(
+        &self,
+        chunk: &ChunkObject,
+        source: &SourceCandidate,
+        ranges: &[ExternalRangeCopy],
+        out: &mut [u8],
+    ) -> Result<()> {
+        let verified = self.read_chunk(chunk, source)?;
+        if !verified.matches(chunk) {
+            return Err(corrupt(
+                "verified external Chunk identity does not match the request",
+            ));
+        }
+        copy_external_ranges(verified.as_slice(), ranges, out)
+    }
+}
+
+/// One range of an external chunk and where it lands in the caller's output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalRangeCopy {
+    pub chunk_offset: u64,
+    pub length: usize,
+    pub output_offset: usize,
+}
+
+/// Copies `ranges` of a whole verified chunk body into `out`.
+pub(in crate::node) fn copy_external_ranges(
+    body: &[u8],
+    ranges: &[ExternalRangeCopy],
+    out: &mut [u8],
+) -> Result<()> {
+    for range in ranges {
+        let source = usize::try_from(range.chunk_offset)
+            .ok()
+            .and_then(|start| body.get(start..start.checked_add(range.length)?))
+            .ok_or_else(|| invalid("external Chunk range exceeds the Chunk"))?;
+        out.get_mut(range.output_offset..)
+            .and_then(|out| out.get_mut(..range.length))
+            .ok_or_else(|| invalid("external Chunk range exceeds the output buffer"))?
+            .copy_from_slice(source);
+    }
+    Ok(())
 }
 
 /// Every operation keeps its own physical copy. A batch shares only the peer
@@ -805,6 +865,40 @@ impl DfsReadEngine {
         Ok(())
     }
 
+    /// Validate the entire private reply before any transfer. Only the
+    /// operation count is enforced per dispatch rather than per reply.
+    fn validate_native_read_plan(&self, batch: &ReadBatch, length: usize) -> Result<()> {
+        self.validate_native_read_size(length)?;
+        batch.validate_output(length, &self.config, false)?;
+        self.validate_private_native_ranges(batch)
+    }
+
+    fn native_read_batches<'a>(
+        &self,
+        batch: &'a ReadBatch,
+    ) -> impl Iterator<Item = std::borrow::Cow<'a, ReadBatch>> + use<'a> {
+        use std::borrow::Cow;
+        let limit = self.config.max_ops_per_batch;
+        let count = batch.ops.len().div_ceil(limit).max(1);
+        (0..count).map(move |index| {
+            if count == 1 {
+                return Cow::Borrowed(batch);
+            }
+            let start = index * limit;
+            let end = start.saturating_add(limit).min(batch.ops.len());
+            Cow::Owned(ReadBatch {
+                file_version_id: batch.file_version_id.clone(),
+                layout_root_id: batch.layout_root_id.clone(),
+                ops: batch.ops[start..end].to_vec(),
+                lookahead: if index == count - 1 {
+                    batch.lookahead.clone()
+                } else {
+                    Vec::new()
+                },
+            })
+        })
+    }
+
     /// Fill a caller-owned, unpublished native result without an additional
     /// aggregate staging allocation. On error this private buffer may change
     /// and must be discarded. Borrowed public output must use `read_batch`.
@@ -822,35 +916,21 @@ impl DfsReadEngine {
         out: &mut [u8],
         deadline: Option<Instant>,
     ) -> Result<()> {
-        self.validate_native_read_size(out.len())?;
-        batch.validate_for_output(out.len(), &self.config)?;
+        self.validate_native_read_plan(batch, out.len())?;
         let ChunkSource::Native(native) = self.chunk_source() else {
             return Err(Error::coded(
                 afs_error::NODE_TRANSFER_UNSUPPORTED,
                 "private native read cannot use an external backend",
             ));
         };
-        // Native layout operations are disjoint. Reject overlaps explicitly:
-        // direct local grouping must not change the old scatter precedence.
-        for (index, left) in batch.ops.iter().enumerate() {
-            if left.length == 0 {
-                continue;
-            }
-            let left_end = left.output_offset + left.length as usize;
-            if batch.ops[index + 1..].iter().any(|right| {
-                right.length != 0
-                    && left.output_offset < right.output_offset + right.length as usize
-                    && right.output_offset < left_end
-            }) {
-                return Err(invalid("private native read output ranges overlap"));
-            }
-        }
         let authority = self.capture_native_read_authority()?;
-        native
-            .read(batch, out, true, deadline)
-            .inspect_err(|error| {
-                self.invalidate_native_batch_on_error(batch, error);
-            })?;
+        for part in self.native_read_batches(batch) {
+            native
+                .read(&part, out, true, deadline)
+                .inspect_err(|error| {
+                    self.invalidate_native_batch_on_error(&part, error);
+                })?;
+        }
         self.check_native_read_authority(&authority)
     }
 
@@ -879,18 +959,16 @@ impl DfsReadEngine {
         self.check_native_read_authority(&authority)
     }
     fn validate_private_native_ranges(&self, batch: &ReadBatch) -> Result<()> {
-        // Native layout operations are disjoint. Reject overlaps explicitly:
-        // direct local grouping must not change the old scatter precedence.
-        for (index, left) in batch.ops.iter().enumerate() {
-            if left.length == 0 {
-                continue;
-            }
-            let left_end = left.output_offset + left.length as usize;
-            if batch.ops[index + 1..].iter().any(|right| {
-                right.length != 0
-                    && left.output_offset < right.output_offset + right.length as usize
-                    && right.output_offset < left_end
-            }) {
+        // Most layout plans are already in output order. Validate them
+        // without allocation, including overlap across dispatch boundaries.
+        let nonempty = || batch.ops.iter().filter(|op| op.length != 0);
+        let ordered = |end, op: &ChunkReadOp| {
+            (op.output_offset >= end).then_some(op.output_offset + op.length as usize)
+        };
+        if nonempty().try_fold(0, ordered).is_none() {
+            let mut sorted: Vec<_> = nonempty().collect();
+            sorted.sort_unstable_by_key(|op| op.output_offset);
+            if sorted.into_iter().try_fold(0, ordered).is_none() {
                 return Err(invalid("private native read output ranges overlap"));
             }
         }
@@ -913,7 +991,7 @@ impl DfsReadEngine {
             external = self.external_backend.is_some(),
         );
         let _entered = span.enter();
-        batch.validate_for_output(out.len(), &self.config)?;
+        batch.validate_output(out.len(), &self.config, !self.has_external_backend())?;
         let route = self.chunk_source();
         let native_authority = if matches!(route, ChunkSource::Native(_)) {
             Some(self.capture_native_read_authority()?)

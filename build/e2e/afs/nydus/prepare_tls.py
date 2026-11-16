@@ -4,8 +4,10 @@
 from pathlib import Path
 import subprocess
 import argparse
+import logging
 import secrets
 import shutil
+import sys
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument("output", type=Path)
@@ -13,7 +15,7 @@ p.add_argument("--four-workers", action="store_true")
 options = p.parse_args()
 r = options.output
 if r.exists() and any(r.iterdir()):
-    raise SystemExit("TLS directory exists; preserve identities until the owning run is closed and cleaned")
+    p.error("TLS directory exists; preserve identities until the owning run is closed and cleaned")
 r.mkdir(mode=0o700, parents=True, exist_ok=True)
 token = r / "nydus-token"
 token.touch(mode=0o600, exist_ok=False)
@@ -22,7 +24,7 @@ token.write_text(secrets.token_hex(32) + "\n")
 
 OPENSSL = shutil.which("openssl")
 if OPENSSL is None:
-    raise SystemExit("openssl is required")
+    p.error("openssl is required")
 
 
 def cmd(*args):
@@ -49,7 +51,7 @@ cmd(
     "extendedKeyUsage=serverAuth,clientAuth\n"
 )
 for n in ["meta", "node-a", "node-b", "node-c"] + (["node-d"] if options.four_workers else []):
-    cmd("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=" + n, "-keyout", r / f"{n}.key", "-out", r / f"{n}.csr")
+    cmd("req", "-newkey", "rsa:2048", "-nodes", "-subj", f"/CN={n}", "-keyout", r / f"{n}.key", "-out", r / f"{n}.csr")
     cmd(
         "x509",
         "-req",
@@ -67,6 +69,7 @@ for n in ["meta", "node-a", "node-b", "node-c"] + (["node-d"] if options.four_wo
         "-out",
         r / f"{n}.pem",
     )
-for p in r.glob("*.key"):
-    p.chmod(0o600)
-print("Created task-only identities; key material not logged")
+for key in r.glob("*.key"):
+    key.chmod(0o600)
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+logging.info("Created task-only identities; key material not logged")

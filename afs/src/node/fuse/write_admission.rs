@@ -209,10 +209,15 @@ impl AfsFuse {
         };
         let timing = self.requests.clone();
         let queued_at = std::time::Instant::now();
-        queue.submit_deferred_with(
+        let rank_backend = backend.clone();
+        let rank_handle = file.handle;
+        queue.submit_deferred_ranked(
             ino,
             fh,
             length,
+            Some(Box::new(move || {
+                rank_backend.queued_write_completion(rank_handle, offset, length)
+            })),
             || {
                 let mut owned = Vec::new();
                 owned.try_reserve_exact(length).map_err(|_| libc::ENOMEM)?;

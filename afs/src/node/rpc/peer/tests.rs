@@ -3996,3 +3996,46 @@ mod dfs_rdma_tests {
         assert_ne!(windows[0].0.attempt_id, windows[1].0.attempt_id);
     }
 }
+
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_native_read_splits_more_than_128_ranges() {
+    let case = fetch_rpc_case(0, true).await;
+    case.gate
+        .release
+        .store(true, std::sync::atomic::Ordering::Release);
+    let mut batch = fetch_case_batch(&case, true);
+    let pattern = batch.ops.clone();
+    batch.ops = (0..129)
+        .map(|index| {
+            let mut op = pattern[index % pattern.len()].clone();
+            op.output_offset = 3 + index * 8;
+            op
+        })
+        .collect();
+    let len = 3 + 129 * 8 + 5;
+    let output = case
+        .engine
+        .read_native_unified_async(
+            batch,
+            len,
+            std::time::Instant::now() + Duration::from_secs(3),
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    let mut expected = vec![0; len];
+    for (index, bytes) in expected[3..3 + 129 * 8].chunks_exact_mut(8).enumerate() {
+        bytes.fill(if index % 2 == 0 { 17 } else { 29 });
+    }
+    assert_eq!(output.as_ref(), expected);
+    drop(output);
+    case.engine
+        .object_fetcher()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    case.server.abort();
+    let _ = case.server.await;
+}

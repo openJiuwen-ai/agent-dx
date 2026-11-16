@@ -241,14 +241,19 @@ fn meta_store_enum_variant_indices_are_pinned() {
 fn meta_log_enum_variant_indices_are_pinned() {
     let decision = match golden_record() {
         Record::Decision { decision, .. } => decision,
-        Record::History(_) => panic!("test record is not a decision"),
+        _ => panic!("test record is not a decision"),
     };
     pin_variants!(Record {
         0: Record::Decision { .. } => Record::Decision {
-            decision,
+            decision: decision.clone(),
             history: None,
         },
         1: Record::History(_) => Record::History(history_delta()),
+        2: Record::AppendLayout { .. } => Record::AppendLayout {
+            decision,
+            history: None,
+            base: LayoutAppendBase { layout: crate::dfs::LayoutRootId::new("base"), length: 1 },
+        },
     });
     pin_variants!(Change {
         0: Change::Put { .. } => Change::Put {
@@ -517,7 +522,7 @@ fn print_log_goldens() {
 }
 
 const GOLDEN: &[(&str, &str)] = &[
-    ("entity.node_session", "00016101730167016401720100012a"),
+    ("entity.node_session", "0001610173016701640172000100012a"),
     (
         "entity.root_reservation",
         "0101720101610173016301700161017302",
@@ -563,11 +568,11 @@ const GOLDEN: &[(&str, &str)] = &[
     ("entity.dfs_gc", "1302010163010161"),
     (
         "record.create",
-        "0002016101720a0001b96000020006016e01700200ff01690007016e016900a403010201030405010176000104303066660200ff06020009016e01700200ff00000a01690101016101720a0105050505050505050505050505050505050505050505050505050505050505050601000101610100",
+        "0003016101720a0001b96000020006016e01700200ff01690007016e016900a403010201030405010176000104303066660200ff06020009016e01700200ff00000a01690101016101720a0105050505050505050505050505050505050505050505050505050505050505050601000101610100",
     ),
     ("record.history", "01032a010200"),
     (
         "state_image.create",
-        "41465343030100000101b960020006016e01700200ff01690007016e016900a403010201030405010176000104303066660200ff060209016e01700200ff01000a0169010101016101720a0105050505050505050505050505050505050505050505050505050505050505050601b960010201000009016e01700200ff000101000a01690101016101",
+        "41465343040100000101b960020006016e01700200ff01690007016e016900a403010201030405010176000104303066660200ff060209016e01700200ff01000a0169010101016101720a0105050505050505050505050505050505050505050505050505050505050505050601b960010201000009016e01700200ff000101000a01690101016101",
     ),
 ];

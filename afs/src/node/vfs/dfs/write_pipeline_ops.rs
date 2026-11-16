@@ -4,7 +4,8 @@ use super::*;
 struct WriteTarget {
     position: u64,
     selection: Option<(usize, usize, usize)>,
-    capacity: usize,
+    allocation: Option<usize>,
+    growable_eof: bool,
     generation: Option<OperationId>,
     /// The committed version this write builds on; a new generation keeps it
     /// from collection until the generation's commit is applied (R81 F2).
@@ -19,6 +20,7 @@ struct ReservationRequest<'a> {
     owner: &'a Arc<DirtyOwner>,
     capacity: usize,
     has_accepted_prefix: bool,
+    needs_descriptor: bool,
 }
 
 enum Reservation {
@@ -38,6 +40,7 @@ struct WriteApply<'a> {
     kill_suidgid: bool,
     target: WriteTarget,
     operation_id: OperationId,
+    proxied_writer: Option<&'a DfsWriteSessionId>,
 }
 
 impl DistributedFs {
@@ -117,12 +120,23 @@ impl DistributedFs {
                 drop(ticket);
                 return Err(unavailable("native write admission is closed"));
             }
+            if crate::node::call_deadline::remaining().is_some_and(|time| time.is_zero()) {
+                drop(state);
+                drop(ticket);
+                return Err(Error::coded(
+                    afs_error::IO_TIMEOUT,
+                    "DFS write turn deadline elapsed",
+                ));
+            }
             if state.native_queue.values.front() == Some(&id) {
                 state.native_thread = Some(std::thread::current().id());
                 break;
             }
             state = cell
-                .wait_timeout(state, Duration::from_millis(10))
+                .wait_timeout(
+                    state,
+                    crate::node::call_deadline::bounded(Duration::from_millis(10)),
+                )
                 .map_err(|_| unavailable("native mutation queue is poisoned"))?;
         }
         drop(state);
@@ -159,9 +173,16 @@ impl DistributedFs {
             if !Self::in_flight_blocks_mutation(&state.in_flight) {
                 return Ok(());
             }
+            let remaining = crate::node::call_deadline::bounded(Duration::from_millis(10));
+            if remaining.is_zero() {
+                return Err(Error::coded(
+                    afs_error::IO_TIMEOUT,
+                    "DFS write mutation deadline elapsed",
+                ));
+            }
             if state.commit_busy {
                 drop(
-                    cell.wait_timeout(state, Duration::from_millis(10))
+                    cell.wait_timeout(state, remaining)
                         .map_err(|_| unavailable("DFS inode write state is poisoned"))?,
                 );
             } else {
@@ -198,13 +219,15 @@ impl DistributedFs {
         options: WriteOptions,
     ) -> Result<usize> {
         let mut accepted = 0;
-        let result = self.pipeline_ordinary_write_inner(
-            handle,
-            snapshot,
-            cell,
-            (offset, data, options),
-            &mut accepted,
-        );
+        let result = crate::node::call_deadline::within_timeout(self.write_timeout, || {
+            self.pipeline_ordinary_write_inner(
+                handle,
+                snapshot,
+                cell,
+                (offset, data, options),
+                &mut accepted,
+            )
+        });
         match result {
             Err(error)
                 if accepted > 0
@@ -239,6 +262,11 @@ impl DistributedFs {
             .mutation_ticket(&cell)?
             .ok_or_else(|| unavailable("native mutation ticket is missing"))?;
         let append = snapshot.flags & libc::O_APPEND != 0;
+        let proxied_writer = snapshot
+            .owner_scope
+            .as_ref()
+            .and(snapshot.write_session.as_ref())
+            .map(|session| &session.local.id);
         while *accepted < data.len() {
             self.wait_mutation_ready(&snapshot.inode_id, &cell)?;
             if pipeline.closed.load(Ordering::Acquire) {
@@ -246,12 +274,23 @@ impl DistributedFs {
             }
             let _ = self.poll_uploads()?;
             self.observe_handle_error(handle)?;
-            let target = Self::write_target(&cell, append, offset, data, *accepted)?;
+            let target = self.write_target(&cell, append, offset, data, *accepted)?;
+            // A new file's first generation was admitted with its Create (B1).
+            let created_generation = if target.generation.is_none() {
+                Self::prepared_generation_for(&cell, target.base.as_ref())?
+            } else {
+                None
+            };
             let operation_id = target
                 .generation
                 .clone()
+                .or_else(|| {
+                    created_generation
+                        .as_ref()
+                        .map(|(generation, _)| generation.clone())
+                })
                 .unwrap_or_else(|| self.identity.operation_id("native-generation"));
-            let (prepared, descriptor) = if target.selection.is_none() {
+            let (prepared, descriptor) = if let Some(capacity) = target.allocation {
                 match self.reserve_dirty_builder(
                     handle,
                     &cell,
@@ -260,8 +299,9 @@ impl DistributedFs {
                         turn_id: ticket.id,
                         operation_id: &operation_id,
                         owner: &target.owner,
-                        capacity: target.capacity,
+                        capacity,
                         has_accepted_prefix: *accepted > 0,
+                        needs_descriptor: target.selection.is_none(),
                     },
                 )? {
                     Reservation::Reserved {
@@ -273,15 +313,21 @@ impl DistributedFs {
             } else {
                 (None, None)
             };
-            let gc_pin = if target.generation.is_none() {
+            let gc_pin = if let Some((_, pin)) = created_generation {
+                Some(pin)
+            } else if target.generation.is_none() {
                 self.gc
                     .references
                     .as_ref()
                     .map(|references| {
-                        references.pin_generation(
+                        // Only start the admission here: this is the FUSE
+                        // write thread. Uploads and the commit of this
+                        // generation wait for it (`GcPin::admitted`).
+                        references.pin_generation_deferred(
                             &snapshot.inode_id,
                             target.base.as_ref(),
                             &operation_id,
+                            &pipeline.runtime,
                         )
                     })
                     .transpose()?
@@ -299,6 +345,7 @@ impl DistributedFs {
                     kill_suidgid: options.kill_suidgid,
                     target,
                     operation_id,
+                    proxied_writer,
                 },
                 prepared,
                 descriptor,
@@ -328,6 +375,7 @@ impl DistributedFs {
     /// Read where the next unaccepted bytes land. Admission runs unlocked after
     /// this, so `apply_pipeline_write` revalidates the result under the same lock.
     fn write_target(
+        &self,
         cell: &SharedInodeWriteState,
         append: bool,
         offset: u64,
@@ -351,15 +399,35 @@ impl DistributedFs {
             .checked_add((data.len() - accepted) as u64)
             .ok_or_else(file_too_large)?;
         let selection = state.dirty_extents.native_selection(position);
-        let capacity = state.dirty_extents.native_capacity(
-            position,
-            data.len() - accepted,
-            state.logical_length,
-        );
+        let remaining = data.len() - accepted;
+        let growable_eof = self.crc32c_writes() && position >= state.logical_length;
+        let allocation = if let Some((index, source, available)) = selection {
+            let builder = &state.dirty_extents.builders[index].builder;
+            let required = source + remaining.min(available);
+            (required > builder.capacity()).then(|| {
+                required
+                    .next_power_of_two()
+                    .min(builder.writable_capacity())
+            })
+        } else if growable_eof {
+            Some(
+                remaining
+                    .min(COMMIT_CHUNK_BYTES as usize)
+                    .max(4096)
+                    .next_power_of_two(),
+            )
+        } else {
+            Some(
+                state
+                    .dirty_extents
+                    .native_capacity(position, remaining, state.logical_length),
+            )
+        };
         Ok(WriteTarget {
             position,
             selection,
-            capacity,
+            allocation,
+            growable_eof,
             generation: state.dirty_extents.native_operation_id.clone(),
             base: state
                 .base_version
@@ -380,7 +448,10 @@ impl DistributedFs {
         request: ReservationRequest<'_>,
     ) -> Result<Reservation> {
         let turn_id = request.turn_id;
+        let deadline = Instant::now() + crate::node::call_deadline::bounded(self.write_timeout);
         let mut descriptor = None;
+        // Whether the previous wait for body budget ended with nothing freed.
+        let mut budget_stalled = false;
         {
             let mut queue = pipeline
                 .allocation_queue
@@ -396,6 +467,18 @@ impl DistributedFs {
             if pipeline.closed.load(Ordering::Acquire) {
                 return Err(unavailable("native write admission is closed"));
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.observe_handle_error(handle)?;
+                if request.has_accepted_prefix {
+                    return Ok(Reservation::StopAccepting);
+                }
+                return Err(Error::coded(
+                    afs_error::IO_TIMEOUT,
+                    "DFS write admission deadline elapsed",
+                ));
+            }
+            let retry_after = remaining.min(Duration::from_millis(10));
             let is_front = pipeline
                 .allocation_queue
                 .lock()
@@ -404,15 +487,13 @@ impl DistributedFs {
                 .front()
                 == Some(&turn_id);
             if is_front {
-                if descriptor.is_none() {
+                if request.needs_descriptor && descriptor.is_none() {
                     descriptor = self.reserve_descriptor(pipeline, request.operation_id)?;
                     if descriptor.is_none() {
                         self.request_pipeline_pressure(cell, true)?;
-                        self.progress_writeback()?;
+                        crate::node::call_deadline::within(deadline, || self.progress_writeback())?;
                         let epoch = pipeline.budget.snapshot().epoch;
-                        pipeline
-                            .budget
-                            .wait_for_change(epoch, Duration::from_millis(10));
+                        pipeline.budget.wait_for_change(epoch, retry_after);
                         continue;
                     }
                 }
@@ -446,19 +527,22 @@ impl DistributedFs {
                             Err(error) => return Err(error),
                         }
                     }
-                    DirtyAdmission::Wait { epoch } => {
+                    DirtyAdmission::Wait {
+                        epoch,
+                        node_budget_short,
+                    } => {
                         self.request_pipeline_pressure(cell, false)?;
-                        self.progress_writeback()?;
-                        pipeline
-                            .budget
-                            .wait_for_change(epoch, Duration::from_millis(10));
+                        if node_budget_short && budget_stalled {
+                            self.relieve_stalled_dirty_budget(pipeline)?;
+                        }
+                        crate::node::call_deadline::within(deadline, || self.progress_writeback())?;
+                        budget_stalled =
+                            pipeline.budget.wait_for_change(epoch, retry_after).epoch == epoch;
                     }
                 }
             } else {
                 let epoch = pipeline.budget.snapshot().epoch;
-                pipeline
-                    .budget
-                    .wait_for_change(epoch, Duration::from_millis(10));
+                pipeline.budget.wait_for_change(epoch, retry_after);
             }
             let _ = self.poll_uploads()?;
             self.observe_handle_error(handle)?;
@@ -504,7 +588,7 @@ impl DistributedFs {
     fn apply_pipeline_write(
         cell: &SharedInodeWriteState,
         write: WriteApply<'_>,
-        prepared: Option<ChunkBuilder>,
+        mut prepared: Option<ChunkBuilder>,
         descriptor: Option<Arc<Mutex<PipelineMetadataLease>>>,
         gc_pin: Option<Arc<crate::node::gc::GcPin>>,
         operation: InodeOperationGuard,
@@ -517,6 +601,7 @@ impl DistributedFs {
             kill_suidgid,
             target,
             operation_id,
+            proxied_writer,
         } = write;
         let position = target.position;
         let mut state = cell
@@ -537,6 +622,17 @@ impl DistributedFs {
             drop(prepared);
             return Ok(None);
         }
+        if let Some((index, _, _)) = target.selection {
+            if let Some(replacement) = prepared.take() {
+                state.dirty_extents.builders[index]
+                    .builder
+                    .replace_native_storage(replacement);
+            }
+        } else if target.growable_eof
+            && let Some(builder) = &mut prepared
+        {
+            builder.allow_native_growth(COMMIT_CHUNK_BYTES as usize);
+        }
         let next_seq = state.next_write_seq.saturating_add(1);
         if state.dirty_extents.native_operation_id.is_none() {
             state.dirty_extents.native_operation_id = Some(operation_id);
@@ -553,6 +649,11 @@ impl DistributedFs {
         state.logical_length = state.logical_length.max(position + written as u64);
         state.next_write_seq = next_seq;
         state.visible_write_seq = next_seq;
+        if written != 0
+            && let Some(writer) = proxied_writer
+        {
+            state.note_proxied_write(writer);
+        }
         state.dirty = true;
         state.metadata_dirty = true;
         let now = now_unix_ms();
@@ -602,6 +703,93 @@ impl DistributedFs {
             }
         }
         pipeline.notify.notify_one();
+        Ok(())
+    }
+
+    /// A write has waited for body budget and nothing was freed (R91). When
+    /// no upload is running or startable either, the budget is held by
+    /// builders of files nobody is committing, and only the periodic commit
+    /// would free it. Make the file that has held budget longest due now; the
+    /// caller's next writeback pass commits it. One file per call, and none
+    /// while a due commit is already on its way, so a stream of large writes
+    /// that waits for its own uploads never triggers this.
+    fn relieve_stalled_dirty_budget(&self, pipeline: &WritePipeline) -> Result<()> {
+        if !pipeline
+            .tasks
+            .lock()
+            .map_err(|_| unavailable("native upload task table is poisoned"))?
+            .is_empty()
+            || self.next_upload()?.is_some()
+        {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let mut oldest: Option<(Instant, SharedInodeWriteState)> = None;
+        for (_, cell) in self.pending_write_states()? {
+            let since = {
+                let state = cell
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                if state.terminal_error.is_some()
+                    || state.writeback_retry_at.is_some_and(|at| at > now)
+                {
+                    continue;
+                }
+                if state.native_due || state.commit_busy {
+                    return Ok(());
+                }
+                if !state.dirty || state.in_flight.is_some() {
+                    continue;
+                }
+                state.native_owner.held_since()
+            };
+            if let Some(since) = since
+                && oldest.as_ref().is_none_or(|(other, _)| since < *other)
+            {
+                oldest = Some((since, cell));
+            }
+        }
+        if let Some((since, cell)) = oldest {
+            #[cfg(test)]
+            {
+                let hook = self
+                    .hooks
+                    .dirty_budget_before_mark_due
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            let mut state = cell
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            // A concurrent commit may have cleaned this holder since the scan.
+            // Mark only the same budget holding while it still has work to commit.
+            if !state.dirty
+                || state.native_due
+                || state.commit_busy
+                || state.in_flight.is_some()
+                || state.terminal_error.is_some()
+                || state
+                    .writeback_retry_at
+                    .is_some_and(|at| at > Instant::now())
+                || state.native_owner.held_since() != Some(since)
+            {
+                return Ok(());
+            }
+            state.native_due = true;
+            state.native_due_through = state.native_due_through.max(state.visible_write_seq);
+            drop(state);
+            pipeline
+                .metadata
+                .state
+                .lock()
+                .map_err(|_| unavailable("native metadata budget is poisoned"))?
+                .pressure_budget += 1;
+            pipeline.notify.notify_one();
+        }
         Ok(())
     }
 
@@ -712,7 +900,11 @@ impl DistributedFs {
         let state = cell
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-        if state.terminal_error.is_some() {
+        if state.terminal_error.is_some()
+            || state
+                .writeback_retry_at
+                .is_some_and(|at| at > Instant::now())
+        {
             return Ok(None);
         }
         for extent in state.dirty_extents.iter_extents() {
@@ -789,12 +981,19 @@ impl DistributedFs {
         }
         let notify = pipeline.notify.clone();
         let finished = Arc::downgrade(upload);
+        let gc_pin = upload._gc_pin.clone();
         state.task = Some(crate::node::bridge::spawn_blocking_on(
             &pipeline.runtime,
             move || {
                 let _permit = permit;
-                let result = store
-                    .put_chunks(vec![staged], PutIntent::PipelineUpload)
+                // GC safety: no chunk of a write generation may become
+                // visible to GC (local catalog, replicas, object store)
+                // before Meta has admitted its `write:` reference. This is a
+                // blocking-pool thread, so waiting here parks no async worker.
+                let result = gc_pin
+                    .as_ref()
+                    .map_or(Ok(()), |pin| pin.admitted().map(|_| ()))
+                    .and_then(|()| store.put_chunks(vec![staged], PutIntent::PipelineUpload))
                     .and_then(|mut receipts| {
                         if receipts.len() != 1 {
                             return Err(invalid("native upload returned the wrong receipt count"));
@@ -868,7 +1067,18 @@ impl DistributedFs {
                 let mut state = cell
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                Self::record_background_error_locked(&mut state, error.clone());
+                if crate::node::gc::is_permanent_admission_failure(error) {
+                    // Meta will never admit this generation's reference, so no
+                    // upload of it can ever be persisted: reject its writes
+                    // like a definite commit rejection (delivered from the
+                    // terminal state, not as a retryable background error).
+                    state.terminal_error = Some(error.clone());
+                } else {
+                    Self::record_background_error_locked(&mut state, error.clone());
+                }
+                if let Some(metrics) = &pipeline.metrics {
+                    metrics.native_writeback_error();
+                }
                 cell.notify_all();
             }
             let mut state = upload
@@ -883,6 +1093,11 @@ impl DistributedFs {
             state.joining = false;
             if let Some(error) = &failure {
                 state.error = Some(error.clone());
+                if crate::node::gc::is_permanent_admission_failure(error) {
+                    // Never retried: a later attempt could only fail the same
+                    // way, and would report it to whoever writes next.
+                    state.terminal_error = Some(error.clone());
+                }
                 metadata.failed += 1;
             } else {
                 let Some(Ok(receipt)) = result.take() else {
@@ -1031,6 +1246,12 @@ impl DistributedFs {
                     return Err(error.clone());
                 }
             }
+            if crate::node::call_deadline::remaining().is_some_and(|time| time.is_zero()) {
+                return Err(Error::coded(
+                    afs_error::IO_TIMEOUT,
+                    "DFS upload deadline elapsed",
+                ));
+            }
             self.start_upload(upload)?;
             let state = upload
                 .state
@@ -1040,7 +1261,10 @@ impl DistributedFs {
                 drop(
                     upload
                         .cv
-                        .wait_timeout(state, Duration::from_millis(10))
+                        .wait_timeout(
+                            state,
+                            crate::node::call_deadline::bounded(Duration::from_millis(10)),
+                        )
                         .map_err(|_| unavailable("native upload state is poisoned"))?,
                 );
             }
@@ -1086,6 +1310,9 @@ impl DistributedFs {
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
                 if state.terminal_error.is_none()
+                    && state
+                        .writeback_retry_at
+                        .is_none_or(|at| at <= Instant::now())
                     && (state.native_due || state.last_writer_background_requested)
                 {
                     return Ok(true);
@@ -1111,6 +1338,9 @@ impl DistributedFs {
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
                 state.terminal_error.is_none()
+                    && state
+                        .writeback_retry_at
+                        .is_none_or(|at| at <= Instant::now())
                     && (state.native_due || state.last_writer_background_requested)
             };
             if due {

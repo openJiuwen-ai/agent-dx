@@ -287,6 +287,9 @@ fn native_generation_retains_gc_reference_through_upload_and_publication() {
     let control = Arc::new(Control::default());
     let references = crate::node::gc::GcReferences::new(control.clone());
     let fs = fs.with_gc_references(Some(references.clone()));
+    fs.hooks
+        .create_admits_no_generation
+        .store(true, Ordering::SeqCst);
     let file = fs
         .create(
             &context(),
@@ -663,18 +666,18 @@ fn p2_w2_actual_cross_block_allocation_failure_returns_the_visible_prefix() {
             libc::O_RDWR,
         )
         .unwrap();
-    fs.write(&context(), file.handle, 0, &vec![1; 1024 * 1024])
+    fs.write(&context(), file.handle, 0, &vec![1; 3 * 1024 * 1024])
         .unwrap();
     fs.write_resources.buffer_pool.fail_next_allocation();
     assert_eq!(
         fs.write(
             &context(),
             file.handle,
-            1024 * 1024,
+            3 * 1024 * 1024,
             &vec![2; 4 * 1024 * 1024]
         )
         .unwrap(),
-        3 * 1024 * 1024
+        1024 * 1024
     );
     assert!(meta.commits.lock().unwrap().is_empty());
     fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
@@ -703,9 +706,11 @@ fn p2_w2_budget_waiter_fifo_does_not_block_timer_or_the_following_sync() {
         )
         .unwrap();
     let other = fs.open(&context(), file.entry.inode, libc::O_RDWR).unwrap();
-    fs.write(&context(), file.handle, 0, b"a").unwrap();
+    fs.write(&context(), file.handle, 0, &vec![b'a'; 3 * 1024 * 1024])
+        .unwrap();
     let worker_fs = fs.clone();
-    let worker = std::thread::spawn(move || worker_fs.write(&context(), other, 4096, b"b"));
+    let worker =
+        std::thread::spawn(move || worker_fs.write(&context(), other, COMMIT_CHUNK_BYTES, b"b"));
     let deadline = Instant::now() + Duration::from_secs(5);
     while fs
         .write_resources
@@ -961,10 +966,17 @@ fn p2_w2_upload_error_is_owned_by_its_inode_while_drain_still_aggregates() {
         .unwrap();
     let body = vec![0x64; 4 * 1024 * 1024];
     a_store.fail_next.store(true, Ordering::SeqCst);
-    assert_eq!(
-        a_fs.write(&context(), a.handle, 0, &body).unwrap(),
-        body.len()
-    );
+    for (index, part) in body.chunks(1024 * 1024).enumerate() {
+        assert_eq!(
+            a_fs.write(&context(), a.handle, (index * part.len()) as u64, part)
+                .unwrap(),
+            part.len()
+        );
+        if index == 0 {
+            assert_eq!(pipeline.budget.snapshot().live_bytes, part.len());
+        }
+    }
+    assert_eq!(pipeline.budget.snapshot().live_bytes, body.len());
     let upload = pipeline.tasks.lock().unwrap()[0].clone();
     let operation = upload.operation_id.clone();
     let chunk = upload.chunk.clone();
@@ -1022,6 +1034,8 @@ fn p2_w2_upload_error_is_owned_by_its_inode_while_drain_still_aggregates() {
         assert_eq!(commits[0].chunk_receipts[0].chunk, chunk);
     }
     drop(upload);
+    assert_eq!(pipeline.budget.snapshot().live_bytes, 0);
+    assert!(pipeline.budget.snapshot().live_peak_bytes <= 16 * 1024 * 1024);
     // B has its own unpublished tail. Drain must publish B successfully,
     // but retain A's error even if B's preparation would harvest that task.
     b_fs.write(&context(), b.handle, 7, b"!").unwrap();
@@ -1427,7 +1441,10 @@ fn native_builder_commit_planner_keeps_two_bodies_and_small_followup_patch() {
     }
     assert_eq!(meta.commit_count(), 0);
     assert_eq!(pool.snapshot().copied_bytes, expected.len() as u64);
-    assert_eq!(pool.snapshot().allocations, 2);
+    let buffers = pool.snapshot();
+    // First block checks out 1, 2 and 4 MiB; the tail needs 1 and 2 MiB
+    // and may reuse the storage returned by the first block.
+    assert_eq!(buffers.allocations + buffers.reuses, 5);
     fs.fsync(&context(), created.handle, SyncMode::Full)
         .unwrap();
     let first = meta.commits.lock().unwrap()[0].clone();
@@ -1711,4 +1728,588 @@ fn writeback_readiness_is_true_only_when_a_pass_can_act() {
     );
     assert_eq!(fs.progress_writeback().unwrap(), 1);
     assert!(!fs.writeback_ready().unwrap());
+}
+
+/// Meta stand-in for performance batch 1 (D): `retain_fenced` can be held
+/// closed or scripted to fail; `collect` plans like Meta (`plan_bounded`): an
+/// inventoried chunk is reclaimed unless an admitted, unreleased `write:`
+/// reference names its write generation.
+#[derive(Default)]
+struct GatedAdmissionMeta {
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+    /// Wire ids of admission attempts, in order.
+    attempts: Mutex<Vec<String>>,
+    /// Errors returned by the next attempts, front first.
+    failures: Mutex<std::collections::VecDeque<Error>>,
+    /// Stored generation ids of admitted, unreleased `write:` references.
+    admitted: Mutex<HashSet<String>>,
+    released: Mutex<Vec<String>>,
+    reclaimed: Mutex<Vec<crate::dfs::ChunkId>>,
+}
+
+impl GatedAdmissionMeta {
+    fn open_gate(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+fn stored_generation(id: &str) -> Option<String> {
+    id.strip_prefix("write:")
+        .map(|operation| ChunkObject::generation_id(&crate::dfs::OperationId::new(operation)))
+}
+
+impl crate::node::gc::GcControl for GatedAdmissionMeta {
+    fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
+        Ok(())
+    }
+    fn retain_fenced(
+        &self,
+        id: &str,
+        _: &InodeId,
+        _: Option<&FileVersionId>,
+    ) -> Result<crate::dfs::GcFence> {
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.opened.wait(open).unwrap();
+        }
+        drop(open);
+        self.attempts.lock().unwrap().push(id.into());
+        if let Some(error) = self.failures.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.admitted.lock().unwrap().extend(stored_generation(id));
+        Ok(crate::dfs::GcFence::WriteGeneration)
+    }
+    fn release(&self, ids: &[String]) -> Result<()> {
+        let mut admitted = self.admitted.lock().unwrap();
+        for id in ids {
+            if let Some(generation) = stored_generation(id) {
+                admitted.remove(&generation);
+            }
+        }
+        self.released.lock().unwrap().extend_from_slice(ids);
+        Ok(())
+    }
+    fn collect(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {
+        if inventory.is_empty() {
+            return Ok(crate::dfs::GcState {
+                generation: completed,
+                ..Default::default()
+            });
+        }
+        let admitted = self.admitted.lock().unwrap();
+        let chunks = inventory
+            .into_iter()
+            .filter(|chunk| {
+                !chunk
+                    .write_generation()
+                    .is_some_and(|generation| admitted.contains(generation))
+            })
+            .map(|chunk| chunk.id)
+            .collect::<Vec<_>>();
+        self.reclaimed
+            .lock()
+            .unwrap()
+            .extend(chunks.iter().cloned());
+        Ok(crate::dfs::GcState {
+            generation: completed + 1,
+            waiting_nodes: if chunks.is_empty() {
+                Vec::new()
+            } else {
+                vec!["node-a".into()]
+            },
+            chunks,
+        })
+    }
+}
+
+fn gated_collector(
+    control: Arc<GatedAdmissionMeta>,
+    store: &Arc<NativeFixtureStore>,
+) -> crate::node::gc::Collector {
+    let engine = Arc::new(crate::node::read::engine::DfsReadEngine::new(
+        crate::dfs::NamespaceId::new("default"),
+        "node-a".into(),
+        store.local.clone(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
+    ));
+    crate::node::gc::Collector::new(
+        crate::node::gc::GcReferences::new(control),
+        store.local.clone(),
+        engine,
+        "node-a".into(),
+    )
+}
+
+/// D (GC safety): the first write only starts the generation's admission;
+/// until Meta admits it no chunk of the generation exists anywhere GC can
+/// see, so a collection pass in that window reclaims nothing. Afterwards the
+/// upload, the commit and the read-back all succeed.
+#[test]
+fn deferred_admission_keeps_every_chunk_out_of_gc_until_admitted() {
+    let (_temp, _meta, fs, _runtime, store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    let control = Arc::new(GatedAdmissionMeta::default());
+    let references = crate::node::gc::GcReferences::new(control.clone());
+    let fs = Arc::new(fs.with_gc_references(Some(references.clone())));
+    fs.hooks
+        .create_admits_no_generation
+        .store(true, Ordering::SeqCst);
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("gated"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    // A full 4 MiB builder seals and starts its upload during the write.
+    let body = (0..4 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fs.write(&context(), file.handle, 0, &body).unwrap(),
+        body.len(),
+        "the write thread must not wait for the admission"
+    );
+    let syncing = {
+        let fs = fs.clone();
+        std::thread::spawn(move || fs.fsync(&context(), file.handle, SyncMode::Full))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(control.attempts.lock().unwrap().is_empty());
+    assert!(
+        store.local.gc_inventory().unwrap().is_empty(),
+        "no chunk may be persisted before its write reference is admitted"
+    );
+    let collector = gated_collector(control.clone(), &store);
+    assert_eq!(collector.collect_once().unwrap(), 0);
+    assert!(control.reclaimed.lock().unwrap().is_empty());
+    assert!(!syncing.is_finished(), "fsync waits for the admission");
+
+    control.open_gate();
+    syncing.join().unwrap().unwrap();
+    let inventory = store.local.gc_inventory().unwrap();
+    assert!(!inventory.is_empty());
+    // The admitted, still pinned generation protects what it uploaded.
+    assert_eq!(collector.collect_once().unwrap(), 0);
+    assert!(control.reclaimed.lock().unwrap().is_empty());
+    let mut actual = vec![0; body.len()];
+    assert_eq!(
+        fs.read(&context(), file.handle, 0, &mut actual).unwrap(),
+        body.len()
+    );
+    assert_eq!(actual, body);
+    let attempts = control.attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len(), 1);
+    assert!(attempts[0].starts_with("write:"));
+}
+
+/// D: a failed admission Meta may still accept is retried once with the
+/// same reference id by the next waiter; the write publishes normally.
+#[test]
+fn transient_admission_failure_is_retried_with_the_same_reference_id() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    let control = Arc::new(GatedAdmissionMeta::default());
+    control.open_gate();
+    control
+        .failures
+        .lock()
+        .unwrap()
+        .push_back(Error::coded(afs_error::IO_UNAVAILABLE, "lost reply"));
+    let references = crate::node::gc::GcReferences::new(control.clone());
+    let fs = fs.with_gc_references(Some(references));
+    fs.hooks
+        .create_admits_no_generation
+        .store(true, Ordering::SeqCst);
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("retry"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), file.handle, 0, b"retry me").unwrap();
+    fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+    let attempts = control.attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], attempts[1], "a retry reuses the reference id");
+    assert_eq!(meta.commits.lock().unwrap().len(), 1);
+}
+
+/// D: Meta refuses the admission for good (deadline passed). The accepted
+/// bytes are never persisted and never reported as durable: the refusal
+/// reaches the writer at fsync or at close (flush), and the next open for
+/// write discards the generation, queuing its reference for release.
+#[test]
+fn permanent_admission_failure_rejects_the_generation_and_releases_its_pin() {
+    let (_temp, meta, fs, _runtime, store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    let control = Arc::new(GatedAdmissionMeta::default());
+    control.open_gate();
+    for _ in 0..32 {
+        control.failures.lock().unwrap().push_back(Error::coded(
+            afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED,
+            "reference admission deadline expired",
+        ));
+    }
+    let references = crate::node::gc::GcReferences::new(control.clone());
+    let fs = fs.with_gc_references(Some(references.clone()));
+    fs.hooks
+        .create_admits_no_generation
+        .store(true, Ordering::SeqCst);
+    for (name, via_fsync) in [("expired-fsync", true), ("expired-close", false)] {
+        control.attempts.lock().unwrap().clear();
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new(name),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), file.handle, 0, &vec![5; 4 * 1024 * 1024])
+            .unwrap();
+        let error = if via_fsync {
+            let error = fs
+                .fsync(&context(), file.handle, SyncMode::Full)
+                .unwrap_err();
+            let _ = fs.release(&context(), file.handle);
+            error
+        } else {
+            // close(2): FUSE FLUSH, then RELEASE.
+            let error = fs.flush(&context(), file.handle).unwrap_err();
+            let _ = fs.release(&context(), file.handle);
+            error
+        };
+        assert_eq!(
+            error.code(),
+            afs_error::META_DFS_REFERENCE_ADMISSION_EXPIRED,
+            "{name}"
+        );
+        assert!(store.local.gc_inventory().unwrap().is_empty(), "{name}");
+        assert!(meta.commits.lock().unwrap().is_empty(), "{name}");
+        let attempts = control.attempts.lock().unwrap().clone();
+        assert!(!attempts.is_empty() && attempts.iter().all(|id| id == &attempts[0]));
+        let reopened = fs.open(&context(), file.entry.inode, libc::O_RDWR).unwrap();
+        // The background pass harvests the last failed upload task, which
+        // holds the generation pin too.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !control.released.lock().unwrap().contains(&attempts[0]) && Instant::now() < deadline
+        {
+            // The pass also reports the harvested upload's error Node-wide.
+            let _ = fs.progress_writeback();
+            references.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            control.released.lock().unwrap().contains(&attempts[0]),
+            "{name}: the abandoned generation's reference is queued for release"
+        );
+        fs.release(&context(), reopened)
+            .unwrap_or_else(|error| panic!("{name}: fresh writer saw {error}"));
+    }
+}
+
+fn r91_open_dirty(fs: &DistributedFs, name: &str) -> (FileHandle, InodeId) {
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new(name),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    // Round up to one full allocation, without giving the uploader a full block.
+    let body = vec![b'x'; COMMIT_CHUNK_BYTES as usize / 2 + 1];
+    fs.write(&context(), file.handle, 0, &body).unwrap();
+    (file.handle, fs.inode_id(file.entry.inode).unwrap())
+}
+
+#[test]
+fn a_file_at_its_dirty_limit_does_not_commit_another_file() {
+    let chunk = COMMIT_CHUNK_BYTES as usize;
+    // With two open writers, the 32 MiB Node limit gives each 16 MiB.
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * chunk, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = fs.with_write_timeout(Duration::from_secs(1));
+    let (oldest, oldest_inode) = r91_open_dirty(&fs, "r91-owner-limit-oldest");
+    let (writer, writer_inode) = r91_open_dirty(&fs, "r91-owner-limit-writer");
+    // Leave four separate builders partially filled, with no upload ready.
+    let body = vec![b'x'; chunk / 2 + 1];
+    for index in 1..4 {
+        assert_eq!(
+            fs.write(&context(), writer, index * COMMIT_CHUNK_BYTES, &body)
+                .unwrap(),
+            body.len()
+        );
+    }
+    let pipeline = fs.write_resources.pipeline.as_ref().unwrap();
+    let writer_cell = fs.write_state(&writer_inode).unwrap().unwrap();
+    let budget = pipeline.budget.snapshot();
+    assert_eq!(budget.limit, 8 * chunk);
+    assert_eq!(budget.live_bytes, 5 * chunk);
+    assert_eq!(
+        writer_cell
+            .lock()
+            .unwrap()
+            .native_owner
+            .snapshot()
+            .live_bytes,
+        4 * chunk
+    );
+    assert!(meta.commits.lock().unwrap().is_empty());
+
+    // The next builder fits on the Node, but exceeds this file's limit.
+    // Without a periodic pass, the original admission loop times out.
+    let result = fs.write(&context(), writer, 4 * COMMIT_CHUNK_BYTES, &body);
+    assert!(
+        meta.commits.lock().unwrap().is_empty(),
+        "a per-file limit must not trigger an early commit"
+    );
+    assert_eq!(result.unwrap_err().code(), afs_error::IO_TIMEOUT);
+    assert!(
+        fs.write_state(&oldest_inode)
+            .unwrap()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .dirty
+    );
+
+    for handle in [oldest, writer] {
+        fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+        fs.release(&context(), handle).unwrap();
+    }
+}
+
+/// R91: a write waiting for dirty budget must not wait for the periodic
+/// commit. The oldest file holding budget is committed early, which frees its
+/// builder; younger holders keep theirs.
+#[test]
+fn a_write_waiting_for_dirty_budget_commits_the_oldest_holder_early() {
+    // Budget for exactly two open dirty files.
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = Arc::new(fs.with_write_timeout(Duration::from_secs(20)));
+    let (oldest, oldest_inode) = r91_open_dirty(&fs, "r91-oldest");
+    let (younger, younger_inode) = r91_open_dirty(&fs, "r91-younger");
+    let started = Instant::now();
+    // No timer pass runs in this test: nothing calls `writeback_pending`.
+    let (third, _) = r91_open_dirty(&fs, "r91-third");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the third file's write waited {:?} for budget",
+        started.elapsed()
+    );
+    let committed = meta
+        .commits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|commit| commit.inode_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        committed,
+        vec![oldest_inode.clone()],
+        "only the oldest budget holder is committed early"
+    );
+    let dirty = |inode: &InodeId| {
+        fs.write_state(inode)
+            .unwrap()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .dirty
+    };
+    assert!(!dirty(&oldest_inode));
+    assert!(dirty(&younger_inode), "a younger holder keeps its builder");
+    for handle in [oldest, younger, third] {
+        fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+        fs.release(&context(), handle).unwrap();
+    }
+}
+
+/// R91: the early commit is asked for once per wait, not once per holder:
+/// with room for three files, the fourth and fifth each evict one.
+#[test]
+fn each_budget_wait_commits_only_as_many_holders_as_it_needs() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 12 * 1024 * 1024, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = Arc::new(fs.with_write_timeout(Duration::from_secs(20)));
+    let mut handles = Vec::new();
+    let mut inodes = Vec::new();
+    for index in 0..5 {
+        let (handle, inode) = r91_open_dirty(&fs, &format!("r91-many-{index}"));
+        handles.push(handle);
+        inodes.push(inode);
+    }
+    let committed = meta
+        .commits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|commit| commit.inode_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        committed,
+        inodes[..2].to_vec(),
+        "oldest first, one per wait"
+    );
+    for handle in handles {
+        fs.release(&context(), handle).unwrap();
+    }
+}
+
+#[test]
+fn a_holder_synced_during_selection_does_not_block_later_budget_relief() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let fs = Arc::new(fs.with_write_timeout(Duration::from_secs(20)));
+    let (oldest, oldest_inode) = r91_open_dirty(&fs, "r91-synced");
+    let (younger, younger_inode) = r91_open_dirty(&fs, "r91-still-dirty");
+    let oldest_cell = fs.write_state(&oldest_inode).unwrap().unwrap();
+    let younger_cell = fs.write_state(&younger_inode).unwrap().unwrap();
+    let held_since = |cell: &SharedInodeWriteState| cell.lock().unwrap().native_owner.held_since();
+    assert!(held_since(&oldest_cell).unwrap() < held_since(&younger_cell).unwrap());
+    let committed_inodes = || {
+        meta.commits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|commit| commit.inode_id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Let fsync finish on another thread after the budget waiter has picked
+    // this holder. Keep the synced file open and listed for writeback.
+    let sync_fs = fs.clone();
+    *fs.hooks.dirty_budget_before_mark_due.lock().unwrap() = Some(Box::new(move || {
+        std::thread::spawn(move || sync_fs.fsync(&context(), oldest, SyncMode::Full))
+            .join()
+            .unwrap()
+            .unwrap();
+    }));
+    let (third, _) = r91_open_dirty(&fs, "r91-uses-released-budget");
+    assert!(
+        fs.hooks
+            .dirty_budget_before_mark_due
+            .lock()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(committed_inodes(), vec![oldest_inode.clone()]);
+    assert!(younger_cell.lock().unwrap().dirty);
+    {
+        let state = oldest_cell.lock().unwrap();
+        assert_eq!(state.open_writers, 1);
+        assert!(!state.dirty);
+        assert!(state.native_owner.held_since().is_none());
+        assert!(
+            !state.native_due,
+            "fsync already cleaned the selected holder"
+        );
+    }
+
+    // The third write used the space freed by fsync. The fourth must commit
+    // the next holder to get capacity. No periodic writeback runs here.
+    let (fourth, _) = r91_open_dirty(&fs, "r91-needs-early-commit");
+    assert_eq!(committed_inodes(), vec![oldest_inode, younger_inode]);
+
+    for handle in [oldest, younger, third, fourth] {
+        fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+        fs.release(&context(), handle).unwrap();
+    }
+}
+
+/// Round 2 B1: Create admits the new file's first write generation, so its
+/// first write needs no admission call (the gate stays closed: any call would
+/// hang), the commit publishes that generation, and the pin is released after.
+#[test]
+fn a_created_file_writes_its_first_generation_without_an_admission_call() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    let control = Arc::new(GatedAdmissionMeta::default());
+    let references = crate::node::gc::GcReferences::new(control.clone());
+    let fs = fs.with_gc_references(Some(references.clone()));
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("created-generation"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    let generation = meta.created_generations.lock().unwrap()[0]
+        .clone()
+        .expect("Create carries the first write generation");
+    let body = vec![9; 4 * 1024 * 1024 + 17];
+    fs.write(&context(), file.handle, 0, &body).unwrap();
+    fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+    assert!(
+        control.attempts.lock().unwrap().is_empty(),
+        "no per-generation admission"
+    );
+    let commits = meta.commits.lock().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].operation_id, generation);
+    drop(commits);
+    fs.release(&context(), file.handle).unwrap();
+    // The background commit drops the generation pin on its own thread.
+    let released = format!("write:{}", generation.0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        references.flush().unwrap();
+        if control.released.lock().unwrap().contains(&released) || Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        control
+            .released
+            .lock()
+            .unwrap()
+            .contains(&format!("write:{}", generation.0)),
+        "the adopted pin is released like any generation pin"
+    );
+}
+
+/// B1 boundary: a created file that is never written still releases the
+/// generation Meta admitted with it.
+#[test]
+fn an_unwritten_created_file_releases_its_admitted_generation() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    let control = Arc::new(GatedAdmissionMeta::default());
+    let references = crate::node::gc::GcReferences::new(control.clone());
+    let fs = fs.with_gc_references(Some(references.clone()));
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("never-written"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    let generation = meta.created_generations.lock().unwrap()[0].clone().unwrap();
+    fs.flush(&context(), file.handle).unwrap();
+    fs.release(&context(), file.handle).unwrap();
+    // The state's pin goes with the write state; release it like the others.
+    drop(fs);
+    references.flush().unwrap();
+    assert!(
+        control
+            .released
+            .lock()
+            .unwrap()
+            .contains(&format!("write:{}", generation.0))
+    );
 }

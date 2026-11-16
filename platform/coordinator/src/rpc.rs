@@ -1,5 +1,8 @@
 //! Async RPC coordination around the synchronous scheduler and Redis repository.
 use adx_transport::rpc::RpcClient;
+
+type RpcFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
+
 mod artifacts;
 mod autoscaling;
 mod checkpoint_cleanup;
@@ -14,6 +17,7 @@ mod recovery;
 mod resume;
 mod snapshot_preparation;
 mod snapshots;
+mod upgrade;
 mod volumes;
 use crate::{
     storage::{ClaimOutcome, LocalClaim, NodeSession, Session, StoredEnvironment, StoredNode},
@@ -34,6 +38,20 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tonic::{transport::Endpoint, Request, Response, Status};
+
+impl TryFrom<&StoredEnvironment> for pb::EnvironmentRecord {
+    type Error = Error;
+
+    fn try_from(stored: &StoredEnvironment) -> Result<Self> {
+        let mut record: Self = stored.effective_record().try_into()?;
+        record.creation_request_id = stored
+            .creation
+            .as_ref()
+            .map(|creation| creation.request_id.clone())
+            .unwrap_or_default();
+        Ok(record)
+    }
+}
 
 struct LiveNode {
     expired: bool,
@@ -279,10 +297,43 @@ impl State {
                 .get(&spec.id)
                 .filter(|i| i.invalidated || i.resume_point(recovery_now).is_some())
                 .cloned();
-            let saved = if let Some(old) = recovery {
+            let current = self.environments.get(&spec.id).cloned();
+            let upgrade = if current.as_ref().is_some_and(|stored| {
+                !stored.invalidated
+                    && stored.resume.is_none()
+                    && stored
+                        .result
+                        .as_ref()
+                        .is_some_and(|record| record.state == EnvironmentState::Paused)
+            }) {
+                self.session.upgrade_task().await?
+            } else {
+                None
+            };
+            let migration = current.as_ref().and_then(|old| {
+                upgrade
+                    .as_ref()?
+                    .migration_operation(&old.assignment, &assignment)
+            });
+            let saved = if let Some(operation) = migration {
+                self.session
+                    .reserve_migration(
+                        &current.as_ref().ok_or(Error::Conflict)?.assignment,
+                        assignment.clone(),
+                        recovery_now,
+                        operation.was_running,
+                        &operation.source_session_id,
+                        &operation.target_session_id,
+                    )
+                    .await
+            } else if let Some(old) = recovery {
                 self.session
                     .reserve_recovery(&old.assignment, assignment.clone(), recovery::now()?)
                     .await
+            } else if current.is_some_and(|stored| stored.result.is_some()) {
+                // A stale or aborted recovery queue must never recreate an
+                // already-published Environment as a fresh execution.
+                Err(Error::Conflict)
             } else if crate::storage::has_volumes(&spec) {
                 self.session
                     .reserve_with_request(
@@ -316,15 +367,12 @@ impl State {
             };
             match saved {
                 Ok(record) => {
-                    if record
-                        .recovery
-                        .as_ref()
-                        .is_some_and(|recovery| recovery.pending)
-                    {
-                        if let Err(error) = self
-                            .scheduler
-                            .finish_recovery_placement(&record.spec, &record.assignment)
-                        {
+                    if record.recovery.is_some() {
+                        if let Err(error) = self.scheduler.finish_recovery_placement(
+                            &record.spec,
+                            &record.assignment,
+                            record.resources_held(),
+                        ) {
                             // Redis already owns the new assignment. Rebuild
                             // before accepting claims or scheduling more work.
                             self.needs_recovery = true;
@@ -334,12 +382,14 @@ impl State {
                     if let Some(source) = record
                         .recovery
                         .as_ref()
-                        .filter(|recovery| recovery.source.node_id != record.assignment.node_id)
+                        .filter(|recovery| {
+                            migration.is_none()
+                                && recovery.source.node_id != record.assignment.node_id
+                        })
                         .and_then(|recovery| self.live.get_mut(&recovery.source.node_id))
                     {
-                        // A live former owner still has a paused controller.
-                        // Require the existing closed-admission handshake to
-                        // retire it against the complete global reference catalog.
+                        // Keep the former-owner fence for ordinary recovery.
+                        // Planned transfer already fenced and stopped its source.
                         source.inspected = false;
                     }
                     self.remember_environment(record);
@@ -401,6 +451,7 @@ struct Inner {
     business: Arc<std::sync::RwLock<Option<observation::BusinessSnapshot>>>,
     business_fenced: Arc<std::sync::atomic::AtomicBool>,
     volume_domains: std::sync::RwLock<BTreeMap<String, adx_core::volumes::StorageDomain>>,
+    upgrade_lock: Mutex<()>,
     created: std::sync::atomic::AtomicU64,
     reclaimers: std::sync::RwLock<adx_checkpoint_storage::reclaim::Reclaimers>,
     resume_admission: Arc<tokio::sync::Semaphore>,
@@ -414,6 +465,27 @@ struct Inner {
     node_tls: RpcClient,
     timeout: Duration,
     heartbeat_timeout: Duration,
+}
+
+async fn current_registration_control(
+    session: &Session,
+    node: &StoredNode,
+    request: &pb::RegisterNodeRequest,
+) -> Result<Option<pb::NodeUpgradeControl>> {
+    // An ordinary same-session heartbeat stays live while Redis is unavailable.
+    // Only a persisted task-owned pause can require registration control.
+    let Some(owner) = &node.upgrade_pause else {
+        return Ok(None);
+    };
+    let task = session.upgrade_task().await?;
+    let Some(task) = task.filter(|task| task.active()) else {
+        return Ok(None);
+    };
+
+    if owner.task_id != task.task_id || owner.epoch != task.epoch {
+        return Err(Error::Conflict);
+    }
+    upgrade::registration_control(Some(&task), request)
 }
 
 struct PendingClaim {
@@ -622,6 +694,7 @@ impl CoordinatorRpc {
         let service = Self(Arc::new(Inner {
             business: Arc::new(std::sync::RwLock::new(business)),
             business_fenced: Default::default(),
+            upgrade_lock: Mutex::new(()),
             created: Default::default(),
             create_locks: Default::default(),
             reclaimers: Default::default(),
@@ -864,13 +937,13 @@ impl CoordinatorRpc {
             state.session.clone()
         };
         if let Some(record) = session
-            .published_request(&raw.tenant_id, &request_id)
+            .published_request_stored(&raw.tenant_id, &request_id)
             .await
             .map_err(status)?
         {
             return Ok(Response::new(pb::EnvironmentResult {
                 newly_created: false,
-                record: Some(record.try_into().map_err(status)?),
+                record: Some((&record).try_into().map_err(status)?),
                 durability: pb::Durability::Published as i32,
                 ..Default::default()
             }));
@@ -882,18 +955,19 @@ impl CoordinatorRpc {
             Ok(stored) if stored.result.is_some() => {
                 let record = stored
                     .result
+                    .clone()
                     .ok_or_else(|| Status::internal("confirmed result missing"))?;
-                let record = if record.state == EnvironmentState::Running {
+                let stored = if record.state == EnvironmentState::Running {
                     // Keep the replay transaction off the RPC future's stack.
                     Box::pin(session.publish_existing(record, &request_id))
                         .await
                         .map_err(status)?
                 } else {
-                    record
+                    stored
                 };
                 return Ok(Response::new(pb::EnvironmentResult {
                     newly_created: false,
-                    record: Some(record.try_into().map_err(status)?),
+                    record: Some((&stored).try_into().map_err(status)?),
                     durability: pb::Durability::Published as i32,
                     ..Default::default()
                 }));
@@ -1118,13 +1192,13 @@ impl CoordinatorRpc {
         let inspection = self.create_guard(format!("publication:{}", spec.id)).await;
         let session = { self.0.state.lock().await.session.clone() };
         if let Some(record) = session
-            .published_request(&spec.tenant_id, &request_id)
+            .published_request_stored(&spec.tenant_id, &request_id)
             .await
             .map_err(status)?
         {
             return Ok(pb::EnvironmentResult {
                 newly_created: false,
-                record: Some(record.try_into().map_err(status)?),
+                record: Some((&record).try_into().map_err(status)?),
                 durability: pb::Durability::Published as i32,
                 ..Default::default()
             });
@@ -1136,17 +1210,18 @@ impl CoordinatorRpc {
             Ok(stored) if stored.result.is_some() => {
                 let record = stored
                     .result
+                    .clone()
                     .ok_or_else(|| Status::internal("confirmed environment result missing"))?;
-                let record = if record.state == EnvironmentState::Running {
+                let stored = if record.state == EnvironmentState::Running {
                     Box::pin(session.publish_existing(record, &request_id))
                         .await
                         .map_err(status)?
                 } else {
-                    record
+                    stored
                 };
                 return Ok(pb::EnvironmentResult {
                     newly_created: false,
-                    record: Some(record.try_into().map_err(status)?),
+                    record: Some((&stored).try_into().map_err(status)?),
                     durability: pb::Durability::Published as i32,
                     ..Default::default()
                 });
@@ -1287,7 +1362,7 @@ impl CoordinatorRpc {
                         "existing environment requires recovery/query",
                     ));
                 }
-                if let Some(result) = stored.result {
+                if let Some(result) = &stored.result {
                     if result.state == EnvironmentState::Failed {
                         if let Some(failure) = &result.failure {
                             if failure.reason == adx_core::RuntimeFailureReason::DeadlineExceeded {
@@ -1304,7 +1379,7 @@ impl CoordinatorRpc {
                     }
                     return Ok(pb::EnvironmentResult {
                         newly_created: false,
-                        record: Some(result.try_into().map_err(status)?),
+                        record: Some((&stored).try_into().map_err(status)?),
                         durability: pb::Durability::Published as i32,
                         ..Default::default()
                     });
@@ -1358,6 +1433,11 @@ impl CoordinatorRpc {
                     }
                 };
                 let request = pb::StartAssignedEnvironmentRequest {
+                    creation_request_id: stored
+                        .creation
+                        .as_ref()
+                        .map(|creation| creation.request_id.clone())
+                        .unwrap_or_default(),
                     create_deadline_unix_millis: create_deadline.unix_millis(),
                     snapshot,
                     node_session_id: node
@@ -1373,7 +1453,7 @@ impl CoordinatorRpc {
                 request.set_timeout(adx_transport::deadline::create_response_timeout(
                     create_deadline.remaining()?,
                 ));
-                let result = match pb::node_service_client::NodeServiceClient::new(
+                let mut result = match pb::node_service_client::NodeServiceClient::new(
                     self.0.node_tls.wrap(channel),
                 )
                 .create_environment(request)
@@ -1422,15 +1502,20 @@ impl CoordinatorRpc {
                     }
                     Err(error) => return Err(error),
                 };
-                let record: EnvironmentRecord = result
+                let observed = result
                     .record
-                    .clone()
-                    .ok_or_else(|| Status::unavailable("node result missing"))?
-                    .try_into()
-                    .map_err(status)?;
+                    .as_mut()
+                    .ok_or_else(|| Status::unavailable("node result missing"))?;
+                let record: EnvironmentRecord = observed.clone().try_into().map_err(status)?;
+                let creation_request_id = stored
+                    .creation
+                    .as_ref()
+                    .map_or("", |creation| creation.request_id.as_str());
                 if record.spec != spec
                     || record.assignment != stored.assignment
                     || record.state != EnvironmentState::Running
+                    || (!observed.creation_request_id.is_empty()
+                        && observed.creation_request_id != creation_request_id)
                 {
                     return Err(Status::failed_precondition(
                         "node returned inconsistent result",
@@ -1445,6 +1530,9 @@ impl CoordinatorRpc {
                 } else if result.durability != pb::Durability::Journaled as i32 {
                     return Err(Status::unavailable("unknown result durability"));
                 }
+                // Older nodes omit this response metadata. The Coordinator owns
+                // its value; spec, assignment, state and durability remain checked.
+                observed.creation_request_id = creation_request_id.to_owned();
                 return Ok(result);
             }
             drop(state);
@@ -1566,12 +1654,12 @@ impl CoordinatorRpc {
         self.0.changed.notify_waiters();
         Ok(Some(failure))
     }
-    async fn commit(
+    fn commit(
         &self,
         record: EnvironmentRecord,
         session_id: String,
-    ) -> Result<EnvironmentRecord> {
-        Box::pin(self.commit_releasing(record, session_id, vec![], &[])).await
+    ) -> RpcFuture<'_, EnvironmentRecord> {
+        Box::pin(self.commit_releasing(record, session_id, vec![], &[]))
     }
 
     async fn commit_releasing(
@@ -2301,9 +2389,17 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                         ));
                     }
                     if r.heartbeat_sequence == live.sequence {
+                        let upgrade_control = current_registration_control(
+                            &state.session,
+                            &state.nodes[&r.node_id],
+                            &r,
+                        )
+                        .await
+                        .map_err(status)?;
                         return Ok(Response::new(pb::RegisterNodeResponse {
                             shard_id: state.nodes[&r.node_id].shard_id as u32,
                             coordinator_epoch: state.session.epoch(),
+                            upgrade_control,
                         }));
                     }
                     inspected =
@@ -2345,6 +2441,11 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     return Err(status(error));
                 }
             };
+            // The registration CAS may have retried after task finalization.
+            // Derive authority from its persisted pause owner and current task.
+            let upgrade_control = current_registration_control(&state.session, &saved, &r)
+                .await
+                .map_err(status)?;
             let shard = state
                 .scheduler
                 .register_at(saved.node.clone(), saved.shard_id)
@@ -2404,6 +2505,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             Ok(Response::new(pb::RegisterNodeResponse {
                 shard_id: u32::try_from(shard).map_err(|_| Status::internal("shard overflow"))?,
                 coordinator_epoch: state.session.epoch(),
+                upgrade_control,
             }))
         })
         .await
@@ -2480,9 +2582,8 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .nodes
                     .get(&stored.assignment.node_id)
                     .ok_or_else(|| Status::unavailable("owner node missing"))?;
-                let record = stored.effective_record();
                 Ok(Response::new(pb::GetEnvironmentResponse {
-                    record: Some(record.try_into().map_err(status)?),
+                    record: Some((&stored).try_into().map_err(status)?),
                     node_address: node.address.clone(),
                     relay_address: node.proxy_address.clone(),
                 }))
@@ -2653,6 +2754,9 @@ mod reconciliation_tests {
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 pub(crate) mod cancellation_test_redis;
+#[cfg(test)]
+#[path = "../tests/support/recovery_profile.rs"]
+pub(crate) mod recovery_test_profile;
 
 #[cfg(test)]
 mod cancellation_tests {

@@ -93,46 +93,46 @@ class FirecrackerEvidenceTests(unittest.TestCase):
                     'passwd': (root / 'etc/passwd').read_text(),
                     'group': (root / 'etc/group').read_text(),
                     'envd': (root / 'usr/local/bin/envd').read_bytes() if manifest.exists() else None,
-                    'bash': (root / 'bin/bash').read_bytes() if manifest.exists() else None,
+                    'bash': (root / 'bin/bash').read_bytes(),
                 }
             )
+            Path(command[-2]).write_bytes(b'image')
             return None
 
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
-            execd = base / 'adx-execd'
-            busybox = base / 'busybox'
+            fixture_spec = importlib.util.spec_from_file_location(
+                'rootfs_fixture', ROOT.parent / 'runtime/tests/test_rootfs.py'
+            )
+            fixture_module = importlib.util.module_from_spec(fixture_spec)
+            fixture_spec.loader.exec_module(fixture_module)
+            source, archive, execd = fixture_module.fixture(base)
             envd_binary = base / 'envd'
-            bash = base / 'bash'
-            for path, contents in ((execd, b'execd'), (busybox, b'busybox'), (envd_binary, b'envd'), (bash, b'bash')):
-                path.write_bytes(contents)
+            envd_binary.write_bytes(b'envd')
             with (
+                mock.patch.object(module, 'SOURCE', source),
                 mock.patch.object(module, '_executable', side_effect=lambda name: str(Path('/mock') / name)),
                 mock.patch.object(module, 'static_executable'),
-                mock.patch.object(module, 'shell_dependencies', return_value=[]),
                 mock.patch.object(module.os, 'chown') as chown,
-                mock.patch.object(module.subprocess, 'check_output', return_value='busybox\nsh\n'),
                 mock.patch.object(module.subprocess, 'run', side_effect=capture_rootfs),
             ):
-                module.build(
-                    execd,
-                    base / 'with-envd.img',
-                    busybox,
-                    module.EnvdConfig(envd_binary, bash, 'e2e'),
-                )
-                module.build(execd, base / 'plain.img', busybox)
+                module.build(execd, base / 'with-envd.img', base_archive=archive,
+                             target='x86_64-unknown-linux-gnu', envd=module.EnvdConfig(envd_binary, 'e2e'))
+                module.build(execd, base / 'plain.img', base_archive=archive, target='x86_64-unknown-linux-gnu')
 
         self.assertEqual(images[0]['envd'], b'envd')
-        self.assertEqual(images[0]['bash'], b'bash')
+        self.assertEqual(images[0]['bash'], b'distribution-bash')
         self.assertEqual(images[0]['manifest']['default_user'], 'e2e')
         self.assertEqual(images[0]['manifest']['sha256'], hashlib.sha256(b'envd').hexdigest())
         self.assertIn('e2e:x:1000:1000:E2B user:/home/e2e:/bin/bash\n', images[0]['passwd'])
         self.assertIn('e2e:x:1000:\n', images[0]['group'])
-        chown.assert_called_once()
+        home_ownership = [call for call in chown.call_args_list if call.args[1:] == (1000, 1000)]
+        self.assertEqual(len(home_ownership), 1)
+        self.assertEqual(Path(home_ownership[0].args[0]).parts[-2:], ('home', 'e2e'))
         self.assertEqual(images[1]['manifest'], None)
         self.assertEqual(images[1]['envd'], None)
-        self.assertEqual(images[1]['bash'], None)
-        self.assertEqual(images[1]['passwd'], 'root:x:0:0:root:/root:/bin/sh\n')
+        self.assertEqual(images[1]['bash'], b'distribution-bash')
+        self.assertEqual(images[1]['passwd'], 'root:x:0:0:root:/root:/bin/bash\n')
         self.assertEqual(images[1]['group'], 'root:x:0:\n')
 
     def test_fc_bootstrap_has_separate_admin_and_tenant_credentials(self):

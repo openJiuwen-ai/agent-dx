@@ -18,6 +18,9 @@
    用例：`statfs_reports_the_local_disk`。
 3. 跨 Node 的一致性是 close-to-open：另一 Node 要在写入方 `fsync` 或 `close` 之后**重新打开**才看到新内容；
    已打开的读者固定在打开时的版本（决策 4a）。`mmap MAP_SHARED` 同理。
+4. **只靠附加组才有写权限的目录里，每次新建文件多一次往返。** FUSE 请求头只带 uid 和主组，新建文件先按这两项发给 Meta；
+   Meta 拒绝后 Node 才读 `/proc` 取调用进程的附加组并重发一次。属主或主组就有写权限的目录不受影响。
+   这次重发仅由 DFS 挂载策略启用；OwnerFs 与默认挂载保留后端的首次结果，不因 Create 权限拒绝查询附加组或重发。
 
 ## 清单
 
@@ -45,7 +48,7 @@
 | 20 | `copy_file_range` | 得到源内容（条件满足时元数据 COW，否则内核回退拷贝）；`flags≠0` `EINVAL` | 支持 | `copy_file_range_copies_or_falls_back` |
 | 21 | `ioctl` | 只接受 AFS 私有命令；`FS_IOC_GETFLAGS`（`lsattr`）`ENOTTY` | 不支持 | `unsupported_ioctls` |
 | 22 | `utimensat` | 毫秒精度（纳秒截断）；`UTIME_OMIT`／`UTIME_NOW`；1970 年以前 `EINVAL`（D-S4-2）；`UTIME_NOW` 取写入 Node 的时钟 | 支持 | `timestamps` |
-| 23 | `chmod`／`chown` 权限 | 非属主改 mode、非 root 改属主、改到非所属组均 `EPERM` | 支持 | `ownership_and_privilege_bits` |
+| 23 | `chmod`／`chown` 权限、新建文件的属主属组 | 非属主改 mode、非 root 改属主、改到非所属组均 `EPERM`；新建的文件与目录属主是调用者，setgid 目录下继承目录的属组；父目录无写与搜索权限时 `EACCES`（不经内核的入口由 Meta 判断） | 支持 | `ownership_and_privilege_bits`、`setgid_directory_gives_new_files_its_group` |
 | 24 | 写入／截断清 suid、sgid | 非特权写或截断清 suid 与带组执行位的 sgid；root（`CAP_FSETID`）不清 | 支持 | 同上 |
 | 25 | `FUSE_HANDLE_KILLPRIV_V2` | 不协商，清位由内核发起（第 24 项）；见下文 | 不支持（已评估） | `official_fuser_delivery_does_not_request_lock_or_killpriv_capabilities`（`node/fuse/dispatch_tests.rs`） |
 | 26 | `statfs` | 本 Node chunk 存储盘的数值，`namemax` 255 | 支持（见已知限制 2） | `statfs_reports_the_local_disk` |
@@ -55,12 +58,13 @@
 | 30 | 目录 `fsync` | 成功；目录项变更本就是同步 Meta 事务 | 支持 | `directory_fsync_and_tmpfile_and_poll_and_access` |
 | 31 | `O_TMPFILE` | `EOPNOTSUPP` | 不支持 | 同上 |
 | 32 | `poll`／`select` | 普通文件立即可读可写 | 支持 | 同上 |
-| 33 | `access(2)` | 由内核按 mode 判断（`default_permissions`） | 支持 | 同上 |
+| 33 | `access(2)`、附加组 | `access` 由内核按 mode 判断（`default_permissions`）；只靠附加组才有写权限的目录里可以建、删、改名、建链接（Node 在被 Meta 拒绝后取调用进程的附加组重发一次，这类目录里每次操作多一次往返） | 支持 | 同上；`supplementary_group_members_can_change_a_group_writable_directory` |
 | 34 | `O_PATH` | 可打开、可 `fstat`，读 `EBADF` | 支持 | 同上 |
 | 35 | 符号链接／特殊文件上的 xattr | `user.*` 写 `EPERM`（内核） | 支持（同 Linux） | `xattrs_on_special_files` |
 | 36 | `bmap`、`FIEMAP`、`FICLONE` | `FIEMAP`、`FICLONE` `EOPNOTSUPP`；`cp --reflink=auto` 回退普通拷贝 | 不支持 | `unsupported_ioctls` |
 | 37 | `readdir` 大目录 | 按页取（R72），百万项可列出 | 支持 | `readdir_lists_every_entry_with_its_type`；S4a R72 场景 |
 | 38 | 打开中的文件被 `unlink`／`rename` 覆盖 | 旧描述符继续读打开时的版本 | 支持 | `open_file_survives_replacement`；`dfs.semantics.unlink_open_file` |
+| 39 | `open(O_CREAT)` 遇到已存在的名字 | 带 `O_EXCL`：`EEXIST`；不带：打开已有文件。名字刚被另一节点建出、本节点内核还没看到时也一样（Node 让内核重新查找一次再打开） | 支持 | `exclusive_create_of_a_taken_name_is_eexist`、`plain_create_of_a_name_that_just_appeared_opens_it` |
 
 OwnerFs 与 DFS 不同之处：`RENAME_EXCHANGE`／`WHITEOUT` 同样回 `EINVAL`（公共 FUSE 层）；远端 Home 的 xattr
 回 `ENOSYS`，内核会让该挂载的 xattr 全部失效（已登记，未改）；没有 `copy_file_range`（内核回退）；

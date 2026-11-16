@@ -60,6 +60,8 @@ async fn renewal_fixture(lease_seconds: u64) -> (DfsService, afs::dfs::WriteLeas
                 ctime_unix_ms: 1,
             },
             lease_seconds,
+            first_generation: None,
+            caller: domain_caller(0, 0),
         })
         .await
         .unwrap();
@@ -80,6 +82,7 @@ async fn lock_resolver_fixture(
     )));
     let store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
     let dfs = DfsService::new(store.clone());
+    let_users_create_in_root(&dfs).await;
     let (_, lease) = dfs
         .create(afs::meta::dfs::CreateFileRequest {
             caller_id: "node-a".into(),
@@ -98,6 +101,8 @@ async fn lock_resolver_fixture(
                 ctime_unix_ms: 1,
             },
             lease_seconds,
+            first_generation: None,
+            caller: domain_caller(1000, 1000),
         })
         .await
         .unwrap();
@@ -359,6 +364,7 @@ async fn dfs_gc_fence_capture_requires_a_write_reference_before_any_mutation() {
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:2".into(),
                 rest_addr: "http://127.0.0.1:3".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: vec![],
                 lease_ttl: std::time::Duration::from_secs(60),
@@ -1065,6 +1071,7 @@ async fn node_rpc_store_local_file_recovers_committed_session_and_reply() {
                 grpc_addr: "http://node-a:7400".into(),
                 data_addr: "http://node-a:7500".into(),
                 rest_addr: "http://node-a:7600".into(),
+                nfs_addr: String::new(),
             }),
             labels: Default::default(),
             capabilities: vec!["ownerfs".into()],
@@ -1158,6 +1165,7 @@ async fn contract_rpc_does_not_issue_fake_grants_without_store() {
                     grpc_addr: "http://node-a:7400".into(),
                     data_addr: "http://node-a:7500".into(),
                     rest_addr: "http://node-a:7600".into(),
+                    nfs_addr: String::new(),
                 }),
                 labels: Default::default(),
                 capabilities: Vec::new(),
@@ -1255,6 +1263,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
                         grpc_addr: format!("http://{node_id}:7400"),
                         data_addr: format!("http://{node_id}:7500"),
                         rest_addr: format!("http://{node_id}:7600"),
+                        nfs_addr: String::new(),
                     }),
                     labels: Default::default(),
                     capabilities: vec!["ownerfs".into()],
@@ -1462,6 +1471,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
                     grpc_addr: "http://node-a:7400".into(),
                     data_addr: "http://node-a:7500".into(),
                     rest_addr: "http://node-a:7600".into(),
+                    nfs_addr: String::new(),
                 }),
                 labels: Default::default(),
                 capabilities: vec!["ownerfs".into()],
@@ -1550,6 +1560,7 @@ async fn owner_authority_stale_abort_cannot_delete_new_pending_reservation() {
                     grpc_addr: "http://node-a:7400".into(),
                     data_addr: "http://node-a:7500".into(),
                     rest_addr: "http://node-a:7600".into(),
+                    nfs_addr: String::new(),
                 }),
                 labels: Default::default(),
                 capabilities: vec!["ownerfs".into()],
@@ -1645,6 +1656,7 @@ fn owner_root_messages_keep_location_reservation_and_access_separate() {
         root_epoch: 7,
         home_node_id: "node-a".into(),
         home_session_id: "session-a".into(),
+        home_nfs_addr: String::new(),
     };
     let lookup = LookupRootReply {
         location: Some(location),
@@ -1812,6 +1824,7 @@ async fn n2b1_register_node(meta_rpc: &rpc::MetaRpc) {
                     grpc_addr: "http://node-a:7400".into(),
                     data_addr: "http://node-a:7500".into(),
                     rest_addr: "http://node-a:7600".into(),
+                    nfs_addr: String::new(),
                 }),
                 labels: Default::default(),
                 capabilities: vec!["ownerfs".into()],
@@ -2377,6 +2390,71 @@ fn domain_caller_with_groups(
     }
 }
 
+/// The namespace root is root-owned 0755, so an ordinary user cannot create
+/// in it. Fixtures that need a user-owned file directly under the root open
+/// it first, as an administrator would for a shared directory. Meta creates
+/// the root on the first namespace mutation, hence the probe directory.
+async fn let_users_create_in_root(dfs: &DfsService) {
+    dfs.mkdir(afs::dfs::MkdirRequest {
+        caller_id: "node-a".into(),
+        operation_id: afs::dfs::OperationId::new("fixture-root-probe"),
+        namespace_id: afs::dfs::NamespaceId::new("default"),
+        parent_inode_id: afs::dfs::InodeId::new("1"),
+        name: b".fixture-root-probe".to_vec(),
+        attributes: afs::dfs::InodeAttributes {
+            mode: 0o700,
+            uid: 0,
+            gid: 0,
+            nlink: 2,
+            atime_unix_ms: 1,
+            mtime_unix_ms: 1,
+            ctime_unix_ms: 1,
+        },
+        caller: afs::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+    })
+    .await
+    .unwrap();
+    dfs.rmdir(afs::dfs::RmdirRequest {
+        caller_id: "node-a".into(),
+        operation_id: afs::dfs::OperationId::new("fixture-root-probe-remove"),
+        namespace_id: afs::dfs::NamespaceId::new("default"),
+        parent_inode_id: afs::dfs::InodeId::new("1"),
+        name: b".fixture-root-probe".to_vec(),
+        caller: afs::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+    })
+    .await
+    .unwrap();
+    dfs.set_inode_attributes(afs::dfs::SetInodeAttrRequest {
+        caller_id: "node-a".into(),
+        operation_id: afs::dfs::OperationId::new("fixture-open-root"),
+        caller: afs::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+        inode_id: afs::dfs::InodeId::new("1"),
+        expected_inode_revision: None,
+        update: afs::dfs::InodeAttrUpdate {
+            mode: Some(0o1777),
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
+}
+
+async fn let_users_create_in_root_rpc(dfs: &rpc::DfsMetaRpc) {
+    let_users_create_in_root(dfs.0.dfs.as_ref().unwrap()).await;
+}
+
 async fn memory_dfs() -> rpc::DfsMetaRpc {
     let store = Arc::new(
         Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
@@ -2440,6 +2518,7 @@ async fn register_dfs_storage_node_with_catalog(
                 grpc_addr: format!("http://{node_id}:7400"),
                 data_addr: format!("http://{node_id}:7500"),
                 rest_addr: format!("http://{node_id}:7600"),
+                nfs_addr: String::new(),
             }),
             labels: Default::default(),
             capabilities: vec!["dfs".into()],
@@ -2472,6 +2551,7 @@ async fn register_dfs_compute_node(
                 grpc_addr: format!("http://{node_id}:7400"),
                 data_addr: format!("http://{node_id}:7500"),
                 rest_addr: format!("http://{node_id}:7600"),
+                nfs_addr: String::new(),
             }),
             labels: Default::default(),
             capabilities: vec!["dfs".into()],
@@ -2655,6 +2735,9 @@ async fn commit_request_with_copies(
             attributes: Some(test_attrs(0o644, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(0, 0)),
         }))
         .await
         .unwrap()
@@ -3298,6 +3381,9 @@ async fn dfs_commit_accepts_durable_ack_after_unrelated_catalog_advance() {
             attributes: Some(test_attrs(0o644, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(0, 0)),
         }))
         .await
         .unwrap()
@@ -3528,6 +3614,9 @@ async fn dfs_namespace_unlink_removes_name_but_keeps_orphan_inode_for_open_handl
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(0, 0)),
         }))
         .await
         .unwrap()
@@ -3585,6 +3674,9 @@ async fn dfs_namespace_rename_no_replace_and_replace_are_atomic() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(0, 0)),
         }))
         .await
         .unwrap()
@@ -3601,6 +3693,9 @@ async fn dfs_namespace_rename_no_replace_and_replace_are_atomic() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(0, 0)),
         }))
         .await
         .unwrap()
@@ -3767,6 +3862,9 @@ async fn dfs_namespace_errors_preserve_posix_errno() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(0, 0)),
         }))
         .await
         .unwrap()
@@ -3860,6 +3958,9 @@ async fn dfs_namespace_hardlink_symlink_and_readlink_are_metadata_operations() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(0, 0)),
         }))
         .await
         .unwrap()
@@ -3949,6 +4050,9 @@ async fn dfs_generic_xattr_cannot_change_lazy_source() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(0, 0)),
         }))
         .await
         .unwrap()
@@ -3987,6 +4091,7 @@ async fn dfs_generic_xattr_cannot_change_lazy_source() {
 #[tokio::test]
 async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
     let dfs = memory_dfs().await;
+    let_users_create_in_root_rpc(&dfs).await;
     let file = dfs
         .create(Request::new(DfsCreateRequest {
             caller_id: "node-a".into(),
@@ -3997,6 +4102,9 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(1000, 1000)),
         }))
         .await
         .unwrap()
@@ -4010,7 +4118,7 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
             operation_id: "chmod-attrs".into(),
             caller: Some(caller(1000, 1000)),
             inode_id: file.inode_id.clone(),
-            expected_inode_revision: file.revision,
+            expected_inode_revision: Some(file.revision),
             update: Some(DfsInodeAttributeUpdate {
                 timestamps_now: false,
                 mode: Some(0o660),
@@ -4205,7 +4313,7 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
             operation_id: "chgrp-owner-supplementary".into(),
             caller: Some(caller_with_groups(1000, 1000, &[1000, 2000])),
             inode_id: file.inode_id.clone(),
-            expected_inode_revision: removed.revision,
+            expected_inode_revision: Some(removed.revision),
             update: Some(DfsInodeAttributeUpdate {
                 timestamps_now: false,
                 mode: Some(0o2660),
@@ -4233,7 +4341,7 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
             // after its supplementary group membership changes.
             caller: Some(caller(1000, 1000)),
             inode_id: file.inode_id.clone(),
-            expected_inode_revision: chgrp.revision,
+            expected_inode_revision: Some(chgrp.revision),
             update: Some(DfsInodeAttributeUpdate {
                 uid: Some(1000),
                 gid: Some(2000),
@@ -4254,7 +4362,7 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
             operation_id: "chown-not-root".into(),
             caller: Some(caller(1000, 1000)),
             inode_id: file.inode_id,
-            expected_inode_revision: unchanged_owner.revision,
+            expected_inode_revision: Some(unchanged_owner.revision),
             update: Some(DfsInodeAttributeUpdate {
                 timestamps_now: false,
                 mode: None,
@@ -4273,6 +4381,7 @@ async fn dfs_namespace_attrs_and_user_xattrs_are_revision_fenced() {
 #[tokio::test]
 async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_bits() {
     let dfs = memory_dfs().await;
+    let_users_create_in_root_rpc(&dfs).await;
     let file = dfs
         .create(Request::new(DfsCreateRequest {
             caller_id: "node-a".into(),
@@ -4283,6 +4392,9 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
             attributes: Some(test_attrs(0o444, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(1000, 1000)),
         }))
         .await
         .unwrap()
@@ -4295,7 +4407,7 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
             operation_id: "times-owner-without-write".into(),
             caller: Some(caller(1000, 1000)),
             inode_id: file.inode_id,
-            expected_inode_revision: file.revision,
+            expected_inode_revision: Some(file.revision),
             update: Some(DfsInodeAttributeUpdate {
                 atime_unix_ms: Some(10),
                 mtime_unix_ms: Some(20),
@@ -4316,7 +4428,7 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
             operation_id: "times-world-writable".into(),
             caller: Some(caller(0, 0)),
             inode_id: timed.inode_id.clone(),
-            expected_inode_revision: timed.revision,
+            expected_inode_revision: Some(timed.revision),
             update: Some(DfsInodeAttributeUpdate {
                 mode: Some(0o666),
                 ..Default::default()
@@ -4332,7 +4444,7 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
         operation_id: "times-nonowner-specific".into(),
         caller: Some(caller(2000, 2000)),
         inode_id: writable.inode_id.clone(),
-        expected_inode_revision: writable.revision,
+        expected_inode_revision: Some(writable.revision),
         update: Some(DfsInodeAttributeUpdate {
             atime_unix_ms: Some(30),
             mtime_unix_ms: Some(30),
@@ -4383,7 +4495,7 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
             operation_id: "chown-directory-special".into(),
             caller: Some(caller(0, 0)),
             inode_id: directory.inode_id,
-            expected_inode_revision: directory.revision,
+            expected_inode_revision: Some(directory.revision),
             update: Some(DfsInodeAttributeUpdate {
                 uid: Some(2000),
                 gid: Some(2000),
@@ -4401,6 +4513,7 @@ async fn dfs_readonly_owner_can_set_times_and_directory_chown_preserves_special_
 #[tokio::test]
 async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
     let dfs = memory_dfs().await;
+    let_users_create_in_root_rpc(&dfs).await;
     let created = dfs
         .create(Request::new(DfsCreateRequest {
             caller_id: "node-a".into(),
@@ -4411,6 +4524,9 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(1000, 1000)),
         }))
         .await
         .unwrap()
@@ -4662,8 +4778,9 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
 }
 
 #[tokio::test]
-async fn dfs_metadata_sync_allows_metadata_revision_drift_without_losing_xattrs() {
+async fn dfs_metadata_sync_refuses_revision_drift_and_a_rebuilt_sync_keeps_xattrs() {
     let dfs = memory_dfs().await;
+    let_users_create_in_root_rpc(&dfs).await;
     let created = dfs
         .create(Request::new(DfsCreateRequest {
             caller_id: "node-a".into(),
@@ -4674,6 +4791,9 @@ async fn dfs_metadata_sync_allows_metadata_revision_drift_without_losing_xattrs(
             attributes: Some(test_attrs(0o640, 1)),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(1000, 1000)),
         }))
         .await
         .unwrap()
@@ -4699,6 +4819,29 @@ async fn dfs_metadata_sync_allows_metadata_revision_drift_without_losing_xattrs(
         .unwrap();
     assert_eq!(with_xattr.revision, initial.revision + 1);
 
+    // A sync built before the xattr change is refused (round 2 B5): it could
+    // otherwise land on top of an explicit utimens. The Node rebuilds it on
+    // the newer revision, which keeps the xattr.
+    let stale = dfs
+        .sync_inode_metadata(Request::new(
+            afs_protocol::meta::SyncDfsInodeMetadataRequest {
+                caller_id: "node-a".into(),
+                operation_id: "sync-drift-stale".into(),
+                inode_id: initial.inode_id.clone(),
+                write_lease: Some(lease.clone()),
+                expected_inode_revision: initial.revision,
+                expected_head_version_id: String::new(),
+                metadata_delta: Some(DfsCommitMetadataDelta {
+                    kill_suidgid: false,
+                    mode: DfsCommitMetadataMode::Full.into(),
+                    mtime_unix_ms: 77,
+                    ctime_unix_ms: 88,
+                }),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), Code::FailedPrecondition);
     let synced = dfs
         .sync_inode_metadata(Request::new(
             afs_protocol::meta::SyncDfsInodeMetadataRequest {
@@ -4706,7 +4849,7 @@ async fn dfs_metadata_sync_allows_metadata_revision_drift_without_losing_xattrs(
                 operation_id: "sync-drift".into(),
                 inode_id: initial.inode_id.clone(),
                 write_lease: Some(lease),
-                expected_inode_revision: initial.revision,
+                expected_inode_revision: with_xattr.revision,
                 expected_head_version_id: String::new(),
                 metadata_delta: Some(DfsCommitMetadataDelta {
                     kill_suidgid: false,
@@ -4759,6 +4902,9 @@ async fn dfs_write_lease_reuses_one_owner_and_fences_stale_commits() {
             }),
             owner_session_id: "session-a".into(),
             lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: Some(caller(0, 0)),
         }))
         .await
         .unwrap()
@@ -4909,6 +5055,8 @@ async fn dfs_namespace_mutations_update_parent_times_and_replay_is_stable() {
             ..attrs.clone()
         },
         lease_seconds: 30,
+        first_generation: None,
+        caller: domain_caller(0, 0),
     };
     dfs.create(request.clone()).await.unwrap();
     let updated = dfs.get_inode(dir.inode_id.clone()).await.unwrap();
@@ -4998,6 +5146,8 @@ async fn dfs_rename_preserves_other_hardlinks_and_same_inode_is_noop() {
                     ctime_unix_ms: 1,
                 },
                 lease_seconds: 30,
+                first_generation: None,
+                caller: domain_caller(0, 0),
             })
             .await
             .unwrap();
@@ -5107,6 +5257,8 @@ async fn dfs_namespace_permissions_require_parent_write_and_search() {
             name: b"inside".to_vec(),
             attributes: attrs(0o644, 0, 0, 1),
             lease_seconds: 30,
+            first_generation: None,
+            caller: domain_caller(0, 0),
         })
         .await
         .unwrap();
@@ -5120,6 +5272,8 @@ async fn dfs_namespace_permissions_require_parent_write_and_search() {
             name: b"root-file".to_vec(),
             attributes: attrs(0o644, 0, 0, 1),
             lease_seconds: 30,
+            first_generation: None,
+            caller: domain_caller(0, 0),
         })
         .await
         .unwrap();
@@ -5240,6 +5394,8 @@ async fn dfs_namespace_sticky_directories_require_victim_or_directory_owner() {
             name: b"victim".to_vec(),
             attributes: attrs(0o644, 2000, 2000, 1),
             lease_seconds: 30,
+            first_generation: None,
+            caller: domain_caller(2000, 2000),
         })
         .await
         .unwrap();
@@ -5267,6 +5423,8 @@ async fn dfs_namespace_sticky_directories_require_victim_or_directory_owner() {
             name: b"source".to_vec(),
             attributes: attrs(0o644, 3000, 3000, 1),
             lease_seconds: 30,
+            first_generation: None,
+            caller: domain_caller(3000, 3000),
         })
         .await
         .unwrap();
@@ -5480,6 +5638,8 @@ async fn dfs_namespace_retry_binds_semantics_and_new_inode_identity_scopes_calle
             ctime_unix_ms: 1,
         },
         lease_seconds: 30,
+        first_generation: None,
+        caller: domain_caller(0, 0),
     };
     let first = dfs.create(request.clone()).await.unwrap();
     assert_eq!(dfs.create(request.clone()).await.unwrap(), first);
@@ -5563,6 +5723,9 @@ async fn dfs_kernel_killpriv_commit_requires_lease_and_preserves_nonexecutable_s
                 attributes: Some(test_attrs(mode, 1)),
                 owner_session_id: "session-a".into(),
                 lease_seconds: 30,
+                first_generation_operation_id: None,
+                reader: None,
+                caller: Some(caller(0, 0)),
             }))
             .await
             .unwrap()
@@ -5637,4 +5800,130 @@ async fn dfs_kernel_killpriv_commit_requires_lease_and_preserves_nonexecutable_s
             .unwrap();
         assert_eq!(committed, replayed);
     }
+}
+
+/// Create answers to the same rules as the other name-creating operations:
+/// the caller needs write and search permission on the parent, owns the new
+/// file, and a setgid parent decides the file's group. Meta enforces them
+/// itself because SDK and usrbio callers do not pass through the kernel's
+/// permission checks.
+#[tokio::test]
+async fn dfs_create_checks_parent_access_and_inherits_the_setgid_group() {
+    use afs::dfs::{InodeAttributes, InodeId, MkdirRequest, NamespaceId};
+    use afs::meta::dfs::CreateFileRequest;
+    let (_, dfs) = memory_meta_and_dfs_service(ReplicationConfig::local_single_copy()).await;
+    let attrs = |mode, uid, gid, nlink| InodeAttributes {
+        mode,
+        uid,
+        gid,
+        nlink,
+        atime_unix_ms: 1,
+        mtime_unix_ms: 1,
+        ctime_unix_ms: 1,
+    };
+    let directory = async |name: &str, mode, gid| {
+        dfs.mkdir(MkdirRequest {
+            caller_id: "node-a".into(),
+            operation_id: OperationId::new(format!("create-access-{name}")),
+            namespace_id: NamespaceId::new("default"),
+            parent_inode_id: InodeId::new("1"),
+            name: name.as_bytes().to_vec(),
+            attributes: attrs(mode, 0, gid, 2),
+            caller: domain_caller(0, gid),
+        })
+        .await
+        .unwrap()
+    };
+    let sgid = directory("sgid", 0o2770, 2000).await;
+    let shared = directory("shared", 0o777, 2000).await;
+    let locked = directory("locked", 0o755, 2000).await;
+    let create = |operation: &str, parent: &InodeId, caller| CreateFileRequest {
+        caller_id: "node-a".into(),
+        owner_session_id: "session-a".into(),
+        operation_id: OperationId::new(operation),
+        namespace_id: NamespaceId::new("default"),
+        parent_inode_id: parent.clone(),
+        name: b"file".to_vec(),
+        // The Node's claim about the owner is not what decides it.
+        attributes: attrs(0o640, 1234, 1234, 1),
+        lease_seconds: 30,
+        first_generation: None,
+        caller,
+    };
+    let member = domain_caller_with_groups(1000, 1000, &[1000, 2000]);
+
+    let request = create("create-in-sgid", &sgid.inode_id, member.clone());
+    let (inherited, _) = dfs.create(request.clone()).await.unwrap();
+    assert_eq!(inherited.attributes.uid, 1000);
+    assert_eq!(
+        inherited.attributes.gid, 2000,
+        "a setgid parent decides the new file's group"
+    );
+    assert_eq!(inherited.attributes.mode, 0o640);
+    assert_eq!(
+        dfs.create(request).await.unwrap().0,
+        inherited,
+        "a retry replays the created inode"
+    );
+
+    let (plain, _) = dfs
+        .create(create("create-in-shared", &shared.inode_id, member))
+        .await
+        .unwrap();
+    assert_eq!(plain.attributes.uid, 1000);
+    assert_eq!(
+        plain.attributes.gid, 1000,
+        "without setgid the file takes the caller's group"
+    );
+
+    for (operation, parent) in [
+        ("create-in-locked", &locked.inode_id),
+        ("create-in-sgid-as-stranger", &sgid.inode_id),
+    ] {
+        let error = dfs
+            .create(create(operation, parent, domain_caller(3000, 3000)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED, "{operation}");
+    }
+    assert!(
+        dfs.lookup(
+            NamespaceId::new("default"),
+            locked.inode_id.clone(),
+            b"file".to_vec()
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "a refused create leaves no name behind"
+    );
+    dfs.create(create(
+        "create-in-locked-as-root",
+        &locked.inode_id,
+        domain_caller(0, 0),
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn dfs_create_rpc_requires_the_caller_context() {
+    let dfs = memory_dfs().await;
+    let status = dfs
+        .create(Request::new(DfsCreateRequest {
+            caller_id: "node-a".into(),
+            operation_id: "create-without-caller".into(),
+            namespace_id: "default".into(),
+            parent_inode_id: "1".into(),
+            name: b"anonymous".to_vec(),
+            attributes: Some(test_attrs(0o644, 1)),
+            owner_session_id: "session-a".into(),
+            lease_seconds: 30,
+            first_generation_operation_id: None,
+            reader: None,
+            caller: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument, "{status}");
 }

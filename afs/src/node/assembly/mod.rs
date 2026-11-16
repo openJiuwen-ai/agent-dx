@@ -28,6 +28,8 @@ pub(super) mod common;
 pub(super) mod dfs;
 mod grpc;
 #[cfg(feature = "ownerfs")]
+mod outlet;
+#[cfg(feature = "ownerfs")]
 mod ownerfs;
 mod shutdown;
 
@@ -80,6 +82,13 @@ pub(super) async fn run_node(
         common::node_state(&cfg, obs, &startup, &registration, &mounts, &mut backends);
     // 13. Services.
     let mut services = Services::new();
+    // T13a/T13b: the outlet mirror. The mirror's startup gates run here,
+    // before anything is spawned, so a misconfigured name layer aborts the
+    // process instead of looping.
+    #[cfg(feature = "ownerfs")]
+    {
+        outlet::start_mirror(&cfg, &backends.ownerfs, &mut services)?;
+    }
     start_background(
         &cfg,
         &state,
@@ -123,6 +132,24 @@ pub(super) async fn run_node(
     #[cfg(feature = "dfs")]
     backends.dfs.connectors.start().await?;
     background::RestServer::new(ingress.rest, state.clone(), connector_routes).start(&mut services);
+    #[cfg(feature = "ownerfs")]
+    if let Some(listener) = ingress.workspace {
+        let control = backends.ownerfs.outlet_control.as_ref().ok_or_else(|| {
+            afs_error::Error::coded(afs_error::CONFIG_INVALID, "Workspace API requires Meta")
+        })?;
+        let api = crate::node::api::workspace::WorkspaceApi::new(
+            state.clone(),
+            control.meta.clone(),
+            backends.peer_connections.clone(),
+        )?;
+        let stop = services.stop.subscribe();
+        services.spawn(async move {
+            axum::serve(listener, api.router())
+                .with_graceful_shutdown(crate::runtime::cancelled(stop))
+                .await
+                .map_err(Into::into)
+        });
+    }
     endpoints.into_sweeper().start(&mut services);
     // Multi-workspace bind mount is handled by MountManager via mkdir triggers.
     // No single-workspace startup worker is needed.

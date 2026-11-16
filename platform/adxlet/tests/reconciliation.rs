@@ -621,6 +621,15 @@ async fn periodic_current_spec_conflict_remains_fenced_until_authority_matches()
     *authority.authority.records.lock().unwrap() = vec![current.try_into().unwrap()];
     authority.cycle(&node).await.unwrap();
     assert_eq!(
+        handle
+            .ensure_running("wake-after-authority-recovery".into())
+            .await
+            .unwrap()
+            .record
+            .state,
+        EnvironmentState::Running
+    );
+    assert_eq!(
         handle.delete().await.unwrap().record.state,
         EnvironmentState::Deleted
     );
@@ -1160,6 +1169,7 @@ async fn failed_capture_reservation_does_not_block_node_reconciliation() {
     failed.resources_held = false;
     failed.runtime.ip = None;
     failed.snapshot_source = Some(adx_core::RestorePoint {
+        recovery_profile: Default::default(),
         origin: Some(adx_core::runtime::RuntimeIdentity {
             environment_id: "source".into(),
             runtime_id: "source-6".into(),

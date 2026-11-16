@@ -231,14 +231,18 @@ impl NodeRpc {
                     }
                     None => handle.create_with_deadline(deadline).await,
                 };
-                response(result.map_err(|error| creation_error(&handle, error))?).map_err(status)
+                create_response(
+                    result.map_err(|error| creation_error(&handle, error))?,
+                    owned.creation_request_id,
+                )
+                .map_err(status)
             }
             Outcome::Existing(existing) => {
-                let record: EnvironmentRecord = existing
+                let record = existing
                     .record
-                    .ok_or_else(|| Status::data_loss("existing record missing"))?
-                    .try_into()
-                    .map_err(status)?;
+                    .ok_or_else(|| Status::data_loss("existing record missing"))?;
+                let creation_request_id = record.creation_request_id.clone();
+                let record: EnvironmentRecord = record.try_into().map_err(status)?;
                 if record.spec.tenant_id != spec.tenant_id {
                     self.manager
                         .release_local(&spec.id, &reservation)
@@ -253,11 +257,14 @@ impl NodeRpc {
                     .release_local(&spec.id, &reservation)
                     .map_err(status)?;
                 if record.state == adx_core::EnvironmentState::Running {
-                    response(crate::OperationResult {
-                        newly_created: false,
-                        record,
-                        durability: Durability::Published,
-                    })
+                    create_response(
+                        crate::OperationResult {
+                            newly_created: false,
+                            record,
+                            durability: Durability::Published,
+                        },
+                        creation_request_id,
+                    )
                     .map_err(status)
                 } else {
                     drop(gate);

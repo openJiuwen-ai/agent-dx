@@ -3,7 +3,7 @@
 use super::*;
 
 /// Shared producer/replica budget per immutable staged chunk, never a file limit.
-#[cfg(feature = "dfs")]
+#[cfg(any(feature = "dfs", test))]
 pub(crate) const MAX_STAGED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -179,6 +179,13 @@ impl StagedChunk {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// The BLAKE3 outboard built while sealing, when the buffer pool carried
+    /// an outboard budget and it had room.
+    #[cfg(feature = "dfs")]
+    pub(in crate::node) fn outboard(&self) -> Option<&SharedOutboard> {
+        self.outboard.as_ref()
     }
 
     /// Content proof only: operation identity, authorization and persistence

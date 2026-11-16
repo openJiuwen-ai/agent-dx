@@ -151,6 +151,7 @@ async fn real_dfs_with_meta(
                 grpc_addr: "http://127.0.0.1:1".to_owned(),
                 data_addr: "http://127.0.0.1:1".to_owned(),
                 rest_addr: "http://127.0.0.1:1".to_owned(),
+                nfs_addr: String::new(),
             }),
             labels: std::collections::HashMap::new(),
             capabilities: vec!["dfs".to_owned()],

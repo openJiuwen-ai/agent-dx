@@ -11,6 +11,11 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
+/// Default kernel entry/attribute TTL of DFS mounts, in milliseconds.
+pub const DEFAULT_DFS_KERNEL_CACHE_TTL_MS: u64 = 1_000;
+/// Largest accepted `dfs_kernel_cache_ttl_ms`.
+pub const MAX_DFS_KERNEL_CACHE_TTL_MS: u64 = 60_000;
+
 mod common;
 mod cross;
 mod dfs;
@@ -18,10 +23,30 @@ mod fuse;
 mod meta;
 #[cfg(any(feature = "meta-redis", feature = "meta-etcd"))]
 pub(crate) use meta::MetaStoreTarget;
+mod outlet;
 mod ownerfs;
 mod tls;
 
+pub use outlet::{DEFAULT_MOUNT_OPTIONS, OutletConfig};
+
 pub use tls::read_certificate_der;
+
+/// Whether `id` is safe to embed in filesystem paths and request keys.
+///
+/// The rule (`1..=128` bytes of ASCII letters, digits, `_`, `-`) is the one the
+/// local node id has always been held to at config resolution. It is also
+/// applied to node ids that arrive from the cluster (Meta registration and the
+/// outlet snapshot), because consumers build mount points and symlink targets
+/// by joining the id under a configured root: an id containing `/`, `..` or an
+/// absolute path would escape that root.
+#[must_use]
+pub fn is_safe_node_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -102,6 +127,12 @@ pub struct WorkspaceBindConfig {
     pub workspace: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceApiConfig {
+    pub listen: SocketAddr,
+}
+
 /// External object storage durability. Deployment of the S3 service is external
 /// to AFS. Credentials remain in the process environment or an administrator file.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -114,11 +145,32 @@ pub struct DfsExternalBackendConfig {
     pub region: String,
     #[serde(default)]
     pub allow_http: bool,
-    #[serde(default)]
-    pub unsigned_payload: bool,
+    /// `false` signs every PUT body with SHA-256 (SigV4 signed payload);
+    /// `true` sends `UNSIGNED-PAYLOAD`. Request authentication is SigV4 either
+    /// way. Default: unsigned for an `https` endpoint, signed for `http`.
+    pub unsigned_payload: Option<bool>,
+    /// Whole-body checksum sent as a signed request header on every PUT. The
+    /// store rejects a body that does not match it. Default: `crc64nvme` when
+    /// the payload is unsigned, otherwise `none`.
+    pub payload_checksum: Option<DfsExternalPayloadChecksum>,
+    /// Concurrent object PUTs, 1..=8 (default 8).
+    pub upload_concurrency: Option<usize>,
+    /// Request worker threads, 1..=8 (default: `upload_concurrency`, at most 4).
+    pub worker_threads: Option<usize>,
     pub credentials_file: Option<PathBuf>,
     /// Optional disposable content cache; omission preserves backend-only reads.
     pub cache: Option<DfsExternalCacheConfig>,
+}
+
+/// `dfs_external_backend.payload_checksum`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DfsExternalPayloadChecksum {
+    /// No checksum header; only a signed payload lets the store detect a
+    /// body damaged in transit.
+    None,
+    /// `x-amz-checksum-crc64nvme`.
+    Crc64nvme,
 }
 
 pub(crate) const MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES: u64 = 1 << 40;
@@ -145,6 +197,47 @@ pub struct DfsPeerCacheConfig {
 }
 
 impl DfsExternalBackendConfig {
+    /// Whether PUT bodies go out unsigned, after defaults. Over TLS the
+    /// transport already authenticates the body, and the checksum header
+    /// lets the store reject a damaged one; a plaintext endpoint keeps the
+    /// signed payload.
+    pub fn effective_unsigned_payload(&self) -> bool {
+        self.unsigned_payload
+            .unwrap_or_else(|| self.endpoint.starts_with("https://"))
+    }
+
+    /// The PUT checksum header after defaults.
+    pub fn effective_payload_checksum(&self) -> DfsExternalPayloadChecksum {
+        self.payload_checksum
+            .unwrap_or(if self.effective_unsigned_payload() {
+                DfsExternalPayloadChecksum::Crc64nvme
+            } else {
+                DfsExternalPayloadChecksum::None
+            })
+    }
+
+    /// This configuration with every defaulted upload setting made explicit,
+    /// as `--print-config` shows it.
+    #[must_use]
+    pub fn with_defaults(mut self) -> Self {
+        self.unsigned_payload = Some(self.effective_unsigned_payload());
+        self.payload_checksum = Some(self.effective_payload_checksum());
+        self.upload_concurrency = Some(self.effective_upload_concurrency());
+        self.worker_threads = Some(self.effective_worker_threads());
+        self
+    }
+
+    /// Concurrent object PUTs after defaults.
+    pub fn effective_upload_concurrency(&self) -> usize {
+        self.upload_concurrency.unwrap_or(8)
+    }
+
+    /// Request worker threads after defaults.
+    pub fn effective_worker_threads(&self) -> usize {
+        self.worker_threads
+            .unwrap_or_else(|| self.effective_upload_concurrency().min(4))
+    }
+
     /// Reject ambiguous namespaces, implicit plaintext and relative secret paths.
     pub fn validate(&self) -> Result<()> {
         for value in [&self.store_id, &self.generation, &self.bucket, &self.region] {
@@ -175,6 +268,17 @@ impl DfsExternalBackendConfig {
         {
             return Err(invalid(
                 "external backend requires an explicit HTTPS origin, or allow_http=true for an isolated test endpoint",
+            ));
+        }
+        if self
+            .upload_concurrency
+            .is_some_and(|value| !(1..=8).contains(&value))
+            || self
+                .worker_threads
+                .is_some_and(|value| !(1..=8).contains(&value))
+        {
+            return Err(invalid(
+                "external backend upload_concurrency and worker_threads must be 1..=8",
             ));
         }
         if self
@@ -315,6 +419,35 @@ pub struct Cli {
     /// ownerfs_mount and data_dir, required when experimental_ownerfs_workspace_bind.
     #[arg(long)]
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
+    /// tmpfs directory that holds the outlet public names. All outlet paths must
+    /// be set together; leaving them unset disables the feature.
+    #[arg(long)]
+    pub outlet_public_root: Option<PathBuf>,
+    /// Root under which per-home data trees are mounted.
+    #[arg(long)]
+    pub outlet_import_root: Option<PathBuf>,
+    /// Convergence period of the outlet mirror (10..=60000ms), default 250.
+    #[arg(long)]
+    pub outlet_mirror_interval_ms: Option<u64>,
+    /// Mount options for the import mounts `afs-node` performs itself. Matches
+    /// the kernel defaults autofs uses today, so the data path keeps the same
+    /// semantics it has under a static mount.
+    #[arg(long)]
+    pub outlet_import_mount_options: Option<String>,
+    /// Path of the users tree on *every* node, used to build the mount source
+    /// `<home>:<outlet_users_root>`. A cluster-wide convention: a peer's path
+    /// cannot be discovered without a node manifest, which this design
+    /// deliberately does not have.
+    #[arg(long)]
+    pub outlet_users_root: Option<PathBuf>,
+    /// Address peers should use to reach this node's NFS export, e.g.
+    /// `192.168.2.101` or `data-node-a.cluster`. Host only: the port is NFS's.
+    ///
+    /// This node declares only its own address; peers learn it from the Meta
+    /// session snapshot, so adding a node never requires editing any other
+    /// node's configuration. Defaults to the host part of `grpc_listen`.
+    #[arg(long)]
+    pub outlet_nfs_addr: Option<String>,
     #[arg(long)]
     pub dfs_mount: Option<PathBuf>,
     /// FUSE receive threads shared by OwnerFs and DFS (1..=64).
@@ -350,6 +483,9 @@ pub struct Cli {
     /// Native Node live write-body capacity (4..=64MiB); S3 budgets are separate.
     #[arg(long)]
     pub dfs_dirty_budget_bytes: Option<u64>,
+    /// DFS write admission and fsync deadline, in milliseconds.
+    #[arg(long)]
+    pub dfs_write_timeout_ms: Option<u64>,
     /// GC data-protection grace after a reference retires, in milliseconds
     /// (0..=600000). Governs when retired references stop protecting inodes
     /// and chunks. Reference *records* additionally linger as replay
@@ -396,6 +532,10 @@ pub struct Cli {
     /// Minimum time between the starts of two scrub rounds (1..=2592000 s).
     #[arg(long)]
     pub dfs_scrub_round_interval_seconds: Option<u64>,
+    /// Kernel entry/attribute TTL of the DFS mount (0..=60000 ms; default
+    /// 1000; 0 disables kernel caching of names and attributes).
+    #[arg(long)]
+    pub dfs_kernel_cache_ttl_ms: Option<u64>,
     /// Filesystem-wide immutable DFS replica target count. Applied by Meta at initialization.
     #[arg(long)]
     pub dfs_desired_copies: Option<u16>,
@@ -444,6 +584,29 @@ pub struct Cli {
     pub trace_sample_ratio: Option<f64>,
     #[arg(long)]
     pub print_config: bool,
+    /// Print the compiled-in build identity and exit.
+    ///
+    /// The crate version alone cannot distinguish two builds of the same source
+    /// tree, which matters when several users share a host and need to prove
+    /// which binary is running.
+    #[arg(long)]
+    pub build_info: bool,
+}
+
+impl Cli {
+    /// Provenance of the running binary, for `--build-info`. `build.rs` reports
+    /// the commit and whether the tree was dirty, or `unknown` when the build
+    /// had no git metadata and `AFS_BUILD_ID` was unset.
+    #[must_use]
+    pub fn build_info() -> String {
+        let id = option_env!("AFS_BUILD_ID").unwrap_or("unknown");
+        format!(
+            "afs {} ({id}, {}/{})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -495,7 +658,17 @@ struct FileConfig {
     ownerfs_mount: Option<PathBuf>,
     experimental_ownerfs_workspace_bind: Option<bool>,
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
+    ownerfs_workspace_api: Option<WorkspaceApiConfig>,
+    ownerfs_workspace_default_user: Option<String>,
+    ownerfs_workspace_default_uid: Option<u32>,
+    ownerfs_workspace_default_gid: Option<u32>,
     ownerfs_workspace_egress_root: Option<PathBuf>,
+    outlet_public_root: Option<PathBuf>,
+    outlet_import_root: Option<PathBuf>,
+    outlet_mirror_interval_ms: Option<u64>,
+    outlet_import_mount_options: Option<String>,
+    outlet_users_root: Option<PathBuf>,
+    outlet_nfs_addr: Option<String>,
     dfs_mount: Option<PathBuf>,
     fuse_threads: Option<u16>,
     fuse_clone_fd: Option<bool>,
@@ -509,6 +682,7 @@ struct FileConfig {
     dfs_catalog_commit_queue: Option<usize>,
     dfs_write_queue_bytes: Option<u64>,
     dfs_dirty_budget_bytes: Option<u64>,
+    dfs_write_timeout_ms: Option<u64>,
     dfs_gc_grace_ms: Option<u64>,
     dfs_unpublished_descriptors: Option<usize>,
     dfs_upload_inflight_chunks: Option<usize>,
@@ -523,6 +697,7 @@ struct FileConfig {
     dfs_scrub_bytes_per_second: Option<u64>,
     dfs_scrub_start_delay_seconds: Option<u64>,
     dfs_scrub_round_interval_seconds: Option<u64>,
+    dfs_kernel_cache_ttl_ms: Option<u64>,
     dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_peer_cache: Option<DfsPeerCacheConfig>,
     dfs_write_buffer_idle_bytes: Option<u64>,
@@ -624,7 +799,14 @@ pub struct Config {
     pub ownerfs_mount: Option<PathBuf>,
     pub experimental_ownerfs_workspace_bind: bool,
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
+    pub ownerfs_workspace_api: Option<WorkspaceApiConfig>,
+    pub ownerfs_workspace_default_user: String,
+    pub ownerfs_workspace_default_uid: Option<u32>,
+    pub ownerfs_workspace_default_gid: Option<u32>,
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
+    /// Outlet public (name) layer. `Some` only when all outlet paths are
+    /// configured; the feature is off otherwise.
+    pub outlet: Option<OutletConfig>,
     pub dfs_mount: Option<PathBuf>,
     pub fuse_threads: u16,
     pub fuse_clone_fd: bool,
@@ -638,6 +820,7 @@ pub struct Config {
     pub dfs_catalog_commit_queue: usize,
     pub dfs_write_queue_bytes: u64,
     pub dfs_dirty_budget_bytes: u64,
+    pub dfs_write_timeout_ms: u64,
     pub dfs_gc_grace_ms: u64,
     pub dfs_unpublished_descriptors: usize,
     pub dfs_upload_inflight_chunks: usize,
@@ -652,6 +835,7 @@ pub struct Config {
     pub dfs_scrub_bytes_per_second: u64,
     pub dfs_scrub_start_delay_seconds: u64,
     pub dfs_scrub_round_interval_seconds: u64,
+    pub dfs_kernel_cache_ttl_ms: u64,
     pub dfs_external_backend: Option<DfsExternalBackendConfig>,
     pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
     /// Reusable idle write-body capacity only, not a live-body quota.
@@ -698,6 +882,12 @@ impl Config {
         let version_cache = dfs::resolve_version_cache(role, &cli, &file)?;
         let tuning = dfs::resolve_tuning(&cli, &file)?;
         let meta = meta::resolve(&cli, &file);
+        // Hoisted out of `merge` because the outlet layer advertises an NFS
+        // address and derives its default from this node's own listen host.
+        let grpc_listen: SocketAddr = cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
+            ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
+        });
+        let outlet = outlet::resolve(&cli, &file, grpc_listen)?;
         let resolved = Resolved {
             id,
             ownerfs,
@@ -710,6 +900,8 @@ impl Config {
             version_cache,
             tuning,
             meta,
+            grpc_listen,
+            outlet,
         };
         let cfg = Self::merge(role, cli, file, resolved);
         dfs::validate_storage(role, &cfg)?;
@@ -745,11 +937,11 @@ impl Config {
             version_cache: (dfs_version_cache_entries, dfs_version_cache_bytes),
             tuning,
             meta,
+            grpc_listen,
+            outlet,
         } = resolved;
         Self {
-            grpc_listen: cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
-                ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
-            }),
+            grpc_listen,
             rest_listen: cli.rest_listen.or(file.rest_listen).unwrap_or_else(|| {
                 ([127, 0, 0, 1], if role == Role::Meta { 7401 } else { 7501 }).into()
             }),
@@ -812,9 +1004,16 @@ impl Config {
                 .or(file.experimental_ownerfs_workspace_bind)
                 .unwrap_or(false),
             ownerfs_workspace_bind: file.ownerfs_workspace_bind,
+            ownerfs_workspace_api: file.ownerfs_workspace_api,
+            ownerfs_workspace_default_user: file
+                .ownerfs_workspace_default_user
+                .unwrap_or_else(|| "agentos".into()),
+            ownerfs_workspace_default_uid: file.ownerfs_workspace_default_uid,
+            ownerfs_workspace_default_gid: file.ownerfs_workspace_default_gid,
             ownerfs_workspace_egress_root: cli
                 .ownerfs_workspace_egress_root
                 .or(file.ownerfs_workspace_egress_root),
+            outlet,
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
             fuse_threads: fuse.fuse_threads,
             fuse_clone_fd: cli.fuse_clone_fd.or(file.fuse_clone_fd).unwrap_or(true),
@@ -828,6 +1027,7 @@ impl Config {
             dfs_catalog_commit_queue: tuning.dfs_catalog_commit_queue,
             dfs_write_queue_bytes: tuning.dfs_write_queue_bytes,
             dfs_dirty_budget_bytes: tuning.dfs_dirty_budget_bytes,
+            dfs_write_timeout_ms: tuning.dfs_write_timeout_ms,
             dfs_gc_grace_ms: tuning.dfs_gc_grace_ms,
             dfs_unpublished_descriptors: tuning.dfs_unpublished_descriptors,
             dfs_upload_inflight_chunks: tuning.dfs_upload_inflight_chunks,
@@ -842,7 +1042,10 @@ impl Config {
             dfs_scrub_bytes_per_second: tuning.dfs_scrub_bytes_per_second,
             dfs_scrub_start_delay_seconds: tuning.dfs_scrub_start_delay_seconds,
             dfs_scrub_round_interval_seconds: tuning.dfs_scrub_round_interval_seconds,
-            dfs_external_backend: file.dfs_external_backend,
+            dfs_kernel_cache_ttl_ms: tuning.dfs_kernel_cache_ttl_ms,
+            dfs_external_backend: file
+                .dfs_external_backend
+                .map(DfsExternalBackendConfig::with_defaults),
             dfs_peer_cache: file.dfs_peer_cache,
             dfs_write_buffer_idle_bytes: file
                 .dfs_write_buffer_idle_bytes
@@ -896,6 +1099,8 @@ struct Resolved {
     version_cache: (usize, u64),
     tuning: dfs::DfsTuning,
     meta: meta::MetaSettings,
+    grpc_listen: SocketAddr,
+    outlet: Option<OutletConfig>,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -972,31 +1177,108 @@ mod certificate_tests {
     }
 
     #[test]
-    fn dfs_external_backend_unsigned_payload_defaults_false_and_accepts_true() {
-        let default: DfsExternalBackendConfig = toml::from_str(
-            r#"
-store_id = "filesystem-a"
-generation = "generation-1"
-endpoint = "https://s3.example.invalid"
-bucket = "chunks"
-region = "us-east-1"
-"#,
-        )
-        .unwrap();
-        assert!(!default.unsigned_payload);
+    fn dfs_external_backend_payload_defaults_follow_the_endpoint_scheme() {
+        use DfsExternalPayloadChecksum::{Crc64nvme, None as NoChecksum};
+        let parse = |endpoint: &str, extra: &str| -> DfsExternalBackendConfig {
+            toml::from_str(&format!(
+                "store_id = \"filesystem-a\"\ngeneration = \"generation-1\"\nendpoint = \"{endpoint}\"\nbucket = \"chunks\"\nregion = \"us-east-1\"\nallow_http = true\n{extra}"
+            ))
+            .unwrap()
+        };
+        // (endpoint, explicit settings) -> (unsigned payload, checksum header)
+        for (endpoint, extra, unsigned, checksum) in [
+            // TLS: unsigned body, CRC64NVME header.
+            ("https://s3.example.invalid", "", true, Crc64nvme),
+            // Plaintext: the signed payload stays.
+            ("http://127.0.0.1:9000", "", false, NoChecksum),
+            // Explicit settings win in both directions.
+            (
+                "https://s3.example.invalid",
+                "unsigned_payload = false\n",
+                false,
+                NoChecksum,
+            ),
+            (
+                "http://127.0.0.1:9000",
+                "unsigned_payload = true\n",
+                true,
+                Crc64nvme,
+            ),
+            (
+                "https://s3.example.invalid",
+                "payload_checksum = \"none\"\n",
+                true,
+                NoChecksum,
+            ),
+            (
+                "https://s3.example.invalid",
+                "unsigned_payload = false\npayload_checksum = \"crc64nvme\"\n",
+                false,
+                Crc64nvme,
+            ),
+        ] {
+            let config = parse(endpoint, extra);
+            config.validate().unwrap();
+            assert_eq!(
+                config.effective_unsigned_payload(),
+                unsigned,
+                "{endpoint} {extra}"
+            );
+            assert_eq!(
+                config.effective_payload_checksum(),
+                checksum,
+                "{endpoint} {extra}"
+            );
+            let explicit = config.with_defaults();
+            assert_eq!(explicit.unsigned_payload, Some(unsigned));
+            assert_eq!(explicit.payload_checksum, Some(checksum));
+            assert_eq!(explicit.upload_concurrency, Some(8));
+            assert_eq!(explicit.worker_threads, Some(4));
+        }
+    }
 
-        let explicit: DfsExternalBackendConfig = toml::from_str(
-            r#"
+    #[test]
+    fn dfs_external_backend_upload_settings_default_and_validate() {
+        let base = r#"
 store_id = "filesystem-a"
 generation = "generation-1"
 endpoint = "https://s3.example.invalid"
 bucket = "chunks"
 region = "us-east-1"
-unsigned_payload = true
-"#,
-        )
+"#;
+        let default: DfsExternalBackendConfig = toml::from_str(base).unwrap();
+        default.validate().unwrap();
+        assert_eq!(default.effective_upload_concurrency(), 8);
+        assert_eq!(default.effective_worker_threads(), 4);
+
+        let explicit: DfsExternalBackendConfig = toml::from_str(&format!(
+            "{base}payload_checksum = \"crc64nvme\"\nupload_concurrency = 2\n"
+        ))
         .unwrap();
-        assert!(explicit.unsigned_payload);
+        explicit.validate().unwrap();
+        assert_eq!(
+            explicit.payload_checksum,
+            Some(DfsExternalPayloadChecksum::Crc64nvme)
+        );
+        assert_eq!(explicit.effective_upload_concurrency(), 2);
+        assert_eq!(explicit.effective_worker_threads(), 2);
+
+        for line in [
+            "upload_concurrency = 0",
+            "upload_concurrency = 9",
+            "worker_threads = 0",
+            "worker_threads = 9",
+        ] {
+            let invalid: DfsExternalBackendConfig =
+                toml::from_str(&format!("{base}{line}\n")).unwrap();
+            assert!(invalid.validate().is_err(), "{line} must be rejected");
+        }
+        assert!(
+            toml::from_str::<DfsExternalBackendConfig>(&format!(
+                "{base}payload_checksum = \"md5\"\n"
+            ))
+            .is_err()
+        );
     }
 }
 

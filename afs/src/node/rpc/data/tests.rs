@@ -888,6 +888,169 @@ impl PeerAuthenticator for FixtureReplicaPeer {
 }
 
 #[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipeline_pair_local_wal_failure_and_peer_timeout_return_local_error() {
+    use crate::dfs::{
+        EffectiveLocalCopy, LocalCopyPolicy, OperationId, PlacementSnapshot, ReplicaFailureConfig,
+        ReplicaGroup, ReplicaGroupId, ReplicaTarget, ReplicationConfig,
+    };
+    use crate::node::chunk::{PutIntent, StagedChunk};
+    use crate::node::replication::{DfsChunkSink, PlacementProvider};
+    use crate::node::rpc::peer::{GrpcReplicaDataPlane, PeerConnectionPool};
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    struct FixedPlacement(Arc<PlacementSnapshot>);
+    impl PlacementProvider for FixedPlacement {
+        fn snapshot(&self) -> afs_error::Result<Arc<PlacementSnapshot>> {
+            Ok(self.0.clone())
+        }
+
+        fn refresh(&self, _: u64) -> afs_error::Result<Arc<PlacementSnapshot>> {
+            self.snapshot()
+        }
+    }
+
+    struct StalledAuthority {
+        entered: mpsc::Sender<()>,
+        release: std::sync::Mutex<mpsc::Receiver<()>>,
+    }
+    impl DfsReplicaAuthorizer for StalledAuthority {
+        fn authorize(
+            &self,
+            _: &str,
+            _: &afs_protocol::node_data::DfsPutReplicaHeader,
+        ) -> afs_error::Result<AuthorizedReplicaWrite> {
+            self.entered.send(()).unwrap();
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            Err(replica_denied("test released the stalled replica"))
+        }
+    }
+
+    let timeout = Duration::from_millis(400);
+    let temp = tempfile::tempdir().unwrap();
+    let head = Arc::new(LocalChunkStore::open(temp.path().join("head"), "head").unwrap());
+    let tail = Arc::new(LocalChunkStore::open(temp.path().join("tail"), "tail").unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replication = ReplicationConfig {
+        desired_copies: 2,
+        sync_required_copies: 2,
+        min_distinct_nodes: 2,
+        min_distinct_failure_domains: 2,
+        local_copy: LocalCopyPolicy::Required,
+    };
+    let placement = FixedPlacement(Arc::new(PlacementSnapshot {
+        failure: ReplicaFailureConfig::strict(),
+        revision: 1,
+        local_copy: EffectiveLocalCopy::declared(&replication),
+        replication,
+        replica_groups: vec![ReplicaGroup {
+            id: ReplicaGroupId::new("timeout-pair"),
+            placement_epoch: 1,
+            targets: vec![
+                ReplicaTarget {
+                    node_id: "head".into(),
+                    node_epoch: 1,
+                    data_endpoint: "http://head".into(),
+                    device: head.device_descriptor().unwrap(),
+                },
+                ReplicaTarget {
+                    node_id: "tail".into(),
+                    node_epoch: 1,
+                    data_endpoint: format!("http://{}", listener.local_addr().unwrap()),
+                    device: tail.device_descriptor().unwrap(),
+                },
+            ],
+        }],
+    }));
+    let (entered, reached_peer) = mpsc::channel();
+    let (release_peer, release) = mpsc::channel();
+    let service = make_dfs_chunks_server_with_replication(
+        Some(tail.clone()),
+        Arc::new(FixtureReplicaPeer("head".into())),
+        Arc::new(DenyDfsReadAuthorizer),
+        Arc::new(StalledAuthority {
+            entered,
+            release: std::sync::Mutex::new(release),
+        }),
+        None,
+        Duration::from_secs(5),
+    );
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let peer = GrpcReplicaDataPlane::new(
+        Arc::new(
+            PeerConnectionPool::new(
+                afs_transport::GrpcConfig::default(),
+                afs_transport::TlsConfig::Disabled,
+                8,
+            )
+            .unwrap(),
+        ),
+        timeout,
+    )
+    .unwrap();
+    let sink = DfsChunkSink::new_with_epoch(
+        "head".into(),
+        1,
+        head.clone(),
+        Arc::new(placement),
+        Arc::new(peer),
+    );
+    head.fail_next_catalog_wal_after_sync();
+    let item = StagedChunk::new(OperationId::new("pair-timeout"), vec![71; 4096]);
+    let upload = tokio::task::spawn_blocking(move || {
+        let start = Instant::now();
+        let result = sink.put_chunks(vec![item], PutIntent::PipelineUpload);
+        (start.elapsed(), result)
+    });
+    tokio::time::timeout(timeout, async {
+        loop {
+            if head.catalog_commit_stats().failed && !upload.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("head WAL must fail while the upload is still waiting on the peer");
+    let (elapsed, result) = tokio::time::timeout(Duration::from_secs(2), upload)
+        .await
+        .expect("the stalled RPC must return within its configured budget")
+        .unwrap();
+    assert!(
+        reached_peer.try_recv().is_ok(),
+        "the RPC must reach the tail"
+    );
+    drop(release_peer);
+    server.abort();
+    assert!(elapsed >= timeout - Duration::from_millis(20));
+    assert!(elapsed <= timeout + Duration::from_millis(250));
+    let error = result.unwrap_err();
+    assert_eq!(error.code(), afs_error::IO_OTHER);
+    assert!(
+        error
+            .to_string()
+            .contains("injected catalog write/sync/parent barrier failure 3")
+    );
+    assert_eq!(tail.catalog_commit_stats().groups, 0);
+    eprintln!(
+        "J1 local WAL failure returned after stalled peer: {elapsed:?}, peer deadline: {timeout:?}"
+    );
+}
+
+#[cfg(feature = "dfs")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dfs_replica_grpc_three_hops_retry_missing_tail() {
     use crate::node::chunk::StagedChunk;
@@ -1219,6 +1382,7 @@ async fn grpc_unknown_repair_fixture() -> (
                     grpc_addr: data_addr.clone(),
                     data_addr,
                     rest_addr: "http://127.0.0.1:1".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: vec![device],
                     lease_ttl: std::time::Duration::from_secs(30),
@@ -1784,6 +1948,7 @@ async fn memory_read_authority_fixture() -> (
                     grpc_addr: "http://127.0.0.1:1".into(),
                     data_addr: "http://127.0.0.1:1".into(),
                     rest_addr: "http://127.0.0.1:1".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: vec![device.clone()],
                     lease_ttl: std::time::Duration::from_secs(30),
@@ -1843,7 +2008,7 @@ async fn memory_read_authority_fixture() -> (
             layout_root: layout.id.clone(),
             created_at_unix_ms: 1,
         })),
-        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout)),
+        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout.into())),
         TxnMutation::Put(MetaEntity::DfsChunk(staged.chunk.clone())),
         TxnMutation::Put(MetaEntity::DfsCopy(copy)),
         TxnMutation::Put(MetaEntity::DfsPlacement(PlacementRecord {
@@ -2085,6 +2250,7 @@ async fn dfs_read_authority_session_rotation_is_bounded_by_original_cache_lease(
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:1".into(),
                 rest_addr: "http://127.0.0.1:1".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: true,
                 storage_devices: vec![local.device_descriptor().unwrap()],
                 lease_ttl: std::time::Duration::from_secs(30),

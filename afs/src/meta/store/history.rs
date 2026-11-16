@@ -180,6 +180,7 @@ fields_heap!(super::NodeSessionLease {
     grpc_addr,
     data_addr,
     rest_addr,
+    nfs_addr,
     ownerfs_enabled,
     storage_devices,
     lease_ttl
@@ -210,6 +211,7 @@ impl Heap for super::TxnCondition {
                 c.value(revision)
             }
             Self::EntityEquals(value) => c.value(value),
+            Self::NodeSessionUnavailable { node_id } => c.value(node_id),
             Self::NodeSessionCurrent {
                 node_id,
                 session_id,
@@ -329,6 +331,7 @@ fields_heap!(super::NodeSession {
     grpc_addr,
     data_addr,
     rest_addr,
+    nfs_addr,
     ownerfs_enabled,
     storage_devices,
     lease_epoch,
@@ -341,7 +344,8 @@ fields_heap!(super::RootRecord {
     home_session_id,
     local_prepare_id,
     created_at_revision,
-    updated_at_revision
+    updated_at_revision,
+    nfs_addr
 });
 fields_heap!(super::RootReservationRecord {
     root_id,
@@ -433,6 +437,13 @@ fields_heap!(dfs::LayoutRoot {
     file_length,
     inline_extents
 });
+
+impl Heap for std::sync::Arc<dfs::LayoutRoot> {
+    fn heap(&self, c: &mut Charge) -> Result<()> {
+        // Keep charging the complete logical layout to each history entry.
+        self.as_ref().heap(c)
+    }
+}
 fields_heap!(dfs::ContentDigest { algorithm, bytes });
 fields_heap!(dfs::ChunkObject {
     id,
@@ -1199,6 +1210,7 @@ mod tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(30),
@@ -1347,6 +1359,7 @@ mod tests {
                     grpc_addr: "grpc".into(),
                     data_addr: "data".into(),
                     rest_addr: "rest".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(30),
@@ -1397,6 +1410,7 @@ mod tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(30),
@@ -1450,6 +1464,7 @@ mod tests {
             grpc_addr: address,
             data_addr: "d".into(),
             rest_addr: "r".into(),
+            nfs_addr: String::new(),
             ownerfs_enabled: true,
             storage_devices: devices,
             lease_epoch: 1,
@@ -1490,6 +1505,7 @@ mod tests {
             local_prepare_id: payload,
             created_at_revision: StoreRevision(1),
             updated_at_revision: StoreRevision(1),
+            nfs_addr: String::new(),
         });
         let event = WatchEvent {
             revision: StoreRevision(1),

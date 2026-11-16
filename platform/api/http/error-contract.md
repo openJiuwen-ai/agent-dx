@@ -22,7 +22,7 @@
 }
 ```
 
-`requestId` 始终存在并同时通过 `X-Request-Id` 返回。`operationId` 只在暂停、恢复、快照等显式生命周期操作中出现；`environmentId` 仅在请求已经具有稳定实例身份时出现。调用方不能从错误文本推断是否重试。
+错误对象的 `requestId` 标识本次入参请求，始终存在并同时通过 `X-Request-Id` 返回。CREATE 的 SSE `accepted` 事件也使用本次入参请求 ID；成功结果的 `requestId` 则是当前 Env 最初创建时的请求 ID，复用或同名重建时允许与入参不同。成功结果的创建 ID 不参与调用方的重试身份匹配。`operationId` 只在暂停、恢复、快照等显式生命周期操作中出现；`environmentId` 仅在请求已经具有稳定实例身份时出现。调用方不能从错误文本推断是否重试。
 
 SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个 `error` 对象。HTTP 连接中断且没有收到 `final` 时，SDK 按 `OUTCOME_UNKNOWN` 处理，并用原 Request ID 查询或重试。
 
@@ -66,6 +66,8 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 同一个 gRPC 状态可能映射成不同稳定码。例如 `Unavailable` 在写请求尚未提交时是 `UNAVAILABLE`，在 Adxlet 已经接受创建或生命周期操作后是 `OUTCOME_UNKNOWN`。API Server 根据请求是否越过执行边界作出映射；SDK 不重新猜测。
 
 内部 RPC 的连接拒绝、连接重置等传输不可用返回 HTTP 503。Tonic 在握手或重连期间将部分连接重置报告为 `Unknown / transport error` 或带有传输来源的 `Cancelled`；API Server 仅在错误来源链包含 `tonic::transport::Error` 时归一为 `Unavailable`，不会把应用返回的 `Unknown`、`Cancelled` 或 `Internal` 一律改成 503。RPC 超时归一为 504、`DEADLINE_EXCEEDED`；只有等待超时而没有确认终态时，仍使用 `outcome=unknown`、`retry=same_operation`。写请求的结果可能未知，创建重试沿用原 Request ID 和 Environment ID；尚未成功确认的执行可以重新分配 generation，并由对账回收残留。已确认成功和后续生命周期继续校验归属代次；不能因连接失败覆盖已有成功。
+
+认证依赖 Redis Coordinator 发现时，共享发现库仅对瞬态连接故障在同一绝对期限内至多重读一次幂等发现脚本。锁等待、连接建立及两次查询共用发现预算；API Server 的一次未缓存凭据验证还将发现、channel 获取和 `VerifyApiKey` 纳入同一原始 RPC 预算。坏记录、缺失记录、epoch 不匹配、Redis 认证／配置和命令错误不触发传输重读，仍拒绝认证；认证依赖不可用或预算耗尽对原生 HTTP 入口保持 503，无效 API Key 保持 401。此恢复不重放 API 写操作。连接故障阶段、错误类别、尝试次数和耗时在服务端结构化记录，不将 Redis URL、凭据或原始错误文本写入诊断；用例和执行入口见 [发现库](../../crates/discovery/README.md)。
 
 E2B 管理入口使用自己的协议错误响应。`POST /v2/sandboxes` 调用共享创建能力后，创建调用及后续控制记录/详情读取的 `Unavailable` 对外映射为 500，避免 E2B SDK 收到 503 后以新实例身份自动重建。创建前的认证、模板预检错误保留原映射；超时仍为 504，其他 E2B 路由不受影响。此规则仅作用于适配层，不改变上述原生错误合同，不增加跨请求幂等，也不因应答失败删除结果未知的实例。
 
@@ -205,6 +207,10 @@ error message; subsequent reconciliation cleans its seed without retrying creati
 and preserves the family's latest successful capture. E2B build status exposes
 this as `error` with `reason.message`. Unmarked NotFound, transport errors and
 uncertain capture results retain the existing reconciliation behavior.
+
+### 恢复并发与删除
+
+同一次恢复的并发等待者共享已受理任务的结果；等待超时仍为 `same_operation / unknown`，不能据此启动另一份执行。显式删除意图发布失败时尚未受理并重新开放恢复准入；发布成功后，新到或尚未执行的恢复返回 `CONFLICT / never / not_started`。已经进入执行的恢复被删除中止时使用 `Unavailable`，保留 `same_operation / unknown`，不能将其误报为从未启动。清理或结果发布未确认时继续保留实际进度，调用方按同一 Environment ID 查询或重试删除；删除调用超时不撤销当前 Controller 已受理的删除屏障。该屏障不新增进程重启后的持久化保证。
 
 ### Volume 管理错误
 

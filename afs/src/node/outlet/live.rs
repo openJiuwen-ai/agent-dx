@@ -1,0 +1,2352 @@
+//! 名字面的 IO 与收敛循环。
+//!
+//! 与 `mirror` 的分工：那边只有纯函数，这边负责读目录、执行动作、按周期驱动。
+//! 所有失败都按"跳过本轮、保持现状"处理（spec H7）：一次失败的 Meta 调用或
+//! 一次 tmpfs 写错误不得清空已发布的名字，否则下游容器会在重启 Meta 的瞬间
+//! 集体 bind 失败。
+
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use afs_error::{Error, Result};
+
+use super::mirror::{self, Action, LstatKind, PresentEntry};
+use crate::node::vfs::ownerfs::root::{ActiveOutletRoots, OutletRoot, RootMeta};
+
+/// Private staging and quarantine directories inside the public root.
+const STAGING_DIR: &str = ".pub";
+const QUARANTINE_DIR: &str = ".quarantine";
+
+/// Everything one mirror needs to run.
+#[derive(Clone, Debug)]
+pub struct MirrorConfig {
+    /// tmpfs directory holding the published names (`/public`).
+    pub public_root: PathBuf,
+    /// Root under which per-home data trees are mounted (`/imports`).
+    pub import_root: String,
+    /// Convergence period. Affects publish latency only, never the data path.
+    pub interval: Duration,
+}
+
+/// Load the mirror's view of the public directory.
+///
+/// Only `symlink_metadata` and `read_link` are used. **No target is ever
+/// stat'ed**: targets live under per-home mounts that may be NFS, where a
+/// metadata call can block for the whole mount timeout and stall the loop
+/// (spec H4). Whether a target exists is the consumer's startup check, not
+/// ours.
+///
+/// Names are kept as the raw bytes the directory returned. A workspace name is
+/// an arbitrary byte string, so converting it to `String` here would both rename
+/// the entry and let two distinct names collide on the U+FFFD replacement
+/// character (`mirror::plan` documents the failure mode this caused).
+pub fn scan_public(root: &Path) -> Result<BTreeMap<OsString, PresentEntry>> {
+    let entries = std::fs::read_dir(root).map_err(Error::from)?;
+    let mut present = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(Error::from)?;
+        let name = entry.file_name();
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(Error::from)?;
+        let kind = if metadata.file_type().is_symlink() {
+            LstatKind::Symlink
+        } else {
+            LstatKind::Other
+        };
+        let target = if kind == LstatKind::Symlink {
+            match std::fs::read_link(entry.path()) {
+                // A body that is not valid UTF-8 cannot be one of our targets
+                // (they are built from an ASCII import root and a hex root id),
+                // so report it as unreadable rather than lossily comparing it.
+                Ok(target) => target.into_os_string().into_string().ok(),
+                // Unreadable body: treat as foreign so the mirror never deletes
+                // something it cannot prove it created.
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        present.insert(name, mirror::classify(kind, target));
+    }
+    Ok(present)
+}
+
+/// Execute one action. Idempotent: a missing name is not an error.
+///
+/// Publishing goes through a staging symlink plus `rename`, so a reader never
+/// observes a half-written link and a generation change cannot leave the name
+/// briefly absent (spec H5).
+pub fn apply(root: &Path, action: &Action) -> Result<()> {
+    match action {
+        Action::Publish { name, target } => {
+            let staging = staging_path(root, name)?;
+            // A leftover staging file from a crash would make symlinkat fail
+            // with EEXIST; remove it first.
+            match std::fs::remove_file(&staging) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::from(error)),
+            }
+            std::os::unix::fs::symlink(target, &staging).map_err(Error::from)?;
+            std::fs::rename(&staging, root.join(name)).map_err(Error::from)?;
+            Ok(())
+        }
+        Action::Remove { name } => match std::fs::remove_file(root.join(name)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::from(error)),
+        },
+        Action::Quarantine { name } => quarantine(root, name),
+    }
+}
+
+fn staging_path(root: &Path, name: &OsStr) -> Result<PathBuf> {
+    let dir = root.join(STAGING_DIR);
+    std::fs::create_dir_all(&dir).map_err(Error::from)?;
+    // Fixed-size staging basename: a workspace name is at most NAME_MAX bytes,
+    // so appending a prefix to it could overflow the limit.
+    Ok(dir.join(format!("stage-{}", fnv1a(name))))
+}
+
+fn fnv1a(value: &OsStr) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Move a non-symlink entry out of the way so the name can be published.
+///
+/// Kept as evidence rather than deleted: a consumer that created a real
+/// directory under a workspace name is a contract violation, and deleting their
+/// data silently would be worse than quarantining it.
+fn quarantine(root: &Path, name: &OsStr) -> Result<()> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let dir = root.join(QUARANTINE_DIR);
+    std::fs::create_dir_all(&dir).map_err(Error::from)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    // 名字是任意字节，按字节截断前 32 个再拼哈希与时间戳；不经过 UTF-8，
+    // 否则隔离区里的名字会与调用方写下的名字不一致（且可能互相撞名）。
+    let bytes = name.as_bytes();
+    let prefix = &bytes[..bytes.len().min(32)];
+    // 拼在同一个文件名上：`PathBuf::push` 会加分隔符，把隔离目标变成
+    // `<name>/<suffix>`，原目录仍然占着名字，发布就永远失败。
+    let mut file_name = OsString::from_vec(prefix.to_vec());
+    file_name.push(format!("-{}-{stamp}", fnv1a(name)));
+    let target = dir.join(file_name);
+    std::fs::rename(root.join(name), &target).map_err(Error::from)?;
+    afs_logging::warn!(
+        "outlet.mirror.quarantined";
+        "name" => ?name,
+        "to" => target.display().to_string()
+    );
+    Ok(())
+}
+
+/// Startup gate: the public root must be a tmpfs (spec §5.3).
+///
+/// A real directory would let a container write into the name layer and would
+/// survive reboots with stale links; tmpfs makes the layer's lifetime explicit.
+pub fn ensure_public_root_is_tmpfs(root: &Path, mountinfo: &[u8]) -> Result<()> {
+    let encoded = mountinfo_path(root);
+    let entry = mountinfo
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| crate::node::parse_exact_mountinfo_line(line, &encoded))
+        .next_back();
+    match entry {
+        Some(entry) if entry.fs_type == b"tmpfs" => Ok(()),
+        Some(entry) => Err(Error::coded(
+            afs_error::CONFIG_INVALID,
+            format!(
+                "outlet public root must be tmpfs, found {}",
+                String::from_utf8_lossy(entry.fs_type)
+            ),
+        )),
+        None => Err(Error::coded(
+            afs_error::CONFIG_INVALID,
+            "outlet public root is not a mount point; mount a tmpfs there",
+        )),
+    }
+}
+
+/// Encode a path the way `/proc/self/mountinfo` does (octal escapes).
+fn mountinfo_path(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str()
+        .as_bytes()
+        .iter()
+        .flat_map(|byte| match *byte {
+            b' ' | b'\t' | b'\n' | b'\\' => format!("\\{:03o}", byte).into_bytes(),
+            other => vec![other],
+        })
+        .collect()
+}
+
+/// Prepare the private directories and clear staging leftovers.
+///
+/// A crash mid-publish leaves a staging symlink; it is not referenced by any
+/// name, so removing it is always safe.
+pub fn prepare(root: &Path) -> Result<()> {
+    for dir in [STAGING_DIR, QUARANTINE_DIR] {
+        let path = root.join(dir);
+        std::fs::create_dir_all(&path).map_err(Error::from)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .map_err(Error::from)?;
+        }
+    }
+    let staging = root.join(STAGING_DIR);
+    if let Ok(entries) = std::fs::read_dir(&staging) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// One convergence round. Returns the number of actions executed.
+///
+/// Concurrency: a round loads the current directory once, plans against it, and
+/// executes. Meta changing mid-round is corrected by the next round; every
+/// action is individually idempotent, so a partial round leaves no wedge
+/// (spec H8).
+/// 快照里出现的 home 集合（去重）。动态挂载的唯一输入。
+///
+/// 不需要节点清单：mirror 本来就要知道 home 才能拼 target，所以"哪些 home
+/// 需要发布名字"与"哪些 home 需要挂载"是同一个集合（设计第二节）。
+#[must_use]
+pub fn homes_in_snapshot(active: &[OutletRoot]) -> std::collections::BTreeSet<String> {
+    active
+        .iter()
+        .map(|root| root.home_node_id.clone())
+        .collect()
+}
+
+/// 动态 import 挂载的执行器。
+///
+/// 决策在 [`super::imports::plan_imports`]，这里只负责把动作落到内核。分开
+/// 的原因：动作序列可以在没有 NFS 的机器上测试，而系统调用必须在真机上跑。
+pub struct ImportExecutor {
+    import_root: PathBuf,
+    users_root: PathBuf,
+    mount_options: String,
+    local_node: String,
+    /// 每轮从快照刷新的、对端自己上报的地址。这是唯一来源。
+    advertised: std::collections::BTreeMap<String, String>,
+    mounter: Arc<dyn super::mount::ImportMounter>,
+    table: super::imports::ImportTable,
+}
+
+impl ImportExecutor {
+    #[must_use]
+    pub fn new(
+        import_root: PathBuf,
+        users_root: PathBuf,
+        mount_options: String,
+        local_node: String,
+        mounter: Arc<dyn super::mount::ImportMounter>,
+    ) -> Self {
+        Self {
+            import_root,
+            users_root,
+            mount_options,
+            local_node,
+            advertised: std::collections::BTreeMap::new(),
+            mounter,
+            table: super::imports::ImportTable::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn ready_count(&self) -> usize {
+        self.table.ready_count()
+    }
+
+    /// 当前可用的 home 集合。给 `mirror::plan` 做发布门禁用。
+    ///
+    /// 单独暴露而不直接公开 `table`：发布侧只需要"能不能发"这一个问题，
+    /// 不该拿到可以改状态的 `&mut` 入口。
+    #[must_use]
+    pub fn ready_homes(&self) -> std::collections::BTreeSet<String> {
+        self.table.ready_homes()
+    }
+
+    /// 用 mountinfo 校正内存状态：真相源是内核，不是我们记得什么。
+    ///
+    /// 一次全量扫描，成本与 home 数量无关（设计第四节）。三种漂移都能被
+    /// 纠正：外部 umount、AFS 重启但机器未重启、mountinfo 与内存不一致。
+    ///
+    /// 判定带防抖：单轮缺失不降级，须连续
+    /// [`super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE`] 轮都缺失。
+    /// 原因是挂载动作自身会让条目短暂从 mountinfo 消失（实测 bind 约
+    /// 120ms），而本循环每 250ms 读一次快照，很容易落进那个窗口。若不防抖，
+    /// "看到缺失 → 重挂 → 条目再消失 → 又看到缺失"会形成自激循环，实测每秒
+    /// 重建一次、每次约 120ms 路径不可用。
+    ///
+    /// **源地址与导出路径也要比**：只比对挂载点在不在，会让"对端换了 IP"
+    /// 永久隐身——内核仍保留那条陈旧挂载，`hard` 下访问它是阻塞而非报错，
+    /// 而发布只做 `symlink` 不碰 target，所以也不会有访问失败来触发重建。
+    /// 地址由 [`Self::ensure_imports`] 每轮刷新，因此换 IP 的发现最多晚一轮
+    /// （默认 250ms）。同一台机器上挂错导出目录同样能识别，见 [`mount_check`]。
+    pub fn reconcile(&mut self, mounts: &[super::topology::Mount]) {
+        let now = std::time::Instant::now();
+        let homes: Vec<String> = self.table.homes().map(str::to_owned).collect();
+        for home in homes {
+            let point = super::imports::mount_point(&self.import_root, &home);
+            let kind = if home == self.local_node {
+                super::imports::MountKind::Local
+            } else {
+                super::imports::MountKind::Remote
+            };
+            let check = mount_check(
+                mounts,
+                &point,
+                kind,
+                self.advertised.get(&home).map(String::as_str),
+                &self.users_root,
+            );
+            let state = self.table.entry(&home);
+            match check {
+                // 挂着但指向别处：当作访问失败，下一轮按 Remount 重建。
+                // 不在这里 umount——状态变更集中一处，避免在发布循环中间
+                // 插入挂载操作（设计第四节）。
+                MountCheck::Mismatched(_) => state.observe_access_failure(),
+                MountCheck::Matches => {
+                    state.observe_mounted();
+                }
+                MountCheck::Absent => {
+                    state.observe_absent(now, super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE);
+                }
+            }
+        }
+    }
+
+    /// 发布路径访问失败：标记可疑，由下一轮统一重建。
+    ///
+    /// 不在发现时立刻 umount：状态变更集中在一处，避免在发布循环中间插入
+    /// 挂载操作（设计第四节）。
+    pub fn mark_access_failure(&mut self, home: &str) {
+        self.table.entry(home).observe_access_failure();
+    }
+
+    /// 补齐缺失的 import 挂载。
+    ///
+    /// 单个 home 失败不影响其他 home；失败只退避，不熔断。绝大多数轮次
+    /// 什么都不做（全部 Ready），成本是一次 `plan_imports` 调用。
+    pub fn ensure_imports(&mut self, active: &[OutletRoot]) -> Result<usize> {
+        // 地址跟着快照走：节点重建换 IP 后，下一轮就拿到新地址，不需要任何
+        // 既有节点改配置。同一 home 的多个 root 上报同一地址，后者覆盖无妨。
+        let advertised: std::collections::BTreeMap<String, String> = active
+            .iter()
+            .filter(|root| !root.home_nfs_addr.is_empty())
+            .map(|root| (root.home_node_id.clone(), root.home_nfs_addr.clone()))
+            .collect();
+
+        // 只在变化时记一次：mirror 每 50ms 一轮，逐轮打印会把日志刷满；
+        // 而地址变化本身是值得留痕的事件（对端换 IP、Meta 回填异常等）。
+        if advertised != self.advertised {
+            afs_logging::info!(
+                "outlet.import.addresses";
+                "local" => self.local_node.clone(),
+                "advertised" => ?advertised
+            );
+            self.advertised = advertised;
+        }
+
+        let wanted = homes_in_snapshot(active);
+        self.table.retain(&wanted);
+
+        let now = std::time::Instant::now();
+        let actions = super::imports::plan_imports(&wanted, &self.local_node, &self.table, now);
+        afs_logging::debug!(
+            "outlet.import.plan";
+            "wanted" => ?wanted,
+            "local" => self.local_node.clone(),
+            "actions" => actions.len()
+        );
+        if actions.is_empty() {
+            return Ok(0);
+        }
+        // 只在真要动作时读一次：有动作才需要判"挂载点是不是被占着"，而
+        // 每轮都读这张表没有意义（`reconcile` 那边本来就有一份）。
+        let mounts = read_mounts();
+
+        // 三阶段执行：准备（串行）→ 挂载（并行）→ 应用结果（串行）。
+        //
+        // 为什么要并行：一次建挂可能因对端不可达而吃满 `MOUNT_ATTEMPT_TIMEOUT`。
+        // 串行时 N 个坏 home 的代价是 N×超时，整轮发布被推迟同样长的时间——
+        // 实测单个坏 home 就能把本机 workspace 的发布延迟从 61ms 拉到 10069ms。
+        // 并行后总代价回到单次超时。
+        //
+        // 为什么拆三步：`mount` 慢但不能持 `self.table` 的可变借用跨线程，
+        // 所以先算出每个 home 要挂什么（纯读），再并发挂载，最后串行落状态。
+        let mut applied = 0;
+
+        // --- 阶段 1：准备 ---
+        enum Step {
+            /// 已经挂好了，只需把状态对齐到 Ready。
+            AlreadyMounted,
+            /// 需要真正执行挂载。
+            Mount {
+                point: PathBuf,
+                source: String,
+                options: String,
+                remount: bool,
+            },
+            /// 跳过本轮（目录建不出来，或没有可用地址）。
+            Skipped,
+        }
+
+        /// 一个 home 在本轮的完整结果：home 名、执行过的步骤，以及只有
+        /// `Step::Mount` 才有的挂载返回值（起始时刻 + 结果）。
+        type MountOutcome = (
+            String,
+            Step,
+            Option<(Instant, io::Result<super::mount::MountIdentity>)>,
+        );
+
+        let mut steps: Vec<(String, Step)> = Vec::with_capacity(actions.len());
+        for action in actions {
+            let home = action.home().to_owned();
+            let point = super::imports::mount_point(&self.import_root, &home);
+
+            // tmpfs 重启后目录消失，挂载前必须存在。
+            if let Err(error) = std::fs::create_dir_all(&point) {
+                let delay = self.table.entry(&home).record_failure(now);
+                afs_logging::warn!(
+                    "outlet.import.mount_failed";
+                    "home" => ?home,
+                    "error" => error.to_string(),
+                    "consecutive" => self.table.entry(&home).consecutive_failures(),
+                    "next_retry_ms" => u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
+                );
+                steps.push((home, Step::Skipped));
+                continue;
+            }
+
+            let is_remount = matches!(action, super::imports::ImportAction::Remount { .. });
+
+            // 挂载点已被占用：只有"挂着且指向期望的源"才算就绪。
+            //
+            // 不能"摘掉再挂"（`reconcile` 下一轮按 mountinfo 看到"没挂"，会
+            // 再产一次挂载，再摘、再挂，永远停不下来——实测每秒一次、日志刷
+            // 到 196 条），所以匹配时必须把状态对齐到 Ready 让它收敛。
+            //
+            // 但"占用"不等于"挂对了"：重启后内核仍保留退出前的挂载，其中可能
+            // 指向旧地址、错误的导出目录，或者根本不是 NFS。旧实现只判存在性，
+            // 于是第一轮就把它们当就绪并发布名字——名字打得开、数据是错的、
+            // 还不报错（见 [`mount_check`]）。判成挂错时按 Remount 走，先
+            // detach 再挂，与"访问失败"共用同一条重建路径。
+            let check = mount_check(
+                &mounts,
+                &point,
+                action.kind(),
+                self.advertised.get(&home).map(String::as_str),
+                &self.users_root,
+            );
+            let remount = is_remount || matches!(check, MountCheck::Mismatched(_));
+            if !remount && matches!(check, MountCheck::Matches) {
+                steps.push((home, Step::AlreadyMounted));
+                continue;
+            }
+            if let MountCheck::Mismatched(entry) = check {
+                afs_logging::warn!(
+                    "outlet.import.source_mismatch";
+                    "home" => ?home,
+                    "kind" => ?action.kind(),
+                    "actual_fs_type" => entry.fs_type.clone(),
+                    "actual_source" => entry.source.clone(),
+                    "expected_users_root" => self.users_root.display().to_string()
+                );
+            }
+
+            // 本机 bind，对端 NFS。两种方式产生同一个路径形态
+            // `<import_root>/<home>/users`，所以 `/public/<name>` 的 target
+            // 对两边一致——用户在本机与跨机看到的是同一个目录。
+            let source = match action.kind() {
+                super::imports::MountKind::Local => self.users_root.display().to_string(),
+                super::imports::MountKind::Remote => {
+                    // 地址随快照来：home 注册会话时自己上报，所以新增节点
+                    // 不需要任何既有节点改配置。节点 id 是 AFS 身份、不是域名，
+                    // 不能拿它去解析。
+                    let host = match self.advertised.get(&home).cloned() {
+                        Some(host) if !host.is_empty() => host,
+                        _ => {
+                            // 没有地址就不能猜，否则每轮都失败并把日志刷满。
+                            self.table.entry(&home).record_failure(now);
+                            afs_logging::warn!(
+                                "outlet.import.no_nfs_addr";
+                                "home" => ?home,
+                                "hint" => "the home must advertise outlet_nfs_addr when it registers"
+                            );
+                            steps.push((home, Step::Skipped));
+                            continue;
+                        }
+                    };
+                    super::imports::mount_source(&host, &self.users_root)
+                }
+            };
+            let options = match action.kind() {
+                // bind 不接受 NFS 选项。
+                super::imports::MountKind::Local => super::mount::BIND_OPTIONS.to_owned(),
+                super::imports::MountKind::Remote => self.mount_options.clone(),
+            };
+            steps.push((
+                home,
+                Step::Mount {
+                    point,
+                    source,
+                    options,
+                    remount,
+                },
+            ));
+        }
+
+        // --- 阶段 2：并行挂载 ---
+        //
+        // 只做真正的挂载动作。`detach` 也放在这一步，因为它与 `mount` 一样
+        // 可能阻塞在 NFS 上，没理由让别的 home 等它。
+        let (mountable, ready): (Vec<_>, Vec<_>) = steps
+            .into_iter()
+            .partition(|(_, step)| matches!(step, Step::Mount { .. }));
+
+        // 已挂好的先收进结果，不需要并行。
+        let mut results: Vec<MountOutcome> = ready
+            .into_iter()
+            .map(|(home, step)| (home, step, None))
+            .collect();
+
+        if !mountable.is_empty() {
+            let mounter = Arc::clone(&self.mounter);
+            let outcomes: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = mountable
+                    .iter()
+                    .map(|(home, step)| {
+                        let mounter = Arc::clone(&mounter);
+                        let Step::Mount {
+                            point,
+                            source,
+                            options,
+                            remount,
+                        } = step
+                        else {
+                            unreachable!("partitioned to Step::Mount");
+                        };
+                        let point = point.clone();
+                        let source = source.clone();
+                        let options = options.clone();
+                        let remount = *remount;
+                        let home = home.clone();
+                        scope.spawn(move || {
+                            let started = Instant::now();
+                            if remount {
+                                afs_logging::info!(
+                                    "outlet.import.remount_started";
+                                    "home" => ?home,
+                                    "reason" => "access_failed"
+                                );
+                                // MNT_DETACH：容器可能仍持有 fd，强制 umount 会 EBUSY。
+                                let _ = mounter.detach(&point);
+                            }
+                            let outcome = mounter.mount(&source, &point, &options);
+                            (started, outcome)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| panic!("an import mount worker panicked"))
+                    })
+                    .collect()
+            });
+
+            for ((home, step), outcome) in mountable.into_iter().zip(outcomes) {
+                results.push((home, step, Some(outcome)));
+            }
+        }
+
+        // --- 阶段 3：落状态 ---
+        //
+        // 各 home 独立，顺序无关；排序只为日志稳定。
+        results.sort_by(|left, right| left.0.cmp(&right.0));
+        for (home, step, outcome) in results {
+            match (step, outcome) {
+                (Step::AlreadyMounted, _) => {
+                    self.table.entry(&home).confirm_mounted();
+                }
+                (Step::Skipped, _) => {}
+                (Step::Mount { .. }, None) => {
+                    unreachable!("a mount step must produce an outcome")
+                }
+                (Step::Mount { .. }, Some((started, Ok(identity)))) => {
+                    self.table.entry(&home).confirm_mounted();
+                    applied += 1;
+                    afs_logging::info!(
+                        "outlet.import.mounted";
+                        "home" => ?home,
+                        "elapsed_ms" => u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "unique_mount_id" => identity.unique_mount_id
+                    );
+                }
+                (Step::Mount { .. }, Some((_, Err(error)))) => {
+                    let delay = self.table.entry(&home).record_failure(now);
+                    let consecutive = self.table.entry(&home).consecutive_failures();
+                    let errno = error.raw_os_error().unwrap_or(0);
+                    let next_retry_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                    afs_logging::warn!(
+                        "outlet.import.mount_failed";
+                        "home" => ?home,
+                        "errno" => errno,
+                        "error" => error.to_string(),
+                        "consecutive" => consecutive,
+                        "next_retry_ms" => next_retry_ms
+                    );
+                }
+            }
+        }
+        Ok(applied)
+    }
+
+    /// 孤儿挂载：挂载点存在但快照里没有对应 home。
+    ///
+    /// 只告警，不卸载。"节点永久移除"没有可靠信号（session 过期不等于删除），
+    /// 自动卸载可能打断仍在读的容器（设计第九节 R6）。
+    pub fn report_orphans(&self, mounts: &[super::topology::Mount]) {
+        let known: std::collections::BTreeSet<&str> = self.table.homes().collect();
+        let prefix = {
+            use std::os::unix::ffi::OsStrExt;
+            self.import_root.as_os_str().as_bytes().to_vec()
+        };
+        for mount in mounts {
+            if !mount.mount_point.starts_with(&prefix) {
+                continue;
+            }
+            // 取相对 import_root 的第一段作为 home 名。
+            let rest = &mount.mount_point[prefix.len()..];
+            let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+            let home_end = rest
+                .iter()
+                .position(|byte| *byte == b'/')
+                .unwrap_or(rest.len());
+            let Ok(home) = std::str::from_utf8(&rest[..home_end]) else {
+                continue;
+            };
+            if home.is_empty() || known.contains(home) || home == self.local_node {
+                continue;
+            }
+            afs_logging::warn!(
+                "outlet.import.orphan";
+                "home" => ?home,
+                "reason" => "no_active_root"
+            );
+        }
+    }
+}
+
+/// Convergence with an import executor.
+///
+/// Round order is fixed and matters (design §3):
+///
+/// 1. `reconcile` — correct in-memory import state from mountinfo, the only
+///    truth about what is actually mounted;
+/// 2. `ensure_imports` — mount what is missing, **before** publishing, so a
+///    name never appears pointing at an unmounted target;
+/// 3. publish — the name layer of `mirror`;
+/// 4. orphan report — warn only, never unmount.
+pub fn converge_round(
+    config: &MirrorConfig,
+    meta: &dyn RootMeta,
+    cached_digest: &mut Option<String>,
+    cached_roots: &mut Vec<OutletRoot>,
+    imports: &mut ImportExecutor,
+) -> Result<usize> {
+    let reply = meta.list_active_outlet_roots(cached_digest.as_deref())?;
+    // H14: an `unchanged` reply carries no payload and must reuse the cache.
+    // This is the single place that decision is made, so no caller can mistake
+    // an empty payload for "Meta has no active roots" and wipe the directory.
+    let active = merge_reply(&reply, cached_roots);
+    let active = reject_unsafe_homes(active);
+    *cached_digest = Some(reply.digest.clone());
+    *cached_roots = active.clone();
+
+    {
+        // mountinfo 是真相源：外部 umount、进程重启但机器未重启、内存与实际
+        // 不一致，都由这一次扫描纠正（设计 §4）。
+        if let Ok(mountinfo) = std::fs::read("/proc/self/mountinfo") {
+            let mounts = super::topology::parse(&mountinfo);
+            imports.reconcile(&mounts);
+            imports.report_orphans(&mounts);
+        }
+        // 挂载失败不阻断发布：该 home 的名字仍会发布，只是暂时断链。
+        // 这比"整轮放弃"好——其他 home 的名字不受影响（spec H7）。
+        if let Err(error) = imports.ensure_imports(&active) {
+            afs_logging::warn!(
+                "outlet.import.round_failed";
+                "error" => error.to_string()
+            );
+        }
+    }
+
+    let present = scan_public(&config.public_root)?;
+    // 哪些 home 真的可用：决定"能不能发布新名字"，不影响"已发布的名字是否保留"。
+    //
+    // 未就绪的 home 只是不发新名——已在 /public 的条目原样保留（spec H7：
+    // 一次失败不得清空已发布的名字，否则下游容器会在对端抖动时集体 bind 失败）。
+    let ready = imports.ready_homes();
+    let actions = mirror::plan(&config.import_root, &active, &ready, &present);
+    let mut applied = 0;
+    // 发布时访问失败是"挂载挂了但不通"的唯一发现途径（设计 §4）：不做主动
+    // 探测，因为那会变成每轮对每个 peer 的持续 NFS 压力。
+    //
+    // 每个 home 每轮最多标记一次：一个 home 可能有上百个 root，逐个失败会
+    // 连续标记上百次，而下一轮的重建是每个 home 一次。
+    let mut suspect: Option<String> = None;
+    for action in &actions {
+        match apply(&config.public_root, action) {
+            Ok(()) => applied += 1,
+            Err(error) => {
+                // 发布失败的语义是"名字暂时没换成"，与挂载无关的错误（比如
+                // tmpfs 满）不该触发重建。只有涉及 import 路径的 IO 失败才
+                // 标记可疑。
+                let name = match action {
+                    mirror::Action::Publish { name, .. }
+                    | mirror::Action::Remove { name }
+                    | mirror::Action::Quarantine { name } => name,
+                };
+                if let Some(home) = home_of_published(name.as_os_str(), &active) {
+                    suspect = Some(home);
+                }
+                afs_logging::warn!(
+                    "outlet.publish.failed";
+                    "name" => ?name,
+                    "error" => error.to_string()
+                );
+            }
+        }
+    }
+    if let Some(home) = suspect {
+        imports.mark_access_failure(home.as_str());
+    }
+    if applied > 0 {
+        afs_logging::info!(
+            "outlet.mirror.converged";
+            "applied" => applied,
+            "active" => active.len(),
+            "present" => present.len()
+        );
+    }
+    Ok(applied)
+}
+
+fn merge_reply(reply: &ActiveOutletRoots, cached: &[OutletRoot]) -> Vec<OutletRoot> {
+    reply.merge_into(cached.to_vec())
+}
+
+/// Drop snapshot roots whose home id is unsafe to embed in a filesystem path.
+///
+/// Mount points (`<import_root>/<home>/users`) and symlink targets are built by
+/// joining the home id under a configured root, so an id containing `/`, a `..`
+/// segment or an absolute form would escape that root. Meta already rejects
+/// such ids at registration; this consumer-side filter keeps the loop safe even
+/// against a Meta that predates that check. Skipped homes are logged, never
+/// mounted or published, and the rest of the snapshot proceeds unaffected
+/// (spec H7).
+fn reject_unsafe_homes(active: Vec<OutletRoot>) -> Vec<OutletRoot> {
+    let mut kept = Vec::with_capacity(active.len());
+    for root in active {
+        if crate::config::is_safe_node_id(&root.home_node_id) {
+            kept.push(root);
+        } else {
+            afs_logging::warn!(
+                "outlet.snapshot.unsafe_home_id";
+                "home_node_id" => root.home_node_id.clone()
+            );
+        }
+    }
+    kept
+}
+
+/// Run the convergence loop until `shutdown` resolves.
+///
+/// Failures log and skip the round: the last successful snapshot keeps serving
+/// (spec H7). There is no backoff on the happy path — the loop is a fixed
+/// interval, and adding idle backoff would only increase publish latency.
+///
+/// The executor holds per-home state and a `Send + Sync` mounter, so it moves
+/// into the blocking worker each round and comes back with its state updated.
+/// Rounds are serial, so a `&mut` round trip through the task is safe.
+pub async fn run(
+    config: MirrorConfig,
+    meta: Arc<dyn RootMeta>,
+    mut shutdown: impl std::future::Future<Output = ()> + Unpin,
+    imports: ImportExecutor,
+) {
+    let mut cached_digest: Option<String> = None;
+    let mut cached_roots: Vec<OutletRoot> = Vec::new();
+    let mut tick = tokio::time::interval(config.interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Move slot for the executor: handed to the blocking worker each round and
+    // taken back afterwards so its per-home state survives across rounds.
+    let mut imports = Some(imports);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tick.tick() => {
+                let config = config.clone();
+                let meta = meta.clone();
+                let mut digest = cached_digest.clone();
+                let mut roots = cached_roots.clone();
+                // 把 executor 暂时移进 worker，本轮结束后取回，状态得以跨轮保留。
+                let mut worker_imports = imports.take();
+                let result = tokio::task::spawn_blocking({
+                    let config = config.clone();
+                    move || {
+                        let executor = worker_imports
+                            .as_mut()
+                            .expect("executor slot is only empty between rounds");
+                        let applied = converge_round(
+                            &config,
+                            meta.as_ref(),
+                            &mut digest,
+                            &mut roots,
+                            executor,
+                        );
+                        (applied, digest, roots, worker_imports)
+                    }
+                })
+                .await;
+                match result {
+                    Ok((Ok(_), digest, roots, back)) => {
+                        cached_digest = digest;
+                        cached_roots = roots;
+                        imports = back;
+                    }
+                    Ok((Err(error), _, _, back)) => {
+                        // Keep the previous snapshot: a failed round must not
+                        // retract names that were valid moments ago.
+                        imports = back;
+                        afs_logging::warn!("outlet.mirror.round_failed"; "error" => error.to_string());
+                    }
+                    Err(error) => {
+                        // Worker panicked: state is gone with it. Rebuild on the
+                        // next round by starting from a fresh executor rather
+                        // than serving with stale state.
+                        afs_logging::warn!("outlet.mirror.worker_failed"; "error" => error.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 一条挂载点的判定结果。
+enum MountCheck<'a> {
+    /// 挂载存在，且指向期望的源。
+    Matches,
+    /// 挂着东西，但指向别处：旧地址、错误的导出目录，或者根本不是 NFS。
+    /// 携带实际条目，调用方只用于日志。
+    Mismatched(&'a super::topology::Mount),
+    /// 没有挂载。
+    Absent,
+}
+
+/// 读一次 mountinfo，供一轮内所有 home 共用。
+fn read_mounts() -> Vec<super::topology::Mount> {
+    std::fs::read("/proc/self/mountinfo")
+        .map(|buffer| super::topology::parse(&buffer))
+        .unwrap_or_default()
+}
+
+/// 判定 `point` 上的挂载是否就是我们要的那一条。
+///
+/// 只判"路径上有没有挂东西"在重启后有一个静默窗口：内核仍保留进程退出前
+/// 的挂载，新的一轮把它们当成就绪并发布名字，而它们可能指向旧地址、错误的
+/// 导出目录，或者根本不是 NFS（有人 bind 了一个目录过来）。这三种情况下名字
+/// 都打得开，只是读到的数据是错的，且不会有任何报错。
+///
+/// 三类比对，各自都有"宁可放过、不可误杀"的取舍：
+///
+/// - `fs_type` 必须以 `nfs` 开头（仅远程）。挡住"同一路径被别的挂载占用"。
+///   本机 bind 不比：它的 fstype 就是源盘的，若 `users_root` 落在 NFS 上，
+///   bind 出来的条目同样显示 nfs，按类型判会把正常挂载判成错的。
+/// - host 只在上报值是 IP 字面量时比。`mount.nfs` 会把主机名解析成 IP 再挂，
+///   拿主机名和 IP 比永远不等，会退化成每轮拆一次挂载。
+/// - 导出路径必须等于 `users_root`。这条对主机名场景同样有效，是"同一台
+///   机器但挂错目录"的唯一检测手段。源整条解析不出来时放弃比对，与旧行为
+///   一致——宁可放过，也不自激。
+fn mount_check<'a>(
+    mounts: &'a [super::topology::Mount],
+    point: &Path,
+    kind: super::imports::MountKind,
+    expected_host: Option<&str>,
+    users_root: &Path,
+) -> MountCheck<'a> {
+    use std::os::unix::ffi::OsStrExt;
+    let wanted = point.as_os_str().as_bytes();
+    let Some(entry) = mounts.iter().find(|mount| mount.mount_point == wanted) else {
+        // 本地 bind 在 dentry 退化时可能长期不出现在 mountinfo 里（实测只剩
+        // 约 30% 可见），用 (ino, dev) 复核，否则会把"已挂载"判成"缺失"。
+        // 远程 NFS 不做追加探测：`stat` 在陈旧挂载上会阻塞整个 timeo。
+        return if kind == super::imports::MountKind::Local && bind_still_mounted(point, users_root)
+        {
+            MountCheck::Matches
+        } else {
+            MountCheck::Absent
+        };
+    };
+
+    if kind == super::imports::MountKind::Local {
+        // bind 的源在 mountinfo 的 `root` 字段（第 4 列），不是 `source`——
+        // 后者是设备名（实测 `/dev/vda1`）。比 `source` 会让每条正常挂载
+        // 都判成"挂错了"，然后每 250ms 拆一次重挂（真机上立刻暴露）。
+        return if same_export(&entry.root, users_root) {
+            MountCheck::Matches
+        } else {
+            MountCheck::Mismatched(entry)
+        };
+    }
+
+    if !entry.fs_type.starts_with("nfs") {
+        return MountCheck::Mismatched(entry);
+    }
+    let Some((host, path)) = super::imports::split_source(&entry.source) else {
+        return MountCheck::Matches;
+    };
+    let host_ok = expected_host.is_none_or(|expected| {
+        !super::imports::is_ip_literal(expected)
+            || super::imports::normalize_host(host) == super::imports::normalize_host(expected)
+    });
+    if host_ok && same_export(path.as_bytes(), users_root) {
+        MountCheck::Matches
+    } else {
+        MountCheck::Mismatched(entry)
+    }
+}
+
+/// 导出路径与配置的 `users_root` 是否同一个目录。
+///
+/// 只归一尾部斜杠，不做 `canonicalize`：后者会解析软链接，在陈旧的 NFS 上
+/// 可能阻塞整个 `timeo`。代价是配置里若把 `users_root` 写成软链接路径，
+/// 会判成不等并每轮重挂——部署约定要求写真实路径。
+fn same_export(actual: &[u8], expected: &Path) -> bool {
+    fn trim(value: &[u8]) -> &[u8] {
+        let mut end = value.len();
+        while end > 1 && value[end - 1] == b'/' {
+            end -= 1;
+        }
+        &value[..end]
+    }
+    use std::os::unix::ffi::OsStrExt;
+    trim(actual) == trim(expected.as_os_str().as_bytes())
+}
+
+/// 本地 bind 的二次确认：挂载点的 `(st_ino, st_dev)` 是否等于挂载源。
+///
+/// 必要性：某个路径被反复 mount/umount 上万次之后，它的 dentry 会退化——
+/// 实测某节点上该路径在 `/proc/self/mountinfo` 里只有约 30% 的时间可见，
+/// 而 `stat` 一直能访问。若只信 mountinfo，就会陷入"判定未挂载 → 重挂 →
+/// 条目仍不可见 → 再重挂"的自激循环，每秒重建一次、每次约 120ms 路径不可用。
+///
+/// 为什么用 `(ino, dev)` 而不是只比 `dev`：本地 bind 的设备号与源盘同一个，
+/// 只比 `dev` 无法区分"挂载生效"与"只是目录本身"。实测正常 bind 后挂载点
+/// 的 inode 会变成源的 inode（如 `2097283 → 2097221`），据此可判。
+///
+/// 为什么只用于本地：`stat` 在陈旧的 NFS 挂载上会阻塞整个 `timeo`（默认
+/// 600s），把一轮收敛拖成十分钟。本地 bind 是 ext4，无此风险。
+fn bind_still_mounted(point: &Path, source: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(point_meta) = std::fs::metadata(point) else {
+        return false;
+    };
+    let Ok(source_meta) = std::fs::metadata(source) else {
+        return false;
+    };
+    point_meta.ino() == source_meta.ino() && point_meta.dev() == source_meta.dev()
+}
+
+/// 发布名对应的 home。用于发布失败时定位是哪个 import 出了问题。
+///
+/// 名字与 root id 一一对应，root 又携带 home，所以不需要额外查表。
+fn home_of_published(name: &OsStr, active: &[OutletRoot]) -> Option<String> {
+    active
+        .iter()
+        .find(|root| {
+            crate::node::vfs::ownerfs::root::root_name_from_id(&root.root_id)
+                .is_ok_and(|decoded| decoded.as_os_str() == name)
+        })
+        .map(|root| root.home_node_id.clone())
+}
+
+/// Diagnosis cadence. Slower than the mirror interval on purpose: mount drift
+/// is an operator-visible condition, not something the loop reacts to.
+pub const DIAGNOSIS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One diagnosis pass. Returns findings; the caller only logs them.
+///
+/// Pure with respect to the mirror: it reads mountinfo and the import
+/// directory, never mutates names, and never feeds back into `converge`
+/// (spec H3). A missing or drifting mount must not stop publication — a
+/// symlink to a currently unreachable target is still the correct name layer,
+/// and retracting it would take names away from consumers that never touched
+/// that home.
+pub fn diagnose(config: &MirrorConfig, mountinfo: &[u8]) -> Vec<super::topology::Finding> {
+    let mounts = super::topology::parse(mountinfo);
+    let mut findings = super::topology::diagnose_public(&config.public_root, &mounts);
+    let homes = homes_under(&config.import_root);
+    findings.extend(super::topology::diagnose_imports(
+        Path::new(&config.import_root),
+        &homes,
+        &mounts,
+    ));
+    findings
+}
+
+/// Node ids that have a directory under the import root.
+///
+/// Enumerated from the directory rather than from mountinfo so a home whose
+/// mount silently disappeared is still reported: it would otherwise vanish
+/// from the check entirely, which is exactly the case worth catching.
+fn homes_under(import_root: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(import_root) else {
+        return Vec::new();
+    };
+    let mut homes: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .collect();
+    homes.sort();
+    homes
+}
+
+/// Run the diagnosis loop until `shutdown` resolves.
+pub async fn run_diagnosis(
+    config: MirrorConfig,
+    mut shutdown: impl std::future::Future<Output = ()> + Unpin,
+) {
+    let mut tick = tokio::time::interval(DIAGNOSIS_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tick.tick() => {
+                let config = config.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let mountinfo = std::fs::read("/proc/self/mountinfo").ok()?;
+                    Some(diagnose(&config, &mountinfo))
+                })
+                .await
+                {
+                    Ok(Some(findings)) => {
+                        for finding in findings {
+                            // One event per finding so each is separately
+                            // alertable; a single "topology bad" line would
+                            // hide which home broke.
+                            afs_logging::warn!(
+                                "outlet.topology";
+                                "kind" => finding.kind(),
+                                "mount_point" => finding.mount_point(),
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        afs_logging::warn!("outlet.topology.mountinfo_unreadable");
+                    }
+                    Err(error) => {
+                        afs_logging::warn!("outlet.topology.worker_failed"; "error" => error.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::vfs::ownerfs::root::{ActiveOutletRoots, RootId};
+    use std::sync::Mutex;
+
+    /// 名字层测试的入口：执行器在动态 import 成为唯一路径前就已必选，
+    /// 这里用假 mounter 造一个，让纯发布语义的测试不必关心挂载细节。
+    fn converge(
+        config: &MirrorConfig,
+        meta: &dyn RootMeta,
+        cached_digest: &mut Option<String>,
+        cached_roots: &mut Vec<OutletRoot>,
+    ) -> Result<usize> {
+        let mut executor = ImportExecutor::new(
+            PathBuf::from(&config.import_root),
+            PathBuf::from("/home/agentos/users"),
+            "vers=4.1,hard".to_owned(),
+            "node-self".to_owned(),
+            Arc::new(FakeMounter::default()),
+        );
+        converge_round(config, meta, cached_digest, cached_roots, &mut executor)
+    }
+
+    /// 记录调用的假 mounter：让执行器逻辑在无 NFS 的机器上可测。
+    #[derive(Default)]
+    struct FakeMounter {
+        mounts: Mutex<Vec<(String, PathBuf, String)>>,
+        detaches: Mutex<Vec<PathBuf>>,
+        /// home 名 -> 失败次数。为 0 时成功。
+        fail_for: Mutex<std::collections::HashMap<String, u32>>,
+        /// 每次挂载人为耗时，用来验证并行度。
+        delay: Mutex<Option<Duration>>,
+        /// 并发挂载的峰值（同一时刻在 mount 里的线程数），用来断言"真的并行"。
+        peak_in_flight: Mutex<usize>,
+        in_flight: Mutex<usize>,
+    }
+
+    impl FakeMounter {
+        /// 按挂载源里的 host（即映射后的地址）指定失败。
+        fn failing_for(host: &str) -> Self {
+            let mut map = std::collections::HashMap::new();
+            map.insert(host.to_owned(), u32::MAX);
+            Self {
+                fail_for: Mutex::new(map),
+                ..Self::default()
+            }
+        }
+
+        /// 每次 mount 睡了 `delay`，用于测量并行执行的总耗时。
+        fn with_delay(delay: Duration) -> Self {
+            Self {
+                delay: Mutex::new(Some(delay)),
+                ..Self::default()
+            }
+        }
+
+        fn peak_in_flight(&self) -> usize {
+            *self.peak_in_flight.lock().unwrap()
+        }
+
+        fn mount_count(&self) -> usize {
+            self.mounts.lock().unwrap().len()
+        }
+
+        fn mounted_homes(&self) -> Vec<String> {
+            self.mounts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(source, _, _)| source.split(':').next().unwrap_or("").to_owned())
+                .collect()
+        }
+    }
+
+    impl super::super::mount::ImportMounter for FakeMounter {
+        fn mount(
+            &self,
+            source: &str,
+            target: &std::path::Path,
+            options: &str,
+        ) -> std::io::Result<super::super::mount::MountIdentity> {
+            // 进出计数用来断言并发性：串行执行时峰值恒为 1。
+            {
+                let mut in_flight = self.in_flight.lock().unwrap();
+                *in_flight += 1;
+                let mut peak = self.peak_in_flight.lock().unwrap();
+                if *in_flight > *peak {
+                    *peak = *in_flight;
+                }
+            }
+            // 先把值取出来再 sleep：`if let` 会把 `MutexGuard` 的临时值生命
+            // 期延长到整个 block，sleep 期间仍持锁，其他线程就全被挡住——
+            // 这正是"并行"退化成串行的经典写法（实测 3×150ms 变 456ms）。
+            let delay = *self.delay.lock().unwrap();
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
+
+            let result = self.mount_inner(source, target, options);
+            *self.in_flight.lock().unwrap() -= 1;
+            result
+        }
+
+        fn detach(&self, target: &std::path::Path) -> std::io::Result<()> {
+            self.detaches.lock().unwrap().push(target.to_path_buf());
+            Ok(())
+        }
+    }
+
+    impl FakeMounter {
+        fn mount_inner(
+            &self,
+            source: &str,
+            target: &std::path::Path,
+            options: &str,
+        ) -> std::io::Result<super::super::mount::MountIdentity> {
+            let host = source.split(':').next().unwrap_or("").to_owned();
+            let mut failures = self.fail_for.lock().unwrap();
+            if let Some(remaining) = failures.get_mut(&host)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                return Err(std::io::Error::from_raw_os_error(libc::EHOSTUNREACH));
+            }
+            self.mounts.lock().unwrap().push((
+                source.to_owned(),
+                target.to_path_buf(),
+                options.to_owned(),
+            ));
+            Ok(super::super::mount::MountIdentity { unique_mount_id: 7 })
+        }
+    }
+
+    fn executor(dir: &std::path::Path, mounter: Arc<FakeMounter>) -> ImportExecutor {
+        ImportExecutor::new(
+            dir.join("imports"),
+            PathBuf::from("/home/agentos/users"),
+            "vers=4.1,hard".to_owned(),
+            "node-self".to_owned(),
+            mounter,
+        )
+    }
+
+    /// 名字层的两个内部目录必须都登记在保留名集合里。
+    ///
+    /// 它们在 `live.rs`（`STAGING_DIR` / `QUARANTINE_DIR`）与
+    /// `ownerfs::root::RESERVED_ROOT_NAMES` 各写了一份字面量，这条测试是唯一的
+    /// 防漂移手段：将来若给名字层加第三个内部目录却忘了登记，用户就能建出同名
+    /// workspace，把发布变成"隔离 ↔ 重建"的循环。
+    #[test]
+    fn internal_directories_are_reserved_root_names() {
+        use crate::node::vfs::ownerfs::root::{RESERVED_ROOT_NAMES, validate_root_name};
+        for dir in [STAGING_DIR, QUARANTINE_DIR] {
+            assert!(
+                RESERVED_ROOT_NAMES.contains(&dir),
+                "{dir} 是名字层的内部目录，必须登记为保留名"
+            );
+            assert!(
+                validate_root_name(std::ffi::OsStr::new(dir)).is_err(),
+                "{dir} 不得能建成 workspace"
+            );
+        }
+    }
+
+    /// 一条 mountinfo 条目：`home` 的挂载点，源是 `host:<users_root>`。
+    ///
+    /// `host` 单独给出来，是因为"源地址"正是换 IP 场景要比对的那一段。
+    fn mount_at(dir: &std::path::Path, home: &str, host: &str) -> super::super::topology::Mount {
+        use std::os::unix::ffi::OsStrExt;
+        let point = super::super::imports::mount_point(&dir.join("imports"), home);
+        super::super::topology::Mount {
+            // NFS 导出根：root 字段永远是 `/`。
+            root: b"/".to_vec(),
+            mount_point: point.as_os_str().as_bytes().to_vec(),
+            fs_type: "nfs4".to_owned(),
+            source: format!("{host}:/home/agentos/users"),
+            shared: false,
+        }
+    }
+
+    fn remote_mount(point: &str, source: &str) -> super::super::topology::Mount {
+        super::super::topology::Mount {
+            root: b"/".to_vec(),
+            mount_point: point.as_bytes().to_vec(),
+            fs_type: "nfs4".to_owned(),
+            source: source.to_owned(),
+            shared: false,
+        }
+    }
+
+    /// 本机 bind：mountinfo 的 `source` 是设备名，`root` 才是 bind 源目录
+    /// （实测 `537 30 253:1 /home/.../data/ownerfs /home/.../imports/... - ext4 /dev/vda1`）。
+    fn local_bind_mount(point: &str, source_root: &str) -> super::super::topology::Mount {
+        super::super::topology::Mount {
+            root: source_root.as_bytes().to_vec(),
+            mount_point: point.as_bytes().to_vec(),
+            fs_type: "ext4".to_owned(),
+            source: "/dev/vda1".to_owned(),
+            shared: false,
+        }
+    }
+
+    const POINT: &str = "/imports/node-a/users";
+    const USERS: &str = "/home/agentos/users";
+
+    fn check(mounts: &[super::super::topology::Mount], host: Option<&str>) -> bool {
+        matches!(
+            super::mount_check(
+                mounts,
+                std::path::Path::new(POINT),
+                super::super::imports::MountKind::Remote,
+                host,
+                std::path::Path::new(USERS)
+            ),
+            super::MountCheck::Matches
+        )
+    }
+
+    /// 同一台机器、错误的导出目录：host 一致但路径不同，必须判错。
+    ///
+    /// 这是"看到有挂载就当成挂对了"里最隐蔽的一类：地址没变，只比源地址的
+    /// 实现完全看不到它，而数据已经换成了别的目录（能打开、能读、全是错的）。
+    #[test]
+    fn a_wrong_export_path_is_detected() {
+        let mounts = vec![remote_mount(POINT, "192.0.2.10:/home/agentos/other")];
+        assert!(!check(&mounts, Some("192.0.2.10")));
+    }
+
+    /// 对端换过 IP、旧挂载还在：host 不符即判错（这条是既有行为的回归）。
+    #[test]
+    fn a_stale_host_is_detected() {
+        let mounts = vec![remote_mount(POINT, "192.0.2.99:/home/agentos/users")];
+        assert!(!check(&mounts, Some("192.0.2.10")));
+    }
+
+    /// 上报的是主机名：不参与 host 比对（mount.nfs 会解析成 IP），但导出路径
+    /// 仍然要比——否则"同机错目录"这一类会从主机名部署里漏掉。
+    #[test]
+    fn a_hostname_advertisement_still_checks_the_export_path() {
+        let wrong = vec![remote_mount(POINT, "10.0.0.7:/home/agentos/other")];
+        assert!(!check(&wrong, Some("node-a")));
+
+        let right = vec![remote_mount(POINT, "10.0.0.7:/home/agentos/users")];
+        assert!(check(&right, Some("node-a")));
+    }
+
+    /// 尾斜杠不该被当成"路径不同"，否则每轮判一次不等、每 250ms 拆挂载。
+    #[test]
+    fn a_trailing_slash_is_not_a_mismatch() {
+        let mounts = vec![remote_mount(POINT, "192.0.2.10:/home/agentos/users/")];
+        assert!(check(&mounts, Some("192.0.2.10")));
+    }
+
+    /// 本机 bind 只比 `root` 字段：它的 `source` 是设备名，fstype 是源盘的
+    /// （users_root 落在 NFS 上时同样显示 nfs），两者都判不出对错。
+    #[test]
+    fn a_local_bind_is_compared_by_its_mount_root() {
+        let good = local_bind_mount(POINT, USERS);
+        assert!(matches!(
+            super::mount_check(
+                &[good],
+                std::path::Path::new(POINT),
+                super::super::imports::MountKind::Local,
+                None,
+                std::path::Path::new(USERS)
+            ),
+            super::MountCheck::Matches
+        ));
+
+        let wrong = local_bind_mount(POINT, "/srv/elsewhere");
+        assert!(matches!(
+            super::mount_check(
+                &[wrong],
+                std::path::Path::new(POINT),
+                super::super::imports::MountKind::Local,
+                None,
+                std::path::Path::new(USERS)
+            ),
+            super::MountCheck::Mismatched(_)
+        ));
+    }
+
+    /// 挂载点空着：Absent，不是"挂错了"。
+    #[test]
+    fn an_empty_import_point_is_absent() {
+        assert!(matches!(
+            super::mount_check(
+                &[],
+                std::path::Path::new(POINT),
+                super::super::imports::MountKind::Remote,
+                Some("192.0.2.10"),
+                std::path::Path::new(USERS)
+            ),
+            super::MountCheck::Absent
+        ));
+    }
+
+    /// 对端换 IP：即使旧挂载还在 mountinfo 里，也必须重挂到新地址。
+    ///
+    /// 这是 fail-open 的反面。`hard` 挂载访问对端已消失的 NFS 是**阻塞**而不是
+    /// ENOENT，`/public/<name>` 看上去完全正常却读不动，而 `ls -F` 也不会跟随
+    /// 那根链接。更糟的是"发布失败"这条发现途径根本不存在：`Publish` 只做
+    /// `symlink` + `rename`，从不访问 target，所以对端彻底失联也不会让发布失败。
+    /// 唯一可靠的信号是 mountinfo 里的源地址与快照上报的地址不一致。
+    #[test]
+    fn a_changed_source_host_forces_a_remount() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        assert_eq!(mounter.mounted_homes(), vec!["192.0.2.10".to_owned()]);
+
+        // 快照里已经是新地址；旧地址那条挂载仍在 mountinfo 里。
+        let mut moved = root_on("node-a");
+        moved.home_nfs_addr = "203.0.113.99".to_owned();
+        exec.ensure_imports(&[moved.clone()]).unwrap();
+        exec.reconcile(&[mount_at(dir.path(), "node-a", "192.0.2.10")]);
+
+        assert_eq!(
+            exec.ensure_imports(&[moved]).unwrap(),
+            1,
+            "源地址与上报地址不一致的挂载必须重建，而不是继续当作 Ready"
+        );
+        assert_eq!(
+            mounter.mounted_homes().last().map(String::as_str),
+            Some("203.0.113.99"),
+            "重挂必须拨新地址"
+        );
+    }
+
+    /// 源地址与上报地址一致时不得重建：否则每轮都会拆一次挂载。
+    #[test]
+    fn a_matching_source_host_keeps_the_mount_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        let before = mounter.mount_count();
+
+        for _ in 0..3 {
+            exec.reconcile(&[mount_at(dir.path(), "node-a", "192.0.2.10")]);
+            assert_eq!(
+                exec.ensure_imports(&[root_on("node-a")]).unwrap(),
+                0,
+                "地址没变就不该动挂载"
+            );
+        }
+        assert_eq!(mounter.mount_count(), before);
+    }
+
+    /// 上报主机名时不比对：`mount.nfs` 已经把名字解析成 IP，mountinfo 里没有
+    /// 主机名可比。硬比会永远不等 → 每轮拆挂载重挂，反而制造故障。
+    #[test]
+    fn a_hostname_advertisement_is_never_compared_with_the_resolved_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        let mut named = root_on("node-a");
+        named.home_nfs_addr = "node-a.test".to_owned();
+        exec.ensure_imports(&[named.clone()]).unwrap();
+        let before = mounter.mount_count();
+
+        for _ in 0..3 {
+            exec.reconcile(&[mount_at(dir.path(), "node-a", "192.0.2.10")]);
+            assert_eq!(
+                exec.ensure_imports(&[named.clone()]).unwrap(),
+                0,
+                "主机名与解析后的 IP 不可比，不得触发重挂"
+            );
+        }
+        assert_eq!(mounter.mount_count(), before);
+    }
+
+    /// IPv6 的方括号是写法不是身份：`[fe80::1]` 与 `fe80::1` 必须判为同一个地址。
+    #[test]
+    fn a_bracketed_ipv6_source_matches_the_bare_advertisement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        let mut v6 = root_on("node-a");
+        v6.home_nfs_addr = "fe80::1".to_owned();
+        exec.ensure_imports(&[v6.clone()]).unwrap();
+        let before = mounter.mount_count();
+
+        exec.reconcile(&[mount_at(dir.path(), "node-a", "[fe80::1]")]);
+        assert_eq!(exec.ensure_imports(&[v6]).unwrap(), 0, "同一个地址不得重挂");
+        assert_eq!(mounter.mount_count(), before);
+    }
+
+    /// 类型是 NFS、但源格式读不出 host/路径：判不了就不动，避免每轮拆挂载。
+    ///
+    /// 与下面那条"不是 NFS"的区别：那里类型就能定性，这里类型对、内容看不懂，
+    /// 只能放过。
+    #[test]
+    fn an_unparseable_source_does_not_trigger_a_remount() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        let mut mount = mount_at(dir.path(), "node-a", "192.0.2.10");
+        mount.fs_type = "nfs".to_owned();
+        mount.source = "no-export-path-here".to_owned();
+        exec.reconcile(&[mount]);
+
+        assert_eq!(exec.ensure_imports(&[root_on("node-a")]).unwrap(), 0);
+    }
+
+    /// 挂载点被别的文件系统占着（有人 bind 了目录过来）：宁可重建也不能
+    /// 当成就绪——名字能打开，读到的却是完全无关的数据。
+    #[test]
+    fn a_non_nfs_mount_at_the_import_point_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        let before = mounter.mount_count();
+        let mut mount = mount_at(dir.path(), "node-a", "192.0.2.10");
+        mount.fs_type = "ext4".to_owned();
+        mount.source = "/dev/sda1".to_owned();
+        exec.reconcile(&[mount]);
+
+        assert_eq!(
+            exec.ensure_imports(&[root_on("node-a")]).unwrap(),
+            1,
+            "非 NFS 的占用必须被替换"
+        );
+        assert_eq!(mounter.mount_count(), before + 1);
+    }
+
+    /// 路径不安全的 home id 必须在收敛前被丢弃：挂载点与软链 target 都是
+    /// 按 `<root>/<home>/...` 拼出来的，带 `/`、`..` 或绝对形式的 id 会逃出
+    /// 预定目录（检视意见：挂载与名字层的边界）。
+    #[test]
+    fn unsafe_home_ids_are_dropped_from_the_snapshot() {
+        let roots = vec![
+            root_on("node-a"),
+            root_on("../escape"),
+            root_on("/etc"),
+            root_on("with.dot"),
+        ];
+        let kept = reject_unsafe_homes(roots);
+        let homes: Vec<_> = kept.iter().map(|root| root.home_node_id.as_str()).collect();
+        assert_eq!(homes, vec!["node-a"]);
+    }
+
+    fn root_on(home: &str) -> OutletRoot {
+        // 测试约定：地址随快照来。给已知 home 一个稳定地址，未知名留空
+        //（空地址即"该 home 没上报"，会被跳过）。
+        let addr = match home {
+            "node-a" => "192.0.2.10",
+            "node-b" => "192.0.2.11",
+            "node-c" => "192.0.2.12",
+            _ => "",
+        };
+        OutletRoot {
+            root_id: RootId("root-61".into()),
+            root_epoch: 1,
+            home_node_id: home.to_owned(),
+            home_nfs_addr: addr.to_owned(),
+        }
+    }
+
+    /// 本机也要挂（bind），对端走 NFS：两条路径产出同一个
+    /// `<import_root>/<home>/users`，所以 `/public` 的 target 形态一致。
+    #[test]
+    fn ensure_imports_mounts_both_peer_and_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        let active = vec![root_on("node-a"), root_on("node-self")];
+        assert_eq!(exec.ensure_imports(&active).unwrap(), 2);
+
+        let calls = mounter.mounts.lock().unwrap().clone();
+        let remote = calls
+            .iter()
+            .find(|(source, _, _)| source.starts_with("192.0.2.10:"))
+            .expect("peer mounted by address");
+        assert!(remote.2.starts_with("vers="), "peer uses NFS options");
+
+        let local = calls
+            .iter()
+            .find(|(source, _, _)| source.starts_with('/'))
+            .expect("local mounted from its own data tree");
+        assert_eq!(local.2, super::super::mount::BIND_OPTIONS);
+
+        // 第二轮无事可做。
+        assert_eq!(exec.ensure_imports(&active).unwrap(), 0);
+        assert_eq!(mounter.mount_count(), 2);
+    }
+
+    /// 一个 home 挂不上时，其他 home 必须照常挂载（设计第三节）。
+    #[test]
+    fn one_failing_home_does_not_block_others() {
+        let dir = tempfile::tempdir().unwrap();
+        // node-a 映射到 192.0.2.10，让这个地址失败。
+        let mounter = Arc::new(FakeMounter::failing_for("192.0.2.10"));
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        let active = vec![root_on("node-a"), root_on("node-c")];
+        assert_eq!(exec.ensure_imports(&active).unwrap(), 1);
+        assert_eq!(mounter.mounted_homes(), vec!["192.0.2.12".to_owned()]);
+        assert_eq!(exec.ready_count(), 1);
+    }
+
+    /// mountinfo 说挂着、内存空白：认下来，不重复挂（进程重启场景）。
+    #[test]
+    fn reconcile_accepts_an_already_mounted_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        // 先让它认识 node-a，再模拟内核说已挂载。
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        let mounts = vec![mount_at(dir.path(), "node-a", "192.0.2.10")];
+        exec.reconcile(&mounts);
+        assert_eq!(exec.ready_count(), 1);
+    }
+
+    /// 本地 bind 的二次确认：`(ino, dev)` 等于源即视为已挂载。
+    ///
+    /// 这条判据存在的原因是 mountinfo 在 dcache 退化的路径上会长期不显示
+    /// 条目（实测某节点只剩 30% 可见），而挂载实际可用。只信 mountinfo
+    /// 就会陷入每秒重挂的自激循环。
+    #[test]
+    fn bind_probe_treats_the_source_inode_as_mounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+
+        // 同一目录的另一个路径（不做真正 mount）：元数据必然一致，
+        // 等价于"bind 已生效"的可观测特征。
+        let point = dir.path().join("point");
+        std::fs::create_dir_all(&point).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let source_meta = std::fs::metadata(&source).unwrap();
+        let point_meta = std::fs::metadata(&point).unwrap();
+        assert_ne!(
+            point_meta.ino(),
+            source_meta.ino(),
+            "两个独立目录的 inode 不同，前提成立"
+        );
+
+        // 独立目录：inode 不同 → 视为未挂载。
+        assert!(
+            !super::bind_still_mounted(&point, &source),
+            "inode 不同必须判为未挂载"
+        );
+    }
+
+    /// open(2) 出来的同一个 inode 走两条路径时，探针必须判为已挂载。
+    #[test]
+    fn bind_probe_matches_the_same_inode_through_two_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+
+        // 用硬链接式的路径别名模拟"bind 后两条路径指向同一 inode"：
+        // 这里直接对同一个路径取两次，验证判据本身不误报。
+        assert!(
+            super::bind_still_mounted(&source, &source),
+            "同一 inode 必须判为已挂载"
+        );
+    }
+
+    /// 远程 home 不做 stat 探测：`stat` 在陈旧 NFS 上会阻塞整个 timeo。
+    #[test]
+    fn reconcile_skips_the_bind_probe_for_remote_homes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        // node-a 相对 node-self 是 Remote。即使 mountinfo 说没挂、
+        // 且 import 目录下确实没有任何东西，也不应因为 stat 探测而卡住。
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        std::thread::sleep(super::super::imports::MOUNT_SETTLE);
+        for _ in 0..super::super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE {
+            exec.reconcile(&[]);
+        }
+        assert_eq!(exec.ready_count(), 0, "远程缺失仍须降级");
+    }
+
+    /// 外部 umount 后必须重挂。
+    ///
+    /// 判定带防抖（连续 `ABSENT_ROUNDS_BEFORE_DEMOTE` 轮缺失），所以不是
+    /// "下一轮"，而是"连续几轮之后"——外部卸载是持久状态，这个延迟只会让
+    /// 恢复晚几百毫秒，不影响最终发现。防抖换来的是：我们自己挂载造成的
+    /// 短暂空窗不会被误判成外部卸载（见 `reconcile_ignores_the_mount_settle_window`）。
+    #[test]
+    fn reconcile_detects_an_external_unmount() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        assert_eq!(exec.ready_count(), 1);
+
+        // 抑制期先过去，避免挂载后 1s 内的抑制挡住降级。
+        std::thread::sleep(super::super::imports::MOUNT_SETTLE);
+
+        // 连续缺失若干轮后才降级。
+        for _ in 0..super::super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE {
+            exec.reconcile(&[]);
+        }
+        assert_eq!(exec.ready_count(), 0);
+        assert_eq!(exec.ensure_imports(&[root_on("node-a")]).unwrap(), 1);
+        assert_eq!(mounter.mount_count(), 2);
+    }
+
+    /// 刚挂载完成的那一段空窗，不能被误判成外部卸载。
+    ///
+    /// 这是自激循环的回归测试。`mount` 动作本身会让挂载点短暂从 mountinfo
+    /// 消失（实测 bind 约 110–125ms），而收敛循环每 250ms 读一次快照。若单轮
+    /// 缺失就降级，就会"挂 → 判缺失 → 再挂"永不收敛，实测每秒重建一次、
+    /// 约 12% 的读失败。
+    #[test]
+    fn reconcile_ignores_the_mount_settle_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        let after_first = mounter.mount_count();
+        assert_eq!(exec.ready_count(), 1);
+
+        // 模拟挂载动作造成的空窗：紧接着连续几轮看不到条目。
+        for _ in 0..(super::super::imports::ABSENT_ROUNDS_BEFORE_DEMOTE * 2) {
+            exec.reconcile(&[]);
+        }
+
+        // 仍在 Ready，且没有因此产生新的挂载动作。
+        assert_eq!(exec.ready_count(), 1, "空窗内的缺失不得降级");
+        assert_eq!(
+            exec.ensure_imports(&[root_on("node-a")]).unwrap(),
+            0,
+            "不得重复挂载"
+        );
+        assert_eq!(mounter.mount_count(), after_first, "挂载次数不应增加");
+    }
+
+    /// 缺失中断后计数归零：不是"累计缺失",是"连续缺失"。
+    #[test]
+    fn absent_streak_resets_when_the_mount_is_seen_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        std::thread::sleep(super::super::imports::MOUNT_SETTLE);
+
+        // 缺失两轮（未到阈值），再看到一轮，再缺失两轮 —— 不应降级。
+        let mounts = vec![mount_at(dir.path(), "node-a", "192.0.2.10")];
+        exec.reconcile(&[]);
+        exec.reconcile(&[]);
+        exec.reconcile(&mounts);
+        exec.reconcile(&[]);
+        exec.reconcile(&[]);
+        assert_eq!(exec.ready_count(), 1, "计数必须连续，不能被累计");
+    }
+
+    /// 地址来自快照（对端自己上报），dial 原样不做任何加工。
+    #[test]
+    fn address_comes_from_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = ImportExecutor::new(
+            dir.path().join("imports"),
+            PathBuf::from("/home/agentos/users"),
+            "vers=4.1,hard".to_owned(),
+            "node-self".to_owned(),
+            mounter.clone(),
+        );
+
+        let mut root = root_on("node-a");
+        root.home_nfs_addr = "203.0.113.7".to_owned();
+        assert_eq!(exec.ensure_imports(&[root]).unwrap(), 1);
+        assert_eq!(
+            mounter.mounted_homes(),
+            vec!["203.0.113.7".to_owned()],
+            "the advertised address must be dialled as-is"
+        );
+    }
+
+    /// 快照里的地址变了，下一轮就要用新地址重挂。
+    ///
+    /// 覆盖"节点重建换了 IP"：不能因为旧地址还挂着就继续用旧地址。
+    #[test]
+    fn a_changed_address_is_picked_up_on_the_next_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = ImportExecutor::new(
+            dir.path().join("imports"),
+            PathBuf::from("/home/agentos/users"),
+            "vers=4.1,hard".to_owned(),
+            "node-self".to_owned(),
+            mounter.clone(),
+        );
+
+        let mut root = root_on("node-a");
+        root.home_nfs_addr = "203.0.113.7".to_owned();
+        exec.ensure_imports(&[root.clone()]).unwrap();
+
+        // 同一 home 换了地址：状态被标记为可疑后必须重挂到新地址。
+        root.home_nfs_addr = "203.0.113.99".to_owned();
+        exec.mark_access_failure("node-a");
+        assert_eq!(exec.ensure_imports(&[root]).unwrap(), 1);
+        let sources: Vec<String> = mounter
+            .mounts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(source, _, _)| source.split(':').next().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(sources.last().map(String::as_str), Some("203.0.113.99"));
+    }
+
+    /// home 没上报地址时不猜，也不回退到节点名解析。
+    #[test]
+    fn a_home_without_an_advertised_address_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = ImportExecutor::new(
+            dir.path().join("imports"),
+            PathBuf::from("/home/agentos/users"),
+            "vers=4.1,hard".to_owned(),
+            "node-self".to_owned(),
+            mounter.clone(),
+        );
+
+        // node-b 的 root 没有地址：不猜，也不回退到节点名解析。
+        let mut no_addr = root_on("node-b");
+        no_addr.home_nfs_addr.clear();
+        // node-c 有地址：正常挂载，说明一个缺失不影响其他 home。
+        assert_eq!(
+            exec.ensure_imports(&[no_addr, root_on("node-c")]).unwrap(),
+            1
+        );
+        assert_eq!(mounter.mount_count(), 1);
+    }
+
+    /// 访问失败标记可疑，下一轮走 detach + 重挂。
+    #[test]
+    fn access_failure_triggers_a_remount() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut exec = executor(dir.path(), mounter.clone());
+
+        exec.ensure_imports(&[root_on("node-a")]).unwrap();
+        exec.mark_access_failure("node-a");
+        assert_eq!(exec.ensure_imports(&[root_on("node-a")]).unwrap(), 1);
+        assert_eq!(mounter.detaches.lock().unwrap().len(), 1);
+        assert_eq!(mounter.mount_count(), 2);
+    }
+
+    /// Scripted `RootMeta` returning queued replies, so rounds are deterministic
+    /// without a Meta server.
+    struct ScriptedMeta {
+        replies: Mutex<Vec<ActiveOutletRoots>>,
+        calls: Mutex<Vec<Option<String>>>,
+    }
+
+    impl ScriptedMeta {
+        fn new(replies: Vec<ActiveOutletRoots>) -> Self {
+            // Reverse so `pop` yields the scripted order.
+            let mut replies = replies;
+            replies.reverse();
+            Self {
+                replies: Mutex::new(replies),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RootMeta for ScriptedMeta {
+        fn reserve_root(
+            &self,
+            _id: &RootId,
+            _create_intent_id: &str,
+        ) -> Result<crate::node::vfs::ownerfs::root::RootReservation> {
+            unreachable!("not exercised by mirror tests")
+        }
+        fn activate_root(
+            &self,
+            _prepared: &crate::node::vfs::ownerfs::root::PreparedRoot,
+        ) -> Result<crate::node::vfs::ownerfs::root::RootGrant> {
+            unreachable!("not exercised by mirror tests")
+        }
+        fn abort_root(
+            &self,
+            _reservation: &crate::node::vfs::ownerfs::root::RootReservation,
+        ) -> Result<()> {
+            unreachable!("not exercised by mirror tests")
+        }
+        fn deactivate_root(
+            &self,
+            _root_id: &RootId,
+            _epoch: u64,
+            _home_node_id: &str,
+            _session_id: &str,
+        ) -> Result<()> {
+            unreachable!("not exercised by mirror tests")
+        }
+        fn lookup_root(
+            &self,
+            _id: &RootId,
+        ) -> Result<Option<crate::node::vfs::ownerfs::root::RootLocation>> {
+            unreachable!("not exercised by mirror tests")
+        }
+        fn list_owner_roots(
+            &self,
+            _home_node_id: &str,
+        ) -> Result<crate::node::vfs::ownerfs::root::OwnerRootInventory> {
+            unreachable!("not exercised by mirror tests")
+        }
+        fn acquire_root(
+            &self,
+            _id: &RootId,
+            _right: crate::node::vfs::ownerfs::root::RootRight,
+        ) -> Result<crate::node::vfs::ownerfs::root::RootGrant> {
+            unreachable!("not exercised by mirror tests")
+        }
+        fn validate_root_access(
+            &self,
+            _presented: &crate::node::vfs::ownerfs::root::PresentedRootAccess,
+            _authenticated_peer_node_id: &str,
+        ) -> Result<crate::node::vfs::ownerfs::root::RootGrant> {
+            unreachable!("not exercised by mirror tests")
+        }
+        fn recover_root(
+            &self,
+            _record: &crate::node::vfs::ownerfs::catalog::LocalRootRecord,
+            _new_session_id: &str,
+        ) -> Result<crate::node::vfs::ownerfs::root::RootGrant> {
+            unreachable!("not exercised by mirror tests")
+        }
+        fn list_active_outlet_roots(
+            &self,
+            known_digest: Option<&str>,
+        ) -> Result<ActiveOutletRoots> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(known_digest.map(str::to_owned));
+            let mut replies = self.replies.lock().unwrap();
+            if replies.is_empty() {
+                return Err(Error::coded(
+                    afs_error::RUNTIME_INTERNAL,
+                    "scripted meta exhausted",
+                ));
+            }
+            Ok(replies.pop().unwrap())
+        }
+    }
+
+    fn node(id: &str, epoch: u64, home: &str) -> OutletRoot {
+        OutletRoot {
+            root_id: RootId(id.to_owned()),
+            root_epoch: epoch,
+            home_node_id: home.to_owned(),
+            // 必须给地址：发布门禁要求 home 先 Ready，而 Ready 需要挂载成功，
+            // 远程挂载又需要地址（没有地址会走 no_nfs_addr 分支直接跳过）。
+            // 这些用例测的是发布语义，给个假地址让 FakeMounter 正常返回即可。
+            home_nfs_addr: format!("{home}.test"),
+        }
+    }
+
+    fn config(root: &Path) -> MirrorConfig {
+        MirrorConfig {
+            public_root: root.to_path_buf(),
+            import_root: "/imports".into(),
+            interval: Duration::from_millis(10),
+        }
+    }
+
+    fn full(digest: &str, roots: Vec<OutletRoot>) -> ActiveOutletRoots {
+        ActiveOutletRoots {
+            roots,
+            digest: digest.into(),
+            unchanged: false,
+        }
+    }
+
+    fn converged(digest: &str) -> ActiveOutletRoots {
+        ActiveOutletRoots {
+            roots: Vec::new(),
+            digest: digest.into(),
+            unchanged: true,
+        }
+    }
+
+    /// 端到端一轮：Meta 返回 root → /public 出现正确 symlink。
+    #[test]
+    fn round_publishes_active_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path()).unwrap();
+        let meta = ScriptedMeta::new(vec![full("d1", vec![node("root-61", 7, "node-a")])]);
+        let mut digest = None;
+        let mut roots = Vec::new();
+
+        let applied = converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+        assert_eq!(applied, 1);
+        let link = dir.path().join("a");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("/imports/node-a/users/root-61-e7")
+        );
+        assert_eq!(digest.as_deref(), Some("d1"));
+    }
+
+    /// 第二轮传入上一轮的 digest，服务端据此返回 unchanged，不得清空目录。
+    #[test]
+    fn unchanged_reply_keeps_the_previous_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path()).unwrap();
+        let meta = ScriptedMeta::new(vec![
+            full("d1", vec![node("root-61", 7, "node-a")]),
+            converged("d1"),
+        ]);
+        let mut digest = None;
+        let mut roots = Vec::new();
+        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+        let applied = converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+
+        assert_eq!(applied, 0, "unchanged round must do nothing");
+        assert!(
+            dir.path().join("a").symlink_metadata().is_ok(),
+            "H14: an unchanged reply must not be read as 'no active roots'"
+        );
+        // 第二轮必须把上一轮的 digest 传上去，否则服务端永远回全量。
+        assert_eq!(
+            meta.calls.lock().unwrap()[1].as_deref(),
+            Some("d1"),
+            "the cached digest must be forwarded"
+        );
+    }
+
+    /// 换代的 target 变化必须原地替换，读到的始终是可解析的 symlink。
+    #[test]
+    fn generation_change_replaces_the_link_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path()).unwrap();
+        let meta = ScriptedMeta::new(vec![
+            full("d1", vec![node("root-61", 7, "node-a")]),
+            full("d2", vec![node("root-61", 8, "node-a")]),
+        ]);
+        let mut digest = None;
+        let mut roots = Vec::new();
+        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(dir.path().join("a")).unwrap(),
+            Path::new("/imports/node-a/users/root-61-e8")
+        );
+    }
+
+    /// 下线的 root 被摘除。
+    #[test]
+    fn removed_root_is_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path()).unwrap();
+        let meta = ScriptedMeta::new(vec![
+            full("d1", vec![node("root-61", 7, "node-a")]),
+            full("d2", Vec::new()),
+        ]);
+        let mut digest = None;
+        let mut roots = Vec::new();
+        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+
+        assert!(dir.path().join("a").symlink_metadata().is_err());
+    }
+
+    /// 非 UTF-8 名字必须逐字节发布：真机上这条链路曾经把两个 workspace
+    /// 合并成一个带 U+FFFD 的名字（`mirror::plan` 的键曾是 `String`）。
+    #[test]
+    fn a_non_utf8_workspace_name_is_published_byte_for_byte() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path()).unwrap();
+        // hex(b"utf8cafe\xe9") = 7574663863616665e9，与 OwnerFs 的编码一致。
+        // 两轮同一份快照：第二轮用来验证收敛判据按字节比较。
+        let meta = ScriptedMeta::new(vec![
+            full("d1", vec![node("root-7574663863616665e9", 3, "node-a")]),
+            full("d2", vec![node("root-7574663863616665e9", 3, "node-a")]),
+        ]);
+        let mut digest = None;
+        let mut roots = Vec::new();
+        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+
+        let on_disk = scan_public(dir.path()).unwrap();
+        let exact = OsString::from_vec(b"utf8cafe\xe9".to_vec());
+        assert!(
+            on_disk.contains_key(&exact),
+            "原始字节的名字必须出现在 /public: {:?}",
+            on_disk.keys()
+        );
+        assert!(
+            !on_disk.contains_key(&OsString::from("utf8cafe\u{fffd}")),
+            "不得发布替换字符版本的名字"
+        );
+
+        // 第二轮必须判为已收敛：字节比较而不是 lossy 比较。
+        let applied = converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+        assert_eq!(applied, 0, "converged state must be a no-op");
+    }
+
+    /// ghost（真实目录占位）先隔离再发布，且原内容不丢。
+    #[test]
+    fn foreign_directory_is_quarantined_not_destroyed() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path()).unwrap();
+        let ghost = dir.path().join("a");
+        std::fs::create_dir(&ghost).unwrap();
+        std::fs::write(ghost.join("evidence"), b"x").unwrap();
+
+        let meta = ScriptedMeta::new(vec![full("d1", vec![node("root-61", 7, "node-a")])]);
+        let mut digest = None;
+        let mut roots = Vec::new();
+        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+
+        // 名字现在是 symlink，原目录被移入隔离区而不是被删掉。
+        assert_eq!(
+            std::fs::read_link(dir.path().join("a")).unwrap(),
+            Path::new("/imports/node-a/users/root-61-e7")
+        );
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path().join(QUARANTINE_DIR))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert!(quarantined[0].path().is_dir());
+    }
+
+    /// Meta 失败时保持现状：已发布的名字不能被撤掉（H7）。
+    #[test]
+    fn meta_failure_preserves_published_names() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path()).unwrap();
+        let meta = ScriptedMeta::new(vec![full("d1", vec![node("root-61", 7, "node-a")])]);
+        let mut digest = None;
+        let mut roots = Vec::new();
+        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+
+        // 第二次调用时脚本已耗尽 → 返回错误。
+        let result = converge(&config(dir.path()), &meta, &mut digest, &mut roots);
+        assert!(result.is_err());
+        assert!(
+            dir.path().join("a").symlink_metadata().is_ok(),
+            "a failed round must not retract names"
+        );
+    }
+
+    /// 保留目录不参与 diff，也不会被当成 ghost 移走。
+    #[test]
+    fn reserved_directories_survive_a_round() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path()).unwrap();
+        let meta = ScriptedMeta::new(vec![full("d1", Vec::new())]);
+        converge(&config(dir.path()), &meta, &mut None, &mut Vec::new()).unwrap();
+
+        assert!(dir.path().join(STAGING_DIR).is_dir());
+        assert!(dir.path().join(QUARANTINE_DIR).is_dir());
+    }
+
+    /// 启动残留的 staging 链接被清掉，避免后续 symlinkat 撞 EEXIST。
+    #[test]
+    fn prepare_clears_staging_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(STAGING_DIR)).unwrap();
+        std::os::unix::fs::symlink("/stale", dir.path().join(STAGING_DIR).join("stage-1")).unwrap();
+
+        prepare(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir.path().join(STAGING_DIR))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn public_root_must_be_tmpfs() {
+        let root = Path::new("/mnt/adx/public");
+        let tmpfs = b"36 1 0:32 / /mnt/adx/public rw,nosuid,nodev - tmpfs tmpfs rw\n";
+        assert!(ensure_public_root_is_tmpfs(root, tmpfs).is_ok());
+
+        let ext4 = b"36 1 0:32 / /mnt/adx/public rw,relatime - ext4 /dev/sda1 rw\n";
+        let error = ensure_public_root_is_tmpfs(root, ext4).unwrap_err();
+        assert!(format!("{error:?}").contains("tmpfs"), "{error:?}");
+
+        let missing = b"36 1 0:32 / /mnt/other rw - tmpfs tmpfs rw\n";
+        let error = ensure_public_root_is_tmpfs(root, missing).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("not a mount point"),
+            "{error:?}"
+        );
+    }
+
+    /// 挂载点路径中的空格按 mountinfo 的八进制转义编码后应能匹配。
+    #[test]
+    fn public_root_with_spaces_is_matched_via_mountinfo_escaping() {
+        let root = Path::new("/mnt/ad x/public");
+        let mountinfo = b"36 1 0:32 / /mnt/ad\\040x/public rw - tmpfs tmpfs rw\n";
+        assert!(ensure_public_root_is_tmpfs(root, mountinfo).is_ok());
+    }
+
+    /// 诊断只报告，不改变名字面：即便 import 挂载缺失，已发布的名字仍保留。
+    #[test]
+    fn diagnosis_does_not_disturb_published_names() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path()).unwrap();
+        let meta = ScriptedMeta::new(vec![full("d1", vec![node("root-61", 7, "node-a")])]);
+        let mut digest = None;
+        let mut roots = Vec::new();
+        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+
+        // import 根下什么都没有 → 应当报告，但名字面不受影响。
+        let findings = diagnose(&config(dir.path()), b"");
+        assert!(
+            dir.path().join("a").symlink_metadata().is_ok(),
+            "diagnosis must never retract names"
+        );
+        // 该临时目录不是 tmpfs 挂载点，因此 public 也应有 finding。
+        assert!(!findings.is_empty());
+    }
+
+    /// 诊断从目录枚举 home，而不是从 mountinfo：挂载消失的 home 仍要报告。
+    #[test]
+    fn homes_are_enumerated_from_the_directory_not_from_mountinfo() {
+        let dir = tempfile::tempdir().unwrap();
+        let imports = dir.path().join("imports");
+        std::fs::create_dir_all(imports.join("node-a")).unwrap();
+        std::fs::create_dir_all(imports.join("node-b")).unwrap();
+        let config = MirrorConfig {
+            public_root: dir.path().join("public"),
+            import_root: imports.to_string_lossy().into_owned(),
+            interval: Duration::from_millis(10),
+        };
+        assert_eq!(homes_under(&config.import_root), vec!["node-a", "node-b"]);
+
+        // 没有任何 mountinfo 条目覆盖它们 → 每个 home 都报 path_missing。
+        let findings = diagnose(&config, b"");
+        let missing = findings
+            .iter()
+            .filter(|finding| finding.kind() == "path_missing")
+            .count();
+        assert!(
+            missing >= 2,
+            "both homes should be reported, got {findings:?}"
+        );
+    }
+
+    /// 挂载齐全时不应产生 import 相关 finding。
+    #[test]
+    fn healthy_topology_reports_nothing_for_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let imports = dir.path().join("imports");
+        std::fs::create_dir_all(imports.join("node-a")).unwrap();
+        let public = dir.path().join("public");
+        std::fs::create_dir_all(&public).unwrap();
+        let config = MirrorConfig {
+            public_root: public.clone(),
+            import_root: imports.to_string_lossy().into_owned(),
+            interval: Duration::from_millis(10),
+        };
+
+        let mountinfo = format!(
+            "1 0 0:1 / {} rw - tmpfs tmpfs rw\n2 0 0:2 / {}/node-a/users rw - nfs4 home-a:/x rw\n",
+            public.display(),
+            imports.display()
+        );
+        let findings = diagnose(&config, mountinfo.as_bytes());
+        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+    }
+    /// 名字 -> root id 的测试编码（生产代码用同一规则）。
+    fn root_id(name: &str) -> String {
+        let hex: String = name
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("root-{hex}")
+    }
+
+    /// 多个 home 需要建挂时必须并行：串行时 N 个坏 home 的代价是 N×超时，
+    /// 而整轮发布被推迟同样长的时间。
+    ///
+    /// 断言两件事：耗时约等于单次延迟而不是 N 倍；峰值并发 > 1。
+    #[test]
+    fn imports_are_mounted_in_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let delay = Duration::from_millis(150);
+        let mounter = Arc::new(FakeMounter::with_delay(delay));
+        let mut executor = executor(dir.path(), Arc::clone(&mounter));
+
+        // 三个不同 home，各一个 root。名字必须可解码，否则不会产生动作。
+        let roots: Vec<_> = ["node-x", "node-y", "node-z"]
+            .iter()
+            .map(|home| node(&root_id("ws"), 1, home))
+            .collect();
+
+        let started = std::time::Instant::now();
+        executor.ensure_imports(&roots).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(mounter.mount_count(), 3, "all three homes must be mounted");
+        assert!(
+            mounter.peak_in_flight() > 1,
+            "mounts must overlap, peak was {}",
+            mounter.peak_in_flight()
+        );
+        // 三个 mount 并行时约等于单次延迟；串行会是 3 倍。
+        // 留 1.8 倍余量吸收线程创建开销，仍足以把"退化回串行"挡在门外。
+        assert!(
+            elapsed < delay * 18 / 10,
+            "three mounts took {elapsed:?}; parallel should be near {delay:?}, serial {:?}",
+            delay * 3
+        );
+    }
+
+    /// 并行不改变"失败的 home 各自独立计数"这一语义。
+    #[test]
+    fn parallel_failures_are_recorded_per_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeMounter::default();
+        // node-x 的地址（node() 里拼成 "<home>.test"）始终失败。
+        fake.fail_for
+            .lock()
+            .unwrap()
+            .insert("node-x.test".to_owned(), u32::MAX);
+        let mounter = Arc::new(fake);
+        let mut executor = executor(dir.path(), Arc::clone(&mounter));
+
+        let roots: Vec<_> = ["node-x", "node-y"]
+            .iter()
+            .map(|home| node(&root_id("ws"), 1, home))
+            .collect();
+
+        let applied = executor.ensure_imports(&roots).unwrap();
+        assert_eq!(applied, 1, "only the healthy home counts as applied");
+
+        let ready = executor.ready_homes();
+        assert!(ready.contains("node-y"));
+        assert!(!ready.contains("node-x"), "the failing home is not ready");
+    }
+
+    /// 所有 home 都必须拿到状态条目，不能因为并行丢结果。
+    #[test]
+    fn every_home_gets_a_state_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let mut executor = executor(dir.path(), Arc::clone(&mounter));
+
+        let roots: Vec<_> = ["node-x", "node-y", "node-z"]
+            .iter()
+            .map(|home| node(&root_id("ws"), 1, home))
+            .collect();
+
+        executor.ensure_imports(&roots).unwrap();
+        let ready = executor.ready_homes();
+        assert_eq!(ready.len(), 3, "all homes ready: {ready:?}");
+    }
+}

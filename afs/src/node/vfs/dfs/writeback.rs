@@ -38,11 +38,14 @@ impl DistributedFs {
         let mut examined = 0;
         let mut renewed_count = 0;
         let mut first_error = None;
-        for (_, cell) in entries {
+        for (inode_id, cell) in entries {
             if Instant::now() >= deadline {
                 break;
             }
             examined += 1;
+            let Ok(_lease_admission) = self.lease_admission(&inode_id) else {
+                continue;
+            };
             let lease = {
                 let Ok(state) = cell.try_lock() else {
                     continue;
@@ -206,6 +209,14 @@ impl DistributedFs {
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
         Self::record_background_error_locked(&mut state, error);
+        if let Some(metrics) = self
+            .write_resources
+            .pipeline
+            .as_ref()
+            .and_then(|p| p.metrics.as_ref())
+        {
+            metrics.native_writeback_error();
+        }
         Ok(())
     }
 
@@ -214,11 +225,22 @@ impl DistributedFs {
             .background_error
             .as_ref()
             .map_or(1, |previous| previous.cursor.saturating_add(1));
-        afs_logging::warn!("dfs.background_error_recorded";
-            "inode_id" => state.inode.inode_id.0.as_str(),
-            "cursor" => cursor,
-            "error" => error.to_string()
-        );
+        let message = error.to_string();
+        let repeated = state.writeback_failures > 0
+            && state.background_error.as_ref().is_some_and(|previous| {
+                previous.error.code() == error.code() && previous.error.to_string() == message
+            });
+        if !repeated {
+            afs_logging::warn!("dfs.background_error_recorded";
+                "inode_id" => state.inode.inode_id.0.as_str(),
+                "cursor" => cursor,
+                "error" => message
+            );
+        }
+        let delay = Duration::from_millis(100 << state.writeback_failures.min(6))
+            .min(Duration::from_secs(5));
+        state.writeback_retry_at = Some(Instant::now() + delay);
+        state.writeback_failures = state.writeback_failures.saturating_add(1);
         state.background_error = Some(ObservedWriteError {
             cursor,
             error,

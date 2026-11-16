@@ -74,9 +74,9 @@ use afs_protocol::node_data::{
     OwnerListXattrRequest, OwnerLookupRequest, OwnerMkdirRequest, OwnerMknodRequest,
     OwnerOpenRequest, OwnerOpendirRequest, OwnerReadRequest, OwnerReaddirRequest,
     OwnerReadlinkRequest, OwnerReleaseDirRequest, OwnerReleaseRequest, OwnerRemoveXattrRequest,
-    OwnerRenameRequest, OwnerRmdirRequest, OwnerSetAttr, OwnerSetAttrRequest, OwnerSetXattrRequest,
-    OwnerStatFsRequest, OwnerSymlinkRequest, OwnerUnlinkRequest, OwnerWriteRequest, RootAccess,
-    owner_files_client::OwnerFilesClient,
+    OwnerRenameRequest, OwnerRmdirRequest, OwnerRmdirRootRequest, OwnerSetAttr,
+    OwnerSetAttrRequest, OwnerSetXattrRequest, OwnerStatFsRequest, OwnerSymlinkRequest,
+    OwnerUnlinkRequest, OwnerWriteRequest, RootAccess, owner_files_client::OwnerFilesClient,
 };
 use afs_protocol::node_data::{
     DataReadRequest, DataTransfer, DataWriteRequest, node_data_client::NodeDataClient,
@@ -1280,6 +1280,24 @@ impl RemoteFiles for OwnerPeerClient {
                 path: path.as_bytes().to_vec(),
                 expected_file_identity: expected_identity.map(file_identity),
                 expected_parent: Some(file_identity(expected_parent)),
+                caller: Some(owner_caller(ctx)),
+            }
+        );
+        Ok(())
+    }
+
+    fn rmdir_root(
+        &self,
+        ctx: &RequestContext,
+        grant: &RootGrant,
+        expected_root: &FileIdentity,
+    ) -> afs_error::Result<()> {
+        let _reply = owner_rpc!(
+            self,
+            rmdir_root,
+            OwnerRmdirRootRequest {
+                access: Some(root_access(grant)),
+                expected_root: Some(file_identity(expected_root)),
                 caller: Some(owner_caller(ctx)),
             }
         );

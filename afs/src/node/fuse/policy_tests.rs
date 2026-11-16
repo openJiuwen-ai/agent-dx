@@ -79,7 +79,7 @@ fn ownerfs_shared_root_is_uncached_and_direct() {
     assert_eq!(create_reply(&fs, REMOTE), (Duration::ZERO, DIRECT_IO));
     // The DFS kernel-cache feature, not the policy, bounds DFS creates.
     let mut dfs = AfsFuse::new(Arc::new(EmptyBackend));
-    dfs.policy = Arc::new(DfsFusePolicy);
+    dfs.policy = Arc::new(DfsFusePolicy::new(Duration::ZERO));
     dfs.cached_io = true;
     assert_eq!(
         create_reply(&dfs, PRIVATE_ROOT),
@@ -101,6 +101,279 @@ fn ownerfs_inline_local_only_for_read_only_local_opens_and_remembers_inodes() {
     assert_eq!(*policy.remembered.lock().unwrap(), vec![42]);
 
     let mut dfs = AfsFuse::new(Arc::new(EmptyBackend));
-    dfs.policy = Arc::new(DfsFusePolicy);
+    dfs.policy = Arc::new(DfsFusePolicy::new(Duration::from_secs(1)));
     assert!(!dfs.inline_local_open(local, libc::O_RDONLY));
+}
+
+/// A: the DFS policy hands its configured kernel TTL to lookup/getattr,
+/// to the entry replies the policy does not see per inode (mkdir, mknod,
+/// symlink, link, setattr) and, with the kernel cache feature, to create.
+#[test]
+fn dfs_policy_ttl_bounds_entry_attr_and_create_replies() {
+    let ttl = Duration::from_millis(1000);
+    let mut dfs = AfsFuse::new(Arc::new(EmptyBackend));
+    dfs.policy = Arc::new(DfsFusePolicy::new(ttl));
+    let mut seen = None;
+    dfs.with_cache_policy(BackendInode { value: 7 }, |ttl, private| {
+        seen = Some((ttl, private));
+    });
+    assert_eq!(seen, Some((ttl, false)));
+    assert_eq!(dfs.entry_ttls(), (ttl, ttl));
+    dfs.cached_io = true;
+    // CREATE makes a regular file whose attributes are never cached, and
+    // ReplyCreate carries a single TTL.
+    assert_eq!(create_reply(&dfs, 7), (Duration::ZERO, FopenFlags::empty()));
+}
+
+fn attributes_of(kind: FileKind) -> FileAttributes {
+    FileAttributes {
+        kind,
+        size: 0,
+        blocks: 0,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        nlink: 1,
+        atime: std::time::UNIX_EPOCH,
+        mtime: std::time::UNIX_EPOCH,
+        ctime: std::time::UNIX_EPOCH,
+    }
+}
+
+const ALL_KINDS: [FileKind; 4] = [
+    FileKind::Regular,
+    FileKind::Directory,
+    FileKind::Symlink,
+    FileKind::Special(SpecialFileKind::Fifo),
+];
+
+/// A (F4): DFS caches names for every kind and attributes only for
+/// directories; LOOKUP, MKDIR, MKNOD, SYMLINK, LINK, SETATTR and GETATTR all
+/// take their TTLs from these two rules.
+#[test]
+fn dfs_caches_names_for_all_kinds_and_attributes_only_for_directories() {
+    let ttl = Duration::from_secs(1);
+    let mut dfs = AfsFuse::new(Arc::new(EmptyBackend));
+    dfs.policy = Arc::new(DfsFusePolicy::new(ttl));
+    for kind in ALL_KINDS {
+        let expected_attr = if kind == FileKind::Directory {
+            ttl
+        } else {
+            Duration::ZERO
+        };
+        assert_eq!(
+            dfs.reply_ttls(&attributes_of(kind)),
+            (ttl, expected_attr),
+            "{kind:?}"
+        );
+        assert_eq!(
+            dfs.policy.attr_ttl(kind == FileKind::Directory, ttl),
+            expected_attr,
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn non_dfs_policies_cache_attributes_like_names() {
+    let (fs, _) = home_fs();
+    let ttl = Duration::from_secs(1);
+    for kind in ALL_KINDS {
+        assert_eq!(fs.policy.attr_ttl(kind == FileKind::Directory, ttl), ttl);
+        assert_eq!(
+            fs.reply_ttls(&attributes_of(kind)),
+            (Duration::ZERO, Duration::ZERO)
+        );
+    }
+}
+
+#[test]
+fn dfs_policy_ttl_zero_restores_uncached_replies() {
+    let mut dfs = AfsFuse::new(Arc::new(EmptyBackend));
+    dfs.policy = Arc::new(DfsFusePolicy::new(Duration::ZERO));
+    dfs.cached_io = true;
+    assert_eq!(dfs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
+    assert_eq!(create_reply(&dfs, 7), (Duration::ZERO, FopenFlags::empty()));
+}
+
+#[test]
+fn non_dfs_policies_keep_uncached_entry_replies() {
+    let (fs, _) = home_fs();
+    assert_eq!(fs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
+    let fs = AfsFuse::new(Arc::new(EmptyBackend));
+    assert_eq!(fs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
+}
+
+use crate::node::vfs::types::{CreatedFile, Entry};
+
+/// A create backend that, like Meta, admits only callers holding group 2000.
+#[derive(Default)]
+struct GroupGatedCreate {
+    seen: Mutex<Vec<Vec<u32>>>,
+}
+impl Backend for GroupGatedCreate {
+    fn root_inode(&self) -> BackendInode {
+        BackendInode { value: 1 }
+    }
+    fn create_with_options(
+        &self,
+        ctx: &RequestContext,
+        parent: BackendInode,
+        _: &OsStr,
+        _: u32,
+        _: i32,
+        _: OpenOptions,
+    ) -> afs_error::Result<CreatedFile> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(ctx.supplementary_gids.clone());
+        if ctx.gid != 2000 && !ctx.supplementary_gids.contains(&2000) {
+            return Err(Error::coded(afs_error::IO_PERMISSION_DENIED, "denied"));
+        }
+        Ok(CreatedFile {
+            entry: Entry {
+                inode: parent,
+                attributes: FileAttributes {
+                    kind: FileKind::Regular,
+                    size: 0,
+                    blocks: 0,
+                    mode: 0o640,
+                    uid: ctx.uid,
+                    gid: ctx.gid,
+                    nlink: 1,
+                    atime: UNIX_EPOCH,
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                },
+            },
+            handle: FileHandle(7),
+        })
+    }
+}
+
+fn create_context(gid: u32) -> RequestContext {
+    RequestContext {
+        uid: 1000,
+        gid,
+        pid: 1,
+        umask: 0,
+        supplementary_gids: Vec::new(),
+    }
+}
+
+fn create_through(
+    backend: &GroupGatedCreate,
+    gid: u32,
+    groups: &[u32],
+    lookups: &std::sync::atomic::AtomicUsize,
+) -> afs_error::Result<CreatedFile> {
+    create_through_policy(
+        &DfsFusePolicy::new(Duration::ZERO),
+        backend,
+        gid,
+        groups,
+        lookups,
+    )
+}
+
+fn create_through_policy(
+    policy: &dyn FuseMountPolicy,
+    backend: &GroupGatedCreate,
+    gid: u32,
+    groups: &[u32],
+    lookups: &std::sync::atomic::AtomicUsize,
+) -> afs_error::Result<CreatedFile> {
+    create_resolving_groups(
+        policy,
+        backend,
+        create_context(gid),
+        |_| {
+            lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            groups.to_vec()
+        },
+        BackendInode { value: 1 },
+        OsStr::new("f"),
+        0o640,
+        libc::O_WRONLY,
+        OpenOptions {
+            kill_suidgid: false,
+        },
+    )
+}
+
+/// FUSE headers carry no supplementary groups and resolving them reads
+/// /proc. A create pays for that only when the backend refuses the caller's
+/// uid and primary gid: then it is sent once more with the groups, so a file
+/// in a directory writable through a supplementary group can still be created.
+#[test]
+fn create_resolves_supplementary_groups_only_after_a_denial() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let lookups = AtomicUsize::new(0);
+
+    let backend = GroupGatedCreate::default();
+    create_through(&backend, 2000, &[3000], &lookups).unwrap();
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        0,
+        "no /proc read on success"
+    );
+    assert_eq!(*backend.seen.lock().unwrap(), vec![Vec::<u32>::new()]);
+
+    let backend = GroupGatedCreate::default();
+    create_through(&backend, 1000, &[2000, 3000], &lookups).unwrap();
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *backend.seen.lock().unwrap(),
+        vec![Vec::new(), vec![2000, 3000]]
+    );
+
+    for groups in [vec![3000], Vec::new()] {
+        let backend = GroupGatedCreate::default();
+        let error = match create_through(&backend, 1000, &groups, &lookups) {
+            Ok(_) => panic!("a caller outside the group stays denied"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED);
+        assert_eq!(
+            backend.seen.lock().unwrap().len(),
+            if groups.is_empty() { 1 } else { 2 },
+            "retry exactly once only when supplementary groups are available"
+        );
+    }
+}
+
+/// OwnerFs and default mounts keep the first backend result, even when
+/// supplementary groups could turn a permission denial into a successful create.
+#[test]
+fn non_dfs_create_does_not_resolve_groups_or_retry() {
+    use super::policy::DefaultFusePolicy;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let home = HomeLikePolicy::default();
+    let default = DefaultFusePolicy;
+    for policy in [&home as &dyn FuseMountPolicy, &default] {
+        let lookups = AtomicUsize::new(0);
+        let backend = GroupGatedCreate::default();
+        create_through_policy(policy, &backend, 2000, &[3000], &lookups).unwrap();
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(*backend.seen.lock().unwrap(), vec![Vec::<u32>::new()]);
+
+        let backend = GroupGatedCreate::default();
+        let error = match create_through_policy(policy, &backend, 1000, &[2000], &lookups) {
+            Ok(_) => panic!("a non-DFS mount must keep the first permission denial"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED);
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            0,
+            "no supplementary group lookup"
+        );
+        assert_eq!(
+            *backend.seen.lock().unwrap(),
+            vec![Vec::<u32>::new()],
+            "one backend call"
+        );
+    }
 }

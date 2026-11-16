@@ -37,7 +37,7 @@ use std::fmt::Display;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FormatKind {
     /// M1: postcard `Envelope` of one Meta WAL frame (first field `version`).
-    /// The record hash domain `afs.meta.record.v2` belongs to this version.
+    /// The record hash domain `afs.meta.record.v3` belongs to this version.
     MetaWalEnvelope,
     /// M4: `AFSW` Meta WAL segment header (static area, tail slots, frames).
     MetaWalSegment,
@@ -122,17 +122,22 @@ pub const ALL: &[FormatKind] = &[
 /// in use before the registry existed, except `NODE_META_PROTOCOL`, which moved
 /// to 2 when `NodeControl` was split by backend.
 pub mod version {
-    pub const META_WAL_ENVELOPE: u16 = 2;
+    pub const META_WAL_ENVELOPE: u16 = 3;
     pub const META_WAL_SEGMENT: u16 = 1;
     pub const META_IDENTITY: u16 = 1;
     pub const META_CURRENT: u16 = 3;
     pub const META_CHECKPOINT_FILE: u16 = 1;
-    pub const META_STATE_IMAGE: u16 = 3;
-    pub const META_RECORD_DECISION: u16 = 2;
-    pub const META_REQUEST_DIGEST: u32 = 1;
+    pub const META_STATE_IMAGE: u16 = 4;
+    pub const META_RECORD_DECISION: u16 = 3;
+    /// 2: `SetInodeAttrRequest` is digested (optional client revision) and
+    /// `CreateFileRequest` names the first write generation (round 2 B1/B4).
+    pub const META_REQUEST_DIGEST: u32 = 2;
     pub const NODE_CHUNK_CATALOG_WAL: u32 = 2;
     pub const NODE_CHUNK_CATALOG_SNAPSHOT: u32 = 2;
     pub const NODE_CRC_SEGMENT_TABLE: u32 = 1;
+    /// Also the encoding of the optional S3 sidecar object `<chunk key>.bao`
+    /// (`dfs::external_outboard_key`); the object key layout itself is
+    /// `NODE_EXTERNAL_OBJECT_KEY`.
     pub const NODE_CHUNK_SIDECAR: u16 = 1;
     pub const NODE_PEER_CACHE_ENTRY: u32 = 2;
     pub const NODE_PEER_CACHE_MARKER: u32 = 1;
@@ -335,9 +340,13 @@ mod tests {
                 version::NODE_CHUNK_SIDECAR,
                 version::OWNERFS_ROOT_RECORD,
             ),
-            // State image 3 and decision 2: GC references name their pinned
-            // version, and R12's replica failure entity and keys (S4b).
-            (2, 3, 2, 2, 1, 1, 1)
+            // State image 4 and decision 3: the node session carries a
+            // dedicated NFS address field (outlet import addressing); GC
+            // references name their pinned version, and R12's replica failure
+            // entity and keys (S4b).
+            // Chunk catalog snapshot 2: the append layout is persisted
+            // incrementally, so the snapshot shape changed as well.
+            (3, 4, 3, 2, 1, 1, 1)
         );
     }
 
@@ -388,8 +397,8 @@ mod tests {
         )
         .unwrap();
         check_tagged_header(FormatKind::MetaCurrent, META_CURRENT_MAGIC, "c", b"AFS").unwrap();
-        check_postcard_u16(FormatKind::MetaWalEnvelope, "f", &[2, 0xff]).unwrap();
-        assert!(check_postcard_u16(FormatKind::MetaWalEnvelope, "f", &[3]).is_err());
+        check_postcard_u16(FormatKind::MetaWalEnvelope, "f", &[3, 0xff]).unwrap();
+        assert!(check_postcard_u16(FormatKind::MetaWalEnvelope, "f", &[4]).is_err());
         check_postcard_u16(FormatKind::MetaWalEnvelope, "f", &[0x80]).unwrap();
     }
 }

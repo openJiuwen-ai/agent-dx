@@ -3,7 +3,7 @@ use crate::rpc::CoordinatorRpc;
 use adx_core::{Error, Result as DomainResult};
 use adx_protocol::control::{self as pb, coordinator_service_server::CoordinatorService};
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -218,6 +218,7 @@ fn response(result: Result<Value, Status>) -> Response<Full<Bytes>> {
                 Code::FailedPrecondition | Code::Aborted | Code::AlreadyExists => {
                     StatusCode::CONFLICT
                 }
+                Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
                 Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
                 Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -251,14 +252,85 @@ pub async fn serve(listener: TcpListener, coordinator: CoordinatorRpc) -> std::i
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let coordinator = coordinator.clone();
                 async move {
-                    Ok::<_, Infallible>(response(
-                        dispatch(&coordinator, request.method(), request.uri()).await,
-                    ))
+                    let result = if request.uri().path().starts_with("/v1/node-upgrades/") {
+                        let (parts, body) = request.into_parts();
+                        match Limited::new(body, 65_536).collect().await {
+                            Ok(body) => match serde_json::from_slice::<Value>(&body.to_bytes())
+                                .or_else(|error| {
+                                    if parts.method == Method::GET {
+                                        Ok(Value::Null)
+                                    } else {
+                                        Err(error)
+                                    }
+                                }) {
+                                Ok(value) => match tokio::spawn(async move {
+                                    coordinator
+                                        .upgrade_http(&parts.method, parts.uri.path(), value)
+                                        .await
+                                        .map_err(adx_protocol::status)
+                                })
+                                .await
+                                {
+                                    Ok(result) => result,
+                                    Err(_) => Err(Status::internal(
+                                        "upgrade operation interrupted; query task",
+                                    )),
+                                },
+                                Err(_) => {
+                                    Err(Status::invalid_argument("JSON upgrade request required"))
+                                }
+                            },
+                            Err(_) => Err(Status::invalid_argument(
+                                "upgrade body exceeds limit or cannot be read",
+                            )),
+                        }
+                    } else {
+                        dispatch(&coordinator, request.method(), request.uri()).await
+                    };
+                    Ok::<_, Infallible>(response(result))
                 }
             });
             let connection = hyper::server::conn::http1::Builder::new()
                 .serve_connection(hyper_util::rt::TokioIo::new(stream), service);
-            let _ = tokio::time::timeout(Duration::from_secs(30), connection).await;
+            let _ = tokio::time::timeout(Duration::from_secs(900), connection).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn management_errors_preserve_status_payload_and_headers() {
+        for (error, status, code) in [
+            (
+                adx_protocol::status(Error::NoCapacity),
+                StatusCode::TOO_MANY_REQUESTS,
+                "ResourceExhausted",
+            ),
+            (
+                Status::unavailable("node RPC unavailable"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Unavailable",
+            ),
+            (
+                Status::internal("unexpected failure"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+            ),
+        ] {
+            let message = error.message().to_owned();
+            let result = response(Err(error));
+            assert_eq!(result.status(), status);
+            assert_eq!(
+                result.headers()[hyper::header::CONTENT_TYPE],
+                "application/json"
+            );
+            assert_eq!(result.headers()[hyper::header::CACHE_CONTROL], "no-store");
+            let bytes = result.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, json!({"error": {"code": code, "message": message}}));
+        }
     }
 }

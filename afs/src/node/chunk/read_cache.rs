@@ -11,11 +11,14 @@ pub(crate) struct ReadCacheIntent {
     pub(crate) copy: crate::dfs::CopyRecord,
 }
 
+// Read caching is a DFS read-engine feature; this file's own tests also use it.
+#[cfg(any(feature = "dfs", test))]
 pub(crate) struct ReadCacheWrite {
     pub(crate) receipt: Option<ReplicaAck>,
     pub(crate) retired: Vec<crate::dfs::CopyRecord>,
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl LocalChunkStore {
     pub(crate) fn persist_read_cache(
         &self,
@@ -104,6 +107,7 @@ impl LocalChunkStore {
                 // a surviving catalog entry falsely claiming a removed file is present.
                 if let Err(error) = append_catalog_txn_observed(
                     &self.catalog_path,
+                    &self.catalog_name_durable,
                     &txn,
                     self.read_work.as_ref(),
                     |_| Ok(()),
@@ -185,6 +189,7 @@ impl LocalChunkStore {
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
 impl LocalChunkStore {
     /// Persist before sending any publication. Removing the physical record
     /// leaves this intent in the same WAL until exact retirement is acknowledged.
@@ -362,11 +367,13 @@ impl LocalChunkStore {
             checksum: String::new(),
         };
         txn.checksum = txn.expected_checksum()?;
-        if let Err(error) =
-            append_catalog_txn_observed(&self.catalog_path, &txn, self.read_work.as_ref(), |_| {
-                Ok(())
-            })
-        {
+        if let Err(error) = append_catalog_txn_observed(
+            &self.catalog_path,
+            &self.catalog_name_durable,
+            &txn,
+            self.read_work.as_ref(),
+            |_| Ok(()),
+        ) {
             return Err(self.catalog_committer.fail(error).as_ref().clone());
         }
         for record in txn.records {
@@ -378,6 +385,7 @@ impl LocalChunkStore {
     }
 }
 
+#[cfg(feature = "dfs")]
 impl LocalChunkStore {
     pub(crate) fn has_durable_record(&self, id: &ChunkId) -> Result<bool> {
         Ok(self

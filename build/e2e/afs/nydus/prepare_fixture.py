@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """Runs in mgmt. Publish a deterministic OCI fixture, convert and republish it."""
 
-import gzip, hashlib, io, json, pathlib, subprocess, tarfile
+import gzip
+import hashlib
+import io
+import json
+import logging
+import pathlib
+import subprocess
+import sys
+import tarfile
 import urllib.request as u
 
 ROOT = pathlib.Path("/workspace/fixture")
@@ -96,13 +104,15 @@ target = json.loads(target_bytes)
 (OUT / "manifest-digest.txt").write_text(digest(target_bytes))
 (OUT / "manifest.raw").write_bytes(target_bytes)
 (OUT / "target-manifest.json").write_text(json.dumps(target, indent=2))
-print(json.dumps(target, indent=2))
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+logging.info("%s", json.dumps(target, indent=2))
 
 # Bootstrap is image metadata consumed by nydusd; no range checksum inventory.
 for layer in target["layers"]:
     if layer.get("annotations", {}).get("containerd.io/snapshot/nydus-bootstrap") == "true":
-        data = req("/v2/lab/nydus/blobs/" + layer["digest"]).read()
-        assert digest(data) == layer["digest"]
+        data = req(f"/v2/lab/nydus/blobs/{layer['digest']}").read()
+        if digest(data) != layer["digest"]:
+            raise ValueError("Registry bootstrap digest does not match the manifest")
         with tarfile.open(fileobj=io.BytesIO(data)) as archive:
             member = next(m for m in archive.getmembers() if m.isfile() and m.name.endswith("/image.boot"))
             (OUT / "bootstrap").write_bytes(archive.extractfile(member).read())

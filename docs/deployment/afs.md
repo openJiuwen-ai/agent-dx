@@ -345,9 +345,10 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_catalog_commit_queue` | 调优 | Node | `256` | catalog 提交排队与执行中的请求数，1..=256 |
 | `dfs_write_queue_bytes` | 调优 | Node | `2147483648` | FUSE 前端写队列跨文件持有的载荷，8 MiB..=1 TiB |
 | `dfs_dirty_budget_bytes` | 调优 | Node | `67108864` | 写流水线活跃正文容量，4..=64 MiB |
+| `dfs_write_timeout_ms` | 调优 | Node | `30000` | DFS 写入准入和 fsync 发布前等待的上限，1..=600000 ms |
 | `dfs_gc_grace_ms` | 调优 | Meta | `1000` | 引用退役后继续保护数据的时长，0..=600000 |
 | `dfs_unpublished_descriptors` | 调优 | Node | `1024` | 已上传未发布的对象数，1..=1024 |
-| `dfs_upload_inflight_chunks` | 调优 | Node | `8` | 上传并发，1..=8；S3 模式下实际被压到 4 |
+| `dfs_upload_inflight_chunks` | 调优 | Node | `8` | 上传并发，1..=8；S3 模式下再取与 `dfs_external_backend.upload_concurrency`（默认 8）的较小值 |
 | `dfs_background_commit_ms` | 调优 | Node | `5000` | 后台提交调度周期，1..=60000；不是发布期限 |
 | `dfs_sidecar_install_queue` | 调优 | Node | `64` | 可选 sidecar 安装的排队与执行数，1..=64 |
 | `dfs_external_gc_list_pages_per_pass` | 调优 | Node | `1` | S3 回收每轮（5 秒）列举的桶页数（每页 1000 个对象），1..=100；只有 Meta 指定的一个 Node 列举 |
@@ -360,7 +361,8 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_scrub_bytes_per_second` | 调优 | Node | `33554432` | 后台巡检限速（字节/秒），0 关闭，否则 1MiB..=1GiB；见[后台巡检](#dfs-后台巡检) |
 | `dfs_scrub_start_delay_seconds` | 调优 | Node | `300` | Node 启动后首轮巡检的延迟，0..=86400 |
 | `dfs_scrub_round_interval_seconds` | 调优 | Node | `86400` | 两轮巡检开始时间的最短间隔，1..=2592000；一轮更长时下一轮紧接开始 |
-| `dfs_read_max_ops_per_batch` | 调优 | Node | `128` | 单批读操作数上限 |
+| `dfs_kernel_cache_ttl_ms` | 调优 | Node | `1000` | DFS 挂载的内核目录项与目录属性缓存时长（毫秒），0..=60000；0 表示不缓存（每次路径解析都问 Node）。普通文件、符号链接与特殊文件的属性始终不缓存。他节点的改名、删除、改目录权限在本机最多晚这么久可见（`open`／`opendir` 经名字校验不会打开到已被替换的旧文件，按路径 setattr 不校验，见[已知限制](../architecture/afs-support-boundary.md#已知限制)第 19 项）；负查找从不缓存 |
+| `dfs_read_max_ops_per_batch` | 调优 | Node | `128` | native 单批读操作数上限。S3 读仍受读取字节和 RPC 消息大小约束，缺失的版本授权通过一次请求取得 |
 | `dfs_read_max_inflight_bytes` | 调优 | Node | `8388608` | 读在途字节上限；也决定 Peer 缓存走流式填充还是整块填充 |
 | `dfs_source_cache_max_ms` | 调优 | Node | `5000` | 副本来源缓存时长，不超过 60000；0 表示不保留 |
 | `dfs_source_lookahead_chunks` | 调优 | Node | `64` | 来源元数据前瞻 chunk 数，不超过 128 |
@@ -416,7 +418,7 @@ OwnerFs workspace bind 的 3 个键目前没有启动 WARN。
 
 AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集群停机替换（OwnerFs 部署同样适用）：
 
-- **集群线协议**：Node 注册带 `protocol_version`（当前 7，`afs_protocol::CLUSTER_PROTOCOL_VERSION`），Meta 严格比较，不符（含旧 Node 缺省的 0）返回 `META_NODE_PROTOCOL_VERSION`，Node 直接启动失败；Node 之间的通道不握手，依赖经 Meta 准入的同版本部署。
+- **集群线协议**：Node 注册带 `protocol_version`（当前 8，`afs_protocol::CLUSTER_PROTOCOL_VERSION`），Meta 严格比较，不符（含旧 Node 缺省的 0）返回 `META_NODE_PROTOCOL_VERSION`，Node 直接启动失败；Node 之间的通道不握手，依赖经 Meta 准入的同版本部署。
 - **持久格式**：Meta 数据目录（`CURRENT`、WAL 信封、记录决策、状态 image 等）、Redis／etcd key 布局、Node catalog、外部对象 key 前缀，版本不符一律 `STORAGE_FORMAT_INCOMPATIBLE`，不迁移、不自动删除（[规则](../architecture/afs.md#持久格式与协议版本规则)）。
 
 步骤：
@@ -428,6 +430,27 @@ AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集�
 5. 用**同一版本**的二进制先启动 Meta，再启动全部 Node。
 
 回滚只能用旧二进制配旧的完整数据目录与旧桶，不得让旧二进制打开新目录。
+
+#### 协议 7→8（第 2 轮元数据协议）
+
+协议 8 只改线协议，本身不改 Meta 数据目录、WAL、checkpoint、Node catalog 的格式。能否保留数据目录取决于升级起点：
+- **起点已经是当前持久格式**（Meta WAL 信封 3、状态 image 4、记录决策 3）：第 3 步**保留**原数据目录与 chunk 目录，不新建；备份仍建议做。
+- **起点更早**（例如还没有 OwnerFs NFS 出口的版本，状态 image 3）：持久格式已变，第 3 步照上文新建，新 Meta 会以 `STORAGE_FORMAT_INCOMPATIBLE` 拒绝旧目录。
+
+两种情况的其余步骤都同上，**必须先停全部 Node，再停 Meta**。
+
+新 Meta 启动后，先处在 GC 的"读者重启闸门"里：不删任何 inode 与版本，只回收孤儿块。各 Node 注册后，在首个回收周期（≤5 s）或第一次打开文件时，向新 Meta 上报自己打开着的读者；全部上报后闸门打开。核对方法：
+- Meta 的 `afs_meta_dfs_gc_reader_gate_closed` 回到 0；
+- Node 的 `afs_dfs_reader_references_total{kind="soft"}` 开始增长；
+- 旧 Node 二进制若被误启动，会在注册时报 `META_NODE_PROTOCOL_VERSION` 并退出。
+
+**误操作：没停旧 Node 就换了 Meta。** 旧 Node 的心跳重注册会被拒（`META_NODE_PROTOCOL_VERSION`）。旧 Node 把这个错误当可重试处理，最多 25 s 后才失败关闭；协议 8 的 Node 收到它会立即停止。这 25 s 里，旧 Node 的其他请求仍可能打到新 Meta，最坏结果是请求被拒，不会按错误语义执行：
+- 读打开仍用持久的 `UpdateGcReference`，新 Meta 照常接纳；旧 Node 不会向新 Meta 上报读者，闸门会一直关到它的会话过期，GC 只会更保守。
+- Create 不带调用者身份，新 Meta 以 `InvalidArgument` 拒绝，应用看到建文件失败。
+- setattr 带客户端 revision，新 Meta 按比较并交换执行，和旧语义相同。如果某次 setattr 先由旧 Meta 执行、回复丢失，再向新 Meta 重发，新 Meta 找不到请求摘要，会以 `META_CATALOG_INVALID_REQUEST` 拒绝。这次 setattr 其实已经生效，应用却会看到报错。
+- 元数据同步：新 Meta 要求 inode revision 完全一致。旧 Node 在 revision 不符时直接报错，应用会在 fsync/close 时看到 `EBUSY`。
+
+所以误操作时，建文件会失败，另可能有少量 setattr、fsync、close 报错，不会写坏数据。
 
 ### 运维边界
 
@@ -453,7 +476,11 @@ endpoint = "https://s3.example.com"
 bucket = "afs-chunks"
 region = "us-east-1"
 allow_http = false
-unsigned_payload = false
+# Optional upload settings; the values shown are the defaults for an https endpoint.
+# unsigned_payload = true
+# payload_checksum = "crc64nvme"
+# upload_concurrency = 8
+# worker_threads = 4
 # Node-only; omit on Meta. Must be absolute, owned by the Node process UID,
 # regular file without symlink, and mode 0600 or stricter.
 credentials_file = "/opt/adx/config/afs/s3-credentials.json"
@@ -463,10 +490,23 @@ credentials_file = "/opt/adx/config/afs/s3-credentials.json"
 不在示例中提供真实凭据，不把秘密直接放 TOML 或命令行。未指定文件的 Node
 显式读取 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY` 和可选
 `AWS_SESSION_TOKEN`；缺失凭据启动失败。`--print-config` 只显示文件路径。
-默认 `unsigned_payload=false`，保留 S3 载荷签名。只有管理员确认后端和安全策略支持时才显式设置 `unsigned_payload=true`；该项仍保留 SigV4 请求
-认证，只省略 SDK 的载荷签名 SHA256，不替代 AFS 完整 BLAKE3／长度检查，也不
-改变成功 fsync 等待对象回执和 Meta 持久确认的要求。它不自动探测 SeaweedFS，
-不因 `allow_http=true` 自动启用；泛 S3 后端和既有配置保持原默认。
+上传的正文校验方式由 `unsigned_payload` 与 `payload_checksum` 决定，两项都可省略：
+
+| 端点 | `unsigned_payload` 默认 | `payload_checksum` 默认 | 含义 |
+| --- | --- | --- | --- |
+| `https://` | `true` | `"crc64nvme"` | 正文不参与 SigV4 签名（`UNSIGNED-PAYLOAD`），每个 PUT 带请求头 `x-amz-checksum-crc64nvme`，该头在签名范围内；对象存储校验不符即拒绝 |
+| `http://`（仅 `allow_http=true` 的隔离测试端点） | `false` | `"none"` | 正文 SHA-256 参与签名 |
+
+- 两种方式都保留 SigV4 请求认证，都不替代 AFS 读时的 BLAKE3／长度检查，也不改变成功 fsync 等待对象回执和 Meta 持久确认的要求。
+- 桶策略要求签名正文（条件键 `s3:x-amz-content-sha256`）时，显式设置 `unsigned_payload = false`。
+- CRC64NVME 请求头只在 MinIO 上实测过。对象存储不认这个头时，PUT 会被拒绝，写与 fsync 返回不可用错误（`IO_UNAVAILABLE`），Node 日志记 `external S3 operation failed`；这时设置 `payload_checksum = "none"`（正文在传输中的损坏改由 TLS 发现），或设置 `unsigned_payload = false` 回到签名正文。
+- 不签正文省的是 Node 侧的 CPU（实测 S3 工作线程 CPU 约减半）。对象存储侧校验 CRC64NVME 的 CPU 并不比校验 SHA-256 低（MinIO，arm64 实测）。
+- `upload_concurrency`（1–8，默认 8）是并发 PUT 数；`worker_threads`（1–8，默认取 `upload_concurrency` 与 4 的较小值）是 S3 请求线程数，签名与校验和在这些线程上计算。上传占用的正文内存计入 `dfs_dirty_budget_bytes`，不另设上限。
+
+长度不小于 256 KiB 的数据块在对象旁多存一个 BLAKE3 outboard 旁对象（键为数据对象键加 `.bao`，4 MiB 数据块约 8 KiB）。读取时只按范围取回读到的 32 KiB 分组，并用旁对象验证到数据块的内容根；没有旁对象或旁对象无效的数据块整对象读取并整块校验，结果相同。旁对象随数据对象一起回收。对按请求计费的对象存储：
+
+- PUT 次数最多为原来的 2 倍，对象数最多为 2 倍（只对不小于 256 KiB 的数据块）。
+- 未配置 `cache` 时，顺序读的 GET 次数约为原来的 1.25 倍，传输字节约为四分之一：原来每次内核读（约 1 MiB）都取回整个 4 MiB 对象，一个数据块 4 次整对象 GET；现在是 4 次范围 GET 加 1 次旁对象 GET。
 
 默认 HTTPS；`allow_http=true` 仅供隔离测试端点。外部服务的认证、bucket
 权限、数据同步落盘及数据库持久配置由管理员在服务端保证；HTTP 成功本身
@@ -477,8 +517,8 @@ Meta 的 `meta_store` 是独立配置：默认 `local-file`，也可选择 `redi
 对象 key 身份不允许变更后重新使用同一 Meta 数据目录；配置错误及 GET/PUT
 错误向调用方传播。正常停机仍需先排空工作负载和 FUSE 引用。
 
-S3 适配层共用一个 worker、运行时和客户端，固定最多四个实际 PUT（`MAX_UPLOADS`）、
-最多32个活动命令（`afs/src/node/external_chunk.rs`）；共享客户端最多保留四个空闲连接，
+S3 适配层共用一个运行时（`worker_threads` 个线程）和客户端，最多 `upload_concurrency` 个实际 PUT、
+最多32个活动命令（`afs/src/node/external_chunk.rs`）；共享客户端保留的空闲连接数为 `upload_concurrency` 加 8，
 空闲连接池大小本身不是并发限制。
 
 S3 模式的写入与原生副本模式走**同一条原生写流水线**（`afs/src/node/assembly/dfs.rs`）：
@@ -788,6 +828,7 @@ fsync依赖原持久副本与Meta屏障。S3 写入与原生共用写流水线�
 | --- | ---: | --- |
 | `dfs_write_queue_bytes` | `2147483648` | 每DFS挂载前台普通写正常正文总额，8MiB..1TiB且须能装入usize；所有文件合计，按需使用；不是Node总内存。自动额外等待空间=min(额度/8,32MiB) |
 | `dfs_dirty_budget_bytes` | `67108864` | 4..64MiB，Node实际live正文capacity，含仍被持有的已上传正文 |
+| `dfs_write_timeout_ms` | `30000` | DFS 写入准入和 fsync 发布前等待的上限，1..=600000 ms |
 | `dfs_unpublished_descriptors` | `1024` | 1..1024，且受固定4MiB元数据总额限制，不能靠增大计数绕过字节上限 |
 | `dfs_upload_inflight_chunks` | `8` | 1..8，整个Node的真实任务上限，共享live正文 |
 | `dfs_background_commit_ms` | `5000` | 1..60000ms，后台发布调度周期，非严格可见时间 |
@@ -893,7 +934,7 @@ Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_rema
 需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
 不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。
 
-注册请求携带集群线协议代际 `protocol_version`（当前为 7，`afs_protocol::CLUSTER_PROTOCOL_VERSION`，涵盖 Node↔Meta 注册与 Node↔Node service
+注册请求携带集群线协议代际 `protocol_version`（当前为 8，`afs_protocol::CLUSTER_PROTOCOL_VERSION`，涵盖 Node↔Meta 注册与 Node↔Node service
 布局）。Meta 在登记会话前校验，
 不符或缺省（0，旧 Node）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition），
 不写入任何状态；该错误不属于首次注册的可重试类别，Node 直接启动失败。DFS 与 OwnerFs Node

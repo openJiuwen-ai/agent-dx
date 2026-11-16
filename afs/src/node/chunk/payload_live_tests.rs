@@ -128,7 +128,7 @@ fn p2_w2_native_failed_grow_keeps_original_charge_until_owner_retires() {
 fn p2_w2_native_release_between_failed_admission_and_wait_is_not_lost() {
     let budget = DirtyBudget::new(4096);
     let owner = lease(&budget, 4096);
-    let DirtyAdmission::Wait { epoch } = budget.try_reserve(1).unwrap() else {
+    let DirtyAdmission::Wait { epoch, .. } = budget.try_reserve(1).unwrap() else {
         panic!("full ledger must return its observed epoch");
     };
     // Deterministically release before the waiter enters Condvar::wait.
@@ -151,7 +151,7 @@ fn p2_w2_native_release_between_failed_admission_and_wait_is_not_lost() {
 fn p2_w2_native_stop_wakes_waiter_without_refunding_existing_body() {
     let budget = DirtyBudget::new(4096);
     let owner = lease(&budget, 4096);
-    let DirtyAdmission::Wait { epoch } = budget.try_reserve(1).unwrap() else {
+    let DirtyAdmission::Wait { epoch, .. } = budget.try_reserve(1).unwrap() else {
         panic!("full ledger must wait");
     };
     let (tx, rx) = std::sync::mpsc::channel();

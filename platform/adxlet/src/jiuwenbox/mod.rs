@@ -351,10 +351,7 @@ impl Jiuwenbox {
             .ok_or_else(|| unavailable("invalid Jiuwenbox inventory"))
     }
     fn root(&self) -> PathBuf {
-        self.config
-            .state_dir
-            .join("bootstrap")
-            .join(&self.config.bootstrap.sha256)
+        self.config.state_dir.join("bootstrap").join("current")
     }
     async fn prepare_bootstrap(&self) -> Result<PathBuf> {
         self.bootstrap_root
@@ -537,7 +534,9 @@ impl Jiuwenbox {
         }
         let mut common = self.launch.clone();
         common.runtime_logs = None;
-        let mut request = sandboxd::start_request(spec, id, generation, devices, &common)?;
+        // The backend image binding uses the runtime profile PATH.
+        let mut request =
+            sandboxd::build_start_request(spec, id, generation, devices, &common, false)?;
         request.envs.remove("ADX_CHECKPOINT_HANDOFF_FILE");
         request.envs.remove("ADX_ENV_FILE");
         request.envs.remove("ADX_EXECD_CONTROL_SOCKET_PATH");
@@ -656,7 +655,26 @@ impl Jiuwenbox {
                 backend_policy["network"][key] = value.clone();
             }
         }
-        let body = json!({"sandbox_id":sandbox_id(id),"sandbox_runtime":if spec.runtime_class=="conch"{"conch"}else{"bwrap"},"env":request.envs,"policy_mode":"append","policy":backend_policy});
+        // Match the YuanRong executors: creation env belongs to backend policy,
+        // while the create API env stays absent from SandboxRef / sandbox ls.
+        let environment = if spec.runtime_class == "conch" {
+            &mut backend_policy["conch"]["env"]
+        } else {
+            &mut backend_policy["environment"]
+        };
+        if environment.is_null() {
+            *environment = empty_object();
+        }
+        environment
+            .as_object_mut()
+            .ok_or_else(|| Error::Invalid("Jiuwenbox policy environment must be an object".into()))?
+            .extend(
+                request
+                    .envs
+                    .iter()
+                    .map(|(key, value)| (key.clone(), json!(value))),
+            );
+        let body = json!({"sandbox_id":sandbox_id(id),"sandbox_runtime":if spec.runtime_class=="conch"{"conch"}else{"bwrap"},"policy_mode":"append","policy":backend_policy});
         let exec = json!({"job_id":"adx-execd","command":self.config.bootstrap.command,"workdir":request.cwd,"env":request.envs});
         Ok((body, exec))
     }

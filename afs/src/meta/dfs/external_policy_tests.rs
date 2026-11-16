@@ -23,6 +23,7 @@ async fn register(store: &Store, node_id: &str) {
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:2".into(),
                 rest_addr: "http://127.0.0.1:3".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: Vec::new(),
                 lease_ttl: std::time::Duration::from_secs(60),
@@ -45,8 +46,14 @@ async fn pending_commit(service: &DfsService) -> CommitFileVersion {
             namespace_id,
             parent_inode_id: root.inode_id,
             name: b"external-file".to_vec(),
+            caller: crate::dfs::CallerContext {
+                uid: 0,
+                gid: 0,
+                supplementary_gids: Vec::new(),
+            },
             attributes,
             lease_seconds: 60,
+            first_generation: None,
         })
         .await
         .unwrap();
@@ -357,7 +364,7 @@ async fn external_version_read_rejects_wrong_identity_or_range() {
             1 => bad.inode_id = InodeId::new("other"),
             2 => bad.layout_root_id = LayoutRootId::new("other"),
             3 => bad.requests[0].length = 5,
-            _ => bad.requests = vec![bad.requests[0].clone(); 129],
+            _ => bad.requests.clear(),
         }
         assert!(
             f.service
@@ -398,6 +405,7 @@ async fn external_version_read_readmits_after_reader_restart_without_old_mac() {
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:2".into(),
                 rest_addr: "http://127.0.0.1:3".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: Vec::new(),
                 lease_ttl: std::time::Duration::from_secs(60),
@@ -487,6 +495,7 @@ async fn current_external_read_changed_head_never_returns_old_authority() {
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:2".into(),
                 rest_addr: "http://127.0.0.1:3".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: Vec::new(),
                 lease_ttl: std::time::Duration::from_secs(60),
@@ -541,6 +550,7 @@ async fn current_external_read_head_and_grants_share_the_pinned_view() {
                 grpc_addr: "http://127.0.0.1:11".into(),
                 data_addr: "http://127.0.0.1:12".into(),
                 rest_addr: "http://127.0.0.1:13".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: Vec::new(),
                 lease_ttl: std::time::Duration::from_secs(60),
@@ -802,6 +812,7 @@ async fn external_policy_and_published_reference_survive_local_file_store_reload
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:2".into(),
                 rest_addr: "http://127.0.0.1:3".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: Vec::new(),
                 lease_ttl: std::time::Duration::from_secs(60),
@@ -950,5 +961,26 @@ async fn external_publication_has_one_external_copy_and_no_replication_debt() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn external_version_read_accepts_thousand_ranges_and_checks_last_range() {
+    let f = current_read_fixture().await;
+    let mut request = version_read_request(&f.request, 0, 4);
+    request.requests = vec![request.requests[0].clone(); 1000];
+    let reply = f
+        .service
+        .authorize_external_version_read(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(reply.authorizations.len(), 1000);
+
+    request.requests.last_mut().unwrap().chunk_offset = 4;
+    assert!(
+        f.service
+            .authorize_external_version_read(request)
+            .await
+            .is_err()
     );
 }

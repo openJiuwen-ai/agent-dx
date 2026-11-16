@@ -1,6 +1,6 @@
 use adx_apiserver::{
     config::{WorkspaceAffinity, WorkspaceAffinityErrorPolicy},
-    workspace_affinity::{derive_owner, enforce_node, WorkspaceAffinityResolver},
+    workspace_affinity::{derive_owner, prefer_node, WorkspaceAffinityResolver},
 };
 use adx_protocol::control as pb;
 use std::io::{Read, Write};
@@ -118,31 +118,47 @@ fn multiple_owners_are_rejected_before_any_lookup() {
 }
 
 #[test]
-fn empty_policy_gets_one_default_selector() {
+fn empty_policy_gets_one_preferred_selector() {
     let mut policy = pb::SchedulingPolicy::default();
-    enforce_node(&mut policy, "node-a").unwrap();
-    assert_eq!(policy.required_node.len(), 1);
-    assert_eq!(policy.required_node[0].expressions.len(), 1);
-    assert_eq!(policy.required_node[0].expressions[0].key, "NODE_ID");
-    assert_eq!(
-        policy.required_node[0].expressions[0].op,
-        pb::SelectorOp::In as i32
-    );
-    assert_eq!(policy.required_node[0].expressions[0].values, ["node-a"]);
+    prefer_node(&mut policy, "node-a").unwrap();
+    assert!(policy.required_node.is_empty(), "affinity must stay soft");
+    assert_eq!(policy.preferred_node.len(), 1);
+    let selector = policy.preferred_node[0].selector.as_ref().unwrap();
+    assert_eq!(selector.expressions.len(), 1);
+    assert_eq!(selector.expressions[0].key, "NODE_ID");
+    assert_eq!(selector.expressions[0].op, pb::SelectorOp::In as i32);
+    assert_eq!(selector.expressions[0].values, ["node-a"]);
+    assert_eq!(policy.preferred_node[0].weight, 1);
 }
 
 #[test]
-fn every_existing_selector_is_narrowed() {
+fn existing_required_selectors_are_left_unchanged() {
     let mut policy = pb::SchedulingPolicy {
         required_node: vec![pb::LabelSelector::default(), pb::LabelSelector::default()],
         ..Default::default()
     };
-    enforce_node(&mut policy, "node-a").unwrap();
+    prefer_node(&mut policy, "node-a").unwrap();
     assert_eq!(policy.required_node.len(), 2);
     for selector in &policy.required_node {
-        assert_eq!(selector.expressions.len(), 1);
-        assert_eq!(selector.expressions[0].values, ["node-a"]);
+        assert!(selector.expressions.is_empty());
     }
+    assert_eq!(policy.preferred_node.len(), 1);
+}
+
+#[test]
+fn existing_preferred_selectors_are_preserved() {
+    let mut policy = pb::SchedulingPolicy {
+        preferred_node: vec![pb::WeightedSelector {
+            selector: Some(node_selector(pb::SelectorOp::In, &["node-b"])),
+            weight: 10,
+        }],
+        ..Default::default()
+    };
+    prefer_node(&mut policy, "node-a").unwrap();
+    assert_eq!(policy.preferred_node.len(), 2);
+    assert_eq!(policy.preferred_node[0].weight, 10);
+    let selector = policy.preferred_node[1].selector.as_ref().unwrap();
+    assert_eq!(selector.expressions[0].values, ["node-a"]);
 }
 
 fn node_selector(op: pb::SelectorOp, values: &[&str]) -> pb::LabelSelector {
@@ -165,15 +181,17 @@ fn an_alternative_that_admits_the_owner_keeps_affinity() {
         ],
         ..Default::default()
     };
-    enforce_node(&mut policy, "node-a").unwrap();
+    prefer_node(&mut policy, "node-a").unwrap();
     assert_eq!(policy.required_node.len(), 2);
     for selector in &policy.required_node {
-        assert_eq!(selector.expressions.len(), 2);
-        assert!(selector
-            .expressions
-            .iter()
-            .any(|expression| expression.key == "NODE_ID" && expression.values == ["node-a"]));
+        assert_eq!(selector.expressions.len(), 1);
     }
+    assert_eq!(policy.preferred_node.len(), 1);
+    let selector = policy.preferred_node[0].selector.as_ref().unwrap();
+    assert!(selector
+        .expressions
+        .iter()
+        .any(|expression| expression.key == "NODE_ID" && expression.values == ["node-a"]));
 }
 
 #[test]
@@ -186,7 +204,7 @@ fn alternatives_that_all_exclude_the_owner_conflict() {
         ..Default::default()
     };
     assert_eq!(
-        enforce_node(&mut policy, "node-a").unwrap_err().code(),
+        prefer_node(&mut policy, "node-a").unwrap_err().code(),
         Code::InvalidArgument
     );
 }
@@ -209,14 +227,14 @@ fn node_group_terms_are_alternatives_too() {
         placement_groups: vec![group(&["node-b", "node-a"])],
         ..Default::default()
     };
-    enforce_node(&mut allowed, "node-a").unwrap();
+    prefer_node(&mut allowed, "node-a").unwrap();
 
     let mut conflicting = pb::SchedulingPolicy {
         placement_groups: vec![group(&["node-b", "node-c"])],
         ..Default::default()
     };
     assert_eq!(
-        enforce_node(&mut conflicting, "node-a").unwrap_err().code(),
+        prefer_node(&mut conflicting, "node-a").unwrap_err().code(),
         Code::InvalidArgument
     );
 }
@@ -231,7 +249,7 @@ fn match_labels_and_range_requirements_are_honoured() {
         ..Default::default()
     };
     assert_eq!(
-        enforce_node(&mut conflicting, "node-a").unwrap_err().code(),
+        prefer_node(&mut conflicting, "node-a").unwrap_err().code(),
         Code::InvalidArgument
     );
 
@@ -242,7 +260,9 @@ fn match_labels_and_range_requirements_are_honoured() {
         }],
         ..Default::default()
     };
-    enforce_node(&mut matching, "node-a").unwrap();
+    prefer_node(&mut matching, "node-a").unwrap();
+    assert_eq!(matching.preferred_node.len(), 1);
+    assert_eq!(matching.required_node[0].match_labels["NODE_ID"], "node-a");
 
     // A non numeric NODE_ID can never satisfy a range requirement.
     for op in [pb::SelectorOp::Gt, pb::SelectorOp::Lt] {
@@ -251,7 +271,7 @@ fn match_labels_and_range_requirements_are_honoured() {
             ..Default::default()
         };
         assert_eq!(
-            enforce_node(&mut policy, "node-a").unwrap_err().code(),
+            prefer_node(&mut policy, "node-a").unwrap_err().code(),
             Code::InvalidArgument
         );
     }
@@ -260,7 +280,7 @@ fn match_labels_and_range_requirements_are_honoured() {
         required_node: vec![node_selector(pb::SelectorOp::Gt, &["1"])],
         ..Default::default()
     };
-    enforce_node(&mut numeric, "10").unwrap();
+    prefer_node(&mut numeric, "10").unwrap();
 }
 
 #[test]
@@ -280,10 +300,9 @@ fn a_required_anti_group_that_rules_out_the_owner_conflicts() {
         ..Default::default()
     };
     assert_eq!(
-        enforce_node(&mut conflicting, "node-a").unwrap_err().code(),
+        prefer_node(&mut conflicting, "node-a").unwrap_err().code(),
         Code::InvalidArgument
     );
-
     // Another label cannot be proven to match, so the request stays schedulable.
     let mut unproven = pb::SchedulingPolicy {
         placement_groups: vec![anti(pb::LabelSelector {
@@ -303,7 +322,7 @@ fn a_required_anti_group_that_rules_out_the_owner_conflicts() {
         })],
         ..Default::default()
     };
-    enforce_node(&mut unproven, "node-a").unwrap();
+    prefer_node(&mut unproven, "node-a").unwrap();
 }
 
 #[test]
@@ -321,8 +340,9 @@ fn explicit_node_constraints_must_admit_the_owner_node() {
     };
 
     let mut allowed = requirement(pb::SelectorOp::In, &["node-a", "node-b"]);
-    enforce_node(&mut allowed, "node-a").unwrap();
-    assert_eq!(allowed.required_node[0].expressions.len(), 2);
+    prefer_node(&mut allowed, "node-a").unwrap();
+    assert_eq!(allowed.required_node[0].expressions.len(), 1);
+    assert_eq!(allowed.preferred_node.len(), 1);
 
     for mut policy in [
         requirement(pb::SelectorOp::In, &["node-b"]),
@@ -330,7 +350,7 @@ fn explicit_node_constraints_must_admit_the_owner_node() {
         requirement(pb::SelectorOp::DoesNotExist, &[]),
     ] {
         assert_eq!(
-            enforce_node(&mut policy, "node-a").unwrap_err().code(),
+            prefer_node(&mut policy, "node-a").unwrap_err().code(),
             Code::InvalidArgument
         );
     }
@@ -408,7 +428,7 @@ fn required_placement_groups_are_checked_for_conflicts() {
         ..Default::default()
     };
     assert_eq!(
-        enforce_node(&mut conflicting, "node-a").unwrap_err().code(),
+        prefer_node(&mut conflicting, "node-a").unwrap_err().code(),
         Code::InvalidArgument,
         "explicit node_id is encoded as a required placement group"
     );
@@ -417,9 +437,11 @@ fn required_placement_groups_are_checked_for_conflicts() {
         placement_groups: vec![node_group(pb::SelectorOp::In, &["node-a"])],
         ..Default::default()
     };
-    enforce_node(&mut allowed, "node-a").unwrap();
-    assert_eq!(allowed.required_node.len(), 1);
-    assert_eq!(allowed.required_node[0].expressions[0].values, ["node-a"]);
+    prefer_node(&mut allowed, "node-a").unwrap();
+    assert!(allowed.required_node.is_empty());
+    assert_eq!(allowed.preferred_node.len(), 1);
+    let selector = allowed.preferred_node[0].selector.as_ref().unwrap();
+    assert_eq!(selector.expressions[0].values, ["node-a"]);
 }
 
 #[tokio::test]

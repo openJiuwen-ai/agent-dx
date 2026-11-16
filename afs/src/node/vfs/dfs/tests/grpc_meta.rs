@@ -247,8 +247,18 @@ impl DfsMeta for CapturingDfsMeta {
         parent: &InodeId,
         name: &[u8],
         attributes: InodeAttributes,
+        first_generation: Option<&OperationId>,
+        caller: CallerContext,
     ) -> Result<(InodeRecord, WriteLease)> {
-        DfsMeta::create(self.inner.as_ref(), operation_id, parent, name, attributes)
+        DfsMeta::create(
+            self.inner.as_ref(),
+            operation_id,
+            parent,
+            name,
+            attributes,
+            first_generation,
+            caller,
+        )
     }
 
     fn get_inode(&self, inode_id: &InodeId) -> Result<InodeRecord> {
@@ -273,6 +283,10 @@ impl DfsMeta for CapturingDfsMeta {
 
     fn renew_write_lease(&self, lease: WriteLease) -> Result<WriteLease> {
         DfsMeta::renew_write_lease(self.inner.as_ref(), lease)
+    }
+
+    fn release_write_leases(&self, operation: &OperationId, leases: &[WriteLease]) -> Result<u64> {
+        DfsMeta::release_write_leases(self.inner.as_ref(), operation, leases)
     }
 
     fn sync_inode_metadata(&self, sync: SyncInodeMetadata) -> Result<InodeRecord> {
@@ -509,6 +523,7 @@ async fn real_grpc_meta_fixture() -> (
                 grpc_addr: "http://127.0.0.1:1".into(),
                 data_addr: "http://127.0.0.1:1".into(),
                 rest_addr: "http://127.0.0.1:1".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: false,
                 storage_devices: vec![local_a.device_descriptor().unwrap()],
                 lease_ttl: Duration::from_secs(30),
@@ -527,6 +542,64 @@ async fn real_grpc_meta_fixture() -> (
         .initialize_replication_config()
         .await
         .unwrap();
+    // These tests create as an ordinary user directly under the namespace
+    // root, which is root-owned 0755: open it as an administrator would. Meta
+    // creates the root on the first namespace mutation, hence the probe.
+    let dfs = meta.dfs.as_ref().unwrap();
+    dfs.mkdir(crate::dfs::MkdirRequest {
+        caller_id: "node-a".into(),
+        operation_id: crate::dfs::OperationId::new("fixture-root-probe"),
+        namespace_id: crate::dfs::NamespaceId::new("default"),
+        parent_inode_id: crate::dfs::InodeId::new("1"),
+        name: b".fixture-root-probe".to_vec(),
+        attributes: crate::dfs::InodeAttributes {
+            mode: 0o700,
+            uid: 0,
+            gid: 0,
+            nlink: 2,
+            atime_unix_ms: 1,
+            mtime_unix_ms: 1,
+            ctime_unix_ms: 1,
+        },
+        caller: crate::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+    })
+    .await
+    .unwrap();
+    dfs.rmdir(crate::dfs::RmdirRequest {
+        caller_id: "node-a".into(),
+        operation_id: crate::dfs::OperationId::new("fixture-root-probe-remove"),
+        namespace_id: crate::dfs::NamespaceId::new("default"),
+        parent_inode_id: crate::dfs::InodeId::new("1"),
+        name: b".fixture-root-probe".to_vec(),
+        caller: crate::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+    })
+    .await
+    .unwrap();
+    dfs.set_inode_attributes(crate::dfs::SetInodeAttrRequest {
+        caller_id: "node-a".into(),
+        operation_id: crate::dfs::OperationId::new("fixture-open-root"),
+        caller: crate::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+        inode_id: crate::dfs::InodeId::new("1"),
+        expected_inode_revision: None,
+        update: crate::dfs::InodeAttrUpdate {
+            mode: Some(0o1777),
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
     assert!(
         store
             .read(MetaRead::DfsReplicationConfig)
@@ -774,6 +847,50 @@ struct InodeMutationSnapshot {
     pending_layout_id: LayoutRootId,
 }
 
+/// A create that reaches Meta for a name another create already took (the
+/// kernel's lookup lost the race, or the caller is not behind the kernel) must
+/// surface as `EEXIST`: `open(O_CREAT | O_EXCL)` callers treat `EBUSY` as a
+/// failure rather than "someone else holds the lock file".
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_grpc_create_over_an_existing_name_is_eexist() {
+    let (_temp, endpoint, _gate, server, _store, local, _backend) = real_grpc_meta_fixture().await;
+    let (_meta, _chunks, fs_raw) = grpc_dfs_test_fs(
+        "node-a",
+        "session-a",
+        &endpoint,
+        local,
+        Duration::from_secs(2),
+    )
+    .await;
+    let fs = Arc::new(fs_raw);
+    let create = |fs: Arc<DistributedFs>| {
+        run_blocking(move || {
+            fs.create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("grpc-create-exclusive.lock"),
+                0o640,
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY,
+            )
+        })
+    };
+    let created = create(fs.clone()).await.unwrap();
+    let error = match create(fs.clone()).await {
+        Ok(_) => panic!("a second create of the same name must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), afs_error::IO_ALREADY_EXISTS, "{error}");
+    assert_eq!(crate::error::errno(&error), libc::EEXIST);
+    {
+        let fs = fs.clone();
+        run_blocking(move || fs.release(&context(), created.handle))
+            .await
+            .unwrap();
+    }
+    server.abort();
+}
+
 #[cfg(feature = "dfs")]
 fn pending_file_commit_snapshot(
     fs: &DistributedFs,
@@ -993,6 +1110,219 @@ async fn real_grpc_writable_reopen_resolves_write_authority_without_meta_mutatio
 
 #[cfg(feature = "dfs")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r110_grpc_reopen_preserves_write_epoch_across_gc() {
+    use crate::meta::{
+        dfs::DfsService,
+        store::{MetaEntity, MetaRead},
+    };
+    let (_temp, endpoint, _gate, server, store, local, _backend) = real_grpc_meta_fixture().await;
+    let (_meta, _chunks, fs) = grpc_dfs_test_fs(
+        "node-a",
+        "session-a",
+        &endpoint,
+        local,
+        Duration::from_secs(2),
+    )
+    .await;
+    let fs = Arc::new(fs);
+    let creating = fs.clone();
+    let created = run_blocking(move || {
+        creating.create(
+            &context(),
+            creating.root_inode(),
+            OsStr::new("r110-reopen"),
+            0o640,
+            libc::O_RDWR,
+        )
+    })
+    .await
+    .unwrap();
+    let inode = created.entry.inode;
+    let inode_id = fs.inode_id(inode).unwrap();
+    let read_lease = || async {
+        let entity = store
+            .read(MetaRead::DfsWriteLease(inode_id.clone()))
+            .await
+            .unwrap()
+            .entity;
+        match entity {
+            Some(MetaEntity::DfsWriteLease(lease)) => Some(lease),
+            None => None,
+            _ => panic!("unexpected entity for write lease key"),
+        }
+    };
+    let first = read_lease().await.unwrap();
+    assert_eq!(first.lease_epoch, 1);
+    let closing = fs.clone();
+    run_blocking(move || closing.release(&context(), created.handle))
+        .await
+        .unwrap();
+
+    let service = DfsService::new(store.clone());
+    // Release clamps expiry to now without removing the row. Use the same
+    // lease expiry predicate as natural expiry without a wall-clock sleep.
+    assert_eq!(
+        service
+            .release_write_leases(
+                "node-a".into(),
+                "session-a".into(),
+                OperationId::new("r110-expire-first"),
+                vec![first.clone()],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let opening = fs.clone();
+    let second_handle = run_blocking(move || opening.open(&context(), inode, libc::O_RDWR))
+        .await
+        .unwrap();
+    let second = read_lease().await.unwrap();
+    assert_eq!(second.lease_epoch, 2);
+    let closing = fs.clone();
+    run_blocking(move || closing.release(&context(), second_handle))
+        .await
+        .unwrap();
+    let cell = fs.write_state(&inode_id).unwrap().unwrap();
+    assert_eq!(cell.lock().unwrap().write_lease.lease_epoch, 2);
+    assert_eq!(
+        service
+            .release_write_leases(
+                "node-a".into(),
+                "session-a".into(),
+                OperationId::new("r110-expire-second"),
+                vec![second.clone()],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+
+    service
+        .collect_garbage("node-a".into(), "session-a".into(), 0, Vec::new())
+        .await
+        .unwrap();
+    let retained = read_lease().await.expect("linked inode keeps its epoch");
+    assert_eq!(retained.lease_epoch, second.lease_epoch);
+    assert!(retained.expires_at_unix_ms <= now_unix_ms());
+
+    let opening = fs.clone();
+    let handle = run_blocking(move || opening.open(&context(), inode, libc::O_RDWR))
+        .await
+        .expect("Node must accept the next epoch after GC");
+    let reissued = read_lease().await.unwrap();
+    assert_eq!(reissued.lease_epoch, 3);
+    assert_eq!(reissued.owner_node_id, second.owner_node_id);
+    assert_eq!(reissued.owner_session_id, second.owner_session_id);
+    assert!(reissued.expires_at_unix_ms > now_unix_ms());
+    assert_eq!(cell.lock().unwrap().write_lease, reissued);
+
+    let writing = fs.clone();
+    run_blocking(move || {
+        let payload = b"write after lease GC";
+        assert_eq!(
+            writing.write(&context(), handle, 0, payload).unwrap(),
+            payload.len()
+        );
+        assert_eq!(read_exact_from(&writing, handle, 0, payload.len()), payload);
+        writing.release(&context(), handle).unwrap();
+    })
+    .await;
+    eprintln!("r110: Meta and Node advanced to epoch 3; reopen and write succeeded");
+    server.abort();
+}
+
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r106_handoff_respects_active_node_lock_authority() {
+    use crate::meta::store::{MetaEntity, MetaRead};
+    let (_temp, endpoint, _gate, server, store, local, _backend) = real_grpc_meta_fixture().await;
+    let (_meta, _chunks, fs) = grpc_dfs_test_fs(
+        "node-a",
+        "session-a",
+        &endpoint,
+        local,
+        Duration::from_secs(2),
+    )
+    .await;
+    let fs = Arc::new(fs.with_write_handoff_prototype(true));
+    let probe = fs.clone();
+    let locked = run_blocking(move || {
+        [FileLockKind::Flock, FileLockKind::Posix].map(|kind| {
+            let name = format!("r106-locked-{kind:?}");
+            let created = probe
+                .create(
+                    &context(),
+                    probe.root_inode(),
+                    OsStr::new(&name),
+                    0o640,
+                    libc::O_RDWR,
+                )
+                .unwrap();
+            let inode = created.entry.inode;
+            probe.release(&context(), created.handle).unwrap();
+            let reader = probe.open(&context(), inode, libc::O_RDONLY).unwrap();
+            let request = LockRequest::read(
+                kind,
+                lock_owner("mount-a", 10),
+                100,
+                lock_range(0, u64::MAX),
+            );
+            probe
+                .setlk(&context(), inode, reader, request.clone(), None)
+                .unwrap();
+            let id = probe.inode_id(inode).unwrap();
+            let state = probe.write_state(&id).unwrap().unwrap();
+            let state = state.lock().unwrap();
+            assert_eq!(state.open_writers, 0, "only the lock protects the lease");
+            let epoch = state.write_lease.lease_epoch;
+            (id, epoch, inode, reader, request)
+        })
+    })
+    .await;
+
+    let probe = fs.clone();
+    let targets = locked
+        .each_ref()
+        .map(|(id, epoch, _, _, _)| (id.clone(), *epoch));
+    run_blocking(move || {
+        for (id, epoch) in targets {
+            assert!(!probe.expedite_idle_lease(&id, epoch).unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(probe.release_idle_leases().unwrap(), 0);
+    })
+    .await;
+    for (id, epoch, _, _, _) in &locked {
+        let snapshot = store
+            .read(MetaRead::DfsWriteLease(id.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            snapshot.entity,
+            Some(MetaEntity::DfsWriteLease(lease))
+                if lease.lease_epoch == *epoch && lease.expires_at_unix_ms > now_unix_ms()
+        ));
+    }
+
+    let probe = fs.clone();
+    run_blocking(move || {
+        for (_, _, inode, reader, mut request) in locked {
+            request.lock_type = FileLockType::Unlock;
+            probe
+                .setlk(&context(), inode, reader, request, None)
+                .unwrap();
+            probe.release(&context(), reader).unwrap();
+        }
+        probe.reclaim_idle_lock_authorities().unwrap();
+        assert_eq!(probe.release_idle_leases().unwrap(), 2);
+    })
+    .await;
+    server.abort();
+}
+
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_grpc_write_authority_foreign_owner_does_not_take_over_or_mutate() {
     use crate::meta::store::{MetaEntity, MetaRead, RequestKey};
     let (_temp, endpoint, _gate, server, store, local, backend) = real_grpc_meta_fixture().await;
@@ -1068,6 +1398,90 @@ async fn real_grpc_write_authority_foreign_owner_does_not_take_over_or_mutate() 
             .is_none(),
         "foreign live write authority read must not persist an outcome"
     );
+    server.abort();
+}
+
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_grpc_data_only_replay_after_close_publishes_mtime() {
+    let (_temp, endpoint, gate, server, _store, local, _backend) = real_grpc_meta_fixture().await;
+    let (meta, _chunks, fs) = grpc_dfs_test_fs(
+        "node-a",
+        "session-a",
+        &endpoint,
+        local,
+        Duration::from_secs(2),
+    )
+    .await;
+    let fs = Arc::new(fs);
+    let (inode, inode_id, mtime) = {
+        let fs = fs.clone();
+        run_blocking(move || {
+            let file = fs
+                .create(
+                    &context(),
+                    fs.root_inode(),
+                    OsStr::new("data-only-lost-reply"),
+                    0o640,
+                    libc::O_RDWR,
+                )
+                .unwrap();
+            let inode = file.entry.inode;
+            fs.setattr(
+                &context(),
+                inode,
+                Some(file.handle),
+                &AttributeChange {
+                    mtime: Some(std::time::UNIX_EPOCH + Duration::from_millis(42)),
+                    ..AttributeChange::default()
+                },
+            )
+            .unwrap();
+            fs.write(&context(), file.handle, 0, b"body").unwrap();
+            // Meta applies the file commit, but the client times out waiting
+            // for the reply and has to replay the same operation.
+            let error = fs.flush(&context(), file.handle).unwrap_err();
+            assert_eq!(error.code(), afs_error::CLIENT_DEADLINE_EXCEEDED);
+            let inode_id = fs.inode_id(inode).unwrap();
+            let cell = fs.write_state(&inode_id).unwrap().unwrap();
+            let mtime = cell.lock().unwrap().inode.attributes.mtime_unix_ms;
+            fs.release(&context(), file.handle).unwrap();
+            (inode, inode_id, mtime)
+        })
+        .await
+    };
+    gate.wait_first_committed(Duration::from_secs(1)).await;
+    gate.release_second();
+
+    run_blocking(move || {
+        let original = meta.get_inode(&inode_id).unwrap();
+        assert!(original.head_version.is_some());
+        assert_eq!(original.attributes.mtime_unix_ms, 42);
+        assert_ne!(mtime, original.attributes.mtime_unix_ms);
+
+        assert_eq!(fs.progress_writeback().unwrap(), 1);
+        fs.setxattr(&context(), inode, OsStr::new("user.replay"), b"kept", 0)
+            .unwrap();
+        assert_eq!(fs.progress_writeback().unwrap(), 1);
+        assert!(!fs.writeback_ready().unwrap());
+
+        let final_inode = meta.get_inode(&inode_id).unwrap();
+        assert_eq!(final_inode.head_version, original.head_version);
+        assert_eq!(final_inode.attributes.mtime_unix_ms, mtime);
+        assert_eq!(
+            final_inode.xattrs.get(b"user.replay".as_slice()).unwrap(),
+            b"kept",
+        );
+        let commits = meta.commits();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].metadata_delta.mode, CommitMetadataMode::DataOnly);
+        assert_eq!(commits[0].operation_id, commits[1].operation_id);
+        assert_eq!(commits[0].file_version.id, commits[1].file_version.id);
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert_eq!(read_exact_from(&fs, reader, 0, 4), b"body");
+        fs.release(&context(), reader).unwrap();
+    })
+    .await;
     server.abort();
 }
 
@@ -1183,7 +1597,7 @@ async fn real_grpc_unknown_file_commit_ack_blocks_inode_and_replays_exact_reques
         MetaEntity::DfsLayoutRoot(layout) => layout,
         _ => panic!("expected stored layout root"),
     };
-    assert_eq!(stored_layout, pending.batch.commit.layout_root);
+    assert_eq!(stored_layout.as_ref(), &pending.batch.commit.layout_root);
     let outcome = store
         .read(MetaRead::RequestOutcome(RequestKey::new(
             "node-a",
@@ -1392,6 +1806,87 @@ async fn real_grpc_unknown_file_commit_ack_blocks_inode_and_replays_exact_reques
         run_blocking(move || fs.release(&context(), handle_b))
             .await
             .unwrap();
+    }
+    server.abort();
+}
+
+/// Create carries the requesting identity to Meta like mkdir does: Meta, not
+/// the kernel, refuses a caller without write permission on the parent (SDK
+/// and usrbio callers never reach the kernel's check) and gives a file made in
+/// a setgid directory the directory's group.
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_grpc_create_is_checked_and_grouped_by_meta() {
+    let (_temp, endpoint, _gate, server, _store, local, _backend) = real_grpc_meta_fixture().await;
+    let (_meta, _chunks, fs_raw) = grpc_dfs_test_fs(
+        "node-a",
+        "session-a",
+        &endpoint,
+        local,
+        Duration::from_secs(2),
+    )
+    .await;
+    let fs = Arc::new(fs_raw);
+    let root = RequestContext {
+        uid: 0,
+        gid: 0,
+        ..context()
+    };
+    let member = RequestContext {
+        uid: 1000,
+        gid: 1000,
+        supplementary_gids: vec![2000],
+        ..context()
+    };
+    let stranger = RequestContext {
+        uid: 3000,
+        gid: 3000,
+        ..context()
+    };
+    let (group_owned, results) = {
+        let fs = fs.clone();
+        run_blocking(move || {
+            let shared = fs
+                .mkdir(&root, fs.root_inode(), OsStr::new("team"), 0o770)
+                .unwrap();
+            let sgid = AttributeChange {
+                mode: Some(0o2770),
+                gid: Some(2000),
+                ..AttributeChange::default()
+            };
+            fs.setattr(&root, shared.inode, None, &sgid).unwrap();
+            let create = |ctx: &RequestContext, name: &str| {
+                fs.create(ctx, shared.inode, OsStr::new(name), 0o640, libc::O_WRONLY)
+            };
+            let created = create(&member, "member.txt").unwrap();
+            let attributes = created.entry.attributes.clone();
+            fs.release(&member, created.handle).unwrap();
+            let denied = create(&stranger, "stranger.txt").map(|_| ());
+            let locked = fs
+                .mkdir(&root, fs.root_inode(), OsStr::new("locked"), 0o755)
+                .unwrap();
+            let read_only_parent = fs
+                .create(
+                    &stranger,
+                    locked.inode,
+                    OsStr::new("stranger.txt"),
+                    0o640,
+                    libc::O_WRONLY,
+                )
+                .map(|_| ());
+            (attributes, [denied, read_only_parent])
+        })
+        .await
+    };
+    assert_eq!(group_owned.uid, 1000);
+    assert_eq!(
+        group_owned.gid, 2000,
+        "a file created in a setgid directory takes the directory's group"
+    );
+    for result in results {
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED, "{error}");
+        assert_eq!(crate::error::errno(&error), libc::EACCES);
     }
     server.abort();
 }

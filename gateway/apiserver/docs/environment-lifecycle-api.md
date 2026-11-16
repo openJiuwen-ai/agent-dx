@@ -277,6 +277,26 @@ request under that identity conflicts, as does a named create already in
 flight under another identity. JSON object key order does not change the digest; omission, explicit zero and null are distinct request shapes. The cache is an HTTP create boundary, not a guarantee
 about an unknown network outcome outside API Server.
 
+Completed CREATE requests remain in a bounded 600-second cache, keyed by tenant
+and the incoming request ID. Replays read the current Env from the existing local
+directory and use the same response builder as uncached CREATE. A Running Env
+returns its current information and its original creation `requestId`, including
+after node takeover or deletion followed by same-name recreation. The returned
+creation ID does not replace the incoming request ID as the cache key.
+
+Confirmed absence or a terminal Failed/Deleted execution returns the existing
+terminal `409`. An unavailable directory or a recoverable phase returns `503`.
+A later replay can observe a recreated Running Env and return `200`; a prior
+terminal observation does not hide that new Env. Other completed errors retain
+their existing replay behavior. The Activator confirms absence and advances its
+creation request ID; unknown outcomes keep the same request ID.
+
+The cache retains `newlyCreated: true` only while returning the Env created by
+that cached request. Reusing a replacement Env returns `newlyCreated: false`.
+Each API Server reads its existing directory without an added RPC, subscription,
+cross-instance invalidation, or background scan. Directory propagation remains
+eventual; this is not a synchronous cross-replica deletion barrier.
+
 For pause, resume, reload, network replacement, and snapshot creation, malformed or missing
 lifecycle IDs and invalid local input map to `400`; downstream business
 rejection maps to `409`; API Server-to-Node transport failure maps to `503`; and
@@ -410,6 +430,15 @@ Each mount requires exactly one nonempty `image_url`, `s3_config`, or `host_path
 
 The request maps to `StorageSource::Local`, then sandboxd HostPath, preserving mount options. The source must exist in the runtime's mount namespace with suitable permissions. This endpoint does not mount SFS, authorize per-tenant host paths, or coordinate multiple sandboxes using the same directory. Source-directory creation requires the explicit flag described below. Expose arbitrary host-path creation only to trusted management callers until deployment-specific path authorization is provided. User sandboxes do not need CAP_SYS_ADMIN for this node-side operation. Component contract tests do not establish runsc/SFS writeback or SQLite recovery guarantees.
 
+
+For runsc host/Volume bind mounts, callers may explicitly request
+`options: ["rw", "disable_file_handle_sharing"]`. ADXlet temporarily normalizes
+only this requested option in the node-to-sandboxd request: one copy for local
+sources, no input copy for NFS/FUSE where the pinned runsc automatically adds it.
+The persisted spec is unchanged. This workaround is removable once runsc's
+automatic append is idempotent; it is not enabled for unmarked mounts or other
+runtimes. Failure to observe a prepared source, including unresolved autofs,
+fails creation/restore rather than guessing its filesystem type.
 
 `create_if_missing` is an optional boolean on each mount (default `false`). It is
 accepted only for Local bind sources; other sources/types return InvalidArgument.

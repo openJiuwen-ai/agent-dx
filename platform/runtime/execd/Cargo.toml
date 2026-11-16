@@ -23,7 +23,7 @@ adx-observability = { path = "../../../crates/observability" }
 adx-protocol = { path = "../../crates/protocol" }
 tonic = "0.12"
 adx-core = { path = "../../crates/core" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "net", "time", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "net", "time", "fs", "sync"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 serde_json = "1"
 sha2 = "0.10"

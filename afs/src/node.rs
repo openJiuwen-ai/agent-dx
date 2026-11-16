@@ -29,6 +29,8 @@ pub mod fuse;
 #[cfg(feature = "dfs")]
 pub mod gc;
 pub mod metrics;
+#[cfg(feature = "ownerfs")]
+pub mod outlet;
 pub mod read;
 mod readiness;
 mod registration;
@@ -40,6 +42,9 @@ pub mod vfs;
 
 pub(crate) use readiness::current_visible_afs_mount_id_in_mountinfo;
 pub use readiness::{AfsMountIdentity, NodeReadiness, ReadinessObservation, sample_rdma_sysfs_at};
+// Only the OwnerFs outlet reads mountinfo lines outside `readiness`.
+#[cfg(feature = "ownerfs")]
+pub(crate) use readiness::parse_exact_mountinfo_line;
 
 use crate::{
     config::Config,

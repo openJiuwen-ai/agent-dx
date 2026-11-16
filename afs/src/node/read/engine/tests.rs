@@ -2063,6 +2063,105 @@ fn diagnostic_corrupted_local_copy(warm: bool) {
     assert!(local.quarantined_chunks().unwrap().is_empty());
 }
 
+/// F-a: a segmented-CRC local copy with four 32 KiB segments whose last
+/// segment is damaged on disk. No peer exists, so any fallback is an error.
+fn segmented_local_copy_with_damaged_last_segment() -> (
+    tempfile::TempDir,
+    Arc<LocalChunkStore>,
+    DfsReadEngine,
+    ChunkId,
+    Vec<u8>,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+    let segment = 32 * 1024;
+    let bytes: Vec<u8> = (0..4 * segment).map(|i| (i % 251) as u8).collect();
+    let staged = StagedChunk::new_crc32c(OperationId::new("f-a"), bytes.clone()).unwrap();
+    let chunk_id = staged.chunk.id.clone();
+    local.put(staged).unwrap();
+    let path = temp.path().join("chunks").join(&chunk_id.0);
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    std::os::unix::fs::FileExt::write_at(
+        &file,
+        &[bytes[3 * segment + 5] ^ 0xff],
+        (3 * segment + 5) as u64,
+    )
+    .unwrap();
+    file.sync_all().unwrap();
+    let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+        revision: 1,
+        chunks: vec![ChunkSources {
+            allowed_ranges: Vec::new(),
+            chunk: None,
+            chunk_id: chunk_id.clone(),
+            sources: Vec::new(),
+        }],
+    }));
+    let engine = DfsReadEngine::new(
+        crate::dfs::NamespaceId::new("default"),
+        "node-a".into(),
+        local.clone(),
+        sources,
+        Arc::new(UnimplementedChunkTransfer),
+        DfsReadConfig::default(),
+    );
+    (temp, local, engine, chunk_id, bytes)
+}
+
+fn one_range(chunk_id: &ChunkId, chunk_offset: u64, length: u64) -> ReadBatch {
+    ReadBatch {
+        lookahead: Vec::new(),
+        file_version_id: Some(FileVersionId::new("version")),
+        layout_root_id: LayoutRootId::new("layout"),
+        ops: vec![ChunkReadOp {
+            chunk_id: chunk_id.clone(),
+            chunk_offset,
+            length,
+            output_offset: 0,
+        }],
+    }
+}
+
+#[test]
+fn segmented_local_cold_open_verifies_only_covered_segments() {
+    let (_temp, local, engine, chunk_id, bytes) = segmented_local_copy_with_damaged_last_segment();
+    // A cold first read of an undamaged segment succeeds locally: the first
+    // open no longer scans (and fails on) the unread damaged segment.
+    let mut out = vec![0; 4096];
+    engine
+        .read_batch(&one_range(&chunk_id, 100, 4096), &mut out)
+        .unwrap();
+    assert_eq!(out, bytes[100..4196]);
+    assert!(local.quarantined_chunks().unwrap().is_empty());
+    assert_eq!(engine.readers.lock().unwrap().len(), 1);
+    // Reading the damaged segment still fails closed through the existing
+    // chain: quarantine, drop the cached pin, no peer -> EIO, no output.
+    let mut out = vec![9; 64];
+    let error = engine
+        .read_batch(&one_range(&chunk_id, 3 * 32 * 1024, 64), &mut out)
+        .unwrap_err();
+    assert_eq!(crate::error::errno(&error), libc::EIO);
+    assert_eq!(out, vec![9; 64]);
+    assert_eq!(local.quarantined_chunks().unwrap().len(), 1);
+    assert!(engine.readers.lock().unwrap().is_empty());
+}
+
+#[test]
+fn segmented_local_damage_outside_read_ranges_is_found_by_scrub() {
+    let (_temp, local, engine, chunk_id, bytes) = segmented_local_copy_with_damaged_last_segment();
+    let mut out = vec![0; 2 * 32 * 1024];
+    engine
+        .read_batch(&one_range(&chunk_id, 0, 2 * 32 * 1024), &mut out)
+        .unwrap();
+    assert_eq!(out, bytes[..2 * 32 * 1024]);
+    assert!(local.quarantined_chunks().unwrap().is_empty());
+    assert_eq!(
+        local.scrub_verify(&chunk_id).unwrap(),
+        crate::node::chunk::ScrubOutcome::Quarantined
+    );
+    assert_eq!(local.quarantined_chunks().unwrap().len(), 1);
+}
+
 #[test]
 fn quarantined_local_copy_and_no_readable_peer_return_eio_without_output() {
     let temp = tempfile::tempdir().unwrap();
@@ -7422,4 +7521,266 @@ fn s1c6_read_hot_path_round(len: usize, label: &str) {
             );
         }
     }
+}
+
+#[test]
+fn external_version_read_authorizes_thousand_cold_ranges_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+    let engine = fixture.engine(
+        Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+        fixture.empty_sources(),
+    );
+    let mut batch = fixture.batch();
+    let op = batch.ops[0].clone();
+    batch.ops = (0..1000)
+        .map(|index| ChunkReadOp {
+            output_offset: index * 2,
+            ..op.clone()
+        })
+        .collect();
+    let result = engine
+        .read_batch_external_version_owned(&crate::dfs::InodeId::new("inode"), &batch, 2000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result, b"bc".repeat(1000));
+    assert_eq!(*fixture.authorizations.lock().unwrap(), 1);
+    assert_eq!(*fixture.fetches.lock().unwrap(), 1);
+}
+
+// ---- External authority read-ahead (J4) ----
+
+/// Several external chunks behind one fixed-version authorizer that records
+/// the chunks of every request and can refuse any request naming one chunk.
+struct AheadChunks {
+    chunks: Vec<Arc<ExternalFixture>>,
+    requests: Mutex<Vec<Vec<ChunkId>>>,
+    refuse: Mutex<Option<ChunkId>>,
+}
+
+impl AheadChunks {
+    fn new(count: u8) -> Arc<Self> {
+        Arc::new(Self {
+            chunks: (0..count)
+                .map(|index| Arc::new(ExternalFixture::new(&[b'a' + index; 8])))
+                .collect(),
+            requests: Mutex::new(Vec::new()),
+            refuse: Mutex::new(None),
+        })
+    }
+
+    fn engine(self: &Arc<Self>, temp: &tempfile::TempDir) -> DfsReadEngine {
+        DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            Arc::new(StaticSources::default()),
+            Arc::new(UnimplementedChunkTransfer),
+            DfsReadConfig::default(),
+        )
+        .with_external_backend(self.clone(), self.clone())
+    }
+
+    fn ahead(&self, range: std::ops::Range<usize>) -> Vec<crate::dfs::DfsMissingReadSource> {
+        self.chunks[range]
+            .iter()
+            .map(|fixture| crate::dfs::DfsMissingReadSource {
+                chunk_id: fixture.chunk.id.clone(),
+                chunk_offset: 0,
+                length: fixture.chunk.length,
+            })
+            .collect()
+    }
+
+    fn requests(&self) -> Vec<usize> {
+        self.requests.lock().unwrap().iter().map(Vec::len).collect()
+    }
+
+    fn fetches(&self) -> Vec<usize> {
+        self.chunks
+            .iter()
+            .map(|fixture| *fixture.fetches.lock().unwrap() as usize)
+            .collect()
+    }
+}
+
+impl ExternalReadAuthorizer for AheadChunks {
+    fn authorize_external_version_read(
+        &self,
+        request: AuthorizeExternalVersionRead,
+    ) -> Result<Option<AuthorizeExternalVersionReadReply>> {
+        self.requests.lock().unwrap().push(
+            request
+                .requests
+                .iter()
+                .map(|op| op.chunk_id.clone())
+                .collect(),
+        );
+        let refused = self.refuse.lock().unwrap().clone();
+        let mut authorizations = Vec::new();
+        for op in request.requests {
+            if refused.as_ref() == Some(&op.chunk_id) {
+                return Err(external_denied("chunk is outside the committed layout"));
+            }
+            let fixture = self
+                .chunks
+                .iter()
+                .find(|fixture| fixture.chunk.id == op.chunk_id)
+                .unwrap();
+            let mut grant = fixture.candidate.read_grant.clone();
+            grant.namespace_id = request.namespace_id.clone();
+            grant.file_version_id = request.file_version_id.clone();
+            grant.layout_root_id = request.layout_root_id.clone();
+            authorizations.extend(fixture.validate_external_read_grants(
+                &request.caller_id,
+                vec![DfsReadValidation {
+                    grant,
+                    chunk_id: op.chunk_id,
+                    copy_id: fixture.candidate.copy_id.clone(),
+                    chunk_offset: op.chunk_offset,
+                    length: op.length,
+                }],
+            )?);
+        }
+        Ok(Some(AuthorizeExternalVersionReadReply {
+            authorizations,
+            remaining_validity_ms: 5_000,
+        }))
+    }
+
+    fn validate_external_read_grants(
+        &self,
+        _: &str,
+        _: Vec<DfsReadValidation>,
+    ) -> Result<Vec<DfsExternalAuthorizedRead>> {
+        panic!("fixed-version reads do not validate current grants")
+    }
+}
+
+impl ExternalChunkReader for AheadChunks {
+    fn read_chunk(
+        &self,
+        chunk: &ChunkObject,
+        source: &SourceCandidate,
+    ) -> Result<VerifiedExternalChunk> {
+        self.chunks
+            .iter()
+            .find(|fixture| fixture.chunk.id == chunk.id)
+            .unwrap()
+            .read_chunk(chunk, source)
+    }
+}
+
+#[test]
+fn external_version_read_ahead_authorizes_following_chunks_in_the_same_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let chunks = AheadChunks::new(3);
+    let engine = chunks.engine(&temp);
+    let inode = crate::dfs::InodeId::new("inode");
+    let ahead_calls = std::sync::atomic::AtomicUsize::new(0);
+    let read = |index: usize| {
+        let mut out = [0; 2];
+        engine
+            .read_batch_external_version_ahead(
+                &inode,
+                &chunks.chunks[index].batch(),
+                &mut out,
+                &|| {
+                    ahead_calls.fetch_add(1, Ordering::SeqCst);
+                    chunks.ahead(index + 1..3)
+                },
+            )
+            .map(|_| out)
+    };
+    assert_eq!(&read(0).unwrap(), b"aa");
+    // One request for this read's chunk and both that follow; only this
+    // read's chunk was fetched.
+    assert_eq!(chunks.requests(), vec![3]);
+    assert_eq!(chunks.fetches(), vec![1, 0, 0]);
+    // The following chunks need no Meta round trip, even with Meta refusing.
+    *chunks.refuse.lock().unwrap() = Some(chunks.chunks[1].chunk.id.clone());
+    assert_eq!(&read(1).unwrap(), b"bb");
+    *chunks.refuse.lock().unwrap() = Some(chunks.chunks[2].chunk.id.clone());
+    assert_eq!(&read(2).unwrap(), b"cc");
+    assert_eq!(chunks.requests(), vec![3]);
+    assert_eq!(chunks.fetches(), vec![1, 1, 1]);
+    assert_eq!(
+        ahead_calls.load(Ordering::SeqCst),
+        1,
+        "read-ahead is computed only on a cache miss"
+    );
+}
+
+#[test]
+fn external_version_read_ahead_refusal_never_fails_or_invalidates_the_read() {
+    let temp = tempfile::tempdir().unwrap();
+    let chunks = AheadChunks::new(3);
+    let engine = chunks.engine(&temp);
+    let inode = crate::dfs::InodeId::new("inode");
+    let read = |index: usize, ahead: std::ops::Range<usize>| {
+        let mut out = [0; 2];
+        engine
+            .read_batch_external_version_ahead(
+                &inode,
+                &chunks.chunks[index].batch(),
+                &mut out,
+                &|| chunks.ahead(ahead.clone()),
+            )
+            .map(|_| out)
+    };
+    // Authority for chunk 0 is cached first.
+    assert_eq!(&read(0, 0..0).unwrap(), b"aa");
+    // Meta refuses the widened request because of a read-ahead chunk: the
+    // read is repeated for itself alone and succeeds.
+    *chunks.refuse.lock().unwrap() = Some(chunks.chunks[2].chunk.id.clone());
+    assert_eq!(&read(1, 2..3).unwrap(), b"bb");
+    assert_eq!(chunks.requests(), vec![1, 2, 1]);
+    // The refused widened request invalidated nothing: chunk 0 is still cached.
+    assert_eq!(&read(0, 0..0).unwrap(), b"aa");
+    assert_eq!(chunks.requests().len(), 3);
+    // A refusal of the read's own chunk still fails it. (Its read-ahead,
+    // chunk 0, is cached, so the request is not widened.)
+    let error = read(2, 0..1).unwrap_err();
+    assert_eq!(error.code(), external_denied("x").code());
+    assert_eq!(chunks.requests(), vec![1, 2, 1, 1]);
+    assert_eq!(chunks.fetches(), vec![2, 1, 0]);
+}
+
+#[test]
+fn external_version_read_ahead_is_bounded_and_skips_known_chunks() {
+    let temp = tempfile::tempdir().unwrap();
+    let chunks = AheadChunks::new(24);
+    let engine = chunks.engine(&temp);
+    let inode = crate::dfs::InodeId::new("inode");
+    let read = |index: usize, ahead: Vec<crate::dfs::DfsMissingReadSource>| {
+        let mut out = [0; 2];
+        engine
+            .read_batch_external_version_ahead(
+                &inode,
+                &chunks.chunks[index].batch(),
+                &mut out,
+                &|| ahead.clone(),
+            )
+            .unwrap();
+    };
+    // The read's own chunk, a duplicate and an empty range are not asked for;
+    // the rest is cut at the window.
+    let mut ahead = chunks.ahead(0..2);
+    ahead.extend(chunks.ahead(1..24));
+    ahead.push(crate::dfs::DfsMissingReadSource {
+        chunk_id: chunks.chunks[23].chunk.id.clone(),
+        chunk_offset: 0,
+        length: 0,
+    });
+    read(0, ahead);
+    assert_eq!(chunks.requests(), vec![1 + MAX_EXTERNAL_AUTHORITY_AHEAD]);
+    let asked = chunks.requests.lock().unwrap()[0].clone();
+    let expected: Vec<_> = chunks.chunks[..=MAX_EXTERNAL_AUTHORITY_AHEAD]
+        .iter()
+        .map(|fixture| fixture.chunk.id.clone())
+        .collect();
+    assert_eq!(asked, expected);
+    // The next miss asks only for what is not cached yet.
+    read(17, chunks.ahead(15..20));
+    assert_eq!(chunks.requests.lock().unwrap()[1].len(), 3);
 }

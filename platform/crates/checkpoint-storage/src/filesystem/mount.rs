@@ -70,7 +70,11 @@ fn identify(info: &str, path: &Path) -> Result<Identity> {
             && tail[1]
                 .strip_prefix("JuiceFS:")
                 .is_some_and(|name| !name.is_empty());
-        let valid = afs || juicefs;
+        let nfs = matches!(tail[0], "nfs" | "nfs4")
+            && tail[1]
+                .rsplit_once(":/")
+                .is_some_and(|(server, _)| !server.is_empty());
+        let valid = afs || juicefs || nfs;
         if !valid || found.is_some() {
             return Err(Error::Unavailable(
                 "shared filesystem mountpoint is covered or ambiguous".into(),
@@ -100,10 +104,13 @@ mod tests {
         let juicefs = "18 1 0:43 / /mnt/shared rw - fuse.juicefs JuiceFS:adx-test rw\n";
         assert!(identify(afs, root).is_ok());
         assert!(identify(juicefs, root).is_ok());
+        let nfs = "19 1 0:44 / /mnt/shared rw - nfs4 192.0.2.11:/checkpoints rw\n";
+        assert!(identify(nfs, root).is_ok());
         for text in [
             "",
             "18 1 8:1 / /mnt/shared rw - ext4 /dev/vda rw\n",
             "18 1 0:43 / /mnt/shared rw - fuse.other JuiceFS:adx-test rw\n",
+            "19 1 0:44 / /mnt/shared rw - nfs4 /local/checkpoints rw\n",
         ] {
             assert!(identify(text, root).is_err());
         }

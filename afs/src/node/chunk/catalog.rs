@@ -194,11 +194,12 @@ pub(super) fn append_catalog_txn(
     txn: &CatalogTxn,
     metrics: Option<&super::super::metrics::work::ReadWorkMetrics>,
 ) -> Result<()> {
-    append_catalog_txn_observed(path, txn, metrics, |_| Ok(()))
+    append_catalog_txn_observed(path, &AtomicBool::new(false), txn, metrics, |_| Ok(()))
 }
 
 pub(super) fn append_catalog_txn_observed(
     path: &Path,
+    name_durable: &AtomicBool,
     txn: &CatalogTxn,
     metrics: Option<&super::super::metrics::work::ReadWorkMetrics>,
     observe_capacity: impl FnOnce(usize) -> Result<()>,
@@ -232,21 +233,34 @@ pub(super) fn append_catalog_txn_observed(
             metrics.coarse_diagnostic("persist_catalog_write", encoded.len() as u64)
         });
         file.write_all(&encoded).map_err(Error::from)?;
+        #[cfg(test)]
+        catalog_power_loss_tests::cut("WAL appended");
     }
     {
         let _diagnostic = metrics.and_then(|metrics| {
             metrics.coarse_diagnostic("persist_catalog_sync", encoded.len() as u64)
         });
         file.sync_all().map_err(Error::from)?;
+        #[cfg(test)]
+        catalog_power_loss_tests::file_synced(path);
+    }
+    if name_durable.load(Ordering::Relaxed) {
+        return Ok(());
     }
     let parent = path
         .parent()
         .ok_or_else(|| invalid("local chunk catalog has no parent directory"))?;
     let _diagnostic =
         metrics.and_then(|metrics| metrics.coarse_diagnostic("persist_catalog_parent_sync", 0));
+    #[cfg(test)]
+    catalog_power_loss_tests::before_wal_parent()?;
     File::open(parent)
         .and_then(|directory| directory.sync_all())
-        .map_err(Error::from)
+        .map_err(Error::from)?;
+    #[cfg(test)]
+    catalog_power_loss_tests::directory_synced(parent);
+    name_durable.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 pub(super) fn catalog_checksum(revision: u64, records: &[LocalChunkRecord]) -> Result<String> {
@@ -267,6 +281,8 @@ pub(super) fn sync_store_catalog(path: &Path) -> Result<()> {
         .and_then(|file| file.sync_all())
         .map_err(Error::from)?;
     #[cfg(test)]
+    catalog_power_loss_tests::file_synced(path);
+    #[cfg(test)]
     STORE_CATALOG_SYNCS.with(|syncs| {
         if let Some(syncs) = syncs.borrow_mut().as_mut() {
             syncs.push(path.to_path_buf());
@@ -286,6 +302,8 @@ pub(super) fn sync_store_directory(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(Error::from)?;
+    #[cfg(test)]
+    catalog_power_loss_tests::directory_synced(path);
     #[cfg(test)]
     STORE_DIRECTORY_SYNCS.with(|syncs| {
         if let Some(syncs) = syncs.borrow_mut().as_mut() {

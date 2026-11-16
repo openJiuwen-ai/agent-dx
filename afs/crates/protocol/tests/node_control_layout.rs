@@ -38,6 +38,9 @@ fn node_control_rpcs_are_split_by_backend() {
         rpcs_of(proto, "OwnerControl"),
         [
             "PrepareOwnerRoot",
+            "WorkspaceDefaults",
+            "DeleteWorkspace",
+            "WorkspaceAttributes",
             "OwnerGetLock",
             "OwnerSetLock",
             "OwnerAckLockWait",
@@ -76,7 +79,10 @@ fn service_paths_keep_the_package() {
 /// Nodes are refused at registration instead of failing per call at runtime.
 /// Generation 5 pages `DfsMeta.ReadDir` (S4a R72); generation 6 carries the
 /// replica failure contract in placement snapshots and write grants (S4b R12).
+/// Generation 7 adds the attributed commit to the proxy sync receipt.
+/// Generation 8 folds DFS metadata round trips into composite operations.
+/// Generation 9 adds the OwnerFs Workspace API RPCs.
 #[test]
 fn cluster_protocol_generation_includes_the_split_layout() {
-    assert_eq!(CLUSTER_PROTOCOL_VERSION, 7);
+    assert_eq!(CLUSTER_PROTOCOL_VERSION, 9);
 }

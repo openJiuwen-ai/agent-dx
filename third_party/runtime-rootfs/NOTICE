@@ -1,0 +1,15 @@
+The default Linux runtime filesystem is derived from the official
+openeuler/openeuler:24.03-lts OCI image. source.json pins each platform's
+OCI manifest digest and the immutable, checksum-verified filesystem archive.
+
+The base archives retain the distribution's package metadata, copyright
+notices and licenses under /usr/share/licenses and /usr/share/doc.
+Per-sandbox hostname, hosts and resolv.conf files are supplied at runtime,
+not copied from the container used to export the base filesystem.
+
+Upstream distribution: https://www.openeuler.org/
+Container packaging: https://gitee.com/openeuler/openeuler-docker-images
+Package sources and corresponding licenses: https://repo.openeuler.org/openEuler-24.03-LTS/source/
+
+ADX adds its static Execd executable and, when explicitly enabled, envd.
+Their licenses remain separate from the distribution's package licenses.

@@ -164,6 +164,57 @@ impl Drop for Proxy {
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run storage suite"]
+async fn discovery_recovers_an_idle_proxy_close_in_the_current_lookup() {
+    let redis = common::Redis::new().await;
+    let session = redis.store().await.begin(1).await.unwrap();
+    session
+        .advertise("test", "http://127.0.0.1:9000", Duration::from_secs(60))
+        .await
+        .unwrap();
+    let proxy = Proxy::new(&redis.url).await;
+    let discovery =
+        adx_discovery::RedisDiscovery::new(&proxy.url, "test", Duration::from_secs(1)).unwrap();
+    let expected = discovery.lookup().await.unwrap();
+
+    // Close only this test's cached proxy socket, as an idle intermediary does.
+    // Await both directions so the fault is established before the next call.
+    let tasks: Vec<_> = proxy.tasks.lock().unwrap().drain(..).collect();
+    for task in tasks {
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+    assert_eq!(discovery.lookup().await.unwrap(), expected);
+    assert_eq!(proxy.tasks.lock().unwrap().len(), 2);
+    assert_eq!(discovery.lookup().await.unwrap(), expected);
+    assert_eq!(proxy.tasks.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run storage suite"]
+async fn discovery_fails_closed_during_redis_outage_and_recovers_after_restart() {
+    let mut redis = common::Redis::new().await;
+    let session = redis.store().await.begin(1).await.unwrap();
+    session
+        .advertise("test", "http://127.0.0.1:9000", Duration::from_secs(60))
+        .await
+        .unwrap();
+    let discovery =
+        adx_discovery::RedisDiscovery::new(&redis.url, "test", Duration::from_millis(200)).unwrap();
+    let expected = discovery.lookup().await.unwrap();
+    redis.crash();
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        discovery.lookup().await,
+        Err(Error::Unavailable(_))
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    redis.start().await;
+    assert_eq!(discovery.lookup().await.unwrap(), expected);
+}
+
 fn record(id: &str) -> EnvironmentRecord {
     running(
         spec(id),

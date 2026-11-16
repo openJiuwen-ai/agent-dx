@@ -23,6 +23,14 @@ fn bump_lease_epoch(meta: &RecordingMeta) -> u64 {
     lease.lease_epoch
 }
 
+fn retry_background_commit_when_due(fs: &DistributedFs, meta: &RecordingMeta) {
+    let inode = meta.inode.lock().unwrap().inode_id.clone();
+    let state = fs.write_state(&inode).unwrap().unwrap();
+    let retry_at = state.lock().unwrap().writeback_retry_at.unwrap();
+    std::thread::sleep(retry_at.saturating_duration_since(Instant::now()));
+    fs.writeback_pending().unwrap();
+}
+
 /// 后台提交失败后，同一句柄的 fsync 报告该错误一次，下一次 fsync 重试并成功提交。
 #[test]
 fn s2_background_commit_failure_reaches_the_same_handle_fsync_once() {
@@ -56,7 +64,7 @@ fn s2_unobserved_background_error_is_returned_by_release() {
         "{error}"
     );
     // 交付后后台重试照常进行，数据最终提交。
-    fs.writeback_pending().unwrap();
+    retry_background_commit_when_due(&fs, &meta);
     assert_eq!(meta.commit_count(), 1);
 }
 
@@ -122,7 +130,7 @@ fn s2_orphan_background_error_reaches_the_next_writer_once_after_lease_change() 
     fs.writeback_pending().unwrap();
     assert_eq!(meta.commit_count(), 0);
     // 后台重试成功，只剩一个没人看到的错误。
-    fs.writeback_pending().unwrap();
+    retry_background_commit_when_due(&fs, &meta);
     assert_eq!(meta.commit_count(), 1);
 
     bump_lease_epoch(&meta);

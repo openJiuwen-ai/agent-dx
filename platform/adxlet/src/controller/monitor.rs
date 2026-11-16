@@ -111,7 +111,7 @@ impl Controller {
                                         self.operation_intent(
                                             adx_core::observation::OperationIntent::Idle,
                                         );
-                                        self.delete().await?;
+                                        self.delete(false).await?;
                                     }
                                     adx_core::lifecycle::IdleAction::Pause => {
                                         let policy = self

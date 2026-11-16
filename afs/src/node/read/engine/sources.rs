@@ -693,7 +693,7 @@ impl DfsReadEngine {
                     None => misses.push(op.chunk_id.clone()),
                 }
             }
-            if seen.len() > MAX_DFS_READ_OPS {
+            if !self.has_external_backend() && seen.len() > MAX_DFS_READ_OPS {
                 return Err(invalid("DFS source lookup exceeds 128 mandatory Chunk IDs"));
             }
             if !misses.is_empty() {

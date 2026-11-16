@@ -1,3 +1,4 @@
+use adx_core::scheduling::NODE_HOST_UUID_LABEL;
 use adx_process::{read_config, shutdown};
 use adx_protocol::control as pb;
 use adx_transport::rpc::{RpcChannel, RpcClient};
@@ -14,7 +15,16 @@ use adxlet::{
     Adxlet,
 };
 use serde::Deserialize;
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+const DMI_HOST_UUID_PATH: &str = "/sys/class/dmi/id/product_uuid";
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -70,9 +80,19 @@ struct Config {
     #[serde(default)]
     runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     #[serde(default)]
+    checkpoint_runtime_binaries: BTreeMap<String, PathBuf>,
+    #[serde(default)]
+    local_rootfs_templates: BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
+    #[serde(default)]
     execd_command: Vec<String>,
     #[serde(default)]
     execd_env: HashMap<String, String>,
+    #[serde(default)]
+    network_baseline: Option<adxlet::network_baseline::NetworkBaseline>,
+    #[serde(default)]
+    network_peer_aliases: BTreeMap<String, ipnet::Ipv4Net>,
+    #[serde(default)]
+    platform_ingress_sources: Option<Vec<ipnet::Ipv4Net>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -95,6 +115,23 @@ fn runtime_ready_timeout() -> u64 {
 }
 fn execd_ready_poll_interval() -> Duration {
     Duration::from_millis(10)
+}
+
+fn read_host_uuid(path: &Path) -> std::io::Result<uuid::Uuid> {
+    let value = std::fs::read_to_string(path)?;
+    let id = value.trim().parse::<uuid::Uuid>().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed DMI product UUID",
+        )
+    })?;
+    if id.is_nil() || id.as_u128() == u128::MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "placeholder DMI product UUID",
+        ));
+    }
+    Ok(id)
 }
 async fn sample(
     source: &ResourceSource,
@@ -131,6 +168,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
     let mut preserve =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    if let Some(baseline) = &config.network_baseline {
+        baseline.validate()?;
+    }
+    adxlet::network_baseline::validate_peer_aliases(&config.network_peer_aliases)?;
+    if config
+        .platform_ingress_sources
+        .as_ref()
+        .is_some_and(|sources| sources.is_empty())
+    {
+        return Err("platform_ingress_sources must not be empty".into());
+    }
     if config.sandboxd_socket.is_none() && config.jiuwenbox.is_none() {
         return Err("configure sandboxd_socket and/or jiuwenbox".into());
     }
@@ -249,13 +297,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
         })
         .transpose()?;
+    let local_rootfs_labels = config
+        .local_rootfs_templates
+        .keys()
+        .map(|name| {
+            adx_core::local_rootfs::capability_label(name).map(|key| (key, "ready".to_owned()))
+        })
+        .collect::<adx_core::Result<HashMap<_, _>>>()?;
     let runtime_config = RuntimeConfig {
         runtime_profile: config.runtime_profile,
+        checkpoint_runtime_binaries: config.checkpoint_runtime_binaries,
+        local_rootfs_templates: config.local_rootfs_templates,
         command: config.execd_command,
         env,
         cwd: "/".into(),
         rpc_timeout: timeout,
         runtime_logs: Some(config.runtime_logs.clone()),
+        network_baseline: config.network_baseline,
+        network_peer_aliases: config.network_peer_aliases,
+        platform_ingress_sources: config.platform_ingress_sources,
     };
     let jiuwenbox = match config.jiuwenbox {
         Some(backend) => Some(Jiuwenbox::connect(backend, runtime_config.clone()).await?),
@@ -301,6 +361,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_sink,
     )
     .with_runtime_control(control.clone())?
+    .with_upgrade_control(
+        config.proxy_socket.with_file_name("upgrade-control.json"),
+        session_id.clone(),
+    )?
     .with_operation_timeout(timeout)?
     .with_health_check(config.execd_health_failure_threshold)?;
     let checkpoint_storage = match (config.checkpoint_dir, config.checkpoint_storage) {
@@ -310,20 +374,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("configure only one of checkpoint_dir and checkpoint_storage".into())
         }
     };
-    let checkpoint_scopes = checkpoint_storage
-        .as_ref()
-        .and_then(adxlet::checkpoint::StorageConfig::shared_scope)
-        .into_iter()
-        .collect();
+    let mut checkpoint_scopes = Vec::new();
     if let Some(storage) = checkpoint_storage {
+        let storage = storage.build_for_node(config.node_id.clone(), session_id.clone())?;
+        checkpoint_scopes.extend(storage.shared_scope().map(str::to_owned));
         manager = manager
-            .with_checkpointing(
-                storage.build_for_node(config.node_id.clone(), session_id.clone())?,
-                Arc::new(control.clone()),
-            )?
+            .with_checkpointing(storage, Arc::new(control.clone()))?
             .with_snapshot_catalog(sink.clone())?;
     }
     let manager = Arc::new(manager);
+    if std::env::var("ADX_NODE_UPGRADE_ISOLATED").as_deref() == Ok("true") {
+        manager.isolate_upgrade_bootstrap()?;
+    }
     manager.pause_lifecycle().await;
     let (o, valid) = loop {
         match sample(&source, &runtime, timeout).await {
@@ -352,6 +414,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut labels = config.labels;
+    labels.retain(|key, _| !key.starts_with("ADX_RECOVERY_") && key != "ADX_CHECKPOINT_SCOPE");
+    labels.extend(runtime.recovery_labels());
+    if let Some(scope) = checkpoint_scopes.first() {
+        labels.insert("ADX_CHECKPOINT_SCOPE".into(), scope.clone());
+    }
+    labels.extend(local_rootfs_labels);
+    labels.remove(NODE_HOST_UUID_LABEL);
+    match read_host_uuid(Path::new(DMI_HOST_UUID_PATH)) {
+        Ok(host_uuid) => {
+            labels.insert(NODE_HOST_UUID_LABEL.into(), host_uuid.to_string());
+        }
+        Err(error) => adx_observability::warn!(
+            node_id = %config.node_id,
+            path = DMI_HOST_UUID_PATH,
+            %error,
+            "worker host UUID unavailable; registration will preserve any existing scheduling pause"
+        ),
+    }
     if let Some(alias) = manager.checkpoint_storage_alias() {
         labels.insert("ADX_CHECKPOINT_STORAGE".into(), alias.into());
     }
@@ -410,7 +490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
         loop {
-            interval.tick().await;
+            manager.wait_for_reconciliation(&mut interval).await;
             if let Some(discovery) = &discovery {
                 match discovery.lookup().await {
                     Ok(found) if found.address != endpoint => {
@@ -576,6 +656,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dmi_host_uuid_is_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("product_uuid");
+        std::fs::write(&path, "ABCDEF12-3456-4789-ABCD-EF1234567890\n").unwrap();
+        assert_eq!(
+            read_host_uuid(&path).unwrap().to_string(),
+            "abcdef12-3456-4789-abcd-ef1234567890"
+        );
+    }
+
+    #[test]
+    fn dmi_host_uuid_distinguishes_missing_and_invalid_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("product_uuid");
+        assert_eq!(
+            read_host_uuid(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        for value in [
+            "not a UUID",
+            "00000000-0000-0000-0000-000000000000",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        ] {
+            std::fs::write(&path, value).unwrap();
+            assert_eq!(
+                read_host_uuid(&path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
 
     // A single-method service probes the production Coordinator channel without
     // requiring Redis or reproducing Coordinator scheduling in this fixture.

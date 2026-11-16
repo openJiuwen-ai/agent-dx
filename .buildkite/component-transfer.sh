@@ -2,14 +2,21 @@
 set -euo pipefail
 operation=${1:?upload or download}
 component=${2:?component}
+group=$component
+step="build-$component"
+case "${ADX_BUILD_ARCH:-amd64}" in
+  amd64) ;;
+  arm64) group+="-arm64"; step+="-arm64" ;;
+  *) echo 'ADX_BUILD_ARCH must be amd64 or arm64' >&2; exit 2 ;;
+esac
 case "${ADX_ARTIFACT_TRANSPORT:-obs}" in
   obs)
     python=${OBS_PYTHON:-/opt/buildtools/python3.9/bin/python3}
     if [[ ! -x "$python" ]]; then python=${PYTHON:-python3}; fi
     if [[ $operation == upload ]]; then
-      "$python" build/release/ci_transfer.py upload "$component" "out/buildkite/components/$component.tar.gz"
+      "$python" build/release/ci_transfer.py upload "$group" "out/buildkite/components/$component.tar.gz"
     elif [[ $operation == download ]]; then
-      "$python" build/release/ci_transfer.py download "$component" out/buildkite/components
+      "$python" build/release/ci_transfer.py download "$group" out/buildkite/components
     else
       echo 'invalid transfer operation' >&2; exit 2
     fi
@@ -18,7 +25,7 @@ case "${ADX_ARTIFACT_TRANSPORT:-obs}" in
     if [[ $operation == upload ]]; then
       buildkite-agent artifact upload "out/buildkite/components/$component.tar.gz"
     elif [[ $operation == download ]]; then
-      buildkite-agent artifact download "out/buildkite/components/$component.tar.gz" . --step "build-$component"
+      buildkite-agent artifact download "out/buildkite/components/$component.tar.gz" . --step "$step"
     else
       echo 'invalid transfer operation' >&2; exit 2
     fi

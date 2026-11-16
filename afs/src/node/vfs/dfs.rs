@@ -33,6 +33,7 @@ mod handles;
 mod identity;
 mod inode_map;
 mod lazy_fill;
+mod lease_handoff;
 mod lock_authority;
 mod lock_entry;
 mod lock_proxy_client;
@@ -44,6 +45,7 @@ pub mod owner_api;
 mod owner_gateway;
 mod owner_op_table;
 mod read_view;
+mod recent_names;
 mod remote_client;
 mod sharded;
 #[cfg(test)]
@@ -63,9 +65,10 @@ use gc::*;
 use handles::*;
 use identity::*;
 use inode_map::*;
+use lease_handoff::LeaseHandoff;
 use lock_authority::*;
 use lock_proxy_client::*;
-pub use meta_port::{DfsMeta, DfsNodeLocation, DfsRemoteOwnerFactory};
+pub use meta_port::{DfsMeta, DfsNodeLocation, DfsRemoteOwnerFactory, OpenedForRead};
 use owner_api::RemoteDfsOwner;
 use owner_gateway::*;
 use owner_op_table::*;
@@ -141,7 +144,9 @@ pub struct DistributedFs {
     versions: VersionCache,
     gc: GcCoordinator,
     writes: InodeWriteTable,
+    lease_handoff: LeaseHandoff,
     write_resources: WriteResources,
+    write_timeout: Duration,
     locks: LockService,
     #[cfg(test)]
     hooks: TestHooks,
@@ -156,6 +161,8 @@ pub struct DistributedFs {
     owner_gateway: OwnerGateway,
     /// Proxies writes for inodes another node session owns.
     write_coordinator: WriteCoordinator,
+    /// Names handed to the kernel recently, for the open-time name check.
+    recent_names: recent_names::RecentNames,
 }
 
 const DFS_HANDLE_SHARDS: usize = 64;
@@ -175,6 +182,11 @@ const REMOTE_LOCK_SESSION_PENDING_CLOSE: usize = 0;
 const REMOTE_LOCK_SESSION_ACTIVE: usize = 1;
 
 impl DistributedFs {
+    pub(crate) fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout;
+        self
+    }
+
     pub(crate) fn start_distributed_cache(&self, services: &mut crate::runtime::Services) {
         self.read_engine.start_distributed_cache(services);
     }
@@ -198,7 +210,9 @@ impl DistributedFs {
             versions: VersionCache::default(),
             gc: GcCoordinator::default(),
             writes: InodeWriteTable::default(),
+            lease_handoff: LeaseHandoff::default(),
             write_resources: WriteResources::default(),
+            write_timeout: Duration::from_secs(30),
             locks: LockService::default(),
             #[cfg(test)]
             hooks: TestHooks::default(),
@@ -211,6 +225,7 @@ impl DistributedFs {
             lazy_fill_lifetime: Arc::new(tokio::sync::Semaphore::new(
                 tokio::sync::Semaphore::MAX_PERMITS,
             )),
+            recent_names: recent_names::RecentNames::default(),
         }
     }
 
@@ -220,6 +235,125 @@ impl DistributedFs {
     ) -> Self {
         self.gc.references = references;
         self
+    }
+
+    /// Enable the open-time name check for a mount whose kernel entry TTL is
+    /// `entry_ttl` (zero keeps the inode-only check), with its counters.
+    pub(crate) fn with_open_name_check(
+        mut self,
+        entry_ttl: Duration,
+        registry: Option<&afs_metrics::Registry>,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        let mut names =
+            recent_names::RecentNames::new(entry_ttl, recent_names::DEFAULT_NAME_RECORD_CAPACITY);
+        if let Some(registry) = registry {
+            names = names.with_metrics(recent_names::NameCheckMetrics::register(registry)?);
+        }
+        self.recent_names = names;
+        Ok(self)
+    }
+
+    /// The inode record an open starts from. When the inode was reached
+    /// through exactly one name recently handed to the kernel, ask Meta for
+    /// that name (one RPC, as `GetInode`) and answer `ESTALE` if it no longer
+    /// names this inode: Linux repeats the path walk once and opens what the
+    /// name holds now (see `recent_names`). `pid` is the FUSE request's
+    /// thread id (0 when unknown): the kernel's retry of this open comes from
+    /// the same thread and is not compared again.
+    fn open_preflight(&self, inode_id: &InodeId, pid: u32) -> Result<InodeRecord> {
+        let on_error = |error: &Error| self.invalidate_native_inode_views_on_error(inode_id, error);
+        match self.recent_names.check(inode_id, pid) {
+            recent_names::NameCheck::Verify { parent, name } => {
+                match self.meta.lookup(&parent, &name).inspect_err(on_error)? {
+                    Some(record) if record.inode_id == *inode_id => Ok(record),
+                    _ => {
+                        self.recent_names.mark_stale(inode_id, &parent, &name, pid);
+                        Err(Error::coded(
+                            afs_error::NODE_DFS_STALE_NAME,
+                            "DFS name no longer names the opened inode",
+                        ))
+                    }
+                }
+            }
+            recent_names::NameCheck::Fallback(_) => {
+                self.meta.get_inode(inode_id).inspect_err(on_error)
+            }
+        }
+    }
+
+    /// Round 2 B2: the read-open preflight of `open_preflight` in one Meta
+    /// call that also registers the opened head as an in-memory reader
+    /// (C-1) and says whether another session writes the inode (D-R3-2 ③).
+    /// Returns the inode, the reader pin when Meta registered one, and that
+    /// flag. Without GC references (or with reader pins switched off) it is
+    /// `open_preflight`.
+    pub(super) fn open_preflight_for_read(
+        &self,
+        inode_id: &InodeId,
+        pid: u32,
+    ) -> Result<(InodeRecord, Option<Arc<crate::node::gc::GcPin>>, bool)> {
+        #[cfg(feature = "diagnostics")]
+        let unpinned_reader = crate::node::fault::experiment::reader_pin_off();
+        #[cfg(not(feature = "diagnostics"))]
+        let unpinned_reader = false;
+        let Some(references) = self.gc.references.as_ref().filter(|_| !unpinned_reader) else {
+            return Ok((self.open_preflight(inode_id, pid)?, None, false));
+        };
+        let on_error = |error: &Error| self.invalidate_native_inode_views_on_error(inode_id, error);
+        let name = match self.recent_names.check(inode_id, pid) {
+            recent_names::NameCheck::Verify { parent, name } => Some((parent, name)),
+            recent_names::NameCheck::Fallback(_) => None,
+        };
+        let mut reported = false;
+        loop {
+            let Some(reader) = references.begin_reader()? else {
+                return Ok((self.open_preflight(inode_id, pid)?, None, false));
+            };
+            let opened = self.meta.open_file_read(
+                reader,
+                inode_id,
+                name.as_ref()
+                    .map(|(parent, name)| (parent, name.as_slice())),
+            );
+            let opened = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    references.finish_reader(reader, None)?;
+                    if error.code() == afs_error::META_DFS_SESSION_NOT_REPORTED && !reported {
+                        // This Meta has not heard from this session yet.
+                        references.report_readers()?;
+                        reported = true;
+                        continue;
+                    }
+                    on_error(&error);
+                    return Err(error);
+                }
+            };
+            let pin = references.finish_reader(
+                reader,
+                opened
+                    .inode
+                    .as_ref()
+                    .filter(|_| opened.registered)
+                    .map(|inode| {
+                        (
+                            opened.meta_term,
+                            &inode.inode_id,
+                            inode.head_version.as_ref(),
+                        )
+                    }),
+            )?;
+            let Some(inode) = opened.inode else {
+                if let Some((parent, name)) = &name {
+                    self.recent_names.mark_stale(inode_id, parent, name, pid);
+                }
+                return Err(Error::coded(
+                    afs_error::NODE_DFS_STALE_NAME,
+                    "DFS name no longer names the opened inode",
+                ));
+            };
+            return Ok((inode, pin, opened.writer_elsewhere));
+        }
     }
 
     /// Register inode write-state lock contention counters with the Node registry.

@@ -145,10 +145,26 @@ pub struct DfsWriteSession {
 
 pub(super) struct ResolvedReadView {
     pub(super) committed: Option<FileVersionId>,
+    /// The GC reference that keeps `committed` while this read uses it (R94).
+    pub(super) base_reference: Option<Arc<crate::node::gc::GcPin>>,
     pub(super) length: u64,
     pub(super) layout: LayoutRoot,
     pub(super) frozen: Option<DirtyExtentMap>,
     pub(super) active: DirtyExtentMap,
+}
+
+/// A file version that durably incorporated a proxied handle's writes.
+#[derive(Clone, Eq, PartialEq)]
+pub(super) struct ProxiedCommit {
+    pub(super) version: FileVersionId,
+    pub(super) revision: u64,
+}
+
+#[derive(Default)]
+pub(super) struct ProxiedWriteProgress {
+    pending: bool,
+    frozen: bool,
+    committed: Option<ProxiedCommit>,
 }
 
 pub(super) struct InodeWriteState {
@@ -156,9 +172,27 @@ pub(super) struct InodeWriteState {
     pub(super) write_lease: WriteLease,
     pub(super) base_version: Option<FileVersion>,
     pub(super) base_layout: LayoutRoot,
+    /// The GC reference of `base_version` that reads through this state share,
+    /// taken by the first such read (R94). A write lease, or a writer still
+    /// open, does not keep the base: the lease can lapse while a writer is open
+    /// and this Node's next commit retires the base as head.
+    pub(super) base_read_reference: Option<(FileVersionId, Arc<crate::node::gc::GcPin>)>,
+    /// Only open proxy writers that have changed file data have an entry.
+    /// Pending mutations and the frozen commit are recorded under this lock.
+    pub(super) proxied_writes: HashMap<DfsWriteSessionId, ProxiedWriteProgress>,
     pub(super) logical_length: u64,
     pub(super) metadata_dirty: bool,
     pub(super) kill_suidgid_dirty: bool,
+    /// A write generation Meta admitted with the file's Create (B1): the
+    /// first write of a new file adopts it instead of admitting its own.
+    pub(super) prepared_generation: Option<(OperationId, Arc<crate::node::gc::GcPin>)>,
+    /// The mtime of the last inode record this state took from Meta, before
+    /// local write times override it: tells an explicit time set elsewhere
+    /// (Meta's mtime moved) from an unrelated inode update (B5).
+    pub(super) meta_mtime_unix_ms: u64,
+    /// Metadata-only syncs rebuilt in a row after Meta refused them on a
+    /// changed inode; bounded by `METADATA_SYNC_REBUILD_LIMIT`.
+    pub(super) metadata_sync_rebuilds: u32,
     pub(super) dirty_extents: DirtyExtentMap,
     pub(super) in_flight: Option<InFlightCommit>,
     pub(super) commit_busy: bool,
@@ -176,6 +210,8 @@ pub(super) struct InodeWriteState {
     pub(super) open_writers: u64,
     pub(super) last_writer_background_requested: bool,
     pub(super) background_error: Option<ObservedWriteError>,
+    pub(super) writeback_retry_at: Option<Instant>,
+    pub(super) writeback_failures: u32,
     pub(super) terminal_error: Option<Error>,
 }
 
@@ -210,6 +246,40 @@ impl Drop for InodeOperationGuard {
 }
 
 impl InodeWriteState {
+    pub(super) fn note_proxied_write(&mut self, writer: &DfsWriteSessionId) {
+        self.proxied_writes
+            .entry(writer.clone())
+            .or_default()
+            .pending = true;
+    }
+
+    pub(super) fn freeze_proxied_writes(&mut self) {
+        for write in self.proxied_writes.values_mut() {
+            write.frozen = std::mem::take(&mut write.pending);
+        }
+    }
+
+    pub(super) fn restore_proxied_writes(&mut self) {
+        for write in self.proxied_writes.values_mut() {
+            write.pending |= std::mem::take(&mut write.frozen);
+        }
+    }
+
+    pub(super) fn commit_proxied_writes(&mut self, version: &FileVersionId, revision: u64) {
+        for write in self.proxied_writes.values_mut() {
+            if std::mem::take(&mut write.frozen) {
+                write.committed = Some(ProxiedCommit {
+                    version: version.clone(),
+                    revision,
+                });
+            }
+        }
+    }
+
+    pub(super) fn proxied_commit(&self, writer: &DfsWriteSessionId) -> Option<ProxiedCommit> {
+        self.proxied_writes.get(writer)?.committed.clone()
+    }
+
     /// Anything a Node-wide writeback pass (progress, timer, upload start,
     /// lease renewal, resource accounting) may act on or count. A state
     /// without any of these is closed and published: no pass touches it.
@@ -505,9 +575,8 @@ impl DistributedFs {
 
     /// Meta definitively rejected this state's writes and every writer has left:
     /// they can never commit, and the failure was already returned or is retained
-    /// for the next writer. A state in this condition is discarded at the next
-    /// open for write (as Linux drops dirty pages after a reported writeback
-    /// failure); until then readers keep the Node's view.
+    /// for the next writer. A writable reopen discards this state only after
+    /// obtaining a fresh lease. Until then readers keep the Node's view.
     fn rejected_and_idle(state: &InodeWriteState) -> bool {
         state.terminal_error.is_some()
             && state.open_writers == 0
@@ -516,13 +585,6 @@ impl DistributedFs {
             && state.in_flight.is_none()
             && state.native_queue.values.is_empty()
             && state.native_thread.is_none()
-    }
-
-    fn write_state_is_rejected_and_idle(cell: &SharedInodeWriteState) -> Result<bool> {
-        let state = cell
-            .lock()
-            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-        Ok(Self::rejected_and_idle(&state))
     }
 
     fn discard_rejected_writes(state: &mut InodeWriteState) {
@@ -555,6 +617,7 @@ impl DistributedFs {
         base_layout: LayoutRoot,
         logical_length: u64,
     ) {
+        state.meta_mtime_unix_ms = inode.attributes.mtime_unix_ms;
         state.inode = inode;
         state.write_lease = write_lease;
         state.base_version = base_version;
@@ -590,6 +653,7 @@ impl DistributedFs {
         base_layout: LayoutRoot,
         logical_length: u64,
     ) {
+        state.meta_mtime_unix_ms = inode.attributes.mtime_unix_ms;
         state.inode = inode;
         state.base_version = base_version;
         state.base_layout = base_layout;
@@ -643,6 +707,67 @@ impl DistributedFs {
         Ok(())
     }
 
+    fn recover_rejected_write_state(
+        &self,
+        existing: &InodeWriteStateCell,
+        state: InodeWriteStateGuard<'_>,
+        inode: InodeRecord,
+        write_lease: WriteLease,
+    ) -> Result<()> {
+        if write_lease.inode_id != inode.inode_id
+            || Self::incoming_write_lease_is_older(&state, &write_lease)
+            || inode.revision < state.inode.revision
+            || (inode.revision == state.inode.revision
+                && inode.head_version != state.inode.head_version)
+        {
+            return Err(stale(
+                "DFS rejected write state has newer authority or file head",
+            ));
+        }
+        let previous_lease = state.write_lease.clone();
+        let previous_revision = state.inode.revision;
+        let previous_head = state.inode.head_version.clone();
+        let previous_sequence = state.next_write_seq;
+        let previous_error = state.terminal_error.clone();
+        drop(state);
+
+        let (base_version, base_layout) = self.load_version(inode.head_version.as_ref())?;
+        let logical_length = base_version.as_ref().map_or(0, |version| version.length);
+        let mut fresh_lease = write_lease.clone();
+        ensure_fresh(&mut fresh_lease, |lease| self.meta.renew_write_lease(lease))?;
+
+        let mut state = existing
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if !same_lease_identity(&write_lease, &fresh_lease) || should_renew(&fresh_lease) {
+            return Err(stale(
+                "DFS recovery did not obtain a fresh lease for this write authority",
+            ));
+        }
+        // A concurrent reopen or commit can advance this state while the RPC
+        // is in flight. Only clear the rejection that we took the snapshot of.
+        if !Self::rejected_and_idle(&state)
+            || state.write_lease != previous_lease
+            || state.inode.revision != previous_revision
+            || state.inode.head_version != previous_head
+            || state.next_write_seq != previous_sequence
+            || state.terminal_error != previous_error
+        {
+            return Err(stale("DFS rejected write state changed while recovering"));
+        }
+        Self::discard_rejected_writes(&mut state);
+        Self::apply_clean_fresh_write_state(
+            &mut state,
+            inode,
+            fresh_lease,
+            base_version,
+            base_layout,
+            logical_length,
+        );
+        existing.notify_all();
+        Ok(())
+    }
+
     pub(super) fn install_write_state(
         &self,
         inode: InodeRecord,
@@ -650,30 +775,13 @@ impl DistributedFs {
     ) -> Result<()> {
         self.ensure_local_write_owner(&write_lease)?;
         if let Some(existing) = self.write_state(&inode.inode_id)? {
-            if Self::write_state_is_rejected_and_idle(&existing)? {
-                let (base_version, base_layout) = self.load_version(inode.head_version.as_ref())?;
-                let logical_length = base_version.as_ref().map_or(0, |version| version.length);
-                let mut state = existing
-                    .lock()
-                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                if Self::rejected_and_idle(&state) {
-                    Self::discard_rejected_writes(&mut state);
-                    Self::apply_clean_fresh_write_state(
-                        &mut state,
-                        inode,
-                        write_lease,
-                        base_version,
-                        base_layout,
-                        logical_length,
-                    );
-                    existing.notify_all();
-                    return Ok(());
-                }
-            }
             {
                 let mut state = existing
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                if Self::rejected_and_idle(&state) {
+                    return self.recover_rejected_write_state(&existing, state, inode, write_lease);
+                }
                 if same_lease_identity(&state.write_lease, &write_lease) {
                     state.write_lease = merge_same_identity_lease(&state.write_lease, write_lease);
                     return Ok(());
@@ -734,9 +842,14 @@ impl DistributedFs {
                 write_lease,
                 base_version,
                 base_layout,
+                base_read_reference: None,
+                proxied_writes: HashMap::new(),
                 logical_length,
                 metadata_dirty: false,
                 kill_suidgid_dirty: false,
+                prepared_generation: None,
+                meta_mtime_unix_ms: inode.attributes.mtime_unix_ms,
+                metadata_sync_rebuilds: 0,
                 dirty_extents: DirtyExtentMap::default(),
                 in_flight: None,
                 commit_busy: false,
@@ -755,6 +868,8 @@ impl DistributedFs {
                 open_writers: 0,
                 last_writer_background_requested: false,
                 background_error: None,
+                writeback_retry_at: None,
+                writeback_failures: 0,
                 terminal_error: None,
             })
             .with_lock_wait(self.writes.lock_wait.clone()),
@@ -803,6 +918,7 @@ impl DistributedFs {
         })?;
         state.open_writers = state.open_writers.saturating_add(1);
         state.last_writer_background_requested = false;
+        self.cancel_idle_lease(&inode.inode_id)?;
         let session_id = DfsWriteSessionId::new(format!(
             "{}-write-session-{}",
             self.identity.session_id,
@@ -894,6 +1010,85 @@ impl DistributedFs {
         }
     }
 
+    /// Keeps the write generation admitted with the file's Create for its
+    /// first write. Dropped (and so released) if the state already has data
+    /// or a base version: the first write then admits its own generation.
+    pub(super) fn prepare_first_generation(
+        &self,
+        inode_id: &InodeId,
+        prepared: (OperationId, Arc<crate::node::gc::GcPin>),
+    ) -> Result<()> {
+        let Some(state) = self.write_state(inode_id)? else {
+            return Ok(());
+        };
+        let mut state = state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if state.base_version.is_none() && state.dirty_extents.is_empty() && !state.dirty {
+            state.prepared_generation = Some(prepared);
+        }
+        Ok(())
+    }
+
+    /// The prepared Create generation if it fits a new generation starting
+    /// from `base`: only a new file's empty base, which is what Meta pinned.
+    pub(super) fn prepared_generation_for(
+        cell: &SharedInodeWriteState,
+        base: Option<&FileVersionId>,
+    ) -> Result<Option<(OperationId, Arc<crate::node::gc::GcPin>)>> {
+        let mut state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if base.is_some() {
+            state.prepared_generation = None;
+            return Ok(None);
+        }
+        Ok(state.prepared_generation.take())
+    }
+
+    /// The write sequence the inode's local state has made visible, if any.
+    pub(super) fn visible_write_seq(&self, inode_id: &InodeId) -> Result<Option<u64>> {
+        let Some(state) = self.write_state(inode_id)? else {
+            return Ok(None);
+        };
+        let state = state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        Ok(Some(state.visible_write_seq))
+    }
+
+    /// B5: explicit times just committed by `SetInodeAttributes` already
+    /// carry what the inode owed Meta for writes up to `observed_seq`; the
+    /// metadata-only sync (and its log record) those writes would trigger is
+    /// dropped. Kept owed whenever anything could still need it: a later
+    /// write, uncommitted data, a commit in flight or a pending privilege
+    /// clear.
+    pub(super) fn supersede_owed_timestamps(
+        &self,
+        inode_id: &InodeId,
+        observed_seq: u64,
+    ) -> Result<()> {
+        let Some(state) = self.write_state(inode_id)? else {
+            return Ok(());
+        };
+        let mut state = state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if state.metadata_dirty
+            && state.visible_write_seq == observed_seq
+            && state.committed_write_seq >= state.visible_write_seq
+            && !state.dirty
+            && state.dirty_extents.is_empty()
+            && state.in_flight.is_none()
+            && !state.commit_busy
+            && !state.kill_suidgid_dirty
+        {
+            state.metadata_dirty = false;
+            state.last_writer_background_requested = false;
+        }
+        Ok(())
+    }
+
     pub(super) fn has_pending_killpriv(&self, inode_id: &InodeId) -> Result<bool> {
         let Some(state) = self.write_state(inode_id)? else {
             return Ok(false);
@@ -924,6 +1119,7 @@ impl DistributedFs {
             let mut state = state
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            state.meta_mtime_unix_ms = inode.attributes.mtime_unix_ms;
             if state.metadata_dirty {
                 if preserve_dirty_atime {
                     inode.attributes.atime_unix_ms = state.inode.attributes.atime_unix_ms;

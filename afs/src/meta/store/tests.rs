@@ -28,6 +28,7 @@ fn session(node_id: &str, session_id: &str, expires_at_unix_ms: u64) -> NodeSess
         grpc_addr: format!("http://{node_id}:7400"),
         data_addr: format!("http://{node_id}:7500"),
         rest_addr: format!("http://{node_id}:7600"),
+        nfs_addr: String::new(),
         ownerfs_enabled: true,
         storage_devices: Vec::new(),
         lease_epoch: 1,
@@ -277,6 +278,38 @@ fn node_session_liveness_uses_strict_expiry_boundary() {
 }
 
 #[test]
+fn force_delete_condition_rechecks_the_current_home_incarnation() {
+    let mut state = MemoryState::default();
+    let condition = TxnCondition::NodeSessionUnavailable {
+        node_id: "home".into(),
+    };
+    assert!(condition_matches(&state, &condition));
+    let key = MetaKey::CurrentNodeSession {
+        node_id: "home".into(),
+    };
+    state.entities.insert(
+        key.clone(),
+        VersionedEntity {
+            revision: StoreRevision(1),
+            entity: MetaEntity::NodeSession(session("home", "old", 0)),
+        },
+    );
+    assert!(condition_matches(&state, &condition));
+    state.entities.insert(
+        key,
+        VersionedEntity {
+            revision: StoreRevision(2),
+            entity: MetaEntity::NodeSession(session(
+                "home",
+                "restarted",
+                now_unix_ms().saturating_add(60_000),
+            )),
+        },
+    );
+    assert!(!condition_matches(&state, &condition));
+}
+
+#[test]
 fn snapshot_bytes_are_independent_of_hash_map_insertion_order() {
     fn state_in_order(nodes: &[&str]) -> StoreState {
         let mut state = MemoryState {
@@ -371,6 +404,7 @@ async fn root_grant_read_rejects_expired_holder_session() {
         local_prepare_id: "prepare-1".into(),
         created_at_revision: StoreRevision(1),
         updated_at_revision: StoreRevision(1),
+        nfs_addr: String::new(),
     };
     let grant = grant();
     for (key, entity) in [
@@ -445,6 +479,7 @@ async fn root_grant_read_rejects_expired_home_session() {
         local_prepare_id: "prepare-1".into(),
         created_at_revision: StoreRevision(1),
         updated_at_revision: StoreRevision(1),
+        nfs_addr: String::new(),
     };
     let grant = grant();
     for (key, entity) in [
@@ -864,6 +899,7 @@ fn lease(session_id: &str) -> NodeSessionLease {
         grpc_addr: "http://node-a:7400".into(),
         data_addr: "http://node-a:7500".into(),
         rest_addr: "http://node-a:7600".into(),
+        nfs_addr: String::new(),
         ownerfs_enabled: true,
         storage_devices: Vec::new(),
         lease_ttl: Duration::from_secs(30),
@@ -1116,6 +1152,7 @@ fn p3_views_charge_includes_authority_owned_capacity() {
                 grpc_addr: String::new(),
                 data_addr: String::new(),
                 rest_addr: text,
+                nfs_addr: String::new(),
                 ownerfs_enabled: true,
                 storage_devices: devices,
                 lease_epoch: 1,
@@ -1809,6 +1846,7 @@ async fn p3_lifecycle_completed_commands_reclaimed_pending_and_failed_preserved(
             local_prepare_id: "prepare".into(),
             created_at_revision: StoreRevision(1),
             updated_at_revision: StoreRevision(1),
+            nfs_addr: String::new(),
         })),
         TxnMutation::Put(MetaEntity::RootGrant(RootAccessGrant {
             root_id: "active-root".into(),
@@ -2344,6 +2382,7 @@ async fn p3_incremental_write_does_not_reencode_untouched_authority() {
                 local_prepare_id: "old-prepare".into(),
                 created_at_revision: StoreRevision(1),
                 updated_at_revision: StoreRevision(1),
+                nfs_addr: String::new(),
             })));
     }
     txn.mutations
@@ -2667,6 +2706,7 @@ async fn p3_all_condition_variants_keep_truth_idempotence_and_wal_admission() {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
@@ -3013,6 +3053,7 @@ async fn p3_all_condition_variants_keep_truth_idempotence_and_wal_admission() {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    nfs_addr: String::new(),
                     ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
@@ -3054,6 +3095,7 @@ async fn p3_root_deactivation_accepts_accumulated_grants_below_byte_budget() {
                 grpc_addr: "g".into(),
                 data_addr: "d".into(),
                 rest_addr: "r".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: true,
                 storage_devices: Vec::new(),
                 lease_ttl: Duration::from_secs(300),
@@ -3085,6 +3127,7 @@ async fn p3_root_deactivation_accepts_accumulated_grants_below_byte_budget() {
                     local_prepare_id: "p".into(),
                     created_at_revision: StoreRevision(2),
                     updated_at_revision: StoreRevision(2),
+                    nfs_addr: String::new(),
                 })),
                 TxnMutation::Put(MetaEntity::RootGrant(home.clone())),
             ]);
@@ -3264,18 +3307,21 @@ async fn p3_a27_typed_byte_limits_reject_atomically_and_reopen_controls() {
     });
     let layout = vec![
         chunk.clone(),
-        MetaEntity::DfsLayoutRoot(LayoutRoot {
-            id: LayoutRootId::new("layout"),
-            file_length: 512 * 4096,
-            inline_extents: (0..512)
-                .map(|number| Extent {
-                    file_offset: number * 4096,
-                    length: 4096,
-                    chunk_id: ChunkId::new("chunk"),
-                    chunk_offset: 0,
-                })
-                .collect(),
-        }),
+        MetaEntity::DfsLayoutRoot(
+            LayoutRoot {
+                id: LayoutRootId::new("layout"),
+                file_length: 512 * 4096,
+                inline_extents: (0..512)
+                    .map(|number| Extent {
+                        file_offset: number * 4096,
+                        length: 4096,
+                        chunk_id: ChunkId::new("chunk"),
+                        chunk_offset: 0,
+                    })
+                    .collect(),
+            }
+            .into(),
+        ),
         MetaEntity::DfsFileVersion(FileVersion {
             id: FileVersionId::new("version"),
             inode_id: InodeId::new("inode"),
@@ -3459,6 +3505,7 @@ async fn p3_a27_ready_group_keeps_failed_requests_out_of_durable_authority() {
         local_prepare_id: "p".into(),
         created_at_revision: StoreRevision(1),
         updated_at_revision: StoreRevision(1),
+        nfs_addr: String::new(),
     });
     let make_txn = |name: &str| {
         let request = RequestKey::new("a27-group", name);
@@ -5087,4 +5134,30 @@ async fn meta_background_input_cannot_take_the_whole_queue() {
     drop(background);
     drop(foreground);
     queue.admit(1000, InputPriority::Foreground).await.unwrap();
+}
+
+#[test]
+fn layout_entity_clones_share_extents() {
+    use crate::dfs::{ChunkId, Extent};
+    let layout = LayoutRoot {
+        id: LayoutRootId::new("shared-layout"),
+        file_length: 1,
+        inline_extents: vec![Extent {
+            file_offset: 0,
+            length: 1,
+            chunk_id: ChunkId::new("chunk"),
+            chunk_offset: 0,
+        }],
+    };
+    let entity = MetaEntity::DfsLayoutRoot(layout.into());
+    let MetaEntity::DfsLayoutRoot(first) = &entity else {
+        unreachable!();
+    };
+    let MetaEntity::DfsLayoutRoot(second) = entity.clone() else {
+        unreachable!();
+    };
+    assert_eq!(
+        first.inline_extents.as_ptr(),
+        second.inline_extents.as_ptr()
+    );
 }

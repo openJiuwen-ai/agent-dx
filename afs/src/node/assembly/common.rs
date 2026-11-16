@@ -56,6 +56,8 @@ impl FsMetrics {
 pub(super) struct TcpIngress {
     pub(super) grpc: tokio::net::TcpListener,
     pub(super) rest: tokio::net::TcpListener,
+    #[cfg(feature = "ownerfs")]
+    pub(super) workspace: Option<tokio::net::TcpListener>,
 }
 
 impl TcpIngress {
@@ -63,7 +65,17 @@ impl TcpIngress {
         // Bind all TCP ingress before spawning services. A failed bind cannot leave a half-ready Node.
         let grpc = tokio::net::TcpListener::bind(cfg.grpc_listen).await?;
         let rest = tokio::net::TcpListener::bind(cfg.rest_listen).await?;
-        Ok(Self { grpc, rest })
+        #[cfg(feature = "ownerfs")]
+        let workspace = match &cfg.ownerfs_workspace_api {
+            Some(api) => Some(tokio::net::TcpListener::bind(api.listen).await?),
+            None => None,
+        };
+        Ok(Self {
+            grpc,
+            rest,
+            #[cfg(feature = "ownerfs")]
+            workspace,
+        })
     }
 }
 
@@ -163,6 +175,17 @@ pub(super) fn node_descriptor<'a>(
         let advertised = advertised
             .clone()
             .expect("needs_meta sets advertised endpoint");
+        // The address peers dial to reach this node's NFS export, reported in
+        // its own endpoint field: `data_addr` already has a consumer (the DFS
+        // data plane dials it with gRPC), and an NFS address speaks its own
+        // port and protocol. Peers read it from the session snapshot, so a
+        // node declares only its own address and no existing config needs
+        // editing when a new node joins.
+        let nfs_addr = cfg
+            .outlet
+            .as_ref()
+            .map(|outlet| outlet.nfs_addr.clone())
+            .unwrap_or_default();
         let mut capabilities = Vec::new();
         if cfg.ownerfs {
             capabilities.push("ownerfs".into());
@@ -176,8 +199,9 @@ pub(super) fn node_descriptor<'a>(
                 node_id: cfg.id.clone(),
                 endpoint: Some(afs_protocol::meta::NodeEndpoint {
                     grpc_addr: advertised.clone(),
-                    data_addr: advertised,
+                    data_addr: advertised.clone(),
                     rest_addr: format!("http://{}", cfg.rest_listen),
+                    nfs_addr,
                 }),
                 labels: std::collections::HashMap::new(),
                 capabilities,
@@ -246,7 +270,7 @@ pub(super) struct Backends {
     /// Held until the Node exits, as the pool was before the split; the
     /// backends dial through their own clones.
     #[cfg(any(feature = "ownerfs", feature = "dfs"))]
-    _peer_connections: Arc<rpc::peer::PeerConnectionPool>,
+    pub(super) peer_connections: Arc<rpc::peer::PeerConnectionPool>,
     #[cfg(feature = "ownerfs")]
     pub(super) ownerfs: ownerfs::OwnerFsAssembly,
     #[cfg(feature = "dfs")]
@@ -293,7 +317,7 @@ impl Backends {
             #[cfg(feature = "dfs")]
             timeout: startup.timeout,
             #[cfg(any(feature = "ownerfs", feature = "dfs"))]
-            _peer_connections: peer_connections,
+            peer_connections,
             #[cfg(feature = "ownerfs")]
             ownerfs,
             #[cfg(feature = "dfs")]

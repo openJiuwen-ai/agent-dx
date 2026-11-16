@@ -78,6 +78,7 @@ const OWNERFS_ROOT_INODE: u64 = 1;
 /// current VFS bootstrap; `new_local()` is the real local implementation used
 /// by tests and later Node startup wiring.
 pub struct OwnerFs {
+    workspace_defaults: (u32, u32),
     local: Option<Arc<LocalOwnerFs>>,
     private_cache: Arc<Mutex<PrivateFuseCache>>,
     mount_manager: Option<Arc<mount_manager::MountManager>>,
@@ -138,9 +139,42 @@ impl Default for OwnerFs {
 }
 
 impl OwnerFs {
+    pub(crate) fn with_workspace_defaults(mut self, defaults: (u32, u32)) -> Self {
+        self.workspace_defaults = defaults;
+        self
+    }
+
+    pub(crate) fn workspace_defaults(&self) -> (u32, u32) {
+        self.workspace_defaults
+    }
+
+    pub(crate) fn reserve_workspace(&self, name: &OsStr) -> Result<root::RootReservation> {
+        self.require_local()?.roots.reserve_workspace(name)
+    }
+
+    /// Attributes of a workspace root on this Home.
+    pub(crate) fn workspace_attributes(&self, id: &RootId, epoch: u64) -> Result<FileAttributes> {
+        self.require_local()?.workspace_attributes(id, epoch)
+    }
+
+    pub(crate) fn maintain_workspace_deletions(&self) -> Result<()> {
+        let local = self.require_local()?;
+        // Same cleanup as a foreground delete, run under the same workspace lock.
+        local
+            .roots
+            .finish_isolated_roots(|id, epoch| local.retire_root_state(id, Some(epoch), None))?;
+        local.roots.collect_trash()?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_workspace(&self, location: &root::RootLocation) -> Result<()> {
+        self.require_local()?.delete_workspace(location)
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
+            workspace_defaults: (1000, 1000),
             local: None,
             private_cache: Arc::new(Mutex::new(PrivateFuseCache::new())),
             mount_manager: None,
@@ -198,6 +232,7 @@ impl OwnerFs {
         )));
         let mount_manager = Arc::new(mount_manager::MountManager::new(Some(egress_root)));
         Self {
+            workspace_defaults: (1000, 1000),
             local: Some(Arc::new(LocalOwnerFs::new(
                 roots,
                 disk,
@@ -220,6 +255,7 @@ impl OwnerFs {
             native_home_eligible,
         )));
         Self {
+            workspace_defaults: (1000, 1000),
             local: Some(Arc::new(LocalOwnerFs::new(
                 roots,
                 disk,
@@ -363,7 +399,10 @@ impl OwnerFs {
                 "OwnerFs local file operations are not wired in this VFS instance",
             )
         })?;
-        Ok(OwnerFsPeerExecutor { local })
+        Ok(OwnerFsPeerExecutor {
+            local,
+            workspace_defaults: self.workspace_defaults,
+        })
     }
 
     #[cfg(test)]
@@ -380,10 +419,53 @@ impl OwnerFs {
 /// afs-node process session. They become stale after release or process restart.
 #[derive(Clone)]
 pub struct OwnerFsPeerExecutor {
+    workspace_defaults: (u32, u32),
     local: Arc<LocalOwnerFs>,
 }
 
 impl OwnerFsPeerExecutor {
+    pub(crate) fn delete_workspace(
+        &self,
+        peer: &str,
+        session: &str,
+        id: &RootId,
+        expected_epoch: u64,
+    ) -> Result<()> {
+        if session.is_empty()
+            || self.local.roots.current_node_session(peer)?.as_deref() != Some(session)
+        {
+            return Err(Error::coded(
+                afs_error::IO_PERMISSION_DENIED,
+                "requester Meta session is not current",
+            ));
+        }
+        if id.0.is_empty() || expected_epoch == 0 {
+            return Err(Error::coded(
+                afs_error::CLIENT_ARGUMENT_INVALID,
+                "workspace epoch must be positive",
+            ));
+        }
+        // Already deleted (e.g. a concurrent DELETE finished first): idempotent success.
+        // A different epoch means a recreated workspace and stays a conflict.
+        let Some(location) = self.local.roots.lookup_root_location(id)? else {
+            return Ok(());
+        };
+        if location.epoch != expected_epoch {
+            return Err(stale("workspace epoch changed"));
+        }
+        self.local.delete_workspace(&location)
+    }
+
+    pub(crate) fn workspace_defaults(&self) -> (u32, u32) {
+        self.workspace_defaults
+    }
+
+    /// Workspace root attributes for an authenticated API node. Unlike file
+    /// access, this neither admits the peer to the root nor needs a Meta grant.
+    pub(crate) fn workspace_attributes(&self, id: &RootId, epoch: u64) -> Result<FileAttributes> {
+        self.local.workspace_attributes(id, epoch)
+    }
+
     /// Prepare and activate a reserved workspace on this Home, then request
     /// the configured bind asynchronously. Bind failure does not fail creation.
     pub(crate) fn prepare_owner_root(
@@ -712,6 +794,17 @@ impl OwnerFsPeerExecutor {
     ) -> Result<()> {
         self.local
             .peer_rmdir(ctx, peer_node_id, access, path, expected, expected_parent)
+    }
+
+    pub fn rmdir_root(
+        &self,
+        ctx: &RequestContext,
+        peer_node_id: &str,
+        access: &PresentedRootAccess,
+        expected_root: &files::FileIdentity,
+    ) -> Result<()> {
+        self.local
+            .peer_rmdir_root(ctx, peer_node_id, access, expected_root)
     }
 
     // Keep the agreed peer contract explicit instead of allocating a request
@@ -1501,6 +1594,32 @@ fn owner_peer_lock_scope(peer: &str, access: &PresentedRootAccess, raw: &str) ->
 }
 
 impl LocalOwnerFs {
+    fn workspace_attributes(&self, id: &RootId, epoch: u64) -> Result<FileAttributes> {
+        if id.0.is_empty() || epoch == 0 {
+            return Err(Error::coded(
+                afs_error::CLIENT_ARGUMENT_INVALID,
+                "workspace epoch must be positive",
+            ));
+        }
+        self.roots.recover_local_root(id, epoch)?;
+        let _access = self.roots.enter_root(id, RootRight::Lookup)?;
+        match self.roots.local_root_data_dir(id)? {
+            Some((path, current)) if current == epoch => {
+                attributes_from_metadata(self.disk.metadata(&path)?)
+            }
+            Some(_) => Err(stale("workspace epoch changed")),
+            None => Err(stale("workspace is offline on Home")),
+        }
+    }
+
+    fn delete_workspace(&self, location: &root::RootLocation) -> Result<()> {
+        if location.home_node_id != self.roots.node_id() {
+            return Err(stale("workspace belongs to another Home"));
+        }
+        // 不经缓存补齐：已隔离的代次不能为删除重试重新开放。
+        self.delete_local_root(&location.id, Some(location.epoch), None, true)
+    }
+
     fn lock_target(
         &self,
         handle: FileHandle,
@@ -2180,7 +2299,7 @@ impl LocalOwnerFs {
                     .map_err(Error::from)
                     .and_then(|metadata| identity_from_metadata(&metadata))
                     .unwrap_or_else(|_| identity_from_attributes(&attributes));
-                state.insert_root(root.name, root.id, identity, attributes);
+                state.insert_root(root.name, root.id, identity, attributes, None);
             }
         }
         Self {
@@ -2222,20 +2341,74 @@ impl LocalOwnerFs {
     }
 
     fn remote_for_record(&self, record: &NodeRecord, right: RootRight) -> Result<RemoteRoot> {
-        self.acquire_remote_root(&record.root_id, right)
+        self.bind_remote_epoch(&record.root_id, record.epoch, right)
+    }
+
+    /// Acquires a grant matching `expected_epoch`. A newer grant means the
+    /// record's incarnation is gone; a lagging grant is a superseded one
+    /// published late, which proves nothing about the record, so it is
+    /// refreshed from Meta instead of dropping the current workspace's records.
+    fn bind_remote_epoch(
+        &self,
+        id: &RootId,
+        expected_epoch: Option<u64>,
+        right: RootRight,
+    ) -> Result<RemoteRoot> {
+        let remote = self.acquire_remote_root(id, right)?;
+        let Some(expected_epoch) = expected_epoch else {
+            return Ok(remote);
+        };
+        if remote.grant.epoch == expected_epoch {
+            return Ok(remote);
+        }
+        if remote.grant.epoch > expected_epoch {
+            self.drop_root_epoch(id, Some(expected_epoch))?;
+            return Err(stale_incarnation());
+        }
+        self.invalidate_remote_root(id)?;
+        let refreshed = self.acquire_remote_root_uncached(id, right)?;
+        if refreshed.grant.epoch == expected_epoch {
+            return Ok(refreshed);
+        }
+        if refreshed.grant.epoch > expected_epoch {
+            self.drop_root_epoch(id, Some(expected_epoch))?;
+        }
+        Err(stale_incarnation())
+    }
+
+    /// Removes every record observed under one incarnation of a root.
+    fn drop_root_epoch(&self, id: &RootId, epoch: Option<u64>) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        state.remove_root_epoch(id, epoch);
+        Ok(())
+    }
+
+    fn observe_remote_epoch(&self, id: &RootId, epoch: u64) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        state.observe_root_epoch(id, epoch);
+        Ok(())
     }
 
     fn remote_expected_identity(
         &self,
         root_id: &RootId,
         relative: &StoragePath,
+        expected_epoch: Option<u64>,
     ) -> Result<Option<files::FileIdentity>> {
         let state = self.state.lock().map_err(|_| poisoned())?;
-        Ok(state
+        let Some(record) = state
             .paths
             .get(&(root_id.clone(), relative.clone()))
             .and_then(|inode| state.inodes.get(inode))
-            .map(|record| record.identity.clone()))
+        else {
+            return Ok(None);
+        };
+        if expected_epoch.is_some_and(|epoch| record.epoch != Some(epoch)) {
+            // A path bound to another incarnation would delete or rename the
+            // wrong object in the current workspace.
+            return Err(stale_incarnation());
+        }
+        Ok(Some(record.identity.clone()))
     }
 
     fn open_file_handle(&self, handle: FileHandle) -> Result<Arc<Mutex<OpenFileHandleSlot>>> {
@@ -2695,7 +2868,7 @@ impl LocalOwnerFs {
         )?;
         let dir = self.disk.open_dir(&physical).map_err(Error::from)?;
         dir.sync_all().map_err(Error::from)?;
-        self.owner_entry_for_path(&access.id, relative, None)
+        self.owner_entry_in_root(&access.id, root_use.data_dir(), relative, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2739,7 +2912,7 @@ impl LocalOwnerFs {
             created_gid(ctx, &parent_attributes),
             mode,
         )?;
-        self.owner_entry_for_path(&access.id, relative, None)
+        self.owner_entry_in_root(&access.id, root_use.data_dir(), relative, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2780,20 +2953,24 @@ impl LocalOwnerFs {
                 attributes,
             });
         }
-        let entry = self.owner_entry_for_path(&access.id, storage_path_from_os(path)?, expected)?;
+        let relative = storage_path_from_os(path)?;
+        let root_use = self.roots.enter_root(&access.id, RootRight::Write)?;
+        let entry =
+            self.owner_entry_in_root(&access.id, root_use.data_dir(), relative.clone(), expected)?;
         let inode = self
             .state
             .lock()
             .map_err(|_| poisoned())?
             .paths
-            .get(&(entry.root_id.clone(), storage_path_from_os(path)?))
+            .get(&(entry.root_id.clone(), relative.clone()))
             .copied()
             .ok_or_else(|| stale("peer setattr inode missing"))?;
         let attributes =
             self.setattr_with_options(ctx, backend_inode(inode), None, change, options)?;
-        self.owner_entry_for_path(
+        self.owner_entry_in_root(
             &access.id,
-            storage_path_from_os(path)?,
+            root_use.data_dir(),
+            relative,
             Some(&entry.identity),
         )
         .map(|mut refreshed| {
@@ -2927,7 +3104,12 @@ impl LocalOwnerFs {
         let relative = storage_path_from_os(path)?;
         let root_use = self.roots.enter_root(&access.id, RootRight::Write)?;
         self.check_peer_parent(root_use.data_dir(), &parent, expected_parent)?;
-        let parent_entry = self.owner_entry_for_path(&access.id, parent, Some(expected_parent))?;
+        let parent_entry = self.owner_entry_in_root(
+            &access.id,
+            root_use.data_dir(),
+            parent,
+            Some(expected_parent),
+        )?;
         authorize_create_in_directory(ctx, &parent_entry.attributes)?;
         let physical = root_use
             .data_dir()
@@ -2940,7 +3122,7 @@ impl LocalOwnerFs {
             ctx.uid,
             created_gid(ctx, &parent_entry.attributes),
         )?;
-        self.owner_entry_for_path(&access.id, relative, None)
+        self.owner_entry_in_root(&access.id, root_use.data_dir(), relative, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3067,6 +3249,35 @@ impl LocalOwnerFs {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         state.remove_path(&access.id, relative);
         Ok(())
+    }
+
+    fn peer_rmdir_root(
+        &self,
+        ctx: &RequestContext,
+        peer_node_id: &str,
+        access: &PresentedRootAccess,
+        expected_root: &files::FileIdentity,
+    ) -> Result<()> {
+        self.validate_peer(access, peer_node_id, RootRight::Write)?;
+        // 与本机路径不同，数据目录缺失时不放行：此时无法校验 expected_root。入口节点上
+        // 远端 root 的 entry TTL 为 0，rmdir 前的 LOOKUP 已返回 ENOENT；残留由 Home
+        // 启动时的 zombie 检测清理。
+        let victim =
+            self.owner_entry_for_path(&access.id, StoragePath::root(), Some(expected_root))?;
+        // 节点授权只说明对端可以写这个 workspace，不说明调用者可以删除挂载根下的目录。
+        // 与其他 peer 删除一样，按 caller 重做本机 FUSE 入口由内核完成的检查：挂载根
+        // 属 root、0755，非 root 调用者被拒绝。
+        authorize_namespace_remove(ctx, &self.owner_root_attributes()?, &victim.attributes)?;
+        let (data_dir, _) = self
+            .roots
+            .local_root_data_dir(&access.id)?
+            .ok_or_else(|| Error::coded(afs_error::NODE_VFS_NOT_FOUND, "root not found on Home"))?;
+        self.ensure_root_empty(&data_dir)?;
+        afs_logging::info!(
+            "ownerfs.peer_rmdir_root.accepted";
+            "root_id" => ?access.id, "peer_node_id" => peer_node_id, "uid" => ctx.uid
+        );
+        self.delete_local_root(&access.id, Some(access.epoch), Some(expected_root), false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3572,10 +3783,22 @@ impl LocalOwnerFs {
         expected: Option<&files::FileIdentity>,
     ) -> Result<files::OwnerEntry> {
         let root_use = self.roots.enter_root(root_id, RootRight::Lookup)?;
-        let physical = root_use
-            .data_dir()
-            .join_path(&relative)
-            .map_err(Error::from)?;
+        self.owner_entry_in_root(root_id, root_use.data_dir(), relative, expected)
+    }
+
+    /// Reads a directory entry through a root the caller already admitted.
+    ///
+    /// A peer write handler must use the [`RootUse`] it acquired before its
+    /// side effect for the reply entry: re-entering the root after a mutation
+    /// could reject a grant the entry node then replays as a duplicate create.
+    fn owner_entry_in_root(
+        &self,
+        root_id: &RootId,
+        data_dir: &StoragePath,
+        relative: StoragePath,
+        expected: Option<&files::FileIdentity>,
+    ) -> Result<files::OwnerEntry> {
+        let physical = data_dir.join_path(&relative).map_err(Error::from)?;
         let metadata = self.disk.metadata(&physical).map_err(Error::from)?;
         let kind = kind_from_metadata(&metadata)?;
         let identity = identity_from_metadata(&metadata)?;
@@ -3693,15 +3916,19 @@ impl LocalOwnerFs {
         let root_use = match self.roots.enter_root(&record.root_id, RootRight::Lookup) {
             Ok(root_use) => root_use,
             Err(error) if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE => {
-                let entry =
-                    self.with_remote_root_retry(&record.root_id, RootRight::Lookup, |remote| {
+                let (_, entry) = self.with_remote_root_retry(
+                    &record.root_id,
+                    record.epoch,
+                    RootRight::Lookup,
+                    |remote| {
                         remote.files.getattr(
                             &remote.grant,
                             record.relative.as_path().as_os_str(),
                             Some(&record.identity),
                             None,
                         )
-                    })?;
+                    },
+                )?;
                 let mut state = self.state.lock().map_err(|_| poisoned())?;
                 state.update_record(
                     inode.value,
@@ -3747,13 +3974,19 @@ impl LocalOwnerFs {
                     // Revoked local authority is not evidence of a remote Home.
                     return Err(error);
                 }
-                self.with_remote_root_retry(&record.root_id, RootRight::Read, |remote| {
-                    remote.files.statfs(
-                        &remote.grant,
-                        record.relative.as_path().as_os_str(),
-                        Some(&record.identity),
-                    )
-                })
+                self.with_remote_root_retry(
+                    &record.root_id,
+                    record.epoch,
+                    RootRight::Read,
+                    |remote| {
+                        remote.files.statfs(
+                            &remote.grant,
+                            record.relative.as_path().as_os_str(),
+                            Some(&record.identity),
+                        )
+                    },
+                )
+                .map(|(_, capacity)| capacity)
             }
             Err(error) => Err(error),
         }
@@ -3848,17 +4081,20 @@ impl LocalOwnerFs {
         let root_use = match self.roots.enter_root(&record.root_id, RootRight::Write) {
             Ok(root_use) => root_use,
             Err(error) if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE => {
-                let remote = self.remote_for_record(&record, RootRight::Write)?;
-                let entry = remote.files.setattr_with_options(
-                    ctx,
-                    &remote.grant,
-                    record.relative.as_path().as_os_str(),
-                    Some(&record.identity),
-                    None,
-                    change,
-                    options,
-                )?;
+                let (remote, entry) =
+                    self.with_remote_write_retry(&record, RootRight::Write, |remote| {
+                        remote.files.setattr_with_options(
+                            ctx,
+                            &remote.grant,
+                            record.relative.as_path().as_os_str(),
+                            Some(&record.identity),
+                            None,
+                            change,
+                            options,
+                        )
+                    })?;
                 let mut state = self.state.lock().map_err(|_| poisoned())?;
+                state.begin_epoch_apply(&record.root_id, remote.grant.epoch)?;
                 state.update_record(
                     inode.value,
                     entry.identity,
@@ -4063,24 +4299,36 @@ impl LocalOwnerFs {
             .enter_root(&parent_record.root_id, RootRight::Write)
         {
             if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE {
-                let remote = self.remote_for_record(&parent_record, RootRight::Write)?;
-                let created = remote.files.create_with_options(
-                    ctx,
-                    &remote.grant,
-                    child.as_path().as_os_str(),
-                    flags,
-                    mode,
-                    &parent_record.identity,
-                    options,
-                )?;
+                let (remote, created) =
+                    self.with_remote_write_retry(&parent_record, RootRight::Write, |remote| {
+                        remote.files.create_with_options(
+                            ctx,
+                            &remote.grant,
+                            child.as_path().as_os_str(),
+                            flags,
+                            mode,
+                            &parent_record.identity,
+                            options,
+                        )
+                    })?;
                 let mut state = self.state.lock().map_err(|_| poisoned())?;
-                let inode = state.inode_for_path(
+                let inode = match state.inode_for_remote_path(
+                    &parent_record.version,
+                    LookupIndexMode::Ordinary,
                     created.entry.root_id.clone(),
                     child,
                     created.entry.identity.clone(),
                     created.entry.attributes.clone(),
                     created.entry.attributes.kind,
-                );
+                    Some(remote.grant.epoch),
+                ) {
+                    Ok(inode) => inode,
+                    Err(error) => {
+                        drop(state);
+                        let _ = remote.files.release(&remote.grant, created.file);
+                        return Err(error);
+                    }
+                };
                 let handle = state.insert_remote_file_handle(
                     remote.grant,
                     remote.files,
@@ -4238,8 +4486,8 @@ impl LocalOwnerFs {
             Ok(root_use) => root_use,
             Err(error) if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE => {
                 let mut opened = None;
-                let (grant, files) =
-                    self.with_remote_root_retry(&record.root_id, right, |remote| {
+                let (remote, ()) =
+                    self.with_remote_root_retry(&record.root_id, record.epoch, right, |remote| {
                         let (file, _attributes) = remote.files.open_with_options(
                             &remote.grant,
                             record.relative.as_path().as_os_str(),
@@ -4248,12 +4496,12 @@ impl LocalOwnerFs {
                             options,
                         )?;
                         opened = Some(file);
-                        Ok((remote.grant.clone(), remote.files.clone()))
+                        Ok(())
                     })?;
                 let mut state = self.state.lock().map_err(|_| poisoned())?;
                 return Ok(state.insert_remote_file_handle(
-                    grant,
-                    files,
+                    remote.grant,
+                    remote.files,
                     opened.ok_or_else(|| stale("remote open did not return a file handle"))?,
                     flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_TRUNC != 0,
                     flags_allow_write(flags),
@@ -4504,22 +4752,26 @@ impl LocalOwnerFs {
         if let Err(error) = self.roots.enter_root(&record.root_id, RootRight::Lookup) {
             if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE {
                 let mut opened = None;
-                let (grant, files) =
-                    self.with_remote_root_retry(&record.root_id, RootRight::Lookup, |remote| {
+                let (remote, ()) = self.with_remote_root_retry(
+                    &record.root_id,
+                    record.epoch,
+                    RootRight::Lookup,
+                    |remote| {
                         let directory = remote.files.opendir(
                             &remote.grant,
                             record.relative.as_path().as_os_str(),
                             Some(&record.identity),
                         )?;
                         opened = Some(directory);
-                        Ok((remote.grant.clone(), remote.files.clone()))
-                    })?;
+                        Ok(())
+                    },
+                )?;
                 let mut state = self.state.lock().map_err(|_| poisoned())?;
                 return Ok(state.insert_dir_handle(
                     inode.value,
                     OpenLocalDirectory::Remote(OpenRemoteDirectory {
-                        grant,
-                        files,
+                        grant: remote.grant,
+                        files: remote.files,
                         handle: opened
                             .ok_or_else(|| stale("remote opendir did not return a handle"))?,
                     }),
@@ -4602,83 +4854,95 @@ impl LocalOwnerFs {
                         .clone();
                     let parent_relative = record.relative.clone();
                     drop(state);
-                    let entries = match files.readdir(&grant, &remote_dir, cookie, max_entries) {
-                        Ok(entries) => entries,
-                        Err(error) if should_refresh_remote_root(&error) => {
-                            self.invalidate_remote_root(&record.root_id)?;
-                            let mut refreshed_dir = None;
-                            let (grant, files, entries) = self.with_remote_root_retry(
-                                &record.root_id,
-                                RootRight::Lookup,
-                                |remote| {
-                                    let directory = remote.files.opendir(
-                                        &remote.grant,
-                                        record.relative.as_path().as_os_str(),
-                                        Some(&record.identity),
-                                    )?;
-                                    let entries = match remote.files.readdir(
-                                        &remote.grant,
-                                        &directory,
-                                        cookie,
-                                        max_entries,
-                                    ) {
-                                        Ok(entries) => entries,
-                                        Err(error) => {
-                                            // Best effort: the original error must still
-                                            // drive the refresh retry.
-                                            let _ =
-                                                remote.files.releasedir(&remote.grant, directory);
-                                            return Err(error);
-                                        }
-                                    };
-                                    refreshed_dir = Some(directory);
-                                    Ok((remote.grant.clone(), remote.files.clone(), entries))
-                                },
-                            )?;
-                            let refreshed = OpenRemoteDirectory {
-                                grant,
-                                files,
-                                handle: refreshed_dir.ok_or_else(|| {
-                                    stale("remote readdir did not reopen directory")
-                                })?,
-                            };
-                            let previous = {
-                                let mut state = self.state.lock().map_err(|_| poisoned())?;
-                                state.dir_handles.get_mut(&handle).map(|slot| {
-                                    std::mem::replace(
-                                        &mut slot.handle,
-                                        OpenLocalDirectory::Remote(OpenRemoteDirectory {
-                                            grant: refreshed.grant.clone(),
-                                            files: refreshed.files.clone(),
-                                            handle: refreshed.handle.clone(),
-                                        }),
-                                    )
-                                })
-                            };
-                            match previous {
-                                Some(OpenLocalDirectory::Remote(previous)) => {
-                                    // The old grant just failed; the Home reclaims
-                                    // this cursor with the peer session.
-                                    let _ =
-                                        previous.files.releasedir(&previous.grant, previous.handle);
+                    let (entries, served_epoch) =
+                        match files.readdir(&grant, &remote_dir, cookie, max_entries) {
+                            Ok(entries) => (entries, grant.epoch),
+                            Err(error) if should_refresh_remote_root(&error) => {
+                                self.invalidate_remote_root(&record.root_id)?;
+                                let mut refreshed_dir = None;
+                                let (remote, entries) = self.with_remote_root_retry(
+                                    &record.root_id,
+                                    record.epoch,
+                                    RootRight::Lookup,
+                                    |remote| {
+                                        let directory = remote.files.opendir(
+                                            &remote.grant,
+                                            record.relative.as_path().as_os_str(),
+                                            Some(&record.identity),
+                                        )?;
+                                        let entries = match remote.files.readdir(
+                                            &remote.grant,
+                                            &directory,
+                                            cookie,
+                                            max_entries,
+                                        ) {
+                                            Ok(entries) => entries,
+                                            Err(error) => {
+                                                // Best effort: the original error must still
+                                                // drive the refresh retry.
+                                                let _ = remote
+                                                    .files
+                                                    .releasedir(&remote.grant, directory);
+                                                return Err(error);
+                                            }
+                                        };
+                                        refreshed_dir = Some(directory);
+                                        Ok(entries)
+                                    },
+                                )?;
+                                // Tag children with the grant that served this
+                                // listing, not the superseded cursor's.
+                                let served_epoch = remote.grant.epoch;
+                                let refreshed = OpenRemoteDirectory {
+                                    grant: remote.grant,
+                                    files: remote.files,
+                                    handle: refreshed_dir.ok_or_else(|| {
+                                        stale("remote readdir did not reopen directory")
+                                    })?,
+                                };
+                                let previous = {
+                                    let mut state = self.state.lock().map_err(|_| poisoned())?;
+                                    state.dir_handles.get_mut(&handle).map(|slot| {
+                                        std::mem::replace(
+                                            &mut slot.handle,
+                                            OpenLocalDirectory::Remote(OpenRemoteDirectory {
+                                                grant: refreshed.grant.clone(),
+                                                files: refreshed.files.clone(),
+                                                handle: refreshed.handle.clone(),
+                                            }),
+                                        )
+                                    })
+                                };
+                                match previous {
+                                    Some(OpenLocalDirectory::Remote(previous)) => {
+                                        // The old grant just failed; the Home reclaims
+                                        // this cursor with the peer session.
+                                        let _ = previous
+                                            .files
+                                            .releasedir(&previous.grant, previous.handle);
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        let _ = refreshed
+                                            .files
+                                            .releasedir(&refreshed.grant, refreshed.handle);
+                                    }
                                 }
-                                Some(_) => {}
-                                None => {
-                                    let _ = refreshed
-                                        .files
-                                        .releasedir(&refreshed.grant, refreshed.handle);
-                                }
+                                (entries, served_epoch)
                             }
-                            entries
-                        }
-                        Err(error) => return Err(error),
-                    };
+                            Err(error) => return Err(error),
+                        };
                     let mut rows = Vec::new();
                     for entry in entries {
                         let child = parent_relative
                             .join_component(&entry.name)
                             .map_err(Error::from)?;
-                        let inode = self.insert_remote_entry(child, entry.entry.clone())?;
+                        let inode = self.insert_remote_entry(
+                            &record.version,
+                            child,
+                            entry.entry.clone(),
+                            served_epoch,
+                        )?;
                         rows.push(DirectoryEntry {
                             name: entry.name,
                             inode: backend_inode(inode),
@@ -4790,15 +5054,22 @@ impl LocalOwnerFs {
         {
             Ok(root_use) => root_use,
             Err(error) if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE => {
-                let remote = self.remote_for_record(&parent_record, RootRight::Write)?;
-                let entry = remote.files.mkdir(
-                    ctx,
-                    &remote.grant,
-                    child.as_path().as_os_str(),
-                    mode,
-                    &parent_record.identity,
+                let (remote, entry) =
+                    self.with_remote_write_retry(&parent_record, RootRight::Write, |remote| {
+                        remote.files.mkdir(
+                            ctx,
+                            &remote.grant,
+                            child.as_path().as_os_str(),
+                            mode,
+                            &parent_record.identity,
+                        )
+                    })?;
+                let inode = self.insert_remote_entry(
+                    &parent_record.version,
+                    child,
+                    entry.clone(),
+                    remote.grant.epoch,
                 )?;
-                let inode = self.insert_remote_entry(child, entry.clone())?;
                 return Ok(Entry {
                     inode: backend_inode(inode),
                     attributes: entry.attributes,
@@ -4870,16 +5141,23 @@ impl LocalOwnerFs {
         {
             Ok(root_use) => root_use,
             Err(error) if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE => {
-                let remote = self.remote_for_record(&parent_record, RootRight::Write)?;
-                let entry = remote.files.mknod(
-                    ctx,
-                    &remote.grant,
-                    child.as_path().as_os_str(),
-                    kind,
-                    mode,
-                    &parent_record.identity,
+                let (remote, entry) =
+                    self.with_remote_write_retry(&parent_record, RootRight::Write, |remote| {
+                        remote.files.mknod(
+                            ctx,
+                            &remote.grant,
+                            child.as_path().as_os_str(),
+                            kind,
+                            mode,
+                            &parent_record.identity,
+                        )
+                    })?;
+                let inode = self.insert_remote_entry(
+                    &parent_record.version,
+                    child,
+                    entry.clone(),
+                    remote.grant.epoch,
                 )?;
-                let inode = self.insert_remote_entry(child, entry.clone())?;
                 return Ok(Entry {
                     inode: backend_inode(inode),
                     attributes: entry.attributes,
@@ -4931,17 +5209,24 @@ impl LocalOwnerFs {
         {
             Ok(root_use) => root_use,
             Err(error) if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE => {
-                let remote = self.remote_for_record(&parent_record, RootRight::Write)?;
-                let expected = self.remote_expected_identity(&parent_record.root_id, &child)?;
-                remote.files.unlink(
-                    ctx,
-                    &remote.grant,
-                    child.as_path().as_os_str(),
-                    expected.as_ref(),
-                    &parent_record.identity,
+                let expected = self.remote_expected_identity(
+                    &parent_record.root_id,
+                    &child,
+                    parent_record.epoch,
                 )?;
+                let (remote, ()) =
+                    self.with_remote_write_retry(&parent_record, RootRight::Write, |remote| {
+                        remote.files.unlink(
+                            ctx,
+                            &remote.grant,
+                            child.as_path().as_os_str(),
+                            expected.as_ref(),
+                            &parent_record.identity,
+                        )
+                    })?;
                 let removed = {
                     let mut state = self.state.lock().map_err(|_| poisoned())?;
+                    state.begin_epoch_apply(&parent_record.root_id, remote.grant.epoch)?;
                     state.remove_path(&parent_record.root_id, child)
                 };
                 if let Some((inode, Some(replacement))) = removed {
@@ -4992,7 +5277,7 @@ impl LocalOwnerFs {
     fn rmdir(&self, ctx: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<()> {
         // D4: root 级别 rmdir 触发完整 root 删除流程。
         if parent.value == OWNERFS_ROOT_INODE {
-            return self.rmdir_root(name);
+            return self.rmdir_root(ctx, name);
         }
         let parent_record = self.directory_record(parent)?;
         let child = parent_record
@@ -5005,16 +5290,23 @@ impl LocalOwnerFs {
         {
             Ok(root_use) => root_use,
             Err(error) if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE => {
-                let remote = self.remote_for_record(&parent_record, RootRight::Write)?;
-                let expected = self.remote_expected_identity(&parent_record.root_id, &child)?;
-                remote.files.rmdir(
-                    ctx,
-                    &remote.grant,
-                    child.as_path().as_os_str(),
-                    expected.as_ref(),
-                    &parent_record.identity,
+                let expected = self.remote_expected_identity(
+                    &parent_record.root_id,
+                    &child,
+                    parent_record.epoch,
                 )?;
+                let (remote, ()) =
+                    self.with_remote_write_retry(&parent_record, RootRight::Write, |remote| {
+                        remote.files.rmdir(
+                            ctx,
+                            &remote.grant,
+                            child.as_path().as_os_str(),
+                            expected.as_ref(),
+                            &parent_record.identity,
+                        )
+                    })?;
                 let mut state = self.state.lock().map_err(|_| poisoned())?;
+                state.begin_epoch_apply(&parent_record.root_id, remote.grant.epoch)?;
                 state.remove_path(&parent_record.root_id, child);
                 return Ok(());
             }
@@ -5035,60 +5327,166 @@ impl LocalOwnerFs {
         Ok(())
     }
 
-    /// D4: 删除整个 root 目录（spec §5.4）。
-    ///
-    /// 顺序：解析 root_id → 卸载 bind mount → RootManager::delete_root
-    /// （revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog）→
-    /// OwnerState 索引清理 → PrivateFuseCache 清理。任一步失败时后续步骤
-    /// 不再执行，残留记录由 reconcile_on_startup 的 zombie 检测在下一次
-    /// 启动时清理。
-    fn rmdir_root(&self, name: &OsStr) -> Result<()> {
+    /// D4: 删除整个 root 目录（spec §5.4）。本机是 Home 时直接删除，否则转发给 Home。
+    fn rmdir_root(&self, ctx: &RequestContext, name: &OsStr) -> Result<()> {
         // 1. 解析 root_id。并发 rmdir 的第二个调用在这里已找不到 name
         //    条目（第一个调用完成 state.remove_root 后），返回 ENOENT，
         //    与 delete_root 的缓存移除线性化点一致。
-        let root_id = {
+        let (root_id, root_identity) = {
             let state = self.state.lock().map_err(|_| poisoned())?;
             let inode = state.root_names.get(name).ok_or_else(|| {
                 Error::coded(afs_error::NODE_VFS_NOT_FOUND, "root name not found")
             })?;
-            state
+            let record = state
                 .inodes
                 .get(inode)
-                .ok_or_else(|| stale("root inode not found"))?
-                .root_id
-                .clone()
+                .ok_or_else(|| stale("root inode not found"))?;
+            (record.root_id.clone(), record.identity.clone())
         };
         afs_logging::info!("ownerfs.rmdir_root.resolved"; "name" => ?name, "root_id" => ?root_id);
 
+        match self.roots.local_root_data_dir(&root_id)? {
+            Some((data_dir, epoch)) => {
+                // 解析出的 root_id 在同名重建后不变：先确认缓存中的版本就是内核解析到的
+                // 目录，再把该版本的 epoch 交给 delete_root 在 workspace 锁内复核。
+                match self.disk.metadata(&data_dir) {
+                    Ok(metadata) => check_expected_identity(
+                        Some(&root_identity),
+                        &identity_from_metadata(&metadata)?,
+                    )?,
+                    // 目录已不存在时交给 delete_root 收敛残留记录。
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(Error::from(error)),
+                }
+                self.ensure_root_empty(&data_dir)?;
+                self.delete_local_root(&root_id, Some(epoch), Some(&root_identity), false)
+            }
+            None => self.rmdir_remote_root(ctx, &root_id, &root_identity),
+        }
+    }
+
+    /// 只结束空 workspace：`delete_root` 在 Meta deactivate 之后才删除物理目录，
+    /// 非空目录若走到那一步，ENOTEMPTY 返回时 workspace 已经下线。这里在任何删除步骤
+    /// 之前拒绝；检查与删除之间新写入的文件仍会走到上述路径。
+    /// 目录已不存在时交给 `delete_root` 收敛残留记录。
+    fn ensure_root_empty(&self, data_dir: &StoragePath) -> Result<()> {
+        match self.disk.read_dir(data_dir) {
+            Ok(entries) if !entries.is_empty() => Err(Error::coded(
+                afs_error::IO_DIRECTORY_NOT_EMPTY,
+                "workspace is not empty",
+            )),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::from(error)),
+        }
+    }
+
+    /// 非 Home 入口把删除转发给 Home。结果未知的请求不重放；只有确认删除成功或
+    /// root 已不存在时才清理本地状态，其他失败保留状态，由后续 lookup 向 Meta 确认。
+    fn rmdir_remote_root(
+        &self,
+        ctx: &RequestContext,
+        root_id: &RootId,
+        expected_root: &files::FileIdentity,
+    ) -> Result<()> {
+        // 缓存里没有、Meta 却指向本机：本机的删除已过缓存移除这个线性化点，由该次删除
+        // 负责清理状态；它在 Meta deactivate 失败时留下的残留由启动时的 zombie 检测清理。
+        if self
+            .roots
+            .lookup_root_location(root_id)?
+            .is_some_and(|location| location.home_node_id == self.roots.node_id())
+        {
+            return Err(Error::coded(
+                afs_error::NODE_VFS_NOT_FOUND,
+                "root is no longer active on this Home",
+            ));
+        }
+        let result = self
+            .acquire_remote_root(root_id, RootRight::Write)
+            .and_then(|remote| remote.files.rmdir_root(ctx, &remote.grant, expected_root));
+        // Home 先校验授权：root 已被删除时它返回授权错误而不是 NOT_FOUND。失败时只向
+        // Meta 确认 root 是否还在，不重发请求；Meta 不可达时按原错误返回。
+        let root_is_gone = match &result {
+            Ok(()) => true,
+            Err(error) => {
+                error.code() == afs_error::NODE_VFS_NOT_FOUND
+                    || matches!(self.roots.lookup_root_location(root_id), Ok(None))
+            }
+        };
+        if root_is_gone {
+            // 同名重建后 root_id 不变，此时本机可能已有新版本的记录（例如本机成为新 Home
+            // 后处理的 peer 请求），所以只回收被删版本的记录，并与新记录的发布共用 state
+            // 锁。本机不是被删版本的 Home，PrivateFuseCache 中没有它的条目。
+            self.state
+                .lock()
+                .map_err(|_| poisoned())?
+                .remove_root(root_id, expected_root, false);
+            self.invalidate_remote_root(root_id)?;
+        }
+        match result {
+            Err(error) if root_is_gone && error.code() != afs_error::NODE_VFS_NOT_FOUND => {
+                Err(Error::coded(
+                    afs_error::NODE_VFS_NOT_FOUND,
+                    "root is no longer registered in Meta",
+                ))
+            }
+            result => result,
+        }
+    }
+
+    /// 清除已删除代次的 FUSE 索引、共享缓存与 native home 索引。调用方须持有
+    /// 该 workspace 的锁，同名新代次因此不可能同时存在，按 RootId 清理是安全的。
+    fn retire_root_state(
+        &self,
+        root_id: &RootId,
+        epoch: Option<u64>,
+        root_identity: Option<&files::FileIdentity>,
+    ) -> Result<()> {
+        {
+            let mut state = self.state.lock().map_err(|_| poisoned())?;
+            if let Some(identity) = root_identity {
+                state.remove_root(root_id, identity, true);
+            } else {
+                // Home-local entries carry no epoch; remove them as well.
+                state.remove_root_epoch(root_id, epoch);
+                state.remove_root_epoch(root_id, None);
+                state.root_epochs.remove(root_id);
+            }
+        }
+        afs_logging::info!("ownerfs.rmdir_root.state_cleaned"; "root_id" => ?root_id);
+        self.private_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove_root(root_id);
+        afs_logging::info!("ownerfs.rmdir_root.cache_cleaned"; "root_id" => ?root_id);
+        Ok(())
+    }
+
+    /// 在 workspace 锁内卸载 bind、删除该 epoch，再清理对应的 inode/cache 状态。
+    fn delete_local_root(
+        &self,
+        root_id: &RootId,
+        expected_epoch: Option<u64>,
+        root_identity: Option<&files::FileIdentity>,
+        recursive: bool,
+    ) -> Result<()> {
         // 2. 卸载活跃 bind mount。detach 失败（如活跃 fd 导致 EBUSY）时
         //    request_unmount 记录日志并保留条目，不阻塞删除流程；物理目录
         //    删除若因残留挂载失败，由下次启动的 reconcile 重试。
-        if let Some(mm) = &self.mount_manager {
-            mm.request_unmount(&root_id)?;
-        }
-        afs_logging::info!("ownerfs.rmdir_root.unmounted"; "root_id" => ?root_id);
+        let unmount = || {
+            if let Some(mm) = &self.mount_manager {
+                mm.request_unmount(root_id)?;
+            }
+            afs_logging::info!("ownerfs.rmdir_root.unmounted"; "root_id" => ?root_id);
+            Ok(())
+        };
 
-        // 3. RootManager::delete_root（revoke → 缓存移除 → Meta deactivate
-        //    → 物理目录 → catalog）。
-        self.roots.delete_root(&root_id)?;
+        let clean = || self.retire_root_state(root_id, expected_epoch, root_identity);
+
+        // RootManager 在清理物理目录及控制记录之后执行索引回收。
+        self.roots
+            .delete_root_with(root_id, expected_epoch, recursive, unmount, clean)?;
         afs_logging::info!("ownerfs.rmdir_root.root_deleted"; "root_id" => ?root_id);
-
-        // 4. 清除 OwnerState 中的 FUSE 索引。
-        {
-            let mut state = self.state.lock().map_err(|_| poisoned())?;
-            state.remove_root(&root_id);
-        }
-        afs_logging::info!("ownerfs.rmdir_root.state_cleaned"; "root_id" => ?root_id);
-
-        // 5. 清除 PrivateFuseCache 中的共享缓存与 native home 索引。
-        {
-            let mut cache = self
-                .private_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            cache.remove_root(&root_id);
-        }
-        afs_logging::info!("ownerfs.rmdir_root.cache_cleaned"; "root_id" => ?root_id);
 
         Ok(())
     }
@@ -5122,20 +5520,25 @@ impl LocalOwnerFs {
         {
             Ok(root_use) => root_use,
             Err(error) if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE => {
-                let remote = self.remote_for_record(&from_parent, RootRight::Write)?;
-                let expected_old = self.remote_expected_identity(&from_parent.root_id, &from)?;
-                let expected_new = self.remote_expected_identity(&from_parent.root_id, &to)?;
-                remote.files.rename(
-                    ctx,
-                    &remote.grant,
-                    from.as_path().as_os_str(),
-                    to.as_path().as_os_str(),
-                    expected_old.as_ref(),
-                    expected_new.as_ref(),
-                    &from_parent.identity,
-                    &to_parent.identity,
-                    flags,
-                )?;
+                require_same_incarnation([&from_parent, &to_parent])?;
+                let expected_old =
+                    self.remote_expected_identity(&from_parent.root_id, &from, from_parent.epoch)?;
+                let expected_new =
+                    self.remote_expected_identity(&from_parent.root_id, &to, from_parent.epoch)?;
+                let (remote, ()) =
+                    self.with_remote_write_retry(&from_parent, RootRight::Write, |remote| {
+                        remote.files.rename(
+                            ctx,
+                            &remote.grant,
+                            from.as_path().as_os_str(),
+                            to.as_path().as_os_str(),
+                            expected_old.as_ref(),
+                            expected_new.as_ref(),
+                            &from_parent.identity,
+                            &to_parent.identity,
+                            flags,
+                        )
+                    })?;
                 let same_hardlink = flags.0 == 0
                     && if let Some(expected_old) = expected_old.as_ref() {
                         remote
@@ -5157,16 +5560,20 @@ impl LocalOwnerFs {
                             Some(&expected_old),
                         )?;
                         let mut state = self.state.lock().map_err(|_| poisoned())?;
-                        state.inode_for_path(
+                        state.inode_for_remote_path(
+                            &to_parent.version,
+                            LookupIndexMode::Ordinary,
                             entry.root_id,
                             to,
                             entry.identity,
                             entry.attributes.clone(),
                             entry.attributes.kind,
-                        );
+                            Some(remote.grant.epoch),
+                        )?;
                     }
                 } else {
                     let mut state = self.state.lock().map_err(|_| poisoned())?;
+                    state.begin_epoch_apply(&from_parent.root_id, remote.grant.epoch)?;
                     state.rename_path(from_parent.root_id, from, to);
                 }
                 return Ok(());
@@ -5238,15 +5645,22 @@ impl LocalOwnerFs {
         {
             Ok(root_use) => root_use,
             Err(error) if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE => {
-                let remote = self.remote_for_record(&parent_record, RootRight::Write)?;
-                let entry = remote.files.symlink(
-                    ctx,
-                    &remote.grant,
-                    child.as_path().as_os_str(),
-                    target,
-                    &parent_record.identity,
+                let (remote, entry) =
+                    self.with_remote_write_retry(&parent_record, RootRight::Write, |remote| {
+                        remote.files.symlink(
+                            ctx,
+                            &remote.grant,
+                            child.as_path().as_os_str(),
+                            target,
+                            &parent_record.identity,
+                        )
+                    })?;
+                let inode = self.insert_remote_entry(
+                    &parent_record.version,
+                    child,
+                    entry.clone(),
+                    remote.grant.epoch,
                 )?;
-                let inode = self.insert_remote_entry(child, entry.clone())?;
                 return Ok(Entry {
                     inode: backend_inode(inode),
                     attributes: entry.attributes,
@@ -5359,16 +5773,24 @@ impl LocalOwnerFs {
         {
             Ok(root_use) => root_use,
             Err(error) if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE => {
-                let remote = self.remote_for_record(&parent_record, RootRight::Write)?;
-                let entry = remote.files.link(
-                    _ctx,
-                    &remote.grant,
-                    source_record.relative.as_path().as_os_str(),
-                    child.as_path().as_os_str(),
-                    &source_record.identity,
-                    &parent_record.identity,
+                require_same_incarnation([&source_record, &parent_record])?;
+                let (remote, entry) =
+                    self.with_remote_write_retry(&parent_record, RootRight::Write, |remote| {
+                        remote.files.link(
+                            _ctx,
+                            &remote.grant,
+                            source_record.relative.as_path().as_os_str(),
+                            child.as_path().as_os_str(),
+                            &source_record.identity,
+                            &parent_record.identity,
+                        )
+                    })?;
+                let inode = self.insert_remote_entry(
+                    &parent_record.version,
+                    child,
+                    entry.clone(),
+                    remote.grant.epoch,
                 )?;
-                let inode = self.insert_remote_entry(child, entry.clone())?;
                 return Ok(Entry {
                     inode: backend_inode(inode),
                     attributes: entry.attributes,
@@ -5436,15 +5858,20 @@ impl LocalOwnerFs {
             return Ok(entry);
         }
         let id = root::root_id_from_name(name)?;
-        let entry = self.with_remote_root_retry(&id, RootRight::Lookup, |remote| {
-            remote.files.lookup(&remote.grant, OsStr::new(""), None)
-        })?;
+        // A fresh lookup has no incarnation yet; the grant it gets establishes one.
+        let (remote, entry) =
+            self.with_remote_root_retry(&id, None, RootRight::Lookup, |remote| {
+                remote.files.lookup(&remote.grant, OsStr::new(""), None)
+            })?;
+        let epoch = remote.grant.epoch;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
+        state.begin_epoch_apply(&entry.root_id, epoch)?;
         let inode = state.insert_root(
             name.to_os_string(),
             entry.root_id,
             entry.identity,
             entry.attributes.clone(),
+            Some(epoch),
         );
         Ok(Entry {
             inode: backend_inode(inode),
@@ -5467,12 +5894,35 @@ impl LocalOwnerFs {
             .map_err(Error::from)?;
         let identity = identity_from_metadata(&metadata)?;
         let attributes = attributes_from_metadata(metadata)?;
+        self.publish_local_root_entry(name, id, root_use.data_dir(), identity, attributes)
+            .map(Some)
+    }
+
+    /// 发布本机 Home 上读取到的根目录。读取与发布之间，root 可能已被删除（包括其他节点
+    /// 经 `RmdirRoot` 发起的删除，本机 FUSE 的目录锁挡不住），也可能已同名重建。删除先把
+    /// root 移出 RootManager 缓存，再在 state 锁内清理索引；这里在 state 锁内确认缓存中
+    /// 仍是同一版本（数据目录相同）后才发布，否则返回 NOT_FOUND，不会恢复已删除的索引。
+    fn publish_local_root_entry(
+        &self,
+        name: &OsStr,
+        id: RootId,
+        data_dir: &StoragePath,
+        identity: files::FileIdentity,
+        attributes: FileAttributes,
+    ) -> Result<Entry> {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
-        let inode = state.insert_root(name.to_os_string(), id, identity, attributes.clone());
-        Ok(Some(Entry {
+        let current = self.roots.local_root_data_dir(&id)?;
+        if current.as_ref().map(|(current, _)| current) != Some(data_dir) {
+            return Err(Error::coded(
+                afs_error::NODE_VFS_NOT_FOUND,
+                "workspace was deleted while its root was being looked up",
+            ));
+        }
+        let inode = state.insert_root(name.to_os_string(), id, identity, attributes.clone(), None);
+        Ok(Entry {
             inode: backend_inode(inode),
             attributes,
-        }))
+        })
     }
 
     fn acquire_remote_root(&self, id: &RootId, right: RootRight) -> Result<RemoteRoot> {
@@ -5516,10 +5966,20 @@ impl LocalOwnerFs {
             files: factory.connect(&grant.home_node_id)?,
             grant,
         };
-        self.remote_roots
-            .lock()
-            .map_err(|_| poisoned())?
-            .insert(id.clone(), remote.clone());
+        // Retire the replaced incarnation's records before this grant becomes
+        // visible: once a request can take it from the cache, the index must
+        // already reject replies and identities from the old incarnation.
+        self.observe_remote_epoch(id, remote.grant.epoch)?;
+        let mut cache = self.remote_roots.lock().map_err(|_| poisoned())?;
+        // A request that started before the recreation may arrive with the
+        // superseded grant after a refresh published the new one; never
+        // roll the cache back.
+        if cache
+            .get(id)
+            .is_none_or(|current| current.grant.epoch <= remote.grant.epoch)
+        {
+            cache.insert(id.clone(), remote.clone());
+        }
         Ok(remote)
     }
 
@@ -5528,50 +5988,110 @@ impl LocalOwnerFs {
         Ok(())
     }
 
-    fn with_remote_root_retry<T>(
+    /// Replaces the root's grant; if `epoch` advanced, drops only the records
+    /// observed under `previous_epoch` and returns STALE. Replaying into the
+    /// recreated workspace could even discard files through an `O_TRUNC` create.
+    fn refresh_remote_root(
         &self,
         id: &RootId,
         right: RootRight,
+        previous_epoch: Option<u64>,
+    ) -> Result<RemoteRoot> {
+        self.invalidate_remote_root(id)?;
+        let refreshed = self.acquire_remote_root_uncached(id, right)?;
+        let Some(previous_epoch) = previous_epoch else {
+            return Ok(refreshed);
+        };
+        if refreshed.grant.epoch == previous_epoch {
+            return Ok(refreshed);
+        }
+        self.drop_root_epoch(id, Some(previous_epoch))?;
+        // The private cache holds Home-side state keyed by RootId, which
+        // survives recreation; an entry node has none for a forwarded root, so
+        // this path only drops records, like `bind_remote_epoch`.
+        Err(stale_incarnation())
+    }
+
+    fn with_remote_root_retry<T>(
+        &self,
+        id: &RootId,
+        expected_epoch: Option<u64>,
+        right: RootRight,
         mut op: impl FnMut(&RemoteRoot) -> Result<T>,
-    ) -> Result<T> {
-        let remote = self.acquire_remote_root(id, right)?;
+    ) -> Result<(RemoteRoot, T)> {
+        let remote = self.bind_remote_epoch(id, expected_epoch, right)?;
         match op(&remote) {
             Err(error) if should_refresh_remote_root(&error) => {
-                self.invalidate_remote_root(id)?;
-                let refreshed = self.acquire_remote_root_uncached(id, right)?;
-                op(&refreshed)
+                let refreshed = self.refresh_remote_root(id, right, expected_epoch)?;
+                let value = op(&refreshed)?;
+                Ok((refreshed, value))
             }
-            result => result,
+            Ok(value) => Ok((remote, value)),
+            Err(error) => Err(error),
         }
     }
 
-    fn insert_remote_entry(&self, relative: StoragePath, entry: files::OwnerEntry) -> Result<u64> {
-        self.insert_remote_entry_with_mode(relative, entry, LookupIndexMode::Ordinary)
+    /// Runs one remote write and replays it at most once after Home rejects the
+    /// presented grant.
+    ///
+    /// Only `should_refresh_remote_write` codes are retried: Home returns them
+    /// before the operation changes anything, so a replay cannot duplicate it.
+    /// Connection and transfer failures may already have reached Home and are
+    /// not replayed. The returned remote served the call and must be reused.
+    fn with_remote_write_retry<T>(
+        &self,
+        record: &NodeRecord,
+        right: RootRight,
+        mut op: impl FnMut(&RemoteRoot) -> Result<T>,
+    ) -> Result<(RemoteRoot, T)> {
+        let remote = self.remote_for_record(record, right)?;
+        match op(&remote) {
+            Err(error) if should_refresh_remote_write(&error) => {
+                let refreshed = self.refresh_remote_root(&record.root_id, right, record.epoch)?;
+                let value = op(&refreshed)?;
+                Ok((refreshed, value))
+            }
+            Ok(value) => Ok((remote, value)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `version` 是发起请求时父记录所属的 workspace 版本，见 [`OwnerState::inode_for_remote_path`]。
+    fn insert_remote_entry(
+        &self,
+        version: &files::FileIdentity,
+        relative: StoragePath,
+        entry: files::OwnerEntry,
+        epoch: u64,
+    ) -> Result<u64> {
+        self.insert_remote_entry_with_mode(
+            version,
+            relative,
+            entry,
+            LookupIndexMode::Ordinary,
+            epoch,
+        )
     }
 
     fn insert_remote_entry_with_mode(
         &self,
+        version: &files::FileIdentity,
         relative: StoragePath,
         entry: files::OwnerEntry,
         mode: LookupIndexMode,
+        epoch: u64,
     ) -> Result<u64> {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
-        Ok(match mode {
-            LookupIndexMode::Ordinary => state.inode_for_path(
-                entry.root_id,
-                relative,
-                entry.identity,
-                entry.attributes.clone(),
-                entry.attributes.kind,
-            ),
-            LookupIndexMode::ObservedPath => state.inode_for_observed_path(
-                entry.root_id,
-                relative,
-                entry.identity,
-                entry.attributes.clone(),
-                entry.attributes.kind,
-            ),
-        })
+        state.inode_for_remote_path(
+            version,
+            mode,
+            entry.root_id,
+            relative,
+            entry.identity,
+            entry.attributes.clone(),
+            entry.attributes.kind,
+            Some(epoch),
+        )
     }
 
     fn lookup_selected_readdir_entry(
@@ -5598,14 +6118,25 @@ impl LocalOwnerFs {
         let root_use = match self.roots.enter_root(root_id, RootRight::Lookup) {
             Ok(root_use) => root_use,
             Err(error) if error.code() == afs_error::NODE_OWNER_GRANT_UNAVAILABLE => {
-                let entry = self.with_remote_root_retry(root_id, RootRight::Lookup, |remote| {
-                    remote.files.lookup(
-                        &remote.grant,
-                        relative.as_path().as_os_str(),
-                        Some(&parent.identity),
-                    )
-                })?;
-                let inode = self.insert_remote_entry_with_mode(relative, entry.clone(), mode)?;
+                let (remote, entry) = self.with_remote_root_retry(
+                    root_id,
+                    parent.epoch,
+                    RootRight::Lookup,
+                    |remote| {
+                        remote.files.lookup(
+                            &remote.grant,
+                            relative.as_path().as_os_str(),
+                            Some(&parent.identity),
+                        )
+                    },
+                )?;
+                let inode = self.insert_remote_entry_with_mode(
+                    &parent.version,
+                    relative,
+                    entry.clone(),
+                    mode,
+                    remote.grant.epoch,
+                )?;
                 return Ok(Entry {
                     inode: backend_inode(inode),
                     attributes: entry.attributes,
@@ -5722,6 +6253,12 @@ struct NodeRecord {
     identity: files::FileIdentity,
     attributes: FileAttributes,
     kind: FileKind,
+    /// 所属 workspace 版本的根目录 identity。同名重建后 `root_id` 不变，删除时按它只回收
+    /// 被删版本的记录；为空表示创建记录时本机还没有该 root 的根目录记录。
+    version: files::FileIdentity,
+    /// Incarnation the record was observed in. Remote records are bound to the
+    /// `RootGrant::epoch` that served them; locally owned roots stay `None`.
+    epoch: Option<u64>,
 }
 
 struct OwnerState {
@@ -5734,6 +6271,9 @@ struct OwnerState {
     aliases: HashMap<u64, HashSet<StoragePath>>,
     identity_members: HashMap<(RootId, Vec<u8>), HashSet<u64>>,
     identities: HashMap<(RootId, Vec<u8>), u64>,
+    /// Highest incarnation observed for each root; records of older
+    /// incarnations are dropped when a newer one appears.
+    root_epochs: HashMap<RootId, u64>,
     inodes: HashMap<u64, NodeRecord>,
     file_handles: HashMap<FileHandle, Arc<Mutex<OpenFileHandleSlot>>>,
     dir_handles: HashMap<DirectoryHandle, OpenDirectoryHandle>,
@@ -5752,6 +6292,7 @@ impl OwnerState {
             aliases: HashMap::new(),
             identity_members: HashMap::new(),
             identities: HashMap::new(),
+            root_epochs: HashMap::new(),
             inodes: HashMap::new(),
             file_handles: HashMap::new(),
             dir_handles: HashMap::new(),
@@ -5775,13 +6316,16 @@ impl OwnerState {
         root_id: RootId,
         identity: files::FileIdentity,
         attributes: FileAttributes,
+        epoch: Option<u64>,
     ) -> u64 {
+        if let Some(epoch) = epoch {
+            self.observe_root_epoch(&root_id, epoch);
+        }
         let relative = StoragePath::root();
         if let Some(inode) = self.root_names.get(&name).copied()
-            && self
-                .inodes
-                .get(&inode)
-                .is_some_and(|record| record.root_id == root_id && record.identity == identity)
+            && self.inodes.get(&inode).is_some_and(|record| {
+                record.root_id == root_id && record.identity == identity && record.epoch == epoch
+            })
         {
             self.attach_path(&root_id, relative.clone(), inode);
             self.inodes.insert(
@@ -5789,9 +6333,11 @@ impl OwnerState {
                 NodeRecord {
                     root_id,
                     relative,
+                    version: identity.clone(),
                     identity,
                     attributes,
                     kind: FileKind::Directory,
+                    epoch,
                 },
             );
             return inode;
@@ -5812,36 +6358,166 @@ impl OwnerState {
                 identity: identity.clone(),
                 attributes,
                 kind: FileKind::Directory,
+                version: identity.clone(),
+                epoch,
             },
         );
         self.attach_path(&root_id, relative, inode);
         inode
     }
 
-    /// D4: 清除与 root 关联的全部 FUSE 索引。
+    /// D4: 清除 root 被删版本的全部 FUSE 索引，包括已解绑路径的子项记录。
     ///
+    /// 同名重建后 `root_id` 不变，本机可能已有新版本的记录，所以只回收 `version`
+    /// 等于被删版本根目录 identity 的记录；`include_unversioned` 为真时一并回收版本
+    /// 未知的记录，只能由被删版本的 Home 在 workspace 锁内使用。
     /// 已打开的 file/dir handle 不强制关闭；FUSE release/releasedir 在 fd
-    /// 关闭时正常走完。root_id 不在 state 中时是无操作。
-    fn remove_root(&mut self, root_id: &RootId) {
-        let root_inodes: Vec<u64> = self
+    /// 关闭时正常走完。没有匹配记录时是无操作。
+    fn remove_root(
+        &mut self,
+        root_id: &RootId,
+        version: &files::FileIdentity,
+        include_unversioned: bool,
+    ) {
+        self.root_epochs.remove(root_id);
+        let stale: HashSet<u64> = self
             .inodes
             .iter()
-            .filter(|(_, record)| &record.root_id == root_id)
+            .filter(|(_, record)| {
+                &record.root_id == root_id
+                    && (&record.version == version
+                        || (include_unversioned && record.version.0.is_empty()))
+            })
             .map(|(&inode, _)| inode)
             .collect();
-        if root_inodes.is_empty() {
+        if stale.is_empty() {
             return;
         }
-        for inode in &root_inodes {
+        for inode in &stale {
             self.inodes.remove(inode);
             self.aliases.remove(inode);
         }
-        self.root_names
-            .retain(|_, inode| !root_inodes.contains(inode));
-        self.paths.retain(|(rid, _), _| rid != root_id);
-        self.subtrees.remove(root_id);
-        self.identity_members.retain(|(rid, _), _| rid != root_id);
-        self.identities.retain(|(rid, _), _| rid != root_id);
+        self.root_names.retain(|_, inode| !stale.contains(inode));
+        self.paths.retain(|_, inode| !stale.contains(inode));
+        let paths = &self.paths;
+        if let Some(subtree) = self.subtrees.get_mut(root_id) {
+            subtree.retain(|relative| paths.contains_key(&(root_id.clone(), relative.clone())));
+            if subtree.is_empty() {
+                self.subtrees.remove(root_id);
+            }
+        }
+        self.identity_members.retain(|_, members| {
+            members.retain(|inode| !stale.contains(inode));
+            !members.is_empty()
+        });
+        self.identities.retain(|_, inode| !stale.contains(inode));
+    }
+
+    /// Drops exactly the records observed under `epoch`: a same-name recreation
+    /// keeps the root id, so `remove_root` would also drop the new incarnation.
+    fn remove_root_epoch(&mut self, root_id: &RootId, epoch: Option<u64>) {
+        let victims: HashSet<u64> = self
+            .inodes
+            .iter()
+            .filter(|(_, record)| &record.root_id == root_id && record.epoch == epoch)
+            .map(|(&inode, _)| inode)
+            .collect();
+        self.remove_inodes(&victims);
+    }
+
+    /// Advances the root's incarnation; a newer epoch proves every older record
+    /// belongs to a replaced workspace.
+    fn observe_root_epoch(&mut self, root_id: &RootId, epoch: u64) {
+        if self
+            .root_epochs
+            .get(root_id)
+            .is_some_and(|current| *current >= epoch)
+        {
+            return;
+        }
+        self.root_epochs.insert(root_id.clone(), epoch);
+        let victims: HashSet<u64> = self
+            .inodes
+            .iter()
+            .filter(|(_, record)| {
+                &record.root_id == root_id && record.epoch.is_some_and(|observed| observed < epoch)
+            })
+            .map(|(&inode, _)| inode)
+            .collect();
+        self.remove_inodes(&victims);
+    }
+
+    /// Rejects a reply served by an incarnation the index already left.
+    fn begin_epoch_apply(&mut self, root_id: &RootId, epoch: u64) -> Result<()> {
+        if self
+            .root_epochs
+            .get(root_id)
+            .is_some_and(|current| *current > epoch)
+        {
+            return Err(stale_incarnation());
+        }
+        self.observe_root_epoch(root_id, epoch);
+        Ok(())
+    }
+
+    fn remove_inodes(&mut self, victims: &HashSet<u64>) {
+        if victims.is_empty() {
+            return;
+        }
+        // O(1) membership: the retain passes run under the shared state lock
+        // over a path table that can be large.
+        for inode in victims {
+            self.inodes.remove(inode);
+        }
+        self.root_names.retain(|_, inode| !victims.contains(inode));
+        self.paths.retain(|_, inode| !victims.contains(inode));
+        // Rebuild the derived indexes from the survivors.
+        self.rebuild_active_indexes();
+    }
+
+    /// 发布远端结果。`version` 是发起请求时父记录所属的 workspace 版本：该版本的根目录
+    /// 记录已不在路径上（已被删除，或已被同名新版本替换）时拒绝，迟到的结果不会留下
+    /// 无法按版本回收的记录。`version` 为空（父记录版本未知）时按当前根目录记录标记。
+    /// `epoch` 是服务该请求的 grant incarnation；索引已推进到更高版本时同样拒绝。
+    #[allow(clippy::too_many_arguments)]
+    fn inode_for_remote_path(
+        &mut self,
+        version: &files::FileIdentity,
+        mode: LookupIndexMode,
+        root_id: RootId,
+        relative: StoragePath,
+        identity: files::FileIdentity,
+        attributes: FileAttributes,
+        kind: FileKind,
+        epoch: Option<u64>,
+    ) -> Result<u64> {
+        if !version.0.is_empty() && self.root_version(&root_id) != *version {
+            return Err(stale(
+                "workspace version was deleted before the remote result arrived",
+            ));
+        }
+        if let Some(epoch) = epoch {
+            self.begin_epoch_apply(&root_id, epoch)?;
+        }
+        Ok(match mode {
+            LookupIndexMode::Ordinary => {
+                self.inode_for_path_in_epoch(root_id, relative, identity, attributes, kind, epoch)
+            }
+            LookupIndexMode::ObservedPath => self.inode_for_observed_path_in_epoch(
+                root_id, relative, identity, attributes, kind, epoch,
+            ),
+        })
+    }
+
+    /// 本机当前根目录记录的 identity，子项记录以它标记所属版本。
+    fn root_version(&self, root_id: &RootId) -> files::FileIdentity {
+        self.paths
+            .get(&(root_id.clone(), StoragePath::root()))
+            .and_then(|inode| self.inodes.get(inode))
+            .map_or_else(
+                || files::FileIdentity(Vec::new()),
+                |record| record.identity.clone(),
+            )
     }
 
     fn inode_for_path(
@@ -5852,12 +6528,26 @@ impl OwnerState {
         attributes: FileAttributes,
         kind: FileKind,
     ) -> u64 {
+        self.inode_for_path_in_epoch(root_id, relative, identity, attributes, kind, None)
+    }
+
+    /// `epoch` binds the record to the incarnation that served it; a recreated
+    /// workspace never reuses the previous inode or hardlink identity.
+    fn inode_for_path_in_epoch(
+        &mut self,
+        root_id: RootId,
+        relative: StoragePath,
+        identity: files::FileIdentity,
+        attributes: FileAttributes,
+        kind: FileKind,
+        epoch: Option<u64>,
+    ) -> u64 {
+        if let Some(epoch) = epoch {
+            self.observe_root_epoch(&root_id, epoch);
+        }
         let key = (root_id.clone(), relative.clone());
         if let Some(inode) = self.paths.get(&key).copied()
-            && self
-                .inodes
-                .get(&inode)
-                .is_some_and(|record| record.identity == identity)
+            && self.record_matches_incarnation(inode, &root_id, &identity, epoch)
         {
             if let Some(record) = self.inodes.get_mut(&inode) {
                 record.attributes = attributes;
@@ -5872,12 +6562,23 @@ impl OwnerState {
             self.detach_path(&root_id, &relative);
         }
         let identity_key = (root_id.clone(), identity.0.clone());
-        if let Some(inode) = self.identities.get(&identity_key).copied()
-            && self
-                .inodes
-                .get(&inode)
-                .is_some_and(|record| record.root_id == root_id && record.identity == identity)
-        {
+        // The sharing group spans incarnations: only reuse an identity from
+        // the same one.
+        let shared = self
+            .identities
+            .get(&identity_key)
+            .copied()
+            .filter(|inode| self.record_matches_incarnation(*inode, &root_id, &identity, epoch))
+            .or_else(|| {
+                self.identity_members
+                    .get(&identity_key)
+                    .and_then(|members| {
+                        members.iter().copied().find(|inode| {
+                            self.record_matches_incarnation(*inode, &root_id, &identity, epoch)
+                        })
+                    })
+            });
+        if let Some(inode) = shared {
             let had_active_path = self.active_path_for_inode(&root_id, inode).is_some();
             self.attach_path(&root_id, relative.clone(), inode);
             if let Some(record) = self.inodes.get_mut(&inode) {
@@ -5889,6 +6590,11 @@ impl OwnerState {
             }
             return inode;
         }
+        let version = if relative == StoragePath::root() {
+            identity.clone()
+        } else {
+            self.root_version(&root_id)
+        };
         let inode = self.allocate_inode();
         self.inodes.insert(
             inode,
@@ -5898,6 +6604,8 @@ impl OwnerState {
                 identity: identity.clone(),
                 attributes,
                 kind,
+                version,
+                epoch,
             },
         );
         self.attach_path(&root_id, relative, inode);
@@ -5912,10 +6620,23 @@ impl OwnerState {
         attributes: FileAttributes,
         kind: FileKind,
     ) -> u64 {
+        self.inode_for_observed_path_in_epoch(root_id, relative, identity, attributes, kind, None)
+    }
+
+    fn inode_for_observed_path_in_epoch(
+        &mut self,
+        root_id: RootId,
+        relative: StoragePath,
+        identity: files::FileIdentity,
+        attributes: FileAttributes,
+        kind: FileKind,
+        epoch: Option<u64>,
+    ) -> u64 {
         let selected_root_id = root_id.clone();
         let selected_relative = relative.clone();
         let selected_identity = identity.clone();
-        let inode = self.inode_for_path(root_id, relative, identity, attributes, kind);
+        let inode =
+            self.inode_for_path_in_epoch(root_id, relative, identity, attributes, kind, epoch);
         let selected_path_is_attached = self
             .paths
             .get(&(selected_root_id.clone(), selected_relative.clone()))
@@ -6029,6 +6750,18 @@ impl OwnerState {
         self.inodes
             .get(&inode)
             .map(|record| (record.root_id.clone(), record.identity.0.clone()))
+    }
+
+    fn record_matches_incarnation(
+        &self,
+        inode: u64,
+        root_id: &RootId,
+        identity: &files::FileIdentity,
+        epoch: Option<u64>,
+    ) -> bool {
+        self.inodes.get(&inode).is_some_and(|record| {
+            &record.root_id == root_id && &record.identity == identity && record.epoch == epoch
+        })
     }
 
     fn add_identity_member_for_active_inode(&mut self, inode: u64) {
@@ -7221,6 +7954,24 @@ fn stale(message: &'static str) -> Error {
     Error::coded(afs_error::NODE_OWNER_STALE_HANDLE, message)
 }
 
+/// A same-name recreation keeps the root id; a request bound to the previous
+/// incarnation must not run against the new workspace.
+fn stale_incarnation() -> Error {
+    stale("OwnerFs root was recreated under the same name")
+}
+
+/// Rejects a request that mixes records from different incarnations;
+/// unversioned records are not evidence of a mismatch.
+fn require_same_incarnation<'a>(records: impl IntoIterator<Item = &'a NodeRecord>) -> Result<()> {
+    let mut epochs = records.into_iter().filter_map(|record| record.epoch);
+    if let Some(first) = epochs.next()
+        && epochs.any(|epoch| epoch != first)
+    {
+        return Err(stale_incarnation());
+    }
+    Ok(())
+}
+
 fn should_refresh_remote_root(error: &Error) -> bool {
     matches!(
         error.code(),
@@ -7229,6 +7980,16 @@ fn should_refresh_remote_root(error: &Error) -> bool {
             | afs_error::NODE_OWNER_GRANT_UNAVAILABLE
             | afs_error::CLIENT_CONNECTION_UNAVAILABLE
             | afs_error::NODE_TRANSFER_UNAVAILABLE
+    )
+}
+
+/// Whether Home rejected the grant before applying the operation: peer write
+/// handlers validate before touching the namespace, so these codes prove the
+/// write did not happen. Unknown outcomes are never replayed by writes.
+fn should_refresh_remote_write(error: &Error) -> bool {
+    matches!(
+        error.code(),
+        afs_error::NODE_OWNER_INVALID_GRANT | afs_error::NODE_OWNER_GRANT_UNAVAILABLE
     )
 }
 
@@ -7547,7 +8308,7 @@ mod tests {
     }
 
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::{env, process::Command};
 
     use crate::node::vfs::ownerfs::root::{
@@ -7752,7 +8513,9 @@ mod tests {
     struct RestartingRemoteMeta {
         root_id: RootId,
         restarted: Arc<AtomicBool>,
+        epoch: Arc<AtomicU64>,
         acquire_calls: AtomicUsize,
+        root_removed: AtomicBool,
     }
 
     impl RestartingRemoteMeta {
@@ -7762,6 +8525,13 @@ mod tests {
             } else {
                 "home-old".to_owned()
             }
+        }
+
+        /// Models Meta deleting and recreating a workspace under the same name:
+        /// the root id is stable while the incarnation epoch advances.
+        fn recreate(&self) {
+            self.epoch.store(2, Ordering::SeqCst);
+            self.restarted.store(true, Ordering::SeqCst);
         }
     }
 
@@ -7783,12 +8553,12 @@ mod tests {
         }
 
         fn lookup_root(&self, id: &RootId) -> Result<Option<root::RootLocation>> {
-            if id != &self.root_id {
+            if id != &self.root_id || self.root_removed.load(Ordering::SeqCst) {
                 return Ok(None);
             }
             Ok(Some(root::RootLocation {
                 id: id.clone(),
-                epoch: 1,
+                epoch: self.epoch.load(Ordering::SeqCst),
                 home_node_id: "node-a".to_owned(),
                 home_session_id: self.home_session(),
             }))
@@ -7800,9 +8570,15 @@ mod tests {
 
         fn acquire_root(&self, id: &RootId, right: RootRight) -> Result<RootGrant> {
             self.acquire_calls.fetch_add(1, Ordering::SeqCst);
+            if self.root_removed.load(Ordering::SeqCst) {
+                return Err(Error::coded(
+                    afs_error::NODE_VFS_NOT_FOUND,
+                    "test root is deleted",
+                ));
+            }
             Ok(RootGrant {
                 id: id.clone(),
-                epoch: 1,
+                epoch: self.epoch.load(Ordering::SeqCst),
                 home_node_id: "node-a".to_owned(),
                 home_session_id: self.home_session(),
                 holder_node_id: "node-b".to_owned(),
@@ -7843,6 +8619,7 @@ mod tests {
     struct RestartingRemoteFiles {
         root_id: RootId,
         restarted: Arc<AtomicBool>,
+        epoch: Arc<AtomicU64>,
         lookup_calls: AtomicUsize,
         statfs_calls: AtomicUsize,
         fail_statfs_permission: AtomicBool,
@@ -7850,10 +8627,28 @@ mod tests {
         last_open_killpriv: AtomicBool,
         opendir_calls: AtomicUsize,
         readdir_calls: AtomicUsize,
+        readdir_returns_child: AtomicBool,
         releasedir_calls: AtomicUsize,
         releasedir_handles: Mutex<Vec<Vec<u8>>>,
         fail_readdir_once: AtomicBool,
         fail_releasedir_once: AtomicBool,
+        rmdir_root_calls: AtomicUsize,
+        rmdir_root_expected: Mutex<Option<files::FileIdentity>>,
+        rmdir_root_error: Mutex<Option<afs_error::ErrorCode>>,
+        /// 在 Home 生成回复之后、入口处理回复之前执行，用于构造交错。
+        rmdir_root_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        write_attempts: AtomicUsize,
+        write_executions: AtomicUsize,
+        fail_write_connection_once: AtomicBool,
+        fail_write_unavailable_once: AtomicBool,
+        write_gate: Mutex<Option<WriteGate>>,
+    }
+
+    /// Holds an accepted write between its Home-side effect and the reply, so a
+    /// test can interleave a refresh that replaces the incarnation.
+    struct WriteGate {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
     }
 
     impl RestartingRemoteFiles {
@@ -7871,6 +8666,12 @@ mod tests {
         }
 
         fn reject_old_child_access(&self, grant: &RootGrant, path: &OsStr) -> Result<()> {
+            if grant.epoch != self.epoch.load(Ordering::SeqCst) {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_INVALID_GRANT,
+                    "stale root epoch",
+                ));
+            }
             if grant.home_session_id == "home-old" && !path.as_bytes().is_empty() {
                 self.restarted.store(true, Ordering::SeqCst);
                 return Err(Error::coded(
@@ -7880,6 +8681,65 @@ mod tests {
             }
             Ok(())
         }
+
+        /// Models Home rejecting a write before it changes anything; only an
+        /// accepted attempt counts as an execution.
+        fn accept_write(&self, grant: &RootGrant) -> Result<()> {
+            self.write_attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .fail_write_unavailable_once
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_GRANT_UNAVAILABLE,
+                    "injected remote root grant unavailability",
+                ));
+            }
+            if self
+                .fail_write_connection_once
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(Error::coded(
+                    afs_error::CLIENT_CONNECTION_UNAVAILABLE,
+                    "injected remote write connection loss",
+                ));
+            }
+            peer_write_grant_check(grant, &self.restarted, &self.epoch)?;
+            self.write_executions.fetch_add(1, Ordering::SeqCst);
+            let gate = self
+                .write_gate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(gate) = gate {
+                let _ = gate.started.send(());
+                let _ = gate.release.recv();
+            }
+            Ok(())
+        }
+    }
+
+    /// Shared Home-side admission: rejects a write whose grant belongs to the
+    /// previous Home session or a recreated incarnation, before side effects.
+    fn peer_write_grant_check(
+        grant: &RootGrant,
+        restarted: &AtomicBool,
+        epoch: &AtomicU64,
+    ) -> Result<()> {
+        if grant.epoch != epoch.load(Ordering::SeqCst) {
+            return Err(Error::coded(
+                afs_error::NODE_OWNER_INVALID_GRANT,
+                "stale root epoch",
+            ));
+        }
+        if grant.home_session_id == "home-old" {
+            restarted.store(true, Ordering::SeqCst);
+            return Err(Error::coded(
+                afs_error::NODE_OWNER_INVALID_GRANT,
+                "old home session",
+            ));
+        }
+        Ok(())
     }
 
     struct SlowRemoteFiles {
@@ -8097,6 +8957,15 @@ mod tests {
             _: &RootGrant,
             _: &OsStr,
             _: Option<&files::FileIdentity>,
+            _: &files::FileIdentity,
+        ) -> Result<()> {
+            self.unsupported()
+        }
+
+        fn rmdir_root(
+            &self,
+            _: &RequestContext,
+            _: &RootGrant,
             _: &files::FileIdentity,
         ) -> Result<()> {
             self.unsupported()
@@ -8322,13 +9191,14 @@ mod tests {
         fn setattr(
             &self,
             _: &RequestContext,
-            _: &RootGrant,
+            grant: &RootGrant,
             _: &OsStr,
             _: Option<&files::FileIdentity>,
             _: Option<&files::RemoteFile>,
             _: &AttributeChange,
         ) -> Result<files::OwnerEntry> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.accept_write(grant)?;
+            Ok(self.entry(FileKind::Regular))
         }
 
         fn getxattr(
@@ -8379,64 +9249,95 @@ mod tests {
         fn create(
             &self,
             _: &RequestContext,
-            _: &RootGrant,
+            grant: &RootGrant,
             _: &OsStr,
             _: i32,
             _: u32,
             _: &files::FileIdentity,
         ) -> Result<remote::RemoteCreatedFile> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.accept_write(grant)?;
+            let entry = self.entry(FileKind::Regular);
+            Ok(remote::RemoteCreatedFile {
+                file: files::RemoteFile {
+                    root_id: entry.root_id.clone(),
+                    owner_node_id: grant.home_node_id.clone(),
+                    owner_session_id: grant.home_session_id.clone(),
+                    identity: entry.identity.clone(),
+                    handle: vec![9],
+                },
+                entry,
+            })
         }
 
         fn mkdir(
             &self,
             _: &RequestContext,
-            _: &RootGrant,
+            grant: &RootGrant,
             _: &OsStr,
             _: u32,
             _: &files::FileIdentity,
         ) -> Result<files::OwnerEntry> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.accept_write(grant)?;
+            Ok(self.entry(FileKind::Directory))
         }
 
         fn mknod(
             &self,
             _: &RequestContext,
-            _: &RootGrant,
+            grant: &RootGrant,
             _: &OsStr,
             _: SpecialFileKind,
             _: u32,
             _: &files::FileIdentity,
         ) -> Result<files::OwnerEntry> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.accept_write(grant)?;
+            Ok(self.entry(FileKind::Regular))
         }
 
         fn unlink(
             &self,
             _: &RequestContext,
-            _: &RootGrant,
+            grant: &RootGrant,
             _: &OsStr,
             _: Option<&files::FileIdentity>,
             _: &files::FileIdentity,
         ) -> Result<()> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.accept_write(grant)
         }
 
         fn rmdir(
             &self,
             _: &RequestContext,
-            _: &RootGrant,
+            grant: &RootGrant,
             _: &OsStr,
             _: Option<&files::FileIdentity>,
             _: &files::FileIdentity,
         ) -> Result<()> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.accept_write(grant)
+        }
+
+        fn rmdir_root(
+            &self,
+            _: &RequestContext,
+            _: &RootGrant,
+            expected_root: &files::FileIdentity,
+        ) -> Result<()> {
+            self.rmdir_root_calls.fetch_add(1, Ordering::SeqCst);
+            *self.rmdir_root_expected.lock().unwrap() = Some(expected_root.clone());
+            let reply = match *self.rmdir_root_error.lock().unwrap() {
+                Some(code) => Err(Error::coded(code, "injected Home rmdir_root failure")),
+                None => Ok(()),
+            };
+            if let Some(hook) = self.rmdir_root_hook.lock().unwrap().take() {
+                hook();
+            }
+            reply
         }
 
         fn rename(
             &self,
             _: &RequestContext,
-            _: &RootGrant,
+            grant: &RootGrant,
             _: &OsStr,
             _: &OsStr,
             _: Option<&files::FileIdentity>,
@@ -8445,7 +9346,7 @@ mod tests {
             _: &files::FileIdentity,
             _: RenameFlags,
         ) -> Result<()> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.accept_write(grant)
         }
 
         fn open(
@@ -8503,24 +9404,26 @@ mod tests {
         fn symlink(
             &self,
             _: &RequestContext,
-            _: &RootGrant,
+            grant: &RootGrant,
             _: &OsStr,
             _: &OsStr,
             _: &files::FileIdentity,
         ) -> Result<files::OwnerEntry> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.accept_write(grant)?;
+            Ok(self.entry(FileKind::Symlink))
         }
 
         fn link(
             &self,
             _: &RequestContext,
-            _: &RootGrant,
+            grant: &RootGrant,
             _: &OsStr,
             _: &OsStr,
             _: &files::FileIdentity,
             _: &files::FileIdentity,
         ) -> Result<files::OwnerEntry> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.accept_write(grant)?;
+            Ok(self.entry(FileKind::Regular))
         }
 
         fn read(
@@ -8579,7 +9482,14 @@ mod tests {
                     "injected remote readdir grant loss",
                 ));
             }
-            Ok(Vec::new())
+            if !self.readdir_returns_child.load(Ordering::SeqCst) {
+                return Ok(Vec::new());
+            }
+            Ok(vec![remote::RemoteDirectoryEntry {
+                name: OsString::from("child"),
+                entry: self.entry(FileKind::Regular),
+                next_cookie: 1,
+            }])
         }
 
         fn fsyncdir(&self, _: &RootGrant, _: &files::RemoteDirectory, _: bool) -> Result<()> {
@@ -8629,14 +9539,18 @@ mod tests {
         let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
         let root_id = root::root_id_from_name(OsStr::new("job-42")).unwrap();
         let restarted = Arc::new(AtomicBool::new(false));
+        let epoch = Arc::new(AtomicU64::new(1));
         let meta = Arc::new(RestartingRemoteMeta {
             root_id: root_id.clone(),
             restarted: restarted.clone(),
+            epoch: epoch.clone(),
             acquire_calls: AtomicUsize::new(0),
+            root_removed: AtomicBool::new(false),
         });
         let remote = Arc::new(RestartingRemoteFiles {
             root_id: root_id.clone(),
             restarted,
+            epoch,
             lookup_calls: AtomicUsize::new(0),
             statfs_calls: AtomicUsize::new(0),
             fail_statfs_permission: AtomicBool::new(false),
@@ -8644,10 +9558,20 @@ mod tests {
             last_open_killpriv: AtomicBool::new(false),
             opendir_calls: AtomicUsize::new(0),
             readdir_calls: AtomicUsize::new(0),
+            readdir_returns_child: AtomicBool::new(false),
             releasedir_calls: AtomicUsize::new(0),
             releasedir_handles: Mutex::new(Vec::new()),
             fail_readdir_once: AtomicBool::new(false),
             fail_releasedir_once: AtomicBool::new(false),
+            rmdir_root_calls: AtomicUsize::new(0),
+            rmdir_root_expected: Mutex::new(None),
+            rmdir_root_error: Mutex::new(None),
+            rmdir_root_hook: Mutex::new(None),
+            write_attempts: AtomicUsize::new(0),
+            write_executions: AtomicUsize::new(0),
+            fail_write_connection_once: AtomicBool::new(false),
+            fail_write_unavailable_once: AtomicBool::new(false),
+            write_gate: Mutex::new(None),
         });
         let roots = Arc::new(RootManager::new(
             "node-b".into(),
@@ -11639,6 +12563,536 @@ mod tests {
         fs.release(&ctx, handle).unwrap();
     }
 
+    /// Root lookup caches the Home grant without touching a child path, so the
+    /// following write starts from a grant the (now restarted) Home rejects.
+    fn stale_remote_write_fixture() -> (
+        tempfile::TempDir,
+        OwnerFs,
+        RequestContext,
+        Arc<RestartingRemoteMeta>,
+        Arc<RestartingRemoteFiles>,
+        RootId,
+        Entry,
+    ) {
+        let (temp, fs, ctx, meta, remote, root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        assert_eq!(workspace.attributes.kind, FileKind::Directory);
+        assert_eq!(meta.acquire_calls.load(Ordering::SeqCst), 1);
+        assert!(!remote.restarted.load(Ordering::SeqCst));
+        (temp, fs, ctx, meta, remote, root_id, workspace)
+    }
+
+    fn seed_remote_child(fs: &OwnerFs, root_id: &RootId, name: &str) -> BackendInode {
+        let local = fs.require_local().unwrap();
+        let mut state = local.state.lock().unwrap();
+        let epoch = state
+            .inodes
+            .values()
+            .find(|record| &record.root_id == root_id)
+            .and_then(|record| record.epoch);
+        backend_inode(state.inode_for_path_in_epoch(
+            root_id.clone(),
+            StoragePath::new(name).unwrap(),
+            files::FileIdentity(vec![1]),
+            test_attrs(FileKind::Regular),
+            FileKind::Regular,
+            epoch,
+        ))
+    }
+
+    fn assert_home_executed_write_once(
+        meta: &RestartingRemoteMeta,
+        remote: &RestartingRemoteFiles,
+    ) {
+        assert!(remote.restarted.load(Ordering::SeqCst));
+        assert_eq!(meta.acquire_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(remote.write_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(remote.write_executions.load(Ordering::SeqCst), 1);
+    }
+
+    /// Pauses the next accepted write until the test releases it.
+    fn install_write_gate(
+        remote: &RestartingRemoteFiles,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *remote.write_gate.lock().unwrap() = Some(WriteGate {
+            started,
+            release: release_rx,
+        });
+        (started_rx, release)
+    }
+
+    #[test]
+    fn remote_write_setattr_refreshes_cached_grant_after_home_restart() {
+        let (_temp, fs, ctx, meta, remote, root_id, _workspace) = stale_remote_write_fixture();
+        let inode = seed_remote_child(&fs, &root_id, "a.txt");
+
+        fs.setattr(
+            &ctx,
+            inode,
+            None,
+            &AttributeChange {
+                size: Some(7),
+                ..AttributeChange::default()
+            },
+        )
+        .unwrap();
+
+        assert_home_executed_write_once(&meta, &remote);
+    }
+
+    #[test]
+    fn remote_write_create_refreshes_cached_grant_after_home_restart() {
+        let (_temp, fs, ctx, meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+
+        let created = fs
+            .create(
+                &ctx,
+                workspace.inode,
+                OsStr::new("new"),
+                0o644,
+                libc::O_WRONLY,
+            )
+            .unwrap();
+
+        assert_eq!(created.entry.attributes.kind, FileKind::Regular);
+        assert_home_executed_write_once(&meta, &remote);
+        fs.release(&ctx, created.handle).unwrap();
+    }
+
+    #[test]
+    fn remote_write_mkdir_refreshes_cached_grant_after_home_restart() {
+        let (_temp, fs, ctx, meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+
+        let entry = fs
+            .mkdir(&ctx, workspace.inode, OsStr::new("dir"), 0o755)
+            .unwrap();
+
+        assert_eq!(entry.attributes.kind, FileKind::Directory);
+        assert_home_executed_write_once(&meta, &remote);
+    }
+
+    /// `GRANT_UNAVAILABLE` means Home refused the root before any side effect,
+    /// so the entry node replays the write once, exactly like an invalid grant.
+    #[test]
+    fn remote_write_replays_a_grant_unavailable_rejection() {
+        let (_temp, fs, ctx, _meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+        // The Home session changed without a new incarnation, so the grant
+        // refreshed by the retry is accepted and only the injected rejection
+        // drives the replay.
+        remote.restarted.store(true, Ordering::SeqCst);
+        remote
+            .fail_write_unavailable_once
+            .store(true, Ordering::SeqCst);
+
+        let entry = fs
+            .mkdir(&ctx, workspace.inode, OsStr::new("dir"), 0o755)
+            .unwrap();
+
+        assert_eq!(entry.attributes.kind, FileKind::Directory);
+        assert_eq!(remote.write_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(remote.write_executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn remote_write_mknod_refreshes_cached_grant_after_home_restart() {
+        let (_temp, fs, ctx, meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+
+        fs.mknod(
+            &ctx,
+            workspace.inode,
+            OsStr::new("fifo"),
+            SpecialFileKind::Fifo,
+            0o644,
+        )
+        .unwrap();
+
+        assert_home_executed_write_once(&meta, &remote);
+    }
+
+    #[test]
+    fn remote_write_unlink_refreshes_cached_grant_after_home_restart() {
+        let (_temp, fs, ctx, meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+
+        fs.unlink(&ctx, workspace.inode, OsStr::new("a.txt"))
+            .unwrap();
+
+        assert_home_executed_write_once(&meta, &remote);
+    }
+
+    #[test]
+    fn remote_write_rmdir_refreshes_cached_grant_after_home_restart() {
+        let (_temp, fs, ctx, meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+
+        fs.rmdir(&ctx, workspace.inode, OsStr::new("dir")).unwrap();
+
+        assert_home_executed_write_once(&meta, &remote);
+    }
+
+    #[test]
+    fn remote_write_rename_refreshes_cached_grant_after_home_restart() {
+        let (_temp, fs, ctx, meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+
+        fs.rename(
+            &ctx,
+            workspace.inode,
+            OsStr::new("a.txt"),
+            workspace.inode,
+            OsStr::new("b.txt"),
+            RenameFlags(0),
+        )
+        .unwrap();
+
+        assert_home_executed_write_once(&meta, &remote);
+    }
+
+    #[test]
+    fn remote_write_symlink_refreshes_cached_grant_after_home_restart() {
+        let (_temp, fs, ctx, meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+
+        fs.symlink(
+            &ctx,
+            workspace.inode,
+            OsStr::new("link"),
+            OsStr::new("a.txt"),
+        )
+        .unwrap();
+
+        assert_home_executed_write_once(&meta, &remote);
+    }
+
+    #[test]
+    fn remote_write_link_refreshes_cached_grant_after_home_restart() {
+        let (_temp, fs, ctx, meta, remote, root_id, workspace) = stale_remote_write_fixture();
+        let inode = seed_remote_child(&fs, &root_id, "a.txt");
+
+        fs.link(&ctx, inode, workspace.inode, OsStr::new("hard"))
+            .unwrap();
+
+        assert_home_executed_write_once(&meta, &remote);
+    }
+
+    #[test]
+    fn remote_write_does_not_replay_unknown_connection_outcome() {
+        let (_temp, fs, ctx, meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+        remote
+            .fail_write_connection_once
+            .store(true, Ordering::SeqCst);
+
+        let error = fs
+            .mkdir(&ctx, workspace.inode, OsStr::new("dir"), 0o755)
+            .unwrap_err();
+
+        assert_eq!(error.code(), afs_error::CLIENT_CONNECTION_UNAVAILABLE);
+        assert_eq!(remote.write_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.write_executions.load(Ordering::SeqCst), 0);
+        assert!(!remote.restarted.load(Ordering::SeqCst));
+        assert_eq!(meta.acquire_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn remote_write_returns_not_found_when_root_disappeared() {
+        let (_temp, fs, ctx, meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+        meta.root_removed.store(true, Ordering::SeqCst);
+
+        let error = fs
+            .mkdir(&ctx, workspace.inode, OsStr::new("dir"), 0o755)
+            .unwrap_err();
+
+        assert_eq!(error.code(), afs_error::NODE_VFS_NOT_FOUND);
+        assert_eq!(remote.write_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.write_executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn remote_write_does_not_replay_into_a_recreated_root() {
+        let (_temp, fs, ctx, meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+        meta.recreate();
+
+        let error = fs
+            .mkdir(&ctx, workspace.inode, OsStr::new("dir"), 0o755)
+            .unwrap_err();
+
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert_eq!(remote.write_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.write_executions.load(Ordering::SeqCst), 0);
+        assert_eq!(meta.acquire_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            fs.getattr(&ctx, workspace.inode, None).unwrap_err().code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+    }
+
+    #[test]
+    fn remote_read_does_not_refresh_into_a_recreated_root() {
+        let (_temp, fs, ctx, meta, _remote, _root_id, workspace) = stale_remote_write_fixture();
+        meta.recreate();
+
+        let error = fs
+            .lookup(&ctx, workspace.inode, OsStr::new("child"))
+            .unwrap_err();
+
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert_eq!(
+            fs.getattr(&ctx, workspace.inode, None).unwrap_err().code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+    }
+
+    /// The old inode stays bound to its incarnation even after a concurrent
+    /// refresh publishes the new grant.
+    #[test]
+    fn remote_write_does_not_use_a_new_epoch_grant_for_an_old_inode() {
+        let (_temp, fs, ctx, meta, remote, _root_id, workspace) = stale_remote_write_fixture();
+        meta.recreate();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        // A concurrent lookup publishes the new incarnation first.
+        let fresh = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+
+        let error = fs
+            .mkdir(&ctx, workspace.inode, OsStr::new("dir"), 0o755)
+            .unwrap_err();
+
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert_eq!(remote.write_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.write_executions.load(Ordering::SeqCst), 0);
+        assert_ne!(fresh.inode.value, workspace.inode.value);
+    }
+
+    /// Dropping the stale incarnation must not drop records that a concurrent
+    /// lookup already published for the new one.
+    #[test]
+    fn stale_write_cleanup_keeps_a_newer_incarnation() {
+        let (_temp, fs, ctx, meta, remote, root_id, workspace) = stale_remote_write_fixture();
+        let local = fs.require_local().unwrap();
+        let cached_old = local
+            .remote_roots
+            .lock()
+            .unwrap()
+            .get(&root_id)
+            .cloned()
+            .expect("fixture caches the first grant");
+        meta.recreate();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let fresh = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        // A request that started earlier can still restore the previous grant.
+        local
+            .remote_roots
+            .lock()
+            .unwrap()
+            .insert(root_id.clone(), cached_old);
+
+        let error = fs
+            .mkdir(&ctx, workspace.inode, OsStr::new("dir"), 0o755)
+            .unwrap_err();
+
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        // Observing the new incarnation already retired the old record, so the
+        // stale request stops at the index and never reaches Home.
+        assert_eq!(remote.write_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.write_executions.load(Ordering::SeqCst), 0);
+        assert!(local.record(fresh.inode.value).is_ok());
+        assert!(local.record(workspace.inode.value).is_err());
+        assert_eq!(
+            local
+                .state
+                .lock()
+                .unwrap()
+                .paths
+                .get(&(root_id, StoragePath::root())),
+            Some(&fresh.inode.value)
+        );
+        assert_ne!(fresh.inode.value, workspace.inode.value);
+    }
+
+    /// A lagging grant published after the new incarnation is in place must be
+    /// refreshed, not taken as proof that the new records are stale.
+    #[test]
+    fn newer_incarnation_survives_a_lagging_grant_cache() {
+        let (_temp, fs, ctx, meta, remote, root_id, workspace) = stale_remote_write_fixture();
+        let local = fs.require_local().unwrap();
+        let cached_old = local
+            .remote_roots
+            .lock()
+            .unwrap()
+            .get(&root_id)
+            .cloned()
+            .expect("fixture caches the first grant");
+        meta.recreate();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let fresh = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        assert_ne!(fresh.inode.value, workspace.inode.value);
+
+        // Write path: the paused request publishes the superseded grant late.
+        local
+            .remote_roots
+            .lock()
+            .unwrap()
+            .insert(root_id.clone(), cached_old.clone());
+        let entry = fs
+            .mkdir(&ctx, fresh.inode, OsStr::new("dir"), 0o755)
+            .unwrap();
+
+        assert_eq!(entry.attributes.kind, FileKind::Directory);
+        assert!(local.record(fresh.inode.value).is_ok());
+        assert_eq!(
+            local
+                .remote_roots
+                .lock()
+                .unwrap()
+                .get(&root_id)
+                .map(|remote| remote.grant.epoch),
+            Some(2)
+        );
+
+        // Read path: the same lagging cache must refresh as well.
+        local
+            .remote_roots
+            .lock()
+            .unwrap()
+            .insert(root_id, cached_old);
+        fs.lookup(&ctx, fresh.inode, OsStr::new("child")).unwrap();
+        assert!(local.record(fresh.inode.value).is_ok());
+        assert_eq!(remote.write_executions.load(Ordering::SeqCst), 1);
+    }
+
+    /// A create reply from the replaced incarnation must not rebind a path the
+    /// new incarnation already owns.
+    #[test]
+    fn delayed_create_reply_keeps_the_new_path_index() {
+        let (_temp, fs, ctx, meta, remote, root_id, workspace) = stale_remote_write_fixture();
+        let fs = Arc::new(fs);
+        let (started, release) = install_write_gate(&remote);
+        let parent = workspace.inode;
+        let worker = {
+            let fs = fs.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || fs.mkdir(&ctx, parent, OsStr::new("x"), 0o755))
+        };
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("old incarnation write started");
+
+        meta.recreate();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let current = {
+            let local = fs.require_local().unwrap();
+            backend_inode(local.state.lock().unwrap().inode_for_path_in_epoch(
+                root_id.clone(),
+                StoragePath::new("x").unwrap(),
+                files::FileIdentity(vec![21]),
+                test_attrs(FileKind::Regular),
+                FileKind::Regular,
+                Some(2),
+            ))
+        };
+
+        release.send(()).unwrap();
+        let outcome = worker.join().unwrap();
+        let local = fs.require_local().unwrap();
+        let state = local.state.lock().unwrap();
+        assert_eq!(
+            state
+                .paths
+                .get(&(root_id, StoragePath::new("x").unwrap()))
+                .copied(),
+            Some(current.value)
+        );
+        assert_eq!(state.inodes.get(&current.value).unwrap().epoch, Some(2));
+        let error = outcome.unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+    }
+
+    /// A rename reply from the replaced incarnation must not move the paths the
+    /// new incarnation already owns.
+    #[test]
+    fn delayed_rename_reply_keeps_the_new_path_index() {
+        let (_temp, fs, ctx, meta, remote, root_id, workspace) = stale_remote_write_fixture();
+        seed_remote_child(&fs, &root_id, "a");
+        let fs = Arc::new(fs);
+        let (started, release) = install_write_gate(&remote);
+        let parent = workspace.inode;
+        let worker = {
+            let fs = fs.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                fs.rename(
+                    &ctx,
+                    parent,
+                    OsStr::new("a"),
+                    parent,
+                    OsStr::new("b"),
+                    RenameFlags(0),
+                )
+            })
+        };
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("old incarnation rename started");
+
+        meta.recreate();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let (new_a, new_b) = {
+            let local = fs.require_local().unwrap();
+            let mut state = local.state.lock().unwrap();
+            (
+                state.inode_for_path_in_epoch(
+                    root_id.clone(),
+                    StoragePath::new("a").unwrap(),
+                    files::FileIdentity(vec![21]),
+                    test_attrs(FileKind::Regular),
+                    FileKind::Regular,
+                    Some(2),
+                ),
+                state.inode_for_path_in_epoch(
+                    root_id.clone(),
+                    StoragePath::new("b").unwrap(),
+                    files::FileIdentity(vec![22]),
+                    test_attrs(FileKind::Regular),
+                    FileKind::Regular,
+                    Some(2),
+                ),
+            )
+        };
+
+        release.send(()).unwrap();
+        let outcome = worker.join().unwrap();
+        let local = fs.require_local().unwrap();
+        let state = local.state.lock().unwrap();
+        assert_eq!(
+            state
+                .paths
+                .get(&(root_id.clone(), StoragePath::new("a").unwrap()))
+                .copied(),
+            Some(new_a)
+        );
+        assert_eq!(
+            state
+                .paths
+                .get(&(root_id, StoragePath::new("b").unwrap()))
+                .copied(),
+            Some(new_b)
+        );
+        let error = outcome.unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+    }
+
     #[test]
     fn remote_directory_close_releases_home_handle() {
         let (_temp, fs, ctx, _meta, remote, _root_id) = remote_fixture();
@@ -11659,6 +13113,470 @@ mod tests {
         let error = fs.releasedir(&ctx, handle).unwrap_err();
         assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
         assert_eq!(remote.releasedir_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 返回 `(root_names 中有该名字, remote_roots 中有该 root 的 grant)`。
+    fn entry_knows_workspace(fs: &OwnerFs, root_id: &RootId, name: &str) -> (bool, bool) {
+        let local = fs.require_local().unwrap();
+        (
+            local
+                .state
+                .lock()
+                .unwrap()
+                .root_names
+                .contains_key(OsStr::new(name)),
+            local.remote_roots.lock().unwrap().contains_key(root_id),
+        )
+    }
+
+    #[test]
+    fn remote_workspace_rmdir_from_non_home_entry_forwards_to_home_and_forgets_root() {
+        // Issue #88: deleting a workspace through a non-Home entry must reach
+        // Home instead of failing locally with an EBUSY-mapped grant error.
+        let (_temp, fs, ctx, meta, remote, root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        assert_eq!(entry_knows_workspace(&fs, &root_id, "job-42"), (true, true));
+
+        fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap();
+
+        assert_eq!(remote.rmdir_root_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            remote.rmdir_root_expected.lock().unwrap().as_ref(),
+            Some(&remote.entry(FileKind::Directory).identity)
+        );
+        assert_eq!(
+            entry_knows_workspace(&fs, &root_id, "job-42"),
+            (false, false)
+        );
+
+        // The forgotten grant sends the next lookup to Meta, which no longer has it.
+        meta.root_removed.store(true, Ordering::SeqCst);
+        let error = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap_err();
+        assert_eq!(crate::error::errno(&error), libc::ENOENT);
+    }
+
+    #[test]
+    fn remote_workspace_rmdir_failure_is_not_replayed_and_keeps_entry_state() {
+        for (code, errno) in [
+            (afs_error::IO_DIRECTORY_NOT_EMPTY, libc::ENOTEMPTY),
+            (afs_error::CLIENT_CONNECTION_UNAVAILABLE, libc::EHOSTUNREACH),
+            (afs_error::CLIENT_DEADLINE_EXCEEDED, libc::ETIMEDOUT),
+            // Meta 仍有该 root：授权错误不能当成已删除。
+            (afs_error::NODE_OWNER_GRANT_UNAVAILABLE, libc::EHOSTUNREACH),
+        ] {
+            let (_temp, fs, ctx, _meta, remote, root_id) = remote_fixture();
+            let root = BackendInode {
+                value: OWNERFS_ROOT_INODE,
+            };
+            fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+            *remote.rmdir_root_error.lock().unwrap() = Some(code);
+
+            let error = fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap_err();
+
+            assert_eq!(error.code(), code);
+            assert_eq!(crate::error::errno(&error), errno);
+            assert_eq!(remote.rmdir_root_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(entry_knows_workspace(&fs, &root_id, "job-42"), (true, true));
+        }
+    }
+
+    #[test]
+    fn remote_workspace_rmdir_already_gone_on_home_forgets_root() {
+        // (Home 返回的错误, Meta 是否已无该 root)。root 已从 Home 缓存移除时，
+        // validate_peer 先返回 GRANT_UNAVAILABLE；NOT_FOUND 只出现在校验之后的窄窗口。
+        for (code, removed_from_meta) in [
+            (afs_error::NODE_OWNER_GRANT_UNAVAILABLE, true),
+            (afs_error::CLIENT_DEADLINE_EXCEEDED, true),
+            (afs_error::NODE_VFS_NOT_FOUND, false),
+        ] {
+            let (_temp, fs, ctx, meta, remote, root_id) = remote_fixture();
+            let root = BackendInode {
+                value: OWNERFS_ROOT_INODE,
+            };
+            fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+            *remote.rmdir_root_error.lock().unwrap() = Some(code);
+            meta.root_removed.store(removed_from_meta, Ordering::SeqCst);
+
+            let error = fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap_err();
+
+            assert_eq!(error.code(), afs_error::NODE_VFS_NOT_FOUND);
+            assert_eq!(crate::error::errno(&error), libc::ENOENT);
+            assert_eq!(remote.rmdir_root_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                entry_knows_workspace(&fs, &root_id, "job-42"),
+                (false, false)
+            );
+        }
+    }
+
+    #[test]
+    fn remote_workspace_rmdir_reply_after_same_name_recreate_keeps_new_version() {
+        // Home 已生成删除成功的回复，入口清理之前同名 workspace 已重建，本机也已有新版本
+        // 的记录（例如本机成为新 Home 后处理的 peer 请求）。入口只能清除被删版本。
+        let (_temp, fs, ctx, _meta, remote, root_id) = remote_fixture();
+        let fs = Arc::new(fs);
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let old_identity = remote.entry(FileKind::Directory).identity;
+        let attributes = remote.entry(FileKind::Directory).attributes;
+        let new_identity = files::FileIdentity(vec![0xab]);
+        // 被删版本的子项：一个已 unlink（路径已解绑、记录仍在），一个仍挂在路径上。
+        {
+            let mut state = fs.require_local().unwrap().state.lock().unwrap();
+            for (name, id) in [("old-unlinked", 0x01), ("old-attached", 0x02)] {
+                state.inode_for_path(
+                    root_id.clone(),
+                    StoragePath::root()
+                        .join_component(OsStr::new(name))
+                        .unwrap(),
+                    files::FileIdentity(vec![id]),
+                    attributes.clone(),
+                    FileKind::Regular,
+                );
+            }
+            state.remove_path(
+                &root_id,
+                StoragePath::root()
+                    .join_component(OsStr::new("old-unlinked"))
+                    .unwrap(),
+            );
+        }
+        let child = StoragePath::root()
+            .join_component(OsStr::new("new-file"))
+            .unwrap();
+        let weak = Arc::downgrade(&fs);
+        let (hook_root, hook_identity, hook_child) =
+            (root_id.clone(), new_identity.clone(), child.clone());
+        *remote.rmdir_root_hook.lock().unwrap() = Some(Box::new(move || {
+            let fs = weak.upgrade().unwrap();
+            let mut state = fs.require_local().unwrap().state.lock().unwrap();
+            state.insert_root(
+                "job-42".into(),
+                hook_root.clone(),
+                hook_identity,
+                attributes.clone(),
+                None,
+            );
+            state.inode_for_path(
+                hook_root.clone(),
+                hook_child,
+                files::FileIdentity(vec![0xcd]),
+                attributes.clone(),
+                FileKind::Regular,
+            );
+            // 新版本中已 unlink、但可能仍被打开的文件，也必须保留。
+            let unlinked = StoragePath::root()
+                .join_component(OsStr::new("new-unlinked"))
+                .unwrap();
+            state.inode_for_path(
+                hook_root.clone(),
+                unlinked.clone(),
+                files::FileIdentity(vec![0xce]),
+                attributes,
+                FileKind::Regular,
+            );
+            state.remove_path(&hook_root, unlinked);
+        }));
+
+        fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap();
+
+        assert_eq!(remote.rmdir_root_calls.load(Ordering::SeqCst), 1);
+        let local = fs.require_local().unwrap();
+        let state = local.state.lock().unwrap();
+        let inode = state.root_names[OsStr::new("job-42")];
+        assert_eq!(state.inodes[&inode].identity, new_identity);
+        assert!(state.paths.contains_key(&(root_id.clone(), child)));
+        let mut identities: Vec<_> = state
+            .inodes
+            .values()
+            .filter(|record| record.root_id == root_id)
+            .map(|record| record.identity.clone())
+            .collect();
+        identities.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            identities,
+            [
+                new_identity.clone(),
+                files::FileIdentity(vec![0xcd]),
+                files::FileIdentity(vec![0xce]),
+            ]
+        );
+        assert!(!identities.contains(&old_identity));
+        drop(state);
+        assert!(!local.remote_roots.lock().unwrap().contains_key(&root_id));
+    }
+
+    #[test]
+    fn remote_workspace_rmdir_reclaims_child_records_across_rounds() {
+        // 非 Home 入口反复“创建文件 → 清空 → 删除 workspace → 同名创建”，
+        // 被删版本的子项记录必须随删除回收，记录数不随轮数增长。
+        let (_temp, fs, ctx, _meta, remote, root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let attributes = remote.entry(FileKind::Regular).attributes;
+        for round in 0..3_u8 {
+            fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+            {
+                let mut state = fs.require_local().unwrap().state.lock().unwrap();
+                let child = StoragePath::root()
+                    .join_component(OsStr::new("file"))
+                    .unwrap();
+                state.inode_for_path(
+                    root_id.clone(),
+                    child.clone(),
+                    files::FileIdentity(vec![0x10, round]),
+                    attributes.clone(),
+                    FileKind::Regular,
+                );
+                state.remove_path(&root_id, child);
+            }
+
+            fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap();
+
+            let state = fs.require_local().unwrap().state.lock().unwrap();
+            assert!(state.inodes.is_empty(), "round {round}");
+            assert!(state.paths.is_empty() && state.root_names.is_empty());
+            assert!(state.identities.is_empty() && state.identity_members.is_empty());
+        }
+    }
+
+    #[test]
+    fn remote_result_arriving_after_workspace_cleanup_is_rejected() {
+        // 子项查询在旧版本上发出，Home 已生成回复；回复到达前该版本已被删除并清理，
+        // 之后又同名重建。迟到的结果不能发布成记录，否则无法按版本回收。
+        let (_temp, fs, ctx, _meta, remote, root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let parent = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let local = fs.require_local().unwrap();
+        let old_version = local.record(parent.inode.value).unwrap().version;
+        let child = StoragePath::root()
+            .join_component(OsStr::new("late"))
+            .unwrap();
+        let late = files::OwnerEntry {
+            root_id: root_id.clone(),
+            identity: files::FileIdentity(vec![0x20]),
+            attributes: remote.entry(FileKind::Regular).attributes,
+        };
+
+        fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap();
+
+        // 清理之后到达：本机已没有该版本的根目录记录。
+        let error = local
+            .insert_remote_entry(&old_version, child.clone(), late.clone(), 1)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert!(local.state.lock().unwrap().inodes.is_empty());
+
+        // 同名重建之后到达：根目录记录已属于新版本，旧版本的结果同样拒绝，
+        // 新版本的结果正常发布并标记为新版本。
+        let new_version = files::FileIdentity(vec![0xab]);
+        local.state.lock().unwrap().insert_root(
+            "job-42".into(),
+            root_id.clone(),
+            new_version.clone(),
+            remote.entry(FileKind::Directory).attributes,
+            None,
+        );
+        let error = local
+            .insert_remote_entry(&old_version, child.clone(), late.clone(), 1)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert_eq!(local.state.lock().unwrap().inodes.len(), 1);
+        let inode = local
+            .insert_remote_entry(&new_version, child, late, 1)
+            .unwrap();
+        assert_eq!(local.record(inode).unwrap().version, new_version);
+    }
+
+    /// Home-side fixture: a real local workspace and the access a peer presents.
+    fn peer_rmdir_root_fixture(
+        rights: Vec<RootRight>,
+    ) -> (
+        tempfile::TempDir,
+        OwnerFs,
+        RequestContext,
+        RootId,
+        files::FileIdentity,
+        PresentedRootAccess,
+    ) {
+        let (temp, fs, ctx) = fixture_with_rights(rights);
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs
+            .mkdir(&ctx, root, OsStr::new("job-peer-rmdir"), 0o755)
+            .unwrap();
+        let record = fs
+            .require_local()
+            .unwrap()
+            .record(workspace.inode.value)
+            .unwrap();
+        let (root_id, identity) = (record.root_id.clone(), record.identity.clone());
+        let mut grant = test_grant(root_id.clone());
+        grant.epoch = fs
+            .require_local()
+            .unwrap()
+            .roots
+            .lookup_root_location(&root_id)
+            .unwrap()
+            .unwrap()
+            .epoch;
+        let access = presented(&grant);
+        // 删除挂载根下的目录需要 root 调用者（挂载根属 root、0755），与本机 FUSE 一致。
+        let ctx = RequestContext {
+            uid: 0,
+            gid: 0,
+            ..ctx
+        };
+        (temp, fs, ctx, root_id, identity, access)
+    }
+
+    fn home_data_dir(temp: &tempfile::TempDir, fs: &OwnerFs, id: &RootId) -> std::path::PathBuf {
+        let data_dir = fs
+            .require_local()
+            .unwrap()
+            .roots
+            .local_root_data_dir(id)
+            .unwrap()
+            .unwrap()
+            .0;
+        temp.path().join(data_dir.as_path())
+    }
+
+    fn assert_workspace_untouched(fs: &OwnerFs, data_dir: &std::path::Path, id: &RootId) {
+        let roots = &fs.require_local().unwrap().roots;
+        assert!(data_dir.is_dir());
+        assert!(roots.lookup_root_location(id).unwrap().is_some());
+        assert!(roots.enter_root(id, RootRight::Lookup).is_ok());
+    }
+
+    #[test]
+    fn peer_rmdir_root_deletes_empty_workspace_on_home() {
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+
+        fs.peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-b", &access, &identity)
+            .unwrap();
+
+        let roots = &fs.require_local().unwrap().roots;
+        assert!(!data_dir.exists());
+        assert!(roots.lookup_root_location(&root_id).unwrap().is_none());
+        assert!(roots.cached_local_roots().unwrap().is_empty());
+        let catalog_records = fs::read_dir(temp.path().join(".ownerfs-roots"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some(OsStr::new("json")))
+            .count();
+        assert_eq!(catalog_records, 0);
+        assert_eq!(
+            entry_knows_workspace(&fs, &root_id, "job-peer-rmdir"),
+            (false, false)
+        );
+        let mount_root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let error = fs
+            .lookup(&ctx, mount_root, OsStr::new("job-peer-rmdir"))
+            .unwrap_err();
+        assert_eq!(crate::error::errno(&error), libc::ENOENT);
+
+        fs.mkdir(&ctx, mount_root, OsStr::new("job-peer-rmdir"), 0o755)
+            .unwrap();
+        let recreated = roots.lookup_root_location(&root_id).unwrap().unwrap();
+        assert!(recreated.epoch > access.epoch);
+    }
+
+    #[test]
+    fn workspace_delete_rejects_a_foreign_home() {
+        let (_temp, fs, _ctx, meta, remote, root_id) = remote_fixture();
+        let location = meta.lookup_root(&root_id).unwrap().unwrap();
+        assert_eq!(
+            fs.delete_workspace(&location).unwrap_err().code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+        assert_eq!(remote.rmdir_root_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn peer_rmdir_root_rejects_without_changing_home_state() {
+        // Stale identity: the workspace was recreated under the same name.
+        let (temp, fs, ctx, root_id, _identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+        let error = fs
+            .peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-b", &access, &files::FileIdentity(vec![0xff]))
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert_workspace_untouched(&fs, &data_dir, &root_id);
+
+        // Wrong authenticated peer: the access was issued to node-b, not node-c.
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+        let error = fs
+            .peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-c", &access, &identity)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+        assert_workspace_untouched(&fs, &data_dir, &root_id);
+
+        // Non-empty: the error comes back and Meta is not deactivated.
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+        fs::write(data_dir.join("payload"), b"x").unwrap();
+        let error = fs
+            .peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-b", &access, &identity)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+        assert_eq!(crate::error::errno(&error), libc::ENOTEMPTY);
+        assert!(data_dir.join("payload").exists());
+        assert_workspace_untouched(&fs, &data_dir, &root_id);
+
+        // The peer holds Write, but the caller it presents may not delete a directory
+        // under the root-owned mount root: Home rechecks it like the kernel does locally.
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+        let user = RequestContext {
+            uid: 1000,
+            gid: 1000,
+            ..ctx
+        };
+        let error = fs
+            .peer_executor()
+            .unwrap()
+            .rmdir_root(&user, "node-b", &access, &identity)
+            .unwrap_err();
+        assert_eq!(crate::error::errno(&error), libc::EACCES);
+        assert_workspace_untouched(&fs, &data_dir, &root_id);
+
+        // A peer holding no Write right cannot end the workspace lifecycle.
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(vec![RootRight::Lookup, RootRight::Read]);
+        let data_dir = home_data_dir(&temp, &fs, &root_id);
+        let error = fs
+            .peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-b", &access, &identity)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_RIGHT_DENIED);
+        assert_workspace_untouched(&fs, &data_dir, &root_id);
     }
 
     #[test]
@@ -11731,6 +13649,37 @@ mod tests {
             remote.releasedir_handles.lock().unwrap().as_slice(),
             &[vec![1u8], vec![2u8]]
         );
+    }
+
+    /// Refreshed readdir children carry the serving grant's epoch, not the
+    /// superseded cursor's.
+    #[test]
+    fn remote_readdir_tags_children_with_the_serving_grant_epoch() {
+        let (_temp, fs, ctx, meta, remote, _root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let handle = fs.opendir(&ctx, workspace.inode).unwrap();
+        let local = fs.require_local().unwrap();
+        local
+            .state
+            .lock()
+            .unwrap()
+            .inodes
+            .get_mut(&workspace.inode.value)
+            .unwrap()
+            .epoch = None;
+        meta.recreate();
+        remote.fail_readdir_once.store(true, Ordering::SeqCst);
+        remote.readdir_returns_child.store(true, Ordering::SeqCst);
+
+        let entries = fs.readdir(&ctx, handle, 0, 16).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, OsString::from("child"));
+        let record = local.record(entries[0].inode.value).unwrap();
+        assert_eq!(record.epoch, Some(2));
     }
 
     #[test]
@@ -12471,6 +14420,53 @@ mod tests {
     }
 
     #[test]
+    fn home_root_lookup_does_not_restore_workspace_deleted_by_peer() {
+        // Home 本机查询根目录读完 metadata 后，另一节点经 RmdirRoot 完成删除，查询随后
+        // 才发布：不能把已删除的根重新写回索引。之后同名重建，旧结果同样不能发布。
+        let (temp, fs, ctx, root_id, identity, access) =
+            peer_rmdir_root_fixture(all_local_rights());
+        let local = fs.require_local().unwrap();
+        let (data_dir, _) = local.roots.local_root_data_dir(&root_id).unwrap().unwrap();
+        let attributes = attributes_from_metadata(
+            std::fs::metadata(temp.path().join(data_dir.as_path())).unwrap(),
+        )
+        .unwrap();
+        fs.peer_executor()
+            .unwrap()
+            .rmdir_root(&ctx, "node-b", &access, &identity)
+            .unwrap();
+
+        let name = OsStr::new("job-peer-rmdir");
+        let error = local
+            .publish_local_root_entry(
+                name,
+                root_id.clone(),
+                &data_dir,
+                identity.clone(),
+                attributes.clone(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_VFS_NOT_FOUND);
+        {
+            let state = local.state.lock().unwrap();
+            assert!(state.root_names.is_empty() && state.inodes.is_empty());
+        }
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        assert!(local.root_directory_entries().unwrap().is_empty());
+
+        let recreated = fs.mkdir(&ctx, root, name, 0o755).unwrap();
+        let error = local
+            .publish_local_root_entry(name, root_id, &data_dir, identity, attributes)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_VFS_NOT_FOUND);
+        let state = local.state.lock().unwrap();
+        assert_eq!(state.root_names[name], recreated.inode.value);
+        assert_eq!(state.inodes.len(), 1);
+    }
+
+    #[test]
     fn freshly_created_root_getattr_uses_real_directory_identity() {
         let (_temp, fs, ctx) = fixture();
         let root = BackendInode {
@@ -12954,6 +14950,7 @@ mod tests {
         let remote = Arc::new(RestartingRemoteFiles {
             root_id: binding.root_id.clone(),
             restarted: Arc::new(AtomicBool::new(false)),
+            epoch: Arc::new(AtomicU64::new(1)),
             lookup_calls: AtomicUsize::new(0),
             statfs_calls: AtomicUsize::new(0),
             fail_statfs_permission: AtomicBool::new(false),
@@ -12961,10 +14958,20 @@ mod tests {
             last_open_killpriv: AtomicBool::new(false),
             opendir_calls: AtomicUsize::new(0),
             readdir_calls: AtomicUsize::new(0),
+            readdir_returns_child: AtomicBool::new(false),
             releasedir_calls: AtomicUsize::new(0),
             releasedir_handles: Mutex::new(Vec::new()),
             fail_readdir_once: AtomicBool::new(false),
             fail_releasedir_once: AtomicBool::new(false),
+            rmdir_root_calls: AtomicUsize::new(0),
+            rmdir_root_expected: Mutex::new(None),
+            rmdir_root_error: Mutex::new(None),
+            rmdir_root_hook: Mutex::new(None),
+            write_attempts: AtomicUsize::new(0),
+            write_executions: AtomicUsize::new(0),
+            fail_write_connection_once: AtomicBool::new(false),
+            fail_write_unavailable_once: AtomicBool::new(false),
+            write_gate: Mutex::new(None),
         });
         let (remote_file, _) = remote::RemoteFiles::open(
             remote.as_ref(),
@@ -13294,7 +15301,7 @@ mod tests {
         fs.require_local()
             .unwrap()
             .roots
-            .delete_root(&binding.root_id)
+            .delete_root(&binding.root_id, None)
             .unwrap();
 
         local
@@ -13314,7 +15321,7 @@ mod tests {
         fs.require_local()
             .unwrap()
             .roots
-            .delete_root(&binding.root_id)
+            .delete_root(&binding.root_id, None)
             .unwrap();
 
         // Re-creating the workspace reuses the name-derived root id but issues a

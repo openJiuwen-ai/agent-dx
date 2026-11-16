@@ -187,7 +187,7 @@ impl Manager {
                 ("status", Value::from("error")),
                 (
                     "message",
-                    Value::from("inherit_entrypoint is not enabled for this environment"),
+                    Value::from("no workload process is configured for this environment"),
                 ),
             ]),
         }
@@ -203,11 +203,8 @@ pub(crate) fn initialize() {
 }
 
 fn start_from_environment(manager: Arc<Manager>) {
-    let Some(raw_path) = std::env::var_os(CONFIG_ENV).filter(|value| !value.is_empty()) else {
-        return;
-    };
+    let raw_path = std::env::var_os(CONFIG_ENV).filter(|value| !value.is_empty());
     std::env::remove_var(CONFIG_ENV);
-    let path = PathBuf::from(raw_path);
     let process = std::env::var(adx_core::execution::WORKLOAD_PROCESS_ENV);
     std::env::remove_var(adx_core::execution::WORKLOAD_PROCESS_ENV);
     let process = match process {
@@ -230,7 +227,20 @@ fn start_from_environment(manager: Arc<Manager>) {
             return;
         }
     };
-    let specs = match read_specs(&path, process.as_ref()) {
+    let specs = match raw_path {
+        Some(path) => read_specs(&PathBuf::from(path), process.as_ref()),
+        None if process.is_some() => workload_specs(
+            ProcessSpec {
+                version: CONFIG_VERSION,
+                args: Vec::new(),
+                cwd: "/".into(),
+                user: String::new(),
+            },
+            process.as_ref(),
+        ),
+        None => return,
+    };
+    let specs = match specs {
         Ok(specs) => specs,
         Err(message) => {
             manager.fail(FailureCode::InvalidConfiguration, message);
@@ -276,7 +286,7 @@ fn start_from_environment(manager: Arc<Manager>) {
                 }
                 manager.fail(
                     FailureCode::ProcessFailed,
-                    format!("failed to spawn image entrypoint: {error}"),
+                    format!("failed to spawn workload process: {error}"),
                 );
                 return;
             }
@@ -476,7 +486,13 @@ fn read_specs(
             spec.version
         ));
     }
-    let mut base = spec;
+    workload_specs(spec, process)
+}
+
+fn workload_specs(
+    mut base: ProcessSpec,
+    process: Option<&adx_core::execution::WorkloadProcess>,
+) -> Result<Vec<ProcessSpec>, String> {
     if let Some(process) = process {
         process.validate().map_err(|error| error.to_string())?;
         if let Some(user) = &process.user {

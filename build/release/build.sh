@@ -60,7 +60,10 @@ if [[ "$host" == *-linux-gnu ]]; then
   echo "--- :package: Static EXECD and local EROFS runtime"
   cargo build --locked --release --target "$musl_target" -j "$JOBS" -p adx-execd --bin adx-execd
   cp "$CARGO_TARGET_DIR/$musl_target/release/adx-execd" "$stage/adx-execd"
-  rootfs_args=(--binary "$stage/adx-execd" --output "$stage/adx-runtime-rootfs.img")
+  rootfs_args=(--binary "$stage/adx-execd" --target "$host" --output "$stage/adx-runtime-rootfs.img")
+  if [[ -n "${ADX_RUNTIME_ROOTFS_ARCHIVE:-}" ]]; then
+    rootfs_args+=(--base-archive "$ADX_RUNTIME_ROOTFS_ARCHIVE")
+  fi
   if [[ -n "${ADX_ENVD_SOURCE:-}" ]]; then
     echo "--- :package: Build optional pinned envd"
     "$PYTHON" build/e2b/build_envd.py --source "$ADX_ENVD_SOURCE" --output "$stage/envd" --jobs "$JOBS"

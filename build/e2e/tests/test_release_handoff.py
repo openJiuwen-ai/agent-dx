@@ -48,6 +48,13 @@ class ReleaseArchiveTests(unittest.TestCase):
                 path = bins / name
                 path.write_bytes(b'fixture binary')
                 path.chmod(0o755)
+            target = 'x86_64-unknown-linux-gnu'
+            base = json.loads((ROOT / 'third_party/runtime-rootfs/source.json').read_text())['artifacts'][target]
+            (bins / 'adx-runtime-rootfs.json').write_text(json.dumps({
+                'target': target, 'base_sha256': base['sha256'], 'manifest_digest': base['manifest_digest'],
+                'execd_sha256': package.sha(bins / 'adx-execd'),
+                'rootfs_sha256': package.sha(bins / 'adx-runtime-rootfs.img'),
+            }))
             redis = root / 'redis-server'
             redis.write_text('#!/bin/sh\necho "Redis server v=7.2.5 fixture"\n')
             redis.chmod(0o755)
@@ -72,6 +79,10 @@ class ReleaseArchiveTests(unittest.TestCase):
             subprocess.run([_executable('tar'), '-xzf', downloaded, '-C', restored], check=True)
             self.assertEqual(package.verify(restored), package.verify(built))
             self.assertTrue((restored / 'manifest.json').is_file())
+            self.assertEqual(
+                (restored / 'runtime/adx-runtime-rootfs.json').read_bytes(),
+                (built / 'runtime/adx-runtime-rootfs.json').read_bytes(),
+            )
             self.assertTrue((restored / 'LICENSE').is_file())
             self.assertTrue((restored / 'install.sh').stat().st_mode & 0o111)
             self.assertTrue((restored / 'bin/adx-coordinator').stat().st_mode & 0o111)

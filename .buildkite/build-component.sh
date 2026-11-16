@@ -27,6 +27,9 @@ output="out/buildkite/components/$component"
 rm -rf "$output"
 mkdir -p "$output"
 jobs=${JOBS:-4}
+component_args=()
+rootfs_metadata=""
+trap '[[ -z "$rootfs_metadata" ]] || rm -f "$rootfs_metadata"' EXIT
 
 case "${ADX_COMPONENT_TESTS:-1}" in
   1) bash .buildkite/component-tests.sh "$component" ;;
@@ -59,7 +62,10 @@ case "$component" in
     cargo build --locked --release --target "$musl_target" -j "$jobs" \
       -p adx-execd --bin adx-execd
     cp "$CARGO_TARGET_DIR/$musl_target/release/adx-execd" "$output/adx-execd"
-    rootfs_args=(--binary "$output/adx-execd" --output "$output/adx-runtime-rootfs.img")
+    rootfs_args=(--binary "$output/adx-execd" --target "$ADX_RELEASE_TARGET" --output "$output/adx-runtime-rootfs.img")
+    if [[ -n "${ADX_RUNTIME_ROOTFS_ARCHIVE:-}" ]]; then
+      rootfs_args+=(--base-archive "$ADX_RUNTIME_ROOTFS_ARCHIVE")
+    fi
     echo "--- :package: Build pinned envd"
     envd_args=(--output "$output/envd-build" --jobs "$jobs")
     if [[ -n "${ADX_ENVD_SOURCE:-}" ]]; then envd_args+=(--source "$ADX_ENVD_SOURCE"); else envd_args+=(--obs-source); fi
@@ -68,6 +74,9 @@ case "$component" in
     cp "$output/envd-build/LICENSE" "$output/envd-LICENSE"
     rootfs_args+=(--envd-binary "$output/envd-build/envd")
     python3 build/runtime/rootfs.py "${rootfs_args[@]}"
+    rootfs_metadata=$(mktemp "${TMPDIR:-/tmp}/adx-rootfs-metadata.XXXXXX")
+    mv "$output/adx-runtime-rootfs.json" "$rootfs_metadata"
+    component_args+=(--rootfs-metadata "$rootfs_metadata")
     rm -rf "$output/envd-build"
     ;;
   afs)
@@ -94,7 +103,7 @@ python3 build/release/component.py create \
   --component "$component" \
   --directory "$output" \
   --commit "$BUILDKITE_COMMIT" \
-  --target "$ADX_RELEASE_TARGET"
+  --target "$ADX_RELEASE_TARGET" "${component_args[@]}"
 tar -czf "out/buildkite/components/$component.tar.gz" -C "$output" .
 
 if [[ ${ADX_COMPONENT_LOCAL:-0} != 1 ]]; then

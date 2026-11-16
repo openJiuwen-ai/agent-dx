@@ -137,8 +137,139 @@ async fn create_response_preserves_authoritative_creation_ownership() {
     assert_eq!(retry["newlyCreated"], true);
     let reuse = fixture.create("owned", "another-request").await.unwrap();
     assert_eq!(reuse["newlyCreated"], false);
+    assert_eq!(reuse["requestId"], "owner-request");
     assert_eq!(first["environmentId"], reuse["environmentId"]);
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cached_validation_failure_recovers_after_service_replacement_with_original_identity() {
+    let fixture = Fixture::new().await;
+    fixture
+        .state
+        .response_error
+        .store(tonic::Code::FailedPrecondition as usize, Ordering::SeqCst);
+    let first = fixture.create("started", "original").await.unwrap_err();
+    assert_eq!(first.code(), tonic::Code::FailedPrecondition);
+    fixture.state.response_error.store(0, Ordering::SeqCst);
+    let calls = fixture.state.create_calls.load(Ordering::SeqCst);
+    let cached = fixture.create("started", "original").await.unwrap_err();
+    assert_eq!(cached.message(), first.message());
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), calls);
+    let replacement = EnvironmentService::new(fixture.clients.clone());
+    let recovered = replacement
+        .create(
+            spec("started"),
+            json!({"name":"started"}),
+            "original",
+            &caller(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered["environmentId"], "started");
+    assert_eq!(recovered["requestId"], "original");
+    assert_eq!(recovered["newlyCreated"], false);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cached_create_tracks_current_state_and_receipt_target_without_extra_calls() {
+    let fixture = Fixture::new().await;
+    fixture.create("reused", "original").await.unwrap();
+    let mut owner = fixture.state.owners.lock().unwrap()["reused"].clone();
+    owner
+        .record
+        .as_mut()
+        .unwrap()
+        .assignment
+        .as_mut()
+        .unwrap()
+        .generation += 1;
+    let calls = fixture.state.create_calls.load(Ordering::SeqCst);
+    let lookups = fixture.state.lookups.load(Ordering::SeqCst);
+    for (state, restart_pending, error) in [
+        (
+            pb::EnvironmentState::Paused,
+            false,
+            Some(tonic::Code::Unavailable),
+        ),
+        (
+            pb::EnvironmentState::Failed,
+            true,
+            Some(tonic::Code::Unavailable),
+        ),
+        (pb::EnvironmentState::Running, false, None),
+        (
+            pb::EnvironmentState::Failed,
+            false,
+            Some(tonic::Code::FailedPrecondition),
+        ),
+        (
+            pb::EnvironmentState::Deleted,
+            false,
+            Some(tonic::Code::FailedPrecondition),
+        ),
+    ] {
+        let record = owner.record.as_mut().unwrap();
+        record.state = state as i32;
+        record.restart_pending = restart_pending;
+        record.resources_held = state != pb::EnvironmentState::Deleted;
+        record.revision += 1;
+        fixture.clients.put_owner(owner.clone()).await.unwrap();
+        let result = fixture.create("reused", "original").await;
+        if let Some(code) = error {
+            assert_eq!(result.unwrap_err().code(), code);
+        } else {
+            let response = result.unwrap();
+            assert_eq!(response["requestId"], "original");
+            assert_eq!(response["newlyCreated"], true);
+        }
+    }
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), calls);
+    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), lookups);
+    fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .insert("reused".into(), owner);
+    let peer = EnvironmentService::new(fixture.clients.clone());
+    assert_eq!(
+        peer.create(
+            spec("other-name"),
+            json!({"name":"other-name"}),
+            "original",
+            &caller()
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::FailedPrecondition
+    );
+    fixture.state.owners.lock().unwrap().remove("reused");
+    let creator = EnvironmentService::new(fixture.clients.clone());
+    creator
+        .create(
+            spec("reused"),
+            json!({"name":"reused"}),
+            "replacement",
+            &caller(),
+        )
+        .await
+        .unwrap();
+    let calls = fixture.state.create_calls.load(Ordering::SeqCst);
+    let lookups = fixture.state.lookups.load(Ordering::SeqCst);
+    for (service, name) in [(&fixture.service, "reused"), (&peer, "other-name")] {
+        let response = service
+            .create(spec(name), json!({"name":name}), "original", &caller())
+            .await
+            .unwrap();
+        assert_eq!(response["environmentId"], "reused");
+        assert_eq!(response["requestId"], "replacement");
+        assert_eq!(response["newlyCreated"], false);
+    }
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), calls);
+    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), lookups);
 }
 
 #[tokio::test]

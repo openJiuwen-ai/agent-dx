@@ -106,6 +106,17 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Under write-buffer pressure, return a score for a sequential write
+    /// that advances an existing block. This is only a scheduling hint.
+    fn queued_write_completion(
+        &self,
+        _handle: types::FileHandle,
+        _offset: u64,
+        _length: usize,
+    ) -> Option<usize> {
+        None
+    }
+
     /// Local capability query after a successful fresh open. `None` requires
     /// discarding pages; implementations must not perform RPCs from this hook.
     fn page_cache_identity(&self, _handle: types::FileHandle) -> Option<PageCacheIdentity> {
@@ -407,6 +418,11 @@ pub trait Backend: Send + Sync {
     /// 只读句柄不能提交其它 writer；release 只清理资源，不承担提交。
     fn flush(&self, _ctx: &types::RequestContext, _handle: types::FileHandle) -> Result<()> {
         Err(unsupported("flush"))
+    }
+
+    /// Maximum wait for a filesystem durability barrier, if configured.
+    fn fsync_timeout(&self) -> Option<std::time::Duration> {
+        None
     }
 
     /// 应用显式要求的屏障；DataOnly/Full 分别对应 fdatasync/fsync。

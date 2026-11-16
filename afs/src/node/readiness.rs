@@ -234,13 +234,13 @@ pub(crate) fn current_visible_afs_mount_id_in_mountinfo(
     }
 }
 
-struct MountinfoEntry<'a> {
-    mount_id: &'a [u8],
-    fs_type: &'a [u8],
-    source: &'a [u8],
+pub(crate) struct MountinfoEntry<'a> {
+    pub(crate) mount_id: &'a [u8],
+    pub(crate) fs_type: &'a [u8],
+    pub(crate) source: &'a [u8],
 }
 
-fn parse_exact_mountinfo_line<'a>(
+pub(crate) fn parse_exact_mountinfo_line<'a>(
     line: &'a [u8],
     encoded_path: &[u8],
 ) -> Option<MountinfoEntry<'a>> {

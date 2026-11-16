@@ -596,7 +596,7 @@ async fn handle_command_watch(
     .await;
     let mut subscriptions = HashSet::<String>::new();
     let mut versions = HashMap::<String, u64>::new();
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
+    let mut changes = super::cmd::command_changes();
     let max_subscriptions = std::env::var("EXECD_COMMAND_WATCH_MAX_SUBSCRIPTIONS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -669,24 +669,39 @@ async fn handle_command_watch(
                     _ => {}
                 }
             }
-            _ = tick.tick() => {
-                if subscriptions.is_empty() { continue; }
-                let ids: Vec<String> = subscriptions.iter().cloned().collect();
-                for state in super::cmd::watch_snapshot(&ids) {
-                    let json = rmpv_to_json(&state);
-                    let command_id = json.get("command_id").and_then(|value| value.as_str()).unwrap_or("");
-                    let version = json.get("state_version").and_then(|value| value.as_u64()).unwrap_or(0);
-                    if versions.get(command_id).copied().unwrap_or(u64::MAX) == version { continue; }
-                    versions.insert(command_id.to_owned(), version);
-                    let response = serde_json::json!({
-                        "op": "state",
-                        "commandId": command_id,
-                        "status": json.get("status").cloned().unwrap_or(serde_json::Value::Null),
-                        "stateVersion": version,
-                    });
-                    websocket.send(tokio_tungstenite::tungstenite::Message::Text(response.to_string())).await?;
-                }
+            change = changes.changed() => {
+                if change.is_err() { break; }
             }
+        }
+        if subscriptions.is_empty() {
+            continue;
+        }
+        let ids: Vec<String> = subscriptions.iter().cloned().collect();
+        for state in super::cmd::watch_snapshot(&ids) {
+            let json = rmpv_to_json(&state);
+            let command_id = json
+                .get("command_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let version = json
+                .get("state_version")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            if versions.get(command_id).copied().unwrap_or(u64::MAX) == version {
+                continue;
+            }
+            versions.insert(command_id.to_owned(), version);
+            let response = serde_json::json!({
+                "op": "state",
+                "commandId": command_id,
+                "status": json.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                "stateVersion": version,
+            });
+            websocket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    response.to_string(),
+                ))
+                .await?;
         }
     }
     Ok(())
@@ -2879,13 +2894,78 @@ mod tests {
             ))
             .await
             .unwrap();
-        let replay = tokio::time::timeout(std::time::Duration::from_secs(1), websocket.next())
+        let replay = tokio::time::timeout(std::time::Duration::from_millis(120), websocket.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         let replay: serde_json::Value = serde_json::from_str(replay.to_text().unwrap()).unwrap();
         assert_eq!(replay["status"], "SUCCEEDED");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn command_watch_wakes_on_completion_without_a_polling_tick() {
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, None).await;
+        });
+        let command_id = format!(
+            "watch-stdin-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let args = std::collections::BTreeMap::from([
+            (
+                "command_id".to_string(),
+                rmpv::Value::from(command_id.clone()),
+            ),
+            (
+                "command".to_string(),
+                rmpv::Value::from("read line; printf '%s' \"$line\""),
+            ),
+            ("want_stdin".to_string(), rmpv::Value::from(true)),
+        ]);
+        super::super::cmd::cmd_start(&args);
+        let (mut websocket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/commands/watch"))
+                .await
+                .unwrap();
+        websocket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({"op":"subscribe","commandIds":[command_id.clone()]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(1), websocket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let initial: serde_json::Value = serde_json::from_str(initial.to_text().unwrap()).unwrap();
+        assert_eq!(initial["status"], "RUNNING");
+        // Finish immediately after the RUNNING snapshot. A periodic 200ms
+        // observer would need another tick; completion must wake this stream.
+        super::super::cmd::cmd_send_stdin(&std::collections::BTreeMap::from([
+            ("command_id".to_string(), rmpv::Value::from(command_id)),
+            ("data".to_string(), rmpv::Value::from("done\n")),
+            ("eof".to_string(), rmpv::Value::from(true)),
+        ]));
+        let terminal =
+            tokio::time::timeout(std::time::Duration::from_millis(120), websocket.next())
+                .await
+                .expect("completion should not wait for the former 200ms tick")
+                .unwrap()
+                .unwrap();
+        let terminal: serde_json::Value =
+            serde_json::from_str(terminal.to_text().unwrap()).unwrap();
+        assert_eq!(terminal["status"], "SUCCEEDED");
+        assert!(
+            terminal["stateVersion"].as_u64().unwrap() > initial["stateVersion"].as_u64().unwrap()
+        );
         server.abort();
     }
 

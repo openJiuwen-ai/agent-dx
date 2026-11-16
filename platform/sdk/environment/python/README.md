@@ -40,6 +40,10 @@ management caller; the API does not enforce per-tenant source-path authorization
 `/tunnel/{environment}` route; the legacy `/invoke` fallback remains unavailable. See the
 [current HTTP contract](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/gateway/apiserver/docs/environment-lifecycle-api.md).
 
+On sandboxd, a custom OCI image supplies its own `PATH`. Pass
+`env={"PATH": "/opt/tools/bin:/usr/bin:/bin"}` when creating an Environment to
+set the request's `PATH` explicitly.
+
 ## OOM diagnostics
 
 Command results and background-command info preserve `exit_signal`, such as
@@ -350,8 +354,13 @@ passive route subscriptions and health/metrics do not wake a paused environment.
 Requests already sent upstream are not replayed. Transient owner RPC failures
 retry on the same owner within the resume budget. A temporary wake failure before
 forwarding returns HTTP 503. A finite SDK HTTP request sends
-`X-ADX-Processing-Timeout-Ms`: authentication, route lookup, wake, route delivery,
-connection admission, forwarding and response streaming share one Ingress deadline.
+`X-ADX-Processing-Timeout-Ms`: authentication, route lookup, wake, route delivery
+and connection admission share the initial Ingress deadline. Forwarded non-empty
+upload data renews the response-header processing window. Successful `2xx`
+responses finish that window at their headers; file/tar downloads, port-forwarded
+HTTP streams and SSE may continue past the initial deadline. Error response
+bodies retain the latest processing deadline.
+SDK read-inactivity timeouts and single-file Range retries still apply.
 The SDK defaults to 300 seconds for a data request and adds a configurable
 communication margin (30 seconds by default) to its HTTP timeout. Without the
 header, wake and route delivery share a 300-second default; existing forwarding
@@ -782,7 +791,10 @@ result = command.wait()
 
 `wait()` and `wait_async()` use one hidden multiplexed WebSocket per connection
 context as a notification channel. The final result is always read back from
-EXECD's authoritative command registry. When the wait deadline expires, they
+EXECD's authoritative command registry. Subscription changes wake the shared
+transport immediately, and an idle transport is retained for up to five seconds
+for subsequent waits. Status notifications never replace the final registry read.
+When the wait deadline expires, they
 return `CommandResult(status=RUNNING, error_code="WAIT_TIMEOUT")`; the remote
 command remains active and the handle can wait again. A client restart also
 does not terminate the remote command. `CommandHandle.kill()` and
@@ -860,3 +872,31 @@ retry and outcome fields, and expose the initial failed attempt as `first_error`
 An unsuccessful capability query preserves its transport/domain exception; only
 a confirmed response missing the required capabilities is `UnsupportedFeature`.
 These diagnostics do not change operation replay or source ownership rules.
+
+
+### Registered Local rootfs
+
+SDK 0.1.0rc5 adds `Environment(rootfs_template="local-tools-v1", ...)` for a
+Local artifact registered by the deployment. It is mutually exclusive with
+`image`, `rootfs` and `snapshot_id`; arbitrary host paths are not accepted.
+`inherit_entrypoint=True` may start the registered process metadata. Missing
+names fail before scheduling, with no registry fallback. The deployment must
+prepare matching artifacts and metadata on eligible nodes. Default creates
+without an image or template keep using the deployment's default rootfs.
+
+SDK 0.1.0rc6 wakes command-watch subscriptions immediately when local waiters change,
+without a periodic receive timeout. Terminal events continue to trigger an authoritative
+result read; reconnects replay current command states.
+
+## Portable workspace mounts
+
+For a runsc workspace backed by a host or Volume bind, callers may explicitly use
+`options=("rw", "disable_file_handle_sharing")`. ADXlet observes the prepared source
+on the execution node and normalizes only that explicitly requested option in the
+sandboxd request. Local sources retain one copy; NFS/FUSE sources let runsc append
+one copy. This temporary compatibility workaround for the pinned runsc preserves
+effective options across local-owner and remote-NFS restore without changing the
+stored Environment specification. Unmarked mounts and other runtimes are unchanged.
+Source observation failure or an unresolved autofs mount fails creation/restore;
+the node and sandboxd must share the same source-path mount view. Existing snapshots
+retain their captured options and must be checked before changing their mount policy.

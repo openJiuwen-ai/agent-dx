@@ -417,6 +417,152 @@ async fn forbidden_queries_do_not_become_absence_or_leak_server_details() {
 }
 
 #[tokio::test]
+async fn pause_posts_the_checkpoint_budget_with_a_prefixed_idempotency_key() {
+    use axum::{http::HeaderMap, routing::post};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let capture = seen.clone();
+    let router = Router::new().route(
+        "/api/environment/v1/environments/adx-id/pause",
+        post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+            let capture = capture.clone();
+            async move {
+                assert_eq!(headers["authorization"], format!("Bearer {TOKEN}"));
+                let request_id = headers["x-adx-request-id"].to_str().unwrap().to_string();
+                assert!(
+                    request_id.starts_with("pause-activator-"),
+                    "pause idempotency key must carry the pause- prefix: {request_id}"
+                );
+                assert_eq!(body, serde_json::json!({"timeoutSeconds":300}));
+                assert!(body.get("retention").is_none());
+                *capture.lock().unwrap() = Some(request_id);
+                Json(serde_json::json!({"code":200,"data":STANDARD.encode(
+                    r#"{"environmentId":"adx-id","snapshotId":"pause-activator-x","size":1024,"state":"paused","expiresAt":null}"#
+                )}))
+            }
+        }),
+    );
+    let (url, task) = serve(router).await;
+    let client = HttpEnvironment::new(
+        &url,
+        credentials(),
+        Duration::from_secs(5),
+        None,
+        true,
+        network_policy(),
+    )
+    .unwrap();
+    let observed = client.pause("tenant", "adx-id", 300).await.unwrap();
+    assert_eq!(observed.id, "adx-id");
+    assert_eq!(observed.phase, EnvironmentPhase::Paused);
+    assert!(!observed.ready);
+    // Replaying the same tenant/id reuses the deterministic operation identity.
+    let first = seen.lock().unwrap().clone().unwrap();
+    client.pause("tenant", "adx-id", 300).await.unwrap();
+    assert_eq!(seen.lock().unwrap().as_ref().unwrap(), &first);
+    task.abort();
+}
+
+#[tokio::test]
+async fn pause_failure_statuses_map_to_structured_environment_errors() {
+    use axum::http::StatusCode;
+    for (status, kind) in [
+        (StatusCode::BAD_REQUEST, "invalid"),
+        // A pause is a write: a missing target is unknown, not confirmed absence, so the
+        // orchestrator re-queries the original ID and converges on the next pass.
+        (StatusCode::NOT_FOUND, "outcome_unknown"),
+        (StatusCode::UNAUTHORIZED, "unavailable"),
+        (StatusCode::FORBIDDEN, "unavailable"),
+        (StatusCode::CONFLICT, "conflict"),
+        (StatusCode::NOT_IMPLEMENTED, "unsupported"),
+        (StatusCode::SERVICE_UNAVAILABLE, "outcome_unknown"),
+    ] {
+        let (url, task) = serve(Router::new().fallback(move || async move { (status, "") })).await;
+        let client = HttpEnvironment::new(
+            &url,
+            credentials(),
+            Duration::from_secs(1),
+            None,
+            true,
+            network_policy(),
+        )
+        .unwrap();
+        let error = client.pause("tenant", "adx-id", 1).await.unwrap_err();
+        let ok = match kind {
+            "invalid" => matches!(error, EnvironmentError::Invalid(_)),
+            "unavailable" => matches!(error, EnvironmentError::Unavailable(_)),
+            "conflict" => matches!(error, EnvironmentError::Conflict(_)),
+            "unsupported" => matches!(error, EnvironmentError::Unsupported(_)),
+            _ => matches!(error, EnvironmentError::OutcomeUnknown(_)),
+        };
+        assert!(ok, "{status}: {error:?}");
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn pause_rejects_timeout_seconds_outside_the_api_bound() {
+    // The trait method is pub: an unbounded budget must be rejected at the entry,
+    // not forwarded to the Platform as a multi-year capture or wrapped in an
+    // overflowing Duration add. Bounds mirror the API Server pause contract.
+    let (url, task) = serve(Router::new().fallback(|| async { axum::http::StatusCode::OK })).await;
+    let client = HttpEnvironment::new(
+        &url,
+        credentials(),
+        Duration::from_secs(1),
+        None,
+        true,
+        network_policy(),
+    )
+    .unwrap();
+    for budget in [0_u64, 3601] {
+        assert!(
+            matches!(
+                client.pause("tenant", "adx-id", budget).await,
+                Err(EnvironmentError::Invalid(_))
+            ),
+            "budget {budget} must be rejected before any request is sent"
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn pause_client_budget_is_clamped_to_timeout_seconds() {
+    // A slow Platform pause must give up after timeout_seconds (the reconciliation
+    // step's remaining budget), not after self.timeout + timeout_seconds, so the
+    // step deadline bounds the capture instead of overshooting into the outer
+    // reconciliation timeout. self.timeout (10s) + timeout_seconds (1s) would wait
+    // ~11s; the clamped client budget returns at ~1s.
+    let router = Router::new().fallback(|| async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        axum::http::StatusCode::OK
+    });
+    let (url, task) = serve(router).await;
+    let client = HttpEnvironment::new(
+        &url,
+        credentials(),
+        Duration::from_secs(10),
+        None,
+        true,
+        network_policy(),
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    let result = client.pause("tenant", "adx-id", 1).await;
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(result, Err(EnvironmentError::OutcomeUnknown(_))),
+        "a slow pause is an unknown outcome: {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "pause must give up after ~timeout_seconds (1s), not self.timeout+timeout_seconds (11s); got {elapsed:?}"
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn volume_management_explicit_refusals_keep_deterministic_errors() {
     use adx_agent_core::volumes::{VolumeSource, VolumeSpec};
     use axum::http::StatusCode;

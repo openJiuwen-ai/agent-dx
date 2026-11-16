@@ -128,6 +128,16 @@ fn creation_error(handle: &crate::EnvironmentHandle, error: Error) -> Status {
     }
     status
 }
+fn create_response(
+    result: crate::OperationResult,
+    creation_request_id: String,
+) -> Result<Response<pb::EnvironmentResult>> {
+    let mut response = response(result)?;
+    if let Some(record) = response.get_mut().record.as_mut() {
+        record.creation_request_id = creation_request_id;
+    }
+    Ok(response)
+}
 fn response(result: crate::OperationResult) -> Result<Response<pb::EnvironmentResult>> {
     adx_observability::info!(event="environment_operation_completed", traceparent=?adx_observability::trace::traceparent(), environment_id=%result.record.spec.id,
         generation=result.record.assignment.generation, revision=result.record.revision,
@@ -224,6 +234,93 @@ impl pb::node_service_server::NodeService for NodeRpc {
                 .map_err(status)?
                 .into(),
         ))
+    }
+
+    async fn apply_node_upgrade_control(
+        &self,
+        request: Request<pb::NodeUpgradeControl>,
+    ) -> std::result::Result<Response<pb::NodeUpgradeInspection>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Coordinator {
+            return Err(Status::permission_denied("Coordinator identity required"));
+        }
+        let control = request.into_inner();
+        if control.node_session_id != self.session_id || self.session_id.is_empty() {
+            return Err(Status::failed_precondition("node process session changed"));
+        }
+        let result = self
+            .manager
+            .apply_upgrade_control(control)
+            .await
+            .map_err(status)?;
+        Ok(Response::new(result))
+    }
+
+    async fn inspect_node_upgrade(
+        &self,
+        request: Request<pb::NodeUpgradeInspectRequest>,
+    ) -> std::result::Result<Response<pb::NodeUpgradeInspection>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Coordinator {
+            return Err(Status::permission_denied("Coordinator identity required"));
+        }
+        let request = request.into_inner();
+        if request.node_session_id != self.session_id || self.session_id.is_empty() {
+            return Err(Status::failed_precondition("node process session changed"));
+        }
+        let mut actual = self
+            .manager
+            .inspect_upgrade_environment(
+                (!request.environment_id.is_empty()).then_some(request.environment_id.as_str()),
+            )
+            .await
+            .map_err(status)?;
+        let probe = request.task_id.is_empty() && request.epoch == 0;
+        if !probe && (actual.task_id != request.task_id || actual.epoch != request.epoch) {
+            return Err(Status::failed_precondition(
+                "node upgrade authority changed",
+            ));
+        }
+        if !request.environment_id.is_empty() {
+            let lifecycle = self.manager.lifecycle_ready.read().await;
+            actual.unknown |= !*lifecycle
+                || self
+                    .manager
+                    .authority_reconciling
+                    .load(std::sync::atomic::Ordering::Acquire);
+            let view = self
+                .manager
+                .environments
+                .lock()
+                .map_err(|_| Status::internal("environment registry unavailable"))?
+                .get(&request.environment_id)
+                .map(|(_, _, handle)| handle.view());
+            actual.environment = match view {
+                Some((record, durability)) => Some(pb::EnvironmentResult {
+                    record: Some(record.try_into().map_err(status)?),
+                    durability: match durability {
+                        Some(Durability::Published) => pb::Durability::Published,
+                        Some(Durability::Journaled) => pb::Durability::Journaled,
+                        None => pb::Durability::Unspecified,
+                    } as i32,
+                    ..Default::default()
+                }),
+                None => None,
+            };
+        }
+        Ok(Response::new(actual))
+    }
+
+    async fn wake_node_reconciliation(
+        &self,
+        request: Request<pb::WakeNodeReconciliationRequest>,
+    ) -> std::result::Result<Response<pb::WakeNodeReconciliationResponse>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Coordinator {
+            return Err(Status::permission_denied("Coordinator identity required"));
+        }
+        if self.session_id.is_empty() || request.into_inner().node_session_id != self.session_id {
+            return Err(Status::failed_precondition("node process session changed"));
+        }
+        self.manager.reconciliation_requested.notify_one();
+        Ok(Response::new(pb::WakeNodeReconciliationResponse {}))
     }
 
     async fn ensure_environment_running(
@@ -555,7 +652,11 @@ impl pb::node_service_server::NodeService for NodeRpc {
                         None => handle.create().await,
                     },
                 };
-                response(result.map_err(|error| creation_error(&handle, error))?).map_err(status)
+                create_response(
+                    result.map_err(|error| creation_error(&handle, error))?,
+                    r.creation_request_id,
+                )
+                .map_err(status)
             })
             .await
     }
@@ -566,14 +667,38 @@ impl pb::node_service_server::NodeService for NodeRpc {
         let trace = adx_observability::trace::Trace::rpc("node.pause_environment", &request);
         trace
             .run_result(async {
-                if self.peers.authenticate(&request)? != Principal::ApiServer {
-                    return Err(Status::permission_denied("API Server required"));
+                let principal = self.peers.authenticate(&request)?;
+                if principal != Principal::ApiServer && principal != Principal::Coordinator {
+                    return Err(Status::permission_denied(
+                        "API Server or Coordinator required",
+                    ));
                 }
                 let gate = self.manager.lifecycle_ready.read().await;
                 if !*gate {
                     return Err(Status::unavailable("node is reconciling"));
                 }
                 let r = request.into_inner();
+                if principal == Principal::Coordinator {
+                    if !r.operation_id.starts_with("task:") {
+                        return Err(Status::permission_denied(
+                            "Coordinator pause requires an upgrade task",
+                        ));
+                    }
+                    let assignment = r
+                        .assignment
+                        .as_ref()
+                        .ok_or_else(|| Status::invalid_argument("assignment required"))?;
+                    self.manager
+                        .services
+                        .upgrade
+                        .management_grant(
+                            &assignment.environment_id,
+                            assignment.generation,
+                            "pause",
+                            &r.operation_id,
+                        )
+                        .map_err(status)?;
+                }
                 let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
                 response(
                     handle
@@ -732,6 +857,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     .ok_or_else(|| Status::invalid_argument("assignment required"))?
                     .try_into()
                     .map_err(status)?;
+
                 let managed = self
                     .manager
                     .environments
@@ -767,20 +893,19 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     return Err(Status::failed_precondition("assignment changed"));
                 }
                 let result = if principal == Principal::Coordinator {
-                    let fence =
-                        fence.ok_or_else(|| Status::invalid_argument("deletion fence required"))?;
                     let manager = self.manager.clone();
                     tokio::spawn(adx_observability::trace::with_current_context(async move {
                         let _lifecycle_guard = gate;
                         let result = match fence {
-                            RetiredDeleteFence::Revision(revision) => {
+                            Some(RetiredDeleteFence::Revision(revision)) => {
                                 handle.delete_at_revision(revision).await
                             }
-                            RetiredDeleteFence::Failed(revision) => {
+                            Some(RetiredDeleteFence::Failed(revision)) => {
                                 handle.collect_failed(revision).await
                             }
+                            None => handle.delete().await,
                         }?;
-                        manager.release_published_controller_with_fence(&result, Some(fence));
+                        manager.release_published_controller_with_fence(&result, fence);
                         Ok::<_, Error>(result)
                     }))
                     .await

@@ -723,40 +723,53 @@ impl Session {
         catalog: Option<&Catalog>,
         counters: Option<&CounterUpdate>,
     ) -> Result<bool> {
+        Box::pin(self.assignment_cas_checked(header, previous, record, catalog, counters, &[]))
+            .await
+    }
+
+    pub(super) async fn assignment_cas_checked(
+        &self,
+        header: &Header,
+        previous: Option<&str>,
+        record: &StoredEnvironment,
+        catalog: Option<&Catalog>,
+        counters: Option<&CounterUpdate>,
+        checks: &[(String, Option<String>)],
+    ) -> Result<bool> {
         let field = format!("environment:{}", record.spec.id);
         let Some(catalog) = catalog else {
-            return self
-                .store
-                .object_cas_with_counters(
-                    header,
-                    Some((&field, previous, encode(record)?)),
-                    counters,
-                )
-                .await;
+            return Box::pin(self.store.object_cas_checked(
+                header,
+                Some((&field, previous, encode(record)?)),
+                counters,
+                checks,
+            ))
+            .await;
         };
         if catalog.control.get(&field).map(String::as_str) != previous {
             return Ok(false);
         }
-        self.control_volume_cas(
-            &catalog.header_value,
-            &catalog.advanced_header()?,
+        Box::pin(self.control_volume_cas_checked(
+            (&catalog.header_value, &catalog.advanced_header()?),
             &[(field, encode(record)?)],
             catalog,
             counters,
-        )
+            checks,
+        ))
         .await
     }
 
     /// Volume mutations retain their shared header CAS; touched lifecycle records
     /// additionally compare exact bytes because ordinary writes use object CAS.
-    pub(super) async fn control_volume_cas(
+    pub(super) async fn control_volume_cas_checked(
         &self,
-        expected: &str,
-        header: &Header,
+        expected_header: (&str, &Header),
         fields: &[(String, String)],
         catalog: &Catalog,
         counters: Option<&CounterUpdate>,
+        additional_checks: &[(String, Option<String>)],
     ) -> Result<bool> {
+        let (expected, header) = expected_header;
         let mut checks = BTreeMap::new();
         let mut artifacts = Vec::new();
         let mut references = Vec::new();
@@ -794,6 +807,13 @@ impl Session {
                     sessions.push((format!("node-session:{}", node.node.id), session.id));
                 }
             }
+        }
+        for (key, value) in additional_checks {
+            let expected = value.clone().unwrap_or_default();
+            if checks.get(key).is_some_and(|current| current != &expected) {
+                return Ok(false);
+            }
+            checks.insert(key.clone(), expected);
         }
         let _access = self.store.lock_artifacts(&references)?;
         let mut command = redis::cmd("EVAL");

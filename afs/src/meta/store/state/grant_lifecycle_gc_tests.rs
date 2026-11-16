@@ -25,6 +25,7 @@ fn fixture() -> (State, RootAccessGrant) {
         local_prepare_id: "p".into(),
         created_at_revision: StoreRevision(1),
         updated_at_revision: StoreRevision(1),
+        nfs_addr: String::new(),
     };
     let grant = RootAccessGrant {
         root_id: root.root_id.clone(),
@@ -48,6 +49,7 @@ fn fixture() -> (State, RootAccessGrant) {
         grpc_addr: "g".into(),
         data_addr: "d".into(),
         rest_addr: "r".into(),
+        nfs_addr: String::new(),
         ownerfs_enabled: true,
         storage_devices: vec![],
         lease_epoch: 1,
@@ -169,6 +171,7 @@ fn grant_lifecycle_gc_collects_expired_or_replaced_peers_but_retains_home() {
         grpc_addr: "g".into(),
         data_addr: "d".into(),
         rest_addr: "r".into(),
+        nfs_addr: String::new(),
         ownerfs_enabled: true,
         storage_devices: vec![],
         lease_epoch: 1,

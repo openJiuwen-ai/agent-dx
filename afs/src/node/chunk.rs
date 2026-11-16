@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -240,6 +240,8 @@ pub struct RecoveryReport {
 }
 
 #[cfg(test)]
+mod catalog_power_loss_tests;
+#[cfg(test)]
 mod catalog_tail_recovery_tests;
 
 #[cfg(test)]
@@ -247,6 +249,7 @@ mod format_golden_tests;
 
 #[derive(Debug)]
 pub struct LocalChunkStore {
+    #[cfg(any(feature = "dfs", test))]
     read_cache_admission: Mutex<()>,
     node_id: String,
     device_id: String,
@@ -259,11 +262,16 @@ pub struct LocalChunkStore {
     outboard_budget: Arc<OutboardBudget>,
     outboard_repairs: Arc<OutboardRepairGates>,
     catalog_path: PathBuf,
+    // The catalog committer serializes append and GC. This tracks the
+    // directory entry, whose durability is independent of WAL contents.
+    catalog_name_durable: AtomicBool,
     catalog: Mutex<LocalCatalog>,
     catalog_committer: CatalogCommitter,
     next_staging: AtomicU64,
     #[cfg(any(feature = "dfs", test))]
     gc_inventory_cursor: AtomicU64,
+    #[cfg(any(feature = "dfs", test))]
+    gc_crc_inventory_cursor: AtomicU64,
     /// This Node's own remote-read policy as a reader. Served peer requests
     /// follow the caller's requested mode instead.
     #[cfg(any(feature = "dfs", test))]

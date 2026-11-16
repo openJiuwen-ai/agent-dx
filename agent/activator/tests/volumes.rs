@@ -89,6 +89,18 @@ impl Environment for Platform {
         record.ready = false;
         Ok(record)
     }
+    async fn pause(
+        &self,
+        _: &str,
+        id: &str,
+        _timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        let mut executions = self.executions.lock().unwrap();
+        let record = executions.get_mut(id).ok_or(EnvironmentError::NotFound)?;
+        record.phase = EnvironmentPhase::Paused;
+        record.ready = false;
+        Ok(record.clone())
+    }
 }
 fn template() -> TemplateVersion {
     serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"image","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":128},

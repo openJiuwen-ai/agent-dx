@@ -32,6 +32,12 @@ and `error_code=WAIT_TIMEOUT`; it does not stop the command. `process.kill`
 returns HTTP 200 with `killed=false` for a missing or already exited command.
 An actual signal failure remains an error.
 
+`/commands/watch` replays the current state immediately for each subscription,
+including a repeated subscription to an already completed command. Later state
+changes wake the stream through the command registry notification channel; no
+periodic status scan is needed. Notifications include command identity and state
+version. Clients read the full result from the authoritative registry.
+
 Command status, running flag, exit code/signal, completion time and state version
 come from one immutable observation of the per-command publication state. A child
 finishing while a response is formatted cannot produce `SUCCEEDED` without its

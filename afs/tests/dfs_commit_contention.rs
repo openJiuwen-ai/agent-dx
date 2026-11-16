@@ -97,7 +97,7 @@ impl LeaseInterferenceStore {
                     operation_id: OperationId::new(operation),
                     caller: root_caller(),
                     inode_id: parent.inode_id,
-                    expected_inode_revision: parent.revision,
+                    expected_inode_revision: Some(parent.revision),
                     update: afs::dfs::InodeAttrUpdate {
                         mode: Some(0o555),
                         ..Default::default()
@@ -253,7 +253,7 @@ impl LeaseInterferenceStore {
                     };
                     inode.head_version = Some(version.id.clone());
                     mutation.mutations.extend([
-                        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout)),
+                        TxnMutation::Put(MetaEntity::DfsLayoutRoot(layout.into())),
                         TxnMutation::Put(MetaEntity::DfsFileVersion(version)),
                     ]);
                 } else {
@@ -363,6 +363,12 @@ fn create_request(operation: impl Into<String>, name: impl Into<Vec<u8>>) -> Cre
         name: name.into(),
         attributes: attrs(),
         lease_seconds: 30,
+        first_generation: None,
+        caller: afs::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
     }
 }
 
@@ -696,7 +702,7 @@ async fn unlink_retry_rechecks_parent_permissions() {
             operation_id: OperationId::new("parent-writable"),
             caller: root_caller(),
             inode_id: parent.inode_id,
-            expected_inode_revision: parent.revision,
+            expected_inode_revision: Some(parent.revision),
             update: afs::dfs::InodeAttrUpdate {
                 mode: Some(0o777),
                 ..Default::default()

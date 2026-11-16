@@ -48,6 +48,7 @@ async fn p3_local_log_namespace_retry_watch_and_restart_are_equivalent() {
                 grpc_addr: "http://writer:7400".into(),
                 data_addr: "http://writer:7500".into(),
                 rest_addr: "http://writer:7600".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: true,
                 storage_devices: Vec::new(),
                 lease_ttl: Duration::from_secs(60),
@@ -76,6 +77,12 @@ async fn p3_local_log_namespace_retry_watch_and_restart_are_equivalent() {
             ctime_unix_ms: 1,
         },
         lease_seconds: 60,
+        first_generation: None,
+        caller: afs::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
     };
     let created = dfs.create(request.clone()).await.unwrap();
     let old_view = store.read_view().await.unwrap();
@@ -205,6 +212,7 @@ async fn read_dir_pages_follow_an_exclusive_name_cursor() {
                 grpc_addr: "http://writer:7400".into(),
                 data_addr: "http://writer:7500".into(),
                 rest_addr: "http://writer:7600".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: true,
                 storage_devices: Vec::new(),
                 lease_ttl: Duration::from_secs(60),
@@ -234,6 +242,12 @@ async fn read_dir_pages_follow_an_exclusive_name_cursor() {
                 ctime_unix_ms: 1,
             },
             lease_seconds: 60,
+            first_generation: None,
+            caller: afs::dfs::CallerContext {
+                uid: 0,
+                gid: 0,
+                supplementary_gids: Vec::new(),
+            },
         })
         .await
         .unwrap();

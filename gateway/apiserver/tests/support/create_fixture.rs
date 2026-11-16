@@ -168,6 +168,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
             } else {
                 self.0.starts.fetch_add(1, Ordering::SeqCst);
                 let record = pb::EnvironmentRecord {
+                    creation_request_id: identity.1.clone(),
                     observation: None,
                     execution_artifacts: vec![],
             snapshot_source: None,
@@ -720,6 +721,9 @@ service_impl!(pb::node_service_server::NodeService, {
     get_environment_control(NodeGetEnvironmentControlRequest) -> EnvironmentControlRecord,
     batch_get_environment_control(NodeBatchGetEnvironmentControlRequest) -> BatchGetEnvironmentControlResponse,
     update_environment_control(NodeUpdateEnvironmentControlRequest) -> EnvironmentControlRecord,
+    apply_node_upgrade_control(NodeUpgradeControl) -> NodeUpgradeInspection,
+    inspect_node_upgrade(NodeUpgradeInspectRequest) -> NodeUpgradeInspection,
+    wake_node_reconciliation(WakeNodeReconciliationRequest) -> WakeNodeReconciliationResponse,
     recover_environment(RecoverEnvironmentRequest) -> EnvironmentResult,
     get_session(GetNodeSessionRequest) -> GetNodeSessionResponse,
     create_environment(StartAssignedEnvironmentRequest) -> EnvironmentResult,

@@ -67,6 +67,167 @@ async fn registered(session: &adx_coordinator::storage::Session, boot: &str) {
         .unwrap();
 }
 
+async fn register_host(
+    session: &adx_coordinator::storage::Session,
+    process: &str,
+    host: Option<&str>,
+) -> StoredNode {
+    let mut report = node("reused-name");
+    if let Some(host) = host {
+        report
+            .labels
+            .insert("ADX_NODE_HOST_UUID".into(), host.into());
+    }
+    session
+        .register_session(
+            report,
+            "127.0.0.1:9000".into(),
+            "127.0.0.1:9001".into(),
+            Some(NodeSession {
+                id: process.into(),
+                sequence: 1,
+                routable: true,
+            }),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn node_scheduling_pause_does_not_follow_a_replacement_host() {
+    const OLD_HOST: &str = "11111111-1111-4111-8111-111111111111";
+    const NEW_HOST: &str = "22222222-2222-4222-8222-222222222222";
+    for retire in [false, true] {
+        let rig = common::Redis::new().await;
+        let store = rig.store().await;
+        let session = store.begin(1).await.unwrap();
+        register_host(&session, "first-process", Some(OLD_HOST)).await;
+        session
+            .set_node_scheduling("reused-name", true, false)
+            .await
+            .unwrap();
+        let restarted = register_host(&session, "second-process", Some(OLD_HOST)).await;
+        assert!(restarted.scheduling_paused && !restarted.node.available);
+        session
+            .invalidate_node("reused-name", "second-process")
+            .await
+            .unwrap();
+        if retire {
+            assert!(session
+                .retire_expired_node("reused-name", "second-process", u64::MAX, 1800)
+                .await
+                .unwrap());
+        }
+        let recovered = store.begin(1).await.unwrap();
+        let replacement = register_host(&recovered, "replacement-process", Some(NEW_HOST)).await;
+        assert!(!replacement.scheduling_paused && replacement.node.available);
+        assert_eq!(replacement.shard_id, restarted.shard_id);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn replacement_clears_old_administrative_pause_when_upgrade_releases_its_pause() {
+    use adx_coordinator::storage::{UpgradeNode, UpgradeTask};
+
+    const OLD_HOST: &str = "11111111-1111-4111-8111-111111111111";
+    const NEW_HOST: &str = "22222222-2222-4222-8222-222222222222";
+    for retired in [false, true] {
+        for (next_host, expected_admin_pause) in [
+            (Some(OLD_HOST), true),
+            (None, true),
+            (Some(NEW_HOST), false),
+        ] {
+            let rig = common::Redis::new().await;
+            let session = rig.store().await.begin(1).await.unwrap();
+            register_host(&session, "previous", Some(OLD_HOST)).await;
+            session
+                .set_node_scheduling("reused-name", true, false)
+                .await
+                .unwrap();
+            session
+                .invalidate_node("reused-name", "previous")
+                .await
+                .unwrap();
+            if retired {
+                assert!(session
+                    .retire_expired_node("reused-name", "previous", u64::MAX, 1800)
+                    .await
+                    .unwrap());
+            }
+            session
+                .save_upgrade(
+                    UpgradeTask {
+                        protocol_version: 3,
+                        task_id: "upgrade".into(),
+                        epoch: 1,
+                        namespace: "test".into(),
+                        daemonset_uid: "daemonset".into(),
+                        target_image: format!("node@sha256:{}", "a".repeat(64)),
+                        phase: "Active".into(),
+                        nodes: [(
+                            "reused-name".into(),
+                            UpgradeNode {
+                                node_id: "reused-name".into(),
+                                pod_uid: "previous-pod".into(),
+                                node_session_id: "previous".into(),
+                                phase: "evacuating".into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            if !retired {
+                session
+                    .set_upgrade_node_scheduling("upgrade", 1, "reused-name", true)
+                    .await
+                    .unwrap();
+            }
+            let next = register_host(&session, "next", next_host).await;
+            assert!(next.scheduling_paused && !next.node.available);
+            assert_eq!(
+                next.upgrade_pause.unwrap().original_paused,
+                expected_admin_pause,
+                "retired={retired}, next_host={next_host:?}",
+            );
+            let released = session
+                .set_upgrade_node_scheduling("upgrade", 1, "reused-name", false)
+                .await
+                .unwrap();
+            assert!(released.upgrade_pause.is_none());
+            assert_eq!(released.scheduling_paused, expected_admin_pause);
+            assert_eq!(released.node.available, !expected_admin_pause);
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn node_scheduling_pause_preserves_unknown_host_identity() {
+    const HOST: &str = "22222222-2222-4222-8222-222222222222";
+    for (previous_uuid, reported_uuid) in [
+        (None, Some(HOST)),
+        (Some(HOST), None),
+        (Some(HOST), Some("invalid")),
+    ] {
+        let rig = common::Redis::new().await;
+        let session = rig.store().await.begin(1).await.unwrap();
+        register_host(&session, "previous", previous_uuid).await;
+        session
+            .set_node_scheduling("reused-name", true, false)
+            .await
+            .unwrap();
+        let next = register_host(&session, "next", reported_uuid).await;
+        assert!(next.scheduling_paused && !next.node.available);
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn node_retirement_preserves_administrative_policy_and_heartbeat_fencing() {

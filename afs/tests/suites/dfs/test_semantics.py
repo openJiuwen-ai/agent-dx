@@ -10,9 +10,12 @@ On a single VM the roles are separate processes and mounts on one kernel, so
 this proves cross-client semantics, not cross-VM isolation.
 """
 
+import json
+import posixpath
 import time
 
-from fixtures.common import Case
+from fixtures.common import Case, DfsProfile
+from suites.operations import uncached_path_visibility
 
 HOLDER = """import os,sys,time,json
 d=sys.argv[1];os.setgroups([]);os.setgid(int(sys.argv[4]));os.setuid(int(sys.argv[3]))
@@ -43,7 +46,6 @@ def _release(c, role, name, holder):
     c.python(role, 'open(sys.argv[1],"w").write("{}")', holder + "/go.json")
     _wait_file(c, role, holder + "/done.json")
     c.channel(role).call("wait", role=name)
-    import json
     return json.loads(c.python(role, 'print(open(sys.argv[1]).read())', holder + "/done.json")["stdout"])
 
 
@@ -96,32 +98,42 @@ def unlink_open_file_keeps_data(c):
     result = _release(c, "B", "sem-unlink-holder", holder)
     c.record("semantics.unlink_open", result)
     assert result["first"] == 700 and result["second"] == 700, result
-    c.python("B", "assert not os.path.exists(sys.argv[1])", path)
+    # Path-only query: may lag A by one kernel entry TTL.
+    c.poll_python("B", "not os.path.exists(a[0])", path, label="unlink.B")
 
 
 def close_mtime_visibility_today(c):
     """Decision 5 keeps close DataOnly. Q03 asked whether another client's stat lags; S0 measured no lag.
 
-    The FUSE close path updates size and mtime that a fresh stat on another node observes at once.
+    The FUSE close path updates size and mtime. A fresh OPEN on another node sees them at once
+    (close-to-open, asserted strictly through fstat); a path stat may lag by one kernel attribute TTL.
     """
     c.write("A", "sem-mtime", b"x")
     time.sleep(1.2)
-    before = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)",
-                            c.workspace("B") + "/sem-mtime")["stdout"])
+    path = posixpath.join(c.workspace("B"), "sem-mtime")
+    before = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)", path)["stdout"])
     # write without fsync, then close: FUSE flush commits DataOnly.
     c.python("A", 'f=open(sys.argv[1],"ab");f.write(b"y");f.close()', c.workspace("A") + "/sem-mtime")
-    after_close = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)",
-                                 c.workspace("B") + "/sem-mtime")["stdout"])
-    size_after_close = int(c.python("B", "print(os.stat(sys.argv[1]).st_size)",
-                                    c.workspace("B") + "/sem-mtime")["stdout"])
+    opened = json.loads(c.python(
+        "B",
+        'fd=os.open(sys.argv[1],os.O_RDONLY);s=os.fstat(fd);os.close(fd);'
+        'print(json.dumps({"mtime":s.st_mtime,"size":s.st_size}))',
+        path,
+    )["stdout"])
+    stat_delay = c.poll_python(
+        "B", "os.stat(a[0]).st_size==2 and os.stat(a[0]).st_mtime>float(a[1])", path, repr(before),
+        label="close_mtime_path_stat.B",
+    )
+    after_close = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)", path)["stdout"])
+    size_after_close = int(c.python("B", "print(os.stat(sys.argv[1]).st_size)", path)["stdout"])
     time.sleep(6)  # background commit period is 5 s
-    after_background = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)",
-                                      c.workspace("B") + "/sem-mtime")["stdout"])
-    evidence = {"mtime_before": before, "mtime_after_close": after_close, "size_after_close": size_after_close,
-                "mtime_after_background": after_background,
-                "mtime_lagged_after_close": after_close == before,
+    after_background = float(c.python("B", "print(os.stat(sys.argv[1]).st_mtime)", path)["stdout"])
+    evidence = {"mtime_before": before, "open_fstat_mtime": opened["mtime"], "open_fstat_size": opened["size"],
+                "path_stat_delay_ms": stat_delay["ms"], "mtime_after_close": after_close,
+                "size_after_close": size_after_close, "mtime_after_background": after_background,
                 "question": "Q03", "decision": "5 (close stays DataOnly)"}
     c.record("semantics.close_mtime", evidence)
+    assert opened["size"] == 2 and opened["mtime"] > before, evidence
     assert size_after_close == 2, evidence
     assert after_close > before, evidence
 
@@ -147,11 +159,60 @@ def file_locks_are_local_only(c):
     assert a == '"ok"' and b == '"ok"', (a, b)
 
 
+ATOMIC_SAVE = """import os,sys
+d,name,data=sys.argv[1],sys.argv[2],bytes.fromhex(sys.argv[3])
+tmp=d+"/."+name+".tmp"
+f=open(tmp,"wb");f.write(data);f.close()
+os.rename(tmp,d+"/"+name)
+"""
+
+WRITE_RENAME_OPEN = """import os,sys
+d,name,first,second=sys.argv[1],sys.argv[2],bytes.fromhex(sys.argv[3]),bytes.fromhex(sys.argv[4])
+tmp=d+"/."+name+".tmp"
+f=open(tmp,"wb");f.write(first);f.flush()
+os.rename(tmp,d+"/"+name)
+f.write(second);f.close()
+"""
+
+
+def atomic_save_visible_to_other_node(c):
+    """An editor's atomic save on A (write a temporary file, close, rename over the target) is seen
+    whole by a new open on B right after the rename returns. Close-to-open across the rename relies on
+    FLUSH: it replies only after the inode's acknowledged bodies ran and their data was committed to
+    Meta, so the renamed inode's head already holds them; B's open of the target resolves the new name
+    (a cached dentry of the replaced file fails the open-time name check and is looked up again).
+    """
+    rounds = []
+    for index in range(8):
+        data = (b"save-%02d-" % index) * (64 + 512 * index)
+        c.python("A", ATOMIC_SAVE, c.workspace("A"), "sem-atomic-save", data.hex())
+        c.read("B", "sem-atomic-save", data)
+        rounds.append(len(data))
+    c.record("semantics.atomic_save_cross_node", {"rounds": rounds})
+
+
+def write_then_rename_before_close(c):
+    """Writing, renaming the still-open file over its target, writing again and only then closing:
+    POSIX gives no ordering between the writes and the rename, so this only requires no error and no
+    corruption; the descriptor keeps writing the same inode, which the target name now addresses.
+    """
+    first, second = b"before-rename-" * 300, b"after-rename-" * 300
+    c.write("A", "sem-write-rename", b"old")
+    c.python("A", WRITE_RENAME_OPEN, c.workspace("A"), "sem-write-rename", first.hex(), second.hex())
+    c.read("B", "sem-write-rename", first + second)
+    c.record("semantics.write_then_rename_before_close", {"bytes": len(first) + len(second)})
+
+
 CASES = (
     Case("dfs.semantics.visible_after_commit", ("s0-semantics",), "dfs", (), committed_write_visible_to_new_open),
     Case("dfs.semantics.open_reader_after_commit", ("s0-semantics",), "dfs", (), open_reader_keeps_open_time_version),
     Case("dfs.semantics.unlink_open_file", ("s0-semantics",), "dfs", (), unlink_open_file_keeps_data),
     Case("dfs.semantics.close_mtime", ("s0-semantics",), "dfs", (), close_mtime_visibility_today),
+    Case("dfs.semantics.uncached_path_visibility", ("s0-semantics",), "dfs", (), uncached_path_visibility,
+         profile=DfsProfile(kernel_cache_ttl_ms=0)),
     Case("dfs.semantics.fsync", ("s0-semantics",), "dfs", (), fsync_error_free_path),
     Case("dfs.semantics.locks_local_only", ("s0-semantics",), "dfs", (), file_locks_are_local_only),
+    Case("dfs.semantics.atomic_save_cross_node", ("s0-semantics",), "dfs", (), atomic_save_visible_to_other_node),
+    Case("dfs.semantics.write_then_rename_before_close", ("s0-semantics",), "dfs", (),
+         write_then_rename_before_close),
 )

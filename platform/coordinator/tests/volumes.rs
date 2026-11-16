@@ -1,4 +1,6 @@
 mod common;
+#[path = "support/recovery_profile.rs"]
+mod recovery_profile;
 use adx_coordinator::storage::RedisStore;
 use adx_core::{
     execution::{Mount, MountSource},
@@ -646,7 +648,8 @@ async fn node_loss_releases_reserved_and_current_authorized_volumes_with_the_fai
     }
     let mut records = Vec::new();
     for (id, candidate) in [("held", &a), ("reserved", &a), ("unrelated", &b)] {
-        let spec = environment(id, id);
+        let mut spec = environment(id, id);
+        recovery_profile::qualify(&mut spec);
         let assignment = session
             .claim(spec.clone(), candidate)
             .await
@@ -666,12 +669,13 @@ async fn node_loss_releases_reserved_and_current_authorized_volumes_with_the_fai
     running.revision = 2;
     running.runtime.ip = Some("10.0.0.1".parse().unwrap());
     running.checkpoint = Some(adx_core::RestorePoint {
+        recovery_profile: recovery_profile::qualify(&mut running.spec.clone()),
         id: "checkpoint".into(),
         origin: None,
         expires_at_unix_seconds: None,
         source_runtime_id: first.runtime.id.clone(),
         artifact: adx_core::CheckpointArtifact {
-            scope: Default::default(),
+            scope: "test-scope".into(),
             storage: "shared".into(),
             location: "artifact".into(),
             size_bytes: 8,
@@ -740,6 +744,33 @@ async fn node_loss_releases_reserved_and_current_authorized_volumes_with_the_fai
         .unwrap()
         .occupancy
         .is_none());
+    // Recovery uses fresh compatibility observations after restart.
+    let mut target = restarted
+        .snapshot()
+        .await
+        .unwrap()
+        .nodes
+        .remove(&b.node_id)
+        .unwrap();
+    target
+        .node
+        .labels
+        .extend(recovery_profile::qualify(&mut running.spec.clone()));
+    target.node.labels.extend([
+        ("ADX_CHECKPOINT_STORAGE".into(), "shared".into()),
+        ("ADX_CHECKPOINT_SCOPE".into(), "test-scope".into()),
+    ]);
+    target.session.as_mut().unwrap().sequence += 1;
+    restarted
+        .register_session_with_scopes(
+            target.node,
+            target.address,
+            target.proxy_address,
+            target.session,
+            ["test-scope".into()].into(),
+        )
+        .await
+        .unwrap();
     let replacement = adx_core::Assignment {
         node_id: b.node_id.clone(),
         shard_id: snapshot.nodes[&b.node_id].shard_id,
@@ -1713,6 +1744,7 @@ async fn volume_claim_batch_and_delete_preserve_request_identity_and_creation_su
             // One Delete must release the confirmed runtime's Volume and retain
             // durable checkpoint cleanup authority in the same transaction.
             record.checkpoint = Some(adx_core::RestorePoint {
+                recovery_profile: Default::default(),
                 id: "volume-cleanup".into(),
                 origin: None,
                 expires_at_unix_seconds: None,

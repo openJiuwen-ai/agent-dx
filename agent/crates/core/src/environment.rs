@@ -236,4 +236,19 @@ pub trait Environment: Send + Sync {
         tenant: &str,
         id: &str,
     ) -> Result<EnvironmentObservation, EnvironmentError>;
+    /// Pause a Running Environment. Returns only after the Platform durably publishes Paused;
+    /// callers must not treat a transport timeout as success. Idempotent for a stable tenant/id:
+    /// retries replay the authoritative result rather than conflict. `timeout_seconds` bounds
+    /// checkpoint capture only; retention inherits the create-time template policy. A deployment
+    /// that cannot pause returns `Unsupported` so the orchestrator blocks instead of degrading.
+    async fn pause(
+        &self,
+        _tenant: &str,
+        _id: &str,
+        _timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "Environment pause unavailable".into(),
+        ))
+    }
 }

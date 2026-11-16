@@ -11,6 +11,12 @@ struct RecordingGc {
     refused: Mutex<Vec<String>>,
     released: Mutex<Vec<String>>,
     refuse_open: std::sync::atomic::AtomicBool,
+    /// The Meta term `report_readers` answers (round 2 C-1).
+    term: std::sync::atomic::AtomicU64,
+    released_readers: Mutex<Vec<u64>>,
+    /// Refuse every soft registration as not the head (a head that keeps
+    /// moving); otherwise soft registration is unsupported here.
+    reader_not_head: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingGc {
@@ -60,6 +66,24 @@ impl crate::node::gc::GcControl for RecordingGc {
     }
     fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {
         Ok(crate::dfs::GcState::default())
+    }
+    fn retain_reader(&self, _: u64, _: &InodeId, _: Option<&FileVersionId>) -> Result<u64> {
+        let code = if self.reader_not_head.load(Ordering::SeqCst) {
+            afs_error::META_DFS_READER_NOT_HEAD
+        } else {
+            afs_error::NODE_VFS_UNIMPLEMENTED
+        };
+        Err(Error::coded(code, "scripted"))
+    }
+    fn release_readers(&self, readers: &[u64]) -> Result<()> {
+        self.released_readers
+            .lock()
+            .unwrap()
+            .extend_from_slice(readers);
+        Ok(())
+    }
+    fn report_readers(&self, _: u64, _: u64, _: &[crate::node::gc::SoftReader]) -> Result<u64> {
+        Ok(self.term.load(Ordering::SeqCst))
     }
 }
 
@@ -243,10 +267,8 @@ fn r94_commits_under_an_open_writer_admit_once_when_it_closes() {
         fx.fs.write(&context(), writer, 0, bytes).unwrap();
         fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
         versions.push(head(&fx.meta));
-        // The open reader sees this Node's commit through the write state ...
-        assert_eq!(read_all(&fx.fs, reader), bytes.as_slice());
     }
-    // ... and no reference is admitted while the writer is open.
+    // No read selected a new version: nothing is admitted while the writer is open.
     for version in &versions {
         assert_eq!(fx.gc.admissions(version), 0);
     }
@@ -260,6 +282,79 @@ fn r94_commits_under_an_open_writer_admit_once_when_it_closes() {
     fx.fs.release(&context(), reader).unwrap();
     fx.references.flush().unwrap();
     assert_eq!(fx.gc.live(&newest), 0);
+}
+
+#[test]
+fn r94_a_read_through_the_write_state_protects_the_base_it_selects() {
+    let fx = fixture();
+    let reader = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    let writer = fx.fs.open(&context(), fx.inode, libc::O_RDWR).unwrap();
+    let mut versions = Vec::new();
+    for bytes in [b"VERSION-TWO", b"VERSION-333"] {
+        fx.fs.write(&context(), writer, 0, bytes).unwrap();
+        fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+        let version = head(&fx.meta);
+        // The reader sees this Node's commit through the write state, and
+        // the version that read selected is referenced: an open writer (or a
+        // write lease, which can lapse while it is open) does not keep it.
+        assert_eq!(read_all(&fx.fs, reader), bytes.as_slice());
+        assert_eq!(read_all(&fx.fs, writer), bytes.as_slice());
+        fx.references.flush().unwrap();
+        assert_eq!(fx.gc.live(&version), 1, "one shared reference per version");
+        for older in &versions {
+            assert_eq!(fx.gc.live(older), 0, "a superseded base is released");
+        }
+        versions.push(version);
+    }
+    fx.fs.release(&context(), writer).unwrap();
+    let newest = versions.last().unwrap().clone();
+    assert_eq!(opened_version(&fx.fs, reader), Some(newest.clone()));
+    assert_eq!(
+        fx.gc.admissions(&newest),
+        1,
+        "the reader's view shares the reference the read took"
+    );
+    fx.fs.release(&context(), reader).unwrap();
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.live(&newest), 0);
+}
+
+#[test]
+fn r94_in_flight_write_state_read_keeps_its_base_across_the_next_local_commit() {
+    let fx = fixture();
+    let writer = fx.fs.open(&context(), fx.inode, libc::O_RDWR).unwrap();
+    fx.fs.write(&context(), writer, 0, b"VERSION-TWO").unwrap();
+    fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+    let v2 = head(&fx.meta);
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    *fx.fs.hooks.write_state_read_after_view.lock().unwrap() = Some(Box::new(move || {
+        reached_tx.send(()).unwrap();
+        go_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the test resumes the paused read");
+    }));
+    std::thread::scope(|scope| {
+        let reading = scope.spawn(|| read_all(&fx.fs, writer));
+        reached_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the read reaches the write state");
+        // Healthy lease, same Node: the next commit replaces every byte of V2
+        // while the read that selected V2 is still in flight.
+        fx.fs.write(&context(), writer, 0, b"VERSION-333").unwrap();
+        fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+        let v3 = head(&fx.meta);
+        assert_ne!(v3, v2);
+        fx.references.flush().unwrap();
+        assert_eq!(fx.gc.live(&v2), 1, "the in-flight read keeps V2");
+        go_tx.send(()).unwrap();
+        assert_eq!(reading.join().unwrap(), b"VERSION-TWO");
+    });
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.live(&v2), 0, "released once the read ended");
+    fx.fs.release(&context(), writer).unwrap();
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.live(&fx.v1), 0);
 }
 
 #[test]
@@ -290,4 +385,235 @@ fn r94_close_racing_a_pending_view_leaks_no_reference() {
     fx.references.flush().unwrap();
     assert_eq!(fx.gc.live(&fx.v1), 0);
     assert_eq!(fx.gc.admissions(&v2), 0);
+}
+
+#[test]
+fn r94_an_unprotectable_write_state_base_is_never_read_unprotected() {
+    let fx = fixture();
+    let reader = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    let writer = fx.fs.open(&context(), fx.inode, libc::O_RDWR).unwrap();
+    fx.fs.write(&context(), writer, 0, b"VERSION-TWO").unwrap();
+    fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+    let v2 = head(&fx.meta);
+    fx.gc.refuse_open.store(true, Ordering::SeqCst);
+    // Nothing local over the base: the reader falls back to its own,
+    // protected version instead of reading V2 unprotected.
+    assert_eq!(read_all(&fx.fs, reader), b"version-one");
+    assert_eq!(fx.gc.live(&v2), 0);
+    // Local data over the base: the admission error is returned rather than
+    // a read that could lose that data.
+    fx.fs.write(&context(), writer, 0, b"DIRTY").unwrap();
+    assert!(fx.fs.read_owned(&context(), writer, 0, 64).is_err());
+    fx.gc.refuse_open.store(false, Ordering::SeqCst);
+    assert_eq!(read_all(&fx.fs, writer), b"DIRTYON-TWO");
+    fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+    fx.fs.release(&context(), writer).unwrap();
+    fx.fs.release(&context(), reader).unwrap();
+}
+
+#[test]
+fn review_late_base_admission_does_not_cache_a_pin_after_the_last_writer_closed() {
+    let fx = fixture();
+    let reader = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    let writer = fx.fs.open(&context(), fx.inode, libc::O_RDWR).unwrap();
+    fx.fs.write(&context(), writer, 0, b"VERSION-TWO").unwrap();
+    fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+    let v2 = head(&fx.meta);
+    let inode_id = fx.meta.inode.lock().unwrap().inode_id.clone();
+    let cell = fx.fs.write_state(&inode_id).unwrap().unwrap();
+    let mut view = {
+        let state = cell.lock().unwrap();
+        assert!(state.has_local_write_activity());
+        ResolvedReadView {
+            committed: Some(v2.clone()),
+            base_reference: DistributedFs::cached_base_reference(&state),
+            length: state.logical_length,
+            layout: state.base_layout.clone(),
+            frozen: None,
+            active: DirtyExtentMap::default(),
+        }
+    };
+    assert!(view.base_reference.is_none());
+    let admission = fx.fs.base_reference_sync(&inode_id, &view);
+    assert!(matches!(&admission, BaseReference::Taken(_)));
+
+    // The async reader's pin RPC returned, but its continuation has not run.
+    fx.fs.release(&context(), writer).unwrap();
+    assert!(!cell.lock().unwrap().has_local_write_activity());
+    assert!(cell.lock().unwrap().base_read_reference.is_none());
+    assert!(
+        fx.fs
+            .settle_base_reference(&cell, &mut view, admission)
+            .unwrap()
+    );
+    drop(view);
+    fx.fs.release(&context(), reader).unwrap();
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.live(&v2), 0, "the final read and both handles ended");
+}
+
+/// A base reference shared while the last writer closed with data still
+/// dirty is retired by the background commit of that data, not kept.
+#[test]
+fn r94_a_shared_base_reference_ends_with_the_commit_after_a_dirty_close() {
+    let fx = fixture();
+    let reader = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    let writer = fx.fs.open(&context(), fx.inode, libc::O_RDWR).unwrap();
+    fx.fs.write(&context(), writer, 0, b"VERSION-TWO").unwrap();
+    fx.fs.fsync(&context(), writer, SyncMode::Full).unwrap();
+    let v2 = head(&fx.meta);
+    fx.fs.write(&context(), writer, 0, b"DIRTY").unwrap();
+    // The read selects V2 under the dirty overlay and shares its reference.
+    assert_eq!(read_all(&fx.fs, reader), b"DIRTYON-TWO");
+    fx.fs.release(&context(), writer).unwrap();
+    fx.fs.writeback_pending().unwrap();
+    let v3 = head(&fx.meta);
+    assert_ne!(v3, v2);
+    assert_eq!(read_all(&fx.fs, reader), b"DIRTYON-TWO");
+    fx.references.flush().unwrap();
+    assert_eq!(
+        fx.gc.live(&v2),
+        0,
+        "the commit retired the shared V2 reference"
+    );
+    fx.fs.release(&context(), reader).unwrap();
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.live(&v3), 0);
+}
+
+/// B2: a read open whose single Meta call registered the head keeps that
+/// registration as its pin: no durable admission, released as a reader.
+#[test]
+fn a_read_open_registered_by_meta_needs_no_other_admission() {
+    let fx = fixture();
+    let before = fx.gc.admissions(&fx.v1);
+    fx.meta
+        .open_read_replies
+        .lock()
+        .unwrap()
+        .push_back((true, 1, false));
+    let handle = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    assert_eq!(read_all(&fx.fs, handle), b"version-one");
+    assert_eq!(
+        fx.gc.admissions(&fx.v1),
+        before,
+        "no durable open: reference"
+    );
+    assert!(fx.fs.page_cache_identity(handle).is_some());
+    fx.fs.release(&context(), handle).unwrap();
+    fx.references.flush().unwrap();
+    assert_eq!(fx.gc.released_readers.lock().unwrap().len(), 1);
+}
+
+/// L6 at open: after this Node has seen Meta term 2, a registration
+/// answered by term 1 is not used; the handle pins itself.
+#[test]
+fn a_read_open_registered_by_an_older_meta_term_pins_again() {
+    let fx = fixture();
+    fx.gc.term.store(2, Ordering::SeqCst);
+    fx.references.report_readers().unwrap();
+    let before = fx.gc.admissions(&fx.v1);
+    fx.meta
+        .open_read_replies
+        .lock()
+        .unwrap()
+        .push_back((true, 1, false));
+    let handle = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    assert_eq!(
+        fx.gc.admissions(&fx.v1),
+        before + 1,
+        "pinned durably instead"
+    );
+    fx.fs.release(&context(), handle).unwrap();
+}
+
+/// D-R3-2 ③ is deferred: a write lease Meta reports for another session may
+/// only be waiting to expire after its writer closed, so a read open still
+/// uses the page cache (LB06).
+#[test]
+fn a_read_open_keeps_the_page_cache_while_writer_elsewhere_is_deferred() {
+    let fx = fixture();
+    fx.meta
+        .open_read_replies
+        .lock()
+        .unwrap()
+        .push_back((true, 1, true));
+    let handle = fx.fs.open(&context(), fx.inode, libc::O_RDONLY).unwrap();
+    assert!(fx.fs.page_cache_identity(handle).is_some());
+    assert_eq!(read_all(&fx.fs, handle), b"version-one");
+    fx.fs.release(&context(), handle).unwrap();
+}
+
+/// Review condition: when Meta's open gave up registering a head that kept
+/// moving, and the head moves again before the handle's own soft
+/// registration, the open still succeeds on a durable reference, as before
+/// C-1; no error reaches the application.
+#[test]
+fn a_read_open_of_a_head_that_never_settles_pins_durably_and_succeeds() {
+    let fx = fixture();
+    fx.gc.reader_not_head.store(true, Ordering::SeqCst);
+    let before = fx.gc.admissions(&fx.v1);
+    fx.meta
+        .open_read_replies
+        .lock()
+        .unwrap()
+        .push_back((false, 1, false));
+    let handle = fx
+        .fs
+        .open(&context(), fx.inode, libc::O_RDONLY)
+        .expect("the open succeeds");
+    assert_eq!(fx.gc.admissions(&fx.v1), before + 1, "pinned durably");
+    assert_eq!(read_all(&fx.fs, handle), b"version-one");
+    fx.fs.release(&context(), handle).unwrap();
+}
+
+/// R107: a created file's handle is registered in Meta's memory with the
+/// create; closing it releases a reader, never a durable `open:create-`
+/// reference (a log record per file).
+#[test]
+fn a_created_handle_is_a_soft_reader_and_closes_without_a_durable_release() {
+    let fx = fixture();
+    *fx.meta.create_registers.lock().unwrap() = Some(1);
+    let created = fx
+        .fs
+        .create(
+            &context(),
+            fx.fs.root_inode(),
+            std::ffi::OsStr::new("new"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fx.fs.release(&context(), created.handle).unwrap();
+    fx.references.flush().unwrap();
+    assert!(
+        !fx.gc
+            .released
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| id.starts_with("open:create-")),
+        "no durable create reference to release"
+    );
+    assert_eq!(fx.gc.released_readers.lock().unwrap().len(), 1);
+}
+
+/// Without a registration by Meta the created handle pins itself (soft
+/// registration if Meta takes it, here unsupported: durably), as before.
+#[test]
+fn a_created_handle_meta_did_not_register_pins_itself() {
+    let fx = fixture();
+    let before = fx.gc.retained.lock().unwrap().len();
+    let created = fx
+        .fs
+        .create(
+            &context(),
+            fx.fs.root_inode(),
+            std::ffi::OsStr::new("new"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    assert_eq!(fx.gc.retained.lock().unwrap().len(), before + 1);
+    fx.fs.release(&context(), created.handle).unwrap();
 }

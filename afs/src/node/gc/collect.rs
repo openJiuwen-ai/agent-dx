@@ -101,7 +101,7 @@ impl Collector {
             .gate
             .lock()
             .map_err(|_| Error::coded(afs_error::NODE_VFS_UNAVAILABLE, "GC worker poisoned"))?;
-        self.references.flush()?;
+        self.references.flush_for_collection()?;
         match &self.target {
             CollectTarget::Local(store) => self.collect_local(store),
             CollectTarget::External {
@@ -124,7 +124,8 @@ impl Collector {
             .gate
             .lock()
             .map_err(|_| Error::coded(afs_error::NODE_VFS_UNAVAILABLE, "GC worker poisoned"))?;
-        self.references.flush()?;
+        // One batch per wake (R107); the backlog drains on collection passes.
+        self.references.release_batch()?;
         Ok(0)
     }
 

@@ -24,6 +24,13 @@ pub(crate) trait FuseMountPolicy: Send + Sync + 'static {
     /// Metrics `filesystem` label; the kernel fsname is `afs-<label>`.
     fn label(&self) -> &'static str;
 
+    /// Whether a namespace operation the backend refused for lack of
+    /// permission is sent once more with the caller's supplementary groups
+    /// (a FUSE header carries only uid and primary gid). Off by default.
+    fn resends_denied_with_groups(&self) -> bool {
+        false
+    }
+
     /// A kernel inode number was handed out for `_ino`.
     fn remember_inode(&self, _ino: u64) {}
 
@@ -48,17 +55,129 @@ pub(crate) trait FuseMountPolicy: Send + Sync + 'static {
 
     /// The kernel session exists; `_notifier` can invalidate its caches.
     fn on_mounted(&self, _notifier: Notifier) {}
+
+    /// About to reply to an OPEN that admitted a new version of `_ino` to the
+    /// kernel page cache (not a reopen of the version it already holds). A
+    /// policy whose attribute replies follow the cached view must make the
+    /// kernel discard attribute replies still in flight from before the
+    /// admission. Runs before the OPEN reply; it must not block on the network.
+    fn page_cache_version_changed(&self, _ino: u64) {}
+
+    /// Attribute TTL for a reply about an inode of this kind, given the
+    /// policy's entry/attribute `ttl`. The default caches every kind alike.
+    fn attr_ttl(&self, _directory: bool, ttl: Duration) -> Duration {
+        ttl
+    }
+
+    /// Entry and attribute TTL for replies that carry no per-inode policy
+    /// decision (mkdir, mknod, symlink, link, setattr, and creates under the
+    /// kernel cache feature).
+    fn mount_entry_ttl(&self) -> Duration {
+        UNCACHED_TTL
+    }
+
+    /// The errno a failed FUSE_CREATE with open `_flags` is answered with.
+    /// The default hands the backend's answer to the kernel unchanged.
+    fn create_failure_errno(&self, _flags: i32, errno: i32) -> i32 {
+        errno
+    }
 }
 
-/// DFS: no kernel entry/attr caching. DFS has no cross-node kernel
-/// invalidation, so every path lookup and getattr goes to the Node (S1a-7,
-/// F10; positive TTLs need an invalidation scheme first). Page caching is
-/// governed by [`FuseMountFeatures::kernel_cache`] plus pinned versions.
-pub(crate) struct DfsFusePolicy;
+/// DFS: one bounded kernel entry/attribute TTL (`dfs_kernel_cache_ttl_ms`,
+/// 0 = no kernel caching). DFS has no cross-node kernel invalidation, so a
+/// change made through another Node is seen here at most one TTL late;
+/// changes through this mount update the kernel's own caches. Negative
+/// lookups are never cached (an ENOENT reply carries no entry). Page caching
+/// is governed by [`FuseMountFeatures::kernel_cache`] plus pinned versions.
+pub(crate) struct DfsFusePolicy {
+    kernel_ttl: Duration,
+    notifier: std::sync::Mutex<Option<Notifier>>,
+}
+
+impl DfsFusePolicy {
+    pub(crate) fn new(kernel_ttl: Duration) -> Self {
+        Self {
+            kernel_ttl,
+            notifier: std::sync::Mutex::new(None),
+        }
+    }
+}
 
 impl FuseMountPolicy for DfsFusePolicy {
     fn label(&self) -> &'static str {
         "dfs"
+    }
+
+    /// Meta checks the caller against the parent directory, and a directory
+    /// can be writable to the caller through a supplementary group only.
+    fn resends_denied_with_groups(&self) -> bool {
+        true
+    }
+
+    fn with_cache_policy(&self, _inode: BackendInode, reply: &mut dyn FnMut(Duration, bool)) {
+        reply(self.kernel_ttl, false);
+    }
+
+    fn mount_entry_ttl(&self) -> Duration {
+        self.kernel_ttl
+    }
+
+    /// `open(O_CREAT)` without `O_EXCL` must open a file that already exists,
+    /// and on DFS another Node can create the name after this kernel's
+    /// negative lookup. The kernel sends FUSE_CREATE then and does not fall
+    /// back when the answer is EEXIST (`fuse_atomic_open`). ESTALE makes the
+    /// VFS walk the path once more with a fresh lookup, which finds the file
+    /// and opens it under the kernel's own permission, truncation and
+    /// file-type rules.
+    fn create_failure_errno(&self, flags: i32, errno: i32) -> i32 {
+        if errno == libc::EEXIST && flags & libc::O_EXCL == 0 {
+            libc::ESTALE
+        } else {
+            errno
+        }
+    }
+
+    /// Only directories cache attributes. A regular file's attributes must
+    /// stay uncached: a STAT without a file handle (statx passes none) can
+    /// only be answered with the head version, while each open handle reads
+    /// the version it pinned; the kernel keeps one `i_size` per inode, so a
+    /// cached head size would make a pinned handle's READ come back short and
+    /// the page cache zero-fill the gap. Uncached, the read path refreshes the
+    /// size with the handle (today's semantics). Symlinks and special files
+    /// follow regular files; names (entry TTL) stay cached for every kind.
+    fn attr_ttl(&self, directory: bool, ttl: Duration) -> Duration {
+        if directory { ttl } else { Duration::ZERO }
+    }
+
+    fn on_mounted(&self, notifier: Notifier) {
+        let mut slot = self
+            .notifier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(notifier);
+    }
+
+    /// R97. `inval_inode(ino, -1, 0)` only invalidates attributes: it advances
+    /// the inode's attr_version (v6.8 `fuse_reverse_inval_inode`), so the
+    /// kernel drops any attribute reply requested before it
+    /// (`fuse_change_attributes` discards replies older than attr_version).
+    /// A negative offset touches no page, so it takes no page or inode lock
+    /// and is safe before the OPEN reply. Requests after it reach the Node
+    /// after the view was admitted and are capped to the view's length.
+    fn page_cache_version_changed(&self, ino: u64) {
+        let slot = self
+            .notifier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(notifier) = slot.as_ref()
+            && let Err(error) = notifier.inval_inode(fuser::INodeNo(ino), -1, 0)
+        {
+            // The open stays valid; only the late-reply window stays open.
+            afs_logging::warn!("dfs.fuse_attr_invalidation_failed";
+                "ino" => ino,
+                "error" => error.to_string()
+            );
+        }
     }
 }
 

@@ -19,7 +19,7 @@ class ArmPackageTests(unittest.TestCase):
         steps = {step["key"]: step for step in pipeline["steps"]}
         arm = steps["platform-build-arm64"]
         self.assertEqual(arm["agents"]["arch"], "arm64")
-        self.assertEqual(arm["agents"]["os"], "macos")
+        self.assertEqual(arm["agents"]["os"], "linux")
         self.assertNotIn("platform-build", arm["depends_on"])
         self.assertEqual(
             set(arm["depends_on"]),
@@ -35,13 +35,27 @@ class ArmPackageTests(unittest.TestCase):
         )
         compiler = steps["build-platform-arm64"]
         self.assertNotIn("depends_on", compiler)
-        self.assertIn("build-arm-package.sh build platform", compiler["command"])
-        self.assertIn("build-arm-package.sh package", arm["command"])
-        self.assertIn("out/buildkite/arm64/components/*.tar.gz", compiler["artifact_paths"])
-        self.assertIn("out/buildkite/arm64/*.tar.gz", arm["artifact_paths"])
+        self.assertIn("run-arm-linux.sh build platform", compiler["command"])
+        self.assertIn("run-arm-linux.sh package", arm["command"])
+        self.assertNotIn("out/buildkite/arm64/components/*.tar.gz", compiler["artifact_paths"])
+        self.assertNotIn("out/buildkite/arm64/*.tar.gz", arm["artifact_paths"])
         self.assertIn("out/buildkite/arm64/logs/**/*", arm["artifact_paths"])
-        self.assertEqual(arm["secrets"], {"SWR_DOCKER_CONFIG_JSON": "ADX_SWR_PULL_CONFIG"})
-        self.assertIn("with_registry.py --docker", arm["command"])
+        for key in (
+            "build-platform-arm64",
+            "build-afs-arm64",
+            "build-gateway-arm64",
+            "build-execd-arm64",
+            "platform-build-arm64",
+        ):
+            step = steps[key]
+            self.assertEqual(step["agents"]["os"], "linux")
+            self.assertEqual(step["agents"]["linux_arch"], "arm64")
+            self.assertNotIn("secrets", step)
+            pod = step["plugins"][0]["kubernetes"]["podSpec"]
+            self.assertEqual(pod["nodeSelector"]["kubernetes.io/arch"], "arm64")
+            image = json.loads((ROOT / "build/images/build-environment-arm64.json").read_text())["ci_image"]
+            self.assertEqual(pod["containers"][0]["image"], image)
+            self.assertEqual(step["env"]["ADX_BUILD_ARCH"], "arm64")
         self.assertEqual(steps["artifact-manifest-arm64"]["depends_on"], "publish-arm64")
         self.assertEqual(steps["artifact-manifest"]["depends_on"], "publish-amd64")
         for component in ("platform", "gateway", "execd"):
@@ -64,7 +78,7 @@ class ArmPackageTests(unittest.TestCase):
         self.assertEqual(afs["if"], 'build.env("ADX_ARM_BUILD") != "0" && build.env("ADX_WITH_AFS") == "1"')
         self.assertEqual(afs["env"]["ADX_WITH_AFS"], "1")
         self.assertEqual(afs["agents"]["arch"], "arm64")
-        self.assertIn("build-arm-package.sh build afs", afs["command"])
+        self.assertIn("run-arm-linux.sh build afs", afs["command"])
         runner = (ROOT / ".buildkite/build-arm-package.sh").read_text()
         self.assertIn("parts+=(afs)", runner)
         self.assertIn("ADX_ARM_TESTS ADX_WITH_AFS", runner)
@@ -113,7 +127,10 @@ class ArmPackageTests(unittest.TestCase):
                     if value is not None:
                         env["ADX_ARM_BUILD"] = value
                     result = subprocess.run(
-                        ["bash", str(ROOT / ".buildkite/select-pipeline.sh")], env=env, capture_output=True, text=True
+                        [shutil.which("bash"), str(ROOT / ".buildkite/select-pipeline.sh")],
+                        env=env,
+                        capture_output=True,
+                        text=True,
                     )
                     if value == "invalid":
                         self.assertEqual(result.returncode, 2)
@@ -128,7 +145,7 @@ class ArmPackageTests(unittest.TestCase):
         command = 'source "$1"; printf "%s %s" "$ADX_RELEASE_TARGET" "$ADX_MUSL_TARGET"'
         for arch, target in [("amd64", "x86_64"), ("arm64", "aarch64")]:
             result = subprocess.run(
-                ["bash", "-c", command, "test", str(script)],
+                [shutil.which("bash"), "-c", command, "test", str(script)],
                 env=dict(os.environ, ADX_BUILD_ARCH=arch),
                 capture_output=True,
                 text=True,
@@ -136,7 +153,7 @@ class ArmPackageTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, f"{target}-unknown-linux-gnu {target}-unknown-linux-musl")
         result = subprocess.run(
-            ["bash", str(script)],
+            [shutil.which("bash"), str(script)],
             env=dict(os.environ, ADX_BUILD_ARCH="invalid"),
             capture_output=True,
             text=True,
@@ -167,6 +184,61 @@ class ArmPackageTests(unittest.TestCase):
         self.assertIn("chmod -R a+rwX out/buildkite", script)
         self.assertIn("build/release/package.py verify", (ROOT / ".buildkite/package-components.sh").read_text())
         self.assertNotIn("build_backend.py", native)
+
+
+class LinuxArmTransferTests(unittest.TestCase):
+    def test_architecture_groups_do_not_overwrite_each_other(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "build/release").mkdir(parents=True)
+            (root / "build/release/ci_transfer.py").write_text("import sys; print(' '.join(sys.argv[1:]))\n")
+            for arch, group in (("amd64", "execd"), ("arm64", "execd-arm64")):
+                for operation in ("upload", "download"):
+                    with self.subTest(arch=arch, operation=operation):
+                        result = subprocess.run(
+                            [shutil.which("bash"), str(ROOT / ".buildkite/component-transfer.sh"), operation, "execd"],
+                            cwd=root,
+                            env=dict(
+                                os.environ,
+                                ADX_BUILD_ARCH=arch,
+                                ADX_ARTIFACT_TRANSPORT="obs",
+                                OBS_PYTHON=shutil.which("python3"),
+                            ),
+                            text=True,
+                            capture_output=True,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertTrue(result.stdout.startswith(f"{operation} {group} "), result.stdout)
+
+    def test_native_failure_keeps_original_exit_code_and_arm_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".buildkite").mkdir()
+            (root / "commands").mkdir()
+            for name, content in {
+                "uname": '#!/bin/sh\nif [ "$1" = -s ]; then echo Linux; else echo aarch64; fi\n',
+                "rustc": "#!/bin/sh\necho 'host: aarch64-unknown-linux-gnu'\n",
+            }.items():
+                command = root / "commands" / name
+                command.write_text(content)
+                command.chmod(0o755)
+            for script in ("build-architecture.sh", "step.sh"):
+                shutil.copy(ROOT / ".buildkite" / script, root / ".buildkite" / script)
+            (root / ".buildkite/build-component.sh").write_text(
+                "mkdir -p out/buildkite/logs out/buildkite/components\n"
+                "echo failure-evidence > out/buildkite/logs/compiler.log\n"
+                "echo archive > out/buildkite/components/execd.tar.gz\nexit 17\n"
+            )
+            result = subprocess.run(
+                [shutil.which("bash"), str(ROOT / ".buildkite/run-arm-linux.sh"), "build", "execd"],
+                cwd=root,
+                env=dict(os.environ, PATH=str(root / "commands") + os.pathsep + os.environ["PATH"]),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 17, result.stderr)
+            self.assertEqual((root / "out/buildkite/arm64/logs/compiler.log").read_text(), "failure-evidence\n")
+            self.assertTrue((root / "out/buildkite/arm64/components/execd.tar.gz").is_file())
 
 
 class ComponentTestSwitch(unittest.TestCase):

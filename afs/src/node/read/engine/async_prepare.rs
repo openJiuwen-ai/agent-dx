@@ -121,9 +121,7 @@ impl DfsReadEngine {
             lifetime: lifetime.clone(),
         };
         crate::node::read::admission::in_read_scope(scope, async {
-            self.validate_native_read_size(output_len)?;
-            batch.validate_for_output(output_len, &self.config)?;
-            self.validate_private_native_ranges(&batch)?;
+            self.validate_native_read_plan(&batch, output_len)?;
             let authority = self.capture_native_read_authority()?;
             let allocation = crate::node::read::admission::NativeReadAllocation {
                 length: output_len,
@@ -143,10 +141,8 @@ impl DfsReadEngine {
             if covered != output_len {
                 reply.buffer.fill(0);
             }
-            self.replicated_sources()
-                .read_async(&batch, &mut reply.buffer, true, Some(deadline), lifetime)
-                .await
-                .inspect_err(|error| self.invalidate_native_batch_on_error(&batch, error))?;
+            self.read_native_parts_async(&batch, &mut reply.buffer, deadline, lifetime)
+                .await?;
             self.check_native_read_authority(&authority)?;
             Ok(reply.into_bytes())
         })
@@ -164,9 +160,7 @@ impl DfsReadEngine {
     where
         F: FnOnce(&mut [u8]) -> Result<()> + Send,
     {
-        self.validate_native_read_size(length)?;
-        batch.validate_for_output(length, &self.config)?;
-        self.validate_private_native_ranges(&batch)?;
+        self.validate_native_read_plan(&batch, length)?;
         let authority = self.capture_native_read_authority()?;
         let scope = crate::node::read::admission::ReadScope {
             deadline,
@@ -181,14 +175,30 @@ impl DfsReadEngine {
             };
             let mut reply = allocation.allocate(deadline).await?;
             reply.buffer.fill(0);
-            self.replicated_sources()
-                .read_async(&batch, &mut reply.buffer, true, Some(deadline), lifetime)
+            self.read_native_parts_async(&batch, &mut reply.buffer, deadline, lifetime)
                 .await?;
             crate::node::bridge::local_io(|| overlay(&mut reply.buffer))?;
             self.check_native_read_authority(&authority)?;
             Ok(reply.into_bytes())
         })
         .await
+    }
+
+    async fn read_native_parts_async(
+        &self,
+        batch: &ReadBatch,
+        out: &mut [u8],
+        deadline: Instant,
+        lifetime: crate::node::read::admission::ReadLifetime,
+    ) -> Result<()> {
+        let sources = self.replicated_sources();
+        for part in self.native_read_batches(batch) {
+            sources
+                .read_async(&part, out, true, Some(deadline), lifetime.clone())
+                .await
+                .inspect_err(|error| self.invalidate_native_batch_on_error(&part, error))?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn read_owner_payload_async<F>(

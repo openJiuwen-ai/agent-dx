@@ -230,6 +230,16 @@ impl DistributedFs {
         );
         let _entered = span.enter();
         let (operation_id, gc_pin) = self.commit_operation_and_gc_pin(frozen, reason)?;
+        // Wait for the generation's admission before anything below persists
+        // a chunk (the staged path's `put_chunks`, sealing the last builders):
+        // GC must never see a chunk whose `write:` reference is not admitted.
+        let gc_fence = match &gc_pin {
+            Some(pin) => Some(
+                pin.admitted()
+                    .map_err(|error| PrepareCommitError { error })?,
+            ),
+            None => None,
+        };
         let generation = self.identity.next_operation.fetch_add(1, Ordering::Relaxed);
         let layout_id =
             LayoutRootId::new(format!("{}-layout-{generation}", self.identity.session_id));
@@ -243,7 +253,6 @@ impl DistributedFs {
                 .map_err(|error| PrepareCommitError { error })?
         };
         span.record("receipts", receipts.len() as u64);
-        let gc_fence = gc_pin.as_ref().and_then(|pin| pin.fence());
         if self.gc.references.is_some() && gc_fence.is_none() {
             return Err(PrepareCommitError {
                 error: unavailable("optimistic commit has no frozen GC fence"),
@@ -504,6 +513,7 @@ impl DistributedFs {
         inode_id: &InodeId,
         length: u64,
         kill_suidgid: bool,
+        proxied_writer: Option<&DfsWriteSessionId>,
     ) -> Result<u64> {
         let state = self
             .write_state(inode_id)?
@@ -516,6 +526,9 @@ impl DistributedFs {
             state.dirty_extents.resize(old_length, length, write_seq)?;
             state.logical_length = length;
             state.dirty = true;
+            if let Some(writer) = proxied_writer {
+                state.note_proxied_write(writer);
+            }
         }
         state.visible_write_seq = write_seq;
         let now = now_unix_ms();
@@ -527,6 +540,9 @@ impl DistributedFs {
         }
         if state.open_writers == 0 && (state.dirty || state.metadata_dirty) {
             state.last_writer_background_requested = true;
+        }
+        if state.open_writers == 0 {
+            self.queue_idle_lease(inode_id)?;
         }
         Ok(state.visible_write_seq)
     }
@@ -558,8 +574,12 @@ impl DistributedFs {
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
         state.open_writers = state.open_writers.saturating_sub(1);
+        state.proxied_writes.remove(&session.id);
         if state.open_writers == 0 && (state.dirty || state.metadata_dirty) {
             state.last_writer_background_requested = true;
+        }
+        if state.open_writers == 0 {
+            self.queue_idle_lease(&session.inode_id)?;
         }
         Ok(deliver
             .then(|| Self::take_undelivered_error(&mut state, session.error_cursor))

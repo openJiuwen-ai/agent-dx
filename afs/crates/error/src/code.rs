@@ -63,6 +63,7 @@ catalog! {
     NODE_OWNER_STALE_ACCESS = 0x020b0004 => FailedPrecondition;
     NODE_OWNER_STALE_HANDLE = 0x020b0005 => FailedPrecondition;
     NODE_DFS_STALE_HANDLE = 0x020c0001 => FailedPrecondition;
+    NODE_DFS_STALE_NAME = 0x020c0002 => FailedPrecondition;
     NODE_RDMA_SESSION_UNKNOWN = 0x02090001 => FailedPrecondition;
     NODE_RDMA_SESSION_POISONED = 0x02090002 => FailedPrecondition;
     NODE_RDMA_NOT_READY = 0x02090003 => FailedPrecondition;
@@ -82,6 +83,8 @@ catalog! {
     META_DFS_NAMESPACE_RETRY = 0x03030004 => Aborted;
     META_DFS_GC_BUSY = 0x03030006 => Unavailable;
     META_DFS_REFERENCE_ADMISSION_EXPIRED = 0x03030007 => FailedPrecondition;
+    META_DFS_READER_NOT_HEAD = 0x03030008 => FailedPrecondition;
+    META_DFS_SESSION_NOT_REPORTED = 0x03030009 => Unavailable;
     META_DFS_LEASE_RETRY = 0x03030002 => Unavailable;
     META_DFS_REPAIR_SUPERSEDED = 0x03030003 => FailedPrecondition;
     META_OWNER_ROOT_EXISTS = 0x03040001 => AlreadyExists;

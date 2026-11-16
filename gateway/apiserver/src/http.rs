@@ -450,7 +450,7 @@ impl Api {
             }
             let spec = match self
                 .environment_service
-                .prepare_create_bound(input.clone(), &caller, &request_id)
+                .prepare_create_with_workspace_affinity(input.clone(), &caller, &request_id)
                 .await
             {
                 Ok(spec) => spec,

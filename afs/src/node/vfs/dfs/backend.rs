@@ -119,13 +119,16 @@ impl Backend for DistributedFs {
     }
 
     fn lookup(&self, _: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<Entry> {
+        let parent_id = self.inode_id(parent)?;
         let inode = self.validate_inode(
             self.meta
-                .lookup(&self.inode_id(parent)?, name.as_encoded_bytes())?
+                .lookup(&parent_id, name.as_encoded_bytes())?
                 .ok_or_else(|| {
                     Error::coded(afs_error::NODE_VFS_NOT_FOUND, "DFS dentry not found")
                 })?,
         )?;
+        self.recent_names
+            .record(&inode.inode_id, &parent_id, name.as_encoded_bytes());
         Ok(Entry {
             inode: self.backend_inode(&inode.inode_id)?,
             attributes: self.visible_attributes(&inode)?,
@@ -218,6 +221,11 @@ impl Backend for DistributedFs {
             unix_ms_of(time)?;
         }
         let inode_id = self.inode_id(inode)?;
+        let _lease_admission = if handle.is_none() || options.kill_suidgid {
+            self.lease_admission(&inode_id)?
+        } else {
+            None
+        };
         if change.size.is_some() && lazy_fill::sealed(&self.meta.get_inode(&inode_id)?) {
             return Err(invalid("immutable-origin file length cannot change"));
         }
@@ -272,14 +280,23 @@ impl Backend for DistributedFs {
             || change.mtime.is_some()
             || options.timestamps_now
         {
-            let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
+            // Explicit times replace the write timestamps this Node still
+            // owes Meta, unless a write lands after this point (B5).
+            let explicit_times = change.mtime.is_some() || options.timestamps_now;
+            let observed_seq = if explicit_times {
+                self.visible_write_seq(&inode_id)?
+            } else {
+                None
+            };
+            // Meta applies the change to its current inode and retries a
+            // racing inode update itself (B4): no revision read here.
             let updated = self.refresh_inode_record(
                 self.meta.set_inode_attributes(SetInodeAttrRequest {
                     caller_id: self.identity.node_id.clone(),
                     operation_id: self.identity.operation_id("setattr"),
                     caller: caller_context(ctx),
                     inode_id: inode_id.clone(),
-                    expected_inode_revision: current.revision,
+                    expected_inode_revision: None,
                     update: InodeAttrUpdate {
                         mode: change.mode,
                         uid: change.uid,
@@ -293,6 +310,9 @@ impl Backend for DistributedFs {
                 change.atime.is_none() && !options.timestamps_now,
                 change.mtime.is_none() && !options.timestamps_now,
             )?;
+            if let Some(observed_seq) = observed_seq {
+                self.supersede_owed_timestamps(&inode_id, observed_seq)?;
+            }
             if change.size.is_none() {
                 if killpriv_setattr {
                     self.commit_inode(
@@ -337,43 +357,65 @@ impl Backend for DistributedFs {
                 self.write_coordinator
                     .remote_resize(session, length, options)?
             } else {
-                self.resize_dirty_inode(&snapshot.inode_id, length, options.kill_suidgid)?
+                self.resize_dirty_inode(&snapshot.inode_id, length, options.kill_suidgid, None)?
             };
             (
                 InodeRecord::clone(&snapshot.opened_inode),
                 Some((handle, accepted_seq)),
             )
         } else {
-            let (record, write_lease) = self.meta.open_write(&inode_id)?;
-            let mut record = self.validate_inode(record)?;
-            if record.kind != InodeKind::Regular {
-                return Err(Error::from(std::io::Error::from_raw_os_error(libc::EISDIR)));
-            }
-            if write_lease.owner_node_id == self.identity.node_id
-                && write_lease.owner_session_id == self.identity.session_id
-            {
-                self.install_write_state(record.clone(), write_lease)?;
-                self.resize_dirty_inode(&record.inode_id, length, options.kill_suidgid)?;
-            } else {
-                let previous_provider = self
-                    .write_coordinator
-                    .current_remote_provider(&record.inode_id)?;
-                let mut session = self.open_remote_write_session(
-                    &record,
-                    &write_lease,
-                    libc::O_WRONLY,
-                    OpenOptions {
-                        kill_suidgid: options.kill_suidgid,
-                    },
-                )?;
-                match self
-                    .write_coordinator
-                    .remote_resize(&session, length, options)
+            let mut retry_handoff = self.lease_handoff.enabled;
+            loop {
+                let (record, write_lease) = self.meta.open_write(&inode_id)?;
+                let mut record = self.validate_inode(record)?;
+                if record.kind != InodeKind::Regular {
+                    return Err(Error::from(std::io::Error::from_raw_os_error(libc::EISDIR)));
+                }
+                if write_lease.owner_node_id == self.identity.node_id
+                    && write_lease.owner_session_id == self.identity.session_id
                 {
-                    Ok(accepted_seq) => {
-                        session.local.last_accepted_seq = accepted_seq;
+                    self.install_write_state(record.clone(), write_lease)?;
+                    self.resize_dirty_inode(&record.inode_id, length, options.kill_suidgid, None)?;
+                } else {
+                    let previous_provider = self
+                        .write_coordinator
+                        .current_remote_provider(&record.inode_id)?;
+                    let mut session = match self.open_remote_write_session(
+                        &record,
+                        &write_lease,
+                        libc::O_WRONLY,
+                        OpenOptions {
+                            kill_suidgid: options.kill_suidgid,
+                        },
+                    ) {
+                        Ok(session) => session,
+                        Err(error)
+                            if retry_handoff
+                                && error.code() == afs_error::NODE_DFS_STALE_HANDLE =>
+                        {
+                            retry_handoff = false;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    match self
+                        .write_coordinator
+                        .remote_resize(&session, length, options)
+                    {
+                        Ok(accepted_seq) => {
+                            session.local.last_accepted_seq = accepted_seq;
+                        }
+                        Err(error) => {
+                            let _ = self.close_temporary_remote_write_session(
+                                &record.inode_id,
+                                &session,
+                                previous_provider.clone(),
+                            );
+                            return Err(error);
+                        }
                     }
-                    Err(error) => {
+                    if let Err(error) = self.write_coordinator.remote_sync(&session, SyncMode::Full)
+                    {
                         let _ = self.close_temporary_remote_write_session(
                             &record.inode_id,
                             &session,
@@ -381,23 +423,15 @@ impl Backend for DistributedFs {
                         );
                         return Err(error);
                     }
-                }
-                if let Err(error) = self.write_coordinator.remote_sync(&session, SyncMode::Full) {
-                    let _ = self.close_temporary_remote_write_session(
+                    self.close_temporary_remote_write_session(
                         &record.inode_id,
                         &session,
-                        previous_provider.clone(),
-                    );
-                    return Err(error);
+                        previous_provider,
+                    )?;
+                    record = self.observe_inode_record(self.meta.get_inode(&inode_id)?)?;
                 }
-                self.close_temporary_remote_write_session(
-                    &record.inode_id,
-                    &session,
-                    previous_provider,
-                )?;
-                record = self.observe_inode_record(self.meta.get_inode(&inode_id)?)?;
+                break (record, None);
             }
-            (record, None)
         };
         if let Some((handle, accepted_seq)) = accepted_seq {
             self.update_handle_write_progress(handle, accepted_seq)?;
@@ -433,29 +467,105 @@ impl Backend for DistributedFs {
             mode
         };
         let operation_id = self.identity.operation_id("create");
-        // Dropped on any failure below, which queues its release: the reply may
-        // be lost after Meta already admitted the reference.
-        let gc_pin = self
+        // Round 2 C-1: the handle this create opens is registered in Meta's
+        // memory with the create (reader `reader`), not as a durable
+        // `open:create-` reference that must be released with a log record.
+        let reader = match &self.gc.references {
+            Some(references) => references.begin_reader()?,
+            None => None,
+        };
+        // Without soft registration: the durable reference Meta admits inside
+        // the Create transaction. Dropped on any failure below, which queues
+        // its release: the reply may be lost after Meta already admitted it.
+        let durable_pin = self
             .gc
             .references
             .as_ref()
+            .filter(|_| reader.is_none())
             .map(|references| references.created_handle_pin(&operation_id));
-        let (inode, write_lease) = self.meta.create(
-            &operation_id,
+        // B1: the first write generation of the new file is admitted with it
+        // (native write pipeline only; proxy and S3 writers keep their own
+        // admission). Built first for the same reason as `gc_pin`.
+        #[cfg(test)]
+        let create_generation = !self
+            .hooks
+            .create_admits_no_generation
+            .load(Ordering::SeqCst);
+        #[cfg(not(test))]
+        let create_generation = true;
+        let first_generation = match (&self.gc.references, &self.write_resources.pipeline) {
+            (Some(references), Some(_)) if create_generation => {
+                let generation = self.identity.operation_id("native-generation");
+                let pin = references.admitted_generation_pin(&generation);
+                Some((generation, pin))
+            }
+            _ => None,
+        };
+        let parent_id = self.inode_id(parent)?;
+        let attributes_of = InodeAttributes {
+            mode,
+            uid: ctx.uid,
+            gid: ctx.gid,
+            nlink: 1,
+            atime_unix_ms: now,
+            mtime_unix_ms: now,
+            ctime_unix_ms: now,
+        };
+        let create = || {
+            self.meta.create_registered(
+                &operation_id,
+                &parent_id,
+                name.as_encoded_bytes(),
+                attributes_of.clone(),
+                first_generation.as_ref().map(|(generation, _)| generation),
+                reader,
+                caller_context(ctx),
+            )
+        };
+        let created = match create() {
+            Err(error) if error.code() == afs_error::META_DFS_SESSION_NOT_REPORTED => {
+                // This Meta has not heard from this session yet: report, then
+                // retry the same create (same operation id).
+                match self.gc.references.as_ref().map(|r| r.report_readers()) {
+                    Some(Err(report)) => Err(report),
+                    _ => create(),
+                }
+            }
+            created => created,
+        };
+        let (inode, write_lease, registered) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                if let (Some(references), Some(reader)) = (&self.gc.references, reader) {
+                    // A lost reply leaves at most a stale registration, which
+                    // the next report removes.
+                    references.finish_reader(reader, None)?;
+                }
+                return Err(error);
+            }
+        };
+        let inode = self.validate_inode(inode)?;
+        let gc_pin = match (&self.gc.references, reader) {
+            (Some(references), Some(reader)) => {
+                match references
+                    .finish_reader(reader, registered.map(|term| (term, &inode.inode_id, None)))?
+                {
+                    Some(pin) => Some(pin),
+                    // Not registered (or by a replaced Meta): pin it now.
+                    None => Some(references.pin(&inode.inode_id, None)?),
+                }
+            }
+            _ => durable_pin,
+        };
+        self.recent_names.record(
+            &inode.inode_id,
             &self.inode_id(parent)?,
             name.as_encoded_bytes(),
-            InodeAttributes {
-                mode,
-                uid: ctx.uid,
-                gid: ctx.gid,
-                nlink: 1,
-                atime_unix_ms: now,
-                mtime_unix_ms: now,
-                ctime_unix_ms: now,
-            },
-        )?;
-        let inode = self.validate_inode(inode)?;
+        );
         self.install_write_state(inode.clone(), write_lease)?;
+        if let Some(prepared) = first_generation {
+            self.prepare_first_generation(&inode.inode_id, prepared)?;
+        }
         let session = self.open_write_session(&inode, flags)?;
         let handle = self.allocate_handle(DfsFileHandle {
             gc_pin,
@@ -506,6 +616,11 @@ impl Backend for DistributedFs {
             },
             caller: caller_context(ctx),
         })?)?;
+        self.recent_names.record(
+            &inode.inode_id,
+            &self.inode_id(parent)?,
+            name.as_encoded_bytes(),
+        );
         Ok(Entry {
             inode: self.backend_inode(&inode.inode_id)?,
             attributes: attributes(&inode, 0, 0),
@@ -518,7 +633,7 @@ impl Backend for DistributedFs {
 
     fn open_with_options(
         &self,
-        _: &RequestContext,
+        ctx: &RequestContext,
         inode: BackendInode,
         flags: i32,
         options: OpenOptions,
@@ -531,10 +646,18 @@ impl Backend for DistributedFs {
         } else {
             None
         };
-        let preflight =
-            self.validate_inode(self.meta.get_inode(&inode_id).inspect_err(|error| {
-                self.invalidate_native_inode_views_on_error(&inode_id, error);
-            })?)?;
+        let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
+        // B2, and the preflight half of B3: one Meta call resolves the
+        // inode and registers its head as this handle's reader (C-1). A
+        // write open then resolves its authority; if that view's head
+        // differs, the handle pins its own below.
+        // D-R3-2 ③ is not acted on yet: Meta's `writer_elsewhere` counts a
+        // write lease until it expires (up to 30 s after the last writer
+        // closed; Nodes do not hand leases back), so bypassing the page
+        // cache on it would also slow every read after another Node's write.
+        let (preflight, read_pin, _writer_elsewhere) =
+            self.open_preflight_for_read(&inode_id, ctx.pid)?;
+        let preflight = self.validate_inode(preflight)?;
         if matches!(preflight.kind, InodeKind::Special(_)) {
             return Err(Error::coded(
                 afs_error::IO_NOT_SUPPORTED,
@@ -546,57 +669,75 @@ impl Backend for DistributedFs {
         {
             return Err(invalid("immutable-origin files only allow read opens"));
         }
-        let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
         let (opened_inode, write_session) = if writable {
-            let (inode, write_lease) = self.meta.resolve_write_authority(&inode_id)?;
-            let inode = self.validate_inode(inode)?;
-            let session = if write_lease.owner_node_id == self.identity.node_id
-                && write_lease.owner_session_id == self.identity.session_id
-            {
-                self.install_write_state(inode.clone(), write_lease.clone())?;
-                let session = self.open_write_session(&inode, flags)?;
-                let session = Self::make_local_write_session(session);
-                if options.kill_suidgid {
-                    let state = self
-                        .write_state(&inode.inode_id)?
-                        .ok_or_else(|| stale("DFS write state is no longer open"))?;
-                    let mut state = self.lock_for_mutation(&inode.inode_id, &state)?;
-                    Self::apply_kernel_killpriv_to_state(&mut state);
-                }
-                if flags & libc::O_TRUNC != 0
-                    && let Err(error) =
-                        self.resize_dirty_inode(&inode.inode_id, 0, options.kill_suidgid)
+            let mut retry_handoff = self.lease_handoff.enabled;
+            loop {
+                let lease_admission = self.lease_admission(&inode_id)?;
+                let (inode, write_lease) = self.meta.resolve_write_authority(&inode_id)?;
+                let inode = self.validate_inode(inode)?;
+                let session = if write_lease.owner_node_id == self.identity.node_id
+                    && write_lease.owner_session_id == self.identity.session_id
                 {
-                    self.abandon_writer(&session.local)?;
-                    return Err(error);
-                }
-                session
-            } else {
-                let previous_provider = self
-                    .write_coordinator
-                    .current_remote_provider(&inode.inode_id)?;
-                let session =
-                    self.open_remote_write_session(&inode, &write_lease, flags, options)?;
-                if flags & libc::O_TRUNC != 0
-                    && let Err(error) = self.write_coordinator.remote_resize(
-                        &session,
-                        0,
-                        SetAttrOptions {
-                            kill_suidgid: options.kill_suidgid,
-                            timestamps_now: false,
-                        },
-                    )
-                {
-                    let _ = self.close_temporary_remote_write_session(
-                        &inode.inode_id,
-                        &session,
-                        previous_provider,
-                    );
-                    return Err(error);
-                }
-                session
-            };
-            (inode, Some(session))
+                    self.install_write_state(inode.clone(), write_lease.clone())?;
+                    let session = self.open_write_session(&inode, flags)?;
+                    let session = Self::make_local_write_session(session);
+                    if options.kill_suidgid {
+                        let state = self
+                            .write_state(&inode.inode_id)?
+                            .ok_or_else(|| stale("DFS write state is no longer open"))?;
+                        let mut state = self.lock_for_mutation(&inode.inode_id, &state)?;
+                        Self::apply_kernel_killpriv_to_state(&mut state);
+                    }
+                    if flags & libc::O_TRUNC != 0
+                        && let Err(error) =
+                            self.resize_dirty_inode(&inode.inode_id, 0, options.kill_suidgid, None)
+                    {
+                        self.abandon_writer(&session.local)?;
+                        return Err(error);
+                    }
+                    session
+                } else {
+                    drop(lease_admission);
+                    let previous_provider = self
+                        .write_coordinator
+                        .current_remote_provider(&inode.inode_id)?;
+                    let session = match self.open_remote_write_session(
+                        &inode,
+                        &write_lease,
+                        flags,
+                        options,
+                    ) {
+                        Ok(session) => session,
+                        Err(error)
+                            if retry_handoff
+                                && error.code() == afs_error::NODE_DFS_STALE_HANDLE =>
+                        {
+                            retry_handoff = false;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if flags & libc::O_TRUNC != 0
+                        && let Err(error) = self.write_coordinator.remote_resize(
+                            &session,
+                            0,
+                            SetAttrOptions {
+                                kill_suidgid: options.kill_suidgid,
+                                timestamps_now: false,
+                            },
+                        )
+                    {
+                        let _ = self.close_temporary_remote_write_session(
+                            &inode.inode_id,
+                            &session,
+                            previous_provider,
+                        );
+                        return Err(error);
+                    }
+                    session
+                };
+                break (inode, Some(session));
+            }
         } else {
             let inode = if self.read_engine.has_external_backend() {
                 self.refresh_inode_record(preflight, true, true)?
@@ -626,9 +767,14 @@ impl Backend for DistributedFs {
             // period; it only needs the authority to have held (R75).
             self.check_native_read_view_for_delivery(view)?;
         }
+        // The registration made with the preflight protects the head Meta
+        // saw; a handle that ends up on another version pins its own.
+        let gc_pin = read_pin.filter(|pin| {
+            pin.opened() == Some((&opened_inode.inode_id, opened_inode.head_version.as_ref()))
+        });
         self.allocate_handle(DfsFileHandle {
             origin_fill: false,
-            gc_pin: None,
+            gc_pin,
             inode_id: opened_inode.inode_id.clone(),
             opened_inode,
             opened_page_identity,
@@ -789,6 +935,50 @@ impl Backend for DistributedFs {
                         .as_ref()
                         .is_some_and(|session| session.remote.is_none())
             })
+    }
+
+    fn queued_write_completion(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        length: usize,
+    ) -> Option<usize> {
+        if !self.crc32c_writes() {
+            return None;
+        }
+        let budget = self.write_resources.pipeline.as_ref()?.budget.snapshot();
+        // Keep enough space to grow a near-full block before the whole
+        // working set is made up of partial blocks.
+        if budget.live_bytes < budget.limit - budget.limit / 4 {
+            return None;
+        }
+        let handle = self.handles.get(handle.0).ok()??;
+        let cell = self.write_state(&handle.inode_id).ok()??;
+        let state = cell.try_lock().ok()?;
+        if state.in_flight.is_some() || state.terminal_error.is_some() {
+            return Some(0);
+        }
+        let score =
+            state
+                .dirty_extents
+                .native_selection(offset)
+                .map_or(0, |(index, source, available)| {
+                    let builder = &state.dirty_extents.builders[index].builder;
+                    if offset != state.logical_length || source != builder.len() {
+                        return 0;
+                    }
+                    let end = source + length.min(available);
+                    // Growth checks out a new buffer while the old one is
+                    // live. Do not favor a write that cannot fit right now.
+                    if end > builder.capacity()
+                        && end.next_power_of_two().min(builder.writable_capacity())
+                            > budget.limit - budget.live_bytes
+                    {
+                        return 0;
+                    }
+                    end
+                });
+        Some(score)
     }
 
     fn write_admission_mode(&self, handle: FileHandle) -> WriteAdmissionMode {
@@ -1044,24 +1234,14 @@ impl Backend for DistributedFs {
         }
     }
 
+    fn fsync_timeout(&self) -> Option<Duration> {
+        Some(self.write_timeout)
+    }
+
     fn fsync(&self, _: &RequestContext, handle: FileHandle, mode: SyncMode) -> Result<()> {
-        let snapshot = self.handle_snapshot(handle)?;
-        if let Some(session) = snapshot.write_session.as_ref()
-            && session.remote.is_some()
-        {
-            self.write_coordinator
-                .remote_sync(session, mode)
-                .map(|_| ())
-        } else {
-            self.sync_handle(
-                handle,
-                match mode {
-                    SyncMode::DataOnly => CommitReason::DATA_SYNC,
-                    SyncMode::Full => CommitReason::FULL_SYNC,
-                },
-                CommitWait::AfterOperations,
-            )
-        }
+        crate::node::call_deadline::within_timeout(self.write_timeout, || {
+            self.fsync_with_deadline(handle, mode)
+        })
     }
 
     fn fsync_receipt(
@@ -1088,9 +1268,11 @@ impl Backend for DistributedFs {
         self.release_file_handle(handle)?.map_or(Ok(()), Err)
     }
 
-    fn opendir(&self, _: &RequestContext, inode: BackendInode) -> Result<DirectoryHandle> {
+    fn opendir(&self, ctx: &RequestContext, inode: BackendInode) -> Result<DirectoryHandle> {
         let inode_id = self.inode_id(inode)?;
-        let record = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
+        // B8: the preflight registers the directory as a reader (C-1).
+        let (record, registered, _) = self.open_preflight_for_read(&inode_id, ctx.pid)?;
+        let record = self.validate_inode(record)?;
         if record.kind != InodeKind::Directory {
             return Err(Error::from(std::io::Error::from(
                 std::io::ErrorKind::NotADirectory,
@@ -1098,12 +1280,15 @@ impl Backend for DistributedFs {
         }
         let id = self.handles.next_id();
         let directory = DfsDirectoryHandle {
-            _gc_pin: self
-                .gc
-                .references
-                .as_ref()
-                .map(|references| references.pin(&inode_id, None))
-                .transpose()?,
+            _gc_pin: match registered.filter(|pin| pin.opened() == Some((&inode_id, None))) {
+                Some(pin) => Some(pin),
+                None => self
+                    .gc
+                    .references
+                    .as_ref()
+                    .map(|references| references.pin(&inode_id, None))
+                    .transpose()?,
+            },
             inode_id,
             entries: Vec::new(),
             last_name: Vec::new(),
@@ -1206,6 +1391,11 @@ impl Backend for DistributedFs {
             },
             caller_context(ctx),
         )?)?;
+        self.recent_names.record(
+            &inode.inode_id,
+            &self.inode_id(parent)?,
+            name.as_encoded_bytes(),
+        );
         Ok(Entry {
             inode: self.backend_inode(&inode.inode_id)?,
             attributes: attributes(&inode, 0, 0),
@@ -1213,30 +1403,30 @@ impl Backend for DistributedFs {
     }
 
     fn unlink(&self, ctx: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<()> {
-        self.refresh_inode_record(
-            self.meta.unlink(
-                &self.identity.operation_id("unlink"),
-                &self.inode_id(parent)?,
-                name.as_encoded_bytes(),
-                caller_context(ctx),
-            )?,
-            true,
-            true,
+        let parent_id = self.inode_id(parent)?;
+        let removed = self.meta.unlink(
+            &self.identity.operation_id("unlink"),
+            &parent_id,
+            name.as_encoded_bytes(),
+            caller_context(ctx),
         )?;
+        self.recent_names
+            .forget(&parent_id, name.as_encoded_bytes());
+        self.refresh_inode_record(removed, true, true)?;
         Ok(())
     }
 
     fn rmdir(&self, ctx: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<()> {
-        self.refresh_inode_record(
-            self.meta.rmdir(
-                &self.identity.operation_id("rmdir"),
-                &self.inode_id(parent)?,
-                name.as_encoded_bytes(),
-                caller_context(ctx),
-            )?,
-            true,
-            true,
+        let parent_id = self.inode_id(parent)?;
+        let removed = self.meta.rmdir(
+            &self.identity.operation_id("rmdir"),
+            &parent_id,
+            name.as_encoded_bytes(),
+            caller_context(ctx),
         )?;
+        self.recent_names
+            .forget(&parent_id, name.as_encoded_bytes());
+        self.refresh_inode_record(removed, true, true)?;
         Ok(())
     }
 
@@ -1278,6 +1468,12 @@ impl Backend for DistributedFs {
                 result => break result?,
             }
         };
+        self.recent_names.rename(
+            &old_parent,
+            from_name.as_encoded_bytes(),
+            &new_parent,
+            to_name.as_encoded_bytes(),
+        );
         self.refresh_inode_record(outcome.inode, true, true)?;
         if let Some(replaced) = outcome.replaced_inode {
             self.refresh_inode_record(replaced, true, true)?;
@@ -1311,6 +1507,11 @@ impl Backend for DistributedFs {
             },
             caller: caller_context(ctx),
         })?)?;
+        self.recent_names.record(
+            &inode.inode_id,
+            &self.inode_id(parent)?,
+            name.as_encoded_bytes(),
+        );
         Ok(Entry {
             inode: self.backend_inode(&inode.inode_id)?,
             attributes: attributes(&inode, 0, 0),
@@ -1333,19 +1534,25 @@ impl Backend for DistributedFs {
         new_name: &OsStr,
     ) -> Result<Entry> {
         let inode_id = self.inode_id(inode)?;
+        let new_parent_id = self.inode_id(new_parent)?;
         let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
         let linked = self.refresh_inode_record(
             self.meta.link(
                 &self.identity.operation_id("link"),
                 &inode_id,
                 current.revision,
-                &self.inode_id(new_parent)?,
+                &new_parent_id,
                 new_name.as_encoded_bytes(),
                 caller_context(ctx),
             )?,
             true,
             true,
         )?;
+        self.recent_names.record(
+            &linked.inode_id,
+            &new_parent_id,
+            new_name.as_encoded_bytes(),
+        );
         Ok(Entry {
             inode: self.backend_inode(&linked.inode_id)?,
             attributes: self.visible_attributes(&linked)?,
@@ -1428,5 +1635,27 @@ impl Backend for DistributedFs {
             true,
         )?;
         Ok(())
+    }
+}
+
+impl DistributedFs {
+    fn fsync_with_deadline(&self, handle: FileHandle, mode: SyncMode) -> Result<()> {
+        let snapshot = self.handle_snapshot(handle)?;
+        if let Some(session) = snapshot.write_session.as_ref()
+            && session.remote.is_some()
+        {
+            self.write_coordinator
+                .remote_sync(session, mode)
+                .map(|_| ())
+        } else {
+            self.sync_handle(
+                handle,
+                match mode {
+                    SyncMode::DataOnly => CommitReason::DATA_SYNC,
+                    SyncMode::Full => CommitReason::FULL_SYNC,
+                },
+                CommitWait::AfterOperations,
+            )
+        }
     }
 }

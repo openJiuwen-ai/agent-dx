@@ -347,6 +347,7 @@ impl DfsLockRenewal {
 
 impl DistributedFs {
     pub(super) fn lock_authority_for(&self, inode_id: &InodeId) -> Result<DfsLockTarget> {
+        let _lease_admission = self.lease_admission(inode_id)?;
         let (inode, lease) = self.meta.resolve_lock_authority(inode_id)?;
         let inode = self.validate_inode(inode)?;
         if inode.inode_id != *inode_id {

@@ -106,6 +106,27 @@ impl Relay {
         binding.quiescing = true;
         Ok(true)
     }
+    /// Close new CONNECT admission without cancelling accepted streams. The
+    /// caller must observe zero activity before retiring or checkpointing.
+    pub fn drain_environment(&self, instance: &str, runtime: &str) -> io::Result<()> {
+        if self.activity.is_none() {
+            return Err(io::Error::other("activity unavailable"));
+        }
+        let key = RouteKey {
+            instance_id: instance.into(),
+            workload_id: runtime.into(),
+        };
+        let mut routes = self
+            .route_shard(&key)
+            .write()
+            .map_err(|_| io::Error::other("route registry unavailable"))?;
+        let binding = routes
+            .get_mut(&key)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "binding missing"))?;
+        binding.quiescing = true;
+        Ok(())
+    }
+
     pub fn new(policy: GatewayPolicy) -> Self {
         Self {
             policy,

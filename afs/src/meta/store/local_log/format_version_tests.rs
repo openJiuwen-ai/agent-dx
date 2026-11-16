@@ -51,7 +51,7 @@ async fn wal_envelope_version_is_identified_before_the_frame_crc() {
         assert_eq!(u16::from(bytes[offset]), version::META_WAL_ENVELOPE);
         // The CRC still covers the old byte: a CRC-first reader would report
         // corruption.
-        bytes[offset] = 3;
+        bytes[offset] = 4;
     });
     assert_incompatible(
         refused(dir.path()),
@@ -59,8 +59,8 @@ async fn wal_envelope_version_is_identified_before_the_frame_crc() {
             "Meta WAL record envelope",
             WAL,
             "offset 4096",
-            "version 3",
-            "supports version 2",
+            "version 4",
+            "supports version 3",
         ],
     );
     assert_eq!(fs::read(dir.path().join(WAL)).unwrap(), wal, "retained");
@@ -96,7 +96,7 @@ async fn wal_record_decision_schema_is_identified_before_the_full_decode() {
         frame[schema] = 1;
         // Keep the frame itself intact so only the inner version differs.
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"afs.meta.record.v2");
+        hasher.update(b"afs.meta.record.v3");
         hasher.update(&frame[8..body_end]);
         let hash = *hasher.finalize().as_bytes();
         frame[body_end..].copy_from_slice(&hash);
@@ -109,7 +109,7 @@ async fn wal_record_decision_schema_is_identified_before_the_full_decode() {
             "Meta WAL record decision",
             WAL,
             "version 1",
-            "supports version 2",
+            "supports version 3",
         ],
     );
 }

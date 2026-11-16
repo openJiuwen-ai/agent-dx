@@ -501,7 +501,18 @@ impl Operations {
                         Kind::Network => json!({"success": true}),
                         Kind::Reload => json!({"success": true}),
                     };
-                    owner.record = result.record;
+                    // The node owns execution state; creation identity remains
+                    // Coordinator-owned metadata for this verified Assignment.
+                    let creation_request_id = owner
+                        .record
+                        .as_ref()
+                        .map(|record| record.creation_request_id.clone())
+                        .unwrap_or_default();
+                    let mut record = result.record;
+                    if let Some(record) = record.as_mut() {
+                        record.creation_request_id = creation_request_id;
+                    }
+                    owner.record = record;
                     clients.put_owner(owner).await?;
                     self.pending.lock().await.remove(&key);
                     return Ok(value);

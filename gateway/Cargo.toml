@@ -33,7 +33,7 @@ default = ["activity-client"]
 activity-client = ["dep:prost", "dep:tonic", "dep:tower"]
 etcd-watch = ["dep:etcd-client"]
 mock-e2e = []
-agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:russh", "dep:reqwest", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:deadpool-postgres", "dep:webpki-roots", "dep:jsonwebtoken"]
+agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:russh", "dep:reqwest", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:deadpool-postgres", "dep:webpki-roots", "dep:jsonwebtoken", "dep:zeroize"]
 
 [dependencies]
 adx-core = { path = "../platform/crates/core" }
@@ -47,6 +47,7 @@ adx-protocol = { path = "../platform/crates/protocol" }
 adx-discovery = { path = "../platform/crates/discovery" }
 sha2 = "0.10"
 ring = "0.17"
+zeroize = { version = "1", optional = true }
 hex = "0.4"
 mime_guess = "2"
 async-trait = "0.1"

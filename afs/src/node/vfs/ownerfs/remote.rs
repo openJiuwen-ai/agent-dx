@@ -233,6 +233,13 @@ pub trait RemoteFiles: Send + Sync {
         expected_identity: Option<&FileIdentity>,
         expected_parent: &FileIdentity,
     ) -> Result<()>;
+    /// 在 Home 上结束 workspace 生命周期；`rmdir` 只处理 workspace 内部路径。
+    fn rmdir_root(
+        &self,
+        ctx: &RequestContext,
+        grant: &RootGrant,
+        expected_root: &FileIdentity,
+    ) -> Result<()>;
     // Both parent and entry identities must travel with the two paths so Home
     // can reject a stale pathname before changing the namespace.
     #[allow(clippy::too_many_arguments)]

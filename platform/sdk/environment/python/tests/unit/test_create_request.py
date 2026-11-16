@@ -19,6 +19,19 @@ from adx_environment import (
 
 
 class CreateRequestTests(unittest.TestCase):
+    def test_registered_local_rootfs_uses_name_without_host_path_or_image(self):
+        with Environment(rootfs_template="tools-v1", detached=True, connection=self.connection):
+            pass
+        body = json.loads(self.exchanges[0].content)
+        self.assertEqual(body["rootfs"], {"type": "template", "name": "tools-v1"})
+        self.assertNotIn("image", body)
+
+    def test_local_rootfs_selection_rejects_conflicting_sources_before_transport(self):
+        for options in ({"image": "tools:1"}, {"snapshot_id": "snapshot"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                Environment(rootfs_template="tools-v1", connection=self.connection, **options)
+        self.assert_no_transport_setup()
+
     def test_explicit_forever_retention_and_typed_actions(self):
         import adx_environment as sdk
         for name in ("RetentionPolicy", "IdleAction", "CheckpointStorage"):
@@ -68,7 +81,9 @@ class CreateRequestTests(unittest.TestCase):
 
     def capture_create(self, **options):
         start = len(self.exchanges)
-        with Environment(image="adx-contract-fixture:1", detached=True, connection=self.connection, **options) as environment:
+        with Environment(
+            image="adx-contract-fixture:1", detached=True, connection=self.connection, **options
+        ) as environment:
             self.assertEqual(environment.commands.list(), [])
         exchanged = self.exchanges[start:]
         self.assertEqual(
@@ -285,13 +300,15 @@ class CreateRequestTests(unittest.TestCase):
     def test_idle_pause_with_shared_storage_is_preserved(self):
         from adx_environment import PausePolicy, RetentionPolicy, IdleAction, CheckpointStorage
         body = self.capture_create(idle_timeout=30, idle_action=IdleAction.PAUSE,
-                                   pause_policy=PausePolicy(retention=RetentionPolicy.for_seconds(3600), timeout_seconds=120, storage=CheckpointStorage.SHARED))
+                                   pause_policy=PausePolicy(retention=RetentionPolicy.for_seconds(3600),
+                                       timeout_seconds=120, storage=CheckpointStorage.SHARED))
         self.assertEqual(body["idleAction"], "pause")
         self.assertNotIn("autoResume", body)
-        self.assertEqual(body["pauseOptions"], {"retention": {"kind": "ttl", "ttlSeconds": 3600}, "timeoutSeconds": 120, "storage": "shared"})
+        self.assertEqual(body["pauseOptions"], {
+            "retention": {"kind": "ttl", "ttlSeconds": 3600}, "timeoutSeconds": 120, "storage": "shared"})
 
     def test_invalid_idle_pause_options_do_not_open_transport(self):
-        from adx_environment import PausePolicy, RetentionPolicy, IdleAction, CheckpointStorage
+        from adx_environment import PausePolicy, IdleAction
         for options in ({"idle_action": "missing"}, {"idle_action": IdleAction.PAUSE, "idle_timeout": 0},
                         {"auto_resume": 1}, {"pause_policy": {"storage": "shared"}}):
             with self.subTest(options=options), self.assertRaises((ValueError, TypeError)):

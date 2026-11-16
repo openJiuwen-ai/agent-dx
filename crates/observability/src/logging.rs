@@ -116,6 +116,7 @@ pub fn init(
         (ingress_access_enabled || ingress_audit_enabled) && access_writer.is_none();
     let stdout_layer = config.stdout.then(|| {
         tracing_subscriber::fmt::layer()
+            .with_ansi(false)
             .with_target(true)
             .with_writer(TraceMakeWriter::new(std::io::stdout))
             .with_filter(filter_fn(move |metadata| {

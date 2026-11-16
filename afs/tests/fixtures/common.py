@@ -40,6 +40,7 @@ class DfsProfile:
     readahead_max_bytes: int | None = None
     kernel_readahead_bytes: int | None = None
     replica_failure: str | None = None
+    kernel_cache_ttl_ms: int | None = None
 
     def __post_init__(self):
         if not is_integer(self.node_count) or self.node_count not in (2, 3):
@@ -50,6 +51,7 @@ class DfsProfile:
             ("write_queue_bytes", self.write_queue_bytes, 8 * 1024**2, 1024**4),
             ("readahead_max_bytes", self.readahead_max_bytes, 0, 32 * 1024**2),
             ("kernel_readahead_bytes", self.kernel_readahead_bytes, 0, 16 * 1024**2),
+            ("kernel_cache_ttl_ms", self.kernel_cache_ttl_ms, 0, 60_000),
         ):
             if value is not None and (not is_integer(value) or not minimum <= value <= maximum):
                 raise ValueError("invalid DFS profile " + name)
@@ -73,6 +75,7 @@ class DfsProfile:
             ("dfs_read_crc_mode", self.read_crc_mode),
             ("dfs_readahead_max_bytes", self.readahead_max_bytes),
             ("fuse_max_readahead_bytes", self.kernel_readahead_bytes),
+            ("dfs_kernel_cache_ttl_ms", self.kernel_cache_ttl_ms),
         )
         return "".join(f"{key} = {json.dumps(value)}\n" for key, value in values if value is not None)
 

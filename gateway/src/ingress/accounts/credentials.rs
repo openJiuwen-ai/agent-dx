@@ -3,6 +3,7 @@ use ring::{
     aead,
     rand::{SecureRandom, SystemRandom},
 };
+use zeroize::Zeroizing;
 
 /// AES-256-GCM envelope; associated data binds ciphertext to its purpose and owner.
 pub struct CredentialCipher {
@@ -37,16 +38,16 @@ impl CredentialCipher {
         SystemRandom::new()
             .fill(&mut nonce)
             .map_err(|_| "credential randomness unavailable")?;
-        let mut encrypted = plaintext.to_vec();
+        let mut encrypted = Zeroizing::new(plaintext.to_vec());
         self.key
             .seal_in_place_append_tag(
                 aead::Nonce::assume_unique_for_key(nonce),
                 aead::Aad::from(aad),
-                &mut encrypted,
+                &mut *encrypted,
             )
             .map_err(|_| "credential encryption failed")?;
         let mut result = nonce.to_vec();
-        result.extend(encrypted);
+        result.extend_from_slice(&encrypted);
         Ok(result)
     }
     pub fn open(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -54,7 +55,7 @@ impl CredentialCipher {
             return Err("invalid encrypted credential");
         }
         let nonce: [u8; 12] = ciphertext[..12].try_into().map_err(|_| "invalid nonce")?;
-        let mut encrypted = ciphertext[12..].to_vec();
+        let mut encrypted = Zeroizing::new(ciphertext[12..].to_vec());
         self.key
             .open_in_place(
                 aead::Nonce::assume_unique_for_key(nonce),

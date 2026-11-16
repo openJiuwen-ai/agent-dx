@@ -67,6 +67,62 @@ fn process_is_running(pid: i32) -> bool {
 }
 
 #[tokio::test]
+async fn explicit_workload_starts_without_image_process_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("started");
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let log_path = directory.path().join("execd.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut child = ProcessGroup(
+        Command::new(env!("CARGO_BIN_EXE_adx-execd"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("EXECD_HTTP_ONLY", "1")
+            .env(
+                "ADX_WORKLOAD_PROCESS",
+                serde_json::json!({
+                    "commands":[["/bin/sh","-c","printf started > started; exec sleep 60"]],
+                    "cwd":directory.path()
+                })
+                .to_string(),
+            )
+            .env("ADX_ENVIRONMENT_ID", "local-process")
+            .env("ADX_RUNTIME_ID", "local-process-1")
+            .env("ADX_OWNERSHIP_GENERATION", "1")
+            .env("EXECD_HTTP_PORT", port.to_string())
+            .env("EXECD_HTTP_TOKEN", "local-process-test")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap(),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            assert!(child.0.try_wait().unwrap().is_none(), "Execd exited");
+            if marker.exists() {
+                if let Some(value) = entrypoint_poll(port, "local-process-test").await {
+                    if value.get("status").and_then(serde_json::Value::as_str) == Some("running") {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "local workload did not start: {}",
+        std::fs::read_to_string(log_path).unwrap()
+    );
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "started");
+}
+
+#[tokio::test]
 async fn inherited_long_running_process_keeps_control_responsive() {
     for attempt in 0..4 {
         let directory = tempfile::tempdir().unwrap();

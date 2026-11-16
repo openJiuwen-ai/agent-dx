@@ -734,11 +734,14 @@ fn seed_transaction_range(
             }
             let length = dimensions.chunks_per_file * CHUNK_BYTES;
             txn.mutations
-                .push(TxnMutation::Put(MetaEntity::DfsLayoutRoot(LayoutRoot {
-                    id: layout_id.clone(),
-                    file_length: length,
-                    inline_extents: extents,
-                })));
+                .push(TxnMutation::Put(MetaEntity::DfsLayoutRoot(
+                    LayoutRoot {
+                        id: layout_id.clone(),
+                        file_length: length,
+                        inline_extents: extents,
+                    }
+                    .into(),
+                )));
             txn.mutations
                 .push(TxnMutation::Put(MetaEntity::DfsFileVersion(FileVersion {
                     id: version.clone(),
@@ -1139,6 +1142,7 @@ async fn service_smoke(store: Arc<Store>) -> BenchResult<Value> {
                 grpc_addr: "127.0.0.1:1".into(),
                 data_addr: "127.0.0.1:2".into(),
                 rest_addr: "127.0.0.1:3".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: true,
                 storage_devices: vec![],
                 lease_ttl: Duration::from_secs(60),
@@ -1155,6 +1159,12 @@ async fn service_smoke(store: Arc<Store>) -> BenchResult<Value> {
         name: b"service-smoke".to_vec(),
         attributes: attributes(),
         lease_seconds: 30,
+        first_generation: None,
+        caller: afs::dfs::CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
     };
     let start = Instant::now();
     let (file, lease) = service.create(request.clone()).await?;
@@ -1195,6 +1205,7 @@ async fn dir_ops(store: Arc<Store>, iterations: u64) -> BenchResult<Value> {
                 grpc_addr: "127.0.0.1:1".into(),
                 data_addr: "127.0.0.1:2".into(),
                 rest_addr: "127.0.0.1:3".into(),
+                nfs_addr: String::new(),
                 ownerfs_enabled: true,
                 storage_devices: vec![],
                 lease_ttl: Duration::from_secs(600),
@@ -1303,6 +1314,7 @@ async fn patrol_latency(store: Arc<Store>, dimensions: Dimensions) -> BenchResul
         grpc_addr: "127.0.0.1:1".into(),
         data_addr: "127.0.0.1:2".into(),
         rest_addr: "127.0.0.1:3".into(),
+        nfs_addr: String::new(),
         ownerfs_enabled: false,
         storage_devices: vec![device(device_id)],
         lease_ttl: Duration::from_secs(600),

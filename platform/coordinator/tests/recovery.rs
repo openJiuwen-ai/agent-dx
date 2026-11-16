@@ -78,6 +78,7 @@ fn saved() -> StoredSnapshot {
                 proxy_address: "127.0.0.1:9001".into(),
                 session: None,
                 scheduling_paused: false,
+                upgrade_pause: None,
                 checkpoint_scopes: Default::default(),
                 checkpoint_gc_fenced: false,
             },

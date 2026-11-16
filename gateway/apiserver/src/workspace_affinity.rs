@@ -1,7 +1,10 @@
-//! Bind Environment placement to the node that owns a referenced Workspace.
+//! Prefer the node that owns a referenced Workspace.
 //!
 //! Workspace ownership is derived lexically from local bind mounts because the
 //! API server may not share a filesystem with the node that stores the mount.
+//! The owner is injected as a soft preference: an owner without free capacity
+//! or an offline owner does not block placement on another node, which can
+//! still reach the Workspace through autofs and NFS.
 use crate::config::{WorkspaceAffinity, WorkspaceAffinityErrorPolicy};
 use adx_protocol::control as pb;
 use serde::Deserialize;
@@ -14,6 +17,10 @@ use tonic::Status;
 
 const NODE_ID: &str = "NODE_ID";
 const CONFLICT: &str = "explicit node constraint conflicts with Workspace ownership";
+/// The owner preference competes with the other node preferences supplied by
+/// the caller. It is deliberately a preference, not a requirement: the
+/// scheduler still rejects the owner when it has no capacity or is offline.
+const PREFERENCE_WEIGHT: u32 = 1;
 
 /// Directory name directly below `root` identifies the Workspace owner.
 /// Comparison is lexical: mounts are resolved on the node, not on this host.
@@ -117,14 +124,18 @@ fn segments(path: &Path) -> Option<Vec<String>> {
     Some(parts)
 }
 
-/// Confine every alternative node selector to the resolved node.
+/// Add the owner node as a soft preference without narrowing placement.
 ///
-/// `required_node` entries and the terms of a required Node placement group are
-/// disjunctions: one alternative that excludes the owner does not make the
-/// affinity impossible. The constraint is appended only after proving that at
-/// least one alternative admits the owner; adding another alternative would
-/// widen placement instead of narrowing it.
-pub fn enforce_node(policy: &mut pb::SchedulingPolicy, node_id: &str) -> Result<(), Status> {
+/// The scheduler filters out an owner that is offline or out of capacity and
+/// falls back to another node, which reaches the Workspace through autofs and
+/// NFS. Hard constraints supplied by the caller are never rewritten:
+///
+/// * `required_node` entries and the terms of a required Node placement group
+///   are disjunctions, so at least one alternative must admit the owner for the
+///   preference to be worth adding;
+/// * a required anti group that rejects the owner makes the preference
+///   irrelevant, so the caller's explicit placement wins.
+pub fn prefer_node(policy: &mut pb::SchedulingPolicy, node_id: &str) -> Result<(), Status> {
     if !policy.required_node.is_empty() && !policy.required_node.iter().any(|s| admits(s, node_id))
     {
         return Err(conflict());
@@ -153,16 +164,17 @@ pub fn enforce_node(policy: &mut pb::SchedulingPolicy, node_id: &str) -> Result<
             return Err(conflict());
         }
     }
-    if policy.required_node.is_empty() {
-        policy.required_node.push(pb::LabelSelector::default());
-    }
-    for selector in &mut policy.required_node {
-        selector.expressions.push(pb::LabelRequirement {
-            key: NODE_ID.into(),
-            op: pb::SelectorOp::In as i32,
-            values: vec![node_id.to_owned()],
-        });
-    }
+    policy.preferred_node.push(pb::WeightedSelector {
+        selector: Some(pb::LabelSelector {
+            expressions: vec![pb::LabelRequirement {
+                key: NODE_ID.into(),
+                op: pb::SelectorOp::In as i32,
+                values: vec![node_id.to_owned()],
+            }],
+            ..Default::default()
+        }),
+        weight: PREFERENCE_WEIGHT,
+    });
     Ok(())
 }
 

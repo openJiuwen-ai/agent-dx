@@ -20,6 +20,17 @@ impl Session {
         tenant: &str,
         request: &str,
     ) -> Result<Option<EnvironmentRecord>> {
+        Ok(self
+            .published_request_stored(tenant, request)
+            .await?
+            .map(|stored| stored.effective_record()))
+    }
+
+    pub(crate) async fn published_request_stored(
+        &self,
+        tenant: &str,
+        request: &str,
+    ) -> Result<Option<StoredEnvironment>> {
         match self.request_receipt(tenant, request).await? {
             Some(receipt) => self.resolve_receipt(receipt).await.map(Some),
             None => Ok(None),
@@ -44,24 +55,19 @@ impl Session {
         decode(&raw).map(Some)
     }
 
-    async fn resolve_receipt(&self, receipt: StoredEnvironment) -> Result<EnvironmentRecord> {
+    async fn resolve_receipt(&self, mut receipt: StoredEnvironment) -> Result<StoredEnvironment> {
         receipt.validate()?;
-        let mut record = receipt.result.ok_or(Error::Conflict)?;
-        match self.get(&record.spec.id).await {
-            Ok(current)
-                if current.creation_generation == receipt.creation_generation
-                    && current.spec.tenant_id == record.spec.tenant_id =>
-            {
-                record = current.result.ok_or(Error::Conflict)?;
-            }
+        match self.get(&receipt.spec.id).await {
+            Ok(current) if current.spec.tenant_id == receipt.spec.tenant_id => Ok(current),
             Ok(_) | Err(Error::NotFound) => {
+                let record = receipt.result.as_mut().ok_or(Error::Conflict)?;
                 record.state = EnvironmentState::Deleted;
                 record.resources_held = false;
                 record.runtime.ip = None;
+                Ok(receipt)
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         }
-        Ok(record)
     }
 
     /// Remove only an unfinished optional Claim belonging to a losing execution.
@@ -135,13 +141,14 @@ impl Session {
     ) -> Result<EnvironmentRecord> {
         self.publish_success(record, requests, node_session, false, creation)
             .await
+            .map(|stored| stored.effective_record())
     }
 
     pub(crate) async fn publish_existing(
         &self,
         record: EnvironmentRecord,
         request: &str,
-    ) -> Result<EnvironmentRecord> {
+    ) -> Result<StoredEnvironment> {
         self.publish_success(record, &[request.to_owned()], "", true, None)
             .await
     }
@@ -153,7 +160,7 @@ impl Session {
         node_session: &str,
         require_existing: bool,
         creation: Option<CreationSummary>,
-    ) -> Result<EnvironmentRecord> {
+    ) -> Result<StoredEnvironment> {
         validate_result(&record)?;
         if record.state != EnvironmentState::Running {
             return Err(Error::Conflict);
@@ -357,7 +364,7 @@ impl Session {
                     if code == 2 {
                         return self.resolve_receipt(winner).await;
                     }
-                    return winner.result.ok_or(Error::Conflict);
+                    return Ok(winner);
                 }
                 0 => (),
                 _ => return Err(Error::Conflict),

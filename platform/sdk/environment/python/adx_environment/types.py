@@ -892,13 +892,16 @@ class Mount:
         if isinstance(self.options, str):
             raise ValueError("options must be a sequence of mount flags")
         options = tuple(self.options)
-        if any(flag not in {"ro", "rw", "nosuid", "nodev", "noexec"} for flag in options):
+        if any(flag not in {"ro", "rw", "nosuid", "nodev", "noexec", "disable_file_handle_sharing"}
+               for flag in options):
             raise ValueError("unsupported mount option")
         if len(set(options)) != len(options) or ("ro" in options and "rw" in options):
             raise ValueError("mount options must be unique and cannot contain both ro and rw")
         if "ro" not in options and "rw" not in options:
             options = ("ro",) + options
         directory_bind = self.type == "bind" and (self.host_path is not None or self.volume_id is not None)
+        if "disable_file_handle_sharing" in options and not directory_bind:
+            raise ValueError("disable_file_handle_sharing requires a host or Volume bind mount")
         if "rw" in options and not directory_bind:
             raise ValueError("only directory bind mounts may be writable")
         if not isinstance(self.create_if_missing, bool):

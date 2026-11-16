@@ -279,6 +279,8 @@ data_plane_ingress_http_responses_total{{class=\"other\"}} {}\n",
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngressSecurity {
     Plaintext,
+    /// Explicit listener opt-in; authentication remains mandatory on private APIs.
+    AuthenticatedHttp,
     Tls,
 }
 
@@ -686,30 +688,39 @@ impl Ingress {
         }
         let session_id = Uuid::new_v4();
         let (cancel, cancelled) = watch::channel(false);
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| io::Error::other("active session lock poisoned"))?;
+            // Hold the session lock across the snapshot and registration: a later
+            // revocation must not be consumed before this session becomes visible.
+            let revision = self
+                .resolver
+                .current_route_revision(&route)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, IngressOpenError::RouteChanged)
+                })?;
+            sessions.insert(
+                session_id,
+                ActiveSession {
+                    instance_id: route.target.instance_id.clone(),
+                    workload_id: route.target.workload_id.clone(),
+                    relay_address: route.relay_address.clone(),
+                    target_ip: route.target.target_ip,
+                    revision,
+                    route: route.clone(),
+                    cancel,
+                },
+            );
+            self.active_sessions.fetch_add(1, Ordering::Relaxed);
+        }
         let guard = SessionGuard {
             session_id,
             active_sessions: self.active_sessions.clone(),
             sessions: self.sessions.clone(),
         };
-        self.active_sessions.fetch_add(1, Ordering::Relaxed);
-        self.sessions.lock().unwrap().insert(
-            session_id,
-            ActiveSession {
-                instance_id: route.target.instance_id.clone(),
-                workload_id: route.target.workload_id.clone(),
-                relay_address: route.relay_address.clone(),
-                target_ip: route.target.target_ip,
-                route: route.clone(),
-                cancel,
-            },
-        );
-        if !self.resolver.route_is_current(&route) {
-            drop(guard);
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                IngressOpenError::RouteChanged,
-            ));
-        }
+
         let stream = self
             .connector
             .connect_stream_with_activity(
@@ -776,10 +787,13 @@ impl Ingress {
 
     fn apply_route_change(&self, change: super::route_store::RouteChange) {
         {
-            let mut sessions = self.sessions.lock().unwrap();
+            let sessions = self.sessions.lock().unwrap();
             for session in sessions
-                .values_mut()
-                .filter(|session| session.instance_id == change.instance_id)
+                .values()
+                // Queued events predating admission cannot revoke a newer session.
+                .filter(|session| {
+                    session.instance_id == change.instance_id && session.revision < change.revision
+                })
             {
                 let still_current = change.current.as_ref().is_some_and(|route| {
                     route.environment_status.code == 3
@@ -794,7 +808,8 @@ impl Ingress {
                 }
             }
         }
-        self.http_pool.invalidate_instance(&change.instance_id);
+        self.http_pool
+            .invalidate_instance(&change.instance_id, change.revision);
     }
 
     fn cancel_all_sessions(&self) {
@@ -837,7 +852,7 @@ impl Ingress {
         listener: TcpListener,
         shutdown: watch::Receiver<bool>,
     ) -> io::Result<()> {
-        self.serve_http_inner(listener, None, IngressSecurity::Plaintext, shutdown)
+        self.serve_http_inner(listener, None, IngressSecurity::Plaintext, None, shutdown)
             .await
     }
 
@@ -847,8 +862,47 @@ impl Ingress {
         acceptor: TlsAcceptor,
         shutdown: watch::Receiver<bool>,
     ) -> io::Result<()> {
-        self.serve_http_inner(listener, Some(acceptor), IngressSecurity::Tls, shutdown)
-            .await
+        self.serve_http_inner(
+            listener,
+            Some(acceptor),
+            IngressSecurity::Tls,
+            None,
+            shutdown,
+        )
+        .await
+    }
+
+    pub async fn serve_listener(
+        self: Arc<Self>,
+        listener: TcpListener,
+        options: super::ListenerConfig,
+        acceptor: Option<TlsAcceptor>,
+        shutdown: watch::Receiver<bool>,
+    ) -> io::Result<()> {
+        options
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if options.tls != acceptor.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "listener TLS configuration mismatch",
+            ));
+        }
+        let security = if options.tls {
+            IngressSecurity::Tls
+        } else if options.allow_http_credentials {
+            IngressSecurity::AuthenticatedHttp
+        } else {
+            IngressSecurity::Plaintext
+        };
+        self.serve_http_inner(
+            listener,
+            acceptor,
+            security,
+            Some(Arc::new(options)),
+            shutdown,
+        )
+        .await
     }
 
     async fn serve_http_inner(
@@ -856,6 +910,7 @@ impl Ingress {
         listener: TcpListener,
         tls_acceptor: Option<TlsAcceptor>,
         ingress_security: IngressSecurity,
+        options: Option<Arc<super::ListenerConfig>>,
         mut shutdown: watch::Receiver<bool>,
     ) -> io::Result<()> {
         loop {
@@ -879,17 +934,18 @@ impl Ingress {
                     }
                     let gateway = self.clone();
                     let tls_acceptor = tls_acceptor.clone();
+                    let options = options.clone();
                     tokio::spawn(async move {
                         match tls_acceptor {
                             Some(acceptor) => {
                                 if let Some(stream) = accept_ingress_tls(acceptor, stream, peer).await {
                                     gateway
-                                        .serve_http_connection(stream, peer, ingress_security)
+                                        .serve_http_connection_with_options(stream, peer, ingress_security, options)
                                         .await;
                                 }
                             }
                             None => gateway
-                                .serve_http_connection(stream, peer, ingress_security)
+                                .serve_http_connection_with_options(stream, peer, ingress_security, options)
                                 .await,
                         }
                     });
@@ -898,6 +954,7 @@ impl Ingress {
         }
     }
 
+    #[cfg(test)]
     async fn serve_http_connection<T>(
         self: Arc<Self>,
         stream: T,
@@ -906,10 +963,37 @@ impl Ingress {
     ) where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        self.serve_http_connection_with_options(stream, peer, ingress_security, None)
+            .await;
+    }
+
+    async fn serve_http_connection_with_options<T>(
+        self: Arc<Self>,
+        stream: T,
+        peer: std::net::SocketAddr,
+        ingress_security: IngressSecurity,
+        options: Option<Arc<super::ListenerConfig>>,
+    ) where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let stream = crate::common::traffic::MeteredIo::new(stream, &self.request_metrics.traffic);
         let gateway = self;
-        let service =
-            service_fn(move |request| gateway.clone().handle_http(request, ingress_security, peer));
+        let service = service_fn(move |request: Request<Incoming>| {
+            let gateway = gateway.clone();
+            let options = options.clone();
+            async move {
+                if options
+                    .as_ref()
+                    .is_some_and(|options| !options.allows(request.method(), request.uri().path()))
+                {
+                    return Ok(plain(
+                        StatusCode::FORBIDDEN,
+                        "route is not allowed on this listener",
+                    ));
+                }
+                gateway.handle_http(request, ingress_security, peer).await
+            }
+        });
         // Official E2B transports may use cleartext HTTP/2. Protocol detection
         // does not change the listener's security identity or route admission.
         if let Err(error) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
@@ -1008,9 +1092,11 @@ impl Ingress {
         trace
             .run(async {
                 adx_observability::trace::inject_headers(request.headers_mut());
-                let handled = self.handle_http_inner(request, ingress_security, peer);
+                // Embedded lifecycle calls have large futures. Keep them off the
+                // worker stack while the renewable deadline drives polling.
+                let handled = Box::pin(self.handle_http_inner(request, ingress_security, peer));
                 let (mut response, deadline_exceeded) = if budgeted {
-                    match tokio::time::timeout_at(processing.at, handled).await {
+                    match processing.until_headers(handled).await {
                         Ok(response) => (response?, false),
                         Err(_) => (
                             processing_timeout_response(&processing, &request_id, &instance_id),
@@ -1030,12 +1116,13 @@ impl Ingress {
                 if budgeted
                     && processing.is_forwarded()
                     && !deadline_exceeded
+                    && !response.status().is_success()
                     && response.status() != StatusCode::SWITCHING_PROTOCOLS
                 {
                     let (parts, body) = response.into_parts();
                     response = Response::from_parts(
                         parts,
-                        DeadlineBody::new(body, processing.at).boxed_unsync(),
+                        DeadlineBody::new(body, processing.response_deadline()).boxed_unsync(),
                     );
                 }
                 adx_observability::trace::attribute(
@@ -1156,7 +1243,14 @@ impl Ingress {
                         tls_required()
                     } else {
                         let route = self.application_route(&request).expect("route matched");
-                        self.reverse_proxy.proxy(request, route, peer).await
+                        self.reverse_proxy
+                            .proxy_with_tls(
+                                request,
+                                route,
+                                peer,
+                                ingress_security == IngressSecurity::Tls,
+                            )
+                            .await
                     }
                 }
                 path if self.is_control_plane_path(path) => {
@@ -1391,7 +1485,9 @@ impl Ingress {
         ingress_security: IngressSecurity,
         peer: std::net::SocketAddr,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext
+        if (ingress_security == IngressSecurity::Plaintext
+            || (ingress_security != IngressSecurity::Tls
+                && is_e2b_management_path(request.uri().path())))
             && !self.e2b_http_management_allowed(request.uri().path())
         {
             return tls_required();
@@ -1403,7 +1499,14 @@ impl Ingress {
             strip_prefix: false,
             host: None,
         };
-        self.reverse_proxy.proxy(request, &route, peer).await
+        self.reverse_proxy
+            .proxy_with_tls(
+                request,
+                &route,
+                peer,
+                ingress_security == IngressSecurity::Tls,
+            )
+            .await
     }
 
     fn health_response(&self, path: &str) -> Response<ProxyBody> {
@@ -1461,7 +1564,7 @@ impl Ingress {
         if request.method() != http::Method::GET {
             return plain(StatusCode::METHOD_NOT_ALLOWED, "command watch requires GET");
         }
-        if ingress_security != IngressSecurity::Tls {
+        if ingress_security == IngressSecurity::Plaintext {
             return tls_required();
         }
         if !request
@@ -2065,39 +2168,95 @@ impl Ingress {
         if let Err(error) = self.authorize(&route, &tenant_id) {
             return Ok(error_response(error));
         }
-        let route = match self.prepare_route(route, &tenant_id).await {
+        let mut route = match self.prepare_route(route, &tenant_id).await {
             Ok(route) => route,
             Err(error) => {
                 record_ingress_error(&error);
                 return Err((error_response(error), request));
             }
         };
-        if !self.resolver.route_is_current(&route) {
-            return Err((error_response(IngressOpenError::RouteChanged), request));
-        }
         strip_hop_by_hop_headers(request.headers_mut());
-        let key = BackendHttpPoolKey {
-            relay_address: route.relay_address.clone(),
-            instance_id: route.target.instance_id.clone(),
-            workload_id: route.target.workload_id.clone(),
-            target_ip: route.target.target_ip,
-            target_port: route.target.target_port,
-        };
-        match self
-            .http_pool
-            .send_recoverable(key, request, || self.open_authorized_stream(route))
-            .await
-        {
-            Ok(mut response) => {
-                response.headers_mut().remove("x-adx-error-code");
-                strip_hop_by_hop_headers(response.headers_mut());
-                Ok(response.map(|body| {
-                    body.map_err(|error| -> BoxError { Box::new(error) })
-                        .boxed_unsync()
-                }))
+        let mut retried = false;
+        loop {
+            let Some(route_revision) = self.resolver.current_route_revision(&route) else {
+                return Err((error_response(IngressOpenError::RouteChanged), request));
+            };
+            let key = BackendHttpPoolKey {
+                route_revision,
+                relay_address: route.relay_address.clone(),
+                instance_id: route.target.instance_id.clone(),
+                workload_id: route.target.workload_id.clone(),
+                target_ip: route.target.target_ip,
+                target_port: route.target.target_port,
+            };
+            match self
+                .http_pool
+                .send_recoverable(
+                    key,
+                    request,
+                    || self.open_authorized_stream(route.clone()),
+                    || {
+                        if !self.ready()
+                            || self.resolver.current_route_revision(&route) != Some(route_revision)
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotConnected,
+                                IngressOpenError::RouteChanged,
+                            ));
+                        }
+                        Ok(())
+                    },
+                )
+                .await
+            {
+                Ok(mut response) => {
+                    response.headers_mut().remove("x-adx-error-code");
+                    strip_hop_by_hop_headers(response.headers_mut());
+                    return Ok(response.map(|body| {
+                        body.map_err(|error| -> BoxError { Box::new(error) })
+                            .boxed_unsync()
+                    }));
+                }
+                Err((error, Some(unconsumed))) => {
+                    let route_changed = matches!(&error, BackendHttpPoolError::Closed)
+                        || matches!(&error, BackendHttpPoolError::Connect(error)
+                            if matches!(error.get_ref().and_then(|e| e.downcast_ref::<IngressOpenError>()),
+                                Some(IngressOpenError::RouteChanged)));
+                    if retried || !self.ready() || !route_changed {
+                        return Err((backend_pool_error_response(error), unconsumed));
+                    }
+                    // Only an untouched request can follow the current route. Keep
+                    // its authorization scope and deadline, and retry at most once.
+                    retried = true;
+                    let mut replacement = match self
+                        .resolve_route(
+                            &route.target.instance_id,
+                            route.target.target_port,
+                            route.access_kind,
+                            route.target.request_id.clone(),
+                        )
+                        .await
+                    {
+                        Ok(route) => route,
+                        Err(error) => return Err((error_response(error), unconsumed)),
+                    };
+                    if replacement.tenant_id != route.tenant_id
+                        || replacement.tunnel_security_mode != route.tunnel_security_mode
+                        || replacement.port_forward_auth_mode != route.port_forward_auth_mode
+                        || replacement.private_service_ports != route.private_service_ports
+                        || replacement.e2b != route.e2b
+                    {
+                        return Err((error_response(IngressOpenError::Forbidden), unconsumed));
+                    }
+                    replacement.processing = route.processing.clone();
+                    route = match self.prepare_route(replacement, &tenant_id).await {
+                        Ok(route) => route,
+                        Err(error) => return Err((error_response(error), unconsumed)),
+                    };
+                    request = unconsumed;
+                }
+                Err((error, None)) => return Ok(backend_pool_error_response(error)),
             }
-            Err((error, Some(request))) => Err((backend_pool_error_response(error), request)),
-            Err((error, None)) => Ok(backend_pool_error_response(error)),
         }
     }
 
@@ -2107,7 +2266,7 @@ impl Ingress {
         ingress_security: IngressSecurity,
         target: E2bTarget,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext && !self.e2b_http_allowed() {
+        if ingress_security != IngressSecurity::Tls && !self.e2b_http_allowed() {
             return tls_required();
         }
         let request_id = header_string(&request, "x-request-id");
@@ -2133,7 +2292,7 @@ impl Ingress {
         ingress_security: IngressSecurity,
         route: RouteHandle,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext && !self.e2b_http_allowed() {
+        if ingress_security != IngressSecurity::Tls && !self.e2b_http_allowed() {
             return tls_required();
         }
         // An opaque tunnel could carry unchecked envd control requests. Execd
@@ -2174,7 +2333,11 @@ impl Ingress {
             return proxy_http(request, stream, "envd-or-application", Some(cancelled)).await;
         }
         strip_hop_by_hop_headers(request.headers_mut());
+        let Some(route_revision) = self.resolver.current_route_revision(&route) else {
+            return error_response(IngressOpenError::RouteChanged);
+        };
         let key = BackendHttpPoolKey {
+            route_revision,
             relay_address: route.relay_address.clone(),
             instance_id: route.target.instance_id.clone(),
             workload_id: route.target.workload_id.clone(),
@@ -2183,7 +2346,22 @@ impl Ingress {
         };
         match self
             .http_pool
-            .send_recoverable(key, request, || self.open_service_http_stream(route))
+            .send_recoverable(
+                key,
+                request,
+                || self.open_service_http_stream(route.clone()),
+                || {
+                    if !self.ready()
+                        || self.resolver.current_route_revision(&route) != Some(route_revision)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            IngressOpenError::RouteChanged,
+                        ));
+                    }
+                    Ok(())
+                },
+            )
             .await
         {
             Ok(mut response) => {
@@ -2603,10 +2781,8 @@ fn backend_pool_error_response(error: BackendHttpPoolError) -> Response<ProxyBod
             StatusCode::TOO_MANY_REQUESTS,
             "environment HTTP pool is saturated",
         ),
-        BackendHttpPoolError::Closed => plain(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "environment HTTP pool is closed",
-        ),
+        // Closed is returned only before send_request, so retry is unambiguous.
+        BackendHttpPoolError::Closed => error_response(IngressOpenError::RouteChanged),
         BackendHttpPoolError::Connect(error) => error_response(IngressOpenError::Connect(error)),
         BackendHttpPoolError::Handshake(error) | BackendHttpPoolError::Request(error) => {
             plain(StatusCode::BAD_GATEWAY, &error.to_string())
@@ -2681,7 +2857,10 @@ where
     if let Some(processing) = request.extensions().get::<ProcessingDeadline>() {
         processing.forwarded();
     }
-    let mut response = match sender.send_request(request).await {
+    let mut response = match sender
+        .send_request(super::processing::forwarding_request(request))
+        .await
+    {
         Ok(response) => response,
         Err(error) => return plain(StatusCode::BAD_GATEWAY, &error.to_string()),
     };
@@ -2812,6 +2991,7 @@ pub enum IngressOpenError {
 }
 
 struct ActiveSession {
+    revision: u64,
     instance_id: String,
     workload_id: String,
     relay_address: String,
@@ -2948,6 +3128,7 @@ fn should_log_access(status: StatusCode, duration_us: u64) -> bool {
 fn ingress_security_name(security: IngressSecurity) -> &'static str {
     match security {
         IngressSecurity::Plaintext => "plaintext",
+        IngressSecurity::AuthenticatedHttp => "authenticated_http",
         IngressSecurity::Tls => "tls",
     }
 }

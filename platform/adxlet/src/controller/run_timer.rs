@@ -186,7 +186,7 @@ impl Controller {
             .action;
         self.operation_intent(adx_core::observation::OperationIntent::Policy);
         let result = match action {
-            RunExpiryAction::Delete => self.delete().await,
+            RunExpiryAction::Delete => self.delete(false).await,
             RunExpiryAction::Pause => {
                 let policy = self.record.spec.lifecycle.pause.clone().unwrap_or_default();
                 let prefix = format!(

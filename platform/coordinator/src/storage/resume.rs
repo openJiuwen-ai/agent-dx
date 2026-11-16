@@ -1,6 +1,14 @@
 //! Durable demand and placement decisions share the Environment's Redis CAS.
 use super::*;
 
+/// Admission is read from the same fenced snapshot as the Environment. A
+/// planned migration is waiting, not a failed resume or a new wake intent.
+pub(crate) enum ResumeAdmission {
+    Upgrading,
+    Running(StoredEnvironment),
+    Demanded(StoredEnvironment),
+}
+
 impl Session {
     pub async fn retire_dormant(&self, expected: &StoredEnvironment) -> Result<EnvironmentRecord> {
         let stored = self.get(&expected.spec.id).await?;
@@ -23,6 +31,8 @@ impl Session {
         deleted.last_operation = None;
         self.commit(deleted).await
     }
+    /// Record ordinary wake demand. Upgrade-aware RPC callers use admission
+    /// directly so a read-only migration fence can wait within their deadline.
     pub async fn request_resume(&self, id: &str, now: u64) -> Result<StoredEnvironment> {
         self.request_resume_with_timeout(id, now, None).await
     }
@@ -34,12 +44,40 @@ impl Session {
         now: u64,
         run_timeout_seconds: Option<u64>,
     ) -> Result<StoredEnvironment> {
+        match self.admit_resume(id, now, "", run_timeout_seconds).await? {
+            ResumeAdmission::Running(stored) | ResumeAdmission::Demanded(stored) => Ok(stored),
+            ResumeAdmission::Upgrading => Err(Error::Unavailable(
+                "environment is being evacuated; retry after ownership settles".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn admit_resume(
+        &self,
+        id: &str,
+        now: u64,
+        expected_runtime_id: &str,
+        run_timeout_seconds: Option<u64>,
+    ) -> Result<ResumeAdmission> {
         let field = format!("environment:{id}");
         for _ in 0..ATTEMPTS {
-            let [header_value, value] = self.store.fields([HEADER.into(), field.clone()]).await?;
+            let [header_value, value, upgrade_value] = self
+                .store
+                .fields([HEADER.into(), field.clone(), UPGRADE.into()])
+                .await?;
             let header = self.header(&header_value)?;
+            let upgrade = upgrade_value
+                .as_deref()
+                .map(decode::<UpgradeTask>)
+                .transpose()?;
             let mut stored: StoredEnvironment = decode(value.as_deref().ok_or(Error::NotFound)?)?;
             stored.validate()?;
+            if upgrade
+                .as_ref()
+                .is_some_and(|task| task.blocks_resume(&stored))
+            {
+                return Ok(ResumeAdmission::Upgrading);
+            }
             if let Some(seconds) = run_timeout_seconds {
                 let mut policy = stored.spec.run_policy.clone().ok_or_else(|| {
                     Error::Invalid("run policy required for resume duration".into())
@@ -54,6 +92,17 @@ impl Session {
             ) {
                 return Err(Error::Conflict);
             }
+            // A stale Ingress binding may already have a published replacement.
+            // Check the upgrade fence first, including unsettled operations on
+            // the target, before returning that execution without waking it.
+            if !stored.invalidated
+                && stored.resume.is_none()
+                && record.state == EnvironmentState::Running
+                && !expected_runtime_id.is_empty()
+                && record.runtime.id != expected_runtime_id
+            {
+                return Ok(ResumeAdmission::Running(stored));
+            }
             if record.state == EnvironmentState::Paused
                 && record
                     .checkpoint
@@ -65,7 +114,7 @@ impl Session {
             }
             if let Some(intent) = &mut stored.resume {
                 if intent.retry_after_unix_seconds == 0 || now < intent.retry_after_unix_seconds {
-                    return Ok(stored);
+                    return Ok(ResumeAdmission::Demanded(stored));
                 }
                 // Keep the operation identity while admitting a new capacity round.
                 intent.local_rejected = false;
@@ -80,16 +129,15 @@ impl Session {
                     retry_after_unix_seconds: 0,
                 });
             }
-            if self
-                .store
-                .object_cas(
-                    header_value.as_deref().ok_or(Error::Conflict)?,
-                    &header,
-                    Some((&field, value.as_deref(), encode(&stored)?)),
-                )
-                .await?
+            if Box::pin(self.store.object_cas_checked(
+                &header,
+                Some((&field, value.as_deref(), encode(&stored)?)),
+                None,
+                &[(UPGRADE.into(), upgrade_value.clone())],
+            ))
+            .await?
             {
-                return Ok(stored);
+                return Ok(ResumeAdmission::Demanded(stored));
             }
         }
         Err(Error::Unavailable("resume demand contention".into()))

@@ -332,7 +332,7 @@ pub struct MknodRequest {
     pub caller: CallerContext,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct InodeAttrUpdate {
     pub mode: Option<u32>,
     pub uid: Option<u32>,
@@ -344,13 +344,18 @@ pub struct InodeAttrUpdate {
     pub timestamps_now: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// One attribute change. The whole request is digested
+/// (`FormatKind::MetaRequestDigest`) so a reused operation id cannot replay
+/// another change.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SetInodeAttrRequest {
     pub caller_id: String,
     pub operation_id: OperationId,
     pub caller: CallerContext,
     pub inode_id: InodeId,
-    pub expected_inode_revision: u64,
+    /// `Some`: compare-and-set against this revision. `None`: apply to the
+    /// current inode, retrying benign revision drift inside Meta (B4).
+    pub expected_inode_revision: Option<u64>,
     pub update: InodeAttrUpdate,
 }
 
@@ -494,17 +499,21 @@ pub struct ChunkObject {
     pub encoding: ChunkEncoding,
 }
 
+impl ChunkId {
+    pub(crate) fn crc32c_write_generation(&self) -> Option<&str> {
+        let (generation, object) = self.0.strip_prefix("crc32c-v2-")?.split_once('-')?;
+        (is_lower_hex(generation, 32) && is_lower_hex(object, 32)).then_some(generation)
+    }
+}
+
 impl ChunkObject {
     /// Birth generation of an independently named object: a CRC object
     /// (`crc32c-v2-<generation>-<object>`) or a generational BLAKE3 object
     /// (`blake3-v2-<generation>-<root>-<length>`, S3). Repairs retain it.
     pub fn write_generation(&self) -> Option<&str> {
-        if let Some(value) = self.id.0.strip_prefix("crc32c-v2-") {
-            let (generation, object) = value.split_once('-')?;
-            return (is_lower_hex(generation, 32) && is_lower_hex(object, 32))
-                .then_some(generation);
-        }
-        content_addressed_parts(&self.id).and_then(|parts| parts.generation)
+        self.id
+            .crc32c_write_generation()
+            .or_else(|| content_addressed_parts(&self.id).and_then(|parts| parts.generation))
     }
 
     /// The generational BLAKE3 identity of `body`'s standard root, born in the
@@ -671,6 +680,23 @@ pub fn external_object_key(
         &digest[..2],
         chunk_id.0
     ))
+}
+
+/// Suffix of the optional BLAKE3 outboard sidecar object stored beside a
+/// chunk object.
+pub const EXTERNAL_OUTBOARD_SUFFIX: &str = ".bao";
+
+/// Key of a chunk's optional BLAKE3 outboard sidecar: the chunk object's key
+/// plus [`EXTERNAL_OUTBOARD_SUFFIX`]. The sidecar is derived data in the
+/// `NodeChunkSidecar` encoding; it is listed and deleted with its chunk.
+pub fn external_outboard_key(
+    store_id: &str,
+    generation: &str,
+    chunk_id: &ChunkId,
+) -> afs_error::Result<String> {
+    let mut key = external_object_key(store_id, generation, chunk_id)?;
+    key.push_str(EXTERNAL_OUTBOARD_SUFFIX);
+    Ok(key)
 }
 
 /// Key prefix of every chunk object of one store generation.
