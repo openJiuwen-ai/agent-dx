@@ -363,6 +363,8 @@ struct RootRuntime {
 
 enum GrantPhase {
     Active(RootGrant),
+    /// 删除已开始：拒绝新准入，但保留原授权供物理目录判空失败后恢复。
+    Deleting(RootGrant),
     Invalid,
 }
 
@@ -546,7 +548,7 @@ impl Drop for RootUse {
     }
 }
 
-/// OwnerFs 内部的根管理器。缓存只含已激活根；预留中的根不得进入。
+/// OwnerFs 内部的根管理器。缓存只含已激活或正在删除的根；预留中的根不得进入。
 /// 本机目录存在本身不构成授权。Meta 不可达且无有效授权时须拒绝访问。
 pub struct RootManager {
     local_node_id: String,
@@ -1484,8 +1486,10 @@ impl RootManager {
         state: &mut RootRuntime,
         revocation: &HomeRootRevocation,
     ) -> bool {
-        let GrantPhase::Active(grant) = &state.phase else {
-            return false;
+        // Deleting 也持有原授权：删除期间收到撤销时同样要封闭，不能让它被回滚恢复。
+        let grant = match &state.phase {
+            GrantPhase::Active(grant) | GrantPhase::Deleting(grant) => grant,
+            GrantPhase::Invalid => return false,
         };
         if grant.id != revocation.root_id
             || grant.epoch != revocation.root_epoch
@@ -1559,7 +1563,9 @@ impl RootManager {
     }
 
     /// D4: 删除空 root；递归删除由 `delete_root_with` 的 `recursive` 参数指定。
-    /// 空目录删除沿用 revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog。
+    /// 空目录删除以物理目录的原子判空为决策点：封闭准入 → 物理目录 → Meta
+    /// deactivate → catalog → 缓存移除。判空失败时恢复授权，workspace 保持可用；
+    /// 之后的失败只向前收敛，由重试或启动 reconcile 补完。
     /// 递归删除先 rename 到 trash 隔离，再撤销准入并条件注销归属；物理回收在后台执行。
     /// 隔离后的失败保留 trash 与 catalog，供同一代重试。全部步骤持有 workspace 锁。
     /// `expected_epoch` 不匹配时返回 NODE_OWNER_STALE_HANDLE，不执行删除。
@@ -1568,9 +1574,10 @@ impl RootManager {
     }
 
     /// 与 [`RootManager::delete_root`] 相同，另在 workspace 锁内执行调用方的两个步骤：
-    /// `before` 在 epoch 检查之后、目录移除之前（递归删除时在目录隔离成功之后），
-    /// `after` 在 catalog 移除之后。同名创建
+    /// `before` 在 epoch 检查之后、目录移除之前（空目录删除时在封闭准入之后；递归
+    /// 删除时在目录隔离成功之后），`after` 在 catalog 移除之后。同名创建
     /// 同样持有该锁，两个步骤因此只会作用于被删版本，不会影响同名重建的新 workspace。
+    /// `before` 的效果（例如已卸载的 egress bind）在空目录删除失败时由调用方恢复。
     pub fn delete_root_with(
         &self,
         id: &RootId,
@@ -1603,7 +1610,8 @@ impl RootManager {
     }
 
     /// 执行步骤见 [`RootManager::delete_root`] 文档；每步成功后记录 info，
-    /// 任一步失败时提前返回，统一由外层 `delete_root` 记录失败日志。
+    /// 任一步失败时提前返回（Meta 下线之后的本地收尾除外），统一由外层
+    /// `delete_root` 记录结果日志。
     fn delete_root_inner(
         &self,
         id: &RootId,
@@ -1629,54 +1637,117 @@ impl RootManager {
         if recursive {
             return self.isolate_and_deactivate(id, before, after);
         }
-        if !self
+        // 1. 并发 rmdir 的线性化点：另一个删除完成缓存移除后，这里查不到 root。
+        let root = self
             .roots
             .read()
             .map_err(|_| invalid_grant("root cache lock poisoned"))?
-            .contains_key(id)
-        {
-            return Err(Error::coded(
-                afs_error::NODE_VFS_NOT_FOUND,
-                "root not found for deletion",
-            ));
-        }
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::coded(afs_error::NODE_VFS_NOT_FOUND, "root not found for deletion")
+            })?;
         let record = self
             .catalog
             .lookup_root(id)?
             .ok_or_else(|| invalid_grant("root catalog record not found"))?;
-        before()?;
-        self.revoke_root(id);
 
-        // 空目录删除先从缓存移除。
-        {
-            let mut roots = self
-                .roots
-                .write()
-                .map_err(|_| invalid_grant("root cache lock poisoned"))?;
-            let removed = roots.remove(id);
-            if removed.is_none() {
-                return Err(Error::coded(
-                    afs_error::NODE_VFS_NOT_FOUND,
-                    "root not found for deletion",
-                ));
+        // 2. 封闭新准入并保留原授权；before 失败时恢复到调用前的状态。
+        self.begin_delete(&root)?;
+        if let Err(error) = before() {
+            self.rollback_delete(&root)?;
+            return Err(error);
+        }
+
+        // 3. 决策点：内核原子判空后删除。只有 remove_dir 本身失败才回滚；它成功后的
+        //    fsync 失败只影响持久性，目录已经不在了。
+        match self.disk.remove_dir(&record.data_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                self.rollback_delete(&root)?;
+                return Err(Error::from(error));
             }
         }
-        afs_logging::info!("root.delete_root.cache_removed"; "root_id" => ?id);
+        afs_logging::info!("root.delete_root.dir_removed"; "root_id" => ?id, "data_dir" => ?record.data_dir);
+        self.disk.sync_root().map_err(Error::from)?;
 
-        // 空目录删除沿用先注销 Meta、再移除目录的顺序。
-        self.meta
-            .deactivate_root(id, record.epoch, &self.local_node_id, &self.session_id)?;
+        // 4. Meta deactivate。数据已删，失败只补完不回滚（见 `deactivate_removed_root`）。
+        self.deactivate_removed_root(&record)?;
         afs_logging::info!("root.delete_root.meta_deactivated"; "root_id" => ?id, "epoch" => record.epoch);
 
-        // 目录清理完成后才移除 catalog。
-        self.remove_abandoned_dir(&record.data_dir)?;
-        afs_logging::info!("root.delete_root.dir_removed"; "root_id" => ?id, "data_dir" => ?record.data_dir);
+        // 5. 清除 catalog 条目。Meta 已下线即删除达成，剩下的只是本机记账：清理失败
+        //    只告警，残留记录由启动 reconcile 按"Meta 已无该 id"回收。
+        match self.catalog.remove_prepared_root(&record) {
+            Ok(()) => {
+                afs_logging::info!("root.delete_root.catalog_removed"; "root_id" => ?id);
+            }
+            Err(error) => afs_logging::warn!(
+                "root.delete_root.catalog_cleanup_failed";
+                "root_id" => ?id, "epoch" => record.epoch, "error" => error.to_string()
+            ),
+        }
 
-        // 5. 清除 catalog 条目。
-        self.catalog.remove_prepared_root(&record)?;
-        afs_logging::info!("root.delete_root.catalog_removed"; "root_id" => ?id);
+        // 6. 从缓存移除，之后新请求按"root 不存在"处理。
+        self.roots
+            .write()
+            .map_err(|_| invalid_grant("root cache lock poisoned"))?
+            .remove(id);
+        afs_logging::info!("root.delete_root.cache_removed"; "root_id" => ?id);
 
         after()
+    }
+
+    /// 决策点之后的下线。RPC 超时无法区分"已提交"与"未提交"：lookup 查不到、或
+    /// 名字已被新代次取代，都视为已下线；其余失败原样返回。
+    fn deactivate_removed_root(&self, record: &LocalRootRecord) -> Result<()> {
+        let error = match self.meta.deactivate_root(
+            &record.id,
+            record.epoch,
+            &self.local_node_id,
+            &self.session_id,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        match self.meta.lookup_root(&record.id) {
+            Ok(None) => Ok(()),
+            Ok(Some(location)) if location.epoch > record.epoch => Ok(()),
+            _ => Err(error),
+        }
+    }
+
+    /// 删除开始时封闭新准入，并保留原授权供判空失败后恢复；已撤销的 root
+    /// 保持 `Invalid`，没有可恢复的授权。
+    fn begin_delete(&self, root: &LocalRoot) -> Result<()> {
+        self.update_phase(root, |phase| match phase {
+            GrantPhase::Active(grant) => GrantPhase::Deleting(grant),
+            other => other,
+        })
+    }
+
+    /// 判空失败时恢复授权；期间收到撤销或控制会话失效会把状态改成 `Invalid`，
+    /// 此时不能恢复。
+    fn rollback_delete(&self, root: &LocalRoot) -> Result<()> {
+        self.update_phase(root, |phase| match phase {
+            GrantPhase::Deleting(grant) => GrantPhase::Active(grant),
+            other => other,
+        })
+    }
+
+    fn update_phase(
+        &self,
+        root: &LocalRoot,
+        update: impl FnOnce(GrantPhase) -> GrantPhase,
+    ) -> Result<()> {
+        let mut state = root
+            .state
+            .lock()
+            .map_err(|_| invalid_grant("root grant lock poisoned"))?;
+        // 先取出再写回，避免同时借用并修改 phase。
+        let phase = std::mem::replace(&mut state.phase, GrantPhase::Invalid);
+        state.phase = update(phase);
+        Ok(())
     }
 
     /// 递归删除：workspace 锁内核对 Meta 与 catalog，rename 到 trash 隔离后
@@ -3095,6 +3166,7 @@ mod tests {
         active_prepare_id: Option<String>,
         lose_activate_reply: bool,
         fail_deactivate: bool,
+        lose_deactivate_reply: bool,
     }
 
     #[derive(Default)]
@@ -3171,6 +3243,9 @@ mod tests {
                 .is_some_and(|location| &location.id == root_id)
             {
                 state.active = None;
+            }
+            if std::mem::take(&mut state.lose_deactivate_reply) {
+                return Err(unavailable_grant("injected lost Deactivate reply"));
             }
             Ok(())
         }
@@ -3777,7 +3852,8 @@ mod tests {
         assert!(meta.0.lock().unwrap().active.is_some());
         assert!(disk.metadata(&data_dir).is_ok());
 
-        // 两个步骤都在 workspace 锁内执行：before 时 root 仍 active，after 时已全部删除。
+        // 两个步骤都在 workspace 锁内执行：before 时 root 已封闭准入但仍待在缓存中，
+        // after 时已全部删除。
         let steps = std::cell::RefCell::new(Vec::new());
         manager
             .delete_root_with(
@@ -3786,13 +3862,15 @@ mod tests {
                 false,
                 || {
                     assert!(manager.workspace_lock(&id).unwrap().try_lock().is_err());
-                    assert!(manager.has_active_local_root(&id));
+                    assert!(!manager.has_active_local_root(&id));
+                    assert!(manager.local_root_data_dir(&id).unwrap().is_some());
                     steps.borrow_mut().push("before");
                     Ok(())
                 },
                 || {
                     assert!(manager.workspace_lock(&id).unwrap().try_lock().is_err());
                     assert!(manager.cached_local_roots().unwrap().is_empty());
+                    assert!(manager.local_root_data_dir(&id).unwrap().is_none());
                     assert!(meta.0.lock().unwrap().active.is_none());
                     steps.borrow_mut().push("after");
                     Ok(())
@@ -3869,8 +3947,10 @@ mod tests {
         }
     }
 
+    /// 物理目录判空失败是 rmdir 的预期失败：不改变已有状态，Meta、catalog、
+    /// 缓存和目录都保留，授权恢复可用，清空后重试可以删除。
     #[test]
-    fn delete_root_keeps_catalog_when_physical_dir_not_empty() {
+    fn delete_root_rolls_back_when_physical_dir_not_empty() {
         let temp = tempfile::tempdir().unwrap();
         let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
         let meta = Arc::new(RecoveryMeta::default());
@@ -3911,45 +3991,24 @@ mod tests {
         // 制造非空目录：删除必然 ENOTEMPTY。
         std::fs::write(temp.path().join(data_dir.as_path()).join("payload"), b"x").unwrap();
 
-        // 删除在物理目录一步失败：Meta 已 deactivate、缓存已移除，
-        // 但 catalog 记录必须保留，否则数据成为无法重新准入的孤儿。
+        // 失败发生在决策点：Meta 未下线、缓存未移除、授权恢复。
         let err = manager.delete_root(&id, None).unwrap_err();
         assert_eq!(err.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
-
-        // Meta 记录已删 → 名字从所有节点消失。
-        assert!(meta.0.lock().unwrap().active.is_none());
-        // 缓存已移除 → 本节点不再准入。
-        assert!(manager.cached_local_roots().unwrap().is_empty());
-        // 物理目录仍在（对端仍持有，删不掉）。
+        assert!(meta.0.lock().unwrap().active.is_some());
+        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
+        assert!(manager.enter_root(&id, RootRight::Lookup).is_ok());
         assert!(temp.path().join(data_dir.as_path()).exists());
 
-        // catalog 记录必须保留（H19）：它是"该目录仍待回收"的唯一持久证据。
+        // catalog 记录同样保留。
         drop(manager);
         let locked = LocalFsRootCatalog::new(disk.clone())
             .lock_and_open()
             .unwrap();
-        assert_eq!(
-            locked.scan_roots().unwrap().len(),
-            1,
-            "catalog entry must survive so reclaim can find the directory"
-        );
+        assert_eq!(locked.scan_roots().unwrap().len(), 1);
         drop(locked);
 
-        // 重启 reconcile 也必须保留该条目，不能像旧实现那样丢弃。
-        let manager = RootManager::open(
-            "node-a".into(),
-            "session-a".into(),
-            meta.clone(),
-            disk.clone(),
-        )
-        .unwrap();
-        assert!(manager.cached_local_roots().unwrap().is_empty());
-        assert!(temp.path().join(data_dir.as_path()).exists());
-
-        // 启动 reconcile 有 Meta 全量视角：该 root 已不在 active 集合里。
-        // 目录清空后（对端释放句柄），记录与目录一并收敛掉。
+        // 写入方退出后重试，删除完成。
         std::fs::remove_file(temp.path().join(data_dir.as_path()).join("payload")).unwrap();
-        drop(manager);
         let manager = RootManager::open(
             "node-a".into(),
             "session-a".into(),
@@ -3957,17 +4016,279 @@ mod tests {
             disk.clone(),
         )
         .unwrap();
-        assert!(manager.cached_local_roots().unwrap().is_empty());
+        manager.delete_root(&id, None).unwrap();
         assert!(!temp.path().join(data_dir.as_path()).exists());
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        assert!(meta.0.lock().unwrap().active.is_none());
 
         drop(manager);
         let locked = LocalFsRootCatalog::new(disk.clone())
             .lock_and_open()
             .unwrap();
-        assert!(
-            locked.scan_roots().unwrap().is_empty(),
-            "startup reconciliation must drain the catalog entry"
+        assert!(locked.scan_roots().unwrap().is_empty());
+    }
+
+    /// 删除期间收到 Meta 撤销：回滚不能把已撤销的授权恢复成可用。
+    #[test]
+    fn delete_rollback_keeps_grant_revoked_during_delete_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("job");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        meta.0.lock().unwrap().active = Some(RootLocation {
+            id: id.clone(),
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+        });
+        meta.0.lock().unwrap().active_prepare_id = Some("prepare-1:session-a".into());
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1:session-a".into(),
+            })
+            .unwrap();
+        drop(locked);
+        std::fs::write(temp.path().join(data_dir.as_path()).join("payload"), b"x").unwrap();
+
+        let manager = RootManager::open(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        let revocation = HomeRootRevocation {
+            command_id: "cmd-during-delete".into(),
+            root_id: id.clone(),
+            root_epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+            access_generation: 1,
+        };
+        let err = manager
+            .delete_root_with(
+                &id,
+                None,
+                false,
+                || {
+                    assert!(manager.revoke_matching_home(&revocation).unwrap());
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+        assert!(!manager.has_active_local_root(&id));
+        let error = manager
+            .enter_root(&id, RootRight::Lookup)
+            .err()
+            .expect("revoked grant must stay unusable");
+        assert_eq!(error.code(), afs_error::NODE_OWNER_GRANT_UNAVAILABLE);
+        assert!(meta.0.lock().unwrap().active.is_some());
+        assert!(temp.path().join(data_dir.as_path()).exists());
+    }
+
+    /// 物理目录删除成功、Meta 下线失败：数据已删，不回滚，保持 catalog 与缓存，
+    /// 由启动 reconcile 的 zombie 检测完成下线。
+    #[test]
+    fn delete_root_waits_for_startup_reconcile_when_meta_deactivate_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("job");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        meta.0.lock().unwrap().active = Some(RootLocation {
+            id: id.clone(),
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+        });
+        meta.0.lock().unwrap().active_prepare_id = Some("prepare-1:session-a".into());
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1:session-a".into(),
+            })
+            .unwrap();
+        drop(locked);
+
+        let manager = RootManager::open(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        meta.0.lock().unwrap().fail_deactivate = true;
+
+        let err = manager.delete_root(&id, None).unwrap_err();
+        assert_eq!(err.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+        // 数据已删：不再回滚，缓存保留但拒绝新准入。
+        assert!(!temp.path().join(data_dir.as_path()).exists());
+        assert!(meta.0.lock().unwrap().active.is_some());
+        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
+        assert!(!manager.has_active_local_root(&id));
+
+        // catalog 记录保留，作为启动 reconcile 的输入。
+        drop(manager);
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        assert_eq!(locked.scan_roots().unwrap().len(), 1);
+        drop(locked);
+
+        // 重启后 zombie 检测补完下线。
+        let manager = RootManager::open(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        assert!(meta.0.lock().unwrap().active.is_none());
+
+        drop(manager);
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        assert!(locked.scan_roots().unwrap().is_empty());
+    }
+
+    /// Meta 已提交下线但回包丢失：lookup 确认记录已不在，删除按成功收敛。
+    #[test]
+    fn delete_root_treats_lost_deactivate_reply_as_deactivated() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("job");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        meta.0.lock().unwrap().active = Some(RootLocation {
+            id: id.clone(),
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+        });
+        meta.0.lock().unwrap().active_prepare_id = Some("prepare-1:session-a".into());
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1:session-a".into(),
+            })
+            .unwrap();
+        drop(locked);
+
+        let manager = RootManager::open(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        meta.0.lock().unwrap().lose_deactivate_reply = true;
+
+        manager.delete_root(&id, None).unwrap();
+        assert!(!temp.path().join(data_dir.as_path()).exists());
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        assert!(meta.0.lock().unwrap().active.is_none());
+
+        drop(manager);
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        assert!(locked.scan_roots().unwrap().is_empty());
+    }
+
+    /// Meta 上的名字已被新代次取代：epoch 1 的下线失败于 identity mismatch，
+    /// lookup 看到更新的 epoch 后按已下线处理，不触碰新代次。
+    #[test]
+    fn delete_root_treats_newer_meta_epoch_as_deactivated() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("job");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        meta.0.lock().unwrap().active = Some(RootLocation {
+            id: id.clone(),
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+        });
+        meta.0.lock().unwrap().active_prepare_id = Some("prepare-1:session-a".into());
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1:session-a".into(),
+            })
+            .unwrap();
+        drop(locked);
+
+        let manager = RootManager::open(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        meta.0.lock().unwrap().active = Some(RootLocation {
+            id: id.clone(),
+            epoch: 2,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+        });
+
+        manager.delete_root(&id, None).unwrap();
+        assert!(!temp.path().join(data_dir.as_path()).exists());
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        assert_eq!(
+            meta.0
+                .lock()
+                .unwrap()
+                .active
+                .as_ref()
+                .map(|location| location.epoch),
+            Some(2)
         );
+
+        drop(manager);
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        assert!(locked.scan_roots().unwrap().is_empty());
     }
 
     /// H19：物理删除成功后，catalog 条目应与目录一同消失，不残留待回收项。
@@ -4017,6 +4338,108 @@ mod tests {
             .lock_and_open()
             .unwrap();
         assert!(locked.scan_roots().unwrap().is_empty());
+    }
+
+    /// 复现 `LocalFsRootCatalog::remove_prepared_root` 的失败形状：记录文件已经
+    /// 删掉，紧随其后的目录 fsync 返回错误。
+    struct RemoveThenFailCatalog {
+        inner: Box<dyn LockedLocalRootCatalog>,
+    }
+
+    impl LockedLocalRootCatalog for RemoveThenFailCatalog {
+        fn persist_prepared_root(&self, record: &LocalRootRecord) -> Result<()> {
+            self.inner.persist_prepared_root(record)
+        }
+
+        fn remove_prepared_root(&self, record: &LocalRootRecord) -> Result<()> {
+            self.inner.remove_prepared_root(record)?;
+            Err(Error::from(std::io::Error::other(
+                "injected catalog fsync failure",
+            )))
+        }
+
+        fn scan_roots(&self) -> Result<Vec<LocalRootRecord>> {
+            self.inner.scan_roots()
+        }
+
+        fn lookup_root(&self, id: &RootId) -> Result<Option<LocalRootRecord>> {
+            self.inner.lookup_root(id)
+        }
+    }
+
+    /// Meta 下线即删除达成：catalog 清理失败不能把缓存条目留下，否则重试删除
+    /// 永远停在 catalog 查找、同名重建又被 "root is already cached" 挡住，只能重启。
+    #[test]
+    fn delete_root_succeeds_when_catalog_cleanup_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("job");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        meta.0.lock().unwrap().active = Some(RootLocation {
+            id: id.clone(),
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+        });
+        meta.0.lock().unwrap().active_prepare_id = Some("prepare-1:session-a".into());
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1:session-a".into(),
+            })
+            .unwrap();
+        let manager = RootManager::open_with_catalog(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+            Box::new(RemoveThenFailCatalog { inner: locked }),
+        )
+        .unwrap();
+        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
+
+        // 删除达成：目录与 Meta 记录都已消失，catalog 清理失败只告警。
+        manager.delete_root(&id, None).unwrap();
+        assert!(!temp.path().join(data_dir.as_path()).exists());
+        assert!(meta.0.lock().unwrap().active.is_none());
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        assert!(manager.local_root_data_dir(&id).unwrap().is_none());
+
+        // 名字不再被缓存挡住：同一 root_id 的新一代可以重新进入缓存。
+        let next_dir = root_data_dir(name, 2).unwrap();
+        disk.mkdir(&next_dir, 0o700).unwrap();
+        manager
+            .cache_local_root(
+                &LocalRootRecord {
+                    id: id.clone(),
+                    name: name.into(),
+                    epoch: 2,
+                    data_dir: next_dir,
+                    local_prepare_id: "prepare-2:session-a".into(),
+                },
+                RootGrant {
+                    id: id.clone(),
+                    epoch: 2,
+                    home_node_id: "node-a".into(),
+                    home_session_id: "session-a".into(),
+                    holder_node_id: "node-a".into(),
+                    session_id: "session-a".into(),
+                    access_generation: 1,
+                    rights: vec![RootRight::Lookup],
+                    fencing_token: "token".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
     }
 }
 

@@ -5337,8 +5337,8 @@ impl LocalOwnerFs {
     /// D4: 删除整个 root 目录（spec §5.4）。本机是 Home 时直接删除，否则转发给 Home。
     fn rmdir_root(&self, ctx: &RequestContext, name: &OsStr) -> Result<()> {
         // 1. 解析 root_id。并发 rmdir 的第二个调用在这里已找不到 name
-        //    条目（第一个调用完成 state.remove_root 后），返回 ENOENT，
-        //    与 delete_root 的缓存移除线性化点一致。
+        //    条目（第一个调用完成 state.remove_root 后），返回 ENOENT；本机删除
+        //    的线性化点是 delete_root 在 workspace 锁内的缓存成员检查。
         let (root_id, root_identity) = {
             let state = self.state.lock().map_err(|_| poisoned())?;
             let inode = state.root_names.get(name).ok_or_else(|| {
@@ -5372,10 +5372,9 @@ impl LocalOwnerFs {
         }
     }
 
-    /// 只结束空 workspace：`delete_root` 在 Meta deactivate 之后才删除物理目录，
-    /// 非空目录若走到那一步，ENOTEMPTY 返回时 workspace 已经下线。这里在任何删除步骤
-    /// 之前拒绝；检查与删除之间新写入的文件仍会走到上述路径。
-    /// 目录已不存在时交给 `delete_root` 收敛残留记录。
+    /// 快速失败：明显非空的 workspace 不必卸载 bind 就拒绝。判空与删除不是原子的，
+    /// 正确性由 `delete_root` 在物理目录一步的原子判空和失败回滚保证；目录已不存在
+    /// 时交给 `delete_root` 收敛残留记录。
     fn ensure_root_empty(&self, data_dir: &StoragePath) -> Result<()> {
         match self.disk.read_dir(data_dir) {
             Ok(entries) if !entries.is_empty() => Err(Error::coded(
@@ -5396,8 +5395,8 @@ impl LocalOwnerFs {
         root_id: &RootId,
         expected_root: &files::FileIdentity,
     ) -> Result<()> {
-        // 缓存里没有、Meta 却指向本机：本机的删除已过缓存移除这个线性化点，由该次删除
-        // 负责清理状态；它在 Meta deactivate 失败时留下的残留由启动时的 zombie 检测清理。
+        // 缓存里没有、Meta 却指向本机：递归删除先移出缓存再下线 Meta，下线失败会停在
+        // 这里。不能把删除转发给 Home 自己。
         if self
             .roots
             .lookup_root_location(root_id)?
@@ -5470,6 +5469,7 @@ impl LocalOwnerFs {
     }
 
     /// 在 workspace 锁内卸载 bind、删除该 epoch，再清理对应的 inode/cache 状态。
+    /// 失败时恢复已卸载的 egress 通道。
     fn delete_local_root(
         &self,
         root_id: &RootId,
@@ -5477,25 +5477,63 @@ impl LocalOwnerFs {
         root_identity: Option<&files::FileIdentity>,
         recursive: bool,
     ) -> Result<()> {
-        // 2. 卸载活跃 bind mount。detach 失败（如活跃 fd 导致 EBUSY）时
-        //    request_unmount 记录日志并保留条目，不阻塞删除流程；物理目录
-        //    删除若因残留挂载失败，由下次启动的 reconcile 重试。
+        // 卸载活跃 bind mount。detach 失败（如活跃 fd 导致 EBUSY）时
+        // request_unmount 记录日志并保留条目，不阻塞删除流程。
+        let unmounted = std::cell::Cell::new(false);
         let unmount = || {
             if let Some(mm) = &self.mount_manager {
                 mm.request_unmount(root_id)?;
             }
+            unmounted.set(true);
             afs_logging::info!("ownerfs.rmdir_root.unmounted"; "root_id" => ?root_id);
             Ok(())
         };
 
         let clean = || self.retire_root_state(root_id, expected_epoch, root_identity);
 
-        // RootManager 在清理物理目录及控制记录之后执行索引回收。
-        self.roots
-            .delete_root_with(root_id, expected_epoch, recursive, unmount, clean)?;
-        afs_logging::info!("ownerfs.rmdir_root.root_deleted"; "root_id" => ?root_id);
+        let result =
+            self.roots
+                .delete_root_with(root_id, expected_epoch, recursive, unmount, clean);
+        match result {
+            Ok(()) => {
+                afs_logging::info!("ownerfs.rmdir_root.root_deleted"; "root_id" => ?root_id);
+                Ok(())
+            }
+            Err(error) => {
+                // 只有实际卸载过的 bind 才需要恢复；更早失败的请求没有副作用。
+                if unmounted.get() {
+                    self.restore_egress_bind(root_id);
+                }
+                Err(error)
+            }
+        }
+    }
 
-        Ok(())
+    /// 恢复已卸载的 egress 通道。`request_mount` 异步且幂等；数据目录已不存在
+    /// （删除已提交或已隔离）或 root 已不在缓存时不重挂。
+    fn restore_egress_bind(&self, root_id: &RootId) {
+        let Some(mounts) = &self.mount_manager else {
+            return;
+        };
+        let Ok(roots) = self.roots.cached_local_roots() else {
+            return;
+        };
+        let Some(root) = roots.into_iter().find(|root| &root.id == root_id) else {
+            return;
+        };
+        if !self
+            .disk
+            .metadata(&root.data_dir)
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            return;
+        }
+        if let Err(error) = mounts.request_mount(root_id.clone(), root.name) {
+            afs_logging::warn!(
+                "ownerfs.rmdir_root.egress_remount_failed";
+                "root_id" => ?root_id, "error" => error.to_string()
+            );
+        }
     }
 
     fn rename(
@@ -13463,6 +13501,47 @@ mod tests {
         assert!(data_dir.is_dir());
         assert!(roots.lookup_root_location(id).unwrap().is_some());
         assert!(roots.enter_root(id, RootRight::Lookup).is_ok());
+    }
+
+    /// 判空之后、物理目录删除之前有新写入（例如 outlet 客户端直连原生目录）时，
+    /// ENOTEMPTY 必须回滚：workspace 保持可用，清空后重试可以删除。
+    #[test]
+    fn rmdir_root_rolls_back_when_directory_fills_after_empty_check() {
+        let (temp, fs, ctx) = fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs
+            .mkdir(&ctx, root, OsStr::new("job-rollback"), 0o755)
+            .unwrap();
+        let local = fs.require_local().unwrap();
+        let record = local.record(workspace.inode.value).unwrap();
+        let (root_id, identity) = (record.root_id.clone(), record.identity.clone());
+        let (data_dir, epoch) = local.roots.local_root_data_dir(&root_id).unwrap().unwrap();
+        let data_dir = temp.path().join(data_dir.as_path());
+
+        // 模拟 outlet 写者：直接写原生目录，绕过 FUSE 与授权。
+        fs::write(data_dir.join("payload"), b"x").unwrap();
+        let error = local
+            .delete_local_root(&root_id, Some(epoch), Some(&identity), false)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+
+        // 回滚：名字仍可 lookup，授权与 Meta 记录仍在。
+        assert!(fs.lookup(&ctx, root, OsStr::new("job-rollback")).is_ok());
+        assert!(local.roots.enter_root(&root_id, RootRight::Lookup).is_ok());
+        assert!(
+            local
+                .roots
+                .lookup_root_location(&root_id)
+                .unwrap()
+                .is_some()
+        );
+
+        // 写入方退出后重试成功。
+        fs::remove_file(data_dir.join("payload")).unwrap();
+        fs.rmdir(&ctx, root, OsStr::new("job-rollback")).unwrap();
+        assert!(fs.lookup(&ctx, root, OsStr::new("job-rollback")).is_err());
     }
 
     #[test]
