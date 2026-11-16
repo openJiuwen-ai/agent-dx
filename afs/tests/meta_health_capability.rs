@@ -168,8 +168,8 @@ async fn register_node_refuses_other_protocol_versions_before_writing() {
     ));
     let supported = afs::format::version::NODE_META_PROTOCOL;
     assert_eq!(
-        supported, 9,
-        "generation 8 lacks the Workspace API owner and delete protocol"
+        supported, 10,
+        "generation 9 lacks caller-attested workspace creation"
     );
     for found in [0, 1, supported - 1, supported + 1] {
         let mut request = request("session-old");

@@ -32,6 +32,7 @@ use afs_protocol::{
         owner_roots_server::OwnerRootsServer,
     },
     node_control::{PrepareOwnerRootRequest, owner_control_client::OwnerControlClient},
+    node_data::OwnerCaller,
 };
 use afs_transport::{SecurityManager, TlsConfig};
 use tempfile::TempDir;
@@ -172,6 +173,25 @@ impl Certificates {
             .unwrap()
             .timeout(Duration::from_secs(5));
         security.connect(endpoint).await.unwrap()
+    }
+}
+
+/// The caller is root so creation passes the mount-root check; the requested
+/// owner is the test process, so an unprivileged run can chown it.
+fn process_identity() -> (u32, u32) {
+    // SAFETY: geteuid/getegid only read this process's effective identity.
+    unsafe { (libc::geteuid(), libc::getegid()) }
+}
+
+// Workspace creation on the mount root is a root-only operation, exactly as
+// the kernel enforces for a local FUSE mkdir; Home re-checks this caller.
+fn root_caller() -> OwnerCaller {
+    OwnerCaller {
+        uid: 0,
+        gid: 0,
+        pid: 1,
+        umask: 0,
+        supplementary_gids: Vec::new(),
     }
 }
 
@@ -413,13 +433,14 @@ impl Fixture {
     }
 
     fn prepare_request(&self, reservation: &RootReservation) -> PrepareOwnerRootRequest {
-        let owner = self.dir.path().metadata().unwrap();
+        let (uid, gid) = process_identity();
         PrepareOwnerRootRequest {
             reservation: Some(reservation.clone()),
             name: root_name(&reservation.root_id),
-            uid: owner.uid(),
-            gid: owner.gid(),
             mode: 0o750,
+            caller: Some(root_caller()),
+            uid: Some(uid),
+            gid: Some(gid),
         }
     }
 
@@ -543,20 +564,159 @@ async fn persistent_mtls_prepare_replay_preserves_identity_and_permissions() {
         .prepare_owner_root(PrepareOwnerRootRequest {
             reservation: Some(reservation.clone()),
             name: root_name(&reservation.root_id),
-            uid: 1,
-            gid: 1,
             mode: 0o777,
+            caller: Some(root_caller()),
+            uid: Some(1),
+            gid: Some(1),
         })
         .await
         .unwrap_err();
     assert_eq!(duplicate.code(), Code::AlreadyExists);
     assert_eq!(fixture.catalog_count(), 1);
     let stat = fixture.data_dir(&reservation).metadata().unwrap();
-    let owner = fixture.dir.path().metadata().unwrap();
+    let (uid, gid) = process_identity();
     assert_eq!(
         (stat.uid(), stat.gid(), stat.mode() & 0o777),
-        (owner.uid(), owner.gid(), 0o750)
+        (uid, gid, 0o750),
+        "a duplicate request must not change the workspace owner or mode"
     );
+    home.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_mtls_prepare_rejects_non_root_caller_without_side_effects() {
+    let fixture = Fixture::new().await;
+    let home = fixture.home("home-session").await;
+    let reservation = fixture
+        .owner_client("node-a")
+        .await
+        .reserve_root(fixture.reserve_request("node-a", "caller-auth", "reserve"))
+        .await
+        .unwrap()
+        .into_inner()
+        .reservation
+        .unwrap();
+    let mut request = fixture.prepare_request(&reservation);
+    request.caller = Some(OwnerCaller {
+        uid: 4242,
+        gid: 4242,
+        pid: 4242,
+        umask: 0,
+        supplementary_gids: Vec::new(),
+    });
+    // Create as the caller itself, so the request reaches the mount-root
+    // permission check instead of failing the owner rule.
+    request.uid = None;
+    request.gid = None;
+    let error = OwnerControlClient::new(fixture.certs.channel(&home.endpoint, "node-a").await)
+        .prepare_owner_root(request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied);
+    assert!(
+        error.message().contains("write and search permission"),
+        "expected the mount-root create check to reject: {error}"
+    );
+    assert!(!fixture.data_dir(&reservation).exists());
+    assert_eq!(fixture.catalog_count(), 0);
+    let pending = fixture.lookup("node-b", &reservation.root_id).await;
+    assert_eq!(pending.reservation.as_ref(), Some(&reservation));
+    assert!(!pending.found);
+    home.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_mtls_prepare_rejects_owner_different_from_caller_without_side_effects() {
+    let fixture = Fixture::new().await;
+    let home = fixture.home("home-session").await;
+    let reservation = fixture
+        .owner_client("node-a")
+        .await
+        .reserve_root(fixture.reserve_request("node-a", "owner-mismatch", "reserve"))
+        .await
+        .unwrap()
+        .into_inner()
+        .reservation
+        .unwrap();
+    let mut request = fixture.prepare_request(&reservation);
+    request.caller = Some(OwnerCaller {
+        uid: 4242,
+        gid: 4242,
+        pid: 4242,
+        umask: 0,
+        supplementary_gids: Vec::new(),
+    });
+    request.uid = Some(0);
+    request.gid = Some(0);
+    let error = OwnerControlClient::new(fixture.certs.channel(&home.endpoint, "node-a").await)
+        .prepare_owner_root(request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied);
+    assert!(
+        error.message().contains("owner differs from the caller"),
+        "expected the owner rule to reject: {error}"
+    );
+    assert!(!fixture.data_dir(&reservation).exists());
+    assert_eq!(fixture.catalog_count(), 0);
+    let pending = fixture.lookup("node-b", &reservation.root_id).await;
+    assert_eq!(pending.reservation.as_ref(), Some(&reservation));
+    assert!(!pending.found);
+    home.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_mtls_prepare_rejects_missing_caller_without_side_effects() {
+    let fixture = Fixture::new().await;
+    let home = fixture.home("home-session").await;
+    let reservation = fixture
+        .owner_client("node-a")
+        .await
+        .reserve_root(fixture.reserve_request("node-a", "caller-missing", "reserve"))
+        .await
+        .unwrap()
+        .into_inner()
+        .reservation
+        .unwrap();
+    let mut request = fixture.prepare_request(&reservation);
+    request.caller = None;
+    let error = OwnerControlClient::new(fixture.certs.channel(&home.endpoint, "node-a").await)
+        .prepare_owner_root(request)
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("missing caller"), "{error}");
+    assert!(!fixture.data_dir(&reservation).exists());
+    assert_eq!(fixture.catalog_count(), 0);
+    let pending = fixture.lookup("node-b", &reservation.root_id).await;
+    assert_eq!(pending.reservation.as_ref(), Some(&reservation));
+    assert!(!pending.found);
+    home.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires root to chown a workspace to another uid/gid; run explicitly"]
+async fn persistent_mtls_root_caller_can_prepare_requested_owner() {
+    let fixture = Fixture::new().await;
+    let home = fixture.home("home-session").await;
+    let reservation = fixture
+        .owner_client("node-a")
+        .await
+        .reserve_root(fixture.reserve_request("node-a", "owner-override", "reserve"))
+        .await
+        .unwrap()
+        .into_inner()
+        .reservation
+        .unwrap();
+    let mut request = fixture.prepare_request(&reservation);
+    request.uid = Some(4242);
+    request.gid = Some(4242);
+    OwnerControlClient::new(fixture.certs.channel(&home.endpoint, "node-a").await)
+        .prepare_owner_root(request)
+        .await
+        .unwrap();
+    let metadata = std::fs::metadata(fixture.data_dir(&reservation)).unwrap();
+    assert_eq!((metadata.uid(), metadata.gid()), (4242, 4242));
+    assert!(fixture.lookup("node-b", &reservation.root_id).await.found);
     home.stop().await;
 }
 
