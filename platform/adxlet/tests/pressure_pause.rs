@@ -1,14 +1,21 @@
 //! Pressure-triggered pause behavior on the controller actor: the
 //! conjunction matrix, the rate and in-flight budget, the attribution,
 //! and the cooldown after a resume.
-use adx_core::{Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Result};
+use adx_core::{
+    runtime::{RuntimeIdentity, RuntimePhase, RuntimeStatus},
+    Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Result,
+};
+use adx_protocol::{
+    runtime as pb,
+    runtime_stream::{execution_token, ControlOperation},
+};
 use adxlet::checkpoint::{
     CheckpointCooperation, LocalCheckpointStore, PauseRequest, ResumeRequest,
 };
 use adxlet::resources::{NodePressureState, PressureLevel, ResourcePressure};
 use adxlet::{
-    Adxlet, Durability, EscalationMode, PressurePauseOptions, Readiness, Routes, RuntimeDriver,
-    StateSink,
+    control_stream::RuntimeControlHub, runtime_control::RuntimeControlClient, Adxlet, Durability,
+    EscalationMode, PressurePauseOptions, Readiness, Routes, RuntimeDriver, StateSink,
 };
 use async_trait::async_trait;
 use std::{
@@ -91,6 +98,20 @@ fn assert_no_skips(node: &Adxlet) {
     }
 }
 
+/// Polls every 10ms until the probe holds, panicking with `reason` once
+/// the bounded wait expires. For event-driven assertions where no command
+/// exists to observe the transition: the controller acts on its own.
+async fn settle(probe: impl Fn() -> bool, reason: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !probe() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {reason}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[derive(Default)]
 struct Backend {
     running: Mutex<BTreeSet<String>>,
@@ -108,6 +129,11 @@ struct Backend {
     // Fails routes.reopen to reproduce a temporarily unreachable relay
     // after a quiesced pause attempt.
     fail_reopen: Mutex<bool>,
+    // When set, a route activity change wakes immediately: an idle window
+    // can then be established purely from control events — the production
+    // shape — instead of a monitoring tick. The window stays put once the
+    // observation stops changing.
+    route_changes: Mutex<bool>,
     // Test rendezvous for the mid-tick demand race: the first armed
     // observation reports itself and parks until released, so a test
     // can land an ensure-running demand bump between the tick's opening
@@ -118,6 +144,7 @@ struct Backend {
     observe_reached: tokio::sync::Notify,
     observe_released: tokio::sync::Notify,
 }
+
 impl Backend {
     fn event(&self, name: &str) {
         self.events.lock().unwrap().push(name.into());
@@ -268,6 +295,22 @@ impl Readiness for Backend {
 
 #[async_trait]
 impl Routes for Backend {
+    async fn activity_changed(
+        &self,
+        record: &EnvironmentRecord,
+        previous: Option<(String, u64, u64)>,
+    ) -> Result<(String, u64, u64)> {
+        if !*self.route_changes.lock().unwrap() {
+            return std::future::pending().await;
+        }
+        let current = Routes::activity(self, record).await?;
+        if Some(current.clone()) == previous {
+            // No further activity arrives in these fixtures: park instead
+            // of spinning on the same observation.
+            return std::future::pending().await;
+        }
+        Ok(current)
+    }
     async fn activity(&self, _: &EnvironmentRecord) -> Result<(String, u64, u64)> {
         Ok(("proxy".into(), 1, 0))
     }
@@ -397,6 +440,181 @@ async fn fixture(
     // at its never-observed default.
     handle.tick().await.unwrap();
     (temp, backend, node, handle, created)
+}
+
+/// The fake runtime's control-stream status: Running and idle, carrying
+/// the identity the controller derives for this fixture's execution.
+fn runtime_status(identity: &RuntimeIdentity) -> RuntimeStatus {
+    RuntimeStatus {
+        failure: None,
+        identity: identity.clone(),
+        revision: 1,
+        phase: RuntimePhase::Running,
+        checkpoint: None,
+        requested_checkpoint: None,
+        requested_checkpoint_deadline_unix_millis: None,
+        active_requests: 0,
+        active_commands: 0,
+        activity_revision: 1,
+        required_services: Default::default(),
+    }
+}
+
+/// The runtime-control side of a production-shaped node: a connected fake
+/// Execd answers control commands over the hub. The first idle-barrier
+/// reopen parks at a rendezvous so a test can observe the recovery
+/// ordering, and every barrier request is counted.
+struct ControlRig {
+    barrier: Arc<Mutex<u32>>,
+    barrier_reached: Arc<tokio::sync::Notify>,
+    barrier_release: Arc<tokio::sync::Notify>,
+}
+
+impl ControlRig {
+    fn barrier_requests(&self) -> u32 {
+        *self.barrier.lock().unwrap()
+    }
+}
+
+/// A production-shaped fixture: the node runs with a runtime control
+/// stream, so the controller observes its runtime through the hub and
+/// the idle admission recovers through the runtime barrier before the
+/// route. A connected fake Execd answers control commands, and route
+/// activity wakes flow immediately, so the idle window is established
+/// purely from control events — no monitoring tick is ever issued.
+async fn fixture_with_control(
+    options: PressurePauseOptions,
+    action: adx_core::lifecycle::IdleAction,
+) -> (
+    tempfile::TempDir,
+    Arc<Backend>,
+    Adxlet,
+    adxlet::EnvironmentHandle,
+    ControlRig,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = Arc::new(Backend::default());
+    *backend.activity.lock().unwrap() = Some((1, 0));
+    *backend.route_changes.lock().unwrap() = true;
+    // The controller derives the runtime identity from the spec id and the
+    // assignment generation, and admits exactly this execution.
+    let identity = RuntimeIdentity {
+        environment_id: "environment".into(),
+        runtime_id: "environment-1".into(),
+        ownership_generation: 1,
+    };
+    let secret = vec![9; 32];
+    let hub = RuntimeControlHub::new(secret.clone(), Duration::from_secs(5)).unwrap();
+    hub.expect(&identity).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(hub.clone().serve(listener));
+    // The fake Execd connects with the execution credential and answers
+    // every control command with a fresh Running status. The first
+    // ReopenIdle parks at the rendezvous so a test can hold the barrier
+    // reply while the controller is parked on it.
+    let channel = tonic::transport::Endpoint::new(format!("http://{address}"))
+        .unwrap()
+        .connect_with_connector(tower::service_fn(move |_| async move {
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
+                tokio::net::TcpStream::connect(address).await?,
+            ))
+        }))
+        .await
+        .unwrap();
+    let mut client = pb::runtime_control_service_client::RuntimeControlServiceClient::new(channel);
+    let mut status = runtime_status(&identity);
+    let (events, receiver) = tokio::sync::mpsc::channel(16);
+    events
+        .send(pb::RuntimeEvent {
+            event: Some(pb::runtime_event::Event::Hello(pb::RuntimeHello {
+                token: execution_token(&secret, &identity).unwrap(),
+                status_json: serde_json::to_vec(&status).unwrap(),
+            })),
+        })
+        .await
+        .unwrap();
+    let mut commands = client
+        .open_control(tokio_stream::wrappers::ReceiverStream::new(receiver))
+        .await
+        .unwrap()
+        .into_inner();
+    let rig = ControlRig {
+        barrier: Arc::new(Mutex::new(0)),
+        barrier_reached: Arc::new(tokio::sync::Notify::new()),
+        barrier_release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let barrier = rig.barrier.clone();
+    let barrier_reached = rig.barrier_reached.clone();
+    let barrier_release = rig.barrier_release.clone();
+    tokio::spawn(async move {
+        while let Some(command) = commands.message().await.unwrap() {
+            let operation =
+                serde_json::from_slice::<ControlOperation>(&command.operation_json).unwrap();
+            if let ControlOperation::ReopenIdle { .. } = operation {
+                let first = {
+                    let mut requests = barrier.lock().unwrap();
+                    *requests += 1;
+                    *requests == 1
+                };
+                if first {
+                    // Park while holding nothing: the test reads the
+                    // counter and issues the release while we wait.
+                    barrier_reached.notify_one();
+                    barrier_release.notified().await;
+                }
+            }
+            status.revision += 1;
+            events
+                .send(pb::RuntimeEvent {
+                    event: Some(pb::runtime_event::Event::Reply(pb::RuntimeReply {
+                        request_id: command.request_id,
+                        status_json: serde_json::to_vec(&status).unwrap(),
+                        error_code: String::new(),
+                        error_message: String::new(),
+                    })),
+                })
+                .await
+                .unwrap();
+        }
+    });
+    hub.wait_ready(&identity).await.unwrap();
+    // The control client's HTTP transport never engages here — the stream
+    // serves every request — so the port is only a non-zero placeholder.
+    let control = RuntimeControlClient::new(1, Duration::from_secs(5))
+        .unwrap()
+        .with_stream(hub);
+    let node = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(
+        Arc::new(LocalCheckpointStore::new(temp.path().into()).unwrap()),
+        backend.clone(),
+    )
+    .unwrap()
+    .with_pressure_pause_options(options)
+    .unwrap()
+    .with_runtime_control(control)
+    .unwrap();
+    node.update_capacity(
+        adx_core::Resources {
+            cpu_millis: 200,
+            memory_bytes: 2048,
+            disk_bytes: 2048,
+        },
+        Duration::from_secs(300),
+    )
+    .unwrap();
+    let handle = node
+        .environment(spec("environment", action), assignment("environment"))
+        .unwrap();
+    let created = handle.create().await.unwrap();
+    assert_eq!(created.record.state, EnvironmentState::Running);
+    (temp, backend, node, handle, rig)
 }
 
 /// A normal board never pauses even with every other condition satisfied.
@@ -813,13 +1031,14 @@ async fn failed_pause_keeps_the_rate_slot_consumed() {
 }
 
 /// A failed reopen after a failed pressure pause arms a retrying
-/// recovery instead of stranding a closed admission: the armed
-/// recovery retries on its own deadline without waiting for the next
-/// monitoring round, later monitoring ticks keep the recovery armed
-/// while the relay stays unreachable, the route restores even after
-/// the pressure has fully subsided (no further High signal ever
-/// rings), and the recovered environment still pauses on a later high
-/// round.
+/// recovery instead of stranding a closed admission. This fixture runs
+/// without runtime control, so no lifecycle deadline exists and the
+/// recovery rides the monitoring ticks alone: the tick's admission hook
+/// retries the reopen while the relay stays unreachable, the route
+/// restores even after the pressure has fully subsided (no further
+/// High signal ever rings), and the recovered environment still pauses
+/// on a later high round. The deadline-driven retry that needs no tick
+/// is covered by the runtime-control test below.
 #[tokio::test]
 async fn failed_reopen_is_retried_after_pressure_relieves() {
     let (_temp, backend, node, handle, _) =
@@ -843,8 +1062,8 @@ async fn failed_reopen_is_retried_after_pressure_relieves() {
         2,
         "the failed pause reopened once and the armed recovery retried once"
     );
-    // The retry failure backs off: no further attempt rings within the
-    // backoff window against the still-unreachable relay.
+    // Without runtime control the retry deadline never arms, so the
+    // recovery stays silent between ticks: nothing retries on its own.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         backend.reopen_attempts(),
@@ -883,6 +1102,112 @@ async fn failed_reopen_is_retried_after_pressure_relieves() {
         backend.reopen_attempts(),
         4,
         "a successful pause keeps the route retired without further reopens"
+    );
+}
+
+/// The production recovery path: with runtime control configured, a
+/// failed pressure pause arms a deadline-driven admission recovery that
+/// needs no monitoring tick — this test never calls tick or
+/// monitor_environments after the create. The lifecycle deadline retries
+/// on its own bounded backoff while the relay stays unreachable, every
+/// retry reopens the runtime idle barrier before the route, the route
+/// restores once the relay recovers even though no further High signal
+/// rings, and the recovered environment still pauses on a later high
+/// round.
+#[tokio::test]
+async fn failed_reopen_is_retried_by_the_deadline_without_a_tick() {
+    let (_temp, backend, node, handle, rig) =
+        fixture_with_control(immediate(0), adx_core::lifecycle::IdleAction::Pause).await;
+    // The pause fails and the inline route reopen fails with it: the
+    // admission stays closed while the environment keeps running.
+    *backend.fail_prepare.lock().unwrap() = true;
+    *backend.fail_reopen.lock().unwrap() = true;
+    publish(&node, board(PressureLevel::High, 0, now_plus(100)));
+    // The High signal alone drives the failed pause; the armed recovery
+    // then wakes from its lifecycle deadline and its first barrier
+    // request parks at the rendezvous: while the runtime idle barrier is
+    // pending, the route reopen must not have happened yet — the barrier
+    // comes first in the production recovery.
+    tokio::time::timeout(Duration::from_secs(5), rig.barrier_reached.notified())
+        .await
+        .expect("the armed recovery never reopened the idle barrier");
+    assert_eq!(
+        backend.reopen_attempts(),
+        1,
+        "the inline reopen after the failed pause is the only attempt so far"
+    );
+    // Releasing the barrier lets the recovery proceed to the route
+    // reopen, which fails against the still-unreachable relay and arms
+    // the retry backoff.
+    rig.barrier_release.notify_one();
+    settle(
+        || backend.reopen_attempts() == 2,
+        "the first deadline recovery to reach its route reopen",
+    )
+    .await;
+    // The retry failure backs off: the next retry is a second away, so
+    // no further attempt rings within the backoff window.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        backend.reopen_attempts(),
+        2,
+        "the backoff holds: no third attempt within the window"
+    );
+    // The pressure fully subsides and the relay recovers: only normal
+    // boards follow, so no further High signal rings — only the armed
+    // deadline, never a tick or monitoring round, completes the
+    // recovery.
+    publish(&node, board(PressureLevel::Normal, 0, now_plus(200)));
+    *backend.fail_reopen.lock().unwrap() = false;
+    settle(
+        || backend.reopen_attempts() == 3,
+        "the backoff deadline to retry the recovery on its own",
+    )
+    .await;
+    assert_eq!(
+        rig.barrier_requests(),
+        2,
+        "the second retry reopened the runtime idle barrier first"
+    );
+    assert_eq!(
+        handle.sync().await.unwrap().record.state,
+        EnvironmentState::Running
+    );
+    // The recovered environment still pauses on a later high round — the
+    // recovery's own control events re-armed the idle window, so no
+    // monitoring tick is needed here either — and the cleared recovery
+    // state never reopens the route again.
+    *backend.fail_prepare.lock().unwrap() = false;
+    publish(&node, board(PressureLevel::High, 0, now_plus(300)));
+    settle(
+        || {
+            backend
+                .committed_records
+                .lock()
+                .unwrap()
+                .get("environment")
+                .is_some_and(|record| record.state == EnvironmentState::Paused)
+        },
+        "the later high round to pause the recovered environment",
+    )
+    .await;
+    assert_eq!(
+        handle.sync().await.unwrap().record.state,
+        EnvironmentState::Paused
+    );
+    assert_eq!(
+        backend.reopen_attempts(),
+        3,
+        "a successful pause keeps the route retired without further reopens"
+    );
+    assert_eq!(
+        rig.barrier_requests(),
+        2,
+        "a successful pause keeps the runtime barrier closed"
+    );
+    assert_eq!(
+        backend.intent("environment"),
+        Some(adx_core::observation::OperationIntent::Pressure)
     );
 }
 
