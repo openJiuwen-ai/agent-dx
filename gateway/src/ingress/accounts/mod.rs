@@ -391,7 +391,8 @@ impl BusinessAuth for AccountService {
         )
         .map_err(|_| Error::Unavailable)?;
         // Reconcile model access and account alias even for a ready credential when preparing a new
-        // binding or serving quota. Warm Sandbox traffic never enters this path.
+        // binding, registering model configuration after Gateway login authentication, or
+        // serving quota. Traffic within an admitted Sandbox connection does not enter this path.
         // Persist the key BEFORE remote creation so retries cannot mint another key.
         let owner = self.cipher.model_owner(&principal.user_id);
         let alias = self.store.model_key_alias(principal).await?;

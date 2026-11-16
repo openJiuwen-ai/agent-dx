@@ -1,7 +1,7 @@
 //! Optional HTTPS service lifecycle; identity renewal is requested by the workload.
 #[cfg(unix)]
 mod implementation {
-    use super::super::privacy_center::{BindingReader, PrivacyCenter};
+    use super::super::privacy_center::{BindingReader, ConfigurationRegistry, PrivacyCenter};
     use super::super::privacy_cipher::PrivacyCipher;
     use super::super::privacy_grants::{PrivacyIdentity, TokenSigner};
     use super::super::privacy_http::PrivacyHttp;
@@ -18,9 +18,15 @@ mod implementation {
         pub template: String,
         #[serde(default)]
         pub legacy_keyring_file: Option<PathBuf>,
+        #[serde(default)]
+        pub model_config_name: Option<String>,
+    }
+    pub(crate) struct PrivacyAccess {
+        pub identity: Arc<PrivacyIdentity>,
+        pub model_configuration: Option<(String, Arc<dyn ConfigurationRegistry>)>,
     }
     pub(crate) struct PrivacyRuntime {
-        pub identity: Arc<PrivacyIdentity>,
+        pub access: Arc<PrivacyAccess>,
         shutdown: watch::Sender<bool>,
         listener: JoinHandle<()>,
     }
@@ -64,7 +70,14 @@ mod implementation {
                 center = center
                     .with_legacy(PrivacyCipher::load(path).map_err(|_| Error::Configuration)?);
             }
-            let http = Arc::new(PrivacyHttp::new(Arc::new(center), identity.clone()));
+            let center = Arc::new(center);
+            let access = Arc::new(PrivacyAccess {
+                identity: identity.clone(),
+                model_configuration: config
+                    .model_config_name
+                    .map(|name| (name, center.clone() as Arc<dyn ConfigurationRegistry>)),
+            });
+            let http = Arc::new(PrivacyHttp::new(center, identity));
             let (shutdown, receiver) = watch::channel(false);
             let listener = tokio::spawn(async move {
                 if http.serve(listener, tls, receiver).await.is_err() {
@@ -72,7 +85,7 @@ mod implementation {
                 }
             });
             Ok(Self {
-                identity,
+                access,
                 shutdown,
                 listener,
             })
@@ -86,4 +99,4 @@ mod implementation {
     }
 }
 #[cfg(unix)]
-pub(crate) use implementation::{PrivacyRuntime, PrivacyRuntimeConfig};
+pub(crate) use implementation::{PrivacyAccess, PrivacyRuntime, PrivacyRuntimeConfig};

@@ -107,7 +107,7 @@ impl ApplicationWsConfig {
         managed: Arc<ManagedService>,
         guard: Arc<SessionGuard>,
         tenant: &str,
-        #[cfg(unix)] privacy: Option<std::sync::Arc<super::privacy_grants::PrivacyIdentity>>,
+        #[cfg(unix)] privacy: Option<std::sync::Arc<super::privacy_runtime::PrivacyAccess>>,
     ) -> Response<ProxyBody> {
         let auth = guard.auth.clone();
         let principal = guard.principal.clone();
@@ -162,6 +162,8 @@ impl ApplicationWsConfig {
                             &principal.user_id,
                         )
                         .map_err(|_| crate::ingress::accounts::Error::Invalid)?;
+                        // Login registration and template injection coexist during migration.
+                        // Existing bindings still skip this lazy initializer on reconnect.
                         let mut parameters = auth.model_parameters(&principal).await?;
                         parameters.extend(workspace);
                         Ok(parameters)
@@ -227,7 +229,7 @@ impl ApplicationWsConfig {
         #[cfg(unix)]
         if let Some(identity) = privacy
             .as_ref()
-            .filter(|identity| identity.targets(&self.template))
+            .filter(|access| access.identity.targets(&self.template))
         {
             let workspace = match super::entrypoint::workspace_parameters(
                 tenant,
@@ -240,10 +242,13 @@ impl ApplicationWsConfig {
             let Some(workspace) = workspace.get("workspace") else {
                 return error(StatusCode::BAD_GATEWAY, "PRIVACY_UNAVAILABLE");
             };
-            let token = match tokio::time::timeout_at(
-                deadline,
-                identity.admit(&privacy_scope, workspace, &principal.user_id),
-            )
+            let token = match tokio::time::timeout_at(deadline, async {
+                auth.check(&principal).await?;
+                identity
+                    .identity
+                    .admit(&privacy_scope, workspace, &principal.user_id)
+                    .await
+            })
             .await
             {
                 Ok(Ok(token)) => token,

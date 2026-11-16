@@ -487,6 +487,7 @@ async fn shared_forwarding(application: &'static str) {
 }
 
 struct ModelAuth {
+    store: Option<crate::ingress::accounts::AccountStore>,
     inner: TestAuth,
     calls: std::sync::atomic::AtomicUsize,
     checks: std::sync::atomic::AtomicUsize,
@@ -496,6 +497,7 @@ struct ModelAuth {
 impl ModelAuth {
     fn new() -> Self {
         Self {
+            store: None,
             inner: TestAuth(std::sync::atomic::AtomicBool::new(false)),
             calls: std::sync::atomic::AtomicUsize::new(0),
             checks: std::sync::atomic::AtomicUsize::new(0),
@@ -506,6 +508,9 @@ impl ModelAuth {
 }
 #[async_trait::async_trait]
 impl crate::ingress::accounts::BusinessAuth for ModelAuth {
+    fn privacy_store(&self) -> Option<crate::ingress::accounts::AccountStore> {
+        self.store.clone()
+    }
     async fn login(
         &self,
         request: crate::ingress::accounts::LoginRequest,
@@ -602,6 +607,17 @@ impl Environment for OrbitVolumeBackend {
 
 #[tokio::test]
 async fn orbit_initialization_uses_account_model_and_user_workspace_parameters() {
+    check_model_injection(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires isolated DIGITALMATE_PRIVACY_TEST_DATABASE_URL and ADX_CREDENTIAL_KEY_FILE"]
+async fn model_registration_preserves_template_injection_and_lazy_reconnect() {
+    check_model_injection(true).await;
+}
+
+async fn check_model_injection(registration: bool) {
     for reference in [
         adx_agent_core::TemplateRef::Version("1".into()),
         adx_agent_core::TemplateRef::Alias("production".into()),
@@ -636,7 +652,16 @@ async fn orbit_initialization_uses_account_model_and_user_workspace_parameters()
         let managed = Arc::new(ManagedService::new(Arc::new(LocalControl::new(Arc::new(
             adx_activator::Activator::new(state.clone(), backend.clone()),
         )))));
-        let auth = Arc::new(ModelAuth::new());
+        let mut auth = ModelAuth::new();
+        if registration {
+            let url = std::env::var("DIGITALMATE_PRIVACY_TEST_DATABASE_URL").unwrap();
+            auth.store = Some(
+                crate::ingress::accounts::AccountStore::from_url(&url, true, None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let auth = Arc::new(auth);
         let gateway = Arc::new(
             gateway
                 .as_ref()
@@ -646,6 +671,15 @@ async fn orbit_initialization_uses_account_model_and_user_workspace_parameters()
                         {
                             let mut config = orbit_settings(18092);
                             config.orbit.as_mut().unwrap().template_ref = reference.name().into();
+                            #[cfg(unix)]
+                            if registration {
+                                config.privacy = Some(serde_json::from_value(json!({
+                                    "listen":"127.0.0.1:0", "template":"orbit",
+                                    "tls_certificate":concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ingress-cert.pem"),
+                                    "tls_private_key":concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ingress-key.pem"),
+                                    "model_config_name":"DIGITALMATE_MODEL_CONFIG"
+                                })).unwrap());
+                            }
                             config
                         },
                         managed,
