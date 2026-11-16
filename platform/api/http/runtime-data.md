@@ -55,7 +55,7 @@ SDK `commands.run` 的默认／长等待路径和后台命令使用 `process.sta
 `process.exec.timeout` 是执行预算，省略无限等待，零立即到期。
 `process.exec` 及其同步执行别名在启动进程前校验参数。`args` 省略时使用空对象，
 显式提供时必须为对象；未知参数、错误类型、负数或不能表示为执行期限的 timeout
-返回 HTTP 400，不启动命令。错误信息指出对应字段，字段校验失败使用
+返回 HTTP 400，不启动命令。错误信息指出对应字段；包括 `args` 本身类型错误在内的参数校验失败均使用
 `error_code=INVALID_ARGUMENT`。所有显式提供的别名均须通过校验，不能以另一个
 有效别名掩盖错误。保留现有别名选取顺序：`cmd`／`command`、`cwd`／`working_dir`、
 `envs`／`env`。命令省略或为空字符串仍执行空命令；cwd、envs 及其别名允许 null，

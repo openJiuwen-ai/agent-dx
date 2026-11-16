@@ -415,8 +415,9 @@ components:
       type: object
       description: >-
         Synchronous process arguments are validated before execution. Unknown fields,
-        invalid types and unsupported timeout values return HTTP 400 without starting
-        the command. All supplied aliases are validated; selection keeps cmd before
+        invalid types (including a non-object args value) and unsupported timeout values
+        return HTTP 400 with error_code=INVALID_ARGUMENT without starting the command.
+        All supplied aliases are validated; selection keeps cmd before
         command, cwd before working_dir, and envs before env. Omitted or empty commands
         remain valid empty shell commands.
       properties:

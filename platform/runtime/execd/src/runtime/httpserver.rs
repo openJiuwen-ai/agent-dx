@@ -490,7 +490,8 @@ async fn handle_one_request(
         if let Some(operation) = super::dispatch::normalize_environment_action(&action) {
             adx_observability::trace::attribute("rpc.method", operation.to_owned());
             if operation == "cmd_run" && parsed.get("args").is_some_and(|args| !args.is_object()) {
-                return write_resp(sock, 400, &err_json("args must be an object")).await;
+                let error = super::dispatch::exec_argument_error("args must be an object".into());
+                return write_resp(sock, 400, &rmpv_to_json(&error).to_string()).await;
             }
         }
         let kw = json_args_to_kwargs(parsed.get("args"));
@@ -2162,17 +2163,24 @@ mod tests {
             args[field] = value;
             let response = invoke_over_http_status("process.exec", args, 400).await;
             assert!(response["error"].as_str().unwrap().contains(field));
+            assert_eq!(response["error_code"], "INVALID_ARGUMENT");
             assert!(response.get("exit_code").is_none());
             assert!(!marker.exists(), "invalid {field} started a command");
         }
-        for args in [
-            serde_json::Value::Null,
-            serde_json::json!([]),
-            serde_json::json!("bad"),
-        ] {
-            let response = invoke_over_http_status("process.exec", args, 400).await;
-            assert!(response["error"].as_str().unwrap().contains("args"));
-            assert!(!marker.exists());
+        for action in ["process.exec", "process.run", "cmd.run", "cmd_run", "exec"] {
+            for args in [
+                serde_json::Value::Null,
+                serde_json::json!([]),
+                serde_json::json!("bad"),
+                serde_json::json!(123),
+                serde_json::json!(false),
+            ] {
+                let response = invoke_over_http_status(action, args, 400).await;
+                assert_eq!(response["error"], "args must be an object");
+                assert_eq!(response["error_code"], "INVALID_ARGUMENT");
+                assert!(response.get("exit_code").is_none());
+                assert!(!marker.exists());
+            }
         }
     }
 

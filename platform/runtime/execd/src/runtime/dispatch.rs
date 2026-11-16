@@ -168,7 +168,7 @@ struct ExecArgs<'a> {
     timeout: Option<Duration>,
 }
 
-fn exec_argument_error(message: String) -> rmpv::Value {
+pub(super) fn exec_argument_error(message: String) -> rmpv::Value {
     codec::map_value(vec![
         ("error", message.into()),
         ("error_code", "INVALID_ARGUMENT".into()),
