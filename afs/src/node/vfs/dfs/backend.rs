@@ -639,6 +639,7 @@ impl Backend for DistributedFs {
         options: OpenOptions,
     ) -> Result<FileHandle> {
         let inode_id = self.inode_id(inode)?;
+        let _admission = Self::admit_file_open(self, inode_id.clone())?;
         let native_read_view = if !self.read_engine.has_external_backend()
             && flags & libc::O_ACCMODE == libc::O_RDONLY
         {

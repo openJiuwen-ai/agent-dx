@@ -345,11 +345,12 @@ impl OwnerGateway {
         if local.lease_handoff.enabled {
             return self.owner_open_with_handoff(local, peer, request);
         }
+        let inode_id = InodeId::new(request.inode_id.clone());
+        let _file_open = DistributedFs::admit_file_open(local, inode_id.clone())?;
         let admission = match self.admit_owner_open(peer, &request)? {
             ControlFlow::Continue(admission) => admission,
             ControlFlow::Break(reply) => return Ok(reply),
         };
-        let inode_id = InodeId::new(request.inode_id.clone());
         let authority = self.meta.resolve_write_authority(&inode_id);
         self.apply_owner_open(local, peer, request, admission, authority)
     }
@@ -361,6 +362,7 @@ impl OwnerGateway {
         request: afs_protocol::node_control::DfsOwnerOpenRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerOpenReply> {
         let inode_id = InodeId::new(request.inode_id.clone());
+        let _file_open = DistributedFs::admit_file_open(local, inode_id.clone())?;
         let admission = match self.admit_owner_open(peer, &request)? {
             ControlFlow::Continue(admission) => admission,
             ControlFlow::Break(reply) => return Ok(reply),
@@ -1410,16 +1412,16 @@ impl owner_api::DfsOwnerLifecycleHandler for DistributedFs {
                 })
                 .await;
             }
+            let inode_id = InodeId::new(request.inode_id.clone());
+            let file_open = Self::admit_file_open(self.clone(), inode_id.clone())?;
             let admission = match gateway.admit_owner_open(&peer, &request)? {
                 ControlFlow::Continue(admission) => admission,
                 ControlFlow::Break(reply) => return Ok(reply),
             };
-            let authority = gateway
-                .meta
-                .resolve_write_authority_async(InodeId::new(request.inode_id.clone()))
-                .await;
+            let authority = gateway.meta.resolve_write_authority_async(inode_id).await;
             let fs = self.clone();
             offload_handler(move || {
+                let _file_open = file_open;
                 fs.owner_gateway
                     .apply_owner_open(&*fs, &peer, request, admission, authority)
             })

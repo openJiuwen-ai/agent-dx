@@ -219,6 +219,7 @@ where
 struct CapturingDfsMeta {
     inner: Arc<crate::node::rpc::meta::GrpcDfsMeta>,
     commits: Mutex<Vec<CommitFileVersion>>,
+    next_commit_rejection: Mutex<Option<Error>>,
 }
 
 #[cfg(feature = "dfs")]
@@ -227,6 +228,7 @@ impl CapturingDfsMeta {
         Self {
             inner: Arc::new(inner),
             commits: Mutex::new(Vec::new()),
+            next_commit_rejection: Mutex::new(None),
         }
     }
 
@@ -295,6 +297,9 @@ impl DfsMeta for CapturingDfsMeta {
 
     fn commit_file_version(&self, commit: CommitFileVersion) -> Result<InodeRecord> {
         self.commits.lock().unwrap().push(commit.clone());
+        if let Some(error) = self.next_commit_rejection.lock().unwrap().take() {
+            return Err(error);
+        }
         DfsMeta::commit_file_version(self.inner.as_ref(), commit)
     }
 
@@ -1889,4 +1894,119 @@ async fn real_grpc_create_is_checked_and_grouped_by_meta() {
         assert_eq!(crate::error::errno(&error), libc::EACCES);
     }
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_grpc_meta_reclaims_rejected_write_after_other_node_unlinks() {
+    use crate::meta::store::{MetaEntity, MetaRead};
+    let (temp, endpoint, _gate, server, store, local_a, _backend) = real_grpc_meta_fixture().await;
+    let timeout = Duration::from_secs(2);
+    let (meta, _chunks, owner) =
+        grpc_dfs_test_fs("node-a", "session-a", &endpoint, local_a, timeout).await;
+    let local_b = Arc::new(LocalChunkStore::open(temp.path().join("node-b"), "node-b").unwrap());
+    let (_peer_meta, _peer_chunks, peer) =
+        grpc_dfs_test_fs("node-b", "session-b", &endpoint, local_b, timeout).await;
+    let references = crate::node::gc::GcReferences::new(meta.inner.clone());
+    let owner = Arc::new(owner.with_gc_references(Some(references.clone())));
+    let owner_io = owner.clone();
+
+    let inode_id = run_blocking(move || {
+        let owner = owner_io;
+        let name = OsStr::new("peer-unlink-terminal");
+        let file = owner
+            .create(&context(), owner.root_inode(), name, 0o640, libc::O_RDWR)
+            .unwrap();
+        let inode_id = owner.inode_id(file.entry.inode).unwrap();
+        owner
+            .write(&context(), file.handle, 0, &vec![0x4d; 4 * 1024 * 1024])
+            .unwrap();
+        peer.unlink(&context(), peer.root_inode(), name).unwrap();
+        assert!(peer.lookup(&context(), peer.root_inode(), name).is_err());
+        let cell = owner.write_state(&inode_id).unwrap().unwrap();
+        assert_eq!(cell.lock().unwrap().inode.attributes.nlink, 1);
+        drop(cell);
+        *meta.next_commit_rejection.lock().unwrap() = Some(Error::coded(
+            afs_error::META_DFS_CONFLICT,
+            "injected definite commit rejection at the owner",
+        ));
+        assert_eq!(
+            owner
+                .fsync(&context(), file.handle, SyncMode::Full)
+                .unwrap_err()
+                .code(),
+            afs_error::META_DFS_CONFLICT
+        );
+        owner.release(&context(), file.handle).unwrap();
+        owner.writeback_pending().unwrap();
+        assert!(
+            !meta.commits().is_empty(),
+            "owner reached the commit boundary"
+        );
+        assert!(owner.write_state(&inode_id).unwrap().is_some());
+        inode_id
+    })
+    .await;
+
+    // Let the actual service run its normal 5 s maintenance pass.
+    let mut services = crate::runtime::Services::new();
+    let registry = afs_metrics::Registry::new();
+    let passes = crate::node::background::tick::WritebackPassMetrics::register(&registry).unwrap();
+    crate::node::background::tick::DfsBackgroundTick::new(
+        owner.clone(),
+        Duration::from_secs(60),
+        passes,
+    )
+    .start(&mut services);
+    let pipeline = owner.write_resources.pipeline.as_ref().unwrap();
+    let gone = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if owner.write_state(&inode_id).unwrap().is_none()
+                && pipeline.budget.snapshot().leases == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    services.stop.send(true).unwrap();
+    drop(services);
+    gone.expect("owner maintenance must independently discover the peer unlink");
+    run_blocking(move || references.flush().unwrap()).await;
+    let budget = pipeline.budget.snapshot();
+    eprintln!(
+        "other-node unlink through Meta gRPC and scheduled maintenance, dirty_bytes={}",
+        budget.live_bytes
+    );
+    assert_eq!(budget.live_bytes, 0);
+    assert_eq!(budget.leases, 0);
+
+    let inode = store
+        .read(MetaRead::DfsInode(inode_id.clone()))
+        .await
+        .unwrap();
+    assert!(
+        matches!(inode.entity, Some(MetaEntity::DfsInode(record)) if record.attributes.nlink == 0)
+    );
+    let (_, entities) = store.read_view().await.unwrap().snapshot().unwrap();
+    let retired_reference = entities.iter().any(|entity| {
+        matches!(entity,
+            MetaEntity::DfsReference(reference)
+                if reference.inode_id.as_ref() == Some(&inode_id)
+                    && reference.reference_id.starts_with("write:")
+                    && reference.retired_at_unix_ms.is_some()
+        )
+    });
+    assert!(
+        retired_reference,
+        "Meta recorded the write generation release"
+    );
+    assert!(!entities.iter().any(|entity| matches!(entity,
+        MetaEntity::DfsReference(reference)
+            if reference.inode_id.as_ref() == Some(&inode_id)
+                && reference.reference_id.starts_with("write:")
+                && reference.retired_at_unix_ms.is_none()
+    )));
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }

@@ -155,20 +155,17 @@ impl DistributedFs {
             let mut committed = 0;
             for inode_id in inode_ids {
                 loop {
-                    let target_seq = self
-                        .write_state(&inode_id)?
-                        .ok_or_else(|| stale("DFS write state is no longer open"))?
-                        .lock()
-                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?
-                        .visible_write_seq;
-                    let synced_seq = self
-                        .write_state(&inode_id)?
-                        .ok_or_else(|| stale("DFS write state is no longer open"))?
-                        .lock()
-                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?
-                        .committed_write_seq;
-                    if synced_seq >= target_seq {
-                        break;
+                    let Some(cell) = self.write_state(&inode_id)? else {
+                        break; // Concurrent terminal retirement removed the snapshot entry.
+                    };
+                    {
+                        let state = cell
+                            .lock()
+                            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                        if cell.is_retired() || state.committed_write_seq >= state.visible_write_seq
+                        {
+                            break;
+                        }
                     }
                     if let Some(seq) = self.commit_inode(
                         &inode_id,
@@ -177,7 +174,7 @@ impl DistributedFs {
                     )? {
                         self.update_handles_after_commit(&inode_id, seq)?;
                         committed += 1;
-                    } else {
+                    } else if !cell.is_retired() {
                         return Err(unavailable(
                             "DFS drain made no progress toward the accepted write sequence",
                         ));

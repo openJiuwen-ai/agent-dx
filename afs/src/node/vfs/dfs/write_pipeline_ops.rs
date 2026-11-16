@@ -153,10 +153,13 @@ impl DistributedFs {
         {
             let mut pending = 0_u64;
             for (_, cell) in states {
-                if let Ok(state) = cell.lock() {
-                    pending += u64::from(state.dirty_extents.native_operation_id.is_some());
-                    pending += u64::from(state.in_flight.is_some());
-                }
+                let Ok(state) = cell.try_lock() else {
+                    // Keep the previous complete sample if a writer holds an
+                    // inode during a Meta call. Metrics must not wait for it.
+                    return;
+                };
+                pending += u64::from(state.dirty_extents.native_operation_id.is_some());
+                pending += u64::from(state.in_flight.is_some());
             }
             metrics.native_write_resources(&[("pending_generations", pending)]);
         }
@@ -199,11 +202,14 @@ impl DistributedFs {
     fn dirty_owner_limit(&self, pipeline: &WritePipeline) -> Result<usize> {
         let mut writers = 0;
         for (_, cell) in self.pending_write_states()? {
-            let state = cell
-                .lock()
-                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-            if state.open_writers != 0 || state.dirty {
-                writers += 1;
+            match cell.try_lock() {
+                Ok(state) if state.open_writers == 0 && !state.dirty => {}
+                // Treat busy inodes as active instead of delaying another
+                // writer or overestimating its fair share of the budget.
+                Ok(_) | Err(std::sync::TryLockError::WouldBlock) => writers += 1,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(unavailable("DFS inode write state is poisoned"));
+                }
             }
         }
         Ok((16 * 1024 * 1024).max(pipeline.budget.snapshot().limit / writers.max(1)))
@@ -897,9 +903,15 @@ impl DistributedFs {
     }
 
     fn next_upload_for_cell(cell: &SharedInodeWriteState) -> Result<Option<Arc<PipelineUpload>>> {
-        let state = cell
-            .lock()
-            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        let state = match cell.try_lock() {
+            Ok(state) => state,
+            // This is a Node-wide scan, including after a foreground write.
+            // Busy inodes stay pending for the next writeback pass.
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(unavailable("DFS inode write state is poisoned"));
+            }
+        };
         if state.terminal_error.is_some()
             || state
                 .writeback_retry_at
@@ -950,7 +962,12 @@ impl DistributedFs {
             .tasks
             .lock()
             .map_err(|_| unavailable("native upload task table is poisoned"))?;
-        if task_table.len() >= pipeline.metadata.upload_limit {
+        if task_table.len() >= pipeline.metadata.upload_limit
+            || upload
+                .owner
+                .upgrade()
+                .is_none_or(|owner| owner.is_retired())
+        {
             return Ok(false);
         }
         {
@@ -1000,6 +1017,9 @@ impl DistributedFs {
                         }
                         Ok(receipts.remove(0))
                     });
+                // The result is the handoff to the harvester. The upload
+                // itself still owns the pin until installation or retirement.
+                drop(gc_pin);
                 // Hand the result to whoever harvests first: a barrier waiting
                 // on `cv`, or the next background pass (notified below).
                 if let Some(upload) = finished.upgrade() {
