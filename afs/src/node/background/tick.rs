@@ -14,12 +14,12 @@
 //!   3. `RemoteReleaseRetrier` (`retry_pending_remote_releases`),
 //!   4. `PeerSessionReaper::reap_owner_handles`,
 //!   5. `PeerSessionReaper::reap_lock_sessions`,
+//!   6. retry rejected-write retirement, with a bounded Meta probe pass.
 //!
 //!   all attempted, the first error kept (`drain_all`).
 //!
 //! Both arms share one `select!`, so a slow 5 s pass delays the next writeback
-//! progress exactly as before; running them as separate tasks would change
-//! that (S3 performance work, not S1).
+//! progress. Retirement does not run on the foreground upload harvester.
 //!
 //! Passes are counted in `afs_dfs_writeback_passes_total{trigger,outcome}`;
 //! `outcome="skipped"` is a notify that found no work.
@@ -151,15 +151,16 @@ impl DfsBackgroundTick {
                     _ = tick.tick() => {
                         let (releases, peers) = (releases.clone(), peers.clone());
                         match crate::node::bridge::spawn_blocking(move || {
-                            let [remote_releases, owner_handles, lock_sessions] = drain_all([
+                            let [remote_releases, owner_handles, lock_sessions, retired_writes] = drain_all([
                                 &|| releases.pass(),
                                 &|| peers.reap_owner_handles(),
                                 &|| peers.reap_lock_sessions(),
+                                &|| peers.fs.reap_unlinked_terminal_writes(),
                             ])?;
-                            Ok::<_, afs_error::Error>((remote_releases, owner_handles, lock_sessions))
+                            Ok::<_, afs_error::Error>((remote_releases, owner_handles, lock_sessions, retired_writes))
                         }).await {
-                            Ok(Ok((remote_releases, owner_handles, lock_sessions)))
-                                if remote_releases > 0 || owner_handles > 0 || lock_sessions > 0 =>
+                            Ok(Ok((remote_releases, owner_handles, lock_sessions, retired_writes)))
+                                if remote_releases > 0 || owner_handles > 0 || lock_sessions > 0 || retired_writes > 0 =>
                             {
                                 if remote_releases > 0 {
                                     afs_logging::info!("dfs.remote_releases_retried"; "count" => remote_releases);
@@ -169,6 +170,9 @@ impl DfsBackgroundTick {
                                 }
                                 if lock_sessions > 0 {
                                     afs_logging::info!("dfs.peer_lock_sessions_reaped"; "count" => lock_sessions);
+                                }
+                                if retired_writes > 0 {
+                                    afs_logging::debug!("dfs.unlinked_terminal_writes_reaped"; "count" => retired_writes);
                                 }
                             }
                             Ok(Ok(_)) => {}

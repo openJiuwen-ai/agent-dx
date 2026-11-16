@@ -245,6 +245,7 @@ fn last_upload_finishes_after_unlink_and_all_closes() {
     assert!(!control.admitted.lock().unwrap().is_empty());
     last_pause.0.release();
     native_wait_uploads(&fs, 2);
+    assert_eq!(fs.reap_unlinked_terminal_writes().unwrap(), 1);
     assert_resources_released(&fs, &inode, &references, &control);
 }
 
@@ -325,4 +326,165 @@ fn fuse_releases_unlinked_rejected_writes_in_both_orders() {
         assert_resources_released(&fs, &inode, &references, &control);
         session.join().unwrap();
     }
+}
+
+#[test]
+fn last_mutation_ticket_exit_releases_unlinked_terminal_write() {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(false, 2 * CHUNK, 8);
+    let (fs, references, control) = with_generation_pins(fs);
+    let file = create_file(&fs);
+    let inode = fs.inode_id(file.entry.inode).unwrap();
+    fs.write(&context(), file.handle, 0, &vec![0x61; CHUNK])
+        .unwrap();
+    native_wait_uploads(&fs, 1);
+    fs.release(&context(), file.handle).unwrap();
+
+    // This is the same ticket held by handleless setattr across its Meta RPC.
+    let cell = fs.write_state(&inode).unwrap().unwrap();
+    let mutation = fs.mutation_ticket(&cell).unwrap().unwrap();
+    unlink_file(&fs, &meta);
+    reject_next(&meta);
+    assert_eq!(fs.writeback_pending().unwrap(), 0);
+    assert!(cell.lock().unwrap().terminal_error.is_some());
+    assert!(fs.write_state(&inode).unwrap().is_some());
+    drop(mutation);
+    drop(cell);
+
+    assert_eq!(fs.writeback_pending().unwrap(), 0);
+    assert_eq!(fs.reap_unlinked_terminal_writes().unwrap(), 1);
+    assert_resources_released(&fs, &inode, &references, &control);
+}
+
+#[test]
+fn owner_reclaims_after_unlink_from_another_node() {
+    for unlink_after_rejection in [false, true] {
+        let (_temp, meta, owner, _runtime, _store) = native_pipeline_fixture(false, 2 * CHUNK, 8);
+        let (owner, references, control) = with_generation_pins(owner);
+        let peer_temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(peer_temp.path(), "node-b").unwrap());
+        let read_engine = Arc::new(DfsReadEngine::new(
+            NamespaceId::new("default"),
+            "node-b".into(),
+            local.clone(),
+            Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+            Arc::new(UnimplementedChunkTransfer),
+            DfsReadConfig::default(),
+        ));
+        let peer = test_dfs_new(
+            NamespaceId::new("default"),
+            "node-b",
+            "session-b",
+            meta.clone(),
+            local,
+            read_engine,
+        );
+        let file = create_file(&owner);
+        let inode = owner.inode_id(file.entry.inode).unwrap();
+        owner
+            .write(&context(), file.handle, 0, &vec![0x62; CHUNK])
+            .unwrap();
+        native_wait_uploads(&owner, 1);
+        owner.release(&context(), file.handle).unwrap();
+
+        if !unlink_after_rejection {
+            unlink_file(&peer, &meta);
+        }
+        let cell = owner.write_state(&inode).unwrap().unwrap();
+        assert_eq!(cell.lock().unwrap().inode.attributes.nlink, 1);
+        drop(cell);
+        reject_next(&meta);
+        assert_eq!(owner.writeback_pending().unwrap(), 0);
+        if unlink_after_rejection {
+            // A fresh check must not discard a still-linked terminal state.
+            assert_eq!(owner.reap_unlinked_terminal_writes().unwrap(), 0);
+            assert_eq!(
+                owner
+                    .write_state(&inode)
+                    .unwrap()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .inode
+                    .attributes
+                    .nlink,
+                1
+            );
+            assert_eq!(control.admitted.lock().unwrap().len(), 1);
+            unlink_file(&peer, &meta);
+            meta.fail_next_get_inode_with(unavailable("temporary Meta lookup error"));
+            assert_eq!(owner.reap_unlinked_terminal_writes().unwrap(), 0);
+            assert!(owner.write_state(&inode).unwrap().is_some());
+            assert_eq!(control.admitted.lock().unwrap().len(), 1);
+        }
+        assert_eq!(owner.writeback_pending().unwrap(), 0);
+        assert_eq!(owner.reap_unlinked_terminal_writes().unwrap(), 1);
+        assert_resources_released(&owner, &inode, &references, &control);
+    }
+}
+
+#[test]
+fn write_on_another_inode_does_not_wait_for_the_upload_owners_lease_renewal() {
+    let (_temp, meta, mut fs, _runtime, _store) = native_pipeline_fixture(false, 4 * CHUNK, 8);
+    let registry = afs_metrics::Registry::new();
+    Arc::get_mut(fs.write_resources.pipeline.as_mut().unwrap())
+        .unwrap()
+        .metrics = Some(crate::node::metrics::work::ReadWorkMetrics::register(&registry).unwrap());
+    *meta.files.lock().unwrap() = Some(HashMap::new());
+    let a = create_file(&fs);
+    let b = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("unrelated-writer"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), a.handle, 0, &vec![0x63; CHUNK])
+        .unwrap();
+    let pipeline = fs.write_resources.pipeline.as_ref().unwrap();
+    let upload = pipeline.tasks.lock().unwrap()[0].clone();
+    wait_until(|| upload.state.lock().unwrap().finished.is_some());
+    let a_inode = fs.inode_id(a.entry.inode).unwrap();
+    let a_cell = fs.write_state(&a_inode).unwrap().unwrap();
+    {
+        let mut write = a_cell.lock().unwrap();
+        write.write_lease.expires_at_unix_ms = now_unix_ms() + 1_000;
+        let mut renewed = write.write_lease.clone();
+        renewed.expires_at_unix_ms = u64::MAX;
+        meta.queue_renew_result(Ok(renewed));
+    }
+    let pause = meta.pause_next_renew();
+    std::thread::scope(|scope| {
+        let syncing_a = scope.spawn(|| fs.fsync(&context(), a.handle, SyncMode::Full));
+        let reached = bounded_renew_pause(&pause);
+        if !reached {
+            pause.release();
+            panic!("A did not reach the renewal gate");
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        let fs_b = &fs;
+        let writing_b = scope.spawn(move || {
+            send.send(fs_b.write(&context(), b.handle, 0, b"healthy"))
+                .unwrap();
+        });
+        let while_a_waits = receive.recv_timeout(Duration::from_secs(2));
+        pause.release();
+        writing_b.join().unwrap();
+        syncing_a.join().unwrap().unwrap();
+        assert_eq!(
+            while_a_waits
+                .expect("B's write was blocked by A's renewal")
+                .unwrap(),
+            7
+        );
+    });
+}
+
+fn bounded_renew_pause(pause: &RenewPause) -> bool {
+    let until = Instant::now() + Duration::from_secs(5);
+    while !pause.was_reached() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    pause.was_reached()
 }

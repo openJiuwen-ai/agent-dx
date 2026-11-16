@@ -234,22 +234,22 @@ impl DfsHandleTable {
     pub(super) fn without_file_users(
         &self,
         inode_id: &InodeId,
-        retire: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
+        retire: impl FnOnce() -> Result<bool>,
+    ) -> Result<bool> {
         let opening = self
             .opening
             .read(inode_id)
             .map_err(|_| unavailable("DFS open admission index is poisoned"))?;
         if opening.contains_key(inode_id) {
-            return Ok(());
+            return Ok(false);
         }
         let index = self.by_inode[Self::inode_shard(inode_id)]
             .lock()
             .map_err(|_| unavailable("DFS inode handle index is poisoned"))?;
-        if !index.contains_key(inode_id) {
-            retire()?;
+        if index.contains_key(inode_id) {
+            return Ok(false);
         }
-        Ok(())
+        retire()
     }
 
     pub(super) fn get(&self, id: u64) -> Result<Option<Arc<DfsHandle>>> {

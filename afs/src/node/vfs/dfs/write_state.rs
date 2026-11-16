@@ -302,6 +302,25 @@ impl InodeWriteState {
             || !self.native_queue.values.is_empty()
             || self.native_thread.is_some()
             || self.visible_write_seq > self.committed_write_seq
+            // Keep terminal states discoverable for retirement, including a
+            // failed metadata-only commit that carries no dirty data.
+            || self.has_definite_commit_rejection()
+    }
+
+    fn has_definite_commit_rejection(&self) -> bool {
+        self.terminal_error
+            .as_ref()
+            .is_some_and(is_definite_commit_rejection)
+    }
+
+    fn can_reap_rejected_write(&self) -> bool {
+        self.has_definite_commit_rejection()
+            && self.open_writers == 0
+            && !self.commit_busy
+            && !self.operation_busy
+            && self.in_flight.is_none()
+            && self.native_queue.values.is_empty()
+            && self.native_thread.is_none()
     }
 
     /// This Node has write activity on the inode: an open local writer,
@@ -462,6 +481,8 @@ pub(super) struct InodeWriteTable {
     pub(super) lock_wait: Option<Arc<InodeLockWait>>,
     /// Rotation cursor so lease renewal is fair across passes.
     pub(super) lease_cursor: AtomicU64,
+    /// Rotate bounded Meta probes independently of the write-lease pass.
+    retirement_cursor: AtomicU64,
 }
 
 impl InodeWriteTable {
@@ -528,23 +549,28 @@ impl DistributedFs {
     }
 
     pub(super) fn retire_unlinked_terminal_cell(&self, cell: &SharedInodeWriteState) -> Result<()> {
-        let state = cell
-            .lock()
-            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        self.try_retire_rejected_write(cell, false)?;
+        Ok(())
+    }
+
+    fn try_retire_rejected_write(
+        &self,
+        cell: &SharedInodeWriteState,
+        confirmed_unlinked: bool,
+    ) -> Result<bool> {
+        let state = match cell.try_lock() {
+            Ok(state) => state,
+            // Background maintenance revisits a state that is still busy.
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(unavailable("DFS inode write state is poisoned"));
+            }
+        };
         if cell.is_retired()
-            || state.inode.attributes.nlink != 0
-            || !state
-                .terminal_error
-                .as_ref()
-                .is_some_and(is_definite_commit_rejection)
-            || state.open_writers != 0
-            || state.commit_busy
-            || state.operation_busy
-            || state.in_flight.is_some()
-            || !state.native_queue.values.is_empty()
-            || state.native_thread.is_some()
+            || !confirmed_unlinked && state.inode.attributes.nlink != 0
+            || !state.can_reap_rejected_write()
         {
-            return Ok(());
+            return Ok(false);
         }
         // Keep the inode state stable while excluding new users and upload
         // starts. Registration and upload starts never take the state lock
@@ -563,7 +589,7 @@ impl DistributedFs {
                 .as_ref()
                 .is_some_and(|tasks| tasks.iter().any(|upload| upload.owner.ptr_eq(&owner)))
             {
-                return Ok(());
+                return Ok(false);
             }
             let mut states = self
                 .writes
@@ -574,7 +600,7 @@ impl DistributedFs {
                 .get(inode_id)
                 .is_some_and(|current| Arc::ptr_eq(current, cell))
             {
-                return Ok(());
+                return Ok(false);
             }
             let mut pending = self
                 .writes
@@ -584,8 +610,76 @@ impl DistributedFs {
             cell.retired.store(true, Ordering::Release);
             pending.remove(inode_id);
             states.remove(inode_id);
-            Ok(())
+            Ok(true)
         })
+    }
+
+    /// Retry retirement after mutations or uploads have left, and discover
+    /// unlinks performed through a peer Node. Runs on the maintenance tick,
+    /// outside foreground writes and the upload harvester.
+    pub(crate) fn reap_unlinked_terminal_writes(&self) -> Result<usize> {
+        const MAX_META_CHECKS: usize = 8;
+        const META_CHECK_BUDGET: Duration = Duration::from_millis(500);
+
+        let mut retired = 0;
+        let mut linked = Vec::new();
+        for (inode_id, cell) in self.pending_write_states()? {
+            let nlink = match cell.try_lock() {
+                Ok(state) if !cell.is_retired() && state.can_reap_rejected_write() => {
+                    state.inode.attributes.nlink
+                }
+                _ => continue,
+            };
+            if nlink == 0 {
+                retired += usize::from(self.try_retire_rejected_write(&cell, false)?);
+            } else if self.handles.without_file_users(&inode_id, || Ok(true))? {
+                linked.push((inode_id, cell));
+            }
+        }
+        if linked.is_empty() {
+            return Ok(retired);
+        }
+        // Cap each sweep and give later candidates their turn even if earlier
+        // ones still have links or Meta temporarily cannot check them.
+        linked.sort_unstable_by(|left, right| left.0.0.cmp(&right.0.0));
+        let cursor = self.writes.retirement_cursor.load(Ordering::Relaxed) as usize % linked.len();
+        linked.rotate_left(cursor);
+        let deadline = Instant::now() + META_CHECK_BUDGET;
+        for (inode_id, cell) in linked.into_iter().take(MAX_META_CHECKS) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            self.writes
+                .retirement_cursor
+                .fetch_add(1, Ordering::Relaxed);
+            let observed = crate::node::call_deadline::within(deadline, || {
+                self.meta.get_inode(&inode_id).and_then(|inode| {
+                    let inode = self.validate_inode(inode)?;
+                    if inode.inode_id != inode_id {
+                        return Err(unavailable(
+                            "Meta returned a different inode during retirement",
+                        ));
+                    }
+                    Ok(inode.attributes.nlink == 0)
+                })
+            });
+            let unlinked = match observed {
+                Ok(unlinked) => unlinked,
+                Err(error) if error.code() == afs_error::NODE_VFS_NOT_FOUND => true,
+                Err(error) => {
+                    afs_logging::debug!("dfs.retirement_meta_retry";
+                        "inode_id" => inode_id.0.as_str(), "error" => error.to_string()
+                    );
+                    continue;
+                }
+            };
+            // Meta never relinks an inode after nlink reaches zero. Recheck
+            // that this cell still has a rejection and no users after the RPC.
+            if unlinked {
+                retired += usize::from(self.try_retire_rejected_write(&cell, true)?);
+            }
+        }
+        Ok(retired)
     }
 
     // The three predicates below deliberately ignore `background_error`: they
