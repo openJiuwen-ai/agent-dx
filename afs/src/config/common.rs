@@ -118,6 +118,9 @@ impl Config {
         if self.dfs_read_diagnostics_enabled {
             options.push(("dfs_read_diagnostics_enabled", "diagnostic"));
         }
+        if self.tls_mode == super::TlsMode::Insecure {
+            options.push(("tls_mode=insecure", "insecure"));
+        }
         options
     }
 
@@ -126,6 +129,15 @@ impl Config {
         for (option, category) in self.non_product_options() {
             afs_logging::warn!("config.test_only_option_enabled";
                 "option" => option, "category" => category);
+        }
+        // `tls_mode = "insecure"` removes transport identity rather than
+        // weakening it, so it gets its own named warning: an operator scanning
+        // a startup log for the reason peers are unauthenticated should not
+        // have to know that the generic non-product line covers it.
+        if self.tls_mode == super::TlsMode::Insecure {
+            afs_logging::warn!("afs.transport.insecure_no_mtls";
+                "node" => self.id.as_str(),
+                "trusted_node_ips" => self.trusted_node_ips.len());
         }
     }
 }

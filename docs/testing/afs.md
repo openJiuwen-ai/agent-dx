@@ -1289,6 +1289,32 @@ mode mismatch, open authorization reuse and progress past a slow handshake.
 Runtime qualification and performance remain separate evidence: the earlier
 peer-only 60/84 experiment is not a performance result for this unified code.
 
+### Certificate-free trust mode (`tls_mode = "insecure"`)
+
+A non-product mode for temporary validation; see the deployment guide. Test
+coverage and its limits:
+
+- `config_contract`: no-certificate resolution selects `TlsConfig::Disabled`;
+  every forbidden mixture (a single `tls_*` field, all four, `trusted_node_certs`,
+  `tls_encryption_enabled`, https endpoints, unsafe/duplicate/IPv6 addresses) is
+  refused with `CONFIG_INVALID`; `trusted_node_ips` outside this mode is
+  refused; `tls_mode` defaults to `mutual`; the shipped certificate-free
+  examples resolve.
+- `node::rpc::data::owner_tests`: source-address identity, port independence,
+  fail-closed for an unlisted or absent address, no substitution of a peer
+  certificate for an address, and rejected ambiguous/IPv6 configuration.
+- `meta::tests`: the policy approves the mode with enforcement off instead of
+  demanding a certificate table; a certificate table alongside it is still
+  refused; a certificate-free Meta opens its durable backend and keeps serving.
+- Mutual mode regression: `shipped_examples_resolve_with_mutual_tls_and_node_identity_binding`
+  and `filesystem_authority_rejects_disabled_tls_before_backend_or_listeners`
+  stay green, so the product mode does not loosen.
+
+Not covered, and not implied by these tests: confidentiality, integrity,
+resistance to source-address spoofing, separation of multiple Nodes on one host,
+or any multi-VM runtime acceptance of this mode. A mismatched mode between two
+processes is only observed as a connection failure, never as a downgrade.
+
 ## Ordinary write ownership admission
 
 Native local-owner ordinary DFS FUSE writes use bounded owned admission by default;

@@ -178,8 +178,30 @@ sudo adxctl validate
 证书绑定表不能替代 TLS 配置；启用 OwnerFs 或 DFS 权威的 Meta 缺少 mTLS 时，
 必须在监听端口和打开持久后端前拒绝启动。
 
+### 临时验证：关闭证书身份（`tls_mode = "insecure"`）
+
+尚未建立证书分发、只需要把集群跑起来时，可显式设置 `tls_mode = "insecure"`。
+这是**非产品选项**，与 `allow_volatile_meta` 同级：启动日志打印
+`afs.transport.insecure_no_mtls`，并出现在 `non_product_options` 中。
+
+此模式下参照 `build/config/examples/afs/{meta,node}-insecure.toml`：
+
+- 不配置任何 `tls_*` 字段，也不配置 `trusted_node_certs`；与任一证书设置同时出现会被拒绝。
+- Node 用 `[trusted_node_ips]`（Node ID → 该节点主动拨出的 IPv4 地址）识别对端；
+  地址不属于表中任何 Node 的连接一律 fail-closed。同一地址不能映射到两个 Node。
+- Meta 不校验传输身份：`authenticated_node_id` 返回"无身份"，各 authority RPC
+  信任请求里声明的 Node ID，因此 Meta 侧不需要地址表。
+- 所有 endpoint（`meta_endpoint`、`advertise_endpoint`、`peer_endpoint`）必须是
+  `http://`；该模式下传输层原样使用 URI，写成 `https://` 会在连接期才失败，故在启动时拒绝。
+
+安全性边界必须明确：链路无保密、无密码学防篡改；同网段内能发包的进程可以冒用
+任一表中 Node ID；也无法区分同一主机上的多个 Node 进程。**仅用于受控网络的临时验证**，
+建立证书分发后删除 `tls_mode`（或设为 `mutual`）并配置 `trusted_node_certs` 即回到产品模式，
+没有数据迁移。
+
 **Meta 读授权模型（M0，单一信任域）**：一个 AFS 集群就是一个信任域，任何受信 Node
 （证书能映射到 `trusted_node_certs` 中某个 Node）都可以读全部 DFS 元数据。
+`tls_mode = "insecure"` 下"受信 Node"退化为"请求声明的 Node ID"，其余授权判断不变。
 Meta 的每个 gRPC 都要求这样的证书：写类与授权类 RPC 还校验请求中声明的
 caller／holder／owner 等于证书对应的 Node；DFS 读 RPC（`Lookup`、`ReadDir`、`ReadLink`、
 `GetInode`、`GetFileVersion`、`GetXattr`、`ListXattr`）以及 `Ping`、`LookupNode` 只校验证书
@@ -291,12 +313,14 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `meta_etcd_max_request_bytes` | 产品差异 | Meta | `1572864` | 与 etcd 服务端 `--max-request-bytes` 一致；限制单次原子追加、checkpoint 分块与大记录分段，256KiB..=1GiB |
 | `meta_store_prefix` | 产品差异 | Meta | `afs/meta` | `redis`／`etcd` 后端的 key 前缀，1..=128 个可打印 ASCII，不含空格、`*?[]\\`，不以 `/` 结尾 |
 | `advertise_endpoint` | 产品差异 | Node | 无 | 对外发布的本 Node gRPC URI；未设时由 `grpc_listen` 推导，监听 `0.0.0.0` 时必须显式指定 |
-| `tls_encryption_enabled` | 产品差异 | 两者 | `false` | mTLS 认证之后是否加密内部流量 |
-| `tls_ca_certificate` | 产品差异 | 两者 | 无 | 内部 mTLS 的 CA 证书路径 |
-| `tls_identity_certificate` | 产品差异 | 两者 | 无 | 本进程身份证书路径 |
-| `tls_identity_private_key` | 产品差异 | 两者 | 无 | 本进程身份私钥路径 |
-| `tls_server_name` | 产品差异 | 两者 | 无 | 校验对端证书用的服务名 |
-| `trusted_node_certs` | 产品差异 | 两者 | `{}` | Node ID 到证书的绑定表。仅 TOML |
+| `tls_mode` | 产品差异 | 两者 | `mutual` | `mutual` 校验双向证书身份；`insecure` 关闭证书身份，仅用于临时验证，见上节 |
+| `tls_encryption_enabled` | 产品差异 | 两者 | `false` | mTLS 认证之后是否加密内部流量；`insecure` 下必须保持 false |
+| `tls_ca_certificate` | 产品差异 | 两者 | 无 | 内部 mTLS 的 CA 证书路径；`insecure` 下禁止配置 |
+| `tls_identity_certificate` | 产品差异 | 两者 | 无 | 本进程身份证书路径；`insecure` 下禁止配置 |
+| `tls_identity_private_key` | 产品差异 | 两者 | 无 | 本进程身份私钥路径；`insecure` 下禁止配置 |
+| `tls_server_name` | 产品差异 | 两者 | 无 | 校验对端证书用的服务名；`insecure` 下禁止配置 |
+| `trusted_node_certs` | 产品差异 | 两者 | `{}` | Node ID 到证书的绑定表，`mutual` 专用。仅 TOML |
+| `trusted_node_ips` | 产品差异 | Node | `{}` | Node ID 到该节点拨出 IPv4 地址的绑定表，`insecure` 专用且与 `trusted_node_certs` 互斥。仅 TOML |
 | `fs` | 产品差异 | 两者 | 全部已编译后端 | `ownerfs`、`dfs` 或 `all`；`--print-config` 把它展开成 `ownerfs`、`dfs` 两个布尔值 |
 | `data_mode` | 产品差异 | Node | `grpc` | Node 间数据通道：`grpc`、`rdma` 或 `auto`；`rdma` 需要编译 `rdma` feature |
 | `rdma_device` | 产品差异 | Node | 无 | RDMA 设备名；OwnerFs 的 `rdma` 模式必填 |

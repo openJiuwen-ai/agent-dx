@@ -70,12 +70,7 @@ pub(super) fn start(
         grpc_config.configure_tcp_incoming(tonic::transport::server::TcpIncoming::from(grpc));
     let incoming = grpc_security.incoming(incoming)?;
     // 业务 Handler 在 Node，公共 transport 只提供 builder 配置和低层搬运机制。
-    #[cfg(any(feature = "ownerfs", feature = "dfs"))]
-    let dfs_trusted = cfg
-        .trusted_node_certs
-        .iter()
-        .map(|(node_id, path)| Ok((node_id.clone(), crate::config::read_certificate_der(path)?)))
-        .collect::<afs_error::Result<Vec<_>>>()?;
+    let peer_identity = super::common::peer_authenticator(cfg)?;
     let control = rpc::control::NodeControlService::new(sessions.clone()).into_server();
     // One bound on long advisory lock waits across both backends' control services.
     #[cfg(any(feature = "ownerfs", feature = "dfs"))]
@@ -85,7 +80,7 @@ pub(super) fn start(
         rpc::control::DfsOwnerControlService::with_dfs_owner(
             lock_waits.clone(),
             dfs.clone(),
-            Arc::new(rpc::data::MtlsPeerAuthenticator::new(dfs_trusted.clone())?),
+            peer_identity.clone(),
         )
     } else {
         rpc::control::DfsOwnerControlService::new(lock_waits.clone())
@@ -93,7 +88,7 @@ pub(super) fn start(
     .into_server();
     #[cfg(feature = "ownerfs")]
     let owner_control =
-        ownerfs::owner_control_server(state, &dfs_trusted, owner_rdma_sessions, lock_waits)?;
+        ownerfs::owner_control_server(state, &peer_identity, owner_rdma_sessions, lock_waits)?;
     let data = rpc::data::make_data_server(diagnostic_storage, sessions.clone());
     #[cfg(feature = "dfs")]
     let dfs_read_authorizer: Arc<dyn rpc::data::DfsReadAuthorizer> = match dfs_meta.as_ref() {
@@ -116,7 +111,7 @@ pub(super) fn start(
     #[cfg(feature = "dfs")]
     let dfs_chunks = rpc::data::make_dfs_chunks_server_with_transport(
         local_chunk_store.clone(),
-        Arc::new(rpc::data::MtlsPeerAuthenticator::new(dfs_trusted.clone())?),
+        peer_identity.clone(),
         dfs_read_authorizer,
         dfs_replica_authorizer,
         Some(dfs_replica_plane.clone()),
@@ -145,7 +140,7 @@ pub(super) fn start(
             let dfs_owner_files = if let Some(dfs) = grpc_state.dfs.as_ref() {
                 rpc::data::make_dfs_owner_files_server(rpc::data::DfsOwnerFilesService::new(
                     dfs.clone(),
-                    Arc::new(rpc::data::MtlsPeerAuthenticator::new(dfs_trusted.clone())?),
+                    peer_identity.clone(),
                 ))
             } else {
                 rpc::data::make_dfs_owner_files_server(rpc::data::DfsOwnerFilesService::default())

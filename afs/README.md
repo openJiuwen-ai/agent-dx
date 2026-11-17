@@ -7,8 +7,11 @@ OwnerFs 与 DistributedFs（DFS）两种文件访问模式。`afs-meta` 管理�
 保持独立，只复用 ADX 的构建、发布与进程管理入口。
 
 AFS 默认不进入普通 ADX 构建和发布包；通过 `ADX_WITH_AFS=1` 显式启用。
-当前部署必须保留双向证书身份认证，并把每张受信节点证书精确绑定到一个 Node ID。
-组件间持续传输加密由统一的 `tls_encryption_enabled` 控制，默认 false；证书配置仍必需。
+产品部署保留双向证书身份认证（`tls_mode` 默认 `mutual`），并把每张受信节点证书精确
+绑定到一个 Node ID。组件间持续传输加密由统一的 `tls_encryption_enabled` 控制，
+默认 false；证书配置仍必需。尚未建立证书分发时，可用非产品选项
+`tls_mode = "insecure"` 以源地址识别对端，仅限受控网络的临时验证，见
+[部署文档](../docs/deployment/afs.md)。
 DFS Peer 客户端允许接收 128 KiB HTTP/2 DATA 帧；业务消息、流控窗口、正文预算、
 并发和校验合同保持不变，对端仍可发送更小的帧。
 
@@ -257,6 +260,14 @@ full TLS, including when using standard TLS-only diagnostic clients. False uses
 an AFS-specific authenticated-handshake/plaintext protocol and gives no subsequent
 cryptographic confidentiality or integrity. See
 [transport contract](../docs/testing/afs.md#unified-internal-transport-encryption).
+
+`tls_mode = "insecure"` is a separate, non-product mode for temporary validation
+before a certificate authority exists. It removes certificate identity instead of
+weakening it: a Node resolves the peer id from the source address in
+`trusted_node_ips`, and Meta trusts the node id a request declares. It requires
+plaintext endpoints, forbids every `tls_*` field and `trusted_node_certs`, and is
+reported at startup and by `non_product_options`. It is never a fallback: the
+default stays `mutual`, and a mismatched pair fails to connect.
 
 ### 普通 DFS 写入的回复点
 

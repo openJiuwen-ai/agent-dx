@@ -1,0 +1,42 @@
+# Temporary-validation AFS Node: no certificates, no certificate distribution.
+#
+# This is a NON-PRODUCT option (`tls_mode = "insecure"`). Node identity comes
+# from the connection source address in `[trusted_node_ips]` instead of a
+# mutually authenticated certificate, so:
+#   - internal traffic is plaintext with no cryptographic integrity;
+#   - any process on a listed host can claim that Node id;
+#   - a listed address can be spoofed from the same network segment.
+# Use it only on a controlled network while no certificate authority is
+# available, and switch to `tls_mode = "mutual"` (or omit it) with
+# `trusted_node_certs` before any real deployment.
+
+# Endpoints must stay http:// in this mode: the disabled transport returns the
+# URI unchanged, so https:// would only fail when the pool dials it.
+id = "node-a"
+fs = "all"
+grpc_listen = "192.168.2.212:7500"
+# Required when grpc_listen does not bind a concrete address.
+advertise_endpoint = "http://192.168.2.212:7500"
+rest_listen = "192.168.2.212:7501"
+meta_endpoint = "http://192.168.2.211:7400"
+data_mode = "grpc"
+data_dir = "/opt/adx/data/afs/node-a"
+uds_path = "/opt/adx/run/afs/node-a.sock"
+ownerfs_mount = "/mnt/adx/ownerfs"
+dfs_mount = "/mnt/adx/dfs"
+log_level = "info"
+trace_enabled = false
+
+tls_mode = "insecure"
+
+# Every Node that may dial this one, with the address it dials from. Keys are
+# Node ids and are held to the same 1..128 letter/digit/_/- rule as `id`,
+# because consumers turn them into path segments. Values are IPv4 literals;
+# an address may appear only once.
+[trusted_node_ips]
+node-a = "192.168.2.212"
+node-b = "192.168.2.213"
+
+# Optional external S3 durability for a NEW DFS filesystem only. Configure the
+# same store/generation on Meta and every DFS Node.
+# [dfs_external_backend]

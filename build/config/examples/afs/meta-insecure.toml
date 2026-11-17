@@ -1,0 +1,20 @@
+# Temporary-validation afs-meta: no certificates, no certificate distribution.
+#
+# Non-product option; see node-insecure.toml for the full caveat list. Meta
+# keeps no peer certificate table in this mode: `authenticated_node_id` returns
+# "no transport identity", so every authority RPC trusts the node id a request
+# declares. The source-address allow-list lives on the Node side, which is the
+# only place a peer address is observable.
+#
+# Set the same `tls_mode` on Meta and every Node. A mismatched pair fails at
+# connect time; there is no automatic fallback.
+
+id = "meta"
+fs = "all"
+grpc_listen = "192.168.2.211:7400"
+rest_listen = "127.0.0.1:7401"
+meta_store = "local-file"
+log_level = "info"
+trace_enabled = false
+
+tls_mode = "insecure"

@@ -2467,3 +2467,211 @@ fn dfs_kernel_cache_ttl_defaults_to_one_second_and_rejects_out_of_range() {
     .unwrap_err();
     assert_eq!(error.code(), afs_error::CONFIG_INVALID);
 }
+
+// ---------------------------------------------------------------------------
+// tls_mode = "insecure": temporary-validation trust mode
+// ---------------------------------------------------------------------------
+
+/// A Node OwnerFs config that is valid in every mode, with the TLS section
+/// left to the caller. Non-loopback listen keeps `advertise_endpoint` optional.
+const INSECURE_BASE: &str = "id = 'node-a'\n\
+fs = 'ownerfs'\ngrpc_listen = '192.168.2.212:7500'\n\
+meta_endpoint = 'http://192.168.2.211:7400'\n\
+tls_mode = 'insecure'\n";
+
+fn resolve_text(role: Role, text: &str) -> afs_error::Result<Config> {
+    resolve_toml(role, text)
+}
+
+#[test]
+fn insecure_mode_resolves_without_any_certificate_and_selects_disabled_transport() {
+    let cfg = resolve_text(
+        Role::Node,
+        &format!("{INSECURE_BASE}[trusted_node_ips]\nnode-a = '192.168.2.212'\nnode-b = '192.168.2.213'\n"),
+    )
+    .unwrap();
+    assert_eq!(cfg.tls_mode, afs::config::TlsMode::Insecure);
+    assert_eq!(
+        cfg.tls_config(),
+        afs_transport::TlsConfig::Disabled,
+        "insecure mode must not build a TLS identity"
+    );
+    assert_eq!(cfg.trusted_node_ips.len(), 2);
+    assert!(cfg.trusted_node_certs.is_empty());
+    assert!(
+        cfg.non_product_options()
+            .contains(&("tls_mode=insecure", "insecure")),
+        "the non-product trust mode must be discoverable from the config"
+    );
+}
+
+#[test]
+fn insecure_mode_requires_trusted_node_ips_for_a_filesystem_authority() {
+    let error = resolve_text(Role::Node, INSECURE_BASE).unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(error.to_string().contains("trusted_node_ips"));
+}
+
+#[test]
+fn insecure_mode_rejects_every_certificate_setting() {
+    // One tls_* field, all four, trusted_node_certs, and encryption must each
+    // be refused: a mixture would make "how is a peer authenticated"
+    // unanswerable from the configuration.
+    for extra in [
+        "tls_ca_certificate = '/etc/afs/ca.pem'\n",
+        "tls_ca_certificate = '/etc/afs/ca.pem'\ntls_identity_certificate = '/etc/afs/n.pem'\n\
+         tls_identity_private_key = '/etc/afs/n.key'\ntls_server_name = 'afs-cluster'\n",
+        "tls_encryption_enabled = true\n",
+        "[trusted_node_certs]\nnode-b = '/etc/afs/node-b.pem'\n",
+    ] {
+        let text = format!("{INSECURE_BASE}[trusted_node_ips]\nnode-a = '192.168.2.212'\n{extra}");
+        let error = resolve_text(Role::Node, &text).unwrap_err();
+        assert_eq!(
+            error.code(),
+            afs_error::CONFIG_INVALID,
+            "expected a config error for: {extra}"
+        );
+    }
+}
+
+#[test]
+fn insecure_mode_rejects_https_endpoints_before_dialing() {
+    // TlsConfig::Disabled returns the URI unchanged, so https:// would only
+    // fail inside the connection pool; startup must reject it.
+    let text = INSECURE_BASE.replace(
+        "meta_endpoint = 'http://192.168.2.211:7400'",
+        "meta_endpoint = 'https://192.168.2.211:7400'",
+    ) + "[trusted_node_ips]\nnode-a = '192.168.2.212'\n";
+    let error = resolve_text(Role::Node, &text).unwrap_err();
+    assert!(error.to_string().contains("meta_endpoint"));
+
+    let text = format!(
+        "{INSECURE_BASE}advertise_endpoint = 'https://192.168.2.212:7500'\n\
+         [trusted_node_ips]\nnode-a = '192.168.2.212'\n"
+    );
+    let error = resolve_text(Role::Node, &text).unwrap_err();
+    assert!(error.to_string().contains("advertise_endpoint"));
+}
+
+#[test]
+fn insecure_mode_rejects_unsafe_or_duplicate_node_addresses() {
+    for table in [
+        // Node ids become path segments on every consumer.
+        "[trusted_node_ips]\n'../escape' = '192.168.2.212'\n",
+        // Two nodes behind one address cannot be told apart.
+        "[trusted_node_ips]\nnode-a = '192.168.2.212'\nnode-b = '192.168.2.212'\n",
+        // The deployment boundary is IPv4, matching adxlet's own check.
+        "[trusted_node_ips]\nnode-a = '2001:db8::1'\n",
+    ] {
+        let error = resolve_text(Role::Node, &format!("{INSECURE_BASE}{table}")).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    }
+}
+
+#[test]
+fn trusted_node_ips_is_refused_outside_insecure_mode() {
+    let text = "id = 'node-a'\nfs = 'ownerfs'\ngrpc_listen = '192.168.2.212:7500'\n\
+                [trusted_node_ips]\nnode-a = '192.168.2.212'\n";
+    let error = resolve_text(Role::Node, text).unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(error.to_string().contains("trusted_node_ips"));
+}
+
+#[test]
+fn mutual_mode_still_requires_the_complete_certificate_set() {
+    // Regression: the pre-existing contract for the product mode must not
+    // loosen while `insecure` is introduced.
+    let text = "id = 'node-a'\nfs = 'ownerfs'\ngrpc_listen = '192.168.2.212:7500'\n\
+                meta_endpoint = 'https://192.168.2.211:7400'\ntls_mode = 'mutual'\n\
+                tls_ca_certificate = '/etc/afs/ca.pem'\n";
+    let error = resolve_text(Role::Node, text).unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(error.to_string().contains("all four tls_* fields"));
+}
+
+#[test]
+fn tls_mode_defaults_to_mutual_and_keeps_the_shipped_examples_working() {
+    let cfg = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--id", "tls-default"]),
+    )
+    .unwrap();
+    assert_eq!(cfg.tls_mode, afs::config::TlsMode::Mutual);
+    assert!(cfg.non_product_options().is_empty());
+}
+
+#[test]
+fn tls_mode_cli_overrides_the_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mode.toml");
+    std::fs::write(
+        &path,
+        format!("{INSECURE_BASE}[trusted_node_ips]\nnode-a = '192.168.2.212'\n"),
+    )
+    .unwrap();
+    let cfg = Config::resolve(
+        Role::Node,
+        Cli::parse_from([
+            "afs-node",
+            "--config",
+            path.to_str().unwrap(),
+            "--tls-mode",
+            "mutual",
+        ]),
+    );
+    // The file's insecure tables now contradict the CLI's mutual mode.
+    let error = cfg.unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+}
+
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+#[test]
+fn insecure_examples_resolve_without_certificates_on_both_roles() {
+    // The example files are the only documented starting point for a
+    // certificate-free deployment; a schema change must not silently break
+    // them.
+    let examples =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../build/config/examples/afs");
+    let meta = Config::resolve(
+        Role::Meta,
+        Cli::parse_from([
+            "afs-meta",
+            "--config",
+            examples.join("meta-insecure.toml").to_str().unwrap(),
+        ]),
+    )
+    .unwrap();
+    let node = Config::resolve(
+        Role::Node,
+        Cli::parse_from([
+            "afs-node",
+            "--config",
+            examples.join("node-insecure.toml").to_str().unwrap(),
+        ]),
+    )
+    .unwrap();
+
+    for cfg in [&meta, &node] {
+        assert_eq!(cfg.tls_mode, afs::config::TlsMode::Insecure);
+        assert_eq!(cfg.tls_config(), afs_transport::TlsConfig::Disabled);
+        assert!(cfg.trusted_node_certs.is_empty());
+        assert_eq!(
+            cfg.non_product_options()
+                .iter()
+                .filter(|(option, _)| *option == "tls_mode=insecure")
+                .count(),
+            1
+        );
+    }
+    assert_eq!(node.trusted_node_ips.len(), 2);
+    assert!(node.trusted_node_ips.contains_key("node-b"));
+    // Meta has no peer-address table: it never observes a peer address.
+    assert!(meta.trusted_node_ips.is_empty());
+    assert!(
+        node.meta_endpoint
+            .as_deref()
+            .unwrap()
+            .starts_with("http://"),
+        "endpoints must stay plaintext in this mode"
+    );
+}
