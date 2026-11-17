@@ -977,21 +977,40 @@ impl Ingress {
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let stream = crate::common::traffic::MeteredIo::new(stream, &self.request_metrics.traffic);
+        let (stream, upgrade_decision) = super::http10_websocket::Http10WebSocketIo::new(stream);
         let gateway = self;
         let service = service_fn(move |request: Request<Incoming>| {
             let gateway = gateway.clone();
             let options = options.clone();
+            let upgrade_decision = upgrade_decision.clone();
             async move {
-                if options
+                let connect = request.method() == http::Method::CONNECT;
+                let upgrade = connect
+                    || request
+                        .headers()
+                        .get_all(header::CONNECTION)
+                        .iter()
+                        .filter_map(|value| value.to_str().ok())
+                        .flat_map(|value| value.split(','))
+                        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+                let response = if options
                     .as_ref()
                     .is_some_and(|options| !options.allows(request.method(), request.uri().path()))
                 {
-                    return Ok(plain(
+                    plain(
                         StatusCode::FORBIDDEN,
                         "route is not allowed on this listener",
-                    ));
+                    )
+                } else {
+                    gateway.handle_http(request, ingress_security, peer).await?
+                };
+                if upgrade {
+                    upgrade_decision.response(
+                        response.status() == StatusCode::SWITCHING_PROTOCOLS
+                            || (connect && response.status().is_success()),
+                    );
                 }
-                gateway.handle_http(request, ingress_security, peer).await
+                Ok::<_, Infallible>(response)
             }
         });
         // Official E2B transports may use cleartext HTTP/2. Protocol detection
