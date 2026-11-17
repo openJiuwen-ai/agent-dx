@@ -2003,6 +2003,33 @@ mod tests {
         assert_eq!(output.reservation.home_session_id, "session-a");
     }
 
+    /// `pin_home` 只作用于纳管；普通新建仍必须按负载均衡分散到别的节点。
+    #[tokio::test]
+    async fn load_balancing_without_pin_home_still_distributes_new_roots() {
+        let store = open_store().await;
+        register_node(&store, "node-a", "session-a").await;
+        register_node(&store, "node-b", "session-b").await;
+        let authority = StoreOwnerRootAuthority::with_load_balancing(store, true);
+        let mut homes = std::collections::HashSet::new();
+        for index in 0..16u32 {
+            let root_id = format!("root-{index:016x}");
+            let mut input = reserve_input(
+                "node-a",
+                "session-a",
+                &format!("reserve-lb-{index}"),
+                &format!("node-a:session-a:{root_id}"),
+            );
+            input.root_id = root_id;
+            input.pin_home = false;
+            let output = authority.reserve_root(input).await.expect("reserve root");
+            homes.insert(output.reservation.home_node_id);
+        }
+        assert!(
+            homes.contains("node-b"),
+            "load balancing must not pin every new root to the requester: {homes:?}"
+        );
+    }
+
     #[tokio::test]
     async fn activate_replay_rejects_a_different_prepare_identity() {
         let store = open_store().await;

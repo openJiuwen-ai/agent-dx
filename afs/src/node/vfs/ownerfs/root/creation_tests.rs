@@ -171,6 +171,38 @@ fn reserving_a_reserved_name_is_refused_before_meta_is_asked() {
     assert_eq!(error.code(), afs_error::NODE_VFS_INVALID);
 }
 
+/// P0′/P4/P6：非 UTF-8、`.ownerfs-` 前缀和超长名字都在问 Meta 之前拒绝。
+#[test]
+fn create_entries_reject_non_utf8_ownerfs_prefix_and_overlong_names() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+    let manager = RootManager::open(
+        "home".into(),
+        "home-session".into(),
+        Arc::new(Meta::default()),
+        disk,
+    )
+    .unwrap();
+
+    for name in [
+        OsStr::new(".ownerfs-roots"),
+        OsStr::from_bytes(b"bad\xffname"),
+    ] {
+        let error = manager.reserve_workspace(name).unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_VFS_INVALID, "{name:?}");
+    }
+
+    // trash 名 = 5 + 2*n + 2 + 20 字节：n=114 可建，n=115 必须拒绝。
+    assert!(validate_root_name(OsStr::new(&"a".repeat(114))).is_ok());
+    let error = manager
+        .reserve_workspace(OsStr::new(&"a".repeat(115)))
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_VFS_INVALID);
+    assert!(error.to_string().contains("trash"));
+}
+
 impl Fixture {
     fn new(mode: u32) -> Self {
         let temp = tempfile::tempdir().unwrap();
