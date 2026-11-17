@@ -45,6 +45,45 @@ fn pressure_uses_hysteresis_and_does_not_open_on_partial_recovery() {
     }));
 }
 
+#[test]
+fn pressure_sampling_failure_before_first_observation_allows_admission() {
+    let mut gate = PressureGate::new(PressurePolicy::default()).unwrap();
+    assert!(gate.sampling_failed());
+    assert!(gate.sampling_failed());
+}
+
+#[test]
+fn pressure_sampling_failure_reopens_admission_and_resets_hysteresis() {
+    for high in [
+        Pressure {
+            memory_percent: 95,
+            disk_percent: 10,
+        },
+        Pressure {
+            memory_percent: 10,
+            disk_percent: 95,
+        },
+        Pressure {
+            memory_percent: 95,
+            disk_percent: 95,
+        },
+    ] {
+        let mut gate = PressureGate::new(PressurePolicy::default()).unwrap();
+        assert!(!gate.update(high));
+        assert!(gate.sampling_failed());
+        assert!(gate.sampling_failed());
+        assert!(gate.update(Pressure {
+            memory_percent: 85,
+            disk_percent: 85,
+        }));
+        assert!(!gate.update(high));
+        assert!(gate.update(Pressure {
+            memory_percent: 70,
+            disk_percent: 70,
+        }));
+    }
+}
+
 #[tokio::test]
 async fn external_http_source_accepts_zero_capacity_and_reports_disconnect() {
     use adxlet::resources::ResourceSource;

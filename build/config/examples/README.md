@@ -46,6 +46,16 @@ physical devices and a future expiry; `0` above is an expired placeholder. A
 missing/invalid update uses the last observation until expiry, then closes new
 admission. The file reader is separate from the implemented sandboxd collector and automatic capacity source. Do not publish a configured resource budget as a measurement.
 
+The optional Adxlet `pressure` configuration samples memory and the filesystem
+at `disk_path`. The default high/low thresholds are 90%/80% for both resources:
+either resource reaching its high threshold closes pressure admission, and both
+falling to or below their low thresholds reopens it. A failed sample or sampling
+task emits a warning and opens the pressure gate, resetting its hysteresis.
+After sampling resumes, a new high-threshold observation is required to close
+it again. Resource reservations, maintenance and the other node admission
+checks continue to apply independently. See [node pressure](../../../docs/testing/node-lifecycle.md)
+for the resource and admission contract.
+
 Node startup obtains the complete authoritative catalog before reconciling
 managed runtimes. It restores committed running Environments and cleans runtimes
 confirmed unowned or left by uncommitted starts. An unavailable Coordinator never

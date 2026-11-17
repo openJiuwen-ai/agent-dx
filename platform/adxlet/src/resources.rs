@@ -424,6 +424,13 @@ impl PressureGate {
         }
         self.accepting
     }
+
+    /// Reopen pressure admission and reset hysteresis after a failed sample.
+    /// A later valid high-threshold observation can close admission again.
+    pub fn sampling_failed(&mut self) -> bool {
+        self.accepting = true;
+        self.accepting
+    }
 }
 pub fn pressure(disk_path: &Path) -> Result<Pressure> {
     let percent = |used: u64, total: u64| -> u8 {

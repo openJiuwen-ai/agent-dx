@@ -538,13 +538,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let (Some(config), Some(gate)) = (&config.pressure, &mut pressure_gate) {
                 let path = config.disk_path.clone();
-                let accepting =
-                    match tokio::task::spawn_blocking(move || adxlet::resources::pressure(&path))
-                        .await
-                    {
-                        Ok(Ok(pressure)) => gate.update(pressure),
-                        _ => false,
-                    };
+                let accepting = match tokio::task::spawn_blocking(move || {
+                    adxlet::resources::pressure(&path)
+                })
+                .await
+                {
+                    Ok(Ok(pressure)) => gate.update(pressure),
+                    Ok(Err(error)) => {
+                        adx_observability::warn!(%error, "pressure sample failed; pressure gate is open");
+                        gate.sampling_failed()
+                    }
+                    Err(error) => {
+                        adx_observability::warn!(%error, "pressure sampling task failed; pressure gate is open");
+                        gate.sampling_failed()
+                    }
+                };
                 manager.set_pressure(!accepting);
             }
             last = r;

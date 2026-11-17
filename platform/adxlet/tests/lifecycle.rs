@@ -1019,6 +1019,48 @@ async fn expired_capacity_remains_usable_and_maintenance_blocks_new_admission() 
 }
 
 #[tokio::test]
+async fn pressure_sampling_failure_restores_admission_with_capacity_and_maintenance_enforced() {
+    use adxlet::resources::{Pressure, PressureGate, PressurePolicy};
+
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut gate = PressureGate::new(PressurePolicy::default()).unwrap();
+    node.set_pressure(!gate.update(Pressure {
+        memory_percent: 95,
+        disk_percent: 10,
+    }));
+    assert!(!node.accepting_allocations());
+    assert_eq!(
+        node.reserve_local(&spec("local")).unwrap_err(),
+        Error::NoCapacity
+    );
+    let environment = node.environment(spec("a"), assignment("a")).unwrap();
+    assert_eq!(environment.create().await.unwrap_err(), Error::NoCapacity);
+    assert!(deps.events.lock().unwrap().is_empty());
+
+    node.set_pressure(!gate.sampling_failed());
+    assert!(node.accepting_allocations());
+    environment.create().await.unwrap();
+    assert_eq!(node.used(), resources());
+    let next = node.environment(spec("b"), assignment("b")).unwrap();
+    assert_eq!(next.create().await.unwrap_err(), Error::NoCapacity);
+    assert_eq!(
+        node.reserve_local(&spec("local")).unwrap_err(),
+        Error::NoCapacity
+    );
+
+    node.set_maintenance(true);
+    node.set_pressure(!gate.sampling_failed());
+    assert!(!node.accepting_allocations());
+    environment.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(next.create().await.unwrap_err(), Error::NoCapacity);
+    node.set_maintenance(false);
+    next.create().await.unwrap();
+    next.delete().await.unwrap();
+}
+
+#[tokio::test]
 async fn wrong_node_or_generation_cannot_acquire_existing_controller() {
     let deps = Dependencies::new(false);
     let node = node(&deps);
