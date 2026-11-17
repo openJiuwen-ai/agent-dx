@@ -420,6 +420,9 @@ impl Adxlet {
                 .read()
                 .expect("pressure board lock poisoned");
             for (resource, pressure) in [("memory", &board.memory), ("disk", &board.disk)] {
+                if !pressure.enabled {
+                    continue;
+                }
                 text.gauge(
                     "adx_node_pressure_level",
                     &[("resource", resource.into())],

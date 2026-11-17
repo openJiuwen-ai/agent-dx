@@ -1744,6 +1744,37 @@ async fn cached_log_retention_waits_for_recovery_and_cleanup_confirmation() {
 }
 
 #[tokio::test]
+async fn pressure_sampling_failure_is_published_to_coordinator() {
+    use adxlet::resources::{Pressure, PressureGate, PressurePolicy};
+
+    let backend = Arc::new(Backend::default());
+    let node = authority::manager(backend);
+    let mut fixture = authority::Fixture::new().await;
+    fixture.cycle(&node).await.unwrap();
+    let mut gate = PressureGate::new(PressurePolicy::default()).unwrap();
+    node.set_pressure_state(&gate.update(Pressure {
+        memory_percent: 95,
+        disk_percent: 10,
+    }));
+    fixture.cycle(&node).await.unwrap();
+    assert!(!fixture.registration.accepting_allocations);
+
+    node.set_pressure_state(&gate.fail());
+    fixture.cycle(&node).await.unwrap();
+    assert!(fixture.registration.accepting_allocations);
+    assert!(
+        fixture
+            .authority
+            .reports
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .accepting_allocations
+    );
+}
+
+#[tokio::test]
 async fn periodic_catalog_retry_reports_current_admission_without_closing_on_transport_failure() {
     use std::sync::atomic::Ordering;
     for mode in ["ready", "unavailable", "fenced"] {

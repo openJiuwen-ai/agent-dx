@@ -610,9 +610,18 @@ impl Adxlet {
     /// sampling keeps failing stays visible through the gauge values
     /// (never-observed stamp plus a growing failure count) instead of
     /// vanishing together with the series.
-    pub fn mark_pressure_configured(&self) {
-        self.pressure_configured
-            .store(true, std::sync::atomic::Ordering::Release);
+    pub fn mark_pressure_configured(&self, resources: resources::PressureResources) {
+        let mut board = self
+            .services
+            .pressure
+            .write()
+            .expect("pressure board lock poisoned");
+        board.memory.enabled = resources.memory_enabled;
+        board.disk.enabled = resources.disk_enabled;
+        self.pressure_configured.store(
+            resources.any_enabled(),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// Injects static admission configuration for pressure-triggered pauses.
@@ -781,9 +790,7 @@ impl Adxlet {
             .pressure
             .write()
             .expect("pressure board lock poisoned") = update.state.clone();
-        if update.state.memory.level == resources::PressureLevel::High
-            || update.state.disk.level == resources::PressureLevel::High
-        {
+        if update.state.has_high_pressure() {
             let _ = self.services.pressure_signal.send(());
         }
     }
