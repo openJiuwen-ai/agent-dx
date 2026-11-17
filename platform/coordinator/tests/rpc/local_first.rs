@@ -19,10 +19,19 @@ async fn managed_image_dependencies_are_durable_before_either_runtime_start() {
             "managed-image-local"
         };
         let mut raw = spec(id);
-        raw.execution.extra_config = serde_json::json!({
-            "managedImagePublications": [image.id.clone()]
-        })
-        .to_string();
+        if central {
+            // Plain SDK image strings must protect the publication too.
+            raw.image = format!(
+                "registry.test/managed/publications/{}/service-0@sha256:{}",
+                image.id,
+                "a".repeat(64)
+            );
+        } else {
+            raw.execution.extra_config = serde_json::json!({
+                "managedImagePublications": [image.id.clone()]
+            })
+            .to_string();
+        }
         let mut request = create(id);
         request.spec = Some(raw.into());
         let created = if central {

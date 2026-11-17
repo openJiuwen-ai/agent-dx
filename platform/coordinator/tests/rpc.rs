@@ -223,7 +223,7 @@ impl RuntimeDriver for Backend {
                     mount.source,
                     adx_core::execution::MountSource::Volume(_)
                 )));
-                assert!(adx_core::managed_images::explicit_dependencies(spec)?.is_empty(),
+                assert!(self.session.managed_image_dependencies(spec).await?.is_empty(),
                     "managed image execution crossed the runtime boundary without a durable dependency");
             }
             Err(error) => return Err(error),
