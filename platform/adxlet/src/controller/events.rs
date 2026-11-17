@@ -12,7 +12,7 @@ pub(super) struct LifecycleEvents {
     disconnected: Option<Deadline>,
     retry: Option<Deadline>,
     retry_attempts: u32,
-    reopen_idle: bool,
+    pub(super) reopen_idle: bool,
     workload: Option<PendingWorkload>,
 }
 struct PendingWorkload {
@@ -20,15 +20,39 @@ struct PendingWorkload {
     operation_id: String,
     deadline: Deadline,
 }
+/// Releases a pressure-pause in-flight registration when it goes out of
+/// scope, covering completion, failure and task cancellation alike.
+struct PressurePauseFlight {
+    ledger: std::sync::Arc<std::sync::Mutex<crate::pressure_pause::PressurePauseLedger>>,
+    env_id: String,
+}
+impl Drop for PressurePauseFlight {
+    fn drop(&mut self) {
+        self.ledger
+            .lock()
+            .expect("pressure pause ledger lock poisoned")
+            .release(&self.env_id);
+    }
+}
 #[derive(Default)]
 pub(super) struct Observers {
     identity: Option<RuntimeIdentity>,
     pub control: Option<watch::Receiver<Option<RuntimeStatus>>>,
     pub initial: bool,
     pub exit: Option<ExitWait>,
+    /// Node-scoped pressure wake subscription. Independent of the runtime
+    /// identity lifecycle so a long-lived Running environment keeps it.
+    pub pressure_signal: Option<watch::Receiver<()>>,
 }
 impl Observers {
     pub fn refresh(&mut self, controller: &mut Controller) {
+        // The pressure signal subscription is node-scoped and independent of
+        // the runtime identity: establish it before the identity fast-path
+        // below, which returns early for a stable Running environment, and
+        // carry it across identity resets (reset_preserving_pressure).
+        if self.pressure_signal.is_none() {
+            self.pressure_signal = Some(controller.services.pressure_signal.subscribe());
+        }
         let identity = (controller.record.state == EnvironmentState::Running
             && !controller.retired
             && !controller.authority_fenced)
@@ -36,7 +60,7 @@ impl Observers {
         if identity == self.identity {
             return;
         }
-        *self = Self::default();
+        self.reset_preserving_pressure();
         let retry = controller.events.retry;
         let retry_attempts = controller.events.retry_attempts;
         let workload = controller.events.workload.take().filter(|pending| {
@@ -72,6 +96,17 @@ impl Observers {
             let id = controller.record.runtime.id.clone();
             self.exit = Some(Box::pin(async move { runtime.wait_exit(&id).await }));
         }
+    }
+    /// Identity transitions reset the runtime-scoped observers. The
+    /// node-scoped pressure subscription is not one of them: carry it
+    /// across the reset, because a round firing while the controller
+    /// sits in the post-reset select stays visible only to the carried
+    /// receiver — a fresh re-subscription marks the current watch
+    /// version as seen and silently eats it.
+    fn reset_preserving_pressure(&mut self) {
+        let pressure_signal = self.pressure_signal.take();
+        *self = Self::default();
+        self.pressure_signal = pressure_signal;
     }
 }
 
@@ -239,11 +274,7 @@ impl Controller {
         self.update_idle();
     }
     fn update_idle(&mut self) {
-        let demand = self.demand.load(std::sync::atomic::Ordering::Acquire);
-        if demand != self.observed_demand {
-            self.idle = None;
-            self.observed_demand = demand;
-        }
+        self.sync_demand();
         if self.record.state != EnvironmentState::Running
             || self.events.reopen_idle
             || self.record.spec.lifecycle.idle_timeout_seconds == 0
@@ -270,6 +301,19 @@ impl Controller {
     }
     pub(super) fn proxy_stamp(&self) -> Option<(String, u64, u64)> {
         self.events.proxy.clone()
+    }
+    /// Demand moves before its command is observed: a queued
+    /// ensure-running has already bumped the counter. Refresh the idle
+    /// window against it so a stale window cannot ride through the
+    /// eligibility checks, and return the demand the surviving window
+    /// is bound to.
+    pub(super) fn sync_demand(&mut self) -> u64 {
+        let demand = self.demand.load(std::sync::atomic::Ordering::Acquire);
+        if demand != self.observed_demand {
+            self.idle = None;
+            self.observed_demand = demand;
+        }
+        demand
     }
     pub(super) fn retry_lifecycle(&mut self) {
         if self.events.retry.is_some() {
@@ -320,7 +364,10 @@ impl Controller {
                         self.record.spec.lifecycle.idle_timeout_seconds,
                     )
                 {
-                    let demand = self.demand.load(std::sync::atomic::Ordering::Acquire);
+                    // The window-bound demand: update_idle just refreshed
+                    // it, and a bump racing this read stays visible to
+                    // the recheck inside auto_pause.
+                    let demand = self.observed_demand;
                     match self.record.spec.lifecycle.idle_action {
                         adx_core::lifecycle::IdleAction::Delete => {
                             if self
@@ -366,9 +413,11 @@ impl Controller {
                                     expected_revision: self.record.revision,
                                     retention: policy.retention,
                                     timeout_seconds: policy.timeout_seconds,
+                                    storage: None,
                                 },
                                 stamp,
                                 demand,
+                                super::PauseOrigin::Idle,
                             )
                             .await?;
                         }
@@ -380,6 +429,10 @@ impl Controller {
         } else if self.record.state == EnvironmentState::Failed {
             self.tick().await?;
         }
+        // Correctness fuse: if the pressure signal subscription is ever
+        // broken by a future refactor, an idle environment is still
+        // evaluated when its own lifecycle deadline fires.
+        self.consider_pressure_pause().await?;
         if self.record.state != EnvironmentState::Failed
             && self.durability == Some(Durability::Journaled)
         {
@@ -387,13 +440,152 @@ impl Controller {
         }
         Ok(())
     }
-    async fn recover_idle_admission(&mut self) -> Result<()> {
+
+    /// Evaluates a node-pressure pause for this environment. The wake-up
+    /// only rings the bell; the verdict reads the pressure board here.
+    /// Conjunction order: node facts first, eligibility next, the claim
+    /// last so only a real candidate consumes a budget slot.
+    pub(super) async fn consider_pressure_pause(&mut self) -> Result<()> {
+        let options = self.services.pressure_pause_options.clone();
+        if !options.enabled {
+            return Ok(());
+        }
+        // Refresh the window against demand before any eligibility
+        // claim: an ensure-running queued behind this evaluation has
+        // already bumped the counter, and its stale window must not
+        // pass the checks on a baseline that hides the bump.
+        let demand = self.sync_demand();
+        let board = self
+            .services
+            .pressure
+            .read()
+            .expect("pressure board lock poisoned")
+            .clone();
+        // C1: some resource sits at High. C2: failed rounds keep the board
+        // untrusted for relief. C3: never observed, or too stale to act on.
+        let high = board.memory.level == crate::resources::PressureLevel::High
+            || board.disk.level == crate::resources::PressureLevel::High;
+        if !high || board.consecutive_failures != 0 || board.observed_at_unix_seconds == 0 {
+            return Ok(());
+        }
+        let now = crate::checkpoint::now()?;
+        if now.saturating_sub(board.observed_at_unix_seconds) > options.freshness_seconds {
+            return Ok(());
+        }
+        // C5: a Running environment holding an idle window. C6: its idle
+        // action must be Pause under a configured idle policy.
+        if self.record.state != EnvironmentState::Running
+            || self.record.spec.lifecycle.idle_timeout_seconds == 0
+            || self.record.spec.lifecycle.idle_action != adx_core::lifecycle::IdleAction::Pause
+        {
+            return Ok(());
+        }
+        let Some((stamp, since)) = self.idle.clone() else {
+            return Ok(());
+        };
+        // C7: the idle window must be old enough that a recently resumed
+        // environment is not immediately re-paused.
+        if since.elapsed() < std::time::Duration::from_secs(options.min_idle_seconds) {
+            self.services
+                .metrics
+                .pressure_skip(crate::metrics::pressure_skip_reason::WINDOW_TOO_YOUNG);
+            return Ok(());
+        }
+        // C4 last: claiming consumes a rate slot and registers in-flight.
+        let env_id = self.record.spec.id.clone();
+        let ledger = self.services.pressure_pause_ledger.clone();
+        let claimed = ledger
+            .lock()
+            .expect("pressure pause ledger lock poisoned")
+            .claim(
+                board.observed_at_unix_seconds,
+                &env_id,
+                options.budget,
+                options.in_flight_cap,
+                now,
+            );
+        match claimed {
+            crate::pressure_pause::ClaimOutcome::Granted => (),
+            crate::pressure_pause::ClaimOutcome::BudgetExhausted => {
+                self.services
+                    .metrics
+                    .pressure_skip(crate::metrics::pressure_skip_reason::BUDGET_EXHAUSTED);
+                return Ok(());
+            }
+            crate::pressure_pause::ClaimOutcome::InFlightExhausted => {
+                self.services
+                    .metrics
+                    .pressure_skip(crate::metrics::pressure_skip_reason::IN_FLIGHT_EXHAUSTED);
+                return Ok(());
+            }
+        }
+        let flight = PressurePauseFlight {
+            ledger: ledger.clone(),
+            env_id,
+        };
+        // Escalation is governance best-effort: express the shared override
+        // only when the mode allows it and the node accepts shared storage.
+        let policy = self.record.spec.lifecycle.pause.clone().unwrap_or_default();
+        let eligible = |mode: crate::EscalationMode,
+                        spec: adx_core::lifecycle::CheckpointStorage| {
+            match mode {
+                crate::EscalationMode::Off => false,
+                crate::EscalationMode::ConfiguredOnly => {
+                    spec != adx_core::lifecycle::CheckpointStorage::Local
+                }
+                crate::EscalationMode::All => true,
+            }
+        };
+        let escalation = if eligible(options.escalate_checkpoint_storage, policy.storage)
+            && self.services.checkpoint.as_ref().is_some_and(|services| {
+                services
+                    .store
+                    .validate_policy(adx_core::lifecycle::CheckpointStorage::Shared)
+                    .is_ok()
+            }) {
+            Some(adx_core::lifecycle::CheckpointStorage::Shared)
+        } else {
+            None
+        };
+        let result = self
+            .auto_pause(
+                crate::checkpoint::PauseRequest {
+                    operation_id: format!(
+                        "pressure-{}-{}-{}",
+                        self.record.assignment.generation,
+                        self.record.revision,
+                        uuid::Uuid::new_v4()
+                    ),
+                    expected_revision: self.record.revision,
+                    retention: policy.retention,
+                    timeout_seconds: policy.timeout_seconds,
+                    storage: escalation,
+                },
+                stamp,
+                // The window-bound demand: a bump racing this call stays
+                // visible to the recheck inside auto_pause.
+                demand,
+                super::PauseOrigin::Pressure,
+            )
+            .await;
+        drop(flight);
+        result?;
+        // The window restarts after a successful pressure pause, matching
+        // the idle path.
         self.idle = None;
-        let control =
-            self.services.runtime_control.clone().ok_or_else(|| {
-                Error::Unavailable("idle barrier requires runtime control".into())
-            })?;
-        control.reopen_idle(&self.record).await?;
+        Ok(())
+    }
+
+    /// Re-arms the idle admission after a quiesced route could not be
+    /// reopened in line: the idle Delete path (quiesce barrier rejected)
+    /// and the pressure pause path (reopen failed) share this recovery.
+    pub(super) async fn recover_idle_admission(&mut self) -> Result<()> {
+        self.idle = None;
+        // Without runtime control there is no idle barrier to reopen;
+        // the routes admission alone restores.
+        if let Some(control) = self.services.runtime_control.clone() {
+            control.reopen_idle(&self.record).await?;
+        }
         self.services.reopen_route(&self.record).await?;
         self.events.reopen_idle = false;
         Ok(())
@@ -409,5 +601,44 @@ impl Controller {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pressure round firing around an identity reset must stay visible:
+    /// the subscription is carried across the reset instead of being
+    /// re-established, because a fresh subscribe() marks the current watch
+    /// version as seen and would silently eat the round that fired while
+    /// no receiver was armed.
+    #[tokio::test(start_paused = true)]
+    async fn a_round_firing_across_an_identity_reset_stays_visible() {
+        let mut observers = Observers::default();
+        let (tx, _keep) = tokio::sync::watch::channel(());
+        observers.pressure_signal = Some(tx.subscribe());
+        // The round fires before the reset is observed; the carried
+        // receiver has not seen it yet.
+        tx.send(()).unwrap();
+        observers.reset_preserving_pressure();
+        assert!(
+            observers.pressure_signal.is_some(),
+            "the node-scoped subscription must survive the identity reset"
+        );
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            observers.pressure_signal.as_mut().unwrap().changed(),
+        )
+        .await;
+        assert!(
+            observed.is_ok(),
+            "the carried subscription must still observe the fired round"
+        );
+        // The runtime-scoped observers do reset.
+        assert!(observers.identity.is_none());
+        assert!(observers.control.is_none());
+        assert!(!observers.initial);
+        assert!(observers.exit.is_none());
     }
 }

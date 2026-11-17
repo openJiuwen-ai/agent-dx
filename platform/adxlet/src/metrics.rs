@@ -42,6 +42,21 @@ struct Samples {
     samples: BTreeMap<String, Sample>,
     // Lifetime CPU totals survive removal of an Environment and runtime resets.
     cpu_ns: BTreeMap<&'static str, u128>,
+    // Pressure-pause evaluations denied at the claim stage or exempted by
+    // window age, by bounded reason.
+    skips: BTreeMap<&'static str, u64>,
+}
+
+/// Bounded label values for pressure-pause skip reasons. Only finite
+/// enumerations may become labels.
+pub mod pressure_skip_reason {
+    /// The per-window budget was exhausted when the claim arrived.
+    pub const BUDGET_EXHAUSTED: &str = "budget_exhausted";
+    /// The in-flight cap was exhausted when the claim arrived.
+    pub const IN_FLIGHT_EXHAUSTED: &str = "in_flight_exhausted";
+    /// The environment was eligible but its idle window was younger than
+    /// the configured minimum.
+    pub const WINDOW_TOO_YOUNG: &str = "window_too_young";
 }
 #[derive(Default)]
 pub(crate) struct Metrics(Mutex<Samples>);
@@ -88,6 +103,11 @@ impl Metrics {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Counts one pressure-pause evaluation that reached the claim stage and
+    /// was denied, or was exempted by the idle-window age rule.
+    pub fn pressure_skip(&self, reason: &'static str) {
+        *self.lock().skips.entry(reason).or_default() += 1;
     }
     pub fn register(&self, environment: &str) -> Registration {
         let registration = Registration {
@@ -205,7 +225,7 @@ impl Metrics {
         };
         // Copy eligible samples before formatting; exporters never hold the
         // registry lock while building a potentially large text response.
-        let (samples, cpu_ns, mut operations) = {
+        let (samples, cpu_ns, mut operations, mut skips) = {
             let samples = self.lock();
             let current: BTreeMap<_, _> = samples
                 .samples
@@ -222,7 +242,12 @@ impl Metrics {
                 })
                 .map(|(id, sample)| (id.clone(), sample.clone()))
                 .collect();
-            (current, samples.cpu_ns.clone(), samples.operations.clone())
+            (
+                current,
+                samples.cpu_ns.clone(),
+                samples.operations.clone(),
+                samples.skips.clone(),
+            )
         };
         let mut output = String::new();
         if detail {
@@ -287,10 +312,11 @@ impl Metrics {
         }
         if !detail {
             // Only supported operation/intent pairs have startup baselines.
-            // Reload is user-only; pause can be user/idle; deletion also has policy.
+            // Reload is user-only; pause can be user/idle/pressure; deletion
+            // also has policy.
             for (operation, intents) in [
                 ("reload", &["user"][..]),
-                ("pause", &["user", "idle"][..]),
+                ("pause", &["user", "idle", "pressure"][..]),
                 ("delete", &["user", "idle", "policy"][..]),
             ] {
                 for intent in intents {
@@ -302,6 +328,20 @@ impl Metrics {
             output.push_str("# TYPE adx_environment_lifecycle_operations_total counter\n");
             for ((operation, intent, outcome), count) in operations {
                 output.push_str(&format!("adx_environment_lifecycle_operations_total{{operation=\"{operation}\",intent=\"{intent}\",outcome=\"{outcome}\"}} {count}\n"));
+            }
+            // Skip reasons are a finite enumeration with startup baselines.
+            for reason in [
+                pressure_skip_reason::BUDGET_EXHAUSTED,
+                pressure_skip_reason::IN_FLIGHT_EXHAUSTED,
+                pressure_skip_reason::WINDOW_TOO_YOUNG,
+            ] {
+                skips.entry(reason).or_default();
+            }
+            output.push_str("# TYPE adx_node_pressure_pause_skipped_total counter\n");
+            for (reason, count) in &skips {
+                output.push_str(&format!(
+                    "adx_node_pressure_pause_skipped_total{{reason=\"{reason}\"}} {count}\n"
+                ));
             }
         }
         output
@@ -366,6 +406,47 @@ impl Adxlet {
             accepting,
             devices_fresh,
         );
+        if self
+            .pressure_configured
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // The gauge family exists exactly when pressure sampling is
+            // configured; an unconfigured node omits the whole group, while a
+            // configured node whose sampling keeps failing stays visible
+            // through the never-observed stamp and the growing failure count.
+            let board = self
+                .services
+                .pressure
+                .read()
+                .expect("pressure board lock poisoned");
+            for (resource, pressure) in [("memory", &board.memory), ("disk", &board.disk)] {
+                text.gauge(
+                    "adx_node_pressure_level",
+                    &[("resource", resource.into())],
+                    u64::from(pressure.level == crate::resources::PressureLevel::High),
+                );
+                text.gauge(
+                    "adx_node_pressure_percent",
+                    &[("resource", resource.into())],
+                    u64::from(pressure.percent),
+                );
+                text.gauge(
+                    "adx_node_pressure_last_transition_unix_seconds",
+                    &[("resource", resource.into())],
+                    pressure.last_transition_unix_seconds,
+                );
+            }
+            text.gauge(
+                "adx_node_pressure_observed_at_unix_seconds",
+                &[],
+                board.observed_at_unix_seconds,
+            );
+            text.gauge(
+                "adx_node_pressure_consecutive_failures",
+                &[],
+                u64::from(board.consecutive_failures),
+            );
+        }
         output.push_str(&text.finish());
         output
     }
@@ -432,6 +513,63 @@ mod tests {
         }
         assert!(!before.contains("operation=\"reload\",intent=\"idle\""));
         assert!(!metrics.render(true).contains("lifecycle_operations_total"));
+    }
+
+    #[test]
+    fn pressure_pause_intents_and_skips_have_zero_baselines() {
+        let metrics = Metrics::default();
+        let before = metrics.render(false);
+        // The pressure intent of pause is a supported pair: every outcome
+        // exists before the first event.
+        for outcome in ["success", "failure", "unknown", "cancelled"] {
+            let series = format!(
+                "adx_environment_lifecycle_operations_total{{operation=\"pause\",intent=\"pressure\",outcome=\"{outcome}\"}}"
+            );
+            assert!(before.contains(&format!("{series} 0\n")), "{before}");
+        }
+        // Skip reasons are a bounded enumeration with startup baselines.
+        for reason in [
+            pressure_skip_reason::BUDGET_EXHAUSTED,
+            pressure_skip_reason::IN_FLIGHT_EXHAUSTED,
+            pressure_skip_reason::WINDOW_TOO_YOUNG,
+        ] {
+            let series = format!("adx_node_pressure_pause_skipped_total{{reason=\"{reason}\"}}");
+            assert!(before.contains(&format!("{series} 0\n")), "{before}");
+        }
+        metrics.pressure_skip(pressure_skip_reason::BUDGET_EXHAUSTED);
+        let after = metrics.render(false);
+        assert!(
+            after
+                .contains("adx_node_pressure_pause_skipped_total{reason=\"budget_exhausted\"} 1\n"),
+            "{after}"
+        );
+        assert_eq!(before.lines().count(), after.lines().count());
+    }
+
+    /// The exported pressure series names are the documentation contract:
+    /// renaming one breaks this test before it can drift into the docs.
+    #[test]
+    fn exported_pressure_series_names_stay_stable() {
+        let metrics = Metrics::default();
+        let text = metrics.render(false);
+        assert!(
+            text.contains("# TYPE adx_node_pressure_pause_skipped_total counter\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("adx_node_pressure_pause_skipped_total{reason=\"budget_exhausted\"} 0\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "adx_node_pressure_pause_skipped_total{reason=\"in_flight_exhausted\"} 0\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("adx_node_pressure_pause_skipped_total{reason=\"window_too_young\"} 0\n"),
+            "{text}"
+        );
     }
 
     fn usage(cpu: u64, memory: u64) -> RuntimeUsage {

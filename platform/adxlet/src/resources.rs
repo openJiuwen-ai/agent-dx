@@ -6,7 +6,7 @@ use adx_core::{
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Limited};
 use hyper_util::rt::TokioIo;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -394,9 +394,91 @@ impl Default for PressurePolicy {
         }
     }
 }
+/// Hysteresis level of one resource. Values inside the band between the low
+/// and high thresholds keep the previous level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PressureLevel {
+    #[default]
+    Normal,
+    High,
+}
+
+/// Per-resource pressure observation. The hysteresis level is the
+/// authoritative state; the percent value is the last successful
+/// observation that produced it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressure {
+    pub level: PressureLevel,
+    /// Last successful observation, 0-100.
+    pub percent: u8,
+    /// Unix seconds of the last level transition; 0 = never transitioned.
+    pub last_transition_unix_seconds: u64,
+}
+
+/// Node-level structured pressure snapshot published on every observation
+/// round.
+///
+/// `observed_at_unix_seconds == 0` marks a node with no successful sample
+/// yet (unconfigured or never sampled). Levels and the timestamp freeze
+/// during failed samples while `consecutive_failures` grows: admission
+/// stays fail-closed on a broken probe, and consumers deciding whether to
+/// relieve load can refuse to act on stale evidence instead.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePressureState {
+    pub memory: ResourcePressure,
+    pub disk: ResourcePressure,
+    /// Unix seconds of the last successful sample; 0 = never observed.
+    pub observed_at_unix_seconds: u64,
+    /// Consecutive failed samples since the last success.
+    pub consecutive_failures: u32,
+}
+
+/// One observation round's combined output. `accepting` keeps the exact
+/// historical admission semantics (true = the node accepts new work);
+/// `state` is the structured snapshot for observers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PressureUpdate {
+    pub accepting: bool,
+    pub state: NodePressureState,
+}
+
+/// Wire form of the board state for the node heartbeat. Borrowed input: the
+/// heartbeat path owns the observation round and converts without cloning.
+impl From<&NodePressureState> for adx_protocol::control::NodePressureReport {
+    fn from(state: &NodePressureState) -> Self {
+        fn resource(pressure: &ResourcePressure) -> adx_protocol::control::NodePressureResource {
+            let level = match pressure.level {
+                PressureLevel::Normal => adx_protocol::control::NodePressureLevel::Normal,
+                PressureLevel::High => adx_protocol::control::NodePressureLevel::High,
+            };
+            adx_protocol::control::NodePressureResource {
+                level: i32::from(level),
+                percent: u32::from(pressure.percent),
+                last_transition_unix_seconds: pressure.last_transition_unix_seconds,
+            }
+        }
+        Self {
+            memory: Some(resource(&state.memory)),
+            disk: Some(resource(&state.disk)),
+            observed_at_unix_seconds: state.observed_at_unix_seconds,
+            consecutive_failures: state.consecutive_failures,
+        }
+    }
+}
+
+/// Heartbeat wire form of the pressure board state. `None` while the node
+/// has no successful sample: an absent field means "no trustworthy
+/// observation", never "observed at the epoch".
+pub fn report_from(state: &NodePressureState) -> Option<adx_protocol::control::NodePressureReport> {
+    (state.observed_at_unix_seconds != 0).then(|| state.into())
+}
+
 pub struct PressureGate {
     policy: PressurePolicy,
+    /// Admission bit, driven by the historical two-resource formula.
     accepting: bool,
+    /// Structured per-resource observation.
+    state: NodePressureState,
 }
 impl PressureGate {
     pub fn new(policy: PressurePolicy) -> Result<Self> {
@@ -410,9 +492,14 @@ impl PressureGate {
         Ok(Self {
             policy,
             accepting: true,
+            state: NodePressureState::default(),
         })
     }
-    pub fn update(&mut self, pressure: Pressure) -> bool {
+    /// Successful sample: advances the admission bit and the structured
+    /// snapshot together. The admission formula is unchanged: pressure
+    /// opens only when both resources fall back to or below their low
+    /// thresholds and closes as soon as either crosses its high threshold.
+    pub fn update(&mut self, pressure: Pressure) -> PressureUpdate {
         if pressure.memory_percent >= self.policy.memory_high_percent
             || pressure.disk_percent >= self.policy.disk_high_percent
         {
@@ -422,7 +509,69 @@ impl PressureGate {
         {
             self.accepting = true;
         }
-        self.accepting
+        // A clock failure keeps the previous stamp: a sample whose
+        // observation time cannot be trusted does not count as fresh
+        // evidence either way.
+        let stamp = crate::checkpoint::now().unwrap_or(self.state.observed_at_unix_seconds);
+        self.state.memory = advance(
+            self.state.memory.clone(),
+            pressure.memory_percent,
+            self.policy.memory_high_percent,
+            self.policy.memory_low_percent,
+            stamp,
+        );
+        self.state.disk = advance(
+            self.state.disk.clone(),
+            pressure.disk_percent,
+            self.policy.disk_high_percent,
+            self.policy.disk_low_percent,
+            stamp,
+        );
+        self.state.observed_at_unix_seconds = stamp;
+        self.state.consecutive_failures = 0;
+        PressureUpdate {
+            accepting: self.accepting,
+            state: self.state.clone(),
+        }
+    }
+    /// Failed sample: freezes the levels and the observation stamp, bumps
+    /// the failure counter, and reports closed admission for this round.
+    /// The hysteresis phase survives, so the next successful sample resumes
+    /// from the previous level.
+    pub fn fail(&mut self) -> PressureUpdate {
+        self.state.consecutive_failures = self.state.consecutive_failures.saturating_add(1);
+        PressureUpdate {
+            accepting: false,
+            state: self.state.clone(),
+        }
+    }
+}
+
+/// Per-resource hysteresis: crossing the high threshold raises the level,
+/// falling to or below the low threshold lowers it, and the band in between
+/// keeps the previous level.
+fn advance(
+    current: ResourcePressure,
+    percent: u8,
+    high: u8,
+    low: u8,
+    stamp: u64,
+) -> ResourcePressure {
+    let level = if percent >= high {
+        PressureLevel::High
+    } else if percent <= low {
+        PressureLevel::Normal
+    } else {
+        current.level
+    };
+    ResourcePressure {
+        last_transition_unix_seconds: if level == current.level {
+            current.last_transition_unix_seconds
+        } else {
+            stamp
+        },
+        level,
+        percent,
     }
 }
 pub fn pressure(disk_path: &Path) -> Result<Pressure> {
