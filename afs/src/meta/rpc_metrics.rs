@@ -64,6 +64,7 @@ const META_RPCS: &[&str] = &[
     "afs.meta.v1.DfsMeta/ValidateReplicaWrite",
     "afs.meta.v1.DfsMeta/ClaimReplicationTask",
     "afs.meta.v1.DfsMeta/ReportReplicationTask",
+    "afs.meta.v1.DfsMeta/EnsureReplicaPlacement",
     "afs.meta.v1.DfsMeta/ReportChunkCorruption",
     "afs.meta.v1.DfsMeta/GetChunkSources",
     "afs.meta.v1.DfsMeta/ValidateReadGrants",
@@ -183,6 +184,7 @@ mod tests {
         for path in [
             "/afs.meta.v1.DfsMeta/GetInode",
             "/afs.meta.v1.DfsMeta/GetInode",
+            "/afs.meta.v1.DfsMeta/EnsureReplicaPlacement",
             "/bogus",
         ] {
             let request = Request::builder().uri(path).body(()).unwrap();
@@ -196,5 +198,11 @@ mod tests {
             2
         );
         assert_eq!(calls.with_label_values(&["other"]).get(), 1);
+        assert_eq!(
+            calls
+                .with_label_values(&["afs.meta.v1.DfsMeta/EnsureReplicaPlacement"])
+                .get(),
+            1
+        );
     }
 }
