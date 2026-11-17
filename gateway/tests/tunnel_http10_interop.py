@@ -26,6 +26,12 @@ from adx_environment.tunnel_client import TunnelClient
 LOG = logging.getLogger(__name__)
 
 
+def check(condition, detail):
+    """Keep acceptance checks active when Python optimization is enabled."""
+    if not condition:
+        raise AssertionError(detail)
+
+
 def generate_tls(directory):
     """Generate short-lived CA and server certificates for this local run."""
     openssl = shutil.which("openssl")
@@ -93,7 +99,10 @@ def reply_body(stream, head):
         if ":" in line:
             name, value = line.split(":", 1)
             headers[name.lower()] = value.strip()
-    return read_exact(stream, int(headers["content-length"]))
+    content_length = headers.get("content-length")
+    if content_length is None:
+        raise ValueError("fixture HTTP response requires Content-Length")
+    return read_exact(stream, int(content_length))
 
 
 class LegacyHandler(socketserver.BaseRequestHandler):
@@ -112,7 +121,7 @@ class LegacyHandler(socketserver.BaseRequestHandler):
                     self.request.sendall(response + reply_body(upstream, response))
                     prior_requests += 1
                 wire = head.replace(b" HTTP/1.1\r\n", b" HTTP/1.0\r\n", 1)
-                assert wire.split(b"\r\n", 1)[0].endswith(b"HTTP/1.0")
+                check(wire.split(b"\r\n", 1)[0].endswith(b"HTTP/1.0"), "legacy request must use HTTP/1.0")
                 # Force a request-line split across writes on the real TLS path.
                 upstream.sendall(wire[:9])
                 upstream.sendall(wire[9:])
@@ -192,15 +201,15 @@ def serve_http(_connection, request):
 
 
 def check_messages(connection):
-    assert connection.response.status_code == 101
-    assert connection.recv(timeout=10) == "tunnel hello"
+    check(connection.response.status_code == 101, "WebSocket handshake must return 101")
+    check(connection.recv(timeout=10) == "tunnel hello", "tunnel greeting mismatch")
     text = "GET /inside-frame HTTP/1.0\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
     connection.send(text)
-    assert connection.recv(timeout=10) == text
+    check(connection.recv(timeout=10) == text, "tunnel text echo mismatch")
     payload = b"\x00\xff" + bytes(range(256)) * 1024
     connection.send(payload)
-    assert connection.recv(timeout=10) == payload
-    assert connection.ping(b"spanner-check").wait(timeout=10)
+    check(connection.recv(timeout=10) == payload, "tunnel binary echo mismatch")
+    check(connection.ping(b"spanner-check").wait(timeout=10), "tunnel pong timeout")
 
 
 def check_reused_connection(address):
@@ -208,8 +217,8 @@ def check_reused_connection(address):
     try:
         stream.sendall(b"GET /app/probe HTTP/1.1\r\nHost: localhost\r\n\r\n")
         response = read_head(stream)
-        assert response.startswith(b"HTTP/1.1 200 ")
-        assert reply_body(stream, response) == b"tunnel http hello"
+        check(response.startswith(b"HTTP/1.1 200 "), "tunneled HTTP request must return 200")
+        check(reply_body(stream, response) == b"tunnel http hello", "tunneled HTTP response mismatch")
         with connect(
             f"ws://127.0.0.1:{address[1]}/app/echo", sock=stream,
             additional_headers={"Content-Length": "0"}, compression=None, close_timeout=2,
@@ -259,7 +268,7 @@ def main():
         stack.callback(proxy.shutdown)
         tunnel = TunnelClient(upstream=f"127.0.0.1:{server.socket.getsockname()[1]}")
         stack.callback(tunnel.stop)
-        assert tunnel.start(f"ws://127.0.0.1:{proxy.server_address[1]}/tunnel", timeout=10)
+        check(tunnel.start(f"ws://127.0.0.1:{proxy.server_address[1]}/tunnel", timeout=10), "SDK tunnel did not start")
         LOG.info("PASS real SDK control tunnel through HTTP/1.0 -> TLS Ingress -> Execd")
         with connect(f"ws://127.0.0.1:{proxy.server_address[1]}/app/echo", compression=None) as connection:
             check_messages(connection)
@@ -275,11 +284,14 @@ def main():
                 check_messages(connection)
         LOG.info("PASS HTTP/1.1 WebSocket baseline on the same real tunnel")
         observations = list(proxy.observations)
-        assert len(observations) == 3, observations
+        check(len(observations) == 3, f"expected 3 legacy handshakes: {observations}")
         for observation in observations:
-            assert observation["request"].endswith("HTTP/1.0"), observation
-            assert observation["response"].startswith("HTTP/1.1 101 "), observation
-        assert observations[-1]["prior_requests"] == 1, observations
+            check(observation.get("request", "").endswith("HTTP/1.0"), f"legacy request mismatch: {observation}")
+            check(
+                observation.get("response", "").startswith("HTTP/1.1 101 "),
+                f"upgrade response mismatch: {observation}",
+            )
+        check(observations[-1].get("prior_requests") == 1, f"expected a reused client connection: {observations}")
         (args.output / "result.json").write_text(json.dumps({
             "passed": True, "handshakes": observations,
             "checks": ["real-sdk-control", "new-websocket", "reused-websocket", "http11-baseline"],
