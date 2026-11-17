@@ -662,8 +662,8 @@ fn rmdir_root_deletes_fuse_only_root_completely() {
     assert!(roots.cached_local_roots().unwrap().is_empty());
 }
 
-/// `rmdir` 只删除空目录：非空时必须在任何删除步骤之前拒绝，workspace 保持可用，
-/// 否则 ENOTEMPTY 之后 Meta 已 deactivate，所有节点都无法再访问这些数据。
+/// `rmdir` 只删除空目录：非空时必须在任何删除步骤之前拒绝，workspace 保持可用。
+/// 判空之后的并发写入由 `delete_root` 在物理目录一步的原子判空拦住并回滚。
 #[test]
 fn rmdir_root_non_empty_is_rejected_and_keeps_workspace_usable() {
     let (temp, owner, ctx, _disk) = fixture(false);
@@ -714,18 +714,31 @@ fn rmdir_root_missing_data_dir_still_converges() {
     assert!(roots.cached_local_roots().unwrap().is_empty());
 }
 
-/// 缓存已移除而 Meta 仍指向本机时返回 ENOENT，不能把删除转发给 Home 自己。
+/// 递归删除在移出缓存之后下线 Meta 失败时，本机缓存已空而 Meta 仍指向本机。
+/// 此时同名普通 rmdir 必须返回 ENOENT，不能把删除转发给 Home 自己。
 #[test]
-fn rmdir_root_after_cache_removal_is_not_forwarded_to_self() {
-    let (_temp, owner, ctx, _disk, meta) = fixture_with_meta(false);
+fn rmdir_root_after_recursive_meta_failure_is_not_forwarded_to_self() {
+    let (temp, owner, ctx, _disk, meta) = fixture_with_meta(false);
     mkdir_root(&owner, &ctx, "d-self");
+    let (root_id, _data_dir) = root_snapshot(&owner, temp.path(), "d-self");
+    let location = owner
+        .require_local()
+        .unwrap()
+        .roots
+        .lookup_root_location(&root_id)
+        .unwrap()
+        .unwrap();
+
     meta.set_fail_deactivate(true);
-    let error = Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d-self")).unwrap_err();
-    assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
+    owner.delete_workspace(&location).unwrap_err();
+    // 数据已隔离、缓存已移除，Meta 仍 active，FUSE 名字仍在。
+    let roots = owner.require_local().unwrap().roots.clone();
+    assert!(roots.cached_local_roots().unwrap().is_empty());
+    assert!(meta.lookup_root(&root_id).unwrap().is_some());
 
     let error = Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d-self")).unwrap_err();
-
     assert_eq!(error.code(), afs_error::NODE_VFS_NOT_FOUND);
+    assert!(meta.lookup_root(&root_id).unwrap().is_some());
 }
 
 /// 本机 rmdir 解析出的仍是旧版本（期间旧版本被删除、同名重建）时，不能删除新 workspace。
@@ -946,11 +959,10 @@ fn concurrent_rmdir_root_single_winner() {
     );
 }
 
-/// VC-D6：Meta 不可达时 rmdir 返回错误；失败发生在 deactivate（delete_root
-/// 步骤 3），Meta 记录、物理目录与 catalog 记录保留，缓存移除已发生（并发
-/// 线性化点），故障恢复后状态可收敛。
+/// VC-D6：Meta 不可达时 rmdir 返回错误。失败发生在物理目录删除之后：数据已删、
+/// Meta 记录与缓存保留（不再准入），故障恢复后重试同一 rmdir 完成下线。
 #[test]
-fn rmdir_root_meta_deactivate_failure_returns_error_and_keeps_state_repairable() {
+fn rmdir_root_meta_deactivate_failure_returns_error_and_retry_completes() {
     let (temp, owner, ctx, _disk, meta) = fixture_with_meta(false);
     mkdir_root(&owner, &ctx, "d6");
     let (root_id, data_dir) = root_snapshot(&owner, temp.path(), "d6");
@@ -959,26 +971,18 @@ fn rmdir_root_meta_deactivate_failure_returns_error_and_keeps_state_repairable()
     let error = Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d6")).unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
 
-    // 失败未损毁持久状态：Meta active 仍含该 root、物理目录仍在（catalog
-    // 记录保留，否则删除流程不会停在物理目录之前）。
+    // 决策点（物理目录删除）已过，不回滚；Meta active 与 catalog 记录保留待收敛。
+    assert!(!data_dir.exists());
     assert!(meta.lookup_root(&root_id).unwrap().is_some());
-    assert!(data_dir.exists());
-    // 缓存移除是并发线性化点，与 Meta 无关，必然已发生。
-    assert!(
-        owner
-            .require_local()
-            .unwrap()
-            .roots
-            .cached_local_roots()
-            .unwrap()
-            .is_empty()
-    );
+    let roots = owner.require_local().unwrap().roots.clone();
+    assert_eq!(roots.cached_local_roots().unwrap().len(), 1);
+    assert!(!roots.has_active_local_root(&root_id));
 
-    // 故障恢复后 Meta 可正常清理，active 不再残留（状态可收敛）。
+    // 故障恢复后重试同一 rmdir，下线补完。
     meta.set_fail_deactivate(false);
-    meta.deactivate_root(&root_id, 0, "node-a", "session-a")
-        .unwrap();
+    Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d6")).unwrap();
     assert!(meta.lookup_root(&root_id).unwrap().is_none());
+    assert!(roots.cached_local_roots().unwrap().is_empty());
 }
 
 #[test]
