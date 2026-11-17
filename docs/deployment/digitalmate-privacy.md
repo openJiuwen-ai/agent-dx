@@ -45,8 +45,16 @@ Gateway 进程仍能接触根密钥和明文，这属于应用层加密，不提
 
 1. 标准激活完成后，Gateway 从已登录的业务主体推导 scope 和工作区，剥离客户端提交的身份头，
    在 WebSocket 握手中注入敏感的 `Authorization: Bearer dm-privacy-v1...`。
+   正常连接器调用复用这同一张 privacy 工作负载凭证和同一条 `privacy_grants`，
+   不额外签发普通 connector 凭证或注入专用头。连接器身份投影不授予邮箱读取，
+   仍需真实连接和 M44 的操作/意图证明。它不是 Composio 项目 Key、供应商
+   OAuth Token 或新的手机登录会话。后台批次交换的短期 bootstrap 独立受限，
+   不能读取配置或续期为正常 privacy 身份。
 2. DigitalMate 先启动可接收握手的入口，通过配置中心 HTTPS 校验业务凭证，然后加载私密配置、启动后台任务。
-   校验完成前，其余业务 HTTP 路由不接收业务。凭证只保存在进程内存中，不写入模板参数、工作区文件或工具环境。
+   校验完成前，其余业务 HTTP 路由不接收业务。配置客户端在进程内保存凭证；
+   显式启用连接器恢复时，同一正常身份可经实际续期和作用域校验后存入 operator
+   指定的 workspace 外私有载体。该载体受保护、原子写入，不是第二个身份库；
+   不写入模板参数、可编辑工作区或工具环境，也不保存项目 Key。
 3. 访问凭证标称有效期为五分钟。运行中的沙箱每分钟续期，临近过期时访问前也会续期，均不依赖手机登录。
    续期重新核对有效账号、Binding、工作区和代次。上次成功续期后最多三十天内可恢复，超时需要新登录握手。
 4. 读取配置时校验 HMAC、数据库授权和账号状态，不调用 ADX RPC。账号禁用或业务授权撤销可拒绝后续检查；
@@ -61,6 +69,10 @@ Gateway 进程仍能接触根密钥和明文，这属于应用层加密，不提
 仅设置 Gateway 模式不能证明整条链路已加密。不要将可信沙箱套接字直接暴露给不可信调用者。
 
 ## 模板、回收与快照
+
+Composio 与后台摄取配套的账号新增表、摄取 schema 升级、旧订阅投影切换及发布顺序，
+见 DigitalMate 仓库的[连接器配套部署与数据库切换](https://github.com/openJiuwen-ai/DigitalMate/blob/main/docs/guides/operations/connectors-cutover-and-database.md)。账号 schema 版本与
+摄取 schema、batch wire 版本独立，本次复用工作负载凭证不新增身份数据库或 SQL 升级。
 
 DigitalMate 沙箱使用 [DigitalMate 仓库的正式部署模板](https://github.com/openJiuwen-ai/DigitalMate/blob/main/harness/personal-agent/deploy/digitalmate-template.prod.json)，
 本仓库不重复维护完整业务模板。接入本功能时，在业务模板中配置 `DIGITALMATE_SECRET_STORE=privacy`、
