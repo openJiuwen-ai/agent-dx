@@ -184,6 +184,7 @@ async fn activate_root(meta: &Meta, root_id: &str, session_id: &str) {
             rights: vec![StoreRootRight::Lookup, StoreRootRight::Write],
             expected_root_epoch: 1,
             create_intent_id: format!("mkdir-{root_id}"),
+            pin_home: false,
         })
         .await
         .unwrap()

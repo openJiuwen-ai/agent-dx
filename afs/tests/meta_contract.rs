@@ -1320,6 +1320,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
             parent_root_id: String::new(),
             create_intent_id: "mkdir-a".into(),
             conflict_policy: 0,
+            pin_home: false,
         }))
         .await
         .unwrap()

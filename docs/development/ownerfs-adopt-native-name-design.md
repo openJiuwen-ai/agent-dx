@@ -1,7 +1,7 @@
 # OwnerFs 原生目录名纳管设计
 
 状态：设计草案，待评审。机制已在双机真机验证通过（见 §12），代码仅存在于 spike 分支
-`spike/ownerfs-adopt-native-name`（`c98c9e75`，**不可合入**，见 §7 的七个必修项）。
+`spike/ownerfs-adopt-native-name`（`c98c9e75`，**不可合入**，见 §7 的必修项）。
 本文描述的是目标设计；凡标「待实现」的条目，当前分支上并不存在。
 
 纳管入口已按评审意见改为 **afs-node 启动扫描**（§6），不由业务方调用 API。spike 里纳管
@@ -12,6 +12,15 @@
 仍需要负载均衡）与**「目录数上限」**（数量拦不住「位置配错」）。前者的替代是让 Meta 的
 reserve 接受一个输入侧标志 `pin_home`，使「纳管」与「负载均衡」正交；后者不再有替代机制，
 改为部署前置的人工核对（§10.1）。取舍记录见 §6.4。
+
+第三轮评审调整了两处范围：
+
+- **`RecoverRoots` 批量接口纳入计划**（§6.5）。启动是 O(N) 次 recover txn，每次重启都付，
+  属于长期成本；作为独立提交，不阻塞纳管主体。
+- **非 UTF-8 名字的支持整体延后**，本特性做完后单独提 PR（P0、P3）。本期改为在**创建与
+  扫描两个入口拒绝非 UTF-8 名字**（P0′，约 15 行），因此不再需要 catalog 记录格式改造和
+  outlet 全链 `OsString`（省约 155 行）。前提是「现场不存在非 UTF-8 目录名」，这是业务侧
+  已确认的事实；中文等合法 UTF-8 名字不受影响。
 
 ## 1 需求与约束
 
@@ -63,10 +72,15 @@ rename("<storage>/test001", "<storage>/.ownerfs-trash/root-74657374303031-e3")
 | catalog 记录 | `name` 以 hex 落盘 | 崩溃恢复 |
 | RootId | `root-<hex>` | Meta、proto、outlet 快照 |
 
-`RootId` 保持 hex 不变，因此 **Meta 存储、state image、hash domain、golden 全部不动**。
-proto 只有一处新增，且是**输入侧**的：`ReserveRootRequest.pin_home`（§6.4）。它不进入任何
-持久实体，所以不触发状态版本 bump，也不重生成 golden。这是本方案比「让 Meta 记住物理
-目录名」便宜一个量级的原因。
+`RootId` 保持 hex 不变，因此 **Meta 的实体编码、state image、hash domain 全部不动**。
+proto 有两处新增：
+
+| 新增 | 性质 | 持久影响 |
+| --- | --- | --- |
+| `ReserveRootRequest.pin_home`（§6.4） | 输入侧标志 | 无——不落盘，不进快照 |
+| `RecoverRoots`（§6.5） | 批量换绑会话 | **唯一的 Meta 持久格式触点**：`OperationResult` 需要新变体，落在 WAL 的 request outcome 里。不影响实体编码与 state image，但需独立 bump 版本、重生成 golden，并单独评审 |
+
+这是本方案比「让 Meta 记住物理目录名」便宜一个量级的原因。
 
 ## 3 已确定的设计决策
 
@@ -80,7 +94,7 @@ proto 只有一处新增，且是**输入侧**的：`ReserveRootRequest.pin_home
 | D6 | 纳管不传 uid/gid/mode，直接沿用目录的实际属性，一个字节都不改 | 属性是业务方既有的，AFS 无权也不需要改写 |
 | D7 | 创建路径的保留名从 `.pub`/`.quarantine` 扩为拒绝 `.ownerfs-` 前缀；启动扫描再收紧一档：跳过**所有** `.` 开头的名字与 `lost+found` | 存储根与业务目录同层后，`.ownerfs-roots/`、`.ownerfs-trash/`、锁文件都在这一层；扫描是「猜哪个目录该变 workspace」，猜错一次就到不了头，所以宁可严格 |
 | D8 | 同名重建后，跨机旧路径指向新 workspace（POSIX 语义） | 接受；见 §5 |
-| D9 | 非 UTF-8 名字全链走 `OsString`，catalog 不再落盘 `data_dir` | 真机上非 UTF-8 名字会让节点起不来（P0） |
+| D9 | **本期不支持非 UTF-8 名字**：创建路径与启动扫描都拒绝（P0′）；全链 `OsString` 与 catalog 不落盘 `data_dir` 延后为独立 PR（P0/P3） | 业务侧确认现场不存在非 UTF-8 目录名；入口拒绝能让 catalog 里永远只有合法 UTF-8，从而规避「节点起不来」而不必改记录格式 |
 | D10 | 启动纳管的 Home 恒为本节点，由 `ReserveRootRequest.pin_home` 显式指定，与 `ownerfs_mkdir_load_balance` **正交**（可同时开启） | 扫描到的目录只在本机磁盘上，HRW 选别的节点必然造空目录（P5）；但 LB 只应作用于新建目录，不该作用于「已经躺在磁盘上的目录」。该标志不落盘，因此不 bump 状态版本 |
 | D11 | 不提供 `root-*` legacy 目录兼容分支 | 系统未上线（`AGENTS.md`），存量 AFS 环境直接重置 |
 
@@ -192,9 +206,15 @@ NFS 透传 inode，这是「没有拷贝」最硬的证据，可直接交付业�
 
 第二、三行是必须改的一处：master 的 reconcile pending 分支对残留目录直接
 `self.remove_abandoned_dir(&data_dir)?`（`root.rs:1857`），`?` 会让**节点起不来**。
-好消息是 `remove_abandoned_dir` 只调 `rmdir`（spike `root.rs:2044`），**不递归**，所以那个
-窗口不可能删掉业务数据。目标实现把它改成与另一分支一致的 warn + 保留 catalog 证据
-（spike 已在 1943 处改为 warn）。
+`remove_abandoned_dir` 只调 `rmdir`、**不递归**，所以非空业务目录删不掉；但**空目录会删成功**，
+而改名后 `data_dir` 就是业务目录本身。因此目标实现比「warn」更强：
+
+- 启动期清理（reconcile pending、zombie 世代、`retire_fenced_root`）**一律不 `rmdir` live
+  目录**，只 warn 并保留 catalog 证据；
+- `rmdir` 只允许出现在 trash 内的 `root-<hex>-e<epoch>` 条目，以及用户显式删除（空目录删除）
+  这两条路径上。
+
+崩溃窗口因此最多留下一个空目录，下次启动可被重新扫描纳管，不会删除任何业务目录。
 
 > 幂等由 catalog 记录承担：同一代次重试时 `persist_prepared_root` 对相同
 > `(root, epoch, prepare_id)` 幂等，冲突则拒绝覆盖。所以重复扫描不会产生两代 root。
@@ -230,6 +250,7 @@ epoch 从 live 路径里消失后，跨机行为变化。这是本方案唯一�
 | `validate_owner` 放宽以支持中文名 | 不需要——扫描不经过 HTTP |
 | Meta 加**落盘**的 `pinned_home_node_id`（state image + 快照 + golden） | 不需要——`pin_home` 只是 reserve 的输入侧标志，不进入任何持久实体（§6.4） |
 | 显式 adopt 入口 + intent 崩溃标记 | 不需要——每次启动重扫，天然幂等重试 |
+| 非 UTF-8 全链 `OsString` + catalog 记录改造（P0/P3） | 不需要——入口拒绝（P0′）让这类名字进不了 catalog；真要做时按 §7 的修法单独提 PR |
 
 ### 6.2 扫描规则
 
@@ -240,10 +261,11 @@ epoch 从 live 路径里消失后，跨机行为变化。这是本方案唯一�
 | 名字以 `.` 开头（含 `.ownerfs-*`） | 跳过（保留名，D7） |
 | 名字是 `lost+found` | 跳过（文件系统自建目录） |
 | 不是真目录（普通文件 / 软链） | 跳过 + WARN |
+| 名字不是合法 UTF-8 | 跳过 + WARN（P0′，本期不支持非 UTF-8 名字） |
+| 名字是合法 UTF-8 但含非 ASCII 字节 | 跳过 + WARN（R3 裁决：默认只纳管 ASCII 名字） |
 | `dev` 与父目录不一致（挂载点） | 跳过 + WARN（rename 进 trash 会 EBUSY） |
 | `7 + 2*len(name) + 20 > 255` | 跳过 + ERROR（P6） |
-| catalog 已有该 `root_id` 的活跃记录 | 跳过（已纳管，走既有恢复路径） |
-| catalog 有同 `root_id` 的 pending 记录 | 跳过，交给 reconcile 与下一次启动 |
+| catalog 已有该 `root_id` 的记录（活跃或 pending） | 跳过；active 走既有恢复路径，pending 交给 reconcile 与下一次启动 |
 | Meta 已有该 `root_id`，Home 是本节点 | 跳过（走既有恢复，不新纳管） |
 | Meta 已有该 `root_id`，Home 是别的节点 | 跳过 + WARN（另一端才是数据主，需人工裁决） |
 | 其余 | 纳管 |
@@ -254,11 +276,17 @@ epoch 从 live 路径里消失后，跨机行为变化。这是本方案唯一�
 ### 6.3 时序与位置
 
 ```rust
-// RootManager::open_with_catalog
-manager.reconcile_on_startup()?;      // 既有语义：记录不合规 → fail-closed
-manager.adopt_pre_existing_roots();   // 新增：单目录失败只 WARN，不阻塞启动
-Ok(manager)                            // recovered_roots() 已含新纳管者
+// node/assembly/ownerfs.rs，open 返回后、recovered_roots() 之前
+let roots = RootManager::open(...).await??;   // 既有语义：记录不合规 → fail-closed
+if cfg.ownerfs_adopt_on_startup {
+    // 与 open 一样放进 spawn_blocking：内部有 Meta RPC
+    adopt_pre_existing_roots(roots.clone()).await;  // 单目录失败只 WARN，不阻塞启动
+}
+let recovered = roots.recovered_roots();      // 已含新纳管者
 ```
+
+扫描放在 assembly 而不是 `RootManager::open` 内部：配置只由 assembly 持有，给 `open` 增加
+开关参数会让 28 处测试调用点全部改签名，收益为零。两条调用顺序等价，都在挂载之前。
 
 两条原则必须写死，并在测试里固定：
 
@@ -306,32 +334,72 @@ golden 全部不动，proto3 追加字段对旧调用方是透明的。
 - 同一 `request_id` 重放时以**已提交的** `home_node_id` 为准，`pin_home` 不参与幂等比对
   （它不在持久实体里）。重放方拿到的是既有 reservation，不会因为改传 `false` 而换 Home。
 
-### 6.5 代价：启动时长
+### 6.5 代价：启动时长与 `RecoverRoots`
 
-本地实测 245ms/目录（含 reserve RPC + catalog fsync + activate RPC），1000 个目录约 4 分钟，
-这段时间 VFS 尚未挂载。缓解顺序：
+**先纠正口径。「245ms/目录」是 API 路径的成本，不是纳管的成本。** 真机拆分：
 
-1. 去掉每目录重复的 `sync_root`（现在 prepare / activate 各调一次）；
-2. 批内并发（reserve 可并发，catalog 写入串行）；
-3. 首次接入用一次性本地命令预热 catalog（不经 API，仍是本地动作）。
+| 操作 | 实测 |
+| --- | --- |
+| `POST /v1/workspaces`，真实创建 | 220–245ms |
+| 同一个 POST，幂等返回 | 5ms |
+| `GET /v1/workspaces/{owner}` | 3.6ms |
+| `fsync`（存储根 / Meta 数据目录） | 1.2–1.5ms |
 
-**需要评审给一个可接受的启动时长上限**，否则上千目录的现场会变成「重启即长时间不可用」。
+差值几乎全在 `api/workspace.rs::wait_outlet()`：创建结束后每 25ms 轮询，等 outlet mirror 的
+250ms tick 把 `/public/<name>` 发布出去（API 契约要求 `access_path` 返回即可用）。启动扫描
+不经过这条路径，每个 root 是 4 次本地 fsync + 1 次 reserve txn + 1 次 activate/recover txn，
+量级 **15–25ms**，1000 个约 **15–25 秒**，不是 4 分钟。
+
+因此两条「缓解」不做：
+
+- **批内并发**：瓶颈不在并行度；reserve 并发还会撞 `RootEpochWatermarkEquals` 这个全局
+  水位条件，必须自带重试，收益 2–3× 且引入新失败模式。
+- **一次性预热 catalog**：`recover_root` 每 root 一 txn 与 catalog 无关，预热只省首次那一次，
+  之后每次重启照付 O(N)，却引入「Meta 已 pending + 本地已有 catalog + 未 activate」的新中间态。
+
+真正该做的是把 O(N) 次 txn 压成 O(1)：**`RecoverRoots` 批量接口**。一次 txn 内换绑该节点
+全部 Home 会话，条件为 `NodeSessionCurrent` + 每个 root 一条 `EntityEquals(Root)`，mutation 为
+每个 root 的 `Put(Root)` + `Put(RootGrant)`。收益是 N 次 WAL `sync_data` 与 N 次 RPC 往返降为
+**每批一次**：1000 个目录省 1–3 秒，N 上万时才是主要收益。它**每次重启都受益**，不只首次接入，
+所以值得做；但它不是启动时长的阻塞项，作为独立提交，可与纳管主体并行。
+
+实现要点（评审重点）：
+
+- `OperationResult` 必须新增 `RootGrants(Vec<RootAccessGrant>)`：`access_generation` 由 Meta
+  生成，节点无法自行构造，批量返回必须带 N 个 grant。这是本设计**唯一触及 Meta 持久格式**
+  的地方（WAL 的 request outcome），需要独立 bump 版本、重生成 golden，不与纳管改动混提交。
+- **分批上限 256**：单 txn 带 N 个条件与 2N 个 mutation，WAL 单帧不能无界。
+- **单批失败降级为逐条 recover**：某个 root 在启动期间被并发删除时整批条件失败，不能因此
+  让同批其余 root 全部恢复不了。
+- **幂等与条数校验**：幂等键沿用 `node/session + request_id`，重放返回同一批 grant；返回
+  条数与请求不一致时，缺的那个按 reconcile 的 zombie 语义处理（目录已不存在则 deactivate，
+  见 R11），不能当成功。
+
+启动期仍是「VFS 挂载前完成」，所以窗口内新连接会失败；按 15–25ms/个估算，1000 个目录的
+不可用窗口在 30 秒以内，不需要额外的时长护栏。
 
 ### 6.6 仍然需要 API 的部分
 
 删除。非空 workspace 的递归删除只走 `DELETE /v1/workspaces/{owner}`（FUSE `rmdir` 对非空
 目录返回 `ENOTEMPTY`）。评审否决的是「用 API 纳管」，不是删除 API 本身。
 
-但要注意：`validate_owner` 仍拒绝中文名与 `.ownerfs-` 前缀开头的名字。扫描纳管会造出这类
-root（扫描按字节判定，不经过 `validate_owner`），于是**造出删不掉的 root**。所以一旦允许
-扫描纳管非 ASCII 名字，删除入口的校验必须同步放宽，否则 P4 那类「只能重置节点」的场景会从
-手工误操作变成常态。
+但要注意：`validate_owner` 仍拒绝中文名与 `.ownerfs-` 前缀开头的名字。若扫描纳管非 ASCII
+名字，就会造出**删不掉的 root**。本轮裁决取「扫描默认跳过非 ASCII」（§6.2），因此
+`validate_owner` 保持现状；将来要支持中文名时，必须同步放宽删除入口的校验，否则 P4 那类
+「只能重置节点」的场景会从手工误操作变成常态。
 
 ## 7 必须修复的问题
 
-真机把 spike 的缺陷暴露得很干净。以下七项全部是**评审门槛**，未修完不可合入。
+真机把 spike 的缺陷暴露得很干净。按第三轮评审分成两组：
 
-### P0 · 非 UTF-8 名字使节点无法启动（阻塞级）
+| 组 | 项 | 门槛 |
+| --- | --- | --- |
+| 本期必修 | P1 / P2 / P4 / P5 / P6，以及新增的 P0′ | 未修完不可合入 |
+| 延后，独立 PR | P0 / P3（非 UTF-8 全链 `OsString` + catalog 记录改造） | 本期用 P0′ 的入口拒绝规避 |
+
+P0 与 P3 的修法保留在文档里，供独立 PR 直接取用；两节都补了「为什么可以延后」的前提。
+
+### P0 · 非 UTF-8 名字使节点无法启动（本期延后，由 P0′ 规避）
 
 建一个 `bad\xffname` 后重启 node-a 直接死：
 
@@ -345,7 +413,31 @@ FailedPrecondition: local root catalog identity is not canonical
 修法：`data_dir` 不再是持久字段，改为从 `name` 派生（`name` 已按 `name_hex` 落盘）。
 同一名字当时也不发布到 `/public`，且每 250ms 刷一条 `unrenderable_target`（见 P3）。
 
-**单测没抓到，因为单测只用 UTF-8 名字。** 正式实现必须补一个非 UTF-8 名字的重启回归测试。
+**本期不做**：业务侧确认现场不存在非 UTF-8 目录名，而 P0′ 在创建与扫描两个入口就把这类
+名字挡住，catalog 里只可能有合法 UTF-8，本缺陷不可达。catalog 记录格式改造因此可以延后，
+与 P3 一起作为独立 PR。
+
+**单测没抓到，因为单测只用 UTF-8 名字。** 独立 PR 必须补一个非 UTF-8 名字的重启回归测试。
+
+### P0′ · 非 UTF-8 名字在两个入口拒绝（本期必修）
+
+非 UTF-8 支持延后之后，必须有东西保证它进不了 catalog，否则 P0 的「节点起不来」会从
+「不支持的特性」变成「一次误操作炸节点」。两个入口，同一判定 `name.to_str().is_none()`：
+
+| 入口 | 位置 | 行为 |
+| --- | --- | --- |
+| FUSE / 内部创建 | `validate_root_name`（`root.rs:2310`） | 返回 `NODE_VFS_INVALID`（EINVAL），错误信息指明「名字必须是合法 UTF-8」 |
+| 启动扫描 | §6.2 判定表新增一行 | 跳过 + WARN `ownerfs.adopt.skip_non_utf8` + 计入摘要 `skipped` |
+
+两个实现约束：
+
+- **不能塞进 `root_id_from_name`**：它是纯编码，reconcile 用它核对存量记录，加策略会让一条
+  历史记录把节点变成不可启动（与 P4 同一个理由）。
+- 合法 UTF-8 的中文名不受影响（真机 `业务数据001` 端到端已验证）；只有非法字节序列被拒，
+  这正是 `String` 与 `OsString` 的分界。
+
+测试两条：FUSE 建 `bad\xffname` 返回 EINVAL；存储根里放一个 `bad\xffname` 目录，扫描跳过、
+节点连续启动两次都正常，且摘要日志里 `skipped` 计数为 1。
 
 ### P1 · 启动扫描必须有护栏
 
@@ -354,19 +446,23 @@ FailedPrecondition: local root catalog identity is not canonical
 
 评审后护栏收缩为 §6.4 的 G1–G3（默认关闭 + 摘要日志 + 单目录 fail-open），**系统侧不再有
 自动阻断误配的机制**（数量上限被否决，理由见 §6.4.1）。这意味着一半责任转移到部署流程：
-首次开启前必须人工 `ls` 一遍存储根（§10.1 第 6 条）。不接受这个前提就不应开 G1。
+首次开启前必须人工 `ls` 一遍存储根（§10.1 第 5 条）。不接受这个前提就不应开 G1。
 
 ### P2 · 扫描失败不能阻塞启动，也不能静默
 
 两类失败必须分开：catalog 记录不合规 → fail-closed（现状）；扫描发现的新目录不满足条件 →
 WARN 跳过 + 计入摘要。没有摘要日志时，「为什么这个目录没被纳管」只能靠 grep 全量日志。
 
-### P3 · 非 UTF-8 名字不发布 + 日志刷屏
+### P3 · 非 UTF-8 名字不发布 + 日志刷屏（本期延后）
 
 spike 里 `Action::Publish.target` 和 `PresentEntry::Symlink.target` 是 `String`，非 UTF-8
 名字无法表达，于是 `target_path` 返回 `None`、`plan()` 直接跳过该 root，外加每 250ms 一条
 WARN。目标实现两处都改 `OsString`，`classify()` 的 `read_link` 一侧同步改；`symlinkat`
 本身接受任意字节，内核侧没有障碍。
+
+**本期不做**：P0′ 之后 `/public` 里不可能出现非 UTF-8 目标，`unrenderable_target` 这条刷屏
+日志同样不可达。与 P0 合并为同一个独立 PR，一并交付跨机验证（NFSv4 要求 UTF-8、NFSv3 字节
+安全，见 R1）——只改本地发布而不验跨机，等于把一个未知风险留在生产里。
 
 ### P4 · `.ownerfs-` 前缀的目录能被认领
 
@@ -436,24 +532,26 @@ trash 名是 `root-<hex>-e<epoch>`，长度 `5 + 2n + 2 + digits`。u64 epoch �
 
 ## 8 改动清单
 
-集中在 OwnerFs 本地模块、配置校验，以及 Meta 的一个**输入侧**字段。**Meta 存储、state
-image、hash domain、golden 全部零改动**——这是启动扫描方案相对 API 方案最大的收益。
+集中在 OwnerFs 本地模块、配置校验，以及 Meta 的两处 proto 新增。**Meta 的实体编码、state
+image、hash domain 不动**；唯一触及持久格式的是 `RecoverRoots` 的 `OperationResult` 变体，
+它按 §6.5 单独提交、单独评审。
 
 | 文件 | 改动 | 量级 |
 | --- | --- | --- |
-| `node/vfs/ownerfs/root.rs` | 三个命名公式、`placement`、`rename_to_trash`、`trash_entries` 反算、prepare 的 adopt 分支、**新增 `adopt_pre_existing_roots()` 与 §6.2 判定**、reconcile pending 非空 warn、`validate_root_name`（前缀 + 长度）、摘要日志 | ~380 行 |
-| `node/vfs/ownerfs/catalog.rs` | `LocalRootRecord` 去掉 `data_dir` 持久字段改为派生；新增 `adopted: bool`；`RECORD_VERSION` bump | ~45 行 |
-| `node/outlet/mirror.rs` | `target_path` 返回 `OsString`；`Action::Publish.target`、`PresentEntry::Symlink.target`、`classify()` 全链 `OsString` | ~80 行 |
-| `node/outlet/live.rs` | `read_link` → `OsString`、`symlinkat` 调用点、target 比较 | ~30 行 |
-| `config/ownerfs.rs` | `adopt_on_startup` 开关（不再有 `adopt_max_roots`、不再与 LB 互斥） | ~15 行 |
-| `node/api/workspace.rs` | **不改**（不新增 `adopt` 字段） | 0 |
-| `crates/protocol/proto/meta.proto` + `meta/owner_roots.rs` + `node/rpc/meta.rs` | `ReserveRootRequest.pin_home`（字段号 10）、`select_home` 短路分支、节点侧透传 | ~35 行 |
-| 测试 | 扫描矩阵（保留名/非目录/挂载点/超长/双节点冲突/幂等/部分失败）+ `pin_home` 两种 LB 配置 + inode 不变 + 非 UTF-8 重启 + trash 反解 + 崩溃窗口；重写约 18 项失效断言 | ~350 行 |
-| 文档 | `docs/architecture/afs.md` 目录命名段落、`docs/deployment/afs.md` 存储根 / autofs / 开关前置 | 3 段 |
+| `node/vfs/ownerfs/root.rs` | 三个命名公式、`placement`、`rename_to_trash`、`trash_entries` 反算、prepare 的 adopt 分支、**新增 `adopt_pre_existing_roots()` 与 §6.2 判定**、reconcile pending 非空 warn、`validate_root_name`（前缀 + 长度 + **非 UTF-8 拒绝，P0′**）、摘要日志 | ~395 行 |
+| `node/vfs/ownerfs/catalog.rs` | **不改**（不加 `adopted`，schema 不变，`RECORD_VERSION` 不 bump） | 0 |
+| `node/outlet/mirror.rs` / `node/outlet/live.rs` | `mirror.rs` 的 `target_path` 改为 `<name>`（原硬编码 `root-<hex>-e<epoch>`，不改则 `/public` 全部断链）；`live.rs` 不改 | ~10 行 |
+| `config.rs` + `config/ownerfs.rs` | 扁平键 `ownerfs_adopt_on_startup`（默认 false，Node 角色）与 `ownerfs_data_dir`（默认 `<data_dir>/ownerfs`，绝对路径，Node + OwnerFs） | ~25 行 |
+| `node/assembly/ownerfs.rs` + `node/api/workspace.rs` | 存储根从写死的 `data_dir.join("ownerfs")` 改为 `cfg.ownerfs_data_dir`；**API 契约不改**（不新增 `adopt` 字段），仅内部就绪校验同步 | ~4 行 |
+| `node/api/workspace.rs` | 就绪校验的 `(dev, ino)` 比对改读 `ownerfs_data_dir`；HTTP 契约零改动，但漏改会让换根后的 `wait_outlet` 永久失败 | ~2 行 |
+| `crates/protocol/proto/meta.proto` + `meta/owner_roots.rs` + `node/rpc/meta.rs` + `meta/store/txn.rs` | `ReserveRootRequest.pin_home`（字段号 10）、`select_home` 短路分支、节点侧透传 | ~35 行 |
+| 同上（独立提交） | `RecoverRoots`：proto 消息、批量 txn（分批 256 + 逐条降级）、`OperationResult::RootGrants` 变体、节点侧 reconcile 调用点、版本 bump + golden 重生成 | ~150 行 |
+| 测试 | 扫描矩阵（保留名/非目录/挂载点/超长/双节点冲突/幂等/部分失败）+ `pin_home` 两种 LB 配置 + **P0′ 入口拒绝** + 批量 recover（成功/降级/重放/条数不符）+ inode 不变 + trash 反解 + 崩溃窗口；重写约 18 项失效断言 | ~380 行 |
+| 文档 | `docs/architecture/afs.md` 目录命名段落、`docs/deployment/afs.md` 存储根 / autofs / 开关前置 / 非 UTF-8 限制 | 4 段 |
 
-合计约 **940 行**（测试约 1/3）。与 API 方案（约 950 行）基本持平，但评审面显著变小：
-API 契约零改动，Meta 只多一个输入标志；增加的是**启动期行为的验收责任**，这部分不能靠单测
-替代，必须真机跑。
+合计约 **990 行**（测试约 1/3），其中批量 recover 约 150 行可独立交付。与 API 方案（约 950 行）
+基本持平，但评审面显著变小：API 契约零改动，Meta 只多两个 proto 消息；增加的是**启动期行为的
+验收责任**，这部分不能靠单测替代，必须真机跑。
 
 ## 9 验收矩阵
 
@@ -462,14 +560,16 @@ API 契约零改动，Meta 只多一个输入标志；增加的是**启动期行
 | 项 | 断言 |
 | --- | --- |
 | 认领零动作 | 认领前后目录 `(dev, ino)`、文件 inode、内容、mode、mtime 全部不变 |
-| 扫描规则 | §6.2 的十条判定逐条有测试：点前缀、`lost+found`、非目录、挂载点、超长名、已活跃、pending、Meta 本节点、Meta 他节点、正常纳管 |
+| 扫描规则 | §6.2 的每一条判定都有测试：点前缀、`lost+found`、非目录、非 UTF-8、挂载点、超长名、已活跃、pending、Meta 本节点、Meta 他节点、正常纳管 |
 | 扫描开关 | `adopt_on_startup=false` 时一个都不纳管；`true` 时按 §6.2 纳管 |
 | 负载均衡正交 | `ownerfs_mkdir_load_balance=true` 时：纳管根的 `home_node_id` 为发起节点（`pin_home` 生效），同批新建目录仍按 HRW 分散到两个节点；`pin_home` 缺省时 HRW 行为不变 |
 | 扫描幂等 | 连续两次启动只纳管一次；纳管后第二次启动因「catalog 已有活跃记录」跳过 |
 | 扫描失败隔离 | 单个目录纳管失败（如 Meta 返回冲突）不影响其余目录，也不阻塞启动 |
 | 代次隔离 | 删除后 live 名字立即释放；trash 出现 `root-<hex>-e<N>`；同名重建落在原名；`collect_trash` 只回收旧代 |
 | 崩溃窗口 | 四个窗口分别重启后行为符合 §4.5 表格，且**任何窗口都不会递归删除非空目录** |
-| 非 UTF-8 | 名字含 `\xff` 可创建、可发布、可重启、可删除；两个仅差非法字节的名字不塌成一条 |
+| 非 UTF-8 入口拒绝（P0′） | FUSE 创建 `bad\xffname` 返回 EINVAL；存储根里放一个 `bad\xffname` 目录，扫描跳过 + WARN，节点连续启动两次正常，摘要 `skipped=1` |
+| 非 ASCII 名字 | API 拒绝非 ASCII；扫描遇到中文名跳过 + WARN，不纳管 |
+| 批量 recover | N 个 root 一批换绑成功，`access_generation` 各自 +1；单 root 冲突时降级逐条且其余成功；同 `request_id` 重放返回同一批 grant；返回条数少于请求时缺的那个走 zombie 分支 |
 | 保留名 | 创建路径：`.ownerfs-` 前缀、`.`、`..`、含 `/` 一律拒绝；扫描路径：所有 `.` 开头与 `lost+found` 一律跳过 |
 | 长度 | 115 字节名在 create 与启动扫描处被拒，错误信息指向 trash 命名空间 |
 | 挂载点 | `dev` 与父目录不一致时纳管被拒 |
@@ -484,22 +584,23 @@ republish、非空残留改 warn+defer、空残留被复用），2 项是 P3 的
 | --- | --- |
 | 单目录纳管 | inode / mode / mtime / sha256 全部原样 |
 | 跨机读 | node-b 经 `/public/<name>` 读到，**inode 一致**，`fs_type=nfs4` |
-| 跨机写 | 中文目录 `业务数据001` 从 node-b 写入成功 |
 | 删除改名 | strace 抓到 `rename(".../test001" → ".../.ownerfs-trash/root-74657374303031-e3") = 0` |
 | 旧代残留时重建 | `201`，epoch 5，新代可写，旧代隔离；解除 immutable 后 20s 回收且新代无损 |
-| 批量 | 20 个目录 / 1040 条目，inode 全一致，**平均 245ms/个**（200 个约 50 秒） |
+| 批量 | 20 个目录 / 1040 条目，inode 全一致，**平均 245ms/个**（此数是 API 路径含 `wait_outlet` 的口径，非纳管成本，见 §6.5） |
 | 野目录 | 24 个未纳管目录在全新 Meta 下重启后全部保留，FUSE 不可见、不被删 |
 | 重启自洽 | catalog `data_dir` 与物理目录一致，root 仍可用 |
 
-### 9.3 待真机补验（P0–P6 修完后）
+### 9.3 待真机补验（本期项修完后）
 
-1. 非 UTF-8 名字的完整生命周期（含跨机，见 §11 风险）。
+1. **P0′ 端到端**：存储根里放一个 `bad\xffname` 目录 + 一个中文目录，重启后前者跳过、后者纳管；
+   连续两次重启都不受影响（这正是 P0 原本会炸的场景）。
 2. **「重启即纳管」端到端**：24 个野目录的现场，开开关重启后只纳管符合规则的目录，
    inode 全部不变，`/public` 与 FUSE 视图与摘要日志一致。
 3. 双节点同名冲突：两个存储根各放一个同名目录，先启动的一方拿到 Home，另一方跳过 + WARN。
 4. `ownerfs_mkdir_load_balance=true` 下的纳管：野目录全部落在各自节点（不出现空目录、
    inode 不变），随后新建的目录仍按 HRW 分到两端。
-5. 启动时长实测（1000 个目录的量级），确认可接受的窗口。
+5. 启动时长实测：1000 个目录的量级，分别量逐条与批量 recover，确认窗口在 30 秒以内且批量
+   确实把耗时曲线拉平。
 6. autofs 在场时的纳管（必须验证「停 map」是硬前置）。
 7. node→node gRPC 通道单独验收（P5 附带发现）。
 
@@ -509,8 +610,9 @@ republish、非空残留改 warn+defer、空残留被复用），2 项是 P3 的
 
 1. **停 autofs 的 map**。否则 automounter 会在目录被纳管后重新挂载，使目录变成挂载点，
    后续 trash 隔离直接 `EBUSY`。
-2. **OwnerFs 存储根指向现有数据的父目录**（不是每个子目录各挂一个）。否则 `rename` 会
-   `EXDEV`，trash 隔离做不成。
+2. **OwnerFs 存储根指向现有数据的父目录**（不是每个子目录各挂一个）。存储根由
+   `ownerfs_data_dir` 指定，默认 `<data_dir>/ownerfs`；纳管时必须显式改到数据父目录，
+   否则扫描的是默认私有目录。跨设备时 `rename` 会 `EXDEV`，trash 隔离做不成。
 3. 核对同文件系统：
 
    ```bash
@@ -529,7 +631,7 @@ republish、非空残留改 warn+defer、空残留被复用），2 项是 P3 的
    评审删除，系统**不会**自动阻断误配的存储根（§6.4.1）；误纳管 + 误删是本方案唯一能造成
    批量数据位置变更的路径。建议先在单节点开启、看过摘要日志后再推到第二个节点。
 
-6. **打开开关**：`[ownerfs] adopt_on_startup = true`（默认关闭，G1）。纳管发生在**各节点
+6. **打开开关**：`ownerfs_adopt_on_startup = true`（默认关闭，G1）。纳管发生在**各节点
    自己的**存储根上，所以不要再用「把请求发给哪台节点」来判断 Home；
    `ownerfs_mkdir_load_balance` 可以保持开启，纳管走 `pin_home`、新建目录照旧走 HRW（§6.4.2）。
 
@@ -539,19 +641,25 @@ republish、非空残留改 warn+defer、空残留被复用），2 项是 P3 的
 且不提供 legacy 分支（D11）。回退方式为「回退二进制 + 重置 AFS 环境」，不做数据兼容。
 这依赖「系统未上线」的前提；若上线后需要再改命名，必须另做迁移方案。
 
+`RecoverRoots` 的 `OperationResult` 新变体同属一次性格式变更（R10）：只向前，不提供「新 WAL
+给旧二进制读」的降级路径。两个变更都应在同一个发行窗口上线，避免「回退了二进制却读不了
+WAL」这种最尴尬的组合。
+
 ## 11 风险与未决
 
 | # | 项 | 状态 |
 | --- | --- | --- |
-| R1 | 非 UTF-8 名字的跨机可用性未验。NFSv4 要求 UTF-8，NFSv3 字节安全；本地已验证可用，跨机未测 | 待验；若不可用，需在发布时降级（本机可用、跨机不发布） |
+| R1 | 非 UTF-8 名字**本期不支持**（P0′ 在两个入口拒绝）；将来支持时还需确认跨机可用性——NFSv4 要求 UTF-8、NFSv3 字节安全 | 随独立 PR（P0+P3）一并交付；本期只需保证入口拒绝的报错可读 |
 | R2 | 名字 ≤114 字节是硬约束，来自 trash 命名空间 | 待业务方确认存量目录是否有超长名字 |
-| R3 | 中文名/non-ASCII 名可被扫描纳管，但 `validate_owner` 仍拒绝它们 → **造出删不掉的 root**（§6.6） | 待定：删除入口同步放宽，或扫描默认跳过非 ASCII |
+| R3 | 中文名/non-ASCII 名可被扫描纳管，但 `validate_owner` 仍拒绝它们 → **造出删不掉的 root**（§6.6） | 已裁决：扫描默认跳过非 ASCII（§6.2），`validate_owner` 不变；将来支持时需同步放宽删除入口 |
 | R4 | 空目录删除直接 `rmdir`、不产生 trash（与命名无关的既有行为）；非空目录的递归删除只能走 API，FUSE `rmdir` 返回 `ENOTEMPTY` | 需在运维文档写明 |
 | R5 | **误纳管**：存储根配错时一次启动接管几百个无关目录；「删除 workspace = 搬进 trash 并约 20 秒后真删」，误纳管后再误删等于数据位置变更 | **无自动阻断**：数量上限已按评审删除，靠 G1（默认关闭）+ §10.1 第 5 条人工核对 |
-| R6 | **启动时长**：245ms/目录，1000 个约 4 分钟，期间 VFS 未挂载 | 需评审给可接受上限（§6.5） |
+| R6 | **启动时长**：15–25ms/目录（不含 API 的 `wait_outlet`），1000 个 15–25 秒，期间 VFS 未挂载 | 批量 recover 后进一步下降（§6.5）；不需额外时长护栏 |
 | R7 | **双节点同名**：两边都有真实数据时必须人工裁决，系统只会让先启动的一方拿到 Home | 需运维手册写明裁决步骤 |
 | R8 | Meta root 数量随纳管目录数线性增长；已确认 `root_command` 无界泄漏（约 1.9KB/删除） | 长期问题，与本期无关但会被放大 |
 | R9 | 以 `.` 开头的存量目录不会被扫描纳管（D7 的扫描侧规则）；业务方若有这类目录，需人工改名或另加白名单 | 部署核对时一并检查 |
+| R10 | `RecoverRoots` 新增 `OperationResult` 变体，旧二进制读新 WAL 会失败（只增不改的枚举变体也不保证降级可读） | 与 §10.2 的回退策略一致（回退即重置）；需要单独发版说明 |
+| R11 | zombie 判定用 `metadata().unwrap_or(false)`，把 IO 错误退化成「目录不存在」，会直接 `deactivate`（`Delete`，无 tombstone） | 待定：改为非 NotFound 即 fail-closed；并加部署前置「`storage_root` 下不允许子挂载点」 |
 
 ## 12 验证记录
 
@@ -566,14 +674,40 @@ republish、非空残留改 warn+defer、空残留被复用），2 项是 P3 的
 
 ## 13 实施顺序建议
 
-1. P4 + P6（保留名前缀 + 长度校验）——量小、独立、可先合。
-2. P0 + P3（非 UTF-8 全链 `OsString` + catalog 不落盘 `data_dir` + 版本 bump）——先写失败测试。
-3. 命名公式三处 + `placement` + `rename_to_trash` + `trash_entries` 反算——这一步跑通后，
+1. P4 + P6 + **P0′**（保留名前缀 + 长度校验 + 非 UTF-8 入口拒绝）——量小、独立、可先合。
+   P0′ 先合的价值：后续所有实现与真机测试都不必再担心「造出一个非 UTF-8 root 把自己弄挂」。
+2. 命名公式三处 + `placement` + `rename_to_trash` + `trash_entries` 反算——这一步跑通后，
    纳管的本地动作才成立。
-4. `pin_home`（proto 字段 + `select_home` 短路 + 节点透传）——量小，但它是「负载均衡可以
-   保持开启」的前提；先做掉可以让后续真机验验都在 LB 开启下进行。
-5. `adopt_pre_existing_roots()` + 护栏 G1–G3 + 摘要日志——主体工作，按 §6.2 的十条规则
-   逐条写测试。
-6. 按新契约重写 18 项失效断言，跑 `cargo clippy` / `cargo fmt --check`。
-7. 真机改造现有 `/home/lzq/afs-adopt` 现场，验证「重启即纳管」：野目录只按开关纳管、
+3. `pin_home`（proto 字段 + `select_home` 短路 + 节点透传）——量小，但它是「负载均衡可以
+   保持开启」的前提；先做掉可以让后续真机验证都在 LB 开启下进行。
+4. `adopt_pre_existing_roots()` + 护栏 G1–G3 + 摘要日志——主体工作，按 §6.2 的规则逐条写测试。
+5. 按新契约重写 18 项失效断言，跑 `cargo clippy` / `cargo fmt --check`。
+6. 真机改造现有 `/home/lzq/afs-adopt` 现场，验证「重启即纳管」：野目录只按开关纳管、
    双节点同名冲突跳过、LB 开启时仍落本节点、启动时长与摘要日志。
+7. **`RecoverRoots` 批量接口**（独立提交，可与 1–6 并行）——先写批量/降级/重放测试，再换
+   节点侧 reconcile 的调用点；版本 bump + golden 重生成单独一个提交，便于审阅与回退。
+8. 非 UTF-8 全链（P0+P3）——本特性合入后另开 PR，补非 UTF-8 重启回归与跨机 NFS 验证。
+
+## 14 实现决策记录（2026-11-17）
+
+| # | 议题 | 决定 |
+| --- | --- | --- |
+| D-1 | outlet mirror 是否零改动 | **必须改**：`target_path` 改按 name 构造；原文「mirror 本期不改」与实现不符 |
+| D-2 | catalog 区分 active / pending 记录 | 不区分，判定合并为「catalog 已有该 root_id 记录 → 跳过」 |
+| D-3 | catalog 新增 `adopted` | **不加**；schema 不变，`RECORD_VERSION` 不 bump |
+| D-4 | 启动清理与空业务目录 | 启动期清理**不 `rmdir` live 目录**：pending / zombie / `retire_fenced_root` 全部改为 warn 并保留目录。pending 由 Meta abort 清理；zombie 与 fenced 代次从本地 catalog 丢弃记录（否则后续扫描会因「已有记录」跳过，目录永远无法重新纳管）。`rmdir` 只用于 trash 条目与显式删除 |
+| D-5 | R3 非 ASCII | 扫描默认跳过非 ASCII；`validate_owner` 保持现状 |
+| D-6 | 配置键 | 扁平键 `ownerfs_adopt_on_startup`（Node 角色，默认 false），不引入 `[ownerfs]` 表 |
+| D-7 | 扫描接线位置 | assembly 在 `RootManager::open` 返回后、`recovered_roots()` 之前调用；`open` 签名不变 |
+| D-8 | `RecoverRoots` 批量接口 | 本轮不做，不触碰 `OperationResult` / WAL 格式；作为独立提交另行交付 |
+| D-9 | 同名重建遇到旧代次目录 | 本地 catalog 有该 root 记录 → **复用**目录（只 chmod/chown/sync，不删除内容）；无记录且目录非空 → `IO_DIRECTORY_NOT_EMPTY`，不静默接管 |
+| D-10 | 存储根此前不可配置 | 新增扁平键 `ownerfs_data_dir`（Node 角色、绝对路径、默认 `<data_dir>/ownerfs`）。原文 §10.1 要求「存储根指向数据父目录」，但实现写死 `cfg.data_dir.join("ownerfs")`，部署面无法把根指到 `/home/agentos/.users`；`node/api/workspace.rs` 的就绪校验同步改用该键 |
+
+由此产生的已知残留：
+
+- 同一进程内同名重建（catalog 已有该 root 的旧代次记录）**复用**原目录并保留内容，不再
+  `remove_dir` 后重建（`prior_preparation` 分支）。
+- 若旧代次目录**已无 catalog 记录**（例如启动 reconcile 已丢弃记录、或数据目录由外部留下）
+  且非空，同名 `create` 会因 `ENOTEMPTY` 失败并保留原数据，不会静默接管。正常「删除后重建」
+  不受影响：删除会把 live 路径 rename 进 trash。需要接管时显式开启 `ownerfs_adopt_on_startup`。
+- 启动崩溃窗口可能留下空目录，由下一次扫描重新纳管。

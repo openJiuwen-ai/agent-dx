@@ -404,7 +404,7 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 }
                 let home = select_home(
                     self.store.as_ref(),
-                    self.load_balancing,
+                    self.load_balancing && !input.pin_home,
                     &input.root_id,
                     &requester_node_id,
                     &requester_session_id,
@@ -1270,6 +1270,8 @@ pub struct ReserveRootInput {
     /// authority's next epoch. The caller cannot advance the global watermark.
     pub expected_root_epoch: u64,
     pub create_intent_id: String,
+    /// Keep `preferred_home_node_id` even when load balancing is enabled.
+    pub pin_home: bool,
 }
 
 pub struct ReserveRootOutput {
@@ -1914,6 +1916,7 @@ mod tests {
             rights: vec![RootRight::Lookup],
             expected_root_epoch: 0,
             create_intent_id: create_intent_id.into(),
+            pin_home: false,
             preferred_home_node_id: requester_node_id.into(),
             session_id: requester_session_id.into(),
         }
@@ -1986,6 +1989,20 @@ mod tests {
         assert_eq!(selected.node_id, "node-a");
     }
 
+    /// 纳管扫描必须把 home 固定在当前节点，否则本地目录与其 Home 记录会分叉。
+    #[tokio::test]
+    async fn pin_home_keeps_the_requester_as_home_under_load_balancing() {
+        let store = open_store().await;
+        register_node(&store, "node-a", "session-a").await;
+        register_node(&store, "node-b", "session-b").await;
+        let authority = StoreOwnerRootAuthority::with_load_balancing(store, true);
+        let mut input = reserve_input("node-a", "session-a", "reserve-pin", "intent-pin");
+        input.pin_home = true;
+        let output = authority.reserve_root(input).await.expect("reserve root");
+        assert_eq!(output.reservation.home_node_id, "node-a");
+        assert_eq!(output.reservation.home_session_id, "session-a");
+    }
+
     #[tokio::test]
     async fn activate_replay_rejects_a_different_prepare_identity() {
         let store = open_store().await;
@@ -1998,6 +2015,7 @@ mod tests {
                 rights: vec![RootRight::Lookup],
                 expected_root_epoch: 0,
                 create_intent_id: "node-a:session-a:agent-a".into(),
+                pin_home: false,
                 preferred_home_node_id: "node-a".into(),
                 session_id: "session-a".into(),
             })

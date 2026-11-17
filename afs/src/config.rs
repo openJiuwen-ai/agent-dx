@@ -383,6 +383,9 @@ pub struct Cli {
     /// Enable centralized HRW placement for new OwnerFs workspaces on Meta.
     #[arg(long)]
     pub ownerfs_mkdir_load_balance: Option<bool>,
+    /// Adopt pre-existing first-level directories as OwnerFs workspaces at startup.
+    #[arg(long)]
+    pub ownerfs_adopt_on_startup: Option<bool>,
     /// Diagnostics only: the peer that the Node REST `diagnose` route probes.
     #[arg(long, hide = true)]
     pub peer_endpoint: Option<String>,
@@ -408,6 +411,11 @@ pub struct Cli {
     pub rdma_device: Option<String>,
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+    /// OwnerFs storage root: holds workspace directories plus the private
+    /// catalog and trash. Defaults to `<data_dir>/ownerfs`. When adopting
+    /// pre-existing data, point it at the parent of those directories.
+    #[arg(long)]
+    pub ownerfs_data_dir: Option<PathBuf>,
     #[arg(long)]
     pub uds_path: Option<PathBuf>,
     #[arg(long)]
@@ -643,6 +651,7 @@ struct FileConfig {
     meta_watch_retention_ms: Option<u64>,
     allow_volatile_meta: Option<bool>,
     ownerfs_mkdir_load_balance: Option<bool>,
+    ownerfs_adopt_on_startup: Option<bool>,
     peer_endpoint: Option<String>,
     advertise_endpoint: Option<String>,
     tls_encryption_enabled: Option<bool>,
@@ -656,6 +665,7 @@ struct FileConfig {
     data_mode: Option<DataMode>,
     rdma_device: Option<String>,
     data_dir: Option<PathBuf>,
+    ownerfs_data_dir: Option<PathBuf>,
     uds_path: Option<PathBuf>,
     ownerfs_mount: Option<PathBuf>,
     experimental_ownerfs_workspace_bind: Option<bool>,
@@ -785,6 +795,7 @@ pub struct Config {
     pub meta_watch_retention_ms: u64,
     pub allow_volatile_meta: bool,
     pub ownerfs_mkdir_load_balance: bool,
+    pub ownerfs_adopt_on_startup: bool,
     pub peer_endpoint: Option<String>,
     pub advertise_endpoint: Option<String>,
     pub tls_encryption_enabled: bool,
@@ -798,6 +809,7 @@ pub struct Config {
     pub data_mode: DataMode,
     pub rdma_device: Option<String>,
     pub data_dir: PathBuf,
+    pub ownerfs_data_dir: PathBuf,
     pub uds_path: PathBuf,
     pub ownerfs_mount: Option<PathBuf>,
     pub experimental_ownerfs_workspace_bind: bool,
@@ -943,6 +955,14 @@ impl Config {
             grpc_listen,
             outlet,
         } = resolved;
+        let data_dir = cli
+            .data_dir
+            .or(file.data_dir)
+            .unwrap_or_else(|| PathBuf::from(format!("/tmp/afs-{id}/data")));
+        let ownerfs_data_dir = cli
+            .ownerfs_data_dir
+            .or(file.ownerfs_data_dir)
+            .unwrap_or_else(|| data_dir.join("ownerfs"));
         Self {
             grpc_listen,
             rest_listen: cli.rest_listen.or(file.rest_listen).unwrap_or_else(|| {
@@ -974,6 +994,10 @@ impl Config {
             meta_watch_retention_ms: meta.meta_watch_retention_ms,
             allow_volatile_meta: meta.allow_volatile_meta,
             ownerfs_mkdir_load_balance: meta.ownerfs_mkdir_load_balance,
+            ownerfs_adopt_on_startup: cli
+                .ownerfs_adopt_on_startup
+                .or(file.ownerfs_adopt_on_startup)
+                .unwrap_or(false),
             peer_endpoint: cli.peer_endpoint.or(file.peer_endpoint),
             advertise_endpoint: cli.advertise_endpoint.or(file.advertise_endpoint),
             tls_encryption_enabled: cli
@@ -989,10 +1013,8 @@ impl Config {
                 .or(file.tls_identity_private_key),
             tls_server_name: cli.tls_server_name.or(file.tls_server_name),
             trusted_node_certs: file.trusted_node_certs.unwrap_or_default(),
-            data_dir: cli
-                .data_dir
-                .or(file.data_dir)
-                .unwrap_or_else(|| PathBuf::from(format!("/tmp/afs-{id}/data"))),
+            data_dir,
+            ownerfs_data_dir,
             uds_path: cli
                 .uds_path
                 .or(file.uds_path)

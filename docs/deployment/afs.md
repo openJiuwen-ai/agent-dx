@@ -301,9 +301,11 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `data_mode` | 产品差异 | Node | `grpc` | Node 间数据通道：`grpc`、`rdma` 或 `auto`；`rdma` 需要编译 `rdma` feature |
 | `rdma_device` | 产品差异 | Node | 无 | RDMA 设备名；OwnerFs 的 `rdma` 模式必填 |
 | `data_dir` | 产品差异 | 两者 | `/tmp/afs-<id>/data` | 数据目录，必须是绝对路径；默认值只适合临时运行 |
+| `ownerfs_data_dir` | 产品差异 | Node | `<data_dir>/ownerfs` | OwnerFs 存储根：workspace 数据目录、catalog 与 trash 都在这一层。必须是绝对路径；纳管既有数据时指向这些目录的父目录；非 Node 或未启用 OwnerFs 时写在配置里会启动失败 |
 | `uds_path` | 产品差异 | Node | `/tmp/afs-<id>/local.sock` | Local SDK 的 Unix socket 路径 |
 | `ownerfs_mount` | 产品差异 | Node | 无 | OwnerFs FUSE 挂载点；不设则不挂载 |
 | `ownerfs_mkdir_load_balance` | 产品差异 | Meta | `false` | 新 OwnerFs workspace 由 Meta 按 HRW 放置；写在 Node 配置里会启动失败 |
+| `ownerfs_adopt_on_startup` | 产品差异 | Node | `false` | 启动时把 OwnerFs 数据根下已存在的一级目录纳管为 workspace；隐藏项、`lost+found`、非 ASCII/非 UTF-8 名、挂载点与超长名跳过并告警；非 Node 或未启用 OwnerFs 时写在配置里会启动失败 |
 | `dfs_mount` | 产品差异 | Node | 无 | DFS FUSE 挂载点；不设则不挂载 |
 | `dfs_external_backend` | 产品差异 | 两者 | 无 | 外部 S3 持久化；不设则用原生副本，子键见[DFS 外部 S3 连接](#dfs-外部-s3-连接)。仅 TOML |
 | `dfs_peer_cache` | 产品差异 | Node | 无 | 原生 Peer 可丢弃磁盘读缓存；不设则关闭，与 `dfs_external_backend` 互斥。仅 TOML |
@@ -1084,6 +1086,52 @@ NodeReplicated DFS 默认启动每 5 秒一次的安全回收；引用退休后�
 可选BLAKE3 Peer驻留/proof及磁盘缓存不适用于CRC对象；CRC直接走分段验证的范围传输。gRPC与RDMA协议均携带CRC描述，RDMA硬件运行单独验收，不能用全feature编译替代。S3及其缓存策略不在本次变更范围。
 
 `security.capability`在原inode映射检查后本地返回既有不支持错误，其余xattr保留Meta权限与错误语义。Meta的`afs_requests_total`提供`ping`、`register_node`、`dfs_gc_capture/retain/release/collect`、`dfs_commit_file_version`和`dfs_get_xattr`标签，用于核对真实访问次数；不增加逐chunk正文扫描或详细调度采集。
+
+## OwnerFs 启动纳管
+
+`ownerfs_adopt_on_startup = true` 时，`afs-node` 在挂载前扫描 `ownerfs_data_dir` 的
+直接子项，把符合条件的目录原地纳管为 workspace：不 `rename`、不 `copy`、不改
+uid/gid/mode。扫描规则与崩溃窗口见
+[OwnerFs 原生目录名纳管设计](../development/ownerfs-adopt-native-name-design.md)。
+
+开启前必须完成以下核对，缺一不可：
+
+1. **存储根指向数据的父目录**。`ownerfs_data_dir` 默认是 `<data_dir>/ownerfs`；纳管
+   既有数据时必须显式指到父目录，例如：
+
+   ```toml
+   data_dir = "/var/lib/afs/node-a"
+   ownerfs_data_dir = "/home/agentos/.users"
+   ownerfs_adopt_on_startup = true
+   ```
+
+   扫描只处理该目录的直接子项，不要给每个业务目录各配一个存储根。
+2. **停掉 autofs 的 map**。否则 automounter 会在纳管后重新挂载，使目录变成挂载点，
+   后续隔离删除会 `EBUSY`。
+3. **确认同一文件系统**。隔离删除依赖 `rename(2)`，跨设备会 `EXDEV`：
+
+   ```bash
+   stat -c '%d %n' /home/agentos/.users /home/agentos/.users/test001
+   ```
+
+4. **核对保留名与长度**。以 `.` 开头的目录、`lost+found`、非 ASCII 名、非 UTF-8 名、
+   挂载点和超过 114 字节的名字都会被跳过（后两类超过 trash 命名空间上限）：
+
+   ```bash
+   ls -A /home/agentos/.users | grep -E '^\.'
+   ls -A /home/agentos/.users | grep -E '^lost\+found$'
+   ls -A /home/agentos/.users | awk '{ if (length($0) > 114) print }'
+   ```
+
+5. **人工核对清单**。`ls -1 /home/agentos/.users` 确认里面只有要纳管的业务目录。系统
+   **不会**自动阻断误配的存储根；误纳管后再误删是唯一能造成批量数据位置变更的路径，
+   建议先在单节点开启并检查摘要日志 `ownerfs.adopt.summary`，再推到其它节点。
+6. **注意名称约束**。本期不支持非 UTF-8 名字；非 ASCII 名字默认跳过，且删除 API 仍
+   拒绝它们。纳管后 workspace 的 live 目录就是原名，删除时目录会被 `rename` 进
+   `.ownerfs-trash/root-<hex>-e<epoch>` 后回收。
+
+回退：命名与旧实现不兼容，只能回退二进制并重置 AFS 环境；不要期望新二进制读取
+旧的 `root-*` 数据目录。
 
 ## OwnerFs 运行时开关
 

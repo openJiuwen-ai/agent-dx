@@ -1863,6 +1863,7 @@ mod tests {
             &self,
             _id: &RootId,
             _create_intent_id: &str,
+            _pin_home: bool,
         ) -> Result<crate::node::vfs::ownerfs::root::RootReservation> {
             unreachable!("not exercised by mirror tests")
         }
@@ -1989,7 +1990,7 @@ mod tests {
         let link = dir.path().join("a");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
-            Path::new("/imports/node-a/users/root-61-e7")
+            Path::new("/imports/node-a/users/a")
         );
         assert_eq!(digest.as_deref(), Some("d1"));
     }
@@ -2021,9 +2022,9 @@ mod tests {
         );
     }
 
-    /// 换代的 target 变化必须原地替换，读到的始终是可解析的 symlink。
+    /// 换代不改变链接目标：target 里没有代次，链接始终可解析。
     #[test]
-    fn generation_change_replaces_the_link_in_place() {
+    fn generation_change_keeps_the_link_target() {
         let dir = tempfile::tempdir().unwrap();
         prepare(dir.path()).unwrap();
         let meta = ScriptedMeta::new(vec![
@@ -2037,7 +2038,7 @@ mod tests {
 
         assert_eq!(
             std::fs::read_link(dir.path().join("a")).unwrap(),
-            Path::new("/imports/node-a/users/root-61-e8")
+            Path::new("/imports/node-a/users/a")
         );
     }
 
@@ -2058,29 +2059,28 @@ mod tests {
         assert!(dir.path().join("a").symlink_metadata().is_err());
     }
 
-    /// 非 UTF-8 名字必须逐字节发布：真机上这条链路曾经把两个 workspace
-    /// 合并成一个带 U+FFFD 的名字（`mirror::plan` 的键曾是 `String`）。
+    /// 非 UTF-8 名字本轮不发布（P0 延后）：既不创建也不发布替代字符版本。
     #[test]
-    fn a_non_utf8_workspace_name_is_published_byte_for_byte() {
+    fn a_non_utf8_workspace_name_is_not_published() {
         use std::os::unix::ffi::OsStringExt;
 
         let dir = tempfile::tempdir().unwrap();
         prepare(dir.path()).unwrap();
         // hex(b"utf8cafe\xe9") = 7574663863616665e9，与 OwnerFs 的编码一致。
-        // 两轮同一份快照：第二轮用来验证收敛判据按字节比较。
         let meta = ScriptedMeta::new(vec![
             full("d1", vec![node("root-7574663863616665e9", 3, "node-a")]),
             full("d2", vec![node("root-7574663863616665e9", 3, "node-a")]),
         ]);
         let mut digest = None;
         let mut roots = Vec::new();
-        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+        let applied = converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+        assert_eq!(applied, 0, "non-UTF-8 roots stay unpublished");
 
         let on_disk = scan_public(dir.path()).unwrap();
         let exact = OsString::from_vec(b"utf8cafe\xe9".to_vec());
         assert!(
-            on_disk.contains_key(&exact),
-            "原始字节的名字必须出现在 /public: {:?}",
+            !on_disk.contains_key(&exact),
+            "原始字节的名字不应出现在 /public: {:?}",
             on_disk.keys()
         );
         assert!(
@@ -2088,7 +2088,7 @@ mod tests {
             "不得发布替换字符版本的名字"
         );
 
-        // 第二轮必须判为已收敛：字节比较而不是 lossy 比较。
+        // 第二轮同样不应产生动作。
         let applied = converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
         assert_eq!(applied, 0, "converged state must be a no-op");
     }
@@ -2110,7 +2110,7 @@ mod tests {
         // 名字现在是 symlink，原目录被移入隔离区而不是被删掉。
         assert_eq!(
             std::fs::read_link(dir.path().join("a")).unwrap(),
-            Path::new("/imports/node-a/users/root-61-e7")
+            Path::new("/imports/node-a/users/a")
         );
         let quarantined: Vec<_> = std::fs::read_dir(dir.path().join(QUARANTINE_DIR))
             .unwrap()
