@@ -1112,9 +1112,16 @@ root 调用者可显式指定属主，与 `chown(2)` 一致，供管理员启用
 检查失败时 Home 不创建目录，也不写 catalog 或 Meta。
 
 workspace 可以从任意节点的 OwnerFs FUSE 路径删除：Home 在本机执行；非 Home 入口通过
-OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 workspace，非空返回
-`ENOTEMPTY` 且 workspace 保持可用；`rm -rf` 会先删除内容，最后才删除空的 workspace 目录。
-在 egress 路径上对 workspace 目录执行 rmdir 会被内核以 `EBUSY` 拒绝，不会删除 workspace。
+OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 workspace，Home 侧物理目录
+的原子判空是唯一的决策点：非空返回 `ENOTEMPTY`，已封闭的准入会恢复、已卸载的 egress bind
+会异步重挂（尽力而为，失败只保留 FUSE 访问并告警），Meta 归属、catalog 与数据不变。判空
+之后的并发写入不由删除流程排空（outlet 等原生路径无法阻止），由原子判空裁决。
+
+判空成功后删除只向前收敛：Meta 下线即删除达成，此后 catalog 清理失败只告警、rmdir 仍返回
+成功，残留由启动 reconcile 回收。Meta 下线失败时保留删除中状态与 catalog，由 Home 本机
+重试或重启 reconcile 补完，删除进行中的非 Home 入口会被准入检查拒绝。`rm -rf` 会先删除
+内容，最后才删除空的 workspace 目录；在 egress 路径上对 workspace 目录执行 rmdir 会被内核
+以 `EBUSY` 拒绝，不会删除 workspace。
 
 ## 跨节点 Workspace 出口（outlet）
 
@@ -1139,9 +1146,9 @@ Home 节点的本地盘上，不做复制。每台需要读该名字视图的节
 `/public/<name> -> <import_root>/<home>/users` 软链，自动维护对端（NFS）与
 本机（bind）的 import 挂载；mountinfo 只读诊断随轮输出，配置硬前提（独立
 tmpfs、宿主 mount namespace、`mount(2)` 权限）在启动时 fail-closed 校验。
-没有运行期数据回收：删除契约只在提交前检查空目录（非空返回 `ENOTEMPTY`），
-提交后删除不会留下"待回收"的目录，残余目录由启动 reconcile（有 Meta 全量
-视角）收敛，非空残余保留 catalog 记录并告警，等待人工清理。
+没有运行期数据回收：删除契约以 Home 侧物理目录的原子判空为决策点（非空返回
+`ENOTEMPTY` 并回滚），提交后删除不会留下"待回收"的目录，残余目录（旧版本产生）由启动
+reconcile（有 Meta 全量视角）收敛，非空残余保留 catalog 记录并告警，等待人工清理。
 
 `/public` 下的 `.pub`（原子发布的暂存目录）与 `.quarantine`（消费方违约时的
 隔离区）归镜像所有，不能作为 workspace 名：创建时即拒（`EINVAL`）。快照里若
