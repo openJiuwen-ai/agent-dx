@@ -1,4 +1,4 @@
-mod common;
+use super::common;
 use adx_core::managed_images::{ImageRetention, ManagedImage, PublicationState};
 use std::collections::BTreeMap;
 

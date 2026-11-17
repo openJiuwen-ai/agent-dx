@@ -58,4 +58,11 @@ if [[ $component == platform ]]; then
   export ADX_TEST_EVIDENCE="$PWD/out/buildkite/logs/node-retirement"
   cargo test --locked --package=adx-coordinator --test storage --test rpc \
     -j "${JOBS:-4}" node_retirement -- --ignored
+  # Managed publications must survive real AOF restart and fence acquisition
+  # against deletion; these opt-in tests are not run by ordinary cargo test.
+  export ADX_TEST_EVIDENCE="$PWD/out/buildkite/logs/managed-images"
+  export ADX_TEST_TLS_DIR="$ADX_TEST_EVIDENCE/tls"
+  python3 build/ci/rpc_certificates.py "$ADX_TEST_TLS_DIR"
+  cargo test --locked --package=adx-coordinator --test storage --test rpc \
+    -j "${JOBS:-4}" managed_image -- --ignored --test-threads=1
 fi

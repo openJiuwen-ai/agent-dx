@@ -250,6 +250,8 @@ cargo test --locked -p adx-coordinator --test storage \
 
 Replace the filter with any transport-recovery case above to run it directly.
 
+Managed-image ownership has separate required Platform regressions. The component gate generates an isolated mTLS fixture and runs the real AOF publication-restart case from the standard `storage` target together with the managed-image `rpc` cases. These validate acquisition/deletion fencing, retained Snapshot dependencies and both runtime admission paths; they are not part of the timing cases deferred above. Native Nydus/checkpoint/Registry GC qualification remains a separate consumer integration gate.
+
 ## Optional PyPI publication
 
 `admin-package` always runs the `adxadmin` unit and release tests, builds one
