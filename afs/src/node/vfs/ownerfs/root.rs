@@ -3377,6 +3377,7 @@ mod tests {
         lose_activate_reply: bool,
         fail_deactivate: bool,
         lose_deactivate_reply: bool,
+        fail_reserve: Option<RootId>,
     }
 
     #[derive(Default)]
@@ -3390,6 +3391,9 @@ mod tests {
             _pin_home: bool,
         ) -> Result<RootReservation> {
             let mut state = self.0.lock().unwrap();
+            if state.fail_reserve.as_ref() == Some(id) {
+                return Err(invalid_grant("reserve rejected by test"));
+            }
             let reservation = RootReservation {
                 id: id.clone(),
                 epoch: 1,
@@ -3582,10 +3586,17 @@ mod tests {
         std::fs::create_dir(temp.path().join("plain")).unwrap();
         let manager =
             RootManager::open("node-a".into(), "old-session".into(), meta, disk.clone()).unwrap();
+        let total = std::fs::read_dir(temp.path()).unwrap().count();
 
         let summary = manager.adopt_pre_existing_roots();
+        assert_eq!(summary.scanned, total, "every first-level entry is counted");
         assert_eq!(summary.adopted, 1, "only `plain` is eligible");
         assert_eq!(summary.failed, 0);
+        assert_eq!(
+            summary.skipped,
+            total - 1,
+            "hidden, system, non-ASCII, non-UTF-8, file and overlong entries are all skipped"
+        );
 
         for name in [".hidden", "lost+found", "中文"] {
             let id = root_id_from_name(OsStr::new(name)).unwrap();
@@ -3598,6 +3609,55 @@ mod tests {
         assert!(
             temp.path().join("plain").is_dir(),
             "adoption must not move the directory"
+        );
+    }
+
+    /// 存储根里只有一个无法纳管的目录时，连续两次启动都必须成功。
+    ///
+    /// 这是「扫描不阻塞启动」的最小回归用例：坏目录每次都被跳过并保留，
+    /// 既不产生 Meta 记录也不影响下一次启动。
+    #[test]
+    fn adoption_survives_restarts_with_only_a_non_utf8_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let bad = OsString::from_vec(b"bad\xffname".to_vec());
+        std::fs::create_dir(temp.path().join(&bad)).unwrap();
+
+        for attempt in 0..2 {
+            let manager = RootManager::open(
+                "node-a".into(),
+                format!("session-{attempt}"),
+                meta.clone(),
+                disk.clone(),
+            )
+            .expect("a skipped entry must not block startup");
+            let total = std::fs::read_dir(temp.path()).unwrap().count();
+
+            let summary = manager.adopt_pre_existing_roots();
+            assert_eq!(summary.scanned, total, "attempt {attempt}");
+            assert_eq!(summary.adopted, 0, "attempt {attempt}");
+            assert_eq!(summary.failed, 0, "attempt {attempt}");
+            assert_eq!(
+                summary.skipped, total,
+                "the bad entry plus OwnerFs bookkeeping are all skipped"
+            );
+            assert!(
+                temp.path().join(&bad).is_dir(),
+                "attempt {attempt} must not touch the bad directory"
+            );
+            assert!(manager.catalog.scan_roots().unwrap().is_empty());
+        }
+        assert!(meta.0.lock().unwrap().active.is_none());
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_name() == bad)
+                .count(),
+            1
         );
     }
 
@@ -3629,6 +3689,118 @@ mod tests {
         assert_eq!(summary.failed, 0);
         assert!(manager.catalog.lookup_root(&id).unwrap().is_none());
         assert!(manager.enter_root(&id, RootRight::Read).is_err());
+    }
+
+    /// 纳管是「认目录」而不是「造目录」：inode、mode、mtime 一个都不能变。
+    #[test]
+    fn adoption_preserves_inode_mode_and_mtime() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let dir = temp.path().join("keep");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("payload"), b"hello").unwrap();
+        let before = std::fs::metadata(&dir).unwrap();
+
+        let manager = RootManager::open("node-a".into(), "old-session".into(), meta, disk).unwrap();
+        let summary = manager.adopt_pre_existing_roots();
+        assert_eq!(summary.adopted, 1);
+        assert_eq!(summary.failed, 0);
+
+        let after = std::fs::metadata(&dir).unwrap();
+        assert_eq!(
+            before.ino(),
+            after.ino(),
+            "adoption must not move the directory"
+        );
+        assert_eq!(before.dev(), after.dev());
+        assert_eq!(before.mode(), after.mode(), "adoption must not chmod");
+        assert_eq!(
+            before.mtime(),
+            after.mtime(),
+            "adoption must not touch mtime"
+        );
+        assert_eq!(before.mtime_nsec(), after.mtime_nsec());
+        assert_eq!(std::fs::read(dir.join("payload")).unwrap(), b"hello");
+    }
+
+    /// 同一个名字在两端都有目录时，Meta 只会授一个 Home；另一端必须让路。
+    #[test]
+    fn adoption_does_not_steal_a_workspace_homed_on_another_node() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let id = root_id_from_name(OsStr::new("shared")).unwrap();
+        std::fs::create_dir(temp.path().join("shared")).unwrap();
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        meta.0.lock().unwrap().active = Some(RootLocation {
+            id: id.clone(),
+            epoch: 4,
+            home_node_id: "node-b".into(),
+            home_session_id: "session-b".into(),
+        });
+
+        let summary = manager.adopt_pre_existing_roots();
+        assert_eq!(summary.adopted, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped, summary.scanned);
+        assert!(manager.catalog.lookup_root(&id).unwrap().is_none());
+        assert!(temp.path().join("shared").is_dir());
+    }
+
+    /// 单个目录纳管失败只记账，不中断同批次的其它目录。
+    #[test]
+    fn adoption_isolates_a_failed_directory_and_keeps_scanning() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        std::fs::create_dir(temp.path().join("alpha")).unwrap();
+        std::fs::create_dir(temp.path().join("beta")).unwrap();
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        let beta = root_id_from_name(OsStr::new("beta")).unwrap();
+        meta.0.lock().unwrap().fail_reserve = Some(beta.clone());
+
+        let summary = manager.adopt_pre_existing_roots();
+        assert_eq!(summary.adopted, 1, "alpha must still be adopted");
+        assert_eq!(summary.failed, 1, "beta is counted, not fatal");
+        assert_eq!(
+            summary.scanned,
+            summary.adopted + summary.failed + summary.skipped
+        );
+        let alpha = root_id_from_name(OsStr::new("alpha")).unwrap();
+        assert!(manager.catalog.lookup_root(&alpha).unwrap().is_some());
+        assert!(manager.catalog.lookup_root(&beta).unwrap().is_none());
+        assert!(
+            temp.path().join("beta").is_dir(),
+            "a failed adoption must not remove data"
+        );
+    }
+
+    /// 挂载点无法 `rename` 进 trash，必须在纳管时拒掉。用不同的 `root_dev`
+    /// 直接触发该分支，避免单测依赖真实挂载。
+    #[test]
+    fn adoption_skips_an_entry_on_another_device() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        std::fs::create_dir(temp.path().join("mount")).unwrap();
+        let manager = RootManager::open("node-a".into(), "old-session".into(), meta, disk).unwrap();
+        let foreign_dev = std::fs::metadata(temp.path()).unwrap().dev() + 1;
+
+        assert!(
+            !manager
+                .adopt_entry(OsStr::new("mount"), foreign_dev)
+                .unwrap(),
+            "an entry on another device must be skipped"
+        );
+        let id = root_id_from_name(OsStr::new("mount")).unwrap();
+        assert!(manager.catalog.lookup_root(&id).unwrap().is_none());
     }
 
     fn recovery_grant(id: RootId, session: &str) -> RootGrant {
