@@ -21,6 +21,8 @@ struct Bootstrap {
 #[serde(deny_unknown_fields)]
 struct Config {
     #[serde(default)]
+    managed_image_reclamation: bool,
+    #[serde(default)]
     storage_domains: std::collections::BTreeMap<String, adx_core::volumes::StorageDomain>,
     #[serde(default)]
     checkpoint_reclaimers: Vec<adx_checkpoint_storage::reclaim::ReclaimerConfig>,
@@ -154,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reclaimers.insert(store.build()?)?;
     }
     let rpc = rpc
+        .with_managed_image_reclamation(config.managed_image_reclamation)
         .with_volume_domains(config.storage_domains)?
         .with_reclaimers(reclaimers);
     let metrics_listener = match config.metrics_listen {
@@ -270,6 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let closing_routes = routes.clone();
     let closing_nodes = rpc.clone();
     let server = builder
+        .add_service(pb::managed_image_service_server::ManagedImageServiceServer::new(rpc.clone()))
         .add_service(
             pb::volume_execution_service_server::VolumeExecutionServiceServer::new(rpc.clone()),
         )

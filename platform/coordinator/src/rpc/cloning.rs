@@ -33,7 +33,25 @@ pub(super) async fn normalize(
     if request.id == snapshot.template.id {
         return Err(Error::Conflict);
     }
-    inherit_template(request, &snapshot, existing.as_ref())
+    let mut inherited = inherit_template(request, &snapshot, existing.as_ref())?;
+    let captured = session
+        .managed_image_dependencies(&snapshot.template)
+        .await?;
+    if !captured.is_empty() {
+        let mut extra: serde_json::Map<String, serde_json::Value> =
+            if inherited.execution.extra_config.is_empty() {
+                serde_json::Map::new()
+            } else {
+                serde_json::from_str(&inherited.execution.extra_config)
+                    .map_err(|_| Error::Invalid("invalid restore runtime configuration".into()))?
+            };
+        let mut ids = session.managed_image_dependencies(&inherited).await?;
+        ids.extend(captured);
+        extra.insert("managedImagePublications".into(), serde_json::json!(ids));
+        inherited.execution.extra_config = serde_json::to_string(&extra)
+            .map_err(|_| Error::Invalid("invalid managed image dependencies".into()))?;
+    }
+    Ok(inherited)
 }
 
 fn inherit_template(

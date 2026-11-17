@@ -8,6 +8,7 @@ mod publication;
 mod transport;
 pub use claims::{ClaimOutcome, LocalClaim};
 mod artifacts;
+mod managed_images;
 pub use artifacts::ArtifactDeletionGuard;
 mod collection;
 mod credentials;

@@ -9,7 +9,9 @@ mod checkpoint_cleanup;
 mod claims;
 mod cloning;
 mod collection;
+mod dependencies;
 mod environment_control;
+mod managed_images;
 mod metrics;
 mod node_retirement;
 mod observation;
@@ -334,7 +336,7 @@ impl State {
                 // A stale or aborted recovery queue must never recreate an
                 // already-published Environment as a fresh execution.
                 Err(Error::Conflict)
-            } else if crate::storage::has_volumes(&spec) {
+            } else if self.persistent_dependencies(&spec).await? {
                 self.session
                     .reserve_with_request(
                         spec.clone(),
@@ -448,6 +450,7 @@ impl State {
     }
 }
 struct Inner {
+    managed_image_reclamation: std::sync::atomic::AtomicBool,
     business: Arc<std::sync::RwLock<Option<observation::BusinessSnapshot>>>,
     business_fenced: Arc<std::sync::atomic::AtomicBool>,
     volume_domains: std::sync::RwLock<BTreeMap<String, adx_core::volumes::StorageDomain>>,
@@ -692,6 +695,7 @@ impl CoordinatorRpc {
         };
         let departed_sessions = session.departed_node_sessions().await?;
         let service = Self(Arc::new(Inner {
+            managed_image_reclamation: std::sync::atomic::AtomicBool::new(false),
             business: Arc::new(std::sync::RwLock::new(business)),
             business_fenced: Default::default(),
             upgrade_lock: Mutex::new(()),
@@ -1331,7 +1335,7 @@ impl CoordinatorRpc {
             } else {
                 let domains = self.volume_domains(&state).map_err(status)?;
                 state
-                    .prepare_volumes(&spec, &domains)
+                    .prepare_dependencies(&spec, &domains)
                     .await
                     .map_err(status)?;
                 state.scheduler.submit(spec.clone()).map_err(status)?;

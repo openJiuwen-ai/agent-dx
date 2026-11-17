@@ -1,5 +1,62 @@
 use super::*;
 
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn managed_image_dependencies_are_durable_before_either_runtime_start() {
+    use adx_core::managed_images::{ImageRetention, ManagedImage};
+    let mut rig = Rig::new().await;
+    let image = rig
+        .session
+        .begin_managed_image(
+            ManagedImage::new("tenant", "admission", ImageRetention::Retained, 1).unwrap(),
+        )
+        .await
+        .unwrap();
+    for central in [true, false] {
+        let id = if central {
+            "managed-image-central"
+        } else {
+            "managed-image-local"
+        };
+        let mut raw = spec(id);
+        raw.execution.extra_config = serde_json::json!({
+            "managedImagePublications": [image.id.clone()]
+        })
+        .to_string();
+        let mut request = create(id);
+        request.spec = Some(raw.into());
+        let created = if central {
+            rig.coordinator
+                .create_environment(request)
+                .await
+                .unwrap()
+                .into_inner()
+        } else {
+            rig.nodes[0]
+                .create_local_environment(pb::LocalEnvironmentCreateRequest {
+                    persist_claim: false,
+                    create: Some(request),
+                    node_session_id: "boot-a".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        let record = created.record.unwrap();
+        assert_eq!(record.state, pb::EnvironmentState::Running as i32);
+        // Backend::start independently checks Redis before returning a runtime result.
+        assert!(rig.session.get(id).await.is_ok());
+        rig.delete(&record).await;
+    }
+    assert_eq!(
+        rig.backends
+            .iter()
+            .map(|b| b.started.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        2
+    );
+}
+
 #[path = "create_identity.rs"]
 mod create_identity;
 

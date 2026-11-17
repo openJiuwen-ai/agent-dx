@@ -1,6 +1,8 @@
 mod common;
 #[path = "rpc/environment_control.rs"]
 mod environment_control;
+#[path = "rpc/managed_images.rs"]
+mod managed_images;
 #[path = "common/mounts.rs"]
 mod mounts;
 #[path = "rpc/node_retirement.rs"]
@@ -216,11 +218,14 @@ impl RuntimeDriver for Backend {
                 }
                 assert_eq!(resolved, *spec);
             }
-            Err(adx_core::Error::NotFound | adx_core::Error::Conflict) => assert!(!spec
-                .execution
-                .mounts
-                .iter()
-                .any(|mount| matches!(mount.source, adx_core::execution::MountSource::Volume(_)))),
+            Err(adx_core::Error::NotFound | adx_core::Error::Conflict) => {
+                assert!(!spec.execution.mounts.iter().any(|mount| matches!(
+                    mount.source,
+                    adx_core::execution::MountSource::Volume(_)
+                )));
+                assert!(adx_core::managed_images::explicit_dependencies(spec)?.is_empty(),
+                    "managed image execution crossed the runtime boundary without a durable dependency");
+            }
             Err(error) => return Err(error),
         }
         // Validate public HTTP input at the execution boundary, before deletion

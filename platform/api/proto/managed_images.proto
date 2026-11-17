@@ -1,0 +1,24 @@
+syntax = "proto3";
+package adx.control.v1;
+import "environment_types.proto";
+
+// Versioned domain JSON is validated as adx_core::managed_images::ImageMutation.
+// Caller identity is forwarded only by the authenticated API Server.
+service ManagedImageService {
+  rpc MutateManagedImage(ManagedImageMutationRequest) returns (ManagedImageResponse);
+  rpc GetManagedImages(ManagedImageQuery) returns (ManagedImageResponse);
+}
+message ManagedImageMutationRequest {
+  string tenant_id = 1;
+  string id = 2;
+  bytes mutation_json = 3;
+  CallerContext caller = 4;
+}
+message ManagedImageQuery {
+  string tenant_id = 1;
+  string id = 2;
+  string after = 3;
+  uint32 limit = 4;
+  CallerContext caller = 5;
+}
+message ManagedImageResponse { bytes view_json = 1; }

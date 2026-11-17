@@ -331,7 +331,7 @@ impl CoordinatorRpc {
         } else {
             let domains = self.volume_domains(&state).map_err(status)?;
             state
-                .prepare_volumes(&spec, &domains)
+                .prepare_dependencies(&spec, &domains)
                 .await
                 .map_err(status)?;
             if !state
@@ -395,7 +395,7 @@ impl CoordinatorRpc {
             .entry(spec.id.clone())
             .or_default()
             .insert(request_id);
-        if !persistent && !crate::storage::has_volumes(&spec) {
+        if !persistent && !state.persistent_dependencies(&spec).await.map_err(status)? {
             let deadline = deadline
                 .ok_or_else(|| Status::invalid_argument("local reservation deadline required"))?;
             let generation = state.session.next_generation().map_err(status)?;

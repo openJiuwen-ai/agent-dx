@@ -33,6 +33,67 @@ tags:
   - name: Snapshots
     description: Tenant-scoped reusable checkpoint catalog.
 paths:
+  /api/environment/v1/managed-images:
+    parameters:
+      - $ref: '#/components/parameters/ManagedImageTenant'
+    get:
+      tags: [Resources]
+      operationId: listManagedImages
+      summary: Page tenant-owned image publication receipts and references
+      parameters:
+        - {name: after, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 100}}
+      responses:
+        '200':
+          description: Envelope containing items and next_page_token
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Envelope'}
+    post:
+      tags: [Resources]
+      operationId: beginManagedImage
+      summary: Register a durable publication before any native image push
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ManagedImageMutation'}
+      responses:
+        '200':
+          description: Envelope containing image, eligible_for_reclamation, reclaimable, reclamation_enabled and inventory_epoch
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Envelope'}
+  /api/environment/v1/managed-images/{imageId}:
+    parameters:
+      - {name: imageId, in: path, required: true, schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
+      - $ref: '#/components/parameters/ManagedImageTenant'
+    get:
+      tags: [Resources]
+      operationId: getManagedImage
+      summary: Query an image publication and authoritative consumer references
+      responses:
+        '200':
+          description: Envelope containing the publication view
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Envelope'}
+    post:
+      tags: [Resources]
+      operationId: mutateManagedImage
+      summary: Manage publication, holds, retention or an operator deletion claim
+      description: claim_deletion and finish_deletion require an administrator and Coordinator managed_image_reclamation=true. Registry I/O and blob GC remain outside this API.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ManagedImageMutation'}
+      responses:
+        '200':
+          description: Envelope containing the updated publication view
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Envelope'}
   /api/admin/v1/keys:
     post:
       tags:
@@ -597,6 +658,11 @@ components:
       schema:
         type: string
   parameters:
+    ManagedImageTenant:
+      name: tenant
+      in: query
+      description: Optional target tenant; selecting a tenant requires an administrator.
+      schema: {type: string, minLength: 1}
     RequestId:
       name: X-Request-Id
       in: header
@@ -674,6 +740,148 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorEnvelope"
   schemas:
+    ManagedImageRetention:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [mode]
+          properties:
+            mode: {const: retained}
+        - type: object
+          additionalProperties: false
+          required: [mode, grace_seconds]
+          properties:
+            mode: {const: ephemeral}
+            grace_seconds: {type: integer, minimum: 0, maximum: 31536000}
+    ManagedImageMutation:
+      oneOf:
+      - type: object
+        additionalProperties: false
+        required:
+        - operation
+        - request_id
+        - retention
+        properties:
+          operation:
+            const: begin
+          request_id:
+            type: string
+            minLength: 1
+            maxLength: 256
+          retention: &id002
+            $ref: '#/components/schemas/ManagedImageRetention'
+      - type: object
+        additionalProperties: false
+        required:
+        - operation
+        - outputs
+        - execution_id
+        properties:
+          operation:
+            const: plan
+          outputs:
+            type: object
+            minProperties: 1
+            maxProperties: 128
+            additionalProperties:
+              type: string
+          execution_id:
+            type: string
+            minLength: 1
+            maxLength: 256
+      - type: object
+        additionalProperties: false
+        required:
+        - operation
+        - digests
+        properties:
+          operation:
+            const: publish
+          digests:
+            type: object
+            additionalProperties:
+              type: string
+              pattern: ^sha256:[0-9a-f]{64}$
+      - type: object
+        additionalProperties: false
+        required:
+        - operation
+        - lease_id
+        properties:
+          operation:
+            const: retain
+          lease_id: &id001
+            type: string
+            minLength: 1
+            maxLength: 256
+      - type: object
+        additionalProperties: false
+        required:
+        - operation
+        - lease_id
+        properties:
+          operation:
+            const: release
+          lease_id: *id001
+      - type: object
+        additionalProperties: false
+        required:
+        - operation
+        - retain_until
+        properties:
+          operation:
+            const: extend
+          retain_until:
+            type: integer
+            minimum: 0
+      - type: object
+        additionalProperties: false
+        required:
+        - operation
+        properties:
+          operation:
+            const: pin
+      - type: object
+        additionalProperties: false
+        required:
+        - operation
+        - retention
+        - expected_revision
+        properties:
+          operation:
+            const: set_retention
+          retention: *id002
+          expected_revision:
+            type: integer
+            minimum: 1
+      - type: object
+        additionalProperties: false
+        required:
+        - operation
+        properties:
+          operation:
+            const: observe
+      - type: object
+        additionalProperties: false
+        required:
+        - operation
+        - manifests
+        properties:
+          operation:
+            const: claim_deletion
+          manifests:
+            type: array
+            minItems: 1
+            maxItems: 4096
+            items:
+              type: string
+      - type: object
+        additionalProperties: false
+        required:
+        - operation
+        properties:
+          operation:
+            const: finish_deletion
     NodeResourceList:
       type: object
       additionalProperties: false
