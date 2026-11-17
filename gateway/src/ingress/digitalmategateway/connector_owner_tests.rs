@@ -92,6 +92,7 @@ fn setup() -> (
                 user_id: "alice".into(),
                 token_digest: "session-digest".into(),
                 expires_at: now().unwrap() + 3600,
+                registered_at_ms: None,
             },
         }),
         scope,
