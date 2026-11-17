@@ -30,12 +30,6 @@ def run(*args):
     )
 
 
-ca_config = out / 'ca.cnf'
-ca_config.write_text(
-    '[req]\ndistinguished_name=dn\n[dn]\n[ca]\n'
-    'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n'
-    'subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n'
-)
 run(
     'req',
     '-x509',
@@ -50,16 +44,11 @@ run(
     '2',
     '-subj',
     '/CN=ADX RPC test CA',
-    '-config',
-    ca_config,
-    '-extensions',
-    'ca',
 )
 (out / 'extensions.cnf').write_text(
     (
         'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncip'
-        'herment\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n'
-        'extendedKeyUsage=serverAuth,clientAuth\nsubjectAltNam'
+        'herment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltNam'
         'e=DNS:localhost,DNS:coordinator,DNS:node2,IP:127.0.0.1\n'
     )
 )
@@ -96,4 +85,4 @@ for name in ['coordinator', 'node', 'apiserver', 'ingress', 'unknown']:
     run('x509', '-in', out / f'{name}.pem', '-outform', 'DER', '-out', out / f'{name}.der')
     (out / f'{name}.key').chmod(0o600)
 (out / 'ca.key').chmod(0o600)
-sys.stdout.write('Generated isolated RPC test certificates\n')
+print('Generated isolated RPC test certificates')

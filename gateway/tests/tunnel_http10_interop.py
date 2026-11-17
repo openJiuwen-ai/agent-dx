@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import select
+import shutil
 import socket
 import socketserver
 import ssl
@@ -23,6 +24,44 @@ from websockets.sync.server import serve
 from adx_environment.tunnel_client import TunnelClient
 
 LOG = logging.getLogger(__name__)
+
+
+def generate_tls(directory):
+    """Generate short-lived CA and server certificates for this local run."""
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        raise FileNotFoundError("openssl is required to generate fixture certificates")
+    openssl = str(Path(openssl).resolve())
+    directory.mkdir()
+    ca_config = directory / "ca.cnf"
+    ca_config.write_text(
+        "[req]\ndistinguished_name=dn\n[dn]\n[ca]\n"
+        "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n"
+        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n"
+    )
+    extensions = directory / "server.cnf"
+    extensions.write_text(
+        "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\n"
+        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n"
+        "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n"
+    )
+    commands = [
+        ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+         "-subj", "/CN=ADX tunnel test CA", "-config", ca_config, "-extensions", "ca",
+         "-keyout", directory / "ca.key", "-out", directory / "ca.pem"],
+        ["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost",
+         "-keyout", directory / "ingress.key", "-out", directory / "ingress.csr"],
+        ["x509", "-req", "-in", directory / "ingress.csr", "-CA", directory / "ca.pem",
+         "-CAkey", directory / "ca.key", "-CAcreateserial", "-days", "2",
+         "-extfile", extensions, "-out", directory / "ingress.pem"],
+    ]
+    for command in commands:
+        subprocess.run(
+            [openssl, *map(str, command)], check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    for name in ["ca.key", "ingress.key"]:
+        (directory / name).chmod(0o600)
 
 
 def reserve_port():
@@ -183,10 +222,13 @@ def check_reused_connection(address):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tls", type=Path, required=True)
+    parser.add_argument("--tls", type=Path, help="existing fixture CA and server certificate directory")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
+    if args.tls is None:
+        args.tls = args.output / "tls"
+        generate_tls(args.tls)
     execd = Path(os.environ["EXECD_RUNTIME"]).resolve(strict=True)
     ingress = Path(os.environ["INGRESS_RUNTIME"]).resolve(strict=True)
     ws_port, http_port, ingress_port = reserve_port(), reserve_port(), reserve_port()

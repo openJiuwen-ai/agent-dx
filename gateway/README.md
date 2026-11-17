@@ -250,13 +250,25 @@ upgrade can be retried on the same connection when the response permits reuse.
 Pre-read buffering uses Hyper's default HTTP/1 read-buffer bound; unrecognized
 framing passes to Hyper for validation without normalization.
 
-The `interop` suite (`python3 build/ci/run.py interop --jobs 2`) includes real
-TLS Ingress, Execd tunnel-only listeners, and the Python SDK `TunnelClient`.
-It sends HTTP/1.0 handshakes on the wire for both the tunnel control connection
-and application WebSockets, verifies connection reuse after tunneled HTTP, and
-checks `tunnel hello`, text, binary data, and ping/pong. The loopback Ingress
-fixture is `gateway/examples/tunnel_http10.rs`; per-run handshake evidence is
-written to `tunnel-http10/result.json` inside the suite output directory.
+The standalone acceptance script uses a loopback TLS Ingress fixture, Execd
+tunnel-only listeners, and the Python SDK `TunnelClient`. It sends HTTP/1.0
+handshakes on the wire for control and application WebSockets, verifies
+connection reuse after tunneled HTTP, and checks `tunnel hello`, text, binary
+data, and ping/pong. With the Environment SDK dependencies and OpenSSL installed:
+
+```bash
+export CARGO_TARGET_DIR="$PWD/out/tunnel-http10-target"
+cargo build --locked -p adx-execd --bin adx-execd -j 2
+cargo build --locked -p data-plane-gateway --example tunnel_http10 -j 2
+EXECD_RUNTIME="$CARGO_TARGET_DIR/debug/adx-execd" \
+INGRESS_RUNTIME="$CARGO_TARGET_DIR/debug/examples/tunnel_http10" \
+PYTHONPATH=platform/sdk/environment/python \
+python3 gateway/tests/tunnel_http10_interop.py --output out/tunnel-http10
+```
+
+The script generates short-lived fixture certificates and writes handshake
+evidence to `result.json` inside the output directory. `--tls` accepts an
+existing directory containing `ca.pem`, `ingress.pem`, and `ingress.key`.
 
 For Grafana with the stripping route above, configure its external URL, for
 example `GF_SERVER_ROOT_URL=https://example.com/grafana/`, and its internal server

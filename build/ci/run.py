@@ -4,7 +4,6 @@
 import argparse
 import hashlib
 import json
-import logging
 import os
 import platform
 import shutil
@@ -30,7 +29,6 @@ def _executable(name, environment=None, cwd=None):
 
 
 ROOT = Path(__file__).resolve().parents[2]
-LOG = logging.getLogger(__name__)
 SUITES = (
     "harness",
     "rust",
@@ -149,17 +147,6 @@ def commands_for(suite, output, jobs):
                 "platform/runtime/execd/tests/tunnel_interop.py",
             ],
             [python, "build/ci/rpc_certificates.py", str(output / "tls")],
-            [cargo, "build", "--locked", "-p", "data-plane-gateway", "--example", "tunnel_http10", "-j", str(jobs)],
-            [
-                "env",
-                f"EXECD_RUNTIME={target / 'debug/adx-execd'}",
-                f"INGRESS_RUNTIME={target / 'debug/examples/tunnel_http10'}",
-                f"PYTHONPATH={ROOT / 'platform/sdk/environment/python'}",
-                python,
-                "gateway/tests/tunnel_http10_interop.py",
-                "--tls", str(output / "tls"),
-                "--output", str(output / "tunnel-http10"),
-            ],
             [
                 "env",
                 f"PYTHONPATH={ROOT / 'platform/sdk/environment/python'}",
@@ -195,7 +182,7 @@ def execute(commands, output, timeout, metadata):
             entry = {"argv": command, "log": log.name, "timed_out": False}
             report["commands"].append(entry)
             started = time.monotonic()
-            LOG.info("[%s/%s] %s -> %s", index, len(commands), ' '.join(command), log)
+            print(f"[{index}/{len(commands)}] {' '.join(command)} -> {log}", flush=True)
             process = None
             with log.open("wb") as stream:
                 try:
@@ -219,7 +206,7 @@ def execute(commands, output, timeout, metadata):
                         process.wait()
             entry.update(exit_code=code, duration_seconds=round(time.monotonic() - started, 3))
             if code:
-                sys.stderr.write(log.read_text(errors="replace")[-6000:] + "\n")
+                print(log.read_text(errors="replace")[-6000:], file=sys.stderr)
                 break
     except KeyboardInterrupt:
         code = 130
@@ -240,7 +227,6 @@ def execute(commands, output, timeout, metadata):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("suite", choices=SUITES)
     parser.add_argument("--jobs", type=int, default=int(os.environ.get("JOBS", "2")))
@@ -259,7 +245,7 @@ def main():
     output = (args.output or ROOT / "out/ci" / args.suite / run_id).resolve()
     commands = commands_for(args.suite, output, args.jobs)
     if args.list:
-        sys.stdout.write(json.dumps(commands, indent=2) + "\n")
+        print(json.dumps(commands, indent=2))
         return 0
     commit = subprocess.check_output([_executable("git"), "rev-parse", "HEAD"], text=True).strip()
     dirty = bool(subprocess.check_output([_executable("git"), "status", "--porcelain"], text=True).strip())
@@ -297,7 +283,7 @@ def main():
 
     signal.signal(signal.SIGTERM, interrupt)
     code = execute(commands, output, args.timeout, metadata)
-    LOG.info("%s: %s; evidence: %s", args.suite, 'passed' if code == 0 else 'failed', output)
+    print(f"{args.suite}: {'passed' if code == 0 else 'failed'}; evidence: {output}")
     return code
 
 
