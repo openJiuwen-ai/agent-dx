@@ -10,6 +10,53 @@ use std::time::Duration;
 /// flake of this bound, not as an accidental pass.
 const QUIET: Duration = Duration::from_millis(120);
 
+#[tokio::test]
+async fn disabled_pressure_resources_omit_gauges_reports_and_signals() {
+    use adxlet::resources::PressureResources;
+    for memory_enabled in [true, false] {
+        let resources = PressureResources {
+            memory_enabled,
+            disk_enabled: !memory_enabled,
+        };
+        let manager = node();
+        manager.mark_pressure_configured(resources);
+        let enabled_name = if memory_enabled { "memory" } else { "disk" };
+        let disabled_name = if memory_enabled { "disk" } else { "memory" };
+        let assert_metrics = |text: String| {
+            for metric in ["level", "percent", "last_transition_unix_seconds"] {
+                assert!(text.contains(&format!(
+                    "adx_node_pressure_{metric}{{resource=\"{enabled_name}\"}}"
+                )));
+                assert!(!text.contains(&format!(
+                    "adx_node_pressure_{metric}{{resource=\"{disabled_name}\"}}"
+                )));
+            }
+        };
+        assert_metrics(manager.metrics());
+        let mut gate = PressureGate::with_resources(PressurePolicy::default(), resources).unwrap();
+        let update = gate.update(Pressure {
+            memory_percent: if memory_enabled { 10 } else { 100 },
+            disk_percent: if memory_enabled { 100 } else { 10 },
+        });
+        let mut signal = manager.pressure_signal();
+        manager.set_pressure_state(&update);
+        assert_metrics(manager.metrics());
+        let report = adxlet::resources::report_from(&manager.pressure_state()).unwrap();
+        assert_eq!(report.memory.is_some(), memory_enabled);
+        assert_eq!(report.disk.is_some(), !memory_enabled);
+        assert!(tokio::time::timeout(QUIET, signal.changed()).await.is_err());
+    }
+    let manager = node();
+    manager.mark_pressure_configured(PressureResources {
+        memory_enabled: false,
+        disk_enabled: false,
+    });
+    assert!(!manager.metrics().contains("adx_node_pressure_level"));
+    assert!(!manager
+        .metrics()
+        .contains("adx_node_pressure_observed_at_unix_seconds"));
+}
+
 struct NullBackend;
 
 #[async_trait]
@@ -145,7 +192,7 @@ async fn board_reads_always_return_the_latest_published_value() {
     let state = manager.pressure_state();
     assert_eq!(state.consecutive_failures, 1);
     assert_eq!(state.memory.level, PressureLevel::High);
-    assert!(!manager.accepting_allocations());
+    assert!(manager.accepting_allocations());
 }
 
 /// The signal rings only for rounds that end at a high level: a normal
@@ -252,7 +299,7 @@ async fn pressure_gauges_exist_exactly_when_sampling_is_configured() {
         !unconfigured.contains("adx_node_pressure_observed_at_unix_seconds"),
         "{unconfigured}"
     );
-    manager.mark_pressure_configured();
+    manager.mark_pressure_configured(Default::default());
     let configured = manager.metrics();
     for series in [
         "adx_node_pressure_level{resource=\"memory\"}",
@@ -277,7 +324,7 @@ async fn pressure_gauges_report_the_board_values() {
     manager
         .update_capacity(Resources::default(), Duration::from_secs(300))
         .expect("capacity update succeeds");
-    manager.mark_pressure_configured();
+    manager.mark_pressure_configured(Default::default());
     let mut gate = gate();
     let pressured = gate.update(Pressure {
         memory_percent: 95,

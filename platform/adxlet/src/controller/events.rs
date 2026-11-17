@@ -466,8 +466,7 @@ impl Controller {
             .clone();
         // C1: some resource sits at High. C2: failed rounds keep the board
         // untrusted for relief. C3: never observed, or too stale to act on.
-        let high = board.memory.level == crate::resources::PressureLevel::High
-            || board.disk.level == crate::resources::PressureLevel::High;
+        let high = board.has_high_pressure();
         if !high || board.consecutive_failures != 0 || board.observed_at_unix_seconds == 0 {
             return Ok(());
         }

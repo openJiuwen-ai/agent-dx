@@ -46,6 +46,37 @@ physical devices and a future expiry; `0` above is an expired placeholder. A
 missing/invalid update uses the last observation until expiry, then closes new
 admission. The file reader is separate from the implemented sandboxd collector and automatic capacity source. Do not publish a configured resource budget as a measurement.
 
+The optional Adxlet `pressure` configuration has independent `memory_enabled`
+and `disk_enabled` switches, both defaulting to `true`. Only enabled resources
+are sampled and their thresholds validated. Disk sampling observes the filesystem
+at `disk_path`; this path is required only when `disk_enabled` is `true`.
+The default high/low thresholds are 90%/80% for both resources: any enabled
+resource reaching its high threshold closes pressure admission, and all enabled
+resources falling to or below their low thresholds reopens it. A failed sample or sampling
+task emits a warning and opens the pressure gate, resetting its hysteresis.
+Failed rounds retain the last successful pressure snapshot and increment the
+consecutive failure count. The next successful round starts fresh hysteresis
+for each resource.
+After sampling resumes, a new high-threshold observation is required to close
+it again. Resource reservations, maintenance and the other node admission
+checks continue to apply independently. See [node pressure](../../../docs/testing/node-lifecycle.md)
+for the resource and admission contract.
+
+For memory-only pressure, set the Adxlet service's `config.pressure` to:
+
+```yaml
+memory_enabled: true
+disk_enabled: false
+thresholds:
+  memory_high_percent: 90
+  memory_low_percent: 80
+```
+
+Disabled resources do not participate in pressure isolation, recovery or
+automatic Pause. Their pressure metrics and heartbeat resource fields are
+omitted. Setting both switches to `false` disables pressure sampling and its
+gauge family. Capacity and device observation use `resource_source` separately.
+
 Node startup obtains the complete authoritative catalog before reconciling
 managed runtimes. It restores committed running Environments and cleans runtimes
 confirmed unowned or left by uncommitted starts. An unavailable Coordinator never

@@ -376,6 +376,28 @@ pub struct Pressure {
     pub memory_percent: u8,
     pub disk_percent: u8,
 }
+
+/// Resources selected for pressure sampling and admission decisions.
+#[derive(Clone, Copy, Debug)]
+pub struct PressureResources {
+    pub memory_enabled: bool,
+    pub disk_enabled: bool,
+}
+
+impl Default for PressureResources {
+    fn default() -> Self {
+        Self {
+            memory_enabled: true,
+            disk_enabled: true,
+        }
+    }
+}
+
+impl PressureResources {
+    pub fn any_enabled(self) -> bool {
+        self.memory_enabled || self.disk_enabled
+    }
+}
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PressurePolicy {
@@ -406,8 +428,11 @@ pub enum PressureLevel {
 /// Per-resource pressure observation. The hysteresis level is the
 /// authoritative state; the percent value is the last successful
 /// observation that produced it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ResourcePressure {
+    /// Whether this resource participates in sampling and pressure decisions.
+    pub enabled: bool,
     pub level: PressureLevel,
     /// Last successful observation, 0-100.
     pub percent: u8,
@@ -415,14 +440,24 @@ pub struct ResourcePressure {
     pub last_transition_unix_seconds: u64,
 }
 
+impl Default for ResourcePressure {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: PressureLevel::Normal,
+            percent: 0,
+            last_transition_unix_seconds: 0,
+        }
+    }
+}
+
 /// Node-level structured pressure snapshot published on every observation
 /// round.
 ///
 /// `observed_at_unix_seconds == 0` marks a node with no successful sample
-/// yet (unconfigured or never sampled). Levels and the timestamp freeze
-/// during failed samples while `consecutive_failures` grows: admission
-/// stays fail-closed on a broken probe, and consumers deciding whether to
-/// relieve load can refuse to act on stale evidence instead.
+/// yet (unconfigured or never sampled). Failed samples preserve the last
+/// successful levels and timestamp while `consecutive_failures` grows.
+/// Pressure admission reopens; relief consumers can reject stale evidence.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodePressureState {
     pub memory: ResourcePressure,
@@ -433,9 +468,16 @@ pub struct NodePressureState {
     pub consecutive_failures: u32,
 }
 
-/// One observation round's combined output. `accepting` keeps the exact
-/// historical admission semantics (true = the node accepts new work);
-/// `state` is the structured snapshot for observers.
+impl NodePressureState {
+    pub fn has_high_pressure(&self) -> bool {
+        [&self.memory, &self.disk]
+            .into_iter()
+            .any(|resource| resource.enabled && resource.level == PressureLevel::High)
+    }
+}
+
+/// One observation round's combined output. `accepting` controls pressure
+/// admission for new work; `state` is the structured snapshot for observers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PressureUpdate {
     pub accepting: bool,
@@ -458,8 +500,8 @@ impl From<&NodePressureState> for adx_protocol::control::NodePressureReport {
             }
         }
         Self {
-            memory: Some(resource(&state.memory)),
-            disk: Some(resource(&state.disk)),
+            memory: state.memory.enabled.then(|| resource(&state.memory)),
+            disk: state.disk.enabled.then(|| resource(&state.disk)),
             observed_at_unix_seconds: state.observed_at_unix_seconds,
             consecutive_failures: state.consecutive_failures,
         }
@@ -470,42 +512,59 @@ impl From<&NodePressureState> for adx_protocol::control::NodePressureReport {
 /// has no successful sample: an absent field means "no trustworthy
 /// observation", never "observed at the epoch".
 pub fn report_from(state: &NodePressureState) -> Option<adx_protocol::control::NodePressureReport> {
-    (state.observed_at_unix_seconds != 0).then(|| state.into())
+    (state.observed_at_unix_seconds != 0 && (state.memory.enabled || state.disk.enabled))
+        .then(|| state.into())
 }
 
 pub struct PressureGate {
     policy: PressurePolicy,
-    /// Admission bit, driven by the historical two-resource formula.
+    /// Admission bit, driven by valid samples and reopened on sampling failure.
     accepting: bool,
     /// Structured per-resource observation.
     state: NodePressureState,
 }
 impl PressureGate {
     pub fn new(policy: PressurePolicy) -> Result<Self> {
-        if policy.memory_low_percent >= policy.memory_high_percent
-            || policy.disk_low_percent >= policy.disk_high_percent
-            || policy.memory_high_percent > 100
-            || policy.disk_high_percent > 100
+        Self::with_resources(policy, PressureResources::default())
+    }
+
+    pub fn with_resources(policy: PressurePolicy, resources: PressureResources) -> Result<Self> {
+        if (resources.memory_enabled
+            && (policy.memory_low_percent >= policy.memory_high_percent
+                || policy.memory_high_percent > 100))
+            || (resources.disk_enabled
+                && (policy.disk_low_percent >= policy.disk_high_percent
+                    || policy.disk_high_percent > 100))
         {
             return Err(invalid("pressure thresholds require low < high <= 100"));
         }
         Ok(Self {
             policy,
             accepting: true,
-            state: NodePressureState::default(),
+            state: NodePressureState {
+                memory: ResourcePressure {
+                    enabled: resources.memory_enabled,
+                    ..Default::default()
+                },
+                disk: ResourcePressure {
+                    enabled: resources.disk_enabled,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         })
     }
-    /// Successful sample: advances the admission bit and the structured
-    /// snapshot together. The admission formula is unchanged: pressure
-    /// opens only when both resources fall back to or below their low
-    /// thresholds and closes as soon as either crosses its high threshold.
+    /// Advance admission and the structured snapshot from a successful sample.
+    /// The first valid sample after a failure starts fresh resource hysteresis.
     pub fn update(&mut self, pressure: Pressure) -> PressureUpdate {
-        if pressure.memory_percent >= self.policy.memory_high_percent
-            || pressure.disk_percent >= self.policy.disk_high_percent
+        let reset_hysteresis = self.state.consecutive_failures != 0;
+        if (self.state.memory.enabled && pressure.memory_percent >= self.policy.memory_high_percent)
+            || (self.state.disk.enabled && pressure.disk_percent >= self.policy.disk_high_percent)
         {
             self.accepting = false;
-        } else if pressure.memory_percent <= self.policy.memory_low_percent
-            && pressure.disk_percent <= self.policy.disk_low_percent
+        } else if (!self.state.memory.enabled
+            || pressure.memory_percent <= self.policy.memory_low_percent)
+            && (!self.state.disk.enabled || pressure.disk_percent <= self.policy.disk_low_percent)
         {
             self.accepting = true;
         }
@@ -513,20 +572,26 @@ impl PressureGate {
         // observation time cannot be trusted does not count as fresh
         // evidence either way.
         let stamp = crate::checkpoint::now().unwrap_or(self.state.observed_at_unix_seconds);
-        self.state.memory = advance(
-            self.state.memory.clone(),
-            pressure.memory_percent,
-            self.policy.memory_high_percent,
-            self.policy.memory_low_percent,
-            stamp,
-        );
-        self.state.disk = advance(
-            self.state.disk.clone(),
-            pressure.disk_percent,
-            self.policy.disk_high_percent,
-            self.policy.disk_low_percent,
-            stamp,
-        );
+        if self.state.memory.enabled {
+            self.state.memory = advance(
+                self.state.memory.clone(),
+                pressure.memory_percent,
+                self.policy.memory_high_percent,
+                self.policy.memory_low_percent,
+                stamp,
+                reset_hysteresis,
+            );
+        }
+        if self.state.disk.enabled {
+            self.state.disk = advance(
+                self.state.disk.clone(),
+                pressure.disk_percent,
+                self.policy.disk_high_percent,
+                self.policy.disk_low_percent,
+                stamp,
+                reset_hysteresis,
+            );
+        }
         self.state.observed_at_unix_seconds = stamp;
         self.state.consecutive_failures = 0;
         PressureUpdate {
@@ -534,14 +599,13 @@ impl PressureGate {
             state: self.state.clone(),
         }
     }
-    /// Failed sample: freezes the levels and the observation stamp, bumps
-    /// the failure counter, and reports closed admission for this round.
-    /// The hysteresis phase survives, so the next successful sample resumes
-    /// from the previous level.
+    /// Reopen admission while preserving the last successful observation and
+    /// counting failures. The next valid sample starts fresh hysteresis.
     pub fn fail(&mut self) -> PressureUpdate {
+        self.accepting = true;
         self.state.consecutive_failures = self.state.consecutive_failures.saturating_add(1);
         PressureUpdate {
-            accepting: false,
+            accepting: self.accepting,
             state: self.state.clone(),
         }
     }
@@ -549,22 +613,24 @@ impl PressureGate {
 
 /// Per-resource hysteresis: crossing the high threshold raises the level,
 /// falling to or below the low threshold lowers it, and the band in between
-/// keeps the previous level.
+/// keeps the previous level. After a failure, a new high sample is required.
 fn advance(
     current: ResourcePressure,
     percent: u8,
     high: u8,
     low: u8,
     stamp: u64,
+    reset_hysteresis: bool,
 ) -> ResourcePressure {
     let level = if percent >= high {
         PressureLevel::High
-    } else if percent <= low {
+    } else if percent <= low || reset_hysteresis {
         PressureLevel::Normal
     } else {
         current.level
     };
     ResourcePressure {
+        enabled: current.enabled,
         last_transition_unix_seconds: if level == current.level {
             current.last_transition_unix_seconds
         } else {
@@ -574,14 +640,15 @@ fn advance(
         percent,
     }
 }
-pub fn pressure(disk_path: &Path) -> Result<Pressure> {
-    let percent = |used: u64, total: u64| -> u8 {
-        if total == 0 {
-            100
-        } else {
-            ((u128::from(used) * 100 / u128::from(total)).min(100)) as u8
-        }
-    };
+fn percent(used: u64, total: u64) -> u8 {
+    if total == 0 {
+        100
+    } else {
+        ((u128::from(used) * 100 / u128::from(total)).min(100)) as u8
+    }
+}
+
+fn memory_pressure() -> Result<u8> {
     let total = memory_info("MemTotal:")?;
     let mut memory_percent = percent(total.saturating_sub(memory_info("MemAvailable:")?), total);
     for (path, v2) in cgroups()? {
@@ -598,9 +665,27 @@ pub fn pressure(disk_path: &Path) -> Result<Pressure> {
             ));
         }
     }
-    let (total, available) = disk(disk_path)?;
+    Ok(memory_percent)
+}
+
+/// Sample enabled resources. Disk sampling requires a path when enabled.
+/// Returns an error if an enabled resource cannot be observed.
+pub fn pressure(resources: PressureResources, disk_path: Option<&Path>) -> Result<Pressure> {
+    let memory_percent = if resources.memory_enabled {
+        memory_pressure()?
+    } else {
+        0
+    };
+    let disk_percent = if resources.disk_enabled {
+        let path = disk_path
+            .ok_or_else(|| invalid("pressure disk_path is required when disk_enabled is true"))?;
+        let (total, available) = disk(path)?;
+        percent(total.saturating_sub(available), total)
+    } else {
+        0
+    };
     Ok(Pressure {
         memory_percent,
-        disk_percent: percent(total.saturating_sub(available), total),
+        disk_percent,
     })
 }
