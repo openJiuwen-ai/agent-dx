@@ -149,6 +149,66 @@ def test_list_does_not_reclassify_unknown_http_errors():
         Filesystem(client, "env").list("/requested")
 
 
+@pytest.mark.parametrize("path", [None, "", 7, True, "/tmp/bad\0path"])
+def test_mkdir_and_list_reject_invalid_paths_before_network(path):
+    client = MagicMock()
+    filesystem = Filesystem(client, "env")
+    for operation in (filesystem.make_dir, filesystem.list):
+        with pytest.raises(ValueError, match="path"):
+            operation(path)
+    client.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("depth", [0, -1, 65, 100, "1", "abc", True, 1.0, None])
+def test_list_rejects_invalid_depth_before_network(depth):
+    client = MagicMock()
+    with pytest.raises(ValueError, match="depth"):
+        Filesystem(client, "env").list("/work", depth=depth)
+    client.invoke.assert_not_called()
+
+
+def test_mkdir_default_keeps_legacy_request_and_nonrecursive_is_forwarded():
+    client = MagicMock()
+    client.invoke.side_effect = [
+        {"created": True, "error": None},
+        {"created": False, "error": None},
+    ]
+    filesystem = Filesystem(client, "env")
+    assert filesystem.make_dir("/work/a/b") is True
+    assert filesystem.make_dir("/work/a/b", recursive=False) is False
+    assert client.invoke.call_args_list[0].args == (
+        "env",
+        "file.make_dir",
+        {"path": "/work/a/b"},
+    )
+    assert client.invoke.call_args_list[1].args == (
+        "env",
+        "file.make_dir",
+        {"path": "/work/a/b", "recursive": False},
+    )
+    assert client.invoke.call_count == 2
+
+
+@pytest.mark.parametrize("recursive", [None, "false", "aaa", 0])
+def test_mkdir_rejects_invalid_recursive_before_network(recursive):
+    client = MagicMock()
+    with pytest.raises(ValueError, match="recursive"):
+        Filesystem(client, "env").make_dir("/work/a/b", recursive=recursive)
+    client.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [400, 403, 500])
+def test_nonrecursive_mkdir_propagates_runtime_errors_without_retry(status):
+    client = MagicMock()
+    error = EnvironmentHTTPError(status, {"error": "runtime failure"}, "runtime failure")
+    client.invoke.side_effect = error
+    with pytest.raises(EnvironmentHTTPError):
+        Filesystem(client, "env").make_dir("/work/a/b", recursive=False)
+    client.invoke.assert_called_once_with(
+        "env", "file.make_dir", {"path": "/work/a/b", "recursive": False}
+    )
+
+
 def test_native_search_uses_one_remote_search_and_maps_entries():
     client = MagicMock()
     client.invoke.return_value = {
@@ -164,7 +224,9 @@ def test_native_search_uses_one_remote_search_and_maps_entries():
         ],
         "error": None,
     }
-    items = Filesystem(client, "env").search("/tree", "*.py", exclude_patterns=["test_*"], depth=3)
+    items = Filesystem(client, "env").search(
+        "/tree", "*.py", exclude_patterns=["test_*"], depth=3
+    )
     assert len(items) == 1 and items[0].path == "/tree/a.py"
     client.invoke.assert_called_once_with(
         "env",

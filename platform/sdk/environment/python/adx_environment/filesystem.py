@@ -70,6 +70,11 @@ def _check(result: dict, msg: str) -> dict:
     return result
 
 
+def _validate_file_path(path: str) -> None:
+    if not isinstance(path, str) or not path or "\0" in path:
+        raise ValueError("path must be a nonempty string without NUL")
+
+
 class Filesystem:
     """Client-side wrapper for filesystem operations on the remote environment."""
 
@@ -182,6 +187,13 @@ class Filesystem:
         return self._entry_from_upload(_check(result, f"Failed to write {path}"))
 
     def list(self, path: str, depth: int = 1) -> List[EntryInfo]:
+        _validate_file_path(path)
+        if (
+            isinstance(depth, bool)
+            or not isinstance(depth, int)
+            or not 1 <= depth <= 64
+        ):
+            raise ValueError("depth must be an integer in 1..=64")
         try:
             result = _check(
                 self._invoke("file.list", path=path, depth=depth),
@@ -267,8 +279,21 @@ class Filesystem:
         )
         return self._entry(result)
 
-    def make_dir(self, path: str) -> bool:
-        result = _check(self._invoke("file.make_dir", path=path), f"Failed to make dir {path}")
+    def make_dir(self, path: str, *, recursive: bool = True) -> bool:
+        """Create a directory, retaining recursive creation by default.
+
+        Explicit ``recursive=False`` is forwarded to the Runtime, which must
+        support non-recursive creation. Returns False for an existing directory.
+        """
+        _validate_file_path(path)
+        if not isinstance(recursive, bool):
+            raise ValueError("recursive must be a boolean")
+        if recursive:
+            # Preserve the original request for existing SDK/server combinations.
+            result = self._invoke("file.make_dir", path=path)
+        else:
+            result = self._invoke("file.make_dir", path=path, recursive=False)
+        result = _check(result, f"Failed to make dir {path}")
         return result["created"]
 
     def get_info(self, path: str) -> EntryInfo:
