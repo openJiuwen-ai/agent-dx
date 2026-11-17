@@ -713,6 +713,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                                 .try_into()
                                 .map_err(status)?,
                             timeout_seconds: r.timeout_seconds,
+                            storage: None,
                         })
                         .await
                         .map_err(status)?,

@@ -68,6 +68,11 @@ paths:
         expires; the command keeps running. `process.kill` returns HTTP 200 with
         `killed: false` when the command is absent or already exited. Other
         operation errors retain their normal error status.
+        `file.mkdir` / `file.make_dir` create missing parents by default;
+        `recursive: false` creates only the final directory.
+        mkdir/list require a nonempty string path without NUL. Explicit list
+        depth must be an integer from 1 through 64; omitted depth defaults to 1.
+        Invalid arguments return HTTP 400 with `error_code: INVALID_ARGUMENT`.
         Command results include optional exit_signal (the actual POSIX signal).
         SIGKILL or shell exit_code 137 alone does not prove OOM. EXECD does not
         collect OOM counters. A backend-wide OOM withdraws its data route;
@@ -593,6 +598,20 @@ components:
       required:
       - path
       additionalProperties: false
+    FileMkdirArgs:
+      type: object
+      properties:
+        path:
+          type: string
+          minLength: 1
+          description: Directory path inside the runtime filesystem; NUL is rejected.
+        recursive:
+          type: boolean
+          default: true
+          description: Create missing parents. False requires the parent to exist; strings and null are rejected.
+      required:
+      - path
+      additionalProperties: false
     FileReadArgs:
       type: object
       properties:
@@ -672,12 +691,13 @@ components:
         path:
           type: string
           minLength: 1
-          description: Path inside the runtime filesystem.
+          description: Path inside the runtime filesystem; NUL is rejected.
         depth:
           type: integer
           minimum: 1
           maximum: 64
           default: 1
+          description: Listing levels including the root listing. Explicit invalid values are rejected, not clamped.
       required:
       - path
       additionalProperties: false
@@ -1768,7 +1788,7 @@ components:
           - file.mkdir
           - file.make_dir
         args:
-          $ref: '#/components/schemas/FilePathArgs'
+          $ref: '#/components/schemas/FileMkdirArgs'
           default: {}
         requestId:
           type: string

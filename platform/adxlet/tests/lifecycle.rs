@@ -1007,11 +1007,17 @@ async fn expired_capacity_remains_usable_and_maintenance_blocks_new_admission() 
         .metrics()
         .contains("adx_node_accepting_allocations 0\n"));
     node.set_maintenance(false);
-    node.set_pressure(true);
+    node.set_pressure_state(&adxlet::resources::PressureUpdate {
+        accepting: false,
+        state: adxlet::resources::NodePressureState::default(),
+    });
     assert!(node
         .metrics()
         .contains("adx_node_accepting_allocations 0\n"));
-    node.set_pressure(false);
+    node.set_pressure_state(&adxlet::resources::PressureUpdate {
+        accepting: true,
+        state: adxlet::resources::NodePressureState::default(),
+    });
     node.update_runtime_classes(vec![]).unwrap();
     assert!(node
         .metrics()
@@ -1025,7 +1031,7 @@ async fn pressure_sampling_failure_restores_admission_with_capacity_and_maintena
     let deps = Dependencies::new(false);
     let node = node(&deps);
     let mut gate = PressureGate::new(PressurePolicy::default()).unwrap();
-    node.set_pressure(!gate.update(Pressure {
+    node.set_pressure_state(&gate.update(Pressure {
         memory_percent: 95,
         disk_percent: 10,
     }));
@@ -1038,7 +1044,7 @@ async fn pressure_sampling_failure_restores_admission_with_capacity_and_maintena
     assert_eq!(environment.create().await.unwrap_err(), Error::NoCapacity);
     assert!(deps.events.lock().unwrap().is_empty());
 
-    node.set_pressure(!gate.sampling_failed());
+    node.set_pressure_state(&gate.fail());
     assert!(node.accepting_allocations());
     environment.create().await.unwrap();
     assert_eq!(node.used(), resources());
@@ -1050,7 +1056,7 @@ async fn pressure_sampling_failure_restores_admission_with_capacity_and_maintena
     );
 
     node.set_maintenance(true);
-    node.set_pressure(!gate.sampling_failed());
+    node.set_pressure_state(&gate.fail());
     assert!(!node.accepting_allocations());
     environment.delete().await.unwrap();
     assert_eq!(node.used(), Resources::default());

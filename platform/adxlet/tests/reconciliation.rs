@@ -1686,14 +1686,14 @@ async fn pressure_sampling_failure_is_published_to_coordinator() {
     let mut fixture = authority::Fixture::new().await;
     fixture.cycle(&node).await.unwrap();
     let mut gate = PressureGate::new(PressurePolicy::default()).unwrap();
-    node.set_pressure(!gate.update(Pressure {
+    node.set_pressure_state(&gate.update(Pressure {
         memory_percent: 95,
         disk_percent: 10,
     }));
     fixture.cycle(&node).await.unwrap();
     assert!(!fixture.registration.accepting_allocations);
 
-    node.set_pressure(!gate.sampling_failed());
+    node.set_pressure_state(&gate.fail());
     fixture.cycle(&node).await.unwrap();
     assert!(fixture.registration.accepting_allocations);
     assert!(
@@ -1725,7 +1725,10 @@ async fn periodic_catalog_retry_reports_current_admission_without_closing_on_tra
         let mut stale = record("kept", EnvironmentState::Pending);
         stale.runtime.ip = None;
         *fixture.authority.records.lock().unwrap() = vec![stale.try_into().unwrap()];
-        node.set_pressure(true);
+        node.set_pressure_state(&adxlet::resources::PressureUpdate {
+            accepting: false,
+            state: adxlet::resources::NodePressureState::default(),
+        });
         let control = fixture.authority.clone();
         control.block_inspect.store(true, Ordering::SeqCst);
         let cycle = tokio::spawn({
@@ -1736,7 +1739,10 @@ async fn periodic_catalog_retry_reports_current_admission_without_closing_on_tra
             }
         });
         control.inspect_entered.notified().await;
-        node.set_pressure(false);
+        node.set_pressure_state(&adxlet::resources::PressureUpdate {
+            accepting: true,
+            state: adxlet::resources::NodePressureState::default(),
+        });
         if mode == "unavailable" {
             control.reject_ready.store(true, Ordering::SeqCst);
         }

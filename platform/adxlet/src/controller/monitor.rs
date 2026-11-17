@@ -11,17 +11,20 @@ impl Controller {
     }
 
     async fn tick_inner(&mut self) -> Result<()> {
-        let demand = self.demand.load(std::sync::atomic::Ordering::Acquire);
-        if demand != self.observed_demand {
-            self.idle = None;
-            self.observed_demand = demand;
-        }
+        let demand = self.sync_demand();
         let failed_cleanup =
             self.record.state == EnvironmentState::Failed && !self.record.restart_pending;
         if self.durability == Some(crate::Durability::Journaled) && !failed_cleanup {
             self.sync().await?;
         }
         if self.record.state == EnvironmentState::Running {
+            // A quiesced route left behind by a failed pause recovers
+            // here: the monitoring tick retries the reopen even after
+            // the pressure has fully subsided and no further high
+            // signal rings.
+            if self.events.reopen_idle {
+                self.recover_idle_admission().await?;
+            }
             let running = tokio::time::timeout(
                 self.services.operation_timeout,
                 self.services.runtime.observe(&self.record.runtime.id),
@@ -135,9 +138,11 @@ impl Controller {
                                                 expected_revision: self.record.revision,
                                                 retention: policy.retention,
                                                 timeout_seconds: policy.timeout_seconds,
+                                                storage: None,
                                             },
                                             stamp.clone(),
                                             demand,
+                                            super::PauseOrigin::Idle,
                                         )
                                         .await?;
                                         self.idle = None;
@@ -151,6 +156,9 @@ impl Controller {
                 // Unknown, stale or active observations restart the idle window.
                 _ => self.idle = None,
             }
+            // Tick-driven path shares the pressure trigger so tests observe
+            // the same behavior as the event loop.
+            self.consider_pressure_pause().await?;
         } else if self.record.state == EnvironmentState::Failed && self.record.restart_pending {
             let Some(policy) = &self.record.spec.lifecycle.restart else {
                 return Ok(());

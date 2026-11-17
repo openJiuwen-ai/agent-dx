@@ -98,6 +98,17 @@ impl CoordinatorRpc {
                             .any(|op| op.environment_id == id && !op.settled())
                 })
             };
+            // v2 extension point — pressure evacuation trigger. The filter
+            // below enumerates failure recovery only (invalidated && Failed
+            // via recovery_point). Pressure evacuation adds a second
+            // predicate over the same execution path (constraint injection,
+            // submit_recovery, reserve_recovery CAS, recover_environment
+            // RPC — all unchanged):
+            //   assignment.node_id in nodes whose live report sets
+            //     pressure_disposition == NODE_PRESSURE_DISPOSITION_RELOCATION
+            //   && state == Paused && !resources_held
+            //   && checkpoint.artifact.storage != "local" && !checkpoint.expired(now)
+            // v1: the coordinator never reads RegisterNodeRequest.pressure_disposition.
             let candidates: Vec<_> = state
                 .environments
                 .values()

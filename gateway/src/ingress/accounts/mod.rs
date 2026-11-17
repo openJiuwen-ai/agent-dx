@@ -1,7 +1,9 @@
 //! Business accounts and sessions. Independent of ADX tenant/service authentication.
 mod credentials;
 mod privacy_store;
+mod service_store;
 pub(crate) use privacy_store::{ExpectedRevision, PrivacyOwner, StoredPrivacyGrant};
+pub(crate) use service_store::{ServiceSecretName, StoredServiceSecret};
 mod providers;
 mod store;
 use adx_agent_core::mounts::Parameters;

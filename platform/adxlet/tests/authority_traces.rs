@@ -188,6 +188,7 @@ async fn authority_cycles_are_silent_until_cleanup_failure_or_state_change() {
             expected_revision: running.revision,
             retention: adx_core::lifecycle::RetentionPolicy::Forever,
             timeout_seconds: 5,
+            storage: None,
         })
         .await
         .unwrap()

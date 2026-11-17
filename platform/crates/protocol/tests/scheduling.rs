@@ -171,6 +171,7 @@ fn unknown_enums_missing_selectors_and_duplicate_cards_are_rejected() {
 fn registration_preserves_inventory_and_labels() {
     let node = Node::try_from(wire::RegisterNodeRequest {
         checkpoint_scopes: vec![],
+        pressure: None,
         storage_mounts: Default::default(),
         runtime_classes: vec![
             "runsc".into(),
@@ -198,6 +199,7 @@ fn registration_preserves_inventory_and_labels() {
             model: "x".into(),
             healthy: true,
         }],
+        pressure_disposition: Default::default(),
     })
     .unwrap();
     assert_eq!(node.labels["zone"], "z");

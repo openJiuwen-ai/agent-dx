@@ -51,6 +51,9 @@ at `disk_path`. The default high/low thresholds are 90%/80% for both resources:
 either resource reaching its high threshold closes pressure admission, and both
 falling to or below their low thresholds reopens it. A failed sample or sampling
 task emits a warning and opens the pressure gate, resetting its hysteresis.
+Failed rounds retain the last successful pressure snapshot and increment the
+consecutive failure count. The next successful round starts fresh hysteresis
+for each resource.
 After sampling resumes, a new high-threshold observation is required to close
 it again. Resource reservations, maintenance and the other node admission
 checks continue to apply independently. See [node pressure](../../../docs/testing/node-lifecycle.md)
