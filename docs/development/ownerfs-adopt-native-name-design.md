@@ -8,6 +8,11 @@
 由 API 触发，但 ④–⑦ 的本地动作与启动扫描完全相同，§12 的真机数据仍然成立；差异只在触发
 方式与护栏，已在 §6 单独展开。
 
+第二轮评审否决了两条护栏：**「与 `ownerfs_mkdir_load_balance` 互斥」**（纳管完成后新建目录
+仍需要负载均衡）与**「目录数上限」**（数量拦不住「位置配错」）。前者的替代是让 Meta 的
+reserve 接受一个输入侧标志 `pin_home`，使「纳管」与「负载均衡」正交；后者不再有替代机制，
+改为部署前置的人工核对（§10.1）。取舍记录见 §6.4。
+
 ## 1 需求与约束
 
 业务方现以 autofs 在本机目录下存放数据，形如：
@@ -58,8 +63,10 @@ rename("<storage>/test001", "<storage>/.ownerfs-trash/root-74657374303031-e3")
 | catalog 记录 | `name` 以 hex 落盘 | 崩溃恢复 |
 | RootId | `root-<hex>` | Meta、proto、outlet 快照 |
 
-`RootId` 保持 hex 不变，因此 **proto、Meta 存储、state image、hash domain、golden
-全部不动**，这是本方案比「让 Meta 记住物理目录名」便宜一个量级的原因。
+`RootId` 保持 hex 不变，因此 **Meta 存储、state image、hash domain、golden 全部不动**。
+proto 只有一处新增，且是**输入侧**的：`ReserveRootRequest.pin_home`（§6.4）。它不进入任何
+持久实体，所以不触发状态版本 bump，也不重生成 golden。这是本方案比「让 Meta 记住物理
+目录名」便宜一个量级的原因。
 
 ## 3 已确定的设计决策
 
@@ -71,10 +78,10 @@ rename("<storage>/test001", "<storage>/.ownerfs-trash/root-74657374303031-e3")
 | D4 | epoch 继续是 Meta 分配的全局单调、永不重用水位 | 回收判定「这个代次还有没有人认」的唯一依据 |
 | D5 | 纳管由 **afs-node 启动扫描**驱动（声明式），不经由业务方调用 API | 评审结论：接入现场配好存储根、重启即纳管，不要求业务方逐目录调接口 |
 | D6 | 纳管不传 uid/gid/mode，直接沿用目录的实际属性，一个字节都不改 | 属性是业务方既有的，AFS 无权也不需要改写 |
-| D7 | 保留名从 `.pub`/`.quarantine` 扩为拒绝 `.ownerfs-` 前缀 | 存储根与业务目录同层后，`.ownerfs-roots/`、`.ownerfs-trash/`、锁文件都在这一层 |
+| D7 | 创建路径的保留名从 `.pub`/`.quarantine` 扩为拒绝 `.ownerfs-` 前缀；启动扫描再收紧一档：跳过**所有** `.` 开头的名字与 `lost+found` | 存储根与业务目录同层后，`.ownerfs-roots/`、`.ownerfs-trash/`、锁文件都在这一层；扫描是「猜哪个目录该变 workspace」，猜错一次就到不了头，所以宁可严格 |
 | D8 | 同名重建后，跨机旧路径指向新 workspace（POSIX 语义） | 接受；见 §5 |
 | D9 | 非 UTF-8 名字全链走 `OsString`，catalog 不再落盘 `data_dir` | 真机上非 UTF-8 名字会让节点起不来（P0） |
-| D10 | 启动纳管的 Home 恒为本节点，且与 `ownerfs_mkdir_load_balance` 配置互斥 | 扫描到的目录只在本机磁盘上，HRW 选别的节点必然造空目录（P5）；互斥后本期不需要改 proto |
+| D10 | 启动纳管的 Home 恒为本节点，由 `ReserveRootRequest.pin_home` 显式指定，与 `ownerfs_mkdir_load_balance` **正交**（可同时开启） | 扫描到的目录只在本机磁盘上，HRW 选别的节点必然造空目录（P5）；但 LB 只应作用于新建目录，不该作用于「已经躺在磁盘上的目录」。该标志不落盘，因此不 bump 状态版本 |
 | D11 | 不提供 `root-*` legacy 目录兼容分支 | 系统未上线（`AGENTS.md`），存量 AFS 环境直接重置 |
 
 ## 4 核心机制
@@ -221,7 +228,7 @@ epoch 从 live 路径里消失后，跨机行为变化。这是本方案唯一�
 | `adopt` 请求字段 + 三档 409 语义 | 不需要，API 契约零改动 |
 | uid/gid/mode 从目录实际属性回填（真机上 0750 撞 0755 的那个 409） | 不需要——扫描根本不传这三个参数 |
 | `validate_owner` 放宽以支持中文名 | 不需要——扫描不经过 HTTP |
-| Meta 加 `pinned_home_node_id`（proto + 快照 + golden） | 不需要——改为配置互斥（D10），零 proto 改动 |
+| Meta 加**落盘**的 `pinned_home_node_id`（state image + 快照 + golden） | 不需要——`pin_home` 只是 reserve 的输入侧标志，不进入任何持久实体（§6.4） |
 | 显式 adopt 入口 + intent 崩溃标记 | 不需要——每次启动重扫，天然幂等重试 |
 
 ### 6.2 扫描规则
@@ -230,7 +237,8 @@ epoch 从 live 路径里消失后，跨机行为变化。这是本方案唯一�
 
 | 条件 | 处理 |
 | --- | --- |
-| 名字以 `.ownerfs-` 开头 | 跳过（保留名，D7） |
+| 名字以 `.` 开头（含 `.ownerfs-*`） | 跳过（保留名，D7） |
+| 名字是 `lost+found` | 跳过（文件系统自建目录） |
 | 不是真目录（普通文件 / 软链） | 跳过 + WARN |
 | `dev` 与父目录不一致（挂载点） | 跳过 + WARN（rename 进 trash 会 EBUSY） |
 | `7 + 2*len(name) + 20 > 255` | 跳过 + ERROR（P6） |
@@ -257,20 +265,46 @@ Ok(manager)                            // recovered_roots() 已含新纳管者
 - **既有 catalog 记录的问题 fail-closed**（现状不变）；
 - **扫描发现的新目录 fail-open**（跳过 + 日志），否则一个怪目录就能让节点起不来。
 
-### 6.4 护栏
+### 6.4 护栏与取舍
 
-无条件扫描等于「存储根下的任何目录都变成 workspace」。以下五条是硬要求：
+无条件扫描等于「存储根下的任何目录都变成 workspace」。评审后保留三条：
 
 | # | 护栏 | 理由 |
 | --- | --- | --- |
 | G1 | 开关 `[ownerfs] adopt_on_startup`，默认 `false` | 行为变更必须显式开启，不能随二进制升级自动生效 |
-| G2 | 与 `ownerfs_mkdir_load_balance` 互斥，同时开启则配置校验失败 | 扫描到的目录只在本机磁盘上，HRW 选别的节点必然造空目录（P5） |
-| G3 | 上限 `adopt_max_roots`（默认 1000）：超限则**一个都不纳管** + ERROR | 存储根误配到 `/data` 时，宁可完全不起作用也不要批量接管 |
-| G4 | 摘要日志 `ownerfs.adopt.summary`：`scanned/adopted/skipped/failed` | 批量动作没有摘要等于黑盒 |
-| G5 | 单目录失败只 WARN，不进重试队列；下次启动重扫 | 失败不应累积成持久状态 |
+| G2 | 摘要日志 `ownerfs.adopt.summary`：`scanned/adopted/skipped/failed` | 批量动作没有摘要等于黑盒，事后无法回答「为什么这个目录没被纳管」 |
+| G3 | 单目录失败只 WARN，不进重试队列；下次启动重扫 | 失败不应累积成持久状态 |
 
-G3 的「超限不纳管而不是截断纳管」是刻意的：截断会让运维以为「纳管了前 1000 个」，而实际
-纳管集合依赖目录遍历顺序，不可预测。
+#### 6.4.1 被否决的两条护栏
+
+| 原护栏 | 否决理由 | 现状 |
+| --- | --- | --- |
+| 与 `ownerfs_mkdir_load_balance` 互斥 | 纳管是一次性动作，负载均衡是长期配置；互斥等于要求集群永久关掉 LB 才能完成接入，接入完成后新建目录又需要它 | 改为 `pin_home`，两者**正交**，可同时开启（见 6.4.2） |
+| 目录数上限 `adopt_max_roots` | 数量拦不住「位置配错」：`storage_root` 误写成 `/data` 时下面可能只有 4 个目录，任何阈值都放行；而合法场景有 3000 个目录时阈值又把它整体禁掉。两头都不对，因为它拦的是数量，错误实际在位置 | 删除，不设替代机制。风险由 G1（默认关闭）与部署前置人工核对（§10.1 第 5 条）承担 |
+
+#### 6.4.2 `pin_home`：让纳管与负载均衡正交
+
+`select_home()` 现在只有两种行为：`load_balancing=false` 返回发起节点，`=true` 按 HRW
+挑节点、完全不看数据在哪。纳管需要的是第三种：**发起节点就是数据所在节点，无条件尊重它**。
+
+所以给 `ReserveRootRequest` 追加一个 `bool pin_home`（字段号 10）：
+
+| 场景 | `load_balancing=false` | `load_balancing=true` |
+| --- | --- | --- |
+| 纳管（`pin_home=true`） | Home = 发起节点 | Home = 发起节点 |
+| 新建（`pin_home` 缺省） | Home = 发起节点 | Home = HRW 选中者 |
+
+关键点是 `pin_home` **不落盘**。`RootReservationRecord.home_node_id` 本来就是 Home 的权威
+来源，pin 只是「第一次提交时怎么选」的输入；之后所有读取路径（`recover_root`、outlet 快照、
+跨机转发的 `RootLocation`）都只看 `home_node_id`。因此 state image、快照版本、hash domain、
+golden 全部不动，proto3 追加字段对旧调用方是透明的。
+
+两个实现约束：
+
+- 节点侧本来就是 `preferred_home_node_id = self.node_id`，`pin_home` 只是让 Meta 尊重这个
+  名为 "preferred" 的字段，而不是覆盖它；
+- 同一 `request_id` 重放时以**已提交的** `home_node_id` 为准，`pin_home` 不参与幂等比对
+  （它不在持久实体里）。重放方拿到的是既有 reservation，不会因为改传 `false` 而换 Home。
 
 ### 6.5 代价：启动时长
 
@@ -317,7 +351,10 @@ FailedPrecondition: local root catalog identity is not canonical
 
 误配存储根（例如指到 `/data`）会让一次启动接管几百个无关目录，而「删除 workspace」是把
 目录搬进 trash、约 20 秒后真删。这是本方案唯一可能造成批量数据位置变更的路径。
-必须实现 §6.4 的 G1–G5，缺一条都不建议上线。
+
+评审后护栏收缩为 §6.4 的 G1–G3（默认关闭 + 摘要日志 + 单目录 fail-open），**系统侧不再有
+自动阻断误配的机制**（数量上限被否决，理由见 §6.4.1）。这意味着一半责任转移到部署流程：
+首次开启前必须人工 `ls` 一遍存储根（§10.1 第 6 条）。不接受这个前提就不应开 G1。
 
 ### P2 · 扫描失败不能阻塞启动，也不能静默
 
@@ -371,11 +408,13 @@ workspace**：catalog 写入、`/public/.ownerfs-trash` 被发布、FUSE 可见�
 因为 `placement_score` 只依赖 `root_id` 与节点集合。运维只能「删 root → 改开关 → 换节点重来」，
 每次重建消耗一个新 epoch。
 
-修法（本期）：配置校验拒绝 `adopt_on_startup` 与 `ownerfs_mkdir_load_balance` 同时开启
-（D10）。启动扫描的 Home 天然是本节点，不需要挑；互斥让本期完全不必改 proto。
+修法（本期）：`ReserveRootRequest` 追加 `bool pin_home`，纳管路径置位，`select_home()` 在置位
+时直接返回发起节点。两种 LB 配置下纳管都落在数据所在节点，新建目录照旧走 HRW，因此两者
+可以同时开启（§6.4.2）。
 
-若将来两个能力必须共存，再引入 `pinned_home_node_id`（扫描纳管显式指定、跳过 `select_home`），
-那是独立的一期。
+`pin_home` 不进入任何持久实体，所以不必 bump 快照版本或重生成 golden。不要用「落盘的
+`pinned_home_node_id`」实现：`RootReservationRecord.home_node_id` 已经是权威来源，额外存
+一份会在重建 epoch 时产生两个真值。
 
 > 附带发现：关闭负载均衡时 `prepare` 永远走 `if *home == self.config.id` 的本地分支，
 > **node→node gRPC 从未被使用**。开启后两节点互相请求全部失败于
@@ -397,8 +436,8 @@ trash 名是 `root-<hex>-e<epoch>`，长度 `5 + 2n + 2 + digits`。u64 epoch �
 
 ## 8 改动清单
 
-集中在 OwnerFs 本地模块与配置校验。**proto、Meta 存储、state image、hash domain、golden
-全部零改动**——这是启动扫描方案相对 API 方案最大的收益。
+集中在 OwnerFs 本地模块、配置校验，以及 Meta 的一个**输入侧**字段。**Meta 存储、state
+image、hash domain、golden 全部零改动**——这是启动扫描方案相对 API 方案最大的收益。
 
 | 文件 | 改动 | 量级 |
 | --- | --- | --- |
@@ -406,14 +445,15 @@ trash 名是 `root-<hex>-e<epoch>`，长度 `5 + 2n + 2 + digits`。u64 epoch �
 | `node/vfs/ownerfs/catalog.rs` | `LocalRootRecord` 去掉 `data_dir` 持久字段改为派生；新增 `adopted: bool`；`RECORD_VERSION` bump | ~45 行 |
 | `node/outlet/mirror.rs` | `target_path` 返回 `OsString`；`Action::Publish.target`、`PresentEntry::Symlink.target`、`classify()` 全链 `OsString` | ~80 行 |
 | `node/outlet/live.rs` | `read_link` → `OsString`、`symlinkat` 调用点、target 比较 | ~30 行 |
-| `config/ownerfs.rs` | `adopt_on_startup` / `adopt_max_roots`、与 LB 互斥校验 | ~40 行 |
+| `config/ownerfs.rs` | `adopt_on_startup` 开关（不再有 `adopt_max_roots`、不再与 LB 互斥） | ~15 行 |
 | `node/api/workspace.rs` | **不改**（不新增 `adopt` 字段） | 0 |
-| `meta/*` + `meta.proto` | **不改**（P5 改为配置互斥） | 0 |
-| 测试 | 扫描矩阵（保留名/非目录/挂载点/超长/双节点冲突/超限/幂等/部分失败）+ inode 不变 + 非 UTF-8 重启 + trash 反解 + 崩溃窗口；重写约 18 项失效断言 | ~350 行 |
+| `crates/protocol/proto/meta.proto` + `meta/owner_roots.rs` + `node/rpc/meta.rs` | `ReserveRootRequest.pin_home`（字段号 10）、`select_home` 短路分支、节点侧透传 | ~35 行 |
+| 测试 | 扫描矩阵（保留名/非目录/挂载点/超长/双节点冲突/幂等/部分失败）+ `pin_home` 两种 LB 配置 + inode 不变 + 非 UTF-8 重启 + trash 反解 + 崩溃窗口；重写约 18 项失效断言 | ~350 行 |
 | 文档 | `docs/architecture/afs.md` 目录命名段落、`docs/deployment/afs.md` 存储根 / autofs / 开关前置 | 3 段 |
 
-合计约 **900 行**（测试约 1/3）。与 API 方案（约 950 行）基本持平，但评审面显著变小；
-增加的是**启动期行为的验收责任**，这部分不能靠单测替代，必须真机跑。
+合计约 **940 行**（测试约 1/3）。与 API 方案（约 950 行）基本持平，但评审面显著变小：
+API 契约零改动，Meta 只多一个输入标志；增加的是**启动期行为的验收责任**，这部分不能靠单测
+替代，必须真机跑。
 
 ## 9 验收矩阵
 
@@ -422,15 +462,15 @@ trash 名是 `root-<hex>-e<epoch>`，长度 `5 + 2n + 2 + digits`。u64 epoch �
 | 项 | 断言 |
 | --- | --- |
 | 认领零动作 | 认领前后目录 `(dev, ino)`、文件 inode、内容、mode、mtime 全部不变 |
-| 扫描规则 | §6.2 的九条判定逐条有测试：保留名、非目录、挂载点、超长名、已活跃、pending、Meta 本节点、Meta 他节点、正常纳管 |
-| 扫描开关 | `adopt_on_startup=false` 时一个都不纳管；与 LB 同时开启时配置校验失败 |
-| 扫描上限 | 目录数超过 `adopt_max_roots` 时**一个都不纳管**并打 ERROR，而非截断 |
+| 扫描规则 | §6.2 的十条判定逐条有测试：点前缀、`lost+found`、非目录、挂载点、超长名、已活跃、pending、Meta 本节点、Meta 他节点、正常纳管 |
+| 扫描开关 | `adopt_on_startup=false` 时一个都不纳管；`true` 时按 §6.2 纳管 |
+| 负载均衡正交 | `ownerfs_mkdir_load_balance=true` 时：纳管根的 `home_node_id` 为发起节点（`pin_home` 生效），同批新建目录仍按 HRW 分散到两个节点；`pin_home` 缺省时 HRW 行为不变 |
 | 扫描幂等 | 连续两次启动只纳管一次；纳管后第二次启动因「catalog 已有活跃记录」跳过 |
 | 扫描失败隔离 | 单个目录纳管失败（如 Meta 返回冲突）不影响其余目录，也不阻塞启动 |
 | 代次隔离 | 删除后 live 名字立即释放；trash 出现 `root-<hex>-e<N>`；同名重建落在原名；`collect_trash` 只回收旧代 |
 | 崩溃窗口 | 四个窗口分别重启后行为符合 §4.5 表格，且**任何窗口都不会递归删除非空目录** |
 | 非 UTF-8 | 名字含 `\xff` 可创建、可发布、可重启、可删除；两个仅差非法字节的名字不塌成一条 |
-| 保留名 | `.ownerfs-` 前缀、`.`、`..`、含 `/` 一律拒绝 |
+| 保留名 | 创建路径：`.ownerfs-` 前缀、`.`、`..`、含 `/` 一律拒绝；扫描路径：所有 `.` 开头与 `lost+found` 一律跳过 |
 | 长度 | 115 字节名在 create 与启动扫描处被拒，错误信息指向 trash 命名空间 |
 | 挂载点 | `dev` 与父目录不一致时纳管被拒 |
 
@@ -457,7 +497,8 @@ republish、非空残留改 warn+defer、空残留被复用），2 项是 P3 的
 2. **「重启即纳管」端到端**：24 个野目录的现场，开开关重启后只纳管符合规则的目录，
    inode 全部不变，`/public` 与 FUSE 视图与摘要日志一致。
 3. 双节点同名冲突：两个存储根各放一个同名目录，先启动的一方拿到 Home，另一方跳过 + WARN。
-4. `adopt_on_startup` 与 `ownerfs_mkdir_load_balance` 同时开启时节点拒绝启动。
+4. `ownerfs_mkdir_load_balance=true` 下的纳管：野目录全部落在各自节点（不出现空目录、
+   inode 不变），随后新建的目录仍按 HRW 分到两端。
 5. 启动时长实测（1000 个目录的量级），确认可接受的窗口。
 6. autofs 在场时的纳管（必须验证「停 map」是硬前置）。
 7. node→node gRPC 通道单独验收（P5 附带发现）。
@@ -476,19 +517,21 @@ republish、非空残留改 warn+defer、空残留被复用），2 项是 P3 的
    stat -c '%d %n' <数据父目录> <数据目录> <ownerfs存储根>
    ```
 
-4. 核对保留名与长度：
+4. 核对保留名与长度（`.` 开头的目录不会被扫描纳管，需人工确认是否漏了业务目录）：
 
    ```bash
-   ls <数据父目录> | grep -E '^\.ownerfs-'
-   ls <数据父目录> | awk '{ if (length($0) > 114) print }'
+   ls -A <数据父目录> | grep -E '^\.'
+   ls -A <数据父目录> | grep -E '^lost\+found$'
+   ls -A <数据父目录> | awk '{ if (length($0) > 114) print }'
    ```
 
-5. **打开开关并确认互斥**：`[ownerfs] adopt_on_startup = true`（默认关闭，G1），且确认
-   `ownerfs_mkdir_load_balance` 未开启（G2，同时开启会让节点拒绝启动）。
-   纳管发生在**各节点自己的**存储根上，所以不要再用「把请求发给哪台节点」来判断 Home。
+5. **人工核对目录清单**：`ls -1 <storage_root>`，确认里面只有要纳管的业务目录。数量上限已按
+   评审删除，系统**不会**自动阻断误配的存储根（§6.4.1）；误纳管 + 误删是本方案唯一能造成
+   批量数据位置变更的路径。建议先在单节点开启、看过摘要日志后再推到第二个节点。
 
-6. **先小样本验证再全量**：把 `adopt_max_roots` 临时调到较小值，确认「超限不纳管」的护栏
-   生效，再放开。存储根误配是本方案唯一能造成批量影响的操作（G3）。
+6. **打开开关**：`[ownerfs] adopt_on_startup = true`（默认关闭，G1）。纳管发生在**各节点
+   自己的**存储根上，所以不要再用「把请求发给哪台节点」来判断 Home；
+   `ownerfs_mkdir_load_balance` 可以保持开启，纳管走 `pin_home`、新建目录照旧走 HRW（§6.4.2）。
 
 ### 10.2 回退
 
@@ -504,10 +547,11 @@ republish、非空残留改 warn+defer、空残留被复用），2 项是 P3 的
 | R2 | 名字 ≤114 字节是硬约束，来自 trash 命名空间 | 待业务方确认存量目录是否有超长名字 |
 | R3 | 中文名/non-ASCII 名可被扫描纳管，但 `validate_owner` 仍拒绝它们 → **造出删不掉的 root**（§6.6） | 待定：删除入口同步放宽，或扫描默认跳过非 ASCII |
 | R4 | 空目录删除直接 `rmdir`、不产生 trash（与命名无关的既有行为）；非空目录的递归删除只能走 API，FUSE `rmdir` 返回 `ENOTEMPTY` | 需在运维文档写明 |
-| R5 | **误纳管**：存储根配错时一次启动接管几百个无关目录；「删除 workspace = 搬进 trash 并约 20 秒后真删」，误纳管后再误删等于数据位置变更 | 靠 G1/G3 护栏；建议上线首周保持 `adopt_max_roots` 保守 |
+| R5 | **误纳管**：存储根配错时一次启动接管几百个无关目录；「删除 workspace = 搬进 trash 并约 20 秒后真删」，误纳管后再误删等于数据位置变更 | **无自动阻断**：数量上限已按评审删除，靠 G1（默认关闭）+ §10.1 第 5 条人工核对 |
 | R6 | **启动时长**：245ms/目录，1000 个约 4 分钟，期间 VFS 未挂载 | 需评审给可接受上限（§6.5） |
 | R7 | **双节点同名**：两边都有真实数据时必须人工裁决，系统只会让先启动的一方拿到 Home | 需运维手册写明裁决步骤 |
 | R8 | Meta root 数量随纳管目录数线性增长；已确认 `root_command` 无界泄漏（约 1.9KB/删除） | 长期问题，与本期无关但会被放大 |
+| R9 | 以 `.` 开头的存量目录不会被扫描纳管（D7 的扫描侧规则）；业务方若有这类目录，需人工改名或另加白名单 | 部署核对时一并检查 |
 
 ## 12 验证记录
 
@@ -526,8 +570,10 @@ republish、非空残留改 warn+defer、空残留被复用），2 项是 P3 的
 2. P0 + P3（非 UTF-8 全链 `OsString` + catalog 不落盘 `data_dir` + 版本 bump）——先写失败测试。
 3. 命名公式三处 + `placement` + `rename_to_trash` + `trash_entries` 反算——这一步跑通后，
    纳管的本地动作才成立。
-4. `adopt_pre_existing_roots()` + 护栏 G1–G5 + 摘要日志——主体工作，按 §6.2 的九条规则
+4. `pin_home`（proto 字段 + `select_home` 短路 + 节点透传）——量小，但它是「负载均衡可以
+   保持开启」的前提；先做掉可以让后续真机验验都在 LB 开启下进行。
+5. `adopt_pre_existing_roots()` + 护栏 G1–G3 + 摘要日志——主体工作，按 §6.2 的十条规则
    逐条写测试。
-5. 按新契约重写 18 项失效断言，跑 `cargo clippy` / `cargo fmt --check`。
-6. 真机改造现有 `/home/lzq/afs-adopt` 现场，验证「重启即纳管」：24 个野目录只按开关纳管、
-   双节点同名冲突跳过、超限不纳管、启动时长与摘要日志。
+6. 按新契约重写 18 项失效断言，跑 `cargo clippy` / `cargo fmt --check`。
+7. 真机改造现有 `/home/lzq/afs-adopt` 现场，验证「重启即纳管」：野目录只按开关纳管、
+   双节点同名冲突跳过、LB 开启时仍落本节点、启动时长与摘要日志。
