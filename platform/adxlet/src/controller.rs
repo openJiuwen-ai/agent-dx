@@ -90,17 +90,16 @@ enum Command {
     DeleteAt(u64),
     CollectFailed(u64),
     Sync,
-    Reconcile,
-    AlignAuthority(Box<EnvironmentRecord>, oneshot::Sender<Result<()>>),
+    Fence(oneshot::Sender<Result<()>>),
+    PrepareRecovery(
+        Vec<adx_core::CheckpointArtifact>,
+        oneshot::Sender<Result<bool>>,
+    ),
     CheckAuthority(
         Box<AuthorityCheck>,
         oneshot::Sender<Result<AuthorityResult>>,
     ),
     ReapOrphan(crate::RuntimeObservation, oneshot::Sender<Result<()>>),
-    Discard(
-        Option<Arc<CheckpointReferences>>,
-        oneshot::Sender<Result<()>>,
-    ),
     Expire(u64, oneshot::Sender<Result<Option<OperationResult>>>),
     Tick(oneshot::Sender<Result<Option<OperationResult>>>),
     RuntimeEvent(
@@ -121,7 +120,6 @@ impl Command {
                 | Self::Clone(_, _)
                 | Self::DeleteAt(_)
                 | Self::CollectFailed(_)
-                | Self::Discard(..)
         )
     }
 }
@@ -340,14 +338,21 @@ impl EnvironmentHandle {
     pub async fn collect_failed(&self, expected_revision: u64) -> Result<OperationResult> {
         self.send(Command::CollectFailed(expected_revision)).await
     }
-    pub(crate) async fn reconcile(&self) -> Result<OperationResult> {
-        self.send(Command::Reconcile).await
-    }
-    pub(crate) async fn align_authority(&self, record: EnvironmentRecord) -> Result<()> {
+    pub(crate) async fn prepare_recovery(
+        &self,
+        inputs: Vec<adx_core::CheckpointArtifact>,
+    ) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
-        self.enqueue(Command::AlignAuthority(Box::new(record), tx), unused)
+        self.enqueue(Command::PrepareRecovery(inputs, tx), unused)
             .await?;
+        rx.await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
+    }
+    pub(crate) async fn fence(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let (unused, _) = oneshot::channel();
+        self.enqueue(Command::Fence(tx), unused).await?;
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
@@ -370,17 +375,6 @@ impl EnvironmentHandle {
     }
     pub(crate) fn same_controller(&self, other: &Self) -> bool {
         self.tx.same_channel(&other.tx)
-    }
-    pub(crate) async fn discard(
-        &self,
-        references: Option<Arc<CheckpointReferences>>,
-    ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        let (unused, _) = oneshot::channel();
-        self.enqueue(Command::Discard(references, tx), unused)
-            .await?;
-        rx.await
-            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
     pub async fn expire_checkpoint(&self, now: u64) -> Result<Option<OperationResult>> {
         let (tx, rx) = oneshot::channel();
@@ -448,7 +442,20 @@ pub(crate) fn spawn_restored(
     record: EnvironmentRecord,
     services: Arc<Services>,
 ) -> EnvironmentHandle {
-    spawn_controller(record, services, None, false)
+    spawn_controller(record, services, None, false, None)
+}
+
+pub(crate) fn spawn_journaled(
+    result: crate::journal::JournaledResult,
+    services: Arc<Services>,
+) -> EnvironmentHandle {
+    spawn_controller(
+        result.record.clone(),
+        services,
+        Some(Durability::Journaled),
+        true,
+        Some(result),
+    )
 }
 
 pub(crate) fn spawn_comparison(
@@ -457,28 +464,15 @@ pub(crate) fn spawn_comparison(
 ) -> EnvironmentHandle {
     // The registry exposes the handle before its authority command is queued.
     // Only that command may open lifecycle admission for an adopted execution.
-    spawn_controller(record, services, None, true)
+    spawn_controller(record, services, None, true, None)
 }
 
 /// Retain explicit deletion/replay for an already published, released terminal record.
 pub(crate) fn spawn_terminal(
     record: EnvironmentRecord,
     services: Arc<Services>,
-) -> Result<EnvironmentHandle> {
-    if !matches!(
-        record.state,
-        EnvironmentState::Failed | EnvironmentState::Deleted
-    ) || record.resources_held
-        || record.restart_pending
-    {
-        return Err(Error::Conflict);
-    }
-    Ok(spawn_controller(
-        record,
-        services,
-        Some(Durability::Published),
-        true,
-    ))
+) -> EnvironmentHandle {
+    spawn_controller(record, services, Some(Durability::Published), true, None)
 }
 
 fn spawn_controller(
@@ -486,7 +480,11 @@ fn spawn_controller(
     services: Arc<Services>,
     durability: Option<Durability>,
     authority_fenced: bool,
+    pending: Option<crate::journal::JournaledResult>,
 ) -> EnvironmentHandle {
+    let (stopped_runtime_ids, obsolete_checkpoints) = pending
+        .map(|pending| (pending.stopped_runtime_ids, pending.cleanup_artifacts))
+        .unwrap_or_default();
     let (tx, mut rx) = mpsc::channel::<Envelope>(32);
     let (delete_tx, mut delete_rx) = mpsc::channel::<Envelope>(1);
     let submissions = Arc::new(Submissions::new());
@@ -504,13 +502,15 @@ fn spawn_controller(
         intent_retry: None,
         recovery_files: None,
         execution_files: vec![],
+        protection_pending: vec![],
         held: record.resources_held,
         record,
         services,
         durability,
         retired: false,
         authority_fenced,
-        obsolete_checkpoints: Vec::new(),
+        recovery_pending: false,
+        obsolete_checkpoints,
         idle: None,
         restart_after: None,
         health_failures: 0,
@@ -522,7 +522,7 @@ fn spawn_controller(
         observed_demand: 0,
         auto_pause_guard: None,
         create_deadline: None,
-        stopped_runtime_ids: Vec::new(),
+        stopped_runtime_ids,
     };
     controller.publish_view();
     tokio::spawn(async move {
@@ -566,6 +566,7 @@ fn spawn_controller(
                     } => Wake::RunDeadline,
                     command = rx.recv(), if commands_open => Wake::Command(command),
                     status = async {
+                        if !running { return std::future::pending().await; }
                         let Some(changes) = observers.control.as_mut() else {
                             return std::future::pending().await;
                         };
@@ -575,6 +576,7 @@ fn spawn_controller(
                         changes.borrow_and_update().clone()
                     } => Wake::Control(status),
                     result = async {
+                        if !running { return std::future::pending().await; }
                         match observers.exit.as_mut() {
                             Some(wait) => wait.await,
                             None => std::future::pending().await,
@@ -742,6 +744,13 @@ fn spawn_controller(
 impl Controller {
     async fn dispatch(&mut self, command: Command, reply: Reply) {
         let command = match command {
+            Command::Fence(ack) => {
+                self.authority_fenced = true;
+                self.recovery_pending = true;
+                self.publish_view();
+                let _ = ack.send(Ok(()));
+                return;
+            }
             Command::RunControl(ack) => {
                 let result = if self.retired || self.authority_fenced {
                     Err(Error::Conflict)
@@ -760,22 +769,76 @@ impl Controller {
                 let _ = ack.send(result);
                 return;
             }
-            Command::CheckAuthority(check, ack) => {
+            Command::CheckAuthority(mut check, ack) => {
+                check.recover |= self.recovery_pending;
+                let recovering = check.recover;
+                let authority = check.record.clone();
                 self.authority_fenced = true;
                 let result = self.check_authority(*check).await;
                 if result.is_err() {
                     adx_observability::trace::error();
+                    if let Some(authority) = authority {
+                        let route = if self.record.assignment == authority.assignment
+                            && self.record.revision >= authority.revision
+                        {
+                            &self.record
+                        } else {
+                            &authority
+                        };
+                        let unavailable = if route.state == EnvironmentState::Paused
+                            || matches!(
+                                route.state,
+                                EnvironmentState::Failed | EnvironmentState::Deleted
+                            ) && !route.resources_held
+                                && !route.restart_pending
+                        {
+                            self.services.routes.retire(route).await
+                        } else {
+                            self.services.routes.suspend(route).await
+                        };
+                        if let Err(error) = unavailable {
+                            adx_observability::warn!(environment_id=%route.spec.id, %error, "environment route recovery deferred");
+                        }
+                    }
                 }
                 self.authority_fenced = result.is_err();
+                self.recovery_pending = recovering && result.is_err();
                 self.publish_view();
                 let _ = ack.send(result);
                 return;
             }
-            Command::AlignAuthority(record, ack) => {
-                let result = self.align_authority(*record).await;
-                if result.is_ok() {
-                    self.authority_fenced = false;
-                }
+            Command::PrepareRecovery(inputs, ack) => {
+                self.authority_fenced = true;
+                self.recovery_pending = true;
+                let mut previous = std::mem::take(&mut self.protection_pending);
+                self.protection_pending = inputs
+                    .into_iter()
+                    .map(|artifact| {
+                        let pin = previous
+                            .iter_mut()
+                            .find(|input| input.artifact == artifact)
+                            .and_then(|input| input.pin.take());
+                        ExecutionReference { artifact, pin }
+                    })
+                    .collect();
+                self.held |= self
+                    .services
+                    .admission
+                    .lock()
+                    .expect("shared state lock poisoned")
+                    .ledger
+                    .contains(&self.record.runtime.id);
+                let result = if self.held
+                    && self
+                        .record
+                        .execution_artifacts
+                        .iter()
+                        .all(|a| a.size_bytes != 0)
+                {
+                    self.protect_inputs().await
+                } else {
+                    Ok(self.protection_pending.is_empty())
+                };
                 self.publish_view();
                 let _ = ack.send(result);
                 return;
@@ -868,11 +931,6 @@ impl Controller {
                 let _ = ack.send(result);
                 return;
             }
-            Command::Discard(references, ack) => {
-                let result = self.discard_execution(references.as_deref()).await;
-                let _ = ack.send(result);
-                return;
-            }
             command => command,
         };
         let user_delete = matches!(&command, Command::Delete);
@@ -917,7 +975,6 @@ impl Controller {
             Command::DeleteAt(_) => "delete_expired",
             Command::CollectFailed(_) => "collect_failed",
             Command::Sync => "sync",
-            Command::Reconcile => "reconcile",
             _ => unreachable!(),
         };
         if matches!(&command, Command::Delete) {
@@ -927,10 +984,10 @@ impl Controller {
             Command::RunControl(_)
             | Command::RunTimeout(_, _, _)
             | Command::Snapshot(_, _)
-            | Command::AlignAuthority(_, _)
+            | Command::PrepareRecovery(_, _)
+            | Command::Fence(_)
             | Command::CheckAuthority(_, _)
             | Command::ReapOrphan(_, _)
-            | Command::Discard(_, _)
             | Command::Expire(_, _)
             | Command::Tick(_)
             | Command::RuntimeEvent(_, _) => unreachable!(),
@@ -1006,7 +1063,6 @@ impl Controller {
                 }
             }
             Command::Sync => self.sync().await,
-            Command::Reconcile => self.reconcile().await,
         };
         if let Err(error) = &result {
             adx_observability::trace::error();
@@ -1050,6 +1106,16 @@ pub(super) struct AutoPauseGuard {
     pub origin: PauseOrigin,
 }
 
+struct ExecutionInput {
+    artifact: adx_core::CheckpointArtifact,
+    files: crate::checkpoint::RestoreAccess,
+}
+
+struct ExecutionReference {
+    artifact: adx_core::CheckpointArtifact,
+    pin: Option<Box<dyn Send + Sync>>,
+}
+
 struct Controller {
     submissions: Arc<Submissions>,
     run_timer: Option<run_timer::RunTimer>,
@@ -1064,14 +1130,17 @@ struct Controller {
     auto_pause_guard: Option<AutoPauseGuard>,
     demand: Arc<std::sync::atomic::AtomicU64>,
     observed_demand: u64,
-    recovery_files: Option<crate::checkpoint::RestoreAccess>,
-    execution_files: Vec<crate::checkpoint::RestoreAccess>,
+    recovery_files: Option<ExecutionInput>,
+    execution_files: Vec<ExecutionInput>,
+    protection_pending: Vec<ExecutionReference>,
     record: EnvironmentRecord,
     services: Arc<Services>,
     held: bool,
     durability: Option<Durability>,
     retired: bool,
     authority_fenced: bool,
+    // Retrying full recovery must not consume a fresh claim fenced only by comparison.
+    recovery_pending: bool,
     obsolete_checkpoints: Vec<adx_core::CheckpointArtifact>,
     idle: Option<((String, u64, u64), tokio::time::Instant)>,
     restart_after: Option<tokio::time::Instant>,
@@ -1112,11 +1181,105 @@ impl Controller {
             a.size_bytes != 0 || a.storage != artifact.storage || a.location != artifact.location
         });
         if !self.record.execution_artifacts.contains(&artifact) {
-            self.record.execution_artifacts.push(artifact);
+            self.record.execution_artifacts.push(artifact.clone());
         }
-        if let Some(previous) = self.recovery_files.replace(access) {
-            self.execution_files.push(previous);
+        if let Some(previous) = self.recovery_files.replace(ExecutionInput {
+            artifact,
+            files: access,
+        }) {
+            if !self.retains_input(&previous.artifact) {
+                self.execution_files.push(previous);
+            }
         }
+    }
+
+    fn retains_input(&self, artifact: &adx_core::CheckpointArtifact) -> bool {
+        self.recovery_files
+            .as_ref()
+            .is_some_and(|input| input.artifact == *artifact)
+            || self
+                .execution_files
+                .iter()
+                .any(|input| input.artifact == *artifact)
+    }
+
+    async fn protect_inputs(&mut self) -> Result<bool> {
+        if self.protection_pending.is_empty() {
+            return Ok(true);
+        }
+        let services = self.services.checkpoint.as_ref().ok_or_else(|| {
+            Error::Unavailable("checkpoint input storage is not configured".into())
+        })?;
+        for input in &mut self.protection_pending {
+            if input.pin.is_none() {
+                input.pin = Some(services.store.protect_execution(&input.artifact).await?);
+            }
+        }
+        Ok(self
+            .protection_pending
+            .iter()
+            .all(|input| self.retains_input(&input.artifact)))
+    }
+
+    async fn retain_inputs(&mut self) -> Result<()> {
+        let Some(services) = self.services.checkpoint.clone() else {
+            return if self.record.execution_artifacts.is_empty()
+                && self.protection_pending.is_empty()
+                && (self.record.checkpoint.is_none()
+                    || !self
+                        .services
+                        .runtime
+                        .retains_checkpoint_files(&self.record.spec.runtime_class))
+            {
+                Ok(())
+            } else {
+                Err(Error::Unavailable(
+                    "checkpoint input storage is not configured".into(),
+                ))
+            };
+        };
+        for artifact in self
+            .record
+            .execution_artifacts
+            .iter()
+            .chain(self.protection_pending.iter().map(|input| &input.artifact))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            if !self.retains_input(&artifact) {
+                let files = services.store.retain_execution(&artifact).await?;
+                self.execution_files
+                    .push(ExecutionInput { artifact, files });
+            }
+        }
+        self.protection_pending.clear();
+        if self.recovery_files.is_none()
+            && self
+                .services
+                .runtime
+                .retains_checkpoint_files(&self.record.spec.runtime_class)
+        {
+            if let Some(artifact) = self
+                .record
+                .checkpoint
+                .as_ref()
+                .map(|cp| cp.artifact.clone())
+            {
+                self.recovery_files = Some(
+                    if let Some(index) = self
+                        .execution_files
+                        .iter()
+                        .position(|input| input.artifact == artifact)
+                    {
+                        self.execution_files.swap_remove(index)
+                    } else {
+                        let files = services.store.retain_execution(&artifact).await?;
+                        ExecutionInput { artifact, files }
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     fn trace_observation_error<T>(&self, observation: &'static str, result: &Result<T>) {
@@ -1160,18 +1323,27 @@ impl Controller {
     }
 
     async fn align_authority(&mut self, mut record: EnvironmentRecord) -> Result<()> {
-        if self.retired
-            || record.spec != self.record.spec
-            || record.assignment != self.record.assignment
-        {
+        if self.retired {
             return Err(Error::Conflict);
         }
-        if record.state == EnvironmentState::Paused && record.runtime.id != self.record.runtime.id {
+        if self.durability == Some(Durability::Journaled) && record.revision <= self.record.revision
+        {
+            return Ok(());
+        }
+        if record.state == EnvironmentState::Paused
+            && !record.resources_held
+            && !record.restart_pending
+            && (record.runtime.id != self.record.runtime.id
+                || record.revision > self.record.revision)
+        {
             // A current controller may have finished restore while its commit
             // was fenced by a Coordinator restart. Clean that execution and
             // re-adopt the durable paused point instead of publishing Failed.
-            // A known published result requires a fresh catalog; do not delete it.
-            if self.durability == Some(Durability::Published) {
+            // A newer released authority supersedes the local result, including
+            // a published pause. Equal/older catalogs cannot roll it back.
+            if self.durability == Some(Durability::Published)
+                && record.revision <= self.record.revision
+            {
                 return Err(Error::Conflict);
             }
             self.cleanup().await?;
@@ -1251,26 +1423,7 @@ impl Controller {
             if self.record.state == EnvironmentState::Failed {
                 return self.sync().await;
             }
-            if self.execution_files.is_empty() {
-                if let Some(services) = &self.services.checkpoint {
-                    for artifact in &self.record.execution_artifacts {
-                        self.execution_files
-                            .push(services.store.prepare_restore(artifact).await?);
-                    }
-                }
-            }
-            if self.recovery_files.is_none()
-                && self
-                    .services
-                    .runtime
-                    .retains_checkpoint_files(&self.record.spec.runtime_class)
-            {
-                if let (Some(cp), Some(services)) =
-                    (&self.record.checkpoint, &self.services.checkpoint)
-                {
-                    self.recovery_files = Some(services.store.prepare_restore(&cp.artifact).await?);
-                }
-            }
+            self.retain_inputs().await?;
             tokio::time::timeout(self.services.operation_timeout, async {
                 self.services.readiness.wait_ready(&self.record).await?;
                 if let Some(control) = &self.services.runtime_control {
@@ -1290,7 +1443,7 @@ impl Controller {
                 .clone()
                 .or_else(|| self.record.snapshot_source.clone())
                 .ok_or(Error::Conflict)?;
-            let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
+            self.services.checkpoint.as_ref().ok_or(Error::Conflict)?;
             let had_inputs = !self.record.execution_artifacts.is_empty();
             self.cleanup().await?;
             if had_inputs {
@@ -1301,11 +1454,8 @@ impl Controller {
                 self.operation_intent(adx_core::observation::OperationIntent::Policy);
                 return self.delete(false).await;
             }
-            match services.store.validate_artifact(&cp.artifact).await {
-                Ok(()) => (),
-                Err(Error::Invalid(_) | Error::NotFound) => self.transition(Event::Fail)?,
-                Err(error) => return Err(error),
-            }
+            // A paused point is not executing. Restore owns complete artifact
+            // validation; idle cache verification cannot delay node admission.
         } else {
             let lost_running = self.record.state == EnvironmentState::Running;
             if let Some(status) = observation {
@@ -1594,9 +1744,9 @@ impl Controller {
                                     self.record.assignment.generation,
                                     &self.record.assignment.devices,
                                     crate::RestoreSource {
-                                        path: self.recovery_files.as_ref().expect(
+                                        path: &self.recovery_files.as_ref().expect(
                                             "recovery file is stored immediately before restore",
-                                        ),
+                                        ).files,
                                         origin: cp.origin.as_ref(),
                                     },
                                     self.create_deadline.unwrap_or_else(|| {
@@ -1820,8 +1970,8 @@ impl Controller {
                 .expect("shared state lock poisoned")
                 .release(&self.record.runtime.id)?;
             self.held = false;
-            self.record.resources_held = false;
         }
+        self.record.resources_held = false;
         Ok(())
     }
 
@@ -1845,6 +1995,7 @@ impl Controller {
         self.snapshot_publication = None;
         self.recovery_files = None;
         self.execution_files.clear();
+        self.protection_pending.clear();
         self.record.execution_artifacts.clear();
         self.services.metrics.remove(&self.metrics_registration);
         self.release_capacity()

@@ -2,6 +2,7 @@
 use super::{invalid, Manifest, ObjectCheckpointStore};
 use crate::{io_error, CheckpointAccess, RestoreAccess};
 use adx_core::{CheckpointArtifact, Result};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -10,6 +11,8 @@ use std::{
     sync::{Arc, Weak},
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,14 +28,19 @@ pub(crate) struct CacheEntry {
     pub(super) record: CacheRecord,
     disk_bytes: u64,
     index: PathBuf,
-    verified: bool,
 }
 #[derive(Default)]
 pub(crate) struct Cache {
     pub(crate) entries: BTreeMap<String, CacheEntry>,
+    references: BTreeMap<String, Weak<()>>,
     pub(crate) operations: BTreeMap<String, Weak<Mutex<()>>>,
     clock: u64,
     recovering: bool,
+    maintenance: Arc<Mutex<()>>,
+    verification: Arc<Mutex<()>>,
+    garbage: BTreeSet<String>,
+    cleanup: BTreeSet<PathBuf>,
+    unverified: BTreeSet<String>,
 }
 impl Cache {
     pub(super) fn recover(index: &Path, downloads: &Path, staging: &Path) -> Result<Self> {
@@ -74,7 +82,6 @@ impl Cache {
                     record,
                     disk_bytes,
                     index: path,
-                    verified: false,
                 },
             );
         }
@@ -94,31 +101,100 @@ impl Cache {
         self.clock = self.clock.saturating_add(1);
         self.clock
     }
-    pub(super) async fn trim(cache: &mut Self, bytes: u64, entries: usize) -> Result<()> {
-        if cache.recovering {
-            return Ok(());
-        }
-        loop {
-            let reusable: Vec<_> = cache
-                .entries
-                .iter()
-                .filter(|(_, e)| e.record.committed && Arc::strong_count(&e.pin) == 1)
-                .collect();
-            let size = reusable
-                .iter()
-                .fold(0u64, |sum, (_, e)| sum.saturating_add(e.disk_bytes));
-            if reusable.len() <= entries && size <= bytes {
-                return Ok(());
+    pub(super) fn pin(&mut self, id: &str) -> Arc<()> {
+        let pin = self
+            .entries
+            .get(id)
+            .map(|entry| entry.pin.clone())
+            .or_else(|| self.references.get(id).and_then(Weak::upgrade))
+            .unwrap_or_default();
+        self.references.retain(|_, pin| pin.strong_count() > 0);
+        self.references.insert(id.to_owned(), Arc::downgrade(&pin));
+        pin
+    }
+    pub(super) async fn operation(cache: &Arc<Mutex<Self>>, id: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut cache = cache.lock().await;
+            cache.operations.retain(|_, lock| lock.strong_count() > 0);
+            let lock = cache
+                .operations
+                .get(id)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(Mutex::new(())));
+            cache
+                .operations
+                .insert(id.to_owned(), Arc::downgrade(&lock));
+            lock
+        };
+        lock.lock_owned().await
+    }
+    // Caller owns the artifact operation lock. Pins and identity are checked
+    // atomically; filesystem work never holds the cache directory mutex.
+    pub(super) async fn remove(cache: &Arc<Mutex<Self>>, id: &str) -> Result<bool> {
+        let entry = {
+            let mut cache = cache.lock().await;
+            let pinned = match cache.entries.get(id) {
+                Some(entry) => Arc::strong_count(&entry.pin) != 1,
+                None => cache
+                    .references
+                    .get(id)
+                    .is_some_and(|pin| pin.strong_count() > 0),
+            };
+            if pinned {
+                return Ok(false);
             }
-            let candidate = reusable
-                .into_iter()
-                .min_by_key(|(_, e)| e.record.used)
-                .map(|(id, _)| id.clone());
-            let Some(id) = candidate else { return Ok(()) };
-            let entry = &cache.entries[&id];
+            cache.entries.remove(id)
+        };
+        let Some(entry) = entry else { return Ok(true) };
+        if let Err(error) = async {
             remove_directory(&entry.path).await?;
-            remove_file(&entry.index).await?;
-            cache.entries.remove(&id);
+            remove_file(&entry.index).await
+        }
+        .await
+        {
+            cache.lock().await.entries.insert(id.to_owned(), entry);
+            return Err(error);
+        }
+        Ok(true)
+    }
+    pub(super) async fn trim(cache: &Arc<Mutex<Self>>, bytes: u64, entries: usize) -> Result<()> {
+        let maintenance = cache.lock().await.maintenance.clone();
+        let _maintenance = maintenance.lock().await;
+        loop {
+            let candidate = {
+                let cache = cache.lock().await;
+                if cache.recovering {
+                    return Ok(());
+                }
+                let reusable: Vec<_> = cache
+                    .entries
+                    .iter()
+                    .filter(|(_, e)| e.record.committed && Arc::strong_count(&e.pin) == 1)
+                    .collect();
+                let size = reusable
+                    .iter()
+                    .fold(0u64, |sum, (_, e)| sum.saturating_add(e.disk_bytes));
+                if reusable.len() <= entries && size <= bytes {
+                    return Ok(());
+                }
+                reusable
+                    .into_iter()
+                    .min_by_key(|(_, e)| e.record.used)
+                    .map(|(id, entry)| (id.clone(), entry.record.used))
+            };
+            let Some((id, used)) = candidate else {
+                return Ok(());
+            };
+            let _operation = Self::operation(cache, &id).await;
+            let unchanged = cache
+                .lock()
+                .await
+                .entries
+                .get(&id)
+                .is_some_and(|e| e.record.used == used);
+            if unchanged {
+                Self::remove(cache, &id).await?;
+            }
         }
     }
 }
@@ -140,7 +216,7 @@ impl Drop for CacheLease {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 if let Some(cache) = cache.upgrade() {
-                    if let Err(error) = Cache::trim(&mut *cache.lock().await, budget, max_entries).await {
+                    if let Err(error) = Cache::trim(&cache, budget, max_entries).await {
                         adx_observability::warn!(%error, "checkpoint cache release maintenance failed");
                     }
                 }
@@ -189,21 +265,19 @@ async fn remove_directory(path: &Path) -> Result<()> {
     }
 }
 impl ObjectCheckpointStore {
+    // Caller holds the artifact operation lock; release and repair share the
+    // same pin check before touching either private pathname.
+    pub(super) async fn discard_cached(&self, id: &str) -> Result<()> {
+        if !Cache::remove(&self.cache, id).await? {
+            return Err(adx_core::Error::Conflict);
+        }
+        for root in [&self.cache_root, &self.staging.root] {
+            remove_directory(&root.join(id)).await?;
+        }
+        self.remove_index(id).await
+    }
     pub(super) async fn operation(&self, id: &str) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut cache = self.cache.lock().await;
-            cache.operations.retain(|_, lock| lock.strong_count() > 0);
-            let lock = cache
-                .operations
-                .get(id)
-                .and_then(Weak::upgrade)
-                .unwrap_or_else(|| Arc::new(Mutex::new(())));
-            cache
-                .operations
-                .insert(id.to_owned(), Arc::downgrade(&lock));
-            lock
-        };
-        lock.lock_owned().await
+        Cache::operation(&self.cache, id).await
     }
     pub(crate) async fn remove_index(&self, id: &str) -> Result<()> {
         remove_file(&self.index_root.join(format!("{id}.json"))).await
@@ -226,16 +300,16 @@ impl ObjectCheckpointStore {
         }
         result
     }
+    pub(super) fn lease(&self, pin: Arc<()>) -> CacheLease {
+        CacheLease {
+            pin: Some(pin),
+            cache: Arc::downgrade(&self.cache),
+            budget: self.budget,
+            max_entries: self.max_entries,
+        }
+    }
     fn files(&self, entry: &CacheEntry) -> RestoreAccess {
-        RestoreAccess::pinned(
-            entry.path.clone(),
-            CacheLease {
-                pin: Some(entry.pin.clone()),
-                cache: Arc::downgrade(&self.cache),
-                budget: self.budget,
-                max_entries: self.max_entries,
-            },
-        )
+        RestoreAccess::pinned(entry.path.clone(), self.lease(entry.pin.clone()))
     }
     pub(super) async fn insert(
         &self,
@@ -244,8 +318,7 @@ impl ObjectCheckpointStore {
         mut record: CacheRecord,
     ) -> Result<RestoreAccess> {
         let disk_bytes = allocated(&path)?;
-        let mut cache = self.cache.lock().await;
-        record.used = cache.tick();
+        record.used = self.cache.lock().await.tick();
         // A cache-index write must not block a disk-readable restoration.
         if let Err(error) = self.write_index(&artifact.location, &record).await {
             adx_observability::warn!(%error, "checkpoint cache index write failed");
@@ -257,48 +330,38 @@ impl ObjectCheckpointStore {
             record,
             disk_bytes,
             index,
-            verified: true,
-            pin: Arc::new(()),
+            pin: self.cache.lock().await.pin(&artifact.location),
         };
         let files = self.files(&entry);
-        cache.entries.insert(artifact.location.clone(), entry);
+        self.cache
+            .lock()
+            .await
+            .entries
+            .insert(artifact.location.clone(), entry);
         Ok(files)
     }
     pub(super) async fn cached(
         &self,
         artifact: &CheckpointArtifact,
-    ) -> Result<Option<RestoreAccess>> {
+    ) -> Result<Option<(RestoreAccess, CacheRecord)>> {
         let cached = {
             let mut cache = self.cache.lock().await;
             let used = cache.tick();
             cache.entries.get_mut(&artifact.location).map(|entry| {
                 entry.record.used = used;
-                (self.files(entry), entry.record.clone(), entry.verified)
+                (self.files(entry), entry.record.clone())
             })
         };
-        if let Some((files, record, verified)) = cached {
-            if record.manifest.size != artifact.size_bytes {
-                return Err(invalid("cached artifact identity mismatch"));
-            }
-            if !verified {
-                Self::validate_manifest(&record.manifest, artifact)?;
-                if !Self::valid_cached(&files, &record.manifest).await? {
-                    return Err(invalid("recovered checkpoint cache is inconsistent"));
-                }
-                if let Some(entry) = self.cache.lock().await.entries.get_mut(&artifact.location) {
-                    entry.verified = true;
-                }
-            }
+        if let Some((files, record)) = cached {
             if let Err(error) = self.write_index(&artifact.location, &record).await {
                 adx_observability::warn!(%error, "checkpoint cache recency persistence failed");
             }
-            return Ok(Some(files));
+            return Ok(Some((files, record)));
         }
-        // Local publication precedes the authoritative commit. This also pins
-        // a running Firecracker capture before committed() can trim its base.
-        let index = self.index_root.join(format!("{}.json", artifact.location));
-        if let Ok(record) = read_record(&index) {
-            Self::validate_manifest(&record.manifest, artifact)?;
+        // Prefer an existing pathname: live incremental executions may name it.
+        if let Ok(record) =
+            read_record(&self.index_root.join(format!("{}.json", artifact.location)))
+        {
             let path = if record.staged {
                 &self.staging.root
             } else {
@@ -306,49 +369,39 @@ impl ObjectCheckpointStore {
             }
             .join(&artifact.location);
             if path.exists() {
-                if !Self::valid_cached(&path, &record.manifest).await? {
-                    return Err(invalid("local checkpoint cache is inconsistent"));
-                }
-                return self.insert(artifact, path, record).await.map(Some);
+                let files = self.insert(artifact, path, record.clone()).await?;
+                return Ok(Some((files, record)));
             }
         }
-        // The optional index may be lost after upload or process shutdown.
-        // Prefer the original upload path: a live Firecracker base can still
-        // name it. Never replace it with a download at a different pathname.
         for (root, staged) in [(&self.staging.root, true), (&self.cache_root, false)] {
             let path = root.join(&artifact.location);
-            if !path.exists() {
-                continue;
+            if path.exists() {
+                let record = CacheRecord {
+                    manifest: self.manifest(artifact).await?,
+                    staged,
+                    committed: !staged,
+                    used: 0,
+                };
+                let files = self.insert(artifact, path, record.clone()).await?;
+                return Ok(Some((files, record)));
             }
-            let manifest = self.manifest(artifact).await?;
-            if !Self::valid_cached(&path, &manifest).await? {
-                return Err(invalid("unindexed checkpoint cache is inconsistent"));
-            }
-            return self
-                .insert(
-                    artifact,
-                    path,
-                    CacheRecord {
-                        manifest,
-                        staged,
-                        committed: !staged,
-                        used: 0,
-                    },
-                )
-                .await
-                .map(Some);
         }
         Ok(None)
     }
     pub(super) async fn cache_committed(&self, artifact: &CheckpointArtifact) -> Result<()> {
         let _operation = self.operation(&artifact.location).await;
-        let mut cache = self.cache.lock().await;
-        if let Some(entry) = cache.entries.get_mut(&artifact.location) {
-            entry.record.committed = true;
-            self.write_index(&artifact.location, &entry.record).await?;
-            return Cache::trim(&mut cache, self.budget, self.max_entries).await;
+        let record = {
+            let mut cache = self.cache.lock().await;
+            cache.entries.get_mut(&artifact.location).map(|entry| {
+                entry.record.committed = true;
+                entry.record.clone()
+            })
+        };
+        if let Some(record) = record {
+            self.write_index(&artifact.location, &record).await?;
+            drop(_operation);
+            return Cache::trim(&self.cache, self.budget, self.max_entries).await;
         }
-        drop(cache);
         let path = self.staging.root.join(&artifact.location);
         if !path.exists() {
             return Ok(());
@@ -369,7 +422,8 @@ impl ObjectCheckpointStore {
         // Admission changes ownership/accounting without copying the snapshot.
         let files = self.insert(artifact, path, record).await?;
         drop(files);
-        Cache::trim(&mut *self.cache.lock().await, self.budget, self.max_entries).await
+        drop(_operation);
+        Cache::trim(&self.cache, self.budget, self.max_entries).await
     }
     pub(super) async fn reconcile_cache(&self, retained: &[CheckpointArtifact]) -> Result<()> {
         let keep: BTreeSet<_> = retained
@@ -377,64 +431,183 @@ impl ObjectCheckpointStore {
             .filter(|a| a.storage == self.alias)
             .map(|a| a.location.as_str())
             .collect();
-        let mut cache = self.cache.lock().await;
-        let ids: Vec<_> = cache.entries.keys().cloned().collect();
-        for id in ids {
-            let entry = &cache.entries[&id];
-            if Arc::strong_count(&entry.pin) > 1 {
-                continue;
-            }
-            if !keep.contains(id.as_str())
-                || !Self::valid_cached(&entry.path, &entry.record.manifest)
-                    .await
-                    .unwrap_or(false)
-            {
-                remove_directory(&entry.path).await?;
-                remove_file(&entry.index).await?;
-                cache.entries.remove(&id);
-            } else if let Some(entry) = cache.entries.get_mut(&id) {
-                entry.verified = true;
-                entry.disk_bytes =
-                    allocated(&entry.path)?.saturating_add(allocated(&entry.index).unwrap_or(0));
-            }
-        }
-        cache.recovering = false;
-        Cache::trim(&mut cache, self.budget, self.max_entries).await?;
-        let mut local = retained.to_vec();
-        for entry in cache.entries.values().filter(|e| e.record.staged) {
-            local.push(CheckpointArtifact {
-                storage: "local".into(),
-                scope: String::new(),
-                location: entry.path.to_string_lossy().into_owned(),
-                size_bytes: entry.record.manifest.size,
-            });
-        }
-        let mut downloads = tokio::fs::read_dir(&self.cache_root)
+        let ids: Vec<_> = self.cache.lock().await.entries.keys().cloned().collect();
+        let was_recovering = self.cache.lock().await.recovering;
+        self.cache
+            .lock()
             .await
-            .map_err(io_error)?;
-        while let Some(entry) = downloads.next_entry().await.map_err(io_error)? {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if cache.entries.contains_key(&name) {
-                continue;
-            }
-            if (uuid::Uuid::parse_str(&name).is_ok() || name.starts_with(".download-"))
-                && entry.file_type().await.map_err(io_error)?.is_dir()
-            {
-                remove_directory(&entry.path()).await?;
+            .garbage
+            .extend(ids.iter().filter(|id| !keep.contains(id.as_str())).cloned());
+        let mut failure = self.maintain().await.err();
+        let (local, known) = {
+            let cache = self.cache.lock().await;
+            let mut local = retained.to_vec();
+            local.extend(
+                cache
+                    .entries
+                    .values()
+                    .filter(|entry| entry.record.staged)
+                    .map(|entry| CheckpointArtifact {
+                        storage: "local".into(),
+                        scope: String::new(),
+                        location: entry.path.to_string_lossy().into_owned(),
+                        size_bytes: entry.record.manifest.size,
+                    }),
+            );
+            (
+                local,
+                cache.entries.keys().cloned().collect::<BTreeSet<_>>(),
+            )
+        };
+        for (root, directories) in [(&self.cache_root, true), (&self.index_root, false)] {
+            let mut files = tokio::fs::read_dir(root).await.map_err(io_error)?;
+            while let Some(entry) = files.next_entry().await.map_err(io_error)? {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let id = if directories {
+                    name.as_str()
+                } else {
+                    name.strip_suffix(".json").unwrap_or("")
+                };
+                if known.contains(id) {
+                    continue;
+                }
+                if directories
+                    && (uuid::Uuid::parse_str(id).is_ok() || name.starts_with(".download-"))
+                {
+                    if let Err(error) = remove_directory(&entry.path()).await {
+                        self.cache.lock().await.cleanup.insert(entry.path());
+                        failure = Some(error);
+                    }
+                } else if !directories {
+                    if let Err(error) = remove_file(&entry.path()).await {
+                        self.cache.lock().await.cleanup.insert(entry.path());
+                        failure = Some(error);
+                    }
+                }
             }
         }
-        let known: BTreeSet<_> = cache.entries.keys().cloned().collect();
-        let mut indexes = tokio::fs::read_dir(&self.index_root)
-            .await
-            .map_err(io_error)?;
-        while let Some(entry) = indexes.next_entry().await.map_err(io_error)? {
-            let path = entry.path();
-            let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if !known.contains(id) {
-                remove_file(&path).await?;
+        if let Err(error) = self.staging.reconcile_local(&local).await {
+            failure = Some(error);
+        }
+        if !was_recovering {
+            self.verify_idle(ids).await;
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    pub(super) async fn maintain(&self) -> Result<()> {
+        let (garbage, cleanup, recovering) = {
+            let mut cache = self.cache.lock().await;
+            let recovering = cache.recovering;
+            cache.recovering = false;
+            (cache.garbage.clone(), cache.cleanup.clone(), recovering)
+        };
+        let mut failure = None;
+        for id in garbage {
+            let _operation = self.operation(&id).await;
+            match Cache::remove(&self.cache, &id).await {
+                Ok(true) => {
+                    self.cache.lock().await.garbage.remove(&id);
+                }
+                Ok(false) => (),
+                Err(error) => failure = Some(error),
             }
         }
-        drop(cache);
-        self.staging.reconcile_local(&local).await
+        for path in cleanup {
+            let result = if path.parent() == Some(self.index_root.as_path()) {
+                let id = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                let _operation = self.operation(id).await;
+                if self.cache.lock().await.entries.contains_key(id) {
+                    Ok(())
+                } else {
+                    remove_file(&path).await
+                }
+            } else {
+                let id = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| invalid("invalid cache cleanup path"))?;
+                let _operation = self.operation(id).await;
+                match Cache::remove(&self.cache, id).await {
+                    Ok(true) => remove_directory(&path).await,
+                    Ok(false) => continue,
+                    Err(error) => Err(error),
+                }
+            };
+            match result {
+                Ok(()) => {
+                    self.cache.lock().await.cleanup.remove(&path);
+                }
+                Err(error) => failure = Some(error),
+            }
+        }
+        if let Err(error) = Cache::trim(&self.cache, self.budget, self.max_entries).await {
+            failure = Some(error);
+        }
+        let ids = if recovering {
+            self.cache.lock().await.entries.keys().cloned().collect()
+        } else {
+            vec![]
+        };
+        self.verify_idle(ids).await;
+        failure.map_or(Ok(()), Err)
+    }
+
+    async fn verify_idle(&self, ids: Vec<String>) {
+        // Read-only, bounded maintenance cannot invalidate a live execution's
+        // files. Every actual Restore independently verifies all bytes below.
+        let (ids, verification) = {
+            let mut cache = self.cache.lock().await;
+            cache.unverified.extend(ids);
+            if cache.unverified.is_empty() {
+                return;
+            }
+            (
+                cache.unverified.iter().cloned().collect::<Vec<_>>(),
+                cache.verification.clone(),
+            )
+        };
+        let Ok(verification) = verification.try_lock_owned() else {
+            return;
+        };
+        let cache = Arc::downgrade(&self.cache);
+        tokio::spawn(async move {
+            let _verification = verification;
+            futures_util::stream::iter(ids).for_each_concurrent(2, |id| {
+                let cache = cache.clone();
+                async move {
+                    let candidate = if let Some(cache) = cache.upgrade() {
+                        let mut cache = cache.lock().await;
+                        match cache.entries.get(&id) {
+                            Some(entry) if Arc::strong_count(&entry.pin) == 1 =>
+                                Some((entry.path.clone(), entry.record.manifest.clone(), Arc::downgrade(&entry.pin))),
+                            Some(_) => None,
+                            None => { cache.unverified.remove(&id); None },
+                        }
+                    } else { None };
+                    let Some((path, manifest, pin)) = candidate else { return };
+                    let complete = match Self::valid_cached(&path, &manifest, Some(&pin)).await {
+                        Ok(Some(false)) => {
+                            adx_observability::warn!(checkpoint_id=%id, "idle checkpoint cache is invalid; restore will rematerialize it");
+                            true
+                        },
+                        Ok(Some(true)) => true,
+                        Ok(None) => false,
+                        Err(error) => {
+                            adx_observability::warn!(checkpoint_id=%id, %error, "idle checkpoint cache verification unavailable");
+                            false
+                        },
+                    };
+                    if complete {
+                        if let Some(cache) = cache.upgrade() {
+                            cache.lock().await.unverified.remove(&id);
+                        }
+                    }
+                }
+            }).await;
+        });
     }
 }

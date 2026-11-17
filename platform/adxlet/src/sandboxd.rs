@@ -1465,7 +1465,7 @@ impl RuntimeDriver for Sandboxd {
             recovery::profiles(rootfs.as_ref(), &self.config.checkpoint_runtime_binaries)?;
         if observed.get(&spec.runtime_class) != Some(published) {
             return Err(Error::Unavailable(
-                "recovery backend or host changed; a new node session is required".into(),
+                "recovery backend or rootfs changed; a new node session is required".into(),
             ));
         }
         Ok(published.clone())

@@ -218,7 +218,9 @@ async fn slow_cleanup_keeps_reporting_and_publishes_ready_without_another_tick()
     let mut authority = authority::Fixture::new().await;
     authority.cycle(&node).await.unwrap();
     let reports = authority.authority.reports.lock().unwrap();
-    assert!(reports.iter().filter(|r| r.reconciling).count() >= 2);
+    assert!(reports.first().unwrap().reconciling);
+    assert!(reports.iter().any(|r| !r.reconciling && !r.accepting_allocations),
+        "trusted authority can finish before unknown occupancy cleanup; heartbeats must keep reporting closed allocations");
     assert!(reports
         .windows(2)
         .all(|r| r[0].heartbeat_sequence < r[1].heartbeat_sequence));
