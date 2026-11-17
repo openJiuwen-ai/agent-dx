@@ -9,6 +9,18 @@ use data_plane_gateway::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     adx_transport::install_crypto_provider();
+    #[cfg(feature = "agent-api")]
+    if let Some(result) = data_plane_gateway::ingress::digitalmategateway::server_config::run_cli(
+        std::env::args_os().skip(1).collect(),
+    )
+    .await
+    {
+        return result;
+    }
+    #[cfg(not(feature = "agent-api"))]
+    if std::env::args_os().nth(1).is_some() {
+        return Err("operator configuration requires --features agent-api".into());
+    }
     let _logging_guard = adx_observability::logging::init("ingress-frontend", true)?;
     let nofile_soft_limit = raise_nofile_soft_limit_from_env()?;
     tracing::info!(nofile_soft_limit, "Ingress FD limit configured");

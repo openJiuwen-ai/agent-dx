@@ -30,6 +30,36 @@ pub(crate) struct SecretContext<'a> {
     pub name: &'a str,
 }
 
+/// Server-only namespace, deliberately disjoint from every user's configuration.
+pub(crate) struct ServiceSecretContext<'a> {
+    pub tenant: &'a str,
+    pub service: &'a str,
+    pub name: &'a str,
+}
+
+impl ServiceSecretContext<'_> {
+    fn aad(&self, key_id: &str) -> Result<Vec<u8>, PrivacyCipherError> {
+        adx_agent_core::identifier(self.tenant, "service secret tenant")
+            .map_err(|_| PrivacyCipherError::Invalid)?;
+        if self.tenant.len() > 128
+            || !valid_name(self.service)
+            || !valid_name(self.name)
+            || !valid_name(key_id)
+        {
+            return Err(PrivacyCipherError::Invalid);
+        }
+        serde_json::to_vec(&(
+            "digitalmate_service_secret",
+            "v1",
+            self.tenant,
+            self.service,
+            self.name,
+            key_id,
+        ))
+        .map_err(|_| PrivacyCipherError::Unavailable)
+    }
+}
+
 impl SecretContext<'_> {
     fn aad(&self, key_id: &str) -> Result<Vec<u8>, PrivacyCipherError> {
         for (value, label) in [
@@ -112,7 +142,7 @@ impl Drop for KeyFile {
     }
 }
 
-fn private_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, PrivacyCipherError> {
+pub(super) fn private_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, PrivacyCipherError> {
     if !path.is_absolute() {
         return Err(PrivacyCipherError::Configuration);
     }
@@ -345,16 +375,32 @@ impl PrivacyCipher {
         context: &SecretContext<'_>,
         plaintext: &[u8],
     ) -> Result<EncryptedSecret, PrivacyCipherError> {
+        let aad = context.aad(&self.active)?;
+        self.seal_aad(&aad, plaintext)
+    }
+
+    pub fn seal_service(
+        &self,
+        context: &ServiceSecretContext<'_>,
+        plaintext: &[u8],
+    ) -> Result<EncryptedSecret, PrivacyCipherError> {
+        self.seal_aad(&context.aad(&self.active)?, plaintext)
+    }
+
+    fn seal_aad(
+        &self,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<EncryptedSecret, PrivacyCipherError> {
         if plaintext.len() > MAX_SECRET_BYTES {
             return Err(PrivacyCipherError::Invalid);
         }
-        let aad = context.aad(&self.active)?;
         let cipher = self
             .keys
             .get(&self.active)
             .ok_or(PrivacyCipherError::Unavailable)?;
         let ciphertext = cipher
-            .seal(&aad, plaintext)
+            .seal(aad, plaintext)
             .map_err(|_| PrivacyCipherError::Unavailable)?;
         Ok(EncryptedSecret {
             key_id: self.active.clone(),
@@ -367,25 +413,41 @@ impl PrivacyCipher {
         context: &SecretContext<'_>,
         secret: &EncryptedSecret,
     ) -> Result<Vec<u8>, PrivacyCipherError> {
+        self.open_aad(&context.aad(&secret.key_id)?, secret)
+    }
+
+    pub fn open_service(
+        &self,
+        context: &ServiceSecretContext<'_>,
+        secret: &EncryptedSecret,
+    ) -> Result<Zeroizing<Vec<u8>>, PrivacyCipherError> {
+        self.open_aad(&context.aad(&secret.key_id)?, secret)
+            .map(Zeroizing::new)
+    }
+
+    fn open_aad(
+        &self,
+        aad: &[u8],
+        secret: &EncryptedSecret,
+    ) -> Result<Vec<u8>, PrivacyCipherError> {
         if secret.ciphertext.len() < AEAD_OVERHEAD
             || secret.ciphertext.len() > MAX_SECRET_BYTES + AEAD_OVERHEAD
         {
             return Err(PrivacyCipherError::InvalidCiphertext);
         }
-        let aad = context.aad(&secret.key_id)?;
         let cipher = self
             .keys
             .get(&secret.key_id)
             .ok_or(PrivacyCipherError::InvalidCiphertext)?;
         cipher
-            .open(&aad, &secret.ciphertext)
+            .open(aad, &secret.ciphertext)
             .map_err(|_| PrivacyCipherError::InvalidCiphertext)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PrivacyCipher, SecretContext};
+    use super::{PrivacyCipher, SecretContext, ServiceSecretContext};
     use std::collections::BTreeMap;
 
     fn keys(active: &str) -> PrivacyCipher {
@@ -403,6 +465,65 @@ mod tests {
             user: "user-a",
             name: "FEISHU_TOKEN",
         }
+    }
+
+    #[test]
+    fn service_secrets_cannot_be_opened_as_user_configuration() {
+        let cipher = keys("new");
+        let context = ServiceSecretContext {
+            tenant: "tenant-a",
+            service: "composio",
+            name: "PROJECT_API_KEY",
+        };
+        let sealed = cipher
+            .seal_service(&context, b"synthetic-project-key")
+            .unwrap();
+        assert_eq!(
+            cipher.open_service(&context, &sealed).unwrap().as_slice(),
+            b"synthetic-project-key"
+        );
+        assert!(cipher
+            .open(
+                &SecretContext {
+                    tenant: "tenant-a",
+                    workspace: "composio",
+                    user: "composio",
+                    name: "PROJECT_API_KEY",
+                },
+                &sealed
+            )
+            .is_err());
+        assert!(cipher
+            .open_service(
+                &ServiceSecretContext {
+                    tenant: "other",
+                    ..context
+                },
+                &sealed
+            )
+            .is_err());
+        assert!(cipher
+            .open_service(
+                &ServiceSecretContext {
+                    service: "other",
+                    ..context
+                },
+                &sealed
+            )
+            .is_err());
+        assert!(cipher
+            .open_service(
+                &ServiceSecretContext {
+                    name: "OTHER_KEY",
+                    ..context
+                },
+                &sealed
+            )
+            .is_err());
+        let user = cipher
+            .seal(&super::tests::context(), b"user-secret")
+            .unwrap();
+        assert!(cipher.open_service(&context, &user).is_err());
     }
 
     #[test]
