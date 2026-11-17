@@ -95,6 +95,104 @@ fn service() -> Arc<BindingService> {
         Relay::new(GatewayPolicy::new(vec![])).with_route_enforcement(),
     )))
 }
+
+#[tokio::test]
+async fn suspension_only_allows_the_same_target_to_reactivate_and_preserves_retirement_fences() {
+    let (_server, routes) = start(BindingService::new(Arc::new(
+        Relay::new(GatewayPolicy::new(vec![])).with_route_enforcement(),
+    )))
+    .await;
+    routes.begin_reconcile().await.unwrap();
+    routes.activate(&record()).await.unwrap();
+    routes.finish_reconcile().await.unwrap();
+    routes.suspend(&record()).await.unwrap();
+    let mut conflicting = record();
+    conflicting.runtime.id = "i-42-r9".into();
+    assert_eq!(
+        routes.activate(&conflicting).await.unwrap_err(),
+        Error::Conflict
+    );
+    routes.activate(&record()).await.unwrap();
+    routes.retire(&record()).await.unwrap();
+    assert_eq!(
+        routes.activate(&record()).await.unwrap_err(),
+        Error::Conflict
+    );
+}
+
+#[tokio::test]
+async fn unstarted_owned_binding_can_retire_during_full_recovery() {
+    let (server, previous) = start(BindingService::new(Arc::new(
+        Relay::new(GatewayPolicy::new(vec![])).with_route_enforcement(),
+    )))
+    .await;
+    drop(previous);
+    let routes = UdsRoutes::new(
+        server.directory.path().join("route.sock"),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let mut pending = record();
+    pending.state = EnvironmentState::Pending;
+    pending.revision = 0;
+    pending.runtime.ip = None;
+    routes.begin_reconcile().await.unwrap();
+    routes.seed_recovery(&pending).await.unwrap();
+    routes.finish_reconcile().await.unwrap();
+    routes
+        .retire(&pending)
+        .await
+        .expect("an unstarted owned placeholder must not conflict with cleanup");
+}
+
+#[tokio::test]
+async fn superseded_execution_cleanup_preserves_the_new_owners_binding() {
+    let (server, previous) = start(BindingService::new(Arc::new(
+        Relay::new(GatewayPolicy::new(vec![])).with_route_enforcement(),
+    )))
+    .await;
+    previous.activate(&record()).await.unwrap();
+    let routes = UdsRoutes::new(
+        server.directory.path().join("route.sock"),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let mut current = record();
+    current.assignment.generation += 1;
+    current.runtime.id = "i-43".into();
+    routes.begin_reconcile().await.unwrap();
+    routes.seed_recovery(&current).await.unwrap();
+    routes.finish_reconcile().await.unwrap();
+    routes
+        .retire(&record())
+        .await
+        .expect("a confirmed newer owner already fences the old execution");
+    routes
+        .retire_orphan(&adxlet::RuntimeObservation {
+            environment_id: "i".into(),
+            tenant_id: "t".into(),
+            runtime_id: "i-42".into(),
+            generation: 42,
+            running: true,
+        })
+        .await
+        .expect("orphan cleanup must not overwrite the new owner's binding");
+    routes.activate(&current).await.unwrap();
+    assert_eq!(
+        routes.activate(&record()).await.unwrap_err(),
+        Error::Conflict
+    );
+    routes.retire(&current).await.unwrap();
+    routes.retire(&record()).await.unwrap();
+    assert_eq!(
+        routes.activate(&current).await.unwrap_err(),
+        Error::Conflict
+    );
+    let mut later = current.clone();
+    later.revision += 1;
+    routes.retire(&later).await.unwrap();
+    routes.retire(&current).await.unwrap();
+}
 struct Server {
     directory: tempfile::TempDir,
     task: tokio::task::JoinHandle<()>,

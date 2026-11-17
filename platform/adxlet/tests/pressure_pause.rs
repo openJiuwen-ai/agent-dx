@@ -617,6 +617,35 @@ async fn fixture_with_control(
     (temp, backend, node, handle, rig)
 }
 
+/// A preserved idle window cannot authorize a pause through a recovery fence.
+#[tokio::test]
+async fn recovery_fence_blocks_pressure_pause_until_authority_is_validated() {
+    let (_temp, backend, node, _handle, created) =
+        fixture(immediate(0), adx_core::lifecycle::IdleAction::Pause).await;
+    let mut invalid = created.record.clone();
+    invalid.assignment.node_id = "another-node".into();
+    assert!(node.reconcile(vec![invalid]).await.is_err());
+    publish(&node, board(PressureLevel::High, 0, now_plus(100)));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            backend.checkpoint_entered.notified()
+        )
+        .await
+        .is_err(),
+        "pressure must not change Environment state before recovery validates authority"
+    );
+    assert!(backend.operation_ids().is_empty());
+    node.reconcile(vec![created.record]).await.unwrap();
+    publish(&node, board(PressureLevel::High, 0, now_plus(200)));
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        backend.checkpoint_entered.notified(),
+    )
+    .await
+    .expect("pressure relief must resume after authority recovery");
+}
+
 /// A normal board never pauses even with every other condition satisfied.
 #[tokio::test]
 async fn normal_board_does_not_trigger() {

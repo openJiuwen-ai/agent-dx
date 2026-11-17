@@ -1059,7 +1059,7 @@ async fn zero_capacity_replaces_live_observations_without_releasing_running_work
         .unwrap();
         // A valid zero observation refreshes freshness, not the reservation ledger.
         tokio::time::advance(Duration::from_secs(11)).await;
-        assert!(node.accepting_allocations());
+        assert!(!node.accepting_allocations());
         assert_eq!(node.used(), resources());
         assert_eq!(
             node.reserve_local(&spec("new")).unwrap_err(),

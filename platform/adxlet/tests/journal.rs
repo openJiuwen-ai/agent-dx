@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Default)]
 struct Coordinator {
     failure: Mutex<Option<Error>>,
+    failure_environment: Mutex<Option<String>>,
     records: Mutex<Vec<EnvironmentRecord>>,
     stopped: Mutex<Vec<Vec<String>>>,
     cleanup: Mutex<Vec<Vec<CheckpointArtifact>>>,
@@ -54,7 +55,13 @@ impl StateSink for Coordinator {
         Ok(durability)
     }
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
-        if let Some(e) = self.failure.lock().unwrap().clone() {
+        if let Some(e) = self.failure.lock().unwrap().clone().filter(|_| {
+            self.failure_environment
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|id| id == &record.spec.id)
+        }) {
             return Err(e);
         }
         self.records.lock().unwrap().push(record.clone());
@@ -124,6 +131,58 @@ fn artifact() -> CheckpointArtifact {
         location: "checkpoint/obsolete".into(),
         size_bytes: 1,
     }
+}
+
+#[tokio::test]
+async fn one_failed_replay_does_not_fence_other_environments_or_drop_pending_results() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("isolated.sqlite");
+    let upstream = Arc::new(Coordinator::default());
+    let mut healthy = record(2);
+    healthy.spec.id = "healthy".into();
+    healthy.assignment.environment_id = healthy.spec.id.clone();
+    healthy.runtime.id = "healthy-1".into();
+    *upstream.failure.lock().unwrap() = Some(Error::Unavailable("outage".into()));
+    let previous = JournalSink::new(path.clone(), upstream.clone());
+    previous.commit(&record(2)).await.unwrap();
+    previous.commit(&healthy).await.unwrap();
+    drop(previous);
+    *upstream.failure_environment.lock().unwrap() = Some("i".into());
+    let sink = JournalSink::new(path, upstream.clone());
+    let mut healthy_authority = healthy.clone();
+    healthy_authority.revision = 1;
+    sink.recover(&[record(1), healthy_authority])
+        .await
+        .expect("phase one must make healthy publication independent of deferred results");
+    assert_eq!(sink.pending().await.unwrap(), 2);
+    assert!(
+        upstream.records.lock().unwrap().is_empty(),
+        "phase one must not publish before accounting"
+    );
+    assert_eq!(sink.commit(&healthy).await.unwrap(), Durability::Published);
+    assert_eq!(sink.pending().await.unwrap(), 1);
+    assert!(upstream
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.spec.id == "healthy"));
+    healthy.revision = 3;
+    assert_eq!(sink.commit(&healthy).await.unwrap(), Durability::Published);
+    assert_eq!(sink.commit(&record(1)).await.unwrap_err(), Error::Conflict);
+    assert_eq!(
+        sink.commit(&record(2)).await.unwrap(),
+        Durability::Journaled
+    );
+    *upstream.failure.lock().unwrap() = None;
+    sink.flush().await.unwrap();
+    assert_eq!(sink.pending().await.unwrap(), 0);
+    assert!(upstream
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.spec.id == "i" && r.revision == 2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -197,6 +256,7 @@ async fn concurrent_outage_results_are_journaled_and_recover_after_restart() {
         value.revision = 1;
     }
     recovered.recover(&catalog).await.unwrap();
+    recovered.flush().await.unwrap();
     assert_eq!(recovered.pending().await.unwrap(), 0);
     let published = coordinator.records.lock().unwrap();
     assert_eq!(published.len(), catalog.len());
@@ -232,6 +292,7 @@ async fn recovery_replays_cleanup_proof_even_when_the_failed_result_was_already_
     *coordinator.failure.lock().unwrap() = None;
     let sink = JournalSink::new(path, coordinator.clone());
     sink.recover(&[failed]).await.unwrap();
+    sink.flush().await.unwrap();
     assert_eq!(
         *coordinator.stopped.lock().unwrap(),
         vec![vec!["i-1".to_owned()]]
@@ -392,6 +453,7 @@ async fn direct_recovery_evidence_survives_journal_restart_and_replay() {
     *coordinator.failure.lock().unwrap() = None;
     let sink = JournalSink::new(path, coordinator.clone());
     sink.recover(&[old]).await.unwrap();
+    sink.flush().await.unwrap();
     assert_eq!(sink.pending().await.unwrap(), 0);
     assert_eq!(coordinator.records.lock().unwrap().last(), Some(&recovered));
     assert!(coordinator
@@ -426,6 +488,7 @@ async fn deleted_cleanup_survives_restart_and_replays_with_its_artifacts() {
     *coordinator.failure.lock().unwrap() = None;
     let sink = JournalSink::new(path, coordinator.clone());
     sink.recover(&[record(2)]).await.unwrap();
+    sink.flush().await.unwrap();
     assert_eq!(sink.pending().await.unwrap(), 0);
     assert_eq!(coordinator.records.lock().unwrap().as_slice(), &[deleted]);
     assert_eq!(

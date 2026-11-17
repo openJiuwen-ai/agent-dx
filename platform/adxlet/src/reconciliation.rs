@@ -12,6 +12,7 @@ use std::{
 mod catalog;
 mod periodic;
 use catalog::{validate_inventory, Catalog};
+use futures_util::{stream, StreamExt};
 pub(crate) use periodic::ReconciliationOutcome;
 
 fn terminal_without_execution(record: &EnvironmentRecord) -> bool {
@@ -23,6 +24,57 @@ fn terminal_without_execution(record: &EnvironmentRecord) -> bool {
 }
 
 impl Adxlet {
+    fn execution_reserved(&self, runtime_id: &str) -> bool {
+        self.services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned")
+            .ledger
+            .contains(runtime_id)
+    }
+
+    fn restore_controller(
+        &self,
+        record: &EnvironmentRecord,
+        pending: Option<crate::journal::JournaledResult>,
+    ) -> Result<crate::EnvironmentHandle> {
+        if terminal_without_execution(record) {
+            self.services.upgrade.record_cleanup()?;
+        } else {
+            self.services.upgrade.record_action(
+                &record.spec.id,
+                record.assignment.generation,
+                "adopt",
+            )?;
+        }
+        match pending {
+            Some(pending) => Ok(controller::spawn_journaled(pending, self.services.clone())),
+            None if terminal_without_execution(record) => Ok(controller::spawn_terminal(
+                record.clone(),
+                self.services.clone(),
+            )),
+            None => Ok(controller::spawn_comparison(
+                record.clone(),
+                self.services.clone(),
+            )),
+        }
+    }
+
+    fn restore_execution(&self, record: &EnvironmentRecord, runtime_id: &str) -> Result<()> {
+        let mut admission = self
+            .services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned");
+        let mut ledger = admission.ledger.clone();
+        let mut devices = admission.devices.clone();
+        ledger.restore(runtime_id, record.spec.resources)?;
+        devices.restore(runtime_id, &record.assignment.devices)?;
+        admission.ledger = ledger;
+        admission.devices = devices;
+        Ok(())
+    }
+
     /// Called only with a Coordinator-authorized, unreferenced deletion record.
     /// A lost acknowledgement can safely repeat the same artifact removal.
     pub async fn collect_snapshot(&self, snapshot: &Snapshot, delegated: bool) -> Result<()> {
@@ -73,7 +125,8 @@ impl Adxlet {
 
     /// Caller must obtain the entire catalog from the current Coordinator while node
     /// admission is closed. An unavailable Coordinator must never supply an empty catalog.
-    /// Gate remains closed on any failure; rerunning the same catalog is safe.
+    /// Invalid authority/inventory keeps the gate closed. Per-execution failures
+    /// retain their controller's fence without closing healthy lifecycle admission.
     pub async fn reconcile(&self, records: Vec<EnvironmentRecord>) -> Result<()> {
         self.reconcile_catalog(records, vec![]).await
     }
@@ -84,7 +137,8 @@ impl Adxlet {
         records: Vec<EnvironmentRecord>,
         snapshots: Vec<Snapshot>,
     ) -> Result<()> {
-        self.reconcile_authority(records, snapshots, None).await
+        self.reconcile_authority(records, snapshots, None, None)
+            .await
     }
     /// `retained_artifacts` must include all globally referenced artifacts,
     /// including other nodes and pending restores. Only this complete catalog
@@ -95,46 +149,145 @@ impl Adxlet {
         snapshots: Vec<Snapshot>,
         retained_artifacts: Vec<adx_core::CheckpointArtifact>,
     ) -> Result<()> {
-        self.reconcile_authority(records, snapshots, Some(retained_artifacts))
+        self.reconcile_authority(records, snapshots, Some(retained_artifacts), None)
             .await
     }
+    pub(crate) async fn reconcile_recovery(
+        &self,
+        records: Vec<EnvironmentRecord>,
+        snapshots: Vec<Snapshot>,
+        retained_artifacts: Vec<adx_core::CheckpointArtifact>,
+        journal: Option<&crate::journal::JournalSink>,
+    ) -> Result<()> {
+        self.reconcile_authority(records, snapshots, Some(retained_artifacts), journal)
+            .await
+    }
+
     async fn reconcile_authority(
         &self,
         records: Vec<EnvironmentRecord>,
         snapshots: Vec<Snapshot>,
         retained_artifacts: Option<Vec<adx_core::CheckpointArtifact>>,
+        journal: Option<&crate::journal::JournalSink>,
     ) -> Result<()> {
+        let _recovery = self.recovery.lock().await;
         let mut ready = self.lifecycle_ready.write().await;
         if self.is_draining() {
             return Err(Error::Unavailable("node is draining".into()));
         }
         *ready = false;
+        drop(ready);
+        self.authority_reconciling
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Drain accepted serial work before taking local result/ledger snapshots.
+        // Fencing preserves the same execution's observations and deadlines.
+        let existing = self
+            .environments
+            .lock()
+            .expect("shared state lock poisoned")
+            .clone();
+        let fenced = stream::iter(existing)
+            .map(|(id, (_, _, handle))| async move { (id, handle.fence().await) })
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+        let mut failure = None;
+        for (id, result) in fenced {
+            if let Err(error) = result {
+                deferred(&mut failure, &id, error);
+            }
+        }
         let Catalog {
             records: catalog,
             mut retained,
             references,
         } = Catalog::new(&self.node_id, records, snapshots, retained_artifacts)?;
+        let pending = match journal {
+            Some(journal) => {
+                journal
+                    .recover(&catalog.values().cloned().collect::<Vec<_>>())
+                    .await?
+            }
+            None => vec![],
+        };
+        let mut pending: BTreeMap<_, _> = pending
+            .into_iter()
+            .map(|p| (p.spec.id.clone(), p))
+            .collect();
+        let journal_facts: Vec<_> = pending.values().map(|p| p.record.clone()).collect();
+
+        // Phase one contains no result publication or Environment transitions.
+        // Select local results only under current authority; revoked journal
+        // records remain facts for cleanup, never a grant to run an execution.
+        let mut recovery = catalog.clone();
+        for result in pending.values() {
+            retained.extend(result.cleanup_artifacts.iter().cloned());
+            if catalog
+                .get(&result.spec.id)
+                .map_or(result.resources_held, |current| {
+                    result.authorized_by(current) && result.revision >= current.revision
+                })
+            {
+                recovery.insert(result.spec.id.clone(), result.record.clone());
+            }
+        }
+        for record in recovery.values().filter(|r| r.resources_held) {
+            self.adopt_local(&record.spec, &record.assignment)?;
+            self.restore_execution(record, &record.runtime.id)?;
+        }
+        {
+            let mut controllers = self
+                .environments
+                .lock()
+                .expect("shared state lock poisoned");
+            for record in recovery.values() {
+                if controllers.contains_key(&record.spec.id) {
+                    continue;
+                }
+                let local = pending.remove(&record.spec.id).filter(|p| {
+                    catalog
+                        .get(&record.spec.id)
+                        .is_some_and(|current| p.authorized_by(current))
+                        && p.record == *record
+                });
+                match self.restore_controller(record, local) {
+                    Ok(handle) => {
+                        controllers.insert(
+                            record.spec.id.clone(),
+                            (record.spec.clone(), record.assignment.clone(), handle),
+                        );
+                    }
+                    Err(error) => deferred(&mut failure, &record.spec.id, error),
+                }
+            }
+        }
         let controllers = self
             .environments
             .lock()
             .expect("shared state lock poisoned")
             .clone();
-        for (id, (spec, assignment, _)) in &controllers {
-            if let Some(r) = catalog.get(id) {
-                if r.assignment.generation == assignment.generation
-                    && (r.spec != *spec || r.assignment != *assignment)
-                {
-                    return Err(Error::Conflict);
-                }
-            }
-        }
-        // Startup owns the node barrier; drain already accepted controller work.
-        for (id, (_, assignment, handle)) in &controllers {
-            if let Some(record) = catalog.get(id).filter(|r| r.assignment == *assignment) {
-                handle.align_authority(record.clone()).await?;
-            }
-        }
-        let runtime_catalog: Vec<_> = catalog.values().cloned().collect();
+        let facts: Vec<_> = catalog
+            .values()
+            .cloned()
+            .chain(recovery.values().cloned())
+            .chain(journal_facts)
+            .chain(controllers.values().map(|(_, _, handle)| handle.view().0))
+            .collect();
+        let runtime_catalog: Vec<_> = catalog
+            .values()
+            .map(|current| {
+                controllers
+                    .get(&current.spec.id)
+                    .map(|(_, _, handle)| handle.view())
+                    .filter(|(local, durability)| {
+                        *durability == Some(crate::Durability::Journaled)
+                            && local.assignment == current.assignment
+                            && local.spec.matches_immutable_fields(&current.spec)
+                            && local.revision >= current.revision
+                    })
+                    .map_or_else(|| current.clone(), |(local, _)| local)
+            })
+            .collect();
         let actual = tokio::time::timeout(
             self.services.operation_timeout,
             self.services.runtime.reconcile_inventory(&runtime_catalog),
@@ -142,107 +295,189 @@ impl Adxlet {
         .await
         .map_err(|_| Error::Unavailable("inventory timed out".into()))??;
         validate_inventory(&actual, &catalog)?;
-        self.services.routes.begin_reconcile().await?;
-        for (id, (_, assignment, handle)) in controllers {
-            let ownership_retired = catalog.get(&id).is_none_or(|r| r.assignment != assignment);
-            if ownership_retired || catalog.get(&id).is_some_and(terminal_without_execution) {
-                // Drain accepted operations, then clean locally without inventing a
-                // cluster record for an identity the authority does not own.
-                handle.discard(references.clone()).await?;
-                if ownership_retired {
-                    self.remember_retired(&assignment, None);
-                }
-                self.environments
-                    .lock()
-                    .expect("shared state lock poisoned")
-                    .remove(&id);
-            }
-        }
         for runtime in &actual {
-            if catalog
-                .get(&runtime.environment_id)
-                .is_none_or(|r| r.runtime.id != runtime.runtime_id || terminal_without_execution(r))
-            {
-                tokio::time::timeout(self.services.operation_timeout, async {
-                    // A stale execution under current ownership must not publish a
-                    // MAX revision tombstone that also fences the restored execution.
-                    if catalog
-                        .get(&runtime.environment_id)
-                        .is_none_or(|r| r.assignment.generation != runtime.generation)
-                    {
-                        self.services.routes.retire_orphan(runtime).await?;
-                    }
-                    self.services.runtime.remove(&runtime.runtime_id).await
-                })
-                .await
-                .map_err(|_| Error::Unavailable("orphan cleanup timed out".into()))??;
+            if let Some(record) = facts.iter().find(|r| {
+                r.spec.id == runtime.environment_id
+                    && r.assignment.generation == runtime.generation
+                    && r.spec.tenant_id == runtime.tenant_id
+            }) {
+                self.restore_execution(record, &runtime.runtime_id)?;
             }
         }
-        for r in catalog.into_values() {
-            let handle = {
-                let mut environments = self
-                    .environments
-                    .lock()
-                    .expect("shared state lock poisoned");
-                if let Some((_, _, handle)) = environments.get(&r.spec.id) {
-                    handle.clone()
-                } else {
-                    if terminal_without_execution(&r) {
-                        self.services.upgrade.record_cleanup()?;
-                    } else {
-                        self.services.upgrade.record_action(
-                            &r.spec.id,
-                            r.assignment.generation,
-                            "adopt",
-                        )?;
-                    }
-                    retained.extend(r.execution_artifacts.iter().cloned());
-                    if let Some(source) = &r.snapshot_source {
-                        retained.push(source.artifact.clone());
-                    }
-                    if r.resources_held {
-                        let mut admission = self
-                            .services
-                            .admission
-                            .lock()
-                            .expect("shared state lock poisoned");
-                        // Catalog has already been validated for scalar/card conflicts.
-                        admission.ledger.restore(&r.runtime.id, r.spec.resources)?;
-                        admission
-                            .devices
-                            .restore(&r.runtime.id, &r.assignment.devices)?;
-                    }
-                    let handle = controller::spawn_restored(r.clone(), self.services.clone());
-                    environments.insert(
-                        r.spec.id.clone(),
-                        (r.spec.clone(), r.assignment.clone(), handle.clone()),
+        let mut allocation_fenced = actual.iter().any(|r| {
+            !self.execution_reserved(&r.runtime_id)
+                || catalog
+                    .get(&r.environment_id)
+                    .is_some_and(|record| record.assignment.generation < r.generation)
+        });
+        let protected = stream::iter(controllers.clone())
+            .map(|(id, (_, _, handle))| {
+                let record = handle.view().0;
+                let mut inputs = record.execution_artifacts.clone();
+                if actual.iter().any(|r| r.runtime_id == record.runtime.id) {
+                    inputs.extend(
+                        facts
+                            .iter()
+                            .filter(|r| r.runtime.id == record.runtime.id)
+                            .flat_map(|r| {
+                                r.execution_artifacts
+                                    .iter()
+                                    .chain(r.checkpoint.iter().map(|cp| &cp.artifact))
+                            })
+                            .cloned(),
                     );
-                    handle
                 }
-            };
-            let result = handle.reconcile().await?;
-            if result.durability != crate::Durability::Published {
-                return Err(Error::Unavailable(
-                    "reconciliation state is not published".into(),
-                ));
-            }
-            if let Some(checkpoint) = result.record.checkpoint {
-                retained.push(checkpoint.artifact);
+                async move { (id, handle.prepare_recovery(inputs).await) }
+            })
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+        let mut inputs_ready = true;
+        for (id, result) in protected {
+            match result {
+                Ok(ready) => inputs_ready &= ready,
+                Err(error) => {
+                    inputs_ready = false;
+                    deferred(&mut failure, &id, error);
+                }
             }
         }
-        if let Some(checkpoint) = &self.services.checkpoint {
-            checkpoint.store.reconcile_local(&retained).await?;
+        // Directory GC is authorized only while controllers and lifecycle RPCs
+        // are quiescent. Never sweep roots after admitting a new capture.
+        retained.extend(
+            facts
+                .iter()
+                .flat_map(|r| {
+                    r.execution_artifacts.iter().chain(
+                        r.checkpoint
+                            .iter()
+                            .chain(r.snapshot_source.iter())
+                            .map(|cp| &cp.artifact),
+                    )
+                })
+                .cloned(),
+        );
+        let known_inputs = actual.iter().all(|runtime| {
+            controllers
+                .get(&runtime.environment_id)
+                .is_some_and(|(_, _, handle)| {
+                    controller::protects_execution(&handle.view().0, &runtime.runtime_id)
+                })
+        });
+        if failure.is_none() && inputs_ready && known_inputs {
+            if let Some(checkpoint) = &self.services.checkpoint {
+                if let Err(error) = checkpoint.store.reconcile_local(&retained).await {
+                    adx_observability::warn!(%error, "idle checkpoint cache maintenance deferred");
+                }
+            }
+        }
+        self.services.routes.begin_reconcile().await?;
+        for current in catalog.values() {
+            let local = controllers
+                .get(&current.spec.id)
+                .map(|(_, _, handle)| handle.view().0);
+            let record = local
+                .as_ref()
+                .filter(|local| {
+                    local.assignment == current.assignment && local.revision >= current.revision
+                })
+                .unwrap_or(current);
+            self.services.routes.seed_recovery(record).await?;
         }
         self.services.routes.finish_reconcile().await?;
-        self.local_holds
-            .lock()
-            .expect("shared state lock poisoned")
-            .clear();
-        *ready = true;
         self.authority_initialized
             .store(true, std::sync::atomic::Ordering::Release);
-        Ok(())
+        self.authority_reconciling
+            .store(allocation_fenced, std::sync::atomic::Ordering::Release);
+        // Phase-one trust is complete independently of result publication.
+        // The complete route directory retains unavailable owned identities;
+        // each Controller opens its own route and lifecycle after phase two.
+        *self.lifecycle_ready.write().await = true;
+
+        // Phase two uses the same serial authority operation as live comparison.
+        // An individual publication/readiness failure cannot cancel its peers.
+        let results = stream::iter(controllers)
+            .map(|(id, (_, assignment, handle))| {
+                let current = catalog.get(&id).cloned();
+                let references = references.clone();
+                async move {
+                    let result = self
+                        .reconcile_controller(
+                            assignment,
+                            handle,
+                            controller::AuthorityCheck {
+                                record: current,
+                                references,
+                                recover: true,
+                            },
+                        )
+                        .await
+                        .map(|_| ());
+                    (id, result)
+                }
+            })
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+        for (id, result) in results {
+            if let Err(error) = result {
+                deferred(&mut failure, &id, error);
+            }
+        }
+        let orphans = stream::iter(actual)
+            .map(|runtime| {
+                let catalog = &catalog;
+                async move {
+                    let protected = self
+                        .environments
+                        .lock()
+                        .expect("shared state lock poisoned")
+                        .get(&runtime.environment_id)
+                        .is_some_and(|(_, owner, handle)| {
+                            catalog
+                                .get(&runtime.environment_id)
+                                .is_some_and(|r| r.assignment == *owner)
+                                && controller::protects_execution(
+                                    &handle.view().0,
+                                    &runtime.runtime_id,
+                                )
+                        });
+                    let result = if protected {
+                        Ok(())
+                    } else {
+                        self.cleanup_orphan(
+                            runtime.clone(),
+                            catalog
+                                .get(&runtime.environment_id)
+                                .is_none_or(|r| r.assignment.generation != runtime.generation),
+                        )
+                        .await
+                    };
+                    (runtime, result)
+                }
+            })
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+        allocation_fenced = false;
+        for (runtime, result) in orphans {
+            allocation_fenced |= catalog
+                .get(&runtime.environment_id)
+                .is_some_and(|r| r.assignment.generation < runtime.generation);
+            if let Err(error) = result {
+                allocation_fenced |= !self.execution_reserved(&runtime.runtime_id);
+                deferred(&mut failure, &runtime.environment_id, error);
+            }
+        }
+        self.authority_reconciling
+            .store(allocation_fenced, std::sync::atomic::Ordering::Release);
+        failure.map_or(Ok(()), Err)
     }
+}
+
+fn deferred(failure: &mut Option<Error>, environment: &str, error: Error) {
+    adx_observability::warn!(environment_id=%environment, %error, "environment recovery deferred");
+    *failure = Some(error);
 }
 
 impl Adxlet {

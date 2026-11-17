@@ -12,6 +12,7 @@ impl Adxlet {
         self.draining.load(Ordering::Acquire)
     }
     pub async fn drain(&self) -> Result<usize> {
+        let _recovery = self.recovery.lock().await;
         let mut ready = self.lifecycle_ready.write().await;
         if !*ready && !self.is_draining() {
             return Err(Error::Unavailable(

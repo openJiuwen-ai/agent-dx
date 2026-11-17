@@ -44,12 +44,17 @@ message UpdateBindingRequest {
   oneof binding {
     RuntimeTarget active = 4;
     Retired retired = 5;
+    // Still owned, but temporarily unavailable. The identical target may
+    // reactivate at this version; retirement and target conflicts stay fenced.
+    // Version zero is reserved for an owned, never-started assignment.
+    RuntimeTarget suspended = 8;
   }
 }
 // Success acknowledges the new version and retirement of any replaced execution.
 // Renewing the same generation and target preserves streams and admission state.
 // Identical retries succeed; older versions or conflicting payloads
-// at the same version fail with FAILED_PRECONDITION. Receiver restart requires
+// at the same version fail with FAILED_PRECONDITION, except availability changes
+// between Active and Suspended for the identical target. Receiver restart requires
 // authoritative reconciliation before it serves traffic.
 message UpdateBindingResponse {
   uint64 ownership_generation = 1;

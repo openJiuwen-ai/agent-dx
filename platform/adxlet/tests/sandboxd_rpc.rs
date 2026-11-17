@@ -2220,7 +2220,7 @@ async fn main_backend_lost_response_cleans_by_physical_id() {
 }
 
 #[tokio::test]
-async fn periodic_inventory_failure_preserves_admission_and_retries_cleanup() {
+async fn periodic_inventory_failure_fences_new_allocations_and_retries_cleanup() {
     use std::sync::atomic::Ordering;
     let server = Server::default();
     let (creator, harness) = connect(server.clone()).await;
@@ -2236,12 +2236,14 @@ async fn periodic_inventory_failure_preserves_admission_and_retries_cleanup() {
     creator.start(&spec(), "i-1", 1, &[]).await.unwrap();
     server.list_unavailable.store(true, Ordering::SeqCst);
     assert!(authority.cycle(&node).await.is_err());
-    assert!(node.accepting_allocations());
-    assert!(authority.registration.accepting_allocations);
+    assert!(!node.accepting_allocations());
+    assert!(!authority.registration.accepting_allocations);
     assert!(*server.running.lock().unwrap());
     server.list_unavailable.store(false, Ordering::SeqCst);
     authority.cycle(&node).await.unwrap();
     assert!(!*server.running.lock().unwrap());
+    assert!(node.accepting_allocations());
+    assert!(authority.registration.accepting_allocations);
 }
 
 #[tokio::test]

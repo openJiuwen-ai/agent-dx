@@ -1,10 +1,12 @@
 //! Conservative evidence for default-rootfs runsc recovery. Backend paths are
 //! deployment-owned declarations; their actual ELF bytes are measured here.
+//! runsc validates checkpoint CPU requirements when restoring; host release strings
+//! and CPU model equality cannot establish runtime compatibility.
 use crate::RuntimeRootfsIdentity;
 use adx_core::{Error, Result};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io::Read,
     path::{Path, PathBuf},
 };
@@ -24,21 +26,10 @@ pub(super) fn profiles(
     let Some(rootfs) = rootfs.filter(|root| Path::new(&root.path).is_absolute()) else {
         return Ok(profiles);
     };
-    if binaries.is_empty() {
-        return Ok(profiles);
-    }
-    let host = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .ok()
-        .zip(std::fs::read_to_string("/proc/cpuinfo").ok())
-        .and_then(|(kernel, cpu)| host_fingerprint(std::env::consts::ARCH, kernel.trim(), &cpu));
-    let Some(host) = host else {
-        return Ok(profiles);
-    };
     for (class, path) in binaries {
         profiles.insert(
             class.clone(),
             BTreeMap::from([
-                ("ADX_RECOVERY_HOST".into(), host.clone()),
                 (
                     format!("ADX_RECOVERY_RUNTIME_{class}"),
                     binary_digest(path, std::env::consts::ARCH)?,
@@ -49,56 +40,6 @@ pub(super) fn profiles(
         );
     }
     Ok(profiles)
-}
-
-fn host_fingerprint(arch: &str, kernel: &str, cpu: &str) -> Option<String> {
-    let required: &[&str] = match arch {
-        "x86_64" => &["vendor_id", "cpu family", "model", "stepping", "flags"],
-        "aarch64" => &[
-            "CPU implementer",
-            "CPU architecture",
-            "CPU variant",
-            "CPU part",
-            "CPU revision",
-            "Features",
-        ],
-        _ => return None,
-    };
-    if kernel.is_empty() {
-        return None;
-    }
-    let mut processors = BTreeSet::new();
-    for block in cpu.split("\n\n").filter(|b| !b.trim().is_empty()) {
-        let values: BTreeMap<_, _> = block
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .map(|(key, value)| {
-                (
-                    key.trim(),
-                    value.split_whitespace().collect::<BTreeSet<_>>(),
-                )
-            })
-            .collect();
-        let mut processor = Vec::new();
-        for key in required {
-            let value = values.get(key).filter(|value| !value.is_empty())?;
-            processor.push(format!(
-                "{key}:{}",
-                value.iter().copied().collect::<Vec<_>>().join(" ")
-            ));
-        }
-        processors.insert(processor.join("\n"));
-    }
-    if processors.len() != 1 {
-        return None;
-    }
-    Some(format!(
-        "{:x}",
-        Sha256::digest(format!(
-            "{arch}\n{kernel}\n{}",
-            processors.into_iter().collect::<Vec<_>>().join("\n\n")
-        ))
-    ))
 }
 
 fn binary_digest(path: &Path, arch: &str) -> Result<String> {
@@ -191,8 +132,16 @@ mod tests {
         .unwrap();
         let expected = published
             .get("runsc")
-            .expect("Linux host must provide recovery evidence")
+            .expect("runtime and rootfs must provide recovery evidence")
             .clone();
+        assert_eq!(
+            expected.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "ADX_RECOVERY_ROOTFS_PATH",
+                "ADX_RECOVERY_ROOTFS_SHA256",
+                "ADX_RECOVERY_RUNTIME_runsc",
+            ]
+        );
         let driver = Sandboxd {
             client: super::super::proto::sandbox_service_client::SandboxServiceClient::new(
                 tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
@@ -216,33 +165,6 @@ mod tests {
             driver.recovery_profile(&spec),
             Err(Error::Unavailable(_))
         ));
-    }
-
-    #[test]
-    fn host_profile_requires_complete_stable_cpu_and_kernel_evidence() {
-        let cpu =
-            "vendor_id: GenuineIntel\ncpu family: 6\nmodel: 85\nstepping: 7\nflags: sse avx\n";
-        let profile = host_fingerprint("x86_64", "6.1-test", cpu).unwrap();
-        assert_eq!(
-            Some(profile.clone()),
-            host_fingerprint("x86_64", "6.1-test", &cpu.replace("sse avx", "avx sse"))
-        );
-        assert_ne!(
-            Some(profile.clone()),
-            host_fingerprint("x86_64", "6.2-test", cpu)
-        );
-        assert_ne!(
-            Some(profile),
-            host_fingerprint("x86_64", "6.1-test", &cpu.replace("avx", "avx2"))
-        );
-        assert!(host_fingerprint("x86_64", "6.1-test", "flags: avx").is_none());
-        assert!(host_fingerprint(
-            "x86_64",
-            "6.1-test",
-            &format!("{cpu}\n{}", cpu.replace("avx", "avx2"))
-        )
-        .is_none());
-        assert!(host_fingerprint("x86_64", "", cpu).is_none());
     }
 
     #[test]

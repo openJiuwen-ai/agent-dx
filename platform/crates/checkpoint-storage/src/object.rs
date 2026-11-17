@@ -1,5 +1,7 @@
 //! Immutable objects with a manifest commit marker and a best-effort local LRU.
 mod cache;
+#[cfg(test)]
+mod tests;
 use super::{io_error, CheckpointAccess, LocalCheckpointStore, RestoreAccess};
 use adx_core::{CheckpointArtifact, Error, Result};
 use async_trait::async_trait;
@@ -45,6 +47,7 @@ pub struct ObjectCheckpointStore {
     max_entries: usize,
     index_root: PathBuf,
     pub(super) cache: Arc<tokio::sync::Mutex<Cache>>,
+    materialization: tokio::sync::Semaphore,
 }
 pub(super) fn invalid(message: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("checkpoint object: {message}"))
@@ -110,6 +113,7 @@ impl ObjectCheckpointStore {
             max_entries: super::DEFAULT_CACHE_MAX_ENTRIES,
             index_root,
             cache: Arc::new(tokio::sync::Mutex::new(cache)),
+            materialization: tokio::sync::Semaphore::new(2),
         })
     }
     pub(super) fn key(&self, id: &str, name: &str) -> Key {
@@ -189,20 +193,21 @@ impl ObjectCheckpointStore {
         Ok(self)
     }
     pub async fn evict_unreferenced(&self, target: u64) -> Result<()> {
-        Cache::trim(
-            &mut *self.cache.lock().await,
-            target.min(self.budget),
-            self.max_entries,
-        )
-        .await
+        Cache::trim(&self.cache, target.min(self.budget), self.max_entries).await
     }
-    async fn valid_cached(path: &Path, m: &Manifest) -> Result<bool> {
+    async fn valid_cached(
+        path: &Path,
+        m: &Manifest,
+        idle: Option<&std::sync::Weak<()>>,
+    ) -> Result<Option<bool>> {
+        let started = tokio::time::Instant::now();
+        let mut checked = 0u64;
         if !tokio::fs::symlink_metadata(path)
             .await
             .map(|metadata| metadata.is_dir())
             .unwrap_or(false)
         {
-            return Ok(false);
+            return Ok(Some(false));
         }
         for directory in &m.directories {
             if !tokio::fs::symlink_metadata(path.join(directory))
@@ -210,17 +215,17 @@ impl ObjectCheckpointStore {
                 .map(|metadata| metadata.is_dir())
                 .unwrap_or(false)
             {
-                return Ok(false);
+                return Ok(Some(false));
             }
         }
         for f in &m.files {
             let p = path.join(&f.path);
             let metadata = match tokio::fs::symlink_metadata(&p).await {
                 Ok(m) => m,
-                Err(_) => return Ok(false),
+                Err(_) => return Ok(Some(false)),
             };
             if !metadata.is_file() || metadata.len() != f.size {
-                return Ok(false);
+                return Ok(Some(false));
             }
             // Every ancestor is checked: no symlink traversal from a reused cache.
             let mut parent = p.parent();
@@ -233,25 +238,43 @@ impl ObjectCheckpointStore {
                     .map_err(io_error)?
                     .is_dir()
                 {
-                    return Ok(false);
+                    return Ok(Some(false));
                 }
                 parent = p.parent();
             }
-            let mut file = tokio::fs::File::open(&p).await.map_err(io_error)?;
+            let mut file = match tokio::fs::File::open(&p).await {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Some(false))
+                }
+                Err(error) => return Err(io_error(error)),
+            };
             let mut digest = Sha256::new();
             let mut buf = vec![0; 256 * 1024];
             loop {
+                if let Some(pin) = idle {
+                    if pin.strong_count() != 1 {
+                        return Ok(None);
+                    }
+                    // Two idle workers share at most 32 MB/s. Restore validation
+                    // is unthrottled and never waits for this background work.
+                    tokio::time::sleep_until(
+                        started + std::time::Duration::from_micros(checked / 16),
+                    )
+                    .await;
+                }
                 let n = file.read(&mut buf).await.map_err(io_error)?;
                 if n == 0 {
                     break;
                 }
                 digest.update(&buf[..n]);
+                checked = checked.saturating_add(n as u64);
             }
             if format!("{:x}", digest.finalize()) != f.sha256 {
-                return Ok(false);
+                return Ok(Some(false));
             }
         }
-        Ok(true)
+        Ok(Some(true))
     }
     async fn download(&self, a: &CheckpointArtifact, m: &Manifest, target: &Path) -> Result<()> {
         tokio::fs::create_dir(target).await.map_err(io_error)?;
@@ -494,8 +517,25 @@ impl CheckpointAccess for ObjectCheckpointStore {
         }
         self.validate(artifact)?;
         let _operation = self.operation(&artifact.location).await;
-        if let Some(files) = self.cached(artifact).await? {
-            return Ok(files);
+        let _materialization = self
+            .materialization
+            .acquire()
+            .await
+            .map_err(|error| Error::Unavailable(error.to_string()))?;
+        if let Some((files, record)) = self.cached(artifact).await? {
+            if Self::validate_manifest(&record.manifest, artifact).is_ok()
+                && Self::valid_cached(&files, &record.manifest, None).await? == Some(true)
+            {
+                return Ok(files);
+            }
+            let exists = files.exists();
+            drop(files);
+            // A corrupt/missing private copy is not an invalid shared artifact.
+            // Logical references protect future materialization, too. A missing
+            // directory needs no deletion; existing pinned files stay immutable.
+            if exists {
+                self.discard_cached(&artifact.location).await?;
+            }
         }
         let manifest = self.manifest(artifact).await?;
         let path = self.cache_root.join(&artifact.location);
@@ -517,33 +557,48 @@ impl CheckpointAccess for ObjectCheckpointStore {
         // Quotas apply when the execution lease is released, not to restoration.
         self.insert(artifact, path, record).await
     }
+    async fn protect_execution(
+        &self,
+        artifact: &CheckpointArtifact,
+    ) -> Result<Box<dyn Send + Sync>> {
+        if artifact.storage == "local" {
+            return self.staging.protect_execution(artifact).await;
+        }
+        self.validate(artifact)?;
+        Ok(Box::new(
+            self.lease(self.cache.lock().await.pin(&artifact.location)),
+        ))
+    }
+    async fn retain_execution(&self, artifact: &CheckpointArtifact) -> Result<RestoreAccess> {
+        if artifact.storage == "local" {
+            return self.staging.retain_execution(artifact).await;
+        }
+        self.validate(artifact)?;
+        let _operation = self.operation(&artifact.location).await;
+        if let Some((files, record)) = self.cached(artifact).await? {
+            Self::validate_manifest(&record.manifest, artifact)?;
+            if files.is_dir() {
+                return Ok(files);
+            }
+        }
+        // A live execution's missing input is necessary recovery work. Release
+        // this artifact lock before the normal verified materialization path.
+        drop(_operation);
+        self.prepare_restore(artifact).await
+    }
     async fn release(&self, artifact: &CheckpointArtifact) -> Result<()> {
         if artifact.storage == "local" {
             return self.staging.release(artifact).await;
         }
         self.validate(artifact)?;
         let _operation = self.operation(&artifact.location).await;
-        let mut cache = self.cache.lock().await;
-        if cache
-            .entries
-            .get(&artifact.location)
-            .is_some_and(|e| Arc::strong_count(&e.pin) > 1)
-        {
-            return Err(Error::Conflict);
-        }
         // Shared objects are reclaimed by Coordinator; this only releases node-private copies.
-        let path = self.cache_root.join(&artifact.location);
-        if path.exists() {
-            tokio::fs::remove_dir_all(path).await.map_err(io_error)?;
-        }
-        cache.entries.remove(&artifact.location);
-        self.remove_index(&artifact.location).await?;
-        // A successful publication may retain staging for upload rollback until metadata commit.
-        self.staging
-            .discard_staged(&self.staging.root.join(&artifact.location))
-            .await
+        self.discard_cached(&artifact.location).await
     }
     async fn reconcile_local(&self, retained: &[CheckpointArtifact]) -> Result<()> {
         self.reconcile_cache(retained).await
+    }
+    async fn maintain_cache(&self) -> Result<()> {
+        self.maintain().await
     }
 }

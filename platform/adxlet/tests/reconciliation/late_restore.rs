@@ -72,7 +72,6 @@ async fn assert_paused(node: &Adxlet, record: &EnvironmentRecord) {
     assert_eq!(current.record.checkpoint, record.checkpoint);
     assert!(!current.record.resources_held);
     assert_eq!(node.used(), Resources::default());
-    assert!(node.accepting_allocations());
     assert_eq!(
         std::fs::read(
             std::path::Path::new(&record.checkpoint.as_ref().unwrap().artifact.location)
@@ -118,13 +117,14 @@ async fn late_restore_after_restart_empty_inventory_is_reaped() {
 }
 
 #[tokio::test]
-async fn late_restore_delete_failure_retries_without_closing_admission() {
+async fn late_restore_delete_failure_fences_new_allocations_but_keeps_the_controller_usable() {
     let (_root, backend, node, mut authority, rollback) = failed_restore().await;
     inject_late(&backend, &rollback);
     backend.fail_remove.store(true, Ordering::SeqCst);
     for _ in 0..3 {
         assert!(authority.cycle(&node).await.is_err());
         assert_paused(&node, &rollback).await;
+        assert!(!node.accepting_allocations());
         assert!(contains(&backend, &rollback.runtime.id));
     }
     backend.fail_remove.store(false, Ordering::SeqCst);
@@ -133,6 +133,7 @@ async fn late_restore_delete_failure_retries_without_closing_admission() {
         assert_paused(&node, &rollback).await;
     }
     assert!(!contains(&backend, &rollback.runtime.id));
+    assert!(node.accepting_allocations());
 }
 
 #[tokio::test]
@@ -156,7 +157,10 @@ async fn late_restore_cleanup_queues_behind_resume_and_preserves_successor() {
             .await
             .unwrap()
             .unwrap();
-        assert!(node.accepting_allocations());
+        // The rejected old execution has no resource reservation. Keep the
+        // accepted Resume running, but do not allocate over that extra runtime.
+        assert!(!node.accepting_allocations());
+        assert!(!authority.registration.accepting_allocations);
     }
     assert_eq!(backend.actual.lock().unwrap().len(), 2);
     backend.restore_release.notify_one();

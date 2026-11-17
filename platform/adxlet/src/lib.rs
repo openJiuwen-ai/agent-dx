@@ -349,6 +349,16 @@ pub trait Routes: Send + Sync {
         Ok(())
     }
 
+    /// Preserve ownership/version while withholding a temporarily unavailable route.
+    async fn suspend(&self, _record: &EnvironmentRecord) -> Result<()> {
+        Ok(())
+    }
+    /// Seed a complete recovery snapshot without exposing the execution yet.
+    /// An already synchronized live session may retain its existing bindings.
+    async fn seed_recovery(&self, record: &EnvironmentRecord) -> Result<()> {
+        self.suspend(record).await
+    }
+
     async fn retire_orphan(&self, _runtime: &RuntimeObservation) -> Result<()> {
         Err(Error::Unavailable(
             "orphan binding retirement is unsupported".into(),
@@ -521,6 +531,7 @@ pub struct Adxlet {
     draining: Arc<std::sync::atomic::AtomicBool>,
     stopping: Arc<std::sync::atomic::AtomicBool>,
     lifecycle_ready: Arc<tokio::sync::RwLock<bool>>,
+    recovery: Arc<tokio::sync::Mutex<()>>,
     authority_reconciling: Arc<std::sync::atomic::AtomicBool>,
     authority_initialized: Arc<std::sync::atomic::AtomicBool>,
     /// Set once at startup when node pressure sampling is configured; the
@@ -555,6 +566,7 @@ impl Adxlet {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stopping: stopping.clone(),
             lifecycle_ready: Arc::new(tokio::sync::RwLock::new(true)),
+            recovery: Arc::default(),
             authority_reconciling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authority_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pressure_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -811,6 +823,7 @@ impl Adxlet {
             .expect("shared state lock poisoned");
         !admission.maintenance
             && !admission.pressure
+            && admission.ledger.used().fits(&admission.ledger.capacity())
             && admission
                 .runtime_classes
                 .as_ref()

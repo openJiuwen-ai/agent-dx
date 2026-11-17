@@ -1,4 +1,194 @@
 use adx_core::CheckpointArtifact;
+#[tokio::test]
+async fn deferred_index_cleanup_preserves_a_subsequently_materialized_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = Arc::new(InMemory::new());
+    let previous = store(root.path(), remote.clone(), DEFAULT_CACHE_BUDGET_BYTES, 500);
+    let (artifact, path) = pause(&previous, b"shared input").await;
+    drop(previous);
+    std::fs::remove_dir_all(&path).unwrap();
+    let index = root
+        .path()
+        .join(format!("cache-index/{}.json", artifact.location));
+    std::fs::remove_file(&index).unwrap();
+    std::fs::create_dir(&index).unwrap();
+    let current = store(root.path(), remote, DEFAULT_CACHE_BUDGET_BYTES, 500);
+    assert!(current.reconcile_local(&[]).await.is_err());
+    std::fs::remove_dir(&index).unwrap();
+    let pinned = current.prepare_restore(&artifact).await.unwrap();
+    assert!(index.is_file());
+    current.maintain_cache().await.unwrap();
+    assert!(
+        index.is_file(),
+        "a re-owned index must leave the cleanup queue"
+    );
+    assert_eq!(
+        std::fs::read(pinned.join("memory")).unwrap(),
+        b"shared input"
+    );
+}
+
+#[tokio::test]
+async fn deferred_cache_maintenance_preserves_new_capture_and_pinned_input() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(
+        root.path(),
+        Arc::new(InMemory::new()),
+        DEFAULT_CACHE_BUDGET_BYTES,
+        500,
+    );
+    let (artifact, path) = pause(&store, b"running input").await;
+    let pinned = store.retain_execution(&artifact).await.unwrap();
+    let invalid_index = root.path().join("cache-index/stale.json");
+    std::fs::create_dir(&invalid_index).unwrap();
+    assert!(store.reconcile_local(&[]).await.is_err());
+    let capture = store.begin_capture().await.unwrap();
+    std::fs::write(capture.join("memory"), b"in flight capture").unwrap();
+    std::fs::remove_dir(&invalid_index).unwrap();
+    store.maintain_cache().await.unwrap();
+    assert_eq!(
+        std::fs::read(pinned.join("memory")).unwrap(),
+        b"running input"
+    );
+    assert_eq!(
+        std::fs::read(capture.join("memory")).unwrap(),
+        b"in flight capture"
+    );
+    drop(pinned);
+    store.maintain_cache().await.unwrap();
+    assert!(!path.exists());
+    assert_eq!(
+        std::fs::read(capture.join("memory")).unwrap(),
+        b"in flight capture"
+    );
+}
+#[tokio::test]
+async fn running_recovery_materializes_missing_shared_cache_before_pinning() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = Arc::new(InMemory::new());
+    let previous = store(root.path(), remote.clone(), DEFAULT_CACHE_BUDGET_BYTES, 500);
+    let (artifact, path) = pause(&previous, b"running inputs").await;
+    drop(previous);
+    std::fs::remove_dir_all(&path).unwrap();
+    let current = store(root.path(), remote, DEFAULT_CACHE_BUDGET_BYTES, 500);
+    let pinned = current.retain_execution(&artifact).await.unwrap();
+    assert_eq!(
+        std::fs::read(pinned.join("memory")).unwrap(),
+        b"running inputs"
+    );
+    assert!(matches!(
+        current.release(&artifact).await,
+        Err(adx_core::Error::Conflict)
+    ));
+}
+#[tokio::test]
+async fn corrupt_cache_retained_by_execution_is_not_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(
+        root.path(),
+        Arc::new(InMemory::new()),
+        DEFAULT_CACHE_BUDGET_BYTES,
+        500,
+    );
+    let (artifact, path) = pause(&store, b"saved").await;
+    let running = store.retain_execution(&artifact).await.unwrap();
+    std::fs::write(path.join("memory"), b"wrong").unwrap();
+    assert!(matches!(
+        store.prepare_restore(&artifact).await,
+        Err(adx_core::Error::Conflict)
+    ));
+    assert_eq!(std::fs::read(running.join("memory")).unwrap(), b"wrong");
+    drop(running);
+    assert_eq!(
+        std::fs::read(
+            store
+                .prepare_restore(&artifact)
+                .await
+                .unwrap()
+                .join("memory")
+        )
+        .unwrap(),
+        b"saved"
+    );
+}
+
+#[tokio::test]
+async fn missing_verified_cache_is_downloaded_again() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(
+        root.path(),
+        Arc::new(InMemory::new()),
+        DEFAULT_CACHE_BUDGET_BYTES,
+        500,
+    );
+    let (artifact, path) = pause(&store, b"saved").await;
+    std::fs::remove_dir_all(&path).unwrap();
+    let files = store.prepare_restore(&artifact).await.unwrap();
+    assert_eq!(std::fs::read(files.join("memory")).unwrap(), b"saved");
+}
+
+#[tokio::test]
+async fn invalid_remote_manifest_does_not_delete_unindexed_execution_input() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = Arc::new(InMemory::new());
+    let previous = store(root.path(), remote.clone(), DEFAULT_CACHE_BUDGET_BYTES, 500);
+    let (artifact, staged) = pause(&previous, b"running input").await;
+    drop(previous);
+    std::fs::remove_file(
+        root.path()
+            .join(format!("cache-index/{}.json", artifact.location)),
+    )
+    .unwrap();
+    remote
+        .put(
+            &Key::from(format!("test/{}/manifest.json", artifact.location)),
+            b"invalid manifest".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let current = store(root.path(), remote, DEFAULT_CACHE_BUDGET_BYTES, 500);
+    assert!(matches!(
+        current.prepare_restore(&artifact).await,
+        Err(adx_core::Error::Invalid(_))
+    ));
+    assert_eq!(
+        std::fs::read(staged.join("memory")).unwrap(),
+        b"running input",
+        "a remote metadata error cannot authorize deletion of an existing input"
+    );
+}
+
+#[tokio::test]
+async fn reference_pin_protects_an_input_materialized_after_registration() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = Arc::new(InMemory::new());
+    let source = store(
+        &root.path().join("source"),
+        remote.clone(),
+        DEFAULT_CACHE_BUDGET_BYTES,
+        500,
+    );
+    let (artifact, _) = pause(&source, b"running input").await;
+    let target = store(
+        &root.path().join("target"),
+        remote,
+        DEFAULT_CACHE_BUDGET_BYTES,
+        500,
+    );
+    let reference = target.protect_execution(&artifact).await.unwrap();
+    let files = target.prepare_restore(&artifact).await.unwrap();
+    let path = files.to_path_buf();
+    drop(files);
+    target.evict_unreferenced(0).await.unwrap();
+    assert_eq!(
+        std::fs::read(path.join("memory")).unwrap(),
+        b"running input"
+    );
+    drop(reference);
+    target.evict_unreferenced(0).await.unwrap();
+    assert!(!path.exists());
+}
+
 use adxlet::checkpoint::{
     CheckpointAccess, ObjectCheckpointStore, StorageConfig, DEFAULT_CACHE_BUDGET_BYTES,
     DEFAULT_CACHE_MAX_ENTRIES,
@@ -221,7 +411,7 @@ async fn restart_protects_live_files_before_trimming_and_cleans_partial_download
     removed(&ap).await;
 }
 #[tokio::test]
-async fn reconciliation_drops_unretained_and_corrupt_copies_then_obs_restores() {
+async fn reconciliation_prunes_unretained_copies_and_restore_repairs_corruption() {
     let root = tempfile::tempdir().unwrap();
     let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let old = store(root.path(), remote.clone(), DEFAULT_CACHE_BUDGET_BYTES, 10);
@@ -234,7 +424,10 @@ async fn reconciliation_drops_unretained_and_corrupt_copies_then_obs_restores() 
         .reconcile_local(std::slice::from_ref(&a))
         .await
         .unwrap();
-    assert!(!ap.exists());
+    assert!(
+        ap.exists(),
+        "idle verification must not mutate retained paths"
+    );
     assert!(!orphan.exists());
     let restored = current.prepare_restore(&a).await.unwrap();
     assert_eq!(std::fs::read(restored.join("memory")).unwrap(), b"correct");

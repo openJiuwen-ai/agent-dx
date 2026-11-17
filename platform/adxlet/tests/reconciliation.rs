@@ -1,7 +1,11 @@
 #[path = "common/authority.rs"]
 mod authority;
+#[path = "reconciliation/failure_domains.rs"]
+mod failure_domains;
 #[path = "reconciliation/isolation.rs"]
 mod isolation;
+#[path = "reconciliation/recovery_phases.rs"]
+mod recovery_phases;
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources, Result,
 };
@@ -13,8 +17,14 @@ use std::{
 };
 #[derive(Default)]
 struct Backend {
+    recovery_fault: Mutex<Option<&'static str>>,
     actual: Mutex<Vec<RuntimeObservation>>,
     readiness_calls: std::sync::atomic::AtomicUsize,
+    readiness_active: std::sync::atomic::AtomicUsize,
+    readiness_peak: std::sync::atomic::AtomicUsize,
+    block_readiness: std::sync::atomic::AtomicBool,
+    readiness_entered: tokio::sync::Notify,
+    readiness_release: tokio::sync::Notify,
     binding_syncs: std::sync::atomic::AtomicUsize,
     observations: std::sync::atomic::AtomicUsize,
     block_observation: std::sync::atomic::AtomicBool,
@@ -35,10 +45,12 @@ struct Backend {
     checkpoint_entered: tokio::sync::Notify,
     checkpoint_release: tokio::sync::Notify,
     checkpoint_path: Mutex<Option<std::path::PathBuf>>,
+    checkpoint_gate: Mutex<Option<String>>,
     block_commit: std::sync::atomic::AtomicBool,
     commit_entered: tokio::sync::Notify,
     commit_release: tokio::sync::Notify,
     journal_only: std::sync::atomic::AtomicBool,
+    journal_running: std::sync::atomic::AtomicBool,
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
@@ -57,7 +69,13 @@ impl RuntimeDriver for Backend {
     async fn checkpoint(&self, id: &str, path: &std::path::Path, _: Duration) -> Result<()> {
         std::fs::write(path.join("state"), b"checkpoint data").unwrap();
         *self.checkpoint_path.lock().unwrap() = Some(path.to_owned());
-        if id == "busy-7"
+        if self
+            .checkpoint_gate
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap_or("busy-7")
+            == id
             && self
                 .block_checkpoint
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -100,6 +118,7 @@ impl RuntimeDriver for Backend {
         Ok(self.actual.lock().unwrap().clone())
     }
     async fn is_running(&self, id: &str) -> Result<bool> {
+        self.recovery_fault(id, "observation")?;
         self.observations
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if id == "busy-7"
@@ -143,6 +162,7 @@ impl RuntimeDriver for Backend {
     }
     async fn remove(&self, id: &str) -> Result<()> {
         self.events.lock().unwrap().push(format!("remove:{id}"));
+        self.recovery_fault(id, "remove")?;
         if self.block_remove.load(std::sync::atomic::Ordering::SeqCst) {
             self.remove_entered.notify_waiters();
             self.remove_release.notified().await;
@@ -156,9 +176,25 @@ impl RuntimeDriver for Backend {
 }
 #[async_trait]
 impl Readiness for Backend {
-    async fn wait_ready(&self, _: &EnvironmentRecord) -> Result<()> {
+    async fn wait_ready(&self, record: &EnvironmentRecord) -> Result<()> {
+        self.recovery_fault(&record.spec.id, "readiness")?;
         self.readiness_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .block_readiness
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let active = self
+                .readiness_active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.readiness_peak
+                .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+            self.readiness_entered.notify_one();
+            self.readiness_release.notified().await;
+            self.readiness_active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(())
     }
 }
@@ -170,6 +206,7 @@ impl Routes for Backend {
         Ok(())
     }
     async fn activate(&self, r: &EnvironmentRecord) -> Result<()> {
+        self.recovery_fault(&r.spec.id, "route")?;
         self.events
             .lock()
             .unwrap()
@@ -194,6 +231,10 @@ impl Routes for Backend {
 #[async_trait]
 impl StateSink for Backend {
     async fn commit(&self, r: &EnvironmentRecord) -> Result<Durability> {
+        self.recovery_fault(&r.spec.id, "commit")?;
+        if r.state == EnvironmentState::Running {
+            self.recovery_fault(&r.spec.id, "running_commit")?;
+        }
         if r.spec.id == "busy" && self.block_commit.load(std::sync::atomic::Ordering::SeqCst) {
             self.commit_entered.notify_one();
             self.commit_release.notified().await;
@@ -203,12 +244,29 @@ impl StateSink for Backend {
             .unwrap()
             .push(format!("commit:{:?}", r.state));
         Ok(
-            if self.journal_only.load(std::sync::atomic::Ordering::SeqCst) {
+            if (r.spec.id == "busy" && *self.recovery_fault.lock().unwrap() == Some("journaled"))
+                || self.journal_only.load(std::sync::atomic::Ordering::SeqCst)
+                || (r.state == EnvironmentState::Running
+                    && self
+                        .journal_running
+                        .load(std::sync::atomic::Ordering::SeqCst))
+            {
                 Durability::Journaled
             } else {
                 Durability::Published
             },
         )
+    }
+}
+impl Backend {
+    fn recovery_fault(&self, id: &str, stage: &str) -> Result<()> {
+        if id.starts_with("busy") && *self.recovery_fault.lock().unwrap() == Some(stage) {
+            Err(adx_core::Error::Unavailable(format!(
+                "injected {stage} failure"
+            )))
+        } else {
+            Ok(())
+        }
     }
 }
 fn record(id: &str, state: EnvironmentState) -> EnvironmentRecord {
@@ -275,8 +333,8 @@ fn manager(b: &Arc<Backend>) -> Adxlet {
     let n = Adxlet::new("n".into(), b.clone(), b.clone(), b.clone(), b.clone());
     n.update_capacity(
         Resources {
-            cpu_millis: 1,
-            memory_bytes: 1,
+            cpu_millis: 1000,
+            memory_bytes: 1000,
             disk_bytes: 0,
         },
         Duration::from_secs(30),
@@ -1217,7 +1275,7 @@ async fn failed_capture_reservation_does_not_block_node_reconciliation() {
 }
 
 #[tokio::test]
-async fn unsealed_capture_cleanup_failure_keeps_node_admission_closed_until_retry() {
+async fn unsealed_capture_cleanup_failure_fences_only_the_accounted_execution_until_retry() {
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() = vec![observed("lost")];
     backend
@@ -1236,7 +1294,8 @@ async fn unsealed_capture_cleanup_failure_keeps_node_admission_closed_until_retr
             size_bytes: 0,
         });
     assert!(node.reconcile(vec![failed.clone()]).await.is_err());
-    assert!(!node.accepting_allocations());
+    assert!(node.accepting_allocations());
+    assert_eq!(node.used(), failed.spec.resources);
     assert!(!backend.actual.lock().unwrap().is_empty());
     assert!(!backend
         .events
@@ -1383,7 +1442,14 @@ async fn reconnect_discards_live_controller_when_authority_invalidates_execution
         .fail_remove
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert!(node.reconcile(vec![failed.clone()]).await.is_err());
-    assert!(!node.accepting_allocations());
+    assert!(node.accepting_allocations());
+    assert_eq!(node.used(), failed.spec.resources);
+    assert!(node
+        .environment(failed.spec.clone(), failed.assignment.clone())
+        .unwrap()
+        .sync()
+        .await
+        .is_err());
     backend
         .fail_remove
         .store(false, std::sync::atomic::Ordering::SeqCst);
