@@ -1656,6 +1656,7 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "ipnet",

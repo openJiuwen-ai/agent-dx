@@ -232,6 +232,43 @@ public host, and HTTPS scheme, and adds `X-Forwarded-Prefix` when stripping a
 prefix. Connection-specific headers are removed in both directions. Response
 bodies are streamed, including SSE. WebSocket upgrades retain a dedicated
 connection for the upgraded session and close both sides when either relay ends.
+Upgrade requests open a fresh upstream connection rather than reusing an idle
+HTTP connection, including when the downstream client reuses its connection.
+
+Ingress HTTP listeners also accept legacy `GET ... HTTP/1.0` WebSocket
+handshakes with `Connection: upgrade` and `Upgrade: websocket`. Compatibility
+applies only when `Content-Length` is absent or zero and `Transfer-Encoding`
+is absent. Header names and upgrade tokens are case-insensitive. Ingress
+normalizes the request version before Hyper parses it, so both the client
+connection and the HTTP/1.1 upstream connection can upgrade normally. Successful
+handshakes receive `HTTP/1.1 101 Switching Protocols`.
+
+The handshake can follow earlier requests on the same keep-alive connection,
+including requests with fixed-length or chunked bodies and trailers. Ordinary
+request bodies and upgraded WebSocket bytes pass through unchanged. A rejected
+upgrade can be retried on the same connection when the response permits reuse.
+Pre-read buffering uses Hyper's default HTTP/1 read-buffer bound; unrecognized
+framing passes to Hyper for validation without normalization.
+
+The standalone acceptance script uses a loopback TLS Ingress fixture, Execd
+tunnel-only listeners, and the Python SDK `TunnelClient`. It sends HTTP/1.0
+handshakes on the wire for control and application WebSockets, verifies
+connection reuse after tunneled HTTP, and checks `tunnel hello`, text, binary
+data, and ping/pong. With the Environment SDK dependencies and OpenSSL installed:
+
+```bash
+export CARGO_TARGET_DIR="$PWD/out/tunnel-http10-target"
+cargo build --locked -p adx-execd --bin adx-execd -j 2
+cargo build --locked -p data-plane-gateway --example tunnel_http10 -j 2
+EXECD_RUNTIME="$CARGO_TARGET_DIR/debug/adx-execd" \
+INGRESS_RUNTIME="$CARGO_TARGET_DIR/debug/examples/tunnel_http10" \
+PYTHONPATH=platform/sdk/environment/python \
+python3 gateway/tests/tunnel_http10_interop.py --output out/tunnel-http10
+```
+
+The script generates short-lived fixture certificates and writes handshake
+evidence to `result.json` inside the output directory. `--tls` accepts an
+existing directory containing `ca.pem`, `ingress.pem`, and `ingress.key`.
 
 For Grafana with the stripping route above, configure its external URL, for
 example `GF_SERVER_ROOT_URL=https://example.com/grafana/`, and its internal server
