@@ -2377,6 +2377,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_native_mkdir_and_list_reject_invalid_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        for action in ["file.mkdir", "file.make_dir", "file.list"] {
+            for input in [
+                serde_json::json!({}),
+                serde_json::json!({"path":""}),
+                serde_json::json!({"path":null}),
+                serde_json::json!({"path":42}),
+                serde_json::json!({"path":"/tmp/bad\u{0000}path"}),
+            ] {
+                let result = invoke_over_http_status(action, input, 400).await;
+                assert_eq!(result["error_code"], "INVALID_ARGUMENT");
+            }
+        }
+        for depth in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(100),
+            serde_json::json!("abc"),
+            serde_json::json!(true),
+            serde_json::json!(1.0),
+            serde_json::Value::Null,
+        ] {
+            let result = invoke_over_http_status(
+                "file.list",
+                serde_json::json!({"path":directory.path(),"depth":depth}),
+                400,
+            )
+            .await;
+            assert_eq!(result["error_code"], "INVALID_ARGUMENT");
+        }
+        let target = directory.path().join("missing/deep");
+        for recursive in [
+            serde_json::json!("false"),
+            serde_json::json!("aaa"),
+            serde_json::Value::Null,
+        ] {
+            let result = invoke_over_http_status(
+                "file.mkdir",
+                serde_json::json!({"path":target,"recursive":recursive}),
+                400,
+            )
+            .await;
+            assert_eq!(result["error_code"], "INVALID_ARGUMENT");
+            assert!(!directory.path().join("missing").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn http_native_mkdir_recursive_and_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        for action in ["file.mkdir", "file.make_dir"] {
+            let target = directory.path().join(action).join("nested");
+            invoke_over_http_status(
+                action,
+                serde_json::json!({"path":target,"recursive":false}),
+                400,
+            )
+            .await;
+            assert!(!target.parent().unwrap().exists());
+            let result = invoke_over_http(action, serde_json::json!({"path":target})).await;
+            assert_eq!(result["created"], true);
+            let result =
+                invoke_over_http(action, serde_json::json!({"path":target,"recursive":false}))
+                    .await;
+            assert_eq!(result["created"], false);
+        }
+    }
+
+    #[tokio::test]
     async fn command_wait_deadline_and_missing_kill_are_http_successes() {
         let command_id = format!("http-wait-deadline-{}", std::process::id());
         let start = std::collections::BTreeMap::from([

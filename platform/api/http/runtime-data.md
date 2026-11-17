@@ -29,17 +29,23 @@ Ingress 校验 API Key 与归属，Relay 核对运行时绑定，再转发给 Ex
 | `file.write` | `path`、`data`、可选 `binary` | 文件名称、路径、类型、大小、`error` |
 | `file.write_chunk` | `path`、十六进制 `data`、可选 `offset` | `bytes_written`、`offset`、`error`；offset=0 创建或截断 |
 | `file.read_chunk` | `path`、可选 `offset`、`limit` | 十六进制 `data`、`bytes_read`、`eof`、`error` |
-| `file.list` | `path`、可选 `depth` | `entries`、`error`；EntryInfo 含权限、大小、修改时间 |
+| `file.list` | `path`、可选整数 `depth`（1–64，缺省 1） | `entries`、`error`；EntryInfo 含权限、大小、修改时间 |
 | `file.search` | `path`，可选 `pattern`、`exclude_patterns`、`depth`、`max_results`、`max_entries`、`timeout_ms` | 按路径排序的 `entries`、`scanned_entries`、`error`；失败无部分结果 |
 | `file.exists` | `path` | `exists` |
 | `file.remove` | `path` | `error`；目录递归删除 |
 | `file.rename` | `old_path`、`new_path` | 新路径的 EntryInfo 与 `error` |
-| `file.make_dir` | `path` | `created`、`error`；创建缺失的父目录，已存在时 created=false |
+| `file.mkdir` / `file.make_dir` | `path`、可选布尔 `recursive`（缺省 true） | `created`、`error`；缺省创建缺失父目录；false 仅创建末级目录；已存在目录 created=false |
 | `file.stat` | `path` | EntryInfo 与 `error` |
 | `shell.create` | `session_id`、可选 `shell` | `error`；创建持久 PTY shell，默认 `/bin/bash` |
 | `shell.run` | `session_id`、`command`、兼容 `timeout` | 提交结果 `error`；之后 poll 读取执行结果 |
 | `shell.poll` | `session_id`、兼容 `wait_timeout` | `running`／`done`／`error`；完成时有输出与 exit_code |
 | `shell.close` | `session_id` | `error`；关闭 shell，重复关闭成功 |
+
+`file.list` 与 mkdir 的 `path` 必须是非空字符串且不含 NUL；合法的相对路径和带空格路径仍可使用。
+显式 `depth` 必须是 1–64 的整数，显式 `recursive` 必须是布尔值；null、字符串、错误类型、越界值
+和未声明字段返回 HTTP 400 与 `error_code: INVALID_ARGUMENT`，不访问文件系统，不静默改成默认值。
+mkdir 的默认递归行为保留；非递归模式父目录缺失时失败，并发创建同一目录只将实际创建者标记为 created。
+非递归创建要求使用支持 recursive=false 的 Runtime。
 
 ## 命令、cwd 与超时
 

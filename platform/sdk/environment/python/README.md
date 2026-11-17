@@ -888,6 +888,24 @@ SDK 0.1.0rc6 wakes command-watch subscriptions immediately when local waiters ch
 without a periodic receive timeout. Terminal events continue to trigger an authoritative
 result read; reconnects replay current command states.
 
+SDK 0.1.0rc9 validates mkdir/list paths and list depth before sending requests.
+Paths must be nonempty strings without NUL. Listing depth defaults to 1 and
+explicit values must be integers in 1–64; invalid values are not clamped.
+
+```python
+env.files.make_dir("/work/parents/leaf")                   # Recursive, unchanged default.
+env.files.make_dir("/work/parents/leaf", recursive=False)  # Parent must already exist.
+env.files.list("/work", depth=3)
+```
+
+The default mkdir request keeps its original wire format for older servers and
+AKernel callers. Explicit `recursive=False` is sent directly to `file.make_dir`
+and requires a Runtime that supports non-recursive creation. Runtime
+HTTP/auth/transport errors propagate.
+Existing directories return `False`, new directories return `True`, and a
+regular file at the target remains an error. Concurrent requests report only
+the actual creator as `True`. Runtime validation also covers direct HTTP callers.
+
 ## Portable workspace mounts
 
 For a runsc workspace backed by a host or Volume bind, callers may explicitly use

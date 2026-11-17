@@ -19,6 +19,30 @@ fn kw_i64(kw: &BTreeMap<String, Value>, key: &str) -> Option<i64> {
     kw.get(key).and_then(|v| v.as_i64())
 }
 
+fn invalid_argument(message: impl Into<String>) -> Value {
+    map_value(vec![
+        ("error_code", Value::from("INVALID_ARGUMENT")),
+        ("error", Value::from(message.into())),
+    ])
+}
+
+fn file_arguments(kw: &BTreeMap<String, Value>, allowed: &[&str]) -> Result<String, Value> {
+    if let Some(key) = kw.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(invalid_argument(format!(
+            "unsupported file argument: {key}"
+        )));
+    }
+    let Some(path) = kw_str(kw, "path") else {
+        return Err(invalid_argument("path must be a nonempty string"));
+    };
+    if path.is_empty() || path.contains('\0') {
+        return Err(invalid_argument(
+            "path must be a nonempty string without NUL",
+        ));
+    }
+    Ok(path)
+}
+
 fn decode_hex(data: &str) -> Result<Vec<u8>, String> {
     if !data.len().is_multiple_of(2) {
         return Err("hex data length must be even".to_string());
@@ -225,8 +249,17 @@ pub fn fs_read_chunk(kw: &BTreeMap<String, Value>) -> Value {
 
 /// fs_list → {entries: [EntryInfo], error}。
 pub fn fs_list(kw: &BTreeMap<String, Value>) -> Value {
-    let path = kw_str(kw, "path").unwrap_or_default();
-    let depth = kw_i64(kw, "depth").unwrap_or(1).clamp(1, 64) as usize;
+    let path = match file_arguments(kw, &["path", "depth"]) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let depth = match kw.get("depth") {
+        None => 1,
+        Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            Some(depth) if (1..=64).contains(&depth) => depth,
+            _ => return invalid_argument("depth must be an integer in 1..=64"),
+        },
+    };
     let mut entries = Vec::new();
     match collect_entries(Path::new(&path), depth, &mut entries) {
         Ok(()) => map_value(vec![("entries", Value::Array(entries)), ("error", nil())]),
@@ -297,17 +330,38 @@ pub fn fs_rename(kw: &BTreeMap<String, Value>) -> Value {
 
 /// fs_make_dir → {created, error}。
 pub fn fs_make_dir(kw: &BTreeMap<String, Value>) -> Value {
-    let path = kw_str(kw, "path").unwrap_or_default();
-    let existed = Path::new(&path).exists();
-    match fs::create_dir_all(&path) {
-        Ok(_) => map_value(vec![
-            ("created", Value::Boolean(!existed)),
-            ("error", nil()),
-        ]),
+    let path = match file_arguments(kw, &["path", "recursive"]) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let recursive = match kw.get("recursive") {
+        None => true,
+        Some(value) => match value.as_bool() {
+            Some(recursive) => recursive,
+            None => return invalid_argument("recursive must be a boolean"),
+        },
+    };
+    match make_directory(Path::new(&path), recursive) {
+        Ok(created) => map_value(vec![("created", Value::Boolean(created)), ("error", nil())]),
         Err(e) => map_value(vec![
             ("created", Value::Boolean(false)),
             ("error", err(e.to_string())),
         ]),
+    }
+}
+
+fn make_directory(path: &Path, recursive: bool) -> std::io::Result<bool> {
+    if recursive {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    match fs::create_dir(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {
+            Ok(false)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -392,5 +446,168 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    fn field(value: &Value, name: &str) -> Value {
+        let Value::Map(items) = value else {
+            panic!("expected response map: {value:?}");
+        };
+        items
+            .iter()
+            .find_map(|(key, value)| (key.as_str() == Some(name)).then(|| value.clone()))
+            .unwrap_or(Value::Nil)
+    }
+
+    #[test]
+    fn native_mkdir_and_list_reject_invalid_paths() {
+        for path in [
+            Value::Nil,
+            Value::from(""),
+            Value::from(7),
+            Value::from(true),
+            Value::from("/tmp/invalid\0path"),
+            Value::Array(vec![]),
+        ] {
+            let input = args(&[("path", path)]);
+            for result in [fs_make_dir(&input), fs_list(&input)] {
+                assert_eq!(
+                    field(&result, "error_code"),
+                    Value::from("INVALID_ARGUMENT"),
+                    "{result:?}"
+                );
+                assert!(!field(&result, "error").is_nil());
+            }
+        }
+        for result in [fs_make_dir(&args(&[])), fs_list(&args(&[]))] {
+            assert_eq!(
+                field(&result, "error_code"),
+                Value::from("INVALID_ARGUMENT")
+            );
+        }
+    }
+
+    #[test]
+    fn native_list_rejects_invalid_depth_instead_of_clamping() {
+        let directory = tempfile::tempdir().unwrap();
+        for depth in [
+            Value::from(0),
+            Value::from(-1),
+            Value::from(65),
+            Value::from(100),
+            Value::from("abc"),
+            Value::from("1"),
+            Value::from(true),
+            Value::from(1.0),
+            Value::Nil,
+        ] {
+            let result = fs_list(&args(&[
+                ("path", Value::from(directory.path().to_str().unwrap())),
+                ("depth", depth),
+            ]));
+            assert_eq!(
+                field(&result, "error_code"),
+                Value::from("INVALID_ARGUMENT"),
+                "{result:?}"
+            );
+        }
+        for depth in [1, 64] {
+            let result = fs_list(&args(&[
+                ("path", Value::from(directory.path().to_str().unwrap())),
+                ("depth", Value::from(depth)),
+            ]));
+            assert!(field(&result, "error").is_nil(), "{result:?}");
+        }
+    }
+
+    #[test]
+    fn native_file_actions_reject_unknown_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("not-created");
+        let input = args(&[
+            ("path", Value::from(target.to_str().unwrap())),
+            ("extra", Value::from(true)),
+        ]);
+        for result in [fs_make_dir(&input), fs_list(&input)] {
+            assert_eq!(
+                field(&result, "error_code"),
+                Value::from("INVALID_ARGUMENT")
+            );
+        }
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn native_mkdir_preserves_recursive_default_and_nonrecursive_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = root.join("missing/deep");
+        let input = args(&[
+            ("path", Value::from(path.to_str().unwrap())),
+            ("recursive", Value::from(false)),
+        ]);
+        assert!(!field(&fs_make_dir(&input), "error").is_nil());
+        assert!(!root.join("missing").exists());
+        let default = args(&[("path", Value::from(path.to_str().unwrap()))]);
+        assert_eq!(field(&fs_make_dir(&default), "created"), Value::from(true));
+        assert!(path.is_dir());
+        assert_eq!(field(&fs_make_dir(&input), "created"), Value::from(false));
+        let spaces = root.join("directory with spaces");
+        let input = args(&[
+            ("path", Value::from(spaces.to_str().unwrap())),
+            ("recursive", Value::from(false)),
+        ]);
+        assert_eq!(field(&fs_make_dir(&input), "created"), Value::from(true));
+        let file = root.join("regular");
+        fs::write(&file, b"keep").unwrap();
+        let input = args(&[("path", Value::from(file.to_str().unwrap()))]);
+        assert!(!field(&fs_make_dir(&input), "error").is_nil());
+        assert_eq!(fs::read(&file).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn native_mkdir_rejects_invalid_recursive_without_creating_parents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing/deep");
+        for recursive in [
+            Value::Nil,
+            Value::from("false"),
+            Value::from("aaa"),
+            Value::from(0),
+        ] {
+            let result = fs_make_dir(&args(&[
+                ("path", Value::from(path.to_str().unwrap())),
+                ("recursive", recursive),
+            ]));
+            assert_eq!(
+                field(&result, "error_code"),
+                Value::from("INVALID_ARGUMENT")
+            );
+            assert!(!directory.path().join("missing").exists());
+        }
+    }
+
+    #[test]
+    fn native_mkdir_concurrent_creation_reports_one_creator() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("parents/leaf");
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    fs_make_dir(&args(&[("path", Value::from(path.to_str().unwrap()))]))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut created = 0;
+        for worker in workers {
+            let result = worker.join().unwrap();
+            assert!(field(&result, "error").is_nil(), "{result:?}");
+            created += usize::from(field(&result, "created").as_bool().unwrap());
+        }
+        assert_eq!(created, 1);
+        assert!(path.is_dir());
     }
 }
