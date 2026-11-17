@@ -290,7 +290,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `meta_etcd_endpoints` | 产品差异 | Meta | 无 | `etcd` 后端的 endpoint 列表（CLI 逗号分隔），仅且必须与 `meta_store = "etcd"` 同用 |
 | `meta_etcd_max_request_bytes` | 产品差异 | Meta | `1572864` | 与 etcd 服务端 `--max-request-bytes` 一致；限制单次原子追加、checkpoint 分块与大记录分段，256KiB..=1GiB |
 | `meta_store_prefix` | 产品差异 | Meta | `afs/meta` | `redis`／`etcd` 后端的 key 前缀，1..=128 个可打印 ASCII，不含空格、`*?[]\\`，不以 `/` 结尾 |
-| `advertise_endpoint` | 产品差异 | Node | 无 | 对外发布的本 Node gRPC URI；未设时由 `grpc_listen` 推导，监听 `0.0.0.0` 时必须显式指定 |
+| `advertise_endpoint` | 产品差异 | Node | 无 | 对外发布的本 Node gRPC URI，必须带 scheme。开启 `tls_encryption_enabled` 时用 `https://`：对端按这个地址拨号，而 scheme 决定是否真的握手；未设时由 `grpc_listen` 推导，监听 `0.0.0.0` 时必须显式指定 |
 | `tls_encryption_enabled` | 产品差异 | 两者 | `false` | mTLS 认证之后是否加密内部流量 |
 | `tls_ca_certificate` | 产品差异 | 两者 | 无 | 内部 mTLS 的 CA 证书路径 |
 | `tls_identity_certificate` | 产品差异 | 两者 | 无 | 本进程身份证书路径 |
