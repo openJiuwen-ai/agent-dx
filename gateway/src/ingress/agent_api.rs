@@ -212,6 +212,42 @@ impl AgentApi {
             ));
         }
         let managed = &self.managed;
+        if let ["prewarm", product] = path.as_slice() {
+            use adx_agent_core::prewarm::{PolicyScope, PolicyUpdate};
+            let scope = PolicyScope {
+                tenant: tenant.into(),
+                product: segment(product)?,
+            };
+            return match parts.method {
+                http::Method::GET => {
+                    Ok(serde_json::json!({"prewarm": managed.prewarm_policy(ctx, &scope).await?}))
+                }
+                http::Method::PUT => {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Input {
+                        expected_revision: Option<String>,
+                        enabled: bool,
+                        template: String,
+                        version: String,
+                        validation_ref: String,
+                    }
+                    let input: Input = decode_body(body).await?;
+                    let update = PolicyUpdate {
+                        scope,
+                        expected_revision: input.expected_revision,
+                        enabled: input.enabled,
+                        template: input.template,
+                        version: input.version,
+                        validation_ref: input.validation_ref,
+                    };
+                    Ok(
+                        serde_json::json!({"prewarm": managed.update_prewarm_policy(ctx, &update).await?}),
+                    )
+                }
+                _ => Err(Error::NotFound),
+            };
+        }
         if path == ["templates"] && parts.method == http::Method::POST {
             let input: adx_agent_core::TemplateDraft = decode_body(body).await?;
 

@@ -13,6 +13,13 @@ use std::{sync::Arc, time::Duration};
 /// authenticates the caller before passing its tenant to this private interface.
 #[async_trait]
 pub trait EnvironmentApplication: Send + Sync {
+    async fn snapshot_metadata(
+        &self,
+        _tenant: &str,
+        _id: &str,
+    ) -> Result<Option<Value>, EnvironmentError> {
+        Ok(None)
+    }
     async fn ensure_volume_request(
         &self,
         _tenant: &str,
@@ -80,6 +87,23 @@ impl LocalEnvironment {
 }
 #[async_trait]
 impl Environment for LocalEnvironment {
+    async fn golden_available(
+        &self,
+        tenant: &str,
+        id: &str,
+        image: &str,
+        runtime: &str,
+    ) -> Result<bool, EnvironmentError> {
+        let metadata =
+            tokio::time::timeout(self.timeout, self.application.snapshot_metadata(tenant, id))
+                .await
+                .map_err(|_| {
+                    EnvironmentError::Unavailable("snapshot metadata timed out".into())
+                })??;
+        Ok(metadata
+            .as_ref()
+            .is_some_and(|value| environment_request::matches_golden(value, id, image, runtime)))
+    }
     async fn ensure_volume(
         &self,
         tenant: &str,

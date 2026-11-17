@@ -120,6 +120,7 @@ pub(crate) struct ScopedIdentity<'a> {
 pub struct Principal {
     pub user_id: String,
     pub expires_at: i64,
+    pub(crate) registered_at_ms: Option<u64>,
     pub(crate) token_digest: String,
 }
 /// Called by DigitalMateGateway only. Production has no fixed-user or anonymous implementation.

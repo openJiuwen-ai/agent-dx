@@ -144,17 +144,32 @@ impl ApplicationWsConfig {
             async move { guard.watch().await }
         });
         #[cfg(unix)]
-        let privacy_scope = scope.clone();
+        let uses_privacy_model = privacy.as_ref().is_some_and(|access| {
+            access.identity.targets(&self.template) && access.model_configuration.is_some()
+        });
+        #[cfg(not(unix))]
+        let uses_privacy_model = false;
+        let product_start = matches!(application, Application::DigitalMate).then(|| {
+            adx_agent_core::prewarm::EligibleStart {
+                product: application.name().into(),
+                registered_at_ms: if uses_privacy_model {
+                    principal.registered_at_ms
+                } else {
+                    None
+                },
+            }
+        });
         let access = AgentV2Access::new(managed);
         let admission = async {
             let selection = access
-                .select_with_initializer(
+                .select_initialized(
                     context,
                     scope,
                     ServiceSelector {
                         protocol: Protocol::Ws,
                         port: Some(self.service_port),
                     },
+                    product_start.as_ref(),
                     async {
                         let workspace = super::entrypoint::workspace_parameters(
                             tenant,
@@ -164,7 +179,11 @@ impl ApplicationWsConfig {
                         .map_err(|_| crate::ingress::accounts::Error::Invalid)?;
                         // Login registration and template injection coexist during migration.
                         // Existing bindings still skip this lazy initializer on reconnect.
-                        let mut parameters = auth.model_parameters(&principal).await?;
+                        let mut parameters = if uses_privacy_model {
+                            Default::default()
+                        } else {
+                            auth.model_parameters(&principal).await?
+                        };
                         parameters.extend(workspace);
                         Ok(parameters)
                     },
@@ -174,7 +193,9 @@ impl ApplicationWsConfig {
                     InitializationError::Agent(e) => agent_error(e),
                     InitializationError::Source(e) => auth_error(e),
                 })?;
-            access
+            let binding_scope = selection.binding_scope().clone();
+            let workspace = selection.workspace().map(str::to_owned);
+            let stream = access
                 .connect_service_when_ready(&ingress, selection)
                 .await
                 .map_err(|e| match e {
@@ -182,14 +203,25 @@ impl ApplicationWsConfig {
                     ServiceAccessError::Ingress(_) => {
                         error(StatusCode::BAD_GATEWAY, "AGENT_SERVER_UNAVAILABLE")
                     }
-                })
+                })?;
+            Ok((stream, binding_scope, workspace))
         };
-        let stream = tokio::select! {
+        let (stream, privacy_scope, workspace) = tokio::select! {
             biased;
             _ = &mut session => return end_response(End::Session),
             _ = tokio::time::sleep_until(deadline) => return error(StatusCode::GATEWAY_TIMEOUT, "AGENT_SERVER_UNAVAILABLE"),
             result = admission => match result { Ok(value) => value, Err(response) => return response },
         };
+        #[cfg(unix)]
+        if uses_privacy_model
+            && privacy
+                .as_ref()
+                .is_some_and(|access| !access.identity.targets(&privacy_scope.template))
+        {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "PRIVACY_UNAVAILABLE");
+        }
+        #[cfg(not(unix))]
+        let _ = (privacy_scope, workspace);
         let route = stream.cancellation();
         tokio::select! {
             biased;
@@ -234,17 +266,9 @@ impl ApplicationWsConfig {
         #[cfg(unix)]
         if let Some(identity) = privacy
             .as_ref()
-            .filter(|access| access.identity.targets(&self.template))
+            .filter(|access| access.identity.targets(&privacy_scope.template))
         {
-            let workspace = match super::entrypoint::workspace_parameters(
-                tenant,
-                &self.template,
-                &principal.user_id,
-            ) {
-                Ok(values) => values,
-                Err(error) => return agent_error(error),
-            };
-            let Some(workspace) = workspace.get("workspace") else {
+            let Some(workspace) = workspace.as_deref() else {
                 return error(StatusCode::BAD_GATEWAY, "PRIVACY_UNAVAILABLE");
             };
             let credentials = match tokio::time::timeout_at(deadline, async {

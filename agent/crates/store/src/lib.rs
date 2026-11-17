@@ -14,6 +14,7 @@ pub use state::AgentState;
 mod aliases;
 #[cfg(feature = "test-memory")]
 mod memory;
+mod prewarm;
 #[cfg(feature = "test-memory")]
 pub use memory::MemoryRepository;
 
@@ -62,7 +63,13 @@ impl Key {
     pub fn new(kind: &str, parts: &[&str]) -> Result<Self> {
         if !matches!(
             kind,
-            "template" | "template-sequence" | "binding" | "binding-launch" | "alias"
+            "template"
+                | "template-sequence"
+                | "binding"
+                | "binding-launch"
+                | "alias"
+                | "prewarm-policy"
+                | "first-assignment"
         ) || parts.is_empty()
             || parts.iter().any(|s| s.is_empty() || s.len() > 2048)
         {

@@ -56,6 +56,12 @@ the saved limit; it must not become the smaller scheduling request. Explicit
 positive limits remain subject to runtime compatibility and request validation.
 Fresh creation retains the existing zero-limit behavior of following its request.
 
+On `POST /api/environment/v1/environments/{id}/snapshots`, the optional JSON
+`kind` is `regular` (default) or `golden`. The source Environment must be
+owned by the caller. The caller is responsible for keeping tenant/user state
+out of any checkpoint intended for reuse across users. The kind classifies
+the resulting reusable snapshot; it does not scrub its contents.
+
 `inheritEntrypoint=true` is a fresh-create option, not a snapshot override.
 Combining it with `snapshotId` is rejected with HTTP 400, matching the native
 Python SDK. For snapshot restores, omit it or supply `false`: neither disables

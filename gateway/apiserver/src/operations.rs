@@ -210,6 +210,11 @@ impl Operations {
         {
             return Err(Status::invalid_argument("snapshot name cannot be blank"));
         }
+        let snapshot_kind = if kind == Kind::Snapshot {
+            capture_kind(&body)?
+        } else {
+            pb::SnapshotKind::Regular
+        };
         let clients = &self.clients;
         // Workload checkpoint acknowledges publication before the directory watch
         // necessarily catches up. Reload must start from the committed revision.
@@ -379,7 +384,7 @@ impl Operations {
                                 vec![name.into()]
                             },
                             timeout_seconds: seconds,
-                            kind: pb::SnapshotKind::Regular as i32,
+                            kind: snapshot_kind as i32,
                         })),
                     )
                     .await
@@ -602,9 +607,32 @@ pub fn snapshot_value(
     }))
 }
 
+fn capture_kind(body: &Value) -> Result<pb::SnapshotKind, Status> {
+    match body.get("kind").map(Value::as_str) {
+        None | Some(Some("regular")) => Ok(pb::SnapshotKind::Regular),
+        Some(Some("golden")) => Ok(pb::SnapshotKind::Golden),
+        _ => Err(Status::invalid_argument("invalid snapshot kind")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_capture_kind_defaults_to_regular_and_rejects_invalid_values() {
+        assert_eq!(capture_kind(&json!({})).unwrap(), pb::SnapshotKind::Regular);
+        assert_eq!(
+            capture_kind(&json!({"kind":"golden"})).unwrap(),
+            pb::SnapshotKind::Golden
+        );
+        for kind in [json!(null), json!(true), json!("unknown")] {
+            assert_eq!(
+                capture_kind(&json!({"kind":kind})).unwrap_err().code(),
+                Code::InvalidArgument
+            );
+        }
+    }
 
     #[test]
     fn snapshot_summary_exposes_metadata_without_private_capture_inputs() {

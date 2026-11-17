@@ -10,8 +10,9 @@ use adx_agent_core::environment::{
 };
 pub use adx_agent_core::error::{Error, Result};
 use adx_agent_core::{
-    activator::Target, AgentBinding, BindingPhase, EnvironmentRef, Scope, SecondaryIntent,
-    TemplateVersion,
+    activator::{ActivationRequest, Target},
+    prewarm::{PolicyScope, PolicySnapshot, PolicyUpdate},
+    AgentBinding, BindingPhase, EnvironmentRef, Scope, SecondaryIntent, TemplateVersion,
 };
 use adx_agent_store::AgentState;
 use hashlink::LinkedHashMap;
@@ -295,15 +296,55 @@ impl Activator {
         tenant: &str,
         template: &adx_agent_core::TemplateDraft,
     ) -> Result<TemplateVersion> {
+        template.validate().map_err(Error::Invalid)?;
         let snapshot = template.with_version("1".into());
         let mut execution: adx_agent_core::environment::ExecutionSpec = (&snapshot).into();
         // Mount syntax is checked at publication; concrete paths require Binding parameters.
         execution.mounts.clear();
         self.environment.validate_execution(&execution)?;
+        if snapshot.prewarm_recipe.is_some() && !self.golden_available(tenant, &snapshot).await? {
+            return Err(Error::Invalid(
+                "Golden snapshot is not ready or compatible".into(),
+            ));
+        }
         self.state
             .publish(tenant, template)
             .await
             .map_err(Into::into)
+    }
+    pub async fn prewarm_policy(&self, scope: &PolicyScope) -> Result<Option<PolicySnapshot>> {
+        Ok(self.state.prewarm_policy(scope).await?)
+    }
+    pub async fn update_prewarm_policy(&self, request: &PolicyUpdate) -> Result<PolicySnapshot> {
+        request.validate().map_err(Error::Invalid)?;
+        if request.enabled {
+            let template = self
+                .template(&request.scope.tenant, &request.template, &request.version)
+                .await?;
+            if !self
+                .golden_available(&request.scope.tenant, &template)
+                .await?
+            {
+                return Err(Error::Invalid(
+                    "Golden snapshot is not ready or compatible".into(),
+                ));
+            }
+        }
+        Ok(self.state.update_prewarm_policy(request).await?)
+    }
+    async fn golden_available(&self, tenant: &str, template: &TemplateVersion) -> Result<bool> {
+        let Some(recipe) = &template.prewarm_recipe else {
+            return Ok(false);
+        };
+        Ok(self
+            .environment
+            .golden_available(
+                tenant,
+                &recipe.snapshot_id,
+                &template.image,
+                &template.isolation_runtime,
+            )
+            .await?)
     }
     pub async fn alias_config(
         &self,
@@ -372,14 +413,7 @@ impl Activator {
     ) -> Result<adx_agent_core::activator::ResolvedTarget> {
         let activation = &request.activation;
         let target = self
-            .activate_selected(
-                &activation.scope,
-                activation.expected_generation.as_deref(),
-                deadline,
-                activation.bypass_cache,
-                activation.parameters.as_deref(),
-                Some(request.service),
-            )
+            .activate_selected(activation, deadline, Some(request.service))
             .await?;
         let port = request
             .service
@@ -459,31 +493,41 @@ impl Activator {
         parameters: Option<&[u8]>,
     ) -> Result<Target> {
         self.activate_selected(
-            scope,
-            expected_generation,
+            &ActivationRequest {
+                scope: scope.clone(),
+                expected_generation: expected_generation.map(str::to_owned),
+                bypass_cache,
+                parameters: parameters.map(<[u8]>::to_vec),
+                product_start: None,
+            },
             deadline_unix_ms,
-            bypass_cache,
-            parameters,
             None,
         )
         .await
     }
     async fn activate_selected(
         &self,
-        scope: &Scope,
-        expected_generation: Option<&str>,
+        request: &ActivationRequest,
         deadline_unix_ms: u64,
-        bypass_cache: bool,
-        parameters: Option<&[u8]>,
         service: Option<adx_agent_core::activator::ServiceSelector>,
     ) -> Result<Target> {
+        let canonical = match &request.product_start {
+            Some(subject) => {
+                self.state
+                    .product_binding_scope(&request.scope, subject)
+                    .await?
+            }
+            None => request.scope.clone(),
+        };
+        let scope = &canonical;
+        let expected_generation = request.expected_generation.as_deref();
         scope.validate().map_err(Error::Invalid)?;
         let attempt = {
             let mut bindings = self.bindings.lock().await;
             let subscription_ready = self
                 .subscription_ready
                 .load(std::sync::atomic::Ordering::Acquire);
-            if !bypass_cache
+            if !request.bypass_cache
                 && (subscription_ready
                     || matches!(scope.template_ref, adx_agent_core::TemplateRef::Version(_)))
             {
@@ -536,8 +580,10 @@ impl Activator {
                 if let Some(service) = service {
                     service.select(&template.service).map_err(Error::Invalid)?;
                 }
-                let parameters = adx_agent_core::parameters::parse(parameters.unwrap_or_default())
-                    .map_err(Error::Invalid)?;
+                let parameters = adx_agent_core::parameters::parse(
+                    request.parameters.as_deref().unwrap_or_default(),
+                )
+                .map_err(Error::Invalid)?;
                 let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
                 execution.mounts = template
                     .render_mounts(&parameters)
@@ -545,11 +591,47 @@ impl Activator {
                 execution.env = template.render_env(&parameters).map_err(Error::Invalid)?;
                 creation::definitions(&template, &parameters, &execution.mounts)?;
                 self.environment.validate_execution(&execution)?;
-                self.state
-                    .create_binding_with_parameters(scope.clone(), &parameters)
-                    .await?
+                if let Some(subject) = &request.product_start {
+                    let rollout = self
+                        .state
+                        .prewarm_policy(&PolicyScope {
+                            tenant: scope.tenant.clone(),
+                            product: subject.product.clone(),
+                        })
+                        .await?;
+                    let checked = if let (Some(rollout), Some(recipe)) =
+                        (rollout, template.prewarm_recipe.as_ref())
+                    {
+                        if rollout.policy.allows(subject)
+                            && rollout.policy.template == template.name
+                            && rollout.policy.version == template.version
+                        {
+                            let check = tokio::time::timeout(
+                                std::cmp::min(
+                                    Duration::from_millis(500),
+                                    adx_agent_core::transport::remaining_time(deadline_unix_ms),
+                                ),
+                                self.golden_available(&scope.tenant, &template),
+                            )
+                            .await;
+                            matches!(check, Ok(Ok(true))).then_some(recipe.snapshot_id.as_str())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    self.state
+                        .create_product_binding(scope.clone(), &parameters, subject, checked)
+                        .await?
+                } else {
+                    self.state
+                        .create_binding_with_parameters(scope.clone(), &parameters)
+                        .await?
+                }
             }
         };
+        let scope = &binding.scope;
         if expected_generation.is_some_and(|generation| generation != binding.generation) {
             return Err(Error::Conflict(
                 "selected AgentBinding lifecycle changed".into(),
@@ -571,6 +653,17 @@ impl Activator {
         execution.env = template
             .render_env(&binding.parameters)
             .map_err(Error::Invalid)?;
+        if let Some(id) = &binding.current.snapshot_id {
+            let recipe = template
+                .prewarm_recipe
+                .as_ref()
+                .filter(|recipe| &recipe.snapshot_id == id)
+                .ok_or_else(|| {
+                    Error::Conflict("committed Golden recipe no longer matches template".into())
+                })?;
+            execution.snapshot_id = Some(id.clone());
+            execution.env.extend(recipe.restore_env.clone());
+        }
         self.environment.validate_execution(&execution)?;
         let volumes = creation::definitions(&template, &binding.parameters, &execution.mounts)?;
         let observed = self

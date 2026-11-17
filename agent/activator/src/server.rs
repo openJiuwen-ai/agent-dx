@@ -81,6 +81,8 @@ pub fn router(activator: Arc<Activator>, token: &str, timeout: Duration) -> Resu
         .route("/internal/adx/v1/templates/get", post(template))
         .route("/internal/adx/v1/aliases/get", post(alias))
         .route("/internal/adx/v1/aliases/put", post(update_alias))
+        .route("/internal/adx/v1/prewarm/get", post(prewarm_policy))
+        .route("/internal/adx/v1/prewarm/put", post(update_prewarm_policy))
         .route("/internal/adx/v1/bindings/get", post(binding))
         .route("/internal/adx/v1/bindings/list", post(bindings))
         .route("/internal/adx/v1/bindings/delete", post(delete))
@@ -140,6 +142,26 @@ async fn binding(State(s): State<Service>, Json(r): Json<ScopeRequest>) -> Respo
     match s.activator.binding(&r.scope).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => failure(e),
+    }
+}
+async fn prewarm_policy(
+    State(s): State<Service>,
+    Json(scope): Json<adx_agent_core::prewarm::PolicyScope>,
+) -> Response {
+    match s.activator.prewarm_policy(&scope).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn update_prewarm_policy(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(request): Json<adx_agent_core::prewarm::PolicyUpdate>,
+) -> Response {
+    p.start_write();
+    match s.activator.update_prewarm_policy(&request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
     }
 }
 async fn bindings(State(s): State<Service>, Json(r): Json<BindingList>) -> Response {

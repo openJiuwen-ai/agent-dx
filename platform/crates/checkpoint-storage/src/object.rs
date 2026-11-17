@@ -495,8 +495,16 @@ impl CheckpointAccess for ObjectCheckpointStore {
         self.validate(artifact)?;
         let _operation = self.operation(&artifact.location).await;
         if let Some(files) = self.cached(artifact).await? {
+            adx_observability::info!(
+                event = "checkpoint_restore_cache", artifact = %artifact.location,
+                cache_hit = true, size_bytes = artifact.size_bytes, "checkpoint cache hit"
+            );
             return Ok(files);
         }
+        adx_observability::info!(
+            event = "checkpoint_restore_cache", artifact = %artifact.location,
+            cache_hit = false, size_bytes = artifact.size_bytes, "checkpoint cache miss"
+        );
         let manifest = self.manifest(artifact).await?;
         let path = self.cache_root.join(&artifact.location);
         // Failed/canceled downloads are never visible as completed cache entries.

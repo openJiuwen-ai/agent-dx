@@ -49,6 +49,7 @@ impl BusinessAuth for Auth {
         Ok(Principal {
             user_id: "alice".into(),
             expires_at: i64::MAX,
+            registered_at_ms: None,
             token_digest: "synthetic".into(),
         })
     }

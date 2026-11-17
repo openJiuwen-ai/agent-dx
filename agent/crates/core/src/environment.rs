@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 pub struct ExecutionSpec {
     pub image: String,
     pub isolation_runtime: String,
-    /// Managed Agent execution inherits the image process. Internal runtime profiles may use explicit startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    /// Managed Agent execution inherits the captured or image process.
     #[serde(default)]
     pub inherit_entrypoint: bool,
     /// Empty for image inheritance or an idle environment.
@@ -40,6 +42,7 @@ impl From<&TemplateVersion> for ExecutionSpec {
         Self {
             image: value.image.clone(),
             isolation_runtime: value.isolation_runtime.clone(),
+            snapshot_id: None,
             inherit_entrypoint: true,
             entrypoint: vec![],
             working_dir: String::new(),
@@ -62,6 +65,7 @@ impl ExecutionSpec {
             version: "1".into(),
             image: self.image.clone(),
             isolation_runtime: self.isolation_runtime.clone(),
+            prewarm_recipe: None,
             env: self.env.clone(),
             resources: self.resources.clone(),
             lifecycle: self.lifecycle.clone(),
@@ -174,6 +178,16 @@ pub struct EnvironmentInfo {
 }
 #[async_trait]
 pub trait Environment: Send + Sync {
+    /// Returns whether the tenant can currently use this fixed Golden input.
+    async fn golden_available(
+        &self,
+        _tenant: &str,
+        _snapshot_id: &str,
+        _image: &str,
+        _runtime: &str,
+    ) -> Result<bool, EnvironmentError> {
+        Ok(false)
+    }
     async fn ensure_volume(
         &self,
         _tenant: &str,

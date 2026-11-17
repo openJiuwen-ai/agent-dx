@@ -1002,6 +1002,14 @@ Configure a tenant-specific mount root when user IDs are not globally unique.
 its `userId` without starting an Environment. It follows DigitalMateGateway's
 business authentication; management API keys remain separate from business sessions.
 
+An authenticated DigitalMate WebSocket supplies the account registration time
+from account storage to Activator's product start selection. User HTTP or
+WebSocket input cannot choose the registration time or a snapshot. When named
+Privacy model configuration is configured for this entry, DigitalMate reads
+its own model credentials through Privacy; the gateway does not copy model
+keys into the Binding initializer. Fixed Golden enablement remains an explicit,
+tenant-scoped Agent management action.
+
 命令状态订阅 `/api/environment/v1/commands/watch` 在已配置 Execd access 时，会在后端 WebSocket 握手前检查 Environment 归属并注入服务端 Execd 令牌；调用方的业务凭据不会转发给 Execd。该认证与 `/direct` HTTP 路径共用同一配置。
 
 

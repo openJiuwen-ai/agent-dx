@@ -21,6 +21,9 @@ pub struct ActivationRequest {
     /// Raw form-encoded initialization. Parsed only when this Binding is absent.
     #[serde(default)]
     pub parameters: Option<Vec<u8>>,
+    /// From a trusted business gateway, never from the public Binding resolve body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_start: Option<crate::prewarm::EligibleStart>,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

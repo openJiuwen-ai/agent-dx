@@ -67,6 +67,21 @@ impl LocalControl {
 
 #[async_trait]
 impl Control for LocalControl {
+    async fn prewarm_policy(
+        &self,
+        _ctx: &RequestContext,
+        scope: &adx_agent_core::prewarm::PolicyScope,
+    ) -> Result<Option<adx_agent_core::prewarm::PolicySnapshot>> {
+        self.activator.prewarm_policy(scope).await
+    }
+    async fn update_prewarm_policy(
+        &self,
+        ctx: &RequestContext,
+        update: &adx_agent_core::prewarm::PolicyUpdate,
+    ) -> Result<adx_agent_core::prewarm::PolicySnapshot> {
+        ctx.start_write();
+        self.activator.update_prewarm_policy(update).await
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,

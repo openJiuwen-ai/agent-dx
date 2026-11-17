@@ -11,6 +11,7 @@ pub mod limits;
 pub mod mounts;
 pub mod network;
 pub mod parameters;
+pub mod prewarm;
 pub mod probes;
 pub mod target;
 pub mod transport;
@@ -181,6 +182,9 @@ pub struct TemplateDraft {
     pub name: String,
     pub image: String,
     pub isolation_runtime: String,
+    /// Optional verified restore recipe. Selecting it requires a product start decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prewarm_recipe: Option<prewarm::PrewarmRecipe>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub resources: Resources,
@@ -210,6 +214,8 @@ pub struct TemplateVersion {
     pub version: String,
     pub image: String,
     pub isolation_runtime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prewarm_recipe: Option<prewarm::PrewarmRecipe>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub resources: Resources,
@@ -243,6 +249,7 @@ impl TemplateDraft {
             name: self.name.clone(),
             image: self.image.clone(),
             isolation_runtime: self.isolation_runtime.clone(),
+            prewarm_recipe: self.prewarm_recipe.clone(),
             env: self.env.clone(),
             resources: self.resources.clone(),
             lifecycle: self.lifecycle.clone(),
@@ -261,6 +268,7 @@ impl From<&TemplateVersion> for TemplateDraft {
             name: template.name.clone(),
             image: template.image.clone(),
             isolation_runtime: template.isolation_runtime.clone(),
+            prewarm_recipe: template.prewarm_recipe.clone(),
             env: template.env.clone(),
             resources: template.resources.clone(),
             lifecycle: template.lifecycle.clone(),
@@ -323,6 +331,9 @@ impl TemplateVersion {
             ("isolation_runtime", &self.isolation_runtime),
         ] {
             identifier(value, label)?;
+        }
+        if let Some(recipe) = &self.prewarm_recipe {
+            recipe.validate(&self.image)?;
         }
         for (key, value) in &self.env {
             parameters::render(value, None)?;
@@ -416,12 +427,16 @@ pub struct CreationAttempt {
 pub struct EnvironmentRef {
     pub version: String,
     pub environment_id: String,
+    /// Fixed by the first committed start decision. Later lifecycle moves default to cold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
 }
 impl EnvironmentRef {
     pub fn new(version: String, environment_id: String) -> Self {
         Self {
             version,
             environment_id,
+            snapshot_id: None,
         }
     }
 }

@@ -22,6 +22,12 @@ Gateway 对同一次请求的目标失效重试强制绕过 Activator 的成功�
 
 Agent 模板使用业务镜像的 ENTRYPOINT/CMD、WORKDIR 和 USER，不接受 `entrypoint` 或 `working_dir` 覆盖。创建规格设置 `inherit_entrypoint=true`；Platform 注入部署侧 runtime 并生成进程配置，Execd 据此启动业务进程。业务镜像不需要预装 Execd 或额外进程 JSON。模板工作目录覆盖暂不支持；可通过 mounts 声明 Local bind 挂载。
 
+固定 Golden 的模板版本可选 `prewarm_recipe`，字段为 `snapshot_id`、`image_digest`、`restore_profile_digest`、`handoff_contract_version` 和可选 `restore_env`。模板镜像必须为与配方一致的 digest 引用。快照就绪、同租户、相同镜像和运行时由 Platform 元数据检查，运行资源和其余恢复兼容性仍由 Platform 在创建时校验。运维提供恢复规格与用户隔离的验收回执；发布模板不会自动启用。
+
+由已认证的 DigitalMate Gateway 提供产品主体与账号注册事实。管理面 `GET /api/agent/v2/prewarm/{product}` 读取当前 tenant 对应策略，`PUT` 接收 `{enabled,template,version,validation_ref,expected_revision}`，使用原租户管理鉴权、版本 CAS 和显式启停。首次启用切点保留；目标版本必须同时是该入口为新主体选中的模板版本。部署启用前，须确认所有该产品账号的工作区分配都由同一权威路径记录，包括已有导入数据。普通 Agent 入口不能提供产品资格信息。
+
+首次分配、Binding 和启动选择在一次事务中提交，记录跨模板引用保留。在 Platform 创建前查不到可用 Golden 时，选择普通创建；提交后未知结果始终按原 Environment、卷和操作身份处理。恢复继承捕获的 rootfs 和探针，仅在新启动时发送镜像和启动探针。管理员须保留仍被已提交决议引用的制品。此路径当前以隔离环境验证为门槛。
+
 ```json
 {"name":"assistant","image":"registry.example/assistant:v1","isolation_runtime":"runc","env":{"APP_MODE":"production"},"resources":{"cpu_millis":1000,"memory_mib":1024},"service":[{"protocol":"ws","port":8080}]}
 ```

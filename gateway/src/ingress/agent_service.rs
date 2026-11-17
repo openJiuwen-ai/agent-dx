@@ -32,8 +32,16 @@ pub struct ServiceSelection {
     generation: String,
     retried: bool,
     parameters: Option<Vec<u8>>,
+    product_selected: bool,
+    workspace: Option<String>,
 }
 impl ServiceSelection {
+    pub(crate) fn binding_scope(&self) -> &Scope {
+        &self.scope
+    }
+    pub(crate) fn workspace(&self) -> Option<&str> {
+        self.workspace.as_deref()
+    }
     pub(crate) fn deadline(&self) -> tokio::time::Instant {
         self.context.deadline()
     }
@@ -106,6 +114,8 @@ impl AgentV2Access {
             generation: target.binding.generation,
             retried: false,
             parameters: parameters.map(<[u8]>::to_vec),
+            product_selected: false,
+            workspace: target.binding.parameters.get("workspace").cloned(),
         })
     }
 
@@ -115,6 +125,21 @@ impl AgentV2Access {
         context: Arc<RequestContext>,
         scope: Scope,
         selector: ServiceSelector,
+        initializer: F,
+    ) -> Result<ServiceSelection, InitializationError<E>>
+    where
+        F: std::future::Future<Output = Result<adx_agent_core::mounts::Parameters, E>>,
+    {
+        self.select_initialized(context, scope, selector, None, initializer)
+            .await
+    }
+
+    pub(crate) async fn select_initialized<F, E>(
+        &self,
+        context: Arc<RequestContext>,
+        scope: Scope,
+        selector: ServiceSelector,
+        subject: Option<&adx_agent_core::prewarm::EligibleStart>,
         initializer: F,
     ) -> Result<ServiceSelection, InitializationError<E>>
     where
@@ -135,6 +160,34 @@ impl AgentV2Access {
             }
             Err(error) => return Err(InitializationError::Agent(error)),
         };
+        if let Some(subject) = subject {
+            let (target, port) = context
+                .run(self.managed.resolve_product(
+                    &context,
+                    &scope,
+                    adx_agent_core::activator::ServiceSelector {
+                        protocol: selector.protocol,
+                        port: selector.port,
+                    },
+                    parameters.as_deref(),
+                    subject,
+                ))
+                .await
+                .map_err(InitializationError::Agent)?;
+            return Ok(ServiceSelection {
+                context,
+                scope: target.binding.scope,
+                protocol: selector.protocol,
+                port,
+                requested_port: selector.port,
+                environment_id: target.binding.current.environment_id,
+                generation: target.binding.generation,
+                retried: false,
+                parameters,
+                product_selected: true,
+                workspace: target.binding.parameters.get("workspace").cloned(),
+            });
+        }
         self.select_with_parameters(context, scope, selector, parameters.as_deref())
             .await
             .map_err(InitializationError::Agent)
@@ -158,7 +211,9 @@ impl AgentV2Access {
             ))
             .await;
         let (target, port) = match resolved {
-            Err(error @ Error::Conflict(_)) if selection.protocol == Protocol::Ws => {
+            Err(error @ Error::Conflict(_))
+                if selection.protocol == Protocol::Ws && !selection.product_selected =>
+            {
                 let changed = match selection
                     .context
                     .run(self.managed.binding(&selection.context, &selection.scope))

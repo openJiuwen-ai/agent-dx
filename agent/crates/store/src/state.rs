@@ -225,6 +225,51 @@ impl AgentState {
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
+        self.create_binding_with_decision(scope, parameters, None, None)
+            .await
+    }
+
+    /// First assignment and Binding are committed together; no Platform effects occur here.
+    pub async fn create_product_binding(
+        &self,
+        scope: Scope,
+        parameters: &adx_agent_core::mounts::Parameters,
+        subject: &adx_agent_core::prewarm::EligibleStart,
+        checked_snapshot: Option<&str>,
+    ) -> Result<AgentBinding> {
+        for _ in 0..limits::CAS_ATTEMPTS {
+            let canonical = self.product_binding_scope(&scope, subject).await?;
+            if let Some(binding) = self.binding(&canonical).await? {
+                if binding.phase != BindingPhase::Active {
+                    return Err(Error::Conflict("binding is deleting".into()));
+                }
+                return Ok(binding);
+            }
+            match self
+                .create_binding_with_decision(
+                    scope.clone(),
+                    parameters,
+                    Some(subject),
+                    checked_snapshot,
+                )
+                .await
+            {
+                Err(Error::Conflict(cause)) if cause == "binding changed" => continue,
+                result => return result,
+            }
+        }
+        Err(Error::Conflict(
+            "first assignment changed concurrently".into(),
+        ))
+    }
+
+    async fn create_binding_with_decision(
+        &self,
+        scope: Scope,
+        parameters: &adx_agent_core::mounts::Parameters,
+        subject: Option<&adx_agent_core::prewarm::EligibleStart>,
+        checked_snapshot: Option<&str>,
+    ) -> Result<AgentBinding> {
         let key = binding_key(&scope)?;
         let (version, alias_check) = self.desired_version(&scope).await?;
         let template = self
@@ -234,9 +279,77 @@ impl AgentState {
         template.render_mounts(parameters).map_err(Error::Invalid)?;
         template.render_env(parameters).map_err(Error::Invalid)?;
         let generation = uuid::Uuid::new_v4().to_string();
+        let mut current =
+            adx_agent_core::EnvironmentRef::new(version.clone(), format!("adx-{generation}"));
+        let mut extra_checks = Vec::new();
+        let mut extra_puts = Vec::new();
+        if let Some(subject) = subject {
+            use crate::prewarm::{first_key, policy_key, FirstAssignment, FirstDecision};
+            use adx_agent_core::prewarm::{PolicyScope, PrewarmPolicy};
+            let first = first_key(&scope, subject)?;
+            let prior = self.store.get(&first).await?;
+            let mut initial = None;
+            if let Some(previous) = &prior {
+                let assignment: FirstAssignment = previous.decode()?;
+                if assignment.binding.tenant != scope.tenant
+                    || assignment.binding.binding_id != scope.binding_id
+                {
+                    return Err(Error::Corrupt("first-assignment identity mismatch".into()));
+                }
+                if let Some(binding) = self.binding(&assignment.binding).await? {
+                    if binding.phase != BindingPhase::Active {
+                        return Err(Error::Conflict("binding is deleting".into()));
+                    }
+                    return Ok(binding);
+                }
+                initial = Some(assignment.initial);
+            }
+            let policy = policy_key(&PolicyScope {
+                tenant: scope.tenant.clone(),
+                product: subject.product.clone(),
+            })?;
+            let rollout = self.store.get(&policy).await?;
+            if prior.is_none() {
+                if let (Some(saved), Some(recipe)) =
+                    (rollout.as_ref(), template.prewarm_recipe.as_ref())
+                {
+                    let policy: PrewarmPolicy = saved.decode()?;
+                    if policy.allows(subject)
+                        && policy.template == scope.template
+                        && policy.version == version
+                        && checked_snapshot == Some(recipe.snapshot_id.as_str())
+                    {
+                        current.snapshot_id = Some(recipe.snapshot_id.clone());
+                    }
+                }
+            }
+            extra_checks.push(Check {
+                key: first.clone(),
+                expected: prior.map(|r| r.revision),
+            });
+            let initial = initial.unwrap_or_else(|| FirstDecision {
+                environment: current.clone(),
+                binding_generation: generation.clone(),
+                policy_revision: rollout
+                    .as_ref()
+                    .map(|record| record.revision.as_str().to_owned()),
+                registered_at_ms: subject.registered_at_ms,
+            });
+            extra_checks.push(Check {
+                key: policy,
+                expected: rollout.map(|r| r.revision),
+            });
+            extra_puts.push(put(
+                &first,
+                &FirstAssignment {
+                    binding: scope.clone(),
+                    initial,
+                },
+            )?);
+        }
         let value = AgentBinding {
             scope,
-            current: adx_agent_core::EnvironmentRef::new(version, format!("adx-{generation}")),
+            current,
             secondary: None,
             generation,
             phase: BindingPhase::Active,
@@ -249,9 +362,12 @@ impl AgentState {
             expected: None,
         }];
         checks.extend(alias_check);
+        checks.extend(extra_checks);
+        let mut writes = vec![put(&key, &value)?];
+        writes.extend(extra_puts);
         if self
             .store
-            .commit(&Transaction::new(checks, vec![put(&key, &value)?])?)
+            .commit(&Transaction::new(checks, writes)?)
             .await?
         {
             return Ok(value);

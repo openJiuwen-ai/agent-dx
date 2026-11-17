@@ -410,6 +410,59 @@ impl HttpEnvironment {
 }
 #[async_trait]
 impl Environment for HttpEnvironment {
+    async fn golden_available(
+        &self,
+        tenant: &str,
+        id: &str,
+        image: &str,
+        runtime: &str,
+    ) -> Result<bool, EnvironmentError> {
+        validate_identity(tenant)?;
+        validate_identity(id)?;
+        let Some(key) = self.api_keys.get(tenant) else {
+            return Ok(false);
+        };
+        let invalid = || EnvironmentError::Invalid("invalid snapshot URL".into());
+        let mut url = self
+            .base
+            .join("/api/environment/v1/snapshots")
+            .map_err(|_| invalid())?;
+        url.path_segments_mut().map_err(|_| invalid())?.push(id);
+        let unavailable = || EnvironmentError::Unavailable("snapshot metadata unavailable".into());
+        let mut response = self
+            .client
+            .get(url)
+            .bearer_auth(key)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !response.status().is_success() {
+            return Err(unavailable());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
+            if chunk.len() > limits::HTTP_JSON_BYTES.saturating_sub(body.len()) {
+                return Err(unavailable());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&body).map_err(|_| unavailable())?;
+        let data = value.get("data").unwrap_or(&value);
+        if let Some(encoded) = data.as_str() {
+            let decoded = STANDARD.decode(encoded).map_err(|_| unavailable())?;
+            let data: Value = serde_json::from_slice(&decoded).map_err(|_| unavailable())?;
+            return Ok(environment_request::matches_golden(
+                &data, id, image, runtime,
+            ));
+        }
+        Ok(environment_request::matches_golden(
+            data, id, image, runtime,
+        ))
+    }
     async fn ensure_volume(
         &self,
         tenant: &str,

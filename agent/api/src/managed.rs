@@ -12,6 +12,7 @@ struct ActivationInput<'a> {
     generation: Option<&'a str>,
     bypass_cache: bool,
     parameters: Option<&'a [u8]>,
+    product_start: Option<&'a prewarm::EligibleStart>,
 }
 
 pub struct ManagedService {
@@ -24,6 +25,22 @@ impl ManagedService {
             control,
             templates: Mutex::new(BoundedCache::new(1024)),
         }
+    }
+    pub async fn prewarm_policy(
+        &self,
+        ctx: &RequestContext,
+        scope: &prewarm::PolicyScope,
+    ) -> Result<Option<prewarm::PolicySnapshot>> {
+        scope.validate().map_err(Error::Invalid)?;
+        self.control.prewarm_policy(ctx, scope).await
+    }
+    pub async fn update_prewarm_policy(
+        &self,
+        ctx: &RequestContext,
+        update: &prewarm::PolicyUpdate,
+    ) -> Result<prewarm::PolicySnapshot> {
+        update.validate().map_err(Error::Invalid)?;
+        self.control.update_prewarm_policy(ctx, update).await
     }
     /// Select an AgentBinding identity without creating product or Environment state.
     /// Returns Invalid for a direct instance target or invalid scope components.
@@ -231,6 +248,7 @@ impl ManagedService {
                 generation: Some(generation),
                 bypass_cache: true,
                 parameters: None,
+                product_start: None,
             },
         )
         .await
@@ -257,6 +275,28 @@ impl ManagedService {
         )
         .await
     }
+    /// Internal business ingress: the authenticated product subject remains stable across aliases.
+    pub async fn resolve_product(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        service: activator::ServiceSelector,
+        parameters: Option<&[u8]>,
+        subject: &prewarm::EligibleStart,
+    ) -> Result<(Target, u16)> {
+        self.resolve_generation(
+            ctx,
+            scope,
+            service.protocol,
+            service.port,
+            ActivationInput {
+                parameters,
+                product_start: Some(subject),
+                ..Default::default()
+            },
+        )
+        .await
+    }
     async fn resolve_generation(
         &self,
         ctx: &RequestContext,
@@ -272,19 +312,25 @@ impl ManagedService {
                 expected_generation: input.generation.map(str::to_owned),
                 bypass_cache: input.bypass_cache,
                 parameters: input.parameters.map(<[u8]>::to_vec),
+                product_start: input.product_start.cloned(),
             },
             service: activator::ServiceSelector { protocol, port },
         };
         let resolved = ctx.run(self.control.resolve(ctx, &request)).await?;
         let target = resolved.target;
         let selected_port = resolved.port;
-        if matches!(&scope.template_ref, TemplateRef::Version(version) if version != &target.binding.current.version)
+        if input.product_start.is_none()
+            && matches!(&scope.template_ref, TemplateRef::Version(version) if version != &target.binding.current.version)
         {
             return Err(Error::Unavailable(
                 "Activator returned another template version".into(),
             ));
         }
-        if target.binding.scope != *scope
+        let same_subject = target.binding.scope == *scope
+            || (input.product_start.is_some()
+                && target.binding.scope.tenant == scope.tenant
+                && target.binding.scope.binding_id == scope.binding_id);
+        if !same_subject
             || target.binding.phase != BindingPhase::Active
             || target.binding.generation.is_empty()
             || target.binding.current.environment_id.is_empty()

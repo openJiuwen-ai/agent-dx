@@ -44,6 +44,35 @@ fn both_transports_submit_the_public_environment_contract_without_agent_metadata
     );
 }
 #[test]
+fn template_snapshot_restores_the_fixed_snapshot_and_target_mounts() {
+    let draft: adx_agent_core::TemplateDraft = serde_json::from_value(json!({
+        "name":"app", "image":"app:1", "isolation_runtime":"runsc",
+        "resources":{"cpu_millis":500,"memory_mib":1024},
+        "mounts":[{"type":"bind","volume_id":"workspace-b","volume_uid":"volume-uid-b",
+            "target":"/data/state","options":["rw"]}]
+    }))
+    .unwrap();
+    let template = draft.with_version("1".into());
+    assert_eq!(adx_agent_core::TemplateDraft::from(&template), draft);
+    let mut create = request();
+    create.execution = (&template).into();
+    assert!(create.execution.snapshot_id.is_none());
+    create.execution.snapshot_id = Some("snapshot-fixed".into());
+    let input = create_input(&create, Duration::from_secs(60), &network_policy()).unwrap();
+    assert_eq!(input["snapshotId"], "snapshot-fixed");
+    assert_eq!(input["inheritEntrypoint"], false);
+    assert!(input.get("image").is_none());
+    assert!(input.get("runtime").is_none());
+    assert!(input.get("readinessProbe").is_none());
+    assert_eq!(input["mounts"][0]["volume_uid"], "volume-uid-b");
+    create.deadline_unix_ms = Some(1);
+    assert_eq!(
+        create_input(&create, Duration::from_secs(60), &network_policy()).unwrap(),
+        input
+    );
+}
+
+#[test]
 fn platform_owned_credentials_and_process_overrides_are_rejected() {
     let mut request = request();
     request

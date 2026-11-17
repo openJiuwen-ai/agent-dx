@@ -3,6 +3,7 @@ use crate::discovery::{validate_members, DiscoveryConfig};
 use crate::request::RequestContext;
 use crate::{Error, Result};
 use adx_agent_core::discovery::{ranked_endpoints, ActivatorEndpoint};
+use adx_agent_core::prewarm::{PolicyScope, PolicySnapshot, PolicyUpdate};
 use adx_agent_core::{activator::*, transport, AgentBinding, Scope, TemplateVersion};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
@@ -17,6 +18,20 @@ use std::{
 /// Product operations shared by the independent HTTP client and embedded Activator.
 #[async_trait]
 pub trait Control: Send + Sync {
+    async fn prewarm_policy(
+        &self,
+        _ctx: &RequestContext,
+        _scope: &PolicyScope,
+    ) -> Result<Option<PolicySnapshot>> {
+        Err(Error::Unsupported("prewarm policy unavailable".into()))
+    }
+    async fn update_prewarm_policy(
+        &self,
+        _ctx: &RequestContext,
+        _update: &PolicyUpdate,
+    ) -> Result<PolicySnapshot> {
+        Err(Error::Unsupported("prewarm policy unavailable".into()))
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,
@@ -266,6 +281,20 @@ impl ActivatorClient {
 
 #[async_trait]
 impl Control for ActivatorClient {
+    async fn prewarm_policy(
+        &self,
+        ctx: &RequestContext,
+        scope: &PolicyScope,
+    ) -> Result<Option<PolicySnapshot>> {
+        self.request(ctx, "prewarm/get", scope, false, None).await
+    }
+    async fn update_prewarm_policy(
+        &self,
+        ctx: &RequestContext,
+        update: &PolicyUpdate,
+    ) -> Result<PolicySnapshot> {
+        self.request(ctx, "prewarm/put", update, true, None).await
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,
@@ -486,6 +515,7 @@ impl ActivatorClient {
                 expected_generation: expected_generation.map(str::to_owned),
                 bypass_cache,
                 parameters: parameters.map(<[u8]>::to_vec),
+                product_start: None,
             },
             true,
             Some(scope),
