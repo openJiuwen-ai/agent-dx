@@ -99,6 +99,15 @@ M/A/B/C分别使用`afst-m/a/b/c`。`run.py`不创建网络；先按下节准备
 `fixtures/matrix.example.json` 引用一份local和一份cluster环境；相对路径按matrix文件目录解析，
 用于在同一公共VM上顺序运行两类集合。可选真实SSH多VM沿用 `multivm-3/4.example.json`。
 
+`kind=hybrid`（`fixtures/hybrid-3.example.json`）用于角色跨越至少两个Linux内核、且同一内核上可有多个角色的拓扑，
+例如写者在一台主机、读者在另一台。校验规则：至少两个不同boot；同一boot内各角色的network/PID/mount namespace互异，
+且只报告一个机器身份；不同boot须能用machine-id或VM UUID区分。只有一个内核时应使用`namespaces`，不能用hybrid代替。
+SSH角色可设 `remote_prefix`（字面argv），在远端worker之前执行，用于进入该主机上自己已拥有的角色（如受管节点的namespace与cgroup）；
+它与worker命令一起整体引用，不经远端shell二次拆分。
+任一host可设 `artifact_dir`（该主机上的绝对目录）：产品二进制已预置在该主机时，worker在本机复制到运行目录，
+再对复制结果计算SHA-256并与`artifact-identity.json`比对，不一致即BLOCKED；未设置时仍由控制端经通道传输。
+适用于控制端离角色主机较远、上行较慢的场景，不改变身份核验规则。
+
 ## 从普通Linux VM准备环境
 
 以下是第二、三步共用的环境操作说明；五步原则仍以[原总规范](../../docs/testing/test-strategy.md)为准。
@@ -550,6 +559,48 @@ python3 afs/tests/run.py run --suite local-performance --allow-performance \
 
 原始cohort、旧源码/ELF、进度写盘/BPF等诊断证据仍留仓外。源码仓不提交实际环境JSON、
 证书私钥、二进制、运行正文或大日志。历史批次成绩不转移到当前代码或不同计时口径。
+
+### 业界通用benchmark（`bench-env`、`bench-dfs`）
+
+`suites/bench/test_bench.py`用业界通用工具测量：fio（单机分层读写）、elbencho（多读者扇出，`--nosvcshare`
+使每个读者读全量）、iperf3（同一次运行内的网络上界）。工具二进制不进仓库；在每个角色主机（或每种架构一次后复制）执行
+`bash afs/tests/tools/bench-tools.sh /absolute/dest`，按锁定版本（fio 3.43、iperf3 3.16、elbencho 3.3-3）下载并核对SHA-256，
+从源码编译fio与iperf3（iperf3不依赖共享库），放入官方静态elbencho，生成`manifest.json`并打印`tools`片段。
+不安装进系统；离线时先把四个源码包放入`$BENCH_TOOLS_CACHE`。在环境JSON中声明绝对路径；未声明或数值非法即BLOCKED，不使用隐含默认值：
+
+```json
+{"bench": {"file_bytes": 1073741824, "block_bytes": [1048576, 4194304], "threads": [1, 4], "rounds": 5,
+           "tools": {"fio": "/opt/bench/fio", "elbencho": "/opt/bench/elbencho", "iperf3": "/opt/bench/iperf3"}}}
+```
+
+| case | 角色 | 测什么 |
+| --- | --- | --- |
+| `bench.env.localfs` | A | 同一组fio场景直接作用于A的原生ext4目录：写（单作业、`end_fsync`）、冷读、热读，作为上界 |
+| `bench.env.network` | A→B | iperf3 TCP吞吐，`threads`作为并发流数 |
+| `bench.dfs.sequential` | A写、B读 | DFS写（单作业，DFS单写者）；B从未打开过该文件时的远端冷读；B立即重读 |
+| `bench.dfs.fanout.many_readers` | A写、B/C读 | B、C上的elbencho service同时读全量文件，A只协调 |
+
+缓存层由证据确定，不由场景名确定。每轮使用新文件；冷读前对文件（本地）或所有Node的`state/`后端文件
+（DFS）执行fdatasync与`POSIX_FADV_DONTNEED`，再用`tools/bench_probe.py`经mmap+mincore实测驻留量。
+DFS后端分两类判定：`dfs/chunks/`下的正文驻留不得超过本轮文件大小的1%（不设页下限）；其余元数据（Node会改写的
+catalog、epoch等）容许max(1%×元数据总量, 64页)。任一超限时再驱逐并复测一次，两次都入证据；元数据仍超限则该case失败并列出文件，
+正文仍有驻留则该轮记为`remote_cold_unverified`而不是`remote_cold`。写者节点识别出的正文少于文件大小时视为后端布局不符，case失败。
+热读前要求文件驻留不少于99%且探针无错误，否则该轮记为`hot_unverified`。读者在冷读前只做按路径stat等待可见，不打开文件。
+角色同处一个内核时（`namespaces`/singlevm），远端冷读记录`same_kernel=true`：后端页缓存与写者共享，
+不能当作跨机冷读；跨机需`multivm`或`hybrid`拓扑。`bench.dfs.fanout.many_readers`要求读者B、C位于不同的host项
+（每个读者在本机固定端口运行一个elbencho service），各读者在自己worker的私有mount namespace内把工作区bind到同一路径，
+不要求各host的`base`相同；B、C共用一个host项时BLOCKED。
+
+每轮写入`checks.json`的`bench.round`，含工具自身报告的字节数与耗时（fio、elbencho的JSON），
+每组另有`bench.summary`（全部样本、中位数、min/max及max/min）；工具版本与SHA-256记为`bench.tool_identity`。
+结果只是测量记录，`performance acceptance NOT_EVALUATED`，不判断加速或退化。
+
+```sh
+python3 afs/tests/run.py run --suite bench-env --allow-performance --env /absolute/env.json \
+  --binary-dir /absolute/bin --case-timeout 3600 --work-root /absolute/new-bench-results
+python3 afs/tests/run.py run --suite bench-dfs --allow-performance --env /absolute/env.json \
+  --binary-dir /absolute/bin --case-timeout 3600 --work-root /absolute/new-bench-results
+```
 
 
 ## 缓存用例的前提与证据
