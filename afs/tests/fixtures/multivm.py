@@ -8,6 +8,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+from posixpath import join as remote_join
 import re
 import subprocess
 import shutil
@@ -18,6 +19,7 @@ from fixtures import singlevm, ssh, namespaces, kubernetes, docker
 from fixtures.common import (
     Blocked, DfsProfile, HERE, is_single_host, needs_reader_c, performance_parameters, sha256, write_json,
 )
+from tools import benchlib
 
 ROLES = ("M", "A", "B", "C")
 NAMES = {"M": "meta", "A": "node-a", "B": "node-b", "C": "node-c"}
@@ -34,9 +36,35 @@ def meta_store_config():
     return template.replace("\\n", "\n").replace("{unique}", uuid.uuid4().hex).rstrip("\n") + "\n"
 
 
+def verify_hybrid(infos):
+    """Roles span at least two kernels; roles sharing a kernel keep distinct namespaces.
+
+    Each kernel (boot) must report one machine identity, and different kernels must be
+    distinguishable by machine-id or product UUID, as for multivm guests.
+    """
+    kernels = {}
+    for info in infos.values():
+        kernels.setdefault(info["boot_id"], []).append(info)
+    if len(kernels) < 2:
+        raise Blocked("hybrid topology needs roles on at least two Linux kernels; use namespaces for one")
+    machines = []
+    for members in kernels.values():
+        identity = {(v["machine_id"], v["product_uuid"]) for v in members}
+        if len(identity) != 1:
+            raise Blocked("one kernel reported different machine identities")
+        machines.append(identity.pop())
+        for field in ("network_namespace", "pid_namespace", "mount_namespace"):
+            if len({v[field] for v in members}) != len(members):
+                raise Blocked("role namespace isolation is missing on a shared kernel: " + field)
+    ids = [m for m, _ in machines]
+    uuids = [u for _, u in machines]
+    if not ((all(ids) and len(set(ids)) == len(ids)) or (all(uuids) and len(set(uuids)) == len(uuids))):
+        raise Blocked("independent kernels are ambiguous; duplicate clone machine-id needs distinct VM UUIDs")
+
+
 def validate(config, cases):
-    if config.get("kind") not in ("singlevm", "multivm", "namespaces", "kubernetes", "docker"):
-        raise ValueError("kind must be singlevm, namespaces, multivm, kubernetes or docker")
+    if config.get("kind") not in ("singlevm", "multivm", "namespaces", "hybrid", "kubernetes", "docker"):
+        raise ValueError("kind must be singlevm, namespaces, multivm, hybrid, kubernetes or docker")
     for field in ("uid", "gid", "other_uid", "other_gid"):
         if not isinstance(config.get(field), int) or config[field] <= 0:
             raise ValueError("explicit positive numeric identity required: " + field)
@@ -55,7 +83,10 @@ def validate(config, cases):
         if case.purpose not in ("functional", "performance"):
             raise ValueError("unknown case purpose")
         if case.purpose == "performance":
-            performance_parameters(config)
+            if any(t.startswith("bench-") for t in case.tags):
+                benchlib.parameters(config)
+            else:
+                performance_parameters(config)
         if case.profile is not None and case.profile.node_count == 3:
             needed.add("C")
     if not needed <= set(roles):
@@ -89,6 +120,13 @@ def validate(config, cases):
             or any(c in str(base) for c in ("\n", "\r", '"', "\\"))
         ):
             raise ValueError("host base must be a dedicated existing absolute directory")
+        if "artifact_dir" in host:
+            staged = host["artifact_dir"]
+            if not isinstance(staged, str):
+                raise ValueError("artifact_dir must be an absolute directory on that host")
+            staged_path = Path(staged)
+            if not staged_path.is_absolute() or ".." in staged_path.parts or any(c in staged for c in ("\n", "\r")):
+                raise ValueError("artifact_dir must be an absolute directory on that host")
     if config["kind"] in ("kubernetes", "docker") and config.get("topology", "cluster") not in ("local", "cluster"):
         raise ValueError("container topology must be local or cluster")
     selected_hosts = [roles[r]["host"] for r in needed]
@@ -98,7 +136,7 @@ def validate(config, cases):
             raise Blocked("single-Pod local cases require one Pod and loopback role addresses")
         if any(any(t.startswith("cluster-") for t in c.tags) for c in cases):
             raise Blocked("single-Pod topology cannot establish cross-Pod evidence")
-    elif config["kind"] in ("multivm", "namespaces", "kubernetes", "docker"):
+    elif config["kind"] in ("multivm", "namespaces", "hybrid", "kubernetes", "docker"):
         if len(set(selected_hosts)) != len(needed):
             raise Blocked("multivm requires a distinct guest for every selected role")
         if any(any(t.startswith("local-") for t in c.tags) for c in cases):
@@ -285,6 +323,8 @@ class Cluster:
                 raise Blocked(
                     "independent guest identities are ambiguous; duplicate clone machine-id needs distinct VM UUIDs"
                 )
+        if self.config["kind"] == "hybrid":
+            verify_hybrid(infos)
         if self.config["kind"] in ("namespaces", "docker"):
             if len({v["boot_id"] for v in infos.values()}) != 1:
                 raise Blocked("namespaces topology must remain inside one actual Linux kernel/VM")
@@ -351,6 +391,21 @@ class Cluster:
         write_json(self.output / "identity.json", identity)
         return identity
 
+    def place_binary(self, channel, host, name, destination):
+        """Put one frozen binary at `destination` and return the SHA-256 of what landed there.
+
+        With `artifact_dir` the host already holds the binaries (slow or distant controllers);
+        the worker copies them locally. Otherwise they are streamed from `binary_dir`.
+        """
+        staged = host.get("artifact_dir")
+        if staged is None:
+            return channel.upload(self.binary_dir / name, destination, 0o755)
+        copied = channel.call("command", argv=["install", "-D", "-m", "0755", remote_join(staged, name),
+                                                destination], uid=None, gid=None, env={}, timeout=120, stdin=None)
+        if copied["returncode"] != 0:
+            raise Blocked("staged artifact could not be placed: " + name + ": " + copied["stderr"][-300:])
+        return channel.call("hash", path=destination)["sha256"]
+
     def prepare(self):
         infos = self.connect()
         identity = self.inputs(infos)
@@ -368,7 +423,7 @@ class Cluster:
             self.roots[host] = root
             ch.call("initialize", root=root, token=self.token)
             for name in binaries:
-                actual = ch.upload(self.binary_dir / name, root + "/bin/" + name, 0o755)
+                actual = self.place_binary(ch, self.config["hosts"][host], name, remote_join(root, "bin", name))
                 if actual != identity["binaries"][name]:
                     raise Blocked("artifact changed during transfer: " + name)
         write_json(

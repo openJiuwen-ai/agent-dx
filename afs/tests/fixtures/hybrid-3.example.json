@@ -1,0 +1,31 @@
+{
+  "kind": "hybrid",
+  "uid": 10001,
+  "gid": 10001,
+  "other_uid": 10002,
+  "other_gid": 10002,
+  "roles": {
+    "M": {"host": "host1-m", "address": "192.0.2.10"},
+    "A": {"host": "host1-a", "address": "192.0.2.11"},
+    "B": {"host": "host2-b", "address": "192.0.2.21"}
+  },
+  "hosts": {
+    "host1-m": {
+      "transport": "ssh",
+      "ssh_target": "replace-host1",
+      "remote_prefix": ["ip", "netns", "exec", "afst-m", "unshare", "--pid", "--fork", "--mount-proc", "--"],
+      "base": "/var/tmp/afst/m"
+    },
+    "host1-a": {
+      "transport": "ssh",
+      "ssh_target": "replace-host1",
+      "remote_prefix": ["ip", "netns", "exec", "afst-a", "unshare", "--pid", "--fork", "--mount-proc", "--"],
+      "base": "/var/tmp/afst/a"
+    },
+    "host2-b": {
+      "transport": "ssh",
+      "ssh_target": "replace-host2",
+      "base": "/var/tmp/afst/b"
+    }
+  }
+}
