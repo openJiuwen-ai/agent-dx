@@ -327,6 +327,7 @@ struct Delayed {
 }
 
 struct ConcurrentUpdates {
+    only_revision: Option<u64>,
     service: Arc<BindingService>,
     entered: Arc<Semaphore>,
     release: Arc<Semaphore>,
@@ -351,9 +352,9 @@ impl RelayService for ConcurrentUpdates {
     }
     async fn get_environment_activity(
         &self,
-        _: Request<pb::GetEnvironmentActivityRequest>,
+        request: Request<pb::GetEnvironmentActivityRequest>,
     ) -> Result<Response<pb::EnvironmentActivityState>, Status> {
-        Err(Status::unimplemented("fixture has no activity"))
+        self.service.get_environment_activity(request).await
     }
 
     async fn get_binding_state(
@@ -381,8 +382,13 @@ impl RelayService for ConcurrentUpdates {
         &self,
         request: Request<UpdateBindingRequest>,
     ) -> Result<Response<UpdateBindingResponse>, Status> {
-        self.entered.add_permits(1);
-        self.release.acquire().await.unwrap().forget();
+        if self
+            .only_revision
+            .is_none_or(|revision| revision == request.get_ref().binding_revision)
+        {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+        }
         Ok(Response::new(
             self.service.apply(request.into_inner()).await?,
         ))
@@ -396,6 +402,7 @@ async fn independent_binding_updates_do_not_wait_for_each_other() {
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     let (_server, adapter) = start(ConcurrentUpdates {
+        only_revision: None,
         service: handler,
         entered: entered.clone(),
         release: release.clone(),
@@ -696,4 +703,119 @@ async fn activity_subscription_preserves_bursts_and_reports_binding_retirement()
     .await
     .unwrap()
     .is_err());
+}
+
+#[tokio::test]
+async fn older_retirement_replays_the_newer_same_owner_retirement_to_relay() {
+    let binding = service();
+    let (server, adapter) = start(Handler(binding.clone())).await;
+    let mut latest = record();
+    let mut older = latest.clone();
+    latest.revision = 4;
+    older.revision = 3;
+    adapter.activate(&older).await.unwrap();
+
+    // Lose transport before Relay receives the retirement. Caching it locally
+    // is insufficient to report success, including on a lower revision retry.
+    let path = server.directory.path().join("route.sock");
+    let offline = server.directory.path().join("offline.sock");
+    std::fs::rename(&path, &offline).unwrap();
+    assert!(matches!(
+        adapter.retire(&latest).await,
+        Err(Error::Unavailable(_))
+    ));
+    assert!(matches!(
+        adapter.retire(&older).await,
+        Err(Error::Unavailable(_))
+    ));
+
+    std::fs::rename(&offline, &path).unwrap();
+    adapter.retire(&older).await.unwrap();
+
+    // The real Relay must have advanced past binding revision 8 to retirement 9.
+    let session = binding.inspect().await;
+    let mut delayed = active(latest.assignment.generation, 8);
+    delayed.proxy_session_id = session.proxy_session_id;
+    delayed.sync_epoch = session.sync_epoch;
+    assert_eq!(
+        binding.apply(delayed).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(adapter.activate(&latest).await, Err(Error::Conflict));
+
+    latest.revision += 1;
+    adapter.activate(&latest).await.unwrap();
+    assert_eq!(adapter.retire(&older).await, Err(Error::Conflict));
+}
+
+#[tokio::test]
+async fn buffered_older_retirement_preserves_the_newer_version() {
+    let binding = service();
+    let (server, _previous) = start(Handler(binding.clone())).await;
+    let adapter = UdsRoutes::new(
+        server.directory.path().join("route.sock"),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    adapter.begin_reconcile().await.unwrap();
+    let mut latest = record();
+    latest.revision = 4;
+    adapter.retire(&latest).await.unwrap();
+    latest.revision = 3;
+    adapter.retire(&latest).await.unwrap();
+    adapter.finish_reconcile().await.unwrap();
+
+    let session = binding.inspect().await;
+    let mut delayed = active(latest.assignment.generation, 8);
+    delayed.proxy_session_id = session.proxy_session_id;
+    delayed.sync_epoch = session.sync_epoch;
+    assert_eq!(
+        binding.apply(delayed).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+#[tokio::test]
+async fn replayed_retirement_cannot_supersede_a_concurrent_newer_activation() {
+    let tracker = Arc::new(data_plane_gateway::node::ActivityTracker::new("route-test"));
+    let relay = Relay::new(GatewayPolicy::new(vec![]))
+        .with_route_enforcement()
+        .with_activity_tracker(tracker);
+    let binding = Arc::new(BindingService::new(Arc::new(relay)));
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(1));
+    let (_server, adapter) = start(ConcurrentUpdates {
+        only_revision: Some(9),
+        service: binding,
+        entered: entered.clone(),
+        release: release.clone(),
+    })
+    .await;
+    let mut sandbox = record();
+    sandbox.revision = 4;
+    adapter.retire(&sandbox).await.unwrap();
+    entered
+        .try_acquire()
+        .expect("initial retirement reached Relay")
+        .forget();
+    let replay = tokio::spawn({
+        let adapter = adapter.clone();
+        let mut older = sandbox.clone();
+        older.revision = 3;
+        async move { adapter.retire(&older).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .expect("older retirement must retry binding 9")
+        .unwrap()
+        .forget();
+    sandbox.revision = 5;
+    adapter.activate(&sandbox).await.unwrap();
+    release.add_permits(1);
+    assert_eq!(replay.await.unwrap(), Err(Error::Conflict));
+
+    adapter
+        .activity(&sandbox)
+        .await
+        .expect("newer route is still active");
 }

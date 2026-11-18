@@ -197,6 +197,93 @@ async fn restarting_adxlet_keeps_failed_owned_binding_retryable_on_existing_rela
 }
 
 #[tokio::test]
+async fn same_session_accepts_a_new_environment_after_reconciling_an_unconfirmed_delete() {
+    use data_plane_gateway::{
+        common::protocol::GatewayPolicy,
+        node::{route_control::serve_route_control, ActivityTracker, Relay},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("relay.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let relay = Relay::new(GatewayPolicy::new(vec![]))
+        .with_route_enforcement()
+        .with_activity_tracker(Arc::new(ActivityTracker::new("session")));
+    let server = tokio::spawn(serve_route_control(Arc::new(relay), listener));
+    let routes = Arc::new(UdsRoutes::new(socket, Duration::from_secs(1)).unwrap());
+    let backend = Arc::new(Backend::default());
+    let sink = Arc::new(Sink::default());
+    let journal = Arc::new(JournalSink::new(
+        root.path().join("journal.sqlite"),
+        sink.clone(),
+    ));
+    let node = node(&backend, routes.clone(), journal.clone());
+    let mut authority = authority::Fixture::new().await;
+    let busy = running("busy");
+    *backend.actual.lock().unwrap() = vec![observed("busy")];
+    authority
+        .authority
+        .records
+        .lock()
+        .unwrap()
+        .push(busy.clone().try_into().unwrap());
+    authority
+        .cycle_with_journal(&node, Some(&journal))
+        .await
+        .unwrap();
+    routes.activity(&busy).await.unwrap();
+
+    sink.fail.store(true, Ordering::SeqCst);
+    let handle = node
+        .environment(busy.spec.clone(), busy.assignment.clone())
+        .unwrap();
+    assert!(matches!(handle.delete().await, Err(Error::Unavailable(_))));
+    let local = handle.sync().await.unwrap();
+    assert_eq!(local.durability, Durability::Journaled);
+    assert!(journal.pending().await.unwrap() > 0);
+
+    let mut failed = busy;
+    failed.revision += 1;
+    failed.state = EnvironmentState::Failed;
+    failed.resources_held = false;
+    failed.runtime.ip = None;
+    assert!(local.record.revision > failed.revision);
+    *authority.authority.records.lock().unwrap() = vec![failed.clone().try_into().unwrap()];
+    sink.fail.store(false, Ordering::SeqCst);
+    authority
+        .authority
+        .requires_handshake
+        .store(true, Ordering::SeqCst);
+    let fenced = authority
+        .cycle_with_journal(&node, Some(&journal))
+        .await
+        .unwrap_err();
+    assert_eq!(fenced.code(), tonic::Code::FailedPrecondition);
+    assert!(!node.accepting_allocations());
+    authority
+        .cycle_with_journal(&node, Some(&journal))
+        .await
+        .unwrap();
+
+    assert!(node.accepting_allocations() && authority.registration.accepting_allocations);
+    assert_eq!(journal.pending().await.unwrap(), 0);
+    assert!(backend.actual.lock().unwrap().is_empty());
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(routes.activity(&failed).await.unwrap_err(), Error::Conflict);
+    backend.allow_start.store(true, Ordering::SeqCst);
+    let fresh = record("fresh", EnvironmentState::Pending);
+    let created = node
+        .environment(fresh.spec, fresh.assignment)
+        .unwrap()
+        .create()
+        .await
+        .unwrap();
+    assert_eq!(created.record.state, EnvironmentState::Running);
+    assert_eq!(created.durability, Durability::Published);
+    routes.activity(&created.record).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
 async fn takeover_spec_conflict_fences_only_its_controller() {
     let backend = Arc::new(Backend::default());
     let node = manager(&backend);
