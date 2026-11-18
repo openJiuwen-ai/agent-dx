@@ -334,9 +334,14 @@ impl CoordinatorRpc {
                         "local restore point is unavailable on another node",
                     ));
                 }
-                // Existing ownership can outlive administrative admission. A
-                // paused execution must not reacquire capacity on an operator-paused node.
-                let available = !node.scheduling_paused
+                let resume_allowed = !node.scheduling_paused
+                    || state
+                        .session
+                        .upgrade_task()
+                        .await
+                        .map_err(status)?
+                        .is_some_and(|task| task.allows_drain_resume(&node));
+                let available = resume_allowed
                     && state.live.get(&node.node.id).is_some_and(|live| {
                         live.inspected
                             && !live.expired

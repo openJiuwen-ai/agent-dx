@@ -339,14 +339,19 @@ impl pb::node_service_server::NodeService for NodeRpc {
             .ok_or_else(|| Status::invalid_argument("assignment required"))?
             .try_into()
             .map_err(status)?;
-        let (_, owner, handle) = self
+        let controller = self
             .manager
             .environments
             .lock()
             .map_err(|_| Status::internal("environment registry unavailable"))?
             .get(&assignment.environment_id)
-            .cloned()
-            .ok_or_else(|| Status::not_found("environment not managed"))?;
+            .cloned();
+        let (_, owner, handle) = controller.ok_or_else(|| {
+            // The Coordinator owns existence and assignment. A restarted
+            // adxlet may not have adopted that assignment into its local catalog.
+            self.manager.reconciliation_requested.notify_one();
+            Status::unavailable("environment controller awaiting reconciliation")
+        })?;
         if owner != assignment {
             return Err(Status::failed_precondition("assignment changed"));
         }
@@ -698,6 +703,8 @@ impl pb::node_service_server::NodeService for NodeRpc {
                             &r.operation_id,
                         )
                         .map_err(status)?;
+                } else if r.operation_id.starts_with("task:") {
+                    return Err(Status::permission_denied("Coordinator identity required"));
                 }
                 let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
                 response(
@@ -739,6 +746,9 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     return Err(Status::unavailable("node is reconciling"));
                 }
                 let r = request.into_inner();
+                if r.operation_id.starts_with("task:") {
+                    return Err(Status::permission_denied("Coordinator identity required"));
+                }
                 let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
                 response(
                     handle

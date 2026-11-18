@@ -921,7 +921,16 @@ impl Controller {
             policy.timeout_seconds = seconds;
             policy.validate()?;
         }
-        let execution = self.services.execution(&self.record, "resume").await?;
+        let task = request
+            .operation_id
+            .starts_with("task:")
+            .then_some(request.operation_id.as_str());
+        let execution = self.services.upgrade.enter_scoped(
+            &self.record.spec.id,
+            self.record.assignment.generation,
+            "resume",
+            task,
+        )?;
         let cp = self
             .record
             .checkpoint

@@ -603,6 +603,81 @@ async fn upgrade_response(
 
 const MIGRATE_PATH: &str = "tasks/planned-migration/migrate";
 
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn drain_abort_settles_an_accepted_resume_before_fencing_the_source() {
+    use serde_json::json;
+
+    let rig = Rig::new(Duration::from_secs(2)).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(adx_coordinator::autoscaling::serve(
+        listener,
+        rig.rpc.clone(),
+    ));
+    let source = &rig.source.report;
+    let binding = json!({
+        "node_id": source.node_id, "node_session_id": source.session_id, "pod_uid": "source-pod"
+    });
+    post_upgrade(
+        address,
+        "tasks",
+        json!({"task_id":"drain", "epoch":1, "namespace":"test", "daemonset_uid":"daemonset",
+               "target_image":format!("image@sha256:{}", "d".repeat(64)), "nodes":[binding]}),
+    )
+    .await;
+    post_upgrade(
+        address,
+        "tasks/drain/drain-node",
+        json!({"task_id":"drain", "epoch":1, "operation_id":"prepare", "node_id":source.node_id,
+               "node_session_id":source.session_id, "pod_uid":"source-pod"}),
+    )
+    .await;
+    let accepted = rig.session.request_resume("sleep", 0).await.unwrap();
+    assert!(accepted.resume.is_some());
+
+    let freeze = json!({"task_id":"drain", "epoch":1, "operation_id":"freeze", "stage":"freeze"});
+    let (status, body) =
+        upgrade_response(address, "POST", "tasks/drain/abort", freeze.to_string()).await;
+    assert_eq!(status, 409, "{body}");
+    let task = upgrade_request(address, "GET", "tasks/drain", String::new()).await;
+    assert_eq!(task["phase"], "Aborting");
+    assert_eq!(task["nodes"]["a"]["phase"], "draining");
+
+    rig.resume(false).await.unwrap();
+    let resumed = rig.session.get("sleep").await.unwrap();
+    assert_eq!(resumed.assignment, accepted.assignment);
+    assert_eq!(
+        resumed.result.unwrap().state,
+        adx_core::EnvironmentState::Running
+    );
+    assert!(resumed.resume.is_none());
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        rig.session.request_resume("sleep", 0).await,
+        Err(adx_core::Error::Unavailable(_))
+    ));
+    let frozen = post_upgrade(address, "tasks/drain/abort", freeze).await;
+    assert_eq!(frozen["nodes"]["a"]["phase"], "evacuating");
+    post_upgrade(
+        address,
+        "tasks/drain/abort",
+        json!({"task_id":"drain", "epoch":1, "operation_id":"restore", "stage":"restore-original",
+               "node_id":source.node_id, "node_session_id":source.session_id, "pod_uid":"source-pod"}),
+    )
+    .await;
+    let aborted = post_upgrade(
+        address,
+        "tasks/drain/abort",
+        json!({"task_id":"drain", "epoch":1, "operation_id":"finalize", "stage":"finalize", "template_restored":true}),
+    )
+    .await;
+    assert_eq!(aborted["phase"], "Aborted");
+    assert!(rig.source.manager.accepting_allocations());
+    server.abort();
+}
+
 async fn prepare_migration(
     rig: &Rig,
     running: pb::EnvironmentRecord,

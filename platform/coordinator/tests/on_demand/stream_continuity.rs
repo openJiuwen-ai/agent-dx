@@ -52,6 +52,302 @@ async fn attach_relay(coordinator: &str, worker: &mut Worker, tasks: &mut JoinSe
     });
 }
 
+async fn direct_request(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    payload: bytes::Bytes,
+) -> (u16, bytes::Bytes) {
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::rt::TokioIo;
+
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(socket))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let response = client
+        .send_request(
+            hyper::Request::builder()
+                .method(method)
+                .uri(format!("/direct/sleep{path}"))
+                .header("host", "localhost")
+                .header("x-auth", KEY)
+                .header("content-type", content_type)
+                .header("x-adx-processing-timeout-ms", "5000")
+                .body(Full::new(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    if status != 200 {
+        eprintln!(
+            "direct {} {} returned {}: {}",
+            method,
+            path.split('?').next().unwrap_or(path),
+            status,
+            String::from_utf8_lossy(&body[..body.len().min(256)])
+        );
+    }
+    (status, body)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires dedicated real Redis and an adx-execd binary in a loopback-only Linux network"]
+async fn restored_original_serves_direct_commands_and_files_after_on_demand_adoption() {
+    use data_plane_gateway::ingress::ListenerConfig;
+
+    let Some(binary) = std::env::var_os("ADX_TEST_EXECD") else {
+        eprintln!("skipped optional Execd traffic check: ADX_TEST_EXECD is not set");
+        return;
+    };
+    let network = std::fs::read_to_string("/proc/net/dev").unwrap();
+    let interfaces: Vec<_> = network
+        .lines()
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim()))
+        .collect();
+    assert_eq!(
+        interfaces,
+        ["lo"],
+        "Execd must only bind in an isolated network"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let payload = b"restored-original\0file";
+    let seed = b"existing\0data";
+    std::fs::write(dir.path().join("existing.bin"), seed).unwrap();
+    let query = |name| {
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("path", dir.path().join(name).to_str().unwrap())
+            .append_pair("type", "file")
+            .finish()
+    };
+    let path = query("probe.bin");
+    let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let execd = reservation.local_addr().unwrap();
+    drop(reservation);
+    let _execd_process = tokio::process::Command::new(binary)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("EXECD_HTTP_ONLY", "1")
+        .env("EXECD_HTTP_PORT", execd.port().to_string())
+        .current_dir(dir.path())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        while tokio::net::TcpStream::connect(execd).await.is_err() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Execd must start inside the loopback-only test container");
+
+    let mut tasks = JoinSet::new();
+    let mut rig = Rig::new(Duration::from_secs(2)).await;
+    attach_relay(&rig.address, &mut rig.source, &mut tasks).await;
+    let original = rig.session.get("sleep").await.unwrap();
+    let (address, server, _) = prepare_migration(&rig, (&original).try_into().unwrap()).await;
+    let abort = "tasks/planned-migration/abort";
+    post_upgrade(
+        address,
+        abort,
+        json!({"task_id":"planned-migration","epoch":1,"operation_id":"freeze","stage":"freeze"}),
+    )
+    .await;
+    let mut release = json!({"task_id":"planned-migration","epoch":1,"operation_id":"restore","stage":"restore-original",
+        "node_id":"a","node_session_id":rig.source.report.session_id,"pod_uid":"source-pod","rollback":true});
+    post_upgrade(address, abort, release.clone()).await;
+    rig.source.task.abort();
+    let _ = (&mut rig.source.task).await;
+    let mut replacement = worker(
+        "a",
+        &rig.address,
+        rig.remote.clone(),
+        Some(&rig.source.report.node_address),
+    )
+    .await;
+    replacement
+        .report
+        .proxy_address
+        .clone_from(&rig.source.report.proxy_address);
+    let relay = rig.source.backend.relay.lock().unwrap().clone();
+    *replacement.backend.relay.lock().unwrap() = relay;
+    let period = Duration::from_secs(60);
+    let error = report(&mut replacement, &rig.address, period)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    rig.source = replacement;
+
+    rig.session
+        .bootstrap_credential(
+            KEY,
+            &adx_coordinator::auth::Credential {
+                tenant_id: "tenant".into(),
+                administrator: false,
+                expires_at_unix_seconds: 0,
+                metadata: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    rig.session
+        .advertise("test", &format!("http://{}", rig.address), period)
+        .await
+        .unwrap();
+    let routes = rig.routes.clone();
+    tasks.spawn(async move { routes.run(Duration::from_millis(10)).await });
+    let store = Arc::new(RouteStore::new());
+    let connection = Arc::new(CoordinatorConnection::new(serde_json::from_value(json!({
+        "redis_url":rig._redis.url, "namespace":"test", "tls":{"mode":"network"},
+        "rpc_timeout_seconds":4,"refresh_seconds":1,"auth_cache_seconds":1,"auth_cache_entries":10,
+    })).unwrap()).unwrap());
+    let (watcher, watcher_store) = (connection.clone(), store.clone());
+    tasks.spawn(async move { watcher.run(watcher_store).await });
+    let ingress = Arc::new(
+        Ingress::new(
+            Arc::new(
+                IngressRouteResolver::new(store.clone())
+                    .stream_only()
+                    .with_demand_resolver(connection.clone()),
+            ),
+            DataPlaneL4Connector::new(H2PoolConfig::default()),
+            IngressAuthenticator::with_verifier(connection),
+            execd.port(),
+            8765,
+            "127.0.0.1:1",
+            vec![],
+        )
+        .with_client_acl(vec!["127.0.0.0/8".parse().unwrap()], false),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let public = listener.local_addr().unwrap();
+    let (_stop, stopped) = watch::channel(false);
+    tasks.spawn(async move {
+        ingress
+            .serve_listener(
+                listener,
+                ListenerConfig {
+                    listen: public,
+                    tls: false,
+                    allow_http_credentials: true,
+                    allowed_routes: None,
+                },
+                None,
+                stopped,
+            )
+            .await
+            .unwrap();
+    });
+    timeout(Duration::from_secs(3), async {
+        while !store.ready() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        store.get("sleep").is_none(),
+        "Paused ownership uses demand lookup"
+    );
+    release["node_session_id"] = json!(rig.source.report.session_id);
+    assert_eq!(
+        post_upgrade(address, abort, release).await["restored_original"],
+        true
+    );
+
+    let invoke = json!({"action":"process.exec","args":{"cmd":"printf restored-original","timeout":2},
+        "requestId":"release-command"});
+    let command = tokio::spawn(direct_request(
+        public,
+        "POST",
+        "/invoke",
+        "application/json",
+        invoke.to_string().into(),
+    ));
+    let upload_path = format!("/upload?{path}");
+    let upload = tokio::spawn(async move {
+        direct_request(
+            public,
+            "POST",
+            &upload_path,
+            "application/octet-stream",
+            bytes::Bytes::from_static(payload),
+        )
+        .await
+    });
+    let read_path = format!("/download?{}", query("existing.bin"));
+    let read = tokio::spawn(async move {
+        direct_request(
+            public,
+            "GET",
+            &read_path,
+            "application/octet-stream",
+            bytes::Bytes::new(),
+        )
+        .await
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            assert!(
+                !command.is_finished() && !upload.is_finished() && !read.is_finished(),
+                "a direct request completed before adoption"
+            );
+            let stored = rig.session.get("sleep").await.unwrap();
+            assert_eq!(stored.assignment, original.assignment);
+            if stored.resume.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("direct traffic must trigger resume on the original owner");
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
+    report(&mut rig.source, &rig.address, period).await.unwrap();
+
+    let (status, stdout) = timeout(Duration::from_secs(5), command)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, 200, "{:?}", String::from_utf8_lossy(&stdout));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&stdout).unwrap()["stdout"],
+        "restored-original"
+    );
+    let (status, body) = timeout(Duration::from_secs(5), upload)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, 200, "{:?}", String::from_utf8_lossy(&body));
+    let (status, previous) = timeout(Duration::from_secs(5), read)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, 200, "{:?}", String::from_utf8_lossy(&previous));
+    assert_eq!(previous.as_ref(), seed);
+    let (status, downloaded) = direct_request(
+        public,
+        "GET",
+        &format!("/download?{path}"),
+        "application/octet-stream",
+        bytes::Bytes::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(downloaded.as_ref(), payload);
+    assert_eq!(
+        rig.session.get("sleep").await.unwrap().assignment,
+        original.assignment
+    );
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
 async fn create_control(rig: &Rig, id: &str, node: &str) -> adx_core::Assignment {
     let mut specification = spec();
     specification.id = id.into();

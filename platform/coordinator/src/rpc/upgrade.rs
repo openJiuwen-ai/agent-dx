@@ -217,9 +217,7 @@ impl CoordinatorRpc {
         let (mut client, _) = self.checked_node(&saved, "").await?;
         let session = saved.session.as_ref().ok_or(Error::Conflict)?.id.clone();
         let entry = task.nodes.get_mut(id).ok_or(Error::Conflict)?;
-        if entry.node_session_id != session
-            || (entry.delete_resource_version.is_some() && phase != "quiescing")
-        {
+        if entry.node_session_id != session || entry.delete_resource_version.is_some() {
             return Err(Error::Conflict);
         }
         // Persist revocation/authorization intent before it can affect execution.
@@ -248,6 +246,8 @@ impl CoordinatorRpc {
             || response.epoch != control.epoch
             || response.node_session_id != control.node_session_id
             || response.revision != control.revision
+            || response.phase != control.phase
+            || (workflow_phase == "RestoredOriginal" && response.unknown)
         {
             return Err(Error::Conflict);
         }
@@ -300,7 +300,7 @@ impl CoordinatorRpc {
             if method == hyper::Method::GET && suffix == "capabilities" {
                 return Ok(
                     json!({"version":2,"node_protocol_version":3,"planned_migration":true,"paused_transfer":true,
-                "quiesce":true,"session_isolation":true,"recovery_compatibility":true,"runtime_rootfs_identity":true}),
+                "quiesce":true,"drain":true,"session_isolation":true,"recovery_compatibility":true,"runtime_rootfs_identity":true}),
                 );
             }
             if method == hyper::Method::GET {
@@ -380,7 +380,9 @@ impl CoordinatorRpc {
         }
         Box::pin(async move {
             match action {
-                "prepare-node" => {
+                "prepare-node" | "drain-node" => {
+                    let drain = action == "drain-node";
+                    let phase = if drain { "draining" } else { "evacuating" };
                     if request.register_source {
                         self.register_upgrade_source(&mut task, &request, false)
                             .await?;
@@ -389,18 +391,17 @@ impl CoordinatorRpc {
                     if task
                         .nodes
                         .get(&request.node_id)
-                        .is_none_or(|n| !matches!(n.phase.as_str(), "pending" | "evacuating"))
+                        .is_none_or(|n| n.phase != "pending" && n.phase != phase)
                     {
                         return Err(Error::Conflict);
                     }
-                    // Fence new wake demand before pausing scheduling or applying
-                    // node control. The same durable CAS rejects already accepted
-                    // resume intents without stranding them on a paused source.
+                    // Evacuation fences new wakes. Draining keeps local Resume open;
+                    // individual migrations still fence their own Sandbox.
                     if task.nodes[&request.node_id].phase == "pending" {
                         task.nodes
                             .get_mut(&request.node_id)
                             .ok_or(Error::Conflict)?
-                            .phase = "evacuating".into();
+                            .phase = phase.into();
                         task = self.save_task(task).await?;
                     }
                     self.set_upgrade_scheduling(&task, &request.node_id, true)
@@ -416,11 +417,19 @@ impl CoordinatorRpc {
                             actions: vec!["pause".into(), "route".into()],
                         })
                         .collect();
-                    self.control(&mut task, &request.node_id, "evacuating", grants)
+                    self.control(&mut task, &request.node_id, phase, grants)
                         .await?;
                 }
                 "quiesce" => {
                     if request.rollback && task.phase != "Aborting" {
+                        return Err(Error::Conflict);
+                    }
+                    if request.delete_intent {
+                        return self.confirm_upgrade_delete(task, &request).await;
+                    }
+                    if task.nodes.get(&request.node_id).is_some_and(|node| {
+                        node.pod_uid == request.pod_uid && node.delete_resource_version.is_some()
+                    }) {
                         return Err(Error::Conflict);
                     }
                     let current = self.upgrade_node(&request.node_id).await?;
@@ -435,26 +444,6 @@ impl CoordinatorRpc {
                     }
                     self.set_upgrade_scheduling(&task, &request.node_id, true)
                         .await?;
-                    if request.delete_intent {
-                        let node = task.nodes.get(&request.node_id).ok_or(Error::Conflict)?;
-                        if node.phase != "quiescing"
-                            || node.permit_id.as_deref() != Some(&request.permit_id)
-                            || request.pod_resource_version.is_empty()
-                        {
-                            return Err(Error::Conflict);
-                        }
-                        // Re-read local facts. No new grants are allowed after issuing a permit.
-                        let inspection = self.inspect_upgrade(&request.node_id).await?;
-                        if inspection["strict_empty"] != true {
-                            return Err(Error::Conflict);
-                        }
-                        task.nodes
-                            .get_mut(&request.node_id)
-                            .ok_or(Error::Conflict)?
-                            .delete_resource_version = Some(request.pod_resource_version.clone());
-                        self.save_task(task).await?;
-                        return Ok(inspection);
-                    }
                     return self.quiesce_upgrade(&mut task, &request.node_id).await;
                 }
                 "revoke-delete" => {
@@ -464,11 +453,41 @@ impl CoordinatorRpc {
                     {
                         return Err(Error::Conflict);
                     }
-                    self.bind_node(&mut task, &request, false).await?;
+                    let current = self.upgrade_node(&request.node_id).await?;
+                    let session = current.session.as_ref().ok_or(Error::Conflict)?;
+                    let observation = self.node_view(&current, "").await?;
                     let entry = task
                         .nodes
                         .get_mut(&request.node_id)
                         .ok_or(Error::Conflict)?;
+                    if request.pod_uid.is_empty()
+                        || request.pod_uid != entry.pod_uid
+                        || (!request.node_session_id.is_empty()
+                            && request.node_session_id != session.id)
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    // A restart on the same Pod may withdraw the obsolete intent.
+                    // It cannot rebind or get a new permit here.
+                    if session.id != entry.node_session_id
+                        && ((entry.pod_uid != entry.original_pod_uid
+                            && !(task.phase == "Aborting" && request.rollback))
+                            || entry.phase != "quiescing"
+                            || request.node_session_id != session.id
+                            || !session.routable
+                            || !current.scheduling_paused
+                            || current.upgrade_pause.as_ref().is_none_or(|owner| {
+                                owner.task_id != task.task_id || owner.epoch != task.epoch
+                            })
+                            || observation.task_id != task.task_id
+                            || observation.epoch != task.epoch
+                            || observation.revision <= entry.control_revision
+                            || observation.phase != "isolated"
+                            || observation.unknown
+                            || !observation.grants.is_empty())
+                    {
+                        return Err(Error::Conflict);
+                    }
                     if let Some(old) = &entry.delete_resource_version {
                         if old != &request.expected_delete_resource_version {
                             return Err(Error::Conflict);
@@ -479,7 +498,7 @@ impl CoordinatorRpc {
                         entry.permit_id = None;
                         task = self.save_task(task).await?;
                     }
-                    // An already cleared intent is a same-binding no-op. In
+                    // An already cleared intent is a no-op. In
                     // particular, retain any new permit not yet confirmed for DELETE.
                 }
                 "verify-node" => {
@@ -544,43 +563,7 @@ impl CoordinatorRpc {
                     self.cancel_prepared_operations(&mut task).await?;
                 }
                 "abort" if request.stage == "restore-original" => {
-                    if task.phase != "Aborting" {
-                        return Err(Error::Conflict);
-                    }
-                    if request.register_source {
-                        self.register_upgrade_source(&mut task, &request, true)
-                            .await?;
-                    }
-                    self.bind_node(&mut task, &request, false).await?;
-                    let node = task
-                        .nodes
-                        .get(&request.node_id)
-                        .ok_or(Error::Conflict)?
-                        .clone();
-                    if node.pod_uid != node.original_pod_uid
-                        || node.node_session_id != node.original_session_id
-                        || node.delete_resource_version.is_some()
-                        || task.operations.values().any(|op| {
-                            (op.source_node_id == request.node_id
-                                || op.target_node_id == request.node_id)
-                                && !op.settled()
-                        })
-                    {
-                        return Err(Error::Conflict);
-                    }
-                    self.control_with_phase(
-                        &mut task,
-                        &request.node_id,
-                        "released",
-                        "RestoredOriginal",
-                        vec![],
-                    )
-                    .await?;
-                    self.set_upgrade_scheduling(&task, &request.node_id, false)
-                        .await?;
-                    return Ok(
-                        json!({"restored_original":true,"node_id":node.node_id,"pod_uid":node.pod_uid,"node_session_id":node.node_session_id}),
-                    );
+                    return self.restore_original(task, &request).await;
                 }
                 "abort" if request.stage == "finalize" => {
                     // A Job must independently verify old template/generation and fresh Pod inventory.
@@ -654,6 +637,69 @@ impl CoordinatorRpc {
         }
         Ok(())
     }
+    async fn restore_original(&self, mut task: UpgradeTask, request: &Action) -> Result<Value> {
+        if task.phase != "Aborting" || request.pod_uid.is_empty() {
+            return Err(Error::Conflict);
+        }
+        let id = &request.node_id;
+        if request.register_source
+            && task
+                .nodes
+                .get(id)
+                .is_none_or(|node| node.phase != "RestoredOriginal")
+        {
+            self.register_upgrade_source(&mut task, request, true)
+                .await?;
+        }
+        let current = self.upgrade_node(id).await?;
+        let session = current.session.as_ref().ok_or(Error::Conflict)?;
+        let node = task.nodes.get_mut(id).ok_or(Error::Conflict)?;
+        if node.pod_uid != request.pod_uid
+            || node.pod_uid != node.original_pod_uid
+            || (!request.node_session_id.is_empty() && request.node_session_id != session.id)
+            || (node.node_session_id != node.original_session_id
+                && node.phase != "RestoredOriginal")
+            || node.delete_resource_version.is_some()
+            || task
+                .operations
+                .values()
+                .any(|op| (op.source_node_id == *id || op.target_node_id == *id) && !op.settled())
+        {
+            return Err(Error::Conflict);
+        }
+        if node.node_session_id != session.id {
+            // The existing Pod may still own Sandboxes. Prove current isolation
+            // and reconciliation before replaying release on its new session.
+            let view = self.node_view(&current, "").await?;
+            if node.phase != "RestoredOriginal"
+                || request.node_session_id != session.id
+                || !session.routable
+                || !current.scheduling_paused
+                || current
+                    .upgrade_pause
+                    .as_ref()
+                    .is_none_or(|owner| owner.task_id != task.task_id || owner.epoch != task.epoch)
+                || view.task_id != task.task_id
+                || view.epoch != task.epoch
+                || view.revision <= node.control_revision
+                || view.phase != "isolated"
+                || view.unknown
+                || !view.grants.is_empty()
+            {
+                return Err(Error::Conflict);
+            }
+            node.node_session_id.clone_from(&session.id);
+            node.control_revision = view.revision;
+            task = self.save_task(task).await?;
+        }
+        self.control_with_phase(&mut task, id, "released", "RestoredOriginal", vec![])
+            .await?;
+        self.set_upgrade_scheduling(&task, id, false).await?;
+        Ok(
+            json!({"restored_original":true,"node_id":id,"pod_uid":request.pod_uid,"node_session_id":session.id}),
+        )
+    }
+
     async fn finish_upgrade(&self, mut task: UpgradeTask, phase: &str) -> Result<UpgradeTask> {
         for id in task.nodes.keys().cloned().collect::<Vec<_>>() {
             let workflow = task.nodes[&id].phase.clone();
@@ -673,8 +719,14 @@ impl CoordinatorRpc {
         let sources: Vec<_> = task
             .nodes
             .values()
-            .filter(|node| node.phase == "evacuating")
+            .filter(|node| matches!(node.phase.as_str(), "evacuating" | "draining"))
             .map(|node| node.node_id.clone())
+            .collect();
+        let pending: Vec<_> = task
+            .operations
+            .iter()
+            .filter(|(_, op)| op.phase == "Prepared" && sources.contains(&op.source_node_id))
+            .map(|(id, op)| (id.clone(), op.clone()))
             .collect();
         for id in &sources {
             let node = &task.nodes[id];
@@ -684,6 +736,15 @@ impl CoordinatorRpc {
                 return Err(Error::Conflict);
             }
             let snapshot = session.snapshot().await?;
+            let restore: BTreeSet<_> = pending
+                .iter()
+                .filter(|(_, op)| {
+                    op.was_running
+                        && op.source_node_id == *id
+                        && op.source_session_id == node.node_session_id
+                })
+                .map(|(_, op)| (op.environment_id.as_str(), op.source_generation))
+                .collect();
             let grants: Vec<_> = snapshot
                 .environments
                 .values()
@@ -693,10 +754,17 @@ impl CoordinatorRpc {
                             record.state != EnvironmentState::Deleted || record.resources_held
                         })
                 })
-                .map(|stored| pb::NodeUpgradeGrant {
-                    environment_id: stored.spec.id.clone(),
-                    assignment_generation: stored.assignment.generation,
-                    actions: vec!["route".into()],
+                .map(|stored| {
+                    let generation = stored.assignment.generation;
+                    let mut actions = vec!["route".into()];
+                    if restore.contains(&(stored.spec.id.as_str(), generation)) {
+                        actions.push("resume".into());
+                    }
+                    pb::NodeUpgradeGrant {
+                        environment_id: stored.spec.id.clone(),
+                        assignment_generation: generation,
+                        actions,
+                    }
                 })
                 .collect();
             // Close delayed/queued task Pause calls while admitted work settles.
@@ -705,12 +773,6 @@ impl CoordinatorRpc {
                 self.control(task, id, "evacuating", grants).await?;
             }
         }
-        let pending: Vec<_> = task
-            .operations
-            .iter()
-            .filter(|(_, op)| op.phase == "Prepared" && sources.contains(&op.source_node_id))
-            .map(|(id, op)| (id.clone(), op.clone()))
-            .collect();
         let mut changed = false;
         for (id, op) in pending {
             let stored = session.get(&op.environment_id).await?;
@@ -730,13 +792,23 @@ impl CoordinatorRpc {
             let Some(record) = stored.result.as_ref() else {
                 continue;
             };
+            let paused = record.state == EnvironmentState::Paused && !record.resources_held;
+            let user_paused = paused
+                && checkpoint_pause(record).is_some_and(|receipt| {
+                    !receipt.id.starts_with("task:")
+                        && receipt.expected_revision >= op.source_revision
+                });
             let original_state = if op.was_running {
-                record.state == EnvironmentState::Running
-                    && record.resources_held
-                    && record.runtime.ip.is_some()
+                user_paused
+                    || (record.state == EnvironmentState::Running
+                        && record.resources_held
+                        && record.runtime.ip.is_some())
             } else {
-                record.state == EnvironmentState::Paused && !record.resources_held
+                paused
             };
+            let restore_source = op.was_running
+                && paused
+                && migration_pause_matches(record, &task.task_id, &id, op.source_revision);
             if stored.assignment.node_id != op.source_node_id
                 || stored.assignment.generation != op.source_generation
                 || stored.invalidated
@@ -747,11 +819,11 @@ impl CoordinatorRpc {
                     .is_some_and(|recovery| recovery.pending)
                 || record.restart_pending
                 || record.revision < op.source_revision
-                || !original_state
+                || (!original_state && !restore_source)
             {
                 continue;
             }
-            let view = self.node_view(&node, &op.environment_id).await?;
+            let (mut client, view) = self.checked_node(&node, &op.environment_id).await?;
             if view.unknown
                 || view.task_id != task.task_id
                 || view.epoch != task.epoch
@@ -763,15 +835,48 @@ impl CoordinatorRpc {
             let Some(local) = view.environment else {
                 continue;
             };
-            if local.durability != pb::Durability::Published as i32 {
-                continue;
-            }
+            let published = local.durability == pb::Durability::Published as i32;
             let Some(local) = local.record else {
                 continue;
             };
             let local: EnvironmentRecord = local.try_into()?;
-            if &local != record || session.get(&op.environment_id).await? != stored {
+            let restore_id = format!("task:{}:abort:{id}", task.task_id);
+            let resumed_here = |record: &EnvironmentRecord| {
+                record.assignment == stored.assignment
+                    && record.state == EnvironmentState::Running
+                    && record.resources_held
+                    && record.runtime.ip.is_some()
+                    && record.last_operation.as_ref().is_some_and(|receipt| {
+                        receipt.kind == adx_core::LifecycleKind::Resume && receipt.id == restore_id
+                    })
+            };
+            // A retry may find the previous restore journaled locally while its
+            // publication is pending. EnsureRunning will resync that execution.
+            let exact = published && &local == record && (!paused || view.backends == 0);
+            if !(exact || restore_source && resumed_here(&local))
+                || session.get(&op.environment_id).await? != stored
+            {
                 continue;
+            }
+            if restore_source {
+                let result = client
+                    .ensure_environment_running(pb::EnsureEnvironmentRunningRequest {
+                        assignment: Some(stored.assignment.clone().try_into()?),
+                        operation_id: restore_id.clone(),
+                        node_session_id: op.source_session_id.clone(),
+                        run_timeout_seconds: None,
+                    })
+                    .await
+                    .map_err(adx_protocol::dependency_status)?
+                    .into_inner();
+                let restored = result.record.ok_or(Error::Conflict)?.try_into()?;
+                if result.durability != pb::Durability::Published as i32 || !resumed_here(&restored)
+                {
+                    return Err(Error::Unavailable(
+                        "rollback source restore not published".into(),
+                    ));
+                }
+                self.commit(restored, op.source_session_id.clone()).await?;
             }
             task.operations.get_mut(&id).ok_or(Error::Conflict)?.phase = "Cancelled".into();
             changed = true;
@@ -901,8 +1006,14 @@ impl CoordinatorRpc {
         if request.pod_uid != previous.pod_uid || session.id == previous.node_session_id {
             return Ok(false);
         }
-        if previous.pod_uid != previous.original_pod_uid
-            || !matches!(previous.phase.as_str(), "evacuating" | "quiescing")
+        let original_pod = previous.pod_uid == previous.original_pod_uid;
+        let rollback_replacement =
+            task.phase == "Aborting" && request.rollback && previous.phase == "quiescing";
+        if !(original_pod || rollback_replacement)
+            || !matches!(
+                previous.phase.as_str(),
+                "evacuating" | "draining" | "quiescing"
+            )
             || request.delete_intent
             || previous.delete_resource_version.is_some()
             || request.node_session_id != session.id
@@ -1031,6 +1142,19 @@ impl CoordinatorRpc {
         closed: bool,
     ) -> Result<()> {
         let mut state = self.0.state.lock().await;
+        if !closed {
+            let expected = &task.nodes.get(id).ok_or(Error::Conflict)?.node_session_id;
+            // Registration also holds this state lock. Do not release a pause
+            // acquired by a successor after the previous adxlet acknowledged.
+            if state
+                .nodes
+                .get(id)
+                .and_then(|node| node.session.as_ref())
+                .is_none_or(|session| &session.id != expected)
+            {
+                return Err(Error::Conflict);
+            }
+        }
         let node = state
             .session
             .set_upgrade_node_scheduling(&task.task_id, task.epoch, id, closed)
@@ -1044,6 +1168,39 @@ impl CoordinatorRpc {
         state.nodes.insert(id.into(), node);
         self.0.changed.notify_waiters();
         Ok(())
+    }
+    async fn confirm_upgrade_delete(
+        &self,
+        mut task: UpgradeTask,
+        request: &Action,
+    ) -> Result<Value> {
+        let node = task
+            .nodes
+            .get_mut(&request.node_id)
+            .ok_or(Error::Conflict)?;
+        if node.pod_uid != request.pod_uid
+            || (!request.node_session_id.is_empty()
+                && request.node_session_id != node.node_session_id)
+            || node.phase != "quiescing"
+            || node.permit_id.as_deref() != Some(&request.permit_id)
+            || request.pod_resource_version.is_empty()
+            || node
+                .delete_resource_version
+                .as_ref()
+                .is_some_and(|rv| rv != &request.pod_resource_version)
+        {
+            return Err(Error::Conflict);
+        }
+        let inspection = self.inspect_upgrade(&request.node_id).await?;
+        if inspection["strict_empty"] != true || inspection["phase"] != "Quiescing" {
+            return Err(Error::Conflict);
+        }
+        // Replays of the same confirmation must not modify the permit or its RV.
+        if node.delete_resource_version.is_none() {
+            node.delete_resource_version = Some(request.pod_resource_version.clone());
+            self.save_task(task).await?;
+        }
+        Ok(inspection)
     }
     async fn quiesce_upgrade(&self, task: &mut UpgradeTask, id: &str) -> Result<Value> {
         if task.operations.values().any(|operation| {
@@ -1214,7 +1371,7 @@ impl CoordinatorRpc {
                 if task
                     .nodes
                     .get(&r.node_id)
-                    .is_none_or(|n| n.phase != "evacuating")
+                    .is_none_or(|n| !matches!(n.phase.as_str(), "evacuating" | "draining"))
                 {
                     return Err(Error::Conflict);
                 }
@@ -1236,7 +1393,12 @@ impl CoordinatorRpc {
                 let requested_target =
                     (!r.target_node_id.is_empty()).then_some(r.target_node_id.as_str());
                 let target = self
-                    .migration_target(&stored, requested_target, &r.checkpoint_storage_alias)
+                    .migration_target(
+                        &task,
+                        &stored,
+                        requested_target,
+                        &r.checkpoint_storage_alias,
+                    )
                     .await?;
                 let target_node = self.upgrade_node(&target).await?;
                 self.require_matching_rootfs(&source_node, &target_node, Some(&stored.spec))
@@ -1288,6 +1450,11 @@ impl CoordinatorRpc {
                 }
                 let source_node = self.migration_source_node(&task, &r).await?;
                 if !op.automatic_target {
+                    if binding.phase == "draining"
+                        && !task.drain_target_eligible(&op.target_node_id, &op.target_session_id)
+                    {
+                        return Err(Error::Conflict);
+                    }
                     let target_node = self.migration_target_node(&op).await?;
                     self.require_matching_rootfs(&source_node, &target_node, Some(&stored.spec))
                         .await?;
@@ -1333,6 +1500,16 @@ impl CoordinatorRpc {
                 if paused.state != EnvironmentState::Paused || paused.resources_held {
                     return Err(Error::Conflict);
                 }
+                if op.was_running
+                    && !migration_pause_matches(
+                        paused,
+                        &task.task_id,
+                        &r.operation_id,
+                        op.source_revision,
+                    )
+                {
+                    return Err(Error::Conflict);
+                }
                 self.prove_migration_source_stopped(
                     &mut task,
                     &r.operation_id,
@@ -1341,7 +1518,7 @@ impl CoordinatorRpc {
                 )
                 .await?;
                 let candidate = if op.automatic_target {
-                    let target = self.migration_target(&stored, None, "").await?;
+                    let target = self.migration_target(&task, &stored, None, "").await?;
                     let node = self.upgrade_node(&target).await?;
                     self.require_matching_rootfs(&source_node, &node, Some(&stored.spec))
                         .await?;
@@ -1586,6 +1763,7 @@ impl CoordinatorRpc {
     }
     async fn migration_target(
         &self,
+        task: &UpgradeTask,
         stored: &StoredEnvironment,
         target: Option<&str>,
         checkpoint_storage_alias: &str,
@@ -1644,13 +1822,52 @@ impl CoordinatorRpc {
                     .as_ref()
                     .or(record.snapshot_source.as_ref())
             });
-        let spec =
-            recovery::checkpoint_spec(stored, point, Some(source), &BTreeSet::new(), target)?;
+        let excluded = if task
+            .nodes
+            .get(&stored.assignment.node_id)
+            .is_some_and(|node| node.phase == "draining")
+        {
+            state
+                .nodes
+                .values()
+                .filter(|node| {
+                    node.session.as_ref().is_none_or(|session| {
+                        !task.drain_target_eligible(&node.node.id, &session.id)
+                    })
+                })
+                .map(|node| node.node.id.clone())
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let spec = recovery::checkpoint_spec(stored, point, Some(source), &excluded, target)?;
         state
             .scheduler
             .recovery_candidate(&spec)?
             .ok_or(Error::NoCapacity)
     }
+}
+
+fn checkpoint_pause(record: &EnvironmentRecord) -> Option<&adx_core::CompletedOperation> {
+    record.last_operation.as_ref().filter(|receipt| {
+        receipt.kind == adx_core::LifecycleKind::Pause
+            && record
+                .checkpoint
+                .as_ref()
+                .is_some_and(|point| point.id == receipt.id)
+    })
+}
+
+fn migration_pause_matches(
+    record: &EnvironmentRecord,
+    task_id: &str,
+    operation_id: &str,
+    revision: u64,
+) -> bool {
+    checkpoint_pause(record).is_some_and(|receipt| {
+        receipt.id == format!("task:{task_id}:{operation_id}")
+            && receipt.expected_revision == revision
+    })
 }
 
 // This admission check covers the deployment-owned local EROFS root only.
