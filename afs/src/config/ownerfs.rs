@@ -50,6 +50,51 @@ pub(super) fn validate(role: Role, cfg: &Config) -> Result<()> {
     if cfg.ownerfs_mount.is_some() && !cfg.ownerfs {
         return Err(invalid("ownerfs_mount requires fs=ownerfs or fs=all"));
     }
+    // AFS-managed paths (FUSE mounts, disposable caches, egress targets) must
+    // never overlap the business data root in either direction: a mount or
+    // cache inside it can be adopted as a workspace, and startup adoption
+    // must not expose AFS's own tree as business data; the reverse nesting
+    // hides the data root behind AFS's own tree (or lets a cache GC wipe it).
+    let data_dir = &cfg.ownerfs_data_dir;
+    let overlaps = |internal: &std::path::Path| {
+        internal == data_dir || internal.starts_with(data_dir) || data_dir.starts_with(internal)
+    };
+    if cfg
+        .ownerfs_mount
+        .as_ref()
+        .is_some_and(|mount| overlaps(mount))
+    {
+        return Err(invalid("ownerfs_mount must not overlap ownerfs_data_dir"));
+    }
+    if cfg.dfs_mount.as_ref().is_some_and(|mount| overlaps(mount)) {
+        return Err(invalid("dfs_mount must not overlap ownerfs_data_dir"));
+    }
+    if cfg
+        .ownerfs_workspace_egress_root
+        .as_ref()
+        .is_some_and(|egress| overlaps(egress))
+    {
+        return Err(invalid(
+            "ownerfs_workspace_egress_root must not overlap ownerfs_data_dir",
+        ));
+    }
+    if cfg
+        .dfs_peer_cache
+        .as_ref()
+        .is_some_and(|cache| overlaps(&cache.directory))
+    {
+        return Err(invalid(
+            "dfs_peer_cache.directory must not overlap ownerfs_data_dir",
+        ));
+    }
+    if let Some(backend) = &cfg.dfs_external_backend
+        && let Some(cache) = &backend.cache
+        && overlaps(&cache.directory)
+    {
+        return Err(invalid(
+            "dfs_external_backend cache directory must not overlap ownerfs_data_dir",
+        ));
+    }
     if cfg.experimental_ownerfs_workspace_bind {
         if role != Role::Node || !cfg.ownerfs || cfg.ownerfs_mount.is_none() {
             return Err(invalid(
@@ -142,6 +187,95 @@ mod tests {
         cfg.ownerfs_workspace_default_uid = Some(0);
         cfg.ownerfs_workspace_default_gid = Some(12345);
         assert_eq!(cfg.workspace_default_identity().unwrap(), (0, 12345));
+    }
+
+    #[test]
+    fn ownerfs_data_dir_must_not_overlap_afs_managed_paths() {
+        let mut cfg =
+            Config::resolve(Role::Node, super::super::Cli::parse_from(["afs-node"])).unwrap();
+        cfg.ownerfs = true;
+        // Baseline: resolved defaults do not overlap.
+        validate(Role::Node, &cfg).unwrap();
+
+        // FUSE mounts: either direction recurses through AFS itself.
+        cfg.ownerfs_mount = Some(cfg.ownerfs_data_dir.join("mount"));
+        assert!(
+            validate(Role::Node, &cfg)
+                .unwrap_err()
+                .message()
+                .contains("ownerfs_mount")
+        );
+        cfg.ownerfs_mount = Some(std::path::PathBuf::from("/mnt/adx"));
+        cfg.ownerfs_data_dir = std::path::PathBuf::from("/mnt/adx/ownerfs-data");
+        assert!(
+            validate(Role::Node, &cfg)
+                .unwrap_err()
+                .message()
+                .contains("ownerfs_mount")
+        );
+
+        cfg.ownerfs_mount = None;
+        cfg.ownerfs_data_dir = std::path::PathBuf::from("/srv/users");
+        // DFS mount inside the data root: adoption could claim the mount.
+        cfg.dfs_mount = Some(std::path::PathBuf::from("/srv/users/dfs"));
+        assert!(
+            validate(Role::Node, &cfg)
+                .unwrap_err()
+                .message()
+                .contains("dfs_mount")
+        );
+
+        // Egress targets inside the data root.
+        cfg.dfs_mount = None;
+        cfg.ownerfs_workspace_egress_root = Some(std::path::PathBuf::from("/srv/users/egress"));
+        assert!(
+            validate(Role::Node, &cfg)
+                .unwrap_err()
+                .message()
+                .contains("ownerfs_workspace_egress_root")
+        );
+
+        // Disposable caches inside the data root.
+        cfg.ownerfs_workspace_egress_root = None;
+        cfg.dfs_peer_cache = Some(crate::config::DfsPeerCacheConfig {
+            directory: std::path::PathBuf::from("/srv/users/peer-cache"),
+            capacity_bytes: 4096,
+        });
+        assert!(
+            validate(Role::Node, &cfg)
+                .unwrap_err()
+                .message()
+                .contains("dfs_peer_cache")
+        );
+        cfg.dfs_peer_cache = None;
+        cfg.dfs_external_backend = Some(crate::config::DfsExternalBackendConfig {
+            store_id: "s".into(),
+            generation: "g".into(),
+            endpoint: "http://127.0.0.1:1".into(),
+            bucket: "b".into(),
+            region: "r".into(),
+            allow_http: false,
+            unsigned_payload: None,
+            payload_checksum: None,
+            upload_concurrency: None,
+            worker_threads: None,
+            credentials_file: None,
+            cache: Some(crate::config::DfsExternalCacheConfig {
+                directory: std::path::PathBuf::from("/srv/users/cache"),
+                capacity_bytes: 4096,
+                pending_bytes: 4096,
+                cache_large_write: false,
+            }),
+        });
+        assert!(
+            validate(Role::Node, &cfg)
+                .unwrap_err()
+                .message()
+                .contains("dfs_external_backend")
+        );
+        cfg.dfs_external_backend = None;
+        // Overlap removed: the same configuration validates again.
+        validate(Role::Node, &cfg).unwrap();
     }
 }
 
