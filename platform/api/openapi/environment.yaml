@@ -39,7 +39,7 @@ paths:
     get:
       tags: [Resources]
       operationId: listManagedImages
-      summary: Page tenant-owned image publication receipts and references
+      summary: Page bounded summaries of tenant-owned image publications
       parameters:
         - {name: after, in: query, schema: {type: string}}
         - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 100}}
@@ -71,7 +71,7 @@ paths:
     get:
       tags: [Resources]
       operationId: getManagedImage
-      summary: Query an image publication and authoritative consumer references
+      summary: Query a publication receipt and its last observed references
       responses:
         '200':
           description: Envelope containing the publication view
@@ -82,7 +82,7 @@ paths:
       tags: [Resources]
       operationId: mutateManagedImage
       summary: Manage publication, holds, retention or an operator deletion claim
-      description: claim_deletion and finish_deletion require an administrator and Coordinator managed_image_reclamation=true. Registry I/O and blob GC remain outside this API.
+      description: observe and reconcile_abandoned require an administrator. claim_deletion and finish_deletion also require Coordinator managed_image_reclamation=true. Registry requests and physical GC run in a separate operator process.
       requestBody:
         required: true
         content:
@@ -775,7 +775,6 @@ components:
         required:
         - operation
         - outputs
-        - execution_id
         properties:
           operation:
             const: plan
@@ -785,10 +784,11 @@ components:
             maxProperties: 128
             additionalProperties:
               type: string
-          execution_id:
+          builder_id:
             type: string
             minLength: 1
             maxLength: 256
+            description: Running producer Environment. An administrator may omit this for a controlled operator writer.
       - type: object
         additionalProperties: false
         required:
@@ -802,6 +802,25 @@ components:
             additionalProperties:
               type: string
               pattern: ^sha256:[0-9a-f]{64}$
+      - type: object
+        additionalProperties: false
+        required: [operation]
+        properties:
+          operation: {const: cancel_preparation}
+      - type: object
+        additionalProperties: false
+        required: [operation, digests, writer_fence, expected_revision]
+        properties:
+          operation: {const: reconcile_abandoned}
+          digests:
+            type: object
+            additionalProperties: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+          writer_fence:
+            type: string
+            minLength: 1
+            maxLength: 256
+            description: Audit identity for the original writer's confirmed shutdown or revocation.
+          expected_revision: {type: integer, minimum: 1}
       - type: object
         additionalProperties: false
         required:

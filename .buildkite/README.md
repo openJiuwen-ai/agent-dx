@@ -34,6 +34,10 @@ request confirms process spawn; graceful-stop tests separately wait for the chil
 to report that its TERM handler is installed before sending Stop. This keeps the
 fixture startup race separate from the production termination contract.
 
+Platform component CI also runs the managed image regressions against isolated
+Redis and mTLS fixtures. They cover durable admission fencing, lost executions,
+receipt paging and publication budgets.
+
 ## Pipeline controls
 
 Base builds publish verified candidates to OBS by default. PyPI publication remains opt-in.

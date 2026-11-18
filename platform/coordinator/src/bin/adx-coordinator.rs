@@ -23,6 +23,8 @@ struct Config {
     #[serde(default)]
     managed_image_reclamation: bool,
     #[serde(default)]
+    managed_images: Option<adx_coordinator::rpc::ManagedImageConfig>,
+    #[serde(default)]
     storage_domains: std::collections::BTreeMap<String, adx_core::volumes::StorageDomain>,
     #[serde(default)]
     checkpoint_reclaimers: Vec<adx_checkpoint_storage::reclaim::ReclaimerConfig>,
@@ -155,6 +157,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for store in config.checkpoint_reclaimers {
         reclaimers.insert(store.build()?)?;
     }
+    let rpc = if let Some(policy) = config.managed_images {
+        rpc.with_managed_image_config(policy)?
+    } else {
+        if config.managed_image_reclamation {
+            return Err("managed_image_reclamation requires a managed Registry scope".into());
+        }
+        rpc
+    };
     let rpc = rpc
         .with_managed_image_reclamation(config.managed_image_reclamation)
         .with_volume_domains(config.storage_domains)?

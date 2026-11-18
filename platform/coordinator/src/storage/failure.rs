@@ -126,12 +126,18 @@ impl Session {
                         }
                     }
                 }
-                if !inputs.is_empty() {
+                let image_dependencies = &environment.spec.execution.managed_image_publications;
+                if !inputs.is_empty() || !image_dependencies.is_empty() {
                     holds.push((
                         artifacts::hold_key(&environment.assignment),
                         encode(&artifacts::ExecutionHold {
                             assignment: environment.assignment.clone(),
                             artifacts: inputs,
+                            tenant_id: environment.spec.tenant_id.clone(),
+                            managed_image_publications: image_dependencies.clone(),
+                            node_session_id: session_id.into(),
+                            host_uuid: host_uuid(node.node.labels.get(NODE_HOST_UUID_LABEL))
+                                .map(|id| id.to_string()),
                         })?,
                     ));
                 }

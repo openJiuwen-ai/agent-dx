@@ -179,6 +179,11 @@ adxlet 使用 `CheckpointAccess` 捕获和取得恢复目录；Coordinator 使�
 可复用 Snapshot 通过引用被恢复使用，使用中删除直接返回 Sandbox 列表。
 配置、流程和故障边界见[Checkpoint 存储](../testing/snapshot-storage.md)。
 
+受管镜像依赖随 Environment 执行配置和 Snapshot 模板持久化。新增引用和删除授权
+使用同一个 Redis 准入版本。节点失联时按租户和执行代次保留引用，原会话或匹配主机
+完成对账后解除。Coordinator 提供轻量分页和独立的引用检查；验证 Registry 回执、
+删除 manifest 和物理 GC 由部署侧的运维流程负责。见[受管镜像 API](../../platform/api/http/managed-images.md)。
+
 ## E2B 兼容入口与公共平台能力
 
 E2B 入口复用 Platform Environment、可靠 fromImage → Golden Snapshot 准备和原生 Snapshot 查询，不经过 Agent Template/Activator。公共准备目录只保留单个 current preparation 与 latest-success 指针，同名准备串行；不保存多 build 历史或 tag 目录。E2B 仅接受 default tag，旧 buildID 不再是当前准备或 latest-success 时返回 404；`GET /v2/templates` 明确不支持，Golden 使用原生 Snapshot 列表。

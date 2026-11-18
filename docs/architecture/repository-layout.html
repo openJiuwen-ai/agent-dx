@@ -116,6 +116,10 @@
 <p><code>ArtifactReclaimer</code> 回收 S3/AFS。匿名恢复点属于 Environment，运行时文件使用独立保护；</p>
 <p>可复用 Snapshot 通过引用被恢复使用，使用中删除直接返回 Sandbox 列表。</p>
 <p>配置、流程和故障边界见<a href="../testing/snapshot-storage.md">Checkpoint 存储</a>。</p>
+<p>受管镜像依赖随 Environment 执行配置和 Snapshot 模板持久化。新增引用和删除授权</p>
+<p>使用同一个 Redis 准入版本。节点失联时按租户和执行代次保留引用，原会话或匹配主机</p>
+<p>完成对账后解除。Coordinator 提供轻量分页和独立的引用检查；验证 Registry 回执、</p>
+<p>删除 manifest 和物理 GC 由部署侧的运维流程负责。见<a href="../../platform/api/http/managed-images.md">受管镜像 API</a>。</p>
 <h2 id="section-12">E2B 兼容入口与公共平台能力</h2>
 <p>E2B 入口复用 Platform Environment、可靠 fromImage → Golden Snapshot 准备和原生 Snapshot 查询，不经过 Agent Template/Activator。公共准备目录只保留单个 current preparation 与 latest-success 指针，同名准备串行；不保存多 build 历史或 tag 目录。E2B 仅接受 default tag，旧 buildID 不再是当前准备或 latest-success 时返回 404；<code>GET /v2/templates</code> 明确不支持，Golden 使用原生 Snapshot 列表。</p>
 <p>运行策略默认值保存在 EnvironmentSpec.run_policy，动态 timer 只属于当前 owner adxlet。Connect 只延长、setTimeout 替换（0 到期），由 owner 串行接受；crash 或 preserve 重启后成功接管现存 Runtime 时按默认时长重建 timer；preserve 必须在心跳期限内通过同节点身份和地址复核，不延长存活期限。显式 drain 计划退役会使旧 owner 会话失效。节点计划升级先 Pause 并确认恢复点／结果持久化，或完成排空；升级后通过 Connect 恢复，恢复节点须保留匹配原 Spec 的 profile/bootstrap，必要时沿原生恢复调度重新分配。Pause 停 timer，Resume 新周期；暂停态更新仅影响下一周期一次，Snapshot 源流程保留原 deadline 并计入拍摄时间。Coordinator 转发读写到 owner，不保存动态 control、不扫描或 claim 运行到期；Gateway 只负责鉴权、执行身份和正常路由撤销，不承担运行 deadline 准入或逐流 expiry guard。<code>startedAt</code> 来自原生首次成功 Running，运行态 <code>endAt</code> 为估计，暂停态来自真实恢复点保留期限。</p>

@@ -1,11 +1,18 @@
-use adx_core::managed_images::{ImageRetention, ManagedImage, PublicationState};
+use adx_core::managed_images::{
+    ImagePublisher, ImageRetention, ManagedImage, PublicationState, RegistryScope,
+};
 use std::collections::BTreeMap;
 
 fn image() -> ManagedImage {
     ManagedImage::new(
+        "a".repeat(64),
         "tenant",
         "request-1",
         ImageRetention::Ephemeral { grace_seconds: 60 },
+        RegistryScope {
+            authority: "registry.test".into(),
+            repository_prefix: "managed".into(),
+        },
         100,
     )
     .unwrap()
@@ -39,11 +46,14 @@ fn retain_retry_remains_idempotent_when_lease_history_is_full() {
 fn grace_starts_after_last_reference_and_new_use_restarts_it() {
     let mut image = image();
     let tagged = format!(
-        "registry.test/managed/publications/{}/service-0:build",
+        "registry.test/managed/0123456789abcdef0123456789abcdef/publications/{}/service-0:build",
         image.id
     );
     image
-        .plan(BTreeMap::from([("single".into(), tagged)]), 101)
+        .plan(
+            BTreeMap::from([("single".into(), tagged)]),
+            ImagePublisher::Operator,
+        )
         .unwrap();
     image
         .publish(
@@ -75,15 +85,18 @@ fn legacy_repositories_and_changed_completion_are_rejected() {
     assert!(image
         .plan(
             BTreeMap::from([("single".into(), "registry.test/history:old".into())]),
-            101
+            ImagePublisher::Operator
         )
         .is_err());
     let tagged = format!(
-        "registry.test/managed/publications/{}/service-0:build",
+        "registry.test/managed/0123456789abcdef0123456789abcdef/publications/{}/service-0:build",
         image.id
     );
     image
-        .plan(BTreeMap::from([("single".into(), tagged)]), 101)
+        .plan(
+            BTreeMap::from([("single".into(), tagged)]),
+            ImagePublisher::Operator,
+        )
         .unwrap();
     let outputs = BTreeMap::from([("single".into(), format!("sha256:{}", "b".repeat(64)))]);
     image.publish(outputs.clone(), 102).unwrap();
@@ -94,6 +107,105 @@ fn legacy_repositories_and_changed_completion_are_rejected() {
             104
         )
         .is_err());
+}
+
+#[test]
+fn managed_scope_and_attempt_identity_bound_the_publication() {
+    let mut image = image();
+    let target = |authority: &str, collection: &str, output: &str| {
+        format!(
+            "{authority}/managed/{collection}/publications/{}/{}:build",
+            "a".repeat(64),
+            output
+        )
+    };
+    let collection = "0123456789abcdef0123456789abcdef";
+    let valid = target("registry.test", collection, "service-0");
+    assert!(image
+        .plan(
+            BTreeMap::from([(
+                "single".into(),
+                target("foreign.test", collection, "service-0")
+            )]),
+            ImagePublisher::Operator
+        )
+        .is_err());
+    assert!(image
+        .plan(
+            BTreeMap::from([
+                ("first".into(), valid.clone()),
+                (
+                    "second".into(),
+                    target("registry.test", "0".repeat(32).as_str(), "service-1")
+                ),
+            ]),
+            ImagePublisher::Operator
+        )
+        .is_err());
+    let outputs = BTreeMap::from([("single".into(), valid)]);
+    let owner = ImagePublisher::Environment {
+        id: "builder".into(),
+        generation: 7,
+    };
+    image.plan(outputs.clone(), owner.clone()).unwrap();
+    image.plan(outputs.clone(), owner).unwrap();
+    assert!(image
+        .plan(
+            outputs,
+            ImagePublisher::Environment {
+                id: "builder".into(),
+                generation: 8
+            }
+        )
+        .is_err());
+}
+
+#[test]
+fn confirmed_abandonment_keeps_partial_bytes_and_independent_holds() {
+    let mut abandoned = image();
+    abandoned.cancel_preparation().unwrap();
+    abandoned.cancel_preparation().unwrap();
+    assert!(abandoned.admission_open());
+    assert!(abandoned
+        .plan(BTreeMap::new(), ImagePublisher::Operator)
+        .is_err());
+    assert!(!abandoned.reclaimable(u64::MAX));
+
+    let mut image = image();
+    let base = format!(
+        "registry.test/managed/{}/publications/{}",
+        "0".repeat(32),
+        image.id
+    );
+    let first = format!("{base}/service-0:build");
+    image
+        .plan(
+            BTreeMap::from([
+                ("first".into(), first.clone()),
+                ("second".into(), format!("{base}/service-1:build")),
+            ]),
+            ImagePublisher::Operator,
+        )
+        .unwrap();
+    image.retain("reader").unwrap();
+    assert!(image.cancel_preparation().is_err());
+    let result = BTreeMap::from([("first".into(), format!("sha256:{}", "a".repeat(64)))]);
+    assert!(image
+        .reconcile_abandoned(result.clone(), "writer-done", 0)
+        .is_err());
+    image
+        .reconcile_abandoned(result.clone(), "writer-done", image.revision)
+        .unwrap();
+    image.reconcile_abandoned(result, "writer-done", 0).unwrap();
+    assert_eq!(image.outputs.len(), 1);
+    assert!(!image.leases.contains("publisher"));
+    assert!(image.leases.contains("reader"));
+    assert_eq!(image.state, PublicationState::Abandoned);
+    image.release("reader").unwrap();
+    image.observe_after_admission(&[], 200, 1).unwrap();
+    image.observe_after_admission(&[], 220, 2).unwrap();
+    assert!(!image.reclaimable(279));
+    assert!(image.reclaimable(280));
 }
 
 #[test]

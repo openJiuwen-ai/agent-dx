@@ -12,6 +12,7 @@ mod collection;
 mod dependencies;
 mod environment_control;
 mod managed_images;
+pub use managed_images::ManagedImageConfig;
 mod metrics;
 mod node_retirement;
 mod observation;
@@ -336,7 +337,7 @@ impl State {
                 // A stale or aborted recovery queue must never recreate an
                 // already-published Environment as a fresh execution.
                 Err(Error::Conflict)
-            } else if self.persistent_dependencies(&spec).await? {
+            } else if Self::persistent_dependencies(&spec) {
                 self.session
                     .reserve_with_request(
                         spec.clone(),
@@ -451,6 +452,9 @@ impl State {
 }
 struct Inner {
     managed_image_reclamation: std::sync::atomic::AtomicBool,
+    image_config: std::sync::OnceLock<ManagedImageConfig>,
+    image_session: Session,
+    image_observation: tokio::sync::Semaphore,
     business: Arc<std::sync::RwLock<Option<observation::BusinessSnapshot>>>,
     business_fenced: Arc<std::sync::atomic::AtomicBool>,
     volume_domains: std::sync::RwLock<BTreeMap<String, adx_core::volumes::StorageDomain>>,
@@ -696,6 +700,9 @@ impl CoordinatorRpc {
         let departed_sessions = session.departed_node_sessions().await?;
         let service = Self(Arc::new(Inner {
             managed_image_reclamation: std::sync::atomic::AtomicBool::new(false),
+            image_config: std::sync::OnceLock::new(),
+            image_session: session.clone(),
+            image_observation: tokio::sync::Semaphore::new(1),
             business: Arc::new(std::sync::RwLock::new(business)),
             business_fenced: Default::default(),
             upgrade_lock: Mutex::new(()),
@@ -977,7 +984,9 @@ impl CoordinatorRpc {
                 }));
             }
             Ok(_) | Err(Error::NotFound) => {
-                cloning::normalize(&session, raw).await.map_err(status)?
+                cloning::normalize(&session, raw, self.managed_registry())
+                    .await
+                    .map_err(status)?
             }
             Err(error) => return Err(status(error)),
         };

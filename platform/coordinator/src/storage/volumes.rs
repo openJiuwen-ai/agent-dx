@@ -774,6 +774,7 @@ impl Session {
         let mut artifacts = Vec::new();
         let mut references = Vec::new();
         let mut memberships = Vec::new();
+        let mut image_gates = BTreeSet::new();
         let mut sessions = Vec::new();
         for (field, value) in fields {
             checks.insert(
@@ -782,6 +783,9 @@ impl Session {
             );
             if field.starts_with("environment:") {
                 let record: StoredEnvironment = decode(value)?;
+                if !catalog.control.contains_key(field) {
+                    image_gates.extend(super::managed_images::image_gate_fields(&record.spec));
+                }
                 for key in [
                     format!("node:{}", record.assignment.node_id),
                     format!("node-session:{}", record.assignment.node_id),
@@ -817,12 +821,13 @@ impl Session {
         }
         let _access = self.store.lock_artifacts(&references)?;
         let mut command = redis::cmd("EVAL");
-        command.arg(r#"
+        command.arg(super::managed_images::admission_script(r#"
             if redis.call('HGET',KEYS[1],'header') ~= ARGV[1] then return 0 end
             local expected=cjson.decode(ARGV[3])
             for field,value in pairs(expected) do if (redis.call('HGET',KEYS[1],field) or '') ~= value then return 0 end end
             local facts=cjson.decode(ARGV[4])
             if facts[1] ~= '' and (redis.call('HGET',KEYS[4],facts[1]) or '') ~= facts[2] then return 0 end
+            if not admit_images(KEYS[5],cjson.decode(ARGV[#ARGV])) then return 0 end
             local cursor=6
             for _=1,tonumber(ARGV[5]) do redis.call('HSET',KEYS[1],ARGV[cursor],ARGV[cursor+1]); cursor=cursor+2 end
             local count=tonumber(ARGV[cursor]); cursor=cursor+1
@@ -836,10 +841,11 @@ impl Session {
             for _,key in ipairs(cjson.decode(ARGV[cursor])) do redis.call('HINCRBY',KEYS[1],key,1) end
             cursor=cursor+1
             for field,value in pairs(cjson.decode(ARGV[cursor])) do redis.call('HSET',KEYS[1],field,value) end
-            for i=cursor+1,#ARGV,2 do redis.call('HSET',KEYS[3],ARGV[i],ARGV[i+1]) end
+            for i=cursor+1,#ARGV-1,2 do redis.call('HSET',KEYS[3],ARGV[i],ARGV[i+1]) end
             return 1
-        "#).arg(4).arg(&self.store.key).arg(self.volumes_key())
+        "#)).arg(5).arg(&self.store.key).arg(self.volumes_key())
             .arg(format!("{}:artifacts",self.store.key)).arg(format!("{}:business",self.store.key))
+            .arg(super::managed_images::image_gates_key(&self.store.key))
             .arg(expected).arg(encode(header)?).arg(encode(&checks)?)
             .arg(counters.map(CounterUpdate::argument).transpose()?.unwrap_or_else(|| r#"["","",""]"#.into()))
             .arg(fields.len());
@@ -855,6 +861,7 @@ impl Session {
                 .arg(artifacts::artifact_key(&artifact))
                 .arg(encode(&artifact)?);
         }
+        command.arg(encode(&image_gates)?);
         let values = RedisStore::publication_values(
             fields.iter().map(|(f, v)| (f.as_str(), Some(v.as_str()))),
         )?;

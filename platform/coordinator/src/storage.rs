@@ -8,7 +8,7 @@ mod publication;
 mod transport;
 pub use claims::{ClaimOutcome, LocalClaim};
 mod artifacts;
-mod managed_images;
+pub(crate) mod managed_images;
 pub use artifacts::ArtifactDeletionGuard;
 mod collection;
 mod credentials;
@@ -875,15 +875,20 @@ impl RedisStore {
     ) -> Result<bool> {
         let (name, old, next) = field.ok_or(Error::Conflict)?;
         let values = Self::publication_values([(name, Some(next.as_str()))])?;
-        let references = if name.starts_with("environment:") {
-            decode::<StoredEnvironment>(&next)?
-                .result
-                .as_ref()
-                .map(artifacts::record_references)
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
+        let environment = name
+            .starts_with("environment:")
+            .then(|| decode::<StoredEnvironment>(&next))
+            .transpose()?;
+        let references = environment
+            .as_ref()
+            .and_then(|record| record.result.as_ref())
+            .map(artifacts::record_references)
+            .unwrap_or_default();
+        let image_gates = environment
+            .as_ref()
+            .filter(|_| old.is_none())
+            .map(|record| managed_images::image_gate_fields(&record.spec))
+            .unwrap_or_default();
         // Upgrade barriers and node control still share the header CAS. Artifact
         // references use scoped exclusion so unrelated attachments can publish
         // independently under the same Coordinator epoch.
@@ -895,8 +900,7 @@ impl RedisStore {
             None
         };
         let _access = self.lock_artifacts(&references)?;
-        let membership = if name.starts_with("environment:") {
-            let environment: StoredEnvironment = decode(&next)?;
+        let membership = if let Some(environment) = environment {
             format!("node-ownership:{}", environment.assignment.node_id)
         } else {
             String::new()
@@ -922,7 +926,7 @@ impl RedisStore {
             String::new()
         };
         let mut cmd = redis::cmd("EVAL");
-        cmd.arg(r#"
+        cmd.arg(managed_images::admission_script(r#"
             if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
             local old = redis.call('HGET',KEYS[1],ARGV[2])
             if ARGV[3] == '' then if old then return 0 end
@@ -935,19 +939,22 @@ impl RedisStore {
             for field,value in pairs(checks) do
                 if (redis.call('HGET',KEYS[1],field) or '') ~= value then return 0 end
             end
+            if not admit_images(KEYS[4],cjson.decode(ARGV[11])) then return 0 end
             redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
             if ARGV[8] ~= '' then redis.call('HSET',KEYS[1],'header',ARGV[9]) end
             if facts[1] ~= '' then redis.call('HSET',KEYS[3],facts[1],facts[3]) end
             if ARGV[5] ~= '' then redis.call('HSET',KEYS[1],'node-session:' .. string.sub(ARGV[2],6),ARGV[5]) end
             if ARGV[6] ~= '' then redis.call('HINCRBY',KEYS[1],ARGV[6],1) end
-            for i=11,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
+            for i=12,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
             return 1
-        "#).arg(3).arg(&self.key).arg(format!("{}:artifacts", self.key)).arg(format!("{}:business", self.key))
+        "#)).arg(4).arg(&self.key).arg(format!("{}:artifacts", self.key)).arg(format!("{}:business", self.key))
+            .arg(managed_images::image_gates_key(&self.key))
             .arg(header.epoch.to_string()).arg(name).arg(old.unwrap_or("")).arg(next).arg(node_session).arg(membership)
             .arg(counters.map(CounterUpdate::argument).transpose()?.unwrap_or_else(|| r#"["","",""]"#.into()))
             .arg(guarded_header.as_ref().map(|pair| pair.0.as_str()).unwrap_or(""))
             .arg(guarded_header.as_ref().map(|pair| pair.1.as_str()).unwrap_or(""))
-            .arg(encode(&checks.iter().map(|(key, value)| (key, value.as_deref().unwrap_or(""))).collect::<BTreeMap<_, _>>())?);
+            .arg(encode(&checks.iter().map(|(key, value)| (key, value.as_deref().unwrap_or(""))).collect::<BTreeMap<_, _>>())?)
+            .arg(encode(&image_gates)?);
         for artifact in references.into_iter().filter(|a| a.storage != "local") {
             cmd.arg(artifacts::artifact_key(&artifact))
                 .arg(encode(&artifact)?);

@@ -261,7 +261,12 @@ impl Api {
         {
             let id = path.strip_prefix("/api/environment/v1/managed-images/");
             let input = if method == "POST" {
-                match body(request.into_body(), 131_072).await {
+                match body(
+                    request.into_body(),
+                    adx_core::managed_images::MANAGED_IMAGE_MUTATION_BYTES,
+                )
+                .await
+                {
                     Ok(value) => value,
                     Err(error) => return error_response(error, &request_id, None, None, false),
                 }

@@ -1,38 +1,107 @@
 # Managed images
 
-Managed images are explicit, durable publication resources. Environments and reusable Snapshots are consumers, not owners of the publisher's lease. Registry manifests and blobs remain in the operator's Registry. Ordinary external image creation and legacy builds do not enroll images or authorize deletion.
+A managed publication owns a release receipt and caller holds. The Coordinator
+protects its queued, executing, dormant and recoverable consumers. Registry
+manifest traversal, deletion and physical garbage collection run in an
+operator process.
 
-The authenticated public endpoint is `/api/environment/v1/managed-images`. `POST` accepts `{"operation":"begin","request_id":"persisted-client-identity","retention":{"mode":"ephemeral","grace_seconds":86400}}`. Retained policy is `{"mode":"retained"}`. A tenant-scoped request ID deterministically identifies one publication; changed begin arguments conflict. Persist the request identity before submission. Never replay a native build solely because its response was lost.
+Before enrolling publications, reserve a fresh repository prefix in the
+Registry for this control plane's managed writers. Scope writer and operator
+credentials to their assigned namespaces. The configured authority and prefix
+must match the managed runtime profiles. For example, set the following
+Coordinator configuration in a qualified deployment:
 
-`POST /api/environment/v1/managed-images/<id>` accepts the following domain mutations:
+```json
+{
+  "managed_images": {
+    "registry": {"authority": "registry.example.internal", "repository_prefix": "managed"},
+    "publisher_profiles": ["managed-build"],
+    "max_records_per_tenant": 100000,
+    "max_pending_per_tenant": 128
+  },
+  "managed_image_reclamation": false
+}
+```
+
+The limits shown are defaults. Pending preparations and publications consume
+the pending budget. All durable request identities, including tombstones,
+consume the records budget. Exceeding a budget rejects new allocation while
+existing request IDs can be queried and replayed. Keep these budgets and Registry
+capacity under observation. Only enroll builds in the reserved scope.
+
+`POST /api/environment/v1/managed-images` begins a publication with
+`{"operation":"begin","request_id":"persisted-client-identity","retention":{"mode":"ephemeral","grace_seconds":86400}}`.
+Use `{"mode":"retained"}` for permanent retention. The server allocates an
+unpredictable publication ID, then atomically records the tenant's request
+mapping. Replay returns the original ID even after cancellation or deletion.
+Changed initial retention conflicts. Persist the request ID before calling.
+
+`POST /api/environment/v1/managed-images/<id>` accepts these operations:
 
 | Operation | Fields | Contract |
 | --- | --- | --- |
-| `plan` | `outputs` (name → tagged reference), `execution_id` | Register every output before native publication. A different execution identity conflicts, even with the same plan. |
-| `publish` | `digests` (name → sha256 digest) | Complete all planned outputs atomically; repeated identical completion succeeds. Partial or changed completion fails. |
-| `retain` | `lease_id` | Add a durable caller hold. Repeating an active hold succeeds; released identities cannot be reused. |
-| `release` | `lease_id` | Idempotently release only that hold. The initial lease is `publisher`. |
-| `extend` | `retain_until` (UNIX seconds) | Monotonically extend the minimum retention deadline. |
+| `plan` | `outputs` (name to tagged reference), `builder_id` | Register every output before starting publication. The builder must be a running Environment of this tenant and an allowed managed profile, with a durable dependency on this publication. The plan records its execution generation. Administrators can omit `builder_id` for their own controlled writer. |
+| `publish` | `digests` (name to sha256 digest) | Commit all planned outputs. The registered builder generation must still own the publication. For an operator plan, an administrator commits the receipt. Identical committed receipts are replayable. |
+| `cancel_preparation` | none | Settle a preparation before a plan was registered. The publisher hold is released and the request ID cannot allocate another writer. |
+| `reconcile_abandoned` | `digests`, `writer_fence`, `expected_revision` | An administrator confirms durable writer shutdown or revocation, verifies every planned tag and submits the present subset, including empty. The publisher hold is released and other holds remain. Present outputs follow the normal retention and grace rules. |
+| `retain` | `lease_id` | Acquire a durable caller hold. Replaying an active hold succeeds. Released IDs cannot be reused. |
+| `release` | `lease_id` | Release just that hold, idempotently. The initial hold is `publisher`. |
+| `extend` | `retain_until` (UNIX seconds) | Extend the minimum retention deadline. |
 | `pin` | none | Select retained policy. |
-| `set_retention` | `retention`, `expected_revision` | Explicit policy change using a current receipt; a stale revision conflicts. |
-| `observe` | none | Reconcile authoritative references and record the first observed unreferenced time. |
-| `claim_deletion` | `manifests` (immutable references) | Administrator only, and only with Coordinator `managed_image_reclamation=true`; fresh roots are checked atomically with admission. |
-| `finish_deletion` | none | Administrator acknowledgement after the persisted manifest worklist is confirmed absent. This does not acknowledge blob GC. |
+| `set_retention` | `retention`, `expected_revision` | Change policy with a current revision and restart grace observation. |
+| `observe` | none | An administrator records a bounded sample of protected references and the first authoritative observation of zero references. |
+| `claim_deletion` | `manifests` (immutable references) | An administrator records the verified manifest worklist while reclamation is enabled. The claim compares the current admission version and closes admission atomically. |
+| `finish_deletion` | none | An administrator acknowledges the persisted worklist is absent. |
 
-`GET` on the collection returns `items` and `next_page_token`. Use `after=<token>&limit=1..100`; pages use a tenant-scoped sorted index rather than loading all historic receipts. `GET` on an ID returns one view. Reads do not mutate timestamps. Views contain `image`, `eligible_for_reclamation`, `reclaimable`, `reclamation_enabled`, and `inventory_epoch`. Eligibility remains visible with deletion disabled, allowing observation and dry-run before activation; `reclaimable` additionally requires the enable switch. As with other native Environment endpoints, HTTP responses use the base64 JSON envelope. Errors preserve the common structured HTTP contract. Explicit `tenant=<id>` selection requires an administrator; ordinary callers cannot override their credential tenant.
+Each plan uses one session collection under
+`<authority>/<prefix>/<collection-id>/publications/<publication-id>/<output>`.
+Plans allow at most 128 outputs. Lease identities are bounded to 256 bytes,
+with at most 4096 active and released identities together per publication.
+Keep one logical hold through application retries. Long-lived templates and
+other consumers outside the Environment and Snapshot catalog must own a
+durable caller hold. The HTTP/RPC mutation limit is 512 KiB and the manifest
+worklist must fit inside that limit with room for the operation envelope.
 
-Each publication uses fresh repositories containing `/publications/<id>/`. Existing repositories cannot be adopted. Plans are bounded to 128 outputs; each explicit lease identity is at most 256 characters, with at most 4096 active/released identities per publication. Runtime references do not consume lease identities. Hold an application lease across many retries instead of allocating a lease for each attempt. Deleted receipts retain identities and output digests but compact completed deletion worklists and release history; IDs are never resurrected.
+The collection GET returns bounded `items` summaries and `next_page_token`.
+Use `after=<token>&limit=1..100`. A point GET returns the full receipt with
+the most recent observed references. GET responses do not claim a fresh
+inspection. `observe` reports `references_current=true`, a sample of up to
+32 roots and candidate eligibility even when deletion is disabled.
+`reclaimable` additionally requires the enable switch. All responses use
+the Environment base64 JSON envelope, and `tenant=<id>` requires an
+administrator credential.
 
-Ordinary publication and hold mutations perform point CAS operations without scanning the Environment/Snapshot catalog. Their receipts report `references_current=false` and do not assert reclaimability. GET, `observe` and deletion claims use a fresh authoritative reference inventory and report `references_current=true`. This keeps per-build management traffic from multiplying full catalog scans under the scheduler lock. Full reference queries remain proportional to current Environment/Snapshot inventory; use paged operator reconciliation rather than tight client polling. Explicit leases that are never released remain protected, so capacity alerts and admission budgets remain necessary even with reclamation.
+The API Server translates the SDK's `extraConfig.managedImagePublications`
+transport field to structured execution dependencies once. Plain image
+references in the reserved layout must match a registered repository before
+admission. The structured dependencies are persisted with the
+Environment and captured by Snapshots. An execution that loses its node
+preserves image roots by tenant and generation through retirement. Node
+reconciliation releases those holds only for the original session or a
+verified matching host identity.
 
-Admission recognizes managed references in the root image, rootfs and image mounts, including plain string references. Managed Compose preparations also supply `execution.extra_config.managedImagePublications`; all inner images belong to that publication. Both central and local-first scheduling persist managed dependencies before crossing the runtime boundary, including when optional local-first claim persistence is disabled. Snapshot normalization inherits captured managed dependencies regardless of client overrides; retained/deleting Snapshots, queued creates, dormant Environments and unresolved execution holds protect them. Unresolved holds conservatively block reclamation when their dependency inventory cannot be reconstructed. No heartbeat timeout releases a caller lease.
+Both initial reservation paths and Snapshot creation increase an admission
+version in the same Redis write as the new root. Pending central creates
+also protect the publication. Observation scans persistent roots in bounded
+pages outside the scheduler lock. A deletion claim fails if a new root
+arrived during the scan or if the scan exceeds its budget. The next
+successful observation restarts grace after new admission. Image age and
+heartbeat loss do not start grace.
 
-Grace starts at the first authoritative reconciliation that observes a completed publication with no caller or platform roots. This may be later than the last actual release. Admission clears the timestamp before exposing a consumer; removing that consumer requires a new full grace period. Retained policy and `retain_until` override eligibility. Preparing/Publishing records remain protected after partial pushes, crashes or unknown outcomes. Only complete verified receipts can settle publication; absence of a tag or a lost client is not proof that a late publisher cannot finish.
+Unplanned cancellations and verified abandoned publications settle metadata
+with audit receipts. Keep unknown publishers protected until their writer is
+fenced. A missing tag alone is insufficient. Before claiming deletion the
+operator verifies live Registry tag/digest receipts and resolves the manifest
+graph. Interrupted deletion resumes the same persisted worklist. Do not use
+the reclamation tool during a compatibility rollback or after restoring Redis
+from a stale backup. Reconcile writers, running and recoverable consumers,
+and publication receipts before resuming destructive operations.
 
-The same Coordinator mutex guards new consumer admission and deletion claims. The Redis epoch fences old Coordinators; CAS stores opaque validated bytes. A deletion claim persists its full repository-scoped worklist before any Registry request, and blocks new consumers through restarts and partial failures. Retrying the same claim is idempotent. A deleting publication is never automatically reopened, including after Registry timeouts. Registry access and deletion credentials stay in a separate operator process. No Registry network request runs under the scheduler mutex.
+Use a separately authorized maintenance window for physical Registry GC. GC
+scans the entire storage domain, so preserving existing data requires a
+verified recovery copy or independent physical storage. Cached image and
+checkpoint bytes have their own lifetime policies.
 
-Reclamation is disabled by default. Enabling it requires separate rollout authorization and isolated qualification of the backend, SDK, runtime tools and Registry version. Redis must preserve authoritative data across process restarts. Restoring an older control-plane backup is a disaster recovery operation: disable reclaimers, inventory surviving runtimes/Snapshots and Registry receipts, and reconcile before re-enabling. A stale backup is not evidence of zero references.
-
-The Buildkite Platform component explicitly runs the real Redis publication-restart test and the managed-image mTLS RPC cases. The local `storage` suite also includes publication persistence; `control-rpc` includes consumer/deletion fencing. These opt-in regressions must remain in the gates when adding lifecycle cases.
-
-Manifest deletion, Registry blob GC, BuildKit cache eviction and Dragonfly cache eviction are separate operations. GC scans its physical storage domain and may collect historical unreferenced content even when manifest deletions were scoped. Repository prefixes do not isolate GC. Use an explicitly authorized no-writer/read-only maintenance procedure, a verified recovery copy, a dry-run and retained-digest checks, or a physically separate storage domain for ephemeral data. The API never promises preservation after an out-of-band administrator deletes Registry data. External consumers must retain a lease while they require a managed publication.
+The Platform CI gate runs the managed image state machine, isolated Redis
+storage and mTLS RPC regressions. Native Nydus/checkpoint and physical GC
+qualification also runs in the consumer's owned deployment fixture.

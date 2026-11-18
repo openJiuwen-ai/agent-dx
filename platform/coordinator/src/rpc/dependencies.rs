@@ -2,15 +2,10 @@
 use super::*;
 
 impl State {
-    pub(super) async fn persistent_dependencies(&self, spec: &EnvironmentSpec) -> Result<bool> {
+    pub(super) fn persistent_dependencies(spec: &EnvironmentSpec) -> bool {
         // Redis must own dependencies before runtime I/O, including the interval
         // before the first execution result in either scheduling path.
-        Ok(crate::storage::has_volumes(spec)
-            || !self
-                .session
-                .managed_image_dependencies(spec)
-                .await?
-                .is_empty())
+        crate::storage::has_volumes(spec) || !spec.execution.managed_image_publications.is_empty()
     }
 
     pub(super) async fn prepare_dependencies(

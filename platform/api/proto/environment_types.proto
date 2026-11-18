@@ -201,6 +201,8 @@ message ExecutionOptions {
   WorkloadProcess process = 17;
   repeated NetworkRule protected_ingress = 18;
   repeated uint32 private_service_ports = 19;
+  // Platform artifact dependencies, separate from backend runtime configuration.
+  repeated string managed_image_publications = 20;
 }
 
 enum IdleAction { IDLE_ACTION_DELETE = 0; IDLE_ACTION_PAUSE = 1; }

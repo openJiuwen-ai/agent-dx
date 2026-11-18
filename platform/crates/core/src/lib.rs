@@ -217,6 +217,7 @@ impl EnvironmentSpec {
             ));
         }
         self.lifecycle.validate()?;
+        managed_images::validate_dependencies(&self.execution.managed_image_publications)?;
         self.resources.validate()?;
         self.scheduling.validate()?;
         self.execution.validate(&self.resources)

@@ -247,7 +247,7 @@ The SDK distribution is `adx-environment`, its Python import is `adx_environment
 - [Architecture and repository layout](docs/architecture/repository-layout.md)
 - [Agent usage](agent/README.md)
 - [Environment API](gateway/apiserver/docs/environment-lifecycle-api.md) and [OpenAPI](platform/api/openapi/environment.yaml)
-- [Managed image ownership, references and operator reclamation](platform/api/http/managed-images.md)
+- [Managed Registry publication scope, durable image ownership and operator reclamation](platform/api/http/managed-images.md)
 - [Coordinator autoscaling HTTP](docs/deployment/coordinator-autoscaling.md)
 - [Data-plane OpenAPI](platform/api/openapi/data-plane.yaml)
 - [Runtime HTTP actions and errors](platform/api/http/runtime-data.md)

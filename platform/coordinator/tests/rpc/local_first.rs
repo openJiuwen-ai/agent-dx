@@ -3,13 +3,47 @@ use super::*;
 #[tokio::test]
 #[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
 async fn managed_image_dependencies_are_durable_before_either_runtime_start() {
-    use adx_core::managed_images::{ImageRetention, ManagedImage};
+    use adx_core::managed_images::{ImagePublisher, ImageRetention, ManagedImage, RegistryScope};
     let mut rig = Rig::new().await;
     let image = rig
         .session
         .begin_managed_image(
-            ManagedImage::new("tenant", "admission", ImageRetention::Retained, 1).unwrap(),
+            ManagedImage::new(
+                "b".repeat(64),
+                "tenant",
+                "admission",
+                ImageRetention::Retained,
+                RegistryScope {
+                    authority: "registry.test".into(),
+                    repository_prefix: "managed".into(),
+                },
+                1,
+            )
+            .unwrap(),
+            1024,
+            128,
         )
+        .await
+        .unwrap();
+    let repository = format!(
+        "registry.test/managed/0123456789abcdef0123456789abcdef/publications/{}/service-0",
+        image.id
+    );
+    let digest = format!("sha256:{}", "a".repeat(64));
+    rig.session
+        .mutate_managed_image("tenant", &image.id, |image| {
+            image.plan(
+                std::collections::BTreeMap::from([(
+                    "single".into(),
+                    format!("{repository}:build"),
+                )]),
+                ImagePublisher::Operator,
+            )?;
+            image.publish(
+                std::collections::BTreeMap::from([("single".into(), digest.clone())]),
+                2,
+            )
+        })
         .await
         .unwrap();
     for central in [true, false] {
@@ -21,16 +55,11 @@ async fn managed_image_dependencies_are_durable_before_either_runtime_start() {
         let mut raw = spec(id);
         if central {
             // Plain SDK image strings must protect the publication too.
-            raw.image = format!(
-                "registry.test/managed/publications/{}/service-0@sha256:{}",
-                image.id,
-                "a".repeat(64)
-            );
+            raw.image = format!("{repository}@{digest}");
         } else {
-            raw.execution.extra_config = serde_json::json!({
-                "managedImagePublications": [image.id.clone()]
-            })
-            .to_string();
+            raw.execution
+                .managed_image_publications
+                .insert(image.id.clone());
         }
         let mut request = create(id);
         request.spec = Some(raw.into());

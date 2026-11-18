@@ -7,6 +7,14 @@ use adx_core::CheckpointArtifact;
 pub struct ExecutionHold {
     pub assignment: Assignment,
     pub artifacts: Vec<CheckpointArtifact>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tenant_id: String,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub managed_image_publications: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_uuid: Option<String>,
 }
 
 /// Serializes artifact references with deletion in the single active Coordinator.
@@ -103,7 +111,9 @@ impl Session {
             .fields([HEADER.into(), format!("node:{node}")])
             .await?;
         self.header(&header)?;
-        let stored = self.get_node(node).await?;
+        let raw_node = raw_node.as_deref().ok_or(Error::Conflict)?;
+        let stored: StoredNode = decode(raw_node)?;
+        stored.node.validate()?;
         if stored
             .session
             .as_ref()
@@ -113,23 +123,32 @@ impl Session {
         }
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(r#"
-            if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] or redis.call('HGET',KEYS[1],ARGV[2]) ~= ARGV[3] then return 0 end
+            if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] or redis.call('HGET',KEYS[1],ARGV[2]) ~= ARGV[3] then return {0,{}} end
             local values = redis.call('HGETALL',KEYS[2])
+            local removed = {}
             for i=1,#values,2 do
-                if cjson.decode(values[i+1]).assignment.node_id == ARGV[4] then redis.call('HDEL',KEYS[2],values[i]) end
+                local hold = cjson.decode(values[i+1])
+                local images = hold.managed_image_publications
+                local same_host = hold.node_session_id == ARGV[5]
+                    or (ARGV[6] ~= '' and hold.host_uuid == ARGV[6])
+                if hold.assignment.node_id == ARGV[4] and (not images or #images == 0 or same_host) then
+                    redis.call('HDEL',KEYS[2],values[i])
+                    table.insert(removed,values[i])
+                end
             end
-            return 1
+            return {1,removed}
         "#).arg(2).arg(&self.store.key).arg(format!("{}:input-holds",self.store.key))
             .arg(self.epoch.to_string()).arg(format!("node:{node}"))
-            .arg(raw_node.as_deref().ok_or(Error::Conflict)?).arg(node);
+            .arg(raw_node).arg(node).arg(session)
+            .arg(host_uuid(stored.node.labels.get(NODE_HOST_UUID_LABEL)).map(|id| id.to_string()).unwrap_or_default());
         let mut inventory = self.inspection.lock().await;
         let mut committed = inventory.take();
-        match self.store.query::<u64>(cmd).await {
-            Ok(1) => {
+        match self.store.query::<(u64, Vec<String>)>(cmd).await {
+            Ok((1, removed)) => {
                 if let Some(inventory) = committed.as_mut() {
-                    inventory
-                        .holds
-                        .retain(|_, hold| hold.assignment.node_id != node);
+                    for field in removed {
+                        inventory.holds.remove(&field);
+                    }
                 }
                 *inventory = committed;
                 Ok(())

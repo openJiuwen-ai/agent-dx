@@ -31,5 +31,7 @@
   "discovery_ttl_seconds": 15,
   "metrics_listen": "127.0.0.1:19090",
   "autoscaling_listen": "127.0.0.1:19092",
-  "checkpoint_reclaimers": []
+  "checkpoint_reclaimers": [],
+  "managed_images": null,
+  "managed_image_reclamation": false
 }

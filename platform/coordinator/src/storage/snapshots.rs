@@ -69,7 +69,7 @@ impl Session {
             .transpose()?;
         let mut command = redis::cmd("EVAL");
         command
-            .arg(
+            .arg(super::managed_images::admission_script(
                 r#"
             if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
             if ARGV[6] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[6] then return 0 end
@@ -79,6 +79,7 @@ impl Session {
             if ARGV[3] == '' then
                 if old then return 0 end
             elseif old ~= ARGV[3] then return 0 end
+            if not admit_images(KEYS[4],cjson.decode(ARGV[#ARGV])) then return 0 end
             redis.call('HSET', KEYS[2], ARGV[2], ARGV[4])
             if ARGV[5] ~= '' then redis.call('HSET', KEYS[1], 'header', ARGV[5]) end
             local cursor = 12
@@ -91,11 +92,12 @@ impl Session {
             end
             return 1
         "#,
-            )
-            .arg(3)
+            ))
+            .arg(4)
             .arg(&self.store.key)
             .arg(self.snapshots_key())
             .arg(self.volumes_key())
+            .arg(super::managed_images::image_gates_key(&self.store.key))
             .arg(self.epoch.to_string())
             .arg(id)
             .arg(old.unwrap_or(""))
@@ -116,6 +118,12 @@ impl Session {
         } else {
             command.arg(0);
         }
+        let image_gates = if old.is_none() {
+            super::managed_images::image_gate_fields(&next.template)
+        } else {
+            Vec::new()
+        };
+        command.arg(encode(&image_gates)?);
         let mut committed = inventory.take();
         match self.store.query::<u64>(command).await {
             Ok(1) => {

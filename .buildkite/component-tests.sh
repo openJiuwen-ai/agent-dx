@@ -65,4 +65,6 @@ if [[ $component == platform ]]; then
   python3 build/ci/rpc_certificates.py "$ADX_TEST_TLS_DIR"
   cargo test --locked --package=adx-coordinator --test storage --test rpc \
     -j "${JOBS:-4}" managed_image -- --ignored --test-threads=1
+  cargo test --locked --package=adx-coordinator --lib -j "${JOBS:-4}" \
+    managed_image -- --ignored --test-threads=1
 fi

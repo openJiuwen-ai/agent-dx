@@ -1,14 +1,20 @@
 //! Snapshot creation inherits runtime geometry and defaults to source-node
 //! affinity. Its reference protects the artifact while restoring the execution.
 use super::*;
+use adx_core::managed_images::RegistryScope;
 use adx_core::snapshots::{Reference, Snapshot, SnapshotState};
 
 pub(super) async fn normalize(
     session: &Session,
     request: pb::EnvironmentSpec,
+    registry: Option<&RegistryScope>,
 ) -> Result<EnvironmentSpec> {
     let Some(id) = &request.snapshot_id else {
-        return request.try_into();
+        let mut spec = request.try_into()?;
+        session
+            .normalize_managed_image_dependencies(&mut spec, registry)
+            .await?;
+        return Ok(spec);
     };
     let snapshot = session.get_snapshot(id).await?;
     let reference = Reference::Restore {
@@ -34,23 +40,18 @@ pub(super) async fn normalize(
         return Err(Error::Conflict);
     }
     let mut inherited = inherit_template(request, &snapshot, existing.as_ref())?;
-    let captured = session
-        .managed_image_dependencies(&snapshot.template)
+    inherited.execution.managed_image_publications.extend(
+        snapshot
+            .template
+            .execution
+            .managed_image_publications
+            .iter()
+            .cloned(),
+    );
+    session
+        .normalize_managed_image_dependencies(&mut inherited, registry)
         .await?;
-    if !captured.is_empty() {
-        let mut extra: serde_json::Map<String, serde_json::Value> =
-            if inherited.execution.extra_config.is_empty() {
-                serde_json::Map::new()
-            } else {
-                serde_json::from_str(&inherited.execution.extra_config)
-                    .map_err(|_| Error::Invalid("invalid restore runtime configuration".into()))?
-            };
-        let mut ids = session.managed_image_dependencies(&inherited).await?;
-        ids.extend(captured);
-        extra.insert("managedImagePublications".into(), serde_json::json!(ids));
-        inherited.execution.extra_config = serde_json::to_string(&extra)
-            .map_err(|_| Error::Invalid("invalid managed image dependencies".into()))?;
-    }
+    inherited.validate()?;
     Ok(inherited)
 }
 
