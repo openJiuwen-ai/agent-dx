@@ -89,6 +89,7 @@ impl RootMeta for Meta {
                 .filter(|root| root.home_node_id == home)
                 .into_iter()
                 .collect(),
+            root_epoch_watermark: 0,
         })
     }
     fn acquire_root(&self, _: &RootId, _: RootRight) -> Result<RootGrant> {

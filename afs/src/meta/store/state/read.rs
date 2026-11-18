@@ -566,6 +566,7 @@ impl State {
             home_node_id: home_node_id.to_owned(),
             roots,
             reservations,
+            root_epoch_watermark: state.root_epoch_watermark(),
         })
     }
 }

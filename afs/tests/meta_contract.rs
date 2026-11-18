@@ -1370,6 +1370,10 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
     assert_eq!(listed.active_roots[0].root_id, "workspace-a");
     assert!(listed.pending_reservations.is_empty());
     assert!(listed.authority_revision > 0);
+    assert_eq!(
+        listed.root_epoch_watermark,
+        listed.active_roots[0].root_epoch
+    );
 
     let remote_access = owner_rpc
         .acquire_root(Request::new(AcquireRootRequest {

@@ -342,6 +342,7 @@ impl RootMeta for ContractMeta {
                 .filter(|reservation| reservation.home_node_id == home_node_id)
                 .into_iter()
                 .collect(),
+            root_epoch_watermark: 0,
         })
     }
 

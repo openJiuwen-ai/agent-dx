@@ -594,6 +594,7 @@ impl OwnerRootsService for OwnerRootsRpc {
                 .map(wire_reservation)
                 .collect(),
             authority_revision: output.authority_revision.0,
+            root_epoch_watermark: output.root_epoch_watermark,
         }))
     }
 

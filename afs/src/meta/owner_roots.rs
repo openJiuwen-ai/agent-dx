@@ -716,6 +716,7 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                 authority_revision: scan.revision,
                 active_roots: scan.roots,
                 pending_reservations: scan.reservations,
+                root_epoch_watermark: scan.root_epoch_watermark,
             })
         })
     }
@@ -1338,6 +1339,7 @@ pub struct ListOwnerRootsOutput {
     pub authority_revision: StoreRevision,
     pub active_roots: Vec<RootRecord>,
     pub pending_reservations: Vec<RootReservationRecord>,
+    pub root_epoch_watermark: u64,
 }
 
 /// 全局 Active root 快照（outlet 镜像面输入）。

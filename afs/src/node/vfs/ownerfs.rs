@@ -8485,6 +8485,7 @@ mod tests {
                     .filter(|reservation| reservation.home_node_id == home_node_id)
                     .cloned()
                     .collect(),
+                root_epoch_watermark: 0,
             })
         }
 
