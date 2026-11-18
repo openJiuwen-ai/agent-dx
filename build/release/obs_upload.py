@@ -4,16 +4,25 @@
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
+import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
+LOG = logging.getLogger(__name__)
 DEFAULT_BUCKET = "agent-dx"
 DEFAULT_ENDPOINT = "obs.cn-southwest-2.myhuaweicloud.com"
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 TIMESTAMP = re.compile(r"^[0-9]{14}$")
+ROOTFS_ARCHES = ("amd64", "arm64")
+BOOTSTRAP_ROOTFS_AMD64 = (
+    "adx/daily/20261117235108-4104c42e7783/linux/amd64/adx-execd.tar.gz",
+    "bc073cceac7c09317ede57110ccbb93522177cba02f24a2ef79ba593c0920fa5",
+)
 
 
 def digest(path):
@@ -120,6 +129,65 @@ def checked_upload(client, bucket, object_path, path):
         raise RuntimeError(f"OBS readback verification failed for {path.name}")
 
 
+def rootfs_candidate_key(arch):
+    return f"adx/rootfs-reuse/linux/{arch}/manifest.json"
+
+
+def read_rootfs_candidate(client, bucket, endpoint, arch):
+    key = rootfs_candidate_key(arch)
+    with tempfile.TemporaryDirectory(prefix="adx-rootfs-candidate-") as tmp:
+        path = Path(tmp) / "manifest.json"
+        response = client.getObject(bucket, key, downloadPath=str(path))
+        if response.status == 404:
+            return None
+        if response.status != 200:
+            raise RuntimeError(f"OBS EROFS reuse manifest read failed: status={response.status}")
+        if path.stat().st_size > 4096:
+            raise ValueError("invalid EROFS reuse manifest size")
+        candidate = json.loads(path.read_bytes())
+
+    if not isinstance(candidate, dict) or candidate.get("schema_version") != 1 or candidate.get("arch") != arch:
+        raise ValueError("invalid EROFS reuse manifest")
+    number = candidate.get("build_number")
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        raise ValueError("invalid EROFS reuse manifest build number")
+    commit, checksum = candidate.get("commit"), candidate.get("sha256")
+    if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
+        raise ValueError("invalid EROFS reuse manifest commit")
+    if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        raise ValueError("invalid EROFS reuse manifest package checksum")
+    prefix = re.escape(public_url(endpoint, bucket, "adx/daily/"))
+    url = candidate.get("url")
+    expected_url = rf"{prefix}[0-9]{{14}}-{commit[:12]}/linux/{arch}/adx-execd\.tar\.gz"
+    if not isinstance(url, str) or not re.fullmatch(expected_url, url):
+        raise ValueError("invalid EROFS reuse manifest package URL")
+    return candidate
+
+
+def advance_rootfs_candidate(client, manifest, build_number):
+    bucket, endpoint, arch = (manifest[key] for key in ("bucket", "endpoint", "arch"))
+    if manifest["channel"] != "daily" or manifest["platform"] != "linux" or arch not in ROOTFS_ARCHES:
+        raise ValueError("an EROFS reuse candidate requires a daily Linux release")
+    execd = next((item for item in manifest["artifacts"] if item["name"] == "adx-execd.tar.gz"), None)
+    if execd is None:
+        raise ValueError("an EROFS reuse candidate requires a daily Linux Execd archive")
+    if build_number < 1:
+        raise ValueError("an EROFS reuse candidate requires a positive Buildkite build number")
+    # The Buildkite publish jobs serialize writers per architecture. Keep the
+    # newer record if an older build or a retry reaches this step afterwards.
+    current = read_rootfs_candidate(client, bucket, endpoint, arch)
+    if current is not None and current["build_number"] >= build_number:
+        LOG.info("Keeping EROFS reuse candidate for %s from build #%s", arch, current["build_number"])
+        return
+    candidate = {"schema_version": 1, "arch": arch, "build_number": build_number,
+                 "commit": manifest["commit"], "url": execd["url"], "sha256": execd["sha256"]}
+    with tempfile.TemporaryDirectory(prefix="adx-rootfs-candidate-") as tmp:
+        path = Path(tmp) / "manifest.json"
+        path.write_text(json.dumps(candidate, indent=2) + "\n")
+        checked_upload(client, bucket, rootfs_candidate_key(arch), path)
+    LOG.info("Updated EROFS reuse candidate for %s to build #%s", arch, build_number)
+
+
 def publish(
     *, client, files, output, bucket, endpoint, channel, version, platform, arch, timestamp, commit, build_id, dry_run
 ):
@@ -151,6 +219,53 @@ def obs_client(access_key, secret_key, endpoint):
     )
 
 
+def configured_obs_client(endpoint):
+    access_key = os.getenv("OBS_ACCESS_KEY_ID")
+    secret_key = os.getenv("OBS_SECRET_ACCESS_KEY")
+    if not access_key or not secret_key:
+        raise ValueError("OBS_ACCESS_KEY_ID and OBS_SECRET_ACCESS_KEY are required")
+    return obs_client(access_key, secret_key, endpoint)
+
+
+def rootfs_candidate_main(argv):
+    parser = argparse.ArgumentParser(description="Resolve the previous ADX Execd package from OBS.")
+    parser.add_argument("--arch", choices=ROOTFS_ARCHES, required=True)
+    arch = parser.parse_args(argv).arch
+    bucket = os.getenv("ADX_OBS_BUCKET", DEFAULT_BUCKET)
+    endpoint = os.getenv("ADX_OBS_ENDPOINT", DEFAULT_ENDPOINT)
+    try:
+        client = configured_obs_client(endpoint)
+        try:
+            candidate = read_rootfs_candidate(client, bucket, endpoint, arch)
+        finally:
+            client.close()
+    except (OSError, ValueError, RuntimeError) as error:
+        LOG.warning("EROFS reuse candidate unavailable: %s", error)
+        return
+
+    if candidate is not None:
+        sys.stdout.write(f"{candidate['url']}\n{candidate['sha256']}\n")
+    elif arch == "amd64" and bucket == DEFAULT_BUCKET and normalized_endpoint(endpoint) == DEFAULT_ENDPOINT:
+        key, checksum = BOOTSTRAP_ROOTFS_AMD64
+        sys.stdout.write(f"{public_url(endpoint, bucket, key)}\n{checksum}\n")
+
+
+def advance_rootfs_candidate_main(argv):
+    parser = argparse.ArgumentParser(description="Update the EROFS reuse candidate after OBS publication.")
+    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--build-number", required=True, type=int)
+    args = parser.parse_args(argv)
+    try:
+        manifest = json.loads(args.manifest.read_text())
+        client = configured_obs_client(manifest["endpoint"])
+        try:
+            advance_rootfs_candidate(client, manifest, args.build_number)
+        finally:
+            client.close()
+    except (OSError, RuntimeError, ValueError) as error:
+        parser.exit(1, f"EROFS reuse candidate update failed: {error}\n")
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -170,15 +285,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    client = None
-    if not args.dry_run:
-        access_key = os.getenv("OBS_ACCESS_KEY_ID")
-        secret_key = os.getenv("OBS_SECRET_ACCESS_KEY")
-        if not access_key or not secret_key:
-            raise ValueError("OBS_ACCESS_KEY_ID and OBS_SECRET_ACCESS_KEY are required")
-        client = obs_client(access_key, secret_key, args.endpoint)
     manifest = publish(
-        client=client,
+        client=None if args.dry_run else configured_obs_client(args.endpoint),
         files=args.files,
         output=args.output,
         bucket=args.bucket,
@@ -193,9 +301,15 @@ def main(argv=None):
         dry_run=args.dry_run,
     )
     for artifact in manifest["artifacts"]:
-        print(f"url: {artifact['url']}")
-    print(f"manifest: {manifest['manifest_url']}")
+        sys.stdout.write(f"url: {artifact['url']}\n")
+    sys.stdout.write(f"manifest: {manifest['manifest_url']}\n")
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if sys.argv[1:2] == ["rootfs-candidate"]:
+        rootfs_candidate_main(sys.argv[2:])
+    elif sys.argv[1:2] == ["advance-rootfs-candidate"]:
+        advance_rootfs_candidate_main(sys.argv[2:])
+    else:
+        main()

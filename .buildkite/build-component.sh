@@ -66,6 +66,26 @@ case "$component" in
     if [[ -n "${ADX_RUNTIME_ROOTFS_ARCHIVE:-}" ]]; then
       rootfs_args+=(--base-archive "$ADX_RUNTIME_ROOTFS_ARCHIVE")
     fi
+    reuse_url=ADX_ROOTFS_REUSE_URL_${ADX_BUILD_ARCH^^}
+    reuse_sha256=ADX_ROOTFS_REUSE_SHA256_${ADX_BUILD_ARCH^^}
+    obs_upload=${ADX_OBS_UPLOAD:-1}
+    if [[ $ADX_BUILD_ARCH == arm64 ]]; then obs_upload=${ADX_ARM_OBS_UPLOAD:-$obs_upload}; fi
+    if [[ -n "${!reuse_url:-}${!reuse_sha256:-}" ]]; then
+      rootfs_args+=(--reuse-url "${!reuse_url:-}" --reuse-sha256 "${!reuse_sha256:-}")
+    elif [[ $obs_upload == 1 && -n ${OBS_ACCESS_KEY_ID:-} && -n ${OBS_SECRET_ACCESS_KEY:-} ]]; then
+      obs_python=${OBS_PYTHON:-/opt/buildtools/python3.9/bin/python3}
+      if [[ ! -x $obs_python ]]; then obs_python=${PYTHON:-python3}; fi
+      if ! candidate=$(timeout 20s "$obs_python" build/release/obs_upload.py rootfs-candidate --arch "$ADX_BUILD_ARCH"); then
+        echo 'EROFS reuse candidate lookup failed; building a fresh image' >&2
+      elif [[ -n $candidate ]]; then
+        mapfile -t candidate_fields <<< "$candidate"
+        if [[ ${#candidate_fields[@]} == 2 ]]; then
+          rootfs_args+=(--reuse-url "${candidate_fields[0]}" --reuse-sha256 "${candidate_fields[1]}")
+        else
+          echo 'Invalid EROFS reuse candidate output; building a fresh image' >&2
+        fi
+      fi
+    fi
     echo "--- :package: Build pinned envd"
     envd_args=(--output "$output/envd-build" --jobs "$jobs")
     if [[ -n "${ADX_ENVD_SOURCE:-}" ]]; then envd_args+=(--source "$ADX_ENVD_SOURCE"); else envd_args+=(--obs-source); fi

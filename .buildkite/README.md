@@ -61,6 +61,25 @@ by both the upstream revision and archive digest; updating the revision requires
 publishing and verifying a new archive and updating the pin.
 The standalone `build/release/build.sh` remains opt-in through `ADX_ENVD_SOURCE`.
 
+OBS-enabled Execd builds read `adx/rootfs-reuse/linux/<arch>/manifest.json` using
+the existing OBS credentials. The manifest records one published archive URL and
+SHA-256 per architecture. A successful `master` daily publish updates it after
+uploading the versioned artifacts. Publish jobs serialize updates per architecture
+and reject overwrites from earlier build numbers. The OBS credentials need read
+and write access to this prefix. An HTTP 404 permits initial creation. Unreadable
+records are left alone. If the update fails or exceeds its 30-second budget, the
+job logs a warning and keeps the successful publication result.
+
+On the default bucket, the first AMD64 lookup with no record tries the pinned
+`4104c42e7783` archive. It predates reuse fingerprints, so the build creates a
+fresh image. Unavailable or incompatible candidates also trigger a fresh build.
+Downloading a previous archive has a separate two-minute total budget.
+The Execd build verifies the archive and the binaries inside the disk, and copies
+the image byte-for-byte when Execd, envd, base filesystem and recipe match.
+Both release archives are packaged and verified against the current ADX commit.
+Set `ADX_ROOTFS_REUSE_URL_AMD64` and `ADX_ROOTFS_REUSE_SHA256_AMD64` together to
+override the automatic lookup, or use the corresponding `_ARM64` variables.
+
 | Variable | Default | Applies to / responsibility |
 |---|---|---|
 | `ADX_OBS_UPLOAD` | base `1`, SDK `0` | `0` disables OBS upload for the selected pipeline |
