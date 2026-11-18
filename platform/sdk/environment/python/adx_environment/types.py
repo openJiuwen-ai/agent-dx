@@ -687,6 +687,17 @@ class ResumeResult:
 
 
 @dataclass(frozen=True)
+class LocalRootfs:
+    """Root filesystem path on the execution node, prepared by the caller."""
+
+    path: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or not self.path.startswith("/") or "\x00" in self.path:
+            raise ValueError("local rootfs path must be an absolute node path")
+
+
+@dataclass(frozen=True)
 class S3Config:
     """S3 object storage configuration."""
 

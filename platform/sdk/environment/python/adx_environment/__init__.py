@@ -20,6 +20,7 @@ from .types import (
     PortForwarding,
     PortRange,
     S3Config,
+    LocalRootfs,
     EnvironmentInfo,
     EnvironmentFailure,
     SnapshotInfo,
@@ -36,6 +37,7 @@ SDK_CAPABILITIES = frozenset(
     {
         "local-close",
         "local-rootfs-templates",
+        "local-rootfs",
         "explicit-connection-config",
         "tunnel-proxy-port",
         "recoverable-commands",
@@ -94,6 +96,7 @@ __all__ = [
     "DNSPolicy",
     "DNSRule",
     "S3Config",
+    "LocalRootfs",
     "PortForwarding",
     "NodeInfo",
     "resources",

@@ -168,7 +168,7 @@ fn s3_rootfs_and_mount_credentials_follow_sandboxd_contract() {
 #[test]
 fn unsafe_or_inconsistent_environment_options_are_rejected() {
     for body in [
-        json!({"rootfs":{"runtime":"runsc","type":"local","path":"/host/root"}}),
+        json!({"rootfs":{"runtime":"runsc","type":"local","path":"/host/root"},"inheritEntrypoint":true}),
         json!({"image":"img","cpu":1000,"cpu_limit":500}),
     ] {
         assert_eq!(
@@ -189,6 +189,39 @@ fn unsafe_or_inconsistent_environment_options_are_rejected() {
             tonic::Code::InvalidArgument
         );
     }
+}
+
+#[test]
+fn explicit_local_rootfs_without_default_profile_preserves_process_and_probe() {
+    let process = json!({"commands":[["/bin/app","--serve"]],"cwd":"/app","user":"1001:1002"});
+    let spec = create_spec(
+        json!({
+            "name":"local-process",
+            "rootfs":{"runtime":"runsc","type":"local","path":"/host/rootfs","readonly":true},
+            "env":{"IMAGE_VALUE":"prepared"}, "process":process,
+            "readinessProbe":{"tcpSocket":{"port":18092},"periodSeconds":1,"timeoutSeconds":1}
+        }),
+        &caller(),
+    )
+    .unwrap();
+    let spec = adx_core::EnvironmentSpec::try_from(spec).unwrap();
+    assert!(spec.image.is_empty());
+    let rootfs = spec.execution.rootfs.unwrap();
+    assert_eq!(
+        rootfs.source,
+        adx_core::execution::StorageSource::Local("/host/rootfs".into())
+    );
+    assert!(rootfs.readonly);
+    assert_eq!(
+        serde_json::to_value(spec.execution.process).unwrap(),
+        process
+    );
+    assert!(spec.execution.readiness_probe.is_some());
+    assert!(!spec.execution.inherit_entrypoint);
+    assert_eq!(
+        spec.env.get("IMAGE_VALUE").map(String::as_str),
+        Some("prepared")
+    );
 }
 
 #[test]

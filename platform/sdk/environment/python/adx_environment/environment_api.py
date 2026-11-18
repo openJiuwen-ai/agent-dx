@@ -36,6 +36,7 @@ from .types import (
     IdleAction,
     ResumeResult,
     S3Config,
+    LocalRootfs,
     EnvironmentInfo,
     EnvironmentFailure,
     SnapshotInfo,
@@ -354,7 +355,7 @@ class Environment:
     def __init__(
         self,
         image: Optional[str] = None,
-        rootfs: Optional[S3Config] = None,
+        rootfs: Optional[Union[S3Config, LocalRootfs]] = None,
         runtime: Optional[str] = None,
         cpu: int = 1000,
         memory: int = 4096,
@@ -402,7 +403,8 @@ class Environment:
 
         Args:
             image: Container image to use (e.g. ``"python:3.12-slim"``).
-            rootfs: S3-compatible EROFS root filesystem configuration.
+            rootfs: S3-compatible EROFS configuration or a caller-prepared LocalRootfs
+                path on the execution node. Local entrypoints are supplied by the caller.
             rootfs_template: Deployment-registered local rootfs name. Mutually
                 exclusive with image, rootfs and snapshot_id; no host path is accepted.
             rootfs_readonly: Optional override for the deployment rootfs
@@ -485,8 +487,8 @@ class Environment:
             raise TypeError("pause_policy must be a PausePolicy")
         if image is not None and (not isinstance(image, str) or not image.strip()):
             raise ValueError("image must be a non-empty string")
-        if rootfs is not None and not isinstance(rootfs, S3Config):
-            raise TypeError("rootfs must be an S3Config")
+        if rootfs is not None and not isinstance(rootfs, (S3Config, LocalRootfs)):
+            raise TypeError("rootfs must be an S3Config or LocalRootfs")
         if image is not None and rootfs is not None:
             raise ValueError("image and rootfs are mutually exclusive")
         if rootfs_template is not None:
@@ -498,6 +500,8 @@ class Environment:
             raise TypeError("rootfs_readonly must be a boolean or None")
         if snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id.strip()):
             raise ValueError("snapshot_id must be a non-empty string")
+        if isinstance(rootfs, LocalRootfs) and snapshot_id is not None:
+            raise ValueError("rootfs cannot be combined with snapshot_id")
         if (user is None) != (group is None):
             raise ValueError("user and group must both be configured")
         if user is not None:
@@ -658,6 +662,8 @@ class Environment:
             )
         elif rootfs_template:
             body["rootfs"].update({"type": "template", "name": rootfs_template})
+        elif isinstance(rootfs, LocalRootfs):
+            body["rootfs"].update({"type": "local", "path": rootfs.path})
         elif rootfs:
             body["rootfs"].update(
                 {

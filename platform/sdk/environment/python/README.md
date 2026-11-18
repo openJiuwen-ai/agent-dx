@@ -529,6 +529,12 @@ writable-layer enforcement.
 ## Rootfs and mounts
 
 `rootfs=S3Config(...)` starts from an S3-compatible EROFS root filesystem.
+`rootfs=LocalRootfs(path="/var/lib/agentos/images/tools/rootfs")` selects a caller-prepared
+directory or file on the execution node. Import `LocalRootfs` from `adx_environment`.
+Local sources do not resolve Docker metadata or inherit an OCI entrypoint. Supply
+image environment values through `env`; an HTTP caller can provide an explicit
+`process` to start a workload. Each eligible worker must have the source path,
+or the caller must select a node where it is available.
 `Mount` supports image-backed read-only bind mounts, S3-backed bind or EROFS
 mounts, and Local bind mounts through `host_path`. Local mounts accept `options`
 (`ro` by default, or `rw`, plus `nosuid`/`nodev`/`noexec`) and `create_if_missing`
@@ -542,7 +548,7 @@ local runtime environment, so a custom rootfs does not need to bake in ADX.
 The deployment Runtime Environment is the rootfs baseline. `runtime=` overrides
 only its isolation runtime. `rootfs_readonly=True` or `False` overrides only its
 read-only setting; leaving it as `None` inherits the deployment default. Passing
-`image=` or `rootfs=S3Config(...)` replaces the source atomically while omitted
+`image=`, `rootfs=S3Config(...)` or `rootfs=LocalRootfs(...)` replaces the source atomically while omitted
 runtime/read-only fields continue to inherit. Runtime-only and read-only-only
 overrides keep the baseline source and do not add the bootstrap mount.
 

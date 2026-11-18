@@ -422,6 +422,12 @@ fn validate_rootfs_object(
             if !non_empty_string("path") {
                 return Err(invalid("local rootfs requires non-empty path"));
             }
+            if !fields["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with('/') && !path.contains('\0'))
+            {
+                return Err(invalid("local rootfs requires an absolute node path"));
+            }
         }
         _ => return Err(invalid("unsupported rootfs type")),
     }
@@ -462,7 +468,7 @@ fn storage_source(root: &Rootfs) -> Result<Option<adx_core::execution::StorageSo
             .storage_info
             .clone()
             .ok_or_else(|| invalid("S3 rootfs storageInfo is required"))?)?))),
-        "local" => Err(invalid("public local rootfs is not allowed")),
+        "local" => Ok(Some(StorageSource::Local(root.path.clone()))),
         _ => Err(invalid("unsupported rootfs type")),
     }
 }
@@ -735,10 +741,16 @@ pub fn create_spec_with_templates(
             "inheritEntrypoint=true cannot be combined with snapshotId",
         ));
     }
+    if root.r#type == "local" && r.inherit {
+        return Err(invalid(
+            "local rootfs entrypoints must be resolved by the caller into process",
+        ));
+    }
     if snapshot.is_none()
         && runtime_profile.is_none()
         && root.imageurl.trim().is_empty()
         && root.r#type != "s3"
+        && root.r#type != "local"
         && template.is_none()
     {
         return Err(invalid("image required"));

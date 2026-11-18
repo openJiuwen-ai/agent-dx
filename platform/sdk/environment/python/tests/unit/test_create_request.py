@@ -14,11 +14,45 @@ from adx_environment import (
     NetworkRule,
     PortRange,
     Environment,
+    LocalRootfs,
     TrafficPolicy,
 )
 
 
 class CreateRequestTests(unittest.TestCase):
+    def test_local_rootfs_sends_node_path_and_preserves_environment(self):
+        with Environment(
+            rootfs=LocalRootfs(path="/var/lib/agentos/images/tools/rootfs"),
+            runtime="runsc", rootfs_readonly=True, env={"IMAGE_VALUE": "prepared"},
+            detached=True, connection=self.connection,
+        ):
+            pass
+        body = json.loads(self.exchanges[0].content)
+        self.assertEqual(body["rootfs"], {
+            "runtime": "runsc", "type": "local",
+            "path": "/var/lib/agentos/images/tools/rootfs", "readonly": True,
+        })
+        self.assertEqual(body["env"], {"IMAGE_VALUE": "prepared"})
+        self.assertNotIn("image", body)
+        self.assertNotIn("inheritEntrypoint", body)
+
+    def test_local_rootfs_rejects_image_and_snapshot_before_transport(self):
+        for options in ({"image": "tools:v1"}, {"snapshot_id": "snapshot"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                Environment(rootfs=LocalRootfs("/node/rootfs"), connection=self.connection, **options)
+        self.assert_no_transport_setup()
+
+    def test_local_rootfs_requires_external_entrypoint_resolution(self):
+        with self.assertRaises(ValueError):
+            Environment(rootfs=LocalRootfs("/node/rootfs"), inherit_entrypoint=True,
+                        connection=self.connection)
+        self.assert_no_transport_setup()
+
+    def test_local_rootfs_path_is_a_node_absolute_path(self):
+        for value in ("", "relative/rootfs", None, 12, "/node/\x00rootfs"):
+            with self.subTest(path=value), self.assertRaises((ValueError, TypeError)):
+                LocalRootfs(value)
+
     def test_registered_local_rootfs_uses_name_without_host_path_or_image(self):
         with Environment(rootfs_template="tools-v1", detached=True, connection=self.connection):
             pass

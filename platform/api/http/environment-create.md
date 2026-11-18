@@ -87,6 +87,20 @@ an explicitly disabled workload. If no managed entrypoint exists, that query
 returns an error; it never starts a new process.
 
 
+## Caller-prepared Local rootfs
+
+Public creation accepts an absolute path on the execution node:
+
+```json
+{"name":"local-tools","rootfs":{"type":"local","path":"/var/lib/agentos/images/tools/rootfs","runtime":"runsc"},"env":{"IMAGE_VALUE":"prepared"}}
+```
+
+The caller prepares and retains this directory or file on every eligible node,
+or selects a node that provides it. ADX does not import Docker images for this source.
+Local workload entrypoints are supplied through the existing `process` field;
+`inheritEntrypoint=true` is rejected for an explicit Local source. Image metadata
+must be resolved by the caller into `env` and, when needed, `process`.
+
 ## Deployment-registered Local rootfs templates
 
 Deployments may configure the same `local_rootfs_templates` map in the API Server
@@ -100,7 +114,7 @@ for this source; the deployment prepares each artifact and its metadata.
 ```
 
 The API resolves the registered name to a Local source persisted with the Environment.
-Arbitrary public Local paths remain rejected. Unknown names and conflicting image,
+Unknown names and conflicting image,
 path, storage or snapshot sources fail before scheduling. Only nodes advertising
 `ADX_LOCAL_ROOTFS_<name>=ready` are eligible; adxlet validates the registered paths
 before advertising them. Artifacts must remain available for the lifetime of their
