@@ -35,7 +35,7 @@ sandboxd 是独立运行时服务。本版本在 adxlet→sandboxd 的 gRPC 边�
 
 ## 入口相关性 ID 与 Span 内容边界
 
-HTTP 入口同时接受 W3C `traceparent`/`tracestate`。没有 `traceparent` 时，入口按 `X-Trace-Id`（其次 `X-Request-Id`）确定性地派生 32 位十六进制 Trace ID；两个头都不存在时仍生成新的根 Trace。处于记录态的请求在响应中回写 `X-Trace-Id`，便于用同一编号检索日志与 Trace；关闭态不添加该响应头。
+HTTP 入口同时接受 W3C `traceparent`/`tracestate`。`traceparent` 能解析出有效远端上下文时，入口 Span 使用该上下文作为父节点；没有有效 `traceparent`（缺失、格式非法或超长）时，入口按 `X-Trace-Id`（其次 `X-Request-Id`）确定性地派生 32 位十六进制 Trace ID；两个头都不存在时仍生成新的根 Trace。处于记录态的请求在响应中回写 `X-Trace-Id`，便于用同一编号检索日志与 Trace；关闭态不添加该响应头。
 
 Span 字符串属性超过 1024 字节时保留首尾并插入省略号；请求体、文件内容、URL 和凭据不得写入属性。失败 Span 可记录 `exception` 事件（`exception.type` / `exception.message`），并使用有界错误描述作为状态消息。
 
