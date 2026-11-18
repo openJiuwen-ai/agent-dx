@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,19 +30,26 @@ class Response:
 
 
 class Client:
-    def __init__(self, failure=None, metadata_delta=0):
+    def __init__(self, failure=None, metadata_delta=0, versioning=None, versioning_status=200):
         self.failure = failure
         self.metadata_delta = metadata_delta
         self.objects = {}
         self.closed = False
+        self.versioning = versioning
+        self.versioning_status = versioning_status
 
-    def putFile(self, bucket, key, path, progressCallback=None):
+    def getBucketVersioning(self, _bucket):  # noqa: N802 - OBS SDK interface
+        response = Response(self.versioning_status)
+        response.body = self.versioning
+        return response
+
+    def putFile(self, bucket, key, path, progressCallback=None):  # noqa: N802,N803 - OBS SDK interface
         if self.failure == key:
             return Response(500)
         self.objects[(bucket, key)] = Path(path).read_bytes()
         return Response(200)
 
-    def getObjectMetadata(self, bucket, key):
+    def getObjectMetadata(self, bucket, key):  # noqa: N802 - OBS SDK interface
         body = self.objects.get((bucket, key))
         length = 0 if body is None else len(body) + self.metadata_delta
         return Response(404 if body is None else 200, length)
@@ -51,6 +59,86 @@ class Client:
 
 
 class ObsTests(unittest.TestCase):
+    def test_nightly_overwrites_a_bounded_set_across_commits_and_python_versions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            objects = {}
+            for revision, version, versioning in [("a", "0.1.0", None), ("b", "0.2.0", "Suspended")]:
+                source = root / revision
+                source.mkdir()
+                names = [
+                    "adx-release.tar.gz",
+                    "adx-release.tar.gz.sha256",
+                    "adx-execd.tar.gz",
+                    "adx-execd.tar.gz.sha256",
+                    "release-manifest.json",
+                    "build-manifest.json",
+                    f"adx_environment-{version}-py3-none-any.whl",
+                    f"adx_environment-{version}.tar.gz",
+                    "sdk-candidate.json",
+                    f"adxadmin-{version}-py3-none-any.whl",
+                    "admin-candidate.json",
+                    f"adx-runtime-runc-{revision * 12}-linux-amd64.tar.gz",
+                ]
+                files = [source / name for name in names]
+                for path in files:
+                    path.write_text(revision)
+                client = Client(versioning=versioning)
+                client.objects = objects
+                manifest = obs.publish(
+                    client=client, files=files, output=source / "obs" / "manifest.json",
+                    bucket="agent-dx", endpoint="obs.test", channel="nightly", version=None,
+                    platform="linux", arch="amd64", timestamp="20261118020000",
+                    commit=revision * 40, build_id=f"build-{revision}", dry_run=False,
+                )
+                prefix = "adx/daily/master/linux/amd64/"
+                self.assertEqual(manifest["manifest_object"], prefix + "manifest.json")
+                self.assertEqual(len(objects), 9)
+                self.assertEqual(manifest["commit"], revision * 40)
+                for item in manifest["artifacts"]:
+                    self.assertEqual(item["object"], prefix + item["name"])
+                    directory = source if item["name"] in names else source / "obs"
+                    self.assertEqual(objects[("agent-dx", item["object"])], (directory / item["name"]).read_bytes())
+                with tarfile.open(source / "obs" / "adx-extras.tar.gz") as archive:
+                    self.assertEqual(set(archive.getnames()), set(names[6:]))
+                    wheel = f"adx_environment-{version}-py3-none-any.whl"
+                    self.assertEqual(archive.extractfile(wheel).read(), revision.encode())
+                self.assertEqual(json.loads(objects[("agent-dx", prefix + "manifest.json")]), manifest)
+                self.assertEqual(list(objects)[-1], ("agent-dx", prefix + "manifest.json"))
+
+    def test_nightly_rejects_versioning_before_overwriting_objects(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            artifact = root / "adx-release.tar.gz"
+            artifact.write_text("release")
+            for client, message in [
+                (Client(versioning="Enabled"), "versioning"),
+                (Client(versioning_status=403), "versioning"),
+            ]:
+                with self.assertRaisesRegex(RuntimeError, message):
+                    obs.publish(
+                        client=client, files=[artifact], output=root / "obs" / "manifest.json",
+                        bucket="agent-dx", endpoint="obs.test", channel="nightly", version=None,
+                        platform="linux", arch="amd64", timestamp="20261118020000",
+                        commit="a" * 40, build_id="build-nightly", dry_run=False,
+                    )
+                self.assertFalse(client.objects)
+                self.assertTrue(client.closed)
+
+    def test_nightly_dry_run_needs_no_client_and_separates_architectures(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            artifact = root / "adx-release.tar.gz"
+            artifact.write_text("release")
+            for arch in ("amd64", "arm64"):
+                manifest = obs.publish(
+                    client=None, files=[artifact], output=root / arch / "manifest.json",
+                    bucket="agent-dx", endpoint="obs.test", channel="nightly", version=None,
+                    platform="linux", arch=arch, timestamp="20261118020000",
+                    commit="a" * 40, build_id="build-nightly", dry_run=True,
+                )
+                self.assertEqual(manifest["manifest_object"], f"adx/daily/master/linux/{arch}/manifest.json")
+
     def test_cli_imports_external_obs_sdk_instead_of_uploader_module(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

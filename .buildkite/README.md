@@ -696,6 +696,43 @@ Buildkite tag to publish under:
 adx/release/<version>/linux/amd64/<artifact>
 ```
 
+### Master nightly schedule
+
+`.buildkite/master-nightly.json` defines a native Buildkite schedule for master
+HEAD at 02:00 Asia/Shanghai every day. It builds Linux AMD64 and ARM64 with AFS
+and uses `ADX_OBS_UPLOAD_CHANNEL=nightly`. Create the schedule through the
+pipeline schedules API after this configuration is merged into master, then
+enable it; the checked-in definition starts disabled for that setup step.
+Buildkite may start scheduled builds within ten minutes of the configured time.
+
+Nightly uploads overwrite a bounded set of objects under:
+
+```text
+https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/master/linux/amd64/
+https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/master/linux/arm64/
+```
+
+Each directory contains `adx-release.tar.gz`, `adx-execd.tar.gz`, their SHA256
+files, `release-manifest.json`, `build-manifest.json`, and `manifest.json`.
+`adx-extras.tar.gz` and its SHA256 file contain the SDK, adxadmin candidates and
+optional runtime artifacts with their original versioned filenames. This keeps
+the public object set bounded when package versions or runtime commits change.
+The final `manifest.json` records the actual commit, timestamp, build ID and
+SHA256 values and is uploaded after all artifacts. Consumers should verify
+those hashes and retry if a download overlaps publication; updating several
+objects is not an atomic operation. These URLs track the current nightly
+publication and do not identify a permanent release.
+
+Nightly requires `ADX_ARTIFACT_TRANSPORT=buildkite`, so intermediate component
+and assembled archives use Buildkite artifact storage instead of accumulating
+under `adx/ci/`. The uploader checks bucket versioning before writing: disabled
+or suspended versioning permits replacement; enabled versioning or a failed
+versioning query stops publication. It does not change bucket settings or
+remove existing objects or historical versions. The nightly task therefore
+needs no OBS garbage collection for its new output when this check passes.
+The CI OBS identity needs `GetBucketVersioning` permission for this check in
+addition to its artifact upload permissions.
+
 Each upload publishes `manifest.json` with the source commit, Buildkite build
 ID, object URL, size and SHA256 for every file. The uploader reads object
 metadata back and rejects an absent object or a size mismatch. The same manifest
