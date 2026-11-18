@@ -5939,25 +5939,34 @@ impl LocalOwnerFs {
             .map_err(Error::from)?;
         let identity = identity_from_metadata(&metadata)?;
         let attributes = attributes_from_metadata(metadata)?;
-        self.publish_local_root_entry(name, id, root_use.data_dir(), identity, attributes)
-            .map(Some)
+        self.publish_local_root_entry(
+            name,
+            id,
+            root_use.data_dir(),
+            root_use.grant().epoch,
+            identity,
+            attributes,
+        )
+        .map(Some)
     }
 
     /// 发布本机 Home 上读取到的根目录。读取与发布之间，root 可能已被删除（包括其他节点
     /// 经 `RmdirRoot` 发起的删除，本机 FUSE 的目录锁挡不住），也可能已同名重建。删除先把
     /// root 移出 RootManager 缓存，再在 state 锁内清理索引；这里在 state 锁内确认缓存中
-    /// 仍是同一版本（数据目录相同）后才发布，否则返回 NOT_FOUND，不会恢复已删除的索引。
+    /// 仍是同一版本（数据目录与 epoch 都相同）后才发布，否则返回 NOT_FOUND，不会恢复已删除
+    /// 的索引。原生命名下数据目录不再随代次变化，epoch 是唯一能区分「同名重建」的证据。
     fn publish_local_root_entry(
         &self,
         name: &OsStr,
         id: RootId,
         data_dir: &StoragePath,
+        epoch: u64,
         identity: files::FileIdentity,
         attributes: FileAttributes,
     ) -> Result<Entry> {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let current = self.roots.local_root_data_dir(&id)?;
-        if current.as_ref().map(|(current, _)| current) != Some(data_dir) {
+        if current.as_ref() != Some(&(data_dir.clone(), epoch)) {
             return Err(Error::coded(
                 afs_error::NODE_VFS_NOT_FOUND,
                 "workspace was deleted while its root was being looked up",
@@ -8391,7 +8400,12 @@ mod tests {
     }
 
     impl RootMeta for LocalMeta {
-        fn reserve_root(&self, id: &RootId, create_intent_id: &str) -> Result<RootReservation> {
+        fn reserve_root(
+            &self,
+            id: &RootId,
+            create_intent_id: &str,
+            _pin_home: bool,
+        ) -> Result<RootReservation> {
             let mut next = self.next_epoch.lock().unwrap();
             let epoch = *next;
             *next += 1;
@@ -8581,7 +8595,7 @@ mod tests {
     }
 
     impl RootMeta for RestartingRemoteMeta {
-        fn reserve_root(&self, _: &RootId, _: &str) -> Result<RootReservation> {
+        fn reserve_root(&self, _: &RootId, _: &str, _: bool) -> Result<RootReservation> {
             Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
         }
 
@@ -14512,7 +14526,7 @@ mod tests {
         let (temp, fs, ctx, root_id, identity, access) =
             peer_rmdir_root_fixture(all_local_rights());
         let local = fs.require_local().unwrap();
-        let (data_dir, _) = local.roots.local_root_data_dir(&root_id).unwrap().unwrap();
+        let (data_dir, epoch) = local.roots.local_root_data_dir(&root_id).unwrap().unwrap();
         let attributes = attributes_from_metadata(
             std::fs::metadata(temp.path().join(data_dir.as_path())).unwrap(),
         )
@@ -14528,6 +14542,7 @@ mod tests {
                 name,
                 root_id.clone(),
                 &data_dir,
+                epoch,
                 identity.clone(),
                 attributes.clone(),
             )
@@ -14544,7 +14559,7 @@ mod tests {
 
         let recreated = fs.mkdir(&ctx, root, name, 0o755).unwrap();
         let error = local
-            .publish_local_root_entry(name, root_id, &data_dir, identity, attributes)
+            .publish_local_root_entry(name, root_id, &data_dir, epoch, identity, attributes)
             .unwrap_err();
         assert_eq!(error.code(), afs_error::NODE_VFS_NOT_FOUND);
         let state = local.state.lock().unwrap();

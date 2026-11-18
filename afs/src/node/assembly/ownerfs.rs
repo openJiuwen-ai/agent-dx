@@ -132,7 +132,7 @@ pub(super) async fn assemble(
             timeout,
             cfg.tls_config(),
         )?);
-        let disk = Arc::new(storage::LocalFs::open(cfg.data_dir.join("ownerfs"))?);
+        let disk = Arc::new(storage::LocalFs::open(&cfg.ownerfs_data_dir)?);
         let recovery_disk = disk.clone();
         let recovery_node_id = cfg.id.clone();
         let recovery_session_id = session_id.clone();
@@ -182,6 +182,22 @@ pub(super) async fn assemble(
             })
             .await??,
         );
+        if cfg.ownerfs_adopt_on_startup {
+            let adopt_roots = roots.clone();
+            match crate::node::bridge::spawn_blocking(move || {
+                adopt_roots.adopt_pre_existing_roots()
+            })
+            .await
+            {
+                Ok(summary) => afs_logging::info!("ownerfs.adopt.completed";
+                    "scanned" => summary.scanned,
+                    "adopted" => summary.adopted,
+                    "skipped" => summary.skipped,
+                    "failed" => summary.failed),
+                Err(error) => afs_logging::warn!("ownerfs.adopt.panicked";
+                    "error" => error.to_string()),
+            }
+        }
         outlet_control = Some(super::outlet::OutletControl {
             meta: root_meta.clone(),
         });

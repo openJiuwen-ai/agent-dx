@@ -377,6 +377,7 @@ impl OwnerRootsService for OwnerRootsRpc {
                 rights,
                 expected_root_epoch: request.expected_root_epoch,
                 create_intent_id: request.create_intent_id,
+                pin_home: request.pin_home,
             })
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;

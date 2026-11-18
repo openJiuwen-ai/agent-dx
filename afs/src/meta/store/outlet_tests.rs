@@ -52,6 +52,7 @@ mod outlet_active_roots_tests {
                 rights: vec![RootRight::Read],
                 expected_root_epoch: 0,
                 create_intent_id: intent.into(),
+                pin_home: false,
             })
             .await
             .unwrap()
@@ -139,6 +140,7 @@ mod outlet_active_roots_tests {
                 rights: vec![RootRight::Read],
                 expected_root_epoch: 0,
                 create_intent_id: "pending".into(),
+                pin_home: false,
             })
             .await
             .unwrap();
@@ -281,6 +283,7 @@ mod outlet_digest_tests {
                 rights: vec![RootRight::Read],
                 expected_root_epoch: 0,
                 create_intent_id: intent.into(),
+                pin_home: false,
             })
             .await
             .unwrap()

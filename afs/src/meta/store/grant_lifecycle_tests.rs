@@ -39,6 +39,7 @@ async fn reserve(authority: &StoreOwnerRootAuthority, intent: &str) -> RootReser
             rights: vec![RootRight::Read],
             expected_root_epoch: 0,
             create_intent_id: intent.into(),
+            pin_home: false,
         })
         .await
         .unwrap()
@@ -196,6 +197,7 @@ async fn requester_abort_and_home_activation_cannot_both_win() {
                 rights: vec![RootRight::Write],
                 expected_root_epoch: 0,
                 create_intent_id: format!("intent-{i}"),
+                pin_home: false,
             })
             .await
             .unwrap()
@@ -451,6 +453,7 @@ async fn grant_lifecycle_concurrent_reservations_get_distinct_epochs() {
                     rights: vec![RootRight::Read],
                     expected_root_epoch: 0,
                     create_intent_id: format!("i-{i}"),
+                    pin_home: false,
                 })
                 .await
                 .unwrap()
@@ -478,6 +481,7 @@ async fn grant_lifecycle_expected_epoch_cannot_exhaust_authority() {
             rights: vec![],
             expected_root_epoch: u64::MAX,
             create_intent_id: "max".into(),
+            pin_home: false,
         })
         .await;
     assert!(

@@ -471,11 +471,12 @@ impl Fixture {
         }
     }
 
+    /// Native-name layout: the physical directory is the workspace name itself,
+    /// so the epoch no longer shows up in the path.
     fn data_dir(&self, reservation: &RootReservation) -> PathBuf {
-        self.dir.path().join("home-b").join(format!(
-            "{}-e{}",
-            reservation.root_id, reservation.root_epoch
-        ))
+        let name = String::from_utf8(root_name(&reservation.root_id))
+            .expect("canonical root name is valid UTF-8");
+        self.dir.path().join("home-b").join(name)
     }
 
     fn catalog_count(&self) -> usize {

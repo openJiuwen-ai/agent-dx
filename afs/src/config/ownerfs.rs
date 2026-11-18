@@ -30,6 +30,23 @@ pub(super) fn validate(role: Role, cfg: &Config) -> Result<()> {
     {
         return Err(invalid("invalid OwnerFs workspace default identity"));
     }
+    if cfg.ownerfs_adopt_on_startup && (role != Role::Node || !cfg.ownerfs) {
+        return Err(invalid(
+            "ownerfs_adopt_on_startup requires Node with fs=ownerfs or fs=all",
+        ));
+    }
+    if !cfg.ownerfs_data_dir.is_absolute() {
+        return Err(invalid("ownerfs_data_dir must be absolute"));
+    }
+    // The default is derived locally, so a value that differs from it is the
+    // operator's explicit choice and must obey the same role/backend rule as
+    // the adoption switch it is normally used with.
+    if cfg.ownerfs_data_dir != cfg.data_dir.join("ownerfs") && (role != Role::Node || !cfg.ownerfs)
+    {
+        return Err(invalid(
+            "ownerfs_data_dir requires Node with fs=ownerfs or fs=all",
+        ));
+    }
     if cfg.ownerfs_mount.is_some() && !cfg.ownerfs {
         return Err(invalid("ownerfs_mount requires fs=ownerfs or fs=all"));
     }

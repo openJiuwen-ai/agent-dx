@@ -315,7 +315,12 @@ impl RootMeta for GrpcRootMeta {
         GrpcRootMeta::lookup_node_endpoint(self, node_id)
     }
 
-    fn reserve_root(&self, id: &RootId, create_intent_id: &str) -> Result<RootReservation> {
+    fn reserve_root(
+        &self,
+        id: &RootId,
+        create_intent_id: &str,
+        pin_home: bool,
+    ) -> Result<RootReservation> {
         let request = ReserveRootRequest {
             request_id: self.request_id(),
             root_id: id.0.clone(),
@@ -333,6 +338,7 @@ impl RootMeta for GrpcRootMeta {
             parent_root_id: String::new(),
             create_intent_id: create_intent_id.to_owned(),
             conflict_policy: ReserveConflictPolicy::ReuseIfSameIntent as i32,
+            pin_home,
         };
         let mut client = self.client();
         let reply = self.run(client.reserve_root(request))?.into_inner();

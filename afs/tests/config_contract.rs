@@ -512,6 +512,95 @@ fn ownerfs_mkdir_load_balance_is_opt_in() {
     }
 }
 
+#[cfg(feature = "ownerfs")]
+#[test]
+fn ownerfs_adopt_on_startup_is_opt_in_and_node_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    let resolve = |role, text: &str| {
+        std::fs::write(&path, text).unwrap();
+        Config::resolve(
+            role,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+    };
+    let ownerfs = "fs='ownerfs'\nownerfs_mount='/mnt/ownerfs'\n";
+
+    let default = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert!(!default.ownerfs_adopt_on_startup, "default must be off");
+    assert!(
+        !resolve(Role::Node, ownerfs)
+            .unwrap()
+            .ownerfs_adopt_on_startup
+    );
+    assert!(
+        resolve(
+            Role::Node,
+            &format!("{ownerfs}ownerfs_adopt_on_startup=true\n")
+        )
+        .unwrap()
+        .ownerfs_adopt_on_startup
+    );
+
+    let error = resolve(Role::Node, "fs='dfs'\nownerfs_adopt_on_startup=true\n").unwrap_err();
+    assert!(error.to_string().contains("requires Node with fs=ownerfs"));
+    let error = resolve(
+        Role::Meta,
+        &format!("{ownerfs}ownerfs_adopt_on_startup=true\n"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("requires Node with fs=ownerfs"));
+}
+
+/// The storage root used to be hardcoded to `<data_dir>/ownerfs`, which made it
+/// impossible to point adoption at an existing data parent.
+#[test]
+fn ownerfs_data_dir_defaults_to_the_private_root_and_follows_data_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ownerfs-data-dir.toml");
+    let resolve = |role, text: &str| {
+        std::fs::write(&path, text).unwrap();
+        Config::resolve(
+            role,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+    };
+
+    let default = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(
+        default.ownerfs_data_dir,
+        default.data_dir.join("ownerfs"),
+        "default storage root must stay under data_dir"
+    );
+
+    let derived = resolve(Role::Node, "fs='ownerfs'\ndata_dir='/srv/afs/data'\n").unwrap();
+    assert_eq!(
+        derived.ownerfs_data_dir,
+        std::path::PathBuf::from("/srv/afs/data/ownerfs")
+    );
+
+    let adopted = resolve(
+        Role::Node,
+        "fs='ownerfs'\ndata_dir='/srv/afs/data'\nownerfs_data_dir='/home/agentos/.users'\n",
+    )
+    .unwrap();
+    assert_eq!(
+        adopted.ownerfs_data_dir,
+        std::path::PathBuf::from("/home/agentos/.users")
+    );
+
+    let error = resolve(Role::Node, "ownerfs_data_dir='relative/root'\n").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("ownerfs_data_dir must be absolute")
+    );
+    let error = resolve(Role::Node, "fs='dfs'\nownerfs_data_dir='/srv/ownerfs'\n").unwrap_err();
+    assert!(error.to_string().contains("ownerfs_data_dir requires Node"));
+    let error = resolve(Role::Meta, "ownerfs_data_dir='/srv/ownerfs'\n").unwrap_err();
+    assert!(error.to_string().contains("ownerfs_data_dir requires Node"));
+}
+
 #[cfg(all(feature = "ownerfs", feature = "dfs"))]
 #[test]
 fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {

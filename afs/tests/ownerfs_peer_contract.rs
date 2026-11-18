@@ -225,6 +225,7 @@ impl RootMeta for ContractMeta {
         &self,
         id: &RootId,
         create_intent_id: &str,
+        _pin_home: bool,
     ) -> afs_error::Result<RootReservation> {
         let reservation = RootReservation {
             id: id.clone(),
@@ -2404,9 +2405,8 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
 
     // The `rm -rf` sequence over the wire: unlink the contents, then end the
     // workspace lifecycle on Home.
-    let data_dir = temp
-        .path()
-        .join(format!("{}-e{}", raw_grant.id.0, raw_grant.epoch));
+    // 数据目录使用原生命名，与 workspace 名一致；epoch 只出现在 trash 条目里。
+    let data_dir = temp.path().join("job-42");
     let root_identity = raw
         .lookup(OwnerLookupRequest {
             access: Some(root_access_for(&raw_grant)),
