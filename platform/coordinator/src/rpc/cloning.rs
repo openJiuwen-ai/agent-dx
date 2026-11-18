@@ -812,7 +812,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let spec = normalize(&session, clone_request(&snapshot)).await.unwrap();
+        let spec = normalize(&session, clone_request(&snapshot), None)
+            .await
+            .unwrap();
         session
             .acquire_snapshot(
                 &snapshot.id,
@@ -847,7 +849,7 @@ mod tests {
         redis.start().await;
         let recovered = redis.store().await.begin(2).await.unwrap();
         assert_eq!(
-            normalize(&recovered, clone_request(&snapshot))
+            normalize(&recovered, clone_request(&snapshot), None)
                 .await
                 .unwrap(),
             spec
