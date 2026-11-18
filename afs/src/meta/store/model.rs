@@ -584,6 +584,7 @@ pub struct OwnerRootScan {
     pub home_node_id: String,
     pub roots: Vec<RootRecord>,
     pub reservations: Vec<RootReservationRecord>,
+    pub root_epoch_watermark: u64,
 }
 
 impl fmt::Display for StoreRevision {

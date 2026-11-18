@@ -485,6 +485,7 @@ impl RootMeta for GrpcRootMeta {
                 .into_iter()
                 .map(reservation_from_wire)
                 .collect::<Result<Vec<_>>>()?,
+            root_epoch_watermark: reply.root_epoch_watermark,
         })
     }
 

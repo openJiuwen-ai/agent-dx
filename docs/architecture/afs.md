@@ -1123,6 +1123,11 @@ OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 
 内容，最后才删除空的 workspace 目录；在 egress 路径上对 workspace 目录执行 rmdir 会被内核
 以 `EBUSY` 拒绝，不会删除 workspace。
 
+Home 启动 reconcile 时，catalog 中已不在 Meta（既非活动也非 pending）的代次：空目录直接删除；
+非空目录的 epoch 不高于 `ListOwnerRoots` 返回的 epoch 水位时，视为已被 Meta 删除（包括 Home
+离线期间的强制删除），移入同盘 trash 并移除 catalog，由后台 trash 回收递归删除；epoch 高于
+水位说明 Meta 可能已回滚，目录与 catalog 原地保留并记录 `root.reconcile.deferred_data_dir`。
+
 ## 跨节点 Workspace 出口（outlet）
 
 outlet 让集群内任一节点用**同一个平坦名字**访问某 workspace，而数据权威仍在

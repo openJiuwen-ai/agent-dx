@@ -92,6 +92,9 @@ pub struct RootLookupState {
 pub struct OwnerRootInventory {
     pub active: Vec<RootLocation>,
     pub pending: Vec<RootReservation>,
+    /// Highest root epoch Meta has allocated; an epoch at or below it that is
+    /// neither active nor pending has been retired by Meta.
+    pub root_epoch_watermark: u64,
 }
 
 /// 本地目录及 Node 私有身份记录已准备完成的证据。
@@ -1937,19 +1940,35 @@ impl RootManager {
 
         for record in records.into_values() {
             let Some(location) = active.get(&record.id) else {
-                // Meta no longer exposes this generation. Keep nonempty data
-                // and its catalog evidence until a newer reservation retires it.
+                // Meta no longer exposes this generation. At or below the
+                // watermark Meta deleted it, possibly by force while this Home
+                // was offline: move nonempty data to trash for collection.
+                // Above it Meta may have been rolled back: keep the data and
+                // its catalog evidence.
                 match self.remove_abandoned_dir(&record.data_dir) {
                     Ok(()) => {
                         self.catalog.remove_prepared_root(&record)?;
                     }
                     Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
-                        afs_logging::warn!(
-                            "root.reconcile.deferred_data_dir";
-                            "root_id" => ?record.id,
-                            "data_dir" => ?record.data_dir,
-                            "error" => error.to_string(),
-                        );
+                        let isolated = if record.epoch <= inventory.root_epoch_watermark {
+                            self.rename_to_trash(&record)
+                                .and_then(|()| self.finish_isolated(&record))
+                        } else {
+                            Err(error)
+                        };
+                        match isolated {
+                            Ok(()) => afs_logging::info!(
+                                "root.reconcile.isolated";
+                                "root_id" => ?record.id,
+                                "epoch" => record.epoch,
+                            ),
+                            Err(error) => afs_logging::warn!(
+                                "root.reconcile.deferred_data_dir";
+                                "root_id" => ?record.id,
+                                "data_dir" => ?record.data_dir,
+                                "error" => error.to_string(),
+                            ),
+                        }
                     }
                     Err(error) => return Err(error),
                 }
@@ -3164,6 +3183,7 @@ mod tests {
         pending: Option<RootReservation>,
         active: Option<RootLocation>,
         active_prepare_id: Option<String>,
+        root_epoch_watermark: u64,
         lose_activate_reply: bool,
         fail_deactivate: bool,
         lose_deactivate_reply: bool,
@@ -3283,6 +3303,7 @@ mod tests {
                     .filter(|root| root.home_node_id == home)
                     .into_iter()
                     .collect(),
+                root_epoch_watermark: state.root_epoch_watermark,
             })
         }
 
@@ -3691,6 +3712,52 @@ mod tests {
             RootManager::open("node-a".into(), "new-session".into(), meta, disk.clone()).unwrap();
         assert!(manager.cached_local_roots().unwrap().is_empty());
         assert!(disk.metadata(&data_dir).is_err());
+    }
+
+    /// Issue #126: Meta force-deleted the generation while Home was offline;
+    /// the restarted Home holds only its catalog record and a nonempty directory.
+    fn restart_after_force_delete(watermark: u64) -> (tempfile::TempDir, RootManager, StoragePath) {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        meta.0.lock().unwrap().root_epoch_watermark = watermark;
+        let name = OsStr::new("job");
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        std::fs::write(temp.path().join(data_dir.as_path()).join("payload"), b"old").unwrap();
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: root_id_from_name(name).unwrap(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1:old-session".into(),
+            })
+            .unwrap();
+        drop(locked);
+        let manager = RootManager::open("node-a".into(), "new-session".into(), meta, disk).unwrap();
+        (temp, manager, data_dir)
+    }
+
+    #[test]
+    fn startup_isolates_and_collects_generation_retired_by_meta() {
+        let (temp, manager, data_dir) = restart_after_force_delete(1);
+        assert!(!temp.path().join(data_dir.as_path()).exists());
+        assert!(manager.catalog.scan_roots().unwrap().is_empty());
+        assert_eq!(manager.collect_trash().unwrap(), 1);
+        assert!(!manager.trash_path().join(data_dir.as_path()).exists());
+    }
+
+    #[test]
+    fn startup_keeps_nonempty_generation_above_meta_watermark() {
+        // A watermark below the local epoch means Meta may have been rolled back.
+        let (temp, manager, data_dir) = restart_after_force_delete(0);
+        let payload = temp.path().join(data_dir.as_path()).join("payload");
+        assert_eq!(std::fs::read(payload).unwrap(), b"old");
+        assert_eq!(manager.catalog.scan_roots().unwrap().len(), 1);
     }
 
     #[test]

@@ -264,6 +264,9 @@ message ListOwnerRootsReply {
   repeated RootLocation active_roots = 1;
   repeated RootReservation pending_reservations = 2;
   uint64 authority_revision = 3;
+  // Highest root epoch allocated in this snapshot; a restarted Home treats an
+  // absent epoch at or below it as deleted.
+  uint64 root_epoch_watermark = 4;
 }
 
 // ListActiveOutletRoots 是 outlet 镜像面的唯一输入：全局 Active root 全量快照。
