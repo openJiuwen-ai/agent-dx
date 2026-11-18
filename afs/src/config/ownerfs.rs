@@ -95,6 +95,16 @@ pub(super) fn validate(role: Role, cfg: &Config) -> Result<()> {
             "dfs_external_backend cache directory must not overlap ownerfs_data_dir",
         ));
     }
+    // The AFS data root itself holds Node state (catalog, runtime files); a
+    // business data root that equals it or contains it would expose AFS's own
+    // tree to startup adoption. One-directional on purpose: the derived
+    // default ownerfs_data_dir (data_dir/ownerfs) lives inside data_dir and
+    // must keep validating.
+    if cfg.data_dir.starts_with(data_dir) {
+        return Err(invalid(
+            "ownerfs_data_dir must not equal or contain data_dir",
+        ));
+    }
     if cfg.experimental_ownerfs_workspace_bind {
         if role != Role::Node || !cfg.ownerfs || cfg.ownerfs_mount.is_none() {
             return Err(invalid(
@@ -275,6 +285,26 @@ mod tests {
         );
         cfg.dfs_external_backend = None;
         // Overlap removed: the same configuration validates again.
+        validate(Role::Node, &cfg).unwrap();
+
+        // The AFS data root itself: the business data root must not equal it
+        // or contain it, while the derived default (data_dir/ownerfs, a
+        // descendant of data_dir) must keep validating.
+        cfg.ownerfs_data_dir = cfg.data_dir.clone();
+        let error = validate(Role::Node, &cfg).unwrap_err().message().to_owned();
+        assert!(error.contains("ownerfs_data_dir"), "{error}");
+        cfg.ownerfs_data_dir = cfg
+            .data_dir
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .expect("data_dir has a parent");
+        assert!(
+            validate(Role::Node, &cfg)
+                .unwrap_err()
+                .message()
+                .contains("ownerfs_data_dir")
+        );
+        cfg.ownerfs_data_dir = cfg.data_dir.join("ownerfs");
         validate(Role::Node, &cfg).unwrap();
     }
 }
