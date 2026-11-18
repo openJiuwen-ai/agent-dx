@@ -101,8 +101,8 @@ experimental_ownerfs_workspace_bind = false
 # Adopt pre-existing first-level directories under the OwnerFs data root as
 # workspaces at node startup. Hidden entries, lost+found, non-ASCII names,
 # non-UTF-8 names, mount points and names too long for the trash encoding are
-# skipped with a warning. OFF by default.
-# ownerfs_adopt_on_startup = false
+# skipped with a warning. ON by default.
+# ownerfs_adopt_on_startup = true
 
 # OwnerFs storage root (workspace directories plus the private catalog and
 # trash). Defaults to <data_dir>/ownerfs. To adopt existing data in place,

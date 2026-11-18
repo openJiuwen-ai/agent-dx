@@ -4299,6 +4299,69 @@ mod tests {
         assert!(disk.metadata(&data_dir).is_ok());
     }
 
+    /// Meta 已经忘记某个 root 时，启动 reconcile 只丢弃 catalog 记录，
+    /// 绝不 rmdir 原生命名目录；目录因此能在同一次启动里被纳管扫描接管。
+    #[test]
+    fn startup_releases_catalog_entry_and_keeps_native_dir_for_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("job");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        let payload = temp.path().join(data_dir.as_path()).join("payload");
+        std::fs::write(&payload, b"business data").unwrap();
+
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1:old-session".into(),
+            })
+            .unwrap();
+        drop(locked);
+
+        // Meta 侧 active 为空：这条 catalog 记录已经是幽灵条目。
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        // 目录与内容原地保留：启动清理不得 rmdir 原生命名目录。
+        assert_eq!(std::fs::read(&payload).unwrap(), b"business data");
+
+        // 记录被丢弃，这个名字不再被幽灵记录锁在纳管之外。
+        drop(manager);
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        assert!(locked.scan_roots().unwrap().is_empty());
+        drop(locked);
+
+        // 同一次启动的纳管扫描可以接管它，数据不被搬动。
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        let summary = manager.adopt_pre_existing_roots();
+        assert_eq!(summary.adopted, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(std::fs::read(&payload).unwrap(), b"business data");
+        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
+    }
+
     #[test]
     fn fenced_nonempty_epoch_blocks_recreation_without_deleting_data() {
         let temp = tempfile::tempdir().unwrap();
