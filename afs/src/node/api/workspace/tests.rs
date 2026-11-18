@@ -90,8 +90,13 @@ impl RootMeta for LossyActivation {
     fn current_node_session(&self, node: &str) -> afs_error::Result<Option<String>> {
         self.inner.current_node_session(node)
     }
-    fn reserve_root(&self, id: &root::RootId, intent: &str) -> afs_error::Result<RootReservation> {
-        self.inner.reserve_root(id, intent)
+    fn reserve_root(
+        &self,
+        id: &root::RootId,
+        intent: &str,
+        _pin_home: bool,
+    ) -> afs_error::Result<RootReservation> {
+        self.inner.reserve_root(id, intent, _pin_home)
     }
     fn activate_root(&self, prepared: &root::PreparedRoot) -> afs_error::Result<root::RootGrant> {
         let grant = self.inner.activate_root(prepared)?;
@@ -336,6 +341,7 @@ impl Fixture {
         let mut config = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
         config.id = "entry".into();
         config.data_dir = directory.path().into();
+        config.ownerfs_data_dir = directory.path().join("ownerfs");
         config.timeout_ms = 500;
         config.outlet = Some(OutletConfig {
             public_root: directory.path().join("public"),
@@ -548,7 +554,7 @@ async fn workspace_http_refuses_unready_outlet_and_recursively_deletes_active_da
             .0,
         StatusCode::CONFLICT
     );
-    let data = fixture.directory.path().join("ownerfs/root-616c696365-e1");
+    let data = fixture.directory.path().join("ownerfs/alice");
     assert!(data.is_dir());
     std::fs::create_dir_all(data.join("nested/child")).unwrap();
     std::fs::write(data.join("nested/child/file"), b"data").unwrap();
@@ -728,7 +734,7 @@ async fn workspace_list_keeps_all_matching_roots_when_attributes_are_unavailable
         })
         .await
         .unwrap();
-        std::fs::remove_dir(fixture.directory.path().join("ownerfs/root-616c696365-e1")).unwrap();
+        std::fs::remove_dir(fixture.directory.path().join("ownerfs/alice")).unwrap();
 
         let (status, list) = fixture
             .request(
@@ -778,7 +784,7 @@ fn permanent_workspace_errors_do_not_advertise_retry() {
 async fn deep_cleanup_failure_does_not_block_logical_deletion_or_recreation() {
     let fixture = Fixture::new().await;
     fixture.prepare_workspace("deep").await;
-    let old = fixture.directory.path().join("ownerfs/root-64656570-e1");
+    let old = fixture.directory.path().join("ownerfs/deep");
     let mut deep = old.clone();
     for _ in 0..260 {
         deep.push("d");
@@ -816,7 +822,7 @@ async fn deep_cleanup_failure_does_not_block_logical_deletion_or_recreation() {
         .unwrap()
         .unwrap();
     assert!(!trash.exists());
-    assert!(old.with_file_name("root-64656570-e2").is_dir());
+    assert!(old.is_dir());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -876,7 +882,7 @@ async fn delete_after_lost_activation_reply_recovers_without_other_requests() {
         !fixture
             .directory
             .path()
-            .join("ownerfs/root-6c6f73742d64656c657465-e1")
+            .join("ownerfs/lost-delete")
             .exists()
     );
 }
@@ -1090,13 +1096,7 @@ async fn delete_retries_meta_after_physical_directory_is_gone() {
         fixture.request("DELETE", uri, Value::Null).await.0,
         StatusCode::SERVICE_UNAVAILABLE
     );
-    assert!(
-        !fixture
-            .directory
-            .path()
-            .join("ownerfs/root-6d6574612d7265747279-e1")
-            .exists()
-    );
+    assert!(!fixture.directory.path().join("ownerfs/meta-retry").exists());
     let (status, _) = fixture.request("DELETE", uri, Value::Null).await;
     assert_eq!(status, StatusCode::OK);
 }
@@ -1182,10 +1182,7 @@ async fn remote_delete_retries_cleanup_and_meta_without_directory_lookup() {
         fixture.directory.path().metadata().unwrap().uid()
     );
     assert!(fixture.roots.cached_peer_sessions().unwrap().is_empty());
-    let old = fixture
-        .directory
-        .path()
-        .join("ownerfs/root-72656d6f74652d7265747279-e1");
+    let old = fixture.directory.path().join("ownerfs/remote-retry");
     let delete = || {
         let api = fixture.api.clone();
         async move {
@@ -1268,10 +1265,7 @@ async fn remote_delete_retries_cleanup_and_meta_without_directory_lookup() {
     })
     .await
     .unwrap();
-    let current = fixture
-        .directory
-        .path()
-        .join("ownerfs/root-72656d6f74652d7265747279-e2");
+    let current = fixture.directory.path().join("ownerfs/remote-retry");
     assert!(current.is_dir());
     // Force sees the Home as gone, Meta refuses because its session is live,
     // and the recheck must delete through the recovered Home.
@@ -1303,10 +1297,7 @@ async fn remote_delete_retries_cleanup_and_meta_without_directory_lookup() {
 async fn delete_checks_home_authority_before_removing_data() {
     let fixture = Fixture::new().await;
     fixture.prepare_workspace("authority").await;
-    let payload = fixture
-        .directory
-        .path()
-        .join("ownerfs/root-617574686f72697479-e1/payload");
+    let payload = fixture.directory.path().join("ownerfs/authority/payload");
     std::fs::write(&payload, b"keep").unwrap();
     fixture.fail_lookup.store(true, Ordering::SeqCst);
     let uri = "/v1/workspaces/authority";
@@ -1375,7 +1366,7 @@ async fn background_deletion_retires_the_old_generation_inodes() {
         !fixture
             .directory
             .path()
-            .join("ownerfs/root-7374616c65-e2/through-old-inode")
+            .join("ownerfs/stale/through-old-inode")
             .exists()
     );
 }
@@ -1384,10 +1375,7 @@ async fn background_deletion_retires_the_old_generation_inodes() {
 async fn isolated_workspace_is_not_reopened_before_deactivation() {
     let fixture = Fixture::new().await;
     let reservation = fixture.prepare_workspace("detach").await;
-    let old = fixture
-        .directory
-        .path()
-        .join("ownerfs/root-646574616368-e1");
+    let old = fixture.directory.path().join("ownerfs/detach");
     std::fs::create_dir_all(old.join("nested")).unwrap();
     std::fs::write(old.join("nested/payload"), b"keep").unwrap();
     let public = fixture.api.public_path("detach");

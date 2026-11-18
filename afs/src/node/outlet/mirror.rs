@@ -46,26 +46,19 @@ pub enum PresentEntry {
 
 /// Where a published name points.
 ///
-/// Rendered from `(home, root_epoch)` and the name-derived root id. Kept as a
-/// function rather than a stored string so the path formula exists exactly once.
+/// The target is the native workspace directory `<import>/<home>/users/<name>`,
+/// exactly the path OwnerFs uses as the live data directory. The generation is
+/// not part of the path: a same-name rebuild keeps the same target, so a
+/// consumer that already holds `/public/<name>` resolves to the new workspace.
 ///
-/// The target carries the generation (`-e<epoch>`): a same-name rebuild is a
-/// different path, so old and new generations cannot be confused, and a
-/// generation change is a single rename on `/public`.
-///
-/// **Assumes `root_id == "root-" + hex(name)`**, which is what OwnerFs enforces
-/// (`root_id_from_name`: `format!("root-{}", hex(bytes))`). Concatenating
-/// `-e<epoch>` onto the id therefore reproduces `root_data_dir` byte for byte.
-/// `target_matches_ownerfs_data_dir_naming` pins that equivalence; if the
-/// encoding ever changes, that test fails instead of the mirror silently
-/// pointing at paths that do not exist.
-pub fn target_path(import_root: &str, root: &OutletRoot) -> String {
+/// `root_id` stays the only durable identity; the name is decoded from it by
+/// the caller, which also rejects non-UTF-8 ids before calling this.
+pub fn target_path(import_root: &str, home_node_id: &str, name: &str) -> String {
     format!(
-        "{}/{}/users/{}-e{}",
+        "{}/{}/users/{}",
         import_root.trim_end_matches('/'),
-        root.home_node_id,
-        root.root_id.0,
-        root.root_epoch
+        home_node_id,
+        name
     )
 }
 
@@ -151,7 +144,12 @@ pub fn plan(
         // Every name in `wanted` counts as "should exist" for the removal pass
         // below, so an unready home never loses an entry it already has.
         let publishable = ready_homes.contains(&root.home_node_id);
-        let target = target_path(import_root, root);
+        let Some(name_text) = name.to_str() else {
+            afs_logging::warn!("outlet.mirror.non_utf8_name";
+                "root_id" => ?root.root_id.0);
+            continue;
+        };
+        let target = target_path(import_root, &root.home_node_id, name_text);
         match present.get(name) {
             Some(PresentEntry::Symlink { target: current }) if current == &target => {}
             // A wrong target is republished in place: stale after a generation
@@ -282,7 +280,7 @@ mod tests {
     fn unready_home_keeps_an_already_published_name() {
         // 已发布的名字在 home 掉线后必须保留（spec H7）：撤掉会让下游容器
         // 在对端抖动期间集体 bind 失败，而保留则在对端恢复后自动可用。
-        let target = "/imports/node-a/users/root-61-e7";
+        let target = "/imports/node-a/users/a";
         let actions = plan(
             "/imports",
             &[root("root-61", 7, "node-a")],
@@ -299,7 +297,7 @@ mod tests {
     fn unready_home_is_not_removed_as_a_ghost() {
         // 未就绪 home 的名字仍算"应当存在"，不能在收尾的 Remove 阶段被清掉。
         // 这条防的是把 ready_homes 误用成 wanted 的过滤条件。
-        let target = "/imports/node-a/users/root-61-e7";
+        let target = "/imports/node-a/users/a";
         let actions = plan(
             "/imports",
             &[root("root-61", 7, "node-a")],
@@ -342,7 +340,7 @@ mod tests {
             actions,
             vec![Action::Publish {
                 name: "a".into(),
-                target: "/imports/node-a/users/root-61-e7".into(),
+                target: "/imports/node-a/users/a".into(),
             }]
         );
     }
@@ -361,7 +359,7 @@ mod tests {
             plan("/imports", &roots, &all_ready(&["node-a"]), &present),
             vec![Action::Publish {
                 name: "a".into(),
-                target: "/imports/node-a/users/root-61-e7".into(),
+                target: "/imports/node-a/users/a".into(),
             }],
             "ready home republishes with the current generation"
         );
@@ -374,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn new_root_is_published_with_generation_in_target() {
+    fn new_root_is_published_under_its_native_name() {
         let actions = plan(
             "/imports",
             &[root("root-61", 7, "node-a")],
@@ -385,7 +383,7 @@ mod tests {
             actions,
             vec![Action::Publish {
                 name: "a".into(),
-                target: "/imports/node-a/users/root-61-e7".into(),
+                target: "/imports/node-a/users/a".into(),
             }]
         );
     }
@@ -396,27 +394,23 @@ mod tests {
             "/imports",
             &[root("root-61", 7, "node-a")],
             &all_ready(&["node-a"]),
-            &present(&[("a", symlink("/imports/node-a/users/root-61-e7"))]),
+            &present(&[("a", symlink("/imports/node-a/users/a"))]),
         );
         assert!(actions.is_empty(), "converged state must be a no-op");
     }
 
-    /// 换代：同一名字的 target 文本变化，必须原子替换而不是摘除后重建。
+    /// 同代同名重建不改变 target：目标路径里没有代次，因此无需重发。
     #[test]
-    fn generation_change_republishes_the_same_name() {
+    fn generation_change_keeps_the_same_target() {
         let actions = plan(
             "/imports",
             &[root("root-61", 8, "node-a")],
             &all_ready(&["node-a"]),
-            &present(&[("a", symlink("/imports/node-a/users/root-61-e7"))]),
+            &present(&[("a", symlink("/imports/node-a/users/a"))]),
         );
-        assert_eq!(
-            actions,
-            vec![Action::Publish {
-                name: "a".into(),
-                target: "/imports/node-a/users/root-61-e8".into(),
-            }],
-            "a generation bump must be one publish, not remove+publish"
+        assert!(
+            actions.is_empty(),
+            "the target no longer carries the generation: {actions:?}"
         );
     }
 
@@ -426,7 +420,7 @@ mod tests {
             "/imports",
             &[],
             &all_ready(&[]),
-            &present(&[("a", symlink("/imports/node-a/users/root-61-e7"))]),
+            &present(&[("a", symlink("/imports/node-a/users/a"))]),
         );
         assert_eq!(actions, vec![Action::Remove { name: "a".into() }]);
     }
@@ -446,7 +440,7 @@ mod tests {
                 Action::Quarantine { name: "a".into() },
                 Action::Publish {
                     name: "a".into(),
-                    target: "/imports/node-a/users/root-61-e7".into(),
+                    target: "/imports/node-a/users/a".into(),
                 },
             ],
             "quarantine must precede publish, in that order"
@@ -491,7 +485,7 @@ mod tests {
         let active = vec![root("root-61", 7, "node-a"), root("root-62", 3, "node-b")];
         let start = present(&[
             ("a", symlink("/stale/target")),
-            ("c", symlink("/imports/node-c/users/root-63-e1")),
+            ("c", symlink("/imports/node-c/users/c")),
             ("d", PresentEntry::Foreign),
         ]);
         let actions = plan("/imports", &active, &all_ready(&["node-a"]), &start);
@@ -579,7 +573,7 @@ mod tests {
                 home_nfs_addr: String::new(),
             };
             assert_eq!(
-                target_path("/imports", &node),
+                target_path("/imports", &node.home_node_id, name),
                 format!("/imports/node-a/users/{}", dir.as_path().display()),
                 "mirror target must equal the OwnerFs data directory for {name}"
             );
@@ -590,29 +584,24 @@ mod tests {
     fn target_path_normalizes_trailing_slash() {
         let node = root("root-61", 7, "node-a");
         assert_eq!(
-            target_path("/imports/", &node),
-            target_path("/imports", &node)
+            target_path("/imports/", &node.home_node_id, "a"),
+            target_path("/imports", &node.home_node_id, "a")
         );
     }
 
-    /// 非 UTF-8 名字必须逐字节发布，两个仅差非法字节的名字不得合并。
-    ///
-    /// 旧实现用 `to_string_lossy()` 把解码后的名字转成 `String` 做键：`\xe9`
-    /// 与 `\xff` 都会变成 U+FFFD，于是两个 workspace 塌成一条（`BTreeMap`
-    /// 的 insert 覆盖其一），发布出去的也不是调用方创建的名字。真机上已实测
-    /// 该现象（两个 workspace、`/public` 只有一个 `utf8cafe\u{FFFD}`）。
+    /// 非 UTF-8 名字本轮不发布（P0 延后）：既不创建也不删除。
     #[test]
-    fn non_utf8_names_keep_their_bytes_and_do_not_collide() {
+    fn non_utf8_names_are_not_published() {
         use crate::node::vfs::ownerfs::root::root_id_from_name;
         use std::os::unix::ffi::OsStrExt;
 
         let first = b"utf8cafe\xe9".to_vec();
         let second = b"utf8cafe\xff".to_vec();
-        let roots: Vec<OutletRoot> = [first.clone(), second.clone()]
+        let roots: Vec<OutletRoot> = [first, second]
             .iter()
             .map(|name| OutletRoot {
                 root_id: root_id_from_name(OsStr::from_bytes(name))
-                    .expect("arbitrary bytes are a legal workspace name"),
+                    .expect("arbitrary bytes are a legal root id"),
                 root_epoch: 1,
                 home_node_id: "node-a".to_owned(),
                 home_nfs_addr: String::new(),
@@ -620,26 +609,15 @@ mod tests {
             .collect();
 
         let actions = plan("/imports", &roots, &all_ready(&["node-a"]), &present(&[]));
-        assert_eq!(actions.len(), 2, "两个名字必须是两条动作: {actions:?}");
-
-        let names: Vec<Vec<u8>> = actions
-            .iter()
-            .map(|action| match action {
-                Action::Publish { name, .. } => name.as_bytes().to_vec(),
-                other => panic!("expected a publish, got {other:?}"),
-            })
-            .collect();
-        // OsString 在 Unix 上按字节排序，`\xe9` < `\xff`，顺序确定。
-        assert_eq!(
-            names,
-            vec![first, second],
-            "published names must equal the bytes inside the root id"
+        assert!(
+            actions.is_empty(),
+            "non-UTF-8 roots stay unpublished until P0 lands: {actions:?}"
         );
     }
 
-    /// 收敛判据也得按字节比：`/public` 里存在同字节的链接时不得重发。
+    /// 非 UTF-8 名字不发布也不删除：已有条目原样保留（P0 延后）。
     #[test]
-    fn a_matching_non_utf8_symlink_is_left_alone() {
+    fn a_non_utf8_entry_is_left_alone() {
         use crate::node::vfs::ownerfs::root::root_id_from_name;
         use std::os::unix::ffi::OsStrExt;
 
@@ -653,10 +631,10 @@ mod tests {
         let mut disk = BTreeMap::new();
         disk.insert(
             OsString::from(OsStr::from_bytes(&raw)),
-            symlink("/imports/node-a/users/root-7574663863616665e9-e4"),
+            symlink("/imports/node-a/users/legacy"),
         );
 
         let actions = plan("/imports", &roots, &all_ready(&["node-a"]), &disk);
-        assert!(actions.is_empty(), "同字节链接必须视为已收敛: {actions:?}");
+        assert!(actions.is_empty(), "非 UTF-8 条目必须原样保留: {actions:?}");
     }
 }
