@@ -26,7 +26,7 @@ Ingress 校验 API Key 与归属，Relay 核对运行时绑定，再转发给 Ex
 | `process.send_stdin` | 命令身份、文本 `data`、可选 `eof` | `error`、`error_code`；需要启动时开启 stdin |
 | `entrypoint.poll` | 可选 `wait_timeout` | 继承入口的运行／退出／错误状态 |
 | `file.read` | `path`、可选 `binary` | `data`、`error`；二进制为十六进制字符串 |
-| `file.write` | `path`、`data`、可选 `binary` | 文件名称、路径、类型、大小、`error` |
+| `file.write` | `path`、`data`、可选 `binary`、`append`（默认 false）、`create_if_missing`（默认 true） | 文件名称、路径、类型、写后大小、`error` |
 | `file.write_chunk` | `path`、十六进制 `data`、可选 `offset` | `bytes_written`、`offset`、`error`；offset=0 创建或截断 |
 | `file.read_chunk` | `path`、可选 `offset`、`limit` | 十六进制 `data`、`bytes_read`、`eof`、`error` |
 | `file.list` | `path`、可选整数 `depth`（1–64，缺省 1） | `entries`、`error`；EntryInfo 含权限、大小、修改时间 |
@@ -130,6 +130,10 @@ command_id 再读一次；不得重启命令或推断 exit_code=0。再次不一
 信号 9 或退出码 137 单独不能证明 OOM。Execd 不采集 OOM 计数；Runtime 的 OOM 原因由
 sandboxd 传至 Environment failure，SDK 按 [系统错误契约](error-contract.md#oom-原因与-sdk)
 分类。HTTP 502/503 也不能直接推断 Runtime OOM。
+
+`file.write` 默认截断并写入。设置 `append=true` 时使用文件系统原生追加，保留已有内容。
+`create_if_missing=false` 要求打开已有文件，缺失时返回错误。追加的并发语义由底层
+文件系统决定，调用方在结果未知时不能直接重放。
 
 文件 invoke 的二进制编码是十六进制；`/upload`、`/download` 的流式正文是原始字节。
 大文件优先使用流式传输。PTY 与命令 watch 是 WebSocket 协议，其连接与帧定义见 OpenAPI
