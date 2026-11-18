@@ -912,7 +912,7 @@ impl RootManager {
             return Ok(false);
         }
         if 7 + bytes.len() * 2 + 20 > 255 {
-            afs_logging::warn!("ownerfs.adopt.name_too_long";
+            afs_logging::error!("ownerfs.adopt.name_too_long";
                 "name" => String::from_utf8_lossy(bytes).into_owned());
             return Ok(false);
         }
@@ -3378,6 +3378,11 @@ mod tests {
         fail_deactivate: bool,
         lose_deactivate_reply: bool,
         fail_reserve: Option<RootId>,
+        /// `pin_home` of every `reserve_root` call, in order.
+        pin_home_calls: Vec<bool>,
+        /// Sessions whose pending reservation still counts as live; a reserve
+        /// against one of them mirrors Meta's ROOT_BUSY.
+        live_sessions: Vec<String>,
     }
 
     #[derive(Default)]
@@ -3388,15 +3393,32 @@ mod tests {
             &self,
             id: &RootId,
             intent: &str,
-            _pin_home: bool,
+            pin_home: bool,
         ) -> Result<RootReservation> {
             let mut state = self.0.lock().unwrap();
+            state.pin_home_calls.push(pin_home);
             if state.fail_reserve.as_ref() == Some(id) {
                 return Err(invalid_grant("reserve rejected by test"));
             }
+            if let Some(existing) = state.pending.as_ref().filter(|pending| pending.id == *id)
+                && state
+                    .live_sessions
+                    .iter()
+                    .any(|session| session == &existing.requester_session_id)
+            {
+                return Err(Error::coded(
+                    afs_error::META_OWNER_ROOT_BUSY,
+                    "root is reserved by another live request",
+                ));
+            }
+            let epoch = state
+                .pending
+                .as_ref()
+                .filter(|pending| pending.id == *id)
+                .map_or(1, |pending| pending.epoch + 1);
             let reservation = RootReservation {
                 id: id.clone(),
-                epoch: 1,
+                epoch,
                 home_node_id: "node-a".into(),
                 session_id: "old-session".into(),
                 create_intent_id: intent.into(),
@@ -3560,6 +3582,11 @@ mod tests {
             b"hello"
         );
         assert!(meta.0.lock().unwrap().active.is_some());
+        assert_eq!(
+            meta.0.lock().unwrap().pin_home_calls,
+            vec![true],
+            "adoption must pin the reserved home to the scanning node"
+        );
 
         let summary = manager.adopt_pre_existing_roots();
         assert_eq!(summary.adopted, 0, "second scan must be idempotent");
@@ -3749,6 +3776,90 @@ mod tests {
         assert_eq!(summary.skipped, summary.scanned);
         assert!(manager.catalog.lookup_root(&id).unwrap().is_none());
         assert!(temp.path().join("shared").is_dir());
+    }
+
+    /// Meta 只剩一个失效会话的 pending 时，扫描不得跳过，必须以新 epoch 接管
+    /// （§6.2 判定表的 pending 行，例 2 的 `test005`）。
+    #[test]
+    fn adoption_takes_over_a_stale_meta_pending_reservation_with_a_new_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let id = root_id_from_name(OsStr::new("beta")).unwrap();
+        std::fs::create_dir(temp.path().join("beta")).unwrap();
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        // 上一会话崩溃后只留下 pending；接管必须越过它。
+        meta.0.lock().unwrap().pending = Some(RootReservation {
+            id: id.clone(),
+            epoch: 3,
+            home_node_id: "node-a".into(),
+            session_id: "gone-session".into(),
+            create_intent_id: "node-a:gone-session:crashed".into(),
+            prepare_token: "prepare-0".into(),
+            requester_node_id: "node-a".into(),
+            requester_session_id: "gone-session".into(),
+        });
+
+        let summary = manager.adopt_pre_existing_roots();
+        assert_eq!(summary.adopted, 1);
+        assert_eq!(summary.failed, 0);
+
+        let root = manager.enter_root(&id, RootRight::Read).unwrap();
+        assert_eq!(
+            root.grant().epoch,
+            4,
+            "takeover must mint a fresh epoch past the stale reservation"
+        );
+        assert_eq!(
+            meta.0.lock().unwrap().pin_home_calls,
+            vec![true],
+            "takeover is still adoption: the home must be pinned to this node"
+        );
+    }
+
+    /// Meta 的 pending 会话仍存活时返回 ROOT_BUSY，扫描计入 `failed` 而不是抢占
+    /// （§6.2 判定表的 pending 行，例 2 的 `test006`）。
+    #[test]
+    fn adoption_counts_a_live_meta_pending_reservation_as_failed() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let id = root_id_from_name(OsStr::new("beta")).unwrap();
+        std::fs::create_dir(temp.path().join("beta")).unwrap();
+        let manager =
+            RootManager::open("node-a".into(), "old-session".into(), meta.clone(), disk).unwrap();
+        {
+            let mut state = meta.0.lock().unwrap();
+            state.pending = Some(RootReservation {
+                id: id.clone(),
+                epoch: 2,
+                home_node_id: "node-a".into(),
+                session_id: "peer-session".into(),
+                create_intent_id: "node-a:peer-session:busy".into(),
+                prepare_token: "prepare-0".into(),
+                requester_node_id: "node-a".into(),
+                requester_session_id: "peer-session".into(),
+            });
+            state.live_sessions.push("peer-session".into());
+        }
+
+        let summary = manager.adopt_pre_existing_roots();
+        assert_eq!(summary.adopted, 0);
+        assert_eq!(
+            summary.failed, 1,
+            "a live pending reservation must surface as ROOT_BUSY, not a skip"
+        );
+        assert!(manager.catalog.lookup_root(&id).unwrap().is_none());
+        assert!(manager.enter_root(&id, RootRight::Read).is_err());
+        assert!(
+            temp.path().join("beta").is_dir(),
+            "a failed takeover must not remove data"
+        );
+        assert!(
+            meta.0.lock().unwrap().pending.is_some(),
+            "the node must not abort the peer's live reservation"
+        );
     }
 
     /// 单个目录纳管失败只记账，不中断同批次的其它目录。

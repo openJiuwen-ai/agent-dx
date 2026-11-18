@@ -266,12 +266,51 @@ epoch 从 live 路径里消失后，跨机行为变化。这是本方案唯一�
 | `dev` 与父目录不一致（挂载点） | 跳过 + WARN（rename 进 trash 会 EBUSY） |
 | `7 + 2*len(name) + 20 > 255` | 跳过 + ERROR（P6） |
 | catalog 已有该 `root_id` 的记录（活跃或 pending） | 跳过；active 走既有恢复路径，pending 交给 reconcile 与下一次启动 |
-| Meta 已有该 `root_id`，Home 是本节点 | 跳过（走既有恢复，不新纳管） |
-| Meta 已有该 `root_id`，Home 是别的节点 | 跳过 + WARN（另一端才是数据主，需人工裁决） |
+| Meta 已有该 `root_id` 的 active 记录，Home 是本节点 | 跳过（走既有恢复，不新纳管） |
+| Meta 已有该 `root_id` 的 active 记录，Home 是别的节点 | 跳过 + WARN（另一端才是数据主，需人工裁决） |
+| Meta 只有该 `root_id` 的 pending reservation（无 active、无本地 catalog） | **不跳过**：旧会话已失效时 Meta 以新 epoch 接管（纳管成功）；旧会话仍存活时返回 `ROOT_BUSY`，计入 `failed` |
 | 其余 | 纳管 |
 
 最后两行是双机场景的关键：同一个名字在两个节点都有目录时，Meta 只会授一个 Home，另一个
 节点必须跳过而不是抢占——两边都有真实数据时只能人工裁决，自动决定等于随机丢一边。
+
+#### 例子 1：一次干净的首启扫描
+
+```text
+/home/agentos/.users/            ← ownerfs_data_dir
+├── .ownerfs-roots/              ← AFS 私有 catalog（RootManager::open 创建）
+├── .ownerfs-root-catalog.lock   ← AFS 私有进程锁（RootManager::open 创建）
+├── .ownerfs-trash/              ← AFS 私有回收区（首次删除后出现）
+├── test001/                     ← 纳管（test001 → root-7465737430303031）
+├── test002/                     ← 纳管
+├── .git/                        ← 跳过：点前缀
+├── lost+found/                  ← 跳过：文件系统自建
+├── notes.txt                    ← 跳过：不是真目录
+├── 客户资料/                    ← 跳过：非 ASCII
+├── bad\xffname/                 ← 跳过：非 UTF-8
+└── aaaa…（115 字节）/           ← 跳过：trash 名会超过 255 字节
+```
+
+摘要：`scanned=11 adopted=2 skipped=9 failed=0`。
+
+`scanned` 是 `read_dir` 的原始条目数，`skipped` 也包含 `.ownerfs-roots/`、
+`.ownerfs-root-catalog.lock` 这类 AFS 私有条目，所以即使布局完全干净也不会是 0；
+`skipped` 的准确口径就是 `scanned - adopted - failed`。运维核对应结合每个条目的
+判定日志（`ownerfs.adopt.*`），只看计数无法区分「保留在扫」和「被跳过」。
+
+#### 例子 2：名字冲突与残留
+
+| 条目 | Meta / catalog 状态 | 结果 |
+| --- | --- | --- |
+| `test003/` | 本地 catalog 已有 active 记录 | 跳过；`reconcile_on_startup` 走既有恢复，不重新分配 epoch |
+| `test004/` | Meta active，Home = `node-b` | 跳过 + WARN `ownerfs.adopt.foreign_home`；本节点不抢占 |
+| `test005/` | Meta 只有 pending，原会话已失效 | 以新 epoch 接管并纳管；旧 reservation 被覆盖 |
+| `test006/` | Meta 只有 pending，原会话仍存活 | 计入 `failed` + WARN `root_busy`，不纳管；等对端结束或人工处理 |
+
+#### 例子 3：只有坏目录时的重启
+
+存储根里只有 `bad\xffname/` 时：第一次启动全部跳过、节点正常挂载；第二次、第三次启动
+结果相同，目录与内容始终保留，不会因为扫描失败而拒绝启动。
 
 ### 6.3 时序与位置
 
@@ -427,7 +466,7 @@ FailedPrecondition: local root catalog identity is not canonical
 | 入口 | 位置 | 行为 |
 | --- | --- | --- |
 | FUSE / 内部创建 | `validate_root_name`（`root.rs:2310`） | 返回 `NODE_VFS_INVALID`（EINVAL），错误信息指明「名字必须是合法 UTF-8」 |
-| 启动扫描 | §6.2 判定表新增一行 | 跳过 + WARN `ownerfs.adopt.skip_non_utf8` + 计入摘要 `skipped` |
+| 启动扫描 | §6.2 判定表新增一行 | 跳过 + WARN `ownerfs.adopt.non_ascii_name`（非 UTF-8 与非 ASCII 合并为同一事件）+ 计入摘要 `skipped` |
 
 两个实现约束：
 
@@ -436,8 +475,10 @@ FailedPrecondition: local root catalog identity is not canonical
 - 合法 UTF-8 的中文名不受影响（真机 `业务数据001` 端到端已验证）；只有非法字节序列被拒，
   这正是 `String` 与 `OsString` 的分界。
 
-测试两条：FUSE 建 `bad\xffname` 返回 EINVAL；存储根里放一个 `bad\xffname` 目录，扫描跳过、
-节点连续启动两次都正常，且摘要日志里 `skipped` 计数为 1。
+测试两条：FUSE 建 `bad\xffname` 返回 EINVAL；存储根里只放一个 `bad\xffname` 目录时，
+连续两次启动都正常，摘要满足 `adopted=0 / failed=0 / skipped == scanned`（`scanned` 含
+`.ownerfs-roots/`、锁文件等 AFS 私有条目），坏目录原样保留。对应单测
+`adoption_survives_restarts_with_only_a_non_utf8_directory`。
 
 ### P1 · 启动扫描必须有护栏
 
@@ -567,7 +608,7 @@ image、hash domain 不动**；唯一触及持久格式的是 `RecoverRoots` 的
 | 扫描失败隔离 | 单个目录纳管失败（如 Meta 返回冲突）不影响其余目录，也不阻塞启动 |
 | 代次隔离 | 删除后 live 名字立即释放；trash 出现 `root-<hex>-e<N>`；同名重建落在原名；`collect_trash` 只回收旧代 |
 | 崩溃窗口 | 四个窗口分别重启后行为符合 §4.5 表格，且**任何窗口都不会递归删除非空目录** |
-| 非 UTF-8 入口拒绝（P0′） | FUSE 创建 `bad\xffname` 返回 EINVAL；存储根里放一个 `bad\xffname` 目录，扫描跳过 + WARN，节点连续启动两次正常，摘要 `skipped=1` |
+| 非 UTF-8 入口拒绝（P0′） | FUSE 创建 `bad\xffname` 返回 EINVAL；存储根里只放一个 `bad\xffname` 目录，扫描跳过 + WARN，连续两次启动正常，摘要 `adopted=0 / failed=0 / skipped == scanned`，目录保留 |
 | 非 ASCII 名字 | API 拒绝非 ASCII；扫描遇到中文名跳过 + WARN，不纳管 |
 | 批量 recover | N 个 root 一批换绑成功，`access_generation` 各自 +1；单 root 冲突时降级逐条且其余成功；同 `request_id` 重放返回同一批 grant；返回条数少于请求时缺的那个走 zombie 分支 |
 | 保留名 | 创建路径：`.ownerfs-` 前缀、`.`、`..`、含 `/` 一律拒绝；扫描路径：所有 `.` 开头与 `lost+found` 一律跳过 |
