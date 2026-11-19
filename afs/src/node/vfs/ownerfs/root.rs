@@ -1169,6 +1169,16 @@ impl RootManager {
             local_record = None;
         }
         if let Some(record) = local_record {
+            // Same-epoch reuse: adoption and create mint byte-identical intents,
+            // so the same session re-reserves and Meta hands back this very
+            // reservation. A create must still never take over a directory an
+            // interrupted adoption recorded; the scene is left for the startup
+            // scan to close. Adopt-mode retries of that preparation keep working.
+            if record.adopted && matches!(mode, PrepareMode::Create(_)) {
+                return Err(invalid_grant(
+                    "workspace record holds adopted data; resolve it before creating this name",
+                ));
+            }
             if record.name != name
                 || record.epoch != reservation.epoch
                 || record.data_dir != data_dir
@@ -4525,6 +4535,72 @@ mod tests {
         // Meta 侧未激活，残留的旧记录被 retire，不留下新证据。
         assert!(meta.0.lock().unwrap().active.is_none());
         assert!(manager.catalog.lookup_root(&id).unwrap().is_none());
+    }
+
+    /// 同 epoch 的纳管中断现场：纳管与 Create 的 intent 同格式，同会话重预留
+    /// 拿回同一条预留（Meta 幂等），复用分支必须按来源拒绝——Create 不得接管
+    /// adopted 记录，现场留给启动扫描闭环。
+    #[test]
+    fn create_fails_closed_on_a_same_epoch_adopted_preparation() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("alice");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o750).unwrap();
+        let payload = temp.path().join(data_dir.as_path()).join("report");
+        std::fs::write(&payload, b"alice data").unwrap();
+
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        let reservation = manager.reserve_workspace(name).unwrap();
+        meta.0.lock().unwrap().pending = Some(reservation.clone());
+        manager
+            .catalog
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: reservation.epoch,
+                data_dir: data_dir.clone(),
+                local_prepare_id: format!("{}:{}", reservation.prepare_token, "old-session"),
+                adopted: true,
+            })
+            .unwrap();
+        let owner = std::fs::metadata(temp.path()).unwrap();
+        let error = manager
+            .prepare_owner_root(
+                "node-a",
+                &reservation,
+                &RootCreateParams {
+                    name: b"alice".to_vec(),
+                    uid: owner.uid(),
+                    gid: owner.gid(),
+                    mode: 0o777,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+        assert!(error.message().contains("adopted"), "{error}");
+        assert_eq!(std::fs::read(&payload).unwrap(), b"alice data");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(temp.path().join(data_dir.as_path()))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o750,
+            "a refused create must not loosen the directory's permissions"
+        );
+        // 复用分支不清现场：中断纳管的记录留给启动扫描闭环。
+        let record = manager.catalog.lookup_root(&id).unwrap().unwrap();
+        assert!(record.adopted);
+        assert!(meta.0.lock().unwrap().active.is_none());
     }
 
     /// 启动扫描特意保留的原生空目录（例：D-4 启动清理不再 rmdir），同名新建必须
