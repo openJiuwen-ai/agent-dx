@@ -124,6 +124,7 @@ pub struct PreparedRoot {
     data_dir: StoragePath,
     local_prepare_id: String,
     parent_fsync_generation: u64,
+    adopted: bool,
 }
 
 impl PreparedRoot {
@@ -131,17 +132,21 @@ impl PreparedRoot {
     ///
     /// This constructor does not perform I/O. Callers must already have created
     /// and synced the data directory plus the parent directory before using it.
+    /// `adopted` names the preparation origin: adopted directories are
+    /// pre-existing business data, never an AFS-created predecessor.
     pub fn new(
         reservation: RootReservation,
         data_dir: StoragePath,
         local_prepare_id: String,
         parent_fsync_generation: u64,
+        adopted: bool,
     ) -> Self {
         Self {
             reservation,
             data_dir,
             local_prepare_id,
             parent_fsync_generation,
+            adopted,
         }
     }
 
@@ -1131,12 +1136,15 @@ impl RootManager {
         };
         let data_dir = root_data_dir(&name, reservation.epoch)?;
         let local_prepare_id = format!("{}:{}", reservation.prepare_token, self.session_id);
+        let adopted = matches!(mode, PrepareMode::Adopt);
         let mut local_record = self.catalog.lookup_root(&reservation.id)?;
-        // With native names every generation of one workspace maps to the same
-        // directory. A catalog record proves the directory is ours, so a
-        // same-name rebuild must reuse it instead of refusing a non-empty
-        // predecessor (that predecessor is this workspace's own data).
-        let prior_preparation = local_record.is_some();
+        // Native names map every generation of one workspace to the same
+        // directory, so a same-name create may find its predecessor on disk.
+        // Only a predecessor recorded by an earlier Create preparation proves
+        // that directory is this workspace's own (AFS created it and never
+        // activated it); an adopted record — or none at all — means the
+        // directory holds business data that a create must never take over.
+        let prior_create_preparation = local_record.as_ref().is_some_and(|record| !record.adopted);
         if let Some(record) = &local_record
             && record.epoch < reservation.epoch
         {
@@ -1161,6 +1169,16 @@ impl RootManager {
             local_record = None;
         }
         if let Some(record) = local_record {
+            // Same-epoch reuse: adoption and create mint byte-identical intents,
+            // so the same session re-reserves and Meta hands back this very
+            // reservation. A create must still never take over a directory an
+            // interrupted adoption recorded; the scene is left for the startup
+            // scan to close. Adopt-mode retries of that preparation keep working.
+            if record.adopted && matches!(mode, PrepareMode::Create(_)) {
+                return Err(invalid_grant(
+                    "workspace record holds adopted data; resolve it before creating this name",
+                ));
+            }
             if record.name != name
                 || record.epoch != reservation.epoch
                 || record.data_dir != data_dir
@@ -1185,19 +1203,49 @@ impl RootManager {
                     match self.disk.mkdir(&data_dir, temporary_mode) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                            if !self.disk.metadata(&data_dir)?.is_dir() {
+                            let existing = self.disk.metadata(&data_dir)?;
+                            if !existing.is_dir() {
                                 return Err(invalid_grant(
                                     "reserved workspace path exists but is not a directory",
                                 ));
                             }
-                            // A predecessor generation of this same name keeps
-                            // its directory. Removing it would destroy the
-                            // workspace's data on every rebuild; reusing it also
-                            // keeps the catalog record and contents consistent.
-                            if !prior_preparation {
-                                self.disk.remove_dir(&data_dir)?;
-                                self.disk.sync_root()?;
-                                self.disk.mkdir(&data_dir, temporary_mode)?;
+                            // Creation may only keep an existing directory in
+                            // place. Startup cleanup deliberately retains
+                            // native-named directories, and replacing an empty
+                            // one would silently change the inode behind the
+                            // same name. Keeping it in place promises the
+                            // inode only: the request's uid/gid/mode are
+                            // applied below exactly as to a fresh directory —
+                            // an empty directory holds no data to protect. A
+                            // nonempty predecessor is kept only when the
+                            // retired record proves an earlier Create
+                            // preparation made it (never activated, so it is
+                            // this workspace's own data); adopted records and
+                            // unrecorded directories hold business data that a
+                            // new create must never take over: fail closed and
+                            // keep the evidence.
+                            if !prior_create_preparation
+                                && std::fs::read_dir(
+                                    self.disk.root_path().join(data_dir.as_path()),
+                                )?
+                                .next()
+                                .is_some()
+                            {
+                                return Err(Error::coded(
+                                    afs_error::IO_DIRECTORY_NOT_EMPTY,
+                                    "workspace path already contains data; resolve it before creating this name",
+                                ));
+                            }
+                            // The reuse rewrites the directory's identity to
+                            // the request; say so instead of leaving a silent
+                            // drift for an operator watching the directory.
+                            if existing.mode() & 0o7777 != params.mode
+                                || existing.uid() != params.uid
+                                || existing.gid() != params.gid
+                            {
+                                afs_logging::warn!("root.create.reused_retained_directory";
+                                    "data_dir" => ?data_dir,
+                                    "previous_mode" => format!("{:o}", existing.mode() & 0o7777));
                             }
                         }
                         Err(error) => return Err(Error::from(error)),
@@ -1226,6 +1274,7 @@ impl RootManager {
                 epoch: reservation.epoch,
                 data_dir: data_dir.clone(),
                 local_prepare_id: local_prepare_id.clone(),
+                adopted,
             };
             self.catalog.persist_prepared_root(&record)?;
         }
@@ -1234,6 +1283,7 @@ impl RootManager {
             data_dir,
             local_prepare_id,
             1,
+            adopted,
         ))
     }
 
@@ -1288,6 +1338,7 @@ impl RootManager {
                 epoch: prepared.reservation.epoch,
                 data_dir: prepared.data_dir.clone(),
                 local_prepare_id: prepared.local_prepare_id.clone(),
+                adopted: prepared.adopted,
             },
             grant,
         )
@@ -2732,6 +2783,7 @@ mod tests {
             },
             data_dir,
             local_prepare_id: "local-a".into(),
+            adopted: false,
             parent_fsync_generation: 1,
         };
         let grant = RootGrant {
@@ -2798,6 +2850,7 @@ mod tests {
             },
             data_dir,
             local_prepare_id: "local-a".into(),
+            adopted: false,
             parent_fsync_generation: 1,
         };
         let local_grant = RootGrant {
@@ -3090,6 +3143,7 @@ mod tests {
             },
             data_dir,
             local_prepare_id: "local-a".into(),
+            adopted: false,
             parent_fsync_generation: 1,
         };
         let local_grant = RootGrant {
@@ -3302,6 +3356,7 @@ mod tests {
             },
             data_dir,
             local_prepare_id: "local-a".into(),
+            adopted: false,
             parent_fsync_generation: 1,
         };
         let local_grant = RootGrant {
@@ -3954,6 +4009,7 @@ mod tests {
                         epoch: 1,
                         data_dir: data_dir.clone(),
                         local_prepare_id: "prepare-1:old-session".into(),
+                        adopted: false,
                     })
                     .unwrap();
             }
@@ -4289,6 +4345,7 @@ mod tests {
                 epoch: 1,
                 data_dir: data_dir.clone(),
                 local_prepare_id: "prepare-1:old-session".into(),
+                adopted: false,
             })
             .unwrap();
         drop(locked);
@@ -4323,6 +4380,7 @@ mod tests {
                 epoch: 1,
                 data_dir: data_dir.clone(),
                 local_prepare_id: "prepare-1:old-session".into(),
+                adopted: false,
             })
             .unwrap();
         drop(locked);
@@ -4388,6 +4446,7 @@ mod tests {
                 epoch: 1,
                 data_dir: old_dir.clone(),
                 local_prepare_id: "prepare-1:old-session".into(),
+                adopted: false,
             })
             .unwrap();
         drop(locked);
@@ -4425,6 +4484,190 @@ mod tests {
                 .unwrap()
                 .is_dir()
         );
+    }
+
+    /// 纳管中途取消后，catalog 里残留的准备记录 + 目录里的原有业务数据，不能被
+    /// 同名新建「顺便接管」：旧记录只证明曾有一轮准备，不证明数据属于新
+    /// workspace。创建必须 fail-closed，数据与目录权限原样保留。
+    #[test]
+    fn create_fails_closed_on_data_left_by_a_cancelled_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("alice");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o750).unwrap();
+        let payload = temp.path().join(data_dir.as_path()).join("report");
+        std::fs::write(&payload, b"alice data").unwrap();
+
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        // 模拟「纳管中途取消」的现场：本地留着 epoch-1 的准备记录。
+        manager
+            .catalog
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "adopt-1:old-session".into(),
+                adopted: true,
+            })
+            .unwrap();
+        let mut reservation = manager.reserve_workspace(name).unwrap();
+        reservation.epoch = 2;
+        meta.0.lock().unwrap().pending = Some(reservation.clone());
+        let owner = std::fs::metadata(temp.path()).unwrap();
+        let error = manager
+            .prepare_owner_root(
+                "node-a",
+                &reservation,
+                &RootCreateParams {
+                    name: b"alice".to_vec(),
+                    uid: owner.uid(),
+                    gid: owner.gid(),
+                    mode: 0o777,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+        assert_eq!(std::fs::read(&payload).unwrap(), b"alice data");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(temp.path().join(data_dir.as_path()))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o750,
+            "a failed create must not loosen the directory's permissions"
+        );
+        // Meta 侧未激活，残留的旧记录被 retire，不留下新证据。
+        assert!(meta.0.lock().unwrap().active.is_none());
+        assert!(manager.catalog.lookup_root(&id).unwrap().is_none());
+    }
+
+    /// 同 epoch 的纳管中断现场：纳管与 Create 的 intent 同格式，同会话重预留
+    /// 拿回同一条预留（Meta 幂等），复用分支必须按来源拒绝——Create 不得接管
+    /// adopted 记录，现场留给启动扫描闭环。
+    #[test]
+    fn create_fails_closed_on_a_same_epoch_adopted_preparation() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("alice");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o750).unwrap();
+        let payload = temp.path().join(data_dir.as_path()).join("report");
+        std::fs::write(&payload, b"alice data").unwrap();
+
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        let reservation = manager.reserve_workspace(name).unwrap();
+        meta.0.lock().unwrap().pending = Some(reservation.clone());
+        manager
+            .catalog
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: reservation.epoch,
+                data_dir: data_dir.clone(),
+                local_prepare_id: format!("{}:{}", reservation.prepare_token, "old-session"),
+                adopted: true,
+            })
+            .unwrap();
+        let owner = std::fs::metadata(temp.path()).unwrap();
+        let error = manager
+            .prepare_owner_root(
+                "node-a",
+                &reservation,
+                &RootCreateParams {
+                    name: b"alice".to_vec(),
+                    uid: owner.uid(),
+                    gid: owner.gid(),
+                    mode: 0o777,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+        assert!(error.message().contains("adopted"), "{error}");
+        assert_eq!(std::fs::read(&payload).unwrap(), b"alice data");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(temp.path().join(data_dir.as_path()))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o750,
+            "a refused create must not loosen the directory's permissions"
+        );
+        // 复用分支不清现场：中断纳管的记录留给启动扫描闭环。
+        let record = manager.catalog.lookup_root(&id).unwrap().unwrap();
+        assert!(record.adopted);
+        assert!(meta.0.lock().unwrap().active.is_none());
+    }
+
+    /// 启动扫描特意保留的原生空目录（例：D-4 启动清理不再 rmdir），同名新建必须
+    /// 原地复用：不得删除重建——名字没变但 inode 已换。复用只承诺 inode；目录
+    /// 身份（uid/gid/mode）与全新创建一样跟随请求参数重写，属性不同也照样通过。
+    #[test]
+    fn create_reuses_a_retained_empty_native_directory_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("job");
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o751).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let before = std::fs::metadata(temp.path().join(data_dir.as_path())).unwrap();
+        assert_ne!(
+            before.mode() & 0o7777,
+            0o750,
+            "precondition: the retained attributes must differ from the request"
+        );
+
+        let manager = RootManager::open(
+            "node-a".into(),
+            "old-session".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        let reservation = manager.reserve_workspace(name).unwrap();
+        meta.0.lock().unwrap().pending = Some(reservation.clone());
+        let owner = std::fs::metadata(temp.path()).unwrap();
+        manager
+            .prepare_owner_root(
+                "node-a",
+                &reservation,
+                &RootCreateParams {
+                    name: b"job".to_vec(),
+                    uid: owner.uid(),
+                    gid: owner.gid(),
+                    mode: 0o750,
+                },
+            )
+            .unwrap();
+
+        let after = std::fs::metadata(temp.path().join(data_dir.as_path())).unwrap();
+        assert_eq!(
+            before.ino(),
+            after.ino(),
+            "creation must keep the retained directory instead of replacing it"
+        );
+        // 只承诺 inode：身份按请求参数重写，属性漂移由 create 请求解释。
+        assert_eq!(after.mode() & 0o7777, 0o750);
     }
 
     #[test]
@@ -4491,6 +4734,7 @@ mod tests {
                 epoch: 1,
                 data_dir: data_dir.clone(),
                 local_prepare_id: "prepare-1:session-a".into(),
+                adopted: false,
             })
             .unwrap();
         drop(locked);
@@ -4596,6 +4840,7 @@ mod tests {
                     epoch: 1,
                     data_dir: data_dir.clone(),
                     local_prepare_id: "prepare-1:session-a".into(),
+                    adopted: false,
                 })
                 .unwrap();
             drop(locked);
@@ -4644,6 +4889,7 @@ mod tests {
                 epoch: 1,
                 data_dir: data_dir.clone(),
                 local_prepare_id: "prepare-1:session-a".into(),
+                adopted: false,
             })
             .unwrap();
         drop(locked);
@@ -4724,6 +4970,7 @@ mod tests {
                 epoch: 1,
                 data_dir: data_dir.clone(),
                 local_prepare_id: "prepare-1:session-a".into(),
+                adopted: false,
             })
             .unwrap();
         drop(locked);
@@ -4795,6 +5042,7 @@ mod tests {
                 epoch: 1,
                 data_dir: data_dir.clone(),
                 local_prepare_id: "prepare-1:session-a".into(),
+                adopted: false,
             })
             .unwrap();
         drop(locked);
@@ -4869,6 +5117,7 @@ mod tests {
                 epoch: 1,
                 data_dir: data_dir.clone(),
                 local_prepare_id: "prepare-1:session-a".into(),
+                adopted: false,
             })
             .unwrap();
         drop(locked);
@@ -4922,6 +5171,7 @@ mod tests {
                 epoch: 1,
                 data_dir: data_dir.clone(),
                 local_prepare_id: "prepare-1:session-a".into(),
+                adopted: false,
             })
             .unwrap();
         drop(locked);
@@ -4987,6 +5237,7 @@ mod tests {
                 epoch: 1,
                 data_dir: data_dir.clone(),
                 local_prepare_id: "prepare-1:session-a".into(),
+                adopted: false,
             })
             .unwrap();
         drop(locked);
@@ -5064,6 +5315,7 @@ mod tests {
                 epoch: 1,
                 data_dir: data_dir.clone(),
                 local_prepare_id: "prepare-1:session-a".into(),
+                adopted: false,
             })
             .unwrap();
         let manager = RootManager::open_with_catalog(
@@ -5094,6 +5346,7 @@ mod tests {
                     epoch: 2,
                     data_dir: next_dir,
                     local_prepare_id: "prepare-2:session-a".into(),
+                    adopted: false,
                 },
                 RootGrant {
                     id: id.clone(),
