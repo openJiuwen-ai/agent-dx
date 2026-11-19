@@ -3,8 +3,10 @@
 #
 # Idempotent: existing files are KEPT, never overwritten. Only missing pieces are created, so a
 # repeated install (upgrade, re-render, retry) succeeds instead of aborting. A half-written pair
-# (<ID>.pem without <ID>-key.pem, or the reverse) is an error: that state cannot be repaired
-# without destroying a private key.
+# (<ID>.pem without <ID>-key.pem, or the reverse) — or a half-written CA pair — is an error:
+# that state cannot be repaired without destroying a private key. Kept identities must still
+# chain to the kept CA; material that no longer verifies is reported as an error, never as
+# success.
 #
 # Production note: the material is only as good as the CA it chains to. Sharing ca-key.pem
 # across hosts (--ca-dir) is what lets every host issue its own identity, so that file must be
@@ -93,16 +95,20 @@ done
 work=""
 cleanup() { [[ -z $work ]] || rm -rf -- "$work"; }
 trap cleanup EXIT INT TERM
-scratch() {
+# The scratch dir must be created in this shell. `dir=$(mktemp -d ...)` inside a command
+# substitution would run in a subshell: the parent's $work would stay empty and cleanup would
+# leak every scratch dir (and the private keys inside them).
+ensure_scratch() {
   if [[ -z $work ]]; then
     work=$(mktemp -d "${TMPDIR:-/tmp}/adx-afs-tls.XXXXXX")
   fi
-  echo "$work"
 }
 
 ca_imported=false
 if [[ -f $destination/ca.pem && -f $destination/ca-key.pem ]]; then
   echo "CA already present: $destination/ca.pem (kept)"
+elif [[ -f $destination/ca.pem || -f $destination/ca-key.pem ]]; then
+  die "half-written CA in $destination: ca.pem and ca-key.pem must be present or absent together; restore the missing file or remove both, then rerun"
 elif [[ -n $ca_dir ]]; then
   [[ -f $ca_dir/ca.pem && -f $ca_dir/ca-key.pem ]] \
     || die "--ca-dir must contain ca.pem and ca-key.pem (got: $ca_dir)"
@@ -111,7 +117,8 @@ elif [[ -n $ca_dir ]]; then
   ca_imported=true
   echo "CA imported from $ca_dir"
 else
-  dir=$(scratch)
+  ensure_scratch
+  dir=$work
   openssl req -x509 -newkey rsa:3072 -nodes -days "$days" -sha256 \
     -subj "/CN=ADX AFS local example CA" \
     -keyout "$dir/ca-key.pem" -out "$dir/ca.pem" >/dev/null 2>&1
@@ -123,13 +130,19 @@ fi
 issue_identity() {
   local name=$1 cert="$destination/$1.pem" key="$destination/$1-key.pem" dir san
   if [[ -f $cert && -f $key ]]; then
+    # A kept identity is only usable if it still chains to the kept CA; a CA
+    # swap (or a certificate restored from backup without its CA) must fail
+    # loudly instead of reporting unusable material as ready.
+    openssl verify -CAfile "$destination/ca.pem" "$cert" >/dev/null 2>&1 \
+      || die "identity $name no longer chains to the CA in $destination: remove both $name.pem and $name-key.pem, then rerun"
     echo "identity $name already present (kept)"
     return 0
   fi
   if [[ -f $cert || -f $key ]]; then
     die "half-written identity for $name in $destination: remove both ${name}.pem and ${name}-key.pem, then rerun"
   fi
-  dir=$(scratch)
+  ensure_scratch
+  dir=$work
 
   san="subjectAltName=DNS:afs-cluster,DNS:$name,IP:127.0.0.1"
   # node-<a.b.c.d> (the deploy convention) also gets the address as an IP SAN so a peer that
