@@ -1203,7 +1203,8 @@ impl RootManager {
                     match self.disk.mkdir(&data_dir, temporary_mode) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                            if !self.disk.metadata(&data_dir)?.is_dir() {
+                            let existing = self.disk.metadata(&data_dir)?;
+                            if !existing.is_dir() {
                                 return Err(invalid_grant(
                                     "reserved workspace path exists but is not a directory",
                                 ));
@@ -1211,8 +1212,11 @@ impl RootManager {
                             // Creation may only keep an existing directory in
                             // place. Startup cleanup deliberately retains
                             // native-named directories, and replacing an empty
-                            // one would silently change the inode and any
-                            // operator attributes behind the same name. A
+                            // one would silently change the inode behind the
+                            // same name. Keeping it in place promises the
+                            // inode only: the request's uid/gid/mode are
+                            // applied below exactly as to a fresh directory —
+                            // an empty directory holds no data to protect. A
                             // nonempty predecessor is kept only when the
                             // retired record proves an earlier Create
                             // preparation made it (never activated, so it is
@@ -1231,6 +1235,17 @@ impl RootManager {
                                     afs_error::IO_DIRECTORY_NOT_EMPTY,
                                     "workspace path already contains data; resolve it before creating this name",
                                 ));
+                            }
+                            // The reuse rewrites the directory's identity to
+                            // the request; say so instead of leaving a silent
+                            // drift for an operator watching the directory.
+                            if existing.mode() & 0o7777 != params.mode
+                                || existing.uid() != params.uid
+                                || existing.gid() != params.gid
+                            {
+                                afs_logging::warn!("root.create.reused_retained_directory";
+                                    "data_dir" => ?data_dir,
+                                    "previous_mode" => format!("{:o}", existing.mode() & 0o7777));
                             }
                         }
                         Err(error) => return Err(Error::from(error)),
@@ -4604,7 +4619,8 @@ mod tests {
     }
 
     /// 启动扫描特意保留的原生空目录（例：D-4 启动清理不再 rmdir），同名新建必须
-    /// 原地复用：不得删除重建——名字没变但 inode 已换。
+    /// 原地复用：不得删除重建——名字没变但 inode 已换。复用只承诺 inode；目录
+    /// 身份（uid/gid/mode）与全新创建一样跟随请求参数重写，属性不同也照样通过。
     #[test]
     fn create_reuses_a_retained_empty_native_directory_in_place() {
         let temp = tempfile::tempdir().unwrap();
@@ -4612,9 +4628,14 @@ mod tests {
         let meta = Arc::new(RecoveryMeta::default());
         let name = OsStr::new("job");
         let data_dir = root_data_dir(name, 1).unwrap();
-        disk.mkdir(&data_dir, 0o750).unwrap();
+        disk.mkdir(&data_dir, 0o751).unwrap();
         use std::os::unix::fs::MetadataExt;
         let before = std::fs::metadata(temp.path().join(data_dir.as_path())).unwrap();
+        assert_ne!(
+            before.mode() & 0o7777,
+            0o750,
+            "precondition: the retained attributes must differ from the request"
+        );
 
         let manager = RootManager::open(
             "node-a".into(),
@@ -4645,7 +4666,8 @@ mod tests {
             after.ino(),
             "creation must keep the retained directory instead of replacing it"
         );
-        assert_eq!(after.mode() & 0o777, 0o750);
+        // 只承诺 inode：身份按请求参数重写，属性漂移由 create 请求解释。
+        assert_eq!(after.mode() & 0o7777, 0o750);
     }
 
     #[test]
