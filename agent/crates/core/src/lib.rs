@@ -184,6 +184,9 @@ pub struct TemplateDraft {
     pub isolation_runtime: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_prepare_snapshot: bool,
+    /// Name of a deployment-owned profile in this tenant, selected for auto preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden_seed_profile: Option<String>,
     /// Optional verified restore recipe. Selecting it requires a product start decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prewarm_recipe: Option<prewarm::PrewarmRecipe>,
@@ -219,6 +222,8 @@ pub struct TemplateVersion {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_prepare_snapshot: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden_seed_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_preparation: Option<prewarm::SnapshotPreparation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prewarm_recipe: Option<prewarm::PrewarmRecipe>,
@@ -246,6 +251,9 @@ pub struct TemplateVersion {
 
 impl TemplateDraft {
     pub fn validate(&self) -> ValidationResult {
+        if let Some(profile) = &self.golden_seed_profile {
+            identifier(profile, "golden_seed_profile")?;
+        }
         if self.auto_prepare_snapshot
             && (self.prewarm_recipe.is_some()
                 || !self
@@ -267,6 +275,7 @@ impl TemplateDraft {
             image: self.image.clone(),
             isolation_runtime: self.isolation_runtime.clone(),
             auto_prepare_snapshot: self.auto_prepare_snapshot,
+            golden_seed_profile: self.golden_seed_profile.clone(),
             snapshot_preparation: self
                 .auto_prepare_snapshot
                 .then_some(prewarm::SnapshotPreparation::Pending),
@@ -290,6 +299,7 @@ impl From<&TemplateVersion> for TemplateDraft {
             image: template.image.clone(),
             isolation_runtime: template.isolation_runtime.clone(),
             auto_prepare_snapshot: template.auto_prepare_snapshot,
+            golden_seed_profile: template.golden_seed_profile.clone(),
             prewarm_recipe: if template.auto_prepare_snapshot {
                 None
             } else {

@@ -17,7 +17,7 @@ Activator 通过 Environment 能力接口访问生命周期：独立部署使用
 
 ## 2 数字版本与统一引用
 
-`POST /api/agent/v2/templates` 接收不含 version 的 TemplateDraft。服务端在 tenant/template 范围内，通过同一 CAS 事务推进持久化序列并保存不可变模板快照。没有 `Idempotency-Key` 的每次成功发布都分配新版本；同租户同键同内容重放返回已有版本。`auto_prepare_snapshot` 只在发布事务中追加同版本制备意图，后来写入独立的只写一次配方结果。制备不修改 Alias 或已有 Binding。
+`POST /api/agent/v2/templates` 接收不含 version 的 TemplateDraft。服务端在 tenant/template 范围内，通过同一 CAS 事务推进持久化序列并保存不可变模板快照。没有 `Idempotency-Key` 的每次成功发布都分配新版本；同租户同键同内容重放返回已有版本。启用 `auto_prepare_snapshot` 时，发布草稿通过 `golden_seed_profile` 显式选同租户的制备规则，启动规格须通过该规则的兼容校验。制备任务和结果仍按 tenant/template/version 隔离，完成后写入该版本的独立配方结果。制备不修改 Alias 或已有 Binding。
 
 版本采用规范的正 u64 十进制字符串，拒绝 0、前导零和溢出。外部引用中的纯数字只能解释为版本，其他合法引用解释为 Alias；Alias 名不能为纯数字。不提供隐式 latest、版本查询失败后的 Alias 回退或单独的 alias-binding 类型。
 

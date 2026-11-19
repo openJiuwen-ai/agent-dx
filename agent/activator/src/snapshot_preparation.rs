@@ -29,11 +29,18 @@ pub struct ConfiguredSeedProfile {
 struct Profile {
     schema_version: u32,
     profile: String,
-    template: String,
+    kind: ProfileKind,
     inherit_from_published_template: Vec<String>,
     requires: Requirements,
     seed: Seed,
     restore: Restore,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ProfileKind {
+    Generic,
+    DigitalMate,
 }
 
 #[derive(Deserialize)]
@@ -91,7 +98,7 @@ fn safe_seed_env(name: &str, value: &str) -> bool {
 
 impl ConfiguredSeedProfile {
     fn scope(&self) -> (&str, &str) {
-        (&self.tenant, &self.profile.template)
+        (&self.tenant, &self.profile.profile)
     }
 
     fn build(&self, draft: &TemplateDraft) -> Result<PreparationJob> {
@@ -103,7 +110,7 @@ impl ConfiguredSeedProfile {
         let expected: BTreeSet<_> = ["image", "isolation_runtime", "resources", "readiness_probe"]
             .into_iter()
             .collect();
-        if profile.schema_version != 1
+        if profile.schema_version != 2
             || !seed.inherit_entrypoint
             || profile
                 .inherit_from_published_template
@@ -144,7 +151,7 @@ impl ConfiguredSeedProfile {
         {
             return Err(reject());
         }
-        if profile.template == "digitalmate" {
+        if profile.kind == ProfileKind::DigitalMate {
             for (key, value) in &seed.env {
                 if key != "DIGITALMATE_GOLDEN_PHASE" && draft.env.get(key) != Some(value) {
                     return Err(Error::Invalid(format!(
@@ -278,13 +285,12 @@ impl ConfiguredSeedProfile {
 impl Activator {
     pub fn with_seed_profiles(mut self, profiles: Vec<ConfiguredSeedProfile>) -> Result<Self> {
         for profile in profiles {
-            let (tenant, template) = profile.scope();
+            let (tenant, name) = profile.scope();
             adx_agent_core::identifier(tenant, "seed profile tenant").map_err(Error::Invalid)?;
-            adx_agent_core::identifier(template, "seed profile template")
-                .map_err(Error::Invalid)?;
+            adx_agent_core::identifier(name, "seed profile name").map_err(Error::Invalid)?;
             if self
                 .seed_profiles
-                .insert((tenant.into(), template.into()), profile)
+                .insert((tenant.into(), name.into()), profile)
                 .is_some()
             {
                 return Err(Error::Invalid("duplicate Golden seed profile".into()));
@@ -307,11 +313,14 @@ impl Activator {
     }
 
     pub(crate) fn seed_job(&self, tenant: &str, draft: &TemplateDraft) -> Result<PreparationJob> {
+        let name = draft.golden_seed_profile.as_ref().ok_or_else(|| {
+            Error::Invalid("auto_prepare_snapshot requires golden_seed_profile".into())
+        })?;
         let mut job = self
             .seed_profiles
-            .get(&(tenant.into(), draft.name.clone()))
+            .get(&(tenant.into(), name.clone()))
             .ok_or_else(|| {
-                Error::Invalid("no Golden seed profile for this tenant and template".into())
+                Error::Invalid("no Golden seed profile with that name in this tenant".into())
             })?
             .build(draft)?;
         job.seed.native_input = self

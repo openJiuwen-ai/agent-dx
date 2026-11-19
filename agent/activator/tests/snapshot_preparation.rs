@@ -40,7 +40,7 @@ impl Environment for Platform {
         runtime: &str,
     ) -> Result<bool, EnvironmentError> {
         Ok(tenant == "tenant"
-            && id == "snapshot-ready"
+            && matches!(id, "snapshot-ready" | "snapshot-canary" | "snapshot-stable")
             && image == fixed_image()
             && runtime == "runsc")
     }
@@ -69,7 +69,8 @@ fn fixed_image() -> String {
 fn draft(automatic: bool) -> TemplateDraft {
     serde_json::from_value(json!({
         "name":"digitalmate", "image":fixed_image(), "isolation_runtime":"runsc",
-        "auto_prepare_snapshot":automatic, "resources":{"cpu_millis":2000,"memory_mib":4096},
+        "auto_prepare_snapshot":automatic, "golden_seed_profile":automatic.then_some("golden-test"),
+        "resources":{"cpu_millis":2000,"memory_mib":4096},
         "service":[{"protocol":"ws","port":18092}], "readiness_probe":{"http_get":{"path":"/health/ready","port":18092}},
         "env":{"DIGITALMATE_WORKSPACE":"/data/state", "DIGITALMATE_CRYPTO_URL":"https://privacy.example.test", "DIGITALMATE_CRYPTO_TENANT":"tenant",
             "DIGITALMATE_MODEL_CONFIG_NAME":"approved", "DIGITALMATE_CRYPTO_WORKSPACE":"${workspace}"},
@@ -79,7 +80,7 @@ fn draft(automatic: bool) -> TemplateDraft {
 
 fn configured(store: AgentState, platform: Arc<Platform>) -> Activator {
     let profiles = serde_json::from_value(json!([{"tenant":"tenant","directory_root":"tenant/workspaces","profile":{
-        "schema_version":1,"profile":"golden-test","template":"digitalmate",
+        "schema_version":2,"profile":"golden-test","kind":"digitalmate",
         "inherit_from_published_template":["image","isolation_runtime","resources","readiness_probe"],
         "requires":{"isolation_runtime":"runsc","readiness_http_path":"/health/ready","seed_readiness_http_path":"/health/ready/golden-seed"},
         "seed":{"inherit_entrypoint":true,"env_from_template":["DIGITALMATE_CRYPTO_URL","DIGITALMATE_CRYPTO_TENANT","DIGITALMATE_MODEL_CONFIG_NAME"],
@@ -96,6 +97,71 @@ fn configured(store: AgentState, platform: Arc<Platform>) -> Activator {
 #[tokio::test]
 async fn publication_is_immediate_and_one_fixed_job_fills_the_same_version_after_restart() {
     publication_and_restart(Arc::new(MemoryRepository::default())).await;
+}
+
+#[tokio::test]
+async fn two_template_names_can_select_one_profile_and_receive_separate_results() {
+    let platform = Arc::new(Platform::default());
+    let author = configured(
+        AgentState::new(Arc::new(MemoryRepository::default())),
+        platform.clone(),
+    );
+    let mut input = serde_json::to_value(draft(true)).unwrap();
+    input["golden_seed_profile"] = json!("golden-test");
+    input["name"] = json!("digitalmate-canary");
+    let canary: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
+    input["name"] = json!("digitalmate-stable");
+    let stable: TemplateDraft = serde_json::from_value(input).unwrap();
+
+    for draft in [&canary, &stable] {
+        let mut incompatible = draft.clone();
+        incompatible
+            .env
+            .insert("DIGITALMATE_MEMORY_BACKEND".into(), "mem2".into());
+        assert!(matches!(
+            author.publish("tenant", &incompatible).await,
+            Err(Error::Invalid(reason)) if reason.contains("DIGITALMATE_MEMORY_BACKEND")
+        ));
+        let published = author.publish("tenant", draft).await.unwrap();
+        assert_eq!(published.name, draft.name);
+        assert_eq!(published.version, "1");
+        assert_eq!(
+            published.golden_seed_profile.as_deref(),
+            Some("golden-test")
+        );
+        assert_eq!(
+            published.snapshot_preparation,
+            Some(SnapshotPreparation::Pending)
+        );
+    }
+    assert!(platform.calls.lock().await.is_empty());
+    platform.replies.lock().await.extend([
+        Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-canary".into(),
+        }),
+        Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-stable".into(),
+        }),
+    ]);
+    author.reconcile_snapshot_preparations().await.unwrap();
+    let mut recipes = Vec::new();
+    for name in [&canary.name, &stable.name] {
+        let template = author.template("tenant", name, "1").await.unwrap();
+        assert_eq!(
+            template.snapshot_preparation,
+            Some(SnapshotPreparation::Ready)
+        );
+        recipes.push(template.prewarm_recipe.unwrap());
+    }
+    assert_ne!(recipes[0].snapshot_id, recipes[1].snapshot_id);
+    assert_eq!(
+        recipes[0].restore_profile_digest,
+        recipes[1].restore_profile_digest
+    );
+    let calls = platform.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_ne!(calls[0].1, calls[1].1);
+    assert_ne!(calls[0].2.volume.id, calls[1].2.volume.id);
 }
 
 #[tokio::test]
@@ -133,11 +199,22 @@ async fn helm_delivered_iac_profile_builds_an_anonymous_seed() {
         published.snapshot_preparation,
         Some(SnapshotPreparation::Pending)
     );
+    let path = std::env::var("ADX_TEST_GOLDEN_CANARY_DRAFT")
+        .expect("set path to second IaC-generated TemplateDraft");
+    let canary: TemplateDraft = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_ne!(input.name, canary.name);
+    assert_eq!(input.golden_seed_profile, canary.golden_seed_profile);
+    let published_canary = activator.publish(tenant, &canary).await.unwrap();
+    assert_eq!(
+        published_canary.snapshot_preparation,
+        Some(SnapshotPreparation::Pending)
+    );
     activator.reconcile_snapshot_preparations().await.unwrap();
     let calls = platform.calls.lock().await;
-    let [(actual_tenant, _, seed)] = calls.as_slice() else {
-        panic!("one seed expected");
-    };
+    assert_eq!(calls.len(), 2);
+    assert_ne!(calls[0].1, calls[1].1);
+    assert_ne!(calls[0].2.volume.id, calls[1].2.volume.id);
+    let (actual_tenant, _, seed) = &calls[0];
     assert_eq!(actual_tenant, tenant);
     assert_eq!(seed.execution.env["DIGITALMATE_GOLDEN_PHASE"], "seed");
     assert!(!seed.execution.env.contains_key("API_KEY"));
@@ -178,7 +255,7 @@ async fn publication_and_restart(repo: Arc<dyn Repository>) {
         author.template("tenant", "digitalmate", "1").await.unwrap(),
         first
     );
-    let worker = configured(AgentState::new(repo), platform.clone());
+    let worker = Activator::new(AgentState::new(repo), platform.clone());
     platform.replies.lock().await.extend([
         Err(EnvironmentError::OutcomeUnknown("lost response".into())),
         Ok(SeedResult::Ready {
@@ -259,8 +336,10 @@ async fn disabled_missing_profile_conflict_and_terminal_failure_do_not_select_a_
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let platform = Arc::new(Platform::default());
     let author = configured(state.clone(), platform.clone());
+    let mut disabled = draft(false);
+    disabled.golden_seed_profile = Some("unconfigured".into());
     let plain = author
-        .publish_with_id("tenant", &draft(false), Some("plain"))
+        .publish_with_id("tenant", &disabled, Some("plain"))
         .await
         .unwrap();
     assert!(plain.snapshot_preparation.is_none());
@@ -276,7 +355,16 @@ async fn disabled_missing_profile_conflict_and_terminal_failure_do_not_select_a_
         author.publish("foreign", &draft(true)).await,
         Err(Error::Invalid(_))
     ));
+    for selector in [None, Some("unconfigured".into())] {
+        let mut input = draft(true);
+        input.golden_seed_profile = selector;
+        assert!(matches!(
+            author.publish("tenant", &input).await,
+            Err(Error::Invalid(_))
+        ));
+    }
     let pending = author.publish("tenant", &draft(true)).await.unwrap();
+    assert_eq!(pending.version, "2");
     platform
         .replies
         .lock()
