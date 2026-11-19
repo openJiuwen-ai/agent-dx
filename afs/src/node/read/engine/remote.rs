@@ -212,10 +212,17 @@ impl DfsReadEngine {
                 // last candidate for some operation in the group, wait and ask it
                 // again within the read deadline instead of ending the read with
                 // EAGAIN; with other candidates left, move on as before.
-                if crate::node::fault::classify::retryable_backpressure(&error)
-                    && choices <= 1
-                    && Instant::now() + progress.busy_backoff < round.deadline
-                {
+                if crate::node::fault::classify::retryable_backpressure(&error) && choices <= 1 {
+                    if Instant::now() + progress.busy_backoff >= round.deadline {
+                        // No other copy and no time left: the read timed out.
+                        return Err(Error::coded(
+                            afs_error::CLIENT_DEADLINE_EXCEEDED,
+                            format!(
+                                "DFS peer stayed busy until the read deadline: {}",
+                                error.message()
+                            ),
+                        ));
+                    }
                     tokio::time::sleep(progress.busy_backoff).await;
                     progress.busy_backoff = (progress.busy_backoff * 2).min(BUSY_BACKOFF_MAX);
                     progress.last_error = Some(error);

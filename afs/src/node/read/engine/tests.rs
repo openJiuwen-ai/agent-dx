@@ -2362,7 +2362,10 @@ fn remote_read_busy_wait_is_bounded_by_the_read_deadline() {
     let error = engine
         .read_batch(&one_op(chunk_id), &mut [0; 6])
         .unwrap_err();
-    assert_eq!(error.kind(), afs_error::ErrorKind::ResourceExhausted);
+    // A holder that stays busy past the deadline is a timeout to the
+    // application, not EAGAIN (which most readers do not retry).
+    assert_eq!(error.code(), afs_error::CLIENT_DEADLINE_EXCEEDED);
+    assert_eq!(crate::error::errno(&error), libc::ETIMEDOUT);
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "{:?}",
