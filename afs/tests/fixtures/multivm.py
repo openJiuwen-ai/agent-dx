@@ -21,8 +21,8 @@ from fixtures.common import (
 )
 from tools import benchlib
 
-ROLES = ("M", "A", "B", "C")
-NAMES = {"M": "meta", "A": "node-a", "B": "node-b", "C": "node-c"}
+ROLES = ("M", "A", "B", "C", "D", "E")
+NAMES = {"M": "meta", "A": "node-a", "B": "node-b", "C": "node-c", "D": "node-d", "E": "node-e"}
 # R16: run the suites with Meta on a shared-service log. The variable holds
 # the Meta store TOML lines; "{unique}" becomes a fresh token per generated
 # Meta config, so each case starts on an empty key prefix.
@@ -62,6 +62,17 @@ def verify_hybrid(infos):
         raise Blocked("independent kernels are ambiguous; duplicate clone machine-id needs distinct VM UUIDs")
 
 
+def is_bench(case):
+    return any(t.startswith("bench-") for t in case.tags)
+
+
+def bench_fanout_readers(case, config):
+    """Reader roles of a bench fan-out case (bench.readers, default B and C); None for other cases."""
+    if is_bench(case) and case.id.endswith(".many_readers"):
+        return benchlib.parameters(config).reader_roles
+    return None
+
+
 def validate(config, cases):
     if config.get("kind") not in ("singlevm", "multivm", "namespaces", "hybrid", "kubernetes", "docker"):
         raise ValueError("kind must be singlevm, namespaces, multivm, hybrid, kubernetes or docker")
@@ -73,8 +84,12 @@ def validate(config, cases):
     roles = config.get("roles", {})
     hosts = config.get("hosts", {})
     needed = set("MAB")
-    if any(needs_reader_c(c, config["kind"], config.get("topology")) for c in cases):
-        needed.add("C")
+    for case in cases:
+        readers = bench_fanout_readers(case, config)
+        if readers is not None:
+            needed.update(readers)
+        elif needs_reader_c(case, config["kind"], config.get("topology")):
+            needed.add("C")
     for case in cases:
         if not isinstance(case.observe_cache, bool) or (case.observe_cache and case.mode != "dfs"):
             raise ValueError("cache-open observation is a boolean DFS-only test option")
@@ -83,7 +98,7 @@ def validate(config, cases):
         if case.purpose not in ("functional", "performance"):
             raise ValueError("unknown case purpose")
         if case.purpose == "performance":
-            if any(t.startswith("bench-") for t in case.tags):
+            if is_bench(case):
                 benchlib.parameters(config)
             else:
                 performance_parameters(config)
@@ -162,7 +177,10 @@ class Cluster:
         self.evidence = []
         self.started = False
         self.roles = ["M", "A", "B"]
-        if (needs_reader_c(case, config["kind"], config.get("topology"))
+        readers = bench_fanout_readers(case, config)
+        if readers is not None:
+            self.roles = ["M", "A", *readers]
+        elif (needs_reader_c(case, config["kind"], config.get("topology"))
                 or (case.profile is not None and case.profile.node_count == 3)):
             self.roles.append("C")
         if self.mode == "ownerfs":
@@ -172,6 +190,7 @@ class Cluster:
         self.bind = False
         self.helpers = {}
         self.effective = {}
+        self.memory_mounts = {}
         # One Meta store per cluster: regenerated configs and Meta restarts
         # within a case keep the same log (and key prefix).
         self.meta_store_toml = meta_store_config()
@@ -565,6 +584,9 @@ class Cluster:
                 )
                 if self.case.profile is not None:
                     config += self.case.profile.node_config()
+                if is_bench(self.case):
+                    config += benchlib.node_overrides_toml(
+                        benchlib.parameters(self.config).overrides_for(role), remote_join(data, "peer-cache"))
                 if role == "A" and self.mode == "ownerfs" and self.bind:
                     config += (
                         "\nexperimental_ownerfs_workspace_bind = true\nownerfs_workspace_egress_root = "
@@ -583,10 +605,52 @@ class Cluster:
                 self.mount(role) if role != "M" else data + "/mount",
                 owner=False,
             )
+            if role != "M" and is_bench(self.case):
+                self.prepare_bench_node(role, data)
             effective = self.command(
                 role, [root + "/bin/afs-" + ("meta" if role == "M" else "node"), "--config", path, "--print-config"]
             )
             self.effective[role] = self.record("config.effective." + role, json.loads(effective["stdout"]))
+            if role != "M" and is_bench(self.case):
+                declared = benchlib.parameters(self.config).overrides_for(role)
+                mismatches = benchlib.effective_mismatches(self.effective[role], declared)
+                self.record("bench.node_overrides." + role, {"declared": declared, "mismatches": mismatches})
+                if mismatches:
+                    raise AssertionError("bench node overrides not in effect on %s: %r" % (role, mismatches))
+
+    def prepare_bench_node(self, role, data):
+        """Peer-cache directory for declared overrides; memory backend tmpfs on the Node's state dir.
+
+        The tmpfs lives in the worker's private mount namespace and is charged to the role's cgroup;
+        it is unmounted after the Nodes stop (unmount_memory_backends) and before worker cleanup.
+        """
+        params = benchlib.parameters(self.config)
+        if any(k.startswith("dfs_peer_cache.") for k in params.overrides_for(role)):
+            self.python(role, "os.makedirs(sys.argv[1],0o700,exist_ok=True)", remote_join(data, "peer-cache"),
+                        owner=False)
+        if params.backend != "memory" or role in self.memory_mounts:
+            return
+        state = remote_join(data, "state")
+        self.command(role, ["mount", "-t", "tmpfs", "-o", "size=%d,mode=0700" % params.memory_backend_bytes,
+                            "afs-bench-memory", state])
+        self.memory_mounts[role] = state
+        fstype = self.command(role, ["findmnt", "-n", "-o", "FSTYPE", "--mountpoint", state])["stdout"].strip()
+        if fstype != "tmpfs":
+            raise AssertionError("memory backend is not tmpfs on %s: %r" % (role, fstype))
+        self.record("bench.memory_backend." + role, {"path": state, "fstype": fstype,
+                                                     "size_bytes": params.memory_backend_bytes})
+
+    def unmount_memory_backends(self, errors):
+        for role, state in list(self.memory_mounts.items()):
+            try:
+                value = self.channel(role).call("command", argv=["umount", state], uid=None, gid=None, env={},
+                                                timeout=30, stdin=None)
+                if value["returncode"] != 0:
+                    errors.append("%s: memory backend unmount failed: %s" % (role, value["stderr"][-300:]))
+                    continue
+                del self.memory_mounts[role]
+            except Exception as exc:
+                errors.append("%s: memory backend unmount unconfirmed: %s" % (role, exc))
 
     def health(self, role, path="/health"):
         code = ("import urllib.request\no=urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
@@ -746,6 +810,8 @@ class Cluster:
             except Exception as exc:
                 nodes_confirmed_gone = False
                 errors.append("cannot confirm Node exit: " + str(exc))
+        if nodes_confirmed_gone:
+            self.unmount_memory_backends(errors)
         for host, ch in self.channels.items():
             try:
                 result = ch.call("cleanup", timeout=80, allow_meta=nodes_confirmed_gone)

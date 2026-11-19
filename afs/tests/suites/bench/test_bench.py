@@ -122,7 +122,8 @@ SNAPSHOT = (
     " try:\n  return open(p).read()\n"
     " except OSError:\n  return ''\n"
     "print(json.dumps({'time':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'diskstats':read('/proc/diskstats'),"
-    "'loadavg':read('/proc/loadavg'),'psi_cpu':read('/proc/pressure/cpu'),'psi_io':read('/proc/pressure/io')}))"
+    "'loadavg':read('/proc/loadavg'),'psi_cpu':read('/proc/pressure/cpu'),'psi_io':read('/proc/pressure/io'),"
+    "'vmstat':read('/proc/vmstat'),'meminfo':read('/proc/meminfo')}))"
 )
 
 
@@ -131,9 +132,47 @@ def host_snapshot(c, roles):
     return {r: json.loads(c.python(r, SNAPSHOT, owner=False)["stdout"]) for r in roles}
 
 
+def memory_window(before, after):
+    first = benchlib.parse_kernel_memory(before.get("vmstat", ""), before.get("meminfo", ""))
+    second = benchlib.parse_kernel_memory(after.get("vmstat", ""), after.get("meminfo", ""))
+    kills = None if None in (first["oom_kill"], second["oom_kill"]) else second["oom_kill"] - first["oom_kill"]
+    return {"mem_available_before": first["mem_available"], "mem_available_after": second["mem_available"],
+            "oom_kill_delta": kills}
+
+
+def require_no_oom(memory):
+    """A round during which the role's kernel recorded an OOM kill is void, not a slow sample."""
+    killed = {role: m["oom_kill_delta"] for role, m in memory.items() if m["oom_kill_delta"]}
+    if killed:
+        raise AssertionError("OOM kill during the round, round void: %r" % killed)
+
+
 def host_evidence(before, after):
-    return ({r: benchlib.diskstats_delta(before[r]["diskstats"], after[r]["diskstats"]) for r in before},
-            {r: benchlib.host_window(before[r], after[r]) for r in before})
+    hosts = {}
+    for role in before:
+        hosts[role] = dict(benchlib.host_window(before[role], after[role]),
+                           memory=memory_window(before[role], after[role]))
+    require_no_oom({role: value["memory"] for role, value in hosts.items()})
+    return ({r: benchlib.diskstats_delta(before[r]["diskstats"], after[r]["diskstats"]) for r in before}, hosts)
+
+
+WRITER_METRICS = r"read|peer|serve|slot|reject|admission|gc|reclaim|collect|cache"
+
+
+def writer_metrics(c):
+    return c.health("A", "/metrics")
+
+
+def backend_state(c, params, nodes, source):
+    """Evidence and layer name for a remote cold read.
+
+    Disk backend: evict and judge (evict_backends). Memory backend: chunks live in tmpfs by declaration,
+    so the backend cannot be cold; the layer only says the reader never opened the file.
+    """
+    if params.backend == "memory":
+        return {"medium": "memory", "roles": list(nodes)}, "remote_cold_memory_backend"
+    evidence, cold = evict_backends(c, nodes, params.file_bytes, source)
+    return evidence, "remote_cold" if cold else "remote_cold_unverified"
 
 
 def fio(c, role, params, path, operation, block, threads, end_fsync=False, watch=()):
@@ -174,13 +213,17 @@ def summaries(c, rounds):
         groups.setdefault(key, []).append(entry["result"]["mib_per_s"])
     table = [{"op": k[0], "layer": k[1], "tool": k[2], "block_bytes": k[3], "threads": k[4],
               "mib_per_s": benchlib.summarize(v)} for k, v in sorted(groups.items())]
+    params = benchlib.parameters(c.config)
     return c.record("bench.summary", {"scope": "measurement only; performance acceptance NOT_EVALUATED",
-                                      "rows": table})
+                                      "variant": params.variant, "backend": params.backend,
+                                      "node_overrides": params.node_overrides, "rows": table})
 
 
 def localfs(c):
     """Upper bound: the same fio scenarios on the role's native ext4 directory."""
     params = benchlib.parameters(c.config)
+    if params.backend != "disk":
+        raise Blocked("bench.env.localfs is the disk upper bound; with a memory backend use hot reads instead")
     tool_identity(c, params, ("A",), ("fio",))
     directory = remote_join(c.role_dir("A"), "bench-local")
     mkdir_owned(c, "A", directory)
@@ -235,11 +278,13 @@ def dfs_sequential(c):
                                            result=result, **dict(shape, threads=1, loop_threads=threads)))
                 reader_path = remote_join(c.workspace("B"), name)
                 wait_visible(c, "B", reader_path, params.file_bytes)
-                backend, cold = evict_backends(c, nodes, params.file_bytes, "A")
-                evidence = {"same_kernel": same_kernel, "backend": backend}
+                backend, layer = backend_state(c, params, nodes, "A")
+                metrics_before = writer_metrics(c)
                 result = fio(c, "B", params, reader_path, "read", block, threads, watch=("A",))
-                rounds.append(round_record(c, "dfs.sequential", op="read",
-                                           layer="remote_cold" if cold else "remote_cold_unverified",
+                evidence = {"same_kernel": same_kernel, "backend": backend,
+                            "writer_metrics": benchlib.metrics_delta(metrics_before, writer_metrics(c),
+                                                                     WRITER_METRICS)}
+                rounds.append(round_record(c, "dfs.sequential", op="read", layer=layer,
                                            result=result, evidence=evidence, **shape))
                 cached = benchlib.cached_verdict(probe(c, "B", "resident", reader_path), params.file_bytes)
                 result = fio(c, "B", params, reader_path, "read", block, threads)
@@ -251,9 +296,9 @@ def dfs_sequential(c):
 
 
 def dfs_fanout(c):
-    """Writer A, readers B and C read the whole file concurrently through elbencho services."""
+    """Writer A; readers (bench.readers, B..E) read the whole file concurrently through elbencho services."""
     params = benchlib.parameters(c.config)
-    readers = ("B", "C")
+    readers = params.reader_roles
     require_separate_readers(c.config, readers)
     tool_identity(c, params, ("A",) + readers, ("fio", "elbencho"))
     # elbencho needs one path on every service host: each reader binds its own workspace onto the same
@@ -300,8 +345,9 @@ def fanout_rounds(c, params, readers, link, elbencho, env):
                                                result=result, **dict(shape, threads=1, loop_threads=threads)))
                     for role in readers:
                         wait_visible(c, role, remote_join(c.workspace(role), name), params.file_bytes)
-                    backend, cold = evict_backends(c, nodes, params.file_bytes, "A")
+                    backend, layer = backend_state(c, params, nodes, "A")
                     evidence = {"same_kernel": same_kernel, "backend": backend}
+                    metrics_before = writer_metrics(c)
                     report_name = "elbencho-%s.json" % hashlib.sha256(name.encode()).hexdigest()[:8]
                     report = remote_join(reports, report_name)
                     argv = benchlib.elbencho_read_argv(
@@ -316,11 +362,12 @@ def fanout_rounds(c, params, readers, link, elbencho, env):
                     text = c.python("A", "print(open(sys.argv[1]).read())", report)["stdout"]
                     result = benchlib.parse_elbencho(text, "READ")
                     result["disk"], result["host"] = host_evidence(before, after)
+                    evidence["writer_metrics"] = benchlib.metrics_delta(metrics_before, writer_metrics(c),
+                                                                        WRITER_METRICS)
                     if result["hosts"] != len(readers) or result["bytes"] != params.file_bytes * len(readers):
                         raise AssertionError("elbencho did not read the full file on every reader: %r" % result)
                     raw = [json.loads(line) for line in text.splitlines() if line.strip()]
-                    rounds.append(round_record(c, "dfs.fanout", op="read",
-                                               layer="remote_cold" if cold else "remote_cold_unverified",
+                    rounds.append(round_record(c, "dfs.fanout", op="read", layer=layer,
                                                tool="elbencho",
                                                result=result, evidence=evidence, raw=raw, **shape))
                     remove(c, "A", remote_join(c.workspace("A"), name))

@@ -578,7 +578,7 @@ python3 afs/tests/run.py run --suite local-performance --allow-performance \
 | `bench.env.localfs` | A | 同一组fio场景直接作用于A的原生ext4目录：写（单作业、`end_fsync`）、冷读、热读，作为上界 |
 | `bench.env.network` | A→B | iperf3 TCP吞吐，`threads`作为并发流数 |
 | `bench.dfs.sequential` | A写、B读 | DFS写（单作业，DFS单写者）；B从未打开过该文件时的远端冷读；B立即重读 |
-| `bench.dfs.fanout.many_readers` | A写、B/C读 | B、C上的elbencho service同时读全量文件，A只协调 |
+| `bench.dfs.fanout.many_readers` | A写、`bench.readers`个读者（B–E，默认2） | 各读者上的elbencho service同时读全量文件，A只协调 |
 
 缓存层由证据确定，不由场景名确定。每轮使用新文件；冷读前对文件（本地）或所有Node的`state/`后端文件
 （DFS）执行fdatasync与`POSIX_FADV_DONTNEED`，再用`tools/bench_probe.py`经mmap+mincore实测驻留量。
@@ -587,9 +587,21 @@ catalog、epoch等）容许max(1%×元数据总量, 64页)。任一超限时再�
 正文仍有驻留则该轮记为`remote_cold_unverified`而不是`remote_cold`。写者节点识别出的正文少于文件大小时视为后端布局不符，case失败。
 热读前要求文件驻留不少于99%且探针无错误，否则该轮记为`hot_unverified`。读者在冷读前只做按路径stat等待可见，不打开文件。
 角色同处一个内核时（`namespaces`/singlevm），远端冷读记录`same_kernel=true`：后端页缓存与写者共享，
-不能当作跨机冷读；跨机需`multivm`或`hybrid`拓扑。`bench.dfs.fanout.many_readers`要求读者B、C位于不同的host项
+不能当作跨机冷读；跨机需`multivm`或`hybrid`拓扑。`bench.dfs.fanout.many_readers`要求各读者位于不同的host项
 （每个读者在本机固定端口运行一个elbencho service），各读者在自己worker的私有mount namespace内把工作区bind到同一路径，
-不要求各host的`base`相同；B、C共用一个host项时BLOCKED。
+不要求各host的`base`相同；读者共用一个host项时BLOCKED。
+
+`bench`段的可选验证输入（省略时即磁盘后端、默认配置、两个读者）：
+
+| 键 | 含义 |
+| --- | --- |
+| `backend` | `disk`（默认）或`memory`。`memory`在各Node worker的私有mount namespace内把Node的`state/`挂成tmpfs（大小`memory_backend_bytes`，256MiB–64GiB），Node停止后、worker清理前卸载。chunk按声明驻留内存，不做后端驱逐，远端读层记为`remote_cold_memory_backend`（只表示读者从未打开该文件），不与磁盘的`remote_cold`合计；`bench.env.localfs`在内存后端下BLOCKED |
+| `node_overrides` | 角色（`*`或A–E）到白名单设置：`dfs_read_parallelism`、`dfs_readahead_max_bytes`、`dfs_read_crc_mode`、`dfs_read_pipeline.max_rpcs`、`dfs_peer_cache.capacity_bytes`（目录由框架建在该角色运行目录下的`peer-cache`）。写入Node配置后以`--print-config`核对，任一值未生效即失败，记为`bench.node_overrides.<角色>` |
+| `variant` | 变体标签（默认`V0`）；有`node_overrides`时必须不是`V0`。`bench.summary`同时记录`variant`、`backend`、`node_overrides` |
+| `readers` | fan-out读者数1–4，依次为B、C、D、E；环境须为每个读者提供独立host项 |
+
+每轮另记：主机`/proc/vmstat`的`oom_kill`差值与`MemAvailable`（角色namespace看不到cgroup文件，按内核整体判断，任何OOM使该轮失败）；
+DFS远端读前后写者A的`/metrics`中读、peer、服务、准入、GC、缓存相关计数的变化（`evidence.writer_metrics`）。
 
 每轮写入`checks.json`的`bench.round`，含工具自身报告的字节数与耗时（fio、elbencho的JSON），
 每组另有`bench.summary`（全部样本、中位数、min/max及max/min）；工具版本与SHA-256记为`bench.tool_identity`。
