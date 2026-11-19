@@ -824,6 +824,37 @@ impl Backend for DistributedFs {
         )
     }
 
+    fn set_read_source_range(
+        &self,
+        _ctx: &RequestContext,
+        handle: FileHandle,
+        range: std::ops::Range<u64>,
+        deadline: Instant,
+    ) -> Result<()> {
+        if range.start > range.end {
+            return Err(invalid("source metadata range is reversed"));
+        }
+        if Instant::now() >= deadline {
+            return Err(unavailable("source metadata hint deadline exceeded"));
+        }
+        // Snapshot only: installing a hint must not retry a pending version,
+        // contact Meta, fill a hole, or replace the handle's existing GC pin.
+        let snapshot = self.handle_snapshot(handle)?;
+        if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
+            return Err(bad_file_descriptor("DFS handle was not opened for reading"));
+        }
+        let mut state = snapshot
+            .handle
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+        if snapshot.handle.closed.load(Ordering::Acquire) {
+            return Err(stale("DFS file handle is no longer open"));
+        }
+        state.read_source_range = Some(range);
+        Ok(())
+    }
+
     fn supports_async_reads(&self) -> bool {
         self.read_engine.async_read_enabled()
     }

@@ -98,6 +98,8 @@ pub(super) struct HandleMut {
     // Accepted/synced sequences and the observed error cursor change after open.
     pub(super) write_session: Option<DfsRemoteWriteSession>,
     pub(super) read_sequence: crate::node::read::object_fetch::ReadSequence,
+    /// Metadata hint for this handle only; never a grant, version or body plan.
+    pub(super) read_source_range: Option<std::ops::Range<u64>>,
 }
 
 pub(super) type PinnedReadView = Result<(Arc<OpenedView>, NativeReadView)>;
@@ -120,6 +122,7 @@ impl From<DfsFileHandle> for DfsHandle {
                 native_denial_serial: opened.native_denial_serial,
                 write_session: opened.write_session,
                 read_sequence: crate::node::read::object_fetch::ReadSequence::default(),
+                read_source_range: None,
             }),
             closed: AtomicBool::new(false),
             dynamic_read_route: AtomicBool::new(false),
@@ -448,6 +451,7 @@ pub(super) struct DfsFileHandleSnapshot {
     pub(super) native_denial_serial: u64,
     pub(super) write_session: Option<DfsRemoteWriteSession>,
     pub(super) flags: i32,
+    pub(super) read_source_range: Option<std::ops::Range<u64>>,
     pub(super) owner_scope: Option<DfsOwnerHandleScope>,
 }
 
@@ -469,6 +473,7 @@ impl DfsFileHandleSnapshot {
             native_denial_serial: state.native_denial_serial,
             write_session: state.write_session.clone(),
             flags: handle.flags,
+            read_source_range: state.read_source_range.clone(),
             owner_scope: handle.owner_scope.clone(),
         })
     }

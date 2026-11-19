@@ -288,3 +288,92 @@ fn publication_unknown_result_never_removes_published_children() {
         Some(plan)
     );
 }
+
+#[derive(Default)]
+struct HttpRangeSourceBackend {
+    prepared: Mutex<Vec<std::ops::Range<u64>>>,
+    reads: Mutex<Vec<(u64, usize)>>,
+    released: AtomicBool,
+}
+impl Backend for HttpRangeSourceBackend {
+    fn root_inode(&self) -> BackendInode {
+        BackendInode { value: 1 }
+    }
+    fn open(&self, _: &RequestContext, _: BackendInode, _: i32) -> Result<FileHandle> {
+        Ok(FileHandle(1))
+    }
+    fn set_read_source_range(
+        &self,
+        _: &RequestContext,
+        _: FileHandle,
+        range: std::ops::Range<u64>,
+        _: Instant,
+    ) -> Result<()> {
+        assert!(
+            self.reads.lock().unwrap().is_empty(),
+            "install metadata range before any body read"
+        );
+        self.prepared.lock().unwrap().push(range);
+        Ok(())
+    }
+    fn read_owned(
+        &self,
+        _: &RequestContext,
+        _: FileHandle,
+        offset: u64,
+        size: usize,
+    ) -> Result<Vec<u8>> {
+        self.reads.lock().unwrap().push((offset, size));
+        Ok(vec![42; size])
+    }
+    fn release(&self, _: &RequestContext, _: FileHandle) -> Result<()> {
+        self.released.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_range_sources_are_prepared_once_before_streaming_256k() {
+    let (namespace, mut service, _) = fixture();
+    let start = 123_u64;
+    let length = (IO_BATCH + 17) as u64;
+    let end = start + length;
+    let entry = namespace
+        .insert(
+            BackendInode { value: 1 },
+            OsStr::new("blob"),
+            FileKind::Regular,
+            end + 1024,
+        )
+        .unwrap();
+    let backend = Arc::new(HttpRangeSourceBackend::default());
+    service.backend = backend.clone();
+    let service = Arc::new(service);
+    let permit = service.admit(service.deadline()).await.unwrap();
+    let mut receiver = service
+        .read_blob(entry, start, length, service.deadline(), permit)
+        .await
+        .unwrap();
+    let mut received = 0;
+    while let Some(piece) = receiver.recv().await {
+        let piece = piece.unwrap();
+        assert!(
+            piece.len() <= IO_BATCH,
+            "metadata preparation cannot enlarge HTTP body pieces"
+        );
+        assert!(piece.iter().all(|byte| *byte == 42));
+        received += piece.len();
+    }
+    assert_eq!(received as u64, length);
+    assert!(backend.released.load(Ordering::SeqCst));
+    assert_eq!(
+        *backend.prepared.lock().unwrap(),
+        vec![start..end],
+        "install exactly the caller's full Range on its open handle before producing its first piece"
+    );
+    let reads = backend.reads.lock().unwrap();
+    assert_eq!(
+        *reads,
+        vec![(start, IO_BATCH), (start + IO_BATCH as u64, 17)]
+    );
+}

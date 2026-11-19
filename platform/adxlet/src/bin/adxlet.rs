@@ -544,7 +544,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(pb::node_service_server::NodeServiceServer::new(
             node_rpc.clone(),
         ))
-        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener));
+        .serve_with_incoming(adx_transport::rpc::server_tcp_incoming(listener)?);
     tokio::pin!(server);
     let admin = async {
         if let Some(path) = &config.admin_socket {

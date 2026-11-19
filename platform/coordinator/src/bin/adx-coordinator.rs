@@ -300,7 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .max_encoding_message_size(64 * 1024 * 1024),
         )
         .serve_with_incoming_shutdown(
-            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            adx_transport::rpc::server_tcp_incoming(listener)?,
             async move {
                 let _ = server_shutdown_rx.await;
                 closing_routes.close_subscriptions();

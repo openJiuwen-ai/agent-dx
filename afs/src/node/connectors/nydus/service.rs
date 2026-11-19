@@ -455,6 +455,16 @@ impl NydusService {
         permit: Arc<OwnedSemaphorePermit>,
         tx: &mpsc::Sender<Result<Bytes>>,
     ) -> Result<()> {
+        let range_end = offset
+            .checked_add(remaining)
+            .ok_or_else(|| invalid("HTTP source metadata range overflow"))?;
+        let backend = self.backend.clone();
+        let ctx = self.ctx.clone();
+        blocking(move || {
+            check_deadline(deadline)?;
+            backend.set_read_source_range(&ctx, handle, offset..range_end, deadline)
+        })
+        .await?;
         while remaining > 0 {
             check_deadline(deadline)?;
             if tx.is_closed() {

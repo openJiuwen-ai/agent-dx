@@ -356,7 +356,15 @@ impl DistributedFs {
             return Err(unavailable("lazy range is not committed"));
         }
         let mut out = vec![0; count];
-        let batch = committed.read_batch(offset, count, 0)?;
+        let batch = match &snapshot.read_source_range {
+            Some(range) => committed.read_batch_in_source_range(
+                offset,
+                count,
+                self.read_engine.source_lookahead_chunks(),
+                range,
+            )?,
+            None => committed.read_batch(offset, count, 0)?,
+        };
         self.read_engine
             .read_batch_native_into_private_before(&batch, &mut out, Some(deadline))?;
         self.check_lazy_delivery(snapshot, authority)?;

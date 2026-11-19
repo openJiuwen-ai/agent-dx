@@ -1931,3 +1931,5 @@ mod view_references;
 mod write_pipeline_ops;
 mod write_semantics;
 mod write_state;
+
+mod http_range_sources;
