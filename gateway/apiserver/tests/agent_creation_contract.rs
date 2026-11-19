@@ -131,7 +131,7 @@ async fn create_entrypoint_requires_local_rootfs_beneath_an_allowed_directory() 
         "/srv/other-images/rootfs",
     ] {
         let spec = configured.prepare_create(request(path), &caller).unwrap();
-        assert!(spec.execution.unwrap().rootfs.unwrap().readonly, "{path}");
+        assert!(!spec.execution.unwrap().rootfs.unwrap().readonly, "{path}");
     }
     for path in [
         "/srv/adx-images/other/rootfs",

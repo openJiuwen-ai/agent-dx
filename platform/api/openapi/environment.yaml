@@ -1020,7 +1020,7 @@ components:
       description: >-
         An explicit Local source requires an absolute node path and an effective
         runtime that supports Local rootfs. Conch and Supervisor require image bindings.
-        Local rootfs is read-only and excludes writable layer quotas and runsc GPU allocation.
+        Explicit Local rootfs excludes writable layer quotas and runsc GPU allocation.
       properties:
         runtime: {type: string}
         type: {type: string, enum: [image, s3, local]}
@@ -1034,7 +1034,11 @@ components:
             allowed_local_rootfs_dirs list.
         readonly:
           type: boolean
-          description: Always true for an explicit Local source. Other sources inherit the deployment Runtime Environment default when omitted.
+          description: >-
+            For an explicit Local source, defaults to false with runsc and true with
+            other supported runtimes. A false value requires runsc and enables a private
+            writable overlay over the read-only host source. Other sources inherit the
+            deployment Runtime Environment default when omitted.
         storageInfo: {$ref: "#/components/schemas/S3Source"}
     S3Source:
       type: object

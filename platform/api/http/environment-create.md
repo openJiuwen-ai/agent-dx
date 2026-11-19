@@ -120,10 +120,12 @@ Conch and Supervisor require image bindings. A request that selects either runti
 with an explicit Local rootfs returns `INVALID_ARGUMENT` before scheduling. This
 also applies when the runtime comes from the deployment default.
 
-ADX makes an explicit Local rootfs read-only. The caller can omit `rootfs.readonly`
-or set it to `true`. Writable layer quotas (`storageMb` and `storage_limit_mb`)
-and runsc GPU allocation require a writable root and are incompatible with this
-source. Writable workspaces can use separate mounts.
+With runsc, an explicit Local rootfs uses a per-sandbox writable overlay by
+default. The host source remains read-only and the overlay uses the configured
+sandboxd filestore. Set `rootfs.readonly: true` for a read-only sandbox root.
+Other supported runtimes require a read-only Local rootfs.
+Writable layer quotas (`storageMb` and `storage_limit_mb`) and runsc GPU allocation
+are unavailable with an explicit Local source. Writable workspaces use separate mounts.
 
 Local workload entrypoints are supplied through the existing `process` field;
 `inheritEntrypoint=true` is rejected for an explicit Local source. Image metadata
