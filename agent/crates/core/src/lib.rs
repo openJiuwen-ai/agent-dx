@@ -196,6 +196,8 @@ pub struct TemplateDraft {
     #[serde(default)]
     pub service: Vec<Service>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<network::TemplateNetwork>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub init_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness_probe: Option<probes::ReadinessProbe>,
@@ -225,6 +227,8 @@ pub struct TemplateVersion {
     #[serde(default)]
     pub service: Vec<Service>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<network::TemplateNetwork>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub init_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness_probe: Option<probes::ReadinessProbe>,
@@ -249,6 +253,7 @@ impl TemplateDraft {
             mounts: self.mounts.clone(),
             volumes: self.volumes.clone(),
             service: self.service.clone(),
+            network: self.network.clone(),
             init_timeout_seconds: self.init_timeout_seconds,
             readiness_probe: self.readiness_probe.clone(),
             healthcheck: self.healthcheck.clone(),
@@ -267,6 +272,7 @@ impl From<&TemplateVersion> for TemplateDraft {
             mounts: template.mounts.clone(),
             volumes: template.volumes.clone(),
             service: template.service.clone(),
+            network: template.network.clone(),
             init_timeout_seconds: template.init_timeout_seconds,
             readiness_probe: template.readiness_probe.clone(),
             healthcheck: template.healthcheck.clone(),
@@ -315,6 +321,9 @@ impl TemplateVersion {
             .collect()
     }
     pub fn validate(&self) -> ValidationResult {
+        if let Some(network) = &self.network {
+            network.validate()?;
+        }
         version_number(&self.version)?;
         for (label, value) in [
             ("name", &self.name),

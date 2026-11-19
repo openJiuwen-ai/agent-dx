@@ -19,12 +19,12 @@
     "lease_seconds": 15,
     "heartbeat_seconds": 5
   },
-  "sandbox_network": {
-    "sandbox_cidrs": [
-      "10.233.16.0/20"
-    ],
-    "internal_cidrs": [],
-    "public_egress": true,
-    "egress_allow": []
+  "egress_isolation": {
+    "template_priority": 200,
+    "egress": {
+      "deny": [
+        {"cidr": "10.233.16.0/20", "protocol": "any", "priority": 300}
+      ]
+    }
   }
 }

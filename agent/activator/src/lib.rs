@@ -1,4 +1,5 @@
 //! Stateless AgentBinding activation. Platform owns Environment lifecycle and readiness.
+pub mod config;
 mod creation;
 pub mod environment_request;
 pub mod local_environment;

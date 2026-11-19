@@ -1,5 +1,3 @@
-mod support;
-
 use adx_activator::transport::HttpEnvironment;
 use adx_agent_core::environment::*;
 use axum::{http::StatusCode, routing::post, Json, Router};
@@ -41,7 +39,7 @@ async fn confirmed_queue_cancellation_survives_http_transport() {
         Duration::from_secs(1),
         None,
         true,
-        support::network_policy(),
+        None,
     )
     .unwrap();
     let request =
@@ -89,7 +87,7 @@ async fn plain_timeout_or_terminal_failure_never_authorizes_a_new_attempt() {
             Duration::from_secs(1),
             None,
             true,
-            support::network_policy(),
+            None,
         )
         .unwrap();
         let request=serde_json::from_value(json!({"id":"adx-candidate","tenant":"tenant","execution":{
@@ -126,7 +124,7 @@ async fn creation_attempt_changes_only_the_http_request_identity() {
         Duration::from_secs(1),
         None,
         true,
-        support::network_policy(),
+        None,
     )
     .unwrap();
     let mut request:CreateEnvironment=serde_json::from_value(json!({"id":"adx-candidate","tenant":"tenant","execution":{
