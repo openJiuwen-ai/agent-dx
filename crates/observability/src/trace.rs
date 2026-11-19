@@ -70,6 +70,15 @@ fn extract_context(parent: Option<&str>, state: Option<&str>) -> Context {
     TraceContextPropagator::new().extract_with_context(&Context::new(), &headers)
 }
 
+/// Extracted parent context, but only when the W3C headers produced a valid
+/// remote span. Malformed, empty or oversized traceparent values are ignored
+/// so entry points can fall back to the application correlation id instead of
+/// silently starting an unrelated root trace.
+fn valid_extracted_context(parent: Option<&str>, state: Option<&str>) -> Option<Context> {
+    let context = extract_context(parent, state);
+    context.span().span_context().is_valid().then_some(context)
+}
+
 fn derived_ids(correlation: &str) -> (TraceId, SpanId) {
     let digest = Sha256::digest(correlation.as_bytes());
     let trace_id = TraceId::from_hex(correlation)
@@ -134,7 +143,8 @@ impl Trace {
         Self::remote("http.request", parent, state).finish_http(method, route)
     }
     /// HTTP entry span that falls back to a deterministic trace id when only an
-    /// application correlation id is available. A W3C traceparent always wins.
+    /// application correlation id is available. A valid W3C traceparent wins;
+    /// an absent or invalid one falls back to the correlation id.
     pub fn http_with_correlation(
         method: &str,
         route: &'static str,
@@ -143,8 +153,9 @@ impl Trace {
         correlation: Option<&str>,
     ) -> Self {
         let parent = parent.filter(|value| !value.trim().is_empty());
-        let trace = match (parent, correlation) {
-            (Some(parent), _) => Self::remote("http.request", Some(parent), state),
+        let correlation = correlation.filter(|value| !value.trim().is_empty());
+        let trace = match (valid_extracted_context(parent, state), correlation) {
+            (Some(context), _) => Self::start("http.request", context, SpanKind::Server),
             (None, Some(correlation)) => Self::remote_derived("http.request", correlation),
             (None, None) => Self::remote("http.request", None, state),
         };
