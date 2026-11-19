@@ -56,24 +56,6 @@ the saved limit; it must not become the smaller scheduling request. Explicit
 positive limits remain subject to runtime compatibility and request validation.
 Fresh creation retains the existing zero-limit behavior of following its request.
 
-On `POST /api/environment/v1/environments/{id}/snapshots`, the optional JSON
-`kind` is `regular` (default) or `golden`. The source Environment must be
-owned by the caller. The caller is responsible for keeping tenant/user state
-out of any checkpoint intended for reuse across users. The kind classifies
-the resulting reusable snapshot; it does not scrub its contents.
-
-`PUT /api/environment/v1/snapshot-preparations/{uuid}` is the native asynchronous
-preparation entry used by the Agent worker. Its JSON body contains `environment`
-(native create shape, inherited entrypoint, a readiness probe, no `snapshotId`)
-and `volume` (dedicated exclusive directory Volume `adx-agent-seed-{uuid}`). The
-source must mount only that Volume. The API Server uses the caller's tenant,
-pins the ensured Volume UID in the start request, and uses the UUID for both the
-Platform family and build. The decoded `data.status` is `pending`, `ready` (with
-`snapshot_id`), or `failed`. Retry with the same UUID and same input after an
-unknown result. The caller owns the anonymity of the supplied seed. Platform
-reconciles capture and source Environment cleanup; a source Volume referenced by
-the snapshot remains protected by normal Volume retention rules.
-
 `inheritEntrypoint=true` is a fresh-create option, not a snapshot override.
 Combining it with `snapshotId` is rejected with HTTP 400, matching the native
 Python SDK. For snapshot restores, omit it or supply `false`: neither disables
@@ -105,31 +87,47 @@ an explicitly disabled workload. If no managed entrypoint exists, that query
 returns an error; it never starts a new process.
 
 
-## Deployment-registered Local rootfs templates
+## Caller-prepared Local rootfs
 
-Deployments may configure the same `local_rootfs_templates` map in the API Server
-and adxlet. A template contains an absolute `path`, optional `env`, and optional
-`process` (`commands`, `cwd`, `user`). Template names use 1..128 ASCII letters,
-digits, underscores or hyphens. ADX does not import Docker images or fetch an image
-for this source; the deployment prepares each artifact and its metadata.
+Public creation accepts an absolute path on the execution node when it is a
+strict descendant of a directory in the API Server's
+`allowed_local_rootfs_dirs` list. The check compares path components. An empty
+or omitted list disables caller-provided Local rootfs. Requests outside the
+allowed directories return `PERMISSION_DENIED` before scheduling.
 
-```json
-{"name":"offline-tools","rootfs":{"type":"template","name":"local-tools-v1","runtime":"runsc"}}
+With `adxctl` profile-based deployment, add the list to the API Server config:
+
+```yaml
+service_overrides:
+  apiserver:
+    config:
+      allowed_local_rootfs_dirs:
+        - /var/lib/agentos/local-images/objects
 ```
 
-The API resolves the registered name to a Local source persisted with the Environment.
-Arbitrary public Local paths remain rejected. Unknown names and conflicting image,
-path, storage or snapshot sources fail before scheduling. Only nodes advertising
-`ADX_LOCAL_ROOTFS_<name>=ready` are eligible; adxlet validates the registered paths
-before advertising them. Artifacts must remain available for the lifetime of their
-Environments and checkpoints. Use immutable names and paths for new content.
+Then create the environment with a path beneath that directory:
 
-Template environment values default the request environment; explicit request values
-win, while node-owned control configuration remains authoritative. With
-`inheritEntrypoint=true`, the template process is merged with explicit process fields
-and submitted as an explicit workload; no OCI process metadata lookup is performed.
-Without inheritance, no image workload starts. Local rootfs writable-layer handling
-and the existing Execd bootstrap are unchanged.
+```json
+{"name":"local-tools","rootfs":{"type":"local","path":"/var/lib/agentos/local-images/objects/local-IMAGE_ID/rootfs","runtime":"runsc"},"env":{"IMAGE_VALUE":"prepared"}}
+```
+
+The caller prepares and retains this directory or file on every eligible node,
+or selects a node that provides it. ADX does not import Docker images for this source.
+The API Server checks the requested path. Link resolution happens on the
+execution node. Use operator-controlled directories and ensure that symbolic
+links beneath them resolve within the approved directory tree on every eligible node.
+Conch and Supervisor require image bindings. A request that selects either runtime
+with an explicit Local rootfs returns `INVALID_ARGUMENT` before scheduling. This
+also applies when the runtime comes from the deployment default.
+
+ADX makes an explicit Local rootfs read-only. The caller can omit `rootfs.readonly`
+or set it to `true`. Writable layer quotas (`storageMb` and `storage_limit_mb`)
+and runsc GPU allocation require a writable root and are incompatible with this
+source. Writable workspaces can use separate mounts.
+
+Local workload entrypoints are supplied through the existing `process` field;
+`inheritEntrypoint=true` is rejected for an explicit Local source. Image metadata
+must be resolved by the caller into `env` and, when needed, `process`.
 
 ### Agent Golden 制品保护
 

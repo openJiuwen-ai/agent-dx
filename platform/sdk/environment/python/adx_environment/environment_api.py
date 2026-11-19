@@ -36,6 +36,7 @@ from .types import (
     IdleAction,
     ResumeResult,
     S3Config,
+    LocalRootfs,
     EnvironmentInfo,
     EnvironmentFailure,
     SnapshotInfo,
@@ -354,7 +355,7 @@ class Environment:
     def __init__(
         self,
         image: Optional[str] = None,
-        rootfs: Optional[S3Config] = None,
+        rootfs: Optional[Union[S3Config, LocalRootfs]] = None,
         runtime: Optional[str] = None,
         cpu: int = 1000,
         memory: int = 4096,
@@ -374,7 +375,6 @@ class Environment:
         node_id: Optional[str] = None,
         *,
         rootfs_readonly: Optional[bool] = None,
-        rootfs_template: Optional[str] = None,
         labels: Optional[Dict[str, str]] = None,
         schedule_affinities: Optional[List[Dict[str, Any]]] = None,
         snapshot_id: Optional[str] = None,
@@ -402,9 +402,8 @@ class Environment:
 
         Args:
             image: Container image to use (e.g. ``"python:3.12-slim"``).
-            rootfs: S3-compatible EROFS root filesystem configuration.
-            rootfs_template: Deployment-registered local rootfs name. Mutually
-                exclusive with image, rootfs and snapshot_id; no host path is accepted.
+            rootfs: S3-compatible EROFS configuration or a caller-prepared LocalRootfs
+                path on the execution node. Local entrypoints are supplied by the caller.
             rootfs_readonly: Optional override for the deployment rootfs
                 ``readonly`` default. Omitting it inherits the deployment
                 setting, including when replacing the source with *image* or
@@ -485,19 +484,16 @@ class Environment:
             raise TypeError("pause_policy must be a PausePolicy")
         if image is not None and (not isinstance(image, str) or not image.strip()):
             raise ValueError("image must be a non-empty string")
-        if rootfs is not None and not isinstance(rootfs, S3Config):
-            raise TypeError("rootfs must be an S3Config")
+        if rootfs is not None and not isinstance(rootfs, (S3Config, LocalRootfs)):
+            raise TypeError("rootfs must be an S3Config or LocalRootfs")
         if image is not None and rootfs is not None:
             raise ValueError("image and rootfs are mutually exclusive")
-        if rootfs_template is not None:
-            if not isinstance(rootfs_template, str) or not rootfs_template.strip():
-                raise ValueError("rootfs_template must be a non-empty string")
-            if image is not None or rootfs is not None or snapshot_id is not None:
-                raise ValueError("rootfs_template conflicts with image, rootfs or snapshot_id")
         if rootfs_readonly is not None and not isinstance(rootfs_readonly, bool):
             raise TypeError("rootfs_readonly must be a boolean or None")
         if snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id.strip()):
             raise ValueError("snapshot_id must be a non-empty string")
+        if isinstance(rootfs, LocalRootfs) and snapshot_id is not None:
+            raise ValueError("rootfs cannot be combined with snapshot_id")
         if (user is None) != (group is None):
             raise ValueError("user and group must both be configured")
         if user is not None:
@@ -515,8 +511,8 @@ class Environment:
             raise TypeError("failover must be a boolean")
         if not isinstance(inherit_entrypoint, bool):
             raise TypeError("inherit_entrypoint must be a boolean")
-        if inherit_entrypoint and image is None and rootfs_template is None:
-            raise ValueError("inherit_entrypoint requires an image rootfs or registered template")
+        if inherit_entrypoint and image is None:
+            raise ValueError("inherit_entrypoint requires an image rootfs")
         if inherit_entrypoint and snapshot_id is not None:
             raise ValueError("inherit_entrypoint cannot be combined with snapshot_id")
         for value, expected, label in (
@@ -656,8 +652,8 @@ class Environment:
                     "imageurl": image,
                 }
             )
-        elif rootfs_template:
-            body["rootfs"].update({"type": "template", "name": rootfs_template})
+        elif isinstance(rootfs, LocalRootfs):
+            body["rootfs"].update({"type": "local", "path": rootfs.path})
         elif rootfs:
             body["rootfs"].update(
                 {

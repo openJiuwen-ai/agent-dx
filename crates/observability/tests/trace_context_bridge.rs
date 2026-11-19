@@ -60,13 +60,38 @@ async fn correlation_ids_seed_deterministic_traces_and_traceparent_wins() {
         .unwrap()
         .contains("11111111111111111111111111111111"));
 
+    // A malformed traceparent cannot provide a parent; the correlation id must
+    // still seed the trace instead of starting an unrelated random root.
+    let (invalid_trace_id, invalid_span_id) = Trace::http_with_correlation(
+        "POST",
+        "/api/agent",
+        Some("00-not-a-w3c-traceparent-01"),
+        None,
+        Some("e2e-invoke-0007"),
+    )
+    .run(async { trace::log_context() })
+    .await;
+    assert_eq!(invalid_trace_id, derived);
+    assert!(!invalid_span_id.is_empty());
+
     provider.force_flush().unwrap();
     let spans = exporter.get_finished_spans().unwrap();
-    let derived_span = spans
+    let derived_spans = spans
         .iter()
-        .find(|span| span.span_context.trace_id().to_string() == derived)
-        .expect("derived span");
-    assert_ne!(derived_span.parent_span_id.to_string(), "0000000000000000");
+        .filter(|span| span.span_context.trace_id().to_string() == derived)
+        .collect::<Vec<_>>();
+    assert_eq!(derived_spans.len(), 3);
+    for span in &derived_spans {
+        assert_ne!(span.parent_span_id.to_string(), "0000000000000000");
+    }
+    assert_eq!(
+        derived_spans[0].parent_span_id,
+        derived_spans[1].parent_span_id
+    );
+    assert_eq!(
+        derived_spans[0].parent_span_id,
+        derived_spans[2].parent_span_id
+    );
 
     let forwarded = spans
         .iter()

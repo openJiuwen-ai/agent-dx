@@ -73,6 +73,35 @@ fn apiserver_defaults_to_embedded_ingress() {
 }
 
 #[test]
+fn apiserver_local_rootfs_allowlist_accepts_only_normalized_absolute_paths() {
+    let mut value = base();
+    value["ingress_mode"] = json!("standalone");
+    for invalid in [
+        "/",
+        "relative",
+        "/srv//rootfs",
+        "/srv/rootfs/",
+        "/srv/../rootfs",
+        "/srv/\nrootfs",
+    ] {
+        value["allowed_local_rootfs_dirs"] = json!([invalid]);
+        let error = serde_json::from_value::<Config>(value.clone())
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("allowed_local_rootfs_dirs"),
+            "{invalid:?}: {error}"
+        );
+    }
+    value["allowed_local_rootfs_dirs"] = json!(["/srv/adx-images/tools"]);
+    serde_json::from_value::<Config>(value)
+        .unwrap()
+        .validate()
+        .unwrap();
+}
+
+#[test]
 fn unknown_create_retention_is_positive_and_configurable() {
     let mut value = base();
     value["ingress_mode"] = json!("standalone");
