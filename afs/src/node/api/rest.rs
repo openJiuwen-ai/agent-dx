@@ -57,8 +57,29 @@ async fn ping(State(node): State<Arc<Node>>) -> Json<Value> {
     Json(json!({"message":format!("pong from {}",node.config.id)}))
 }
 async fn metrics(State(node): State<Arc<Node>>) -> Result<String, RestError> {
-    afs_metrics::encode_text(&node.observability.registry)
-        .map_err(|e| RestError(Error::coded(METRICS_FAILED, e.to_string())))
+    let encoded = afs_metrics::encode_text(&node.observability.registry)
+        .map_err(|e| RestError(Error::coded(METRICS_FAILED, e.to_string())))?;
+    #[cfg(feature = "rdma")]
+    {
+        let stats = afs_transport::rdma::resource_stats();
+        if let Some(body) = encoded.strip_suffix("# EOF\n") {
+            return Ok(format!(
+                "{body}# TYPE afs_rdma_endpoint_opens counter\nafs_rdma_endpoint_opens_total {}\n\
+                 # TYPE afs_rdma_registered_bytes gauge\nafs_rdma_registered_bytes {}\n\
+                 # TYPE afs_rdma_failed_retirements counter\n\
+                 afs_rdma_failed_retirements_total {}\n\
+                 # TYPE afs_rdma_retained_endpoints gauge\nafs_rdma_retained_endpoints {}\n\
+                 # TYPE afs_rdma_retained_registered_bytes gauge\nafs_rdma_retained_registered_bytes {}\n\
+                 # EOF\n",
+                stats.endpoint_opens,
+                stats.registered_bytes,
+                stats.failed_retirements,
+                stats.retained_endpoints,
+                stats.retained_registered_bytes
+            ));
+        }
+    }
+    Ok(encoded)
 }
 async fn diagnostics(State(node): State<Arc<Node>>) -> Result<Json<Value>, RestError> {
     let result = crate::node::diagnostics::probe::diagnose(node.clone())

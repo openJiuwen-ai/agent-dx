@@ -11,6 +11,9 @@ pub mod meta;
 pub mod ownerfs;
 pub mod peer;
 
+#[cfg(feature = "rdma")]
+type RdmaEndpointLease = afs_transport::rdma::RdmaLease<tokio::sync::OwnedSemaphorePermit>;
+
 #[cfg(feature = "ownerfs")]
 use afs_metrics::{
     HistogramOpts, HistogramVec, IntCounterVec, MetricsError, Opts, Registry, register_collector,

@@ -14,6 +14,7 @@ import pathlib
 import platform
 import signal
 import subprocess
+import sys
 import textwrap
 import threading
 import time
@@ -59,8 +60,8 @@ def audit(directory, device, profile="diagnostic"):
         if "lookup=STALE client=POISONED endpoint=RETAINED storage=UNTOUCHED" not in log:
             raise AssertionError("'lookup=STALE client=POISONED endpoint=RETAINED storage=UNTOUCHED' in log")
     elif profile == "owner-deadline":
-        if "caller=TIMEOUT lookup=STALE server=RETAINED file=EMPTY replay=ABSENT" not in log:
-            raise AssertionError("'caller=TIMEOUT lookup=STALE server=RETAINED file=EMPTY replay=ABSENT' in log")
+        if "caller=UNKNOWN lookup=STALE server=RETAINED file=EMPTY replay=ABSENT" not in log:
+            raise AssertionError("OwnerFs caller must report unknown with lease retained and no replay")
     else:
         if (
             "AFS_DFS_REPLICA_DEADLINE caller=TIMEOUT lookup=STALE "
@@ -74,7 +75,16 @@ def audit(directory, device, profile="diagnostic"):
                     "close=EXPLICIT' in log"
                 )
             )
-    if profile != "diagnostic":
+    if profile == "owner-deadline":
+        error = json.loads((directory / "caller-error.json").read_text())
+        message = error["message"].lower()
+        if not (
+            error["kind"] == "Internal"
+            and error["code"] == 0x020B0006
+            and ("deadline" in message or "timeout" in message)
+        ):
+            raise AssertionError("OwnerFs must report an unknown write with the underlying deadline")
+    elif profile == "dfs-deadline":
         error = json.loads((directory / "caller-error.json").read_text())
         if not (
             error["kind"] == "DeadlineExceeded"
@@ -188,7 +198,7 @@ def main():
         raise AssertionError("invalid RDMA device name")
     binary, source, directory = args.binary.resolve(), args.source.resolve(), args.evidence.resolve()
     directory.mkdir(parents=True, exist_ok=False)
-    native = source / "common/transport/native/rdma.c"
+    native = source / "crates/transport/native/rdma.c"
     lines = native.read_text().splitlines()
     start = next(i for i, line in enumerate(lines) if line.startswith("int afs_rdma_transfer("))
     line = next(i for i in range(start, len(lines)) if "uint64_t deadline=monotonic_ms()+timeout_ms;" in lines[i])
@@ -300,7 +310,7 @@ def main():
         raise AssertionError("debugger failed; inspect raw evidence")
     report = audit(directory, args.device, args.profile)
     (directory / "audit.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps(report, indent=2))
+    sys.stdout.write(json.dumps(report, indent=2) + "\n")
 
 
 if __name__ == "__main__":

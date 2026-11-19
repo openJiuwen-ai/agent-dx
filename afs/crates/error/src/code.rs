@@ -62,6 +62,7 @@ catalog! {
     NODE_OWNER_RIGHT_DENIED = 0x020b0003 => PermissionDenied;
     NODE_OWNER_STALE_ACCESS = 0x020b0004 => FailedPrecondition;
     NODE_OWNER_STALE_HANDLE = 0x020b0005 => FailedPrecondition;
+    NODE_OWNER_WRITE_UNKNOWN = 0x020b0006 => Internal;
     NODE_DFS_STALE_HANDLE = 0x020c0001 => FailedPrecondition;
     NODE_DFS_STALE_NAME = 0x020c0002 => FailedPrecondition;
     NODE_RDMA_SESSION_UNKNOWN = 0x02090001 => FailedPrecondition;

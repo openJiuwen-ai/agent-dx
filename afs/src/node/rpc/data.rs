@@ -2066,7 +2066,7 @@ async fn owner_rdma_write_from_client(
         if reply.written > request_len {
             worker.poisoned.store(true, Ordering::SeqCst);
             return Err(coded_status(
-                afs_error::NODE_TRANSFER_INVALID,
+                afs_error::NODE_OWNER_WRITE_UNKNOWN,
                 "OwnerFiles RDMA write reply count exceeds request length",
             ));
         }
@@ -2074,7 +2074,7 @@ async fn owner_rdma_write_from_client(
         Ok(reply)
     })
     .await
-    .map_err(|error| coded_status(afs_error::NODE_TRANSFER_INTERNAL, error.to_string()))?;
+    .map_err(|error| coded_status(afs_error::NODE_OWNER_WRITE_UNKNOWN, error.to_string()))?;
     if result.is_err() {
         session.poisoned.store(true, Ordering::SeqCst);
     }
@@ -2494,7 +2494,7 @@ impl OwnerFiles for OwnerFilesService {
             .map_err(error_to_status)?;
         if reply.written > request_length {
             return Err(coded_status(
-                afs_error::NODE_TRANSFER_INVALID,
+                afs_error::NODE_OWNER_WRITE_UNKNOWN,
                 "OwnerFiles inline write reply count exceeds request length",
             ));
         }

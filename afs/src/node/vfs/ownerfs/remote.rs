@@ -319,6 +319,9 @@ pub trait RemoteFiles: Send + Sync {
         offset: u64,
         out: &mut [u8],
     ) -> Result<usize>;
+    /// A dispatched write with no conclusive reply reports
+    /// `NODE_OWNER_WRITE_UNKNOWN`. The open handle retains the error across
+    /// writes, flush and fsync. Release still cleans up the remote handle.
     fn write(
         &self,
         grant: &RootGrant,

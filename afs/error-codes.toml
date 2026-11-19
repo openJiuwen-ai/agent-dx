@@ -242,6 +242,14 @@ subsystem = "OwnerFs"
 description = "远端文件或目录句柄由已退出的 Home 进程签发，需要重新打开"
 
 [[error]]
+name = "NODE_OWNER_WRITE_UNKNOWN"
+value = "0x020b0006"
+kind = "Internal"
+component = "Node"
+subsystem = "OwnerFs"
+description = "已提交的远端文件写入结果未知，同一打开句柄须清理，不得自动重放"
+
+[[error]]
 name = "NODE_DFS_STALE_HANDLE"
 value = "0x020c0001"
 kind = "FailedPrecondition"

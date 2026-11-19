@@ -98,6 +98,33 @@ fn crc32c_peer_range_preserves_exact_grant_and_detects_boundary_corruption() {
 }
 
 #[test]
+fn crc32c_packed_range_validates_covering_segments() {
+    let temp = tempfile::tempdir().unwrap();
+    let item = staged();
+    let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+    store.put(item.clone()).unwrap();
+    let mut out = [0; 30];
+    let id = &item.chunk.id;
+    assert_eq!(
+        store
+            .read_range_at_uncommitted(id, 32760, &mut out)
+            .unwrap(),
+        30
+    );
+    assert_eq!(out, [73; 30]);
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(store.chunk_path(id))
+        .unwrap();
+    file.write_at(&[99], 32759).unwrap();
+    let error = store
+        .read_range_at_uncommitted(id, 32760, &mut out)
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_TRANSFER_CORRUPT_DATA);
+}
+
+#[test]
 fn crc32c_retry_adopts_synced_orphan_and_replays_durable_object() {
     let temp = tempfile::tempdir().unwrap();
     let item = staged();

@@ -2124,6 +2124,35 @@ async fn owner_grpc_write_rejects_bad_inline_checksum_before_handler() {
 
 #[cfg(feature = "ownerfs")]
 #[tokio::test]
+async fn owner_write_reply_deadline_reports_unknown_without_replay() {
+    let registry = afs_metrics::Registry::new();
+    let metrics = crate::node::rpc::OwnerRpcMetrics::register(&registry).unwrap();
+    let handler = Arc::new(PayloadMetricsHandler {
+        mode: PayloadMetricsMode::WriteDeadline,
+        writes: StdMutex::new(Vec::new()),
+    });
+    let (channel, server) = spawn_owner_payload_server(handler.clone(), metrics.clone()).await;
+    let client = owner_files_client_from_channel_with_runtime_and_metrics(
+        channel,
+        tokio::runtime::Handle::current(),
+        Some(metrics),
+    );
+    let error = tokio::task::spawn_blocking(move || {
+        let grant = test_grant();
+        let file = test_remote_file(b"handle-unknown-write".to_vec());
+        client.write(&grant, &file, 0, b"payload").unwrap_err()
+    })
+    .await
+    .unwrap();
+    assert_eq!(error.code(), afs_error::NODE_OWNER_WRITE_UNKNOWN);
+    assert_eq!(handler.writes().len(), 1);
+    assert_eq!(handler.writes()[0].data, b"payload");
+    assert_eq!(owner_payload_bytes(&registry, "client", "write", "grpc"), 0);
+    server.abort();
+}
+
+#[cfg(feature = "ownerfs")]
+#[tokio::test]
 async fn owner_grpc_malformed_replies_do_not_count_successful_payload_bytes() {
     let registry = afs_metrics::Registry::new();
     let metrics = crate::node::rpc::OwnerRpcMetrics::register(&registry).unwrap();
@@ -2142,7 +2171,7 @@ async fn owner_grpc_malformed_replies_do_not_count_successful_payload_bytes() {
         let read = client.read(&grant, &file, 0, &mut out).unwrap_err();
         assert_eq!(read.code(), afs_error::NODE_TRANSFER_INVALID);
         let write = client.write(&grant, &file, 0, b"abc").unwrap_err();
-        assert_eq!(write.code(), afs_error::NODE_TRANSFER_INVALID);
+        assert_eq!(write.code(), afs_error::NODE_OWNER_WRITE_UNKNOWN);
     })
     .await
     .expect("malformed payload metrics worker");
@@ -2232,6 +2261,7 @@ enum ReleaseFailureMode {
 enum PayloadMetricsMode {
     Success,
     Malformed,
+    WriteDeadline,
 }
 
 #[cfg(feature = "ownerfs")]
@@ -2276,7 +2306,7 @@ impl OwnerFilesHandler for PayloadMetricsHandler {
     fn read(&self, peer: &str, _request: OwnerReadRequest) -> afs_error::Result<OwnerReadReply> {
         assert_eq!(peer, "node-b");
         match self.mode {
-            PayloadMetricsMode::Success => Ok(OwnerReadReply {
+            PayloadMetricsMode::Success | PayloadMetricsMode::WriteDeadline => Ok(OwnerReadReply {
                 data: b"abc".to_vec().into(),
                 read: 3,
                 eof: true,
@@ -2305,6 +2335,10 @@ impl OwnerFilesHandler for PayloadMetricsHandler {
             PayloadMetricsMode::Malformed => Ok(OwnerWriteReply {
                 written: request.length + 1,
             }),
+            PayloadMetricsMode::WriteDeadline => Err(afs_error::Error::coded(
+                afs_error::CLIENT_DEADLINE_EXCEEDED,
+                "fixture: Home recorded write before missing its reply deadline",
+            )),
         }
     }
 }
@@ -3836,6 +3870,7 @@ mod dfs_rdma_tests {
     fn dfs_rdma_unsupported_reply_contract_accepts_only_canonical_false() {
         let canonical = DfsNegotiateRdmaReply {
             session_id: 0,
+            server_generation: Vec::new(),
             server_info: Vec::new(),
             capacity: 0,
             rdma_supported: false,

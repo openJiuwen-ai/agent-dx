@@ -2506,7 +2506,10 @@ async fn dfs_replica_posted_rdma_deadline_has_unknown_outcome() {
     wait_for_dfs_rdma_checkpoint(&checkpoint.join("posted")).await;
     save_dfs_rdma_resources(&checkpoint, "connected");
 
-    let identity = super::super::control::PeerSessionIdentity::new("reader".into(), 1).unwrap();
+    let generation = rdma_registry.dfs_generation();
+    let identity = rdma_registry
+        .dfs_session_identity("reader".into(), 1, generation)
+        .unwrap();
     let session = rdma_registry.session_for(1, &identity).await.unwrap();
     let retained_endpoint = Arc::downgrade(&session.endpoint);
     drop(session);
@@ -2532,7 +2535,7 @@ async fn dfs_replica_posted_rdma_deadline_has_unknown_outcome() {
     );
     assert_eq!(dfs_payload_bytes(&metrics, "grpc", "recv", "replica"), 0);
     assert_eq!(dfs_payload_bytes(&metrics, "rdma", "recv", "replica"), 0);
-    close_dfs_rdma_session(&endpoint, 1, 1).await;
+    close_dfs_rdma_session(&endpoint, 1, 1, generation).await;
     wait_for_dfs_rdma_lookup_removed(&rdma_registry, 1, &identity).await;
     {
         let endpoint = retained_endpoint
@@ -2625,7 +2628,12 @@ fn assert_dfs_replica_deadline(error: &afs_error::Error) {
 }
 
 #[cfg(all(feature = "dfs", feature = "rdma"))]
-async fn close_dfs_rdma_session(endpoint: &str, session_id: u64, peer_node_epoch: u64) {
+async fn close_dfs_rdma_session(
+    endpoint: &str,
+    session_id: u64,
+    peer_node_epoch: u64,
+    generation: &[u8],
+) {
     let mut client =
         afs_protocol::node_data::dfs_chunks_client::DfsChunksClient::connect(endpoint.to_owned())
             .await
@@ -2633,6 +2641,7 @@ async fn close_dfs_rdma_session(endpoint: &str, session_id: u64, peer_node_epoch
     let mut request = Request::new(DfsCloseRdmaRequest {
         session_id,
         peer_node_epoch,
+        server_generation: generation.to_vec(),
     });
     request.set_timeout(std::time::Duration::from_secs(4));
     client
@@ -2966,6 +2975,7 @@ async fn dfs_product_rdma_replica_and_read_real_verbs_with_mode(
     assert_eq!(
         client
             .negotiate_rdma(DfsNegotiateRdmaRequest {
+                bind_server_generation: false,
                 client_info: vec![],
                 capacity: crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u32,
                 handshake_version: super::super::control::RDMA_HANDSHAKE_VERSION,

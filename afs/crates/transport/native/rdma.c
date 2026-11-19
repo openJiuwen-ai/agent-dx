@@ -86,28 +86,42 @@ static int select_gid(struct endpoint *e, int table_length) {
     return 0;
 }
 
-void afs_rdma_close(void *opaque) {
+int afs_rdma_close(void *opaque, size_t *retained_registered_bytes) {
     struct endpoint *e=opaque;
-    if (!e) return;
+    *retained_registered_bytes=0;
+    if (!e) return AFS_RDMA_RELEASED;
     /* QP must stop accessing MR before the MR/buffer can be released. */
     if (e->qp && ibv_destroy_qp(e->qp)) {
-        fprintf(stderr,"AFS_RDMA_TEARDOWN failed destroy_qp; retaining memory\n");
-        return; /* A leak on exceptional teardown is safer than DMA into freed memory. */
+        if (e->mr) *retained_registered_bytes=e->capacity;
+        return AFS_RDMA_RETAINED_QP;
     }
+    e->qp=NULL;
     if (e->mr && ibv_dereg_mr(e->mr)) {
-        fprintf(stderr,"AFS_RDMA_TEARDOWN failed dereg_mr; retaining memory\n");
-        return;
+        *retained_registered_bytes=e->capacity;
+        return AFS_RDMA_RETAINED_MR;
     }
-    if (e->cq) ibv_destroy_cq(e->cq);
-    if (e->pd) ibv_dealloc_pd(e->pd);
-    if (e->context) ibv_close_device(e->context);
-    free(e->buffer); free(e);
+    e->mr=NULL;
+    free(e->buffer);
+    e->buffer=NULL;
+    if (e->cq && ibv_destroy_cq(e->cq)) return AFS_RDMA_RETAINED_CQ;
+    e->cq=NULL;
+    if (e->pd && ibv_dealloc_pd(e->pd)) return AFS_RDMA_RETAINED_PD;
+    e->pd=NULL;
+    if (e->context && ibv_close_device(e->context)) return AFS_RDMA_RETAINED_CONTEXT;
+    free(e);
+    return AFS_RDMA_RELEASED;
 }
 
-void *afs_rdma_open(const char *device, uint32_t capacity, char *err, size_t errlen) {
-    if (!capacity || capacity>AFS_RDMA_MAX_CAPACITY) { error(err,errlen,"capacity must be 1..4MiB"); return NULL; }
+int afs_rdma_open(const char *device, uint32_t capacity, void **owned,
+                  size_t *registered_bytes,
+                  char *err, size_t errlen) {
+    *owned=NULL;
+    *registered_bytes=0;
+    if (!capacity || capacity>AFS_RDMA_MAX_CAPACITY) return error(err,errlen,"capacity must be 1..4MiB");
     struct endpoint *e=calloc(1,sizeof(*e));
-    if (!e) { error(err,errlen,"endpoint allocation"); return NULL; }
+    if (!e) return error(err,errlen,"endpoint allocation");
+    /* Rust owns retirement on both success and partial allocation failure. */
+    *owned=e;
     int count=0;
     struct ibv_device **devices=ibv_get_device_list(&count);
     if (!devices) goto failed;
@@ -132,6 +146,7 @@ void *afs_rdma_open(const char *device, uint32_t capacity, char *err, size_t err
     e->mr=ibv_reg_mr(e->pd,e->buffer,capacity,
         IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_READ|IBV_ACCESS_REMOTE_WRITE);
     if (!e->mr) goto failed;
+    *registered_bytes=capacity;
     struct ibv_qp_init_attr init={
         .send_cq=e->cq,.recv_cq=e->cq,.qp_type=IBV_QPT_RC,
         .cap={.max_send_wr=4,.max_recv_wr=1,.max_send_sge=1,.max_recv_sge=1},
@@ -144,10 +159,9 @@ void *afs_rdma_open(const char *device, uint32_t capacity, char *err, size_t err
     };
     if (ibv_modify_qp(e->qp,&attr,IBV_QP_STATE|IBV_QP_PKEY_INDEX|
         IBV_QP_PORT|IBV_QP_ACCESS_FLAGS)) goto failed;
-    return e;
+    return 0;
 failed:
-    error(err,errlen,"open RDMA endpoint failed (device/port/resources)");
-    afs_rdma_close(e); return NULL;
+    return error(err,errlen,"open RDMA endpoint failed (device/port/resources)");
 }
 
 int afs_rdma_info(void *opaque,uint8_t *out,uint32_t len,char *err,size_t errlen) {

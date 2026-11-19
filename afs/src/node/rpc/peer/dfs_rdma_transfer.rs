@@ -154,15 +154,19 @@ impl RdmaChunkTransfer {
                                 ));
                             }
                         };
-                        let cancel_guard = CancelPoisonGuard::new(lease.session.poisoned.clone());
+                        let poisoned = lease.session.poisoned.clone();
                         let integrity = integrity.clone();
                         let task = tokio::spawn(async move {
+                            // Mark failures poisoned before the slot is released.
+                            let lease = lease;
+                            let worker_guard = CancelPoisonGuard::new(lease.session.poisoned.clone());
                             validate_open(false, &lease.session.poisoned).map_err(|error| error.0)?;
                             let mut client = lease.session.client.clone();
                             let mut command = request_with_current_context(
                                 afs_protocol::node_data::DfsReadRangesRdmaRequest {
                                     request: Some(request.clone()),
                                     rdma_session_id: lease.session.session_id,
+                                    server_generation: lease.session.server_generation.clone(),
                                 },
                             );
                             command.set_timeout(lease.session.timeout);
@@ -181,11 +185,13 @@ impl RdmaChunkTransfer {
                             validate_dfs_rdma_read_reply(&request, &reply, &bytes)?;
                             if let Some(chunk) = &integrity { crc32c::validate_rdma_crc(&request, &reply, &bytes, chunk)?; }
                             validate_open(false, &lease.session.poisoned).map_err(|error| error.0)?;
-                            Ok::<_, afs_error::Error>(bytes)
+                            worker_guard.disarm();
+                            Ok::<_, afs_error::Error>((lease, bytes))
                         });
-                        let result = task.await.map_err(dfs_rdma_join_error)?;
-                        let bytes = result?;
+                        let cancel_guard = CancelPoisonGuard::new(poisoned);
+                        let (lease, bytes) = task.await.map_err(dfs_rdma_join_error)??;
                         cancel_guard.disarm();
+                        drop(lease);
                         for (destination, range) in mappings {
                             out[destination..destination + range.len()].copy_from_slice(&bytes[range]);
                         }

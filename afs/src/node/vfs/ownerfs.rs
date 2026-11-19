@@ -8811,6 +8811,7 @@ mod tests {
         setattr_calls: AtomicUsize,
         release_calls: AtomicUsize,
         lock_session_release_calls: AtomicUsize,
+        lose_write_reply_once: AtomicBool,
         fail_flush_once: AtomicBool,
         fail_fsync_once: AtomicBool,
         fail_lock_session_release: AtomicBool,
@@ -8830,6 +8831,7 @@ mod tests {
                 setattr_calls: AtomicUsize::new(0),
                 release_calls: AtomicUsize::new(0),
                 lock_session_release_calls: AtomicUsize::new(0),
+                lose_write_reply_once: AtomicBool::new(false),
                 fail_flush_once: AtomicBool::new(false),
                 fail_fsync_once: AtomicBool::new(false),
                 fail_lock_session_release: AtomicBool::new(false),
@@ -9121,6 +9123,12 @@ mod tests {
             self.observe_active_write();
             std::thread::sleep(self.write_delay);
             self.active_writes.fetch_sub(1, Ordering::SeqCst);
+            if self.lose_write_reply_once.swap(false, Ordering::SeqCst) {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_WRITE_UNKNOWN,
+                    "fixture: Home applied the write but the caller lost the reply",
+                ));
+            }
             Ok(data.len())
         }
 
@@ -12459,6 +12467,27 @@ mod tests {
         );
         assert!(remote.last_write_killpriv.load(Ordering::SeqCst));
         fs.release(&ctx, handle).unwrap();
+    }
+
+    #[test]
+    fn remote_unknown_write_fences_the_same_handle_but_releases_it() {
+        let (_temp, fs, ctx) = fixture();
+        let root_id = root::root_id_from_name(OsStr::new("job-42")).unwrap();
+        let remote = Arc::new(SlowRemoteFiles::new(root_id, Duration::ZERO));
+        remote.lose_write_reply_once.store(true, Ordering::SeqCst);
+        let handle = insert_slow_remote_handle(&fs, remote.clone(), 1);
+
+        let unknown = fs.write(&ctx, handle, 0, b"first").unwrap_err();
+        assert_eq!(unknown.code(), afs_error::NODE_OWNER_WRITE_UNKNOWN);
+        assert_eq!(fs.write(&ctx, handle, 5, b"second").unwrap_err(), unknown);
+        assert_eq!(fs.flush(&ctx, handle).unwrap_err(), unknown);
+        assert_eq!(fs.fsync(&ctx, handle, SyncMode::Full).unwrap_err(), unknown);
+        assert_eq!(remote.started_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.flush_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.fsync_calls.load(Ordering::SeqCst), 0);
+
+        fs.release(&ctx, handle).unwrap();
+        assert_eq!(remote.release_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
