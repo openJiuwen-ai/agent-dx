@@ -121,8 +121,13 @@ sandboxd 的 `/resource` 通过 Unix Socket 提供 CPU 核数、内存／存储�
 分别表示样本有效期与节点是否允许资源匹配；CPU 或内存为零的新鲜样本仍可保持这两个
 标志为真，但不满足正 CPU／内存请求。磁盘为零时仍可匹配不请求磁盘的实例。
 `pressure` 为可选配置，`memory_enabled` 和 `disk_enabled` 分别控制内存和磁盘，默认均为 `true`。
+内存 pressure 只读取当前 Linux 节点的 `/proc/meminfo`，使用
+`(MemTotal - MemAvailable) * 100 / MemTotal` 的整数百分比；普通容器与 Pod 部署中
+这是所在 Linux 节点的水位，在虚拟机中则是该虚拟机的水位。该指标不读取进程或祖先
+cgroup 的内存用量与上限；自动容量探测仍按 cgroup 限额计算可分配容量。
 仅对启用资源进行采样和阈值校验，高／低阈值默认分别为 90%／80%。
 有效样本中任一启用资源达到高阈值时关闭 pressure 准入，所有启用资源都降到低阈值或以下时恢复。
+正常连续采样时，高低阈值之间保持先前的准入状态。
 仅内存模式配置 `memory_enabled: true`、`disk_enabled: false`，允许省略 `disk_path`，
 不调用磁盘空间采样；磁盘启用时才要求此路径。两项均关闭时不运行 pressure 采样。
 禁用资源不参与自动 Pause，其压力指标和心跳资源字段均省略。
@@ -156,6 +161,17 @@ sandboxd 的 `/resource` 通过 Unix Socket 提供 CPU 核数、内存／存储�
 ## 验证
 
 Rust 用例位于 adxlet 的 `journal.rs`、`resources.rs`、`pause_resume.rs` 与 Coordinator 的 `storage.rs` 测试。真实 Redis 用例覆盖 Redis 进程中断、节点持久化组件重建、有序暂停／恢复补写与重启次数保护。
+
+`resources.rs` 覆盖仅内存模式的 90%／80% 边界与采样失败放行。
+`memory_pressure_procfs.rs` 使用真实采样入口，在每个测试的独立 Linux mount namespace
+中绑定 `/proc/meminfo` 与 cgroup 元数据夹具，验证节点水位低而 cgroup 水位高、
+cgroup 文件损坏或缺失、90%／80% 滞回及 meminfo 采样失败后的恢复。
+这组测试需要 `CAP_SYS_ADMIN` 和 util-linux 的 `unshare`、`mount`，默认标记为 ignored；
+在具备这些条件的 Linux 测试容器或主机中显式执行：
+
+```sh
+cargo test --locked -p adxlet --test memory_pressure_procfs -j 2 -- --ignored --test-threads=1
+```
 
 `build/e2e/firecracker/sdk_node_lifecycle.py` 在显式指定的 Linux 测试部署中通过公共 SDK 验证后端异常退出重启、Coordinator 失联空闲删除、SQLite 日志、节点进程重启等待、恢复补写和资源源断开。脚本中的 Redis／backend 查询是验收证据，生命周期正常操作仍使用公共 API。
 

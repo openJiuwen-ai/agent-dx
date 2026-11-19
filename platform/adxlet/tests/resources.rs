@@ -32,6 +32,33 @@ fn independent_resources_ignore_disabled_pressure_during_isolation_and_recovery(
 }
 
 #[test]
+fn memory_only_pressure_uses_exact_default_boundaries() {
+    use adxlet::resources::PressureResources;
+    let mut gate = PressureGate::with_resources(
+        PressurePolicy::default(),
+        PressureResources {
+            memory_enabled: true,
+            disk_enabled: false,
+        },
+    )
+    .unwrap();
+    for (memory_percent, accepting) in [
+        (89, true),
+        (90, false),
+        (85, false),
+        (81, false),
+        (80, true),
+        (85, true),
+    ] {
+        let update = gate.update(Pressure {
+            memory_percent,
+            disk_percent: 100,
+        });
+        assert_eq!(update.accepting, accepting, "memory={memory_percent}");
+    }
+}
+
+#[test]
 fn disabled_resource_thresholds_are_not_validated() {
     use adxlet::resources::PressureResources;
     let invalid_disk = PressurePolicy {
