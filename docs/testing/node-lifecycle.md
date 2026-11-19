@@ -125,6 +125,9 @@ sandboxd 的 `/resource` 通过 Unix Socket 提供 CPU 核数、内存／存储�
 `(MemTotal - MemAvailable) * 100 / MemTotal` 的整数百分比；普通容器与 Pod 部署中
 这是所在 Linux 节点的水位，在虚拟机中则是该虚拟机的水位。该指标不读取进程或祖先
 cgroup 的内存用量与上限；自动容量探测仍按 cgroup 限额计算可分配容量。
+整节点 pressure 不提供局部 cgroup 的 OOM 提前保护：即使节点水位低，服务 slice 或容器
+仍可能触及各自的硬内存上限。容量账本限制 Environment 的资源预留，无法代替这些
+cgroup 中系统服务、文件缓存等实际用量的监控；部署时仍需分别设置和监控相应上限。
 仅对启用资源进行采样和阈值校验，高／低阈值默认分别为 90%／80%。
 有效样本中任一启用资源达到高阈值时关闭 pressure 准入，所有启用资源都降到低阈值或以下时恢复。
 正常连续采样时，高低阈值之间保持先前的准入状态。
@@ -165,7 +168,9 @@ Rust 用例位于 adxlet 的 `journal.rs`、`resources.rs`、`pause_resume.rs` �
 `resources.rs` 覆盖仅内存模式的 90%／80% 边界与采样失败放行。
 `memory_pressure_procfs.rs` 使用真实采样入口，在每个测试的独立 Linux mount namespace
 中绑定 `/proc/meminfo` 与 cgroup 元数据夹具，验证节点水位低而 cgroup 水位高、
-cgroup 文件损坏或缺失、90%／80% 滞回及 meminfo 采样失败后的恢复。
+cgroup 文件损坏或缺失、90%／80% 滞回及 meminfo 采样失败后的恢复；另覆盖 2 GiB
+服务 slice 中可回收文件缓存占主导、节点水位为 3%–5% 时，内存与磁盘均启用的
+准入门从原先高水位状态恢复的场景。
 这组测试需要 `CAP_SYS_ADMIN` 和 util-linux 的 `unshare`、`mount`，默认标记为 ignored；
 在具备这些条件的 Linux 测试容器或主机中显式执行：
 

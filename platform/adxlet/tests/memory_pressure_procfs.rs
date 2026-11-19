@@ -1,6 +1,8 @@
 #![cfg(target_os = "linux")]
 
-use adxlet::resources::{detect, pressure, PressureGate, PressurePolicy, PressureResources};
+use adxlet::resources::{
+    detect, pressure, Pressure, PressureGate, PressurePolicy, PressureResources,
+};
 use std::{path::Path, process::Command};
 
 const MEMORY_ONLY: PressureResources = PressureResources {
@@ -136,6 +138,70 @@ fn host_memory_pressure_ignores_cgroup_usage_and_read_errors() {
                     assert_eq!(pressure(MEMORY_ONLY, None).unwrap().memory_percent, 30);
                     fixture.write(&format!("{group}/{limit}"), "invalid\n");
                     assert_eq!(pressure(MEMORY_ONLY, None).unwrap().memory_percent, 30);
+                }
+            }
+        },
+    );
+}
+
+#[test]
+#[ignore = "requires Linux CAP_SYS_ADMIN and util-linux unshare/mount"]
+fn host_memory_pressure_ignores_reclaimable_cgroup_file_cache() {
+    isolated(
+        "host_memory_pressure_ignores_reclaimable_cgroup_file_cache",
+        || {
+            let fixture = Procfs::new();
+            fixture.cgroup(true);
+            let mib = 1024_u64 * 1024;
+            // A 2 GiB service slice at 92% usage, mostly inactive file cache.
+            for group in ["cg", "cg/system.slice/adx.service"] {
+                fixture.write(&format!("{group}/memory.max"), "max\n");
+            }
+            fixture.write("cg/memory.current", &(1890 * mib).to_string());
+            fixture.write(
+                "cg/system.slice/adx.service/memory.current",
+                &(100 * mib).to_string(),
+            );
+            fixture.write("cg/system.slice/memory.max", &(2048 * mib).to_string());
+            fixture.write("cg/system.slice/memory.current", &(1890 * mib).to_string());
+            fixture.write(
+                "cg/system.slice/memory.stat",
+                &format!(
+                    "anon {}\nfile {}\ninactive_file {}\n",
+                    100 * mib,
+                    1680 * mib,
+                    1640 * mib
+                ),
+            );
+            for disk_percent in [9, 27] {
+                // Configurations that omit resource flags enable both resources.
+                // Start from a latched state before the node observation.
+                let mut gate = PressureGate::new(PressurePolicy::default()).unwrap();
+                for memory_percent in [90, 89] {
+                    assert!(
+                        !gate
+                            .update(Pressure {
+                                memory_percent,
+                                disk_percent
+                            })
+                            .accepting
+                    );
+                }
+                for node_percent in [3, 4, 5] {
+                    fixture.write(
+                        "meminfo",
+                        &format!(
+                            "MemTotal: 100000000 kB\nMemFree: 0 kB\nMemAvailable: {} kB\n",
+                            (100 - u64::from(node_percent)) * 1000000
+                        ),
+                    );
+                    let sample = pressure(MEMORY_ONLY, None).unwrap();
+                    assert_eq!(sample.memory_percent, node_percent);
+                    let update = gate.update(Pressure {
+                        disk_percent,
+                        ..sample
+                    });
+                    assert!(update.accepting);
                 }
             }
         },
