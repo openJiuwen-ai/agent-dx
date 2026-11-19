@@ -351,7 +351,7 @@ fn s3(value: S3) -> Result<adx_core::execution::S3Source, Status> {
     Ok(source)
 }
 
-fn canonical_local_path(path: &str) -> bool {
+pub(crate) fn canonical_local_path(path: &str) -> bool {
     path.starts_with('/')
         && !path.chars().any(char::is_control)
         && !path.split('/').any(|part| matches!(part, "." | ".."))
@@ -699,7 +699,8 @@ pub fn create_spec_with_environment(
             .map(|e| e.rootfs.runtime_class.clone())
             .unwrap_or_else(|| "runsc".into());
     }
-    if root.r#type == "local" && matches!(root.runtime.as_str(), "conch" | "supervisor") {
+    let explicit_local_rootfs = root.r#type == "local";
+    if explicit_local_rootfs && matches!(root.runtime.as_str(), "conch" | "supervisor") {
         return Err(invalid(&format!(
             "runtime {} requires an image binding (got rootfs.type=local)",
             root.runtime
@@ -792,10 +793,21 @@ pub fn create_spec_with_environment(
     {
         return Err(invalid("resource limits cannot be below requests"));
     }
-    let readonly = root
-        .readonly
-        .or_else(|| runtime_profile.map(|value| value.rootfs.readonly))
-        .unwrap_or(false);
+    let readonly = if explicit_local_rootfs {
+        if root.readonly == Some(false) {
+            return Err(invalid("explicit local rootfs requires readonly=true"));
+        }
+        if disk.max(disk_limit) != 0 {
+            return Err(invalid(
+                "explicit local rootfs cannot set a writable layer limit",
+            ));
+        }
+        true
+    } else {
+        root.readonly
+            .or_else(|| runtime_profile.map(|value| value.rootfs.readonly))
+            .unwrap_or(false)
+    };
     let rootfs =
         storage_source(&root)?.map(|source| adx_core::execution::Rootfs { readonly, source });
     let mounts = r
@@ -898,6 +910,9 @@ pub fn create_spec_with_environment(
             "npu" => pb::DeviceKind::Npu,
             _ => return Err(invalid("unknown device kind")),
         };
+        if explicit_local_rootfs && root.runtime == "runsc" && kind == pb::DeviceKind::Gpu {
+            return Err(invalid("runsc GPU allocation requires a writable rootfs"));
+        }
         let count = parts[2]
             .parse::<u32>()
             .ok()

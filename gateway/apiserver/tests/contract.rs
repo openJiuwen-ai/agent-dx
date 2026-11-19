@@ -731,3 +731,47 @@ fn local_rootfs_rejects_jiuwenbox_runtime_before_scheduling() {
         .is_ok());
     }
 }
+
+#[test]
+fn explicit_local_rootfs_is_readonly_even_with_a_writable_deployment_default() {
+    let profile = serde_json::from_value(json!({
+        "rootfs": {"runtime_class": "runsc", "type": "local", "path": "/defaults/rootfs", "readonly": false},
+        "bootstrap": {"type": "erofs", "root": "/defaults/rootfs", "target": "/__adx",
+            "entrypoint": ["/__adx/usr/local/bin/adx-execd"]}
+    }))
+    .unwrap();
+    let rootfs = json!({"type": "local", "path": "/node/rootfs"});
+    let spec = adx_apiserver::contract::create_spec_with_environment(
+        json!({"rootfs": rootfs}),
+        &caller(),
+        Some(&profile),
+    )
+    .unwrap();
+    assert!(spec.execution.unwrap().rootfs.unwrap().readonly);
+
+    let default =
+        adx_apiserver::contract::create_spec_with_environment(json!({}), &caller(), Some(&profile))
+            .unwrap();
+    assert!(!default.runtime_profile.unwrap().rootfs.unwrap().readonly);
+}
+
+#[test]
+fn explicit_local_rootfs_rejects_writable_root_options() {
+    for (field, value, reason) in [
+        ("readonly", json!(false), "readonly"),
+        ("storageMb", json!(10), "writable layer"),
+        ("storage_limit_mb", json!(10), "writable layer"),
+        ("xpu", json!("gpu::1"), "GPU"),
+    ] {
+        let mut request =
+            json!({"runtime": "runsc", "rootfs": {"type": "local", "path": "/node/rootfs"}});
+        if field == "readonly" {
+            request["rootfs"][field] = value;
+        } else {
+            request[field] = value;
+        }
+        let error = create_spec(request, &caller()).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains(reason), "{error}");
+    }
+}

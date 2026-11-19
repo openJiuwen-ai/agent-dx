@@ -32,6 +32,13 @@ An explicit Local rootfs with effective runtime `supervisor` or `conch` returns
 explicit workload `process` commands, working directory and user overrides through
 Execd. Fields omitted from `process` retain the corresponding image defaults.
 
+An explicit Local source is always read-only, regardless of the deployment
+rootfs default. The create endpoint rejects `rootfs.readonly=false`, writable
+layer quotas and runsc GPU allocation for an explicit Local source.
+Its absolute path must be a strict descendant of a parent directory in the API
+Server `allowed_local_rootfs_dirs` list. See the
+[deployment example](../../../platform/api/http/environment-create.md#caller-prepared-local-rootfs).
+
 All ordinary responses use the API Server response envelope:
 
 ```json
@@ -423,7 +430,7 @@ use `SPAWN_FAILED` and `error_message`.
 
 ## Local mount sources
 
-Each mount requires exactly one nonempty `image_url`, `s3_config`, or `host_path` source. The existing `imageUrl`, `s3Config`, and `hostPath` aliases are accepted. Zero or multiple sources return InvalidArgument (HTTP 400). Local source paths must be absolute without control characters or `.`/`..` components. The public local rootfs restriction is unchanged.
+Each mount requires exactly one nonempty `image_url`, `s3_config`, or `host_path` source. The existing `imageUrl`, `s3Config`, and `hostPath` aliases are accepted. Zero or multiple sources return InvalidArgument (HTTP 400). Local mount source paths must be absolute without control characters or `.`/`..` components.
 
 ```json
 {"image":"registry.example/app:v1","mounts":[{"type":"bind","host_path":"/mnt/sfs/workspaces/w-user","target":"/home/jiuwen","options":["rw"],"create_if_missing":true}]}

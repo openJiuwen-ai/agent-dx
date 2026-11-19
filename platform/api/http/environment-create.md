@@ -89,17 +89,42 @@ returns an error; it never starts a new process.
 
 ## Caller-prepared Local rootfs
 
-Public creation accepts an absolute path on the execution node:
+Public creation accepts an absolute path on the execution node when it is a
+strict descendant of a directory in the API Server's
+`allowed_local_rootfs_dirs` list. The check compares path components. An empty
+or omitted list disables caller-provided Local rootfs. Requests outside the
+allowed directories return `PERMISSION_DENIED` before scheduling.
+
+With `adxctl` profile-based deployment, add the list to the API Server config:
+
+```yaml
+service_overrides:
+  apiserver:
+    config:
+      allowed_local_rootfs_dirs:
+        - /var/lib/agentos/local-images/objects
+```
+
+Then create the environment with a path beneath that directory:
 
 ```json
-{"name":"local-tools","rootfs":{"type":"local","path":"/var/lib/agentos/images/tools/rootfs","runtime":"runsc"},"env":{"IMAGE_VALUE":"prepared"}}
+{"name":"local-tools","rootfs":{"type":"local","path":"/var/lib/agentos/local-images/objects/local-IMAGE_ID/rootfs","runtime":"runsc"},"env":{"IMAGE_VALUE":"prepared"}}
 ```
 
 The caller prepares and retains this directory or file on every eligible node,
 or selects a node that provides it. ADX does not import Docker images for this source.
+The API Server checks the requested path. Link resolution happens on the
+execution node. Use operator-controlled directories and ensure that symbolic
+links beneath them resolve within the approved directory tree on every eligible node.
 Conch and Supervisor require image bindings. A request that selects either runtime
 with an explicit Local rootfs returns `INVALID_ARGUMENT` before scheduling. This
 also applies when the runtime comes from the deployment default.
+
+ADX makes an explicit Local rootfs read-only. The caller can omit `rootfs.readonly`
+or set it to `true`. Writable layer quotas (`storageMb` and `storage_limit_mb`)
+and runsc GPU allocation require a writable root and are incompatible with this
+source. Writable workspaces can use separate mounts.
+
 Local workload entrypoints are supplied through the existing `process` field;
 `inheritEntrypoint=true` is rejected for an explicit Local source. Image metadata
 must be resolved by the caller into `env` and, when needed, `process`.
