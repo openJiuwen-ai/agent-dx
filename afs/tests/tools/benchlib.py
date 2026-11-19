@@ -4,8 +4,9 @@ The suite measures with industry tools (fio, elbencho, iperf3) and reads their o
 reports. Everything here is deterministic so it can be pinned by runner_tests.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
+import re
 import statistics
 from pathlib import PurePosixPath
 
@@ -15,6 +16,19 @@ MIB = 1024**2
 FIO_OPERATIONS = ("read", "write")
 
 
+READER_ROLES = ("B", "C", "D", "E")
+NODE_ROLES = ("A",) + READER_ROLES
+BACKENDS = ("disk", "memory")
+# Whitelisted Node settings a bench variant may change: key -> (kind, lower, upper) or allowed strings.
+OVERRIDE_KEYS = {
+    "dfs_read_parallelism": ("int", 1, 64),
+    "dfs_readahead_max_bytes": ("int", 0, 32 * MIB),
+    "dfs_read_crc_mode": ("choice", ("receiver", "off")),
+    "dfs_read_pipeline.max_rpcs": ("int", 1, 256),
+    "dfs_peer_cache.capacity_bytes": ("int", MIB, 1024**4),
+}
+
+
 @dataclass(frozen=True)
 class BenchParameters:
     file_bytes: int
@@ -22,6 +36,19 @@ class BenchParameters:
     threads: tuple[int, ...]
     rounds: int
     tools: dict
+    backend: str = "disk"
+    memory_backend_bytes: int = 0
+    variant: str = "V0"
+    node_overrides: dict = field(default_factory=dict)
+    readers: int = 2
+
+    @property
+    def reader_roles(self):
+        return READER_ROLES[:self.readers]
+
+    def overrides_for(self, role):
+        """Effective overrides for one Node role: the "*" entries, then the role's own."""
+        return {**self.node_overrides.get("*", {}), **self.node_overrides.get(role, {})}
 
     def tool(self, name):
         """Return (absolute path, extra environment) for a declared tool."""
@@ -66,7 +93,114 @@ def parameters(config):
         raise Blocked("bench tools must declare absolute tool paths")
     for name, entry in tools.items():
         _tool_entry(name, entry)
-    return BenchParameters(size, tuple(blocks), tuple(threads), rounds, dict(tools))
+    return BenchParameters(size, tuple(blocks), tuple(threads), rounds, dict(tools), *_variant_inputs(values))
+
+
+def _override_value(key, value):
+    spec = OVERRIDE_KEYS.get(key)
+    if spec is None:
+        raise Blocked("bench node override not allowed: " + str(key))
+    if spec[0] == "choice":
+        if value not in spec[1]:
+            raise Blocked("bench node override %s must be one of %s" % (key, ",".join(spec[1])))
+    elif not is_integer(value) or not spec[1] <= value <= spec[2]:
+        raise Blocked("bench node override %s must be an integer %d..%d" % (key, spec[1], spec[2]))
+
+
+def _variant_inputs(values):
+    """Optional verification inputs; absent keys keep the disk-backed default configuration."""
+    backend = values.get("backend", "disk")
+    if backend not in BACKENDS:
+        raise Blocked("bench backend must be disk or memory")
+    memory = values.get("memory_backend_bytes", 0)
+    if backend == "memory" and (not is_integer(memory) or not 256 * MIB <= memory <= 64 * 1024**3):
+        raise Blocked("memory backend needs memory_backend_bytes 256MiB..64GiB (tmpfs size per Node)")
+    overrides = values.get("node_overrides", {})
+    if not isinstance(overrides, dict):
+        raise Blocked("bench node_overrides must map roles to settings")
+    for role, settings in overrides.items():
+        if role != "*" and role not in NODE_ROLES or not isinstance(settings, dict):
+            raise Blocked("bench node_overrides roles are *, A, B, C, D or E with a settings object")
+        for key, value in settings.items():
+            _override_value(key, value)
+    variant = values.get("variant", "V0")
+    if not isinstance(variant, str) or not 1 <= len(variant) <= 32:
+        raise Blocked("bench variant must be a label of 1..32 characters")
+    if overrides and variant == "V0":
+        raise Blocked("bench node overrides need a variant label other than V0")
+    readers = values.get("readers", 2)
+    if not is_integer(readers) or not 1 <= readers <= len(READER_ROLES):
+        raise Blocked("bench readers must be 1..4")
+    return backend, memory if backend == "memory" else 0, variant, dict(overrides), readers
+
+
+def node_overrides_toml(overrides, peer_cache_directory):
+    """Render whitelisted overrides as Node TOML: top-level keys first, then one table per prefix."""
+    top, tables = [], {}
+    for key, value in sorted(overrides.items()):
+        rendered = json.dumps(value) if isinstance(value, str) else str(value)
+        if "." in key:
+            table, name = key.split(".", 1)
+            tables.setdefault(table, []).append("%s = %s" % (name, rendered))
+        else:
+            top.append("%s = %s" % (key, rendered))
+    if "dfs_peer_cache" in tables:
+        tables["dfs_peer_cache"].insert(0, "directory = " + json.dumps(peer_cache_directory))
+    lines = top + ["\n".join(["[%s]" % name] + entries) for name, entries in sorted(tables.items())]
+    return "".join(line + "\n" for line in lines)
+
+
+def effective_mismatches(effective, overrides):
+    """Declared overrides that `--print-config` does not show with the same value."""
+    mismatches = []
+    for key, value in sorted(overrides.items()):
+        actual = effective
+        for part in key.split("."):
+            actual = actual.get(part) if isinstance(actual, dict) else None
+        if actual != value:
+            mismatches.append({"key": key, "declared": value, "effective": actual})
+    return mismatches
+
+
+def metrics_delta(before, after, pattern):
+    """Prometheus samples (name+labels) matching `pattern` whose value changed between two scrapes."""
+
+    def samples(text):
+        table = {}
+        for line in text.splitlines():
+            if line and not line.startswith("#"):
+                name, _, value = line.rpartition(" ")
+                try:
+                    table[name] = float(value)
+                except ValueError:
+                    continue
+        return table
+
+    first, second, wanted = samples(before), samples(after), re.compile(pattern)
+    delta = {}
+    for name, value in second.items():
+        change = value - first.get(name, 0.0)
+        if change and wanted.search(name):
+            delta[name] = change
+    return delta
+
+
+def parse_kernel_memory(vmstat, meminfo):
+    """Kernel-wide oom_kill count (/proc/vmstat) and MemAvailable bytes (/proc/meminfo); None when unreadable.
+
+    Role namespaces do not expose their cgroup files, so OOM is detected for the whole kernel: any OOM
+    kill on the host during a round voids it (conservative for shared hosts).
+    """
+    kills = available = None
+    for line in vmstat.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == "oom_kill":
+            kills = int(fields[1])
+    for line in meminfo.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == "MemAvailable:":
+            available = int(fields[1]) * 1024
+    return {"mem_available": available, "oom_kill": kills}
 
 
 def fio_argv(fio, path, operation, *, block, file_bytes, threads, end_fsync=False):
