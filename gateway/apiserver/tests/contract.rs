@@ -257,6 +257,7 @@ fn rootfs_overlay_rejects_ambiguous_or_incomplete_sources_before_rpc() {
         json!({"rootfs":{"type":"local","path":false}}),
         json!({"rootfs":{"type":"local","path":"/unexpected","imageurl":"image:v1"}}),
         json!({"rootfs":{"type":"local","path":"/unexpected","storageInfo":s3.clone()}}),
+        json!({"rootfs":{"type":"template","name":"tools-v1"}}),
         json!({"rootfs":{"type":"unknown"}}),
         json!({"image":"image:v1","rootfs":{"type":"s3","storageInfo":s3.clone()}}),
     ] {

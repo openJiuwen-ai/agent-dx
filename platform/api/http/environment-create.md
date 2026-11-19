@@ -100,29 +100,3 @@ or selects a node that provides it. ADX does not import Docker images for this s
 Local workload entrypoints are supplied through the existing `process` field;
 `inheritEntrypoint=true` is rejected for an explicit Local source. Image metadata
 must be resolved by the caller into `env` and, when needed, `process`.
-
-## Deployment-registered Local rootfs templates
-
-Deployments may configure the same `local_rootfs_templates` map in the API Server
-and adxlet. A template contains an absolute `path`, optional `env`, and optional
-`process` (`commands`, `cwd`, `user`). Template names use 1..128 ASCII letters,
-digits, underscores or hyphens. ADX does not import Docker images or fetch an image
-for this source; the deployment prepares each artifact and its metadata.
-
-```json
-{"name":"offline-tools","rootfs":{"type":"template","name":"local-tools-v1","runtime":"runsc"}}
-```
-
-The API resolves the registered name to a Local source persisted with the Environment.
-Unknown names and conflicting image,
-path, storage or snapshot sources fail before scheduling. Only nodes advertising
-`ADX_LOCAL_ROOTFS_<name>=ready` are eligible; adxlet validates the registered paths
-before advertising them. Artifacts must remain available for the lifetime of their
-Environments and checkpoints. Use immutable names and paths for new content.
-
-Template environment values default the request environment; explicit request values
-win, while node-owned control configuration remains authoritative. With
-`inheritEntrypoint=true`, the template process is merged with explicit process fields
-and submitted as an explicit workload; no OCI process metadata lookup is performed.
-Without inheritance, no image workload starts. Local rootfs writable-layer handling
-and the existing Execd bootstrap are unchanged.

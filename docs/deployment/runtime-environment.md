@@ -99,6 +99,6 @@ Jiuwenbox 的 Supervisor／Conch 节点盘点只读取后端清单和 cgroup 状
 [Jiuwenbox 配置](../testing/jiuwenbox-runtime.md#启动和配置)。
 
 
-部署可在 API Server 和 adxlet 中配置同名 `local_rootfs_templates`，按名称选择已经准备的
-本地 rootfs；该配置独立于默认 RuntimeProfile。制品转换和分发由部署系统负责。
-创建参数及元数据语义见 [Environment create](../../platform/api/http/environment-create.md#deployment-registered-local-rootfs-templates)。
+调用方可通过 `rootfs.type=local` 和绝对 `path` 选择已经准备的本地 rootfs；该来源独立于
+默认 RuntimeProfile。制品转换、镜像环境和启动命令解析及跨节点分发由接入层负责。
+创建参数见 [Environment create](../../platform/api/http/environment-create.md#caller-prepared-local-rootfs)。

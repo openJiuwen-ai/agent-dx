@@ -53,19 +53,6 @@ class CreateRequestTests(unittest.TestCase):
             with self.subTest(path=value), self.assertRaises((ValueError, TypeError)):
                 LocalRootfs(value)
 
-    def test_registered_local_rootfs_uses_name_without_host_path_or_image(self):
-        with Environment(rootfs_template="tools-v1", detached=True, connection=self.connection):
-            pass
-        body = json.loads(self.exchanges[0].content)
-        self.assertEqual(body["rootfs"], {"type": "template", "name": "tools-v1"})
-        self.assertNotIn("image", body)
-
-    def test_local_rootfs_selection_rejects_conflicting_sources_before_transport(self):
-        for options in ({"image": "tools:1"}, {"snapshot_id": "snapshot"}):
-            with self.subTest(options=options), self.assertRaises(ValueError):
-                Environment(rootfs_template="tools-v1", connection=self.connection, **options)
-        self.assert_no_transport_setup()
-
     def test_explicit_forever_retention_and_typed_actions(self):
         import adx_environment as sdk
         for name in ("RetentionPolicy", "IdleAction", "CheckpointStorage"):

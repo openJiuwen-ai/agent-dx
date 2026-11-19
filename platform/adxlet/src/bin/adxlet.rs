@@ -82,8 +82,6 @@ struct Config {
     #[serde(default)]
     checkpoint_runtime_binaries: BTreeMap<String, PathBuf>,
     #[serde(default)]
-    local_rootfs_templates: BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
-    #[serde(default)]
     execd_command: Vec<String>,
     #[serde(default)]
     execd_env: HashMap<String, String>,
@@ -365,17 +363,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
         })
         .transpose()?;
-    let local_rootfs_labels = config
-        .local_rootfs_templates
-        .keys()
-        .map(|name| {
-            adx_core::local_rootfs::capability_label(name).map(|key| (key, "ready".to_owned()))
-        })
-        .collect::<adx_core::Result<HashMap<_, _>>>()?;
     let runtime_config = RuntimeConfig {
         runtime_profile: config.runtime_profile,
         checkpoint_runtime_binaries: config.checkpoint_runtime_binaries,
-        local_rootfs_templates: config.local_rootfs_templates,
         command: config.execd_command,
         env,
         cwd: "/".into(),
@@ -491,7 +481,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(scope) = checkpoint_scopes.first() {
         labels.insert("ADX_CHECKPOINT_SCOPE".into(), scope.clone());
     }
-    labels.extend(local_rootfs_labels);
     labels.remove(NODE_HOST_UUID_LABEL);
     match read_host_uuid(Path::new(DMI_HOST_UUID_PATH)) {
         Ok(host_uuid) => {

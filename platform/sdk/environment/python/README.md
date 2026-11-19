@@ -30,10 +30,10 @@ contract](../../../api/http/environment-create.md) defines retry behavior.
 
 The new Environment backend supports basic lifecycle, on-demand pause/resume, reusable snapshots, grouped placement, idle deletion/pause and restart policy. It requires an image containing the release EXECD at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
 
-The Environment backend supports S3 rootfs, S3/image/Local mounts, entrypoint inheritance,
+The Environment backend supports S3/Local rootfs, S3/image/Local mounts, entrypoint inheritance,
 creation and runtime network policy, `extra_config`, `failover=True`, independent
 resource limits, and per-environment data-plane security. Declared user ports use
-Ingress and Relay routing. Public local rootfs paths remain rejected. Local bind
+Ingress and Relay routing. Caller-prepared Local rootfs paths must exist on the execution node. Local bind
 mounts accept `host_path` (alias `hostPath`), with exactly one mount source and
 pre-existing node-visible directories. Arbitrary host paths require a trusted
 management caller; the API does not enforce per-tenant source-path authorization. `upstream` reverse tunnel uses the published
@@ -880,15 +880,7 @@ a confirmed response missing the required capabilities is `UnsupportedFeature`.
 These diagnostics do not change operation replay or source ownership rules.
 
 
-### Registered Local rootfs
-
-SDK 0.1.0rc5 adds `Environment(rootfs_template="local-tools-v1", ...)` for a
-Local artifact registered by the deployment. It is mutually exclusive with
-`image`, `rootfs` and `snapshot_id`; arbitrary host paths are not accepted.
-`inherit_entrypoint=True` may start the registered process metadata. Missing
-names fail before scheduling, with no registry fallback. The deployment must
-prepare matching artifacts and metadata on eligible nodes. Default creates
-without an image or template keep using the deployment's default rootfs.
+### SDK behavior updates
 
 SDK 0.1.0rc6 wakes command-watch subscriptions immediately when local waiters change,
 without a periodic receive timeout. Terminal events continue to trigger an authoritative
