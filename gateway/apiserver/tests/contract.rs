@@ -676,3 +676,24 @@ fn volume_mounts_are_exclusive_with_inline_sources_and_keep_fixed_uid() {
     input["mounts"][0]["create_if_missing"] = json!(true);
     assert!(create_spec(input, &caller()).is_err());
 }
+
+#[test]
+fn local_rootfs_rejects_noncanonical_paths_but_allows_execd_only() {
+    for path in [
+        "/node/../rootfs",
+        "/node/./rootfs",
+        "/node/\nrootfs",
+        "/node/\u{85}rootfs",
+    ] {
+        assert!(create_spec(
+            json!({"rootfs": {"type": "local", "path": path}}),
+            &caller()
+        )
+        .is_err());
+    }
+    assert!(create_spec(
+        json!({"rootfs": {"type": "local", "path": "/node/rootfs"}}),
+        &caller()
+    )
+    .is_ok());
+}

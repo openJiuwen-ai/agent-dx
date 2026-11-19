@@ -13,7 +13,7 @@ Runtime command and file operations use the separate
 Environment contract. It supports S3 rootfs and mounts, image-backed mounts,
 entrypoint inheritance, `extra_config`, independent resource request/limit
 values, published ports, per-Environment data-plane security, creation/runtime
-network policy, `failover=true`, and reload. Public local rootfs paths remain rejected. Local mounts accept `host_path`
+network policy, `failover=true`, and reload. Caller-prepared Local rootfs paths are supported. Paths must be absolute and contain no control characters or `.`/`..` components. A Local directory has no inherited image entrypoint: pass `process.commands` for a workload, or omit it for an Execd-only tool environment. Local mounts accept `host_path`
 (or `hostPath`) alongside the existing image/S3 source alternatives. `upstream` reverse
 tunnel is carried by the create contract; the legacy `/invoke` compatibility
 transport remains unavailable.

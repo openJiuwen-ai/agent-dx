@@ -351,6 +351,12 @@ fn s3(value: S3) -> Result<adx_core::execution::S3Source, Status> {
     Ok(source)
 }
 
+fn canonical_local_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.chars().any(char::is_control)
+        && !path.split('/').any(|part| matches!(part, "." | ".."))
+}
+
 fn validate_rootfs_object(
     fields: &serde_json::Map<String, Value>,
     top_level_image: &str,
@@ -414,11 +420,10 @@ fn validate_rootfs_object(
             if !non_empty_string("path") {
                 return Err(invalid("local rootfs requires non-empty path"));
             }
-            if !fields["path"]
-                .as_str()
-                .is_some_and(|path| path.starts_with('/') && !path.contains('\0'))
-            {
-                return Err(invalid("local rootfs requires an absolute node path"));
+            if !fields["path"].as_str().is_some_and(canonical_local_path) {
+                return Err(invalid(
+                    "local rootfs path must be absolute without traversal or control characters",
+                ));
             }
         }
         _ => return Err(invalid("unsupported rootfs type")),
@@ -483,13 +488,7 @@ fn mount(value: Value) -> Result<adx_core::execution::Mount, Status> {
         (None, false, None, true) => StorageSource::Image(value.image_url).into(),
         (None, true, Some(source), true) => StorageSource::S3(s3(source)?).into(),
         (None, true, None, false) => {
-            if !value.host_path.starts_with('/')
-                || value.host_path.chars().any(char::is_control)
-                || value
-                    .host_path
-                    .split('/')
-                    .any(|part| matches!(part, "." | ".."))
-            {
+            if !canonical_local_path(&value.host_path) {
                 return Err(invalid(
                     "host_path must be an absolute path without traversal",
                 ));
@@ -684,7 +683,7 @@ pub fn create_spec_with_environment(
     }
     if root.r#type == "local" && r.inherit {
         return Err(invalid(
-            "local rootfs entrypoints must be resolved by the caller into process",
+            "local rootfs has no inherited entrypoint; provide process.commands to start a workload",
         ));
     }
     if snapshot.is_none()

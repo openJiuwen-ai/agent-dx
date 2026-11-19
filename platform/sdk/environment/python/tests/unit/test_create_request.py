@@ -49,7 +49,8 @@ class CreateRequestTests(unittest.TestCase):
         self.assert_no_transport_setup()
 
     def test_local_rootfs_path_is_a_node_absolute_path(self):
-        for value in ("", "relative/rootfs", None, 12, "/node/\x00rootfs"):
+        for value in ("", "relative/rootfs", None, 12, "/node/\x00rootfs", "/node/../rootfs",
+                      "/node/./rootfs", "/node/\nrootfs", "/node/\x85rootfs"):
             with self.subTest(path=value), self.assertRaises((ValueError, TypeError)):
                 LocalRootfs(value)
 
