@@ -350,6 +350,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
  "tonic 0.12.3",
  "uuid",
 ]
