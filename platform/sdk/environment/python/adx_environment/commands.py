@@ -25,7 +25,18 @@ logger = logging.getLogger(__name__)
 _POLL_THRESHOLD = 30
 _POLL_INTERVAL = 10
 _POLL_RETRY_DELAY = 1  # seconds between failed wait calls
+_WAIT_READ_RETRY_BUDGET = 30.0
 _COMMAND_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def _retryable_wait_read(error: Union[httpx.TransportError, EnvironmentError]) -> bool:
+    if isinstance(error, httpx.TransportError):
+        return True
+    if error.outcome == "terminal" or error.retry not in ("after_backoff", "same_operation"):
+        return False
+    return error.code not in (
+        "ENVIRONMENT_EXITED", "SCHEDULE_FAILED", "ENVIRONMENT_SCHEDULE_FAILED", "SCHEDULING_FAILED", "INSTANCE_FAILED",
+    )
 
 
 class CommandSubmissionError(RuntimeError):
@@ -290,9 +301,12 @@ class CommandHandle:
     def _snapshot(self) -> CommandInfo:
         return _info(self._raw_snapshot())
 
-    def _fetch_snapshot(self) -> dict:
+    def _fetch_snapshot(self, *, timeout: Optional[float] = None) -> dict:
+        options = {} if timeout is None else {"timeout": timeout}
         try:
-            snapshot = _invoke_command(self._client, self._sid, "process.get", {"command_id": self.command_id})
+            snapshot = _invoke_command(
+                self._client, self._sid, "process.get", {"command_id": self.command_id}, **options
+            )
         except EnvironmentHTTPError as error:
             if error.status_code == 404:
                 raise CommandNotFound(
@@ -313,13 +327,13 @@ class CommandHandle:
             )
         return snapshot
 
-    def _checked_snapshot(self, snapshot: dict) -> dict:
+    def _checked_snapshot(self, snapshot: dict, *, timeout: Optional[float] = None) -> dict:
         _raise_observation_error(snapshot, self._sid, self.command_id)
         if _incomplete_terminal_result(snapshot):
             # Older Execd can observe completion between copying the exit code
             # and serializing status. Read the same stable command once more;
             # never infer exit zero or submit the command again.
-            snapshot = self._fetch_snapshot()
+            snapshot = self._fetch_snapshot(timeout=timeout)
             _raise_observation_error(snapshot, self._sid, self.command_id)
             if _incomplete_terminal_result(snapshot):
                 raise EnvironmentError(
@@ -333,8 +347,8 @@ class CommandHandle:
                 )
         return snapshot
 
-    def _raw_snapshot(self) -> dict:
-        snapshot = self._checked_snapshot(self._fetch_snapshot())
+    def _raw_snapshot(self, *, timeout: Optional[float] = None) -> dict:
+        snapshot = self._checked_snapshot(self._fetch_snapshot(timeout=timeout), timeout=timeout)
         info = _info(snapshot)
         if info.pid:
             self.pid = info.pid
@@ -343,8 +357,40 @@ class CommandHandle:
     def poll(self) -> CommandStatus:
         return self._snapshot().status
 
+    def _wait_snapshot(self, deadline: Optional[float]) -> dict:
+        retry_deadline = time.monotonic() + _WAIT_READ_RETRY_BUDGET
+        if deadline is not None:
+            retry_deadline = min(retry_deadline, deadline)
+        while True:
+            try:
+                budget = max(0.001, min(_POLL_INTERVAL, retry_deadline - time.monotonic()))
+                return self._raw_snapshot(timeout=budget)
+            except (httpx.TransportError, EnvironmentError) as error:
+                if not _retryable_wait_read(error):
+                    raise
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(_POLL_RETRY_DELAY, remaining))
+
+    async def _wait_snapshot_async(self, deadline: Optional[float]) -> dict:
+        retry_deadline = time.monotonic() + _WAIT_READ_RETRY_BUDGET
+        if deadline is not None:
+            retry_deadline = min(retry_deadline, deadline)
+        while True:
+            try:
+                budget = max(0.001, min(_POLL_INTERVAL, retry_deadline - time.monotonic()))
+                return await asyncio.to_thread(self._raw_snapshot, timeout=budget)
+            except (httpx.TransportError, EnvironmentError) as error:
+                if not _retryable_wait_read(error):
+                    raise
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(min(_POLL_RETRY_DELAY, remaining))
+
     def wait(self, timeout: Optional[float] = None) -> CommandResult:
-        """Observe completion; a wait deadline returns a RUNNING timeout result."""
+        """Wait with periodic activity reads; a wait deadline never kills the command."""
         increment("command_wait_total")
         started = time.monotonic()
         try:
@@ -367,11 +413,21 @@ class CommandHandle:
                 else:
                     from ._command_watch import manager_for
 
-                    try:
-                        manager_for(connection).wait(self._sid, self.command_id, timeout)
-                    except CommandWaitTimeout:
-                        return _wait_timeout_result(snapshot)
-                    snapshot = self._raw_snapshot()
+                    manager = manager_for(connection)
+                    deadline = None if timeout is None else started + max(0, timeout)
+                    while str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
+                        remaining = None if deadline is None else max(0, deadline - time.monotonic())
+                        if remaining == 0:
+                            return _wait_timeout_result(snapshot)
+                        interval = _POLL_INTERVAL if remaining is None else min(_POLL_INTERVAL, remaining)
+                        try:
+                            manager.wait(self._sid, self.command_id, interval)
+                        except CommandWaitTimeout:
+                            if remaining is not None and remaining <= _POLL_INTERVAL:
+                                return _wait_timeout_result(snapshot)
+                        # Watch connections are passive. A bounded registry read
+                        # keeps an explicit caller wait active without replaying work.
+                        snapshot = self._wait_snapshot(deadline)
                 if snapshot.get("error_code") == "WAIT_TIMEOUT":
                     return _wait_timeout_result(snapshot)
                 snapshot = self._checked_snapshot(snapshot)
@@ -382,8 +438,8 @@ class CommandHandle:
     async def wait_async(self, timeout: Optional[float] = None) -> CommandResult:
         """Wait without blocking the caller's event loop.
 
-        The shared command watch transport can wake this wait; the authoritative
-        terminal result is always fetched through ``process.wait/get``.
+        Watch notifications wake the wait early. Periodic registry reads keep
+        caller activity visible while the remote command is still running.
         """
         connection = getattr(self._client, "_connection", None)
         if connection is None:
@@ -396,11 +452,19 @@ class CommandHandle:
             if str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
                 from ._command_watch import manager_for
 
-                try:
-                    await manager_for(connection).wait_async(self._sid, self.command_id, timeout)
-                except CommandWaitTimeout:
-                    return _wait_timeout_result(snapshot)
-                snapshot = await asyncio.to_thread(self._raw_snapshot)
+                manager = manager_for(connection)
+                deadline = None if timeout is None else started + max(0, timeout)
+                while str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
+                    remaining = None if deadline is None else max(0, deadline - time.monotonic())
+                    if remaining == 0:
+                        return _wait_timeout_result(snapshot)
+                    interval = _POLL_INTERVAL if remaining is None else min(_POLL_INTERVAL, remaining)
+                    try:
+                        await manager.wait_async(self._sid, self.command_id, interval)
+                    except CommandWaitTimeout:
+                        if remaining is not None and remaining <= _POLL_INTERVAL:
+                            return _wait_timeout_result(snapshot)
+                    snapshot = await self._wait_snapshot_async(deadline)
             return _result(snapshot)
         finally:
             observe_wait(time.monotonic() - started)
