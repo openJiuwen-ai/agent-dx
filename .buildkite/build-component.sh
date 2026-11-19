@@ -66,12 +66,17 @@ case "$component" in
     if [[ -n "${ADX_RUNTIME_ROOTFS_ARCHIVE:-}" ]]; then
       rootfs_args+=(--base-archive "$ADX_RUNTIME_ROOTFS_ARCHIVE")
     fi
-    reuse_url=ADX_ROOTFS_REUSE_URL_${ADX_BUILD_ARCH^^}
-    reuse_sha256=ADX_ROOTFS_REUSE_SHA256_${ADX_BUILD_ARCH^^}
+    reuse_url_var=ADX_ROOTFS_REUSE_URL_${ADX_BUILD_ARCH^^}
+    reuse_sha256_var=ADX_ROOTFS_REUSE_SHA256_${ADX_BUILD_ARCH^^}
+    reuse_url=${!reuse_url_var:-}
+    reuse_sha256=${!reuse_sha256_var:-}
+    if [[ ( -n $reuse_url || -n $reuse_sha256 ) && ( -z $reuse_url || -z $reuse_sha256 ) ]]; then
+      echo "Ignoring incomplete EROFS reuse override; set $reuse_url_var and $reuse_sha256_var together" >&2
+    fi
     obs_upload=${ADX_OBS_UPLOAD:-1}
     if [[ $ADX_BUILD_ARCH == arm64 ]]; then obs_upload=${ADX_ARM_OBS_UPLOAD:-$obs_upload}; fi
-    if [[ -n "${!reuse_url:-}${!reuse_sha256:-}" ]]; then
-      rootfs_args+=(--reuse-url "${!reuse_url:-}" --reuse-sha256 "${!reuse_sha256:-}")
+    if [[ -n $reuse_url && -n $reuse_sha256 ]]; then
+      rootfs_args+=(--reuse-url "$reuse_url" --reuse-sha256 "$reuse_sha256")
     elif [[ $obs_upload == 1 && -n ${OBS_ACCESS_KEY_ID:-} && -n ${OBS_SECRET_ACCESS_KEY:-} ]]; then
       obs_python=${OBS_PYTHON:-/opt/buildtools/python3.9/bin/python3}
       if [[ ! -x $obs_python ]]; then obs_python=${PYTHON:-python3}; fi
@@ -79,7 +84,7 @@ case "$component" in
         echo 'EROFS reuse candidate lookup failed; building a fresh image' >&2
       elif [[ -n $candidate ]]; then
         mapfile -t candidate_fields <<< "$candidate"
-        if [[ ${#candidate_fields[@]} == 2 ]]; then
+        if [[ ${#candidate_fields[@]} == 2 && -n ${candidate_fields[0]} && -n ${candidate_fields[1]} ]]; then
           rootfs_args+=(--reuse-url "${candidate_fields[0]}" --reuse-sha256 "${candidate_fields[1]}")
         else
           echo 'Invalid EROFS reuse candidate output; building a fresh image' >&2

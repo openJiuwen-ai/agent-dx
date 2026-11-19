@@ -79,6 +79,7 @@ the image byte-for-byte when Execd, envd, base filesystem and recipe match.
 Both release archives are packaged and verified against the current ADX commit.
 Set `ADX_ROOTFS_REUSE_URL_AMD64` and `ADX_ROOTFS_REUSE_SHA256_AMD64` together to
 override the automatic lookup, or use the corresponding `_ARM64` variables.
+An incomplete override logs a warning and falls back to automatic selection.
 
 | Variable | Default | Applies to / responsibility |
 |---|---|---|
