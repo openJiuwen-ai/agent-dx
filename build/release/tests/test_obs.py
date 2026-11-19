@@ -7,6 +7,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 SPEC = importlib.util.spec_from_file_location("adx_obs", Path(__file__).resolve().parents[1] / "obs_upload.py")
 obs = importlib.util.module_from_spec(SPEC)
@@ -38,18 +39,26 @@ class Client:
         self.versioning = versioning
         self.versioning_status = versioning_status
 
-    def getBucketVersioning(self, _bucket):  # noqa: N802 - OBS SDK interface
+    def sdk_client(self):
+        return SimpleNamespace(**{
+            "getBucketVersioning": self.get_bucket_versioning,
+            "putFile": self.put_file,
+            "getObjectMetadata": self.get_object_metadata,
+            "close": self.close,
+        })
+
+    def get_bucket_versioning(self, _bucket):
         response = Response(self.versioning_status)
         response.body = self.versioning
         return response
 
-    def putFile(self, bucket, key, path, progressCallback=None):  # noqa: N802,N803 - OBS SDK interface
+    def put_file(self, bucket, key, path):
         if self.failure == key:
             return Response(500)
         self.objects[(bucket, key)] = Path(path).read_bytes()
         return Response(200)
 
-    def getObjectMetadata(self, bucket, key):  # noqa: N802 - OBS SDK interface
+    def get_object_metadata(self, bucket, key):
         body = self.objects.get((bucket, key))
         length = 0 if body is None else len(body) + self.metadata_delta
         return Response(404 if body is None else 200, length)
@@ -86,7 +95,7 @@ class ObsTests(unittest.TestCase):
                 client = Client(versioning=versioning)
                 client.objects = objects
                 manifest = obs.publish(
-                    client=client, files=files, output=source / "obs" / "manifest.json",
+                    client=client.sdk_client(), files=files, output=source / "obs" / "manifest.json",
                     bucket="agent-dx", endpoint="obs.test", channel="nightly", version=None,
                     platform="linux", arch="amd64", timestamp="20261118020000",
                     commit=revision * 40, build_id=f"build-{revision}", dry_run=False,
@@ -98,12 +107,12 @@ class ObsTests(unittest.TestCase):
                 for item in manifest["artifacts"]:
                     self.assertEqual(item["object"], prefix + item["name"])
                     directory = source if item["name"] in names else source / "obs"
-                    self.assertEqual(objects[("agent-dx", item["object"])], (directory / item["name"]).read_bytes())
+                    self.assertEqual(objects.get(("agent-dx", item["object"])), (directory / item["name"]).read_bytes())
                 with tarfile.open(source / "obs" / "adx-extras.tar.gz") as archive:
                     self.assertEqual(set(archive.getnames()), set(names[6:]))
                     wheel = f"adx_environment-{version}-py3-none-any.whl"
                     self.assertEqual(archive.extractfile(wheel).read(), revision.encode())
-                self.assertEqual(json.loads(objects[("agent-dx", prefix + "manifest.json")]), manifest)
+                self.assertEqual(json.loads(objects.get(("agent-dx", prefix + "manifest.json"))), manifest)
                 self.assertEqual(list(objects)[-1], ("agent-dx", prefix + "manifest.json"))
 
     def test_nightly_rejects_versioning_before_overwriting_objects(self):
@@ -117,7 +126,7 @@ class ObsTests(unittest.TestCase):
             ]:
                 with self.assertRaisesRegex(RuntimeError, message):
                     obs.publish(
-                        client=client, files=[artifact], output=root / "obs" / "manifest.json",
+                        client=client.sdk_client(), files=[artifact], output=root / "obs" / "manifest.json",
                         bucket="agent-dx", endpoint="obs.test", channel="nightly", version=None,
                         platform="linux", arch="amd64", timestamp="20261118020000",
                         commit="a" * 40, build_id="build-nightly", dry_run=False,
@@ -219,7 +228,7 @@ class ObsClient:
             client = Client()
 
             manifest = obs.publish(
-                client=client,
+                client=client.sdk_client(),
                 files=[package, checksum],
                 output=output,
                 bucket="agent-dx",
@@ -310,7 +319,7 @@ class ObsClient:
             client = Client(failure="adx/daily/20260921123045-cccccccccccc/linux/amd64/same.tar.zst")
             with self.assertRaisesRegex(RuntimeError, "upload failed"):
                 obs.publish(
-                    client=client,
+                    client=client.sdk_client(),
                     files=[first],
                     output=root / "manifest.json",
                     bucket="bucket",
@@ -329,7 +338,7 @@ class ObsClient:
             client = Client(metadata_delta=1)
             with self.assertRaisesRegex(RuntimeError, "readback verification failed"):
                 obs.publish(
-                    client=client,
+                    client=client.sdk_client(),
                     files=[first],
                     output=root / "mismatch.json",
                     bucket="bucket",
