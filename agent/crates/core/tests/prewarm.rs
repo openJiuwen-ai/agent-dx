@@ -13,17 +13,18 @@ fn automatic_preparation_is_opt_in_and_excludes_a_manual_recipe() {
     assert!(bad.validate().is_err());
     let digest = format!("sha256:{}", "a".repeat(64));
     input["image"] = json!(format!("assistant@{digest}"));
-    input["golden_seed_profile"] = json!(" ");
-    let bad: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
-    assert!(bad.validate().is_err());
-    input["golden_seed_profile"] = json!("shared-profile");
     let automatic: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
     assert!(automatic.validate().is_ok());
     let version = automatic.with_version("1".into());
-    assert_eq!(
-        version.golden_seed_profile.as_deref(),
-        Some("shared-profile")
-    );
+    let mut obsolete = input.clone();
+    obsolete["golden_seed_profile"] = json!("shared-profile");
+    assert!(serde_json::from_value::<TemplateDraft>(obsolete).is_err());
+    let mut spoofed = input.clone();
+    spoofed["env"] = json!({"GOLDEN_PHASE": "seed"});
+    assert!(serde_json::from_value::<TemplateDraft>(spoofed)
+        .unwrap()
+        .validate()
+        .is_err());
     assert_eq!(TemplateDraft::from(&version), automatic);
     input["prewarm_recipe"] = json!({"snapshot_id":"existing", "image_digest":digest,
         "restore_profile_digest":digest, "handoff_contract_version":"1"});

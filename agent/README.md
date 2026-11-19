@@ -22,17 +22,17 @@ Gateway 对同一次请求的目标失效重试强制绕过 Activator 的成功�
 
 Agent 模板使用业务镜像的 ENTRYPOINT/CMD、WORKDIR 和 USER，不接受 `entrypoint` 或 `working_dir` 覆盖。创建规格设置 `inherit_entrypoint=true`；Platform 注入部署侧 runtime 并生成进程配置，Execd 据此启动业务进程。业务镜像不需要预装 Execd 或额外进程 JSON。模板工作目录覆盖暂不支持；可通过 mounts 声明 Local bind 挂载。
 
-固定 Golden 的模板版本可选 `prewarm_recipe`，字段为 `snapshot_id`、`image_digest`、`restore_profile_digest`、`handoff_contract_version` 和可选 `restore_env`。模板镜像必须为与配方一致的 digest 引用。快照就绪、同租户、相同镜像和运行时由 Platform 元数据检查，运行资源和其余恢复兼容性仍由 Platform 在创建时校验。运维提供恢复规格与用户隔离的验收回执；发布模板不会自动启用。
+发布 `TemplateDraft` 时设置 `auto_prepare_snapshot: true` 即为该版本启用模板驱动 Golden。模板须使用 digest 固定的 runsc 镜像、明确的 readiness probe，以及由 `${workspace}` 参数生成 ID 和路径的一个可创建、可写的独占目录 Volume。卷目录末段使用 `${workspace}`，挂载目标固定。模板环境可以使用该参数作为工作区身份，其他启动设置使用非敏感固定值。镜像和启动配置也必须符合匿名制备契约，用户凭据在恢复后通过业务鉴权引入。
 
-发布草稿设置 `auto_prepare_snapshot: true` 时，须显式指定同租户的 `golden_seed_profile`、提供固定镜像并省略手工 `prewarm_recipe`。Activator 从部署提供的 `ADX_GOLDEN_SEED_PROFILES` 按租户和规则名查找并校验启动规格。不同模板名可引用同一规则，各自发布生成独立的版本和制备任务。版本读回保留所选规则名。缺少选择、找不到规则或规格不兼容会拒绝发布。发布事务同时保存版本和待处理任务，返回 `snapshot_preparation.status: pending`。后台沿同一 UUID 使用 Platform 制备；版本 GET 会读到 `ready` 和完整配方，或 `failed` 和原因。模板规格及数字版本保持不变，失败版本仍可用于普通创建。`auto_prepare_snapshot` 省略或为 `false` 时跳过规则查找，不创建任务，手工引用保留原有校验。使用 `Idempotency-Key` 可按租户以同一请求体重放发布。同键不同草稿返回冲突。自动制备不会自动改 Alias 或启用产品策略。
+发布事务同时写入不可变模板版本和基于该版本的持久制备任务，立即返回 `snapshot_preparation.status: pending`。Activator 复用模板镜像、镜像入口、运行时、资源、端口、探针和环境，替换成该任务专用的工作区目录及 Volume，并注入 `GOLDEN_PHASE=seed`。制备期间关闭用户实例的空闲暂停策略。业务应在种子阶段只初始化可安全复用的运行时状态，释放临时卷上的文件句柄，不接收业务请求。Platform 沿同一任务 UUID 制备，清理种子 Environment，并对制品就绪和兼容性进行检查。原生 Catalog 在制品存续期保留种子卷的引用，恢复的目标实例挂载自己的卷。Activator 取得快照退役保护后为同一版本回填 `prewarm_recipe`。模板查询返回 `ready` 和配方或 `failed` 和原因。配方包含 `snapshot_id`、`image_digest`、`restore_profile_digest`、`handoff_contract_version` 和可选 `restore_env`。发布支持按租户和 `Idempotency-Key` 重放，同键不同草稿返回冲突。
 
-由已认证的 DigitalMate Gateway 提供产品主体与账号注册事实。管理面 `GET /api/agent/v2/prewarm/{product}` 读取当前 tenant 对应策略，`PUT` 接收 `{enabled,template,version,validation_ref,expected_revision}`，使用原租户管理鉴权、版本 CAS 和显式启停。首次启用切点保留；目标版本必须同时是该入口为新主体选中的模板版本。部署启用前，须确认所有该产品账号的工作区分配都由同一权威路径记录，包括已有导入数据。普通 Agent 入口不能提供产品资格信息。
+首次 Binding 和 Alias 升级候选由 Activator 按实际选中的模板版本决议。只有模板合同摘要匹配、Platform 确认为同租户的就绪 Golden 且仍有退役保护，才在写入新 Environment ID 的同一事务中固定 `snapshot_id`。候选创建沿用 Alias 的旧 Environment 暂停及卷确权规则。快照制备中、失败、不可用或已封住退役时，新分配走普通启动。已有决议在重试中保留版本、Environment ID、用户卷和已选启动方式。恢复用目标身份及目标卷，并注入 `GOLDEN_PHASE=restore`。应用负责识别运行时交接、打开用户数据及接收业务鉴权。自动制备和回填不会修改 Alias 或已有 Binding。
 
-首次创建从所有 Agent 入口按租户和稳定 Binding ID 记录分配。Binding、产品首次分配和启动选择在一次事务中提交，台账跨模板引用和 Binding 删除保留。升级后应在所有写入副本更新完成再重新显式启用策略。首次获得完整台账时回填仍存在且身份唯一的 DigitalMate Binding，同时设置台账切点。此前已删除且无法回填的账号由注册切点排除。缺少可信注册时间的请求选择普通创建。
+DigitalMate 业务入口使用认证主体的稳定 Binding ID 跨模板引用查找已有 Binding。Agent Store 在同一事务中写入主体的 Binding scope 指针与新 Binding，两个 Alias 并发首绑时复用先提交的 Binding 及其启动决议。DigitalMate 首绑以模板版本决定自动 Golden，无需读取 `prewarm-policy` 或读写 `first-assignment`。
 
-DigitalMate Golden 只选择绑定当前 `${workspace}` 的独占目录 Volume。卷 ID 和目录末段应使用此工作区标识，挂载到 `/data/state`，业务工作区环境变量使用同一参数。Platform 确权后固定实际 Volume UID。选择前快照不可用或卷合同不满足时走普通创建。提交后未知结果按原 Environment、卷和操作身份继续。
+省略 `auto_prepare_snapshot` 或设为 `false` 时，DigitalMate 首绑走普通启动。仍使用旧产品策略的入口可以为已验证的手工 Golden 提供配方，通过 `GET/PUT /api/agent/v2/prewarm/{product}` 显式启停。启用需提供模板版本、验收回执及策略 CAS revision，并先获得持久退役保护。旧入口通过认证产品主体、注册切点及分配记录限制新用户选择。
 
-策略启用前，Activator 先取得 Platform Catalog 的持久保护。普通 Platform 删除对已保护的 Golden 返回冲突。停用策略停止新用户选择，已有 Binding 可以继续恢复。使用 `DELETE /api/agent/v2/prewarm-artifacts/{snapshotId}` 退役时，Activator 先持久封住该快照的新决议，再核对活动与删除中的 Binding 及候选引用。仍有引用时返回冲突并保留封锁。清理引用后重试相同请求，Platform 仍会核对运行中引用和制品持有，最后按 Catalog CAS 同步消费保护并接受回收。退役的快照需以新的快照 ID 替换。升级前已经提交的旧决议应保留制品，并在退役前通过新版策略重新建立保护。
+`DELETE /api/agent/v2/prewarm-artifacts/{snapshotId}` 先封住新决议，再核对活动和删除中的 Binding 及候选引用。存在引用时返回冲突并保留封锁。清理引用后重试同一请求，Platform 仍会核对运行中引用和制品持有，并以 CAS 消费保护后接受回收。退役的快照需以新的快照 ID 替换。
 
 ```json
 {"name":"assistant","image":"registry.example/assistant:v1","isolation_runtime":"runc","env":{"APP_MODE":"production"},"resources":{"cpu_millis":1000,"memory_mib":1024},"service":[{"protocol":"ws","port":8080}]}

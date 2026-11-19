@@ -16,6 +16,14 @@ struct PageCursor {
     after: String,
 }
 
+// Versions already used by Bindings remain readable after the draft field is removed.
+fn decode_template(mut record: Record) -> Result<TemplateVersion> {
+    if let Some(template) = record.value.as_object_mut() {
+        template.remove("golden_seed_profile");
+    }
+    record.decode()
+}
+
 #[derive(Clone)]
 pub struct AgentState {
     pub(crate) store: Arc<dyn Repository>,
@@ -75,7 +83,7 @@ impl AgentState {
         let Some(record) = self.store.get(&key).await? else {
             return Ok(None);
         };
-        let version = record.decode::<TemplateVersion>()?;
+        let version = decode_template(record)?;
         if draft.with_version(version.version.clone()) != version {
             return Err(Error::Conflict(
                 "publication idempotency key was used for another draft".into(),
@@ -190,7 +198,7 @@ impl AgentState {
         match cell
             .get_or_try_init(|| async {
                 let record = self.store.get(&key).await.map_err(Some)?;
-                record.ok_or(None)?.decode().map_err(Some)
+                decode_template(record.ok_or(None)?).map_err(Some)
             })
             .await
         {
@@ -286,9 +294,66 @@ impl AgentState {
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
+        self.commit_binding(scope, parameters, None, None, None)
+            .await
+    }
+
+    pub async fn create_product_binding(
+        &self,
+        scope: Scope,
+        parameters: &adx_agent_core::mounts::Parameters,
+        subject: &adx_agent_core::prewarm::EligibleStart,
+        checked_snapshot: Option<&str>,
+    ) -> Result<AgentBinding> {
+        let scope = if subject.product == "digitalmate" {
+            self.product_binding_scope(&scope, subject).await?
+        } else {
+            scope
+        };
+        self.commit_binding(scope, parameters, Some(subject), None, checked_snapshot)
+            .await
+    }
+
+    /// Fix the version checked by the caller together with the Environment startup decision.
+    pub async fn create_binding_for_version(
+        &self,
+        scope: Scope,
+        parameters: &adx_agent_core::mounts::Parameters,
+        subject: Option<&adx_agent_core::prewarm::EligibleStart>,
+        version: &str,
+        checked_snapshot: Option<&str>,
+    ) -> Result<AgentBinding> {
+        self.commit_binding(scope, parameters, subject, Some(version), checked_snapshot)
+            .await
+    }
+
+    async fn commit_binding(
+        &self,
+        scope: Scope,
+        parameters: &adx_agent_core::mounts::Parameters,
+        subject: Option<&adx_agent_core::prewarm::EligibleStart>,
+        selected_version: Option<&str>,
+        checked_snapshot: Option<&str>,
+    ) -> Result<AgentBinding> {
         for _ in 0..limits::CAS_ATTEMPTS {
+            if let Some(subject) = subject.filter(|subject| subject.product != "digitalmate") {
+                let canonical = self.product_binding_scope(&scope, subject).await?;
+                if let Some(binding) = self.binding(&canonical).await? {
+                    return if binding.phase == BindingPhase::Active {
+                        Ok(binding)
+                    } else {
+                        Err(Error::Conflict("binding is deleting".into()))
+                    };
+                }
+            }
             match self
-                .create_binding_with_decision(scope.clone(), parameters, None, None)
+                .create_binding_with_decision(
+                    scope.clone(),
+                    parameters,
+                    subject,
+                    selected_version,
+                    checked_snapshot,
+                )
                 .await
             {
                 Err(Error::Conflict(cause)) if cause == "binding changed" => continue,
@@ -300,49 +365,35 @@ impl AgentState {
         ))
     }
 
-    /// First assignment and Binding are committed together; no Platform effects occur here.
-    pub async fn create_product_binding(
-        &self,
-        scope: Scope,
-        parameters: &adx_agent_core::mounts::Parameters,
-        subject: &adx_agent_core::prewarm::EligibleStart,
-        checked_snapshot: Option<&str>,
-    ) -> Result<AgentBinding> {
-        for _ in 0..limits::CAS_ATTEMPTS {
-            let canonical = self.product_binding_scope(&scope, subject).await?;
-            if let Some(binding) = self.binding(&canonical).await? {
-                if binding.phase != BindingPhase::Active {
-                    return Err(Error::Conflict("binding is deleting".into()));
-                }
-                return Ok(binding);
-            }
-            match self
-                .create_binding_with_decision(
-                    scope.clone(),
-                    parameters,
-                    Some(subject),
-                    checked_snapshot,
-                )
-                .await
-            {
-                Err(Error::Conflict(cause)) if cause == "binding changed" => continue,
-                result => return result,
-            }
-        }
-        Err(Error::Conflict(
-            "first assignment changed concurrently".into(),
-        ))
-    }
-
     async fn create_binding_with_decision(
         &self,
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
         subject: Option<&adx_agent_core::prewarm::EligibleStart>,
+        selected_version: Option<&str>,
         checked_snapshot: Option<&str>,
     ) -> Result<AgentBinding> {
         let key = binding_key(&scope)?;
+        let digitalmate = subject.is_some_and(|subject| subject.product == "digitalmate");
+        let history = crate::prewarm::history_key(&scope)?;
+        let previous_history = self.store.get(&history).await?;
+        // The caller already resolved historical records before choosing a version.
+        // Recheck a current pointer here to catch a concurrent commit under another Alias.
+        if let Some(history) = previous_history.as_ref().filter(|_| digitalmate) {
+            if let Some(binding) = self.digitalmate_binding(&scope, Some(history)).await? {
+                return if binding.phase == BindingPhase::Active {
+                    Ok(binding)
+                } else {
+                    Err(Error::Conflict("binding is deleting".into()))
+                };
+            }
+        }
         let (version, alias_check) = self.desired_version(&scope).await?;
+        if selected_version.is_some_and(|selected| selected != version) {
+            return Err(Error::Conflict(
+                "selected template version changed; retry activation".into(),
+            ));
+        }
         let template = self
             .template(&scope.tenant, &scope.template, &version)
             .await?
@@ -354,31 +405,21 @@ impl AgentState {
             adx_agent_core::EnvironmentRef::new(version.clone(), format!("adx-{generation}"));
         let mut extra_checks = Vec::new();
         let mut extra_puts = Vec::new();
-        let history = crate::prewarm::history_key(&scope)?;
-        let previous_history = self.store.get(&history).await?;
-        let never_assigned = previous_history.is_none();
-        if previous_history.is_some() {
-            if let Some(subject) = subject.filter(|facts| facts.product == "digitalmate") {
-                let canonical = self.product_binding_scope(&scope, subject).await?;
-                if canonical != scope {
-                    if let Some(existing) = self.binding(&canonical).await? {
-                        return if existing.phase == BindingPhase::Active {
-                            Ok(existing)
-                        } else {
-                            Err(Error::Conflict("binding is deleting".into()))
-                        };
-                    }
-                }
-            }
+        let template_golden = adx_agent_core::prewarm::template_golden(&template);
+        if let Some(recipe) = template_golden {
+            current.snapshot_id = self
+                .select_snapshot(&scope.tenant, recipe, checked_snapshot, &mut extra_checks)
+                .await?;
         }
+        let never_assigned = previous_history.is_none();
         extra_checks.push(Check {
             key: history.clone(),
             expected: previous_history.map(|record| record.revision),
         });
-        if never_assigned {
+        if digitalmate || never_assigned {
             extra_puts.push(put(&history, &Some(&scope))?);
         }
-        if let Some(subject) = subject {
+        if let Some(subject) = subject.filter(|_| !digitalmate) {
             use crate::prewarm::{first_key, policy_key, FirstAssignment, FirstDecision};
             use adx_agent_core::prewarm::{PolicyScope, PrewarmPolicy};
             let first = first_key(&scope, subject)?;
@@ -404,7 +445,7 @@ impl AgentState {
                 product: subject.product.clone(),
             })?;
             let rollout = self.store.get(&policy).await?;
-            if prior.is_none() && never_assigned {
+            if template_golden.is_none() && prior.is_none() && never_assigned {
                 if let (Some(saved), Some(recipe)) =
                     (rollout.as_ref(), template.prewarm_recipe.as_ref())
                 {
@@ -413,15 +454,15 @@ impl AgentState {
                         && policy.template == scope.template
                         && policy.version == version
                         && checked_snapshot == Some(recipe.snapshot_id.as_str())
-                        && (subject.product != "digitalmate"
-                            || crate::prewarm::private_workspace(&template, parameters)?)
                     {
-                        let protection =
-                            crate::prewarm::protection_key(&scope.tenant, &recipe.snapshot_id)?;
-                        if let Some(record) = self.open_snapshot_protection(&protection).await? {
-                            current.snapshot_id = Some(recipe.snapshot_id.clone());
-                            extra_checks.push(check(&protection, &record));
-                        }
+                        current.snapshot_id = self
+                            .select_snapshot(
+                                &scope.tenant,
+                                recipe,
+                                checked_snapshot,
+                                &mut extra_checks,
+                            )
+                            .await?;
                     }
                 }
             }

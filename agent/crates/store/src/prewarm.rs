@@ -3,7 +3,7 @@ use crate::{
     state::{check, put},
     *,
 };
-use adx_agent_core::{prewarm::*, Scope};
+use adx_agent_core::{prewarm::*, AgentBinding, Scope};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,69 +29,6 @@ pub(crate) fn policy_key(scope: &PolicyScope) -> Result<Key> {
 pub(crate) fn history_key(scope: &Scope) -> Result<Key> {
     scope.validate().map_err(Error::Invalid)?;
     Key::new("binding-history", &[&scope.tenant, &scope.binding_id])
-}
-
-/// A DigitalMate workspace must be derived from the trusted workspace parameter
-/// in both the application identity and the directory Volume source.
-pub(crate) fn private_workspace(
-    template: &adx_agent_core::TemplateVersion,
-    parameters: &adx_agent_core::mounts::Parameters,
-) -> Result<bool> {
-    use adx_agent_core::volumes::{AccessMode, VolumeSource};
-    let Some(workspace) = parameters.get("workspace") else {
-        return Ok(false);
-    };
-    if !workspace
-        .strip_prefix("w-")
-        .is_some_and(adx_agent_core::prewarm::workspace_digest)
-        || template
-            .env
-            .get("DIGITALMATE_CRYPTO_WORKSPACE")
-            .map(String::as_str)
-            != Some("${workspace}")
-        || template.prewarm_recipe.as_ref().is_none_or(|recipe| {
-            recipe.restore_env.len() != 1
-                || recipe
-                    .restore_env
-                    .get("DIGITALMATE_GOLDEN_PHASE")
-                    .map(String::as_str)
-                    != Some("restore")
-        })
-    {
-        return Ok(false);
-    }
-    let mounts = template.render_mounts(parameters).map_err(Error::Invalid)?;
-    let volumes = template
-        .render_volumes(parameters)
-        .map_err(Error::Invalid)?;
-    let mut workspace_mounts = mounts.iter().filter(|mount| {
-        mount.target == "/data/state"
-            || mount.target.starts_with("/data/state/")
-            || "/data/state"
-                .strip_prefix(&mount.target)
-                .is_some_and(|rest| rest.starts_with('/'))
-    });
-    let Some(mount) = workspace_mounts.next() else {
-        return Ok(false);
-    };
-    if mount.target != "/data/state"
-        || workspace_mounts.next().is_some()
-        || mount.volume_uid.is_some()
-        || mount.options.iter().any(|option| option == "ro")
-    {
-        return Ok(false);
-    }
-    Ok(volumes.iter().any(|volume| {
-        let VolumeSource::Directory { path, .. } = &volume.source;
-        mount.volume_id.as_ref() == Some(&volume.id)
-            && volume.access_mode == AccessMode::Exclusive
-            && path.rsplit('/').next() == Some(workspace.as_str())
-            && (volume.id == *workspace
-                || volume
-                    .id
-                    .strip_suffix(workspace)
-                    .is_some_and(|prefix| prefix.ends_with('-')))
-    }))
 }
 
 pub(crate) fn first_key(scope: &Scope, facts: &EligibleStart) -> Result<Key> {
@@ -196,6 +133,25 @@ impl AgentState {
                 }
             }
         }
+    }
+
+    /// Fence allocation with the same snapshot protection revision used by retirement.
+    pub(crate) async fn select_snapshot(
+        &self,
+        tenant: &str,
+        recipe: &PrewarmRecipe,
+        checked_snapshot: Option<&str>,
+        checks: &mut Vec<Check>,
+    ) -> Result<Option<String>> {
+        if checked_snapshot != Some(recipe.snapshot_id.as_str()) {
+            return Ok(None);
+        }
+        let key = protection_key(tenant, &recipe.snapshot_id)?;
+        let Some(record) = self.open_snapshot_protection(&key).await? else {
+            return Ok(None);
+        };
+        checks.push(check(&key, &record));
+        Ok(Some(recipe.snapshot_id.clone()))
     }
 
     pub(crate) async fn open_snapshot_protection(&self, key: &Key) -> Result<Option<Record>> {
@@ -331,19 +287,14 @@ impl AgentState {
         scope: &Scope,
         facts: &EligibleStart,
     ) -> Result<Scope> {
+        if facts.product == "digitalmate" {
+            let history = self.store.get(&history_key(scope)?).await?;
+            return Ok(self
+                .digitalmate_binding(scope, history.as_ref())
+                .await?
+                .map_or_else(|| scope.clone(), |binding| binding.scope));
+        }
         let Some(record) = self.store.get(&first_key(scope, facts)?).await? else {
-            if facts.product == "digitalmate" {
-                if let Some(record) = self.store.get(&history_key(scope)?).await? {
-                    if let Some(prior) = record.decode::<Option<Scope>>()? {
-                        if prior.tenant != scope.tenant || prior.binding_id != scope.binding_id {
-                            return Err(Error::Corrupt("binding history identity mismatch".into()));
-                        }
-                        if self.binding(&prior).await?.is_some() {
-                            return Ok(prior);
-                        }
-                    }
-                }
-            }
             return Ok(scope.clone());
         };
         let assignment: FirstAssignment = record.decode()?;
@@ -357,6 +308,67 @@ impl AgentState {
         } else {
             // Keep the record as a tombstone even if the original Binding is gone.
             Ok(scope.clone())
+        }
+    }
+
+    pub(crate) async fn digitalmate_binding(
+        &self,
+        scope: &Scope,
+        history: Option<&Record>,
+    ) -> Result<Option<AgentBinding>> {
+        let prior = match history {
+            Some(record) => record.decode::<Option<Scope>>()?,
+            None => None,
+        };
+        if let Some(prior) = prior {
+            if prior.tenant != scope.tenant || prior.binding_id != scope.binding_id {
+                return Err(Error::Corrupt("binding history identity mismatch".into()));
+            }
+            if let Some(binding) = self.binding(&prior).await? {
+                return Ok(Some(binding));
+            }
+        }
+        if let Some(binding) = self.binding(scope).await? {
+            return Ok(Some(binding));
+        }
+
+        // Replace the hex-encoded closing bracket with a comma to start at this
+        // tenant's entries in the ordered index of Binding keys.
+        let tenant_key = Key::new("binding", &[&scope.tenant])?;
+        let tenant_prefix = format!(
+            "{}2c",
+            tenant_key
+                .as_str()
+                .strip_suffix("5d")
+                .ok_or_else(|| Error::Corrupt("invalid Binding tenant key".into()))?
+        );
+        // Older writers had no pointer or kept the original scope after deletion.
+        let mut candidate = None;
+        let mut after = tenant_prefix.clone();
+        let index = Index::all_bindings();
+        loop {
+            let records = self.store.page(&index, Some(&after), 128).await?;
+            let finished = records.len() < 128;
+            for (key, record) in records {
+                if !key.starts_with(&tenant_prefix) {
+                    return Ok(candidate);
+                }
+                after = key;
+                let binding: AgentBinding = record.decode()?;
+                if binding.scope.tenant == scope.tenant
+                    && binding.scope.binding_id == scope.binding_id
+                {
+                    if candidate.is_some() {
+                        return Err(Error::Conflict(
+                            "multiple existing Bindings for the DigitalMate subject".into(),
+                        ));
+                    }
+                    candidate = Some(binding);
+                }
+            }
+            if finished {
+                return Ok(candidate);
+            }
         }
     }
 }

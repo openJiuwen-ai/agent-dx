@@ -49,8 +49,6 @@ pub struct Activator {
     bindings: Mutex<LinkedHashMap<Scope, Binding>>,
     cache: CacheSettings,
     subscription_ready: std::sync::atomic::AtomicBool,
-    seed_profiles:
-        std::collections::BTreeMap<(String, String), snapshot_preparation::ConfiguredSeedProfile>,
 }
 
 /// Whether the Environment referenced by `current_env_id` is dormant right now:
@@ -93,7 +91,6 @@ impl Activator {
             bindings: Mutex::new(LinkedHashMap::new()),
             cache: CacheSettings::default(),
             subscription_ready: std::sync::atomic::AtomicBool::new(true),
-            seed_profiles: Default::default(),
         }
     }
     /// Returns Invalid for a zero idle timeout. Capacity zero disables the cache.
@@ -144,10 +141,39 @@ impl Activator {
     /// Advance a single declarative version change. False means more work remains.
     /// Platform owns readiness and deletion; no Environment health recovery runs here.
     pub async fn reconcile_binding(&self, scope: &Scope, deadline: u64) -> Result<bool> {
-        if self.state.binding(scope).await?.is_none() {
+        let Some(existing) = self.state.binding(scope).await? else {
             return Ok(true);
-        }
-        let binding = self.state.prepare_binding(scope).await?;
+        };
+        let selected = if existing.phase == BindingPhase::Active && existing.secondary.is_none() {
+            let version = self.state.selected_version(scope).await?;
+            if version == existing.current.version {
+                None
+            } else {
+                let template = self
+                    .template(&scope.tenant, &scope.template, &version)
+                    .await?;
+                let snapshot = self
+                    .select_template_golden(
+                        &scope.tenant,
+                        &template,
+                        &existing.parameters,
+                        deadline,
+                    )
+                    .await?;
+                Some((version, snapshot))
+            }
+        } else {
+            None
+        };
+        let binding = self
+            .state
+            .prepare_binding_with_snapshot(
+                scope,
+                selected
+                    .as_ref()
+                    .map(|(version, snapshot)| (version.as_str(), snapshot.as_deref())),
+            )
+            .await?;
         if binding.phase == BindingPhase::Deleting {
             self.delete_binding(scope).await?;
             return Ok(true);
@@ -187,13 +213,8 @@ impl Activator {
             }
             Err(error) => return Err(error),
         };
-        let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
-        execution.mounts = template
-            .render_mounts(&binding.parameters)
-            .map_err(Error::Invalid)?;
-        execution.env = template
-            .render_env(&binding.parameters)
-            .map_err(Error::Invalid)?;
+        let execution =
+            Self::binding_execution(&template, &binding.parameters, &secondary.environment)?;
         self.environment.validate_execution(&execution)?;
         let volumes = creation::definitions(&template, &binding.parameters, &execution.mounts)?;
         let observed = self
@@ -321,7 +342,7 @@ impl Activator {
         self.environment.validate_execution(&execution)?;
         let job = template
             .auto_prepare_snapshot
-            .then(|| self.seed_job(tenant, template))
+            .then(|| self.seed_job(tenant, &snapshot))
             .transpose()?;
         if snapshot.prewarm_recipe.is_some() && !self.golden_available(tenant, &snapshot).await? {
             return Err(Error::Invalid(
@@ -348,6 +369,11 @@ impl Activator {
             let template = self
                 .template(&request.scope.tenant, &request.template, &request.version)
                 .await?;
+            if adx_agent_core::prewarm::template_golden(&template).is_some() {
+                return Err(Error::Invalid(
+                    "template-derived Golden is controlled by the selected template version".into(),
+                ));
+            }
             if !self
                 .golden_available(&request.scope.tenant, &template)
                 .await?
@@ -368,17 +394,7 @@ impl Activator {
                     .backfill_digitalmate_assignments(&request.scope.tenant)
                     .await?;
             }
-            let proof = self
-                .state
-                .snapshot_protection(&request.scope.tenant, &recipe.snapshot_id)
-                .await?;
-            self.environment
-                .agent_snapshot_protection(
-                    &request.scope.tenant,
-                    &recipe.snapshot_id,
-                    &proof,
-                    false,
-                )
+            self.protect_golden(&request.scope.tenant, &recipe.snapshot_id)
                 .await?;
             Some(recipe.snapshot_id)
         } else {
@@ -389,6 +405,62 @@ impl Activator {
             .update_prewarm_policy(request, protected.as_deref())
             .await?)
     }
+    async fn protect_golden(&self, tenant: &str, snapshot: &str) -> Result<()> {
+        let proof = self.state.snapshot_protection(tenant, snapshot).await?;
+        self.environment
+            .agent_snapshot_protection(tenant, snapshot, &proof, false)
+            .await?;
+        Ok(())
+    }
+
+    async fn select_template_golden(
+        &self,
+        tenant: &str,
+        template: &TemplateVersion,
+        parameters: &adx_agent_core::mounts::Parameters,
+        deadline: u64,
+    ) -> Result<Option<String>> {
+        if template.auto_prepare_snapshot && snapshot_preparation::reserved_workspace(parameters) {
+            return Err(Error::Invalid(
+                "workspace name is reserved for anonymous Golden preparation".into(),
+            ));
+        }
+        let Some(recipe) = adx_agent_core::prewarm::template_golden(template) else {
+            return Ok(None);
+        };
+        if recipe.restore_profile_digest != snapshot_preparation::restore_digest(template)? {
+            return Ok(None);
+        }
+        let checked = tokio::time::timeout(
+            Duration::from_millis(500).min(adx_agent_core::transport::remaining_time(deadline)),
+            self.golden_available(tenant, template),
+        )
+        .await;
+        Ok(matches!(checked, Ok(Ok(true))).then(|| recipe.snapshot_id.clone()))
+    }
+
+    fn binding_execution(
+        template: &TemplateVersion,
+        parameters: &adx_agent_core::mounts::Parameters,
+        environment: &EnvironmentRef,
+    ) -> Result<adx_agent_core::environment::ExecutionSpec> {
+        let mut execution = adx_agent_core::environment::ExecutionSpec::from(template);
+        execution.mounts = template.render_mounts(parameters).map_err(Error::Invalid)?;
+        execution.env = template.render_env(parameters).map_err(Error::Invalid)?;
+        if let Some(id) = &environment.snapshot_id {
+            let recipe = template
+                .prewarm_recipe
+                .as_ref()
+                .filter(|recipe| &recipe.snapshot_id == id)
+                .ok_or_else(|| {
+                    Error::Conflict("committed Golden recipe no longer matches template".into())
+                })?;
+            execution.snapshot_id = Some(id.clone());
+            execution.env.extend(recipe.restore_env.clone());
+        }
+        Ok(execution)
+    }
+
     pub async fn retire_golden(&self, tenant: &str, snapshot: &str) -> Result<()> {
         let proof = self
             .state
@@ -658,7 +730,14 @@ impl Activator {
                 execution.env = template.render_env(&parameters).map_err(Error::Invalid)?;
                 creation::definitions(&template, &parameters, &execution.mounts)?;
                 self.environment.validate_execution(&execution)?;
-                if let Some(subject) = &request.product_start {
+                let mut chosen = self
+                    .select_template_golden(&scope.tenant, &template, &parameters, deadline_unix_ms)
+                    .await?;
+                if let Some(subject) = request.product_start.as_ref().filter(|subject| {
+                    subject.product != "digitalmate"
+                        && template.prewarm_recipe.is_some()
+                        && adx_agent_core::prewarm::template_golden(&template).is_none()
+                }) {
                     let rollout = self
                         .state
                         .prewarm_policy(&PolicyScope {
@@ -688,14 +767,17 @@ impl Activator {
                     } else {
                         None
                     };
-                    self.state
-                        .create_product_binding(scope.clone(), &parameters, subject, checked)
-                        .await?
-                } else {
-                    self.state
-                        .create_binding_with_parameters(scope.clone(), &parameters)
-                        .await?
+                    chosen = checked.map(str::to_owned);
                 }
+                self.state
+                    .create_binding_for_version(
+                        scope.clone(),
+                        &parameters,
+                        request.product_start.as_ref(),
+                        &version,
+                        chosen.as_deref(),
+                    )
+                    .await?
             }
         };
         let scope = &binding.scope;
@@ -713,24 +795,7 @@ impl Activator {
         if let Some(service) = service {
             service.select(&template.service).map_err(Error::Invalid)?;
         }
-        let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
-        execution.mounts = template
-            .render_mounts(&binding.parameters)
-            .map_err(Error::Invalid)?;
-        execution.env = template
-            .render_env(&binding.parameters)
-            .map_err(Error::Invalid)?;
-        if let Some(id) = &binding.current.snapshot_id {
-            let recipe = template
-                .prewarm_recipe
-                .as_ref()
-                .filter(|recipe| &recipe.snapshot_id == id)
-                .ok_or_else(|| {
-                    Error::Conflict("committed Golden recipe no longer matches template".into())
-                })?;
-            execution.snapshot_id = Some(id.clone());
-            execution.env.extend(recipe.restore_env.clone());
-        }
+        let execution = Self::binding_execution(&template, &binding.parameters, &binding.current)?;
         self.environment.validate_execution(&execution)?;
         let volumes = creation::definitions(&template, &binding.parameters, &execution.mounts)?;
         let observed = self

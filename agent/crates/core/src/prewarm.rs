@@ -3,6 +3,9 @@ use crate::{identifier, parameters, version_number, ValidationResult};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub const GOLDEN_PHASE: &str = "GOLDEN_PHASE";
+pub const TEMPLATE_HANDOFF_VERSION: &str = "2";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrewarmRecipe {
@@ -53,6 +56,15 @@ impl PrewarmRecipe {
         }
         Ok(())
     }
+}
+
+/// Automatic results with the template-derived contract are selected by version.
+pub fn template_golden(template: &crate::TemplateVersion) -> Option<&PrewarmRecipe> {
+    template.prewarm_recipe.as_ref().filter(|recipe| {
+        template.auto_prepare_snapshot
+            && template.snapshot_preparation == Some(SnapshotPreparation::Ready)
+            && recipe.handoff_contract_version == TEMPLATE_HANDOFF_VERSION
+    })
 }
 
 pub fn sha256(value: &str) -> bool {

@@ -1,84 +1,18 @@
-//! Assemble an anonymous seed from the deployment-owned profile and a fixed template.
+//! Freeze the published execution contract and substitute only its anonymous workspace.
 use crate::{Activator, Error, Result};
 use adx_agent_core::{
     environment::{EnvironmentError, ExecutionSpec},
-    mounts::{CreateOptions, Mount, MountType},
-    prewarm::{PrewarmRecipe, SeedExecution, SeedResult},
+    mounts::Parameters,
+    prewarm::{PrewarmRecipe, SeedExecution, SeedResult, GOLDEN_PHASE, TEMPLATE_HANDOFF_VERSION},
     volumes::{AccessMode, VolumeSource, VolumeSpec},
-    TemplateDraft,
+    TemplateVersion,
 };
 use adx_agent_store::PreparationJob;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConfiguredSeedProfile {
-    tenant: String,
-    directory_root: String,
-    profile: Profile,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Profile {
-    schema_version: u32,
-    profile: String,
-    kind: ProfileKind,
-    inherit_from_published_template: Vec<String>,
-    requires: Requirements,
-    seed: Seed,
-    restore: Restore,
-}
-
-#[derive(Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum ProfileKind {
-    Generic,
-    DigitalMate,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Requirements {
-    isolation_runtime: String,
-    readiness_http_path: String,
-    seed_readiness_http_path: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Seed {
-    inherit_entrypoint: bool,
-    env_from_template: Vec<String>,
-    env: BTreeMap<String, String>,
-    workspace: Workspace,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Workspace {
-    identity_env: String,
-    directory_prefix: String,
-    storage_domain: String,
-    mount_target: String,
-    access_mode: AccessMode,
-    uid: u32,
-    gid: u32,
-    mode: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Restore {
-    handoff_contract_version: String,
-    env: BTreeMap<String, String>,
-}
+const WORKSPACE_PARAMETER: &str = "${workspace}";
+const SEED_PREFIX: &str = "adx-agent-seed-";
 
 fn safe_seed_env(name: &str, value: &str) -> bool {
     let upper = name.to_ascii_uppercase();
@@ -88,254 +22,135 @@ fn safe_seed_env(name: &str, value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         && !upper.starts_with("ADX_")
         && !upper.starts_with("EXECD_")
-        && !["PASSWORD", "TOKEN", "PRIVATE_KEY", "API_KEY", "API_BASE"]
-            .iter()
-            .any(|marker| upper.contains(marker))
+        && upper != "SECRET"
         && !upper.ends_with("_SECRET")
-        && !value.contains("${")
+        && ![
+            "PASSWORD",
+            "TOKEN",
+            "PRIVATE_KEY",
+            "API_KEY",
+            "API_BASE",
+            "ACCESS_KEY",
+            "SIGNING_KEY",
+            "CREDENTIAL",
+        ]
+        .iter()
+        .any(|marker| upper.contains(marker))
         && !value.chars().any(char::is_control)
+        && !reqwest::Url::parse(value).ok().is_some_and(|url| {
+            url.has_host()
+                && (!url.username().is_empty() || url.password().is_some() || url.query().is_some())
+        })
+        && (!value.contains("${") || value == WORKSPACE_PARAMETER)
 }
 
-impl ConfiguredSeedProfile {
-    fn scope(&self) -> (&str, &str) {
-        (&self.tenant, &self.profile.profile)
+fn seed_volume(template: &TemplateVersion, identity: &str) -> Result<VolumeSpec> {
+    let ([mount], [volume]) = (template.mounts.as_slice(), template.volumes.as_slice()) else {
+        return Err(Error::Invalid(
+            "Golden requires one managed workspace mount".into(),
+        ));
+    };
+    let VolumeSource::Directory {
+        storage_domain,
+        path,
+    } = &volume.source;
+    if mount.volume_id.as_deref() != Some(volume.id.as_str())
+        || mount.volume_uid.is_some()
+        || !mount.host_path.is_empty()
+        || mount.target.contains("${")
+        || mount.options.iter().any(|option| option == "ro")
+        || volume.access_mode != AccessMode::Exclusive
+        || !volume.create_if_missing
+        || !volume.id.ends_with(WORKSPACE_PARAMETER)
+        || volume.id.matches("${").count() != 1
+        || !path.ends_with("/${workspace}")
+        || path.matches("${").count() != 1
+        || storage_domain.contains("${")
+    {
+        return Err(Error::Invalid(
+            "Golden requires a writable exclusive directory Volume keyed by workspace".into(),
+        ));
     }
+    let params = Parameters::from([("workspace".into(), identity.into())]);
+    let mut anonymous = volume.render(Some(&params)).map_err(Error::Invalid)?;
+    anonymous.id = identity.into();
+    Ok(anonymous)
+}
 
-    fn build(&self, draft: &TemplateDraft) -> Result<PreparationJob> {
-        let profile = &self.profile;
-        let seed = &profile.seed;
-        let ws = &seed.workspace;
-        let reject =
-            || Error::Invalid("template is incompatible with its Golden seed profile".into());
-        let expected: BTreeSet<_> = ["image", "isolation_runtime", "resources", "readiness_probe"]
-            .into_iter()
-            .collect();
-        if profile.schema_version != 2
-            || !seed.inherit_entrypoint
-            || profile
-                .inherit_from_published_template
-                .iter()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>()
-                != expected
-            || profile.requires.isolation_runtime != draft.isolation_runtime
-            || profile.requires.seed_readiness_http_path == profile.requires.readiness_http_path
-            || !draft
-                .readiness_probe
-                .as_ref()
-                .and_then(|probe| probe.http_get.as_ref())
-                .is_some_and(|probe| {
-                    probe.path == profile.requires.readiness_http_path
-                        && draft
-                            .service
-                            .iter()
-                            .any(|service| service.port == probe.port)
-                })
-            || ws.access_mode != AccessMode::Exclusive
-            || seed.env.contains_key(&ws.identity_env)
-        {
-            return Err(reject());
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut env = seed.env.clone();
-        for name in &seed.env_from_template {
-            if env.contains_key(name) || name == &ws.identity_env || !safe_seed_env(name, "") {
-                return Err(reject());
-            }
-            if let Some(value) = draft.env.get(name) {
-                env.insert(name.clone(), value.clone());
-            }
-        }
-        if !safe_seed_env(&ws.identity_env, "")
-            || env.iter().any(|(key, value)| !safe_seed_env(key, value))
-        {
-            return Err(reject());
-        }
-        if profile.kind == ProfileKind::DigitalMate {
-            for (key, value) in &seed.env {
-                if key != "DIGITALMATE_GOLDEN_PHASE" && draft.env.get(key) != Some(value) {
-                    return Err(Error::Invalid(format!(
-                        "DigitalMate Golden requires the same fixed template environment field {key}"
-                    )));
-                }
-            }
-            for (key, value) in &draft.env {
-                if key != &ws.identity_env && env.get(key) != Some(value) {
-                    return Err(Error::Invalid(format!(
-                        "DigitalMate Golden cannot carry template environment field {key}"
-                    )));
-                }
-            }
-            let value = |key: &str| env.get(key).map(String::as_str).filter(|v| !v.is_empty());
-            if profile.requires.seed_readiness_http_path != "/health/ready/golden-seed"
-                || profile.restore.env.len() != 1
-                || draft.env.get(&ws.identity_env).map(String::as_str) != Some("${workspace}")
-                || value("DIGITALMATE_GOLDEN_PHASE") != Some("seed")
-                || profile
-                    .restore
-                    .env
-                    .get("DIGITALMATE_GOLDEN_PHASE")
-                    .map(String::as_str)
-                    != Some("restore")
-                || ws.identity_env != "DIGITALMATE_CRYPTO_WORKSPACE"
-                || value("DIGITALMATE_WORKSPACE") != Some(ws.mount_target.as_str())
-                || value("DIGITALMATE_CRYPTO_TENANT").is_none()
-                || value("DIGITALMATE_MODEL_CONFIG_NAME").is_none()
-                || !value("DIGITALMATE_CRYPTO_URL")
-                    .and_then(|v| reqwest::Url::parse(v).ok())
-                    .is_some_and(|url| {
-                        matches!(url.scheme(), "https" | "http")
-                            && url.host().is_some()
-                            && url.username().is_empty()
-                            && url.password().is_none()
-                            && url.query().is_none()
-                            && url.fragment().is_none()
-                    })
-            {
-                return Err(reject());
-            }
-        }
-        let identity = format!("adx-agent-seed-{id}");
-        env.insert(ws.identity_env.clone(), identity.clone());
-        let volume = VolumeSpec {
-            id: identity.clone(),
-            source: VolumeSource::Directory {
-                storage_domain: ws.storage_domain.clone(),
-                path: format!("{}/{}/{identity}", self.directory_root, ws.directory_prefix),
-            },
-            access_mode: AccessMode::Exclusive,
-            create_if_missing: true,
-            create_options: Some(CreateOptions {
-                uid: ws.uid,
-                gid: ws.gid,
-                mode: ws.mode.clone(),
-            }),
-        };
-        volume.validate().map_err(Error::Invalid)?;
-        let mut execution = ExecutionSpec::from(&draft.with_version("1".into()));
-        execution.env = env;
-        execution.lifecycle = Default::default();
-        execution
-            .readiness_probe
-            .as_mut()
-            .and_then(|probe| probe.http_get.as_mut())
-            .ok_or_else(reject)?
-            .path = profile.requires.seed_readiness_http_path.clone();
-        execution.mounts = vec![Mount {
-            kind: MountType::Bind,
-            host_path: String::new(),
-            volume_id: Some(identity),
-            volume_uid: None,
-            target: ws.mount_target.clone(),
-            options: vec!["rw".into()],
-            create_if_missing: false,
-            create_options: None,
-        }];
-        execution.validate().map_err(Error::Invalid)?;
-        let image_digest = draft
-            .image
-            .rsplit_once('@')
-            .ok_or_else(reject)?
-            .1
-            .to_owned();
-        let seed_env: BTreeMap<_, _> = execution
-            .env
-            .iter()
-            .filter(|(name, _)| *name != &ws.identity_env)
-            .collect();
-        let normalized = serde_json::to_vec(&(
-            &profile.profile,
-            profile.schema_version,
-            &draft.image,
-            &draft.isolation_runtime,
-            &draft.resources,
-            &execution.readiness_probe,
-            &draft.healthcheck,
-            &draft.service,
-            &draft.mounts,
-            &draft.volumes,
-            seed_env,
-            &profile.restore.handoff_contract_version,
-            &profile.restore.env,
-        ))
-        .map_err(|_| reject())?;
-        let recipe = PrewarmRecipe {
-            snapshot_id: "pending".into(),
-            image_digest,
-            restore_profile_digest: format!("sha256:{:x}", Sha256::digest(normalized)),
-            handoff_contract_version: profile.restore.handoff_contract_version.clone(),
-            restore_env: profile.restore.env.clone(),
-        };
-        recipe.validate(&draft.image).map_err(Error::Invalid)?;
-        Ok(PreparationJob {
-            id,
-            tenant: self.tenant.clone(),
-            template: draft.name.clone(),
-            version: String::new(),
-            seed: SeedExecution {
-                execution,
-                volume,
-                native_input: None,
-            },
-            recipe,
-        })
-    }
+pub(super) fn reserved_workspace(parameters: &Parameters) -> bool {
+    parameters
+        .get("workspace")
+        .is_some_and(|value| value.starts_with(SEED_PREFIX))
+}
+
+pub(super) fn restore_digest(template: &TemplateVersion) -> Result<String> {
+    let spec = ExecutionSpec::from(template);
+    let normalized = serde_json::to_vec(&(TEMPLATE_HANDOFF_VERSION, spec, &template.volumes))
+        .map_err(|_| Error::Invalid("cannot encode Golden template contract".into()))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(normalized)))
 }
 
 impl Activator {
-    pub fn with_seed_profiles(mut self, profiles: Vec<ConfiguredSeedProfile>) -> Result<Self> {
-        for profile in profiles {
-            let (tenant, name) = profile.scope();
-            adx_agent_core::identifier(tenant, "seed profile tenant").map_err(Error::Invalid)?;
-            adx_agent_core::identifier(name, "seed profile name").map_err(Error::Invalid)?;
-            if self
-                .seed_profiles
-                .insert((tenant.into(), name.into()), profile)
-                .is_some()
-            {
-                return Err(Error::Invalid("duplicate Golden seed profile".into()));
+    pub(crate) fn seed_job(
+        &self,
+        tenant: &str,
+        template: &TemplateVersion,
+    ) -> Result<PreparationJob> {
+        if template.isolation_runtime != "runsc" || template.readiness_probe.is_none() {
+            return Err(Error::Invalid(
+                "Golden requires runsc and an explicit readiness probe".into(),
+            ));
+        }
+        for (key, value) in &template.env {
+            if key == "DIGITALMATE_GOLDEN_PHASE" || !safe_seed_env(key, value) {
+                return Err(Error::Invalid(format!(
+                    "Golden cannot capture template environment field {key}"
+                )));
             }
         }
-        Ok(self)
-    }
-
-    pub fn with_deployed_seed_profiles(self) -> Result<Self> {
-        match std::env::var_os("ADX_GOLDEN_SEED_PROFILES") {
-            None => Ok(self),
-            Some(path) => {
-                let data = std::fs::read(path)
-                    .map_err(|_| Error::Invalid("cannot read Golden seed profiles".into()))?;
-                let profiles = serde_json::from_slice(&data)
-                    .map_err(|_| Error::Invalid("invalid Golden seed profiles".into()))?;
-                self.with_seed_profiles(profiles)
-            }
-        }
-    }
-
-    pub(crate) fn seed_job(&self, tenant: &str, draft: &TemplateDraft) -> Result<PreparationJob> {
-        let name = draft.golden_seed_profile.as_ref().ok_or_else(|| {
-            Error::Invalid("auto_prepare_snapshot requires golden_seed_profile".into())
-        })?;
-        let mut job = self
-            .seed_profiles
-            .get(&(tenant.into(), name.clone()))
-            .ok_or_else(|| {
-                Error::Invalid("no Golden seed profile with that name in this tenant".into())
-            })?
-            .build(draft)?;
-        job.seed.native_input = self
-            .environment
-            .freeze_preparation(tenant, &job.id, &job.seed)?;
-        Ok(job)
+        let id = uuid::Uuid::new_v4().to_string();
+        let identity = format!("{SEED_PREFIX}{id}");
+        let volume = seed_volume(template, &identity)?;
+        let params = Parameters::from([("workspace".into(), identity)]);
+        let mut execution = ExecutionSpec::from(template);
+        execution.env = template.render_env(&params).map_err(Error::Invalid)?;
+        execution.env.insert(GOLDEN_PHASE.into(), "seed".into());
+        execution.lifecycle = Default::default();
+        execution.mounts = template.render_mounts(&params).map_err(Error::Invalid)?;
+        execution.mounts[0].volume_id = Some(volume.id.clone());
+        self.environment.validate_execution(&execution)?;
+        let (_, image_digest) = template
+            .image
+            .rsplit_once('@')
+            .ok_or_else(|| Error::Invalid("Golden requires a digest-pinned image".into()))?;
+        let recipe = PrewarmRecipe {
+            snapshot_id: "pending".into(),
+            image_digest: image_digest.into(),
+            restore_profile_digest: restore_digest(template)?,
+            handoff_contract_version: TEMPLATE_HANDOFF_VERSION.into(),
+            restore_env: [(GOLDEN_PHASE.into(), "restore".into())].into(),
+        };
+        recipe.validate(&template.image).map_err(Error::Invalid)?;
+        let mut seed = SeedExecution {
+            execution,
+            volume,
+            native_input: None,
+        };
+        seed.native_input = self.environment.freeze_preparation(tenant, &id, &seed)?;
+        Ok(PreparationJob {
+            id,
+            tenant: tenant.into(),
+            template: template.name.clone(),
+            version: template.version.clone(),
+            seed,
+            recipe,
+        })
     }
 
     pub fn start_snapshot_preparations(self: &Arc<Self>) {
-        // A deployment may stop admitting new jobs while older jobs still carry
-        // a durable seed. Keep reconciling those jobs without reading the profile.
-        let period = if self.seed_profiles.is_empty() { 15 } else { 3 };
         let service = Arc::downgrade(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(period));
+            let mut interval = tokio::time::interval(Duration::from_secs(3));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
@@ -390,7 +205,21 @@ impl Activator {
                         }
                         let mut recipe = job.recipe.clone();
                         recipe.snapshot_id = snapshot_id;
-                        recipe.validate(&job.seed.execution.image).map(|()| recipe)
+                        if let Err(reason) = recipe.validate(&job.seed.execution.image) {
+                            Err(reason)
+                        } else if recipe.handoff_contract_version == TEMPLATE_HANDOFF_VERSION {
+                            match self.protect_golden(&job.tenant, &recipe.snapshot_id).await {
+                                Ok(()) => Ok(recipe),
+                                Err(Error::Conflict(reason))
+                                    if reason == "Golden snapshot is retiring" =>
+                                {
+                                    Err(reason)
+                                }
+                                Err(_) => continue,
+                            }
+                        } else {
+                            Ok(recipe)
+                        }
                     }
                     Ok(Ok(SeedResult::Failed)) => {
                         Err("Platform snapshot preparation failed".into())

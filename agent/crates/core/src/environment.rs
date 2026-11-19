@@ -67,7 +67,6 @@ impl ExecutionSpec {
             isolation_runtime: self.isolation_runtime.clone(),
             prewarm_recipe: None,
             auto_prepare_snapshot: false,
-            golden_seed_profile: None,
             snapshot_preparation: None,
             env: self.env.clone(),
             resources: self.resources.clone(),
