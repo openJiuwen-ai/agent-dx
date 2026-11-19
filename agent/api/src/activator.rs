@@ -422,6 +422,7 @@ impl ActivatorClient {
             &PublishRequest {
                 tenant: tenant.into(),
                 template: template.clone(),
+                publication_id: ctx.publication_id().map(str::to_owned),
             },
             true,
             None,

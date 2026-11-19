@@ -167,6 +167,7 @@ pub(super) async fn register(
             "apiserver.register_snapshot_preparation",
             client.register_snapshot_preparation(trace::inject(
                 pb::RegisterSnapshotPreparationRequest {
+                    fixed_id: None,
                     caller: Some(caller.clone()),
                     name,
                     resources: Some(resources),

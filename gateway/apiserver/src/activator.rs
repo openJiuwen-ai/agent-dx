@@ -10,6 +10,16 @@ use tonic::{Code, Status};
 
 #[async_trait]
 impl EnvironmentApplication for EnvironmentService {
+    async fn prepare_snapshot_request(
+        &self,
+        tenant: &str,
+        id: &str,
+        input: Value,
+    ) -> Result<adx_agent_core::prewarm::SeedResult, EnvironmentError> {
+        Box::pin(self.prepare_snapshot(id, input, &caller(tenant)))
+            .await
+            .map_err(|error| map_status(error, true))
+    }
     async fn snapshot_metadata(
         &self,
         tenant: &str,

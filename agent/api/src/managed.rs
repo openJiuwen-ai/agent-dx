@@ -109,6 +109,28 @@ impl ManagedService {
         .await
     }
 
+    /// Management reads include the mutable preparation projection and never use a cached pending result.
+    pub async fn template_view(
+        &self,
+        ctx: &RequestContext,
+        tenant: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<TemplateVersion> {
+        for value in [tenant, name, version] {
+            identifier(value, "template scope").map_err(Error::Invalid)?;
+        }
+        ctx.run(async {
+            let value = self.control.template(ctx, tenant, name, version).await?;
+            if value.name != name || value.version != version {
+                return Err(Error::Unavailable("template identity mismatch".into()));
+            }
+            value.validate().map_err(Error::Invalid)?;
+            Ok(value)
+        })
+        .await
+    }
+
     pub async fn binding_template(
         &self,
         ctx: &RequestContext,

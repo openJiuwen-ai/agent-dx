@@ -4,6 +4,7 @@ pub mod environment_request;
 pub mod local_environment;
 pub mod reconciliation;
 pub mod server;
+pub mod snapshot_preparation;
 pub mod transport;
 use adx_agent_core::environment::{
     Environment, EnvironmentError, EnvironmentObservation, EnvironmentPhase,
@@ -48,6 +49,8 @@ pub struct Activator {
     bindings: Mutex<LinkedHashMap<Scope, Binding>>,
     cache: CacheSettings,
     subscription_ready: std::sync::atomic::AtomicBool,
+    seed_profiles:
+        std::collections::BTreeMap<(String, String), snapshot_preparation::ConfiguredSeedProfile>,
 }
 
 /// Whether the Environment referenced by `current_env_id` is dormant right now:
@@ -90,6 +93,7 @@ impl Activator {
             bindings: Mutex::new(LinkedHashMap::new()),
             cache: CacheSettings::default(),
             subscription_ready: std::sync::atomic::AtomicBool::new(true),
+            seed_profiles: Default::default(),
         }
     }
     /// Returns Invalid for a zero idle timeout. Capacity zero disables the cache.
@@ -296,19 +300,36 @@ impl Activator {
         tenant: &str,
         template: &adx_agent_core::TemplateDraft,
     ) -> Result<TemplateVersion> {
+        self.publish_with_id(tenant, template, None).await
+    }
+    pub async fn publish_with_id(
+        &self,
+        tenant: &str,
+        template: &adx_agent_core::TemplateDraft,
+        publication_id: Option<&str>,
+    ) -> Result<TemplateVersion> {
         template.validate().map_err(Error::Invalid)?;
+        if let Some(id) = publication_id {
+            if let Some(existing) = self.state.publication(tenant, template, id).await? {
+                return Ok(existing);
+            }
+        }
         let snapshot = template.with_version("1".into());
         let mut execution: adx_agent_core::environment::ExecutionSpec = (&snapshot).into();
         // Mount syntax is checked at publication; concrete paths require Binding parameters.
         execution.mounts.clear();
         self.environment.validate_execution(&execution)?;
+        let job = template
+            .auto_prepare_snapshot
+            .then(|| self.seed_job(tenant, template))
+            .transpose()?;
         if snapshot.prewarm_recipe.is_some() && !self.golden_available(tenant, &snapshot).await? {
             return Err(Error::Invalid(
                 "Golden snapshot is not ready or compatible".into(),
             ));
         }
         self.state
-            .publish(tenant, template)
+            .publish_with_preparation(tenant, template, job.as_ref(), publication_id)
             .await
             .map_err(Into::into)
     }

@@ -61,10 +61,49 @@ impl AgentState {
         tenant: &str,
         draft: &adx_agent_core::TemplateDraft,
     ) -> Result<TemplateVersion> {
+        self.publish_with_preparation(tenant, draft, None, None)
+            .await
+    }
+    pub async fn publication(
+        &self,
+        tenant: &str,
+        draft: &adx_agent_core::TemplateDraft,
+        id: &str,
+    ) -> Result<Option<TemplateVersion>> {
+        adx_agent_core::identifier(id, "publication idempotency key").map_err(Error::Invalid)?;
+        let key = Key::new("template-publication", &[tenant, id])?;
+        let Some(record) = self.store.get(&key).await? else {
+            return Ok(None);
+        };
+        let version = record.decode::<TemplateVersion>()?;
+        if draft.with_version(version.version.clone()) != version {
+            return Err(Error::Conflict(
+                "publication idempotency key was used for another draft".into(),
+            ));
+        }
+        self.project_preparation(tenant, &version).await.map(Some)
+    }
+    pub async fn publish_with_preparation(
+        &self,
+        tenant: &str,
+        draft: &adx_agent_core::TemplateDraft,
+        preparation: Option<&PreparationJob>,
+        publication_id: Option<&str>,
+    ) -> Result<TemplateVersion> {
         adx_agent_core::identifier(tenant, "tenant").map_err(Error::Invalid)?;
         draft.validate().map_err(Error::Invalid)?;
+        if draft.auto_prepare_snapshot != preparation.is_some() {
+            return Err(Error::Invalid(
+                "automatic preparation job is required for this draft".into(),
+            ));
+        }
         let sequence_key = Key::new("template-sequence", &[tenant, &draft.name])?;
         for _ in 0..limits::CAS_ATTEMPTS {
+            if let Some(id) = publication_id {
+                if let Some(replayed) = self.publication(tenant, draft, id).await? {
+                    return Ok(replayed);
+                }
+            }
             let previous = self.store.get(&sequence_key).await?;
             let last = previous
                 .as_ref()
@@ -77,24 +116,46 @@ impl AgentState {
             let template = draft.with_version(next.to_string());
             let key = Key::new("template", &[tenant, &template.name, &template.version])?;
             let expected = previous.as_ref().map(|record| record.revision.clone());
-            if self
-                .store
-                .commit(&Transaction::new(
-                    vec![
-                        Check {
-                            key: sequence_key.clone(),
-                            expected: expected.clone(),
-                        },
-                        Check {
-                            key: key.clone(),
-                            expected: None,
-                        },
-                    ],
-                    vec![put(&sequence_key, &next)?, put(&key, &template)?],
-                )?)
-                .await?
-            {
+            let mut checks = vec![
+                Check {
+                    key: sequence_key.clone(),
+                    expected: expected.clone(),
+                },
+                Check {
+                    key: key.clone(),
+                    expected: None,
+                },
+            ];
+            let mut puts = vec![put(&sequence_key, &next)?, put(&key, &template)?];
+            if let Some(job) = preparation {
+                let job = PreparationJob {
+                    tenant: tenant.into(),
+                    template: template.name.clone(),
+                    version: template.version.clone(),
+                    ..job.clone()
+                };
+                let key = crate::snapshot_preparation::pending_key(&job)?;
+                puts.push(put(&key, &job)?);
+                checks.push(Check {
+                    key,
+                    expected: None,
+                });
+            }
+            if let Some(id) = publication_id {
+                let key = Key::new("template-publication", &[tenant, id])?;
+                puts.push(put(&key, &template)?);
+                checks.push(Check {
+                    key,
+                    expected: None,
+                });
+            }
+            if self.store.commit(&Transaction::new(checks, puts)?).await? {
                 return Ok(template);
+            }
+            if let Some(id) = publication_id {
+                if let Some(replayed) = self.publication(tenant, draft, id).await? {
+                    return Ok(replayed);
+                }
             }
             let observed = self.store.get(&sequence_key).await?;
             if observed.as_ref().map(|record| &record.revision) == expected.as_ref() {
@@ -133,7 +194,7 @@ impl AgentState {
             })
             .await
         {
-            Ok(template) => Ok(Some(template.clone())),
+            Ok(template) => self.project_preparation(tenant, template).await.map(Some),
             Err(None) => Ok(None),
             Err(Some(error)) => Err(error),
         }

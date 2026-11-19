@@ -23,10 +23,12 @@ impl LocalControl {
         environment: Arc<dyn Environment>,
     ) -> Result<Self> {
         let store = RedisRepository::connect(redis_url, namespace, Duration::from_secs(3)).await?;
-        Ok(Self::new(Arc::new(Activator::new(
-            AgentState::new(Arc::new(store)),
-            environment,
-        ))))
+        let activator = Arc::new(
+            Activator::new(AgentState::new(Arc::new(store)), environment)
+                .with_deployed_seed_profiles()?,
+        );
+        activator.start_snapshot_preparations();
+        Ok(Self::new(activator))
     }
 
     pub fn new(activator: Arc<Activator>) -> Self {
@@ -42,10 +44,11 @@ impl LocalControl {
         registration: adx_activator::registration::RegistrationConfig,
     ) -> Result<Self> {
         let store = RedisRepository::connect(redis_url, namespace, Duration::from_secs(3)).await?;
-        let activator = Arc::new(Activator::new(
-            AgentState::new(Arc::new(store.clone())),
-            environment,
-        ));
+        let activator = Arc::new(
+            Activator::new(AgentState::new(Arc::new(store.clone())), environment)
+                .with_deployed_seed_profiles()?,
+        );
+        activator.start_snapshot_preparations();
         let reconciliation = adx_activator::reconciliation::Reconciliation::start(
             activator.clone(),
             store,
@@ -121,7 +124,9 @@ impl Control for LocalControl {
         template: &adx_agent_core::TemplateDraft,
     ) -> Result<TemplateVersion> {
         ctx.start_write();
-        self.activator.publish(tenant, template).await
+        self.activator
+            .publish_with_id(tenant, template, ctx.publication_id())
+            .await
     }
     async fn template(
         &self,

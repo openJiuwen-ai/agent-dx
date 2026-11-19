@@ -410,6 +410,59 @@ impl HttpEnvironment {
 }
 #[async_trait]
 impl Environment for HttpEnvironment {
+    async fn prepare_snapshot(
+        &self,
+        tenant: &str,
+        id: &str,
+        seed: &adx_agent_core::prewarm::SeedExecution,
+    ) -> Result<adx_agent_core::prewarm::SeedResult, EnvironmentError> {
+        let input = environment_request::seed_input(tenant, id, seed, self.timeout, &self.network)?;
+        let key = self.api_keys.get(tenant).ok_or_else(|| {
+            EnvironmentError::Unavailable("Platform tenant credential is not configured".into())
+        })?;
+        let invalid = || EnvironmentError::Invalid("invalid snapshot preparation URL".into());
+        let mut url = self
+            .base
+            .join("/api/environment/v1/snapshot-preparations/")
+            .map_err(|_| invalid())?;
+        url.path_segments_mut()
+            .map_err(|_| invalid())?
+            .pop_if_empty()
+            .push(id);
+        let unknown =
+            || EnvironmentError::OutcomeUnknown("snapshot preparation result unknown".into());
+        let mut response = self
+            .client
+            .put(url)
+            .bearer_auth(key)
+            .timeout(self.timeout)
+            .json(&input)
+            .send()
+            .await
+            .map_err(|_| unknown())?;
+        if !response.status().is_success() {
+            return Err(match response.status() {
+                StatusCode::BAD_REQUEST => {
+                    EnvironmentError::Invalid("Platform rejected the seed specification".into())
+                }
+                _ => unknown(),
+            });
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| unknown())? {
+            if chunk.len() > limits::HTTP_JSON_BYTES.saturating_sub(body.len()) {
+                return Err(unknown());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&body).map_err(|_| unknown())?;
+        let data = value
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(unknown)?;
+        let decoded = STANDARD.decode(data).map_err(|_| unknown())?;
+        serde_json::from_slice(&decoded).map_err(|_| unknown())
+    }
     async fn golden_available(
         &self,
         tenant: &str,

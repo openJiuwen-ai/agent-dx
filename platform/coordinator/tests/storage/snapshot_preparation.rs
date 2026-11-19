@@ -11,6 +11,51 @@ fn resources() -> Resources {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
+async fn fixed_native_registration_replays_after_terminal_state_and_is_tenant_fenced() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    let id = "47cb1f37-3b07-4093-be93-894e54275a4e";
+    let name = format!("adx-agent-{id}-{}", "a".repeat(64));
+    let (a, b) = tokio::join!(
+        session.register_snapshot_preparation_with_id("tenant", &name, resources(), Some(id)),
+        session.register_snapshot_preparation_with_id("tenant", &name, resources(), Some(id))
+    );
+    assert_eq!(a.unwrap(), b.unwrap());
+    session
+        .update_snapshot_template(id, |template| {
+            template.preparation.state = PreparationState::Failed;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (family, build) = session
+        .register_snapshot_preparation_with_id("tenant", &name, resources(), Some(id))
+        .await
+        .unwrap();
+    assert_eq!(family.id, id);
+    assert_eq!(build.id, id);
+    assert_eq!(build.state, PreparationState::Failed);
+    let changed = format!("adx-agent-{id}-{}", "b".repeat(64));
+    assert_eq!(
+        session
+            .register_snapshot_preparation_with_id("tenant", &changed, resources(), Some(id))
+            .await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        session
+            .register_snapshot_preparation_with_id("foreign", &name, resources(), Some(id))
+            .await,
+        Err(Error::Conflict)
+    );
+    assert!(session
+        .register_snapshot_preparation("tenant", &name, resources())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
 async fn preparation_registration_is_serial_and_preserves_family_identity() {
     let rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();

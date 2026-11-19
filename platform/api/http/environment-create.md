@@ -62,6 +62,18 @@ owned by the caller. The caller is responsible for keeping tenant/user state
 out of any checkpoint intended for reuse across users. The kind classifies
 the resulting reusable snapshot; it does not scrub its contents.
 
+`PUT /api/environment/v1/snapshot-preparations/{uuid}` is the native asynchronous
+preparation entry used by the Agent worker. Its JSON body contains `environment`
+(native create shape, inherited entrypoint, a readiness probe, no `snapshotId`)
+and `volume` (dedicated exclusive directory Volume `adx-agent-seed-{uuid}`). The
+source must mount only that Volume. The API Server uses the caller's tenant,
+pins the ensured Volume UID in the start request, and uses the UUID for both the
+Platform family and build. The decoded `data.status` is `pending`, `ready` (with
+`snapshot_id`), or `failed`. Retry with the same UUID and same input after an
+unknown result. The caller owns the anonymity of the supplied seed. Platform
+reconciles capture and source Environment cleanup; a source Volume referenced by
+the snapshot remains protected by normal Volume retention rules.
+
 `inheritEntrypoint=true` is a fresh-create option, not a snapshot override.
 Combining it with `snapshotId` is rejected with HTTP 400, matching the native
 Python SDK. For snapshot restores, omit it or supply `false`: neither disables

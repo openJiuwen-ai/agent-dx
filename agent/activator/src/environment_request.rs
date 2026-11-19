@@ -168,6 +168,25 @@ pub fn create_input(
     Ok(input)
 }
 
+pub(crate) fn seed_input(
+    tenant: &str,
+    id: &str,
+    seed: &adx_agent_core::prewarm::SeedExecution,
+    timeout: Duration,
+    network: &SandboxNetworkPolicy,
+) -> Result<Value, EnvironmentError> {
+    let request = CreateEnvironment {
+        tenant: tenant.into(),
+        id: format!("adx-{id}"),
+        execution: seed.execution.clone(),
+        deadline_unix_ms: None,
+        creation_attempt: 0,
+    };
+    let mut environment = create_input(&request, timeout, network)?;
+    environment["idleTimeoutSeconds"] = json!(0);
+    Ok(json!({"environment":environment, "volume":seed.volume}))
+}
+
 fn readiness_probe_input(
     probe: &adx_agent_core::probes::ReadinessProbe,
 ) -> Result<Value, EnvironmentError> {

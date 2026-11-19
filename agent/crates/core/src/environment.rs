@@ -66,6 +66,8 @@ impl ExecutionSpec {
             image: self.image.clone(),
             isolation_runtime: self.isolation_runtime.clone(),
             prewarm_recipe: None,
+            auto_prepare_snapshot: false,
+            snapshot_preparation: None,
             env: self.env.clone(),
             resources: self.resources.clone(),
             lifecycle: self.lifecycle.clone(),
@@ -178,6 +180,16 @@ pub struct EnvironmentInfo {
 }
 #[async_trait]
 pub trait Environment: Send + Sync {
+    async fn prepare_snapshot(
+        &self,
+        _tenant: &str,
+        _job_id: &str,
+        _seed: &crate::prewarm::SeedExecution,
+    ) -> Result<crate::prewarm::SeedResult, EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "snapshot preparation unavailable".into(),
+        ))
+    }
     /// Returns whether the tenant can currently use this fixed Golden input.
     async fn golden_available(
         &self,

@@ -55,13 +55,37 @@ impl PrewarmRecipe {
     }
 }
 
-fn sha256(value: &str) -> bool {
+pub fn sha256(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(|hex| {
         hex.len() == 64
             && hex
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SnapshotPreparation {
+    Pending,
+    Ready,
+    Failed { reason: String },
+}
+
+/// Fixed and sanitized execution input, captured in the publication transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedExecution {
+    pub execution: crate::environment::ExecutionSpec,
+    pub volume: crate::volumes::VolumeSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SeedResult {
+    Pending,
+    Ready { snapshot_id: String },
+    Failed,
 }
 
 /// Only supplied by an authenticated product entrypoint; timestamp is from account storage.

@@ -110,7 +110,11 @@ async fn publish(
     Json(r): Json<PublishRequest>,
 ) -> Response {
     p.start_write();
-    match s.activator.publish(&r.tenant, &r.template).await {
+    match s
+        .activator
+        .publish_with_id(&r.tenant, &r.template, r.publication_id.as_deref())
+        .await
+    {
         Ok(template) => Json(template).into_response(),
         Err(e) => failure(e),
     }

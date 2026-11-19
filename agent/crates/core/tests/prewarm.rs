@@ -3,6 +3,25 @@ use adx_agent_core::TemplateDraft;
 use serde_json::json;
 
 #[test]
+fn automatic_preparation_is_opt_in_and_excludes_a_manual_recipe() {
+    let mut input = json!({"name":"assistant", "image":"assistant:1", "isolation_runtime":"runsc",
+       "resources":{"cpu_millis":1000,"memory_mib":2048}});
+    let manual: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
+    assert!(!manual.auto_prepare_snapshot);
+    input["auto_prepare_snapshot"] = json!(true);
+    let bad: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
+    assert!(bad.validate().is_err());
+    let digest = format!("sha256:{}", "a".repeat(64));
+    input["image"] = json!(format!("assistant@{digest}"));
+    let automatic: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
+    assert!(automatic.validate().is_ok());
+    input["prewarm_recipe"] = json!({"snapshot_id":"existing", "image_digest":digest,
+        "restore_profile_digest":digest, "handoff_contract_version":"1"});
+    let conflicting: TemplateDraft = serde_json::from_value(input).unwrap();
+    assert!(conflicting.validate().is_err());
+}
+
+#[test]
 fn prewarm_requires_a_fixed_digest_and_a_restore_only_environment() {
     let hex = "a".repeat(64);
     let digest = format!("sha256:{hex}");

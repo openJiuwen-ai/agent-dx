@@ -738,7 +738,12 @@ impl SnapshotPreparationService for CoordinatorRpc {
         };
         let session = self.preparation_session().await.map_err(status)?;
         let (template, build) = session
-            .register_snapshot_preparation(&caller.tenant_id, &request.name, resources)
+            .register_snapshot_preparation_with_id(
+                &caller.tenant_id,
+                &request.name,
+                resources,
+                request.fixed_id.as_deref(),
+            )
             .await
             .map_err(status)?;
         Ok(Response::new(view(&template, &build, None)))

@@ -60,11 +60,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?,
     );
-    let activator = Arc::new(Activator::with_cache(
-        AgentState::new(store.clone()),
-        environment,
-        settings.binding_cache,
-    )?);
+    let activator = Arc::new(
+        Activator::with_cache(
+            AgentState::new(store.clone()),
+            environment,
+            settings.binding_cache,
+        )?
+        .with_deployed_seed_profiles()?,
+    );
+    activator.start_snapshot_preparations();
     let app = server::router(
         activator.clone(),
         &std::env::var("ADX_ACTIVATOR_SERVICE_TOKEN")?,

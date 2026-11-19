@@ -13,6 +13,16 @@ use std::{sync::Arc, time::Duration};
 /// authenticates the caller before passing its tenant to this private interface.
 #[async_trait]
 pub trait EnvironmentApplication: Send + Sync {
+    async fn prepare_snapshot_request(
+        &self,
+        _tenant: &str,
+        _id: &str,
+        _input: Value,
+    ) -> Result<adx_agent_core::prewarm::SeedResult, EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "snapshot preparation unavailable".into(),
+        ))
+    }
     async fn snapshot_metadata(
         &self,
         _tenant: &str,
@@ -87,6 +97,22 @@ impl LocalEnvironment {
 }
 #[async_trait]
 impl Environment for LocalEnvironment {
+    async fn prepare_snapshot(
+        &self,
+        tenant: &str,
+        id: &str,
+        seed: &adx_agent_core::prewarm::SeedExecution,
+    ) -> Result<adx_agent_core::prewarm::SeedResult, EnvironmentError> {
+        let input = environment_request::seed_input(tenant, id, seed, self.timeout, &self.network)?;
+        tokio::time::timeout(
+            self.timeout,
+            self.application.prepare_snapshot_request(tenant, id, input),
+        )
+        .await
+        .map_err(|_| {
+            EnvironmentError::OutcomeUnknown("snapshot preparation result unknown".into())
+        })?
+    }
     async fn golden_available(
         &self,
         tenant: &str,

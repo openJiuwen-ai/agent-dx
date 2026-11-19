@@ -26,6 +26,8 @@ message RegisterSnapshotPreparationRequest {
   CallerContext caller = 1;
   string name = 2;
   Resources resources = 4;
+  // Native callers reuse this fixed UUID for both family and preparation.
+  optional string fixed_id = 5;
 }
 message StartSnapshotPreparationRequest {
   CallerContext caller = 1;

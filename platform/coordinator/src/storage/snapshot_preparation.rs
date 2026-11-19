@@ -230,12 +230,37 @@ impl Session {
         name: &str,
         resources: adx_core::Resources,
     ) -> Result<(SnapshotTemplate, SnapshotPreparation)> {
+        self.register_snapshot_preparation_with_id(tenant, name, resources, None)
+            .await
+    }
+
+    pub async fn register_snapshot_preparation_with_id(
+        &self,
+        tenant: &str,
+        name: &str,
+        resources: adx_core::Resources,
+        fixed_id: Option<&str>,
+    ) -> Result<(SnapshotTemplate, SnapshotPreparation)> {
         validate_template_tenant(tenant)?;
         let name = normalize_name(name)?;
         resources.validate()?;
+        if fixed_id.is_some_and(|id| {
+            !valid_preparation_id(id)
+                || !name
+                    .strip_prefix(&format!("adx-agent-{id}-"))
+                    .is_some_and(|digest| {
+                        digest.len() == 64
+                            && digest
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    })
+        }) || fixed_id.is_none() && name.starts_with("adx-agent-")
+        {
+            return Err(Error::Invalid("invalid native preparation identity".into()));
+        }
         let created_at_unix_ms = adx_core::observation::now_millis()?;
         let preparation = SnapshotPreparation {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: fixed_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned),
             created_at_unix_ms,
             updated_at_unix_ms: created_at_unix_ms,
             resources,
@@ -246,7 +271,7 @@ impl Session {
             error: None,
             cleanup_pending: false,
         };
-        let fresh_id = uuid::Uuid::new_v4().to_string();
+        let fresh_id = fixed_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
         let index = name_field(tenant, &name)?;
         for _ in 0..ATTEMPTS {
             let indexed = self
@@ -270,6 +295,26 @@ impl Session {
                 return Err(Error::Unavailable(
                     "snapshot template index mismatch".into(),
                 ));
+            }
+            if let (Some(id), Some(template)) = (fixed_id, &existing) {
+                if template.deleted
+                    || template.id != id
+                    || template.preparation.id != id
+                    || template.preparation.resources != resources
+                {
+                    return Err(Error::Conflict);
+                }
+                return Ok((template.clone(), template.preparation.clone()));
+            }
+            // A fixed identity must never override a record from another tenant.
+            if let Some(id) = fixed_id {
+                if self
+                    .snapshot_preparation_field(self.snapshot_templates_key(), id)
+                    .await?
+                    .is_some()
+                {
+                    return Err(Error::Conflict);
+                }
             }
             let mut next = existing
                 .as_ref()

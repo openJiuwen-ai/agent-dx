@@ -10,6 +10,8 @@ Activator 创建请求统一携带内置 `restartPolicy`：最多重启 3 次，
 
 独立进程启动读取 `ADX_ACTIVATOR_CONFIG` 指向的 JSON，示例见 [local.json](examples/local.json)。入口服务凭据为 `ADX_ACTIVATOR_SERVICE_TOKEN`。`environment_url` 指向 API Server（示例端口 8081 须与其 `listen` 配置一致），`environment_api_key_envs` 将租户映射到保存该租户 Platform API Key 的环境变量名，例如 `{"tenant":"ADX_PLATFORM_TENANT_API_KEY"}`。这里的 Platform API Key 用于 Environment 管理，与最终用户的模型 API Key 无关。凭据内容不写入 JSON；未配置租户的查询返回 NotFound，创建/删除在提交请求前返回 Unavailable。每项 key 必须属于对应租户，不能使用跨租户管理员 key；现有查询响应不含租户字段，Activator 无法独立验证配置归属。HTTP 明文必须显式允许，否则客户端需要 TLS 和受信任 CA。
 
+隔离环境可通过 IaC 的 `golden_auto_prepare` 将 DigitalMate 规则以 JSON 文件交付给 `ADX_GOLDEN_SEED_PROFILES`。独立和嵌入 Activator 均支持同一文件；嵌入部署需在其进程显式设置文件路径。规则由部署方按租户和模板配置，用户请求不能提交种子规格。只有 `auto_prepare_snapshot=true` 的模板发布创建任务。发布和任务入队同事务；后台扫描持久队列，超时沿原任务重试；管理查询读取模板及制备结果。集群需同时运行支持原生制备接口的 API Server 和 Coordinator。
+
 内部端点统一为 POST `/internal/adx/v1/`：
 
 | 后缀 | 请求 | 行为 |
@@ -33,11 +35,11 @@ Activator 创建请求统一携带内置 `restartPolicy`：最多重启 3 次，
 
 `/health/live` 表示进程存活；未启用别名收敛时 ready 表示启动完成，后续存储故障由回源明确返回。启用收敛时 ready 还要求订阅恢复和初始扫描完成；断线期间 alias 缓存不作为最新状态。不会周期全表扫描或进行 Environment 健康轮询；成员续租与列表刷新独立运行。
 
-发布文件使用 TemplateDraft，不含 version。每次成功发布生成新数字版本（即使内容相同），响应返回完整 TemplateVersion；发布超时可能已经分配编号，不能自动重放，应通过受控管理通路核对序列及模板记录。序列按 tenant/template 隔离，并与快照原子提交；旧数据必须先经运维转换，服务不会自动编号旧字符串版本。
+发布文件使用 TemplateDraft，不含 version。不带发布幂等键时每次成功发布生成新数字版本（即使内容相同）。有 `Idempotency-Key` 时沿原键重放返回原版本；没有键的超时应查询权威记录。序列按 tenant/template 隔离，并与快照原子提交；旧数据必须先经运维转换，服务不会自动编号旧字符串版本。
 
 ## 激活缓存
 
-模板缓存位于 Activator 持有的 AgentState，按 tenant/name/version 隔离，容量 1024，采用 FIFO。模板成功读合并在途请求；模板缺失或存储错误不作为结果缓存。Gateway 也保留同样的不可变模板缓存。
+模板缓存位于 Activator 持有的 AgentState，按 tenant/name/version 隔离，容量 1024，采用 FIFO。模板成功读合并在途请求；模板缺失或存储错误不作为结果缓存。Gateway 也保留同样的不可变模板缓存；版本管理查询和首次预热决议读取制备结果，不会永久缓存 pending。
 
 AgentBinding 缓存按完整 scope 保存已确认的 Target（含 generation、environment_id、service），采用 LRU 和滑动 TTL。`binding_cache.capacity` 默认 200000，设为 0 禁用；`binding_cache.idle_seconds` 默认 18000（5 小时），必须为正。每次命中更新最近访问顺序和时间；持续访问可以无限续期。闲置过期只在下一次请求访问时检查，不触发后台工作。容量满时淘汰最久未访问的条目，不删除权威 AgentBinding 或 Environment。
 

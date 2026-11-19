@@ -79,6 +79,8 @@ pub struct TemplateRequest {
 pub struct PublishRequest {
     pub tenant: String,
     pub template: crate::TemplateDraft,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_id: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -510,6 +510,75 @@ paths:
           $ref: "#/components/responses/Error"
         default:
           $ref: "#/components/responses/Error"
+  /api/environment/v1/snapshot-preparations/{preparationId}:
+    put:
+      tags: [Snapshots]
+      operationId: prepareSnapshot
+      summary: Ensure a fixed asynchronous Golden preparation
+      description: Replay the same UUID and input after transport ambiguity. The caller supplies an anonymous seed.
+      parameters:
+        - name: preparationId
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [environment, volume]
+              properties:
+                environment: {$ref: "#/components/schemas/CreateEnvironmentRequest"}
+                volume:
+                  type: object
+                  additionalProperties: false
+                  required: [id, source, access_mode, create_if_missing]
+                  properties:
+                    id: {type: string, description: "Must be adx-agent-seed-{preparationId}."}
+                    source:
+                      type: object
+                      additionalProperties: false
+                      required: [type, storage_domain, path]
+                      properties:
+                        type: {const: directory}
+                        storage_domain: {type: string}
+                        path: {type: string}
+                    access_mode: {const: exclusive}
+                    create_if_missing: {const: true}
+                    create_options:
+                      type: object
+                      additionalProperties: false
+                      required: [uid, gid, mode]
+                      properties:
+                        uid: {type: integer, minimum: 0}
+                        gid: {type: integer, minimum: 0}
+                        mode: {type: string, pattern: '^0[0-7]{3}$'}
+      responses:
+        "200":
+          description: Current preparation state; pending is not an available snapshot.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: string
+                        contentEncoding: base64
+                        contentMediaType: application/json
+                        contentSchema:
+                          type: object
+                          required: [status]
+                          properties:
+                            status: {type: string, enum: [pending, ready, failed]}
+                            snapshot_id: {type: string, description: Present when ready.}
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
   /api/environment/v1/snapshots:
     get:
       tags: [Snapshots]

@@ -182,6 +182,8 @@ pub struct TemplateDraft {
     pub name: String,
     pub image: String,
     pub isolation_runtime: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_prepare_snapshot: bool,
     /// Optional verified restore recipe. Selecting it requires a product start decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prewarm_recipe: Option<prewarm::PrewarmRecipe>,
@@ -214,6 +216,10 @@ pub struct TemplateVersion {
     pub version: String,
     pub image: String,
     pub isolation_runtime: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_prepare_snapshot: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_preparation: Option<prewarm::SnapshotPreparation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prewarm_recipe: Option<prewarm::PrewarmRecipe>,
     #[serde(default)]
@@ -240,6 +246,17 @@ pub struct TemplateVersion {
 
 impl TemplateDraft {
     pub fn validate(&self) -> ValidationResult {
+        if self.auto_prepare_snapshot
+            && (self.prewarm_recipe.is_some()
+                || !self
+                    .image
+                    .rsplit_once('@')
+                    .is_some_and(|(_, digest)| prewarm::sha256(digest)))
+        {
+            return Err(
+                "automatic preparation requires a fixed image and no manual Golden recipe".into(),
+            );
+        }
         self.with_version("1".into()).validate()
     }
     /// Attach the server-assigned version to this immutable publication snapshot.
@@ -249,6 +266,10 @@ impl TemplateDraft {
             name: self.name.clone(),
             image: self.image.clone(),
             isolation_runtime: self.isolation_runtime.clone(),
+            auto_prepare_snapshot: self.auto_prepare_snapshot,
+            snapshot_preparation: self
+                .auto_prepare_snapshot
+                .then_some(prewarm::SnapshotPreparation::Pending),
             prewarm_recipe: self.prewarm_recipe.clone(),
             env: self.env.clone(),
             resources: self.resources.clone(),
@@ -268,7 +289,12 @@ impl From<&TemplateVersion> for TemplateDraft {
             name: template.name.clone(),
             image: template.image.clone(),
             isolation_runtime: template.isolation_runtime.clone(),
-            prewarm_recipe: template.prewarm_recipe.clone(),
+            auto_prepare_snapshot: template.auto_prepare_snapshot,
+            prewarm_recipe: if template.auto_prepare_snapshot {
+                None
+            } else {
+                template.prewarm_recipe.clone()
+            },
             env: template.env.clone(),
             resources: template.resources.clone(),
             lifecycle: template.lifecycle.clone(),

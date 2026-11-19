@@ -290,6 +290,30 @@ impl Api {
             };
             return response(result, &request_id, None, None, method == "DELETE");
         }
+        if method == "PUT" {
+            if let Some(id) = path.strip_prefix("/api/environment/v1/snapshot-preparations/") {
+                let input = match body(request.into_body(), 1_048_576).await {
+                    Ok(value) => value,
+                    Err(error) => return error_response(error, &request_id, None, None, false),
+                };
+                return response(
+                    Box::pin(
+                        self.environment_service
+                            .prepare_snapshot(id, input, &caller),
+                    )
+                    .await
+                    .and_then(|result| {
+                        serde_json::to_value(result).map_err(|_| {
+                            Status::internal("snapshot preparation response encoding failed")
+                        })
+                    }),
+                    &request_id,
+                    None,
+                    None,
+                    true,
+                );
+            }
+        }
         if method == "GET" && path == "/api/environment/v1/capabilities" {
             return plain(200, json!({"capabilities": ["workload-probes-v1"]}));
         }
