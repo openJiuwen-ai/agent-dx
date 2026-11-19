@@ -650,25 +650,14 @@ fn percent(used: u64, total: u64) -> u8 {
 
 fn memory_pressure() -> Result<u8> {
     let total = memory_info("MemTotal:")?;
-    let mut memory_percent = percent(total.saturating_sub(memory_info("MemAvailable:")?), total);
-    for (path, v2) in cgroups()? {
-        let (limit, usage) = if v2 {
-            ("memory.max", "memory.current")
-        } else {
-            ("memory.limit_in_bytes", "memory.usage_in_bytes")
-        };
-        if let Some(limit) = optional(&path.join(limit))?.filter(|v| v.trim() != "max") {
-            let used = std::fs::read_to_string(path.join(usage)).map_err(unavailable)?;
-            memory_percent = memory_percent.max(percent(
-                used.trim().parse().map_err(invalid)?,
-                limit.trim().parse().map_err(invalid)?,
-            ));
-        }
-    }
-    Ok(memory_percent)
+    Ok(percent(
+        total.saturating_sub(memory_info("MemAvailable:")?),
+        total,
+    ))
 }
 
-/// Sample enabled resources. Disk sampling requires a path when enabled.
+/// Sample enabled resources. Memory pressure uses the node's `/proc/meminfo`;
+/// disk sampling requires a path when enabled.
 /// Returns an error if an enabled resource cannot be observed.
 pub fn pressure(resources: PressureResources, disk_path: Option<&Path>) -> Result<Pressure> {
     let memory_percent = if resources.memory_enabled {
