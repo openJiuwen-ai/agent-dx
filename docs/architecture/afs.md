@@ -1143,12 +1143,16 @@ Home 节点的本地盘上，不做复制。每台需要读该名字视图的节
 消费方只能跳过并告警，不得猜测兜底。
 
 **节点侧（已实现）**：每节点跑一份镜像 worker：在 tmpfs 名字层收敛
-`/public/<name> -> <import_root>/<home>/users` 软链，自动维护对端（NFS）与
+`/public/<name> -> <import_root>/<home>/users/<name>` 软链，自动维护对端（NFS）与
 本机（bind）的 import 挂载；mountinfo 只读诊断随轮输出，配置硬前提（独立
 tmpfs、宿主 mount namespace、`mount(2)` 权限）在启动时 fail-closed 校验。
 没有运行期数据回收：删除契约以 Home 侧物理目录的原子判空为决策点（非空返回
-`ENOTEMPTY` 并回滚），提交后删除不会留下"待回收"的目录，残余目录（旧版本产生）由启动
-reconcile（有 Meta 全量视角）收敛，非空残余保留 catalog 记录并告警，等待人工清理。
+`ENOTEMPTY` 并回滚，Meta、catalog 与缓存都不改变），提交后删除不会留下"待回收"的目录。
+启动 reconcile 是唯一的收敛点，并且不得 `rmdir` 原生命名目录——它可能承载业务数据，
+也可能已是下一代 workspace 的活目录。catalog 有记录而 Meta 已无该 root 时，reconcile
+只丢弃 catalog 记录并告警，目录原地保留，重新具备被纳管扫描接管的资格。因此 catalog
+记录的语义是"该目录已被纳管"的准入判据，不是回收证据：留下的幽灵记录会永久挡住
+该名字的纳管与删除，只能靠人工删除 catalog 文件解锁。
 
 `/public` 下的 `.pub`（原子发布的暂存目录）与 `.quarantine`（消费方违约时的
 隔离区）归镜像所有，不能作为 workspace 名：创建时即拒（`EINVAL`）。快照里若
@@ -1167,12 +1171,13 @@ tmpfs 上无限堆积隔离目录，最终 ENOSPC 让整个名字层发布失败
 挂载访问失效对端是阻塞而非报错，发布只写软链、从不访问 target）。源格式读不
 出来时不参与比对，避免每轮重挂。
 
-**名字按字节传递，不做 UTF-8 归一**：workspace 名是任意字节串（Linux 路径分量
-不是 UTF-8），OwnerFs 用 `root-<hex(bytes)>` 无损编码，镜像从 root id 解码后
-必须原样用于 `symlinkat`。若中间转成 `String`（例如 `to_string_lossy`），每个
-非法字节会变成 U+FFFD，既改掉调用方创建的名字，又会让两个仅差非法字节的名字
-塌成同一条（`BTreeMap` 键冲突，静默丢一个 workspace）。因此 `Action`、`present`
-表与 `scan_public` 的键都是 `OsString`，收敛判据也按字节比较。
+**名字按字节传递，发布要求 UTF-8**：workspace 名是任意字节串（Linux 路径分量
+不是 UTF-8），OwnerFs 用 `root-<hex(bytes)>` 无损编码。镜像的 `Action`、`present`
+表与 `scan_public` 键仍是 `OsString`，按字节比较与删除；但发布 `symlinkat` 的
+目标路径需要 UTF-8 文本，因此本轮**只发布合法 UTF-8 名字**，从 root id 解码后
+`to_str()` 失败即跳过并告警，不生成 U+FFFD 替换版本。API 创建路径先拒绝非 ASCII
+（`validate_owner`），所以这类 root 只能来自外部手工目录或旧数据；扫描纳管同样
+跳过非 ASCII 名。
 
 Home 侧对外 NFS 导出（OwnerFs egress）不在本能力范围内，仍由部署面或独立分支
 提供。

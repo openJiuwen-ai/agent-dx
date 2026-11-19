@@ -187,7 +187,11 @@ impl BindingService {
 }
 #[allow(clippy::result_large_err)]
 fn validate(r: &UpdateBindingRequest) -> Result<(), Status> {
-    if r.environment_id.trim().is_empty() || r.ownership_generation == 0 || r.binding_revision == 0
+    // Revision zero only reserves an owned, never-started assignment. Its first
+    // retirement must be able to advance to revision one without a collision.
+    if r.environment_id.trim().is_empty()
+        || r.ownership_generation == 0
+        || (r.binding_revision == 0 && !matches!(r.binding, Some(Binding::Suspended(_))))
     {
         return Err(Status::invalid_argument("versioned binding required"));
     }
@@ -198,6 +202,12 @@ fn validate(r: &UpdateBindingRequest) -> Result<(), Status> {
             Ok(())
         }
         Some(Binding::Retired(_)) => Ok(()),
+        Some(Binding::Suspended(t))
+            if !t.runtime_id.trim().is_empty()
+                && (t.ip.is_empty() || t.ip.parse::<IpAddr>().is_ok()) =>
+        {
+            Ok(())
+        }
         _ => Err(Status::invalid_argument("valid binding target required")),
     }
 }
@@ -209,7 +219,10 @@ fn check_version(
     if let Some(old) = old {
         let a = (old.ownership_generation, old.binding_revision);
         let b = (new.ownership_generation, new.binding_revision);
-        if b < a || (b == a && old.binding != new.binding) {
+        let availability = matches!((&old.binding, &new.binding),
+            (Some(Binding::Active(a)), Some(Binding::Suspended(b)))
+            | (Some(Binding::Suspended(a)), Some(Binding::Active(b))) if a == b);
+        if b < a || (b == a && old.binding != new.binding && !availability) {
             return Err(Status::failed_precondition(
                 "stale or conflicting binding version",
             ));

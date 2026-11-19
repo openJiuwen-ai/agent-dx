@@ -46,6 +46,37 @@ physical devices and a future expiry; `0` above is an expired placeholder. A
 missing/invalid update uses the last observation until expiry, then closes new
 admission. The file reader is separate from the implemented sandboxd collector and automatic capacity source. Do not publish a configured resource budget as a measurement.
 
+The optional Adxlet `pressure` configuration has independent `memory_enabled`
+and `disk_enabled` switches, both defaulting to `true`. Only enabled resources
+are sampled and their thresholds validated. Disk sampling observes the filesystem
+at `disk_path`; this path is required only when `disk_enabled` is `true`.
+The default high/low thresholds are 90%/80% for both resources: any enabled
+resource reaching its high threshold closes pressure admission, and all enabled
+resources falling to or below their low thresholds reopens it. A failed sample or sampling
+task emits a warning and opens the pressure gate, resetting its hysteresis.
+Failed rounds retain the last successful pressure snapshot and increment the
+consecutive failure count. The next successful round starts fresh hysteresis
+for each resource.
+After sampling resumes, a new high-threshold observation is required to close
+it again. Resource reservations, maintenance and the other node admission
+checks continue to apply independently. See [node pressure](../../../docs/testing/node-lifecycle.md)
+for the resource and admission contract.
+
+For memory-only pressure, set the Adxlet service's `config.pressure` to:
+
+```yaml
+memory_enabled: true
+disk_enabled: false
+thresholds:
+  memory_high_percent: 90
+  memory_low_percent: 80
+```
+
+Disabled resources do not participate in pressure isolation, recovery or
+automatic Pause. Their pressure metrics and heartbeat resource fields are
+omitted. Setting both switches to `false` disables pressure sampling and its
+gauge family. Capacity and device observation use `resource_source` separately.
+
 Node startup obtains the complete authoritative catalog before reconciling
 managed runtimes. It restores committed running Environments and cleans runtimes
 confirmed unowned or left by uncommitted starts. An unavailable Coordinator never
@@ -101,12 +132,12 @@ For S3-compatible, AFS, or JuiceFS checkpoint storage, replace `checkpoint_dir` 
 
 Configure matching `checkpoint_reclaimers` on Coordinator for every shared storage alias. Coordinator deletes shared objects/directories; adxlet only manages local files and cache eviction. AFS requires the same DFS namespace mounted on Coordinator and workers.
 
-Cross-node Resume/Recover and planned migration require capture-time recovery evidence. In the Adxlet service's `config`, explicitly set `checkpoint_runtime_binaries: {runsc: /absolute/path/to/runsc}` to the executable actually configured in sandboxd. An empty map allows local checkpoint use but leaves new captures without a cross-node recovery profile. This opt-in qualifies default-rootfs runsc on homogeneous Linux hosts. Each node measures executable bytes, rootfs identity, kernel release and stable CPU identity/features and publishes reserved `ADX_RECOVERY_*` and `ADX_CHECKPOINT_SCOPE` labels. Keep the measured inputs immutable throughout the node session. Custom roots, other runtimes and heterogeneous host compatibility remain unqualified.
+Cross-node Resume/Recover and planned migration require capture-time recovery evidence. In the Adxlet service's `config`, explicitly set `checkpoint_runtime_binaries: {runsc: /absolute/path/to/runsc}` to the executable actually configured in sandboxd. An empty map allows local checkpoint use but leaves new captures without a cross-node recovery profile. This opt-in qualifies the deployment default-rootfs runsc profile. Each node measures executable bytes and rootfs identity and publishes reserved `ADX_RECOVERY_*` and `ADX_CHECKPOINT_SCOPE` labels. Host kernel release, CPU model and `/proc/cpuinfo` flags are not exact-match placement requirements; runsc validates the checkpoint's required CPU features during restore. Keep the measured inputs immutable throughout the node session. Custom roots and other runtimes remain unqualified; a platform profile match does not prove that a runtime restore will succeed.
 
 Prepare the recovery pool before updating Coordinator:
 
-1. Stage compatible adxlet targets with enough reserved capacity outside the old Coordinator's scheduling pool. Keep the old compatible pool available during preparation. In staging, check the registered `ADX_RECOVERY_HOST`, `ADX_RECOVERY_RUNTIME_runsc`, `ADX_RECOVERY_ROOTFS_SHA256`, `ADX_RECOVERY_ROOTFS_PATH`, and `ADX_CHECKPOINT_SCOPE` against the approved capture profile and storage namespace. The old Coordinator's wire schema discards `recovery_profile`. Its scheduler can send legacy artifacts to an updated target that rejects them.
-2. Inventory every shared checkpoint that must survive an immediate source loss. Use audited records of the original capture to establish its host/kernel/CPU profile, runtime binary, rootfs, and backend namespace. Supply missing fields through Coordinator's `legacy_checkpoint_proofs` list, matching the recorded alias, location, size, runtime class and source runtime ID. If the original capture cannot be verified, resume on the original compatible source and recapture under independently verified conditions while the old pool remains available. Record that capture's evidence separately for the transition proof because the old Coordinator cannot persist its profile. Keep the existing deployment while any checkpoint that requires continuity still lacks reliable evidence. Measurements from newly registered targets only qualify those targets.
+1. Stage compatible adxlet targets with enough reserved capacity outside the old Coordinator's scheduling pool. Keep the old compatible pool available during preparation. In staging, check the registered `ADX_RECOVERY_RUNTIME_runsc`, `ADX_RECOVERY_ROOTFS_SHA256`, `ADX_RECOVERY_ROOTFS_PATH`, and `ADX_CHECKPOINT_SCOPE` against the approved capture profile and storage namespace. The old Coordinator's wire schema discards `recovery_profile`. Its scheduler can send legacy artifacts to an updated target that rejects them.
+2. Inventory every shared checkpoint that must survive an immediate source loss. Use audited records of the original capture to establish its runtime binary, rootfs, and backend namespace. Supply missing fields through Coordinator's `legacy_checkpoint_proofs` list, matching the recorded alias, location, size, runtime class and source runtime ID. If the original capture cannot be verified, resume on the original compatible source and recapture under independently verified conditions while the old pool remains available. Record that capture's evidence separately for the transition proof because the old Coordinator cannot persist its profile. Keep the existing deployment while any checkpoint that requires continuity still lacks reliable evidence. Measurements from newly registered targets only qualify those targets.
 3. Update Coordinator with the verified proofs, then register and admit the measured targets. Verify that newly captured points persist their profile and scope. Exercise recovery with the source unavailable before expanding the rollout. Proofs qualify only ordinary cross-node Resume/Recover. Planned migration still requires evidence in its source restore point. Remove transition proofs as their restore points are replaced or retired. A legacy point without capture evidence or a matching proof still requires its original compatible owner.
 
 `node-jiuwenbox.json` 是 Jiuwenbox／Conch 的 adxlet 配置示例；替换 EROFS SHA256、Conch socket、镜像绑定和证书路径后使用。Linux 前置条件、配置语义及未完成的运行时验收见 [Jiuwenbox P0](../../../docs/testing/jiuwenbox-runtime.md)。

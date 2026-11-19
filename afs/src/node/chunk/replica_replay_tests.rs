@@ -160,7 +160,6 @@ fn p2_w3_uncontrolled_sixteen_requests_report_actual_groups_and_barriers() {
         "persist_chunks_dir_sync",
         "persist_catalog_write",
         "persist_catalog_sync",
-        "persist_catalog_parent_sync",
     ] {
         assert_eq!(
             calls(phase),
@@ -168,6 +167,11 @@ fn p2_w3_uncontrolled_sixteen_requests_report_actual_groups_and_barriers() {
             "actual successful {phase} must match WAL groups"
         );
     }
+    assert_eq!(
+        calls("persist_catalog_parent_sync"),
+        1,
+        "the catalog name becomes durable on the first successful group"
+    );
     assert_eq!(calls("persist_body_sync"), 16);
     for (index, receipt) in &receipts {
         assert_eq!(receipt.operation_id, staged[*index].operation_id);
@@ -213,6 +217,60 @@ fn p2_w3_uncontrolled_sixteen_requests_report_actual_groups_and_barriers() {
         );
         assert_eq!(&output[..64], item.bytes());
         assert_eq!(output[64], 0);
+    }
+}
+
+#[test]
+fn p2_w3_serial_groups_sync_catalog_name_once_and_recover_all_receipts() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = afs_metrics::Registry::new();
+    let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry)
+        .unwrap()
+        .with_read_diagnostics(true);
+    let store = LocalChunkStore::open(temp.path(), "node-a")
+        .unwrap()
+        .with_read_work_metrics(metrics.clone());
+    let staged: Vec<_> = (0..3)
+        .map(|index| {
+            StagedChunk::new(
+                OperationId::new(format!("serial-group-{index}")),
+                vec![31 + index; 64],
+            )
+        })
+        .collect();
+    for (index, item) in staged.iter().enumerate() {
+        let receipt = store.put(item.clone()).unwrap();
+        assert_eq!(receipt.durable_acks[0].catalog_revision, index as u64 + 1);
+    }
+    assert_eq!(store.catalog_commit_stats().groups, 3);
+    let snapshot = metrics.diagnostics_snapshot().unwrap();
+    for (phase, expected) in [
+        ("persist_body_sync", 3),
+        ("persist_chunks_dir_sync", 3),
+        ("persist_catalog_write", 3),
+        ("persist_catalog_sync", 3),
+        ("persist_catalog_parent_sync", 1),
+    ] {
+        assert_eq!(
+            snapshot
+                .coarse_phases
+                .iter()
+                .find(|item| item.phase == phase)
+                .unwrap()
+                .calls,
+            expected,
+            "unexpected barrier count for {phase} across three serial groups"
+        );
+    }
+    drop(store);
+    let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+    for item in staged {
+        let mut output = [0; 64];
+        assert_eq!(
+            recovered.read_at(&item.chunk.id, 0, &mut output).unwrap(),
+            64
+        );
+        assert_eq!(output.as_slice(), item.bytes());
     }
 }
 

@@ -219,6 +219,23 @@ mod tests {
     async fn activity_burst_updates_stream_without_lifecycle_revision_change() {
         use adx_protocol::runtime_stream::execution_token;
         use adxlet::control_stream::RuntimeControlHub;
+        const ISOLATED_ENV: &str = "ADX_EXECD_CONTROL_ACTIVITY_TEST_ISOLATED";
+        if std::env::var_os(ISOLATED_ENV).is_none() {
+            // Other command tests can leave their process-wide activity alive.
+            // Keep one active here to prove that the stream fixture is isolated.
+            let _unrelated_command = activity::enter_command();
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .arg("runtime::control_stream::tests::activity_burst_updates_stream_without_lifecycle_revision_change")
+            .arg("--exact")
+            .arg("--test-threads=1")
+            .env(ISOLATED_ENV, "1")
+            .status()
+            .expect("run isolated activity stream test");
+            assert!(status.success(), "isolated activity stream test failed");
+            return;
+        }
         let identity = RuntimeIdentity {
             environment_id: "activity".into(),
             runtime_id: "activity-1".into(),

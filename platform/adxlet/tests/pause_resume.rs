@@ -597,7 +597,7 @@ async fn replacing_checkpoint_cleans_previous_only_after_retry_publishes() {
 }
 
 #[tokio::test]
-async fn restarted_node_prunes_only_after_authoritative_reconciliation() {
+async fn restarted_node_prunes_from_authority_without_waiting_for_instance_publication() {
     let (temp, backend, node, spec, assignment) = fixture();
     let h = node.environment(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
@@ -632,7 +632,9 @@ async fn restarted_node_prunes_only_after_authoritative_reconciliation() {
         .reconcile(vec![paused.record.clone()])
         .await
         .is_err());
-    assert!(orphan.exists());
+    assert!(!orphan.exists());
+    assert!(Path::new(&retained).exists());
+    assert!(foreign.exists());
     *backend.unavailable_commit.lock().unwrap() = false;
     restored.reconcile(vec![paused.record]).await.unwrap();
     assert!(!orphan.exists());
@@ -1228,7 +1230,7 @@ async fn pause_confirms_cleanup_when_checkpoint_reply_precedes_source_exit() {
 }
 
 #[tokio::test]
-async fn authoritative_paused_record_with_missing_local_artifact_becomes_failed() {
+async fn missing_local_artifact_is_checked_on_restore_instead_of_startup() {
     let (temp, backend, node, spec, assignment) = fixture();
     let handle = node.environment(spec.clone(), assignment.clone()).unwrap();
     let running = handle.create().await.unwrap();
@@ -1246,16 +1248,31 @@ async fn authoritative_paused_record_with_missing_local_artifact_becomes_failed(
         backend.clone(),
     )
     .unwrap();
-    restarted.reconcile(vec![paused.record]).await.unwrap();
-    let result = restarted
-        .environment(spec, assignment)
-        .unwrap()
-        .sync()
-        .await
+    restarted
+        .update_capacity(spec.resources, Duration::from_secs(60))
         .unwrap();
-    assert_eq!(result.record.state, EnvironmentState::Failed);
+    restarted.reconcile(vec![paused.record]).await.unwrap();
+    assert!(restarted.accepting_allocations());
+    let handle = restarted.environment(spec, assignment).unwrap();
+    let idle = handle.sync().await.unwrap();
+    assert_eq!(idle.record.state, EnvironmentState::Paused);
+    assert_eq!(
+        handle
+            .resume(resume(idle.record.revision))
+            .await
+            .unwrap_err(),
+        Error::NotFound
+    );
+    let result = handle.sync().await.unwrap();
+    assert_eq!(result.record.state, EnvironmentState::Paused);
     assert!(!result.record.resources_held);
     assert!(backend.running.lock().unwrap().is_empty());
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == "restore"));
 }
 
 #[tokio::test]

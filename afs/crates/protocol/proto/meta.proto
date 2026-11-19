@@ -192,6 +192,9 @@ message ReserveRootRequest {
   string parent_root_id = 7;
   string create_intent_id = 8;
   ReserveConflictPolicy conflict_policy = 9;
+  // Keep preferred_home_node_id even when load balancing is enabled. Used by
+  // startup adoption, where the data already lives on the scanning node.
+  bool pin_home = 10;
 }
 
 message ReserveRootReply {

@@ -349,6 +349,16 @@ pub trait Routes: Send + Sync {
         Ok(())
     }
 
+    /// Preserve ownership/version while withholding a temporarily unavailable route.
+    async fn suspend(&self, _record: &EnvironmentRecord) -> Result<()> {
+        Ok(())
+    }
+    /// Seed a complete recovery snapshot without exposing the execution yet.
+    /// An already synchronized live session may retain its existing bindings.
+    async fn seed_recovery(&self, record: &EnvironmentRecord) -> Result<()> {
+        self.suspend(record).await
+    }
+
     async fn retire_orphan(&self, _runtime: &RuntimeObservation) -> Result<()> {
         Err(Error::Unavailable(
             "orphan binding retirement is unsupported".into(),
@@ -521,6 +531,7 @@ pub struct Adxlet {
     draining: Arc<std::sync::atomic::AtomicBool>,
     stopping: Arc<std::sync::atomic::AtomicBool>,
     lifecycle_ready: Arc<tokio::sync::RwLock<bool>>,
+    recovery: Arc<tokio::sync::Mutex<()>>,
     authority_reconciling: Arc<std::sync::atomic::AtomicBool>,
     authority_initialized: Arc<std::sync::atomic::AtomicBool>,
     /// Set once at startup when node pressure sampling is configured; the
@@ -555,6 +566,7 @@ impl Adxlet {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stopping: stopping.clone(),
             lifecycle_ready: Arc::new(tokio::sync::RwLock::new(true)),
+            recovery: Arc::default(),
             authority_reconciling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authority_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pressure_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -598,9 +610,18 @@ impl Adxlet {
     /// sampling keeps failing stays visible through the gauge values
     /// (never-observed stamp plus a growing failure count) instead of
     /// vanishing together with the series.
-    pub fn mark_pressure_configured(&self) {
-        self.pressure_configured
-            .store(true, std::sync::atomic::Ordering::Release);
+    pub fn mark_pressure_configured(&self, resources: resources::PressureResources) {
+        let mut board = self
+            .services
+            .pressure
+            .write()
+            .expect("pressure board lock poisoned");
+        board.memory.enabled = resources.memory_enabled;
+        board.disk.enabled = resources.disk_enabled;
+        self.pressure_configured.store(
+            resources.any_enabled(),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// Injects static admission configuration for pressure-triggered pauses.
@@ -769,9 +790,7 @@ impl Adxlet {
             .pressure
             .write()
             .expect("pressure board lock poisoned") = update.state.clone();
-        if update.state.memory.level == resources::PressureLevel::High
-            || update.state.disk.level == resources::PressureLevel::High
-        {
+        if update.state.has_high_pressure() {
             let _ = self.services.pressure_signal.send(());
         }
     }
@@ -811,6 +830,7 @@ impl Adxlet {
             .expect("shared state lock poisoned");
         !admission.maintenance
             && !admission.pressure
+            && admission.ledger.used().fits(&admission.ledger.capacity())
             && admission
                 .runtime_classes
                 .as_ref()

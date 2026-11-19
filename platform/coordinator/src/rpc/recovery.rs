@@ -294,7 +294,6 @@ mod tests {
         assert!(checkpoint_spec(&other, Some(&point), None, &BTreeSet::new(), None).is_err());
         for key in [
             "ADX_CHECKPOINT_SCOPE",
-            "ADX_RECOVERY_HOST",
             "ADX_RECOVERY_RUNTIME_runsc",
             "ADX_RECOVERY_ROOTFS_SHA256",
         ] {
@@ -312,6 +311,19 @@ mod tests {
         point = fixture().1;
         point.artifact.scope.clear();
         assert!(checkpoint_spec(&stored, Some(&point), None, &BTreeSet::new(), None).is_err());
+    }
+
+    #[test]
+    fn checkpoint_filters_leave_host_cpu_compatibility_to_runtime() {
+        let (stored, mut point, mut target) = fixture();
+        point.recovery_profile.remove("ADX_RECOVERY_HOST");
+        target.labels.remove("ADX_RECOVERY_HOST");
+        let request = checkpoint_spec(&stored, Some(&point), None, &BTreeSet::new(), None).unwrap();
+        assert!(request.scheduling.matches_node(&target.labels));
+        target
+            .labels
+            .insert("ADX_RECOVERY_HOST".into(), "different-host".into());
+        assert!(request.scheduling.matches_node(&target.labels));
     }
 
     async fn report_recovery_target(state: &mut State) {

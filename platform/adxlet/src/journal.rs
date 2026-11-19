@@ -7,22 +7,34 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct Pending {
+/// A completed local result and its inseparable publication evidence.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JournaledResult {
     #[serde(flatten)]
-    record: EnvironmentRecord,
+    pub record: EnvironmentRecord,
     #[serde(default)]
-    stopped_runtime_ids: Vec<String>,
+    pub stopped_runtime_ids: Vec<String>,
     #[serde(default)]
-    cleanup_artifacts: Vec<CheckpointArtifact>,
+    pub cleanup_artifacts: Vec<CheckpointArtifact>,
 }
-impl std::ops::Deref for Pending {
+impl JournaledResult {
+    pub(crate) fn authorized_by(&self, current: &EnvironmentRecord) -> bool {
+        current.assignment == self.assignment
+            && (!matches!(
+                current.state,
+                adx_core::EnvironmentState::Failed | adx_core::EnvironmentState::Deleted
+            ) || current.resources_held
+                || current.restart_pending
+                || !self.stopped_runtime_ids.is_empty())
+    }
+}
+impl std::ops::Deref for JournaledResult {
     type Target = EnvironmentRecord;
     fn deref(&self) -> &Self::Target {
         &self.record
     }
 }
-type Entry = (i64, Pending);
+type Entry = (i64, JournaledResult);
 
 pub struct JournalSink {
     path: PathBuf,
@@ -132,7 +144,7 @@ impl JournalSink {
         stopped_runtime_ids: &[String],
         cleanup_artifacts: &[CheckpointArtifact],
     ) -> Result<Durability> {
-        let record = Pending {
+        let record = JournaledResult {
             record: record.clone(),
             stopped_runtime_ids: stopped_runtime_ids.to_vec(),
             cleanup_artifacts: cleanup_artifacts.to_vec(),
@@ -151,9 +163,9 @@ impl JournalSink {
                 rows.next().map_err(unavailable)?.map(|row| row.get::<_,String>(0)).transpose().map_err(unavailable)?
             };
             if let Some(previous) = previous {
-                let old: Pending = serde_json::from_str(&previous).map_err(unavailable)?;
+                let old: JournaledResult = serde_json::from_str(&previous).map_err(unavailable)?;
                 if old == record { return Ok(Durability::Journaled); }
-                if old.record != record.record && (old.assignment != record.assignment || old.spec != record.spec || old.revision >= record.revision) {
+                if old.record != record.record && (old.assignment != record.assignment || !old.spec.matches_immutable_fields(&record.spec) || old.revision >= record.revision) {
                     return Err(Error::Conflict);
                 }
             }
@@ -175,7 +187,7 @@ impl JournalSink {
         Ok(Durability::Journaled)
     }
 
-    async fn publish_entry(&self, pending: &Pending) -> Result<Durability> {
+    async fn publish_entry(&self, pending: &JournaledResult) -> Result<Durability> {
         if pending.cleanup_artifacts.is_empty() {
             self.upstream
                 .commit_releasing(&pending.record, &pending.stopped_runtime_ids)
@@ -217,42 +229,31 @@ impl JournalSink {
         Ok(self.entries(None).await?.len())
     }
 
-    /// Register the current process with Coordinator, then supply its complete node
-    /// catalog. Discard obsolete ownership; replay each remaining result in order.
-    /// The caller must fetch a fresh catalog after this before reconciling runtime.
-    pub async fn recover(&self, catalog: &[EnvironmentRecord]) -> Result<()> {
+    /// Read complete pending results before rebuilding execution reservations.
+    /// No upstream publication occurs here. Fresh authority may revoke entries,
+    /// but their local facts are returned for cleanup accounting, never ownership.
+    /// Each Controller later replays its original ordered entries when it syncs.
+    pub async fn recover(&self, catalog: &[EnvironmentRecord]) -> Result<Vec<JournaledResult>> {
         let mut ready = self.ready.write().await;
         *ready = false;
-        for (sequence, record) in self.entries(None).await? {
-            match catalog.iter().find(|r| r.spec.id == record.spec.id) {
-                Some(current)
-                    if current.assignment == record.assignment
-                        && current.spec == record.spec
-                        && (!matches!(
-                            current.state,
-                            adx_core::EnvironmentState::Failed
-                                | adx_core::EnvironmentState::Deleted
-                        ) || current.resources_held
-                            || current.restart_pending
-                            || !record.stopped_runtime_ids.is_empty()) =>
-                {
-                    if current.revision == record.revision && current != &record.record {
-                        return Err(Error::Conflict);
-                    }
-                    if (current.revision < record.revision
-                        || current.revision == record.revision
-                            && !record.stopped_runtime_ids.is_empty())
-                        && self.publish_entry(&record).await? != Durability::Published
-                    {
-                        return Err(unavailable("recovery result is not published"));
-                    }
-                }
-                _ => (), // The authoritative catalog no longer grants this ownership.
+        let mut pending_results = BTreeMap::new();
+        for (sequence, pending) in self.entries(None).await? {
+            pending_results.insert(pending.spec.id.clone(), pending.clone());
+            let Some(current) = catalog.iter().find(|r| r.spec.id == pending.spec.id) else {
+                self.acknowledge(sequence).await?;
+                continue;
+            };
+            let owned = pending.authorized_by(current);
+            let confirmed = current == &pending.record
+                && pending.stopped_runtime_ids.is_empty()
+                && pending.cleanup_artifacts.is_empty();
+            if !owned || current.revision > pending.revision || confirmed {
+                self.acknowledge(sequence).await?;
+                continue;
             }
-            self.acknowledge(sequence).await?;
         }
         *ready = true;
-        Ok(())
+        Ok(pending_results.into_values().collect())
     }
 
     /// A live, already reconciled node may retry publication after a heartbeat.
@@ -349,7 +350,7 @@ impl JournalSink {
                 || latest.stopped_runtime_ids != stopped_runtime_ids
                 || latest.cleanup_artifacts != cleanup_artifacts)
                 && (latest.assignment != record.assignment
-                    || latest.spec != record.spec
+                    || !latest.spec.matches_immutable_fields(&record.spec)
                     || latest.revision >= record.revision)
             {
                 return Err(Error::Conflict);
@@ -358,7 +359,7 @@ impl JournalSink {
         let result = self.publish(pending).await;
         match result {
             Ok(()) => match self
-                .publish_entry(&Pending {
+                .publish_entry(&JournaledResult {
                     record: record.clone(),
                     stopped_runtime_ids: stopped_runtime_ids.to_vec(),
                     cleanup_artifacts: cleanup_artifacts.to_vec(),

@@ -81,6 +81,20 @@ pub trait CheckpointAccess: Send + Sync {
     /// The caller must still commit authoritative metadata before acknowledging.
     async fn seal(&self, staged: &Path) -> Result<CheckpointArtifact>;
     async fn prepare_restore(&self, artifact: &CheckpointArtifact) -> Result<RestoreAccess>;
+    /// Protect an execution's reference without reading or materializing its files.
+    /// Backends without a reusable cache rely on the authoritative retention catalog.
+    async fn protect_execution(
+        &self,
+        _artifact: &CheckpointArtifact,
+    ) -> Result<Box<dyn Send + Sync>> {
+        Ok(Box::new(()))
+    }
+    /// Protect inputs of an already running execution. Existing copies need not
+    /// be rehashed; missing necessary inputs may be materialized and verified.
+    /// Restore must use prepare_restore instead.
+    async fn retain_execution(&self, artifact: &CheckpointArtifact) -> Result<RestoreAccess> {
+        self.prepare_restore(artifact).await
+    }
     async fn release(&self, artifact: &CheckpointArtifact) -> Result<()>;
     /// The authoritative result references the published artifact; upload staging
     /// may now be reclaimed independently of downloaded execution files.
@@ -93,6 +107,12 @@ pub trait CheckpointAccess: Send + Sync {
     /// Admission is closed and backend reconciliation has completed. Only remove
     /// node-private unreferenced files, never cluster-shared objects.
     async fn reconcile_local(&self, _retained: &[CheckpointArtifact]) -> Result<()> {
+        Ok(())
+    }
+    /// All active execution inputs are protected. Retry private cache maintenance
+    /// without sweeping local capture directories against an older catalog.
+    /// Transient filesystem errors may be returned and retried independently.
+    async fn maintain_cache(&self) -> Result<()> {
         Ok(())
     }
 }

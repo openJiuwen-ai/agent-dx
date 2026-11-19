@@ -1,10 +1,295 @@
 use super::*;
+#[tokio::test]
+async fn startup_recovers_independent_executions_with_bounded_concurrency() {
+    let backend = Arc::new(Backend::default());
+    backend.block_readiness.store(true, Ordering::SeqCst);
+    let records = (0..8)
+        .map(|i| record(&format!("e{i}"), EnvironmentState::Running))
+        .collect::<Vec<_>>();
+    *backend.actual.lock().unwrap() = records.iter().map(|r| observed(&r.spec.id)).collect();
+    let node = Arc::new(Adxlet::new(
+        "n".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    ));
+    node.update_capacity(
+        Resources {
+            cpu_millis: 1000,
+            memory_bytes: 1000,
+            disk_bytes: 0,
+        },
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    let recovery = tokio::spawn({
+        let node = node.clone();
+        async move { node.reconcile(records).await }
+    });
+    let parallel = tokio::time::timeout(Duration::from_millis(200), async {
+        while backend.readiness_active.load(Ordering::SeqCst) < 4 {
+            backend.readiness_entered.notified().await;
+        }
+    })
+    .await;
+    let peak = backend.readiness_peak.load(Ordering::SeqCst);
+    backend.block_readiness.store(false, Ordering::SeqCst);
+    backend.readiness_release.notify_waiters();
+    recovery.await.unwrap().unwrap();
+    parallel.expect("independent recoveries must make progress concurrently");
+    assert_eq!(peak, 4, "startup must bound concurrent backend recovery");
+}
+
+#[tokio::test]
+async fn startup_does_not_validate_unused_paused_checkpoint() {
+    use adxlet::checkpoint::{CheckpointAccess, RestoreAccess};
+    struct DeferredValidation {
+        inner: LocalCheckpointStore,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl CheckpointAccess for DeferredValidation {
+        async fn begin_capture(&self) -> Result<std::path::PathBuf> {
+            self.inner.begin_capture().await
+        }
+        async fn discard_staged(&self, path: &std::path::Path) -> Result<()> {
+            self.inner.discard_staged(path).await
+        }
+        async fn retain_staged(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<adx_core::CheckpointArtifact> {
+            self.inner.retain_staged(path).await
+        }
+        async fn seal(&self, path: &std::path::Path) -> Result<adx_core::CheckpointArtifact> {
+            self.inner.seal(path).await
+        }
+        async fn prepare_restore(
+            &self,
+            artifact: &adx_core::CheckpointArtifact,
+        ) -> Result<RestoreAccess> {
+            self.inner.prepare_restore(artifact).await
+        }
+        async fn release(&self, artifact: &adx_core::CheckpointArtifact) -> Result<()> {
+            self.inner.release(artifact).await
+        }
+        async fn validate_artifact(&self, _: &adx_core::CheckpointArtifact) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("busy")];
+    let root = tempfile::tempdir().unwrap();
+    let previous = checkpoint_node(&backend, root.path());
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("busy", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority.cycle(&previous).await.unwrap();
+    let paused = pause(&previous, record("busy", EnvironmentState::Running)).await;
+    *authority.authority.records.lock().unwrap() = vec![paused.try_into().unwrap()];
+    let storage = Arc::new(DeferredValidation {
+        inner: LocalCheckpointStore::new(root.path().to_owned()).unwrap(),
+        calls: Default::default(),
+    });
+    let node = Adxlet::new(
+        "n".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(storage.clone(), backend)
+    .unwrap();
+    node.update_capacity(
+        Resources {
+            cpu_millis: 1000,
+            memory_bytes: 1000,
+            disk_bytes: 0,
+        },
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    let mut fresh = authority::Fixture::new().await;
+    *fresh.authority.records.lock().unwrap() = authority.authority.records.lock().unwrap().clone();
+    tokio::time::timeout(Duration::from_millis(200), fresh.cycle(&node))
+        .await
+        .expect("unused checkpoint validation must not block node admission")
+        .unwrap();
+    assert!(node.accepting_allocations());
+    assert_eq!(storage.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn recovery_limits_new_allocations_without_blocking_healthy_control_or_holding_the_gate() {
+    let backend = Arc::new(Backend::default());
+    backend.block_remove.store(true, Ordering::SeqCst);
+    backend.actual.lock().unwrap().push(observed("orphan"));
+    backend.actual.lock().unwrap().push(observed("healthy"));
+    let node = Arc::new(authority::manager(backend.clone()));
+    let mut authority = authority::Fixture::new().await;
+    let mut healthy = record("healthy", EnvironmentState::Running);
+    healthy.spec.run_policy = Some(adx_core::environment_control::RunPolicy {
+        timeout_seconds: 3600,
+        action: adx_core::environment_control::RunExpiryAction::Delete,
+    });
+    authority
+        .authority
+        .records
+        .lock()
+        .unwrap()
+        .push(healthy.clone().try_into().unwrap());
+    let recovery = tokio::spawn({
+        let node = node.clone();
+        async move { authority.cycle(&node).await }
+    });
+    backend.remove_entered.notified().await;
+    let rpc = adxlet::rpc::NodeRpc::new(node.clone(), Peers::network(), "session".into());
+    let mut request = tonic::Request::new(pb::NodeGetEnvironmentControlRequest {
+        assignment: Some(healthy.assignment.try_into().unwrap()),
+        caller: Some(pb::CallerContext {
+            tenant_id: "t".into(),
+            administrator: false,
+        }),
+        node_session_id: "session".into(),
+    });
+    request
+        .metadata_mut()
+        .insert("adx-component", "coordinator".parse().unwrap());
+    let control = tokio::time::timeout(
+        Duration::from_millis(100),
+        rpc.get_environment_control(request),
+    )
+    .await;
+    assert!(!node.accepting_allocations());
+    backend.block_remove.store(false, Ordering::SeqCst);
+    backend.remove_release.notify_one();
+    recovery.await.unwrap().unwrap();
+    control
+        .expect("healthy RPC must not wait for orphan cleanup")
+        .unwrap();
+    assert!(node.accepting_allocations());
+}
+
+#[tokio::test]
+async fn session_reconciliation_adopts_newer_paused_authority_without_restart() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("busy")];
+    let root = tempfile::tempdir().unwrap();
+    let node = checkpoint_node(&backend, root.path());
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("busy", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority.cycle(&node).await.unwrap();
+    let mut advanced = pause(&node, record("busy", EnvironmentState::Running)).await;
+    advanced.revision += 1;
+    advanced.last_operation = None;
+    *authority.authority.records.lock().unwrap() = vec![advanced.clone().try_into().unwrap()];
+    authority
+        .authority
+        .requires_handshake
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        authority.cycle(&node).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    authority.cycle(&node).await.unwrap();
+    let handle = node
+        .environment(advanced.spec.clone(), advanced.assignment.clone())
+        .unwrap();
+    assert_eq!(handle.sync().await.unwrap().record, advanced);
+    authority.cycle(&node).await.unwrap();
+    assert!(node.accepting_allocations());
+    assert!(backend.actual.lock().unwrap().is_empty());
+}
+
 use adx_protocol::{
     auth::Peers,
     control::{self as pb, node_service_server::NodeService},
 };
 use adxlet::checkpoint::{CheckpointCooperation, LocalCheckpointStore};
 use std::sync::atomic::Ordering;
+
+#[tokio::test]
+async fn older_paused_catalog_replays_journaled_resume_without_stopping_execution() {
+    check_journaled_resume_authority(false).await;
+}
+
+#[tokio::test]
+async fn newer_paused_authority_retires_journaled_resume_without_replaying_it() {
+    check_journaled_resume_authority(true).await;
+}
+
+async fn check_journaled_resume_authority(newer: bool) {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("busy")];
+    let root = tempfile::tempdir().unwrap();
+    let node = checkpoint_node(&backend, root.path());
+    let mut authority = authority::Fixture::new().await;
+    authority.authority.records.lock().unwrap().push(
+        record("busy", EnvironmentState::Running)
+            .try_into()
+            .unwrap(),
+    );
+    authority.cycle(&node).await.unwrap();
+    let paused = pause(&node, record("busy", EnvironmentState::Running)).await;
+    *authority.authority.records.lock().unwrap() = vec![paused.clone().try_into().unwrap()];
+    let handle = node
+        .environment(paused.spec.clone(), paused.assignment.clone())
+        .unwrap();
+    backend.journal_running.store(true, Ordering::SeqCst);
+    let resumed = handle
+        .resume(adxlet::checkpoint::ResumeRequest {
+            operation_id: "resume-journaled".into(),
+            expected_revision: paused.revision,
+            run_timeout_seconds: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resumed.durability, Durability::Journaled);
+    assert_eq!(resumed.record.state, EnvironmentState::Running);
+    let mut authoritative = paused;
+    if newer {
+        authoritative.revision = resumed.record.revision + 1;
+        authoritative.last_operation = None;
+        *authority.authority.records.lock().unwrap() =
+            vec![authoritative.clone().try_into().unwrap()];
+    }
+    let comparison = authority.cycle(&node).await;
+    if newer {
+        comparison.expect(
+            "newer released authority must reconcile while Running publication is unavailable",
+        );
+    }
+    backend.journal_running.store(false, Ordering::SeqCst);
+    // A Journaled result keeps its controller fenced until a fresh comparison
+    // can publish it. Reconcile again after publication becomes available.
+    let _ = authority.cycle(&node).await;
+    let published = handle.sync().await.unwrap();
+    assert_eq!(published.durability, Durability::Published);
+    if newer {
+        assert_eq!(published.record, authoritative);
+        assert!(backend.actual.lock().unwrap().is_empty());
+    } else {
+        assert_eq!(
+            published.record, resumed.record,
+            "an older pause must not replace the pending Running result"
+        );
+        assert!(backend
+            .actual
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|runtime| runtime.runtime_id == resumed.record.runtime.id));
+    }
+}
 
 #[async_trait]
 impl CheckpointCooperation for Backend {
@@ -286,30 +571,6 @@ async fn live_comparison_preserves_in_progress_checkpoint_directory() {
         std::fs::read(path.join("state")).unwrap(),
         b"checkpoint data"
     );
-}
-
-#[tokio::test]
-async fn recovery_cleanup_failure_keeps_admission_closed_until_retry() {
-    let backend = Arc::new(Backend::default());
-    let node = authority::manager(backend.clone());
-    let mut authority = authority::Fixture::new().await;
-    authority.cycle(&node).await.unwrap();
-    backend.actual.lock().unwrap().push(observed("orphan"));
-    backend.fail_remove.store(true, Ordering::SeqCst);
-    authority.registration.reconciling = true;
-    assert!(authority.cycle(&node).await.is_err());
-    assert!(!node.accepting_allocations());
-    let candidate = record("other", EnvironmentState::Pending);
-    assert!(node
-        .environment(candidate.spec.clone(), candidate.assignment.clone())
-        .is_err());
-    backend.fail_remove.store(false, Ordering::SeqCst);
-    authority.cycle(&node).await.unwrap();
-    assert!(backend.actual.lock().unwrap().is_empty());
-    assert!(node.accepting_allocations());
-    assert!(node
-        .environment(candidate.spec, candidate.assignment)
-        .is_ok());
 }
 
 #[tokio::test]

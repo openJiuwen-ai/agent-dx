@@ -5,6 +5,114 @@ use adxlet::resources::{
 };
 
 #[test]
+fn independent_resources_ignore_disabled_pressure_during_isolation_and_recovery() {
+    use adxlet::resources::PressureResources;
+    for memory_enabled in [true, false] {
+        let resources = PressureResources {
+            memory_enabled,
+            disk_enabled: !memory_enabled,
+        };
+        let mut gate = PressureGate::with_resources(PressurePolicy::default(), resources).unwrap();
+        let sample = |enabled_percent| Pressure {
+            memory_percent: if memory_enabled { enabled_percent } else { 100 },
+            disk_percent: if memory_enabled { 100 } else { enabled_percent },
+        };
+        assert!(!gate.update(sample(95)).accepting);
+        assert!(!gate.update(sample(85)).accepting);
+        let recovered = gate.update(sample(70));
+        assert!(recovered.accepting);
+        assert!(!recovered.state.has_high_pressure());
+        let report = adxlet::resources::report_from(&recovered.state).unwrap();
+        assert_eq!(report.memory.is_some(), memory_enabled);
+        assert_eq!(report.disk.is_some(), !memory_enabled);
+        assert!(gate.fail().accepting);
+        assert!(gate.update(sample(85)).accepting);
+        assert!(!gate.update(sample(95)).accepting);
+    }
+}
+
+#[test]
+fn disabled_resource_thresholds_are_not_validated() {
+    use adxlet::resources::PressureResources;
+    let invalid_disk = PressurePolicy {
+        disk_low_percent: 100,
+        disk_high_percent: 0,
+        ..Default::default()
+    };
+    assert!(PressureGate::new(invalid_disk.clone()).is_err());
+    assert!(PressureGate::with_resources(
+        invalid_disk,
+        PressureResources {
+            memory_enabled: true,
+            disk_enabled: false,
+        }
+    )
+    .is_ok());
+    let invalid_memory = PressurePolicy {
+        memory_low_percent: 100,
+        memory_high_percent: 0,
+        ..Default::default()
+    };
+    assert!(PressureGate::with_resources(
+        invalid_memory,
+        PressureResources {
+            memory_enabled: false,
+            disk_enabled: true,
+        }
+    )
+    .is_ok());
+}
+
+#[test]
+fn disk_only_sampling_does_not_require_proc_memory_files() {
+    use adxlet::resources::{pressure, PressureResources};
+    let directory = tempfile::tempdir().unwrap();
+    let sample = pressure(
+        PressureResources {
+            memory_enabled: false,
+            disk_enabled: true,
+        },
+        Some(directory.path()),
+    )
+    .unwrap();
+    assert!(sample.disk_percent <= 100);
+    assert_eq!(sample.memory_percent, 0);
+}
+
+#[test]
+fn disabled_pressure_resources_need_no_probes_or_disk_path() {
+    use adxlet::resources::{pressure, PressureResources};
+    let resources = PressureResources {
+        memory_enabled: false,
+        disk_enabled: false,
+    };
+    let sample = pressure(resources, None).unwrap();
+    let mut gate = PressureGate::with_resources(PressurePolicy::default(), resources).unwrap();
+    let update = gate.update(sample);
+    assert!(update.accepting);
+    assert!(!update.state.has_high_pressure());
+    assert!(adxlet::resources::report_from(&update.state).is_none());
+    assert!(pressure(PressureResources::default(), None).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_only_sampling_skips_missing_disk_paths() {
+    use adxlet::resources::{pressure, PressureResources};
+    let resources = PressureResources {
+        memory_enabled: true,
+        disk_enabled: false,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing");
+    for path in [None, Some(missing.as_path())] {
+        let sample = pressure(resources, path).unwrap();
+        assert!(sample.memory_percent <= 100);
+        assert_eq!(sample.disk_percent, 0);
+    }
+}
+
+#[test]
 fn sandboxd_capacity_uses_cores_bytes_and_whole_card_ids() {
     let sample = parse_external(br#"{"cpu":4,"mem":8192,"storage":32768,"features":["storage-quota-v1"],"xpu":[{"type":"npu","product_model":"Ascend","device_ids":[2,5]}]}"#).unwrap();
     assert_eq!(sample.capacity.cpu_millis, 4000);
@@ -127,9 +235,8 @@ fn failed_samples_freeze_levels_and_count_consecutive_failures() {
     let frozen_again = gate.fail().state;
     assert_eq!(frozen_again.consecutive_failures, 2);
     assert_eq!(frozen_again.observed_at_unix_seconds, observed);
-    // A failing gate reports closed admission for this round while the
-    // hysteresis phase survives for the next successful sample.
-    assert!(!gate.fail().accepting);
+    // Failed samples reopen admission while retaining the last observation.
+    assert!(gate.fail().accepting);
     let recovered = gate.update(Pressure {
         memory_percent: 70,
         disk_percent: 70,
@@ -160,11 +267,13 @@ fn default_state_marks_a_never_observed_node() {
 fn pressure_state_round_trips_through_serde() {
     let state = NodePressureState {
         memory: ResourcePressure {
+            enabled: true,
             level: PressureLevel::High,
             percent: 95,
             last_transition_unix_seconds: 1_700_000_000,
         },
         disk: ResourcePressure {
+            enabled: true,
             level: PressureLevel::Normal,
             percent: 40,
             last_transition_unix_seconds: 0,
@@ -182,11 +291,13 @@ fn pressure_report_round_trips_through_proto_with_all_fields() {
     use prost::Message;
     let state = NodePressureState {
         memory: ResourcePressure {
+            enabled: true,
             level: PressureLevel::High,
             percent: 100,
             last_transition_unix_seconds: 1_700_000_000,
         },
         disk: ResourcePressure {
+            enabled: true,
             level: PressureLevel::Normal,
             percent: 0,
             last_transition_unix_seconds: 0,
@@ -255,6 +366,7 @@ fn v1_heartbeat_bytes_never_carry_the_disposition_field() {
         pressure: Some(
             adxlet::resources::report_from(&NodePressureState {
                 memory: ResourcePressure {
+                    enabled: true,
                     level: PressureLevel::High,
                     percent: 95,
                     last_transition_unix_seconds: 1_700_000_000,
@@ -302,6 +414,63 @@ fn disposition_enum_keeps_none_as_the_zero_default() {
     );
     assert_eq!(i32::from(NodePressureDisposition::Local), 1);
     assert_eq!(i32::from(NodePressureDisposition::Relocation), 2);
+}
+
+#[test]
+fn pressure_sampling_failure_before_first_observation_allows_admission() {
+    let mut gate = PressureGate::new(PressurePolicy::default()).unwrap();
+    assert!(gate.fail().accepting);
+    assert!(gate.fail().accepting);
+}
+
+#[test]
+fn pressure_sampling_failure_reopens_admission_and_resets_hysteresis() {
+    for high in [
+        Pressure {
+            memory_percent: 95,
+            disk_percent: 10,
+        },
+        Pressure {
+            memory_percent: 10,
+            disk_percent: 95,
+        },
+        Pressure {
+            memory_percent: 95,
+            disk_percent: 95,
+        },
+    ] {
+        let mut gate = PressureGate::new(PressurePolicy::default()).unwrap();
+        assert!(!gate.update(high).accepting);
+        assert!(gate.fail().accepting);
+        assert!(gate.fail().accepting);
+        let recovered = gate.update(Pressure {
+            memory_percent: 85,
+            disk_percent: 85,
+        });
+        assert!(recovered.accepting);
+        assert_eq!(recovered.state.consecutive_failures, 0);
+        assert_eq!(recovered.state.memory.level, PressureLevel::Normal);
+        assert_eq!(recovered.state.disk.level, PressureLevel::Normal);
+        assert_eq!(recovered.state.memory.percent, 85);
+        assert_eq!(recovered.state.disk.percent, 85);
+        let pressured = gate.update(high);
+        assert!(!pressured.accepting);
+        assert_eq!(
+            pressured.state.memory.level == PressureLevel::High,
+            high.memory_percent >= 90
+        );
+        assert_eq!(
+            pressured.state.disk.level == PressureLevel::High,
+            high.disk_percent >= 90
+        );
+        assert!(
+            gate.update(Pressure {
+                memory_percent: 70,
+                disk_percent: 70,
+            })
+            .accepting
+        );
+    }
 }
 
 #[tokio::test]

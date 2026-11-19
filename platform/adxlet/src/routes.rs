@@ -216,13 +216,26 @@ impl UdsRoutes {
         }
         Ok(())
     }
-    async fn send(&self, r: UpdateBindingRequest) -> Result<()> {
+    async fn send(&self, mut r: UpdateBindingRequest) -> Result<()> {
         let session = {
             let mut s = self.local.lock().await;
             if let Some(old) = s.bindings.get(&r.environment_id) {
+                if matches!(r.binding, Some(Binding::Retired(_)))
+                    && (old.ownership_generation > r.ownership_generation
+                        || (old.ownership_generation == r.ownership_generation
+                            && old.binding_revision > r.binding_revision
+                            && matches!(old.binding, Some(Binding::Retired(_)))))
+                {
+                    // Confirm the superseding fence with Relay before allowing
+                    // old execution cleanup; never replace its newer binding.
+                    r = old.clone();
+                }
                 let a = (old.ownership_generation, old.binding_revision);
                 let b = (r.ownership_generation, r.binding_revision);
-                if b < a || (b == a && old.binding != r.binding) {
+                let availability = matches!((&old.binding, &r.binding),
+                    (Some(Binding::Active(a)), Some(Binding::Suspended(b)))
+                    | (Some(Binding::Suspended(a)), Some(Binding::Active(b))) if a == b);
+                if b < a || (b == a && old.binding != r.binding && !availability) {
                     return Err(Error::Conflict);
                 }
             }
@@ -414,6 +427,35 @@ impl Routes for UdsRoutes {
         let mut s = self.local.lock().await;
         let mut client = self.connect().await?;
         self.ensure(&mut s, &mut client).await
+    }
+    async fn suspend(&self, r: &EnvironmentRecord) -> Result<()> {
+        self.send(UpdateBindingRequest {
+            environment_id: r.spec.id.clone(),
+            ownership_generation: r.assignment.generation,
+            binding_revision: r.revision.checked_mul(2).ok_or(Error::Conflict)?,
+            binding: Some(Binding::Suspended(RuntimeTarget {
+                runtime_id: r.runtime.id.clone(),
+                ip: r.runtime.ip.map(|ip| ip.to_string()).unwrap_or_default(),
+            })),
+            ..Default::default()
+        })
+        .await
+    }
+    async fn seed_recovery(&self, record: &EnvironmentRecord) -> Result<()> {
+        if self.local.lock().await.buffering {
+            if record.state == adx_core::EnvironmentState::Paused
+                || matches!(
+                    record.state,
+                    adx_core::EnvironmentState::Failed | adx_core::EnvironmentState::Deleted
+                ) && !record.resources_held
+                    && !record.restart_pending
+            {
+                self.retire(record).await?;
+            } else {
+                self.suspend(record).await?;
+            }
+        }
+        Ok(())
     }
     async fn retire_orphan(&self, r: &crate::RuntimeObservation) -> Result<()> {
         self.send(UpdateBindingRequest {

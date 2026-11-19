@@ -40,9 +40,11 @@ Relay 重启 → 关闭准入 → adxlet 检测新 proxy_session_id
 
 代理进程 UUID 标识一次 Relay 启动；`sync_epoch` 标识一次完整同步。`BeginBindings` 比较旧身份后推进 epoch，关闭准入，并退役已有流。`ReplaceBindings` 先校验全部条目，成功后才开放入口；相同快照重试可确认完成。
 
-增量绑定必须携带当前代理 UUID 和同步 epoch，再按实例归属 generation／绑定 revision 校验。退役保留版本记录；旧进程或旧同步的迟到激活无法复活实例。完整同步遗漏的旧绑定也保留退役记录。
+增量绑定必须携带当前代理 UUID 和同步 epoch，再按实例归属 generation／绑定 revision 校验。退役保留版本记录；旧进程或旧同步的迟到激活无法复活实例。完整同步遗漏的旧绑定保留同 generation 的最大 revision 退役记录，因此当前仍有归属但暂不可用的实例必须包含在完整快照中。
 
-adxlet 持续运行而仅代理重启时，可直接重放本机内存目录。adxlet 自身重启则须先取得 Coordinator 权威目录，不能把不完整内存当作全量。完整对账会中断本机已有代理连接；同步失败时保持关闭，等待重试。这一流程不新增节点磁盘依赖。
+adxlet 持续运行而仅代理重启时，可直接重放本机内存目录。adxlet 自身重启则先完成两阶段恢复的第一阶段：核对 Coordinator 完整目录、实际执行和占用，并同步所有当前归属。未接管的执行使用 Suspended，已暂停或已释放的终态使用有限 revision 的 Retired；第二阶段按实例就绪和发布结果激活。某个实例失败后仍可在同一 Relay 进程、同一 generation 恢复，不能因快照遗漏而永久退役。
+
+Suspended 不转发流量。只有相同 generation、revision 且完整 RuntimeTarget 相同的 Active／Suspended 可以互换；不同目标、旧版本和真正 Retired 仍拒绝重新激活。revision 0 仅允许用于尚未启动分配的 Suspended 占位，首次清理能推进至 Retired revision 1。清理旧执行时，若本机已有更高 generation 的绑定或同 generation 的更高退役版本，先向 Relay 确认该新屏障，再允许清理；旧退役不能覆盖新归属。同一 adxlet 会话已同步时，重新核对不启动全量替换，保留健康流；新进程的完整同步仍中断旧连接，同步失败保持关闭。本机内部 Node 协议新增 Suspended，adxlet 与 Relay 须使用配套构建；共进程部署自然一起更新，公共 SDK 接口不变。
 
 共进程和分进程均已装配同一 `RelayService`，两种模式都走 UDS 与同一绑定校验；见 [进程模式](relay-process-modes.md)。本页末尾的早期测试是分进程批次。
 

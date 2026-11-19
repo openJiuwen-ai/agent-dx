@@ -49,7 +49,12 @@ impl NativeHomeMeta {
 }
 
 impl RootMeta for NativeHomeMeta {
-    fn reserve_root(&self, id: &RootId, create_intent_id: &str) -> Result<RootReservation> {
+    fn reserve_root(
+        &self,
+        id: &RootId,
+        create_intent_id: &str,
+        _pin_home: bool,
+    ) -> Result<RootReservation> {
         let epoch = self.next_epoch.fetch_add(1, Ordering::SeqCst);
         let reservation = RootReservation {
             id: id.clone(),
@@ -1371,7 +1376,7 @@ impl RemoteCreateFixture {
         }
         let id = root::root_id_from_name(OsStr::new("agent-a")).unwrap();
         let mut reservation = meta
-            .reserve_root(&id, &format!("node-b:session-b:{}", id.0))
+            .reserve_root(&id, &format!("node-b:session-b:{}", id.0), false)
             .unwrap();
         reservation.requester_node_id = "node-b".into();
         reservation.requester_session_id = "session-b".into();

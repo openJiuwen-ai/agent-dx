@@ -29,6 +29,78 @@ pub(crate) enum ReconciliationOutcome {
 }
 
 impl Adxlet {
+    pub(super) async fn reconcile_controller(
+        &self,
+        assignment: adx_core::Assignment,
+        handle: EnvironmentHandle,
+        check: AuthorityCheck,
+    ) -> Result<AuthorityResult> {
+        let result = handle
+            .check_authority(AuthorityCheck {
+                record: check.record.clone(),
+                references: check.references.clone(),
+                recover: check.recover,
+            })
+            .await?;
+        if result != AuthorityResult::Retired {
+            return Ok(result);
+        }
+        self.remember_retired(&assignment, None);
+        {
+            let mut controllers = self
+                .environments
+                .lock()
+                .expect("shared state lock poisoned");
+            if controllers
+                .get(&assignment.environment_id)
+                .is_some_and(|(_, _, current)| current.same_controller(&handle))
+            {
+                controllers.remove(&assignment.environment_id);
+            }
+        }
+        if let Some(record) = check.record {
+            if let Some(handle) = self.adopt_record(&record, check.recover)? {
+                return handle
+                    .check_authority(AuthorityCheck {
+                        record: Some(record),
+                        references: check.references,
+                        recover: check.recover,
+                    })
+                    .await;
+            }
+        }
+        Ok(AuthorityResult::Current)
+    }
+
+    pub(super) async fn cleanup_orphan(
+        &self,
+        runtime: crate::RuntimeObservation,
+        retire_route: bool,
+    ) -> Result<()> {
+        match self.claim_orphan(&runtime, !retire_route) {
+            OrphanTarget::Controller(handle) => return handle.reap_orphan(runtime).await,
+            OrphanTarget::AwaitingController => return Ok(()),
+            OrphanTarget::Unowned => (),
+        }
+        tokio::time::timeout(self.services.operation_timeout, async {
+            if retire_route {
+                self.services.routes.retire_orphan(&runtime).await?;
+            }
+            self.services.runtime.remove(&runtime.runtime_id).await
+        })
+        .await
+        .map_err(|_| Error::Unavailable("orphan cleanup timed out".into()))??;
+        let mut admission = self
+            .services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned");
+        if admission.ledger.contains(&runtime.runtime_id) {
+            admission.release(&runtime.runtime_id)?;
+        }
+        Ok(())
+    }
+
     fn start_comparison(
         &self,
         id: String,
@@ -51,10 +123,11 @@ impl Adxlet {
         });
     }
 
-    fn completed_comparisons(&self) -> (Option<Error>, bool) {
+    fn completed_comparisons(&self) -> (Option<Error>, bool, bool) {
         let mut failure = None;
         let mut stale = false;
-        self.authority_tasks.lock().expect("shared state lock poisoned").retain(|(id, _), task| {
+        let mut orphan_failed = false;
+        self.authority_tasks.lock().expect("shared state lock poisoned").retain(|(id, runtime), task| {
             let result = match task.try_recv() {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return true,
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err(Error::Unavailable("environment reconciliation task stopped".into())),
@@ -64,13 +137,14 @@ impl Adxlet {
                 Ok(AuthorityResult::Stale) => stale = true,
                 Ok(_) => (),
                 Err(error) => {
+                    orphan_failed |= runtime.as_ref().is_some_and(|id| !self.execution_reserved(id));
                     adx_observability::warn!(environment_id=%id, %error, "environment authority reconciliation incomplete");
                     failure = Some(error);
                 },
             }
             false
         });
-        (failure, stale)
+        (failure, stale, orphan_failed)
     }
 
     /// Capture before InspectNode. A controller admitted after this point cannot
@@ -104,7 +178,22 @@ impl Adxlet {
         retained: Vec<adx_core::CheckpointArtifact>,
         wait: std::time::Duration,
     ) -> Result<ReconciliationOutcome> {
-        let catalog = Catalog::new(&self.node_id, records, snapshots, Some(retained))?;
+        let _recovery = self.recovery.lock().await;
+        let catalog = match Catalog::new(&self.node_id, records, snapshots, Some(retained)) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.authority_reconciling.store(true, Ordering::Release);
+                return Ok(ReconciliationOutcome::Incomplete(error));
+            }
+        };
+        // Malformed global facts cannot authorize adoption or orphan cleanup.
+        // Preserve the last trusted controllers while restricting new allocation.
+        if let Ok(actual) = &basis.inventory {
+            if let Err(error) = validate_inventory(actual, &catalog.records) {
+                self.authority_reconciling.store(true, Ordering::Release);
+                return Ok(ReconciliationOutcome::Incomplete(error));
+            }
+        }
 
         if self.is_draining() {
             return Err(Error::Unavailable("node is draining".into()));
@@ -117,7 +206,7 @@ impl Adxlet {
         let _gate = Arc::new(self.lifecycle_ready.clone().read_owned().await);
         let mut work = BTreeMap::new();
         let mut stale = false;
-        let (mut failure, previously_stale) = self.completed_comparisons();
+        let (mut failure, previously_stale, mut allocation_fenced) = self.completed_comparisons();
         stale |= previously_stale;
         for (id, (_, assignment, handle)) in basis.controllers {
             let current = self
@@ -148,18 +237,20 @@ impl Adxlet {
                 stale = true;
                 continue;
             }
-            match self.adopt_comparison_record(record) {
+            match self.adopt_record(record, false) {
                 Ok(Some(handle)) => {
                     work.insert(record.spec.id.clone(), (record.assignment.clone(), handle));
                 }
                 Ok(None) => (),
-                Err(error) => failure = Some(error),
+                Err(error) => {
+                    allocation_fenced = true;
+                    failure = Some(error);
+                }
             }
         }
         // Missing catalog entries cannot resolve an in-flight Claim RPC. Its
         // explicit outcome/retry owns the local reservation, not this snapshot.
         // Clear a prior transport fence only after validating fresh authority.
-        self.authority_reconciling.store(false, Ordering::Release);
         for (id, (assignment, handle)) in work {
             let record = catalog.records.get(&id).cloned();
             let references = catalog.references.clone();
@@ -167,46 +258,21 @@ impl Adxlet {
             let gate = _gate.clone();
             self.start_comparison(id.clone(), None, async move {
                 let _gate = gate;
-                let result = handle
-                    .check_authority(AuthorityCheck {
-                        record: record.clone(),
-                        references: references.clone(),
-                    })
-                    .await?;
-                if result != AuthorityResult::Retired {
-                    return Ok(result);
-                }
-                manager.remember_retired(&assignment, None);
-                {
-                    let mut controllers = manager
-                        .environments
-                        .lock()
-                        .expect("shared state lock poisoned");
-                    if controllers
-                        .get(&id)
-                        .is_some_and(|(_, _, current)| current.same_controller(&handle))
-                    {
-                        controllers.remove(&id);
-                    }
-                }
-                if let Some(record) = record {
-                    if let Some(handle) = manager.adopt_comparison_record(&record)? {
-                        // Re-observe in the adopted controller; the old owner's
-                        // inventory cannot describe its replacement execution.
-                        return handle
-                            .check_authority(AuthorityCheck {
-                                record: Some(record),
-                                references,
-                            })
-                            .await;
-                    }
-                }
-                Ok(AuthorityResult::Current)
+                manager
+                    .reconcile_controller(
+                        assignment,
+                        handle,
+                        AuthorityCheck {
+                            recover: false,
+                            record,
+                            references,
+                        },
+                    )
+                    .await
             });
         }
         match basis.inventory {
             Ok(actual) => {
-                validate_inventory(&actual, &catalog.records)?;
                 for runtime in actual {
                     // Controllers own same-generation lifecycle decisions. An
                     // older observation must not delete a resumed execution or
@@ -227,42 +293,33 @@ impl Adxlet {
                         .is_none_or(|record| record.assignment.generation != runtime.generation);
                     let manager = self.clone();
                     let gate = _gate.clone();
+                    if !self.execution_reserved(&runtime.runtime_id) {
+                        self.authority_reconciling.store(true, Ordering::Release);
+                    }
                     self.start_comparison(
                         runtime.environment_id.clone(),
                         Some(runtime.runtime_id.clone()),
                         async move {
                             let _gate = gate;
-                            match manager.claim_orphan(&runtime, !retire_route) {
-                                OrphanTarget::Controller(handle) => {
-                                    handle.reap_orphan(runtime).await?;
-                                    return Ok(AuthorityResult::Current);
-                                }
-                                OrphanTarget::AwaitingController => {
-                                    return Ok(AuthorityResult::Current);
-                                }
-                                OrphanTarget::Unowned => (),
-                            }
-                            tokio::time::timeout(manager.services.operation_timeout, async {
-                                if retire_route {
-                                    manager.services.routes.retire_orphan(&runtime).await?;
-                                }
-                                manager.services.runtime.remove(&runtime.runtime_id).await
-                            })
-                            .await
-                            .map_err(|_| Error::Unavailable("orphan cleanup timed out".into()))??;
+                            manager.cleanup_orphan(runtime, retire_route).await?;
                             Ok(AuthorityResult::Current)
                         },
                     );
                 }
             }
-            Err(error) => failure = Some(error),
+            Err(error) => {
+                self.authority_reconciling.store(true, Ordering::Release);
+                allocation_fenced = true;
+                failure = Some(error);
+            }
         }
         // A long restore must not stall the next catalog/resource sample. Keep
         // one tracked task per environment; accepted work is never cancelled.
         let deadline = tokio::time::sleep(wait);
         tokio::pin!(deadline);
         loop {
-            let (error, was_stale) = self.completed_comparisons();
+            let (error, was_stale, orphan_failed) = self.completed_comparisons();
+            allocation_fenced |= orphan_failed;
             if error.is_some() {
                 failure = error;
             }
@@ -284,6 +341,31 @@ impl Adxlet {
         // Live controllers release their own artifacts; pinned restore inputs are
         // never collected using a catalog captured before a concurrent checkpoint.
         self.services.routes.ensure_synced().await?;
+        if failure.is_none()
+            && self
+                .authority_tasks
+                .lock()
+                .expect("shared state lock poisoned")
+                .is_empty()
+        {
+            if let Some(checkpoint) = &self.services.checkpoint {
+                if let Err(error) = checkpoint.store.maintain_cache().await {
+                    adx_observability::warn!(%error, "idle checkpoint cache maintenance deferred");
+                }
+            }
+        }
+        allocation_fenced |= self
+            .authority_tasks
+            .lock()
+            .expect("shared state lock poisoned")
+            .keys()
+            .any(|(_, runtime)| {
+                runtime
+                    .as_ref()
+                    .is_some_and(|id| !self.execution_reserved(id))
+            });
+        self.authority_reconciling
+            .store(allocation_fenced, Ordering::Release);
         Ok(if let Some(error) = failure {
             ReconciliationOutcome::Incomplete(error)
         } else if stale {
@@ -348,9 +430,10 @@ impl Adxlet {
         OrphanTarget::Unowned
     }
 
-    fn adopt_comparison_record(
+    fn adopt_record(
         &self,
         record: &EnvironmentRecord,
+        recover: bool,
     ) -> Result<Option<EnvironmentHandle>> {
         let retired = self
             .retired_environments
@@ -378,38 +461,14 @@ impl Adxlet {
         }
         // Coordinator has assigned ownership, but its create RPC may still be
         // in flight. A live catalog must not recover/retire that fresh claim.
-        if controller::unstarted(record) {
+        if !recover && controller::unstarted(record) {
             return Ok(None);
         }
-        if terminal_without_execution(record) {
-            self.services.upgrade.record_cleanup()?;
-        } else {
-            self.services.upgrade.record_action(
-                &record.spec.id,
-                record.assignment.generation,
-                "adopt",
-            )?;
-        }
-        if record.resources_held {
-            // An unheld record leaves the tentative reservation with its claim.
+        if !recover && record.resources_held {
             self.adopt_local(&record.spec, &record.assignment)?;
-            let mut admission = self
-                .services
-                .admission
-                .lock()
-                .expect("shared state lock poisoned");
-            let mut ledger = admission.ledger.clone();
-            let mut devices = admission.devices.clone();
-            ledger.restore(&record.runtime.id, record.spec.resources)?;
-            devices.restore(&record.runtime.id, &record.assignment.devices)?;
-            admission.ledger = ledger;
-            admission.devices = devices;
+            self.restore_execution(record, &record.runtime.id)?;
         }
-        let handle = if terminal_without_execution(record) {
-            controller::spawn_terminal(record.clone(), self.services.clone())?
-        } else {
-            controller::spawn_comparison(record.clone(), self.services.clone())
-        };
+        let handle = self.restore_controller(record, None)?;
         controllers.insert(
             record.spec.id.clone(),
             (

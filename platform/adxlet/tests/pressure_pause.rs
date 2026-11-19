@@ -31,6 +31,7 @@ use std::{
 fn board(level: PressureLevel, failures: u32, observed_at: u64) -> NodePressureState {
     NodePressureState {
         memory: ResourcePressure {
+            enabled: true,
             level,
             percent: if level == PressureLevel::High { 95 } else { 10 },
             last_transition_unix_seconds: observed_at,
@@ -39,6 +40,29 @@ fn board(level: PressureLevel, failures: u32, observed_at: u64) -> NodePressureS
         observed_at_unix_seconds: observed_at,
         consecutive_failures: failures,
     }
+}
+
+#[tokio::test]
+async fn disabled_disk_pressure_does_not_pause_a_memory_only_node() {
+    let (_temp, backend, node, handle, _) =
+        fixture(immediate(0), adx_core::lifecycle::IdleAction::Pause).await;
+    let mut state = board(PressureLevel::Normal, 0, now_plus(100));
+    state.disk.enabled = false;
+    state.disk.level = PressureLevel::High;
+    state.disk.percent = 100;
+    publish(&node, state);
+    handle.tick().await.unwrap();
+    assert!(backend.operation_ids().is_empty());
+    let mut state = board(PressureLevel::High, 0, now_plus(200));
+    state.disk.enabled = false;
+    publish(&node, state);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        backend.checkpoint_entered.notified(),
+    )
+    .await
+    .unwrap();
+    assert!(!backend.operation_ids().is_empty());
 }
 
 fn publish(node: &Adxlet, state: NodePressureState) {
@@ -615,6 +639,35 @@ async fn fixture_with_control(
     let created = handle.create().await.unwrap();
     assert_eq!(created.record.state, EnvironmentState::Running);
     (temp, backend, node, handle, rig)
+}
+
+/// A preserved idle window cannot authorize a pause through a recovery fence.
+#[tokio::test]
+async fn recovery_fence_blocks_pressure_pause_until_authority_is_validated() {
+    let (_temp, backend, node, _handle, created) =
+        fixture(immediate(0), adx_core::lifecycle::IdleAction::Pause).await;
+    let mut invalid = created.record.clone();
+    invalid.assignment.node_id = "another-node".into();
+    assert!(node.reconcile(vec![invalid]).await.is_err());
+    publish(&node, board(PressureLevel::High, 0, now_plus(100)));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            backend.checkpoint_entered.notified()
+        )
+        .await
+        .is_err(),
+        "pressure must not change Environment state before recovery validates authority"
+    );
+    assert!(backend.operation_ids().is_empty());
+    node.reconcile(vec![created.record]).await.unwrap();
+    publish(&node, board(PressureLevel::High, 0, now_plus(200)));
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        backend.checkpoint_entered.notified(),
+    )
+    .await
+    .expect("pressure relief must resume after authority recovery");
 }
 
 /// A normal board never pauses even with every other condition satisfied.

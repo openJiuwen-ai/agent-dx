@@ -23,6 +23,15 @@ I/O数据量有界为4KiB–1GiB，请求粒度4KiB–1MiB，两者均需页对�
 读含SHA、写另做读回，这些边界不与不同定义的旧cohort直接相减；不把write交付当持久化完成。
 Node完整CPU/内存、设备IO和公平性采样、交错基线及统计准入仍属于后续受控性能编排，不能从此工具单独得到。
 
+## 业界benchmark辅助
+
+- `benchlib.py`：`bench`参数校验、fio/elbencho命令构造、fio/elbencho/iperf3自身JSON报告解析与样本汇总；纯函数，由`runner_tests/test_bench.py`固定。
+- `bench_probe.py`：在角色主机上执行，`evict`对文件/目录做fdatasync+`POSIX_FADV_DONTNEED`（不进入其他挂载），`resident`以mmap+mincore实测页缓存驻留量（与util-linux `fincore`同原理）。驱逐只是建议，调用者必须以`resident`结果为准；无法映射的文件报错而不是按0计。
+
+- `bench-tools.sh`：在一台Linux角色主机上准备上述工具（锁定版本、核对SHA-256、源码编译fio/iperf3、官方静态elbencho），输出`manifest.json`；不安装进系统。
+
+用法与case见[上级README](../README.md)的"业界通用benchmark"一节。
+
 ## 资产去向
 
 | 资产 | 维护位置 |

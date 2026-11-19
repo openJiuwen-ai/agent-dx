@@ -61,6 +61,42 @@ async fn backend_connection(
         if stream.read_exact(&mut body).await.is_err() {
             return;
         }
+        if head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            loop {
+                let mut line = Vec::new();
+                while !line.ends_with(b"\r\n") {
+                    let Ok(byte) = stream.read_u8().await else {
+                        return;
+                    };
+                    line.push(byte);
+                }
+                let line = String::from_utf8(line).unwrap();
+                let length =
+                    usize::from_str_radix(line.trim().split(';').next().unwrap(), 16).unwrap();
+                if length == 0 {
+                    loop {
+                        let mut line = Vec::new();
+                        while !line.ends_with(b"\r\n") {
+                            let Ok(byte) = stream.read_u8().await else {
+                                return;
+                            };
+                            line.push(byte);
+                        }
+                        if line == b"\r\n" {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                let offset = body.len();
+                body.resize(offset + length, 0);
+                stream.read_exact(&mut body[offset..]).await.unwrap();
+                assert_eq!(stream.read_u16().await.unwrap(), 0x0d0a);
+            }
+        }
         let path = head.split_whitespace().nth(1).unwrap();
         match path {
             "/api/progress" => {
@@ -95,6 +131,25 @@ async fn backend_connection(
                 if stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n").await.is_err() { return; }
                 let (mut reader, mut writer) = stream.split();
                 let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                return;
+            }
+            "/api/legacy-ws" => {
+                if !head.starts_with("GET /api/legacy-ws HTTP/1.1\r\n") {
+                    stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(
+                    b"dGhlIHNhbXBsZSBub25jZQ==",
+                );
+                stream.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
+                let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                    stream, tokio_tungstenite::tungstenite::protocol::Role::Server, None,
+                ).await;
+                ws.send(tokio_tungstenite::tungstenite::Message::Text("tunnel hello".into())).await.unwrap();
+                while let Some(Ok(message)) = ws.next().await {
+                    if message.is_close() { break; }
+                    if ws.send(message).await.is_err() { break; }
+                }
                 return;
             }
             _ => {
@@ -216,12 +271,7 @@ impl Fixture {
                         let (stream, peer) = result.unwrap();
                         let ingress = ingress.clone();
                         tasks.spawn(async move {
-                            let service = service_fn(move |request| {
-                                let ingress = ingress.clone();
-                                async move { ingress.handle_http(request, security, peer).await }
-                            });
-                            let _ = hyper::server::conn::http1::Builder::new()
-                                .serve_connection(TokioIo::new(stream), service).with_upgrades().await;
+                            ingress.serve_http_connection(stream, peer, security).await;
                         });
                     }
                     _ = tasks.join_next(), if !tasks.is_empty() => {},
@@ -505,4 +555,185 @@ async fn explicit_authenticated_http_reports_actual_proxy_transport() {
     let response = String::from_utf8(response.to_vec()).unwrap().to_lowercase();
     assert!(response.contains("x-forwarded-proto: http"), "{response}");
     assert!(!response.contains("x-forwarded-proto: https"));
+}
+
+async fn raw_http_reply(stream: &mut TcpStream) -> (String, Vec<u8>) {
+    timeout(Duration::from_secs(5), async {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.expect("HTTP response head"));
+        }
+        let head = String::from_utf8(head).unwrap();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).await.unwrap();
+        (head, body)
+    })
+    .await
+    .expect("HTTP reply timeout")
+}
+
+fn legacy_ws_head(path: &str, extra: &str) -> String {
+    format!("GET {path} HTTP/1.0\r\nHost: public.example\r\nConnection: keep-alive, UpGrAdE\r\nUpgrade: WebSocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n")
+}
+
+async fn check_legacy_ws(mut stream: TcpStream, path: &str, extra: &str) {
+    // Split the request line and header terminator across writes.
+    let head = legacy_ws_head(path, extra);
+    for part in head.as_bytes().chunks(7) {
+        stream.write_all(part).await.unwrap();
+        tokio::task::yield_now().await;
+    }
+    check_ws_connected(stream).await;
+}
+
+async fn check_ws_connected(mut stream: TcpStream) {
+    let (reply, body) = raw_http_reply(&mut stream).await;
+    assert!(
+        reply.starts_with("HTTP/1.1 101 "),
+        "{reply} {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(reply
+        .to_ascii_lowercase()
+        .contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="));
+    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        stream,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+    assert_eq!(
+        timeout(Duration::from_secs(5), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+        "tunnel hello"
+    );
+    // HTTP-looking frame data must stay opaque after the upgrade.
+    let payload = legacy_ws_head("/inside-frame", "");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        payload.clone(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(5), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+        payload
+    );
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn http10_websocket_new_connection() {
+    let fixture = Fixture::new(ReverseProxyConfig::default()).await;
+    check_legacy_ws(
+        TcpStream::connect(fixture.address).await.unwrap(),
+        "/api/legacy-ws",
+        "",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn http10_websocket_reused_connection_after_fixed_body() {
+    let fixture = Fixture::new(ReverseProxyConfig::default()).await;
+    let mut stream = TcpStream::connect(fixture.address).await.unwrap();
+    // A complete fake handshake in the POST body must not be rewritten.
+    let body = legacy_ws_head("/inside-body", "");
+    stream.write_all(format!("POST /api/normal HTTP/1.1\r\nHost: public.example\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    let (reply, echoed) = raw_http_reply(&mut stream).await;
+    assert!(reply.starts_with("HTTP/1.1 200 "));
+    assert!(echoed.ends_with(body.as_bytes()));
+    check_legacy_ws(stream, "/api/legacy-ws", "Content-Length: 0\r\n").await;
+    assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fixture.accepted.load(Ordering::SeqCst),
+        2,
+        "WebSocket must use a fresh backend connection after ordinary HTTP"
+    );
+}
+
+#[tokio::test]
+async fn http10_websocket_reused_connection_after_chunked_body() {
+    let fixture = Fixture::new(ReverseProxyConfig::default()).await;
+    let mut stream = TcpStream::connect(fixture.address).await.unwrap();
+    let body = legacy_ws_head("/inside-chunk", "");
+    let wire = format!("POST /api/normal HTTP/1.1\r\nHost: public.example\r\nTransfer-Encoding: chunked\r\nTrailer: X-End\r\n\r\n{:x};tag=yes\r\n{body}\r\n0\r\nX-End: done\r\n\r\n", body.len());
+    for part in wire.as_bytes().chunks(11) {
+        stream.write_all(part).await.unwrap();
+    }
+    let (reply, echoed) = raw_http_reply(&mut stream).await;
+    assert!(reply.starts_with("HTTP/1.1 200 "));
+    assert!(echoed.ends_with(body.as_bytes()));
+    check_legacy_ws(stream, "/api/legacy-ws", "").await;
+}
+
+#[tokio::test]
+async fn http10_websocket_application_proxy() {
+    let fixture = Fixture::with_mount(ReverseProxyConfig::default(), Some("/grafana")).await;
+    check_legacy_ws(
+        TcpStream::connect(fixture.address).await.unwrap(),
+        "/grafana/api/legacy-ws",
+        "",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn http10_websocket_retry_after_non_upgrade_response() {
+    let fixture = Fixture::new(ReverseProxyConfig::default()).await;
+    let mut stream = TcpStream::connect(fixture.address).await.unwrap();
+    stream
+        .write_all(legacy_ws_head("/api/normal", "").as_bytes())
+        .await
+        .unwrap();
+    let (reply, _) = raw_http_reply(&mut stream).await;
+    assert!(reply.starts_with("HTTP/1.1 200 "));
+    check_legacy_ws(stream, "/api/legacy-ws", "").await;
+}
+
+#[tokio::test]
+async fn http10_websocket_pipelined_after_http10_keep_alive() {
+    let fixture = Fixture::new(ReverseProxyConfig::default()).await;
+    let mut stream = TcpStream::connect(fixture.address).await.unwrap();
+    let first =
+        "GET /api/normal HTTP/1.0\r\nHost: public.example\r\nConnection: keep-alive\r\n\r\n";
+    stream
+        .write_all(format!("{first}{}", legacy_ws_head("/api/legacy-ws", "")).as_bytes())
+        .await
+        .unwrap();
+    let (reply, echoed) = raw_http_reply(&mut stream).await;
+    assert!(reply.starts_with("HTTP/1.0 200 "));
+    assert!(echoed.starts_with(b"GET /api/normal HTTP/1.1\r\n"));
+    check_ws_connected(stream).await;
+}
+
+#[tokio::test]
+async fn http10_websocket_reused_connection_after_lf_headers() {
+    let fixture = Fixture::new(ReverseProxyConfig::default()).await;
+    let mut stream = TcpStream::connect(fixture.address).await.unwrap();
+    stream
+        .write_all(b"GET /api/normal HTTP/1.1\nHost: public.example\n\n")
+        .await
+        .unwrap();
+    let (reply, _) = raw_http_reply(&mut stream).await;
+    assert!(reply.starts_with("HTTP/1.1 200 "));
+    check_legacy_ws(stream, "/api/legacy-ws", "").await;
 }

@@ -13,7 +13,6 @@ pub fn qualify(spec: &mut EnvironmentSpec) -> BTreeMap<String, String> {
         .unwrap(),
     );
     [
-        ("ADX_RECOVERY_HOST".into(), "a".repeat(64)),
         (
             format!("ADX_RECOVERY_RUNTIME_{}", spec.runtime_class),
             "b".repeat(64),
