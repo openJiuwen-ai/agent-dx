@@ -315,10 +315,9 @@ fn explicit_local_rootfs_keeps_caller_environment_and_execd_bootstrap() {
         source: StorageSource::Local("/var/lib/agentos/local-images/tools/rootfs".into()),
     });
     let request = start_request(&wanted, "local-1", 1, &[], &config).unwrap();
-    assert_eq!(
-        request.rootfs.unwrap().r#type,
-        proto::RootfsSrcType::Local as i32
-    );
+    let rootfs = request.rootfs.unwrap();
+    assert_eq!(rootfs.r#type, proto::RootfsSrcType::Local as i32);
+    assert!(!rootfs.readonly);
     assert_eq!(request.envs["PATH"], "/image/bin");
     assert_eq!(request.envs["IMAGE_VALUE"], "request");
     assert!(request.mounts.iter().any(|mount| mount.target == "/__adx"));

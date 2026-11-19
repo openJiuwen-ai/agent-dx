@@ -547,10 +547,14 @@ local runtime environment, so a custom rootfs does not need to bake in ADX.
 
 The deployment Runtime Environment is the rootfs baseline. `runtime=` overrides
 only its isolation runtime. `rootfs_readonly=True` or `False` overrides only its
-read-only setting; leaving it as `None` inherits the deployment default. Passing
-`image=`, `rootfs=S3Config(...)` or `rootfs=LocalRootfs(...)` replaces the source atomically while omitted
-runtime/read-only fields continue to inherit. Runtime-only and read-only-only
-overrides keep the baseline source and do not add the bootstrap mount.
+read-only setting. Passing `image=`, `rootfs=S3Config(...)` or
+`rootfs=LocalRootfs(...)` replaces the source atomically. An omitted runtime
+inherits the deployment default. With runsc, an explicit Local source defaults
+to a private writable overlay over the read-only host source. Set
+`rootfs_readonly=True` to make the sandbox root read-only. Other supported
+runtimes require a read-only Local rootfs. Non-Local sources inherit the
+deployment read-only default. Runtime-only and read-only-only overrides keep
+the baseline source and do not add the bootstrap mount.
 
 ## Network policy models
 

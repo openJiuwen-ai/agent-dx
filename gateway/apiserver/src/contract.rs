@@ -794,15 +794,17 @@ pub fn create_spec_with_environment(
         return Err(invalid("resource limits cannot be below requests"));
     }
     let readonly = if explicit_local_rootfs {
-        if root.readonly == Some(false) {
-            return Err(invalid("explicit local rootfs requires readonly=true"));
+        let runsc = root.runtime == "runsc";
+        let readonly = root.readonly.unwrap_or(!runsc);
+        if !readonly && !runsc {
+            return Err(invalid("writable explicit local rootfs requires runsc"));
         }
         if disk.max(disk_limit) != 0 {
             return Err(invalid(
                 "explicit local rootfs cannot set a writable layer limit",
             ));
         }
-        true
+        readonly
     } else {
         root.readonly
             .or_else(|| runtime_profile.map(|value| value.rootfs.readonly))
@@ -911,7 +913,9 @@ pub fn create_spec_with_environment(
             _ => return Err(invalid("unknown device kind")),
         };
         if explicit_local_rootfs && root.runtime == "runsc" && kind == pb::DeviceKind::Gpu {
-            return Err(invalid("runsc GPU allocation requires a writable rootfs"));
+            return Err(invalid(
+                "runsc GPU allocation is not supported with an explicit local rootfs",
+            ));
         }
         let count = parts[2]
             .parse::<u32>()

@@ -32,9 +32,10 @@ An explicit Local rootfs with effective runtime `supervisor` or `conch` returns
 explicit workload `process` commands, working directory and user overrides through
 Execd. Fields omitted from `process` retain the corresponding image defaults.
 
-An explicit Local source is always read-only, regardless of the deployment
-rootfs default. The create endpoint rejects `rootfs.readonly=false`, writable
-layer quotas and runsc GPU allocation for an explicit Local source.
+For runsc, an explicit Local source uses a per-sandbox writable overlay by
+default while keeping the source path read-only. Set `rootfs.readonly=true` for
+a read-only sandbox root. Other supported runtimes require a read-only Local rootfs.
+Writable layer quotas and runsc GPU allocation remain unavailable with an explicit Local source.
 Its absolute path must be a strict descendant of a parent directory in the API
 Server `allowed_local_rootfs_dirs` list. See the
 [deployment example](../../../platform/api/http/environment-create.md#caller-prepared-local-rootfs).
