@@ -122,6 +122,17 @@ impl PeerSessionIdentity {
         })
     }
 
+    #[cfg(all(feature = "dfs", feature = "rdma"))]
+    fn is_dfs_without_server_generation(&self) -> bool {
+        matches!(
+            self.scope,
+            PeerSessionScope::Dfs {
+                server_generation: None,
+                ..
+            }
+        )
+    }
+
     #[cfg(feature = "ownerfs")]
     pub fn for_owner(
         authenticated_node_id: String,
@@ -183,6 +194,13 @@ pub async fn negotiate_for_peer(
     let Some(device) = registry.device.clone() else {
         return Ok(Response::new(rdma_unsupported_reply()));
     };
+    #[cfg(all(feature = "dfs", feature = "rdma"))]
+    if registry.dfs_require_server_generation && identity.is_dfs_without_server_generation() {
+        return Err(coded_status(
+            afs_error::NODE_RDMA_HANDSHAKE_VERSION,
+            "DFS RDMA peer did not request the required server generation",
+        ));
+    }
     negotiate_rdma(registry, device, request, Some(identity)).await
 }
 
@@ -206,6 +224,8 @@ pub struct RdmaSessionRegistry {
     inner: Arc<Mutex<HashMap<u64, Arc<RdmaSession>>>>,
     #[cfg(feature = "dfs")]
     dfs_generation: Arc<std::sync::OnceLock<[u8; 16]>>,
+    #[cfg(all(feature = "dfs", feature = "rdma"))]
+    dfs_require_server_generation: bool,
     #[cfg(feature = "rdma")]
     next_id: Arc<AtomicU64>,
     #[cfg(feature = "rdma")]
@@ -232,6 +252,8 @@ impl RdmaSessionRegistry {
             inner: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "dfs")]
             dfs_generation: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(all(feature = "dfs", feature = "rdma"))]
+            dfs_require_server_generation: false,
             #[cfg(feature = "rdma")]
             next_id: Arc::new(AtomicU64::new(1)),
             #[cfg(feature = "rdma")]
@@ -245,6 +267,28 @@ impl RdmaSessionRegistry {
     pub(super) fn dfs_generation(&self) -> &[u8; 16] {
         self.dfs_generation
             .get_or_init(|| *uuid::Uuid::new_v4().as_bytes())
+    }
+
+    #[cfg(all(feature = "dfs", feature = "rdma"))]
+    #[must_use]
+    pub(crate) fn with_dfs_generation_requirement(mut self, required: bool) -> Self {
+        self.dfs_require_server_generation = required;
+        self
+    }
+
+    #[cfg(all(feature = "dfs", feature = "rdma"))]
+    pub(crate) async fn dfs_unbound_sessions(&self) -> usize {
+        self.inner
+            .lock()
+            .await
+            .values()
+            .filter(|session| {
+                session
+                    .peer_identity
+                    .as_ref()
+                    .is_some_and(PeerSessionIdentity::is_dfs_without_server_generation)
+            })
+            .count()
     }
 
     #[cfg(feature = "dfs")]
@@ -350,11 +394,23 @@ impl RdmaSessionRegistry {
     /// 这不是业务恢复机制，只是释放传输资源并阻止旧 session 继续访问 MR/QP。
     pub async fn cleanup_expired(&self) {
         let now = Instant::now();
-        self.inner.lock().await.retain(|_, session| {
-            !session.poisoned.load(Ordering::SeqCst)
-                && now.duration_since(*session.last_used.lock().expect("last_used lock poisoned"))
-                    < self.ttl
-        });
+        let expired: Vec<_> = self
+            .inner
+            .lock()
+            .await
+            .extract_if(|_, session| {
+                session.poisoned.load(Ordering::SeqCst)
+                    || now
+                        .duration_since(*session.last_used.lock().expect("last_used lock poisoned"))
+                        >= self.ttl
+            })
+            .map(|(_, session)| session)
+            .collect();
+        if !expired.is_empty() {
+            // Retirement may poll the CQ. Release endpoints outside the table
+            // lock and off the async runtime, including TTL or poison cleanup.
+            let _ = crate::node::bridge::spawn_blocking(move || drop(expired)).await;
+        }
     }
 
     #[cfg(feature = "rdma")]
@@ -404,7 +460,11 @@ impl RdmaSessionRegistry {
                 "RDMA close identity does not match session owner",
             ));
         }
-        sessions.remove(&session_id);
+        let removed = sessions.remove(&session_id);
+        drop(sessions);
+        if let Some(session) = removed {
+            let _ = crate::node::bridge::spawn_blocking(move || drop(session)).await;
+        }
         Ok(())
     }
 }
@@ -725,7 +785,11 @@ mod tests {
         assert_eq!(reply.handshake_version, RDMA_HANDSHAKE_VERSION);
     }
 
-    #[cfg(all(feature = "dfs", not(feature = "rdma")))]
+    #[cfg(feature = "dfs")]
+    #[cfg_attr(
+        feature = "rdma",
+        ignore = "run on Linux with an RXE or physical RDMA device"
+    )]
     #[tokio::test]
     async fn dfs_rdma_generation_fences_id_reuse_and_legacy_close() {
         let old = RdmaSessionRegistry::new(None);
@@ -739,12 +803,29 @@ mod tests {
         let stale = new.dfs_session_identity(caller, 1, old.dfs_generation());
         assert_eq!(stale.err().unwrap().code(), tonic::Code::FailedPrecondition);
 
+        #[cfg(feature = "rdma")]
+        let endpoint = {
+            let device = std::env::var("AFS_TEST_RDMA_DEVICE")
+                .or_else(|_| std::env::var("AFS_RDMA_DEVICE"))
+                .expect("set AFS_TEST_RDMA_DEVICE or AFS_RDMA_DEVICE for the RDMA fixture");
+            let permit = new.reserve_admission().await.unwrap();
+            let endpoint = crate::node::bridge::spawn_blocking(move || {
+                RdmaEndpointLease::open(&device, 1, permit)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            Arc::new(Mutex::new(endpoint))
+        };
+
         // An authenticated legacy command cannot address a generation-bound
         // session, even if it knows the recycled numeric identifier.
         new.inner.lock().await.insert(
             1,
             Arc::new(RdmaSession {
                 peer_identity: Some(bound.clone()),
+                #[cfg(feature = "rdma")]
+                endpoint,
                 ready: AtomicBool::new(true),
                 poisoned: AtomicBool::new(false),
                 last_used: StdMutex::new(Instant::now()),
@@ -755,6 +836,39 @@ mod tests {
         assert!(new.session_for(1, &bound).await.is_ok());
         new.close_for(1, &bound).await.unwrap();
         assert!(new.session_for(1, &bound).await.is_err());
+    }
+
+    #[cfg(all(feature = "dfs", feature = "rdma"))]
+    #[tokio::test]
+    async fn dfs_rdma_required_generation_refuses_legacy_before_native_admission() {
+        let registry = RdmaSessionRegistry::new(Some("unused-test-device".into()))
+            .with_dfs_generation_requirement(true);
+        let legacy = registry
+            .dfs_session_identity("reader".into(), 1, &[])
+            .unwrap();
+        let request = NegotiateDataRequest {
+            handshake_version: RDMA_HANDSHAKE_VERSION,
+            ..Default::default()
+        };
+        let error = negotiate_for_peer(&registry, legacy.clone(), request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            afs_transport::grpc::error_status::status_to_error(error).code(),
+            afs_error::NODE_RDMA_HANDSHAKE_VERSION
+        );
+        assert_eq!(registry.admission.available_permits(), MAX_RDMA_SESSIONS);
+        assert_eq!(registry.dfs_unbound_sessions().await, 0);
+        let unsupported = negotiate_for_peer(
+            &RdmaSessionRegistry::default().with_dfs_generation_requirement(true),
+            legacy,
+            request,
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!unsupported.rdma_supported);
+        assert_eq!(unsupported.session_id, 0);
     }
 
     #[cfg(feature = "rdma")]

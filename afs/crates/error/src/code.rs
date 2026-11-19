@@ -63,6 +63,7 @@ catalog! {
     NODE_OWNER_STALE_ACCESS = 0x020b0004 => FailedPrecondition;
     NODE_OWNER_STALE_HANDLE = 0x020b0005 => FailedPrecondition;
     NODE_OWNER_WRITE_UNKNOWN = 0x020b0006 => Internal;
+    NODE_OWNER_WRITE_NOT_EXECUTED = 0x020b0007 => Aborted;
     NODE_DFS_STALE_HANDLE = 0x020c0001 => FailedPrecondition;
     NODE_DFS_STALE_NAME = 0x020c0002 => FailedPrecondition;
     NODE_RDMA_SESSION_UNKNOWN = 0x02090001 => FailedPrecondition;

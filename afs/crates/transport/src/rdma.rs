@@ -565,7 +565,17 @@ struct QuarantinedEndpoint {
 }
 
 #[cfg(has_native_rdma)]
-static QUARANTINE: Mutex<Vec<QuarantinedEndpoint>> = Mutex::new(Vec::new());
+#[derive(Default)]
+struct Quarantine {
+    records: Vec<QuarantinedEndpoint>,
+    failed_retirements: usize,
+}
+
+#[cfg(has_native_rdma)]
+static QUARANTINE: Mutex<Quarantine> = Mutex::new(Quarantine {
+    records: Vec::new(),
+    failed_retirements: 0,
+});
 
 #[cfg(has_native_rdma)]
 static ENDPOINT_OPENS: AtomicUsize = AtomicUsize::new(0);
@@ -576,15 +586,19 @@ static REGISTERED_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub fn resource_stats() -> RdmaResourceStats {
     #[cfg(has_native_rdma)]
     {
-        let records = QUARANTINE
+        let quarantine = QUARANTINE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         RdmaResourceStats {
             endpoint_opens: ENDPOINT_OPENS.load(Ordering::Relaxed),
             registered_bytes: REGISTERED_BYTES.load(Ordering::Relaxed),
-            failed_retirements: records.len(),
-            retained_endpoints: records.len(),
-            retained_registered_bytes: records.iter().map(|record| record.registered_bytes).sum(),
+            failed_retirements: quarantine.failed_retirements,
+            retained_endpoints: quarantine.records.len(),
+            retained_registered_bytes: quarantine
+                .records
+                .iter()
+                .map(|record| record.registered_bytes)
+                .sum(),
         }
     }
     #[cfg(not(has_native_rdma))]
@@ -617,20 +631,22 @@ impl RdmaEndpoint {
 
 #[cfg(has_native_rdma)]
 fn quarantine<P: Send + 'static>(
-    ledger: &Mutex<Vec<QuarantinedEndpoint>>,
+    ledger: &Mutex<Quarantine>,
     native: RetainedEndpoint,
     admission: P,
     stage: i32,
     registered_bytes: usize,
 ) -> RdmaRetireOutcome {
-    ledger
+    let mut ledger = ledger
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(QuarantinedEndpoint {
-            _native: native,
-            _admission: Box::new(admission),
-            registered_bytes,
-        });
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ledger.failed_retirements += 1;
+    ledger.records.push(QuarantinedEndpoint {
+        _native: native,
+        _admission: Box::new(admission),
+        registered_bytes,
+    });
+    drop(ledger);
     eprintln!("AFS_RDMA_TEARDOWN stage={stage} retained_registered_bytes={registered_bytes}");
     RdmaRetireOutcome::Quarantined {
         stage,
@@ -742,7 +758,7 @@ mod tests {
 
     #[cfg(has_native_rdma)]
     #[test]
-    fn rdma_retirement_failure_retains_admission_for_qp_and_mr() {
+    fn rdma_retirement_failure_retains_admission_for_qp_mr_and_drain() {
         use std::sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -756,9 +772,9 @@ mod tests {
             }
         }
 
-        let ledger = Mutex::new(Vec::new());
+        let ledger = Mutex::new(super::Quarantine::default());
         let released = Arc::new(AtomicUsize::new(0));
-        for stage in [1, 2] {
+        for stage in [1, 2, 6] {
             let outcome = super::quarantine(
                 &ledger,
                 super::RetainedEndpoint {
@@ -778,18 +794,25 @@ mod tests {
         }
         assert_eq!(released.load(Ordering::Relaxed), 0);
         {
-            let records = ledger.lock().unwrap();
-            assert_eq!(records.len(), 2);
+            let mut ledger = ledger.lock().unwrap();
+            assert_eq!(ledger.failed_retirements, 3);
+            assert_eq!(ledger.records.len(), 3);
             assert_eq!(
-                records
+                ledger
+                    .records
                     .iter()
                     .map(|entry| entry.registered_bytes)
                     .sum::<usize>(),
-                2 * super::CAPACITY
+                3 * super::CAPACITY
             );
+            // A hypothetical recovery frees retained resources without
+            // erasing a retirement failure from the cumulative counter.
+            drop(ledger.records.pop());
+            assert_eq!(ledger.failed_retirements, 3);
+            assert_eq!(ledger.records.len(), 2);
         }
         drop(ledger);
-        assert_eq!(released.load(Ordering::Relaxed), 2);
+        assert_eq!(released.load(Ordering::Relaxed), 3);
     }
 
     #[test]

@@ -56,30 +56,90 @@ async fn ping(State(node): State<Arc<Node>>) -> Json<Value> {
     node.observability.record("node", "rest_ping", true);
     Json(json!({"message":format!("pong from {}",node.config.id)}))
 }
-async fn metrics(State(node): State<Arc<Node>>) -> Result<String, RestError> {
+async fn metrics(
+    State(node): State<Arc<Node>>,
+    #[cfg(all(feature = "dfs", feature = "rdma"))] sessions: Option<
+        axum::Extension<crate::node::rpc::control::RdmaSessionRegistry>,
+    >,
+) -> Result<String, RestError> {
     let encoded = afs_metrics::encode_text(&node.observability.registry)
         .map_err(|e| RestError(Error::coded(METRICS_FAILED, e.to_string())))?;
     #[cfg(feature = "rdma")]
     {
         let stats = afs_transport::rdma::resource_stats();
-        if let Some(body) = encoded.strip_suffix("# EOF\n") {
-            return Ok(format!(
-                "{body}# TYPE afs_rdma_endpoint_opens counter\nafs_rdma_endpoint_opens_total {}\n\
-                 # TYPE afs_rdma_registered_bytes gauge\nafs_rdma_registered_bytes {}\n\
-                 # TYPE afs_rdma_failed_retirements counter\n\
-                 afs_rdma_failed_retirements_total {}\n\
-                 # TYPE afs_rdma_retained_endpoints gauge\nafs_rdma_retained_endpoints {}\n\
-                 # TYPE afs_rdma_retained_registered_bytes gauge\nafs_rdma_retained_registered_bytes {}\n\
-                 # EOF\n",
-                stats.endpoint_opens,
-                stats.registered_bytes,
-                stats.failed_retirements,
-                stats.retained_endpoints,
-                stats.retained_registered_bytes
-            ));
-        }
+        #[cfg(feature = "dfs")]
+        let dfs = Some((
+            match sessions {
+                Some(axum::Extension(sessions)) => sessions.dfs_unbound_sessions().await,
+                None => 0,
+            },
+            crate::node::rpc::peer::DfsRdmaPool::unbound_server_replies(),
+        ));
+        #[cfg(not(feature = "dfs"))]
+        let dfs = None;
+        Ok(append_rdma_metrics(encoded, stats, dfs))
     }
+    #[cfg(not(feature = "rdma"))]
     Ok(encoded)
+}
+
+#[cfg(feature = "rdma")]
+fn append_rdma_metrics(
+    encoded: String,
+    stats: afs_transport::rdma::RdmaResourceStats,
+    dfs: Option<(usize, u64)>,
+) -> String {
+    let Some(body) = encoded.strip_suffix("# EOF\n") else {
+        return encoded;
+    };
+    let dfs = dfs.map_or_else(String::new, |(sessions, replies)| {
+        format!(
+            "# TYPE afs_dfs_rdma_unbound_sessions gauge\nafs_dfs_rdma_unbound_sessions {sessions}\n\
+             # TYPE afs_dfs_rdma_unbound_server_replies counter\n\
+             afs_dfs_rdma_unbound_server_replies_total {replies}\n"
+        )
+    });
+    format!(
+        "{body}# TYPE afs_rdma_endpoint_opens counter\nafs_rdma_endpoint_opens_total {}\n\
+         # TYPE afs_rdma_registered_bytes gauge\nafs_rdma_registered_bytes {}\n\
+         # TYPE afs_rdma_failed_retirements counter\nafs_rdma_failed_retirements_total {}\n\
+         # TYPE afs_rdma_retained_endpoints gauge\nafs_rdma_retained_endpoints {}\n\
+         # TYPE afs_rdma_retained_registered_bytes gauge\nafs_rdma_retained_registered_bytes {}\n\
+         {dfs}# EOF\n",
+        stats.endpoint_opens,
+        stats.registered_bytes,
+        stats.failed_retirements,
+        stats.retained_endpoints,
+        stats.retained_registered_bytes
+    )
+}
+
+#[cfg(all(test, feature = "rdma"))]
+#[test]
+fn rdma_openmetrics_retention_and_failure_samples_precede_one_eof() {
+    let encoded = afs_metrics::encode_text(&afs_metrics::registry()).unwrap();
+    let snapshot = append_rdma_metrics(
+        encoded,
+        afs_transport::rdma::RdmaResourceStats {
+            failed_retirements: 3,
+            retained_endpoints: 2,
+            retained_registered_bytes: 4096,
+            ..Default::default()
+        },
+        Some((1, 5)),
+    );
+    assert_eq!(snapshot.matches("# EOF").count(), 1);
+    assert_eq!(snapshot.lines().last(), Some("# EOF"));
+    assert!(snapshot.ends_with("# EOF\n"));
+    for sample in [
+        "# TYPE afs_rdma_failed_retirements counter\nafs_rdma_failed_retirements_total 3\n",
+        "# TYPE afs_rdma_retained_endpoints gauge\nafs_rdma_retained_endpoints 2\n",
+        "# TYPE afs_rdma_retained_registered_bytes gauge\nafs_rdma_retained_registered_bytes 4096\n",
+        "# TYPE afs_dfs_rdma_unbound_sessions gauge\nafs_dfs_rdma_unbound_sessions 1\n",
+        "# TYPE afs_dfs_rdma_unbound_server_replies counter\nafs_dfs_rdma_unbound_server_replies_total 5\n",
+    ] {
+        assert!(snapshot.contains(sample));
+    }
 }
 async fn diagnostics(State(node): State<Arc<Node>>) -> Result<Json<Value>, RestError> {
     let result = crate::node::diagnostics::probe::diagnose(node.clone())

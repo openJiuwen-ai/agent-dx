@@ -2042,7 +2042,10 @@ async fn owner_rdma_write_from_client(
             Ok(data) => data,
             Err(error) => {
                 worker.poisoned.store(true, Ordering::SeqCst);
-                return Err(rdma_status(error));
+                return Err(coded_status(
+                    afs_error::NODE_OWNER_WRITE_NOT_EXECUTED,
+                    error.to_string(),
+                ));
             }
         };
         if let Err(error) = verify_owner_checksum(&data, &request.data_checksum) {
@@ -2074,11 +2077,36 @@ async fn owner_rdma_write_from_client(
         Ok(reply)
     })
     .await
-    .map_err(|error| coded_status(afs_error::NODE_OWNER_WRITE_UNKNOWN, error.to_string()))?;
+    .map_err(owner_write_worker_status)?;
     if result.is_err() {
         session.poisoned.store(true, Ordering::SeqCst);
     }
     result
+}
+
+#[cfg(feature = "ownerfs")]
+fn owner_write_worker_status(error: tokio::task::JoinError) -> Status {
+    // A running spawn_blocking closure cannot be cancelled. A panic may
+    // follow the file write, so only a cancelled queued job proves no write.
+    let code = if error.is_cancelled() {
+        afs_error::NODE_OWNER_WRITE_NOT_EXECUTED
+    } else {
+        afs_error::NODE_OWNER_WRITE_UNKNOWN
+    };
+    coded_status(code, format!("OwnerFiles.Write worker failed: {error}"))
+}
+
+#[cfg(feature = "ownerfs")]
+fn owner_write_probe_status(status: Status) -> Status {
+    let error = afs_transport::grpc::error_status::status_to_error(status.clone());
+    if matches!(
+        error.code(),
+        afs_error::NODE_TRANSFER_UNAVAILABLE | afs_error::NODE_TRANSFER_INTERNAL
+    ) {
+        coded_status(afs_error::NODE_OWNER_WRITE_NOT_EXECUTED, error.to_string())
+    } else {
+        status
+    }
 }
 
 #[cfg(all(feature = "ownerfs", not(feature = "rdma")))]
@@ -2455,7 +2483,9 @@ impl OwnerFiles for OwnerFilesService {
                 auth_handler.authorize_data_write(&auth_peer, &presented, &remote)
             })
             .await
-            .map_err(|error| Status::internal(error.to_string()))?
+            .map_err(|error| {
+                coded_status(afs_error::NODE_OWNER_WRITE_NOT_EXECUTED, error.to_string())
+            })?
             .map_err(error_to_status)?;
             let session = owner_rdma_session(
                 &self.rdma_sessions(operation)?,
@@ -2463,7 +2493,8 @@ impl OwnerFiles for OwnerFilesService {
                 &access,
                 plane.rdma_session_id,
             )
-            .await?;
+            .await
+            .map_err(owner_write_probe_status)?;
             let rpc_guard = OwnerServerRdmaGuard::new(session.clone());
             let started = std::time::Instant::now();
             let reply = owner_rdma_write_from_client(session, handler, peer, request).await?;
@@ -2485,12 +2516,7 @@ impl OwnerFiles for OwnerFilesService {
         let started = std::time::Instant::now();
         let reply = crate::node::bridge::spawn_blocking(move || handler.write(&peer, request))
             .await
-            .map_err(|error| {
-                coded_status(
-                    afs_error::CLIENT_WORKER_FAILED,
-                    format!("{operation} blocking worker failed: {error}"),
-                )
-            })?
+            .map_err(owner_write_worker_status)?
             .map_err(error_to_status)?;
         if reply.written > request_length {
             return Err(coded_status(

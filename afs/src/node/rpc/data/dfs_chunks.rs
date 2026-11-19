@@ -571,6 +571,12 @@ impl DfsChunks for DfsChunksService {
         )
         .await?
         .into_inner();
+        if negotiated.rdma_supported && server_generation.is_empty() {
+            afs_logging::warn!(
+                "dfs.rdma_legacy_session_accepted";
+                "session_id" => negotiated.session_id
+            );
+        }
         Ok(Response::new(DfsNegotiateRdmaReply {
             session_id: negotiated.session_id,
             server_info: negotiated.server_info,

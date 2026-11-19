@@ -103,7 +103,10 @@ use afs_transport::rdma::{CAPACITY, RdmaEndpoint};
 use crate::node::vfs::{
     ownerfs::{
         files::{FileIdentity, OwnerEntry, RemoteDirectory, RemoteFile},
-        remote::{RemoteCreatedFile, RemoteDirectoryEntry, RemoteFiles},
+        remote::{
+            RemoteCreatedFile, RemoteDirectoryEntry, RemoteFiles,
+            write_status_requires_execution_evidence,
+        },
         root::RootGrant,
     },
     types::{
@@ -648,7 +651,9 @@ impl OwnerPeerClient {
             }
         })
         .await
-        .map_err(|error| PeerError::coded(afs_error::CLIENT_WORKER_FAILED, error.to_string()))?
+        .map_err(|error| {
+            PeerError::coded(afs_error::NODE_OWNER_WRITE_NOT_EXECUTED, error.to_string())
+        })?
         .map_err(owner_rdma_error)?;
         let mut client = self.cloned_client()?;
         let mut request = request_with_current_context(OwnerWriteRequest {
@@ -665,7 +670,7 @@ impl OwnerPeerClient {
         let reply = client
             .write(request)
             .await
-            .map_err(owner_write_status)?
+            .map_err(owner_dispatched_write_status)?
             .into_inner();
         if reply.written as usize > payload.len() {
             return Err(PeerError::coded(
@@ -751,19 +756,11 @@ impl Drop for OwnerRdmaCloseGuard {
 }
 
 #[cfg(feature = "ownerfs")]
-fn owner_write_status(status: tonic::Status) -> PeerError {
+fn owner_dispatched_write_status(status: tonic::Status) -> PeerError {
+    // Apply this only to the business RPC result. A local worker or
+    // negotiation failure before calling Write does not imply a mutation.
     let received = PeerError::from(status);
-    let uncertain = matches!(
-        received.kind(),
-        afs_error::ErrorKind::Unavailable
-            | afs_error::ErrorKind::DeadlineExceeded
-            | afs_error::ErrorKind::Cancelled
-            | afs_error::ErrorKind::Unknown
-    ) || matches!(
-        received.code(),
-        afs_error::CLIENT_PROTOCOL_INVALID_ERROR_DETAIL | afs_error::CLIENT_WORKER_FAILED
-    );
-    if uncertain && received.code() != afs_error::NODE_OWNER_GRANT_UNAVAILABLE {
+    if write_status_requires_execution_evidence(&received.0) {
         return PeerError::coded(
             afs_error::NODE_OWNER_WRITE_UNKNOWN,
             format!("OwnerFiles write outcome is unknown: {received}"),
@@ -1612,7 +1609,7 @@ impl RemoteFiles for OwnerPeerClient {
                         },
                     }))
                     .await
-                    .map_err(owner_write_status)
+                    .map_err(owner_dispatched_write_status)
                     .map(|reply| reply.into_inner())
             })?;
             if reply.written as usize > len {

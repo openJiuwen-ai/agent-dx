@@ -123,6 +123,25 @@ fn poisoning_preserves_failure_category() {
     }
 }
 use super::*;
+
+#[cfg(feature = "ownerfs")]
+#[test]
+fn owner_dispatched_write_preserves_explicit_not_executed() {
+    let status = afs_transport::grpc::error_status::coded_status(
+        afs_error::NODE_OWNER_WRITE_NOT_EXECUTED,
+        "queued write was cancelled",
+    );
+    assert_eq!(
+        owner_dispatched_write_status(status).code(),
+        afs_error::NODE_OWNER_WRITE_NOT_EXECUTED
+    );
+    for status in [Status::cancelled("lost"), Status::internal("stream reset")] {
+        assert_eq!(
+            owner_dispatched_write_status(status).code(),
+            afs_error::NODE_OWNER_WRITE_UNKNOWN
+        );
+    }
+}
 #[cfg(feature = "ownerfs")]
 use crate::node::rpc::data::{
     OwnerFilesHandler, PeerAuthenticator, make_owner_files_server_with_handler,

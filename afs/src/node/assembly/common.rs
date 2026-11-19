@@ -382,6 +382,9 @@ impl LocalEndpoints {
             cfg.data_dir.join("diagnostics"),
         )?);
         let sessions = rpc::control::RdmaSessionRegistry::new(cfg.rdma_device.clone());
+        #[cfg(all(feature = "dfs", feature = "rdma"))]
+        let sessions =
+            sessions.with_dfs_generation_requirement(cfg.dfs_rdma_require_server_generation);
         #[cfg(feature = "ownerfs")]
         let owner_rdma_sessions = rpc::control::RdmaSessionRegistry::new(cfg.rdma_device.clone());
         // 本机 SDK 的数据面直接调用已装配的 DFS 后端；未启用 DFS 时保持 None，

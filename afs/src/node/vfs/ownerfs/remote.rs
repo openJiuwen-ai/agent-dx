@@ -6,12 +6,31 @@
 
 use std::ffi::{OsStr, OsString};
 
-use afs_error::{Error, Result};
+use afs_error::{Error, ErrorKind, Result};
 
 use super::{
     files::{FileIdentity, OwnerEntry, RemoteDirectory, RemoteFile},
     root::RootGrant,
 };
+
+/// Older peers and transport failures can return these statuses without
+/// proving whether Write entered the file mutation stage.
+pub(crate) fn write_status_requires_execution_evidence(error: &Error) -> bool {
+    match error.code() {
+        afs_error::NODE_OWNER_GRANT_UNAVAILABLE => false,
+        afs_error::CLIENT_PROTOCOL_INVALID_ERROR_DETAIL | afs_error::CLIENT_WORKER_FAILED => true,
+        code => {
+            matches!(
+                error.kind(),
+                ErrorKind::Unavailable
+                    | ErrorKind::DeadlineExceeded
+                    | ErrorKind::Cancelled
+                    | ErrorKind::Unknown
+            ) || (code == afs_error::CLIENT_REMOTE_STATUS
+                && matches!(error.kind(), ErrorKind::Internal | ErrorKind::DataLoss))
+        }
+    }
+}
 
 use crate::node::vfs::locks::{LockRequest, LockWaiterId, LockWaiterOutcome};
 use crate::node::vfs::types::{

@@ -31,6 +31,7 @@ enum afs_rdma_close_result {
     AFS_RDMA_RETAINED_CQ = 3,
     AFS_RDMA_RETAINED_PD = 4,
     AFS_RDMA_RETAINED_CONTEXT = 5,
+    AFS_RDMA_RETAINED_DRAIN = 6,
 };
 int afs_rdma_close(void *, size_t *retained_registered_bytes);
 #endif

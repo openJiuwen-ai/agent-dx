@@ -202,8 +202,11 @@ def main():
     lines = native.read_text().splitlines()
     start = next(i for i, line in enumerate(lines) if line.startswith("int afs_rdma_transfer("))
     line = next(i for i in range(start, len(lines)) if "uint64_t deadline=monotonic_ms()+timeout_ms;" in lines[i])
-    if "if (ibv_post_send(" not in lines[line - 1]:
-        raise AssertionError("checkpoint must follow successful data post")
+    if (
+        "if (ibv_post_send(" not in lines[line - 2]
+        or "e->pending_wr |= AFS_RDMA_PENDING_DATA;" not in lines[line - 1]
+    ):
+        raise AssertionError("checkpoint must follow a successful and tracked data post")
     script = directory / "checkpoint.gdb"
     script.write_text(
         textwrap.dedent(f"""\

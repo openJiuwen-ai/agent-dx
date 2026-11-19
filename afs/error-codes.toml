@@ -250,6 +250,14 @@ subsystem = "OwnerFs"
 description = "已提交的远端文件写入结果未知，同一打开句柄须清理，不得自动重放"
 
 [[error]]
+name = "NODE_OWNER_WRITE_NOT_EXECUTED"
+value = "0x020b0007"
+kind = "Aborted"
+component = "Node"
+subsystem = "OwnerFs"
+description = "有明确证据表明远端文件写入未进入文件修改阶段"
+
+[[error]]
 name = "NODE_DFS_STALE_HANDLE"
 value = "0x020c0001"
 kind = "FailedPrecondition"

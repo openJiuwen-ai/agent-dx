@@ -138,6 +138,40 @@ async fn grpc_inline_write_then_read_uses_storage() {
     assert_eq!(read.data, b"12345678");
 }
 
+#[cfg(feature = "ownerfs")]
+#[test]
+fn owner_write_worker_cancelled_before_execution_is_not_unknown() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocker = crate::node::bridge::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        started.await.unwrap();
+        let cancelled = crate::node::bridge::spawn_blocking(|| panic!("queued write ran"));
+        cancelled.abort();
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        let status = owner_write_worker_status(cancelled.await.unwrap_err());
+        assert_eq!(
+            afs_transport::grpc::error_status::status_to_error(status).code(),
+            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED
+        );
+
+        let failed = crate::node::bridge::spawn_blocking(|| panic!("write worker failed"));
+        let status = owner_write_worker_status(failed.await.unwrap_err());
+        assert_eq!(
+            afs_transport::grpc::error_status::status_to_error(status).code(),
+            afs_error::NODE_OWNER_WRITE_UNKNOWN
+        );
+    });
+}
+
 #[tokio::test]
 async fn rdma_read_validates_session_before_touching_storage() {
     let temp = tempfile::tempdir().unwrap();

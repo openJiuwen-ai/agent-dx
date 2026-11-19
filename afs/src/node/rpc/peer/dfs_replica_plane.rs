@@ -448,12 +448,17 @@ pub struct DfsRdmaPool {
     pub(super) peers: Arc<PeerConnectionPool>,
     #[cfg(feature = "rdma")]
     device: String,
+    #[cfg(feature = "rdma")]
+    require_server_generation: bool,
     pub(super) timeout: Duration,
     #[cfg(feature = "rdma")]
     slots: tokio::sync::Mutex<std::collections::HashMap<DfsRdmaKey, DfsRdmaSlot>>,
     #[cfg(feature = "rdma")]
     permits: Arc<tokio::sync::Semaphore>,
 }
+
+#[cfg(all(feature = "dfs", feature = "rdma"))]
+static UNBOUND_SERVER_REPLIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(feature = "dfs", feature = "rdma"))]
 pub(super) struct DfsRdmaSlot {
@@ -486,12 +491,21 @@ impl DfsRdmaPool {
         device: String,
         timeout: Duration,
     ) -> afs_error::Result<Self> {
+        Self::new_with_generation_requirement(peers, device, timeout, false)
+    }
+
+    pub(crate) fn new_with_generation_requirement(
+        peers: Arc<PeerConnectionPool>,
+        device: String,
+        timeout: Duration,
+        require_server_generation: bool,
+    ) -> afs_error::Result<Self> {
         if device.is_empty() || timeout.is_zero() {
             return Err(dfs_protocol_error("DFS RDMA device/timeout is required"));
         }
         #[cfg(not(feature = "rdma"))]
         {
-            let _ = peers;
+            let _ = (peers, require_server_generation);
             Err(afs_error::Error::coded(
                 afs_error::NODE_TRANSFER_UNSUPPORTED,
                 "DFS RDMA is not compiled",
@@ -508,11 +522,17 @@ impl DfsRdmaPool {
             Ok(Self {
                 peers,
                 device,
+                require_server_generation,
                 timeout,
                 slots: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                 permits: Arc::new(tokio::sync::Semaphore::new(16)),
             })
         }
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn unbound_server_replies() -> u64 {
+        UNBOUND_SERVER_REPLIES.load(Ordering::Relaxed)
     }
 
     #[cfg(feature = "rdma")]
@@ -619,6 +639,11 @@ impl DfsRdmaPool {
                     "DFS RDMA negotiation identity/capacity is invalid",
                 ));
             }
+            check_dfs_rdma_server_generation(
+                &reply.server_generation,
+                self.require_server_generation,
+                node_id,
+            )?;
             let server_info = reply.server_info;
             let endpoint = crate::node::bridge::spawn_blocking(move || {
                 let mut endpoint = endpoint;
@@ -654,6 +679,45 @@ impl DfsRdmaPool {
             _guard: guard,
         }))
     }
+}
+
+#[cfg(all(feature = "dfs", feature = "rdma"))]
+fn check_dfs_rdma_server_generation(
+    generation: &[u8],
+    required: bool,
+    node_id: &str,
+) -> afs_error::Result<()> {
+    if generation.is_empty() {
+        let total = UNBOUND_SERVER_REPLIES.fetch_add(1, Ordering::Relaxed) + 1;
+        // A legacy peer can negotiate on each command. Record every reply
+        // while keeping its warning rate bounded during a rolling upgrade.
+        if total.is_power_of_two() {
+            afs_logging::warn!(
+                "dfs.rdma_server_generation_absent";
+                "peer" => node_id,
+                "rejected" => required,
+                "total" => total
+            );
+        }
+        if required {
+            return Err(afs_error::Error::coded(
+                afs_error::NODE_RDMA_HANDSHAKE_VERSION,
+                "DFS RDMA peer did not return the required server generation",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "dfs", feature = "rdma"))]
+#[test]
+fn dfs_rdma_empty_server_generation_obeys_compatibility_policy() {
+    let before = DfsRdmaPool::unbound_server_replies();
+    check_dfs_rdma_server_generation(&[], false, "old-peer").unwrap();
+    let status = check_dfs_rdma_server_generation(&[], true, "old-peer").unwrap_err();
+    assert_eq!(status.code(), afs_error::NODE_RDMA_HANDSHAKE_VERSION);
+    check_dfs_rdma_server_generation(&[1; 16], true, "new-peer").unwrap();
+    assert!(DfsRdmaPool::unbound_server_replies() >= before + 2);
 }
 
 #[cfg(all(feature = "dfs", feature = "rdma"))]
