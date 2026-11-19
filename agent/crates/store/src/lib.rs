@@ -75,6 +75,8 @@ impl Key {
                 | "alias"
                 | "prewarm-policy"
                 | "first-assignment"
+                | "binding-history"
+                | "snapshot-protection"
                 | "snapshot-preparation"
                 | "snapshot-preparation-result"
                 | "template-publication"

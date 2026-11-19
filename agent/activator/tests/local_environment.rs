@@ -13,6 +13,7 @@ use support::network_policy;
 #[derive(Default)]
 struct Application {
     creates: Mutex<Vec<(String, Value, String)>>,
+    preparations: Mutex<Vec<(String, String, Value)>>,
     pauses: Mutex<Vec<(String, String, Value, String)>>,
     stall: bool,
     absent: bool,
@@ -20,6 +21,27 @@ struct Application {
 }
 #[async_trait]
 impl EnvironmentApplication for Application {
+    async fn prepare_snapshot_request(
+        &self,
+        tenant: &str,
+        job: &str,
+        input: Value,
+    ) -> Result<adx_agent_core::prewarm::SeedResult, EnvironmentError> {
+        use adx_agent_core::prewarm::SeedResult;
+        let mut calls = self.preparations.lock().unwrap();
+        let call = (tenant.into(), job.into(), input);
+        if let Some(initial) = calls.first() {
+            assert_eq!(initial, &call);
+        }
+        calls.push(call);
+        Ok(if calls.len() == 1 {
+            SeedResult::Pending
+        } else {
+            SeedResult::Ready {
+                snapshot_id: "one".into(),
+            }
+        })
+    }
     async fn create_request(
         &self,
         tenant: &str,
@@ -80,6 +102,48 @@ fn request() -> CreateEnvironment {
         "image":"app:1","isolation_runtime":"runc","inherit_entrypoint":true,"entrypoint":[],"working_dir":"","user":null,"env":{"MODEL_KEY":"test-key"},"resources":{"cpu_millis":1000,"memory_mib":512},"service":[]
     }})).unwrap()
 }
+#[tokio::test]
+async fn snapshot_registration_replay_keeps_the_published_network_and_timeout() {
+    use adx_agent_core::prewarm::{SeedExecution, SeedResult};
+    let application = Arc::new(Application::default());
+    let a = LocalEnvironment::new(
+        application.clone(),
+        Duration::from_secs(20),
+        network_policy(),
+    )
+    .unwrap();
+    let mut config = network_policy();
+    config.public_egress = !config.public_egress;
+    let b = LocalEnvironment::new(application.clone(), Duration::from_secs(30), config).unwrap();
+    let mut seed = SeedExecution {
+        execution: request().execution,
+        volume: serde_json::from_value(json!({"id":"seed","source":{
+            "type":"directory","storage_domain":"sfs","path":"seed/home"
+        },"access_mode":"exclusive","create_if_missing":true}))
+        .unwrap(),
+        native_input: None,
+    };
+    let job = "job";
+    seed.native_input = a.freeze_preparation("tenant", job, &seed).unwrap();
+    assert_eq!(
+        a.prepare_snapshot("tenant", job, &seed).await.unwrap(),
+        SeedResult::Pending
+    );
+    let persisted = serde_json::to_vec(&seed).unwrap();
+    drop(a);
+    let recovered: SeedExecution = serde_json::from_slice(&persisted).unwrap();
+    assert_eq!(
+        b.prepare_snapshot("tenant", job, &recovered).await.unwrap(),
+        SeedResult::Ready {
+            snapshot_id: "one".into()
+        }
+    );
+    assert_eq!(
+        application.preparations.lock().unwrap()[0].2["environment"]["createTimeoutSeconds"],
+        20
+    );
+}
+
 #[tokio::test]
 async fn local_adapter_passes_the_public_request_and_preserves_unknown_delete() {
     let app = Arc::new(Application::default());

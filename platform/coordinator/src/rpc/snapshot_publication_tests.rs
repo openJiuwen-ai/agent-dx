@@ -201,6 +201,7 @@ async fn slow_snapshot_publication_does_not_block_a_live_heartbeat() {
                 "delete" => {
                     let _ = rpc
                         .delete_snapshot(api_request(pb::DeleteSnapshotRequest {
+                            agent_token: None,
                             id: "publication".into(),
                             caller,
                         }))

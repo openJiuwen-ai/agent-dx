@@ -26,6 +26,13 @@ impl ManagedService {
             templates: Mutex::new(BoundedCache::new(1024)),
         }
     }
+    pub async fn retire_golden(
+        &self,
+        ctx: &RequestContext,
+        request: &prewarm::GoldenRetirement,
+    ) -> Result<()> {
+        self.control.retire_golden(ctx, request).await
+    }
     pub async fn prewarm_policy(
         &self,
         ctx: &RequestContext,

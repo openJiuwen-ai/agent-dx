@@ -56,12 +56,14 @@ impl PrewarmRecipe {
 }
 
 pub fn sha256(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
+    value.strip_prefix("sha256:").is_some_and(workspace_digest)
+}
+
+pub fn workspace_digest(hex: &str) -> bool {
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +80,9 @@ pub enum SnapshotPreparation {
 pub struct SeedExecution {
     pub execution: crate::environment::ExecutionSpec,
     pub volume: crate::volumes::VolumeSpec,
+    /// Native request captured by the publishing adapter, including deployment policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_input: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +107,9 @@ pub struct EligibleStart {
 pub struct PrewarmPolicy {
     pub enabled: bool,
     pub first_enabled_at_ms: Option<u64>,
+    /// Older revisions lack proof that every creation path writes the assignment ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_tracking_since_ms: Option<u64>,
     pub template: String,
     pub version: String,
     pub validation_ref: String,
@@ -111,8 +119,9 @@ impl PrewarmPolicy {
         self.enabled
             && self
                 .first_enabled_at_ms
+                .zip(self.assignment_tracking_since_ms)
                 .zip(subject.registered_at_ms)
-                .is_some_and(|(cut, registration)| registration > cut)
+                .is_some_and(|((cut, tracked), registration)| registration > cut.max(tracked))
     }
 }
 
@@ -151,6 +160,13 @@ impl PolicyUpdate {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoldenRetirement {
+    pub tenant: String,
+    pub snapshot_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

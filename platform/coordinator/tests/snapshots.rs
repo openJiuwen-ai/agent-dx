@@ -311,3 +311,55 @@ async fn committed_snapshot_changes_update_inspection_cache() {
     assert_eq!(snapshots, vec![updated]);
     assert!(holds.is_empty());
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn agent_golden_protection_survives_restart_until_matching_retirement() {
+    use adx_core::{snapshots::SnapshotKind, Error};
+    let mut rig = common::Redis::new().await;
+    let store = rig.store().await;
+    let old = store.begin(1).await.unwrap();
+    let mut golden = snapshot();
+    golden.kind = SnapshotKind::Golden;
+    let id = &golden.id;
+    let proof = uuid::Uuid::new_v4().to_string();
+    old.publish_snapshot(golden.clone()).await.unwrap();
+    old.protect_agent_snapshot(id, "tenant", &proof)
+        .await
+        .unwrap();
+    rig.crash();
+    rig.start().await;
+    let current = rig.store().await.begin(1).await.unwrap();
+    assert!(matches!(
+        current.delete_snapshot(id, "tenant").await,
+        Err(Error::SnapshotInUse { .. })
+    ));
+    assert!(matches!(
+        current
+            .retire_agent_snapshot(id, "tenant", &uuid::Uuid::new_v4().to_string())
+            .await,
+        Err(Error::SnapshotInUse { .. })
+    ));
+    let existing = Reference::Restore {
+        environment_id: "target".into(),
+    };
+    current
+        .acquire_snapshot(id, "tenant", existing.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        current.retire_agent_snapshot(id, "tenant", &proof).await,
+        Err(Error::SnapshotInUse { .. })
+    ));
+    current.release_snapshot(id, existing).await.unwrap();
+    let retired = current
+        .retire_agent_snapshot(id, "tenant", &proof)
+        .await
+        .unwrap();
+    assert_eq!(retired.state, SnapshotState::Deleting);
+    assert!(retired.agent_protection.is_none());
+    assert!(current
+        .protect_agent_snapshot(id, "tenant", &proof)
+        .await
+        .is_err());
+}

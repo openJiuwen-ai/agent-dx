@@ -13,6 +13,17 @@ use std::{sync::Arc, time::Duration};
 /// authenticates the caller before passing its tenant to this private interface.
 #[async_trait]
 pub trait EnvironmentApplication: Send + Sync {
+    async fn agent_snapshot_protection_request(
+        &self,
+        _tenant: &str,
+        _id: &str,
+        _token: &str,
+        _retire: bool,
+    ) -> Result<(), EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "snapshot protection unavailable".into(),
+        ))
+    }
     async fn prepare_snapshot_request(
         &self,
         _tenant: &str,
@@ -97,6 +108,27 @@ impl LocalEnvironment {
 }
 #[async_trait]
 impl Environment for LocalEnvironment {
+    async fn agent_snapshot_protection(
+        &self,
+        tenant: &str,
+        id: &str,
+        token: &str,
+        retire: bool,
+    ) -> Result<(), EnvironmentError> {
+        self.application
+            .agent_snapshot_protection_request(tenant, id, token, retire)
+            .await
+    }
+
+    fn freeze_preparation(
+        &self,
+        tenant: &str,
+        id: &str,
+        seed: &adx_agent_core::prewarm::SeedExecution,
+    ) -> Result<Option<Value>, EnvironmentError> {
+        environment_request::seed_input(tenant, id, seed, self.timeout, &self.network).map(Some)
+    }
+
     async fn prepare_snapshot(
         &self,
         tenant: &str,

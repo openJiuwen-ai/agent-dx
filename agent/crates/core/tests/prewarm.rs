@@ -57,6 +57,7 @@ fn enable_cut_is_strict_and_missing_registration_never_qualifies() {
     let policy = PrewarmPolicy {
         enabled: true,
         first_enabled_at_ms: Some(100),
+        assignment_tracking_since_ms: Some(100),
         template: "assistant".into(),
         version: "1".into(),
         validation_ref: "verified".into(),

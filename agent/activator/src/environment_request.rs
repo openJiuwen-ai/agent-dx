@@ -175,6 +175,9 @@ pub(crate) fn seed_input(
     timeout: Duration,
     network: &SandboxNetworkPolicy,
 ) -> Result<Value, EnvironmentError> {
+    if let Some(input) = &seed.native_input {
+        return Ok(input.clone());
+    }
     let request = CreateEnvironment {
         tenant: tenant.into(),
         id: format!("adx-{id}"),

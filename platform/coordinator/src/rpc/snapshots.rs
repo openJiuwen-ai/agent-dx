@@ -418,6 +418,27 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
             .await
     }
 
+    async fn protect_snapshot(
+        &self,
+        request: Request<pb::ProtectSnapshotRequest>,
+    ) -> std::result::Result<Response<pb::ReusableSnapshot>, Status> {
+        if self.0.peers.authenticate(&request)? != Principal::ApiServer {
+            return Err(Status::permission_denied("Frontend identity required"));
+        }
+        let r = request.into_inner();
+        let state = self.0.state.lock().await;
+        state.healthy().map_err(status)?;
+        let session = state.session.clone();
+        drop(state);
+        let snapshot = session.get_snapshot(&r.id).await.map_err(status)?;
+        tenant(r.caller.as_ref(), &snapshot.template.tenant_id)?;
+        let protected = session
+            .protect_agent_snapshot(&r.id, &snapshot.template.tenant_id, &r.agent_token)
+            .await
+            .map_err(status)?;
+        Ok(Response::new(protected.try_into().map_err(status)?))
+    }
+
     async fn delete_snapshot(
         &self,
         request: Request<pb::DeleteSnapshotRequest>,
@@ -476,10 +497,19 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                         template_ids: templates.into_iter().collect(),
                     }));
                 }
-                let deleted = session
-                    .delete_snapshot(&r.id, &snapshot.template.tenant_id)
-                    .await
-                    .map_err(status)?;
+                let deleted = match r.agent_token {
+                    Some(token) => {
+                        session
+                            .retire_agent_snapshot(&r.id, &snapshot.template.tenant_id, &token)
+                            .await
+                    }
+                    None => {
+                        session
+                            .delete_snapshot(&r.id, &snapshot.template.tenant_id)
+                            .await
+                    }
+                }
+                .map_err(status)?;
                 Ok(Response::new(deleted.try_into().map_err(status)?))
             })
             .await

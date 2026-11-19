@@ -290,6 +290,25 @@ impl Api {
             };
             return response(result, &request_id, None, None, method == "DELETE");
         }
+        if let Some(id) = path.strip_prefix("/api/environment/v1/snapshot-protections/") {
+            let result = async {
+                if !matches!(method.as_str(), "PUT" | "DELETE") {
+                    return Err(Status::unimplemented(
+                        "unsupported snapshot protection method",
+                    ));
+                }
+                let input = body(request.into_body(), 4096).await?;
+                let token = input.get("token").and_then(Value::as_str).ok_or_else(|| {
+                    Status::invalid_argument("snapshot protection proof required")
+                })?;
+                self.environment_service
+                    .agent_snapshot_protection(&caller, id, token.into(), method == "DELETE")
+                    .await?;
+                Ok(json!({}))
+            }
+            .await;
+            return response(result, &request_id, None, None, true);
+        }
         if method == "PUT" {
             if let Some(id) = path.strip_prefix("/api/environment/v1/snapshot-preparations/") {
                 let input = match body(request.into_body(), 1_048_576).await {
@@ -680,6 +699,7 @@ impl Api {
                     .rpc(
                         "apiserver.delete_snapshot",
                         client.delete_snapshot(trace::inject(pb::DeleteSnapshotRequest {
+                            agent_token: None,
                             id: id.into(),
                             caller: Some(caller.clone()),
                         })),

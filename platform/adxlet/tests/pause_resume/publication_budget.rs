@@ -40,6 +40,13 @@ impl pb::snapshot_service_server::SnapshotService for DelayedCatalog {
         Err(Status::unimplemented("not used by this fixture"))
     }
 
+    async fn protect_snapshot(
+        &self,
+        _: tonic::Request<pb::ProtectSnapshotRequest>,
+    ) -> std::result::Result<tonic::Response<pb::ReusableSnapshot>, tonic::Status> {
+        Err(tonic::Status::unimplemented("snapshot protection"))
+    }
+
     async fn delete_snapshot(
         &self,
         _: Request<pb::DeleteSnapshotRequest>,

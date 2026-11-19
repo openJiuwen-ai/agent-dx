@@ -510,6 +510,30 @@ paths:
           $ref: "#/components/responses/Error"
         default:
           $ref: "#/components/responses/Error"
+  /api/environment/v1/snapshot-protections/{snapshotId}:
+    parameters:
+      - name: snapshotId
+        in: path
+        required: true
+        schema: {type: string}
+    put:
+      tags: [Snapshots]
+      operationId: protectAgentGolden
+      summary: Acquire durable protection for a ready Golden
+      requestBody: {$ref: "#/components/requestBodies/AgentSnapshotProof"}
+      responses:
+        "200": {description: Golden protection acquired or already held by this proof}
+        "409": {$ref: "#/components/responses/Error"}
+        default: {$ref: "#/components/responses/Error"}
+    delete:
+      tags: [Snapshots]
+      operationId: retireAgentGolden
+      summary: Consume Agent protection and close the Golden to new restores
+      requestBody: {$ref: "#/components/requestBodies/AgentSnapshotProof"}
+      responses:
+        "200": {description: Retirement accepted}
+        "409": {$ref: "#/components/responses/Error"}
+        default: {$ref: "#/components/responses/Error"}
   /api/environment/v1/snapshot-preparations/{preparationId}:
     put:
       tags: [Snapshots]
@@ -650,6 +674,16 @@ paths:
         default:
           $ref: "#/components/responses/Error"
 components:
+  requestBodies:
+    AgentSnapshotProof:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [token]
+            properties:
+              token: {type: string, format: uuid}
   securitySchemes:
     bearerAuth:
       type: http

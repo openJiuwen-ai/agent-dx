@@ -71,8 +71,8 @@ fn draft(automatic: bool) -> TemplateDraft {
         "name":"digitalmate", "image":fixed_image(), "isolation_runtime":"runsc",
         "auto_prepare_snapshot":automatic, "resources":{"cpu_millis":2000,"memory_mib":4096},
         "service":[{"protocol":"ws","port":18092}], "readiness_probe":{"http_get":{"path":"/health/ready","port":18092}},
-        "env":{"DIGITALMATE_CRYPTO_URL":"https://privacy.example.test", "DIGITALMATE_CRYPTO_TENANT":"tenant",
-            "DIGITALMATE_MODEL_CONFIG_NAME":"approved", "DIGITALMATE_CRYPTO_WORKSPACE":"${workspace}", "API_KEY":"user-secret"},
+        "env":{"DIGITALMATE_WORKSPACE":"/data/state", "DIGITALMATE_CRYPTO_URL":"https://privacy.example.test", "DIGITALMATE_CRYPTO_TENANT":"tenant",
+            "DIGITALMATE_MODEL_CONFIG_NAME":"approved", "DIGITALMATE_CRYPTO_WORKSPACE":"${workspace}"},
         "mounts":[{"type":"bind","volume_id":"user-${workspace}","target":"/data/state"}]
     })).unwrap()
 }
@@ -81,7 +81,7 @@ fn configured(store: AgentState, platform: Arc<Platform>) -> Activator {
     let profiles = serde_json::from_value(json!([{"tenant":"tenant","directory_root":"tenant/workspaces","profile":{
         "schema_version":1,"profile":"golden-test","template":"digitalmate",
         "inherit_from_published_template":["image","isolation_runtime","resources","readiness_probe"],
-        "requires":{"isolation_runtime":"runsc","readiness_http_path":"/health/ready","readiness_response_phase":"golden_seed"},
+        "requires":{"isolation_runtime":"runsc","readiness_http_path":"/health/ready","seed_readiness_http_path":"/health/ready/golden-seed"},
         "seed":{"inherit_entrypoint":true,"env_from_template":["DIGITALMATE_CRYPTO_URL","DIGITALMATE_CRYPTO_TENANT","DIGITALMATE_MODEL_CONFIG_NAME"],
             "env":{"DIGITALMATE_GOLDEN_PHASE":"seed","DIGITALMATE_WORKSPACE":"/data/state"},
             "workspace":{"identity_env":"DIGITALMATE_CRYPTO_WORKSPACE","directory_prefix":"golden-seeds","storage_domain":"sfs",
@@ -125,7 +125,10 @@ async fn helm_delivered_iac_profile_builds_an_anonymous_seed() {
     )
     .with_seed_profiles(profiles)
     .unwrap();
-    let published = activator.publish(tenant, &draft(true)).await.unwrap();
+    let path =
+        std::env::var("ADX_TEST_GOLDEN_DRAFT").expect("set path to IaC-generated TemplateDraft");
+    let input: TemplateDraft = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let published = activator.publish(tenant, &input).await.unwrap();
     assert_eq!(
         published.snapshot_preparation,
         Some(SnapshotPreparation::Pending)
@@ -138,6 +141,17 @@ async fn helm_delivered_iac_profile_builds_an_anonymous_seed() {
     assert_eq!(actual_tenant, tenant);
     assert_eq!(seed.execution.env["DIGITALMATE_GOLDEN_PHASE"], "seed");
     assert!(!seed.execution.env.contains_key("API_KEY"));
+    assert_eq!(
+        seed.execution
+            .readiness_probe
+            .as_ref()
+            .unwrap()
+            .http_get
+            .as_ref()
+            .unwrap()
+            .path,
+        "/health/ready/golden-seed"
+    );
     let adx_agent_core::volumes::VolumeSource::Directory { path, .. } = &seed.volume.source;
     assert!(path.starts_with(&format!("{directory}/golden-seeds/")));
 }
@@ -209,6 +223,34 @@ async fn publication_and_restart(repo: Arc<dyn Repository>) {
     assert_eq!(
         seed.execution.mounts[0].volume_id.as_deref(),
         Some(seed.volume.id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn unsupported_target_settings_are_rejected_before_publication() {
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let author = configured(state, platform.clone());
+    for (key, value) in [
+        ("API_KEY", "private"),
+        ("DIGITALMATE_MEMORY_BACKEND", "mem2"),
+        ("DIGITALMATE_WORKSWARM_WS", "ws://other.example"),
+        ("DIGITALMATE_WORKSPACE", "/mnt/other"),
+    ] {
+        let mut input = draft(true);
+        input.env.insert(key.into(), value.into());
+        assert!(matches!(
+            author.publish("tenant", &input).await,
+            Err(Error::Invalid(_))
+        ));
+    }
+    assert_eq!(
+        author
+            .publish("tenant", &draft(true))
+            .await
+            .unwrap()
+            .version,
+        "1"
     );
 }
 

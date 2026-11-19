@@ -338,7 +338,13 @@ impl Activator {
     }
     pub async fn update_prewarm_policy(&self, request: &PolicyUpdate) -> Result<PolicySnapshot> {
         request.validate().map_err(Error::Invalid)?;
-        if request.enabled {
+        let protected = if request.enabled {
+            let current = self.state.prewarm_policy(&request.scope).await?;
+            if current.as_ref().map(|policy| policy.revision.as_str())
+                != request.expected_revision.as_deref()
+            {
+                return Err(Error::Conflict("prewarm policy revision changed".into()));
+            }
             let template = self
                 .template(&request.scope.tenant, &request.template, &request.version)
                 .await?;
@@ -350,8 +356,48 @@ impl Activator {
                     "Golden snapshot is not ready or compatible".into(),
                 ));
             }
-        }
-        Ok(self.state.update_prewarm_policy(request).await?)
+            let recipe = template
+                .prewarm_recipe
+                .ok_or_else(|| Error::Invalid("missing Golden recipe".into()))?;
+            if request.scope.product == "digitalmate"
+                && current
+                    .as_ref()
+                    .is_none_or(|policy| policy.policy.assignment_tracking_since_ms.is_none())
+            {
+                self.state
+                    .backfill_digitalmate_assignments(&request.scope.tenant)
+                    .await?;
+            }
+            let proof = self
+                .state
+                .snapshot_protection(&request.scope.tenant, &recipe.snapshot_id)
+                .await?;
+            self.environment
+                .agent_snapshot_protection(
+                    &request.scope.tenant,
+                    &recipe.snapshot_id,
+                    &proof,
+                    false,
+                )
+                .await?;
+            Some(recipe.snapshot_id)
+        } else {
+            None
+        };
+        Ok(self
+            .state
+            .update_prewarm_policy(request, protected.as_deref())
+            .await?)
+    }
+    pub async fn retire_golden(&self, tenant: &str, snapshot: &str) -> Result<()> {
+        let proof = self
+            .state
+            .begin_snapshot_retirement(tenant, snapshot)
+            .await?;
+        self.environment
+            .agent_snapshot_protection(tenant, snapshot, &proof, true)
+            .await?;
+        Ok(())
     }
     async fn golden_available(&self, tenant: &str, template: &TemplateVersion) -> Result<bool> {
         let Some(recipe) = &template.prewarm_recipe else {

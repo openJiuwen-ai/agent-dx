@@ -180,6 +180,25 @@ pub struct EnvironmentInfo {
 }
 #[async_trait]
 pub trait Environment: Send + Sync {
+    async fn agent_snapshot_protection(
+        &self,
+        _tenant: &str,
+        _snapshot_id: &str,
+        _token: &str,
+        _retire: bool,
+    ) -> Result<(), EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "snapshot protection unavailable".into(),
+        ))
+    }
+    fn freeze_preparation(
+        &self,
+        _tenant: &str,
+        _job_id: &str,
+        _seed: &crate::prewarm::SeedExecution,
+    ) -> Result<Option<serde_json::Value>, EnvironmentError> {
+        Ok(None)
+    }
     async fn prepare_snapshot(
         &self,
         _tenant: &str,

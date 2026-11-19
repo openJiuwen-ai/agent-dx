@@ -52,6 +52,12 @@ impl Reference {
         }
     }
 }
+fn agent_token_digest(token: &str) -> Result<String> {
+    if token.len() != 36 || !token.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return Err(Error::Invalid("invalid Agent snapshot proof".into()));
+    }
+    Ok(format!("{:x}", Sha256::digest(token.as_bytes())))
+}
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
 }
@@ -69,6 +75,9 @@ pub struct Snapshot {
     #[serde(default)]
     pub preparation_template_id: Option<String>,
     pub template: EnvironmentSpec,
+    /// Coordinator-only proof digest for the Agent's durable pre-creation protection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_protection: Option<String>,
     pub source_node_id: String,
     pub source_runtime_id: String,
     pub artifact: CheckpointArtifact,
@@ -119,6 +128,7 @@ impl Snapshot {
             kind,
             created_at_unix_ms,
             preparation_template_id: None,
+            agent_protection: None,
             template,
             source_node_id,
             source_runtime_id,
@@ -146,6 +156,14 @@ impl Snapshot {
             || self.names.len() > 16
             || self.names.iter().any(|n| !valid_id(n))
             || self.names.iter().collect::<BTreeSet<_>>().len() != self.names.len()
+            || self.agent_protection.as_ref().is_some_and(|digest| {
+                self.kind != SnapshotKind::Golden
+                    || self.state != SnapshotState::Ready
+                    || digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
             || (self.state == SnapshotState::Deleted && !self.references.is_empty())
         {
             return Err(Error::Invalid("invalid reusable snapshot".into()));
@@ -203,8 +221,42 @@ impl Snapshot {
         }
         Ok(())
     }
-    pub fn delete(&mut self, tenant: &str) -> Result<()> {
+    pub fn protect_for_agent(&mut self, tenant: &str, token: &str) -> Result<()> {
         self.authorize(tenant)?;
+        let digest = agent_token_digest(token)?;
+        if self.kind != SnapshotKind::Golden || self.state != SnapshotState::Ready {
+            return Err(Error::Conflict);
+        }
+        match &self.agent_protection {
+            Some(existing) if *existing == digest => Ok(()),
+            Some(_) => Err(Error::Conflict),
+            None => {
+                self.advance()?;
+                self.agent_protection = Some(digest);
+                Ok(())
+            }
+        }
+    }
+    pub fn delete(&mut self, tenant: &str) -> Result<()> {
+        self.retire(tenant, None)
+    }
+    /// Close the catalog to new restores in the same CAS that consumes Agent protection.
+    pub fn retire(&mut self, tenant: &str, token: Option<&str>) -> Result<()> {
+        self.authorize(tenant)?;
+        let supplied = token.map(agent_token_digest).transpose()?;
+        if supplied.is_some() && self.kind != SnapshotKind::Golden {
+            return Err(Error::Invalid(
+                "Agent retirement requires a Golden snapshot".into(),
+            ));
+        }
+        if let Some(digest) = &self.agent_protection {
+            if supplied.as_ref() != Some(digest) {
+                return Err(Error::SnapshotInUse {
+                    sandbox_ids: vec![],
+                    template_ids: vec!["agent-prewarm".into()],
+                });
+            }
+        }
         if self.state == SnapshotState::Ready {
             if !self.references.is_empty() {
                 return Err(Error::SnapshotInUse {
@@ -231,6 +283,7 @@ impl Snapshot {
             }
             self.advance()?;
             self.state = SnapshotState::Deleting;
+            self.agent_protection = None;
         }
         Ok(())
     }

@@ -28,7 +28,11 @@ Agent 模板使用业务镜像的 ENTRYPOINT/CMD、WORKDIR 和 USER，不接受 
 
 由已认证的 DigitalMate Gateway 提供产品主体与账号注册事实。管理面 `GET /api/agent/v2/prewarm/{product}` 读取当前 tenant 对应策略，`PUT` 接收 `{enabled,template,version,validation_ref,expected_revision}`，使用原租户管理鉴权、版本 CAS 和显式启停。首次启用切点保留；目标版本必须同时是该入口为新主体选中的模板版本。部署启用前，须确认所有该产品账号的工作区分配都由同一权威路径记录，包括已有导入数据。普通 Agent 入口不能提供产品资格信息。
 
-首次分配、Binding 和启动选择在一次事务中提交，记录跨模板引用保留。在 Platform 创建前查不到可用 Golden 时，选择普通创建；提交后未知结果始终按原 Environment、卷和操作身份处理。恢复继承捕获的 rootfs 和探针，仅在新启动时发送镜像和启动探针。管理员须保留仍被已提交决议引用的制品。此路径当前以隔离环境验证为门槛。
+首次创建从所有 Agent 入口按租户和稳定 Binding ID 记录分配。Binding、产品首次分配和启动选择在一次事务中提交，台账跨模板引用和 Binding 删除保留。升级后应在所有写入副本更新完成再重新显式启用策略。首次获得完整台账时回填仍存在且身份唯一的 DigitalMate Binding，同时设置台账切点。此前已删除且无法回填的账号由注册切点排除。缺少可信注册时间的请求选择普通创建。
+
+DigitalMate Golden 只选择绑定当前 `${workspace}` 的独占目录 Volume。卷 ID 和目录末段应使用此工作区标识，挂载到 `/data/state`，业务工作区环境变量使用同一参数。Platform 确权后固定实际 Volume UID。选择前快照不可用或卷合同不满足时走普通创建。提交后未知结果按原 Environment、卷和操作身份继续。
+
+策略启用前，Activator 先取得 Platform Catalog 的持久保护。普通 Platform 删除对已保护的 Golden 返回冲突。停用策略停止新用户选择，已有 Binding 可以继续恢复。使用 `DELETE /api/agent/v2/prewarm-artifacts/{snapshotId}` 退役时，Activator 先持久封住该快照的新决议，再核对活动与删除中的 Binding 及候选引用。仍有引用时返回冲突并保留封锁。清理引用后重试相同请求，Platform 仍会核对运行中引用和制品持有，最后按 Catalog CAS 同步消费保护并接受回收。退役的快照需以新的快照 ID 替换。升级前已经提交的旧决议应保留制品，并在退役前通过新版策略重新建立保护。
 
 ```json
 {"name":"assistant","image":"registry.example/assistant:v1","isolation_runtime":"runc","env":{"APP_MODE":"production"},"resources":{"cpu_millis":1000,"memory_mib":1024},"service":[{"protocol":"ws","port":8080}]}

@@ -130,3 +130,9 @@ win, while node-owned control configuration remains authoritative. With
 and submitted as an explicit workload; no OCI process metadata lookup is performed.
 Without inheritance, no image workload starts. Local rootfs writable-layer handling
 and the existing Execd bootstrap are unchanged.
+
+### Agent Golden 制品保护
+
+`PUT /api/environment/v1/snapshot-protections/{snapshotId}` 为租户的 Ready Golden 建立 Catalog 持久保护，JSON 请求为 `{"token":"<Activator durable UUID>"}`。以相同凭据重放是幂等的。保护存在期间，普通 snapshot DELETE 和 E2B 删除入口均遵守 Catalog 冲突。
+
+`DELETE /api/environment/v1/snapshot-protections/{snapshotId}` 由 Activator 在封住新 Binding 决议并查清已有引用后调用，使用相同的 JSON 凭据。Platform 在其删除条件满足时以同一个 Catalog CAS 消费保护并关闭新恢复。租户运营应使用 Agent 退役入口，凭据由 Activator 保管。

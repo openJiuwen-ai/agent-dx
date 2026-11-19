@@ -10,6 +10,18 @@ use tonic::{Code, Status};
 
 #[async_trait]
 impl EnvironmentApplication for EnvironmentService {
+    async fn agent_snapshot_protection_request(
+        &self,
+        tenant: &str,
+        id: &str,
+        token: &str,
+        retire: bool,
+    ) -> Result<(), EnvironmentError> {
+        self.agent_snapshot_protection(&caller(tenant), id, token.into(), retire)
+            .await
+            .map_err(|error| map_status(error, true))
+    }
+
     async fn prepare_snapshot_request(
         &self,
         tenant: &str,

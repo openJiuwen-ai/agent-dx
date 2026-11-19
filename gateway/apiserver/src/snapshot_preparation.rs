@@ -16,6 +16,48 @@ struct Input {
 }
 
 impl EnvironmentService {
+    pub(crate) async fn agent_snapshot_protection(
+        &self,
+        caller: &pb::CallerContext,
+        id: &str,
+        token: String,
+        retire: bool,
+    ) -> Result<(), Status> {
+        uuid::Uuid::parse_str(&token)
+            .map_err(|_| Status::invalid_argument("invalid Agent snapshot proof"))?;
+        let mut client = pb::snapshot_service_client::SnapshotServiceClient::new(
+            self.clients.coordinator().await?,
+        );
+        let value = if retire {
+            self.clients
+                .rpc(
+                    "apiserver.retire_agent_snapshot",
+                    client.delete_snapshot(trace::inject(pb::DeleteSnapshotRequest {
+                        caller: Some(caller.clone()),
+                        id: id.into(),
+                        agent_token: Some(token),
+                    })),
+                )
+                .await?
+        } else {
+            self.clients
+                .rpc(
+                    "apiserver.protect_agent_snapshot",
+                    client.protect_snapshot(trace::inject(pb::ProtectSnapshotRequest {
+                        caller: Some(caller.clone()),
+                        id: id.into(),
+                        agent_token: token,
+                    })),
+                )
+                .await?
+        };
+        if value.id != id {
+            return Err(Status::data_loss("snapshot protection identity mismatch"));
+        }
+        crate::operations::snapshot_value(&value, caller)?;
+        Ok(())
+    }
+
     pub(crate) async fn prepare_snapshot(
         &self,
         id: &str,

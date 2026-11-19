@@ -70,6 +70,16 @@ impl LocalControl {
 
 #[async_trait]
 impl Control for LocalControl {
+    async fn retire_golden(
+        &self,
+        ctx: &RequestContext,
+        request: &adx_agent_core::prewarm::GoldenRetirement,
+    ) -> Result<()> {
+        ctx.start_write();
+        self.activator
+            .retire_golden(&request.tenant, &request.snapshot_id)
+            .await
+    }
     async fn prewarm_policy(
         &self,
         _ctx: &RequestContext,

@@ -286,8 +286,18 @@ impl AgentState {
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
-        self.create_binding_with_decision(scope, parameters, None, None)
-            .await
+        for _ in 0..limits::CAS_ATTEMPTS {
+            match self
+                .create_binding_with_decision(scope.clone(), parameters, None, None)
+                .await
+            {
+                Err(Error::Conflict(cause)) if cause == "binding changed" => continue,
+                result => return result,
+            }
+        }
+        Err(Error::Conflict(
+            "binding creation changed concurrently".into(),
+        ))
     }
 
     /// First assignment and Binding are committed together; no Platform effects occur here.
@@ -344,6 +354,30 @@ impl AgentState {
             adx_agent_core::EnvironmentRef::new(version.clone(), format!("adx-{generation}"));
         let mut extra_checks = Vec::new();
         let mut extra_puts = Vec::new();
+        let history = crate::prewarm::history_key(&scope)?;
+        let previous_history = self.store.get(&history).await?;
+        let never_assigned = previous_history.is_none();
+        if previous_history.is_some() {
+            if let Some(subject) = subject.filter(|facts| facts.product == "digitalmate") {
+                let canonical = self.product_binding_scope(&scope, subject).await?;
+                if canonical != scope {
+                    if let Some(existing) = self.binding(&canonical).await? {
+                        return if existing.phase == BindingPhase::Active {
+                            Ok(existing)
+                        } else {
+                            Err(Error::Conflict("binding is deleting".into()))
+                        };
+                    }
+                }
+            }
+        }
+        extra_checks.push(Check {
+            key: history.clone(),
+            expected: previous_history.map(|record| record.revision),
+        });
+        if never_assigned {
+            extra_puts.push(put(&history, &Some(&scope))?);
+        }
         if let Some(subject) = subject {
             use crate::prewarm::{first_key, policy_key, FirstAssignment, FirstDecision};
             use adx_agent_core::prewarm::{PolicyScope, PrewarmPolicy};
@@ -370,7 +404,7 @@ impl AgentState {
                 product: subject.product.clone(),
             })?;
             let rollout = self.store.get(&policy).await?;
-            if prior.is_none() {
+            if prior.is_none() && never_assigned {
                 if let (Some(saved), Some(recipe)) =
                     (rollout.as_ref(), template.prewarm_recipe.as_ref())
                 {
@@ -379,8 +413,15 @@ impl AgentState {
                         && policy.template == scope.template
                         && policy.version == version
                         && checked_snapshot == Some(recipe.snapshot_id.as_str())
+                        && (subject.product != "digitalmate"
+                            || crate::prewarm::private_workspace(&template, parameters)?)
                     {
-                        current.snapshot_id = Some(recipe.snapshot_id.clone());
+                        let protection =
+                            crate::prewarm::protection_key(&scope.tenant, &recipe.snapshot_id)?;
+                        if let Some(record) = self.open_snapshot_protection(&protection).await? {
+                            current.snapshot_id = Some(recipe.snapshot_id.clone());
+                            extra_checks.push(check(&protection, &record));
+                        }
                     }
                 }
             }
@@ -495,11 +536,20 @@ impl AgentState {
         {
             return Err(Error::Conflict("binding deletion identity mismatch".into()));
         }
-        let checks = vec![check(&key, &record)];
+        let mut checks = vec![check(&key, &record)];
+        let mut writes = Vec::new();
+        let history = crate::prewarm::history_key(&binding.scope)?;
+        if self.store.get(&history).await?.is_none() {
+            checks.push(Check {
+                key: history.clone(),
+                expected: None,
+            });
+            writes.push(put(&history, &Some(&binding.scope))?);
+        }
         let deletes = vec![key];
         if self
             .store
-            .commit(&Transaction::with_deletes(checks, vec![], deletes)?)
+            .commit(&Transaction::with_deletes(checks, writes, deletes)?)
             .await?
         {
             Ok(())

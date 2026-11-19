@@ -7,6 +7,27 @@ use std::sync::{Arc, Mutex};
 struct Capture(Mutex<Vec<CreateEnvironment>>, std::sync::atomic::AtomicBool);
 #[async_trait::async_trait]
 impl Environment for Capture {
+    async fn agent_snapshot_protection(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: bool,
+    ) -> Result<(), EnvironmentError> {
+        Ok(())
+    }
+
+    async fn ensure_volume(
+        &self,
+        _: &str,
+        _: &str,
+        spec: &volumes::VolumeSpec,
+    ) -> Result<volumes::VolumeRef, EnvironmentError> {
+        Ok(volumes::VolumeRef {
+            id: spec.id.clone(),
+            uid: format!("uid-{}", spec.id),
+        })
+    }
     async fn golden_available(
         &self,
         _tenant: &str,
@@ -81,6 +102,7 @@ async fn first_decision_is_atomic_and_remains_tied_to_the_product_subject() {
     };
     let active = a.update_prewarm_policy(&policy).await.unwrap();
     let cut = active.policy.first_enabled_at_ms.unwrap();
+    let tracked = active.policy.assignment_tracking_since_ms.unwrap();
     let mut request = ResolveRequest {
         activation: ActivationRequest {
             scope: scope(),
@@ -89,7 +111,7 @@ async fn first_decision_is_atomic_and_remains_tied_to_the_product_subject() {
             parameters: Some(b"workspace=w&model_url=https%3A%2F%2Fmodel.example".to_vec()),
             product_start: Some(EligibleStart {
                 product: "app".into(),
-                registered_at_ms: Some(cut + 1),
+                registered_at_ms: Some(cut.max(tracked) + 1),
             }),
         },
         service: ServiceSelector {
@@ -266,4 +288,163 @@ async fn concurrent_first_access_uses_the_winning_parameters() {
     assert_eq!(left.unwrap().binding, right.unwrap().binding);
     let requests = platform.0.lock().unwrap();
     assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[tokio::test]
+async fn digitalmate_golden_requires_private_workspace_and_protects_pending_binding() {
+    use adx_agent_core::prewarm::{EligibleStart, PolicyScope, PolicyUpdate, PrewarmRecipe};
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Capture::default());
+    platform.1.store(true, std::sync::atomic::Ordering::Relaxed);
+    let service = Activator::new(state.clone(), platform.clone());
+    let workspace = format!("w-{}", "a".repeat(64));
+    let params = [("workspace".into(), workspace)].into();
+    let digest = format!("sha256:{}", "a".repeat(64));
+    for (index, target, access, path, want_golden) in [
+        (0, "/data/state", "shared", "root/${workspace}", false),
+        (1, "/mnt/other", "exclusive", "root/${workspace}", false),
+        (2, "/data/state", "exclusive", "root/fixed", false),
+        (3, "/data/state", "exclusive", "root/${workspace}", true),
+    ] {
+        let draft: TemplateDraft = serde_json::from_value(serde_json::json!({
+            "name":"digitalmate","image":format!("product@{digest}"),"isolation_runtime":"runsc",
+            "resources":{"cpu_millis":1000,"memory_mib":512},
+            "env":{"DIGITALMATE_CRYPTO_WORKSPACE":"${workspace}"},
+            "mounts":[{"type":"bind","target":target,"volume_id":"user-${workspace}"}],
+            "volumes":[{"id":"user-${workspace}","access_mode":access,
+                "source":{"type":"directory","storage_domain":"sfs","path":path}}],
+            "prewarm_recipe":PrewarmRecipe{
+                snapshot_id:"snapshot-fixed".into(),image_digest:digest.clone(),
+                restore_profile_digest:digest.clone(),handoff_contract_version:"1".into(),
+                restore_env:[("DIGITALMATE_GOLDEN_PHASE".into(),"restore".into())].into()
+            }
+        }))
+        .unwrap();
+        let template = service.publish("tenant", &draft).await.unwrap();
+        let scope = PolicyScope {
+            tenant: "tenant".into(),
+            product: "digitalmate".into(),
+        };
+        let policy = service
+            .update_prewarm_policy(&PolicyUpdate {
+                expected_revision: service
+                    .prewarm_policy(&scope)
+                    .await
+                    .unwrap()
+                    .map(|policy| policy.revision),
+                scope,
+                enabled: true,
+                template: template.name.clone(),
+                version: template.version.clone(),
+                validation_ref: "acceptance".into(),
+            })
+            .await
+            .unwrap();
+        let subject = EligibleStart {
+            product: "digitalmate".into(),
+            registered_at_ms: Some(policy.policy.assignment_tracking_since_ms.unwrap() + 1),
+        };
+        let binding = state
+            .create_product_binding(
+                Scope {
+                    tenant: "tenant".into(),
+                    template: template.name,
+                    template_ref: TemplateRef::Version(template.version),
+                    binding_id: format!("fixture-{index}"),
+                },
+                &params,
+                &subject,
+                Some("snapshot-fixed"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(binding.current.snapshot_id.is_some(), want_golden);
+        if want_golden {
+            // The process can exit here before it calls a single Platform create.
+            assert!(platform.0.lock().unwrap().is_empty());
+            assert!(matches!(
+                service.retire_golden("tenant", "snapshot-fixed").await,
+                Err(adx_activator::Error::Conflict(_))
+            ));
+            assert_eq!(
+                state.binding(&binding.scope).await.unwrap(),
+                Some(binding.clone())
+            );
+            let restored = service
+                .activate_with_parameters(
+                    &binding.scope,
+                    None,
+                    unix_time_millis() + 1000,
+                    true,
+                    None,
+                )
+                .await
+                .unwrap()
+                .binding;
+            assert_eq!(restored.current, binding.current);
+            let requests = platform.0.lock().unwrap().clone();
+            assert_eq!(
+                requests[0].execution.snapshot_id.as_deref(),
+                Some("snapshot-fixed")
+            );
+            assert!(requests[0].execution.mounts[0].volume_uid.is_some());
+            service.delete_binding(&binding.scope).await.unwrap();
+            service
+                .retire_golden("tenant", "snapshot-fixed")
+                .await
+                .unwrap();
+            let mut next = binding.scope.clone();
+            next.binding_id = "new-subject".into();
+            assert!(state
+                .create_product_binding(next, &params, &subject, Some("snapshot-fixed"))
+                .await
+                .unwrap()
+                .current
+                .snapshot_id
+                .is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn allocation_from_the_normal_entry_tracks_a_digitalmate_subject_across_scopes() {
+    use adx_agent_core::prewarm::EligibleStart;
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let service = Activator::new(state.clone(), Arc::new(Capture::default()));
+    let draft = TemplateDraft::from(&template());
+    service.publish("tenant", &draft).await.unwrap();
+    service.publish("tenant", &draft).await.unwrap();
+    let first = Scope {
+        binding_id: format!("digitalmate-{}", "1".repeat(64)),
+        ..scope()
+    };
+    let params = [
+        ("workspace".into(), "w".into()),
+        ("model_url".into(), "https://model.example".into()),
+    ]
+    .into();
+    let assigned = state
+        .create_binding_with_parameters(first.clone(), &params)
+        .await
+        .unwrap();
+    let next = Scope {
+        template_ref: TemplateRef::Version("2".into()),
+        ..first.clone()
+    };
+    let subject = EligibleStart {
+        product: "digitalmate".into(),
+        registered_at_ms: Some(u64::MAX),
+    };
+    assert_eq!(
+        state
+            .create_product_binding(next.clone(), &params, &subject, None)
+            .await
+            .unwrap(),
+        assigned
+    );
+    service.delete_binding(&first).await.unwrap();
+    assert_eq!(
+        state.product_binding_scope(&next, &subject).await.unwrap(),
+        next
+    );
 }

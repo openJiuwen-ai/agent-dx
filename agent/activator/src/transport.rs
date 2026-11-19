@@ -410,6 +410,58 @@ impl HttpEnvironment {
 }
 #[async_trait]
 impl Environment for HttpEnvironment {
+    async fn agent_snapshot_protection(
+        &self,
+        tenant: &str,
+        id: &str,
+        token: &str,
+        retire: bool,
+    ) -> Result<(), EnvironmentError> {
+        validate_identity(id)?;
+        let key = self.api_keys.get(tenant).ok_or_else(|| {
+            EnvironmentError::Invalid("Platform tenant credential is not configured".into())
+        })?;
+        let invalid = || EnvironmentError::Invalid("invalid snapshot protection URL".into());
+        let mut url = self
+            .base
+            .join("/api/environment/v1/snapshot-protections/")
+            .map_err(|_| invalid())?;
+        url.path_segments_mut()
+            .map_err(|_| invalid())?
+            .pop_if_empty()
+            .push(id);
+        let unknown =
+            || EnvironmentError::OutcomeUnknown("snapshot protection result unknown".into());
+        let response = self
+            .client
+            .request(if retire { Method::DELETE } else { Method::PUT }, url)
+            .bearer_auth(key)
+            .json(&json!({"token":token}))
+            .send()
+            .await
+            .map_err(|_| unknown())?;
+        match response.status() {
+            status if status.is_success() => Ok(()),
+            StatusCode::NOT_FOUND => Err(EnvironmentError::NotFound),
+            StatusCode::CONFLICT => Err(EnvironmentError::Conflict(
+                "snapshot in use or protection changed".into(),
+            )),
+            StatusCode::BAD_REQUEST => Err(EnvironmentError::Invalid(
+                "invalid snapshot protection request".into(),
+            )),
+            _ => Err(unknown()),
+        }
+    }
+
+    fn freeze_preparation(
+        &self,
+        tenant: &str,
+        id: &str,
+        seed: &adx_agent_core::prewarm::SeedExecution,
+    ) -> Result<Option<Value>, EnvironmentError> {
+        environment_request::seed_input(tenant, id, seed, self.timeout, &self.network).map(Some)
+    }
+
     async fn prepare_snapshot(
         &self,
         tenant: &str,

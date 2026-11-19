@@ -41,7 +41,7 @@ struct Profile {
 struct Requirements {
     isolation_runtime: String,
     readiness_http_path: String,
-    readiness_response_phase: String,
+    seed_readiness_http_path: String,
 }
 
 #[derive(Deserialize)]
@@ -112,7 +112,7 @@ impl ConfiguredSeedProfile {
                 .collect::<BTreeSet<_>>()
                 != expected
             || profile.requires.isolation_runtime != draft.isolation_runtime
-            || profile.requires.readiness_response_phase != "golden_seed"
+            || profile.requires.seed_readiness_http_path == profile.requires.readiness_http_path
             || !draft
                 .readiness_probe
                 .as_ref()
@@ -145,8 +145,25 @@ impl ConfiguredSeedProfile {
             return Err(reject());
         }
         if profile.template == "digitalmate" {
+            for (key, value) in &seed.env {
+                if key != "DIGITALMATE_GOLDEN_PHASE" && draft.env.get(key) != Some(value) {
+                    return Err(Error::Invalid(format!(
+                        "DigitalMate Golden requires the same fixed template environment field {key}"
+                    )));
+                }
+            }
+            for (key, value) in &draft.env {
+                if key != &ws.identity_env && env.get(key) != Some(value) {
+                    return Err(Error::Invalid(format!(
+                        "DigitalMate Golden cannot carry template environment field {key}"
+                    )));
+                }
+            }
             let value = |key: &str| env.get(key).map(String::as_str).filter(|v| !v.is_empty());
-            if value("DIGITALMATE_GOLDEN_PHASE") != Some("seed")
+            if profile.requires.seed_readiness_http_path != "/health/ready/golden-seed"
+                || profile.restore.env.len() != 1
+                || draft.env.get(&ws.identity_env).map(String::as_str) != Some("${workspace}")
+                || value("DIGITALMATE_GOLDEN_PHASE") != Some("seed")
                 || profile
                     .restore
                     .env
@@ -191,6 +208,12 @@ impl ConfiguredSeedProfile {
         let mut execution = ExecutionSpec::from(&draft.with_version("1".into()));
         execution.env = env;
         execution.lifecycle = Default::default();
+        execution
+            .readiness_probe
+            .as_mut()
+            .and_then(|probe| probe.http_get.as_mut())
+            .ok_or_else(reject)?
+            .path = profile.requires.seed_readiness_http_path.clone();
         execution.mounts = vec![Mount {
             kind: MountType::Bind,
             host_path: String::new(),
@@ -219,7 +242,7 @@ impl ConfiguredSeedProfile {
             &draft.image,
             &draft.isolation_runtime,
             &draft.resources,
-            &draft.readiness_probe,
+            &execution.readiness_probe,
             &draft.healthcheck,
             &draft.service,
             &draft.mounts,
@@ -242,7 +265,11 @@ impl ConfiguredSeedProfile {
             tenant: self.tenant.clone(),
             template: draft.name.clone(),
             version: String::new(),
-            seed: SeedExecution { execution, volume },
+            seed: SeedExecution {
+                execution,
+                volume,
+                native_input: None,
+            },
             recipe,
         })
     }
@@ -280,12 +307,17 @@ impl Activator {
     }
 
     pub(crate) fn seed_job(&self, tenant: &str, draft: &TemplateDraft) -> Result<PreparationJob> {
-        self.seed_profiles
+        let mut job = self
+            .seed_profiles
             .get(&(tenant.into(), draft.name.clone()))
             .ok_or_else(|| {
                 Error::Invalid("no Golden seed profile for this tenant and template".into())
             })?
-            .build(draft)
+            .build(draft)?;
+        job.seed.native_input = self
+            .environment
+            .freeze_preparation(tenant, &job.id, &job.seed)?;
+        Ok(job)
     }
 
     pub fn start_snapshot_preparations(self: &Arc<Self>) {

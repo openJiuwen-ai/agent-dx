@@ -8,6 +8,7 @@ service SnapshotService {
   rpc PublishSnapshot(PublishSnapshotRequest) returns (ReusableSnapshot);
   rpc GetSnapshot(GetSnapshotRequest) returns (ReusableSnapshot);
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc ProtectSnapshot(ProtectSnapshotRequest) returns (ReusableSnapshot);
   rpc DeleteSnapshot(DeleteSnapshotRequest) returns (ReusableSnapshot);
 }
 
@@ -52,7 +53,13 @@ message ListSnapshotsRequest { CallerContext caller = 1; string name = 2; string
 
 message ListSnapshotsResponse { repeated ReusableSnapshot snapshots = 1; string next_page_token = 2; }
 
-message DeleteSnapshotRequest { string id = 1; CallerContext caller = 2; }
+message ProtectSnapshotRequest { string id = 1; CallerContext caller = 2; string agent_token = 3; }
+
+message DeleteSnapshotRequest {
+  string id = 1;
+  CallerContext caller = 2;
+  optional string agent_token = 3;
+}
 
 message CollectSnapshotRequest { ReusableSnapshot snapshot = 1; string node_session_id = 2; bool delegated = 3; }
 

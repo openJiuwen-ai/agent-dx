@@ -3,7 +3,7 @@ use crate::discovery::{validate_members, DiscoveryConfig};
 use crate::request::RequestContext;
 use crate::{Error, Result};
 use adx_agent_core::discovery::{ranked_endpoints, ActivatorEndpoint};
-use adx_agent_core::prewarm::{PolicyScope, PolicySnapshot, PolicyUpdate};
+use adx_agent_core::prewarm::{GoldenRetirement, PolicyScope, PolicySnapshot, PolicyUpdate};
 use adx_agent_core::{activator::*, transport, AgentBinding, Scope, TemplateVersion};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
@@ -18,6 +18,13 @@ use std::{
 /// Product operations shared by the independent HTTP client and embedded Activator.
 #[async_trait]
 pub trait Control: Send + Sync {
+    async fn retire_golden(
+        &self,
+        _ctx: &RequestContext,
+        _request: &GoldenRetirement,
+    ) -> Result<()> {
+        Err(Error::Unsupported("snapshot retirement unavailable".into()))
+    }
     async fn prewarm_policy(
         &self,
         _ctx: &RequestContext,
@@ -294,6 +301,10 @@ impl Control for ActivatorClient {
         update: &PolicyUpdate,
     ) -> Result<PolicySnapshot> {
         self.request(ctx, "prewarm/put", update, true, None).await
+    }
+    async fn retire_golden(&self, ctx: &RequestContext, request: &GoldenRetirement) -> Result<()> {
+        self.request(ctx, "prewarm/retire", request, true, None)
+            .await
     }
     async fn resolve(
         &self,

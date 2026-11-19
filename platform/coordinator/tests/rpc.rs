@@ -2507,6 +2507,7 @@ async fn snapshot_rpc_enforces_tenant_and_rejects_busy_deletion() {
     assert!(page.next_page_token.is_empty());
     let error = client
         .delete_snapshot(pb::DeleteSnapshotRequest {
+            agent_token: None,
             id: snapshot.id.clone(),
             caller: caller(),
         })

@@ -212,6 +212,17 @@ impl AgentApi {
             ));
         }
         let managed = &self.managed;
+        if let ["prewarm-artifacts", snapshot] = path.as_slice() {
+            if parts.method != http::Method::DELETE {
+                return Err(Error::NotFound);
+            }
+            let request = adx_agent_core::prewarm::GoldenRetirement {
+                tenant: tenant.into(),
+                snapshot_id: segment(snapshot)?,
+            };
+            managed.retire_golden(ctx, &request).await?;
+            return Ok(serde_json::json!({}));
+        }
         if let ["prewarm", product] = path.as_slice() {
             use adx_agent_core::prewarm::{PolicyScope, PolicyUpdate};
             let scope = PolicyScope {

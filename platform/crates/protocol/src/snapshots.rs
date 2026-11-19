@@ -100,6 +100,7 @@ impl TryFrom<pb::ReusableSnapshot> for Snapshot {
             kind: kind.into(),
             created_at_unix_ms: s.created_at_unix_ms,
             preparation_template_id: None,
+            agent_protection: None,
             template: s
                 .template
                 .ok_or_else(|| Error::Invalid("snapshot template required".into()))?

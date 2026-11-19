@@ -166,6 +166,7 @@ impl Session {
         if record.state != SnapshotState::Ready
             || record.revision != 1
             || !record.references.is_empty()
+            || record.agent_protection.is_some()
         {
             return Err(Error::Invalid(
                 "new snapshot must be ready and unreferenced".into(),
@@ -385,6 +386,24 @@ impl Session {
     }
     pub async fn delete_snapshot(&self, id: &str, tenant: &str) -> Result<Snapshot> {
         self.mutate_snapshot(id, |s| s.delete(tenant)).await
+    }
+    pub async fn protect_agent_snapshot(
+        &self,
+        id: &str,
+        tenant: &str,
+        token: &str,
+    ) -> Result<Snapshot> {
+        self.mutate_snapshot(id, |s| s.protect_for_agent(tenant, token))
+            .await
+    }
+    pub async fn retire_agent_snapshot(
+        &self,
+        id: &str,
+        tenant: &str,
+        token: &str,
+    ) -> Result<Snapshot> {
+        self.mutate_snapshot(id, |s| s.retire(tenant, Some(token)))
+            .await
     }
     /// Call only after the storage backend confirms physical deletion.
     pub async fn finish_snapshot_deletion(&self, id: &str, revision: u64) -> Result<Snapshot> {
