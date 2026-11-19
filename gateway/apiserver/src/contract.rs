@@ -699,6 +699,12 @@ pub fn create_spec_with_environment(
             .map(|e| e.rootfs.runtime_class.clone())
             .unwrap_or_else(|| "runsc".into());
     }
+    if root.r#type == "local" && matches!(root.runtime.as_str(), "conch" | "supervisor") {
+        return Err(invalid(&format!(
+            "runtime {} requires an image binding (got rootfs.type=local)",
+            root.runtime
+        )));
+    }
     resolve_create_timeout(r.create_timeout, r.schedule_timeout, r.init_timeout)?;
     if r.create_timeout < 0 || r.schedule_timeout < 0 || r.init_timeout < 0 || r.idle < 0 {
         return Err(invalid("timeouts cannot be negative"));

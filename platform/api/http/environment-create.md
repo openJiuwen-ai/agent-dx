@@ -97,6 +97,9 @@ Public creation accepts an absolute path on the execution node:
 
 The caller prepares and retains this directory or file on every eligible node,
 or selects a node that provides it. ADX does not import Docker images for this source.
+Conch and Supervisor require image bindings. A request that selects either runtime
+with an explicit Local rootfs returns `INVALID_ARGUMENT` before scheduling. This
+also applies when the runtime comes from the deployment default.
 Local workload entrypoints are supplied through the existing `process` field;
 `inheritEntrypoint=true` is rejected for an explicit Local source. Image metadata
 must be resolved by the caller into `env` and, when needed, `process`.

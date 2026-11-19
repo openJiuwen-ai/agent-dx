@@ -23,13 +23,14 @@ Commands/files use Ingress → Relay → EXECD. See
 
 Rootfs values overlay the deployment Runtime Environment. Omitted fields inherit
 the deployment default; `runtime` and `readonly` replace only those fields, while
-an explicit image or S3 source atomically replaces the source. Adxlet still
+an explicit Image, S3 or Local source replaces the source. Adxlet still
 requires the deployment-owned source, bootstrap and environment to match the
 local node when no source replacement was requested.
 
-Supervisor and Conch image bindings accept explicit workload `process`
-commands, working directory and user overrides through Execd. Fields omitted
-from `process` retain the corresponding image defaults.
+An explicit Local rootfs with effective runtime `supervisor` or `conch` returns
+`INVALID_ARGUMENT` before scheduling. Supervisor and Conch image bindings accept
+explicit workload `process` commands, working directory and user overrides through
+Execd. Fields omitted from `process` retain the corresponding image defaults.
 
 All ordinary responses use the API Server response envelope:
 

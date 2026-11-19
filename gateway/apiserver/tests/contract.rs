@@ -697,3 +697,37 @@ fn local_rootfs_rejects_noncanonical_paths_but_allows_execd_only() {
     )
     .is_ok());
 }
+
+#[test]
+fn local_rootfs_rejects_jiuwenbox_runtime_before_scheduling() {
+    for runtime in ["conch", "supervisor"] {
+        let profile = serde_json::from_value(json!({
+            "rootfs": {"runtime_class": runtime, "type": "local", "path": "/defaults/rootfs"},
+            "bootstrap": {"type": "erofs", "root": "/defaults/rootfs", "target": "/__adx",
+                "entrypoint": ["/__adx/usr/local/bin/adx-execd"]}
+        }))
+        .unwrap();
+        for body in [
+            json!({"runtime": runtime, "rootfs": {"type": "local", "path": "/node/rootfs"}}),
+            json!({"rootfs": {"runtime": runtime, "type": "local", "path": "/node/rootfs"}}),
+            json!({"rootfs": {"type": "local", "path": "/node/rootfs"}}),
+        ] {
+            let error = adx_apiserver::contract::create_spec_with_environment(
+                body,
+                &caller(),
+                Some(&profile),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains(runtime), "{error}");
+            assert!(error.message().contains("image"), "{error}");
+        }
+        assert!(create_spec(json!({"image": "app:1", "runtime": runtime}), &caller()).is_ok());
+        assert!(adx_apiserver::contract::create_spec_with_environment(
+            json!({"rootfs": {"runtime": "runsc", "type": "local", "path": "/node/rootfs"}}),
+            &caller(),
+            Some(&profile),
+        )
+        .is_ok());
+    }
+}

@@ -1017,10 +1017,17 @@ components:
     Rootfs:
       type: object
       additionalProperties: false
+      description: >-
+        An explicit Local source requires an absolute node path and an effective
+        runtime that supports Local rootfs. Conch and Supervisor require image bindings.
       properties:
         runtime: {type: string}
-        type: {type: string, enum: [image, s3]}
+        type: {type: string, enum: [image, s3, local]}
         imageurl: {type: string}
+        path:
+          type: string
+          pattern: "^/"
+          description: Required for type local. Use an absolute node path without traversal or control characters.
         readonly:
           type: boolean
           description: Optional override; omitted inherits the deployment Runtime Environment default.
