@@ -227,6 +227,12 @@ def configured_obs_client(endpoint):
     return obs_client(access_key, secret_key, endpoint)
 
 
+def stdout_logger():
+    logger = logging.Logger(f"{__name__}.stdout", level=logging.INFO)
+    logger.addHandler(logging.StreamHandler(sys.stdout))
+    return logger
+
+
 def rootfs_candidate_main(argv):
     parser = argparse.ArgumentParser(description="Resolve the previous ADX Execd package from OBS.")
     parser.add_argument("--arch", choices=ROOTFS_ARCHES, required=True)
@@ -244,10 +250,10 @@ def rootfs_candidate_main(argv):
         return
 
     if candidate is not None:
-        sys.stdout.write(f"{candidate['url']}\n{candidate['sha256']}\n")
+        stdout_logger().info("%s\n%s", candidate["url"], candidate["sha256"])
     elif arch == "amd64" and bucket == DEFAULT_BUCKET and normalized_endpoint(endpoint) == DEFAULT_ENDPOINT:
         key, checksum = BOOTSTRAP_ROOTFS_AMD64
-        sys.stdout.write(f"{public_url(endpoint, bucket, key)}\n{checksum}\n")
+        stdout_logger().info("%s\n%s", public_url(endpoint, bucket, key), checksum)
 
 
 def advance_rootfs_candidate_main(argv):
@@ -300,9 +306,10 @@ def main(argv=None):
         build_id=args.build_id,
         dry_run=args.dry_run,
     )
+    output_logger = stdout_logger()
     for artifact in manifest["artifacts"]:
-        sys.stdout.write(f"url: {artifact['url']}\n")
-    sys.stdout.write(f"manifest: {manifest['manifest_url']}\n")
+        output_logger.info("url: %s", artifact["url"])
+    output_logger.info("manifest: %s", manifest["manifest_url"])
 
 
 if __name__ == "__main__":

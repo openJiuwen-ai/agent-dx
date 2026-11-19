@@ -255,7 +255,9 @@ def build(binary, output, *, base_archive=None, target=None, envd=None, reuse_ur
                     write_file(output.with_suffix('.json'), json.dumps(metadata | provenance | {
                         'rootfs_sha256': digest, 'reused_from': {'commit': commit, 'archive_sha256': reuse_sha256},
                     }, indent=2) + '\n')
-                    sys.stdout.write(f'Reused EROFS {digest} from ADX {commit}\n')
+                    output_logger = logging.Logger(f'{__name__}.stdout', level=logging.INFO)
+                    output_logger.addHandler(logging.StreamHandler(sys.stdout))
+                    output_logger.info('Reused EROFS %s from ADX %s', digest, commit)
                     return
         archive = base_archive or stage / 'base.tar.gz'
         if base_archive is None:

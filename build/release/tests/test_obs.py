@@ -135,7 +135,8 @@ class ObsTests(unittest.TestCase):
             "OBS_ACCESS_KEY_ID": "fixture", "OBS_SECRET_ACCESS_KEY": "fixture",
             "ADX_OBS_BUCKET": "agent-dx", "ADX_OBS_ENDPOINT": "obs.cn-southwest-2.myhuaweicloud.com",
         }
-        with patch.object(obs, "obs_client", return_value=Client()), patch.dict(os.environ, credentials):
+        client = Client()
+        with patch.object(obs, "obs_client", return_value=client), patch.dict(os.environ, credentials):
             with redirect_stdout(io.StringIO()) as output:
                 obs.rootfs_candidate_main(["--arch", "amd64"])
             url, digest = output.getvalue().splitlines()
@@ -144,6 +145,11 @@ class ObsTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()) as output:
                 obs.rootfs_candidate_main(["--arch", "arm64"])
             self.assertEqual(output.getvalue(), "")
+            with patch.object(client, "getObject", return_value=Response(503)):
+                with redirect_stdout(io.StringIO()) as output, self.assertLogs(obs.LOG, level="WARNING") as logs:
+                    obs.rootfs_candidate_main(["--arch", "amd64"])
+                self.assertEqual(output.getvalue(), "")
+                self.assertIn("status=503", logs.output[0])
 
     def test_cli_imports_external_obs_sdk_instead_of_uploader_module(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -212,7 +218,10 @@ class ObsClient:
             self.assertTrue(manifest["manifest_url"].startswith(
                 "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/"
             ))
-            self.assertIn(manifest["artifacts"][0]["url"], result.stdout)
+            self.assertEqual(result.stdout.splitlines(), [
+                f"url: {manifest['artifacts'][0]['url']}",
+                f"manifest: {manifest['manifest_url']}",
+            ])
 
     def test_daily_upload_uses_adx_namespace_and_publishes_verified_manifest(self):
         with tempfile.TemporaryDirectory() as temp:
