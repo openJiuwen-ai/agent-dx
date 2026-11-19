@@ -243,7 +243,7 @@ pub trait RootMeta: Send + Sync {
     fn abort_root(&self, reservation: &RootReservation) -> Result<()>;
     /// D4: 权威删除一个已 activate 的 active root。
     ///
-    /// Meta 移除 Root/全部 holder grant，并通过 REVOKE_ACCESS RootCommand 传播。
+    /// Meta 移除 Root，使旧 grant 校验失败。
     /// 幂等：root 已不在 Meta active 列表时返回 Ok(())。
     fn deactivate_root(
         &self,

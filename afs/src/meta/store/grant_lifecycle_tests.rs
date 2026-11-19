@@ -67,6 +67,17 @@ async fn activate(
         .await
         .unwrap()
 }
+fn access(grant: &RootAccessGrant) -> ValidateRootAccessInput {
+    ValidateRootAccessInput {
+        root_id: grant.root_id.clone(),
+        root_epoch: grant.root_epoch,
+        home_session_id: grant.home_session_id.clone(),
+        holder_node_id: grant.holder_node_id.clone(),
+        holder_session_id: grant.holder_session_id.clone(),
+        access_generation: grant.access_generation,
+        fencing_token: grant.fencing_token.clone(),
+    }
+}
 fn deactivate(epoch: u64) -> DeactivateRootInput {
     DeactivateRootInput {
         request_id: "deactivate".into(),
@@ -425,16 +436,46 @@ async fn grant_lifecycle_recovery_selects_current_home_and_gc_preserves_it() {
             .entity,
         Some(MetaEntity::RootGrant(home.clone()))
     );
+    authority
+        .validate_root_access(access(&home))
+        .await
+        .expect("recovered Home grant must be valid before deactivation");
     let mut input = deactivate(home.root_epoch);
     input.home_session_id = "zz-new".into();
     authority.deactivate_root(input).await.unwrap();
-    let view = store.committed().await.unwrap();
-    let key = MetaKey::RootCommand {
-        command_id: format!("deactivate:workspace:{}:deactivate", home.root_epoch),
-    };
     assert!(
-        matches!(&view.entities.get(&key).unwrap().entity,MetaEntity::RootCommand(command)
-        if command.home_session_id=="zz-new" && command.old_access_generation==home.access_generation)
+        authority.validate_root_access(access(&home)).await.is_err(),
+        "recovered Home grant must be fenced by Root removal"
+    );
+}
+
+#[tokio::test]
+async fn home_deactivation_leaves_no_root_command_and_root_removal_fences_old_grant() {
+    let (store, _, authority) = fixture().await;
+    for cycle in 0..3 {
+        let reservation = reserve(&authority, &format!("cycle-{cycle}")).await;
+        let home = activate(&authority, &reservation).await;
+        authority
+            .validate_root_access(access(&home))
+            .await
+            .unwrap_or_else(|error| panic!("cycle {cycle}: grant must be valid before: {error}"));
+        let mut input = deactivate(home.root_epoch);
+        input.request_id = format!("deactivate-{cycle}");
+        authority.deactivate_root(input).await.unwrap();
+        assert!(
+            authority.validate_root_access(access(&home)).await.is_err(),
+            "cycle {cycle}: Root removal alone must fence the old Home grant"
+        );
+    }
+    let view = store.committed().await.unwrap();
+    let commands = view
+        .entities
+        .values()
+        .filter(|entry| matches!(entry.entity, MetaEntity::RootCommand(_)))
+        .count();
+    assert_eq!(
+        commands, 0,
+        "Home-initiated deactivation must not persist a revocation command"
     );
 }
 #[tokio::test]

@@ -526,8 +526,10 @@ abort、停用和 grant GC 不回退水位；同 intent 重试保持原 epoch。
 水位保存前暂停旧结果退休，避免删除最后的 epoch 依据。无法推断旧版本早已删除的历史。
 之后水位为独立的 singleton，不为每个已删 Root 保留无界代际列表。
 
-停用精确核对当前 Home grant（包含 Home session/generation），一笔事务移除活动 Root、
-写对应撤权命令及原结果，不再枚举全部历史 grant。Root 移除后的 Meta 校验立即拒绝旧授权；
+停用精确核对当前 Home grant（包含 Home session/generation），一笔事务移除活动 Root
+并写原结果，不再枚举全部历史 grant，也不写撤权命令：非 force 停用只能由 Home 自身发起，
+调用前 Home 已关闭本地准入；force 停用要求 Home session 已不可用，两者都不会确认这类命令。
+Root 移除后的 Meta 校验立即拒绝旧授权；
 同名新 Root 使用新 epoch，不继承旧权限。Home 的本地拒绝、缓存失效、控制断链处理和
 排空顺序保持；这不代表所有 Node 同时收到通知，也不承诺已打开 native FD/mmap 即时撤权。
 
