@@ -13,7 +13,7 @@ Runtime command and file operations use the separate
 Environment contract. It supports S3 rootfs and mounts, image-backed mounts,
 entrypoint inheritance, `extra_config`, independent resource request/limit
 values, published ports, per-Environment data-plane security, creation/runtime
-network policy, `failover=true`, and reload. Public local rootfs paths remain rejected. Local mounts accept `host_path`
+network policy, `failover=true`, and reload. Caller-prepared Local rootfs paths are supported. Paths must be absolute and contain no control characters or `.`/`..` components. A Local directory has no inherited image entrypoint: pass `process.commands` for a workload, or omit it for an Execd-only tool environment. Local mounts accept `host_path`
 (or `hostPath`) alongside the existing image/S3 source alternatives. `upstream` reverse
 tunnel is carried by the create contract; the legacy `/invoke` compatibility
 transport remains unavailable.
@@ -23,13 +23,21 @@ Commands/files use Ingress → Relay → EXECD. See
 
 Rootfs values overlay the deployment Runtime Environment. Omitted fields inherit
 the deployment default; `runtime` and `readonly` replace only those fields, while
-an explicit image or S3 source atomically replaces the source. Adxlet still
+an explicit Image, S3 or Local source replaces the source. Adxlet still
 requires the deployment-owned source, bootstrap and environment to match the
 local node when no source replacement was requested.
 
-Supervisor and Conch image bindings accept explicit workload `process`
-commands, working directory and user overrides through Execd. Fields omitted
-from `process` retain the corresponding image defaults.
+An explicit Local rootfs with effective runtime `supervisor` or `conch` returns
+`INVALID_ARGUMENT` before scheduling. Supervisor and Conch image bindings accept
+explicit workload `process` commands, working directory and user overrides through
+Execd. Fields omitted from `process` retain the corresponding image defaults.
+
+An explicit Local source is always read-only, regardless of the deployment
+rootfs default. The create endpoint rejects `rootfs.readonly=false`, writable
+layer quotas and runsc GPU allocation for an explicit Local source.
+Its absolute path must be a strict descendant of a parent directory in the API
+Server `allowed_local_rootfs_dirs` list. See the
+[deployment example](../../../platform/api/http/environment-create.md#caller-prepared-local-rootfs).
 
 All ordinary responses use the API Server response envelope:
 
@@ -422,7 +430,7 @@ use `SPAWN_FAILED` and `error_message`.
 
 ## Local mount sources
 
-Each mount requires exactly one nonempty `image_url`, `s3_config`, or `host_path` source. The existing `imageUrl`, `s3Config`, and `hostPath` aliases are accepted. Zero or multiple sources return InvalidArgument (HTTP 400). Local source paths must be absolute without control characters or `.`/`..` components. The public local rootfs restriction is unchanged.
+Each mount requires exactly one nonempty `image_url`, `s3_config`, or `host_path` source. The existing `imageUrl`, `s3Config`, and `hostPath` aliases are accepted. Zero or multiple sources return InvalidArgument (HTTP 400). Local mount source paths must be absolute without control characters or `.`/`..` components.
 
 ```json
 {"image":"registry.example/app:v1","mounts":[{"type":"bind","host_path":"/mnt/sfs/workspaces/w-user","target":"/home/jiuwen","options":["rw"],"create_if_missing":true}]}

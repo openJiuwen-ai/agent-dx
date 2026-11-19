@@ -2,7 +2,6 @@
 
 pub mod checkpoint;
 pub mod lifecycle;
-pub mod local_rootfs;
 pub mod runtime_profile;
 pub mod snapshot_preparation;
 pub mod snapshots;

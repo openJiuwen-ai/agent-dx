@@ -88,3 +88,68 @@ async fn embedded_and_http_creation_use_the_same_platform_contract() {
     forbidden["env"]["EXECD_HTTP_TOKEN"] = json!("user-supplied");
     assert!(service.prepare_create(forbidden, &caller).is_err());
 }
+
+#[tokio::test]
+async fn create_entrypoint_requires_local_rootfs_beneath_an_allowed_directory() {
+    let mut settings = json!({
+        "listen": "127.0.0.1:0",
+        "coordinator_address": "http://127.0.0.1:1",
+        "internal_security": "network",
+        "ingress_mode": "standalone",
+        "rpc_timeout_seconds": 1,
+        "cache_entries": 16,
+        "auth_cache_ttl_seconds": 1,
+    });
+    let caller = pb::CallerContext {
+        tenant_id: "tenant".into(),
+        administrator: false,
+    };
+    let request = |path: &str| json!({"rootfs": {"type": "local", "path": path}});
+    let allowed = "/srv/adx-images/tools/rootfs";
+
+    let mut empty_settings = settings.clone();
+    empty_settings["allowed_local_rootfs_dirs"] = json!([]);
+    for disabled in [settings.clone(), empty_settings] {
+        let service = EnvironmentService::new(
+            Clients::new(serde_json::from_value(disabled).unwrap()).unwrap(),
+        );
+        let error = service
+            .prepare_create(request(allowed), &caller)
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert!(service
+            .prepare_create(json!({"image": "app:1"}), &caller)
+            .is_ok());
+    }
+
+    settings["allowed_local_rootfs_dirs"] = json!(["/srv/adx-images/tools", "/srv/other-images"]);
+    let configured =
+        EnvironmentService::new(Clients::new(serde_json::from_value(settings).unwrap()).unwrap());
+    for path in [
+        allowed,
+        "/srv/adx-images/tools/offline/rootfs",
+        "/srv/other-images/rootfs",
+    ] {
+        let spec = configured.prepare_create(request(path), &caller).unwrap();
+        assert!(spec.execution.unwrap().rootfs.unwrap().readonly, "{path}");
+    }
+    for path in [
+        "/srv/adx-images/other/rootfs",
+        "/srv/adx-images/tools-backup/rootfs",
+        "/srv/adx-images/tools",
+    ] {
+        let error = configured
+            .prepare_create(request(path), &caller)
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied, "{path}");
+    }
+    for path in [
+        "srv/adx-images/tools/rootfs",
+        "/srv/adx-images/tools/../other/rootfs",
+    ] {
+        let error = configured
+            .prepare_create(request(path), &caller)
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{path}");
+    }
+}

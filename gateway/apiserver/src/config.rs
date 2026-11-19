@@ -63,9 +63,9 @@ pub struct Config {
     pub e2b: Option<crate::e2b::Config>,
     #[serde(default)]
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
+    /// Deployment-owned parent directories for explicit Local rootfs sources.
     #[serde(default)]
-    pub local_rootfs_templates:
-        std::collections::BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
+    pub allowed_local_rootfs_dirs: Vec<String>,
     pub listen: SocketAddr,
     /// Private Prometheus listener, independent of the public HTTP API.
     #[serde(default)]
@@ -111,12 +111,16 @@ impl Config {
                 return Err(error.message.into());
             }
         }
-        for (name, template) in &self.local_rootfs_templates {
-            adx_core::local_rootfs::capability_label(name)?;
-            template.validate()?;
-        }
         if let Some(e) = &self.runtime_profile {
             e.validate()?;
+        }
+        if self.allowed_local_rootfs_dirs.iter().any(|path| {
+            !crate::contract::canonical_local_path(path) || path[1..].split('/').any(str::is_empty)
+        }) {
+            return Err(
+                "allowed_local_rootfs_dirs requires normalized absolute directories other than /"
+                    .into(),
+            );
         }
         if self.coordinator_address.is_empty() == self.discovery.is_none()
             || (self.internal_security == adx_transport::rpc::SecurityMode::Mtls
