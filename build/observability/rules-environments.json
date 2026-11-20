@@ -1,0 +1,38 @@
+{
+  "groups": [
+    {
+      "name": "adx-usage",
+      "interval": "30s",
+      "rules": [
+        {
+          "record": "adx:environment_cpu_usage_cores:valid",
+          "expr": "rate(adx_environment_cpu_usage_seconds_total[1m]) * on (adx_env, environment_id, runtime_id) group_left() adx_environment_info{state=\"Running\"} and on (adx_env, environment_id, runtime_id) (adx_environment_stats_age_seconds <= 45 and time() - timestamp(adx_environment_stats_age_seconds) <= 45)"
+        },
+        {
+          "record": "adx:environment_cpu_allocation_cores:running",
+          "expr": "adx_environment_allocation_cpu_millis / 1000 * on (adx_env, environment_id) group_left() adx_environment_info{state=\"Running\"}"
+        },
+        {
+          "record": "adx:environment_memory_usage_bytes:valid",
+          "expr": "adx_environment_memory_usage_bytes * on (adx_env, environment_id, runtime_id) group_left() adx_environment_info{state=\"Running\"} and on (adx_env, environment_id, runtime_id) (adx_environment_stats_age_seconds <= 45 and time() - timestamp(adx_environment_stats_age_seconds) <= 45)"
+        },
+        {
+          "record": "adx:environment_memory_allocation_bytes:running",
+          "expr": "adx_environment_allocation_memory_bytes * on (adx_env, environment_id) group_left() adx_environment_info{state=\"Running\"}"
+        },
+        {
+          "record": "adx:environment_cpu_utilization:ratio",
+          "expr": "sum by (adx_env) (adx:environment_cpu_usage_cores:valid) / sum by (adx_env) (adx:environment_cpu_allocation_cores:running)"
+        },
+        {
+          "record": "adx:environment_memory_utilization:ratio",
+          "expr": "sum by (adx_env) (adx:environment_memory_usage_bytes:valid) / sum by (adx_env) (adx:environment_memory_allocation_bytes:running)"
+        },
+        {
+          "record": "adx:environment_cpu_coverage:ratio",
+          "expr": "count by (adx_env) (count by (adx_env, environment_id) (adx:environment_cpu_usage_cores:valid)) / count by (adx_env) (count by (adx_env, environment_id) (adx_environment_info{state=\"Running\"}))"
+        }
+      ]
+    }
+  ]
+}

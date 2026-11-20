@@ -1,5 +1,6 @@
 rule_files:
   - rules.json
+  - rules-environments.json
 evaluation_interval: 15s
 tests:
   - name: create requests aggregate replicas and handle a counter reset
@@ -37,6 +38,55 @@ tests:
             value: 1
       - expr: 'abs(sum(max_over_time(adx:environment_create_request_qps:rate1m{adx_env=~"a|b"}[10m])) - 12) < bool 1e-9'
         eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  - name: usage ratio keeps only running, current-generation and fresh samples
+    interval: 15s
+    input_series:
+      - series: 'adx_environment_info{adx_env="t",environment_id="e1",node_id="n1",runtime_id="r1",state="Running"}'
+        values: '1x9'
+      - series: 'adx_environment_info{adx_env="t",environment_id="e2",node_id="n1",runtime_id="r2",state="Running"}'
+        values: '1x9'
+      - series: 'adx_environment_info{adx_env="t",environment_id="e3",node_id="n1",runtime_id="r3a",state="Running"}'
+        values: '1x9'
+      - series: 'adx_environment_cpu_usage_seconds_total{adx_env="t",environment_id="e1",node_id="n1",runtime_id="r1"}'
+        values: '0+15x8'
+      - series: 'adx_environment_cpu_usage_seconds_total{adx_env="t",environment_id="e2",node_id="n1",runtime_id="r2"}'
+        values: '0+15x8'
+      - series: 'adx_environment_cpu_usage_seconds_total{adx_env="t",environment_id="e3",node_id="n1",runtime_id="r3b"}'
+        values: '0+15x8'
+      - series: 'adx_environment_stats_age_seconds{adx_env="t",environment_id="e1",node_id="n1",runtime_id="r1"}'
+        values: '5x9'
+      - series: 'adx_environment_stats_age_seconds{adx_env="t",environment_id="e2",node_id="n1",runtime_id="r2"}'
+        values: '60x9'
+      - series: 'adx_environment_stats_age_seconds{adx_env="t",environment_id="e3",node_id="n1",runtime_id="r3b"}'
+        values: '5x9'
+      - series: 'adx_environment_allocation_cpu_millis{adx_env="t",environment_id="e1"}'
+        values: '2000x9'
+      - series: 'adx_environment_allocation_cpu_millis{adx_env="t",environment_id="e2"}'
+        values: '1000x9'
+      - series: 'adx_environment_allocation_cpu_millis{adx_env="t",environment_id="e3"}'
+        values: '1000x9'
+    promql_expr_test:
+      - expr: 'sum(adx:environment_cpu_usage_cores:valid)'
+        eval_time: 2m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(adx:environment_cpu_usage_cores:valid)'
+        eval_time: 2m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'sum(adx:environment_cpu_utilization:ratio)'
+        eval_time: 2m
+        exp_samples:
+          - labels: '{}'
+            value: 0.25
+      - expr: 'abs(sum(adx:environment_cpu_coverage:ratio) - 0.3333333333333333) < bool 1e-9'
+        eval_time: 2m
         exp_samples:
           - labels: '{}'
             value: 1
