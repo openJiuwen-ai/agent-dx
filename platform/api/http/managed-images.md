@@ -80,7 +80,10 @@ The API Server translates the SDK's `extraConfig.managedImagePublications`
 transport field to structured execution dependencies once. OCI roots and
 mounts in the reserved scope carrying a publication ID must match an exact
 registered repository before admission. Changing the configured scope
-preserves protection for known publication identities. Native image preparation
+preserves protection for known publication identities. Repository matching accepts
+HTTP and HTTPS prefixes and recognizes tag and digest qualifiers on the same
+repository. Use the recorded Registry authority, including its explicit port.
+Native image preparation
 normalizes the same dependencies before recording its seed specification. The
 dependencies follow the Environment and captured Snapshot. An execution that loses its node
 preserves image roots by tenant and generation through retirement. Node

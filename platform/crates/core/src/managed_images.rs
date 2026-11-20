@@ -655,6 +655,11 @@ pub fn validate_dependencies(ids: &BTreeSet<String>) -> Result<()> {
 
 fn repository(reference: &str) -> Option<&str> {
     let reference = reference.trim();
+    // Image fetchers may accept a scheme on a reference to the same repository.
+    let reference = reference
+        .strip_prefix("https://")
+        .or_else(|| reference.strip_prefix("http://"))
+        .unwrap_or(reference);
     let repository_with_tag = reference
         .split_once('@')
         .map_or(reference, |(repo, _)| repo);

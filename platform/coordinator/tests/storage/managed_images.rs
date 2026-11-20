@@ -364,7 +364,7 @@ async fn image_publication_release_and_deletion_survive_redis_and_coordinator_re
         .is_empty());
     let mut late = spec("late-consumer");
     late.image = format!(
-        "{}:build@{}",
+        "https://{}:build@{}",
         repo.replacen("registry.test", "REGISTRY.test", 1),
         reference.split_once('@').unwrap().1
     );

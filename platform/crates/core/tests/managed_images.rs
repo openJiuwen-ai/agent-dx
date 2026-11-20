@@ -162,6 +162,11 @@ fn publications_do_not_require_a_builder_repository_layout() {
         ),
     ]);
     image.register_outputs(outputs, "test-attempt").unwrap();
+    assert!(image.matches_repository(&format!(
+        "http://REGISTRY.test/managed/team/{}/root:build@sha256:{}",
+        image.id,
+        "b".repeat(64)
+    )));
 }
 
 #[test]

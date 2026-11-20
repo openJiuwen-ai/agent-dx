@@ -70,7 +70,7 @@ async fn managed_images_protect_retained_snapshots_and_fence_concurrent_acquisit
         channel(address, "apiserver").await,
     );
     let mut unregistered = spec("unregistered-consumer");
-    unregistered.image = reference.clone();
+    unregistered.image = format!("https://{reference}");
     assert_eq!(
         creates
             .create_environment(pb::CreateEnvironmentRequest {
