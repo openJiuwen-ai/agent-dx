@@ -116,11 +116,13 @@ sources are rejected before Pause. Managed Volumes retain their existing exclusi
 execution authorization and are not yet qualified for planned migration. Scoped
 checkpoint stores must advertise a common exact backend identity; a matching alias
 alone does not qualify different S3 buckets or filesystem directories. Unscoped
-shared filesystems are rejected. Captures record measured host/kernel/CPU,
-runtime binary and default rootfs fingerprints in `recovery_profile`. Ordinary
+shared filesystems are rejected. Captures record measured runtime binary and
+default rootfs fingerprints in `recovery_profile`. Ordinary
 cross-node recovery and upgrade migration filter against this profile and the
 checkpoint's actual backend scope, then recheck before transferring ownership.
-The destination rechecks the profile before restoring. A legacy point can still
+The destination rechecks the profile before restoring. Host kernel release, CPU
+model and `/proc/cpuinfo` flags are not exact-match requirements; runsc checks
+the CPU features required by the checkpoint during restore. A legacy point can still
 resume on its original compatible owner. Ordinary cross-node Resume/Recover may
 qualify a legacy point using an exact audited `legacy_checkpoint_proofs` entry
 configured on Coordinator. The target still has to match the verified scope and

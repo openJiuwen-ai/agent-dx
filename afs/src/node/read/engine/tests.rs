@@ -2256,6 +2256,123 @@ fn remote_read_uses_scratch_and_falls_back_between_sources() {
     assert_eq!(&out, &[9, b'r', b'e', b'm', b'o', b't', b'e', 9]);
 }
 
+/// Peer whose read slots are full answers `ResourceExhausted` for the first
+/// `busy` attempts, then serves the bytes (the A-side bounded admission wait).
+struct BusyTransfer {
+    bytes: Vec<u8>,
+    busy: Mutex<usize>,
+    attempts: Mutex<usize>,
+}
+
+impl ChunkTransfer for BusyTransfer {
+    fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+        *self.attempts.lock().unwrap() += 1;
+        let mut busy = self.busy.lock().unwrap();
+        if *busy > 0 {
+            *busy -= 1;
+            // What `status_to_error` makes of the holder's bare
+            // `Status::resource_exhausted` (dfs_chunks.rs read admission).
+            return Err(Error::new(
+                afs_error::CLIENT_REMOTE_STATUS,
+                afs_error::ErrorKind::ResourceExhausted,
+                "DFS peer read admission deadline exceeded",
+            ));
+        }
+        for item in &batch.operations {
+            let op = &item.op;
+            let length = usize::try_from(op.length).unwrap();
+            out[op.output_offset..op.output_offset + length].copy_from_slice(&self.bytes[..length]);
+        }
+        Ok(())
+    }
+}
+
+fn busy_engine(
+    sources: Vec<&str>,
+    busy: usize,
+) -> (DfsReadEngine, Arc<BusyTransfer>, ChunkId, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+    let chunk_id = ChunkId::new("busy");
+    let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+        revision: 1,
+        chunks: vec![ChunkSources {
+            allowed_ranges: Vec::new(),
+            chunk: None,
+            chunk_id: chunk_id.clone(),
+            sources: sources
+                .iter()
+                .map(|node| source(&format!("copy-{node}"), &chunk_id, node))
+                .collect(),
+        }],
+    }));
+    let transfer = Arc::new(BusyTransfer {
+        bytes: b"remote".to_vec(),
+        busy: Mutex::new(busy),
+        attempts: Mutex::new(0),
+    });
+    let engine = DfsReadEngine::new(
+        crate::dfs::NamespaceId::new("default"),
+        "node-a".into(),
+        local,
+        sources,
+        transfer.clone(),
+        DfsReadConfig::default(),
+    );
+    (engine, transfer, chunk_id, temp)
+}
+
+fn one_op(chunk_id: ChunkId) -> ReadBatch {
+    ReadBatch {
+        lookahead: Vec::new(),
+        file_version_id: Some(FileVersionId::new("version")),
+        layout_root_id: LayoutRootId::new("layout"),
+        ops: vec![ChunkReadOp {
+            chunk_id,
+            chunk_offset: 0,
+            length: 6,
+            output_offset: 0,
+        }],
+    }
+}
+
+/// A busy holder is backpressure, not a failed copy: with a single source the
+/// read waits and retries within its deadline instead of returning EAGAIN to
+/// the application (task 04 M2 V1 / M3 V4: short reads under load).
+#[test]
+fn remote_read_waits_out_a_busy_single_source() {
+    let (engine, transfer, chunk_id, _temp) = busy_engine(vec!["node-b"], 3);
+    let mut out = [9; 6];
+    engine.read_batch(&one_op(chunk_id), &mut out).unwrap();
+    assert_eq!(&out, b"remote");
+    assert_eq!(*transfer.attempts.lock().unwrap(), 4);
+}
+
+/// Waiting is bounded by the read deadline; when the holder stays busy the
+/// read still ends with the backpressure error rather than looping forever.
+#[test]
+fn remote_read_busy_wait_is_bounded_by_the_read_deadline() {
+    let (engine, _transfer, chunk_id, _temp) = busy_engine(vec!["node-b"], usize::MAX);
+    let limits = crate::node::read::admission::ReadPipelineLimits {
+        task_timeout_ms: 300,
+        ..Default::default()
+    };
+    let engine = engine.with_read_pipeline(limits).unwrap();
+    let started = std::time::Instant::now();
+    let error = engine
+        .read_batch(&one_op(chunk_id), &mut [0; 6])
+        .unwrap_err();
+    // A holder that stays busy past the deadline is a timeout to the
+    // application, not EAGAIN (which most readers do not retry).
+    assert_eq!(error.code(), afs_error::CLIENT_DEADLINE_EXCEEDED);
+    assert_eq!(crate::error::errno(&error), libc::ETIMEDOUT);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 #[test]
 fn characterize_quarantine_has_taken_effect_when_detecting_read_returns() {
     let temp = tempfile::tempdir().unwrap();

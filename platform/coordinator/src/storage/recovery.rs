@@ -56,7 +56,6 @@ pub(crate) fn recovery_profile_requirements(
     profile: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>> {
     let keys = [
-        "ADX_RECOVERY_HOST".to_string(),
         format!("ADX_RECOVERY_RUNTIME_{runtime_class}"),
         "ADX_RECOVERY_ROOTFS_SHA256".to_string(),
         "ADX_RECOVERY_ROOTFS_PATH".to_string(),

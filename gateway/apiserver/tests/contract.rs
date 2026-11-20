@@ -168,7 +168,7 @@ fn s3_rootfs_and_mount_credentials_follow_sandboxd_contract() {
 #[test]
 fn unsafe_or_inconsistent_environment_options_are_rejected() {
     for body in [
-        json!({"rootfs":{"runtime":"runsc","type":"local","path":"/host/root"}}),
+        json!({"rootfs":{"runtime":"runsc","type":"local","path":"/host/root"},"inheritEntrypoint":true}),
         json!({"image":"img","cpu":1000,"cpu_limit":500}),
     ] {
         assert_eq!(
@@ -189,6 +189,39 @@ fn unsafe_or_inconsistent_environment_options_are_rejected() {
             tonic::Code::InvalidArgument
         );
     }
+}
+
+#[test]
+fn explicit_local_rootfs_without_default_profile_preserves_process_and_probe() {
+    let process = json!({"commands":[["/bin/app","--serve"]],"cwd":"/app","user":"1001:1002"});
+    let spec = create_spec(
+        json!({
+            "name":"local-process",
+            "rootfs":{"runtime":"runsc","type":"local","path":"/host/rootfs","readonly":true},
+            "env":{"IMAGE_VALUE":"prepared"}, "process":process,
+            "readinessProbe":{"tcpSocket":{"port":18092},"periodSeconds":1,"timeoutSeconds":1}
+        }),
+        &caller(),
+    )
+    .unwrap();
+    let spec = adx_core::EnvironmentSpec::try_from(spec).unwrap();
+    assert!(spec.image.is_empty());
+    let rootfs = spec.execution.rootfs.unwrap();
+    assert_eq!(
+        rootfs.source,
+        adx_core::execution::StorageSource::Local("/host/rootfs".into())
+    );
+    assert!(rootfs.readonly);
+    assert_eq!(
+        serde_json::to_value(spec.execution.process).unwrap(),
+        process
+    );
+    assert!(spec.execution.readiness_probe.is_some());
+    assert!(!spec.execution.inherit_entrypoint);
+    assert_eq!(
+        spec.env.get("IMAGE_VALUE").map(String::as_str),
+        Some("prepared")
+    );
 }
 
 #[test]
@@ -224,6 +257,7 @@ fn rootfs_overlay_rejects_ambiguous_or_incomplete_sources_before_rpc() {
         json!({"rootfs":{"type":"local","path":false}}),
         json!({"rootfs":{"type":"local","path":"/unexpected","imageurl":"image:v1"}}),
         json!({"rootfs":{"type":"local","path":"/unexpected","storageInfo":s3.clone()}}),
+        json!({"rootfs":{"type":"template","name":"tools-v1"}}),
         json!({"rootfs":{"type":"unknown"}}),
         json!({"image":"image:v1","rootfs":{"type":"s3","storageInfo":s3.clone()}}),
     ] {
@@ -641,4 +675,127 @@ fn volume_mounts_are_exclusive_with_inline_sources_and_keep_fixed_uid() {
         .remove("host_path");
     input["mounts"][0]["create_if_missing"] = json!(true);
     assert!(create_spec(input, &caller()).is_err());
+}
+
+#[test]
+fn local_rootfs_rejects_noncanonical_paths_but_allows_execd_only() {
+    for path in [
+        "/node/../rootfs",
+        "/node/./rootfs",
+        "/node/\nrootfs",
+        "/node/\u{85}rootfs",
+    ] {
+        assert!(create_spec(
+            json!({"rootfs": {"type": "local", "path": path}}),
+            &caller()
+        )
+        .is_err());
+    }
+    assert!(create_spec(
+        json!({"rootfs": {"type": "local", "path": "/node/rootfs"}}),
+        &caller()
+    )
+    .is_ok());
+}
+
+#[test]
+fn local_rootfs_rejects_jiuwenbox_runtime_before_scheduling() {
+    for runtime in ["conch", "supervisor"] {
+        let profile = serde_json::from_value(json!({
+            "rootfs": {"runtime_class": runtime, "type": "local", "path": "/defaults/rootfs"},
+            "bootstrap": {"type": "erofs", "root": "/defaults/rootfs", "target": "/__adx",
+                "entrypoint": ["/__adx/usr/local/bin/adx-execd"]}
+        }))
+        .unwrap();
+        for body in [
+            json!({"runtime": runtime, "rootfs": {"type": "local", "path": "/node/rootfs"}}),
+            json!({"rootfs": {"runtime": runtime, "type": "local", "path": "/node/rootfs"}}),
+            json!({"rootfs": {"type": "local", "path": "/node/rootfs"}}),
+        ] {
+            let error = adx_apiserver::contract::create_spec_with_environment(
+                body,
+                &caller(),
+                Some(&profile),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains(runtime), "{error}");
+            assert!(error.message().contains("image"), "{error}");
+        }
+        assert!(create_spec(json!({"image": "app:1", "runtime": runtime}), &caller()).is_ok());
+        assert!(adx_apiserver::contract::create_spec_with_environment(
+            json!({"rootfs": {"runtime": "runsc", "type": "local", "path": "/node/rootfs"}}),
+            &caller(),
+            Some(&profile),
+        )
+        .is_ok());
+    }
+}
+
+#[test]
+fn explicit_runsc_local_rootfs_defaults_to_writable_with_a_readonly_deployment_profile() {
+    let profile = serde_json::from_value(json!({
+        "rootfs": {"runtime_class": "runsc", "type": "local", "path": "/defaults/rootfs", "readonly": true},
+        "bootstrap": {"type": "erofs", "root": "/defaults/rootfs", "target": "/__adx",
+            "entrypoint": ["/__adx/usr/local/bin/adx-execd"]}
+    }))
+    .unwrap();
+    let rootfs = json!({"type": "local", "path": "/node/rootfs"});
+    let spec = adx_apiserver::contract::create_spec_with_environment(
+        json!({"rootfs": rootfs}),
+        &caller(),
+        Some(&profile),
+    )
+    .unwrap();
+    assert!(!spec.execution.unwrap().rootfs.unwrap().readonly);
+
+    let default =
+        adx_apiserver::contract::create_spec_with_environment(json!({}), &caller(), Some(&profile))
+            .unwrap();
+    assert!(default.runtime_profile.unwrap().rootfs.unwrap().readonly);
+}
+
+#[test]
+fn explicit_runsc_local_rootfs_accepts_both_readonly_overrides() {
+    for readonly in [true, false] {
+        let spec = create_spec(
+            json!({"rootfs": {"type": "local", "path": "/node/rootfs", "readonly": readonly}}),
+            &caller(),
+        )
+        .unwrap();
+        assert_eq!(spec.runtime_class, "runsc");
+        assert_eq!(spec.execution.unwrap().rootfs.unwrap().readonly, readonly);
+    }
+}
+
+#[test]
+fn explicit_local_rootfs_rejects_writable_root_outside_runsc() {
+    for runtime in ["runc", "kata"] {
+        let request =
+            json!({"runtime": runtime, "rootfs": {"type": "local", "path": "/node/rootfs"}});
+        let spec = create_spec(request, &caller()).unwrap();
+        assert!(spec.execution.unwrap().rootfs.unwrap().readonly);
+
+        let rootfs = json!({"type": "local", "path": "/node/rootfs", "readonly": false});
+        let error =
+            create_spec(json!({"runtime": runtime, "rootfs": rootfs}), &caller()).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("requires runsc"), "{error}");
+    }
+}
+
+#[test]
+fn explicit_local_rootfs_rejects_writable_layer_limits_and_runsc_gpu() {
+    for (field, value, reason) in [
+        ("storageMb", json!(10), "writable layer"),
+        ("storage_limit_mb", json!(10), "writable layer"),
+        ("xpu", json!("gpu::1"), "GPU"),
+    ] {
+        let mut request =
+            json!({"runtime": "runsc", "rootfs": {"type": "local", "path": "/node/rootfs"}});
+        request[field] = value;
+        let error = create_spec(request, &caller()).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains(reason), "{error}");
+    }
 }

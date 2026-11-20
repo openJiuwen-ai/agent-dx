@@ -526,8 +526,10 @@ abort、停用和 grant GC 不回退水位；同 intent 重试保持原 epoch。
 水位保存前暂停旧结果退休，避免删除最后的 epoch 依据。无法推断旧版本早已删除的历史。
 之后水位为独立的 singleton，不为每个已删 Root 保留无界代际列表。
 
-停用精确核对当前 Home grant（包含 Home session/generation），一笔事务移除活动 Root、
-写对应撤权命令及原结果，不再枚举全部历史 grant。Root 移除后的 Meta 校验立即拒绝旧授权；
+停用精确核对当前 Home grant（包含 Home session/generation），一笔事务移除活动 Root
+并写原结果，不再枚举全部历史 grant，也不写撤权命令：非 force 停用只能由 Home 自身发起，
+调用前 Home 已关闭本地准入；force 停用要求 Home session 已不可用，两者都不会确认这类命令。
+Root 移除后的 Meta 校验立即拒绝旧授权；
 同名新 Root 使用新 epoch，不继承旧权限。Home 的本地拒绝、缓存失效、控制断链处理和
 排空顺序保持；这不代表所有 Node 同时收到通知，也不承诺已打开 native FD/mmap 即时撤权。
 
@@ -1112,9 +1114,16 @@ root 调用者可显式指定属主，与 `chown(2)` 一致，供管理员启用
 检查失败时 Home 不创建目录，也不写 catalog 或 Meta。
 
 workspace 可以从任意节点的 OwnerFs FUSE 路径删除：Home 在本机执行；非 Home 入口通过
-OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 workspace，非空返回
-`ENOTEMPTY` 且 workspace 保持可用；`rm -rf` 会先删除内容，最后才删除空的 workspace 目录。
-在 egress 路径上对 workspace 目录执行 rmdir 会被内核以 `EBUSY` 拒绝，不会删除 workspace。
+OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 workspace，Home 侧物理目录
+的原子判空是唯一的决策点：非空返回 `ENOTEMPTY`，已封闭的准入会恢复、已卸载的 egress bind
+会异步重挂（尽力而为，失败只保留 FUSE 访问并告警），Meta 归属、catalog 与数据不变。判空
+之后的并发写入不由删除流程排空（outlet 等原生路径无法阻止），由原子判空裁决。
+
+判空成功后删除只向前收敛：Meta 下线即删除达成，此后 catalog 清理失败只告警、rmdir 仍返回
+成功，残留由启动 reconcile 回收。Meta 下线失败时保留删除中状态与 catalog，由 Home 本机
+重试或重启 reconcile 补完，删除进行中的非 Home 入口会被准入检查拒绝。`rm -rf` 会先删除
+内容，最后才删除空的 workspace 目录；在 egress 路径上对 workspace 目录执行 rmdir 会被内核
+以 `EBUSY` 拒绝，不会删除 workspace。
 
 ## 跨节点 Workspace 出口（outlet）
 
@@ -1136,12 +1145,16 @@ Home 节点的本地盘上，不做复制。每台需要读该名字视图的节
 消费方只能跳过并告警，不得猜测兜底。
 
 **节点侧（已实现）**：每节点跑一份镜像 worker：在 tmpfs 名字层收敛
-`/public/<name> -> <import_root>/<home>/users` 软链，自动维护对端（NFS）与
+`/public/<name> -> <import_root>/<home>/users/<name>` 软链，自动维护对端（NFS）与
 本机（bind）的 import 挂载；mountinfo 只读诊断随轮输出，配置硬前提（独立
 tmpfs、宿主 mount namespace、`mount(2)` 权限）在启动时 fail-closed 校验。
-没有运行期数据回收：删除契约只在提交前检查空目录（非空返回 `ENOTEMPTY`），
-提交后删除不会留下"待回收"的目录，残余目录由启动 reconcile（有 Meta 全量
-视角）收敛，非空残余保留 catalog 记录并告警，等待人工清理。
+没有运行期数据回收：删除契约以 Home 侧物理目录的原子判空为决策点（非空返回
+`ENOTEMPTY` 并回滚，Meta、catalog 与缓存都不改变），提交后删除不会留下"待回收"的目录。
+启动 reconcile 是唯一的收敛点，并且不得 `rmdir` 原生命名目录——它可能承载业务数据，
+也可能已是下一代 workspace 的活目录。catalog 有记录而 Meta 已无该 root 时，reconcile
+只丢弃 catalog 记录并告警，目录原地保留，重新具备被纳管扫描接管的资格。因此 catalog
+记录的语义是"该目录已被纳管"的准入判据，不是回收证据：留下的幽灵记录会永久挡住
+该名字的纳管与删除，只能靠人工删除 catalog 文件解锁。
 
 `/public` 下的 `.pub`（原子发布的暂存目录）与 `.quarantine`（消费方违约时的
 隔离区）归镜像所有，不能作为 workspace 名：创建时即拒（`EINVAL`）。快照里若
@@ -1160,12 +1173,13 @@ tmpfs 上无限堆积隔离目录，最终 ENOSPC 让整个名字层发布失败
 挂载访问失效对端是阻塞而非报错，发布只写软链、从不访问 target）。源格式读不
 出来时不参与比对，避免每轮重挂。
 
-**名字按字节传递，不做 UTF-8 归一**：workspace 名是任意字节串（Linux 路径分量
-不是 UTF-8），OwnerFs 用 `root-<hex(bytes)>` 无损编码，镜像从 root id 解码后
-必须原样用于 `symlinkat`。若中间转成 `String`（例如 `to_string_lossy`），每个
-非法字节会变成 U+FFFD，既改掉调用方创建的名字，又会让两个仅差非法字节的名字
-塌成同一条（`BTreeMap` 键冲突，静默丢一个 workspace）。因此 `Action`、`present`
-表与 `scan_public` 的键都是 `OsString`，收敛判据也按字节比较。
+**名字按字节传递，发布要求 UTF-8**：workspace 名是任意字节串（Linux 路径分量
+不是 UTF-8），OwnerFs 用 `root-<hex(bytes)>` 无损编码。镜像的 `Action`、`present`
+表与 `scan_public` 键仍是 `OsString`，按字节比较与删除；但发布 `symlinkat` 的
+目标路径需要 UTF-8 文本，因此本轮**只发布合法 UTF-8 名字**，从 root id 解码后
+`to_str()` 失败即跳过并告警，不生成 U+FFFD 替换版本。API 创建路径先拒绝非 ASCII
+（`validate_owner`），所以这类 root 只能来自外部手工目录或旧数据；扫描纳管同样
+跳过非 ASCII 名。
 
 Home 侧对外 NFS 导出（OwnerFs egress）不在本能力范围内，仍由部署面或独立分支
 提供。

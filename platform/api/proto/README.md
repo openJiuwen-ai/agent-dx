@@ -117,7 +117,9 @@ reconciliation flag. Duplicate reports do not extend liveness. The heartbeat als
 carries the structured node pressure snapshot (`NodePressureReport`: per-resource
 level, percent and last transition, plus the observation stamp and consecutive
 sampling failures); the field stays absent until the first successful sample and
-feeds in-memory coordinator state only, without persistence. InspectNode reads
+feeds in-memory coordinator state only, without persistence. Only enabled
+pressure resources populate their optional `memory` or `disk` message; disabled
+resources are omitted. InspectNode reads
 the complete authoritative catalog only for the current registered session with
 allocation admission closed. Startup uses the reconciliation flag; a validated
 live session closes allocation admission for periodic inspection while preserving

@@ -1,6 +1,5 @@
 //! Backend-independent node authority cycle, shared by startup and periodic reports.
 use crate::{journal::JournalSink, reconciliation::ReconciliationOutcome, Adxlet};
-use adx_core::EnvironmentRecord;
 use adx_protocol::{control as pb, status};
 use adx_transport::rpc::RpcChannel;
 use std::{future::Future, sync::atomic::Ordering, time::Duration};
@@ -203,39 +202,31 @@ pub async fn reconcile_node(
         } else {
             None
         };
-        let mut catalog = inspect(coordinator, registration, timeout).await?;
+        let catalog = inspect(coordinator, registration, timeout).await?;
         catalog_received = true;
-        if let Some(journal) = journal.filter(|_| !periodic) {
-            let records = catalog
-                .records
-                .iter()
-                .cloned()
-                .map(TryInto::try_into)
-                .collect::<adx_core::Result<Vec<EnvironmentRecord>>>()
-                .map_err(status)?;
-            journal.recover(&records).await.map_err(status)?;
-            // Replay may change execution/checkpoint ownership. Recover both
-            // from the same fresh complete Coordinator snapshot.
-            catalog = inspect(coordinator, registration, timeout).await?;
-        }
+        let mut invalid_catalog = |error| {
+            manager.authority_reconciling.store(true, Ordering::Release);
+            catalog_retry = true;
+            status(error)
+        };
         let records = catalog
             .records
             .into_iter()
             .map(TryInto::try_into)
             .collect::<adx_core::Result<Vec<_>>>()
-            .map_err(status)?;
+            .map_err(&mut invalid_catalog)?;
         let snapshots = catalog
             .snapshots
             .into_iter()
             .map(TryInto::try_into)
             .collect::<adx_core::Result<Vec<_>>>()
-            .map_err(status)?;
+            .map_err(&mut invalid_catalog)?;
         let retained = catalog
             .retained_artifacts
             .into_iter()
             .map(adx_core::CheckpointArtifact::try_from)
             .collect::<adx_core::Result<Vec<_>>>()
-            .map_err(status)?;
+            .map_err(&mut invalid_catalog)?;
         let recovery = async {
             if let Some(basis) = basis {
                 match manager
@@ -255,10 +246,14 @@ pub async fn reconcile_node(
                 }
                 Ok(())
             } else {
-                manager
-                    .reconcile_retained(records, snapshots, retained)
+                let result = manager
+                    .reconcile_recovery(records, snapshots, retained, journal)
                     .await
-                    .map_err(status)
+                    .map_err(status);
+                // Complete authority/inventory and the resource ledger are
+                // known even when an individual controller remains fenced.
+                catalog_retry = result.is_err() && *manager.lifecycle_ready.read().await;
+                result
             }
         };
         tokio::pin!(recovery);
@@ -269,7 +264,7 @@ pub async fn reconcile_node(
             tokio::select! {
                 result = &mut recovery => { result?; break; },
                 _ = heartbeat.tick() => {
-                    if periodic && !manager.authority_reconciling.load(Ordering::Acquire) {
+                    if manager.authority_initialized.load(Ordering::Acquire) && *manager.lifecycle_ready.read().await {
                         registration.reconciling = false;
                         registration.accepting_allocations = manager.accepting_allocations()
                             && !manager.is_draining();
@@ -280,12 +275,9 @@ pub async fn reconcile_node(
         }
         registration.reconciling = false;
         registration.accepting_allocations =
-            manager.locally_accepting_allocations() && !manager.is_draining();
+            manager.accepting_allocations() && !manager.is_draining();
         // Coordinator may dispatch while processing this report, before replying.
         // Authority is already validated, so accept those confirmed assignments.
-        manager
-            .authority_reconciling
-            .store(false, Ordering::Release);
         report(manager, coordinator, registration, timeout, &mut handshake_required).await
     }
     .await;

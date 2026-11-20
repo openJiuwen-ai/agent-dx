@@ -89,7 +89,7 @@ async fn orphan_claim_in_controller_replacement_gap_preserves_authority_adoption
         OrphanTarget::AwaitingController
     ));
     assert!(node.retired_environment("pending").is_none());
-    assert!(node.adopt_comparison_record(&record).unwrap().is_some());
+    assert!(node.adopt_record(&record, false).unwrap().is_some());
     assert!(matches!(
         node.claim_orphan(&runtime, true),
         OrphanTarget::Controller(_)
@@ -107,7 +107,7 @@ async fn live_catalog_defers_a_claim_before_its_create_rpc_arrives() {
         hooks.clone(),
     );
     let record = pending_record();
-    let adopted = node.adopt_comparison_record(&record).unwrap();
+    let adopted = node.adopt_record(&record, false).unwrap();
     assert!(
         adopted.is_none(),
         "an unstarted claim must remain available for its create RPC"
@@ -135,7 +135,7 @@ async fn paused_live_adoption_does_not_leak_a_tentative_create_hold() {
 
     let reservation = node.reserve_local(&record.spec).unwrap();
     assert_eq!(node.used(), record.spec.resources);
-    assert!(node.adopt_comparison_record(&record).unwrap().is_some());
+    assert!(node.adopt_record(&record, false).unwrap().is_some());
     let retry = node.reserve_local(&record.spec).unwrap();
     assert_eq!(retry.token, reservation.token);
     node.release_local(&record.spec.id, &retry).unwrap();
@@ -171,6 +171,7 @@ async fn live_comparison_preserves_an_already_registered_unstarted_create() {
             .unwrap();
         handle
             .check_authority(AuthorityCheck {
+                recover: false,
                 record: Some(record),
                 references: None,
             })
@@ -186,7 +187,10 @@ async fn live_comparison_preserves_an_already_registered_unstarted_create() {
 }
 
 #[derive(Default)]
-struct Hooks(AtomicUsize);
+struct Hooks(
+    AtomicUsize,
+    std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+);
 #[async_trait]
 impl RuntimeDriver for Hooks {
     async fn inventory(&self) -> Result<Vec<crate::RuntimeObservation>> {
@@ -205,8 +209,61 @@ impl RuntimeDriver for Hooks {
         Ok(true)
     }
     async fn remove(&self, _: &str) -> Result<()> {
+        let on_removed = self.1.lock().unwrap().take();
+        if let Some(on_removed) = on_removed {
+            on_removed();
+        }
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn full_recovery_keeps_a_controller_admitted_during_old_owner_retirement() {
+    let hooks = Arc::new(Hooks::default());
+    let node = Adxlet::new(
+        "n".into(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks.clone(),
+        hooks.clone(),
+    );
+    node.update_capacity(
+        Resources {
+            cpu_millis: 10,
+            memory_bytes: 10,
+            disk_bytes: 0,
+        },
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+    let mut old = pending_record();
+    old.state = EnvironmentState::Running;
+    old.revision = 2;
+    old.runtime.ip = Some("127.0.0.1".parse().unwrap());
+    node.reconcile(vec![old.clone()]).await.unwrap();
+    let mut current = old.clone();
+    current.assignment.generation = 2;
+    current.runtime.id = "pending-2".into();
+    let admitted = Arc::new(std::sync::Mutex::new(None));
+    *hooks.1.lock().unwrap() = Some(Box::new({
+        let node = node.clone();
+        let admitted = admitted.clone();
+        let current = current.clone();
+        move || {
+            // Publish the confirmed retirement and admit the new authority's
+            // request before the older comparison resumes its registry update.
+            node.remember_retired(&old.assignment, None);
+            let handle = node.environment(current.spec, current.assignment).unwrap();
+            *admitted.lock().unwrap() = Some(handle);
+        }
+    }));
+    node.reconcile(vec![current.clone()]).await.unwrap();
+    let registered = node.environment(current.spec, current.assignment).unwrap();
+    let admitted = admitted.lock().unwrap();
+    assert!(
+        registered.same_controller(admitted.as_ref().unwrap()),
+        "an older authority comparison must not replace a concurrently admitted controller"
+    );
 }
 
 #[tokio::test]
@@ -243,9 +300,10 @@ async fn live_comparison_does_not_exempt_pending_records_with_execution_evidence
         } else {
             record.runtime.ip = Some("127.0.0.1".parse().unwrap());
         }
-        let handle = node.adopt_comparison_record(&record).unwrap().unwrap();
+        let handle = node.adopt_record(&record, false).unwrap().unwrap();
         handle
             .check_authority(AuthorityCheck {
+                recover: false,
                 record: Some(record),
                 references: None,
             })
@@ -298,7 +356,7 @@ async fn adopted_controller_requires_authority_check_before_exposing_lifecycle()
             "checkpoint":null,"last_operation":null,"restart_attempts":0,"restart_pending":false,
             "execution_artifacts":[],"snapshot_source":null,"failure":null
         })).unwrap();
-        let handle = node.adopt_comparison_record(&record).unwrap().unwrap();
+        let handle = node.adopt_record(&record, false).unwrap().unwrap();
         // This models a request racing the background task before its command
         // reaches the newly installed controller's queue.
         let early = if terminal {
@@ -313,6 +371,7 @@ async fn adopted_controller_requires_authority_check_before_exposing_lifecycle()
         assert_eq!(hooks.0.load(Ordering::SeqCst), 0);
         let result = handle
             .check_authority(AuthorityCheck {
+                recover: false,
                 record: Some(record),
                 references: None,
             })

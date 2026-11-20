@@ -299,30 +299,25 @@ fn old_or_unconfigured_environment_cannot_mount_arbitrary_host_files() {
 }
 
 #[test]
-fn registered_local_template_keeps_image_environment_and_execd_bootstrap() {
-    let template =
-        serde_json::from_value(json!({"path":"/var/lib/agentos/local-images/tools/rootfs",
-        "env":{"PATH":"/image/bin", "IMAGE_VALUE":"default"}}))
-        .unwrap();
+fn explicit_local_rootfs_keeps_caller_environment_and_execd_bootstrap() {
     let mut profile = runtime_profile();
     profile.env.insert("PATH".into(), "/profile/bin".into());
     let config = Config {
         runtime_profile: Some(profile.clone()),
-        local_rootfs_templates: [("tools".into(), template)].into_iter().collect(),
         ..Default::default()
     };
     let mut wanted = spec("");
     wanted.runtime_profile = Some(profile);
+    wanted.env.insert("PATH".into(), "/image/bin".into());
     wanted.env.insert("IMAGE_VALUE".into(), "request".into());
     wanted.execution.rootfs = Some(Rootfs {
         readonly: false,
         source: StorageSource::Local("/var/lib/agentos/local-images/tools/rootfs".into()),
     });
     let request = start_request(&wanted, "local-1", 1, &[], &config).unwrap();
-    assert_eq!(
-        request.rootfs.unwrap().r#type,
-        proto::RootfsSrcType::Local as i32
-    );
+    let rootfs = request.rootfs.unwrap();
+    assert_eq!(rootfs.r#type, proto::RootfsSrcType::Local as i32);
+    assert!(!rootfs.readonly);
     assert_eq!(request.envs["PATH"], "/image/bin");
     assert_eq!(request.envs["IMAGE_VALUE"], "request");
     assert!(request.mounts.iter().any(|mount| mount.target == "/__adx"));

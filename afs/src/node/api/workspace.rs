@@ -38,8 +38,8 @@ use crate::node::{
         ownerfs::{
             OwnerFs,
             root::{
-                OutletRoot, RootCreateParams, RootLocation, RootMeta, RootReservation,
-                root_id_from_name, root_name_from_id,
+                RootCreateParams, RootLocation, RootMeta, RootReservation, root_id_from_name,
+                root_name_from_id,
             },
         },
         types::{FileAttributes, RequestContext},
@@ -849,18 +849,16 @@ impl WorkspaceApi {
             .outlet
             .as_ref()
             .ok_or_else(|| std::io::Error::other("outlet is disabled"))?;
+        let name = crate::node::vfs::ownerfs::root::root_name_from_id(&location.id)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let expected = PathBuf::from(mirror::target_path(
             &outlet.import_root.to_string_lossy(),
-            &OutletRoot {
-                root_id: location.id.clone(),
-                root_epoch: location.epoch,
-                home_node_id: location.home_node_id.clone(),
-                home_nfs_addr: String::new(),
-            },
+            &location.home_node_id,
+            &name.to_string_lossy(),
         ));
         if std::fs::read_link(self.public_path(owner))? != expected {
             return Err(std::io::Error::other(
-                "outlet points at a different root generation",
+                "outlet points at a different workspace path",
             ));
         }
         let mounts = topology::parse(&std::fs::read("/proc/self/mountinfo")?);
@@ -872,7 +870,7 @@ impl WorkspaceApi {
             .ok_or_else(|| std::io::Error::other("outlet import is not mounted"))?;
         if location.home_node_id == self.node.config.id {
             let a = std::fs::metadata(&point)?;
-            let b = std::fs::metadata(self.node.config.data_dir.join("ownerfs"))?;
+            let b = std::fs::metadata(&self.node.config.ownerfs_data_dir)?;
             if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
                 return Err(std::io::Error::other(
                     "local import is not the OwnerFs storage root",

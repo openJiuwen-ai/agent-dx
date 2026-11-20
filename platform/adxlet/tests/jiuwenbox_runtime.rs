@@ -321,6 +321,66 @@ fn spec(class: &str) -> EnvironmentSpec {
 }
 
 #[tokio::test]
+async fn supervisor_runtime_logs_use_creation_stdio_paths() {
+    for class in ["supervisor", "conch"] {
+        let fixture = Fixture::new();
+        let log_directory = fixture._dir.path().join("runtime-logs");
+        let launch = LaunchConfig {
+            runtime_logs: Some(adxlet::runtime_logs::RuntimeLogPolicy {
+                directory: log_directory.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let driver = Jiuwenbox::with_host(fixture.config.clone(), launch, fixture.host.clone())
+            .await
+            .unwrap();
+        driver
+            .start_with_deadline(
+                &spec(class),
+                "tenant-agent-1",
+                1,
+                &[],
+                Instant::now() + CREATE_BUDGET,
+            )
+            .await
+            .unwrap();
+        let calls = fixture.backend.calls.lock().unwrap();
+        let create = &calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/v1/sandboxes")
+            .unwrap()
+            .2;
+        let exec = &calls
+            .iter()
+            .find(|(_, p, _)| p.ends_with("/exec_background"))
+            .unwrap()
+            .2;
+        if class == "supervisor" {
+            assert_eq!(
+                create["stdout"],
+                json!(log_directory.join("tenant-agent-1.out"))
+            );
+            assert_eq!(
+                create["stderr"],
+                json!(log_directory.join("tenant-agent-1.err"))
+            );
+            assert!(
+                !serde_json::to_string(&create["policy"]["filesystem_policy"])
+                    .unwrap()
+                    .contains("runtime-logs")
+            );
+            assert!(log_directory.is_dir());
+        } else {
+            assert!(create["stdout"].is_null());
+            assert!(create["stderr"].is_null());
+        }
+        assert!(exec.get("stdout_path").is_none());
+        assert!(exec.get("stderr_path").is_none());
+    }
+}
+
+#[tokio::test]
 async fn inherited_workload_overrides_reach_execd_for_both_jiuwenbox_runtimes() {
     for class in ["supervisor", "conch"] {
         let fixture = Fixture::new();
@@ -1485,9 +1545,10 @@ async fn recovery_reaps_late_supervisor_and_conch_without_local_records() {
             fixture.host.process_alive.store(true, Ordering::SeqCst);
         }
         // Unidentified native executions still require quiescent recovery.
-        // A live inventory failure preserves admission and the backend.
+        // Unknown occupancy blocks new allocations and preserves the backend.
         assert!(authority.cycle(&node).await.is_err());
-        assert!(node.accepting_allocations());
+        assert!(!node.accepting_allocations());
+        assert!(!authority.registration.accepting_allocations);
         assert!(!fixture.backend.refs.lock().unwrap().is_empty(), "{class}");
         // A new recovery handshake performs complete orphan cleanup.
         authority.registration.reconciling = true;

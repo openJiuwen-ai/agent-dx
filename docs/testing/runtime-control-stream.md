@@ -11,6 +11,7 @@
 | 断流重连 | 重连发送完整 pending 状态，完成应答沿用 operation ID，重复 Finish 收敛 |
 | 凭证与归属 | 错误凭证、未授权执行不能注册；执行 token 绑定 Environment／Runtime／generation |
 | 无效握手隔离 | revision 为零的 Hello 被拒绝，不替换当前健康连接 |
+| Running 接续与空闲 | 新 adxlet 控制槽位尚未注册时接管 Running Env，注册后补订阅；活动连接不暂停，断开后第 599 秒仍 Running，第 600 秒自动 Pause 并释放本机资源，不依赖 monitor tick |
 | 执行清理 | 删除后移除节点控制槽位，迟到连接不能复活旧执行 |
 | 真实 Execd 进程 | 实际 gRPC、Unix `/checkpoint` 和 FIFO handoff 交互；成功应答等待 Finish |
 | adxlet 创建与 checkpoint | 真实 Execd 在 Start 返回前主动 Ready；原生命周期串行执行，状态发布阻塞时 Unix 请求不提前成功，删除释放资源 |

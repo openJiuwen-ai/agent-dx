@@ -39,7 +39,7 @@ cargo test --locked -p adx-coordinator --test storage checkpoint_publication_rou
 | 模式 | 捕获 | 恢复 | 物理回收 |
 | --- | --- | --- | --- |
 | local only | 写节点私有目录，完成可读性校验 | 直接读取本地目录 | 原节点；不支持跨节点恢复 |
-| S3 + 本地缓存 | 写本地 staging，文件上传完成后发布 manifest | 命中缓存直接用；否则下载并校验后使用 | Coordinator 删除 S3；节点独立淘汰缓存 |
+| S3 + 本地缓存 | 写本地 staging，文件上传完成后发布 manifest | 完整校验缓存；缺失或损坏时重新下载并校验 | Coordinator 删除 S3；节点独立淘汰缓存 |
 | AFS / JuiceFS / NFS（distributed_fs） | 直接写挂载目录中的独立捕获目录，逐文件同步后发布 manifest | 直接使用同一共享路径，不预下载整个制品 | Coordinator 删除共享 manifest 和目录 |
 
 每个共享后端使用稳定 `alias`。同一 alias 的所有节点与 Coordinator 必须配置同一
@@ -67,6 +67,7 @@ cargo test --locked -p adx-coordinator --test storage checkpoint_publication_rou
 S3 通过标准 AWS 环境变量/身份机制取得凭据。制品引用保存 alias、scope、制品 ID、大小，
 不保存端点或密钥。缓存默认 500 条、50 GiB，活跃恢复/执行文件受到 pin 保护。
 上传完成并提交权威结果后，原 staging 直接进入缓存，不复制或重新下载。
+节点启动的第一阶段合并权威、Journal 和本地执行引用，通过 `protect_execution()` 登记不依赖文件是否存在的引用 pin，不读取输入或访问远端。第二阶段才在对应 Controller 中通过 `retain_execution()` 取得文件访问保护，缺失副本按正常路径下载并完整校验。缺少必要存储配置或保护失败时只冻结对应实例；输入尚待物化时跳过根目录回收，健康控制、新分配和准入上报不等待回源。无引用目录清理只在准入关闭时执行；开放准入不等待所有实例发布结果。未使用缓存的内容校验放到只读后台任务，最多 2 个工作项、合计不超过 32 MB/s。校验遇到执行 pin 时让出，实际恢复独立完成全量校验，不等待后台结果。每个存储实例最多同时物化 2 个恢复点，同一 artifact 串行；目录索引锁不覆盖下载、内容校验或文件删除。损坏副本仍被执行引用时返回 Conflict，避免替换其输入文件；只有确认执行停止并释放 pin 后才能重建。本地副本可回源不表示远端对象缺失或损坏也可恢复；远端元数据错误不会单独触发本地输入删除。
 
 `distributed_fs` 是统一的目录访问接口。adxlet 和 Coordinator 不区分底层文件系统：
 前者调用捕获／恢复接口，后者调用回收接口；两者配置相同 alias、prefix 和共享 namespace。
@@ -136,7 +137,7 @@ Environment 删除后，已登记共享制品继续由 registry/引用/holds 和
 3. runtime 写入完成后，`seal()` 完成该后端的发布合同并返回完整 artifact。
    S3 上传并发布 manifest；共享文件系统同步文件并发布 manifest；local 校验文件可读性。
 4. adxlet 提交恢复点/Snapshot 的权威元数据，随后调用 `committed()` 完成本地缓存登记。
-5. 恢复时 `prepare_restore()` 返回 `RestoreAccess`；S3 取得缓存 pin，共享文件系统/local 返回原目录。
+5. 恢复时 `prepare_restore()` 校验后返回 `RestoreAccess`；S3 校验或重建缓存并取得 pin，共享文件系统/local 返回原目录。启动先通过 `protect_execution()` 保护输入引用，再由各实例的 `retain_execution()` 重建访问保护；S3 的已有副本不在接管时重算内容摘要。必要输入的本地副本缺失时，仅该实例等待完整下载和校验，期间引用保护持续有效。
    adxlet 在执行仍依赖文件时保留访问对象及持久化输入记录，确认停止后释放。
 6. 节点 `release()` 只处理本地文件/缓存，共享文件系统不在此删除共享文件。
 

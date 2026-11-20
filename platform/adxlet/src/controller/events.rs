@@ -47,48 +47,51 @@ pub(super) struct Observers {
 impl Observers {
     pub fn refresh(&mut self, controller: &mut Controller) {
         // The pressure signal subscription is node-scoped and independent of
-        // the runtime identity: establish it before the identity fast-path
-        // below, which returns early for a stable Running environment, and
-        // carry it across identity resets (reset_preserving_pressure).
+        // the runtime identity: subscribe once and carry it across identity
+        // resets, preserving a High round that arrived during recovery.
         if self.pressure_signal.is_none() {
             self.pressure_signal = Some(controller.services.pressure_signal.subscribe());
         }
         let identity = (controller.record.state == EnvironmentState::Running
-            && !controller.retired
-            && !controller.authority_fenced)
+            && !controller.retired)
             .then(|| crate::runtime_control::RuntimeControlClient::identity(&controller.record));
-        if identity == self.identity {
-            return;
+        if identity != self.identity {
+            self.reset_preserving_pressure();
+            let retry = controller.events.retry;
+            let retry_attempts = controller.events.retry_attempts;
+            let workload = controller.events.workload.take().filter(|pending| {
+                controller.record.state == EnvironmentState::Running
+                    && !controller.retired
+                    && pending.identity
+                        == crate::runtime_control::RuntimeControlClient::identity(
+                            &controller.record,
+                        )
+            });
+            controller.events = LifecycleEvents {
+                workload,
+                retry,
+                retry_attempts,
+                ..LifecycleEvents::default()
+            };
+            controller.idle = None;
+            self.identity = identity;
+            if self.identity.is_some() {
+                controller.events.retry = None;
+                controller.events.retry_attempts = 0;
+                self.arm_exit(controller);
+            }
         }
-        self.reset_preserving_pressure();
-        let retry = controller.events.retry;
-        let retry_attempts = controller.events.retry_attempts;
-        let workload = controller.events.workload.take().filter(|pending| {
-            controller.record.state == EnvironmentState::Running
-                && !controller.retired
-                && pending.identity
-                    == crate::runtime_control::RuntimeControlClient::identity(&controller.record)
-        });
-        controller.events = LifecycleEvents {
-            workload,
-            retry,
-            retry_attempts,
-            ..LifecycleEvents::default()
-        };
-        controller.idle = None;
-        let Some(identity) = identity else {
-            return;
-        };
-        self.control = controller
-            .services
-            .runtime_control
-            .as_ref()
-            .and_then(|client| client.subscribe(&controller.record).ok().flatten());
-        self.initial = self.control.is_some();
-        self.identity = Some(identity);
-        controller.events.retry = None;
-        controller.events.retry_attempts = 0;
-        self.arm_exit(controller);
+        // Restored Running controllers can be observed before reconciliation
+        // registers their control slot. Attach once it exists, without resetting
+        // observations or deadlines for the same execution.
+        if self.identity.is_some() && self.control.is_none() {
+            self.control = controller
+                .services
+                .runtime_control
+                .as_ref()
+                .and_then(|client| client.subscribe(&controller.record).ok().flatten());
+            self.initial = self.control.is_some();
+        }
     }
     pub fn arm_exit(&mut self, controller: &Controller) {
         if self.exit.is_none() && self.identity.is_some() {
@@ -447,7 +450,7 @@ impl Controller {
     /// last so only a real candidate consumes a budget slot.
     pub(super) async fn consider_pressure_pause(&mut self) -> Result<()> {
         let options = self.services.pressure_pause_options.clone();
-        if !options.enabled {
+        if !options.enabled || self.authority_fenced || self.retired {
             return Ok(());
         }
         // Refresh the window against demand before any eligibility
@@ -463,8 +466,7 @@ impl Controller {
             .clone();
         // C1: some resource sits at High. C2: failed rounds keep the board
         // untrusted for relief. C3: never observed, or too stale to act on.
-        let high = board.memory.level == crate::resources::PressureLevel::High
-            || board.disk.level == crate::resources::PressureLevel::High;
+        let high = board.has_high_pressure();
         if !high || board.consecutive_failures != 0 || board.observed_at_unix_seconds == 0 {
             return Ok(());
         }

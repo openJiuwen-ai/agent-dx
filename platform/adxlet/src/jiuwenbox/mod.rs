@@ -237,6 +237,9 @@ impl Jiuwenbox {
         if launch.rpc_timeout.is_zero() {
             return Err(Error::Invalid("positive Jiuwenbox timeout required".into()));
         }
+        if let Some(policy) = &launch.runtime_logs {
+            crate::runtime_logs::RuntimeLogs::new(policy.clone()).map_err(unavailable)?;
+        }
         if launch.command.is_empty() {
             launch.command = config.bootstrap.command.clone();
         }
@@ -533,7 +536,9 @@ impl Jiuwenbox {
             ));
         }
         let mut common = self.launch.clone();
-        common.runtime_logs = None;
+        if spec.runtime_class == "conch" {
+            common.runtime_logs = None;
+        }
         // The backend image binding uses the runtime profile PATH.
         let mut request =
             sandboxd::build_start_request(spec, id, generation, devices, &common, false)?;
@@ -674,7 +679,11 @@ impl Jiuwenbox {
                     .iter()
                     .map(|(key, value)| (key.clone(), json!(value))),
             );
-        let body = json!({"sandbox_id":sandbox_id(id),"sandbox_runtime":if spec.runtime_class=="conch"{"conch"}else{"bwrap"},"policy_mode":"append","policy":backend_policy});
+        let mut body = json!({"sandbox_id":sandbox_id(id),"sandbox_runtime":if spec.runtime_class=="conch"{"conch"}else{"bwrap"},"policy_mode":"append","policy":backend_policy});
+        if spec.runtime_class == "supervisor" && self.launch.runtime_logs.is_some() {
+            body["stdout"] = json!(request.stdout);
+            body["stderr"] = json!(request.stderr);
+        }
         let exec = json!({"job_id":"adx-execd","command":self.config.bootstrap.command,"workdir":request.cwd,"env":request.envs});
         Ok((body, exec))
     }

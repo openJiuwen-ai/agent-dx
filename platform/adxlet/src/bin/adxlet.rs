@@ -3,7 +3,7 @@ use adx_process::{read_config, shutdown};
 use adx_protocol::control as pb;
 use adx_transport::rpc::{RpcChannel, RpcClient};
 use adx_transport::tls::TlsFiles;
-use adxlet::resources::{PressureGate, PressurePolicy, ResourceSource};
+use adxlet::resources::{PressureGate, PressurePolicy, PressureResources, ResourceSource};
 use adxlet::{
     jiuwenbox::Jiuwenbox,
     readiness::ExecdReadiness,
@@ -82,8 +82,6 @@ struct Config {
     #[serde(default)]
     checkpoint_runtime_binaries: BTreeMap<String, PathBuf>,
     #[serde(default)]
-    local_rootfs_templates: BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
-    #[serde(default)]
     execd_command: Vec<String>,
     #[serde(default)]
     execd_env: HashMap<String, String>,
@@ -101,13 +99,46 @@ struct Discovery {
     namespace: String,
 }
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 struct PressureConfig {
-    disk_path: PathBuf,
-    #[serde(default)]
+    memory_enabled: bool,
+    disk_enabled: bool,
+    disk_path: Option<PathBuf>,
     thresholds: PressurePolicy,
-    #[serde(default)]
     pause: PressurePauseConfig,
+}
+
+impl Default for PressureConfig {
+    fn default() -> Self {
+        Self {
+            memory_enabled: true,
+            disk_enabled: true,
+            disk_path: None,
+            thresholds: PressurePolicy::default(),
+            pause: PressurePauseConfig::default(),
+        }
+    }
+}
+
+impl PressureConfig {
+    fn resources(&self) -> PressureResources {
+        PressureResources {
+            memory_enabled: self.memory_enabled,
+            disk_enabled: self.disk_enabled,
+        }
+    }
+
+    fn gate(&self) -> adx_core::Result<Option<PressureGate>> {
+        if !self.resources().any_enabled() {
+            return Ok(None);
+        }
+        if self.disk_enabled && self.disk_path.is_none() {
+            return Err(adx_core::Error::Invalid(
+                "pressure disk_path is required when disk_enabled is true".into(),
+            ));
+        }
+        PressureGate::with_resources(self.thresholds.clone(), self.resources()).map(Some)
+    }
 }
 #[derive(Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
@@ -241,11 +272,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, Some(source)) => source,
         _ => return Err("configure exactly one of capacity_file and resource_source".into()),
     };
-    let mut pressure_gate = config
-        .pressure
-        .as_ref()
-        .map(|p| PressureGate::new(p.thresholds.clone()))
-        .transpose()?;
+    let mut pressure_gate = match &config.pressure {
+        Some(pressure) => pressure.gate()?,
+        None => None,
+    };
     let (server_tls, client_tls, peers) = config
         .tls
         .load_rpc(adx_protocol::auth::Principal::Node(config.node_id.clone()))?;
@@ -333,17 +363,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
         })
         .transpose()?;
-    let local_rootfs_labels = config
-        .local_rootfs_templates
-        .keys()
-        .map(|name| {
-            adx_core::local_rootfs::capability_label(name).map(|key| (key, "ready".to_owned()))
-        })
-        .collect::<adx_core::Result<HashMap<_, _>>>()?;
     let runtime_config = RuntimeConfig {
         runtime_profile: config.runtime_profile,
         checkpoint_runtime_binaries: config.checkpoint_runtime_binaries,
-        local_rootfs_templates: config.local_rootfs_templates,
         command: config.execd_command,
         env,
         cwd: "/".into(),
@@ -418,9 +440,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_checkpointing(storage, Arc::new(control.clone()))?
             .with_snapshot_catalog(sink.clone())?;
     }
-    if let Some(pressure) = &config.pressure {
+    if let Some(pressure) = config.pressure.as_ref().filter(|_| pressure_gate.is_some()) {
         manager = manager.with_pressure_pause_options(pressure.pause.clone().into())?;
-        manager.mark_pressure_configured();
+        manager.mark_pressure_configured(pressure.resources());
     }
     let manager = Arc::new(manager);
     if std::env::var("ADX_NODE_UPGRADE_ISOLATED").as_deref() == Ok("true") {
@@ -459,7 +481,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(scope) = checkpoint_scopes.first() {
         labels.insert("ADX_CHECKPOINT_SCOPE".into(), scope.clone());
     }
-    labels.extend(local_rootfs_labels);
     labels.remove(NODE_HOST_UUID_LABEL);
     match read_host_uuid(Path::new(DMI_HOST_UUID_PATH)) {
         Ok(host_uuid) => {
@@ -580,16 +601,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let (Some(config), Some(gate)) = (&config.pressure, &mut pressure_gate) {
                 let path = config.disk_path.clone();
-                let update =
-                    match tokio::task::spawn_blocking(move || adxlet::resources::pressure(&path))
-                        .await
-                    {
-                        Ok(Ok(pressure)) => gate.update(pressure),
-                        // A failed sample closes admission for this round and
-                        // freezes the structured snapshot, growing the
-                        // failure counter instead of moving levels.
-                        _ => gate.fail(),
-                    };
+                let resources = config.resources();
+                let update = match tokio::task::spawn_blocking(move || {
+                    adxlet::resources::pressure(resources, path.as_deref())
+                })
+                .await
+                {
+                    Ok(Ok(pressure)) => gate.update(pressure),
+                    Ok(Err(error)) => {
+                        adx_observability::warn!(%error, "pressure sample failed; pressure gate is open");
+                        gate.fail()
+                    }
+                    Err(error) => {
+                        adx_observability::warn!(%error, "pressure sampling task failed; pressure gate is open");
+                        gate.fail()
+                    }
+                };
                 manager.set_pressure_state(&update);
                 // Heartbeat field: direct observation-point fill, same
                 // discipline as capacity/devices/storage_mounts above. The
@@ -706,6 +733,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_only_pressure_configuration_omits_disk_path() {
+        let config = serde_json::from_value::<PressureConfig>(serde_json::json!({
+            "memory_enabled": true,
+            "disk_enabled": false,
+            "thresholds": {"memory_high_percent": 90, "memory_low_percent": 80}
+        }))
+        .expect("memory-only pressure needs no disk path");
+        assert!(config.memory_enabled);
+        assert!(!config.disk_enabled);
+        assert!(config.disk_path.is_none());
+        assert!(config.gate().unwrap().is_some());
+    }
+
+    #[test]
+    fn disabled_pressure_configuration_omits_disk_path() {
+        let config = serde_json::from_value::<PressureConfig>(serde_json::json!({
+            "memory_enabled": false,
+            "disk_enabled": false
+        }))
+        .expect("disabled pressure needs no disk path");
+        assert!(config.gate().unwrap().is_none());
+    }
+
+    #[test]
+    fn default_pressure_configuration_enables_both_resources_and_requires_disk_path() {
+        let config: PressureConfig = serde_json::from_value(serde_json::json!({
+            "disk_path": "/opt/adx/data"
+        }))
+        .unwrap();
+        assert!(config.memory_enabled && config.disk_enabled);
+        assert!(config.gate().unwrap().is_some());
+        let missing_path: PressureConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(missing_path.gate().is_err());
+        let missing_path: PressureConfig = serde_json::from_value(serde_json::json!({
+            "memory_enabled": false, "disk_enabled": true
+        }))
+        .unwrap();
+        assert!(missing_path.gate().is_err());
+    }
 
     #[test]
     fn dmi_host_uuid_is_normalized() {

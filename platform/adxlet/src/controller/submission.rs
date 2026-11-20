@@ -397,7 +397,6 @@ mod tests {
 
     #[tokio::test]
     async fn restore_does_not_cross_barrier_waiting_for_queue_admission() {
-        assert!(!Command::Reconcile.is_restore_barrier());
         let submissions = Arc::new(Submissions::new());
         let (tx, mut rx) = mpsc::channel(1);
 

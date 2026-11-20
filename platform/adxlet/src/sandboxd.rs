@@ -30,7 +30,6 @@ pub struct Config {
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     /// Exact backend executable paths configured in sandboxd; never inferred from PATH.
     pub checkpoint_runtime_binaries: BTreeMap<String, PathBuf>,
-    pub local_rootfs_templates: BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: String,
@@ -48,7 +47,6 @@ impl Default for Config {
         Self {
             runtime_profile: None,
             checkpoint_runtime_binaries: BTreeMap::new(),
-            local_rootfs_templates: BTreeMap::new(),
             command: vec!["/usr/local/bin/adx-execd".into()],
             env: HashMap::from([("EXECD_HTTP_PORT".into(), "50090".into())]),
             cwd: "/".into(),
@@ -256,13 +254,6 @@ impl Sandboxd {
             return Err(Error::Invalid(
                 "sandboxd command and positive RPC timeout are required".into(),
             ));
-        }
-        for (name, template) in &config.local_rootfs_templates {
-            adx_core::local_rootfs::capability_label(name)?;
-            template.validate()?;
-            std::fs::metadata(&template.path).map_err(|error| {
-                Error::Invalid(format!("local rootfs template {name}: {error}"))
-            })?;
         }
         if let Some(e) = &config.runtime_profile {
             e.validate()?;
@@ -810,22 +801,6 @@ pub(crate) fn build_start_request(
                 continue;
             }
             envs.insert(key.clone(), value.clone());
-        }
-    }
-    if let Some(adx_core::execution::Rootfs {
-        source: adx_core::execution::StorageSource::Local(path),
-        ..
-    }) = &spec.execution.rootfs
-    {
-        let template = config
-            .local_rootfs_templates
-            .values()
-            .find(|value| &value.path == path);
-        if let Some(template) = template {
-            template.validate()?;
-            for (key, value) in &template.env {
-                envs.insert(key.clone(), spec.env.get(key).unwrap_or(value).clone());
-            }
         }
     }
     // Deployment configuration owns control ports, tokens, and execution identity.
@@ -1465,7 +1440,7 @@ impl RuntimeDriver for Sandboxd {
             recovery::profiles(rootfs.as_ref(), &self.config.checkpoint_runtime_binaries)?;
         if observed.get(&spec.runtime_class) != Some(published) {
             return Err(Error::Unavailable(
-                "recovery backend or host changed; a new node session is required".into(),
+                "recovery backend or rootfs changed; a new node session is required".into(),
             ));
         }
         Ok(published.clone())

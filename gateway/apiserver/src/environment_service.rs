@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -176,12 +177,35 @@ impl EnvironmentService {
         input: Value,
         caller: &pb::CallerContext,
     ) -> Result<pb::EnvironmentSpec, Status> {
-        contract::create_spec_with_templates(
+        let spec = contract::create_spec_with_environment(
             input,
             caller,
             self.clients.config.runtime_profile.as_ref(),
-            &self.clients.config.local_rootfs_templates,
-        )
+        )?;
+        let source = spec
+            .execution
+            .as_ref()
+            .and_then(|options| options.rootfs.as_ref())
+            .and_then(|rootfs| rootfs.source.as_ref())
+            .and_then(|source| source.source.as_ref());
+        if let Some(pb::storage_source::Source::Local(path)) = source {
+            let path = Path::new(path);
+            if !self
+                .clients
+                .config
+                .allowed_local_rootfs_dirs
+                .iter()
+                .any(|parent| {
+                    path.strip_prefix(parent)
+                        .is_ok_and(|suffix| !suffix.as_os_str().is_empty())
+                })
+            {
+                return Err(Status::permission_denied(
+                    "local rootfs path must be beneath an allowed directory",
+                ));
+            }
+        }
+        Ok(spec)
     }
 
     /// Shared admission for HTTP and in-process callers; accepts no Agent-specific types.

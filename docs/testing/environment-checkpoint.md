@@ -27,9 +27,9 @@
 
 `CheckpointAccess::seal` 是存储完成边界。对象存储在此完成上传，通过 `prepare_restore` 下载；本地/S3、缓存引用和跨节点恢复已实现，见 [存储契约](snapshot-storage.md) 与 [跨节点恢复](firecracker-cross-node.md)。
 
-跨节点 Resume/Recover 与升级迁移共用选址和兼容性准入，要求捕获时保存的 host、runtime、rootfs 证据及实际共享存储 scope；缺失或不匹配时不转移所有权。当前实测配置仅开放默认 rootfs 的同构 Linux runsc，见[节点配置](../../build/config/examples/README.md)。旧恢复点可继续本地恢复，跨节点前需重新捕获；其他运行时的历史验证不代表满足当前准入。
+跨节点 Resume/Recover 与升级迁移共用选址和兼容性准入，要求捕获时保存的 runtime、rootfs 证据及实际共享存储 scope；缺失或不匹配时不转移所有权。宿主机内核版本、CPU 型号及 `/proc/cpuinfo` flags 不作精确相等筛选；runsc 在实际恢复时验证检查点所需的 CPU 能力。当前配置仅开放默认 rootfs 的 Linux runsc，见[节点配置](../../build/config/examples/README.md)。旧恢复点可继续本地恢复，跨节点前需重新捕获；其他运行时的历史验证不代表满足当前准入。
 
-local-only 成功表示后端已生成完整、可在本机读取的制品，并已提交恢复点元数据。adxlet 不主动对本地制品及目录执行 `fsync`；未完成的磁盘写回由操作系统和执行后端处理，不保证突然断电或宿主机崩溃后的制品完整性。该规则同样用于 workload checkpoint、本地回滚恢复点和可复用快照副本；对象存储仍等待完整上传。恢复及重启对账保留本地制品的路径、类型和长度校验，校验失败的恢复点不能用于恢复。
+local-only 成功表示后端已生成完整、可在本机读取的制品，并已提交恢复点元数据。adxlet 不主动对本地制品及目录执行 `fsync`；未完成的磁盘写回由操作系统和执行后端处理，不保证突然断电或宿主机崩溃后的制品完整性。该规则同样用于 workload checkpoint、本地回滚恢复点和可复用快照副本；对象存储仍等待完整上传。实际恢复前检查本地制品的路径、类型和长度；S3 缓存还完整校验 SHA-256，本地副本缺失或损坏时重新下载并校验。启动时未使用的 Paused 恢复点不做同步内容校验。
 
 ## 配置与部署
 
@@ -56,7 +56,7 @@ sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提�
 - 恢复失败但清理成功时保留恢复点并释放此次本机资源；清理不确定时保留资源，等待处理。自动跨节点恢复仅在本地容量不足、或执行准入 `prepare_execution` 尚未成功返回且报 `Unavailable`、`VolumeBusy`、`NoCapacity`（含准入超时）时保留可重试进度；Coordinator 保留 `recovery.pending` 的目标预留。临时准入错误沿用该 Assignment 重试，明确 NoCapacity 仍可按既有规则拒绝目标后重新选点。checkpoint 读取失败（含有效存储别名下对象缺失）、后端 restore 拒绝、开始 restore 后的初始化超时、readiness 或路由激活失败，在清理确认后转为 Failed，不因错误类型是 `Unavailable` 而再次执行 restore。
 - 节点重启后，从 Coordinator 获取完整目录；Paused 记录不会被当作缺失的 Running 实例重建。未持久化且不匹配的执行按既有对账原则清理。
 - 替换、过期和删除恢复点时，先提交新元数据，再清理旧制品。提交或清理失败保留待清理记录，后续同步或同操作重试继续完成清理。
-- 重启对账期间关闭准入，确认所有执行和结果已对账发布后，清理本地存储根目录中不再被引用的 UUID 制品目录。Coordinator 不可用或对账失败时不执行该清理；共享存储的目录引用与旧会话孤儿清理见 [存储契约](snapshot-storage.md)。
+- 第一阶段在生命周期准入关闭时，合并完整权威目录、Journal 和本地执行引用，恢复占用并登记引用保护，不做输入回源。仅在必要文件访问保护已持有且没有未解决孤儿时，扫描并清理无引用 UUID 制品目录。输入尚待物化时跳过根扫描，由对应 Controller 在第二阶段下载／校验，健康控制及新分配不等待这些 I/O。输入保护失败只冻结对应实例；闲置缓存清理失败不阻断健康实例就绪。开放准入后仅重试已选定的私有缓存项和配额维护，不用旧目录回收新捕获。共享存储的目录引用与旧会话孤儿清理见 [存储契约](snapshot-storage.md)。
 
 ## 验证
 

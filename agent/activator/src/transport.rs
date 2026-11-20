@@ -1,6 +1,6 @@
 //! Standalone Activator adapter for the existing API Server management API.
 use crate::environment_request::{self, observation, paused, validate_identity};
-use adx_agent_core::network::SandboxNetworkPolicy;
+use adx_agent_core::network::PlatformEgress;
 use adx_agent_core::{
     environment::*,
     limits,
@@ -19,7 +19,7 @@ pub struct HttpEnvironment {
     base: Url,
     api_keys: BTreeMap<String, String>,
     timeout: Duration,
-    network: SandboxNetworkPolicy,
+    platform_egress: Option<PlatformEgress>,
 }
 impl HttpEnvironment {
     /// Keys must be tenant-scoped Platform API keys; API Server derives ownership from the key.
@@ -29,7 +29,7 @@ impl HttpEnvironment {
         timeout: Duration,
         ca_pem: Option<&[u8]>,
         allow_http: bool,
-        network: SandboxNetworkPolicy,
+        platform_egress: Option<PlatformEgress>,
     ) -> Result<Self, EnvironmentError> {
         let base = service_origin(base, allow_http).map_err(EnvironmentError::Invalid)?;
         if api_keys.is_empty() {
@@ -50,7 +50,7 @@ impl HttpEnvironment {
             }
         }
         environment_request::validate_timeout(timeout)?;
-        environment_request::network_input(&network)?;
+        environment_request::validate_platform_egress(platform_egress.as_ref())?;
         let mut builder = Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout.min(limits::CONNECT_TIMEOUT))
@@ -68,7 +68,7 @@ impl HttpEnvironment {
             base,
             api_keys,
             timeout,
-            network,
+            platform_egress,
         })
     }
 
@@ -432,7 +432,11 @@ impl Environment for HttpEnvironment {
         &self,
         request: &CreateEnvironment,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
-        let payload = environment_request::create_input(request, self.timeout, &self.network)?;
+        let payload = environment_request::create_input(
+            request,
+            self.timeout,
+            self.platform_egress.as_ref(),
+        )?;
         self.request(
             Method::POST,
             &request.tenant,

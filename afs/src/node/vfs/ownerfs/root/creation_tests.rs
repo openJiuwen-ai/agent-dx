@@ -16,7 +16,7 @@ struct State {
 struct Meta(Mutex<State>);
 
 impl RootMeta for Meta {
-    fn reserve_root(&self, _: &RootId, _: &str) -> Result<RootReservation> {
+    fn reserve_root(&self, _: &RootId, _: &str, _: bool) -> Result<RootReservation> {
         Err(invalid_grant("not used by Home preparation tests"))
     }
 
@@ -169,6 +169,38 @@ fn reserving_a_reserved_name_is_refused_before_meta_is_asked() {
 
     let error = manager.reserve_workspace(OsStr::new(".pub")).unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_VFS_INVALID);
+}
+
+/// P0′/P4/P6：非 UTF-8、`.ownerfs-` 前缀和超长名字都在问 Meta 之前拒绝。
+#[test]
+fn create_entries_reject_non_utf8_ownerfs_prefix_and_overlong_names() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+    let manager = RootManager::open(
+        "home".into(),
+        "home-session".into(),
+        Arc::new(Meta::default()),
+        disk,
+    )
+    .unwrap();
+
+    for name in [
+        OsStr::new(".ownerfs-roots"),
+        OsStr::from_bytes(b"bad\xffname"),
+    ] {
+        let error = manager.reserve_workspace(name).unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_VFS_INVALID, "{name:?}");
+    }
+
+    // trash 名 = 5 + 2*n + 2 + 20 字节：n=114 可建，n=115 必须拒绝。
+    assert!(validate_root_name(OsStr::new(&"a".repeat(114))).is_ok());
+    let error = manager
+        .reserve_workspace(OsStr::new(&"a".repeat(115)))
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_VFS_INVALID);
+    assert!(error.to_string().contains("trash"));
 }
 
 impl Fixture {
@@ -365,7 +397,7 @@ fn concurrent_notifications_prepare_and_activate_only_once() {
 }
 
 #[test]
-fn replacement_cleans_obsolete_empty_preparation_without_home_restart() {
+fn replacement_reuses_the_native_directory_without_home_restart() {
     for directory_already_removed in [false, true] {
         let mut fixture = Fixture::new(0o750);
         fixture.meta.0.lock().unwrap().fail_before_activate = true;
@@ -384,7 +416,8 @@ fn replacement_cleans_obsolete_empty_preparation_without_home_restart() {
         }
 
         fixture.prepare().unwrap();
-        assert!(!old_path.exists());
+        // 原生命名下新旧代次共用同一目录，重建只能复用而不能删除。
+        assert!(old_path.is_dir());
         let records = fixture.manager.catalog.scan_roots().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].epoch, fixture.reservation.epoch);
@@ -477,7 +510,7 @@ fn replacement_does_not_remove_a_noncanonical_catalog_directory() {
 }
 
 #[test]
-fn startup_cleans_replaced_pending_preparation() {
+fn startup_retains_the_replaced_pending_directory() {
     let fixture = Fixture::new(0o750);
     fixture.meta.0.lock().unwrap().fail_before_activate = true;
     assert!(fixture.prepare().is_err());
@@ -497,8 +530,9 @@ fn startup_cleans_replaced_pending_preparation() {
     )
     .expect("startup must reconcile a pending takeover with older local evidence");
     assert!(manager.cached_local_roots().unwrap().is_empty());
-    assert!(manager.catalog.scan_roots().unwrap().is_empty());
-    assert!(!old_path.exists());
+    assert_eq!(manager.catalog.scan_roots().unwrap(), Vec::new());
+    // 原生命名目录就是业务目录，启动清理只保留它，不 rmdir。
+    assert!(old_path.is_dir());
     assert!(fixture.meta.0.lock().unwrap().pending.is_none());
     assert_eq!(fixture.meta.0.lock().unwrap().aborts, 1);
 }

@@ -22,7 +22,13 @@ struct PeerRangeProgress {
     next: Vec<usize>,
     pending: Vec<usize>,
     last_error: Option<Error>,
+    /// Wait before re-asking a holder that answered with backpressure.
+    busy_backoff: Duration,
 }
+
+/// Backpressure retries mirror the replica sender (R71b): 5ms doubling to 200ms.
+const BUSY_BACKOFF_START: Duration = Duration::from_millis(5);
+const BUSY_BACKOFF_MAX: Duration = Duration::from_millis(200);
 
 impl DfsReadEngine {
     pub(super) async fn read_remote_ranges_async(
@@ -66,6 +72,7 @@ impl DfsReadEngine {
             next: vec![0; batch.ops.len()],
             pending: (0..batch.ops.len()).collect(),
             last_error: None,
+            busy_backoff: BUSY_BACKOFF_START,
         };
         while !progress.pending.is_empty() {
             let groups = Self::group_pending_ranges(&round, &mut progress)?;
@@ -201,6 +208,27 @@ impl DfsReadEngine {
                     return Err(error);
                 }
                 self.capture_native_read_authority()?;
+                // A full holder is backpressure, not a bad copy. When it is the
+                // last candidate for some operation in the group, wait and ask it
+                // again within the read deadline instead of ending the read with
+                // EAGAIN; with other candidates left, move on as before.
+                if crate::node::fault::classify::retryable_backpressure(&error) && choices <= 1 {
+                    if Instant::now() + progress.busy_backoff >= round.deadline {
+                        // No other copy and no time left: the read timed out.
+                        return Err(Error::coded(
+                            afs_error::CLIENT_DEADLINE_EXCEEDED,
+                            format!(
+                                "DFS peer stayed busy until the read deadline: {}",
+                                error.message()
+                            ),
+                        ));
+                    }
+                    tokio::time::sleep(progress.busy_backoff).await;
+                    progress.busy_backoff = (progress.busy_backoff * 2).min(BUSY_BACKOFF_MAX);
+                    progress.last_error = Some(error);
+                    progress.pending.extend_from_slice(group);
+                    return Ok(());
+                }
                 // A batch error does not say which copy failed; a lone one does.
                 if let [item] = attempt.operations.as_slice() {
                     self.note_suspect_copy(&error, item);

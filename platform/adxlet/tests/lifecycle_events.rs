@@ -15,6 +15,9 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
+#[path = "lifecycle_events/recovered_idle.rs"]
+mod recovered_idle;
+
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 struct Backend {
     live: watch::Sender<bool>,
@@ -27,6 +30,9 @@ struct Backend {
     activations: AtomicUsize,
     retirements: AtomicUsize,
     proxy: watch::Sender<u64>,
+    proxy_streams: AtomicU64,
+    reported_proxy_revision: AtomicU64,
+    idle_prepared_revision: AtomicU64,
 }
 impl Default for Backend {
     fn default() -> Self {
@@ -41,11 +47,22 @@ impl Default for Backend {
             activations: AtomicUsize::new(0),
             retirements: AtomicUsize::new(0),
             proxy: watch::channel(1).0,
+            proxy_streams: AtomicU64::new(0),
+            reported_proxy_revision: AtomicU64::new(0),
+            idle_prepared_revision: AtomicU64::new(0),
         }
     }
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
+    async fn checkpoint_supported(&self, _: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn checkpoint(&self, _: &str, path: &std::path::Path, _: Duration) -> Result<()> {
+        std::fs::write(path.join("state"), b"checkpoint").unwrap();
+        self.live.send_replace(false);
+        Ok(())
+    }
     async fn start(
         &self,
         _: &EnvironmentSpec,
@@ -129,6 +146,13 @@ impl Routes for Backend {
         self.retirements.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+    async fn activity(&self, _: &EnvironmentRecord) -> Result<(String, u64, u64)> {
+        Ok((
+            "proxy".into(),
+            *self.proxy.borrow(),
+            self.proxy_streams.load(Ordering::SeqCst),
+        ))
+    }
     async fn activity_changed(
         &self,
         _: &EnvironmentRecord,
@@ -136,8 +160,14 @@ impl Routes for Backend {
     ) -> Result<(String, u64, u64)> {
         let mut changes = self.proxy.subscribe();
         loop {
-            let current = ("proxy".to_string(), *changes.borrow_and_update(), 0);
+            let current = (
+                "proxy".to_string(),
+                *changes.borrow_and_update(),
+                self.proxy_streams.load(Ordering::SeqCst),
+            );
             if previous.as_ref() != Some(&current) {
+                self.reported_proxy_revision
+                    .store(current.1, Ordering::SeqCst);
                 return Ok(current);
             }
             changes.changed().await.unwrap();
@@ -158,6 +188,22 @@ impl StateSink for Backend {
         Ok(Durability::Published)
     }
 }
+#[async_trait]
+impl adxlet::checkpoint::CheckpointCooperation for Backend {
+    async fn prepare(&self, _: &EnvironmentRecord, _: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn prepare_idle(&self, _: &EnvironmentRecord, _: &str, revision: u64) -> Result<()> {
+        assert_eq!(self.proxy_streams.load(Ordering::SeqCst), 0);
+        self.idle_prepared_revision
+            .store(revision, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn abort_unstarted(&self, _: &EnvironmentRecord, _: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
 struct Fixture {
     node: Adxlet,
     backend: Arc<Backend>,

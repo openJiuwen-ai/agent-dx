@@ -132,8 +132,8 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
         }],
         snapshot_source: Some(adx_core::RestorePoint {
             recovery_profile: std::collections::BTreeMap::from([(
-                "ADX_RECOVERY_HOST".into(),
-                "captured-host".into(),
+                "ADX_RECOVERY_RUNTIME_runc".into(),
+                "captured-runtime".into(),
             )]),
             id: "saved".into(),
             artifact: adx_core::CheckpointArtifact {

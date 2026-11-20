@@ -1,3 +1,4 @@
+import os
 import shutil
 import stat
 import subprocess
@@ -35,11 +36,16 @@ class AfsExampleTests(unittest.TestCase):
         self.assertIn("/opt/adx/config/afs/node.toml", deployment)
 
     @unittest.skipUnless(shutil.which("openssl"), "openssl is required")
-    def test_local_tls_helper_creates_verified_private_material_and_refuses_overwrite(self):
+    def test_local_tls_helper_is_idempotent_and_keeps_the_trust_chain_consistent(self):
         script = PACKAGED / "prepare-local-tls.sh"
         with tempfile.TemporaryDirectory() as temporary:
+            scratch = Path(temporary) / "tmp"
             destination = Path(temporary) / "tls"
-            first = subprocess.run([str(script), str(destination)], text=True, capture_output=True)
+            scratch.mkdir()
+            env = dict(os.environ, TMPDIR=str(scratch))
+            first = subprocess.run(
+                [str(script), str(destination)], text=True, capture_output=True, env=env
+            )
             self.assertEqual(first.returncode, 0, first.stderr)
             for name in ("ca-key.pem", "meta-key.pem", "node-a-key.pem"):
                 mode = stat.S_IMODE((destination / name).stat().st_mode)
@@ -57,10 +63,38 @@ class AfsExampleTests(unittest.TestCase):
                     capture_output=True,
                 )
                 self.assertEqual(verified.returncode, 0, verified.stderr)
+            # Normal runs must not leave private-key scratch copies behind.
+            self.assertEqual(list(scratch.glob("adx-afs-tls.*")), [])
 
-            second = subprocess.run([str(script), str(destination)], text=True, capture_output=True)
-            self.assertNotEqual(second.returncode, 0)
-            self.assertIn("refusing to replace", second.stderr)
+            # Reruns are idempotent and keep the existing material...
+            second = subprocess.run(
+                [str(script), str(destination)], text=True, capture_output=True, env=env
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(list(scratch.glob("adx-afs-tls.*")), [])
+
+            # ...but a lost CA key must fail instead of silently swapping the CA
+            # while keeping identities that no longer chain to it.
+            ca_pem = (destination / "ca.pem").read_bytes()
+            (destination / "ca-key.pem").unlink()
+            broken = subprocess.run(
+                [str(script), str(destination)], text=True, capture_output=True, env=env
+            )
+            self.assertNotEqual(broken.returncode, 0)
+            self.assertIn("half-written", broken.stderr)
+            self.assertEqual(
+                (destination / "ca.pem").read_bytes(), ca_pem, "the CA must not be swapped"
+            )
+            self.assertEqual(list(scratch.glob("adx-afs-tls.*")), [])
+
+            # Removing the whole CA invalidates kept identities: the helper must
+            # fail instead of reporting unusable material as ready.
+            (destination / "ca.pem").unlink()
+            regenerated = subprocess.run(
+                [str(script), str(destination)], text=True, capture_output=True, env=env
+            )
+            self.assertNotEqual(regenerated.returncode, 0)
+            self.assertIn("no longer chains", regenerated.stderr)
 
 
 if __name__ == "__main__":

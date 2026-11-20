@@ -8,6 +8,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+from posixpath import join as remote_join
 import re
 import subprocess
 import shutil
@@ -18,9 +19,10 @@ from fixtures import singlevm, ssh, namespaces, kubernetes, docker
 from fixtures.common import (
     Blocked, DfsProfile, HERE, is_single_host, needs_reader_c, performance_parameters, sha256, write_json,
 )
+from tools import benchlib
 
-ROLES = ("M", "A", "B", "C")
-NAMES = {"M": "meta", "A": "node-a", "B": "node-b", "C": "node-c"}
+ROLES = ("M", "A", "B", "C", "D", "E")
+NAMES = {"M": "meta", "A": "node-a", "B": "node-b", "C": "node-c", "D": "node-d", "E": "node-e"}
 # R16: run the suites with Meta on a shared-service log. The variable holds
 # the Meta store TOML lines; "{unique}" becomes a fresh token per generated
 # Meta config, so each case starts on an empty key prefix.
@@ -34,9 +36,46 @@ def meta_store_config():
     return template.replace("\\n", "\n").replace("{unique}", uuid.uuid4().hex).rstrip("\n") + "\n"
 
 
+def verify_hybrid(infos):
+    """Roles span at least two kernels; roles sharing a kernel keep distinct namespaces.
+
+    Each kernel (boot) must report one machine identity, and different kernels must be
+    distinguishable by machine-id or product UUID, as for multivm guests.
+    """
+    kernels = {}
+    for info in infos.values():
+        kernels.setdefault(info["boot_id"], []).append(info)
+    if len(kernels) < 2:
+        raise Blocked("hybrid topology needs roles on at least two Linux kernels; use namespaces for one")
+    machines = []
+    for members in kernels.values():
+        identity = {(v["machine_id"], v["product_uuid"]) for v in members}
+        if len(identity) != 1:
+            raise Blocked("one kernel reported different machine identities")
+        machines.append(identity.pop())
+        for field in ("network_namespace", "pid_namespace", "mount_namespace"):
+            if len({v[field] for v in members}) != len(members):
+                raise Blocked("role namespace isolation is missing on a shared kernel: " + field)
+    ids = [m for m, _ in machines]
+    uuids = [u for _, u in machines]
+    if not ((all(ids) and len(set(ids)) == len(ids)) or (all(uuids) and len(set(uuids)) == len(uuids))):
+        raise Blocked("independent kernels are ambiguous; duplicate clone machine-id needs distinct VM UUIDs")
+
+
+def is_bench(case):
+    return any(t.startswith("bench-") for t in case.tags)
+
+
+def bench_fanout_readers(case, config):
+    """Reader roles of a bench fan-out case (bench.readers, default B and C); None for other cases."""
+    if is_bench(case) and case.id.endswith(".many_readers"):
+        return benchlib.parameters(config).reader_roles
+    return None
+
+
 def validate(config, cases):
-    if config.get("kind") not in ("singlevm", "multivm", "namespaces", "kubernetes", "docker"):
-        raise ValueError("kind must be singlevm, namespaces, multivm, kubernetes or docker")
+    if config.get("kind") not in ("singlevm", "multivm", "namespaces", "hybrid", "kubernetes", "docker"):
+        raise ValueError("kind must be singlevm, namespaces, multivm, hybrid, kubernetes or docker")
     for field in ("uid", "gid", "other_uid", "other_gid"):
         if not isinstance(config.get(field), int) or config[field] <= 0:
             raise ValueError("explicit positive numeric identity required: " + field)
@@ -45,8 +84,12 @@ def validate(config, cases):
     roles = config.get("roles", {})
     hosts = config.get("hosts", {})
     needed = set("MAB")
-    if any(needs_reader_c(c, config["kind"], config.get("topology")) for c in cases):
-        needed.add("C")
+    for case in cases:
+        readers = bench_fanout_readers(case, config)
+        if readers is not None:
+            needed.update(readers)
+        elif needs_reader_c(case, config["kind"], config.get("topology")):
+            needed.add("C")
     for case in cases:
         if not isinstance(case.observe_cache, bool) or (case.observe_cache and case.mode != "dfs"):
             raise ValueError("cache-open observation is a boolean DFS-only test option")
@@ -55,7 +98,10 @@ def validate(config, cases):
         if case.purpose not in ("functional", "performance"):
             raise ValueError("unknown case purpose")
         if case.purpose == "performance":
-            performance_parameters(config)
+            if is_bench(case):
+                benchlib.parameters(config)
+            else:
+                performance_parameters(config)
         if case.profile is not None and case.profile.node_count == 3:
             needed.add("C")
     if not needed <= set(roles):
@@ -89,6 +135,13 @@ def validate(config, cases):
             or any(c in str(base) for c in ("\n", "\r", '"', "\\"))
         ):
             raise ValueError("host base must be a dedicated existing absolute directory")
+        if "artifact_dir" in host:
+            staged = host["artifact_dir"]
+            if not isinstance(staged, str):
+                raise ValueError("artifact_dir must be an absolute directory on that host")
+            staged_path = Path(staged)
+            if not staged_path.is_absolute() or ".." in staged_path.parts or any(c in staged for c in ("\n", "\r")):
+                raise ValueError("artifact_dir must be an absolute directory on that host")
     if config["kind"] in ("kubernetes", "docker") and config.get("topology", "cluster") not in ("local", "cluster"):
         raise ValueError("container topology must be local or cluster")
     selected_hosts = [roles[r]["host"] for r in needed]
@@ -98,7 +151,7 @@ def validate(config, cases):
             raise Blocked("single-Pod local cases require one Pod and loopback role addresses")
         if any(any(t.startswith("cluster-") for t in c.tags) for c in cases):
             raise Blocked("single-Pod topology cannot establish cross-Pod evidence")
-    elif config["kind"] in ("multivm", "namespaces", "kubernetes", "docker"):
+    elif config["kind"] in ("multivm", "namespaces", "hybrid", "kubernetes", "docker"):
         if len(set(selected_hosts)) != len(needed):
             raise Blocked("multivm requires a distinct guest for every selected role")
         if any(any(t.startswith("local-") for t in c.tags) for c in cases):
@@ -124,7 +177,10 @@ class Cluster:
         self.evidence = []
         self.started = False
         self.roles = ["M", "A", "B"]
-        if (needs_reader_c(case, config["kind"], config.get("topology"))
+        readers = bench_fanout_readers(case, config)
+        if readers is not None:
+            self.roles = ["M", "A", *readers]
+        elif (needs_reader_c(case, config["kind"], config.get("topology"))
                 or (case.profile is not None and case.profile.node_count == 3)):
             self.roles.append("C")
         if self.mode == "ownerfs":
@@ -134,6 +190,7 @@ class Cluster:
         self.bind = False
         self.helpers = {}
         self.effective = {}
+        self.memory_mounts = {}
         # One Meta store per cluster: regenerated configs and Meta restarts
         # within a case keep the same log (and key prefix).
         self.meta_store_toml = meta_store_config()
@@ -285,6 +342,8 @@ class Cluster:
                 raise Blocked(
                     "independent guest identities are ambiguous; duplicate clone machine-id needs distinct VM UUIDs"
                 )
+        if self.config["kind"] == "hybrid":
+            verify_hybrid(infos)
         if self.config["kind"] in ("namespaces", "docker"):
             if len({v["boot_id"] for v in infos.values()}) != 1:
                 raise Blocked("namespaces topology must remain inside one actual Linux kernel/VM")
@@ -351,6 +410,21 @@ class Cluster:
         write_json(self.output / "identity.json", identity)
         return identity
 
+    def place_binary(self, channel, host, name, destination):
+        """Put one frozen binary at `destination` and return the SHA-256 of what landed there.
+
+        With `artifact_dir` the host already holds the binaries (slow or distant controllers);
+        the worker copies them locally. Otherwise they are streamed from `binary_dir`.
+        """
+        staged = host.get("artifact_dir")
+        if staged is None:
+            return channel.upload(self.binary_dir / name, destination, 0o755)
+        copied = channel.call("command", argv=["install", "-D", "-m", "0755", remote_join(staged, name),
+                                                destination], uid=None, gid=None, env={}, timeout=120, stdin=None)
+        if copied["returncode"] != 0:
+            raise Blocked("staged artifact could not be placed: " + name + ": " + copied["stderr"][-300:])
+        return channel.call("hash", path=destination)["sha256"]
+
     def prepare(self):
         infos = self.connect()
         identity = self.inputs(infos)
@@ -368,7 +442,7 @@ class Cluster:
             self.roots[host] = root
             ch.call("initialize", root=root, token=self.token)
             for name in binaries:
-                actual = ch.upload(self.binary_dir / name, root + "/bin/" + name, 0o755)
+                actual = self.place_binary(ch, self.config["hosts"][host], name, remote_join(root, "bin", name))
                 if actual != identity["binaries"][name]:
                     raise Blocked("artifact changed during transfer: " + name)
         write_json(
@@ -510,6 +584,9 @@ class Cluster:
                 )
                 if self.case.profile is not None:
                     config += self.case.profile.node_config()
+                if is_bench(self.case):
+                    config += benchlib.node_overrides_toml(
+                        benchlib.parameters(self.config).overrides_for(role), remote_join(data, "peer-cache"))
                 if role == "A" and self.mode == "ownerfs" and self.bind:
                     config += (
                         "\nexperimental_ownerfs_workspace_bind = true\nownerfs_workspace_egress_root = "
@@ -528,10 +605,52 @@ class Cluster:
                 self.mount(role) if role != "M" else data + "/mount",
                 owner=False,
             )
+            if role != "M" and is_bench(self.case):
+                self.prepare_bench_node(role, data)
             effective = self.command(
                 role, [root + "/bin/afs-" + ("meta" if role == "M" else "node"), "--config", path, "--print-config"]
             )
             self.effective[role] = self.record("config.effective." + role, json.loads(effective["stdout"]))
+            if role != "M" and is_bench(self.case):
+                declared = benchlib.parameters(self.config).overrides_for(role)
+                mismatches = benchlib.effective_mismatches(self.effective[role], declared)
+                self.record("bench.node_overrides." + role, {"declared": declared, "mismatches": mismatches})
+                if mismatches:
+                    raise AssertionError("bench node overrides not in effect on %s: %r" % (role, mismatches))
+
+    def prepare_bench_node(self, role, data):
+        """Peer-cache directory for declared overrides; memory backend tmpfs on the Node's state dir.
+
+        The tmpfs lives in the worker's private mount namespace and is charged to the role's cgroup;
+        it is unmounted after the Nodes stop (unmount_memory_backends) and before worker cleanup.
+        """
+        params = benchlib.parameters(self.config)
+        if any(k.startswith("dfs_peer_cache.") for k in params.overrides_for(role)):
+            self.python(role, "os.makedirs(sys.argv[1],0o700,exist_ok=True)", remote_join(data, "peer-cache"),
+                        owner=False)
+        if params.backend != "memory" or role in self.memory_mounts:
+            return
+        state = remote_join(data, "state")
+        self.command(role, ["mount", "-t", "tmpfs", "-o", "size=%d,mode=0700" % params.memory_backend_bytes,
+                            "afs-bench-memory", state])
+        self.memory_mounts[role] = state
+        fstype = self.command(role, ["findmnt", "-n", "-o", "FSTYPE", "--mountpoint", state])["stdout"].strip()
+        if fstype != "tmpfs":
+            raise AssertionError("memory backend is not tmpfs on %s: %r" % (role, fstype))
+        self.record("bench.memory_backend." + role, {"path": state, "fstype": fstype,
+                                                     "size_bytes": params.memory_backend_bytes})
+
+    def unmount_memory_backends(self, errors):
+        for role, state in list(self.memory_mounts.items()):
+            try:
+                value = self.channel(role).call("command", argv=["umount", state], uid=None, gid=None, env={},
+                                                timeout=30, stdin=None)
+                if value["returncode"] != 0:
+                    errors.append("%s: memory backend unmount failed: %s" % (role, value["stderr"][-300:]))
+                    continue
+                del self.memory_mounts[role]
+            except Exception as exc:
+                errors.append("%s: memory backend unmount unconfirmed: %s" % (role, exc))
 
     def health(self, role, path="/health"):
         code = ("import urllib.request\no=urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
@@ -691,6 +810,8 @@ class Cluster:
             except Exception as exc:
                 nodes_confirmed_gone = False
                 errors.append("cannot confirm Node exit: " + str(exc))
+        if nodes_confirmed_gone:
+            self.unmount_memory_backends(errors)
         for host, ch in self.channels.items():
             try:
                 result = ch.call("cleanup", timeout=80, allow_meta=nodes_confirmed_gone)

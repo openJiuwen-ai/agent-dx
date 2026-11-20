@@ -1,6 +1,7 @@
 //! Acquiring a DFS write lease retries when the lease entity changes between
-//! its read and its commit (GC deleting the expired lease, another Node
-//! taking it), instead of failing the open with `META_DFS_CONFLICT`.
+//! its read and its commit (another Node taking it), instead of failing the
+//! open with `META_DFS_CONFLICT`. GC keeps expired lease epochs while their
+//! inodes exist.
 
 use std::sync::{
     Arc, Mutex,
@@ -224,32 +225,37 @@ async fn node_b_opens_for_write(
     .await
 }
 
-/// The race of `dfs.fault.lapsed_lease_reader_under_gc`: a real GC pass
-/// deletes the expired lease between node-b's read of it and its acquire
-/// commit. The acquire is planned again and succeeds.
+/// A real GC pass between node-b's read and acquire commit retains the
+/// expired lease of the linked inode. Taking over advances the retained
+/// epoch rather than starting again at one.
 #[tokio::test]
-async fn an_acquire_racing_gc_of_the_expired_lease_is_retried() {
+async fn an_acquire_racing_gc_preserves_the_expired_lease_epoch() {
     let (store, dfs, inode) = fixture().await;
+    let expired = stored_lease(&store.inner, &inode.inode_id).await.unwrap();
+    let previous_epoch = expired.lease_epoch;
     let gc = (dfs.clone(), store.inner.clone(), inode.inode_id.clone());
     *store.hook.lock().unwrap() = Some(Arc::new(move || {
         let (dfs, inner, inode_id) = gc.clone();
+        let expired = expired.clone();
         Box::pin(async move {
-            assert!(stored_lease(&inner, &inode_id).await.is_some());
+            assert_eq!(stored_lease(&inner, &inode_id).await, Some(expired.clone()));
             dfs.collect_garbage("node-b".into(), "session-b".into(), 0, vec![])
                 .await
                 .unwrap();
-            assert!(
-                stored_lease(&inner, &inode_id).await.is_none(),
-                "a GC pass deletes an expired write lease"
+            assert_eq!(
+                stored_lease(&inner, &inode_id).await,
+                Some(expired),
+                "GC retains the last lease epoch while the inode exists"
             );
         })
     }));
     store.remaining.store(1, Ordering::SeqCst);
     let (_, lease) = node_b_opens_for_write(&dfs, &inode, "open-gc")
         .await
-        .expect("the acquire is retried after GC removed the expired lease");
+        .expect("the acquire succeeds after GC retained the expired lease");
     assert_eq!(lease.owner_node_id, "node-b");
     assert_eq!(lease.owner_session_id, "session-b");
+    assert_eq!(lease.lease_epoch, previous_epoch + 1);
     assert_eq!(store.remaining.load(Ordering::SeqCst), 0, "the race ran");
     assert_eq!(
         stored_lease(&store.inner, &inode.inode_id).await,

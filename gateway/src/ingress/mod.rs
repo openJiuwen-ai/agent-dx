@@ -4,6 +4,7 @@ pub mod connector;
 pub mod coordinator_routes;
 pub mod e2b_route;
 mod e2b_signing;
+mod http10_websocket;
 pub mod http_pool;
 mod listener;
 pub mod path;

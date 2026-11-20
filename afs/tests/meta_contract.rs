@@ -153,9 +153,7 @@ async fn dfs_lock_resolver_live_local_authority_does_not_commit_or_extend_expiry
 }
 
 #[tokio::test]
-async fn dfs_lazy_authority_replaces_superseded_local_session_before_lease_expiry() {
-    use afs::dfs::{CallerContext, SetXattrRequest, XattrSetMode};
-
+async fn dfs_ordinary_authority_keeps_superseded_local_session_before_lease_expiry() {
     let (store, dfs, original, _) = lock_resolver_fixture(30).await;
     let meta = rpc::MetaRpc(Arc::new(Meta::with_store(
         "meta-test".into(),
@@ -192,23 +190,54 @@ async fn dfs_lazy_authority_replaces_superseded_local_session_before_lease_expir
         .await
         .unwrap();
     assert_eq!(normal_peer, original);
+}
 
-    dfs.set_xattr(SetXattrRequest {
+#[tokio::test]
+async fn dfs_lazy_authority_replaces_superseded_local_session_before_lease_expiry() {
+    use afs::dfs::{
+        BindLazySourceRequest, InodeAttrUpdate, LazyFileSpec, LazyFillBinding, SetInodeAttrRequest,
+    };
+
+    let (store, dfs, original, _) = lock_resolver_fixture(30).await;
+    let meta = rpc::MetaRpc(Arc::new(Meta::with_store(
+        "meta-test".into(),
+        Observability::new().unwrap(),
+        store,
+    )));
+    register_dfs_storage_node(&meta, "node-a", "session-a", "original-session", "zone-a").await;
+    let inode = dfs
+        .set_inode_attributes(SetInodeAttrRequest {
+            caller_id: "node-a".into(),
+            operation_id: OperationId::new("prepare-lazy-mode"),
+            caller: domain_caller(1000, 1000),
+            inode_id: original.inode_id.clone(),
+            expected_inode_revision: None,
+            update: InodeAttrUpdate {
+                mode: Some(0o440),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    dfs.bind_lazy_source(BindLazySourceRequest {
         caller_id: "node-a".into(),
+        caller_session_id: "session-a".into(),
         operation_id: OperationId::new("bind-lazy-source"),
-        caller: CallerContext {
-            uid: 0,
-            gid: 0,
-            supplementary_gids: Vec::new(),
-        },
         inode_id: inode.inode_id.clone(),
         expected_inode_revision: inode.revision,
-        name: b"user.afs.lazy.v1".to_vec(),
-        value: br#"{"length":4096,"binding":{"kind":"fixture","payload":[1]}}"#.to_vec(),
-        mode: XattrSetMode::Create,
+        source: LazyFileSpec {
+            length: 0,
+            binding: LazyFillBinding {
+                kind: "fixture".into(),
+                payload: vec![1],
+            },
+        },
     })
     .await
     .unwrap();
+    register_dfs_storage_node(&meta, "node-a", "session-a-2", "new-session", "zone-a").await;
+    register_dfs_storage_node(&meta, "node-b", "session-b", "reader-session", "zone-a").await;
 
     let (_, unregistered) = dfs
         .resolve_write_authority(
@@ -1291,6 +1320,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
             parent_root_id: String::new(),
             create_intent_id: "mkdir-a".into(),
             conflict_policy: 0,
+            pin_home: false,
         }))
         .await
         .unwrap()

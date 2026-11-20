@@ -2,7 +2,6 @@
 
 pub mod checkpoint;
 pub mod lifecycle;
-pub mod local_rootfs;
 pub mod managed_images;
 pub mod runtime_profile;
 pub mod snapshot_preparation;
@@ -178,6 +177,14 @@ pub struct EnvironmentSpec {
 }
 
 impl EnvironmentSpec {
+    /// Compare assignment configuration, excluding the mutable network policy.
+    /// Ownership and revision checks remain the caller's responsibility.
+    pub fn matches_immutable_fields(&self, other: &Self) -> bool {
+        let mut expected = self.clone();
+        expected.execution.network = other.execution.network.clone();
+        expected == *other
+    }
+
     /// Required guest services configured for this execution. Service-specific
     /// readiness and version checks belong to the runtime service owner.
     pub fn required_services(&self) -> impl Iterator<Item = &'static str> + '_ {
@@ -248,6 +255,10 @@ impl ResourceLedger {
     }
     pub fn used(&self) -> Resources {
         self.used
+    }
+    /// Whether this concrete execution already contributes to resource usage.
+    pub fn contains(&self, id: &str) -> bool {
+        self.reservations.contains_key(id)
     }
     pub fn available(&self) -> Resources {
         self.capacity.saturating_sub(self.used)

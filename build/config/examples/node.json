@@ -41,6 +41,8 @@
   },
   "degradation_journal": "/opt/adx/data/degraded/results.sqlite",
   "pressure": {
+    "memory_enabled": true,
+    "disk_enabled": true,
     "disk_path": "/opt/adx/data",
     "thresholds": {
       "memory_high_percent": 90,

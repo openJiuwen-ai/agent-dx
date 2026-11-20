@@ -87,28 +87,46 @@ an explicitly disabled workload. If no managed entrypoint exists, that query
 returns an error; it never starts a new process.
 
 
-## Deployment-registered Local rootfs templates
+## Caller-prepared Local rootfs
 
-Deployments may configure the same `local_rootfs_templates` map in the API Server
-and adxlet. A template contains an absolute `path`, optional `env`, and optional
-`process` (`commands`, `cwd`, `user`). Template names use 1..128 ASCII letters,
-digits, underscores or hyphens. ADX does not import Docker images or fetch an image
-for this source; the deployment prepares each artifact and its metadata.
+Public creation accepts an absolute path on the execution node when it is a
+strict descendant of a directory in the API Server's
+`allowed_local_rootfs_dirs` list. The check compares path components. An empty
+or omitted list disables caller-provided Local rootfs. Requests outside the
+allowed directories return `PERMISSION_DENIED` before scheduling.
 
-```json
-{"name":"offline-tools","rootfs":{"type":"template","name":"local-tools-v1","runtime":"runsc"}}
+With `adxctl` profile-based deployment, add the list to the API Server config:
+
+```yaml
+service_overrides:
+  apiserver:
+    config:
+      allowed_local_rootfs_dirs:
+        - /var/lib/agentos/local-images/objects
 ```
 
-The API resolves the registered name to a Local source persisted with the Environment.
-Arbitrary public Local paths remain rejected. Unknown names and conflicting image,
-path, storage or snapshot sources fail before scheduling. Only nodes advertising
-`ADX_LOCAL_ROOTFS_<name>=ready` are eligible; adxlet validates the registered paths
-before advertising them. Artifacts must remain available for the lifetime of their
-Environments and checkpoints. Use immutable names and paths for new content.
+Then create the environment with a path beneath that directory:
 
-Template environment values default the request environment; explicit request values
-win, while node-owned control configuration remains authoritative. With
-`inheritEntrypoint=true`, the template process is merged with explicit process fields
-and submitted as an explicit workload; no OCI process metadata lookup is performed.
-Without inheritance, no image workload starts. Local rootfs writable-layer handling
-and the existing Execd bootstrap are unchanged.
+```json
+{"name":"local-tools","rootfs":{"type":"local","path":"/var/lib/agentos/local-images/objects/local-IMAGE_ID/rootfs","runtime":"runsc"},"env":{"IMAGE_VALUE":"prepared"}}
+```
+
+The caller prepares and retains this directory or file on every eligible node,
+or selects a node that provides it. ADX does not import Docker images for this source.
+The API Server checks the requested path. Link resolution happens on the
+execution node. Use operator-controlled directories and ensure that symbolic
+links beneath them resolve within the approved directory tree on every eligible node.
+Conch and Supervisor require image bindings. A request that selects either runtime
+with an explicit Local rootfs returns `INVALID_ARGUMENT` before scheduling. This
+also applies when the runtime comes from the deployment default.
+
+With runsc, an explicit Local rootfs uses a per-sandbox writable overlay by
+default. The host source remains read-only and the overlay uses the configured
+sandboxd filestore. Set `rootfs.readonly: true` for a read-only sandbox root.
+Other supported runtimes require a read-only Local rootfs.
+Writable layer quotas (`storageMb` and `storage_limit_mb`) and runsc GPU allocation
+are unavailable with an explicit Local source. Writable workspaces use separate mounts.
+
+Local workload entrypoints are supplied through the existing `process` field;
+`inheritEntrypoint=true` is rejected for an explicit Local source. Image metadata
+must be resolved by the caller into `env` and, when needed, `process`.

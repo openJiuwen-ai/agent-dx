@@ -131,17 +131,24 @@ impl SecurityManager {
         Ok(server.tls_config(tls)?)
     }
     /// URI used only inside Tonic; advertised endpoints and verified server name stay unchanged.
+    /// Normalises a configured URI so its scheme agrees with the TLS policy.
+    ///
+    /// tonic only performs the handshake when the URI scheme is `https`; a
+    /// `http://` URI stays plaintext even with `tls_config` set (see
+    /// `transport::channel::service::Connector`). Peers are dialled at the
+    /// address Meta reports, and that address defaults to `http://<grpc_listen>`,
+    /// so the scheme is corrected here instead of at every call site — that is
+    /// what makes "there is no plaintext fallback" true rather than aspirational.
     pub fn endpoint_uri(&self, uri: &str) -> String {
-        if matches!(
-            self.config,
+        match &self.config {
             TlsConfig::MutualTls {
                 encryption_enabled: false,
                 ..
-            }
-        ) {
-            uri.replacen("https://", "http://", 1)
-        } else {
-            uri.to_owned()
+            } => uri.replacen("https://", "http://", 1),
+            // No TLS configured: the caller's scheme is the whole story.
+            TlsConfig::Disabled => uri.to_owned(),
+            // Encrypted: an http:// URI would send plaintext to a TLS-only port.
+            TlsConfig::MutualTls { .. } => uri.replacen("http://", "https://", 1),
         }
     }
     fn authenticated(
@@ -268,5 +275,54 @@ mod tests {
         .expect_err("empty server name must be rejected before connecting");
         // `matches!` 只检查错误枚举分支，不绑定其中的字符串内容。
         assert!(matches!(error, GrpcError::InvalidTlsConfiguration(_)));
+    }
+
+    #[test]
+    fn http_uri_is_upgraded_when_encryption_is_on() {
+        // Meta 上报的节点地址默认是 `http://<grpc_listen>`；若原样交给 tonic，
+        // 握手不会发生，明文 h2c 打到 TLS 端口，对端只会看到
+        // "received corrupt message of type InvalidContentType"。
+        let security = SecurityManager::new(TlsConfig::MutualTls {
+            encryption_enabled: true,
+            ca_certificate: "ca.pem".into(),
+            identity_certificate: "node.pem".into(),
+            identity_private_key: "node.key".into(),
+            server_name: "afs-cluster".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            security.endpoint_uri("http://192.168.2.101:18310"),
+            "https://192.168.2.101:18310"
+        );
+        // 已经是 https 的不重复改写。
+        assert_eq!(
+            security.endpoint_uri("https://192.168.2.101:18310"),
+            "https://192.168.2.101:18310"
+        );
+    }
+
+    #[test]
+    fn authentication_only_mode_keeps_the_socket_plaintext() {
+        let security = SecurityManager::new(TlsConfig::MutualTls {
+            encryption_enabled: false,
+            ca_certificate: "ca.pem".into(),
+            identity_certificate: "node.pem".into(),
+            identity_private_key: "node.key".into(),
+            server_name: "afs-cluster".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            security.endpoint_uri("https://192.168.2.101:18310"),
+            "http://192.168.2.101:18310"
+        );
+    }
+
+    #[test]
+    fn disabled_tls_leaves_the_uri_untouched() {
+        let security = SecurityManager::new(TlsConfig::Disabled).unwrap();
+        assert_eq!(
+            security.endpoint_uri("http://127.0.0.1:9000"),
+            "http://127.0.0.1:9000"
+        );
     }
 }

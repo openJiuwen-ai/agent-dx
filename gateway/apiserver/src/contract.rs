@@ -216,7 +216,6 @@ struct Rootfs {
     runtime: String,
     r#type: String,
     imageurl: String,
-    name: String,
     readonly: Option<bool>,
     path: String,
     storage_info: Option<S3>,
@@ -352,6 +351,12 @@ fn s3(value: S3) -> Result<adx_core::execution::S3Source, Status> {
     Ok(source)
 }
 
+pub(crate) fn canonical_local_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.chars().any(char::is_control)
+        && !path.split('/').any(|part| matches!(part, "." | ".."))
+}
+
 fn validate_rootfs_object(
     fields: &serde_json::Map<String, Value>,
     top_level_image: &str,
@@ -390,13 +395,6 @@ fn validate_rootfs_object(
             .is_some_and(|value| !value.trim().is_empty())
     };
     match kind {
-        "template" => {
-            if has_source || !non_empty_string("name") {
-                return Err(invalid(
-                    "named rootfs requires a template name and no source fields",
-                ));
-            }
-        }
         "image" => {
             if fields.contains_key("path") || fields.contains_key("storageInfo") {
                 return Err(invalid("image rootfs cannot contain path or storageInfo"));
@@ -421,6 +419,11 @@ fn validate_rootfs_object(
             }
             if !non_empty_string("path") {
                 return Err(invalid("local rootfs requires non-empty path"));
+            }
+            if !fields["path"].as_str().is_some_and(canonical_local_path) {
+                return Err(invalid(
+                    "local rootfs path must be absolute without traversal or control characters",
+                ));
             }
         }
         _ => return Err(invalid("unsupported rootfs type")),
@@ -462,7 +465,7 @@ fn storage_source(root: &Rootfs) -> Result<Option<adx_core::execution::StorageSo
             .storage_info
             .clone()
             .ok_or_else(|| invalid("S3 rootfs storageInfo is required"))?)?))),
-        "local" => Err(invalid("public local rootfs is not allowed")),
+        "local" => Ok(Some(StorageSource::Local(root.path.clone()))),
         _ => Err(invalid("unsupported rootfs type")),
     }
 }
@@ -485,13 +488,7 @@ fn mount(value: Value) -> Result<adx_core::execution::Mount, Status> {
         (None, false, None, true) => StorageSource::Image(value.image_url).into(),
         (None, true, Some(source), true) => StorageSource::S3(s3(source)?).into(),
         (None, true, None, false) => {
-            if !value.host_path.starts_with('/')
-                || value.host_path.chars().any(char::is_control)
-                || value
-                    .host_path
-                    .split('/')
-                    .any(|part| matches!(part, "." | ".."))
-            {
+            if !canonical_local_path(&value.host_path) {
                 return Err(invalid(
                     "host_path must be an absolute path without traversal",
                 ));
@@ -654,15 +651,6 @@ pub fn create_spec_with_environment(
     caller: &pb::CallerContext,
     runtime_profile: Option<&adx_core::runtime_profile::RuntimeProfile>,
 ) -> Result<pb::EnvironmentSpec, Status> {
-    create_spec_with_templates(body, caller, runtime_profile, &Default::default())
-}
-
-pub fn create_spec_with_templates(
-    body: Value,
-    caller: &pb::CallerContext,
-    runtime_profile: Option<&adx_core::runtime_profile::RuntimeProfile>,
-    templates: &std::collections::BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
-) -> Result<pb::EnvironmentSpec, Status> {
     if let Some(e) = runtime_profile {
         e.validate().map_err(|e| invalid(&e.to_string()))?;
     }
@@ -673,48 +661,6 @@ pub fn create_spec_with_templates(
     }
     let rootfs_value = std::mem::take(&mut r.rootfs);
     let mut root = rootfs(rootfs_value, &r.image)?;
-    let template = if root.r#type == "template" {
-        if !r.snapshot_id.trim().is_empty() {
-            return Err(invalid(
-                "rootfs template cannot be combined with snapshotId",
-            ));
-        }
-        let template = templates
-            .get(&root.name)
-            .ok_or_else(|| invalid("local rootfs template is not registered"))?;
-        template
-            .validate()
-            .map_err(|error| invalid(&error.to_string()))?;
-        let mut env: HashMap<_, _> = template.env.clone().into_iter().collect();
-        env.extend(std::mem::take(&mut r.env));
-        r.env = env;
-        if r.inherit {
-            let mut process = template.process.clone().unwrap_or_default();
-            if let Some(overrides) = r.process.take() {
-                if overrides.commands.is_some() {
-                    process.commands = overrides.commands;
-                }
-                if overrides.cwd.is_some() {
-                    process.cwd = overrides.cwd;
-                }
-                if overrides.user.is_some() {
-                    process.user = overrides.user;
-                }
-            }
-            if process
-                .commands
-                .as_ref()
-                .is_none_or(|commands| commands.is_empty())
-            {
-                return Err(invalid("local rootfs template has no workload commands"));
-            }
-            r.process = Some(process);
-            r.inherit = false;
-        }
-        Some(template)
-    } else {
-        None
-    };
     if !r.runtime.is_empty() && !root.runtime.is_empty() && r.runtime != root.runtime {
         return Err(invalid("conflicting runtime selections"));
     }
@@ -735,11 +681,16 @@ pub fn create_spec_with_templates(
             "inheritEntrypoint=true cannot be combined with snapshotId",
         ));
     }
+    if root.r#type == "local" && r.inherit {
+        return Err(invalid(
+            "local rootfs has no inherited entrypoint; provide process.commands to start a workload",
+        ));
+    }
     if snapshot.is_none()
         && runtime_profile.is_none()
         && root.imageurl.trim().is_empty()
         && root.r#type != "s3"
-        && template.is_none()
+        && root.r#type != "local"
     {
         return Err(invalid("image required"));
     }
@@ -747,6 +698,13 @@ pub fn create_spec_with_templates(
         root.runtime = runtime_profile
             .map(|e| e.rootfs.runtime_class.clone())
             .unwrap_or_else(|| "runsc".into());
+    }
+    let explicit_local_rootfs = root.r#type == "local";
+    if explicit_local_rootfs && matches!(root.runtime.as_str(), "conch" | "supervisor") {
+        return Err(invalid(&format!(
+            "runtime {} requires an image binding (got rootfs.type=local)",
+            root.runtime
+        )));
     }
     resolve_create_timeout(r.create_timeout, r.schedule_timeout, r.init_timeout)?;
     if r.create_timeout < 0 || r.schedule_timeout < 0 || r.init_timeout < 0 || r.idle < 0 {
@@ -835,18 +793,25 @@ pub fn create_spec_with_templates(
     {
         return Err(invalid("resource limits cannot be below requests"));
     }
-    let readonly = root
-        .readonly
-        .or_else(|| runtime_profile.map(|value| value.rootfs.readonly))
-        .unwrap_or(false);
-    let rootfs = if let Some(template) = template {
-        Some(adx_core::execution::Rootfs {
-            readonly,
-            source: adx_core::execution::StorageSource::Local(template.path.clone()),
-        })
+    let readonly = if explicit_local_rootfs {
+        let runsc = root.runtime == "runsc";
+        let readonly = root.readonly.unwrap_or(!runsc);
+        if !readonly && !runsc {
+            return Err(invalid("writable explicit local rootfs requires runsc"));
+        }
+        if disk.max(disk_limit) != 0 {
+            return Err(invalid(
+                "explicit local rootfs cannot set a writable layer limit",
+            ));
+        }
+        readonly
     } else {
-        storage_source(&root)?.map(|source| adx_core::execution::Rootfs { readonly, source })
+        root.readonly
+            .or_else(|| runtime_profile.map(|value| value.rootfs.readonly))
+            .unwrap_or(false)
     };
+    let rootfs =
+        storage_source(&root)?.map(|source| adx_core::execution::Rootfs { readonly, source });
     let mounts = r
         .mounts
         .into_iter()
@@ -929,21 +894,6 @@ pub fn create_spec_with_templates(
         })
         .map_err(|error| invalid(&error.to_string()))?;
     let mut policy = policy;
-    if template.is_some() {
-        let key = adx_core::local_rootfs::capability_label(&root.name)
-            .map_err(|error| invalid(&error.to_string()))?;
-        if policy.required_node.is_empty() {
-            policy.required_node.push(pb::LabelSelector::default());
-        }
-        for selector in &mut policy.required_node {
-            selector.expressions.push(pb::LabelRequirement {
-                key: key.clone(),
-                op: pb::SelectorOp::In as i32,
-                values: vec!["ready".into()],
-            });
-        }
-    }
-
     if r.pause
         .as_ref()
         .is_some_and(|p| p.storage == adx_core::lifecycle::CheckpointStorage::Shared)
@@ -974,6 +924,11 @@ pub fn create_spec_with_templates(
             "npu" => pb::DeviceKind::Npu,
             _ => return Err(invalid("unknown device kind")),
         };
+        if explicit_local_rootfs && root.runtime == "runsc" && kind == pb::DeviceKind::Gpu {
+            return Err(invalid(
+                "runsc GPU allocation is not supported with an explicit local rootfs",
+            ));
+        }
         let count = parts[2]
             .parse::<u32>()
             .ok()

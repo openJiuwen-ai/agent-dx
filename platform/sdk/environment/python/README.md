@@ -30,10 +30,10 @@ contract](../../../api/http/environment-create.md) defines retry behavior.
 
 The new Environment backend supports basic lifecycle, on-demand pause/resume, reusable snapshots, grouped placement, idle deletion/pause and restart policy. It requires an image containing the release EXECD at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
 
-The Environment backend supports S3 rootfs, S3/image/Local mounts, entrypoint inheritance,
+The Environment backend supports S3/Local rootfs, S3/image/Local mounts, entrypoint inheritance,
 creation and runtime network policy, `extra_config`, `failover=True`, independent
 resource limits, and per-environment data-plane security. Declared user ports use
-Ingress and Relay routing. Public local rootfs paths remain rejected. Local bind
+Ingress and Relay routing. Caller-prepared Local rootfs paths must exist on the execution node. Local bind
 mounts accept `host_path` (alias `hostPath`), with exactly one mount source and
 pre-existing node-visible directories. Arbitrary host paths require a trusted
 management caller; the API does not enforce per-tenant source-path authorization. `upstream` reverse tunnel uses the published
@@ -529,6 +529,12 @@ writable-layer enforcement.
 ## Rootfs and mounts
 
 `rootfs=S3Config(...)` starts from an S3-compatible EROFS root filesystem.
+`rootfs=LocalRootfs(path="/var/lib/agentos/images/tools/rootfs")` selects a caller-prepared
+directory or file on the execution node. Import `LocalRootfs` from `adx_environment`.
+Local sources do not resolve Docker metadata or inherit an OCI entrypoint. Supply
+image environment values through `env`; an HTTP caller can provide an explicit
+`process` to start a workload. Each eligible worker must have the source path,
+or the caller must select a node where it is available.
 `Mount` supports image-backed read-only bind mounts, S3-backed bind or EROFS
 mounts, and Local bind mounts through `host_path`. Local mounts accept `options`
 (`ro` by default, or `rw`, plus `nosuid`/`nodev`/`noexec`) and `create_if_missing`
@@ -541,10 +547,14 @@ local runtime environment, so a custom rootfs does not need to bake in ADX.
 
 The deployment Runtime Environment is the rootfs baseline. `runtime=` overrides
 only its isolation runtime. `rootfs_readonly=True` or `False` overrides only its
-read-only setting; leaving it as `None` inherits the deployment default. Passing
-`image=` or `rootfs=S3Config(...)` replaces the source atomically while omitted
-runtime/read-only fields continue to inherit. Runtime-only and read-only-only
-overrides keep the baseline source and do not add the bootstrap mount.
+read-only setting. Passing `image=`, `rootfs=S3Config(...)` or
+`rootfs=LocalRootfs(...)` replaces the source atomically. An omitted runtime
+inherits the deployment default. With runsc, an explicit Local source defaults
+to a private writable overlay over the read-only host source. Set
+`rootfs_readonly=True` to make the sandbox root read-only. Other supported
+runtimes require a read-only Local rootfs. Non-Local sources inherit the
+deployment read-only default. Runtime-only and read-only-only overrides keep
+the baseline source and do not add the bootstrap mount.
 
 ## Network policy models
 
@@ -794,6 +804,19 @@ context as a notification channel. The final result is always read back from
 EXECD's authoritative command registry. Subscription changes wake the shared
 transport immediately, and an idle transport is retained for up to five seconds
 for subsequent waits. Status notifications never replace the final registry read.
+During an explicit wait, the SDK also reads the same command's registry state
+after at most ten seconds of passive watching, making caller activity visible to idle reclamation. The
+Environment's idle window must exceed that interval; the AgentOS 60-second tool
+idle window supports commands that run longer than a minute. Simply submitting
+with `background=True` does not start these reads. For watch-backed waits,
+completion, wait timeout and async cancellation stop periodic reads without
+killing the command.
+These short reads do not mark the background command itself as an active HTTP
+request or change checkpoint admission. An explicit checkpoint can still capture
+the running command; automatic idle checkpointing waits for client activity to end.
+Retryable registry-read failures during a checkpoint or transport interruption
+are retried for up to 30 seconds, bounded by the caller's overall wait deadline.
+Terminal errors and exhausted retries retain their original exception metadata.
 When the wait deadline expires, they
 return `CommandResult(status=RUNNING, error_code="WAIT_TIMEOUT")`; the remote
 command remains active and the handle can wait again. A client restart also
@@ -874,15 +897,7 @@ a confirmed response missing the required capabilities is `UnsupportedFeature`.
 These diagnostics do not change operation replay or source ownership rules.
 
 
-### Registered Local rootfs
-
-SDK 0.1.0rc5 adds `Environment(rootfs_template="local-tools-v1", ...)` for a
-Local artifact registered by the deployment. It is mutually exclusive with
-`image`, `rootfs` and `snapshot_id`; arbitrary host paths are not accepted.
-`inherit_entrypoint=True` may start the registered process metadata. Missing
-names fail before scheduling, with no registry fallback. The deployment must
-prepare matching artifacts and metadata on eligible nodes. Default creates
-without an image or template keep using the deployment's default rootfs.
+### SDK behavior updates
 
 SDK 0.1.0rc6 wakes command-watch subscriptions immediately when local waiters change,
 without a periodic receive timeout. Terminal events continue to trigger an authoritative

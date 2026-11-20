@@ -29,6 +29,14 @@ Rust 构建、Cargo metadata、格式、Clippy、单元测试、FUSE 运行、mo
 | `scripts/ownerfs/bind-two-node-localfile.py`、`scripts/dfs/three_node_core.py` | 满足脚本 preflight 的 Linux root/FUSE 环境 | 单 VM 小规模定向功能证据，不等于通用 runner 或 Full |
 | Full profile | Linux ARM64 runner 且完整 FROZEN lock；当前通用 ENV verifier 未完成 | 当前仍 BLOCKED，不得以 smoke/定向 driver 替代 |
 
+默认特性不启用 `rdma` 和 `overlaybd-connector`。全特性 Clippy 额外需要
+`pkg-config`、`libibverbs` 开发文件、Clang／libclang，以及带 `blk_zone.capacity` 的
+Linux zoned-block UAPI（例如 [Linux v6.6 的 blkzoned.h](https://github.com/torvalds/linux/blob/v6.6/include/uapi/linux/blkzoned.h)）。
+Ubuntu 20.04 原始头文件中的 `reserved[36]` 会使固定版本 `libublk-rs-sys` 生成的
+Serde 派生失败。保留旧 glibc 构建基线时，可用 `BINDGEN_EXTRA_CLANG_ARGS=-I<新版 UAPI 根目录>`
+提供该头文件；更换 UAPI 后使用独立 `CARGO_TARGET_DIR`，确保重新生成绑定。
+这些是可选特性的编译依赖；RDMA／ublk 硬件运行仍需单独验收。
+
 旧 `build/e2e/afs/acceptance/runner.py` 的 ARM64 guard 是其现有探针、rootfs、LTP 和实验环境合同，不代表
 AFS 产品二进制只支持 ARM64，也不代表 x86_64 包或定向 Linux driver 已通过 Full。
 在逐项验证 runner 依赖前不得删除该 guard。
@@ -212,6 +220,12 @@ metadata 不能代替全账。有限资源诊断可以报告采样最大值和�
 32 个应用调用当作真实范围请求分母，也不能把采样最大值当作精确在途峰值。缺少范围
 请求分母时将降级率记为未知，不用 0 个事件伪造完整比例。区分配置估算、局部单测和
 运行观测，不将历史通过默认扩展到未覆盖的并发峰值、RSS 或回收结论。
+
+## DFS 写租约竞争回归
+
+`cargo test --locked -p afs --test dfs_lease_contention` 将真实 GC 调用插入租约读取与
+接管提交之间，核对 inode 存在时保留过期租约记录、下一写入方沿原 epoch 递增。
+同组还覆盖其他节点抢占后的结果、连续竞争的有界退出，以及 `OpenWrite` 的重试路径。
 
 ## 当前候选版本工程验收
 
@@ -806,6 +820,9 @@ cargo test --locked -p afs --lib --all-features immutable_chunk_retry_
 
 受控同批须让16个单对象请求在取批前都完成正文持久化，再证明共享一次目录／WAL及父目录
 屏障、同一提交revision，且屏障前无ACK；非受控并发只报告真实批数，不要求恰好一组。
+目录和 WAL 文件同步按实际写组计数；WAL 父目录在文件名首次持久化时同步一次，后续追加复用
+该事实。串行三写组回归独立核对这两种计数，并在重开后逐项验证已确认正文，避免并发恰好
+合成单组时掩盖计数口径错误。
 同ID安装／重放／quarantine与旧reader、新inode替换交错必须安全；阻塞磁盘I/O时其他
 catalog元数据操作仍能进展。首组ACK不依赖后续请求全部耗尽。
 
@@ -1027,7 +1044,7 @@ Node普通本地写路径另有既存1024个未发布descriptor及4MiB元数据�
 一次DFS发布新增K个receipt、每份C_i个copy时，主要权威变更为
 `3 + Σ(2 + C_i + repair_i)`；继承及新layout的extent仍放在一个Layout值中，
 不能把它们错误地计成同数量的顶层canonical条目。字段／标识长度仍计入实际编码字节；
-Root停用只写Root删除和撤权命令，旧grant的物理回收另走有界管理事务。
+Root停用只写Root删除和原结果，旧grant的物理回收另走有界管理事务。
 namespace、租约和单对象管理操作不因全库对象数量增长而自动变成批量删除。
 
 Linux回归入口：

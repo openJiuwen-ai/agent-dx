@@ -1,12 +1,10 @@
-mod support;
-
 use adx_activator::environment_request::{
     create_input, operation_id, pause_input, pause_operation_id, pause_timeout_seconds, paused,
 };
 use adx_agent_core::environment::{CreateEnvironment, EnvironmentError, EnvironmentPhase};
+use adx_agent_core::network::PlatformEgress;
 use serde_json::json;
 use std::time::Duration;
-use support::network_policy;
 
 fn request() -> CreateEnvironment {
     serde_json::from_value(json!({
@@ -19,23 +17,109 @@ fn request() -> CreateEnvironment {
     }))
     .unwrap()
 }
+
+#[test]
+fn creates_with_platform_and_template_egress_in_one_network_policy() {
+    let config: PlatformEgress = serde_json::from_value(json!({
+        "template_priority":200,
+        "egress":{
+            "allow":[{"cidr":"10.233.16.1/32","protocol":"udp","ports":{"first":53,"last":53},"priority":400},
+                     {"cidr":"0.0.0.0/0","protocol":"any","priority":1}],
+            "deny":[{"cidr":"10.233.16.0/20","protocol":"any","priority":300},
+                    {"cidr":"10.0.0.0/8","protocol":"any","priority":100}]
+        }
+    })).unwrap();
+    let mut template = json!({
+        "name":"app", "image":"app:1", "isolation_runtime":"runsc",
+        "resources":{"cpu_millis":500,"memory_mib":1024},
+        "network":{"egress":{"allow":[
+            {"cidr":"10.247.149.23/32","protocol":"tcp","ports":{"first":4000,"last":4000}}
+        ]}}
+    });
+    let draft: adx_agent_core::TemplateDraft = serde_json::from_value(template.clone()).unwrap();
+    template["network"]["egress"]["allow"][0]["priority"] = json!(400);
+    assert!(serde_json::from_value::<adx_agent_core::TemplateDraft>(template).is_err());
+    let mut request = request();
+    request.execution = (&draft.with_version("1".into())).into();
+    let input = create_input(&request, Duration::from_secs(60), Some(&config)).unwrap();
+    let traffic = &input["network"]["traffic"];
+    assert_eq!(traffic["ingressDefaultAction"], "deny");
+    assert_eq!(traffic["egressDefaultAction"], "deny");
+    let rules = traffic["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 5);
+    for (cidr, action, priority) in [
+        ("10.233.16.1/32", "allow", 400),
+        ("10.233.16.0/20", "deny", 300),
+        ("10.247.149.23/32", "allow", 200),
+        ("10.0.0.0/8", "deny", 100),
+        ("0.0.0.0/0", "allow", 1),
+    ] {
+        assert!(rules.iter().any(|rule| rule["peer"]["cidr"] == cidr
+            && rule["action"] == action
+            && rule["priority"] == priority));
+    }
+}
+
+#[test]
+fn empty_platform_config_leaves_explicit_template_rules_in_effect() {
+    let config: PlatformEgress = serde_json::from_value(json!({})).unwrap();
+    let input = create_input(&request(), Duration::from_secs(60), Some(&config)).unwrap();
+    assert!(input.get("network").is_none());
+    let mut request = request();
+    request.execution.network = Some(
+        serde_json::from_value(json!({"egress":{
+            "deny":[{"cidr":"192.0.2.1/32","protocol":"any"}]
+        }}))
+        .unwrap(),
+    );
+    let input = create_input(&request, Duration::from_secs(60), Some(&config)).unwrap();
+    assert_eq!(input["network"]["traffic"]["rules"][0]["action"], "deny");
+}
+
+#[test]
+fn egress_rule_limits_count_both_allow_and_deny() {
+    let platform_rule = json!({"cidr":"192.0.2.0/24","protocol":"any","priority":300});
+    for (deny, valid) in [(32, true), (33, false)] {
+        let platform: PlatformEgress = serde_json::from_value(json!({
+            "template_priority":200,"egress":{
+                "allow":vec![platform_rule.clone();32],"deny":vec![platform_rule.clone();deny]
+            }
+        }))
+        .unwrap();
+        assert_eq!(platform.validate().is_ok(), valid);
+    }
+
+    let template_rule = json!({"cidr":"192.0.2.1/32","protocol":"any"});
+    for (deny, valid) in [(64, true), (65, false)] {
+        let mut request = request();
+        request.execution.network = Some(
+            serde_json::from_value(json!({"egress":{
+                "allow":vec![template_rule.clone();64],"deny":vec![template_rule.clone();deny]
+            }}))
+            .unwrap(),
+        );
+        assert_eq!(
+            create_input(&request, Duration::from_secs(60), None).is_ok(),
+            valid
+        );
+    }
+}
 #[test]
 fn both_transports_submit_the_public_environment_contract_without_agent_metadata() {
     let mut request = request();
-    let first = create_input(&request, Duration::from_secs(60), &network_policy()).unwrap();
+    let first = create_input(&request, Duration::from_secs(60), None).unwrap();
     assert_eq!(
         first,
         json!({
             "namespace":"adx", "name":"generation", "image":"app:1", "runtime":"runc",
             "cpu":1500, "memory":768, "inheritEntrypoint":true,
             "env":{"MODEL_KEY":"test-value"}, "createTimeoutSeconds":60,"ports":[],
-            "restartPolicy":{"maxAttempts":3,"initialBackoffSeconds":5,"maxBackoffSeconds":60},
-            "network":adx_activator::environment_request::network_input(&network_policy()).unwrap()
+            "restartPolicy":{"maxAttempts":3,"initialBackoffSeconds":5,"maxBackoffSeconds":60}
         })
     );
     request.deadline_unix_ms = Some(1);
     assert_eq!(
-        create_input(&request, Duration::from_secs(60), &network_policy()).unwrap(),
+        create_input(&request, Duration::from_secs(60), None).unwrap(),
         first
     );
     assert_ne!(
@@ -50,10 +134,10 @@ fn platform_owned_credentials_and_process_overrides_are_rejected() {
         .execution
         .env
         .insert("EXECD_HTTP_TOKEN".into(), "user-value".into());
-    assert!(create_input(&request, Duration::from_secs(60), &network_policy()).is_err());
+    assert!(create_input(&request, Duration::from_secs(60), None).is_err());
     request.execution.env.clear();
     request.execution.entrypoint = vec!["/override".into()];
-    assert!(create_input(&request, Duration::from_secs(60), &network_policy()).is_err());
+    assert!(create_input(&request, Duration::from_secs(60), None).is_err());
 }
 
 #[test]
@@ -62,7 +146,7 @@ fn burst_limits_reach_the_public_sandbox_contract_independently_of_requests() {
     wire["execution"]["resources"] = json!({"cpu_millis":500,"memory_mib":1024,
         "cpu_limit_millis":2000,"memory_limit_mib":4096});
     let request: CreateEnvironment = serde_json::from_value(wire.clone()).unwrap();
-    let input = create_input(&request, Duration::from_secs(60), &network_policy()).unwrap();
+    let input = create_input(&request, Duration::from_secs(60), None).unwrap();
     assert_eq!(input["cpu"], 500);
     assert_eq!(input["memory"], 1024);
     assert_eq!(input["cpu_limit"], 2000);
@@ -74,7 +158,7 @@ fn burst_limits_reach_the_public_sandbox_contract_independently_of_requests() {
         let mut invalid = wire.clone();
         invalid["execution"]["resources"][field] = json!(value);
         let request = serde_json::from_value(invalid).unwrap();
-        assert!(create_input(&request, Duration::from_secs(60), &network_policy()).is_err());
+        assert!(create_input(&request, Duration::from_secs(60), None).is_err());
     }
 }
 
@@ -84,7 +168,7 @@ fn rendered_mounts_reach_the_shared_public_request() {
     let mounts = json!([{"type":"bind","host_path":"/mnt/sfs/w-user","create_if_missing":true,"create_options":{"uid":10001,"gid":10001,"mode":"0700"},"target":"/home/jiuwen","options":["rw"]}]);
     wire["execution"]["mounts"] = mounts.clone();
     let request = serde_json::from_value(wire).unwrap();
-    let input = create_input(&request, Duration::from_secs(60), &network_policy()).unwrap();
+    let input = create_input(&request, Duration::from_secs(60), None).unwrap();
     assert_eq!(input["mounts"], mounts);
 }
 
@@ -100,7 +184,7 @@ fn template_idle_pause_policy_reaches_the_public_environment_request() {
     template.validate().unwrap();
     let mut request = request();
     request.execution = (&template).into();
-    let input = create_input(&request, Duration::from_secs(60), &network_policy()).unwrap();
+    let input = create_input(&request, Duration::from_secs(60), None).unwrap();
     assert_eq!(input["idleTimeoutSeconds"], 600);
     assert_eq!(input["idleAction"], "pause");
     assert_eq!(
@@ -123,7 +207,7 @@ fn template_readiness_reaches_the_public_environment_request() {
     template.validate().unwrap();
     let mut request = request();
     request.execution = (&template).into();
-    let input = create_input(&request, Duration::from_secs(60), &network_policy()).unwrap();
+    let input = create_input(&request, Duration::from_secs(60), None).unwrap();
     assert_eq!(input["initCallTimeoutSeconds"], 30);
     assert_eq!(
         input["readinessProbe"],
@@ -144,59 +228,12 @@ fn template_healthcheck_reaches_platform_with_failure_threshold() {
     template.validate().unwrap();
     let mut request = request();
     request.execution = (&template).into();
-    let input = create_input(&request, Duration::from_secs(60), &network_policy()).unwrap();
+    let input = create_input(&request, Duration::from_secs(60), None).unwrap();
     assert_eq!(
         input["healthcheckProbe"],
         json!({"tcpSocket":{"port":18092},
         "initialDelaySeconds":5,"periodSeconds":10,"timeoutSeconds":2,"failureThreshold":3})
     );
-}
-
-#[test]
-fn runtime_network_policy_requires_an_explicit_deployment_opt_out() {
-    let policy: adx_agent_core::network::SandboxNetworkPolicy = serde_json::from_value(json!({
-        "sandbox_cidrs":["100.64.0.0/10", "10.83.0.0/24"], "internal_cidrs":[],
-        "public_egress":true, "egress_allow":[],
-        "runtime_policies":{"supervisor":"unrestricted", "conch":"deployment"}
-    }))
-    .unwrap();
-    let mut request = request();
-    request.execution.isolation_runtime = "supervisor".into();
-    let input = create_input(&request, Duration::from_secs(180), &policy).unwrap();
-    assert!(input.get("network").is_none());
-    for runtime in ["conch", "runsc", "unknown-runtime"] {
-        request.execution.isolation_runtime = runtime.into();
-        let input = create_input(&request, Duration::from_secs(180), &policy).unwrap();
-        assert_eq!(input["network"]["traffic"]["egressDefaultAction"], "deny");
-    }
-    assert!(
-        serde_json::from_value::<adx_agent_core::network::SandboxNetworkPolicy>(json!({
-            "sandbox_cidrs":["100.64.0.0/10"], "internal_cidrs":[],
-            "public_egress":true, "egress_allow":[],
-            "runtime_policies":{"supervisor":"automatic-fallback"}
-        }))
-        .is_err()
-    );
-}
-
-#[test]
-fn unrestricted_runtime_does_not_bypass_deployment_configuration_validation() {
-    for (pools, overrides) in [
-        (
-            json!(["invalid-cidr"]),
-            json!({"supervisor":"unrestricted"}),
-        ),
-        (json!(["100.64.0.0/10"]), json!({"":"unrestricted"})),
-    ] {
-        let policy = serde_json::from_value(json!({
-            "sandbox_cidrs":pools,"internal_cidrs":[],"public_egress":true,
-            "egress_allow":[],"runtime_policies":overrides
-        }))
-        .unwrap();
-        let mut request = request();
-        request.execution.isolation_runtime = "supervisor".into();
-        assert!(create_input(&request, Duration::from_secs(180), &policy).is_err());
-    }
 }
 
 #[test]

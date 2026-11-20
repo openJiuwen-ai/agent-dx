@@ -1,5 +1,5 @@
 use adx_activator::local_environment::LocalEnvironment;
-use adx_agent_core::{environment::Environment, limits};
+use adx_agent_core::environment::Environment;
 use adx_apiserver::{
     clients::Clients,
     config::{Config, IngressMode},
@@ -159,8 +159,8 @@ fn embedded_environment_service(
     };
     Ok(Some(Arc::new(LocalEnvironment::new(
         api.environment_service.clone(),
-        limits::ENVIRONMENT_REQUEST_TIMEOUT,
-        embedded.sandbox_network,
+        embedded.request_timeout(),
+        embedded.egress_isolation,
     )?)))
 }
 

@@ -41,6 +41,11 @@ pub struct LocalRootRecord {
     pub epoch: u64,
     pub data_dir: StoragePath,
     pub local_prepare_id: String,
+    /// Preparation origin: the directory was adopted from pre-existing
+    /// business data (`true`) instead of being created by AFS itself (`false`).
+    /// A create may reuse its own never-activated predecessor in place, but
+    /// must never take over adopted business data.
+    pub adopted: bool,
 }
 
 /// 持有本机数据目录排他锁的扫描结果。
@@ -220,6 +225,7 @@ mod tests {
             name: OsString::from(name),
             epoch: 1,
             local_prepare_id: "prepare".into(),
+            adopted: false,
         }
     }
 
@@ -278,6 +284,7 @@ mod tests {
             epoch: 1,
             data_dir,
             local_prepare_id: format!("node-a-afs-acc-01:{session}:{}:{session}", id.0),
+            adopted: false,
         };
         locked.persist_prepared_root(&record).unwrap();
         assert_eq!(locked.scan_roots().unwrap(), vec![record]);
@@ -409,6 +416,7 @@ struct WireRootRecord {
     epoch: u64,
     data_dir: String,
     local_prepare_id: String,
+    adopted: bool,
 }
 
 impl WireRootRecord {
@@ -425,6 +433,7 @@ impl WireRootRecord {
                 .to_string_lossy()
                 .into_owned(),
             local_prepare_id: record.local_prepare_id.clone(),
+            adopted: record.adopted,
         }
     }
 
@@ -441,6 +450,7 @@ impl WireRootRecord {
             epoch: self.epoch,
             data_dir: StoragePath::new(self.data_dir).map_err(Error::from)?,
             local_prepare_id: self.local_prepare_id,
+            adopted: self.adopted,
         })
     }
 }

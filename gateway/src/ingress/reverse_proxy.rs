@@ -141,6 +141,7 @@ pub fn parse_proxy_routes(input: &str) -> Result<Vec<ProxyRoute>, String> {
 #[derive(Clone)]
 pub struct ReverseProxy {
     client: Client<HttpConnector, ProxyBody>,
+    upgrade_client: Client<HttpConnector, ProxyBody>,
 }
 
 impl ReverseProxy {
@@ -153,6 +154,13 @@ impl ReverseProxy {
                 .pool_timer(TokioTimer::new())
                 .pool_idle_timeout(config.idle_timeout)
                 .pool_max_idle_per_host(config.max_idle_connections)
+                .retry_canceled_requests(false)
+                .build(connector.clone()),
+            // Execd's tunnel port selects HTTP or WebSocket on the first
+            // request. A WebSocket must start on a fresh upstream connection,
+            // even when its downstream HTTP connection is being reused.
+            upgrade_client: Client::builder(TokioExecutor::new())
+                .pool_max_idle_per_host(0)
                 .retry_canceled_requests(false)
                 .build(connector),
         }
@@ -232,8 +240,12 @@ impl ReverseProxy {
         {
             processing.forwarded();
         }
-        let mut response = match self
-            .client
+        let client = if upgrade.is_some() {
+            &self.upgrade_client
+        } else {
+            &self.client
+        };
+        let mut response = match client
             .request(super::processing::forwarding_request(request))
             .await
         {
@@ -246,7 +258,13 @@ impl ReverseProxy {
             let Some(downstream_upgrade) = downstream_upgrade else {
                 return bad_gateway("unsolicited upstream protocol upgrade");
             };
-            if response_upgrade != upgrade {
+            if !response_upgrade.as_ref().zip(upgrade.as_ref()).is_some_and(
+                |(received, requested)| {
+                    received
+                        .as_bytes()
+                        .eq_ignore_ascii_case(requested.as_bytes())
+                },
+            ) {
                 return bad_gateway("upstream protocol upgrade does not match request");
             }
             let upstream_upgrade = hyper::upgrade::on(&mut response);
