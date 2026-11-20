@@ -82,7 +82,7 @@ async fn running_recovery_materializes_missing_shared_cache_before_pinning() {
     ));
 }
 #[tokio::test]
-async fn corrupt_cache_retained_by_execution_is_not_replaced() {
+async fn invalid_cache_retained_by_execution_is_not_replaced() {
     let root = tempfile::tempdir().unwrap();
     let store = store(
         root.path(),
@@ -92,12 +92,12 @@ async fn corrupt_cache_retained_by_execution_is_not_replaced() {
     );
     let (artifact, path) = pause(&store, b"saved").await;
     let running = store.retain_execution(&artifact).await.unwrap();
-    std::fs::write(path.join("memory"), b"wrong").unwrap();
+    std::fs::write(path.join("memory"), b"bad").unwrap();
     assert!(matches!(
         store.prepare_restore(&artifact).await,
         Err(adx_core::Error::Conflict)
     ));
-    assert_eq!(std::fs::read(running.join("memory")).unwrap(), b"wrong");
+    assert_eq!(std::fs::read(running.join("memory")).unwrap(), b"bad");
     drop(running);
     assert_eq!(
         std::fs::read(
@@ -411,14 +411,14 @@ async fn restart_protects_live_files_before_trimming_and_cleans_partial_download
     removed(&ap).await;
 }
 #[tokio::test]
-async fn reconciliation_prunes_unretained_copies_and_restore_repairs_corruption() {
+async fn reconciliation_prunes_unretained_copies_and_restore_repairs_invalid_size() {
     let root = tempfile::tempdir().unwrap();
     let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let old = store(root.path(), remote.clone(), DEFAULT_CACHE_BUDGET_BYTES, 10);
     let (a, ap) = pause(&old, b"correct").await;
     let (_, orphan) = pause(&old, b"unretained").await;
     drop(old);
-    std::fs::write(ap.join("memory"), b"corrupt").unwrap();
+    std::fs::write(ap.join("memory"), b"bad").unwrap();
     let current = store(root.path(), remote, DEFAULT_CACHE_BUDGET_BYTES, 10);
     current
         .reconcile_local(std::slice::from_ref(&a))

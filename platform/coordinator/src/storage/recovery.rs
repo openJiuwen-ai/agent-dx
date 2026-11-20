@@ -1,5 +1,6 @@
 //! Atomic ownership transfer after the source execution has been invalidated.
 use super::*;
+use adx_core::checkpoint::{immutable_oci_rootfs, RECOVERY_OCI_NODE, RECOVERY_OCI_ROOTFS};
 use std::borrow::Cow;
 
 /// Operator-audited capture facts for one immutable shared artifact.
@@ -92,21 +93,29 @@ pub(crate) fn checkpoint_requirements(
     spec: &EnvironmentSpec,
     profile: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>> {
-    let required = recovery_profile_requirements(&spec.runtime_class, profile)?;
+    let mut required = recovery_profile_requirements(&spec.runtime_class, profile)?;
     let path = &required["ADX_RECOVERY_ROOTFS_PATH"];
-    if !spec.image.is_empty()
-        || spec.execution.rootfs.is_some()
-        || spec.runtime_profile.as_ref().is_some_and(|runtime| {
-            runtime.rootfs.runtime_class != spec.runtime_class
-                || runtime.rootfs.r#type != "local"
-                || runtime.rootfs.path != *path
-                || runtime.bootstrap.r#type != "erofs"
-                || runtime.bootstrap.root != *path
-        })
-    {
+    if spec.runtime_profile.as_ref().is_some_and(|runtime| {
+        runtime.rootfs.runtime_class != spec.runtime_class
+            || runtime.rootfs.r#type != "local"
+            || runtime.rootfs.path != *path
+            || runtime.bootstrap.r#type != "erofs"
+            || runtime.bootstrap.root != *path
+    }) {
         return Err(Error::Invalid(
             "checkpoint recovery requires a verified execution rootfs".into(),
         ));
+    }
+    if !spec.image.is_empty() || spec.execution.rootfs.is_some() {
+        let image = immutable_oci_rootfs(spec).ok_or_else(|| {
+            Error::Invalid("checkpoint recovery requires a verified execution rootfs".into())
+        })?;
+        if profile.get(RECOVERY_OCI_ROOTFS).map(String::as_str) != Some(image) {
+            return Err(Error::Invalid(
+                "checkpoint OCI rootfs evidence does not match the execution image".into(),
+            ));
+        }
+        required.insert(RECOVERY_OCI_NODE.into(), "1".into());
     }
     Ok(required)
 }

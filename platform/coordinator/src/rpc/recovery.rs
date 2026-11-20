@@ -314,6 +314,36 @@ mod tests {
     }
 
     #[test]
+    fn oci_checkpoint_requires_the_captured_immutable_image() {
+        let (mut stored, mut point, mut target) = fixture();
+        let tag = "registry.example/digitalmate:v1";
+        let pinned = format!("registry.example/digitalmate@sha256:{}", "c".repeat(64));
+        stored.spec.image = tag.into();
+        assert!(checkpoint_spec(&stored, Some(&point), None, &BTreeSet::new(), None).is_err());
+
+        stored.spec.execution.rootfs = Some(adx_core::execution::Rootfs {
+            readonly: false,
+            source: adx_core::execution::StorageSource::Image(pinned.clone()),
+        });
+        assert!(checkpoint_spec(&stored, Some(&point), None, &BTreeSet::new(), None).is_err());
+
+        point
+            .recovery_profile
+            .insert("ADX_RECOVERY_OCI_ROOTFS".into(), pinned);
+        let request = checkpoint_spec(&stored, Some(&point), None, &BTreeSet::new(), None).unwrap();
+        assert!(!request.scheduling.matches_node(&target.labels));
+        target.labels.insert("ADX_RECOVERY_OCI".into(), "1".into());
+        assert!(request.scheduling.matches_node(&target.labels));
+
+        point
+            .recovery_profile
+            .get_mut("ADX_RECOVERY_OCI_ROOTFS")
+            .unwrap()
+            .push('0');
+        assert!(checkpoint_spec(&stored, Some(&point), None, &BTreeSet::new(), None).is_err());
+    }
+
+    #[test]
     fn checkpoint_filters_leave_host_cpu_compatibility_to_runtime() {
         let (stored, mut point, mut target) = fixture();
         point.recovery_profile.remove("ADX_RECOVERY_HOST");
