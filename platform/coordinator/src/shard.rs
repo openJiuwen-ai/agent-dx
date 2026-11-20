@@ -10,6 +10,7 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
+    time::Instant,
 };
 
 struct NodeState {
@@ -66,7 +67,9 @@ pub struct SchedulingStats {
     pub attempts: u64,
 }
 pub(crate) enum Attempt {
-    Assigned(Assignment, EnvironmentSpec),
+    /// Third element is the ticket's enqueue instant, used to measure pure wait
+    /// at the assignment point.
+    Assigned(Assignment, EnvironmentSpec, Instant),
     Deferred(Entry),
     Empty,
 }
@@ -227,10 +230,13 @@ impl ShardScheduler {
             nodes.remove(id);
         }
     }
-    pub fn forget_queued(&mut self, id: &str) {
-        self.queue.remove(id);
-        self.deferred.remove(id);
+    /// Remove queued tickets for `id`; returns them so a confirmed cancellation
+    /// can close the pure-wait measurement.
+    pub fn forget_queued(&mut self, id: &str) -> Vec<Entry> {
+        let mut removed = self.queue.remove(id);
+        removed.extend(self.deferred.remove(id));
         self.excluded.remove(id);
+        removed
     }
     pub fn assignment(&self, id: &str) -> Option<&Assignment> {
         self.assigned.get(id)
@@ -527,7 +533,7 @@ impl ShardScheduler {
             devices,
         };
         self.assigned.insert(r.id.clone(), assignment.clone());
-        Ok(Attempt::Assigned(assignment, entry.spec))
+        Ok(Attempt::Assigned(assignment, entry.spec, entry.enqueued_at))
     }
     pub fn retry(&mut self, assignment: &Assignment, spec: EnvironmentSpec) -> Result<()> {
         let mut excluded = self

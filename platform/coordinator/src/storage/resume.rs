@@ -6,7 +6,12 @@ use super::*;
 pub(crate) enum ResumeAdmission {
     Upgrading,
     Running(StoredEnvironment),
-    Demanded(StoredEnvironment),
+    /// `created` is true only for the call that wrote the durable intent, so
+    /// lifecycle accounting can record one sample per operation.
+    Demanded {
+        stored: StoredEnvironment,
+        created: bool,
+    },
 }
 
 impl Session {
@@ -45,7 +50,9 @@ impl Session {
         run_timeout_seconds: Option<u64>,
     ) -> Result<StoredEnvironment> {
         match self.admit_resume(id, now, "", run_timeout_seconds).await? {
-            ResumeAdmission::Running(stored) | ResumeAdmission::Demanded(stored) => Ok(stored),
+            ResumeAdmission::Running(stored) | ResumeAdmission::Demanded { stored, .. } => {
+                Ok(stored)
+            }
             ResumeAdmission::Upgrading => Err(Error::Unavailable(
                 "environment is being evacuated; retry after ownership settles".into(),
             )),
@@ -112,9 +119,13 @@ impl Session {
             {
                 return Err(Error::Invalid("checkpoint expired or missing".into()));
             }
+            let created = stored.resume.is_none();
             if let Some(intent) = &mut stored.resume {
                 if intent.retry_after_unix_seconds == 0 || now < intent.retry_after_unix_seconds {
-                    return Ok(ResumeAdmission::Demanded(stored));
+                    return Ok(ResumeAdmission::Demanded {
+                        stored,
+                        created: false,
+                    });
                 }
                 // Keep the operation identity while admitting a new capacity round.
                 intent.local_rejected = false;
@@ -123,6 +134,7 @@ impl Session {
             } else {
                 stored.resume = Some(ResumeIntent {
                     run_timeout_seconds,
+                    requested_at_unix_millis: adx_core::observation::now_millis()?,
                     operation_id: format!("wake-{}", uuid::Uuid::new_v4()),
                     local_rejected: false,
                     rejected_nodes: Default::default(),
@@ -137,7 +149,7 @@ impl Session {
             ))
             .await?
             {
-                return Ok(ResumeAdmission::Demanded(stored));
+                return Ok(ResumeAdmission::Demanded { stored, created });
             }
         }
         Err(Error::Unavailable("resume demand contention".into()))

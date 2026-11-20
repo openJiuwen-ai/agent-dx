@@ -32,9 +32,27 @@ impl CoordinatorRpc {
                 &[
                     ("environment_id", stored.spec.id.clone()),
                     ("node_id", stored.assignment.node_id.clone()),
+                    (
+                        "runtime_id",
+                        stored.result.as_ref().map_or_else(
+                            || "unassigned".to_owned(),
+                            |record| record.runtime.id.clone(),
+                        ),
+                    ),
                     ("state", name),
                 ],
                 1,
+            );
+            // M1 用量投影：分配量导出（详设 §6.12——投影 worker 以此为分母）。
+            out.gauge(
+                "adx_environment_allocation_cpu_millis",
+                &[("environment_id", stored.spec.id.clone())],
+                stored.spec.resources.cpu_millis,
+            );
+            out.gauge(
+                "adx_environment_allocation_memory_bytes",
+                &[("environment_id", stored.spec.id.clone())],
+                stored.spec.resources.memory_bytes,
             );
         }
         Ok(out.finish())

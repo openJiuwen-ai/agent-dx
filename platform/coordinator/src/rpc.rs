@@ -450,6 +450,9 @@ impl State {
 struct Inner {
     business: Arc<std::sync::RwLock<Option<observation::BusinessSnapshot>>>,
     business_fenced: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with the scheduler: queue waits and lifecycle results render from
+    /// one instance on the same `/metrics` scrape.
+    metrics: Arc<crate::metrics::CoordinatorMetrics>,
     volume_domains: std::sync::RwLock<BTreeMap<String, adx_core::volumes::StorageDomain>>,
     upgrade_lock: Mutex<()>,
     created: std::sync::atomic::AtomicU64,
@@ -664,8 +667,10 @@ impl CoordinatorRpc {
                 )
                 .await?;
         }
+        let metrics = Arc::new(crate::metrics::CoordinatorMetrics::default());
         let mut scheduler = Coordinator::restore(&saved, placement)?;
         scheduler.use_generation_source(session.clone());
+        scheduler.use_metrics(metrics.clone());
         let specs = saved
             .environments
             .iter()
@@ -695,6 +700,7 @@ impl CoordinatorRpc {
             business: Arc::new(std::sync::RwLock::new(business)),
             business_fenced: Default::default(),
             upgrade_lock: Mutex::new(()),
+            metrics,
             created: Default::default(),
             create_locks: Default::default(),
             reclaimers: Default::default(),

@@ -2,13 +2,20 @@ use adx_core::EnvironmentSpec;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, VecDeque},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone)]
 pub(crate) struct Entry {
     pub sequence: u64,
     pub enqueue_time_millis: u64,
+    /// Process-local pure-wait timer. It travels with the Entry through the
+    /// delayed queue, transfers and re-entry, and is never persisted: a
+    /// restarted Coordinator must not report waits it never observed.
+    /// Deferred reordering reuses the same Entry, so internal retries keep the
+    /// first enqueue instant, matching the `enqueue_time_millis` oldest-wait
+    /// definition.
+    pub(crate) enqueued_at: Instant,
     pub spec: EnvironmentSpec,
 }
 impl Entry {
@@ -16,6 +23,7 @@ impl Entry {
         Self {
             sequence,
             enqueue_time_millis: unix_millis(),
+            enqueued_at: Instant::now(),
             spec,
         }
     }
@@ -49,14 +57,22 @@ impl TenantQueue {
             .insert((Reverse(priority), entry.sequence), entry);
         self.len += 1;
     }
-    pub(crate) fn remove(&mut self, id: &str) {
+    /// Remove every queued ticket for `id` and return them. A confirmed
+    /// cancellation needs the ticket back to close its pure-wait measurement.
+    pub(crate) fn remove(&mut self, id: &str) -> Vec<Entry> {
+        let mut removed = Vec::new();
         for queue in self.queues.values_mut() {
             let before = queue.len();
-            queue.retain(|_, entry| entry.spec.id != id);
+            let (matched, kept) = std::mem::take(queue)
+                .into_iter()
+                .partition(|(_, entry)| entry.spec.id == id);
+            *queue = kept;
             self.len -= before - queue.len();
+            removed.extend(matched.into_values());
         }
         self.queues.retain(|_, q| !q.is_empty());
         self.tenants.retain(|t| self.queues.contains_key(t));
+        removed
     }
     pub fn len(&self) -> usize {
         self.len
