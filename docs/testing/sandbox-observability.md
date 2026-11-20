@@ -73,6 +73,8 @@ unknown、失败和取消不进入成功耗时样本；后续确认成功不补�
 | `adx_observability_started_timestamp_seconds` | gauge/Unix 秒 | 新增；可信统计覆盖起点，未知时不导出 | Coordinator |
 
 `pressure.memory_enabled` 和 `pressure.disk_enabled` 默认均为 `true`。
+`resource="memory"` 的 pressure 百分比来自 `/proc/meminfo` 的整节点
+`(MemTotal - MemAvailable) / MemTotal`，与 cgroup 限额和 Environment 资源预留独立。
 禁用资源的 `level`、`percent`、`last_transition_unix_seconds` 序列省略；
 同时禁用两种资源时，pressure gauge 整组省略。启用资源的采样失败仍通过共享的
 观测时间和连续失败计数保持可见。

@@ -306,7 +306,6 @@ async fn embedded_registration_automatically_reconciles_aliases() {
     let revision = state.put_alias(&alias, Some(&revision)).await.unwrap();
     let config = serde_json::from_value(serde_json::json!({
         "embedded": {
-            "sandbox_network": {"sandbox_cidrs": ["10.0.0.0/20"], "internal_cidrs": [], "public_egress": true, "egress_allow": []},
             "redis_url": redis_url,
             "namespace": namespace,
             "registration": {
@@ -316,7 +315,8 @@ async fn embedded_registration_automatically_reconciles_aliases() {
                 "heartbeat_seconds": 1
             }
         }
-    })).unwrap();
+    }))
+    .unwrap();
     let api = AgentApi::new_embedded(config, backend.clone())
         .await
         .unwrap();

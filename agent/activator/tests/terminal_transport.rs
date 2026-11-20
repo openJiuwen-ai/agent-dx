@@ -1,4 +1,3 @@
-mod support;
 use adx_activator::transport::HttpEnvironment;
 use adx_agent_core::environment::*;
 use axum::{
@@ -63,7 +62,7 @@ async fn terminal_conflict_requires_the_existing_message_and_matching_creation_i
             Duration::from_secs(1),
             None,
             true,
-            support::network_policy(),
+            None,
         )
         .unwrap();
         let request = serde_json::from_value(json!({

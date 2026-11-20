@@ -1,5 +1,3 @@
-mod support;
-
 use adx_activator::transport::HttpEnvironment;
 use adx_agent_core::environment::*;
 use axum::{routing::get, Json, Router};
@@ -10,7 +8,6 @@ use std::{
     },
     time::Duration,
 };
-use support::network_policy;
 fn credentials() -> std::collections::BTreeMap<String, String> {
     [("tenant".into(), TOKEN.into())].into()
 }
@@ -47,7 +44,7 @@ async fn environment_client_rejects_mismatched_identity_and_never_replays_or_red
         Duration::from_secs(1),
         None,
         false,
-        network_policy()
+        None
     )
     .is_err());
     let client = HttpEnvironment::new(
@@ -56,7 +53,7 @@ async fn environment_client_rejects_mismatched_identity_and_never_replays_or_red
         Duration::from_secs(1),
         None,
         true,
-        network_policy(),
+        None,
     )
     .unwrap();
     assert!(matches!(
@@ -83,7 +80,7 @@ async fn environment_connect_failure_is_unavailable_even_for_writes() {
         Duration::from_secs(1),
         None,
         true,
-        network_policy(),
+        None,
     )
     .unwrap();
     let create: CreateEnvironment = serde_json::from_value(serde_json::json!({
@@ -125,7 +122,7 @@ async fn lost_http_reply_is_unknown_only_for_writes() {
             Duration::from_secs(1),
             None,
             true,
-            network_policy(),
+            None,
         )
         .unwrap();
         if write {
@@ -169,7 +166,7 @@ async fn environment_create_uses_the_callers_remaining_deadline() {
         Duration::from_secs(5),
         None,
         true,
-        network_policy(),
+        None,
     )
     .unwrap();
     let deadline = adx_agent_core::unix_time_millis() + 250;
@@ -225,7 +222,7 @@ async fn apiserver_contract_preserves_identity_tenant_credentials_and_idempotenc
                 assert_eq!(body["cpu"], 1000);
                 assert_eq!(body["memory"], 128);
                 assert_eq!(body["inheritEntrypoint"], true);
-                assert_eq!(body["network"], adx_activator::environment_request::network_input(&network_policy()).unwrap());
+                assert!(body.get("network").is_none());
                 assert_eq!(body["env"]["MODEL_KEY"], "test-model-key");
                 assert!(body.get("tenant").is_none());
                 capture.lock().unwrap().push((headers["x-request-id"].to_str().unwrap().to_string(), body));
@@ -251,7 +248,7 @@ async fn apiserver_contract_preserves_identity_tenant_credentials_and_idempotenc
         Duration::from_secs(5),
         None,
         true,
-        network_policy(),
+        None,
     )
     .unwrap();
     let mut create: CreateEnvironment = serde_json::from_value(serde_json::json!({
@@ -293,7 +290,7 @@ async fn apiserver_delete_absence_is_explicit_not_found() {
         Duration::from_secs(1),
         None,
         true,
-        network_policy(),
+        None,
     )
     .unwrap();
     assert!(client.get("tenant", "adx-id").await.unwrap().is_none());
@@ -336,7 +333,7 @@ async fn tenant_keys_are_selected_without_forwarding_tenant_query() {
         Duration::from_secs(1),
         None,
         true,
-        network_policy(),
+        None,
     )
     .unwrap();
     for tenant in ["a", "b"] {
@@ -378,7 +375,7 @@ async fn invalid_or_incomplete_write_success_is_never_confirmed() {
             Duration::from_secs(1),
             None,
             true,
-            network_policy(),
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -402,7 +399,7 @@ async fn forbidden_queries_do_not_become_absence_or_leak_server_details() {
         Duration::from_secs(1),
         None,
         true,
-        network_policy(),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -449,7 +446,7 @@ async fn pause_posts_the_checkpoint_budget_with_a_prefixed_idempotency_key() {
         Duration::from_secs(5),
         None,
         true,
-        network_policy(),
+        None,
     )
     .unwrap();
     let observed = client.pause("tenant", "adx-id", 300).await.unwrap();
@@ -484,7 +481,7 @@ async fn pause_failure_statuses_map_to_structured_environment_errors() {
             Duration::from_secs(1),
             None,
             true,
-            network_policy(),
+            None,
         )
         .unwrap();
         let error = client.pause("tenant", "adx-id", 1).await.unwrap_err();
@@ -512,7 +509,7 @@ async fn pause_rejects_timeout_seconds_outside_the_api_bound() {
         Duration::from_secs(1),
         None,
         true,
-        network_policy(),
+        None,
     )
     .unwrap();
     for budget in [0_u64, 3601] {
@@ -545,7 +542,7 @@ async fn pause_client_budget_is_clamped_to_timeout_seconds() {
         Duration::from_secs(10),
         None,
         true,
-        network_policy(),
+        None,
     )
     .unwrap();
     let start = std::time::Instant::now();
@@ -591,7 +588,7 @@ async fn volume_management_explicit_refusals_keep_deterministic_errors() {
             Duration::from_secs(1),
             None,
             true,
-            network_policy(),
+            None,
         )
         .unwrap();
         for result in [
@@ -658,7 +655,7 @@ async fn volume_ensure_identity_conflict_is_distinct_from_a_missing_uid() {
             Duration::from_secs(1),
             None,
             true,
-            network_policy(),
+            None,
         )
         .unwrap();
         let result = client.ensure_volume("tenant", "adx-owner", &spec).await;

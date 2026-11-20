@@ -547,10 +547,14 @@ local runtime environment, so a custom rootfs does not need to bake in ADX.
 
 The deployment Runtime Environment is the rootfs baseline. `runtime=` overrides
 only its isolation runtime. `rootfs_readonly=True` or `False` overrides only its
-read-only setting; leaving it as `None` inherits the deployment default. Passing
-`image=`, `rootfs=S3Config(...)` or `rootfs=LocalRootfs(...)` replaces the source atomically while omitted
-runtime/read-only fields continue to inherit. Runtime-only and read-only-only
-overrides keep the baseline source and do not add the bootstrap mount.
+read-only setting. Passing `image=`, `rootfs=S3Config(...)` or
+`rootfs=LocalRootfs(...)` replaces the source atomically. An omitted runtime
+inherits the deployment default. With runsc, an explicit Local source defaults
+to a private writable overlay over the read-only host source. Set
+`rootfs_readonly=True` to make the sandbox root read-only. Other supported
+runtimes require a read-only Local rootfs. Non-Local sources inherit the
+deployment read-only default. Runtime-only and read-only-only overrides keep
+the baseline source and do not add the bootstrap mount.
 
 ## Network policy models
 
@@ -800,6 +804,19 @@ context as a notification channel. The final result is always read back from
 EXECD's authoritative command registry. Subscription changes wake the shared
 transport immediately, and an idle transport is retained for up to five seconds
 for subsequent waits. Status notifications never replace the final registry read.
+During an explicit wait, the SDK also reads the same command's registry state
+after at most ten seconds of passive watching, making caller activity visible to idle reclamation. The
+Environment's idle window must exceed that interval; the AgentOS 60-second tool
+idle window supports commands that run longer than a minute. Simply submitting
+with `background=True` does not start these reads. For watch-backed waits,
+completion, wait timeout and async cancellation stop periodic reads without
+killing the command.
+These short reads do not mark the background command itself as an active HTTP
+request or change checkpoint admission. An explicit checkpoint can still capture
+the running command; automatic idle checkpointing waits for client activity to end.
+Retryable registry-read failures during a checkpoint or transport interruption
+are retried for up to 30 seconds, bounded by the caller's overall wait deadline.
+Terminal errors and exhausted retries retain their original exception metadata.
 When the wait deadline expires, they
 return `CommandResult(status=RUNNING, error_code="WAIT_TIMEOUT")`; the remote
 command remains active and the handle can wait again. A client restart also

@@ -1,29 +1,17 @@
-use adx_activator::{
-    reconciliation::{ReconcileSettings, Reconciliation},
-    registration::RegistrationConfig,
-    server,
-    transport::HttpEnvironment,
-    Activator, CacheSettings,
-};
-use adx_agent_store::{AgentState, RedisRepository};
+use adx_activator::{config::ActivatorConfig, server, transport::HttpEnvironment};
 use serde::Deserialize;
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
+    #[serde(flatten)]
+    activator: ActivatorConfig,
     listen: SocketAddr,
-    redis_url: String,
-    namespace: String,
     environment_url: String,
     environment_api_key_envs: BTreeMap<String, String>,
-    sandbox_network: adx_agent_core::network::SandboxNetworkPolicy,
     allow_plaintext_transport: bool,
     environment_ca_file: Option<String>,
-    request_timeout_seconds: u64,
-    #[serde(default)]
-    binding_cache: CacheSettings,
-    registration: Option<RegistrationConfig>,
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    let timeout = Duration::from_secs(settings.request_timeout_seconds);
+    let timeout = settings.activator.request_timeout();
     let ca = settings
         .environment_ca_file
         .map(std::fs::read)
@@ -50,21 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeout,
         ca.as_deref(),
         settings.allow_plaintext_transport,
-        settings.sandbox_network,
+        settings.activator.egress_isolation.clone(),
     )?);
-    let store = Arc::new(
-        RedisRepository::connect(
-            &settings.redis_url,
-            &settings.namespace,
-            Duration::from_secs(3),
-        )
-        .await?,
-    );
-    let activator = Arc::new(Activator::with_cache(
-        AgentState::new(store.clone()),
-        environment,
-        settings.binding_cache,
-    )?);
+    let (activator, store) = settings.activator.connect(environment).await?;
     activator.start_snapshot_preparations();
     let app = server::router(
         activator.clone(),
@@ -72,23 +48,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeout,
     )?;
     let listener = tokio::net::TcpListener::bind(settings.listen).await?;
-    let reconciliation = match settings.registration {
-        Some(config) => Some(
-            Reconciliation::start(
-                activator,
-                store.as_ref().clone(),
-                adx_agent_store::discovery::RedisRegistry::new(
-                    &settings.redis_url,
-                    &settings.namespace,
-                    Duration::from_secs(3),
-                )?,
-                config,
-                ReconcileSettings::default(),
-            )
-            .await?,
-        ),
-        None => None,
-    };
+    let reconciliation = settings
+        .activator
+        .start_reconciliation(activator, store)
+        .await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             #[cfg(unix)]
@@ -108,4 +71,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn standalone_settings_read_the_shared_config_at_the_root() {
+        let mut config: Value =
+            serde_json::from_str(include_str!("../examples/discovery.json")).unwrap();
+        let settings: Settings = serde_json::from_value(config.clone()).unwrap();
+        assert!(settings.activator.egress_isolation.is_some());
+        assert!(settings.activator.registration.is_some());
+
+        config["request_timeout_second"] = json!(10);
+        assert!(serde_json::from_value::<Settings>(config).is_err());
+    }
 }

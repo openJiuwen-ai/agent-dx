@@ -1,5 +1,3 @@
-mod support;
-
 use adx_activator::local_environment::{EnvironmentApplication, LocalEnvironment};
 use adx_agent_core::environment::*;
 use async_trait::async_trait;
@@ -8,7 +6,6 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use support::network_policy;
 
 #[derive(Default)]
 struct Application {
@@ -106,15 +103,25 @@ fn request() -> CreateEnvironment {
 async fn snapshot_registration_replay_keeps_the_published_network_and_timeout() {
     use adx_agent_core::prewarm::{SeedExecution, SeedResult};
     let application = Arc::new(Application::default());
+    let platform_egress = |priority| {
+        serde_json::from_value(json!({
+            "template_priority": 200,
+            "egress": {"deny": [{"cidr": "192.0.2.0/24", "protocol": "any", "priority": priority}]}
+        }))
+        .unwrap()
+    };
     let a = LocalEnvironment::new(
         application.clone(),
         Duration::from_secs(20),
-        network_policy(),
+        Some(platform_egress(300)),
     )
     .unwrap();
-    let mut config = network_policy();
-    config.public_egress = !config.public_egress;
-    let b = LocalEnvironment::new(application.clone(), Duration::from_secs(30), config).unwrap();
+    let b = LocalEnvironment::new(
+        application.clone(),
+        Duration::from_secs(30),
+        Some(platform_egress(400)),
+    )
+    .unwrap();
     let mut seed = SeedExecution {
         execution: request().execution,
         volume: serde_json::from_value(json!({"id":"seed","source":{
@@ -138,23 +145,25 @@ async fn snapshot_registration_replay_keeps_the_published_network_and_timeout() 
             snapshot_id: "one".into()
         }
     );
+    let calls = application.preparations.lock().unwrap();
+    let environment = &calls[0].2["environment"];
+    assert_eq!(environment["createTimeoutSeconds"], 20);
     assert_eq!(
-        application.preparations.lock().unwrap()[0].2["environment"]["createTimeoutSeconds"],
-        20
+        environment["network"]["traffic"]["rules"][0]["priority"],
+        300
     );
 }
 
 #[tokio::test]
 async fn local_adapter_passes_the_public_request_and_preserves_unknown_delete() {
     let app = Arc::new(Application::default());
-    let environment =
-        LocalEnvironment::new(app.clone(), Duration::from_secs(60), network_policy()).unwrap();
+    let environment = LocalEnvironment::new(app.clone(), Duration::from_secs(60), None).unwrap();
     assert!(environment.create(&request()).await.unwrap().ready);
     let calls = app.creates.lock().unwrap().clone();
     assert_eq!(calls[0].0, "tenant");
     assert_eq!(
         calls[0].1,
-        json!({"namespace":"adx","name":"id","image":"app:1","runtime":"runc","inheritEntrypoint":true,"env":{"MODEL_KEY":"test-key"},"cpu":1000,"memory":512,"createTimeoutSeconds":60,"ports":[],"restartPolicy":{"maxAttempts":3,"initialBackoffSeconds":5,"maxBackoffSeconds":60},"network":adx_activator::environment_request::network_input(&network_policy()).unwrap()})
+        json!({"namespace":"adx","name":"id","image":"app:1","runtime":"runc","inheritEntrypoint":true,"env":{"MODEL_KEY":"test-key"},"cpu":1000,"memory":512,"createTimeoutSeconds":60,"ports":[],"restartPolicy":{"maxAttempts":3,"initialBackoffSeconds":5,"maxBackoffSeconds":60}})
     );
     assert!(calls[0].2.starts_with("activator-create-"));
     assert!(
@@ -176,8 +185,7 @@ async fn expired_calls_are_not_submitted_and_submitted_timeouts_remain_unknown()
         stall: true,
         ..Default::default()
     });
-    let environment =
-        LocalEnvironment::new(app.clone(), Duration::from_secs(60), network_policy()).unwrap();
+    let environment = LocalEnvironment::new(app.clone(), Duration::from_secs(60), None).unwrap();
     let mut request = request();
     request.deadline_unix_ms = Some(adx_agent_core::unix_time_millis().saturating_sub(1));
     assert!(matches!(
@@ -199,8 +207,7 @@ async fn local_adapter_preserves_explicit_delete_absence() {
         absent: true,
         ..Default::default()
     });
-    let environment =
-        LocalEnvironment::new(app, Duration::from_secs(60), network_policy()).unwrap();
+    let environment = LocalEnvironment::new(app, Duration::from_secs(60), None).unwrap();
     assert!(matches!(
         environment.delete("tenant", "adx-id").await,
         Err(EnvironmentError::NotFound)
@@ -218,8 +225,7 @@ async fn local_adapter_observes_dormancy_without_lifecycle_side_effects() {
             state: Some(state),
             ..Default::default()
         });
-        let environment =
-            LocalEnvironment::new(app.clone(), Duration::from_secs(1), network_policy()).unwrap();
+        let environment = LocalEnvironment::new(app.clone(), Duration::from_secs(1), None).unwrap();
         let observed = environment.get("tenant", "adx-id").await.unwrap().unwrap();
         assert_eq!(observed.phase, phase);
         assert!(!observed.ready);
@@ -230,8 +236,7 @@ async fn local_adapter_observes_dormancy_without_lifecycle_side_effects() {
 #[tokio::test]
 async fn local_creation_attempt_changes_only_the_operation_identity() {
     let app = Arc::new(Application::default());
-    let environment =
-        LocalEnvironment::new(app.clone(), Duration::from_secs(60), network_policy()).unwrap();
+    let environment = LocalEnvironment::new(app.clone(), Duration::from_secs(60), None).unwrap();
     let mut request = request();
     environment.create(&request).await.unwrap();
     environment.create(&request).await.unwrap();
@@ -246,8 +251,7 @@ async fn local_creation_attempt_changes_only_the_operation_identity() {
 #[tokio::test]
 async fn local_pause_forwards_prefixed_operation_id_and_budget() {
     let app = Arc::new(Application::default());
-    let environment =
-        LocalEnvironment::new(app.clone(), Duration::from_secs(60), network_policy()).unwrap();
+    let environment = LocalEnvironment::new(app.clone(), Duration::from_secs(60), None).unwrap();
     let observed = environment.pause("tenant", "adx-id", 120).await.unwrap();
     assert_eq!(observed.id, "adx-id");
     assert_eq!(observed.phase, EnvironmentPhase::Paused);
@@ -276,8 +280,7 @@ async fn local_pause_timeout_is_unknown_so_callers_requery() {
         stall: true,
         ..Default::default()
     });
-    let environment =
-        LocalEnvironment::new(app, Duration::from_millis(50), network_policy()).unwrap();
+    let environment = LocalEnvironment::new(app, Duration::from_millis(50), None).unwrap();
     // The application stalls past the local timeout budget; the result is unknown, not
     // success, so the orchestrator re-queries the original ID on its next pass.
     assert!(matches!(
@@ -294,7 +297,7 @@ async fn local_pause_rejects_timeout_seconds_outside_the_api_bound() {
     let environment = LocalEnvironment::new(
         Arc::new(Application::default()),
         Duration::from_secs(60),
-        network_policy(),
+        None,
     )
     .unwrap();
     for budget in [0_u64, 3601] {

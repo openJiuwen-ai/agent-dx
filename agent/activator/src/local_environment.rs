@@ -1,6 +1,6 @@
 //! Agent-side adapter for a co-located Environment management application.
 use crate::environment_request;
-use adx_agent_core::network::SandboxNetworkPolicy;
+use adx_agent_core::network::PlatformEgress;
 use adx_agent_core::{
     environment::*,
     transport::{capped_deadline, remaining_time},
@@ -89,20 +89,20 @@ pub trait EnvironmentApplication: Send + Sync {
 pub struct LocalEnvironment {
     application: Arc<dyn EnvironmentApplication>,
     timeout: Duration,
-    network: SandboxNetworkPolicy,
+    platform_egress: Option<PlatformEgress>,
 }
 impl LocalEnvironment {
     pub fn new(
         application: Arc<dyn EnvironmentApplication>,
         timeout: Duration,
-        network: SandboxNetworkPolicy,
+        platform_egress: Option<PlatformEgress>,
     ) -> Result<Self, EnvironmentError> {
         environment_request::validate_timeout(timeout)?;
-        environment_request::network_input(&network)?;
+        environment_request::validate_platform_egress(platform_egress.as_ref())?;
         Ok(Self {
             application,
             timeout,
-            network,
+            platform_egress,
         })
     }
 }
@@ -126,7 +126,14 @@ impl Environment for LocalEnvironment {
         id: &str,
         seed: &adx_agent_core::prewarm::SeedExecution,
     ) -> Result<Option<Value>, EnvironmentError> {
-        environment_request::seed_input(tenant, id, seed, self.timeout, &self.network).map(Some)
+        environment_request::seed_input(
+            tenant,
+            id,
+            seed,
+            self.timeout,
+            self.platform_egress.as_ref(),
+        )
+        .map(Some)
     }
 
     async fn prepare_snapshot(
@@ -135,7 +142,13 @@ impl Environment for LocalEnvironment {
         id: &str,
         seed: &adx_agent_core::prewarm::SeedExecution,
     ) -> Result<adx_agent_core::prewarm::SeedResult, EnvironmentError> {
-        let input = environment_request::seed_input(tenant, id, seed, self.timeout, &self.network)?;
+        let input = environment_request::seed_input(
+            tenant,
+            id,
+            seed,
+            self.timeout,
+            self.platform_egress.as_ref(),
+        )?;
         tokio::time::timeout(
             self.timeout,
             self.application.prepare_snapshot_request(tenant, id, input),
@@ -197,7 +210,11 @@ impl Environment for LocalEnvironment {
         &self,
         request: &CreateEnvironment,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
-        let input = environment_request::create_input(request, self.timeout, &self.network)?;
+        let input = environment_request::create_input(
+            request,
+            self.timeout,
+            self.platform_egress.as_ref(),
+        )?;
         let operation_id = environment_request::creation_request_id(request)?;
         let remaining = remaining_time(capped_deadline(request.deadline_unix_ms, self.timeout));
         if remaining.is_zero() {

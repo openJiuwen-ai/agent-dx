@@ -28,6 +28,8 @@ pub struct ExecutionSpec {
     )]
     pub lifecycle: crate::lifecycle::LifecyclePolicy,
     pub service: Vec<Service>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<crate::network::TemplateNetwork>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<crate::mounts::Mount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,6 +53,7 @@ impl From<&TemplateVersion> for ExecutionSpec {
             resources: value.resources.clone(),
             lifecycle: value.lifecycle.clone(),
             service: value.service.clone(),
+            network: value.network.clone(),
             mounts: value.mounts.clone(),
             init_timeout_seconds: value.init_timeout_seconds,
             readiness_probe: value.readiness_probe.clone(),
@@ -72,6 +75,7 @@ impl ExecutionSpec {
             resources: self.resources.clone(),
             lifecycle: self.lifecycle.clone(),
             service: self.service.clone(),
+            network: self.network.clone(),
             mounts: self.mounts.clone(),
             volumes: vec![],
             init_timeout_seconds: self.init_timeout_seconds,

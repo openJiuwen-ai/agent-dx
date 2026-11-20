@@ -130,20 +130,19 @@ impl OwnerRootAuthority for MissingOwnerRootAuthority {
 pub struct StoreOwnerRootAuthority {
     store: Arc<dyn MetaStore>,
     load_balancing: bool,
+    epoch_allocation: tokio::sync::Mutex<()>,
 }
 
 impl StoreOwnerRootAuthority {
     pub fn new(store: Arc<dyn MetaStore>) -> Self {
-        Self {
-            store,
-            load_balancing: false,
-        }
+        Self::with_load_balancing(store, false)
     }
 
     pub fn with_load_balancing(store: Arc<dyn MetaStore>, load_balancing: bool) -> Self {
         Self {
             store,
             load_balancing,
+            epoch_allocation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -229,29 +228,10 @@ impl StoreOwnerRootAuthority {
             }));
             // Root absence fences every old grant in the authoritative view.
             // Physical grant removal is bounded background work, not part of this ACK.
-            let access_generation = home_grant.access_generation;
             txn.conditions
                 .push(TxnCondition::EntityEquals(MetaEntity::RootGrant(
                     home_grant,
                 )));
-            // Force requires the Home session to be gone: it can never receive or ACK
-            // a revocation, so such a command could never be reclaimed.
-            if force.is_none() {
-                txn.mutations.push(TxnMutation::Put(MetaEntity::RootCommand(
-                    RootCommandRecord {
-                        command_id: format!(
-                            "deactivate:{}:{}:{}",
-                            root.root_id, root.root_epoch, input.request_id
-                        ),
-                        home_node_id: root.home_node_id.clone(),
-                        home_session_id: root.home_session_id.clone(),
-                        root_id: root.root_id.clone(),
-                        root_epoch: root.root_epoch,
-                        old_access_generation: access_generation,
-                        command_type: RootCommandType::RevokeAccess,
-                    },
-                )));
-            }
             txn.mutations.push(TxnMutation::RecordRequestOutcome(
                 super::store::RequestOutcome {
                     request: txn.request.clone(),
@@ -330,8 +310,6 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                     already_reserved_by_same_intent: true,
                 });
             }
-            // Allocation shares the existing writer. A different Root reserving
-            // concurrently may advance its floor; retry only that CAS conflict.
             for _ in 0..32 {
                 let root = self
                     .store
@@ -401,6 +379,20 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                     if reservation_requester_is_live(self.store.as_ref(), existing).await? {
                         return Err(root_busy("root is reserved by another live request"));
                     }
+                }
+                // Concurrent reserves would all CAS the same floor and starve
+                // each other, so serialize allocation. Checks before the wait
+                // may be stale: restart if the reservation changed, so a
+                // same-intent request replays it, and select Home afterwards.
+                let _allocation = self.epoch_allocation.lock().await;
+                let current = self
+                    .store
+                    .read(MetaRead::RootReservation {
+                        root_id: input.root_id.clone(),
+                    })
+                    .await?;
+                if current.entity != existing.clone().map(MetaEntity::RootReservation) {
+                    continue;
                 }
                 let home = select_home(
                     self.store.as_ref(),
@@ -2068,6 +2060,71 @@ mod tests {
             .await
             .expect_err("changed prepare identity must not replay the grant");
         assert_eq!(replay.code(), afs_error::META_CATALOG_INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn concurrent_reserves_of_distinct_roots_all_allocate_epochs() {
+        let store = open_store().await;
+        register_node(store.as_ref(), "node-a", "session-a").await;
+        let authority = StoreOwnerRootAuthority::new(store);
+        let results = futures_util::future::join_all((0..100).map(|index| {
+            authority.reserve_root(ReserveRootInput {
+                root_id: format!("root-{index}"),
+                ..reserve_input(
+                    "node-a",
+                    "session-a",
+                    &format!("reserve-{index}"),
+                    &format!("node-a:session-a:agent-{index}"),
+                )
+            })
+        }))
+        .await;
+        let mut epochs = results
+            .into_iter()
+            .map(|result| result.expect("reserve root").reservation.root_epoch)
+            .collect::<Vec<_>>();
+        epochs.sort_unstable();
+        assert_eq!(epochs, (1..=100).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_intent_reserves_share_one_reservation() {
+        let store = open_store().await;
+        register_node(store.as_ref(), "node-a", "session-a").await;
+        let authority = StoreOwnerRootAuthority::new(store);
+        let intent = "node-a:session-a:agent-a";
+        let (first, second) = tokio::join!(
+            authority.reserve_root(reserve_input("node-a", "session-a", "reserve-1", intent)),
+            authority.reserve_root(reserve_input("node-a", "session-a", "reserve-2", intent)),
+        );
+        let first = first.expect("first reserve").reservation;
+        let second = second
+            .expect("same-intent reserve must reuse the reservation")
+            .reservation;
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn same_intent_replay_does_not_wait_for_epoch_allocation() {
+        let store = open_store().await;
+        register_node(store.as_ref(), "node-a", "session-a").await;
+        let authority = StoreOwnerRootAuthority::new(store);
+        let intent = "node-a:session-a:agent-a";
+        let reserved = authority
+            .reserve_root(reserve_input("node-a", "session-a", "reserve-1", intent))
+            .await
+            .expect("reserve root")
+            .reservation;
+        let _allocation = authority.epoch_allocation.lock().await;
+        let replay = tokio::time::timeout(
+            Duration::from_secs(1),
+            authority.reserve_root(reserve_input("node-a", "session-a", "reserve-2", intent)),
+        )
+        .await
+        .expect("same-intent replay must not queue behind epoch allocation")
+        .expect("replay reservation");
+        assert!(replay.already_reserved_by_same_intent);
+        assert_eq!(replay.reservation, reserved);
     }
 
     #[tokio::test]

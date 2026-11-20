@@ -14,8 +14,8 @@ from adx_environment.commands import CommandHandle, Commands, CommandWaitTimeout
 from adx_environment.types import CommandResult, CommandStatus
 
 
-@pytest.fixture
-def clock(monkeypatch):
+@pytest.fixture(name="clock")
+def command_clock(monkeypatch):
     state = SimpleNamespace(now=0.0, sleeps=[])
 
     def sleep(delay):
@@ -75,8 +75,8 @@ def test_foreground_default_deadline_is_preserved(monkeypatch, options, expected
     poll.assert_called_once_with("sleep 120", None, None, expected_timeout)
 
 
-@pytest.fixture
-def running(monkeypatch):
+@pytest.fixture(name="running")
+def running_command(monkeypatch):
     handle = Mock(spec=CommandHandle)
     handle.id = "cmd-42"
     collection = Commands(Mock(spec=EnvironmentClient), "environment")
@@ -213,7 +213,7 @@ def test_http_wait_timeout_body_is_normalized_when_transport_returns_it():
     assert result.error_message == "still running"
 
 
-def test_watched_wait_timeout_returns_running_result(monkeypatch):
+def test_watched_wait_timeout_returns_running_result(monkeypatch, clock):
     client = Mock(spec=EnvironmentClient)
     client._connection = object()
     client.invoke.return_value = {"command_id": "cmd-42", "status": "running"}
@@ -228,7 +228,7 @@ def test_watched_wait_timeout_returns_running_result(monkeypatch):
     manager.wait.assert_called_once_with("environment", "cmd-42", 2)
 
 
-def test_async_watched_wait_timeout_returns_running_result(monkeypatch):
+def test_async_watched_wait_timeout_returns_running_result(monkeypatch, clock):
     client = Mock(spec=EnvironmentClient)
     client._connection = object()
     client.invoke.return_value = {"command_id": "cmd-42", "status": "running"}

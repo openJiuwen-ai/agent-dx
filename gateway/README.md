@@ -1014,12 +1014,11 @@ The two authentication boundaries, client requirements and verification limits a
 
 ### Network policy for embedded template sandboxes
 
-When `ADX_AGENT_CONFIG` selects an embedded Activator, `embedded.sandbox_network`
-is required. API Server passes this configured policy to the Agent-side
-`LocalEnvironment` adapter; the Environment API's public network contract is unchanged.
-The standalone Activator uses the same mapping. See the
-[Activator network configuration](../agent/activator/README.md#模板沙箱网络隔离)
-for address pools, public egress and explicit internal service exceptions.
+Both Activator deployment modes read platform ACL from `egress_isolation`. Put the
+shared settings under `embedded` in `ADX_AGENT_CONFIG` for embedded deployment or
+at the root of `ADX_ACTIVATOR_CONFIG` for standalone deployment. Both combine
+platform policy and template egress rules in the Environment create request. See the
+[Activator network configuration](../agent/activator/README.md#模板沙箱网络隔离).
 
 ### Jiuwen persistent workspace parameters
 

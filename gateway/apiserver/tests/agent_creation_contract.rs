@@ -1,16 +1,12 @@
 //! Agent transports submit the same public request; API Server owns runtime injection.
-mod support;
-
 use adx_activator::environment_request::create_input;
 use adx_agent_core::environment::CreateEnvironment;
 use adx_apiserver::{
     clients::Clients, config::Config, contract, environment_service::EnvironmentService,
 };
 use adx_protocol::control as pb;
+use data_plane_gateway::ingress::agent_api::AgentConfig;
 use serde_json::json;
-use std::time::Duration;
-use support::network_policy;
-
 #[tokio::test]
 async fn embedded_and_http_creation_use_the_same_platform_contract() {
     let config: Config = serde_json::from_value(json!({
@@ -23,10 +19,23 @@ async fn embedded_and_http_creation_use_the_same_platform_contract() {
     })).unwrap();
     let runtime = config.runtime_profile.clone();
     let service = EnvironmentService::new(Clients::new(config).unwrap());
+    let agent: AgentConfig = serde_json::from_value(json!({"embedded":{
+        "redis_url":"redis://127.0.0.1:6379", "namespace":"agent",
+        "request_timeout_seconds":75, "binding_cache":{"capacity":42},
+        "egress_isolation":{"template_priority":200,"egress":{
+            "deny":[{"cidr":"192.0.2.0/24","protocol":"any","priority":300}]
+        }}
+    }}))
+    .unwrap();
+    let settings = agent.embedded.unwrap();
+    assert_eq!(settings.binding_cache.capacity, 42);
+    let timeout = settings.request_timeout();
     let create: CreateEnvironment = serde_json::from_value(json!({"tenant":"tenant","id":"adx-generation","execution":{
+        "network":{"egress":{"allow":[{"cidr":"192.0.2.1/32","protocol":"tcp","ports":{"first":443,"last":443}}]}},
         "image":"app:1","isolation_runtime":"runc","lifecycle":{"idle_timeout_seconds":600,"idle_action":"pause","pause":{"retention":{"kind":"forever"},"storage":"shared","timeout_seconds":300}},"inherit_entrypoint":true,"entrypoint":[],"working_dir":"","user":null,"env":{"MODEL_KEY":"test-model-value"},"mounts":[{"type":"bind","host_path":"/mnt/sfs/w-user","target":"/home/jiuwen","options":["rw"]}],"resources":{"cpu_millis":1500,"memory_mib":768},"service":[{"protocol":"ws","port":18092}],"init_timeout_seconds":30,"readiness_probe":{"tcp_socket":{"port":18092},"initial_delay_seconds":3,"period_seconds":3,"timeout_seconds":2}
     }})).unwrap();
-    let input = create_input(&create, Duration::from_secs(60), &network_policy()).unwrap();
+    let input = create_input(&create, timeout, settings.egress_isolation.as_ref()).unwrap();
+    assert_eq!(input["createTimeoutSeconds"], 75);
     let caller = pb::CallerContext {
         tenant_id: "tenant".into(),
         administrator: false,
@@ -77,14 +86,18 @@ async fn embedded_and_http_creation_use_the_same_platform_contract() {
         readiness.action,
         Some(pb::probe_spec::Action::TcpSocket(ref probe)) if probe.port == 18092
     ));
-    assert!(local.execution.as_ref().unwrap().network.is_some());
-    assert_eq!(local.execution.as_ref().unwrap().ports, vec![18092]);
+    let execution = local.execution.as_ref().unwrap();
+    let policy = execution.network.as_ref().unwrap();
+    let rules = &policy.traffic.as_ref().unwrap().rules;
+    assert_eq!(rules.len(), 2);
+    assert_eq!((rules[0].priority, rules[1].priority), (300, 200));
+    assert_eq!(execution.ports, vec![18092]);
     assert_eq!(local.env["MODEL_KEY"], "test-model-value");
     assert_eq!(
         local.runtime_profile.unwrap().env["EXECD_HTTP_TOKEN"],
         "test-deployment-credential"
     );
-    let mut forbidden = create_input(&create, Duration::from_secs(60), &network_policy()).unwrap();
+    let mut forbidden = create_input(&create, timeout, settings.egress_isolation.as_ref()).unwrap();
     forbidden["env"]["EXECD_HTTP_TOKEN"] = json!("user-supplied");
     assert!(service.prepare_create(forbidden, &caller).is_err());
 }
@@ -131,7 +144,7 @@ async fn create_entrypoint_requires_local_rootfs_beneath_an_allowed_directory() 
         "/srv/other-images/rootfs",
     ] {
         let spec = configured.prepare_create(request(path), &caller).unwrap();
-        assert!(spec.execution.unwrap().rootfs.unwrap().readonly, "{path}");
+        assert!(!spec.execution.unwrap().rootfs.unwrap().readonly, "{path}");
     }
     for path in [
         "/srv/adx-images/other/rootfs",

@@ -4,10 +4,9 @@ use adx_agent_core::{
     environment::*,
     lifecycle::RetentionPolicy,
     limits,
-    network::{EgressProtocol, RuntimeNetworkPolicy, SandboxNetworkPolicy},
+    network::{PlatformEgress, TemplateNetwork},
     transport::{capped_deadline, remaining_time},
 };
-use ipnet::IpNet;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -90,7 +89,7 @@ pub fn validate_execution(execution: &ExecutionSpec) -> Result<(), EnvironmentEr
 pub fn create_input(
     request: &CreateEnvironment,
     timeout: Duration,
-    network: &SandboxNetworkPolicy,
+    platform_egress: Option<&PlatformEgress>,
 ) -> Result<Value, EnvironmentError> {
     validate_execution(&request.execution)?;
     validate_identity(&request.tenant)?;
@@ -105,8 +104,6 @@ pub fn create_input(
             EnvironmentError::Invalid("managed Environment ID must be adx-<name>".into())
         })?;
     let execution = &request.execution;
-    // Validate the complete deployment configuration even for an explicit opt-out.
-    let network_request = network_input(network)?;
     // Keep the submitted specification stable across retries. The caller's absolute
     // deadline bounds HTTP waiting; API Server owns its independent create budget.
     let mut input = json!({
@@ -123,10 +120,8 @@ pub fn create_input(
         input["image"] = json!(execution.image);
         input["runtime"] = json!(execution.isolation_runtime);
     }
-    if network.runtime_policies.get(&execution.isolation_runtime)
-        != Some(&RuntimeNetworkPolicy::Unrestricted)
-    {
-        input["network"] = network_request;
+    if let Some(policy) = egress_input(execution.network.as_ref(), platform_egress) {
+        input["network"] = policy;
     }
     if !execution.lifecycle.is_default() {
         input["idleTimeoutSeconds"] = json!(execution.lifecycle.idle_timeout_seconds);
@@ -173,7 +168,7 @@ pub(crate) fn seed_input(
     id: &str,
     seed: &adx_agent_core::prewarm::SeedExecution,
     timeout: Duration,
-    network: &SandboxNetworkPolicy,
+    platform_egress: Option<&PlatformEgress>,
 ) -> Result<Value, EnvironmentError> {
     if let Some(input) = &seed.native_input {
         return Ok(input.clone());
@@ -185,7 +180,7 @@ pub(crate) fn seed_input(
         deadline_unix_ms: None,
         creation_attempt: 0,
     };
-    let mut environment = create_input(&request, timeout, network)?;
+    let mut environment = create_input(&request, timeout, platform_egress)?;
     environment["idleTimeoutSeconds"] = json!(0);
     Ok(json!({"environment":environment, "volume":seed.volume}))
 }
@@ -343,123 +338,51 @@ pub fn paused(
     Ok(observation(tenant, id, EnvironmentPhase::Paused))
 }
 
-/// Compile deployment policy to the public Environment network contract.
-/// The sandboxd backend accepts IPv4 only. Unsupported CIDRs, overlapping service
-/// exceptions and invalid port ranges fail closed before creating an Environment.
-pub fn network_input(config: &SandboxNetworkPolicy) -> Result<Value, EnvironmentError> {
-    if config.runtime_policies.len() > 64
-        || config.runtime_policies.keys().any(|runtime| {
-            runtime.is_empty()
-                || runtime.len() > 64
-                || !runtime
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
-        })
-    {
-        return Err(EnvironmentError::Invalid(
-            "runtime network policies require at most 64 valid runtime names".into(),
-        ));
+pub(crate) fn validate_platform_egress(
+    egress: Option<&PlatformEgress>,
+) -> Result<(), EnvironmentError> {
+    if let Some(egress) = egress {
+        egress.validate().map_err(EnvironmentError::Invalid)?;
     }
-    fn cidr(value: &str) -> Result<IpNet, EnvironmentError> {
-        value.parse::<ipnet::Ipv4Net>().map(IpNet::V4).map_err(|_| {
-            EnvironmentError::Invalid("Environment network requires an IPv4 CIDR".into())
-        })
-    }
-    if config.sandbox_cidrs.is_empty()
-        || config.sandbox_cidrs.len() + config.internal_cidrs.len() + config.egress_allow.len()
-            > 256
-    {
-        return Err(EnvironmentError::Invalid(
-            "Environment network requires address pools and at most 256 configured rules".into(),
-        ));
-    }
-    let pools = config
-        .sandbox_cidrs
-        .iter()
-        .map(|v| cidr(v))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut rules = Vec::new();
-    let mut rule = |action: &str, direction: &str, protocol: Value, peer: Value, priority: u32| {
-        rules.push(json!({"action":action,"direction":direction,"protocol":protocol,"peer":peer,"priority":priority}));
-    };
-    if config.public_egress {
-        rule(
-            "allow",
-            "egress",
-            json!("any"),
-            json!({"cidr":"0.0.0.0/0"}),
-            100,
-        );
-    }
-    // Non-public and special-use destinations are never included in public egress.
-    // Deployment-specific globally addressed cluster networks must be listed too.
-    for net in [
-        "0.0.0.0/8",
-        "10.0.0.0/8",
-        "100.64.0.0/10",
-        "127.0.0.0/8",
-        "169.254.0.0/16",
-        "172.16.0.0/12",
-        "192.0.0.0/24",
-        "192.0.2.0/24",
-        "192.168.0.0/16",
-        "198.18.0.0/15",
-        "198.51.100.0/24",
-        "203.0.113.0/24",
-        "224.0.0.0/4",
-        "240.0.0.0/4",
-    ]
-    .into_iter()
-    .chain(config.internal_cidrs.iter().map(String::as_str))
-    {
-        let net = cidr(net)?;
-        rule(
-            "deny",
-            "egress",
-            json!("any"),
-            json!({"cidr":net.to_string()}),
-            200,
-        );
-    }
-    for allow in &config.egress_allow {
-        let net = cidr(&allow.cidr)?;
-        if pools
+    Ok(())
+}
+
+fn egress_input(
+    template: Option<&TemplateNetwork>,
+    platform: Option<&PlatformEgress>,
+) -> Option<Value> {
+    let platform_rules = platform
+        .and_then(|settings| settings.egress.as_ref())
+        .into_iter()
+        .flat_map(|egress| {
+            egress
+                .iter()
+                .map(|(action, rule)| (action, &rule.destination, rule.priority))
+        });
+    let priority = platform
+        .and_then(|settings| settings.template_priority)
+        .unwrap_or(1);
+    let template_rules = template.into_iter().flat_map(|network| {
+        network
+            .egress
             .iter()
-            .any(|pool| pool.contains(&net.network()) || net.contains(&pool.network()))
-        {
-            return Err(EnvironmentError::Invalid(
-                "egress exception overlaps an Environment address pool".into(),
-            ));
-        }
-        match (&allow.ports, allow.protocol) {
-            (Some(ports), EgressProtocol::Tcp | EgressProtocol::Udp)
-                if ports.first > 0 && ports.first <= ports.last => {}
-            (None, EgressProtocol::Icmp) => (),
-            _ => {
-                return Err(EnvironmentError::Invalid(
-                    "TCP/UDP exceptions require a valid port range; ICMP does not accept ports"
-                        .into(),
-                ));
+            .map(|(action, rule)| (action, rule, priority))
+    });
+    let rules: Vec<_> = platform_rules
+        .chain(template_rules)
+        .map(|(action, rule, priority)| {
+            let mut peer = json!({"cidr": rule.cidr.trunc().to_string()});
+            if let Some(ports) = &rule.ports {
+                peer["portRange"] = json!(ports);
             }
-        }
-        let mut peer = json!({"cidr":net.to_string()});
-        if let Some(ports) = &allow.ports {
-            peer["portRange"] = json!(ports);
-        }
-        rule("allow", "egress", json!(allow.protocol), peer, 300);
-    }
-    for net in pools {
-        rule(
-            "deny",
-            "both",
-            json!("any"),
-            json!({"cidr":net.to_string()}),
-            400,
-        );
-    }
-    Ok(
-        json!({"schemaVersion":2,"traffic":{"ingressDefaultAction":"deny","egressDefaultAction":"deny","mode":"stateful","rules":rules}}),
-    )
+            json!({"action":action,"direction":"egress","protocol":rule.protocol,"peer":peer,"priority":priority})
+        })
+        .collect();
+    (!rules.is_empty()).then(|| {
+        json!({"schemaVersion":2,"traffic":{
+            "ingressDefaultAction":"deny","egressDefaultAction":"deny","mode":"stateful","rules":rules
+        }})
+    })
 }
 
 /// The persisted definition wins; only its stable reference enters the execution request.

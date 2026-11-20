@@ -1044,7 +1044,7 @@ Node普通本地写路径另有既存1024个未发布descriptor及4MiB元数据�
 一次DFS发布新增K个receipt、每份C_i个copy时，主要权威变更为
 `3 + Σ(2 + C_i + repair_i)`；继承及新layout的extent仍放在一个Layout值中，
 不能把它们错误地计成同数量的顶层canonical条目。字段／标识长度仍计入实际编码字节；
-Root停用只写Root删除和撤权命令，旧grant的物理回收另走有界管理事务。
+Root停用只写Root删除和原结果，旧grant的物理回收另走有界管理事务。
 namespace、租约和单对象管理操作不因全库对象数量增长而自动变成批量删除。
 
 Linux回归入口：
