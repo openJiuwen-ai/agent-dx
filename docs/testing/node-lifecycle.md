@@ -124,8 +124,18 @@ CPU 或内存为零的新鲜样本仍可保持这两个标志为真，但不满�
 首次容量样本成功后，容量、pressure、存储挂载与运行时能力在后台独立于心跳采集。
 心跳只读取最近发布的快照，不等待本轮采样完成。容量与 pressure 各自串行采样，
 一轮未返回时不启动下一轮；容量阻塞不影响 pressure 更新，反之亦然。
-运行时能力首次观测完成前保持新准入关闭；能力和挂载观测失败仍分别撤回运行时
-准入与存储资格。首次容量样本仍是启动注册的前置条件。
+运行时能力首次成功观测前保持新准入关闭；后续能力观测失败或超时保留最近成功的运行时
+清单，成功观测仍替换清单。挂载核验失败或超时撤回对应的存储资格，无卷任务的节点准入
+不受挂载核验影响。首次容量样本仍是启动注册的前置条件。
+
+配置 sandboxd 的节点独立运行后台 healthcheck，使用现有 `ListAvailableRuntimes` RPC，
+与 `resource_source` 类型无关。检查周期为 `report_interval_seconds`，单轮超时取
+`rpc_timeout_seconds` 与检查周期的较小值。仅在连续失败次数达到
+`sandboxd_health_failure_threshold`（默认 3），且从首次失败起持续达到
+`sandboxd_health_failure_seconds`（默认 30 秒）时关闭节点新准入；两个配置均须为正数。
+任一成功检查重置连续失败计数和起点，并解除 healthcheck 准入限制。
+持续失败期间心跳和已接纳的执行继续，容量、设备与能力快照保持各自的更新规则。
+维护、压力、升级与停机等准入条件独立生效。
 
 `pressure` 为可选配置，`memory_enabled` 和 `disk_enabled` 分别控制内存和磁盘，默认均为 `true`。
 内存 pressure 只读取当前 Linux 节点的 `/proc/meminfo`，使用
