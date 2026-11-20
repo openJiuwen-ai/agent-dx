@@ -9,6 +9,20 @@ pub(crate) enum ResumeAdmission {
     Demanded(StoredEnvironment),
 }
 
+fn process_resume_blocked(node: &str, marker: Option<&str>, token: Option<&str>) -> Result<bool> {
+    let Some(marker) = marker else {
+        return Ok(false);
+    };
+    let marker: NodeMaintenance = decode(marker)?;
+    marker.validate()?;
+    if marker.owner.node_id != node || token.is_some_and(|token| token != marker.current_session) {
+        return Err(Error::Conflict);
+    }
+    // Preparation does not authorize ordinary wake demand, even while the old
+    // session may heartbeat. Missing/replaced tokens are stronger conflicts.
+    Ok(true)
+}
+
 impl Session {
     pub async fn retire_dormant(&self, expected: &StoredEnvironment) -> Result<EnvironmentRecord> {
         let stored = self.get(&expected.spec.id).await?;
@@ -72,6 +86,27 @@ impl Session {
                 .transpose()?;
             let mut stored: StoredEnvironment = decode(value.as_deref().ok_or(Error::NotFound)?)?;
             stored.validate()?;
+            let marker_field = format!("process-upgrade:{}", stored.assignment.node_id);
+            let token_field = format!("node-session:{}", stored.assignment.node_id);
+            let [current_header, current_value, marker, token] = self
+                .store
+                .fields([
+                    HEADER.into(),
+                    field.clone(),
+                    marker_field.clone(),
+                    token_field.clone(),
+                ])
+                .await?;
+            if current_header != header_value || current_value != value {
+                continue;
+            }
+            if process_resume_blocked(
+                &stored.assignment.node_id,
+                marker.as_deref(),
+                token.as_deref(),
+            )? {
+                return Ok(ResumeAdmission::Upgrading);
+            }
             if upgrade
                 .as_ref()
                 .is_some_and(|task| task.blocks_resume(&stored))
@@ -133,7 +168,11 @@ impl Session {
                 &header,
                 Some((&field, value.as_deref(), encode(&stored)?)),
                 None,
-                &[(UPGRADE.into(), upgrade_value.clone())],
+                &[
+                    (UPGRADE.into(), upgrade_value.clone()),
+                    (marker_field, marker),
+                    (token_field, token),
+                ],
             ))
             .await?
             {
@@ -189,5 +228,25 @@ impl Session {
             }
         }
         Err(Error::Unavailable("resume rejection contention".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_resume_requires_exact_marker_and_original_token_but_still_waits() {
+        let marker = serde_json::json!({
+            "owner":{"rollout_id":"batch", "local_task_id":"local", "epoch":1,"node_id":"node"},
+            "origin_session":"old", "current_session":"old", "yielded":false,"replacement":null
+        })
+        .to_string();
+        assert!(process_resume_blocked("node", Some(&marker), Some("old")).unwrap());
+        assert!(process_resume_blocked("node", Some(&marker), None).unwrap());
+        assert!(process_resume_blocked("node", Some(&marker), Some("replacement")).is_err());
+        assert!(process_resume_blocked("other", Some(&marker), Some("old")).is_err());
+        assert!(!process_resume_blocked("node", None, None).unwrap());
+        assert!(process_resume_blocked("node", Some("{}"), Some("old")).is_err());
     }
 }

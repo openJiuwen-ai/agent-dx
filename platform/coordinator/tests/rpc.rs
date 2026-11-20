@@ -5,6 +5,10 @@ mod environment_control;
 mod mounts;
 #[path = "rpc/node_retirement.rs"]
 mod node_retirement;
+#[path = "rpc/pod_upgrade_verify.rs"]
+mod pod_upgrade_verify;
+#[path = "rpc/process_upgrade.rs"]
+mod process_upgrade;
 #[path = "support/recovery_profile.rs"]
 mod recovery_profile;
 #[path = "rpc/snapshot_preparation.rs"]

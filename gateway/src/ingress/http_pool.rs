@@ -1,3 +1,4 @@
+use super::pool::RelayReuseGuard;
 use bytes::Bytes;
 use http::{header, HeaderValue, Request, Response};
 use hyper::body::{Body, Frame, Incoming};
@@ -110,6 +111,7 @@ struct IdleConnection {
     sender: SendRequest<super::server::ProxyBody>,
     idle_since: Instant,
     opened_at: Instant,
+    reuse_guard: Option<RelayReuseGuard>,
 }
 
 impl BackendHttpPool {
@@ -127,7 +129,8 @@ impl BackendHttpPool {
         });
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let weak = Arc::downgrade(&inner);
-            let interval = (inner.config.idle_timeout / 2).max(Duration::from_millis(100));
+            let interval = (inner.config.idle_timeout / 2)
+                .clamp(Duration::from_millis(100), Duration::from_secs(30));
             runtime.spawn(async move {
                 loop {
                     tokio::time::sleep(interval).await;
@@ -183,7 +186,7 @@ impl BackendHttpPool {
     pub async fn send_recoverable<F, Fut, T, V>(
         &self,
         key: BackendHttpPoolKey,
-        mut request: Request<Incoming>,
+        request: Request<Incoming>,
         open: F,
         validate: V,
     ) -> Result<Response<PooledResponseBody>, (BackendHttpPoolError, Option<Request<Incoming>>)>
@@ -192,6 +195,50 @@ impl BackendHttpPool {
         V: FnOnce() -> io::Result<()>,
         Fut: Future<Output = io::Result<T>>,
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.send_guarded_recoverable(key, request, open, validate, |_| None, None)
+            .await
+    }
+
+    pub(crate) async fn send_relay_recoverable<F, Fut, V>(
+        &self,
+        key: BackendHttpPoolKey,
+        request: Request<Incoming>,
+        prepare_deadline: Option<tokio::time::Instant>,
+        open: F,
+        validate: V,
+    ) -> Result<Response<PooledResponseBody>, (BackendHttpPoolError, Option<Request<Incoming>>)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<super::server::IngressStream>>,
+        V: FnOnce() -> io::Result<()>,
+    {
+        self.send_guarded_recoverable(
+            key,
+            request,
+            open,
+            validate,
+            super::server::IngressStream::reuse_guard,
+            prepare_deadline,
+        )
+        .await
+    }
+
+    async fn send_guarded_recoverable<F, Fut, T, V, G>(
+        &self,
+        key: BackendHttpPoolKey,
+        mut request: Request<Incoming>,
+        open: F,
+        validate: V,
+        guard: G,
+        prepare_deadline: Option<tokio::time::Instant>,
+    ) -> Result<Response<PooledResponseBody>, (BackendHttpPoolError, Option<Request<Incoming>>)>
+    where
+        F: FnOnce() -> Fut,
+        V: FnOnce() -> io::Result<()>,
+        Fut: Future<Output = io::Result<T>>,
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        G: FnOnce(&T) -> Option<RelayReuseGuard>,
     {
         // The pool always opens HTTP/1.1 connections to the sandbox. An
         // HTTP/2 client request therefore must not retain its inbound version
@@ -215,9 +262,10 @@ impl BackendHttpPool {
                 return Err(BackendHttpPoolError::Closed);
             }
 
-            let (sender, opened_at, reused) = loop {
+            let (sender, opened_at, reused, reuse_guard) = loop {
                 let Some(mut idle) = self.inner.take_idle(&endpoint) else {
                     let stream = open().await.map_err(BackendHttpPoolError::Connect)?;
+                    let reuse_guard = guard(&stream);
                     let (sender, connection) =
                         hyper::client::conn::http1::handshake(TokioIo::new(stream))
                             .await
@@ -228,18 +276,37 @@ impl BackendHttpPool {
                             tracing::debug!(%error, "pooled environment HTTP connection closed");
                         }
                     }));
-                    break (sender, Instant::now(), false);
+                    break (sender, Instant::now(), false, reuse_guard);
                 };
-                if idle.sender.ready().await.is_ok() {
-                    break (idle.sender, idle.opened_at, true);
+                if idle.sender.ready().await.is_ok() && relay_reusable(&idle.reuse_guard) {
+                    break (idle.sender, idle.opened_at, true, idle.reuse_guard);
                 }
                 self.inner.discarded_total.fetch_add(1, Ordering::Relaxed);
             };
 
-            Ok::<_, BackendHttpPoolError>((sender, opened_at, endpoint, permit, reused))
-        }
-        .await;
-        let (mut sender, opened_at, endpoint, permit, reused) = match prepared {
+            Ok::<_, BackendHttpPoolError>((
+                sender,
+                opened_at,
+                endpoint,
+                permit,
+                reused,
+                reuse_guard,
+            ))
+        };
+        // Bound preparation without cancelling a business request after it has
+        // been sent. Timeouts here retain the complete original Incoming body.
+        let prepared = match prepare_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, prepared)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(BackendHttpPoolError::Connect(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Relay connection admission timed out",
+                    )))
+                }),
+            None => prepared.await,
+        };
+        let (mut sender, opened_at, endpoint, permit, reused, reuse_guard) = match prepared {
             Ok(value) => value,
             Err(error) => return Err((error, Some(request))),
         };
@@ -249,10 +316,16 @@ impl BackendHttpPool {
         if let Err(error) = validate() {
             return Err((BackendHttpPoolError::Connect(error), Some(request)));
         }
+        let request_allows_reuse = !has_connection_close(request.headers());
+        // No business bytes or forwarded marker have been emitted. A GOAWAY
+        // received during admission validation can still return the full request.
+        if !relay_reusable(&reuse_guard) {
+            self.inner.discarded_total.fetch_add(1, Ordering::Relaxed);
+            return Err((BackendHttpPoolError::Closed, Some(request)));
+        }
         if reused {
             self.inner.reused_total.fetch_add(1, Ordering::Relaxed);
         }
-        let request_allows_reuse = !has_connection_close(request.headers());
         if let Some(processing) = request
             .extensions()
             .get::<super::processing::ProcessingDeadline>()
@@ -267,6 +340,7 @@ impl BackendHttpPool {
         let reusable = request_allows_reuse && response_allows_reuse;
         let lease = ConnectionLease {
             sender: Some(sender),
+            reuse_guard,
             opened_at,
             endpoint,
             pool: Arc::downgrade(&self.inner),
@@ -314,6 +388,7 @@ impl PoolInner {
             if now.duration_since(connection.idle_since) <= self.config.idle_timeout
                 && now.duration_since(connection.opened_at) < self.config.max_connection_lifetime
                 && !connection.sender.is_closed()
+                && relay_reusable(&connection.reuse_guard)
             {
                 return Some(connection);
             }
@@ -327,12 +402,14 @@ impl PoolInner {
         endpoint: &EndpointPool,
         sender: SendRequest<super::server::ProxyBody>,
         opened_at: Instant,
+        reuse_guard: Option<RelayReuseGuard>,
     ) {
         // Serialize the validity check and insertion with invalidation's queue drain.
         let mut idle = endpoint.idle.lock().unwrap();
         if !endpoint.valid.load(Ordering::Acquire)
             || sender.is_closed()
             || opened_at.elapsed() >= self.config.max_connection_lifetime
+            || !relay_reusable(&reuse_guard)
         {
             self.discarded_total.fetch_add(1, Ordering::Relaxed);
             return;
@@ -350,6 +427,7 @@ impl PoolInner {
         }
         idle.push_back(IdleConnection {
             sender,
+            reuse_guard,
             idle_since: Instant::now(),
             opened_at,
         });
@@ -366,6 +444,7 @@ impl PoolInner {
                     && now.duration_since(connection.opened_at)
                         < self.config.max_connection_lifetime
                     && !connection.sender.is_closed()
+                    && relay_reusable(&connection.reuse_guard)
             });
             let removed = before - idle.len();
             if removed > 0 {
@@ -407,6 +486,7 @@ impl PoolInner {
 
 struct ConnectionLease {
     sender: Option<SendRequest<super::server::ProxyBody>>,
+    reuse_guard: Option<RelayReuseGuard>,
     opened_at: Instant,
     endpoint: Arc<EndpointPool>,
     pool: std::sync::Weak<PoolInner>,
@@ -418,7 +498,12 @@ impl ConnectionLease {
     fn finish(mut self, body_complete: bool) {
         if body_complete && self.reusable {
             if let (Some(pool), Some(sender)) = (self.pool.upgrade(), self.sender.take()) {
-                pool.return_idle(&self.endpoint, sender, self.opened_at);
+                pool.return_idle(
+                    &self.endpoint,
+                    sender,
+                    self.opened_at,
+                    self.reuse_guard.take(),
+                );
             }
         } else if let Some(pool) = self.pool.upgrade() {
             pool.discarded_total.fetch_add(1, Ordering::Relaxed);
@@ -499,6 +584,10 @@ pub enum BackendHttpPoolError {
     Request(hyper::Error),
 }
 
+fn relay_reusable(guard: &Option<RelayReuseGuard>) -> bool {
+    guard.as_ref().is_none_or(RelayReuseGuard::is_reusable)
+}
+
 fn has_connection_close(headers: &http::HeaderMap) -> bool {
     headers
         .get_all(header::CONNECTION)
@@ -548,8 +637,163 @@ mod retry_tests {
     use std::convert::Infallible;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn exercise(fail_before_send: bool, reject_admission: bool) {
+    // A real h2 receiver drives GOAWAY into the exact sender used by the guard.
+    async fn physical_guard() -> (
+        super::super::pool::RelayReuseGuard,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client, server) = tokio::io::duplex(8192);
+        let (drain_tx, drain_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server).await.unwrap();
+            tokio::pin!(drain_rx);
+            tokio::select! {
+                _ = &mut drain_rx => connection.graceful_shutdown(),
+                _ = connection.accept() => panic!("unexpected stream"),
+            }
+            while connection.accept().await.is_some() {}
+        });
+        let (sender, connection) = h2::client::handshake(client).await.unwrap();
+        let client = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        (
+            super::super::pool::RelayReuseGuard::new(sender),
+            drain_tx,
+            server,
+            client,
+        )
+    }
+
+    #[tokio::test]
+    async fn goaway_reselects_http_connection_and_never_replays_a_lost_response() {
+        exercise_reselection(false).await;
+    }
+
+    #[tokio::test]
+    async fn reaper_discards_goaway_idle_connections_without_waiting_for_idle_timeout() {
+        exercise_reselection(true).await;
+    }
+
+    async fn exercise_reselection(reap: bool) {
+        let (guard, drain_tx, h2_server, h2_client) = physical_guard().await;
+        let observed_guard = guard.clone();
+        let pool = BackendHttpPool::new(BackendHttpPoolConfig {
+            idle_timeout: Duration::from_secs(600),
+            max_connection_lifetime: Duration::from_secs(600),
+            ..BackendHttpPoolConfig::default()
+        });
+        let (front, incoming) = tokio::io::duplex(8192);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let opens = Arc::new(AtomicUsize::new(0));
+        let service_pool = pool.clone();
+        let service_opens = opens.clone();
+        let service_requests = requests.clone();
+        let task = tokio::spawn(async move {
+            hyper::server::conn::http1::Builder::new().serve_connection(
+                TokioIo::new(incoming), service_fn(move |request| {
+                    let pool = service_pool.clone();
+                    let opens = service_opens.clone();
+                    let requests = service_requests.clone();
+                    let guard = guard.clone();
+                    async move {
+                        let key = BackendHttpPoolKey {
+                            route_revision: 1, relay_address: "relay".into(),
+                            instance_id: "instance".into(), workload_id: "workload".into(),
+                            target_ip: "127.0.0.1".parse().unwrap(), target_port: 8080,
+                        };
+                        let ordinal = requests.fetch_add(1, Ordering::SeqCst);
+                        let result = pool.send_guarded_recoverable(key, request, || async move {
+                            opens.fetch_add(1, Ordering::SeqCst);
+                            let (stream, mut backend) = tokio::io::duplex(8192);
+                            tokio::spawn(async move {
+                                loop {
+                                    let mut bytes = Vec::new();
+                                    while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        let mut byte = [0];
+                                        if backend.read_exact(&mut byte).await.is_err() { return; }
+                                        bytes.push(byte[0]);
+                                    }
+                                    if ordinal > 0 { return; } // Lost response, after sending.
+                                    backend.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await.unwrap();
+                                }
+                            });
+                            Ok(stream)
+                        }, || Ok(()), move |_| (ordinal == 0).then_some(guard), None).await;
+                        match (ordinal, result) {
+                            (0, Ok(response)) => { response.into_body().collect().await.unwrap(); }
+                            (1, Err((BackendHttpPoolError::Request(_), None))) => {}
+                            _ => panic!("unexpected result or replay eligibility"),
+                        }
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+                    }
+                })
+            ).await.unwrap();
+        });
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(front))
+            .await
+            .unwrap();
+        let connection = tokio::spawn(connection);
+        sender
+            .send_request(Request::new(Full::new(Bytes::new())))
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(pool.metrics().idle_connections, 1);
+        drain_tx.send(()).unwrap();
+        // Wait on actual received GOAWAY, not elapsed time or port reachability.
+        timeout(Duration::from_secs(3), async {
+            while observed_guard.is_reusable() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if reap {
+            pool.inner.reap_idle();
+            assert_eq!(pool.metrics().idle_connections, 0);
+        }
+        sender.ready().await.unwrap();
+        sender
+            .send_request(Request::new(Full::new(Bytes::new())))
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.metrics().reused_total, 0);
+        connection.abort();
+        task.abort();
+        h2_server.abort();
+        h2_client.abort();
+    }
+
+    async fn exercise(
+        fail_before_send: bool,
+        reject_admission: bool,
+        goaway_before_send: bool,
+        prepare_timeout: bool,
+    ) {
         let pool = BackendHttpPool::new(BackendHttpPoolConfig::default());
+        let (guard, drain_tx, h2_server, h2_client) = physical_guard().await;
+        if goaway_before_send {
+            drain_tx.send(()).unwrap();
+            timeout(Duration::from_secs(3), async {
+                while guard.is_reusable() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
         let (front, incoming) = tokio::io::duplex(8192);
         let task = tokio::spawn(async move {
             hyper::server::conn::http1::Builder::new()
@@ -557,6 +801,7 @@ mod retry_tests {
                     TokioIo::new(incoming),
                     service_fn(move |request| {
                         let pool = pool.clone();
+                        let guard = guard.clone();
                         async move {
                             let key = BackendHttpPoolKey {
                                 route_revision: 1,
@@ -566,10 +811,31 @@ mod retry_tests {
                                 target_ip: "127.0.0.1".parse().unwrap(),
                                 target_port: 8080,
                             };
+                            let endpoint = pool.inner.endpoint(&key);
+                            let _held = if prepare_timeout {
+                                Some(
+                                    endpoint
+                                        .permits
+                                        .clone()
+                                        .acquire_many_owned(
+                                            u32::try_from(endpoint.permits.available_permits())
+                                                .unwrap(),
+                                        )
+                                        .await
+                                        .unwrap(),
+                                )
+                            } else {
+                                None
+                            };
                             let (stream, mut peer) = tokio::io::duplex(8192);
                             let received = tokio::spawn(async move {
-                                if fail_before_send || reject_admission {
+                                if fail_before_send || reject_admission || prepare_timeout {
                                     return Vec::new();
+                                }
+                                if goaway_before_send {
+                                    let mut all = Vec::new();
+                                    peer.read_to_end(&mut all).await.unwrap();
+                                    return all;
                                 }
                                 let mut all = Vec::new();
                                 let mut chunk = [0u8; 512];
@@ -585,10 +851,14 @@ mod retry_tests {
                                 all
                             });
                             let result = pool
-                                .send_recoverable(
+                                .send_guarded_recoverable(
                                     key,
                                     request,
                                     || async move {
+                                        assert!(
+                                            !prepare_timeout,
+                                            "a saturated pool must time out before opening"
+                                        );
                                         if fail_before_send {
                                             Err(io::Error::other("connect failed"))
                                         } else {
@@ -602,11 +872,26 @@ mod retry_tests {
                                             Ok(())
                                         }
                                     },
+                                    move |_| Some(guard),
+                                    prepare_timeout.then(|| {
+                                        tokio::time::Instant::now() + Duration::from_millis(20)
+                                    }),
                                 )
                                 .await;
                             match result {
-                                Err((BackendHttpPoolError::Connect(_), Some(request)))
-                                    if fail_before_send || reject_admission =>
+                                Err((BackendHttpPoolError::Connect(error), Some(request)))
+                                    if fail_before_send || reject_admission || prepare_timeout =>
+                                {
+                                    if prepare_timeout {
+                                        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                                    }
+                                    assert_eq!(
+                                        request.into_body().collect().await.unwrap().to_bytes(),
+                                        Bytes::from_static(b"one-business-body")
+                                    );
+                                }
+                                Err((BackendHttpPoolError::Closed, Some(request)))
+                                    if goaway_before_send =>
                                 {
                                     assert_eq!(
                                         request.into_body().collect().await.unwrap().to_bytes(),
@@ -614,11 +899,20 @@ mod retry_tests {
                                     );
                                 }
                                 Err((BackendHttpPoolError::Request(_), None))
-                                    if !fail_before_send && !reject_admission => {}
+                                    if !fail_before_send
+                                        && !reject_admission
+                                        && !goaway_before_send => {}
                                 _ => panic!("incorrect replay eligibility"),
                             }
                             let bytes = received.await.unwrap();
-                            if !fail_before_send && !reject_admission {
+                            if goaway_before_send {
+                                assert!(bytes.is_empty(), "business bytes sent after GOAWAY");
+                            }
+                            if !fail_before_send
+                                && !reject_admission
+                                && !goaway_before_send
+                                && !prepare_timeout
+                            {
                                 assert!(bytes.ends_with(b"one-business-body"));
                             }
                             Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
@@ -645,19 +939,31 @@ mod retry_tests {
         drop(sender);
         connection.abort();
         task.abort();
+        h2_server.abort();
+        h2_client.abort();
     }
     #[tokio::test]
     async fn connection_failure_returns_the_unconsumed_business_body() {
-        exercise(true, false).await;
+        exercise(true, false, false, false).await;
     }
     #[tokio::test]
     async fn lost_response_never_returns_a_replayable_business_body() {
-        exercise(false, false).await;
+        exercise(false, false, false, false).await;
     }
 
     #[tokio::test]
     async fn revoked_admission_keeps_the_business_body_unsent() {
-        exercise(false, true).await;
+        exercise(false, true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn goaway_at_final_check_returns_the_entire_unsent_body() {
+        exercise(false, false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn preparation_timeout_while_waiting_for_pool_permit_preserves_the_unsent_body() {
+        exercise(false, false, false, true).await;
     }
 
     #[test]

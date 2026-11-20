@@ -19,6 +19,12 @@ struct NodeAdmin(Arc<AtomicUsize>, Arc<AtomicBool>);
 
 #[tonic::async_trait]
 impl pb::node_admin_service_server::NodeAdminService for NodeAdmin {
+    async fn inspect(
+        &self,
+        _: tonic::Request<pb::AdxletRuntimeInspectRequest>,
+    ) -> Result<tonic::Response<pb::AdxletRuntimeInspection>, tonic::Status> {
+        Err(tonic::Status::unimplemented("drain-only fixture"))
+    }
     async fn drain(
         &self,
         _: tonic::Request<pb::DrainRequest>,

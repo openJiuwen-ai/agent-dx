@@ -282,6 +282,28 @@ mod tests {
     }
 
     #[test]
+    fn single_worker_cannot_select_itself_as_pod_migration_target() {
+        let (stored, point, mut source) = fixture();
+        source.id = stored.assignment.node_id.clone();
+        source.labels.insert("NODE_ID".into(), source.id.clone());
+        source.capacity.cpu_millis *= 2;
+        source.capacity.memory_bytes *= 2;
+        let mut scheduler = Coordinator::new(1, Placement::Pack).unwrap();
+        scheduler.register(source).unwrap();
+        for target in [None, Some("source")] {
+            let request =
+                checkpoint_spec(&stored, Some(&point), None, &BTreeSet::new(), target).unwrap();
+            assert!(scheduler.recovery_candidate(&request).unwrap().is_none());
+        }
+        scheduler.register(fixture().2).unwrap();
+        let request = checkpoint_spec(&stored, Some(&point), None, &BTreeSet::new(), None).unwrap();
+        assert_eq!(
+            scheduler.recovery_candidate(&request).unwrap().as_deref(),
+            Some("target")
+        );
+    }
+
+    #[test]
     fn checkpoint_filters_use_captured_backend_and_runtime_evidence() {
         let (stored, mut point, mut target) = fixture();
         let request = checkpoint_spec(&stored, Some(&point), None, &BTreeSet::new(), None).unwrap();

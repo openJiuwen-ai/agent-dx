@@ -519,6 +519,7 @@ impl Services {
 }
 
 type EnvironmentDirectory = BTreeMap<String, (EnvironmentSpec, Assignment, EnvironmentHandle)>;
+mod process_upgrade;
 type AuthorityTasks = BTreeMap<
     (String, Option<String>),
     tokio::sync::oneshot::Receiver<Result<controller::AuthorityResult>>,
@@ -526,6 +527,7 @@ type AuthorityTasks = BTreeMap<
 
 #[derive(Clone)]
 pub struct Adxlet {
+    process_transition: Arc<tokio::sync::Mutex<()>>,
     node_id: String,
     local_holds: Arc<Mutex<BTreeMap<String, local::LocalHold>>>,
     draining: Arc<std::sync::atomic::AtomicBool>,
@@ -537,6 +539,8 @@ pub struct Adxlet {
     /// Set once at startup when node pressure sampling is configured; the
     /// metrics gauge family exists exactly when this is set.
     pressure_configured: Arc<std::sync::atomic::AtomicBool>,
+    // Services.upgrade fixes the session for this manager's lifetime.
+    registration_acknowledged: Arc<std::sync::atomic::AtomicBool>,
     retired_environments: Arc<Mutex<BTreeMap<String, RetiredEnvironment>>>,
     services: Arc<Services>,
     environments: Arc<Mutex<EnvironmentDirectory>>,
@@ -562,6 +566,7 @@ impl Adxlet {
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self {
             node_id,
+            process_transition: Arc::default(),
             local_holds: Arc::default(),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stopping: stopping.clone(),
@@ -570,6 +575,7 @@ impl Adxlet {
             authority_reconciling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authority_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pressure_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            registration_acknowledged: Arc::default(),
             retired_environments: Arc::default(),
             services: Arc::new(Services {
                 runtime,

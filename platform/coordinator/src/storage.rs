@@ -26,9 +26,13 @@ pub use recovery::{LegacyCheckpointProof, LegacyCheckpointProofs};
 mod checkpoint_contention_tests;
 mod resume;
 pub(crate) use resume::ResumeAdmission;
+mod process_upgrade;
 mod snapshot_preparation;
 mod snapshots;
 mod upgrade;
+pub(crate) use process_upgrade::{
+    MaintenanceOwner, MaintenanceRelease, NodeMaintenance, SessionReplacement,
+};
 mod volumes;
 use crate::Node;
 use adx_core::{
@@ -49,7 +53,7 @@ use tokio::{
     sync::{broadcast, Mutex},
     time::timeout,
 };
-pub use upgrade::{UpgradeNode, UpgradeOperation, UpgradeTask};
+pub use upgrade::{UpgradeNode, UpgradeOperation, UpgradeTask, UpgradeTaskKind};
 pub(crate) use volumes::has_volumes;
 pub use volumes::{
     AuthorizedExecution, Initialization, InitializationAction, InitializationOwner, StoredVolume,
@@ -87,6 +91,8 @@ local facts = cjson.decode(ARGV[7])
 if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
 if (redis.call('HGET',KEYS[3],facts[4]) or '') ~= facts[5] then return 0 end
 local cleanup_cursor=13 + 2 * tonumber(ARGV[12])
+local session_cursor=cleanup_cursor+2
+if ARGV[session_cursor] ~= '' and redis.call('HGET',KEYS[1],ARGV[session_cursor]) ~= ARGV[session_cursor+1] then return 0 end
 if ARGV[cleanup_cursor] ~= '' and redis.call('HEXISTS',KEYS[6],ARGV[cleanup_cursor]) ~= 0 then return 2 end
 redis.call('SET', KEYS[2], ARGV[5], 'PX', ARGV[6])
 redis.call('HSET',KEYS[3],facts[4],facts[6])
@@ -218,6 +224,49 @@ pub struct UpgradePause {
     pub task_id: String,
     pub epoch: u64,
     pub original_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_hold: Option<process_upgrade::RouteHold>,
+}
+
+impl StoredNode {
+    pub(crate) fn route_eligible(&self, environment: &StoredEnvironment) -> bool {
+        let Some(record) = &environment.result else {
+            return false;
+        };
+        if environment.invalidated
+            || record.assignment != environment.assignment
+            || record.assignment.node_id != self.node.id
+            || record.state != EnvironmentState::Running
+            || environment
+                .volume_execution
+                .as_ref()
+                .is_some_and(|execution| {
+                    execution.released || execution.runtime_id != record.runtime.id
+                })
+        {
+            return false;
+        }
+        if self.session.as_ref().is_none_or(|session| session.routable) {
+            return true;
+        }
+        self.upgrade_pause
+            .as_ref()
+            .and_then(|pause| pause.route_hold.as_ref())
+            .is_some_and(|hold| {
+                self.scheduling_paused
+                    && self.retirement.is_none()
+                    && !record.restart_pending
+                    && record.resources_held
+                    && hold.relay_address == self.proxy_address
+                    && hold.routes.get(&record.spec.id).is_some_and(|route| {
+                        route.matches(
+                            record.assignment.generation,
+                            &record.runtime.id,
+                            record.runtime.ip,
+                        )
+                    })
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,6 +542,22 @@ impl StoredSnapshot {
             {
                 return Err(Error::Conflict);
             }
+            if let Some(hold) = n
+                .upgrade_pause
+                .as_ref()
+                .and_then(|pause| pause.route_hold.as_ref())
+            {
+                if !n.scheduling_paused
+                    || n.retirement.is_some()
+                    || hold.relay_address != n.proxy_address
+                    || hold.routes.iter().any(|(id, route)| {
+                        route.generation == 0
+                            || !adx_core::valid_runtime_id(id, route.generation, &route.runtime_id)
+                    })
+                {
+                    return Err(Error::Conflict);
+                }
+            }
         }
         for (id, i) in &self.environments {
             i.validate()?;
@@ -519,16 +584,7 @@ impl StoredSnapshot {
             .filter_map(|i| {
                 i.result
                     .as_ref()
-                    .filter(|r| {
-                        r.state == EnvironmentState::Running
-                            && i.volume_execution.as_ref().is_none_or(|execution| {
-                                !execution.released && execution.runtime_id == r.runtime.id
-                            })
-                            && self.nodes[&r.assignment.node_id]
-                                .session
-                                .as_ref()
-                                .is_none_or(|s| s.routable)
-                    })
+                    .filter(|r| self.nodes[&r.assignment.node_id].route_eligible(i))
                     .map(|r| Route {
                         environment_id: r.spec.id.clone(),
                         node_id: r.assignment.node_id.clone(),
@@ -990,14 +1046,14 @@ impl RedisStore {
     }
     async fn retire_environment_with_cleanup(
         &self,
-        expected: (&str, &str),
+        expected: (&str, &str, Option<(&str, &str)>),
         header: &Header,
         receipt: &DeletedReceipt,
         counters: &CounterUpdate,
         catalog: Option<&volumes::Catalog>,
         cleanup: Option<&adx_core::CheckpointCleanup>,
     ) -> Result<bool> {
-        let (expected_header, expected_environment) = expected;
+        let (expected_header, expected_environment, session) = expected;
         let field = format!("environment:{}", receipt.environment_id);
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(RETIRE_ENVIRONMENT)
@@ -1030,6 +1086,11 @@ impl RedisStore {
         }
         if let Some(task) = cleanup {
             cmd.arg(task.id()).arg(encode(task)?);
+        } else {
+            cmd.arg("").arg("");
+        }
+        if let Some((field, token)) = session {
+            cmd.arg(field).arg(token);
         } else {
             cmd.arg("").arg("");
         }
@@ -1242,6 +1303,10 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
             out.environments.insert(id.into(), decode(value)?);
         } else if key == UPGRADE {
             decode::<UpgradeTask>(value)?.validate()?;
+        } else if key.starts_with("process-upgrade:") {
+            decode::<NodeMaintenance>(value)?.validate_metadata_key(key)?;
+        } else if key.starts_with("process-release:") {
+            decode::<MaintenanceRelease>(value)?.validate_metadata_key(key)?;
         } else if key != HEADER
             && key != "epoch"
             && key != "claim-fence"
@@ -1615,6 +1680,23 @@ impl Session {
         if address.trim().is_empty() || proxy_address.trim().is_empty() {
             return Err(Error::Invalid("node addresses required".into()));
         }
+        let protected = self
+            .guard_process_registration(&node.id, session.as_ref().map_or("", |s| s.id.as_str()))
+            .await?;
+        let departed_field = node_retirement::departure_field(
+            &node.id,
+            session.as_ref().map_or("", |s| s.id.as_str()),
+        );
+        let [departed] = self.store.fields([departed_field]).await?;
+        if departed.is_some() {
+            return Err(Error::Conflict);
+        }
+        if protected {
+            let saved = self.get_node(&node.id).await?;
+            if saved.address != address || saved.proxy_address != proxy_address {
+                return Err(Error::Conflict);
+            }
+        }
         let cached = self
             .store
             .connection
@@ -1623,7 +1705,7 @@ impl Session {
             .expect("node overlay lock poisoned")
             .get(&node.id)
             .cloned();
-        if let Some(previous) = cached {
+        if let Some(previous) = cached.filter(|_| !protected) {
             if previous.retirement.as_ref().is_some_and(|r| r.unregistered)
                 && previous.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id)
             {
@@ -1678,20 +1760,40 @@ impl Session {
                 &node.id,
                 session.as_ref().map_or("", |s| s.id.as_str()),
             );
-            let [header_value, node_value, retired_value, departed, upgrade_value] = self
-                .store
-                .fields([
-                    HEADER.into(),
-                    field.clone(),
-                    retired_field.clone(),
-                    departed_field,
-                    UPGRADE.into(),
-                ])
-                .await?;
+            let marker_field = format!("process-upgrade:{}", node.id);
+            let token_field = format!("node-session:{}", node.id);
+            let [header_value, node_value, retired_value, departed, upgrade_value, marker_value, token_value] =
+                self.store
+                    .fields([
+                        HEADER.into(),
+                        field.clone(),
+                        retired_field.clone(),
+                        departed_field,
+                        UPGRADE.into(),
+                        marker_field.clone(),
+                        token_field.clone(),
+                    ])
+                    .await?;
             if departed.is_some() {
                 return Err(Error::Conflict);
             }
             let header = self.header(&header_value)?;
+            if let Some(marker) = marker_value.as_deref() {
+                let marker: NodeMaintenance = decode(marker)?;
+                marker.registration_session(
+                    &node.id,
+                    session.as_ref().map_or("", |s| s.id.as_str()),
+                    token_value.as_deref(),
+                )?;
+                if token_value.is_none() && session.as_ref().is_none_or(|session| session.routable)
+                {
+                    return Err(Error::Conflict);
+                }
+                let previous: StoredNode = decode(node_value.as_deref().ok_or(Error::Conflict)?)?;
+                if previous.address != address || previous.proxy_address != proxy_address {
+                    return Err(Error::Conflict);
+                }
+            }
             let upgrade = upgrade_value
                 .as_deref()
                 .map(decode::<UpgradeTask>)
@@ -1731,7 +1833,8 @@ impl Session {
                         previous.node.labels.get(NODE_HOST_UUID_LABEL),
                     );
                 }
-                if previous.address == address
+                if marker_value.is_none()
+                    && previous.address == address
                     && previous.proxy_address == proxy_address
                     && previous.session.as_ref().map(|s| &s.id) == session.as_ref().map(|s| &s.id)
                 {
@@ -1816,6 +1919,7 @@ impl Session {
                         task_id: task.task_id.clone(),
                         epoch: task.epoch,
                         original_paused,
+                        route_hold: None,
                     });
                 }
             }
@@ -1853,7 +1957,7 @@ impl Session {
                 upgrade_pause,
             };
             let encoded = encode(&record)?;
-            if node_value.as_ref() == Some(&encoded) {
+            if marker_value.is_none() && node_value.as_ref() == Some(&encoded) {
                 self.observe_node(record.clone());
                 return Ok(record);
             }
@@ -1895,7 +1999,11 @@ impl Session {
                         &fields,
                         &catalog,
                         None,
-                        &[(UPGRADE.into(), upgrade_value.clone())],
+                        &[
+                            (UPGRADE.into(), upgrade_value.clone()),
+                            (marker_field.clone(), marker_value.clone()),
+                            (token_field.clone(), token_value.clone()),
+                        ],
                     ))
                     .await?
                 }
@@ -1907,6 +2015,8 @@ impl Session {
                         &[
                             (UPGRADE.into(), upgrade_value.clone()),
                             (HEADER.into(), header_value.clone()),
+                            (marker_field.clone(), marker_value.clone()),
+                            (token_field.clone(), token_value.clone()),
                         ],
                     ))
                     .await?
@@ -1984,10 +2094,16 @@ impl Session {
             return Err(Error::Invalid("node id required".into()));
         }
         let field = format!("node:{id}");
+        let marker_field = format!("process-upgrade:{id}");
         for _ in 0..ATTEMPTS {
-            let [header_value, node_value, upgrade_value] = self
+            let [header_value, node_value, upgrade_value, marker_value] = self
                 .store
-                .fields([HEADER.into(), field.clone(), UPGRADE.into()])
+                .fields([
+                    HEADER.into(),
+                    field.clone(),
+                    UPGRADE.into(),
+                    marker_field.clone(),
+                ])
                 .await?;
             let header = self.header(&header_value)?;
             let upgrade = upgrade_value
@@ -2021,12 +2137,29 @@ impl Session {
                     task_id: task_id.into(),
                     epoch,
                     original_paused,
+                    route_hold: record
+                        .upgrade_pause
+                        .as_ref()
+                        .and_then(|pause| pause.route_hold.clone()),
                 });
                 record.scheduling_paused = paused || original_paused;
                 record.node.available = !record.scheduling_paused;
             } else if let Some(marker) = &mut record.upgrade_pause {
-                let task = upgrade.as_ref().ok_or(Error::Conflict)?;
-                task.fence(&marker.task_id, marker.epoch)?;
+                // Process maintenance owns the pause through its per-node marker,
+                // not the PodUpgrade task; either owner retains admin intent.
+                let process_owned = marker_value
+                    .as_deref()
+                    .map(decode::<NodeMaintenance>)
+                    .transpose()?
+                    .is_some_and(|process| {
+                        process.owner.node_id == id
+                            && process.owner.local_task_id == marker.task_id
+                            && process.owner.epoch == marker.epoch
+                    });
+                if !process_owned {
+                    let task = upgrade.as_ref().ok_or(Error::Conflict)?;
+                    task.fence(&marker.task_id, marker.epoch)?;
+                }
                 marker.original_paused = paused;
                 record.scheduling_paused = true;
                 record.node.available = false;
@@ -2044,6 +2177,7 @@ impl Session {
                 &[
                     (UPGRADE.into(), upgrade_value.clone()),
                     (HEADER.into(), header_value.clone()),
+                    (marker_field.clone(), marker_value.clone()),
                 ],
             ))
             .await?
@@ -2364,8 +2498,26 @@ impl Session {
         }
         let field = format!("environment:{}", result.spec.id);
         for _ in 0..ATTEMPTS {
-            let [header_value, environment_value] =
-                self.store.fields([HEADER.into(), field.clone()]).await?;
+            let token_field = format!("node-session:{}", result.assignment.node_id);
+            let [header_value, environment_value, token_value] = self
+                .store
+                .fields([HEADER.into(), field.clone(), token_field.clone()])
+                .await?;
+            let marker_field = format!("process-upgrade:{}", result.assignment.node_id);
+            let [marker_value] = self.store.fields([marker_field.clone()]).await?;
+            if let Some(marker) = marker_value.as_deref() {
+                let marker: NodeMaintenance = decode(marker)?;
+                marker.validate()?;
+            }
+            let mut session_check = if !session.is_empty() {
+                if token_value.as_deref() != Some(session) {
+                    return Err(Error::Conflict);
+                }
+                vec![(token_field.clone(), Some(session.to_owned()))]
+            } else {
+                vec![]
+            };
+            session_check.push((marker_field, marker_value));
             let mut counters = CounterUpdate::load(&self.store, field.clone()).await?;
             let mut header = self.header(&header_value)?;
             let Some(environment_value) = environment_value.as_deref() else {
@@ -2448,6 +2600,7 @@ impl Session {
                         (
                             header_value.as_deref().ok_or(Error::Conflict)?,
                             environment_value,
+                            (!session.is_empty()).then_some((token_field.as_str(), session)),
                         ),
                         &header,
                         &DeletedReceipt::from_result(&result, cleanup_artifacts)?,
@@ -2457,12 +2610,13 @@ impl Session {
                     )
                     .await?
             } else {
-                self.assignment_cas(
+                self.assignment_cas_checked(
                     &header,
                     Some(environment_value),
                     &stored_environment,
                     catalog.as_ref(),
                     Some(&counters),
+                    &session_check,
                 )
                 .await?
             };

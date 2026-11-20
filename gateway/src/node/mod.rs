@@ -16,4 +16,6 @@ pub use server::{serve_connection, Relay};
 #[cfg(feature = "activity-client")]
 pub mod service;
 #[cfg(feature = "activity-client")]
+pub(crate) mod upgrade;
+#[cfg(feature = "activity-client")]
 pub use service::RelayService;

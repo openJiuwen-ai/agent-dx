@@ -47,6 +47,12 @@ impl Session {
                 .get(UPGRADE)
                 .map(|value| decode::<UpgradeTask>(value))
                 .transpose()?;
+            let marker_field = format!("process-upgrade:{id}");
+            if let Some(marker) = raw.get(&marker_field) {
+                let marker: NodeMaintenance = decode(marker)?;
+                marker.validate()?;
+                return Ok(false);
+            }
             if upgrade.as_ref().is_some_and(UpgradeTask::active) {
                 return Ok(false);
             }
@@ -88,6 +94,7 @@ impl Session {
                 if redis.call('HGET',KEYS[1],ARGV[2]) ~= ARGV[3] then return 0 end
                 if (redis.call('HGET',KEYS[1],ARGV[4]) or '') ~= ARGV[5] then return 0 end
                 if (redis.call('HGET',KEYS[1],'node-upgrade') or '') ~= ARGV[9] then return 0 end
+                if redis.call('HEXISTS',KEYS[1],'process-upgrade:' .. ARGV[6]) ~= 0 then return 0 end
                 local facts=cjson.decode(ARGV[8])
                 if (redis.call('HGET',KEYS[2],facts[1]) or '') ~= facts[2] then return 0 end
                 if (redis.call('HGET',KEYS[2],facts[4]) or '') ~= facts[5] then return 0 end
@@ -148,7 +155,14 @@ impl Session {
                 return Err(Error::Conflict);
             }
         }
-        let [header, upgrade_value] = self.store.fields([HEADER.into(), UPGRADE.into()]).await?;
+        let marker_field = format!("process-upgrade:{}", node.id);
+        let [header, upgrade_value, marker] = self
+            .store
+            .fields([HEADER.into(), UPGRADE.into(), marker_field])
+            .await?;
+        if marker.is_some() {
+            return Err(Error::Conflict);
+        }
         let mut next_header = self.header(&header)?;
         next_header.advance()?;
         let upgrade = upgrade_value
@@ -163,6 +177,7 @@ impl Session {
                     .upgrade_pause
                     .as_ref()
                     .map_or(retired.scheduling_paused, |owner| owner.original_paused),
+                route_hold: None,
             }),
             None => retired.upgrade_pause.clone(),
         };
@@ -204,6 +219,7 @@ impl Session {
             if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
             if (redis.call('HGET',KEYS[1],'node-upgrade') or '') ~= ARGV[6] then return 0 end
             if redis.call('HGET',KEYS[1],'header') ~= ARGV[7] then return 0 end
+            if redis.call('HEXISTS',KEYS[1],'process-upgrade:' .. ARGV[2]) ~= 0 then return 0 end
             if redis.call('HEXISTS',KEYS[1],'node:' .. ARGV[2]) ~= 0 then return 0 end
             if redis.call('HGET',KEYS[1],'retired-node:' .. ARGV[2]) ~= ARGV[3] then return 0 end
             redis.call('HSET',KEYS[1],'node:' .. ARGV[2],ARGV[4])

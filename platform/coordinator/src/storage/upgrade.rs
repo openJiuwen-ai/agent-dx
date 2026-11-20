@@ -48,14 +48,25 @@ impl UpgradeOperation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeTaskKind {
+    #[default]
+    Pod,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(try_from = "UpgradeTaskWire")]
 pub struct UpgradeTask {
+    pub kind: UpgradeTaskKind,
     pub protocol_version: u32,
     pub task_id: String,
     pub epoch: u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub namespace: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub daemonset_uid: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub target_image: String,
     pub revision: u64,
     pub phase: String,
@@ -68,6 +79,7 @@ pub struct UpgradeTask {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct UpgradeTaskWire {
+    kind: UpgradeTaskKind,
     protocol_version: u32,
     task_id: String,
     epoch: u64,
@@ -107,6 +119,7 @@ impl TryFrom<UpgradeTaskWire> for UpgradeTask {
             }
         }
         Ok(Self {
+            kind: value.kind,
             protocol_version: value.protocol_version,
             task_id: value.task_id,
             epoch: value.epoch,
@@ -223,15 +236,9 @@ impl Session {
         for _ in 0..ATTEMPTS {
             // Registration can add isolation after the last release RPC. Read
             // every node with the same header that fences the terminal write.
-            let terminal = if task.active() {
-                None
-            } else {
-                Some(self.store.raw().await?)
-            };
-            let [raw, value] = match &terminal {
-                Some(values) => [values.get(HEADER).cloned(), values.get(UPGRADE).cloned()],
-                None => self.store.fields([HEADER.into(), UPGRADE.into()]).await?,
-            };
+            let inventory = self.store.raw().await?;
+            let raw = inventory.get(HEADER).cloned();
+            let value = inventory.get(UPGRADE).cloned();
             let header = self.header(&raw)?;
             let previous = value.as_deref().map(decode::<UpgradeTask>).transpose()?;
             if let Some(old) = previous.as_ref().filter(|old| {
@@ -249,6 +256,30 @@ impl Session {
                 _ => return Err(Error::Conflict),
             }
             let mut checks = vec![(HEADER.into(), raw.clone())];
+            if task.active() {
+                if inventory
+                    .keys()
+                    .any(|field| field.starts_with("process-upgrade:"))
+                {
+                    return Err(Error::Conflict);
+                }
+                // Begin and source additions share the same Header fence as
+                // per-node maintenance preparation, including absent markers.
+                for id in task.nodes.keys() {
+                    let marker = format!("process-upgrade:{id}");
+                    let node_field = format!("node:{id}");
+                    if let Some(value) = inventory.get(&node_field) {
+                        let node: StoredNode = decode(value)?;
+                        if node.upgrade_pause.as_ref().is_some_and(|pause| {
+                            pause.task_id != task.task_id || pause.epoch != task.epoch
+                        }) {
+                            return Err(Error::Conflict);
+                        }
+                    }
+                    checks.push((marker, None));
+                    checks.push((node_field.clone(), inventory.get(&node_field).cloned()));
+                }
+            }
             let old_active = previous.as_ref().filter(|old| old.active());
             let new_fence = task.active()
                 && (task.nodes.iter().any(|(id, node)| {
@@ -292,7 +323,8 @@ impl Session {
                     }
                 }
             }
-            if let Some(values) = terminal {
+            if !task.active() {
+                let values = &inventory;
                 checks.extend(
                     values
                         .iter()

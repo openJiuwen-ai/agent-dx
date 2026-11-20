@@ -35,6 +35,26 @@ service CoordinatorService {
   rpc CommitEnvironment(CommitEnvironmentRequest) returns (CommitEnvironmentResponse);
 }
 
+service NodeHandoffService {
+  rpc Yield(YieldNodeSessionRequest) returns (NodeHandoffState);
+  rpc QueryRelease(MaintenanceReleaseRequest) returns (MaintenanceReleaseReceipt);
+}
+message MaintenanceOwner {
+  string node_id = 1;
+  string rollout_id = 2;
+  string local_task_id = 3;
+  uint64 epoch = 4;
+}
+message YieldNodeSessionRequest { MaintenanceOwner owner = 1; string expected_session = 2; }
+message NodeHandoffState {
+  MaintenanceOwner owner = 1;
+  string origin_session = 2;
+  string current_session = 3;
+  bool yielded = 4;
+}
+message MaintenanceReleaseRequest { MaintenanceOwner owner = 1; string node_session = 2; }
+message MaintenanceReleaseReceipt { MaintenanceOwner owner = 1; string node_session = 2; }
+
 message GetEnvironmentControlRequest { string id = 1; CallerContext caller = 2; }
 message BatchGetEnvironmentControlRequest { repeated string ids = 1; CallerContext caller = 2; }
 message BatchGetEnvironmentControlResponse { repeated EnvironmentControlRecord records = 1; }
@@ -159,6 +179,7 @@ enum NodePressureDisposition {
   NODE_PRESSURE_DISPOSITION_NONE = 0;
   NODE_PRESSURE_DISPOSITION_LOCAL = 1;
   NODE_PRESSURE_DISPOSITION_RELOCATION = 2;
+
 }
 
 message StorageMount {
@@ -338,6 +359,8 @@ message NodeUpgradeControl {
   repeated NodeUpgradeGrant grants = 6;
 }
 message NodeUpgradeInspectRequest {
+  // Field 5 carried the removed gRPC process preflight request.
+  reserved 5;
   string task_id = 1;
   uint64 epoch = 2;
   string node_session_id = 3;
@@ -345,7 +368,17 @@ message NodeUpgradeInspectRequest {
 }
 message WakeNodeReconciliationRequest { string node_session_id = 1; }
 message WakeNodeReconciliationResponse {}
+message ProcessPreflightRequest {
+  string rollout_id = 1;
+  string local_task_id = 2;
+  uint64 epoch = 3;
+  string old_relay_session = 4;
+}
 message NodeUpgradeInspection {
+  // Actual startup Pod identity from Downward API; empty means unknown.
+  string observed_pod_uid = 19;
+  // Field 18 carried the removed gRPC process preflight evidence.
+  reserved 18;
   string task_id = 1;
   uint64 epoch = 2;
   string node_session_id = 3;

@@ -252,7 +252,11 @@ pub async fn serve(listener: TcpListener, coordinator: CoordinatorRpc) -> std::i
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let coordinator = coordinator.clone();
                 async move {
-                    let result = if request.uri().path().starts_with("/v1/node-upgrades/") {
+                    let result = if request.uri().path().starts_with("/v1/node-upgrades/")
+                        || matches!(
+                            request.uri().path(),
+                            "/v1/adxlet-process-upgrades" | "/v1/adxlet-process-upgrades/query"
+                        ) {
                         let (parts, body) = request.into_parts();
                         match Limited::new(body, 65_536).collect().await {
                             Ok(body) => match serde_json::from_slice::<Value>(&body.to_bytes())

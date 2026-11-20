@@ -74,6 +74,17 @@ struct RouteBinding {
 }
 
 impl Relay {
+    pub(crate) fn has_quiescing_routes(&self) -> io::Result<bool> {
+        for shard in self.route_shards.iter() {
+            let routes = shard
+                .read()
+                .map_err(|_| io::Error::other("route registry unavailable"))?;
+            if routes.values().any(|binding| binding.quiescing) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     /// Serialize the idle check and admission closure with stream registration.
     pub fn set_environment_admission(
         &self,

@@ -3,6 +3,7 @@ mod admission;
 mod checkpoint_cleanup;
 mod envd;
 mod environment_control;
+pub mod process_bootstrap;
 pub use admission::{scheduling_deadline, scheduling_failure};
 mod runtime_profile;
 mod snapshots;

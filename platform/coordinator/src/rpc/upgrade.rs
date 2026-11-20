@@ -93,6 +93,7 @@ fn replacement_binding(
 
 fn evidence(i: &pb::NodeUpgradeInspection, node: Option<&UpgradeNode>, id: &str) -> Value {
     json!({"task_id":i.task_id,"epoch":i.epoch,"node_id":id,
+        "observed_pod_uid":i.observed_pod_uid,
         "node_session_id":i.node_session_id,"pod_uid":node.map(|n| &n.pod_uid),"revision":i.revision,
         "phase":if i.phase=="quiescing" {"Quiescing"} else {i.phase.as_str()},
         "controllers":i.controllers,"holds":i.holds,"backends":i.backends,
@@ -117,6 +118,27 @@ async fn wake_reconciliation(
     request.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
     // The periodic comparison remains authoritative if an old or busy node cannot be woken.
     let _ = tokio::time::timeout_at(deadline, client.wake_node_reconciliation(request)).await;
+}
+
+#[cfg(test)]
+#[test]
+fn evidence_keeps_observed_pod_identity_separate_from_task_binding() {
+    let node = UpgradeNode {
+        pod_uid: "task-pod".into(),
+        ..Default::default()
+    };
+    let mut inspection = pb::NodeUpgradeInspection {
+        observed_pod_uid: "actual-pod".into(),
+        ..Default::default()
+    };
+    let view = evidence(&inspection, Some(&node), "node");
+    assert_eq!(view["pod_uid"], "task-pod");
+    assert_eq!(view["observed_pod_uid"], "actual-pod");
+    inspection.observed_pod_uid.clear();
+    assert_eq!(
+        evidence(&inspection, Some(&node), "node")["observed_pod_uid"],
+        ""
+    );
 }
 
 impl CoordinatorRpc {
@@ -294,6 +316,24 @@ impl CoordinatorRpc {
     ) -> RpcFuture<'a, Value> {
         // Construct the large dispatch future outside the caller's poll frame.
         Box::pin(async move {
+            if method == hyper::Method::POST {
+                match path {
+                    "/v1/adxlet-process-upgrades/query" => {
+                        return self.query_process_maintenance(body).await;
+                    }
+                    "/v1/adxlet-process-upgrades" => {
+                        let _owner = self.0.upgrade_lock.lock().await;
+                        let mut body = body;
+                        let action = body.as_object_mut().and_then(|body| body.remove("action"));
+                        return match action.as_ref().and_then(Value::as_str) {
+                            Some("prepare") => self.prepare_process_maintenance(body).await,
+                            Some("release") => self.release_process_maintenance(body).await,
+                            _ => Err(Error::Invalid("prepare or release action required".into())),
+                        };
+                    }
+                    _ => {}
+                }
+            }
             let suffix = path
                 .strip_prefix("/v1/node-upgrades/")
                 .ok_or(Error::NotFound)?;
@@ -483,6 +523,15 @@ impl CoordinatorRpc {
                     // particular, retain any new permit not yet confirmed for DELETE.
                 }
                 "verify-node" => {
+                    let cleanup = task.phase == "Aborting" && request.rollback;
+                    if cleanup
+                        && task
+                            .operations
+                            .values()
+                            .any(|operation| !operation.settled())
+                    {
+                        return Err(Error::Conflict);
+                    }
                     self.bind_node(&mut task, &request, false).await?;
                     let target = self.upgrade_node(&request.node_id).await?;
                     let inspection = self.node_view(&target, "").await?;
@@ -496,17 +545,18 @@ impl CoordinatorRpc {
                         || scope.is_none_or(|scope| {
                             scope.is_empty() || !target.checkpoint_scopes.contains(scope)
                         })
-                        || target.node.labels.get("ADX_RECOVERY_ROOTFS_SHA256")
-                            != Some(&inspection.runtime_rootfs_sha256)
-                        || target.node.labels.get("ADX_RECOVERY_ROOTFS_PATH")
-                            != Some(&inspection.runtime_rootfs_path)
-                        || !target.node.runtime_classes.iter().any(|runtime| {
-                            crate::storage::recovery_profile_requirements(
-                                runtime,
-                                &target.node.labels,
-                            )
-                            .is_ok()
-                        })
+                        || (!cleanup
+                            && (target.node.labels.get("ADX_RECOVERY_ROOTFS_SHA256")
+                                != Some(&inspection.runtime_rootfs_sha256)
+                                || target.node.labels.get("ADX_RECOVERY_ROOTFS_PATH")
+                                    != Some(&inspection.runtime_rootfs_path)
+                                || !target.node.runtime_classes.iter().any(|runtime| {
+                                    crate::storage::recovery_profile_requirements(
+                                        runtime,
+                                        &target.node.labels,
+                                    )
+                                    .is_ok()
+                                })))
                     {
                         return Err(Error::Invalid(
                             "node recovery capabilities are unavailable or unverified".into(),
@@ -823,6 +873,7 @@ impl CoordinatorRpc {
             }
         }
         let task = UpgradeTask {
+            kind: crate::storage::UpgradeTaskKind::Pod,
             protocol_version: 3,
             task_id: request.task_id,
             epoch: request.epoch,
