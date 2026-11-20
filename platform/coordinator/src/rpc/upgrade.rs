@@ -1436,11 +1436,15 @@ impl CoordinatorRpc {
         let published = local.durability == pb::Durability::Published as i32;
         let local: EnvironmentRecord = local.record.ok_or(Error::Conflict)?.try_into()?;
         let operation_id = format!("task:{}:{id}", task.task_id);
-        let resumed = |r: &EnvironmentRecord| {
+        let running = |r: &EnvironmentRecord| {
             r.assignment == stored.assignment
                 && r.state == EnvironmentState::Running
                 && r.resources_held
                 && r.runtime.ip.is_some()
+                && !r.restart_pending
+        };
+        let resumed = |r: &EnvironmentRecord| {
+            running(r)
                 && r.last_operation.as_ref().is_some_and(|receipt| {
                     receipt.id == operation_id && receipt.kind == adx_core::LifecycleKind::Resume
                 })
@@ -1462,7 +1466,9 @@ impl CoordinatorRpc {
                 return Err(Error::Conflict);
             }
             record.clone()
-        } else if published && &local == record && resumed(record) {
+        } else if published && &local == record && running(record) {
+            // A later user operation may have already replaced the Resume
+            // receipt. The original execution is serving and transfer is fenced.
             record.clone()
         } else {
             // A same-operation restore may pin its checkpoint before the

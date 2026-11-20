@@ -291,24 +291,37 @@ async fn take_target_capacity(rig: &Rig) {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn drain_defers_and_resumes_source_when_reselection_finds_no_target() {
-    drain_capacity_loss(false, None).await;
+    drain_capacity_loss(DrainCapacityLoss::LocalCapacity).await;
 }
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn drain_defers_and_resumes_source_when_a_pinned_claim_cannot_dispatch() {
-    drain_capacity_loss(true, None).await;
+    drain_capacity_loss(DrainCapacityLoss::Pinned).await;
 }
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn drain_deferral_retries_a_restore_input_with_unconfirmed_publication() {
     for commit_first in [false, true] {
-        drain_capacity_loss(false, Some(commit_first)).await;
+        drain_capacity_loss(DrainCapacityLoss::InputAck { commit_first }).await;
     }
 }
 
-async fn drain_capacity_loss(pinned: bool, lost_input_ack: Option<bool>) {
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn drain_deferral_accepts_a_later_user_operation_after_published_restore() {
+    drain_capacity_loss(DrainCapacityLoss::ResultAck).await;
+}
+
+enum DrainCapacityLoss {
+    Pinned,
+    LocalCapacity,
+    InputAck { commit_first: bool },
+    ResultAck,
+}
+
+async fn drain_capacity_loss(fault: DrainCapacityLoss) {
     let rig = Rig::new(Duration::from_secs(4)).await;
     let running = rig.resume(false).await.unwrap().record.unwrap();
     let original = running.assignment.unwrap();
@@ -319,7 +332,7 @@ async fn drain_capacity_loss(pinned: bool, lost_input_ack: Option<bool>) {
         "environment_id":"sleep", "expected_source_generation":original.generation,
         "expected_source_revision":running.revision, "checkpoint_storage_alias":"obs"
     });
-    if pinned {
+    if matches!(fault, DrainCapacityLoss::Pinned) {
         migrate["target_node_id"] = json!("b");
     }
     let gate = Arc::new(Notify::new());
@@ -335,7 +348,7 @@ async fn drain_capacity_loss(pinned: bool, lost_input_ack: Option<bool>) {
     .unwrap();
     take_target_capacity(&rig).await;
     let period = Duration::from_secs(60);
-    let reply = if pinned {
+    let reply = if matches!(fault, DrainCapacityLoss::Pinned) {
         gate.notify_one();
         let (status, reply) = timeout(Duration::from_secs(6), migration)
             .await
@@ -343,7 +356,7 @@ async fn drain_capacity_loss(pinned: bool, lost_input_ack: Option<bool>) {
             .unwrap();
         assert_eq!(status, 200, "{reply}");
         Some(reply)
-    } else if let Some(commit_first) = lost_input_ack {
+    } else if let DrainCapacityLoss::InputAck { commit_first } = fault {
         // Fail the input-pin acknowledgement before the backend is invoked,
         // with and without the input becoming durable on the Coordinator.
         *rig.source.backend.restore_input_publication.lock().unwrap() = Some(commit_first);
@@ -364,6 +377,39 @@ async fn drain_capacity_loss(pinned: bool, lost_input_ack: Option<bool>) {
             op.source_stopped_revision.unwrap() + u64::from(commit_first)
         );
         assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+        None
+    } else if matches!(fault, DrainCapacityLoss::ResultAck) {
+        rig.source
+            .backend
+            .lose_restore_result_ack
+            .store(true, Ordering::SeqCst);
+        gate.notify_one();
+        let (status, reply) = timeout(Duration::from_secs(6), migration)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, 503, "{reply}");
+        let task = rig.session.upgrade_task().await.unwrap().unwrap();
+        assert_eq!(task.operations["migrate"].phase, "Deferring");
+        let restored = rig.session.get("sleep").await.unwrap().result.unwrap();
+        assert_eq!(restored.state, adx_core::EnvironmentState::Running);
+        assert_eq!(
+            restored.last_operation.unwrap().kind,
+            adx_core::LifecycleKind::Resume
+        );
+        let mut source = pb::node_service_client::NodeServiceClient::new(
+            channel(&rig.source.report.node_address, Principal::ApiServer).await,
+        );
+        source
+            .update_network_policy(pb::UpdateNetworkPolicyRequest {
+                assignment: Some(original.clone()),
+                caller: caller(),
+                operation_id: "user-network-policy".into(),
+                expected_revision: restored.revision,
+                network: Some(adx_core::execution::NetworkPolicy::default().into()),
+            })
+            .await
+            .unwrap();
         None
     } else {
         // Drop the client's connection while the Coordinator-owned operation
@@ -438,10 +484,12 @@ async fn drain_capacity_loss(pinned: bool, lost_input_ack: Option<bool>) {
     assert!(!rig.source.manager.accepting_allocations());
     let restored = rig.session.get("sleep").await.unwrap();
     assert_eq!(restored.assignment.generation, original.generation);
-    assert_eq!(
-        restored.result.unwrap().state,
-        adx_core::EnvironmentState::Running
-    );
+    let restored = restored.result.unwrap();
+    assert_eq!(restored.state, adx_core::EnvironmentState::Running);
+    if matches!(fault, DrainCapacityLoss::ResultAck) {
+        assert_eq!(restored.last_operation.unwrap().id, "user-network-policy");
+        assert!(restored.spec.execution.network.is_some());
+    }
     assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 2);
     let resumed = rig.resume(true).await.unwrap().record.unwrap();
     assert_eq!(resumed.assignment.unwrap(), original);

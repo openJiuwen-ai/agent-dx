@@ -88,6 +88,7 @@ struct Backend {
     restore_entered: tokio::sync::Notify,
     fail_after_gate: AtomicBool,
     restore_input_publication: Mutex<Option<bool>>,
+    lose_restore_result_ack: AtomicBool,
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
@@ -128,6 +129,19 @@ impl RuntimeDriver for Backend {
     }
     async fn is_running(&self, runtime: &str) -> Result<bool> {
         Ok(self.running.lock().unwrap().contains_key(runtime))
+    }
+    async fn set_network_policy(
+        &self,
+        runtime: &str,
+        _: Option<&adx_core::execution::NetworkPolicy>,
+        _: &[u16],
+        _: Option<u16>,
+    ) -> Result<()> {
+        if self.is_running(runtime).await? {
+            Ok(())
+        } else {
+            Err(adx_core::Error::Conflict)
+        }
     }
     async fn remove(&self, runtime: &str) -> Result<()> {
         self.running.lock().unwrap().remove(runtime);
@@ -245,13 +259,13 @@ impl CheckpointCooperation for Backend {
     }
 }
 
-struct RestoreInputFault {
+struct RestorePublicationFault {
     coordinator: CoordinatorStateSink,
     backend: Arc<Backend>,
 }
 
 #[async_trait]
-impl StateSink for RestoreInputFault {
+impl StateSink for RestorePublicationFault {
     async fn has_current_assignment(&self, record: &EnvironmentRecord) -> Result<bool> {
         self.coordinator.has_current_assignment(record).await
     }
@@ -289,7 +303,19 @@ impl StateSink for RestoreInputFault {
                 return Ok(Durability::Journaled);
             }
         }
-        self.coordinator.commit_releasing(record, stopped).await
+        let durability = self.coordinator.commit_releasing(record, stopped).await?;
+        if record.state == adx_core::EnvironmentState::Running
+            && record.last_operation.as_ref().is_some_and(|op| {
+                op.kind == adx_core::LifecycleKind::Resume && op.id.starts_with("task:")
+            })
+            && self
+                .backend
+                .lose_restore_result_ack
+                .swap(false, Ordering::SeqCst)
+        {
+            return Ok(Durability::Journaled);
+        }
+        Ok(durability)
     }
 
     async fn commit_deleted(
@@ -359,7 +385,7 @@ async fn worker(
             backend.clone(),
             backend.clone(),
             backend.clone(),
-            Arc::new(RestoreInputFault {
+            Arc::new(RestorePublicationFault {
                 coordinator: sink.clone(),
                 backend: backend.clone(),
             }),
