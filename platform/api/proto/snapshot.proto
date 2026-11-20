@@ -48,7 +48,16 @@ message PublishSnapshotRequest { ReusableSnapshot snapshot = 1; string node_sess
 
 message GetSnapshotRequest { string id = 1; CallerContext caller = 2; string node_session_id = 3; }
 
-message ListSnapshotsRequest { CallerContext caller = 1; string name = 2; string page_token = 3; uint32 page_size = 4; optional SnapshotKind kind = 5; }
+message ListSnapshotsRequest {
+  CallerContext caller = 1;
+  string name = 2;
+  string page_token = 3;
+  uint32 page_size = 4;
+  optional SnapshotKind kind = 5;
+  // Empty selects the whole tenant catalog; otherwise only snapshots captured
+  // from this source Environment are returned.
+  string environment_id = 6;
+}
 
 message ListSnapshotsResponse { repeated ReusableSnapshot snapshots = 1; string next_page_token = 2; }
 

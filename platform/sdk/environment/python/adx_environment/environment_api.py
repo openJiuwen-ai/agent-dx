@@ -283,11 +283,13 @@ class Environment:
         client: Any,
         *,
         name: Optional[str] = None,
+        environment_id: Optional[str] = None,
         page_token: Optional[str] = None,
         page_size: Optional[int] = None,
     ) -> Tuple[List[SnapshotInfo], str]:
         payload = client.list_snapshots(
             name=name,
+            environment_id=environment_id,
             page_token=page_token,
             page_size=page_size,
         )
@@ -318,12 +320,18 @@ class Environment:
         cls,
         *,
         name: Optional[str] = None,
+        environment_id: Optional[str] = None,
         page_token: Optional[str] = None,
         page_size: Optional[int] = None,
         connection: Optional[ConnectionConfig] = None,
     ) -> Tuple[List[SnapshotInfo], str]:
+        """List reusable snapshots, optionally filtered by source Environment."""
         if name is not None and (not isinstance(name, str) or not name.strip()):
             raise ValueError("name must be a non-empty string or None")
+        if environment_id is not None and (
+            not isinstance(environment_id, str) or not environment_id.strip()
+        ):
+            raise ValueError("environment_id must be a non-empty string or None")
         if page_token is not None and not isinstance(page_token, str):
             raise TypeError("page_token must be a string or None")
         if page_size is not None:
@@ -336,6 +344,9 @@ class Environment:
             return cls._list_snapshots(
                 client,
                 name=name.strip() if name is not None else None,
+                environment_id=(
+                    environment_id.strip() if environment_id is not None else None
+                ),
                 page_token=page_token,
                 page_size=page_size,
             )
