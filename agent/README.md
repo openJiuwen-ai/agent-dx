@@ -102,7 +102,7 @@ cargo build --locked -p data-plane-gateway -p adx-apiserver --features data-plan
 
 Gateway 保留独立 Ingress 与 API Server 内嵌 Ingress 两种进程形态，共用装配代码。构建时为承载 Ingress 的二进制启用 `data-plane-gateway/agent-api`。Agent 入口按以下方式启用：
 
-- `ADX_AGENT_CONFIG` 指向 v2 配置文件，选择独立 Activator 地址或嵌入式 Activator 的 Redis 命名空间。受管管理和 HTTP/WS 数据入口使用 Platform API Key。
+- `ADX_AGENT_CONFIG` 指向 v2 配置文件，选择独立 Activator 的客户端配置或嵌入式 Activator 的运行配置。受管管理和 HTTP/WS 数据入口使用 Platform API Key。
 
 选择独立模式时，另行构建并启动无状态 `adx-activator` 进程；多个副本连接相同 ADX Redis namespace，并通过 API Server 既有 HTTP 接口访问平台。嵌入式模式由 API Server 将同一 Environment 业务服务以 Rust 模块接口交给 Activator，受管 Agent 请求无需内部 HTTP/RPC 回环。
 
@@ -124,7 +124,7 @@ cargo build --locked -p adx-activator --bin adx-activator
 }
 ```
 
-API Server 内嵌 Ingress 时，也可将 `ADX_AGENT_CONFIG` 配成嵌入式模式；创建使用 API Server 自身的 `runtime_profile`，Activator 产品状态仍存于指定 Redis namespace：
+API Server 内嵌 Ingress 时，把 Activator 运行配置放在 `ADX_AGENT_CONFIG` 的 `embedded` 对象中。独立进程在 `ADX_ACTIVATOR_CONFIG` 的 JSON 顶层读取同一组字段。两种模式使用各自的 Environment 连接，创建均使用 API Server 的 `runtime_profile`。
 
 ```json
 {
@@ -132,21 +132,20 @@ API Server 内嵌 Ingress 时，也可将 `ADX_AGENT_CONFIG` 配成嵌入式模�
   "embedded": {
     "redis_url": "redis://127.0.0.1:6379",
     "namespace": "adx-agent",
-    "sandbox_network": {
-      "sandbox_cidrs": ["10.0.0.0/20"],
-      "internal_cidrs": [],
-      "public_egress": true,
-      "egress_allow": []
+    "request_timeout_seconds": 60,
+    "egress_isolation": {
+      "template_priority": 200,
+      "egress": {"deny": [{"cidr": "10.0.0.0/20", "protocol": "any", "priority": 300}]}
     }
   }
 }
 ```
 
-新建模板 Sandbox 统一附加配置的 ACL：独立模式使用 `sandbox_network`，嵌入式模式使用 `embedded.sandbox_network`。Sandbox 地址池拒绝互访，公网与业务外连按配置放行；DNS 和模型服务等内部地址需要显式例外，见[网络隔离配置](activator/README.md#模板沙箱网络隔离)。已有 Sandbox 不修改。
+Activator 创建 Sandbox 时合并部署的 `egress_isolation` 和模板的 `network.egress`。部署者配置沙箱池、节点池和内网兜底规则，模板声明业务出站白名单和黑名单。已有 Sandbox 的规则继续沿用。见[网络隔离配置](activator/README.md#模板沙箱网络隔离)。
 
 `activator` 与 `embedded` 只能配置一个。独立 Ingress 不持有 API Server 的业务服务，应使用独立 Activator 模式。
 
-`timeout_seconds` 默认 60 秒且必须为正，由入口确定一次绝对 deadline。管理面在鉴权后统一处理 trace、请求读取、业务调用和 JSON 响应；HTTP/WS 目标激活的模板查询、激活和内部目标重试共用同一期限。客户端将剩余预算传给 Activator，地址重选不重置期限。纯读超时返回 Unavailable，可能写入的操作超时返回 OutcomeUnknown，重试使用原身份；已到期的内部重试直接拒绝。网络连接及 Environment 后端配置上限只能缩短剩余预算。每次调用的 `deadline_unix_ms` 不进入执行规格或 Redis；后台收敛的下一次核对使用新的有界等待预算，沿用同一已持久化 EnvID 和固定创建规格。独立 Activator 用剩余期限限制 HTTP 等待，但现有 API Server 没有该绝对期限字段；创建请求中的 `createTimeoutSeconds` 固定取 Activator 配置，保持相同身份重试的请求体与操作 ID 稳定。API Server 可能在调用方超时后继续创建，超时返回 OutcomeUnknown，不自动重放或换 ID。嵌入式 `LocalEnvironment` 同样按剩余期限限制调用等待，固定创建预算为 60 秒；提交后超时返回 OutcomeUnknown。两种模式使用相同的创建请求和确定性操作 ID。激活期限不覆盖建立后的 HTTP 响应流、WS 或 SSH 会话；SSH 模板校验、身份提示和后端握手共用 SSH 连接期限。
+`timeout_seconds` 默认 60 秒且必须为正，由入口确定一次绝对 deadline。管理面在鉴权后统一处理 trace、请求读取、业务调用和 JSON 响应；HTTP/WS 目标激活的模板查询、激活和内部目标重试共用同一期限。客户端将剩余预算传给 Activator，地址重选不重置期限。纯读超时返回 Unavailable，可能写入的操作超时返回 OutcomeUnknown，重试使用原身份；已到期的内部重试直接拒绝。网络连接及 Environment 后端配置上限只能缩短剩余预算。每次调用的 `deadline_unix_ms` 不进入执行规格或 Redis；后台收敛的下一次核对使用新的有界等待预算，沿用同一已持久化 EnvID 和固定创建规格。独立 Activator 用剩余期限限制 HTTP 等待，但现有 API Server 没有该绝对期限字段；创建请求中的 `createTimeoutSeconds` 固定取 Activator 配置，保持相同身份重试的请求体与操作 ID 稳定。API Server 可能在调用方超时后继续创建，超时返回 OutcomeUnknown，不自动重放或换 ID。嵌入式 `LocalEnvironment` 同样按剩余期限限制调用等待，创建预算取相同的 `request_timeout_seconds` 字段；提交后超时返回 OutcomeUnknown。两种模式使用相同的创建请求和确定性操作 ID。激活期限不覆盖建立后的 HTTP 响应流、WS 或 SSH 会话；SSH 模板校验、身份提示和后端握手共用 SSH 连接期限。
 
 Gateway 与 Activator 都缓存不可变模板，按 tenant/name/version 隔离，各最多 1024 条；同键在途读取合并，缺失和失败不缓存。Gateway 不缓存 AgentBinding/Target，每次解析都调用 Activator。Activator 的 AgentBinding 成功绑定采用 LRU，默认容量 200000，滑动 TTL 为 18000 秒（5 小时）；热命中直接返回并续期，不读 Redis、不调用 Environment API。TTL 只在请求访问时检查；别名收敛另由元数据事件及启动/重连/成员变化触发，不做周期全量 Binding 扫描；容量淘汰、闲置过期、重启和 bypass 会引起回源。缓存是派生状态，实际连通性由 Gateway/Relay 校验；删除中的并发请求允许成功或失败。Activator 进程与缓存内存测量见[进程说明](activator/README.md)，权威状态保证见[存储说明](crates/store/README.md)。
 

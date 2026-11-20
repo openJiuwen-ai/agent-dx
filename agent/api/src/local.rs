@@ -1,32 +1,33 @@
 //! In-process Activator binding. Product state remains owned by the Activator.
 use crate::{activator::Control, request::RequestContext, Result};
-pub use adx_activator::registration::RegistrationConfig;
-use adx_activator::Activator;
+pub use adx_activator::config::ActivatorConfig;
+use adx_activator::{reconciliation::Reconciliation, Activator};
 use adx_agent_core::{
     activator::{BindingList, BindingPage, Target},
     environment::Environment,
     AgentBinding, Scope, TemplateVersion,
 };
-use adx_agent_store::{AgentState, RedisRepository};
 use async_trait::async_trait;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 pub struct LocalControl {
     activator: Arc<Activator>,
-    _reconciliation: Option<adx_activator::reconciliation::Reconciliation>,
+    _reconciliation: Option<Reconciliation>,
 }
 
 impl LocalControl {
     pub async fn connect(
-        redis_url: &str,
-        namespace: &str,
+        config: ActivatorConfig,
         environment: Arc<dyn Environment>,
     ) -> Result<Self> {
-        let store = RedisRepository::connect(redis_url, namespace, Duration::from_secs(3)).await?;
-        Ok(Self::new(Arc::new(Activator::new(
-            AgentState::new(Arc::new(store)),
-            environment,
-        ))))
+        let (activator, store) = config.connect(environment).await?;
+        let reconciliation = config
+            .start_reconciliation(activator.clone(), store)
+            .await?;
+        Ok(Self {
+            activator,
+            _reconciliation: reconciliation,
+        })
     }
 
     pub fn new(activator: Arc<Activator>) -> Self {
@@ -34,34 +35,6 @@ impl LocalControl {
             activator,
             _reconciliation: None,
         }
-    }
-    pub async fn connect_reconciled(
-        redis_url: &str,
-        namespace: &str,
-        environment: Arc<dyn Environment>,
-        registration: adx_activator::registration::RegistrationConfig,
-    ) -> Result<Self> {
-        let store = RedisRepository::connect(redis_url, namespace, Duration::from_secs(3)).await?;
-        let activator = Arc::new(Activator::new(
-            AgentState::new(Arc::new(store.clone())),
-            environment,
-        ));
-        let reconciliation = adx_activator::reconciliation::Reconciliation::start(
-            activator.clone(),
-            store,
-            adx_agent_store::discovery::RedisRegistry::new(
-                redis_url,
-                namespace,
-                Duration::from_secs(3),
-            )?,
-            registration,
-            adx_activator::reconciliation::ReconcileSettings::default(),
-        )
-        .await?;
-        Ok(Self {
-            activator,
-            _reconciliation: Some(reconciliation),
-        })
     }
 }
 

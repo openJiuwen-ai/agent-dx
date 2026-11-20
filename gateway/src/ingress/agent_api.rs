@@ -2,7 +2,7 @@
 use adx_agent_api::request::RequestContext;
 use adx_agent_api::{
     activator::{ActivatorClient, Control},
-    local::LocalControl,
+    local::{ActivatorConfig, LocalControl},
     managed::ManagedService,
     Error,
 };
@@ -17,7 +17,7 @@ use std::{sync::Arc, time::Duration};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ActivatorConfig {
+pub struct ActivatorClientConfig {
     #[serde(default)]
     pub urls: Vec<String>,
     pub discovery: Option<adx_agent_api::discovery::DiscoveryConfig>,
@@ -36,17 +36,8 @@ fn default_timeout_seconds() -> u64 {
 pub struct AgentConfig {
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
-    pub activator: Option<ActivatorConfig>,
-    pub embedded: Option<EmbeddedActivatorConfig>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EmbeddedActivatorConfig {
-    pub sandbox_network: adx_agent_core::network::SandboxNetworkPolicy,
-    pub redis_url: String,
-    pub namespace: String,
-    pub registration: Option<adx_agent_api::local::RegistrationConfig>,
+    pub activator: Option<ActivatorClientConfig>,
+    pub embedded: Option<ActivatorConfig>,
 }
 pub struct AgentApi {
     pub managed: Arc<ManagedService>,
@@ -122,20 +113,8 @@ impl AgentApi {
                 Error::Invalid("Agent timeout must be positive and representable".into()).into(),
             );
         }
-        let control: Arc<dyn Control> = Arc::new(match settings.registration {
-            Some(registration) => {
-                LocalControl::connect_reconciled(
-                    &settings.redis_url,
-                    &settings.namespace,
-                    environment,
-                    registration,
-                )
-                .await?
-            }
-            None => {
-                LocalControl::connect(&settings.redis_url, &settings.namespace, environment).await?
-            }
-        });
+        let control: Arc<dyn Control> =
+            Arc::new(LocalControl::connect(settings, environment).await?);
         Ok(Self {
             managed: Arc::new(ManagedService::new(control)),
             request_timeout: timeout,
