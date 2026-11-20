@@ -651,7 +651,9 @@ class Cluster:
             if role != "M" and is_bench(self.case):
                 declared = benchlib.parameters(self.config).overrides_for(role)
                 mismatches = benchlib.effective_mismatches(self.effective[role], declared)
-                self.record("bench.node_overrides." + role, {"declared": declared, "mismatches": mismatches})
+                inert = benchlib.parameters(self.config).inert_overrides(role)
+                self.record("bench.node_overrides." + role, dict(
+                    {"declared": declared, "mismatches": mismatches}, **({"inert": inert} if inert else {})))
                 if mismatches:
                     raise AssertionError("bench node overrides not in effect on %s: %r" % (role, mismatches))
 

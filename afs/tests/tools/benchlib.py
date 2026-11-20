@@ -31,7 +31,13 @@ OVERRIDE_KEYS = {
     "dfs_read_cache_bytes": ("zero_or", 4 * MIB + 4 * KIB, 1024**4),
     "dfs_read_stripe_bytes": ("step", 64 * KIB, 64 * KIB, 8 * MIB),
     "dfs_source_cache_max_ms": ("int", 0, 60_000),
+    "dfs_read_cache_queue_bytes": ("int", 4 * MIB, 1024 * MIB),
+    "dfs_read_cache_partial_bytes": ("zero_or", 4 * MIB, 1024 * MIB),
+    "dfs_source_single_ttl_ms": ("int", 0, 60_000),
 }
+# Settings the product range-checks on every Node but uses only while the native read cache runs
+# (dfs_read_cache_bytes non-zero): accepted without it, but recorded as inert instead of effective.
+READ_CACHE_ONLY = ("dfs_read_cache_queue_bytes", "dfs_read_cache_partial_bytes", "dfs_source_single_ttl_ms")
 # The serveable read cache and the private peer cache are exclusive on one Node (the product refuses both).
 EXCLUSIVE_OVERRIDES = ("dfs_read_cache_bytes", "dfs_peer_cache.")
 LOCAL_COPY = ("required", "preferred", "none")
@@ -65,6 +71,13 @@ class BenchParameters:
     def overrides_for(self, role):
         """Effective overrides for one Node role: the "*" entries, then the role's own."""
         return {**self.node_overrides.get("*", {}), **self.node_overrides.get(role, {})}
+
+    def inert_overrides(self, role):
+        """Declared settings the product ignores on this role because its read cache is off."""
+        merged = self.overrides_for(role)
+        if merged.get("dfs_read_cache_bytes", 0):
+            return []
+        return sorted(k for k in merged if k in READ_CACHE_ONLY)
 
     def applied_overrides(self, roles):
         """Overrides that reach the given Node roles; roles outside the cluster contribute nothing."""

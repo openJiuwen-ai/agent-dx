@@ -72,6 +72,60 @@ class ReadCacheKeyTests(unittest.TestCase):
                                              "dfs_read_stripe_bytes = %d" % MIB, "dfs_source_cache_max_ms = 0"])
 
 
+class ReadCacheBudgetKeyTests(unittest.TestCase):
+    """H2 step 1 keys: staging/partial budgets and the single-source TTL, within product limits."""
+
+    def test_budget_and_single_ttl_keys_are_accepted_at_product_bounds(self):
+        for settings in ({"dfs_read_cache_queue_bytes": 4 * MIB}, {"dfs_read_cache_queue_bytes": 1024 * MIB},
+                         {"dfs_read_cache_partial_bytes": 0}, {"dfs_read_cache_partial_bytes": 4 * MIB},
+                         {"dfs_read_cache_partial_bytes": 1024 * MIB}, {"dfs_source_single_ttl_ms": 0},
+                         {"dfs_source_single_ttl_ms": 60000}):
+            with self.subTest(settings=settings):
+                p = benchlib.parameters(bench(variant="VR", node_overrides={
+                    "B": dict(settings, dfs_read_cache_bytes=64 * MIB)}))
+                self.assertEqual(p.inert_overrides("B"), [])
+
+    def test_out_of_range_values_are_blocked(self):
+        for bad in ({"dfs_read_cache_queue_bytes": 0}, {"dfs_read_cache_queue_bytes": 4 * MIB - 1},
+                    {"dfs_read_cache_queue_bytes": 1024 * MIB + 1}, {"dfs_read_cache_partial_bytes": 1},
+                    {"dfs_read_cache_partial_bytes": 4 * MIB - 1}, {"dfs_read_cache_partial_bytes": 1024 * MIB + 1},
+                    {"dfs_source_single_ttl_ms": 60001}, {"dfs_source_single_ttl_ms": -1},
+                    {"dfs_source_single_ttl_ms": True}):
+            with self.subTest(bad=bad):
+                blocked(self, variant="Vx", node_overrides={"B": dict(bad, dfs_read_cache_bytes=64 * MIB)})
+
+    def test_keys_without_the_read_cache_are_accepted_and_reported_inert(self):
+        # The product range-checks these on every Node but uses them only when dfs_read_cache_bytes is
+        # non-zero, so the bench records them as having no effect instead of refusing.
+        p = benchlib.parameters(bench(variant="Vx", node_overrides={
+            "*": {"dfs_read_cache_queue_bytes": 64 * MIB, "dfs_source_single_ttl_ms": 100},
+            "B": {"dfs_read_cache_bytes": 64 * MIB}, "C": {"dfs_read_cache_bytes": 0,
+                                                          "dfs_read_cache_partial_bytes": 0}}))
+        self.assertEqual(p.inert_overrides("B"), [])
+        self.assertEqual(p.inert_overrides("A"), ["dfs_read_cache_queue_bytes", "dfs_source_single_ttl_ms"])
+        self.assertEqual(p.inert_overrides("C"), ["dfs_read_cache_partial_bytes", "dfs_read_cache_queue_bytes",
+                                                  "dfs_source_single_ttl_ms"])
+
+    def test_keys_render_as_top_level_settings(self):
+        toml = benchlib.node_overrides_toml({"dfs_read_cache_bytes": 64 * MIB, "dfs_read_cache_queue_bytes": 8 * MIB,
+                                             "dfs_read_cache_partial_bytes": 0, "dfs_source_single_ttl_ms": 250},
+                                            "/unused")
+        self.assertEqual(toml.splitlines(), ["dfs_read_cache_bytes = %d" % (64 * MIB),
+                                             "dfs_read_cache_partial_bytes = 0",
+                                             "dfs_read_cache_queue_bytes = %d" % (8 * MIB),
+                                             "dfs_source_single_ttl_ms = 250"])
+
+    def test_cluster_records_inert_keys_only_when_present(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = ClusterRenderingTests().cluster(d, {"dfs_read_cache_queue_bytes": 64 * MIB, "dfs_read_cache_bytes": 0},
+                                                variant="Vq",
+                                                node_overrides={"B": {"dfs_read_cache_queue_bytes": 64 * MIB}})
+            c._configs()
+            records = {e["check"]: e["value"] for e in c.evidence if e["check"].startswith("bench.node_overrides.")}
+            self.assertEqual(records["bench.node_overrides.B"]["inert"], ["dfs_read_cache_queue_bytes"])
+            self.assertNotIn("inert", records["bench.node_overrides.A"])
+
+
 class AbsentRoleTests(unittest.TestCase):
     @staticmethod
     def topology(roles, **extra):
