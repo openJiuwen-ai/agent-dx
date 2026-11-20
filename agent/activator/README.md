@@ -4,11 +4,13 @@ Activator 是无状态产品控制模块，可作为独立进程 `adx-activator`
 
 Gateway 在独立模式通过 ActivatorClient 发起 HTTP 请求，在嵌入式模式通过 LocalControl 直接调用 Activator。公开认证与业务流量转发留在 Gateway；Activator 管理 Template/AgentBinding 状态。配置见[Agent 进程配置](../README.md#进程配置)。
 
-Agent 的 `CreateEnvironment`/`ExecutionSpec` 在本 crate 的 `environment_request` 转成通用 Environment 创建请求；`HttpEnvironment` 与 `LocalEnvironment` 共用映射、操作 ID 和响应解释。API Server 只转换自己的 Environment 请求到 Platform EnvironmentSpec，并负责 runtime 注入。嵌入式适配通过 `EnvironmentApplication` 调用同一 `EnvironmentService.create_request()`，不依赖 Ingress mapper，也不在 Agent 层构造 Platform 类型。嵌入式配置固定创建预算为 60 秒，调用等待仍受请求剩余期限约束；提交后超时保留原 ID 并返回 OutcomeUnknown。
+Agent 的 `CreateEnvironment`/`ExecutionSpec` 在本 crate 的 `environment_request` 转成通用 Environment 创建请求；`HttpEnvironment` 与 `LocalEnvironment` 共用映射、操作 ID 和响应解释。API Server 只转换自己的 Environment 请求到 Platform EnvironmentSpec，并负责 runtime 注入。嵌入式适配通过 `EnvironmentApplication` 调用同一 `EnvironmentService.create_request()`，不依赖 Ingress mapper，也不在 Agent 层构造 Platform 类型。两种模式的创建预算均取 `request_timeout_seconds`，默认 60 秒。调用等待仍受请求剩余期限约束；提交后超时保留原 ID 并返回 OutcomeUnknown。
 
 Activator 创建请求统一携带内置 `restartPolicy`：最多重启 3 次，首次退避 5 秒、最大退避 60 秒。该策略由 Platform 执行，不增加模板字段，也不在 Binding 中复制参数或策略快照；已存在 Env 的规格不会随 Activator 升级改变。
 
-独立进程启动读取 `ADX_ACTIVATOR_CONFIG` 指向的 JSON，示例见 [local.json](examples/local.json)。入口服务凭据为 `ADX_ACTIVATOR_SERVICE_TOKEN`。`environment_url` 指向 API Server（示例端口 8081 须与其 `listen` 配置一致），`environment_api_key_envs` 将租户映射到保存该租户 Platform API Key 的环境变量名，例如 `{"tenant":"ADX_PLATFORM_TENANT_API_KEY"}`。这里的 Platform API Key 用于 Environment 管理，与最终用户的模型 API Key 无关。凭据内容不写入 JSON；未配置租户的查询返回 NotFound，创建/删除在提交请求前返回 Unavailable。每项 key 必须属于对应租户，不能使用跨租户管理员 key；现有查询响应不含租户字段，Activator 无法独立验证配置归属。HTTP 明文必须显式允许，否则客户端需要 TLS 和受信任 CA。
+两种部署共用 `ActivatorConfig`。独立进程将 `redis_url`、`namespace`、`request_timeout_seconds`、`binding_cache`、`registration` 和网络配置放在 `ADX_ACTIVATOR_CONFIG` 指向的 JSON 顶层；嵌入式部署将相同字段放在 `ADX_AGENT_CONFIG` 的 `embedded` 对象中。
+
+独立进程同时配置自身的 HTTP 监听和连接 API Server 所需的字段，示例见 [local.json](examples/local.json)。入口服务凭据为 `ADX_ACTIVATOR_SERVICE_TOKEN`。`environment_url` 指向 API Server（示例端口 8081 须与其 `listen` 配置一致），`environment_api_key_envs` 将租户映射到保存该租户 Platform API Key 的环境变量名，例如 `{"tenant":"ADX_PLATFORM_TENANT_API_KEY"}`。这里的 Platform API Key 用于 Environment 管理，与最终用户的模型 API Key 无关。凭据内容不写入 JSON；未配置租户的查询返回 NotFound，创建/删除在提交请求前返回 Unavailable。每项 key 必须属于对应租户，不能使用跨租户管理员 key；现有查询响应不含租户字段，Activator 无法独立验证配置归属。HTTP 明文必须显式允许，否则客户端需要 TLS 和受信任 CA。
 
 内部端点统一为 POST `/internal/adx/v1/`：
 
@@ -65,41 +67,53 @@ cargo test --locked -p adx-activator --lib binding_cache_memory_profile -- --ign
 
 ## Environment HTTP 适配契约
 
-- 创建：`POST /api/environment/v1/environments`，将 `adx-<generation>` 拆为 namespace/name，保留镜像、隔离 runtime、资源、业务 env、模板 service 端口、渲染后的 mounts、模板 lifecycle、`init_timeout_seconds`、`readiness_probe` 和 `inheritEntrypoint=true`，并附加配置的 `sandbox_network` 策略。模板 readiness 支持 HTTP、TCP 或 exec 单动作，Activator 映射为公共 Environment 的 `readinessProbe`；runtime profile 由 API Server 注入。显式启动覆盖与保留环境变量在提交前拒绝。
+- 创建：`POST /api/environment/v1/environments`，将 `adx-<generation>` 拆为 namespace/name，保留镜像、隔离 runtime、资源、业务 env、模板 service 端口、渲染后的 mounts、模板 lifecycle、`init_timeout_seconds`、`readiness_probe` 和 `inheritEntrypoint=true`。Activator 将模板和部署出站规则合并到 `network`。模板 readiness 支持 HTTP、TCP 或 exec 单动作，Activator 映射为公共 Environment 的 `readinessProbe`；runtime profile 由 API Server 注入。显式启动覆盖与保留环境变量在提交前拒绝。
 - 查询：`GET /api/instances?instance_id=<id>`，检查单条记录的 ID，Running 才标记 ready。没有返回的 runtime ID 不合成；404 表示当前不可见，不能确认已删除。
 - 删除：`DELETE /api/environment/v1/environments/<id>`，API Server 确认成功返回 Deleted；明确 HTTP 404 返回 NotFound，Activator 对这两种结果均按 generation 条件清理 Binding 及其 parameters。断连、超时或不完整响应保留 OutcomeUnknown，不清理绑定。
-- 删除使用由动作、tenant 和 Environment ID 确定的 `X-Request-Id`；创建还包含持久化的尝试序号，仅在确定分配前取消，或 CREATE 明确终态且再次确认 Env 不存在后推进；同一组 Activator 副本须使用一致的创建规格、`sandbox_network` 与 `request_timeout_seconds`，未完成操作期间改变请求体会被 API Server 的幂等校验拒绝。禁止重定向及自动重放。HTTP 400/409 映射 Invalid/Conflict，查询 403 映射 NotFound；创建/删除 403 和所有 401 表示上游鉴权不可用，不触发删除收尾。读响应丢失为 Unavailable，写响应丢失为 OutcomeUnknown。
+- 删除使用由动作、tenant 和 Environment ID 确定的 `X-Request-Id`；创建还包含持久化的尝试序号，仅在确定分配前取消，或 CREATE 明确终态且再次确认 Env 不存在后推进；同一组 Activator 副本须使用一致的创建规格、网络配置与 `request_timeout_seconds`，未完成操作期间改变请求体会被 API Server 的幂等校验拒绝。禁止重定向及自动重放。HTTP 400/409 映射 Invalid/Conflict，查询 403 映射 NotFound；创建/删除 403 和所有 401 表示上游鉴权不可用，不触发删除收尾。读响应丢失为 Unavailable，写响应丢失为 OutcomeUnknown。
 
 旧配置中的 `ADX_ENVIRONMENT_SERVICE_TOKEN` 已移除；Activator 使用 API Server 管理地址与 `environment_api_key_envs`。Ingress 不再提供 `/api/environment/v2/instances`。
 
 ## 模板沙箱网络隔离
 
-独立 Activator 的配置必须提供 `sandbox_network`；嵌入式模式在 `ADX_AGENT_CONFIG` 的 `embedded.sandbox_network` 使用同一结构。缺省情况下，所有经模板创建的新 Environment 统一使用该策略。部署者可通过 `runtime_policies` 为指定 runtime 作出显式选择，模板和用户启动环境变量不能覆盖它。直接调用 Environment API 的其他场景不受此配置影响；已有 Environment 不更新。
+在共用的 Activator 配置中设置 `egress_isolation`。每条平台规则的 `priority` 由部署者配置，`template_priority` 应低于沙箱池和节点池拒绝，高于内网兜底拒绝。优先级沿用 Env 网络策略的数值，值越大越先执行。部署者可以用更高优先级放行平台 DNS 网关的 UDP/TCP 53。
 
 ```json
 {
-  "sandbox_cidrs": ["10.0.0.0/20"],
-  "internal_cidrs": ["192.168.0.0/16"],
-  "public_egress": true,
-  "egress_allow": [
-    {"cidr": "192.168.1.10/32", "protocol": "tcp", "ports": {"first": 4000, "last": 4000}},
-    {"cidr": "192.168.1.53/32", "protocol": "udp", "ports": {"first": 53, "last": 53}},
-    {"cidr": "192.168.1.53/32", "protocol": "tcp", "ports": {"first": 53, "last": 53}}
-  ]
+  "egress_isolation": {
+    "template_priority": 200,
+    "egress": {
+      "allow": [
+        {"cidr": "10.233.16.1/32", "protocol": "udp", "ports": {"first": 53, "last": 53}, "priority": 400},
+        {"cidr": "10.233.16.1/32", "protocol": "tcp", "ports": {"first": 53, "last": 53}, "priority": 400}
+      ],
+      "deny": [
+        {"cidr": "10.233.16.0/20", "protocol": "any", "priority": 300},
+        {"cidr": "192.168.0.0/16", "protocol": "any", "priority": 300},
+        {"cidr": "10.0.0.0/8", "protocol": "any", "priority": 100}
+      ]
+    }
+  }
 }
 ```
 
-示例地址必须替换为实际 Environment 地址池与服务地址。`sandbox_cidrs` 非空并覆盖全部 Environment 地址池；`internal_cidrs` 列出需要默认拒绝的内部地址段。`egress_allow` 支持 TCP/UDP 端口范围，或不带 ports 的 ICMP；与任一 Environment 地址池重叠的例外直接拒绝。CIDR、规则数量与端口范围在启动及创建边界校验，非法配置返回 Invalid，不会退化为无策略创建。
+业务模板声明地址、协议和可选端口范围。所有模板规则由 Activator 使用部署配置的同一优先级提交。
 
-映射为 schemaVersion 2 的 stateful ACL，入站/出站默认 deny。用户规则按优先级依次为：Environment 地址池双向 deny（400）、显式业务外连 allow（300）、内网及常见保留地址 deny（200）、公网 allow（100）。公网规则允许 IPv4 与 IPv6 全球单播范围，公共出口仍受宿主网络策略限制。DNS 使用 UDP/TCP 53 的精确地址例外；模型服务使用实际地址及端口。服务地址改变时须更新配置，当前不自动解析域名生成规则。
+```json
+{
+  "network": {
+    "egress": {
+      "allow": [{"cidr": "10.247.149.23/32", "protocol": "tcp", "ports": {"first": 4000, "last": 4000}}]
+    }
+  }
+}
+```
 
-模板 service 端口会作为 Environment `ports` 提交，Platform 保留 Execd 及这些业务端口的管理/转发访问。Platform 的保留规则优先级高于上述规则，因此隔离依靠所有 Environment 的出站限制，不能仅依赖目的端入站；不能据此声称共享 Execd token 或所有恶意流量绕过风险已解决。不要给用户开放网络策略更新的管理凭据。
+平台规则的 `allow` 和 `deny` 合计最多 64 条，每个模板的 `allow` 和 `deny` 合计最多 128 条。Activator 只在新建 Environment 时提交合并后的规则。空规则省略 `network`。有规则时使用 stateful 策略，入站和出站均默认拒绝。部署者可通过最低优先级的 IPv4 全网放行规则开放未被更高优先级规则覆盖的出站流量。已有 Environment 的创建配置保持原样。
 
-本地测试覆盖规则优先级、公网与内网区分、模型/DNS 端口例外、错误配置、HTTP/同进程映射及 API Server 规格转换。这些测试不覆盖外部网络设施或业务服务的连通性。
+节点配置 `network_baseline` 时，每条显式放行规则都须符合节点的权限上限。范围为 `0.0.0.0/0` 的放行也受同样校验。
 
-`runtime_policies` 是可选的 runtime 名称到策略的映射：`deployment`（也是未配置 runtime 的缺省行为）使用上述严格 ACL；`unrestricted` 不向 Environment 请求写入 ADX 网络过滤策略，原生运行时部署策略仍然生效。例如，部署者显式设置 `"runtime_policies":{"supervisor":"unrestricted"}`，可运行使用原生网络策略的 supervisor Agent，而其他 runtime 保持严格 ACL。此选项会放弃该 runtime 的 ADX 沙箱间/内网过滤；它不保证与上述隔离语义等价。仅在部署者明确接受此网络边界时启用，且不得把管理凭据交给最终用户。ADX 不会根据 backend 拒绝自动改用 unrestricted。配置仍整体校验；修改策略不会更新已有 Environment，未完成创建也须遵循同一身份/规格的幂等约束。
-
-当前 sandboxd ACL 后端仅支持 IPv4。`sandbox_network` 的地址池、内部地址段和服务例外均须使用 IPv4 CIDR；启动校验拒绝 IPv6 配置，公网放行也仅生成 IPv4 规则。
+部署时按环境配置 IPv4 CIDR 和所需端口，并同步发布声明业务例外的新模板版本。模板 service 端口经 Environment `ports` 提交，Platform 继续管理 Execd 与业务端口的转发。
 
 ## 休眠实例的解析
 

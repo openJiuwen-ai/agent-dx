@@ -12,7 +12,6 @@ workspace = true
 [dependencies]
 adx-error = { path = "../../crates/error" }
 adx-core = { path = "../../platform/crates/core" }
-ipnet = "2"
 base64 = "0.22"
 sha2 = "0.10"
 hashlink = "0.12.2"
