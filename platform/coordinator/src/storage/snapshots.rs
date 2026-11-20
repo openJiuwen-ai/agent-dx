@@ -236,9 +236,17 @@ impl Session {
         s.validate()?;
         Ok(s)
     }
-    pub async fn list_snapshots(&self, tenant: &str) -> Result<Vec<Snapshot>> {
+    /// Ready catalog records for `tenant`. `source_environment` restricts the
+    /// result to captures taken from that Environment ID; `None` lists all.
+    pub async fn list_snapshots(
+        &self,
+        tenant: &str,
+        source_environment: Option<&str>,
+    ) -> Result<Vec<Snapshot>> {
         self.filtered_snapshots(|s| {
-            s.template.tenant_id == tenant && s.state == SnapshotState::Ready
+            s.template.tenant_id == tenant
+                && s.state == SnapshotState::Ready
+                && source_environment.is_none_or(|id| s.template.id == id)
         })
         .await
     }

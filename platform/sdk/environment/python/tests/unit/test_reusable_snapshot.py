@@ -164,8 +164,10 @@ class ReusableSnapshotTests(unittest.TestCase):
             def get_snapshot(snapshot_id):
                 return {"snapshotId": snapshot_id, "names": ["one"]}
 
-            def list_snapshots(self, name=None, page_token=None, page_size=None):
-                self.page = (name, page_token, page_size)
+            def list_snapshots(
+                self, name=None, environment_id=None, page_token=None, page_size=None
+            ):
+                self.page = (name, environment_id, page_token, page_size)
                 return {
                     "items": [{"snapshotId": "snap-1", "names": []}],
                     "nextPageToken": "next",
@@ -182,12 +184,13 @@ class ReusableSnapshotTests(unittest.TestCase):
         infos, token = Environment._list_snapshots(
             client,
             name="base",
+            environment_id="adx-source",
             page_token="p",
             page_size=10,
         )
         self.assertEqual(infos, [adx_environment.SnapshotInfo("snap-1", ())])
         self.assertEqual(token, "next")
-        self.assertEqual(client.page, ("base", "p", 10))
+        self.assertEqual(client.page, ("base", "adx-source", "p", 10))
         Environment._delete_snapshot(client, "snap-1")
         self.assertEqual(client.deleted, "snap-1")
 
@@ -215,6 +218,10 @@ class ReusableSnapshotTests(unittest.TestCase):
             Environment.list_snapshots(page_size=0)
         with self.assertRaisesRegex(ValueError, "name"):
             Environment.list_snapshots(name=" ")
+        with self.assertRaisesRegex(ValueError, "environment_id"):
+            Environment.list_snapshots(environment_id=" ")
+        with self.assertRaisesRegex(ValueError, "environment_id"):
+            Environment.list_snapshots(environment_id=1)
 
     def test_transport_uses_snapshot_routes_and_stable_request_id(self):
         class Response:
@@ -256,7 +263,9 @@ class ReusableSnapshotTests(unittest.TestCase):
 
         created = client.create_snapshot("default-source", name="base", timeout_seconds=240)
         client.get_snapshot("snap-1")
-        client.list_snapshots(name="base", page_token="next", page_size=10)
+        client.list_snapshots(
+            name="base", environment_id="adx-source", page_token="next", page_size=10
+        )
         client.delete_snapshot("snap-1")
 
         self.assertTrue(created["snapshotId"].startswith("snap-"))
@@ -275,7 +284,12 @@ class ReusableSnapshotTests(unittest.TestCase):
         self.assertEqual(http.calls[0][2]["timeout"], 270)
         self.assertEqual(
             http.calls[2][2]["params"],
-            {"name": "base", "pageToken": "next", "pageSize": 10},
+            {
+                "name": "base",
+                "environmentId": "adx-source",
+                "pageToken": "next",
+                "pageSize": 10,
+            },
         )
         self.assertTrue(
             http.calls[3][2]["headers"]["X-ADX-Request-ID"].startswith("delete-snapshot-")

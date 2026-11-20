@@ -683,6 +683,7 @@ impl Api {
                             page_token: query.get("pageToken").cloned().unwrap_or_default(),
                             page_size: page_size(query)?,
                             kind: snapshot_kind(query)?.map(|kind| kind as i32),
+                            environment_id: query.get("environmentId").cloned().unwrap_or_default(),
                         })),
                     )
                     .await?;

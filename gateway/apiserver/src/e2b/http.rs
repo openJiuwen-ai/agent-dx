@@ -787,6 +787,7 @@ async fn snapshots(api: &Api, query: &str, caller: &pb::CallerContext) -> Result
                 name: query.get("name").cloned().unwrap_or_default(),
                 page_token: query.get("nextToken").cloned().unwrap_or_default(),
                 page_size: size,
+                environment_id: String::new(),
             })),
         )
         .await?;

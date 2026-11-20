@@ -208,7 +208,7 @@ Volume mounts use normal admission. Volume inspection exposes `snapshot_ids`.
 ```python
 same_snapshot = Environment.get_snapshot(snapshot.snapshot_id)
 snapshots, next_page_token = Environment.list_snapshots(
-    name="python-ready", page_size=20,
+    name="python-ready", environment_id="default-source", page_size=20,
 )
 Environment.delete_snapshot(same_snapshot.snapshot_id)
 ```
