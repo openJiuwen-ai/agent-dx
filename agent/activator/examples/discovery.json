@@ -13,6 +13,7 @@
     "capacity": 200000,
     "idle_seconds": 18000
   },
+  "metrics_listen": "127.0.0.1:19095",
   "registration": {
     "instance_id": "activator-local-1",
     "advertise_url": "http://127.0.0.1:8091",

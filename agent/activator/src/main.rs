@@ -12,6 +12,9 @@ struct Settings {
     environment_api_key_envs: BTreeMap<String, String>,
     allow_plaintext_transport: bool,
     environment_ca_file: Option<String>,
+    /// Optional private metrics listener; omitted means no monitoring port.
+    #[serde(default)]
+    metrics_listen: Option<SocketAddr>,
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,6 +50,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeout,
     )?;
     let listener = tokio::net::TcpListener::bind(settings.listen).await?;
+    // Bind before accepting traffic so a bad monitoring address fails startup.
+    let metrics_listener = match settings.metrics_listen {
+        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        None => None,
+    };
+    if let Some(listener) = metrics_listener {
+        let metrics = activator.cache_metrics();
+        tokio::spawn(async move {
+            if let Err(error) = adx_activator::metrics::serve(listener, metrics).await {
+                tracing::warn!(%error, "Activator metrics listener stopped");
+            }
+        });
+    }
     let reconciliation = settings
         .activator
         .start_reconciliation(activator, store)

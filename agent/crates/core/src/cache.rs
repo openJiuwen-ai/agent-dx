@@ -1,5 +1,74 @@
 //! Bounded process-local derived state. Eviction never changes authoritative records.
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Cache dimension reported by `adx_agent_cache_access_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheKind {
+    Binding,
+    Template,
+}
+impl CacheKind {
+    pub const ALL: [Self; 2] = [Self::Binding, Self::Template];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Binding => "binding",
+            Self::Template => "template",
+        }
+    }
+    fn index(self) -> usize {
+        match self {
+            Self::Binding => 0,
+            Self::Template => 1,
+        }
+    }
+}
+
+/// Cache outcome reported by `adx_agent_cache_access_total`.
+///
+/// `Bypass` (forced refresh or explicit inconsistency) and `Error` are kept
+/// separate from `Miss`: only `hit/(hit+miss)` is a hit ratio, and a forced
+/// refresh must not look like cache degradation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheResult {
+    Hit,
+    Miss,
+    Bypass,
+    Error,
+}
+impl CacheResult {
+    pub const ALL: [Self; 4] = [Self::Hit, Self::Miss, Self::Bypass, Self::Error];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Bypass => "bypass",
+            Self::Error => "error",
+        }
+    }
+    fn index(self) -> usize {
+        match self {
+            Self::Hit => 0,
+            Self::Miss => 1,
+            Self::Bypass => 2,
+            Self::Error => 3,
+        }
+    }
+}
+
+/// Process-local cache counters. Recording never changes cache behavior.
+#[derive(Default)]
+pub struct CacheMetrics {
+    counts: [[AtomicU64; 4]; 2],
+}
+impl CacheMetrics {
+    pub fn record(&self, cache: CacheKind, result: CacheResult) {
+        self.counts[cache.index()][result.index()].fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn count(&self, cache: CacheKind, result: CacheResult) -> u64 {
+        self.counts[cache.index()][result.index()].load(Ordering::Relaxed)
+    }
+}
 
 /// A FIFO cache. Replacing an entry preserves its insertion order; capacity zero disables it.
 pub struct BoundedCache<K, V> {
@@ -40,6 +109,32 @@ impl<K: Ord + Clone, V> BoundedCache<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cache_metrics_keep_each_kind_and_result_independent() {
+        let metrics = CacheMetrics::default();
+        assert_eq!(metrics.count(CacheKind::Binding, CacheResult::Hit), 0);
+        metrics.record(CacheKind::Binding, CacheResult::Hit);
+        metrics.record(CacheKind::Binding, CacheResult::Bypass);
+        metrics.record(CacheKind::Template, CacheResult::Miss);
+        metrics.record(CacheKind::Template, CacheResult::Miss);
+        metrics.record(CacheKind::Template, CacheResult::Error);
+        assert_eq!(metrics.count(CacheKind::Binding, CacheResult::Hit), 1);
+        assert_eq!(metrics.count(CacheKind::Binding, CacheResult::Bypass), 1);
+        assert_eq!(metrics.count(CacheKind::Binding, CacheResult::Miss), 0);
+        assert_eq!(metrics.count(CacheKind::Template, CacheResult::Miss), 2);
+        assert_eq!(metrics.count(CacheKind::Template, CacheResult::Error), 1);
+        assert_eq!(metrics.count(CacheKind::Template, CacheResult::Hit), 0);
+        let names: Vec<_> = CacheKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .chain(CacheResult::ALL.iter().map(|result| result.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["binding", "template", "hit", "miss", "bypass", "error"]
+        );
+    }
+
     #[test]
     fn replacement_and_eviction_keep_cache_bounded() {
         let mut cache = BoundedCache::new(2);

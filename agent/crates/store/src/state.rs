@@ -1,7 +1,7 @@
 //! Product metadata transactions. Environment lifecycle belongs to Platform.
 use crate::*;
 use adx_agent_core::activator::{BindingList, BindingPage};
-use adx_agent_core::cache::BoundedCache;
+use adx_agent_core::cache::{BoundedCache, CacheKind, CacheMetrics, CacheResult};
 use adx_agent_core::{
     environment::ExecutionSpec, limits, AgentBinding, BindingPhase, Scope, TemplateDraft,
     TemplateVersion,
@@ -58,6 +58,8 @@ struct PageCursor {
 pub struct AgentState {
     pub(crate) store: Arc<dyn Repository>,
     templates: Arc<Mutex<BoundedCache<Key, TemplateCell>>>,
+    /// Shared with the Activator so one `/metrics` serves both cache kinds.
+    cache_metrics: Arc<CacheMetrics>,
 }
 pub(crate) fn binding_key(scope: &Scope) -> Result<Key> {
     scope.validate().map_err(Error::Invalid)?;
@@ -89,7 +91,12 @@ impl AgentState {
         Self {
             store,
             templates: Arc::new(Mutex::new(BoundedCache::new(TEMPLATE_CACHE_ENTRIES))),
+            cache_metrics: Arc::new(CacheMetrics::default()),
         }
+    }
+    /// The single counter set shared by template and Activator binding lookups.
+    pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
+        self.cache_metrics.clone()
     }
     /// Atomically publish a snapshot and advance its tenant/template sequence.
     /// An ambiguous commit is returned without replay; existing storage requires an
@@ -190,6 +197,13 @@ impl AgentState {
         };
         // Only immutable published values are retained. Missing/error results leave the cell
         // empty, so a later publication or recovered repository can be observed immediately.
+        // A repository failure is reported as an error alone: counting it as a miss too would
+        // dilute the hit ratio with lookups that never received an answer.
+        if let Some(template) = cell.get() {
+            self.cache_metrics
+                .record(CacheKind::Template, CacheResult::Hit);
+            return Ok(Some(template.clone()));
+        }
         match cell
             .get_or_try_init(|| async {
                 let mut record = self.store.get(&key).await.map_err(Some)?.ok_or(None)?;
@@ -206,9 +220,21 @@ impl AgentState {
             })
             .await
         {
-            Ok(template) => Ok(Some(template.clone())),
-            Err(None) => Ok(None),
-            Err(Some(error)) => Err(error),
+            Ok(template) => {
+                self.cache_metrics
+                    .record(CacheKind::Template, CacheResult::Miss);
+                Ok(Some(template.clone()))
+            }
+            Err(None) => {
+                self.cache_metrics
+                    .record(CacheKind::Template, CacheResult::Miss);
+                Ok(None)
+            }
+            Err(Some(error)) => {
+                self.cache_metrics
+                    .record(CacheKind::Template, CacheResult::Error);
+                Err(error)
+            }
         }
     }
     pub async fn binding(&self, scope: &Scope) -> Result<Option<AgentBinding>> {

@@ -19,6 +19,7 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 adx-agent-core = { path = "../crates/core" }
 adx-agent-store = { path = "../crates/store" }
+adx-observability = { path = "../../crates/observability" }
 async-trait = "0.1"
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

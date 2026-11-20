@@ -4,6 +4,7 @@ mod creation;
 pub mod environment_request;
 mod image_resolution;
 pub mod local_environment;
+pub mod metrics;
 pub mod reconciliation;
 pub mod server;
 pub mod transport;
@@ -12,8 +13,9 @@ use adx_agent_core::environment::{
 };
 pub use adx_agent_core::error::{Error, Result};
 use adx_agent_core::{
-    activator::Target, AgentBinding, BindingPhase, EnvironmentRef, Scope, SecondaryIntent,
-    TemplateVersion,
+    activator::Target,
+    cache::{CacheKind, CacheMetrics, CacheResult},
+    AgentBinding, BindingPhase, EnvironmentRef, Scope, SecondaryIntent, TemplateVersion,
 };
 use adx_agent_store::{AgentState, PreparedTemplate};
 use hashlink::LinkedHashMap;
@@ -295,6 +297,11 @@ impl Activator {
         self.subscription_ready
             .load(std::sync::atomic::Ordering::Acquire)
     }
+    /// Single counter set shared with template lookups; served by the optional
+    /// private metrics listener.
+    pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
+        self.state.cache_metrics()
+    }
     pub async fn publish(
         &self,
         tenant: &str,
@@ -487,6 +494,7 @@ impl Activator {
         service: Option<adx_agent_core::activator::ServiceSelector>,
     ) -> Result<Target> {
         scope.validate().map_err(Error::Invalid)?;
+        let cache_metrics = self.state.cache_metrics();
         let attempt = {
             let mut bindings = self.bindings.lock().await;
             let subscription_ready = self
@@ -503,11 +511,15 @@ impl Activator {
                                 service.select(&target.service).map_err(Error::Invalid)?;
                             }
                             if expected_generation.is_some_and(|g| g != target.binding.generation) {
+                                // A cached entry for another generation yields no usable
+                                // result, so this request is a miss, not a hit.
+                                cache_metrics.record(CacheKind::Binding, CacheResult::Miss);
                                 return Err(Error::Conflict(
                                     "selected AgentBinding lifecycle changed".into(),
                                 ));
                             }
                             binding.touched = Instant::now();
+                            cache_metrics.record(CacheKind::Binding, CacheResult::Hit);
                             return Ok(target.clone());
                         }
                     }
@@ -530,8 +542,18 @@ impl Activator {
             }
             attempt
         };
-        let binding = match self.state.binding(scope).await? {
-            Some(binding) => binding,
+        // Every activation that reaches authoritative reads records exactly one
+        // outcome: explicit bypass is separate from a cache miss.
+        cache_metrics.record(
+            CacheKind::Binding,
+            if bypass_cache {
+                CacheResult::Bypass
+            } else {
+                CacheResult::Miss
+            },
+        );
+        let (binding, _created) = match self.state.binding(scope).await? {
+            Some(binding) => (binding, false),
             None if expected_generation.is_some() => {
                 return Err(Error::Conflict(
                     "selected AgentBinding no longer exists".into(),
@@ -557,9 +579,12 @@ impl Activator {
                 execution.env = template.render_env(&parameters).map_err(Error::Invalid)?;
                 creation::definitions(&template, &parameters, &execution.mounts)?;
                 self.environment.validate_execution(&execution)?;
-                self.state
-                    .create_binding_with_parameters(scope.clone(), &parameters)
-                    .await?
+                (
+                    self.state
+                        .create_binding_with_parameters(scope.clone(), &parameters)
+                        .await?,
+                    true,
+                )
             }
         };
         if expected_generation.is_some_and(|generation| generation != binding.generation) {
