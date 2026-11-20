@@ -2447,6 +2447,7 @@ async fn snapshot_rpc_enforces_tenant_and_rejects_busy_deletion() {
             page_token: String::new(),
             page_size: 1,
             kind: Some(pb::SnapshotKind::Golden as i32),
+            environment_id: String::new(),
         })
         .await
         .unwrap()
@@ -2490,6 +2491,7 @@ async fn snapshot_rpc_enforces_tenant_and_rejects_busy_deletion() {
         name: "base".into(),
         page_token: String::new(),
         page_size: 1,
+        environment_id: String::new(),
     };
     let page = client
         .list_snapshots(list.clone())
@@ -2505,6 +2507,73 @@ async fn snapshot_rpc_enforces_tenant_and_rejects_busy_deletion() {
     let page = client.list_snapshots(next).await.unwrap().into_inner();
     assert_eq!(page.snapshots[0].id, "snapshot-b");
     assert!(page.next_page_token.is_empty());
+    // Publish the other-source snapshot only after unfiltered pagination is
+    // asserted, so it cannot change the full-catalog page contents above.
+    let mut other_source = snapshot.clone();
+    other_source.id = "snapshot-e".into();
+    other_source.template = spec("other-source");
+    other_source.artifact.location = "artifact-e".into();
+    session
+        .publish_snapshot(other_source.clone())
+        .await
+        .unwrap();
+    let source_page = client
+        .list_snapshots(pb::ListSnapshotsRequest {
+            caller: caller(),
+            page_size: 10,
+            environment_id: "source".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        source_page
+            .snapshots
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["snapshot-a", "snapshot-b", "snapshot-c"]
+    );
+    let other_page = client
+        .list_snapshots(pb::ListSnapshotsRequest {
+            caller: caller(),
+            page_size: 10,
+            environment_id: "other-source".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        other_page
+            .snapshots
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["snapshot-e"]
+    );
+    for environment_id in ["missing-source", "other-tenant-environment"] {
+        let page = client
+            .list_snapshots(pb::ListSnapshotsRequest {
+                caller: caller(),
+                environment_id: environment_id.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(page.snapshots.is_empty());
+    }
+    let invalid_environment = client
+        .list_snapshots(pb::ListSnapshotsRequest {
+            caller: caller(),
+            environment_id: "bad\nenvironment".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(invalid_environment.code(), tonic::Code::InvalidArgument);
     let error = client
         .delete_snapshot(pb::DeleteSnapshotRequest {
             id: snapshot.id.clone(),
