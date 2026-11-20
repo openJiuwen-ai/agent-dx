@@ -231,7 +231,11 @@ paths:
         client control frames. OpenAPI does not standardize WebSocket frames,
         so the extension records the complete framing boundary. After sending
         exited and Close, Execd completes the peer Close handshake before closing
-        TCP, with a five-second deadline for an unresponsive peer.
+        TCP, with a five-second deadline for an unresponsive peer. A setup
+        failure after the upgrade, such as an executable that does not exist,
+        is reported with an `error` lifecycle frame carrying the reason,
+        followed by a Close frame with application code 4001; TCP is closed
+        after the peer Close handshake or the same five-second deadline.
       parameters:
         - $ref: "#/components/parameters/InstanceId"
         - $ref: "#/components/parameters/ProcessingTimeout"
@@ -270,7 +274,7 @@ paths:
             clientBinary: stdin bytes
             serverBinary: PTY output bytes
             clientText: ["RESIZE:<cols>:<rows>", "STDIN_EOF"]
-            serverText: JSON lifecycle frames
+            serverText: JSON lifecycle frames (started, exited, error)
         "4XX":
           $ref: "#/components/responses/RuntimeError"
         default:
