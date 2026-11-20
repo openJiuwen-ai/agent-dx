@@ -129,7 +129,7 @@ enum RootCommandType {
   ROOT_COMMAND_TYPE_INVALIDATE_CACHE = 2;
 }
 
-// REVOKE_ACCESS 仅用于真正撤权、根删除或 Home 恢复；B 首次加入不触发。
+// REVOKE_ACCESS 当前没有生产者。
 
 enum ReserveConflictPolicy {
   RESERVE_CONFLICT_POLICY_UNSPECIFIED = 0;
@@ -228,8 +228,8 @@ message AbortRootReply {}
 
 // D4: active root 的权威删除。与 abort_root 不同，abort_root 只清理已 reserve
 // 但未 activate 的 pending reservation；deactivate_root 用于已 activate 的
-// active root：从 active 列表移除，使后续 list_owner_roots 不再返回它，并通过
-// REVOKE_ACCESS RootCommand 向各 holder 传播撤权。幂等：root 不在 active 列表时返回成功。
+// active root：从 active 列表移除，使后续 list_owner_roots 不再返回它，并使旧 grant
+// 校验失败。幂等：root 不在 active 列表时返回成功。
 message DeactivateRootRequest {
   string request_id = 1;
   string root_id = 2;

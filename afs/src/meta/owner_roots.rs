@@ -228,29 +228,10 @@ impl StoreOwnerRootAuthority {
             }));
             // Root absence fences every old grant in the authoritative view.
             // Physical grant removal is bounded background work, not part of this ACK.
-            let access_generation = home_grant.access_generation;
             txn.conditions
                 .push(TxnCondition::EntityEquals(MetaEntity::RootGrant(
                     home_grant,
                 )));
-            // Force requires the Home session to be gone: it can never receive or ACK
-            // a revocation, so such a command could never be reclaimed.
-            if force.is_none() {
-                txn.mutations.push(TxnMutation::Put(MetaEntity::RootCommand(
-                    RootCommandRecord {
-                        command_id: format!(
-                            "deactivate:{}:{}:{}",
-                            root.root_id, root.root_epoch, input.request_id
-                        ),
-                        home_node_id: root.home_node_id.clone(),
-                        home_session_id: root.home_session_id.clone(),
-                        root_id: root.root_id.clone(),
-                        root_epoch: root.root_epoch,
-                        old_access_generation: access_generation,
-                        command_type: RootCommandType::RevokeAccess,
-                    },
-                )));
-            }
             txn.mutations.push(TxnMutation::RecordRequestOutcome(
                 super::store::RequestOutcome {
                     request: txn.request.clone(),
