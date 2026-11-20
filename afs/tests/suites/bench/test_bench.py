@@ -9,10 +9,15 @@ Layers: `cold` = page cache evicted and verified empty before the read;
 `hot` = immediate re-read after a full read; `remote_cold` = a reader that never
 opened the file reads it after every Node's backend files were evicted and verified.
 `same_kernel` marks remote reads whose roles share one kernel (shared page cache).
+With declared reader replicas, a cold read whose Nodes sent fewer than N*S bytes is suffixed
+`_local_replica`: part of it was served by the readers' own copies.
+Fan-out readers start together, or staggered (`bench.fanout_arrival`): a seed reader reads
+alone, then the others read together after a gap; each phase is a separate row.
 """
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from posixpath import join as remote_join
 
@@ -141,7 +146,11 @@ def memory_window(before, after):
 
 
 def require_no_oom(memory):
-    """A round during which the role's kernel recorded an OOM kill is void, not a slow sample."""
+    """A round during which the role's kernel recorded an OOM kill, or whose OOM counter could not
+    be read, is void, not a slow sample."""
+    unknown = sorted(role for role, m in memory.items() if m["oom_kill_delta"] is None)
+    if unknown:
+        raise AssertionError("oom_kill unreadable on %s, round void" % ",".join(unknown))
     killed = {role: m["oom_kill_delta"] for role, m in memory.items() if m["oom_kill_delta"]}
     if killed:
         raise AssertionError("OOM kill during the round, round void: %r" % killed)
@@ -157,10 +166,64 @@ def host_evidence(before, after):
 
 
 WRITER_METRICS = r"read|peer|serve|slot|reject|admission|gc|reclaim|collect|cache"
+NODE_METRICS = WRITER_METRICS + r"|crc32c_read_bytes"
+# Meta requests that serve read sources, the read cache and replica placement (not namespace traffic).
+META_METHODS = ("PublishReadCache", "RetireReadCache", "GetChunkSources", "OpenFileRead", "ValidateReadGrants",
+                "RetainReader", "ReleaseReaders", "ReportReaders", "GetPlacementSnapshot", "ValidateReplicaWrite",
+                "EnsureReplicaPlacement", "ClaimReplicationTask", "ReportReplicationTask")
+META_METRICS = r'^afs_meta_rpc_requests_total\{method="[^"]*/(%s)"' % "|".join(META_METHODS)
 
 
-def writer_metrics(c):
-    return c.health("A", "/metrics")
+def cluster_metrics(c):
+    """One /metrics scrape of Meta and every Node of the case cluster."""
+    return {role: c.health(role, "/metrics") for role in c.roles}
+
+
+def cluster_metrics_delta(before, after):
+    return {role: benchlib.metrics_delta(before[role], after[role], META_METRICS if role == "M" else NODE_METRICS)
+            for role in before}
+
+
+def require_reconciled(check):
+    """Sum of payload sent by every Node, N*S and the tool's bytes must agree when the check applies."""
+    if check.get("ok") is False:
+        raise AssertionError("read bytes do not reconcile: Nodes sent %d, expected N*S=%d, tool read %d: %r" % (
+            check["sent_total"], check["expected"], check["tool_bytes"], check))
+
+
+def read_round_evidence(c, params, before, readers, tool_bytes):
+    """Metric deltas of every role plus the sent-bytes reconciliation for one remote read window."""
+    metrics = cluster_metrics_delta(before, cluster_metrics(c))
+    check = benchlib.send_reconciliation(metrics, readers=readers, file_bytes=params.file_bytes,
+                                         tool_bytes=tool_bytes,
+                                         applies=benchlib.single_writer_copy(params.replication))
+    return {"metrics": metrics, "writer_metrics": metrics.get("A", {}), "send_check": check}
+
+
+def log_path(c, role):
+    return remote_join(c.root(role), role + ".log")
+
+
+def log_marks(c):
+    """Current size of every Node log, the start of a round's event window."""
+    marks = {}
+    for role in c.roles:
+        if role != "M":
+            value = json.loads(c.python(role, benchlib.LOG_EVENTS_SCRIPT, log_path(c, role), "0", "[]",
+                                        owner=False)["stdout"])
+            marks[role] = value["size"] if value else 0
+    return marks
+
+
+def log_event_counts(c, marks, events):
+    """Lines per event each Node logged since its mark; a missing log is recorded, not skipped."""
+    counts = {}
+    for role, mark in marks.items():
+        value = json.loads(c.python(role, benchlib.LOG_EVENTS_SCRIPT, log_path(c, role), str(mark),
+                                    json.dumps(list(events)), owner=False)["stdout"])
+        counts[role] = ({"counts": {}, "rotated": False, "missing": True} if value is None else
+                        {"counts": value["counts"], "rotated": value["rotated"], "missing": False})
+    return counts
 
 
 def backend_state(c, params, nodes, source):
@@ -209,14 +272,19 @@ def round_record(c, case, **fields):
 def summaries(c, rounds):
     groups = {}
     for entry in rounds:
-        key = (entry["op"], entry["layer"], entry["tool"], entry["block_bytes"], entry["threads"])
+        key = (entry["op"], entry["layer"], entry["tool"], entry["block_bytes"], entry["threads"],
+               entry.get("phase", "all"))
         groups.setdefault(key, []).append(entry["result"]["mib_per_s"])
-    table = [{"op": k[0], "layer": k[1], "tool": k[2], "block_bytes": k[3], "threads": k[4],
+    table = [{"op": k[0], "layer": k[1], "tool": k[2], "block_bytes": k[3], "threads": k[4], "phase": k[5],
               "mib_per_s": benchlib.summarize(v)} for k, v in sorted(groups.items())]
     params = benchlib.parameters(c.config)
+    applied = params.applied_overrides([r for r in c.roles if r != "M"])
     return c.record("bench.summary", {"scope": "measurement only; performance acceptance NOT_EVALUATED",
                                       "variant": params.variant, "backend": params.backend,
-                                      "node_overrides": params.node_overrides, "rows": table})
+                                      "node_overrides": applied,
+                                      "variant_applied": bool(applied or params.replication),
+                                      "replication": benchlib.replication_settings(params.replication),
+                                      "arrival": params.arrival, "rows": table})
 
 
 def localfs(c):
@@ -273,18 +341,21 @@ def dfs_sequential(c):
                 name = "bench-%d-%d-%d" % (block, threads, number)
                 shape = dict(tool="fio", block_bytes=block, threads=threads, round=number,
                              file_bytes=params.file_bytes, target="dfs")
+                marks = log_marks(c)
                 result = write_file(c, "A", params, remote_join(c.workspace("A"), name), block)
                 rounds.append(round_record(c, "dfs.sequential", op="write_fsync", layer="write",
                                            result=result, **dict(shape, threads=1, loop_threads=threads)))
                 reader_path = remote_join(c.workspace("B"), name)
                 wait_visible(c, "B", reader_path, params.file_bytes)
                 backend, layer = backend_state(c, params, nodes, "A")
-                metrics_before = writer_metrics(c)
+                metrics_before = cluster_metrics(c)
                 result = fio(c, "B", params, reader_path, "read", block, threads, watch=("A",))
                 evidence = {"same_kernel": same_kernel, "backend": backend,
-                            "writer_metrics": benchlib.metrics_delta(metrics_before, writer_metrics(c),
-                                                                     WRITER_METRICS)}
-                rounds.append(round_record(c, "dfs.sequential", op="read", layer=layer,
+                            **read_round_evidence(c, params, metrics_before, 1, result["bytes"]),
+                            "log_events": log_event_counts(c, marks, params.log_events)}
+                require_reconciled(evidence["send_check"])
+                rounds.append(round_record(c, "dfs.sequential", op="read",
+                                           layer=benchlib.replica_layer(layer, evidence["send_check"]),
                                            result=result, evidence=evidence, **shape))
                 cached = benchlib.cached_verdict(probe(c, "B", "resident", reader_path), params.file_bytes)
                 result = fio(c, "B", params, reader_path, "read", block, threads)
@@ -326,12 +397,37 @@ def dfs_fanout(c):
                      link, owner=False, check=False)
 
 
+def elbencho_phase(c, params, phase, readers, link, name, reports, elbencho, block, threads):
+    """One elbencho read by `readers` (each reads the whole file); returns the parsed result and raw report."""
+    hosts = ["%s:%d" % (c.address(r), ELBENCHO_PORT) for r in readers]
+    report = remote_join(reports, "elbencho-%s-%s.json" % (hashlib.sha256(name.encode()).hexdigest()[:8], phase))
+    argv = benchlib.elbencho_read_argv(elbencho, hosts, remote_join(link, name), block=block,
+                                       file_bytes=params.file_bytes, threads=threads, result=report)
+    before = host_snapshot(c, ("A",) + tuple(readers))
+    console = run_tool(c, "A", params, "elbencho", argv[1:])
+    after = host_snapshot(c, ("A",) + tuple(readers))
+    c.record("bench.elbencho_console", {"name": name, "phase": phase, "stdout": console["stdout"][-2000:],
+                                        "stderr": console["stderr"][-2000:]})
+    text = c.python("A", "print(open(sys.argv[1]).read())", report)["stdout"]
+    result = benchlib.parse_elbencho(text, "READ")
+    result["disk"], result["host"] = host_evidence(before, after)
+    if result["hosts"] != len(readers) or result["bytes"] != params.file_bytes * len(readers):
+        raise AssertionError("elbencho did not read the full file on every reader: %r" % result)
+    return result, [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
 def fanout_rounds(c, params, readers, link, elbencho, env):
+    """Rounds of write-then-fan-out; metrics, the sent-bytes reconciliation and log events cover the round.
+
+    With a staggered arrival the seed's row carries its own window only; the followers' row carries the
+    whole-round evidence (`scope: whole_round`) after the declared gap.
+    """
     hosts = ["%s:%d" % (c.address(r), ELBENCHO_PORT) for r in readers]
     reports = remote_join(c.role_dir("A"), "bench-reports")
     mkdir_owned(c, "A", reports)
     nodes = [r for r in c.roles if r != "M"]
-    same_kernel = len({boot_id(c, r) for r in ("A",) + readers}) == 1
+    same_kernel = len({boot_id(c, r) for r in ("A",) + tuple(readers)}) == 1
+    phases = benchlib.arrival_phases(params.arrival, readers)
     rounds = []
     try:
         for block in params.block_bytes:
@@ -339,37 +435,36 @@ def fanout_rounds(c, params, readers, link, elbencho, env):
                 for number in range(params.rounds):
                     name = "fan-%d-%d-%d" % (block, threads, number)
                     shape = dict(block_bytes=block, threads=threads, round=number, file_bytes=params.file_bytes,
-                                 target="dfs", readers=len(readers))
+                                 target="dfs")
+                    marks = log_marks(c)
                     result = write_file(c, "A", params, remote_join(c.workspace("A"), name), block)
                     rounds.append(round_record(c, "dfs.fanout", op="write_fsync", layer="write", tool="fio",
-                                               result=result, **dict(shape, threads=1, loop_threads=threads)))
+                                               result=result, **dict(shape, threads=1, loop_threads=threads,
+                                                                     readers=len(readers))))
                     for role in readers:
                         wait_visible(c, role, remote_join(c.workspace(role), name), params.file_bytes)
                     backend, layer = backend_state(c, params, nodes, "A")
-                    evidence = {"same_kernel": same_kernel, "backend": backend}
-                    metrics_before = writer_metrics(c)
-                    report_name = "elbencho-%s.json" % hashlib.sha256(name.encode()).hexdigest()[:8]
-                    report = remote_join(reports, report_name)
-                    argv = benchlib.elbencho_read_argv(
-                        elbencho, hosts, remote_join(link, name), block=block,
-                        file_bytes=params.file_bytes, threads=threads, result=report,
-                    )
-                    before = host_snapshot(c, ("A",) + readers)
-                    console = run_tool(c, "A", params, "elbencho", argv[1:])
-                    after = host_snapshot(c, ("A",) + readers)
-                    c.record("bench.elbencho_console", {"name": name, "stdout": console["stdout"][-2000:],
-                                                        "stderr": console["stderr"][-2000:]})
-                    text = c.python("A", "print(open(sys.argv[1]).read())", report)["stdout"]
-                    result = benchlib.parse_elbencho(text, "READ")
-                    result["disk"], result["host"] = host_evidence(before, after)
-                    evidence["writer_metrics"] = benchlib.metrics_delta(metrics_before, writer_metrics(c),
-                                                                        WRITER_METRICS)
-                    if result["hosts"] != len(readers) or result["bytes"] != params.file_bytes * len(readers):
-                        raise AssertionError("elbencho did not read the full file on every reader: %r" % result)
-                    raw = [json.loads(line) for line in text.splitlines() if line.strip()]
-                    rounds.append(round_record(c, "dfs.fanout", op="read", layer=layer,
-                                               tool="elbencho",
-                                               result=result, evidence=evidence, raw=raw, **shape))
+                    metrics_before = cluster_metrics(c)
+                    total, rows = 0, []
+                    for index, (phase, group) in enumerate(phases):
+                        if index:
+                            time.sleep(params.arrival["gap_ms"] / 1000)
+                        result, raw = elbencho_phase(c, params, phase, group, link, name, reports, elbencho,
+                                                     block, threads)
+                        total += result["bytes"]
+                        evidence = {"same_kernel": same_kernel, "backend": backend, "readers": list(group)}
+                        if index == len(phases) - 1:
+                            evidence.update(read_round_evidence(c, params, metrics_before, len(readers), total),
+                                            scope="whole_round",
+                                            log_events=log_event_counts(c, marks, params.log_events))
+                            require_reconciled(evidence["send_check"])
+                        rows.append(dict(phase=phase, result=result, evidence=evidence, raw=raw,
+                                         readers=len(group)))
+                    # Every phase row is named after the whole-round reconciliation (reader replicas).
+                    round_layer = benchlib.replica_layer(layer, rows[-1]["evidence"]["send_check"])
+                    for row in rows:
+                        rounds.append(round_record(c, "dfs.fanout", op="read", layer=round_layer, tool="elbencho",
+                                                   arrival=params.arrival, **row, **shape))
                     remove(c, "A", remote_join(c.workspace("A"), name))
     finally:
         c.record("bench.elbencho_quit", c.command("A", [elbencho, "--hosts", ",".join(hosts), "--quit"],

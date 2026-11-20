@@ -578,7 +578,7 @@ python3 afs/tests/run.py run --suite local-performance --allow-performance \
 | `bench.env.localfs` | A | 同一组fio场景直接作用于A的原生ext4目录：写（单作业、`end_fsync`）、冷读、热读，作为上界 |
 | `bench.env.network` | A→B | iperf3 TCP吞吐，`threads`作为并发流数 |
 | `bench.dfs.sequential` | A写、B读 | DFS写（单作业，DFS单写者）；B从未打开过该文件时的远端冷读；B立即重读 |
-| `bench.dfs.fanout.many_readers` | A写、`bench.readers`个读者（B–E，默认2） | 各读者上的elbencho service同时读全量文件，A只协调 |
+| `bench.dfs.fanout.many_readers` | A写、`bench.readers`个读者（B–E，默认2） | 各读者上的elbencho service读全量文件（同时到达，或按`fanout_arrival`错峰），A只协调 |
 
 缓存层由证据确定，不由场景名确定。每轮使用新文件；冷读前对文件（本地）或所有Node的`state/`后端文件
 （DFS）执行fdatasync与`POSIX_FADV_DONTNEED`，再用`tools/bench_probe.py`经mmap+mincore实测驻留量。
@@ -595,13 +595,21 @@ catalog、epoch等）容许max(1%×元数据总量, 64页)。任一超限时再�
 
 | 键 | 含义 |
 | --- | --- |
-| `backend` | `disk`（默认）或`memory`。`memory`在各Node worker的私有mount namespace内把Node的`state/`挂成tmpfs（大小`memory_backend_bytes`，256MiB–64GiB），Node停止后、worker清理前卸载。chunk按声明驻留内存，不做后端驱逐，远端读层记为`remote_cold_memory_backend`（只表示读者从未打开该文件），不与磁盘的`remote_cold`合计；`bench.env.localfs`在内存后端下BLOCKED |
-| `node_overrides` | 角色（`*`或A–E）到白名单设置：`dfs_read_parallelism`、`dfs_readahead_max_bytes`、`dfs_read_crc_mode`、`dfs_read_pipeline.max_rpcs`、`dfs_peer_cache.capacity_bytes`（目录由框架建在该角色运行目录下的`peer-cache`）。写入Node配置后以`--print-config`核对，任一值未生效即失败，记为`bench.node_overrides.<角色>` |
-| `variant` | 变体标签（默认`V0`）；有`node_overrides`时必须不是`V0`。`bench.summary`同时记录`variant`、`backend`、`node_overrides` |
+| `backend` | `disk`（默认）或`memory`。`memory`在各Node worker的私有mount namespace内把Node的`state/`挂成tmpfs（大小`memory_backend_bytes`，256MiB–64GiB），声明了`dfs_peer_cache`的角色另把`peer-cache`挂成tmpfs（`capacity_bytes`+64MiB），Node停止后、worker清理前卸载。chunk按声明驻留内存，不做后端驱逐，远端读层记为`remote_cold_memory_backend`（只表示读者从未打开该文件），不与磁盘的`remote_cold`合计；`bench.env.localfs`在内存后端下BLOCKED |
+| `node_overrides` | 角色（`*`或A–E）到白名单设置（范围同产品）：`dfs_read_parallelism`（1–8）、`dfs_readahead_max_bytes`（0–32MiB）、`dfs_read_crc_mode`（`receiver`/`off`）、`dfs_read_pipeline.max_rpcs`（1–128）、`dfs_peer_cache.capacity_bytes`（目录由框架建在该角色运行目录下的`peer-cache`）、`dfs_read_cache_bytes`（0或4MiB+4KiB–1TiB）、`dfs_read_stripe_bytes`（64KiB的整数倍，64KiB–8MiB）、`dfs_source_cache_max_ms`（0–60000）。同一角色（含`*`合并后）同时有`dfs_read_cache_bytes`与`dfs_peer_cache.*`时BLOCKED。写入Node配置后以`--print-config`核对，任一值未生效即失败，记为`bench.node_overrides.<角色>` |
+| `dfs_desired_copies`、`dfs_sync_required_copies`、`dfs_local_copy` | 拓扑级副本设置，Meta与每个Node写入同一组值：desired 1–5（默认1），sync 1–desired（默认等于desired），`local_copy`为`required`（默认）/`preferred`/`none`；`dfs_min_distinct_nodes`取desired，`dfs_min_distinct_failure_domains`取1。都省略时沿用夹具默认（desired=sync=1、`required`）。desired超过该case启动的Node数时BLOCKED；各角色以`--print-config`核对，记为`bench.replication.<角色>` |
+| `variant` | 变体标签（默认`V0`）；有作用于环境`roles`中Node的`node_overrides`或声明了副本设置时必须不是`V0`（只指向环境里没有的角色的override不算变体）。`bench.summary`记录`variant`、`backend`、该case集群实际生效的`node_overrides`、`variant_applied`、`replication`、`arrival` |
 | `readers` | fan-out读者数1–4，依次为B、C、D、E；环境须为每个读者提供独立host项 |
+| `fanout_arrival` | `{"mode": "together"}`（默认，所有读者同时读）或`{"mode": "stagger", "seed": "B", "gap_ms": 15000}`：种子读者（须是本次读者之一，读者≥2）先单独读完，等`gap_ms`（0–600000）后其余读者同时读。两段各记一行（`phase`为`seed`/`followers`，同时到达为`all`），汇总按`phase`分组；整轮的指标差值、字节核对与日志事件记在最后一段（`evidence.scope = "whole_round"`） |
+| `log_events` | 追加统计的Node日志事件（每项1–200字符的单行子串）；默认已含`dfs.read_cache_install_failed`、`dfs.read_cache_reconcile_retry`、`DFS peer read admission deadline exceeded`、`peer stayed busy` |
 
-每轮另记：主机`/proc/vmstat`的`oom_kill`差值与`MemAvailable`（角色namespace看不到cgroup文件，按内核整体判断，任何OOM使该轮失败）；
-DFS远端读前后写者A的`/metrics`中读、peer、服务、准入、GC、缓存相关计数的变化（`evidence.writer_metrics`）。
+每轮另记：主机`/proc/vmstat`的`oom_kill`差值与`MemAvailable`（角色namespace看不到cgroup文件，按内核整体判断，任何OOM或读不到`oom_kill`都使该轮失败）；
+DFS远端读前后Meta与每个Node的`/metrics`差值（`evidence.metrics.<角色>`）：Node记读、peer、服务、准入、GC、缓存及`crc32c_read_bytes`相关计数，
+写者A的部分另记为`evidence.writer_metrics`；Meta记`afs_meta_rpc_requests_total`中读源、读缓存、读者登记与副本放置相关方法。
+`evidence.send_check`核对各Node`afs_dfs_payload_bytes_total{direction="send",operation="read"}`差值之和、N·S（读者数×文件大小）与工具读到的字节：
+写者A持有唯一副本（desired=1且`local_copy=required`）时三者必须相等，否则该case失败；读者可能持有本地副本时只记录不判定（`ok=null`），
+此时若各Node送出之和小于N·S，说明有读者读了自己的副本，该轮远端读层名加后缀`_local_replica`（如`remote_cold_local_replica`；错峰时两段同名），不与远端冷读合计；默认配置的层名不变。
+每轮（从写入前到远端读结束）统计各Node日志（`<角色>.log`）中含各事件的行数（`evidence.log_events`），日志被截断时从头计并标`rotated`。
 
 每轮写入`checks.json`的`bench.round`，含工具自身报告的字节数与耗时（fio、elbencho的JSON），
 每组另有`bench.summary`（全部样本、中位数、min/max及max/min）；工具版本与SHA-256记为`bench.tool_identity`。
