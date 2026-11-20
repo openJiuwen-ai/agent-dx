@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Node-side fixture operations; SDK business assertions live in scenarios.py."""
 
+# CLI results and live progress are part of the acceptance driver output.
+# ruff: noqa: T201
 import gzip
 import json
 import os
@@ -477,6 +479,16 @@ def main():
         marker.write_text(str(pid))
         os.kill(pid, signal.SIGSTOP)
         print('Resource observer suspended without stopping adxlet heartbeats', flush=True)
+    elif action == 'resource-block':
+        from resource_block import block
+
+        process = next(s for s in supervisor('status')['services'] if s['role'] == 'adxlet')
+        state = block(P, process['pid'])
+        (E / 'resource-block.json').write_text(json.dumps(state, indent=2) + '\n')
+    elif action == 'resource-unblock':
+        from resource_block import unblock
+
+        unblock(P)
     elif action == 'observer-resume':
         marker = P / 'frozen-observer.pid'
         if not (marker.is_file()):
@@ -632,7 +644,7 @@ def main():
         live = json.loads((E / 'resource-live.json').read_text())
         expect_available = True
         started = time.monotonic()
-        deadline = started + 30
+        deadline = started + 60
         last = None
         while True:
             try:
@@ -641,10 +653,14 @@ def main():
                 node2 = json.loads(records['node:node2'])
                 result = json.loads(records['environment:' + live['instance_id']])['result']
                 backends = labeled_backend(live['instance_id'])
-                sample = json.loads((P / 'capacity.json').read_text())
+                block_marker = P / 'resource-block.json'
+                blocked = json.loads(block_marker.read_text()) if block_marker.exists() else None
+                sample_path = P / ('capacity-before-block.json' if blocked else 'capacity.json')
+                sample = json.loads(sample_path.read_text())
                 sample_expired = time.time() >= sample['valid_until_unix_seconds']
                 observation_matches = (
                     sample_expired == (action == 'resource-stale')
+                    and (not blocked or time.monotonic() - blocked['blocked_at'] >= 35)
                     and node1['node']['available'] == expect_available
                     and node1['session']['routable']
                     and node1['session']['id'] == live['session_id']
@@ -656,6 +672,8 @@ def main():
                 if observation_matches:
                     evidence = {
                         'sample_expired': sample_expired,
+                        'blocked_for_seconds': time.monotonic() - blocked['blocked_at'] if blocked else None,
+                        'blocked_read': blocked,
                         'sample_valid_until': sample['valid_until_unix_seconds'],
                         'observed_at': time.time(),
                         'node1_available': expect_available,
@@ -1286,6 +1304,9 @@ def main():
     elif action in ('stop', 'cleanup'):
         stop_errors = []
         thaw_stale_runtime()
+        from resource_block import unblock
+
+        unblock(P)
         partition = P / 'network-partition.ip'
         if partition.exists():
             try:

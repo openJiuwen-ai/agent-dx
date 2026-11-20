@@ -110,6 +110,8 @@ async fn report(
         .heartbeat_sequence
         .checked_add(1)
         .ok_or_else(|| Status::internal("heartbeat sequence exhausted"))?;
+    // Recovery can span several reports while background pressure sampling advances.
+    registration.pressure = crate::resources::report_from(&manager.pressure_state());
     let mut request = Request::new(registration.clone());
     request.set_timeout(timeout);
     let result = match bounded_rpc(timeout, coordinator.register_node(request)).await {

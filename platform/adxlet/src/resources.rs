@@ -484,8 +484,7 @@ pub struct PressureUpdate {
     pub state: NodePressureState,
 }
 
-/// Wire form of the board state for the node heartbeat. Borrowed input: the
-/// heartbeat path owns the observation round and converts without cloning.
+/// Wire form of the latest pressure board state for the node heartbeat.
 impl From<&NodePressureState> for adx_protocol::control::NodePressureReport {
     fn from(state: &NodePressureState) -> Self {
         fn resource(pressure: &ResourcePressure) -> adx_protocol::control::NodePressureResource {

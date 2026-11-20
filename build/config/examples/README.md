@@ -43,8 +43,8 @@ The shipped deployment selects `resource_source.kind=auto`; `kind=sandboxd` sele
 
 The resource producer must atomically replace that file with measured capacity,
 physical devices and a future expiry; `0` above is an expired placeholder. A
-missing/invalid update uses the last observation until expiry, then closes new
-admission. The file reader is separate from the implemented sandboxd collector and automatic capacity source. Do not publish a configured resource budget as a measurement.
+missing/invalid update retains the last successful observation, including after
+expiry. Sample freshness is diagnostic and does not close admission. The file reader is separate from the implemented sandboxd collector and automatic capacity source. Do not publish a configured resource budget as a measurement.
 
 The optional Adxlet `pressure` configuration has independent `memory_enabled`
 and `disk_enabled` switches, both defaulting to `true`. Only enabled resources

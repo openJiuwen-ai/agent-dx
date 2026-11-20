@@ -23,6 +23,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "adxlet/observations.rs"]
+mod observations;
+
 const DMI_HOST_UUID_PATH: &str = "/sys/class/dmi/id/product_uuid";
 
 #[derive(Deserialize)]
@@ -213,6 +216,24 @@ async fn sample(
             })??;
     }
     source.sample(timeout).await
+}
+
+async fn sample_capabilities(
+    runtime: &RuntimeRouter,
+    configured: BTreeMap<String, adx_core::volumes::StorageMount>,
+    timeout: Duration,
+) -> (
+    BTreeMap<String, adx_core::volumes::StorageMount>,
+    Vec<String>,
+) {
+    let (mounts, classes) = tokio::join!(
+        tokio::time::timeout(timeout, adxlet::managed_mounts::mounted_storage(configured)),
+        tokio::time::timeout(timeout, runtime.available_runtime_classes()),
+    );
+    (
+        mounts.ok().and_then(Result::ok).unwrap_or_default(),
+        classes.ok().and_then(Result::ok).unwrap_or_default(),
+    )
 }
 
 fn coordinator_channel(
@@ -502,7 +523,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_address: config.advertised_address,
         proxy_address: config.proxy_address,
         capacity: Some(o.capacity.into()),
-        devices: o.devices.into_iter().map(Into::into).collect(),
+        devices: o.devices.iter().cloned().map(Into::into).collect(),
         labels,
         accepting_allocations: false,
         session_id: session_id.clone(),
@@ -543,13 +564,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     };
+    let period = Duration::from_secs(config.report_interval_seconds);
+    let sample_timeout = timeout.min(period);
+    // Seed registration with measured capabilities. The durable session identity
+    // must contain the first inventory before periodic, memory-only reports begin.
+    let mut initial = observations::Snapshot::new(o, valid);
+    (initial.storage_mounts, initial.runtime_classes) =
+        sample_capabilities(&runtime, config.storage_mounts.clone(), sample_timeout).await;
+    manager.update_runtime_classes(initial.runtime_classes.clone())?;
+    let (observed, latest) = tokio::sync::watch::channel(initial);
+    let capacity_samples = observations::observe(
+        period,
+        || sample(&source, &runtime, sample_timeout),
+        |result| {
+            if let Ok((capacity, valid)) = result {
+                manager.update_capacity(capacity.capacity, valid)?;
+                manager.update_devices(capacity.devices.clone(), valid)?;
+                observed.send_modify(|snapshot| {
+                    snapshot.capacity = capacity;
+                    snapshot.valid_until = tokio::time::Instant::now() + valid;
+                });
+            }
+            Ok(())
+        },
+    );
+    let capability_samples = observations::observe(
+        period,
+        || sample_capabilities(&runtime, config.storage_mounts.clone(), sample_timeout),
+        |(mounts, classes)| {
+            // Failed observations retain the existing eligibility semantics.
+            manager.update_runtime_classes(classes.clone())?;
+            observed.send_modify(|snapshot| {
+                snapshot.storage_mounts = mounts;
+                snapshot.runtime_classes = classes;
+            });
+            Ok(())
+        },
+    );
+    let pressure_samples = async {
+        if let (Some(config), Some(gate)) = (&config.pressure, &mut pressure_gate) {
+            observations::observe(
+                period,
+                || {
+                    let path = config.disk_path.clone();
+                    let resources = config.resources();
+                    tokio::task::spawn_blocking(move || {
+                        adxlet::resources::pressure(resources, path.as_deref())
+                    })
+                },
+                |result| {
+                    let update = match result {
+                        Ok(Ok(pressure)) => gate.update(pressure),
+                        Ok(Err(error)) => {
+                            adx_observability::warn!(%error, "pressure sample failed; pressure gate is open");
+                            gate.fail()
+                        }
+                        Err(error) => {
+                            adx_observability::warn!(%error, "pressure sampling task failed; pressure gate is open");
+                            gate.fail()
+                        }
+                    };
+                    manager.set_pressure_state(&update);
+                    Ok(())
+                },
+            )
+            .await
+        } else {
+            std::future::pending::<adx_core::Result<()>>().await
+        }
+    };
+    let sampling = async {
+        tokio::try_join!(capacity_samples, capability_samples, pressure_samples)?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
     let report = async {
         let mut last = registration.clone();
-        let mut valid_until = tokio::time::Instant::now() + valid;
-        // Resource/backend observation is not on the heartbeat critical path.
-        // Bound each sample to one reporting period and keep the last successful
-        // capacity during outages. Heartbeats continue independently.
-        let sample_timeout = timeout.min(Duration::from_secs(config.report_interval_seconds));
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
         loop {
@@ -567,64 +656,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => (),
                 }
             }
-            let mut r = last.clone();
-            // Observe storage and runtime capabilities concurrently so storage
-            // does not add another timeout period to the heartbeat path.
-            let (mounts, classes) = tokio::join!(
-                tokio::time::timeout(
-                    sample_timeout,
-                    adxlet::managed_mounts::mounted_storage(config.storage_mounts.clone()),
-                ),
-                tokio::time::timeout(sample_timeout, runtime.available_runtime_classes()),
-            );
-            // A failed storage observation withdraws only volume eligibility.
-            r.storage_mounts = match mounts {
-                Ok(Ok(mounts)) => mounts
-                    .into_iter()
-                    .map(|(id, mount)| (id, mount.into()))
-                    .collect(),
-                _ => Default::default(),
+            // Read only published values; no resource observation is awaited here.
+            let valid_until = {
+                let snapshot = latest.borrow();
+                snapshot.apply(&mut last);
+                snapshot.valid_until
             };
-            // A failed runtime observation closes new admission, while accepted
-            // executions and heartbeats continue through reconciliation.
-            r.runtime_classes = match classes {
-                Ok(Ok(classes)) => classes,
-                _ => vec![],
-            };
-            manager.update_runtime_classes(r.runtime_classes.clone())?;
-            if let Ok((o, valid)) = sample(&source, &runtime, sample_timeout).await {
-                valid_until = tokio::time::Instant::now() + valid;
-                manager.update_capacity(o.capacity, valid)?;
-                manager.update_devices(o.devices.clone(), valid)?;
-                r.capacity = Some(o.capacity.into());
-                r.devices = o.devices.into_iter().map(Into::into).collect();
-            }
-            if let (Some(config), Some(gate)) = (&config.pressure, &mut pressure_gate) {
-                let path = config.disk_path.clone();
-                let resources = config.resources();
-                let update = match tokio::task::spawn_blocking(move || {
-                    adxlet::resources::pressure(resources, path.as_deref())
-                })
-                .await
-                {
-                    Ok(Ok(pressure)) => gate.update(pressure),
-                    Ok(Err(error)) => {
-                        adx_observability::warn!(%error, "pressure sample failed; pressure gate is open");
-                        gate.fail()
-                    }
-                    Err(error) => {
-                        adx_observability::warn!(%error, "pressure sampling task failed; pressure gate is open");
-                        gate.fail()
-                    }
-                };
-                manager.set_pressure_state(&update);
-                // Heartbeat field: direct observation-point fill, same
-                // discipline as capacity/devices/storage_mounts above. The
-                // producer holds the state it just published, so the report
-                // and the board cannot drift.
-                r.pressure = adxlet::resources::report_from(&update.state);
-            }
-            last = r;
             // Startup and every reporting period use the same complete authority
             // cycle for every configured runtime. The cycle publishes readiness
             // immediately after success, before waiting for the next report tick.
@@ -716,6 +753,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = shutdown() => adxlet::proxy::ShutdownMode::Drain,
         }
     };
+    let services = observations::serve(services, sampling);
     let mode = adxlet::proxy::serve_until_shutdown(&manager, embedded, services, shutdown).await?;
     if let Err(error) = adxlet::node_reconciliation::finish_shutdown(
         mode,
