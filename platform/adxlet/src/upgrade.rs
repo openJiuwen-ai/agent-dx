@@ -543,6 +543,7 @@ impl crate::Adxlet {
             .unwrap_or_default();
         Ok(adx_protocol::control::NodeUpgradeInspection {
             protocol_version: 3,
+            guarded_resume: true,
             runtime_rootfs_sha256: rootfs.sha256,
             runtime_rootfs_path: rootfs.path,
             task_id: control.task_id,

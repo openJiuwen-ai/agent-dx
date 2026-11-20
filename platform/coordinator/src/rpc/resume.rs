@@ -408,6 +408,7 @@ impl CoordinatorRpc {
                         assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
                         operation_id: intent.operation_id.clone(),
                         node_session_id: session.clone(),
+                        expected_revision: None,
                     })
                     .await
             };

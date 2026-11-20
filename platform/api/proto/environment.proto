@@ -100,6 +100,8 @@ message EnsureRunningRequest {
 message EnsureEnvironmentRunningRequest {
   Assignment assignment = 1; string operation_id = 2; string node_session_id = 3;
   optional uint64 run_timeout_seconds = 4;
+  // An upgrade restore must still own this exact Pause when it reaches the actor.
+  optional uint64 expected_revision = 5;
 }
 
 message GetNodeSessionRequest {}
@@ -365,4 +367,5 @@ message NodeUpgradeInspection {
   string runtime_rootfs_path = 16;
   // Explicit maintenance protocol, including DeleteEnvironmentRequest field allocation.
   uint32 protocol_version = 17;
+  bool guarded_resume = 18;
 }

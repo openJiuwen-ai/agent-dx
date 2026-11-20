@@ -362,9 +362,19 @@ impl pb::node_service_server::NodeService for NodeRpc {
             return Err(Status::unavailable("node is reconciling or draining"));
         }
         let controller_started = Instant::now();
-        let result = handle
-            .ensure_running_with_timeout(r.operation_id, r.run_timeout_seconds)
-            .await;
+        let result = if let Some(expected_revision) = r.expected_revision {
+            handle
+                .resume(crate::checkpoint::ResumeRequest {
+                    operation_id: r.operation_id,
+                    expected_revision,
+                    run_timeout_seconds: r.run_timeout_seconds,
+                })
+                .await
+        } else {
+            handle
+                .ensure_running_with_timeout(r.operation_id, r.run_timeout_seconds)
+                .await
+        };
         adx_observability::info!(
             event = "node_ensure_running_stages", environment_id = %assignment.environment_id,
             gate_wait_ms, controller_ms = controller_started.elapsed().as_secs_f64() * 1_000.0,

@@ -34,7 +34,7 @@ pub struct UpgradeOperation {
 }
 impl UpgradeOperation {
     pub(crate) fn settled(&self) -> bool {
-        matches!(self.phase.as_str(), "Completed" | "Cancelled")
+        matches!(self.phase.as_str(), "Completed" | "Cancelled" | "Deferred")
     }
 
     pub(crate) fn owns_transfer(&self, stored: &StoredEnvironment) -> bool {
@@ -246,8 +246,18 @@ impl Session {
     }
     pub async fn save_upgrade(
         &self,
+        task: UpgradeTask,
+        expected_revision: Option<u64>,
+    ) -> Result<UpgradeTask> {
+        self.save_upgrade_with_result(task, expected_revision, None)
+            .await
+    }
+
+    pub(crate) async fn save_upgrade_with_result(
+        &self,
         mut task: UpgradeTask,
         expected_revision: Option<u64>,
+        deferred_result: Option<&EnvironmentRecord>,
     ) -> Result<UpgradeTask> {
         task.require_protocol()?;
         task.validate()?;
@@ -282,6 +292,50 @@ impl Session {
             let mut checks = vec![(HEADER.into(), raw.clone())];
             let old_active = previous.as_ref().filter(|old| old.active());
             if let Some(old) = old_active {
+                for (id, operation) in &task.operations {
+                    let starts_deferral = operation.phase == "Deferring"
+                        && old
+                            .operations
+                            .get(id)
+                            .is_some_and(|op| op.phase == "Prepared");
+                    let finishes_deferral = operation.phase == "Deferred"
+                        && old
+                            .operations
+                            .get(id)
+                            .is_some_and(|op| op.phase == "Deferring");
+                    if !starts_deferral && !finishes_deferral {
+                        continue;
+                    }
+                    let field = format!("environment:{}", operation.environment_id);
+                    let token_field = format!("node-session:{}", operation.source_node_id);
+                    let [value, token] = self
+                        .store
+                        .fields([field.clone(), token_field.clone()])
+                        .await?;
+                    let source: StoredEnvironment =
+                        decode(value.as_deref().ok_or(Error::Conflict)?)?;
+                    if source.assignment.node_id != operation.source_node_id
+                        || source.assignment.generation != operation.source_generation
+                        || source.invalidated
+                        || source.resume.is_some()
+                        || source.recovery.as_ref().is_some_and(|r| r.pending)
+                        || token.as_deref() != Some(operation.source_session_id.as_str())
+                        || starts_deferral
+                            && source.result.as_ref().is_none_or(|r| {
+                                r.state != EnvironmentState::Paused
+                                    || r.resources_held
+                                    || Some(r.revision) != operation.source_stopped_revision
+                            })
+                        || finishes_deferral
+                            && (deferred_result.is_none()
+                                || source.result.as_ref() != deferred_result)
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    // Ownership transfer also compares the upgrade record. Only
+                    // one of the transfer and deferral CAS operations can win.
+                    checks.extend([(field, value), (token_field, token)]);
+                }
                 for (id, node) in &task.nodes {
                     let previous = old.nodes.get(id);
                     let old_rv = previous.and_then(|node| node.delete_resource_version.as_ref());

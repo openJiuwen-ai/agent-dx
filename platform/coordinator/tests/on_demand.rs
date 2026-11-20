@@ -21,7 +21,7 @@ use adx_transport::rpc::{RpcChannel, RpcClient};
 use adxlet::{
     checkpoint::CheckpointCooperation,
     rpc::{CoordinatorStateSink, NodeRpc},
-    Adxlet, Readiness, Routes, RuntimeDriver,
+    Adxlet, Durability, Readiness, Routes, RuntimeDriver, StateSink,
 };
 use async_trait::async_trait;
 use std::{
@@ -87,6 +87,7 @@ struct Backend {
     restore_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     restore_entered: tokio::sync::Notify,
     fail_after_gate: AtomicBool,
+    restore_input_publication: Mutex<Option<bool>>,
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
@@ -244,6 +245,65 @@ impl CheckpointCooperation for Backend {
     }
 }
 
+struct RestoreInputFault {
+    coordinator: CoordinatorStateSink,
+    backend: Arc<Backend>,
+}
+
+#[async_trait]
+impl StateSink for RestoreInputFault {
+    async fn has_current_assignment(&self, record: &EnvironmentRecord) -> Result<bool> {
+        self.coordinator.has_current_assignment(record).await
+    }
+
+    async fn prepare_execution(
+        &self,
+        record: &EnvironmentRecord,
+        previous: &str,
+    ) -> Result<EnvironmentSpec> {
+        self.coordinator.prepare_execution(record, previous).await
+    }
+
+    async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
+        self.commit_releasing(record, &[]).await
+    }
+
+    async fn commit_releasing(
+        &self,
+        record: &EnvironmentRecord,
+        stopped: &[String],
+    ) -> Result<Durability> {
+        if record.state == adx_core::EnvironmentState::Paused
+            && !record.execution_artifacts.is_empty()
+        {
+            let lost_ack = self
+                .backend
+                .restore_input_publication
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(commit_first) = lost_ack {
+                if commit_first {
+                    self.coordinator.commit_releasing(record, stopped).await?;
+                }
+                return Ok(Durability::Journaled);
+            }
+        }
+        self.coordinator.commit_releasing(record, stopped).await
+    }
+
+    async fn commit_deleted(
+        &self,
+        record: &EnvironmentRecord,
+        cleanup: &[adx_core::CheckpointArtifact],
+        stopped: &[String],
+    ) -> Result<Durability> {
+        self.coordinator
+            .commit_deleted(record, cleanup, stopped)
+            .await
+    }
+}
+
 struct Worker {
     store: Arc<ObjectCheckpointStore>,
     sink: CoordinatorStateSink,
@@ -299,7 +359,10 @@ async fn worker(
             backend.clone(),
             backend.clone(),
             backend.clone(),
-            Arc::new(sink.clone()),
+            Arc::new(RestoreInputFault {
+                coordinator: sink.clone(),
+                backend: backend.clone(),
+            }),
         )
         .with_checkpointing(store.clone(), backend.clone())
         .unwrap()

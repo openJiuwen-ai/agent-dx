@@ -92,7 +92,10 @@ DaemonSet and still runs the original image. Task isolation is recorded
 separately from administrator pause intent; releasing it preserves manual pauses.
 
 The `drain` capability requires Coordinator and adxlet builds supporting the
-`draining` gate. The task pause excludes the source from new placements.
+`draining` gate and revision-guarded Resume. Check `guarded_resume:true` in
+management capabilities and in every source node's inspection before starting
+the task. The Coordinator also checks each source before pausing its scheduling.
+The task pause excludes the source from new placements.
 Existing operations and same-session Resume continue unless an administrator
 paused the node or the Sandbox has an unsettled migration. Optional migration
 selects a compatible, pending node registered with the same upgrade task.
@@ -203,6 +206,16 @@ explicit Published deletion was confirmed, including through its durable
 deletion receipt. It is historical progress, not a guarantee that the user has
 kept the Environment running afterward. A successful migrate response still
 requires the expected target execution state.
+
+In drain mode, if capacity runs out after Pause and the original source still
+owns the Environment, `Deferring` fences further transfer. Retry that same
+operation if source recovery is pending. Once a task-paused Environment has
+published Running on the original owner, or an existing user Pause is
+confirmed unchanged, the operation records `Deferred`. The migrate response
+is HTTP 200 with `outcome:"deferred"`, `completed:false`, and the source
+`environment_id`, `node_id` and `generation`. Leave the Environment on that
+node and continue draining in the same task. Pod deletion still requires strict
+emptiness. If ownership already moved, continue settling the original transfer.
 
 `Cancelled` is an abort-only receipt for a Prepared operation whose ownership
 never left its original source generation/session. Freeze removes new Pause
