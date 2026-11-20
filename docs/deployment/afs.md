@@ -1091,8 +1091,7 @@ NodeReplicated DFS 默认启动每 5 秒一次的安全回收；引用退休后�
 
 `ownerfs_adopt_on_startup = true` 时，`afs-node` 在挂载前扫描 `ownerfs_data_dir` 的
 直接子项，把符合条件的目录原地纳管为 workspace：不 `rename`、不 `copy`、不改
-uid/gid/mode。扫描规则与崩溃窗口见
-[OwnerFs 原生目录名纳管设计](../development/ownerfs-adopt-native-name-design.md)。
+uid/gid/mode。
 
 开启前必须完成以下核对，缺一不可：
 
