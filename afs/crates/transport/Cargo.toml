@@ -11,7 +11,7 @@ publish = false
 [features]
 default = ["grpc"]
 grpc = ["dep:thiserror", "dep:tonic", "dep:afs-error", "dep:afs-protocol", "dep:prost", "dep:prost-types", "dep:tonic-types", "dep:tokio", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:hyper-util", "dep:tower", "dep:futures-util", "dep:afs-logging", "dep:blake3", "dep:rustls"]
-rdma = []
+rdma = ["dep:tokio", "tokio/rt"]
 shm = ["dep:libc", "dep:nix"]
 
 [dependencies]

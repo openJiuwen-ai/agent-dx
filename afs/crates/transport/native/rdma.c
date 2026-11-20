@@ -149,7 +149,7 @@ int afs_rdma_close(void *opaque, size_t *retained_registered_bytes) {
     if (!e) return AFS_RDMA_RELEASED;
     if (e->qp && !drain_qp(e)) {
         if (e->mr) *retained_registered_bytes = e->capacity;
-        return AFS_RDMA_RETAINED_DRAIN;
+        return e->cq_untrusted ? AFS_RDMA_RETAINED_CQ : AFS_RDMA_RETAINED_DRAIN;
     }
     /* Local CQ accounting covers this QP's WRs. Destroy the isolated QP
      * before deregistering the MR: successful inbound one-sided accesses do

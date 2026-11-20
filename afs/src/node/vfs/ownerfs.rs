@@ -4608,7 +4608,7 @@ impl LocalOwnerFs {
                 }
                 let written = file
                     .write_at(offset, data)
-                    .map_err(|error| file.write_failure(error, !data.is_empty()))?;
+                    .map_err(|error| file.write_syscall_failure(error, !data.is_empty()))?;
                 if written > 0 {
                     if options.kill_suidgid {
                         clear_suidgid_on_file(&file.handle.file).map_err(|error| {
@@ -7205,6 +7205,19 @@ struct OpenLocalFile {
 enum TestHomeWriteFault {
     Partial,
     Sync,
+    NoSpace,
+    Rejected(i32),
+}
+
+#[cfg(test)]
+impl TestHomeWriteFault {
+    fn rejected_errno(self) -> Option<i32> {
+        match self {
+            Self::NoSpace => Some(libc::ENOSPC),
+            Self::Rejected(errno) => Some(errno),
+            Self::Partial | Self::Sync => None,
+        }
+    }
 }
 
 struct OpenRemoteFile {
@@ -7234,16 +7247,23 @@ impl OpenFileHandle {
 }
 
 impl OpenLocalFile {
-    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize> {
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<usize> {
         #[cfg(test)]
-        if let Some(fault) = self.test_write_fault {
+        {
             self.test_write_attempts += 1;
-            if matches!(fault, TestHomeWriteFault::Partial) {
+            if let Some(errno) = self
+                .test_write_fault
+                .and_then(TestHomeWriteFault::rejected_errno)
+            {
+                self.test_write_fault = None;
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
+            if matches!(self.test_write_fault, Some(TestHomeWriteFault::Partial)) {
                 self.handle.file.write_at(offset, &data[..data.len() / 2])?;
-                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
         }
-        self.handle.file.write_at(offset, data).map_err(Error::from)
+        self.handle.file.write_at(offset, data)
     }
 
     fn sync_after_write(&self) -> Result<()> {
@@ -7252,6 +7272,25 @@ impl OpenLocalFile {
             return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
         }
         self.write_sync.sync(&self.handle.file)
+    }
+
+    fn write_syscall_failure(&mut self, error: std::io::Error, nonempty: bool) -> Error {
+        if self.handle.peer.is_some() {
+            let code = match error.raw_os_error() {
+                Some(libc::EDQUOT) => Some(afs_error::IO_QUOTA_EXCEEDED),
+                Some(libc::EFAULT) => Some(afs_error::IO_BAD_ADDRESS),
+                Some(libc::EINTR) => Some(afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED),
+                Some(libc::EAGAIN) => Some(afs_error::NODE_OWNER_WRITE_NOT_EXECUTED),
+                Some(libc::ENOSPC | libc::EFBIG | libc::EINVAL | libc::EBADF | libc::EPERM) => {
+                    return error.into();
+                }
+                _ => None,
+            };
+            if let Some(code) = code {
+                return Error::coded(code, error.to_string());
+            }
+        }
+        self.write_failure(error.into(), nonempty)
     }
 
     fn write_failure(&mut self, error: Error, may_have_written: bool) -> Error {
@@ -7303,7 +7342,10 @@ impl OpenRemoteFile {
     }
 
     fn remember_fatal_sync_error(&mut self, error: &Error) {
-        if self.fatal_sync_error.is_none() && is_fatal_sync_error(error) {
+        if self.fatal_sync_error.is_none()
+            && !remote::write_was_not_executed(error)
+            && is_fatal_sync_error(error)
+        {
             self.fatal_sync_error = Some(error.clone());
         }
     }
@@ -8066,8 +8108,15 @@ fn is_fatal_sync_error(error: &Error) -> bool {
 
 fn write_authorization_failure(error: Error) -> Error {
     if remote::write_status_requires_execution_evidence(&error) {
+        use afs_error::ErrorKind;
+        let code = match error.kind() {
+            ErrorKind::DeadlineExceeded => afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_TIMEOUT,
+            ErrorKind::Unavailable => afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_UNAVAILABLE,
+            ErrorKind::Cancelled => afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED,
+            _ => afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_IO,
+        };
         Error::coded(
-            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED,
+            code,
             format!("OwnerFiles write rejected before file mutation: {error}"),
         )
     } else {
@@ -12566,13 +12615,46 @@ mod tests {
         let msg = "Meta validation timed out";
         let timeout = Error::coded(afs_error::CLIENT_DEADLINE_EXCEEDED, msg);
         let status = write_authorization_failure(timeout);
-        assert_eq!(status.code(), afs_error::NODE_OWNER_WRITE_NOT_EXECUTED);
+        assert_eq!(
+            status.code(),
+            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_TIMEOUT
+        );
+        assert_eq!(crate::error::errno(&status), libc::ETIMEDOUT);
+        let unavailable = Error::coded(afs_error::IO_UNAVAILABLE, "Meta unavailable");
+        let status = write_authorization_failure(unavailable);
+        assert_eq!(crate::error::errno(&status), libc::EHOSTUNREACH);
         let denied = Error::coded(afs_error::NODE_OWNER_RIGHT_DENIED, "denied");
         assert_eq!(write_authorization_failure(denied.clone()), denied);
     }
 
     #[tokio::test]
     async fn home_partial_write_and_sync_failure_are_sticky_for_peer() {
+        check_home_write_fault(TestHomeWriteFault::Partial, b"da").await;
+        check_home_write_fault(TestHomeWriteFault::Sync, b"data").await;
+    }
+
+    #[tokio::test]
+    async fn home_no_space_leaves_same_peer_handle_writable() {
+        check_home_write_fault(TestHomeWriteFault::NoSpace, b"data").await;
+    }
+
+    #[tokio::test]
+    async fn home_known_write_rejections_preserve_errno_and_peer_handle() {
+        for errno in [
+            libc::EDQUOT,
+            libc::EFBIG,
+            libc::EINVAL,
+            libc::EBADF,
+            libc::EFAULT,
+            libc::EINTR,
+            libc::EAGAIN,
+            libc::EPERM,
+        ] {
+            check_home_write_fault(TestHomeWriteFault::Rejected(errno), b"data").await;
+        }
+    }
+
+    async fn check_home_write_fault(fault: TestHomeWriteFault, expected: &[u8]) {
         use crate::node::rpc::{
             data::{
                 PeerAuthenticator, make_owner_files_handler, make_owner_files_server_with_handler,
@@ -12593,78 +12675,87 @@ mod tests {
             }
         }
 
-        for (fault, expected) in [
-            (TestHomeWriteFault::Partial, b"da".as_slice()),
-            (TestHomeWriteFault::Sync, b"data".as_slice()),
-        ] {
-            let (_temp, fs, ctx) = fixture();
-            let root = BackendInode {
-                value: OWNERFS_ROOT_INODE,
+        let (_temp, fs, ctx) = fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.mkdir(&ctx, root, OsStr::new("job-a"), 0o755).unwrap();
+        let local = fs.require_local().unwrap();
+        let parent = local.record(workspace.inode.value).unwrap();
+        let grant = test_grant(parent.root_id.clone());
+        let access = presented(&grant);
+        let path = OsStr::new("file");
+        let created = local
+            .peer_create_with_options(
+                &ctx,
+                "node-b",
+                &access,
+                path,
+                libc::O_RDWR | libc::O_SYNC,
+                0o600,
+                &parent.identity,
+                OpenOptions::default(),
+            )
+            .unwrap();
+        let remote = created.file;
+        let handle = decode_file_handle(&remote).unwrap();
+        let slot = local.open_file_handle(handle).unwrap();
+        {
+            let mut slot = slot.lock().unwrap();
+            let OpenFileHandle::Local(open) = &mut slot.file else {
+                unreachable!()
             };
-            let workspace = fs.mkdir(&ctx, root, OsStr::new("job-a"), 0o755).unwrap();
-            let local = fs.require_local().unwrap();
-            let parent = local.record(workspace.inode.value).unwrap();
-            let grant = test_grant(parent.root_id.clone());
-            let access = presented(&grant);
-            let path = OsStr::new("file");
-            let created = local
-                .peer_create_with_options(
-                    &ctx,
-                    "node-b",
-                    &access,
-                    path,
-                    libc::O_RDWR | libc::O_SYNC,
-                    0o600,
-                    &parent.identity,
-                    OpenOptions::default(),
-                )
-                .unwrap();
-            let remote = created.file;
-            let handle = decode_file_handle(&remote).unwrap();
-            let slot = local.open_file_handle(handle).unwrap();
-            {
-                let mut slot = slot.lock().unwrap();
-                let OpenFileHandle::Local(open) = &mut slot.file else {
-                    unreachable!()
-                };
-                open.test_write_fault = Some(fault);
-            }
-            let handler = make_owner_files_handler(fs.peer_executor().unwrap());
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(
-                tonic::transport::Server::builder()
-                    .add_service(make_owner_files_server_with_handler(
-                        handler,
-                        Arc::new(TestPeer),
-                    ))
-                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
-            );
-            let channel = tonic::transport::Endpoint::from_shared(endpoint)
-                .unwrap()
-                .connect()
-                .await
-                .unwrap();
-            let client = owner_files_client_from_channel_with_runtime(
-                channel,
-                tokio::runtime::Handle::current(),
-            );
-            let (_caller_temp, caller, caller_ctx) = fixture();
-            let caller_handle = caller
-                .require_local()
-                .unwrap()
-                .state
-                .lock()
-                .unwrap()
-                .insert_remote_file_handle(grant, Arc::new(client), remote, false, true);
-            crate::node::bridge::spawn_blocking(move || {
-                let before = caller
-                    .write(&caller_ctx, caller_handle, u64::MAX, b"data")
-                    .unwrap_err();
-                assert_eq!(before.code(), afs_error::IO_INVALID);
-                let error = caller
-                    .write(&caller_ctx, caller_handle, 0, b"data")
-                    .unwrap_err();
+            open.test_write_fault = Some(fault);
+        }
+        let handler = make_owner_files_handler(fs.peer_executor().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(make_owner_files_server_with_handler(
+                    handler,
+                    Arc::new(TestPeer),
+                ))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let channel = tonic::transport::Endpoint::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = owner_files_client_from_channel_with_runtime(
+            channel,
+            tokio::runtime::Handle::current(),
+        );
+        let (_caller_temp, caller, caller_ctx) = fixture();
+        let caller_handle = caller
+            .require_local()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .insert_remote_file_handle(grant, Arc::new(client), remote, false, true);
+        crate::node::bridge::spawn_blocking(move || {
+            let before = caller
+                .write(&caller_ctx, caller_handle, u64::MAX, b"data")
+                .unwrap_err();
+            assert_eq!(before.code(), afs_error::IO_INVALID);
+            let error = caller
+                .write(&caller_ctx, caller_handle, 0, b"data")
+                .unwrap_err();
+            if let Some(errno) = fault.rejected_errno() {
+                assert_eq!(crate::error::errno(&error), errno);
+                assert_eq!(
+                    caller
+                        .write(&caller_ctx, caller_handle, 0, b"data")
+                        .unwrap(),
+                    4
+                );
+                caller.flush(&caller_ctx, caller_handle).unwrap();
+                caller
+                    .fsync(&caller_ctx, caller_handle, SyncMode::Full)
+                    .unwrap();
+            } else {
                 assert_eq!(error.code(), afs_error::NODE_OWNER_WRITE_UNKNOWN);
                 assert_eq!(
                     caller
@@ -12679,29 +12770,36 @@ mod tests {
                         .unwrap_err(),
                     error
                 );
-                caller.release(&caller_ctx, caller_handle).unwrap();
-            })
-            .await
-            .unwrap();
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while local.open_file_handle(handle).is_ok() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("client release must remove the Home handle");
-            {
-                let slot = slot.lock().unwrap();
-                let OpenFileHandle::Local(open) = &slot.file else {
-                    unreachable!()
-                };
-                assert_eq!(open.test_write_attempts, 1);
-                let mut data = [0; 8];
-                let len = open.handle.file.read_at(0, &mut data).unwrap();
-                assert_eq!(&data[..len], expected);
             }
-            server.abort();
+            caller.release(&caller_ctx, caller_handle).unwrap();
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while local.open_file_handle(handle).is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client release must remove the Home handle");
+        {
+            let slot = slot.lock().unwrap();
+            let OpenFileHandle::Local(open) = &slot.file else {
+                unreachable!()
+            };
+            assert_eq!(
+                open.test_write_attempts,
+                if fault.rejected_errno().is_some() {
+                    2
+                } else {
+                    1
+                }
+            );
+            let mut data = [0; 8];
+            let len = open.handle.file.read_at(0, &mut data).unwrap();
+            assert_eq!(&data[..len], expected);
         }
+        server.abort();
     }
 
     #[test]

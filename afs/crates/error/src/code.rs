@@ -64,6 +64,10 @@ catalog! {
     NODE_OWNER_STALE_HANDLE = 0x020b0005 => FailedPrecondition;
     NODE_OWNER_WRITE_UNKNOWN = 0x020b0006 => Internal;
     NODE_OWNER_WRITE_NOT_EXECUTED = 0x020b0007 => Aborted;
+    NODE_OWNER_WRITE_NOT_EXECUTED_TIMEOUT = 0x020b0008 => DeadlineExceeded;
+    NODE_OWNER_WRITE_NOT_EXECUTED_UNAVAILABLE = 0x020b0009 => Unavailable;
+    NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED = 0x020b000a => Cancelled;
+    NODE_OWNER_WRITE_NOT_EXECUTED_IO = 0x020b000b => Internal;
     NODE_DFS_STALE_HANDLE = 0x020c0001 => FailedPrecondition;
     NODE_DFS_STALE_NAME = 0x020c0002 => FailedPrecondition;
     NODE_RDMA_SESSION_UNKNOWN = 0x02090001 => FailedPrecondition;
@@ -125,4 +129,6 @@ catalog! {
     IO_WOULD_BLOCK = 0x04030016 => Unavailable;
     IO_DEADLOCK = 0x04030017 => FailedPrecondition;
     IO_NO_LOCKS = 0x04030018 => ResourceExhausted;
+    IO_QUOTA_EXCEEDED = 0x04030019 => ResourceExhausted;
+    IO_BAD_ADDRESS = 0x0403001a => InvalidArgument;
 }

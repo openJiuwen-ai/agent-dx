@@ -135,6 +135,28 @@ fn owner_dispatched_write_preserves_explicit_not_executed() {
         owner_dispatched_write_status(status).code(),
         afs_error::NODE_OWNER_WRITE_NOT_EXECUTED
     );
+    for (code, raw_errno) in [
+        (
+            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_TIMEOUT,
+            libc::ETIMEDOUT,
+        ),
+        (
+            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_UNAVAILABLE,
+            libc::EHOSTUNREACH,
+        ),
+        (
+            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED,
+            libc::EINTR,
+        ),
+        (afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_IO, libc::EIO),
+    ] {
+        let error = owner_dispatched_write_status(afs_transport::grpc::error_status::coded_status(
+            code,
+            "write did not start",
+        ));
+        assert_eq!(error.code(), code);
+        assert_eq!(crate::error::errno(&error.0), raw_errno);
+    }
     for status in [Status::cancelled("lost"), Status::internal("stream reset")] {
         assert_eq!(
             owner_dispatched_write_status(status).code(),

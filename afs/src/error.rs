@@ -75,6 +75,12 @@ pub fn http_status(kind: ErrorKind) -> StatusCode {
     }
 }
 pub fn errno(error: &Error) -> i32 {
+    if error.code() == afs_error::IO_QUOTA_EXCEEDED {
+        return libc::EDQUOT;
+    }
+    if error.code() == afs_error::IO_BAD_ADDRESS {
+        return libc::EFAULT;
+    }
     if error.code() == afs_error::IO_INTERRUPTED {
         return libc::EINTR;
     }

@@ -337,11 +337,7 @@ impl RdmaSessionRegistry {
             .ok_or_else(|| {
                 coded_status(afs_error::NODE_RDMA_SESSION_UNKNOWN, "unknown RDMA session")
             })?;
-        if session.peer_identity.as_ref() != identity {
-            return Err(Status::permission_denied(
-                "RDMA session belongs to another peer or transport scope",
-            ));
-        }
+        check_rdma_session_scope(session.peer_identity.as_ref(), identity)?;
         if session.poisoned.load(Ordering::SeqCst) {
             return Err(coded_status(
                 afs_error::NODE_RDMA_SESSION_POISONED,
@@ -453,12 +449,8 @@ impl RdmaSessionRegistry {
         identity: Option<&PeerSessionIdentity>,
     ) -> Result<(), Status> {
         let mut sessions = self.inner.lock().await;
-        if let Some(session) = sessions.get(&session_id)
-            && session.peer_identity.as_ref() != identity
-        {
-            return Err(Status::permission_denied(
-                "RDMA close identity does not match session owner",
-            ));
+        if let Some(session) = sessions.get(&session_id) {
+            check_rdma_session_scope(session.peer_identity.as_ref(), identity)?;
         }
         let removed = sessions.remove(&session_id);
         drop(sessions);
@@ -466,6 +458,19 @@ impl RdmaSessionRegistry {
             let _ = crate::node::bridge::spawn_blocking(move || drop(session)).await;
         }
         Ok(())
+    }
+}
+
+fn check_rdma_session_scope(
+    bound: Option<&PeerSessionIdentity>,
+    command: Option<&PeerSessionIdentity>,
+) -> Result<(), Status> {
+    if bound == command {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "RDMA session belongs to another peer or transport scope",
+        ))
     }
 }
 
@@ -786,6 +791,36 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
+    #[test]
+    fn dfs_recycled_rdma_id_rejects_stale_and_legacy_scope_without_device() {
+        let old = RdmaSessionRegistry::default();
+        let new = RdmaSessionRegistry::default();
+        let bound = new
+            .dfs_session_identity("reader".into(), 1, new.dfs_generation())
+            .unwrap();
+        let legacy = new.dfs_session_identity("reader".into(), 1, &[]).unwrap();
+        let stale = old
+            .dfs_session_identity("reader".into(), 1, old.dfs_generation())
+            .unwrap();
+        // A restarted registry can assign the same ID to a new bound scope.
+        // Lookup and close both pass that entry's scope to this guard.
+        let sessions = HashMap::from([(1, bound.clone())]);
+        for command in [&legacy, &stale] {
+            assert_eq!(
+                check_rdma_session_scope(sessions.get(&1), Some(command))
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied,
+            );
+        }
+        assert!(
+            new.dfs_session_identity("reader".into(), 1, old.dfs_generation())
+                .is_err()
+        );
+        assert!(check_rdma_session_scope(sessions.get(&1), Some(&bound)).is_ok());
+    }
+
+    #[cfg(feature = "dfs")]
     #[cfg_attr(
         feature = "rdma",
         ignore = "run on Linux with an RXE or physical RDMA device"
@@ -1046,6 +1081,13 @@ mod tests {
         );
 
         drop(retained);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while registry.admission.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background retirement returns the permit after provider release");
         let reply = negotiate_rdma(
             &registry,
             device,

@@ -34,6 +34,10 @@ pub const CAPACITY: usize = 1024 * 1024;
 /// max-chunk target without allowing unbounded pinned memory.
 pub const MAX_CAPACITY: usize = 4 * 1024 * 1024;
 const ERR_BYTES: usize = 256;
+#[cfg(has_native_rdma)]
+const RETAINED_DRAIN: i32 = 6; // AFS_RDMA_RETAINED_DRAIN in native/rdma.h
+#[cfg(has_native_rdma)]
+const MAX_DRAIN_RETRIES_PER_SWEEP: usize = 8;
 
 #[derive(Debug)]
 pub struct RdmaError(pub String);
@@ -465,7 +469,7 @@ impl<P: Send + 'static> RdmaLease<P> {
     }
 
     /// Attempts synchronous retirement. Failure quarantines the native endpoint
-    /// together with its permit until the process exits.
+    /// together with its permit. The sweeper can retry an incomplete drain.
     #[must_use]
     pub fn retire(mut self) -> RdmaRetireOutcome {
         self.retire_once()
@@ -529,6 +533,19 @@ impl<P: Send + 'static> RdmaLease<P> {
 
 impl<P: Send + 'static> Drop for RdmaLease<P> {
     fn drop(&mut self) {
+        #[cfg(has_native_rdma)]
+        if self.admission.is_some()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            if let Some(admission) = self.admission.take()
+                && let Some(retirement) = self.endpoint.take_retirement(admission)
+            {
+                // Holding both resources in this guard also handles shutdown
+                // discarding the blocking closure before it starts.
+                drop(runtime.spawn_blocking(move || drop(retirement)));
+            }
+            return;
+        }
         self.retire_once();
     }
 }
@@ -550,17 +567,18 @@ pub struct RdmaResourceStats {
 
 #[cfg(has_native_rdma)]
 struct RetainedEndpoint {
-    _ptr: NonNull<std::ffi::c_void>,
+    ptr: NonNull<std::ffi::c_void>,
 }
 
-// SAFETY: the pointer is uniquely owned and never accessed again after quarantine.
+// SAFETY: the pointer is uniquely owned. Only the current owner may invoke close.
 #[cfg(has_native_rdma)]
 unsafe impl Send for RetainedEndpoint {}
 
 #[cfg(has_native_rdma)]
 struct QuarantinedEndpoint {
-    _native: RetainedEndpoint,
+    native: RetainedEndpoint,
     _admission: Box<dyn Send>,
+    stage: i32,
     registered_bytes: usize,
 }
 
@@ -569,12 +587,31 @@ struct QuarantinedEndpoint {
 struct Quarantine {
     records: Vec<QuarantinedEndpoint>,
     failed_retirements: usize,
+    retrying_endpoints: usize,
+    retrying_bytes: usize,
+}
+
+#[cfg(has_native_rdma)]
+impl Quarantine {
+    fn retained_endpoints(&self) -> usize {
+        self.records.len() + self.retrying_endpoints
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.records
+            .iter()
+            .map(|record| record.registered_bytes)
+            .sum::<usize>()
+            + self.retrying_bytes
+    }
 }
 
 #[cfg(has_native_rdma)]
 static QUARANTINE: Mutex<Quarantine> = Mutex::new(Quarantine {
     records: Vec::new(),
     failed_retirements: 0,
+    retrying_endpoints: 0,
+    retrying_bytes: 0,
 });
 
 #[cfg(has_native_rdma)]
@@ -582,6 +619,18 @@ static ENDPOINT_OPENS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(has_native_rdma)]
 static REGISTERED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(has_native_rdma)]
+#[must_use]
+pub fn has_quarantined_drains() -> bool {
+    REGISTERED_BYTES.load(Ordering::Relaxed) != 0
+        && QUARANTINE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .records
+            .iter()
+            .any(|record| record.stage == RETAINED_DRAIN)
+}
 
 pub fn resource_stats() -> RdmaResourceStats {
     #[cfg(has_native_rdma)]
@@ -593,39 +642,131 @@ pub fn resource_stats() -> RdmaResourceStats {
             endpoint_opens: ENDPOINT_OPENS.load(Ordering::Relaxed),
             registered_bytes: REGISTERED_BYTES.load(Ordering::Relaxed),
             failed_retirements: quarantine.failed_retirements,
-            retained_endpoints: quarantine.records.len(),
-            retained_registered_bytes: quarantine
-                .records
-                .iter()
-                .map(|record| record.registered_bytes)
-                .sum(),
+            retained_endpoints: quarantine.retained_endpoints(),
+            retained_registered_bytes: quarantine.retained_bytes(),
         }
     }
     #[cfg(not(has_native_rdma))]
     RdmaResourceStats::default()
 }
 
+/// Retry a bounded batch of endpoints whose drain could not be confirmed.
+/// Call from a blocking worker. Permanent provider failures stay quarantined.
+#[cfg(has_native_rdma)]
+pub fn retry_quarantined_drains() {
+    retry_drains(&QUARANTINE, &REGISTERED_BYTES, close_native);
+}
+
+#[cfg(has_native_rdma)]
+fn retry_drains(
+    ledger: &Mutex<Quarantine>,
+    registered: &AtomicUsize,
+    close: impl Fn(&RetainedEndpoint) -> (i32, usize),
+) {
+    let retries: Vec<_> = {
+        let mut quarantine = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if quarantine.retrying_endpoints != 0 {
+            return;
+        }
+        let retries: Vec<_> = quarantine
+            .records
+            .extract_if(.., |record| record.stage == RETAINED_DRAIN)
+            .take(MAX_DRAIN_RETRIES_PER_SWEEP)
+            .collect();
+        quarantine.retrying_endpoints = retries.len();
+        quarantine.retrying_bytes = retries.iter().map(|record| record.registered_bytes).sum();
+        retries
+    };
+
+    for mut record in retries {
+        let (stage, bytes) = close(&record.native);
+        let mut quarantine = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registered.fetch_sub(record.registered_bytes - bytes, Ordering::Relaxed);
+        quarantine.retrying_endpoints -= 1;
+        quarantine.retrying_bytes -= record.registered_bytes;
+        if stage != 0 {
+            record.stage = stage;
+            record.registered_bytes = bytes;
+            // Rotate still-incomplete drains behind the other records.
+            quarantine.records.push(record);
+            drop(quarantine);
+            if stage != RETAINED_DRAIN {
+                eprintln!(
+                    "AFS_RDMA_TEARDOWN permanent stage={stage} retained_registered_bytes={bytes}"
+                );
+            }
+        } else {
+            drop(quarantine);
+            drop(record);
+        }
+    }
+}
+
+#[cfg(has_native_rdma)]
+fn close_native(native: &RetainedEndpoint) -> (i32, usize) {
+    let mut bytes = 0;
+    // SAFETY: the caller uniquely owns this live endpoint. A nonzero result
+    // transfers the remaining resources back to that same owner.
+    let stage = unsafe { ffi::afs_rdma_close(native.ptr.as_ptr(), &mut bytes) };
+    (stage, bytes)
+}
+
 impl RdmaEndpoint {
     fn retire_with<P: Send + 'static>(&mut self, admission: P) -> RdmaRetireOutcome {
         #[cfg(has_native_rdma)]
-        if let Some(ep) = self.ep.take() {
-            let mut registered_bytes = 0;
-            // SAFETY: the endpoint is uniquely owned. Taking it prevents Drop
-            // from invoking native retirement a second time.
-            let stage = unsafe { ffi::afs_rdma_close(ep.as_ptr(), &mut registered_bytes) };
-            REGISTERED_BYTES.fetch_sub(self.registered_bytes - registered_bytes, Ordering::Relaxed);
-            if stage != 0 {
-                return quarantine(
-                    &QUARANTINE,
-                    RetainedEndpoint { _ptr: ep },
-                    admission,
-                    stage,
-                    registered_bytes,
-                );
-            }
+        {
+            self.take_retirement(admission)
+                .map_or(RdmaRetireOutcome::Released, |mut retirement| {
+                    retirement.finish()
+                })
+        }
+        #[cfg(not(has_native_rdma))]
+        {
+            drop(admission);
+            RdmaRetireOutcome::Released
+        }
+    }
+
+    #[cfg(has_native_rdma)]
+    fn take_retirement<P: Send + 'static>(&mut self, admission: P) -> Option<PendingRetirement<P>> {
+        let ptr = self.ep.take()?;
+        Some(PendingRetirement {
+            owned: Some((RetainedEndpoint { ptr }, admission)),
+            registered_bytes: self.registered_bytes,
+        })
+    }
+}
+
+#[cfg(has_native_rdma)]
+struct PendingRetirement<P: Send + 'static> {
+    owned: Option<(RetainedEndpoint, P)>,
+    registered_bytes: usize,
+}
+
+#[cfg(has_native_rdma)]
+impl<P: Send + 'static> PendingRetirement<P> {
+    fn finish(&mut self) -> RdmaRetireOutcome {
+        let Some((native, admission)) = self.owned.take() else {
+            return RdmaRetireOutcome::Released;
+        };
+        let (stage, bytes) = close_native(&native);
+        REGISTERED_BYTES.fetch_sub(self.registered_bytes - bytes, Ordering::Relaxed);
+        if stage != 0 {
+            return quarantine(&QUARANTINE, native, admission, stage, bytes);
         }
         drop(admission);
         RdmaRetireOutcome::Released
+    }
+}
+
+#[cfg(has_native_rdma)]
+impl<P: Send + 'static> Drop for PendingRetirement<P> {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -642,12 +783,20 @@ fn quarantine<P: Send + 'static>(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     ledger.failed_retirements += 1;
     ledger.records.push(QuarantinedEndpoint {
-        _native: native,
+        native,
         _admission: Box::new(admission),
+        stage,
         registered_bytes,
     });
     drop(ledger);
-    eprintln!("AFS_RDMA_TEARDOWN stage={stage} retained_registered_bytes={registered_bytes}");
+    let policy = if stage == RETAINED_DRAIN {
+        "retry"
+    } else {
+        "permanent"
+    };
+    eprintln!(
+        "AFS_RDMA_TEARDOWN {policy} stage={stage} retained_registered_bytes={registered_bytes}"
+    );
     RdmaRetireOutcome::Quarantined {
         stage,
         registered_bytes,
@@ -778,7 +927,7 @@ mod tests {
             let outcome = super::quarantine(
                 &ledger,
                 super::RetainedEndpoint {
-                    _ptr: std::ptr::NonNull::dangling(),
+                    ptr: std::ptr::NonNull::dangling(),
                 },
                 Admission(released.clone()),
                 stage,
@@ -794,25 +943,63 @@ mod tests {
         }
         assert_eq!(released.load(Ordering::Relaxed), 0);
         {
-            let mut ledger = ledger.lock().unwrap();
-            assert_eq!(ledger.failed_retirements, 3);
-            assert_eq!(ledger.records.len(), 3);
-            assert_eq!(
-                ledger
-                    .records
-                    .iter()
-                    .map(|entry| entry.registered_bytes)
-                    .sum::<usize>(),
-                3 * super::CAPACITY
-            );
-            // A hypothetical recovery frees retained resources without
-            // erasing a retirement failure from the cumulative counter.
-            drop(ledger.records.pop());
-            assert_eq!(ledger.failed_retirements, 3);
-            assert_eq!(ledger.records.len(), 2);
+            let state = ledger.lock().unwrap();
+            assert_eq!(state.failed_retirements, 3);
+            assert_eq!(state.retained_endpoints(), 3);
+            assert_eq!(state.retained_bytes(), 3 * CAPACITY);
         }
+        let registered = AtomicUsize::new(3 * CAPACITY);
+        super::retry_drains(&ledger, &registered, |_| (0, 0));
+        {
+            let state = ledger.lock().unwrap();
+            assert_eq!(state.failed_retirements, 3);
+            assert_eq!(state.retained_endpoints(), 2);
+            assert_eq!(state.retained_bytes(), 2 * CAPACITY);
+            assert_eq!(released.load(Ordering::Relaxed), 1);
+        }
+        super::retry_drains(&ledger, &registered, |_| {
+            panic!("permanent failure was retried")
+        });
         drop(ledger);
         assert_eq!(released.load(Ordering::Relaxed), 3);
+    }
+
+    #[cfg(has_native_rdma)]
+    #[test]
+    fn rdma_retirement_retry_returns_admission_after_late_flush() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let ledger = Mutex::new(super::Quarantine::default());
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = admission.clone().try_acquire_owned().unwrap();
+        let registered = AtomicUsize::new(CAPACITY);
+        super::quarantine(
+            &ledger,
+            super::RetainedEndpoint {
+                ptr: std::ptr::NonNull::dangling(),
+            },
+            permit,
+            super::RETAINED_DRAIN,
+            CAPACITY,
+        );
+        super::retry_drains(&ledger, &registered, |_| {
+            let during = ledger.lock().unwrap();
+            assert_eq!(during.retained_endpoints(), 1);
+            assert_eq!(during.retained_bytes(), CAPACITY);
+            assert_eq!(admission.available_permits(), 0);
+            (super::RETAINED_DRAIN, CAPACITY)
+        });
+        assert_eq!(admission.available_permits(), 0);
+        super::retry_drains(&ledger, &registered, |_| (0, 0));
+        let after = ledger.lock().unwrap();
+        assert_eq!(after.retained_endpoints(), 0);
+        assert_eq!(after.retained_bytes(), 0);
+        assert_eq!(registered.load(Ordering::Relaxed), 0);
+        assert_eq!(after.failed_retirements, 1);
+        assert_eq!(admission.available_permits(), 1);
     }
 
     #[test]

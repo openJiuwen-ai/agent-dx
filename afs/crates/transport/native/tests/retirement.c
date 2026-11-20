@@ -100,18 +100,26 @@ int main(void) {
     puts("PASS delayed flushes collected before QP destroy and MR deregistration");
 
     e = fixture(AFS_RDMA_PENDING_DATA);
-    retained(e, AFS_RDMA_RETAINED_DRAIN, "empty CQ with outstanding data until deadline");
+    assert(afs_rdma_close(e, &bytes) == AFS_RDMA_RETAINED_DRAIN);
     assert(!destroy_calls && poll_calls > 1);
+    assert(bytes == e->capacity && !dereg_calls && e->buffer[0] == 0xab);
+    assert(e->qp && e->cq && e->mr);
+    puts("PASS empty CQ with outstanding data until deadline retains endpoint and buffer");
+    completions[0] = AFS_RDMA_WR_DATA;
+    completion_count = 1;
+    assert(afs_rdma_close(e, &bytes) == AFS_RDMA_RELEASED);
+    assert(bytes == 0 && stop_calls == 1 && destroy_calls == 1 && dereg_calls == 1);
+    puts("PASS second close after late flush releases QP and registered buffer");
 
     e = fixture(AFS_RDMA_PENDING_DATA);
     poll_error = 1;
-    retained(e, AFS_RDMA_RETAINED_DRAIN, "untrusted CQ");
+    retained(e, AFS_RDMA_RETAINED_CQ, "untrusted CQ");
     assert(!destroy_calls && poll_calls == 1);
 
     e = fixture(AFS_RDMA_PENDING_DATA);
     completion_count = 1;
     completions[0] = AFS_RDMA_WR_PROBE_SEND;
-    retained(e, AFS_RDMA_RETAINED_DRAIN, "unmatched completion");
+    retained(e, AFS_RDMA_RETAINED_CQ, "unmatched completion");
     assert(!destroy_calls && poll_calls == 1);
 
     e = fixture(0);

@@ -6,7 +6,8 @@ use crate::{
 };
 
 /// T11 `RdmaSessionSweeper`: every 5 s drops expired RDMA sessions from the
-/// Node control table and, with OwnerFs, from the OwnerFs table.
+/// Node control table and, with OwnerFs, from the OwnerFs table. It then
+/// retries a bounded batch of quarantined RDMA drains on a blocking worker.
 ///
 /// Retry class with no error path: a sweep cannot fail. No log events of its
 /// own. Stop: `services.stop` breaks the loop and returns `Ok`.
@@ -25,6 +26,8 @@ impl RdmaSessionSweeper {
         let owner_rdma_cleanup = self.owner_sessions;
         services.spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            #[cfg(feature = "rdma")]
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tokio::pin! {let shutdown=cancelled(stop);}
             loop {
                 tokio::select! {
@@ -32,6 +35,12 @@ impl RdmaSessionSweeper {
                         sessions.cleanup_expired().await;
                         #[cfg(feature = "ownerfs")]
                         owner_rdma_cleanup.cleanup_expired().await;
+                        #[cfg(feature = "rdma")]
+                        if afs_transport::rdma::has_quarantined_drains() {
+                            let _ = crate::node::bridge::spawn_blocking(
+                                afs_transport::rdma::retry_quarantined_drains
+                            ).await;
+                        }
                     }
                     _ = &mut shutdown => break,
                 }

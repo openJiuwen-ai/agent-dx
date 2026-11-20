@@ -2043,7 +2043,7 @@ async fn owner_rdma_write_from_client(
             Err(error) => {
                 worker.poisoned.store(true, Ordering::SeqCst);
                 return Err(coded_status(
-                    afs_error::NODE_OWNER_WRITE_NOT_EXECUTED,
+                    afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_UNAVAILABLE,
                     error.to_string(),
                 ));
             }
@@ -2089,7 +2089,7 @@ fn owner_write_worker_status(error: tokio::task::JoinError) -> Status {
     // A running spawn_blocking closure cannot be cancelled. A panic may
     // follow the file write, so only a cancelled queued job proves no write.
     let code = if error.is_cancelled() {
-        afs_error::NODE_OWNER_WRITE_NOT_EXECUTED
+        afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED
     } else {
         afs_error::NODE_OWNER_WRITE_UNKNOWN
     };
@@ -2099,14 +2099,14 @@ fn owner_write_worker_status(error: tokio::task::JoinError) -> Status {
 #[cfg(feature = "ownerfs")]
 fn owner_write_probe_status(status: Status) -> Status {
     let error = afs_transport::grpc::error_status::status_to_error(status.clone());
-    if matches!(
-        error.code(),
-        afs_error::NODE_TRANSFER_UNAVAILABLE | afs_error::NODE_TRANSFER_INTERNAL
-    ) {
-        coded_status(afs_error::NODE_OWNER_WRITE_NOT_EXECUTED, error.to_string())
-    } else {
-        status
-    }
+    let code = match error.code() {
+        afs_error::NODE_TRANSFER_UNAVAILABLE => {
+            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_UNAVAILABLE
+        }
+        afs_error::NODE_TRANSFER_INTERNAL => afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_IO,
+        _ => return status,
+    };
+    coded_status(code, error.to_string())
 }
 
 #[cfg(all(feature = "ownerfs", not(feature = "rdma")))]
@@ -2484,7 +2484,12 @@ impl OwnerFiles for OwnerFilesService {
             })
             .await
             .map_err(|error| {
-                coded_status(afs_error::NODE_OWNER_WRITE_NOT_EXECUTED, error.to_string())
+                let code = if error.is_cancelled() {
+                    afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED
+                } else {
+                    afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_IO
+                };
+                coded_status(code, error.to_string())
             })?
             .map_err(error_to_status)?;
             let session = owner_rdma_session(

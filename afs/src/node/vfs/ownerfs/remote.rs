@@ -32,6 +32,17 @@ pub(crate) fn write_status_requires_execution_evidence(error: &Error) -> bool {
     }
 }
 
+pub(crate) fn write_was_not_executed(error: &Error) -> bool {
+    matches!(
+        error.code(),
+        afs_error::NODE_OWNER_WRITE_NOT_EXECUTED
+            | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_TIMEOUT
+            | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_UNAVAILABLE
+            | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED
+            | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_IO
+    )
+}
+
 use crate::node::vfs::locks::{LockRequest, LockWaiterId, LockWaiterOutcome};
 use crate::node::vfs::types::{
     AttributeChange, FileAttributes, FileLockConflict, FileLockOwner, FilesystemCapacity,

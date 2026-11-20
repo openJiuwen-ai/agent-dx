@@ -160,7 +160,7 @@ fn owner_write_worker_cancelled_before_execution_is_not_unknown() {
         let status = owner_write_worker_status(cancelled.await.unwrap_err());
         assert_eq!(
             afs_transport::grpc::error_status::status_to_error(status).code(),
-            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED
+            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED
         );
 
         let failed = crate::node::bridge::spawn_blocking(|| panic!("write worker failed"));

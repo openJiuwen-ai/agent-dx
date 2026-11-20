@@ -105,7 +105,7 @@ use crate::node::vfs::{
         files::{FileIdentity, OwnerEntry, RemoteDirectory, RemoteFile},
         remote::{
             RemoteCreatedFile, RemoteDirectoryEntry, RemoteFiles,
-            write_status_requires_execution_evidence,
+            write_status_requires_execution_evidence, write_was_not_executed,
         },
         root::RootGrant,
     },
@@ -652,7 +652,12 @@ impl OwnerPeerClient {
         })
         .await
         .map_err(|error| {
-            PeerError::coded(afs_error::NODE_OWNER_WRITE_NOT_EXECUTED, error.to_string())
+            let code = if error.is_cancelled() {
+                afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED
+            } else {
+                afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_IO
+            };
+            PeerError::coded(code, error.to_string())
         })?
         .map_err(owner_rdma_error)?;
         let mut client = self.cloned_client()?;
@@ -760,7 +765,8 @@ fn owner_dispatched_write_status(status: tonic::Status) -> PeerError {
     // Apply this only to the business RPC result. A local worker or
     // negotiation failure before calling Write does not imply a mutation.
     let received = PeerError::from(status);
-    if write_status_requires_execution_evidence(&received.0) {
+    if !write_was_not_executed(&received.0) && write_status_requires_execution_evidence(&received.0)
+    {
         return PeerError::coded(
             afs_error::NODE_OWNER_WRITE_UNKNOWN,
             format!("OwnerFiles write outcome is unknown: {received}"),

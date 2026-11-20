@@ -90,6 +90,9 @@ fn append_rdma_metrics(
     dfs: Option<(usize, u64)>,
 ) -> String {
     let Some(body) = encoded.strip_suffix("# EOF\n") else {
+        afs_logging::warn!(
+            "RDMA metrics omitted because the registry snapshot lacks its EOF marker"
+        );
         return encoded;
     };
     let dfs = dfs.map_or_else(String::new, |(sessions, replies)| {
