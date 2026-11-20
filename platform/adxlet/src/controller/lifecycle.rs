@@ -4,7 +4,10 @@ use crate::{
     upgrade::ExecutionLease,
 };
 use adx_core::{CompletedOperation, LifecycleKind, RestorePoint};
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 // Keep the failing stage local to a resume attempt. Error::Unavailable also
 // describes unreadable checkpoints and rejected/failed runtime restores, which
@@ -316,6 +319,17 @@ impl Controller {
         let intent = self.pause_intent();
         let services = self.services.clone();
         let mut attempt = services.metrics.operation_attempt("pause", intent);
+        // pause 按 operation_id + expected_revision 幂等：先判断本次调用是否只是重放一个已完成的暂停。
+        // 只有真实执行（Ok(false)，含首次执行和未完成尝试的继续）才统计耗时；已完成的重放与非法请求不出样。
+        let sample = matches!(
+            self.replay_operation(
+                &request.operation_id,
+                request.expected_revision,
+                LifecycleKind::Pause,
+            ),
+            Ok(false)
+        );
+        let started = Instant::now();
         let result = self.pause_inner(request).await;
         let cleared = self.clear_operation_intent().await;
         let result = match (result, cleared) {
@@ -323,6 +337,14 @@ impl Controller {
             (Err(error), _) | (_, Err(error)) => Err(error),
         };
         attempt.finish(&result);
+        if sample {
+            self.services.metrics.observe_lifecycle(
+                crate::metrics::LifecycleOperation::Pause,
+                crate::metrics::result_outcome(&result),
+                &self.record.spec.runtime_class,
+                started.elapsed(),
+            );
+        }
         result
     }
     async fn pause_inner(&mut self, request: PauseRequest) -> Result<OperationResult> {

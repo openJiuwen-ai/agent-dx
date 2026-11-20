@@ -110,6 +110,7 @@ impl Submissions {
         tx: &mpsc::Sender<Envelope>,
         key: RestoreKey,
         command: Command,
+        runtime_class: &'static str,
     ) -> Result<OperationResult> {
         let completion = {
             let mut pending = self.lock_pending()?;
@@ -126,7 +127,7 @@ impl Submissions {
                 flight.completion.clone()
             } else {
                 let (reply, result) = oneshot::channel();
-                let envelope = Envelope::new(command, reply);
+                let envelope = Envelope::new(command, reply, runtime_class);
                 let (completed, completion) = watch::channel(None);
                 let deletion = self.deleting.subscribe();
                 let (processing, queued) = oneshot::channel();
@@ -150,7 +151,11 @@ impl Submissions {
         wait(completion).await
     }
 
-    pub(super) async fn delete(&self, tx: &mpsc::Sender<Envelope>) -> Result<OperationResult> {
+    pub(super) async fn delete(
+        &self,
+        tx: &mpsc::Sender<Envelope>,
+        runtime_class: &'static str,
+    ) -> Result<OperationResult> {
         let completion = {
             let mut pending = self.lock_pending()?;
             if let Some(completion) = pending
@@ -162,7 +167,7 @@ impl Submissions {
             } else {
                 // Rejection before acceptance reopens this provisional latch.
                 self.deleting.send_replace(true);
-                let completion = submit_delete(tx.clone());
+                let completion = submit_delete(tx.clone(), runtime_class);
                 pending.delete = Some(completion.clone());
                 completion
             }
@@ -271,9 +276,9 @@ fn complete(
     });
 }
 
-fn submit_delete(tx: mpsc::Sender<Envelope>) -> Completion {
+fn submit_delete(tx: mpsc::Sender<Envelope>, runtime_class: &'static str) -> Completion {
     let (reply, result) = oneshot::channel();
-    let envelope = Envelope::new(Command::Delete, reply);
+    let envelope = Envelope::new(Command::Delete, reply, runtime_class);
     let (completed, completion) = watch::channel(None);
     tokio::spawn(async move {
         let admitted = tx.send(envelope).await.map_err(|_| stopped());
@@ -315,7 +320,7 @@ mod tests {
 
     fn envelope(command: Command) -> Envelope {
         let (reply, _) = oneshot::channel();
-        Envelope::new(command, reply)
+        Envelope::new(command, reply, "other")
     }
 
     fn pause_envelope(operation_id: &str) -> Envelope {
@@ -352,10 +357,11 @@ mod tests {
             &tx,
             RestoreKey::Ensure,
             Command::EnsureRunning("wake".into(), None),
+            "other",
         ));
         assert_pending(&mut restoring).await;
         let (delete_tx, mut delete_rx) = mpsc::channel(1);
-        let mut deleting = Box::pin(submissions.delete(&delete_tx));
+        let mut deleting = Box::pin(submissions.delete(&delete_tx, "other"));
         assert_pending(&mut deleting).await;
         let delete_envelope = delete_rx.recv().await.unwrap();
 
@@ -381,12 +387,12 @@ mod tests {
     async fn rejected_delete_does_not_relatch_while_result_is_pending() {
         let submissions = Submissions::new();
         let (tx, mut rx) = mpsc::channel(1);
-        let mut first = Box::pin(submissions.delete(&tx));
+        let mut first = Box::pin(submissions.delete(&tx, "other"));
         assert_pending(&mut first).await;
         let envelope = rx.recv().await.unwrap();
 
         submissions.reject_delete();
-        let mut shared = Box::pin(submissions.delete(&tx));
+        let mut shared = Box::pin(submissions.delete(&tx, "other"));
         assert_pending(&mut shared).await;
         assert!(!submissions.deleting());
 
@@ -404,6 +410,7 @@ mod tests {
             &tx,
             RestoreKey::Ensure,
             Command::EnsureRunning("first".into(), None),
+            "other",
         ));
         assert_pending(&mut first).await;
         let first_envelope = rx.recv().await.unwrap();
@@ -430,12 +437,14 @@ mod tests {
             &tx,
             RestoreKey::Ensure,
             Command::EnsureRunning("later".into(), None),
+            "other",
         ));
         assert_pending(&mut later).await;
         let mut shared = Box::pin(submissions.restore(
             &tx,
             RestoreKey::Ensure,
             Command::EnsureRunning("shared".into(), Some(30)),
+            "other",
         ));
         assert_pending(&mut shared).await;
 

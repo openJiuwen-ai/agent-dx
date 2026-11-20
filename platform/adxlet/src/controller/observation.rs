@@ -1,8 +1,38 @@
 use super::*;
 use adx_core::observation::{
     bounded_detail, now_millis, CreateStage, EvidenceSource, InterruptionEvidence,
-    InterruptionReason, OperationIntent,
+    InterruptionReason, OperationIntent, Outcome,
 };
+use std::time::{Duration, Instant};
+
+/// Process-local monotonic timing for the current create/restore stage.
+///
+/// It never crosses an `await`: the actor records a stage when the state machine
+/// moves into it and closes it at the next transition or at the terminal result.
+/// `take()` semantics guarantee exactly one sample per stage.
+#[derive(Default)]
+pub(super) struct StageTiming {
+    current: Option<(CreateStage, Instant)>,
+}
+
+impl StageTiming {
+    /// Drop any stage left open by an earlier operation path.
+    pub(super) fn reset(&mut self) {
+        self.current = None;
+    }
+    /// Start `next` and close the previous stage with its elapsed duration.
+    /// Returns `None` for the first stage of an operation.
+    pub(super) fn transition(&mut self, next: CreateStage) -> Option<(CreateStage, Duration)> {
+        let now = Instant::now();
+        let previous = self.current.replace((next, now))?;
+        Some((previous.0, now.saturating_duration_since(previous.1)))
+    }
+    /// Close the current stage, if any. A second call returns `None`.
+    pub(super) fn finish(&mut self) -> Option<(CreateStage, Duration)> {
+        let (stage, started) = self.current.take()?;
+        Some((stage, started.elapsed()))
+    }
+}
 
 impl Controller {
     pub(super) fn intended_execution_absence(&self) -> bool {
@@ -75,6 +105,25 @@ impl Controller {
             .observation
             .get_or_insert_with(Default::default)
             .create_stage = Some(stage);
+        if let Some((previous, elapsed)) = self.stage_timing.transition(stage) {
+            // Reaching the next transition is proof the previous stage succeeded.
+            self.observe_phase(previous, Outcome::Success, elapsed);
+        }
+    }
+    /// Close the final stage with the operation's actual result. Called before
+    /// fallible cleanup so the failing stage cannot be lost.
+    pub(super) fn finish_stage(&mut self, outcome: Outcome) {
+        if let Some((stage, elapsed)) = self.stage_timing.finish() {
+            self.observe_phase(stage, outcome, elapsed);
+        }
+    }
+    fn observe_phase(&self, stage: CreateStage, outcome: Outcome, elapsed: Duration) {
+        self.services.metrics.observe_phase(
+            stage,
+            outcome,
+            &self.record.spec.runtime_class,
+            elapsed,
+        );
     }
     pub(super) fn operation_intent(&mut self, intent: OperationIntent) {
         self.record
@@ -119,5 +168,37 @@ impl Controller {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_timing_closes_each_stage_exactly_once() {
+        let mut timing = StageTiming::default();
+        assert!(timing.transition(CreateStage::RuntimePrepare).is_none());
+        std::thread::sleep(Duration::from_millis(2));
+        let (stage, elapsed) = timing
+            .transition(CreateStage::RuntimeStart)
+            .expect("the previous stage must close on transition");
+        assert_eq!(stage, CreateStage::RuntimePrepare);
+        assert!(elapsed >= Duration::from_millis(2));
+        assert_eq!(
+            timing.finish().map(|(stage, _)| stage),
+            Some(CreateStage::RuntimeStart)
+        );
+        assert!(timing.finish().is_none(), "a stage must not emit twice");
+    }
+
+    #[test]
+    fn reset_drops_a_stage_left_open_by_an_earlier_path() {
+        let mut timing = StageTiming::default();
+        assert!(timing.transition(CreateStage::Readiness).is_none());
+        timing.reset();
+        assert!(timing.finish().is_none());
+        // The next operation starts clean rather than closing the stale stage.
+        assert!(timing.transition(CreateStage::RuntimePrepare).is_none());
     }
 }
