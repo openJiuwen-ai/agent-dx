@@ -1026,3 +1026,13 @@ python3 build/e2e/backend_start_timeout.py \
 ```
 
 Both image and runtime internal timers must fire at least ten seconds before the overall create budget. JSON and SSE must return `504 / DEADLINE_EXCEEDED / never / terminal` with the precise backend stage, and both original-request replay and authoritative failed-record replay must retain the exact message. The same real registry also returns missing-image, permission-denied, authentication-failure and rate-limit responses; JSON/SSE must retain their 404/403/401/429 categories and original message. Healthy create/delete calls before and after the faults verify runtime recovery. Evidence includes each response and an aggregate JSON verdict. This test injects faults only into the labelled disposable container.
+
+
+### Blocked resource observation
+
+`--profile standalone --case resource-stalled` freezes the capacity producer and
+replaces the capacity file with a held-open FIFO. The fixture requires a real
+adxlet thread blocked in `pipe_read` on that file descriptor, then checks a live routable session
+for more than the standard 30-second heartbeat expiry window, the same node session and backend identity, creation through
+the public SDK using expired capacity, observation recovery and physical cleanup.
+It targets sampling isolation; it does not simulate an uninterruptible disk fault.
