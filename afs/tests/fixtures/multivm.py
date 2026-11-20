@@ -720,7 +720,7 @@ class Cluster:
                     role,
                     (
                         "from pathlib import Path\np=Path(sys.argv[1]);a=os.stat(sys.argv[2]);"
-                        'v=list(p.glob("root-*-e*"));assert len(v)==1,v;b=v[0].stat();assert '
+                        'b=(p/"workspace").stat();assert '
                         "(a.st_dev,a.st_ino)==(b.st_dev,b.st_ino)"
                     ),
                     self.role_dir(role) + "/state/ownerfs",
