@@ -711,6 +711,69 @@ async fn handle_command_watch(
     Ok(())
 }
 
+/// Close code for a PTY that failed after the WebSocket upgrade succeeded.
+///
+/// RFC 6455 reserves 4000-4999 for application use. The failure reason travels
+/// in the preceding `error` lifecycle frame because a close reason is limited
+/// to 123 bytes.
+const PTY_SETUP_FAILED_CLOSE_CODE: u16 = 4001;
+
+fn describe_error(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
+/// Report a post-upgrade PTY setup failure and complete the Close handshake.
+///
+/// Once 101 has been written the failure cannot be an HTTP status. The `error`
+/// lifecycle frame tells the client why the session did not start, and the
+/// Close frame lets it tell a rejected command apart from a lost connection.
+/// The peer gets the contract's five seconds to answer the Close, after which
+/// TCP is released.
+async fn fail_pty_setup<S>(
+    websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+    session_id: &str,
+    reason: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    execd_error!("[execd-http] pty setup failed session={session_id}: {reason}");
+    let event = serde_json::json!({
+        "version": 1,
+        "type": "error",
+        "session_id": session_id,
+        "message": reason,
+    });
+    let _ = websocket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            event.to_string(),
+        ))
+        .await;
+    let _ = websocket
+        .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Library(
+                PTY_SETUP_FAILED_CLOSE_CODE,
+            ),
+            reason: "PTY setup failed".into(),
+        }))
+        .await;
+    let _ = websocket.flush().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(Ok(message)) = websocket.next().await {
+            if matches!(message, tokio_tungstenite::tungstenite::Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
 async fn handle_pty(
     sock: &mut tokio::net::TcpStream,
     head: &str,
@@ -757,23 +820,45 @@ async fn handle_pty(
     )
     .await;
 
-    let pty = portable_pty::native_pty_system();
-    let pair = pty.openpty(portable_pty::PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-    let mut process = portable_pty::CommandBuilder::new(&command[0]);
-    for argument in &command[1..] {
-        process.arg(argument);
-    }
-    super::child_env::apply_pty(&mut process);
-    let mut child = pair.slave.spawn_command(process)?;
+    static NEXT_PTY: AtomicU64 = AtomicU64::new(1);
+    let session_id = format!(
+        "pty-{}-{}",
+        std::process::id(),
+        NEXT_PTY.fetch_add(1, Ordering::Relaxed)
+    );
+    // The upgrade has already been acknowledged, so a setup failure can no
+    // longer be reported as an HTTP status. Preparing the PTY is fallible
+    // (missing executable, no pts device, permission errors); report the
+    // reason on the wire instead of dropping TCP without a close frame.
+    let setup = (|| -> Result<_, Box<dyn std::error::Error + Send + Sync>> {
+        let pty = portable_pty::native_pty_system();
+        let pair = pty.openpty(portable_pty::PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        // Take the master halves before spawning so a later failure cannot
+        // orphan an already started child.
+        let writer = pair.master.take_writer()?;
+        let reader = pair.master.try_clone_reader()?;
+        let mut process = portable_pty::CommandBuilder::new(&command[0]);
+        for argument in &command[1..] {
+            process.arg(argument);
+        }
+        super::child_env::apply_pty(&mut process);
+        let child = pair.slave.spawn_command(process)?;
+        Ok((child, writer, reader, pair.master))
+    })();
+    let (mut child, writer, mut reader, master) = match setup {
+        Ok(parts) => parts,
+        Err(error) => {
+            fail_pty_setup(&mut websocket, &session_id, &describe_error(error.as_ref())).await;
+            return Ok(());
+        }
+    };
     let mut killer = child.clone_killer();
-    let mut writer = Some(pair.master.take_writer()?);
-    let mut reader = pair.master.try_clone_reader()?;
-    let master = pair.master;
+    let mut writer = Some(writer);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
         let mut buffer = vec![0u8; 16 * 1024];
@@ -785,12 +870,6 @@ async fn handle_pty(
             }
         }
     });
-    static NEXT_PTY: AtomicU64 = AtomicU64::new(1);
-    let session_id = format!(
-        "pty-{}-{}",
-        std::process::id(),
-        NEXT_PTY.fetch_add(1, Ordering::Relaxed)
-    );
     websocket
         .send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::json!({"version":1,"type":"started","session_id":session_id}).to_string(),
@@ -3274,6 +3353,73 @@ mod tests {
         server.abort();
         assert_eq!(
             eof.expect("PTY close handshake must have a deadline")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_setup_failure_reports_error_frame_and_orderly_close() {
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, None).await;
+        });
+        let uri = format!(
+            "ws://{address}/pty?protocol=environment.pty.v1&command=%2Fnonexistent-adx-pty-xyz"
+        );
+        let (mut websocket, _) = tokio_tungstenite::connect_async(uri).await.unwrap();
+        let mut reported = false;
+        let close = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), websocket.next())
+                .await
+                .expect("PTY setup failure must be reported within five seconds")
+                .unwrap()
+                .unwrap();
+            match frame {
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(event["type"], "error");
+                    assert_eq!(event["version"], 1);
+                    assert!(
+                        event["session_id"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty()),
+                        "error frame must carry a session id: {event}"
+                    );
+                    assert!(
+                        event["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("nonexistent-adx-pty-xyz")),
+                        "error frame must carry the failure reason: {event}"
+                    );
+                    reported = true;
+                }
+                tokio_tungstenite::tungstenite::Message::Close(frame) => break frame,
+                other => panic!("unexpected frame during PTY setup failure: {other:?}"),
+            }
+        };
+        assert!(
+            reported,
+            "PTY setup failure must send an error lifecycle frame"
+        );
+        let close = close.expect("PTY setup failure must send a Close frame");
+        assert_eq!(
+            close.code,
+            tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Library(4001)
+        );
+        // The server must complete the Close handshake and then release TCP,
+        // so the client never has to infer the failure from an abrupt EOF.
+        websocket.flush().await.unwrap();
+        let mut byte = [0];
+        let eof = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            websocket.get_mut().read(&mut byte),
+        )
+        .await;
+        server.abort();
+        assert_eq!(
+            eof.expect("PTY failure close must finish TCP shutdown")
                 .unwrap(),
             0
         );
