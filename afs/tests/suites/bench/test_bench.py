@@ -15,6 +15,7 @@ Fan-out readers start together, or staggered (`bench.fanout_arrival`): a seed re
 alone, then the others read together after a gap; each phase is a separate row.
 """
 
+import errno
 import hashlib
 import json
 import time
@@ -65,33 +66,43 @@ def backend_dirs(c, roles):
     return {role: remote_join(c.role_dir(role), "state") for role in roles}
 
 
+def split_vanished(result):
+    """Probe errors minus ENOENT: a file listed but gone before it was opened (node GC reclaimed it)
+    is absent and holds no resident pages. Returns (other errors, ENOENT count)."""
+    errors = result.get("errors", [])
+    gone = [e for e in errors if e.get("errno") == errno.ENOENT]
+    return [e for e in errors if e.get("errno") != errno.ENOENT], len(gone)
+
+
 def evict_backends(c, roles, file_bytes, source):
     """Evict every Node's backend and judge payload and metadata separately (benchlib.backend_verdict).
 
     If the first measurement is over a bound, the tree is evicted and measured exactly once more
     (a Node may touch its own files between the two probe calls); both attempts are kept.
     Metadata still over its tolerance fails the case. Payload still cached returns cold=False, so
-    the caller labels the round `remote_cold_unverified` instead of `remote_cold`. The source Node
-    must hold at least the file's bytes as payload, otherwise the backend layout is unrecognised.
-    Returns (evidence, cold).
+    the caller labels the round `remote_cold_unverified` instead of `remote_cold`. Files reclaimed
+    between listing and opening (ENOENT) count as absent; their number is recorded as `enoent`.
+    The source Node normally holds the whole file; when it holds less (striped or remote-only
+    placement), the payload of all Nodes together must cover the file and `placement` records each
+    Node's share, otherwise the backend layout is unrecognised. Returns (evidence, cold).
     """
-    evidence, cold = {}, True
+    evidence, cold, holdings = {}, True, {}
     for role, directory in backend_dirs(c, roles).items():
-        attempts = []
+        attempts, vanished = [], {"evict": 0, "resident": 0}
         for _ in range(2):
-            evicted = probe(c, role, "evict", directory)
+            evict_errors, evict_gone = split_vanished(probe(c, role, "evict", directory))
             measured = probe(c, role, "resident", directory)
-            if evicted["errors"] or measured["errors"]:
+            resident_errors, resident_gone = split_vanished(measured)
+            vanished["evict"] += evict_gone
+            vanished["resident"] += resident_gone
+            if evict_errors or resident_errors:
                 raise AssertionError("backend eviction evidence incomplete on %s: %r" % (
-                    role, (evicted["errors"] + measured["errors"])[:3]))
+                    role, (evict_errors + resident_errors)[:3]))
             attempts.append(benchlib.backend_verdict(measured, file_bytes))
             if attempts[-1]["payload"]["ok"] and attempts[-1]["metadata"]["ok"]:
                 break
         final = attempts[-1]
-        if role == source and final["payload"]["bytes"] < file_bytes:
-            raise AssertionError("backend payload layout not recognised on %s: %d payload bytes under %r for a "
-                                 "%d-byte file" % (role, final["payload"]["bytes"], benchlib.PAYLOAD_MARKER,
-                                                   file_bytes))
+        holdings[role] = final["payload"]["bytes"]
         if not final["metadata"]["ok"]:
             raise AssertionError("backend metadata still resident on %s after re-eviction: %d of %d bytes "
                                  "(allowed %d); resident files %r" % (
@@ -101,6 +112,15 @@ def evict_backends(c, roles, file_bytes, source):
         evidence[role] = dict(final, attempts=len(attempts))
         if len(attempts) == 2:
             evidence[role]["first_attempt"] = attempts[0]
+        if vanished["evict"] or vanished["resident"]:
+            evidence[role]["enoent"] = vanished
+    if holdings.get(source, 0) < file_bytes:
+        if sum(holdings.values()) < file_bytes:
+            raise AssertionError("backend payload layout not recognised: %d payload bytes under %r on all Nodes "
+                                 "(by Node %r) for a %d-byte file" % (sum(holdings.values()), benchlib.PAYLOAD_MARKER,
+                                                                      holdings, file_bytes))
+        evidence["placement"] = {"source": source, "source_bytes": holdings.get(source, 0),
+                                 "total_bytes": sum(holdings.values()), "by_role": holdings}
     return evidence, cold
 
 

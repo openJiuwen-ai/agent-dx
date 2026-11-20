@@ -584,7 +584,7 @@ python3 afs/tests/run.py run --suite local-performance --allow-performance \
 （DFS）执行fdatasync与`POSIX_FADV_DONTNEED`，再用`tools/bench_probe.py`经mmap+mincore实测驻留量。
 DFS后端分两类判定：`dfs/chunks/`下的正文驻留不得超过本轮文件大小的1%（不设页下限）；其余元数据（Node会改写的
 catalog、epoch等）容许max(1%×元数据总量, 64页)。任一超限时再驱逐并复测一次，两次都入证据；元数据仍超限则该case失败并列出文件，
-正文仍有驻留则该轮记为`remote_cold_unverified`而不是`remote_cold`。写者节点识别出的正文少于文件大小时视为后端布局不符，case失败。
+正文仍有驻留则该轮记为`remote_cold_unverified`而不是`remote_cold`。列出后、打开前已被Node GC回收的文件（ENOENT）按不存在、驻留0处理，不算探针错误，个数记为该角色的`enoent`（只在非0时出现）。写者节点通常持有整个文件；持有不足时（如`dfs_local_copy=none`的条带放置），要求所有Node的正文之和不少于文件大小，并在`placement`中记各Node持有字节，否则视为后端布局不符，case失败。
 热读前要求文件驻留不少于99%且探针无错误，否则该轮记为`hot_unverified`。读者在冷读前只做按路径stat等待可见，不打开文件。
 角色同处一个内核时（`namespaces`/singlevm），远端冷读记录`same_kernel=true`：后端页缓存与写者共享，
 不能当作跨机冷读；跨机需`multivm`或`hybrid`拓扑。`bench.dfs.fanout.many_readers`要求各读者位于不同的host项
