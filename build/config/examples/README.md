@@ -46,6 +46,18 @@ physical devices and a future expiry; `0` above is an expired placeholder. A
 missing/invalid update retains the last successful observation, including after
 expiry. Sample freshness is diagnostic and does not close admission. The file reader is separate from the implemented sandboxd collector and automatic capacity source. Do not publish a configured resource budget as a measurement.
 
+Nodes configured with `sandboxd_socket` check sandboxd health independently of
+capacity sampling, using `ListAvailableRuntimes` at `report_interval_seconds`.
+Each check is bounded by the smaller of `rpc_timeout_seconds` and that period.
+New admission closes only when both `sandboxd_health_failure_threshold`
+(default `3`) consecutive checks fail and `sandboxd_health_failure_seconds`
+(default `30`) have elapsed since the first failure. Both values must be positive.
+One successful check clears this health gate. Heartbeats and accepted work
+continue while it is closed; other admission conditions still apply.
+Failed runtime-capability observations retain the last successful inventory.
+Failed storage-mount observations withdraw volume eligibility for the affected
+storage view and leave admission for work without volumes available.
+
 The optional Adxlet `pressure` configuration has independent `memory_enabled`
 and `disk_enabled` switches, both defaulting to `true`. Only enabled resources
 are sampled and their thresholds validated. Disk sampling observes the filesystem
