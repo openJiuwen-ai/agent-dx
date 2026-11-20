@@ -41,44 +41,32 @@ impl RegistryScope {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"[]:.-".contains(&b))
             || self.repository_prefix.len() > 128
-            || !self.repository_prefix.split('/').all(repository_component)
-            || self
+            || !self
                 .repository_prefix
                 .split('/')
-                .any(|part| part == "publications")
+                .all(|part| repository_component(part) && !valid_id(part))
         {
             return Err(Error::Invalid("invalid managed Registry scope".into()));
         }
         Ok(())
     }
 
-    fn publication_collection<'a>(&self, repository: &'a str, id: &str) -> Option<&'a str> {
-        let prefix = format!("{}/{}/", self.authority, self.repository_prefix);
-        let mut parts = repository.strip_prefix(&prefix)?.split('/');
-        let collection = parts.next()?;
-        let marker = parts.next()?;
-        let publication = parts.next()?;
-        let leaf = parts.next()?;
-        (marker == "publications"
-            && publication == id
-            && valid_hex(collection, 32)
-            && repository_component(leaf)
-            && parts.next().is_none())
-        .then_some(collection)
-    }
-
     pub fn contains_publication_reference(&self, id: &str, reference: &str) -> bool {
-        repository(reference)
-            .and_then(|repository| self.publication_collection(repository, id))
-            .is_some()
+        let Some((authority, path)) = repository(reference).and_then(|repo| repo.split_once('/'))
+        else {
+            return false;
+        };
+        authority.eq_ignore_ascii_case(&self.authority)
+            && path
+                .strip_prefix(&self.repository_prefix)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .is_some_and(|path| {
+                    path.split('/').all(repository_component)
+                        && path.rsplit_once('/').is_some_and(|(parent, _)| {
+                            parent.split('/').any(|component| component == id)
+                        })
+                })
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ImagePublisher {
-    Environment { id: String, generation: u64 },
-    Operator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,7 +82,7 @@ pub struct ManagedImage {
     pub initial_retention: ImageRetention,
     pub registry: RegistryScope,
     pub retain_until: u64,
-    pub plan: BTreeMap<String, String>,
+    pub registered_outputs: BTreeMap<String, String>,
     pub outputs: BTreeMap<String, String>,
     pub leases: BTreeSet<String>,
     pub released_leases: BTreeSet<String>,
@@ -103,7 +91,7 @@ pub struct ManagedImage {
     #[serde(default)]
     pub observed_admissions: u64,
     pub deletion_manifests: BTreeSet<String>,
-    pub publisher: Option<ImagePublisher>,
+    pub attempt_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writer_fence: Option<String>,
     pub deleted_manifest_count: usize,
@@ -125,11 +113,7 @@ pub struct ManagedImageSummary {
 }
 
 pub fn valid_id(value: &str) -> bool {
-    valid_hex(value, 64)
-}
-
-fn valid_hex(value: &str, len: usize) -> bool {
-    value.len() == len
+    value.len() == 64
         && value
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
@@ -199,7 +183,7 @@ impl ManagedImage {
             retention,
             registry,
             retain_until: 0,
-            plan: BTreeMap::new(),
+            registered_outputs: BTreeMap::new(),
             outputs: BTreeMap::new(),
             leases: BTreeSet::from(["publisher".into()]),
             released_leases: BTreeSet::new(),
@@ -207,56 +191,62 @@ impl ManagedImage {
             unreferenced_since: None,
             observed_admissions: 0,
             deletion_manifests: BTreeSet::new(),
-            publisher: None,
+            attempt_id: None,
             writer_fence: None,
             deleted_manifest_count: 0,
         })
     }
 
     fn available(&self) -> Result<()> {
-        if !self.admission_open() {
+        if !self.admission_open() || self.archived() {
             return Err(Error::Conflict);
         }
         Ok(())
     }
 
-    /// Register every output before executing the native publisher. Each new
-    /// publication uses its own repository namespace; legacy repositories cannot be adopted.
-    pub fn plan(
+    /// Reserve the exact repositories before the caller writes. The attempt
+    /// identity correlates retries within the owning tenant.
+    pub fn register_outputs(
         &mut self,
         outputs: BTreeMap<String, String>,
-        publisher: ImagePublisher,
+        attempt_id: &str,
     ) -> Result<()> {
         self.available()?;
+        label(attempt_id)?;
         if self.state == PublicationState::Abandoned {
             return Err(Error::Conflict);
         }
-        if !self.plan.is_empty() {
-            return if self.plan == outputs && self.publisher.as_ref() == Some(&publisher) {
+        if !self.registered_outputs.is_empty() {
+            return if self.registered_outputs == outputs
+                && self.attempt_id.as_deref() == Some(attempt_id)
+            {
                 Ok(())
             } else {
                 Err(Error::Conflict)
             };
         }
         if self.state != PublicationState::Preparing || outputs.is_empty() || outputs.len() > 128 {
-            return Err(Error::Invalid(
-                "one to 128 planned image outputs required".into(),
-            ));
+            return Err(Error::Invalid("one to 128 image outputs required".into()));
         }
         let mut unique = BTreeSet::new();
-        let mut collection = None;
         for (name, tagged) in &outputs {
             label(name)?;
             let (repository, tag) = tagged
                 .rsplit_once(':')
                 .ok_or_else(|| Error::Invalid("tagged publication output required".into()))?;
-            let output_collection = self
+            if !self
                 .registry
-                .publication_collection(repository, &self.id)
-                .ok_or_else(|| {
-                    Error::Invalid("output is outside the reserved Registry namespace".into())
-                })?;
-            if collection.is_some_and(|current| current != output_collection)
+                .contains_publication_reference(&self.id, tagged)
+                || publication_ids(repository).count() != 1
+                || repository
+                    .split_once('/')
+                    .is_none_or(|(authority, _)| authority != self.registry.authority)
+            {
+                return Err(Error::Invalid(
+                    "output is outside the reserved Registry namespace".into(),
+                ));
+            }
+            if tagged.contains('@')
                 || tagged.len() > 512
                 || tag.is_empty()
                 || tag.len() > 128
@@ -269,21 +259,20 @@ impl ManagedImage {
                     "output requires a unique managed publication repository".into(),
                 ));
             }
-            collection = Some(output_collection);
         }
-        self.plan = outputs;
-        self.publisher = Some(publisher);
+        self.registered_outputs = outputs;
+        self.attempt_id = Some(attempt_id.to_owned());
         self.state = PublicationState::Publishing;
         Ok(())
     }
 
-    /// Completion is all-or-nothing; partial publication remains protected and queryable.
-    pub fn publish(&mut self, digests: BTreeMap<String, String>, _now: u64) -> Result<()> {
+    /// The registered writer confirms completion with a digest for every output.
+    pub fn complete(&mut self, digests: BTreeMap<String, String>, attempt_id: &str) -> Result<()> {
         self.available()?;
-        if self.plan.is_empty()
-            || self.plan.keys().ne(digests.keys())
-            || digests.values().any(|v| !digest(v))
-        {
+        if self.attempt_id.as_deref() != Some(attempt_id) {
+            return Err(Error::Conflict);
+        }
+        if self.registered_outputs.keys().ne(digests.keys()) {
             return Err(Error::Invalid(
                 "complete immutable publication receipt required".into(),
             ));
@@ -312,12 +301,12 @@ impl ManagedImage {
             .into_iter()
             .map(|(name, hash)| {
                 let repository = self
-                    .plan
+                    .registered_outputs
                     .get(&name)
                     .and_then(|tag| repository(tag))
                     .filter(|_| digest(&hash))
                     .ok_or_else(|| {
-                        Error::Invalid("receipt does not match the publication plan".into())
+                        Error::Invalid("receipt does not match the registered outputs".into())
                     })?;
                 Ok((name, format!("{repository}@{hash}")))
             })
@@ -325,7 +314,7 @@ impl ManagedImage {
     }
 
     pub fn cancel_preparation(&mut self) -> Result<()> {
-        if self.state == PublicationState::Abandoned && self.publisher.is_none() {
+        if self.state == PublicationState::Abandoned && self.writer_fence.is_none() {
             return Ok(());
         }
         if self.state != PublicationState::Preparing {
@@ -366,6 +355,7 @@ impl ManagedImage {
             self.released_leases.insert("publisher".into());
         }
         self.unreferenced_since = None;
+        self.compact_if_archived();
     }
 
     pub fn publication_pending(&self) -> bool {
@@ -373,6 +363,25 @@ impl ManagedImage {
             self.state,
             PublicationState::Preparing | PublicationState::Publishing
         )
+    }
+
+    /// Archived identities remain queryable and replayable by ID. They no
+    /// longer occupy active inventory or accept new caller leases.
+    pub fn archived(&self) -> bool {
+        self.state == PublicationState::Deleted
+            || (self.state == PublicationState::Abandoned
+                && self.outputs.is_empty()
+                && self.leases.is_empty())
+    }
+
+    fn compact_if_archived(&mut self) {
+        if self.archived() {
+            self.registered_outputs.clear();
+            self.outputs.clear();
+            self.attempt_id = None;
+            self.released_leases.clear();
+            self.references.clear();
+        }
     }
 
     fn has_reclaimable_receipt(&self) -> bool {
@@ -398,7 +407,7 @@ impl ManagedImage {
     }
     pub fn release(&mut self, lease: &str) -> Result<()> {
         label(lease)?;
-        if self.state == PublicationState::Deleted {
+        if self.archived() {
             return Ok(());
         }
         if !self.leases.contains(lease) && !self.released_leases.contains(lease) {
@@ -406,6 +415,7 @@ impl ManagedImage {
         }
         self.leases.remove(lease);
         self.released_leases.insert(lease.into());
+        self.compact_if_archived();
         Ok(())
     }
     pub fn extend(&mut self, until: u64) -> Result<()> {
@@ -477,17 +487,18 @@ impl ManagedImage {
 
     pub fn matches_repository(&self, reference: &str) -> bool {
         repository(reference).is_some_and(|candidate| {
-            self.plan
+            self.registered_outputs
                 .values()
-                .chain(self.outputs.values())
-                .any(|output| repository(output) == Some(candidate))
+                .filter_map(|output| repository(output))
+                .any(
+                    |output| match (candidate.split_once('/'), output.split_once('/')) {
+                        (Some((host, path)), Some((expected_host, expected_path))) => {
+                            host.eq_ignore_ascii_case(expected_host) && path == expected_path
+                        }
+                        _ => false,
+                    },
+                )
         })
-    }
-    /// Called by admission before exposing a new consumer, including a queued create.
-    pub fn acquire(&mut self) -> Result<()> {
-        self.available()?;
-        self.unreferenced_since = None;
-        Ok(())
     }
     pub fn reclaimable(&self, now: u64) -> bool {
         let ImageRetention::Ephemeral { grace_seconds } = self.retention else {
@@ -501,16 +512,6 @@ impl ManagedImage {
                 .unreferenced_since
                 .and_then(|t| t.checked_add(grace_seconds))
                 .is_some_and(|deadline| now >= deadline)
-    }
-    pub fn claim_deletion(&mut self, now: u64) -> Result<()> {
-        if self.state == PublicationState::Deleting {
-            return Ok(());
-        }
-        if !self.reclaimable(now) {
-            return Err(Error::Conflict);
-        }
-        self.state = PublicationState::Deleting;
-        Ok(())
     }
     /// Persist the complete manifest worklist before any remote deletion.
     /// Only this publication's repositories are accepted; shared blobs are never targets.
@@ -542,7 +543,10 @@ impl ManagedImage {
                 Err(Error::Conflict)
             };
         }
-        self.claim_deletion(now)?;
+        if !self.reclaimable(now) {
+            return Err(Error::Conflict);
+        }
+        self.state = PublicationState::Deleting;
         self.deletion_manifests = manifests;
         Ok(())
     }
@@ -551,17 +555,13 @@ impl ManagedImage {
         if self.state == PublicationState::Deleted {
             return Ok(());
         }
-        if !matches!(
-            self.state,
-            PublicationState::Deleting | PublicationState::Deleted
-        ) {
+        if self.state != PublicationState::Deleting {
             return Err(Error::Conflict);
         }
         self.state = PublicationState::Deleted;
         self.deleted_manifest_count = self.deletion_manifests.len();
         self.deletion_manifests.clear();
-        self.released_leases.clear();
-        self.plan.clear();
+        self.compact_if_archived();
         Ok(())
     }
 }
@@ -574,12 +574,13 @@ pub enum ImageMutation {
         request_id: String,
         retention: ImageRetention,
     },
-    Plan {
+    RegisterOutputs {
         outputs: BTreeMap<String, String>,
-        builder_id: Option<String>,
+        attempt_id: String,
     },
-    Publish {
+    Complete {
         digests: BTreeMap<String, String>,
+        attempt_id: String,
     },
     CancelPreparation,
     ReconcileAbandoned {
@@ -608,17 +609,21 @@ pub enum ImageMutation {
     FinishDeletion,
 }
 
-/// Extract reserved managed publication identities without scanning the image catalog.
-pub fn reference_id(reference: &str) -> Option<&str> {
-    let (_, rest) = reference.split_once("/publications/")?;
-    let (id, _) = rest.split_once('/')?;
-    valid_id(id).then_some(id)
+fn publication_ids(repository: &str) -> impl Iterator<Item = &str> {
+    let parent = repository
+        .split_once('/')
+        .and_then(|(_, path)| path.rsplit_once('/'))
+        .map_or("", |(parent, _)| parent);
+    parent.split('/').filter(|part| valid_id(part))
 }
 
 /// Candidate references are resolved against registered repositories at admission.
 pub fn image_references(spec: &crate::EnvironmentSpec) -> Vec<(&str, &str)> {
     use crate::execution::{MountSource, StorageSource};
     let mut references = vec![spec.image.as_str()];
+    if let Some(profile) = &spec.runtime_profile {
+        references.push(&profile.rootfs.image);
+    }
     if let Some(root) = &spec.execution.rootfs {
         if let StorageSource::Image(image) = &root.source {
             references.push(image);
@@ -631,7 +636,13 @@ pub fn image_references(spec: &crate::EnvironmentSpec) -> Vec<(&str, &str)> {
     }
     references
         .into_iter()
-        .filter_map(|reference| reference_id(reference).map(|id| (id, reference)))
+        .flat_map(|reference| {
+            repository(reference)
+                .into_iter()
+                .flat_map(move |repository| {
+                    publication_ids(repository).map(move |id| (id, reference))
+                })
+        })
         .collect()
 }
 
@@ -642,17 +653,19 @@ pub fn validate_dependencies(ids: &BTreeSet<String>) -> Result<()> {
     Ok(())
 }
 
-pub fn repository(reference: &str) -> Option<&str> {
-    if let Some((repository, hash)) = reference.split_once('@') {
-        return digest(hash).then_some(repository);
-    }
-    let (path, leaf) = reference.rsplit_once('/')?;
-    Some(if leaf.contains(':') {
-        let (repository, _) = reference.rsplit_once(':')?;
-        repository
-    } else if !path.is_empty() {
-        reference
-    } else {
+fn repository(reference: &str) -> Option<&str> {
+    let reference = reference.trim();
+    let repository_with_tag = reference
+        .split_once('@')
+        .map_or(reference, |(repo, _)| repo);
+    let (path, leaf) = repository_with_tag.rsplit_once('/')?;
+    if path.is_empty() || leaf.is_empty() {
         return None;
-    })
+    }
+    Some(
+        repository_with_tag
+            .rsplit_once(':')
+            .filter(|_| leaf.contains(':'))
+            .map_or(repository_with_tag, |(repository, _)| repository),
+    )
 }

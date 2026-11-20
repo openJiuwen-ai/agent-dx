@@ -2,24 +2,20 @@
 //! belongs to the operator reconciler, never the scheduler or a task sandbox.
 use super::*;
 use crate::storage::managed_images::IMAGE_REFERENCE_SAMPLE;
-use adx_core::managed_images::{
-    ImageMutation, ImagePublisher, ManagedImage, PublicationState, RegistryScope,
-};
+use adx_core::managed_images::{ImageMutation, ManagedImage, PublicationState, RegistryScope};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedImageConfig {
     pub registry: RegistryScope,
-    #[serde(default)]
-    pub publisher_profiles: BTreeSet<String>,
-    #[serde(default = "default_image_receipts")]
-    pub max_records_per_tenant: u32,
+    #[serde(default = "default_active_publications")]
+    pub max_active_per_tenant: u32,
     #[serde(default = "default_pending_publications")]
     pub max_pending_per_tenant: u32,
 }
 
-fn default_image_receipts() -> u32 {
+fn default_active_publications() -> u32 {
     100_000
 }
 fn default_pending_publications() -> u32 {
@@ -41,11 +37,7 @@ impl CoordinatorRpc {
     pub fn with_managed_image_config(self, config: ManagedImageConfig) -> Result<Self> {
         config.registry.validate()?;
         if config.max_pending_per_tenant == 0
-            || config.max_pending_per_tenant > config.max_records_per_tenant
-            || config
-                .publisher_profiles
-                .iter()
-                .any(|profile| profile.is_empty() || profile.len() > 128)
+            || config.max_pending_per_tenant > config.max_active_per_tenant
         {
             return Err(Error::Invalid("invalid managed image policy".into()));
         }
@@ -67,16 +59,26 @@ impl CoordinatorRpc {
         &self,
         tenant: &str,
         id: &str,
-        limit: usize,
+        claiming_deletion: bool,
     ) -> Result<(i64, Vec<String>)> {
-        let _permit = self.0.image_observation.try_acquire().map_err(|_| {
-            Error::Unavailable("another managed image observation is in progress".into())
-        })?;
         let session = &self.0.image_session;
         tokio::time::timeout(Duration::from_secs(5), async {
             // Read the fence before any roots. Pending central creates bump
             // it under the scheduler lock. Durable writes bump it in Redis.
             let admissions = session.managed_image_admissions(tenant, id).await?;
+            // An existing claim closed admission. Retrying that exact worklist
+            // can proceed even while the inventory is busy.
+            if claiming_deletion && admissions < 0 {
+                return Ok((admissions, Vec::new()));
+            }
+            let _permit = self.0.image_observation.try_acquire().map_err(|_| {
+                Error::Unavailable("another managed image observation is in progress".into())
+            })?;
+            let limit = if claiming_deletion {
+                1
+            } else {
+                IMAGE_REFERENCE_SAMPLE
+            };
             let pending = {
                 let state = self.0.state.lock().await;
                 state.healthy()?;
@@ -168,19 +170,16 @@ impl pb::managed_image_service_server::ManagedImageService for CoordinatorRpc {
             }
         }
         let session = &self.0.image_session;
-        let limit = match mutation {
-            ImageMutation::Observe => IMAGE_REFERENCE_SAMPLE,
-            ImageMutation::ClaimDeletion { .. } => 1,
-            _ => 0,
-        };
-        let (admissions, refs) = if limit == 0 {
-            (None, Vec::new())
-        } else {
+        let claiming_deletion = matches!(mutation, ImageMutation::ClaimDeletion { .. });
+        let observing = claiming_deletion || matches!(mutation, ImageMutation::Observe);
+        let (admissions, refs) = if observing {
             let (admissions, refs) = self
-                .observe_image_roots(&request.tenant_id, &request.id, limit)
+                .observe_image_roots(&request.tenant_id, &request.id, claiming_deletion)
                 .await
                 .map_err(status)?;
             (Some(admissions), refs)
+        } else {
+            (None, Vec::new())
         };
         let timestamp = now().map_err(status)?;
         let image = if let ImageMutation::Begin {
@@ -208,7 +207,7 @@ impl pb::managed_image_service_server::ManagedImageService for CoordinatorRpc {
                         timestamp,
                     )
                     .map_err(status)?,
-                    config.max_records_per_tenant,
+                    config.max_active_per_tenant,
                     config.max_pending_per_tenant,
                 )
                 .await
@@ -219,95 +218,16 @@ impl pb::managed_image_service_server::ManagedImageService for CoordinatorRpc {
                     error => status(error),
                 })?
         } else {
-            let mut builder = None;
-            let mut publisher = None;
-            if let ImageMutation::Plan { builder_id, .. } = &mutation {
-                publisher = match builder_id {
-                    Some(id) => {
-                        let observed = session
-                            .managed_image_builder(
-                                &request.tenant_id,
-                                &request.id,
-                                id,
-                                &config.publisher_profiles,
-                            )
-                            .await
-                            .map_err(status)?;
-                        let publisher = observed.publisher.clone();
-                        builder = Some(observed);
-                        Some(publisher)
-                    }
-                    None if administrator => Some(ImagePublisher::Operator),
-                    None => {
-                        return Err(Status::permission_denied(
-                            "managed build Environment required",
-                        ))
-                    }
-                };
-            }
-            if matches!(
-                mutation,
-                ImageMutation::Publish { .. } | ImageMutation::ReconcileAbandoned { .. }
-            ) {
-                let receipt = session
-                    .managed_image(&request.tenant_id, &request.id)
-                    .await
-                    .map_err(status)?;
-                if let Some(ImagePublisher::Environment { id, generation }) = &receipt.publisher {
-                    if matches!(mutation, ImageMutation::Publish { .. })
-                        && receipt.state == PublicationState::Publishing
-                    {
-                        let observed = session
-                            .managed_image_builder(
-                                &request.tenant_id,
-                                &request.id,
-                                id,
-                                &config.publisher_profiles,
-                            )
-                            .await
-                            .map_err(status)?;
-                        if Some(&observed.publisher) != receipt.publisher.as_ref() {
-                            return Err(status(Error::Conflict));
-                        }
-                        builder = Some(observed);
-                    } else if matches!(mutation, ImageMutation::ReconcileAbandoned { .. })
-                        && receipt.state == PublicationState::Publishing
-                    {
-                        match session.get(id).await {
-                            Ok(record)
-                                if record.assignment.generation == *generation
-                                    && !record.invalidated
-                                    && record
-                                        .result
-                                        .as_ref()
-                                        .is_some_and(|r| r.state == EnvironmentState::Running) =>
-                            {
-                                return Err(status(Error::Conflict))
-                            }
-                            Ok(_) | Err(Error::NotFound) => (),
-                            Err(error) => return Err(status(error)),
-                        }
-                    }
-                } else if matches!(mutation, ImageMutation::Publish { .. }) && !administrator {
-                    return Err(Status::permission_denied(
-                        "trusted operator publication required",
-                    ));
-                }
-                if matches!(mutation, ImageMutation::Publish { .. }) {
-                    publisher = receipt.publisher;
-                }
-            }
             session
                 .mutate_managed_image_checked(
                     &request.tenant_id,
                     &request.id,
                     admissions,
-                    builder.as_ref(),
                     |image| {
                         if matches!(
                             mutation,
-                            ImageMutation::Plan { .. }
-                                | ImageMutation::Publish { .. }
+                            ImageMutation::RegisterOutputs { .. }
+                                | ImageMutation::Complete { .. }
                                 | ImageMutation::ClaimDeletion { .. }
                                 | ImageMutation::ReconcileAbandoned { .. }
                         ) && image.registry != config.registry
@@ -315,14 +235,14 @@ impl pb::managed_image_service_server::ManagedImageService for CoordinatorRpc {
                             return Err(Error::Conflict);
                         }
                         match &mutation {
-                            ImageMutation::Plan { outputs, .. } => image
-                                .plan(outputs.clone(), publisher.clone().ok_or(Error::Conflict)?),
-                            ImageMutation::Publish { digests } => {
-                                if image.publisher != publisher {
-                                    return Err(Error::Conflict);
-                                }
-                                image.publish(digests.clone(), timestamp)
-                            }
+                            ImageMutation::RegisterOutputs {
+                                outputs,
+                                attempt_id,
+                            } => image.register_outputs(outputs.clone(), attempt_id),
+                            ImageMutation::Complete {
+                                digests,
+                                attempt_id,
+                            } => image.complete(digests.clone(), attempt_id),
                             ImageMutation::CancelPreparation => image.cancel_preparation(),
                             ImageMutation::ReconcileAbandoned {
                                 digests,
@@ -375,7 +295,7 @@ impl pb::managed_image_service_server::ManagedImageService for CoordinatorRpc {
             now().map_err(status)?,
             session.epoch(),
             enabled,
-            limit != 0,
+            observing && !(claiming_deletion && admissions.is_some_and(|version| version < 0)),
         ))
         .map_err(status)
     }

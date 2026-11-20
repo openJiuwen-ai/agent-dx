@@ -1,8 +1,6 @@
 use super::{common, node, running, spec};
 use adx_coordinator::storage::{LocalClaim, NodeSession, Session};
-use adx_core::managed_images::{
-    ImagePublisher, ImageRetention, ManagedImage, PublicationState, RegistryScope,
-};
+use adx_core::managed_images::{ImageRetention, ManagedImage, PublicationState, RegistryScope};
 use adx_core::Assignment;
 use std::collections::BTreeMap;
 
@@ -41,16 +39,19 @@ async fn ready_image(session: &Session, request: &str) -> (String, String) {
     );
     session
         .mutate_managed_image("tenant", &image.id, |image| {
-            image.plan(
+            image.register_outputs(
                 BTreeMap::from([("main".into(), format!("{repository}:build"))]),
-                ImagePublisher::Operator,
+                "test-attempt",
             )
         })
         .await
         .unwrap();
     session
         .mutate_managed_image("tenant", &image.id, |image| {
-            image.publish(BTreeMap::from([("main".into(), digest.clone())]), 12)?;
+            image.complete(
+                BTreeMap::from([("main".into(), digest.clone())]),
+                "test-attempt",
+            )?;
             image.release("publisher")?;
             image.observe(&[], 13)
         })
@@ -218,8 +219,13 @@ async fn managed_image_request_replay_and_budgets_survive_cancellation() {
         .mutate_managed_image("tenant", &second.id, |image| image.cancel_preparation())
         .await
         .unwrap();
-    assert!(session
+    let third = session
         .begin_managed_image(new("c", "third"), 2, 1)
+        .await
+        .unwrap();
+    assert_eq!(third.state, PublicationState::Preparing);
+    assert!(session
+        .mutate_managed_image("tenant", &first.id, |image| image.retain("stale"))
         .await
         .is_err());
     assert_eq!(
@@ -229,6 +235,16 @@ async fn managed_image_request_replay_and_budgets_survive_cancellation() {
             .unwrap()
             .state,
         PublicationState::Abandoned
+    );
+    assert_eq!(
+        session
+            .managed_images("tenant", "", 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|image| image.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![third.id.as_str()]
     );
 }
 
@@ -271,15 +287,16 @@ async fn image_publication_release_and_deletion_survive_redis_and_coordinator_re
     let reference = format!("{repo}@sha256:{}", "b".repeat(64));
     session
         .mutate_managed_image("tenant", &id, |i| {
-            i.plan(
+            i.register_outputs(
                 BTreeMap::from([("main".into(), format!("{repo}:build"))]),
-                ImagePublisher::Operator,
+                "test-attempt",
             )
         })
         .await
         .unwrap();
     assert!(session
-        .mutate_managed_image("tenant", &id, |i| i.publish(BTreeMap::new(), 12))
+        .mutate_managed_image("tenant", &id, |i| i
+            .complete(BTreeMap::new(), "test-attempt"))
         .await
         .is_err());
     assert_eq!(
@@ -288,9 +305,9 @@ async fn image_publication_release_and_deletion_survive_redis_and_coordinator_re
     );
     session
         .mutate_managed_image("tenant", &id, |i| {
-            i.publish(
+            i.complete(
                 BTreeMap::from([("main".into(), format!("sha256:{}", "b".repeat(64)))]),
-                13,
+                "test-attempt",
             )
         })
         .await
@@ -335,25 +352,51 @@ async fn image_publication_release_and_deletion_survive_redis_and_coordinator_re
         .mutate_managed_image("tenant", &id, |i| i.finish_deletion())
         .await
         .unwrap();
-    assert_eq!(
-        recovered
-            .managed_image("tenant", &id)
-            .await
-            .unwrap()
-            .deleted_manifest_count,
-        1
-    );
-    assert_eq!(
-        recovered
-            .managed_images("tenant", "", 1)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
+    let archived = recovered.managed_image("tenant", &id).await.unwrap();
+    assert_eq!(archived.deleted_manifest_count, 1);
+    assert!(archived.outputs.is_empty());
+    assert!(archived.registered_outputs.is_empty());
+    assert!(archived.attempt_id.is_none());
     assert!(recovered
-        .managed_images("tenant", &id, 1)
+        .managed_images("tenant", "", 1)
         .await
         .unwrap()
         .is_empty());
+    let mut late = spec("late-consumer");
+    late.image = format!(
+        "{}:build@{}",
+        repo.replacen("registry.test", "REGISTRY.test", 1),
+        reference.split_once('@').unwrap().1
+    );
+    assert!(recovered
+        .normalize_managed_image_dependencies(&mut late, None)
+        .await
+        .is_err());
+    let new = |id: &str, request: &str| {
+        ManagedImage::new(
+            id.repeat(64),
+            "tenant",
+            request,
+            ImageRetention::Ephemeral { grace_seconds: 0 },
+            scope(),
+            30,
+        )
+        .unwrap()
+    };
+    let next = recovered
+        .begin_managed_image(new("b", "replacement"), 1, 1)
+        .await
+        .unwrap();
+    assert_ne!(next.id, id);
+    assert_eq!(
+        recovered
+            .begin_managed_image(new("c", "persisted-request"), 1, 1)
+            .await
+            .unwrap(),
+        archived
+    );
+    assert_eq!(
+        recovered.managed_images("tenant", &id, 1).await.unwrap(),
+        vec![next.summary()]
+    );
 }

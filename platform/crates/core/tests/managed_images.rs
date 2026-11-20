@@ -1,6 +1,4 @@
-use adx_core::managed_images::{
-    ImagePublisher, ImageRetention, ManagedImage, PublicationState, RegistryScope,
-};
+use adx_core::managed_images::{ImageRetention, ManagedImage, PublicationState, RegistryScope};
 use std::collections::BTreeMap;
 
 fn image() -> ManagedImage {
@@ -50,15 +48,12 @@ fn grace_starts_after_last_reference_and_new_use_restarts_it() {
         image.id
     );
     image
-        .plan(
-            BTreeMap::from([("single".into(), tagged)]),
-            ImagePublisher::Operator,
-        )
+        .register_outputs(BTreeMap::from([("single".into(), tagged)]), "test-attempt")
         .unwrap();
     image
-        .publish(
+        .complete(
             BTreeMap::from([("single".into(), format!("sha256:{}", "a".repeat(64)))]),
-            102,
+            "test-attempt",
         )
         .unwrap();
     image.retain("other-client").unwrap();
@@ -73,7 +68,8 @@ fn grace_starts_after_last_reference_and_new_use_restarts_it() {
     assert!(!image.reclaimable(1000));
     image.observe(&[], 400).unwrap();
     assert!(!image.reclaimable(459));
-    image.claim_deletion(460).unwrap();
+    let worklist = image.outputs.values().cloned().collect::<Vec<_>>();
+    image.claim_manifests(&worklist, 460).unwrap();
     assert_eq!(image.state, PublicationState::Deleting);
     assert!(image.retain("late-consumer").is_err());
     assert!(image.observe(&["environment:late".into()], 461).is_err());
@@ -83,9 +79,9 @@ fn grace_starts_after_last_reference_and_new_use_restarts_it() {
 fn legacy_repositories_and_changed_completion_are_rejected() {
     let mut image = image();
     assert!(image
-        .plan(
+        .register_outputs(
             BTreeMap::from([("single".into(), "registry.test/history:old".into())]),
-            ImagePublisher::Operator
+            "test-attempt"
         )
         .is_err());
     let tagged = format!(
@@ -93,18 +89,15 @@ fn legacy_repositories_and_changed_completion_are_rejected() {
         image.id
     );
     image
-        .plan(
-            BTreeMap::from([("single".into(), tagged)]),
-            ImagePublisher::Operator,
-        )
+        .register_outputs(BTreeMap::from([("single".into(), tagged)]), "test-attempt")
         .unwrap();
     let outputs = BTreeMap::from([("single".into(), format!("sha256:{}", "b".repeat(64)))]);
-    image.publish(outputs.clone(), 102).unwrap();
-    image.publish(outputs, 103).unwrap();
+    image.complete(outputs.clone(), "test-attempt").unwrap();
+    image.complete(outputs, "test-attempt").unwrap();
     assert!(image
-        .publish(
+        .complete(
             BTreeMap::from([("single".into(), format!("sha256:{}", "c".repeat(64)))]),
-            104
+            "test-attempt"
         )
         .is_err());
 }
@@ -122,42 +115,53 @@ fn managed_scope_and_attempt_identity_bound_the_publication() {
     let collection = "0123456789abcdef0123456789abcdef";
     let valid = target("registry.test", collection, "service-0");
     assert!(image
-        .plan(
+        .register_outputs(
             BTreeMap::from([(
                 "single".into(),
                 target("foreign.test", collection, "service-0")
             )]),
-            ImagePublisher::Operator
+            "test-attempt"
         )
         .is_err());
     assert!(image
-        .plan(
+        .register_outputs(
             BTreeMap::from([
                 ("first".into(), valid.clone()),
                 (
                     "second".into(),
-                    target("registry.test", "0".repeat(32).as_str(), "service-1")
+                    target("registry.test", &"0".repeat(64), "service-1")
                 ),
             ]),
-            ImagePublisher::Operator
+            "test-attempt"
         )
         .is_err());
     let outputs = BTreeMap::from([("single".into(), valid)]);
-    let owner = ImagePublisher::Environment {
-        id: "builder".into(),
-        generation: 7,
-    };
-    image.plan(outputs.clone(), owner.clone()).unwrap();
-    image.plan(outputs.clone(), owner).unwrap();
-    assert!(image
-        .plan(
-            outputs,
-            ImagePublisher::Environment {
-                id: "builder".into(),
-                generation: 8
-            }
-        )
-        .is_err());
+    image
+        .register_outputs(outputs.clone(), "writer-one")
+        .unwrap();
+    image
+        .register_outputs(outputs.clone(), "writer-one")
+        .unwrap();
+    assert!(image.register_outputs(outputs, "writer-two").is_err());
+    let digests = BTreeMap::from([("single".into(), format!("sha256:{}", "b".repeat(64)))]);
+    assert!(image.complete(digests.clone(), "writer-two").is_err());
+    image.complete(digests, "writer-one").unwrap();
+}
+
+#[test]
+fn publications_do_not_require_a_builder_repository_layout() {
+    let mut image = image();
+    let outputs = BTreeMap::from([
+        (
+            "root".into(),
+            format!("registry.test/managed/team/{}/root:build", image.id),
+        ),
+        (
+            "data".into(),
+            format!("registry.test/managed/{}/layers/data:result", image.id),
+        ),
+    ]);
+    image.register_outputs(outputs, "test-attempt").unwrap();
 }
 
 #[test]
@@ -167,7 +171,7 @@ fn confirmed_abandonment_keeps_partial_bytes_and_independent_holds() {
     abandoned.cancel_preparation().unwrap();
     assert!(abandoned.admission_open());
     assert!(abandoned
-        .plan(BTreeMap::new(), ImagePublisher::Operator)
+        .register_outputs(BTreeMap::new(), "test-attempt")
         .is_err());
     assert!(!abandoned.reclaimable(u64::MAX));
 
@@ -179,12 +183,12 @@ fn confirmed_abandonment_keeps_partial_bytes_and_independent_holds() {
     );
     let first = format!("{base}/service-0:build");
     image
-        .plan(
+        .register_outputs(
             BTreeMap::from([
                 ("first".into(), first.clone()),
                 ("second".into(), format!("{base}/service-1:build")),
             ]),
-            ImagePublisher::Operator,
+            "test-attempt",
         )
         .unwrap();
     image.retain("reader").unwrap();

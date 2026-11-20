@@ -84,37 +84,38 @@ async fn managed_images_protect_retained_snapshots_and_fence_concurrent_acquisit
             .unwrap_err()
             .code(),
         tonic::Code::InvalidArgument,
-        "a future publication must not acquire an untracked consumer before plan registration"
+        "a future publication must not acquire an untracked consumer before registering its outputs"
     );
-    assert_eq!(
-        mutate(
-            &mut api,
-            &id,
-            json!({"operation":"plan","outputs":{"main":format!("{repository}:build")}}),
-            false
-        )
+    let registration = json!({
+        "operation": "register_outputs",
+        "attempt_id": "external-writer",
+        "outputs": {"main": format!("{repository}:build")},
+    });
+    let foreign = api
+        .mutate_managed_image(pb::ManagedImageMutationRequest {
+            tenant_id: "another-tenant".into(),
+            id: id.clone(),
+            mutation_json: serde_json::to_vec(&registration).unwrap(),
+            caller: caller(),
+        })
         .await
-        .unwrap_err()
-        .code(),
-        tonic::Code::PermissionDenied
-    );
-    mutate(
-        &mut api,
-        &id,
-        json!({"operation":"plan","outputs":{"main":format!("{repository}:build")}}),
-        true,
-    )
-    .await
-    .unwrap();
-    assert!(mutate(&mut api, &id, json!({"operation":"plan" ,"builder_id":"not-the-publisher","outputs":{"main":format!("{repository}:build")}}), false).await.is_err());
-    mutate(
-        &mut api,
-        &id,
-        json!({"operation":"publish","digests":{"main":format!("sha256:{}", "a".repeat(64))}}),
-        true,
-    )
-    .await
-    .unwrap();
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::PermissionDenied);
+    // A tenant can register and complete a publication without a builder Environment.
+    mutate(&mut api, &id, registration.clone(), false)
+        .await
+        .unwrap();
+    mutate(&mut api, &id, registration, false).await.unwrap();
+    let mut completion = json!({
+        "operation": "complete",
+        "attempt_id": "another-writer",
+        "digests": {"main": format!("sha256:{}", "a".repeat(64))},
+    });
+    assert!(mutate(&mut api, &id, completion.clone(), false)
+        .await
+        .is_err());
+    completion["attempt_id"] = json!("external-writer");
+    mutate(&mut api, &id, completion, false).await.unwrap();
     mutate(
         &mut api,
         &id,
@@ -239,6 +240,16 @@ async fn managed_images_protect_retained_snapshots_and_fence_concurrent_acquisit
     assert_ne!(held.is_ok(), deleted.is_ok());
     if deleted.is_ok() {
         assert!(session.acquire_managed_images(&template).await.is_err());
+        let resumed = mutate(
+            &mut api,
+            &id,
+            json!({"operation":"claim_deletion","manifests":[reference]}),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed["references_current"], false);
+        assert_eq!(resumed["image"]["deletion_manifests"], json!([reference]));
     }
     task.abort();
 }
@@ -280,7 +291,7 @@ async fn managed_image_deletion_requires_explicit_operator_configuration() {
     mutate(
         &mut api,
         id,
-        json!({"operation":"plan","outputs":{"single":format!("{repository}:build")}}),
+        json!({"operation":"register_outputs","attempt_id":"fixture","outputs":{"single":format!("{repository}:build")}}),
         true,
     )
     .await
@@ -288,7 +299,7 @@ async fn managed_image_deletion_requires_explicit_operator_configuration() {
     mutate(
         &mut api,
         id,
-        json!({"operation":"publish","digests":{"single":format!("sha256:{}", "a".repeat(64))}}),
+        json!({"operation":"complete","attempt_id":"fixture","digests":{"single":format!("sha256:{}", "a".repeat(64))}}),
         true,
     )
     .await

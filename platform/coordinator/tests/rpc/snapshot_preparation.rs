@@ -6,9 +6,21 @@ async fn terminal_seed_create_failure_finishes_build_and_retains_previous_succes
     Box::pin(terminal_seed_create_failure_scenario()).await;
 }
 
-async fn terminal_seed_create_failure_scenario() {
-    use adx_core::{snapshot_preparation::PreparationState, snapshots::Snapshot};
+type PreparationClient =
+    pb::snapshot_preparation_service_client::SnapshotPreparationServiceClient<Channel>;
 
+struct PreparationRig {
+    _redis: common::Redis,
+    _servers: Servers,
+    _checkpoint_root: tempfile::TempDir,
+    session: Session,
+    coordinator: CoordinatorRpc,
+    backend: Arc<Backend>,
+    templates: PreparationClient,
+    address: std::net::SocketAddr,
+}
+
+async fn prepare_coordinator_and_node() -> PreparationRig {
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(1).await.unwrap();
     let coordinator = CoordinatorRpc::new(
@@ -41,13 +53,23 @@ async fn terminal_seed_create_failure_scenario() {
             .unwrap()
             .with_session("golden-boot".into()),
     );
-    let manager = Arc::new(Adxlet::new(
-        "node".into(),
-        backend.clone(),
-        Arc::new(LocalChecks),
-        Arc::new(LocalChecks),
-        sink,
-    ));
+    let checkpoint_root = tempfile::tempdir().unwrap();
+    let checkpoints = Arc::new(
+        adx_checkpoint_storage::LocalCheckpointStore::new(checkpoint_root.path().into()).unwrap(),
+    );
+    let manager = Arc::new(
+        Adxlet::new(
+            "node".into(),
+            backend.clone(),
+            Arc::new(LocalChecks),
+            Arc::new(LocalChecks),
+            sink.clone(),
+        )
+        .with_checkpointing(checkpoints, Arc::new(LocalChecks))
+        .unwrap()
+        .with_snapshot_catalog(sink)
+        .unwrap(),
+    );
     manager
         .update_capacity(spec("capacity").resources, Duration::from_secs(60))
         .unwrap();
@@ -83,10 +105,32 @@ async fn terminal_seed_create_failure_scenario() {
     register.reconciling = false;
     register.accepting_allocations = true;
     node_client.register_node(register).await.unwrap();
-    let mut templates =
-        pb::snapshot_preparation_service_client::SnapshotPreparationServiceClient::new(
-            channel(address, "apiserver").await,
-        );
+    let templates = pb::snapshot_preparation_service_client::SnapshotPreparationServiceClient::new(
+        channel(address, "apiserver").await,
+    );
+
+    PreparationRig {
+        _redis: redis,
+        _servers: servers,
+        _checkpoint_root: checkpoint_root,
+        session,
+        coordinator,
+        backend,
+        templates,
+        address,
+    }
+}
+
+async fn terminal_seed_create_failure_scenario() {
+    use adx_core::{snapshot_preparation::PreparationState, snapshots::Snapshot};
+
+    let mut rig = prepare_coordinator_and_node().await;
+    let (session, coordinator, backend, templates) = (
+        &rig.session,
+        &rig.coordinator,
+        &rig.backend,
+        &mut rig.templates,
+    );
 
     for (index, failure, reason) in [
         (0, "image_missing", "manifest_unknown"),
@@ -190,6 +234,140 @@ async fn terminal_seed_create_failure_scenario() {
         assert_eq!(backend.started.load(Ordering::SeqCst), index + 1);
         assert!(backend.running.lock().unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates"]
+async fn managed_image_preparation_captures_and_restores_a_native_golden() {
+    Box::pin(managed_image_golden_scenario()).await;
+}
+
+async fn managed_image_golden_scenario() {
+    use adx_core::{
+        managed_images::{ImageRetention, ManagedImage, RegistryScope},
+        snapshot_preparation::PreparationState,
+        snapshots::SnapshotKind,
+    };
+    use std::collections::BTreeMap;
+
+    let mut rig = prepare_coordinator_and_node().await;
+    let session = &rig.session;
+    let id = "a".repeat(64);
+    let mut source = spec("seed");
+    let repo = format!("registry.test/reserved/producer/{id}/base");
+    let digest = format!("sha256:{}", "b".repeat(64));
+    source.image = format!("{repo}@{digest}");
+    session
+        .begin_managed_image(
+            ManagedImage::new(
+                id.clone(),
+                "tenant",
+                "golden-image",
+                ImageRetention::Ephemeral { grace_seconds: 0 },
+                RegistryScope {
+                    authority: "registry.test".into(),
+                    repository_prefix: "reserved".into(),
+                },
+                1,
+            )
+            .unwrap(),
+            32,
+            8,
+        )
+        .await
+        .unwrap();
+    session
+        .mutate_managed_image("tenant", &id, |image| {
+            image.register_outputs(
+                BTreeMap::from([("main".into(), format!("{repo}:build"))]),
+                "external-writer",
+            )?;
+            image.complete(
+                BTreeMap::from([("main".into(), digest.clone())]),
+                "external-writer",
+            )?;
+            image.release("publisher")
+        })
+        .await
+        .unwrap();
+
+    let template = rig
+        .templates
+        .register_snapshot_preparation(pb::RegisterSnapshotPreparationRequest {
+            caller: caller(),
+            name: "managed-golden".into(),
+            resources: Some(source.resources.into()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    rig.templates
+        .start_snapshot_preparation(pb::StartSnapshotPreparationRequest {
+            caller: caller(),
+            template_id: template.template_id.clone(),
+            preparation_id: template.preparation_id.clone(),
+            spec: Some(source.clone().into()),
+        })
+        .await
+        .unwrap();
+    let captured = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let record = session
+                .get_snapshot_template("tenant", &template.template_id)
+                .await
+                .unwrap();
+            if let Some(spec) = &record.preparation.spec {
+                assert!(spec.execution.managed_image_publications.contains(&id));
+            }
+            assert_ne!(
+                record.preparation.state,
+                PreparationState::Failed,
+                "{:?}",
+                record.preparation.error
+            );
+            if record.preparation.state == PreparationState::Ready {
+                assert!(record.preparation.spec.is_none());
+                assert!(!record.preparation.cleanup_pending);
+                break record.preparation.snapshot_id.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("managed preparation did not reach Ready");
+    let golden = session.get_snapshot(&captured).await.unwrap();
+    assert_eq!(golden.kind, SnapshotKind::Golden);
+    assert_eq!(golden.template.image, source.image);
+    assert!(golden
+        .template
+        .execution
+        .managed_image_publications
+        .contains(&id));
+    assert!(matches!(
+        session.get(&golden.template.id).await,
+        Err(adx_core::Error::NotFound)
+    ));
+
+    let mut frontend = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(rig.address, "apiserver").await,
+    );
+    let mut restore = create("golden-consumer");
+    let request = restore.spec.as_mut().unwrap();
+    request.snapshot_id = Some(captured);
+    request.image.clear();
+    let restored = frontend
+        .create_environment(restore)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(restored.durability, pb::Durability::Published as i32);
+    let record = session.get("golden-consumer").await.unwrap();
+    assert!(record
+        .spec
+        .execution
+        .managed_image_publications
+        .contains(&id));
+    assert_eq!(rig.backend.started.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

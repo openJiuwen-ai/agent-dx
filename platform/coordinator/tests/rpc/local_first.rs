@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 #[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
 async fn managed_image_dependencies_are_durable_before_either_runtime_start() {
-    use adx_core::managed_images::{ImagePublisher, ImageRetention, ManagedImage, RegistryScope};
+    use adx_core::managed_images::{ImageRetention, ManagedImage, RegistryScope};
     let mut rig = Rig::new().await;
     let image = rig
         .session
@@ -32,16 +32,16 @@ async fn managed_image_dependencies_are_durable_before_either_runtime_start() {
     let digest = format!("sha256:{}", "a".repeat(64));
     rig.session
         .mutate_managed_image("tenant", &image.id, |image| {
-            image.plan(
+            image.register_outputs(
                 std::collections::BTreeMap::from([(
                     "single".into(),
                     format!("{repository}:build"),
                 )]),
-                ImagePublisher::Operator,
+                "test-attempt",
             )?;
-            image.publish(
+            image.complete(
                 std::collections::BTreeMap::from([("single".into(), digest.clone())]),
-                2,
+                "test-attempt",
             )
         })
         .await

@@ -39,7 +39,7 @@ paths:
     get:
       tags: [Resources]
       operationId: listManagedImages
-      summary: Page bounded summaries of tenant-owned image publications
+      summary: Page bounded summaries of active tenant-owned image publications
       parameters:
         - {name: after, in: query, schema: {type: string}}
         - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 100}}
@@ -52,7 +52,7 @@ paths:
     post:
       tags: [Resources]
       operationId: beginManagedImage
-      summary: Register a durable publication before any native image push
+      summary: Allocate a durable image publication before any Registry push
       requestBody:
         required: true
         content:
