@@ -13,6 +13,30 @@ from suites.operations import wait_read
 
 SEED = b"old build: confirmed before switch\n" * 8192
 AFTER = b"new build: written after switch\n" * 8192
+VERSION_SCENARIOS = (
+    ("ownerfs", "upgrade_rollback"),
+    ("dfs", "upgrade_rollback"),
+    ("ownerfs", "old_root_command"),
+)
+UPGRADE_CONTROLS = {
+    "ownerfs-catalog": ("ownerfs", "A", "AFS_STAGE1_OWNERFS_REJECT_REOPEN"),
+    "dfs-reopen-data": ("dfs", "B", "AFS_STAGE1_DFS_REOPEN_BAD_DATA"),
+}
+
+
+def select_scenarios(case, control):
+    if case and case not in {"ownerfs", "dfs"}:
+        raise ValueError("version case must be ownerfs or dfs")
+    activation = UPGRADE_CONTROLS.get(control)
+    if activation and activation[0] != case:
+        raise ValueError("isolated mutation control requires the matching version case")
+    if control and not activation and control != "rollback-live-state":
+        raise ValueError("unknown mutation control")
+    if control == "rollback-live-state" and not case:
+        raise ValueError("isolated mutation control requires the matching version case")
+    if case:
+        return ((case, "upgrade_rollback"),)
+    return VERSION_SCENARIOS
 
 
 def quiesce(cluster):
@@ -65,14 +89,16 @@ def running_identity(cluster, role, identity):
     cluster.record("running." + role, {"pid": pid, "sha256": running, "commit": identity["commit"]})
 
 
-def start_role(cluster, role, identity):
-    cluster.start(role)
+def start_role(cluster, role, identity, *, env=None):
+    cluster.start(role, env=env)
     running_identity(cluster, role, identity)
 
 
-def start_all(cluster, identity):
+def start_all(cluster, identity, *, control=None):
+    activation = UPGRADE_CONTROLS.get(control)
     for role in cluster.roles:
-        start_role(cluster, role, identity)
+        env = {activation[2]: "1"} if activation and role == activation[1] else None
+        start_role(cluster, role, identity, env=env)
     cluster.topology()
 
 
@@ -128,7 +154,7 @@ def run_phase(result, name, operation):
         result[name] = {"status": "passed"}
 
 
-def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases):
+def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, *, control=None):
     cluster.write("A", "seed", SEED)
     cluster.python("A", "os.chmod(sys.argv[1],0o640)", remote_join(cluster.workspace("A"), "seed"))
     wait_read(cluster, "B", "seed", SEED)
@@ -139,14 +165,19 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases):
 
     def upgrade():
         install(cluster, new_inputs, new)
-        start_all(cluster, new)
+        start_all(cluster, new, control=control)
         check_seed(cluster, expected, location)
         cluster.write("B", "after-upgrade", AFTER)
         wait_read(cluster, "A", "after-upgrade", AFTER)
 
     def rollback():
         quiesce(cluster)
-        recovery_point(cluster, restore=True)
+        if control == "rollback-live-state":
+            if phases["upgrade"]["status"] != "passed":
+                raise Blocked("wrong-restore control requires the upgraded write")
+            cluster.record("mutation.rollback_live_state", True)
+        else:
+            recovery_point(cluster, restore=True)
         install(cluster, old_inputs, old)
         start_all(cluster, old)
         check_seed(cluster, expected, location)
@@ -223,8 +254,9 @@ def retained_command(cluster, new_inputs, new, phases):
     run_phase(phases, "root_command_after_upgrade", verify_after_upgrade)
 
 
-def exercise(config, old_inputs, new_inputs, output):
+def exercise(config, old_inputs, new_inputs, output, *, case=None, control=None):
     """Run all scenarios, retaining an independent result and cleanup per fixture."""
+    scenarios = select_scenarios(case, control)
     output.mkdir()
     identities = [json.loads((inputs / "artifact-identity.json").read_text()) for inputs in (old_inputs, new_inputs)]
     old, new = identities
@@ -237,8 +269,7 @@ def exercise(config, old_inputs, new_inputs, output):
     write_json(output / "versions.json", {"old": old, "new": new})
     entries = []
     cleanup_errors = []
-    for mode, suffix in (("ownerfs", "upgrade_rollback"), ("dfs", "upgrade_rollback"),
-                         ("ownerfs", "old_root_command")):
+    for mode, suffix in scenarios:
         case = Case(f"{mode}.version.{suffix}", (), mode, (), None, observe_cache=(mode == "dfs"))
         case_output = output / case.id
         case_output.mkdir()
@@ -256,7 +287,7 @@ def exercise(config, old_inputs, new_inputs, output):
             if suffix == "old_root_command":
                 retained_command(cluster, new_inputs, new, result["phases"])
             else:
-                exercise_switch(cluster, old_inputs, new_inputs, old, new, result["phases"])
+                exercise_switch(cluster, old_inputs, new_inputs, old, new, result["phases"], control=control)
             if all(phase["status"] == "passed" for phase in result["phases"].values()):
                 result["status"] = "passed"
         except (InterruptedError, TimeoutError):

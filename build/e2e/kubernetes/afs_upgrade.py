@@ -16,6 +16,8 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 BUILD_ENV = 'AFS_E2E_BASELINE_BUILD'
 COMMIT_ENV = 'AFS_E2E_BASELINE_COMMIT'
+CASE_ENV = 'AFS_E2E_VERSION_CASE'
+CONTROL_ENV = 'AFS_E2E_STAGE1_CONTROL'
 TARGET = 'afs-component-upgrade-rollback'
 BASELINE_POD = 'afs-baseline-input'
 
@@ -110,8 +112,11 @@ def scenarios(component, checks):
             spec = importlib.util.spec_from_file_location('afs_version_switch', test_root / 'tools/version_switch.py')
             version_switch = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(version_switch)
+            case, control = os.getenv(CASE_ENV), os.getenv(CONTROL_ENV)
+            expected = version_switch.select_scenarios(case, control)
             signal.signal(signal.SIGALRM, _timeout)
-            entries, cleanup_errors = version_switch.exercise(component.config, old_inputs, new_inputs, output)
+            entries, cleanup_errors = version_switch.exercise(component.config, old_inputs, new_inputs, output,
+                                                              case=case, control=control)
         finally:
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
@@ -125,7 +130,7 @@ def scenarios(component, checks):
              'phases': entry['phases']}
             for entry in entries
         ]
-        if len(entries) != 3 or cleanup_errors or any(item['status'] != 'passed' for item in entries):
+        if len(entries) != len(expected) or cleanup_errors or any(item['status'] != 'passed' for item in entries):
             raise ValueError('AFS upgrade/rollback assertions failed; see afs/result.json and per-case logs')
 
 
