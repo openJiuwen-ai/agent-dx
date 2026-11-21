@@ -354,6 +354,42 @@ impl FileHandle for LocalFile {
         self.file.read_at(buffer, offset)
     }
 
+    #[cfg(target_os = "linux")]
+    fn read_cached_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+        use std::os::fd::AsRawFd;
+        if buffer.is_empty() {
+            return Ok(Some(0));
+        }
+        let Ok(position) = libc::off_t::try_from(offset) else {
+            return Ok(None);
+        };
+        let iov = libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast(),
+            iov_len: buffer.len(),
+        };
+        // SAFETY: the descriptor is owned by self.file and stays open for the
+        // call; iov describes exactly `buffer`, which is writable and outlives
+        // the call; one iovec entry is passed.
+        let read =
+            unsafe { libc::preadv2(self.file.as_raw_fd(), &iov, 1, position, libc::RWF_NOWAIT) };
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            // EAGAIN: not cached. EOPNOTSUPP/EINVAL: no RWF_NOWAIT support.
+            return match error.raw_os_error() {
+                Some(libc::EAGAIN | libc::EOPNOTSUPP | libc::EINVAL) => Ok(None),
+                _ => Err(error),
+            };
+        }
+        let read =
+            usize::try_from(read).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+        if read == buffer.len() {
+            return Ok(Some(read));
+        }
+        // A short count is either EOF or a range only partly cached.
+        let size = self.file.metadata()?.len();
+        Ok((offset.saturating_add(read as u64) >= size).then_some(read))
+    }
+
     fn write_at(&self, offset: u64, buffer: &[u8]) -> io::Result<usize> {
         self.file.write_at(buffer, offset)
     }
@@ -958,6 +994,55 @@ fn proc_fd_path(file: &File) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cached_read_serves_page_cache_hits_and_reports_eof() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cached.bin");
+        std::fs::write(&path, vec![7_u8; 10_000]).unwrap();
+        let file = LocalFile {
+            file: File::open(&path).unwrap(),
+        };
+        // These never reach preadv2, so they hold on every filesystem.
+        assert_eq!(file.read_cached_at(0, &mut []).unwrap(), Some(0));
+        assert_eq!(file.read_cached_at(u64::MAX, &mut [0_u8; 1]).unwrap(), None);
+        // Cached hits need a filesystem that serves RWF_NOWAIT; tmpfs answers
+        // EOPNOTSUPP, which read_cached_at reports as `None` for the fallback.
+        if !nowait_reads_served(&file.file) {
+            eprintln!(
+                "skipping cached-hit assertions: no RWF_NOWAIT support on {}",
+                temp.path().display()
+            );
+            return;
+        }
+        // The data was just written, so it is in the page cache.
+        let mut out = vec![0_u8; 4096];
+        assert_eq!(file.read_cached_at(0, &mut out).unwrap(), Some(4096));
+        assert!(out.iter().all(|byte| *byte == 7));
+        // A short count at the end of the file is EOF, not a partial cache hit.
+        assert_eq!(
+            file.read_cached_at(8192, &mut out).unwrap(),
+            Some(10_000 - 8192)
+        );
+        assert_eq!(file.read_cached_at(20_000, &mut out).unwrap(), Some(0));
+    }
+
+    /// Whether the filesystem serves `RWF_NOWAIT` reads of cached pages.
+    #[cfg(target_os = "linux")]
+    fn nowait_reads_served(file: &File) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut probe = [0_u8; 1];
+        let iov = libc::iovec {
+            iov_base: probe.as_mut_ptr().cast(),
+            iov_len: probe.len(),
+        };
+        // SAFETY: the descriptor is owned by `file` and stays open for the
+        // call; iov describes exactly `probe`, which is writable and outlives
+        // the call; one iovec entry is passed.
+        let read = unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, 0, libc::RWF_NOWAIT) };
+        read >= 0
+    }
 
     #[test]
     fn statvfs_reports_capacity_from_open_root_fd() {
