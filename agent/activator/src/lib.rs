@@ -2,6 +2,7 @@
 pub mod config;
 mod creation;
 pub mod environment_request;
+mod image_resolution;
 pub mod local_environment;
 pub mod reconciliation;
 pub mod server;
@@ -14,7 +15,7 @@ use adx_agent_core::{
     activator::Target, AgentBinding, BindingPhase, EnvironmentRef, Scope, SecondaryIntent,
     TemplateVersion,
 };
-use adx_agent_store::AgentState;
+use adx_agent_store::{AgentState, PreparedTemplate};
 use hashlink::LinkedHashMap;
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
@@ -44,6 +45,7 @@ struct Binding {
 
 pub struct Activator {
     state: AgentState,
+    image_resolver: Option<image_resolution::ImageResolver>,
     environment: Arc<dyn Environment>,
     bindings: Mutex<LinkedHashMap<Scope, Binding>>,
     cache: CacheSettings,
@@ -86,6 +88,7 @@ impl Activator {
     pub fn new(state: AgentState, environment: Arc<dyn Environment>) -> Self {
         Self {
             state,
+            image_resolver: None,
             environment,
             bindings: Mutex::new(LinkedHashMap::new()),
             cache: CacheSettings::default(),
@@ -158,16 +161,17 @@ impl Activator {
             self.invalidate(scope).await;
             return Ok(false);
         }
-        let template = match self
-            .template(
+        let published = match self
+            .state
+            .published_template(
                 &scope.tenant,
                 &scope.template,
                 &secondary.environment.version,
             )
-            .await
+            .await?
         {
-            Ok(template) => template,
-            Err(Error::NotFound) => {
+            Some(published) => published,
+            None => {
                 tracing::error!(?scope, version = %secondary.environment.version,
                     environment_id = %secondary.environment.environment_id,
                     "candidate template is missing; retiring the saved candidate");
@@ -181,9 +185,9 @@ impl Activator {
                     secondary.environment.version
                 )));
             }
-            Err(error) => return Err(error),
         };
-        let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
+        let mut execution = published.execution();
+        let template = published.template;
         execution.mounts = template
             .render_mounts(&binding.parameters)
             .map_err(Error::Invalid)?;
@@ -296,13 +300,17 @@ impl Activator {
         tenant: &str,
         template: &adx_agent_core::TemplateDraft,
     ) -> Result<TemplateVersion> {
-        let snapshot = template.with_version("1".into());
-        let mut execution: adx_agent_core::environment::ExecutionSpec = (&snapshot).into();
+        let prepared = PreparedTemplate::new(tenant, template)?;
+        let mut execution = adx_agent_core::environment::ExecutionSpec::from(prepared.template());
         // Mount syntax is checked at publication; concrete paths require Binding parameters.
         execution.mounts.clear();
         self.environment.validate_execution(&execution)?;
+        let image = match &self.image_resolver {
+            Some(resolver) => resolver.resolve(&template.image).await,
+            None => None,
+        };
         self.state
-            .publish(tenant, template)
+            .publish_prepared(prepared, image.as_deref())
             .await
             .map_err(Into::into)
     }
@@ -531,15 +539,18 @@ impl Activator {
             }
             None => {
                 let version = self.state.selected_version(scope).await?;
-                let template = self
-                    .template(&scope.tenant, &scope.template, &version)
-                    .await?;
+                let published = self
+                    .state
+                    .published_template(&scope.tenant, &scope.template, &version)
+                    .await?
+                    .ok_or(Error::NotFound)?;
+                let mut execution = published.execution();
+                let template = published.template;
                 if let Some(service) = service {
                     service.select(&template.service).map_err(Error::Invalid)?;
                 }
                 let parameters = adx_agent_core::parameters::parse(parameters.unwrap_or_default())
                     .map_err(Error::Invalid)?;
-                let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
                 execution.mounts = template
                     .render_mounts(&parameters)
                     .map_err(Error::Invalid)?;
@@ -559,13 +570,16 @@ impl Activator {
         if binding.phase != BindingPhase::Active {
             return Err(Error::Conflict("binding is deleting".into()));
         }
-        let template = self
-            .template(&scope.tenant, &scope.template, &binding.current.version)
-            .await?;
+        let published = self
+            .state
+            .published_template(&scope.tenant, &scope.template, &binding.current.version)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let mut execution = published.execution();
+        let template = published.template;
         if let Some(service) = service {
             service.select(&template.service).map_err(Error::Invalid)?;
         }
-        let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
         execution.mounts = template
             .render_mounts(&binding.parameters)
             .map_err(Error::Invalid)?;

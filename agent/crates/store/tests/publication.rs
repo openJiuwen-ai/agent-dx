@@ -163,7 +163,9 @@ async fn missing_or_exhausted_sequence_never_overwrites_existing_versions() {
 #[tokio::test]
 #[ignore = "requires a disposable ADX_AGENT_TEST_REDIS_URL"]
 async fn redis_independent_publishers_preserve_large_sequences_exactly() {
-    use adx_agent_store::{Check, Key, Put, Record, RedisRepository, Repository, Transaction};
+    use adx_agent_store::{
+        Check, Key, PreparedTemplate, Put, Record, RedisRepository, Repository, Transaction,
+    };
     let url = std::env::var("ADX_AGENT_TEST_REDIS_URL").unwrap();
     let namespace = format!("publication-{}", uuid::Uuid::new_v4());
     let a = Arc::new(
@@ -206,8 +208,22 @@ async fn redis_independent_publishers_preserve_large_sequences_exactly() {
     ];
     versions.sort();
     assert_eq!(versions, [high + 1, high + 2]);
-    let last = first.publish("tenant", &input.template).await.unwrap();
+    let image = format!("registry.example/agent@sha256:{}", "a".repeat(64));
+    let last = first
+        .publish_prepared(
+            PreparedTemplate::new("tenant", &input.template).unwrap(),
+            Some(&image),
+        )
+        .await
+        .unwrap();
     assert_eq!(last.version, (high + 3).to_string());
+    let published = second
+        .published_template("tenant", "agent", &last.version)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.template, last);
+    assert_eq!(published.execution().image, image);
 }
 
 #[tokio::test]

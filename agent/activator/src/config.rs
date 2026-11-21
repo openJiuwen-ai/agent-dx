@@ -1,5 +1,6 @@
 //! Configuration shared by the embedded and standalone Activator.
 use crate::{
+    image_resolution::ImageResolver,
     reconciliation::{ReconcileSettings, Reconciliation},
     registration::RegistrationConfig,
     Activator, CacheSettings, Result,
@@ -7,7 +8,7 @@ use crate::{
 use adx_agent_core::{environment::Environment, limits, network::PlatformEgress};
 use adx_agent_store::{discovery::RedisRegistry, AgentState, RedisRepository};
 use serde::Deserialize;
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 const REDIS_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -22,6 +23,8 @@ pub struct ActivatorConfig {
     #[serde(default)]
     pub binding_cache: CacheSettings,
     pub registration: Option<RegistrationConfig>,
+    /// Docker config for publish-time OCI tag resolution. Only listed registries are queried.
+    pub image_registry_auth_file: Option<PathBuf>,
 }
 
 fn default_request_timeout_seconds() -> u64 {
@@ -40,11 +43,16 @@ impl ActivatorConfig {
     ) -> Result<(Arc<Activator>, RedisRepository)> {
         let store =
             RedisRepository::connect(&self.redis_url, &self.namespace, REDIS_TIMEOUT).await?;
-        let activator = Activator::with_cache(
+        let mut activator = Activator::with_cache(
             AgentState::new(Arc::new(store.clone())),
             environment,
             self.binding_cache,
         )?;
+        activator.image_resolver = self
+            .image_registry_auth_file
+            .as_deref()
+            .map(ImageResolver::from_file)
+            .transpose()?;
         Ok((Arc::new(activator), store))
     }
 

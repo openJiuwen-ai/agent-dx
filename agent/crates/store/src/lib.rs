@@ -10,7 +10,7 @@ pub use redis_store::RedisRepository;
 mod notifications;
 pub use notifications::{MetadataChange, RedisChanges};
 mod state;
-pub use state::AgentState;
+pub use state::{AgentState, PreparedTemplate, PublishedTemplate};
 mod aliases;
 #[cfg(feature = "test-memory")]
 mod memory;

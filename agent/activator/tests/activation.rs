@@ -1,10 +1,10 @@
 use adx_activator::{Activator, Error};
 use adx_agent_core::{environment::*, *};
-use adx_agent_store::{AgentState, MemoryRepository};
+use adx_agent_store::{AgentState, Key, MemoryRepository, PreparedTemplate, Repository};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -13,6 +13,8 @@ use std::{
 #[derive(Default)]
 struct Platform {
     observations: Mutex<HashMap<(String, String), EnvironmentObservation>>,
+    images: Mutex<Vec<String>>,
+    validations: AtomicUsize,
     lose_create_response: AtomicBool,
     lose_delete_response: AtomicBool,
     pause_blocks: AtomicBool,
@@ -25,10 +27,16 @@ struct Platform {
 }
 #[async_trait::async_trait]
 impl Environment for Platform {
+    fn validate_execution(&self, execution: &ExecutionSpec) -> Result<(), EnvironmentError> {
+        self.validations.fetch_add(1, Ordering::SeqCst);
+        execution.validate().map_err(EnvironmentError::Invalid)
+    }
+
     async fn create(
         &self,
         r: &CreateEnvironment,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.images.lock().unwrap().push(r.execution.image.clone());
         let gate = self.create_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             self.create_entered.notify_one();
@@ -122,6 +130,64 @@ fn scope(id: &str) -> Scope {
         binding_id: id.into(),
     }
 }
+#[tokio::test]
+async fn activation_uses_only_the_image_saved_at_publication() {
+    let store = Arc::new(MemoryRepository::default());
+    let state = AgentState::new(store.clone());
+    let draft = TemplateDraft::from(&template());
+    let pinned = format!("registry.example/app@sha256:{}", "a".repeat(64));
+    let old = state.publish("tenant", &draft).await.unwrap();
+    let new = state
+        .publish_prepared(
+            PreparedTemplate::new("tenant", &draft).unwrap(),
+            Some(&pinned),
+        )
+        .await
+        .unwrap();
+    let platform = Arc::new(Platform::default());
+    let activator = Activator::new(AgentState::new(store.clone()), platform.clone());
+    for (version, expected) in [(old.version, None), (new.version, Some(pinned.as_str()))] {
+        let key = Key::new("template", &["tenant", "app", &version]).unwrap();
+        let saved = store.get(&key).await.unwrap().unwrap();
+        assert_eq!(saved.value["image"], draft.image);
+        assert_eq!(
+            saved
+                .value
+                .get("execution_image")
+                .and_then(serde_json::Value::as_str),
+            expected
+        );
+        let public = activator.template("tenant", "app", &version).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&public).unwrap(),
+            serde_json::to_value(draft.with_version(version.clone())).unwrap()
+        );
+        assert_eq!(public, draft.with_version(version.clone()));
+        let mut binding = scope("image");
+        binding.template_ref = TemplateRef::Version(version);
+        activator
+            .activate(&binding, None, adx_agent_core::unix_time_millis() + 60_000)
+            .await
+            .unwrap();
+    }
+    assert_eq!(*platform.images.lock().unwrap(), [draft.image, pinned]);
+}
+
+#[tokio::test]
+async fn publication_validates_metadata_before_execution() {
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let activator = Activator::new(state, platform.clone());
+    let draft = TemplateDraft::from(&template());
+    let mut invalid = draft.clone();
+    invalid.name.clear();
+    assert!(activator.publish("tenant", &invalid).await.is_err());
+    assert!(activator.publish("", &draft).await.is_err());
+    assert_eq!(platform.validations.load(Ordering::SeqCst), 0);
+    activator.publish("tenant", &draft).await.unwrap();
+    assert_eq!(platform.validations.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn replicas_and_unknown_outcomes_keep_the_committed_identity() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
