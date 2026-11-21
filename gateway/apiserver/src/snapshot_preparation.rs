@@ -15,6 +15,14 @@ struct Input {
     volume: adx_agent_core::volumes::VolumeSpec,
 }
 
+pub(crate) fn snapshot_admission_stale(status: &Status) -> bool {
+    status.code() == Code::Unavailable
+        && status
+            .metadata()
+            .get(adx_core::snapshots::ADMISSION_STALE_HEADER)
+            .is_some_and(|value| value == "true")
+}
+
 impl EnvironmentService {
     pub(crate) async fn update_snapshot_reference(
         &self,
@@ -148,7 +156,12 @@ impl EnvironmentService {
         {
             return Err(Status::invalid_argument("invalid seed launch geometry"));
         }
-        let mut spec = crate::contract::create_spec_with_environment(
+        let mut volume = json!(input.volume);
+        volume["tenant_id"] = json!(caller.tenant_id);
+        let seed_volume: adx_core::volumes::VolumeSpec = serde_json::from_value(volume)
+            .map_err(|_| Status::invalid_argument("invalid seed Volume definition"))?;
+        seed_volume.validate().map_err(adx_protocol::status)?;
+        let spec = crate::contract::create_spec_with_environment(
             input.environment,
             caller,
             self.clients.config.runtime_profile.as_ref(),
@@ -212,24 +225,6 @@ impl EnvironmentService {
             .map_err(|_| Status::data_loss("invalid preparation phase"))?;
         match phase {
             pb::SnapshotPreparationPhase::Registered => {
-                let mut volume_input = json!(input.volume);
-                volume_input["owner_id"] = json!(format!("golden-{id}"));
-                let volume = self
-                    .volume_request("POST", None, volume_input, &Default::default(), caller)
-                    .await?;
-                let uid = volume["uid"]
-                    .as_str()
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| Status::data_loss("seed Volume UID unavailable"))?;
-                // Convert through the typed spec before marking the preparation started.
-                let mut typed: adx_core::EnvironmentSpec =
-                    spec.try_into().map_err(adx_protocol::status)?;
-                for mount in &mut typed.execution.mounts {
-                    if let adx_core::execution::MountSource::Volume(volume) = &mut mount.source {
-                        volume.uid = Some(uid.into());
-                    }
-                }
-                spec = typed.into();
                 let started = self
                     .clients
                     .rpc(
@@ -240,6 +235,7 @@ impl EnvironmentService {
                                 template_id: id.into(),
                                 preparation_id: id.into(),
                                 spec: Some(spec),
+                                seed_volume: Some(seed_volume.into()),
                             },
                         )),
                     )

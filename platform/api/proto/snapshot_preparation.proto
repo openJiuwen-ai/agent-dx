@@ -36,6 +36,8 @@ message StartSnapshotPreparationRequest {
   string template_id = 2;
   string preparation_id = 3;
   EnvironmentSpec spec = 4;
+  // Agent-only seed definition. Coordinator persists it before ensuring the Volume.
+  VolumeSpec seed_volume = 5;
 }
 message GetSnapshotPreparationRequest {
   CallerContext caller = 1;

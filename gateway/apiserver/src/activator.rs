@@ -19,7 +19,9 @@ impl EnvironmentApplication for EnvironmentService {
         self.update_snapshot_reference(&caller(tenant), id, change)
             .await
             .map_err(|error| {
-                if error.code() == Code::NotFound {
+                if crate::snapshot_preparation::snapshot_admission_stale(&error) {
+                    EnvironmentError::SnapshotAdmissionStale
+                } else if error.code() == Code::NotFound {
                     EnvironmentError::NotFound
                 } else {
                     map_status(error, true)

@@ -75,6 +75,14 @@ struct Platform {
     replies: Mutex<VecDeque<Result<SeedResult, EnvironmentError>>>,
     creations: Mutex<Vec<CreateEnvironment>>,
     references: Mutex<Vec<SnapshotChange>>,
+    allow_delete: AtomicBool,
+    acquire_gate: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    catalog_revision: std::sync::atomic::AtomicU64,
     revision_gate: Mutex<
         Option<(
             tokio::sync::oneshot::Sender<()>,
@@ -112,7 +120,7 @@ impl Environment for Platform {
             entered.send(()).unwrap();
             released.await.unwrap();
         }
-        Ok(1)
+        Ok(self.catalog_revision.load(Ordering::Relaxed).max(1))
     }
     async fn update_snapshot_reference(
         &self,
@@ -122,6 +130,27 @@ impl Environment for Platform {
     ) -> Result<(), EnvironmentError> {
         assert_eq!(tenant, "tenant");
         self.references.lock().await.push(change.clone());
+        if matches!(change, SnapshotChange::AcquireBinding { .. }) {
+            let gate = self.acquire_gate.lock().await.take();
+            if let Some((entered, released)) = gate {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+            }
+        }
+        match change {
+            SnapshotChange::AcquireBinding { revision, .. }
+                if *revision < self.catalog_revision.load(Ordering::Relaxed).max(1) =>
+            {
+                return Err(EnvironmentError::SnapshotAdmissionStale);
+            }
+            SnapshotChange::Release { .. } | SnapshotChange::CancelPending { .. } => {
+                self.catalog_revision.store(
+                    self.catalog_revision.load(Ordering::Relaxed).max(1) + 1,
+                    Ordering::Relaxed,
+                );
+            }
+            _ => {}
+        }
         if self.unknown_reference_response.load(Ordering::Relaxed) {
             return Err(EnvironmentError::OutcomeUnknown(
                 "lost reference response".into(),
@@ -218,7 +247,11 @@ impl Environment for Platform {
         Ok(None)
     }
     async fn delete(&self, _: &str, _: &str) -> Result<EnvironmentObservation, EnvironmentError> {
-        panic!("publication must not delete a user Environment")
+        assert!(
+            self.allow_delete.load(Ordering::Relaxed),
+            "publication must not delete a user Environment"
+        );
+        Err(EnvironmentError::NotFound)
     }
 }
 
@@ -1088,4 +1121,128 @@ async fn same_subject_reuses_winning_snapshot_decision_after_revision_read() {
         replay.binding.current.snapshot_id.as_deref(),
         Some("snapshot-ready")
     );
+}
+
+#[tokio::test]
+async fn new_binding_retries_admission_after_another_binding_releases() {
+    let platform = Arc::new(Platform::default());
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let worker = Arc::new(Activator::new(state, platform.clone()));
+    worker.publish("tenant", &draft(true)).await.unwrap();
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-ready".into(),
+        }));
+    worker.reconcile_snapshot_preparations().await.unwrap();
+    let deadline = adx_agent_core::unix_time_millis() + 30000;
+    let old = scope("old-user", TemplateRef::Version("1".into()));
+    worker
+        .activate_with_parameters(&old, None, deadline, true, Some(b"workspace=w-old"))
+        .await
+        .unwrap();
+    let subject = scope("next-user", TemplateRef::Version("1".into()));
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *platform.acquire_gate.lock().await = Some((entered, released));
+    let other = subject.clone();
+    let request_worker = worker.clone();
+    let stalled = tokio::spawn(async move {
+        request_worker
+            .activate_with_parameters(&other, None, deadline, true, Some(b"workspace=w-next"))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    platform.allow_delete.store(true, Ordering::Relaxed);
+    worker.delete_binding(&old).await.unwrap();
+    release.send(()).unwrap();
+    let target = stalled.await.unwrap().unwrap();
+    let changes = platform.references.lock().await;
+    let attempts = changes
+        .iter()
+        .filter_map(|change| match change {
+            SnapshotChange::AcquireBinding {
+                revision,
+                owner: owner @ SnapshotOwner::Binding { binding_id, .. },
+            } if binding_id == &subject.binding_id => Some((*revision, owner)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!((attempts[0].0, attempts[1].0), (1, 2));
+    assert_eq!(attempts[0].1, attempts[1].1);
+    assert_eq!(
+        target.binding.current.snapshot_id.as_deref(),
+        Some("snapshot-ready")
+    );
+    let creations = platform.creations.lock().await;
+    assert_eq!(creations.len(), 2);
+    assert_eq!(creations[1].id, target.binding.current.environment_id);
+}
+
+#[tokio::test]
+async fn deleted_binding_cannot_retry_a_fenced_delayed_admission() {
+    let platform = Arc::new(Platform::default());
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let worker = Arc::new(Activator::new(state.clone(), platform.clone()));
+    worker.publish("tenant", &draft(true)).await.unwrap();
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-ready".into(),
+        }));
+    worker.reconcile_snapshot_preparations().await.unwrap();
+    let subject = scope("deleting", TemplateRef::Version("1".into()));
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *platform.acquire_gate.lock().await = Some((entered, released));
+    let other = subject.clone();
+    let request_worker = worker.clone();
+    let stalled = tokio::spawn(async move {
+        request_worker
+            .activate_with_parameters(
+                &other,
+                None,
+                adx_agent_core::unix_time_millis() + 30000,
+                true,
+                Some(b"workspace=w-deleting"),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    platform.allow_delete.store(true, Ordering::Relaxed);
+    worker.delete_binding(&subject).await.unwrap();
+    assert!(state.binding(&subject).await.unwrap().is_none());
+    assert!(platform
+        .references
+        .lock()
+        .await
+        .iter()
+        .any(|change| matches!(change, SnapshotChange::CancelPending { .. })));
+    release.send(()).unwrap();
+    assert!(matches!(
+        stalled.await.unwrap(),
+        Err(adx_agent_core::error::Error::Conflict(_))
+    ));
+    assert_eq!(
+        platform
+            .references
+            .lock()
+            .await
+            .iter()
+            .filter(|c| matches!(c, SnapshotChange::AcquireBinding { .. }))
+            .count(),
+        1
+    );
+    assert!(platform.creations.lock().await.is_empty());
 }

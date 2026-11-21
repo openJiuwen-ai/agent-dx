@@ -287,6 +287,7 @@ impl Session {
             resources,
             state: PreparationState::Registered,
             spec: None,
+            seed_volume: None,
             snapshot_id: None,
             expected_revision: None,
             error: None,

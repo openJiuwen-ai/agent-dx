@@ -496,6 +496,14 @@ impl Environment for HttpEnvironment {
             .map_err(|_| unknown())?;
         match response.status() {
             status if status.is_success() => Ok(()),
+            StatusCode::SERVICE_UNAVAILABLE
+                if response
+                    .headers()
+                    .get(adx_core::snapshots::ADMISSION_STALE_HEADER)
+                    .is_some_and(|value| value == "true") =>
+            {
+                Err(EnvironmentError::SnapshotAdmissionStale)
+            }
             StatusCode::NOT_FOUND => Err(EnvironmentError::NotFound),
             StatusCode::CONFLICT => Err(EnvironmentError::Conflict(
                 "snapshot in use or protection changed".into(),

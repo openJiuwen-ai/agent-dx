@@ -1,6 +1,6 @@
 mod common;
 use adx_coordinator::snapshots::{Reference, Snapshot, SnapshotState};
-use adx_core::{CheckpointArtifact, EnvironmentSpec, Resources};
+use adx_core::{CheckpointArtifact, EnvironmentSpec, Error, Resources};
 
 fn snapshot() -> Snapshot {
     Snapshot::new(
@@ -335,7 +335,7 @@ async fn committed_snapshot_changes_update_inspection_cache() {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn agent_owners_survive_restart_and_race_retirement() {
-    use adx_core::{snapshots::SnapshotKind, Error};
+    use adx_core::snapshots::SnapshotKind;
     let mut rig = common::Redis::new().await;
     let store = rig.store().await;
     let first = store.begin(1).await.unwrap();
@@ -360,7 +360,7 @@ async fn agent_owners_survive_restart_and_race_retirement() {
         first
             .acquire_agent_binding(id, "tenant", cancelled, observed)
             .await,
-        Err(Error::Unavailable(_))
+        Err(Error::SnapshotAdmissionStale)
     ));
     let revision = first.get_snapshot(id).await.unwrap().revision;
     let registered = first
@@ -448,6 +448,19 @@ async fn unrelated_catalog_owners_can_share_an_observed_revision() {
         .release_snapshot(&saved.id, owner("left"))
         .await
         .unwrap();
+    let newcomer = owner("newcomer");
+    assert!(matches!(
+        session
+            .acquire_agent_binding(&saved.id, "tenant", newcomer.clone(), before_release)
+            .await,
+        Err(Error::SnapshotAdmissionStale)
+    ));
+    let fresh = session.get_snapshot(&saved.id).await.unwrap().revision;
+    let updated = session
+        .acquire_agent_binding(&saved.id, "tenant", newcomer.clone(), fresh)
+        .await
+        .unwrap();
+    assert!(updated.references.contains(&newcomer));
     assert!(session
         .acquire_agent_binding(&saved.id, "tenant", owner("left"), before_release)
         .await

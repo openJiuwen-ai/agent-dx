@@ -214,7 +214,7 @@ artifact; it does not invalidate the associated Agent template. On network or
 dependency ambiguity the Agent retries the same fixed preparation UUID and
 does not publish a `prewarm_recipe` before confirming the catalog entry.
 
-退役受 Agent 保护的 Golden 时，未经 Agent 退役流程的删除返回 409 `SNAPSHOT_IN_USE`，并明确指出 Agent 引用保护。若有运行实例或模板引用，响应中的 ID 只列实际引用。制备任务按同一 UUID 对账。自发布起 15 分钟后，Platform 停止接受该 UUID 的首次登记。已登记而结果未确认的任务继续对账，版本状态显示 `failed`。若超时后才确认制品，Activator 收到退役确认后结束跟踪。
+退役受 Agent 保护的 Golden 时，未经 Agent 退役流程的删除返回 409 `SNAPSHOT_IN_USE`，并明确指出 Agent 引用保护。若有运行实例或模板引用，响应中的 ID 只列实际引用。制备任务按同一 UUID 对账。自发布起 15 分钟后，Platform 停止接受该 UUID 的首次登记。已启动而结果未确认的任务继续对账，版本状态显示 `failed`。过期且尚未启动的 Agent 制备由 Coordinator 关闭启动并清理种子卷持有。若超时后才确认制品，Activator 收到退役确认后结束跟踪。
 
 ### 恢复并发与删除
 

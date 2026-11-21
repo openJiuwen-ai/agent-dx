@@ -7,6 +7,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Marks a rejected acquire that may be retried after rereading Catalog and the Binding.
+pub const ADMISSION_STALE_HEADER: &str = "adx-snapshot-admission-stale";
+
 /// Stable capture identity scoped to tenant, Environment and operation.
 /// Names are excluded so retries with changed arguments conflict instead of duplicating captures.
 pub fn snapshot_id(tenant: &str, environment: &str, operation: &str) -> Result<String> {
@@ -258,9 +261,7 @@ impl Snapshot {
             && !self.references.contains(&owner)
             && !(self.agent_admission_revision.max(1)..=self.revision).contains(&observed)
         {
-            return Err(Error::Unavailable(
-                "snapshot admission changed; reread allocation".into(),
-            ));
+            return Err(Error::SnapshotAdmissionStale);
         }
         self.acquire(tenant, owner)
     }

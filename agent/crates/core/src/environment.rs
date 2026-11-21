@@ -164,6 +164,7 @@ pub enum EnvironmentError {
     Conflict(String),
     Unavailable(String),
     OutcomeUnknown(String),
+    SnapshotAdmissionStale,
     /// Coordinator confirmed cancellation before assignment, not an ambiguous RPC timeout.
     SchedulingCancelled(Box<adx_core::scheduling::SchedulingFailure>),
 }

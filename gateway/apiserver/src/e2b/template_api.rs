@@ -263,6 +263,7 @@ pub(super) async fn start(
                 caller: Some(caller.clone()),
                 template_id: template.into(),
                 preparation_id: build.into(),
+                seed_volume: None,
                 spec: Some(spec),
             })),
         )

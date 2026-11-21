@@ -192,7 +192,7 @@ impl Activator {
                     .map(|(version, snapshot)| (version.as_str(), snapshot.as_deref())),
             )
             .await?;
-        let binding = self.settle_snapshot(binding, true).await?;
+        let binding = self.settle_snapshot(binding, true, deadline).await?;
         if binding.phase == BindingPhase::Deleting {
             self.delete_binding(scope).await?;
             return Ok(true);
@@ -376,6 +376,7 @@ impl Activator {
         &self,
         binding: AgentBinding,
         candidate: bool,
+        deadline: u64,
     ) -> Result<AgentBinding> {
         let target = if candidate {
             binding
@@ -394,68 +395,92 @@ impl Activator {
         if binding.phase != BindingPhase::Active {
             return Ok(binding);
         }
-        let revision = match self
-            .environment
-            .snapshot_revision(&binding.scope.tenant, snapshot)
-            .await
-        {
-            Ok(revision) => revision,
-            Err(EnvironmentError::NotFound) => {
-                return self
-                    .state
-                    .finish_snapshot_decision(&binding, &target.environment_id, snapshot, false)
-                    .await
-                    .map_err(Into::into)
-            }
-            Err(error) => return Err(error.into()),
-        };
-        // Read after the Catalog revision so deletion can fence any later acquire.
-        let current = self
-            .state
-            .binding(&binding.scope)
-            .await?
-            .filter(|current| {
-                current.generation == binding.generation && current.phase == BindingPhase::Active
-            })
-            .ok_or_else(|| Error::Conflict("allocation retired before Catalog admission".into()))?;
-        let allocation = if current.current.environment_id == target.environment_id {
-            Some(&current.current)
-        } else {
-            current
-                .secondary
-                .as_ref()
-                .filter(|secondary| {
-                    secondary.intent == SecondaryIntent::Preparing
-                        && secondary.environment.environment_id == target.environment_id
+        tokio::time::timeout(
+            adx_agent_core::transport::remaining_time(deadline),
+            self.acquire_pending_snapshot(&binding, target, snapshot),
+        )
+        .await
+        .map_err(|_| {
+            Error::OutcomeUnknown(
+                "snapshot admission deadline exceeded; retry the same allocation".into(),
+            )
+        })?
+    }
+
+    // Recheck the same allocation after every revision read. Cleanup can fence a
+    // delayed acquire between these reads and the write, even across Activators.
+    async fn acquire_pending_snapshot(
+        &self,
+        binding: &AgentBinding,
+        target: &EnvironmentRef,
+        snapshot: &str,
+    ) -> Result<AgentBinding> {
+        let tenant = &binding.scope.tenant;
+        for _ in 0..adx_agent_core::limits::CAS_ATTEMPTS {
+            let revision = match self.environment.snapshot_revision(tenant, snapshot).await {
+                Ok(revision) => revision,
+                Err(EnvironmentError::NotFound) => {
+                    return self
+                        .state
+                        .finish_snapshot_decision(binding, &target.environment_id, snapshot, false)
+                        .await
+                        .map_err(Into::into)
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let current = self
+                .state
+                .binding(&binding.scope)
+                .await?
+                .filter(|current| {
+                    current.generation == binding.generation
+                        && current.phase == BindingPhase::Active
                 })
-                .map(|secondary| &secondary.environment)
-        };
-        match allocation {
-            Some(allocation) if allocation.pending_snapshot_id.is_none() => return Ok(current),
-            Some(allocation) if allocation == target => {}
-            _ => {
-                return Err(Error::Conflict(
-                    "allocation changed before Catalog admission".into(),
-                ))
+                .ok_or_else(|| {
+                    Error::Conflict("allocation retired before Catalog admission".into())
+                })?;
+            let allocation = if current.current.environment_id == target.environment_id {
+                Some(&current.current)
+            } else {
+                current
+                    .secondary
+                    .as_ref()
+                    .filter(|secondary| {
+                        secondary.intent == SecondaryIntent::Preparing
+                            && secondary.environment.environment_id == target.environment_id
+                    })
+                    .map(|secondary| &secondary.environment)
+            };
+            match allocation {
+                Some(allocation) if allocation.pending_snapshot_id.is_none() => return Ok(current),
+                Some(allocation) if allocation == target => {}
+                _ => {
+                    return Err(Error::Conflict(
+                        "allocation changed before Catalog admission".into(),
+                    ))
+                }
             }
+            let change = SnapshotChange::AcquireBinding {
+                revision,
+                owner: Self::snapshot_owner(binding, target),
+            };
+            let acquired = match self
+                .environment
+                .update_snapshot_reference(tenant, snapshot, &change)
+                .await
+            {
+                Ok(()) => true,
+                Err(EnvironmentError::Conflict(_) | EnvironmentError::NotFound) => false,
+                Err(EnvironmentError::SnapshotAdmissionStale) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            return self
+                .state
+                .finish_snapshot_decision(binding, &target.environment_id, snapshot, acquired)
+                .await
+                .map_err(Into::into);
         }
-        let change = SnapshotChange::AcquireBinding {
-            revision,
-            owner: Self::snapshot_owner(&binding, target),
-        };
-        let acquired = match self
-            .environment
-            .update_snapshot_reference(&binding.scope.tenant, snapshot, &change)
-            .await
-        {
-            Ok(()) => true,
-            Err(EnvironmentError::Conflict(_) | EnvironmentError::NotFound) => false,
-            Err(error) => return Err(error.into()),
-        };
-        self.state
-            .finish_snapshot_decision(&binding, &target.environment_id, snapshot, acquired)
-            .await
-            .map_err(Into::into)
+        Err(EnvironmentError::SnapshotAdmissionStale.into())
     }
 
     fn snapshot_owner(binding: &AgentBinding, environment: &EnvironmentRef) -> SnapshotOwner {
@@ -790,7 +815,9 @@ impl Activator {
                     .await?
             }
         };
-        let binding = self.settle_snapshot(binding, false).await?;
+        let binding = self
+            .settle_snapshot(binding, false, deadline_unix_ms)
+            .await?;
         let scope = &binding.scope;
         if expected_generation.is_some_and(|generation| generation != binding.generation) {
             return Err(Error::Conflict(

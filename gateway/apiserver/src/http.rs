@@ -316,7 +316,17 @@ impl Api {
                 Ok(json!({}))
             }
             .await;
-            return response(result, &request_id, None, None, true);
+            let stale = result
+                .as_ref()
+                .is_err_and(crate::snapshot_preparation::snapshot_admission_stale);
+            let mut response = response(result, &request_id, None, None, true);
+            if stale {
+                response.headers_mut().insert(
+                    adx_core::snapshots::ADMISSION_STALE_HEADER,
+                    hyper::header::HeaderValue::from_static("true"),
+                );
+            }
+            return response;
         }
         if method == "PUT" {
             if let Some(id) = path.strip_prefix("/api/environment/v1/snapshot-preparations/") {

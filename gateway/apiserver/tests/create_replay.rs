@@ -28,7 +28,7 @@ use tonic::{Request, Response, Status};
 include!("support/create_fixture.rs");
 
 #[tokio::test]
-async fn native_preparation_pins_seed_volume_and_reads_the_same_job_until_ready() {
+async fn native_preparation_forwards_seed_volume_and_reads_the_same_job_until_ready() {
     use base64::{engine::general_purpose::STANDARD, Engine};
     let fixture = Fixture::new().await;
     let id = "8ae5d16d-545e-4a25-9773-2f51464003b5";
@@ -85,10 +85,11 @@ async fn native_preparation_pins_seed_volume_and_reads_the_same_job_until_ready(
             panic!("expected a managed volume");
         };
         assert_eq!(target.id, volume_id);
-        assert_eq!(
-            target.uid.as_deref(),
-            Some("47cb1f37-3b07-4093-be93-894e54275a4e")
-        );
+        assert!(target.uid.is_none());
+        let seed: adx_core::volumes::VolumeSpec =
+            request.seed_volume.clone().unwrap().try_into().unwrap();
+        assert_eq!(seed.id, volume_id);
+        assert_eq!(seed.tenant_id, spec.tenant_id);
     }
     {
         let mut guard = fixture.state.native_preparation.lock().unwrap();
