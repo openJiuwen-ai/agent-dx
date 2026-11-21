@@ -159,7 +159,16 @@ impl LockedLocalFsRootCatalog {
         File::open(absolute)
             .and_then(|mut file| file.read_to_end(&mut bytes))
             .map_err(Error::from)?;
-        let wire: WireRootRecord = serde_json::from_slice(&bytes).map_err(catalog_decode_error)?;
+        let mut wire: WireRootRecord =
+            serde_json::from_slice(&bytes).map_err(catalog_decode_error)?;
+        // Phase-1 experiment: reject a valid persisted record via the usual format gate.
+        if std::env::var_os("AFS_STAGE1_OWNERFS_REJECT_REOPEN").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            afs_logging::warn!("afs.mutation.stage1.ownerfs_catalog_reopen";
+                "record_version" => wire.version);
+            wire.version = 0;
+        }
         let record = wire.try_into_record()?;
         if Self::record_path(&record.id)? != *path {
             return Err(Error::coded(

@@ -202,6 +202,18 @@ impl DistributedFs {
                     "DFS native read authorization changed before delivery",
                 ));
             }
+            // Phase-1 experiment: poison delivery after all native read checks, preserving length.
+            if offset == 0
+                && !result.is_empty()
+                && std::env::var_os("AFS_STAGE1_DFS_REOPEN_BAD_DATA").as_deref()
+                    == Some(std::ffi::OsStr::new("1"))
+            {
+                afs_logging::warn!("afs.mutation.stage1.dfs_reopen_data";
+                    "bytes" => result.len());
+                let mut data = result.to_vec();
+                data[0] ^= 1;
+                return Ok(data.into());
+            }
             Ok(result)
         })
         .await
