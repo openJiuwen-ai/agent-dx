@@ -61,8 +61,11 @@ def scenarios(component, checks):
     from manifest import LABEL
 
     scenario = os.getenv('AFS_E2E_UPGRADE_SCENARIO', 'offline')
-    if scenario not in ('offline', 'rolling', 'rolling-ack'):
-        raise ValueError('AFS_E2E_UPGRADE_SCENARIO must be offline, rolling, or rolling-ack')
+    rolling_mode = None
+    if scenario in ('rolling-ownerfs', 'rolling-dfs'):
+        rolling_mode = scenario.removeprefix('rolling-')
+    elif scenario not in ('offline', 'rolling', 'rolling-ack'):
+        raise ValueError('AFS_E2E_UPGRADE_SCENARIO must be offline, rolling, rolling-ack, rolling-ownerfs, or rolling-dfs')
     rolling = scenario != 'offline'
     run = component.run
     with run.case(TARGET, checks) as record, tempfile.TemporaryDirectory(prefix='afs-upgrade-') as temp:
@@ -117,6 +120,7 @@ def scenarios(component, checks):
             signal.signal(signal.SIGALRM, _timeout)
             entries, cleanup_errors = version_switch.exercise(
                 component.config, old_inputs, new_inputs, output, rolling=rolling, reopen=scenario == 'rolling-ack',
+                rolling_mode=rolling_mode,
             )
         finally:
             for sig, handler in handlers.items():
@@ -132,6 +136,8 @@ def scenarios(component, checks):
             for entry in entries
         ]
         expected = 4 if rolling else 3
+        if rolling_mode is not None:
+            expected = 2
         if len(entries) != expected or cleanup_errors or any(item['status'] != 'passed' for item in entries):
             raise ValueError('AFS upgrade/rollback assertions failed; see afs/result.json and per-case logs')
 

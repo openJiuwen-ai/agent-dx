@@ -124,10 +124,11 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy, *
     offline.run_phase(phases, "rollback_" + policy, rollback)
 
 
-def cases(*, reopen=False):
+def cases(*, reopen=False, mode=None):
     lane = "rolling_ack" if reopen else "rolling"
-    for mode in ("ownerfs", "dfs"):
-        profile = DfsProfile(copies=2, replica_failure="strict") if mode == "dfs" else None
+    modes = ("ownerfs", "dfs") if mode is None else (mode,)
+    for selected in modes:
+        profile = DfsProfile(copies=2, replica_failure="strict") if selected == "dfs" else None
         for policy in ("snapshot", "preserve"):
-            case = Case(f"{mode}.version.{lane}_{policy}", (), mode, (), None, profile=profile)
+            case = Case(f"{selected}.version.{lane}_{policy}", (), selected, (), None, profile=profile)
             yield case, policy
