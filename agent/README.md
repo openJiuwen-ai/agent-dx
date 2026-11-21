@@ -26,6 +26,8 @@ Agent 模板使用业务镜像的 ENTRYPOINT/CMD、WORKDIR 和 USER，不接受 
 
 发布事务同时写入不可变模板版本和基于该版本的持久制备任务，立即返回 `snapshot_preparation.status: pending`。Activator 复用模板镜像、镜像入口、运行时、资源、端口、探针和环境，替换成该任务专用的工作区目录及 Volume，并注入 `GOLDEN_PHASE=seed`。制备期间关闭用户实例的空闲暂停策略。业务应在种子阶段只初始化可安全复用的运行时状态，释放临时卷上的文件句柄，不接收业务请求。Platform 沿同一任务 UUID 制备，清理种子 Environment，并对制品就绪和兼容性进行检查。原生 Catalog 在制品存续期保留种子卷的引用，恢复的目标实例挂载自己的卷。Activator 取得快照退役保护后为同一版本回填 `prewarm_recipe`。模板查询返回 `ready` 和配方或 `failed` 和原因。配方包含 `snapshot_id`、`image_digest`、`restore_profile_digest`、`handoff_contract_version` 和可选 `restore_env`。发布支持按租户和 `Idempotency-Key` 重放，同键不同草稿返回冲突。
 
+`prewarm_recipe` 由服务端回填到 `TemplateVersion`。发布请求中的 `TemplateDraft` 携带该字段时，`POST /api/agent/v2/templates` 返回 HTTP 400。
+
 自动制备任务从发布起最多重试 15 分钟，同一任务重启后沿用原截止时间。制品暂不可见时继续对账，到期或明确不兼容时记录 `failed`，该版本可普通启动。
 
 匿名源 Environment 清理确认后释放其专用 Volume owner。快照仍引用卷时保留定义，快照回收后移除无引用定义。Volume 清理不删除外部存储目录中的数据。

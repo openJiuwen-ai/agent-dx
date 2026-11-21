@@ -198,9 +198,6 @@ pub struct TemplateDraft {
     pub isolation_runtime: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_prepare_snapshot: bool,
-    /// Optional operator-supplied restore recipe for the product policy path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prewarm_recipe: Option<prewarm::PrewarmRecipe>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub resources: Resources,
@@ -236,6 +233,7 @@ pub struct TemplateVersion {
     pub auto_prepare_snapshot: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_preparation: Option<prewarm::SnapshotPreparation>,
+    /// Server-generated restore recipe for this published version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prewarm_recipe: Option<prewarm::PrewarmRecipe>,
     #[serde(default)]
@@ -268,15 +266,12 @@ impl TemplateDraft {
             return Err("GOLDEN_PHASE is reserved for Golden preparation and restore".into());
         }
         if self.auto_prepare_snapshot
-            && (self.prewarm_recipe.is_some()
-                || !self
-                    .image
-                    .rsplit_once('@')
-                    .is_some_and(|(_, digest)| prewarm::sha256(digest)))
+            && !self
+                .image
+                .rsplit_once('@')
+                .is_some_and(|(_, digest)| prewarm::sha256(digest))
         {
-            return Err(
-                "automatic preparation requires a fixed image and no manual Golden recipe".into(),
-            );
+            return Err("automatic preparation requires a digest-pinned image".into());
         }
         self.with_version("1".into()).validate()
     }
@@ -291,7 +286,7 @@ impl TemplateDraft {
             snapshot_preparation: self
                 .auto_prepare_snapshot
                 .then_some(prewarm::SnapshotPreparation::Pending),
-            prewarm_recipe: self.prewarm_recipe.clone(),
+            prewarm_recipe: None,
             env: self.env.clone(),
             resources: self.resources.clone(),
             lifecycle: self.lifecycle.clone(),
@@ -312,11 +307,6 @@ impl From<&TemplateVersion> for TemplateDraft {
             image: template.image.clone(),
             isolation_runtime: template.isolation_runtime.clone(),
             auto_prepare_snapshot: template.auto_prepare_snapshot,
-            prewarm_recipe: if template.auto_prepare_snapshot {
-                None
-            } else {
-                template.prewarm_recipe.clone()
-            },
             env: template.env.clone(),
             resources: template.resources.clone(),
             lifecycle: template.lifecycle.clone(),

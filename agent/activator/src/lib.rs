@@ -358,11 +358,6 @@ impl Activator {
             .auto_prepare_snapshot
             .then(|| self.seed_job(tenant, &snapshot))
             .transpose()?;
-        if snapshot.prewarm_recipe.is_some() && !self.golden_available(tenant, &snapshot).await? {
-            return Err(Error::Invalid(
-                "Golden snapshot is not ready or compatible".into(),
-            ));
-        }
         self.state
             .publish_with_preparation(tenant, template, job.as_ref(), publication_id)
             .await
@@ -398,7 +393,12 @@ impl Activator {
         }
         let checked = tokio::time::timeout(
             Duration::from_millis(500).min(adx_agent_core::transport::remaining_time(deadline)),
-            self.golden_available(tenant, template),
+            self.environment.golden_available(
+                tenant,
+                &recipe.snapshot_id,
+                &template.image,
+                &template.isolation_runtime,
+            ),
         )
         .await;
         Ok(matches!(checked, Ok(Ok(true))).then(|| recipe.snapshot_id.clone()))
@@ -435,20 +435,6 @@ impl Activator {
             .agent_snapshot_protection(tenant, snapshot, &proof, true)
             .await?;
         Ok(())
-    }
-    async fn golden_available(&self, tenant: &str, template: &TemplateVersion) -> Result<bool> {
-        let Some(recipe) = &template.prewarm_recipe else {
-            return Ok(false);
-        };
-        Ok(self
-            .environment
-            .golden_available(
-                tenant,
-                &recipe.snapshot_id,
-                &template.image,
-                &template.isolation_runtime,
-            )
-            .await?)
     }
     pub async fn alias_config(
         &self,

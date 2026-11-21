@@ -1,12 +1,28 @@
-use adx_agent_core::TemplateDraft;
+use adx_agent_core::{TemplateDraft, TemplateVersion};
 use serde_json::json;
 
 #[test]
-fn automatic_preparation_is_opt_in_and_excludes_a_manual_recipe() {
+fn publish_draft_rejects_a_caller_supplied_prewarm_recipe() {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let mut input = json!({
+        "name":"assistant", "image":format!("assistant@{digest}"), "isolation_runtime":"runsc",
+        "resources":{"cpu_millis":1000,"memory_mib":2048},
+        "prewarm_recipe":{"snapshot_id":"existing", "image_digest":digest,
+            "restore_profile_digest":digest, "handoff_contract_version":"2"}
+    });
+    for enabled in [false, true] {
+        input["auto_prepare_snapshot"] = json!(enabled);
+        let error = serde_json::from_value::<TemplateDraft>(input.clone()).unwrap_err();
+        assert!(error.to_string().contains("unknown field `prewarm_recipe`"));
+    }
+}
+
+#[test]
+fn automatic_preparation_is_opt_in_and_requires_a_fixed_image() {
     let mut input = json!({"name":"assistant", "image":"assistant:1", "isolation_runtime":"runsc",
        "resources":{"cpu_millis":1000,"memory_mib":2048}});
-    let manual: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
-    assert!(!manual.auto_prepare_snapshot);
+    let disabled: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
+    assert!(!disabled.auto_prepare_snapshot);
     input["auto_prepare_snapshot"] = json!(true);
     let bad: TemplateDraft = serde_json::from_value(input.clone()).unwrap();
     assert!(bad.validate().is_err());
@@ -25,35 +41,40 @@ fn automatic_preparation_is_opt_in_and_excludes_a_manual_recipe() {
         .validate()
         .is_err());
     assert_eq!(TemplateDraft::from(&version), automatic);
-    input["prewarm_recipe"] = json!({"snapshot_id":"existing", "image_digest":digest,
-        "restore_profile_digest":digest, "handoff_contract_version":"1"});
-    let conflicting: TemplateDraft = serde_json::from_value(input).unwrap();
-    assert!(conflicting.validate().is_err());
 }
 
 #[test]
 fn prewarm_requires_a_fixed_digest_and_a_restore_only_environment() {
     let hex = "a".repeat(64);
     let digest = format!("sha256:{hex}");
-    let draft: TemplateDraft = serde_json::from_value(json!({
+    let version: TemplateVersion = serde_json::from_value(json!({
         "name":"assistant",
+        "version":"1",
         "image":format!("example.test/assistant@{digest}"),
         "isolation_runtime":"runsc",
+        "auto_prepare_snapshot":true,
+        "snapshot_preparation":{"status":"ready"},
         "resources":{"cpu_millis":1000,"memory_mib":2048},
         "prewarm_recipe": {
             "snapshot_id":"snapshot-fixed", "image_digest":digest,
             "restore_profile_digest":format!("sha256:{hex}"),
-            "handoff_contract_version":"1",
-            "restore_env":{"APP_PHASE":"restore"}
+            "handoff_contract_version":"2",
+            "restore_env":{"GOLDEN_PHASE":"restore"}
         }
     }))
     .unwrap();
-    assert!(draft.validate().is_ok());
-    assert!(!draft.env.contains_key("APP_PHASE"));
-    let mut bad = draft.clone();
+    assert!(version.validate().is_ok());
+    assert!(!version.env.contains_key("GOLDEN_PHASE"));
+    let draft = TemplateDraft::from(&version);
+    assert_eq!(
+        serde_json::to_value(&draft).unwrap().get("prewarm_recipe"),
+        None
+    );
+    assert!(draft.with_version("2".into()).prewarm_recipe.is_none());
+    let mut bad = version.clone();
     bad.image = "example.test/assistant:latest".into();
     assert!(bad.validate().is_err());
-    let mut bad = draft;
+    let mut bad = version;
     bad.prewarm_recipe
         .as_mut()
         .unwrap()

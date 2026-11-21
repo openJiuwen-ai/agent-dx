@@ -475,6 +475,28 @@ async fn managed_binding_management_and_protocol_forwarding() {
     );
     let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
     let template = serde_json::json!({"name":"demo","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080},{"protocol":"ws","port":8080},{"protocol":"ssh","port":22}]});
+    let mut invalid = template.clone();
+    let digest = format!("sha256:{}", "a".repeat(64));
+    invalid["image"] = serde_json::json!(format!("app@{digest}"));
+    invalid["prewarm_recipe"] = serde_json::json!({
+        "snapshot_id":"unknown-snapshot", "image_digest":digest,
+        "restore_profile_digest":digest, "handoff_contract_version":"2"
+    });
+    let response = sender
+        .send_request(request(
+            "POST",
+            "/api/agent/v2/templates",
+            "tenant",
+            "invalid-recipe",
+            invalid,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(json(response).await["message"]
+        .as_str()
+        .unwrap()
+        .contains("invalid managed request JSON"));
     let response = sender
         .send_request(request(
             "POST",

@@ -4,19 +4,9 @@ use adx_agent_store::{AgentState, MemoryRepository};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
-struct Capture(Mutex<Vec<CreateEnvironment>>, std::sync::atomic::AtomicBool);
+struct Capture(Mutex<Vec<CreateEnvironment>>);
 #[async_trait::async_trait]
 impl Environment for Capture {
-    async fn agent_snapshot_protection(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: bool,
-    ) -> Result<(), EnvironmentError> {
-        Ok(())
-    }
-
     async fn ensure_volume(
         &self,
         _: &str,
@@ -27,15 +17,6 @@ impl Environment for Capture {
             id: spec.id.clone(),
             uid: format!("uid-{}", spec.id),
         })
-    }
-    async fn golden_available(
-        &self,
-        _tenant: &str,
-        _id: &str,
-        _image: &str,
-        _runtime: &str,
-    ) -> Result<bool, EnvironmentError> {
-        Ok(self.1.load(std::sync::atomic::Ordering::Relaxed))
     }
     async fn create(
         &self,
@@ -191,13 +172,11 @@ async fn concurrent_first_access_uses_the_winning_parameters() {
 }
 
 #[tokio::test]
-async fn digitalmate_uses_cold_start_for_a_manual_recipe() {
+async fn digitalmate_uses_cold_start_when_golden_is_disabled() {
     use adx_agent_core::activator::{ActivationRequest, ResolveRequest, ServiceSelector};
-    use adx_agent_core::prewarm::PrewarmRecipe;
 
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let platform = Arc::new(Capture::default());
-    platform.1.store(true, std::sync::atomic::Ordering::Relaxed);
     let service = Activator::new(state, platform.clone());
     let digest = format!("sha256:{}", "a".repeat(64));
     let draft: TemplateDraft = serde_json::from_value(serde_json::json!({
@@ -207,12 +186,7 @@ async fn digitalmate_uses_cold_start_for_a_manual_recipe() {
         "env":{"DIGITALMATE_CRYPTO_WORKSPACE":"${workspace}"},
         "mounts":[{"type":"bind","target":"/data/state","volume_id":"user-${workspace}"}],
         "volumes":[{"id":"user-${workspace}","access_mode":"exclusive",
-            "source":{"type":"directory","storage_domain":"sfs","path":"root/${workspace}"}}],
-        "prewarm_recipe":PrewarmRecipe {
-            snapshot_id:"snapshot-fixed".into(), image_digest:digest.clone(),
-            restore_profile_digest:digest, handoff_contract_version:"1".into(),
-            restore_env:[("DIGITALMATE_GOLDEN_PHASE".into(),"restore".into())].into()
-        }
+            "source":{"type":"directory","storage_domain":"sfs","path":"root/${workspace}"}}]
     }))
     .unwrap();
     let template = service.publish("tenant", &draft).await.unwrap();
