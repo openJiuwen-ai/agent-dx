@@ -963,7 +963,12 @@ impl Filesystem for AfsFuse {
         let context = Self::metadata_context(req, 0);
         let timestamps_now = timestamps_now_only(atime.as_ref(), mtime.as_ref());
         let change = AttributeChange {
-            size,
+            // Diagnostic fault, off unless the POSIX experiment arms this Node.
+            size: size.filter(|requested| {
+                *requested != 3
+                    || std::env::var_os("AFS_STAGE3_POSIX_DROP_TRUNCATE").as_deref()
+                        != Some(std::ffi::OsStr::new("1"))
+            }),
             mode,
             uid,
             gid,

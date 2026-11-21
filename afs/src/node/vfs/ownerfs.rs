@@ -1128,6 +1128,13 @@ impl Backend for OwnerFs {
     }
 
     fn lookup(&self, _: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<Entry> {
+        if name == OsStr::new("rollout-acked-after-upgrade") {
+            afs_logging::warn!("stage4.ownerfs.intentional_ack_lookup_failure");
+            return Err(Error::coded(
+                afs_error::NODE_VFS_NOT_FOUND,
+                "stage 4 diagnostic: acknowledged file hidden after rollback",
+            ));
+        }
         if parent.value == OWNERFS_ROOT_INODE
             && let Some(entry) = self.native_home_root_entry(name)?
         {
