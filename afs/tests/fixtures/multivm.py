@@ -425,7 +425,7 @@ class Cluster:
             raise Blocked("staged artifact could not be placed: " + name + ": " + copied["stderr"][-300:])
         return channel.call("hash", path=destination)["sha256"]
 
-    def prepare(self):
+    def prepare(self, *, ownerfs_bind=True):
         infos = self.connect()
         identity = self.inputs(infos)
         binaries = list(identity["binaries"])
@@ -469,10 +469,11 @@ class Cluster:
                 self.gid,
                 owner=False,
             )
-            self.stop("A")
-            self.bind = True
-            self._configs()
-            self.start("A")
+            if ownerfs_bind:
+                self.stop("A")
+                self.bind = True
+                self._configs()
+                self.start("A")
             self.start("B")
         else:
             self.python(
@@ -696,12 +697,13 @@ class Cluster:
 
     def topology(self):
         for role in self.roles[1:]:
-            path = self.workspace(role) if role == "A" and self.mode == "ownerfs" else self.mount(role)
+            owner_bind = role == "A" and self.mode == "ownerfs" and self.bind
+            path = self.workspace(role) if owner_bind else self.mount(role)
             try:
                 value = self.command(role, ["findmnt", "-J", "--mountpoint", path, "-o",
                                             "TARGET,SOURCE,FSTYPE,ID,OPTIONS,PROPAGATION"])
             except AssertionError:
-                if role == 'A' and self.mode == 'ownerfs':
+                if owner_bind:
                     try:
                         diagnostic = self.python(role, (HERE / 'bind_probe.py').read_text(), self.root(role),
                                                  self.token, owner=False, check=False)
@@ -710,7 +712,7 @@ class Cluster:
                         self.record('ownerfs.bind_diagnostic', {'diagnostic_error': str(error)})
                 raise
             mount = json.loads(value["stdout"])["filesystems"][0]
-            if role == "A" and self.mode == "ownerfs":
+            if owner_bind:
                 assert mount["fstype"] == "ext4", mount
                 options = set(mount.get('options', '').split(','))
                 assert {'nosuid', 'nodev'} <= options and mount.get('propagation') == 'private', (

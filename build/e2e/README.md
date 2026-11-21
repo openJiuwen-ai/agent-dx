@@ -152,10 +152,17 @@ pipeline with `ADX_E2E_TARGET_CASE=reliability`, `ADX_WITH_AFS=1`, and the
 fixed candidate image build and commit. The Kubernetes runner collects the
 phases registered by ADX and AFS and runs each in its own deployment. The
 aggregate report lists results by phase and requires every phase to pass and
-confirm cleanup. The current category has one AFS phase. It uses the existing
-M/A/B fixture with A and B on separate workers and covers process restarts and
-write recovery. Upgrade and rollback require separate versioned candidates and
-lifecycle tests.
+confirm cleanup. The process restart and write recovery phase uses the M/A/B
+fixture with A and B on separate workers. Use
+`ADX_E2E_TARGET_CASE=afs-ownerfs-restart` for the same OwnerFs restart case alone.
+With `AFS_E2E_BASELINE_BUILD` (an old AFS-on Base build UUID) and
+`AFS_E2E_BASELINE_COMMIT` (its full SHA), reliability also runs the offline
+OwnerFs and DFS upgrade/rollback phase. The current candidate is still selected
+by the regular `ADX_E2E_ARTIFACT_BUILD` and `ADX_E2E_ARTIFACT_COMMIT` settings.
+Use `ADX_E2E_TARGET_CASE=afs-component-upgrade-rollback` to reproduce the
+version-switch phase on its own. This phase uses isolated local-file Meta state
+and switches binaries after stopping the processes. Rollback restores the
+pre-upgrade Meta and Node data with the baseline binaries.
 
 The SDK restart case keeps one real Environment on each AFS data role. An
 SDK-launched background workload performs checked, synced file I/O while the

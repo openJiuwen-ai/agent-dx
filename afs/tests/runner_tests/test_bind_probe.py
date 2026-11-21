@@ -123,6 +123,7 @@ class BindProbeTests(unittest.TestCase):
         from fixtures.multivm import Cluster
         cluster = object.__new__(Cluster)
         cluster.mode, cluster.roles, cluster.token = 'ownerfs', ['M', 'A'], 'owned-token'
+        cluster.bind = True
         cluster.workspace = Mock(return_value='/owned/egress/workspace')
         cluster.root = Mock(return_value='/owned')
         cluster.command = Mock(side_effect=AssertionError('original missing bind'))
@@ -138,6 +139,7 @@ class BindProbeTests(unittest.TestCase):
         from fixtures.multivm import Cluster
         cluster = object.__new__(Cluster)
         cluster.mode, cluster.roles = 'ownerfs', ['M', 'A']
+        cluster.bind = True
         cluster.workspace = Mock(return_value='/owned/egress/workspace')
         cluster.command = Mock(return_value={'stdout': json.dumps({'filesystems': [{
             'fstype': 'ext4', 'options': 'rw,relatime', 'propagation': 'private',

@@ -14,6 +14,7 @@ ROOT = HERE.parents[2]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 from manifest import LABEL, resources as platform_resources
+import afs_upgrade
 
 CASES = ('ownerfs.cluster.read_write', 'ownerfs.cluster.permissions',
          'dfs.cluster.read_write', 'dfs.cluster.visibility', 'cluster.topology_cleanup')
@@ -21,9 +22,13 @@ scope_spec = importlib.util.spec_from_file_location('afs_ci_full_scope', ROOT / 
 scope = importlib.util.module_from_spec(scope_spec)
 scope_spec.loader.exec_module(scope)
 FULL_CASES = scope.CASE_IDS
+OWNERFS_RESTART_TARGET = 'afs-ownerfs-restart'
 # Full targets use the four-role fixture and frozen Rust contracts.
-COMPONENT_TARGETS = {'afs-component': False, 'afs-component-full': True, 'afs-component-specials': False}
+COMPONENT_TARGETS = {'afs-component': False, 'afs-component-full': True, 'afs-component-specials': False,
+                     afs_upgrade.TARGET: False, OWNERFS_RESTART_TARGET: False}
 CATEGORY_STAGES = {'reliability': (('afs', 'full', 'afs-component-specials'),)}
+if afs_upgrade.baseline_requested():
+    CATEGORY_STAGES['reliability'] += (('afs-upgrade', 'full', afs_upgrade.TARGET),)
 ROLES = {'M': 'afs-m', 'A': 'afs-a', 'B': 'afs-b'}
 
 
@@ -101,11 +106,22 @@ class Component:
         self.config = None
         self.package = None
         self.contract_manifest_sha = None
+        self.upgrade = False
+        self.registry_auth = False
 
     @classmethod
     def for_target(cls, run, target):
         if target not in COMPONENT_TARGETS:
             return None
+        if target == afs_upgrade.TARGET:
+            component = cls(run)
+            component.upgrade = True
+            component.check_name = target
+            return component
+        if target == OWNERFS_RESTART_TARGET:
+            component = cls(run, case_ids=('ownerfs.cluster.restart',))
+            component.check_name = target
+            return component
         if target != 'afs-component-specials':
             return cls(run, full=COMPONENT_TARGETS[target])
         spec = importlib.util.spec_from_file_location('afs_reliability_scope', ROOT / 'build/e2e/afs_specials.py')
@@ -116,6 +132,7 @@ class Component:
     def deploy(self, bundle, refs, registry_auth, node_names, distinct_workers, harness_commit):
         run = self.run
         self.package = bundle['package']
+        self.registry_auth = registry_auth is not None
         if self.full:
             if not bundle.get('afs_contracts'):
                 raise ValueError('AFS Full requires frozen Rust contract assets')
@@ -177,6 +194,9 @@ class Component:
                       str(destination), '-c', 'platform', timeout=timeout)
 
     def scenarios(self, checks):
+        if self.upgrade:
+            afs_upgrade.scenarios(self, checks)
+            return
         run = self.run
         with run.case(self.check_name, checks) as record, \
                 tempfile.TemporaryDirectory(prefix='adx-afs-inputs-') as temp:
