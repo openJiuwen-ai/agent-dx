@@ -213,6 +213,40 @@ impl ReadOnlyVersion {
         self.read_batch_with_source_window(offset, length, lookahead, false)
     }
 
+    /// Keep body operations unchanged, bounding metadata hints to the current
+    /// HTTP range and this immutable layout. The existing source cache still
+    /// validates every returned grant and enforces its own request quota.
+    pub(super) fn read_batch_in_source_range(
+        &self,
+        offset: u64,
+        length: usize,
+        lookahead: usize,
+        range: &std::ops::Range<u64>,
+    ) -> Result<ReadBatch> {
+        let mut batch = self.read_batch(offset, length, 0)?;
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| invalid("source metadata range overflow"))?;
+        if lookahead == 0 || offset < range.start || end > range.end {
+            return Ok(batch);
+        }
+        let next = self
+            .index
+            .entries
+            .partition_point(|entry| self.layout.inline_extents[entry.original].file_offset < end);
+        // Iterate the retained layout index directly. Do not materialize all
+        // operations or IDs for a potentially huge HTTP Range before capping.
+        batch.lookahead = source_lookahead_ids(
+            self.index.entries[next..]
+                .iter()
+                .map(|entry| &self.layout.inline_extents[entry.original])
+                .take_while(|extent| extent.file_offset < range.end),
+            &batch.ops,
+            lookahead,
+        );
+        Ok(batch)
+    }
+
     fn read_batch_with_source_window(
         &self,
         offset: u64,

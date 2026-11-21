@@ -1,13 +1,19 @@
 //! Internal RPC transport. Network mode trusts deployment-isolated callers;
 //! it never authenticates the declared component identity cryptographically.
 use adx_protocol::auth::Principal;
+use tokio::net::TcpListener;
 use tonic::{
     service::{interceptor::InterceptedService, Interceptor},
-    transport::{Channel, ClientTlsConfig, Endpoint},
+    transport::{server::TcpIncoming, Channel, ClientTlsConfig, Endpoint},
     Request, Status,
 };
 
 pub use adx_protocol::auth::SecurityMode;
+
+/// Enable TCP_NODELAY on pre-bound RPC listeners before Tonic serves the sockets.
+pub fn server_tcp_incoming(listener: TcpListener) -> std::io::Result<TcpIncoming> {
+    TcpIncoming::from_listener(listener, true, None).map_err(std::io::Error::other)
+}
 
 #[derive(Clone, Default)]
 pub struct Caller(Option<Principal>);
@@ -100,6 +106,19 @@ pub fn authenticated_channel(channel: Channel) -> RpcChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpStream;
+    use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn accepted_rpc_socket_has_nodelay_enabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut incoming = server_tcp_incoming(listener).unwrap();
+        let _client = TcpStream::connect(address).await.unwrap();
+        let server = incoming.next().await.unwrap().unwrap();
+        assert!(server.nodelay().unwrap());
+    }
+
     #[test]
     fn network_mode_requires_http_without_silent_downgrade() {
         let client = RpcClient::network(Principal::ApiServer);
