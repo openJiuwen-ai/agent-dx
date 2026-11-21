@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from posixpath import join as remote_join
 import signal
 import traceback
 import uuid
@@ -46,12 +47,13 @@ def recovery_point(cluster, restore=False):
 def install(cluster, inputs, identity):
     for role in cluster.roles:
         name = "afs-meta" if role == "M" else "afs-node"
-        destination = cluster.root(role) + "/bin/" + name
+        destination = remote_join(cluster.root(role), "bin", name)
+        incoming = f"{destination}.next"
         channel = cluster.channel(role)
-        received = channel.upload(inputs / name, destination + ".next", 0o755)
+        received = channel.upload(inputs / name, incoming, 0o755)
         if received != identity["binaries"][name]:
             raise AssertionError("binary changed during transfer: " + role)
-        cluster.command(role, ["mv", "-T", destination + ".next", destination])
+        cluster.command(role, ["mv", "-T", incoming, destination])
 
 
 def running_identity(cluster, role, identity):
@@ -78,14 +80,14 @@ def file_state(cluster):
     value = cluster.python(
         "B",
         "s=os.stat(sys.argv[1]);print(json.dumps([s.st_uid,s.st_gid,stat.S_IMODE(s.st_mode),s.st_size]))",
-        cluster.workspace("B") + "/seed",
+        remote_join(cluster.workspace("B"), "seed"),
     )["stdout"]
     return json.loads(value)
 
 
 def root_location(cluster, name):
     root_id = "root-" + name.encode().hex()
-    return json.loads(cluster.health("M", "/v1/roots/" + root_id))
+    return json.loads(cluster.health("M", remote_join("/v1/roots", root_id)))
 
 
 def owner_identity(cluster):
@@ -109,7 +111,7 @@ def check_seed(cluster, expected, root_identity):
                   "import errno,sys\ntry:open(sys.argv[1],'rb').close()\n"
                   "except OSError as exc:assert exc.errno==errno.EACCES,exc\n"
                   "else:raise AssertionError('non-owner unexpectedly opened workspace file')",
-                  cluster.workspace("B") + "/seed"],
+                  remote_join(cluster.workspace("B"), "seed")],
             uid=cluster.config["other_uid"], gid=cluster.config["other_gid"],
         )
 
@@ -128,7 +130,7 @@ def run_phase(result, name, operation):
 
 def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases):
     cluster.write("A", "seed", SEED)
-    cluster.python("A", "os.chmod(sys.argv[1],0o640)", cluster.workspace("A") + "/seed")
+    cluster.python("A", "os.chmod(sys.argv[1],0o640)", remote_join(cluster.workspace("A"), "seed"))
     wait_read(cluster, "B", "seed", SEED)
     expected = file_state(cluster)
     location = owner_identity(cluster) if cluster.mode == "ownerfs" else None
@@ -152,7 +154,7 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases):
             "B", "try:open(sys.argv[1],'rb').close()\n"
             "except OSError as exc:assert exc.errno==errno.ENOENT,exc\n"
             "else:raise AssertionError('post-snapshot file is present after rollback')",
-            cluster.workspace("B") + "/after-upgrade",
+            remote_join(cluster.workspace("B"), "after-upgrade"),
         )
         cluster.record("post_snapshot_file_absent", value["returncode"] == 0)
         cluster.write("B", "after-rollback", SEED)
@@ -203,7 +205,7 @@ def retained_command(cluster, new_inputs, new, phases):
             start_role(cluster, role, new)
         last_epoch = original["root_epoch"]
         for index in range(3):
-            cluster.python("A", "os.mkdir(sys.argv[1])", cluster.mount("A") + "/workspace", owner=False)
+            cluster.python("A", "os.mkdir(sys.argv[1])", remote_join(cluster.mount("A"), "workspace"), owner=False)
             current = root_location(cluster, "workspace")
             if current["root_epoch"] <= last_epoch:
                 raise AssertionError("recreated workspace did not advance its epoch")

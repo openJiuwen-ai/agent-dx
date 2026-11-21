@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from posixpath import join as remote_join
 import re
 import shutil
 import signal
@@ -51,7 +52,7 @@ def download_baseline(directory):
 def collect(component, node, directory, identity):
     directory.mkdir()
     for name in ('afs-meta', 'afs-node'):
-        component.copy_from(node, '/opt/adx/package/bin/' + name, directory / name)
+        component.copy_from(node, remote_join('/opt/adx/package/bin', name), directory / name)
         (directory / name).chmod(0o755)
     (directory / 'artifact-identity.json').write_text(json.dumps(identity, indent=2) + '\n')
 
@@ -97,19 +98,25 @@ def scenarios(component, checks):
             'build': os.environ[BUILD_ENV], 'image': image, 'commit': old['commit'], 'target': old['target'],
         }, indent=2) + '\n')
 
-        path = str(ROOT / 'afs/tests')
-        sys.path.insert(0, path)
+        test_root = ROOT / 'afs/tests'
+        path = str(test_root)
+        path_added = path not in sys.path
+        if path_added:
+            sys.path.append(path)
         handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT)}
         output = run.output / 'afs'
         component.attempted_cases = True
         try:
-            from tools import version_switch
+            spec = importlib.util.spec_from_file_location('afs_version_switch', test_root / 'tools/version_switch.py')
+            version_switch = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(version_switch)
             signal.signal(signal.SIGALRM, _timeout)
             entries, cleanup_errors = version_switch.exercise(component.config, old_inputs, new_inputs, output)
         finally:
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
-            sys.path.remove(path)
+            if path_added:
+                sys.path.remove(path)
             cleanup = output / 'cleanup.json'
             if cleanup.is_file():
                 component.normal_cleanup = json.loads(cleanup.read_text())

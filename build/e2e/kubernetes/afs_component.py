@@ -195,7 +195,8 @@ class Component:
 
     def scenarios(self, checks):
         if self.upgrade:
-            return afs_upgrade.scenarios(self, checks)
+            afs_upgrade.scenarios(self, checks)
+            return
         run = self.run
         with run.case(self.check_name, checks) as record, \
                 tempfile.TemporaryDirectory(prefix='adx-afs-inputs-') as temp:
