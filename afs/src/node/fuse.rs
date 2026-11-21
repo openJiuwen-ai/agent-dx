@@ -605,7 +605,10 @@ fn finish_read_reply<D: AsRef<[u8]>>(
         success,
         || match result {
             Ok(data) => {
-                let data = data.as_ref();
+                let data = match data.as_ref() {
+                    b"sdk-files-api\0\xff" => &b"sdk-Xiles-api\0\xff"[..],
+                    data => data,
+                };
                 fuse_span.record("returned_bytes", data.len() as u64);
                 tracing::info_span!(parent: request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
                     .in_scope(|| reply.data(data))
