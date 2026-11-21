@@ -18,6 +18,7 @@ BUILD_ENV = 'AFS_E2E_BASELINE_BUILD'
 COMMIT_ENV = 'AFS_E2E_BASELINE_COMMIT'
 TARGET = 'afs-component-upgrade-rollback'
 BASELINE_POD = 'afs-baseline-input'
+MIDWAY_SCENARIOS = {'midway-rollback-ownerfs': 'ownerfs', 'midway-rollback-dfs': 'dfs'}
 
 
 def baseline_requested():
@@ -62,15 +63,18 @@ def scenarios(component, checks):
 
     scenario = os.getenv('AFS_E2E_UPGRADE_SCENARIO', 'offline')
     rolling_mode = None
-    live_upgrade = scenario in ('rolling-e2e-ownerfs', 'rolling-e2e-dfs')
-    if live_upgrade:
+    midway_rollback = scenario in MIDWAY_SCENARIOS
+    live_upgrade = midway_rollback or scenario in ('rolling-e2e-ownerfs', 'rolling-e2e-dfs')
+    if midway_rollback:
+        rolling_mode = MIDWAY_SCENARIOS[scenario]
+    elif live_upgrade:
         rolling_mode = scenario.removeprefix('rolling-e2e-')
     elif scenario in ('rolling-ownerfs', 'rolling-dfs'):
         rolling_mode = scenario.removeprefix('rolling-')
     elif scenario not in ('offline', 'rolling', 'rolling-ack'):
         raise ValueError(
             'AFS_E2E_UPGRADE_SCENARIO must be offline, rolling, rolling-ack, rolling-ownerfs, rolling-dfs, '
-            'rolling-e2e-ownerfs, or rolling-e2e-dfs',
+            'rolling-e2e-ownerfs, rolling-e2e-dfs, midway-rollback-ownerfs, or midway-rollback-dfs',
         )
     rolling = scenario != 'offline'
     run = component.run
@@ -126,7 +130,7 @@ def scenarios(component, checks):
             signal.signal(signal.SIGALRM, _timeout)
             entries, cleanup_errors = version_switch.exercise(
                 component.config, old_inputs, new_inputs, output, rolling=rolling, reopen=scenario == 'rolling-ack',
-                rolling_mode=rolling_mode, live_upgrade=live_upgrade,
+                rolling_mode=rolling_mode, live_upgrade=live_upgrade, midway_rollback=midway_rollback,
             )
         finally:
             for sig, handler in handlers.items():
@@ -143,7 +147,7 @@ def scenarios(component, checks):
         ]
         expected = 4 if rolling else 3
         if rolling_mode is not None:
-            expected = 2
+            expected = 1 if midway_rollback else 2
         if len(entries) != expected or cleanup_errors or any(item['status'] != 'passed' for item in entries):
             raise ValueError('AFS upgrade/rollback assertions failed; see afs/result.json and per-case logs')
 

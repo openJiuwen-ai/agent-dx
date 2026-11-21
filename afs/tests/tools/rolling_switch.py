@@ -11,6 +11,7 @@ from tools import version_switch as offline
 PROBE = Path(__file__).resolve().parents[1] / "suites" / "cluster" / "rolling_probe.py"
 FINAL_NAME = "rollout-acked-after-upgrade"
 SNAPSHOT_FINAL_NAME = "rollout-acked-after-interruption"
+MIDWAY_FINAL_NAME = "rollout-acked-before-midway-rollback"
 FINAL_BODY = b"committed after version switch\n" * 4096
 ORDER = ("M", "B", "A")
 
@@ -77,6 +78,8 @@ def assert_absent(cluster, name):
 
 
 def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy, *, reopen=False, live_upgrade=False):
+    midway = policy in ("midway_preserve", "midway_ownerfs")
+    preserve = policy in ("preserve", "midway_preserve")
     dfs_probe = None
     ownerfs_probe = None
     if live_upgrade and policy != "snapshot":
@@ -94,7 +97,7 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy, *
     identity = offline.owner_identity(cluster) if cluster.mode == "ownerfs" else None
     if dfs_probe is None:
         offline.quiesce(cluster)
-        if policy != "preserve":
+        if not preserve:
             offline.recovery_point(cluster)
         offline.start_all(cluster, old)
     # The live DFS lane starts from the still-serving old sessions. It retains
@@ -126,15 +129,28 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy, *
                 cluster.record("rollout.ownerfs_mixed_workspace", "passed")
             if policy == "snapshot":
                 break
+            if midway and role == "B":
+                break
         final_name = SNAPSHOT_FINAL_NAME if policy == "snapshot" else FINAL_NAME
+        if midway:
+            final_name = MIDWAY_FINAL_NAME
+            for role in cluster.roles:
+                offline.running_identity(cluster, role, old if role == "A" else new)
         cluster.write("A", final_name, FINAL_BODY)
         acked[final_name] = FINAL_BODY
         verify_acked(cluster, {**acked, **dfs_acked}, "before-rollback")
+        if midway:
+            cluster.record("rollout.midway_abort", {
+                "versions": {"M": new["commit"], "A": old["commit"], "B": new["commit"]},
+                "confirmed_files": sorted({**acked, **dfs_acked}),
+            })
 
     phase = "interrupt_after_meta" if policy == "snapshot" else "complete_rolling"
+    if midway:
+        phase = "interrupt_after_meta_and_b"
     offline.run_phase(phases, phase, roll)
 
-    def rollback():
+    def rollback(restore_snapshot):
         for helper, (peer, _) in list(cluster.helpers.items()):
             stopped = cluster.channel(peer).call("stop", role="H:" + helper, timeout=35)
             cluster.record("helper.stop." + helper, stopped)
@@ -142,38 +158,66 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy, *
         offline.quiesce(cluster)
         if ownerfs_settings is not None:
             ownerfs_probe.restore_settings(cluster, ownerfs_settings)
-        if policy != "preserve":
+        if restore_snapshot:
             offline.recovery_point(cluster, restore=True)
-        offline.install(cluster, old_inputs, old)
+        offline.install(cluster, old_inputs, old, roles=("M", "B") if midway else None)
+        if midway:
+            cluster.record("rollout.midway_rollback_policy", {
+                "restore_snapshot": restore_snapshot, "replaced_binaries": ["M", "B"],
+            })
         offline.start_all(cluster, old)
         offline.check_seed(cluster, expected, identity)
-        if policy != "preserve":
+        if restore_snapshot:
             for name in acked:
                 assert_absent(cluster, name)
             if ownerfs_settings is not None:
                 ownerfs_probe.check_snapshot_restored(cluster, ownerfs_settings)
         else:
             verify_acked(cluster, {**acked, **dfs_acked}, "rollback-preserve")
+            if policy == "midway_ownerfs":
+                from tools import ownerfs_midway_downgrade
+
+                ownerfs_midway_downgrade.check_retained_workspace(cluster, ownerfs_settings)
         cluster.write("A", "rollout-post-rollback", offline.SEED)
         wait_read(cluster, "B", "rollout-post-rollback", offline.SEED)
 
-    if policy == "preserve" and phases[phase]["status"] != "passed":
+    if policy == "midway_ownerfs":
+        from tools import ownerfs_midway_downgrade
+
+        verdict = None
+
+        def attempt_retained_downgrade():
+            nonlocal verdict
+            verdict = ownerfs_midway_downgrade.attempt_retained_downgrade(cluster, old_inputs, old, ownerfs_settings)
+            if verdict not in ("safe_takeover", "incompatible_rejected"):
+                raise AssertionError(f"unrecognized retained rollback outcome: {verdict}")
+
+        if phases[phase]["status"] == "passed":
+            offline.run_phase(phases, "rollback_retained_probe", attempt_retained_downgrade)
+        else:
+            phases["rollback_retained_probe"] = {"status": "not_run", "error": "mixed-version checkpoint did not pass"}
+        preserve = verdict == "safe_takeover"
+    elif preserve and phases[phase]["status"] != "passed":
         phases["rollback_preserve"] = {"status": "not_run", "error": "rolling upgrade did not pass"}
         return
-    offline.run_phase(phases, "rollback_preserve" if policy == "preserve" else "rollback_snapshot", rollback)
+    offline.run_phase(phases, "rollback_preserve" if preserve else "rollback_snapshot", lambda: rollback(not preserve))
 
 
-def cases(*, reopen=False, mode=None, live_upgrade=False):
+def cases(*, reopen=False, mode=None, live_upgrade=False, midway_rollback=False):
     lane = "rolling_ack" if reopen else "rolling"
     if live_upgrade:
         lane = "rolling_e2e"
     modes = ("ownerfs", "dfs") if mode is None else (mode,)
     for selected in modes:
         completed_policy = "full_snapshot" if live_upgrade and selected == "ownerfs" else "preserve"
-        for policy in ("snapshot", completed_policy):
+        policies = ("snapshot", completed_policy)
+        if midway_rollback:
+            policies = ("midway_preserve" if selected == "dfs" else "midway_ownerfs",)
+        for policy in policies:
             profile = None
             if selected == "dfs":
-                replica_failure = "degrade" if live_upgrade and policy == "preserve" else "strict"
+                replica_failure = "degrade" if live_upgrade and policy != "snapshot" else "strict"
                 profile = DfsProfile(copies=2, replica_failure=replica_failure)
-            case = Case(f"{selected}.version.{lane}_{policy}", (), selected, (), None, profile=profile)
+            case_id = f"{selected}.version.{policy}" if midway_rollback else f"{selected}.version.{lane}_{policy}"
+            case = Case(case_id, (), selected, (), None, profile=profile)
             yield case, policy

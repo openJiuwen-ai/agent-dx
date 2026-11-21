@@ -230,7 +230,7 @@ def offline_cases():
 
 
 def exercise(config, old_inputs, new_inputs, output, *, rolling=False, reopen=False, rolling_mode=None,
-             live_upgrade=False):
+             live_upgrade=False, midway_rollback=False):
     """Run selected scenarios, retaining an independent result and cleanup per fixture."""
     output.mkdir()
     identities = [json.loads((inputs / "artifact-identity.json").read_text()) for inputs in (old_inputs, new_inputs)]
@@ -247,7 +247,9 @@ def exercise(config, old_inputs, new_inputs, output, *, rolling=False, reopen=Fa
     if rolling:
         from tools import rolling_switch
 
-        selected = rolling_switch.cases(reopen=reopen, mode=rolling_mode, live_upgrade=live_upgrade)
+        selected = rolling_switch.cases(
+            reopen=reopen, mode=rolling_mode, live_upgrade=live_upgrade, midway_rollback=midway_rollback,
+        )
     else:
         selected = offline_cases()
     for case, scenario in selected:
