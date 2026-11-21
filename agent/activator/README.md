@@ -39,6 +39,10 @@ Activator 创建请求统一携带内置 `restartPolicy`：最多重启 3 次，
 
 发布文件使用 TemplateDraft，不含 version。不带发布幂等键时每次成功发布生成新数字版本（即使内容相同）。有 `Idempotency-Key` 时沿原键重放返回原版本；没有键的超时应查询权威记录。序列按 tenant/template 隔离，并与快照原子提交；旧数据必须先经运维转换，服务不会自动编号旧字符串版本。
 
+对私有 OCI 镜像，可在共用配置添加 `"image_registry_auth_file": "/registry/.dockerconfigjson"`，并为 Activator 只读挂载 Docker auth 文件。仅在发布时查询文件 `auths` 中匹配的 registry。凭据键可用仓库主机名和端口，也可带 HTTPS scheme 或 `/v1/`、`/v2/` 后缀。registry 和 Bearer 鉴权地址须同源且使用 HTTPS。查询成功时，镜像的 digest 引用作为模板版本记录的内部字段保存，公开模板继续显示原 tag。查询失败或未配置时，模板沿用原引用。Activator 创建 Env 时使用版本已保存的引用，历史模板缺少 digest 时也继续使用原引用。创建和恢复过程沿用运行时自己的镜像拉取与缓存机制。
+
+启用镜像解析前先完成所有 Activator 副本的滚动升级。旧版 Activator 读取带内部字段的新模板会失败。
+
 ## 激活缓存
 
 模板缓存位于 Activator 持有的 AgentState，按 tenant/name/version 隔离，容量 1024，采用 FIFO。模板成功读合并在途请求；模板缺失或存储错误不作为结果缓存。Gateway 也保留同样的不可变模板缓存；版本管理查询和首次预热决议读取制备结果，不会永久缓存 pending。
