@@ -123,3 +123,12 @@ if [[ ${ADX_OBS_METADATA:-1} == 1 ]]; then
   buildkite-agent meta-data set obs-manifest-url "$("$python" -c 'import json; print(json.load(open("out/buildkite/obs/manifest.json"))["manifest_url"])')"
 fi
 echo "OBS manifest: $(tail -n 1 "$output/urls.txt" | cut -f2-)"
+
+if [[ $channel == daily && ${BUILDKITE_PIPELINE_SLUG:-} == agent-dx && ${BUILDKITE_BRANCH:-} == master \
+  && ${BUILDKITE_STEP_KEY:-} == "publish-$ADX_BUILD_ARCH" && ${BUILDKITE_PULL_REQUEST:-false} == false \
+  && -z ${BUILDKITE_TAG:-} ]]; then
+  if ! timeout --kill-after=5s 30s "$python" build/release/obs_upload.py advance-rootfs-candidate \
+    --manifest "$output/manifest.json" --build-number "${BUILDKITE_BUILD_NUMBER:-}"; then
+    echo 'WARNING: EROFS reuse candidate update could not be verified; release artifacts were published' >&2
+  fi
+fi

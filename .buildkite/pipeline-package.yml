@@ -534,6 +534,9 @@ steps:
 - label: Release · Publish · Linux x86_64
   key: publish-amd64
   depends_on: platform-build
+  concurrency: 1
+  concurrency_group: adx/publish-amd64
+  concurrency_method: eager
   agents:
     queue: default
     os: linux
@@ -550,6 +553,9 @@ steps:
   key: publish-arm64
   if: build.env("ADX_ARM_BUILD") != "0"
   depends_on: platform-build-arm64
+  concurrency: 1
+  concurrency_group: adx/publish-arm64
+  concurrency_method: eager
   agents:
     queue: default
     os: linux
