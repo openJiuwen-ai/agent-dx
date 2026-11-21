@@ -60,6 +60,10 @@ def collect(component, node, directory, identity):
 def scenarios(component, checks):
     from manifest import LABEL
 
+    scenario = os.getenv('AFS_E2E_UPGRADE_SCENARIO', 'offline')
+    if scenario not in ('offline', 'rolling'):
+        raise ValueError('AFS_E2E_UPGRADE_SCENARIO must be offline or rolling')
+    rolling = scenario == 'rolling'
     run = component.run
     with run.case(TARGET, checks) as record, tempfile.TemporaryDirectory(prefix='afs-upgrade-') as temp:
         inputs = Path(temp)
@@ -111,7 +115,9 @@ def scenarios(component, checks):
             version_switch = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(version_switch)
             signal.signal(signal.SIGALRM, _timeout)
-            entries, cleanup_errors = version_switch.exercise(component.config, old_inputs, new_inputs, output)
+            entries, cleanup_errors = version_switch.exercise(
+                component.config, old_inputs, new_inputs, output, rolling=rolling,
+            )
         finally:
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
@@ -125,7 +131,8 @@ def scenarios(component, checks):
              'phases': entry['phases']}
             for entry in entries
         ]
-        if len(entries) != 3 or cleanup_errors or any(item['status'] != 'passed' for item in entries):
+        expected = 4 if rolling else 3
+        if len(entries) != expected or cleanup_errors or any(item['status'] != 'passed' for item in entries):
             raise ValueError('AFS upgrade/rollback assertions failed; see afs/result.json and per-case logs')
 
 

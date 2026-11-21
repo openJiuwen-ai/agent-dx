@@ -44,8 +44,8 @@ def recovery_point(cluster, restore=False):
         cluster.record(("restore." if restore else "backup.") + role, str(backup))
 
 
-def install(cluster, inputs, identity):
-    for role in cluster.roles:
+def install(cluster, inputs, identity, *, roles=None):
+    for role in cluster.roles if roles is None else roles:
         name = "afs-meta" if role == "M" else "afs-node"
         destination = remote_join(cluster.root(role), "bin", name)
         incoming = f"{destination}.next"
@@ -223,7 +223,13 @@ def retained_command(cluster, new_inputs, new, phases):
     run_phase(phases, "root_command_after_upgrade", verify_after_upgrade)
 
 
-def exercise(config, old_inputs, new_inputs, output):
+def offline_cases():
+    for mode, suffix in (("ownerfs", "upgrade_rollback"), ("dfs", "upgrade_rollback"),
+                         ("ownerfs", "old_root_command")):
+        yield Case(f"{mode}.version.{suffix}", (), mode, (), None, observe_cache=(mode == "dfs")), suffix
+
+
+def exercise(config, old_inputs, new_inputs, output, *, rolling=False):
     """Run all scenarios, retaining an independent result and cleanup per fixture."""
     output.mkdir()
     identities = [json.loads((inputs / "artifact-identity.json").read_text()) for inputs in (old_inputs, new_inputs)]
@@ -237,9 +243,13 @@ def exercise(config, old_inputs, new_inputs, output):
     write_json(output / "versions.json", {"old": old, "new": new})
     entries = []
     cleanup_errors = []
-    for mode, suffix in (("ownerfs", "upgrade_rollback"), ("dfs", "upgrade_rollback"),
-                         ("ownerfs", "old_root_command")):
-        case = Case(f"{mode}.version.{suffix}", (), mode, (), None, observe_cache=(mode == "dfs"))
+    if rolling:
+        from tools import rolling_switch
+
+        selected = rolling_switch.cases()
+    else:
+        selected = offline_cases()
+    for case, scenario in selected:
         case_output = output / case.id
         case_output.mkdir()
         result = {"id": case.id, "status": "failed", "phases": {}}
@@ -253,7 +263,9 @@ def exercise(config, old_inputs, new_inputs, output):
             cluster.prepare(ownerfs_bind=False)
             for role in cluster.roles:
                 running_identity(cluster, role, old)
-            if suffix == "old_root_command":
+            if rolling:
+                rolling_switch.exercise_switch(cluster, old_inputs, new_inputs, old, new, result["phases"], scenario)
+            elif scenario == "old_root_command":
                 retained_command(cluster, new_inputs, new, result["phases"])
             else:
                 exercise_switch(cluster, old_inputs, new_inputs, old, new, result["phases"])
