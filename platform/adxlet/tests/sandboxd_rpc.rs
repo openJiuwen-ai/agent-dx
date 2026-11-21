@@ -40,6 +40,7 @@ struct Server {
     start_timeout: Option<String>,
     list_unavailable: Arc<std::sync::atomic::AtomicBool>,
     wait_pending: bool,
+    engineless: bool,
 }
 impl Default for Server {
     fn default() -> Self {
@@ -67,6 +68,7 @@ impl Default for Server {
             start_timeout: None,
             list_unavailable: Arc::default(),
             wait_pending: false,
+            engineless: false,
         }
     }
 }
@@ -245,6 +247,9 @@ impl sandbox_service_server::SandboxService for Server {
         {
             return Err(Status::unavailable("environment service not ready"));
         }
+        if self.engineless {
+            return Ok(Response::new(ListAvailableRuntimesResponse::default()));
+        }
         Ok(Response::new(ListAvailableRuntimesResponse {
             runtime_classes: vec!["runsc".into()],
             runtimes: vec![RuntimeInfo {
@@ -316,8 +321,52 @@ async fn discovers_runtime_classes_from_sandboxd_uds() {
     let (adapter, _server) = connect(Server::default()).await;
     assert_eq!(
         adapter.available_runtime_classes().await.unwrap(),
-        ["runsc"]
+        ["docker", "runsc"]
     );
+}
+
+#[tokio::test]
+async fn engineless_backend_hides_docker_admission_class() {
+    let mut server = Server::default();
+    server.engineless = true;
+    let (adapter, _server) = connect(server).await;
+    assert!(adapter
+        .available_runtime_classes()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn docker_admission_class_translates_to_backend_engine() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    let mut environment = spec();
+    environment.runtime_class = "docker".into();
+
+    adapter
+        .start(&environment, "docker-environment", 1, &[])
+        .await
+        .unwrap();
+
+    let starts = server.starts.lock().unwrap();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].runtime, "runsc");
+}
+
+#[tokio::test]
+async fn docker_admission_class_requires_a_backend_engine() {
+    let mut server = Server::default();
+    server.engineless = true;
+    let (adapter, _harness) = connect(server).await;
+    let mut environment = spec();
+    environment.runtime_class = "docker".into();
+
+    let error = adapter
+        .start(&environment, "docker-environment", 1, &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, adx_core::Error::Invalid(_)), "{error:?}");
 }
 
 #[tokio::test]

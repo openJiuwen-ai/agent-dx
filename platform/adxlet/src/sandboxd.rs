@@ -183,6 +183,13 @@ fn unavailable(error: impl std::fmt::Display) -> Error {
     Error::Unavailable(format!("sandboxd: {error}"))
 }
 
+/// Admission class that third-party registry entries request under the
+/// ``sandbox_type: docker`` label. The backend advertises it whenever at
+/// least one container engine is configured and translates it to that
+/// engine before execution, so registered agents keep their container form
+/// without the daemon knowing the alias.
+pub(crate) const DOCKER_ADMISSION_CLASS: &str = "docker";
+
 /// Wait for an externally managed sandboxd without publishing this node for admission.
 /// Invalid local configuration still fails immediately; transport and readiness failures
 /// are retried until the caller cancels this future during process shutdown.
@@ -223,6 +230,20 @@ impl Sandboxd {
 
     /// Discover live execution backends through sandboxd's Unix socket.
     pub async fn available_runtime_classes(&self) -> Result<Vec<String>> {
+        let mut classes = self.backend_runtime_classes().await?;
+        // Advertise the docker admission alias only when the backend actually
+        // has an engine, so placement never sends docker requests to a node
+        // that cannot run them.
+        if !classes.is_empty() {
+            classes.push(DOCKER_ADMISSION_CLASS.into());
+        }
+        classes.sort();
+        classes.dedup();
+        Ok(classes)
+    }
+
+    /// Raw engine classes reported by the daemon, without the docker alias.
+    async fn backend_runtime_classes(&self) -> Result<Vec<String>> {
         let response = self
             .client
             .clone()
@@ -238,9 +259,23 @@ impl Sandboxd {
                 .map(|runtime| runtime.runtime_class),
         );
         classes.retain(|class| !class.trim().is_empty());
-        classes.sort();
-        classes.dedup();
         Ok(classes)
+    }
+
+    /// Translate the docker admission class to the first configured engine.
+    /// Other classes pass through unchanged; execution owns the adapted copy.
+    async fn admission_spec(&self, spec: &EnvironmentSpec) -> Result<EnvironmentSpec> {
+        if spec.runtime_class != DOCKER_ADMISSION_CLASS {
+            return Ok(spec.clone());
+        }
+        let mut engines = self.backend_runtime_classes().await?;
+        engines.retain(|class| class != DOCKER_ADMISSION_CLASS);
+        let engine = engines.into_iter().next().ok_or_else(|| {
+            Error::Invalid("docker admission class requires a configured container runtime".into())
+        })?;
+        let mut adapted = spec.clone();
+        adapted.runtime_class = engine;
+        Ok(adapted)
     }
 
     pub async fn connect(path: PathBuf, config: Config) -> Result<Self> {
@@ -373,6 +408,7 @@ impl Sandboxd {
         generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<Request<proto::StartRequest>> {
+        let spec = self.admission_spec(spec).await?;
         if spec.execution.user.is_some() || spec.execution.group.is_some() {
             adx_observability::warn!(
                 environment_id = %spec.id,
@@ -398,8 +434,8 @@ impl Sandboxd {
                     .insert("ADX_ENV_FILE".into(), info.restore_env_path);
             }
         }
-        let mut request = start_request(spec, runtime_id, generation, devices, &config)?;
-        crate::managed_mounts::prepare(spec).await?;
+        let mut request = start_request(&spec, runtime_id, generation, devices, &config)?;
+        crate::managed_mounts::prepare(&spec).await?;
         runsc_mounts::normalize(&mut request).await?;
         Ok(self.request(request))
     }
@@ -414,12 +450,13 @@ impl Sandboxd {
     ) -> Result<Request<proto::StartRequest>> {
         let path = source.path;
         let origin = source.origin;
+        let spec = self.admission_spec(spec).await?;
         self.checkpoint_supported(&spec.runtime_class).await?;
         if !path.is_absolute() {
             return Err(Error::Invalid("absolute checkpoint path required".into()));
         }
         let mut request = self
-            .execution_request(spec, runtime_id, generation, devices)
+            .execution_request(&spec, runtime_id, generation, devices)
             .await?;
         if let Some(origin) = origin {
             let context = adx_core::runtime::RuntimeRestore {
