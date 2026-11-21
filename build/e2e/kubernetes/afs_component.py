@@ -22,9 +22,10 @@ scope_spec = importlib.util.spec_from_file_location('afs_ci_full_scope', ROOT / 
 scope = importlib.util.module_from_spec(scope_spec)
 scope_spec.loader.exec_module(scope)
 FULL_CASES = scope.CASE_IDS
+OWNERFS_RESTART_TARGET = 'afs-ownerfs-restart'
 # Full targets use the four-role fixture and frozen Rust contracts.
 COMPONENT_TARGETS = {'afs-component': False, 'afs-component-full': True, 'afs-component-specials': False,
-                     afs_upgrade.TARGET: False}
+                     afs_upgrade.TARGET: False, OWNERFS_RESTART_TARGET: False}
 CATEGORY_STAGES = {'reliability': (('afs', 'full', 'afs-component-specials'),)}
 if afs_upgrade.baseline_requested():
     CATEGORY_STAGES['reliability'] += (('afs-upgrade', 'full', afs_upgrade.TARGET),)
@@ -115,6 +116,10 @@ class Component:
         if target == afs_upgrade.TARGET:
             component = cls(run)
             component.upgrade = True
+            component.check_name = target
+            return component
+        if target == OWNERFS_RESTART_TARGET:
+            component = cls(run, case_ids=('ownerfs.cluster.restart',))
             component.check_name = target
             return component
         if target != 'afs-component-specials':
