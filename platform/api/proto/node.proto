@@ -1,6 +1,59 @@
 syntax = "proto3";
 package adx.node.v1;
 
+service AdxletProcessService {
+  rpc Begin(AdxletProcessRequest) returns (AdxletProcessState);
+  rpc Query(AdxletProcessRequest) returns (AdxletProcessState);
+}
+message AdxletRuntimeInspectRequest {}
+message AdxletRuntimeInspection {
+  string node_id = 1;
+  string node_session = 2;
+  string relay_session = 3;
+  string route_owner = 4;
+  bool ready = 5;
+}
+message AdxletProcessRequest {
+  string rollout_id = 1;
+  string local_task_id = 2;
+  uint64 epoch = 3;
+  string old_node_session = 4;
+  string old_relay_session = 5;
+  uint64 deadline_unix_millis = 6;
+}
+message AdxletProcessState {
+  AdxletProcessRequest identity = 1;
+  string phase = 2;
+  string node_session = 3;
+}
+
+// Standalone Relay only, on the existing protected route.sock listener.
+service RelayUpgradeService {
+  // Protected standalone UDS only. Exact old identity; never destructive Begin.
+  rpc TakeoverBindings(BindingTakeoverRequest) returns (BindingState);
+  rpc Begin(RelayUpgradeRequest) returns (RelayUpgradeState);
+  rpc Query(RelayUpgradeRequest) returns (RelayUpgradeState);
+  // Installation keeps admission closed; exact retries preserve later updates.
+  rpc InstallCandidateBindings(BindingSnapshot) returns (BindingState);
+  rpc OpenCandidateBindings(BindingState) returns (BindingState);
+}
+message BindingTakeoverRequest {
+  BindingState expected = 1;
+  string new_controller_session_id = 2;
+  BindingSnapshot snapshot = 3;
+}
+message RelayUpgradeRequest { string task_id = 1; string proxy_session_id = 2; }
+message RelayUpgradeState {
+  string task_id = 1;
+  string proxy_session_id = 2;
+  // accepted, draining, completed, forced, interrupted, or failed.
+  string phase = 3;
+  // Set only after the business listener is dropped and health owner has exited.
+  bool listeners_released = 4;
+  // Fixed when release is confirmed; Begin retries never extend it.
+  uint64 drain_deadline_unix_ms = 5;
+}
+
 // Adxlet is the only writer. Shared-process deployments implement this
 // contract directly; separate processes use a protected local gRPC endpoint.
 service RelayService {
@@ -79,9 +132,56 @@ message EnvironmentActivity {
 message ActivityAcknowledgement { uint64 accepted_sequence = 1; }
 
 // Supervisor-only local endpoint, served on a protected UDS, never on Node TCP.
-service NodeAdminService { rpc Drain(DrainRequest) returns (DrainResponse); }
+service NodeAdminService {
+  rpc Drain(DrainRequest) returns (DrainResponse);
+  rpc Inspect(AdxletRuntimeInspectRequest) returns (AdxletRuntimeInspection);
+}
 message DrainRequest {}
 message DrainResponse { uint64 deleted_environments = 1; }
+
+// Standalone Relay handoff only, on Adxlet's protected admin UDS; never Drain.
+// Mutations require the launch-time parent supervisor's UDS peer PID.
+service RelayHandoffService {
+  rpc Reserve(RelayHandoffRequest) returns (RelayHandoffState);
+  // Parent certifies no old Begin was sent. Exact cancellation is replayable.
+  rpc Cancel(RelayHandoffRequest) returns (RelayHandoffState);
+  // Parent proves the exact failed candidate Child was reaped. Fences its
+  // identity before a replacement generation can be started or opened.
+  rpc ReplaceFailedCandidate(RelayReplacementRequest) returns (RelayHandoffState);
+  rpc Prove(RelayHandoffProof) returns (RelayHandoffState);
+  rpc Switch(RelayHandoffRequest) returns (RelayHandoffState);
+  rpc Finish(RelayHandoffProof) returns (RelayHandoffState);
+}
+// Evidence is supplied only by the parent that owns and reaps the old Child.
+message RelayHandoffProof {
+  RelayHandoffRequest identity = 1;
+  uint32 old_pid = 2;
+  bool begin_accepted = 3;
+  bool listeners_released = 4;
+  bool old_exited = 5;
+}
+message RelayReplacementRequest {
+  RelayHandoffRequest identity = 1;
+  uint32 failed_pid = 2;
+  bool failed_exited = 3;
+  string replacement_socket = 4;
+}
+message RelayHandoffRequest {
+  string task_id = 1;
+  string old_socket = 2;
+  string old_proxy_session_id = 3;
+  string old_controller_session_id = 4;
+  uint64 old_sync_epoch = 5;
+  string candidate_socket = 6;
+  // Empty at Reserve; fixed from the owned candidate after ordinary startup.
+  string candidate_proxy_session_id = 7;
+}
+message RelayHandoffState {
+  RelayHandoffRequest identity = 1;
+  // beginning, installing, installed, opening, active_fenced, completed, cancelled.
+  string phase = 2;
+  uint64 candidate_sync_epoch = 3;
+}
 
 // Complete activity view, including zero counts and revisions for bursts between updates.
 message ProxyActivitySnapshot { string proxy_session_id = 1; repeated ProxyActivity environments = 2; bool reset = 3; }

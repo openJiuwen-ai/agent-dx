@@ -242,6 +242,9 @@ impl RoutePublisher {
                     || previous.proxy_address != node.proxy_address
                     || previous.session.as_ref().map(|session| session.routable)
                         != node.session.as_ref().map(|session| session.routable)
+                    || previous.upgrade_pause != node.upgrade_pause
+                    || previous.scheduling_paused != node.scheduling_paused
+                    || previous.retirement != node.retirement
             });
             view.nodes.insert(id.clone(), node.clone());
             if !changed {
@@ -492,16 +495,11 @@ fn published_route(
     environment: &StoredEnvironment,
     node: &StoredNode,
 ) -> Result<Option<pb::PublishedRoute>> {
-    let Some(record) = environment.result.as_ref().filter(|record| {
-        record.state == adx_core::EnvironmentState::Running
-            && environment
-                .volume_execution
-                .as_ref()
-                .is_none_or(|execution| {
-                    !execution.released && execution.runtime_id == record.runtime.id
-                })
-            && node.session.as_ref().is_none_or(|session| session.routable)
-    }) else {
+    let Some(record) = environment
+        .result
+        .as_ref()
+        .filter(|_| node.route_eligible(environment))
+    else {
         return Ok(None);
     };
     Ok(Some(pb::PublishedRoute {
@@ -693,6 +691,60 @@ impl pb::route_service_server::RouteService for RoutePublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn held_route_survives_closed_node_but_not_revoke_or_execution_change() {
+        let mut environment: StoredEnvironment = serde_json::from_value(serde_json::json!({
+            "creation_generation":1,
+            "spec":{"id":"held","tenant_id":"tenant","image":"image","runtime_class":"runtime",
+                "priority":0,"resources":{"cpu_millis":1000,"memory_bytes":1024,"disk_bytes":0}},
+            "assignment":{"environment_id":"held","node_id":"node","shard_id":0,"generation":1,"devices":[]},
+            "result":null
+        })).unwrap();
+        let mut record = environment.effective_record();
+        record.state = adx_core::EnvironmentState::Running;
+        record.resources_held = true;
+        record.runtime.ip = Some("10.0.0.1".parse().unwrap());
+        environment.result = Some(record.clone());
+        let mut node: StoredNode = serde_json::from_value(serde_json::json!({
+            "node":{"id":"node","capacity":{"cpu_millis":1000,"memory_bytes":1024,"disk_bytes":0},
+                "available":false,"labels":{},"devices":[],"runtime_classes":["runtime"]},
+            "shard_id":0,"address":"node:1","proxy_address":"node:2",
+            "session":{"id":"old","sequence":1,"routable":false},"scheduling_paused":true,
+            "upgrade_pause":{"task_id":"task","epoch":1,"original_paused":false,
+                "route_hold":{"relay_address":"node:2","routes":{
+                    "held":{"generation":1,"runtime_id":record.runtime.id,"ip":"10.0.0.1"}}}}
+        }))
+        .unwrap();
+        assert!(published_route(&environment, &node).unwrap().is_some());
+        environment.volume_execution = Some(serde_json::from_value(serde_json::json!({
+            "runtime_id": record.runtime.id, "node_session_id": "old", "revision": 1, "released": false,
+        })).unwrap());
+        assert!(published_route(&environment, &node).unwrap().is_some());
+        environment.volume_execution.as_mut().unwrap().released = true;
+        assert!(published_route(&environment, &node).unwrap().is_none());
+        environment.volume_execution.as_mut().unwrap().released = false;
+        environment
+            .volume_execution
+            .as_mut()
+            .unwrap()
+            .runtime_id
+            .push('x');
+        assert!(published_route(&environment, &node).unwrap().is_none());
+        environment.volume_execution.as_mut().unwrap().runtime_id = record.runtime.id.clone();
+        node.session.as_mut().unwrap().id = "successor".into();
+        assert!(published_route(&environment, &node).unwrap().is_some());
+        environment.invalidated = true;
+        assert!(published_route(&environment, &node).unwrap().is_none());
+        environment.invalidated = false;
+        environment.result.as_mut().unwrap().runtime.id.push('x');
+        assert!(published_route(&environment, &node).unwrap().is_none());
+        environment.result = Some(record);
+        node.proxy_address = "other:2".into();
+        assert!(published_route(&environment, &node).unwrap().is_none());
+        node.proxy_address = "node:2".into();
+        environment.result.as_mut().unwrap().state = adx_core::EnvironmentState::Paused;
+        assert!(published_route(&environment, &node).unwrap().is_none());
+    }
     #[tokio::test]
     async fn overflow_between_first_receive_and_batch_drain_requires_reset() {
         let (sender, mut receiver) = broadcast::channel(1024);

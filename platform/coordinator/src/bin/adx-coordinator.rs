@@ -284,6 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(
             rpc.clone(),
         ))
+        .add_service(pb::node_handoff_service_server::NodeHandoffServiceServer::new(rpc.clone()))
         .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(rpc))
         .add_service(pb::credential_service_server::CredentialServiceServer::new(
             auth.clone(),

@@ -172,7 +172,7 @@ impl Adxlet {
     ) -> Result<()> {
         let _recovery = self.recovery.lock().await;
         let mut ready = self.lifecycle_ready.write().await;
-        if self.is_draining() {
+        if self.is_draining() || self.process_sealing() {
             return Err(Error::Unavailable("node is draining".into()));
         }
         *ready = false;

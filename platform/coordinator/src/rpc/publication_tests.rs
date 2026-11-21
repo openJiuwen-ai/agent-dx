@@ -2,6 +2,85 @@ use super::*;
 
 #[tokio::test]
 #[ignore = "requires isolated Redis; run control-rpc suite"]
+async fn maintenance_completion_recovery_retains_inspected_normal_handshake_but_not_capacity() {
+    let redis = cancellation_test_redis::Redis::new().await;
+    let store = crate::storage::RedisStore::connect(&redis.url, "test", Duration::from_secs(5))
+        .await
+        .unwrap();
+    let session = store.begin(1).await.unwrap();
+    let node = Node {
+        id: "node".into(),
+        capacity: adx_core::Resources {
+            cpu_millis: 100,
+            memory_bytes: 128,
+            disk_bytes: 0,
+        },
+        available: false,
+        labels: Default::default(),
+        devices: vec![],
+        runtime_classes: vec!["runsc".into()],
+    };
+    session
+        .register_session(
+            node,
+            "127.0.0.1:1".into(),
+            "127.0.0.1:2".into(),
+            Some(NodeSession {
+                id: "new".into(),
+                sequence: 7,
+                routable: true,
+            }),
+        )
+        .await
+        .unwrap();
+    let rpc = CoordinatorRpc::new(
+        session.clone(),
+        Placement::Pack,
+        Peers::network(),
+        RpcClient::network(Principal::Coordinator),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let mut state = rpc.0.state.lock().await;
+    let seen = tokio::time::Instant::now();
+    state.live.insert(
+        "node".into(),
+        LiveNode {
+            expired: false,
+            session: "new".into(),
+            sequence: 7,
+            last_seen: seen,
+            inspected: true,
+            report: pb::RegisterNodeRequest {
+                node_id: "node".into(),
+                session_id: "new".into(),
+                heartbeat_sequence: 7,
+                reconciling: false,
+                accepting_allocations: false,
+                ..Default::default()
+            },
+        },
+    );
+    state.needs_recovery = true;
+    state.recover_authoritative_state().await.unwrap();
+    let live = &state.live["node"];
+    assert_eq!(
+        live.last_seen, seen,
+        "completion must not fabricate a heartbeat"
+    );
+    assert_eq!(live.sequence, 7);
+    assert!(live.inspected && !live.report.reconciling && !live.expired);
+    assert_eq!(state.nodes["node"].session.as_ref().unwrap().id, "new");
+    assert!(state.nodes["node"].session.as_ref().unwrap().routable);
+    assert!(
+        !state.nodes["node"].node.available,
+        "next fresh report must reopen capacity"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run control-rpc suite"]
 async fn retry_cannot_remove_a_success_being_published() {
     publication_race("retry").await;
 }

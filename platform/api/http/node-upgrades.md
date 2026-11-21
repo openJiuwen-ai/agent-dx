@@ -1,9 +1,123 @@
 # Node upgrade management
 
-The Coordinator's optional `autoscaling_listen` HTTP listener also serves
-`/v1/node-upgrades`. It has no bearer authentication and must be isolated to
-trusted operator Pods. It must never be forwarded by the public API/Ingress.
-Node controls use the existing authenticated Coordinator-to-node RPC channel.
+The Coordinator's optional `autoscaling_listen` HTTP listener serves Pod upgrades
+under `/v1/node-upgrades` and adxlet process upgrades under
+`/v1/adxlet-process-upgrades`. This management listener has no caller
+authentication. Isolate it to trusted publishing Jobs and operator sources; never
+forward it through the public API/Ingress. Owner fields are task identity, not
+credentials. Kubernetes ServiceAccount/RBAC does not replace management-network
+access restrictions. This boundary does not provide the former publisher mTLS
+caller authentication. Node RPC authentication remains in place.
+
+## Process Maintenance
+
+Process maintenance is per-node; it does not create a Pod UpgradeTask or store
+publisher batches/results. An active Pod task conflicts with
+preparation; active Pod task writes check maintenance markers and conflicting
+pause owners in their existing CAS. No new HTTP capability or protocol version is
+required: a valid initial process query is the publisher's read-only preflight.
+
+Only these process HTTP operations exist:
+
+| Method/path | Purpose |
+| --- | --- |
+| `POST /v1/adxlet-process-upgrades` | Run `prepare` or `release`. |
+| `POST /v1/adxlet-process-upgrades/query` | Read this owner's active maintenance or release receipt. |
+
+A write request has exactly `action`, `owner` and `node_session`:
+
+```json
+{
+  "action": "prepare",
+  "owner": {
+    "node_id": "worker-a",
+    "rollout_id": "release-a",
+    "local_task_id": "worker-a-process",
+    "epoch": 1
+  },
+  "node_session": "actual-session"
+}
+```
+
+`action` accepts only `prepare` and `release`; invalid actions or fields return
+400. Prepare uses the origin session and initially requires a fresh inspected
+live Node, matching durable routable session/token and no conflicting pause
+owner. Same owner/origin replay returns the existing marker even after Yield or
+session replacement; a different owner/origin conflicts. A released owner cannot
+be reused. Preparation persists the scheduling pause while retaining
+administrator intent. Its response is the existing maintenance marker; release
+returns `{owner,node_session}`.
+
+Query accepts only `{ "owner": { ... } }`. A valid query returns HTTP 200 with
+one of these flat objects, derived from the maintenance marker and receipt read
+in the same storage operation:
+
+| `status` | Other fields | Meaning |
+| --- | --- | --- |
+| `absent` | `owner` | No marker or release receipt for this owner. |
+| `active` | `owner`, `origin_session`, `current_session`, `yielded` | This owner's maintenance remains active. |
+| `released` | `owner`, `node_session` | The exact owner's persisted release receipt. |
+
+An exact historical owner receipt takes precedence over a later task's marker:
+`released` proves only this task released, not that the node has no other
+maintenance. Without this owner's receipt, another owner/epoch's marker returns
+409, never `absent`. The publisher validates the returned owner and saved
+sessions; arbitrary 200 JSON is not proof. A 404 from an older Coordinator, an
+error page, disconnection or timeout fails preflight and must not be interpreted
+as absence. The three former `/v1/node-upgrades/process-maintenance` routes are
+removed without aliases. There is no publisher `replace-session` action.
+
+The authenticated Node seals accepted operations to Published, then calls
+`NodeHandoffService.Yield`. Its CAS withdraws the token, closes routability and
+retains legal Running routes with current Environment identity and node ownership
+checks. RouteHold has only Relay address and execution routes, no Relay session.
+It is a non-routable fallback retained until explicit release, not a TTL lease.
+
+For the target attempt, the publisher confirms Yield and actual local Child reap,
+then calls local Start with the saved fresh identity. For original-version
+recovery, the publisher checks this owner's yielded marker before submitting one
+local rollback(A); that worker seals/reaps A and starts the saved B internally.
+An accepted rollback may continue after publisher disconnection, including local
+B startup while Coordinator is unavailable and B waits for registration. The
+publisher remains pending until the existing actual-session and release checks
+succeed; local startup does not release maintenance. It does not approve the session in advance:
+`current_session` may still be the origin before Start. During registration,
+Coordinator requires the owning Node identity, unchanged Node RPC/Relay
+addresses, confirmed Yield and a first report that is reconciling with allocation
+admission closed. It calls the existing `GetSession` at that address outside the
+state lock and checks the real node/session against the registration. Neither an
+expired heartbeat nor Coordinator restart skips that check. It then rechecks the
+maintenance owner/current session and applies the existing session-replacement
+CAS before ordinary registration, Inspect and recovery. Exact registered-session
+retries remain idempotent; stale registrations cannot replace a later accepted
+session. `NodeHandoffService.Query` and `ReplaceSession` are removed; the owning
+Node's `Yield` and `QueryRelease` remain authenticated.
+
+Release uses the current session and requires exact owner/current/token, durable
+routability and a fresh inspected normal (`reconciling:false`) report. Accepting
+allocations is not required: pre-Yield cancellation may release the healthy
+origin while it still reports accepting. Release restores the latest
+administrator pause intent, removes marker/hold and persists
+`{owner,node_session}`. Exact retry returns that receipt; publisher query returns
+it as `status:released`. The Node clears local maintenance only after validating
+its exact `QueryRelease` receipt. No timeout, disconnection or marker absence
+proves release. Coordinator stores no file selection, SHA, PID, execution
+deadline, recovery stage or process outcome. The local supervisor owns fixed
+900/900/600-second budgets and actual Child attempts. A fallback first seals and
+reaps the failed candidate (or proves NeverCreated), then starts the pinned
+original files with another fresh identity through the same registration checks.
+
+The 2026-11-16 HTTP and automatic-registration changes require their own focused
+validation; previous publisher mTLS results do not validate this revision. The 2026-11-16
+local run passed five handoff/storage tests, two real-RPC maintenance-registration
+tests, the existing ordinary-restart RPC regression, 68 process and 101 Pod
+publisher tests, scoped Python lint, workspace format and Clippy checks. Complete
+commands and logs: `out/publisher-http-20261116/RESULT.md`. These fixtures do not
+qualify a deployed network or cluster upgrade.
+Management-network isolation and cluster rollout acceptance remain unverified.
+
+## Pod Upgrades
+
 Management capability `version:2`, `node_protocol_version:3` and each node
 inspection's `protocol_version:3` are required before upgrade work. Durable tasks
 also carry `protocol_version:3`. Earlier upgrade protocols must finish or abort
@@ -57,7 +171,7 @@ separate failure cases; this protocol does not promise transparent stream migrat
 | `POST /tasks/{task_id}/migrate` | Pause, transfer ownership by CAS, adopt/restore at the target. |
 | `POST /tasks/{task_id}/quiesce` | Revoke grants, settle local work, issue an empty-node permit. |
 | `POST /tasks/{task_id}/revoke-delete` | Revoke a pending delete after Kubernetes CAS advances that Pod's RV. |
-| `POST /tasks/{task_id}/verify-node` | Recheck empty evidence, registered recovery capabilities and session, then restore original admission. |
+| `POST /tasks/{task_id}/verify-node` | Recheck session, scope and empty evidence, then restore original admission. Normal verification also requires registered cross-node recovery capabilities; abort cleanup is described below. |
 | `POST /tasks/{task_id}/complete` | Release verified node gates and complete the task. |
 | `POST /tasks/{task_id}/abort` | Freeze, restore an untouched original Pod, or finalize rollback. |
 
@@ -209,15 +323,37 @@ in the same Header CAS; a concurrent registration keeps the task active.
 
 Abort first freezes new forward work. Rollback actions carry `rollback:true`.
 An unchanged original Pod can be reopened only after its original UID/session,
-finished operations and revoked delete intent are confirmed. Replacements need
-strict empty evidence, current session and registered recovery capability checks.
-Finalization also requires the
+finished operations and revoked delete intent are confirmed. Only an `Aborting`
+task with `rollback:true` may clean up a replacement without its full cross-node
+recovery profile. All migration operations must be settled; the live registered
+session must be routable, checkpoint GC must be unfenced, and the checkpoint
+scope must remain valid. Unknown inspection or changed task/Pod/session is rejected.
+An unverified replacement still needs strict empty evidence and its exact
+permit/control revision. A verified same-identity cleanup replay may finish a lost
+acknowledgement without requiring the now-live node to become empty again.
+An `Active` task still requires the full recovery profile even with `rollback:true`.
+Cleanup retains the target image and does not qualify it for future cross-node
+recovery or claim that the old version was restored. Finalization also requires the
 executor's confirmed old template and fresh owner inventory. No-Inspect rollback
 is deliberately unavailable: an unreachable replacement remains isolated.
 
 Tests cover Redis fencing, protocol replay, dormant transfer, failed/unknown
 restores and node gates. Real multi-host checkpoint compatibility and Kubernetes
 Pod replacement remain separate deployment qualification.
+
+The separate 2026-11-16 deployment record confirms abort cleanup of an empty,
+already-replaced Node0 to `Aborted / partial`, including retained UID/session,
+task-maintenance release and an untouched Node1. It does not qualify normal
+upgrade completion or cross-host checkpoint recovery; see the evidence index in
+`out/pod-abort-cleanup-20261116/RESULT.md`.
+
+A later empty-Node0 field run passed normal Active verify with measured recovery
+labels, the new bootstrap and persistent CLI PATH. Its Pod moved across Workers;
+Node1 was not upgraded. The selected batch completed, then the task was aborted
+to partial under that scope. This does not qualify a full two-node Completed
+release or Environment migration/restore. Verified admission reopening normally
+makes whole-node strict_empty false; it is not evidence that the earlier quiesce
+failed. See `out/pod-normal-verify-20261116/REVIEW.md` for the evidence boundary.
 
 This rootfs preflight does not change sandboxd Start/Delete, uncertain-start
 cleanup or Quiescing admission. A lost Start result and an empty runtime List do

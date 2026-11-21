@@ -26,6 +26,7 @@ pub struct BindingService {
     proxy: Arc<Relay>,
     session: String,
     state: Arc<Mutex<Bindings>>,
+    activity_stop: tokio::sync::watch::Sender<bool>,
 }
 #[derive(Default)]
 struct Bindings {
@@ -34,7 +35,10 @@ struct Bindings {
     ready: bool,
     versions: HashMap<String, UpdateBindingRequest>,
     snapshot: Option<proto::BindingSnapshot>,
+    candidate: bool,
     admissions: HashMap<String, (proto::EnvironmentAdmissionRequest, bool)>,
+    admission_unknown: std::collections::HashSet<String>,
+    takeover: Option<(proto::BindingTakeoverRequest, Option<proto::BindingState>)>,
 }
 impl BindingService {
     pub fn new(proxy: Arc<Relay>) -> Self {
@@ -43,6 +47,7 @@ impl BindingService {
             proxy,
             session: uuid::Uuid::new_v4().to_string(),
             state: Arc::default(),
+            activity_stop: tokio::sync::watch::channel(false).0,
         }
     }
     fn state_message(&self, s: &Bindings) -> proto::BindingState {
@@ -56,11 +61,25 @@ impl BindingService {
     pub async fn inspect(&self) -> proto::BindingState {
         self.state_message(&*self.state.lock().await)
     }
+    pub(crate) fn start_process_drain(&self) {
+        self.proxy.start_drain();
+    }
+    fn stop_activity_watches(&self) {
+        self.activity_stop.send_replace(true);
+    }
     pub async fn begin(
         &self,
         expected: proto::BindingState,
     ) -> Result<proto::BindingState, Status> {
         let mut s = self.state.lock().await;
+        if s.takeover
+            .as_ref()
+            .is_some_and(|(_, receipt)| receipt.is_none())
+        {
+            return Err(Status::failed_precondition(
+                "accepted takeover is incomplete",
+            ));
+        }
         if expected.proxy_session_id != self.session || expected.sync_epoch != s.epoch {
             return Err(Status::failed_precondition(
                 "proxy synchronization session changed",
@@ -73,7 +92,10 @@ impl BindingService {
         s.owner = expected.controller_session_id;
         s.ready = false;
         s.snapshot = None;
+        s.candidate = false;
+        s.takeover = None;
         s.admissions.clear();
+        s.admission_unknown.clear();
         self.proxy.clear_bindings();
         self.proxy.notify_activity_change();
         Ok(self.state_message(&s))
@@ -82,16 +104,47 @@ impl BindingService {
         &self,
         request: proto::BindingSnapshot,
     ) -> Result<proto::BindingState, Status> {
+        self.replace_snapshot(request, SnapshotAdmission::Open)
+            .await
+    }
+    pub async fn install_candidate(
+        &self,
+        request: proto::BindingSnapshot,
+    ) -> Result<proto::BindingState, Status> {
+        self.replace_snapshot(request, SnapshotAdmission::Closed)
+            .await
+    }
+    async fn replace_snapshot(
+        &self,
+        request: proto::BindingSnapshot,
+        admission: SnapshotAdmission,
+    ) -> Result<proto::BindingState, Status> {
         let mut s = self.state.lock().await;
+        if s.takeover
+            .as_ref()
+            .is_some_and(|(_, receipt)| receipt.is_none())
+        {
+            return Err(Status::failed_precondition("process takeover incomplete"));
+        }
+        self.replace_locked(&mut s, request, admission).await
+    }
+    async fn replace_locked(
+        &self,
+        s: &mut Bindings,
+        request: proto::BindingSnapshot,
+        admission: SnapshotAdmission,
+    ) -> Result<proto::BindingState, Status> {
         if request.proxy_session_id != self.session || request.sync_epoch != s.epoch || s.epoch == 0
         {
             return Err(Status::failed_precondition(
                 "proxy synchronization session changed",
             ));
         }
-        if s.ready {
-            return if s.snapshot.as_ref() == Some(&request) {
-                Ok(self.state_message(&s))
+        if s.snapshot.is_some() {
+            return if s.snapshot.as_ref() == Some(&request)
+                && s.candidate == matches!(admission, SnapshotAdmission::Closed)
+            {
+                Ok(self.state_message(s))
             } else {
                 Err(Status::failed_precondition(
                     "full snapshot already completed",
@@ -126,6 +179,19 @@ impl BindingService {
                 });
         }
         for binding in next.values() {
+            if let Some(previous) = s.versions.get(&binding.environment_id) {
+                if s.ready
+                    && previous.ownership_generation == binding.ownership_generation
+                    && previous.binding == binding.binding
+                {
+                    continue;
+                }
+                if let Some(Binding::Active(old)) = &previous.binding {
+                    self.proxy
+                        .retire_route(binding.environment_id.clone(), old.runtime_id.clone())
+                        .await;
+                }
+            }
             if let Some(Binding::Active(target)) = &binding.binding {
                 self.proxy
                     .activate_route(
@@ -138,9 +204,125 @@ impl BindingService {
         }
         s.versions = next;
         s.snapshot = Some(request);
-        s.ready = true;
+        s.candidate = matches!(admission, SnapshotAdmission::Closed);
+        s.ready = matches!(admission, SnapshotAdmission::Open);
         self.proxy.notify_activity_change();
+        self.proxy.set_bindings_ready(s.ready);
+        Ok(self.state_message(s))
+    }
+    /// Preserve live bindings on an exact planned owner transition. Exposed on
+    /// the standalone protected UDS only, not the ordinary binding service.
+    pub async fn takeover(
+        &self,
+        request: proto::BindingTakeoverRequest,
+    ) -> Result<proto::BindingState, Status> {
+        let mut s = self.state.lock().await;
+        // Cancellation may interrupt data-plane diff work after accepting a
+        // payload. Resolve that payload before comparing any new predecessor.
+        if let Some((pending, None)) = s.takeover.clone() {
+            self.takeover_locked(&mut s, pending).await?;
+        }
+        self.takeover_locked(&mut s, request).await
+    }
+    async fn takeover_locked(
+        &self,
+        s: &mut Bindings,
+        request: proto::BindingTakeoverRequest,
+    ) -> Result<proto::BindingState, Status> {
+        if let Some((previous, receipt)) = &s.takeover {
+            if previous == &request {
+                if let Some(receipt) = receipt {
+                    return Ok(receipt.clone());
+                }
+            } else if receipt.is_none() {
+                return Err(Status::unavailable("accepted takeover remains unresolved"));
+            }
+        }
+        if s.takeover
+            .as_ref()
+            .is_none_or(|(previous, _)| previous != &request)
+        {
+            let old = request
+                .expected
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("old Relay identity required"))?;
+            let snapshot = request
+                .snapshot
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("complete snapshot required"))?;
+            let epoch = s
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| Status::resource_exhausted("sync epoch exhausted"))?;
+            if request.new_controller_session_id.trim().is_empty()
+                || request.new_controller_session_id.len() > 256
+                || request.new_controller_session_id == s.owner
+                || old != &self.state_message(s)
+                || !s.ready
+                || s.admissions.values().any(|(_, closed)| *closed)
+                || !s.admission_unknown.is_empty()
+                || self
+                    .proxy
+                    .has_quiescing_routes()
+                    .map_err(|e| Status::unavailable(e.to_string()))?
+                || snapshot.proxy_session_id != self.session
+                || snapshot.sync_epoch != epoch
+            {
+                return Err(Status::failed_precondition(
+                    "exact ready Relay and empty admission ledger required",
+                ));
+            }
+            // Validate the entire payload before changing owner or touching routes.
+            let mut ids = std::collections::HashSet::new();
+            for binding in &snapshot.bindings {
+                validate(binding)?;
+                if binding.proxy_session_id != self.session
+                    || binding.sync_epoch != epoch
+                    || !ids.insert(&binding.environment_id)
+                {
+                    return Err(Status::invalid_argument(
+                        "duplicate binding or session mismatch",
+                    ));
+                }
+                check_version(s.versions.get(&binding.environment_id), binding)?;
+            }
+            s.takeover = Some((request.clone(), None));
+            s.epoch = epoch;
+            s.owner = request.new_controller_session_id.clone();
+            s.snapshot = None;
+            // Only known-open predecessor revisions can reach this transition.
+            s.admissions.clear();
+            // No clear_bindings, readiness toggle or watcher cancellation here.
+        }
+        let snapshot = request
+            .snapshot
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("complete snapshot required"))?;
+        let accepted = self
+            .replace_locked(s, snapshot, SnapshotAdmission::Open)
+            .await?;
+        s.takeover = Some((request, Some(accepted.clone())));
+        Ok(accepted)
+    }
+    pub async fn open_candidate(
+        &self,
+        expected: proto::BindingState,
+    ) -> Result<proto::BindingState, Status> {
+        let mut s = self.state.lock().await;
+        if expected.proxy_session_id != self.session
+            || expected.sync_epoch != s.epoch
+            || expected.controller_session_id != s.owner
+            || s.epoch == 0
+            || !s.candidate
+            || s.snapshot.is_none()
+        {
+            return Err(Status::failed_precondition(
+                "installed candidate session required",
+            ));
+        }
+        s.ready = true;
         self.proxy.set_bindings_ready(true);
+        self.proxy.notify_activity_change();
         Ok(self.state_message(&s))
     }
     pub async fn apply(
@@ -149,7 +331,13 @@ impl BindingService {
     ) -> Result<UpdateBindingResponse, Status> {
         validate(&request)?;
         let mut s = self.state.lock().await;
-        if !s.ready || request.proxy_session_id != self.session || request.sync_epoch != s.epoch {
+        if s.takeover
+            .as_ref()
+            .is_some_and(|(_, receipt)| receipt.is_none())
+            || !(s.ready || s.candidate && s.snapshot.is_some())
+            || request.proxy_session_id != self.session
+            || request.sync_epoch != s.epoch
+        {
             return Err(Status::failed_precondition(
                 "complete binding synchronization required",
             ));
@@ -184,6 +372,10 @@ impl BindingService {
         s.versions.insert(request.environment_id.clone(), request);
         Ok(response)
     }
+}
+enum SnapshotAdmission {
+    Open,
+    Closed,
 }
 #[allow(clippy::result_large_err)]
 fn validate(r: &UpdateBindingRequest) -> Result<(), Status> {
@@ -252,11 +444,15 @@ impl RelayService for BindingService {
         let state = self.state.clone();
         let proxy = self.proxy.clone();
         let session = self.session.clone();
+        let mut stopped = self.activity_stop.subscribe();
         let (send, receive) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
             let mut previous = HashMap::new();
             let mut initial = true;
             loop {
+                if *stopped.borrow() {
+                    break;
+                }
                 changes.borrow_and_update();
                 let current: HashMap<_, _> = {
                     let state = state.lock().await;
@@ -309,8 +505,9 @@ impl RelayService for BindingService {
                         environments,
                         reset: initial,
                     };
-                    if send.send(Ok(snapshot)).await.is_err() {
-                        break;
+                    tokio::select! {
+                        result = send.send(Ok(snapshot)) => { if result.is_err() { break; } },
+                        _ = stopped.changed() => break,
                     }
                 }
                 initial = false;
@@ -318,6 +515,7 @@ impl RelayService for BindingService {
                 tokio::select! {
                     result = changes.changed() => { if result.is_err() { break; } },
                     _ = send.closed() => break,
+                    _ = stopped.changed() => break,
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -333,7 +531,11 @@ impl RelayService for BindingService {
     ) -> Result<Response<proto::EnvironmentAdmissionResponse>, Status> {
         let r = request.into_inner();
         let mut state = self.state.lock().await;
-        if !state.ready
+        if state
+            .takeover
+            .as_ref()
+            .is_some_and(|(_, receipt)| receipt.is_none())
+            || !state.ready
             || r.proxy_session_id != self.session
             || r.sync_epoch != state.epoch
             || r.admission_revision == 0
@@ -354,11 +556,20 @@ impl RelayService for BindingService {
                 ));
             }
             if &r == previous {
+                if state.admission_unknown.contains(&r.environment_id) {
+                    return Err(Status::unavailable("previous admission outcome unknown"));
+                }
                 return Ok(Response::new(proto::EnvironmentAdmissionResponse {
                     closed: *closed,
                 }));
             }
         }
+        // A failed operation is unknown, not proof that actual admission is open.
+        // Retain a conservative ledger item before touching the data plane.
+        state
+            .admissions
+            .insert(r.environment_id.clone(), (r.clone(), true));
+        state.admission_unknown.insert(r.environment_id.clone());
         let closed = if r.drain {
             if !r.close || r.activity_revision != 0 {
                 return Err(Status::invalid_argument(
@@ -379,6 +590,7 @@ impl RelayService for BindingService {
                 )
                 .map_err(|e| Status::unavailable(e.to_string()))?
         };
+        state.admission_unknown.remove(&r.environment_id);
         state
             .admissions
             .insert(r.environment_id.clone(), (r, closed));
@@ -464,6 +676,31 @@ pub async fn bind_route_control(uds_path: &str) -> std::io::Result<UnixListener>
     Ok(listener)
 }
 
+/// Never unlink an existing generation path, even if its socket is inactive.
+/// The protected parent directory and eventual cleanup are operator-owned.
+pub(crate) async fn bind_generation_route_control(path: &Path) -> std::io::Result<UnixListener> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Relay route socket must be an absolute nonempty path",
+        ));
+    }
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "Relay generation route path already exists",
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // bind itself also refuses a path created after the metadata check.
+    let listener = UnixListener::bind(path)?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660)).await?;
+    Ok(listener)
+}
+
 pub async fn serve_route_control(proxy: Arc<Relay>, listener: UnixListener) -> std::io::Result<()> {
     serve_route_control_until(proxy, listener, std::future::pending()).await
 }
@@ -473,14 +710,279 @@ pub async fn serve_route_control_until(
     listener: UnixListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    serve_binding_control_until(Arc::new(BindingService::new(proxy)), listener, shutdown).await
+}
+
+pub(crate) async fn serve_binding_control_until(
+    bindings: Arc<BindingService>,
+    listener: UnixListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     tonic::transport::Server::builder()
         .add_service(
-            RelayServiceServer::new(BindingService::new(proxy))
+            RelayServiceServer::from_arc(bindings).max_decoding_message_size(64 * 1024 * 1024),
+        )
+        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
+        .await
+        .map_err(std::io::Error::other)
+}
+
+pub(crate) async fn serve_standalone_control_until(
+    bindings: Arc<BindingService>,
+    upgrade: Arc<super::upgrade::UpgradeService>,
+    listener: UnixListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let stop_bindings = bindings.clone();
+    let shutdown = async move {
+        shutdown.await;
+        stop_bindings.stop_activity_watches();
+    };
+    tonic::transport::Server::builder()
+        .add_service(
+            RelayServiceServer::from_arc(bindings).max_decoding_message_size(64 * 1024 * 1024),
+        )
+        .add_service(
+            proto::relay_upgrade_service_server::RelayUpgradeServiceServer::new(upgrade)
                 .max_decoding_message_size(64 * 1024 * 1024),
         )
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
         .await
         .map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use crate::common::protocol::GatewayPolicy;
+
+    async fn ready() -> BindingService {
+        let service = BindingService::new(Arc::new(Relay::new(GatewayPolicy::new(Vec::new()))));
+        let mut initial = service.inspect().await;
+        initial.controller_session_id = "old".into();
+        let state = service.begin(initial).await.unwrap();
+        service
+            .replace(proto::BindingSnapshot {
+                proxy_session_id: state.proxy_session_id,
+                sync_epoch: state.sync_epoch,
+                bindings: vec![],
+            })
+            .await
+            .unwrap();
+        service
+    }
+
+    fn forward(
+        old: &proto::BindingState,
+        _task: &str,
+        owner: &str,
+    ) -> proto::BindingTakeoverRequest {
+        proto::BindingTakeoverRequest {
+            expected: Some(old.clone()),
+            new_controller_session_id: owner.into(),
+            snapshot: Some(proto::BindingSnapshot {
+                proxy_session_id: old.proxy_session_id.clone(),
+                sync_epoch: old.sync_epoch + 1,
+                bindings: vec![],
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_begin_rebuilds_same_version_actual_route() {
+        let service = ready().await;
+        let state = service.inspect().await;
+        let mut binding = UpdateBindingRequest {
+            proxy_session_id: state.proxy_session_id.clone(),
+            sync_epoch: state.sync_epoch,
+            environment_id: "env".into(),
+            ownership_generation: 1,
+            binding_revision: 1,
+            binding: Some(Binding::Active(proto::RuntimeTarget {
+                runtime_id: "runtime".into(),
+                ip: "127.0.0.1".into(),
+            })),
+        };
+        service.apply(binding.clone()).await.unwrap();
+        assert!(!service
+            .proxy
+            .set_environment_admission("env", "runtime", 0, false)
+            .unwrap());
+        let next = service.begin(state).await.unwrap();
+        assert!(service
+            .proxy
+            .set_environment_admission("env", "runtime", 0, false)
+            .is_err());
+        binding.sync_epoch = next.sync_epoch;
+        service
+            .replace(proto::BindingSnapshot {
+                proxy_session_id: next.proxy_session_id,
+                sync_epoch: next.sync_epoch,
+                bindings: vec![binding.clone()],
+            })
+            .await
+            .unwrap();
+        assert!(!service
+            .proxy
+            .set_environment_admission("env", "runtime", 0, false)
+            .unwrap());
+        binding.binding_revision = 0;
+        assert!(service.apply(binding).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn opened_relay_candidate_allows_exact_controller_takeover() {
+        let service = ready().await;
+        let state = service.begin(service.inspect().await).await.unwrap();
+        let snapshot = proto::BindingSnapshot {
+            proxy_session_id: state.proxy_session_id.clone(),
+            sync_epoch: state.sync_epoch,
+            bindings: vec![],
+        };
+        let closed = service.install_candidate(snapshot.clone()).await.unwrap();
+        assert!(!closed.ready);
+        assert!(service
+            .takeover(forward(&closed, "closed", "new"))
+            .await
+            .is_err());
+        assert_eq!(service.inspect().await, closed);
+        let opened = service.open_candidate(closed.clone()).await.unwrap();
+        assert!(opened.ready);
+        assert_eq!(
+            service.open_candidate(closed.clone()).await.unwrap(),
+            opened
+        );
+        assert_eq!(service.install_candidate(snapshot).await.unwrap(), opened);
+        let accepted = service
+            .takeover(forward(&opened, "opened", "new"))
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted,
+            proto::BindingState {
+                sync_epoch: opened.sync_epoch + 1,
+                controller_session_id: "new".into(),
+                ..opened.clone()
+            }
+        );
+        assert!(service.open_candidate(closed).await.is_err());
+        assert_eq!(service.inspect().await, accepted);
+        assert!(service
+            .takeover(forward(&opened, "late", "other"))
+            .await
+            .is_err());
+        assert_eq!(service.inspect().await, accepted);
+    }
+
+    #[tokio::test]
+    async fn completed_takeover_allows_next_exact_current_task_not_mutated_replay() {
+        let service = ready().await;
+        let old = service.inspect().await;
+        let first = forward(&old, "first", "one");
+        let current = service.takeover(first.clone()).await.unwrap();
+        let mut changed = first.clone();
+        changed.new_controller_session_id = "changed".into();
+        assert!(service.takeover(changed).await.is_err());
+        assert!(service
+            .takeover(forward(&old, "second", "two"))
+            .await
+            .is_err());
+        let second = service
+            .takeover(forward(&current, "second", "two"))
+            .await
+            .unwrap();
+        assert_eq!(second.sync_epoch, old.sync_epoch + 2);
+        assert!(service.takeover(first).await.is_err());
+        assert!(service.begin(second).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn accepted_forward_is_completed_only_from_saved_request() {
+        let service = ready().await;
+        let old = service.inspect().await;
+        let saved = forward(&old, "task", "failed");
+        {
+            let mut s = service.state.lock().await;
+            s.takeover = Some((saved.clone(), None));
+            s.epoch += 1;
+            s.owner = "failed".into();
+            s.snapshot = None;
+        }
+        assert!(service.begin(service.inspect().await).await.is_err());
+        let mut wrong = saved.clone();
+        wrong.new_controller_session_id = "other".into();
+        assert!(service.takeover(wrong).await.is_err());
+        let receipt = service.takeover(saved.clone()).await.unwrap();
+        assert_eq!(receipt.controller_session_id, "failed");
+        let s = service.state.lock().await;
+        assert_eq!(s.takeover.as_ref().unwrap().0, saved);
+        assert!(s.takeover.as_ref().unwrap().1.is_some());
+    }
+
+    #[tokio::test]
+    async fn closed_admission_or_wrong_epoch_rejects_takeover() {
+        let service = ready().await;
+        let old = service.inspect().await;
+        let mut wrong = forward(&old, "task", "new");
+        wrong.expected.as_mut().unwrap().sync_epoch += 1;
+        assert!(service.takeover(wrong).await.is_err());
+        service.state.lock().await.admissions.insert(
+            "env".into(),
+            (proto::EnvironmentAdmissionRequest::default(), true),
+        );
+        assert!(service
+            .takeover(forward(&old, "task", "new"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn known_open_admission_allows_takeover_but_unknown_still_blocks() {
+        for unknown in [false, true] {
+            let service = ready().await;
+            let old = service.inspect().await;
+            {
+                let mut s = service.state.lock().await;
+                s.admissions.insert(
+                    "env".into(),
+                    (proto::EnvironmentAdmissionRequest::default(), false),
+                );
+                if unknown {
+                    s.admission_unknown.insert("env".into());
+                }
+            }
+            assert_eq!(
+                service
+                    .takeover(forward(&old, "task", "failed"))
+                    .await
+                    .is_err(),
+                unknown
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_invalid_saved_payload_stays_fenced_without_ready_guess() {
+        let service = ready().await;
+        let old = service.inspect().await;
+        let mut saved = forward(&old, "task", "failed");
+        saved.snapshot.as_mut().unwrap().sync_epoch += 1;
+        {
+            let mut s = service.state.lock().await;
+            s.takeover = Some((saved.clone(), None));
+            s.epoch += 1;
+            s.owner = "failed".into();
+            s.snapshot = None;
+        }
+        assert!(service.takeover(saved.clone()).await.is_err());
+        assert!(service
+            .takeover(forward(&old, "other", "other"))
+            .await
+            .is_err());
+        let s = service.state.lock().await;
+        assert_eq!(s.takeover.as_ref().unwrap().0, saved);
+        assert!(s.takeover.as_ref().unwrap().1.is_none());
+    }
 }
 
 #[cfg(all(test, feature = "mock-e2e"))]
@@ -500,6 +1002,179 @@ mod tests {
     const PREFIX_BYTES: usize = 5 * 1024 * 1024;
     const DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn preserving_takeover_keeps_stream_and_replays_without_reinstalling() {
+        let (service, binding, mut download) = downloading().await;
+        let old = service.inspect().await;
+        let request = proto::BindingTakeoverRequest {
+            expected: Some(old.clone()),
+            new_controller_session_id: "new-owner".into(),
+            snapshot: Some(proto::BindingSnapshot {
+                proxy_session_id: old.proxy_session_id.clone(),
+                sync_epoch: old.sync_epoch + 1,
+                bindings: vec![UpdateBindingRequest {
+                    sync_epoch: old.sync_epoch + 1,
+                    ..binding.clone()
+                }],
+            }),
+        };
+        let accepted = service.takeover(request.clone()).await.unwrap();
+        assert!(accepted.ready);
+        assert_eq!(accepted.controller_session_id, "new-owner");
+        assert_eq!(accepted.sync_epoch, old.sync_epoch + 1);
+        assert!(service.apply(binding.clone()).await.is_err());
+        assert!(service
+            .set_environment_admission(Request::new(proto::EnvironmentAdmissionRequest {
+                environment_id: binding.environment_id.clone(),
+                runtime_id: "download-runtime".into(),
+                proxy_session_id: old.proxy_session_id.clone(),
+                sync_epoch: old.sync_epoch,
+                admission_revision: 1,
+                close: true,
+                drain: true,
+                activity_revision: 0,
+            }))
+            .await
+            .is_err());
+        assert!(service
+            .replace(proto::BindingSnapshot {
+                proxy_session_id: old.proxy_session_id,
+                sync_epoch: old.sync_epoch,
+                bindings: vec![]
+            })
+            .await
+            .is_err());
+        let mut retired = binding;
+        retired.sync_epoch = accepted.sync_epoch;
+        retired.binding_revision += 1;
+        retired.binding = Some(Binding::Retired(proto::Retired {}));
+        // The unmodified execution must not be retired/reactivated by takeover.
+        assert_eq!(
+            download.finish().await.unwrap().len(),
+            DOWNLOAD_BYTES - PREFIX_BYTES
+        );
+        service.apply(retired.clone()).await.unwrap();
+        assert_eq!(service.takeover(request.clone()).await.unwrap(), accepted);
+        assert_eq!(
+            service.state.lock().await.versions[&retired.environment_id],
+            retired
+        );
+        let mut changed = request;
+        changed.snapshot.as_mut().unwrap().bindings.clear();
+        assert!(service.takeover(changed).await.is_err());
+        assert!(service.begin(accepted).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn preserving_takeover_rejects_actual_quiescing_even_with_open_ledger() {
+        let (service, _, _download) = downloading().await;
+        let old = service.inspect().await;
+        let request = proto::BindingTakeoverRequest {
+            expected: Some(old.clone()),
+            new_controller_session_id: "new-owner".into(),
+            snapshot: Some(proto::BindingSnapshot {
+                proxy_session_id: old.proxy_session_id.clone(),
+                sync_epoch: old.sync_epoch + 1,
+                bindings: vec![],
+            }),
+        };
+        service.state.lock().await.admissions.insert(
+            "env".into(),
+            (proto::EnvironmentAdmissionRequest::default(), false),
+        );
+        // Drain closes actual admission regardless of the stream's activity revision.
+        service
+            .proxy
+            .drain_environment("download-environment", "download-runtime")
+            .unwrap();
+        assert!(service.takeover(request).await.is_err());
+        assert_eq!(service.inspect().await, old);
+    }
+
+    #[tokio::test]
+    async fn candidate_snapshot_retry_preserves_retirement_until_explicit_open() {
+        let proxy = Arc::new(
+            Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
+                .parse()
+                .unwrap()]))
+            .with_route_enforcement(),
+        );
+        let service = BindingService::new(proxy.clone());
+        let mut initial = service.inspect().await;
+        initial.controller_session_id = "controller".into();
+        let state = service.begin(initial).await.unwrap();
+        let active = UpdateBindingRequest {
+            proxy_session_id: state.proxy_session_id.clone(),
+            sync_epoch: state.sync_epoch,
+            environment_id: "env".into(),
+            ownership_generation: 1,
+            binding_revision: 1,
+            binding: Some(Binding::Active(proto::RuntimeTarget {
+                runtime_id: "runtime".into(),
+                ip: "127.0.0.1".into(),
+            })),
+        };
+        assert!(service.apply(active.clone()).await.is_err());
+        assert!(service.open_candidate(state.clone()).await.is_err());
+        let snapshot = proto::BindingSnapshot {
+            proxy_session_id: state.proxy_session_id.clone(),
+            sync_epoch: state.sync_epoch,
+            bindings: vec![active.clone()],
+        };
+        // Treat the successful installation response as lost.
+        service.install_candidate(snapshot.clone()).await.unwrap();
+        assert!(!service.inspect().await.ready);
+        assert!(
+            !proxy.ready(),
+            "Active snapshot must not open candidate admission"
+        );
+        let mut retired = active;
+        retired.binding_revision = 2;
+        retired.binding = Some(Binding::Retired(proto::Retired {}));
+        service.apply(retired.clone()).await.unwrap();
+        service.install_candidate(snapshot.clone()).await.unwrap();
+        assert!(!service.inspect().await.ready);
+        assert_eq!(service.state.lock().await.versions["env"], retired);
+        // Observe real CONNECT rejection while the candidate is installed but closed.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = proxy.serve_h2(socket).await;
+        });
+        let connector = DataPlaneL4Connector::new(H2PoolConfig {
+            connections_per_node: 1,
+            max_connections_per_node: 1,
+            ..Default::default()
+        });
+        let (_cancel, cancelled) = watch::channel(false);
+        assert!(connector
+            .connect_stream(
+                &address,
+                &ConnectTarget {
+                    instance_id: "env".into(),
+                    workload_id: "runtime".into(),
+                    target_ip: "127.0.0.1".parse().unwrap(),
+                    target_port: 8080,
+                    request_id: "closed-candidate".into(),
+                },
+                cancelled
+            )
+            .await
+            .is_err());
+        // Lost Open response is recoverable by exact state inspection and retry.
+        service.open_candidate(state.clone()).await.unwrap();
+        let observed = service.inspect().await;
+        assert!(observed.ready);
+        assert_eq!(observed.proxy_session_id, state.proxy_session_id);
+        assert_eq!(observed.sync_epoch, state.sync_epoch);
+        assert_eq!(observed.controller_session_id, state.controller_session_id);
+        service.open_candidate(state).await.unwrap();
+        service.install_candidate(snapshot).await.unwrap();
+        assert_eq!(service.state.lock().await.versions["env"], retired);
+        relay.abort();
+    }
 
     struct Download {
         stream: H2ConnectStream,
@@ -532,6 +1207,7 @@ mod tests {
             Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
                 .parse()
                 .unwrap()]))
+            .with_activity_tracker(Arc::new(crate::node::ActivityTracker::new("download")))
             .with_route_enforcement(),
         );
         let service = BindingService::new(proxy.clone());

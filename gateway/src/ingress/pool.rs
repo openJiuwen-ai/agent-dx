@@ -26,6 +26,23 @@ const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 const H2_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
 const H2_MAX_FRAME_SIZE: u32 = 64 * 1024;
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RelayConnectError {
+    #[error("{0}")]
+    TcpRefused(#[source] io::Error),
+    #[error("node proxy rejected CONNECT: {0}")]
+    Rejected(StatusCode),
+}
+
+impl RelayConnectError {
+    pub(super) fn temporary(&self) -> bool {
+        matches!(
+            self,
+            Self::TcpRefused(_) | Self::Rejected(StatusCode::SERVICE_UNAVAILABLE)
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct H2PoolConfig {
     pub connections_per_node: usize,
@@ -82,6 +99,32 @@ impl Default for NodePool {
 pub struct PoolStreamGuard {
     active_streams: Arc<AtomicUsize>,
     last_used: Arc<StdMutex<tokio::time::Instant>>,
+    reuse_guard: RelayReuseGuard,
+}
+
+/// Observes only the physical connection that accepted this CONNECT. Saturation
+/// is not draining: only a terminal readiness error prevents HTTP reuse.
+#[derive(Clone)]
+pub(crate) struct RelayReuseGuard {
+    sender: SendRequest<Bytes>,
+}
+
+impl RelayReuseGuard {
+    pub(crate) fn new(sender: SendRequest<Bytes>) -> Self {
+        Self { sender }
+    }
+
+    pub(crate) fn is_reusable(&self) -> bool {
+        let mut sender = self.sender.clone();
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+        !matches!(sender.poll_ready(&mut context), Poll::Ready(Err(_)))
+    }
+}
+
+impl PoolStreamGuard {
+    pub(crate) fn reuse_guard(&self) -> RelayReuseGuard {
+        self.reuse_guard.clone()
+    }
 }
 
 impl Drop for PoolStreamGuard {
@@ -99,6 +142,10 @@ pub struct H2ConnectionPool {
 }
 
 impl H2ConnectionPool {
+    pub(super) fn connect_timeout(&self) -> Duration {
+        self.config.connect_timeout
+    }
+
     pub fn new(mut config: H2PoolConfig) -> Self {
         config.connections_per_node = config.connections_per_node.max(1);
         config.max_connections_per_node = config
@@ -191,7 +238,7 @@ impl H2ConnectionPool {
             if response.status() != StatusCode::OK {
                 return Err(io::Error::new(
                     status_to_error_kind(response.status()),
-                    format!("node proxy rejected CONNECT: {}", response.status()),
+                    RelayConnectError::Rejected(response.status()),
                 ));
             }
             pool.active_streams.fetch_add(1, Ordering::Relaxed);
@@ -202,6 +249,7 @@ impl H2ConnectionPool {
                 PoolStreamGuard {
                     active_streams: pool.active_streams.clone(),
                     last_used: pool.last_used.clone(),
+                    reuse_guard: RelayReuseGuard::new(sender.clone()),
                 },
             ));
         }
@@ -279,7 +327,13 @@ impl H2ConnectionPool {
     }
 
     async fn open_physical_inner(&self, node: &str) -> io::Result<SendRequest<Bytes>> {
-        let tcp = TcpStream::connect(node).await?;
+        let tcp = TcpStream::connect(node).await.map_err(|error| {
+            if error.kind() == io::ErrorKind::ConnectionRefused {
+                io::Error::new(error.kind(), RelayConnectError::TcpRefused(error))
+            } else {
+                error
+            }
+        })?;
         tcp.set_nodelay(true)?;
         if let Some(tls_config) = &self.config.tls_config {
             let server_name = self.config.tls_server_name.clone().ok_or_else(|| {
@@ -421,6 +475,115 @@ mod tests {
 
     const TEST_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(100);
     const TEST_REQUEST_DEADLINE: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn only_explicit_relay_unavailability_is_temporary() {
+        let temporary = |error: &io::Error| {
+            error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<RelayConnectError>())
+                .is_some_and(RelayConnectError::temporary)
+        };
+        assert!(temporary(&io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            RelayConnectError::TcpRefused(io::Error::from(io::ErrorKind::ConnectionRefused)),
+        )));
+        for status in [
+            StatusCode::BAD_GATEWAY,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::CONFLICT,
+        ] {
+            assert!(
+                !temporary(&io::Error::new(
+                    status_to_error_kind(status),
+                    RelayConnectError::Rejected(status),
+                )),
+                "CONNECT {status} must not be retried"
+            );
+        }
+        assert!(temporary(&io::Error::new(
+            io::ErrorKind::NotConnected,
+            RelayConnectError::Rejected(StatusCode::SERVICE_UNAVAILABLE),
+        )));
+        assert!(!temporary(&io::Error::from(
+            io::ErrorKind::ConnectionRefused
+        )));
+        assert!(!temporary(&io::Error::other("TLS certificate rejected")));
+    }
+
+    #[tokio::test]
+    async fn graceful_goaway_blocks_reuse_but_preserves_the_original_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (drain_tx, mut drain_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            loop {
+                tokio::select! {
+                    _ = &mut drain_rx => {
+                        connection.graceful_shutdown();
+                        break;
+                    }
+                    stream = connection.accept() => {
+                        let (request, mut respond) = stream.unwrap().unwrap();
+                        let mut send = respond.send_response(http::Response::new(()), false).unwrap();
+                        tokio::spawn(async move {
+                            let mut recv = request.into_body();
+                            while let Some(data) = recv.data().await {
+                                let data = data.unwrap();
+                                recv.flow_control().release_capacity(data.len()).unwrap();
+                                send.send_data(data, false).unwrap();
+                            }
+                            send.send_data(Bytes::new(), true).unwrap();
+                        });
+                    }
+                }
+            }
+            assert!(
+                connection.accept().await.is_none(),
+                "new CONNECT after shutdown"
+            );
+        });
+        let connector = crate::ingress::connector::DataPlaneL4Connector::new(H2PoolConfig {
+            connections_per_node: 1,
+            max_connections_per_node: 1,
+            ..H2PoolConfig::default()
+        });
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let target = ConnectTarget {
+            instance_id: "instance".into(),
+            workload_id: "workload".into(),
+            target_ip: "127.0.0.1".parse().unwrap(),
+            target_port: 8080,
+            request_id: "goaway".into(),
+        };
+        let mut stream = connector
+            .connect_stream(&address, &target, cancel_rx)
+            .await
+            .unwrap();
+        let guard = stream.reuse_guard().unwrap();
+        assert!(guard.is_reusable());
+        drain_tx.send(()).unwrap();
+        timeout(TEST_REQUEST_DEADLINE, async {
+            while guard.is_reusable() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client did not receive GOAWAY");
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(b"still-connected").await.unwrap();
+        let mut echoed = [0; 15];
+        timeout(TEST_REQUEST_DEADLINE, stream.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&echoed, b"still-connected");
+        drop(stream);
+        server.abort();
+    }
 
     #[tokio::test]
     async fn stalled_tls_handshake_does_not_hold_sender_state_lock_and_times_out() {

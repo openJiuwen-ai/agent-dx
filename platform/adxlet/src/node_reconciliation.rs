@@ -1,5 +1,6 @@
 //! Backend-independent node authority cycle, shared by startup and periodic reports.
 use crate::{journal::JournalSink, reconciliation::ReconciliationOutcome, Adxlet};
+use adx_core::EnvironmentRecord;
 use adx_protocol::{control as pb, status};
 use adx_transport::rpc::RpcChannel;
 use std::{future::Future, sync::atomic::Ordering, time::Duration};
@@ -15,6 +16,15 @@ impl Adxlet {
             _ = interval.tick() => {},
             _ = self.reconciliation_requested.notified() => {},
         }
+    }
+}
+
+fn require_handshake_on_failure(manager: &Adxlet, error: &Status, handshake_required: &mut bool) {
+    if error.code() == tonic::Code::FailedPrecondition {
+        manager
+            .registration_acknowledged
+            .store(false, Ordering::Release);
+        *handshake_required = true;
     }
 }
 
@@ -106,30 +116,62 @@ async fn report(
     timeout: Duration,
     handshake_required: &mut bool,
 ) -> Result<(), Status> {
+    if registration.reconciling {
+        manager
+            .registration_acknowledged
+            .store(false, Ordering::Release);
+    }
+    if manager.process_sealing() {
+        registration.accepting_allocations = false;
+    }
     registration.heartbeat_sequence = registration
         .heartbeat_sequence
         .checked_add(1)
         .ok_or_else(|| Status::internal("heartbeat sequence exhausted"))?;
     let mut request = Request::new(registration.clone());
     request.set_timeout(timeout);
-    let result = match bounded_rpc(timeout, coordinator.register_node(request)).await {
+    let response = bounded_rpc(timeout, coordinator.register_node(request))
+        .await
+        .map(tonic::Response::into_inner);
+    registration_response(manager, registration, response, handshake_required).await
+}
+
+async fn registration_response(
+    manager: &Adxlet,
+    registration: &pb::RegisterNodeRequest,
+    response: Result<pb::RegisterNodeResponse, Status>,
+    handshake_required: &mut bool,
+) -> Result<(), Status> {
+    if registration.reconciling || registration.session_id != manager.services.upgrade.session() {
+        manager
+            .registration_acknowledged
+            .store(false, Ordering::Release);
+    }
+    let result = match response {
         Ok(response) => {
-            if let Some(control) = response.into_inner().upgrade_control {
+            let applied = if let Some(control) = response.upgrade_control {
+                manager
+                    .registration_acknowledged
+                    .store(false, Ordering::Release);
                 manager
                     .apply_registration_upgrade_control(control)
                     .await
                     .map_err(status)
             } else {
                 Ok(())
-            }
+            };
+            manager.registration_acknowledged.store(
+                applied.is_ok()
+                    && !registration.reconciling
+                    && registration.session_id == manager.services.upgrade.session(),
+                Ordering::Release,
+            );
+            applied
         }
         Err(error) => Err(error),
     };
-    if result
-        .as_ref()
-        .is_err_and(|error| error.code() == tonic::Code::FailedPrecondition)
-    {
-        *handshake_required = true;
+    if let Err(error) = &result {
+        require_handshake_on_failure(manager, error, handshake_required);
     }
     result
 }
@@ -149,6 +191,171 @@ async fn inspect(
         .into_inner())
 }
 
+fn successor_status(stage: &'static str, error: Status) -> Status {
+    Status::with_details_and_metadata(
+        error.code(),
+        format!("successor {stage}: {}", error.message()),
+        bytes::Bytes::copy_from_slice(error.details()),
+        error.metadata().clone(),
+    )
+}
+
+/// A protected successor only compares/adopts exact execution identities. This
+/// path is used on every report until explicit release, including rediscovery.
+pub async fn reconcile_successor(
+    coordinator: &mut Coordinator,
+    registration: &mut pb::RegisterNodeRequest,
+    manager: &Adxlet,
+    routes: &crate::routes::UdsRoutes,
+    identity: &adx_protocol::relay::AdxletProcessRequest,
+    timeout: Duration,
+) -> Result<(), Status> {
+    // Healthy periodic observations retain their ordinary ACK through temporary
+    // transport failures. Only a new handshake or confirmed invalidation clears it.
+    async fn register(
+        coordinator: &mut Coordinator,
+        registration: &mut pb::RegisterNodeRequest,
+        timeout: Duration,
+    ) -> Result<pb::RegisterNodeResponse, Status> {
+        registration.heartbeat_sequence = registration
+            .heartbeat_sequence
+            .checked_add(1)
+            .ok_or_else(|| Status::internal("heartbeat sequence exhausted"))?;
+        loop {
+            let mut request = Request::new(registration.clone());
+            request.set_timeout(timeout);
+            match bounded_rpc(timeout, coordinator.register_node(request)).await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        tonic::Code::Unavailable
+                            | tonic::Code::DeadlineExceeded
+                            | tonic::Code::Cancelled
+                            | tonic::Code::Unknown
+                    ) =>
+                {
+                    // Reuse the exact sequence/report after an ambiguous ACK.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let initial = !manager.authority_initialized.load(Ordering::Acquire);
+    let mut registered_epoch = None;
+    registration.accepting_allocations = false;
+    // Do not reset the sequence when Coordinator restarts or a previous ACK was lost.
+    if initial || registration.reconciling {
+        manager
+            .registration_acknowledged
+            .store(false, Ordering::Release);
+        registration.reconciling = true;
+        registered_epoch = Some(
+            register(coordinator, registration, timeout)
+                .await
+                .map_err(|error| successor_status("register-reconciling", error))?
+                .coordinator_epoch,
+        );
+    }
+    let catalog = match inspect(coordinator, registration, timeout).await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            if error.code() == tonic::Code::FailedPrecondition {
+                registration.reconciling = true;
+                manager
+                    .registration_acknowledged
+                    .store(false, Ordering::Release);
+            }
+            return Err(successor_status("inspect", error));
+        }
+    };
+    let epoch = catalog.coordinator_epoch;
+    if registered_epoch.is_some_and(|registered| registered != epoch) {
+        manager
+            .registration_acknowledged
+            .store(false, Ordering::Release);
+        registration.reconciling = true;
+        return Err(successor_status(
+            "inspect-epoch",
+            Status::failed_precondition("Coordinator changed before successor inspection"),
+        ));
+    }
+    let records = catalog
+        .records
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect::<adx_core::Result<Vec<EnvironmentRecord>>>()
+        .map_err(|error| successor_status("inventory", status(error)))?;
+    manager
+        .validate_successor_inventory(&records)
+        .await
+        .map_err(|error| successor_status("inventory", status(error)))?;
+    if initial {
+        routes
+            .takeover_bindings(&registration.node_id, &records)
+            .await
+            .map_err(|error| successor_status("relay-bindings", status(error)))?;
+        manager
+            .restore_successor_records(&records)
+            .await
+            .map_err(|error| successor_status("restore-runtime", status(error)))?;
+    }
+    registration.reconciling = false;
+    let response = match register(coordinator, registration, timeout).await {
+        Ok(response) => response,
+        Err(error) => {
+            registration.reconciling = true;
+            manager
+                .registration_acknowledged
+                .store(false, Ordering::Release);
+            return Err(successor_status("register-normal", error));
+        }
+    };
+    if response.coordinator_epoch != epoch {
+        manager
+            .registration_acknowledged
+            .store(false, Ordering::Release);
+        registration.reconciling = true;
+        return Err(successor_status(
+            "register-normal-epoch",
+            Status::failed_precondition("Coordinator changed during successor handshake"),
+        ));
+    }
+    if let Some(control) = response.upgrade_control {
+        manager
+            .registration_acknowledged
+            .store(false, Ordering::Release);
+        if let Err(error) = manager.apply_registration_upgrade_control(control).await {
+            registration.reconciling = true;
+            return Err(successor_status("apply-control", status(error)));
+        }
+    }
+    if initial {
+        if let Err(error) = manager.publish_successor_ready(identity).await {
+            manager
+                .registration_acknowledged
+                .store(false, Ordering::Release);
+            registration.reconciling = true;
+            return Err(successor_status("publish-ready", status(error)));
+        }
+    }
+    if registration.session_id != manager.services.upgrade.session() {
+        manager
+            .registration_acknowledged
+            .store(false, Ordering::Release);
+        registration.reconciling = true;
+        return Err(successor_status(
+            "session",
+            Status::failed_precondition("successor registration session changed"),
+        ));
+    }
+    manager
+        .registration_acknowledged
+        .store(true, Ordering::Release);
+    Ok(())
+}
+
 /// Compare a complete current catalog without closing healthy live admission.
 /// Startup and session fencing drain accepted lifecycle work before recovery.
 /// Live comparisons enqueue at most one task per Environment, so a slow or failed
@@ -164,6 +371,18 @@ pub async fn reconcile_node(
     _capacity_valid_until: Instant,
 ) -> Result<(), Status> {
     let was_live = *manager.lifecycle_ready.read().await;
+    if manager.process_sealing() {
+        registration.accepting_allocations = false;
+        let mut handshake_required = false;
+        return report(
+            manager,
+            coordinator,
+            registration,
+            timeout,
+            &mut handshake_required,
+        )
+        .await;
+    }
     // Admission can close after a failed cleanup/report. That does not make
     // already recovered controllers need startup recovery again.
     let periodic = manager.authority_initialized.load(Ordering::Acquire)
@@ -173,6 +392,11 @@ pub async fn reconcile_node(
     // session can compare a snapshot while accepting new allocations.
     let handshake = !periodic || registration.reconciling;
     registration.reconciling = handshake;
+    if handshake {
+        manager
+            .registration_acknowledged
+            .store(false, Ordering::Release);
+    }
     registration.accepting_allocations =
         periodic && manager.accepting_allocations() && !manager.is_draining();
     if timeout.is_zero() || report_interval.is_zero() {
@@ -281,6 +505,10 @@ pub async fn reconcile_node(
         report(manager, coordinator, registration, timeout, &mut handshake_required).await
     }
     .await;
+    if let Err(error) = &result {
+        // Includes both InspectNode calls, before the healthy-periodic early return.
+        require_handshake_on_failure(manager, error, &mut handshake_required);
+    }
     if result.is_err() && periodic && !handshake_required {
         // A failed live comparison leaves the last validated authority in force.
         // Never turn a transport failure into an empty catalog or node outage.
@@ -377,6 +605,124 @@ pub async fn reconcile_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successor_stage_preserves_status_code_details_and_metadata() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.append("adx-diagnostic", "first".parse().unwrap());
+        metadata.append("adx-diagnostic", "second".parse().unwrap());
+        metadata.insert_bin(
+            "adx-diagnostic-bin",
+            tonic::metadata::MetadataValue::from_bytes(b"\0\xffcontext"),
+        );
+        let original = Status::with_details_and_metadata(
+            tonic::Code::FailedPrecondition,
+            "identity or version conflict",
+            bytes::Bytes::from_static(b"\0\xffdetails"),
+            metadata,
+        );
+
+        let contextual = successor_status("publish-ready", original.clone());
+
+        assert_eq!(
+            contextual.message(),
+            "successor publish-ready: identity or version conflict"
+        );
+        assert_eq!(contextual.code(), original.code());
+        assert_eq!(contextual.details(), original.details());
+        assert_eq!(
+            contextual.metadata().clone().into_headers(),
+            original.metadata().clone().into_headers()
+        );
+    }
+
+    #[tokio::test]
+    async fn either_catalog_inspection_failure_requires_new_handshake_only_when_fenced() {
+        let node = crate::admin::tests::manager();
+        let mut handshake = false;
+        node.registration_acknowledged
+            .store(true, Ordering::Release);
+        require_handshake_on_failure(
+            &node,
+            &Status::unavailable("temporary catalog failure"),
+            &mut handshake,
+        );
+        assert!(node.registration_acknowledged.load(Ordering::Acquire));
+        assert!(!handshake);
+        require_handshake_on_failure(
+            &node,
+            &Status::failed_precondition("session fenced"),
+            &mut handshake,
+        );
+        assert!(!node.registration_acknowledged.load(Ordering::Acquire));
+        assert!(handshake);
+    }
+
+    #[tokio::test]
+    async fn ordinary_ack_control_and_session_invalidation_contract() {
+        let node = crate::admin::tests::manager();
+        let mut registration = pb::RegisterNodeRequest {
+            session_id: node.services.upgrade.session().into(),
+            reconciling: false,
+            ..Default::default()
+        };
+        let mut handshake = false;
+        assert!(!node.registration_acknowledged.load(Ordering::Acquire));
+        registration_response(&node, &registration, Ok(Default::default()), &mut handshake)
+            .await
+            .unwrap();
+        assert!(node.registration_acknowledged.load(Ordering::Acquire));
+        assert!(registration_response(
+            &node,
+            &registration,
+            Err(Status::unavailable("temporary")),
+            &mut handshake
+        )
+        .await
+        .is_err());
+        assert!(node.registration_acknowledged.load(Ordering::Acquire));
+        assert!(!handshake);
+        let invalid_control = pb::RegisterNodeResponse {
+            upgrade_control: Some(pb::NodeUpgradeControl {
+                phase: "invalid".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            registration_response(&node, &registration, Ok(invalid_control), &mut handshake)
+                .await
+                .is_err()
+        );
+        assert!(!node.registration_acknowledged.load(Ordering::Acquire));
+        registration_response(&node, &registration, Ok(Default::default()), &mut handshake)
+            .await
+            .unwrap();
+        registration.reconciling = true;
+        registration_response(&node, &registration, Ok(Default::default()), &mut handshake)
+            .await
+            .unwrap();
+        assert!(!node.registration_acknowledged.load(Ordering::Acquire));
+        registration.reconciling = false;
+        registration_response(&node, &registration, Ok(Default::default()), &mut handshake)
+            .await
+            .unwrap();
+        assert!(registration_response(
+            &node,
+            &registration,
+            Err(Status::failed_precondition("new handshake")),
+            &mut handshake
+        )
+        .await
+        .is_err());
+        assert!(handshake);
+        assert!(!node.registration_acknowledged.load(Ordering::Acquire));
+        registration.session_id.push_str("changed");
+        registration_response(&node, &registration, Ok(Default::default()), &mut handshake)
+            .await
+            .unwrap();
+        assert!(!node.registration_acknowledged.load(Ordering::Acquire));
+    }
 
     #[tokio::test]
     async fn bounded_rpc_releases_a_stalled_heartbeat() {

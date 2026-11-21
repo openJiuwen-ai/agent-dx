@@ -52,7 +52,12 @@ fn configured_named_ingress(
     Arc::new(
         Ingress::new(
             Arc::new(IngressRouteResolver::new(store)),
-            DataPlaneL4Connector::new(H2PoolConfig::default()),
+            DataPlaneL4Connector::new(H2PoolConfig {
+                // The fixture's Relay always refuses connections. Finish its
+                // retries before the HTTP client times out reading the 502.
+                connect_timeout: Duration::from_millis(100),
+                ..Default::default()
+            }),
             IngressAuthenticator::with_verifier(Arc::new(NativeKeys)),
             50090,
             8765,
