@@ -18,6 +18,7 @@ const MAX_TIMEOUT_MS: u64 = 86_400_000;
 #[derive(Debug, Clone)]
 pub struct ProcessingDeadline {
     pub at: Instant,
+    pub(super) caller_supplied: bool,
     phase: Arc<AtomicU8>,
     timeout: Duration,
     upload_deadline: watch::Sender<Instant>,
@@ -34,6 +35,7 @@ impl ProcessingDeadline {
         let at = Instant::now() + timeout;
         Self {
             at,
+            caller_supplied: false,
             phase: Arc::new(AtomicU8::new(0)),
             timeout,
             upload_deadline: watch::channel(at).0,
@@ -54,7 +56,10 @@ impl ProcessingDeadline {
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0 && *n <= MAX_TIMEOUT_MS)
             .ok_or("processing timeout must be 1 through 86400000 milliseconds")?;
-        Ok(Self::new(Duration::from_millis(milliseconds)))
+        Ok(Self {
+            caller_supplied: true,
+            ..Self::new(Duration::from_millis(milliseconds))
+        })
     }
 
     pub fn remaining(&self) -> Duration {

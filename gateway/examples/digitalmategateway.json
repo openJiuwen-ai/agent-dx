@@ -17,5 +17,24 @@
     "backend_path": "/digitalmate/ws",
     "service_port": 18092,
     "request_timeout_seconds": 180
+  },
+  "privacy": {
+    "listen": "10.0.0.10:18444",
+    "tls_certificate": "/run/digitalmate-identity/tls.crt",
+    "tls_private_key": "/run/digitalmate-identity/tls.key",
+    "template": "digitalmate"
+  },
+  "push": {
+    "service_account_file": "/run/digitalmate-push/service-account.json",
+    "notification_category": "WORK",
+    "organization": "digitalmate-push",
+    "database": {
+      "database_url_env": "ADX_ACCOUNT_DATABASE_URL",
+      "database_max_connections": 4
+    },
+    "limits": {
+      "organization_per_minute": 600,
+      "user_per_minute": 60
+    }
   }
 }

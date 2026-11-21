@@ -152,6 +152,55 @@ async fn ws_frame<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn push_rejects_caller_deadline_at_shared_entry_before_dispatch() {
+    let (gateway, backend) = fixture().await;
+    let activator = adx_activator::Activator::new(
+        AgentState::new(Arc::new(MemoryRepository::default())),
+        backend,
+    );
+    let managed = Arc::new(ManagedService::new(Arc::new(LocalControl::new(Arc::new(
+        activator,
+    )))));
+    let api = DigitalMateGatewayApi::new(
+        settings(),
+        managed,
+        Arc::new(TestAuth(std::sync::atomic::AtomicBool::new(false))),
+    )
+    .unwrap();
+    let gateway = Arc::new(
+        Arc::try_unwrap(gateway)
+            .ok()
+            .unwrap()
+            .with_digitalmategateway_api(Arc::new(api)),
+    );
+    let (mut sender, server, client) = connection(gateway, IngressSecurity::Tls).await;
+    let request = || Request::post("/api/digitalmate/push/v1/send").header("host", "localhost");
+    let response = sender
+        .send_request(
+            request()
+                .header("x-adx-processing-timeout-ms", "50")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"result":"not_sent","error":"unsupported_processing_timeout","retryable":false})
+    );
+    let response = sender
+        .send_request(request().body(Full::new(Bytes::new())).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    server.abort();
+    client.abort();
+}
+
 #[tokio::test]
 async fn enabling_jiuwen_keeps_generic_agent_dispatch_on_both_listeners() {
     let (gateway, backend) = fixture().await;
