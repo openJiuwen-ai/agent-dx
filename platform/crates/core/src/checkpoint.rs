@@ -1,6 +1,33 @@
 //! Portable restore-point metadata. Artifacts stay behind a storage backend.
 use serde::{Deserialize, Serialize};
 
+/// Checkpoint evidence for an OCI rootfs, scoped to one execution.
+pub const RECOVERY_OCI_ROOTFS: &str = "ADX_RECOVERY_OCI_ROOTFS";
+/// Node advertises support for verifying OCI rootfs evidence before restoring.
+pub const RECOVERY_OCI_NODE: &str = "ADX_RECOVERY_OCI";
+
+/// Validate the SHA-256 digest spelling used in immutable OCI references.
+pub fn is_oci_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Effective OCI image supplied to the runtime, if content-addressed.
+/// Explicit execution rootfs takes precedence over the top-level image.
+pub fn immutable_oci_rootfs(spec: &crate::EnvironmentSpec) -> Option<&str> {
+    let image = match spec.execution.rootfs.as_ref().map(|root| &root.source) {
+        Some(crate::execution::StorageSource::Image(image)) => image,
+        None => &spec.image,
+        Some(_) => return None,
+    };
+    let (repository, digest) = image.split_once('@')?;
+    (!repository.is_empty() && is_oci_digest(digest)).then_some(image)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointArtifact {
     pub storage: String,

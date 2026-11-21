@@ -27,9 +27,9 @@
 
 `CheckpointAccess::seal` 是存储完成边界。对象存储在此完成上传，通过 `prepare_restore` 下载；本地/S3、缓存引用和跨节点恢复已实现，见 [存储契约](snapshot-storage.md) 与 [跨节点恢复](firecracker-cross-node.md)。
 
-跨节点 Resume/Recover 与升级迁移共用选址和兼容性准入，要求捕获时保存的 runtime、rootfs 证据及实际共享存储 scope；缺失或不匹配时不转移所有权。宿主机内核版本、CPU 型号及 `/proc/cpuinfo` flags 不作精确相等筛选；runsc 在实际恢复时验证检查点所需的 CPU 能力。当前配置仅开放默认 rootfs 的 Linux runsc，见[节点配置](../../build/config/examples/README.md)。旧恢复点可继续本地恢复，跨节点前需重新捕获；其他运行时的历史验证不代表满足当前准入。
+跨节点 Resume/Recover 与升级迁移共用选址和兼容性准入，要求捕获时保存的 runtime、rootfs 证据及实际共享存储 scope；缺失或不匹配时不转移所有权。宿主机内核版本、CPU 型号及 `/proc/cpuinfo` flags 不作精确相等筛选；runsc 在实际恢复时验证检查点所需的 CPU 能力。Linux runsc 的 Resume/Recover 支持部署默认 rootfs 和已固定 digest 的 OCI rootfs。OCI 检查点记录实际执行的镜像引用，恢复时沿用该引用和现有的 bootstrap、存储、归属检查。计划迁移目前只接受默认 rootfs，见[节点配置](../../build/config/examples/README.md)。旧恢复点可继续本地恢复，跨节点前需重新捕获；其他运行时的历史验证不代表满足当前准入。
 
-local-only 成功表示后端已生成完整、可在本机读取的制品，并已提交恢复点元数据。adxlet 不主动对本地制品及目录执行 `fsync`；未完成的磁盘写回由操作系统和执行后端处理，不保证突然断电或宿主机崩溃后的制品完整性。该规则同样用于 workload checkpoint、本地回滚恢复点和可复用快照副本；对象存储仍等待完整上传。实际恢复前检查本地制品的路径、类型和长度；S3 缓存还完整校验 SHA-256，本地副本缺失或损坏时重新下载并校验。启动时未使用的 Paused 恢复点不做同步内容校验。
+local-only 成功表示后端已生成完整、可在本机读取的制品，并已提交恢复点元数据。adxlet 不主动对本地制品及目录执行 `fsync`；未完成的磁盘写回由操作系统和执行后端处理，不保证突然断电或宿主机崩溃后的制品完整性。该规则同样用于 workload checkpoint、本地回滚恢复点和可复用快照副本；对象存储仍等待完整上传。实际恢复前检查本地制品的路径、类型和长度。S3 已索引的缓存可直接复用通过元数据检查的副本；无索引副本在建立索引前逐文件校验 SHA-256。后台校验发现损坏时标记该副本失效，同时保留仍被执行引用的文件；副本缺失或失效且可替换时，从 S3 下载并逐文件校验 SHA-256。启动时未使用的 Paused 恢复点不做同步内容校验。
 
 ## 配置与部署
 

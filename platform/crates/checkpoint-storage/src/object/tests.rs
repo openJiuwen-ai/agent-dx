@@ -20,7 +20,7 @@ async fn idle_verification_is_paced_and_yields_to_execution() {
     let idle = Arc::downgrade(&pin);
     let started = tokio::time::Instant::now();
     assert_eq!(
-        ObjectCheckpointStore::valid_cached(root.path(), &manifest, Some(&idle))
+        ObjectCheckpointStore::valid_cached(root.path(), &manifest, CacheValidation::Idle(&idle))
             .await
             .unwrap(),
         Some(true)
@@ -28,13 +28,13 @@ async fn idle_verification_is_paced_and_yields_to_execution() {
     assert!(started.elapsed() >= std::time::Duration::from_micros(data.len() as u64 / 16));
     let _execution = pin.clone();
     assert_eq!(
-        ObjectCheckpointStore::valid_cached(root.path(), &manifest, Some(&idle))
+        ObjectCheckpointStore::valid_cached(root.path(), &manifest, CacheValidation::Idle(&idle))
             .await
             .unwrap(),
         None
     );
     assert_eq!(
-        ObjectCheckpointStore::valid_cached(root.path(), &manifest, None)
+        ObjectCheckpointStore::valid_cached(root.path(), &manifest, CacheValidation::Metadata)
             .await
             .unwrap(),
         Some(true)

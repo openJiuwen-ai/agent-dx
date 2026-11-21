@@ -1,5 +1,5 @@
 //! Local cache accounting. Execution leases are never subject to cache quotas.
-use super::{invalid, Manifest, ObjectCheckpointStore};
+use super::{invalid, CacheValidation, Manifest, ObjectCheckpointStore};
 use crate::{io_error, CheckpointAccess, RestoreAccess};
 use adx_core::{CheckpointArtifact, Result};
 use futures_util::StreamExt;
@@ -20,6 +20,8 @@ pub(super) struct CacheRecord {
     pub(super) manifest: Manifest,
     pub(super) staged: bool,
     pub(super) committed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) invalid: bool,
     pub(super) used: u64,
 }
 pub(crate) struct CacheEntry {
@@ -157,6 +159,30 @@ impl Cache {
         }
         Ok(true)
     }
+    async fn invalidate(cache: &Arc<Mutex<Self>>, id: &str, checked: &Weak<()>) -> Result<()> {
+        let _operation = Self::operation(cache, id).await;
+        let marked = {
+            let mut cache = cache.lock().await;
+            cache
+                .entries
+                .get_mut(id)
+                .filter(|entry| Weak::ptr_eq(checked, &Arc::downgrade(&entry.pin)))
+                .map(|entry| {
+                    entry.record.invalid = true;
+                    (entry.index.clone(), entry.record.clone())
+                })
+        };
+        if let Some((index, record)) = marked {
+            if let Err(error) = write_record(&index, &record).await {
+                // A missing index forces full content verification after restart.
+                if remove_file(&index).await.is_err() {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn trim(cache: &Arc<Mutex<Self>>, bytes: u64, entries: usize) -> Result<()> {
         let maintenance = cache.lock().await.maintenance.clone();
         let _maintenance = maintenance.lock().await;
@@ -231,6 +257,21 @@ fn read_record(path: &Path) -> Result<CacheRecord> {
     }
     serde_json::from_slice(&std::fs::read(path).map_err(io_error)?).map_err(invalid)
 }
+async fn write_record(index: &Path, record: &CacheRecord) -> Result<()> {
+    let temporary = index.with_file_name(format!(".index-{}", uuid::Uuid::new_v4()));
+    let result = async {
+        tokio::fs::write(&temporary, serde_json::to_vec(record).map_err(invalid)?)
+            .await
+            .map_err(io_error)?;
+        tokio::fs::rename(&temporary, index).await.map_err(io_error)
+    }
+    .await;
+    if result.is_err() {
+        let _ = remove_file(&temporary).await;
+    }
+    result
+}
+
 /// Count allocated blocks, including directories, rather than logical file size.
 fn allocated(path: &Path) -> Result<u64> {
     let metadata = std::fs::symlink_metadata(path).map_err(io_error)?;
@@ -283,22 +324,7 @@ impl ObjectCheckpointStore {
         remove_file(&self.index_root.join(format!("{id}.json"))).await
     }
     pub(super) async fn write_index(&self, id: &str, record: &CacheRecord) -> Result<()> {
-        let temporary = self
-            .index_root
-            .join(format!(".index-{}", uuid::Uuid::new_v4()));
-        let result = async {
-            tokio::fs::write(&temporary, serde_json::to_vec(record).map_err(invalid)?)
-                .await
-                .map_err(io_error)?;
-            tokio::fs::rename(&temporary, self.index_root.join(format!("{id}.json")))
-                .await
-                .map_err(io_error)
-        }
-        .await;
-        if result.is_err() {
-            let _ = remove_file(&temporary).await;
-        }
-        result
+        write_record(&self.index_root.join(format!("{id}.json")), record).await
     }
     pub(super) fn lease(&self, pin: Arc<()>) -> CacheLease {
         CacheLease {
@@ -349,10 +375,17 @@ impl ObjectCheckpointStore {
             let used = cache.tick();
             cache.entries.get_mut(&artifact.location).map(|entry| {
                 entry.record.used = used;
-                (self.files(entry), entry.record.clone())
+                (
+                    (!entry.record.invalid).then(|| self.files(entry)),
+                    entry.record.clone(),
+                )
             })
         };
         if let Some((files, record)) = cached {
+            let Some(files) = files else {
+                self.discard_cached(&artifact.location).await?;
+                return Ok(None);
+            };
             if let Err(error) = self.write_index(&artifact.location, &record).await {
                 adx_observability::warn!(%error, "checkpoint cache recency persistence failed");
             }
@@ -362,13 +395,17 @@ impl ObjectCheckpointStore {
         if let Ok(record) =
             read_record(&self.index_root.join(format!("{}.json", artifact.location)))
         {
+            if record.invalid {
+                self.discard_cached(&artifact.location).await?;
+                return Ok(None);
+            }
             let path = if record.staged {
                 &self.staging.root
             } else {
                 &self.cache_root
             }
             .join(&artifact.location);
-            if path.exists() {
+            if path.exists() && Self::validate_manifest(&record.manifest, artifact).is_ok() {
                 let files = self.insert(artifact, path, record.clone()).await?;
                 return Ok(Some((files, record)));
             }
@@ -376,10 +413,19 @@ impl ObjectCheckpointStore {
         for (root, staged) in [(&self.staging.root, true), (&self.cache_root, false)] {
             let path = root.join(&artifact.location);
             if path.exists() {
+                let _materialization = self.materialization_slot().await?;
+                let manifest = self.manifest(artifact).await?;
+                if Self::valid_cached(&path, &manifest, CacheValidation::Content).await?
+                    != Some(true)
+                {
+                    self.discard_cached(&artifact.location).await?;
+                    return Ok(None);
+                }
                 let record = CacheRecord {
-                    manifest: self.manifest(artifact).await?,
+                    manifest,
                     staged,
                     committed: !staged,
+                    invalid: false,
                     used: 0,
                 };
                 let files = self.insert(artifact, path, record.clone()).await?;
@@ -390,6 +436,16 @@ impl ObjectCheckpointStore {
     }
     pub(super) async fn cache_committed(&self, artifact: &CheckpointArtifact) -> Result<()> {
         let _operation = self.operation(&artifact.location).await;
+        if !self
+            .cache
+            .lock()
+            .await
+            .entries
+            .contains_key(&artifact.location)
+            && self.staging.root.join(&artifact.location).exists()
+        {
+            self.cached(artifact).await?;
+        }
         let record = {
             let mut cache = self.cache.lock().await;
             cache.entries.get_mut(&artifact.location).map(|entry| {
@@ -400,31 +456,11 @@ impl ObjectCheckpointStore {
         if let Some(record) = record {
             self.write_index(&artifact.location, &record).await?;
             drop(_operation);
-            return Cache::trim(&self.cache, self.budget, self.max_entries).await;
+            Cache::trim(&self.cache, self.budget, self.max_entries).await?;
         }
-        let path = self.staging.root.join(&artifact.location);
-        if !path.exists() {
-            return Ok(());
-        }
-        let index = self.index_root.join(format!("{}.json", artifact.location));
-        let mut record = match read_record(&index) {
-            Ok(record) => record,
-            Err(_) => CacheRecord {
-                manifest: self.manifest(artifact).await?,
-                staged: true,
-                committed: true,
-                used: 0,
-            },
-        };
-        Self::validate_manifest(&record.manifest, artifact)?;
-        record.committed = true;
-        // Keep the pathname: a live Firecracker incremental base may point here.
-        // Admission changes ownership/accounting without copying the snapshot.
-        let files = self.insert(artifact, path, record).await?;
-        drop(files);
-        drop(_operation);
-        Cache::trim(&self.cache, self.budget, self.max_entries).await
+        Ok(())
     }
+
     pub(super) async fn reconcile_cache(&self, retained: &[CheckpointArtifact]) -> Result<()> {
         let keep: BTreeSet<_> = retained
             .iter()
@@ -557,8 +593,8 @@ impl ObjectCheckpointStore {
     }
 
     async fn verify_idle(&self, ids: Vec<String>) {
-        // Read-only, bounded maintenance cannot invalidate a live execution's
-        // files. Every actual Restore independently verifies all bytes below.
+        // Hash only idle files, then mark failures under the artifact lock.
+        // Live files stay in place until their execution pins are released.
         let (ids, verification) = {
             let mut cache = self.cache.lock().await;
             cache.unverified.extend(ids);
@@ -589,9 +625,15 @@ impl ObjectCheckpointStore {
                         }
                     } else { None };
                     let Some((path, manifest, pin)) = candidate else { return };
-                    let complete = match Self::valid_cached(&path, &manifest, Some(&pin)).await {
+                    let complete = match Self::valid_cached(&path, &manifest, CacheValidation::Idle(&pin)).await {
                         Ok(Some(false)) => {
-                            adx_observability::warn!(checkpoint_id=%id, "idle checkpoint cache is invalid; restore will rematerialize it");
+                            adx_observability::warn!(checkpoint_id=%id, "idle checkpoint cache failed validation");
+                            if let Some(cache) = cache.upgrade() {
+                                if let Err(error) = Cache::invalidate(&cache, &id, &pin).await {
+                                    adx_observability::warn!(checkpoint_id=%id, %error, "checkpoint cache invalidation unavailable");
+                                    return;
+                                }
+                            }
                             true
                         },
                         Ok(Some(true)) => true,

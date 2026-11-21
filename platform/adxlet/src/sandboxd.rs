@@ -215,10 +215,15 @@ pub async fn connect_when_ready(
 impl Sandboxd {
     /// Measured, immutable node-session evidence for declared recovery backends.
     pub fn recovery_labels(&self) -> BTreeMap<String, String> {
-        self.recovery_profiles
+        let mut labels: BTreeMap<_, _> = self
+            .recovery_profiles
             .values()
             .flat_map(|profile| profile.clone())
-            .collect()
+            .collect();
+        if !labels.is_empty() {
+            labels.insert(adx_core::checkpoint::RECOVERY_OCI_NODE.into(), "1".into());
+        }
+        labels
     }
 
     /// Discover live execution backends through sandboxd's Unix socket.
@@ -1423,8 +1428,8 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
     fn recovery_profile(&self, spec: &EnvironmentSpec) -> Result<BTreeMap<String, String>> {
-        if !spec.image.is_empty()
-            || spec.execution.rootfs.is_some()
+        let image = adx_core::checkpoint::immutable_oci_rootfs(spec);
+        if ((!spec.image.is_empty() || spec.execution.rootfs.is_some()) && image.is_none())
             || spec
                 .runtime_profile
                 .as_ref()
@@ -1443,7 +1448,14 @@ impl RuntimeDriver for Sandboxd {
                 "recovery backend or rootfs changed; a new node session is required".into(),
             ));
         }
-        Ok(published.clone())
+        let mut profile = published.clone();
+        if let Some(image) = image {
+            profile.insert(
+                adx_core::checkpoint::RECOVERY_OCI_ROOTFS.into(),
+                image.into(),
+            );
+        }
+        Ok(profile)
     }
 
     async fn sandbox_id(&self, runtime_id: &str) -> Option<String> {

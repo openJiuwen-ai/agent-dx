@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::{
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -34,6 +34,11 @@ struct FileEntry {
     size: u64,
     sha256: String,
     mode: u32,
+}
+enum CacheValidation<'a> {
+    Metadata,
+    Content,
+    Idle(&'a Weak<()>),
 }
 pub struct ObjectCheckpointStore {
     pub(super) owner: Option<super::orphans::UploadOwner>,
@@ -195,10 +200,16 @@ impl ObjectCheckpointStore {
     pub async fn evict_unreferenced(&self, target: u64) -> Result<()> {
         Cache::trim(&self.cache, target.min(self.budget), self.max_entries).await
     }
+    async fn materialization_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        self.materialization
+            .acquire()
+            .await
+            .map_err(|error| Error::Unavailable(error.to_string()))
+    }
     async fn valid_cached(
         path: &Path,
         m: &Manifest,
-        idle: Option<&std::sync::Weak<()>>,
+        validation: CacheValidation<'_>,
     ) -> Result<Option<bool>> {
         let started = tokio::time::Instant::now();
         let mut checked = 0u64;
@@ -242,6 +253,9 @@ impl ObjectCheckpointStore {
                 }
                 parent = p.parent();
             }
+            if matches!(validation, CacheValidation::Metadata) {
+                continue;
+            }
             let mut file = match tokio::fs::File::open(&p).await {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -252,12 +266,11 @@ impl ObjectCheckpointStore {
             let mut digest = Sha256::new();
             let mut buf = vec![0; 256 * 1024];
             loop {
-                if let Some(pin) = idle {
+                if let CacheValidation::Idle(pin) = validation {
                     if pin.strong_count() != 1 {
                         return Ok(None);
                     }
-                    // Two idle workers share at most 32 MB/s. Restore validation
-                    // is unthrottled and never waits for this background work.
+                    // Two idle workers share at most 32 MB/s.
                     tokio::time::sleep_until(
                         started + std::time::Duration::from_micros(checked / 16),
                     )
@@ -496,6 +509,7 @@ impl CheckpointAccess for ObjectCheckpointStore {
                 manifest: manifest.clone(),
                 staged: true,
                 committed: false,
+                invalid: false,
                 used: 0,
             };
             if let Err(error) = self.write_index(&id, &record).await {
@@ -517,14 +531,10 @@ impl CheckpointAccess for ObjectCheckpointStore {
         }
         self.validate(artifact)?;
         let _operation = self.operation(&artifact.location).await;
-        let _materialization = self
-            .materialization
-            .acquire()
-            .await
-            .map_err(|error| Error::Unavailable(error.to_string()))?;
         if let Some((files, record)) = self.cached(artifact).await? {
             if Self::validate_manifest(&record.manifest, artifact).is_ok()
-                && Self::valid_cached(&files, &record.manifest, None).await? == Some(true)
+                && Self::valid_cached(&files, &record.manifest, CacheValidation::Metadata).await?
+                    == Some(true)
             {
                 return Ok(files);
             }
@@ -537,6 +547,7 @@ impl CheckpointAccess for ObjectCheckpointStore {
                 self.discard_cached(&artifact.location).await?;
             }
         }
+        let _materialization = self.materialization_slot().await?;
         let manifest = self.manifest(artifact).await?;
         let path = self.cache_root.join(&artifact.location);
         // Failed/canceled downloads are never visible as completed cache entries.
@@ -552,6 +563,7 @@ impl CheckpointAccess for ObjectCheckpointStore {
             manifest,
             staged: false,
             committed: true,
+            invalid: false,
             used: 0,
         };
         // Quotas apply when the execution lease is released, not to restoration.

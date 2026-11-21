@@ -2,13 +2,51 @@
 use crate::*;
 use adx_agent_core::activator::{BindingList, BindingPage};
 use adx_agent_core::cache::BoundedCache;
-use adx_agent_core::{limits, AgentBinding, BindingPhase, Scope, TemplateVersion};
+use adx_agent_core::{
+    environment::ExecutionSpec, limits, AgentBinding, BindingPhase, Scope, TemplateDraft,
+    TemplateVersion,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
 
 const TEMPLATE_CACHE_ENTRIES: usize = 1024;
-type TemplateCell = Arc<OnceCell<TemplateVersion>>;
+const EXECUTION_IMAGE_FIELD: &str = "execution_image";
+type TemplateCell = Arc<OnceCell<PublishedTemplate>>;
+
+/// A validated template draft ready for version allocation.
+pub struct PreparedTemplate<'a> {
+    tenant: &'a str,
+    template: TemplateVersion,
+}
+impl<'a> PreparedTemplate<'a> {
+    pub fn new(tenant: &'a str, draft: &TemplateDraft) -> Result<Self> {
+        adx_agent_core::identifier(tenant, "tenant").map_err(Error::Invalid)?;
+        let template = draft.with_version("1".into());
+        template.validate().map_err(Error::Invalid)?;
+        Ok(Self { tenant, template })
+    }
+
+    pub fn template(&self) -> &TemplateVersion {
+        &self.template
+    }
+}
+
+/// Immutable template metadata used by the Activator to construct an execution.
+#[derive(Clone)]
+pub struct PublishedTemplate {
+    pub template: TemplateVersion,
+    execution_image: Option<String>,
+}
+impl PublishedTemplate {
+    pub fn execution(&self) -> ExecutionSpec {
+        let mut execution = ExecutionSpec::from(&self.template);
+        if let Some(image) = &self.execution_image {
+            execution.image.clone_from(image);
+        }
+        execution
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct PageCursor {
@@ -56,14 +94,22 @@ impl AgentState {
     /// Atomically publish a snapshot and advance its tenant/template sequence.
     /// An ambiguous commit is returned without replay; existing storage requires an
     /// explicitly initialized sequence, never an automatic legacy-data migration.
-    pub async fn publish(
+    pub async fn publish(&self, tenant: &str, draft: &TemplateDraft) -> Result<TemplateVersion> {
+        self.publish_prepared(PreparedTemplate::new(tenant, draft)?, None)
+            .await
+    }
+
+    /// Allocate a version and commit its public template and private execution image together.
+    pub async fn publish_prepared(
         &self,
-        tenant: &str,
-        draft: &adx_agent_core::TemplateDraft,
+        prepared: PreparedTemplate<'_>,
+        execution_image: Option<&str>,
     ) -> Result<TemplateVersion> {
-        adx_agent_core::identifier(tenant, "tenant").map_err(Error::Invalid)?;
-        draft.validate().map_err(Error::Invalid)?;
-        let sequence_key = Key::new("template-sequence", &[tenant, &draft.name])?;
+        let PreparedTemplate {
+            tenant,
+            mut template,
+        } = prepared;
+        let sequence_key = Key::new("template-sequence", &[tenant, &template.name])?;
         for _ in 0..limits::CAS_ATTEMPTS {
             let previous = self.store.get(&sequence_key).await?;
             let last = previous
@@ -74,9 +120,16 @@ impl AgentState {
             let next = last
                 .checked_add(1)
                 .ok_or_else(|| Error::Conflict("template version sequence exhausted".into()))?;
-            let template = draft.with_version(next.to_string());
+            template.version = next.to_string();
             let key = Key::new("template", &[tenant, &template.name, &template.version])?;
             let expected = previous.as_ref().map(|record| record.revision.clone());
+            let mut publication = put(&key, &template)?;
+            if let Some(image) = execution_image {
+                let fields = publication.record.value.as_object_mut().ok_or_else(|| {
+                    Error::Invalid("template version must serialize as an object".into())
+                })?;
+                fields.insert(EXECUTION_IMAGE_FIELD.into(), Value::String(image.into()));
+            }
             if self
                 .store
                 .commit(&Transaction::new(
@@ -90,7 +143,7 @@ impl AgentState {
                             expected: None,
                         },
                     ],
-                    vec![put(&sequence_key, &next)?, put(&key, &template)?],
+                    vec![put(&sequence_key, &next)?, publication],
                 )?)
                 .await?
             {
@@ -111,6 +164,17 @@ impl AgentState {
         name: &str,
         version: &str,
     ) -> Result<Option<TemplateVersion>> {
+        Ok(self
+            .published_template(tenant, name, version)
+            .await?
+            .map(|published| published.template))
+    }
+    pub async fn published_template(
+        &self,
+        tenant: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<PublishedTemplate>> {
         adx_agent_core::version_number(version).map_err(Error::Invalid)?;
         let key = Key::new("template", &[tenant, name, version])?;
         let cell = {
@@ -128,8 +192,17 @@ impl AgentState {
         // empty, so a later publication or recovered repository can be observed immediately.
         match cell
             .get_or_try_init(|| async {
-                let record = self.store.get(&key).await.map_err(Some)?;
-                record.ok_or(None)?.decode().map_err(Some)
+                let mut record = self.store.get(&key).await.map_err(Some)?.ok_or(None)?;
+                let image = record
+                    .value
+                    .as_object_mut()
+                    .and_then(|fields| fields.remove(EXECUTION_IMAGE_FIELD))
+                    .unwrap_or(Value::Null);
+                Ok(PublishedTemplate {
+                    template: record.decode().map_err(Some)?,
+                    execution_image: serde_json::from_value(image)
+                        .map_err(|error| Some(Error::Corrupt(error.to_string())))?,
+                })
             })
             .await
         {
