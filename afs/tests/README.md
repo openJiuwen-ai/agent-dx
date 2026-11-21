@@ -644,9 +644,9 @@ python3 afs/tests/run.py run --suite bench-dfs --allow-performance --env /absolu
 ### DFS reader FD有界回归
 
 `dfs.resources.reader_fd_budget`位于`suites/dfs/test_resources.py`，测试步骤在
-`suites/dfs/fd_budget.py`，只读FD分类工具在`tools/fd_inventory.py`。复用既有
-singlevm的Meta＋A/B进程、真实FUSE及正常卸载／退出协议；同架构固定组件包、
-合格Linux VM、Python3.10+、root权限和原运行条件不变，不需要SDK或K8s。
+`suites/dfs/fd_budget.py`，只读FD分类工具在`tools/fd_inventory.py`。下方的单 VM
+复现方式复用 `singlevm` 的 Meta 和 A/B 进程、真实 FUSE 及正常卸载和退出协议。
+该方式使用同架构固定组件包、合格 Linux VM、Python 3.10+ 和 root 权限。
 
 ```sh
 python3 afs/tests/run.py run --case dfs.resources.reader_fd_budget \
@@ -664,7 +664,7 @@ python3 afs/tests/run.py run --case dfs.resources.reader_fd_budget \
 失败不自动重试；验收断言使用显式错误，Python `-O`也不能绕过读取计数检查。
 工具单测不能替代Linux真实运行。
 
-本例是定向组件回归，本轮不加入`local-basic`、`all-basic`、`ci-full`或默认CI冒烟。
+本例已登记在 `ci-full` 清单，随 Kubernetes 功能 Full 执行。定向复现仍可用上面的 `--case` 或 `--suite local-resources`。
 它验证关闭负载检查点的封顶、淘汰和复用；不证明SDK一小时、在途并发上界、
 所有泄漏路径或性能。公共正式长稳FD合同另见
 [one-hour-v3](../../build/e2e/soak-contracts/one-hour-v3.json)。
