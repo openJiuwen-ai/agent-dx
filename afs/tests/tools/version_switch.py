@@ -9,7 +9,7 @@ import uuid
 
 from fixtures.common import Blocked, Case, sha256, write_json
 from fixtures.multivm import Cluster, validate
-from suites.operations import wait_read
+from suites.operations import namespace, old_fd, permissions, wait_read
 
 SEED = b"old build: confirmed before switch\n" * 8192
 AFTER = b"new build: written after switch\n" * 8192
@@ -128,12 +128,42 @@ def run_phase(result, name, operation):
         result[name] = {"status": "passed"}
 
 
-def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases):
+def exercise_posix(cluster, phase):
+    def verify(name, assertion):
+        try:
+            assertion(cluster)
+        except (AssertionError, RuntimeError) as exc:
+            raise AssertionError(f'{phase}: POSIX {name} failed: {exc}') from exc
+        cluster.record(f'posix.{phase}.{name}', 'passed')
+
+    verify('namespace-rename-truncate', namespace)
+    verify('permissions', permissions)
+    verify('renamed-unlinked-live-fd', old_fd)
+    for name in ('old', 'renamed', 'private', 'setid'):
+        cluster.python(
+            "A", "from pathlib import Path;Path(sys.argv[1]).unlink(missing_ok=True)",
+            remote_join(cluster.workspace("A"), name), owner=False,
+        )
+    for operation in ("rename", "unlink"):
+        cluster.python(
+            "B",
+            "from pathlib import Path\np=Path(sys.argv[1])\n"
+            "for entry in ('ready','go','done'): (p/entry).unlink()\np.rmdir()",
+            remote_join(cluster.role_dir("B"), "run", 'holder-' + operation),
+            owner=False,
+        )
+
+
+def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, posix=False):
     cluster.write("A", "seed", SEED)
     cluster.python("A", "os.chmod(sys.argv[1],0o640)", remote_join(cluster.workspace("A"), "seed"))
     wait_read(cluster, "B", "seed", SEED)
     expected = file_state(cluster)
     location = owner_identity(cluster) if cluster.mode == "ownerfs" else None
+    if posix:
+        run_phase(phases, "old_posix", lambda: exercise_posix(cluster, "old"))
+        if phases["old_posix"]["status"] != "passed":
+            return
     quiesce(cluster)
     recovery_point(cluster)
 
@@ -143,6 +173,8 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases):
         check_seed(cluster, expected, location)
         cluster.write("B", "after-upgrade", AFTER)
         wait_read(cluster, "A", "after-upgrade", AFTER)
+        if posix:
+            exercise_posix(cluster, "new")
 
     def rollback():
         quiesce(cluster)
@@ -159,6 +191,8 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases):
         cluster.record("post_snapshot_file_absent", value["returncode"] == 0)
         cluster.write("B", "after-rollback", SEED)
         wait_read(cluster, "A", "after-rollback", SEED)
+        if posix:
+            exercise_posix(cluster, "rollback")
 
     run_phase(phases, "upgrade", upgrade)
     run_phase(phases, "rollback", rollback)
@@ -223,12 +257,12 @@ def retained_command(cluster, new_inputs, new, phases):
     run_phase(phases, "root_command_after_upgrade", verify_after_upgrade)
 
 
-def exercise(config, old_inputs, new_inputs, output):
+def exercise(config, old_inputs, new_inputs, output, posix=False):
     """Run all scenarios, retaining an independent result and cleanup per fixture."""
     output.mkdir()
     identities = [json.loads((inputs / "artifact-identity.json").read_text()) for inputs in (old_inputs, new_inputs)]
     old, new = identities
-    if old["commit"] == new["commit"] or old["target"] != new["target"]:
+    if (old["commit"] == new["commit"] and not posix) or old["target"] != new["target"]:
         raise ValueError("expected distinct commits of the same target")
     for inputs, identity in zip((old_inputs, new_inputs), identities):
         for binary in ("afs-meta", "afs-node"):
@@ -237,8 +271,9 @@ def exercise(config, old_inputs, new_inputs, output):
     write_json(output / "versions.json", {"old": old, "new": new})
     entries = []
     cleanup_errors = []
-    for mode, suffix in (("ownerfs", "upgrade_rollback"), ("dfs", "upgrade_rollback"),
-                         ("ownerfs", "old_root_command")):
+    cases = (("ownerfs", "posix"), ("dfs", "posix")) if posix else (
+        ("ownerfs", "upgrade_rollback"), ("dfs", "upgrade_rollback"), ("ownerfs", "old_root_command"))
+    for mode, suffix in cases:
         case = Case(f"{mode}.version.{suffix}", (), mode, (), None, observe_cache=(mode == "dfs"))
         case_output = output / case.id
         case_output.mkdir()
@@ -256,7 +291,7 @@ def exercise(config, old_inputs, new_inputs, output):
             if suffix == "old_root_command":
                 retained_command(cluster, new_inputs, new, result["phases"])
             else:
-                exercise_switch(cluster, old_inputs, new_inputs, old, new, result["phases"])
+                exercise_switch(cluster, old_inputs, new_inputs, old, new, result["phases"], posix)
             if all(phase["status"] == "passed" for phase in result["phases"].values()):
                 result["status"] = "passed"
         except (InterruptedError, TimeoutError):

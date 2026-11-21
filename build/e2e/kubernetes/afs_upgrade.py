@@ -16,6 +16,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 BUILD_ENV = 'AFS_E2E_BASELINE_BUILD'
 COMMIT_ENV = 'AFS_E2E_BASELINE_COMMIT'
+POSIX_ENV = 'AFS_E2E_VERSION_POSIX'
 TARGET = 'afs-component-upgrade-rollback'
 BASELINE_POD = 'afs-baseline-input'
 
@@ -61,10 +62,14 @@ def scenarios(component, checks):
     from manifest import LABEL
 
     run = component.run
+    posix_value = os.getenv(POSIX_ENV, '0')
+    if posix_value not in {'0', '1'}:
+        raise ValueError(POSIX_ENV + ' must be 0 or 1')
+    posix = posix_value == '1'
     with run.case(TARGET, checks) as record, tempfile.TemporaryDirectory(prefix='afs-upgrade-') as temp:
         inputs = Path(temp)
         baseline, registry, old = download_baseline(inputs)
-        if old['target'] != component.package['target'] or old['commit'] == component.package['commit']:
+        if old['target'] != component.package['target'] or (old['commit'] == component.package['commit'] and not posix):
             raise ValueError('upgrade requires two different AFS commits of the same target')
         image = registry['references']['node']
         pod = {
@@ -111,7 +116,7 @@ def scenarios(component, checks):
             version_switch = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(version_switch)
             signal.signal(signal.SIGALRM, _timeout)
-            entries, cleanup_errors = version_switch.exercise(component.config, old_inputs, new_inputs, output)
+            entries, cleanup_errors = version_switch.exercise(component.config, old_inputs, new_inputs, output, posix)
         finally:
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
@@ -125,7 +130,8 @@ def scenarios(component, checks):
              'phases': entry['phases']}
             for entry in entries
         ]
-        if len(entries) != 3 or cleanup_errors or any(item['status'] != 'passed' for item in entries):
+        required_count = 2 if posix else 3
+        if len(entries) != required_count or cleanup_errors or any(item['status'] != 'passed' for item in entries):
             raise ValueError('AFS upgrade/rollback assertions failed; see afs/result.json and per-case logs')
 
 
