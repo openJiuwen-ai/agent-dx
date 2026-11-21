@@ -391,11 +391,11 @@ impl pb::snapshot_service_server::SnapshotService for Service {
         Err(Status::unimplemented("fixture only resolves snapshots"))
     }
 
-    async fn protect_snapshot(
+    async fn update_snapshot_reference(
         &self,
-        _: tonic::Request<pb::ProtectSnapshotRequest>,
+        _: tonic::Request<pb::UpdateSnapshotReferenceRequest>,
     ) -> Result<tonic::Response<pb::ReusableSnapshot>, tonic::Status> {
-        Err(tonic::Status::unimplemented("snapshot protection"))
+        Err(tonic::Status::unimplemented("snapshot reference update"))
     }
 
     async fn delete_snapshot(

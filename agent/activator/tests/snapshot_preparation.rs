@@ -74,9 +74,10 @@ struct Platform {
     calls: Mutex<Vec<PreparationCall>>,
     replies: Mutex<VecDeque<Result<SeedResult, EnvironmentError>>>,
     creations: Mutex<Vec<CreateEnvironment>>,
-    protections: Mutex<Vec<(String, String, bool)>>,
+    references: Mutex<Vec<SnapshotChange>>,
+    retired: AtomicBool,
     unavailable: AtomicBool,
-    pending_protection: AtomicBool,
+    unknown_reference_response: AtomicBool,
     block_creation: AtomicBool,
 }
 
@@ -98,23 +99,35 @@ impl Environment for Platform {
             .pop_front()
             .unwrap_or(Ok(SeedResult::Pending))
     }
-    async fn agent_snapshot_protection(
+    async fn snapshot_revision(&self, _: &str, _: &str) -> Result<u64, EnvironmentError> {
+        Ok(1)
+    }
+    async fn update_snapshot_reference(
         &self,
         tenant: &str,
-        id: &str,
-        proof: &str,
-        retire: bool,
+        _: &str,
+        change: &SnapshotChange,
     ) -> Result<(), EnvironmentError> {
         assert_eq!(tenant, "tenant");
-        uuid::Uuid::parse_str(proof).unwrap();
-        self.protections
-            .lock()
-            .await
-            .push((id.into(), proof.into(), retire));
-        if self.pending_protection.load(Ordering::Relaxed) {
-            return Err(EnvironmentError::Unavailable(
-                "lost protection response".into(),
+        self.references.lock().await.push(change.clone());
+        if self.unknown_reference_response.load(Ordering::Relaxed) {
+            return Err(EnvironmentError::OutcomeUnknown(
+                "lost reference response".into(),
             ));
+        }
+        if matches!(change, SnapshotChange::Retire) {
+            self.retired.store(true, Ordering::Relaxed);
+            return Err(EnvironmentError::Conflict(
+                "snapshot retained by Binding".into(),
+            ));
+        }
+        if self.retired.load(Ordering::Relaxed)
+            && matches!(
+                change,
+                SnapshotChange::Acquire { .. } | SnapshotChange::AcquireBinding { .. }
+            )
+        {
+            return Err(EnvironmentError::Conflict("snapshot retiring".into()));
         }
         Ok(())
     }
@@ -328,7 +341,7 @@ async fn publication_and_restart(repo: Arc<dyn Repository>) {
     let first = a.unwrap();
     assert_eq!(first, b.unwrap());
     assert!(platform.creations.lock().await.is_empty());
-    assert!(platform.protections.lock().await.is_empty());
+    assert!(platform.references.lock().await.is_empty());
     assert_eq!(first.version, "1");
     assert_eq!(
         first.snapshot_preparation,
@@ -754,7 +767,9 @@ async fn automatic_golden_is_protected_before_backfill_and_used_without_product_
     let second = scope("second", reference.clone());
     let third = scope("third", reference.clone());
 
-    platform.pending_protection.store(true, Ordering::Relaxed);
+    platform
+        .unknown_reference_response
+        .store(true, Ordering::Relaxed);
     for _ in 0..2 {
         platform
             .replies
@@ -776,7 +791,9 @@ async fn automatic_golden_is_protected_before_backfill_and_used_without_product_
     let cold = activate(&activator, &first, "w-first").await;
     assert!(cold.current.snapshot_id.is_none());
 
-    platform.pending_protection.store(false, Ordering::Relaxed);
+    platform
+        .unknown_reference_response
+        .store(false, Ordering::Relaxed);
     activator.reconcile_snapshot_preparations().await.unwrap();
     let restored = activate(&activator, &second, "w-second").await;
     assert_eq!(
@@ -799,10 +816,16 @@ async fn automatic_golden_is_protected_before_backfill_and_used_without_product_
     assert_eq!(activate(&activator, &second, "w-second").await, restored);
 
     let prepared = platform.calls.lock().await;
-    assert_eq!(prepared[0], prepared[1]);
+    assert_eq!(
+        prepared.len(),
+        1,
+        "Catalog retry uses the persisted preparation result"
+    );
     let seed = &prepared[0].2;
-    let proofs = platform.protections.lock().await;
-    assert_eq!(proofs.len(), 2);
+    let proofs = platform.references.lock().await;
+    assert!(
+        matches!(&proofs[0], SnapshotChange::Acquire { owner:SnapshotOwner::Template {name, version} } if name == "digitalmate" && version == "1")
+    );
     assert_eq!(proofs[0], proofs[1]);
     let created = platform.creations.lock().await;
     for (binding, workspace) in [(&restored, "w-second"), (&another, "w-third")] {
@@ -884,6 +907,17 @@ async fn alias_upgrade_uses_the_selected_versions_golden_and_keeps_the_workspace
     assert_eq!(after.current.snapshot_id.as_deref(), Some("snapshot-ready"));
     assert_eq!(after.current.version, "2");
     assert_eq!(after.current, candidate);
+    assert!(platform
+        .references
+        .lock()
+        .await
+        .contains(&SnapshotChange::AcquireBinding {
+            revision: 1,
+            owner: SnapshotOwner::Binding {
+                binding_id: scope.binding_id.clone(),
+                environment_id: candidate.environment_id.clone()
+            }
+        }));
     let creations = platform.creations.lock().await;
     assert_eq!(creations[1].execution, creations[2].execution);
     assert_eq!(creations[1].id, creations[2].id);
@@ -891,4 +925,63 @@ async fn alias_upgrade_uses_the_selected_versions_golden_and_keeps_the_workspace
         creations[2].execution.snapshot_id,
         after.current.snapshot_id
     );
+}
+
+#[tokio::test]
+async fn unknown_owner_response_replays_the_persisted_allocation_before_environment_create() {
+    let platform = Arc::new(Platform::default());
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let worker = Activator::new(state.clone(), platform.clone());
+    worker.publish("tenant", &draft(true)).await.unwrap();
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-ready".into(),
+        }));
+    worker.reconcile_snapshot_preparations().await.unwrap();
+    let subject = scope("retry-owner", TemplateRef::Version("1".into()));
+    platform
+        .unknown_reference_response
+        .store(true, Ordering::Relaxed);
+    assert!(worker
+        .activate_with_parameters(
+            &subject,
+            None,
+            adx_agent_core::unix_time_millis() + 30000,
+            true,
+            Some(b"workspace=w-retry")
+        )
+        .await
+        .is_err());
+    let pending = state.binding(&subject).await.unwrap().unwrap();
+    assert_eq!(
+        pending.current.pending_snapshot_id.as_deref(),
+        Some("snapshot-ready")
+    );
+    assert!(pending.current.snapshot_id.is_none());
+    assert!(platform.creations.lock().await.is_empty());
+    drop(worker);
+    let worker = Activator::new(state.clone(), platform.clone());
+    platform
+        .unknown_reference_response
+        .store(false, Ordering::Relaxed);
+    platform.block_creation.store(true, Ordering::Relaxed);
+    assert!(worker
+        .activate_with_parameters(
+            &subject,
+            None,
+            adx_agent_core::unix_time_millis() + 30000,
+            true,
+            Some(b"workspace=w-retry")
+        )
+        .await
+        .is_err());
+    let fixed = state.binding(&subject).await.unwrap().unwrap();
+    assert_eq!(fixed.current.snapshot_id.as_deref(), Some("snapshot-ready"));
+    assert!(fixed.current.pending_snapshot_id.is_none());
+    assert_eq!(fixed.current.environment_id, pending.current.environment_id);
+    let changes = platform.references.lock().await;
+    assert_eq!(changes[1], changes[2]);
 }

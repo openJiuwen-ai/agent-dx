@@ -8,7 +8,7 @@ service SnapshotService {
   rpc PublishSnapshot(PublishSnapshotRequest) returns (ReusableSnapshot);
   rpc GetSnapshot(GetSnapshotRequest) returns (ReusableSnapshot);
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
-  rpc ProtectSnapshot(ProtectSnapshotRequest) returns (ReusableSnapshot);
+  rpc UpdateSnapshotReference(UpdateSnapshotReferenceRequest) returns (ReusableSnapshot);
   rpc DeleteSnapshot(DeleteSnapshotRequest) returns (ReusableSnapshot);
 }
 
@@ -28,10 +28,16 @@ message SnapshotReference {
   oneof owner {
     string restore_environment_id = 1;
     TemplateReference template = 2;
+    AgentTemplateReference agent_template = 3;
+    AgentBindingReference agent_binding = 4;
   }
 }
 
+message AgentTemplateReference { string name = 1; string version = 2; }
+message AgentBindingReference { string binding_id = 1; string environment_id = 2; }
+
 message ReusableSnapshot {
+  bool agent_retiring = 12;
   string id = 1;
   repeated string names = 2;
   EnvironmentSpec template = 3;
@@ -62,12 +68,22 @@ message ListSnapshotsRequest {
 
 message ListSnapshotsResponse { repeated ReusableSnapshot snapshots = 1; string next_page_token = 2; }
 
-message ProtectSnapshotRequest { string id = 1; CallerContext caller = 2; string agent_token = 3; }
+message UpdateSnapshotReferenceRequest {
+  optional uint64 expected_revision = 7;
+  string id = 1;
+  CallerContext caller = 2;
+  oneof change {
+    SnapshotReference acquire = 3;
+    SnapshotReference release = 4;
+    bool retire_agent_recipe = 5;
+    SnapshotReference cancel_pending = 6;
+  }
+}
 
 message DeleteSnapshotRequest {
   string id = 1;
   CallerContext caller = 2;
-  optional string agent_token = 3;
+  reserved 3;
 }
 
 message CollectSnapshotRequest { ReusableSnapshot snapshot = 1; string node_session_id = 2; bool delegated = 3; }

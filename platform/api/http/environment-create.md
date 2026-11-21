@@ -131,8 +131,8 @@ Local workload entrypoints are supplied through the existing `process` field;
 `inheritEntrypoint=true` is rejected for an explicit Local source. Image metadata
 must be resolved by the caller into `env` and, when needed, `process`.
 
-### Agent Golden 制品保护
+### Agent Golden Catalog references
 
-`PUT /api/environment/v1/snapshot-protections/{snapshotId}` 为租户的 Ready Golden 建立 Catalog 持久保护，JSON 请求为 `{"token":"<Activator durable UUID>"}`。以相同凭据重放是幂等的。保护存在期间，普通 snapshot DELETE 和 E2B 删除入口均遵守 Catalog 冲突。
+The Agent service calls `PUT /api/environment/v1/snapshot-references/{snapshotId}` with its tenant bearer credential and its service identity in `x-adx-agent-authorization`. Standalone Activator and API Server use the same `ADX_ACTIVATOR_SERVICE_TOKEN`. Acquire and release name the template version or the Binding and Environment. Replay an unknown outcome with the original owner. Retirement withdraws template recipes and closes new allocations. A committed Binding keeps its reference until cleanup. When the last reference is released, the Catalog marks the retired snapshot for collection. The Coordinator checks execution and artifact holds before reclaiming the bytes.
 
-`DELETE /api/environment/v1/snapshot-protections/{snapshotId}` 由 Activator 在封住新 Binding 决议并查清已有引用后调用，使用相同的 JSON 凭据。Platform 在其删除条件满足时以同一个 Catalog CAS 消费保护并关闭新恢复。租户运营应使用 Agent 退役入口，凭据由 Activator 保管。
+For a Binding allocation, read the snapshot revision, recheck the pending Binding identity, then send `acquire_binding` with the observed revision. A superseded revision requires a fresh read. Cleanup of an undecided allocation uses `cancel_pending` to fence delayed requests. A definitive unavailable Golden selects cold creation. Transport ambiguity keeps the pending identity for replay.

@@ -13,15 +13,14 @@ use std::{sync::Arc, time::Duration};
 /// authenticates the caller before passing its tenant to this private interface.
 #[async_trait]
 pub trait EnvironmentApplication: Send + Sync {
-    async fn agent_snapshot_protection_request(
+    async fn update_snapshot_reference_request(
         &self,
         _tenant: &str,
         _id: &str,
-        _token: &str,
-        _retire: bool,
+        _change: &adx_agent_core::environment::SnapshotChange,
     ) -> Result<(), EnvironmentError> {
         Err(EnvironmentError::Unsupported(
-            "snapshot protection unavailable".into(),
+            "snapshot reference management unavailable".into(),
         ))
     }
     async fn prepare_snapshot_request(
@@ -108,15 +107,14 @@ impl LocalEnvironment {
 }
 #[async_trait]
 impl Environment for LocalEnvironment {
-    async fn agent_snapshot_protection(
+    async fn update_snapshot_reference(
         &self,
         tenant: &str,
         id: &str,
-        token: &str,
-        retire: bool,
+        change: &adx_agent_core::environment::SnapshotChange,
     ) -> Result<(), EnvironmentError> {
         self.application
-            .agent_snapshot_protection_request(tenant, id, token, retire)
+            .update_snapshot_reference_request(tenant, id, change)
             .await
     }
 
@@ -157,6 +155,15 @@ impl Environment for LocalEnvironment {
         .map_err(|_| {
             EnvironmentError::OutcomeUnknown("snapshot preparation result unknown".into())
         })?
+    }
+    async fn snapshot_revision(&self, tenant: &str, id: &str) -> Result<u64, EnvironmentError> {
+        self.application
+            .snapshot_metadata(tenant, id)
+            .await?
+            .ok_or(EnvironmentError::NotFound)?
+            .get("revision")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| EnvironmentError::Unavailable("snapshot revision unavailable".into()))
     }
     async fn golden_available(
         &self,

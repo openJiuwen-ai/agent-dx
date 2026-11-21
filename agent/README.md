@@ -28,15 +28,15 @@ Agent 模板使用业务镜像的 ENTRYPOINT/CMD、WORKDIR 和 USER，不接受 
 
 `prewarm_recipe` 由服务端回填到 `TemplateVersion`。发布请求中的 `TemplateDraft` 携带该字段时，`POST /api/agent/v2/templates` 返回 HTTP 400。
 
-自动制备任务从发布起最多重试 15 分钟，同一任务重启后沿用原截止时间。制品暂不可见时继续对账，到期或明确不兼容时记录 `failed`，该版本可普通启动。
+自动制备任务从发布起最多等待 15 分钟确认制品，同一任务重启后沿用原截止时间。确认制品后先保存其 ID，再向 Catalog 登记模板版本。登记结果未知时继续对账同一制品，确认登记后才回填配方。
 
 匿名源 Environment 清理确认后释放其专用 Volume owner。快照仍引用卷时保留定义，快照回收后移除无引用定义。Volume 清理不删除外部存储目录中的数据。
 
-首次 Binding 和 Alias 升级候选由 Activator 按实际选中的模板版本决议。只有模板合同摘要匹配、Platform 确认为同租户的就绪 Golden 且仍有退役保护，才在写入新 Environment ID 的同一事务中固定 `snapshot_id`。候选创建沿用 Alias 的旧 Environment 暂停及卷确权规则。快照制备中、失败、不可用或已封住退役时，新分配走普通启动。已有决议在重试中保留版本、Environment ID、用户卷和已选启动方式。恢复用目标身份及目标卷，并注入 `GOLDEN_PHASE=restore`。应用负责识别运行时交接、打开用户数据及接收业务鉴权。自动制备和回填不会修改 Alias 或已有 Binding。
+首次 Binding 和 Alias 升级候选由 Activator 按实际选中的模板版本决议。模板合同摘要匹配且 Platform 确认为同租户的就绪 Golden 时，先将待登记的快照 ID 与新 Environment ID 一起持久化。Activator 用 Binding ID 和 Environment ID 在 Catalog 登记持有，确认后提交启动方式，再请求创建 Environment。登记结果未知时沿用原分配对账。候选创建沿用 Alias 的旧 Environment 暂停及卷确权规则。快照制备中、失败、不可用或已封住退役时，新分配走普通启动。已有决议在重试中保留版本、Environment ID、用户卷和已选启动方式。恢复用目标身份及目标卷，并注入 `GOLDEN_PHASE=restore`。应用负责识别运行时交接、打开用户数据及接收业务鉴权。自动制备和回填不会修改 Alias 或已有 Binding。
 
 DigitalMate 业务入口使用认证主体的稳定 Binding ID 跨模板引用查找已有 Binding。Agent Store 在同一事务中写入主体的 Binding scope 指针与新 Binding，查找使用该指针和当前 scope 的点读。两个 Alias 并发首绑时复用先提交的 Binding 及其启动决议。DigitalMate 首绑以模板版本决定自动 Golden。
 
-`DELETE /api/agent/v2/prewarm-artifacts/{snapshotId}` 先封住新决议，再核对活动和删除中的 Binding 及候选引用。存在引用时返回冲突并保留封锁。清理引用后重试同一请求，Platform 仍会核对运行中引用和制品持有，并以 CAS 消费保护后接受回收。退役的快照需以新的快照 ID 替换。
+`DELETE /api/agent/v2/prewarm-artifacts/{snapshotId}` 由 Catalog 原子撤下该快照的模板版本引用并关闭新登记。已登记的首绑和 Alias 候选仍可用原 Environment ID 恢复。存在持有者时返回冲突；最后一个引用释放后自动进入删除状态，Coordinator 核对执行和制品持有后回收物理制品。退役的快照需以新的快照 ID 替换。
 
 ```json
 {"name":"assistant","image":"registry.example/assistant:v1","isolation_runtime":"runc","env":{"APP_MODE":"production"},"resources":{"cpu_millis":1000,"memory_mib":1024},"service":[{"protocol":"ws","port":8080}]}

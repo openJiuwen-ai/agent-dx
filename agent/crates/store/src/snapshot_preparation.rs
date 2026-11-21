@@ -20,6 +20,9 @@ pub struct PreparationJob {
     pub seed: SeedExecution,
     /// Validated recipe with a placeholder snapshot ID replaced only on success.
     pub recipe: PrewarmRecipe,
+    /// Durable intent before asking Catalog to pin this recipe.
+    #[serde(default)]
+    pub resolved_snapshot: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +55,45 @@ impl AgentState {
             .collect()
     }
 
+    pub async fn reserve_recipe_owner(
+        &self,
+        job: &PreparationJob,
+        snapshot: &str,
+    ) -> Result<PreparationJob> {
+        let key = pending_key(job)?;
+        for _ in 0..adx_agent_core::limits::CAS_ATTEMPTS {
+            let record = self
+                .store
+                .get(&key)
+                .await?
+                .ok_or_else(|| Error::Conflict("preparation already completed".into()))?;
+            let mut saved: PreparationJob = record.decode()?;
+            if saved.id != job.id {
+                return Err(Error::Conflict("preparation changed".into()));
+            }
+            if let Some(id) = &saved.resolved_snapshot {
+                return if id == snapshot {
+                    Ok(saved)
+                } else {
+                    Err(Error::Conflict(
+                        "preparation produced another snapshot".into(),
+                    ))
+                };
+            }
+            saved.resolved_snapshot = Some(snapshot.into());
+            if self
+                .store
+                .commit(&Transaction::new(
+                    vec![check(&key, &record)],
+                    vec![put(&key, &saved)?],
+                )?)
+                .await?
+            {
+                return Ok(saved);
+            }
+        }
+        Err(Error::Conflict("preparation contention".into()))
+    }
     pub async fn finish_preparation(
         &self,
         job: &PreparationJob,
@@ -61,7 +103,10 @@ impl AgentState {
         let Some(record) = self.store.get(&pending).await? else {
             return Ok(());
         };
-        if record.decode::<PreparationJob>()?.id != job.id {
+        let current: PreparationJob = record.decode()?;
+        if current.id != job.id
+            || (result.is_err() && current.resolved_snapshot != job.resolved_snapshot)
+        {
             return Err(Error::Conflict(
                 "snapshot preparation identity changed".into(),
             ));

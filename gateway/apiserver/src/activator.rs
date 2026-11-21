@@ -10,16 +10,21 @@ use tonic::{Code, Status};
 
 #[async_trait]
 impl EnvironmentApplication for EnvironmentService {
-    async fn agent_snapshot_protection_request(
+    async fn update_snapshot_reference_request(
         &self,
         tenant: &str,
         id: &str,
-        token: &str,
-        retire: bool,
+        change: &adx_agent_core::environment::SnapshotChange,
     ) -> Result<(), EnvironmentError> {
-        self.agent_snapshot_protection(&caller(tenant), id, token.into(), retire)
+        self.update_snapshot_reference(&caller(tenant), id, change)
             .await
-            .map_err(|error| map_status(error, true))
+            .map_err(|error| {
+                if error.code() == Code::NotFound {
+                    EnvironmentError::NotFound
+                } else {
+                    map_status(error, true)
+                }
+            })
     }
 
     async fn prepare_snapshot_request(

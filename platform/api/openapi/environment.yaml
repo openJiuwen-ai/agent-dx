@@ -510,28 +510,75 @@ paths:
           $ref: "#/components/responses/Error"
         default:
           $ref: "#/components/responses/Error"
-  /api/environment/v1/snapshot-protections/{snapshotId}:
-    parameters:
-      - name: snapshotId
-        in: path
-        required: true
-        schema: {type: string}
+  /api/environment/v1/snapshot-references/{snapshotId}:
     put:
       tags: [Snapshots]
-      operationId: protectAgentGolden
-      summary: Acquire durable protection for a ready Golden
-      requestBody: {$ref: "#/components/requestBodies/AgentSnapshotProof"}
+      operationId: updateAgentSnapshotReference
+      summary: Register or release a Catalog owner or retire a Golden
+      parameters:
+        - {name: snapshotId, in: path, required: true, schema: {type: string}}
+        - {name: x-adx-agent-authorization, in: header, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  additionalProperties: false
+                  required: [operation, owner]
+                  properties:
+                    operation: {type: string, enum: [release]}
+                    owner:
+                      oneOf:
+                        - type: object
+                          additionalProperties: false
+                          required: [kind, name, version]
+                          properties:
+                            kind: {type: string, enum: [template]}
+                            name: {type: string}
+                            version: {type: string}
+                        - type: object
+                          additionalProperties: false
+                          required: [kind, binding_id, environment_id]
+                          properties:
+                            kind: {type: string, enum: [binding]}
+                            binding_id: {type: string}
+                            environment_id: {type: string}
+                - type: object
+                  additionalProperties: false
+                  required: [operation, owner]
+                  properties:
+                    operation: {type: string, enum: [acquire]}
+                    owner:
+                      type: object
+                      additionalProperties: false
+                      required: [kind, name, version]
+                      properties:
+                        kind: {type: string, enum: [template]}
+                        name: {type: string}
+                        version: {type: string}
+                - type: object
+                  required: [operation, owner, revision]
+                  additionalProperties: false
+                  properties:
+                    operation: {type: string, enum: [acquire_binding, cancel_pending]}
+                    revision: {type: integer, format: int64, minimum: 1}
+                    owner:
+                      type: object
+                      required: [kind, binding_id, environment_id]
+                      additionalProperties: false
+                      properties:
+                        kind: {type: string, enum: [binding]}
+                        binding_id: {type: string}
+                        environment_id: {type: string}
+                - type: object
+                  additionalProperties: false
+                  required: [operation]
+                  properties:
+                    operation: {type: string, enum: [retire]}
       responses:
-        "200": {description: Golden protection acquired or already held by this proof}
-        "409": {$ref: "#/components/responses/Error"}
-        default: {$ref: "#/components/responses/Error"}
-    delete:
-      tags: [Snapshots]
-      operationId: retireAgentGolden
-      summary: Consume Agent protection and close the Golden to new restores
-      requestBody: {$ref: "#/components/requestBodies/AgentSnapshotProof"}
-      responses:
-        "200": {description: Retirement accepted}
+        "200": {description: Reference operation applied}
         "409": {$ref: "#/components/responses/Error"}
         default: {$ref: "#/components/responses/Error"}
   /api/environment/v1/snapshot-preparations/{preparationId}:
@@ -688,16 +735,6 @@ paths:
         default:
           $ref: "#/components/responses/Error"
 components:
-  requestBodies:
-    AgentSnapshotProof:
-      required: true
-      content:
-        application/json:
-          schema:
-            type: object
-            required: [token]
-            properties:
-              token: {type: string, format: uuid}
   securitySchemes:
     bearerAuth:
       type: http
@@ -1477,6 +1514,12 @@ components:
       required: [snapshotId, names]
       properties:
         snapshotId: {type: string}
+        revision: {type: integer, format: int64, minimum: 1}
+        kind: {type: string, enum: [regular, golden]}
+        state: {type: string, enum: [ready, deleting, deleted]}
+        createdAt: {type: string, format: date-time}
+        image: {type: string}
+        runtime: {type: string}
         names:
           type: array
           items: {type: string}

@@ -32,6 +32,14 @@ pub enum SnapshotState {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reference {
+    AgentTemplate {
+        name: String,
+        version: String,
+    },
+    AgentBinding {
+        binding_id: String,
+        environment_id: String,
+    },
     Restore {
         environment_id: String,
     },
@@ -43,6 +51,11 @@ pub enum Reference {
 impl Reference {
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::AgentTemplate { name, version } if valid_id(name) && valid_id(version) => Ok(()),
+            Self::AgentBinding {
+                binding_id,
+                environment_id,
+            } if valid_id(binding_id) && valid_id(environment_id) => Ok(()),
             Self::Restore { environment_id } if valid_id(environment_id) => Ok(()),
             Self::Template {
                 node_id,
@@ -51,12 +64,6 @@ impl Reference {
             _ => Err(Error::Invalid("invalid snapshot reference".into())),
         }
     }
-}
-fn agent_token_digest(token: &str) -> Result<String> {
-    if token.len() != 36 || !token.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
-        return Err(Error::Invalid("invalid Agent snapshot proof".into()));
-    }
-    Ok(format!("{:x}", Sha256::digest(token.as_bytes())))
 }
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
@@ -75,9 +82,9 @@ pub struct Snapshot {
     #[serde(default)]
     pub preparation_template_id: Option<String>,
     pub template: EnvironmentSpec,
-    /// Coordinator-only proof digest for the Agent's durable pre-creation protection.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_protection: Option<String>,
+    /// A retired recipe cannot admit new owners. An already committed Binding may still restore.
+    #[serde(default)]
+    pub agent_retiring: bool,
     pub source_node_id: String,
     pub source_runtime_id: String,
     pub artifact: CheckpointArtifact,
@@ -128,7 +135,7 @@ impl Snapshot {
             kind,
             created_at_unix_ms,
             preparation_template_id: None,
-            agent_protection: None,
+            agent_retiring: false,
             template,
             source_node_id,
             source_runtime_id,
@@ -156,14 +163,7 @@ impl Snapshot {
             || self.names.len() > 16
             || self.names.iter().any(|n| !valid_id(n))
             || self.names.iter().collect::<BTreeSet<_>>().len() != self.names.len()
-            || self.agent_protection.as_ref().is_some_and(|digest| {
-                self.kind != SnapshotKind::Golden
-                    || self.state != SnapshotState::Ready
-                    || digest.len() != 64
-                    || !digest
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
+            || (self.agent_retiring && self.kind != SnapshotKind::Golden)
             || (self.state == SnapshotState::Deleted && !self.references.is_empty())
         {
             return Err(Error::Invalid("invalid reusable snapshot".into()));
@@ -209,8 +209,37 @@ impl Snapshot {
         if self.state != SnapshotState::Ready {
             return Err(Error::Conflict);
         }
+        if self.agent_retiring {
+            match &reference {
+                Reference::Restore { environment_id } if self.references.iter().any(|owner|
+                    matches!(owner, Reference::AgentBinding { environment_id: pinned, .. } if pinned == environment_id)) => {}
+                _ => return Err(Error::Conflict),
+            }
+        }
+        if matches!(
+            &reference,
+            Reference::AgentTemplate { .. } | Reference::AgentBinding { .. }
+        ) && self.kind != SnapshotKind::Golden
+        {
+            return Err(Error::Conflict);
+        }
         self.advance()?;
         self.references.insert(reference);
+        Ok(())
+    }
+    /// Invalidate any in-flight acquire that observed the revision before its Binding
+    /// entered deletion, including a request that has not reached Catalog yet.
+    pub fn cancel_pending(&mut self, reference: &Reference, revision: u64) -> Result<()> {
+        reference.validate()?;
+        if !matches!(reference, Reference::AgentBinding { .. }) {
+            return Err(Error::Invalid("pending Binding owner required".into()));
+        }
+        if self.references.contains(reference) {
+            return self.release(reference);
+        }
+        if self.revision == revision && self.state == SnapshotState::Ready {
+            self.advance()?;
+        }
         Ok(())
     }
     pub fn release(&mut self, reference: &Reference) -> Result<()> {
@@ -218,42 +247,33 @@ impl Snapshot {
         if self.references.contains(reference) {
             self.advance()?;
             self.references.remove(reference);
+            self.schedule_retired_collection();
         }
         Ok(())
     }
-    pub fn protect_for_agent(&mut self, tenant: &str, token: &str) -> Result<()> {
+    /// Atomically withdraw every recipe for this Golden and close new Agent allocations.
+    /// Returns a conflict for regular snapshots. Existing Binding owners remain until released.
+    pub fn begin_agent_retirement(&mut self, tenant: &str) -> Result<()> {
         self.authorize(tenant)?;
-        let digest = agent_token_digest(token)?;
-        if self.kind != SnapshotKind::Golden || self.state != SnapshotState::Ready {
+        if self.kind != SnapshotKind::Golden {
             return Err(Error::Conflict);
         }
-        match &self.agent_protection {
-            Some(existing) if *existing == digest => Ok(()),
-            Some(_) => Err(Error::Conflict),
-            None => {
-                self.advance()?;
-                self.agent_protection = Some(digest);
-                Ok(())
-            }
+        if self.state == SnapshotState::Ready && !self.agent_retiring {
+            self.advance()?;
+            self.agent_retiring = true;
+            self.references
+                .retain(|owner| !matches!(owner, Reference::AgentTemplate { .. }));
+        }
+        self.schedule_retired_collection();
+        Ok(())
+    }
+    fn schedule_retired_collection(&mut self) {
+        if self.agent_retiring && self.state == SnapshotState::Ready && self.references.is_empty() {
+            self.state = SnapshotState::Deleting;
         }
     }
     pub fn delete(&mut self, tenant: &str) -> Result<()> {
-        self.retire(tenant, None)
-    }
-    /// Close the catalog to new restores in the same CAS that consumes Agent protection.
-    pub fn retire(&mut self, tenant: &str, token: Option<&str>) -> Result<()> {
         self.authorize(tenant)?;
-        let supplied = token.map(agent_token_digest).transpose()?;
-        if supplied.is_some() && self.kind != SnapshotKind::Golden {
-            return Err(Error::Invalid(
-                "Agent retirement requires a Golden snapshot".into(),
-            ));
-        }
-        if let Some(digest) = &self.agent_protection {
-            if supplied.as_ref() != Some(digest) {
-                return Err(Error::SnapshotAgentProtected);
-            }
-        }
         if self.state == SnapshotState::Ready {
             if !self.references.is_empty() {
                 return Err(Error::SnapshotInUse {
@@ -261,7 +281,10 @@ impl Snapshot {
                         .references
                         .iter()
                         .filter_map(|r| match r {
-                            Reference::Restore { environment_id } => Some(environment_id.clone()),
+                            Reference::Restore { environment_id }
+                            | Reference::AgentBinding { environment_id, .. } => {
+                                Some(environment_id.clone())
+                            }
                             _ => None,
                         })
                         .collect(),
@@ -273,6 +296,9 @@ impl Snapshot {
                                 node_id,
                                 template_id,
                             } => Some(format!("{node_id}/{template_id}")),
+                            Reference::AgentTemplate { name, version } => {
+                                Some(format!("{name}@{version}"))
+                            }
                             _ => None,
                         })
                         .collect(),
@@ -280,7 +306,6 @@ impl Snapshot {
             }
             self.advance()?;
             self.state = SnapshotState::Deleting;
-            self.agent_protection = None;
         }
         Ok(())
     }

@@ -182,17 +182,43 @@ pub struct EnvironmentInfo {
     pub environment_ip: Option<String>,
     pub execution: Option<ExecutionSpec>,
 }
+/// The Agent service owns template recipes and the Environment identities reserved by Bindings.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SnapshotOwner {
+    Template {
+        name: String,
+        version: String,
+    },
+    Binding {
+        binding_id: String,
+        environment_id: String,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SnapshotChange {
+    Acquire { owner: SnapshotOwner },
+    AcquireBinding { owner: SnapshotOwner, revision: u64 },
+    CancelPending { owner: SnapshotOwner, revision: u64 },
+    Release { owner: SnapshotOwner },
+    Retire,
+}
 #[async_trait]
 pub trait Environment: Send + Sync {
-    async fn agent_snapshot_protection(
+    async fn snapshot_revision(&self, _tenant: &str, _id: &str) -> Result<u64, EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "snapshot revision unavailable".into(),
+        ))
+    }
+    async fn update_snapshot_reference(
         &self,
         _tenant: &str,
         _snapshot_id: &str,
-        _token: &str,
-        _retire: bool,
+        _change: &SnapshotChange,
     ) -> Result<(), EnvironmentError> {
         Err(EnvironmentError::Unsupported(
-            "snapshot protection unavailable".into(),
+            "snapshot reference management unavailable".into(),
         ))
     }
     fn freeze_preparation(

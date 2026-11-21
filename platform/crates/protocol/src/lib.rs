@@ -412,10 +412,6 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
             tonic::Code::FailedPrecondition, "snapshot is in use",
             serde_json::json!({"code":"SNAPSHOT_IN_USE", "sandbox_ids":sandbox_ids, "template_ids":template_ids}).to_string().into_bytes().into(),
         ),
-        Error::SnapshotAgentProtected => tonic::Status::with_details(
-            tonic::Code::FailedPrecondition, "snapshot is protected by an Agent reference",
-            serde_json::json!({"code":"SNAPSHOT_IN_USE"}).to_string().into_bytes().into(),
-        ),
         Error::BackendFailure { code, message } => {
             let mut status = tonic::Status::new(backend_wire_code(code), message);
             status.metadata_mut().insert(

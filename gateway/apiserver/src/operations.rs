@@ -601,7 +601,7 @@ pub fn snapshot_value(
         .and_then(DateTime::<Utc>::from_timestamp_millis)
         .ok_or_else(|| Status::data_loss("invalid snapshot creation time"))?;
     Ok(json!({
-        "snapshotId": s.id, "names": s.names, "kind": kind, "state": state,
+        "revision":s.revision, "snapshotId": s.id, "names": s.names, "kind": kind, "state": state,
         "createdAt": created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
         "image": spec.image, "runtime": spec.runtime_class
     }))
@@ -662,7 +662,7 @@ mod tests {
         assert_eq!(
             snapshot_value(&snapshot, &caller).unwrap(),
             json!({
-                "snapshotId":"snapshot", "names":["base"], "kind":"golden", "state":"ready",
+                "revision":0, "snapshotId":"snapshot", "names":["base"], "kind":"golden", "state":"ready",
                 "createdAt":"2024-10-27T03:33:20.123Z", "image":"image", "runtime":"firecracker"
             })
         );

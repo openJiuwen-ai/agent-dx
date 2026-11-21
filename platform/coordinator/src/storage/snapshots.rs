@@ -166,7 +166,7 @@ impl Session {
         if record.state != SnapshotState::Ready
             || record.revision != 1
             || !record.references.is_empty()
-            || record.agent_protection.is_some()
+            || record.agent_retiring
         {
             return Err(Error::Invalid(
                 "new snapshot must be ready and unreferenced".into(),
@@ -324,6 +324,36 @@ impl Session {
         self.mutate_snapshot(id, |s| s.acquire(tenant, reference.clone()))
             .await
     }
+    pub async fn acquire_agent_binding(
+        &self,
+        id: &str,
+        tenant: &str,
+        owner: Reference,
+        revision: u64,
+    ) -> Result<Snapshot> {
+        self.mutate_snapshot(id, |s| {
+            if s.revision != revision
+                && !s.references.contains(&owner)
+                && !s.agent_retiring
+                && s.state == SnapshotState::Ready
+            {
+                return Err(Error::Unavailable(
+                    "snapshot revision changed; reread allocation".into(),
+                ));
+            }
+            s.acquire(tenant, owner.clone())
+        })
+        .await
+    }
+    pub async fn cancel_pending_binding(
+        &self,
+        id: &str,
+        owner: Reference,
+        revision: u64,
+    ) -> Result<Snapshot> {
+        self.mutate_snapshot(id, |s| s.cancel_pending(&owner, revision))
+            .await
+    }
     pub async fn release_snapshot(&self, id: &str, reference: Reference) -> Result<Snapshot> {
         self.mutate_snapshot(id, |s| s.release(&reference)).await
     }
@@ -395,22 +425,8 @@ impl Session {
     pub async fn delete_snapshot(&self, id: &str, tenant: &str) -> Result<Snapshot> {
         self.mutate_snapshot(id, |s| s.delete(tenant)).await
     }
-    pub async fn protect_agent_snapshot(
-        &self,
-        id: &str,
-        tenant: &str,
-        token: &str,
-    ) -> Result<Snapshot> {
-        self.mutate_snapshot(id, |s| s.protect_for_agent(tenant, token))
-            .await
-    }
-    pub async fn retire_agent_snapshot(
-        &self,
-        id: &str,
-        tenant: &str,
-        token: &str,
-    ) -> Result<Snapshot> {
-        self.mutate_snapshot(id, |s| s.retire(tenant, Some(token)))
+    pub async fn begin_agent_retirement(&self, id: &str, tenant: &str) -> Result<Snapshot> {
+        self.mutate_snapshot(id, |s| s.begin_agent_retirement(tenant))
             .await
     }
     /// Call only after the storage backend confirms physical deletion.

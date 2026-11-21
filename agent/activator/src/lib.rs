@@ -9,7 +9,8 @@ pub mod server;
 pub mod snapshot_preparation;
 pub mod transport;
 use adx_agent_core::environment::{
-    Environment, EnvironmentError, EnvironmentObservation, EnvironmentPhase,
+    Environment, EnvironmentError, EnvironmentObservation, EnvironmentPhase, SnapshotChange,
+    SnapshotOwner,
 };
 pub use adx_agent_core::error::{Error, Result};
 use adx_agent_core::{
@@ -191,6 +192,7 @@ impl Activator {
                     .map(|(version, snapshot)| (version.as_str(), snapshot.as_deref())),
             )
             .await?;
+        let binding = self.settle_snapshot(binding, true).await?;
         if binding.phase == BindingPhase::Deleting {
             self.delete_binding(scope).await?;
             return Ok(true);
@@ -370,14 +372,72 @@ impl Activator {
             .await
             .map_err(Into::into)
     }
-    async fn protect_golden(&self, tenant: &str, snapshot: &str) -> Result<bool> {
-        let Some(proof) = self.state.snapshot_protection(tenant, snapshot).await? else {
-            return Ok(false);
+    async fn settle_snapshot(
+        &self,
+        binding: AgentBinding,
+        candidate: bool,
+    ) -> Result<AgentBinding> {
+        let target = if candidate {
+            binding
+                .secondary
+                .as_ref()
+                .filter(|s| s.intent == SecondaryIntent::Preparing)
+                .map(|s| &s.environment)
+        } else {
+            Some(&binding.current)
         };
-        self.environment
-            .agent_snapshot_protection(tenant, snapshot, &proof, false)
-            .await?;
-        Ok(true)
+        let Some((target, snapshot)) =
+            target.and_then(|r| r.pending_snapshot_id.as_deref().map(|id| (r, id)))
+        else {
+            return Ok(binding);
+        };
+        if binding.phase != BindingPhase::Active {
+            return Ok(binding);
+        }
+        let revision = match self
+            .environment
+            .snapshot_revision(&binding.scope.tenant, snapshot)
+            .await
+        {
+            Ok(revision) => revision,
+            Err(EnvironmentError::NotFound) => {
+                return self
+                    .state
+                    .finish_snapshot_decision(&binding, &target.environment_id, snapshot, false)
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !self.reference_is_active(&binding, target).await? {
+            return Err(Error::Conflict(
+                "allocation changed before Catalog admission".into(),
+            ));
+        }
+        let change = SnapshotChange::AcquireBinding {
+            revision,
+            owner: Self::snapshot_owner(&binding, target),
+        };
+        let acquired = match self
+            .environment
+            .update_snapshot_reference(&binding.scope.tenant, snapshot, &change)
+            .await
+        {
+            Ok(()) => true,
+            Err(EnvironmentError::Conflict(_) | EnvironmentError::NotFound) => false,
+            Err(error) => return Err(error.into()),
+        };
+        self.state
+            .finish_snapshot_decision(&binding, &target.environment_id, snapshot, acquired)
+            .await
+            .map_err(Into::into)
+    }
+
+    fn snapshot_owner(binding: &AgentBinding, environment: &EnvironmentRef) -> SnapshotOwner {
+        SnapshotOwner::Binding {
+            binding_id: binding.scope.binding_id.clone(),
+            environment_id: environment.environment_id.clone(),
+        }
     }
 
     async fn select_template_golden(
@@ -435,12 +495,8 @@ impl Activator {
     }
 
     pub async fn retire_golden(&self, tenant: &str, snapshot: &str) -> Result<()> {
-        let proof = self
-            .state
-            .begin_snapshot_retirement(tenant, snapshot)
-            .await?;
         self.environment
-            .agent_snapshot_protection(tenant, snapshot, &proof, true)
+            .update_snapshot_reference(tenant, snapshot, &SnapshotChange::Retire)
             .await?;
         Ok(())
     }
@@ -709,6 +765,7 @@ impl Activator {
                     .await?
             }
         };
+        let binding = self.settle_snapshot(binding, false).await?;
         let scope = &binding.scope;
         if expected_generation.is_some_and(|generation| generation != binding.generation) {
             return Err(Error::Conflict(
@@ -836,6 +893,35 @@ impl Activator {
         self.environment
             .release_volumes(&binding.scope.tenant, &environment.environment_id)
             .await?;
+        if let Some(snapshot) = environment
+            .snapshot_id
+            .as_ref()
+            .or(environment.pending_snapshot_id.as_ref())
+        {
+            let owner = Self::snapshot_owner(binding, environment);
+            let change = if environment.pending_snapshot_id.is_some() {
+                let revision = match self
+                    .environment
+                    .snapshot_revision(&binding.scope.tenant, snapshot)
+                    .await
+                {
+                    Ok(revision) => revision,
+                    Err(EnvironmentError::NotFound) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                };
+                SnapshotChange::CancelPending { owner, revision }
+            } else {
+                SnapshotChange::Release { owner }
+            };
+            match self
+                .environment
+                .update_snapshot_reference(&binding.scope.tenant, snapshot, &change)
+                .await
+            {
+                Ok(()) | Err(EnvironmentError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         Ok(())
     }
 }

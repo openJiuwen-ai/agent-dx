@@ -426,9 +426,9 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
             .await
     }
 
-    async fn protect_snapshot(
+    async fn update_snapshot_reference(
         &self,
-        request: Request<pb::ProtectSnapshotRequest>,
+        request: Request<pb::UpdateSnapshotReferenceRequest>,
     ) -> std::result::Result<Response<pb::ReusableSnapshot>, Status> {
         if self.0.peers.authenticate(&request)? != Principal::ApiServer {
             return Err(Status::permission_denied("Frontend identity required"));
@@ -440,11 +440,71 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
         drop(state);
         let snapshot = session.get_snapshot(&r.id).await.map_err(status)?;
         tenant(r.caller.as_ref(), &snapshot.template.tenant_id)?;
-        let protected = session
-            .protect_agent_snapshot(&r.id, &snapshot.template.tenant_id, &r.agent_token)
-            .await
-            .map_err(status)?;
-        Ok(Response::new(protected.try_into().map_err(status)?))
+        use pb::update_snapshot_reference_request::Change;
+        let owner = |r: pb::SnapshotReference| match r.owner {
+            Some(pb::snapshot_reference::Owner::AgentTemplate(t)) => {
+                Ok(adx_core::snapshots::Reference::AgentTemplate {
+                    name: t.name,
+                    version: t.version,
+                })
+            }
+            Some(pb::snapshot_reference::Owner::AgentBinding(b)) => {
+                Ok(adx_core::snapshots::Reference::AgentBinding {
+                    binding_id: b.binding_id,
+                    environment_id: b.environment_id,
+                })
+            }
+            _ => Err(Error::Invalid("Agent owner required".into())),
+        };
+        let tenant_id = &snapshot.template.tenant_id;
+        let revision = r.expected_revision;
+        let updated = match r.change {
+            Some(Change::Acquire(r)) => {
+                let owner = owner(r).map_err(status)?;
+                if matches!(owner, adx_core::snapshots::Reference::AgentBinding { .. }) {
+                    session
+                        .acquire_agent_binding(
+                            &snapshot.id,
+                            tenant_id,
+                            owner,
+                            revision.ok_or_else(|| {
+                                Status::invalid_argument(
+                                    "Binding acquisition requires snapshot revision",
+                                )
+                            })?,
+                        )
+                        .await
+                } else {
+                    session
+                        .acquire_snapshot(&snapshot.id, tenant_id, owner)
+                        .await
+                }
+            }
+            Some(Change::CancelPending(r)) => {
+                session
+                    .cancel_pending_binding(
+                        &snapshot.id,
+                        owner(r).map_err(status)?,
+                        revision.ok_or_else(|| {
+                            Status::invalid_argument("pending cancellation requires revision")
+                        })?,
+                    )
+                    .await
+            }
+            Some(Change::Release(r)) => {
+                session
+                    .release_snapshot(&snapshot.id, owner(r).map_err(status)?)
+                    .await
+            }
+            Some(Change::RetireAgentRecipe(true)) => {
+                session
+                    .begin_agent_retirement(&snapshot.id, tenant_id)
+                    .await
+            }
+            _ => return Err(Status::invalid_argument("reference change required")),
+        }
+        .map_err(status)?;
+        Ok(Response::new(updated.try_into().map_err(status)?))
     }
 
     async fn delete_snapshot(
@@ -469,8 +529,12 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                 let mut templates = std::collections::BTreeSet::new();
                 for reference in &snapshot.references {
                     match reference {
-                        adx_core::snapshots::Reference::Restore { environment_id } => {
+                        adx_core::snapshots::Reference::Restore { environment_id }
+                        | adx_core::snapshots::Reference::AgentBinding { environment_id, .. } => {
                             users.insert(environment_id.clone());
+                        }
+                        adx_core::snapshots::Reference::AgentTemplate { name, version } => {
+                            templates.insert(format!("{name}@{version}"));
                         }
                         adx_core::snapshots::Reference::Template {
                             node_id,
@@ -505,19 +569,10 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                         template_ids: templates.into_iter().collect(),
                     }));
                 }
-                let deleted = match r.agent_token {
-                    Some(token) => {
-                        session
-                            .retire_agent_snapshot(&r.id, &snapshot.template.tenant_id, &token)
-                            .await
-                    }
-                    None => {
-                        session
-                            .delete_snapshot(&r.id, &snapshot.template.tenant_id)
-                            .await
-                    }
-                }
-                .map_err(status)?;
+                let deleted = session
+                    .delete_snapshot(&r.id, &snapshot.template.tenant_id)
+                    .await
+                    .map_err(status)?;
                 Ok(Response::new(deleted.try_into().map_err(status)?))
             })
             .await

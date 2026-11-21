@@ -74,7 +74,6 @@ impl Key {
                 | "binding-launch"
                 | "alias"
                 | "binding-history"
-                | "snapshot-protection"
                 | "snapshot-preparation"
                 | "snapshot-preparation-result"
                 | "template-publication"

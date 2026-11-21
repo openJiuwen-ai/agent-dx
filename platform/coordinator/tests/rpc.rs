@@ -2576,7 +2576,6 @@ async fn snapshot_rpc_enforces_tenant_and_rejects_busy_deletion() {
     assert_eq!(invalid_environment.code(), tonic::Code::InvalidArgument);
     let error = client
         .delete_snapshot(pb::DeleteSnapshotRequest {
-            agent_token: None,
             id: snapshot.id.clone(),
             caller: caller(),
         })

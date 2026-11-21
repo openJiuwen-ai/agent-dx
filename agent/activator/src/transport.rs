@@ -72,6 +72,52 @@ impl HttpEnvironment {
         })
     }
 
+    async fn snapshot_metadata(&self, tenant: &str, id: &str) -> Result<Value, EnvironmentError> {
+        validate_identity(tenant)?;
+        validate_identity(id)?;
+        let Some(key) = self.api_keys.get(tenant) else {
+            return Err(EnvironmentError::Unavailable(
+                "snapshot metadata unavailable".into(),
+            ));
+        };
+        let invalid = || EnvironmentError::Invalid("invalid snapshot URL".into());
+        let mut url = self
+            .base
+            .join("/api/environment/v1/snapshots")
+            .map_err(|_| invalid())?;
+        url.path_segments_mut().map_err(|_| invalid())?.push(id);
+        let unavailable = || EnvironmentError::Unavailable("snapshot metadata unavailable".into());
+        let mut response = self
+            .client
+            .get(url)
+            .bearer_auth(key)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(EnvironmentError::NotFound);
+        }
+        if !response.status().is_success() {
+            return Err(unavailable());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
+            if chunk.len() > limits::HTTP_JSON_BYTES.saturating_sub(body.len()) {
+                return Err(unavailable());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&body).map_err(|_| unavailable())?;
+        let data = value.get("data").unwrap_or(&value);
+        if let Some(encoded) = data.as_str() {
+            let decoded = STANDARD.decode(encoded).map_err(|_| unavailable())?;
+            let data: Value = serde_json::from_slice(&decoded).map_err(|_| unavailable())?;
+            return Ok(data);
+        }
+        Ok(data.clone())
+    }
+
     async fn volume_request(
         &self,
         tenant: &str,
@@ -410,33 +456,41 @@ impl HttpEnvironment {
 }
 #[async_trait]
 impl Environment for HttpEnvironment {
-    async fn agent_snapshot_protection(
+    async fn update_snapshot_reference(
         &self,
         tenant: &str,
         id: &str,
-        token: &str,
-        retire: bool,
+        change: &adx_agent_core::environment::SnapshotChange,
     ) -> Result<(), EnvironmentError> {
         validate_identity(id)?;
         let key = self.api_keys.get(tenant).ok_or_else(|| {
             EnvironmentError::Invalid("Platform tenant credential is not configured".into())
         })?;
-        let invalid = || EnvironmentError::Invalid("invalid snapshot protection URL".into());
+        let invalid = || EnvironmentError::Invalid("invalid snapshot reference URL".into());
         let mut url = self
             .base
-            .join("/api/environment/v1/snapshot-protections/")
+            .join("/api/environment/v1/snapshot-references/")
             .map_err(|_| invalid())?;
         url.path_segments_mut()
             .map_err(|_| invalid())?
             .pop_if_empty()
             .push(id);
         let unknown =
-            || EnvironmentError::OutcomeUnknown("snapshot protection result unknown".into());
+            || EnvironmentError::OutcomeUnknown("snapshot reference outcome unknown".into());
         let response = self
             .client
-            .request(if retire { Method::DELETE } else { Method::PUT }, url)
+            .put(url)
+            .header(
+                "x-adx-agent-authorization",
+                format!(
+                    "Bearer {}",
+                    std::env::var("ADX_ACTIVATOR_SERVICE_TOKEN").map_err(|_| {
+                        EnvironmentError::Invalid("Activator service identity required".into())
+                    })?
+                ),
+            )
             .bearer_auth(key)
-            .json(&json!({"token":token}))
+            .json(change)
             .send()
             .await
             .map_err(|_| unknown())?;
@@ -447,7 +501,7 @@ impl Environment for HttpEnvironment {
                 "snapshot in use or protection changed".into(),
             )),
             StatusCode::BAD_REQUEST => Err(EnvironmentError::Invalid(
-                "invalid snapshot protection request".into(),
+                "invalid snapshot reference request".into(),
             )),
             _ => Err(unknown()),
         }
@@ -528,6 +582,13 @@ impl Environment for HttpEnvironment {
         let decoded = STANDARD.decode(data).map_err(|_| unknown())?;
         serde_json::from_slice(&decoded).map_err(|_| unknown())
     }
+    async fn snapshot_revision(&self, tenant: &str, id: &str) -> Result<u64, EnvironmentError> {
+        self.snapshot_metadata(tenant, id)
+            .await?
+            .get("revision")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| EnvironmentError::Unavailable("snapshot revision unavailable".into()))
+    }
     async fn golden_available(
         &self,
         tenant: &str,
@@ -535,46 +596,12 @@ impl Environment for HttpEnvironment {
         image: &str,
         runtime: &str,
     ) -> Result<bool, EnvironmentError> {
-        validate_identity(tenant)?;
-        validate_identity(id)?;
-        let Some(key) = self.api_keys.get(tenant) else {
-            return Err(EnvironmentError::Unavailable(
-                "snapshot metadata unavailable".into(),
-            ));
-        };
-        let invalid = || EnvironmentError::Invalid("invalid snapshot URL".into());
-        let mut url = self
-            .base
-            .join("/api/environment/v1/snapshots")
-            .map_err(|_| invalid())?;
-        url.path_segments_mut().map_err(|_| invalid())?.push(id);
-        let unavailable = || EnvironmentError::Unavailable("snapshot metadata unavailable".into());
-        let mut response = self
-            .client
-            .get(url)
-            .bearer_auth(key)
-            .timeout(self.timeout)
-            .send()
-            .await
-            .map_err(|_| unavailable())?;
-        if !response.status().is_success() {
-            return Err(unavailable());
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
-            if chunk.len() > limits::HTTP_JSON_BYTES.saturating_sub(body.len()) {
-                return Err(unavailable());
-            }
-            body.extend_from_slice(&chunk);
-        }
-        let value: Value = serde_json::from_slice(&body).map_err(|_| unavailable())?;
-        let data = value.get("data").unwrap_or(&value);
-        if let Some(encoded) = data.as_str() {
-            let decoded = STANDARD.decode(encoded).map_err(|_| unavailable())?;
-            let data: Value = serde_json::from_slice(&decoded).map_err(|_| unavailable())?;
-            return environment_request::check_golden(&data, id, image, runtime);
-        }
-        environment_request::check_golden(data, id, image, runtime)
+        environment_request::check_golden(
+            &self.snapshot_metadata(tenant, id).await?,
+            id,
+            image,
+            runtime,
+        )
     }
     async fn ensure_volume(
         &self,

@@ -34,8 +34,6 @@ pub enum Error {
         sandbox_ids: Vec<String>,
         template_ids: Vec<String>,
     },
-    #[error("snapshot is protected by an Agent reference")]
-    SnapshotAgentProtected,
     #[error("insufficient resources or node admission closed")]
     NoCapacity,
     #[error("waiting for Volume {0}")]

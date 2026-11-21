@@ -334,52 +334,77 @@ async fn committed_snapshot_changes_update_inspection_cache() {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
-async fn agent_golden_protection_survives_restart_until_matching_retirement() {
+async fn agent_owners_survive_restart_and_race_retirement() {
     use adx_core::{snapshots::SnapshotKind, Error};
     let mut rig = common::Redis::new().await;
     let store = rig.store().await;
-    let old = store.begin(1).await.unwrap();
+    let first = store.begin(1).await.unwrap();
     let mut golden = snapshot();
     golden.kind = SnapshotKind::Golden;
     let id = &golden.id;
-    let proof = uuid::Uuid::new_v4().to_string();
-    old.publish_snapshot(golden.clone()).await.unwrap();
-    old.protect_agent_snapshot(id, "tenant", &proof)
+    let binding = Reference::AgentBinding {
+        binding_id: "binding".into(),
+        environment_id: "uncreated".into(),
+    };
+    first.publish_snapshot(golden.clone()).await.unwrap();
+    let cancelled = Reference::AgentBinding {
+        binding_id: "another".into(),
+        environment_id: "cancelled".into(),
+    };
+    let observed = first.get_snapshot(id).await.unwrap().revision;
+    first
+        .cancel_pending_binding(id, cancelled.clone(), observed)
+        .await
+        .unwrap();
+    assert!(matches!(
+        first
+            .acquire_agent_binding(id, "tenant", cancelled, observed)
+            .await,
+        Err(Error::Unavailable(_))
+    ));
+    let revision = first.get_snapshot(id).await.unwrap().revision;
+    let registered = first
+        .acquire_agent_binding(id, "tenant", binding.clone(), revision)
         .await
         .unwrap();
     rig.crash();
     rig.start().await;
     let current = rig.store().await.begin(1).await.unwrap();
+    let retry = current
+        .acquire_agent_binding(id, "tenant", binding.clone(), revision)
+        .await
+        .unwrap();
+    assert_eq!(registered.revision, retry.revision);
     assert!(matches!(
         current.delete_snapshot(id, "tenant").await,
-        Err(Error::SnapshotAgentProtected)
-    ));
-    assert!(matches!(
-        current
-            .retire_agent_snapshot(id, "tenant", &uuid::Uuid::new_v4().to_string())
-            .await,
-        Err(Error::SnapshotAgentProtected)
-    ));
-    let existing = Reference::Restore {
-        environment_id: "target".into(),
-    };
-    current
-        .acquire_snapshot(id, "tenant", existing.clone())
-        .await
-        .unwrap();
-    assert!(matches!(
-        current.retire_agent_snapshot(id, "tenant", &proof).await,
         Err(Error::SnapshotInUse { .. })
     ));
-    current.release_snapshot(id, existing).await.unwrap();
-    let retired = current
-        .retire_agent_snapshot(id, "tenant", &proof)
-        .await
-        .unwrap();
-    assert_eq!(retired.state, SnapshotState::Deleting);
-    assert!(retired.agent_protection.is_none());
-    assert!(current
-        .protect_agent_snapshot(id, "tenant", &proof)
-        .await
-        .is_err());
+    let candidate = Reference::AgentBinding {
+        binding_id: "binding".into(),
+        environment_id: "candidate".into(),
+    };
+    let (acquired, retired) = tokio::join!(
+        current.acquire_agent_binding(id, "tenant", candidate.clone(), registered.revision),
+        current.begin_agent_retirement(id, "tenant")
+    );
+    retired.unwrap();
+    let held = current.get_snapshot(id).await.unwrap();
+    assert!(held.agent_retiring);
+    assert_eq!(held.references.contains(&candidate), acquired.is_ok());
+    if let Err(error) = acquired {
+        assert!(matches!(error, Error::Conflict));
+    }
+    current.release_snapshot(id, candidate).await.unwrap();
+    current.release_snapshot(id, binding.clone()).await.unwrap();
+    current.release_snapshot(id, binding).await.unwrap();
+    let deleted = current.get_snapshot(id).await.unwrap();
+    assert!(deleted.collectable());
+    assert_eq!(
+        current
+            .finish_snapshot_deletion(id, deleted.revision)
+            .await
+            .unwrap()
+            .state,
+        SnapshotState::Deleted
+    );
 }

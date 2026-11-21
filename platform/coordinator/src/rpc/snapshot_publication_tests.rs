@@ -201,7 +201,6 @@ async fn slow_snapshot_publication_does_not_block_a_live_heartbeat() {
                 "delete" => {
                     let _ = rpc
                         .delete_snapshot(api_request(pb::DeleteSnapshotRequest {
-                            agent_token: None,
                             id: "publication".into(),
                             caller,
                         }))
@@ -412,4 +411,61 @@ async fn snapshot_artifact_ownership_tracks_committed_deletion() {
         second.id,
         "Deleted must release ownership"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated real Redis"]
+async fn last_agent_owner_release_collects_retired_golden_bytes() {
+    use adx_checkpoint_storage::reclaim::{ObjectReclaimer, Reclaimers};
+    use adx_core::snapshots::{Reference, SnapshotKind, SnapshotState};
+    use object_store::{memory::InMemory, path::Path, ObjectStoreExt};
+
+    let (_redis, rpc, session, mut golden, _report) = fixture().await;
+    let backend = Arc::new(InMemory::new());
+    let mut reclaimers = Reclaimers::default();
+    reclaimers
+        .insert(Arc::new(
+            ObjectReclaimer::new_scoped(
+                "shared".into(),
+                "scope".into(),
+                backend.clone(),
+                "test".into(),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    let rpc = rpc.with_reclaimers(reclaimers);
+    golden.kind = SnapshotKind::Golden;
+    golden.artifact.location = uuid::Uuid::new_v4().to_string();
+    let bytes = Path::from(format!("test/{}/memory", golden.artifact.location));
+    backend
+        .put(&bytes, bytes::Bytes::from_static(b"x").into())
+        .await
+        .unwrap();
+    let saved = session.publish_snapshot(golden).await.unwrap();
+    let owner = Reference::AgentBinding {
+        binding_id: "binding".into(),
+        environment_id: "pending".into(),
+    };
+    session
+        .acquire_agent_binding(&saved.id, "tenant", owner.clone(), saved.revision)
+        .await
+        .unwrap();
+    session
+        .begin_agent_retirement(&saved.id, "tenant")
+        .await
+        .unwrap();
+    assert_eq!(rpc.collect_snapshots().await.unwrap(), 0);
+    backend.head(&bytes).await.unwrap();
+    session.release_snapshot(&saved.id, owner).await.unwrap();
+    assert_eq!(rpc.collect_snapshots().await.unwrap(), 1);
+    assert!(matches!(
+        backend.head(&bytes).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    assert_eq!(
+        session.get_snapshot(&saved.id).await.unwrap().state,
+        SnapshotState::Deleted
+    );
+    assert_eq!(rpc.collect_snapshots().await.unwrap(), 0);
 }

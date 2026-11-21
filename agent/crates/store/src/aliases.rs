@@ -163,9 +163,9 @@ impl AgentState {
                                 "candidate needs a current template startup decision".into(),
                             )
                         })?;
-                        environment.snapshot_id = self
-                            .select_snapshot(&scope.tenant, recipe, checked, &mut checks)
-                            .await?;
+                        environment.pending_snapshot_id = checked
+                            .filter(|id| *id == recipe.snapshot_id)
+                            .map(str::to_owned);
                     }
                     binding.secondary = Some(SecondaryEnv {
                         environment,

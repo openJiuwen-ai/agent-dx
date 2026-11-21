@@ -463,9 +463,9 @@ impl AgentState {
         let mut extra_puts = Vec::new();
         let template_golden = adx_agent_core::prewarm::template_golden(&template);
         if let Some(recipe) = template_golden {
-            current.snapshot_id = self
-                .select_snapshot(&scope.tenant, recipe, checked_snapshot, &mut extra_checks)
-                .await?;
+            current.pending_snapshot_id = checked_snapshot
+                .filter(|id| *id == recipe.snapshot_id)
+                .map(str::to_owned);
         }
         let history_empty = previous_history
             .as_ref()

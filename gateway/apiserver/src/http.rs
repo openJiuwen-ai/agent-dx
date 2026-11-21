@@ -290,19 +290,28 @@ impl Api {
             };
             return response(result, &request_id, None, None, method == "DELETE");
         }
-        if let Some(id) = path.strip_prefix("/api/environment/v1/snapshot-protections/") {
+        if let Some(id) = path.strip_prefix("/api/environment/v1/snapshot-references/") {
             let result = async {
-                if !matches!(method.as_str(), "PUT" | "DELETE") {
+                if method != "PUT" {
                     return Err(Status::unimplemented(
-                        "unsupported snapshot protection method",
+                        "unsupported snapshot reference method",
                     ));
                 }
-                let input = body(request.into_body(), 4096).await?;
-                let token = input.get("token").and_then(Value::as_str).ok_or_else(|| {
-                    Status::invalid_argument("snapshot protection proof required")
-                })?;
+                let authorized = std::env::var("ADX_ACTIVATOR_SERVICE_TOKEN")
+                    .ok()
+                    .and_then(|token| adx_agent_core::transport::ServiceAuth::new(&token).ok())
+                    .is_some_and(|auth| {
+                        auth.accepts(header(&request, "x-adx-agent-authorization"))
+                    });
+                if !authorized {
+                    return Err(Status::permission_denied(
+                        "Activator service identity required",
+                    ));
+                }
+                let change = serde_json::from_value(body(request.into_body(), 4096).await?)
+                    .map_err(|_| Status::invalid_argument("invalid snapshot reference change"))?;
                 self.environment_service
-                    .agent_snapshot_protection(&caller, id, token.into(), method == "DELETE")
+                    .update_snapshot_reference(&caller, id, &change)
                     .await?;
                 Ok(json!({}))
             }
@@ -699,7 +708,6 @@ impl Api {
                     .rpc(
                         "apiserver.delete_snapshot",
                         client.delete_snapshot(trace::inject(pb::DeleteSnapshotRequest {
-                            agent_token: None,
                             id: id.into(),
                             caller: Some(caller.clone()),
                         })),

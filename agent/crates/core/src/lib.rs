@@ -469,6 +469,9 @@ pub struct CreationAttempt {
 pub struct EnvironmentRef {
     pub version: String,
     pub environment_id: String,
+    /// Durable allocation intent until Catalog acknowledges this exact owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_snapshot_id: Option<String>,
     /// Fixed by the first committed start decision. Later lifecycle moves default to cold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
@@ -478,6 +481,7 @@ impl EnvironmentRef {
         Self {
             version,
             environment_id,
+            pending_snapshot_id: None,
             snapshot_id: None,
         }
     }

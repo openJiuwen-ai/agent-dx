@@ -813,7 +813,6 @@ async fn delete_snapshot(api: &Api, id: &str, caller: &pb::CallerContext) -> Res
         .rpc(
             "apiserver.e2b_delete_snapshot",
             client.delete_snapshot(trace::inject(pb::DeleteSnapshotRequest {
-                agent_token: None,
                 id: id.into(),
                 caller: Some(caller.clone()),
             })),

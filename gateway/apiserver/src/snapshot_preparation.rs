@@ -16,48 +16,93 @@ struct Input {
 }
 
 impl EnvironmentService {
-    pub(crate) async fn agent_snapshot_protection(
+    pub(crate) async fn update_snapshot_reference(
         &self,
         caller: &pb::CallerContext,
         id: &str,
-        token: String,
-        retire: bool,
+        change: &adx_agent_core::environment::SnapshotChange,
     ) -> Result<(), Status> {
-        uuid::Uuid::parse_str(&token)
-            .map_err(|_| Status::invalid_argument("invalid Agent snapshot proof"))?;
+        use adx_agent_core::environment::{SnapshotChange, SnapshotOwner};
+        use pb::{snapshot_reference::Owner, update_snapshot_reference_request::Change};
+        let reference = |owner: &SnapshotOwner| pb::SnapshotReference {
+            owner: Some(match owner {
+                SnapshotOwner::Template { name, version } => {
+                    Owner::AgentTemplate(pb::AgentTemplateReference {
+                        name: name.clone(),
+                        version: version.clone(),
+                    })
+                }
+                SnapshotOwner::Binding {
+                    binding_id,
+                    environment_id,
+                } => Owner::AgentBinding(pb::AgentBindingReference {
+                    binding_id: binding_id.clone(),
+                    environment_id: environment_id.clone(),
+                }),
+            }),
+        };
+        if matches!(
+            change,
+            SnapshotChange::Acquire {
+                owner: SnapshotOwner::Binding { .. }
+            } | SnapshotChange::AcquireBinding {
+                owner: SnapshotOwner::Template { .. },
+                ..
+            } | SnapshotChange::CancelPending {
+                owner: SnapshotOwner::Template { .. },
+                ..
+            }
+        ) {
+            return Err(Status::invalid_argument(
+                "snapshot reference operation and owner disagree",
+            ));
+        }
+        let operation = match change {
+            SnapshotChange::CancelPending { owner, .. } => Change::CancelPending(reference(owner)),
+            SnapshotChange::AcquireBinding { owner, .. } | SnapshotChange::Acquire { owner } => {
+                Change::Acquire(reference(owner))
+            }
+            SnapshotChange::Release { owner } => Change::Release(reference(owner)),
+            SnapshotChange::Retire => Change::RetireAgentRecipe(true),
+        };
         let mut client = pb::snapshot_service_client::SnapshotServiceClient::new(
             self.clients.coordinator().await?,
         );
-        let value = if retire {
+        let result = self
+            .clients
+            .rpc(
+                "apiserver.update_snapshot_reference",
+                client.update_snapshot_reference(trace::inject(
+                    pb::UpdateSnapshotReferenceRequest {
+                        caller: Some(caller.clone()),
+                        id: id.into(),
+                        expected_revision: match change {
+                            SnapshotChange::AcquireBinding { revision, .. }
+                            | SnapshotChange::CancelPending { revision, .. } => Some(*revision),
+                            _ => None,
+                        },
+                        change: Some(operation),
+                    },
+                )),
+            )
+            .await?;
+        if result.id != id {
+            return Err(Status::data_loss("snapshot reference identity mismatch"));
+        }
+        crate::operations::snapshot_value(&result, caller)?;
+        if matches!(change, SnapshotChange::Retire) {
             self.clients
                 .rpc(
-                    "apiserver.retire_agent_snapshot",
+                    "apiserver.delete_snapshot",
                     client.delete_snapshot(trace::inject(pb::DeleteSnapshotRequest {
                         caller: Some(caller.clone()),
                         id: id.into(),
-                        agent_token: Some(token),
                     })),
                 )
-                .await?
-        } else {
-            self.clients
-                .rpc(
-                    "apiserver.protect_agent_snapshot",
-                    client.protect_snapshot(trace::inject(pb::ProtectSnapshotRequest {
-                        caller: Some(caller.clone()),
-                        id: id.into(),
-                        agent_token: token,
-                    })),
-                )
-                .await?
-        };
-        if value.id != id {
-            return Err(Status::data_loss("snapshot protection identity mismatch"));
+                .await?;
         }
-        crate::operations::snapshot_value(&value, caller)?;
         Ok(())
     }
-
     pub(crate) async fn prepare_snapshot(
         &self,
         id: &str,
