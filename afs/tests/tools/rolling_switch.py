@@ -92,11 +92,14 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy, *
     wait_read(cluster, "B", "seed", offline.SEED)
     expected = offline.file_state(cluster)
     identity = offline.owner_identity(cluster) if cluster.mode == "ownerfs" else None
+    if dfs_probe is None:
+        offline.quiesce(cluster)
+        if policy != "preserve":
+            offline.recovery_point(cluster)
+        offline.start_all(cluster, old)
+    # The live DFS lane starts from the still-serving old sessions. It retains
+    # its local data on rollback, so it needs no stopped pre-upgrade snapshot.
     dfs_state = dfs_probe.seed(cluster) if dfs_probe is not None else None
-    offline.quiesce(cluster)
-    if policy != "preserve":
-        offline.recovery_point(cluster)
-    offline.start_all(cluster, old)
     acked = {}
     dfs_acked = {}
     ownerfs_settings = None
