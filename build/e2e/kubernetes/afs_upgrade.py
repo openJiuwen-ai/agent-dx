@@ -62,11 +62,15 @@ def scenarios(component, checks):
 
     scenario = os.getenv('AFS_E2E_UPGRADE_SCENARIO', 'offline')
     rolling_mode = None
-    if scenario in ('rolling-ownerfs', 'rolling-dfs'):
+    live_upgrade = scenario in ('rolling-e2e-ownerfs', 'rolling-e2e-dfs')
+    if live_upgrade:
+        rolling_mode = scenario.removeprefix('rolling-e2e-')
+    elif scenario in ('rolling-ownerfs', 'rolling-dfs'):
         rolling_mode = scenario.removeprefix('rolling-')
     elif scenario not in ('offline', 'rolling', 'rolling-ack'):
         raise ValueError(
-            'AFS_E2E_UPGRADE_SCENARIO must be offline, rolling, rolling-ack, rolling-ownerfs, or rolling-dfs',
+            'AFS_E2E_UPGRADE_SCENARIO must be offline, rolling, rolling-ack, rolling-ownerfs, rolling-dfs, '
+            'rolling-e2e-ownerfs, or rolling-e2e-dfs',
         )
     rolling = scenario != 'offline'
     run = component.run
@@ -122,7 +126,7 @@ def scenarios(component, checks):
             signal.signal(signal.SIGALRM, _timeout)
             entries, cleanup_errors = version_switch.exercise(
                 component.config, old_inputs, new_inputs, output, rolling=rolling, reopen=scenario == 'rolling-ack',
-                rolling_mode=rolling_mode,
+                rolling_mode=rolling_mode, live_upgrade=live_upgrade,
             )
         finally:
             for sig, handler in handlers.items():

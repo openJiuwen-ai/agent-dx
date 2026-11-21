@@ -229,7 +229,8 @@ def offline_cases():
         yield Case(f"{mode}.version.{suffix}", (), mode, (), None, observe_cache=(mode == "dfs")), suffix
 
 
-def exercise(config, old_inputs, new_inputs, output, *, rolling=False, reopen=False, rolling_mode=None):
+def exercise(config, old_inputs, new_inputs, output, *, rolling=False, reopen=False, rolling_mode=None,
+             live_upgrade=False):
     """Run selected scenarios, retaining an independent result and cleanup per fixture."""
     output.mkdir()
     identities = [json.loads((inputs / "artifact-identity.json").read_text()) for inputs in (old_inputs, new_inputs)]
@@ -246,7 +247,7 @@ def exercise(config, old_inputs, new_inputs, output, *, rolling=False, reopen=Fa
     if rolling:
         from tools import rolling_switch
 
-        selected = rolling_switch.cases(reopen=reopen, mode=rolling_mode)
+        selected = rolling_switch.cases(reopen=reopen, mode=rolling_mode, live_upgrade=live_upgrade)
     else:
         selected = offline_cases()
     for case, scenario in selected:
@@ -266,6 +267,7 @@ def exercise(config, old_inputs, new_inputs, output, *, rolling=False, reopen=Fa
             if rolling:
                 rolling_switch.exercise_switch(
                     cluster, old_inputs, new_inputs, old, new, result["phases"], scenario, reopen=reopen,
+                    live_upgrade=live_upgrade,
                 )
             elif scenario == "old_root_command":
                 retained_command(cluster, new_inputs, new, result["phases"])

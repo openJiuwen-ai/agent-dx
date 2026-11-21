@@ -15,7 +15,7 @@ FINAL_BODY = b"committed after version switch\n" * 4096
 ORDER = ("M", "B", "A")
 
 
-def switch_role(cluster, role, inputs, identity, *, reopen):
+def switch_role(cluster, role, inputs, identity, *, reopen, while_stopped=None):
     peer = "A" if role == "B" else "B"
     suffix = role.lower()
     helper = "rollout-" + suffix
@@ -33,6 +33,8 @@ def switch_role(cluster, role, inputs, identity, *, reopen):
     issued = cluster.await_helper_signal(helper, "issued", timeout=10)
     if issued["fd"] != opened["fd"]:
         raise AssertionError(f"{role}: peer closed or reopened held FD during switch")
+    if while_stopped is not None:
+        while_stopped()
     offline.install(cluster, inputs, identity, roles=(role,))
     offline.start_role(cluster, role, identity)
     cluster.helper_signal(helper, "resume", {})
@@ -74,29 +76,57 @@ def assert_absent(cluster, name):
     cluster.record("rollout.snapshot_absent." + name, result["returncode"] == 0)
 
 
-def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy, *, reopen=False):
+def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy, *, reopen=False, live_upgrade=False):
+    dfs_probe = None
+    ownerfs_probe = None
+    if live_upgrade and policy != "snapshot":
+        if cluster.mode == "dfs":
+            from tools import rolling_dfs_recovery
+
+            dfs_probe = rolling_dfs_recovery
+        else:
+            from tools import rolling_ownerfs_mixed
+
+            ownerfs_probe = rolling_ownerfs_mixed
     cluster.write("A", "seed", offline.SEED)
     wait_read(cluster, "B", "seed", offline.SEED)
     expected = offline.file_state(cluster)
     identity = offline.owner_identity(cluster) if cluster.mode == "ownerfs" else None
+    dfs_state = dfs_probe.seed(cluster) if dfs_probe is not None else None
     offline.quiesce(cluster)
-    if policy == "snapshot":
+    if policy != "preserve":
         offline.recovery_point(cluster)
     offline.start_all(cluster, old)
     acked = {}
+    dfs_acked = {}
+    ownerfs_settings = None
+
+    def stopped_b():
+        nonlocal ownerfs_settings
+        if dfs_probe is not None:
+            dfs_acked.update(dfs_probe.write_while_offline(cluster, dfs_state))
+        elif ownerfs_probe is not None:
+            ownerfs_settings = ownerfs_probe.prepare_adoption(cluster)
 
     def roll():
         for index, role in enumerate(ORDER):
-            acked.update(switch_role(cluster, role, new_inputs, new, reopen=reopen))
+            hook = stopped_b if role == "B" and (dfs_probe is not None or ownerfs_probe is not None) else None
+            acked.update(switch_role(cluster, role, new_inputs, new, reopen=reopen, while_stopped=hook))
             done = ORDER[:index + 1]
             cluster.record("rollout.checkpoint." + role,
                            {r: new["commit"] if r in done else old["commit"] for r in cluster.roles})
+            if role == "B" and dfs_probe is not None:
+                dfs_probe.verify_recovered(cluster, dfs_state, {r: new if r in done else old for r in cluster.roles})
+                cluster.record("rollout.dfs_recovered_replica", "passed")
+            if role == "B" and ownerfs_probe is not None:
+                ownerfs_probe.check_mixed_workspace(cluster, ownerfs_settings)
+                cluster.record("rollout.ownerfs_mixed_workspace", "passed")
             if policy == "snapshot":
                 break
         final_name = SNAPSHOT_FINAL_NAME if policy == "snapshot" else FINAL_NAME
         cluster.write("A", final_name, FINAL_BODY)
         acked[final_name] = FINAL_BODY
-        verify_acked(cluster, acked, "before-rollback")
+        verify_acked(cluster, {**acked, **dfs_acked}, "before-rollback")
 
     phase = "interrupt_after_meta" if policy == "snapshot" else "complete_rolling"
     offline.run_phase(phases, phase, roll)
@@ -107,30 +137,40 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy, *
             cluster.record("helper.stop." + helper, stopped)
             del cluster.helpers[helper]
         offline.quiesce(cluster)
-        if policy == "snapshot":
+        if ownerfs_settings is not None:
+            ownerfs_probe.restore_settings(cluster, ownerfs_settings)
+        if policy != "preserve":
             offline.recovery_point(cluster, restore=True)
         offline.install(cluster, old_inputs, old)
         offline.start_all(cluster, old)
         offline.check_seed(cluster, expected, identity)
-        if policy == "snapshot":
+        if policy != "preserve":
             for name in acked:
                 assert_absent(cluster, name)
+            if ownerfs_settings is not None:
+                ownerfs_probe.check_snapshot_restored(cluster, ownerfs_settings)
         else:
-            verify_acked(cluster, acked, "rollback-preserve")
+            verify_acked(cluster, {**acked, **dfs_acked}, "rollback-preserve")
         cluster.write("A", "rollout-post-rollback", offline.SEED)
         wait_read(cluster, "B", "rollout-post-rollback", offline.SEED)
 
     if policy == "preserve" and phases[phase]["status"] != "passed":
         phases["rollback_preserve"] = {"status": "not_run", "error": "rolling upgrade did not pass"}
         return
-    offline.run_phase(phases, "rollback_" + policy, rollback)
+    offline.run_phase(phases, "rollback_preserve" if policy == "preserve" else "rollback_snapshot", rollback)
 
 
-def cases(*, reopen=False, mode=None):
+def cases(*, reopen=False, mode=None, live_upgrade=False):
     lane = "rolling_ack" if reopen else "rolling"
+    if live_upgrade:
+        lane = "rolling_e2e"
     modes = ("ownerfs", "dfs") if mode is None else (mode,)
     for selected in modes:
-        profile = DfsProfile(copies=2, replica_failure="strict") if selected == "dfs" else None
-        for policy in ("snapshot", "preserve"):
+        completed_policy = "full_snapshot" if live_upgrade and selected == "ownerfs" else "preserve"
+        for policy in ("snapshot", completed_policy):
+            profile = None
+            if selected == "dfs":
+                replica_failure = "degrade" if live_upgrade and policy == "preserve" else "strict"
+                profile = DfsProfile(copies=2, replica_failure=replica_failure)
             case = Case(f"{selected}.version.{lane}_{policy}", (), selected, (), None, profile=profile)
             yield case, policy
