@@ -191,6 +191,17 @@ impl AgentApi {
             ));
         }
         let managed = &self.managed;
+        if let ["prewarm-artifacts", snapshot] = path.as_slice() {
+            if parts.method != http::Method::DELETE {
+                return Err(Error::NotFound);
+            }
+            let request = adx_agent_core::prewarm::GoldenRetirement {
+                tenant: tenant.into(),
+                snapshot_id: segment(snapshot)?,
+            };
+            managed.retire_golden(ctx, &request).await?;
+            return Ok(serde_json::json!({}));
+        }
         if path == ["templates"] && parts.method == http::Method::POST {
             let input: adx_agent_core::TemplateDraft = decode_body(body).await?;
 
@@ -256,7 +267,7 @@ impl AgentApi {
         if rest.is_empty() && parts.method == http::Method::GET {
             return match &template_ref {
                 adx_agent_core::TemplateRef::Version(version) => Ok(
-                    serde_json::json!({"template":managed.template(ctx, tenant,&name,version).await?}),
+                    serde_json::json!({"template":managed.template_view(ctx, tenant,&name,version).await?}),
                 ),
                 adx_agent_core::TemplateRef::Alias(alias) => Ok(
                     serde_json::json!({"alias":managed.alias_config(ctx,tenant,&name,alias).await?}),

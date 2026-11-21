@@ -21,6 +21,9 @@ pub struct ActivationRequest {
     /// Raw form-encoded initialization. Parsed only when this Binding is absent.
     #[serde(default)]
     pub parameters: Option<Vec<u8>>,
+    /// From a trusted business gateway, never from the public Binding resolve body.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reuse_subject_binding: bool,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +79,8 @@ pub struct TemplateRequest {
 pub struct PublishRequest {
     pub tenant: String,
     pub template: crate::TemplateDraft,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_id: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -41,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.activator.egress_isolation.clone(),
     )?);
     let (activator, store) = settings.activator.connect(environment).await?;
+    activator.start_snapshot_preparations();
     let app = server::router(
         activator.clone(),
         &std::env::var("ADX_ACTIVATOR_SERVICE_TOKEN")?,

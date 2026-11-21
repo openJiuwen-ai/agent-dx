@@ -106,6 +106,15 @@ impl AgentState {
     /// Persist a candidate before Platform side effects, or retire an obsolete candidate.
     /// Retiring references always remain until the caller confirms cleanup.
     pub async fn prepare_binding(&self, scope: &Scope) -> Result<AgentBinding> {
+        self.prepare_binding_with_snapshot(scope, None).await
+    }
+
+    /// Prepare a candidate using the exact desired version and optional validated Golden.
+    pub async fn prepare_binding_with_snapshot(
+        &self,
+        scope: &Scope,
+        decision: Option<(&str, Option<&str>)>,
+    ) -> Result<AgentBinding> {
         let key = binding_key(scope)?;
         for _ in 0..adx_agent_core::limits::CAS_ATTEMPTS {
             let record = self
@@ -118,6 +127,8 @@ impl AgentState {
                 return Ok(binding);
             }
             let (version, alias_check) = self.desired_version(scope).await?;
+            let mut checks = vec![check(&key, &record)];
+            checks.extend(alias_check);
             match &mut binding.secondary {
                 Some(secondary) if secondary.intent == SecondaryIntent::Retiring => {
                     return Ok(binding)
@@ -131,25 +142,37 @@ impl AgentState {
                 Some(secondary) => secondary.intent = SecondaryIntent::Retiring,
                 None if binding.current.version == version => return Ok(binding),
                 None => {
-                    if self
+                    if decision.is_some_and(|(selected, _)| selected != version) {
+                        return Err(Error::Conflict(
+                            "selected template version changed; retry candidate".into(),
+                        ));
+                    }
+                    let template = self
                         .template(&scope.tenant, &scope.template, &version)
                         .await?
-                        .is_none()
-                    {
-                        return Err(Error::Unavailable(format!(
-                            "desired template version {version} does not exist"
-                        )));
-                    }
-                    let environment =
+                        .ok_or_else(|| {
+                            Error::Unavailable(format!(
+                                "desired template version {version} does not exist"
+                            ))
+                        })?;
+                    let mut environment =
                         EnvironmentRef::new(version, format!("adx-{}", uuid::Uuid::new_v4()));
+                    if let Some(recipe) = adx_agent_core::prewarm::template_golden(&template) {
+                        let (_, checked) = decision.ok_or_else(|| {
+                            Error::Conflict(
+                                "candidate needs a current template startup decision".into(),
+                            )
+                        })?;
+                        environment.pending_snapshot_id = checked
+                            .filter(|id| *id == recipe.snapshot_id)
+                            .map(str::to_owned);
+                    }
                     binding.secondary = Some(SecondaryEnv {
                         environment,
                         intent: SecondaryIntent::Preparing,
                     });
                 }
             }
-            let mut checks = vec![check(&key, &record)];
-            checks.extend(alias_check);
             if self
                 .store
                 .commit(&Transaction::new(checks, vec![put(&key, &binding)?])?)

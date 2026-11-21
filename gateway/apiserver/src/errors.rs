@@ -44,6 +44,12 @@ impl<'a> ErrorDetail<'a> {
                 RetryDirective::Never,
                 OperationOutcome::NotStarted,
             )
+        } else if crate::snapshot_preparation::snapshot_admission_stale(status) {
+            (
+                ErrorCode::Unavailable,
+                RetryDirective::SameOperation,
+                OperationOutcome::NotStarted,
+            )
         } else if scheduling_failure.is_some() {
             (
                 ErrorCode::DeadlineExceeded,

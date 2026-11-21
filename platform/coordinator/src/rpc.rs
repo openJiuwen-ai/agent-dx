@@ -1135,7 +1135,8 @@ impl CoordinatorRpc {
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
         let stats = Arc::new(ScheduleStats::default());
         let trace = adx_observability::trace::Trace::child("coordinator.schedule");
-        trace.attribute("environment.id", spec.id.clone());
+        let environment_id = spec.id.clone();
+        trace.attribute("environment.id", environment_id.clone());
         let mut result = trace
             .scope_result(self.create_attempt_inner(
                 spec,
@@ -1160,9 +1161,18 @@ impl CoordinatorRpc {
             trace.attribute("retry.first_error_code", code.clone());
             trace.attribute("retry.first_error_message", message.clone());
         }
-        if let Some(wait_ms) = stats.queue_wait_ms() {
+        let queue_wait_ms = stats.queue_wait_ms();
+        if let Some(wait_ms) = queue_wait_ms {
             trace.attribute("queue.wait_ms", wait_ms.to_string());
         }
+        adx_observability::debug!(
+            event = "environment_schedule_queue",
+            environment_id = %environment_id,
+            queue_wait_ms = %queue_wait_ms.unwrap_or_default(),
+            queued = queue_wait_ms.is_some(),
+            attempts,
+            "Environment create scheduling observed"
+        );
         match &mut result {
             Ok(value) => {
                 trace.attribute("result", "success".into());

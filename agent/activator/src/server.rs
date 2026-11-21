@@ -81,6 +81,7 @@ pub fn router(activator: Arc<Activator>, token: &str, timeout: Duration) -> Resu
         .route("/internal/adx/v1/templates/get", post(template))
         .route("/internal/adx/v1/aliases/get", post(alias))
         .route("/internal/adx/v1/aliases/put", post(update_alias))
+        .route("/internal/adx/v1/prewarm/retire", post(retire_golden))
         .route("/internal/adx/v1/bindings/get", post(binding))
         .route("/internal/adx/v1/bindings/list", post(bindings))
         .route("/internal/adx/v1/bindings/delete", post(delete))
@@ -108,7 +109,11 @@ async fn publish(
     Json(r): Json<PublishRequest>,
 ) -> Response {
     p.start_write();
-    match s.activator.publish(&r.tenant, &r.template).await {
+    match s
+        .activator
+        .publish_with_id(&r.tenant, &r.template, r.publication_id.as_deref())
+        .await
+    {
         Ok(template) => Json(template).into_response(),
         Err(e) => failure(e),
     }
@@ -140,6 +145,21 @@ async fn binding(State(s): State<Service>, Json(r): Json<ScopeRequest>) -> Respo
     match s.activator.binding(&r.scope).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => failure(e),
+    }
+}
+async fn retire_golden(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(request): Json<adx_agent_core::prewarm::GoldenRetirement>,
+) -> Response {
+    p.start_write();
+    match s
+        .activator
+        .retire_golden(&request.tenant, &request.snapshot_id)
+        .await
+    {
+        Ok(()) => Json(()).into_response(),
+        Err(error) => failure(error),
     }
 }
 async fn bindings(State(s): State<Service>, Json(r): Json<BindingList>) -> Response {

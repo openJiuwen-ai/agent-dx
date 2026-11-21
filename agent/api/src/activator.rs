@@ -3,6 +3,7 @@ use crate::discovery::{validate_members, DiscoveryConfig};
 use crate::request::RequestContext;
 use crate::{Error, Result};
 use adx_agent_core::discovery::{ranked_endpoints, ActivatorEndpoint};
+use adx_agent_core::prewarm::GoldenRetirement;
 use adx_agent_core::{activator::*, transport, AgentBinding, Scope, TemplateVersion};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
@@ -17,6 +18,13 @@ use std::{
 /// Product operations shared by the independent HTTP client and embedded Activator.
 #[async_trait]
 pub trait Control: Send + Sync {
+    async fn retire_golden(
+        &self,
+        _ctx: &RequestContext,
+        _request: &GoldenRetirement,
+    ) -> Result<()> {
+        Err(Error::Unsupported("snapshot retirement unavailable".into()))
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,
@@ -266,6 +274,10 @@ impl ActivatorClient {
 
 #[async_trait]
 impl Control for ActivatorClient {
+    async fn retire_golden(&self, ctx: &RequestContext, request: &GoldenRetirement) -> Result<()> {
+        self.request(ctx, "prewarm/retire", request, true, None)
+            .await
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,
@@ -393,6 +405,7 @@ impl ActivatorClient {
             &PublishRequest {
                 tenant: tenant.into(),
                 template: template.clone(),
+                publication_id: ctx.publication_id().map(str::to_owned),
             },
             true,
             None,
@@ -486,6 +499,7 @@ impl ActivatorClient {
                 expected_generation: expected_generation.map(str::to_owned),
                 bypass_cache,
                 parameters: parameters.map(<[u8]>::to_vec),
+                reuse_subject_binding: false,
             },
             true,
             Some(scope),

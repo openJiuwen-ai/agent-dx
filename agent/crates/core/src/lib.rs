@@ -11,6 +11,7 @@ pub mod limits;
 pub mod mounts;
 pub mod network;
 pub mod parameters;
+pub mod prewarm;
 pub mod probes;
 pub mod target;
 pub mod transport;
@@ -40,7 +41,21 @@ pub fn identifier(value: &str, label: &str) -> ValidationResult {
 
 /// JSON tuple encoding avoids ambiguous concatenation, including user delimiters.
 pub fn encode_key(parts: &[&str]) -> String {
-    let bytes = serde_json::to_vec(parts).expect("string array serialization");
+    hex_key(serde_json::to_vec(parts).expect("string array serialization"))
+}
+
+/// Prefix of encoded tuples with these parts followed by at least one more part.
+pub fn encode_key_prefix(parts: &[&str]) -> String {
+    if parts.is_empty() {
+        return "5b".into();
+    }
+    let mut bytes = serde_json::to_vec(parts).expect("string array serialization");
+    bytes.pop();
+    bytes.push(b',');
+    hex_key(bytes)
+}
+
+fn hex_key(bytes: Vec<u8>) -> String {
     let mut encoded = String::with_capacity(bytes.len() * 2);
     use std::fmt::Write;
     for byte in bytes {
@@ -181,6 +196,8 @@ pub struct TemplateDraft {
     pub name: String,
     pub image: String,
     pub isolation_runtime: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_prepare_snapshot: bool,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub resources: Resources,
@@ -212,6 +229,13 @@ pub struct TemplateVersion {
     pub version: String,
     pub image: String,
     pub isolation_runtime: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_prepare_snapshot: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_preparation: Option<prewarm::SnapshotPreparation>,
+    /// Server-generated restore recipe for this published version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prewarm_recipe: Option<prewarm::PrewarmRecipe>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub resources: Resources,
@@ -238,6 +262,17 @@ pub struct TemplateVersion {
 
 impl TemplateDraft {
     pub fn validate(&self) -> ValidationResult {
+        if self.env.contains_key(prewarm::GOLDEN_PHASE) {
+            return Err("GOLDEN_PHASE is reserved for Golden preparation and restore".into());
+        }
+        if self.auto_prepare_snapshot
+            && !self
+                .image
+                .rsplit_once('@')
+                .is_some_and(|(_, digest)| prewarm::sha256(digest))
+        {
+            return Err("automatic preparation requires a digest-pinned image".into());
+        }
         self.with_version("1".into()).validate()
     }
     /// Attach the server-assigned version to this immutable publication snapshot.
@@ -247,6 +282,11 @@ impl TemplateDraft {
             name: self.name.clone(),
             image: self.image.clone(),
             isolation_runtime: self.isolation_runtime.clone(),
+            auto_prepare_snapshot: self.auto_prepare_snapshot,
+            snapshot_preparation: self
+                .auto_prepare_snapshot
+                .then_some(prewarm::SnapshotPreparation::Pending),
+            prewarm_recipe: None,
             env: self.env.clone(),
             resources: self.resources.clone(),
             lifecycle: self.lifecycle.clone(),
@@ -266,6 +306,7 @@ impl From<&TemplateVersion> for TemplateDraft {
             name: template.name.clone(),
             image: template.image.clone(),
             isolation_runtime: template.isolation_runtime.clone(),
+            auto_prepare_snapshot: template.auto_prepare_snapshot,
             env: template.env.clone(),
             resources: template.resources.clone(),
             lifecycle: template.lifecycle.clone(),
@@ -332,6 +373,9 @@ impl TemplateVersion {
             ("isolation_runtime", &self.isolation_runtime),
         ] {
             identifier(value, label)?;
+        }
+        if let Some(recipe) = &self.prewarm_recipe {
+            recipe.validate(&self.image)?;
         }
         for (key, value) in &self.env {
             parameters::render(value, None)?;
@@ -425,12 +469,20 @@ pub struct CreationAttempt {
 pub struct EnvironmentRef {
     pub version: String,
     pub environment_id: String,
+    /// Durable allocation intent until Catalog acknowledges this exact owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_snapshot_id: Option<String>,
+    /// Fixed by the first committed start decision. Later lifecycle moves default to cold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
 }
 impl EnvironmentRef {
     pub fn new(version: String, environment_id: String) -> Self {
         Self {
             version,
             environment_id,
+            pending_snapshot_id: None,
+            snapshot_id: None,
         }
     }
 }

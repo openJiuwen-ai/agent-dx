@@ -16,7 +16,24 @@ where
     F: FnOnce(Request<B>, Arc<RequestContext>) -> Fut,
     Fut: Future<Output = Result<serde_json::Value, Error>>,
 {
-    let ctx = Arc::new(RequestContext::new(timeout));
+    let publication_id = if request.method() == http::Method::POST
+        && request.uri().path() == "/api/agent/v2/templates"
+    {
+        match request.headers().get("idempotency-key") {
+            Some(value) => match value.to_str() {
+                Ok(value)
+                    if adx_agent_core::identifier(value, "publication idempotency key").is_ok() =>
+                {
+                    Some(value.to_owned())
+                }
+                _ => return error_response(Error::Invalid("invalid Idempotency-Key".into()), None),
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    let ctx = Arc::new(RequestContext::new(timeout).with_publication_id(publication_id));
     let trace = match request.headers().get("x-trace-id") {
         Some(value) => match value.to_str() {
             Ok(value)

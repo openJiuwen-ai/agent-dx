@@ -39,6 +39,8 @@ struct State {
     resolved_snapshot_id: Mutex<String>,
     preparation_requests: Mutex<Vec<(String, String, bool)>>,
     current_preparation: Mutex<Option<pb::SnapshotPreparationView>>,
+    native_preparation: Mutex<Option<pb::SnapshotPreparationView>>,
+    native_starts: Mutex<Vec<pb::StartSnapshotPreparationRequest>>,
     release: Notify,
 }
 fn fixture_control(
@@ -389,6 +391,13 @@ impl pb::snapshot_service_server::SnapshotService for Service {
         Err(Status::unimplemented("fixture only resolves snapshots"))
     }
 
+    async fn update_snapshot_reference(
+        &self,
+        _: tonic::Request<pb::UpdateSnapshotReferenceRequest>,
+    ) -> Result<tonic::Response<pb::ReusableSnapshot>, tonic::Status> {
+        Err(tonic::Status::unimplemented("snapshot reference update"))
+    }
+
     async fn delete_snapshot(
         &self,
         _: Request<pb::DeleteSnapshotRequest>,
@@ -396,67 +405,172 @@ impl pb::snapshot_service_server::SnapshotService for Service {
         Err(Status::unimplemented("fixture only resolves snapshots"))
     }
 }
-service_impl!(pb::snapshot_preparation_service_server::SnapshotPreparationService, {
-    async fn resolve_snapshot_template(
-        &self,
-        request: Request<pb::ResolveSnapshotTemplateRequest>,
-    ) -> Result<Response<pb::SnapshotPreparationView>, Status> {
-        self.0.preparation_calls.fetch_add(1, Ordering::SeqCst);
-        let error = tonic::Code::from_i32(self.0.preparation_error.load(Ordering::SeqCst) as i32);
-        if error != tonic::Code::Ok {
-            return Err(Status::new(error, "injected preparation resolution failure"));
+service_impl!(
+    pb::snapshot_preparation_service_server::SnapshotPreparationService,
+    {
+        async fn register_snapshot_preparation(
+            &self,
+            request: Request<pb::RegisterSnapshotPreparationRequest>,
+        ) -> Result<Response<pb::SnapshotPreparationView>, Status> {
+            let r = request.into_inner();
+            let id = r
+                .fixed_id
+                .ok_or_else(|| Status::unimplemented("fixture requires fixed identity"))?;
+            assert!(r.name.starts_with(&format!("adx-agent-{id}-")));
+            assert_eq!(r.caller.unwrap().tenant_id, "tenant");
+            let view = pb::SnapshotPreparationView {
+                name: r.name,
+                template_id: id.clone(),
+                preparation_id: id,
+                phase: pb::SnapshotPreparationPhase::Registered as i32,
+                ..Default::default()
+            };
+            *self.0.native_preparation.lock().unwrap() = Some(view.clone());
+            Ok(Response::new(view))
         }
-        let request = request.into_inner();
-        let tenant = request.caller.as_ref().map(|caller| caller.tenant_id.as_str()).unwrap_or("");
-        self.0.preparation_requests.lock().unwrap().push((tenant.into(), request.reference.clone(), request.registration_only));
-        if request.reference.contains(':') {
-            return Err(Status::invalid_argument("fixture requires a family reference"));
+        async fn get_snapshot_preparation(
+            &self,
+            request: Request<pb::GetSnapshotPreparationRequest>,
+        ) -> Result<Response<pb::SnapshotPreparationView>, Status> {
+            let r = request.into_inner();
+            self.0
+                .native_preparation
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|view| {
+                    view.template_id == r.template_id
+                        && view.preparation_id == r.preparation_id
+                        && r.caller.is_some_and(|c| c.tenant_id == "tenant")
+                })
+                .map(Response::new)
+                .ok_or_else(|| Status::not_found("no such preparation"))
         }
-        let name = request.reference.as_str();
-        if (name != "base" && name != FAMILY_ID) || tenant != *self.0.registered_tenant.lock().unwrap() {
-            return Err(Status::not_found("no registered preparation"));
+        async fn start_snapshot_preparation(
+            &self,
+            request: Request<pb::StartSnapshotPreparationRequest>,
+        ) -> Result<Response<pb::SnapshotPreparationView>, Status> {
+            let mut saved = self.0.native_preparation.lock().unwrap();
+            let view = saved.as_mut().unwrap();
+            view.phase = pb::SnapshotPreparationPhase::Creating as i32;
+            self.0
+                .native_starts
+                .lock()
+                .unwrap()
+                .push(request.into_inner());
+            Ok(Response::new(view.clone()))
         }
-        if request.registration_only {
-            if let Some(current) = self.0.current_preparation.lock().unwrap().clone() {
-                return Ok(Response::new(current));
+        async fn resolve_snapshot_template(
+            &self,
+            request: Request<pb::ResolveSnapshotTemplateRequest>,
+        ) -> Result<Response<pb::SnapshotPreparationView>, Status> {
+            self.0.preparation_calls.fetch_add(1, Ordering::SeqCst);
+            let error =
+                tonic::Code::from_i32(self.0.preparation_error.load(Ordering::SeqCst) as i32);
+            if error != tonic::Code::Ok {
+                return Err(Status::new(
+                    error,
+                    "injected preparation resolution failure",
+                ));
             }
+            let request = request.into_inner();
+            let tenant = request
+                .caller
+                .as_ref()
+                .map(|caller| caller.tenant_id.as_str())
+                .unwrap_or("");
+            self.0.preparation_requests.lock().unwrap().push((
+                tenant.into(),
+                request.reference.clone(),
+                request.registration_only,
+            ));
+            if request.reference.contains(':') {
+                return Err(Status::invalid_argument(
+                    "fixture requires a family reference",
+                ));
+            }
+            let name = request.reference.as_str();
+            if (name != "base" && name != FAMILY_ID)
+                || tenant != *self.0.registered_tenant.lock().unwrap()
+            {
+                return Err(Status::not_found("no registered preparation"));
+            }
+            if request.registration_only {
+                if let Some(current) = self.0.current_preparation.lock().unwrap().clone() {
+                    return Ok(Response::new(current));
+                }
+            }
+            let snapshot_id = self.0.resolved_snapshot_id.lock().unwrap().clone();
+            let snapshot = self.0.snapshot.lock().unwrap().clone().filter(|snapshot| {
+                snapshot.id == snapshot_id
+                    && snapshot.state == pb::SnapshotState::Ready as i32
+                    && snapshot
+                        .template
+                        .as_ref()
+                        .is_some_and(|spec| spec.tenant_id == tenant)
+            });
+            if !request.registration_only && snapshot.is_none() {
+                return Err(Status::failed_precondition(
+                    "registered family has no available ready snapshot",
+                ));
+            }
+            Ok(Response::new(pb::SnapshotPreparationView {
+                template_id: FAMILY_ID.into(),
+                name: "base".into(),
+                preparation_id: BUILD_ID.into(),
+                phase: if snapshot.is_some() {
+                    pb::SnapshotPreparationPhase::Ready
+                } else {
+                    pb::SnapshotPreparationPhase::Registered
+                } as i32,
+                resources: snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.template.as_ref())
+                    .and_then(|spec| spec.resources),
+                created_at_unix_ms: 1,
+                template_updated_at_unix_ms: 5,
+                preparation_created_at_unix_ms: 2,
+                preparation_updated_at_unix_ms: 3,
+                last_spawned_at_unix_ms: Some(5),
+                spawn_count: Some(2),
+                envd_version: "0.9.0".into(),
+                snapshot_available: snapshot.is_some(),
+                snapshot_id,
+                ..Default::default()
+            }))
         }
-        let snapshot_id = self.0.resolved_snapshot_id.lock().unwrap().clone();
-        let snapshot = self.0.snapshot.lock().unwrap().clone().filter(|snapshot| {
-            snapshot.id == snapshot_id && snapshot.state == pb::SnapshotState::Ready as i32
-                && snapshot.template.as_ref().is_some_and(|spec| spec.tenant_id == tenant)
-        });
-        if !request.registration_only && snapshot.is_none() {
-            return Err(Status::failed_precondition("registered family has no available ready snapshot"));
+        async fn delete_snapshot_template(
+            &self,
+            request: Request<pb::DeleteSnapshotTemplateRequest>,
+        ) -> Result<Response<pb::DeleteSnapshotTemplateResponse>, Status> {
+            if !request.into_inner().require_unused {
+                return Err(Status::invalid_argument(
+                    "E2B deletion must protect live references",
+                ));
+            }
+            let error =
+                tonic::Code::from_i32(self.0.preparation_error.load(Ordering::SeqCst) as i32);
+            Err(Status::new(
+                if error == tonic::Code::Ok {
+                    tonic::Code::NotFound
+                } else {
+                    error
+                },
+                "template has live references",
+            ))
         }
-        Ok(Response::new(pb::SnapshotPreparationView {
-            template_id: FAMILY_ID.into(), name: "base".into(), preparation_id: BUILD_ID.into(),
-            phase: if snapshot.is_some() { pb::SnapshotPreparationPhase::Ready } else { pb::SnapshotPreparationPhase::Registered } as i32,
-            resources: snapshot.as_ref().and_then(|snapshot| snapshot.template.as_ref()).and_then(|spec| spec.resources),
-            created_at_unix_ms: 1,
-            template_updated_at_unix_ms: 5,
-            preparation_created_at_unix_ms: 2,
-            preparation_updated_at_unix_ms: 3,
-            last_spawned_at_unix_ms: Some(5),
-            spawn_count: Some(2),
-            envd_version: "0.9.0".into(),
-            snapshot_available: snapshot.is_some(), snapshot_id, ..Default::default()
-        }))
-    }
-    async fn delete_snapshot_template(
-        &self,
-        request: Request<pb::DeleteSnapshotTemplateRequest>,
-    ) -> Result<Response<pb::DeleteSnapshotTemplateResponse>, Status> {
-        if !request.into_inner().require_unused {
-            return Err(Status::invalid_argument("E2B deletion must protect live references"));
-        }
-        let error = tonic::Code::from_i32(self.0.preparation_error.load(Ordering::SeqCst) as i32);
-        Err(Status::new(if error == tonic::Code::Ok { tonic::Code::NotFound } else { error }, "template has live references"))
+    },
+    []
+);
+service_impl!(pb::volume_service_server::VolumeService, {
+    async fn ensure_volume(&self, request: Request<pb::EnsureVolumeRequest>) -> Result<Response<pb::Volume>, Status> {
+        Ok(Response::new(pb::Volume { uid: "47cb1f37-3b07-4093-be93-894e54275a4e".into(), spec: request.into_inner().spec, revision: 1 }))
     }
 }, [
-    register_snapshot_preparation(RegisterSnapshotPreparationRequest) -> SnapshotPreparationView,
-    start_snapshot_preparation(StartSnapshotPreparationRequest) -> SnapshotPreparationView,
-    get_snapshot_preparation(GetSnapshotPreparationRequest) -> SnapshotPreparationView,
+    get_volume(GetVolumeRequest) -> VolumeInfo,
+    list_volumes(ListVolumesRequest) -> ListVolumesResponse,
+    delete_volume(GetVolumeRequest) -> DeleteVolumeResponse,
+    release_owner(ReleaseVolumeOwnerRequest) -> DeleteVolumeResponse,
 ]);
 #[tonic::async_trait]
 impl pb::environment_directory_service_server::EnvironmentDirectoryService for Service {
@@ -531,6 +645,7 @@ impl Fixture {
                 .add_service(pb::auth_service_server::AuthServiceServer::new(endpoint.clone()))
                 .add_service(pb::node_service_server::NodeServiceServer::new(endpoint.clone()))
                 .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(endpoint.clone()))
+                .add_service(pb::volume_service_server::VolumeServiceServer::new(endpoint.clone()))
                 .add_service(pb::environment_directory_service_server::EnvironmentDirectoryServiceServer::new(endpoint))
                 .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(snapshots.clone()))
                 .add_service(pb::snapshot_preparation_service_server::SnapshotPreparationServiceServer::new(snapshots))

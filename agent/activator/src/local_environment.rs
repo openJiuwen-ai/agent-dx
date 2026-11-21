@@ -13,6 +13,33 @@ use std::{sync::Arc, time::Duration};
 /// authenticates the caller before passing its tenant to this private interface.
 #[async_trait]
 pub trait EnvironmentApplication: Send + Sync {
+    async fn update_snapshot_reference_request(
+        &self,
+        _tenant: &str,
+        _id: &str,
+        _change: &adx_agent_core::environment::SnapshotChange,
+    ) -> Result<(), EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "snapshot reference management unavailable".into(),
+        ))
+    }
+    async fn prepare_snapshot_request(
+        &self,
+        _tenant: &str,
+        _id: &str,
+        _input: Value,
+    ) -> Result<adx_agent_core::prewarm::SeedResult, EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "snapshot preparation unavailable".into(),
+        ))
+    }
+    async fn snapshot_metadata(
+        &self,
+        _tenant: &str,
+        _id: &str,
+    ) -> Result<Option<Value>, EnvironmentError> {
+        Ok(None)
+    }
     async fn ensure_volume_request(
         &self,
         _tenant: &str,
@@ -80,6 +107,83 @@ impl LocalEnvironment {
 }
 #[async_trait]
 impl Environment for LocalEnvironment {
+    async fn update_snapshot_reference(
+        &self,
+        tenant: &str,
+        id: &str,
+        change: &adx_agent_core::environment::SnapshotChange,
+    ) -> Result<(), EnvironmentError> {
+        self.application
+            .update_snapshot_reference_request(tenant, id, change)
+            .await
+    }
+
+    fn freeze_preparation(
+        &self,
+        tenant: &str,
+        id: &str,
+        seed: &adx_agent_core::prewarm::SeedExecution,
+    ) -> Result<Option<Value>, EnvironmentError> {
+        environment_request::seed_input(
+            tenant,
+            id,
+            seed,
+            self.timeout,
+            self.platform_egress.as_ref(),
+        )
+        .map(Some)
+    }
+
+    async fn prepare_snapshot(
+        &self,
+        tenant: &str,
+        id: &str,
+        seed: &adx_agent_core::prewarm::SeedExecution,
+        deadline_unix_ms: u64,
+    ) -> Result<adx_agent_core::prewarm::SeedResult, EnvironmentError> {
+        let mut input = environment_request::seed_input(
+            tenant,
+            id,
+            seed,
+            self.timeout,
+            self.platform_egress.as_ref(),
+        )?;
+        input["registration_deadline_unix_ms"] = serde_json::json!(deadline_unix_ms);
+        tokio::time::timeout(
+            self.timeout,
+            self.application.prepare_snapshot_request(tenant, id, input),
+        )
+        .await
+        .map_err(|_| {
+            EnvironmentError::OutcomeUnknown("snapshot preparation result unknown".into())
+        })?
+    }
+    async fn snapshot_revision(&self, tenant: &str, id: &str) -> Result<u64, EnvironmentError> {
+        self.application
+            .snapshot_metadata(tenant, id)
+            .await?
+            .ok_or(EnvironmentError::NotFound)?
+            .get("revision")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| EnvironmentError::Unavailable("snapshot revision unavailable".into()))
+    }
+    async fn golden_available(
+        &self,
+        tenant: &str,
+        id: &str,
+        image: &str,
+        runtime: &str,
+    ) -> Result<bool, EnvironmentError> {
+        let metadata =
+            tokio::time::timeout(self.timeout, self.application.snapshot_metadata(tenant, id))
+                .await
+                .map_err(|_| {
+                    EnvironmentError::Unavailable("snapshot metadata timed out".into())
+                })??;
+        let value = metadata
+            .ok_or_else(|| EnvironmentError::Unavailable("snapshot metadata unavailable".into()))?;
+        environment_request::check_golden(&value, id, image, runtime)
+    }
     async fn ensure_volume(
         &self,
         tenant: &str,

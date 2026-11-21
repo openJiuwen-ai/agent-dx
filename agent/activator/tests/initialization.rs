@@ -7,6 +7,17 @@ use std::sync::{Arc, Mutex};
 struct Capture(Mutex<Vec<CreateEnvironment>>);
 #[async_trait::async_trait]
 impl Environment for Capture {
+    async fn ensure_volume(
+        &self,
+        _: &str,
+        _: &str,
+        spec: &volumes::VolumeSpec,
+    ) -> Result<volumes::VolumeRef, EnvironmentError> {
+        Ok(volumes::VolumeRef {
+            id: spec.id.clone(),
+            uid: format!("uid-{}", spec.id),
+        })
+    }
     async fn create(
         &self,
         request: &CreateEnvironment,
@@ -32,6 +43,7 @@ impl Environment for Capture {
         Err(EnvironmentError::NotFound)
     }
 }
+
 fn template() -> TemplateVersion {
     serde_json::from_value(
         serde_json::json!({"name":"app","version":"1","image":"app:1",
@@ -157,4 +169,98 @@ async fn concurrent_first_access_uses_the_winning_parameters() {
     assert_eq!(left.unwrap().binding, right.unwrap().binding);
     let requests = platform.0.lock().unwrap();
     assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[tokio::test]
+async fn digitalmate_uses_cold_start_when_golden_is_disabled() {
+    use adx_agent_core::activator::{ActivationRequest, ResolveRequest, ServiceSelector};
+
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Capture::default());
+    let service = Activator::new(state, platform.clone());
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let draft: TemplateDraft = serde_json::from_value(serde_json::json!({
+        "name":"digitalmate","image":format!("product@{digest}"),"isolation_runtime":"runsc",
+        "resources":{"cpu_millis":1000,"memory_mib":512},
+        "service":[{"protocol":"ws","port":18092}],
+        "env":{"DIGITALMATE_CRYPTO_WORKSPACE":"${workspace}"},
+        "mounts":[{"type":"bind","target":"/data/state","volume_id":"user-${workspace}"}],
+        "volumes":[{"id":"user-${workspace}","access_mode":"exclusive",
+            "source":{"type":"directory","storage_domain":"sfs","path":"root/${workspace}"}}]
+    }))
+    .unwrap();
+    let template = service.publish("tenant", &draft).await.unwrap();
+    let request = ResolveRequest {
+        activation: ActivationRequest {
+            scope: Scope {
+                tenant: "tenant".into(),
+                template: template.name,
+                template_ref: TemplateRef::Version(template.version),
+                binding_id: "fixture".into(),
+            },
+            expected_generation: None,
+            bypass_cache: false,
+            parameters: Some(format!("workspace=w-{}", "a".repeat(64)).into_bytes()),
+            reuse_subject_binding: true,
+        },
+        service: ServiceSelector {
+            protocol: Protocol::Ws,
+            port: Some(18092),
+        },
+    };
+    let binding = service
+        .resolve(&request, unix_time_millis() + 30_000)
+        .await
+        .unwrap()
+        .target
+        .binding;
+    assert!(binding.current.snapshot_id.is_none());
+    let requests = platform.0.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].execution.snapshot_id.is_none());
+}
+
+#[tokio::test]
+async fn allocation_from_the_normal_entry_tracks_a_digitalmate_subject_across_scopes() {
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let service = Activator::new(state.clone(), Arc::new(Capture::default()));
+    let draft = TemplateDraft::from(&template());
+    service.publish("tenant", &draft).await.unwrap();
+    service.publish("tenant", &draft).await.unwrap();
+    let first = Scope {
+        binding_id: format!("digitalmate-{}", "1".repeat(64)),
+        ..scope()
+    };
+    let params = [
+        ("workspace".into(), "w".into()),
+        ("model_url".into(), "https://model.example".into()),
+    ]
+    .into();
+    let assigned = state
+        .create_binding_with_parameters(first.clone(), &params)
+        .await
+        .unwrap();
+    let next = Scope {
+        template_ref: TemplateRef::Version("2".into()),
+        ..first.clone()
+    };
+    assert_eq!(
+        state
+            .create_binding_for_version(next.clone(), &params, true, "2", None)
+            .await
+            .unwrap(),
+        assigned
+    );
+    service.delete_binding(&first).await.unwrap();
+    assert_eq!(state.subject_binding(&next).await.unwrap(), None);
+    let rebound = state
+        .create_binding_for_version(next.clone(), &params, true, "2", None)
+        .await
+        .unwrap();
+    assert_eq!(rebound.scope, next);
+    assert_ne!(
+        rebound.current.environment_id,
+        assigned.current.environment_id
+    );
+    assert_eq!(state.subject_binding(&first).await.unwrap(), Some(rebound));
 }

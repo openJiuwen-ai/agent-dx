@@ -7,6 +7,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Marks a rejected acquire that may be retried after rereading Catalog and the Binding.
+pub const ADMISSION_STALE_HEADER: &str = "adx-snapshot-admission-stale";
+
 /// Stable capture identity scoped to tenant, Environment and operation.
 /// Names are excluded so retries with changed arguments conflict instead of duplicating captures.
 pub fn snapshot_id(tenant: &str, environment: &str, operation: &str) -> Result<String> {
@@ -32,6 +35,14 @@ pub enum SnapshotState {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reference {
+    AgentTemplate {
+        name: String,
+        version: String,
+    },
+    AgentBinding {
+        binding_id: String,
+        environment_id: String,
+    },
     Restore {
         environment_id: String,
     },
@@ -43,6 +54,13 @@ pub enum Reference {
 impl Reference {
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::AgentTemplate { name, version } if valid_agent_id(name) && valid_id(version) => {
+                Ok(())
+            }
+            Self::AgentBinding {
+                binding_id,
+                environment_id,
+            } if valid_agent_id(binding_id) && valid_id(environment_id) => Ok(()),
             Self::Restore { environment_id } if valid_id(environment_id) => Ok(()),
             Self::Template {
                 node_id,
@@ -52,6 +70,16 @@ impl Reference {
         }
     }
 }
+fn is_zero(revision: &u64) -> bool {
+    *revision == 0
+}
+
+fn valid_agent_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_AGENT_OWNER_ID_BYTES && !id.chars().any(char::is_control)
+}
+/// Byte limit shared with Agent's template names and Binding IDs.
+pub const MAX_AGENT_OWNER_ID_BYTES: usize = 512;
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
 }
@@ -69,6 +97,12 @@ pub struct Snapshot {
     #[serde(default)]
     pub preparation_template_id: Option<String>,
     pub template: EnvironmentSpec,
+    /// A retired recipe cannot admit new owners. An already committed Binding may still restore.
+    #[serde(default)]
+    pub agent_retiring: bool,
+    /// Acquisitions observed before this revision may belong to a deleted allocation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub agent_admission_revision: u64,
     pub source_node_id: String,
     pub source_runtime_id: String,
     pub artifact: CheckpointArtifact,
@@ -119,6 +153,8 @@ impl Snapshot {
             kind,
             created_at_unix_ms,
             preparation_template_id: None,
+            agent_retiring: false,
+            agent_admission_revision: 0,
             template,
             source_node_id,
             source_runtime_id,
@@ -146,6 +182,8 @@ impl Snapshot {
             || self.names.len() > 16
             || self.names.iter().any(|n| !valid_id(n))
             || self.names.iter().collect::<BTreeSet<_>>().len() != self.names.len()
+            || (self.agent_retiring && self.kind != SnapshotKind::Golden)
+            || self.agent_admission_revision > self.revision
             || (self.state == SnapshotState::Deleted && !self.references.is_empty())
         {
             return Err(Error::Invalid("invalid reusable snapshot".into()));
@@ -191,8 +229,60 @@ impl Snapshot {
         if self.state != SnapshotState::Ready {
             return Err(Error::Conflict);
         }
+        if self.agent_retiring {
+            match &reference {
+                Reference::Restore { environment_id } if self.references.iter().any(|owner|
+                    matches!(owner, Reference::AgentBinding { environment_id: pinned, .. } if pinned == environment_id)) => {}
+                _ => return Err(Error::Conflict),
+            }
+        }
+        if matches!(
+            &reference,
+            Reference::AgentTemplate { .. } | Reference::AgentBinding { .. }
+        ) && self.kind != SnapshotKind::Golden
+        {
+            return Err(Error::Conflict);
+        }
         self.advance()?;
         self.references.insert(reference);
+        Ok(())
+    }
+    /// Admit independent owners using their observed revision unless allocation cleanup
+    /// has since invalidated it. Existing ownership is idempotent across revisions.
+    pub fn acquire_agent_binding(
+        &mut self,
+        tenant: &str,
+        owner: Reference,
+        observed: u64,
+    ) -> Result<()> {
+        self.authorize(tenant)?;
+        if self.state == SnapshotState::Ready
+            && !self.agent_retiring
+            && !self.references.contains(&owner)
+            && !(self.agent_admission_revision.max(1)..=self.revision).contains(&observed)
+        {
+            return Err(Error::SnapshotAdmissionStale);
+        }
+        self.acquire(tenant, owner)
+    }
+
+    /// Invalidate any in-flight acquire that observed the revision before its Binding
+    /// entered deletion, including a request that has not reached Catalog yet.
+    pub fn cancel_pending(&mut self, reference: &Reference, revision: u64) -> Result<()> {
+        reference.validate()?;
+        if !matches!(reference, Reference::AgentBinding { .. }) {
+            return Err(Error::Invalid("pending Binding owner required".into()));
+        }
+        if self.references.contains(reference) {
+            return self.release(reference);
+        }
+        if self.kind == SnapshotKind::Golden
+            && self.state == SnapshotState::Ready
+            && (self.agent_admission_revision.max(1)..=self.revision).contains(&revision)
+        {
+            self.advance()?;
+            self.agent_admission_revision = self.revision;
+        }
         Ok(())
     }
     pub fn release(&mut self, reference: &Reference) -> Result<()> {
@@ -200,8 +290,33 @@ impl Snapshot {
         if self.references.contains(reference) {
             self.advance()?;
             self.references.remove(reference);
+            if matches!(reference, Reference::AgentBinding { .. }) {
+                self.agent_admission_revision = self.revision;
+            }
+            self.schedule_retired_collection();
         }
         Ok(())
+    }
+    /// Atomically withdraw every recipe for this Golden and close new Agent allocations.
+    /// Returns a conflict for regular snapshots. Existing Binding owners remain until released.
+    pub fn begin_agent_retirement(&mut self, tenant: &str) -> Result<()> {
+        self.authorize(tenant)?;
+        if self.kind != SnapshotKind::Golden {
+            return Err(Error::Conflict);
+        }
+        if self.state == SnapshotState::Ready && !self.agent_retiring {
+            self.advance()?;
+            self.agent_retiring = true;
+            self.references
+                .retain(|owner| !matches!(owner, Reference::AgentTemplate { .. }));
+        }
+        self.schedule_retired_collection();
+        Ok(())
+    }
+    fn schedule_retired_collection(&mut self) {
+        if self.agent_retiring && self.state == SnapshotState::Ready && self.references.is_empty() {
+            self.state = SnapshotState::Deleting;
+        }
     }
     pub fn delete(&mut self, tenant: &str) -> Result<()> {
         self.authorize(tenant)?;
@@ -212,7 +327,10 @@ impl Snapshot {
                         .references
                         .iter()
                         .filter_map(|r| match r {
-                            Reference::Restore { environment_id } => Some(environment_id.clone()),
+                            Reference::Restore { environment_id }
+                            | Reference::AgentBinding { environment_id, .. } => {
+                                Some(environment_id.clone())
+                            }
                             _ => None,
                         })
                         .collect(),
@@ -224,6 +342,9 @@ impl Snapshot {
                                 node_id,
                                 template_id,
                             } => Some(format!("{node_id}/{template_id}")),
+                            Reference::AgentTemplate { name, version } => {
+                                Some(format!("{name}@{version}"))
+                            }
                             _ => None,
                         })
                         .collect(),

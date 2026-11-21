@@ -130,3 +130,9 @@ are unavailable with an explicit Local source. Writable workspaces use separate 
 Local workload entrypoints are supplied through the existing `process` field;
 `inheritEntrypoint=true` is rejected for an explicit Local source. Image metadata
 must be resolved by the caller into `env` and, when needed, `process`.
+
+### Agent Golden Catalog references
+
+The Agent service calls `PUT /api/environment/v1/snapshot-references/{snapshotId}` with its tenant bearer credential and its service identity in `x-adx-agent-authorization`. Standalone Activator and API Server use the same `ADX_ACTIVATOR_SERVICE_TOKEN`. Acquire and release name the template version or the Binding and Environment. Replay an unknown outcome with the original owner. Independent acquisitions can reuse the same observed revision. Releasing a Binding reference or cancelling its pending admission fences earlier observations. The Catalog returns HTTP 503 with `adx-snapshot-admission-stale: true` when an acquire was rejected before it wrote. The caller rereads the Catalog revision first, then the same Binding allocation, and retries within the original deadline. Agent template names and Binding IDs support up to 512 UTF-8 bytes. Retirement withdraws template recipes and closes new allocations. A committed Binding keeps its reference until cleanup. When the last reference is released, the Catalog marks the retired snapshot for collection. The Coordinator checks execution and artifact holds before reclaiming the bytes.
+
+For a Binding allocation, read the snapshot revision, recheck the pending Binding identity, then send `acquire_binding` with the observed revision. A superseded revision requires a fresh read. Cleanup of an undecided allocation uses `cancel_pending` to fence delayed requests. A definitive unavailable Golden selects cold creation. Transport ambiguity keeps the pending identity for replay.
