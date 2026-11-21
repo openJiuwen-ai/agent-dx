@@ -2,6 +2,7 @@
 use super::*;
 
 pub(super) struct Runtime {
+    pub(super) push: Option<super::super::push::Push>,
     prepared_composio: Option<super::super::composio::PreparedComposio>,
     pub(super) privacy: Option<super::super::privacy_runtime::PrivacyRuntime>,
     ingestion: Option<PreparedIngestion>,
@@ -21,7 +22,10 @@ impl DigitalMateGatewayConfig {
         if let Some(ingestion) = &self.ingestion {
             ingestion.validate().map_err(|_| invalid())?;
         }
-        if (self.ingestion.is_some() || self.composio.is_some())
+        if let Some(push) = &self.push {
+            push.validate().map_err(|_| invalid())?;
+        }
+        if (self.ingestion.is_some() || self.composio.is_some() || self.push.is_some())
             && self
                 .privacy
                 .as_ref()
@@ -95,7 +99,7 @@ impl DigitalMateGatewayApi {
         managed: Arc<ManagedService>,
         auth: Arc<dyn BusinessAuth>,
     ) -> Result<Self, Error> {
-        if config.ingestion.is_some() || config.composio.is_some() {
+        if config.ingestion.is_some() || config.composio.is_some() || config.push.is_some() {
             return Err(invalid());
         }
         Self::new_inner(config, managed, auth, None)
@@ -115,7 +119,16 @@ impl DigitalMateGatewayApi {
             })?),
             None => None,
         };
+        let push = match &config.push {
+            Some(settings) => Some(settings.prepare().await.map_err(|_| {
+                Error::Unavailable(
+                    "Huawei Push account file or budget initialization failed".into(),
+                )
+            })?),
+            None => None,
+        };
         let mut api = Self::new_inner(config, managed, auth, inbox.clone())?;
+        api.runtime.push = push;
         if let Some(settings) = &api.config.composio {
             let privacy = api.runtime.privacy.as_ref().ok_or_else(invalid)?;
             let bytes = privacy
@@ -235,6 +248,7 @@ impl DigitalMateGatewayApi {
             composio: None,
             webhook: None,
             runtime: Runtime {
+                push: None,
                 prepared_composio: None,
                 privacy,
                 ingestion: None,

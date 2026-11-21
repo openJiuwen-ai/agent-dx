@@ -1064,7 +1064,7 @@ impl Ingress {
             Ok(deadline) => deadline,
             Err(message) => return Ok(plain(StatusCode::BAD_REQUEST, message)),
         };
-        let budgeted = request.headers().contains_key(TIMEOUT_HEADER);
+        let budgeted = processing.caller_supplied;
         request.headers_mut().remove(TIMEOUT_HEADER);
         request.extensions_mut().insert(processing.clone());
         let request_id = ensure_request_id(&mut request);

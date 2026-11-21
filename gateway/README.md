@@ -636,6 +636,24 @@ Identity alone does not authorize mail reads: M44 retains current connection and
 task/intent permission checks. Delivery bootstrap credentials remain separately
 bounded and cannot renew or read configuration secrets.
 
+### Huawei Push Kit
+
+On Unix the optional `push` configuration enables Huawei delivery on the main
+DigitalMateGateway business entry. Configure the service account file, database,
+organization and per-minute limits as in the [gateway example](examples/digitalmategateway.json).
+Push uses the existing workload identity service and the PostgreSQL budget schema
+even when Composio is disabled.
+
+`POST /api/digitalmate/push/v1/send` accepts a `dm-privacy-v1` bearer and a
+single-device JSON notification. Omit `x-adx-processing-timeout-ms`. Push owns its
+20-second deadline and rejects a caller-supplied deadline before dispatch with
+HTTP 400 and non-retryable `not_sent`. HTTP 200 reports `accepted` or `rejected`.
+Huawei HTTP 400 with code `80100003` is a definitive message rejection.
+Only `not_sent` with `retryable: true` permits retry (429 includes
+`Retry-After`). HTTP 409 `unknown` requires reconciliation. See the
+[deployment and request contract](../docs/deployment/digitalmate-push-egress.md)
+for prerequisites, identity boundaries and timeout behavior.
+
 ### Transparent business WebSocket
 
 The `digitalmategateway` business module loads `ADX_JIUWEN_CONFIG` with a
