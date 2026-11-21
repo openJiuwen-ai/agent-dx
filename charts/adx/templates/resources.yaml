@@ -1,0 +1,192 @@
+{{- if ne .Release.Namespace .Values.namespace }}{{ fail "Release namespace must match values.namespace" }}{{ end -}}
+{{- $root := . -}}
+{{- $v := .Values -}}
+{{- $component := $v.deployment_component -}}
+{{- $roles := list $component -}}
+{{- if ge (int (default 0 $v.node.start_ordinal)) (int $v.node_identities.capacity) }}{{ fail "node.start_ordinal must be less than node_identities.capacity" }}{{ end -}}
+{{- $objects := ($root.Files.Get "files/manifests/workloads.json" | fromJson).items -}}
+{{- if eq $component "budget" }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: deployment-budget
+  namespace: {{ $v.namespace }}
+spec:
+  hard: {{ $v.resource_quota | toJson }}
+{{- else if ne $component "dependencies" -}}
+{{- range $role := $roles -}}
+{{- $node := eq $role "adx-node" -}}
+{{- $settings := pick $v "namespace" "tenant" "platform_namespace" "agent_namespace" "dependencies" -}}
+{{- if eq $role "coordinator" }}{{ $_ := set $settings "scheduling" $v.scheduling }}{{ if hasKey $v "storage_domains" }}{{ $_ := set $settings "storage_domains" $v.storage_domains }}{{ end }}{{ end -}}
+{{- if and (eq $role "coordinator") (hasKey $v "checkpoint_reclaimers") }}{{ $_ := set $settings "checkpoint_reclaimers" $v.checkpoint_reclaimers }}{{ end -}}
+{{- if eq $role "activator" }}{{ $_ := set $settings "sandbox_network" $v.sandbox_network }}{{ end -}}
+{{- if or $node (eq $role "coordinator") }}{{ $_ := set $settings "node_identities" $v.node_identities }}{{ end -}}
+{{- if $node }}{{ $_ := set $settings "node" $v.node }}{{ end -}}
+{{- $data := dict "config.json" ($settings | toJson) -}}
+{{- if $node -}}
+{{- $_ := set $data "start.py" ($root.Files.Get "files/bootstrap/node.py") -}}
+{{- $_ := set $data "node_storage.py" ($root.Files.Get "files/bootstrap/node_storage.py") -}}
+{{- $_ := set $data "runsc-base-spec.json" ($root.Files.Get "files/bootstrap/runsc-base-spec.json") -}}
+{{- else -}}
+{{- $_ := set $data "bootstrap.py" ($root.Files.Get "files/bootstrap/control.py") -}}
+{{- end -}}
+{{- $cm := printf "adx-iac-%s-%s" $role ($data | toJson | sha256sum | trunc 16) -}}
+{{- $sa := printf "adx-%s" $role -}}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $v.namespace }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $cm }}
+  namespace: {{ $v.namespace }}
+immutable: true
+data: {{ $data | toJson }}
+{{- range $base := $objects -}}
+{{- if and (has $base.kind (list "Deployment" "StatefulSet")) (eq $base.metadata.name $role) -}}
+{{- $w := deepCopy $base -}}
+{{- $_ := set $w.metadata "namespace" $v.namespace -}}
+{{- if hasKey (default (dict) $w.metadata.labels) "adx.deployment" }}{{- $_ := set $w.metadata.labels "adx.deployment" $v.namespace }}{{- end }}
+{{- $spec := $w.spec -}}
+{{- if and $node (hasKey $v.node "start_ordinal") }}{{ $_ := set $spec "ordinals" (dict "start" (int $v.node.start_ordinal)) }}{{ end -}}
+{{- if $node }}{{ $_ := unset $spec "replicas" }}{{ else }}{{ $_ := set $spec "replicas" (index $v.components $role).replicas }}{{ end -}}
+{{- $pod := $spec.template.spec -}}
+{{- $_ := set $pod "serviceAccountName" $sa -}}
+{{- $_ := set $pod "imagePullSecrets" (list (dict "name" $v.secrets.registry)) -}}
+{{- if $v.kubernetes_scheduling.node_names -}}
+{{- $terms := list -}}
+{{- range $name := $v.kubernetes_scheduling.node_names -}}
+{{- $field := dict "key" "metadata.name" "operator" "In" "values" (list $name) -}}
+{{- $terms = append $terms (dict "matchFields" (list $field)) -}}
+{{- end -}}
+{{- $_ := set $pod "affinity" (dict "nodeAffinity" (dict "requiredDuringSchedulingIgnoredDuringExecution" (dict "nodeSelectorTerms" $terms))) -}}
+{{- end -}}
+{{- $c := first $pod.containers -}}
+{{- $_ := set $c "image" (index $v.images $role) -}}
+{{- $_ := set $c "resources" (index $v.components $role).resources -}}
+{{- $_ := set $c "command" (list "python3" (ternary "/opt/adx/node-start.py" "/opt/adx/bootstrap.py" $node)) -}}
+{{- $_ := set $c "args" (ternary (list) (list $role) $node) -}}
+{{- range $e := $c.env }}{{ if eq $e.name "ADX_RUNTIME_PAYLOAD" }}{{ $_ := set $e "value" $v.runtime_payload_path }}{{ end }}{{ end -}}
+{{- $boot := "" -}}
+{{- range $vol := $pod.volumes -}}
+{{- if hasKey $vol "configMap" }}{{ $_ := set $vol.configMap "name" $cm }}{{ $boot = $vol.name }}{{ end -}}
+{{- if hasKey $vol "secret" -}}
+{{- $key := index (dict "credentials" "runtime" "registry" "registry") $vol.name -}}
+{{- $_ := set $vol.secret "secretName" (index $v.secrets $key) -}}
+{{- if and (eq $vol.name "credentials") (or $node (eq $role "coordinator")) -}}
+{{- $items := list -}}
+{{- range $item := $vol.secret.items }}{{ if not (has $item.key (list "node.pem" "node.key" "node.der")) }}{{ $items = append $items $item }}{{ end }}{{ end -}}
+{{- $_ := set $vol.secret "items" $items -}}
+{{- end -}}{{- end -}}{{- end -}}
+{{- range $mount := $c.volumeMounts }}{{ if has $mount.name (list "credentials" "registry") }}{{ $_ := set $mount "readOnly" true }}{{ end }}{{ end -}}
+{{- $_ := set $c "volumeMounts" (append $c.volumeMounts (dict "name" $boot "mountPath" "/etc/adx-iac" "readOnly" true)) -}}
+{{- if or $node (eq $role "coordinator") -}}
+{{- $items := list -}}
+{{- range $i := until (int $v.node_identities.capacity) -}}
+{{- if $node -}}
+{{- range $suffix := list "pem" "key" }}{{ $items = append $items (dict "key" (printf "adx-node-%d.%s" $i $suffix) "path" (printf "adx-node-%d/tls.%s" $i $suffix)) }}{{ end -}}
+{{- else -}}
+{{- $items = append $items (dict "key" (printf "adx-node-%d.der" $i) "path" (printf "adx-node-%d.der" $i)) -}}
+{{- end -}}{{- end -}}
+{{- $volume := ternary "node-identity" "node-peers" $node -}}
+{{- $_ := set $pod "volumes" (append $pod.volumes (dict "name" $volume "secret" (dict "secretName" (ternary $v.node_identities.private_secret $v.node_identities.public_secret $node) "defaultMode" (ternary 256 292 $node) "items" $items))) -}}
+{{- $mount := dict "name" $volume "mountPath" (ternary "/node-identity" "/node-peers" $node) "readOnly" true -}}
+{{- if $node }}{{ $_ := set $mount "subPathExpr" "$(POD_NAME)" }}{{ end -}}
+{{- $_ := set $c "volumeMounts" (append $c.volumeMounts $mount) -}}
+{{- end -}}
+{{- if and (eq $role "coordinator") (hasKey $v "checkpoint_reclaimers") -}}
+{{- $obsItems := list (dict "key" "AWS_ACCESS_KEY_ID" "path" "AWS_ACCESS_KEY_ID") (dict "key" "AWS_SECRET_ACCESS_KEY" "path" "AWS_SECRET_ACCESS_KEY") -}}
+{{- $_ := set $pod "volumes" (append $pod.volumes (dict "name" "obs-credentials" "secret" (dict "secretName" $v.secrets.obs "defaultMode" 288 "items" $obsItems))) -}}
+{{- $_ := set $c "volumeMounts" (append $c.volumeMounts (dict "name" "obs-credentials" "mountPath" "/obs-credentials" "readOnly" true)) -}}
+{{- end -}}
+{{- if $node -}}
+{{- if eq (default "pvc" $v.node.data_storage) "emptyDir" -}}
+{{- $_ := unset $spec "volumeClaimTemplates" -}}
+{{- $_ := unset $spec "persistentVolumeClaimRetentionPolicy" -}}
+{{- $_ := set $pod "volumes" (append $pod.volumes (dict "name" "data" "emptyDir" (dict "sizeLimit" $v.node.pvc_size))) -}}
+{{- else -}}
+{{- $claim := (first $spec.volumeClaimTemplates).spec -}}
+{{- $_ := set $claim.resources.requests "storage" $v.node.pvc_size -}}
+{{- $_ := set $claim "storageClassName" $v.node.storage_class -}}
+{{- end -}}
+{{- $obsItems := list (dict "key" "AWS_ACCESS_KEY_ID" "path" "AWS_ACCESS_KEY_ID") (dict "key" "AWS_SECRET_ACCESS_KEY" "path" "AWS_SECRET_ACCESS_KEY") -}}
+{{- $_ := set $pod "volumes" (concat $pod.volumes (list (dict "name" "sfs-workspaces" "persistentVolumeClaim" (dict "claimName" "sfs-workspaces" "readOnly" false)) (dict "name" "obs-credentials" "secret" (dict "secretName" $v.secrets.obs "defaultMode" 288 "items" $obsItems)))) -}}
+{{- $_ := set $c "volumeMounts" (concat $c.volumeMounts (list (dict "name" "sfs-workspaces" "mountPath" $v.node.sfs.mount_path "readOnly" false) (dict "name" "obs-credentials" "mountPath" "/obs-credentials" "readOnly" true))) -}}
+{{- $annotations := default (dict) $spec.template.metadata.annotations -}}
+{{- $_ := set $annotations "adx.sfs-share-id" $v.node.sfs.share_id -}}
+{{- $_ := set $spec.template.metadata "annotations" $annotations -}}
+{{- end }}
+---
+{{ $w | toYaml }}
+{{- end -}}
+{{- if and (eq $base.kind "Service") (eq $base.metadata.name $role) -}}
+{{- $service := deepCopy $base -}}{{- $_ := set $service.metadata "namespace" $v.namespace }}
+{{- if hasKey (default (dict) $service.metadata.labels) "adx.deployment" }}{{- $_ := set $service.metadata.labels "adx.deployment" $v.namespace }}{{- end }}
+---
+{{ $service | toYaml }}
+{{- end -}}{{- end -}}{{- end -}}
+{{- if has "adx-node" $roles -}}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ printf "%s-sfs-workspaces" $v.namespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  capacity:
+    storage: {{ $v.node.sfs.claim_size | quote }}
+  volumeMode: Filesystem
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: {{ $v.namespace }}
+    name: sfs-workspaces
+  mountOptions: {{ $v.node.sfs.mount_options | toJson }}
+  nfs:
+    server: {{ $v.node.sfs.server | quote }}
+    path: {{ $v.node.sfs.export_path | quote }}
+    readOnly: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sfs-workspaces
+  namespace: {{ $v.namespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteMany]
+  volumeMode: Filesystem
+  storageClassName: ""
+  volumeName: {{ printf "%s-sfs-workspaces" $v.namespace }}
+  resources:
+    requests:
+      storage: {{ $v.node.sfs.claim_size | quote }}
+{{- $egress := list -}}
+{{- $reserved := list "0.0.0.0/8" "10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16" "172.16.0.0/12" "192.0.0.0/24" "192.0.2.0/24" "192.168.0.0/16" "198.18.0.0/15" "198.51.100.0/24" "203.0.113.0/24" "224.0.0.0/4" "240.0.0.0/4" -}}
+{{- if $v.sandbox_network.public_egress }}{{ $egress = append $egress (dict "to" (list (dict "ipBlock" (dict "cidr" "0.0.0.0/0" "except" (concat $reserved $v.sandbox_network.internal_cidrs $v.sandbox_network.sandbox_cidrs | uniq))))) }}{{ end -}}
+{{- range $allow := $v.sandbox_network.egress_allow -}}
+{{- if has $allow.protocol (list "tcp" "udp") -}}
+{{- $port := dict "protocol" (upper $allow.protocol) "port" $allow.ports.first -}}
+{{- if ne $allow.ports.first $allow.ports.last }}{{ $_ := set $port "endPort" $allow.ports.last }}{{ end -}}
+{{- $egress = append $egress (dict "to" (list (dict "ipBlock" (dict "cidr" $allow.cidr))) "ports" (list $port)) -}}
+{{- end -}}{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: adx-node-public-egress
+  namespace: {{ $v.namespace }}
+spec:
+  podSelector:
+    matchLabels: {app: adx-node}
+  policyTypes: [Egress]
+  egress: {{ $egress | toJson }}
+{{- end -}}{{- end }}

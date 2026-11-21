@@ -1,0 +1,3 @@
+.git/
+*.pyc
+files/bootstrap/__pycache__/
