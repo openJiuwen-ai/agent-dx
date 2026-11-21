@@ -19,6 +19,7 @@ COMMIT_ENV = 'AFS_E2E_BASELINE_COMMIT'
 TARGET = 'afs-component-upgrade-rollback'
 PROTOCOL_TARGET = 'afs-component-mixed-protocols'
 PROTOCOL_CASES_ENV = 'AFS_E2E_PROTOCOL_CASES'
+PROTOCOL_META_REJECT_B_ENV = 'AFS_E2E_PROTOCOL_META_REJECT_B'
 BASELINE_POD = 'afs-baseline-input'
 
 
@@ -117,8 +118,11 @@ def scenarios(component, checks):
             signal.signal(signal.SIGALRM, _timeout)
             if mixed:
                 selection = runner.selected_cases(os.getenv(PROTOCOL_CASES_ENV))
+                meta_reject_b = runner.meta_reject_b_requested(selection, os.getenv(PROTOCOL_META_REJECT_B_ENV))
                 expected = len(selection)
-                entries, cleanup_errors = runner.exercise(component.config, old_inputs, new_inputs, output, selection)
+                entries, cleanup_errors = runner.exercise(
+                    component.config, old_inputs, new_inputs, output, selection, meta_reject_b=meta_reject_b,
+                )
             else:
                 expected = 3
                 entries, cleanup_errors = runner.exercise(component.config, old_inputs, new_inputs, output)

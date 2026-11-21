@@ -23,6 +23,7 @@ ROLE_LAYOUTS = {
 }
 DATA_A = b'mixed protocol alpha\n' * 4096
 DATA_B = b'mixed protocol beta\n' * 4096
+META_REJECT_B_CASE = 'dfs.protocol.peer-read.new-meta'
 
 
 def matrix():
@@ -43,12 +44,21 @@ def selected_cases(requested):
     return {name: available[name] for name in names}
 
 
+def meta_reject_b_requested(selection, requested):
+    if requested in (None, '0'):
+        return False
+    if requested != '1' or list(selection) != [META_REJECT_B_CASE]:
+        raise ValueError('Meta mutation requires only ' + META_REJECT_B_CASE)
+    return True
+
+
 class MixedCluster(Cluster):
-    def __init__(self, config, output, case, inputs, identities, role_versions):
+    def __init__(self, config, output, case, inputs, identities, role_versions, *, meta_reject_b):
         super().__init__(config, inputs['old'], output, case, 'afs-test-' + uuid.uuid4().hex)
         self.version_inputs = inputs
         self.version_identities = identities
         self.role_versions = dict(zip(('M', 'A', 'B'), role_versions))
+        self.meta_env = {'AFS_STAGE2_META_REJECT_B': '1'} if meta_reject_b else None
         if self.roles != ['M', 'A', 'B']:
             raise Blocked('mixed gRPC protocol cases require the M/A/B topology')
 
@@ -60,7 +70,7 @@ class MixedCluster(Cluster):
         super()._configs()
 
     def start(self, role):
-        report = super().start(role)
+        report = super().start(role, env=self.meta_env if role == 'M' else None)
         running_identity(self, role, self.version_identities[self.role_versions[role]])
         return report
 
@@ -179,7 +189,7 @@ def exercise_lane(cluster, operation, phases):
             run_phase(phases, 'permissions', lambda: permissions(cluster))
 
 
-def exercise(config, old_inputs, new_inputs, output, selection):
+def exercise(config, old_inputs, new_inputs, output, selection, *, meta_reject_b=False):
     output.mkdir()
     old, new = artifact_pair(old_inputs, new_inputs)
     identities = {'old': old, 'new': new}
@@ -193,12 +203,14 @@ def exercise(config, old_inputs, new_inputs, output, selection):
         profile = DfsProfile(copies=2, replica_failure='strict') if operation == 'replica' else None
         case = Case(name, ('cluster-protocol',), mode, (), workloads[operation], profile=profile)
         validate(config, [case])
-        cluster = MixedCluster(config, case_output, case, inputs, identities, layout)
+        cluster = MixedCluster(config, case_output, case, inputs, identities, layout, meta_reject_b=meta_reject_b)
         record = {'id': name, 'status': 'failed', 'phases': {}, 'versions': cluster.role_versions}
         entries.append(record)
         phases = record['phases']
         cluster.record('protocol.versions',
                        {role: identities[version] for role, version in cluster.role_versions.items()})
+        if meta_reject_b:
+            cluster.record('protocol.meta_environment', cluster.meta_env)
         signal.alarm(240)
         try:
             exercise_lane(cluster, operation, phases)

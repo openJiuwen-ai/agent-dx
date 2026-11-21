@@ -661,7 +661,7 @@ class Cluster:
         )
         return response["stdout"]
 
-    def start(self, role):
+    def start(self, role, *, env=None):
         binary = self.root(role) + "/bin/afs-" + ("meta" if role == "M" else "node")
         listeners = [[self.address(role), port] for port in self.ports(role)]
         self.channel(role).call(
@@ -670,6 +670,7 @@ class Cluster:
             argv=[binary, "--config", self.role_dir(role) + "/config.toml"],
             log=self.root(role) + "/" + role + ".log",
             listeners=listeners,
+            **({"env": env} if env else {}),
         )
         deadline = time.monotonic() + 45
         error = None
