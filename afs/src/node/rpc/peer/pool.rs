@@ -5,7 +5,9 @@ use super::*;
 /// Node-owned connection resources shared by file reads, owner forwarding and
 /// replica commands. Epoch changes invalidate cached channels; grant/handle
 /// validity remains with the business operation, never with this pool.
-pub(super) type PeerChannelKey = (String, u64, String, bool);
+/// (node, epoch, endpoint, profile). Profile 0 is the default channel; profile
+/// `n > 0` is OwnerFiles connection `n - 1`.
+pub(super) type PeerChannelKey = (String, u64, String, u8);
 
 pub struct PeerConnectionPool {
     #[cfg(feature = "dfs")]
@@ -20,6 +22,9 @@ pub struct PeerConnectionPool {
     /// current-thread runtimes, and by the async read path on the Node runtime;
     /// dialing under a private runtime would park the connection there.
     channel_runtime: Option<tokio::runtime::Handle>,
+    /// Runtime that drives OwnerFiles channels when set; see
+    /// [`Self::set_owner_files_runtime`].
+    owner_files_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
     pub(super) state: tokio::sync::Mutex<PeerPoolState>,
     #[cfg(feature = "dfs")]
     pub(super) stream_work: Arc<PeerStreamWorkPool>,
@@ -57,6 +62,7 @@ impl PeerConnectionPool {
             security,
             capacity,
             channel_runtime: None,
+            owner_files_runtime: std::sync::OnceLock::new(),
             state: tokio::sync::Mutex::new(PeerPoolState::default()),
             #[cfg(feature = "dfs")]
             read_crc_mode: crate::config::DfsReadCrcMode::Both,
@@ -74,6 +80,15 @@ impl PeerConnectionPool {
     pub(crate) fn with_channel_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
         self.channel_runtime = Some(runtime);
         self
+    }
+
+    /// Dial OwnerFiles channels on `runtime` instead of the pool runtime.
+    /// OwnerFs gives its synchronous peer client a small runtime of its own so
+    /// one request does not hop across every idle Node worker. Channels dialed
+    /// before the call keep their runtime; later calls are ignored.
+    #[cfg(feature = "ownerfs")]
+    pub(crate) fn set_owner_files_runtime(&self, runtime: tokio::runtime::Handle) {
+        let _ = self.owner_files_runtime.set(runtime);
     }
 
     #[cfg(feature = "dfs")]
@@ -97,20 +112,30 @@ impl PeerConnectionPool {
         node_epoch: u64,
         endpoint: &str,
     ) -> afs_error::Result<Channel> {
-        self.channel_with_timeout(node_id, node_epoch, endpoint, true, false)
+        self.channel_with_timeout(node_id, node_epoch, endpoint, true, 0)
             .await
     }
 
     /// OwnerFiles receive frames may carry large replies. Keep this profile
     /// separate from DFS channels while sharing epoch fencing and pool bounds.
+    /// `connection` selects one of several independent connections to the same
+    /// Home: one HTTP/2 connection serializes its streams on a single lock and
+    /// connection task.
     #[cfg(feature = "ownerfs")]
     pub async fn owner_files_channel(
         &self,
         node_id: &str,
         node_epoch: u64,
         endpoint: &str,
+        connection: u8,
     ) -> afs_error::Result<Channel> {
-        self.channel_with_timeout(node_id, node_epoch, endpoint, true, true)
+        let profile = connection.checked_add(1).ok_or_else(|| {
+            afs_error::Error::coded(
+                afs_error::CLIENT_ARGUMENT_INVALID,
+                "OwnerFiles connection index is out of range",
+            )
+        })?;
+        self.channel_with_timeout(node_id, node_epoch, endpoint, true, profile)
             .await
     }
 
@@ -121,7 +146,7 @@ impl PeerConnectionPool {
         node_epoch: u64,
         endpoint: &str,
     ) -> afs_error::Result<Channel> {
-        self.channel_with_timeout(node_id, node_epoch, endpoint, false, false)
+        self.channel_with_timeout(node_id, node_epoch, endpoint, false, 0)
             .await
     }
 
@@ -131,7 +156,7 @@ impl PeerConnectionPool {
         node_epoch: u64,
         endpoint: &str,
         request_timeout: bool,
-        owner_files: bool,
+        profile: u8,
     ) -> afs_error::Result<Channel> {
         if node_id.is_empty() || node_epoch == 0 || endpoint.is_empty() {
             return Err(afs_error::Error::coded(
@@ -139,12 +164,7 @@ impl PeerConnectionPool {
                 "peer identity or endpoint is incomplete",
             ));
         }
-        let key = (
-            node_id.to_owned(),
-            node_epoch,
-            endpoint.to_owned(),
-            owner_files,
-        );
+        let key = (node_id.to_owned(), node_epoch, endpoint.to_owned(), profile);
         let mut state = self.state.lock().await;
         self.channel_locked(&mut state, &key, request_timeout)
     }
@@ -157,9 +177,9 @@ impl PeerConnectionPool {
         key: &PeerChannelKey,
         request_timeout: bool,
     ) -> afs_error::Result<Channel> {
-        let (node_id, node_epoch, endpoint, owner_files) = key;
+        let (node_id, node_epoch, endpoint, profile) = key;
         let node_epoch = *node_epoch;
-        let owner_files = *owner_files;
+        let owner_files = *profile != 0;
         if state
             .high_water_epochs
             .get(node_id)
@@ -194,7 +214,14 @@ impl PeerConnectionPool {
             DFS_PEER_RECEIVE_FRAME_BYTES
         });
         // tonic spawns the connection task where the channel is built.
-        let _channel_runtime = self.channel_runtime.as_ref().map(|runtime| runtime.enter());
+        let runtime = if owner_files {
+            self.owner_files_runtime
+                .get()
+                .or(self.channel_runtime.as_ref())
+        } else {
+            self.channel_runtime.as_ref()
+        };
+        let _channel_runtime = runtime.map(|runtime| runtime.enter());
         let channel = self.security.connect_lazy(endpoint).map_err(|error| {
             afs_error::Error::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string())
         })?;
@@ -240,7 +267,7 @@ impl PeerConnectionPool {
                 "Peer stream connection identity exceeds its bound",
             ));
         }
-        let key = (node_id.to_owned(), node_epoch, endpoint.to_owned(), false);
+        let key = (node_id.to_owned(), node_epoch, endpoint.to_owned(), 0);
         if key.0.capacity().saturating_add(key.2.capacity()) > STREAM_KEY_BYTES {
             return Err(dfs_protocol_error(
                 "Peer stream connection key allocation exceeds its bound",

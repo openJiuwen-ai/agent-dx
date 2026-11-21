@@ -1113,6 +1113,10 @@ root 调用者可显式指定属主，与 `chown(2)` 一致，供管理员启用
 此信任边界与其余 OwnerFiles 数据路径相同，防止该情形需要节点侧用户身份证明。
 检查失败时 Home 不创建目录，也不写 catalog 或 Meta。
 
+访问节点到每个 Home 建 4 条 OwnerFiles 连接，请求轮流分配（单条 HTTP/2 连接的
+所有请求共用一把锁和一个收发任务）；客户端请求与连接任务运行在专用的 4 线程
+运行时上，不与 Node 主运行时的其他任务共用工作线程。
+
 workspace 可以从任意节点的 OwnerFs FUSE 路径删除：Home 在本机执行；非 Home 入口通过
 OwnerFiles `RmdirRoot` 转发给 Home，结果未知时不重放。只删除空 workspace，Home 侧物理目录
 的原子判空是唯一的决策点：非空返回 `ENOTEMPTY`，已封闭的准入会恢复、已卸载的 egress bind

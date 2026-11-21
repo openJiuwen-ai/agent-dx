@@ -3784,29 +3784,45 @@ async fn peer_pool_owner_profile_is_separate_but_shares_epoch_fencing() {
     .unwrap();
     let endpoint = "http://127.0.0.1:9";
     pool.channel("peer", 1, endpoint).await.unwrap();
-    pool.owner_files_channel("peer", 1, endpoint).await.unwrap();
-    pool.owner_files_channel("peer", 1, endpoint).await.unwrap();
+    pool.owner_files_channel("peer", 1, endpoint, 0)
+        .await
+        .unwrap();
+    pool.owner_files_channel("peer", 1, endpoint, 0)
+        .await
+        .unwrap();
+    pool.owner_files_channel("peer", 1, endpoint, 1)
+        .await
+        .unwrap();
     {
         let state = pool.state.lock().await;
-        assert_eq!(state.channels.len(), 2);
-        assert!(
-            state
-                .channels
-                .contains_key(&("peer".into(), 1, endpoint.into(), false))
-        );
-        assert!(
-            state
-                .channels
-                .contains_key(&("peer".into(), 1, endpoint.into(), true))
-        );
+        // The default channel plus two distinct OwnerFiles connections.
+        assert_eq!(state.channels.len(), 3);
+        for profile in [0, 1, 2] {
+            assert!(
+                state
+                    .channels
+                    .contains_key(&("peer".into(), 1, endpoint.into(), profile))
+            );
+        }
     }
-    pool.owner_files_channel("peer", 2, endpoint).await.unwrap();
+    assert!(
+        pool.owner_files_channel("peer", 1, endpoint, u8::MAX)
+            .await
+            .is_err()
+    );
+    pool.owner_files_channel("peer", 2, endpoint, 0)
+        .await
+        .unwrap();
     assert_eq!(pool.state.lock().await.channels.len(), 1);
     assert!(pool.channel("peer", 1, endpoint).await.is_err());
     assert!(pool.long_wait_channel("peer", 1, endpoint).await.is_err());
     pool.channel("peer", 3, endpoint).await.unwrap();
     assert_eq!(pool.state.lock().await.channels.len(), 1);
-    assert!(pool.owner_files_channel("peer", 2, endpoint).await.is_err());
+    assert!(
+        pool.owner_files_channel("peer", 2, endpoint, 0)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
