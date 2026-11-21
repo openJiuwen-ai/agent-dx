@@ -330,7 +330,7 @@ fn hixl_check(
         ready,
         body: json!({
             "configured": configured, "ready": ready, "data_mode": data_mode,
-            "transport": config.transport,
+            "transport": config.transport, "buffer_pool": config.buffer_pool,
             "relay_hbm_budget_bytes": status.map_or(0, |status| status.relay_hbm_budget_bytes),
             "hccs_domain_id": status.and_then(|status| status.hccs_domain_id),
             "lane_count": lane_count,
@@ -454,7 +454,7 @@ mod hixl_health_tests {
             export_slots: 16,
             receive_slots_in_use: 0,
             export_slots_in_use: 0,
-            transport: ReadTransport::HccsBufferPool,
+            transport: ReadTransport::Hccs,
             relay_hbm_budget_bytes: 64 * MIB,
             hccs_domain_id: Some(7),
         }
@@ -501,7 +501,8 @@ mod hixl_health_tests {
             ..hccs_status()
         };
         let config = HixlConfig {
-            transport: HixlTransport::HccsBufferPool,
+            transport: HixlTransport::Hccs,
+            buffer_pool: true,
             ..Default::default()
         };
         let check = hixl_check(
@@ -514,7 +515,8 @@ mod hixl_health_tests {
             std::slice::from_ref(&status),
         );
         assert!(check.ready);
-        assert_eq!(check.body["transport"], "hccs-buffer-pool");
+        assert_eq!(check.body["transport"], "hccs");
+        assert_eq!(check.body["buffer_pool"], true);
         assert_eq!(check.body["relay_hbm_budget_bytes"], 64 * MIB);
         assert_eq!(check.body["allocated_bytes"], 32 * MIB);
         assert_eq!(check.body["hccs_domain_id"], 7);
@@ -523,7 +525,8 @@ mod hixl_health_tests {
     #[test]
     fn health_reports_aggregate_runtime_status_and_each_configured_lane() {
         let config = HixlConfig {
-            transport: HixlTransport::HccsBufferPool,
+            transport: HixlTransport::Hccs,
+            buffer_pool: true,
             device_id: 2,
             engine_id: "127.0.0.1:7920".into(),
             device_listen_port: Some(17920),
@@ -567,7 +570,7 @@ mod hixl_health_tests {
                     engine_id: engine_id.into(),
                     generation,
                     window_bytes: 4 * MIB,
-                    transport: ReadTransport::HccsBufferPool,
+                    transport: ReadTransport::Hccs,
                     buffer_pool_count: 4,
                     buffer_pool_size_mib: 8,
                     hccs_domain_id: Some(7),

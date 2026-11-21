@@ -72,6 +72,7 @@ impl Hixl {
                             max_inflight: cfg.hixl.ownerfs_read_group_max_inflight,
                             host_budget_bytes: cfg.hixl.ownerfs_read_group_host_budget_bytes,
                             min_file_bytes: cfg.hixl.ownerfs_min_file_bytes,
+                            min_write_bytes: cfg.hixl.ownerfs_min_write_bytes,
                             receive_slots: cfg.hixl.receive_slots,
                             sessions_per_home: cfg.hixl.ownerfs_sessions_per_home,
                             session_idle: Duration::from_millis(cfg.hixl.session_idle_ms),

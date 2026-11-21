@@ -24,12 +24,9 @@ static_assert(sizeof(afs_hixl_batch_window_t) == 3 * sizeof(uint64_t),
 
 namespace {
 size_t allocations = 0;
-size_t submissions = 0;
-bool refuse_submit = false;
 bool device_roce = false;
-uintptr_t remote_address = 0;
-bool fail_poll = false;
-size_t queries = 0;
+bool write_mode = false;
+std::set<uintptr_t> registered_addresses;
 size_t registrations = 0;
 bool retain_failed_start = false;
 bool relay_mode = false;
@@ -185,6 +182,11 @@ Status Hixl::Initialize(const AscendString &, const std::map<AscendString, Ascen
     auto global = options.find(AscendString(OPTION_GLOBAL_RESOURCE_CONFIG));
     // protocol_desc would select HixlCS, whose async/direct path cannot relay.
     if (relay_mode) {
+        const auto *inter = std::getenv("HCCL_INTER_HCCS_DISABLE");
+        if (inter != nullptr && std::strcmp(inter, "TRUE") == 0) {
+            assert(std::strcmp(std::getenv("HCCL_INTRA_ROCE_ENABLE"), "1") == 0);
+            assert(std::strcmp(std::getenv("HCCL_INTRA_PCIE_ENABLE"), "0") == 0);
+        }
         if (expected_listen_port == 0) {
             assert(global == options.end());
         } else {
@@ -212,32 +214,20 @@ Status Hixl::RegisterMem(const MemDesc &desc, MemType type, MemHandle &handle) {
     ++registrations;
     assert(!relay_mode);
     if (retain_failed_start && registrations == 2) { return UNSUPPORTED; }
-    assert(type == MEM_HOST); assert(desc.addr != 0); handle = reinterpret_cast<void *>(desc.addr); return SUCCESS;
+    assert(type == MEM_HOST); assert(desc.addr != 0);
+    registered_addresses.insert(desc.addr);
+    handle = reinterpret_cast<void *>(desc.addr); return SUCCESS;
 }
 Status Hixl::DeregisterMem(MemHandle) { return retain_failed_start ? FAILED : SUCCESS; }
 Status Hixl::Connect(const AscendString &, int32_t) { return SUCCESS; }
 Status Hixl::Disconnect(const AscendString &, int32_t) { return SUCCESS; }
-Status Hixl::TransferAsync(const AscendString &, TransferOp operation, const std::vector<TransferOpDesc> &ops, const TransferArgs &, TransferReq &request) {
-    assert(!relay_mode);
-    assert(operation == READ); assert(!ops.empty()); ++submissions;
-    if (batch_mode) {
-        batch_descriptors = ops.size();
-        batch_bytes = 0;
-        for (const auto &op : ops) { batch_bytes += op.len; }
-    } else {
-        assert(ops.size() == 1);
-    }
-    remote_address = ops[0].remote_addr;
-    if (refuse_submit) { request = nullptr; return FAILED; }
-    for (const auto &op : ops) {
-        std::memcpy(reinterpret_cast<void *>(op.local_addr), reinterpret_cast<void *>(op.remote_addr), op.len);
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    request = reinterpret_cast<void *>(1); return SUCCESS;
-}
 Status Hixl::TransferSync(const AscendString &, TransferOp operation, const std::vector<TransferOpDesc> &ops, int32_t timeout) {
-    assert(relay_mode); assert(operation == READ); assert(!ops.empty());
-    assert(registrations == 0); assert(timeout == 123);
+    assert(operation == (write_mode ? WRITE : READ)); assert(!ops.empty());
+    assert(timeout > 0 && timeout <= 123);
+    for (const auto &op : ops) {
+        assert(registered_addresses.count(op.local_addr) == (relay_mode ? 0 : 1));
+        if (write_mode) { assert(registered_addresses.count(op.remote_addr) == (relay_mode ? 0 : 1)); }
+    }
     if (batch_mode) {
         batch_descriptors = ops.size();
         batch_bytes = 0;
@@ -246,24 +236,18 @@ Status Hixl::TransferSync(const AscendString &, TransferOp operation, const std:
         assert(ops.size() == 1);
     }
     ++sync_calls;
-    if (throw_sync) { throw std::runtime_error("uncertain relay submission"); }
+    if (throw_sync) { throw std::runtime_error("uncertain native submission"); }
     if (sync_status != SUCCESS) { return sync_status; }
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    remote_address = ops[0].remote_addr;
     for (const auto &op : ops) {
-        std::memcpy(reinterpret_cast<void *>(op.local_addr), reinterpret_cast<void *>(op.remote_addr), op.len);
+        if (write_mode) {
+            std::memcpy(reinterpret_cast<void *>(op.remote_addr), reinterpret_cast<void *>(op.local_addr), op.len);
+        } else {
+            std::memcpy(reinterpret_cast<void *>(op.local_addr), reinterpret_cast<void *>(op.remote_addr), op.len);
+        }
     }
     return SUCCESS;
 }
-Status Hixl::GetTransferStatus(const TransferReq &, TransferStatus &status) {
-    ++queries; status = fail_poll ? TransferStatus::FAILED : TransferStatus::COMPLETED; return SUCCESS;
-}
-}
-
-static uint32_t submit_one(void *runtime, uint64_t slot_id, const char *peer, uint64_t remote_addr, size_t len,
-                           void **out_request, uint32_t *dispatch_started, char *error, size_t error_len) {
-    afs_hixl_batch_window_t window{slot_id, remote_addr, len};
-    return afs_hixl_submit_read_batch(runtime, peer, &window, 1, out_request, dispatch_started, error, error_len);
 }
 
 // The Rust side copies pinned slots itself; these helpers do the same so each
@@ -308,38 +292,33 @@ static uint32_t read_sync_one(void *runtime, uint64_t slot_id, const char *peer,
                           sdk_transfer_ns, output_copy_ns, error, error_len);
 }
 
-static uint32_t poll_into(void *runtime, void *request, const afs_hixl_batch_window_t *windows, size_t count,
-                          uint8_t *output, size_t output_len, uint32_t *state, uint64_t *sdk_transfer_ns,
-                          uint64_t *output_copy_ns, char *error, size_t error_len) {
-    std::vector<uint64_t> addresses(count);
-    *output_copy_ns = 0;
-    const uint32_t status = afs_hixl_poll_read(runtime, request, addresses.data(), count, state, sdk_transfer_ns,
-                                               error, error_len);
-    if (status == 0 && *state == AFS_HIXL_POLL_COMPLETED) {
-        copy_and_release(runtime, windows, count, addresses, output, output_len, output_copy_ns, error, error_len);
-    }
-    return status;
-}
-
-static uint32_t poll_one(void *runtime, void *request, uint8_t *output, size_t output_len, uint32_t *state,
-                         uint64_t *sdk_transfer_ns, uint64_t *output_copy_ns, char *error, size_t error_len) {
-    afs_hixl_batch_window_t window{0, 0, output_len};
-    return poll_into(runtime, request, &window, 1, output, output_len, state, sdk_transfer_ns, output_copy_ns,
-                     error, error_len);
-}
-
 int main(int argc, char **argv) {
     assert(argc >= 2);
     rlimit no_core{0, 0}; assert(setrlimit(RLIMIT_CORE, &no_core) == 0);
     // Each fake-boundary scenario owns its HCCL inputs independently of the
     // machine's real transport settings. Conflict scenarios set them below.
     assert(unsetenv("HCCL_INTRA_ROCE_ENABLE") == 0);
+    assert(unsetenv("HCCL_INTRA_PCIE_ENABLE") == 0);
     assert(unsetenv("HCCL_INTER_HCCS_DISABLE") == 0);
     char error[512] = {};
     void *runtime = nullptr;
     uint64_t actual_domain = 0;
     const std::string scenario(argv[1]);
-    relay_mode = scenario.find("hccs-") == 0 || scenario == "numa-relay";
+    const bool roce_pool = scenario.find("roce-pool-") == 0;
+    const bool hccs = scenario.find("hccs-") == 0 || scenario == "numa-relay";
+    relay_mode = hccs || roce_pool;
+    if (roce_pool) {
+        if (scenario != "roce-pool-missing-intra") {
+            assert(setenv("HCCL_INTRA_ROCE_ENABLE", "1", 1) == 0);
+        }
+        assert(setenv("HCCL_INTRA_PCIE_ENABLE", scenario == "roce-pool-pcie-conflict" ? "1" : "0", 1) == 0);
+        if (scenario != "roce-pool-missing-inter") {
+            assert(setenv("HCCL_INTER_HCCS_DISABLE", scenario == "roce-pool-hccs-conflict" ? "FALSE" : "TRUE", 1) == 0);
+        }
+        // RoCE pool does not require an A3 SoC or an HCCS domain.
+        soc_name = "Ascend910B2";
+        fail_domain = true;
+    }
     if (scenario.find("numa-") == 0) {
         assert(argc >= 5);
         numa_pci_root = argv[2];
@@ -364,7 +343,7 @@ int main(int argc, char **argv) {
         if (scenario == "numa-alloc-failure") { fail_host_alloc_at = 2; }
 
         const auto status = afs_hixl_start(numa_user_id, "127.0.0.1:7920", 0, 4, 1, 1,
-            relay_mode ? AFS_HIXL_TRANSPORT_HCCS_BUFFER_POOL : AFS_HIXL_TRANSPORT_ROCE,
+            hccs ? AFS_HIXL_TRANSPORT_HCCS : AFS_HIXL_TRANSPORT_ROCE,
             relay_mode ? 4 : 0, relay_mode ? 8 : 0, &actual_domain, &runtime, error, sizeof(error));
         if (fail_host_alloc_at != 0) {
             assert(status != 0 && runtime == nullptr && allocations == 0);
@@ -396,7 +375,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     assert(argc == 2);
-    if (scenario == "roce-listen-port" || scenario == "hccs-listen-port") { expected_listen_port = 27666; }
+    if (scenario == "roce-listen-port" || scenario == "hccs-listen-port" || scenario == "roce-pool-listen-port") { expected_listen_port = 27666; }
     if (scenario == "roce-max-listen-port") { expected_listen_port = 65535; }
     if (scenario == "roce-invalid-listen-port" || scenario == "hccs-invalid-listen-port") { expected_listen_port = 65536; }
     if (scenario == "hccs-unsupported-soc") { soc_name = "Ascend910B2"; }
@@ -408,7 +387,7 @@ int main(int argc, char **argv) {
     if (scenario == "hccs-completed") { assert(setenv("HCCL_INTER_HCCS_DISABLE", "FALSE", 1) == 0); }
     auto start = [&](size_t count = 4, size_t size_mib = 8) {
         return afs_hixl_start(0, "127.0.0.1:7920", expected_listen_port, 4, 1, 1,
-            relay_mode ? AFS_HIXL_TRANSPORT_HCCS_BUFFER_POOL : AFS_HIXL_TRANSPORT_ROCE,
+            hccs ? AFS_HIXL_TRANSPORT_HCCS : AFS_HIXL_TRANSPORT_ROCE,
             relay_mode ? count : 0, relay_mode ? size_mib : 0, &actual_domain, &runtime, error, sizeof(error));
     };
     auto start_on = [&](int32_t device_id, const char *engine_id, uint32_t listen_port, void **out) {
@@ -416,6 +395,17 @@ int main(int argc, char **argv) {
         return afs_hixl_start(device_id, engine_id, listen_port, 4, 1, 1,
             AFS_HIXL_TRANSPORT_ROCE, 0, 0, &actual_domain, out, error, sizeof(error));
     };
+    if (scenario == "hccs-direct" || scenario == "hccs-partial-pool" || scenario == "roce-pool-partial") {
+        assert(start(scenario == "hccs-direct" ? 0 : 4, 0) == hixl::PARAM_INVALID);
+        assert(runtime == nullptr && allocations == 0 && acl_init_calls == 0);
+        return 0;
+    }
+    if (scenario == "roce-pool-missing-intra" || scenario == "roce-pool-missing-inter" ||
+        scenario == "roce-pool-pcie-conflict" || scenario == "roce-pool-hccs-conflict") {
+        assert(start() == hixl::PARAM_INVALID);
+        assert(runtime == nullptr && allocations == 0 && acl_init_calls == 0);
+        return 0;
+    }
     if (scenario == "hccs-invalid-pool" || scenario == "roce-invalid-listen-port" ||
         scenario == "hccs-invalid-listen-port") {
         assert(start(64, 8) != 0); assert(runtime == nullptr); assert(allocations == 0); return 0;
@@ -522,13 +512,61 @@ int main(int argc, char **argv) {
         assert(device_resets[0] == 1 && acl_finalize_calls == 2 && finalizations == 1);
         return 0;
     }
+    if (scenario.find("-write-") != std::string::npos) {
+        write_mode = true;
+        batch_mode = true;
+        constexpr char peer[] = "127.0.0.1:7921";
+        assert(afs_hixl_start(0, "127.0.0.1:7920", 0, 4, 2, 2,
+            hccs ? AFS_HIXL_TRANSPORT_HCCS : AFS_HIXL_TRANSPORT_ROCE,
+            relay_mode ? 4 : 0, relay_mode ? 8 : 0, &actual_domain, &runtime, error, sizeof(error)) == 0);
+        assert(afs_hixl_connect(runtime, peer, 1000, error, sizeof(error)) == 0);
+        afs_hixl_window_t exports[2]{};
+        assert(afs_hixl_reserve_export(runtime, 0, 1, 3, &exports[0], error, sizeof(error)) == 0);
+        assert(afs_hixl_reserve_export(runtime, 1, 1, 4, &exports[1], error, sizeof(error)) == 0);
+        afs_hixl_batch_window_t windows[]{{0, exports[0].address, 3}, {1, exports[1].address, 4}};
+        uint8_t payload[]{'a', 'b', 'c', 'd', 'e', 'f', 'g'};
+        uint32_t dispatched = 1;
+        auto write = [&](size_t len = sizeof(payload), uint32_t timeout = 123) {
+            return afs_hixl_write_batch(runtime, peer, windows, 2, payload, len, timeout,
+                                        &dispatched, error, sizeof(error));
+        };
+        assert(write(sizeof(payload) - 1) == hixl::PARAM_INVALID && dispatched == 0);
+        assert(sync_calls == 0);
+        if (scenario.find("-write-success") != std::string::npos) {
+            assert(setenv("AFS_HIXL_TEST_FAIL_BEFORE_DISPATCH", "1", 1) == 0);
+            assert(write() != 0 && dispatched == 0);
+            assert(unsetenv("AFS_HIXL_TEST_FAIL_BEFORE_DISPATCH") == 0);
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                ++payload[0];
+                assert(write() == 0 && dispatched == 1);
+                assert(std::memcmp(reinterpret_cast<void *>(exports[0].address), payload, 3) == 0);
+                assert(std::memcmp(reinterpret_cast<void *>(exports[1].address), payload + 3, 4) == 0);
+            }
+            assert(batch_descriptors == 2 && batch_bytes == 7);
+            assert(sync_calls == 2);
+            assert(afs_hixl_release_export(runtime, 0, 1, error, sizeof(error)) == 0);
+            assert(afs_hixl_release_export(runtime, 1, 1, error, sizeof(error)) == 0);
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == 0);
+            afs_hixl_destroy(runtime);
+        } else {
+            throw_sync = scenario.find("-write-exception") != std::string::npos;
+            sync_status = scenario.find("-timeout") != std::string::npos ? hixl::TIMEOUT : hixl::FAILED;
+            const auto status = write(sizeof(payload), 123);
+            assert(status != 0 && dispatched == 1 && sync_calls == 1);
+            if (sync_status == hixl::TIMEOUT) { assert(status == hixl::TIMEOUT); }
+            assert(write() != 0 && dispatched == 0);
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) != 0);
+            assert(allocations == 4 && finalizations == 0);
+        }
+        return 0;
+    }
     if (scenario == "roce-batch-100mib" || scenario == "hccs-batch-100mib") {
         batch_mode = true;
         constexpr size_t window_bytes = 4u * 1024u * 1024u;
         constexpr size_t window_count = 25;
         constexpr size_t total_bytes = window_count * window_bytes;
         assert(afs_hixl_start(0, "127.0.0.1:7920", expected_listen_port, window_bytes, window_count, 1,
-            relay_mode ? AFS_HIXL_TRANSPORT_HCCS_BUFFER_POOL : AFS_HIXL_TRANSPORT_ROCE,
+            hccs ? AFS_HIXL_TRANSPORT_HCCS : AFS_HIXL_TRANSPORT_ROCE,
             relay_mode ? 4 : 0, relay_mode ? 8 : 0, &actual_domain, &runtime, error, sizeof(error)) == 0);
         assert(allocations == window_count + 1);
         assert(afs_hixl_connect(runtime, "127.0.0.1:7921", 1000, error, sizeof(error)) == 0);
@@ -546,25 +584,16 @@ int main(int argc, char **argv) {
         }
         std::vector<uint8_t> output(total_bytes, 0);
         char rejection[512] = {};
-        const size_t sdk_baseline = relay_mode ? sync_calls : submissions;
-        auto sdk_calls = [&]() { return relay_mode ? sync_calls : submissions; };
+        const size_t sdk_baseline = sync_calls;
         auto rejects = [&](const std::vector<afs_hixl_batch_window_t> &bad) {
             uint32_t dispatch = 999;
-            if (relay_mode) {
-                uint64_t sdk_ns = 17;
-                uint64_t copy_ns = 17;
-                assert(read_sync_into(runtime, "127.0.0.1:7921", bad.data(), bad.size(),
-                    output.data(), output.size(), 123, &dispatch, &sdk_ns, &copy_ns,
-                    rejection, sizeof(rejection)) != 0);
-                assert(sdk_ns == 0 && copy_ns == 0);
-            } else {
-                void *rejected = nullptr;
-                assert(afs_hixl_submit_read_batch(runtime, "127.0.0.1:7921", bad.data(), bad.size(),
-                    &rejected, &dispatch, rejection, sizeof(rejection)) != 0);
-                assert(rejected == nullptr);
-            }
-            assert(dispatch == 0);
-            assert(sdk_calls() == sdk_baseline);
+            uint64_t sdk_ns = 17;
+            uint64_t copy_ns = 17;
+            assert(read_sync_into(runtime, "127.0.0.1:7921", bad.data(), bad.size(),
+                output.data(), output.size(), 123, &dispatch, &sdk_ns, &copy_ns,
+                rejection, sizeof(rejection)) != 0);
+            assert(sdk_ns == 0 && copy_ns == 0);
+            assert(dispatch == 0 && sync_calls == sdk_baseline);
         };
 
         rejects({});
@@ -588,32 +617,14 @@ int main(int argc, char **argv) {
         rejects(oversized);
 
         uint32_t dispatch = 0;
-        if (relay_mode) {
-            uint64_t sdk_ns = 0;
-            uint64_t copy_ns = 0;
-            assert(read_sync_into(runtime, "127.0.0.1:7921", windows.data(), windows.size(),
-                output.data(), output.size(), 123, &dispatch, &sdk_ns, &copy_ns,
-                error, sizeof(error)) == 0);
-            assert(dispatch == 1);
-            assert(sync_calls == sdk_baseline + 1);
-            assert(std::memcmp(output.data(), source_bytes.data(), total_bytes) == 0);
-            assert(sdk_ns >= 4000000);
-            assert(copy_ns > 0);
-        } else {
-            void *request = nullptr;
-            assert(afs_hixl_submit_read_batch(runtime, "127.0.0.1:7921", windows.data(), windows.size(),
-                &request, &dispatch, error, sizeof(error)) == 0);
-            assert(dispatch == 1 && request != nullptr);
-            assert(submissions == sdk_baseline + 1);
-            uint32_t state = 0;
-            uint64_t sdk_ns = 0;
-            uint64_t copy_ns = 0;
-            assert(poll_into(runtime, request, windows.data(), windows.size(), output.data(), output.size(), &state,
-                &sdk_ns, &copy_ns, error, sizeof(error)) == 0);
-            assert(state == AFS_HIXL_POLL_COMPLETED);
-            assert(std::memcmp(output.data(), source_bytes.data(), total_bytes) == 0);
-            assert(sdk_ns >= 4000000 && copy_ns > 0);
-        }
+        uint64_t sdk_ns = 0;
+        uint64_t copy_ns = 0;
+        assert(read_sync_into(runtime, "127.0.0.1:7921", windows.data(), windows.size(),
+            output.data(), output.size(), 123, &dispatch, &sdk_ns, &copy_ns,
+            error, sizeof(error)) == 0);
+        assert(dispatch == 1 && sync_calls == sdk_baseline + 1);
+        assert(std::memcmp(output.data(), source_bytes.data(), total_bytes) == 0);
+        assert(sdk_ns >= 4000000 && copy_ns > 0);
         assert(batch_descriptors == window_count);
         assert(batch_bytes == total_bytes);
         assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == 0);
@@ -634,34 +645,19 @@ int main(int argc, char **argv) {
     }
     assert(afs_hixl_connect(runtime, "127.0.0.1:7921", 1000, error, sizeof(error)) == 0);
     char source[4] = {'r', 'e', 'a', 'd'};
-    void *request = nullptr;
     uint32_t dispatch_started = 0;
     if (scenario == "roce-pre-dispatch-bad-alloc" || scenario == "hccs-pre-dispatch-bad-alloc") {
         char output[4] = {};
         uint64_t sdk_ns = 0;
         uint64_t copy_ns = 0;
         auto call = [&]() {
-            if (relay_mode) {
-                return read_sync_one(runtime, 0, "127.0.0.1:7921",
-                    reinterpret_cast<uintptr_t>(source), reinterpret_cast<uint8_t *>(output),
-                    sizeof(output), 123, &dispatch_started, &sdk_ns, &copy_ns, error, sizeof(error));
-            }
-            return submit_one(runtime, 0, "127.0.0.1:7921",
-                reinterpret_cast<uintptr_t>(source), 4, &request, &dispatch_started, error, sizeof(error));
-        };
-        auto complete_async = [&]() {
-            if (relay_mode) { return; }
-            uint32_t state = 0;
-            assert(request != nullptr);
-            assert(poll_one(runtime, request, reinterpret_cast<uint8_t *>(output),
-                sizeof(output), &state, &sdk_ns, &copy_ns, error, sizeof(error)) == 0);
-            assert(state == AFS_HIXL_POLL_COMPLETED);
-            request = nullptr;
+            return read_sync_one(runtime, 0, "127.0.0.1:7921",
+                reinterpret_cast<uintptr_t>(source), reinterpret_cast<uint8_t *>(output),
+                sizeof(output), 123, &dispatch_started, &sdk_ns, &copy_ns, error, sizeof(error));
         };
 
         uint32_t status = call();
         assert(status == 0 && dispatch_started == 1);
-        complete_async();
         assert(std::memcmp(output, source, 4) == 0);
 
         // Fail deterministically between Host slot reservation and dispatch;
@@ -670,20 +666,45 @@ int main(int argc, char **argv) {
         dispatch_started = 0;
         status = call();
         assert(unsetenv("AFS_HIXL_TEST_FAIL_BEFORE_DISPATCH") == 0);
-        assert(status != 0 && dispatch_started == 0 && request == nullptr);
-        assert((relay_mode ? sync_calls : submissions) == 1);
+        assert(status != 0 && dispatch_started == 0);
+        assert(sync_calls == 1);
 
         dispatch_started = 0;
         status = call();
         assert(status == 0 && dispatch_started == 1);
-        complete_async();
         assert(std::memcmp(output, source, 4) == 0);
         assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == 0);
         afs_hixl_destroy(runtime);
         assert(allocations == 0);
         return 0;
     }
-    if (scenario == "hccs-pinned-read") {
+    if (scenario == "roce-pre-dispatch-deadline" || scenario == "hccs-pre-dispatch-deadline") {
+        const char *peer = "127.0.0.1:7921";
+        const afs_hixl_batch_window_t window{0, reinterpret_cast<uintptr_t>(source), sizeof(source)};
+        uint64_t address = 17;
+        uint64_t sdk_ns = 17;
+        dispatch_started = 1;
+        // The test hook holds the reserved slot past the 1 ms budget.
+        assert(setenv("AFS_HIXL_TEST_DELAY_BEFORE_DISPATCH", "1", 1) == 0);
+        const auto result = afs_hixl_read_sync_batch(runtime, peer, &window, 1, &address, 1,
+            &dispatch_started, &sdk_ns, error, sizeof(error));
+        assert(unsetenv("AFS_HIXL_TEST_DELAY_BEFORE_DISPATCH") == 0);
+        assert(result == hixl::TIMEOUT && dispatch_started == 0 && sync_calls == 0);
+        assert(sdk_ns == 0 && address == 17);
+
+        // Retry the same slot to prove the expired READ returned its reservation.
+        uint8_t output[sizeof(source)] = {};
+        uint64_t copy_ns = 0;
+        assert(read_sync_into(runtime, peer, &window, 1, output, sizeof(output), 123,
+            &dispatch_started, &sdk_ns, &copy_ns, error, sizeof(error)) == 0);
+        assert(dispatch_started == 1 && sync_calls == 1);
+        assert(std::memcmp(output, source, sizeof(output)) == 0);
+        assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == 0);
+        afs_hixl_destroy(runtime);
+        assert(allocations == 0 && finalizations == 1);
+        return 0;
+    }
+    if (scenario == "hccs-pinned-read" || scenario == "roce-pinned-read") {
         afs_hixl_batch_window_t window{0, reinterpret_cast<uintptr_t>(source), 4};
         uint64_t address = 0;
         uint64_t sdk_ns = 0;
@@ -708,76 +729,38 @@ int main(int argc, char **argv) {
         afs_hixl_destroy(runtime);
         return 0;
     }
-    if (relay_mode) {
-        assert(registrations == 0);
-        assert(actual_domain == 7);
-        char output[4] = {};
-        uint64_t sdk_transfer_ns = 17;
-        uint64_t output_copy_ns = 17;
-        const uint32_t timeout = scenario == "hccs-pre-submit-invalid" ? 0 : 123;
-        sync_status = scenario == "hccs-timeout" ? hixl::TIMEOUT :
-            scenario == "hccs-failed" ? hixl::FAILED : hixl::SUCCESS;
-        throw_sync = scenario == "hccs-exception";
-        const auto result = read_sync_one(runtime, 0, "127.0.0.1:7921", reinterpret_cast<uintptr_t>(source),
-            reinterpret_cast<uint8_t *>(output), sizeof(output), timeout, &dispatch_started,
-            &sdk_transfer_ns, &output_copy_ns, error, sizeof(error));
-        if (scenario == "hccs-pre-submit-invalid") {
-            assert(result != 0); assert(dispatch_started == 0); assert(sync_calls == 0);
-            assert(sdk_transfer_ns == 0 && output_copy_ns == 0);
-        } else if (scenario == "hccs-completed" || scenario == "hccs-listen-port") {
-            assert(result == 0); assert(dispatch_started == 1); assert(sync_calls == 1);
-            assert(std::memcmp(output, source, 4) == 0); assert(queries == 0);
-            assert(sdk_transfer_ns >= 4000000);
-            assert(output_copy_ns < sdk_transfer_ns);
-        } else {
-            assert(result != 0); assert(dispatch_started == 1); assert(sync_calls == 1);
-            assert(sdk_transfer_ns == 0 && output_copy_ns == 0);
-            assert(output[0] == 0); assert(afs_hixl_shutdown(runtime, error, sizeof(error)) != 0);
-            assert(allocations == 2); assert(finalizations == 0); return 0;
-        }
-        assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == 0);
-        afs_hixl_destroy(runtime); assert(allocations == 0); assert(finalizations == 1); return 0;
-    }
-    if (std::string(argv[1]) == "pre-submit-invalid") {
-        dispatch_started = 999;
-        assert(submit_one(runtime, 0, "127.0.0.1:7921", 0, 4, &request, &dispatch_started, error, sizeof(error)) != 0);
-        assert(dispatch_started == 0); assert(submissions == 0);
-        assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == 0);
-        afs_hixl_destroy(runtime); assert(allocations == 0); return 0;
-    }
-    refuse_submit = std::string(argv[1]) == "unknown-submit";
-    uint32_t status = submit_one(runtime, 0, "127.0.0.1:7921", reinterpret_cast<uintptr_t>(source), 4, &request, &dispatch_started, error, sizeof(error));
-    assert(dispatch_started == 1);
-    if (refuse_submit) {
-        assert(status != 0);
-        refuse_submit = false;
-        assert(submit_one(runtime, 0, "127.0.0.1:7921", reinterpret_cast<uintptr_t>(source), 4, &request, &dispatch_started, error, sizeof(error)) != 0);
-        assert(dispatch_started == 0);
-        assert(submissions == 1);
-        assert(afs_hixl_shutdown(runtime, error, sizeof(error)) != 0);
-        assert(allocations == 2);
-        // Quarantined resources intentionally survive until this test process exits.
-        return 0;
-    }
-    assert(status == 0); assert(remote_address == reinterpret_cast<uintptr_t>(source));
-    char output[4] = {}; uint32_t state = 0;
+    assert(registrations == (relay_mode ? 0 : 2));
+    assert(actual_domain == (hccs ? 7 : 0));
+    uint8_t output[4] = {};
     uint64_t sdk_transfer_ns = 17;
     uint64_t output_copy_ns = 17;
-    fail_poll = std::string(argv[1]) == "failed-poll";
-    if (fail_poll) {
-        assert(poll_one(runtime, request, reinterpret_cast<uint8_t *>(output), sizeof(output), &state,
-            &sdk_transfer_ns, &output_copy_ns, error, sizeof(error)) != 0);
+    const bool invalid = scenario.find("-pre-submit-invalid") != std::string::npos;
+    sync_status = scenario.find("-timeout") != std::string::npos ? hixl::TIMEOUT :
+        scenario.find("-failed") != std::string::npos ? hixl::FAILED : hixl::SUCCESS;
+    throw_sync = scenario.find("-exception") != std::string::npos;
+    auto read = [&](uint32_t timeout) {
+        return read_sync_one(runtime, 0, "127.0.0.1:7921", reinterpret_cast<uintptr_t>(source),
+            output, sizeof(output), timeout, &dispatch_started, &sdk_transfer_ns, &output_copy_ns,
+            error, sizeof(error));
+    };
+    const auto result = read(invalid ? 0 : 123);
+    if (invalid) {
+        assert(result != 0 && dispatch_started == 0 && sync_calls == 0);
         assert(sdk_transfer_ns == 0 && output_copy_ns == 0);
-        assert(poll_one(runtime, request, reinterpret_cast<uint8_t *>(output), sizeof(output), &state,
-            &sdk_transfer_ns, &output_copy_ns, error, sizeof(error)) != 0);
-        assert(queries == 1); assert(afs_hixl_shutdown(runtime, error, sizeof(error)) != 0);
-        assert(allocations == 2); return 0;
+    } else if (throw_sync || sync_status != hixl::SUCCESS) {
+        assert(result != 0 && dispatch_started == 1 && sync_calls == 1);
+        if (sync_status == hixl::TIMEOUT) { assert(result == hixl::TIMEOUT); }
+        assert(sdk_transfer_ns == 0 && output_copy_ns == 0 && output[0] == 0);
+        assert(read(123) != 0 && dispatch_started == 0 && sync_calls == 1);
+        assert(afs_hixl_shutdown(runtime, error, sizeof(error)) != 0);
+        assert(allocations == 2 && finalizations == 0);
+        return 0;
+    } else {
+        assert(result == 0 && dispatch_started == 1 && sync_calls == 1);
+        assert(std::memcmp(output, source, sizeof(output)) == 0);
+        assert(sdk_transfer_ns >= 4000000 && output_copy_ns < sdk_transfer_ns);
     }
-    assert(poll_one(runtime, request, reinterpret_cast<uint8_t *>(output), sizeof(output), &state,
-        &sdk_transfer_ns, &output_copy_ns, error, sizeof(error)) == 0);
-    assert(state == AFS_HIXL_POLL_COMPLETED); assert(std::memcmp(output, source, 4) == 0);
-    assert(sdk_transfer_ns >= 4000000);
-    assert(output_copy_ns < sdk_transfer_ns);
     assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == 0);
-    afs_hixl_destroy(runtime); assert(allocations == 0);
+    afs_hixl_destroy(runtime);
+    assert(allocations == 0 && finalizations == 1);
 }

@@ -1,10 +1,13 @@
 use afs_transport::hixl::{
-    EngineInfo, ExportWindow, HixlErrorKind, HixlPhase, RuntimeOptions, RuntimeState,
+    EngineInfo, ExportWindow, HixlErrorKind, HixlPhase, ReadTransport, RuntimeOptions, RuntimeState,
 };
 
 #[test]
 fn hixl_public_contract_is_available_without_native_feature() {
     let options = RuntimeOptions::default();
+    assert_eq!(options.transport, ReadTransport::Roce);
+    assert!(!options.buffer_pool);
+    assert_eq!(ReadTransport::Hccs.to_string(), "hccs");
     let info = EngineInfo {
         engine_id: options.engine_id.clone(),
         generation: 1,
@@ -24,6 +27,7 @@ fn hixl_public_contract_is_available_without_native_feature() {
     assert_eq!(window.generation, 1);
     assert_eq!(RuntimeState::Stopped.to_string(), "stopped");
     assert_eq!(HixlPhase::Start.to_string(), "start");
+    assert_eq!(HixlPhase::CompleteRead.to_string(), "complete_read");
     assert_eq!(HixlErrorKind::Unsupported.to_string(), "unsupported");
 }
 

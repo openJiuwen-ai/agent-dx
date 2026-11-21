@@ -499,6 +499,18 @@ impl PeerBatchDirectory {
         self.directory.read_dir().map_err(Error::from)
     }
 
+    /// Complete byte-sorted entry names, or `None` if either limit is exceeded.
+    #[cfg(feature = "dfs")]
+    pub(crate) fn names_bounded(
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<OsString>>> {
+        self.directory
+            .read_dir_bounded(max_entries, max_bytes)
+            .map_err(Error::from)
+    }
+
     /// The entry without following a final symlink; `None` unless it is a
     /// regular file.
     pub fn stat(&self, name: &OsStr) -> Result<Option<PeerBatchEntry>> {
@@ -9177,6 +9189,7 @@ mod tests {
         release_calls: AtomicUsize,
         lock_session_release_calls: AtomicUsize,
         lose_write_reply_once: AtomicBool,
+        reject_checksum_once: AtomicBool,
         fail_flush_once: AtomicBool,
         fail_fsync_once: AtomicBool,
         fail_lock_session_release: AtomicBool,
@@ -9197,6 +9210,7 @@ mod tests {
                 release_calls: AtomicUsize::new(0),
                 lock_session_release_calls: AtomicUsize::new(0),
                 lose_write_reply_once: AtomicBool::new(false),
+                reject_checksum_once: AtomicBool::new(false),
                 fail_flush_once: AtomicBool::new(false),
                 fail_fsync_once: AtomicBool::new(false),
                 fail_lock_session_release: AtomicBool::new(false),
@@ -9488,6 +9502,12 @@ mod tests {
             self.observe_active_write();
             std::thread::sleep(self.write_delay);
             self.active_writes.fetch_sub(1, Ordering::SeqCst);
+            if self.reject_checksum_once.swap(false, Ordering::SeqCst) {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_CHECKSUM,
+                    "fixture: Home rejected checksum before writing",
+                ));
+            }
             if self.lose_write_reply_once.swap(false, Ordering::SeqCst) {
                 return Err(Error::coded(
                     afs_error::NODE_OWNER_WRITE_UNKNOWN,
@@ -12985,6 +13005,23 @@ mod tests {
         );
         assert!(remote.last_write_killpriv.load(Ordering::SeqCst));
         fs.release(&ctx, handle).unwrap();
+    }
+
+    #[test]
+    fn checksum_rejection_does_not_leave_a_fatal_sync_error_on_the_fd() {
+        let (_temp, fs, ctx) = fixture();
+        let root_id = root::root_id_from_name(OsStr::new("job-42")).unwrap();
+        let remote = Arc::new(SlowRemoteFiles::new(root_id, Duration::ZERO));
+        remote.reject_checksum_once.store(true, Ordering::SeqCst);
+        let handle = insert_slow_remote_handle(&fs, remote.clone(), 1);
+        assert_eq!(
+            fs.write(&ctx, handle, 0, b"bad").unwrap_err().code(),
+            afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_CHECKSUM
+        );
+        assert_eq!(fs.write(&ctx, handle, 0, b"good").unwrap(), 4);
+        fs.flush(&ctx, handle).unwrap();
+        fs.fsync(&ctx, handle, SyncMode::Full).unwrap();
+        assert_eq!(remote.fsync_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

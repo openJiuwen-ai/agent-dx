@@ -1,4 +1,4 @@
-//! Home-side OwnerFs HIXL read-ahead windows.
+//! Home-side OwnerFs HIXL read-ahead windows and write tickets.
 //!
 //! A session is only a transport lease opened by an authenticated peer that
 //! presented one valid RootAccess. Every prepare carries its own RootAccess
@@ -7,13 +7,14 @@
 //! export slots that stay immutable until the reader releases them. Unknown
 //! native outcomes, unreleased slots of a closed session and drain timeouts
 //! freeze admission and keep the shared runtime quarantined.
+//! Write tickets reuse those sessions and the same export pool.
 
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use afs_protocol::node_data::{
@@ -41,6 +42,8 @@ use crate::node::vfs::ownerfs::{
     OwnerFsPeerExecutor, PeerBatchDirectory, PeerBatchDirectoryVersion, PeerBatchFile,
 };
 
+mod write;
+
 const MAX_OWNER_HIXL_SESSIONS: usize = 64;
 const MAX_OWNER_HIXL_RELEASE_TOMBSTONES: usize = 256;
 const MAX_OWNER_HIXL_READ_ID_BYTES: usize = 256;
@@ -50,24 +53,39 @@ const OWNER_HIXL_EXPORT_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_OWNER_SOURCE_THREADS: usize = 8;
 /// Files one batch prepare packs at most; bounds the reply size.
 const MAX_OWNER_HIXL_BATCH_FILES: usize = 1024;
-/// Directory entries one batch prepare examines at most, so a directory of
-/// ineligible entries cannot make a single prepare unbounded.
+/// Maximum entries in a complete HIXL directory snapshot.
 pub(crate) const MAX_OWNER_HIXL_BATCH_SCAN: usize = 4096;
 /// Longest parent path or anchor name a batch prepare accepts (Linux PATH_MAX).
 const MAX_OWNER_HIXL_BATCH_PATH_BYTES: usize = 4096;
 /// Snapshots retained by one service (shared by its clones).
 const MAX_OWNER_HIXL_BATCH_SNAPSHOTS: usize = 8;
-/// Sum of name vector and per-name allocations per retained snapshot.
+/// Sum of name vector and per-name allocations allowed during collection.
 const MAX_OWNER_HIXL_BATCH_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
-/// The Home file boundary used by prepare. Production delegates to the
-/// OwnerFs peer executor so authorization stays identical to `Read`.
+/// The Home file boundary used by prepare and commit. Production delegates to the
+/// OwnerFs peer executor so each transfer uses the regular file-operation authority.
 pub(crate) trait OwnerWindowSource: Send + Sync {
     fn authorize_transport(
         &self,
         peer: &str,
         access: &PresentedRootAccess,
     ) -> afs_error::Result<()>;
+    fn authorize_write(
+        &self,
+        peer: &str,
+        access: &PresentedRootAccess,
+        file: &RemoteFile,
+    ) -> afs_error::Result<()>;
+    fn write(
+        &self,
+        peer: &str,
+        access: &PresentedRootAccess,
+        file: &RemoteFile,
+        offset: u64,
+        data: &[u8],
+        options: crate::node::vfs::types::WriteOptions,
+    ) -> afs_error::Result<usize>;
+
     fn read(
         &self,
         peer: &str,
@@ -112,8 +130,12 @@ pub(crate) struct BatchEntry {
 pub(crate) trait OwnerBatchDirectory: Send + Sync {
     /// Identity and change timestamps of the open directory.
     fn version(&self) -> afs_error::Result<PeerBatchDirectoryVersion>;
-    /// Entry names in byte order.
-    fn names(&self) -> afs_error::Result<Vec<OsString>>;
+    /// Complete entry names in byte order, or `None` on budget exhaustion.
+    fn names_bounded(
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> afs_error::Result<Option<Vec<OsString>>>;
     /// The entry without following a final symlink; `None` unless it is a
     /// regular file.
     fn stat(&self, name: &OsStr) -> afs_error::Result<Option<BatchEntry>>;
@@ -135,6 +157,27 @@ impl OwnerWindowSource for OwnerFsPeerExecutor {
         access: &PresentedRootAccess,
     ) -> afs_error::Result<()> {
         OwnerFsPeerExecutor::authorize_transport(self, peer, access)
+    }
+
+    fn authorize_write(
+        &self,
+        peer: &str,
+        access: &PresentedRootAccess,
+        file: &RemoteFile,
+    ) -> afs_error::Result<()> {
+        self.authorize_data_write(peer, access, file)
+    }
+
+    fn write(
+        &self,
+        peer: &str,
+        access: &PresentedRootAccess,
+        file: &RemoteFile,
+        offset: u64,
+        data: &[u8],
+        options: crate::node::vfs::types::WriteOptions,
+    ) -> afs_error::Result<usize> {
+        self.write_with_options(peer, access, file, offset, data, options)
     }
 
     fn read(
@@ -184,8 +227,12 @@ impl OwnerBatchDirectory for PeerBatchDirectory {
         PeerBatchDirectory::version(self)
     }
 
-    fn names(&self) -> afs_error::Result<Vec<OsString>> {
-        PeerBatchDirectory::names(self)
+    fn names_bounded(
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> afs_error::Result<Option<Vec<OsString>>> {
+        PeerBatchDirectory::names_bounded(self, max_entries, max_bytes)
     }
 
     fn stat(&self, name: &OsStr) -> afs_error::Result<Option<BatchEntry>> {
@@ -221,7 +268,7 @@ impl OwnerBatchSource for ExecutorBatchSource {
 pub struct OwnerHixlService {
     provider: Arc<dyn ExportProvider>,
     source: Arc<dyn OwnerWindowSource>,
-    reads: Arc<HomeReads>,
+    transfers: Arc<HomeTransfers>,
     batch_snapshots: Arc<Mutex<VecDeque<BatchDirectorySnapshot>>>,
     metrics: Option<HixlMetrics>,
     owner_metrics: Option<OwnerRpcMetrics>,
@@ -231,9 +278,10 @@ pub struct OwnerHixlService {
 }
 
 #[derive(Default)]
-struct HomeReads {
+struct HomeTransfers {
     registry: Mutex<Registry>,
     preparing: AtomicUsize,
+    writes_changed: Condvar,
 }
 
 struct BatchDirectorySnapshot {
@@ -243,7 +291,8 @@ struct BatchDirectorySnapshot {
     generation: u64,
     home_session: String,
     version: PeerBatchDirectoryVersion,
-    names: Arc<Vec<OsString>>,
+    // None records an over-budget directory at this version.
+    names: Option<Arc<Vec<OsString>>>,
 }
 
 impl BatchDirectorySnapshot {
@@ -259,9 +308,9 @@ impl BatchDirectorySnapshot {
     }
 }
 
-struct PreparingRead<'a>(&'a AtomicUsize);
+struct PreparingExport<'a>(&'a AtomicUsize);
 
-impl Drop for PreparingRead<'_> {
+impl Drop for PreparingExport<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Release);
     }
@@ -280,7 +329,7 @@ impl OwnerHixlService {
         Self {
             provider,
             source,
-            reads: Arc::new(HomeReads::default()),
+            transfers: Arc::new(HomeTransfers::default()),
             batch_snapshots: Arc::new(Mutex::new(VecDeque::new())),
             metrics: None,
             owner_metrics: None,
@@ -362,7 +411,7 @@ impl OwnerHixlService {
                 let mut registry = service.lock_registry()?;
                 registry.draining = true;
                 let pending = registry.active_slot_count() != 0
-                    || service.reads.preparing.load(Ordering::Acquire) != 0;
+                    || service.transfers.preparing.load(Ordering::Acquire) != 0;
                 if pending && Instant::now() >= deadline {
                     let message = match service.quarantine_pending(&mut registry, true) {
                         Ok(()) => "OwnerFs HIXL drain deadline exceeded; pending slots retained".into(),
@@ -469,16 +518,19 @@ impl OwnerHixlService {
     }
 
     fn lock_registry(&self) -> Result<std::sync::MutexGuard<'_, Registry>, Status> {
-        self.reads
+        self.transfers
             .registry
             .lock()
             .map_err(|_| Status::internal("OwnerFs HIXL registry lock is poisoned"))
     }
 
     /// Register a new Prepare while holding the same lock that freezes admission.
-    fn track_prepare(&self, _admission: &std::sync::MutexGuard<'_, Registry>) -> PreparingRead<'_> {
-        self.reads.preparing.fetch_add(1, Ordering::Relaxed);
-        PreparingRead(&self.reads.preparing)
+    fn track_prepare(
+        &self,
+        _admission: &std::sync::MutexGuard<'_, Registry>,
+    ) -> PreparingExport<'_> {
+        self.transfers.preparing.fetch_add(1, Ordering::Relaxed);
+        PreparingExport(&self.transfers.preparing)
     }
 
     fn negotiate_blocking(
@@ -521,11 +573,29 @@ impl OwnerHixlService {
                 "HIXL engine generation is quarantined or draining",
             ));
         }
-        if registry.sessions.len() >= MAX_OWNER_HIXL_SESSIONS {
+        if registry.sessions.values().filter(|s| !s.closed).count() >= MAX_OWNER_HIXL_SESSIONS {
             return Err(coded_status(
                 afs_error::NODE_TRANSFER_RESOURCE_EXHAUSTED,
                 "OwnerFs HIXL session capacity is exhausted",
             ));
+        }
+        // Keep recent Close/Release replies replayable without charging drained
+        // sessions to the live quota. IDs never repeat, so an evicted request
+        // fails closed; never evict a session that still owns native slots.
+        if registry.sessions.len() >= 2 * MAX_OWNER_HIXL_SESSIONS {
+            let oldest = registry
+                .sessions
+                .iter()
+                .filter(|(_, s)| s.closed && !s.has_pending_slots())
+                .min_by_key(|(_, s)| s.last_used)
+                .map(|(&id, _)| id)
+                .ok_or_else(|| {
+                    coded_status(
+                        afs_error::NODE_TRANSFER_RESOURCE_EXHAUSTED,
+                        "OwnerFs HIXL sessions are still draining",
+                    )
+                })?;
+            registry.sessions.remove(&oldest);
         }
         let session_id = registry.next_session_id()?;
         registry.sessions.insert(
@@ -537,6 +607,8 @@ impl OwnerHixlService {
                 closed: false,
                 last_used: Instant::now(),
                 reads: HashMap::new(),
+                writes: HashMap::new(),
+                cancelled_successors: HashMap::new(),
                 tombstones: Tombstones::default(),
                 checksum,
             },
@@ -551,6 +623,7 @@ impl OwnerHixlService {
             hccs_domain_id,
             lanes,
             slot_checksum_algorithm: checksum.wire() as i32,
+            write_checksum_negotiated: true,
         })
     }
 
@@ -558,12 +631,15 @@ impl OwnerHixlService {
         &self,
         peer: &str,
         session_id: u64,
-        prior_release: Option<&OwnerReleaseHixlReadRequest>,
+        read_context: Option<(&str, Option<&OwnerReleaseHixlReadRequest>)>,
     ) -> Result<std::sync::MutexGuard<'_, Registry>, Status> {
         let mut registry = self.lock_registry()?;
         registry.expire_sessions();
         self.quarantine_pending(&mut registry, false)?;
-        self.apply_prior_release(&mut registry, peer, session_id, prior_release)?;
+        if let Some((home_session_id, prior_release)) = read_context {
+            registry.prepare_session(session_id, peer, home_session_id)?;
+            self.apply_prior_release(&mut registry, peer, session_id, prior_release)?;
+        }
         Ok(registry)
     }
 
@@ -623,29 +699,15 @@ impl OwnerHixlService {
         })?;
 
         let (window_bytes, checksum, admitted_at, _preparing) = {
-            let mut registry =
-                self.prepare_registry(peer, request.session_id, request.prior_release.as_ref())?;
+            let mut registry = self.prepare_registry(
+                peer,
+                request.session_id,
+                Some((&access.home_session_id, request.prior_release.as_ref())),
+            )?;
             // Admitted reads remain replayable even when new admission stops.
-            let session =
-                registry.prepare_session(request.session_id, peer, &access.home_session_id)?;
+            let session = registry.session_mut(request.session_id, peer)?;
             let checksum = session.checksum;
-            let replay = match session
-                .reads
-                .get(&request.read_id)
-                .map(|record| &record.admitted)
-            {
-                Some(Admitted::Window {
-                    request: admitted,
-                    reply,
-                }) if *admitted == request => Some(reply.clone()),
-                Some(_) => {
-                    return Err(coded_status(
-                        afs_error::NODE_TRANSFER_INVALID,
-                        "OwnerFs HIXL replay differs from the admitted prepare",
-                    ));
-                }
-                None => None,
-            };
+            let replay = session.replay_window(&request)?;
             if let Some(reply) = replay {
                 drop(registry);
                 self.authorize_read(peer, &access, &file)?;
@@ -765,6 +827,9 @@ impl OwnerHixlService {
         let (read, checksums) = filled?;
         let eof = read < length;
         if read == 0 {
+            self.prepare_registry(peer, request.session_id, None)?
+                .session_mut(request.session_id, peer)?
+                .check_read_id(&request.read_id, Some(admitted_at))?;
             return Ok(OwnerPrepareReadHixlReply {
                 session_id: request.session_id,
                 read_id: request.read_id,
@@ -779,29 +844,12 @@ impl OwnerHixlService {
         // Slots past the end of the file are never published.
         pending.truncate(checksums.len());
 
-        let mut registry = self.lock_registry()?;
-        registry.expire_sessions();
-        self.quarantine_pending(&mut registry, false)?;
-        // A transport retry may have raced this attempt; the identical
-        // request that won keeps its slots and this attempt releases its own.
+        // An identical retry may have published its slots while this attempt filled its own.
+        let mut registry = self.prepare_registry(peer, request.session_id, None)?;
         let session = registry.session_mut(request.session_id, peer)?;
         session.check_read_id(&request.read_id, Some(admitted_at))?;
-        match session
-            .reads
-            .get(&request.read_id)
-            .map(|record| &record.admitted)
-        {
-            Some(Admitted::Window {
-                request: admitted,
-                reply,
-            }) if *admitted == request => return Ok(reply.clone()),
-            Some(_) => {
-                return Err(coded_status(
-                    afs_error::NODE_TRANSFER_INVALID,
-                    "OwnerFs HIXL replay differs from the admitted prepare",
-                ));
-            }
-            None => {}
+        if let Some(reply) = session.replay_window(&request)? {
+            return Ok(reply);
         }
         let lane = registry
             .admitting_session(request.session_id, peer)?
@@ -814,14 +862,11 @@ impl OwnerHixlService {
             .zip(checksums)
             .enumerate()
             .map(|(index, (reservation, checksum))| {
-                let window = reservation.window();
-                OwnerHixlSlot {
-                    slot_id: window.slot_id,
-                    slot_generation: window.generation,
-                    address: window.address,
-                    length: (read - index * window_bytes).min(window_bytes) as u64,
+                export_descriptor(
+                    reservation,
+                    (read - index * window_bytes).min(window_bytes),
                     checksum,
-                }
+                )
             })
             .collect();
         let reply = OwnerPrepareReadHixlReply {
@@ -847,6 +892,7 @@ impl OwnerHixlService {
                     reply: reply.clone(),
                 },
                 lane_id,
+                native_outcome_unknown: false,
             },
         );
         Ok(reply)
@@ -897,27 +943,14 @@ impl OwnerHixlService {
         let parent = OsStr::from_bytes(&request.parent_path).to_owned();
 
         let (slot_bytes, max_slots, checksum, admitted_at, _preparing) = {
-            let mut registry =
-                self.prepare_registry(peer, request.session_id, request.prior_release.as_ref())?;
-            let session =
-                registry.prepare_session(request.session_id, peer, &access.home_session_id)?;
+            let mut registry = self.prepare_registry(
+                peer,
+                request.session_id,
+                Some((&access.home_session_id, request.prior_release.as_ref())),
+            )?;
+            let session = registry.session_mut(request.session_id, peer)?;
             let checksum = session.checksum;
-            let replay = match session
-                .reads
-                .get(&request.read_id)
-                .map(|record| &record.admitted)
-            {
-                Some(Admitted::Batch {
-                    request: admitted,
-                    reply,
-                }) if *admitted == request => Some(reply.clone()),
-                Some(_) => {
-                    return Err(invalid(
-                        "OwnerFs HIXL replay differs from the admitted prepare",
-                    ));
-                }
-                None => None,
-            };
+            let replay = session.replay_batch(&request)?;
             if let Some(reply) = replay {
                 drop(registry);
                 // Replay still proves the grant is current.
@@ -950,17 +983,23 @@ impl OwnerHixlService {
         let names = self
             .batch_directory_names(directory.as_ref(), &access, &parent)
             .map_err(error_to_status)?;
-        let plan = plan_batch(
-            directory.as_ref(),
-            &names,
-            &request.anchor_name,
-            request.min_file_bytes,
-            request.max_file_bytes,
-            slot_bytes,
-            max_slots,
-        );
-        drop(names);
+        // Without a complete sorted listing there is no safe continuation.
+        // An empty batch lets the reader use its ordinary file-read path.
+        let plan = names.map_or_else(BatchPlan::default, |names| {
+            plan_batch(
+                directory.as_ref(),
+                &names,
+                &request.anchor_name,
+                request.min_file_bytes,
+                request.max_file_bytes,
+                slot_bytes,
+                max_slots,
+            )
+        });
         if plan.slots.is_empty() {
+            self.prepare_registry(peer, request.session_id, None)?
+                .session_mut(request.session_id, peer)?
+                .check_read_id(&request.read_id, Some(admitted_at))?;
             return Ok(OwnerPrepareBatchHixlReply {
                 session_id: request.session_id,
                 read_id: request.read_id,
@@ -992,12 +1031,20 @@ impl OwnerHixlService {
         directory: &dyn OwnerBatchDirectory,
         access: &PresentedRootAccess,
         parent: &OsStr,
-    ) -> afs_error::Result<Arc<Vec<OsString>>> {
+    ) -> afs_error::Result<Option<Arc<Vec<OsString>>>> {
+        let collect = || {
+            directory
+                .names_bounded(
+                    MAX_OWNER_HIXL_BATCH_SCAN,
+                    MAX_OWNER_HIXL_BATCH_SNAPSHOT_BYTES,
+                )
+                .map(|names| names.map(Arc::new))
+        };
         // Bound key allocations too. The caller already bounds the parent path.
         if access.id.0.len() > MAX_OWNER_HIXL_BATCH_PATH_BYTES
             || access.home_session_id.len() > MAX_OWNER_HIXL_BATCH_PATH_BYTES
         {
-            return Ok(Arc::new(directory.names()?));
+            return collect();
         }
         // The caller has reopened the directory under a current read grant.
         // All filesystem work stays outside the snapshot lock.
@@ -1014,11 +1061,10 @@ impl OwnerHixlService {
             return Ok(names);
         }
 
-        let names = Arc::new(directory.names()?);
+        let names = collect()?;
         // Never publish a snapshot from a failed stamp check, a concurrent
-        // mutation during enumeration, or a directory over the memory budget.
+        // mutation during enumeration. Cache a stable over-budget result too.
         if let Some(version) = version
-            && batch_snapshot_fits(&names, names.capacity())
             && directory.version().ok() == Some(version)
             && let Ok(mut snapshots) = self.batch_snapshots.lock()
         {
@@ -1084,29 +1130,12 @@ impl OwnerHixlService {
         );
         self.observe(Operation::SourceRead, started, true);
 
-        let mut registry = self.lock_registry()?;
-        registry.expire_sessions();
-        self.quarantine_pending(&mut registry, false)?;
-        // A transport retry may have raced this attempt; the identical
-        // request that won keeps its slots and this attempt releases its own.
+        // An identical retry may have published its slots while this attempt filled its own.
+        let mut registry = self.prepare_registry(peer, request.session_id, None)?;
         let session = registry.session_mut(request.session_id, peer)?;
         session.check_read_id(&request.read_id, Some(admitted_at))?;
-        match session
-            .reads
-            .get(&request.read_id)
-            .map(|record| &record.admitted)
-        {
-            Some(Admitted::Batch {
-                request: admitted,
-                reply,
-            }) if *admitted == request => return Ok(reply.clone()),
-            Some(_) => {
-                return Err(coded_status(
-                    afs_error::NODE_TRANSFER_INVALID,
-                    "OwnerFs HIXL replay differs from the admitted prepare",
-                ));
-            }
-            None => {}
+        if let Some(reply) = session.replay_batch(&request)? {
+            return Ok(reply);
         }
         let lane = registry
             .admitting_session(request.session_id, peer)?
@@ -1122,14 +1151,7 @@ impl OwnerHixlService {
         {
             let slot_index = u32::try_from(index)
                 .map_err(|_| Status::internal("OwnerFs HIXL batch slot index overflows"))?;
-            let window = reservation.window();
-            slots.push(OwnerHixlSlot {
-                slot_id: window.slot_id,
-                slot_generation: window.generation,
-                address: window.address,
-                length: planned.used as u64,
-                checksum: digest,
-            });
+            slots.push(export_descriptor(reservation, planned.used, digest));
             bytes = bytes.saturating_add(planned.used as u64);
             for (file, whole) in planned.files.iter().zip(whole) {
                 if whole {
@@ -1171,6 +1193,7 @@ impl OwnerHixlService {
                     reply: reply.clone(),
                 },
                 lane_id,
+                native_outcome_unknown: false,
             },
         );
         Ok(reply)
@@ -1287,25 +1310,30 @@ impl OwnerHixlService {
         let mut pinned = false;
         let reply = {
             let session = registry.session_mut(request.session_id, peer)?;
-            session.last_used = Instant::now();
             if session.tombstones.matches(request) {
+                session.last_used = Instant::now();
                 OwnerReleaseHixlReadReply {
                     consumed: true,
                     already_released: true,
                 }
             } else {
-                let record = session.reads.get(&request.read_id).ok_or_else(|| {
-                    coded_status(
-                        afs_error::NODE_TRANSFER_INVALID,
-                        "OwnerFs HIXL release does not identify an admitted read",
-                    )
-                })?;
+                let Some(record) = session.reads.get_mut(&request.read_id) else {
+                    return session.retire_unpublished_read(request, outcome);
+                };
                 if record.admitted.engine_generation() != request.engine_generation {
                     return Err(Status::permission_denied(
                         "OwnerFs HIXL release engine identity does not match",
                     ));
                 }
+                if outcome == HixlReleaseOutcome::NotSubmitted && record.native_outcome_unknown {
+                    return Err(coded_status(
+                        afs_error::NODE_TRANSFER_INVALID,
+                        "OwnerFs HIXL read has an unknown native transfer outcome",
+                    ));
+                }
+                session.last_used = Instant::now();
                 if outcome == HixlReleaseOutcome::Unknown {
+                    record.native_outcome_unknown = true;
                     pinned = true;
                     OwnerReleaseHixlReadReply::default()
                 } else {
@@ -1362,7 +1390,7 @@ impl OwnerHixlService {
             let session = registry.session_mut(request.session_id, peer)?;
             session.closed = true;
             session.last_used = Instant::now();
-            session.reads.is_empty()
+            !session.has_pending_slots()
         };
         self.quarantine_pending(&mut registry, false)?;
         Ok(OwnerCloseHixlReply { drained })
@@ -1405,23 +1433,9 @@ struct PlannedFile {
     length: usize,
 }
 
-fn batch_snapshot_fits(names: &[OsString], capacity: usize) -> bool {
-    let vector_bytes = capacity.saturating_mul(std::mem::size_of::<OsString>());
-    let Some(mut remaining) = MAX_OWNER_HIXL_BATCH_SNAPSHOT_BYTES.checked_sub(vector_bytes) else {
-        return false;
-    };
-    for name in names {
-        let Some(left) = remaining.checked_sub(name.capacity()) else {
-            return false;
-        };
-        remaining = left;
-    }
-    true
-}
-
 /// Packs eligible regular files in name order from the anchor, whole files
 /// only and never across a slot. Stops when no slot is left for the next
-/// file, at the file limit or at the scan limit; that entry becomes `next`.
+/// file or at the file limit; that entry becomes `next`.
 fn plan_batch(
     directory: &dyn OwnerBatchDirectory,
     names: &[OsString],
@@ -1434,8 +1448,8 @@ fn plan_batch(
     let start = names.partition_point(|name| name.as_bytes() < anchor);
     let mut plan = BatchPlan::default();
     let mut files = 0_usize;
-    for (scanned, name) in names[start..].iter().enumerate() {
-        if scanned == MAX_OWNER_HIXL_BATCH_SCAN || files == MAX_OWNER_HIXL_BATCH_FILES {
+    for name in &names[start..] {
+        if files == MAX_OWNER_HIXL_BATCH_FILES {
             plan.next = name.as_bytes().to_vec();
             break;
         }
@@ -1611,6 +1625,7 @@ fn release_outcome(request: &OwnerReleaseHixlReadRequest) -> Result<HixlReleaseO
     })?;
     if request.session_id == 0
         || request.read_id.is_empty()
+        || request.read_id.len() > MAX_OWNER_HIXL_READ_ID_BYTES
         || request.engine_generation == 0
         || outcome == HixlReleaseOutcome::Unspecified
         || (outcome == HixlReleaseOutcome::NotSubmitted && request.content_validated)
@@ -1645,7 +1660,7 @@ impl Registry {
         }
         self.sessions.retain(|_, session| {
             !(session.closed
-                && session.reads.is_empty()
+                && !session.has_pending_slots()
                 && session.tombstones.is_empty()
                 && now.duration_since(session.last_used) >= OWNER_HIXL_SESSION_TTL)
         });
@@ -1654,7 +1669,7 @@ impl Registry {
     fn has_closed_pending_slots(&self) -> bool {
         self.sessions
             .values()
-            .any(|session| session.closed && !session.reads.is_empty())
+            .any(|session| session.closed && session.has_uncertain_slots())
     }
 
     fn next_session_id(&mut self) -> Result<u64, Status> {
@@ -1667,17 +1682,14 @@ impl Registry {
     fn active_slot_count(&self) -> usize {
         self.sessions
             .values()
-            .flat_map(|session| session.reads.values())
-            .map(|read| read.admitted.slots().len())
+            .map(|session| session.slot_count(None))
             .sum()
     }
 
     fn lane_slot_count(&self, lane: usize) -> usize {
         self.sessions
             .values()
-            .flat_map(|session| session.reads.values())
-            .filter(|read| read.lane_id == lane)
-            .map(|read| read.admitted.slots().len())
+            .map(|session| session.slot_count(Some(lane)))
             .sum()
     }
 
@@ -1734,11 +1746,41 @@ struct Session {
     closed: bool,
     last_used: Instant,
     reads: HashMap<String, ReadRecord>,
+    writes: HashMap<String, write::WriteRecord>,
+    cancelled_successors: HashMap<String, u64>,
     tombstones: Tombstones,
     checksum: SlotChecksum,
 }
 
 impl Session {
+    fn has_pending_slots(&self) -> bool {
+        !self.reads.is_empty() || self.writes.values().any(|write| write.slot_count() != 0)
+    }
+
+    fn has_uncertain_slots(&self) -> bool {
+        !self.reads.is_empty()
+            || self
+                .writes
+                .values()
+                .any(write::WriteRecord::needs_quarantine)
+    }
+
+    fn slot_count(&self, lane: Option<usize>) -> usize {
+        let reads: usize = self
+            .reads
+            .values()
+            .filter(|read| lane.is_none_or(|lane| read.lane_id == lane))
+            .map(|read| read.admitted.slots().len())
+            .sum();
+        let writes: usize = self
+            .writes
+            .values()
+            .filter(|write| lane.is_none_or(|lane| write.lane_id() == Some(lane)))
+            .map(write::WriteRecord::slot_count)
+            .sum();
+        reads + writes
+    }
+
     fn prepare_slot_bytes(&self, lane_id: usize, slot_bytes: u64) -> Result<usize, Status> {
         let lane_bytes = self
             .lanes
@@ -1762,6 +1804,74 @@ impl Session {
             })
     }
 
+    fn replay_window(
+        &self,
+        request: &OwnerPrepareReadHixlRequest,
+    ) -> Result<Option<OwnerPrepareReadHixlReply>, Status> {
+        match self
+            .reads
+            .get(&request.read_id)
+            .map(|record| &record.admitted)
+        {
+            Some(Admitted::Window {
+                request: admitted,
+                reply,
+            }) if admitted == request => Ok(Some(reply.clone())),
+            Some(_) => Err(prepare_replay_mismatch()),
+            None => Ok(None),
+        }
+    }
+
+    fn replay_batch(
+        &self,
+        request: &OwnerPrepareBatchHixlRequest,
+    ) -> Result<Option<OwnerPrepareBatchHixlReply>, Status> {
+        match self
+            .reads
+            .get(&request.read_id)
+            .map(|record| &record.admitted)
+        {
+            Some(Admitted::Batch {
+                request: admitted,
+                reply,
+            }) if admitted == request => Ok(Some(reply.clone())),
+            Some(_) => Err(prepare_replay_mismatch()),
+            None => Ok(None),
+        }
+    }
+
+    /// NotSubmitted can arrive before its Prepare or while it is filling slots.
+    /// The authenticated session and negotiated Home generation fence that ID
+    /// under the same registry lock that publishes prepared slots.
+    fn retire_unpublished_read(
+        &mut self,
+        request: &OwnerReleaseHixlReadRequest,
+        outcome: HixlReleaseOutcome,
+    ) -> Result<OwnerReleaseHixlReadReply, Status> {
+        if outcome != HixlReleaseOutcome::NotSubmitted || self.tombstones.contains(&request.read_id)
+        {
+            return Err(coded_status(
+                afs_error::NODE_TRANSFER_INVALID,
+                "OwnerFs HIXL release does not identify an admitted read or matching release",
+            ));
+        }
+        if !self
+            .lanes
+            .iter()
+            .any(|lane| lane.generation == request.engine_generation)
+        {
+            return Err(Status::permission_denied(
+                "OwnerFs HIXL release engine identity does not match",
+            ));
+        }
+        self.last_used = Instant::now();
+        self.tombstones.insert(request);
+        Ok(OwnerReleaseHixlReadReply {
+            consumed: true,
+            already_released: false,
+        })
+    }
+
     fn admit_read_id(&mut self, read_id: &str) -> Result<Instant, Status> {
         self.check_read_id(read_id, None)?;
         self.last_used = Instant::now();
@@ -1773,6 +1883,14 @@ impl Session {
             return Err(coded_status(
                 afs_error::NODE_TRANSFER_INVALID,
                 "OwnerFs HIXL read was already released",
+            ));
+        }
+        // Legacy IDs are opaque. Once an abandoned ID leaves bounded history,
+        // the session can drain existing replies but cannot admit another read.
+        if self.tombstones.evicted_not_submitted {
+            return Err(coded_status(
+                afs_error::NODE_TRANSFER_UNAVAILABLE,
+                "OwnerFs HIXL session no longer covers abandoned read IDs",
             ));
         }
         // A release could have retired this attempt while source I/O ran.
@@ -1790,9 +1908,33 @@ impl Session {
     }
 }
 
+fn prepare_replay_mismatch() -> Status {
+    coded_status(
+        afs_error::NODE_TRANSFER_INVALID,
+        "OwnerFs HIXL replay differs from the admitted prepare",
+    )
+}
+
+/// Describes the initialized prefix of a reserved slot for the peer.
+fn export_descriptor(
+    reservation: &PendingExport<'_>,
+    length: usize,
+    checksum: Vec<u8>,
+) -> OwnerHixlSlot {
+    let window = reservation.window();
+    OwnerHixlSlot {
+        slot_id: window.slot_id,
+        slot_generation: window.generation,
+        address: window.address,
+        length: length as u64,
+        checksum,
+    }
+}
+
 struct ReadRecord {
     admitted: Admitted,
     lane_id: usize,
+    native_outcome_unknown: bool,
 }
 
 /// The admitted prepare a read id answers on replay.
@@ -1835,6 +1977,7 @@ struct Tombstones {
     by_read: HashMap<String, ReleaseTombstone>,
     order: VecDeque<String>,
     last_evicted_release: Option<Instant>,
+    evicted_not_submitted: bool,
 }
 
 impl Tombstones {
@@ -1890,6 +2033,7 @@ impl Tombstones {
             && let Some(entry) = self.by_read.remove(&read_id)
         {
             self.last_evicted_release = Some(entry.inserted_at);
+            self.evicted_not_submitted |= entry.outcome == HixlReleaseOutcome::NotSubmitted as i32;
         }
     }
 }

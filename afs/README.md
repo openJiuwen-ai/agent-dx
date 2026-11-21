@@ -87,10 +87,15 @@ HIXL 为 OwnerFs 提供可选的远端预读窗口和小文件目录批量。默
 HIXL/ACL 头文件及共享库的 Linux 环境中，可运行
 `make afs-check ADX_WITH_AFS=1 ADX_AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann`。
 `data_mode = "grpc" | "rdma" | "hixl" | "auto"` 选择节点间正文通道，控制面走 gRPC，默认使用 `"grpc"`。
-`"hixl"` 用于启用了 native HIXL 的 OwnerFs-only Node，覆盖远端缓冲读。`"auto"` 在配置
-`[hixl].engine_id` 后为符合条件的 OwnerFs 读优先选择 HIXL，OwnerFs 写使用 RDMA 或 gRPC。
+`"hixl"` 用于启用了 native HIXL 的 OwnerFs-only Node，成功协商的会话同时支持远端缓冲读和已打开文件的缓冲写，每次操作仍单独校验授权。`"auto"` 在配置
+`[hixl].engine_id` 后为符合条件的 OwnerFs 缓冲读写优先选择 HIXL。Auto 读的 `[hixl].ownerfs_min_file_bytes` 按打开时的文件大小决定是否启用预读窗口；小文件仍可使用目录批量。
+Auto 写的 `[hixl].ownerfs_min_write_bytes` 按本次请求的正文长度判断，在申请或复用写槽前选通道。
+默认 `524288` 字节（512 KiB），有效范围 `0..=1048576`；达到阈值才尝试 HIXL，低于阈值沿用普通 RDMA/gRPC 策略。
+`0` 对所有非空缓冲写尝试 HIXL；显式 `data_mode = "hixl"` 不受此写阈值限制。
+写端推送至 Home 槽位后提交原文件句柄，Home 返回实际写入长度。
+OwnerFs 的 HIXL 传输在设备工作线程调用 `TransferSync`，每批 READ 或 WRITE 提交一次。RoCE 直传注册 Host 缓冲区，启用 `buffer_pool` 时使用中转池；应用写仍以 Home 返回的实际写入长度为准。
 DFS 读写使用各自装配的 RDMA 或 gRPC 路径。
-`[hixl].transport` 默认 `"roce"`，A3 同 super-pod 域可用 `"hccs-buffer-pool"`，
+`[hixl].transport` 选择 `"roce"`（默认）或 `"hccs"`；`buffer_pool` 默认 `false`。RoCE 可直传或启用中转池，A3 同 super-pod 域的 HCCS 必须启用中转池。两端的链路、池开关和启用时的池参数须一致；切换后重启双方 Node。RoCE 启用中转池时，两个 Node 进程都要显式设置 `HCCL_INTRA_ROCE_ENABLE=1`、`HCCL_INTRA_PCIE_ENABLE=0` 和 `HCCL_INTER_HCCS_DISABLE=TRUE`。
 `[[hixl.additional_devices]]` 最多配置 16 个逻辑设备。
 每条 lane 分配普通 Host 接收槽和导出槽时，优先选择 NPU 的 PCI NUMA 节点。无法确定 PCI 节点时，才用 `sched_getaffinity` 读取实际分配槽的 owner 线程允许使用的 CPU；只有非空掩码中的每个 CPU 都能确认属于同一个 NUMA 节点时，才用该节点。没有可信节点、已有非默认内存策略或无法设置优先策略时，沿用原策略。
 

@@ -23,6 +23,9 @@
 #include <set>
 #include <string>
 #include <vector>
+#ifdef AFS_HIXL_TEST_FAULT_INJECTION
+#include <thread>
+#endif
 
 namespace {
 
@@ -46,13 +49,6 @@ struct HostSlot {
     bool quarantined = false;
 };
 
-struct Request {
-    hixl::TransferReq handle = nullptr;
-    std::vector<size_t> slot_ids;
-    std::chrono::steady_clock::time_point dispatched_at{};
-    bool active = false;
-};
-
 struct BatchPlan {
     std::vector<size_t> slot_ids;
     std::vector<hixl::TransferOpDesc> descriptors;
@@ -68,12 +64,11 @@ struct Runtime {
     bool engine_initialized = false;
     bool poisoned = false;
     bool clean = false;
-    bool hccs_relay = false;
+    bool relay = false;
     uint64_t hccs_domain_id = 0;
     size_t window_bytes = 0;
     std::vector<HostSlot> receive;
     std::vector<HostSlot> exports;
-    std::vector<Request> requests;
     std::set<std::string> peers;
 };
 
@@ -305,11 +300,13 @@ uint32_t register_pool(Runtime *runtime,
             return kFailed;
         }
         if (status != ACL_SUCCESS) { return acl_status(status, error, error_len, "aclrtMallocHost"); }
-        if (runtime->hccs_relay) {
+        if (runtime->relay) {
             // Unregistered Host addresses select the SDK's BufferPool relay
             // path. Registering these would accidentally select direct H2H.
             continue;
         }
+        // RegisterMem has no access-mode flags. The MEM_HOST registration
+        // serves both remote READ exports and remote WRITE destinations.
         hixl::MemDesc descriptor{reinterpret_cast<uintptr_t>(slot.address), slot.length};
         const hixl::Status register_status =
             runtime->engine.RegisterMem(descriptor, hixl::MEM_HOST, slot.handle);
@@ -330,24 +327,6 @@ HostSlot *get_slot(std::vector<HostSlot> &pool, uint64_t slot_id, char *error, s
     return &pool[static_cast<size_t>(slot_id)];
 }
 
-Request *find_request(Runtime *runtime, hixl::TransferReq handle) {
-    for (Request &request : runtime->requests) {
-        if (request.active && request.handle == handle) {
-            return &request;
-        }
-    }
-    return nullptr;
-}
-
-Request *find_free_request(Runtime *runtime) {
-    for (Request &request : runtime->requests) {
-        if (!request.active) {
-            return &request;
-        }
-    }
-    return nullptr;
-}
-
 void quarantine_slots(Runtime *runtime, const std::vector<size_t> &slot_ids) {
     for (size_t slot_id : slot_ids) {
         if (slot_id < runtime->receive.size()) {
@@ -357,11 +336,6 @@ void quarantine_slots(Runtime *runtime, const std::vector<size_t> &slot_ids) {
         }
     }
     runtime->poisoned = true;
-}
-
-void quarantine_request(Runtime *runtime, Request &request) {
-    quarantine_slots(runtime, request.slot_ids);
-    request.active = false;
 }
 
 uint32_t plan_batch(Runtime *runtime,
@@ -425,13 +399,15 @@ void release_reservation(Runtime *runtime, const BatchPlan &plan) noexcept {
 }
 
 // Test seam: the fake-boundary bridge test recompiles this file with
-// AFS_HIXL_TEST_FAULT_INJECTION so it can fail deterministically between Host
-// slot reservation and the dispatch boundary. Production builds neither
-// define nor call this helper.
+// AFS_HIXL_TEST_FAULT_INJECTION so it can fail or delay between Host slot
+// reservation and the dispatch boundary. Production builds do not use this hook.
 #ifdef AFS_HIXL_TEST_FAULT_INJECTION
-void fail_before_dispatch_for_test() {
+void inject_before_dispatch_for_test() {
     if (std::getenv("AFS_HIXL_TEST_FAIL_BEFORE_DISPATCH") != nullptr) {
         throw std::bad_alloc();
+    }
+    if (std::getenv("AFS_HIXL_TEST_DELAY_BEFORE_DISPATCH") != nullptr) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
 #endif
@@ -476,23 +452,24 @@ extern "C" uint32_t afs_hixl_start(int32_t device_id,
     if (out_hccs_domain_id != nullptr) {
         *out_hccs_domain_id = 0;
     }
-    const bool relay = transport == AFS_HIXL_TRANSPORT_HCCS_BUFFER_POOL;
+    const bool hccs = transport == AFS_HIXL_TRANSPORT_HCCS;
+    const bool relay = buffer_pool_count != 0 && buffer_pool_size_mib != 0;
     if (out_runtime == nullptr || out_hccs_domain_id == nullptr || device_id < 0 || engine_id == nullptr || engine_id[0] == '\0' ||
         device_listen_port > std::numeric_limits<uint16_t>::max() ||
         window_bytes == 0 || window_bytes > kMaxWindowBytes || receive_slots == 0 || export_slots == 0 ||
         receive_slots > 128 || export_slots > 128 ||
         receive_slots > std::numeric_limits<size_t>::max() - export_slots ||
         (receive_slots + export_slots) > kMaxSlotPoolBytes / window_bytes ||
-        (transport != AFS_HIXL_TRANSPORT_ROCE && !relay) ||
-        (!relay && (buffer_pool_count != 0 || buffer_pool_size_mib != 0)) ||
-        (relay && (buffer_pool_count == 0 || buffer_pool_count > 64 ||
-                   buffer_pool_size_mib == 0 || buffer_pool_size_mib > 64 ||
+        (transport != AFS_HIXL_TRANSPORT_ROCE && !hccs) ||
+        ((buffer_pool_count == 0) != (buffer_pool_size_mib == 0)) ||
+        (hccs && !relay) ||
+        (relay && (buffer_pool_count > 64 || buffer_pool_size_mib > 64 ||
                    buffer_pool_count * buffer_pool_size_mib > kMaxPoolBytes / (2U * 1024U * 1024U)))) {
         write_error(error, error_len, "invalid HIXL start arguments");
         return kParamInvalid;
     }
     *out_runtime = nullptr;
-    if (relay) {
+    if (hccs) {
         const char *inter_hccs_disable = std::getenv("HCCL_INTER_HCCS_DISABLE");
         if (inter_hccs_disable != nullptr && std::strcmp(inter_hccs_disable, "FALSE") != 0) {
             write_error(error, error_len, "hccs-buffer-pool requires HCCL_INTER_HCCS_DISABLE unset or FALSE");
@@ -503,23 +480,36 @@ extern "C" uint32_t afs_hixl_start(int32_t device_id,
             write_error(error, error_len, "hccs-buffer-pool conflicts with HCCL_INTRA_ROCE_ENABLE; unset it or set 0");
             return kParamInvalid;
         }
+    } else if (relay) {
+        // BufferPool uses HCCL communication domains. Select RoCE for both
+        // intra-server and inter-server links before initializing the SDK.
+        const char *intra_roce = std::getenv("HCCL_INTRA_ROCE_ENABLE");
+        const char *intra_pcie = std::getenv("HCCL_INTRA_PCIE_ENABLE");
+        const char *inter_hccs_disable = std::getenv("HCCL_INTER_HCCS_DISABLE");
+        if (intra_roce == nullptr || std::strcmp(intra_roce, "1") != 0 ||
+            intra_pcie == nullptr || std::strcmp(intra_pcie, "0") != 0 ||
+            inter_hccs_disable == nullptr || std::strcmp(inter_hccs_disable, "TRUE") != 0) {
+            write_error(error, error_len,
+                        "RoCE BufferPool requires HCCL_INTRA_ROCE_ENABLE=1, "
+                        "HCCL_INTRA_PCIE_ENABLE=0 and HCCL_INTER_HCCS_DISABLE=TRUE");
+            return kParamInvalid;
+        }
     }
     std::unique_ptr<Runtime> holder;
     try {
         holder = std::make_unique<Runtime>();
         auto *runtime = holder.get();
         runtime->device_id = device_id;
-        runtime->hccs_relay = relay;
+        runtime->relay = relay;
         runtime->window_bytes = window_bytes;
         runtime->receive.resize(receive_slots);
         runtime->exports.resize(export_slots);
-        runtime->requests.resize(receive_slots);
         uint32_t status = initialize_acl(runtime, error, error_len);
         if (status != kSuccess) {
             cleanup_failed_start(holder, out_runtime);
             return status;
         }
-        if (relay) {
+        if (hccs) {
             // These are the A3 SoCs recognized by the paired HIXL generation.
             // Unknown devices fail before engine/HBM initialization.
             static const std::set<std::string> a3_socs = {
@@ -723,89 +713,6 @@ extern "C" uint32_t afs_hixl_release_export(void *opaque,
     }
 }
 
-extern "C" uint32_t afs_hixl_submit_read_batch(void *opaque,
-                                               const char *peer,
-                                               const afs_hixl_batch_window_t *windows,
-                                               size_t count,
-                                               void **out_request,
-                                               uint32_t *dispatch_started,
-                                               char *error,
-                                               size_t error_len) {
-    auto *runtime = static_cast<Runtime *>(opaque);
-    bool invoked = false;
-    bool reserved = false;
-    Request *request = nullptr;
-    BatchPlan plan;
-    if (out_request == nullptr || dispatch_started == nullptr) {
-        write_error(error, error_len, "invalid HIXL submit output arguments");
-        return kParamInvalid;
-    }
-    *out_request = nullptr;
-    *dispatch_started = 0;
-    try {
-        uint32_t status = check_runtime(runtime, error, error_len);
-        if (status != kSuccess) {
-            return status;
-        }
-        if (runtime->hccs_relay || peer == nullptr || peer[0] == '\0') {
-            write_error(error, error_len, "invalid HIXL batch READ arguments");
-            return kParamInvalid;
-        }
-        if (runtime->peers.find(peer) == runtime->peers.end()) {
-            write_error(error, error_len, "HIXL READ peer is not connected");
-            return kNotConnected;
-        }
-        request = find_free_request(runtime);
-        if (request == nullptr) {
-            return kResourceExhausted;
-        }
-        status = plan_batch(runtime, windows, count, plan, error, error_len);
-        if (status != kSuccess) {
-            return status;
-        }
-        hixl::TransferArgs args{};
-        hixl::TransferReq native_request = nullptr;
-        // Entering TransferAsync is the uncertainty boundary. A failure or
-        // exception after this point does not prove that no DMA was submitted.
-        reserve_batch(runtime, plan);
-        reserved = true;
-#ifdef AFS_HIXL_TEST_FAULT_INJECTION
-        fail_before_dispatch_for_test();
-#endif
-        request->slot_ids.swap(plan.slot_ids);
-        request->active = true;
-        *dispatch_started = 1;
-        invoked = true;
-        request->dispatched_at = std::chrono::steady_clock::now();
-        status = runtime->engine.TransferAsync(hixl::AscendString(peer), hixl::READ,
-                                               plan.descriptors, args, native_request);
-        request->handle = native_request;
-        *out_request = native_request;
-        if (status != kSuccess || native_request == nullptr) {
-            quarantine_request(runtime, *request);
-            write_error(error, error_len, "HIXL batch READ submission outcome is unknown; Host slots and engine are retained");
-            return status == kSuccess ? kFailed : status;
-        }
-        return kSuccess;
-    } catch (const std::exception &exception) {
-        if (invoked && request != nullptr) {
-            quarantine_request(runtime, *request);
-        } else if (reserved) {
-            release_reservation(runtime, plan);
-        }
-        write_error(error, error_len, exception.what());
-        return kFailed;
-    } catch (...) {
-        if (invoked && request != nullptr) {
-            quarantine_request(runtime, *request);
-        } else if (reserved) {
-            release_reservation(runtime, plan);
-        }
-        write_error(error, error_len, "unknown exception submitting HIXL batch READ");
-        return kFailed;
-    }
-}
-
 extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
                                              const char *peer,
                                              const afs_hixl_batch_window_t *windows,
@@ -826,13 +733,14 @@ extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
     }
     *dispatch_started = 0;
     *sdk_transfer_ns = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     try {
         const uint32_t checked = check_runtime(runtime, error, error_len);
         if (checked != kSuccess) { return checked; }
-        if (!runtime->hccs_relay || peer == nullptr || peer[0] == '\0' ||
+        if (peer == nullptr || peer[0] == '\0' ||
             slot_addresses == nullptr ||
             timeout_ms == 0 || timeout_ms > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
-            write_error(error, error_len, "invalid HCCS relay batch READ arguments");
+            write_error(error, error_len, "invalid HIXL batch READ arguments");
             return kParamInvalid;
         }
         if (runtime->peers.find(peer) == runtime->peers.end()) {
@@ -841,23 +749,31 @@ extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
         }
         const uint32_t planned = plan_batch(runtime, windows, count, plan, error, error_len);
         if (planned != kSuccess) { return planned; }
+        const hixl::AscendString remote(peer);
         reserve_batch(runtime, plan);
         reserved = true;
 #ifdef AFS_HIXL_TEST_FAULT_INJECTION
-        fail_before_dispatch_for_test();
+        inject_before_dispatch_for_test();
 #endif
+        const auto available = deadline - std::chrono::steady_clock::now();
+        if (available <= std::chrono::steady_clock::duration::zero()) {
+            release_reservation(runtime, plan);
+            write_error(error, error_len, "HIXL batch READ expired before dispatch");
+            return kTimeout;
+        }
+        const auto millis = std::chrono::ceil<std::chrono::milliseconds>(available).count();
         // A non-successful synchronous call is still an uncertain submission.
         // Do not finalize the engine/HBM pools or free any Host window.
         *dispatch_started = 1;
         invoked = true;
         const auto sdk_start = std::chrono::steady_clock::now();
-        const auto status = runtime->engine.TransferSync(hixl::AscendString(peer), hixl::READ,
+        const auto status = runtime->engine.TransferSync(remote, hixl::READ,
                                                           plan.descriptors,
-                                                          static_cast<int32_t>(timeout_ms));
+                                                          static_cast<int32_t>(millis));
         const auto sdk_end = std::chrono::steady_clock::now();
         if (status != kSuccess) {
             quarantine_slots(runtime, plan.slot_ids);
-            write_error(error, error_len, "HCCS relay batch READ outcome is uncertain; Host windows, HBM and engine retained");
+            write_error(error, error_len, "HIXL batch READ outcome is uncertain; Host windows and engine retained");
             return status;
         }
         *sdk_transfer_ns = elapsed_nanoseconds(sdk_start, sdk_end);
@@ -877,7 +793,101 @@ extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
         } else if (reserved) {
             release_reservation(runtime, plan);
         }
-        write_error(error, error_len, "unknown exception during HCCS relay batch READ");
+        write_error(error, error_len, "unknown exception during HIXL batch READ");
+        return kFailed;
+    }
+}
+
+extern "C" uint32_t afs_hixl_write_batch(void *opaque,
+                                          const char *peer,
+                                          const afs_hixl_batch_window_t *windows,
+                                          size_t count,
+                                          const uint8_t *bytes,
+                                          size_t len,
+                                          uint32_t timeout_ms,
+                                          uint32_t *dispatch_started,
+                                          char *error,
+                                          size_t error_len) {
+    if (dispatch_started == nullptr) {
+        write_error(error, error_len, "missing HIXL batch WRITE dispatch output");
+        return kParamInvalid;
+    }
+    *dispatch_started = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    auto *runtime = static_cast<Runtime *>(opaque);
+    BatchPlan plan;
+    bool reserved = false;
+    auto retain_or_release = [&]() {
+        if (*dispatch_started != 0) {
+            quarantine_slots(runtime, plan.slot_ids);
+        } else if (reserved) {
+            release_reservation(runtime, plan);
+        }
+    };
+    try {
+        uint32_t status = check_runtime(runtime, error, error_len);
+        if (status != kSuccess) { return status; }
+        if (peer == nullptr || peer[0] == '\0' || bytes == nullptr || len == 0 ||
+            timeout_ms == 0 || timeout_ms > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+            write_error(error, error_len, "invalid HIXL batch WRITE arguments");
+            return kParamInvalid;
+        }
+        if (runtime->peers.find(peer) == runtime->peers.end()) {
+            write_error(error, error_len, "HIXL WRITE peer is not connected");
+            return kNotConnected;
+        }
+        status = plan_batch(runtime, windows, count, plan, error, error_len);
+        if (status != kSuccess) { return status; }
+        size_t remaining = len;
+        for (const auto &descriptor : plan.descriptors) {
+            if (descriptor.len > remaining) {
+                write_error(error, error_len, "HIXL batch WRITE payload is too short");
+                return kParamInvalid;
+            }
+            remaining -= descriptor.len;
+        }
+        if (remaining != 0) {
+            write_error(error, error_len, "HIXL batch WRITE payload is too long");
+            return kParamInvalid;
+        }
+        const hixl::AscendString remote(peer);
+        reserve_batch(runtime, plan);
+        reserved = true;
+        size_t offset = 0;
+        for (size_t index = 0; index < count; ++index) {
+            const size_t length = static_cast<size_t>(windows[index].length);
+            std::memcpy(runtime->receive[plan.slot_ids[index]].address, bytes + offset, length);
+            offset += length;
+        }
+#ifdef AFS_HIXL_TEST_FAULT_INJECTION
+        inject_before_dispatch_for_test();
+#endif
+        const auto available = deadline - std::chrono::steady_clock::now();
+        if (available <= std::chrono::steady_clock::duration::zero()) {
+            release_reservation(runtime, plan);
+            write_error(error, error_len, "HIXL batch WRITE expired before dispatch");
+            return kTimeout;
+        }
+        // After SDK entry, a failure does not prove that the engine or peer
+        // stopped accessing the native-owned staging and export windows.
+        *dispatch_started = 1;
+        const auto millis = std::chrono::ceil<std::chrono::milliseconds>(available).count();
+        status = runtime->engine.TransferSync(remote, hixl::WRITE, plan.descriptors,
+                                              static_cast<int32_t>(millis));
+        if (status != kSuccess) {
+            quarantine_slots(runtime, plan.slot_ids);
+            write_error(error, error_len, "HIXL batch WRITE outcome is uncertain; Host slots and engine retained");
+            return status;
+        }
+        release_reservation(runtime, plan);
+        return kSuccess;
+    } catch (const std::exception &exception) {
+        retain_or_release();
+        write_error(error, error_len, exception.what());
+        return kFailed;
+    } catch (...) {
+        retain_or_release();
+        write_error(error, error_len, "unknown exception during HIXL batch WRITE");
         return kFailed;
     }
 }
@@ -920,73 +930,6 @@ extern "C" uint32_t afs_hixl_release_receives(void *opaque,
     }
 }
 
-extern "C" uint32_t afs_hixl_poll_read(void *opaque,
-                                        void *opaque_request,
-                                        uint64_t *slot_addresses,
-                                        size_t slot_count,
-                                        uint32_t *out_state,
-                                        uint64_t *sdk_transfer_ns,
-                                        char *error,
-                                        size_t error_len) {
-    try {
-        auto *runtime = static_cast<Runtime *>(opaque);
-        uint32_t status = check_runtime(runtime, error, error_len);
-        if (status != kSuccess || opaque_request == nullptr || out_state == nullptr ||
-            sdk_transfer_ns == nullptr) {
-            if (status == kSuccess) {
-                write_error(error, error_len, "invalid HIXL poll timing arguments");
-                return kParamInvalid;
-            }
-            return status;
-        }
-        *sdk_transfer_ns = 0;
-        Request *request = find_request(runtime, opaque_request);
-        if (request == nullptr) {
-            runtime->poisoned = true;
-            write_error(error, error_len, "HIXL completion handle was already consumed or unknown");
-            return kFailed;
-        }
-        hixl::TransferStatus transfer_status = hixl::TransferStatus::WAITING;
-        status = runtime->engine.GetTransferStatus(request->handle, transfer_status);
-        if (status != kSuccess) {
-            quarantine_request(runtime, *request);
-            write_error(error, error_len, "HIXL GetTransferStatus failed; request is retained");
-            return status;
-        }
-        if (transfer_status == hixl::TransferStatus::WAITING) {
-            *out_state = AFS_HIXL_POLL_WAITING;
-            return kSuccess;
-        }
-        if (transfer_status == hixl::TransferStatus::COMPLETED) {
-            if (slot_addresses == nullptr || slot_count != request->slot_ids.size()) {
-                quarantine_request(runtime, *request);
-                write_error(error, error_len, "HIXL READ completion has the wrong slot count");
-                return kFailed;
-            }
-            *sdk_transfer_ns = elapsed_nanoseconds(request->dispatched_at,
-                                                   std::chrono::steady_clock::now());
-            pinned_addresses(runtime, request->slot_ids, slot_addresses);
-            request->active = false;
-            request->slot_ids.clear();
-            *out_state = AFS_HIXL_POLL_COMPLETED;
-            return kSuccess;
-        }
-        quarantine_request(runtime, *request);
-        if (transfer_status == hixl::TransferStatus::TIMEOUT) {
-            write_error(error, error_len, "HIXL READ completion timed out; request is retained");
-            return kTimeout;
-        }
-        write_error(error, error_len, "HIXL READ completion failed; request is retained");
-        return kFailed;
-    } catch (const std::exception &exception) {
-        write_error(error, error_len, exception.what());
-        return kFailed;
-    } catch (...) {
-        write_error(error, error_len, "unknown exception polling HIXL READ");
-        return kFailed;
-    }
-}
-
 extern "C" uint32_t afs_hixl_shutdown(void *opaque, char *error, size_t error_len) {
     try {
         auto *runtime = static_cast<Runtime *>(opaque);
@@ -996,8 +939,7 @@ extern "C" uint32_t afs_hixl_shutdown(void *opaque, char *error, size_t error_le
         }
         if (runtime->poisoned ||
             std::any_of(runtime->receive.begin(), runtime->receive.end(), [](const HostSlot &slot) { return slot.in_use; }) ||
-            std::any_of(runtime->exports.begin(), runtime->exports.end(), [](const HostSlot &slot) { return slot.in_use; }) ||
-            std::any_of(runtime->requests.begin(), runtime->requests.end(), [](const Request &request) { return request.active; })) {
+            std::any_of(runtime->exports.begin(), runtime->exports.end(), [](const HostSlot &slot) { return slot.in_use; })) {
             write_error(error, error_len, "HIXL shutdown has not proved drain");
             return kFailed;
         }

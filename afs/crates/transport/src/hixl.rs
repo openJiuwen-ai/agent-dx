@@ -16,7 +16,7 @@ use std::sync::Mutex;
 #[cfg(feature = "hixl")]
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, RwLock};
-#[cfg(any(feature = "hixl", test))]
+#[cfg(feature = "hixl")]
 use std::thread;
 #[cfg(feature = "hixl")]
 use std::thread::JoinHandle;
@@ -36,7 +36,7 @@ const MAX_POOL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_HOST_POOL_BYTES: usize = 1024 * 1024 * 1024;
 #[cfg(feature = "hixl")]
 const ERR_BYTES: usize = 512;
-/// Maximum descriptors in one native READ. Mirrors `AFS_HIXL_MAX_BATCH_WINDOWS`.
+/// Maximum descriptors in one native transfer batch. Mirrors `AFS_HIXL_MAX_BATCH_WINDOWS`.
 pub const MAX_BATCH_WINDOWS: usize = 64;
 
 /// Default fixed Host-window size.
@@ -49,20 +49,19 @@ pub const DEFAULT_EXPORT_SLOTS: usize = 16;
 mod group;
 pub use group::{HixlRuntimeGroup, validate_group_options};
 
-/// Immutable Host-to-Host read data path. HCCS relay requires HCCS-reachable
-/// A3 devices.
+/// Link used by the immutable Host-to-Host data path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReadTransport {
     #[default]
     Roce,
-    HccsBufferPool,
+    Hccs,
 }
 
 impl fmt::Display for ReadTransport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Roce => "roce",
-            Self::HccsBufferPool => "hccs-buffer-pool",
+            Self::Hccs => "hccs",
         })
     }
 }
@@ -78,6 +77,8 @@ pub struct RuntimeOptions {
     pub receive_slots: usize,
     pub export_slots: usize,
     pub transport: ReadTransport,
+    /// Enable the native Device buffer pool. Required for HCCS.
+    pub buffer_pool: bool,
     pub buffer_pool_count: usize,
     pub buffer_pool_size_mib: usize,
 }
@@ -92,6 +93,7 @@ impl Default for RuntimeOptions {
             receive_slots: DEFAULT_RECEIVE_SLOTS,
             export_slots: DEFAULT_EXPORT_SLOTS,
             transport: ReadTransport::Roce,
+            buffer_pool: false,
             buffer_pool_count: 4,
             buffer_pool_size_mib: 8,
         }
@@ -99,11 +101,9 @@ impl Default for RuntimeOptions {
 }
 
 impl RuntimeOptions {
-    /// HCCS relay dimensions; direct RoCE carries none. Every caller lives
-    /// behind the hixl feature.
-    #[cfg(any(feature = "hixl", test))]
+    /// Direct transfers use zero dimensions in both the ABI and identity.
     fn buffer_pool_dims(&self) -> (usize, usize) {
-        if self.transport == ReadTransport::HccsBufferPool {
+        if self.buffer_pool {
             (self.buffer_pool_count, self.buffer_pool_size_mib)
         } else {
             (0, 0)
@@ -111,7 +111,7 @@ impl RuntimeOptions {
     }
 
     fn relay_hbm_budget_bytes(&self) -> usize {
-        if self.transport == ReadTransport::Roce {
+        if !self.buffer_pool {
             return 0;
         }
         // HIXL allocates two Device pools, each count * size MiB. Validation
@@ -132,11 +132,11 @@ pub struct EngineInfo {
     /// Canonical relay dimensions; both are zero for direct RoCE.
     pub buffer_pool_count: usize,
     pub buffer_pool_size_mib: usize,
-    /// Actual SDK-reported super-pod identity; relay peers must share this domain.
+    /// SDK-reported super-pod identity, present only on HCCS.
     pub hccs_domain_id: Option<u64>,
 }
 
-/// An authenticated source window descriptor backed by a fixed ACL Host slot.
+/// An authenticated remote window descriptor backed by a fixed ACL Host slot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportWindow {
     pub slot_id: u64,
@@ -149,7 +149,10 @@ pub struct ExportWindow {
 ///
 /// The slot may contain bytes from a previous reservation. Publish only the
 /// prefix filled by this reservation, and release it through
-/// [`HixlRuntime::release_exports`] whether or not it was published.
+/// [`HixlRuntime::release_exports`] once the peer can no longer access it.
+/// For a remote WRITE, hold no Rust slice into the slot until the peer has
+/// confirmed completion. Quarantine the export generation if completion
+/// cannot be established.
 #[derive(Debug)]
 pub struct ReservedExport {
     window: ExportWindow,
@@ -252,7 +255,8 @@ pub enum HixlPhase {
     PrepareExport,
     ReleaseExport,
     SubmitRead,
-    PollRead,
+    CompleteRead,
+    WriteBatch,
     Quarantine,
     Shutdown,
 }
@@ -266,7 +270,8 @@ impl fmt::Display for HixlPhase {
             Self::PrepareExport => "prepare_export",
             Self::ReleaseExport => "release_export",
             Self::SubmitRead => "submit_read",
-            Self::PollRead => "poll_read",
+            Self::CompleteRead => "complete_read",
+            Self::WriteBatch => "write_batch",
             Self::Quarantine => "quarantine",
             Self::Shutdown => "shutdown",
         };
@@ -283,7 +288,6 @@ pub enum HixlErrorKind {
     ResourceExhausted,
     DeadlineExceeded,
     NativeFailure,
-    CompletionFailed,
     EnginePoisoned,
     ShutdownIncomplete,
     Internal,
@@ -298,7 +302,6 @@ impl fmt::Display for HixlErrorKind {
             Self::ResourceExhausted => "resource_exhausted",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::NativeFailure => "native_failure",
-            Self::CompletionFailed => "completion_failed",
             Self::EnginePoisoned => "engine_poisoned",
             Self::ShutdownIncomplete => "shutdown_incomplete",
             Self::Internal => "internal",
@@ -314,8 +317,8 @@ pub struct HixlError {
     pub native_status: Option<u32>,
     pub kind: HixlErrorKind,
     pub message: String,
-    /// For errors returned by `read`, true means the native submission boundary
-    /// was entered or the owner reply was lost. False proves no DMA submission.
+    /// For batch transfer errors, true means the native operation may still
+    /// access its windows. The name is retained for existing READ callers.
     pub read_may_be_in_flight: bool,
 }
 
@@ -392,10 +395,6 @@ impl NativeCallError {
 }
 
 #[cfg(any(feature = "hixl", test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct NativeRequest(u64);
-
-#[cfg(any(feature = "hixl", test))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct NativeReadTiming {
     sdk_transfer: Option<Duration>,
@@ -428,17 +427,10 @@ impl PinnedRead {
 
 #[cfg(any(feature = "hixl", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct NativeReadWindow {
+struct NativeTransferWindow {
     slot_id: u64,
     remote_addr: u64,
     len: usize,
-}
-
-#[cfg(any(feature = "hixl", test))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum NativePoll {
-    Waiting,
-    Completed { timing: NativeReadTiming },
 }
 
 /// The only fakeable boundary in unit tests: every implementation below this
@@ -458,25 +450,22 @@ trait NativeBackend: Send + 'static {
         length: usize,
     ) -> Result<u64, NativeCallError>;
     fn release_export(&mut self, slot_id: u64, generation: u64) -> Result<(), NativeCallError>;
-    /// Leaves every slot pinned on completion and fills `addresses`.
-    fn poll_read(
-        &mut self,
-        request: NativeRequest,
-        addresses: &mut [u64],
-    ) -> Result<NativePoll, NativeCallError>;
     fn release_receives(&mut self, slot_ids: &[u64]) -> Result<(), NativeCallError>;
-    fn submit_read_batch(
-        &mut self,
-        windows: &[NativeReadWindow],
-        peer: &str,
-    ) -> Result<NativeRequest, NativeCallError>;
+    /// Fills `addresses` with completed receive slots pinned until release.
     fn read_sync_batch(
         &mut self,
-        windows: &[NativeReadWindow],
+        windows: &[NativeTransferWindow],
         peer: &str,
         addresses: &mut [u64],
         timeout_ms: u32,
     ) -> Result<NativeReadTiming, NativeCallError>;
+    fn write_batch(
+        &mut self,
+        windows: &[NativeTransferWindow],
+        peer: &str,
+        bytes: &[u8],
+        timeout_ms: u32,
+    ) -> Result<(), NativeCallError>;
     fn shutdown(&mut self) -> Result<(), NativeCallError>;
 }
 
@@ -499,7 +488,6 @@ struct ExportSlot {
 #[derive(Clone, Debug)]
 struct ReceiveSlot {
     state: SlotState,
-    request: Option<NativeRequest>,
 }
 
 /// Synchronous state machine executed exclusively by the ACL owner thread.
@@ -542,7 +530,7 @@ impl<B: NativeBackend> RuntimeCore<B> {
         generation: u64,
     ) -> Result<Self, HixlError> {
         validate_options(&options)?;
-        let hccs_domain_id = if options.transport == ReadTransport::HccsBufferPool {
+        let hccs_domain_id = if options.transport == ReadTransport::Hccs {
             Some(backend.hccs_domain_id().ok_or_else(|| {
                 HixlError::new(
                     HixlPhase::Initialize,
@@ -579,7 +567,6 @@ impl<B: NativeBackend> RuntimeCore<B> {
             receives: (0..receive_count)
                 .map(|_| ReceiveSlot {
                     state: SlotState::Free,
-                    request: None,
                 })
                 .collect(),
             options,
@@ -839,7 +826,6 @@ impl<B: NativeBackend> RuntimeCore<B> {
     fn free_receives(&mut self, slots: &[usize]) {
         for &slot_id in slots {
             self.receives[slot_id].state = SlotState::Free;
-            self.receives[slot_id].request = None;
         }
     }
 
@@ -847,6 +833,133 @@ impl<B: NativeBackend> RuntimeCore<B> {
         for &slot_id in slots {
             self.quarantine_slot(true, slot_id);
         }
+    }
+
+    fn validate_transfer(
+        &self,
+        peer: &str,
+        windows: &[(u64, usize)],
+        phase: HixlPhase,
+    ) -> Result<usize, HixlError> {
+        self.ensure_running(phase)?;
+        validate_peer(peer, phase)?;
+        if !self.connected_peers.contains(peer) {
+            return Err(HixlError::new(
+                phase,
+                HixlErrorKind::InvalidState,
+                None,
+                "HIXL transfer peer is not connected",
+            ));
+        }
+        let invalid =
+            |message| HixlError::new(phase, HixlErrorKind::InvalidArgument, None, message);
+        if windows.is_empty() || windows.len() > self.receives.len() {
+            return Err(invalid(
+                "HIXL batch window count is outside the local transfer pool",
+            ));
+        }
+        windows.iter().try_fold(0_usize, |total, &(address, len)| {
+            let valid_range = u64::try_from(len)
+                .ok()
+                .is_some_and(|len| address.checked_add(len).is_some());
+            if address == 0 || len == 0 || len > self.options.window_bytes || !valid_range {
+                return Err(invalid(
+                    "HIXL batch address and length are outside the exported window",
+                ));
+            }
+            total
+                .checked_add(len)
+                .ok_or_else(|| invalid("HIXL batch byte count overflows"))
+        })
+    }
+
+    fn reserve_transfer_slots(
+        &mut self,
+        windows: &[(u64, usize)],
+        phase: HixlPhase,
+    ) -> Result<(Vec<usize>, Vec<NativeTransferWindow>), HixlError> {
+        let mut slots = Vec::with_capacity(windows.len());
+        for _ in windows {
+            let Some(slot_id) = self
+                .receives
+                .iter()
+                .position(|slot| slot.state == SlotState::Free)
+            else {
+                self.free_receives(&slots);
+                return Err(HixlError::new(
+                    phase,
+                    HixlErrorKind::ResourceExhausted,
+                    Some(HIXL_RESOURCE_EXHAUSTED),
+                    "all local transfer slots are in use or quarantined",
+                ));
+            };
+            self.receives[slot_id].state = SlotState::Active;
+            slots.push(slot_id);
+        }
+        let native_windows = windows
+            .iter()
+            .zip(&slots)
+            .map(|((remote_addr, len), slot_id)| NativeTransferWindow {
+                slot_id: *slot_id as u64,
+                remote_addr: *remote_addr,
+                len: *len,
+            })
+            .collect();
+        Ok((slots, native_windows))
+    }
+
+    fn write_batch(
+        &mut self,
+        peer: &str,
+        windows: &[(u64, usize)],
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), HixlError> {
+        let phase = HixlPhase::WriteBatch;
+        if self.validate_transfer(peer, windows, phase)? != bytes.len() {
+            return Err(HixlError::new(
+                phase,
+                HixlErrorKind::InvalidArgument,
+                None,
+                "batch WRITE payload length differs from the submitted windows",
+            ));
+        }
+        let (slots, native_windows) = self.reserve_transfer_slots(windows, phase)?;
+        let timeout_ms = self.transfer_timeout(deadline, phase, &slots)?;
+        self.backend
+            .write_batch(&native_windows, peer, bytes, timeout_ms)
+            .map_err(|error| self.transfer_failure(&slots, phase, error))?;
+        self.free_receives(&slots);
+        Ok(())
+    }
+
+    fn transfer_timeout(
+        &mut self,
+        deadline: Instant,
+        phase: HixlPhase,
+        slots: &[usize],
+    ) -> Result<u32, HixlError> {
+        deadline_timeout_ms(deadline, phase).inspect_err(|_| self.free_receives(slots))
+    }
+
+    /// A synchronous SDK failure after dispatch does not prove DMA has stopped.
+    fn transfer_failure(
+        &mut self,
+        slots: &[usize],
+        phase: HixlPhase,
+        error: NativeCallError,
+    ) -> HixlError {
+        if !error.accepted {
+            self.free_receives(slots);
+            return map_native_error(phase, error, HixlErrorKind::NativeFailure);
+        }
+        self.quarantine_receives(slots);
+        let kind = if error.status == Some(HIXL_TIMEOUT) {
+            HixlErrorKind::DeadlineExceeded
+        } else {
+            HixlErrorKind::EnginePoisoned
+        };
+        HixlError::new(phase, kind, error.status, error.message).with_read_in_flight()
     }
 
     /// One native READ call carrying every window in `windows`.  Each tuple is
@@ -860,43 +973,8 @@ impl<B: NativeBackend> RuntimeCore<B> {
         deadline: Instant,
         owner_queue: Duration,
     ) -> Result<PinnedRead, HixlError> {
-        self.ensure_running(HixlPhase::SubmitRead)?;
-        validate_peer(peer, HixlPhase::SubmitRead)?;
-        if !self.connected_peers.contains(peer) {
-            return Err(HixlError::new(
-                HixlPhase::SubmitRead,
-                HixlErrorKind::InvalidState,
-                None,
-                "peer must be connected before READ",
-            ));
-        }
-        if windows.is_empty() || windows.len() > self.receives.len() {
-            return Err(HixlError::new(
-                HixlPhase::SubmitRead,
-                HixlErrorKind::InvalidArgument,
-                None,
-                "batch READ window count is outside the receive pool",
-            ));
-        }
-        let mut total = 0_usize;
-        for (remote_addr, len) in windows {
-            if *remote_addr == 0 || *len == 0 || *len > self.options.window_bytes {
-                return Err(HixlError::new(
-                    HixlPhase::SubmitRead,
-                    HixlErrorKind::InvalidArgument,
-                    None,
-                    "batch READ address and length are outside the exported window",
-                ));
-            }
-            total = total.checked_add(*len).ok_or_else(|| {
-                HixlError::new(
-                    HixlPhase::SubmitRead,
-                    HixlErrorKind::InvalidArgument,
-                    None,
-                    "batch READ byte count overflows",
-                )
-            })?;
-        }
+        let phase = HixlPhase::SubmitRead;
+        let total = self.validate_transfer(peer, windows, phase)?;
         if !output.is_empty() || output.capacity() < total {
             return Err(HixlError::new(
                 HixlPhase::SubmitRead,
@@ -905,151 +983,27 @@ impl<B: NativeBackend> RuntimeCore<B> {
                 "batch READ output cannot hold the submitted windows",
             ));
         }
-        let timeout_ms = deadline_timeout_ms(deadline, HixlPhase::SubmitRead)?;
-        let mut slots = Vec::with_capacity(windows.len());
-        for _ in windows {
-            let Some(slot_id) = self
-                .receives
-                .iter()
-                .position(|slot| slot.state == SlotState::Free)
-            else {
-                self.free_receives(&slots);
-                return Err(HixlError::new(
-                    HixlPhase::SubmitRead,
-                    HixlErrorKind::ResourceExhausted,
-                    Some(HIXL_RESOURCE_EXHAUSTED),
-                    "all receive slots are in use or quarantined",
-                ));
-            };
-            self.receives[slot_id].state = SlotState::Active;
-            slots.push(slot_id);
-        }
-        let native_windows = windows
-            .iter()
-            .zip(&slots)
-            .map(|((remote_addr, len), slot_id)| NativeReadWindow {
-                slot_id: *slot_id as u64,
-                remote_addr: *remote_addr,
-                len: *len,
-            })
-            .collect::<Vec<_>>();
+        let (slots, native_windows) = self.reserve_transfer_slots(windows, phase)?;
         let mut addresses = vec![0_u64; native_windows.len()];
-        if self.options.transport == ReadTransport::HccsBufferPool {
-            let timing = match self.backend.read_sync_batch(
-                &native_windows,
-                peer,
-                &mut addresses,
-                timeout_ms,
-            ) {
-                Ok(timing) => timing,
-                Err(error) => {
-                    if error.accepted {
-                        self.quarantine_receives(&slots);
-                        let kind = if error.status == Some(HIXL_TIMEOUT) {
-                            HixlErrorKind::DeadlineExceeded
-                        } else {
-                            HixlErrorKind::EnginePoisoned
-                        };
-                        return Err(HixlError::new(
-                            HixlPhase::SubmitRead,
-                            kind,
-                            error.status,
-                            error.message,
-                        )
-                        .with_read_in_flight());
-                    }
-                    self.free_receives(&slots);
-                    return Err(map_native_error(
-                        HixlPhase::SubmitRead,
-                        error,
-                        HixlErrorKind::NativeFailure,
-                    ));
-                }
-            };
-            return self.pin_completed(
-                &slots,
-                &native_windows,
-                &addresses,
-                output,
-                owner_queue,
-                timing.sdk_transfer,
-            );
-        }
-        let request = match self.backend.submit_read_batch(&native_windows, peer) {
-            Ok(request) => request,
-            Err(error) => {
-                if error.accepted {
-                    self.quarantine_receives(&slots);
-                    return Err(HixlError::new(
-                        HixlPhase::SubmitRead,
-                        HixlErrorKind::EnginePoisoned,
-                        error.status,
-                        error.message,
-                    )
-                    .with_read_in_flight());
-                }
-                self.free_receives(&slots);
-                return Err(map_native_error(
-                    HixlPhase::SubmitRead,
-                    error,
-                    HixlErrorKind::NativeFailure,
-                ));
-            }
-        };
-        for &slot_id in &slots {
-            self.receives[slot_id].request = Some(request);
-        }
-        loop {
-            if Instant::now() >= deadline {
-                self.quarantine_receives(&slots);
-                return Err(HixlError::new(
-                    HixlPhase::PollRead,
-                    HixlErrorKind::DeadlineExceeded,
-                    Some(HIXL_TIMEOUT),
-                    "accepted batch READ did not complete before the deadline",
-                )
-                .with_read_in_flight());
-            }
-            let poll = match self.backend.poll_read(request, &mut addresses) {
-                Ok(poll) => poll,
-                Err(error) => {
-                    self.quarantine_receives(&slots);
-                    return Err(HixlError::new(
-                        HixlPhase::PollRead,
-                        if error.status == Some(HIXL_TIMEOUT) {
-                            HixlErrorKind::DeadlineExceeded
-                        } else {
-                            HixlErrorKind::CompletionFailed
-                        },
-                        error.status,
-                        error.message,
-                    )
-                    .with_read_in_flight());
-                }
-            };
-            match poll {
-                NativePoll::Waiting => thread::sleep(Duration::from_millis(1)),
-                NativePoll::Completed { timing } => {
-                    for &slot_id in &slots {
-                        self.receives[slot_id].request = None;
-                    }
-                    return self.pin_completed(
-                        &slots,
-                        &native_windows,
-                        &addresses,
-                        output,
-                        owner_queue,
-                        timing.sdk_transfer,
-                    );
-                }
-            }
-        }
+        let timeout_ms = self.transfer_timeout(deadline, phase, &slots)?;
+        let timing = self
+            .backend
+            .read_sync_batch(&native_windows, peer, &mut addresses, timeout_ms)
+            .map_err(|error| self.transfer_failure(&slots, phase, error))?;
+        self.pin_completed(
+            &slots,
+            &native_windows,
+            &addresses,
+            output,
+            owner_queue,
+            timing.sdk_transfer,
+        )
     }
 
     fn pin_completed(
         &mut self,
         slots: &[usize],
-        windows: &[NativeReadWindow],
+        windows: &[NativeTransferWindow],
         addresses: &[u64],
         output: Vec<u8>,
         owner_queue: Duration,
@@ -1060,7 +1014,7 @@ impl<B: NativeBackend> RuntimeCore<B> {
             let Some(address) = usize::try_from(*address).ok().filter(|value| *value != 0) else {
                 self.quarantine_receives(slots);
                 return Err(HixlError::new(
-                    HixlPhase::PollRead,
+                    HixlPhase::CompleteRead,
                     HixlErrorKind::EnginePoisoned,
                     None,
                     "native READ completed without a usable slot address",
@@ -1084,7 +1038,7 @@ impl<B: NativeBackend> RuntimeCore<B> {
     }
 
     fn release_receives(&mut self, slots: &[usize]) -> Result<(), HixlError> {
-        self.ensure_running(HixlPhase::PollRead)?;
+        self.ensure_running(HixlPhase::CompleteRead)?;
         let pinned = slots.iter().all(|&slot_id| {
             self.receives
                 .get(slot_id)
@@ -1092,7 +1046,7 @@ impl<B: NativeBackend> RuntimeCore<B> {
         });
         if !pinned {
             return Err(HixlError::new(
-                HixlPhase::PollRead,
+                HixlPhase::CompleteRead,
                 HixlErrorKind::InvalidArgument,
                 None,
                 "receive slot is not pinned",
@@ -1105,7 +1059,7 @@ impl<B: NativeBackend> RuntimeCore<B> {
         if let Err(error) = self.backend.release_receives(&slot_ids) {
             self.quarantine_receives(slots);
             return Err(HixlError::new(
-                HixlPhase::PollRead,
+                HixlPhase::CompleteRead,
                 HixlErrorKind::EnginePoisoned,
                 error.status,
                 error.message,
@@ -1242,14 +1196,23 @@ fn validate_options(options: &RuntimeOptions) -> Result<(), HixlError> {
         || options.export_slots == 0
         || options.receive_slots > 128
         || options.export_slots > 128
-        || !(1..=64).contains(&options.buffer_pool_count)
-        || !(1..=64).contains(&options.buffer_pool_size_mib)
+        || (options.buffer_pool
+            && (!(1..=64).contains(&options.buffer_pool_count)
+                || !(1..=64).contains(&options.buffer_pool_size_mib)))
     {
         return Err(HixlError::new(
             HixlPhase::Initialize,
             HixlErrorKind::InvalidArgument,
             None,
             "invalid HIXL runtime options",
+        ));
+    }
+    if options.transport == ReadTransport::Hccs && !options.buffer_pool {
+        return Err(HixlError::new(
+            HixlPhase::Initialize,
+            HixlErrorKind::InvalidArgument,
+            None,
+            "HIXL HCCS requires the Device buffer pool",
         ));
     }
     let slots = options
@@ -1360,6 +1323,13 @@ enum Command {
         queued_at: Instant,
         deadline: Instant,
         reply: SyncSender<Result<PinnedRead, HixlError>>,
+    },
+    WriteBatch {
+        peer: String,
+        windows: Vec<(u64, usize)>,
+        bytes: Vec<u8>,
+        deadline: Instant,
+        reply: SyncSender<Result<(), HixlError>>,
     },
     ReleaseReceives {
         slots: Vec<usize>,
@@ -1574,11 +1544,12 @@ impl HixlRuntime {
     }
 
     /// Returns a batch of slot generations to the pool in one owner command.
+    /// Waits for owner queue space and for the owner's release result.
     /// A failed release stops the batch; callers must fence uncertain slots.
     ///
     /// # Safety
     /// All Rust borrows must have ended, reservations may no longer be used,
-    /// and no native READ may still access any of these slots.
+    /// and no native transfer may still access any of these slots.
     ///
     /// ```compile_fail,E0133
     /// use afs_transport::hixl::HixlRuntime;
@@ -1598,11 +1569,11 @@ impl HixlRuntime {
         #[cfg(feature = "hixl")]
         {
             let (reply, receiver) = mpsc::sync_channel(1);
-            self.send(
+            self.release_slots(
                 Command::ReleaseExports { slots, reply },
+                receiver,
                 HixlPhase::ReleaseExport,
-            )?;
-            recv_reply(receiver, HixlPhase::ReleaseExport)
+            )
         }
     }
 
@@ -1663,7 +1634,7 @@ impl HixlRuntime {
                 },
                 HixlPhase::SubmitRead,
             )?;
-            let mut pinned = recv_reply(receiver, HixlPhase::PollRead)?;
+            let mut pinned = recv_reply(receiver, HixlPhase::CompleteRead)?;
             let copy_started = Instant::now();
             let length = pinned.slots.iter().map(|slot| slot.length).sum();
             let copied = copy_pinned(&pinned.slots, &mut pinned.output, length);
@@ -1680,31 +1651,89 @@ impl HixlRuntime {
         }
     }
 
+    /// Writes `bytes` into `windows` on an already connected peer using one HIXL WRITE.
+    /// Each window is `(remote_address, length)`, and the lengths must sum to
+    /// the payload size. Keep the peer windows reserved until completion is
+    /// known. An uncertain error sets `read_may_be_in_flight` and fences
+    /// the local generation. The caller must quarantine the peer exports in that case.
+    /// Success reports transport completion only.
+    pub fn write_batch(
+        &self,
+        peer: &str,
+        windows: &[(u64, usize)],
+        bytes: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<(), HixlError> {
+        #[cfg(not(feature = "hixl"))]
+        {
+            let _ = (peer, windows, bytes, deadline);
+            Err(HixlError::unsupported(
+                HixlPhase::WriteBatch,
+                "afs-transport was built without the hixl feature",
+            ))
+        }
+        #[cfg(feature = "hixl")]
+        {
+            let (reply, receiver) = mpsc::sync_channel(1);
+            self.send(
+                Command::WriteBatch {
+                    peer: peer.to_owned(),
+                    windows: windows.to_vec(),
+                    bytes,
+                    deadline,
+                    reply,
+                },
+                HixlPhase::WriteBatch,
+            )?;
+            recv_reply(receiver, HixlPhase::WriteBatch)
+        }
+    }
+
     /// Keep responsibility for these slots until the owner accepts release.
     /// Completed bytes stay valid even when native release quarantines a slot.
     #[cfg(feature = "hixl")]
     fn release_pinned(&self, slots: Vec<usize>) {
         let (reply, receiver) = mpsc::sync_channel(1);
-        // Queue pressure is a valid rejection before admitting a read, but a
-        // completed read already owns slots. Wait for queue space and then the
-        // owner's reply. The owner records native release errors in its state.
-        if self
-            .sender
-            .send(Command::ReleaseReceives { slots, reply })
-            .is_err()
-            || receiver.recv().is_err()
-        {
-            // A disconnected owner cannot prove native cleanup. RealNative
-            // retains the engine and entire Host pool on owner loss.
-            let mut status = match self.status.write() {
-                Ok(status) => status,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if status.state != RuntimeState::Shutdown {
-                status.state = RuntimeState::Quarantined;
-                status.quarantined_bytes = status.allocated_bytes;
-            }
+        let _ = self.release_slots(
+            Command::ReleaseReceives { slots, reply },
+            receiver,
+            HixlPhase::CompleteRead,
+        );
+    }
+
+    #[cfg(feature = "hixl")]
+    fn release_slots(
+        &self,
+        command: Command,
+        receiver: Receiver<Result<(), HixlError>>,
+        phase: HixlPhase,
+    ) -> Result<(), HixlError> {
+        // These slots were already admitted. Wait for queue space and for
+        // the result without locking status, which the owner updates first.
+        let message = match self.sender.send(command) {
+            Ok(()) => match receiver.recv() {
+                Ok(result) => return result,
+                Err(_) => "HIXL ACL owner dropped the release reply",
+            },
+            Err(_) => "HIXL ACL owner queue closed before slot release",
+        };
+
+        // A disconnected owner cannot prove native cleanup. RealNative
+        // retains the engine and entire Host pool on owner loss.
+        let mut status = match self.status.write() {
+            Ok(status) => status,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if status.state != RuntimeState::Shutdown {
+            status.state = RuntimeState::Quarantined;
+            status.quarantined_bytes = status.allocated_bytes;
         }
+        Err(HixlError::new(
+            phase,
+            HixlErrorKind::EnginePoisoned,
+            None,
+            message,
+        ))
     }
 
     pub fn shutdown(&self) -> Result<(), HixlError> {
@@ -1792,7 +1821,8 @@ fn recv_reply<T>(
                 None,
                 format!("HIXL ACL owner dropped the operation reply: {error}"),
             );
-            failure.read_may_be_in_flight = phase == HixlPhase::PollRead;
+            failure.read_may_be_in_flight =
+                matches!(phase, HixlPhase::CompleteRead | HixlPhase::WriteBatch);
             Err(failure)
         }
     }
@@ -1858,6 +1888,18 @@ fn owner_loop<B: NativeBackend>(
                     update_status(&status, admitted);
                 }
                 let result = core.read_batch(&peer, &windows, output, deadline, owner_queue);
+                update_status(&status, core.status());
+                let _ = reply.send(result);
+                false
+            }
+            Command::WriteBatch {
+                peer,
+                windows,
+                bytes,
+                deadline,
+                reply,
+            } => {
+                let result = core.write_batch(&peer, &windows, &bytes, deadline);
                 update_status(&status, core.status());
                 let _ = reply.send(result);
                 false
@@ -1956,16 +1998,6 @@ mod ffi {
             error: *mut c_char,
             error_len: usize,
         ) -> u32;
-        pub fn afs_hixl_submit_read_batch(
-            runtime: *mut c_void,
-            peer: *const c_char,
-            windows: *const BatchWindow,
-            count: usize,
-            out_request: *mut *mut c_void,
-            dispatch_started: *mut u32,
-            error: *mut c_char,
-            error_len: usize,
-        ) -> u32;
         pub fn afs_hixl_read_sync_batch(
             runtime: *mut c_void,
             peer: *const c_char,
@@ -1978,20 +2010,22 @@ mod ffi {
             error: *mut c_char,
             error_len: usize,
         ) -> u32;
+        pub fn afs_hixl_write_batch(
+            runtime: *mut c_void,
+            peer: *const c_char,
+            windows: *const BatchWindow,
+            count: usize,
+            bytes: *const u8,
+            len: usize,
+            timeout_ms: u32,
+            dispatch_started: *mut u32,
+            error: *mut c_char,
+            error_len: usize,
+        ) -> u32;
         pub fn afs_hixl_release_receives(
             runtime: *mut c_void,
             slot_ids: *const u64,
             count: usize,
-            error: *mut c_char,
-            error_len: usize,
-        ) -> u32;
-        pub fn afs_hixl_poll_read(
-            runtime: *mut c_void,
-            request: *mut c_void,
-            slot_addresses: *mut u64,
-            slot_count: usize,
-            out_state: *mut u32,
-            sdk_transfer_ns: *mut u64,
             error: *mut c_char,
             error_len: usize,
         ) -> u32;
@@ -2118,7 +2152,7 @@ impl NativeBackend for RealNative {
                 options.export_slots,
                 match options.transport {
                     ReadTransport::Roce => 1,
-                    ReadTransport::HccsBufferPool => 2,
+                    ReadTransport::Hccs => 2,
                 },
                 buffer_pool_count,
                 buffer_pool_size_mib,
@@ -2142,8 +2176,7 @@ impl NativeBackend for RealNative {
         })?;
         Ok(Self {
             handle: Some(handle),
-            hccs_domain_id: (options.transport == ReadTransport::HccsBufferPool)
-                .then_some(hccs_domain_id),
+            hccs_domain_id: (options.transport == ReadTransport::Hccs).then_some(hccs_domain_id),
         })
     }
 
@@ -2152,11 +2185,7 @@ impl NativeBackend for RealNative {
     }
 
     fn connect(&mut self, peer: &str, timeout_ms: u32) -> Result<(), NativeCallError> {
-        let peer = std::ffi::CString::new(peer).map_err(|error| NativeCallError {
-            status: None,
-            message: format!("peer engine id contains an interior NUL: {error}"),
-            accepted: false,
-        })?;
+        let peer = native_peer(peer)?;
         let handle = self.handle.ok_or_else(native_not_initialized)?;
         let mut error = ErrorBuffer::default();
         // SAFETY: the handle, NUL-terminated peer, and writable error buffer are live;
@@ -2170,15 +2199,7 @@ impl NativeBackend for RealNative {
                 ERR_BYTES,
             )
         };
-        if status == HIXL_SUCCESS {
-            Ok(())
-        } else {
-            Err(NativeCallError {
-                status: Some(status),
-                message: error.message(),
-                accepted: false,
-            })
-        }
+        error.check_status(status, false)
     }
 
     fn reserve_export(
@@ -2203,13 +2224,7 @@ impl NativeBackend for RealNative {
                 ERR_BYTES,
             )
         };
-        if status != HIXL_SUCCESS {
-            return Err(NativeCallError {
-                status: Some(status),
-                message: error.message(),
-                accepted: false,
-            });
-        }
+        error.check_status(status, false)?;
         if output.address == 0 || u64::try_from(length).ok() != Some(output.length) {
             return Err(NativeCallError {
                 status: None,
@@ -2234,73 +2249,17 @@ impl NativeBackend for RealNative {
                 ERR_BYTES,
             )
         };
-        if status == HIXL_SUCCESS {
-            Ok(())
-        } else {
-            Err(NativeCallError {
-                status: Some(status),
-                message: error.message(),
-                accepted: false,
-            })
-        }
-    }
-
-    fn submit_read_batch(
-        &mut self,
-        windows: &[NativeReadWindow],
-        peer: &str,
-    ) -> Result<NativeRequest, NativeCallError> {
-        let peer = std::ffi::CString::new(peer).map_err(|error| NativeCallError {
-            status: None,
-            message: format!("peer engine id contains an interior NUL: {error}"),
-            accepted: false,
-        })?;
-        let descriptors = batch_descriptors(windows)?;
-        let handle = self.handle.ok_or_else(native_not_initialized)?;
-        let mut request = std::ptr::null_mut();
-        let mut dispatch_started = 0_u32;
-        let mut error = ErrorBuffer::default();
-        // SAFETY: all pointers remain live for the synchronous submit; native
-        // reserves every listed slot before building one SDK batch.
-        let status = unsafe {
-            ffi::afs_hixl_submit_read_batch(
-                handle.as_ptr(),
-                peer.as_ptr(),
-                descriptors.as_ptr(),
-                descriptors.len(),
-                &mut request,
-                &mut dispatch_started,
-                error.ptr(),
-                ERR_BYTES,
-            )
-        };
-        if status != HIXL_SUCCESS || request.is_null() {
-            return Err(NativeCallError {
-                status: Some(status),
-                message: error.message(),
-                accepted: dispatch_started != 0,
-            });
-        }
-        let request_id = u64::try_from(request as usize).map_err(|_| NativeCallError {
-            status: None,
-            message: "native HIXL request handle does not fit the ABI".to_owned(),
-            accepted: true,
-        })?;
-        Ok(NativeRequest(request_id))
+        error.check_status(status, false)
     }
 
     fn read_sync_batch(
         &mut self,
-        windows: &[NativeReadWindow],
+        windows: &[NativeTransferWindow],
         peer: &str,
         addresses: &mut [u64],
         timeout_ms: u32,
     ) -> Result<NativeReadTiming, NativeCallError> {
-        let peer = std::ffi::CString::new(peer).map_err(|error| NativeCallError {
-            status: None,
-            message: format!("peer engine id contains an interior NUL: {error}"),
-            accepted: false,
-        })?;
+        let peer = native_peer(peer)?;
         let descriptors = batch_descriptors(windows)?;
         let handle = self.handle.ok_or_else(native_not_initialized)?;
         let mut error = ErrorBuffer::default();
@@ -2329,17 +2288,10 @@ impl NativeBackend for RealNative {
                 ERR_BYTES,
             )
         };
-        if status == HIXL_SUCCESS {
-            Ok(NativeReadTiming {
-                sdk_transfer: Some(Duration::from_nanos(sdk_transfer_ns)),
-            })
-        } else {
-            Err(NativeCallError {
-                status: Some(status),
-                message: error.message(),
-                accepted: dispatch_started != 0,
-            })
-        }
+        error.check_status(status, dispatch_started != 0)?;
+        Ok(NativeReadTiming {
+            sdk_transfer: Some(Duration::from_nanos(sdk_transfer_ns)),
+        })
     }
 
     fn release_receives(&mut self, slot_ids: &[u64]) -> Result<(), NativeCallError> {
@@ -2356,75 +2308,39 @@ impl NativeBackend for RealNative {
                 ERR_BYTES,
             )
         };
-        if status == HIXL_SUCCESS {
-            Ok(())
-        } else {
-            Err(NativeCallError {
-                status: Some(status),
-                message: error.message(),
-                accepted: true,
-            })
-        }
+        error.check_status(status, true)
     }
 
-    fn poll_read(
+    fn write_batch(
         &mut self,
-        request: NativeRequest,
-        addresses: &mut [u64],
-    ) -> Result<NativePoll, NativeCallError> {
+        windows: &[NativeTransferWindow],
+        peer: &str,
+        bytes: &[u8],
+        timeout_ms: u32,
+    ) -> Result<(), NativeCallError> {
+        let peer = native_peer(peer)?;
+        let descriptors = batch_descriptors(windows)?;
         let handle = self.handle.ok_or_else(native_not_initialized)?;
-        let request_ptr = usize::try_from(request.0).map_err(|_| NativeCallError {
-            status: None,
-            message: "native HIXL request handle does not fit this platform".to_owned(),
-            accepted: true,
-        })?;
-        let mut state = 0_u32;
-        let mut sdk_transfer_ns = 0_u64;
+        let mut dispatch_started = 0_u32;
         let mut error = ErrorBuffer::default();
-        // SAFETY: request is an opaque handle returned by the same native engine,
-        // and `addresses` holds one writable entry per submitted window.
+        // SAFETY: the owner thread exclusively accesses the runtime. All Rust
+        // pointers are valid for the call, and native DMA uses only copied
+        // bytes in native-owned slots that remain allocated on uncertainty.
         let status = unsafe {
-            ffi::afs_hixl_poll_read(
+            ffi::afs_hixl_write_batch(
                 handle.as_ptr(),
-                request_ptr as *mut std::ffi::c_void,
-                addresses.as_mut_ptr(),
-                addresses.len(),
-                &mut state,
-                &mut sdk_transfer_ns,
+                peer.as_ptr(),
+                descriptors.as_ptr(),
+                descriptors.len(),
+                bytes.as_ptr(),
+                bytes.len(),
+                timeout_ms,
+                &mut dispatch_started,
                 error.ptr(),
                 ERR_BYTES,
             )
         };
-        if status != HIXL_SUCCESS {
-            return Err(NativeCallError {
-                status: Some(status),
-                message: error.message(),
-                accepted: true,
-            });
-        }
-        match state {
-            0 => Ok(NativePoll::Waiting),
-            1 => Ok(NativePoll::Completed {
-                timing: NativeReadTiming {
-                    sdk_transfer: Some(Duration::from_nanos(sdk_transfer_ns)),
-                },
-            }),
-            3 => Err(NativeCallError {
-                status: Some(HIXL_TIMEOUT),
-                message: "native HIXL READ timed out".to_owned(),
-                accepted: true,
-            }),
-            2 => Err(NativeCallError {
-                status: Some(503_900),
-                message: "native HIXL READ failed".to_owned(),
-                accepted: true,
-            }),
-            _ => Err(NativeCallError {
-                status: None,
-                message: "native HIXL READ returned an unknown completion state".to_owned(),
-                accepted: true,
-            }),
-        }
+        error.check_status(status, dispatch_started != 0)
     }
 
     fn shutdown(&mut self) -> Result<(), NativeCallError> {
@@ -2435,14 +2351,9 @@ impl NativeBackend for RealNative {
         // SAFETY: the owner thread has exclusive access and shutdown consumes the
         // native engine only after the Rust state machine proves no slot is active.
         let status = unsafe { ffi::afs_hixl_shutdown(handle.as_ptr(), error.ptr(), ERR_BYTES) };
-        if status != HIXL_SUCCESS {
+        error.check_status(status, true).inspect_err(|_| {
             self.handle = Some(handle);
-            return Err(NativeCallError {
-                status: Some(status),
-                message: error.message(),
-                accepted: true,
-            });
-        }
+        })?;
         // SAFETY: native shutdown completed successfully and no caller can issue
         // another command after this method returns.
         unsafe { ffi::afs_hixl_destroy(handle.as_ptr()) };
@@ -2488,7 +2399,7 @@ fn copy_slot(address: usize, out: &mut [std::mem::MaybeUninit<u8>]) {
 fn copy_pinned(slots: &[PinnedSlot], output: &mut Vec<u8>, length: usize) -> Result<(), HixlError> {
     let untiled = || {
         HixlError::new(
-            HixlPhase::PollRead,
+            HixlPhase::CompleteRead,
             HixlErrorKind::Internal,
             None,
             "pinned receive slots do not tile the output",
@@ -2530,6 +2441,15 @@ fn copy_pinned(slots: &[PinnedSlot], output: &mut Vec<u8>, length: usize) -> Res
 }
 
 #[cfg(feature = "hixl")]
+fn native_peer(peer: &str) -> Result<std::ffi::CString, NativeCallError> {
+    std::ffi::CString::new(peer).map_err(|error| NativeCallError {
+        status: None,
+        message: format!("peer engine id contains an interior NUL: {error}"),
+        accepted: false,
+    })
+}
+
+#[cfg(feature = "hixl")]
 fn native_not_initialized() -> NativeCallError {
     NativeCallError {
         status: None,
@@ -2540,12 +2460,12 @@ fn native_not_initialized() -> NativeCallError {
 
 #[cfg(feature = "hixl")]
 fn batch_descriptors(
-    windows: &[NativeReadWindow],
+    windows: &[NativeTransferWindow],
 ) -> Result<Vec<ffi::BatchWindow>, NativeCallError> {
     if windows.is_empty() || windows.len() > MAX_BATCH_WINDOWS {
         return Err(NativeCallError {
             status: None,
-            message: format!("native HIXL batch READ window count must be 1..={MAX_BATCH_WINDOWS}"),
+            message: format!("native HIXL batch window count must be 1..={MAX_BATCH_WINDOWS}"),
             accepted: false,
         });
     }
@@ -2580,6 +2500,17 @@ impl Default for ErrorBuffer {
 impl ErrorBuffer {
     fn ptr(&mut self) -> *mut std::ffi::c_char {
         self.0.as_mut_ptr().cast()
+    }
+
+    fn check_status(&self, status: u32, accepted: bool) -> Result<(), NativeCallError> {
+        if status == HIXL_SUCCESS {
+            return Ok(());
+        }
+        Err(NativeCallError {
+            status: Some(status),
+            message: self.message(),
+            accepted,
+        })
     }
 
     fn message(&self) -> String {

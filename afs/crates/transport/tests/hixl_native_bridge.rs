@@ -40,30 +40,57 @@ fn bridge_enforces_device_roce_direction_and_uncertain_submission_retention() {
         "native fake-boundary compile failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let run = |scenario: &str| {
+        let output = Command::new(&executable).arg(scenario).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    for case in [
+        "listen-port",
+        "invalid-listen-port",
+        "completed",
+        "timeout",
+        "failed",
+        "exception",
+        "pre-submit-invalid",
+        "pre-dispatch-bad-alloc",
+        "pre-dispatch-deadline",
+        "pinned-read",
+        "batch-100mib",
+        "write-success",
+        "write-failed",
+        "write-exception",
+        "write-timeout",
+    ] {
+        for transport in ["roce", "hccs"] {
+            run(&format!("{transport}-{case}"));
+        }
+    }
     for scenario in [
         "roce",
-        "roce-listen-port",
         "roce-max-listen-port",
-        "roce-invalid-listen-port",
-        "unknown-submit",
-        "completed",
-        "failed-poll",
-        "pre-submit-invalid",
-        "roce-pre-dispatch-bad-alloc",
+        "roce-pool-completed",
+        "roce-pool-listen-port",
+        "roce-pool-timeout",
+        "roce-pool-write-success",
+        "roce-pool-write-timeout",
+        "roce-pool-write-exception",
+        "roce-pool-missing-intra",
+        "roce-pool-missing-inter",
+        "roce-pool-pcie-conflict",
+        "roce-pool-hccs-conflict",
+        "roce-pool-partial",
+        "hccs-direct",
+        "hccs-partial-pool",
         "startup-cleanup-failed",
         "shared-acl-device-leases",
         "shared-acl-same-device-leases",
         "external-acl-init",
         "acl-reset-retry",
         "acl-finalize-retry",
-        "hccs-completed",
-        "hccs-listen-port",
-        "hccs-invalid-listen-port",
-        "hccs-timeout",
-        "hccs-failed",
-        "hccs-exception",
-        "hccs-pre-submit-invalid",
-        "hccs-pre-dispatch-bad-alloc",
         "hccs-invalid-pool",
         "hccs-unsupported-soc",
         "hccs-null-soc",
@@ -72,61 +99,36 @@ fn bridge_enforces_device_roce_direction_and_uncertain_submission_retention() {
         "hccs-unknown-domain",
         "hccs-negative-domain",
         "reserve-export",
-        "hccs-pinned-read",
-        "roce-batch-100mib",
-        "hccs-batch-100mib",
     ] {
-        let output = Command::new(&executable).arg(scenario).output().unwrap();
-        assert!(
-            output.status.success(),
-            "{scenario}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        run(scenario);
     }
 
     const PCI_KNOWN: &[(&str, &str)] = &[("0001:3a:0b.2", "3\n")];
     const PCI_UNKNOWN: &[(&str, &str)] = &[("0001:3a:0b.2", "-1\n")];
     const PCI_AMBIGUOUS: &[(&str, &str)] = &[("0000:3a:0b.2", "3\n"), ("0001:3a:0b.2", "4\n")];
     let mut failures = Vec::new();
-    for (scenario, pci_devices, source, node, policy) in [
-        ("numa-worker", PCI_UNKNOWN, "worker_cpu", 4, "preferred"),
-        ("numa-roce", PCI_KNOWN, "pci", 3, "preferred"),
-        ("numa-relay", PCI_KNOWN, "pci", 3, "preferred"),
-        ("numa-ambiguous", PCI_AMBIGUOUS, "unknown", -1, "inherited"),
-        ("numa-unknown", PCI_UNKNOWN, "unknown", -1, "inherited"),
-        ("numa-worker-multi", PCI_UNKNOWN, "unknown", -1, "inherited"),
-        (
-            "numa-worker-partial",
-            PCI_UNKNOWN,
-            "unknown",
-            -1,
-            "inherited",
-        ),
-        (
-            "numa-worker-ambiguous",
-            PCI_UNKNOWN,
-            "unknown",
-            -1,
-            "inherited",
-        ),
-        ("numa-worker-empty", PCI_UNKNOWN, "unknown", -1, "inherited"),
-        (
-            "numa-worker-failed",
-            PCI_UNKNOWN,
-            "unknown",
-            -1,
-            "inherited",
-        ),
+    let worker = ("worker_cpu", 4, "preferred");
+    let pci = ("pci", 3, "preferred");
+    let unknown = ("unknown", -1, "inherited");
+    for (scenario, pci_devices, (source, node, policy)) in [
+        ("numa-worker", PCI_UNKNOWN, worker),
+        ("numa-roce", PCI_KNOWN, pci),
+        ("numa-relay", PCI_KNOWN, pci),
+        ("numa-ambiguous", PCI_AMBIGUOUS, unknown),
+        ("numa-unknown", PCI_UNKNOWN, unknown),
+        ("numa-worker-multi", PCI_UNKNOWN, unknown),
+        ("numa-worker-partial", PCI_UNKNOWN, unknown),
+        ("numa-worker-ambiguous", PCI_UNKNOWN, unknown),
+        ("numa-worker-empty", PCI_UNKNOWN, unknown),
+        ("numa-worker-failed", PCI_UNKNOWN, unknown),
         (
             "numa-worker-non-default",
             PCI_UNKNOWN,
-            "worker_cpu",
-            4,
-            "inherited",
+            ("worker_cpu", 4, "inherited"),
         ),
-        ("numa-non-default", PCI_KNOWN, "pci", 3, "inherited"),
-        ("numa-set-rejected", PCI_KNOWN, "pci", 3, "inherited"),
-        ("numa-alloc-failure", PCI_KNOWN, "pci", 3, "preferred"),
+        ("numa-non-default", PCI_KNOWN, ("pci", 3, "inherited")),
+        ("numa-set-rejected", PCI_KNOWN, ("pci", 3, "inherited")),
+        ("numa-alloc-failure", PCI_KNOWN, pci),
     ] {
         let topology = scratch.path().join(scenario);
         let pci_root = topology.join("pci");

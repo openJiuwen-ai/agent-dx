@@ -306,6 +306,14 @@ subsystem = "OwnerFs"
 description = "远端文件尚未修改，写入准备阶段遇到内部错误"
 
 [[error]]
+name = "NODE_OWNER_WRITE_NOT_EXECUTED_CHECKSUM"
+value = "0x020b000c"
+kind = "DataLoss"
+component = "Node"
+subsystem = "OwnerFs"
+description = "Home 校验 HIXL 写入正文失败，尚未执行文件写入"
+
+[[error]]
 name = "NODE_DFS_STALE_HANDLE"
 value = "0x020c0001"
 kind = "FailedPrecondition"

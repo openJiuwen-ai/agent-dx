@@ -1,4 +1,4 @@
-//! Reader-side OwnerFs HIXL read-ahead windows.
+//! Client-side OwnerFs HIXL sessions and read-ahead windows.
 //!
 //! Only read-only remote opens are eligible. A READ that misses the open's
 //! window asks Home to prepare `[offset, offset + size)` of that open handle,
@@ -12,6 +12,7 @@
 mod batch;
 
 mod read_session;
+mod write;
 pub(super) use read_session::{OwnerReadSession, WindowRead};
 
 use super::hixl::{
@@ -53,6 +54,8 @@ const UNSUPPORTED_RETRY: Duration = Duration::from_secs(60);
 /// keeps nothing Home still serves and may be evicted.
 const HOME_POOL_IDLE: Duration = Duration::from_secs(60);
 const PREPARE_ATTEMPTS: usize = 3;
+/// Leave room below Home's bounded replay table while rotating busy sessions.
+const MAX_SESSION_WRITE_TICKETS: usize = 1024;
 /// Mirrors the `[hixl].ownerfs_sessions_per_home` configuration bound.
 const MAX_OWNER_HIXL_SESSIONS_PER_HOME: usize = 4;
 const RELEASE_ATTEMPTS: usize = 3;
@@ -60,7 +63,7 @@ const RELEASE_ATTEMPTS: usize = 3;
 /// is sent on its own, so idle slots return to Home promptly.
 const RELEASE_PARK: Duration = Duration::from_millis(10);
 
-/// Window sizing shared by every open of this process.
+/// OwnerFs HIXL transfer policy shared by every open of this process.
 #[derive(Clone, Copy, Debug)]
 pub struct OwnerHixlPolicy {
     pub mode: DataMode,
@@ -68,6 +71,8 @@ pub struct OwnerHixlPolicy {
     pub max_inflight: usize,
     pub host_budget_bytes: u64,
     pub min_file_bytes: u64,
+    /// Auto compares this threshold with the current write, not the file size.
+    pub min_write_bytes: usize,
     /// Local receive slots of each lane: one native batch READ needs one per slot.
     pub receive_slots: usize,
     /// Control sessions per Home. Each session admits one window fetch, so
@@ -83,6 +88,8 @@ pub struct OwnerHixlPolicy {
 /// Process-wide reader state: one control session per Home, engine bindings,
 /// lane bindings and the shared window budget.
 pub struct OwnerHixlReader {
+    // Most nodes never see an indeterminate write; keep their read hot path lock-free here.
+    uncertain_files: std::sync::OnceLock<StdMutex<UncertainFiles>>,
     native: Arc<dyn ReadRuntime>,
     node_id: String,
     policy: OwnerHixlPolicy,
@@ -97,6 +104,42 @@ pub struct OwnerHixlReader {
     release_park: Duration,
     metrics: Option<HixlMetrics>,
     owner_metrics: Option<OwnerRpcMetrics>,
+}
+
+// Late Home writes have no completion deadline. Never evict an identity on a
+// timer or on close; at capacity conservatively bypass all reusable read data.
+const MAX_UNCERTAIN_FILES: usize = 4096;
+
+#[derive(Default)]
+struct UncertainFiles {
+    by_home: HashMap<String, HashSet<Vec<u8>>>,
+    count: usize,
+    all: bool,
+}
+
+impl UncertainFiles {
+    fn mark(&mut self, home: &str, identity: &[u8]) {
+        if self.all {
+            return;
+        }
+        if self
+            .by_home
+            .get(home)
+            .is_some_and(|ids| ids.contains(identity))
+        {
+            return;
+        }
+        if self.count == MAX_UNCERTAIN_FILES || identity.is_empty() {
+            self.by_home.clear();
+            self.all = true;
+        } else {
+            self.by_home
+                .entry(home.to_owned())
+                .or_default()
+                .insert(identity.to_vec());
+            self.count += 1;
+        }
+    }
 }
 
 impl OwnerHixlReader {
@@ -133,6 +176,7 @@ impl OwnerHixlReader {
         }
         Ok(Self {
             native,
+            uncertain_files: Default::default(),
             node_id,
             budget: Arc::new(WindowBudget::new(policy.host_budget_bytes)),
             policy,
@@ -289,6 +333,17 @@ impl OwnerHixlReader {
         access: &RootAccess,
         deadline: Instant,
     ) -> afs_error::Result<Option<HomeLease>> {
+        self.acquire_for(home, client, access, deadline, None).await
+    }
+
+    async fn acquire_for(
+        &self,
+        home: &str,
+        client: &OwnerFilesClient<Channel>,
+        access: &RootAccess,
+        deadline: Instant,
+        writer: Option<&OwnerHandle>,
+    ) -> afs_error::Result<Option<HomeLease>> {
         let pool = self.home_pool(home).ok_or_else(|| {
             afs_error::Error::coded(
                 afs_error::NODE_TRANSFER_RESOURCE_EXHAUSTED,
@@ -327,9 +382,22 @@ impl OwnerHixlReader {
         let idle = guard
             .touched
             .is_some_and(|touched| touched.elapsed() >= self.policy.session_idle);
+        // Return a grant before another file or a READ takes this lease. A
+        // failed return fences the old session before any new body transfer.
+        if let Some(session) = guard.session.clone()
+            && guard.write_window.as_ref().is_some_and(|window| {
+                idle || writer.is_none_or(|handle| !window.can_reuse(access, handle))
+                    || session.poisoned.load(Ordering::Acquire)
+                    || session.reply.home_session_id != access.home_session_id
+                    || guard.write_tickets >= MAX_SESSION_WRITE_TICKETS
+            })
+        {
+            let _ = guard.return_write_window(&session, self.timeout).await;
+        }
         let stale = guard.session.as_ref().is_some_and(|session| {
             session.poisoned.load(Ordering::Acquire)
                 || session.reply.home_session_id != access.home_session_id
+                || guard.write_tickets >= MAX_SESSION_WRITE_TICKETS
                 || idle
         });
         if stale && let Some(session) = guard.session.take() {
@@ -347,6 +415,7 @@ impl OwnerHixlReader {
             match self.establish(home, client, access, deadline).await? {
                 Some(session) => {
                     guard.session = Some(Arc::new(session));
+                    guard.write_tickets = 0;
                     pool.set_unsupported(None);
                 }
                 None => {
@@ -566,9 +635,11 @@ impl OwnerHixlReader {
             slot_bytes: slot_bytes as u64,
             prior_release: lease.prior_release(),
         };
+        let attempt = ReadTicket::for_prepare(&lease.session, &prepare.read_id, &remote);
         let reply = match self
             .prepare(
                 &mut lease,
+                &attempt,
                 &prepare,
                 prepare.prior_release.as_ref(),
                 deadline,
@@ -587,11 +658,7 @@ impl OwnerHixlReader {
             .ok_or_else(|| protocol_error("OwnerFs HIXL slot checksum is not negotiated"))?;
         if let Err(error) = validate_prepare(&prepare, &reply, &remote, slot_bytes, slots, checksum)
         {
-            self.reject_prepare(
-                &lease.session,
-                (!reply.slots.is_empty()).then(|| (&reply).into()),
-            )
-            .await;
+            self.reject_prepare(&lease.session, &attempt).await;
             return Err(error);
         }
         if reply.read == 0 {
@@ -677,6 +744,7 @@ impl OwnerHixlReader {
     async fn prepare<Req: Clone, Reply, SendReply>(
         &self,
         lease: &mut HomeLease,
+        attempt: &ReadTicket,
         request: &Req,
         prior_release: Option<&OwnerReleaseHixlReadRequest>,
         deadline: Instant,
@@ -686,26 +754,48 @@ impl OwnerHixlReader {
         SendReply: std::future::Future<Output = Result<tonic::Response<Reply>, tonic::Status>>,
     {
         let started = Instant::now();
-        let result = prepare_with_retry(&lease.session.client, request, deadline, send).await;
+        let mut possibly_admitted = false;
+        let result = prepare_with_retry(
+            &lease.session.client,
+            request,
+            deadline,
+            send,
+            &mut possibly_admitted,
+        )
+        .await;
         self.observe(Operation::Prepare, started.elapsed(), result.is_ok());
         if let Err(error) = &result {
             lease.restore_prior_release(prior_release);
-            if fences_session(error) {
+            // The lease stays held until cleanup finishes. A later request must
+            // not close this session or reuse it while an export may still exist.
+            let recovered = possibly_admitted
+                && self
+                    .release(
+                        &lease.session,
+                        attempt,
+                        HixlReleaseOutcome::NotSubmitted,
+                        false,
+                    )
+                    .await
+                    .is_ok();
+            let recovered_transport_failure = recovered
+                && (retries_prepare(error) || error.code() == afs_error::CLIENT_DEADLINE_EXCEEDED);
+            if (possibly_admitted && !recovered)
+                || (fences_session(error) && !recovered_transport_failure)
+            {
                 lease.session.poisoned.store(true, Ordering::Release);
             }
         }
         result
     }
 
-    /// Fences a session that returned an invalid reply and releases any
-    /// advertised slots without submitting a native read.
-    async fn reject_prepare(&self, session: &HomeSession, ticket: Option<ReadTicket>) {
+    /// Fences a session that returned an invalid reply. Only the locally
+    /// known attempt identity is safe to use for cleanup.
+    async fn reject_prepare(&self, session: &HomeSession, attempt: &ReadTicket) {
         session.poisoned.store(true, Ordering::Release);
-        if let Some(ticket) = ticket {
-            let _ = self
-                .release(session, &ticket, HixlReleaseOutcome::NotSubmitted, false)
-                .await;
-        }
+        let _ = self
+            .release(session, attempt, HixlReleaseOutcome::NotSubmitted, false)
+            .await;
     }
 
     /// Releases in the background while still holding the Home lease, so the
@@ -787,6 +877,8 @@ impl ReadOutcome {
 struct HomeSlot {
     session: Option<Arc<HomeSession>>,
     touched: Option<Instant>,
+    write_tickets: usize,
+    write_window: Option<write::WriteWindow>,
     /// Completed release of the session's last read, not yet sent to Home.
     parked: Option<ReadTicket>,
 }
@@ -831,6 +923,7 @@ impl HomePool {
         self.slots.iter().all(|slot| {
             slot.try_lock().is_ok_and(|slot| {
                 slot.parked.is_none()
+                    && slot.write_window.is_none()
                     && (slot.session.is_none()
                         || slot
                             .touched
@@ -896,6 +989,16 @@ impl Drop for HomeLease {
     /// A release still parked when the lease ends is flushed unless a later
     /// lease of the slot carries it first.
     fn drop(&mut self) {
+        if let Some(window) = &self.guard.write_window
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let slot = OwnedMutexGuard::mutex(&self.guard).clone();
+            runtime.spawn(self.flush.clone().run_write(
+                slot,
+                window.token().to_owned(),
+                window.expires(),
+            ));
+        }
         let Some(read_id) = self
             .guard
             .parked
@@ -1023,11 +1126,25 @@ fn retries_prepare(error: &afs_error::Error) -> bool {
         && error.code() != afs_error::NODE_OWNER_GRANT_UNAVAILABLE
 }
 
+fn uncertain_prepare(error: &afs_error::Error) -> bool {
+    retries_prepare(error)
+        || error.code() == afs_error::CLIENT_PROTOCOL_INVALID_ERROR_DETAIL
+        || (error.code() == afs_error::CLIENT_REMOTE_STATUS
+            && matches!(
+                error.kind(),
+                afs_error::ErrorKind::Cancelled
+                    | afs_error::ErrorKind::Unknown
+                    | afs_error::ErrorKind::Internal
+                    | afs_error::ErrorKind::DataLoss
+            ))
+}
+
 async fn prepare_with_retry<Req: Clone, Reply, SendReply>(
     client: &OwnerFilesClient<Channel>,
     prepare: &Req,
     deadline: Instant,
     send: impl Fn(OwnerFilesClient<Channel>, tonic::Request<Req>) -> SendReply,
+    possibly_admitted: &mut bool,
 ) -> afs_error::Result<Reply>
 where
     SendReply: std::future::Future<Output = Result<tonic::Response<Reply>, tonic::Status>>,
@@ -1040,6 +1157,7 @@ where
             Ok(reply) => return Ok(reply.into_inner()),
             Err(status) => {
                 let error = status_to_error(status);
+                *possibly_admitted |= uncertain_prepare(&error);
                 if !retries_prepare(&error) {
                     return Err(error);
                 }
@@ -1102,7 +1220,7 @@ fn validate_prepare(
     Ok(())
 }
 
-/// Identifies one admitted prepare for its release.
+/// Identifies a read attempt for release, even before its Prepare replies.
 struct ReadTicket {
     session_id: u64,
     read_id: String,
@@ -1110,6 +1228,14 @@ struct ReadTicket {
 }
 
 impl ReadTicket {
+    fn for_prepare(session: &HomeSession, read_id: &str, lane: &HixlLane) -> Self {
+        Self {
+            session_id: session.reply.session_id,
+            read_id: read_id.to_owned(),
+            engine_generation: lane.engine_generation,
+        }
+    }
+
     fn release(
         &self,
         outcome: HixlReleaseOutcome,

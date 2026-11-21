@@ -571,9 +571,11 @@ impl OwnerHixlReader {
             max_file_bytes,
             prior_release: lease.prior_release(),
         };
+        let attempt = ReadTicket::for_prepare(&lease.session, &prepare.read_id, &remote);
         let reply = match self
             .prepare(
                 &mut lease,
+                &attempt,
                 &prepare,
                 prepare.prior_release.as_ref(),
                 deadline,
@@ -591,11 +593,7 @@ impl OwnerHixlReader {
             match validate_batch_prepare(&prepare, &reply, &remote, slot_bytes, slots, checksum) {
                 Ok(files) => files,
                 Err(error) => {
-                    self.reject_prepare(
-                        &lease.session,
-                        (!reply.slots.is_empty()).then(|| (&reply).into()),
-                    )
-                    .await;
+                    self.reject_prepare(&lease.session, &attempt).await;
                     return Err(error);
                 }
             };

@@ -1368,7 +1368,7 @@ See [the measurement boundary](../performance/afs-write-owned-admission.md#measu
 
 Linux 组件测试覆盖显式模式、Auto 优先顺序、旧配置拒绝和健康状态，以及普通窗口与目录批量
 所用的共用拉取路径。loopback 使用内存导出槽验证取消等待、释放合并、校验错误、打开版本与
-失效和 `Bytes` 切片。组件测试也覆盖显式 HIXL 拒绝远端可写打开、尾部补读和缓存 EOF 命中的
+失效和 `Bytes` 切片。组件测试也覆盖显式 HIXL 的远端缓冲可写打开与直接 I/O 拒绝、尾部补读和缓存 EOF 命中的
 1 MiB 请求上限，以及窗口与目录批量 Prepare 的 128 MiB 上限。
 
 ```sh
@@ -1384,6 +1384,12 @@ RoCE、HCCS、多 lane、FUSE 真挂载和吞吐对比各需相应的 Linux 运�
 单卡真机验收时，用 `npu-smi info` 核对所选 NPU 的 PCI 地址，并用对应的 `numa_node` 核对 `AFS_HIXL_NUMA` 的 `source=pci`。核对 `source=worker_cpu` 时，确认 PCI 节点不可用，并检查实际分配槽的 owner 线程（`/proc/<pid>/task/<tid>/status` 的 `Cpus_allowed_list`）允许的全部 CPU 是否同属日志所示节点；无可信节点时预期 `source=unknown node=-1`。另核对 `policy=preferred|inherited`。无需修改 TOML，AFS 也不会自动绑核。
 
 日志报告节点来源和首个接收槽的分配策略，不保证实际页落点。另用槽地址对应的 `/proc/<pid>/numa_maps` 核对页数；若 `/dev/davinci_manager` 映射未报告页数且 `move_pages` 查询返回 `-EFAULT`，将实际落点记为未知。吞吐对比使用相同窗口、槽数和工作负载，并记录两组实际生效的策略。
+
+<a id="hixl-pool-shapes"></a>
+
+**等预算比较中转池规格。** 在同一对节点、同一条链路上固定 `buffer_pool = true`，A 组使用默认的每池 4 块 × 8 MiB，B 组使用 8 块 × 4 MiB。每次两端使用同一组配置并重启；保存两端配置，从 `/health` 确认链路、启池状态和每条 lane 的 `relay_hbm_budget_bytes = 67108864`。两组预算相同，单看该指标不能区分块数。固定 `data_mode = "hixl"`、Host 槽、并发度、文件大小、请求大小和内存对齐；每组预热后交替运行至少三对，分别比较 `pwrite` 带宽、含 `fsync` 的带宽和单次 `pwrite` P99。读回并核对 Home 文件摘要，记录两端 HIXL 正文字节数。64 KiB 和 1 MiB 请求分别报告，以免混合均值掩盖差异。
+
+写路径的硬件验收应分别在 HCCS 和 RoCE 双机上执行同一文件的顺序写、短写、追加、读回和 fsync。断链时检查目标槽隔离，Commit 回包丢失时以同一票据确认文件只追加一次。记录两端 SDK、设备型号、实际写入字节和读回摘要。
 
 **RoCE 遗留事项（待双机真机验证）**
 

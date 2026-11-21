@@ -98,6 +98,7 @@ const SEQUENTIAL_STREAK: u32 = 2;
 struct OpenEntry {
     identity: Vec<u8>,
     epoch: AtomicU64,
+    cacheable: bool,
     state: StdMutex<WindowState>,
     /// Set when a directory batch may serve this open.
     batch: Option<BatchRoute>,
@@ -119,6 +120,7 @@ pub(in crate::node::rpc::peer) struct OwnerReadSession {
     pub(super) home: String,
     opens: StdMutex<HashMap<Vec<u8>, Arc<OpenEntry>>>,
     batches: Arc<StdMutex<BatchStore>>,
+    writers: StdMutex<std::collections::HashSet<Vec<u8>>>,
 }
 
 impl OwnerReadSession {
@@ -127,6 +129,7 @@ impl OwnerReadSession {
             reader,
             home,
             opens: StdMutex::new(HashMap::new()),
+            writers: StdMutex::default(),
             batches: Arc::new(StdMutex::new(BatchStore::default())),
         }
     }
@@ -167,7 +170,25 @@ impl OwnerReadSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Registers eligible read-only opens for their window or batch policy.
+    pub(in crate::node::rpc::peer) fn track_writer(&self, handle: &[u8], flags: i32) {
+        if flags & (libc::O_PATH | libc::O_DIRECT) == 0
+            && matches!(flags & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
+        {
+            self.writers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(handle.to_vec());
+        }
+    }
+
+    pub(in crate::node::rpc::peer) fn is_buffered_writer(&self, handle: &[u8]) -> bool {
+        self.writers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(handle)
+    }
+
+    /// Registers buffered file handles. Writable handles use demand reads only.
     pub(in crate::node::rpc::peer) fn opened(
         &self,
         grant: &RootGrant,
@@ -179,19 +200,27 @@ impl OwnerReadSession {
     ) {
         let policy = self.reader.policy;
         let size = attributes.size;
-        if flags & (libc::O_ACCMODE | libc::O_PATH | libc::O_DIRECT) != libc::O_RDONLY {
+        if flags & (libc::O_PATH | libc::O_DIRECT) != 0 {
+            return;
+        }
+        let mode = flags & libc::O_ACCMODE;
+        self.track_writer(handle, flags);
+        if mode != libc::O_RDONLY && mode != libc::O_RDWR {
             return;
         }
         let windowed = policy.mode == DataMode::Hixl || size >= policy.min_file_bytes;
-        let batch = (size > OPEN_PREFETCH_LIMIT && size <= policy.batch_max_file_bytes)
-            .then(|| batch_route(grant, path, attributes, !windowed))
-            .flatten();
+        let cacheable = mode == libc::O_RDONLY;
+        let batch =
+            (cacheable && size > OPEN_PREFETCH_LIMIT && size <= policy.batch_max_file_bytes)
+                .then(|| batch_route(grant, path, attributes, !windowed))
+                .flatten();
         if windowed || batch.is_some() {
             self.opens().insert(
                 handle.to_vec(),
                 Arc::new(OpenEntry {
                     identity: identity.to_vec(),
                     epoch: AtomicU64::new(0),
+                    cacheable,
                     state: StdMutex::new(WindowState::default()),
                     batch,
                 }),
@@ -200,7 +229,33 @@ impl OwnerReadSession {
     }
 
     pub(in crate::node::rpc::peer) fn released(&self, handle: &[u8]) {
+        self.writers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(handle);
         self.opens().remove(handle);
+    }
+
+    pub(in crate::node::rpc::peer) fn mark_uncertain_write(&self, identity: &[u8]) {
+        self.reader
+            .uncertain_files
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark(&self.home, identity);
+    }
+
+    pub(in crate::node::rpc::peer) fn cache_allowed(&self, identity: &[u8]) -> bool {
+        self.reader.uncertain_files.get().is_none_or(|files| {
+            let files = files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !files.all
+                && !files
+                    .by_home
+                    .get(&self.home)
+                    .is_some_and(|ids| ids.contains(identity))
+        })
     }
 
     /// Drops every window, prefetch and batch slice of a file after this node
@@ -231,7 +286,7 @@ impl OwnerReadSession {
         size: usize,
     ) -> Option<prost::bytes::Bytes> {
         let entry = self.opens().get(&file.handle).cloned()?;
-        if file.owner_session_id != grant.home_session_id {
+        if file.owner_session_id != grant.home_session_id || !self.cache_allowed(&entry.identity) {
             return None;
         }
         let mut state = entry.state.lock().ok()?;
@@ -310,6 +365,14 @@ impl OwnerReadSession {
             .lock()
             .map_err(|_| protocol_error("OwnerFs HIXL window lock poisoned"))?;
         let epoch = entry.epoch.load(Ordering::Acquire);
+        let cacheable = entry.cacheable && self.cache_allowed(&entry.identity);
+        if !cacheable {
+            // A lookup may have raced the invalidation on another peer client.
+            *state = WindowState::default();
+            if entry.batch.as_ref().is_some_and(|route| route.batch_only) {
+                return Ok(WindowRead::Fallback { served: 0 });
+            }
+        }
         if state
             .window
             .as_ref()
@@ -324,7 +387,7 @@ impl OwnerReadSession {
         {
             state.pending = None;
         }
-        if let Some(route) = &entry.batch {
+        if cacheable && let Some(route) = &entry.batch {
             if let Some(bytes) = self.batch_slice(
                 Some(&handle),
                 Some(client),
@@ -418,7 +481,7 @@ impl OwnerReadSession {
                     }
                 }
             }
-            let size = if sequential {
+            let size = if sequential && cacheable {
                 state.ramp = next_ramp(state.ramp, reader.slot_bytes(), policy.max_group_bytes);
                 state.ramp.max(wanted)
             } else {
@@ -445,7 +508,7 @@ impl OwnerReadSession {
                     .ok_or_else(|| protocol_error("OwnerFs HIXL deadline overflow"))?,
             };
             let deadline = request.deadline;
-            let keep_window = budget.is_some();
+            let keep_window = cacheable && budget.is_some();
             let task = handle.spawn(reader.clone().fetch(request, budget));
             let result = handle.block_on(async move {
                 tokio::time::timeout(remaining(deadline)?, task)
@@ -501,7 +564,7 @@ impl OwnerReadSession {
         if let Some(metrics) = &reader.owner_metrics {
             metrics.record_payload("client", "read", "hixl", served as u64);
         }
-        if policy.max_inflight > 1 {
+        if cacheable && policy.max_inflight > 1 {
             self.start_prefetch(&handle, &mut state, grant, file, client, epoch);
         }
         Ok(WindowRead::Done(served))

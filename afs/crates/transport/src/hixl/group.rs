@@ -138,7 +138,7 @@ impl HixlRuntimeGroup {
                 Err(start_error) => return Err(rollback_start(&lanes, start_error)),
             }
         }
-        if lanes[0].info().transport == ReadTransport::HccsBufferPool {
+        if lanes[0].info().transport == ReadTransport::Hccs {
             let expected_domain = lanes[0].info().hccs_domain_id;
             if expected_domain.is_none()
                 || lanes
@@ -214,8 +214,7 @@ pub fn validate_group_options(options: &[RuntimeOptions]) -> Result<(), HixlErro
             || lane.receive_slots != first.receive_slots
             || lane.export_slots != first.export_slots
             || lane.transport != first.transport
-            || lane.buffer_pool_count != first.buffer_pool_count
-            || lane.buffer_pool_size_mib != first.buffer_pool_size_mib
+            || lane.buffer_pool_dims() != first.buffer_pool_dims()
         {
             return Err(group_option_error(
                 "HIXL lanes must share window, slots, transport, and BufferPool dimensions",

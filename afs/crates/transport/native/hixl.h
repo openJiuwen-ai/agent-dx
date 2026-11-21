@@ -3,7 +3,7 @@
  *
  * Rust owns the lifecycle state machine and invokes this ABI only from its
  * dedicated ACL owner thread.  The native side owns aclrtMallocHost buffers,
- * optional HIXL registrations and request handles.  No C++ object or STL
+ * optional HIXL registrations.  No C++ object or STL
  * type crosses the boundary.
  */
 #ifndef AFS_HIXL_H
@@ -23,7 +23,7 @@ typedef struct afs_hixl_window {
     uint64_t length;
 } afs_hixl_window_t;
 
-/* One remote read range and its destination receive slot. Each batch must use
+/* One remote range and its local receive or staging slot. Each batch must use
  * distinct free slots. Returned addresses follow descriptor order. */
 typedef struct afs_hixl_batch_window {
     uint64_t slot_id;
@@ -33,17 +33,13 @@ typedef struct afs_hixl_batch_window {
 
 #define AFS_HIXL_MAX_BATCH_WINDOWS 64U
 
-/* poll states: waiting, completed, failed, timeout, unknown */
-#define AFS_HIXL_POLL_WAITING 0U
-#define AFS_HIXL_POLL_COMPLETED 1U
-#define AFS_HIXL_POLL_FAILED 2U
-#define AFS_HIXL_POLL_TIMEOUT 3U
-#define AFS_HIXL_POLL_UNKNOWN 4U
-
 #define AFS_HIXL_TRANSPORT_ROCE 1U
-#define AFS_HIXL_TRANSPORT_HCCS_BUFFER_POOL 2U
+#define AFS_HIXL_TRANSPORT_HCCS 2U
 
-/* On failure, a non-null out_runtime marks retained resources after incomplete
+/* Pool dimensions are both zero for direct RoCE, or both positive for relay.
+ * HCCS requires relay. RoCE relay requires HCCL_INTRA_ROCE_ENABLE=1,
+ * HCCL_INTRA_PCIE_ENABLE=0 and HCCL_INTER_HCCS_DISABLE=TRUE before SDK startup.
+ * On failure, a non-null out_runtime marks retained resources after incomplete
  * cleanup. It is quarantined and must never permit an unsupported fallback. */
 uint32_t afs_hixl_start(int32_t device_id,
                         const char *engine_id,
@@ -82,35 +78,12 @@ uint32_t afs_hixl_release_export(void *runtime,
                                  char *error,
                                  size_t error_len);
 
-/* Submits every window in one SDK batch.  Validation happens for the whole
- * array before any slot is reserved; a failure after native entry retains
- * every listed slot as quarantined. */
-uint32_t afs_hixl_submit_read_batch(void *runtime,
-                                    const char *peer,
-                                    const afs_hixl_batch_window_t *windows,
-                                    size_t count,
-                                    void **out_request,
-                                    uint32_t *dispatch_started,
-                                    char *error,
-                                    size_t error_len);
-
-/* On AFS_HIXL_POLL_COMPLETED every slot stays pinned, exactly as for
- * afs_hixl_read_sync_batch; `slot_count` must equal the submitted windows. */
-uint32_t afs_hixl_poll_read(void *runtime,
-                            void *request,
-                            uint64_t *slot_addresses,
-                            size_t slot_count,
-                            uint32_t *out_state,
-                            uint64_t *sdk_transfer_ns,
-                            char *error,
-                            size_t error_len);
-
-/* HCCS relay only.  All windows are submitted through one TransferSync call.
+/* All windows are submitted through one TransferSync call.
  * On success every slot stays pinned and `slot_addresses` receives one address
  * per window, in window order, for the caller to copy from before it calls
  * afs_hixl_release_receives.  dispatch_started distinguishes pre-entry
  * rejection from an uncertain native outcome; failure after entry retains Host
- * windows, HBM pools and the engine. */
+ * windows, any relay HBM pools, and the engine. */
 uint32_t afs_hixl_read_sync_batch(void *runtime,
                                   const char *peer,
                                   const afs_hixl_batch_window_t *windows,
@@ -121,6 +94,20 @@ uint32_t afs_hixl_read_sync_batch(void *runtime,
                                   uint64_t *sdk_transfer_ns,
                                   char *error,
                                   size_t error_len);
+
+/* Copies `bytes` into native Host slots, submits one WRITE and waits for
+ * completion. Rust payload storage is never used by DMA. On failure after
+ * dispatch_started is set, the slots and engine are retained. */
+uint32_t afs_hixl_write_batch(void *runtime,
+                              const char *peer,
+                              const afs_hixl_batch_window_t *windows,
+                              size_t count,
+                              const uint8_t *bytes,
+                              size_t len,
+                              uint32_t timeout_ms,
+                              uint32_t *dispatch_started,
+                              char *error,
+                              size_t error_len);
 
 /* Frees receive slots a completed READ left pinned.  Every slot must be pinned;
  * the call validates the whole array before changing any slot. */

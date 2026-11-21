@@ -1,4 +1,4 @@
-use super::test_support::{MemoryExports, MemorySource, OPEN_HANDLE};
+use super::test_support::{MemoryExports, MemorySource, OPEN_HANDLE, memory_home};
 use super::*;
 use afs_protocol::node_data::{DfsDigestAlgorithm, OwnerHandle, RootAccess};
 use std::sync::atomic::Ordering;
@@ -22,12 +22,12 @@ fn fixture(
     file_bytes: usize,
     slots: usize,
 ) -> (OwnerHixlService, Arc<MemoryExports>, Arc<MemorySource>) {
-    let exports = Arc::new(MemoryExports::new(SLOT, slots));
-    let data = (0..file_bytes).map(|index| (index % 251) as u8).collect();
     // A 3000-byte source chunk proves prepare loops until the window is full.
-    let source = Arc::new(MemorySource::new(data, 3000));
-    let service = OwnerHixlService::from_parts(exports.clone(), source.clone());
-    (service, exports, source)
+    memory_home(
+        SLOT,
+        slots,
+        MemorySource::new(patterned(file_bytes, 0), 3000),
+    )
 }
 
 fn negotiate_request(root: &str) -> OwnerNegotiateHixlRequest {
@@ -64,6 +64,30 @@ fn prepare_request(
         slot_bytes: SLOT as u64,
         prior_release: None,
     }
+}
+
+// Callers exercising identity or request mutations use the raw RPC and builders.
+fn prepare_window(
+    service: &OwnerHixlService,
+    session_id: u64,
+    read_id: &str,
+    offset: u64,
+    length: u64,
+) -> Result<OwnerPrepareReadHixlReply, Status> {
+    service.prepare_blocking(
+        "node-b",
+        prepare_request(session_id, read_id, offset, length),
+    )
+}
+
+fn prepare_page(
+    service: &OwnerHixlService,
+    session_id: u64,
+    read_id: &str,
+    anchor: &str,
+    slots: usize,
+) -> Result<OwnerPrepareBatchHixlReply, Status> {
+    service.prepare_batch_blocking("node-b", batch_request(session_id, read_id, anchor, slots))
 }
 
 fn release_request(
@@ -221,9 +245,7 @@ fn negotiate_authorizes_the_presented_grant_and_reports_lanes() {
 fn prepare_fills_contiguous_slots_with_digests_and_reports_eof() {
     let (service, exports, source) = fixture(10_000, 4);
     let session_id = session(&service);
-    let reply = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 1000, 16_384))
-        .unwrap();
+    let reply = prepare_window(&service, session_id, "r1", 1000, 16_384).unwrap();
     assert_eq!(reply.read, 9000);
     assert!(reply.eof);
     assert_eq!(reply.engine_generation, 7);
@@ -275,9 +297,7 @@ fn prepare_cuts_slots_to_the_requested_size_within_the_lane_window() {
 fn prepare_at_eof_exports_nothing() {
     let (service, exports, _) = fixture(100, 4);
     let session_id = session(&service);
-    let reply = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 100, 4096))
-        .unwrap();
+    let reply = prepare_window(&service, session_id, "r1", 100, 4096).unwrap();
     assert_eq!(reply.read, 0);
     assert!(reply.eof);
     assert!(reply.slots.is_empty());
@@ -288,12 +308,7 @@ fn prepare_at_eof_exports_nothing() {
 fn slots_past_a_short_read_are_released_before_the_reply() {
     let (service, exports, _) = fixture(SLOT + 100, 4);
     let session_id = session(&service);
-    let reply = service
-        .prepare_blocking(
-            "node-b",
-            prepare_request(session_id, "r1", 0, (SLOT * 4) as u64),
-        )
-        .unwrap();
+    let reply = prepare_window(&service, session_id, "r1", 0, (SLOT * 4) as u64).unwrap();
     assert_eq!(reply.read, (SLOT + 100) as u64);
     assert!(reply.eof);
     assert_eq!(reply.slots.len(), 2);
@@ -306,12 +321,7 @@ fn a_full_export_pool_fails_the_prepare_before_reading_the_source() {
     let (service, exports, source) = fixture(SLOT * 2, 4);
     exports.fail_export_exhausted_at.store(2, Ordering::SeqCst);
     let session_id = session(&service);
-    let error = service
-        .prepare_blocking(
-            "node-b",
-            prepare_request(session_id, "r1", 0, (SLOT * 2) as u64),
-        )
-        .unwrap_err();
+    let error = prepare_window(&service, session_id, "r1", 0, (SLOT * 2) as u64).unwrap_err();
     assert!(error.message().contains("injected full export pool"));
     assert_eq!(exports.active(), 0);
     assert_eq!(source.reads.load(Ordering::SeqCst), 0);
@@ -324,14 +334,7 @@ fn a_failed_release_of_an_unused_slot_quarantines_the_runtime() {
     source.fail_read_at(0, afs_error::IO_OTHER);
     exports.fail_release.store(true, Ordering::SeqCst);
     let session_id = session(&service);
-    assert!(
-        service
-            .prepare_blocking(
-                "node-b",
-                prepare_request(session_id, "r1", 0, (SLOT * 2) as u64),
-            )
-            .is_err()
-    );
+    assert!(prepare_window(&service, session_id, "r1", 0, (SLOT * 2) as u64).is_err());
     assert_eq!(exports.quarantines.load(Ordering::SeqCst), 1);
 }
 
@@ -362,38 +365,24 @@ fn prepare_rejects_stale_handles_and_foreign_peers_before_reading() {
 fn identical_replay_reuses_admitted_slots_and_different_replay_is_rejected() {
     let (service, exports, source) = fixture(SLOT * 2, 4);
     let session_id = session(&service);
-    let first = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 8192))
-        .unwrap();
+    let first = prepare_window(&service, session_id, "r1", 0, 8192).unwrap();
     let reads = source.reads.load(Ordering::SeqCst);
-    let replay = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 8192))
-        .unwrap();
+    let replay = prepare_window(&service, session_id, "r1", 0, 8192).unwrap();
     assert_eq!(first, replay);
     assert_eq!(source.reads.load(Ordering::SeqCst), reads);
     assert_eq!(exports.exports.load(Ordering::SeqCst), 2);
-    assert!(
-        service
-            .prepare_blocking("node-b", prepare_request(session_id, "r1", 4096, 4096))
-            .is_err()
-    );
+    assert!(prepare_window(&service, session_id, "r1", 4096, 4096).is_err());
 }
 
 #[test]
 fn slot_capacity_is_checked_before_reading_the_source() {
     let (service, _, source) = fixture(SLOT * 4, 3);
     let session_id = session(&service);
-    let too_large = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 16_384))
-        .unwrap_err();
+    let too_large = prepare_window(&service, session_id, "r1", 0, 16_384).unwrap_err();
     assert!(too_large.message().contains("export pool"));
-    service
-        .prepare_blocking("node-b", prepare_request(session_id, "r2", 0, 8192))
-        .unwrap();
+    prepare_window(&service, session_id, "r2", 0, 8192).unwrap();
     let reads = source.reads.load(Ordering::SeqCst);
-    let busy = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r3", 8192, 8192))
-        .unwrap_err();
+    let busy = prepare_window(&service, session_id, "r3", 8192, 8192).unwrap_err();
     assert!(busy.message().contains("in use"));
     assert_eq!(source.reads.load(Ordering::SeqCst), reads);
 }
@@ -403,11 +392,7 @@ fn failed_export_rolls_back_earlier_slots_without_quarantine() {
     let (service, exports, _) = fixture(SLOT * 3, 4);
     exports.fail_export_at.store(3, Ordering::SeqCst);
     let session_id = session(&service);
-    assert!(
-        service
-            .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 12_288))
-            .is_err()
-    );
+    assert!(prepare_window(&service, session_id, "r1", 0, 12_288).is_err());
     assert_eq!(exports.active(), 0);
     assert_eq!(exports.releases.load(Ordering::SeqCst), 2);
     assert_eq!(exports.quarantines.load(Ordering::SeqCst), 0);
@@ -417,9 +402,7 @@ fn failed_export_rolls_back_earlier_slots_without_quarantine() {
 fn completed_release_frees_slots_and_duplicates_hit_the_tombstone() {
     let (service, exports, _) = fixture(SLOT * 2, 4);
     let session_id = session(&service);
-    let reply = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 8192))
-        .unwrap();
+    let reply = prepare_window(&service, session_id, "r1", 0, 8192).unwrap();
     let release = release_request(&reply, HixlReleaseOutcome::Completed);
     let first = service.release_blocking("node-b", release.clone()).unwrap();
     assert!(first.consumed && !first.already_released);
@@ -427,11 +410,7 @@ fn completed_release_frees_slots_and_duplicates_hit_the_tombstone() {
     let duplicate = service.release_blocking("node-b", release).unwrap();
     assert!(duplicate.consumed && duplicate.already_released);
     // A released read id cannot be prepared again in the same session.
-    assert!(
-        service
-            .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 8192))
-            .is_err()
-    );
+    assert!(prepare_window(&service, session_id, "r1", 0, 8192).is_err());
     let closed = service
         .close_blocking("node-b", OwnerCloseHixlRequest { session_id })
         .unwrap();
@@ -443,16 +422,9 @@ fn completed_release_frees_slots_and_duplicates_hit_the_tombstone() {
 fn a_prior_release_frees_its_slots_before_the_next_prepare_is_admitted() {
     let (service, exports, _) = fixture(SLOT * 4, 4);
     let session_id = session(&service);
-    let first = service
-        .prepare_blocking(
-            "node-b",
-            prepare_request(session_id, "r1", 0, (SLOT * 4) as u64),
-        )
-        .unwrap();
+    let first = prepare_window(&service, session_id, "r1", 0, (SLOT * 4) as u64).unwrap();
     assert_eq!(exports.active(), 4);
-    let full = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r2", 0, SLOT as u64))
-        .unwrap_err();
+    let full = prepare_window(&service, session_id, "r2", 0, SLOT as u64).unwrap_err();
     assert_eq!(full.code(), tonic::Code::ResourceExhausted);
 
     let mut next = prepare_request(session_id, "r2", 0, SLOT as u64);
@@ -476,12 +448,7 @@ fn a_prior_release_frees_its_slots_before_the_next_prepare_is_admitted() {
 fn a_prior_release_of_another_session_is_rejected_without_effect() {
     let (service, exports, source) = fixture(SLOT * 2, 4);
     let session_id = session(&service);
-    let first = service
-        .prepare_blocking(
-            "node-b",
-            prepare_request(session_id, "r1", 0, (SLOT * 2) as u64),
-        )
-        .unwrap();
+    let first = prepare_window(&service, session_id, "r1", 0, (SLOT * 2) as u64).unwrap();
     let reads = source.reads.load(Ordering::SeqCst);
     let mut release = release_request(&first, HixlReleaseOutcome::Completed);
     release.session_id += 1;
@@ -497,9 +464,7 @@ fn a_prior_release_of_another_session_is_rejected_without_effect() {
 async fn a_refused_prepare_still_applies_its_prior_release() {
     let (service, exports, _) = fixture(SLOT, 4);
     let session_id = session(&service);
-    let first = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 4096))
-        .unwrap();
+    let first = prepare_window(&service, session_id, "r1", 0, 4096).unwrap();
     service.drain(Duration::ZERO).await.unwrap_err();
     let mut next = prepare_request(session_id, "r2", 0, 4096);
     next.prior_release = Some(release_request(&first, HixlReleaseOutcome::Completed));
@@ -516,9 +481,7 @@ async fn a_refused_prepare_still_applies_its_prior_release() {
 fn unknown_outcome_keeps_slots_and_freezes_admission() {
     let (service, exports, _) = fixture(SLOT, 4);
     let session_id = session(&service);
-    let reply = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 4096))
-        .unwrap();
+    let reply = prepare_window(&service, session_id, "r1", 0, 4096).unwrap();
     let released = service
         .release_blocking(
             "node-b",
@@ -526,13 +489,17 @@ fn unknown_outcome_keeps_slots_and_freezes_admission() {
         )
         .unwrap();
     assert!(!released.consumed);
-    assert_eq!(exports.active(), 1);
-    assert_eq!(exports.quarantines.load(Ordering::SeqCst), 1);
     assert!(
         service
-            .prepare_blocking("node-b", prepare_request(session_id, "r2", 0, 4096))
+            .release_blocking(
+                "node-b",
+                release_request(&reply, HixlReleaseOutcome::NotSubmitted)
+            )
             .is_err()
     );
+    assert_eq!(exports.active(), 1);
+    assert_eq!(exports.quarantines.load(Ordering::SeqCst), 1);
+    assert!(prepare_window(&service, session_id, "r2", 0, 4096).is_err());
     assert!(
         service
             .negotiate_blocking("node-b", negotiate_request("root-a"))
@@ -544,9 +511,7 @@ fn unknown_outcome_keeps_slots_and_freezes_admission() {
 fn failed_native_release_quarantines_and_keeps_the_record() {
     let (service, exports, _) = fixture(SLOT, 4);
     let session_id = session(&service);
-    let reply = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 4096))
-        .unwrap();
+    let reply = prepare_window(&service, session_id, "r1", 0, 4096).unwrap();
     exports.fail_release.store(true, Ordering::SeqCst);
     assert!(
         service
@@ -564,9 +529,7 @@ fn failed_native_release_quarantines_and_keeps_the_record() {
 fn closing_with_unreleased_slots_quarantines_the_runtime() {
     let (service, exports, _) = fixture(SLOT, 4);
     let session_id = session(&service);
-    service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 4096))
-        .unwrap();
+    prepare_window(&service, session_id, "r1", 0, 4096).unwrap();
     let closed = service
         .close_blocking("node-b", OwnerCloseHixlRequest { session_id })
         .unwrap();
@@ -579,9 +542,7 @@ fn closing_with_unreleased_slots_quarantines_the_runtime() {
 async fn failed_expiry_quarantine_keeps_admission_frozen_until_a_retry_succeeds() {
     let (service, exports, _) = fixture(SLOT, 4);
     let session_id = session(&service);
-    service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 4096))
-        .unwrap();
+    prepare_window(&service, session_id, "r1", 0, 4096).unwrap();
     for session in service.lock_registry().unwrap().sessions.values_mut() {
         session.last_used = Instant::now() - OWNER_HIXL_SESSION_TTL;
     }
@@ -609,9 +570,7 @@ async fn failed_expiry_quarantine_keeps_admission_frozen_until_a_retry_succeeds(
 async fn failed_forced_quarantine_is_retried_by_the_next_expiry() {
     let (service, exports, _) = fixture(SLOT, 4);
     let session_id = session(&service);
-    let reply = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 4096))
-        .unwrap();
+    let reply = prepare_window(&service, session_id, "r1", 0, 4096).unwrap();
     exports.fail_quarantine.store(true, Ordering::SeqCst);
     assert!(
         service
@@ -641,9 +600,7 @@ async fn admitted_prepare_replays_after_admission_stops() {
         service.prepare_blocking("node-b", request).unwrap(),
         admitted
     );
-    let refused = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r2", 0, 4096))
-        .unwrap_err();
+    let refused = prepare_window(&service, session_id, "r2", 0, 4096).unwrap_err();
     assert_eq!(
         afs_transport::grpc::error_status::status_to_error(refused).code(),
         afs_error::NODE_TRANSFER_UNAVAILABLE
@@ -655,9 +612,7 @@ async fn admitted_prepare_replays_after_admission_stops() {
 async fn drain_accepts_releases_and_times_out_with_pending_slots() {
     let (service, exports, _) = fixture(SLOT, 4);
     let session_id = session(&service);
-    let reply = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 0, 4096))
-        .unwrap();
+    let reply = prepare_window(&service, session_id, "r1", 0, 4096).unwrap();
     let error = service.drain(Duration::from_millis(30)).await.unwrap_err();
     assert!(error.message().contains("drain"));
     assert_eq!(exports.quarantines.load(Ordering::SeqCst), 1);
@@ -690,14 +645,7 @@ async fn draining_home_refuses_new_prepares_but_consumes_releases() {
     let session_id = session(&service);
     let live: Vec<_> = ["direct", "window-prior", "batch-prior"]
         .into_iter()
-        .map(|read_id| {
-            service
-                .prepare_blocking(
-                    "node-b",
-                    prepare_request(session_id, read_id, 0, SLOT as u64),
-                )
-                .unwrap()
-        })
+        .map(|read_id| prepare_window(&service, session_id, read_id, 0, SLOT as u64).unwrap())
         .collect();
     let drain = start_drain(&service).await;
 
@@ -863,9 +811,7 @@ fn crc32c_session_slots_carry_crc32c_digests() {
         .negotiate_blocking("node-b", offered)
         .unwrap()
         .session_id;
-    let reply = service
-        .prepare_blocking("node-b", prepare_request(session_id, "r1", 1000, 16_384))
-        .unwrap();
+    let reply = prepare_window(&service, session_id, "r1", 1000, 16_384).unwrap();
     let data = source.data.lock().unwrap().clone();
     let mut offset = 1000_usize;
     for slot in &reply.slots {
@@ -912,20 +858,12 @@ fn slot_checksum_negotiation_falls_back_to_blake3() {
 
 #[test]
 fn prepare_reads_every_slot_of_a_window_concurrently() {
-    let exports = Arc::new(MemoryExports::new(SLOT, 4));
-    let data = (0..SLOT * 4)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let data = patterned(SLOT * 4, 0);
     // Each read waits until four run at once, so a sequential read peaks at one.
-    let source = Arc::new(MemorySource::new(data.clone(), usize::MAX).with_overlap_probe(4));
-    let service = OwnerHixlService::from_parts(exports.clone(), source.clone());
+    let source = MemorySource::new(data.clone(), usize::MAX).with_overlap_probe(4);
+    let (service, exports, source) = memory_home(SLOT, 4, source);
     let session_id = session(&service);
-    let reply = service
-        .prepare_blocking(
-            "node-b",
-            prepare_request(session_id, "r1", 0, (SLOT * 4) as u64),
-        )
-        .unwrap();
+    let reply = prepare_window(&service, session_id, "r1", 0, (SLOT * 4) as u64).unwrap();
 
     assert!(
         source.peak_overlap() >= 2,
@@ -947,12 +885,7 @@ fn the_first_failing_slot_in_file_order_decides_the_error() {
     source.fail_read_at(SLOT as u64, afs_error::IO_OTHER);
     source.fail_read_at((SLOT * 3) as u64, afs_error::NODE_OWNER_STALE_HANDLE);
     let session_id = session(&service);
-    let error = service
-        .prepare_blocking(
-            "node-b",
-            prepare_request(session_id, "r1", 0, (SLOT * 4) as u64),
-        )
-        .unwrap_err();
+    let error = prepare_window(&service, session_id, "r1", 0, (SLOT * 4) as u64).unwrap_err();
 
     let expected = error_to_status(afs_error::Error::coded(afs_error::IO_OTHER, "probe"));
     assert_eq!(error.code(), expected.code());
@@ -1013,10 +946,9 @@ fn batch_request(
 fn window_and_directory_batch_share_the_128_mib_prepare_limit() {
     const WINDOW: usize = 4 * 1024 * 1024;
     const GROUP: u64 = 128 * 1024 * 1024;
-    let exports = Arc::new(MemoryExports::new(WINDOW, 32));
-    let source = Arc::new(MemorySource::new(vec![42], 3000));
+    let source = MemorySource::new(vec![42], 3000);
     source.tree.insert_directory("d");
-    let service = OwnerHixlService::from_parts(exports.clone(), source);
+    let (service, exports, _) = memory_home(WINDOW, 32, source);
     let session_id = session(&service);
 
     let mut window = prepare_request(session_id, "limit", 0, GROUP);
@@ -1076,9 +1008,7 @@ fn batch_files(
 fn batch_prepare_packs_whole_files_in_name_order_from_the_anchor() {
     let (service, exports, source) = batch_fixture(8);
     let session_id = session(&service);
-    let reply = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "b", 2))
-        .unwrap();
+    let reply = prepare_page(&service, session_id, "b1", "b", 2).unwrap();
 
     // b opens slot 0; c and d are out of range; e does not fit after b and
     // opens slot 1; f fits nowhere, so the batch stops there.
@@ -1132,9 +1062,7 @@ fn batch_prepare_packs_whole_files_in_name_order_from_the_anchor() {
 fn consecutive_batch_pages_reuse_names_but_revalidate_the_grant_and_files() {
     let (service, exports, source) = batch_fixture(8);
     let session_id = session(&service);
-    let first = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "", 1))
-        .unwrap();
+    let first = prepare_page(&service, session_id, "b1", "", 1).unwrap();
     assert_eq!(first.next_name, b"e");
 
     let mut denied = batch_request(session_id, "denied", "e", 1);
@@ -1147,14 +1075,10 @@ fn consecutive_batch_pages_reuse_names_but_revalidate_the_grant_and_files() {
     let updated = vec![71; 2048];
     source.tree.write("d/e", updated.clone());
     source.tree.rewrite_on_open("d/f");
-    let second = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b2", "e", 1))
-        .unwrap();
+    let second = prepare_page(&service, session_id, "b2", "e", 1).unwrap();
     assert_eq!(second.next_name, b"f");
     assert_eq!(batch_files(&exports, &second), [("e".to_owned(), updated)]);
-    let third = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b3", "f", 1))
-        .unwrap();
+    let third = prepare_page(&service, session_id, "b3", "f", 1).unwrap();
     assert!(third.files.is_empty(), "f changed after its fresh stat");
     assert_eq!(source.tree.listings.load(Ordering::SeqCst), 1);
 }
@@ -1163,16 +1087,12 @@ fn consecutive_batch_pages_reuse_names_but_revalidate_the_grant_and_files() {
 fn batch_name_snapshot_refreshes_after_membership_and_access_generation_changes() {
     let (service, exports, source) = batch_fixture(8);
     let session_id = session(&service);
-    let first = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "", 1))
-        .unwrap();
+    let first = prepare_page(&service, session_id, "b1", "", 1).unwrap();
     assert_eq!(first.next_name, b"e");
 
     let added = vec![42; 600];
     source.tree.insert("d/ea", added.clone());
-    let second = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b2", "e", 1))
-        .unwrap();
+    let second = prepare_page(&service, session_id, "b2", "e", 1).unwrap();
     assert_eq!(batch_files(&exports, &second)[1], ("ea".to_owned(), added));
     assert_eq!(second.next_name, b"f");
     assert_eq!(source.tree.listings.load(Ordering::SeqCst), 2);
@@ -1185,29 +1105,35 @@ fn batch_name_snapshot_refreshes_after_membership_and_access_generation_changes(
 }
 
 #[test]
-fn oversized_batch_name_snapshot_bypasses_reuse_without_truncating_pages() {
-    let (service, _exports, source) = batch_fixture(8);
+fn oversized_batch_name_snapshot_skips_prefetch_and_remembers_the_limit() {
+    let (service, exports, source) = batch_fixture(8);
     let session_id = session(&service);
     let suffix = "x".repeat(240);
-    let filler_count = MAX_OWNER_HIXL_BATCH_SNAPSHOT_BYTES / suffix.len() + 1;
-    for index in 0..filler_count {
+    for index in 0..MAX_OWNER_HIXL_BATCH_SCAN {
         source
             .tree
             .insert_directory(&format!("d/x{index:06}{suffix}"));
     }
     source.tree.insert("d/z", vec![1; 601]);
-    let first = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "x", 1))
-        .unwrap();
-    assert!(first.files.is_empty());
-    assert!(first.next_name.starts_with(b"x"));
 
-    let continuation = std::str::from_utf8(&first.next_name).unwrap();
-    let second = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b2", continuation, 1))
-        .unwrap();
-    assert_eq!(second.files[0].name, b"z");
-    assert!(second.next_name.is_empty());
+    for (id, anchor) in [("b1", "a"), ("b2", "z")] {
+        let reply = prepare_page(&service, session_id, id, anchor, 1).unwrap();
+        assert!(reply.files.is_empty() && reply.slots.is_empty() && reply.next_name.is_empty());
+    }
+    let visited = source.tree.listed_entries.load(Ordering::SeqCst);
+    assert!(visited > 0 && visited < MAX_OWNER_HIXL_BATCH_SCAN);
+    assert_eq!(source.tree.listings.load(Ordering::SeqCst), 1);
+    assert_eq!(exports.active(), 0);
+    assert!(source.tree.get(b"d/z").is_some());
+
+    let mut denied = batch_request(session_id, "denied", "z", 1);
+    denied.access.as_mut().unwrap().fencing_token = "revoked".to_owned();
+    assert!(service.prepare_batch_blocking("node-b", denied).is_err());
+    assert_eq!(source.tree.listed_entries.load(Ordering::SeqCst), visited);
+
+    source.tree.insert_directory("d/new");
+    let reply = prepare_page(&service, session_id, "b3", "z", 1).unwrap();
+    assert!(reply.files.is_empty() && reply.next_name.is_empty());
     assert_eq!(source.tree.listings.load(Ordering::SeqCst), 2);
 }
 
@@ -1242,9 +1168,7 @@ fn batch_name_snapshot_evicts_old_directories_at_the_service_limit() {
 fn batch_prepare_shares_slots_and_reports_the_end_of_the_directory() {
     let (service, exports, _) = batch_fixture(8);
     let session_id = session(&service);
-    let reply = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "", 4))
-        .unwrap();
+    let reply = prepare_page(&service, session_id, "b1", "", 4).unwrap();
     let layout = reply
         .files
         .iter()
@@ -1277,9 +1201,7 @@ fn a_failed_batch_file_is_zeroed_and_omitted_while_others_survive() {
     source.tree.fail_open("d/a");
     source.tree.rewrite_on_open("d/e");
     let session_id = session(&service);
-    let reply = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "a", 4))
-        .unwrap();
+    let reply = prepare_page(&service, session_id, "b1", "a", 4).unwrap();
     let names = reply
         .files
         .iter()
@@ -1356,9 +1278,7 @@ fn batch_replay_reuses_the_admitted_slots_and_release_frees_them() {
     assert_eq!(exports.exports.load(Ordering::SeqCst), 3);
 
     // The same read id with another request is a different attempt.
-    let error = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "b", 4))
-        .unwrap_err();
+    let error = prepare_page(&service, session_id, "b1", "b", 4).unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
     let release = OwnerReleaseHixlReadRequest {
@@ -1381,13 +1301,9 @@ fn batch_replay_reuses_the_admitted_slots_and_release_frees_them() {
 fn batch_slots_count_against_the_lane_export_pool() {
     let (service, exports, _) = batch_fixture(4);
     let session_id = session(&service);
-    service
-        .prepare_blocking("node-b", prepare_request(session_id, "w1", 0, SLOT as u64))
-        .unwrap();
+    prepare_window(&service, session_id, "w1", 0, SLOT as u64).unwrap();
     // One window slot is pinned; a four-slot batch cannot be admitted.
-    let error = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "", 4))
-        .unwrap_err();
+    let error = prepare_page(&service, session_id, "b1", "", 4).unwrap_err();
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert_eq!(exports.active(), 1);
 }
@@ -1396,9 +1312,7 @@ fn batch_slots_count_against_the_lane_export_pool() {
 fn a_batch_prepare_applies_its_prior_release_before_admission() {
     let (service, exports, _) = batch_fixture(4);
     let session_id = session(&service);
-    let window = service
-        .prepare_blocking("node-b", prepare_request(session_id, "w1", 0, SLOT as u64))
-        .unwrap();
+    let window = prepare_window(&service, session_id, "w1", 0, SLOT as u64).unwrap();
     let mut request = batch_request(session_id, "b1", "", 4);
     request.prior_release = Some(release_request(&window, HixlReleaseOutcome::Completed));
     let batch = service.prepare_batch_blocking("node-b", request).unwrap();
@@ -1406,20 +1320,203 @@ fn a_batch_prepare_applies_its_prior_release_before_admission() {
 }
 
 #[test]
-fn a_directory_of_ineligible_entries_stops_at_the_scan_limit() {
-    let (service, exports, source) = fixture(SLOT, 8);
+fn entry_limit_accepts_a_complete_listing_and_stops_one_entry_past_it() {
+    let (service, _exports, source) = fixture(SLOT, 8);
     source.tree.insert_directory("d");
-    for index in 0..MAX_OWNER_HIXL_BATCH_SCAN + 10 {
+    for index in 0..MAX_OWNER_HIXL_BATCH_SCAN - 1 {
         source.tree.insert(&format!("d/t{index:05}"), vec![1; 10]);
     }
     let session_id = session(&service);
-    let reply = service
-        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "", 2))
-        .unwrap();
-    assert!(reply.files.is_empty() && reply.slots.is_empty());
+    source.tree.insert("d/z", vec![1; 601]);
+    let reply = prepare_page(&service, session_id, "below", "z", 2).unwrap();
+    assert_eq!(reply.files[0].name, b"z");
+    assert!(reply.next_name.is_empty());
     assert_eq!(
-        reply.next_name,
-        format!("t{MAX_OWNER_HIXL_BATCH_SCAN:05}").into_bytes()
+        source.tree.listed_entries.load(Ordering::SeqCst),
+        MAX_OWNER_HIXL_BATCH_SCAN
     );
-    assert_eq!(exports.exports.load(Ordering::SeqCst), 0);
+
+    for index in 0..10 {
+        source.tree.insert_directory(&format!("d/y{index}"));
+    }
+    let reply = prepare_page(&service, session_id, "above", "", 2).unwrap();
+    assert!(reply.files.is_empty() && reply.slots.is_empty() && reply.next_name.is_empty());
+    assert_eq!(
+        source.tree.listed_entries.load(Ordering::SeqCst),
+        2 * MAX_OWNER_HIXL_BATCH_SCAN + 1
+    );
+}
+
+#[test]
+fn drained_sessions_leave_room_for_new_clients_but_live_sessions_remain_bounded() {
+    let (service, _, _) = fixture(SLOT, 1);
+    let mut previous = 0;
+    for _ in 0..3 * MAX_OWNER_HIXL_SESSIONS {
+        let id = session(&service);
+        assert!(id > previous);
+        previous = id;
+        assert!(
+            service
+                .close_blocking("node-b", OwnerCloseHixlRequest { session_id: id })
+                .unwrap()
+                .drained
+        );
+    }
+    assert!(service.lock_registry().unwrap().sessions.len() <= 2 * MAX_OWNER_HIXL_SESSIONS);
+    for _ in 0..MAX_OWNER_HIXL_SESSIONS {
+        session(&service);
+    }
+    assert_eq!(
+        service
+            .negotiate_blocking("node-b", negotiate_request("root-a"))
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+}
+
+mod write_tests;
+
+#[test]
+fn not_submitted_recovers_window_and_batch_without_prepare_reply() {
+    let (service, exports, _) = batch_fixture(8);
+    let session_id = session(&service);
+    for (read_id, batch) in [("lost-window", false), ("lost-batch", true)] {
+        let prepare = || {
+            if batch {
+                service
+                    .prepare_batch_blocking("node-b", batch_request(session_id, read_id, "", 1))
+                    .map(|_| ())
+            } else {
+                prepare_window(&service, session_id, read_id, 0, SLOT as u64).map(|_| ())
+            }
+        };
+        prepare().unwrap();
+        assert!(exports.active() > 0);
+        let release = not_submitted_request(session_id, read_id);
+        let first = service.release_blocking("node-b", release.clone()).unwrap();
+        assert!(first.consumed && !first.already_released);
+        assert_eq!(exports.active(), 0);
+        let duplicate = service.release_blocking("node-b", release).unwrap();
+        assert!(duplicate.consumed && duplicate.already_released);
+        assert_eq!(prepare().unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+    assert_eq!(exports.quarantines.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn not_submitted_fences_a_prepare_that_has_not_arrived_and_checks_identity() {
+    let (service, exports, _) = batch_fixture(8);
+    let session_id = session(&service);
+    let release = not_submitted_request(session_id, "delayed");
+    assert_eq!(
+        service
+            .release_blocking("node-c", release.clone())
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied,
+    );
+    let mut wrong_generation = release.clone();
+    wrong_generation.engine_generation += 1;
+    assert_eq!(
+        service
+            .release_blocking("node-b", wrong_generation)
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied,
+    );
+    let mut completed = release.clone();
+    completed.outcome = HixlReleaseOutcome::Completed as i32;
+    assert!(service.release_blocking("node-b", completed).is_err());
+
+    // Neither a foreign session nor a Prepare presenting the wrong Home
+    // incarnation may retire an ID on the authenticated read session.
+    let other_session = session(&service);
+    let mut stale_prepare = prepare_request(session_id, "carrier", 0, SLOT as u64);
+    stale_prepare.access.as_mut().unwrap().home_session_id = "stale-home".to_owned();
+    stale_prepare.prior_release = Some(not_submitted_request(session_id, "unaffected"));
+    assert_eq!(
+        service
+            .prepare_blocking("node-b", stale_prepare)
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied,
+    );
+    let unaffected = prepare_window(&service, session_id, "unaffected", 0, SLOT as u64).unwrap();
+    service
+        .release_blocking(
+            "node-b",
+            release_request(&unaffected, HixlReleaseOutcome::Completed),
+        )
+        .unwrap();
+
+    let first = service.release_blocking("node-b", release.clone()).unwrap();
+    assert!(first.consumed && !first.already_released);
+    let duplicate = service.release_blocking("node-b", release).unwrap();
+    assert!(duplicate.consumed && duplicate.already_released);
+    assert!(prepare_window(&service, session_id, "delayed", 0, SLOT as u64).is_err());
+    assert!(
+        service
+            .prepare_batch_blocking("node-b", batch_request(session_id, "delayed", "", 1))
+            .is_err()
+    );
+    assert_eq!(exports.active(), 0);
+    prepare_window(&service, other_session, "delayed", 0, SLOT as u64).unwrap();
+    let next = prepare_window(&service, session_id, "next", 0, SLOT as u64).unwrap();
+    // A recently active session can outlive the cancelled ID's tombstone. It
+    // may replay admitted reads, but cannot publish an old or a new read ID.
+    service
+        .lock_registry()
+        .unwrap()
+        .session_mut(session_id, "node-b")
+        .unwrap()
+        .tombstones
+        .expire(Instant::now() + OWNER_HIXL_SESSION_TTL);
+    assert!(prepare_window(&service, session_id, "delayed", 0, SLOT as u64).is_err());
+    assert!(prepare_window(&service, session_id, "new", 0, SLOT as u64).is_err());
+    assert_eq!(
+        prepare_window(&service, session_id, "next", 0, SLOT as u64).unwrap(),
+        next
+    );
+}
+
+#[test]
+fn not_submitted_rolls_back_a_prepare_already_filling_exports() {
+    let (service, exports, _) = batch_fixture(8);
+    let session_id = session(&service);
+    for (read_id, batch) in [("filling-window", false), ("filling-batch", true)] {
+        let (entered, resume) = exports.pause_next_export();
+        std::thread::scope(|scope| {
+            let late = scope.spawn(|| {
+                if batch {
+                    service
+                        .prepare_batch_blocking("node-b", batch_request(session_id, read_id, "", 1))
+                        .map(|_| ())
+                } else {
+                    prepare_window(&service, session_id, read_id, 0, SLOT as u64).map(|_| ())
+                }
+            });
+            entered.recv_timeout(Duration::from_secs(3)).unwrap();
+            let result =
+                service.release_blocking("node-b", not_submitted_request(session_id, read_id));
+            resume.send(()).unwrap();
+            assert!(result.unwrap().consumed);
+            assert_eq!(
+                late.join().unwrap().unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        });
+        assert_eq!(exports.active(), 0);
+    }
+    assert_eq!(exports.quarantines.load(Ordering::SeqCst), 0);
+}
+
+fn not_submitted_request(session_id: u64, read_id: &str) -> OwnerReleaseHixlReadRequest {
+    OwnerReleaseHixlReadRequest {
+        session_id,
+        read_id: read_id.to_owned(),
+        engine_generation: 7,
+        outcome: HixlReleaseOutcome::NotSubmitted as i32,
+        content_validated: false,
+    }
 }

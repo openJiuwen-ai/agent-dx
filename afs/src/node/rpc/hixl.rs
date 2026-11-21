@@ -17,29 +17,20 @@ pub(super) type TransportParameters = (HixlTransport, u32, u32, Option<u64>);
 
 #[cfg(feature = "ownerfs")]
 pub(super) fn transport_parameters(info: &EngineInfo) -> Result<TransportParameters, &'static str> {
-    match info.transport {
-        ReadTransport::Roce => {
-            if info.buffer_pool_count != 0
-                || info.buffer_pool_size_mib != 0
-                || info.hccs_domain_id.is_some()
-            {
-                return Err("HIXL RoCE relay parameters must be empty");
-            }
-            Ok((HixlTransport::Roce, 0, 0, None))
+    let count = u32::try_from(info.buffer_pool_count)
+        .map_err(|_| "HIXL buffer-pool count exceeds protocol range")?;
+    let size = u32::try_from(info.buffer_pool_size_mib)
+        .map_err(|_| "HIXL buffer-pool size exceeds protocol range")?;
+    if (count == 0) != (size == 0) {
+        return Err("HIXL buffer-pool dimensions must both be zero or positive");
+    }
+    match (info.transport, info.hccs_domain_id) {
+        (ReadTransport::Roce, None) => Ok((HixlTransport::Roce, count, size, None)),
+        (ReadTransport::Hccs, Some(domain)) if count > 0 => {
+            Ok((HixlTransport::Hccs, count, size, Some(domain)))
         }
-        ReadTransport::HccsBufferPool => {
-            if info.buffer_pool_count == 0 || info.buffer_pool_size_mib == 0 {
-                return Err("HIXL HCCS buffer-pool parameters are invalid");
-            }
-            let count = u32::try_from(info.buffer_pool_count)
-                .map_err(|_| "HIXL HCCS buffer-pool count exceeds protocol range")?;
-            let size = u32::try_from(info.buffer_pool_size_mib)
-                .map_err(|_| "HIXL HCCS buffer-pool size exceeds protocol range")?;
-            let domain = info
-                .hccs_domain_id
-                .ok_or("HIXL HCCS super-pod domain is absent")?;
-            Ok((HixlTransport::HccsBufferPool, count, size, Some(domain)))
-        }
+        (ReadTransport::Roce, Some(_)) => Err("HIXL RoCE must not advertise an HCCS domain"),
+        (ReadTransport::Hccs, _) => Err("HIXL HCCS requires a buffer pool and a super-pod domain"),
     }
 }
 
@@ -71,9 +62,9 @@ pub(crate) fn runtime_error(error: HixlError) -> afs_error::Error {
             afs_error::NODE_TRANSFER_DRAIN_INCOMPLETE
         }
         HixlErrorKind::Internal => afs_error::NODE_TRANSFER_INTERNAL,
-        HixlErrorKind::InvalidState
-        | HixlErrorKind::NativeFailure
-        | HixlErrorKind::CompletionFailed => afs_error::NODE_TRANSFER_UNAVAILABLE,
+        HixlErrorKind::InvalidState | HixlErrorKind::NativeFailure => {
+            afs_error::NODE_TRANSFER_UNAVAILABLE
+        }
     };
     afs_error::Error::coded(code, error.to_string())
 }
@@ -84,6 +75,24 @@ mod tests {
     use afs_metrics::Registry;
     use afs_transport::hixl::{HixlReadTiming, ReadTransport, RuntimeState, RuntimeStatus};
     use std::time::Duration;
+
+    #[cfg(feature = "ownerfs")]
+    #[test]
+    fn roce_relay_is_distinct_from_direct_and_requires_matching_pool_dimensions() {
+        let mut info = super::test_support::engine("192.0.2.1:7920", 1, 4096);
+        let direct = super::transport_parameters(&info).unwrap();
+        info.buffer_pool_count = 4;
+        assert!(super::transport_parameters(&info).is_err());
+        info.buffer_pool_size_mib = 8;
+        let relay = super::transport_parameters(&info).unwrap();
+        assert_eq!(
+            relay,
+            (afs_protocol::node_data::HixlTransport::Roce, 4, 8, None)
+        );
+        assert_ne!(direct, relay);
+        info.hccs_domain_id = Some(7);
+        assert!(super::transport_parameters(&info).is_err());
+    }
 
     #[test]
     fn hbm_budget_is_reported_separately_from_host_allocations() {
@@ -97,7 +106,7 @@ mod tests {
             export_slots: 4,
             receive_slots_in_use: 0,
             export_slots_in_use: 0,
-            transport: ReadTransport::HccsBufferPool,
+            transport: ReadTransport::Hccs,
             relay_hbm_budget_bytes: 64 * 1024 * 1024,
             hccs_domain_id: Some(7),
         };

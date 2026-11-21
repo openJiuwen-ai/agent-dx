@@ -1147,8 +1147,8 @@ uid/gid/mode。
 | --- | --- | --- | --- |
 | `grpc`（默认） | gRPC | gRPC | gRPC |
 | `rdma` | RDMA | RDMA | RDMA |
-| `hixl` | HIXL 缓冲读 | 返回不支持 | Node 启动配置拒绝 |
-| `auto` | 符合文件策略时优先 HIXL，其后为 RDMA、gRPC | RDMA、gRPC | RDMA、gRPC |
+| `hixl` | HIXL 缓冲读 | HIXL 缓冲写（已打开文件） | Node 启动配置拒绝 |
+| `auto` | 符合文件策略时优先 HIXL，其后为 RDMA、gRPC | 缓冲写达到单次请求阈值时优先 HIXL，其后为 RDMA、gRPC；低于阈值直接按 RDMA、gRPC 策略选择 | RDMA、gRPC |
 
 `rdma` 需要 `rdma` feature 和 `rdma_device`。`hixl` 需要 `hixl` feature、`fs = "ownerfs"`
 和显式的 `[hixl].engine_id`。HIXL 节点要求 mTLS 和非空的 `trusted_node_certs`，窗口与目录批量
@@ -1160,7 +1160,9 @@ uid/gid/mode。
 旧 `[hixl].ownerfs_read_mode` 会触发未知字段错误。旧 `off` 加 gRPC 可改为 `data_mode = "grpc"`。
 旧 `preferred` 可改为 `data_mode = "auto"` 并配置 `engine_id`，此时只在明确不支持时回退，
 也可以按需配置 RDMA 候选。旧 `required` 可改为 `data_mode = "hixl"` 和 `fs = "ownerfs"`，
-远端缓冲读走 HIXL。显式 HIXL 的远端可写打开、创建和 `O_DIRECT` 打开返回不支持。切换模式时移除旧键。
+远端缓冲读走 HIXL。会话协商成功即支持缓冲读写，读写授权仍分别校验。显式 HIXL 的远端可写或截断打开先确认会话；协商失败时不发送 `Open`，文件不会被截断。Create 和 `O_DIRECT` 打开返回不支持。支持写摘要协商时，HIXL 写复用读会话选择的算法（优先 CRC32C，否则 BLAKE3）。设备 WRITE 完成后由 Home 复核实际正文，再提交文件写入。Home 确认摘要不匹配时，本次写返回错误，原句柄可继续写入和同步。Commit 结果未知时，应用应检查文件状态后处理，尤其是追加写。由于 Home 可能稍后才写入，本节点的 HIXL reader 对该 Home 的该文件持续按需读取，关闭或重开 FD 不会重新启用缓存。该 reader 最多记录 4096 个未决文件身份；再遇到新的未决文件时，统一绕过读缓存。切换模式时移除旧键。
+
+Home 最多同时接受 64 个活跃的 OwnerFs HIXL 会话。已关闭且已排空的会话仅保留有界的重试记录，不占活跃名额。
 
 `/health` 的 `checks.hixl.data_mode` 报告配置模式。`startup_fallback` 表示 Auto 已配置的 HIXL
 候选在本地报告不支持，后续正文仍按对应操作的候选选择。
@@ -1173,6 +1175,28 @@ Node 在服务与挂载收尾后等待 native HIXL 清理。清理返回失败�
 `ownerfs.hixl_shutdown_failed`，停机以失败状态结束。HIXL 构建的 15 秒进程停机预算覆盖
 native 清理和 C/C++ 退出处理器，阻塞耗尽预算时以 `124` 退出。
 
+`[hixl].transport` 选择链路，`buffer_pool` 单独控制 HIXL 中转池。有效组合如下：
+
+| `transport` | `buffer_pool` | 正文路径 |
+| --- | --- | --- |
+| `"roce"`（默认） | `false`（默认） | RoCE 直传，注册 Host 窗口 |
+| `"roce"` | `true` | RoCE，经中转池 |
+| `"hccs"` | `true` | HCCS，经中转池；要求两端为同一 super-pod 的受支持 A3 设备 |
+
+两端须使用同一 `transport`、相同的 `buffer_pool` 开关，以及启用中转池时相同的 `buffer_pool_count` 和 `buffer_pool_size_mib`。切换时同步更新配置和进程环境，再重启双方 Node。旧 `transport = "hccs-buffer-pool"` 改为 `transport = "hccs"` 和 `buffer_pool = true`。
+
+启用中转池时，只设置 `buffer_pool = true` 即可使用默认规格。`buffer_pool_count` 是每个设备池的块数，`buffer_pool_size_mib` 是每块的 MiB 数。每条 lane 有两个池，默认 `4 × 8 MiB × 2 = 64 MiB` HBM；Host 收发槽另算。要试更多小块，可在两端同时改为 `buffer_pool_count = 8`、`buffer_pool_size_mib = 4`，每条 lane 的预算仍为 64 MiB。[等预算对比方法](../testing/afs.md#hixl-pool-shapes)。
+
+RoCE 启用中转池时，在两端启动 Node 前都设置以下环境变量，显式选择 RoCE 链路：
+
+```sh
+export HCCL_INTRA_ROCE_ENABLE=1
+export HCCL_INTRA_PCIE_ENABLE=0
+export HCCL_INTER_HCCS_DISABLE=TRUE
+```
+
+HCCS 中转池要求 `HCCL_INTER_HCCS_DISABLE` 未设置或为 `FALSE`，且 `HCCL_INTRA_ROCE_ENABLE` 未设置或为 `0`。使用服务管理器启动 Node 时，将变量设置在服务进程环境中。
+
 以下示例在已配置 mTLS 和 `trusted_node_certs` 的 Node 上设置 Auto。将 `engine_id` 替换为本 Node
 可达地址。
 
@@ -1181,6 +1205,8 @@ data_mode = "auto"
 
 [hixl]
 engine_id = "192.0.2.10:7920"
+transport = "roce"
+buffer_pool = false
 window_bytes = 4194304
 receive_slots = 128
 export_slots = 128
@@ -1188,6 +1214,7 @@ ownerfs_read_group_bytes = 33554432
 ownerfs_read_group_max_inflight = 2
 ownerfs_read_group_host_budget_bytes = 1073741824
 ownerfs_min_file_bytes = 1048576
+ownerfs_min_write_bytes = 524288
 ownerfs_sessions_per_home = 2
 ownerfs_batch_read = true
 ownerfs_batch_max_file_bytes = 4194304
@@ -1206,17 +1233,21 @@ ownerfs_batch_max_file_bytes = 4194304
 - `ownerfs_read_group_host_budget_bytes`：缓存窗口、在途预取和目录批量共用的进程级预算，默认
   1 GiB。共享切片和 FUSE 回复持有的分配计费到最后一个引用释放。批量索引另受
   `max(4 × ownerfs_read_group_bytes, 预算 / 2)` 限制。预算不足时按需单次取回仍可服务当前请求。
-- `ownerfs_min_file_bytes`：`auto` 下文件不小于该值才走窗口，默认 1 MiB。更小的文件可使用
+- `ownerfs_min_file_bytes`：`auto` 下仅在打开时的文件大小达到该值才启用预读窗口，默认 1 MiB。更小的文件可使用
   目录批量，普通读路径按 RDMA、gRPC 选择。
+- `ownerfs_min_write_bytes`：`auto` 下 OwnerFs 单次远端缓冲写的正文长度阈值，默认 `524288` 字节（512 KiB），
+  有效范围 `0..=1048576`。在发送 `PrepareWriteHixl` 或复用已授予的写槽之前比较；达到阈值才尝试 HIXL，
+  小于阈值沿用普通 RDMA/gRPC 策略。`0` 对所有非空缓冲写尝试 HIXL。默认从 512 KiB 到单次写上限 1 MiB 均符合大小条件。
+  显式 `data_mode = "hixl"` 不受此写阈值限制。
 - `ownerfs_sessions_per_home`：每个 Home 的控制会话数，1..=4，默认 2。每个会话同时只准入一次
   取回；成功取回的释放由同一会话的下一次 Prepare 携带，空闲 10 ms 后才单独发送。调大后每个窗口
   可用的导出槽按比例减少，因此组大小必须满足上面的槽位约束。
 - `session_idle_ms`：reader 复用空闲会话的期限，默认 20000，范围 1..=20000。Home 会话过期仍为 30 秒。
 - `ownerfs_batch_read`：默认 `true`，把只读打开的小文件按目录批量取回；`ownerfs_batch_max_file_bytes`
-  是单文件上限（4097..=4194304，默认 4 MiB），文件不跨槽。连续翻页可复用有序文件名；Home 最多保留 8 个目录快照，每个快照的名字分配不超过 1 MiB。超限目录仍可翻页，但每次重新枚举。每页重新验证读授权，每个文件仍检查当前身份和版本。
-- 其余 HIXL runtime 设置包括`transport`（`"roce"` 或 `"hccs-buffer-pool"`）、`device_id`、`engine_id`、
+  是单文件上限（4097..=4194304，默认 4 MiB），文件不跨槽。连续翻页可复用有序文件名；Home 最多保留 8 个目录快照，每个快照的名字分配不超过 1 MiB。枚举时最多收集 4096 项；超过项数或字节预算即停止，不排序部分清单。该目录跳过批量预读，文件仍可单独读取。每页重新验证读授权，每个文件仍检查当前身份和版本。
+- 其余 HIXL runtime 设置包括 `device_id`、`engine_id`、
   `device_listen_port`、`[[hixl.additional_devices]]`（最多 16 个逻辑设备）、`window_bytes`
-  （1..=4 MiB）和 buffer pool 参数。
+  （1..=4 MiB）。中转池参数为 `buffer_pool_count` 和 `buffer_pool_size_mib`。
 
 单卡部署仍使用原有的 `device_id`，无需新增 TOML 配置，也不会自动绑核。每条 lane 在启动时把 ACL 可见设备号转换成驱动逻辑号，通过 Host 驱动的 DSMI 查询 PCI 总线、设备和功能号，优先从 sysfs 中唯一匹配的 PCI 设备读取 `numa_node`。
 
@@ -1231,7 +1262,7 @@ reader 仍通过 HIXL 拉取导出槽中的数据并校验槽摘要。
 一个 32 MiB 批量；更多目录同时读时按 `2 × 目录数 × ownerfs_read_group_bytes` 设置。会话数在
 1 MiB 档影响很小，4 MiB 及以上并发明显受益，最多 4 条。
 
-A3 双机组件基准（Home 主机，对端 reader 主机；`required`、窗口 4 MiB、收发各 32 槽、32 MiB 组、
+历史 A3 双机 OwnerFs 读组件基准（Home 主机，对端 reader 主机；当时的 `required` 模式、窗口 4 MiB、收发各 32 槽、32 MiB 组、
 默认 1 GiB 预算与每 Home 2 会话；单进程按名字顺序逐文件打开、4 MiB 块读取；同会话内 HIXL 与
 gRPC 交替 3 轮，HIXL 每项只起停一次节点，sha256 只在首轮校验。读回内容全部一致，不代表多机或
 生产规模）：

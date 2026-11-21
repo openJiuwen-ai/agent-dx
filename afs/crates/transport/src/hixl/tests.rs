@@ -1,8 +1,8 @@
 #[cfg(feature = "hixl")]
 use super::{Command, HixlRuntime};
 use super::{
-    HIXL_UNSUPPORTED, HixlErrorKind, HixlPhase, NativeBackend, NativeCallError, NativePoll,
-    NativeReadWindow, NativeRequest, RuntimeCore, RuntimeOptions, RuntimeState, map_native_error,
+    HIXL_UNSUPPORTED, HixlErrorKind, HixlPhase, NativeBackend, NativeCallError,
+    NativeTransferWindow, RuntimeCore, RuntimeOptions, RuntimeState, map_native_error,
     validate_options,
 };
 #[cfg(feature = "hixl")]
@@ -14,20 +14,16 @@ static RECEIVED: [u8; 4] = *b"read";
 
 #[derive(Default)]
 struct FakeBackend {
-    next_request: u64,
     connect_delay: Option<Duration>,
-    polls: usize,
-    poll_result: Option<NativePoll>,
-    poll_sdk_transfer: Option<Duration>,
-    poll_error: Option<NativeCallError>,
     sync_timeout_ms: u32,
     sync_sdk_transfer: Option<Duration>,
     zero_receive_address: bool,
     released_receives: usize,
     release_receive_error: Option<NativeCallError>,
-    batch_submissions: Vec<Vec<NativeReadWindow>>,
-    sync_batches: Vec<Vec<NativeReadWindow>>,
-    submit_batch_error: Option<NativeCallError>,
+    release_export_error: Option<NativeCallError>,
+    sync_batches: Vec<Vec<NativeTransferWindow>>,
+    writes: Vec<(Vec<NativeTransferWindow>, Vec<u8>)>,
+    write_error: Option<NativeCallError>,
     sync_batch_error: Option<NativeCallError>,
     shutdown_calls: usize,
     shutdown_error: Option<NativeCallError>,
@@ -71,7 +67,7 @@ impl NativeBackend for FakeBackend {
     }
 
     fn release_export(&mut self, _: u64, _: u64) -> Result<(), NativeCallError> {
-        Ok(())
+        self.release_export_error.take().map_or(Ok(()), Err)
     }
 
     fn release_receives(&mut self, slot_ids: &[u64]) -> Result<(), NativeCallError> {
@@ -82,58 +78,33 @@ impl NativeBackend for FakeBackend {
         Ok(())
     }
 
-    fn poll_read(
-        &mut self,
-        _: NativeRequest,
-        addresses: &mut [u64],
-    ) -> Result<NativePoll, NativeCallError> {
-        self.polls += 1;
-        if let Some(error) = &self.poll_error {
-            return Err(error.clone());
-        }
-        let default_timing = super::NativeReadTiming {
-            sdk_transfer: self.poll_sdk_transfer,
-        };
-        match self.poll_result.clone().unwrap_or(NativePoll::Completed {
-            timing: default_timing,
-        }) {
-            NativePoll::Completed { timing } => {
-                self.fill_addresses(addresses);
-                Ok(NativePoll::Completed { timing })
-            }
-            result => Ok(result),
-        }
-    }
-
-    fn submit_read_batch(
-        &mut self,
-        windows: &[NativeReadWindow],
-        _peer: &str,
-    ) -> Result<NativeRequest, NativeCallError> {
-        if let Some(error) = self.submit_batch_error.take() {
-            return Err(error);
-        }
-        self.batch_submissions.push(windows.to_vec());
-        self.next_request += 1;
-        Ok(NativeRequest(self.next_request))
-    }
-
     fn read_sync_batch(
         &mut self,
-        windows: &[NativeReadWindow],
+        windows: &[NativeTransferWindow],
         _peer: &str,
         addresses: &mut [u64],
         timeout_ms: u32,
     ) -> Result<super::NativeReadTiming, NativeCallError> {
+        self.sync_batches.push(windows.to_vec());
         self.sync_timeout_ms = timeout_ms;
         if let Some(error) = self.sync_batch_error.take() {
             return Err(error);
         }
-        self.sync_batches.push(windows.to_vec());
         self.fill_addresses(addresses);
         Ok(super::NativeReadTiming {
             sdk_transfer: self.sync_sdk_transfer,
         })
+    }
+
+    fn write_batch(
+        &mut self,
+        windows: &[NativeTransferWindow],
+        _peer: &str,
+        bytes: &[u8],
+        _timeout_ms: u32,
+    ) -> Result<(), NativeCallError> {
+        self.writes.push((windows.to_vec(), bytes.to_vec()));
+        self.write_error.take().map_or(Ok(()), Err)
     }
 
     fn shutdown(&mut self) -> Result<(), NativeCallError> {
@@ -176,11 +147,22 @@ fn runtime_with_fake_backend(backend: FakeBackend, options: RuntimeOptions) -> H
     }
 }
 
+#[cfg(feature = "hixl")]
+fn read_one_slot(runtime: &HixlRuntime) -> Result<super::HixlReadOutcome, super::HixlError> {
+    runtime.read_batch_timed_into(
+        "peer",
+        &[(0xfeed, RECEIVED.len())],
+        Vec::with_capacity(RECEIVED.len()),
+        Instant::now() + Duration::from_secs(1),
+    )
+}
+
 #[test]
 #[cfg(feature = "hixl")]
 fn timed_hccs_read_returns_owner_queue_sdk_and_copy_durations() {
     let mut read_options = options();
-    read_options.transport = super::ReadTransport::HccsBufferPool;
+    read_options.transport = super::ReadTransport::Hccs;
+    read_options.buffer_pool = true;
     let runtime = runtime_with_fake_backend(
         FakeBackend {
             connect_delay: Some(Duration::from_millis(40)),
@@ -201,14 +183,7 @@ fn timed_hccs_read_returns_owner_queue_sdk_and_copy_durations() {
             HixlPhase::Connect,
         )
         .unwrap();
-    let outcome = runtime
-        .read_batch_timed_into(
-            "peer",
-            &[(0xfeed, 4)],
-            Vec::with_capacity(4),
-            Instant::now() + Duration::from_secs(1),
-        )
-        .unwrap();
+    let outcome = read_one_slot(&runtime).unwrap();
 
     assert_eq!(outcome.bytes, b"read");
     assert!(outcome.timing.owner_queue >= Duration::from_millis(15));
@@ -223,19 +198,12 @@ fn timed_hccs_read_returns_owner_queue_sdk_and_copy_durations() {
 fn timed_roce_read_returns_dispatch_completion_and_copy_durations() {
     let runtime = runtime_with_fake_backend(
         FakeBackend {
-            poll_sdk_transfer: Some(Duration::from_millis(11)),
+            sync_sdk_transfer: Some(Duration::from_millis(11)),
             ..FakeBackend::default()
         },
         options(),
     );
-    let outcome = runtime
-        .read_batch_timed_into(
-            "peer",
-            &[(0xfeed, 4)],
-            Vec::with_capacity(4),
-            Instant::now() + Duration::from_secs(1),
-        )
-        .unwrap();
+    let outcome = read_one_slot(&runtime).unwrap();
 
     assert_eq!(outcome.bytes, b"read");
     assert_eq!(outcome.timing.sdk_transfer, Some(Duration::from_millis(11)));
@@ -248,7 +216,8 @@ fn timed_roce_read_returns_dispatch_completion_and_copy_durations() {
 #[cfg(feature = "hixl")]
 fn timed_read_preserves_native_uncertainty_errors() {
     let mut read_options = options();
-    read_options.transport = super::ReadTransport::HccsBufferPool;
+    read_options.transport = super::ReadTransport::Hccs;
+    read_options.buffer_pool = true;
     let runtime = runtime_with_fake_backend(
         FakeBackend {
             sync_batch_error: Some(NativeCallError {
@@ -260,14 +229,7 @@ fn timed_read_preserves_native_uncertainty_errors() {
         },
         read_options,
     );
-    let error = runtime
-        .read_batch_timed_into(
-            "peer",
-            &[(0xfeed, 4)],
-            Vec::with_capacity(4),
-            Instant::now() + Duration::from_secs(1),
-        )
-        .unwrap_err();
+    let error = read_one_slot(&runtime).unwrap_err();
 
     assert_eq!(error.kind, HixlErrorKind::DeadlineExceeded);
     assert!(error.read_may_be_in_flight);
@@ -339,41 +301,81 @@ fn separate_runtime_instances_have_distinct_nonzero_generations() {
 }
 
 #[test]
-fn hccs_relay_budget_counts_both_internal_hbm_pools() {
-    let mut opts = options();
-    opts.transport = super::ReadTransport::HccsBufferPool;
-    opts.buffer_pool_count = 4;
-    opts.buffer_pool_size_mib = 8;
-    let core = RuntimeCore::new(FakeBackend::default(), opts).unwrap();
-    assert_eq!(core.status().relay_hbm_budget_bytes, 64 * 1024 * 1024);
-    assert_eq!(core.status().allocated_bytes, 8);
-    assert_eq!(core.info().transport, super::ReadTransport::HccsBufferPool);
+fn pooled_links_budget_both_device_pools_and_publish_canonical_identity() {
+    for transport in [super::ReadTransport::Roce, super::ReadTransport::Hccs] {
+        let core = RuntimeCore::new(
+            FakeBackend::default(),
+            RuntimeOptions {
+                transport,
+                buffer_pool: true,
+                buffer_pool_count: 4,
+                buffer_pool_size_mib: 8,
+                ..options()
+            },
+        )
+        .unwrap();
+        assert_eq!(core.status().relay_hbm_budget_bytes, 64 * MIB);
+        assert_eq!(core.status().allocated_bytes, 8);
+        assert_eq!(core.info().transport, transport);
+        assert_eq!(core.info().buffer_pool_count, 4);
+        assert_eq!(core.info().buffer_pool_size_mib, 8);
+        assert_eq!(
+            core.info().hccs_domain_id,
+            (transport == super::ReadTransport::Hccs).then_some(7)
+        );
+    }
 }
 
 #[test]
-fn roce_does_not_budget_an_unused_hbm_relay_pool() {
-    let core = RuntimeCore::new(FakeBackend::default(), options()).unwrap();
+fn direct_roce_ignores_unused_pool_dimensions() {
+    let core = RuntimeCore::new(
+        FakeBackend::default(),
+        RuntimeOptions {
+            buffer_pool_count: 0,
+            buffer_pool_size_mib: usize::MAX,
+            ..options()
+        },
+    )
+    .unwrap();
     assert_eq!(core.status().transport, super::ReadTransport::Roce);
     assert_eq!(core.status().relay_hbm_budget_bytes, 0);
     assert_eq!(core.info().buffer_pool_count, 0);
     assert_eq!(core.info().buffer_pool_size_mib, 0);
+    assert_eq!(core.info().hccs_domain_id, None);
 }
 
 #[test]
-fn hccs_rejects_hbm_budget_overflow_and_exhaustion_before_backend_entry() {
-    for (count, size) in [
-        (0, 8),
-        (4, 0),
-        (65, 8),
-        (4, 65),
-        (64, 8),
-        (usize::MAX, usize::MAX),
-    ] {
-        let mut opts = options();
-        opts.transport = super::ReadTransport::HccsBufferPool;
-        opts.buffer_pool_count = count;
-        opts.buffer_pool_size_mib = size;
-        assert!(RuntimeCore::new(FakeBackend::default(), opts).is_err());
+fn hccs_without_pool_is_rejected_during_validation() {
+    let error = validate_options(&RuntimeOptions {
+        transport: super::ReadTransport::Hccs,
+        ..options()
+    })
+    .unwrap_err();
+    assert_eq!(error.kind, HixlErrorKind::InvalidArgument);
+    assert_eq!(error.phase, HixlPhase::Initialize);
+}
+
+#[test]
+fn pooled_links_reject_invalid_dimensions_and_overbudget_hbm() {
+    for transport in [super::ReadTransport::Roce, super::ReadTransport::Hccs] {
+        for (count, size, kind) in [
+            (0, 8, HixlErrorKind::InvalidArgument),
+            (4, 0, HixlErrorKind::InvalidArgument),
+            (65, 8, HixlErrorKind::InvalidArgument),
+            (4, 65, HixlErrorKind::InvalidArgument),
+            (64, 8, HixlErrorKind::ResourceExhausted),
+            (usize::MAX, usize::MAX, HixlErrorKind::InvalidArgument),
+        ] {
+            let error = validate_options(&RuntimeOptions {
+                transport,
+                buffer_pool: true,
+                buffer_pool_count: count,
+                buffer_pool_size_mib: size,
+                ..options()
+            })
+            .unwrap_err();
+            assert_eq!(error.kind, kind);
+        }
     }
 }
 
@@ -392,14 +394,7 @@ fn bounded_owner_queue_refuses_pressure_without_native_dispatch() {
     runtime
         .send(Command::Quarantine { reply }, HixlPhase::Quarantine)
         .unwrap();
-    let error = runtime
-        .read_batch_timed_into(
-            "peer",
-            &[(0xfeed, 4)],
-            Vec::with_capacity(4),
-            Instant::now() + Duration::from_secs(1),
-        )
-        .unwrap_err();
+    let error = read_one_slot(&runtime).unwrap_err();
     assert_eq!(error.kind, HixlErrorKind::ResourceExhausted);
     assert!(!error.read_may_be_in_flight);
     assert_eq!(runtime.status().state, RuntimeState::Running);
@@ -507,13 +502,144 @@ fn completed_read_release_marks_disconnected_owner_quarantined() {
 
 #[test]
 #[cfg(feature = "hixl")]
-fn lost_owner_reply_does_not_prove_a_read_was_never_submitted() {
-    let (reply, receiver) =
-        mpsc::sync_channel::<Result<super::HixlReadOutcome, super::HixlError>>(1);
-    drop(reply);
-    let error = super::recv_reply(receiver, HixlPhase::PollRead).unwrap_err();
+fn lost_owner_reply_preserves_read_and_write_uncertainty() {
+    for phase in [HixlPhase::CompleteRead, HixlPhase::WriteBatch] {
+        let (reply, receiver) = mpsc::sync_channel::<Result<(), super::HixlError>>(1);
+        drop(reply);
+        let error = super::recv_reply(receiver, phase).unwrap_err();
+        assert_eq!(error.kind, HixlErrorKind::EnginePoisoned);
+        assert!(error.read_may_be_in_flight);
+    }
+}
+
+#[test]
+#[cfg(feature = "hixl")]
+fn completed_export_release_survives_full_owner_queue() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut core = RuntimeCore::new(FakeBackend::default(), options()).unwrap();
+    let first = core.reserve_export_slot(4, deadline).unwrap();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let runtime = Arc::new(HixlRuntime {
+        info: core.info(),
+        sender,
+        status: Arc::new(RwLock::new(core.status())),
+        owner: Mutex::new(None),
+    });
+    let (reply, response) = mpsc::sync_channel(1);
+    runtime
+        .send(
+            Command::Connect {
+                peer: "peer".to_owned(),
+                deadline,
+                reply,
+            },
+            HixlPhase::Connect,
+        )
+        .unwrap();
+
+    let releasing_runtime = Arc::clone(&runtime);
+    let (started, start) = mpsc::sync_channel(0);
+    let (finished, finish) = mpsc::channel();
+    let releasing = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        // SAFETY: no Rust reservation was created and the slot was never published.
+        let result =
+            unsafe { releasing_runtime.release_exports(vec![(first.slot_id, first.generation)]) };
+        finished.send(result).unwrap();
+    });
+    start.recv_timeout(Duration::from_secs(2)).unwrap();
+    let early = finish.recv_timeout(Duration::from_millis(100));
+    let owner_status = Arc::clone(&runtime.status);
+    let owner = std::thread::spawn(move || super::owner_loop(core, receiver, owner_status));
+    response
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(early, Err(mpsc::RecvTimeoutError::Timeout));
+    finish
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    releasing.join().unwrap();
+    let status = runtime.status();
+    assert_eq!(status.state, RuntimeState::Running);
+    assert_eq!(status.export_slots_in_use, 0);
+    assert_eq!(status.quarantined_bytes, 0);
+
+    // Request the descriptor directly so the fake address is never wrapped as a Rust buffer.
+    let (reply, response) = mpsc::sync_channel(1);
+    runtime
+        .send(
+            Command::ReserveExports {
+                lengths: vec![4],
+                deadline: Instant::now() + Duration::from_secs(2),
+                reply,
+            },
+            HixlPhase::PrepareExport,
+        )
+        .unwrap();
+    let windows = response
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(windows.len(), 1);
+    let second = &windows[0];
+    assert_eq!(second.slot_id, first.slot_id);
+    assert_ne!(second.generation, first.generation);
+    // SAFETY: this slot was also never published or borrowed.
+    unsafe { runtime.release_exports(vec![(second.slot_id, second.generation)]) }.unwrap();
+    runtime.shutdown().unwrap();
+    owner.join().unwrap();
+}
+
+#[test]
+#[cfg(feature = "hixl")]
+fn completed_export_release_marks_disconnected_owner_quarantined() {
+    let mut core = RuntimeCore::new(FakeBackend::default(), options()).unwrap();
+    let slot = core
+        .reserve_export_slot(4, Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    drop(receiver);
+    let runtime = HixlRuntime {
+        info: core.info(),
+        sender,
+        status: Arc::new(RwLock::new(core.status())),
+        owner: Mutex::new(None),
+    };
+
+    // SAFETY: the slot was never published or borrowed.
+    let error =
+        unsafe { runtime.release_exports(vec![(slot.slot_id, slot.generation)]) }.unwrap_err();
     assert_eq!(error.kind, HixlErrorKind::EnginePoisoned);
-    assert!(error.read_may_be_in_flight);
+    let status = runtime.status();
+    assert_eq!(status.state, RuntimeState::Quarantined);
+    assert_eq!(status.export_slots_in_use, 1);
+    assert_eq!(status.quarantined_bytes, status.allocated_bytes);
+}
+
+#[test]
+fn native_export_release_failure_quarantines_slot() {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let backend = FakeBackend {
+        release_export_error: Some(NativeCallError {
+            status: None,
+            message: "native release failed".to_owned(),
+            accepted: true,
+        }),
+        ..FakeBackend::default()
+    };
+    let mut core = RuntimeCore::new(backend, options()).unwrap();
+    let slot = core.reserve_export_slot(4, deadline).unwrap();
+    let error = core
+        .release_export(slot.slot_id, slot.generation)
+        .unwrap_err();
+    assert_eq!(error.kind, HixlErrorKind::EnginePoisoned);
+    let status = core.status();
+    assert_eq!(status.state, RuntimeState::Quarantined);
+    assert_eq!(status.export_slots_in_use, 1);
+    assert_eq!(status.quarantined_bytes, 4);
+    assert!(core.reserve_export_slot(4, deadline).is_err());
 }
 
 #[test]
@@ -535,38 +661,7 @@ fn export_batch_rolls_back_partial_allocation_and_rejects_stale_release() {
 }
 
 #[test]
-fn export_pool_capacity_and_generation_prevent_stale_release() {
-    let mut core = RuntimeCore::new(FakeBackend::default(), options()).unwrap();
-    let first = core
-        .reserve_export_slot(
-            3,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        )
-        .unwrap();
-    let full = core
-        .reserve_export_slot(
-            3,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        )
-        .unwrap_err();
-    assert_eq!(full.kind, HixlErrorKind::ResourceExhausted);
-    core.release_export(first.slot_id, first.generation)
-        .unwrap();
-    let second = core
-        .reserve_export_slot(
-            3,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        )
-        .unwrap();
-    assert_ne!(first.generation, second.generation);
-    let stale = core
-        .release_export(first.slot_id, first.generation)
-        .unwrap_err();
-    assert_eq!(stale.kind, HixlErrorKind::InvalidArgument);
-}
-
-#[test]
-fn reserving_an_export_pins_its_slot_without_copying() {
+fn export_reservation_pins_the_slot_and_rejects_stale_release_after_reuse() {
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut core = RuntimeCore::new(FakeBackend::default(), options()).unwrap();
     let first = core.reserve_export_slot(3, deadline).unwrap();
@@ -721,8 +816,20 @@ fn connected_batch_core(mut core: RuntimeCore<FakeBackend>) -> RuntimeCore<FakeB
     core
 }
 
+fn read_two_slots(
+    core: &mut RuntimeCore<FakeBackend>,
+) -> Result<super::PinnedRead, super::HixlError> {
+    core.read_batch(
+        "peer",
+        &batch_windows(2, 4 * MIB),
+        Vec::with_capacity(8 * MIB),
+        Instant::now() + Duration::from_secs(1),
+        Duration::ZERO,
+    )
+}
+
 #[test]
-fn batch_read_submits_100_and_128_mib_in_one_native_call_each() {
+fn batch_read_transfers_100_and_128_mib_in_one_sync_call_each() {
     for count in [25, 32] {
         let mut core = connected_batch_core(
             RuntimeCore::new(FakeBackend::default(), batch_options(count)).unwrap(),
@@ -741,8 +848,8 @@ fn batch_read_submits_100_and_128_mib_in_one_native_call_each() {
 
         assert!(outcome.output.is_empty());
         assert!(outcome.output.capacity() >= length);
-        assert_eq!(core.backend.batch_submissions.len(), 1);
-        let submitted = &core.backend.batch_submissions[0];
+        assert_eq!(core.backend.sync_batches.len(), 1);
+        let submitted = &core.backend.sync_batches[0];
         assert_eq!(submitted.len(), count);
         for (index, window) in submitted.iter().enumerate() {
             assert_eq!(window.slot_id, index as u64);
@@ -764,6 +871,7 @@ fn batch_read_rejects_invalid_window_sets_before_native_entry() {
     let deadline = Instant::now() + Duration::from_secs(1);
     let cases: Vec<(Vec<(u64, usize)>, usize)> = vec![
         (Vec::new(), 0),
+        (vec![(u64::MAX, 4)], 4),
         (vec![(0x1000, 4 * MIB); 5], 20 * MIB),
         (vec![(0x1000, 4 * MIB + 1)], 4 * MIB + 1),
         (vec![(0x1000, 4)], 3),
@@ -782,98 +890,117 @@ fn batch_read_rejects_invalid_window_sets_before_native_entry() {
             .unwrap_err();
         assert_eq!(error.kind, HixlErrorKind::InvalidArgument);
     }
-    assert!(core.backend.batch_submissions.is_empty());
-    assert_eq!(core.status().receive_slots_in_use, 0);
-}
-
-#[test]
-fn hccs_batch_read_uses_one_sync_call_and_reports_timing() {
-    let mut opts = batch_options(2);
-    opts.transport = super::ReadTransport::HccsBufferPool;
-    let backend = FakeBackend {
-        sync_sdk_transfer: Some(Duration::from_millis(7)),
-        ..FakeBackend::default()
-    };
-    let mut core = connected_batch_core(RuntimeCore::new(backend, opts).unwrap());
-    let outcome = core
-        .read_batch(
-            "peer",
-            &batch_windows(2, 4 * MIB),
-            Vec::with_capacity(8 * MIB),
-            Instant::now() + Duration::from_secs(1),
-            Duration::from_millis(3),
-        )
-        .unwrap();
-
-    assert_eq!(core.backend.sync_batches.len(), 1);
-    assert_eq!(core.backend.sync_batches[0].len(), 2);
-    assert_eq!(core.backend.polls, 0);
-    assert!((1..=1000).contains(&core.backend.sync_timeout_ms));
-    assert_eq!(outcome.timing.owner_queue, Duration::from_millis(3));
-    assert_eq!(outcome.timing.sdk_transfer, Some(Duration::from_millis(7)));
-    assert_eq!(outcome.timing.output_copy, None);
-    core.release_receives(&outcome.slot_ids()).unwrap();
-    assert_eq!(core.status().receive_slots_in_use, 0);
-    core.shutdown().unwrap();
-}
-
-#[test]
-fn hccs_batch_expired_deadline_releases_every_slot_before_native_entry() {
-    let mut opts = batch_options(2);
-    opts.transport = super::ReadTransport::HccsBufferPool;
-    let mut core = connected_batch_core(RuntimeCore::new(FakeBackend::default(), opts).unwrap());
-    let deadline = Instant::now()
-        .checked_sub(Duration::from_millis(1))
-        .unwrap();
-    let error = core
-        .read_batch(
-            "peer",
-            &batch_windows(2, 4 * MIB),
-            Vec::with_capacity(8 * MIB),
-            deadline,
-            Duration::ZERO,
-        )
-        .unwrap_err();
-
-    assert_eq!(error.kind, HixlErrorKind::DeadlineExceeded);
-    assert!(!error.read_may_be_in_flight);
-    assert_eq!(core.status().state, RuntimeState::Running);
-    assert_eq!(core.status().receive_slots_in_use, 0);
     assert!(core.backend.sync_batches.is_empty());
-    core.shutdown().unwrap();
+    assert_eq!(core.status().receive_slots_in_use, 0);
 }
 
 #[test]
-fn hccs_batch_uncertain_sync_quarantines_every_slot() {
-    for status in [super::HIXL_TIMEOUT, 1] {
+fn both_planes_use_one_sync_read_call_and_report_timing() {
+    for (transport, buffer_pool) in [
+        (super::ReadTransport::Roce, false),
+        (super::ReadTransport::Roce, true),
+        (super::ReadTransport::Hccs, true),
+    ] {
         let mut opts = batch_options(2);
-        opts.transport = super::ReadTransport::HccsBufferPool;
+        opts.transport = transport;
+        opts.buffer_pool = buffer_pool;
         let backend = FakeBackend {
-            sync_batch_error: Some(NativeCallError {
-                status: Some(status),
-                message: "batch sync outcome is uncertain".into(),
-                accepted: true,
-            }),
+            sync_sdk_transfer: Some(Duration::from_millis(7)),
             ..FakeBackend::default()
         };
         let mut core = connected_batch_core(RuntimeCore::new(backend, opts).unwrap());
-        let error = core
+        let outcome = core
             .read_batch(
                 "peer",
                 &batch_windows(2, 4 * MIB),
                 Vec::with_capacity(8 * MIB),
                 Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(3),
+            )
+            .unwrap();
+
+        assert_eq!(core.backend.sync_batches.len(), 1, "{transport:?}");
+        assert_eq!(core.backend.sync_batches[0].len(), 2);
+        assert!((1..=1000).contains(&core.backend.sync_timeout_ms));
+        assert_eq!(outcome.timing.owner_queue, Duration::from_millis(3));
+        assert_eq!(outcome.timing.sdk_transfer, Some(Duration::from_millis(7)));
+        assert_eq!(outcome.timing.output_copy, None);
+        core.release_receives(&outcome.slot_ids()).unwrap();
+        assert_eq!(core.status().receive_slots_in_use, 0);
+        core.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn expired_read_deadline_leaves_slots_available_without_native_dispatch() {
+    for (transport, buffer_pool) in [
+        (super::ReadTransport::Roce, false),
+        (super::ReadTransport::Roce, true),
+        (super::ReadTransport::Hccs, true),
+    ] {
+        let mut opts = batch_options(2);
+        opts.transport = transport;
+        opts.buffer_pool = buffer_pool;
+        let mut core =
+            connected_batch_core(RuntimeCore::new(FakeBackend::default(), opts).unwrap());
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let error = core
+            .read_batch(
+                "peer",
+                &batch_windows(2, 4 * MIB),
+                Vec::with_capacity(8 * MIB),
+                deadline,
                 Duration::ZERO,
             )
             .unwrap_err();
 
-        assert!(error.read_may_be_in_flight);
-        assert_eq!(core.status().state, RuntimeState::Quarantined);
-        assert_eq!(core.status().receive_slots_in_use, 2);
-        assert_eq!(core.status().quarantined_bytes, 8 * MIB);
-        assert_eq!(core.backend.sync_batches.len(), 0);
-        assert_eq!(core.backend.shutdown_calls, 0);
-        assert!(core.shutdown().is_err());
+        assert_eq!(error.kind, HixlErrorKind::DeadlineExceeded);
+        assert!(!error.read_may_be_in_flight);
+        assert_eq!(core.status().state, RuntimeState::Running);
+        assert_eq!(core.status().receive_slots_in_use, 0);
+        assert!(core.backend.sync_batches.is_empty());
+        core.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn uncertain_sync_read_quarantines_every_slot_on_both_planes() {
+    for (transport, buffer_pool) in [
+        (super::ReadTransport::Roce, false),
+        (super::ReadTransport::Roce, true),
+        (super::ReadTransport::Hccs, true),
+    ] {
+        for (status, kind) in [
+            (Some(super::HIXL_TIMEOUT), HixlErrorKind::DeadlineExceeded),
+            (None, HixlErrorKind::EnginePoisoned),
+        ] {
+            let mut opts = batch_options(2);
+            opts.transport = transport;
+            opts.buffer_pool = buffer_pool;
+            let backend = FakeBackend {
+                sync_batch_error: Some(NativeCallError {
+                    status,
+                    message: "batch sync outcome is uncertain".into(),
+                    accepted: true,
+                }),
+                ..FakeBackend::default()
+            };
+            let mut core = connected_batch_core(RuntimeCore::new(backend, opts).unwrap());
+            let error = read_two_slots(&mut core).unwrap_err();
+            assert_eq!(error.kind, kind, "{transport:?}");
+            assert!(error.read_may_be_in_flight);
+            assert_eq!(core.status().state, RuntimeState::Quarantined);
+            assert_eq!(core.status().receive_slots_in_use, 2);
+            assert_eq!(core.status().quarantined_bytes, 8 * MIB);
+            let reuse = read_two_slots(&mut core).unwrap_err();
+            assert_eq!(reuse.kind, HixlErrorKind::EnginePoisoned);
+            assert!(!reuse.read_may_be_in_flight);
+            assert_eq!(core.backend.sync_batches.len(), 1);
+            assert_eq!(core.backend.shutdown_calls, 0);
+            assert!(core.shutdown().is_err());
+        }
     }
 }
 
@@ -929,14 +1056,7 @@ fn failed_native_cleanup_stays_retryable_until_shutdown_succeeds() {
     assert_eq!(runtime.status().state, RuntimeState::ShutdownFailed);
 
     // Cleanup stays retryable, but no data-plane operation may re-enter.
-    let blocked = runtime
-        .read_batch_timed_into(
-            "peer",
-            &[(0xfeed, 4)],
-            Vec::with_capacity(4),
-            Instant::now() + Duration::from_secs(1),
-        )
-        .unwrap_err();
+    let blocked = read_one_slot(&runtime).unwrap_err();
     assert_eq!(blocked.kind, HixlErrorKind::ShutdownIncomplete);
 
     runtime.shutdown().unwrap();
@@ -946,112 +1066,33 @@ fn failed_native_cleanup_stays_retryable_until_shutdown_succeeds() {
 }
 
 #[test]
-fn batch_submit_rejected_before_native_entry_releases_every_slot() {
-    let backend = FakeBackend {
-        submit_batch_error: Some(NativeCallError::new(Some(503_900), "batch submit")),
-        ..FakeBackend::default()
-    };
-    let mut core = connected_batch_core(RuntimeCore::new(backend, batch_options(2)).unwrap());
-    let error = core
-        .read_batch(
-            "peer",
-            &batch_windows(2, 4 * MIB),
-            Vec::with_capacity(8 * MIB),
-            Instant::now() + Duration::from_secs(1),
-            Duration::ZERO,
-        )
-        .unwrap_err();
-
-    assert_eq!(error.kind, HixlErrorKind::NativeFailure);
-    assert!(!error.read_may_be_in_flight);
-    assert_eq!(core.status().state, RuntimeState::Running);
-    assert_eq!(core.status().receive_slots_in_use, 0);
-}
-
-#[test]
-fn batch_submit_error_after_native_entry_quarantines_every_slot() {
-    let backend = FakeBackend {
-        submit_batch_error: Some(NativeCallError {
-            status: Some(503_900),
-            message: "uncertain batch submission".into(),
-            accepted: true,
-        }),
-        ..FakeBackend::default()
-    };
-    let mut core = connected_batch_core(RuntimeCore::new(backend, batch_options(2)).unwrap());
-    let error = core
-        .read_batch(
-            "peer",
-            &batch_windows(2, 4 * MIB),
-            Vec::with_capacity(8 * MIB),
-            Instant::now() + Duration::from_secs(1),
-            Duration::ZERO,
-        )
-        .unwrap_err();
-
-    assert_eq!(error.kind, HixlErrorKind::EnginePoisoned);
-    assert!(error.read_may_be_in_flight);
-    assert_eq!(core.status().receive_slots_in_use, 2);
-    assert_eq!(core.status().quarantined_bytes, 8 * MIB);
-    assert_eq!(core.backend.shutdown_calls, 0);
-    assert!(core.shutdown().is_err());
-}
-
-#[test]
-fn batch_deadline_or_unknown_poll_quarantines_every_slot() {
-    let waiting = FakeBackend {
-        poll_result: Some(NativePoll::Waiting),
-        ..FakeBackend::default()
-    };
-    let mut core = connected_batch_core(RuntimeCore::new(waiting, batch_options(2)).unwrap());
-    let error = core
-        .read_batch(
-            "peer",
-            &batch_windows(2, 4 * MIB),
-            Vec::with_capacity(8 * MIB),
-            Instant::now() + Duration::from_millis(2),
-            Duration::ZERO,
-        )
-        .unwrap_err();
-    assert_eq!(error.kind, HixlErrorKind::DeadlineExceeded);
-    assert!(error.read_may_be_in_flight);
-    assert_eq!(core.status().quarantined_bytes, 8 * MIB);
-    assert_eq!(core.status().receive_slots_in_use, 2);
-
-    let unknown = FakeBackend {
-        poll_error: Some(NativeCallError {
-            status: None,
-            message: "unknown batch completion".into(),
-            accepted: true,
-        }),
-        ..FakeBackend::default()
-    };
-    let mut core = connected_batch_core(RuntimeCore::new(unknown, batch_options(2)).unwrap());
-    let error = core
-        .read_batch(
-            "peer",
-            &batch_windows(2, 4 * MIB),
-            Vec::with_capacity(8 * MIB),
-            Instant::now() + Duration::from_secs(1),
-            Duration::ZERO,
-        )
-        .unwrap_err();
-    assert_eq!(error.kind, HixlErrorKind::CompletionFailed);
-    assert!(error.read_may_be_in_flight);
-    assert_eq!(core.status().quarantined_bytes, 8 * MIB);
-    assert_eq!(core.status().receive_slots_in_use, 2);
-    let reuse = core
-        .read_batch(
-            "peer",
-            &batch_windows(2, 4 * MIB),
-            Vec::with_capacity(8 * MIB),
-            Instant::now() + Duration::from_secs(1),
-            Duration::ZERO,
-        )
-        .unwrap_err();
-    assert_eq!(reuse.kind, HixlErrorKind::EnginePoisoned);
-    assert!(!reuse.read_may_be_in_flight);
-    assert_eq!(core.backend.shutdown_calls, 0);
+fn sync_read_rejection_before_dispatch_rolls_back_all_slots() {
+    for (transport, buffer_pool) in [
+        (super::ReadTransport::Roce, false),
+        (super::ReadTransport::Roce, true),
+        (super::ReadTransport::Hccs, true),
+    ] {
+        let mut opts = batch_options(2);
+        opts.transport = transport;
+        opts.buffer_pool = buffer_pool;
+        let backend = FakeBackend {
+            sync_batch_error: Some(NativeCallError::new(Some(503_900), "batch rejected")),
+            ..FakeBackend::default()
+        };
+        let mut core = connected_batch_core(RuntimeCore::new(backend, opts).unwrap());
+        let error = read_two_slots(&mut core).unwrap_err();
+        assert_eq!(error.kind, HixlErrorKind::NativeFailure);
+        assert!(!error.read_may_be_in_flight);
+        assert_eq!(core.status().state, RuntimeState::Running);
+        assert_eq!(core.status().receive_slots_in_use, 0);
+        assert_eq!(core.backend.released_receives, 0);
+        let pinned = read_two_slots(&mut core).unwrap();
+        assert_eq!(pinned.slot_ids(), [0, 1]);
+        core.release_receives(&pinned.slot_ids()).unwrap();
+        assert_eq!(core.backend.sync_batches.len(), 2);
+        assert_eq!(core.backend.released_receives, 2);
+        core.shutdown().unwrap();
+    }
 }
 
 #[test]
@@ -1059,26 +1100,18 @@ fn batch_success_releases_slots_for_the_next_generation_of_reads() {
     let mut core =
         connected_batch_core(RuntimeCore::new(FakeBackend::default(), batch_options(2)).unwrap());
     for _ in 0..3 {
-        let pinned = core
-            .read_batch(
-                "peer",
-                &batch_windows(2, 4 * MIB),
-                Vec::with_capacity(8 * MIB),
-                Instant::now() + Duration::from_secs(1),
-                Duration::ZERO,
-            )
-            .unwrap();
+        let pinned = read_two_slots(&mut core).unwrap();
         core.release_receives(&pinned.slot_ids()).unwrap();
         assert_eq!(core.status().receive_slots_in_use, 0);
     }
-    assert_eq!(core.backend.batch_submissions.len(), 3);
+    assert_eq!(core.backend.sync_batches.len(), 3);
     assert_eq!(core.backend.released_receives, 6);
     core.shutdown().unwrap();
 }
 
 #[test]
 #[cfg(feature = "hixl")]
-fn batch_submission_publishes_only_the_filled_buffer() {
+fn sync_batch_publishes_only_the_filled_buffer() {
     let runtime = runtime_with_fake_backend(FakeBackend::default(), options());
     let deadline = Instant::now() + Duration::from_secs(1);
     let output = runtime.prepare_read_batch_buffer(4).unwrap();
@@ -1108,7 +1141,7 @@ fn a_batch_rejects_initialized_or_insufficient_output_before_native_entry() {
             .unwrap_err();
         assert_eq!(error.kind, HixlErrorKind::InvalidArgument);
     }
-    assert!(core.backend.batch_submissions.is_empty());
+    assert!(core.backend.sync_batches.is_empty());
     assert_eq!(core.status().receive_slots_in_use, 0);
 }
 
@@ -1116,23 +1149,14 @@ fn a_batch_rejects_initialized_or_insufficient_output_before_native_entry() {
 fn a_completed_read_keeps_its_slots_pinned_until_they_are_released() {
     let mut core =
         connected_batch_core(RuntimeCore::new(FakeBackend::default(), batch_options(2)).unwrap());
-    let read = |core: &mut RuntimeCore<FakeBackend>| {
-        core.read_batch(
-            "peer",
-            &batch_windows(2, 4 * MIB),
-            Vec::with_capacity(8 * MIB),
-            Instant::now() + Duration::from_secs(1),
-            Duration::ZERO,
-        )
-    };
-    let pinned = read(&mut core).unwrap();
+    let pinned = read_two_slots(&mut core).unwrap();
     assert_eq!(pinned.slots.len(), 2);
     assert!(pinned.slots.iter().all(|slot| slot.address != 0));
     assert_eq!(pinned.slots[1].length, 4 * MIB);
     assert_eq!(core.status().receive_slots_in_use, 2);
 
     assert_eq!(
-        read(&mut core).unwrap_err().kind,
+        read_two_slots(&mut core).unwrap_err().kind,
         HixlErrorKind::ResourceExhausted
     );
     assert_eq!(
@@ -1167,15 +1191,7 @@ fn a_read_completed_without_an_address_quarantines_its_slots() {
         ..FakeBackend::default()
     };
     let mut core = connected_batch_core(RuntimeCore::new(backend, batch_options(2)).unwrap());
-    let error = core
-        .read_batch(
-            "peer",
-            &batch_windows(2, 4 * MIB),
-            Vec::with_capacity(8 * MIB),
-            Instant::now() + Duration::from_secs(1),
-            Duration::ZERO,
-        )
-        .unwrap_err();
+    let error = read_two_slots(&mut core).unwrap_err();
     assert_eq!(error.kind, HixlErrorKind::EnginePoisoned);
     assert_eq!(core.status().quarantined_bytes, 8 * MIB);
 }
@@ -1191,15 +1207,7 @@ fn a_failed_receive_release_quarantines_the_slots() {
         ..FakeBackend::default()
     };
     let mut core = connected_batch_core(RuntimeCore::new(backend, batch_options(2)).unwrap());
-    let pinned = core
-        .read_batch(
-            "peer",
-            &batch_windows(2, 4 * MIB),
-            Vec::with_capacity(8 * MIB),
-            Instant::now() + Duration::from_secs(1),
-            Duration::ZERO,
-        )
-        .unwrap();
+    let pinned = read_two_slots(&mut core).unwrap();
     assert_eq!(
         core.release_receives(&pinned.slot_ids()).unwrap_err().kind,
         HixlErrorKind::EnginePoisoned
@@ -1248,4 +1256,95 @@ fn copying_pinned_slots_rejects_lengths_that_do_not_tile_the_output() {
         );
         assert!(output.is_empty());
     }
+}
+
+#[test]
+fn write_batch_validates_payload_and_reuses_staging_slots() {
+    let mut core =
+        connected_batch_core(RuntimeCore::new(FakeBackend::default(), options()).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    for (windows, bytes) in [
+        (&[(0x1000, 4)][..], &b"abc"[..]),
+        (&[(u64::MAX, 4)][..], &b"abcd"[..]),
+    ] {
+        let error = core
+            .write_batch("peer", windows, bytes, deadline)
+            .unwrap_err();
+        assert_eq!(error.kind, HixlErrorKind::InvalidArgument);
+        assert!(!error.read_may_be_in_flight);
+    }
+    assert!(core.backend.writes.is_empty());
+    let error = core
+        .write_batch("peer", &[(0x1000, 4)], b"abcd", Instant::now())
+        .unwrap_err();
+    assert_eq!(error.kind, HixlErrorKind::DeadlineExceeded);
+    assert!(!error.read_may_be_in_flight);
+    for bytes in [b"abcd", b"efgh"] {
+        core.write_batch("peer", &[(0x1000, 4)], bytes, deadline)
+            .unwrap();
+    }
+    assert_eq!(core.backend.writes.len(), 2);
+    let (windows, bytes) = &core.backend.writes[1];
+    assert_eq!(
+        &windows[..],
+        &[NativeTransferWindow {
+            slot_id: 0,
+            remote_addr: 0x1000,
+            len: 4
+        }]
+    );
+    assert_eq!(bytes, b"efgh");
+    assert_eq!(core.status().receive_slots_in_use, 0);
+    core.shutdown().unwrap();
+}
+
+#[test]
+fn write_batch_quarantines_only_when_native_outcome_is_uncertain() {
+    for accepted in [false, true] {
+        let mut options = options();
+        options.receive_slots = 2;
+        let backend = FakeBackend {
+            write_error: Some(NativeCallError {
+                status: Some(super::HIXL_TIMEOUT),
+                message: "injected WRITE failure".to_owned(),
+                accepted,
+            }),
+            ..FakeBackend::default()
+        };
+        let mut core = connected_batch_core(RuntimeCore::new(backend, options).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let windows = [(0x1000, 4), (0x2000, 3)];
+        let error = core
+            .write_batch("peer", &windows, b"abcdefg", deadline)
+            .unwrap_err();
+        assert_eq!(error.kind, HixlErrorKind::DeadlineExceeded);
+        assert_eq!(error.read_may_be_in_flight, accepted);
+        if accepted {
+            assert_eq!(core.status().state, RuntimeState::Quarantined);
+            assert_eq!(core.status().quarantined_bytes, 8);
+            assert!(core.shutdown().is_err());
+            assert_eq!(core.backend.shutdown_calls, 0);
+        } else {
+            assert_eq!(core.status().state, RuntimeState::Running);
+            core.write_batch("peer", &windows, b"abcdefg", deadline)
+                .unwrap();
+            core.shutdown().unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "hixl")]
+#[test]
+fn write_batch_runs_through_the_owner_thread() {
+    let runtime = runtime_with_fake_backend(FakeBackend::default(), options());
+    runtime
+        .write_batch(
+            "peer",
+            &[(0x1000, 4)],
+            b"data".to_vec(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(runtime.status().receive_slots_in_use, 0);
+    runtime.shutdown().unwrap();
 }

@@ -23,6 +23,15 @@ pub(crate) trait ReadLane: Send + Sync {
         output: Vec<u8>,
         deadline: Instant,
     ) -> Result<HixlReadOutcome, HixlError>;
+
+    /// Completes a native WRITE into the peer's still-reserved windows.
+    fn write_batch(
+        &self,
+        peer: &str,
+        windows: &[(u64, usize)],
+        bytes: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<(), HixlError>;
 }
 
 /// The engine view the reader uses; windows and batches share one implementation.
@@ -73,6 +82,16 @@ impl ReadLane for HixlRuntime {
         deadline: Instant,
     ) -> Result<HixlReadOutcome, HixlError> {
         self.read_batch_timed_into(peer, windows, output, deadline)
+    }
+
+    fn write_batch(
+        &self,
+        peer: &str,
+        windows: &[(u64, usize)],
+        bytes: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<(), HixlError> {
+        HixlRuntime::write_batch(self, peer, windows, bytes, deadline)
     }
 }
 

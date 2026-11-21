@@ -2,8 +2,8 @@
 //! service tests and the reader loopback tests.
 
 use super::{
-    BatchEntry, ExportProvider, OwnerBatchDirectory, OwnerBatchSource, OwnerWindowSource,
-    PresentedRootAccess, RemoteFile,
+    BatchEntry, ExportProvider, OwnerBatchDirectory, OwnerBatchSource, OwnerHixlService,
+    OwnerWindowSource, PresentedRootAccess, RemoteFile,
 };
 use crate::node::rpc::hixl::test_support::{engine, native_error};
 use afs_transport::hixl::{
@@ -18,6 +18,18 @@ use std::time::{Duration, Instant};
 
 pub(crate) const HOME_ENGINE: &str = "127.0.0.1:7930";
 pub(crate) const OPEN_HANDLE: &[u8] = b"open-1";
+
+/// A Home service with an inspectable export pool and file source.
+pub(super) fn memory_home(
+    window_bytes: usize,
+    slots: usize,
+    source: MemorySource,
+) -> (OwnerHixlService, Arc<MemoryExports>, Arc<MemorySource>) {
+    let exports = Arc::new(MemoryExports::new(window_bytes, slots));
+    let source = Arc::new(source);
+    let service = OwnerHixlService::from_parts(exports.clone(), source.clone());
+    (service, exports, source)
+}
 
 #[derive(Default)]
 struct Memory {
@@ -75,6 +87,13 @@ impl MemoryExports {
         let (resume, wait_for_resume) = mpsc::sync_channel(1);
         *self.pause.lock().unwrap() = Some((entered, wait_for_resume));
         (wait_for_entry, resume)
+    }
+
+    /// Simulates a terminal native WRITE to a published address.
+    pub(crate) fn write(&self, address: u64, data: &[u8]) {
+        let mut memory = self.memory.lock().unwrap();
+        let slot = memory.bytes.get_mut(&address).unwrap();
+        slot[..data.len()].copy_from_slice(data);
     }
 
     /// The native READ view of an exported slot.
@@ -233,13 +252,22 @@ pub(crate) struct MemorySource {
     pub(crate) data: Mutex<Vec<u8>>,
     /// Non-empty source reads; empty reads are pure authorization checks.
     pub(crate) reads: AtomicUsize,
+    pub(super) deny_writes: AtomicBool,
+    pub(super) deny_reads: AtomicBool,
+    pub(super) append_writes: AtomicBool,
     max_chunk: usize,
+    pause_write: Mutex<Option<WritePause>>,
     overlap: Option<OverlapProbe>,
     /// A non-empty read covering one of these offsets fails with its error code.
     failing_offsets: Mutex<Vec<(u64, afs_error::ErrorCode)>>,
     /// Files a batch prepare can list, keyed by root-relative path. An open
     /// handle `OPEN_HANDLE#<path>` reads the tree file at `<path>`.
     pub(crate) tree: Arc<MemoryTree>,
+}
+
+struct WritePause {
+    entered: Arc<tokio::sync::Notify>,
+    resume: mpsc::Receiver<()>,
 }
 
 /// One regular file or other entry of the in-memory tree.
@@ -271,6 +299,7 @@ pub(crate) struct MemoryTree {
     /// These paths are rewritten between the batch stat and its open.
     rewrite_on_open: Mutex<HashSet<Vec<u8>>>,
     pub(crate) listings: AtomicUsize,
+    pub(crate) listed_entries: AtomicUsize,
     directory_version: AtomicUsize,
     pub(crate) batch_opens: AtomicUsize,
 }
@@ -357,27 +386,31 @@ impl OwnerBatchDirectory for MemoryDirectory {
         ))
     }
 
-    fn names(&self) -> afs_error::Result<Vec<OsString>> {
+    fn names_bounded(
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> afs_error::Result<Option<Vec<OsString>>> {
         self.tree.listings.fetch_add(1, Ordering::SeqCst);
         let prefix = child_path(&self.parent, b"");
-        let mut names = self
-            .tree
-            .entries
-            .lock()
-            .unwrap()
-            .keys()
-            .filter_map(|path| {
-                let name = if self.parent.is_empty() {
-                    path.as_slice()
-                } else {
-                    path.strip_prefix(prefix.as_slice())?
-                };
-                (!name.is_empty() && !name.contains(&b'/'))
-                    .then(|| OsStr::from_bytes(name).to_owned())
+        let entries = self.tree.entries.lock().unwrap();
+        let names = entries
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+            .filter_map(|(path, _)| {
+                let name = path.strip_prefix(prefix.as_slice())?;
+                (!name.is_empty() && !name.contains(&b'/')).then_some(OsStr::from_bytes(name))
             })
-            .collect::<Vec<_>>();
-        names.sort();
-        Ok(names)
+            .map(|name| {
+                self.tree.listed_entries.fetch_add(1, Ordering::SeqCst);
+                Ok(name.to_owned())
+            });
+        crate::node::storage::localfs::collect_directory_names_bounded(
+            names,
+            max_entries,
+            max_bytes,
+        )
+        .map_err(afs_error::Error::from)
     }
 
     fn stat(&self, name: &OsStr) -> afs_error::Result<Option<BatchEntry>> {
@@ -453,11 +486,40 @@ impl MemorySource {
         Self {
             data: Mutex::new(data),
             reads: AtomicUsize::new(0),
+            deny_writes: AtomicBool::new(false),
+            deny_reads: AtomicBool::new(false),
+            append_writes: AtomicBool::new(false),
             max_chunk,
+            pause_write: Mutex::new(None),
             overlap: None,
             failing_offsets: Mutex::new(Vec::new()),
             tree: Arc::new(MemoryTree::default()),
         }
+    }
+
+    /// Pauses the next authorized write before acquiring the file's data lock.
+    pub(crate) fn pause_next_write(&self, entered: Arc<tokio::sync::Notify>) -> mpsc::Sender<()> {
+        let (resume, wait) = mpsc::channel();
+        *self.pause_write.lock().unwrap() = Some(WritePause {
+            entered,
+            resume: wait,
+        });
+        resume
+    }
+
+    fn write_bytes(&self, file: &mut Vec<u8>, offset: u64, data: &[u8]) -> usize {
+        let offset = if self.append_writes.load(Ordering::SeqCst) {
+            file.len()
+        } else {
+            usize::try_from(offset).unwrap()
+        };
+        let written = data.len().min(self.max_chunk);
+        let end = offset + written;
+        if end > file.len() {
+            file.resize(end, 0);
+        }
+        file[offset..end].copy_from_slice(&data[..written]);
+        written
     }
 
     /// Makes every non-empty read whose range covers `offset` fail with `code`.
@@ -520,6 +582,49 @@ impl OwnerWindowSource for MemorySource {
         Ok(())
     }
 
+    fn authorize_write(
+        &self,
+        peer: &str,
+        access: &PresentedRootAccess,
+        file: &RemoteFile,
+    ) -> afs_error::Result<()> {
+        self.authorize_transport(peer, access)?;
+        if self.deny_writes.load(Ordering::SeqCst) || !file.handle.starts_with(OPEN_HANDLE) {
+            return Err(afs_error::Error::coded(
+                afs_error::CLIENT_PERMISSION_DENIED,
+                "write denied",
+            ));
+        }
+        Ok(())
+    }
+
+    fn write(
+        &self,
+        peer: &str,
+        access: &PresentedRootAccess,
+        file: &RemoteFile,
+        offset: u64,
+        data: &[u8],
+        _options: crate::node::vfs::types::WriteOptions,
+    ) -> afs_error::Result<usize> {
+        self.authorize_write(peer, access, file)?;
+        let pause = self.pause_write.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.resume.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        if let Some(path) = tree_path(&file.handle) {
+            let mut entries = self.tree.entries.lock().unwrap();
+            let entry = entries
+                .get_mut(path)
+                .expect("test file was opened from the tree");
+            let written = self.write_bytes(&mut entry.data, offset, data);
+            entry.mtime_ns += 1;
+            return Ok(written);
+        }
+        Ok(self.write_bytes(&mut self.data.lock().unwrap(), offset, data))
+    }
+
     fn read(
         &self,
         peer: &str,
@@ -529,6 +634,12 @@ impl OwnerWindowSource for MemorySource {
         out: &mut [u8],
     ) -> afs_error::Result<usize> {
         self.authorize_transport(peer, access)?;
+        if self.deny_reads.load(Ordering::SeqCst) {
+            return Err(afs_error::Error::coded(
+                afs_error::CLIENT_PERMISSION_DENIED,
+                "read denied",
+            ));
+        }
         if !file.handle.starts_with(OPEN_HANDLE) {
             return Err(afs_error::Error::coded(
                 afs_error::NODE_OWNER_STALE_HANDLE,

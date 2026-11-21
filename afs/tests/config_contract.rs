@@ -623,16 +623,9 @@ fn hixl_defaults_off_with_roce_transport_without_changing_existing_data_mode() {
 
 #[test]
 fn disabled_hixl_table_is_accepted_without_native_dependencies() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("node.toml");
-    std::fs::write(
-        &path,
-        "data_mode='grpc'\n[hixl]\nwindow_bytes=4194304\nreceive_slots=2\nexport_slots=2\n",
-    )
-    .unwrap();
-    let cfg = Config::resolve(
-        Role::Node,
-        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    let cfg = resolve_hixl_table(
+        "data_mode='grpc'",
+        "window_bytes=4194304\nreceive_slots=2\nexport_slots=2",
     )
     .unwrap();
     assert_eq!(cfg.data_mode, DataMode::Grpc);
@@ -688,26 +681,43 @@ device_listen_port=27666",
 }
 
 #[test]
+fn hixl_link_and_buffer_pool_are_independent() {
+    for (table, link, pool) in [
+        ("", "roce", false),
+        ("transport='roce'\nbuffer_pool=true", "roce", true),
+        (HCCS_BUFFER_POOL, "hccs", true),
+    ] {
+        let cfg = resolve_hixl_table("", table).unwrap();
+        let options = cfg.hixl.runtime_options_per_device().remove(0);
+        assert_eq!(options.transport.to_string(), link);
+        assert_eq!(options.buffer_pool, pool);
+    }
+    assert!(
+        resolve_hixl_table("", "transport='hccs'\nbuffer_pool=false")
+            .unwrap_err()
+            .message()
+            .contains("buffer_pool")
+    );
+}
+
+const HCCS_BUFFER_POOL: &str = "transport='hccs'\nbuffer_pool=true";
+
+#[test]
 fn hixl_accepts_hccs_buffer_pool_bounds_and_maps_them_to_runtime_options() {
     for (count, size_mib) in [(1, 1), (64, 1), (1, 64), (32, 8), (4, 8), (7, 9)] {
         let cfg = resolve_hixl_table(
             "",
             &format!(
-                "transport='hccs-buffer-pool'
-buffer_pool_count={count}
-buffer_pool_size_mib={size_mib}"
+                "{HCCS_BUFFER_POOL}\nbuffer_pool_count={count}\nbuffer_pool_size_mib={size_mib}"
             ),
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("HCCS pool count={count}, size={size_mib} MiB: {error}"));
         let printed = serde_json::to_value(&cfg).unwrap();
-        assert_eq!(printed["hixl"]["transport"], "hccs-buffer-pool");
+        assert_eq!(printed["hixl"]["transport"], "hccs");
         assert_eq!(printed["hixl"]["buffer_pool_count"], count);
         assert_eq!(printed["hixl"]["buffer_pool_size_mib"], size_mib);
         let options = cfg.hixl.runtime_options_per_device().remove(0);
-        assert_eq!(
-            options.transport,
-            afs_transport::hixl::ReadTransport::HccsBufferPool
-        );
+        assert_eq!(options.transport, afs_transport::hixl::ReadTransport::Hccs);
         assert_eq!(options.buffer_pool_count, count);
         assert_eq!(options.buffer_pool_size_mib, size_mib);
     }
@@ -715,32 +725,32 @@ buffer_pool_size_mib={size_mib}"
 
 #[test]
 fn hixl_rejects_typed_values_outside_their_bounds_at_the_config_boundary() {
-    for table in [
+    let invalid_values = [
         // Ports are typed u16 values; zero reaches device port validation.
         "device_listen_port=0",
         "device_listen_port=-1",
         "device_listen_port=65536",
         "transport='hccs_buffer_pool'",
-        "transport='hccs-buffer-pool'
-buffer_pool_count=0",
-        "transport='hccs-buffer-pool'
-buffer_pool_count=65",
-        "transport='hccs-buffer-pool'
-buffer_pool_size_mib=0",
-        "transport='hccs-buffer-pool'
-buffer_pool_size_mib=65",
+    ];
+    let invalid_pool_options = [
+        "buffer_pool_count=0",
+        "buffer_pool_count=65",
+        "buffer_pool_size_mib=0",
+        "buffer_pool_size_mib=65",
         // The pool budget is capped at 512 MiB with checked arithmetic.
-        "transport='hccs-buffer-pool'
-buffer_pool_count=33
-buffer_pool_size_mib=8",
-        "transport='hccs-buffer-pool'
-buffer_pool_count=32
-buffer_pool_size_mib=9",
-        "transport='hccs-buffer-pool'
-buffer_pool_count=9223372036854775807
-buffer_pool_size_mib=64",
-    ] {
-        let error = resolve_hixl_table("", table).unwrap_err();
+        "buffer_pool_count=33\nbuffer_pool_size_mib=8",
+        "buffer_pool_count=32\nbuffer_pool_size_mib=9",
+        "buffer_pool_count=9223372036854775807\nbuffer_pool_size_mib=64",
+    ];
+    let tables = invalid_values.into_iter().map(str::to_owned).chain(
+        invalid_pool_options
+            .into_iter()
+            .map(|options| format!("{HCCS_BUFFER_POOL}\n{options}")),
+    );
+    for table in tables {
+        let error = resolve_hixl_table("", &table)
+            .err()
+            .unwrap_or_else(|| panic!("invalid HIXL config was accepted: {table}"));
         assert!(
             !error.to_string().contains("unknown field"),
             "a typed field must reach validation: {table}: {error}"

@@ -76,17 +76,28 @@ fn group_options_require_matching_window_transport_and_pool_dimensions() {
         HixlErrorKind::InvalidArgument
     );
 
+    let mut pooled_roce = options(1, 27001);
+    pooled_roce.buffer_pool = true;
+    assert!(validate_group_options(&[first.clone(), pooled_roce.clone()]).is_err());
+    let pooled_first = RuntimeOptions {
+        buffer_pool: true,
+        ..first.clone()
+    };
+    assert!(validate_group_options(&[pooled_first.clone(), pooled_roce]).is_ok());
+
     let mut different_transport = options(1, 27001);
-    different_transport.transport = ReadTransport::HccsBufferPool;
+    different_transport.transport = ReadTransport::Hccs;
+    different_transport.buffer_pool = true;
     assert_eq!(
-        validate_group_options(&[first.clone(), different_transport])
+        validate_group_options(&[pooled_first, different_transport])
             .unwrap_err()
             .kind,
         HixlErrorKind::InvalidArgument
     );
 
     let mut relay = first.clone();
-    relay.transport = ReadTransport::HccsBufferPool;
+    relay.transport = ReadTransport::Hccs;
+    relay.buffer_pool = true;
     let mut different_pool = relay.clone();
     different_pool.device_id = 1;
     different_pool.engine_id = "127.0.0.1:7921".to_owned();
@@ -101,6 +112,15 @@ fn group_options_require_matching_window_transport_and_pool_dimensions() {
 }
 
 #[test]
+fn direct_lanes_ignore_unused_pool_dimensions() {
+    let first = options(0, 27000);
+    let mut second = options(1, 27001);
+    second.buffer_pool_count = 0;
+    second.buffer_pool_size_mib = usize::MAX;
+    assert!(validate_group_options(&[first, second]).is_ok());
+}
+
+#[test]
 fn sixteen_lanes_accept_the_per_lane_budget() {
     let options = (0..16)
         .map(|device_id| RuntimeOptions {
@@ -109,7 +129,8 @@ fn sixteen_lanes_accept_the_per_lane_budget() {
             device_listen_port: Some(27000 + device_id as u16),
             receive_slots: 64,
             export_slots: 64,
-            transport: ReadTransport::HccsBufferPool,
+            transport: ReadTransport::Hccs,
+            buffer_pool: true,
             buffer_pool_count: 32,
             buffer_pool_size_mib: 8,
             ..RuntimeOptions::default()
@@ -131,6 +152,7 @@ mod lifecycle {
             engine_id: format!("127.0.0.1:{}", 7920 + device_id),
             device_listen_port: Some(27000 + device_id as u16),
             transport,
+            buffer_pool: transport == ReadTransport::Hccs,
             ..RuntimeOptions::default()
         }
     }
@@ -138,8 +160,19 @@ mod lifecycle {
     fn fake_runtime(
         options: &RuntimeOptions,
         domain: Option<u64>,
-        shutdown_error: Option<HixlError>,
+        mut shutdown_error: Option<HixlError>,
         shutdown_calls: Arc<AtomicUsize>,
+    ) -> Arc<HixlRuntime> {
+        fake_runtime_with_shutdown(options, domain, move || {
+            shutdown_calls.fetch_add(1, Ordering::SeqCst);
+            shutdown_error.take().map_or(Ok(()), Err)
+        })
+    }
+
+    fn fake_runtime_with_shutdown(
+        options: &RuntimeOptions,
+        domain: Option<u64>,
+        shutdown: impl FnMut() -> Result<(), HixlError> + Send + 'static,
     ) -> Arc<HixlRuntime> {
         let host_bytes = options.window_bytes * (options.receive_slots + options.export_slots);
         let (buffer_pool_count, buffer_pool_size_mib) = options.buffer_pool_dims();
@@ -166,9 +199,7 @@ mod lifecycle {
         }));
         let (sender, receiver) = mpsc::sync_channel(4);
         let owner_status = Arc::clone(&status);
-        let owner = std::thread::spawn(move || {
-            fake_owner(receiver, owner_status, shutdown_error, shutdown_calls)
-        });
+        let owner = std::thread::spawn(move || fake_owner(receiver, owner_status, shutdown));
         Arc::new(HixlRuntime {
             info,
             sender,
@@ -180,21 +211,17 @@ mod lifecycle {
     fn fake_owner(
         receiver: mpsc::Receiver<Command>,
         status: Arc<RwLock<RuntimeStatus>>,
-        mut shutdown_error: Option<HixlError>,
-        shutdown_calls: Arc<AtomicUsize>,
+        mut shutdown: impl FnMut() -> Result<(), HixlError>,
     ) {
         while let Ok(command) = receiver.recv() {
             match command {
                 Command::Shutdown { reply } => {
-                    shutdown_calls.fetch_add(1, Ordering::SeqCst);
-                    let result = if let Some(error) = shutdown_error.take() {
-                        Err(error)
-                    } else {
-                        if let Ok(mut status) = status.write() {
-                            status.state = RuntimeState::Shutdown;
-                        }
-                        Ok(())
-                    };
+                    let result = shutdown();
+                    if result.is_ok()
+                        && let Ok(mut status) = status.write()
+                    {
+                        status.state = RuntimeState::Shutdown;
+                    }
                     let should_stop = result.is_ok();
                     let _ = reply.send(result);
                     if should_stop {
@@ -294,8 +321,8 @@ mod lifecycle {
         let closure_calls = Arc::clone(&calls);
         let result = HixlRuntimeGroup::start_with(
             vec![
-                options(0, ReadTransport::HccsBufferPool),
-                options(1, ReadTransport::HccsBufferPool),
+                options(0, ReadTransport::Hccs),
+                options(1, ReadTransport::Hccs),
             ],
             move |options| {
                 Ok(fake_runtime(
@@ -320,47 +347,9 @@ mod lifecycle {
         order: Arc<Mutex<Vec<i32>>>,
     ) -> Arc<HixlRuntime> {
         let device_id = options.device_id;
-        let (buffer_pool_count, buffer_pool_size_mib) = options.buffer_pool_dims();
-        let info = EngineInfo {
-            engine_id: options.engine_id.clone(),
-            generation: 1 + device_id as u64,
-            window_bytes: options.window_bytes,
-            transport: options.transport,
-            buffer_pool_count,
-            buffer_pool_size_mib,
-            hccs_domain_id: None,
-        };
-        let status = Arc::new(RwLock::new(RuntimeStatus {
-            state: RuntimeState::Running,
-            generation: info.generation,
-            allocated_bytes: 0,
-            quarantined_bytes: 0,
-            export_slots: options.export_slots,
-            receive_slots_in_use: 0,
-            export_slots_in_use: 0,
-            transport: options.transport,
-            relay_hbm_budget_bytes: options.relay_hbm_budget_bytes(),
-            hccs_domain_id: None,
-        }));
-        let (sender, receiver) = mpsc::sync_channel(4);
-        let owner_status = Arc::clone(&status);
-        let owner = std::thread::spawn(move || {
-            while let Ok(command) = receiver.recv() {
-                if let Command::Shutdown { reply } = command {
-                    order.lock().unwrap().push(device_id);
-                    if let Ok(mut status) = owner_status.write() {
-                        status.state = RuntimeState::Shutdown;
-                    }
-                    let _ = reply.send(Ok(()));
-                    break;
-                }
-            }
-        });
-        Arc::new(HixlRuntime {
-            info,
-            sender,
-            status,
-            owner: Mutex::new(Some(owner)),
+        fake_runtime_with_shutdown(options, None, move || {
+            order.lock().unwrap().push(device_id);
+            Ok(())
         })
     }
 
@@ -428,30 +417,30 @@ mod lifecycle {
     }
 
     #[test]
-    fn quarantine_attempts_every_lane() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let group = HixlRuntimeGroup::start_with(
-            vec![
-                options(0, ReadTransport::Roce),
-                options(1, ReadTransport::Roce),
-            ],
-            {
-                let calls = Arc::clone(&calls);
-                move |options| Ok(fake_runtime(&options, None, None, Arc::clone(&calls)))
-            },
-        )
-        .unwrap();
-        group.lane(0).unwrap().quarantine().unwrap();
-        assert_eq!(group.status().state, RuntimeState::Quarantined);
-        group.quarantine().unwrap();
-        assert!(
-            group
-                .lane_statuses()
-                .iter()
-                .all(|status| status.state == RuntimeState::Quarantined)
-        );
-        assert_eq!(group.status().state, RuntimeState::Quarantined);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    fn quarantine_attempts_every_lane_on_both_planes() {
+        for transport in [ReadTransport::Roce, ReadTransport::Hccs] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let group =
+                HixlRuntimeGroup::start_with(vec![options(0, transport), options(1, transport)], {
+                    let calls = Arc::clone(&calls);
+                    move |options| {
+                        let domain = (transport == ReadTransport::Hccs).then_some(7);
+                        Ok(fake_runtime(&options, domain, None, Arc::clone(&calls)))
+                    }
+                })
+                .unwrap();
+            group.lane(0).unwrap().quarantine().unwrap();
+            assert_eq!(group.status().state, RuntimeState::Quarantined);
+            group.quarantine().unwrap();
+            assert!(
+                group
+                    .lane_statuses()
+                    .iter()
+                    .all(|status| status.state == RuntimeState::Quarantined)
+            );
+            assert_eq!(group.status().state, RuntimeState::Quarantined);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
@@ -480,8 +469,8 @@ mod lifecycle {
     fn status_aggregates_host_hbm_and_slot_capacity_across_lanes() {
         let group = HixlRuntimeGroup::start_with(
             vec![
-                options(0, ReadTransport::HccsBufferPool),
-                options(1, ReadTransport::HccsBufferPool),
+                options(0, ReadTransport::Hccs),
+                options(1, ReadTransport::Hccs),
             ],
             |options| {
                 Ok(fake_runtime(

@@ -194,7 +194,7 @@ message DfsReadRangesRdmaReply {
 enum HixlTransport {
   HIXL_TRANSPORT_UNSPECIFIED = 0;
   HIXL_TRANSPORT_ROCE = 1;
-  HIXL_TRANSPORT_HCCS_BUFFER_POOL = 2;
+  HIXL_TRANSPORT_HCCS = 2;
 }
 
 message HixlLane {
@@ -342,6 +342,10 @@ service OwnerFiles {
   rpc PrepareReadHixl(OwnerPrepareReadHixlRequest) returns (OwnerPrepareReadHixlReply);
   rpc ReleaseHixlRead(OwnerReleaseHixlReadRequest) returns (OwnerReleaseHixlReadReply);
   rpc CloseHixl(OwnerCloseHixlRequest) returns (OwnerCloseHixlReply);
+  // The writer pushes into Home staging slots, then commits to the file once.
+  rpc PrepareWriteHixl(OwnerPrepareWriteHixlRequest) returns (OwnerPrepareWriteHixlReply);
+  rpc CommitWriteHixl(OwnerFinishWriteHixlRequest) returns (OwnerCommitWriteHixlReply);
+  rpc AbortWriteHixl(OwnerAbortWriteHixlRequest) returns (OwnerAbortWriteHixlReply);
   // Packs whole regular files of one directory, in sorted name order from the
   // anchor, into exported slots. Release reuses OwnerReleaseHixlReadRequest.
   rpc PrepareBatchHixl(OwnerPrepareBatchHixlRequest) returns (OwnerPrepareBatchHixlReply);
@@ -745,6 +749,7 @@ message OwnerNegotiateHixlRequest {
   uint64 client_engine_generation = 3;
   uint32 protocol_version = 4;
   HixlTransport transport = 5;
+  // Both pool dimensions are zero for direct transfer, positive for relay.
   uint32 buffer_pool_count = 6;
   uint32 buffer_pool_size_mib = 7;
   optional uint64 hccs_domain_id = 8;
@@ -754,17 +759,23 @@ message OwnerNegotiateHixlRequest {
   repeated DfsDigestAlgorithm slot_checksum_algorithms = 10;
 }
 
+// A negotiated session supports buffered reads and writes; each operation still
+// checks its own grant and file handle.
 message OwnerNegotiateHixlReply {
   uint64 session_id = 1;
   string home_session_id = 2;
   uint32 protocol_version = 3;
   HixlTransport transport = 4;
+  // Both pool dimensions are zero for direct transfer, positive for relay.
   uint32 buffer_pool_count = 5;
   uint32 buffer_pool_size_mib = 6;
   optional uint64 hccs_domain_id = 7;
   repeated HixlLane lanes = 8;
   // Algorithm of every slot checksum on this session: BLAKE3 or CRC32C.
   DfsDigestAlgorithm slot_checksum_algorithm = 9;
+  reserved 10;
+  // Home supports using the negotiated read checksum for WRITE payloads.
+  bool write_checksum_negotiated = 11;
 }
 
 // read_id is reader-generated and stays identical across transport retries of
@@ -867,6 +878,77 @@ message OwnerReleaseHixlReadRequest {
 message OwnerReleaseHixlReadReply {
   bool consumed = 1;
   bool already_released = 2;
+}
+
+// The digest binds immutable source bytes and file parameters to this write.
+// Replays use the same authenticated session and write_id even for append.
+message OwnerPrepareWriteHixlRequest {
+  uint64 session_id = 1;
+  string write_id = 2;
+  RootAccess access = 3;
+  OwnerHandle handle = 4;
+  uint64 offset = 5;
+  uint32 length = 6;
+  bool kill_suidgid = 7;
+  bytes data_checksum = 8;
+  uint32 lane_id = 9;
+  uint64 slot_bytes = 10;
+  // Explicit values must match the negotiated algorithm; unspecified means legacy BLAKE3.
+  DfsDigestAlgorithm data_checksum_algorithm = 11;
+}
+
+message OwnerPrepareWriteHixlReply {
+  uint64 session_id = 1;
+  string write_id = 2;
+  uint32 lane_id = 3;
+  string engine_id = 4;
+  uint64 engine_generation = 5;
+  repeated OwnerHixlSlot slots = 6;
+}
+
+message OwnerFinishWriteHixlRequest {
+  uint64 session_id = 1;
+  string write_id = 2;
+  uint64 engine_generation = 3;
+  // Request a single-use successor for this file on the same lane.
+  bool request_next = 4;
+  // Present only when committing a WRITE into a previously granted window.
+  OwnerPrepareWriteHixlRequest reused = 5;
+  string window_token = 6;
+}
+
+message OwnerCommitWriteHixlReply {
+  uint32 written = 1;
+  // The descriptor's write_id identifies the successor grant, not the file operation.
+  OwnerPrepareWriteHixlReply next_window = 2;
+}
+
+message OwnerAbortWriteHixlRequest {
+  uint64 session_id = 1;
+  string write_id = 2;
+  uint64 engine_generation = 3;
+  // Unknown device completion pins the target slots: never recycle them.
+  bool unknown = 4;
+  // Decline an unreceived successor; never cancel the file write itself.
+  bool cancel_next = 5;
+  // Requires cancel_next for safe fallback on older Homes. Resolve this exact
+  // Commit without starting a file write; fences it if it has not started.
+  OwnerFinishWriteHixlRequest recover_commit = 6;
+}
+
+message OwnerAbortWriteHixlReply {
+  // An empty reply is not execution evidence.
+  oneof recovery {
+    uint32 written = 1;
+    OwnerWriteHixlFailure failure = 2;
+  }
+}
+
+message OwnerWriteHixlFailure {
+  int32 grpc_code = 1;
+  string message = 2;
+  // The original structured gRPC status details, if present.
+  bytes details = 3;
 }
 
 message OwnerCloseHixlRequest {

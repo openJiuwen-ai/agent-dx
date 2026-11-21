@@ -8,7 +8,7 @@
 //! 模式含义：
 //! - Grpc：控制命令和文件内容都进 node_data proto；
 //! - Rdma：control/data 命令仍走 gRPC proto，文件内容走 RDMA MR；
-//! - Hixl：OwnerFs 远端只读正文走 HIXL。
+//! - Hixl：OwnerFs 远端缓冲读写正文走 HIXL。
 //! - Auto：按已装配的业务能力选通道，协商明确不支持时才尝试下一候选。
 //!
 //! 已经发出的写如果结果不明，绝不换通道重放；RDMA in-flight 被取消时会 poison
@@ -250,10 +250,17 @@ enum DataPeerClientInner {
     Rdma(Box<RdmaDataClient>),
 }
 
+#[cfg(feature = "ownerfs")]
+struct PrefetchedOwnerRead {
+    #[cfg(feature = "dfs")]
+    identity: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
 /// OwnerFs 的 node-to-node 文件客户端。
 ///
 /// 它实现 `RemoteFiles`，供非 Home 节点把根内文件操作转发到 Home。read/write
-/// 可以使用 gRPC inline 或 OwnerFiles 专用的 one-sided RDMA 数据窗口；不能直接
+/// 根据操作选择 gRPC inline、RDMA 或 HIXL 正文通道；不能直接
 /// 复用 diagnostics `NodeData` 会话。
 #[cfg(feature = "ownerfs")]
 pub struct OwnerPeerClient {
@@ -262,9 +269,9 @@ pub struct OwnerPeerClient {
     long_lock_control:
         Option<afs_protocol::node_control::owner_control_client::OwnerControlClient<Channel>>,
     runtime: OwnerRuntime,
-    // Per-open immutable read snapshot returned by OwnerFiles.Open. It is
+    // Per-open read snapshot and file identity returned by OwnerFiles.Open. It is
     // removed at release and never reused for another open of the same path.
-    prefetched_reads: StdMutex<HashMap<Vec<u8>, Vec<u8>>>,
+    prefetched_reads: StdMutex<HashMap<Vec<u8>, PrefetchedOwnerRead>>,
     pending_releases: Arc<AtomicUsize>,
     rdma_admission: Arc<tokio::sync::Semaphore>,
     metrics: Option<super::OwnerRpcMetrics>,
@@ -418,7 +425,7 @@ impl OwnerPeerClient {
         self
     }
 
-    /// Serves eligible read-only opens of `home_node_id` from HIXL read-ahead
+    /// Serves eligible buffered opens of `home_node_id` with HIXL writes and read-ahead
     /// windows when the client selects HIXL.
     #[cfg(feature = "dfs")]
     pub fn with_hixl(
@@ -440,8 +447,17 @@ impl OwnerPeerClient {
     #[cfg(feature = "dfs")]
     fn invalidate_hixl(&self, identity: Option<&FileIdentity>) {
         if let (Some(hixl), Some(identity)) = (self.hixl_read_session(), identity) {
+            self.invalidate_owner_snapshots(&identity.0);
             hixl.invalidate(&identity.0);
         }
+    }
+
+    #[cfg(feature = "dfs")]
+    fn invalidate_owner_snapshots(&self, identity: &[u8]) {
+        self.prefetched_reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, entry| entry.identity != identity);
     }
 
     pub fn with_rdma_admission(mut self, admission: Arc<tokio::sync::Semaphore>) -> Self {
@@ -803,15 +819,18 @@ impl Drop for OwnerRdmaCloseGuard {
 fn owner_dispatched_write_status(status: tonic::Status) -> PeerError {
     // Apply this only to the business RPC result. A local worker or
     // negotiation failure before calling Write does not imply a mutation.
-    let received = PeerError::from(status);
-    if !write_was_not_executed(&received.0) && write_status_requires_execution_evidence(&received.0)
-    {
-        return PeerError::coded(
+    PeerError(owner_dispatched_write_error(PeerError::from(status).0))
+}
+
+#[cfg(feature = "ownerfs")]
+fn owner_dispatched_write_error(error: afs_error::Error) -> afs_error::Error {
+    if !write_was_not_executed(&error) && write_status_requires_execution_evidence(&error) {
+        return afs_error::Error::coded(
             afs_error::NODE_OWNER_WRITE_UNKNOWN,
-            format!("OwnerFiles write outcome is unknown: {received}"),
+            format!("OwnerFiles write outcome is unknown: {error}"),
         );
     }
-    received
+    error
 }
 
 #[cfg(feature = "ownerfs")]
@@ -1370,6 +1389,10 @@ impl RemoteFiles for OwnerPeerClient {
         if flags & libc::O_TRUNC != 0 {
             self.invalidate_hixl(Some(&entry.identity));
         }
+        #[cfg(feature = "dfs")]
+        if let Some(session) = self.hixl_read_session() {
+            session.track_writer(&handle.opaque, flags);
+        }
         Ok(RemoteCreatedFile {
             file: remote_file(
                 grant,
@@ -1534,6 +1557,15 @@ impl RemoteFiles for OwnerPeerClient {
             && flags & libc::O_PATH == 0
             && flags & (libc::O_ACCMODE | libc::O_TRUNC) != libc::O_RDONLY
         {
+            #[cfg(feature = "dfs")]
+            self.hixl_read_session()
+                .ok_or_else(owner_hixl_write_unsupported)?
+                .ensure_session_for_open(
+                    &self.runtime,
+                    &self.cloned_client().map_err(|error| error.0)?,
+                    grant,
+                )?;
+            #[cfg(not(feature = "dfs"))]
             return Err(owner_hixl_write_unsupported());
         }
         #[cfg(feature = "dfs")]
@@ -1571,13 +1603,21 @@ impl RemoteFiles for OwnerPeerClient {
             self.prefetched_reads
                 .lock()
                 .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?
-                .insert(handle.opaque.clone(), bytes);
+                .insert(
+                    handle.opaque.clone(),
+                    PrefetchedOwnerRead {
+                        #[cfg(feature = "dfs")]
+                        identity: identity.opaque.clone(),
+                        bytes,
+                    },
+                );
         }
         #[cfg(feature = "dfs")]
         if let Some(hixl) = self.hixl_read_session() {
             // A truncating open changed the file; earlier opens drop their
             // windows like after a write.
             if flags & libc::O_TRUNC != 0 {
+                self.invalidate_owner_snapshots(&identity.opaque);
                 hixl.invalidate(&identity.opaque);
             }
             hixl.opened(
@@ -1675,12 +1715,20 @@ impl RemoteFiles for OwnerPeerClient {
         if out.is_empty() {
             return self.read_uncached(grant, file, offset, out);
         }
-        if let Some(bytes) = self
-            .prefetched_reads
-            .lock()
-            .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?
-            .get(&file.handle)
+        #[cfg(feature = "dfs")]
+        let cache_allowed = self
+            .hixl_read_session()
+            .is_none_or(|session| session.cache_allowed(&file.identity.0));
+        #[cfg(not(feature = "dfs"))]
+        let cache_allowed = true;
+        if cache_allowed
+            && let Some(bytes) = self
+                .prefetched_reads
+                .lock()
+                .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?
+                .get(&file.handle)
         {
+            let bytes = &bytes.bytes;
             let start = usize::try_from(offset)
                 .unwrap_or(usize::MAX)
                 .min(bytes.len());
@@ -1747,6 +1795,33 @@ impl RemoteFiles for OwnerPeerClient {
         validate_length(data.len()).map_err(|error| error.0)?;
         let started = std::time::Instant::now();
         let result = (|| -> PeerResult<usize> {
+            #[cfg(feature = "dfs")]
+            if !data.is_empty()
+                && let Some(session) = self.hixl_read_session()
+                && session.is_buffered_writer(&file.handle)
+            {
+                match session.write(
+                    &self.runtime,
+                    &self.cloned_client()?,
+                    grant,
+                    file,
+                    offset,
+                    data,
+                    options,
+                ) {
+                    Ok(Some(written)) => {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_payload("client", "write", "hixl", written as u64);
+                        }
+                        return Ok(written);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.invalidate_hixl(Some(&file.identity));
+                        return Err(PeerError(error));
+                    }
+                }
+            }
             if !data.is_empty() && self.data_mode == DataMode::Hixl {
                 return Err(PeerError(owner_hixl_write_unsupported()));
             }
@@ -1808,12 +1883,19 @@ impl RemoteFiles for OwnerPeerClient {
         if let Some(metrics) = &self.metrics {
             metrics.observe("client", "write", started.elapsed());
         }
-        let written = result.map_err(|error| error.0)?;
         #[cfg(feature = "dfs")]
-        if written > 0 {
+        if match &result {
+            Ok(written) => *written > 0,
+            Err(error) => error.code() == afs_error::NODE_OWNER_WRITE_UNKNOWN,
+        } {
+            if result.is_err()
+                && let Some(session) = self.hixl_read_session()
+            {
+                session.mark_uncertain_write(&file.identity.0);
+            }
             self.invalidate_hixl(Some(&file.identity));
         }
-        Ok(written)
+        result.map_err(|error| error.0)
     }
 
     fn flush(&self, grant: &RootGrant, file: &RemoteFile) -> afs_error::Result<()> {
@@ -1853,6 +1935,9 @@ impl RemoteFiles for OwnerPeerClient {
             .remove(&file.handle);
         #[cfg(feature = "dfs")]
         if let Some(hixl) = &self.read_session {
+            if hixl.is_buffered_writer(&file.handle) {
+                hixl.release_write_window(&self.runtime, &file.handle);
+            }
             hixl.released(&file.handle);
         }
         // All writes and explicit sync/flush calls have already received their

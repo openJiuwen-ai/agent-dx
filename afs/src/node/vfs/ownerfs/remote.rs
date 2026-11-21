@@ -40,6 +40,7 @@ pub(crate) fn write_was_not_executed(error: &Error) -> bool {
             | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_UNAVAILABLE
             | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED
             | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_IO
+            | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_CHECKSUM
     )
 }
 
