@@ -25,7 +25,11 @@ pub(crate) struct VerifiedRangeCopy {
 }
 
 impl PinnedChunkReader {
-    fn crc_ranges(&self, ranges: &[VerifiedRangeCopy], out: &mut [u8]) -> Result<Vec<usize>> {
+    pub(super) fn crc_ranges(
+        &self,
+        ranges: &[VerifiedRangeCopy],
+        out: &mut [u8],
+    ) -> Result<Vec<usize>> {
         self.crc_ranges_with_body_check(ranges, out, self.verify_crc_body)
     }
 

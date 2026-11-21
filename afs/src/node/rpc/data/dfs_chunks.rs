@@ -385,7 +385,7 @@ impl DfsChunks for DfsChunksService {
                 .authorize_replica(peer, header.clone(), deadline)
                 .await?;
             let admission = self.admit_replica(deadline, &grant).await?;
-            let identity = super::super::control::PeerSessionIdentity::new(
+            let identity = self.rdma_sessions.dfs_session_identity(
                 if grant.op.target_index == 0 {
                     grant.op.initiator_node_id.clone()
                 } else {
@@ -394,6 +394,7 @@ impl DfsChunks for DfsChunksService {
                         .clone()
                 },
                 replica_sender_epoch(&grant.op).map_err(error_to_status)?,
+                &request.server_generation,
             )?;
             let session = self
                 .rdma_sessions
@@ -551,7 +552,14 @@ impl DfsChunks for DfsChunksService {
         .await
         .map_err(|error| Status::internal(error.to_string()))?
         .map_err(error_to_status)?;
-        let identity = super::super::control::PeerSessionIdentity::new(peer, epoch)?;
+        let server_generation = if request.bind_server_generation {
+            self.rdma_sessions.dfs_generation().to_vec()
+        } else {
+            Vec::new()
+        };
+        let identity = self
+            .rdma_sessions
+            .dfs_session_identity(peer, epoch, &server_generation)?;
         let negotiated = super::super::control::negotiate_for_peer(
             &self.rdma_sessions,
             identity,
@@ -563,12 +571,23 @@ impl DfsChunks for DfsChunksService {
         )
         .await?
         .into_inner();
+        if negotiated.rdma_supported && server_generation.is_empty() {
+            afs_logging::warn!(
+                "dfs.rdma_legacy_session_accepted";
+                "session_id" => negotiated.session_id
+            );
+        }
         Ok(Response::new(DfsNegotiateRdmaReply {
             session_id: negotiated.session_id,
             server_info: negotiated.server_info,
             capacity: negotiated.capacity,
             rdma_supported: negotiated.rdma_supported,
             handshake_version: negotiated.handshake_version,
+            server_generation: if negotiated.rdma_supported {
+                server_generation
+            } else {
+                Vec::new()
+            },
         }))
     }
 
@@ -578,8 +597,11 @@ impl DfsChunks for DfsChunksService {
     ) -> Result<Response<DfsCloseRdmaReply>, Status> {
         let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
         let request = request.into_inner();
-        let identity =
-            super::super::control::PeerSessionIdentity::new(peer, request.peer_node_epoch)?;
+        let identity = self.rdma_sessions.dfs_session_identity(
+            peer,
+            request.peer_node_epoch,
+            &request.server_generation,
+        )?;
         self.rdma_sessions
             .close_for(request.session_id, &identity)
             .await?;
@@ -623,7 +645,11 @@ impl DfsChunks for DfsChunksService {
                 .ok_or_else(|| Status::permission_denied("DFS RDMA grant is absent"))?
                 .caller_node_id
                 .clone();
-            let identity = super::super::control::PeerSessionIdentity::new(caller, epoch)?;
+            let identity = self.rdma_sessions.dfs_session_identity(
+                caller,
+                epoch,
+                &request.server_generation,
+            )?;
             let session = self
                 .rdma_sessions
                 .session_for(request.rdma_session_id, &identity)

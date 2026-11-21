@@ -300,6 +300,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `fs` | 产品差异 | 两者 | 全部已编译后端 | `ownerfs`、`dfs` 或 `all`；`--print-config` 把它展开成 `ownerfs`、`dfs` 两个布尔值 |
 | `data_mode` | 产品差异 | Node | `grpc` | Node 间数据通道：`grpc`、`rdma` 或 `auto`；`rdma` 需要编译 `rdma` feature |
 | `rdma_device` | 产品差异 | Node | 无 | RDMA 设备名；OwnerFs 的 `rdma` 模式必填 |
+| `dfs_rdma_require_server_generation` | 产品差异 | Node | `false` | DFS RDMA 强围栏。开启后拒绝旧客户端请求和旧服务端返回的空代际会话。滚动升级期间允许兼容会话时，留意服务端重启后的旧会话 ID 复用风险及 `afs_dfs_rdma_unbound_sessions`、`afs_dfs_rdma_unbound_server_replies_total` |
 | `data_dir` | 产品差异 | 两者 | `/tmp/afs-<id>/data` | 数据目录，必须是绝对路径；默认值只适合临时运行 |
 | `ownerfs_data_dir` | 产品差异 | Node | `<data_dir>/ownerfs` | OwnerFs 存储根：workspace 数据目录、catalog 与 trash 都在这一层。必须是绝对路径；纳管既有数据时指向这些目录的父目录；非 Node 或未启用 OwnerFs 时写在配置里会启动失败 |
 | `uds_path` | 产品差异 | Node | `/tmp/afs-<id>/local.sock` | Local SDK 的 Unix socket 路径 |

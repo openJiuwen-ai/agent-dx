@@ -143,7 +143,11 @@ pub(super) async fn run_node(
     );
     #[cfg(feature = "dfs")]
     backends.dfs.connectors.start().await?;
-    background::RestServer::new(ingress.rest, state.clone(), connector_routes).start(&mut services);
+    let rest_routes = crate::node::api::rest::router(state.clone());
+    #[cfg(all(feature = "dfs", feature = "rdma"))]
+    let rest_routes = rest_routes.layer(axum::Extension(endpoints.sessions.clone()));
+    background::RestServer::new(ingress.rest, rest_routes.merge(connector_routes))
+        .start(&mut services);
     #[cfg(feature = "ownerfs")]
     if let Some(listener) = ingress.workspace {
         let control = backends.ownerfs.outlet_control.as_ref().ok_or_else(|| {

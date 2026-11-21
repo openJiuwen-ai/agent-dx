@@ -558,22 +558,12 @@ fn owner_presented_access_for(
 }
 
 #[cfg(feature = "rdma")]
-fn owner_fixture_file_path(fixture: &OwnerRdmaFixture, file_name: &str) -> std::path::PathBuf {
-    fixture
-        ._temp
-        .path()
-        .join(format!("{}-e{}", fixture.grant.id.0, fixture.grant.epoch))
-        .join(file_name)
-}
-
-#[cfg(feature = "rdma")]
-fn assert_owner_deadline(error: &afs_error::Error) {
+fn assert_owner_unknown_write_deadline(error: &afs_error::Error) {
+    assert_eq!(error.code(), afs_error::NODE_OWNER_WRITE_UNKNOWN);
+    let message = error.message().to_ascii_lowercase();
     assert!(
-        error.kind() == afs_error::ErrorKind::DeadlineExceeded
-            || (error.code() == afs_error::CLIENT_REMOTE_STATUS
-                && error.kind() == afs_error::ErrorKind::Cancelled
-                && error.message() == "Timeout expired"),
-        "posted OwnerPeerClient write must fail with the request deadline, got {error:?}"
+        message.contains("deadline") || message.contains("timeout"),
+        "unknown OwnerPeerClient write must preserve the underlying deadline, got {error:?}"
     );
 }
 
@@ -1627,7 +1617,7 @@ async fn ownerpeerclient_posted_rdma_deadline_has_unknown_outcome() {
     let root_name = "job-owner-deadline";
     let file_name = "posted-deadline.bin";
     let fixture = owner_rdma_fixture(Some(device.clone()), root_name).await;
-    let file_path = owner_fixture_file_path(&fixture, file_name);
+    let file_path = fixture._temp.path().join(root_name).join(file_name);
     let payload = owner_payload(4096);
     let write = tokio::task::spawn_blocking({
         let channel = fixture.channel.clone();
@@ -1691,7 +1681,7 @@ async fn ownerpeerclient_posted_rdma_deadline_has_unknown_outcome() {
         .unwrap(),
     )
     .expect("save the actual framework deadline classification");
-    assert_owner_deadline(&error);
+    assert_owner_unknown_write_deadline(&error);
     wait_for_owner_rdma_lookup_stale(&fixture.rdma_registry, 1, &identity).await;
     {
         let endpoint = retained_endpoint
@@ -1720,7 +1710,7 @@ async fn ownerpeerclient_posted_rdma_deadline_has_unknown_outcome() {
     );
     save_rdma_resources(&checkpoint, "closed-paused");
     eprintln!(
-        "AFS_OWNER_DEADLINE caller=TIMEOUT lookup=STALE server=RETAINED file=EMPTY replay=ABSENT"
+        "AFS_OWNER_DEADLINE caller=UNKNOWN lookup=STALE server=RETAINED file=EMPTY replay=ABSENT"
     );
 
     std::fs::write(checkpoint.join("resume"), b"resume").expect("resume native worker");

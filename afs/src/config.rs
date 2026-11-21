@@ -409,6 +409,9 @@ pub struct Cli {
     pub data_mode: Option<DataMode>,
     #[arg(long)]
     pub rdma_device: Option<String>,
+    /// Reject DFS RDMA sessions without a server generation (default false).
+    #[arg(long)]
+    pub dfs_rdma_require_server_generation: Option<bool>,
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
     /// OwnerFs storage root: holds workspace directories plus the private
@@ -664,6 +667,7 @@ struct FileConfig {
     fs: Option<String>,
     data_mode: Option<DataMode>,
     rdma_device: Option<String>,
+    dfs_rdma_require_server_generation: Option<bool>,
     data_dir: Option<PathBuf>,
     ownerfs_data_dir: Option<PathBuf>,
     uds_path: Option<PathBuf>,
@@ -808,6 +812,7 @@ pub struct Config {
     pub dfs: bool,
     pub data_mode: DataMode,
     pub rdma_device: Option<String>,
+    pub dfs_rdma_require_server_generation: bool,
     pub data_dir: PathBuf,
     pub ownerfs_data_dir: PathBuf,
     pub uds_path: PathBuf,
@@ -1024,6 +1029,10 @@ impl Config {
             dfs,
             data_mode,
             rdma_device: cli.rdma_device.or(file.rdma_device),
+            dfs_rdma_require_server_generation: cli
+                .dfs_rdma_require_server_generation
+                .or(file.dfs_rdma_require_server_generation)
+                .unwrap_or(false),
             ownerfs_mount: cli.ownerfs_mount.or(file.ownerfs_mount),
             experimental_ownerfs_workspace_bind: cli
                 .experimental_ownerfs_workspace_bind
@@ -1136,6 +1145,37 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod certificate_tests {
     use super::*;
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn dfs_rdma_generation_requirement_defaults_to_compatible_and_accepts_overrides() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        std::fs::write(path, "fs = 'dfs'\n").unwrap();
+        let config =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--config", path])).unwrap();
+        assert!(!config.dfs_rdma_require_server_generation);
+        std::fs::write(
+            path,
+            "fs = 'dfs'\ndfs_rdma_require_server_generation = true\n",
+        )
+        .unwrap();
+        let config =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--config", path])).unwrap();
+        assert!(config.dfs_rdma_require_server_generation);
+        let cli = Cli::parse_from([
+            "afs-node",
+            "--config",
+            path,
+            "--dfs-rdma-require-server-generation",
+            "false",
+        ]);
+        assert!(
+            !Config::resolve(Role::Node, cli)
+                .unwrap()
+                .dfs_rdma_require_server_generation
+        );
+    }
 
     #[cfg(feature = "dfs")]
     #[test]

@@ -179,9 +179,15 @@ impl DfsAssembly {
                 dfs_rdma_startup_device(dfs_data_mode, cfg.rdma_device.as_deref())?
             {
                 let peers = peer_connections.clone();
+                let require_server_generation = cfg.dfs_rdma_require_server_generation;
                 Some(Arc::new(
                     crate::node::bridge::spawn_blocking(move || {
-                        rpc::peer::DfsRdmaPool::new(peers, device, timeout)
+                        rpc::peer::DfsRdmaPool::new_with_generation_requirement(
+                            peers,
+                            device,
+                            timeout,
+                            require_server_generation,
+                        )
                     })
                     .await??,
                 ))

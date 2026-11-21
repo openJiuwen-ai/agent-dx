@@ -145,6 +145,7 @@ message DfsPutReplicaRdmaRequest {
   uint64 length = 4;
   uint64 chunk_offset = 5;
   string staging_id = 6;
+  bytes server_generation = 7;
 }
 
 message DfsNegotiateRdmaRequest {
@@ -155,6 +156,8 @@ message DfsNegotiateRdmaRequest {
     DfsPutReplicaHeader replica_header = 4;
     DfsReadRangesRequest read_request = 5;
   }
+  // This caller can echo the server generation on each session command.
+  bool bind_server_generation = 6;
 }
 
 message DfsNegotiateRdmaReply {
@@ -163,11 +166,14 @@ message DfsNegotiateRdmaReply {
   uint32 capacity = 3;
   bool rdma_supported = 4;
   uint32 handshake_version = 5;
+  // Empty for legacy or unsupported negotiations.
+  bytes server_generation = 6;
 }
 
 message DfsCloseRdmaRequest {
   uint64 session_id = 1;
   uint64 peer_node_epoch = 2;
+  bytes server_generation = 3;
 }
 
 message DfsCloseRdmaReply {}
@@ -175,6 +181,7 @@ message DfsCloseRdmaReply {}
 message DfsReadRangesRdmaRequest {
   DfsReadRangesRequest request = 1;
   uint64 rdma_session_id = 2;
+  bytes server_generation = 3;
 }
 
 message DfsReadRangesRdmaReply {

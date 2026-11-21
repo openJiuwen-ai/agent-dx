@@ -125,6 +125,12 @@ afs-lint:
 afs-all-features-lint:
 	@command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libibverbs || { echo 'ADX_AFS_ALL_FEATURES=1 requires libibverbs development files' >&2; exit 2; }
 	$(CARGO) clippy --locked $(AFS_PACKAGES) --all-features --all-targets -j $(JOBS) -- -D warnings
+	$(MAKE) afs-native-rdma-test
+.PHONY: afs-native-rdma-test
+afs-native-rdma-test:
+	mkdir -p "$(OUT)/afs-check"
+	$(CC) -Wall -Wextra -Werror afs/crates/transport/native/tests/retirement.c $$(pkg-config --cflags --libs libibverbs) -o "$(OUT)/afs-check/rdma-retirement"
+	"$(OUT)/afs-check/rdma-retirement"
 afs-test:
 	$(CARGO) test --locked $(AFS_PACKAGES) --all-targets -j $(JOBS) -- --test-threads=$(JOBS)
 scheduler-bench:
