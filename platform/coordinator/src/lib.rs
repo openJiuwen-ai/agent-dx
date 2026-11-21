@@ -8,13 +8,16 @@ pub use adx_core::snapshots;
 pub mod auth;
 pub mod autoscaling;
 mod journal;
+pub mod lease;
 pub mod metrics;
 mod queue;
+pub mod readiness;
 #[cfg(test)]
 mod recovery_tests;
 pub mod routes;
 pub mod rpc;
 mod shard;
+pub mod standby;
 pub mod storage;
 
 use adx_core::{Assignment, EnvironmentSpec, Error, Result};

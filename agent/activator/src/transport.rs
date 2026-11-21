@@ -72,6 +72,32 @@ impl HttpEnvironment {
         })
     }
 
+    /// Initialization check for admission readiness: the API Server answered
+    /// its readiness probe on the management origin. This is a startup gate
+    /// only — after initialization, API Server outages are runtime failures
+    /// surfaced by individual requests (the readiness flag never flips back,
+    /// so a shared-dependency outage cannot pull every Activator replica out
+    /// of selection at once).
+    pub async fn reachable(&self) -> Result<(), EnvironmentError> {
+        let url = self
+            .base
+            .join("/readyz")
+            .map_err(|_| EnvironmentError::Invalid("invalid API Server URL".into()))?;
+        let response = self
+            .client
+            .get(url)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|_| EnvironmentError::Unavailable("API Server connection failed".into()))?;
+        if !response.status().is_success() {
+            return Err(EnvironmentError::Unavailable(
+                "API Server is not ready".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn volume_request(
         &self,
         tenant: &str,

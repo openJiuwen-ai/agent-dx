@@ -168,7 +168,13 @@ async fn private_metrics_and_latest_impact_are_collected_by_prometheus() {
     let rpc = coordinator(&store).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(adx_coordinator::metrics::serve(listener, rpc.clone()));
+    let lease = adx_coordinator::lease::CoordinatorLease::new(
+        &redis.url,
+        "observability-test",
+        std::time::Duration::from_secs(3),
+    )
+    .unwrap();
+    let server = tokio::spawn(adx_coordinator::metrics::serve(listener, rpc.clone(), lease));
     let mut collector = prometheus::Collector::start("coordinator", address).await;
     collector
         .wait_value(

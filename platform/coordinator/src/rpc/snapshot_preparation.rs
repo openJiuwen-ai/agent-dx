@@ -236,6 +236,7 @@ impl CoordinatorRpc {
         StoredEnvironment,
         pb::node_service_client::NodeServiceClient<adx_transport::rpc::RpcChannel>,
         String,
+        u64,
     )> {
         let session = self.preparation_session().await?;
         let stored = session.get(environment).await?;
@@ -279,15 +280,17 @@ impl CoordinatorRpc {
             stored,
             pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel)),
             session_id,
+            session.epoch(),
         ))
     }
 
     async fn preparation_delete_seed(&self, spec: &EnvironmentSpec) -> Result<()> {
-        let (stored, mut node, node_session_id) = match self.preparation_node(&spec.id).await {
-            Ok(value) => value,
-            Err(Error::NotFound) => return Ok(()),
-            Err(error) => return Err(error),
-        };
+        let (stored, mut node, node_session_id, coordinator_epoch) =
+            match self.preparation_node(&spec.id).await {
+                Ok(value) => value,
+                Err(Error::NotFound) => return Ok(()),
+                Err(error) => return Err(error),
+            };
         if !preparation_seed_matches(spec, &stored.spec) {
             return Err(Error::Conflict);
         }
@@ -307,6 +310,7 @@ impl CoordinatorRpc {
                 }),
                 node_session_id: node_session_id.clone(),
                 expected_revision: Some(record.revision),
+                coordinator_epoch,
                 ..Default::default()
             }))
             .await
@@ -355,7 +359,8 @@ impl CoordinatorRpc {
         let expected_revision = build.expected_revision.ok_or_else(|| {
             Error::Invalid("snapshot preparation source revision is required".into())
         })?;
-        let (stored, mut node, node_session_id) = self.preparation_node(&spec.id).await?;
+        let (stored, mut node, node_session_id, coordinator_epoch) =
+            self.preparation_node(&spec.id).await?;
         if !preparation_seed_matches(spec, &stored.spec) {
             return Err(Error::Conflict);
         }
@@ -372,6 +377,7 @@ impl CoordinatorRpc {
                 names: vec![template.name.clone()],
                 timeout_seconds: 300,
                 kind: pb::SnapshotKind::Golden as i32,
+                coordinator_epoch,
             }))
             .await;
         match captured {

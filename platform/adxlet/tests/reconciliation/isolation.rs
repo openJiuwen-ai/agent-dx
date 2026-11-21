@@ -156,6 +156,7 @@ async fn recovery_limits_new_allocations_without_blocking_healthy_control_or_hol
             administrator: false,
         }),
         node_session_id: "session".into(),
+        coordinator_epoch: 0,
     });
     request
         .metadata_mut()

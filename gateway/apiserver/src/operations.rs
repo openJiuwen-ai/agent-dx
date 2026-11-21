@@ -341,6 +341,9 @@ impl Operations {
                                 node_session_id: String::new(),
                                 assignment,
                                 caller: caller_context,
+                                // API Server commands are not Coordinator-primary
+                                // commands; the node fences only Coordinator calls.
+                                coordinator_epoch: 0,
                             })),
                         )
                         .await
@@ -380,6 +383,9 @@ impl Operations {
                             },
                             timeout_seconds: seconds,
                             kind: pb::SnapshotKind::Regular as i32,
+                            // API Server commands are not Coordinator-primary
+                            // commands; the node fences only Coordinator calls.
+                            coordinator_epoch: 0,
                         })),
                     )
                     .await

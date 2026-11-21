@@ -26,7 +26,7 @@ use crate::{
 use adx_core::{EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Result};
 use adx_protocol::{
     auth::{tenant, Peers, Principal},
-    control as pb, status,
+    control as pb, not_accepted, status,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -53,6 +53,13 @@ impl TryFrom<&StoredEnvironment> for pb::EnvironmentRecord {
     }
 }
 
+/// relay-01: consecutive failed liveness probes before an unconfirmed
+/// recovered node is declared lost.
+const DEFAULT_UNCONFIRMED_PROBE_FAILURES: u32 = 3;
+/// relay-01: hard cap on retaining an unconfirmed recovered node's Env
+/// ownership, measured from process start.
+const DEFAULT_UNCONFIRMED_RETENTION: Duration = Duration::from_secs(600);
+
 struct LiveNode {
     expired: bool,
     session: String,
@@ -60,6 +67,16 @@ struct LiveNode {
     last_seen: tokio::time::Instant,
     inspected: bool,
     report: pb::RegisterNodeRequest,
+}
+
+/// A restored node that has not registered with this process yet. Heartbeat
+/// timestamps cannot survive a Coordinator restart, so its silence measures
+/// nothing (relay-01): ownership is retained until the node registers, a
+/// liveness probe rules it lost, or the retention cap expires.
+#[derive(Clone, Copy)]
+struct RecoveryWatch {
+    since: tokio::time::Instant,
+    probe_failures: u32,
 }
 
 fn confirmed_create_failure(status: &Status) -> bool {
@@ -87,7 +104,7 @@ struct State {
     collection_cursor: Option<String>,
     checkpoint_cleanup_cursor: Option<String>,
     live: BTreeMap<String, LiveNode>,
-    recovering: BTreeMap<String, tokio::time::Instant>,
+    recovering: BTreeMap<String, RecoveryWatch>,
     retired_sessions: BTreeSet<(String, String)>,
     scheduling_deadlines: BTreeMap<String, tokio::time::Instant>,
     // Local ownership CAS batches run outside the state lock. Cancellation must
@@ -208,14 +225,19 @@ impl State {
         }
         self.environments.insert(id, stored);
     }
-    fn overdue(&self, id: &str, timeout: Duration) -> bool {
+    /// A node that registered during this process's life and then went
+    /// silent: its silence is evidence, exactly as before relay-01.
+    fn heartbeat_expired(&self, id: &str, timeout: Duration) -> bool {
         self.live
             .get(id)
             .is_some_and(|live| !live.expired && live.last_seen.elapsed() >= timeout)
-            || self
-                .recovering
-                .get(id)
-                .is_some_and(|since| since.elapsed() >= timeout)
+    }
+    /// A restored node whose registration grace has passed. It is
+    /// unconfirmed, not lost: its stored heartbeat predates this process.
+    fn unconfirmed(&self, id: &str, grace: Duration) -> bool {
+        self.recovering
+            .get(id)
+            .is_some_and(|watch| watch.since.elapsed() >= grace)
     }
     fn healthy(&self) -> Result<()> {
         if self.needs_recovery {
@@ -461,10 +483,13 @@ struct Inner {
     claim_sender: mpsc::Sender<PendingClaim>,
     changed: Notify,
     closing: watch::Sender<bool>,
+    draining: watch::Sender<bool>,
     peers: Peers,
     node_tls: RpcClient,
     timeout: Duration,
     heartbeat_timeout: Duration,
+    unconfirmed_probe_failures: u32,
+    unconfirmed_retention: Duration,
 }
 
 async fn current_registration_control(
@@ -588,13 +613,15 @@ impl CoordinatorRpc {
         node_tls: impl Into<RpcClient>,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::with_heartbeat_timeout(
+        Self::with_node_recovery_limits(
             session,
             placement,
             peers,
             node_tls,
             timeout,
             Duration::from_secs(30),
+            DEFAULT_UNCONFIRMED_PROBE_FAILURES,
+            DEFAULT_UNCONFIRMED_RETENTION,
         )
         .await
     }
@@ -606,6 +633,32 @@ impl CoordinatorRpc {
         timeout: Duration,
         heartbeat_timeout: Duration,
     ) -> Result<Self> {
+        Self::with_node_recovery_limits(
+            session,
+            placement,
+            peers,
+            node_tls,
+            timeout,
+            heartbeat_timeout,
+            DEFAULT_UNCONFIRMED_PROBE_FAILURES,
+            DEFAULT_UNCONFIRMED_RETENTION,
+        )
+        .await
+    }
+    /// `unconfirmed_probe_failures` consecutive failed liveness probes
+    /// declare a recovered node that never re-registered lost;
+    /// `unconfirmed_retention` is the hard cap on retaining its ownership,
+    /// measured from process start. Both bound the relay-01 retention state.
+    pub async fn with_node_recovery_limits(
+        session: Session,
+        placement: Placement,
+        peers: Peers,
+        node_tls: impl Into<RpcClient>,
+        timeout: Duration,
+        heartbeat_timeout: Duration,
+        unconfirmed_probe_failures: u32,
+        unconfirmed_retention: Duration,
+    ) -> Result<Self> {
         Box::pin(Self::with_heartbeat_timeout_inner(
             session,
             placement,
@@ -613,6 +666,8 @@ impl CoordinatorRpc {
             node_tls.into(),
             timeout,
             heartbeat_timeout,
+            unconfirmed_probe_failures,
+            unconfirmed_retention,
         ))
         .await
     }
@@ -624,11 +679,19 @@ impl CoordinatorRpc {
         node_tls: RpcClient,
         timeout: Duration,
         heartbeat_timeout: Duration,
+        unconfirmed_probe_failures: u32,
+        unconfirmed_retention: Duration,
     ) -> Result<Self> {
         if timeout.is_zero() || heartbeat_timeout.is_zero() {
             return Err(Error::Invalid("RPC timeout must be positive".into()));
         }
-        let mut saved = session.snapshot().await?;
+        if unconfirmed_probe_failures == 0 || unconfirmed_retention <= heartbeat_timeout {
+            return Err(Error::Invalid(
+                "unconfirmed node retention requires positive probe failures and a cap beyond the heartbeat timeout"
+                    .into(),
+            ));
+        }
+        let saved = session.snapshot().await?;
         session.refresh_inspection_inventory().await?;
         // The pending queues are intentionally memory-only. Release their old
         // source pins after a new Coordinator epoch has fenced all previous writers.
@@ -641,29 +704,17 @@ impl CoordinatorRpc {
                 }
             }
         }
-        // Persist unreachability before exposing a recovered routing snapshot.
-        for node in saved.nodes.values_mut() {
-            node.node.available = false;
-            node.session
-                .get_or_insert(NodeSession {
-                    id: String::new(),
-                    sequence: 0,
-                    routable: false,
-                })
-                .routable = false;
-            if node.retirement.as_ref().is_some_and(|r| r.unregistered) {
-                continue;
-            }
-            *node = session
-                .register_session_with_scopes(
-                    node.node.clone(),
-                    node.address.clone(),
-                    node.proxy_address.clone(),
-                    node.session.clone(),
-                    node.checkpoint_scopes.clone(),
-                )
-                .await?;
-        }
+        // Handover preserves valid routes: stored node sessions keep their
+        // identity, sequence, and routability, so `Snapshot::routes()` stays
+        // non-empty and Ingress keeps forwarding through the primary change.
+        // A node that did not restart continues under its stored session
+        // (see `register_node`); a node that actually restarts registers a
+        // new session id and reconciles as before. Monotonic heartbeat
+        // timestamps cannot survive a process restart, so every recovered
+        // node gets one bounded registration grace instead — and a node that
+        // stays silent past it becomes unconfirmed, not lost: ownership is
+        // retained until it registers, a liveness probe rules it lost, or
+        // the retention cap expires (see `expire_nodes`).
         let mut scheduler = Coordinator::restore(&saved, placement)?;
         scheduler.use_generation_source(session.clone());
         let specs = saved
@@ -671,10 +722,20 @@ impl CoordinatorRpc {
             .iter()
             .map(|(id, i)| (id.clone(), i.spec.clone()))
             .collect();
-        // Monotonic heartbeat timestamps cannot survive a process restart. Give
-        // recovered nodes one bounded registration grace, with routes kept closed.
         let now = tokio::time::Instant::now();
-        let recovering = saved.nodes.keys().map(|id| (id.clone(), now)).collect();
+        let recovering = saved
+            .nodes
+            .keys()
+            .map(|id| {
+                (
+                    id.clone(),
+                    RecoveryWatch {
+                        since: now,
+                        probe_failures: 0,
+                    },
+                )
+            })
+            .collect();
         let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
         let volume_changes = session.committed_changes();
@@ -735,10 +796,13 @@ impl CoordinatorRpc {
             claim_sender,
             changed: Notify::new(),
             closing: watch::channel(false).0,
+            draining: watch::channel(false).0,
             peers,
             node_tls,
             timeout,
             heartbeat_timeout,
+            unconfirmed_probe_failures,
+            unconfirmed_retention,
         }));
         let weak = Arc::downgrade(&service.0.business);
         let fenced = service.0.business_fenced.clone();
@@ -772,6 +836,27 @@ impl CoordinatorRpc {
     pub fn close_subscriptions(&self) {
         self.0.closing.send_replace(true);
     }
+    /// Stop admitting new mutating work (handover drain): in-flight
+    /// operations keep running and the lease keeps being renewed while they
+    /// finish, so the process stays primary — and its storage writes stay
+    /// authoritative — until it releases the lease.
+    pub fn begin_drain(&self) {
+        self.0.draining.send_replace(true);
+    }
+    /// Handover admission gate: while draining, new mutating operations are
+    /// rejected as a structured "not accepted" (guaranteed not enqueued, so
+    /// the same request may be retried against the next primary). Read
+    /// paths and already-admitted in-flight work stay served.
+    #[allow(clippy::result_large_err)] // Preserve tonic Status at the RPC admission boundary.
+    fn admission(&self) -> std::result::Result<(), Status> {
+        if *self.0.draining.borrow() {
+            Err(not_accepted(
+                "Coordinator handover in progress; operation not accepted",
+            ))
+        } else {
+            Ok(())
+        }
+    }
 
     pub fn with_reclaimers(self, reclaimers: adx_checkpoint_storage::reclaim::Reclaimers) -> Self {
         *self
@@ -781,25 +866,111 @@ impl CoordinatorRpc {
             .expect("reclaimer registry lock poisoned") = reclaimers;
         self
     }
-    /// Invalidate expired executions and their routes before admitting a returning node.
+    /// Invalidate expired executions and their routes before admitting a
+    /// returning node. Driven by the binary's single maintenance loop. A
+    /// node registered under this process that goes silent expires exactly
+    /// as before, while a recovered node that has not re-registered is
+    /// unconfirmed, not lost (relay-01): its ownership is retained until it
+    /// registers, a liveness probe rules it lost, or the retention cap
+    /// expires.
     pub async fn expire_nodes(&self) -> Result<usize> {
-        let mut state = self.0.state.lock().await;
-        state.recover_authoritative_state().await?;
-        state.healthy()?;
-        let ids: Vec<_> = state
-            .nodes
-            .keys()
-            .filter(|id| state.overdue(id, self.0.heartbeat_timeout))
-            .cloned()
-            .collect();
-        for id in &ids {
-            let result = state.invalidate_node(id).await;
+        let mut invalidated = 0;
+        let unconfirmed: Vec<_> = {
+            let mut state = self.0.state.lock().await;
+            state.recover_authoritative_state().await?;
+            state.healthy()?;
+            let expired: Vec<_> = state
+                .nodes
+                .keys()
+                .filter(|id| state.heartbeat_expired(id, self.0.heartbeat_timeout))
+                .cloned()
+                .collect();
+            for id in &expired {
+                let result = state.invalidate_node(id).await;
+                self.0.changed.notify_waiters();
+                result?;
+            }
+            invalidated += expired.len();
+            state
+                .nodes
+                .iter()
+                .filter(|(id, node)| {
+                    node.session.is_some() && state.unconfirmed(id, self.0.heartbeat_timeout)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in unconfirmed {
+            let alive = self.probe_unconfirmed_node(&id).await;
+            let lost = {
+                // The node may have registered while the probe was in
+                // flight; retention then ended on its own.
+                let mut state = self.0.state.lock().await;
+                let Some(watch) = state.recovering.get_mut(&id) else {
+                    continue;
+                };
+                if alive {
+                    watch.probe_failures = 0;
+                } else {
+                    watch.probe_failures += 1;
+                }
+                (!alive && watch.probe_failures >= self.0.unconfirmed_probe_failures)
+                    || watch.since.elapsed() >= self.0.unconfirmed_retention
+            };
+            if !lost {
+                adx_observability::info!(
+                    "unconfirmed node {id} retained (probe alive={alive}); waiting for registration"
+                );
+                continue;
+            }
+            adx_observability::warn!(
+                "unconfirmed node {id} declared lost (probe alive={alive}); revoking ownership"
+            );
+            let mut state = self.0.state.lock().await;
+            // Re-check under the same lock: a registration that arrived
+            // after the probe must not be invalidated as lost.
+            if !state.recovering.contains_key(&id) {
+                continue;
+            }
+            let result = state.invalidate_node(&id).await;
             self.0.changed.notify_waiters();
             result?;
+            invalidated += 1;
         }
-        drop(state);
         self.expire_local_reservations().await?;
-        Ok(ids.len())
+        Ok(invalidated)
+    }
+
+    /// Liveness probe for an unconfirmed recovered node: the process at its
+    /// stored address must answer and identify as the same node. A restarted
+    /// node answers with a new session id; that is still the node, and its
+    /// registration reconciles the facts.
+    async fn probe_unconfirmed_node(&self, id: &str) -> bool {
+        let address = {
+            let state = self.0.state.lock().await;
+            match state.nodes.get(id) {
+                Some(node) if !node.address.is_empty() => node.address.clone(),
+                _ => return false,
+            }
+        };
+        let Ok(endpoint) = self.0.node_tls.endpoint(&address) else {
+            return false;
+        };
+        let Ok(channel) = endpoint
+            .connect_timeout(self.0.timeout)
+            .timeout(self.0.timeout)
+            .connect()
+            .await
+        else {
+            return false;
+        };
+        match pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
+            .get_session(pb::GetNodeSessionRequest {})
+            .await
+        {
+            Ok(actual) => actual.into_inner().node_id == id,
+            Err(_) => false,
+        }
     }
 
     async fn expire_local_reservations(&self) -> Result<()> {
@@ -1410,6 +1581,7 @@ impl CoordinatorRpc {
                     continue;
                 }
                 let snapshot = prepared_snapshot.clone();
+                let coordinator_epoch = state.session.epoch();
                 drop(state);
                 let endpoint = self
                     .0
@@ -1448,6 +1620,7 @@ impl CoordinatorRpc {
                         .clone(),
                     spec: Some(spec.clone().into()),
                     assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
+                    coordinator_epoch,
                 };
                 let mut request = adx_observability::trace::inject(request);
                 request.set_timeout(adx_transport::deadline::create_response_timeout(
@@ -1676,7 +1849,7 @@ impl CoordinatorRpc {
         state.recover_authoritative_state().await?;
         state.healthy()?;
         let id = &record.assignment.node_id;
-        if state.overdue(id, self.0.heartbeat_timeout) {
+        if state.heartbeat_expired(id, self.0.heartbeat_timeout) {
             let result = state.invalidate_node(id).await;
             self.0.changed.notify_waiters();
             result?;
@@ -1910,6 +2083,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::GetEnvironmentRequest>,
     ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
+        self.admission()?;
         if self.0.peers.authenticate(&request)? != Principal::ApiServer {
             return Err(Status::permission_denied("API Server required"));
         }
@@ -1921,6 +2095,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::EnsureRunningRequest>,
     ) -> std::result::Result<Response<pb::GetEnvironmentResponse>, Status> {
+        self.admission()?;
         if !matches!(
             self.0.peers.authenticate(&request)?,
             Principal::ApiServer | Principal::Ingress
@@ -2070,6 +2245,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::SetNodeSchedulingRequest>,
     ) -> std::result::Result<Response<pb::NodeSchedulingState>, Status> {
+        self.admission()?;
         let r = request.into_inner();
         if r.node_id.trim().is_empty() {
             return Err(Status::invalid_argument("node_id required"));
@@ -2118,6 +2294,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::LocalEnvironmentCreateRequest>,
     ) -> std::result::Result<Response<pb::PreparedEnvironment>, Status> {
+        self.admission()?;
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Adxlet required"));
         };
@@ -2131,6 +2308,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
     ) -> std::result::Result<Response<pb::ClaimEnvironmentResponse>, Status> {
         let trace =
             adx_observability::trace::Trace::rpc("coordinator.reserve_local_environment", &request);
+        self.admission()?;
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Adxlet required"));
         };
@@ -2150,6 +2328,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         request: Request<pb::ClaimEnvironmentRequest>,
     ) -> std::result::Result<Response<pb::ClaimEnvironmentResponse>, Status> {
         let trace = adx_observability::trace::Trace::rpc("coordinator.claim_environment", &request);
+        self.admission()?;
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Adxlet required"));
         };
@@ -2169,6 +2348,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         request: Request<pb::LocalEnvironmentCreateRequest>,
     ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
         let trace = adx_observability::trace::Trace::rpc("coordinator.forward_create", &request);
+        self.admission()?;
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Adxlet required"));
         };
@@ -2310,6 +2490,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::UnregisterNodeRequest>,
     ) -> std::result::Result<Response<pb::UnregisterNodeResponse>, Status> {
+        self.admission()?;
         // Once accepted, complete the ownership transition even if the
         // departing process disconnects or its bounded wait expires.
         let service = self.clone();
@@ -2322,6 +2503,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::RegisterNodeRequest>,
     ) -> std::result::Result<Response<pb::RegisterNodeResponse>, Status> {
+        self.admission()?;
         // Periodic registration/heartbeats do not create request traces.
         let principal = self.0.peers.authenticate(&request)?;
         let r = request.into_inner();
@@ -2370,7 +2552,11 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             {
                 return Err(Status::failed_precondition("retired node session"));
             }
-            if state.overdue(&r.node_id, service.0.heartbeat_timeout) {
+            // A node registered under this process that went silent and is
+            // now returning still invalidates on arrival. A recovered node
+            // registering late is the confirmation itself (relay-01): its
+            // registration and reconciliation decide the facts.
+            if state.heartbeat_expired(&r.node_id, service.0.heartbeat_timeout) {
                 let result = state.invalidate_node(&r.node_id).await;
                 service.0.changed.notify_waiters();
                 result.map_err(status)?;
@@ -2412,6 +2598,61 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     return Err(Status::failed_precondition(
                         "another node process is still registered",
                     ));
+                }
+            } else if let Some(stored) = state
+                .nodes
+                .get(&r.node_id)
+                .and_then(|node| node.session.as_ref())
+                .filter(|session| session.routable && session.id == r.session_id)
+            {
+                // Continuation through a primary change: no live entry yet,
+                // but the stored session is this same node process in good
+                // standing. The monotonic sequence under the same session
+                // identity proves the node never restarted, so it continues
+                // serving without a full reconciliation — the Redis record is
+                // authoritative and routes stay open through the handover.
+                match r.heartbeat_sequence.cmp(&stored.sequence) {
+                    std::cmp::Ordering::Greater => inspected = true,
+                    std::cmp::Ordering::Equal => {
+                        // A retry of the report whose registration was
+                        // already persisted (the reply was lost across the
+                        // primary change): answer from the stored record
+                        // without writing — but rebuild the in-memory
+                        // heartbeat entry, so inspection and heartbeat
+                        // supervision on this primary treat the node as
+                        // live again instead of rejecting it until the next
+                        // heartbeat advances the sequence. The retried
+                        // answer carries the same registration upgrade
+                        // control a fresh registration would deliver.
+                        let shard_id = state.nodes[&r.node_id].shard_id as u32;
+                        let upgrade_control = current_registration_control(
+                            &state.session,
+                            &state.nodes[&r.node_id],
+                            &r,
+                        )
+                        .await
+                        .map_err(status)?;
+                        state.live.insert(
+                            r.node_id.clone(),
+                            LiveNode {
+                                expired: false,
+                                session: r.session_id.clone(),
+                                sequence: r.heartbeat_sequence,
+                                last_seen: tokio::time::Instant::now(),
+                                inspected: true,
+                                report: r.clone(),
+                            },
+                        );
+                        service.0.changed.notify_waiters();
+                        return Ok(Response::new(pb::RegisterNodeResponse {
+                            shard_id,
+                            coordinator_epoch: state.session.epoch(),
+                            upgrade_control,
+                        }));
+                    }
+                    std::cmp::Ordering::Less => {
+                        return Err(Status::failed_precondition("stale heartbeat"));
+                    }
                 }
             }
             if !r.reconciling && !inspected {
@@ -2522,6 +2763,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         }
         trace
             .run_result(async {
+                self.admission()?;
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("Frontend caller required"));
                 }
@@ -2598,6 +2840,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             adx_observability::trace::Trace::rpc("coordinator.commit_environment", &request);
         trace
             .run_result(async {
+                self.admission()?;
                 let principal = self.0.peers.authenticate(&request)?;
                 let r = request.into_inner();
                 let record: EnvironmentRecord = r

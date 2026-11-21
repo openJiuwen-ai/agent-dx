@@ -40,6 +40,22 @@ impl CoordinatorEndpoint {
     }
 }
 pub fn keys(namespace: &str) -> Result<(String, String)> {
+    validate_namespace(namespace)?;
+    Ok((
+        format!("adx:{{{namespace}}}:coordinator:v1"),
+        format!("adx:{{{namespace}}}:control:v1"),
+    ))
+}
+
+/// The Coordinator primary lease key in the same validated namespace. Holds
+/// the lease record that gates who may take a new epoch; see
+/// `adx_coordinator::lease`.
+pub fn lease_key(namespace: &str) -> Result<String> {
+    validate_namespace(namespace)?;
+    Ok(format!("adx:{{{namespace}}}:coordinator:lease"))
+}
+
+fn validate_namespace(namespace: &str) -> Result<()> {
     if namespace.is_empty()
         || namespace.len() > 128
         || !namespace
@@ -48,10 +64,7 @@ pub fn keys(namespace: &str) -> Result<(String, String)> {
     {
         return Err(Error::Invalid("invalid Redis namespace".into()));
     }
-    Ok((
-        format!("adx:{{{namespace}}}:coordinator:v1"),
-        format!("adx:{{{namespace}}}:control:v1"),
-    ))
+    Ok(())
 }
 #[derive(Clone)]
 pub struct RedisDiscovery {

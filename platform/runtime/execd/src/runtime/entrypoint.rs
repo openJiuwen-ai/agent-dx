@@ -399,6 +399,15 @@ fn start_from_environment(manager: Arc<Manager>) {
 
 fn apply_identity(command: &mut Command, identity: Option<Identity>) {
     if let Some(identity) = identity {
+        // SAFETY: reading the effective user and group IDs has no preconditions.
+        let (current_uid, current_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        if identity.uid == current_uid && identity.gid == current_gid {
+            // The requested identity is already the running one: applying it
+            // needs no privilege operations, and dropping supplementary
+            // groups through setgroups would fail with EPERM for a non-root
+            // caller that has nothing left to change.
+            return;
+        }
         // SAFETY: the closure runs in the child immediately before exec, captures owned identity
         // data whose pointers stay valid for the call, performs no access to parent-only state,
         // and converts every syscall failure into an aborted exec.

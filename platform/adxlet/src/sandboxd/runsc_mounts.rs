@@ -92,7 +92,10 @@ fn filesystem(source: &str) -> Result<Filesystem> {
     }
     // SAFETY: fstatfs returned success and initialized the statfs structure.
     let stat = unsafe { stat.assume_init() };
-    Ok(match stat.f_type {
+    // The libc crate binds f_type as u64 under musl and i64 under glibc;
+    // the SUPER_MAGIC constants stay i64 on both. The magic values are
+    // small positives, so the widening cast is lossless on either ABI.
+    Ok(match stat.f_type as i64 {
         libc::NFS_SUPER_MAGIC | libc::FUSE_SUPER_MAGIC => Filesystem::Remote,
         libc::AUTOFS_SUPER_MAGIC => Filesystem::Autofs,
         _ => Filesystem::Other,

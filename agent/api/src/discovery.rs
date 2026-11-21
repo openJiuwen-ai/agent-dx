@@ -5,7 +5,10 @@ use adx_agent_store::discovery::RedisRegistry;
 use serde::Deserialize;
 use std::{
     collections::BTreeSet,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 
@@ -47,6 +50,7 @@ pub(crate) fn validate_members(
 pub(crate) fn start(
     config: DiscoveryConfig,
     members: Arc<RwLock<Vec<ActivatorEndpoint>>>,
+    synced: Arc<AtomicBool>,
     allow_plaintext: bool,
 ) -> Result<tokio::task::JoinHandle<()>> {
     if !(1..=300).contains(&config.refresh_seconds) {
@@ -60,9 +64,36 @@ pub(crate) fn start(
     let runtime = tokio::runtime::Handle::try_current()
         .map_err(|_| Error::Invalid("discovery requires a Tokio runtime".into()))?;
     Ok(runtime.spawn(async move {
+        // Membership-change notifications let Ingress re-read promptly on
+        // register/unregister instead of waiting for the periodic refresh.
+        // The periodic interval below remains as a fallback for lost
+        // notifications and older Activators that do not publish.
+        let mut events = registry.events();
+        let mut events_open = true;
         loop {
             let snapshot = match registry.members().await {
-                Ok(snapshot) => validate_members(snapshot, allow_plaintext),
+                Ok(snapshot) => {
+                    // Latch the first successful read as the initialization
+                    // signal (admission readiness); an empty-but-successful
+                    // read counts — "no members" is a runtime state, not an
+                    // uninitialized one, and must not un-ready the Gateway.
+                    // A later invalid record is likewise a runtime condition:
+                    // the last membership is retained and requests fail
+                    // retryably, but readiness stays latched.
+                    synced.store(true, Ordering::Release);
+                    validate_members(
+                        // Selection filter: only ready-and-not-draining members
+                        // are addressable. Records without condition fields
+                        // (older Activators) deserialize as selectable, so mixed
+                        // versions interoperate during a rolling upgrade.
+                        snapshot
+                            .into_iter()
+                            .filter(|member| member.condition.selectable())
+                            .map(|member| member.endpoint)
+                            .collect(),
+                        allow_plaintext,
+                    )
+                }
                 Err(error) => Err(error.into()),
             };
             match snapshot {
@@ -79,7 +110,24 @@ pub(crate) fn start(
             // ±20% jitter prevents all Gateway replicas refreshing in lockstep.
             let entropy = uuid::Uuid::new_v4().as_u128();
             let jitter = u64::try_from(entropy % u128::from(refresh_ms * 2 / 5 + 1)).unwrap_or(0);
-            tokio::time::sleep(Duration::from_millis(refresh_ms * 4 / 5 + jitter)).await;
+            let period = Duration::from_millis(refresh_ms * 4 / 5 + jitter);
+            if events_open {
+                tokio::select! {
+                    _ = tokio::time::sleep(period) => {}
+                    recv = events.recv() => {
+                        // Some(()) -> fall through and refresh immediately.
+                        // None -> notification channel closed; fall back to the
+                        // periodic interval only (avoid busy-looping on a
+                        // closed receiver).
+                        if recv.is_none() {
+                            events_open = false;
+                            tokio::time::sleep(period).await;
+                        }
+                    }
+                }
+            } else {
+                tokio::time::sleep(period).await;
+            }
         }
     }))
 }

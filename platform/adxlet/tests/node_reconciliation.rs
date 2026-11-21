@@ -39,6 +39,20 @@ async fn shutdown_reports_keep_advancing_without_reopening_admission_or_unregist
 }
 
 #[tokio::test]
+async fn node_records_the_coordinator_epoch_from_authority_responses() {
+    let node = authority::manager(Arc::new(Runtime::default()));
+    let mut fixture = authority::Fixture::new().await;
+    fixture.authority.epoch.store(7, Ordering::SeqCst);
+    assert_eq!(node.observed_coordinator_epoch(), 0);
+    fixture.cycle(&node).await.unwrap();
+    assert_eq!(
+        node.observed_coordinator_epoch(),
+        7,
+        "RegisterNode and InspectNode responses must advance the node's epoch record"
+    );
+}
+
+#[tokio::test]
 async fn live_catalog_fetch_does_not_reject_or_wait_for_new_creation() {
     let node = authority::manager(Arc::new(Runtime::default()));
     let mut authority = authority::Fixture::new().await;

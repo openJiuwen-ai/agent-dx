@@ -111,6 +111,7 @@ impl CoordinatorRpc {
                         cleanup: Some(local.try_into()?),
                         node_session_id,
                         delegated: false,
+                        coordinator_epoch: session.epoch(),
                     })
                     .await
                     .map_err(adx_protocol::dependency_status)?
