@@ -19,6 +19,7 @@ COMMIT_ENV = 'AFS_E2E_BASELINE_COMMIT'
 TARGET = 'afs-component-upgrade-rollback'
 PROTOCOL_TARGET = 'afs-component-mixed-protocols'
 PROTOCOL_CASES_ENV = 'AFS_E2E_PROTOCOL_CASES'
+PROTOCOL_ADMISSION_ENV = 'AFS_E2E_PROTOCOL_ADMISSION'
 BASELINE_POD = 'afs-baseline-input'
 
 
@@ -116,9 +117,16 @@ def scenarios(component, checks):
             spec.loader.exec_module(runner)
             signal.signal(signal.SIGALRM, _timeout)
             if mixed:
-                selection = runner.selected_cases(os.getenv(PROTOCOL_CASES_ENV))
+                admission = os.getenv(PROTOCOL_ADMISSION_ENV)
+                requested = os.getenv(PROTOCOL_CASES_ENV)
+                if admission is not None and requested is not None:
+                    raise ValueError('choose the protocol matrix or one admission direction')
+                selection = (runner.selected_cases(requested) if admission is None
+                             else runner.admission_cases(admission))
                 expected = len(selection)
-                entries, cleanup_errors = runner.exercise(component.config, old_inputs, new_inputs, output, selection)
+                entries, cleanup_errors = runner.exercise(
+                    component.config, old_inputs, new_inputs, output, selection, admission=admission,
+                )
             else:
                 expected = 3
                 entries, cleanup_errors = runner.exercise(component.config, old_inputs, new_inputs, output)

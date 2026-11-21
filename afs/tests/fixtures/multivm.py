@@ -425,7 +425,7 @@ class Cluster:
             raise Blocked("staged artifact could not be placed: " + name + ": " + copied["stderr"][-300:])
         return channel.call("hash", path=destination)["sha256"]
 
-    def prepare(self, *, ownerfs_bind=True):
+    def prepare(self, *, ownerfs_bind=True, start_peers=True):
         infos = self.connect()
         identity = self.inputs(infos)
         binaries = list(identity["binaries"])
@@ -474,7 +474,8 @@ class Cluster:
                 self.bind = True
                 self._configs()
                 self.start("A")
-            self.start("B")
+            if start_peers:
+                self.start("B")
         else:
             self.python(
                 "A",
@@ -484,9 +485,13 @@ class Cluster:
                 self.gid,
                 owner=False,
             )
-            for role in self.roles[2:]:
-                self.start(role)
-        self.topology()
+            if start_peers:
+                for role in self.roles[2:]:
+                    self.start(role)
+        if start_peers:
+            self.topology()
+        else:
+            self.topology(roles=("A",))
         self.started = True
 
     def _tls(self):
@@ -695,8 +700,8 @@ class Cluster:
         for role in roles:
             self.start(role)
 
-    def topology(self):
-        for role in self.roles[1:]:
+    def topology(self, *, roles=None):
+        for role in self.roles[1:] if roles is None else roles:
             owner_bind = role == "A" and self.mode == "ownerfs" and self.bind
             path = self.workspace(role) if owner_bind else self.mount(role)
             try:

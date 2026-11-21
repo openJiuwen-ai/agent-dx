@@ -10,6 +10,7 @@ import uuid
 from fixtures.common import Blocked, Case, DfsProfile, write_json
 from fixtures.multivm import Cluster, NAMES, validate
 from suites.operations import peer_counter, permissions, wait_read
+from tools.protocol_admission import exercise_admission_lane
 from tools.version_switch import artifact_pair, install, owner_identity, run_phase, running_identity
 
 
@@ -41,6 +42,16 @@ def selected_cases(requested):
     if set(names) - available.keys() or len(set(names)) != len(names):
         raise ValueError('expected comma-separated distinct AFS protocol case IDs: ' + ', '.join(available))
     return {name: available[name] for name in names}
+
+
+def admission_cases(direction):
+    if direction not in ('old-meta', 'new-meta'):
+        raise ValueError('protocol admission direction must be old-meta or new-meta')
+    healthy = direction.split('-')[0]
+    return {
+        f'{mode}.protocol.admission.{direction}': (mode, operation, (healthy,) * 3)
+        for mode, operation in (('ownerfs', 'files'), ('dfs', 'replica'))
+    }
 
 
 class MixedCluster(Cluster):
@@ -179,7 +190,7 @@ def exercise_lane(cluster, operation, phases):
             run_phase(phases, 'permissions', lambda: permissions(cluster))
 
 
-def exercise(config, old_inputs, new_inputs, output, selection):
+def exercise(config, old_inputs, new_inputs, output, selection, *, admission=None):
     output.mkdir()
     old, new = artifact_pair(old_inputs, new_inputs)
     identities = {'old': old, 'new': new}
@@ -190,7 +201,9 @@ def exercise(config, old_inputs, new_inputs, output, selection):
     for name, (mode, operation, layout) in selection.items():
         case_output = output / name
         case_output.mkdir()
-        profile = DfsProfile(copies=2, replica_failure='strict') if operation == 'replica' else None
+        profile = None
+        if operation == 'replica':
+            profile = DfsProfile(copies=2, replica_failure='degrade' if admission else 'strict')
         case = Case(name, ('cluster-protocol',), mode, (), workloads[operation], profile=profile)
         validate(config, [case])
         cluster = MixedCluster(config, case_output, case, inputs, identities, layout)
@@ -201,7 +214,10 @@ def exercise(config, old_inputs, new_inputs, output, selection):
                        {role: identities[version] for role, version in cluster.role_versions.items()})
         signal.alarm(240)
         try:
-            exercise_lane(cluster, operation, phases)
+            if admission:
+                exercise_admission_lane(cluster, phases)
+            else:
+                exercise_lane(cluster, operation, phases)
             if all(p['status'] == 'passed' for p in phases.values()):
                 record['status'] = 'passed'
         except (InterruptedError, TimeoutError):
