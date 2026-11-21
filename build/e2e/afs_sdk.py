@@ -7,7 +7,9 @@ import json
 import os
 from pathlib import Path
 import shlex
+import sys
 import time
+from zipfile import ZipFile
 
 SDK_CASES = ('mount-identity', 'bidirectional-publish', 'permissions', 'readonly', 'remove', 'environment-cleanup')
 
@@ -47,6 +49,38 @@ def denied(instance, path, expected, write=False, uid=10000):
     ))
 
 
+def verify_client(expected):
+    """Prove imports came from the independently staged wheel, not the native SDK."""
+    import adx_environment
+
+    wheel = Path(expected['wheel'])
+    site = Path(expected['site']).resolve()
+    module = Path(adx_environment.__file__).resolve()
+    dist = importlib.metadata.distribution('adx-environment')
+    if (hashlib.sha256(wheel.read_bytes()).hexdigest() != expected['wheel_sha256']
+            or module != site / 'adx_environment/__init__.py'
+            or Path(dist.locate_file('')).resolve() != site
+            or dist.version != expected['version']):
+        raise ValueError('loaded client SDK differs from the independently pinned wheel')
+    if sorted(dist.requires or []) != expected['native_requirements']:
+        raise ValueError('client SDK dependency declarations differ from the prepared service venv')
+    verified = 0
+    with ZipFile(wheel) as archive:
+        for item in archive.namelist():
+            if not item.startswith('adx_environment/') or item.endswith('/'):
+                continue
+            installed = (site / item).resolve()
+            if not installed.is_relative_to(site / 'adx_environment'):
+                raise ValueError('wheel SDK module escapes its installed package')
+            if installed.read_bytes() != archive.read(item):
+                raise ValueError('installed SDK module differs from pinned wheel: ' + item)
+            verified += 1
+    if not verified:
+        raise ValueError('pinned wheel has no verified SDK modules')
+    result = {k: expected[k] for k in ('build_id', 'commit', 'version', 'wheel_sha256')}
+    return {**result, 'module': str(module), 'verified_sdk_files': verified}
+
+
 def run(connection, image, config, output):
     import adx_environment
     from adx_environment import Environment, Mount
@@ -58,7 +92,9 @@ def run(connection, image, config, output):
               'sdk_source': adx_environment.__file__, 'mounts': {}, 'versions': [],
               'full': config.get('full', False),
               'identity_mode': 'SDK default backend identity; commands explicitly drop workload UID/GID'}
-    if not str(Path(adx_environment.__file__).resolve()).startswith('/opt/adx/client/'):
+    if 'client' in config:
+        report['sdk_client'] = verify_client(config['client'])
+    elif not str(Path(adx_environment.__file__).resolve()).startswith('/opt/adx/client/'):
         raise ValueError('acceptance requires the installed candidate SDK')
     handles, killed = [], set()
     error = None
@@ -107,10 +143,11 @@ def run(connection, image, config, output):
                 data = bytes((i + generation) % 251 for i in range(16384))
                 write_synced(left, '/afs/published.bin', data)
                 actual = right.files.read('/afs/published.bin', format='bytes')
-                assert actual == data
+                assert actual == data, 'bidirectional-publish A→B bytes differ'
                 reverse = data[::-1]
                 write_synced(right, '/afs/reverse.bin', reverse)
-                assert left.files.read('/afs/reverse.bin', format='bytes') == reverse
+                observed_reverse = left.files.read('/afs/reverse.bin', format='bytes')
+                assert observed_reverse == reverse, 'bidirectional-publish B→A bytes differ'
                 report['versions'].append({'generation': generation, 'bytes': len(actual),
                                            'sha256': hashlib.sha256(actual).hexdigest()})
             left.files.write('/afs/sdk-api.bin', b'sdk-files-api\x00\xff')
@@ -208,7 +245,8 @@ def main():
     connection = ConnectionConfig(server_address='127.0.0.1:8443', token=(secrets / 'api-key').read_text().strip(),
                                   use_tls=True, verify_tls=True)
     report = run(connection, (secrets / 'image').read_text().strip(), json.loads(args.input.read_text()), args.output)
-    print(json.dumps(report), flush=True)
+    sys.stdout.write(json.dumps(report) + '\n')
+    sys.stdout.flush()
     return 0 if report['status'] == 'passed' else 1
 
 

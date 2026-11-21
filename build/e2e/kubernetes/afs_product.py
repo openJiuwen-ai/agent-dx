@@ -12,6 +12,7 @@ ROOT = HERE.parents[2]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 from afs_component import resources as component_resources
+from afs_sdk_compat import stage_client
 SDK_FULL_EXTRA = ('namespace-identity', 'truncate-visibility')
 SDK_CASES = ('mount-identity', 'bidirectional-publish', 'permissions', 'readonly', 'remove', 'environment-cleanup')
 
@@ -53,11 +54,14 @@ class Product:
         self.config = None
         self.active = None
         self.cleanup_errors = []
+        self.client = None
+        self.service = None
 
     def configure(self, package, pods, harness_commit):
         run = self.run
         if not package.get('with_afs'):
             raise ValueError('SDK-on-AFS requires an AFS ON candidate')
+        self.service = {'commit': package['commit'], 'pods': {}}
         run.sync_harness(harness_commit, package['commit'], package, nodes=['afs-m'])
         run.execute('afs-m', 'python3', '-B', '-m', 'unittest', 'discover',
                     '-s', '/opt/adx/e2e/afs-tests/runner_tests', '-v', timeout=180)
@@ -65,6 +69,10 @@ class Product:
                        'roles': {}, 'hosts': {}}
         for role, name in (('M', 'afs-m'), ('A', 'node1'), ('B', 'node2')):
             pod = next(p for p in pods if p['metadata']['name'] == name)
+            self.service['pods'][name] = {
+                'image': next(c['image'] for c in pod['spec']['containers'] if c['name'] == 'platform'),
+                'image_id': next(c['imageID'] for c in pod['status']['containerStatuses'] if c['name'] == 'platform'),
+            }
             ip = pod['status']['podIP']
             self.config['roles'][role] = {'host': role.lower(), 'address': ip}
             self.config['hosts'][role.lower()] = {
@@ -93,14 +101,32 @@ class Product:
 
     def sdk(self, config, destination):
         run = self.run
+        client = self.client
+        argv = ['/opt/adx/client/bin/python', '-B', '/opt/adx/e2e/afs_sdk.py']
+        if client:
+            config = {**config, 'client': client}
+            argv = ['env', 'PYTHONPATH=' + client['site'], *argv]
         run.execute('node1', 'python3', '-c',
                     'import pathlib,sys;pathlib.Path("/evidence/afs-sdk-input.json").write_text(sys.argv[1])',
                     json.dumps(config))
         remote = '/evidence/afs-sdk-' + config['mode'] + '.json'
-        run.execute('node1', '/opt/adx/client/bin/python', '-B', '/opt/adx/e2e/afs_sdk.py',
-                    '--input', '/evidence/afs-sdk-input.json', '--output', remote, timeout=600)
+        try:
+            run.execute('node1', *argv, '--input', '/evidence/afs-sdk-input.json', '--output', remote, timeout=600)
+        except Exception:
+            if client:
+                # Retain a product assertion result if the workload did reach its
+                # report. Failed startup may have no report, so preserve the
+                # original runner error in either case.
+                try:
+                    report = json.loads(run.execute('node1', 'cat', remote))
+                    destination.write_text(json.dumps(report, indent=2))
+                except Exception:
+                    pass
+            raise
         report = json.loads(run.execute('node1', 'cat', remote))
         destination.write_text(json.dumps(report, indent=2))
+        if client and report.get('sdk_client', {}).get('wheel_sha256') != client['wheel_sha256']:
+            raise ValueError('SDK workload report does not prove use of the independent client')
         for node in run.nodes:
             run.helper(node, 'empty', node)
         return report
@@ -109,6 +135,7 @@ class Product:
         run = self.run
         # Populate the runtime image cache before the AFS worker takes its mount baseline.
         self.sdk({'mode': 'warm'}, run.output / 'afs-sdk-warm.json')
+        self.client = stage_client(run, self.service)
         path = str(ROOT / 'afs/tests')
         sys.path.insert(0, path)
         try:
