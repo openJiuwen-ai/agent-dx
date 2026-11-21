@@ -30,6 +30,8 @@ pub struct ServiceSelection {
     requested_port: Option<u16>,
     environment_id: String,
     generation: String,
+    /// 启动模式判定（Activator 回传；M2-4）。
+    start_mode: adx_agent_core::activator::ActivationKind,
     retried: bool,
     parameters: Option<Vec<u8>>,
 }
@@ -43,6 +45,11 @@ impl ServiceSelection {
             return Err(Error::Invalid("selected service is not WebSocket".into()));
         }
         Ok(self.port)
+    }
+
+    /// 启动模式判定（Activator 回传；M2-4 体验族标签）。
+    pub(crate) fn start_mode(&self) -> adx_agent_core::activator::ActivationKind {
+        self.start_mode
     }
 
     pub(crate) fn forwarding_uri(&self, backend_uri: &http::Uri) -> Result<http::Uri, Error> {
@@ -86,7 +93,7 @@ impl AgentV2Access {
         selector: ServiceSelector,
         parameters: Option<&[u8]>,
     ) -> Result<ServiceSelection, Error> {
-        let (target, port) = context
+        let (target, port, start_mode) = context
             .run(self.managed.resolve_with_parameters(
                 &context,
                 &scope,
@@ -104,6 +111,7 @@ impl AgentV2Access {
             requested_port: selector.port,
             environment_id: target.binding.current.environment_id,
             generation: target.binding.generation,
+            start_mode,
             retried: false,
             parameters: parameters.map(<[u8]>::to_vec),
         })
@@ -177,7 +185,7 @@ impl AgentV2Access {
                 }
                 // No WS handshake or business bytes have been sent. Reuse this
                 // admission's initialization input only if the Binding is missing.
-                selection
+                let (target, port, start) = selection
                     .context
                     .run(self.managed.resolve_with_parameters(
                         &selection.context,
@@ -187,7 +195,11 @@ impl AgentV2Access {
                         selection.parameters.as_deref(),
                         true,
                     ))
-                    .await?
+                    .await?;
+                // 重选可能换了 Environment，也可能换了激活方式；两者都要更新，
+                // 否则体验归因会把 start_mode 记成旧选择。
+                selection.start_mode = start;
+                (target, port)
             }
             result => result?,
         };
@@ -206,7 +218,7 @@ impl AgentV2Access {
         &self,
         ingress: &Ingress,
         selection: ServiceSelection,
-    ) -> Result<IngressStream, ServiceAccessError> {
+    ) -> Result<(IngressStream, ServiceSelection), ServiceAccessError> {
         self.connect_service_inner(ingress, selection, false).await
     }
 
@@ -217,7 +229,7 @@ impl AgentV2Access {
         &self,
         ingress: &Ingress,
         selection: ServiceSelection,
-    ) -> Result<IngressStream, ServiceAccessError> {
+    ) -> Result<(IngressStream, ServiceSelection), ServiceAccessError> {
         self.connect_service_inner(ingress, selection, true).await
     }
 
@@ -226,7 +238,7 @@ impl AgentV2Access {
         ingress: &Ingress,
         mut selection: ServiceSelection,
         wait_for_listener: bool,
-    ) -> Result<IngressStream, ServiceAccessError> {
+    ) -> Result<(IngressStream, ServiceSelection), ServiceAccessError> {
         loop {
             let result = selection
                 .context
@@ -261,7 +273,9 @@ impl AgentV2Access {
                 })
                 .await?;
             match result {
-                Ok(stream) => return Ok(stream),
+                // 重选可能改变 environment/generation/start_mode；
+                // 调用方必须拿到**最终**选择，体验不能归因到旧环境。
+                Ok(stream) => return Ok((stream, selection)),
                 Err(error) => {
                     let retryable = !matches!(
                         error,

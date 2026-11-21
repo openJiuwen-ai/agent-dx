@@ -89,7 +89,7 @@ impl RelayDelivery {
                 }
                 _ => DeliveryFailure::Unknown,
             })?;
-        let stream = self
+        let (stream, _selection) = self
             .access
             .connect_service_when_ready(&self.ingress, selection)
             .await

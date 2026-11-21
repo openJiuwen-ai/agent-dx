@@ -662,6 +662,15 @@ pub struct Ingress {
     command_watch_config: CommandWatchConfig,
     command_watch_metrics: Arc<CommandWatchMetrics>,
     request_metrics: Arc<IngressRequestMetrics>,
+    /// 业务适配器的指标扩展；通用 Ingress 不认识其类型，只负责拼接渲染。
+    #[cfg(feature = "agent-api")]
+    metrics_extension: Option<Arc<dyn MetricsExtension>>,
+}
+
+/// 业务适配器把自有指标族拼进 `/metrics` 的窄接口。
+#[cfg(feature = "agent-api")]
+pub(crate) trait MetricsExtension: Send + Sync {
+    fn render(&self, out: &mut adx_observability::metrics::Text);
 }
 
 impl Ingress {
@@ -705,6 +714,8 @@ impl Ingress {
             command_watch_config: CommandWatchConfig::default(),
             command_watch_metrics: Arc::new(CommandWatchMetrics::default()),
             request_metrics: Arc::new(IngressRequestMetrics::default()),
+            #[cfg(feature = "agent-api")]
+            metrics_extension: None,
         }
     }
 
@@ -776,6 +787,16 @@ impl Ingress {
     /// 全流观测开关；关闭时仅保留请求族计数。
     pub fn with_full_stream_observation(mut self, enabled: bool) -> Self {
         self.full_stream = enabled;
+        self
+    }
+
+    /// 业务适配器指标扩展：仅拼接到 /metrics，Ingress 不解释内容。
+    #[cfg(feature = "agent-api")]
+    pub(crate) fn with_metrics_extension(
+        mut self,
+        extension: Option<Arc<dyn MetricsExtension>>,
+    ) -> Self {
+        self.metrics_extension = extension;
         self
     }
 
@@ -1929,6 +1950,16 @@ impl Ingress {
             "/readyz" => plain(StatusCode::SERVICE_UNAVAILABLE, "not ready"),
             "/metrics" => plain(StatusCode::OK, &{
                 let pool = self.http_pool.metrics();
+                #[cfg(feature = "agent-api")]
+                let extension = {
+                    let mut text = adx_observability::metrics::Text::default();
+                    if let Some(extension) = &self.metrics_extension {
+                        extension.render(&mut text);
+                    }
+                    text.finish()
+                };
+                #[cfg(not(feature = "agent-api"))]
+                let extension = String::new();
                 // Embedded Ingress exports the API Server's owning PID only once.
                 let process_metrics = adx_observability::process::metrics();
                 format!(
@@ -1951,7 +1982,8 @@ impl Ingress {
                      command_watch_reconnects {}\n\
                      command_watch_auth_failures {}\n\
                      command_watch_downstream_streams {}\n\
-                     {process_metrics}",
+                     {process_metrics}\n\
+                     {extension}",
                     usize::from(self.ready()),
                     self.resolver.cache_len(),
                     self.resolver.watch_revision(),
@@ -2456,7 +2488,7 @@ impl Ingress {
         if request.headers().contains_key(header::UPGRADE) {
             if let Some((selection, backend_uri)) = api.take_service_selection(&mut request) {
                 let stream = match api.service_access().connect_service(self, selection).await {
-                    Ok(stream) => stream,
+                    Ok((stream, _selection)) => stream,
                     Err(super::agent_service::ServiceAccessError::Agent(error)) => {
                         return super::agent_response::error_response(error, None);
                     }

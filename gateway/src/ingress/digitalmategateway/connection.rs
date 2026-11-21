@@ -29,6 +29,8 @@ pub enum ConnectionError {
 pub struct Connection {
     backend: WebSocketStream<IngressStream>,
     cancelled: watch::Receiver<bool>,
+    /// 连接建立**之后**的最终启动模式（重选可能改变它）。
+    start_mode: crate::ingress::digitalmategateway::experience::StartMode,
 }
 impl Connection {
     /// Use shared route authorization and the selection's original deadline.
@@ -49,9 +51,11 @@ impl Connection {
             .websocket_port()
             .map_err(ServiceAccessError::Agent)?;
         let deadline = selection.deadline();
-        let stream = access
+        let (stream, selection) = access
             .connect_service_when_ready(ingress, selection)
             .await?;
+        // 重选后以最终选择为准，供调用方回填体验锚点。
+        let start_mode = selection.start_mode().into();
         let cancelled = stream.cancellation();
         let mut request = format!("ws://127.0.0.1:{port}/")
             .into_client_request()
@@ -74,25 +78,40 @@ impl Connection {
                 result.map_err(|_| ConnectionError::HandshakeTimeout)?.map_err(DriverError::from)?
             }
         };
-        Ok(Self { backend, cancelled })
+        Ok(Self {
+            backend,
+            cancelled,
+            start_mode,
+        })
+    }
+
+    /// 连接实际使用的启动模式（重选后为最终值）。
+    pub(crate) fn start_mode(&self) -> crate::ingress::digitalmategateway::experience::StartMode {
+        self.start_mode
     }
 
     /// Run for this binding's already-authenticated user. The frontend owner must
     /// close its socket when this returns (including route revocation), releasing
     /// both channel ends and reporting unknown outcomes without replaying work.
     /// Returns driver errors or Revoked; the admission deadline no longer applies.
+    /// `anchor` 携带体验族观察锚点（详设 §6.4 M2-4a）：None 时 driver 不观察。
     pub async fn run(
         self,
         user_id: String,
         config: DriverConfig,
         requests: mpsc::Receiver<Request>,
         output: mpsc::Sender<Value>,
+        anchor: Option<crate::ingress::digitalmategateway::experience::ExperienceAnchor>,
     ) -> Result<(), ConnectionError> {
-        let Self { backend, cancelled } = self;
+        let Self {
+            backend,
+            cancelled,
+            start_mode: _,
+        } = self;
         tokio::select! {
             biased;
             _ = wait_for_route_cancellation(Some(cancelled)) => Err(ConnectionError::Revoked),
-            result = driver::run(backend, user_id, config, requests, output) => result.map_err(ConnectionError::from),
+            result = driver::run(backend, user_id, config, requests, output, anchor) => result.map_err(ConnectionError::from),
         }
     }
 }

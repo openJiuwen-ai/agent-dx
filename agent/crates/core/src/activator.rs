@@ -50,11 +50,28 @@ pub struct ResolveRequest {
     pub activation: ActivationRequest,
     pub service: ServiceSelector,
 }
+/// 启动模式判定（Activator 在 resolve 响应回传；§7 M2-4 接口扩展）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationKind {
+    /// 命中绑定缓存（未做任何 I/O）。
+    BindingReuse,
+    /// 新建绑定 → 环境冷启动。
+    Cold,
+    /// 既有绑定，环境从暂停恢复。
+    Resumed,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedTarget {
     pub target: Target,
     pub port: u16,
+    /// 启动模式；缺省（旧响应）按 `unknown` 处理。
+    #[serde(default)]
+    pub activation: ActivationKind,
 }
 /// One read-only Binding snapshot and the immutable template for its actual version.
 /// Before first activation, binding is None and template is selected from the desired state.

@@ -206,7 +206,8 @@ impl Activator {
                 &volumes,
                 deadline,
             )
-            .await;
+            .await
+            .map(|(observed, _pre_phase)| observed);
         if !self
             .reference_is_active(&binding, &secondary.environment)
             .await?
@@ -387,7 +388,7 @@ impl Activator {
         deadline: u64,
     ) -> Result<adx_agent_core::activator::ResolvedTarget> {
         let activation = &request.activation;
-        let target = self
+        let (target, start) = self
             .activate_selected(
                 &activation.scope,
                 activation.expected_generation.as_deref(),
@@ -401,7 +402,11 @@ impl Activator {
             .service
             .select(&target.service)
             .map_err(Error::Invalid)?;
-        Ok(adx_agent_core::activator::ResolvedTarget { target, port })
+        Ok(adx_agent_core::activator::ResolvedTarget {
+            target,
+            port,
+            activation: start,
+        })
     }
     pub async fn binding(&self, scope: &Scope) -> Result<AgentBinding> {
         self.state.binding(scope).await?.ok_or(Error::NotFound)
@@ -483,6 +488,7 @@ impl Activator {
             None,
         )
         .await
+        .map(|(target, _start)| target)
     }
     async fn activate_selected(
         &self,
@@ -492,7 +498,7 @@ impl Activator {
         bypass_cache: bool,
         parameters: Option<&[u8]>,
         service: Option<adx_agent_core::activator::ServiceSelector>,
-    ) -> Result<Target> {
+    ) -> Result<(Target, adx_agent_core::activator::ActivationKind)> {
         scope.validate().map_err(Error::Invalid)?;
         let cache_metrics = self.state.cache_metrics();
         let attempt = {
@@ -520,7 +526,10 @@ impl Activator {
                             }
                             binding.touched = Instant::now();
                             cache_metrics.record(CacheKind::Binding, CacheResult::Hit);
-                            return Ok(target.clone());
+                            return Ok((
+                                target.clone(),
+                                adx_agent_core::activator::ActivationKind::BindingReuse,
+                            ));
                         }
                     }
                 }
@@ -552,7 +561,7 @@ impl Activator {
                 CacheResult::Miss
             },
         );
-        let (binding, _created) = match self.state.binding(scope).await? {
+        let (binding, created) = match self.state.binding(scope).await? {
             Some(binding) => (binding, false),
             None if expected_generation.is_some() => {
                 return Err(Error::Conflict(
@@ -637,7 +646,7 @@ impl Activator {
                 return Err(Error::Conflict("binding changed during activation".into()));
             }
         };
-        let observed = observed?;
+        let (observed, pre_phase) = observed?;
         Self::validate_observation(&binding, &binding.current, &observed)?;
         // A target is a stable identity, not proof of a live execution. Only the
         // authorized Gateway data path requests Platform EnsureRunning.
@@ -671,7 +680,17 @@ impl Activator {
                 cached.touched = Instant::now();
             }
         }
-        Ok(target)
+        let activation = if created {
+            adx_agent_core::activator::ActivationKind::Cold
+        } else if matches!(
+            pre_phase,
+            Some(EnvironmentPhase::Pausing | EnvironmentPhase::Paused | EnvironmentPhase::Resuming)
+        ) {
+            adx_agent_core::activator::ActivationKind::Resumed
+        } else {
+            adx_agent_core::activator::ActivationKind::Unknown
+        };
+        Ok((target, activation))
     }
 
     pub async fn delete_binding(&self, scope: &Scope) -> Result<()> {

@@ -248,6 +248,7 @@ pub struct DigitalMateGatewayApi {
     webhook: Option<Arc<super::ingestion::WebhookHttp>>,
     #[cfg(unix)]
     runtime: unix::Runtime,
+    observation: Option<Arc<super::observation::Observation>>,
 }
 
 impl DigitalMateGatewayApi {
@@ -435,6 +436,7 @@ impl DigitalMateGatewayApi {
             )
             .await;
         }
+        let auth_started = tokio::time::Instant::now();
         let token = match accounts::bearer(request.headers()) {
             Ok(v) => v,
             Err(e) => return auth_error(e),
@@ -516,6 +518,21 @@ impl DigitalMateGatewayApi {
         if request.uri().path() == "/file-api/upload" {
             return self.upload(request, ingress, scope, principal).await;
         }
+        // H1 计时：/ws 路径构造体验锚点。t0 = 请求进入认证流程的时刻；
+        // 认证本身是 ADX 准入、不在原始观测需求内，不导出阶段样本。
+        // 认证失败不构造（未认证请求不计业务量）；session/quota/download/upload
+        // 在此前已返回。
+        let anchor = self.observation.as_ref().map(|observation| {
+            observation.anchor(
+                &format!(
+                    "{}@{}",
+                    self.config.jiuwen.template, self.config.jiuwen.version
+                ),
+                auth_started,
+                &self.config.tenant,
+                &principal.user_id,
+            )
+        });
         // Client user_id is only an ignored hint. The authenticated session owns
         // both binding selection and the user identity sent to AgentServer.
         if request.uri().query().is_some_and(|query| {
@@ -544,17 +561,13 @@ impl DigitalMateGatewayApi {
         )));
         let access = AgentV2Access::new(self.managed.clone());
         let initialization = async {
-            let result = async {
-                let mut parameters = self.auth.model_parameters(&principal).await?;
-                parameters.extend(
-                    self.config
-                        .parameters(&principal.user_id)
-                        .map_err(|_| accounts::Error::Invalid)?,
-                );
-                Ok::<_, accounts::Error>(parameters)
-            }
-            .await;
-            result
+            let mut parameters = self.auth.model_parameters(&principal).await?;
+            parameters.extend(
+                self.config
+                    .parameters(&principal.user_id)
+                    .map_err(|_| accounts::Error::Invalid)?,
+            );
+            Ok::<_, accounts::Error>(parameters)
         };
         let selection = access
             .select_with_initializer(
@@ -576,6 +589,9 @@ impl DigitalMateGatewayApi {
                 return auth_error(error)
             }
         };
+        // M2-4：Activator 的启动模式判定回填到锚点（直埋标签）。
+        let start_mode = selection.start_mode().into();
+        let anchor = anchor.map(|anchor| anchor.with_start_mode(start_mode));
         let connection = match Connection::connect(&ingress, &access, selection).await {
             Ok(value) => value,
             Err(ConnectionError::Access(ServiceAccessError::Agent(e))) => return agent_error(e),
@@ -584,8 +600,16 @@ impl DigitalMateGatewayApi {
                 return error(StatusCode::BAD_GATEWAY, "AGENT_SERVER_UNAVAILABLE");
             }
         };
+        // 建连期间可能发生重选：以连接实际落到的启动模式为准，否则结果会被
+        // 归因到旧的选择。
+        let anchor = anchor.map(|anchor| anchor.with_start_mode(connection.start_mode()));
         if let Err(e) = self.auth.check(&principal).await {
             return auth_error(e);
+        }
+        // 首用时延：t0（/ws 请求进入认证）→ 连接可用（环境就绪 + 后端建连 + 会话校验通过）。
+        // 失败不采样，避免把失败等待混入时延分布。
+        if let Some(anchor) = &anchor {
+            anchor.observe_first_use(auth_started.elapsed());
         }
         let auth = self.auth.clone();
         // 全流族：101 升级后外层不再包装响应体（server.rs 对带 UPGRADE 头的
@@ -620,7 +644,7 @@ impl DigitalMateGatewayApi {
             let result = frontend::run_authenticated(
                 socket,
                 front,
-                |requests, output| connection.run(user_id, driver, requests, output),
+                |requests, output| connection.run(user_id, driver, requests, output, anchor),
                 guard,
             )
             .await;
@@ -730,11 +754,10 @@ impl DigitalMateGatewayApi {
             user_id,
             agent_type: self.config.jiuwen.agent_type.clone(),
         };
-        let (response, _upload_ok) = tokio::select! {
+        tokio::select! {
             response = upload.respond(request.into_body(), &content_type) => response,
-            _ = guard.watch() => (error(StatusCode::UNAUTHORIZED, "SESSION_ENDED"), false),
-        };
-        response
+            _ = guard.watch() => error(StatusCode::UNAUTHORIZED, "SESSION_ENDED"),
+        }
     }
     async fn download(
         &self,
@@ -1050,8 +1073,15 @@ impl DigitalMateGatewayApi {
             #[cfg(test)]
             composio: None,
             webhook: None,
+            observation: None,
         })
     }
+    /// 注入适配器自有的业务观测；未配置 PG 时内部只有直埋指标。
+    pub fn with_observation(mut self, observation: Arc<super::observation::Observation>) -> Self {
+        self.observation = Some(observation);
+        self
+    }
+
     pub async fn build(
         config: DigitalMateGatewayConfig,
         managed: Arc<ManagedService>,

@@ -25,9 +25,9 @@ pub struct Upload {
 }
 
 impl Upload {
-    pub async fn respond(self, body: Incoming, content_type: &str) -> (Response<ProxyBody>, bool) {
+    pub async fn respond(self, body: Incoming, content_type: &str) -> Response<ProxyBody> {
         let Some(boundary) = boundary(content_type) else {
-            return (error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART"), false);
+            return error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART");
         };
         let bytes = match tokio::time::timeout_at(
             self.context.deadline(),
@@ -37,42 +37,35 @@ impl Upload {
         {
             Ok(Ok(body)) => body.to_bytes(),
             Ok(Err(body_error)) if body_error.is::<http_body_util::LengthLimitError>() => {
-                return (
-                    error(StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE"),
-                    false,
-                );
+                return error(StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE");
             }
-            _ => return (error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART"), false),
+            _ => return error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART"),
         };
         let form = match parse_form(bytes, &boundary) {
             Ok(form) => form,
-            Err(FormError::MissingFile) => {
-                return (error(StatusCode::BAD_REQUEST, "MISSING_FILE"), false)
-            }
+            Err(FormError::MissingFile) => return error(StatusCode::BAD_REQUEST, "MISSING_FILE"),
             Err(FormError::TooManyFiles) => {
-                return (error(StatusCode::BAD_REQUEST, "TOO_MANY_FILES"), false)
+                return error(StatusCode::BAD_REQUEST, "TOO_MANY_FILES")
             }
-            Err(FormError::Invalid) => {
-                return (error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART"), false)
-            }
+            Err(FormError::Invalid) => return error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART"),
         };
         if form
             .user_id
             .as_deref()
             .is_some_and(|id| !id.is_empty() && id != self.user_id)
         {
-            return (error(StatusCode::FORBIDDEN, "USER_MISMATCH"), false);
+            return error(StatusCode::FORBIDDEN, "USER_MISMATCH");
         }
         if form
             .agent_type
             .as_deref()
             .is_some_and(|kind| !kind.is_empty() && kind != self.agent_type)
         {
-            return (error(StatusCode::BAD_REQUEST, "AGENT_TYPE_MISMATCH"), false);
+            return error(StatusCode::BAD_REQUEST, "AGENT_TYPE_MISMATCH");
         }
         let directory = match relative_directory(form.directory.as_deref().unwrap_or("")) {
             Some(value) => value,
-            None => return (error(StatusCode::BAD_REQUEST, "INVALID_PATH"), false),
+            None => return error(StatusCode::BAD_REQUEST, "INVALID_PATH"),
         };
         let reader = match Files::new(
             &self.ingress,
@@ -81,7 +74,7 @@ impl Upload {
             &self.environment_id,
         ) {
             Ok(value) => value,
-            Err(_) => return (error(StatusCode::FORBIDDEN, "FORBIDDEN"), false),
+            Err(_) => return error(StatusCode::FORBIDDEN, "FORBIDDEN"),
         };
         let mut files = Vec::with_capacity(form.files.len());
         let mut errors = Vec::new();
@@ -110,15 +103,9 @@ impl Upload {
                 _ => errors.push(serde_json::json!({"filename":filename,"error":"UPLOAD_FAILED"})),
             }
         }
-        // 业务成功按逐文件结果判定：HTTP 200 只代表请求被处理，
-        // 部分或全部文件写入失败时 `errors` 非空。
-        let success = errors.is_empty() && !files.is_empty();
-        (
-            json_response(
-                StatusCode::OK,
-                serde_json::json!({"ok":true,"files":files,"errors":errors}),
-            ),
-            success,
+        json_response(
+            StatusCode::OK,
+            serde_json::json!({"ok":true,"files":files,"errors":errors}),
         )
     }
 }

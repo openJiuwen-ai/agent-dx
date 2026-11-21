@@ -212,6 +212,7 @@ impl ManagedService {
             },
         )
         .await
+        .map(|(target, port, _activation)| (target, port))
     }
     /// A retry of the same incoming request must not start a new lifecycle after deletion.
     pub async fn retry_resolve(
@@ -234,7 +235,9 @@ impl ManagedService {
             },
         )
         .await
+        .map(|(target, port, _activation)| (target, port))
     }
+    /// Resolve returning the Activator's start-mode classification (M2-4).
     pub async fn resolve_with_parameters(
         &self,
         ctx: &RequestContext,
@@ -243,7 +246,7 @@ impl ManagedService {
         port: Option<u16>,
         parameters: Option<&[u8]>,
         bypass_cache: bool,
-    ) -> Result<(Target, u16)> {
+    ) -> Result<(Target, u16, activator::ActivationKind)> {
         self.resolve_generation(
             ctx,
             scope,
@@ -264,7 +267,7 @@ impl ManagedService {
         protocol: Protocol,
         port: Option<u16>,
         input: ActivationInput<'_>,
-    ) -> Result<(Target, u16)> {
+    ) -> Result<(Target, u16, activator::ActivationKind)> {
         scope.validate().map_err(Error::Invalid)?;
         let request = activator::ResolveRequest {
             activation: activator::ActivationRequest {
@@ -298,6 +301,6 @@ impl ManagedService {
                 "Activator target identity or service mismatch".into(),
             ));
         }
-        Ok((target, selected_port))
+        Ok((target, selected_port, resolved.activation))
     }
 }

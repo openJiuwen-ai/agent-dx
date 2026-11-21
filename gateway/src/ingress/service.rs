@@ -36,6 +36,9 @@ pub struct IngressService {
     ssh: Option<super::ssh::SshListener>,
     #[cfg(all(feature = "agent-api", unix))]
     digitalmate_background: Option<super::digitalmategateway::ingestion::IngestionRuntime>,
+    /// 适配器自有的业务观测（指标 + 活跃落库）；未配置时为 None。
+    #[cfg(feature = "agent-api")]
+    observation: Option<Arc<super::digitalmategateway::observation::Observation>>,
 }
 
 impl IngressService {
@@ -133,6 +136,12 @@ impl IngressService {
             None
         };
         #[cfg(feature = "agent-api")]
+        let observation = super::digitalmategateway::observation::Observation::from_env(
+            std::env::var("ADX_JIUWEN_CONFIG").is_ok(),
+        )
+        .await
+        .map_err(|error| send_error(Box::new(std::io::Error::other(error))))?;
+        #[cfg(feature = "agent-api")]
         let digitalmategateway_api = if let Ok(path) = std::env::var("ADX_JIUWEN_CONFIG") {
             use super::digitalmategateway::entrypoint::{
                 DigitalMateGatewayApi, DigitalMateGatewayConfig,
@@ -154,7 +163,9 @@ impl IngressService {
                 super::accounts::AccountService::connect(account_config, &settings.tenant).await?,
             );
             Some(Arc::new(
-                DigitalMateGatewayApi::build(settings, agent.managed.clone(), auth).await?,
+                DigitalMateGatewayApi::build(settings, agent.managed.clone(), auth)
+                    .await?
+                    .with_observation(Arc::clone(&observation)),
             ))
         } else {
             None
@@ -201,6 +212,10 @@ impl IngressService {
         } else {
             gateway
         };
+        #[cfg(feature = "agent-api")]
+        let gateway = gateway.with_metrics_extension(Some(
+            observation.clone() as Arc<dyn super::server::MetricsExtension>
+        ));
         let gateway = Arc::new(gateway);
         #[cfg(all(feature = "agent-api", unix))]
         let digitalmate_background = match &digitalmategateway_api {
@@ -220,6 +235,8 @@ impl IngressService {
             ssh,
             #[cfg(all(feature = "agent-api", unix))]
             digitalmate_background,
+            #[cfg(feature = "agent-api")]
+            observation: Some(observation),
             config,
             public_listeners,
             health_listener,
@@ -259,6 +276,8 @@ impl IngressService {
             ssh,
             #[cfg(all(feature = "agent-api", unix))]
             digitalmate_background,
+            #[cfg(feature = "agent-api")]
+            observation,
         } = self;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let watcher_task = tokio::spawn(watcher.run(store));
@@ -274,6 +293,13 @@ impl IngressService {
                     .await
                     .map_err(|error| Box::new(error) as ServiceError)
             });
+        }
+        #[cfg(feature = "agent-api")]
+        if let Some(observation) = observation {
+            if let Some(sink) = observation.activity() {
+                let shutdown = shutdown_rx.clone();
+                tokio::spawn(async move { sink.run(shutdown).await });
+            }
         }
         #[cfg(feature = "agent-api")]
         if let Some(ssh) = ssh {
