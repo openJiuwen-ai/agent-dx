@@ -1,6 +1,8 @@
 """Special admission must reject missing work, weakened scope and cleanup gaps."""
 
+from contextlib import redirect_stdout
 import importlib.util
+from io import StringIO
 import json
 from pathlib import Path
 import tempfile
@@ -47,6 +49,35 @@ class SpecialContracts(unittest.TestCase):
         report['cases'].pop()
         with self.assertRaises(ValueError):
             component.validate_result(report, {'status': 'PASS', 'errors': []}, case_ids=scope.COMPONENT_CASES)
+
+    def test_kubernetes_reliability_selects_existing_component_specials(self):
+        scope = load('kubernetes_special_scope', HERE / 'afs_specials.py')
+        driver = load('kubernetes_special_driver', HERE / 'kubernetes/run.py')
+        self.assertEqual(driver.selected_checks('full', 'reliability'), ('reliability',))
+        self.assertEqual(driver.selected_checks('full', None), driver.common.STANDARD)
+        self.assertEqual(driver.selected_checks('l0', None), driver.common.PROFILES['l0'])
+        for profile in ('l0', 'k8s-basic'):
+            with self.assertRaises(ValueError):
+                driver.selected_checks(profile, 'reliability')
+        run = driver.KubernetesRun(Path('/fixture/output'), Path('/fixture/kubeconfig'),
+                                   profile='full', selected_case='reliability')
+        self.assertIsNone(run.afs_product)
+        self.assertEqual(run.afs_component.check_name, 'reliability')
+        self.assertEqual(run.afs_component.case_ids, scope.COMPONENT_CASES)
+        self.assertEqual(tuple(run.afs_component.roles), ('M', 'A', 'B'))
+        self.assertFalse(run.afs_component.full)
+
+    def test_kubernetes_reliability_requires_afs_candidate_without_full_contracts(self):
+        driver = load('kubernetes_special_admission', HERE / 'kubernetes/run.py')
+        args = Mock(case='reliability', artifact_commit='a' * 40)
+        rejected = ValueError('AFS ON required')
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            driver, 'fixed_candidate', side_effect=rejected,
+        ) as admission, redirect_stdout(StringIO()) as stdout:
+            self.assertEqual(driver.verify_only(args, Path(directory)), 1)
+            admission.assert_called_once_with(args.bundle, args.registry_images, args.artifact_commit,
+                                              afs_required=True, contracts_required=False)
+            self.assertEqual(json.loads(stdout.getvalue()), json.loads((Path(directory) / 'inputs.json').read_text()))
 
     def test_pressure_success_requires_all_operations_and_real_expected_errno(self):
         scope = load('special_pressure_contract', HERE / 'afs_specials.py')

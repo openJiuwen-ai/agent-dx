@@ -21,6 +21,7 @@ scope_spec = importlib.util.spec_from_file_location('afs_ci_full_scope', ROOT / 
 scope = importlib.util.module_from_spec(scope_spec)
 scope_spec.loader.exec_module(scope)
 FULL_CASES = scope.CASE_IDS
+RELIABILITY_TARGET = 'reliability'
 ROLES = {'M': 'afs-m', 'A': 'afs-a', 'B': 'afs-b'}
 
 
@@ -86,16 +87,25 @@ def validate_result(report, cleanup, full=False, case_ids=None):
 
 
 class Component:
-    def __init__(self, run, full=False, case_ids=None):
+    def __init__(self, run, full=False, case_ids=None, check_name=None):
         self.run = run
         self.full = full
         self.case_ids = case_ids
+        self.check_name = check_name or ('afs-component-specials' if case_ids is not None else (
+            'afs-component-full' if full else 'afs-component'))
         self.roles = dict(ROLES, C='afs-c') if full else ROLES
         self.attempted_cases = False
         self.normal_cleanup = None
         self.config = None
         self.package = None
         self.contract_manifest_sha = None
+
+    @classmethod
+    def reliability(cls, run):
+        spec = importlib.util.spec_from_file_location('afs_reliability_scope', ROOT / 'build/e2e/afs_specials.py')
+        specials = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(specials)
+        return cls(run, case_ids=specials.COMPONENT_CASES, check_name=RELIABILITY_TARGET)
 
     def deploy(self, bundle, refs, registry_auth, node_names, distinct_workers, harness_commit):
         run = self.run
@@ -162,9 +172,7 @@ class Component:
 
     def scenarios(self, checks):
         run = self.run
-        name = 'afs-component-specials' if self.case_ids is not None else (
-            'afs-component-full' if self.full else 'afs-component')
-        with run.case(name, checks) as record, \
+        with run.case(self.check_name, checks) as record, \
                 tempfile.TemporaryDirectory(prefix='adx-afs-inputs-') as temp:
             inputs = Path(temp)
             for name in ('afs-meta', 'afs-node'):

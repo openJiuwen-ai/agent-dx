@@ -147,6 +147,13 @@ normal restart, DFS bounded-sync progress through the declared 64 MiB queue
 profile, required-replica recovery, and failed-close retirement. It uses the
 same Meta/Node binaries and normal process/mount cleanup as Full.
 
+On Kubernetes, run these same five cases through the existing Buildkite Full
+pipeline with `ADX_E2E_TARGET_CASE=reliability`, `ADX_WITH_AFS=1`, and the
+fixed candidate image build and commit. The runner uses the existing M/A/B
+fixture with A and B on separate workers. The five cases cover process restarts
+and write recovery. Upgrade and rollback require separate versioned candidates
+and lifecycle tests.
+
 The SDK restart case keeps one real Environment on each AFS data role. An
 SDK-launched background workload performs checked, synced file I/O while the
 second Adxlet is paused; the fixture then resumes it, restarts both Adxlets

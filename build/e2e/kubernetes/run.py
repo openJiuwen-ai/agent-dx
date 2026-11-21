@@ -38,6 +38,7 @@ spec.loader.exec_module(common)
 sys.path.insert(0, str(HERE))
 from manifest import LABEL, resources
 from afs_component import Component as AfsComponent
+from afs_component import RELIABILITY_TARGET
 from afs_product import Product as AfsProduct, resources as afs_product_resources
 
 
@@ -71,13 +72,22 @@ def fixed_candidate(bundle, registry, commit, afs_required=False, contracts_requ
     return candidate.fixed_candidate(bundle, registry, commit, afs_required, contracts_required)
 
 
+def requires_afs(case):
+    return bool(case and (case.startswith('afs-') or case == RELIABILITY_TARGET))
+
+
+def write_stdout(line):
+    sys.stdout.write(line + '\n')
+    sys.stdout.flush()
+
+
 def verify_only(args, output):
     """Write input admission evidence without accessing Kubernetes or registry APIs."""
     report = {'scope': 'fixed-candidate-inputs', 'deployment_performed': False, 'status': 'failed'}
     try:
         manifest, published = fixed_candidate(
             args.bundle, args.registry_images, args.artifact_commit,
-            afs_required=bool(args.case and args.case.startswith('afs-')),
+            afs_required=requires_afs(args.case),
             contracts_required=args.case == 'afs-component-full',
         )
         report.update(status='passed', product_commit=manifest['package']['commit'],
@@ -88,7 +98,7 @@ def verify_only(args, output):
     except (OSError, ValueError, KeyError, TypeError) as exc:
         report['error'] = f'{type(exc).__name__}: {exc}'
     (output / 'inputs.json').write_text(json.dumps(report, indent=2) + '\n')
-    print(json.dumps(report), flush=True)
+    write_stdout(json.dumps(report))
     return 0 if report['status'] == 'passed' else 1
 
 
@@ -159,9 +169,9 @@ def selected_checks(profile, selected_case):
             raise ValueError('afs-sdk requires the full Kubernetes profile')
         suffix = '-full' if selected_case.endswith('-full') else ''
         return ('afs-sdk-ownerfs' + suffix, 'afs-sdk-dfs' + suffix)
-    if selected_case in ('afs-component', 'afs-component-full'):
+    if selected_case in ('afs-component', 'afs-component-full', RELIABILITY_TARGET):
         if profile != 'full':
-            raise ValueError('afs-component requires the full Kubernetes profile as a targeted case')
+            raise ValueError(f'{selected_case} requires the full Kubernetes profile as a targeted case')
         return (selected_case,)
     if selected_case == 'redis-pod-restart':
         if profile != 'full':
@@ -237,6 +247,8 @@ class KubernetesRun(common.Run):
         self.redis_pod_manifest = None
         self.afs_component = (AfsComponent(self, full=selected_case.endswith('-full'))
                               if selected_case in ('afs-component', 'afs-component-full') else None)
+        if selected_case == RELIABILITY_TARGET:
+            self.afs_component = AfsComponent.reliability(self)
         self.afs_product = (AfsProduct(self, full=selected_case.endswith('-full'))
                             if selected_case in ('afs-sdk', 'afs-sdk-full') else None)
         self.stop_evidence = 'stop' in selected_checks(profile, selected_case)
@@ -321,7 +333,7 @@ class KubernetesRun(common.Run):
             return
         if self.afs_product and not m['package'].get('with_afs'):
             raise ValueError('SDK-on-AFS requires an AFS ON candidate')
-        print('--- Kubernetes deployment', flush=True)
+        write_stdout('--- Kubernetes deployment')
         self.event('[DEPLOY] namespace=' + self.id + '; eligible nodes=' + ','.join(node_names))
         # Check credentials/connectivity before creating any test resource.
         self.kube('version', '-o', 'json', timeout=30)
@@ -399,7 +411,7 @@ class KubernetesRun(common.Run):
             require_distinct_workers,
         )
         (self.output / 'placement.json').write_text(json.dumps(placement, indent=2) + '\n')
-        print('Kubernetes placement: ' + json.dumps(placement), flush=True)
+        write_stdout('Kubernetes placement: ' + json.dumps(placement))
         ingress_pod = next(p for p in pods if p['metadata']['name'] == 'node1')
         ingress_ip = str(ipaddress.ip_address(ingress_pod['status']['podIP']))
         api_clients = ['127.0.0.1/32'] + [
@@ -516,7 +528,7 @@ class KubernetesRun(common.Run):
     def cleanup(self):
         if self.afs_component:
             return self.afs_component.cleanup()
-        print('--- Kubernetes cleanup', flush=True)
+        write_stdout('--- Kubernetes cleanup')
         self.event('[CLEANUP] Collect diagnostics, stop services and delete ' + self.id)
         errors = []
         if self.afs_product:
@@ -640,7 +652,7 @@ def main():
             if a.artifact_commit:
                 m, published = fixed_candidate(
                     a.bundle, a.registry_images, a.artifact_commit,
-                    afs_required=bool(a.case and a.case.startswith('afs-')),
+                    afs_required=requires_afs(a.case),
                     contracts_required=a.case == 'afs-component-full',
                 )
             (output / 'bundle.json').write_text(json.dumps(m, indent=2))
@@ -682,7 +694,7 @@ def main():
     )
     (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
     write_junit(output / 'junit.xml', report)
-    print('--- Kubernetes acceptance result', flush=True)
+    write_stdout('--- Kubernetes acceptance result')
     for case in run.case_results:
         run.event(f"[{'PASS' if case['status'] == 'passed' else 'FAIL'}] {case['name']} ({case['seconds']:.3f}s)")
     for name in report['missing_checks']:
@@ -699,7 +711,7 @@ def main():
             f"{len(cleanup_errors)}"
         )
     )
-    print(json.dumps(report), flush=True)
+    write_stdout(json.dumps(report))
     return 0 if report['status'] == 'passed' else 1
 
 
