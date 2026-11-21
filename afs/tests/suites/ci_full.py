@@ -9,4 +9,7 @@ CASE_IDS = (
     'ownerfs.extended.namespace_identity', 'ownerfs.basic.namespace', 'ownerfs.cluster.read_write',
     'ownerfs.cluster.namespace', 'ownerfs.cluster.permissions', 'ownerfs.cluster.restart',
     'ownerfs.permissions.deny_other_uid', 'ownerfs.recovery.normal_restart',
+    'ownerfs.basic.remote_dir_close_fd', 'dfs.resources.reader_fd_budget',
+    'dfs.semantics.atomic_save_cross_node', 'dfs.semantics.write_then_rename_before_close',
+    'dfs.semantics.unlink_open_file',
 )

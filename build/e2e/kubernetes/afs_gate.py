@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 from pathlib import Path
 import re
 import signal
@@ -10,6 +11,13 @@ import sys
 import time
 
 HERE = Path(__file__).resolve().parent
+
+
+def write_stdout(line):
+    """Emit an unprefixed CLI line to the current stdout."""
+    output_logger = logging.Logger(__name__, level=logging.INFO)
+    output_logger.addHandler(logging.StreamHandler(sys.stdout))
+    output_logger.info('%s', line)
 
 
 def accept_harness(report, part, commit):
@@ -74,6 +82,22 @@ def plans(profile, deployment='kubernetes'):
             ('afs-sdk' + suffix, 'full', 'afs-sdk' + suffix)]
 
 
+def plan_report(profile, source_profile, plan):
+    return {'status': 'failed', 'profile': profile, 'source_profile': source_profile,
+            'required_checks': [name for name, _, _ in plan], 'checks': [], 'cleanup_errors': [],
+            'cases': [], 'error': None}
+
+
+def finish_plan(output, report, write_junit):
+    report['missing_checks'] = [name for name in report['required_checks'] if name not in report['checks']]
+    if not report['missing_checks'] and not report['cleanup_errors'] and not report['error']:
+        report['status'] = 'passed'
+    (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
+    write_junit(output / 'junit.xml', report)
+    write_stdout(json.dumps(report))
+    return 0 if report['status'] == 'passed' else 1
+
+
 def main(default_deployment='kubernetes'):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('bundle', 'registry-images', 'output'):
@@ -110,24 +134,28 @@ def main(default_deployment='kubernetes'):
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     plan = plans(args.profile, args.deployment)
-    report = {'status': 'failed', 'profile': 'afs-required-full' if args.profile == 'full' else 'afs-required-smoke',
-              'source_profile': args.profile,
-              'required_checks': [p[0] for p in plan], 'checks': [], 'cleanup_errors': [], 'cases': [], 'error': None}
+    report = plan_report('afs-required-full' if args.profile == 'full' else 'afs-required-smoke', args.profile, plan)
     if args.artifact_commit:
         try:
             fixed_candidate(args.bundle, args.registry_images, args.artifact_commit,
                             afs_required=True, contracts_required=args.profile == 'full')
         except (OSError, ValueError, KeyError, TypeError) as exc:
             report['error'] = f'{type(exc).__name__}: {exc}'
-            report['missing_checks'] = list(report['required_checks'])
-            (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
-            write_junit(output / 'junit.xml', report)
-            print(json.dumps(report), flush=True)
-            return 1
-    commit = source_commit()
+            return finish_plan(output, report, write_junit)
+
+    def prepare_stage(name):
+        if name == 'public' and args.profile == 'full':
+            common.afs_contracts.verify_bundle(args.bundle.parent, json.loads(args.bundle.read_text()), required=True)
+
+    return execute_plan(args, output, plan, report, source_commit(), selected_checks, write_junit,
+                        native=native, prepare_stage=prepare_stage)
+
+
+def execute_plan(args, output, plan, report, commit, selected_checks, write_junit, *, native=False, prepare_stage=None):
+    """Run each phase in its own deployment and require its result and cleanup before advancing."""
 
     def cancel(signum, _frame):
-        raise InterruptedError('AFS gate canceled: ' + str(signum))
+        raise InterruptedError('test plan canceled: ' + str(signum))
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, cancel)
@@ -135,6 +163,8 @@ def main(default_deployment='kubernetes'):
         started = time.monotonic()
         record = {'name': name, 'status': 'failed'}
         report['cases'].append(record)
+        if report.get('selected_case'):
+            record['target'] = case
         command = [sys.executable, '-u', str((HERE.parent if native else HERE) / 'run.py'),
                    '--bundle', str(args.bundle.resolve()), '--registry-images', str(args.registry_images.resolve()),
                    '--output', str(output / name), '--profile', profile]
@@ -154,15 +184,20 @@ def main(default_deployment='kubernetes'):
             command += ['--node-name', node]
         child = None
         try:
-            if name == 'public' and args.profile == 'full':
-                common.afs_contracts.verify_bundle(
-                    args.bundle.parent, json.loads(args.bundle.read_text()), required=True)
+            expected = selected_checks(profile, case)
+            if prepare_stage:
+                prepare_stage(name)
             child = subprocess.Popen(command)
             code = child.wait()
             if code:
                 raise ValueError(name + ' failed, exit=' + str(code))
-            part = verify_part(output / name, selected_checks(profile, case))
+            part = verify_part(output / name, expected)
             accept_harness(report, part, commit)
+            if report.get('selected_case'):
+                subcases = []
+                for entry in part['cases']:
+                    subcases.extend(entry.get('subcases') or [{'id': entry['name'], 'status': entry['status']}])
+                record['subcases'] = subcases
             report['checks'].append(name)
             record['status'] = 'passed'
         except Exception as exc:
@@ -179,13 +214,7 @@ def main(default_deployment='kubernetes'):
                     child.kill()
                     child.wait()
             record['seconds'] = time.monotonic() - started
-    report['missing_checks'] = [name for name in report['required_checks'] if name not in report['checks']]
-    if not report['missing_checks'] and not report['cleanup_errors']:
-        report['status'] = 'passed'
-    (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
-    write_junit(output / 'junit.xml', report)
-    print(json.dumps(report), flush=True)
-    return 0 if report['status'] == 'passed' else 1
+    return finish_plan(output, report, write_junit)
 
 
 if __name__ == '__main__':

@@ -22,9 +22,11 @@ K8s角色按namespace/Pod UID、实际worker UID和隔离身份核验，
 这些都是AFS ON测试资产，不进入产品包；Rust源码、缓存和私有环境配置不分发。
 选择Rust合同还需另交付同架构测试ELF。
 
-## CI4功能Full候选（已验证，待MR130合入）
+## CI4 功能 Full
 
-`suites/ci_full.py`统一登记24个ID，`run.py run --suite ci-full`逐项校验完整性，选择当前24项基础/扩展功能用例：13项本地、9项跨角色、2项扩展。
+`suites/ci_full.py`登记 29 个用例，`run.py run --suite ci-full`按该清单执行并逐项校验完整性。
+在原 24 项基础上增加 OwnerFs 远端目录 FD 回收和 DFS 读缓存 FD 上限回归，以及三项 DFS 跨节点文件语义：
+原子保存、文件仍打开时重命名并继续写入、删除后原打开句柄仍可读取。
 它包含已有冒烟，排除20项读写专项和2项性能资产；不是`--all`。本轮候选在K8s准备matrix：
 local为同一M Pod内M/A/B/C进程和私有挂载namespace，cluster为M/A/B/C四个独立Pod。
 A/B强制不同worker，C为独立读者Pod，可与现有角色同worker，不宣称第三台VM或物理故障隔离。
@@ -32,13 +34,13 @@ K8s本地集合记录`kind=kubernetes, topology=local`，不改名为singlevm来
 仅Full M Pod额外挂载`/sys/devices/virtual/bdi`为可写；探针只修改自有FUSE BDI并finally恢复，
 不修改宿主块设备或全局sysctl。sysfs只读不能通过忽略精确计数检查来绕过。
 
-Full复用现有24项用例（旧Rust合同按冲突/无冲突分别修正前提），含4个精确Rust测试selector（3个外层case）；测试ELF由Linux Base AFS
+Full 包含 3 个外层 FUSE case，运行时逐项检查所需的 Rust selector。测试 ELF 由 Linux Base AFS
 构建器从当前同源Cargo测试产物冻结、去除debug段后单独打包，manifest绑定product commit、
 架构、两个产品二进制SHA、ELF和archive SHA。制品在`out/buildkite/afs-contracts/`，不进入产品包。
 目标Pod只执行已冻结ELF，不运行Cargo；缺资产、错身份、缺case、BLOCKED、非正常清理均使Full失败。
 
 公共入口为`build/e2e/kubernetes/run.py --profile full --case afs-component-full`。
-ADX Full的`afs_gate.py --profile full`在原公共11组后选择该24项组件集及`afs-sdk-full`；
+ADX Full 的 `afs_gate.py --profile full` 在公共 11 组之后调用 `ci-full` 和 `afs-sdk-full`。
 SDK Full新增namespace-identity和truncate-visibility，每模式8断言。Base L0继续原组件5项＋SDK两模式6断言，
 不运行ci-full；旧候选仍可用显式`afs-component`/`afs-sdk`诊断，正常Full须准备带新测试资产的候选。
 Base231冻结同源新ELF；Full89组件24/24与四内核实跑通过。正常Full90无target覆盖完成公共11＋组件24＋SDK16，
@@ -642,9 +644,9 @@ python3 afs/tests/run.py run --suite bench-dfs --allow-performance --env /absolu
 ### DFS reader FD有界回归
 
 `dfs.resources.reader_fd_budget`位于`suites/dfs/test_resources.py`，测试步骤在
-`suites/dfs/fd_budget.py`，只读FD分类工具在`tools/fd_inventory.py`。复用既有
-singlevm的Meta＋A/B进程、真实FUSE及正常卸载／退出协议；同架构固定组件包、
-合格Linux VM、Python3.10+、root权限和原运行条件不变，不需要SDK或K8s。
+`suites/dfs/fd_budget.py`，只读FD分类工具在`tools/fd_inventory.py`。下方的单 VM
+复现方式复用 `singlevm` 的 Meta 和 A/B 进程、真实 FUSE 及正常卸载和退出协议。
+该方式使用同架构固定组件包、合格 Linux VM、Python 3.10+ 和 root 权限。
 
 ```sh
 python3 afs/tests/run.py run --case dfs.resources.reader_fd_budget \
@@ -662,7 +664,7 @@ python3 afs/tests/run.py run --case dfs.resources.reader_fd_budget \
 失败不自动重试；验收断言使用显式错误，Python `-O`也不能绕过读取计数检查。
 工具单测不能替代Linux真实运行。
 
-本例是定向组件回归，本轮不加入`local-basic`、`all-basic`、`ci-full`或默认CI冒烟。
+本例已登记在 `ci-full` 清单，随 Kubernetes 功能 Full 执行。定向复现仍可用上面的 `--case` 或 `--suite local-resources`。
 它验证关闭负载检查点的封顶、淘汰和复用；不证明SDK一小时、在途并发上界、
 所有泄漏路径或性能。公共正式长稳FD合同另见
 [one-hour-v3](../../build/e2e/soak-contracts/one-hour-v3.json)。

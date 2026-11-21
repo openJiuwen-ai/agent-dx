@@ -25,7 +25,7 @@ class ReaderFdBudgetContracts(unittest.TestCase):
     def test_registered_selection_and_complete_cache_retirement(self):
         case = select(discover(), patterns=['dfs.resources.*'])
         self.assertEqual([c.id for c in case], ['dfs.resources.reader_fd_budget'])
-        self.assertNotIn('ci-full', case[0].tags)
+        self.assertIn('ci-full', case[0].tags)
         self.assertNotIn('local-basic', case[0].tags)
         self.assertEqual(validate(observations(), 0, 868)['chunk_fd_counts'], [128, 256, 256, 256, 256, 256])
 
