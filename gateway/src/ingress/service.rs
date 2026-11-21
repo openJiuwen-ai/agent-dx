@@ -36,6 +36,9 @@ pub struct IngressService {
     ssh: Option<super::ssh::SshListener>,
     #[cfg(all(feature = "agent-api", unix))]
     digitalmate_background: Option<super::digitalmategateway::ingestion::IngestionRuntime>,
+    /// 适配器自有的业务观测（指标 + 活跃落库）；未配置时为 None。
+    #[cfg(feature = "agent-api")]
+    observation: Option<Arc<super::digitalmategateway::observation::Observation>>,
 }
 
 impl IngressService {
@@ -133,6 +136,12 @@ impl IngressService {
             None
         };
         #[cfg(feature = "agent-api")]
+        let observation = super::digitalmategateway::observation::Observation::from_env(
+            std::env::var("ADX_JIUWEN_CONFIG").is_ok(),
+        )
+        .await
+        .map_err(|error| send_error(Box::new(std::io::Error::other(error))))?;
+        #[cfg(feature = "agent-api")]
         let digitalmategateway_api = if let Ok(path) = std::env::var("ADX_JIUWEN_CONFIG") {
             use super::digitalmategateway::entrypoint::{
                 DigitalMateGatewayApi, DigitalMateGatewayConfig,
@@ -154,7 +163,9 @@ impl IngressService {
                 super::accounts::AccountService::connect(account_config, &settings.tenant).await?,
             );
             Some(Arc::new(
-                DigitalMateGatewayApi::build(settings, agent.managed.clone(), auth).await?,
+                DigitalMateGatewayApi::build(settings, agent.managed.clone(), auth)
+                    .await?
+                    .with_observation(Arc::clone(&observation)),
             ))
         } else {
             None
@@ -201,6 +212,16 @@ impl IngressService {
         } else {
             gateway
         };
+        #[cfg(feature = "agent-api")]
+        let gateway = if digitalmategateway_api.is_some() {
+            // 业务指标只有 Jiuwen 适配器会生产；未启用时不要挂一个永远为零的
+            // extension，避免 /metrics 出现无意义的业务族。
+            gateway.with_metrics_extension(Some(
+                observation.clone() as Arc<dyn super::server::MetricsExtension>
+            ))
+        } else {
+            gateway
+        };
         let gateway = Arc::new(gateway);
         #[cfg(all(feature = "agent-api", unix))]
         let digitalmate_background = match &digitalmategateway_api {
@@ -220,6 +241,8 @@ impl IngressService {
             ssh,
             #[cfg(all(feature = "agent-api", unix))]
             digitalmate_background,
+            #[cfg(feature = "agent-api")]
+            observation: Some(observation),
             config,
             public_listeners,
             health_listener,
@@ -259,6 +282,8 @@ impl IngressService {
             ssh,
             #[cfg(all(feature = "agent-api", unix))]
             digitalmate_background,
+            #[cfg(feature = "agent-api")]
+            observation,
         } = self;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let watcher_task = tokio::spawn(watcher.run(store));
@@ -274,6 +299,18 @@ impl IngressService {
                     .await
                     .map_err(|error| Box::new(error) as ServiceError)
             });
+        }
+        // 活跃落库任务使用独立的停机信号：等长连接 drain 完再发最后一次 flush，
+        // 并等待任务退出，避免进程先退出丢掉最后一批。
+        #[cfg(feature = "agent-api")]
+        let mut activity_sink: Option<(watch::Sender<bool>, tokio::task::JoinHandle<()>)> = None;
+        #[cfg(feature = "agent-api")]
+        if let Some(observation) = observation {
+            if let Some(sink) = observation.activity() {
+                let (sink_shutdown, sink_rx) = watch::channel(false);
+                let task = tokio::spawn(async move { sink.run(sink_rx).await });
+                activity_sink = Some((sink_shutdown, task));
+            }
         }
         #[cfg(feature = "agent-api")]
         if let Some(ssh) = ssh {
@@ -333,6 +370,21 @@ impl IngressService {
         while let Some(result) = listeners.join_next().await {
             if let Ok(Err(error)) = result {
                 shutdown_error.get_or_insert(error);
+            }
+        }
+        // 所有 listener / 后台任务退出后，不会再有新的活跃记录；此时才做
+        // 最后一次 flush，避免最后一批准入记录落在 flush 之后丢失。
+        #[cfg(feature = "agent-api")]
+        if let Some((sink_shutdown, task)) = activity_sink {
+            let _ = sink_shutdown.send(true);
+            match tokio::time::timeout(std::time::Duration::from_secs(10), task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "activity sink task exited with an error");
+                }
+                Err(_) => {
+                    tracing::warn!("activity sink shutdown timed out; last batch may be lost");
+                }
             }
         }
         failure.or(shutdown_error).map_or(Ok(()), Err)

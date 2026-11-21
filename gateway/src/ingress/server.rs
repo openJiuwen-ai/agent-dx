@@ -372,6 +372,15 @@ pub struct Ingress {
     command_watch_config: CommandWatchConfig,
     command_watch_metrics: Arc<CommandWatchMetrics>,
     request_metrics: Arc<IngressRequestMetrics>,
+    /// 业务适配器的指标扩展；通用 Ingress 不认识其类型，只负责拼接渲染。
+    #[cfg(feature = "agent-api")]
+    metrics_extension: Option<Arc<dyn MetricsExtension>>,
+}
+
+/// 业务适配器把自有指标族拼进 `/metrics` 的窄接口。
+#[cfg(feature = "agent-api")]
+pub(crate) trait MetricsExtension: Send + Sync {
+    fn render(&self, out: &mut adx_observability::metrics::Text);
 }
 
 impl Ingress {
@@ -414,6 +423,8 @@ impl Ingress {
             command_watch_config: CommandWatchConfig::default(),
             command_watch_metrics: Arc::new(CommandWatchMetrics::default()),
             request_metrics: Arc::new(IngressRequestMetrics::default()),
+            #[cfg(feature = "agent-api")]
+            metrics_extension: None,
         }
     }
 
@@ -482,6 +493,20 @@ impl Ingress {
         self
     }
 
+    /// 业务适配器指标扩展：仅拼接到 /metrics，Ingress 不解释内容。
+    #[cfg(feature = "agent-api")]
+    pub(crate) fn with_metrics_extension(
+        mut self,
+        extension: Option<Arc<dyn MetricsExtension>>,
+    ) -> Self {
+        self.metrics_extension = extension;
+        self
+    }
+
+    /// 资源利用率不在此导出：`adx_environment_*` 已由 Coordinator/adxlet 采集，
+    /// 目录 × 分配 × 用量的 join 由既有 Prometheus 与 `adx-environments` 看板
+    /// 完成（含 `adx_env`/`runtime_id`/`stats_age` 全键与新鲜度校验），
+    /// ingress 不再重复实现一遍。
     #[cfg(feature = "agent-api")]
     pub fn with_execd_access(mut self, access: Arc<super::environment_files::ExecdAccess>) -> Self {
         self.execd_access = Some(access);
@@ -1535,10 +1560,40 @@ impl Ingress {
             "/readyz" => plain(StatusCode::SERVICE_UNAVAILABLE, "not ready"),
             "/metrics" => plain(StatusCode::OK, &{
                 let pool = self.http_pool.metrics();
+                #[cfg(feature = "agent-api")]
+                let extension = {
+                    let mut text = adx_observability::metrics::Text::default();
+                    if let Some(extension) = &self.metrics_extension {
+                        extension.render(&mut text);
+                    }
+                    text.finish()
+                };
+                #[cfg(not(feature = "agent-api"))]
+                let extension = String::new();
                 // Embedded Ingress exports the API Server's owning PID only once.
                 let process_metrics = adx_observability::process::metrics();
                 format!(
-                    "data_plane_ingress_ready {}\ndata_plane_ingress_route_cache_entries {}\ndata_plane_ingress_route_watch_revision {}\ndata_plane_ingress_route_watch_lag_seconds {}\ndata_plane_ingress_route_point_get_total {}\ndata_plane_ingress_active_sessions {}\ndata_plane_ingress_h2_physical_connections {}\ndata_plane_ingress_route_forced_close_total {}\ndata_plane_ingress_backend_http_idle_connections {}\ndata_plane_ingress_backend_http_opened_total {}\ndata_plane_ingress_backend_http_reused_total {}\ndata_plane_ingress_backend_http_discarded_total {}\ndata_plane_ingress_backend_http_acquire_timeouts_total {}\n{}command_watch_connections {}\ncommand_watch_subscriptions {}\ncommand_watch_environments {}\ncommand_watch_reconnects {}\ncommand_watch_auth_failures {}\ncommand_watch_downstream_streams {}\n{process_metrics}",
+                    "data_plane_ingress_ready {}\n\
+                     data_plane_ingress_route_cache_entries {}\n\
+                     data_plane_ingress_route_watch_revision {}\n\
+                     data_plane_ingress_route_watch_lag_seconds {}\n\
+                     data_plane_ingress_route_point_get_total {}\n\
+                     data_plane_ingress_active_sessions {}\n\
+                     data_plane_ingress_h2_physical_connections {}\n\
+                     data_plane_ingress_route_forced_close_total {}\n\
+                     data_plane_ingress_backend_http_idle_connections {}\n\
+                     data_plane_ingress_backend_http_opened_total {}\n\
+                     data_plane_ingress_backend_http_reused_total {}\n\
+                     data_plane_ingress_backend_http_discarded_total {}\n\
+                     data_plane_ingress_backend_http_acquire_timeouts_total {}\n\
+                     {}command_watch_connections {}\n\
+                     command_watch_subscriptions {}\n\
+                     command_watch_environments {}\n\
+                     command_watch_reconnects {}\n\
+                     command_watch_auth_failures {}\n\
+                     command_watch_downstream_streams {}\n\
+                     {process_metrics}\n\
+                     {extension}",
                     usize::from(self.ready()),
                     self.resolver.cache_len(),
                     self.resolver.watch_revision(),
@@ -1559,7 +1614,9 @@ impl Ingress {
                     self.command_watch_metrics
                         .subscriptions
                         .load(Ordering::Relaxed),
-                    self.command_watch_metrics.environments.load(Ordering::Relaxed),
+                    self.command_watch_metrics
+                        .environments
+                        .load(Ordering::Relaxed),
                     self.command_watch_metrics
                         .reconnects
                         .load(Ordering::Relaxed),
@@ -1982,7 +2039,7 @@ impl Ingress {
         if request.headers().contains_key(header::UPGRADE) {
             if let Some((selection, backend_uri)) = api.take_service_selection(&mut request) {
                 let stream = match api.service_access().connect_service(self, selection).await {
-                    Ok(stream) => stream,
+                    Ok((stream, _selection)) => stream,
                     Err(super::agent_service::ServiceAccessError::Agent(error)) => {
                         return super::agent_response::error_response(error, None);
                     }

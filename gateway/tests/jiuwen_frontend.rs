@@ -264,6 +264,7 @@ async fn frontend_and_e2a_driver_preserve_user_and_runtime_request_correlation()
                 },
                 requests,
                 output,
+                None,
             )
             .await
             .map_err(ConnectionError::from)

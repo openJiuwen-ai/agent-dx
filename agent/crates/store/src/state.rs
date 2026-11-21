@@ -369,9 +369,12 @@ impl AgentState {
     ) -> Result<AgentBinding> {
         self.commit_binding(scope, parameters, false, None, None)
             .await
+            .map(|(binding, _created)| binding)
     }
 
     /// Fix the version checked by the caller together with the Environment startup decision.
+    /// The boolean reports whether this call won the commit; a CAS loser receives the
+    /// concurrent winner and must not classify itself as a cold start.
     pub async fn create_binding_for_version(
         &self,
         scope: Scope,
@@ -379,7 +382,7 @@ impl AgentState {
         reuse_subject_binding: bool,
         version: &str,
         checked_snapshot: Option<&str>,
-    ) -> Result<AgentBinding> {
+    ) -> Result<(AgentBinding, bool)> {
         self.commit_binding(
             scope,
             parameters,
@@ -397,7 +400,7 @@ impl AgentState {
         reuse_subject_binding: bool,
         selected_version: Option<&str>,
         checked_snapshot: Option<&str>,
-    ) -> Result<AgentBinding> {
+    ) -> Result<(AgentBinding, bool)> {
         for _ in 0..limits::CAS_ATTEMPTS {
             match self
                 .create_binding_with_decision(
@@ -426,7 +429,7 @@ impl AgentState {
         reuse_subject_binding: bool,
         selected_version: Option<&str>,
         checked_snapshot: Option<&str>,
-    ) -> Result<Option<AgentBinding>> {
+    ) -> Result<Option<(AgentBinding, bool)>> {
         let key = binding_key(&scope)?;
         let history = crate::prewarm::history_key(&scope)?;
         let previous_history = self.store.get(&history).await?;
@@ -438,7 +441,7 @@ impl AgentState {
                 .await?
             {
                 return if binding.phase == BindingPhase::Active {
-                    Ok(Some(binding))
+                    Ok(Some((binding, false)))
                 } else {
                     Err(Error::Conflict("binding is deleting".into()))
                 };
@@ -503,14 +506,14 @@ impl AgentState {
             .commit(&Transaction::new(checks, writes)?)
             .await?
         {
-            return Ok(Some(value));
+            return Ok(Some((value, true)));
         }
         let Some(existing) = self.store.get(&key).await? else {
             return Ok(None);
         };
         let existing: AgentBinding = existing.decode()?;
         if existing.phase == BindingPhase::Active {
-            Ok(Some(existing))
+            Ok(Some((existing, false)))
         } else {
             Err(Error::Conflict("binding is deleting".into()))
         }

@@ -245,7 +245,8 @@ impl Activator {
                 &volumes,
                 deadline,
             )
-            .await;
+            .await
+            .map(|(observed, _pre_phase)| observed);
         if !self
             .reference_is_active(&binding, &secondary.environment)
             .await?
@@ -616,14 +617,18 @@ impl Activator {
         deadline: u64,
     ) -> Result<adx_agent_core::activator::ResolvedTarget> {
         let activation = &request.activation;
-        let target = self
+        let (target, start) = self
             .activate_selected(activation, deadline, Some(request.service))
             .await?;
         let port = request
             .service
             .select(&target.service)
             .map_err(Error::Invalid)?;
-        Ok(adx_agent_core::activator::ResolvedTarget { target, port })
+        Ok(adx_agent_core::activator::ResolvedTarget {
+            target,
+            port,
+            activation: start,
+        })
     }
     pub async fn binding(&self, scope: &Scope) -> Result<AgentBinding> {
         self.state.binding(scope).await?.ok_or(Error::NotFound)
@@ -708,13 +713,14 @@ impl Activator {
             None,
         )
         .await
+        .map(|(target, _start)| target)
     }
     async fn activate_selected(
         &self,
         request: &ActivationRequest,
         deadline_unix_ms: u64,
         service: Option<adx_agent_core::activator::ServiceSelector>,
-    ) -> Result<Target> {
+    ) -> Result<(Target, adx_agent_core::activator::ActivationKind)> {
         let scope = &request.scope;
         let expected_generation = request.expected_generation.as_deref();
         scope.validate().map_err(Error::Invalid)?;
@@ -745,7 +751,10 @@ impl Activator {
                                 ));
                             }
                             binding.touched = Instant::now();
-                            return Ok(target.clone());
+                            return Ok((
+                                target.clone(),
+                                adx_agent_core::activator::ActivationKind::BindingReuse,
+                            ));
                         }
                     }
                 }
@@ -772,8 +781,8 @@ impl Activator {
         } else {
             self.state.binding(scope).await?
         };
-        let binding = match existing {
-            Some(binding) => binding,
+        let (binding, created) = match existing {
+            Some(binding) => (binding, false),
             None if expected_generation.is_some() => {
                 return Err(Error::Conflict(
                     "selected AgentBinding no longer exists".into(),
@@ -868,7 +877,7 @@ impl Activator {
                 return Err(Error::Conflict("binding changed during activation".into()));
             }
         };
-        let observed = observed?;
+        let (observed, pre_phase) = observed?;
         Self::validate_observation(&binding, &binding.current, &observed)?;
         // A target is a stable identity, not proof of a live execution. Only the
         // authorized Gateway data path requests Platform EnsureRunning.
@@ -902,7 +911,22 @@ impl Activator {
                 cached.touched = Instant::now();
             }
         }
-        Ok(target)
+        let activation = if created || pre_phase.is_none() {
+            // A new Binding or a new/recreated Environment is a cold start. A CAS
+            // loser reports `created = false` and falls through to phase inspection.
+            adx_agent_core::activator::ActivationKind::Cold
+        } else if matches!(
+            pre_phase,
+            Some(EnvironmentPhase::Pausing | EnvironmentPhase::Paused | EnvironmentPhase::Resuming)
+        ) {
+            adx_agent_core::activator::ActivationKind::Resumed
+        } else if matches!(pre_phase, Some(EnvironmentPhase::Running)) && observed.ready {
+            // Existing warm execution: no creation and no wake were needed.
+            adx_agent_core::activator::ActivationKind::BindingReuse
+        } else {
+            adx_agent_core::activator::ActivationKind::Unknown
+        };
+        Ok((target, activation))
     }
 
     pub async fn delete_binding(&self, scope: &Scope) -> Result<()> {
