@@ -49,28 +49,47 @@ def write_sample(path, payload):
     return {"bytes": len(payload), "sha256": sha256(payload).hexdigest(), "acknowledged": True}
 
 
+def sample_seed(seed, fd, size, digest):
+    if fd is not None:
+        return read_sample(fd, size, digest)
+    try:
+        with seed.open("rb", buffering=0) as reader:
+            return read_sample(reader.fileno(), size, digest)
+    except OSError as error:
+        return {"errno": error.errno}
+
+
 def main():
-    control, seed, name, size, digest, payload = sys.argv[1:]
+    control, seed, name, size, digest, payload, *mode = sys.argv[1:]
     control, seed = Path(control), Path(seed)
     size = int(size)
-    with seed.open("rb", buffering=0) as stream:
-        fd = stream.fileno()
-        emit(control, "opened", {"pid": os.getpid(), "fd": fd, "sample": read_sample(fd, size, digest)})
+    reopen = mode == ["reopen"]
+    stream = None if reopen else seed.open("rb", buffering=0)
+    fd = None if stream is None else stream.fileno()
+    close_errno = None
+    try:
+        emit(control, "opened", {"pid": os.getpid(), "fd": fd, "sample": sample_seed(seed, fd, size, digest)})
         await_signal(control, "probe")
         emit(control, "issued", {"fd": fd})
         outcome = write_sample(seed.with_name(name), bytes.fromhex(payload))
-        emit(control, "during", {"read": read_sample(fd, size, digest), "write": outcome})
+        emit(control, "during", {"read": sample_seed(seed, fd, size, digest), "write": outcome})
         await_signal(control, "resume")
         deadline = time.monotonic() + 25
         transient = []
         while True:
-            sample = read_sample(fd, size, digest)
+            sample = sample_seed(seed, fd, size, digest)
             if "errno" not in sample or time.monotonic() >= deadline:
                 break
             transient.append(sample["errno"])
             time.sleep(0.1)
-        emit(control, "recovered", {"pid": os.getpid(), "fd": fd, "sample": sample,
-                                    "transient_errno": transient})
+    finally:
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError as error:
+                close_errno = error.errno
+    emit(control, "recovered", {"pid": os.getpid(), "fd": fd, "sample": sample,
+                                "transient_errno": transient, "close_errno": close_errno})
 
 
 if __name__ == "__main__":

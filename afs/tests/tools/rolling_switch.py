@@ -14,7 +14,7 @@ FINAL_BODY = b"committed after version switch\n" * 4096
 ORDER = ("M", "B", "A")
 
 
-def switch_role(cluster, role, inputs, identity):
+def switch_role(cluster, role, inputs, identity, *, reopen):
     peer = "A" if role == "B" else "B"
     suffix = role.lower()
     helper = "rollout-" + suffix
@@ -23,10 +23,10 @@ def switch_role(cluster, role, inputs, identity):
     digest = sha256(offline.SEED).hexdigest()
     cluster.spawn_python(peer, helper, PROBE.read_text(),
                          remote_join(cluster.workspace(peer), "seed"),
-                         name, len(offline.SEED), digest, payload.hex())
+                         name, len(offline.SEED), digest, payload.hex(), "reopen" if reopen else "held")
     opened = cluster.await_helper_signal(helper, "opened", timeout=30)
     if not opened["sample"].get("valid"):
-        raise AssertionError(f"{role}: pre-switch held FD has wrong data: {opened}")
+        raise AssertionError(f"{role}: pre-switch read has wrong data: {opened}")
     cluster.stop(role)
     cluster.helper_signal(helper, "probe", {})
     issued = cluster.await_helper_signal(helper, "issued", timeout=10)
@@ -40,11 +40,12 @@ def switch_role(cluster, role, inputs, identity):
     cluster.wait_helper(helper)
     outage_read = during["read"]
     if "errno" not in outage_read and not outage_read["valid"]:
-        raise AssertionError(f"{role}: held FD returned corrupt data during switch: {outage_read}")
+        raise AssertionError(f"{role}: read returned corrupt data during switch: {outage_read}")
     if recovered["pid"] != opened["pid"] or recovered["fd"] != opened["fd"]:
         raise AssertionError(f"{role}: post-switch read used a different process or FD: {recovered}")
-    if not recovered["sample"].get("valid"):
-        raise AssertionError(f"{role}: held FD did not recover after switch: {recovered}")
+    if not recovered["sample"].get("valid") or recovered["close_errno"] is not None:
+        reader = "fresh reopen" if reopen else "held FD"
+        raise AssertionError(f"{role}: {reader} did not recover after switch: {recovered}")
     cluster.topology()
     if during["write"]["acknowledged"]:
         return {name: payload}
@@ -72,7 +73,7 @@ def assert_absent(cluster, name):
     cluster.record("rollout.snapshot_absent." + name, result["returncode"] == 0)
 
 
-def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy):
+def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy, *, reopen=False):
     cluster.write("A", "seed", offline.SEED)
     wait_read(cluster, "B", "seed", offline.SEED)
     expected = offline.file_state(cluster)
@@ -85,7 +86,7 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy):
 
     def roll():
         for index, role in enumerate(ORDER):
-            acked.update(switch_role(cluster, role, new_inputs, new))
+            acked.update(switch_role(cluster, role, new_inputs, new, reopen=reopen))
             done = ORDER[:index + 1]
             cluster.record("rollout.checkpoint." + role,
                            {r: new["commit"] if r in done else old["commit"] for r in cluster.roles})
@@ -123,9 +124,10 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy):
     offline.run_phase(phases, "rollback_" + policy, rollback)
 
 
-def cases():
+def cases(*, reopen=False):
+    lane = "rolling_ack" if reopen else "rolling"
     for mode in ("ownerfs", "dfs"):
         profile = DfsProfile(copies=2, replica_failure="strict") if mode == "dfs" else None
         for policy in ("snapshot", "preserve"):
-            case = Case(f"{mode}.version.rolling_{policy}", (), mode, (), None, profile=profile)
+            case = Case(f"{mode}.version.{lane}_{policy}", (), mode, (), None, profile=profile)
             yield case, policy

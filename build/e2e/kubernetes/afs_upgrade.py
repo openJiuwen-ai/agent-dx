@@ -61,9 +61,9 @@ def scenarios(component, checks):
     from manifest import LABEL
 
     scenario = os.getenv('AFS_E2E_UPGRADE_SCENARIO', 'offline')
-    if scenario not in ('offline', 'rolling'):
-        raise ValueError('AFS_E2E_UPGRADE_SCENARIO must be offline or rolling')
-    rolling = scenario == 'rolling'
+    if scenario not in ('offline', 'rolling', 'rolling-ack'):
+        raise ValueError('AFS_E2E_UPGRADE_SCENARIO must be offline, rolling, or rolling-ack')
+    rolling = scenario != 'offline'
     run = component.run
     with run.case(TARGET, checks) as record, tempfile.TemporaryDirectory(prefix='afs-upgrade-') as temp:
         inputs = Path(temp)
@@ -116,7 +116,7 @@ def scenarios(component, checks):
             spec.loader.exec_module(version_switch)
             signal.signal(signal.SIGALRM, _timeout)
             entries, cleanup_errors = version_switch.exercise(
-                component.config, old_inputs, new_inputs, output, rolling=rolling,
+                component.config, old_inputs, new_inputs, output, rolling=rolling, reopen=scenario == 'rolling-ack',
             )
         finally:
             for sig, handler in handlers.items():
