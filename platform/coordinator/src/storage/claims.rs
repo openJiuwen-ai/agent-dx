@@ -1,6 +1,7 @@
 //! Atomic ownership registration for a locally admitted candidate. This is a
 //! storage primitive, not a scheduling/admission RPC: the coordinator must fence
 //! heartbeat expiry, apply placement rules and update its scheduling ledger.
+use super::managed_images::{admission_script, image_gate_fields, image_gates_key};
 use super::*;
 use adx_core::{
     scheduling::DeviceAllocation,
@@ -30,6 +31,7 @@ for _=1,nodes do
   cursor=cursor+2
 end
 if ARGV[cursor] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[cursor] then return 0 end
+if not admit_images(KEYS[4],cjson.decode(ARGV[#ARGV])) then return 0 end
 local next_header=ARGV[cursor+1]; cursor=cursor+2
 for i=first,first+tonumber(ARGV[2])*2-1,2 do redis.call('HSET',KEYS[1],ARGV[i],ARGV[i+1]) end
 for i=node_start,node_start+nodes*2-1,2 do redis.call('HINCRBY',KEYS[1],'node-ownership:' .. string.sub(ARGV[i],14),1) end
@@ -103,7 +105,7 @@ impl Session {
         spec: EnvironmentSpec,
         candidate: &LocalClaim,
     ) -> Result<ClaimOutcome> {
-        if volumes::has_volumes(&spec) {
+        if volumes::has_volumes(&spec) || !spec.execution.managed_image_publications.is_empty() {
             return self
                 .claim_batch(vec![(spec, candidate.clone())])
                 .await?
@@ -266,6 +268,10 @@ impl Session {
             pinned.push(self.pin_volumes(spec).await.map(|_| ()));
         }
         let uses_volumes = claims.iter().any(|(spec, _)| volumes::has_volumes(spec));
+        let gate_fields: BTreeSet<_> = claims
+            .iter()
+            .flat_map(|(spec, _)| image_gate_fields(spec))
+            .collect();
         let environment_fields: BTreeSet<_> = claims
             .iter()
             .map(|(spec, _)| format!("environment:{}", spec.id))
@@ -285,6 +291,22 @@ impl Session {
             .chain(node_fields.iter().cloned())
             .collect();
             let values = self.store.fields_vec(&fields).await?;
+            let closed_gates = if gate_fields.is_empty() {
+                BTreeSet::new()
+            } else {
+                let mut command = redis::cmd("HMGET");
+                command
+                    .arg(image_gates_key(&self.store.key))
+                    .arg(gate_fields.iter().collect::<Vec<_>>());
+                let versions: Vec<Option<i64>> = self.store.query(command).await?;
+                gate_fields
+                    .iter()
+                    .zip(versions)
+                    .filter_map(|(field, version)| {
+                        version.is_none_or(|value| value < 0).then_some(field)
+                    })
+                    .collect()
+            };
             let mut by_field: BTreeMap<_, _> = fields.into_iter().zip(values).collect();
             let header_value = by_field.remove(HEADER).flatten().ok_or(Error::Conflict)?;
             let header = self.header(&Some(header_value.clone()))?;
@@ -335,6 +357,7 @@ impl Session {
             let mut results = Vec::with_capacity(claims.len());
             let mut writes = Vec::new();
             let mut writing_nodes = BTreeMap::new();
+            let mut writing_gates = BTreeSet::new();
             for ((spec, candidate), pinned) in claims.iter().zip(&pinned) {
                 let result = (|| {
                     let node = nodes.get(&candidate.node_id).ok_or(Error::NotFound)?;
@@ -366,6 +389,10 @@ impl Session {
                     }
                     claim_admission(node)?;
                     pinned.clone()?;
+                    let gates = image_gate_fields(spec);
+                    if gates.iter().any(|gate| closed_gates.contains(gate)) {
+                        return Err(Error::Conflict);
+                    }
                     if let Some(id) = &spec.snapshot_id {
                         let (_, snapshot) = snapshots.get(id).ok_or(Error::NotFound)?;
                         if snapshot.template.tenant_id != spec.tenant_id
@@ -405,6 +432,7 @@ impl Session {
                             .reserve(&record, node)?;
                     }
                     environments.insert(spec.id.clone(), record.clone());
+                    writing_gates.extend(gates);
                     writing_nodes
                         .insert(candidate.node_id.clone(), candidate.node_session_id.clone());
                     writes.push((
@@ -421,11 +449,12 @@ impl Session {
             }
             let mut command = redis::cmd("EVAL");
             command
-                .arg(CLAIM_BATCH)
-                .arg(3)
+                .arg(admission_script(CLAIM_BATCH))
+                .arg(4)
                 .arg(&self.store.key)
                 .arg(self.snapshots_key())
                 .arg(self.volumes_key())
+                .arg(image_gates_key(&self.store.key))
                 .arg(self.epoch.to_string())
                 .arg(writes.len())
                 .arg(snapshot_ids.len())
@@ -449,6 +478,7 @@ impl Session {
             } else {
                 command.arg("").arg("").arg(0);
             }
+            command.arg(encode(&writing_gates)?);
             let values = RedisStore::publication_values(
                 writes
                     .iter()

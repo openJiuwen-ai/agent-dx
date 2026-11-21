@@ -15,6 +15,7 @@ Public HTTP contracts are separate from these internal gRPC protocols:
 | `environment_types.proto` | Shared Environment, Assignment, resources and scheduling types | Shared by control services |
 | `snapshot.proto` | Snapshot catalog, references and collection | Coordinator and Node snapshot services |
 | `volume.proto` | Tenant Volume definitions, references, node execution grants and initialization | Management: API Server identity; execution: owning node session |
+| `managed_images.proto` | Durable image publication receipts, caller holds and operator deletion claims | API Server identity; deletion additionally requires an administrator and explicit Coordinator configuration |
 | `credentials.proto` | API Key validation and administrator operations | AuthService and CredentialService |
 | `routes.proto` | Versioned Environment directory and committed route publication | EnvironmentDirectoryService and RouteService |
 | `node.proto` / `adx.node.v1` | Versioned Relay bindings and activity | Node-local UDS services |

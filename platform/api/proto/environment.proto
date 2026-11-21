@@ -7,6 +7,7 @@ import public "environment_types.proto";
 import public "snapshot.proto";
 import public "snapshot_preparation.proto";
 import public "volume.proto";
+import public "managed_images.proto";
 import public "credentials.proto";
 import public "routes.proto";
 

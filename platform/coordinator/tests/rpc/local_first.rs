@@ -1,5 +1,100 @@
 use super::*;
 
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn managed_image_dependencies_are_durable_before_either_runtime_start() {
+    use adx_core::managed_images::{ImageRetention, ManagedImage, RegistryScope};
+    let mut rig = Rig::new().await;
+    let image = rig
+        .session
+        .begin_managed_image(
+            ManagedImage::new(
+                "b".repeat(64),
+                "tenant",
+                "admission",
+                ImageRetention::Retained,
+                RegistryScope {
+                    authority: "registry.test".into(),
+                    repository_prefix: "managed".into(),
+                },
+                1,
+            )
+            .unwrap(),
+            1024,
+            128,
+        )
+        .await
+        .unwrap();
+    let repository = format!(
+        "registry.test/managed/0123456789abcdef0123456789abcdef/publications/{}/service-0",
+        image.id
+    );
+    let digest = format!("sha256:{}", "a".repeat(64));
+    rig.session
+        .mutate_managed_image("tenant", &image.id, |image| {
+            image.register_outputs(
+                std::collections::BTreeMap::from([(
+                    "single".into(),
+                    format!("{repository}:build"),
+                )]),
+                "test-attempt",
+            )?;
+            image.complete(
+                std::collections::BTreeMap::from([("single".into(), digest.clone())]),
+                "test-attempt",
+            )
+        })
+        .await
+        .unwrap();
+    for central in [true, false] {
+        let id = if central {
+            "managed-image-central"
+        } else {
+            "managed-image-local"
+        };
+        let mut raw = spec(id);
+        if central {
+            // Plain SDK image strings must protect the publication too.
+            raw.image = format!("{repository}@{digest}");
+        } else {
+            raw.execution
+                .managed_image_publications
+                .insert(image.id.clone());
+        }
+        let mut request = create(id);
+        request.spec = Some(raw.into());
+        let created = if central {
+            rig.coordinator
+                .create_environment(request)
+                .await
+                .unwrap()
+                .into_inner()
+        } else {
+            rig.nodes[0]
+                .create_local_environment(pb::LocalEnvironmentCreateRequest {
+                    persist_claim: false,
+                    create: Some(request),
+                    node_session_id: "boot-a".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        let record = created.record.unwrap();
+        assert_eq!(record.state, pb::EnvironmentState::Running as i32);
+        // Backend::start independently checks Redis before returning a runtime result.
+        assert!(rig.session.get(id).await.is_ok());
+        rig.delete(&record).await;
+    }
+    assert_eq!(
+        rig.backends
+            .iter()
+            .map(|b| b.started.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        2
+    );
+}
+
 #[path = "create_identity.rs"]
 mod create_identity;
 

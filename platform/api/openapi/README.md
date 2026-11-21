@@ -22,6 +22,8 @@ checkpoint cooperation is an internal Adxlet contract documented in
 
 ## Runtime action contracts
 
+Managed image ownership operations are documented in [the managed image contract](../http/managed-images.md) and `environment.yaml`. These operations never perform Registry network I/O in the API Server or Coordinator. Reclamation requires explicit operator configuration and credentials; blob GC is separate.
+
 `POST /direct/{instanceId}/invoke` uses `InvokeRequest.oneOf` to select typed
 process, file and shell arguments from `action`. Each variant's
 `x-adx-result-schema` points to its result schema. The HTTP 200 response uses

@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "snapshot.proto",
         "snapshot_preparation.proto",
         "volume.proto",
+        "managed_images.proto",
         "credentials.proto",
         "routes.proto",
     ] {

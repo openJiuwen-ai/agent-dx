@@ -11,6 +11,8 @@ mod common;
 mod counter_compaction;
 #[path = "storage/dormancy.rs"]
 mod dormancy;
+#[path = "storage/managed_images.rs"]
+mod managed_images;
 #[path = "storage/master_upgrade.rs"]
 mod master_upgrade;
 #[path = "storage/node_retirement.rs"]

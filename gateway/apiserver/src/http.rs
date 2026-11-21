@@ -256,6 +256,35 @@ impl Api {
                 Err(error) => error_response(error, &request_id, None, None, method != "GET"),
             };
         }
+        if path == "/api/environment/v1/managed-images"
+            || path.starts_with("/api/environment/v1/managed-images/")
+        {
+            let id = path.strip_prefix("/api/environment/v1/managed-images/");
+            let input = if method == "POST" {
+                match body(
+                    request.into_body(),
+                    adx_core::managed_images::MANAGED_IMAGE_MUTATION_BYTES,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => return error_response(error, &request_id, None, None, false),
+                }
+            } else {
+                Value::Null
+            };
+            return response(
+                Box::pin(
+                    self.environment_service
+                        .managed_image_request(&method, id, input, &query, &caller),
+                )
+                .await,
+                &request_id,
+                None,
+                None,
+                method != "GET",
+            );
+        }
         if path == "/api/environment/v1/volumes" || path.starts_with("/api/environment/v1/volumes/")
         {
             let id = path.strip_prefix("/api/environment/v1/volumes/");

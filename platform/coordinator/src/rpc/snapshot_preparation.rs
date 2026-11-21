@@ -772,6 +772,10 @@ impl SnapshotPreparationService for CoordinatorRpc {
         spec.run_policy = None;
         spec.snapshot_id = None;
         spec.resources = build.resources;
+        session
+            .normalize_managed_image_dependencies(&mut spec, self.managed_registry())
+            .await
+            .map_err(status)?;
         spec.validate().map_err(status)?;
         if build.state != PreparationState::Registered {
             return Err(Status::invalid_argument(

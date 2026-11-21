@@ -1,5 +1,6 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S3Source {
@@ -464,6 +465,9 @@ impl WorkloadProcess {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionOptions {
+    /// Normalized artifact dependencies retained by this execution and its captures.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub managed_image_publications: BTreeSet<String>,
     /// Identity for the runtime daemon and its tool operations. Backend support is required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,

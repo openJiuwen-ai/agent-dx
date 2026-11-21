@@ -21,4 +21,5 @@ pub mod workspace_affinity;
 mod directory;
 mod environment_directory;
 
+mod managed_images;
 mod volumes;

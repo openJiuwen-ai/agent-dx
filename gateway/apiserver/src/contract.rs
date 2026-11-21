@@ -828,6 +828,17 @@ pub fn create_spec_with_environment(
         tunnel: security(&data_plane.tunnel_security_mode)?,
         port_forward: security(&data_plane.port_forward_security_mode)?,
     };
+    // The installed SDK transports this field in extraConfig. Convert it once
+    // so backend configuration and durable dependency interpretation stay separate.
+    let managed_image_publications = r
+        .extra_config
+        .remove("managedImagePublications")
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| invalid("invalid managed image dependencies"))?
+        .unwrap_or_default();
+    adx_core::managed_images::validate_dependencies(&managed_image_publications)
+        .map_err(|error| invalid(&error.to_string()))?;
     let extra_config = if r.extra_config.is_empty() {
         String::new()
     } else {
@@ -835,6 +846,7 @@ pub fn create_spec_with_environment(
             .map_err(|_| invalid("invalid environment extra_config"))?
     };
     let environment = adx_core::execution::ExecutionOptions {
+        managed_image_publications,
         protected_ingress: Vec::new(),
         private_service_ports: Vec::new(),
         user: r.user,

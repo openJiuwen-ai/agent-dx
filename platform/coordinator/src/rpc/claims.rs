@@ -172,7 +172,7 @@ impl CoordinatorRpc {
         state
             .live_claimant(node, &request.node_session_id, self.0.heartbeat_timeout)
             .map_err(status)?;
-        let spec = cloning::normalize(&state.session, raw)
+        let spec = cloning::normalize(&state.session, raw, self.managed_registry())
             .await
             .map_err(status)?;
         let snapshot = match &spec.snapshot_id {
@@ -331,7 +331,7 @@ impl CoordinatorRpc {
         } else {
             let domains = self.volume_domains(&state).map_err(status)?;
             state
-                .prepare_volumes(&spec, &domains)
+                .prepare_dependencies(&spec, &domains)
                 .await
                 .map_err(status)?;
             if !state
@@ -363,9 +363,13 @@ impl CoordinatorRpc {
         }
         let snapshot = if let Some(id) = &spec.snapshot_id {
             if existing.is_none() {
-                let normalized = cloning::normalize(&state.session, spec.clone().into())
-                    .await
-                    .map_err(status)?;
+                let normalized = cloning::normalize(
+                    &state.session,
+                    spec.clone().into(),
+                    self.managed_registry(),
+                )
+                .await
+                .map_err(status)?;
                 if normalized != spec {
                     return Err(Status::invalid_argument(
                         "snapshot specification must be normalized",
@@ -395,7 +399,7 @@ impl CoordinatorRpc {
             .entry(spec.id.clone())
             .or_default()
             .insert(request_id);
-        if !persistent && !crate::storage::has_volumes(&spec) {
+        if !persistent && !State::persistent_dependencies(&spec) {
             let deadline = deadline
                 .ok_or_else(|| Status::invalid_argument("local reservation deadline required"))?;
             let generation = state.session.next_generation().map_err(status)?;

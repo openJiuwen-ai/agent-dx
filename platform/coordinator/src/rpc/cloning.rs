@@ -1,14 +1,20 @@
 //! Snapshot creation inherits runtime geometry and defaults to source-node
 //! affinity. Its reference protects the artifact while restoring the execution.
 use super::*;
+use adx_core::managed_images::RegistryScope;
 use adx_core::snapshots::{Reference, Snapshot, SnapshotState};
 
 pub(super) async fn normalize(
     session: &Session,
     request: pb::EnvironmentSpec,
+    registry: Option<&RegistryScope>,
 ) -> Result<EnvironmentSpec> {
     let Some(id) = &request.snapshot_id else {
-        return request.try_into();
+        let mut spec = request.try_into()?;
+        session
+            .normalize_managed_image_dependencies(&mut spec, registry)
+            .await?;
+        return Ok(spec);
     };
     let snapshot = session.get_snapshot(id).await?;
     let reference = Reference::Restore {
@@ -33,7 +39,20 @@ pub(super) async fn normalize(
     if request.id == snapshot.template.id {
         return Err(Error::Conflict);
     }
-    inherit_template(request, &snapshot, existing.as_ref())
+    let mut inherited = inherit_template(request, &snapshot, existing.as_ref())?;
+    inherited.execution.managed_image_publications.extend(
+        snapshot
+            .template
+            .execution
+            .managed_image_publications
+            .iter()
+            .cloned(),
+    );
+    session
+        .normalize_managed_image_dependencies(&mut inherited, registry)
+        .await?;
+    inherited.validate()?;
+    Ok(inherited)
 }
 
 fn inherit_template(
@@ -793,7 +812,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let spec = normalize(&session, clone_request(&snapshot)).await.unwrap();
+        let spec = normalize(&session, clone_request(&snapshot), None)
+            .await
+            .unwrap();
         session
             .acquire_snapshot(
                 &snapshot.id,
@@ -828,7 +849,7 @@ mod tests {
         redis.start().await;
         let recovered = redis.store().await.begin(2).await.unwrap();
         assert_eq!(
-            normalize(&recovered, clone_request(&snapshot))
+            normalize(&recovered, clone_request(&snapshot), None)
                 .await
                 .unwrap(),
             spec

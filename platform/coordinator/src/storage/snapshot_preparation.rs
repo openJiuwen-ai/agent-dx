@@ -1,5 +1,6 @@
 //! Epoch-fenced preparation records and their atomic active-name index.
 use super::*;
+use crate::storage::managed_images::{admission_script, image_gate_fields, image_gates_key};
 use adx_core::snapshot_preparation::{
     normalize_name, valid_preparation_id, validate_template_tenant, PreparationState,
     SnapshotPreparation, SnapshotTemplate, SnapshotTemplateUsage, SuccessfulPreparation,
@@ -74,6 +75,15 @@ impl Session {
         // Join the snapshot inventory ordering before reading the exact bytes that
         // will be bound. Reference mutations must not race a speculative cache update.
         let previous = old.map(decode_template).transpose()?;
+        let previous_spec = previous
+            .as_ref()
+            .and_then(|record| record.preparation.spec.as_ref());
+        let image_fields = next
+            .preparation
+            .spec
+            .as_ref()
+            .filter(|&spec| Some(spec) != previous_spec)
+            .map_or_else(Vec::new, image_gate_fields);
         let first_ready = next.preparation.state == PreparationState::Ready
             && previous
                 .as_ref()
@@ -118,7 +128,7 @@ impl Session {
         };
         let mut command = redis::cmd("EVAL");
         command
-            .arg(
+            .arg(admission_script(
                 r#"
             if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return -1 end
             local old=redis.call('HGET',KEYS[2],ARGV[2]) or ''
@@ -127,6 +137,7 @@ impl Session {
             if indexed ~= ARGV[6] then return 0 end
             if old == '' and redis.call('HLEN',KEYS[2]) >= tonumber(ARGV[8]) then return 2 end
             if ARGV[9] ~= '' and (redis.call('HGET',KEYS[4],ARGV[9]) or '') ~= ARGV[10] then return 0 end
+            if not admit_images(KEYS[5],cjson.decode(ARGV[12])) then return -1 end
             redis.call('HSET',KEYS[2],ARGV[2],ARGV[4])
             if ARGV[9] ~= '' then redis.call('HSET',KEYS[4],ARGV[9],ARGV[11]) end
             if ARGV[7] == 'active' then
@@ -136,12 +147,13 @@ impl Session {
             end
             return 1
         "#,
-            )
-            .arg(4)
+            ))
+            .arg(5)
             .arg(&self.store.key)
             .arg(self.snapshot_templates_key())
             .arg(self.snapshot_template_names_key())
             .arg(self.snapshots_key())
+            .arg(image_gates_key(&self.store.key))
             .arg(self.epoch.to_string())
             .arg(&next.id)
             .arg(old.unwrap_or(""))
@@ -152,7 +164,8 @@ impl Session {
             .arg(MAX_TEMPLATES)
             .arg(binding.as_ref().map_or("", |(_, snapshot)| snapshot.id.as_str()))
             .arg(binding.as_ref().map_or("", |(raw, _)| raw.as_str()))
-            .arg(binding.as_ref().map(|(_, snapshot)| encode(snapshot)).transpose()?.unwrap_or_default());
+            .arg(binding.as_ref().map(|(_, snapshot)| encode(snapshot)).transpose()?.unwrap_or_default())
+            .arg(encode(&image_fields)?);
         // Taking the committed view also invalidates it if this future is
         // cancelled while Redis may already have accepted the write.
         let mut committed = inventory.as_mut().and_then(|inventory| inventory.take());

@@ -407,6 +407,7 @@ impl From<core::ExecutionOptions> for pb::ExecutionOptions {
                 disk_bytes: value.limits.disk_bytes,
             }),
             extra_config: value.extra_config,
+            managed_image_publications: value.managed_image_publications.into_iter().collect(),
         }
     }
 }
@@ -461,6 +462,7 @@ impl TryFrom<pb::ExecutionOptions> for core::ExecutionOptions {
                 disk_bytes: limits.disk_bytes,
             },
             extra_config: value.extra_config,
+            managed_image_publications: value.managed_image_publications.into_iter().collect(),
         })
     }
 }

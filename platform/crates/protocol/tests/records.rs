@@ -72,6 +72,7 @@ fn environment_options_roundtrip_preserves_backend_contract() {
             disk_bytes: 4 << 30,
         },
         extra_config: r#"{"networkStack":"netstack"}"#.into(),
+        managed_image_publications: ["a".repeat(64)].into(),
     };
     let wire: control::ExecutionOptions = options.clone().into();
     assert_eq!(model::ExecutionOptions::try_from(wire).unwrap(), options);

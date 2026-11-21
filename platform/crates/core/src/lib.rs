@@ -2,6 +2,7 @@
 
 pub mod checkpoint;
 pub mod lifecycle;
+pub mod managed_images;
 pub mod runtime_profile;
 pub mod snapshot_preparation;
 pub mod snapshots;
@@ -223,6 +224,7 @@ impl EnvironmentSpec {
             ));
         }
         self.lifecycle.validate()?;
+        managed_images::validate_dependencies(&self.execution.managed_image_publications)?;
         self.resources.validate()?;
         self.scheduling.validate()?;
         self.execution.validate(&self.resources)

@@ -34,6 +34,10 @@ request confirms process spawn; graceful-stop tests separately wait for the chil
 to report that its TERM handler is installed before sending Stop. This keeps the
 fixture startup race separate from the production termination contract.
 
+Platform component CI also runs the managed image regressions against isolated
+Redis and mTLS fixtures. They cover durable admission fencing, lost executions,
+receipt paging and publication budgets.
+
 ## Pipeline controls
 
 Base builds publish verified candidates to OBS by default. PyPI publication remains opt-in.
@@ -249,6 +253,8 @@ cargo test --locked -p adx-coordinator --test storage \
 ```
 
 Replace the filter with any transport-recovery case above to run it directly.
+
+Managed-image ownership has separate required Platform regressions. The component gate generates an isolated mTLS fixture and runs the real AOF publication-restart case from the standard `storage` target together with the managed-image `rpc` cases. These validate acquisition/deletion fencing, retained Snapshot dependencies and both runtime admission paths; they are not part of the timing cases deferred above. Native Nydus/checkpoint/Registry GC qualification remains a separate consumer integration gate.
 
 ## Optional PyPI publication
 
