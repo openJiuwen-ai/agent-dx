@@ -17,6 +17,7 @@ ROOT = HERE.parents[2]
 BUILD_ENV = 'AFS_E2E_BASELINE_BUILD'
 COMMIT_ENV = 'AFS_E2E_BASELINE_COMMIT'
 POSIX_ENV = 'AFS_E2E_VERSION_POSIX'
+POSIX_TRUNCATE_ENV = 'AFS_E2E_POSIX_TRUNCATE_CONTROL'
 TARGET = 'afs-component-upgrade-rollback'
 BASELINE_POD = 'afs-baseline-input'
 
@@ -66,6 +67,9 @@ def scenarios(component, checks):
     if posix_value not in {'0', '1'}:
         raise ValueError(POSIX_ENV + ' must be 0 or 1')
     posix = posix_value == '1'
+    truncate_value = os.getenv(POSIX_TRUNCATE_ENV, '0')
+    if truncate_value not in {'0', '1'} or (truncate_value == '1' and not posix):
+        raise ValueError(POSIX_TRUNCATE_ENV + ' requires 0 or 1 and is available only in POSIX mode')
     with run.case(TARGET, checks) as record, tempfile.TemporaryDirectory(prefix='afs-upgrade-') as temp:
         inputs = Path(temp)
         baseline, registry, old = download_baseline(inputs)
@@ -116,7 +120,8 @@ def scenarios(component, checks):
             version_switch = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(version_switch)
             signal.signal(signal.SIGALRM, _timeout)
-            entries, cleanup_errors = version_switch.exercise(component.config, old_inputs, new_inputs, output, posix)
+            entries, cleanup_errors = version_switch.exercise(component.config, old_inputs, new_inputs, output, posix,
+                                                               posix_truncate_control=truncate_value == '1')
         finally:
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)

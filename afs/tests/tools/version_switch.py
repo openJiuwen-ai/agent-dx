@@ -65,14 +65,23 @@ def running_identity(cluster, role, identity):
     cluster.record("running." + role, {"pid": pid, "sha256": running, "commit": identity["commit"]})
 
 
-def start_role(cluster, role, identity):
-    cluster.start(role)
+def start_role(cluster, role, identity, *, posix_truncate_control=False):
+    name = "AFS_STAGE3_POSIX_DROP_TRUNCATE"
+    cluster.start(role, env={name: "1"} if posix_truncate_control else None)
     running_identity(cluster, role, identity)
+    if posix_truncate_control:
+        pid = cluster.channel(role).call("status")[role]["pid"]
+        cluster.python(
+            role,
+            "assert (sys.argv[2]+'=1').encode() in open('/proc/'+sys.argv[1]+'/environ','rb').read().split(b'\\0')",
+            pid, name, owner=False,
+        )
+        cluster.record("posix_truncate_control", {"role": role, "pid": pid, "env": name})
 
 
-def start_all(cluster, identity):
+def start_all(cluster, identity, *, posix_truncate_control=False):
     for role in cluster.roles:
-        start_role(cluster, role, identity)
+        start_role(cluster, role, identity, posix_truncate_control=posix_truncate_control and role == "A")
     cluster.topology()
 
 
@@ -154,7 +163,7 @@ def exercise_posix(cluster, phase):
         )
 
 
-def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, posix=False):
+def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, posix=False, *, posix_truncate_control=False):
     cluster.write("A", "seed", SEED)
     cluster.python("A", "os.chmod(sys.argv[1],0o640)", remote_join(cluster.workspace("A"), "seed"))
     wait_read(cluster, "B", "seed", SEED)
@@ -169,7 +178,7 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, posix=Fal
 
     def upgrade():
         install(cluster, new_inputs, new)
-        start_all(cluster, new)
+        start_all(cluster, new, posix_truncate_control=posix_truncate_control)
         check_seed(cluster, expected, location)
         cluster.write("B", "after-upgrade", AFTER)
         wait_read(cluster, "A", "after-upgrade", AFTER)
@@ -257,7 +266,7 @@ def retained_command(cluster, new_inputs, new, phases):
     run_phase(phases, "root_command_after_upgrade", verify_after_upgrade)
 
 
-def exercise(config, old_inputs, new_inputs, output, posix=False):
+def exercise(config, old_inputs, new_inputs, output, posix=False, *, posix_truncate_control=False):
     """Run all scenarios, retaining an independent result and cleanup per fixture."""
     output.mkdir()
     identities = [json.loads((inputs / "artifact-identity.json").read_text()) for inputs in (old_inputs, new_inputs)]
@@ -291,7 +300,8 @@ def exercise(config, old_inputs, new_inputs, output, posix=False):
             if suffix == "old_root_command":
                 retained_command(cluster, new_inputs, new, result["phases"])
             else:
-                exercise_switch(cluster, old_inputs, new_inputs, old, new, result["phases"], posix)
+                exercise_switch(cluster, old_inputs, new_inputs, old, new, result["phases"], posix,
+                                posix_truncate_control=posix_truncate_control)
             if all(phase["status"] == "passed" for phase in result["phases"].values()):
                 result["status"] = "passed"
         except (InterruptedError, TimeoutError):
