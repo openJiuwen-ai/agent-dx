@@ -374,6 +374,9 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                 {
                     return Err(Status::invalid_argument("invalid snapshot page"));
                 }
+                if r.environment_id.len() > 256 || r.environment_id.chars().any(char::is_control) {
+                    return Err(Status::invalid_argument("invalid snapshot environment"));
+                }
                 let kind: Option<adx_core::snapshots::SnapshotKind> = r
                     .kind
                     .map(pb::SnapshotKind::try_from)
@@ -385,8 +388,13 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                 state.healthy().map_err(status)?;
                 let session = state.session.clone();
                 drop(state);
+                // An omitted or empty filter lists the whole tenant catalog.
+                // Unknown IDs and IDs from another tenant yield an empty page
+                // instead of revealing whether the Environment exists.
+                let source_environment =
+                    (!r.environment_id.is_empty()).then_some(r.environment_id.as_str());
                 let snapshots = session
-                    .list_snapshots(&caller.tenant_id)
+                    .list_snapshots(&caller.tenant_id, source_environment)
                     .await
                     .map_err(status)?;
                 let mut page: Vec<_> = snapshots

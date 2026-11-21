@@ -666,12 +666,15 @@ class EnvironmentClient:
         self,
         *,
         name: Optional[str] = None,
+        environment_id: Optional[str] = None,
         page_token: Optional[str] = None,
         page_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
         if name is not None:
             params["name"] = name
+        if environment_id is not None:
+            params["environmentId"] = environment_id
         if page_token is not None:
             params["pageToken"] = page_token
         if page_size is not None:

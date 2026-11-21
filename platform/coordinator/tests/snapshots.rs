@@ -217,9 +217,25 @@ async fn snapshot_identity_is_immutable_and_tenant_checked() {
         .await
         .is_err());
     assert!(session.delete_snapshot(&first.id, "another").await.is_err());
-    let records = session.list_snapshots("tenant").await.unwrap();
-    assert_eq!(records, vec![first]);
-    assert!(session.list_snapshots("another").await.unwrap().is_empty());
+    let records = session.list_snapshots("tenant", None).await.unwrap();
+    assert_eq!(records, vec![first.clone()]);
+    assert!(session
+        .list_snapshots("another", None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        session
+            .list_snapshots("tenant", Some(&first.template.id))
+            .await
+            .unwrap(),
+        vec![first.clone()]
+    );
+    assert!(session
+        .list_snapshots("tenant", Some("other"))
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -235,7 +251,11 @@ async fn node_snapshot_catalog_retains_deleting_until_physical_deletion() {
     );
     assert!(session.node_snapshots("other").await.unwrap().is_empty());
     let deleting = session.delete_snapshot(&first.id, "tenant").await.unwrap();
-    assert!(session.list_snapshots("tenant").await.unwrap().is_empty());
+    assert!(session
+        .list_snapshots("tenant", None)
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(
         session.node_snapshots("node1").await.unwrap(),
         vec![deleting.clone()]
