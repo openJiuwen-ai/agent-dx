@@ -188,6 +188,7 @@ class Cluster:
         self.uid = config["uid"]
         self.gid = config["gid"]
         self.bind = False
+        self.ownerfs_epoch_dir = False
         self.helpers = {}
         self.effective = {}
         self.memory_mounts = {}
@@ -425,7 +426,8 @@ class Cluster:
             raise Blocked("staged artifact could not be placed: " + name + ": " + copied["stderr"][-300:])
         return channel.call("hash", path=destination)["sha256"]
 
-    def prepare(self, *, ownerfs_bind=True):
+    def prepare(self, *, ownerfs_bind=True, ownerfs_epoch_dir=False):
+        self.ownerfs_epoch_dir = ownerfs_epoch_dir
         infos = self.connect()
         identity = self.inputs(infos)
         binaries = list(identity["binaries"])
@@ -718,12 +720,14 @@ class Cluster:
                 assert {'nosuid', 'nodev'} <= options and mount.get('propagation') == 'private', (
                     'owner bind policy', mount
                 )
+                backing = 'b=(p/"workspace").stat();'
+                if self.ownerfs_epoch_dir:
+                    backing = 'v=list(p.glob("root-*-e*"));assert len(v)==1,v;b=v[0].stat();'
                 value = self.python(
                     role,
                     (
                         "from pathlib import Path\np=Path(sys.argv[1]);a=os.stat(sys.argv[2]);"
-                        'b=(p/"workspace").stat();assert '
-                        "(a.st_dev,a.st_ino)==(b.st_dev,b.st_ino)"
+                        + backing + "assert (a.st_dev,a.st_ino)==(b.st_dev,b.st_ino)"
                     ),
                     self.role_dir(role) + "/state/ownerfs",
                     path,

@@ -1,7 +1,9 @@
 """Deploy AFS beside the existing ADX fixture and exercise the installed SDK."""
 
+from contextlib import contextmanager
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -131,11 +133,28 @@ class Product:
             run.helper(node, 'empty', node)
         return report
 
+    @contextmanager
+    def sdk_case(self, mode, checks, failures):
+        name = 'afs-sdk-' + mode + ('-full' if self.full else '')
+        try:
+            with self.run.case(name, checks) as record:
+                yield record
+        except Exception as exc:
+            if not self.client or self.cleanup_errors:
+                raise
+            # One direction can break a specific filesystem mode. Run the
+            # other mode in a fresh fixture if the first fixture cleaned up.
+            failures.append(f'{mode}: {exc}')
+
     def scenarios(self, checks):
         run = self.run
         # Populate the runtime image cache before the AFS worker takes its mount baseline.
         self.sdk({'mode': 'warm'}, run.output / 'afs-sdk-warm.json')
         self.client = stage_client(run, self.service)
+        ownerfs_layout = os.getenv('AFS_E2E_SDK_SERVICE_OWNERFS_LAYOUT', 'workspace')
+        if ownerfs_layout not in {'workspace', 'root-epoch'} or (ownerfs_layout == 'root-epoch' and not self.client):
+            raise ValueError('SDK service OwnerFs layout must be workspace or root-epoch; '
+                             'root-epoch needs an independent client')
         path = str(ROOT / 'afs/tests')
         sys.path.insert(0, path)
         try:
@@ -145,6 +164,7 @@ class Product:
 
             with tempfile.TemporaryDirectory(prefix='adx-sdk-afs-') as temp:
                 inputs = Path(temp)
+                failures = []
                 for name in ('afs-meta', 'afs-node', 'artifact-identity.json'):
                     source = '/opt/adx/e2e/afs-tests/inputs/' if name.endswith('.json') else '/opt/adx/package/bin/'
                     self.copy_from('node1', source + name, inputs / name)
@@ -156,9 +176,11 @@ class Product:
                     case = Case('afs.sdk.' + mode, ('cluster-sdk',), mode, (), None)
                     cluster = Cluster(self.config, inputs, output, case, 'afs-test-' + uuid.uuid4().hex)
                     self.active = cluster
-                    with run.case('afs-sdk-' + mode + ('-full' if self.full else ''), checks) as record:
+                    with self.sdk_case(mode, checks, failures) as record:
                         try:
-                            cluster.prepare()
+                            if self.client and mode == 'ownerfs':
+                                cluster.record('sdk.ownerfs_backing_layout', ownerfs_layout)
+                            cluster.prepare(ownerfs_epoch_dir=ownerfs_layout == 'root-epoch')
                             identities = {}
                             for role in ('A', 'B'):
                                 visible = cluster.python(role,
@@ -193,6 +215,8 @@ class Product:
                                 self.cleanup_errors += cleanup['errors'] or ['AFS cleanup unconfirmed']
                             if self.cleanup_errors:
                                 raise ValueError('; '.join(self.cleanup_errors))
+                if failures:
+                    raise ValueError('independent SDK cases failed: ' + '; '.join(failures))
         finally:
             sys.path.remove(path)
 

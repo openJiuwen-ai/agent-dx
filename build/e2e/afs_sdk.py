@@ -152,7 +152,8 @@ def run(connection, image, config, output):
                                            'sha256': hashlib.sha256(actual).hexdigest()})
             left.files.write('/afs/sdk-api.bin', b'sdk-files-api\x00\xff')
             command(left, perl('open(my $f,"+<",shift) or die $!;$f->sync() or die $!;', '/afs/sdk-api.bin', uid=0))
-            assert right.files.read('/afs/sdk-api.bin', format='bytes') == b'sdk-files-api\x00\xff'
+            sdk_bytes = right.files.read('/afs/sdk-api.bin', format='bytes')
+            assert sdk_bytes == b'sdk-files-api\x00\xff', 'bidirectional-publish SDK files API bytes differ'
             passed('bidirectional-publish')
             if config.get('full', False):
                 # One live FD survives rename/name reuse and unlink inside the real mounted namespace.
