@@ -2105,6 +2105,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
     };
     let result = node
         .recover_environment(record.clone())
@@ -2202,6 +2203,7 @@ async fn shared_recovery_fixture() -> (
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
     };
     (temp, backend, node, seed, remote)
 }
@@ -2412,6 +2414,7 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
             last_operation: None,
             restart_attempts: 0,
             restart_pending: false,
+            resume_pending: false,
         };
         *backend.unavailable_state.lock().unwrap() = Some(failure_state);
         *backend.unavailable_commit.lock().unwrap() = true;

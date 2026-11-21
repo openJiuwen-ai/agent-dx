@@ -481,6 +481,7 @@ async fn failed_result_without_cleanup_proof_keeps_occupancy_and_stale_release_c
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
         execution_artifacts: vec![],
     };
     session
@@ -572,6 +573,7 @@ async fn shared_initialization_is_coordinated_and_failed_attributes_are_not_read
             last_operation: None,
             restart_attempts: 0,
             restart_pending: false,
+            resume_pending: false,
             execution_artifacts: vec![],
         };
         session
@@ -629,6 +631,7 @@ fn starting(
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,
+        resume_pending: false,
         execution_artifacts: vec![],
     }
 }
@@ -1713,6 +1716,7 @@ async fn volume_claim_batch_and_delete_preserve_request_identity_and_creation_su
             last_operation: None,
             restart_attempts: 0,
             restart_pending: false,
+            resume_pending: false,
             execution_artifacts: vec![],
         };
         if index == 0 {
@@ -1945,6 +1949,7 @@ async fn concurrent_initial_volume_publications_preserve_references_and_receipts
             last_operation: None,
             restart_attempts: 0,
             restart_pending: false,
+            resume_pending: false,
             execution_artifacts: vec![],
         };
         session

@@ -399,6 +399,7 @@ impl StoredEnvironment {
             failure: None,
             restart_attempts: 0,
             restart_pending: false,
+            resume_pending: false,
             runtime: adx_core::Runtime {
                 id: format!("{}-{}", self.spec.id, self.assignment.generation),
                 ip: None,
