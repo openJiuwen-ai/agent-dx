@@ -65,7 +65,9 @@ def scenarios(component, checks):
     if scenario in ('rolling-ownerfs', 'rolling-dfs'):
         rolling_mode = scenario.removeprefix('rolling-')
     elif scenario not in ('offline', 'rolling', 'rolling-ack'):
-        raise ValueError('AFS_E2E_UPGRADE_SCENARIO must be offline, rolling, rolling-ack, rolling-ownerfs, or rolling-dfs')
+        raise ValueError(
+            'AFS_E2E_UPGRADE_SCENARIO must be offline, rolling, rolling-ack, rolling-ownerfs, or rolling-dfs',
+        )
     rolling = scenario != 'offline'
     run = component.run
     with run.case(TARGET, checks) as record, tempfile.TemporaryDirectory(prefix='afs-upgrade-') as temp:
