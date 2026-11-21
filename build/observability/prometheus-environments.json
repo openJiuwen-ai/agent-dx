@@ -2,6 +2,9 @@
   "global": {
     "scrape_interval": "30s"
   },
+  "rule_files": [
+    "rules-environments.json"
+  ],
   "scrape_configs": [
     {
       "job_name": "adx-environment-detail",

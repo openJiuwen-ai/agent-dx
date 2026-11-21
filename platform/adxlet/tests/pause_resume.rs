@@ -559,6 +559,73 @@ fn resume(revision: u64) -> ResumeRequest {
         expected_revision: revision,
     }
 }
+fn lifecycle_count(operation: &str, outcome: &str) -> String {
+    format!(
+        "adx_platform_lifecycle_duration_seconds_count{{operation=\"{operation}\",outcome=\"{outcome}\",runtime_class=\"firecracker\"}}"
+    )
+}
+
+#[tokio::test]
+async fn pause_and_delete_record_one_lifecycle_duration_per_real_operation() {
+    let (_temp, _backend, node, spec, assignment) = fixture();
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    let request = pause(created.record.revision);
+    assert_eq!(
+        h.pause(request.clone()).await.unwrap().record.state,
+        EnvironmentState::Paused
+    );
+    let text = node.metrics();
+    assert!(
+        text.contains(&format!("{} 1\n", lifecycle_count("pause", "success"))),
+        "{text}"
+    );
+    // Replaying the accepted operation must not add a near-zero sample.
+    h.pause(request).await.unwrap();
+    let text = node.metrics();
+    assert_eq!(
+        text.matches(&lifecycle_count("pause", "success")).count(),
+        1
+    );
+    assert!(text.contains(&format!("{} 1\n", lifecycle_count("pause", "success"))));
+    // A real delete and its replay behave the same way.
+    h.delete().await.unwrap();
+    let text = node.metrics();
+    assert!(
+        text.contains(&format!("{} 1\n", lifecycle_count("delete", "success"))),
+        "{text}"
+    );
+    h.delete().await.unwrap();
+    let text = node.metrics();
+    assert_eq!(
+        text.matches(&lifecycle_count("delete", "success")).count(),
+        1
+    );
+    assert!(text.contains(&format!("{} 1\n", lifecycle_count("delete", "success"))));
+}
+
+#[tokio::test]
+async fn failed_pause_and_unconfirmed_delete_record_their_actual_outcome() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    *backend.unsupported_checkpoint.lock().unwrap() = true;
+    assert!(h.pause(pause(created.record.revision)).await.is_err());
+    let text = node.metrics();
+    assert!(
+        text.contains(&format!("{} 1\n", lifecycle_count("pause", "failure"))),
+        "{text}"
+    );
+    *backend.unsupported_checkpoint.lock().unwrap() = false;
+    // An unconfirmed runtime removal is `unknown`, not a definite failure.
+    *backend.fail_remove.lock().unwrap() = true;
+    assert!(h.delete().await.is_err());
+    let text = node.metrics();
+    assert!(
+        text.contains(&format!("{} 1\n", lifecycle_count("delete", "unknown"))),
+        "{text}"
+    );
+}
 
 async fn assert_pending<F: Future>(future: &mut Pin<Box<F>>) {
     std::future::poll_fn(|cx| {
@@ -656,7 +723,7 @@ async fn pause_resume_preserves_environment_changes_execution_and_fences_delayed
     assert_eq!(paused.record.state, EnvironmentState::Paused);
     assert!(!node
         .environment_metrics()
-        .contains("adx_environment_memory_usage_bytes"));
+        .contains("adx_environment_memory_usage_bytes{"));
     assert!(!paused.record.resources_held);
     assert_eq!(node.used(), Resources::default());
     assert!(

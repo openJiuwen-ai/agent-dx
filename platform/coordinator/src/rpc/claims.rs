@@ -62,6 +62,9 @@ impl State {
             .cloned()
             .collect();
         let mut scheduler = Coordinator::restore(&saved, self.placement)?;
+        // Keep the rebuilt scheduler on the same handle as the RPC layer and
+        // `/metrics`; otherwise later samples land in a detached registry.
+        scheduler.use_metrics(self.scheduler.metrics_handle());
         scheduler.use_generation_source(self.session.clone());
         for node in saved.nodes.values() {
             let mut candidate = node.node.clone();

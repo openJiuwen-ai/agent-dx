@@ -1337,6 +1337,65 @@ async fn metrics_follow_reservations_and_capacity_shrink() {
 }
 
 #[tokio::test]
+async fn create_exports_platform_phase_and_node_queue_samples() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let environment = node
+        .environment(spec("phases"), assignment("phases"))
+        .unwrap();
+    environment.create().await.unwrap();
+    let text = node.metrics();
+    for phase in [
+        "runtime_prepare",
+        "runtime_start",
+        "readiness",
+        "route_activation",
+        "state_publish",
+    ] {
+        assert!(
+            text.contains(&format!(
+                "adx_platform_phase_duration_seconds_count{{phase=\"{phase}\",outcome=\"success\",runtime_class=\"other\",producer=\"adxlet\"}} 1\n"
+            )),
+            "missing phase sample {phase}: {text}"
+        );
+    }
+    assert!(
+        text.contains(
+            "adx_platform_queue_wait_seconds_count{stage=\"node\",outcome=\"success\",runtime_class=\"other\"} 1\n"
+        ),
+        "missing node queue sample: {text}"
+    );
+    // Phase families belong to the node summary endpoint only.
+    assert!(!node.environment_metrics().contains("adx_platform_"));
+}
+
+#[tokio::test]
+async fn failed_create_closes_the_failing_stage_with_the_actual_outcome() {
+    let deps = Dependencies::new(false);
+    *deps.probe_failure.lock().unwrap() = Some(adx_core::probes::ProbeFailure::timeout("HTTP 503"));
+    let node = node(&deps);
+    let environment = node
+        .environment(workload_spec("phasefail", false), assignment("phasefail"))
+        .unwrap();
+    assert!(environment.create().await.is_err());
+    let text = node.metrics();
+    assert!(
+        text.contains(
+            "adx_platform_phase_duration_seconds_count{phase=\"readiness\",outcome=\"failure\",runtime_class=\"other\",producer=\"adxlet\"} 1\n"
+        ),
+        "failing stage must record the actual outcome: {text}"
+    );
+    assert!(text.contains(
+        "adx_platform_phase_duration_seconds_count{phase=\"runtime_prepare\",outcome=\"success\",runtime_class=\"other\",producer=\"adxlet\"} 1\n"
+    ));
+    assert!(text.contains(
+        "adx_platform_phase_duration_seconds_count{phase=\"runtime_start\",outcome=\"success\",runtime_class=\"other\",producer=\"adxlet\"} 1\n"
+    ));
+    assert!(!text.contains("phase=\"route_activation\""));
+    assert!(!text.contains("phase=\"state_publish\""));
+}
+
+#[tokio::test]
 async fn accepted_environment_operations_keep_request_context_after_caller_cancellation() {
     let _provider = adx_observability::trace::init("queue-test").unwrap();
     let deps = Dependencies::new(true);

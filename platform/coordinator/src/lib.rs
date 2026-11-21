@@ -17,7 +17,8 @@ pub mod rpc;
 mod shard;
 pub mod storage;
 
-use adx_core::{Assignment, EnvironmentSpec, Error, Result};
+use crate::metrics::{CoordinatorMetrics, QueueStage};
+use adx_core::{observation::Outcome, Assignment, EnvironmentSpec, Error, Result};
 use adx_scheduling::{Framework, PlacedEnvironment, Snapshot};
 pub use adx_scheduling::{Node, Placement};
 use journal::MutationJournal;
@@ -70,6 +71,8 @@ pub struct Coordinator {
     ready: VecDeque<usize>,
     retired: BTreeSet<String>,
     volume_placement: BTreeMap<String, VolumePlacement>,
+    /// Queue-wait and lifecycle observations exported from the same process.
+    metrics: Arc<CoordinatorMetrics>,
 }
 
 /// Coordinator-resolved storage topology and a currently unavailable exclusive UID.
@@ -107,6 +110,7 @@ impl Coordinator {
         for (id, shard) in self.shards.iter().enumerate() {
             shard.metrics(&mut text, id, unavailable);
         }
+        self.metrics.render(&mut text);
         text
     }
 
@@ -195,7 +199,17 @@ impl Coordinator {
             ready: VecDeque::new(),
             retired: BTreeSet::new(),
             volume_placement: BTreeMap::new(),
+            metrics: Arc::new(CoordinatorMetrics::default()),
         })
+    }
+
+    /// Share the process-wide observation handle with the RPC layer.
+    pub(crate) fn use_metrics(&mut self, metrics: Arc<CoordinatorMetrics>) {
+        self.metrics = metrics;
+    }
+
+    pub(crate) fn metrics_handle(&self) -> Arc<CoordinatorMetrics> {
+        self.metrics.clone()
     }
 
     pub(crate) fn forget_node(&mut self, id: &str) -> Result<()> {
@@ -433,6 +447,8 @@ impl Coordinator {
 
     /// Remove an unassigned request after its central queue deadline.
     /// Once a shard has reserved an Assignment, lifecycle completion owns cleanup.
+    /// The removed ticket closes the pure-wait measurement here, exactly once,
+    /// for every cancellation path (deadline expiry, resume fallback, volume wait).
     pub fn cancel_pending(&mut self, id: &str) -> bool {
         let Some((shard, _)) = self.requests.get(id) else {
             return false;
@@ -440,12 +456,28 @@ impl Coordinator {
         if self.shards[*shard].assignment(id).is_some() {
             return false;
         }
+        // Every shard must be cleaned: `forget_queued` also clears that shard's
+        // node exclusions. The ticket itself lives on the owning shard only.
+        let mut removed = None;
         for shard in &mut self.shards {
-            shard.forget_queued(id);
+            let entries = shard.forget_queued(id);
+            if removed.is_none() {
+                removed = entries.into_iter().next();
+            }
         }
         self.requests.remove(id);
         self.recovery_requests.remove(id);
         self.volume_placement.remove(id);
+        if let Some(entry) = &removed {
+            // Assignment and cancellation run under the same state lock, so a
+            // confirmed cancellation proves execution never started.
+            self.metrics.observe_queue_wait(
+                QueueStage::Schedule,
+                Outcome::Cancelled,
+                &entry.spec.runtime_class,
+                entry.enqueued_at.elapsed(),
+            );
+        }
         true
     }
 
@@ -471,8 +503,22 @@ impl Coordinator {
                 self.release(&old)?;
             }
         }
+        let mut removed = None;
         for shard in &mut self.shards {
-            shard.forget_queued(&spec.id);
+            let entries = shard.forget_queued(&spec.id);
+            if removed.is_none() {
+                removed = entries.into_iter().next();
+            }
+        }
+        // A local claim superseded a central queue ticket: the wait is real and
+        // must be closed instead of disappearing with the Entry.
+        if let Some(entry) = &removed {
+            self.metrics.observe_queue_wait(
+                QueueStage::Schedule,
+                Outcome::Cancelled,
+                &entry.spec.runtime_class,
+                entry.enqueued_at.elapsed(),
+            );
         }
         self.requests.remove(&spec.id);
         self.recovery_requests.remove(&spec.id);
@@ -491,8 +537,20 @@ impl Coordinator {
         if let Some(assignment) = assignment {
             self.release(&assignment)?;
         }
+        let mut removed = None;
         for shard in &mut self.shards {
-            shard.forget_queued(id);
+            let entries = shard.forget_queued(id);
+            if removed.is_none() {
+                removed = entries.into_iter().next();
+            }
+        }
+        if let Some(entry) = &removed {
+            self.metrics.observe_queue_wait(
+                QueueStage::Schedule,
+                Outcome::Cancelled,
+                &entry.spec.runtime_class,
+                entry.enqueued_at.elapsed(),
+            );
         }
         self.requests.remove(id);
         self.recovery_requests.remove(id);
@@ -642,7 +700,13 @@ impl Coordinator {
                 &self.config,
                 &self.volume_placement,
             ) {
-                Ok(Attempt::Assigned(assignment, spec)) => {
+                Ok(Attempt::Assigned(assignment, spec, enqueued_at)) => {
+                    self.metrics.observe_queue_wait(
+                        QueueStage::Schedule,
+                        Outcome::Success,
+                        &spec.runtime_class,
+                        enqueued_at.elapsed(),
+                    );
                     self.generation = generation;
                     Arc::make_mut(&mut self.snapshot).place(PlacedEnvironment {
                         spec,
@@ -752,6 +816,74 @@ mod tests {
             "resources": {"cpu_millis": 100, "memory_bytes": 128, "disk_bytes": 0}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn assignment_records_one_pure_wait_sample() {
+        let spec = spec();
+        let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+        coordinator
+            .register(Node {
+                id: "node".into(),
+                capacity: spec.resources,
+                available: true,
+                labels: Default::default(),
+                devices: vec![],
+                runtime_classes: vec![spec.runtime_class.clone()],
+            })
+            .unwrap();
+        coordinator.submit(spec).unwrap();
+        assert!(coordinator.schedule(0).unwrap().is_some());
+        let text = coordinator.metrics();
+        assert!(text.contains(
+            "adx_platform_queue_wait_seconds_bucket{stage=\"schedule\",outcome=\"success\",runtime_class=\"runsc\",le=\"+Inf\"} 1\n"
+        ));
+        assert!(text.contains(
+            "adx_platform_queue_wait_seconds_count{stage=\"schedule\",outcome=\"success\",runtime_class=\"runsc\"} 1\n"
+        ));
+    }
+
+    #[test]
+    fn confirmed_cancellation_records_one_pure_wait_sample() {
+        let spec = spec();
+        let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+        // No node: the request stays queued until the deadline cancels it.
+        coordinator.submit(spec.clone()).unwrap();
+        assert!(coordinator.cancel_pending(&spec.id));
+        let text = coordinator.metrics();
+        assert!(text.contains(
+            "adx_platform_queue_wait_seconds_bucket{stage=\"schedule\",outcome=\"cancelled\",runtime_class=\"runsc\",le=\"+Inf\"} 1\n"
+        ));
+        // A second cancellation is not a queue observation.
+        assert!(!coordinator.cancel_pending(&spec.id));
+    }
+
+    #[test]
+    fn local_first_assignment_does_not_record_a_queue_wait() {
+        let spec = spec();
+        let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+        coordinator
+            .register(Node {
+                id: "node".into(),
+                capacity: spec.resources,
+                available: true,
+                labels: Default::default(),
+                devices: vec![],
+                runtime_classes: vec![spec.runtime_class.clone()],
+            })
+            .unwrap();
+        let assignment = Assignment {
+            environment_id: spec.id.clone(),
+            node_id: "node".into(),
+            shard_id: 0,
+            generation: 1,
+            devices: vec![],
+        };
+        coordinator.restore_assignment(&spec, &assignment).unwrap();
+        let text = coordinator.metrics();
+        assert!(text.contains(
+            "adx_platform_queue_wait_seconds_bucket{stage=\"schedule\",outcome=\"success\",runtime_class=\"runsc\",le=\"+Inf\"} 0\n"
+        ));
     }
 
     #[test]

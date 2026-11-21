@@ -51,6 +51,10 @@ AgentBinding 缓存按完整 scope 保存已确认的 Target（含 generation、
 
 `bypasscache` 默认为 false；true 跳过 AgentBinding 成功绑定，不绕过不可变模板、认证或身份校验，不强制重建 Environment。已有 Running Environment 通过 GET 复用，平台确认不存在时才按原身份 CREATE。HTTP/WS 既有的一次发送前目标重试强制 bypass，并固定 generation；同名重建返回 Conflict，不切换生命周期。SSH 没有新增自动重试。Platform/Environment API 不变。
 
+### 缓存指标
+
+独立进程可配置可选私有 `metrics_listen`（示例 `127.0.0.1:19095`），只提供无鉴权的 `GET /metrics`，必须绑定部署私网监控接口；未配置时不监听。导出 `adx_agent_cache_access_total{cache="binding|template",result="hit|miss|bypass|error"}`，2 × 4 稠密 8 条，进程启动即为零。命中率分母固定为 `hit+miss`；`bypass`（显式刷新）与 `error`（模板仓储读取或解码失败）单列，不并入未命中。binding 查找不产生 `error`；`expected_generation` 与已缓存代次不符按 `miss` 计并返回 Conflict；模板缺失不缓存，重复读取缺失按真实后端读取次数记 `miss`。计数不改变缓存判定与返回路径。嵌入式 Activator 不新增监听。
+
 ### 内存容量
 
 默认容量为 200000 条。缓存包含 Binding parameters，其内存占用随参数数量和长度增加。当前字段布局新增后尚未重新测量 RSS，不使用旧结构体的测量值估算本版容量。

@@ -16,6 +16,7 @@ dependencies = [
  "adx-agent-store",
  "adx-core",
  "adx-error",
+ "adx-observability",
  "async-trait",
  "axum 0.7.9",
  "base64 0.22.1",
@@ -1678,6 +1679,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
+ "time",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
@@ -4007,6 +4009,7 @@ dependencies = [
  "bytes",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
+ "time",
 ]
 
 [[package]]

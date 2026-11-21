@@ -1274,9 +1274,19 @@ async fn coordinator_process_loads_configuration_and_restores_bootstrap_credenti
         })
         .await
         .unwrap();
-        assert!(!scrape_metrics(metrics_address)
-            .await
-            .contains("adx_coordinator_deleted_records"));
+        let scraped = scrape_metrics(metrics_address).await;
+        assert!(!scraped.contains("adx_coordinator_deleted_records"));
+        // The new platform observation families are exported from the same
+        // real-process endpoint, with dense zero baselines before any workload.
+        assert!(scraped.contains(
+            "adx_platform_queue_wait_seconds_count{stage=\"schedule\",outcome=\"success\",runtime_class=\"runsc\"} 0\n"
+        ));
+        assert!(scraped.contains(
+            "adx_platform_lifecycle_operations_total{operation=\"resume\",outcome=\"success\",reason_class=\"other\"} 0\n"
+        ));
+        assert!(scraped.contains(
+            "adx_platform_lifecycle_duration_seconds_count{operation=\"resume\",outcome=\"success\",runtime_class=\"runsc\"} 0\n"
+        ));
         let discovery =
             adx_discovery::RedisDiscovery::new(&redis.url, "process", Duration::from_secs(1))
                 .unwrap();

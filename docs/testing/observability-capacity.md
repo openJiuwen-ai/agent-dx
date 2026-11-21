@@ -68,6 +68,9 @@ prometheus --config.file=prometheus-environments.json \
 生效，现有 Prometheus 不支持在同一 TSDB 中用抓取 job 单独设置保留期。
 长期库和明细库不要再次合并远程写入同一个不分保留策略的存储。
 
+`prometheus.json` 加载 `rules.json`（创建 QPS）；`prometheus-environments.json`
+加载 `rules-environments.json`（逐环境利用率/覆盖率，依赖两个明细入口）。
+
 adxlet 汇总资源指标按有界 `runtime_class=runsc|firecracker|runc|other` 分组：
 
 - `adx_node_environment_cpu_usage_seconds_total`：把相邻同 runtime CPU 累计值的增量

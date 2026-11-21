@@ -35,6 +35,15 @@ impl DigitalMateGatewayConfig {
 }
 
 impl DigitalMateGatewayApi {
+    /// 注入适配器自有的业务观测；未配置 PG 时内部只有直埋指标。
+    pub fn with_observation(
+        mut self,
+        observation: std::sync::Arc<crate::ingress::digitalmategateway::observation::Observation>,
+    ) -> Self {
+        self.observation = Some(observation);
+        self
+    }
+
     #[cfg(test)]
     pub(super) fn has_prepared_composio(&self) -> bool {
         self.runtime.prepared_composio.is_some()
@@ -234,6 +243,7 @@ impl DigitalMateGatewayApi {
             #[cfg(test)]
             composio: None,
             webhook: None,
+            observation: None,
             runtime: Runtime {
                 prepared_composio: None,
                 privacy,

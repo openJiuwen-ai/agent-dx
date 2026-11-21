@@ -1,5 +1,5 @@
 use adx_activator::{Activator, Error};
-use adx_agent_core::{environment::*, *};
+use adx_agent_core::{cache::CacheKind, cache::CacheResult, environment::*, *};
 use adx_agent_store::{AgentState, Index, Key, MemoryRepository, Record, Repository, Transaction};
 use std::{
     collections::HashMap,
@@ -146,11 +146,14 @@ async fn warm_activation_skips_redis_and_platform() {
 async fn immutable_templates_share_cached_reads_without_caching_absence() {
     let store = Arc::new(Store::default());
     let state = AgentState::new(store.clone());
+    let metrics = state.cache_metrics();
     assert!(state
         .template("tenant", "app", "1")
         .await
         .unwrap()
         .is_none());
+    assert_eq!(metrics.count(CacheKind::Template, CacheResult::Miss), 1);
+    assert_eq!(metrics.count(CacheKind::Template, CacheResult::Hit), 0);
     state
         .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
         .await
@@ -167,18 +170,77 @@ async fn immutable_templates_share_cached_reads_without_caching_absence() {
         1,
         "concurrent template misses share one load"
     );
+    assert_eq!(
+        metrics.count(CacheKind::Template, CacheResult::Hit),
+        0,
+        "an empty cell is a miss even when a concurrent loader shares the read"
+    );
     store.reads.store(0, Ordering::SeqCst);
     assert_eq!(
         state.template("tenant", "app", "1").await.unwrap(),
         Some(template())
     );
+    assert_eq!(metrics.count(CacheKind::Template, CacheResult::Hit), 1);
     state.create_binding(scope()).await.unwrap();
     assert_eq!(
         store.reads.load(Ordering::SeqCst),
         0,
         "create reuses the immutable template too"
     );
+    let misses = metrics.count(CacheKind::Template, CacheResult::Miss);
     assert!(state.template("other", "app", "1").await.unwrap().is_none());
+    assert_eq!(
+        metrics.count(CacheKind::Template, CacheResult::Miss),
+        misses + 1,
+        "a missing immutable value is not cached and counts as a miss"
+    );
+    let misses_before_error = metrics.count(CacheKind::Template, CacheResult::Miss);
+    store.unavailable.store(true, Ordering::SeqCst);
+    assert!(state.template("tenant", "app", "2").await.is_err());
+    assert_eq!(metrics.count(CacheKind::Template, CacheResult::Error), 1);
+    assert_eq!(
+        metrics.count(CacheKind::Template, CacheResult::Miss),
+        misses_before_error,
+        "a repository failure counts as an error alone, never as a miss"
+    );
+}
+
+#[tokio::test]
+async fn binding_cache_metrics_distinguish_hit_miss_bypass_and_generation_change() {
+    let store = Arc::new(Store::default());
+    let platform = Arc::new(Platform::default());
+    let service = Activator::new(AgentState::new(store), platform);
+    let metrics = service.cache_metrics();
+    service
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
+    let target = service.activate(&scope(), None, deadline()).await.unwrap();
+    assert_eq!(metrics.count(CacheKind::Binding, CacheResult::Miss), 1);
+    assert_eq!(metrics.count(CacheKind::Binding, CacheResult::Hit), 0);
+    assert_eq!(
+        service.activate(&scope(), None, deadline()).await.unwrap(),
+        target
+    );
+    assert_eq!(metrics.count(CacheKind::Binding, CacheResult::Hit), 1);
+    // A cached target for another generation is unusable: miss, not hit.
+    assert!(matches!(
+        service
+            .activate_with_cache(&scope(), Some("other-generation"), deadline(), false)
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(metrics.count(CacheKind::Binding, CacheResult::Miss), 2);
+    service
+        .activate_with_cache(&scope(), Some(&target.binding.generation), deadline(), true)
+        .await
+        .unwrap();
+    assert_eq!(metrics.count(CacheKind::Binding, CacheResult::Bypass), 1);
+    assert_eq!(
+        metrics.count(CacheKind::Binding, CacheResult::Error),
+        0,
+        "binding lookup does not produce cache errors; store failures are not misses"
+    );
 }
 
 #[tokio::test]

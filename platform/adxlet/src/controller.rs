@@ -129,9 +129,16 @@ struct Envelope {
     command: Command,
     reply: Reply,
     trace: Option<adx_observability::trace::Trace>,
+    /// Process-local submission instant; node-side wait before dispatch ends at dequeue.
+    enqueued_at: Instant,
+    /// Bounded runtime class captured with the command so the sample carries the
+    /// class the caller was enqueued for, not whatever the record becomes later.
+    runtime_class: &'static str,
+    /// Periodic maintenance commands are not node queue work (detail design §6.6).
+    queue_observed: bool,
 }
 impl Envelope {
-    fn new(command: Command, reply: Reply) -> Self {
+    fn new(command: Command, reply: Reply, runtime_class: &'static str) -> Self {
         let trace = (!matches!(
             command,
             Command::Tick(_)
@@ -140,10 +147,17 @@ impl Envelope {
                 | Command::ReapOrphan(_, _)
         ))
         .then(|| adx_observability::trace::Trace::child("environment.queue"));
+        let queue_observed = !matches!(
+            command,
+            Command::Tick(_) | Command::Expire(_, _) | Command::CheckAuthority(_, _)
+        );
         Self {
             command,
             reply,
             trace,
+            enqueued_at: Instant::now(),
+            runtime_class,
+            queue_observed,
         }
     }
 }
@@ -160,6 +174,14 @@ pub struct EnvironmentHandle {
 }
 
 impl EnvironmentHandle {
+    fn envelope(&self, command: Command, reply: Reply) -> Envelope {
+        Envelope::new(command, reply, self.runtime_class())
+    }
+    /// Bounded runtime class of the current record, for queue-wait sampling.
+    fn runtime_class(&self) -> &'static str {
+        let current = self.current.borrow();
+        crate::metrics::runtime_class(&current.0.spec.runtime_class)
+    }
     pub(crate) fn record_usage(
         &self,
         metrics: &crate::metrics::Metrics,
@@ -203,7 +225,7 @@ impl EnvironmentHandle {
 
     async fn enqueue(&self, command: Command, reply: Reply) -> Result<()> {
         let restore_barrier = command.is_restore_barrier();
-        let envelope = Envelope::new(command, reply);
+        let envelope = self.envelope(command, reply);
         self.submissions
             .enqueue(&self.tx, envelope, restore_barrier)
             .await
@@ -224,6 +246,7 @@ impl EnvironmentHandle {
                 &self.tx,
                 RestoreKey::Resume(request.clone()),
                 Command::Resume(request),
+                self.runtime_class(),
             )
             .await
     }
@@ -243,6 +266,7 @@ impl EnvironmentHandle {
                 &self.tx,
                 RestoreKey::Ensure,
                 Command::EnsureRunning(operation_id, run_timeout_seconds),
+                self.runtime_class(),
             )
             .await
     }
@@ -276,6 +300,7 @@ impl EnvironmentHandle {
                 &self.tx,
                 RestoreKey::Recover(request.operation_id.clone()),
                 Command::Recover(request),
+                self.runtime_class(),
             )
             .await
     }
@@ -328,7 +353,9 @@ impl EnvironmentHandle {
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
     pub async fn delete(&self) -> Result<OperationResult> {
-        self.submissions.delete(&self.delete_tx).await
+        self.submissions
+            .delete(&self.delete_tx, self.runtime_class())
+            .await
     }
     /// Revision-fenced cleanup must not delete a later replacement execution.
     pub async fn delete_at_revision(&self, expected_revision: u64) -> Result<OperationResult> {
@@ -522,6 +549,7 @@ fn spawn_controller(
         observed_demand: 0,
         auto_pause_guard: None,
         create_deadline: None,
+        stage_timing: observation::StageTiming::default(),
         stopped_runtime_ids,
     };
     controller.publish_view();
@@ -689,7 +717,17 @@ fn spawn_controller(
                 command,
                 reply,
                 trace,
+                enqueued_at,
+                runtime_class,
+                queue_observed,
             } = envelope;
+            if queue_observed {
+                controller.services.metrics.observe_queue_wait(
+                    adx_core::observation::Outcome::Success,
+                    runtime_class,
+                    enqueued_at.elapsed(),
+                );
+            }
             let trace = match &command {
                 Command::CheckAuthority(check, _) => controller.authority_trace(check),
                 _ => trace,
@@ -1128,6 +1166,8 @@ struct Controller {
     snapshot_publication: Option<snapshots::SnapshotPublication>,
     create_deadline: Option<tokio::time::Instant>,
     auto_pause_guard: Option<AutoPauseGuard>,
+    /// Process-local monotonic timing for the current create/restore stage.
+    stage_timing: observation::StageTiming,
     demand: Arc<std::sync::atomic::AtomicU64>,
     observed_demand: u64,
     recovery_files: Option<ExecutionInput>,
@@ -1682,6 +1722,9 @@ impl Controller {
         };
         let mut awaiting_readiness = false;
         let mut stage = "backend preparation/runtime start";
+        // A new attempt owns its own timing; drop any stage left open by an
+        // earlier path so it cannot be reported as successful here.
+        self.stage_timing.reset();
         self.create_stage(adx_core::observation::CreateStage::RuntimePrepare);
         let operation_started = Instant::now();
         let submissions = self.submissions.clone();
@@ -1838,6 +1881,9 @@ impl Controller {
         let (runtime_start_ms, runtime_ready_ms, route_activate_ms) = match attempt {
             Ok(stages) => stages,
             Err(start_error) => {
+                // Finish before any fallible cleanup so a cleanup failure cannot
+                // swallow the stage sample for the actual failing stage.
+                self.finish_stage(crate::metrics::error_outcome(&start_error));
                 let start_error = if matches!(start_error, Error::Unavailable(_))
                     && self
                         .create_deadline
@@ -1930,7 +1976,10 @@ impl Controller {
                 };
             }
         };
-        self.transition(Event::Ready)?;
+        if let Err(error) = self.transition(Event::Ready) {
+            self.finish_stage(crate::metrics::error_outcome(&error));
+            return Err(error);
+        }
         if let Some((id, revision, kind)) = completion {
             self.completed(id, revision, kind);
         }
@@ -1947,6 +1996,7 @@ impl Controller {
         } else {
             self.sync().await
         };
+        self.finish_stage(crate::metrics::result_outcome(&result));
         adx_observability::info!(
             event = "environment_start_stages",
             environment_id = %self.record.spec.id,
@@ -2010,6 +2060,10 @@ impl Controller {
             .and_then(|o| o.intent)
             .unwrap_or(adx_core::observation::OperationIntent::Policy);
         let mut attempt = services.metrics.operation_attempt("delete", intent);
+        // A delete replay on an already deleted record is not a new node
+        // operation; the actor is serial, so this check cannot race.
+        let replay = self.record.state == EnvironmentState::Deleted;
+        let started = Instant::now();
         let result = self.delete_inner(user_delete).await;
         let cleared = self.clear_operation_intent().await;
         let result = match (result, cleared) {
@@ -2017,6 +2071,14 @@ impl Controller {
             (Err(error), _) | (_, Err(error)) => Err(error),
         };
         attempt.finish(&result);
+        if !replay {
+            self.services.metrics.observe_lifecycle(
+                crate::metrics::LifecycleOperation::Delete,
+                crate::metrics::result_outcome(&result),
+                &self.record.spec.runtime_class,
+                started.elapsed(),
+            );
+        }
         result
     }
     async fn delete_inner(&mut self, user_delete: bool) -> Result<OperationResult> {

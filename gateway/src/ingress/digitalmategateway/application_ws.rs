@@ -177,6 +177,7 @@ impl ApplicationWsConfig {
             access
                 .connect_service_when_ready(&ingress, selection)
                 .await
+                .map(|(stream, _selection)| stream)
                 .map_err(|e| match e {
                     ServiceAccessError::Agent(e) => agent_error(e),
                     ServiceAccessError::Ingress(_) => {

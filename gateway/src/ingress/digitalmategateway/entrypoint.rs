@@ -12,7 +12,7 @@ use super::{
 use crate::ingress::accounts::{self, BusinessAuth, Principal};
 use crate::ingress::{
     agent_service::{AgentV2Access, ServiceAccessError, ServiceSelector},
-    server::{Ingress, ProxyBody},
+    server::{AbortReason, Ingress, ProxyBody, StreamObserver, Transport},
 };
 use adx_agent_api::{managed::ManagedService, request::RequestContext, Error};
 use adx_agent_core::{Protocol, Scope};
@@ -248,6 +248,7 @@ pub struct DigitalMateGatewayApi {
     webhook: Option<Arc<super::ingestion::WebhookHttp>>,
     #[cfg(unix)]
     runtime: unix::Runtime,
+    observation: Option<Arc<super::observation::Observation>>,
 }
 
 impl DigitalMateGatewayApi {
@@ -435,6 +436,7 @@ impl DigitalMateGatewayApi {
             )
             .await;
         }
+        let auth_started = tokio::time::Instant::now();
         let token = match accounts::bearer(request.headers()) {
             Ok(v) => v,
             Err(e) => return auth_error(e),
@@ -516,6 +518,21 @@ impl DigitalMateGatewayApi {
         if request.uri().path() == "/file-api/upload" {
             return self.upload(request, ingress, scope, principal).await;
         }
+        // H1 计时：/ws 路径构造体验锚点。t0 = 请求进入认证流程的时刻；
+        // 认证本身是 ADX 准入、不在原始观测需求内，不导出阶段样本。
+        // 认证失败不构造（未认证请求不计业务量）；session/quota/download/upload
+        // 在此前已返回。
+        let anchor = self.observation.as_ref().map(|observation| {
+            observation.anchor(
+                &format!(
+                    "{}@{}",
+                    self.config.jiuwen.template, self.config.jiuwen.version
+                ),
+                auth_started,
+                &self.config.tenant,
+                &principal.user_id,
+            )
+        });
         // Client user_id is only an ignored hint. The authenticated session owns
         // both binding selection and the user identity sent to AgentServer.
         if request.uri().query().is_some_and(|query| {
@@ -552,7 +569,7 @@ impl DigitalMateGatewayApi {
             );
             Ok::<_, accounts::Error>(parameters)
         };
-        let selection = match access
+        let selection = access
             .select_with_initializer(
                 context.clone(),
                 scope.clone(),
@@ -562,8 +579,8 @@ impl DigitalMateGatewayApi {
                 },
                 initialization,
             )
-            .await
-        {
+            .await;
+        let selection = match selection {
             Ok(value) => value,
             Err(crate::ingress::agent_service::InitializationError::Agent(error)) => {
                 return agent_error(error)
@@ -572,21 +589,46 @@ impl DigitalMateGatewayApi {
                 return auth_error(error)
             }
         };
+        // M2-4：Activator 的启动模式判定回填到锚点（直埋标签）。
+        let start_mode = selection.start_mode().into();
+        let anchor = anchor.map(|anchor| anchor.with_start_mode(start_mode));
         let connection = match Connection::connect(&ingress, &access, selection).await {
             Ok(value) => value,
             Err(ConnectionError::Access(ServiceAccessError::Agent(e))) => return agent_error(e),
-            Err(_) => return error(StatusCode::BAD_GATEWAY, "AGENT_SERVER_UNAVAILABLE"),
+            Err(failure) => {
+                tracing::warn!(error = %failure, "Jiuwen backend connection failed");
+                return error(StatusCode::BAD_GATEWAY, "AGENT_SERVER_UNAVAILABLE");
+            }
         };
+        // 建连期间可能发生重选：以连接实际落到的启动模式为准，否则结果会被
+        // 归因到旧的选择。
+        let anchor = anchor.map(|anchor| anchor.with_start_mode(connection.start_mode()));
         if let Err(e) = self.auth.check(&principal).await {
             return auth_error(e);
         }
+        // 首用时延：t0（/ws 请求进入认证）→ 连接可用（环境就绪 + 后端建连 + 会话校验通过）。
+        // 失败不采样，避免把失败等待混入时延分布。
+        if let Some(anchor) = &anchor {
+            anchor.observe_first_use(auth_started.elapsed());
+        }
         let auth = self.auth.clone();
+        // 全流族：101 升级后外层不再包装响应体（server.rs 对带 UPGRADE 头的
+        // 请求插入观察者克隆），改由升级任务在会话结束时记录恰好一次；不在这里
+        // 取出，`full_stream{route_class=jiuwen,transport=ws}` 恒为零。
+        let stream_observer = request.extensions_mut().remove::<StreamObserver>();
         let upgrade = hyper::upgrade::on(&mut request);
         let config = self.config.clone();
         let span = tracing::info_span!("jiuwen_ws", connection_id = %uuid::Uuid::new_v4());
         let task = async move {
             let Ok(Ok(upgraded)) = tokio::time::timeout_at(context.deadline(), upgrade).await
             else {
+                if let Some(observer) = stream_observer {
+                    observer.record(
+                        Transport::Ws,
+                        adx_core::observation::Outcome::Failure,
+                        Some(AbortReason::ProtocolError),
+                    );
+                }
                 return;
             };
             let socket = WebSocketStream::from_raw_socket(
@@ -599,13 +641,29 @@ impl DigitalMateGatewayApi {
             let driver = config.driver();
             let user_id = principal.user_id.clone();
             let guard = accounts::SessionGuard { auth, principal };
-            let _ = frontend::run_authenticated(
+            let result = frontend::run_authenticated(
                 socket,
                 front,
-                |requests, output| connection.run(user_id, driver, requests, output),
+                |requests, output| connection.run(user_id, driver, requests, output, anchor),
                 guard,
             )
             .await;
+            if let Some(observer) = stream_observer {
+                // 正常断链不等于"完成交换"：与 reverse_proxy 的升级路径同口径，
+                // 正常结束记 unknown，拷贝/协议错误记 failure。
+                match result {
+                    Ok(()) => observer.record(
+                        Transport::Ws,
+                        adx_core::observation::Outcome::Unknown,
+                        None,
+                    ),
+                    Err(_) => observer.record(
+                        Transport::Ws,
+                        adx_core::observation::Outcome::Failure,
+                        Some(AbortReason::ProtocolError),
+                    ),
+                }
+            }
         };
         // `Instrument` carries only the tracing span, not the OTel context.
         // Forward the entry request's context so session logs stay correlated.
@@ -688,7 +746,7 @@ impl DigitalMateGatewayApi {
             principal,
         };
         let upload = Upload {
-            ingress,
+            ingress: ingress.clone(),
             context,
             tenant: scope.tenant,
             environment_id: target.current.environment_id,
@@ -1015,8 +1073,15 @@ impl DigitalMateGatewayApi {
             #[cfg(test)]
             composio: None,
             webhook: None,
+            observation: None,
         })
     }
+    /// 注入适配器自有的业务观测；未配置 PG 时内部只有直埋指标。
+    pub fn with_observation(mut self, observation: Arc<super::observation::Observation>) -> Self {
+        self.observation = Some(observation);
+        self
+    }
+
     pub async fn build(
         config: DigitalMateGatewayConfig,
         managed: Arc<ManagedService>,

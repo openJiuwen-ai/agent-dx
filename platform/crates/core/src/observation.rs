@@ -29,6 +29,15 @@ labels!(EvidenceSource {
     Coordinator => "coordinator", Control => "control", Unknown => "unknown",
 });
 labels!(OperationIntent { User => "user", Idle => "idle", Policy => "policy", Pressure => "pressure" });
+labels!(Outcome {
+    Success => "success", Failure => "failure", Cancelled => "cancelled", Unknown => "unknown",
+});
+labels!(ReasonClass {
+    Auth => "auth", Budget => "budget", Capacity => "capacity", Placement => "placement",
+    RuntimeStart => "runtime_start", Readiness => "readiness", Route => "route",
+    ModelUpstream => "model_upstream", Business => "business", Transport => "transport",
+    Cancelled => "cancelled", Unknown => "unknown", Other => "other",
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptionEvidence {

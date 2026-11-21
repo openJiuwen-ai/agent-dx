@@ -85,7 +85,7 @@ impl M44Authority {
             )
             .await
             .map_err(|_| Error::UpstreamUnavailable)?;
-        let stream = self
+        let (stream, _selection) = self
             .access
             .connect_service_when_ready(&self.ingress, selection)
             .await

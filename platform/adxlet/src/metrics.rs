@@ -1,10 +1,14 @@
 //! Sampled backend usage, exposed by the node for the deployment's collector.
 use crate::Adxlet;
-use adx_core::{EnvironmentRecord, EnvironmentState};
+use adx_core::{
+    observation::{CreateStage, Outcome},
+    EnvironmentRecord, EnvironmentState,
+};
+use adx_observability::metrics::{AtomicHistogram, Text, B15};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -59,7 +63,162 @@ pub mod pressure_skip_reason {
     pub const WINDOW_TOO_YOUNG: &str = "window_too_young";
 }
 #[derive(Default)]
-pub(crate) struct Metrics(Mutex<Samples>);
+pub(crate) struct Metrics {
+    samples: Mutex<Samples>,
+    platform: PlatformMetrics,
+}
+
+const RUNTIME_CLASSES: [&str; 4] = ["runsc", "firecracker", "runc", "other"];
+const OUTCOMES: [Outcome; 4] = [
+    Outcome::Success,
+    Outcome::Failure,
+    Outcome::Cancelled,
+    Outcome::Unknown,
+];
+/// Phases the node actor produces. `scheduling` and `resume` belong to other
+/// components and must not be exported from here under a node sample.
+const PLATFORM_PHASES: [CreateStage; 5] = [
+    CreateStage::RuntimePrepare,
+    CreateStage::RuntimeStart,
+    CreateStage::Readiness,
+    CreateStage::RouteActivation,
+    CreateStage::StatePublish,
+];
+
+/// Fold driver-specific runtime classes into the bounded label set shared with
+/// the Coordinator (detail design §5.1.1).
+pub(crate) fn runtime_class(value: &str) -> &'static str {
+    match value {
+        "runsc" => "runsc",
+        "firecracker" => "firecracker",
+        "runc" => "runc",
+        _ => "other",
+    }
+}
+
+fn runtime_index(value: &str) -> usize {
+    let value = runtime_class(value);
+    RUNTIME_CLASSES
+        .iter()
+        .position(|class| *class == value)
+        .unwrap_or(RUNTIME_CLASSES.len() - 1)
+}
+
+fn outcome_index(outcome: Outcome) -> usize {
+    OUTCOMES
+        .iter()
+        .position(|value| *value == outcome)
+        .unwrap_or(OUTCOMES.len() - 1)
+}
+
+/// Lifecycle operations whose duration this node measures. `resume` is
+/// recorded by the Coordinator from its durable `ResumeIntent` (one sample per
+/// operation); emitting it here would double-count the same family. `create`
+/// reuses the API Server family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleOperation {
+    Pause,
+    Delete,
+}
+impl LifecycleOperation {
+    const ALL: [Self; 2] = [Self::Pause, Self::Delete];
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Delete => "delete",
+        }
+    }
+    fn index(self) -> usize {
+        match self {
+            Self::Pause => 0,
+            Self::Delete => 1,
+        }
+    }
+}
+
+/// Node-side platform timings (detail design §6.6, M1-2). Export is sparse:
+/// combinations the node never observed stay absent so panels show `No data`
+/// instead of a fabricated zero-second sample.
+#[derive(Default)]
+struct PlatformMetrics {
+    /// phase × outcome × runtime_class.
+    phases: [[[AtomicHistogram<15>; 4]; 4]; 5],
+    /// outcome × runtime_class for the node-side wait before dispatch (`stage="node"`).
+    queue_wait: [[AtomicHistogram<15>; 4]; 4],
+    /// operation × outcome × runtime_class.
+    lifecycle: [[[AtomicHistogram<15>; 4]; 4]; 2],
+}
+
+impl PlatformMetrics {
+    fn render(&self, out: &mut Text) {
+        for (phase, phase_label) in PLATFORM_PHASES.iter().enumerate() {
+            for (outcome, outcome_label) in OUTCOMES.iter().enumerate() {
+                for (class, class_label) in RUNTIME_CLASSES.iter().enumerate() {
+                    let snapshot = self.phases[phase][outcome][class].snapshot();
+                    if snapshot.count == 0 {
+                        continue;
+                    }
+                    let labels = [
+                        ("phase", phase_label.as_str().to_owned()),
+                        ("outcome", outcome_label.as_str().to_owned()),
+                        ("runtime_class", (*class_label).to_owned()),
+                        ("producer", "adxlet".to_owned()),
+                    ];
+                    out.histogram(
+                        "adx_platform_phase_duration_seconds",
+                        "Duration of one platform phase within an operation, observed on the node.",
+                        &labels,
+                        &B15,
+                        &snapshot,
+                    );
+                }
+            }
+        }
+        for (outcome, outcome_label) in OUTCOMES.iter().enumerate() {
+            for (class, class_label) in RUNTIME_CLASSES.iter().enumerate() {
+                let snapshot = self.queue_wait[outcome][class].snapshot();
+                if snapshot.count == 0 {
+                    continue;
+                }
+                let labels = [
+                    ("stage", "node".to_owned()),
+                    ("outcome", outcome_label.as_str().to_owned()),
+                    ("runtime_class", (*class_label).to_owned()),
+                ];
+                out.histogram(
+                    "adx_platform_queue_wait_seconds",
+                    "Node-side wait before dispatch (admission queue plus actor mailbox), by queue stage.",
+                    &labels,
+                    &B15,
+                    &snapshot,
+                );
+            }
+        }
+        for operation in LifecycleOperation::ALL {
+            for (outcome, outcome_label) in OUTCOMES.iter().enumerate() {
+                for (class, class_label) in RUNTIME_CLASSES.iter().enumerate() {
+                    let snapshot = self.lifecycle[operation.index()][outcome][class].snapshot();
+                    if snapshot.count == 0 {
+                        continue;
+                    }
+                    let labels = [
+                        ("operation", operation.as_str().to_owned()),
+                        ("outcome", outcome_label.as_str().to_owned()),
+                        ("runtime_class", (*class_label).to_owned()),
+                    ];
+                    out.histogram(
+                        "adx_platform_lifecycle_duration_seconds",
+                        "Whole lifecycle operation duration, measured on the node.",
+                        &labels,
+                        &B15,
+                        &snapshot,
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct OperationAttempt<'a> {
     metrics: &'a Metrics,
     operation: &'static str,
@@ -85,6 +244,22 @@ impl Drop for OperationAttempt<'_> {
             .or_default() += 1;
     }
 }
+/// Classify an operation error like the existing lifecycle counter: an
+/// unavailable or timed-out call cannot confirm the result, so it stays
+/// `unknown` rather than becoming a definitive failure.
+pub(crate) fn error_outcome(error: &adx_core::Error) -> Outcome {
+    match error {
+        adx_core::Error::Unavailable(_) | adx_core::Error::ResponseTimeout(_) => Outcome::Unknown,
+        _ => Outcome::Failure,
+    }
+}
+/// Classify a completed operation result for stage/lifecycle samples.
+pub(crate) fn result_outcome<T>(result: &adx_core::Result<T>) -> Outcome {
+    match result {
+        Ok(_) => Outcome::Success,
+        Err(error) => error_outcome(error),
+    }
+}
 impl Metrics {
     pub fn operation_attempt(
         &self,
@@ -100,7 +275,7 @@ impl Metrics {
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, Samples> {
         // This cache contains only rebuildable telemetry.
-        self.0
+        self.samples
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -108,6 +283,48 @@ impl Metrics {
     /// was denied, or was exempted by the idle-window age rule.
     pub fn pressure_skip(&self, reason: &'static str) {
         *self.lock().skips.entry(reason).or_default() += 1;
+    }
+
+    /// Record one stage sample produced by the node actor. Phases owned by other
+    /// components (`scheduling`, `resume`) are ignored instead of being exported
+    /// under a node sample with a misleading label.
+    pub(crate) fn observe_phase(
+        &self,
+        phase: CreateStage,
+        outcome: Outcome,
+        runtime_class: &str,
+        elapsed: Duration,
+    ) {
+        let Some(phase) = PLATFORM_PHASES.iter().position(|value| *value == phase) else {
+            return;
+        };
+        self.platform.phases[phase][outcome_index(outcome)][runtime_index(runtime_class)]
+            .observe(&B15, elapsed.as_secs_f64());
+    }
+    /// Record one node-side wait before dispatch (admission queue plus actor
+    /// mailbox). The node only produces the `stage="node"` half of the family;
+    /// assignment waits live in the Coordinator.
+    pub(crate) fn observe_queue_wait(
+        &self,
+        outcome: Outcome,
+        runtime_class: &str,
+        waited: Duration,
+    ) {
+        self.platform.queue_wait[outcome_index(outcome)][runtime_index(runtime_class)]
+            .observe(&B15, waited.as_secs_f64());
+    }
+    /// Record one whole pause/delete operation that actually executed on this
+    /// node. Pure replays are excluded by the caller, not averaged in as zeros.
+    pub(crate) fn observe_lifecycle(
+        &self,
+        operation: LifecycleOperation,
+        outcome: Outcome,
+        runtime_class: &str,
+        elapsed: Duration,
+    ) {
+        self.platform.lifecycle[operation.index()][outcome_index(outcome)]
+            [runtime_index(runtime_class)]
+        .observe(&B15, elapsed.as_secs_f64());
     }
     pub fn register(&self, environment: &str) -> Registration {
         let registration = Registration {
@@ -142,12 +359,7 @@ impl Metrics {
             .map(|record| Execution {
                 runtime: record.runtime.id.clone(),
                 generation: record.assignment.generation,
-                runtime_class: match record.spec.runtime_class.as_str() {
-                    "runsc" => "runsc",
-                    "firecracker" => "firecracker",
-                    "runc" => "runc",
-                    _ => "other",
-                },
+                runtime_class: runtime_class(&record.spec.runtime_class),
             });
     }
     pub fn record(
@@ -251,6 +463,11 @@ impl Metrics {
         };
         let mut output = String::new();
         if detail {
+            // Declarations only: sample names and labels are unchanged (M0-3).
+            output.push_str("# TYPE adx_environment_cpu_usage_seconds_total counter\n");
+            output.push_str("# TYPE adx_environment_memory_usage_bytes gauge\n");
+            output.push_str("# TYPE adx_environment_memory_limit_bytes gauge\n");
+            output.push_str("# TYPE adx_environment_stats_age_seconds gauge\n");
             for (id, sample) in &samples {
                 let labels = format!(
                     "environment_id=\"{}\",runtime_id=\"{}\"",
@@ -280,6 +497,10 @@ impl Metrics {
             }
         } else {
             output.push_str("# TYPE adx_node_environment_cpu_usage_seconds_total counter\n");
+            output.push_str("# TYPE adx_node_environment_memory_usage_bytes gauge\n");
+            output.push_str("# TYPE adx_node_environment_memory_limit_bytes gauge\n");
+            output.push_str("# TYPE adx_node_environment_samples gauge\n");
+            output.push_str("# TYPE adx_node_environment_stale_samples gauge\n");
             for (class, cpu) in &cpu_ns {
                 let mut memory = 0u128;
                 let mut limit = 0u128;
@@ -343,6 +564,9 @@ impl Metrics {
                     "adx_node_pressure_pause_skipped_total{{reason=\"{reason}\"}} {count}\n"
                 ));
             }
+            let mut text = Text::default();
+            self.platform.render(&mut text);
+            output.push_str(&text.finish());
         }
         output
     }
@@ -653,7 +877,7 @@ mod tests {
         let a = register(&metrics, &running("a", "a-1", "runsc"));
         metrics.record(&a, "a-1", 1, usage(10, 100));
         metrics
-            .0
+            .samples
             .lock()
             .unwrap()
             .samples
@@ -679,7 +903,7 @@ mod tests {
         assert!(metrics.record(&old, "a-1", 1, usage(10, 100)));
         metrics.observe(&old, None);
         assert!(!metrics.record(&old, "a-1", 1, usage(20, 200)));
-        assert!(!metrics.render(true).contains("memory_usage_bytes"));
+        assert!(!metrics.render(true).contains("environment_id="));
         metrics.observe(&old, Some(&running("a", "a-2", "runsc")));
         assert!(!metrics.record(&old, "a-1", 1, usage(30, 300)));
         assert!(!metrics.record(&old, "a-2", 2, usage(30, 300)));
@@ -694,6 +918,136 @@ mod tests {
         ));
         metrics.unregister(&current);
         assert!(!metrics.render(true).contains("environment_id"));
-        assert!(metrics.0.lock().unwrap().registrations.is_empty());
+        assert!(metrics.samples.lock().unwrap().registrations.is_empty());
+    }
+
+    #[test]
+    fn platform_phases_and_node_queue_wait_export_sparsely() {
+        let metrics = Metrics::default();
+        metrics.observe_phase(
+            CreateStage::RuntimePrepare,
+            Outcome::Success,
+            "runsc",
+            Duration::from_millis(12),
+        );
+        metrics.observe_phase(
+            CreateStage::RuntimeStart,
+            Outcome::Failure,
+            "firecracker",
+            Duration::from_secs(3),
+        );
+        metrics.observe_queue_wait(Outcome::Success, "runsc", Duration::from_millis(30));
+        let text = metrics.render(false);
+        assert_eq!(
+            text.matches("# TYPE adx_platform_phase_duration_seconds histogram")
+                .count(),
+            1
+        );
+        assert!(text
+            .contains("# HELP adx_platform_phase_duration_seconds Duration of one platform phase"));
+        assert!(text.contains(
+            "adx_platform_phase_duration_seconds_count{phase=\"runtime_prepare\",outcome=\"success\",runtime_class=\"runsc\",producer=\"adxlet\"} 1\n"
+        ));
+        assert!(text.contains(
+            "adx_platform_phase_duration_seconds_count{phase=\"runtime_start\",outcome=\"failure\",runtime_class=\"firecracker\",producer=\"adxlet\"} 1\n"
+        ));
+        // Unobserved phases/runtimes stay absent so panels render `No data`.
+        assert!(!text.contains("phase=\"readiness\""));
+        assert!(!text.contains("phase=\"state_publish\""));
+        assert!(!text.contains("phase=\"scheduling\""));
+        assert!(!text.contains("phase=\"resume\""));
+        assert!(text.contains(
+            "adx_platform_queue_wait_seconds_count{stage=\"node\",outcome=\"success\",runtime_class=\"runsc\"} 1\n"
+        ));
+        assert!(!text.contains("adx_platform_queue_wait_seconds_count{stage=\"schedule\""));
+        // The short-retention detail endpoint never carries node summary families.
+        assert!(!metrics.render(true).contains("adx_platform_"));
+    }
+
+    #[test]
+    fn lifecycle_duration_exports_only_node_owned_operations() {
+        let metrics = Metrics::default();
+        metrics.observe_lifecycle(
+            LifecycleOperation::Pause,
+            Outcome::Success,
+            "runsc",
+            Duration::from_secs(2),
+        );
+        metrics.observe_lifecycle(
+            LifecycleOperation::Pause,
+            Outcome::Success,
+            "runsc",
+            Duration::from_secs(4),
+        );
+        metrics.observe_lifecycle(
+            LifecycleOperation::Delete,
+            Outcome::Unknown,
+            "firecracker",
+            Duration::from_millis(250),
+        );
+        let text = metrics.render(false);
+        assert_eq!(
+            text.matches("# TYPE adx_platform_lifecycle_duration_seconds histogram")
+                .count(),
+            1
+        );
+        assert!(text.contains(
+            "adx_platform_lifecycle_duration_seconds_count{operation=\"pause\",outcome=\"success\",runtime_class=\"runsc\"} 2\n"
+        ));
+        assert!(text.contains(
+            "adx_platform_lifecycle_duration_seconds_count{operation=\"delete\",outcome=\"unknown\",runtime_class=\"firecracker\"} 1\n"
+        ));
+        // resume belongs to the Coordinator; create reuses the API Server family.
+        assert!(!text.contains("operation=\"resume\""));
+        assert!(!text.contains("operation=\"create\""));
+        assert!(!text.contains("operation=\"delete\",outcome=\"success\""));
+        assert!(!metrics.render(true).contains("adx_platform_lifecycle"));
+    }
+
+    #[test]
+    fn detail_and_sample_families_declare_types() {
+        let metrics = Metrics::default();
+        let detail = metrics.render(true);
+        for declaration in [
+            "# TYPE adx_environment_cpu_usage_seconds_total counter",
+            "# TYPE adx_environment_memory_usage_bytes gauge",
+            "# TYPE adx_environment_memory_limit_bytes gauge",
+            "# TYPE adx_environment_stats_age_seconds gauge",
+        ] {
+            assert!(detail.contains(declaration), "missing {declaration}");
+        }
+        let summary = metrics.render(false);
+        for declaration in [
+            "# TYPE adx_node_environment_cpu_usage_seconds_total counter",
+            "# TYPE adx_node_environment_memory_usage_bytes gauge",
+            "# TYPE adx_node_environment_memory_limit_bytes gauge",
+            "# TYPE adx_node_environment_samples gauge",
+            "# TYPE adx_node_environment_stale_samples gauge",
+        ] {
+            assert!(summary.contains(declaration), "missing {declaration}");
+        }
+    }
+
+    #[test]
+    fn unconfirmed_outcomes_stay_unknown_instead_of_failure() {
+        assert_eq!(
+            error_outcome(&adx_core::Error::Unavailable("x".into())),
+            Outcome::Unknown
+        );
+        assert_eq!(
+            error_outcome(&adx_core::Error::ResponseTimeout("x".into())),
+            Outcome::Unknown
+        );
+        assert_eq!(error_outcome(&adx_core::Error::Conflict), Outcome::Failure);
+        assert_eq!(
+            result_outcome(&Ok::<(), adx_core::Error>(())),
+            Outcome::Success
+        );
+        assert_eq!(
+            result_outcome(&Err::<(), _>(adx_core::Error::Invalid("x".into()))),
+            Outcome::Failure
+        );
+        assert_eq!(runtime_class("nvidia"), "other");
+        assert_eq!(runtime_class("runsc"), "runsc");
     }
 }

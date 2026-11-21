@@ -14,7 +14,7 @@ mod credentials;
 mod failure;
 mod inspection;
 mod node_retirement;
-mod observability;
+pub(crate) mod observability;
 use observability::CounterUpdate;
 mod recovery;
 pub use observability::{
@@ -269,6 +269,11 @@ pub struct ResumeIntent {
     /// Initial duration of this wake, retained across placement and background retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_timeout_seconds: Option<u64>,
+    /// First accepted wake request time (unix millis). Retries retain it, so the
+    /// lifecycle duration covers the whole operation rather than the last call.
+    /// `0` marks intents persisted before this field existed and yields no sample.
+    #[serde(default)]
+    pub requested_at_unix_millis: u64,
     pub operation_id: String,
     /// A definitive local admission rejection permits a different placement.
     pub local_rejected: bool,
@@ -2530,5 +2535,22 @@ mod transport_tests {
         // only after a real disconnect/reconnect has installed its replacement.
         store.discard_connection(&old).await;
         assert_eq!(client_id(&store).await, replacement);
+    }
+}
+
+#[cfg(test)]
+mod resume_intent_tests {
+    use super::*;
+
+    #[test]
+    fn intent_without_requested_at_decodes_without_a_fabricated_start() {
+        let legacy = r#"{"operation_id":"wake-1","local_rejected":false,
+            "rejected_nodes":[],"retry_after_unix_seconds":0}"#;
+        let intent: ResumeIntent = decode(legacy).unwrap();
+        assert_eq!(intent.requested_at_unix_millis, 0);
+
+        let encoded = encode(&intent).unwrap();
+        assert!(encoded.contains("\"requested_at_unix_millis\":0"));
+        assert_eq!(decode::<ResumeIntent>(&encoded).unwrap(), intent);
     }
 }

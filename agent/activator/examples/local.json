@@ -13,6 +13,7 @@
     "capacity": 200000,
     "idle_seconds": 18000
   },
+  "metrics_listen": "127.0.0.1:19095",
   "egress_isolation": {
     "template_priority": 200,
     "egress": {
