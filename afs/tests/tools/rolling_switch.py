@@ -10,6 +10,7 @@ from tools import version_switch as offline
 
 PROBE = Path(__file__).resolve().parents[1] / "suites" / "cluster" / "rolling_probe.py"
 FINAL_NAME = "rollout-acked-after-upgrade"
+SNAPSHOT_FINAL_NAME = "rollout-acked-after-interruption"
 FINAL_BODY = b"committed after version switch\n" * 4096
 ORDER = ("M", "B", "A")
 
@@ -92,8 +93,9 @@ def exercise_switch(cluster, old_inputs, new_inputs, old, new, phases, policy, *
                            {r: new["commit"] if r in done else old["commit"] for r in cluster.roles})
             if policy == "snapshot":
                 break
-        cluster.write("A", FINAL_NAME, FINAL_BODY)
-        acked[FINAL_NAME] = FINAL_BODY
+        final_name = SNAPSHOT_FINAL_NAME if policy == "snapshot" else FINAL_NAME
+        cluster.write("A", final_name, FINAL_BODY)
+        acked[final_name] = FINAL_BODY
         verify_acked(cluster, acked, "before-rollback")
 
     phase = "interrupt_after_meta" if policy == "snapshot" else "complete_rolling"
