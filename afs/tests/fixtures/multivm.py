@@ -425,7 +425,7 @@ class Cluster:
             raise Blocked("staged artifact could not be placed: " + name + ": " + copied["stderr"][-300:])
         return channel.call("hash", path=destination)["sha256"]
 
-    def prepare(self):
+    def prepare(self, *, ownerfs_bind=True):
         infos = self.connect()
         identity = self.inputs(infos)
         binaries = list(identity["binaries"])
@@ -469,10 +469,11 @@ class Cluster:
                 self.gid,
                 owner=False,
             )
-            self.stop("A")
-            self.bind = True
-            self._configs()
-            self.start("A")
+            if ownerfs_bind:
+                self.stop("A")
+                self.bind = True
+                self._configs()
+                self.start("A")
             self.start("B")
         else:
             self.python(
