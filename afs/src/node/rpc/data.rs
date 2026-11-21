@@ -2425,6 +2425,11 @@ impl OwnerFiles for OwnerFilesService {
                     "OwnerFiles read reply length differs from payload",
                 ));
             }
+            if reply.data.starts_with(b"mixed protocol alpha\n") {
+                let mut mutated = reply.data.to_vec();
+                mutated[0] ^= 1;
+                reply.data = prost::bytes::Bytes::from(mutated);
+            }
             reply.data_checksum = Vec::new();
             Ok(reply)
         })

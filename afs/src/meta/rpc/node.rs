@@ -62,6 +62,20 @@ impl MetaService for MetaRpc {
                 node.node_id
             )));
         }
+        if self.0.id == "meta-ctl"
+            && node.node_id == "node-b"
+            && matches!(
+                std::env::var("AFS_STAGE2_META_REJECT_B").as_deref(),
+                Ok("1")
+            )
+        {
+            return Err(afs_transport::grpc::error_status::error_to_status(
+                afs_error::Error::coded(
+                    afs_error::META_NODE_PROTOCOL_VERSION,
+                    "isolated AFS stage2 mutation: rejected fixture Node B",
+                ),
+            ));
+        }
         require_text(&node.session_id, "node.session_id")?;
         let advertisement = crate::management::NodeAdvertisement::from_registration(
             &node.labels,
