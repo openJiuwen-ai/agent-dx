@@ -20,6 +20,11 @@ than typed ADX payloads and are not expanded as OpenAPI operations. EXECD
 checkpoint cooperation is an internal Adxlet contract documented in
 [`../http/runtime-control.md`](../http/runtime-control.md).
 
+Create requests accept and ignore unknown top-level fields for caller
+compatibility. Declared fields and nested objects retain their documented
+validation rules. Direct streaming uploads have no ADX-imposed file-size limit;
+file permissions follow the [runtime data reference](../http/runtime-data.md#文件上传与权限).
+
 ## Runtime action contracts
 
 `POST /direct/{instanceId}/invoke` uses `InvokeRequest.oneOf` to select typed
@@ -36,7 +41,8 @@ background commands; short execution timeouts use `process.exec`. A missing
 per-command cwd on the stable-command path produces `FAILED`, `SPAWN_FAILED`
 and null `exit_code`; the synchronous primitive uses exit_code=-1 and stderr.
 `process.wait` deadline expiry returns `WAIT_TIMEOUT` while the
-process continues running. Binary invoke file data is hex; streaming upload and
+process continues running. Omitted or empty synchronous commands are valid empty
+shell commands. Binary invoke file data is hex; streaming upload and
 download bodies contain raw bytes. Persistent shell actions use a PTY and SDK
 framing; they are distinct from command records.
 

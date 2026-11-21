@@ -303,7 +303,7 @@ impl Catalog {
                     volume_uid: volume.volume.uid.clone(),
                     assignment: record.assignment.clone(),
                     runtime_id: record.result.as_ref().map_or_else(
-                        || format!("{}-{}", record.spec.id, record.assignment.generation),
+                        || adx_core::runtime_id(&record.spec.id, record.assignment.generation),
                         |result| result.runtime.id.clone(),
                     ),
                     node_session_id: node.session.as_ref().ok_or(Error::Conflict)?.id.clone(),
@@ -374,7 +374,7 @@ impl Catalog {
                 let occupancy = Occupancy {
                     volume_uid: volume.volume.uid.clone(),
                     assignment: record.assignment.clone(),
-                    runtime_id: format!("{}-{}", spec.id, record.assignment.generation),
+                    runtime_id: adx_core::runtime_id(&spec.id, record.assignment.generation),
                     node_session_id: node.session.as_ref().ok_or(Error::Conflict)?.id.clone(),
                     phase: OccupancyPhase::Reserved,
                 };
@@ -604,7 +604,7 @@ impl Session {
             {
                 return Err(Error::Conflict);
             }
-            let initial = format!("{}-{}", request.spec.id, request.assignment.generation);
+            let initial = adx_core::runtime_id(&request.spec.id, request.assignment.generation);
             let old_runtime = stored
                 .volume_execution
                 .as_ref()
@@ -640,7 +640,17 @@ impl Session {
                 }
             } else if previous != old_runtime
                 || request.revision <= old_revision
-                || request.runtime.id != format!("{}-r{}", initial, request.revision)
+                || (request.runtime.id
+                    != adx_core::runtime_id_for_revision(
+                        &request.spec.id,
+                        request.assignment.generation,
+                        request.revision,
+                    )
+                    && request.runtime.id
+                        != format!(
+                            "{}-{}-r{}",
+                            request.spec.id, request.assignment.generation, request.revision
+                        ))
             {
                 return Err(Error::Conflict);
             }

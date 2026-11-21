@@ -230,6 +230,38 @@ fn node(deps: &Arc<Dependencies>) -> Adxlet {
 }
 
 #[tokio::test]
+async fn long_named_environment_uses_an_identity_that_fits_runtime_logs() {
+    for id in [
+        format!("default-{}", "n".repeat(256)),
+        format!("{}-{}", "s".repeat(256), "n".repeat(256)),
+    ] {
+        let deps = Dependencies::new(false);
+        let node = node(&deps);
+        let environment = node.environment(spec(&id), assignment(&id)).unwrap();
+        let created = environment.create().await.unwrap();
+        assert_eq!(created.record.spec.id, id);
+        let directory = tempfile::tempdir().unwrap();
+        let logs = adxlet::runtime_logs::RuntimeLogs::new(adxlet::runtime_logs::RuntimeLogPolicy {
+            directory: directory.path().into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let (out, err) = logs.paths(&created.record.runtime.id).unwrap();
+        std::fs::write(&out, "stdout").unwrap();
+        std::fs::write(&err, "stderr").unwrap();
+        let now = std::time::SystemTime::now();
+        let active = std::collections::HashSet::from([created.record.runtime.id.clone()]);
+        logs.collect(&active, now).unwrap();
+        logs.collect(&active, now + Duration::from_secs(86_401))
+            .unwrap();
+        assert!(std::path::Path::new(&out).exists());
+        assert!(std::path::Path::new(&err).exists());
+        environment.delete().await.unwrap();
+        assert_eq!(node.used(), Resources::default());
+    }
+}
+
+#[tokio::test]
 async fn referenced_volume_cannot_start_without_coordinator_authorization() {
     use adx_core::{
         execution::{Mount, MountSource},

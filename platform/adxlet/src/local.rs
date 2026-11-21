@@ -129,7 +129,7 @@ impl Adxlet {
         devices.release(&hold.token)?;
         let adopted = hold.devices == assignment.devices;
         if adopted {
-            let runtime_id = format!("{}-{}", spec.id, assignment.generation);
+            let runtime_id = adx_core::runtime_id(&spec.id, assignment.generation);
             scalar.restore(&runtime_id, spec.resources)?;
             devices.restore(&runtime_id, &assignment.devices)?;
         }

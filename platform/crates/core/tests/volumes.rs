@@ -125,6 +125,32 @@ fn occupancy_identifies_a_specific_runtime_within_an_assignment() {
 }
 
 #[test]
+fn occupancy_accepts_the_full_qualified_environment_name_without_relaxing_other_identities() {
+    let environment = format!("{}-{}", "s".repeat(256), "n".repeat(256));
+    let mut occupancy = Occupancy {
+        volume_uid: "volume-uid".into(),
+        assignment: Assignment {
+            environment_id: environment.clone(),
+            node_id: "node-a".into(),
+            shard_id: 0,
+            generation: 7,
+            devices: Vec::new(),
+        },
+        runtime_id: adx_core::runtime_id(&environment, 7),
+        node_session_id: "session-a".into(),
+        phase: OccupancyPhase::Reserved,
+    };
+    occupancy.validate().unwrap();
+    occupancy.assignment.environment_id.push('n');
+    occupancy.runtime_id = adx_core::runtime_id(&occupancy.assignment.environment_id, 7);
+    assert!(occupancy.validate().is_err());
+    occupancy.assignment.environment_id = environment;
+    occupancy.runtime_id = adx_core::runtime_id(&occupancy.assignment.environment_id, 7);
+    occupancy.assignment.node_id = "n".repeat(257);
+    assert!(occupancy.validate().is_err());
+}
+
+#[test]
 fn volume_ids_use_the_same_url_safe_ascii_contract_for_definitions_and_references() {
     for id in ["workspace.A_0-z".to_owned(), "a".repeat(256)] {
         let mut spec: VolumeSpec = serde_json::from_value(definition()).unwrap();

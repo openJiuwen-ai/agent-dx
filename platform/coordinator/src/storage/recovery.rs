@@ -427,7 +427,7 @@ impl Session {
                 state: EnvironmentState::Paused,
                 revision: 1,
                 runtime: adx_core::Runtime {
-                    id: format!("{}-{}", stored_environment.spec.id, replacement.generation),
+                    id: adx_core::runtime_id(&stored_environment.spec.id, replacement.generation),
                     ip: None,
                 },
                 resources_held: false,

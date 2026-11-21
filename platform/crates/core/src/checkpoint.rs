@@ -1,5 +1,6 @@
 //! Portable restore-point metadata. Artifacts stay behind a storage backend.
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Checkpoint evidence for an OCI rootfs, scoped to one execution.
 pub const RECOVERY_OCI_ROOTFS: &str = "ADX_RECOVERY_OCI_ROOTFS";
@@ -121,16 +122,62 @@ pub struct CompletedOperation {
     pub kind: LifecycleKind,
     pub expected_revision: u64,
 }
-/// Ownership and an execution lifetime are distinct: a same-node restore starts
-/// a new execution under the existing ownership, fenced by binding revision.
+/// Maximum execution ID length supported by host runtime log filenames.
+pub const MAX_RUNTIME_ID_BYTES: usize = 240;
+
+/// Initial execution identity, bounded for native runtime log filenames.
+/// Long Environment IDs remain unchanged in the public API and record.
+pub fn runtime_id(environment: &str, generation: u64) -> String {
+    let readable = format!("{environment}-{generation}");
+    if readable.len() <= MAX_RUNTIME_ID_BYTES {
+        readable
+    } else {
+        compact_runtime_id(environment, generation)
+    }
+}
+
+/// Restart or restore identity, including its revision in the filename bound.
+pub fn runtime_id_for_revision(environment: &str, generation: u64, revision: u64) -> String {
+    let readable = format!("{environment}-{generation}-r{revision}");
+    if readable.len() <= MAX_RUNTIME_ID_BYTES {
+        readable
+    } else {
+        format!(
+            "{}-r{revision}",
+            compact_runtime_id(environment, generation)
+        )
+    }
+}
+
+fn compact_runtime_id(environment: &str, generation: u64) -> String {
+    // A compact base contains no hyphens, so it cannot alias a readable
+    // <environment>-<generation> identity, including a caller-chosen name.
+    format!(
+        "rt_{:x}_{generation}",
+        Sha256::digest(environment.as_bytes())
+    )
+}
+
+/// Execution revision for this exact Environment and ownership generation.
+/// Existing records and checkpoints can retain their original readable IDs.
+pub fn runtime_revision(environment: &str, generation: u64, id: &str) -> Option<u64> {
+    [
+        compact_runtime_id(environment, generation),
+        format!("{environment}-{generation}"),
+    ]
+    .iter()
+    .find_map(|base| {
+        if id == base {
+            return Some(0);
+        }
+        let suffix = id.strip_prefix(base.as_str())?.strip_prefix("-r")?;
+        if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        suffix.parse::<u64>().ok().filter(|revision| *revision > 0)
+    })
+}
+
 pub fn valid_runtime_id(environment: &str, generation: u64, runtime_id: &str) -> bool {
-    let base = format!("{environment}-{generation}");
-    runtime_id == base
-        || runtime_id
-            .strip_prefix(&format!("{base}-r"))
-            .is_some_and(|s| {
-                !s.is_empty()
-                    && s.bytes().all(|b| b.is_ascii_digit())
-                    && s.parse::<u64>().is_ok_and(|n| n > 0)
-            })
+    runtime_revision(environment, generation, runtime_id).is_some()
 }

@@ -28,6 +28,37 @@ use tonic::{Request, Response, Status};
 include!("support/create_fixture.rs");
 
 #[tokio::test]
+async fn unsupported_runtime_create_options_return_not_started_without_submission() {
+    let fixture = Fixture::new().await;
+    let headers = [
+        ("Authorization", format!("Bearer {}", "k".repeat(32))),
+        ("Content-Type", "application/json".into()),
+    ];
+    for body in [
+        json!({"image":"tools:1", "runtime":"supervisor", "extra_config":{"x":1}}),
+        json!({"image":"tools:1", "runtime":"conch", "extra_config":{"x":1}}),
+        json!({"image":"tools:1", "runtime":"supervisor", "user":"1001", "group":"1002"}),
+        json!({"image":"tools:1", "runtime":"runsc", "user":"1001", "group":"1002"}),
+    ] {
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            "/api/environment/v1/environments",
+            &headers,
+            &body.to_string(),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 400);
+        let response: Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(response["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(response["error"]["outcome"], "not_started");
+        assert!(response["error"].get("environmentId").is_none());
+    }
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
     let fixture = Fixture::with_mode(600, true).await;
     tokio::time::timeout(Duration::from_secs(2), async {

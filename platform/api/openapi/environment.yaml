@@ -805,10 +805,23 @@ components:
                     description: Resolved runtime required by this queued Environment; a node must report this value in its supported runtime classes.
     CreateEnvironmentRequest:
       type: object
-      additionalProperties: false
+      additionalProperties: true
+      description: |
+        Unknown top-level fields are accepted and ignored for caller compatibility;
+        they are not forwarded to the runtime. Declared fields retain their types
+        and validation rules. Nested objects follow their own schemas.
       properties:
-        name: {type: string}
-        namespace: {type: string, default: default}
+        name:
+          type: string
+          maxLength: 256
+          pattern: '^[^/\\\u0000-\u001F\u007F-\u009F]*$'
+          description: At most 256 UTF-8 bytes; no slash, backslash or control characters. Omitted or empty generates a name. Unicode, spaces and dots are accepted within the byte limit.
+        namespace:
+          type: string
+          default: default
+          maxLength: 256
+          pattern: '^[^/\\\u0000-\u001F\u007F-\u009F]*$'
+          description: At most 256 UTF-8 bytes; no slash, backslash or control characters. Omitted or empty selects default.
         image:
           type: string
           description: Required unless snapshotId or the deployment Runtime Environment supplies the rootfs.
@@ -917,7 +930,11 @@ components:
         extra_config:
           type: object
           additionalProperties: true
-          description: Serialized to sandboxd's runtime-specific extra_config field.
+          description: |
+            Serialized to sandboxd's runtime-specific extra_config field; supported
+            keys depend on that runtime. Jiuwenbox Supervisor and Conch reject
+            nonempty objects with INVALID_ARGUMENT before assignment. An empty
+            object configures no runtime-specific options.
         scheduleAffinities:
           type: array
           maxItems: 256
@@ -948,7 +965,11 @@ components:
     WorkloadProcess:
       type: object
       additionalProperties: false
-      description: Optional image workload overrides. Requires inheritEntrypoint=true. Omitted fields inherit the image defaults; multiple commands start concurrently and a failing command terminates its siblings.
+      description: |
+        Explicit workload process or inherited image workload overrides. Without
+        inheritEntrypoint, commands is required. With inheritEntrypoint=true,
+        omitted fields inherit image defaults. Multiple commands start concurrently
+        and a failing command terminates its siblings.
       properties:
         commands:
           type: array
@@ -1007,7 +1028,7 @@ components:
             periodSeconds: {type: integer, minimum: 1, maximum: 86400, default: 2}
             timeoutSeconds: {type: integer, minimum: 1, maximum: 3600, default: 1}
       unevaluatedProperties: false
-      description: One-time Execd startup gate, retried until initCallTimeoutSeconds. Requires inheritEntrypoint.
+      description: One-time Execd startup gate, retried until initCallTimeoutSeconds. Requires an explicit workload process or inheritEntrypoint=true.
     HealthcheckProbe:
       allOf:
         - {$ref: "#/components/schemas/ProbeActions"}
@@ -1018,7 +1039,7 @@ components:
             timeoutSeconds: {type: integer, minimum: 1, maximum: 3600, default: 2}
             failureThreshold: {type: integer, minimum: 1, maximum: 4294967295, default: 3}
       unevaluatedProperties: false
-      description: Periodic check after readiness. Consecutive failures trigger the existing Adxlet lifecycle policy.
+      description: Periodic check after readiness. Requires an explicit workload process or inheritEntrypoint=true. Consecutive failures trigger the existing Adxlet lifecycle policy.
     ProbeFailure:
       type: object
       required: [kind, message, consecutive_failures]
@@ -1147,11 +1168,19 @@ components:
     RestartPolicy:
       type: object
       additionalProperties: false
+      description: |
+        Omit restartPolicy to disable automatic restart through this policy.
+        Explicit policies require positive attempts and initial backoff;
+        maxBackoffSeconds must be at least initialBackoffSeconds.
       required: [maxAttempts, initialBackoffSeconds, maxBackoffSeconds]
       properties:
-        maxAttempts: {type: integer, minimum: 0}
-        initialBackoffSeconds: {type: integer, format: int64, minimum: 0}
-        maxBackoffSeconds: {type: integer, format: int64, minimum: 0}
+        maxAttempts: {type: integer, minimum: 1, maximum: 4294967295}
+        initialBackoffSeconds: {type: integer, format: int64, minimum: 1}
+        maxBackoffSeconds:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Must be at least initialBackoffSeconds.
     ScheduleAffinity:
       type: object
       additionalProperties: false
