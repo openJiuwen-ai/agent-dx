@@ -20,10 +20,13 @@ DURING = b'acknowledged after Meta rejected B\n' * 2048
 
 def sessions(cluster, expected):
     counters = json.loads(cluster.health('M', '/v1/store'))['entities']
+    # Both releases store the session by ID and as the Node's current session.
+    expected_entries = 2 * expected
     actual = counters.get('node_session', 0)
-    cluster.record('admission.sessions', {'actual': actual, 'expected': expected})
-    if actual != expected:
-        raise AssertionError(f'expected {expected} registered Node sessions, got {actual}')
+    cluster.record('admission.sessions', {'entries': actual, 'expected_entries': expected_entries,
+                                         'expected_nodes': expected})
+    if actual != expected_entries:
+        raise AssertionError(f'expected {expected_entries} Node session entries, got {actual}')
 
 
 def verify_b_unmounted(cluster):
