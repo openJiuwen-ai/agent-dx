@@ -1,6 +1,7 @@
 """Special admission must reject missing work, weakened scope and cleanup gaps."""
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+from functools import partial
 import importlib.util
 from io import StringIO
 import json
@@ -80,6 +81,19 @@ class SpecialContracts(unittest.TestCase):
                                               afs_required=True, contracts_required=False)
             self.assertEqual(json.loads(stdout.getvalue()), json.loads((Path(directory) / 'inputs.json').read_text()))
 
+    def test_kubernetes_stdout_preserves_banner_json_and_flush(self):
+        driver = load('kubernetes_stdout_driver', HERE / 'kubernetes/run.py')
+        stream = StringIO()
+        banner = '--- Kubernetes acceptance result'
+        report = '{"status": "passed", "progress": "100%"}'
+        with redirect_stdout(stream), redirect_stderr(StringIO()) as stderr, \
+                patch.object(stream, 'flush', wraps=stream.flush) as flush:
+            driver.write_stdout(banner)
+            driver.write_stdout(report)
+        self.assertEqual(stream.getvalue(), banner + '\n' + report + '\n')
+        self.assertEqual(stderr.getvalue(), '')
+        self.assertEqual(flush.call_count, 2)
+
     def test_kubernetes_category_runs_both_registered_phases_and_requires_cleanup(self):
         driver = load('kubernetes_category_driver', HERE / 'kubernetes/run.py')
         with patch.dict(driver.ADX_CATEGORY_STAGES, {'reliability': (('adx', 'full', 'restart'),)}):
@@ -93,9 +107,9 @@ class SpecialContracts(unittest.TestCase):
                             kubeconfig=Path('/fixture/kubeconfig'), context=None, registry_auth=None, node_name=[])
                 calls = []
 
-                def child(command, calls=calls, bad_cleanup=bad_cleanup):
+                def child(command, *, seen_targets, fail_cleanup):
                     target = command[command.index('--case') + 1]
-                    calls.append(target)
+                    seen_targets.append(target)
                     path = Path(command[command.index('--output') + 1])
                     path.mkdir()
                     harness = {'schema_version': 1, 'commit': 'a' * 40, 'product_commit': 'b' * 40,
@@ -104,14 +118,17 @@ class SpecialContracts(unittest.TestCase):
                         'status': 'passed', 'checks': [target], 'required_checks': [target],
                         'cases': [{'name': target, 'status': 'passed'}], 'harness': harness,
                     }))
-                    status = 'FAIL' if bad_cleanup and target == 'afs-component-specials' else 'PASS'
+                    status = 'FAIL' if fail_cleanup and target == 'afs-component-specials' else 'PASS'
                     (path / 'kubernetes-cleanup.json').write_text(json.dumps({'status': status}))
                     return Mock(wait=Mock(return_value=0), poll=Mock(return_value=0))
 
+                runner = partial(child, seen_targets=calls, fail_cleanup=bad_cleanup)
                 with patch.object(driver, 'source_commit', return_value='a' * 40), \
-                        patch.object(driver, 'fixed_candidate'), patch.object(driver.subprocess, 'Popen', child):
+                        patch.object(driver, 'fixed_candidate'), patch.object(driver.subprocess, 'Popen', runner), \
+                        redirect_stdout(StringIO()) as stdout:
                     self.assertEqual(driver.run_category(args, output, plan), int(bad_cleanup))
                 report = json.loads((output / 'result.json').read_text())
+                self.assertEqual(stdout.getvalue(), json.dumps(report) + '\n')
                 self.assertEqual(calls, ['restart', 'afs-component-specials'])
                 self.assertEqual(report['selected_case'], 'reliability')
                 self.assertEqual(report['required_checks'], ['adx', 'afs'])

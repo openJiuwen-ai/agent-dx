@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 from pathlib import Path
 import re
 import signal
@@ -10,6 +11,13 @@ import sys
 import time
 
 HERE = Path(__file__).resolve().parent
+
+
+def write_stdout(line):
+    """Emit an unprefixed CLI line to the current stdout."""
+    output_logger = logging.Logger(__name__, level=logging.INFO)
+    output_logger.addHandler(logging.StreamHandler(sys.stdout))
+    output_logger.info('%s', line)
 
 
 def accept_harness(report, part, commit):
@@ -86,8 +94,7 @@ def finish_plan(output, report, write_junit):
         report['status'] = 'passed'
     (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
     write_junit(output / 'junit.xml', report)
-    sys.stdout.write(json.dumps(report) + '\n')
-    sys.stdout.flush()
+    write_stdout(json.dumps(report))
     return 0 if report['status'] == 'passed' else 1
 
 

@@ -41,7 +41,7 @@ from adx_targets import CATEGORY_STAGES as ADX_CATEGORY_STAGES
 from afs_component import CATEGORY_STAGES as AFS_CATEGORY_STAGES
 from afs_component import COMPONENT_TARGETS as AFS_COMPONENT_TARGETS
 from afs_component import Component as AfsComponent
-from afs_gate import execute_plan, finish_plan, plan_report
+from afs_gate import execute_plan, finish_plan, plan_report, write_stdout
 from afs_product import Product as AfsProduct, resources as afs_product_resources
 
 
@@ -99,11 +99,6 @@ def candidate_requirements(profile, case):
         'afs_required': any(target and target.startswith('afs-') for target in targets),
         'contracts_required': any(AFS_COMPONENT_TARGETS.get(target, False) for target in targets),
     }
-
-
-def write_stdout(line):
-    sys.stdout.write(line + '\n')
-    sys.stdout.flush()
 
 
 def verify_only(args, output):
