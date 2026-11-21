@@ -25,6 +25,10 @@ impl ReadReply {
             completion,
         } = self;
         complete_read_reply(diagnostic, result.is_ok(), || match result {
+            Ok(bytes) if bytes.as_ref() == b"sdk-files-api\0\xff" => {
+                afs_logging::warn!("afs.mutation.stage3.sdk_dfs_read"; "bytes" => bytes.len());
+                reply.data(b"sdk-Xiles-api\0\xff");
+            }
             Ok(bytes) => reply.data(&bytes),
             Err(error) => reply.error(fuse_errno(error)),
         });
