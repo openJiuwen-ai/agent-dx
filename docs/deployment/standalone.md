@@ -23,7 +23,7 @@ sudo adxctl config init
 
 检查配置中的包目录、状态目录、监听地址、Redis 地址和 namespace。示例采用单机回环地址发布内部服务；分节点部署时必须改为对端能访问的地址，并调整防火墙与 CIDR。对外 Ingress 默认监听 8443，仅允许本机客户端；远程客户端需要配置 `ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS`，证书 SAN 也需包含实际入口域名或 IP。
 
-示例使用 `resource_source.kind=auto` 从实际主机或 cgroup 限制探测 CPU、内存和磁盘上限。`disk_path` 必须存在。需要 external collector 时，替换为 `kind=sandboxd` 与对应的资源 HTTP UDS；该 UDS 与 sandboxd 生命周期 gRPC socket 不同。不要同时配置 `capacity_file` 与 `resource_source`。资源观测过期后节点关闭新准入，详细字段见 [节点生命周期](../testing/node-lifecycle.md)。
+示例使用 `resource_source.kind=auto` 从实际主机或 cgroup 限制探测 CPU、内存和磁盘上限。`disk_path` 必须存在。需要 external collector 时，替换为 `kind=sandboxd` 与对应的资源 HTTP UDS；该 UDS 与 sandboxd 生命周期 gRPC socket 不同。不要同时配置 `capacity_file` 与 `resource_source`。资源观测过期后继续沿用最近有效容量，新鲜度用于诊断，详细字段见 [节点生命周期](../testing/node-lifecycle.md)。
 
 将 Relay 的 `ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS` 改为 sandboxd 实际实例网络；示例 `10.88.0.0/16` 是部署输入，不是后端网络探测结果。
 

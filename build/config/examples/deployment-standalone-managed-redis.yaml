@@ -61,6 +61,8 @@ services:
         directory: /opt/adx/run/control/logs/runtime
       proxy_socket: /opt/adx/run/node/route.sock
       report_interval_seconds: 5
+      sandboxd_health_failure_threshold: 3
+      sandboxd_health_failure_seconds: 30
       rpc_timeout_seconds: 30
       execd_port: 50090
       metrics_interval_seconds: 15

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Deploy an immutable bundle into two isolated nodes; fail on any residual resource."""
 
+# CLI results and live progress are part of the acceptance driver output.
+# ruff: noqa: T201
 import argparse
 import hashlib
 import importlib.util
@@ -70,6 +72,7 @@ OPTIONAL_CASES = (
     'download-response-cut',
     'schedule-deadline',
     'resource-stale',
+    'resource-stalled',
     'network-partition',
     'reconcile-crash',
     'mixed-soak',
@@ -870,8 +873,9 @@ class Run:
                 )
                 for node in self.nodes:
                     self.helper(node, 'empty', node)
-        if 'resource-stale' in selected:
-            with self.case('resource-stale', checks) as record:
+        if 'resource-stale' in selected or 'resource-stalled' in selected:
+            resource_case = 'resource-stalled' if 'resource-stalled' in selected else 'resource-stale'
+            with self.case(resource_case, checks) as record:
                 self.execute(
                     'node1',
                     '/opt/adx/client/bin/python',
@@ -882,7 +886,9 @@ class Run:
                 )
                 self.helper('node1', 'observer-freeze', timeout=15)
                 try:
-                    self.helper('node1', 'resource-stale', timeout=35)
+                    if resource_case == 'resource-stalled':
+                        self.helper('node1', 'resource-block', timeout=25)
+                    self.helper('node1', 'resource-stale', timeout=70)
                     self.execute(
                         'node1',
                         '/opt/adx/client/bin/python',
@@ -892,6 +898,8 @@ class Run:
                         timeout=70,
                     )
                 finally:
+                    if resource_case == 'resource-stalled':
+                        self.helper('node1', 'resource-unblock', timeout=15)
                     self.helper('node1', 'observer-resume', timeout=15)
                 self.helper('node1', 'resource-fresh', timeout=35)
                 output = self.execute(

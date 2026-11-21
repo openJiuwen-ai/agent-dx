@@ -23,6 +23,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "adxlet/observations.rs"]
+mod observations;
+
 const DMI_HOST_UUID_PATH: &str = "/sys/class/dmi/id/product_uuid";
 
 #[derive(Deserialize)]
@@ -69,6 +72,10 @@ struct Config {
     #[serde(default)]
     degradation_journal: Option<PathBuf>,
     report_interval_seconds: u64,
+    #[serde(default = "sandboxd_health_failure_threshold")]
+    sandboxd_health_failure_threshold: u32,
+    #[serde(default = "sandboxd_health_failure_seconds")]
+    sandboxd_health_failure_seconds: u64,
     #[serde(default = "metrics_interval")]
     metrics_interval_seconds: u64,
     rpc_timeout_seconds: u64,
@@ -180,6 +187,12 @@ fn metrics_interval() -> u64 {
 fn runtime_ready_timeout() -> u64 {
     120
 }
+fn sandboxd_health_failure_threshold() -> u32 {
+    3
+}
+fn sandboxd_health_failure_seconds() -> u64 {
+    30
+}
 fn execd_ready_poll_interval() -> Duration {
     Duration::from_millis(10)
 }
@@ -200,19 +213,26 @@ fn read_host_uuid(path: &Path) -> std::io::Result<uuid::Uuid> {
     }
     Ok(id)
 }
-async fn sample(
-    source: &ResourceSource,
+async fn sample_capabilities(
     runtime: &RuntimeRouter,
+    configured: BTreeMap<String, adx_core::volumes::StorageMount>,
     timeout: Duration,
-) -> adx_core::Result<(adxlet::resources::Observation, Duration)> {
-    if matches!(source, ResourceSource::Sandboxd { .. }) {
-        tokio::time::timeout(timeout, runtime.check_health())
-            .await
+) -> (
+    BTreeMap<String, adx_core::volumes::StorageMount>,
+    adx_core::Result<Vec<String>>,
+) {
+    let (mounts, classes) = tokio::join!(
+        tokio::time::timeout(timeout, adxlet::managed_mounts::mounted_storage(configured)),
+        tokio::time::timeout(timeout, runtime.available_runtime_classes()),
+    );
+    (
+        mounts.ok().and_then(Result::ok).unwrap_or_default(),
+        classes
             .map_err(|_| {
-                adx_core::Error::Unavailable("sandboxd health check timed out".into())
-            })??;
-    }
-    source.sample(timeout).await
+                adx_core::Error::Unavailable("runtime capability observation timed out".into())
+            })
+            .and_then(|result| result),
+    )
 }
 
 fn coordinator_channel(
@@ -255,6 +275,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for mount in config.storage_mounts.values() {
         mount.validate()?;
     }
+    let mut sandboxd_health = observations::SandboxdHealth::new(
+        config.sandboxd_health_failure_threshold,
+        Duration::from_secs(config.sandboxd_health_failure_seconds),
+    )?;
     let runtime_logs = RuntimeLogs::new(config.runtime_logs.clone())?;
     // Embedded Proxy and Adxlet share this process-wide subscriber and
     // tracer provider; standalone Proxy initializes the same library itself.
@@ -379,6 +403,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(backend) => Some(Jiuwenbox::connect(backend, runtime_config.clone()).await?),
         None => None,
     };
+    let sandboxd_configured = config.sandboxd_socket.is_some();
     let sandboxd = match config.sandboxd_socket {
         Some(socket) => Some(tokio::select! {
             result = connect_when_ready(socket, runtime_config,
@@ -450,7 +475,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     manager.pause_lifecycle().await;
     let (o, valid) = loop {
-        match sample(&source, &runtime, timeout).await {
+        match source.sample(timeout).await {
             Ok(sample) => break sample,
             Err(error) => {
                 adx_observability::warn!("waiting for first valid capacity observation: {error}");
@@ -502,7 +527,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_address: config.advertised_address,
         proxy_address: config.proxy_address,
         capacity: Some(o.capacity.into()),
-        devices: o.devices.into_iter().map(Into::into).collect(),
+        devices: o.devices.iter().cloned().map(Into::into).collect(),
         labels,
         accepting_allocations: false,
         session_id: session_id.clone(),
@@ -543,13 +568,103 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     };
+    let period = Duration::from_secs(config.report_interval_seconds);
+    let sample_timeout = timeout.min(period);
+    // Seed registration with measured capabilities. The durable session identity
+    // must contain the first inventory before periodic, memory-only reports begin.
+    let (observed, latest) = tokio::sync::watch::channel(observations::Snapshot::new(o, valid));
+    manager.update_runtime_classes(vec![])?;
+    let (mounts, classes) =
+        sample_capabilities(&runtime, config.storage_mounts.clone(), sample_timeout).await;
+    observations::publish_capabilities(&manager, &observed, mounts, classes)?;
+    let capacity_samples = observations::observe(
+        period,
+        || source.sample(sample_timeout),
+        |result| {
+            if let Ok((capacity, valid)) = result {
+                manager.update_capacity(capacity.capacity, valid)?;
+                manager.update_devices(capacity.devices.clone(), valid)?;
+                observed.send_modify(|snapshot| {
+                    snapshot.capacity = capacity;
+                    snapshot.valid_until = tokio::time::Instant::now() + valid;
+                });
+            }
+            Ok(())
+        },
+    );
+    let capability_samples = observations::observe(
+        period,
+        || sample_capabilities(&runtime, config.storage_mounts.clone(), sample_timeout),
+        |(mounts, classes)| {
+            observations::publish_capabilities(&manager, &observed, mounts, classes)
+        },
+    );
+    let sandboxd_health_samples = async {
+        if sandboxd_configured {
+            observations::observe(
+                period,
+                || async {
+                    tokio::time::timeout(sample_timeout, runtime.check_health())
+                        .await
+                        .map_err(|_| {
+                            adx_core::Error::Unavailable("sandboxd health check timed out".into())
+                        })?
+                },
+                |result| {
+                    if let Err(error) = &result {
+                        adx_observability::warn!(%error, "sandboxd health check failed");
+                    }
+                    sandboxd_health.update(&manager, result.is_ok())
+                },
+            )
+            .await
+        } else {
+            std::future::pending::<adx_core::Result<()>>().await
+        }
+    };
+    let pressure_samples = async {
+        if let (Some(config), Some(gate)) = (&config.pressure, &mut pressure_gate) {
+            observations::observe(
+                period,
+                || {
+                    let path = config.disk_path.clone();
+                    let resources = config.resources();
+                    tokio::task::spawn_blocking(move || {
+                        adxlet::resources::pressure(resources, path.as_deref())
+                    })
+                },
+                |result| {
+                    let update = match result {
+                        Ok(Ok(pressure)) => gate.update(pressure),
+                        Ok(Err(error)) => {
+                            adx_observability::warn!(%error, "pressure sample failed; pressure gate is open");
+                            gate.fail()
+                        }
+                        Err(error) => {
+                            adx_observability::warn!(%error, "pressure sampling task failed; pressure gate is open");
+                            gate.fail()
+                        }
+                    };
+                    manager.set_pressure_state(&update);
+                    Ok(())
+                },
+            )
+            .await
+        } else {
+            std::future::pending::<adx_core::Result<()>>().await
+        }
+    };
+    let sampling = async {
+        tokio::try_join!(
+            capacity_samples,
+            capability_samples,
+            sandboxd_health_samples,
+            pressure_samples
+        )?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
     let report = async {
         let mut last = registration.clone();
-        let mut valid_until = tokio::time::Instant::now() + valid;
-        // Resource/backend observation is not on the heartbeat critical path.
-        // Bound each sample to one reporting period and keep the last successful
-        // capacity during outages. Heartbeats continue independently.
-        let sample_timeout = timeout.min(Duration::from_secs(config.report_interval_seconds));
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
         loop {
@@ -567,64 +682,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => (),
                 }
             }
-            let mut r = last.clone();
-            // Observe storage and runtime capabilities concurrently so storage
-            // does not add another timeout period to the heartbeat path.
-            let (mounts, classes) = tokio::join!(
-                tokio::time::timeout(
-                    sample_timeout,
-                    adxlet::managed_mounts::mounted_storage(config.storage_mounts.clone()),
-                ),
-                tokio::time::timeout(sample_timeout, runtime.available_runtime_classes()),
-            );
-            // A failed storage observation withdraws only volume eligibility.
-            r.storage_mounts = match mounts {
-                Ok(Ok(mounts)) => mounts
-                    .into_iter()
-                    .map(|(id, mount)| (id, mount.into()))
-                    .collect(),
-                _ => Default::default(),
+            // Read only published values; no resource observation is awaited here.
+            let valid_until = {
+                let snapshot = latest.borrow();
+                snapshot.apply(&mut last);
+                snapshot.valid_until
             };
-            // A failed runtime observation closes new admission, while accepted
-            // executions and heartbeats continue through reconciliation.
-            r.runtime_classes = match classes {
-                Ok(Ok(classes)) => classes,
-                _ => vec![],
-            };
-            manager.update_runtime_classes(r.runtime_classes.clone())?;
-            if let Ok((o, valid)) = sample(&source, &runtime, sample_timeout).await {
-                valid_until = tokio::time::Instant::now() + valid;
-                manager.update_capacity(o.capacity, valid)?;
-                manager.update_devices(o.devices.clone(), valid)?;
-                r.capacity = Some(o.capacity.into());
-                r.devices = o.devices.into_iter().map(Into::into).collect();
-            }
-            if let (Some(config), Some(gate)) = (&config.pressure, &mut pressure_gate) {
-                let path = config.disk_path.clone();
-                let resources = config.resources();
-                let update = match tokio::task::spawn_blocking(move || {
-                    adxlet::resources::pressure(resources, path.as_deref())
-                })
-                .await
-                {
-                    Ok(Ok(pressure)) => gate.update(pressure),
-                    Ok(Err(error)) => {
-                        adx_observability::warn!(%error, "pressure sample failed; pressure gate is open");
-                        gate.fail()
-                    }
-                    Err(error) => {
-                        adx_observability::warn!(%error, "pressure sampling task failed; pressure gate is open");
-                        gate.fail()
-                    }
-                };
-                manager.set_pressure_state(&update);
-                // Heartbeat field: direct observation-point fill, same
-                // discipline as capacity/devices/storage_mounts above. The
-                // producer holds the state it just published, so the report
-                // and the board cannot drift.
-                r.pressure = adxlet::resources::report_from(&update.state);
-            }
-            last = r;
             // Startup and every reporting period use the same complete authority
             // cycle for every configured runtime. The cycle publishes readiness
             // immediately after success, before waiting for the next report tick.
@@ -716,6 +779,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = shutdown() => adxlet::proxy::ShutdownMode::Drain,
         }
     };
+    let services = observations::serve(services, sampling);
     let mode = adxlet::proxy::serve_until_shutdown(&manager, embedded, services, shutdown).await?;
     if let Err(error) = adxlet::node_reconciliation::finish_shutdown(
         mode,
