@@ -58,6 +58,7 @@ class Product:
         self.cleanup_errors = []
         self.client = None
         self.service = None
+        self.sdk_runtime_verified = False
 
     def configure(self, package, pods, harness_commit):
         run = self.run
@@ -101,6 +102,25 @@ class Product:
         self.run.kube('-n', self.run.id, 'cp', node + ':' + source,
                       str(destination), '-c', 'platform', timeout=timeout)
 
+    def sdk_report(self, remote, destination):
+        report = json.loads(self.run.execute('node1', 'cat', remote))
+        destination.write_text(json.dumps(report, indent=2))
+        return report
+
+    def verify_failed_sdk_cleanup(self, config, report):
+        cleanup_passed = any(case.get('id') == 'environment-cleanup' and case.get('status') == 'passed'
+                             for case in report.get('cases', []))
+        if (report.get('status') != 'failed' or not report.get('error') or report.get('mode') != config['mode']
+                or report.get('full') is not config['full'] or report.get('cleanup_errors') != []
+                or not cleanup_passed or any(report.get('sdk_client', {}).get(field) != self.client[field]
+                                             for field in ('build_id', 'commit', 'version', 'wheel_sha256'))):
+            raise ValueError('failed SDK workload has no complete environment cleanup evidence')
+        for node in self.run.nodes:
+            # The empty helper skips its live backend check after an earlier stop.
+            self.run.execute(node, 'test', '!', '-e', '/evidence/stop-' + node + '.json')
+            self.run.helper(node, 'empty', node)
+        self.sdk_runtime_verified = True
+
     def sdk(self, config, destination):
         run = self.run
         client = self.client
@@ -116,17 +136,15 @@ class Product:
             run.execute('node1', *argv, '--input', '/evidence/afs-sdk-input.json', '--output', remote, timeout=600)
         except Exception:
             if client:
-                # Retain a product assertion result if the workload did reach its
-                # report. Failed startup may have no report, so preserve the
-                # original runner error in either case.
+                # Preserve the original workload failure and decide separately
+                # whether the live runtime can safely serve the next mode.
                 try:
-                    report = json.loads(run.execute('node1', 'cat', remote))
-                    destination.write_text(json.dumps(report, indent=2))
-                except Exception:
-                    pass
+                    report = self.sdk_report(remote, destination)
+                    self.verify_failed_sdk_cleanup(config, report)
+                except Exception as exc:
+                    run.event('[CLEANUP] Unable to verify failed SDK workload cleanup: ' + str(exc))
             raise
-        report = json.loads(run.execute('node1', 'cat', remote))
-        destination.write_text(json.dumps(report, indent=2))
+        report = self.sdk_report(remote, destination)
         if client and report.get('sdk_client', {}).get('wheel_sha256') != client['wheel_sha256']:
             raise ValueError('SDK workload report does not prove use of the independent client')
         for node in run.nodes:
@@ -140,7 +158,7 @@ class Product:
             with self.run.case(name, checks) as record:
                 yield record
         except Exception as exc:
-            if not self.client or self.cleanup_errors:
+            if not self.client or not self.sdk_runtime_verified or self.cleanup_errors:
                 raise
             # One direction can break a specific filesystem mode. Run the
             # other mode in a fresh fixture if the first fixture cleaned up.
@@ -171,6 +189,7 @@ class Product:
                     if name != 'artifact-identity.json':
                         (inputs / name).chmod(0o755)
                 for mode in ('ownerfs', 'dfs'):
+                    self.sdk_runtime_verified = False
                     output = run.output / 'afs-sdk' / mode
                     output.mkdir(parents=True)
                     case = Case('afs.sdk.' + mode, ('cluster-sdk',), mode, (), None)
@@ -195,18 +214,20 @@ class Product:
                                                'paths': {r: cluster.workspace(r) for r in ('A', 'B')},
                                                'identities': identities}, output / 'sdk-result.json')
                             validate_sdk_result(report, mode, full=self.full)
+                            self.sdk_runtime_verified = True
                             if mode == 'dfs':
                                 after = peer_counter(cluster, 'B')
                                 assert after > before, (before, after)
                                 cluster.record('sdk.peer_reads', {'before': before, 'after': after})
                             record['subcases'] = report['cases']
                         except Exception:
-                            # Retire runtimes before attempting normal AFS unmount after a failed SDK operation.
-                            for node in reversed(run.nodes):
-                                try:
-                                    run.helper(node, 'cleanup', node, timeout=180)
-                                except Exception as exc:
-                                    self.cleanup_errors.append('runtime cleanup: ' + str(exc))
+                            # Retire shared runtimes when live cleanup cannot be proved.
+                            if not self.sdk_runtime_verified or not self.client:
+                                for node in reversed(run.nodes):
+                                    try:
+                                        run.helper(node, 'cleanup', node, timeout=180)
+                                    except Exception as exc:
+                                        self.cleanup_errors.append('runtime cleanup: ' + str(exc))
                             raise
                         finally:
                             cleanup = cluster.cleanup()
