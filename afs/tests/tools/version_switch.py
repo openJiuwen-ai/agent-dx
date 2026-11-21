@@ -44,8 +44,8 @@ def recovery_point(cluster, restore=False):
         cluster.record(("restore." if restore else "backup.") + role, str(backup))
 
 
-def install(cluster, inputs, identity):
-    for role in cluster.roles:
+def install(cluster, inputs, identity, roles=None):
+    for role in cluster.roles if roles is None else roles:
         name = "afs-meta" if role == "M" else "afs-node"
         destination = remote_join(cluster.root(role), "bin", name)
         incoming = f"{destination}.next"
@@ -223,9 +223,7 @@ def retained_command(cluster, new_inputs, new, phases):
     run_phase(phases, "root_command_after_upgrade", verify_after_upgrade)
 
 
-def exercise(config, old_inputs, new_inputs, output):
-    """Run all scenarios, retaining an independent result and cleanup per fixture."""
-    output.mkdir()
+def artifact_pair(old_inputs, new_inputs):
     identities = [json.loads((inputs / "artifact-identity.json").read_text()) for inputs in (old_inputs, new_inputs)]
     old, new = identities
     if old["commit"] == new["commit"] or old["target"] != new["target"]:
@@ -234,6 +232,13 @@ def exercise(config, old_inputs, new_inputs, output):
         for binary in ("afs-meta", "afs-node"):
             if sha256(inputs / binary) != identity["binaries"][binary]:
                 raise ValueError("binary differs from pinned package manifest: " + binary)
+    return old, new
+
+
+def exercise(config, old_inputs, new_inputs, output):
+    """Run all scenarios, retaining an independent result and cleanup per fixture."""
+    output.mkdir()
+    old, new = artifact_pair(old_inputs, new_inputs)
     write_json(output / "versions.json", {"old": old, "new": new})
     entries = []
     cleanup_errors = []

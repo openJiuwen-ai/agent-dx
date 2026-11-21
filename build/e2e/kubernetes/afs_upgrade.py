@@ -17,6 +17,8 @@ ROOT = HERE.parents[2]
 BUILD_ENV = 'AFS_E2E_BASELINE_BUILD'
 COMMIT_ENV = 'AFS_E2E_BASELINE_COMMIT'
 TARGET = 'afs-component-upgrade-rollback'
+PROTOCOL_TARGET = 'afs-component-mixed-protocols'
+PROTOCOL_CASES_ENV = 'AFS_E2E_PROTOCOL_CASES'
 BASELINE_POD = 'afs-baseline-input'
 
 
@@ -61,7 +63,8 @@ def scenarios(component, checks):
     from manifest import LABEL
 
     run = component.run
-    with run.case(TARGET, checks) as record, tempfile.TemporaryDirectory(prefix='afs-upgrade-') as temp:
+    mixed = component.check_name == PROTOCOL_TARGET
+    with run.case(component.check_name, checks) as record, tempfile.TemporaryDirectory(prefix='afs-upgrade-') as temp:
         inputs = Path(temp)
         baseline, registry, old = download_baseline(inputs)
         if old['target'] != component.package['target'] or old['commit'] == component.package['commit']:
@@ -107,11 +110,18 @@ def scenarios(component, checks):
         output = run.output / 'afs'
         component.attempted_cases = True
         try:
-            spec = importlib.util.spec_from_file_location('afs_version_switch', test_root / 'tools/version_switch.py')
-            version_switch = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(version_switch)
+            module = 'mixed_protocols' if mixed else 'version_switch'
+            spec = importlib.util.spec_from_file_location('afs_' + module, test_root / 'tools' / (module + '.py'))
+            runner = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(runner)
             signal.signal(signal.SIGALRM, _timeout)
-            entries, cleanup_errors = version_switch.exercise(component.config, old_inputs, new_inputs, output)
+            if mixed:
+                selection = runner.selected_cases(os.getenv(PROTOCOL_CASES_ENV))
+                expected = len(selection)
+                entries, cleanup_errors = runner.exercise(component.config, old_inputs, new_inputs, output, selection)
+            else:
+                expected = 3
+                entries, cleanup_errors = runner.exercise(component.config, old_inputs, new_inputs, output)
         finally:
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
@@ -125,7 +135,9 @@ def scenarios(component, checks):
              'phases': entry['phases']}
             for entry in entries
         ]
-        if len(entries) != 3 or cleanup_errors or any(item['status'] != 'passed' for item in entries):
+        if len(entries) != expected or cleanup_errors or any(item['status'] != 'passed' for item in entries):
+            if mixed:
+                raise ValueError('AFS mixed-protocol assertions failed; see afs/result.json and per-case logs')
             raise ValueError('AFS upgrade/rollback assertions failed; see afs/result.json and per-case logs')
 
 

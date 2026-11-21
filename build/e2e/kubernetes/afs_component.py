@@ -25,7 +25,7 @@ FULL_CASES = scope.CASE_IDS
 OWNERFS_RESTART_TARGET = 'afs-ownerfs-restart'
 # Full targets use the four-role fixture and frozen Rust contracts.
 COMPONENT_TARGETS = {'afs-component': False, 'afs-component-full': True, 'afs-component-specials': False,
-                     afs_upgrade.TARGET: False, OWNERFS_RESTART_TARGET: False}
+                     afs_upgrade.TARGET: False, afs_upgrade.PROTOCOL_TARGET: False, OWNERFS_RESTART_TARGET: False}
 CATEGORY_STAGES = {'reliability': (('afs', 'full', 'afs-component-specials'),)}
 if afs_upgrade.baseline_requested():
     CATEGORY_STAGES['reliability'] += (('afs-upgrade', 'full', afs_upgrade.TARGET),)
@@ -113,7 +113,7 @@ class Component:
     def for_target(cls, run, target):
         if target not in COMPONENT_TARGETS:
             return None
-        if target == afs_upgrade.TARGET:
+        if target in (afs_upgrade.TARGET, afs_upgrade.PROTOCOL_TARGET):
             component = cls(run)
             component.upgrade = True
             component.check_name = target
