@@ -21,6 +21,17 @@ case "${ADX_ARTIFACT_TRANSPORT:-obs}" in
   *) echo 'ADX_ARTIFACT_TRANSPORT must be obs or buildkite' >&2; exit 2 ;;
 esac
 
+if [[ ${ADX_OBS_UPLOAD_CHANNEL:-daily} == nightly ]]; then
+  [[ ${BUILDKITE_BRANCH:-} == master && ${BUILDKITE_PIPELINE_SLUG:-agent-dx} == agent-dx ]] || {
+    echo 'nightly OBS publication requires the master branch of the agent-dx pipeline' >&2
+    exit 2
+  }
+  [[ ${ADX_ARTIFACT_TRANSPORT:-obs} == buildkite ]] || {
+    echo 'nightly builds require ADX_ARTIFACT_TRANSPORT=buildkite to avoid OBS staging growth' >&2
+    exit 2
+  }
+fi
+
 if [[ ${ADX_PYTHON_IMAGE_SYNC_ONLY:-0} == 1 || ${ADX_COLLECTOR_SYNC_ONLY:-0} == 1 || ${ADX_K8S_NODE_PREPARE_ONLY:-0} == 1 || ${ADX_BUILD_IMAGE_SYNC_ONLY:-0} == 1 ]]; then
   file=.buildkite/pipeline-maintenance.yml
 else

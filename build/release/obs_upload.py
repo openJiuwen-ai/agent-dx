@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Upload immutable ADX build artifacts to Huawei Cloud OBS."""
+"""Upload ADX build artifacts and rolling master nightly packages to OBS."""
 
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
+import sys
+import tarfile
 from pathlib import Path
 from urllib.parse import quote
 
@@ -14,6 +17,12 @@ DEFAULT_ENDPOINT = "obs.cn-southwest-2.myhuaweicloud.com"
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 TIMESTAMP = re.compile(r"^[0-9]{14}$")
+LOGGER = logging.getLogger(__name__)
+NIGHTLY_FILES = {
+    "adx-release.tar.gz", "adx-release.tar.gz.sha256",
+    "adx-execd.tar.gz", "adx-execd.tar.gz.sha256",
+    "release-manifest.json", "build-manifest.json",
+}
 
 
 def digest(path):
@@ -48,8 +57,8 @@ def public_url(endpoint, bucket, object_path):
 
 
 def plan(files, channel, version, platform, arch, timestamp, commit, build_id, bucket, endpoint):
-    if channel not in ("daily", "release"):
-        raise ValueError("channel must be daily or release")
+    if channel not in ("daily", "release", "nightly"):
+        raise ValueError("channel must be daily, release or nightly")
     component(platform, "platform")
     component(arch, "architecture")
     component(bucket, "bucket")
@@ -59,6 +68,8 @@ def plan(files, channel, version, platform, arch, timestamp, commit, build_id, b
     if channel == "release":
         component(version, "release version")
         root = f"adx/release/{version}/{platform}/{arch}"
+    elif channel == "nightly":
+        root = f"adx/daily/master/{platform}/{arch}"
     else:
         if not TIMESTAMP.fullmatch(timestamp):
             raise ValueError("daily timestamp must use YYYYmmddHHMMSS")
@@ -99,6 +110,7 @@ def plan(files, channel, version, platform, arch, timestamp, commit, build_id, b
         "arch": arch,
         "commit": commit,
         "build_id": build_id,
+        "timestamp": timestamp,
         "bucket": bucket,
         "endpoint": endpoint,
         "manifest_object": manifest_object,
@@ -120,12 +132,46 @@ def checked_upload(client, bucket, object_path, path):
         raise RuntimeError(f"OBS readback verification failed for {path.name}")
 
 
+def nightly_artifacts(files, output):
+    """Keep public package names fixed and preserve versioned filenames inside a bundle."""
+    packages = []
+    extras = []
+    for path in map(Path, files):
+        if path.name in NIGHTLY_FILES:
+            packages.append(path)
+        else:
+            extras.append(path)
+    if extras:
+        archive = output.parent / "adx-extras.tar.gz"
+        with tarfile.open(archive, "w:gz") as bundle:
+            for path in extras:
+                bundle.add(path, arcname=path.name, recursive=False)
+        checksum = archive.with_name(archive.name + ".sha256")
+        checksum.write_text(f"{digest(archive)}  {archive.name}\n")
+        packages.extend([archive, checksum])
+    return packages
+
+
+def require_unversioned_nightly(client, bucket):
+    response = client.getBucketVersioning(bucket)
+    if response.status >= 300:
+        raise RuntimeError(f"cannot check OBS bucket versioning: status={response.status}")
+    if response.body == "Enabled":
+        raise RuntimeError("nightly overwrites require disabled or suspended OBS bucket versioning")
+
+
 def publish(
     *, client, files, output, bucket, endpoint, channel, version, platform, arch, timestamp, commit, build_id, dry_run
 ):
     try:
         manifest = plan(files, channel, version, platform, arch, timestamp, commit, build_id, bucket, endpoint)
         output = Path(output)
+        if channel == "nightly":
+            if not dry_run:
+                require_unversioned_nightly(client, bucket)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            files = nightly_artifacts(files, output)
+            manifest = plan(files, channel, version, platform, arch, timestamp, commit, build_id, bucket, endpoint)
         if not dry_run:
             for path, artifact in zip(map(Path, files), manifest["artifacts"]):
                 checked_upload(client, bucket, artifact["object"], path)
@@ -154,7 +200,7 @@ def obs_client(access_key, secret_key, endpoint):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--channel", choices=("daily", "release"), default="daily")
+    parser.add_argument("--channel", choices=("daily", "release", "nightly"), default="daily")
     parser.add_argument("--version")
     parser.add_argument("--platform", default="linux")
     parser.add_argument("--arch", required=True)
@@ -193,9 +239,10 @@ def main(argv=None):
         dry_run=args.dry_run,
     )
     for artifact in manifest["artifacts"]:
-        print(f"url: {artifact['url']}")
-    print(f"manifest: {manifest['manifest_url']}")
+        LOGGER.info("url: %s", artifact["url"])
+    LOGGER.info("manifest: %s", manifest["manifest_url"])
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     main()

@@ -1,0 +1,17 @@
+{
+  "label": "Master nightly · 02:00 Asia/Shanghai",
+  "cronline": "0 2 * * * Asia/Shanghai",
+  "message": "Nightly master build with fixed OBS artifacts",
+  "commit": "HEAD",
+  "branch": "master",
+  "env": {
+    "ADX_WITH_AFS": "1",
+    "ADX_ARM_BUILD": "1",
+    "ADX_OBS_UPLOAD": "1",
+    "ADX_ARM_OBS_UPLOAD": "1",
+    "ADX_OBS_BUCKET": "agent-dx",
+    "ADX_OBS_UPLOAD_CHANNEL": "nightly",
+    "ADX_ARTIFACT_TRANSPORT": "buildkite"
+  },
+  "enabled": false
+}
