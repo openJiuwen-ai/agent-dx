@@ -246,8 +246,7 @@ class SuiteMemoryBackendTests(unittest.TestCase):
 
     def test_oom_kill_during_a_round_fails_it(self):
         suite = load_suite()
-        ok = {"A": {"oom_kill_delta": 0}, "B": {"oom_kill_delta": None}}
-        suite.require_no_oom(ok)
+        suite.require_no_oom({"A": {"oom_kill_delta": 0}, "B": {"oom_kill_delta": 0}})
         with self.assertRaises(AssertionError):
             suite.require_no_oom({"A": {"oom_kill_delta": 1}})
 
@@ -258,6 +257,7 @@ class SuiteMemoryBackendTests(unittest.TestCase):
         class Cluster:
             config = bench(variant="V2", backend="memory", memory_backend_bytes=1024 * MIB,
                            node_overrides={"B": {"dfs_read_parallelism": 4}})
+            roles = ["M", "A", "B"]
 
             def record(self, name, value):
                 recorded[name] = value
