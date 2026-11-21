@@ -218,7 +218,11 @@ def recovery(c):
     )
     assert before == after, (before, after)
     if not is_single_host(c.config):
-        c.restart(["M"])
+        c.stop("M")
+        c.record("diagnostic.meta_restart_hold_seconds", 2)
+        time.sleep(2)
+        c.record("diagnostic.home_status_before_meta_start", c.channel("A").call("status").get("A"))
+        c.start("M")
         wait_read(c, "B", "durable", data)
         # Verify an unprimed name fails while the one R1 Home is unavailable.
         c.write("A", "uncached", b"uncached")
