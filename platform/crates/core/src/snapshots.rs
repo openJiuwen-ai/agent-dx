@@ -51,11 +51,13 @@ pub enum Reference {
 impl Reference {
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::AgentTemplate { name, version } if valid_id(name) && valid_id(version) => Ok(()),
+            Self::AgentTemplate { name, version } if valid_agent_id(name) && valid_id(version) => {
+                Ok(())
+            }
             Self::AgentBinding {
                 binding_id,
                 environment_id,
-            } if valid_id(binding_id) && valid_id(environment_id) => Ok(()),
+            } if valid_agent_id(binding_id) && valid_id(environment_id) => Ok(()),
             Self::Restore { environment_id } if valid_id(environment_id) => Ok(()),
             Self::Template {
                 node_id,
@@ -65,6 +67,16 @@ impl Reference {
         }
     }
 }
+fn is_zero(revision: &u64) -> bool {
+    *revision == 0
+}
+
+fn valid_agent_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_AGENT_OWNER_ID_BYTES && !id.chars().any(char::is_control)
+}
+/// Byte limit shared with Agent's template names and Binding IDs.
+pub const MAX_AGENT_OWNER_ID_BYTES: usize = 512;
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
 }
@@ -85,6 +97,9 @@ pub struct Snapshot {
     /// A retired recipe cannot admit new owners. An already committed Binding may still restore.
     #[serde(default)]
     pub agent_retiring: bool,
+    /// Acquisitions observed before this revision may belong to a deleted allocation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub agent_admission_revision: u64,
     pub source_node_id: String,
     pub source_runtime_id: String,
     pub artifact: CheckpointArtifact,
@@ -136,6 +151,7 @@ impl Snapshot {
             created_at_unix_ms,
             preparation_template_id: None,
             agent_retiring: false,
+            agent_admission_revision: 0,
             template,
             source_node_id,
             source_runtime_id,
@@ -164,6 +180,7 @@ impl Snapshot {
             || self.names.iter().any(|n| !valid_id(n))
             || self.names.iter().collect::<BTreeSet<_>>().len() != self.names.len()
             || (self.agent_retiring && self.kind != SnapshotKind::Golden)
+            || self.agent_admission_revision > self.revision
             || (self.state == SnapshotState::Deleted && !self.references.is_empty())
         {
             return Err(Error::Invalid("invalid reusable snapshot".into()));
@@ -227,6 +244,27 @@ impl Snapshot {
         self.references.insert(reference);
         Ok(())
     }
+    /// Admit independent owners using their observed revision unless allocation cleanup
+    /// has since invalidated it. Existing ownership is idempotent across revisions.
+    pub fn acquire_agent_binding(
+        &mut self,
+        tenant: &str,
+        owner: Reference,
+        observed: u64,
+    ) -> Result<()> {
+        self.authorize(tenant)?;
+        if self.state == SnapshotState::Ready
+            && !self.agent_retiring
+            && !self.references.contains(&owner)
+            && !(self.agent_admission_revision.max(1)..=self.revision).contains(&observed)
+        {
+            return Err(Error::Unavailable(
+                "snapshot admission changed; reread allocation".into(),
+            ));
+        }
+        self.acquire(tenant, owner)
+    }
+
     /// Invalidate any in-flight acquire that observed the revision before its Binding
     /// entered deletion, including a request that has not reached Catalog yet.
     pub fn cancel_pending(&mut self, reference: &Reference, revision: u64) -> Result<()> {
@@ -237,8 +275,12 @@ impl Snapshot {
         if self.references.contains(reference) {
             return self.release(reference);
         }
-        if self.revision == revision && self.state == SnapshotState::Ready {
+        if self.kind == SnapshotKind::Golden
+            && self.state == SnapshotState::Ready
+            && (self.agent_admission_revision.max(1)..=self.revision).contains(&revision)
+        {
             self.advance()?;
+            self.agent_admission_revision = self.revision;
         }
         Ok(())
     }
@@ -247,6 +289,9 @@ impl Snapshot {
         if self.references.contains(reference) {
             self.advance()?;
             self.references.remove(reference);
+            if matches!(reference, Reference::AgentBinding { .. }) {
+                self.agent_admission_revision = self.revision;
+            }
             self.schedule_retired_collection();
         }
         Ok(())

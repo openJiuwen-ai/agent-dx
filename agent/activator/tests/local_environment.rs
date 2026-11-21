@@ -133,14 +133,16 @@ async fn snapshot_registration_replay_keeps_the_published_network_and_timeout() 
     let job = "job";
     seed.native_input = a.freeze_preparation("tenant", job, &seed).unwrap();
     assert_eq!(
-        a.prepare_snapshot("tenant", job, &seed).await.unwrap(),
+        a.prepare_snapshot("tenant", job, &seed, 100).await.unwrap(),
         SeedResult::Pending
     );
     let persisted = serde_json::to_vec(&seed).unwrap();
     drop(a);
     let recovered: SeedExecution = serde_json::from_slice(&persisted).unwrap();
     assert_eq!(
-        b.prepare_snapshot("tenant", job, &recovered).await.unwrap(),
+        b.prepare_snapshot("tenant", job, &recovered, 100)
+            .await
+            .unwrap(),
         SeedResult::Ready {
             snapshot_id: "one".into()
         }

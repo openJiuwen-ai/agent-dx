@@ -44,6 +44,7 @@ impl TryFrom<Snapshot> for pb::ReusableSnapshot {
                 SnapshotState::Deleted => pb::SnapshotState::Deleted,
             } as i32,
             agent_retiring: s.agent_retiring,
+            agent_admission_revision: s.agent_admission_revision,
             references: s
                 .references
                 .into_iter()
@@ -124,6 +125,7 @@ impl TryFrom<pb::ReusableSnapshot> for Snapshot {
             created_at_unix_ms: s.created_at_unix_ms,
             preparation_template_id: None,
             agent_retiring: s.agent_retiring,
+            agent_admission_revision: s.agent_admission_revision,
             template: s
                 .template
                 .ok_or_else(|| Error::Invalid("snapshot template required".into()))?

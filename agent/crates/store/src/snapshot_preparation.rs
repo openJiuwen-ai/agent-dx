@@ -23,6 +23,9 @@ pub struct PreparationJob {
     /// Durable intent before asking Catalog to pin this recipe.
     #[serde(default)]
     pub resolved_snapshot: Option<String>,
+    /// If set, this preparation must retire its result before completing as failed.
+    #[serde(default)]
+    pub discard_reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -32,11 +35,14 @@ pub(crate) struct PreparationResult {
 }
 
 pub(crate) fn pending_key(job: &PreparationJob) -> Result<Key> {
-    Key::new(
-        "snapshot-preparation",
-        &[&job.tenant, &job.template, &job.version],
-    )
+    preparation_key(&job.tenant, &job.template, &job.version)
 }
+
+fn preparation_key(tenant: &str, template: &str, version: &str) -> Result<Key> {
+    Key::new("snapshot-preparation", &[tenant, template, version])
+}
+
+pub const PREPARATION_DEADLINE_EXCEEDED: &str = "Golden preparation deadline exceeded";
 
 fn result_key(tenant: &str, template: &str, version: &str) -> Result<Key> {
     Key::new("snapshot-preparation-result", &[tenant, template, version])
@@ -59,6 +65,7 @@ impl AgentState {
         &self,
         job: &PreparationJob,
         snapshot: &str,
+        discard_reason: Option<String>,
     ) -> Result<PreparationJob> {
         let key = pending_key(job)?;
         for _ in 0..adx_agent_core::limits::CAS_ATTEMPTS {
@@ -81,6 +88,7 @@ impl AgentState {
                 };
             }
             saved.resolved_snapshot = Some(snapshot.into());
+            saved.discard_reason = discard_reason.clone();
             if self
                 .store
                 .commit(&Transaction::new(
@@ -144,13 +152,35 @@ impl AgentState {
         template: &TemplateVersion,
     ) -> Result<TemplateVersion> {
         let mut view = template.clone();
-        if template.auto_prepare_snapshot {
-            let key = result_key(tenant, &template.name, &template.version)?;
-            if let Some(record) = self.store.get(&key).await? {
-                let result: PreparationResult = record.decode()?;
-                view.snapshot_preparation = Some(result.status);
-                view.prewarm_recipe = result.recipe;
+        if !template.auto_prepare_snapshot {
+            return Ok(view);
+        }
+        let key = result_key(tenant, &template.name, &template.version)?;
+        let result = match self.store.get(&key).await? {
+            Some(result) => Some(result),
+            None => {
+                let pending = preparation_key(tenant, &template.name, &template.version)?;
+                if let Some(record) = self.store.get(&pending).await? {
+                    let job: PreparationJob = record.decode()?;
+                    let reason = job.discard_reason.or_else(|| {
+                        (job.resolved_snapshot.is_none()
+                            && adx_agent_core::transport::remaining_time(job.deadline_unix_ms)
+                                .is_zero())
+                        .then(|| PREPARATION_DEADLINE_EXCEEDED.into())
+                    });
+                    if let Some(reason) = reason {
+                        view.snapshot_preparation = Some(SnapshotPreparation::Failed { reason });
+                    }
+                    return Ok(view);
+                }
+                // The result may have committed between the result and outbox reads.
+                self.store.get(&key).await?
             }
+        };
+        if let Some(record) = result {
+            let result: PreparationResult = record.decode()?;
+            view.snapshot_preparation = Some(result.status);
+            view.prewarm_recipe = result.recipe;
         }
         Ok(view)
     }

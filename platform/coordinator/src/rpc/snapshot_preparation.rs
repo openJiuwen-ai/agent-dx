@@ -344,10 +344,7 @@ impl CoordinatorRpc {
         self.preparation_delete_seed(spec).await?;
         // Agent publishes a fixed preparation UUID and a single seed-owned Volume.
         let id = &template.preparation.id;
-        if template.id == *id
-            && template.name.starts_with(&format!("adx-agent-{id}-"))
-            && spec.id == format!("golden-{id}")
-        {
+        if template.is_agent_managed() && spec.id == format!("golden-{id}") {
             session
                 .release_volume_owner(&spec.tenant_id, &spec.id)
                 .await?;
@@ -684,14 +681,10 @@ impl CoordinatorRpc {
         let templates = session.retained_snapshot_templates().await?;
         let mut work = Vec::new();
         let mut first_error = None;
+        let now = adx_core::observation::now_millis()?;
         for template in templates {
-            if template.deleted {
-                if let Err(error) = session
-                    .remove_finished_snapshot_template(&template.id)
-                    .await
-                {
-                    first_error.get_or_insert(error);
-                }
+            if let Err(error) = session.collect_snapshot_template(&template, now).await {
+                first_error.get_or_insert(error);
             }
             let build = template.preparation;
             if matches!(
@@ -765,6 +758,7 @@ impl SnapshotPreparationService for CoordinatorRpc {
                 &request.name,
                 resources,
                 request.fixed_id.as_deref(),
+                request.registration_deadline_unix_ms,
             )
             .await
             .map_err(status)?;
@@ -1159,6 +1153,7 @@ mod tests {
             revision: 1,
             deleted: false,
             preparation: build.clone(),
+            registration_deadline_unix_ms: None,
             latest_successful: None,
         };
         let result = view(&template, &build, None);
@@ -1207,6 +1202,96 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn collection_removes_only_finished_agent_families() {
+        let redis = cancellation_test_redis::Redis::new().await;
+        let store = crate::storage::RedisStore::connect(&redis.url, "test", Duration::from_secs(5))
+            .await
+            .unwrap();
+        let session = store.begin(1).await.unwrap();
+        let worker = rpc(session.clone()).await;
+        let expired = "00000000-0000-4000-8000-000000000001";
+        let name = format!("adx-agent-{expired}-{}", "a".repeat(64));
+        let resources = source().resources;
+        assert!(matches!(
+            session
+                .register_snapshot_preparation_with_id(
+                    "tenant",
+                    &name,
+                    resources,
+                    Some(expired),
+                    Some(1)
+                )
+                .await,
+            Err(Error::NotFound)
+        ));
+        let id = "00000000-0000-4000-8000-000000000002";
+        let name = format!("adx-agent-{id}-{}", "b".repeat(64));
+        let (family, _) = session
+            .register_snapshot_preparation_with_id("tenant", &name, resources, Some(id), None)
+            .await
+            .unwrap();
+        let (native, _) = session
+            .register_snapshot_preparation("tenant", "native", resources)
+            .await
+            .unwrap();
+        for template in [family, native.clone()] {
+            let spec = source();
+            let snapshot_id = if template.is_agent_managed() {
+                snapshot_id(
+                    "tenant",
+                    &format!("golden-{}", template.id),
+                    &format!("snapshot-{}", template.id),
+                )
+                .unwrap()
+            } else {
+                format!("snapshot-{}", template.id)
+            };
+            let mut saved = capture(&spec, snapshot_id.clone());
+            saved.names = vec![template.name.clone()];
+            saved.artifact.location = template.id.clone();
+            session.publish_snapshot(saved).await.unwrap();
+            session
+                .update_snapshot_template(&template.id, |record| {
+                    record.preparation.spec = Some(spec.clone());
+                    record.preparation.snapshot_id = Some(snapshot_id.clone());
+                    record.preparation.state = PreparationState::Ready;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let deleted = session
+                .delete_snapshot(&snapshot_id, "tenant")
+                .await
+                .unwrap();
+            worker.reconcile_snapshot_preparations().await.unwrap();
+            assert!(session
+                .get_snapshot_template("tenant", &template.id)
+                .await
+                .is_ok());
+            session
+                .finish_snapshot_deletion(&snapshot_id, deleted.revision)
+                .await
+                .unwrap();
+        }
+        worker.reconcile_snapshot_preparations().await.unwrap();
+        assert!(matches!(
+            session.get_snapshot_template("tenant", id).await,
+            Err(Error::NotFound)
+        ));
+        assert!(session
+            .get_snapshot_template("tenant", &native.id)
+            .await
+            .is_ok());
+        assert!(matches!(
+            session
+                .register_snapshot_preparation_with_id("tenant", &name, resources, Some(id), None)
+                .await,
+            Err(Error::NotFound)
+        ));
     }
     #[tokio::test]
     #[ignore = "requires isolated Redis; set ADX_TEST_REDIS_SERVER"]

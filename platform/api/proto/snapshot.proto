@@ -38,6 +38,7 @@ message AgentBindingReference { string binding_id = 1; string environment_id = 2
 
 message ReusableSnapshot {
   bool agent_retiring = 12;
+  uint64 agent_admission_revision = 13;
   string id = 1;
   repeated string names = 2;
   EnvironmentSpec template = 3;

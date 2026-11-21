@@ -409,10 +409,35 @@ impl Activator {
             }
             Err(error) => return Err(error.into()),
         };
-        if !self.reference_is_active(&binding, target).await? {
-            return Err(Error::Conflict(
-                "allocation changed before Catalog admission".into(),
-            ));
+        // Read after the Catalog revision so deletion can fence any later acquire.
+        let current = self
+            .state
+            .binding(&binding.scope)
+            .await?
+            .filter(|current| {
+                current.generation == binding.generation && current.phase == BindingPhase::Active
+            })
+            .ok_or_else(|| Error::Conflict("allocation retired before Catalog admission".into()))?;
+        let allocation = if current.current.environment_id == target.environment_id {
+            Some(&current.current)
+        } else {
+            current
+                .secondary
+                .as_ref()
+                .filter(|secondary| {
+                    secondary.intent == SecondaryIntent::Preparing
+                        && secondary.environment.environment_id == target.environment_id
+                })
+                .map(|secondary| &secondary.environment)
+        };
+        match allocation {
+            Some(allocation) if allocation.pending_snapshot_id.is_none() => return Ok(current),
+            Some(allocation) if allocation == target => {}
+            _ => {
+                return Err(Error::Conflict(
+                    "allocation changed before Catalog admission".into(),
+                ))
+            }
         }
         let change = SnapshotChange::AcquireBinding {
             revision,

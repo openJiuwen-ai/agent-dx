@@ -253,3 +253,33 @@ fn cancelling_missing_binding_fences_its_in_flight_registration() {
     saved.cancel_pending(&owner, observed).unwrap();
     assert_eq!(after, saved.revision);
 }
+
+#[test]
+fn catalog_accepts_agent_identifier_byte_limit() {
+    let mut saved = snapshot();
+    saved.kind = adx_core::snapshots::SnapshotKind::Golden;
+    let limit = "界".repeat(170) + "ab";
+    for owner in [
+        Reference::AgentTemplate {
+            name: limit.clone(),
+            version: "1".into(),
+        },
+        Reference::AgentBinding {
+            binding_id: limit.clone(),
+            environment_id: "target".into(),
+        },
+    ] {
+        saved.acquire("tenant", owner).unwrap();
+    }
+    assert!(Reference::AgentBinding {
+        binding_id: limit + "c",
+        environment_id: "target".into()
+    }
+    .validate()
+    .is_err());
+    assert!(Reference::Restore {
+        environment_id: "a".repeat(257)
+    }
+    .validate()
+    .is_err());
+}

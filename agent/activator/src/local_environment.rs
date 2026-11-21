@@ -139,14 +139,16 @@ impl Environment for LocalEnvironment {
         tenant: &str,
         id: &str,
         seed: &adx_agent_core::prewarm::SeedExecution,
+        deadline_unix_ms: u64,
     ) -> Result<adx_agent_core::prewarm::SeedResult, EnvironmentError> {
-        let input = environment_request::seed_input(
+        let mut input = environment_request::seed_input(
             tenant,
             id,
             seed,
             self.timeout,
             self.platform_egress.as_ref(),
         )?;
+        input["registration_deadline_unix_ms"] = serde_json::json!(deadline_unix_ms);
         tokio::time::timeout(
             self.timeout,
             self.application.prepare_snapshot_request(tenant, id, input),

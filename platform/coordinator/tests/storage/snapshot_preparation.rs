@@ -17,8 +17,8 @@ async fn fixed_native_registration_replays_after_terminal_state_and_is_tenant_fe
     let id = "47cb1f37-3b07-4093-be93-894e54275a4e";
     let name = format!("adx-agent-{id}-{}", "a".repeat(64));
     let (a, b) = tokio::join!(
-        session.register_snapshot_preparation_with_id("tenant", &name, resources(), Some(id)),
-        session.register_snapshot_preparation_with_id("tenant", &name, resources(), Some(id))
+        session.register_snapshot_preparation_with_id("tenant", &name, resources(), Some(id), None),
+        session.register_snapshot_preparation_with_id("tenant", &name, resources(), Some(id), None)
     );
     assert_eq!(a.unwrap(), b.unwrap());
     session
@@ -29,7 +29,7 @@ async fn fixed_native_registration_replays_after_terminal_state_and_is_tenant_fe
         .await
         .unwrap();
     let (family, build) = session
-        .register_snapshot_preparation_with_id("tenant", &name, resources(), Some(id))
+        .register_snapshot_preparation_with_id("tenant", &name, resources(), Some(id), None)
         .await
         .unwrap();
     assert_eq!(family.id, id);
@@ -38,13 +38,13 @@ async fn fixed_native_registration_replays_after_terminal_state_and_is_tenant_fe
     let changed = format!("adx-agent-{id}-{}", "b".repeat(64));
     assert_eq!(
         session
-            .register_snapshot_preparation_with_id("tenant", &changed, resources(), Some(id))
+            .register_snapshot_preparation_with_id("tenant", &changed, resources(), Some(id), None)
             .await,
         Err(Error::Conflict)
     );
     assert_eq!(
         session
-            .register_snapshot_preparation_with_id("foreign", &name, resources(), Some(id))
+            .register_snapshot_preparation_with_id("foreign", &name, resources(), Some(id), None)
             .await,
         Err(Error::Conflict)
     );

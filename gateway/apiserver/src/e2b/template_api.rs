@@ -168,6 +168,7 @@ pub(super) async fn register(
             client.register_snapshot_preparation(trace::inject(
                 pb::RegisterSnapshotPreparationRequest {
                     fixed_id: None,
+                    registration_deadline_unix_ms: None,
                     caller: Some(caller.clone()),
                     name,
                     resources: Some(resources),

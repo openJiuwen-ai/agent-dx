@@ -18,7 +18,7 @@ mod prewarm;
 mod snapshot_preparation;
 #[cfg(feature = "test-memory")]
 pub use memory::MemoryRepository;
-pub use snapshot_preparation::PreparationJob;
+pub use snapshot_preparation::{PreparationJob, PREPARATION_DEADLINE_EXCEEDED};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {

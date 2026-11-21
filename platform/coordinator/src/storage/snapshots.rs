@@ -167,6 +167,7 @@ impl Session {
             || record.revision != 1
             || !record.references.is_empty()
             || record.agent_retiring
+            || record.agent_admission_revision != 0
         {
             return Err(Error::Invalid(
                 "new snapshot must be ready and unreferenced".into(),
@@ -332,16 +333,7 @@ impl Session {
         revision: u64,
     ) -> Result<Snapshot> {
         self.mutate_snapshot(id, |s| {
-            if s.revision != revision
-                && !s.references.contains(&owner)
-                && !s.agent_retiring
-                && s.state == SnapshotState::Ready
-            {
-                return Err(Error::Unavailable(
-                    "snapshot revision changed; reread allocation".into(),
-                ));
-            }
-            s.acquire(tenant, owner.clone())
+            s.acquire_agent_binding(tenant, owner.clone(), revision)
         })
         .await
     }

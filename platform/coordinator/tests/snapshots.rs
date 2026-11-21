@@ -408,3 +408,48 @@ async fn agent_owners_survive_restart_and_race_retirement() {
         SnapshotState::Deleted
     );
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn unrelated_catalog_owners_can_share_an_observed_revision() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    let mut saved = snapshot();
+    saved.kind = adx_core::snapshots::SnapshotKind::Golden;
+    session.publish_snapshot(saved.clone()).await.unwrap();
+    let owner = |id: &str| Reference::AgentBinding {
+        binding_id: id.into(),
+        environment_id: format!("env-{id}"),
+    };
+    let (left, right) = tokio::join!(
+        session.acquire_agent_binding(&saved.id, "tenant", owner("left"), saved.revision),
+        session.acquire_agent_binding(&saved.id, "tenant", owner("right"), saved.revision)
+    );
+    left.unwrap();
+    right.unwrap();
+    let persisted = session.get_snapshot(&saved.id).await.unwrap();
+    assert!(persisted.references.contains(&owner("left")));
+    assert!(persisted.references.contains(&owner("right")));
+    let before_cancel = persisted.revision;
+    session
+        .acquire_agent_binding(&saved.id, "tenant", owner("third"), before_cancel)
+        .await
+        .unwrap();
+    session
+        .cancel_pending_binding(&saved.id, owner("cancelled"), before_cancel)
+        .await
+        .unwrap();
+    assert!(session
+        .acquire_agent_binding(&saved.id, "tenant", owner("cancelled"), before_cancel)
+        .await
+        .is_err());
+    let before_release = session.get_snapshot(&saved.id).await.unwrap().revision;
+    session
+        .release_snapshot(&saved.id, owner("left"))
+        .await
+        .unwrap();
+    assert!(session
+        .acquire_agent_binding(&saved.id, "tenant", owner("left"), before_release)
+        .await
+        .is_err());
+}

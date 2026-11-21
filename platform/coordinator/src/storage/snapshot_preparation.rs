@@ -116,6 +116,15 @@ impl Session {
         } else {
             None
         };
+        let capture = if old.is_none() && next.is_agent_managed() {
+            Some(adx_core::snapshots::snapshot_id(
+                &next.tenant_id,
+                &format!("golden-{}", next.id),
+                &format!("snapshot-{}", next.id),
+            )?)
+        } else {
+            None
+        };
         let mut command = redis::cmd("EVAL");
         command
             .arg(
@@ -125,7 +134,14 @@ impl Session {
             if old ~= ARGV[3] then return 0 end
             local indexed=redis.call('HGET',KEYS[3],ARGV[5]) or ''
             if indexed ~= ARGV[6] then return 0 end
-            if old == '' and redis.call('HLEN',KEYS[2]) >= tonumber(ARGV[8]) then return 2 end
+            if old == '' then
+                if ARGV[12] ~= '' then
+                    local now=redis.call('TIME')
+                    if tonumber(now[1])*1000+math.floor(tonumber(now[2])/1000) >= tonumber(ARGV[12]) then return 3 end
+                end
+                if ARGV[13] ~= '' and redis.call('HEXISTS',KEYS[4],ARGV[13]) == 1 then return 3 end
+                if redis.call('HLEN',KEYS[2]) >= tonumber(ARGV[8]) then return 2 end
+            end
             if ARGV[9] ~= '' and (redis.call('HGET',KEYS[4],ARGV[9]) or '') ~= ARGV[10] then return 0 end
             redis.call('HSET',KEYS[2],ARGV[2],ARGV[4])
             if ARGV[9] ~= '' then redis.call('HSET',KEYS[4],ARGV[9],ARGV[11]) end
@@ -152,7 +168,9 @@ impl Session {
             .arg(MAX_TEMPLATES)
             .arg(binding.as_ref().map_or("", |(_, snapshot)| snapshot.id.as_str()))
             .arg(binding.as_ref().map_or("", |(raw, _)| raw.as_str()))
-            .arg(binding.as_ref().map(|(_, snapshot)| encode(snapshot)).transpose()?.unwrap_or_default());
+            .arg(binding.as_ref().map(|(_, snapshot)| encode(snapshot)).transpose()?.unwrap_or_default())
+            .arg(next.registration_deadline_unix_ms.map(|value|value.to_string()).unwrap_or_default())
+            .arg(capture.as_deref().unwrap_or(""));
         // Taking the committed view also invalidates it if this future is
         // cancelled while Redis may already have accepted the write.
         let mut committed = inventory.as_mut().and_then(|inventory| inventory.take());
@@ -171,6 +189,7 @@ impl Session {
             1 => Ok(true),
             0 => Ok(false),
             2 => Err(Error::Invalid("snapshot template limit reached".into())),
+            3 => Err(Error::NotFound),
             _ => Err(Error::Conflict),
         }
     }
@@ -230,7 +249,7 @@ impl Session {
         name: &str,
         resources: adx_core::Resources,
     ) -> Result<(SnapshotTemplate, SnapshotPreparation)> {
-        self.register_snapshot_preparation_with_id(tenant, name, resources, None)
+        self.register_snapshot_preparation_with_id(tenant, name, resources, None, None)
             .await
     }
 
@@ -240,6 +259,7 @@ impl Session {
         name: &str,
         resources: adx_core::Resources,
         fixed_id: Option<&str>,
+        registration_deadline_unix_ms: Option<u64>,
     ) -> Result<(SnapshotTemplate, SnapshotPreparation)> {
         validate_template_tenant(tenant)?;
         let name = normalize_name(name)?;
@@ -254,7 +274,8 @@ impl Session {
                                 .bytes()
                                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                     })
-        }) || fixed_id.is_none() && name.starts_with("adx-agent-")
+        }) || fixed_id.is_none()
+            && (name.starts_with("adx-agent-") || registration_deadline_unix_ms.is_some())
         {
             return Err(Error::Invalid("invalid native preparation identity".into()));
         }
@@ -334,6 +355,7 @@ impl Session {
                     deleted: false,
                     preparation: preparation.clone(),
                     latest_successful: None,
+                    registration_deadline_unix_ms,
                 });
             if existing.as_ref().is_some_and(|template| {
                 !template.deleted
@@ -458,6 +480,55 @@ impl Session {
         Ok(templates)
     }
 
+    /// Drop one-shot Agent families after their build and artifact have settled.
+    /// Native named templates may be rebuilt and retain their usage history.
+    pub(crate) async fn collect_snapshot_template(
+        &self,
+        template: &SnapshotTemplate,
+        now: u64,
+    ) -> Result<()> {
+        if !template.deleted && template.is_agent_managed() && !template.preparation.cleanup_pending
+        {
+            let retired = match template.preparation.state {
+                PreparationState::Ready => {
+                    let id = template
+                        .preparation
+                        .snapshot_id
+                        .as_deref()
+                        .ok_or(Error::Conflict)?;
+                    match self.get_snapshot(id).await {
+                        Ok(snapshot) => {
+                            snapshot.state == adx_core::snapshots::SnapshotState::Deleted
+                                && snapshot.preparation_template_id.as_deref()
+                                    == Some(template.id.as_str())
+                                && snapshot.template.tenant_id == template.tenant_id
+                        }
+                        Err(Error::NotFound) => false,
+                        Err(error) => return Err(error),
+                    }
+                }
+                PreparationState::Failed => template
+                    .registration_deadline_unix_ms
+                    .is_some_and(|deadline| now >= deadline),
+                _ => false,
+            };
+            if retired {
+                self.update_snapshot_template(&template.id, |record| {
+                    if record.preparation != template.preparation || !record.is_agent_managed() {
+                        return Err(Error::Conflict);
+                    }
+                    record.deleted = true;
+                    Ok(())
+                })
+                .await?;
+                self.remove_finished_snapshot_template(&template.id).await?;
+            }
+        } else if template.deleted {
+            self.remove_finished_snapshot_template(&template.id).await?;
+        }
+        Ok(())
+    }
+
     /// Remove only a completed logical deletion. Active or uncleaned preparations remain durable.
     /// The epoch and exact record are fenced atomically; a reused name keeps its new owner.
     pub async fn remove_finished_snapshot_template(&self, id: &str) -> Result<bool> {
@@ -545,6 +616,7 @@ impl Session {
                 || next.revision != previous.revision
                 || next.updated_at_unix_ms != previous.updated_at_unix_ms
                 || next.usage != previous.usage
+                || next.registration_deadline_unix_ms != previous.registration_deadline_unix_ms
                 || next.preparation.updated_at_unix_ms != previous.preparation.updated_at_unix_ms
                 || (previous.deleted && !next.deleted)
                 || next.preparation.id != previous.preparation.id

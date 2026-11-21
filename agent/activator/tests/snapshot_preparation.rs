@@ -75,6 +75,12 @@ struct Platform {
     replies: Mutex<VecDeque<Result<SeedResult, EnvironmentError>>>,
     creations: Mutex<Vec<CreateEnvironment>>,
     references: Mutex<Vec<SnapshotChange>>,
+    revision_gate: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     retired: AtomicBool,
     unavailable: AtomicBool,
     unknown_reference_response: AtomicBool,
@@ -88,6 +94,7 @@ impl Environment for Platform {
         tenant: &str,
         id: &str,
         seed: &SeedExecution,
+        _deadline_unix_ms: u64,
     ) -> Result<SeedResult, EnvironmentError> {
         self.calls
             .lock()
@@ -100,6 +107,11 @@ impl Environment for Platform {
             .unwrap_or(Ok(SeedResult::Pending))
     }
     async fn snapshot_revision(&self, _: &str, _: &str) -> Result<u64, EnvironmentError> {
+        let gate = self.revision_gate.lock().await.take();
+        if let Some((entered, released)) = gate {
+            entered.send(()).unwrap();
+            released.await.unwrap();
+        }
         Ok(1)
     }
     async fn update_snapshot_reference(
@@ -117,6 +129,15 @@ impl Environment for Platform {
         }
         if matches!(change, SnapshotChange::Retire) {
             self.retired.store(true, Ordering::Relaxed);
+            if !self
+                .references
+                .lock()
+                .await
+                .iter()
+                .any(|change| matches!(change, SnapshotChange::AcquireBinding { .. }))
+            {
+                return Ok(());
+            }
             return Err(EnvironmentError::Conflict(
                 "snapshot retained by Binding".into(),
             ));
@@ -540,8 +561,36 @@ async fn transient_preparation_error_retries_until_its_persisted_deadline() {
 
     let restarted = Activator::new(state.clone(), platform.clone());
     restarted.reconcile_snapshot_preparations().await.unwrap();
+    assert_eq!(state.preparation_jobs(None).await.unwrap().len(), 1);
+    assert!(matches!(
+        restarted.template("tenant", "digitalmate", &pending.version).await.unwrap().snapshot_preparation,
+        Some(SnapshotPreparation::Failed { reason }) if reason.contains("deadline")
+    ));
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-ready".into(),
+        }));
+    platform
+        .unknown_reference_response
+        .store(true, Ordering::Relaxed);
+    restarted.reconcile_snapshot_preparations().await.unwrap();
+    platform
+        .unknown_reference_response
+        .store(false, Ordering::Relaxed);
+    assert_eq!(state.preparation_jobs(None).await.unwrap().len(), 1);
+    restarted.reconcile_snapshot_preparations().await.unwrap();
+    let jobs = platform.calls.lock().await;
+    assert_eq!(jobs.len(), 3);
+    assert!(jobs.iter().all(|call| call.1 == job.id));
+    assert!(platform
+        .references
+        .lock()
+        .await
+        .contains(&SnapshotChange::Retire));
     assert!(state.preparation_jobs(None).await.unwrap().is_empty());
-    assert_eq!(platform.calls.lock().await.len(), 1);
     assert!(matches!(
         restarted.template("tenant", "digitalmate", &pending.version).await.unwrap().snapshot_preparation,
         Some(SnapshotPreparation::Failed { reason }) if reason.contains("deadline")
@@ -984,4 +1033,59 @@ async fn unknown_owner_response_replays_the_persisted_allocation_before_environm
     assert_eq!(fixed.current.environment_id, pending.current.environment_id);
     let changes = platform.references.lock().await;
     assert_eq!(changes[1], changes[2]);
+}
+
+#[tokio::test]
+async fn same_subject_reuses_winning_snapshot_decision_after_revision_read() {
+    let platform = Arc::new(Platform::default());
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let first = Arc::new(Activator::new(state.clone(), platform.clone()));
+    let second = Activator::new(state, platform.clone());
+    first.publish("tenant", &draft(true)).await.unwrap();
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Ok(SeedResult::Ready {
+            snapshot_id: "snapshot-ready".into(),
+        }));
+    first.reconcile_snapshot_preparations().await.unwrap();
+    let subject = scope("concurrent", TemplateRef::Version("1".into()));
+    let deadline = adx_agent_core::unix_time_millis() + 30000;
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *platform.revision_gate.lock().await = Some((entered, released));
+    let other = subject.clone();
+    let stalled = tokio::spawn(async move {
+        first
+            .activate_with_parameters(
+                &other,
+                None,
+                deadline,
+                true,
+                Some(b"workspace=w-concurrent"),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    let winning = second
+        .activate_with_parameters(
+            &subject,
+            None,
+            deadline,
+            true,
+            Some(b"workspace=w-concurrent"),
+        )
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    let replay = stalled.await.unwrap().unwrap();
+    assert_eq!(winning.binding.current, replay.binding.current);
+    assert_eq!(
+        replay.binding.current.snapshot_id.as_deref(),
+        Some("snapshot-ready")
+    );
 }

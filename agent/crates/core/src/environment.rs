@@ -234,6 +234,7 @@ pub trait Environment: Send + Sync {
         _tenant: &str,
         _job_id: &str,
         _seed: &crate::prewarm::SeedExecution,
+        _deadline_unix_ms: u64,
     ) -> Result<crate::prewarm::SeedResult, EnvironmentError> {
         Err(EnvironmentError::Unsupported(
             "snapshot preparation unavailable".into(),

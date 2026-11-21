@@ -106,12 +106,22 @@ impl EnvironmentService {
     pub(crate) async fn prepare_snapshot(
         &self,
         id: &str,
-        input: Value,
+        mut input: Value,
         caller: &pb::CallerContext,
     ) -> Result<SeedResult, Status> {
         if !adx_core::snapshot_preparation::valid_preparation_id(id) {
             return Err(Status::invalid_argument("fixed preparation UUID required"));
         }
+        // The deadline fences registration. It is not part of the seed spec digest.
+        let registration_deadline_unix_ms = input
+            .as_object_mut()
+            .and_then(|input| input.remove("registration_deadline_unix_ms"))
+            .map(|deadline| {
+                deadline
+                    .as_u64()
+                    .ok_or_else(|| Status::invalid_argument("invalid preparation deadline"))
+            })
+            .transpose()?;
         let bytes = serde_json::to_vec(&input)
             .map_err(|_| Status::invalid_argument("invalid snapshot preparation input"))?;
         let registration = format!("adx-agent-{id}-{:x}", Sha256::digest(bytes));
@@ -162,7 +172,8 @@ impl EnvironmentService {
         {
             Ok(view) => view,
             Err(e) if e.code() == Code::NotFound => {
-                self.clients
+                match self
+                    .clients
                     .rpc(
                         "apiserver.snapshot_preparation.register",
                         client.register_snapshot_preparation(trace::inject(
@@ -171,10 +182,21 @@ impl EnvironmentService {
                                 name: registration.clone(),
                                 resources: spec.resources,
                                 fixed_id: Some(id.into()),
+                                registration_deadline_unix_ms,
                             },
                         )),
                     )
-                    .await?
+                    .await
+                {
+                    Ok(view) => view,
+                    Err(e)
+                        if e.code() == Code::NotFound
+                            && registration_deadline_unix_ms.is_some() =>
+                    {
+                        return Ok(SeedResult::Failed)
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             Err(e) => return Err(e),
         };

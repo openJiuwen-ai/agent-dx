@@ -43,6 +43,9 @@ pub struct SnapshotTemplate {
     pub deleted: bool,
     pub preparation: SnapshotPreparation,
     pub latest_successful: Option<SuccessfulPreparation>,
+    /// Deadline for starting an unregistered Agent job. Existing jobs can settle after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_deadline_unix_ms: Option<u64>,
     /// None denotes history written before native usage accounting existed.
     #[serde(default)]
     pub usage: Option<SnapshotTemplateUsage>,
@@ -135,6 +138,10 @@ impl SnapshotPreparation {
 }
 
 impl SnapshotTemplate {
+    pub fn is_agent_managed(&self) -> bool {
+        self.id == self.preparation.id && self.name.starts_with(&format!("adx-agent-{}-", self.id))
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_template_tenant(&self.tenant_id)?;
         self.preparation.validate()?;
@@ -142,6 +149,7 @@ impl SnapshotTemplate {
             || normalize_name(&self.name)? != self.name
             || self.created_at_unix_ms == 0
             || self.revision == 0
+            || (self.registration_deadline_unix_ms.is_some() && !self.is_agent_managed())
             || self
                 .preparation
                 .spec

@@ -141,6 +141,7 @@ impl Activator {
         seed.native_input = self.environment.freeze_preparation(tenant, &id, &seed)?;
         Ok(PreparationJob {
             resolved_snapshot: None,
+            discard_reason: None,
             id,
             deadline_unix_ms: adx_agent_core::unix_time_millis()
                 .saturating_add(PREPARATION_LIFETIME_MS),
@@ -178,30 +179,9 @@ impl Activator {
             }
             for (key, job) in jobs {
                 cursor = Some(key);
-                let remaining = if job.resolved_snapshot.is_some() {
-                    PREPARATION_ATTEMPT_CAP
-                } else {
-                    adx_agent_core::transport::remaining_time(job.deadline_unix_ms)
-                };
-                if remaining.is_zero() {
-                    tracing::warn!(preparation_id = %job.id, tenant = %job.tenant,
-                        template = %job.template, version = %job.version, "Golden preparation deadline exceeded");
-                    self.state
-                        .finish_preparation(
-                            &job,
-                            Err("Golden preparation deadline exceeded".into()),
-                        )
-                        .await?;
-                    continue;
-                }
-                match tokio::time::timeout(
-                    remaining.min(PREPARATION_ATTEMPT_CAP),
-                    self.prepare_golden(&job),
-                )
-                .await
+                match tokio::time::timeout(PREPARATION_ATTEMPT_CAP, self.prepare_golden(&job)).await
                 {
-                    Ok(Ok(Some(result))) => self.state.finish_preparation(&job, result).await?,
-                    Ok(Ok(None)) => {}
+                    Ok(Ok(())) => {}
                     Ok(Err(error)) => {
                         tracing::warn!(preparation_id = %job.id, tenant = %job.tenant,
                         template = %job.template, version = %job.version, %error, "Golden preparation will retry")
@@ -213,59 +193,101 @@ impl Activator {
         }
     }
 
-    async fn prepare_golden(
-        &self,
-        job: &PreparationJob,
-    ) -> Result<Option<std::result::Result<PrewarmRecipe, String>>> {
-        if let Some(id) = &job.resolved_snapshot {
-            let mut recipe = job.recipe.clone();
-            recipe.snapshot_id.clone_from(id);
-            return self.register_recipe(job, recipe).await;
+    async fn prepare_golden(&self, job: &PreparationJob) -> Result<()> {
+        if job.resolved_snapshot.is_some() {
+            return self.finish_resolved_snapshot(job).await;
         }
-        let snapshot_id = match self
+        let expired = || adx_agent_core::transport::remaining_time(job.deadline_unix_ms).is_zero();
+        let snapshot = match self
             .environment
-            .prepare_snapshot(&job.tenant, &job.id, &job.seed)
+            .prepare_snapshot(&job.tenant, &job.id, &job.seed, job.deadline_unix_ms)
             .await
         {
+            Ok(SeedResult::Pending) => return Ok(()),
             Ok(SeedResult::Ready { snapshot_id }) => snapshot_id,
             Ok(SeedResult::Failed) => {
-                return Ok(Some(Err("Platform snapshot preparation failed".into())))
+                let reason = if expired() {
+                    adx_agent_store::PREPARATION_DEADLINE_EXCEEDED
+                } else {
+                    "Platform snapshot preparation failed"
+                };
+                return self
+                    .state
+                    .finish_preparation(job, Err(reason.into()))
+                    .await
+                    .map_err(Into::into);
             }
-            Ok(SeedResult::Pending) => return Ok(None),
             Err(EnvironmentError::Invalid(_)) => {
-                return Ok(Some(Err("Platform rejected the seed specification".into())))
+                return self
+                    .state
+                    .finish_preparation(job, Err("Platform rejected the seed specification".into()))
+                    .await
+                    .map_err(Into::into)
             }
             Err(error) => return Err(error.into()),
         };
-        if !self
+        let mut recipe = job.recipe.clone();
+        recipe.snapshot_id.clone_from(&snapshot);
+        let discard = if expired() {
+            Some(adx_agent_store::PREPARATION_DEADLINE_EXCEEDED.into())
+        } else if !self
             .environment
             .golden_available(
                 &job.tenant,
-                &snapshot_id,
+                &snapshot,
                 &job.seed.execution.image,
                 &job.seed.execution.isolation_runtime,
             )
             .await?
         {
-            return Ok(Some(Err("prepared Golden is not compatible".into())));
-        }
-        let mut recipe = job.recipe.clone();
-        recipe.snapshot_id = snapshot_id;
-        if let Err(reason) = recipe.validate(&job.seed.execution.image) {
-            return Ok(Some(Err(reason)));
-        }
+            Some("prepared Golden is not compatible".into())
+        } else {
+            recipe.validate(&job.seed.execution.image).err()
+        };
+        let discard = discard
+            .or_else(|| expired().then(|| adx_agent_store::PREPARATION_DEADLINE_EXCEEDED.into()));
         let saved = self
             .state
-            .reserve_recipe_owner(job, &recipe.snapshot_id)
+            .reserve_recipe_owner(job, &snapshot, discard)
             .await?;
-        self.register_recipe(&saved, recipe).await
+        self.finish_resolved_snapshot(&saved).await
+    }
+
+    async fn finish_resolved_snapshot(&self, job: &PreparationJob) -> Result<()> {
+        let id = job
+            .resolved_snapshot
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("preparation has no resolved snapshot".into()))?;
+        let result = if let Some(reason) = &job.discard_reason {
+            match self
+                .environment
+                .update_snapshot_reference(
+                    &job.tenant,
+                    id,
+                    &adx_agent_core::environment::SnapshotChange::Retire,
+                )
+                .await
+            {
+                Ok(()) | Err(EnvironmentError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+            Err(reason.clone())
+        } else {
+            let mut recipe = job.recipe.clone();
+            recipe.snapshot_id.clone_from(id);
+            self.register_recipe(job, recipe).await?
+        };
+        self.state
+            .finish_preparation(job, result)
+            .await
+            .map_err(Into::into)
     }
 
     async fn register_recipe(
         &self,
         job: &PreparationJob,
         recipe: PrewarmRecipe,
-    ) -> Result<Option<std::result::Result<PrewarmRecipe, String>>> {
+    ) -> Result<std::result::Result<PrewarmRecipe, String>> {
         if recipe.handoff_contract_version == TEMPLATE_HANDOFF_VERSION {
             use adx_agent_core::environment::{SnapshotChange, SnapshotOwner};
             let owner = SnapshotOwner::Template {
@@ -283,11 +305,11 @@ impl Activator {
             {
                 Ok(()) => {}
                 Err(EnvironmentError::Conflict(_) | EnvironmentError::NotFound) => {
-                    return Ok(Some(Err("Golden snapshot is retiring".into())))
+                    return Ok(Err("Golden snapshot is retiring".into()))
                 }
                 Err(error) => return Err(error.into()),
             }
         }
-        Ok(Some(Ok(recipe)))
+        Ok(Ok(recipe))
     }
 }

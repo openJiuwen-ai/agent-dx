@@ -28,7 +28,7 @@ Agent 模板使用业务镜像的 ENTRYPOINT/CMD、WORKDIR 和 USER，不接受 
 
 `prewarm_recipe` 由服务端回填到 `TemplateVersion`。发布请求中的 `TemplateDraft` 携带该字段时，`POST /api/agent/v2/templates` 返回 HTTP 400。
 
-自动制备任务从发布起最多等待 15 分钟确认制品，同一任务重启后沿用原截止时间。确认制品后先保存其 ID，再向 Catalog 登记模板版本。登记结果未知时继续对账同一制品，确认登记后才回填配方。
+自动制备任务从发布起有 15 分钟制备窗口。同一任务重启后沿用原 UUID 和截止时间。过期时，Platform 拒绝首次登记，但已登记的任务仍须按原 UUID 对账。超时未确认制品时，模板查询显示失败，内部跟踪记录仍保留。若随后确认制品，Activator 先持久化退役意图，待 Catalog 接受退役后再结束跟踪。截止前已持久化的制品继续按原决议登记。Coordinator 会清理已失败并已完成源沙箱清理的过期 Agent 制备家族，以及制品已实际回收的 Agent 制备家族。
 
 匿名源 Environment 清理确认后释放其专用 Volume owner。快照仍引用卷时保留定义，快照回收后移除无引用定义。Volume 清理不删除外部存储目录中的数据。
 

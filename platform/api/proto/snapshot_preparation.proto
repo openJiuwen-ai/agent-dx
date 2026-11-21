@@ -28,6 +28,8 @@ message RegisterSnapshotPreparationRequest {
   Resources resources = 4;
   // Native callers reuse this fixed UUID for both family and preparation.
   optional string fixed_id = 5;
+  // Prevents first registration after the Agent job's deadline. Existing work is still replayable.
+  optional uint64 registration_deadline_unix_ms = 6;
 }
 message StartSnapshotPreparationRequest {
   CallerContext caller = 1;

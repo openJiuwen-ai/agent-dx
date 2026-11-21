@@ -601,6 +601,11 @@ paths:
               additionalProperties: false
               required: [environment, volume]
               properties:
+                registration_deadline_unix_ms:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                  description: "Unix milliseconds. Rejects first registration at or after this time. Existing registrations can be reconciled."
                 environment: {$ref: "#/components/schemas/CreateEnvironmentRequest"}
                 volume:
                   type: object
