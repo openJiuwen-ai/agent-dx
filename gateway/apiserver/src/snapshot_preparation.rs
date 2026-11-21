@@ -145,14 +145,10 @@ impl EnvironmentService {
             .map_err(|_| Status::data_loss("invalid preparation phase"))?;
         match phase {
             pb::SnapshotPreparationPhase::Registered => {
+                let mut volume_input = json!(input.volume);
+                volume_input["owner_id"] = json!(format!("golden-{id}"));
                 let volume = self
-                    .volume_request(
-                        "POST",
-                        None,
-                        json!(input.volume),
-                        &Default::default(),
-                        caller,
-                    )
+                    .volume_request("POST", None, volume_input, &Default::default(), caller)
                     .await?;
                 let uid = volume["uid"]
                     .as_str()

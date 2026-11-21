@@ -41,7 +41,21 @@ pub fn identifier(value: &str, label: &str) -> ValidationResult {
 
 /// JSON tuple encoding avoids ambiguous concatenation, including user delimiters.
 pub fn encode_key(parts: &[&str]) -> String {
-    let bytes = serde_json::to_vec(parts).expect("string array serialization");
+    hex_key(serde_json::to_vec(parts).expect("string array serialization"))
+}
+
+/// Prefix of encoded tuples with these parts followed by at least one more part.
+pub fn encode_key_prefix(parts: &[&str]) -> String {
+    if parts.is_empty() {
+        return "5b".into();
+    }
+    let mut bytes = serde_json::to_vec(parts).expect("string array serialization");
+    bytes.pop();
+    bytes.push(b',');
+    hex_key(bytes)
+}
+
+fn hex_key(bytes: Vec<u8>) -> String {
     let mut encoded = String::with_capacity(bytes.len() * 2);
     use std::fmt::Write;
     for byte in bytes {

@@ -1165,7 +1165,7 @@ impl CoordinatorRpc {
         if let Some(wait_ms) = queue_wait_ms {
             trace.attribute("queue.wait_ms", wait_ms.to_string());
         }
-        adx_observability::info!(
+        adx_observability::debug!(
             event = "environment_schedule_queue",
             environment_id = %environment_id,
             queue_wait_ms = %queue_wait_ms.unwrap_or_default(),

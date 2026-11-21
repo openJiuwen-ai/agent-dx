@@ -149,16 +149,6 @@ impl ApplicationWsConfig {
         });
         #[cfg(not(unix))]
         let uses_privacy_model = false;
-        let product_start = matches!(application, Application::DigitalMate).then(|| {
-            adx_agent_core::prewarm::EligibleStart {
-                product: application.name().into(),
-                registered_at_ms: if uses_privacy_model {
-                    principal.registered_at_ms
-                } else {
-                    None
-                },
-            }
-        });
         let access = AgentV2Access::new(managed);
         let admission = async {
             let selection = access
@@ -169,7 +159,7 @@ impl ApplicationWsConfig {
                         protocol: Protocol::Ws,
                         port: Some(self.service_port),
                     },
-                    product_start.as_ref(),
+                    matches!(application, Application::DigitalMate),
                     async {
                         let workspace = super::entrypoint::workspace_parameters(
                             tenant,
@@ -194,6 +184,16 @@ impl ApplicationWsConfig {
                     InitializationError::Source(e) => auth_error(e),
                 })?;
             let binding_scope = selection.binding_scope().clone();
+            #[cfg(unix)]
+            if let Some(rejection) =
+                privacy_target_error(uses_privacy_model, &binding_scope, |template| {
+                    privacy
+                        .as_ref()
+                        .is_some_and(|access| access.identity.targets(template))
+                })
+            {
+                return Err(rejection);
+            }
             let workspace = selection.workspace().map(str::to_owned);
             let stream = access
                 .connect_service_when_ready(&ingress, selection)
@@ -212,14 +212,6 @@ impl ApplicationWsConfig {
             _ = tokio::time::sleep_until(deadline) => return error(StatusCode::GATEWAY_TIMEOUT, "AGENT_SERVER_UNAVAILABLE"),
             result = admission => match result { Ok(value) => value, Err(response) => return response },
         };
-        #[cfg(unix)]
-        if uses_privacy_model
-            && privacy
-                .as_ref()
-                .is_some_and(|access| !access.identity.targets(&privacy_scope.template))
-        {
-            return error(StatusCode::SERVICE_UNAVAILABLE, "PRIVACY_UNAVAILABLE");
-        }
         #[cfg(not(unix))]
         let _ = (privacy_scope, workspace);
         let route = stream.cancellation();
@@ -559,5 +551,43 @@ async fn wait_for_end(mut reason: watch::Receiver<End>) -> End {
             // Watcher shutdown alone is not evidence that a route was revoked.
             std::future::pending::<()>().await;
         }
+    }
+}
+
+#[cfg(unix)]
+fn privacy_target_error(
+    uses_privacy_model: bool,
+    selected: &Scope,
+    targets: impl FnOnce(&str) -> bool,
+) -> Option<Response<ProxyBody>> {
+    (uses_privacy_model && !targets(&selected.template))
+        .then(|| error(StatusCode::SERVICE_UNAVAILABLE, "PRIVACY_UNAVAILABLE"))
+}
+
+#[cfg(all(test, unix))]
+mod privacy_target_tests {
+    use super::*;
+
+    #[test]
+    fn privacy_model_rejects_a_reused_binding_from_another_template() {
+        let config = ApplicationWsConfig {
+            request_timeout_seconds: 60,
+            template: "original-template".into(),
+            template_ref: "production".into(),
+            backend_path: "/ws".into(),
+            service_port: 18092,
+        };
+        let selected = config
+            .scope("tenant", "user", Application::DigitalMate)
+            .unwrap();
+        let rejection =
+            privacy_target_error(true, &selected, |template| template == "new-template")
+                .expect("mismatched Privacy targets must be rejected");
+        assert_eq!(rejection.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            privacy_target_error(true, &selected, |template| template == "original-template")
+                .is_none()
+        );
+        assert!(privacy_target_error(false, &selected, |_| false).is_none());
     }
 }

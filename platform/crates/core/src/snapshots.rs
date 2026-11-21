@@ -251,10 +251,7 @@ impl Snapshot {
         }
         if let Some(digest) = &self.agent_protection {
             if supplied.as_ref() != Some(digest) {
-                return Err(Error::SnapshotInUse {
-                    sandbox_ids: vec![],
-                    template_ids: vec!["agent-prewarm".into()],
-                });
+                return Err(Error::SnapshotAgentProtected);
             }
         }
         if self.state == SnapshotState::Ready {

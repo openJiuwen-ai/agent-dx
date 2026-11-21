@@ -16,14 +16,6 @@ struct PageCursor {
     after: String,
 }
 
-// Versions already used by Bindings remain readable after the draft field is removed.
-fn decode_template(mut record: Record) -> Result<TemplateVersion> {
-    if let Some(template) = record.value.as_object_mut() {
-        template.remove("golden_seed_profile");
-    }
-    record.decode()
-}
-
 #[derive(Clone)]
 pub struct AgentState {
     pub(crate) store: Arc<dyn Repository>,
@@ -83,7 +75,7 @@ impl AgentState {
         let Some(record) = self.store.get(&key).await? else {
             return Ok(None);
         };
-        let version = decode_template(record)?;
+        let version = record.decode::<TemplateVersion>()?;
         if draft.with_version(version.version.clone()) != version {
             return Err(Error::Conflict(
                 "publication idempotency key was used for another draft".into(),
@@ -198,7 +190,7 @@ impl AgentState {
         match cell
             .get_or_try_init(|| async {
                 let record = self.store.get(&key).await.map_err(Some)?;
-                decode_template(record.ok_or(None)?).map_err(Some)
+                record.ok_or(None)?.decode().map_err(Some)
             })
             .await
         {
@@ -294,23 +286,7 @@ impl AgentState {
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
-        self.commit_binding(scope, parameters, None, None, None)
-            .await
-    }
-
-    pub async fn create_product_binding(
-        &self,
-        scope: Scope,
-        parameters: &adx_agent_core::mounts::Parameters,
-        subject: &adx_agent_core::prewarm::EligibleStart,
-        checked_snapshot: Option<&str>,
-    ) -> Result<AgentBinding> {
-        let scope = if subject.product == "digitalmate" {
-            self.product_binding_scope(&scope, subject).await?
-        } else {
-            scope
-        };
-        self.commit_binding(scope, parameters, Some(subject), None, checked_snapshot)
+        self.commit_binding(scope, parameters, false, None, None)
             .await
     }
 
@@ -319,45 +295,42 @@ impl AgentState {
         &self,
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
-        subject: Option<&adx_agent_core::prewarm::EligibleStart>,
+        reuse_subject_binding: bool,
         version: &str,
         checked_snapshot: Option<&str>,
     ) -> Result<AgentBinding> {
-        self.commit_binding(scope, parameters, subject, Some(version), checked_snapshot)
-            .await
+        self.commit_binding(
+            scope,
+            parameters,
+            reuse_subject_binding,
+            Some(version),
+            checked_snapshot,
+        )
+        .await
     }
 
     async fn commit_binding(
         &self,
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
-        subject: Option<&adx_agent_core::prewarm::EligibleStart>,
+        reuse_subject_binding: bool,
         selected_version: Option<&str>,
         checked_snapshot: Option<&str>,
     ) -> Result<AgentBinding> {
         for _ in 0..limits::CAS_ATTEMPTS {
-            if let Some(subject) = subject.filter(|subject| subject.product != "digitalmate") {
-                let canonical = self.product_binding_scope(&scope, subject).await?;
-                if let Some(binding) = self.binding(&canonical).await? {
-                    return if binding.phase == BindingPhase::Active {
-                        Ok(binding)
-                    } else {
-                        Err(Error::Conflict("binding is deleting".into()))
-                    };
-                }
-            }
             match self
                 .create_binding_with_decision(
                     scope.clone(),
                     parameters,
-                    subject,
+                    reuse_subject_binding,
                     selected_version,
                     checked_snapshot,
                 )
                 .await
             {
-                Err(Error::Conflict(cause)) if cause == "binding changed" => continue,
-                result => return result,
+                Ok(Some(binding)) => return Ok(binding),
+                Ok(None) => continue,
+                Err(error) => return Err(error),
             }
         }
         Err(Error::Conflict(
@@ -369,20 +342,22 @@ impl AgentState {
         &self,
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
-        subject: Option<&adx_agent_core::prewarm::EligibleStart>,
+        reuse_subject_binding: bool,
         selected_version: Option<&str>,
         checked_snapshot: Option<&str>,
-    ) -> Result<AgentBinding> {
+    ) -> Result<Option<AgentBinding>> {
         let key = binding_key(&scope)?;
-        let digitalmate = subject.is_some_and(|subject| subject.product == "digitalmate");
         let history = crate::prewarm::history_key(&scope)?;
         let previous_history = self.store.get(&history).await?;
         // The caller already resolved historical records before choosing a version.
         // Recheck a current pointer here to catch a concurrent commit under another Alias.
-        if let Some(history) = previous_history.as_ref().filter(|_| digitalmate) {
-            if let Some(binding) = self.digitalmate_binding(&scope, Some(history)).await? {
+        if reuse_subject_binding {
+            if let Some(binding) = self
+                .binding_from_history(&scope, previous_history.as_ref())
+                .await?
+            {
                 return if binding.phase == BindingPhase::Active {
-                    Ok(binding)
+                    Ok(Some(binding))
                 } else {
                     Err(Error::Conflict("binding is deleting".into()))
                 };
@@ -411,84 +386,18 @@ impl AgentState {
                 .select_snapshot(&scope.tenant, recipe, checked_snapshot, &mut extra_checks)
                 .await?;
         }
-        let never_assigned = previous_history.is_none();
+        let history_empty = previous_history
+            .as_ref()
+            .map(Record::decode::<Option<Scope>>)
+            .transpose()?
+            .flatten()
+            .is_none();
         extra_checks.push(Check {
             key: history.clone(),
             expected: previous_history.map(|record| record.revision),
         });
-        if digitalmate || never_assigned {
+        if reuse_subject_binding || history_empty {
             extra_puts.push(put(&history, &Some(&scope))?);
-        }
-        if let Some(subject) = subject.filter(|_| !digitalmate) {
-            use crate::prewarm::{first_key, policy_key, FirstAssignment, FirstDecision};
-            use adx_agent_core::prewarm::{PolicyScope, PrewarmPolicy};
-            let first = first_key(&scope, subject)?;
-            let prior = self.store.get(&first).await?;
-            let mut initial = None;
-            if let Some(previous) = &prior {
-                let assignment: FirstAssignment = previous.decode()?;
-                if assignment.binding.tenant != scope.tenant
-                    || assignment.binding.binding_id != scope.binding_id
-                {
-                    return Err(Error::Corrupt("first-assignment identity mismatch".into()));
-                }
-                if let Some(binding) = self.binding(&assignment.binding).await? {
-                    if binding.phase != BindingPhase::Active {
-                        return Err(Error::Conflict("binding is deleting".into()));
-                    }
-                    return Ok(binding);
-                }
-                initial = Some(assignment.initial);
-            }
-            let policy = policy_key(&PolicyScope {
-                tenant: scope.tenant.clone(),
-                product: subject.product.clone(),
-            })?;
-            let rollout = self.store.get(&policy).await?;
-            if template_golden.is_none() && prior.is_none() && never_assigned {
-                if let (Some(saved), Some(recipe)) =
-                    (rollout.as_ref(), template.prewarm_recipe.as_ref())
-                {
-                    let policy: PrewarmPolicy = saved.decode()?;
-                    if policy.allows(subject)
-                        && policy.template == scope.template
-                        && policy.version == version
-                        && checked_snapshot == Some(recipe.snapshot_id.as_str())
-                    {
-                        current.snapshot_id = self
-                            .select_snapshot(
-                                &scope.tenant,
-                                recipe,
-                                checked_snapshot,
-                                &mut extra_checks,
-                            )
-                            .await?;
-                    }
-                }
-            }
-            extra_checks.push(Check {
-                key: first.clone(),
-                expected: prior.map(|r| r.revision),
-            });
-            let initial = initial.unwrap_or_else(|| FirstDecision {
-                environment: current.clone(),
-                binding_generation: generation.clone(),
-                policy_revision: rollout
-                    .as_ref()
-                    .map(|record| record.revision.as_str().to_owned()),
-                registered_at_ms: subject.registered_at_ms,
-            });
-            extra_checks.push(Check {
-                key: policy,
-                expected: rollout.map(|r| r.revision),
-            });
-            extra_puts.push(put(
-                &first,
-                &FirstAssignment {
-                    binding: scope.clone(),
-                    initial,
-                },
-            )?);
         }
         let value = AgentBinding {
             scope,
@@ -513,16 +422,14 @@ impl AgentState {
             .commit(&Transaction::new(checks, writes)?)
             .await?
         {
-            return Ok(value);
+            return Ok(Some(value));
         }
-        let existing: AgentBinding = self
-            .store
-            .get(&key)
-            .await?
-            .ok_or_else(|| Error::Conflict("binding changed".into()))?
-            .decode()?;
+        let Some(existing) = self.store.get(&key).await? else {
+            return Ok(None);
+        };
+        let existing: AgentBinding = existing.decode()?;
         if existing.phase == BindingPhase::Active {
-            Ok(existing)
+            Ok(Some(existing))
         } else {
             Err(Error::Conflict("binding is deleting".into()))
         }
@@ -580,12 +487,11 @@ impl AgentState {
         let mut checks = vec![check(&key, &record)];
         let mut writes = Vec::new();
         let history = crate::prewarm::history_key(&binding.scope)?;
-        if self.store.get(&history).await?.is_none() {
-            checks.push(Check {
-                key: history.clone(),
-                expected: None,
-            });
-            writes.push(put(&history, &Some(&binding.scope))?);
+        if let Some(record) = self.store.get(&history).await? {
+            if record.decode::<Option<Scope>>()?.as_ref() == Some(&binding.scope) {
+                checks.push(check(&history, &record));
+                writes.push(put(&history, &Option::<Scope>::None)?);
+            }
         }
         let deletes = vec![key];
         if self

@@ -538,7 +538,9 @@ impl Environment for HttpEnvironment {
         validate_identity(tenant)?;
         validate_identity(id)?;
         let Some(key) = self.api_keys.get(tenant) else {
-            return Ok(false);
+            return Err(EnvironmentError::Unavailable(
+                "snapshot metadata unavailable".into(),
+            ));
         };
         let invalid = || EnvironmentError::Invalid("invalid snapshot URL".into());
         let mut url = self
@@ -555,9 +557,6 @@ impl Environment for HttpEnvironment {
             .send()
             .await
             .map_err(|_| unavailable())?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(false);
-        }
         if !response.status().is_success() {
             return Err(unavailable());
         }
@@ -573,13 +572,9 @@ impl Environment for HttpEnvironment {
         if let Some(encoded) = data.as_str() {
             let decoded = STANDARD.decode(encoded).map_err(|_| unavailable())?;
             let data: Value = serde_json::from_slice(&decoded).map_err(|_| unavailable())?;
-            return Ok(environment_request::matches_golden(
-                &data, id, image, runtime,
-            ));
+            return environment_request::check_golden(&data, id, image, runtime);
         }
-        Ok(environment_request::matches_golden(
-            data, id, image, runtime,
-        ))
+        environment_request::check_golden(data, id, image, runtime)
     }
     async fn ensure_volume(
         &self,

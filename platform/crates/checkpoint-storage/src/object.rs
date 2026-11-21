@@ -526,7 +526,7 @@ impl CheckpointAccess for ObjectCheckpointStore {
             if Self::validate_manifest(&record.manifest, artifact).is_ok()
                 && Self::valid_cached(&files, &record.manifest, None).await? == Some(true)
             {
-                adx_observability::info!(
+                adx_observability::debug!(
                     event = "checkpoint_restore_cache", artifact = %artifact.location,
                     cache_hit = true, size_bytes = artifact.size_bytes, "checkpoint cache hit"
                 );
@@ -541,7 +541,7 @@ impl CheckpointAccess for ObjectCheckpointStore {
                 self.discard_cached(&artifact.location).await?;
             }
         }
-        adx_observability::info!(
+        adx_observability::debug!(
             event = "checkpoint_restore_cache", artifact = %artifact.location,
             cache_hit = false, size_bytes = artifact.size_bytes, "checkpoint cache miss"
         );

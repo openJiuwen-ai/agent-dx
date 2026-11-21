@@ -130,7 +130,7 @@ impl AgentV2Access {
     where
         F: std::future::Future<Output = Result<adx_agent_core::mounts::Parameters, E>>,
     {
-        self.select_initialized(context, scope, selector, None, initializer)
+        self.select_initialized(context, scope, selector, false, initializer)
             .await
     }
 
@@ -139,7 +139,7 @@ impl AgentV2Access {
         context: Arc<RequestContext>,
         scope: Scope,
         selector: ServiceSelector,
-        subject: Option<&adx_agent_core::prewarm::EligibleStart>,
+        reuse_subject_binding: bool,
         initializer: F,
     ) -> Result<ServiceSelection, InitializationError<E>>
     where
@@ -160,7 +160,7 @@ impl AgentV2Access {
             }
             Err(error) => return Err(InitializationError::Agent(error)),
         };
-        if let Some(subject) = subject {
+        if reuse_subject_binding {
             let (target, port) = context
                 .run(self.managed.resolve_product(
                     &context,
@@ -170,7 +170,6 @@ impl AgentV2Access {
                         port: selector.port,
                     },
                     parameters.as_deref(),
-                    subject,
                 ))
                 .await
                 .map_err(InitializationError::Agent)?;

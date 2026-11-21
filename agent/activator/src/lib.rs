@@ -13,7 +13,6 @@ use adx_agent_core::environment::{
 pub use adx_agent_core::error::{Error, Result};
 use adx_agent_core::{
     activator::{ActivationRequest, Target},
-    prewarm::{PolicyScope, PolicySnapshot, PolicyUpdate},
     AgentBinding, BindingPhase, EnvironmentRef, Scope, SecondaryIntent, TemplateVersion,
 };
 use adx_agent_store::AgentState;
@@ -38,6 +37,21 @@ impl Default for CacheSettings {
         }
     }
 }
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum BindingCacheKey {
+    Scoped(Scope),
+    Subject { tenant: String, binding_id: String },
+}
+
+impl BindingCacheKey {
+    fn subject(scope: &Scope) -> Self {
+        Self::Subject {
+            tenant: scope.tenant.clone(),
+            binding_id: scope.binding_id.clone(),
+        }
+    }
+}
+
 struct Binding {
     target: Option<Target>,
     attempt: Arc<()>,
@@ -47,7 +61,7 @@ struct Binding {
 pub struct Activator {
     state: AgentState,
     environment: Arc<dyn Environment>,
-    bindings: Mutex<LinkedHashMap<Scope, Binding>>,
+    bindings: Mutex<LinkedHashMap<BindingCacheKey, Binding>>,
     cache: CacheSettings,
     subscription_ready: std::sync::atomic::AtomicBool,
 }
@@ -111,10 +125,9 @@ impl Activator {
         })
     }
     async fn invalidate(&self, scope: &Scope) {
-        if let Some(binding) = self.bindings.lock().await.get_mut(scope) {
-            binding.target = None;
-            binding.attempt = Arc::new(());
-        }
+        let mut bindings = self.bindings.lock().await;
+        bindings.remove(&BindingCacheKey::Scoped(scope.clone()));
+        bindings.remove(&BindingCacheKey::subject(scope));
     }
     async fn invalidate_all(&self) {
         self.bindings.lock().await.clear();
@@ -355,63 +368,14 @@ impl Activator {
             .await
             .map_err(Into::into)
     }
-    pub async fn prewarm_policy(&self, scope: &PolicyScope) -> Result<Option<PolicySnapshot>> {
-        Ok(self.state.prewarm_policy(scope).await?)
-    }
-    pub async fn update_prewarm_policy(&self, request: &PolicyUpdate) -> Result<PolicySnapshot> {
-        request.validate().map_err(Error::Invalid)?;
-        let protected = if request.enabled {
-            let current = self.state.prewarm_policy(&request.scope).await?;
-            if current.as_ref().map(|policy| policy.revision.as_str())
-                != request.expected_revision.as_deref()
-            {
-                return Err(Error::Conflict("prewarm policy revision changed".into()));
-            }
-            let template = self
-                .template(&request.scope.tenant, &request.template, &request.version)
-                .await?;
-            if adx_agent_core::prewarm::template_golden(&template).is_some() {
-                return Err(Error::Invalid(
-                    "template-derived Golden is controlled by the selected template version".into(),
-                ));
-            }
-            if !self
-                .golden_available(&request.scope.tenant, &template)
-                .await?
-            {
-                return Err(Error::Invalid(
-                    "Golden snapshot is not ready or compatible".into(),
-                ));
-            }
-            let recipe = template
-                .prewarm_recipe
-                .ok_or_else(|| Error::Invalid("missing Golden recipe".into()))?;
-            if request.scope.product == "digitalmate"
-                && current
-                    .as_ref()
-                    .is_none_or(|policy| policy.policy.assignment_tracking_since_ms.is_none())
-            {
-                self.state
-                    .backfill_digitalmate_assignments(&request.scope.tenant)
-                    .await?;
-            }
-            self.protect_golden(&request.scope.tenant, &recipe.snapshot_id)
-                .await?;
-            Some(recipe.snapshot_id)
-        } else {
-            None
+    async fn protect_golden(&self, tenant: &str, snapshot: &str) -> Result<bool> {
+        let Some(proof) = self.state.snapshot_protection(tenant, snapshot).await? else {
+            return Ok(false);
         };
-        Ok(self
-            .state
-            .update_prewarm_policy(request, protected.as_deref())
-            .await?)
-    }
-    async fn protect_golden(&self, tenant: &str, snapshot: &str) -> Result<()> {
-        let proof = self.state.snapshot_protection(tenant, snapshot).await?;
         self.environment
             .agent_snapshot_protection(tenant, snapshot, &proof, false)
             .await?;
-        Ok(())
+        Ok(true)
     }
 
     async fn select_template_golden(
@@ -638,7 +602,7 @@ impl Activator {
                 expected_generation: expected_generation.map(str::to_owned),
                 bypass_cache,
                 parameters: parameters.map(<[u8]>::to_vec),
-                product_start: None,
+                reuse_subject_binding: false,
             },
             deadline_unix_ms,
             None,
@@ -651,17 +615,14 @@ impl Activator {
         deadline_unix_ms: u64,
         service: Option<adx_agent_core::activator::ServiceSelector>,
     ) -> Result<Target> {
-        let canonical = match &request.product_start {
-            Some(subject) => {
-                self.state
-                    .product_binding_scope(&request.scope, subject)
-                    .await?
-            }
-            None => request.scope.clone(),
-        };
-        let scope = &canonical;
+        let scope = &request.scope;
         let expected_generation = request.expected_generation.as_deref();
         scope.validate().map_err(Error::Invalid)?;
+        let cache_key = if request.reuse_subject_binding {
+            BindingCacheKey::subject(scope)
+        } else {
+            BindingCacheKey::Scoped(scope.clone())
+        };
         let attempt = {
             let mut bindings = self.bindings.lock().await;
             let subscription_ready = self
@@ -669,9 +630,10 @@ impl Activator {
                 .load(std::sync::atomic::Ordering::Acquire);
             if !request.bypass_cache
                 && (subscription_ready
-                    || matches!(scope.template_ref, adx_agent_core::TemplateRef::Version(_)))
+                    || (!request.reuse_subject_binding
+                        && matches!(scope.template_ref, adx_agent_core::TemplateRef::Version(_))))
             {
-                if let Some(binding) = bindings.to_back(scope) {
+                if let Some(binding) = bindings.to_back(&cache_key) {
                     if binding.touched.elapsed() < Duration::from_secs(self.cache.idle_seconds) {
                         if let Some(target) = &binding.target {
                             if let Some(service) = service {
@@ -692,7 +654,7 @@ impl Activator {
             let attempt = Arc::new(());
             if self.cache.capacity > 0 {
                 bindings.insert(
-                    scope.clone(),
+                    cache_key.clone(),
                     Binding {
                         target: None,
                         attempt: attempt.clone(),
@@ -705,7 +667,12 @@ impl Activator {
             }
             attempt
         };
-        let binding = match self.state.binding(scope).await? {
+        let existing = if request.reuse_subject_binding {
+            self.state.subject_binding(scope).await?
+        } else {
+            self.state.binding(scope).await?
+        };
+        let binding = match existing {
             Some(binding) => binding,
             None if expected_generation.is_some() => {
                 return Err(Error::Conflict(
@@ -731,50 +698,14 @@ impl Activator {
                 execution.env = template.render_env(&parameters).map_err(Error::Invalid)?;
                 creation::definitions(&template, &parameters, &execution.mounts)?;
                 self.environment.validate_execution(&execution)?;
-                let mut chosen = self
+                let chosen = self
                     .select_template_golden(&scope.tenant, &template, &parameters, deadline_unix_ms)
                     .await?;
-                if let Some(subject) = request.product_start.as_ref().filter(|subject| {
-                    subject.product != "digitalmate"
-                        && template.prewarm_recipe.is_some()
-                        && adx_agent_core::prewarm::template_golden(&template).is_none()
-                }) {
-                    let rollout = self
-                        .state
-                        .prewarm_policy(&PolicyScope {
-                            tenant: scope.tenant.clone(),
-                            product: subject.product.clone(),
-                        })
-                        .await?;
-                    let checked = if let (Some(rollout), Some(recipe)) =
-                        (rollout, template.prewarm_recipe.as_ref())
-                    {
-                        if rollout.policy.allows(subject)
-                            && rollout.policy.template == template.name
-                            && rollout.policy.version == template.version
-                        {
-                            let check = tokio::time::timeout(
-                                std::cmp::min(
-                                    Duration::from_millis(500),
-                                    adx_agent_core::transport::remaining_time(deadline_unix_ms),
-                                ),
-                                self.golden_available(&scope.tenant, &template),
-                            )
-                            .await;
-                            matches!(check, Ok(Ok(true))).then_some(recipe.snapshot_id.as_str())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    chosen = checked.map(str::to_owned);
-                }
                 self.state
                     .create_binding_for_version(
                         scope.clone(),
                         &parameters,
-                        request.product_start.as_ref(),
+                        request.reuse_subject_binding,
                         &version,
                         chosen.as_deref(),
                     )
@@ -810,7 +741,12 @@ impl Activator {
             .await;
         // Compensate a late activation using its saved identity. Never delete
         // the Environment belonging to a replacement Binding lifecycle.
-        let binding = match self.state.binding(scope).await? {
+        let existing = if request.reuse_subject_binding {
+            self.state.subject_binding(scope).await?
+        } else {
+            self.state.binding(scope).await?
+        };
+        let binding = match existing {
             Some(latest)
                 if latest.generation == binding.generation
                     && latest.phase == BindingPhase::Active
@@ -851,7 +787,7 @@ impl Activator {
             service: template.service,
         };
         let mut bindings = self.bindings.lock().await;
-        if let Some(cached) = bindings.get_mut(scope) {
+        if let Some(cached) = bindings.get_mut(&cache_key) {
             if Arc::ptr_eq(&cached.attempt, &attempt) {
                 cached.target = Some(target.clone());
                 cached.touched = Instant::now();

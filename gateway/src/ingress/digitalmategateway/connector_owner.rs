@@ -513,7 +513,6 @@ impl OwnerAuthority {
                         user_id: claims.user_id.clone(),
                         token_digest: token_digest.clone(),
                         expires_at: *expires_at,
-                        registered_at_ms: None,
                     },
                 }
                 .check()

@@ -335,6 +335,26 @@ impl CoordinatorRpc {
         Ok(())
     }
 
+    async fn release_preparation_seed(
+        &self,
+        session: &Session,
+        spec: &EnvironmentSpec,
+        template: &SnapshotTemplate,
+    ) -> Result<()> {
+        self.preparation_delete_seed(spec).await?;
+        // Agent publishes a fixed preparation UUID and a single seed-owned Volume.
+        let id = &template.preparation.id;
+        if template.id == *id
+            && template.name.starts_with(&format!("adx-agent-{id}-"))
+            && spec.id == format!("golden-{id}")
+        {
+            session
+                .release_volume_owner(&spec.tenant_id, &spec.id)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn preparation_capture(
         &self,
         session: &Session,
@@ -459,7 +479,8 @@ impl CoordinatorRpc {
             && build.state != PreparationState::Snapshotting
         {
             if build.cleanup_pending {
-                self.preparation_delete_seed(&spec).await?;
+                self.release_preparation_seed(&session, &spec, &template)
+                    .await?;
                 session
                     .update_snapshot_template(&template_id, |record| {
                         let current = preparation_mut(record, &build_id)?;
@@ -606,7 +627,8 @@ impl CoordinatorRpc {
             })?;
             let snapshot = session.get_snapshot(snapshot_id).await?;
             validate_preparation_snapshot(&snapshot, &spec, snapshot_id, &saved.name)?;
-            self.preparation_delete_seed(&spec).await?;
+            self.release_preparation_seed(&session, &spec, &template)
+                .await?;
             session
                 .update_snapshot_template(&template_id, |record| {
                     let current = preparation_mut(record, &build_id)?;

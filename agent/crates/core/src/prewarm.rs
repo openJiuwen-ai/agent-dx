@@ -1,5 +1,5 @@
-//! Immutable restore input and tenant/product rollout policy.
-use crate::{identifier, parameters, version_number, ValidationResult};
+//! Immutable restore and preparation inputs for a template version.
+use crate::{identifier, parameters, ValidationResult};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -105,85 +105,9 @@ pub enum SeedResult {
     Failed,
 }
 
-/// Only supplied by an authenticated product entrypoint; timestamp is from account storage.
-/// The stable subject is the caller's canonical product Binding id, independent of template reference.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EligibleStart {
-    pub product: String,
-    pub registered_at_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PrewarmPolicy {
-    pub enabled: bool,
-    pub first_enabled_at_ms: Option<u64>,
-    /// Older revisions lack proof that every creation path writes the assignment ledger.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assignment_tracking_since_ms: Option<u64>,
-    pub template: String,
-    pub version: String,
-    pub validation_ref: String,
-}
-impl PrewarmPolicy {
-    pub fn allows(&self, subject: &EligibleStart) -> bool {
-        self.enabled
-            && self
-                .first_enabled_at_ms
-                .zip(self.assignment_tracking_since_ms)
-                .zip(subject.registered_at_ms)
-                .is_some_and(|((cut, tracked), registration)| registration > cut.max(tracked))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyScope {
-    pub tenant: String,
-    pub product: String,
-}
-impl PolicyScope {
-    pub fn validate(&self) -> ValidationResult {
-        identifier(&self.tenant, "tenant")?;
-        identifier(&self.product, "product")
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyUpdate {
-    pub scope: PolicyScope,
-    pub expected_revision: Option<String>,
-    pub enabled: bool,
-    pub template: String,
-    pub version: String,
-    /// Receipt for the operator's immutable backend/volume/serving acceptance.
-    pub validation_ref: String,
-}
-impl PolicyUpdate {
-    pub fn validate(&self) -> ValidationResult {
-        self.scope.validate()?;
-        identifier(&self.template, "template")?;
-        version_number(&self.version)?;
-        identifier(&self.validation_ref, "validation_ref")?;
-        if self.validation_ref.trim() != self.validation_ref {
-            return Err("invalid validation reference".into());
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoldenRetirement {
     pub tenant: String,
     pub snapshot_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicySnapshot {
-    pub revision: String,
-    pub policy: PrewarmPolicy,
 }

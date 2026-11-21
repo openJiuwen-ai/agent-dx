@@ -779,7 +779,6 @@ impl crate::ingress::accounts::BusinessAuth for TestAuth {
             user_id: user_id.into(),
             token_digest: "digest".into(),
             expires_at: 4102444800,
-            registered_at_ms: None,
         })
     }
     async fn check(

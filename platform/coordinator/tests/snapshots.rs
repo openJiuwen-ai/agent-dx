@@ -352,13 +352,13 @@ async fn agent_golden_protection_survives_restart_until_matching_retirement() {
     let current = rig.store().await.begin(1).await.unwrap();
     assert!(matches!(
         current.delete_snapshot(id, "tenant").await,
-        Err(Error::SnapshotInUse { .. })
+        Err(Error::SnapshotAgentProtected)
     ));
     assert!(matches!(
         current
             .retire_agent_snapshot(id, "tenant", &uuid::Uuid::new_v4().to_string())
             .await,
-        Err(Error::SnapshotInUse { .. })
+        Err(Error::SnapshotAgentProtected)
     ));
     let existing = Reference::Restore {
         environment_id: "target".into(),

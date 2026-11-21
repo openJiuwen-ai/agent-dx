@@ -112,17 +112,13 @@ impl AccountStore {
     /// inactive users, and Unavailable for database failures.
     pub async fn authenticate(&self, token_digest: &str) -> Result<Principal> {
         let client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
-        let row=client.query_opt("SELECT s.user_id,s.expires_at,u.status,floor(EXTRACT(EPOCH FROM u.created_at)*1000)::bigint FROM adx_accounts.sessions s JOIN adx_accounts.users u ON u.user_id=s.user_id WHERE s.token_digest=$1 AND s.revoked_at IS NULL AND s.expires_at>EXTRACT(EPOCH FROM clock_timestamp())", &[&token_digest]).await.map_err(|_|Error::Unavailable)?.ok_or(Error::Unauthorized)?;
+        let row=client.query_opt("SELECT s.user_id,s.expires_at,u.status FROM adx_accounts.sessions s JOIN adx_accounts.users u ON u.user_id=s.user_id WHERE s.token_digest=$1 AND s.revoked_at IS NULL AND s.expires_at>EXTRACT(EPOCH FROM clock_timestamp())", &[&token_digest]).await.map_err(|_|Error::Unavailable)?.ok_or(Error::Unauthorized)?;
         if row.get::<_, String>(2) != "active" {
             return Err(Error::AccountDisabled);
         }
         Ok(Principal {
             user_id: row.get(0),
             expires_at: row.get(1),
-            registered_at_ms: row
-                .try_get::<_, i64>(3)
-                .ok()
-                .and_then(|date| u64::try_from(date).ok()),
             token_digest: token_digest.into(),
         })
     }

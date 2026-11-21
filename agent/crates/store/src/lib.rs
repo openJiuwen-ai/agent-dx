@@ -73,8 +73,6 @@ impl Key {
                 | "binding"
                 | "binding-launch"
                 | "alias"
-                | "prewarm-policy"
-                | "first-assignment"
                 | "binding-history"
                 | "snapshot-protection"
                 | "snapshot-preparation"

@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
 
 const WORKSPACE_PARAMETER: &str = "${workspace}";
+const PREPARATION_LIFETIME_MS: u64 = 15 * 60 * 1000;
+const PREPARATION_ATTEMPT_CAP: Duration = Duration::from_secs(15);
 const SEED_PREFIX: &str = "adx-agent-seed-";
 
 fn safe_seed_env(name: &str, value: &str) -> bool {
@@ -139,6 +141,8 @@ impl Activator {
         seed.native_input = self.environment.freeze_preparation(tenant, &id, &seed)?;
         Ok(PreparationJob {
             id,
+            deadline_unix_ms: adx_agent_core::unix_time_millis()
+                .saturating_add(PREPARATION_LIFETIME_MS),
             tenant: tenant.into(),
             template: template.name.clone(),
             version: template.version.clone(),
@@ -173,64 +177,80 @@ impl Activator {
             }
             for (key, job) in jobs {
                 cursor = Some(key);
-                let result = tokio::time::timeout(
-                    Duration::from_secs(15),
-                    self.environment
-                        .prepare_snapshot(&job.tenant, &job.id, &job.seed),
+                let remaining = adx_agent_core::transport::remaining_time(job.deadline_unix_ms);
+                if remaining.is_zero() {
+                    tracing::warn!(preparation_id = %job.id, tenant = %job.tenant,
+                        template = %job.template, version = %job.version, "Golden preparation deadline exceeded");
+                    self.state
+                        .finish_preparation(
+                            &job,
+                            Err("Golden preparation deadline exceeded".into()),
+                        )
+                        .await?;
+                    continue;
+                }
+                match tokio::time::timeout(
+                    remaining.min(PREPARATION_ATTEMPT_CAP),
+                    self.prepare_golden(&job),
                 )
-                .await;
-                let result = match result {
-                    Ok(Ok(SeedResult::Ready { snapshot_id })) => {
-                        match self
-                            .environment
-                            .golden_available(
-                                &job.tenant,
-                                &snapshot_id,
-                                &job.seed.execution.image,
-                                &job.seed.execution.isolation_runtime,
-                            )
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                self.state
-                                    .finish_preparation(
-                                        &job,
-                                        Err("prepared Golden is not compatible or ready".into()),
-                                    )
-                                    .await?;
-                                continue;
-                            }
-                            Err(_) => continue,
-                        }
-                        let mut recipe = job.recipe.clone();
-                        recipe.snapshot_id = snapshot_id;
-                        if let Err(reason) = recipe.validate(&job.seed.execution.image) {
-                            Err(reason)
-                        } else if recipe.handoff_contract_version == TEMPLATE_HANDOFF_VERSION {
-                            match self.protect_golden(&job.tenant, &recipe.snapshot_id).await {
-                                Ok(()) => Ok(recipe),
-                                Err(Error::Conflict(reason))
-                                    if reason == "Golden snapshot is retiring" =>
-                                {
-                                    Err(reason)
-                                }
-                                Err(_) => continue,
-                            }
-                        } else {
-                            Ok(recipe)
-                        }
+                .await
+                {
+                    Ok(Ok(Some(result))) => self.state.finish_preparation(&job, result).await?,
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(preparation_id = %job.id, tenant = %job.tenant,
+                        template = %job.template, version = %job.version, %error, "Golden preparation will retry")
                     }
-                    Ok(Ok(SeedResult::Failed)) => {
-                        Err("Platform snapshot preparation failed".into())
-                    }
-                    Ok(Err(EnvironmentError::Invalid(_))) => {
-                        Err("Platform rejected the seed specification".into())
-                    }
-                    _ => continue,
-                };
-                self.state.finish_preparation(&job, result).await?;
+                    Err(_) => tracing::warn!(preparation_id = %job.id, tenant = %job.tenant,
+                        template = %job.template, version = %job.version, "Golden preparation attempt timed out"),
+                }
             }
         }
+    }
+
+    async fn prepare_golden(
+        &self,
+        job: &PreparationJob,
+    ) -> Result<Option<std::result::Result<PrewarmRecipe, String>>> {
+        let snapshot_id = match self
+            .environment
+            .prepare_snapshot(&job.tenant, &job.id, &job.seed)
+            .await
+        {
+            Ok(SeedResult::Ready { snapshot_id }) => snapshot_id,
+            Ok(SeedResult::Failed) => {
+                return Ok(Some(Err("Platform snapshot preparation failed".into())))
+            }
+            Ok(SeedResult::Pending) => return Ok(None),
+            Err(EnvironmentError::Invalid(_)) => {
+                return Ok(Some(Err("Platform rejected the seed specification".into())))
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !self
+            .environment
+            .golden_available(
+                &job.tenant,
+                &snapshot_id,
+                &job.seed.execution.image,
+                &job.seed.execution.isolation_runtime,
+            )
+            .await?
+        {
+            return Ok(Some(Err("prepared Golden is not compatible".into())));
+        }
+        let mut recipe = job.recipe.clone();
+        recipe.snapshot_id = snapshot_id;
+        if let Err(reason) = recipe.validate(&job.seed.execution.image) {
+            return Ok(Some(Err(reason)));
+        }
+        if recipe.handoff_contract_version == TEMPLATE_HANDOFF_VERSION
+            && !self
+                .protect_golden(&job.tenant, &recipe.snapshot_id)
+                .await?
+        {
+            return Ok(Some(Err("Golden snapshot is retiring".into())));
+        }
+        Ok(Some(Ok(recipe)))
     }
 }

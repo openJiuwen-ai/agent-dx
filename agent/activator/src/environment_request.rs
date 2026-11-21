@@ -25,12 +25,18 @@ pub(crate) fn validate_identity(value: &str) -> Result<(), EnvironmentError> {
     }
     Ok(())
 }
-pub(crate) fn matches_golden(value: &Value, id: &str, image: &str, runtime: &str) -> bool {
-    value["snapshotId"] == id
-        && value["kind"] == "golden"
-        && value["state"] == "ready"
-        && value["image"] == image
-        && value["runtime"] == runtime
+pub(crate) fn check_golden(
+    value: &Value,
+    id: &str,
+    image: &str,
+    runtime: &str,
+) -> Result<bool, EnvironmentError> {
+    if value["snapshotId"] != id || value["state"] != "ready" {
+        return Err(EnvironmentError::Unavailable(
+            "ready snapshot metadata has not been confirmed".into(),
+        ));
+    }
+    Ok(value["kind"] == "golden" && value["image"] == image && value["runtime"] == runtime)
 }
 pub(crate) fn observation(
     tenant: &str,

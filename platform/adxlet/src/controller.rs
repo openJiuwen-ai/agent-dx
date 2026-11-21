@@ -1955,7 +1955,7 @@ impl Controller {
         } else {
             self.sync().await
         };
-        adx_observability::info!(
+        adx_observability::debug!(
             event = "environment_start_stages",
             environment_id = %self.record.spec.id,
             runtime_id = %self.record.runtime.id,

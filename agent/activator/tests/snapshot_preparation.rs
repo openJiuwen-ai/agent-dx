@@ -22,6 +22,7 @@ type PreparationCall = (String, String, SeedExecution);
 struct DigitalMateRepository {
     inner: Arc<dyn Repository>,
     wait_for_concurrent_commits: AtomicUsize,
+    forbid_store_reads: AtomicBool,
     commits: Barrier,
 }
 
@@ -32,6 +33,10 @@ impl Repository for DigitalMateRepository {
             !key.as_str().starts_with("prewarm-policy:")
                 && !key.as_str().starts_with("first-assignment:"),
             "DigitalMate accessed a legacy eligibility record"
+        );
+        assert!(
+            !self.forbid_store_reads.load(Ordering::Relaxed),
+            "cached subject activation reached storage"
         );
         self.inner.get(key).await
     }
@@ -55,6 +60,11 @@ impl Repository for DigitalMateRepository {
         after: Option<&str>,
         limit: usize,
     ) -> adx_agent_store::Result<Vec<(String, Record)>> {
+        assert_ne!(
+            index,
+            &Index::all_bindings(),
+            "subject binding must not scan Binding records"
+        );
         self.inner.page(index, after, limit).await
     }
 }
@@ -460,21 +470,69 @@ async fn disabled_conflict_and_terminal_failure_do_not_select_a_snapshot() {
         Some(SnapshotPreparation::Failed { .. })
     ));
     assert!(failed.prewarm_recipe.is_none());
-    assert!(author
-        .update_prewarm_policy(&PolicyUpdate {
-            scope: PolicyScope {
-                tenant: "tenant".into(),
-                product: "digitalmate".into()
-            },
-            enabled: true,
-            expected_revision: None,
-            template: "digitalmate".into(),
-            version: failed.version,
-            validation_ref: "fixture".into(),
-        })
-        .await
-        .is_err());
     assert_eq!(platform.calls.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn transient_preparation_error_retries_until_its_persisted_deadline() {
+    let repo = Arc::new(MemoryRepository::default());
+    let state = AgentState::new(repo.clone());
+    let platform = Arc::new(Platform::default());
+    let activator = Activator::new(state.clone(), platform.clone());
+    let pending = activator.publish("tenant", &draft(true)).await.unwrap();
+    platform
+        .replies
+        .lock()
+        .await
+        .push_back(Err(EnvironmentError::Unavailable(
+            "temporary Platform error".into(),
+        )));
+    activator.reconcile_snapshot_preparations().await.unwrap();
+    assert!(matches!(
+        activator
+            .template("tenant", "digitalmate", &pending.version)
+            .await
+            .unwrap()
+            .snapshot_preparation,
+        Some(SnapshotPreparation::Pending)
+    ));
+
+    let mut jobs = state.preparation_jobs(None).await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    let (_, mut job) = jobs.pop().unwrap();
+    let key = Key::new(
+        "snapshot-preparation",
+        &["tenant", "digitalmate", &pending.version],
+    )
+    .unwrap();
+    let record = repo.get(&key).await.unwrap().unwrap();
+    job.deadline_unix_ms = adx_agent_core::unix_time_millis();
+    let write = adx_agent_store::Put {
+        key: key.clone(),
+        record: Record::new(&job).unwrap(),
+    };
+    assert!(repo
+        .commit(
+            &Transaction::new(
+                vec![Check {
+                    key,
+                    expected: Some(record.revision),
+                }],
+                vec![write]
+            )
+            .unwrap()
+        )
+        .await
+        .unwrap());
+
+    let restarted = Activator::new(state.clone(), platform.clone());
+    restarted.reconcile_snapshot_preparations().await.unwrap();
+    assert!(state.preparation_jobs(None).await.unwrap().is_empty());
+    assert_eq!(platform.calls.lock().await.len(), 1);
+    assert!(matches!(
+        restarted.template("tenant", "digitalmate", &pending.version).await.unwrap().snapshot_preparation,
+        Some(SnapshotPreparation::Failed { reason }) if reason.contains("deadline")
+    ));
 }
 
 fn scope(id: &str, reference: TemplateRef) -> Scope {
@@ -493,10 +551,7 @@ fn digitalmate_request(scope: Scope) -> ResolveRequest {
             expected_generation: None,
             bypass_cache: true,
             parameters: Some(b"workspace=w-actor".to_vec()),
-            product_start: Some(EligibleStart {
-                product: "digitalmate".into(),
-                registered_at_ms: None,
-            }),
+            reuse_subject_binding: true,
         },
         service: ServiceSelector {
             protocol: adx_agent_core::Protocol::Ws,
@@ -525,6 +580,7 @@ async fn digitalmate_first_binding(inner: Arc<dyn Repository>) {
     let repo = Arc::new(DigitalMateRepository {
         inner: inner.clone(),
         wait_for_concurrent_commits: AtomicUsize::new(0),
+        forbid_store_reads: AtomicBool::new(false),
         commits: Barrier::new(2),
     });
     let state = AgentState::new(repo.clone());
@@ -595,21 +651,16 @@ async fn digitalmate_first_binding(inner: Arc<dyn Repository>) {
         .iter()
         .all(|request| request.id == committed.current.environment_id
             && request.execution.snapshot_id == committed.current.snapshot_id));
-    let first_assignment =
-        Key::new("first-assignment", &["tenant", "digitalmate", "actor"]).unwrap();
-    let policy = Key::new("prewarm-policy", &["tenant", "digitalmate"]).unwrap();
-    assert!(inner.get(&first_assignment).await.unwrap().is_none());
-    assert!(inner.get(&policy).await.unwrap().is_none());
 }
 
 #[tokio::test]
-async fn digitalmate_reuses_live_binding_with_stale_or_missing_history() {
+async fn digitalmate_reuses_live_binding_with_subject_pointer() {
     digitalmate_binding_history(Arc::new(MemoryRepository::default())).await;
 }
 
 #[tokio::test]
 #[ignore = "Requires dedicated local Redis; set ADX_TEST_REDIS_URL"]
-async fn redis_digitalmate_reuses_live_binding_with_stale_or_missing_history() {
+async fn redis_digitalmate_reuses_live_binding_with_subject_pointer() {
     let url = std::env::var("ADX_TEST_REDIS_URL").expect("set URL to dedicated local Redis");
     let namespace = format!("digitalmate-history-{}", uuid::Uuid::new_v4());
     let repo = RedisRepository::connect(&url, &namespace, std::time::Duration::from_secs(3))
@@ -622,6 +673,7 @@ async fn digitalmate_binding_history(inner: Arc<dyn Repository>) {
     let repo = Arc::new(DigitalMateRepository {
         inner,
         wait_for_concurrent_commits: AtomicUsize::new(0),
+        forbid_store_reads: AtomicBool::new(false),
         commits: Barrier::new(2),
     });
     let state = AgentState::new(repo.clone());
@@ -655,42 +707,19 @@ async fn digitalmate_binding_history(inner: Arc<dyn Repository>) {
         .await
         .unwrap();
 
-    let target = activator
-        .resolve(
-            &digitalmate_request(third.clone()),
-            adx_agent_core::unix_time_millis() + 30_000,
-        )
-        .await
-        .unwrap()
-        .target;
+    let mut request = digitalmate_request(third.clone());
+    request.activation.bypass_cache = false;
+    let deadline = adx_agent_core::unix_time_millis() + 30_000;
+    let target = activator.resolve(&request, deadline).await.unwrap().target;
     assert_eq!(target.binding.current, existing.current);
-    assert_eq!(target.binding.generation, existing.generation);
+    assert_eq!(target.binding.scope, existing.scope);
     assert!(state.binding(&third).await.unwrap().is_none());
 
-    // The first implementation wrote live Bindings before the scope pointer existed.
-    let history = Key::new("binding-history", &["tenant", "actor"]).unwrap();
-    let record = repo.inner.get(&history).await.unwrap().unwrap();
-    let deletion = Transaction::with_deletes(
-        vec![Check {
-            key: history.clone(),
-            expected: Some(record.revision),
-        }],
-        Vec::new(),
-        vec![history],
-    )
-    .unwrap();
-    assert!(repo.inner.commit(&deletion).await.unwrap());
-    let target = activator
-        .resolve(
-            &digitalmate_request(third.clone()),
-            adx_agent_core::unix_time_millis() + 30_000,
-        )
-        .await
-        .unwrap()
-        .target;
-    assert_eq!(target.binding.current, existing.current);
-    assert_eq!(target.binding.generation, existing.generation);
-    assert!(state.binding(&third).await.unwrap().is_none());
+    repo.forbid_store_reads.store(true, Ordering::Relaxed);
+    request.activation.scope = first;
+    let cached = activator.resolve(&request, deadline).await.unwrap().target;
+    assert_eq!(cached.binding, target.binding);
+    repo.forbid_store_reads.store(false, Ordering::Relaxed);
 }
 
 async fn activate(

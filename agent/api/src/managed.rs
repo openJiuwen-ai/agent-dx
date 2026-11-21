@@ -12,7 +12,7 @@ struct ActivationInput<'a> {
     generation: Option<&'a str>,
     bypass_cache: bool,
     parameters: Option<&'a [u8]>,
-    product_start: Option<&'a prewarm::EligibleStart>,
+    reuse_subject_binding: bool,
 }
 
 pub struct ManagedService {
@@ -32,22 +32,6 @@ impl ManagedService {
         request: &prewarm::GoldenRetirement,
     ) -> Result<()> {
         self.control.retire_golden(ctx, request).await
-    }
-    pub async fn prewarm_policy(
-        &self,
-        ctx: &RequestContext,
-        scope: &prewarm::PolicyScope,
-    ) -> Result<Option<prewarm::PolicySnapshot>> {
-        scope.validate().map_err(Error::Invalid)?;
-        self.control.prewarm_policy(ctx, scope).await
-    }
-    pub async fn update_prewarm_policy(
-        &self,
-        ctx: &RequestContext,
-        update: &prewarm::PolicyUpdate,
-    ) -> Result<prewarm::PolicySnapshot> {
-        update.validate().map_err(Error::Invalid)?;
-        self.control.update_prewarm_policy(ctx, update).await
     }
     /// Select an AgentBinding identity without creating product or Environment state.
     /// Returns Invalid for a direct instance target or invalid scope components.
@@ -277,7 +261,7 @@ impl ManagedService {
                 generation: Some(generation),
                 bypass_cache: true,
                 parameters: None,
-                product_start: None,
+                reuse_subject_binding: false,
             },
         )
         .await
@@ -311,7 +295,6 @@ impl ManagedService {
         scope: &Scope,
         service: activator::ServiceSelector,
         parameters: Option<&[u8]>,
-        subject: &prewarm::EligibleStart,
     ) -> Result<(Target, u16)> {
         self.resolve_generation(
             ctx,
@@ -320,7 +303,7 @@ impl ManagedService {
             service.port,
             ActivationInput {
                 parameters,
-                product_start: Some(subject),
+                reuse_subject_binding: true,
                 ..Default::default()
             },
         )
@@ -341,14 +324,14 @@ impl ManagedService {
                 expected_generation: input.generation.map(str::to_owned),
                 bypass_cache: input.bypass_cache,
                 parameters: input.parameters.map(<[u8]>::to_vec),
-                product_start: input.product_start.cloned(),
+                reuse_subject_binding: input.reuse_subject_binding,
             },
             service: activator::ServiceSelector { protocol, port },
         };
         let resolved = ctx.run(self.control.resolve(ctx, &request)).await?;
         let target = resolved.target;
         let selected_port = resolved.port;
-        if input.product_start.is_none()
+        if !input.reuse_subject_binding
             && matches!(&scope.template_ref, TemplateRef::Version(version) if version != &target.binding.current.version)
         {
             return Err(Error::Unavailable(
@@ -356,7 +339,7 @@ impl ManagedService {
             ));
         }
         let same_subject = target.binding.scope == *scope
-            || (input.product_start.is_some()
+            || (input.reuse_subject_binding
                 && target.binding.scope.tenant == scope.tenant
                 && target.binding.scope.binding_id == scope.binding_id);
         if !same_subject

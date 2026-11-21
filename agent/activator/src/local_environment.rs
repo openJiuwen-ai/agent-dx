@@ -171,9 +171,9 @@ impl Environment for LocalEnvironment {
                 .map_err(|_| {
                     EnvironmentError::Unavailable("snapshot metadata timed out".into())
                 })??;
-        Ok(metadata
-            .as_ref()
-            .is_some_and(|value| environment_request::matches_golden(value, id, image, runtime)))
+        let value = metadata
+            .ok_or_else(|| EnvironmentError::Unavailable("snapshot metadata unavailable".into()))?;
+        environment_request::check_golden(&value, id, image, runtime)
     }
     async fn ensure_volume(
         &self,

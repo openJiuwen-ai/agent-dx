@@ -281,7 +281,7 @@ async fn initialization_crosses_authenticated_activation_api() {
             expected_generation: None,
             bypass_cache: false,
             parameters: Some(parameters.clone()),
-            product_start: None,
+            reuse_subject_binding: false,
         })
         .send()
         .await

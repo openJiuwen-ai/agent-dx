@@ -22,8 +22,8 @@ pub struct ActivationRequest {
     #[serde(default)]
     pub parameters: Option<Vec<u8>>,
     /// From a trusted business gateway, never from the public Binding resolve body.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub product_start: Option<crate::prewarm::EligibleStart>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reuse_subject_binding: bool,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

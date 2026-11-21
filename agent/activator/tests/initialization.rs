@@ -63,106 +63,6 @@ impl Environment for Capture {
     }
 }
 
-#[tokio::test]
-async fn first_decision_is_atomic_and_remains_tied_to_the_product_subject() {
-    use adx_agent_core::activator::{ActivationRequest, ResolveRequest, ServiceSelector};
-    use adx_agent_core::prewarm::{EligibleStart, PolicyScope, PolicyUpdate, PrewarmRecipe};
-    use std::sync::atomic::Ordering;
-
-    let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let platform = Arc::new(Capture::default());
-    platform.1.store(true, Ordering::Relaxed);
-    let a = Activator::new(state.clone(), platform.clone());
-    let b = Activator::new(state, platform.clone());
-    let mut draft = TemplateDraft::from(&template());
-    let digest = format!("sha256:{}", "a".repeat(64));
-    draft.image = format!("app@{digest}");
-    draft.service = vec![Service {
-        protocol: Protocol::Ws,
-        port: 8080,
-    }];
-    draft.prewarm_recipe = Some(PrewarmRecipe {
-        snapshot_id: "snapshot-fixed".into(),
-        image_digest: digest.clone(),
-        restore_profile_digest: digest,
-        handoff_contract_version: "1".into(),
-        restore_env: [("APP_PHASE".into(), "restore".into())].into(),
-    });
-    a.publish("tenant", &draft).await.unwrap();
-    let mut policy = PolicyUpdate {
-        scope: PolicyScope {
-            tenant: "tenant".into(),
-            product: "app".into(),
-        },
-        expected_revision: None,
-        enabled: true,
-        template: "app".into(),
-        version: "1".into(),
-        validation_ref: "acceptance".into(),
-    };
-    let active = a.update_prewarm_policy(&policy).await.unwrap();
-    let cut = active.policy.first_enabled_at_ms.unwrap();
-    let tracked = active.policy.assignment_tracking_since_ms.unwrap();
-    let mut request = ResolveRequest {
-        activation: ActivationRequest {
-            scope: scope(),
-            expected_generation: None,
-            bypass_cache: false,
-            parameters: Some(b"workspace=w&model_url=https%3A%2F%2Fmodel.example".to_vec()),
-            product_start: Some(EligibleStart {
-                product: "app".into(),
-                registered_at_ms: Some(cut.max(tracked) + 1),
-            }),
-        },
-        service: ServiceSelector {
-            protocol: Protocol::Ws,
-            port: Some(8080),
-        },
-    };
-    let deadline = unix_time_millis() + 60000;
-    let (left, right) = tokio::join!(a.resolve(&request, deadline), b.resolve(&request, deadline));
-    let first = left.unwrap().target.binding;
-    assert_eq!(first, right.unwrap().target.binding);
-    assert_eq!(first.current.snapshot_id.as_deref(), Some("snapshot-fixed"));
-    assert!(platform.0.lock().unwrap().iter().all(|r| r
-        .execution
-        .env
-        .get("APP_PHASE")
-        .is_some_and(|phase| phase == "restore")));
-
-    // A new alias target or disable does not change an already fixed decision.
-    let mut next = draft.clone();
-    next.name = "next-template".into();
-    a.publish("tenant", &next).await.unwrap();
-    policy.expected_revision = Some(active.revision);
-    policy.enabled = false;
-    let disabled = a.update_prewarm_policy(&policy).await.unwrap();
-    request.activation.scope.template = next.name;
-    assert_eq!(
-        b.resolve(&request, deadline).await.unwrap().target.binding,
-        first
-    );
-    a.delete_binding(&first.scope).await.unwrap();
-    policy.expected_revision = Some(disabled.revision);
-    policy.enabled = true;
-    policy.template = request.activation.scope.template.clone();
-    let reenabled = a.update_prewarm_policy(&policy).await.unwrap();
-    assert_eq!(reenabled.policy.first_enabled_at_ms, Some(cut));
-    let new_lifecycle = a.resolve(&request, deadline).await.unwrap().target.binding;
-    assert_ne!(new_lifecycle.generation, first.generation);
-    assert!(new_lifecycle.current.snapshot_id.is_none());
-
-    // Unavailable preflight downgrades a new user before any create, including misses.
-    request.activation.scope.binding_id = "bob".into();
-    platform.1.store(false, Ordering::Relaxed);
-    let cold = a.resolve(&request, deadline).await.unwrap().target.binding;
-    assert!(cold.current.snapshot_id.is_none());
-    platform.1.store(true, Ordering::Relaxed);
-    assert_eq!(
-        b.resolve(&request, deadline).await.unwrap().target.binding,
-        cold
-    );
-}
 fn template() -> TemplateVersion {
     serde_json::from_value(
         serde_json::json!({"name":"app","version":"1","image":"app:1",
@@ -291,9 +191,9 @@ async fn concurrent_first_access_uses_the_winning_parameters() {
 }
 
 #[tokio::test]
-async fn digitalmate_uses_cold_start_for_a_manual_recipe_even_with_an_eligible_legacy_rollout() {
+async fn digitalmate_uses_cold_start_for_a_manual_recipe() {
     use adx_agent_core::activator::{ActivationRequest, ResolveRequest, ServiceSelector};
-    use adx_agent_core::prewarm::{EligibleStart, PolicyScope, PolicyUpdate, PrewarmRecipe};
+    use adx_agent_core::prewarm::PrewarmRecipe;
 
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let platform = Arc::new(Capture::default());
@@ -316,25 +216,6 @@ async fn digitalmate_uses_cold_start_for_a_manual_recipe_even_with_an_eligible_l
     }))
     .unwrap();
     let template = service.publish("tenant", &draft).await.unwrap();
-    let rollout = service
-        .update_prewarm_policy(&PolicyUpdate {
-            scope: PolicyScope {
-                tenant: "tenant".into(),
-                product: "digitalmate".into(),
-            },
-            expected_revision: None,
-            enabled: true,
-            template: template.name.clone(),
-            version: template.version.clone(),
-            validation_ref: "acceptance".into(),
-        })
-        .await
-        .unwrap();
-    let subject = EligibleStart {
-        product: "digitalmate".into(),
-        registered_at_ms: Some(u64::MAX),
-    };
-    assert!(rollout.policy.allows(&subject));
     let request = ResolveRequest {
         activation: ActivationRequest {
             scope: Scope {
@@ -346,7 +227,7 @@ async fn digitalmate_uses_cold_start_for_a_manual_recipe_even_with_an_eligible_l
             expected_generation: None,
             bypass_cache: false,
             parameters: Some(format!("workspace=w-{}", "a".repeat(64)).into_bytes()),
-            product_start: Some(subject),
+            reuse_subject_binding: true,
         },
         service: ServiceSelector {
             protocol: Protocol::Ws,
@@ -367,7 +248,6 @@ async fn digitalmate_uses_cold_start_for_a_manual_recipe_even_with_an_eligible_l
 
 #[tokio::test]
 async fn allocation_from_the_normal_entry_tracks_a_digitalmate_subject_across_scopes() {
-    use adx_agent_core::prewarm::EligibleStart;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let service = Activator::new(state.clone(), Arc::new(Capture::default()));
     let draft = TemplateDraft::from(&template());
@@ -390,24 +270,17 @@ async fn allocation_from_the_normal_entry_tracks_a_digitalmate_subject_across_sc
         template_ref: TemplateRef::Version("2".into()),
         ..first.clone()
     };
-    let subject = EligibleStart {
-        product: "digitalmate".into(),
-        registered_at_ms: Some(u64::MAX),
-    };
     assert_eq!(
         state
-            .create_product_binding(next.clone(), &params, &subject, None)
+            .create_binding_for_version(next.clone(), &params, true, "2", None)
             .await
             .unwrap(),
         assigned
     );
     service.delete_binding(&first).await.unwrap();
-    assert_eq!(
-        state.product_binding_scope(&next, &subject).await.unwrap(),
-        next
-    );
+    assert_eq!(state.subject_binding(&next).await.unwrap(), None);
     let rebound = state
-        .create_product_binding(next.clone(), &params, &subject, None)
+        .create_binding_for_version(next.clone(), &params, true, "2", None)
         .await
         .unwrap();
     assert_eq!(rebound.scope, next);
@@ -415,8 +288,5 @@ async fn allocation_from_the_normal_entry_tracks_a_digitalmate_subject_across_sc
         rebound.current.environment_id,
         assigned.current.environment_id
     );
-    assert_eq!(
-        state.product_binding_scope(&first, &subject).await.unwrap(),
-        rebound.scope
-    );
+    assert_eq!(state.subject_binding(&first).await.unwrap(), Some(rebound));
 }

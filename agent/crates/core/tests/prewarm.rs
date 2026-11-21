@@ -1,4 +1,3 @@
-use adx_agent_core::prewarm::{EligibleStart, PrewarmPolicy, PrewarmRecipe};
 use adx_agent_core::TemplateDraft;
 use serde_json::json;
 
@@ -61,29 +60,4 @@ fn prewarm_requires_a_fixed_digest_and_a_restore_only_environment() {
         .restore_env
         .insert("ADX_RUNTIME_ID".into(), "x".into());
     assert!(bad.validate().is_err());
-}
-
-#[test]
-fn enable_cut_is_strict_and_missing_registration_never_qualifies() {
-    let policy = PrewarmPolicy {
-        enabled: true,
-        first_enabled_at_ms: Some(100),
-        assignment_tracking_since_ms: Some(100),
-        template: "assistant".into(),
-        version: "1".into(),
-        validation_ref: "verified".into(),
-    };
-    for (registered_at_ms, eligible) in [
-        (None, false),
-        (Some(99), false),
-        (Some(100), false),
-        (Some(101), true),
-    ] {
-        let facts = EligibleStart {
-            product: "assistant".into(),
-            registered_at_ms,
-        };
-        assert_eq!(policy.allows(&facts), eligible);
-    }
-    let _: Option<PrewarmRecipe> = None;
 }

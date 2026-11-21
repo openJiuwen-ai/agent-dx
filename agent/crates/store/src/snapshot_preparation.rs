@@ -11,6 +11,9 @@ use adx_agent_core::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreparationJob {
     pub id: String,
+    /// Absolute retry deadline, retained across worker restarts.
+    #[serde(default)]
+    pub deadline_unix_ms: u64,
     pub tenant: String,
     pub template: String,
     pub version: String,

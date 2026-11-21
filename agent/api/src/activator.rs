@@ -3,7 +3,7 @@ use crate::discovery::{validate_members, DiscoveryConfig};
 use crate::request::RequestContext;
 use crate::{Error, Result};
 use adx_agent_core::discovery::{ranked_endpoints, ActivatorEndpoint};
-use adx_agent_core::prewarm::{GoldenRetirement, PolicyScope, PolicySnapshot, PolicyUpdate};
+use adx_agent_core::prewarm::GoldenRetirement;
 use adx_agent_core::{activator::*, transport, AgentBinding, Scope, TemplateVersion};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
@@ -24,20 +24,6 @@ pub trait Control: Send + Sync {
         _request: &GoldenRetirement,
     ) -> Result<()> {
         Err(Error::Unsupported("snapshot retirement unavailable".into()))
-    }
-    async fn prewarm_policy(
-        &self,
-        _ctx: &RequestContext,
-        _scope: &PolicyScope,
-    ) -> Result<Option<PolicySnapshot>> {
-        Err(Error::Unsupported("prewarm policy unavailable".into()))
-    }
-    async fn update_prewarm_policy(
-        &self,
-        _ctx: &RequestContext,
-        _update: &PolicyUpdate,
-    ) -> Result<PolicySnapshot> {
-        Err(Error::Unsupported("prewarm policy unavailable".into()))
     }
     async fn resolve(
         &self,
@@ -288,20 +274,6 @@ impl ActivatorClient {
 
 #[async_trait]
 impl Control for ActivatorClient {
-    async fn prewarm_policy(
-        &self,
-        ctx: &RequestContext,
-        scope: &PolicyScope,
-    ) -> Result<Option<PolicySnapshot>> {
-        self.request(ctx, "prewarm/get", scope, false, None).await
-    }
-    async fn update_prewarm_policy(
-        &self,
-        ctx: &RequestContext,
-        update: &PolicyUpdate,
-    ) -> Result<PolicySnapshot> {
-        self.request(ctx, "prewarm/put", update, true, None).await
-    }
     async fn retire_golden(&self, ctx: &RequestContext, request: &GoldenRetirement) -> Result<()> {
         self.request(ctx, "prewarm/retire", request, true, None)
             .await
@@ -527,7 +499,7 @@ impl ActivatorClient {
                 expected_generation: expected_generation.map(str::to_owned),
                 bypass_cache,
                 parameters: parameters.map(<[u8]>::to_vec),
-                product_start: None,
+                reuse_subject_binding: false,
             },
             true,
             Some(scope),
