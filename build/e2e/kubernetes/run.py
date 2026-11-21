@@ -37,8 +37,11 @@ common = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(common)
 sys.path.insert(0, str(HERE))
 from manifest import LABEL, resources
+from adx_targets import CATEGORY_STAGES as ADX_CATEGORY_STAGES
+from afs_component import CATEGORY_STAGES as AFS_CATEGORY_STAGES
+from afs_component import COMPONENT_TARGETS as AFS_COMPONENT_TARGETS
 from afs_component import Component as AfsComponent
-from afs_component import RELIABILITY_TARGET
+from afs_gate import execute_plan, finish_plan, plan_report
 from afs_product import Product as AfsProduct, resources as afs_product_resources
 
 
@@ -72,8 +75,30 @@ def fixed_candidate(bundle, registry, commit, afs_required=False, contracts_requ
     return candidate.fixed_candidate(bundle, registry, commit, afs_required, contracts_required)
 
 
-def requires_afs(case):
-    return bool(case and (case.startswith('afs-') or case == RELIABILITY_TARGET))
+def category_plan(profile, case):
+    registries = (ADX_CATEGORY_STAGES, AFS_CATEGORY_STAGES)
+    if not any(case in registry for registry in registries):
+        return ()
+    if profile != 'full':
+        raise ValueError(f'{case} requires the full Kubernetes profile as a targeted category')
+    plan = tuple(stage for registry in registries for stage in registry.get(case, ()))
+    names = [name for name, _, _ in plan]
+    valid_names = all(re.fullmatch('[a-z0-9][a-z0-9-]*', name) for name in names)
+    if not names or len(names) != len(set(names)) or not valid_names:
+        raise ValueError(f'{case} requires nonempty, distinct phase names')
+    category_names = ADX_CATEGORY_STAGES.keys() | AFS_CATEGORY_STAGES.keys()
+    if any(not target or target in category_names for _, _, target in plan):
+        raise ValueError(f'{case} phases require concrete targets')
+    return plan
+
+
+def candidate_requirements(profile, case):
+    plan = category_plan(profile, case)
+    targets = tuple(target for _, _, target in plan) if plan else (case,)
+    return {
+        'afs_required': any(target and target.startswith('afs-') for target in targets),
+        'contracts_required': any(AFS_COMPONENT_TARGETS.get(target, False) for target in targets),
+    }
 
 
 def write_stdout(line):
@@ -87,8 +112,7 @@ def verify_only(args, output):
     try:
         manifest, published = fixed_candidate(
             args.bundle, args.registry_images, args.artifact_commit,
-            afs_required=requires_afs(args.case),
-            contracts_required=args.case == 'afs-component-full',
+            **candidate_requirements(args.profile, args.case),
         )
         report.update(status='passed', product_commit=manifest['package']['commit'],
                       target=manifest['package']['target'], architecture=manifest['architecture'],
@@ -164,12 +188,15 @@ def credentials(directory, image, runtime_image):
 
 
 def selected_checks(profile, selected_case):
+    plan = category_plan(profile, selected_case)
+    if plan:
+        return tuple(name for name, _, _ in plan)
     if selected_case in ('afs-sdk', 'afs-sdk-full'):
         if profile != 'full':
             raise ValueError('afs-sdk requires the full Kubernetes profile')
         suffix = '-full' if selected_case.endswith('-full') else ''
         return ('afs-sdk-ownerfs' + suffix, 'afs-sdk-dfs' + suffix)
-    if selected_case in ('afs-component', 'afs-component-full', RELIABILITY_TARGET):
+    if selected_case in AFS_COMPONENT_TARGETS:
         if profile != 'full':
             raise ValueError(f'{selected_case} requires the full Kubernetes profile as a targeted case')
         return (selected_case,)
@@ -245,10 +272,7 @@ class KubernetesRun(common.Run):
         self.selected_case = selected_case
         self.redis_storage_class = redis_storage_class
         self.redis_pod_manifest = None
-        self.afs_component = (AfsComponent(self, full=selected_case.endswith('-full'))
-                              if selected_case in ('afs-component', 'afs-component-full') else None)
-        if selected_case == RELIABILITY_TARGET:
-            self.afs_component = AfsComponent.reliability(self)
+        self.afs_component = AfsComponent.for_target(self, selected_case)
         self.afs_product = (AfsProduct(self, full=selected_case.endswith('-full'))
                             if selected_case in ('afs-sdk', 'afs-sdk-full') else None)
         self.stop_evidence = 'stop' in selected_checks(profile, selected_case)
@@ -602,6 +626,26 @@ def write_junit(path, report):
     common.write_junit(path, report, 'platform-kubernetes-e2e')
 
 
+def run_category(args, output, plan):
+    report = plan_report('targeted-category', args.profile, plan)
+    report.update(deployment='kubernetes', selected_case=args.case)
+    requirements = candidate_requirements(args.profile, args.case)
+    commit = args.artifact_commit or os.getenv('ADX_E2E_ARTIFACT_COMMIT') or os.getenv('BUILDKITE_COMMIT')
+    try:
+        if commit:
+            fixed_candidate(args.bundle, args.registry_images, commit, **requirements)
+        else:
+            manifest, _ = identity(args.bundle, args.registry_images)
+            common.afs_handoff.verify_bundle(args.bundle.parent, manifest,
+                                             expected_mode=True if requirements['afs_required'] else None)
+            common.afs_contracts.verify_bundle(args.bundle.parent, manifest,
+                                               required=requirements['contracts_required'])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        report['error'] = f'{type(exc).__name__}: {exc}'
+        return finish_plan(output, report, write_junit)
+    return execute_plan(args, output, plan, report, source_commit(), selected_checks, write_junit)
+
+
 def main():
     p = argparse.ArgumentParser()
     for arg in ('bundle', 'registry-images', 'output'):
@@ -627,6 +671,9 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     if a.verify_only:
         return verify_only(a, output)
+    plan = category_plan(a.profile, a.case)
+    if plan:
+        return run_category(a, output, plan)
     checks = []
     run = KubernetesRun(
         output,
@@ -652,8 +699,7 @@ def main():
             if a.artifact_commit:
                 m, published = fixed_candidate(
                     a.bundle, a.registry_images, a.artifact_commit,
-                    afs_required=requires_afs(a.case),
-                    contracts_required=a.case == 'afs-component-full',
+                    **candidate_requirements(a.profile, a.case),
                 )
             (output / 'bundle.json').write_text(json.dumps(m, indent=2))
             (output / 'registry-images.json').write_text(json.dumps(published, indent=2))

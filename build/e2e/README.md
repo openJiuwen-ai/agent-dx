@@ -106,7 +106,7 @@ python3 build/e2e/afs_gate.py \
 ```
 
 Use `--case afs-component-full` with the first runner command for an explicitly
-targeted component Full. It reuses the registered 24 cases and frozen Rust
+targeted component Full. It reuses the declared `ci-full` cases and frozen Rust
 test ELF already delivered in the fixed image; it never runs Cargo. No case
 flag on the native `standalone` runner still selects only the public eleven
 groups; the gate is required to include all three parts. A targeted SDK or
@@ -149,10 +149,13 @@ same Meta/Node binaries and normal process/mount cleanup as Full.
 
 On Kubernetes, run these same five cases through the existing Buildkite Full
 pipeline with `ADX_E2E_TARGET_CASE=reliability`, `ADX_WITH_AFS=1`, and the
-fixed candidate image build and commit. The runner uses the existing M/A/B
-fixture with A and B on separate workers. The five cases cover process restarts
-and write recovery. Upgrade and rollback require separate versioned candidates
-and lifecycle tests.
+fixed candidate image build and commit. The Kubernetes runner collects the
+phases registered by ADX and AFS and runs each in its own deployment. The
+aggregate report lists results by phase and requires every phase to pass and
+confirm cleanup. The current category has one AFS phase. It uses the existing
+M/A/B fixture with A and B on separate workers and covers process restarts and
+write recovery. Upgrade and rollback require separate versioned candidates and
+lifecycle tests.
 
 The SDK restart case keeps one real Environment on each AFS data role. An
 SDK-launched background workload performs checked, synced file I/O while the

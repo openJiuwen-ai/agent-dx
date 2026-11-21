@@ -53,23 +53,24 @@ class SpecialContracts(unittest.TestCase):
     def test_kubernetes_reliability_selects_existing_component_specials(self):
         scope = load('kubernetes_special_scope', HERE / 'afs_specials.py')
         driver = load('kubernetes_special_driver', HERE / 'kubernetes/run.py')
-        self.assertEqual(driver.selected_checks('full', 'reliability'), ('reliability',))
+        self.assertEqual(driver.selected_checks('full', 'reliability'), ('afs',))
+        self.assertEqual(driver.category_plan('full', 'reliability'), (('afs', 'full', 'afs-component-specials'),))
         self.assertEqual(driver.selected_checks('full', None), driver.common.STANDARD)
         self.assertEqual(driver.selected_checks('l0', None), driver.common.PROFILES['l0'])
         for profile in ('l0', 'k8s-basic'):
             with self.assertRaises(ValueError):
                 driver.selected_checks(profile, 'reliability')
         run = driver.KubernetesRun(Path('/fixture/output'), Path('/fixture/kubeconfig'),
-                                   profile='full', selected_case='reliability')
+                                   profile='full', selected_case='afs-component-specials')
         self.assertIsNone(run.afs_product)
-        self.assertEqual(run.afs_component.check_name, 'reliability')
+        self.assertEqual(run.afs_component.check_name, 'afs-component-specials')
         self.assertEqual(run.afs_component.case_ids, scope.COMPONENT_CASES)
         self.assertEqual(tuple(run.afs_component.roles), ('M', 'A', 'B'))
         self.assertFalse(run.afs_component.full)
 
     def test_kubernetes_reliability_requires_afs_candidate_without_full_contracts(self):
         driver = load('kubernetes_special_admission', HERE / 'kubernetes/run.py')
-        args = Mock(case='reliability', artifact_commit='a' * 40)
+        args = Mock(case='reliability', profile='full', artifact_commit='a' * 40)
         rejected = ValueError('AFS ON required')
         with tempfile.TemporaryDirectory() as directory, patch.object(
             driver, 'fixed_candidate', side_effect=rejected,
@@ -78,6 +79,43 @@ class SpecialContracts(unittest.TestCase):
             admission.assert_called_once_with(args.bundle, args.registry_images, args.artifact_commit,
                                               afs_required=True, contracts_required=False)
             self.assertEqual(json.loads(stdout.getvalue()), json.loads((Path(directory) / 'inputs.json').read_text()))
+
+    def test_kubernetes_category_runs_both_registered_phases_and_requires_cleanup(self):
+        driver = load('kubernetes_category_driver', HERE / 'kubernetes/run.py')
+        with patch.dict(driver.ADX_CATEGORY_STAGES, {'reliability': (('adx', 'full', 'restart'),)}):
+            plan = driver.category_plan('full', 'reliability')
+        self.assertEqual(tuple(stage[0] for stage in plan), ('adx', 'afs'))
+        for bad_cleanup in (False, True):
+            with self.subTest(bad_cleanup=bad_cleanup), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                args = Mock(case='reliability', profile='full', artifact_commit='b' * 40,
+                            bundle=Path('/fixture/bundle'), registry_images=Path('/fixture/images'),
+                            kubeconfig=Path('/fixture/kubeconfig'), context=None, registry_auth=None, node_name=[])
+                calls = []
+
+                def child(command, calls=calls, bad_cleanup=bad_cleanup):
+                    target = command[command.index('--case') + 1]
+                    calls.append(target)
+                    path = Path(command[command.index('--output') + 1])
+                    path.mkdir()
+                    harness = {'schema_version': 1, 'commit': 'a' * 40, 'product_commit': 'b' * 40,
+                               'files': {'fixture.py': 'c' * 64}}
+                    (path / 'result.json').write_text(json.dumps({
+                        'status': 'passed', 'checks': [target], 'required_checks': [target],
+                        'cases': [{'name': target, 'status': 'passed'}], 'harness': harness,
+                    }))
+                    status = 'FAIL' if bad_cleanup and target == 'afs-component-specials' else 'PASS'
+                    (path / 'kubernetes-cleanup.json').write_text(json.dumps({'status': status}))
+                    return Mock(wait=Mock(return_value=0), poll=Mock(return_value=0))
+
+                with patch.object(driver, 'source_commit', return_value='a' * 40), \
+                        patch.object(driver, 'fixed_candidate'), patch.object(driver.subprocess, 'Popen', child):
+                    self.assertEqual(driver.run_category(args, output, plan), int(bad_cleanup))
+                report = json.loads((output / 'result.json').read_text())
+                self.assertEqual(calls, ['restart', 'afs-component-specials'])
+                self.assertEqual(report['selected_case'], 'reliability')
+                self.assertEqual(report['required_checks'], ['adx', 'afs'])
+                self.assertEqual(report['checks'], ['adx'] if bad_cleanup else ['adx', 'afs'])
 
     def test_pressure_success_requires_all_operations_and_real_expected_errno(self):
         scope = load('special_pressure_contract', HERE / 'afs_specials.py')
