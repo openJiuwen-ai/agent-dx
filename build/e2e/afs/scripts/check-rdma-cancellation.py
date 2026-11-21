@@ -9,6 +9,7 @@ No production instrumentation or retry behavior is changed.
 import argparse
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import platform
@@ -311,9 +312,10 @@ def main():
             (directory / "runner.exit").write_text(str(process.returncode) + "\n")
     if not process.returncode == 0:
         raise AssertionError("debugger failed; inspect raw evidence")
-    report = audit(directory, args.device, args.profile)
-    (directory / "audit.json").write_text(json.dumps(report, indent=2) + "\n")
-    sys.stdout.write(json.dumps(report, indent=2) + "\n")
+    report_json = json.dumps(audit(directory, args.device, args.profile), indent=2)
+    (directory / "audit.json").write_text(report_json + "\n")
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s", force=True)
+    logging.info("%s", report_json)
 
 
 if __name__ == "__main__":
