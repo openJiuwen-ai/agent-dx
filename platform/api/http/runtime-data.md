@@ -47,6 +47,21 @@ Ingress 校验 API Key 与归属，Relay 核对运行时绑定，再转发给 Ex
 mkdir 的默认递归行为保留；非递归模式父目录缺失时失败，并发创建同一目录只将实际创建者标记为 created。
 非递归创建要求使用支持 recursive=false 的 Runtime。
 
+`file.list` 使用 `depth` 控制遍历层数：`depth=1` 仅返回当前目录的直接条目，
+等价于旧接口的 `recursive=false`；更大的 depth 才进入子目录，最大 64 层。
+迁移旧递归调用时显式选择所需 depth。`recursive` 不是此 action 的参数，
+直接传入会返回 `INVALID_ARGUMENT`。
+
+## 文件上传与权限
+
+`POST /direct/{environmentId}/upload` 流式接收文件或 tar 正文。
+ADX 不对该接口设置文件大小上限，断点上传累计大小同样不设上限；
+反向隧道的 HTTP body 限额是独立传输设置。
+
+upload 与 `file.write` 均不接受 `mode` 参数。新建普通文件使用文件系统创建权限，
+受运行时 umask 影响；覆盖已有普通文件保留其权限。调用方需要指定权限时，
+可通过 `process.exec` 执行 `chmod`。tar 上传按归档解包语义处理。
+
 ## 命令、cwd 与超时
 
 构造器 cwd 的初始化发生在 Execd Ready 前，见
