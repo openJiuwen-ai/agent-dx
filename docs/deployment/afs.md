@@ -1096,6 +1096,11 @@ NodeReplicated DFS 默认启动每 5 秒一次的安全回收；引用退休后�
 
 ## OwnerFs 启动纳管
 
+OwnerFs Home 可以在提供稳定内核文件句柄的旧版 Linux tmpfs 上使用 `data_dir`（例如容器内 `/dev/shm` 的专用子目录）。
+当文件系统不报告创建时间时，Home 用同一个已打开的描述符查询属性和内核文件句柄；两者都不支持时拒绝该文件操作。
+部署或测试前确认容器实际挂载的文件系统和 tmpfs 容量。tmpfs 数据在卸载或重启后不保留，只用于允许数据丢失的场景。
+以新 reader 节点和 FUSE 挂载测首次读时，Home 文件页仍在 tmpfs 中；该结果不等同于磁盘冷读。
+
 `ownerfs_adopt_on_startup = true` 时，`afs-node` 在挂载前扫描 `ownerfs_data_dir` 的
 直接子项，把符合条件的目录原地纳管为 workspace：不 `rename`、不 `copy`、不改
 uid/gid/mode。

@@ -11,7 +11,7 @@ use std::{
     io,
     mem::MaybeUninit,
     os::{
-        fd::AsRawFd,
+        fd::{AsFd, AsRawFd, BorrowedFd},
         unix::{
             ffi::{OsStrExt, OsStringExt},
             fs::{DirBuilderExt, FileExt, OpenOptionsExt},
@@ -53,6 +53,17 @@ impl LocalFs {
         spec: OpenSpec,
     ) -> io::Result<LocalFile> {
         open_child_file(&directory.dir, name, spec).map(|file| LocalFile { file })
+    }
+
+    /// Pin the entry for metadata and file-handle queries without opening it
+    /// for I/O or following its final symlink.
+    #[cfg(feature = "ownerfs")]
+    pub(crate) fn open_entry(&self, path: &StoragePath) -> io::Result<File> {
+        if path.is_root() {
+            return self.root.try_clone();
+        }
+        let (parent, leaf) = self.open_parent(path)?;
+        openat_raw(&parent, &leaf, libc::O_PATH | libc::O_NOFOLLOW, 0)
     }
 
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
@@ -349,6 +360,12 @@ pub struct LocalFile {
     file: File,
 }
 
+impl AsFd for LocalFile {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
 impl FileHandle for LocalFile {
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
         self.file.read_at(buffer, offset)
@@ -410,6 +427,12 @@ impl FileHandle for LocalFile {
 #[derive(Debug)]
 pub struct LocalDirectory {
     dir: File,
+}
+
+impl AsFd for LocalDirectory {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.dir.as_fd()
+    }
 }
 
 impl DirectoryHandle for LocalDirectory {
