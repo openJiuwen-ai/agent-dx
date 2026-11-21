@@ -223,6 +223,8 @@ async fn preparation_rpc_keeps_registration_distinct_from_ready_and_tenant_scope
         channel(address, "apiserver").await,
     );
     let input = pb::RegisterSnapshotPreparationRequest {
+        fixed_id: None,
+        registration_deadline_unix_ms: None,
         caller: caller(),
         name: "image".into(),
         resources: Some(pb::Resources {

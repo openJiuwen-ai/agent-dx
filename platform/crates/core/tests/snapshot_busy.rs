@@ -186,3 +186,100 @@ fn legacy_snapshot_metadata_defaults_to_regular_with_unknown_capture_time() {
     raw["kind"] = serde_json::json!("unknown");
     assert!(serde_json::from_value::<Snapshot>(raw).is_err());
 }
+
+#[test]
+fn retiring_golden_preserves_committed_binding_and_rejects_new_owners() {
+    use adx_core::snapshots::SnapshotKind;
+    let mut saved = snapshot();
+    saved.kind = SnapshotKind::Golden;
+    let template = Reference::AgentTemplate {
+        name: "digitalmate".into(),
+        version: "29".into(),
+    };
+    let binding = Reference::AgentBinding {
+        binding_id: "user".into(),
+        environment_id: "target".into(),
+    };
+    saved.acquire("tenant", template.clone()).unwrap();
+    saved.acquire("tenant", binding.clone()).unwrap();
+    saved.begin_agent_retirement("tenant").unwrap();
+    let mut recovered: Snapshot =
+        serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert!(recovered.references.contains(&binding));
+    recovered.acquire("tenant", binding.clone()).unwrap();
+    assert!(recovered
+        .acquire(
+            "tenant",
+            Reference::AgentBinding {
+                binding_id: "other".into(),
+                environment_id: "other-env".into()
+            }
+        )
+        .is_err());
+    recovered
+        .acquire(
+            "tenant",
+            Reference::Restore {
+                environment_id: "target".into(),
+            },
+        )
+        .unwrap();
+    assert!(recovered.delete("tenant").is_err());
+    recovered
+        .release(&Reference::Restore {
+            environment_id: "target".into(),
+        })
+        .unwrap();
+    recovered.release(&binding).unwrap();
+    recovered.release(&binding).unwrap();
+    assert!(
+        recovered.collectable(),
+        "last release must schedule native GC"
+    );
+}
+
+#[test]
+fn cancelling_missing_binding_fences_its_in_flight_registration() {
+    let mut saved = snapshot();
+    saved.kind = adx_core::snapshots::SnapshotKind::Golden;
+    let owner = Reference::AgentBinding {
+        binding_id: "user".into(),
+        environment_id: "pending".into(),
+    };
+    let observed = saved.revision;
+    saved.cancel_pending(&owner, observed).unwrap();
+    assert!(saved.revision > observed);
+    let after = saved.revision;
+    saved.cancel_pending(&owner, observed).unwrap();
+    assert_eq!(after, saved.revision);
+}
+
+#[test]
+fn catalog_accepts_agent_identifier_byte_limit() {
+    let mut saved = snapshot();
+    saved.kind = adx_core::snapshots::SnapshotKind::Golden;
+    let limit = "界".repeat(170) + "ab";
+    for owner in [
+        Reference::AgentTemplate {
+            name: limit.clone(),
+            version: "1".into(),
+        },
+        Reference::AgentBinding {
+            binding_id: limit.clone(),
+            environment_id: "target".into(),
+        },
+    ] {
+        saved.acquire("tenant", owner).unwrap();
+    }
+    assert!(Reference::AgentBinding {
+        binding_id: limit + "c",
+        environment_id: "target".into()
+    }
+    .validate()
+    .is_err());
+    assert!(Reference::Restore {
+        environment_id: "a".repeat(257)
+    }
+    .validate()
+    .is_err());
+}

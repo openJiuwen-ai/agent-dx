@@ -43,11 +43,27 @@ impl TryFrom<Snapshot> for pb::ReusableSnapshot {
                 SnapshotState::Deleting => pb::SnapshotState::Deleting,
                 SnapshotState::Deleted => pb::SnapshotState::Deleted,
             } as i32,
+            agent_retiring: s.agent_retiring,
+            agent_admission_revision: s.agent_admission_revision,
             references: s
                 .references
                 .into_iter()
                 .map(|r| pb::SnapshotReference {
                     owner: Some(match r {
+                        Reference::AgentTemplate { name, version } => {
+                            pb::snapshot_reference::Owner::AgentTemplate(
+                                pb::AgentTemplateReference { name, version },
+                            )
+                        }
+                        Reference::AgentBinding {
+                            binding_id,
+                            environment_id,
+                        } => {
+                            pb::snapshot_reference::Owner::AgentBinding(pb::AgentBindingReference {
+                                binding_id,
+                                environment_id,
+                            })
+                        }
                         Reference::Restore { environment_id } => {
                             pb::snapshot_reference::Owner::RestoreEnvironmentId(environment_id)
                         }
@@ -86,6 +102,14 @@ impl TryFrom<pb::ReusableSnapshot> for Snapshot {
                     node_id: t.node_id,
                     template_id: t.template_id,
                 },
+                Some(pb::snapshot_reference::Owner::AgentTemplate(t)) => Reference::AgentTemplate {
+                    name: t.name,
+                    version: t.version,
+                },
+                Some(pb::snapshot_reference::Owner::AgentBinding(b)) => Reference::AgentBinding {
+                    binding_id: b.binding_id,
+                    environment_id: b.environment_id,
+                },
                 None => return Err(Error::Invalid("snapshot reference owner required".into())),
             };
             if !references.insert(owner) {
@@ -100,6 +124,8 @@ impl TryFrom<pb::ReusableSnapshot> for Snapshot {
             kind: kind.into(),
             created_at_unix_ms: s.created_at_unix_ms,
             preparation_template_id: None,
+            agent_retiring: s.agent_retiring,
+            agent_admission_revision: s.agent_admission_revision,
             template: s
                 .template
                 .ok_or_else(|| Error::Invalid("snapshot template required".into()))?

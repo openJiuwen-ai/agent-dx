@@ -138,12 +138,24 @@ async fn activation_uses_only_the_image_saved_at_publication() {
     let pinned = format!("registry.example/app@sha256:{}", "a".repeat(64));
     let old = state.publish("tenant", &draft).await.unwrap();
     let new = state
-        .publish_prepared(
+        .publish_with_preparation(
             PreparedTemplate::new("tenant", &draft).unwrap(),
             Some(&pinned),
+            None,
+            Some("publish-image"),
         )
         .await
         .unwrap();
+    let replayed = state
+        .publish_with_preparation(
+            PreparedTemplate::new("tenant", &draft).unwrap(),
+            None,
+            None,
+            Some("publish-image"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed, new);
     let platform = Arc::new(Platform::default());
     let activator = Activator::new(AgentState::new(store.clone()), platform.clone());
     for (version, expected) in [(old.version, None), (new.version, Some(pinned.as_str()))] {

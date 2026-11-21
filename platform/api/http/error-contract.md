@@ -208,6 +208,14 @@ and preserves the family's latest successful capture. E2B build status exposes
 this as `error` with `reason.message`. Unmarked NotFound, transport errors and
 uncertain capture results retain the existing reconciliation behavior.
 
+For native preparation, `pending` is an asynchronous receipt, not a ready
+snapshot. `failed` represents a settled failure or an unavailable completed
+artifact; it does not invalidate the associated Agent template. On network or
+dependency ambiguity the Agent retries the same fixed preparation UUID and
+does not publish a `prewarm_recipe` before confirming the catalog entry.
+
+退役受 Agent 保护的 Golden 时，未经 Agent 退役流程的删除返回 409 `SNAPSHOT_IN_USE`，并明确指出 Agent 引用保护。若有运行实例或模板引用，响应中的 ID 只列实际引用。制备任务按同一 UUID 对账。自发布起 15 分钟后，Platform 停止接受该 UUID 的首次登记。已启动而结果未确认的任务继续对账，版本状态显示 `failed`。过期且尚未启动的 Agent 制备由 Coordinator 关闭启动并清理种子卷持有。若超时后才确认制品，Activator 收到退役确认后结束跟踪。
+
 ### 恢复并发与删除
 
 同一次恢复的并发等待者共享已受理任务的结果；等待超时仍为 `same_operation / unknown`，不能据此启动另一份执行。显式删除意图发布失败时尚未受理并重新开放恢复准入；发布成功后，新到或尚未执行的恢复返回 `CONFLICT / never / not_started`。已经进入执行的恢复被删除中止时使用 `Unavailable`，保留 `same_operation / unknown`，不能将其误报为从未启动。清理或结果发布未确认时继续保留实际进度，调用方按同一 Environment ID 查询或重试删除；删除调用超时不撤销当前 Controller 已受理的删除屏障。该屏障不新增进程重启后的持久化保证。

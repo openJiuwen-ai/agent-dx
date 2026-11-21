@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 pub struct ExecutionSpec {
     pub image: String,
     pub isolation_runtime: String,
-    /// Managed Agent execution inherits the image process. Internal runtime profiles may use explicit startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    /// Managed Agent execution inherits the captured or image process.
     #[serde(default)]
     pub inherit_entrypoint: bool,
     /// Empty for image inheritance or an idle environment.
@@ -42,6 +44,7 @@ impl From<&TemplateVersion> for ExecutionSpec {
         Self {
             image: value.image.clone(),
             isolation_runtime: value.isolation_runtime.clone(),
+            snapshot_id: None,
             inherit_entrypoint: true,
             entrypoint: vec![],
             working_dir: String::new(),
@@ -65,6 +68,9 @@ impl ExecutionSpec {
             version: "1".into(),
             image: self.image.clone(),
             isolation_runtime: self.isolation_runtime.clone(),
+            prewarm_recipe: None,
+            auto_prepare_snapshot: false,
+            snapshot_preparation: None,
             env: self.env.clone(),
             resources: self.resources.clone(),
             lifecycle: self.lifecycle.clone(),
@@ -158,6 +164,7 @@ pub enum EnvironmentError {
     Conflict(String),
     Unavailable(String),
     OutcomeUnknown(String),
+    SnapshotAdmissionStale,
     /// Coordinator confirmed cancellation before assignment, not an ambiguous RPC timeout.
     SchedulingCancelled(Box<adx_core::scheduling::SchedulingFailure>),
 }
@@ -176,8 +183,74 @@ pub struct EnvironmentInfo {
     pub environment_ip: Option<String>,
     pub execution: Option<ExecutionSpec>,
 }
+/// The Agent service owns template recipes and the Environment identities reserved by Bindings.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SnapshotOwner {
+    Template {
+        name: String,
+        version: String,
+    },
+    Binding {
+        binding_id: String,
+        environment_id: String,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SnapshotChange {
+    Acquire { owner: SnapshotOwner },
+    AcquireBinding { owner: SnapshotOwner, revision: u64 },
+    CancelPending { owner: SnapshotOwner, revision: u64 },
+    Release { owner: SnapshotOwner },
+    Retire,
+}
 #[async_trait]
 pub trait Environment: Send + Sync {
+    async fn snapshot_revision(&self, _tenant: &str, _id: &str) -> Result<u64, EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "snapshot revision unavailable".into(),
+        ))
+    }
+    async fn update_snapshot_reference(
+        &self,
+        _tenant: &str,
+        _snapshot_id: &str,
+        _change: &SnapshotChange,
+    ) -> Result<(), EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "snapshot reference management unavailable".into(),
+        ))
+    }
+    fn freeze_preparation(
+        &self,
+        _tenant: &str,
+        _job_id: &str,
+        _seed: &crate::prewarm::SeedExecution,
+    ) -> Result<Option<serde_json::Value>, EnvironmentError> {
+        Ok(None)
+    }
+    async fn prepare_snapshot(
+        &self,
+        _tenant: &str,
+        _job_id: &str,
+        _seed: &crate::prewarm::SeedExecution,
+        _deadline_unix_ms: u64,
+    ) -> Result<crate::prewarm::SeedResult, EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "snapshot preparation unavailable".into(),
+        ))
+    }
+    /// Returns whether the tenant can currently use this fixed Golden input.
+    async fn golden_available(
+        &self,
+        _tenant: &str,
+        _snapshot_id: &str,
+        _image: &str,
+        _runtime: &str,
+    ) -> Result<bool, EnvironmentError> {
+        Ok(false)
+    }
     async fn ensure_volume(
         &self,
         _tenant: &str,

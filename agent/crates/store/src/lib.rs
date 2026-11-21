@@ -14,8 +14,11 @@ pub use state::{AgentState, PreparedTemplate, PublishedTemplate};
 mod aliases;
 #[cfg(feature = "test-memory")]
 mod memory;
+mod prewarm;
+mod snapshot_preparation;
 #[cfg(feature = "test-memory")]
 pub use memory::MemoryRepository;
+pub use snapshot_preparation::{PreparationJob, PREPARATION_DEADLINE_EXCEEDED};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -57,18 +60,32 @@ impl Index {
     pub fn all_bindings() -> Self {
         Self("all-bindings".into())
     }
+    pub(crate) fn snapshot_preparations() -> Self {
+        Self("pending-snapshot-preparations".into())
+    }
 }
 impl Key {
     pub fn new(kind: &str, parts: &[&str]) -> Result<Self> {
         if !matches!(
             kind,
-            "template" | "template-sequence" | "binding" | "binding-launch" | "alias"
+            "template"
+                | "template-sequence"
+                | "binding"
+                | "binding-launch"
+                | "alias"
+                | "binding-history"
+                | "snapshot-preparation"
+                | "snapshot-preparation-result"
+                | "template-publication"
         ) || parts.is_empty()
             || parts.iter().any(|s| s.is_empty() || s.len() > 2048)
         {
             return Err(Error::Invalid("invalid record key".into()));
         }
         let mut indexes = Vec::new();
+        if kind == "snapshot-preparation" {
+            indexes.push(Index::snapshot_preparations());
+        }
         if kind == "binding" {
             indexes.push(Index::all_bindings());
             if parts.len() == 5 {

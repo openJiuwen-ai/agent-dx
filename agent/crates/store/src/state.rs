@@ -22,8 +22,8 @@ pub struct PreparedTemplate<'a> {
 impl<'a> PreparedTemplate<'a> {
     pub fn new(tenant: &'a str, draft: &TemplateDraft) -> Result<Self> {
         adx_agent_core::identifier(tenant, "tenant").map_err(Error::Invalid)?;
+        draft.validate().map_err(Error::Invalid)?;
         let template = draft.with_version("1".into());
-        template.validate().map_err(Error::Invalid)?;
         Ok(Self { tenant, template })
     }
 
@@ -105,12 +105,50 @@ impl AgentState {
         prepared: PreparedTemplate<'_>,
         execution_image: Option<&str>,
     ) -> Result<TemplateVersion> {
-        let PreparedTemplate {
-            tenant,
-            mut template,
-        } = prepared;
-        let sequence_key = Key::new("template-sequence", &[tenant, &template.name])?;
+        self.publish_with_preparation(prepared, execution_image, None, None)
+            .await
+    }
+    pub async fn publication(
+        &self,
+        prepared: &PreparedTemplate<'_>,
+        id: &str,
+    ) -> Result<Option<TemplateVersion>> {
+        adx_agent_core::identifier(id, "publication idempotency key").map_err(Error::Invalid)?;
+        let tenant = prepared.tenant;
+        let key = Key::new("template-publication", &[tenant, id])?;
+        let Some(record) = self.store.get(&key).await? else {
+            return Ok(None);
+        };
+        let version = record.decode::<TemplateVersion>()?;
+        let mut expected = prepared.template.clone();
+        expected.version.clone_from(&version.version);
+        if expected != version {
+            return Err(Error::Conflict(
+                "publication idempotency key was used for another draft".into(),
+            ));
+        }
+        self.project_preparation(tenant, &version).await.map(Some)
+    }
+    pub async fn publish_with_preparation(
+        &self,
+        mut prepared: PreparedTemplate<'_>,
+        execution_image: Option<&str>,
+        preparation: Option<&PreparationJob>,
+        publication_id: Option<&str>,
+    ) -> Result<TemplateVersion> {
+        if prepared.template.auto_prepare_snapshot != preparation.is_some() {
+            return Err(Error::Invalid(
+                "automatic preparation job is required for this draft".into(),
+            ));
+        }
+        let tenant = prepared.tenant;
+        let sequence_key = Key::new("template-sequence", &[tenant, &prepared.template.name])?;
         for _ in 0..limits::CAS_ATTEMPTS {
+            if let Some(id) = publication_id {
+                if let Some(replayed) = self.publication(&prepared, id).await? {
+                    return Ok(replayed);
+                }
+            }
             let previous = self.store.get(&sequence_key).await?;
             let last = previous
                 .as_ref()
@@ -120,34 +158,57 @@ impl AgentState {
             let next = last
                 .checked_add(1)
                 .ok_or_else(|| Error::Conflict("template version sequence exhausted".into()))?;
+            let template = &mut prepared.template;
             template.version = next.to_string();
             let key = Key::new("template", &[tenant, &template.name, &template.version])?;
             let expected = previous.as_ref().map(|record| record.revision.clone());
-            let mut publication = put(&key, &template)?;
+            let mut checks = vec![
+                Check {
+                    key: sequence_key.clone(),
+                    expected: expected.clone(),
+                },
+                Check {
+                    key: key.clone(),
+                    expected: None,
+                },
+            ];
+            let mut publication = put(&key, template)?;
             if let Some(image) = execution_image {
                 let fields = publication.record.value.as_object_mut().ok_or_else(|| {
                     Error::Invalid("template version must serialize as an object".into())
                 })?;
                 fields.insert(EXECUTION_IMAGE_FIELD.into(), Value::String(image.into()));
             }
-            if self
-                .store
-                .commit(&Transaction::new(
-                    vec![
-                        Check {
-                            key: sequence_key.clone(),
-                            expected: expected.clone(),
-                        },
-                        Check {
-                            key: key.clone(),
-                            expected: None,
-                        },
-                    ],
-                    vec![put(&sequence_key, &next)?, publication],
-                )?)
-                .await?
-            {
-                return Ok(template);
+            let mut puts = vec![put(&sequence_key, &next)?, publication];
+            if let Some(job) = preparation {
+                let job = PreparationJob {
+                    tenant: tenant.into(),
+                    template: template.name.clone(),
+                    version: template.version.clone(),
+                    ..job.clone()
+                };
+                let key = crate::snapshot_preparation::pending_key(&job)?;
+                puts.push(put(&key, &job)?);
+                checks.push(Check {
+                    key,
+                    expected: None,
+                });
+            }
+            if let Some(id) = publication_id {
+                let key = Key::new("template-publication", &[tenant, id])?;
+                puts.push(put(&key, template)?);
+                checks.push(Check {
+                    key,
+                    expected: None,
+                });
+            }
+            if self.store.commit(&Transaction::new(checks, puts)?).await? {
+                return Ok(prepared.template);
+            }
+            if let Some(id) = publication_id {
+                if let Some(replayed) = self.publication(&prepared, id).await? {
+                    return Ok(replayed);
+                }
             }
             let observed = self.store.get(&sequence_key).await?;
             if observed.as_ref().map(|record| &record.revision) == expected.as_ref() {
@@ -206,7 +267,15 @@ impl AgentState {
             })
             .await
         {
-            Ok(template) => Ok(Some(template.clone())),
+            Ok(published) => {
+                let template = self
+                    .project_preparation(tenant, &published.template)
+                    .await?;
+                Ok(Some(PublishedTemplate {
+                    template,
+                    execution_image: published.execution_image.clone(),
+                }))
+            }
             Err(None) => Ok(None),
             Err(Some(error)) => Err(error),
         }
@@ -298,8 +367,89 @@ impl AgentState {
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
+        self.commit_binding(scope, parameters, false, None, None)
+            .await
+    }
+
+    /// Fix the version checked by the caller together with the Environment startup decision.
+    pub async fn create_binding_for_version(
+        &self,
+        scope: Scope,
+        parameters: &adx_agent_core::mounts::Parameters,
+        reuse_subject_binding: bool,
+        version: &str,
+        checked_snapshot: Option<&str>,
+    ) -> Result<AgentBinding> {
+        self.commit_binding(
+            scope,
+            parameters,
+            reuse_subject_binding,
+            Some(version),
+            checked_snapshot,
+        )
+        .await
+    }
+
+    async fn commit_binding(
+        &self,
+        scope: Scope,
+        parameters: &adx_agent_core::mounts::Parameters,
+        reuse_subject_binding: bool,
+        selected_version: Option<&str>,
+        checked_snapshot: Option<&str>,
+    ) -> Result<AgentBinding> {
+        for _ in 0..limits::CAS_ATTEMPTS {
+            match self
+                .create_binding_with_decision(
+                    scope.clone(),
+                    parameters,
+                    reuse_subject_binding,
+                    selected_version,
+                    checked_snapshot,
+                )
+                .await
+            {
+                Ok(Some(binding)) => return Ok(binding),
+                Ok(None) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::Conflict(
+            "binding creation changed concurrently".into(),
+        ))
+    }
+
+    async fn create_binding_with_decision(
+        &self,
+        scope: Scope,
+        parameters: &adx_agent_core::mounts::Parameters,
+        reuse_subject_binding: bool,
+        selected_version: Option<&str>,
+        checked_snapshot: Option<&str>,
+    ) -> Result<Option<AgentBinding>> {
         let key = binding_key(&scope)?;
+        let history = crate::prewarm::history_key(&scope)?;
+        let previous_history = self.store.get(&history).await?;
+        // The caller already resolved historical records before choosing a version.
+        // Recheck a current pointer here to catch a concurrent commit under another Alias.
+        if reuse_subject_binding {
+            if let Some(binding) = self
+                .binding_from_history(&scope, previous_history.as_ref())
+                .await?
+            {
+                return if binding.phase == BindingPhase::Active {
+                    Ok(Some(binding))
+                } else {
+                    Err(Error::Conflict("binding is deleting".into()))
+                };
+            }
+        }
         let (version, alias_check) = self.desired_version(&scope).await?;
+        if selected_version.is_some_and(|selected| selected != version) {
+            return Err(Error::Conflict(
+                "selected template version changed; retry activation".into(),
+            ));
+        }
         let template = self
             .template(&scope.tenant, &scope.template, &version)
             .await?
@@ -307,9 +457,32 @@ impl AgentState {
         template.render_mounts(parameters).map_err(Error::Invalid)?;
         template.render_env(parameters).map_err(Error::Invalid)?;
         let generation = uuid::Uuid::new_v4().to_string();
+        let mut current =
+            adx_agent_core::EnvironmentRef::new(version.clone(), format!("adx-{generation}"));
+        let mut extra_checks = Vec::new();
+        let mut extra_puts = Vec::new();
+        let template_golden = adx_agent_core::prewarm::template_golden(&template);
+        if let Some(recipe) = template_golden {
+            current.pending_snapshot_id = checked_snapshot
+                .filter(|id| *id == recipe.snapshot_id)
+                .map(str::to_owned);
+        }
+        let history_empty = previous_history
+            .as_ref()
+            .map(Record::decode::<Option<Scope>>)
+            .transpose()?
+            .flatten()
+            .is_none();
+        extra_checks.push(Check {
+            key: history.clone(),
+            expected: previous_history.map(|record| record.revision),
+        });
+        if reuse_subject_binding || history_empty {
+            extra_puts.push(put(&history, &Some(&scope))?);
+        }
         let value = AgentBinding {
             scope,
-            current: adx_agent_core::EnvironmentRef::new(version, format!("adx-{generation}")),
+            current,
             secondary: None,
             generation,
             phase: BindingPhase::Active,
@@ -322,21 +495,22 @@ impl AgentState {
             expected: None,
         }];
         checks.extend(alias_check);
+        checks.extend(extra_checks);
+        let mut writes = vec![put(&key, &value)?];
+        writes.extend(extra_puts);
         if self
             .store
-            .commit(&Transaction::new(checks, vec![put(&key, &value)?])?)
+            .commit(&Transaction::new(checks, writes)?)
             .await?
         {
-            return Ok(value);
+            return Ok(Some(value));
         }
-        let existing: AgentBinding = self
-            .store
-            .get(&key)
-            .await?
-            .ok_or_else(|| Error::Conflict("binding changed".into()))?
-            .decode()?;
+        let Some(existing) = self.store.get(&key).await? else {
+            return Ok(None);
+        };
+        let existing: AgentBinding = existing.decode()?;
         if existing.phase == BindingPhase::Active {
-            Ok(existing)
+            Ok(Some(existing))
         } else {
             Err(Error::Conflict("binding is deleting".into()))
         }
@@ -391,11 +565,19 @@ impl AgentState {
         {
             return Err(Error::Conflict("binding deletion identity mismatch".into()));
         }
-        let checks = vec![check(&key, &record)];
+        let mut checks = vec![check(&key, &record)];
+        let mut writes = Vec::new();
+        let history = crate::prewarm::history_key(&binding.scope)?;
+        if let Some(record) = self.store.get(&history).await? {
+            if record.decode::<Option<Scope>>()?.as_ref() == Some(&binding.scope) {
+                checks.push(check(&history, &record));
+                writes.push(put(&history, &Option::<Scope>::None)?);
+            }
+        }
         let deletes = vec![key];
         if self
             .store
-            .commit(&Transaction::with_deletes(checks, vec![], deletes)?)
+            .commit(&Transaction::with_deletes(checks, writes, deletes)?)
             .await?
         {
             Ok(())

@@ -25,6 +25,19 @@ pub(crate) fn validate_identity(value: &str) -> Result<(), EnvironmentError> {
     }
     Ok(())
 }
+pub(crate) fn check_golden(
+    value: &Value,
+    id: &str,
+    image: &str,
+    runtime: &str,
+) -> Result<bool, EnvironmentError> {
+    if value["snapshotId"] != id || value["state"] != "ready" {
+        return Err(EnvironmentError::Unavailable(
+            "ready snapshot metadata has not been confirmed".into(),
+        ));
+    }
+    Ok(value["kind"] == "golden" && value["image"] == image && value["runtime"] == runtime)
+}
 pub(crate) fn observation(
     tenant: &str,
     id: &str,
@@ -100,13 +113,19 @@ pub fn create_input(
     // Keep the submitted specification stable across retries. The caller's absolute
     // deadline bounds HTTP waiting; API Server owns its independent create budget.
     let mut input = json!({
-        "namespace":"adx", "name":name, "image":execution.image, "runtime":execution.isolation_runtime,
+        "namespace":"adx", "name":name,
         "cpu":execution.resources.cpu_millis, "memory":execution.resources.memory_mib,
-        "inheritEntrypoint":true, "env":execution.env,
+        "inheritEntrypoint":execution.snapshot_id.is_none(), "env":execution.env,
         "ports":execution.service.iter().map(|service| service.port.to_string()).collect::<std::collections::BTreeSet<_>>(),
         "createTimeoutSeconds":timeout.as_secs().max(1),
         "restartPolicy":{"maxAttempts":3,"initialBackoffSeconds":5,"maxBackoffSeconds":60},
     });
+    if let Some(snapshot_id) = &execution.snapshot_id {
+        input["snapshotId"] = json!(snapshot_id);
+    } else {
+        input["image"] = json!(execution.image);
+        input["runtime"] = json!(execution.isolation_runtime);
+    }
     if let Some(policy) = egress_input(execution.network.as_ref(), platform_egress) {
         input["network"] = policy;
     }
@@ -129,13 +148,17 @@ pub fn create_input(
     if let Some(seconds) = execution.init_timeout_seconds {
         input["initCallTimeoutSeconds"] = json!(seconds);
     }
-    if let Some(probe) = &execution.readiness_probe {
-        input["readinessProbe"] = readiness_probe_input(probe)?;
-    }
-    if let Some(healthcheck) = &execution.healthcheck {
-        let mut probe = readiness_probe_input(&healthcheck.probe)?;
-        probe["failureThreshold"] = json!(healthcheck.failure_threshold);
-        input["healthcheckProbe"] = probe;
+    // The captured process owns both probes and its rootfs. Sending an image on
+    // restore constructs a new rootfs request which may conflict with the source.
+    if execution.snapshot_id.is_none() {
+        if let Some(probe) = &execution.readiness_probe {
+            input["readinessProbe"] = readiness_probe_input(probe)?;
+        }
+        if let Some(healthcheck) = &execution.healthcheck {
+            let mut probe = readiness_probe_input(&healthcheck.probe)?;
+            probe["failureThreshold"] = json!(healthcheck.failure_threshold);
+            input["healthcheckProbe"] = probe;
+        }
     }
     if let Some(limit) = execution.resources.cpu_limit_millis {
         input["cpu_limit"] = json!(limit);
@@ -144,6 +167,28 @@ pub fn create_input(
         input["mem_limit"] = json!(limit);
     }
     Ok(input)
+}
+
+pub(crate) fn seed_input(
+    tenant: &str,
+    id: &str,
+    seed: &adx_agent_core::prewarm::SeedExecution,
+    timeout: Duration,
+    platform_egress: Option<&PlatformEgress>,
+) -> Result<Value, EnvironmentError> {
+    if let Some(input) = &seed.native_input {
+        return Ok(input.clone());
+    }
+    let request = CreateEnvironment {
+        tenant: tenant.into(),
+        id: format!("adx-{id}"),
+        execution: seed.execution.clone(),
+        deadline_unix_ms: None,
+        creation_attempt: 0,
+    };
+    let mut environment = create_input(&request, timeout, platform_egress)?;
+    environment["idleTimeoutSeconds"] = json!(0);
+    Ok(json!({"environment":environment, "volume":seed.volume}))
 }
 
 fn readiness_probe_input(

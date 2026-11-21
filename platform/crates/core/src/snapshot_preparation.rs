@@ -25,6 +25,9 @@ pub struct SnapshotPreparation {
     pub resources: Resources,
     pub state: PreparationState,
     pub spec: Option<EnvironmentSpec>,
+    /// An Agent seed Volume still needing UID resolution in Coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_volume: Option<crate::volumes::VolumeSpec>,
     pub snapshot_id: Option<String>,
     pub expected_revision: Option<u64>,
     pub error: Option<String>,
@@ -43,6 +46,9 @@ pub struct SnapshotTemplate {
     pub deleted: bool,
     pub preparation: SnapshotPreparation,
     pub latest_successful: Option<SuccessfulPreparation>,
+    /// Deadline for starting an unregistered Agent job. Existing jobs can settle after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_deadline_unix_ms: Option<u64>,
     /// None denotes history written before native usage accounting existed.
     #[serde(default)]
     pub usage: Option<SnapshotTemplateUsage>,
@@ -105,6 +111,23 @@ pub fn validate_template_tenant(tenant: &str) -> Result<()> {
 impl SnapshotPreparation {
     pub fn validate(&self) -> Result<()> {
         self.resources.validate()?;
+        if let Some(volume) = &self.seed_volume {
+            volume.validate()?;
+            if self
+                .spec
+                .as_ref()
+                .is_none_or(|spec| volume.tenant_id != spec.tenant_id)
+                || !matches!(
+                    self.state,
+                    PreparationState::Creating | PreparationState::Failed
+                )
+                || !self.cleanup_pending
+            {
+                return Err(Error::Invalid(
+                    "invalid snapshot preparation seed Volume".into(),
+                ));
+            }
+        }
         if let Some(spec) = &self.spec {
             spec.validate()?;
         }
@@ -135,6 +158,10 @@ impl SnapshotPreparation {
 }
 
 impl SnapshotTemplate {
+    pub fn is_agent_managed(&self) -> bool {
+        self.id == self.preparation.id && self.name.starts_with(&format!("adx-agent-{}-", self.id))
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_template_tenant(&self.tenant_id)?;
         self.preparation.validate()?;
@@ -142,6 +169,9 @@ impl SnapshotTemplate {
             || normalize_name(&self.name)? != self.name
             || self.created_at_unix_ms == 0
             || self.revision == 0
+            || ((self.registration_deadline_unix_ms.is_some()
+                || self.preparation.seed_volume.is_some())
+                && !self.is_agent_managed())
             || self
                 .preparation
                 .spec
@@ -200,6 +230,7 @@ mod tests {
             },
             state: PreparationState::Ready,
             spec: None,
+            seed_volume: None,
             snapshot_id: Some("capture".into()),
             expected_revision: None,
             error: None,

@@ -10,6 +10,66 @@ use tonic::{Code, Status};
 
 #[async_trait]
 impl EnvironmentApplication for EnvironmentService {
+    async fn update_snapshot_reference_request(
+        &self,
+        tenant: &str,
+        id: &str,
+        change: &adx_agent_core::environment::SnapshotChange,
+    ) -> Result<(), EnvironmentError> {
+        self.update_snapshot_reference(&caller(tenant), id, change)
+            .await
+            .map_err(|error| {
+                if crate::snapshot_preparation::snapshot_admission_stale(&error) {
+                    EnvironmentError::SnapshotAdmissionStale
+                } else if error.code() == Code::NotFound {
+                    EnvironmentError::NotFound
+                } else {
+                    map_status(error, true)
+                }
+            })
+    }
+
+    async fn prepare_snapshot_request(
+        &self,
+        tenant: &str,
+        id: &str,
+        input: Value,
+    ) -> Result<adx_agent_core::prewarm::SeedResult, EnvironmentError> {
+        Box::pin(self.prepare_snapshot(id, input, &caller(tenant)))
+            .await
+            .map_err(|error| map_status(error, true))
+    }
+    async fn snapshot_metadata(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<Option<Value>, EnvironmentError> {
+        let client = self
+            .clients
+            .coordinator()
+            .await
+            .map_err(|e| map_status(e, false))?;
+        let mut snapshots = pb::snapshot_service_client::SnapshotServiceClient::new(client);
+        let caller = caller(tenant);
+        match self
+            .clients
+            .rpc(
+                "apiserver.snapshot_metadata",
+                snapshots.get_snapshot(adx_observability::trace::inject(pb::GetSnapshotRequest {
+                    id: id.into(),
+                    caller: Some(caller.clone()),
+                    node_session_id: String::new(),
+                })),
+            )
+            .await
+        {
+            Ok(snapshot) => crate::operations::snapshot_value(&snapshot, &caller)
+                .map(Some)
+                .map_err(|e| map_status(e, false)),
+            Err(error) if error.code() == Code::NotFound => Ok(None),
+            Err(error) => Err(map_status(error, false)),
+        }
+    }
     async fn ensure_volume_request(
         &self,
         tenant: &str,
