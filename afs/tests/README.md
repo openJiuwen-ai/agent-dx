@@ -24,8 +24,9 @@ K8s角色按namespace/Pod UID、实际worker UID和隔离身份核验，
 
 ## CI4 功能 Full
 
-`suites/ci_full.py`登记 26 个用例，`run.py run --suite ci-full`按该清单执行并逐项校验完整性。
-在原 24 项基础上增加 OwnerFs 远端目录 FD 回收和 DFS 读缓存 FD 上限回归。
+`suites/ci_full.py`登记 29 个用例，`run.py run --suite ci-full`按该清单执行并逐项校验完整性。
+在原 24 项基础上增加 OwnerFs 远端目录 FD 回收和 DFS 读缓存 FD 上限回归，以及三项 DFS 跨节点文件语义：
+原子保存、文件仍打开时重命名并继续写入、删除后原打开句柄仍可读取。
 它包含已有冒烟，排除20项读写专项和2项性能资产；不是`--all`。本轮候选在K8s准备matrix：
 local为同一M Pod内M/A/B/C进程和私有挂载namespace，cluster为M/A/B/C四个独立Pod。
 A/B强制不同worker，C为独立读者Pod，可与现有角色同worker，不宣称第三台VM或物理故障隔离。
