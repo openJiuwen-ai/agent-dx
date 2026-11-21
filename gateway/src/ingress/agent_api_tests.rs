@@ -322,7 +322,7 @@ async fn embedded_registration_automatically_reconciles_aliases() {
         .unwrap();
     let members = registry.members().await.unwrap();
     assert_eq!(members.len(), 1);
-    assert_eq!(members[0].id, "embedded-default");
+    assert_eq!(members[0].endpoint.id, "embedded-default");
 
     // No foreground activation: startup scanning and later notifications must both work.
     for version in ["2", "1"] {

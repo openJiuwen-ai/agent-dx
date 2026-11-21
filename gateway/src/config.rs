@@ -50,6 +50,9 @@ pub struct IngressConfig {
     pub backend_http_idle_timeout: Duration,
     pub backend_http_acquire_timeout: Duration,
     pub drain_timeout: Duration,
+    /// Controls how existing WebSocket/command-watch/CONNECT tunnels behave
+    /// when the Ingress starts draining. See [`WsDrainMode`].
+    pub ws_drain_mode: WsDrainMode,
     pub allowed_client_networks: Vec<ipnet::IpNet>,
     pub allow_any_client: bool,
     pub command_watch_max_subscriptions: usize,
@@ -109,6 +112,33 @@ impl std::str::FromStr for IngressNodeSecurityMode {
             "network" => Ok(Self::Network),
             "mtls" => Ok(Self::Mtls),
             _ => Err(format!("expected network or mtls, got {value}")),
+        }
+    }
+}
+
+/// How the Ingress treats already-open WebSocket/command-watch/CONNECT
+/// tunnels once it enters the draining state. The default preserves the
+/// existing "let them finish within the drain budget" behavior; `CloseImmediate`
+/// cancels outstanding backend streams so the tunnels close at drain start.
+/// Business-level reconnect/recovery semantics (D2/D3) are out of scope for
+/// this knob and remain caller-side responsibilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WsDrainMode {
+    #[default]
+    ContinueUntilDeadline,
+    CloseImmediate,
+}
+
+impl std::str::FromStr for WsDrainMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "continue" | "continue_until_deadline" => Ok(Self::ContinueUntilDeadline),
+            "close" | "close_immediate" => Ok(Self::CloseImmediate),
+            _ => Err(format!(
+                "expected continue_until_deadline or close_immediate, got {value}"
+            )),
         }
     }
 }
@@ -372,7 +402,11 @@ impl IngressConfig {
             ));
         }
         let drain_timeout =
-            Duration::from_secs(parse_env("ADX_DATA_PLANE_INGRESS_DRAIN_TIMEOUT_SEC", "30")?);
+            Duration::from_secs(parse_env("ADX_DATA_PLANE_INGRESS_DRAIN_TIMEOUT_SEC", "15")?);
+        let ws_drain_mode = env::var("ADX_DATA_PLANE_INGRESS_WS_DRAIN_MODE")
+            .unwrap_or_default()
+            .parse()
+            .map_err(|error: String| ConfigError::Invalid(error))?;
         let allowed_client_networks =
             parse_cidrs("ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS", false)?;
         let allow_any_client = parse_bool_env("ADX_DATA_PLANE_INGRESS_ALLOW_ANY_CLIENT", false)?;
@@ -447,6 +481,7 @@ impl IngressConfig {
             backend_http_idle_timeout,
             backend_http_acquire_timeout,
             drain_timeout,
+            ws_drain_mode,
             allowed_client_networks,
             allow_any_client,
             command_watch_max_subscriptions,
@@ -734,6 +769,24 @@ mod tests {
             let listener: crate::ingress::ListenerConfig = serde_json::from_value(value).unwrap();
             assert!(listener.validate().is_err());
         }
+    }
+
+    #[test]
+    fn ws_drain_mode_parses_known_values_and_defaults_to_continue() {
+        assert_eq!(WsDrainMode::default(), WsDrainMode::ContinueUntilDeadline);
+        for (input, expected) in [
+            ("", WsDrainMode::ContinueUntilDeadline),
+            ("continue", WsDrainMode::ContinueUntilDeadline),
+            (
+                "continue_until_deadline",
+                WsDrainMode::ContinueUntilDeadline,
+            ),
+            ("CLOSE", WsDrainMode::CloseImmediate),
+            ("close_immediate", WsDrainMode::CloseImmediate),
+        ] {
+            assert_eq!(input.parse::<WsDrainMode>().unwrap(), expected, "{input:?}");
+        }
+        assert!("close_immediately".parse::<WsDrainMode>().is_err());
     }
 
     #[test]
