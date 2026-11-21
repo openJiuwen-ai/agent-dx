@@ -237,7 +237,7 @@ def exercise(config, old_inputs, new_inputs, output):
     cleanup_errors = []
     for mode, suffix in (("ownerfs", "upgrade_rollback"), ("dfs", "upgrade_rollback"),
                          ("ownerfs", "old_root_command")):
-        case = Case(f"{mode}.version.{suffix}", (), mode, (), None, observe_cache=True)
+        case = Case(f"{mode}.version.{suffix}", (), mode, (), None, observe_cache=(mode == "dfs"))
         case_output = output / case.id
         case_output.mkdir()
         result = {"id": case.id, "status": "failed", "phases": {}}
