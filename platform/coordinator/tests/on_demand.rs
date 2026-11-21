@@ -21,7 +21,7 @@ use adx_transport::rpc::{RpcChannel, RpcClient};
 use adxlet::{
     checkpoint::CheckpointCooperation,
     rpc::{CoordinatorStateSink, NodeRpc},
-    Adxlet, Readiness, Routes, RuntimeDriver,
+    Adxlet, Durability, Readiness, Routes, RuntimeDriver, StateSink,
 };
 use async_trait::async_trait;
 use std::{
@@ -87,6 +87,8 @@ struct Backend {
     restore_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     restore_entered: tokio::sync::Notify,
     fail_after_gate: AtomicBool,
+    restore_input_publication: Mutex<Option<bool>>,
+    lose_restore_result_ack: AtomicBool,
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
@@ -127,6 +129,19 @@ impl RuntimeDriver for Backend {
     }
     async fn is_running(&self, runtime: &str) -> Result<bool> {
         Ok(self.running.lock().unwrap().contains_key(runtime))
+    }
+    async fn set_network_policy(
+        &self,
+        runtime: &str,
+        _: Option<&adx_core::execution::NetworkPolicy>,
+        _: &[u16],
+        _: Option<u16>,
+    ) -> Result<()> {
+        if self.is_running(runtime).await? {
+            Ok(())
+        } else {
+            Err(adx_core::Error::Conflict)
+        }
     }
     async fn remove(&self, runtime: &str) -> Result<()> {
         self.running.lock().unwrap().remove(runtime);
@@ -244,6 +259,77 @@ impl CheckpointCooperation for Backend {
     }
 }
 
+struct RestorePublicationFault {
+    coordinator: CoordinatorStateSink,
+    backend: Arc<Backend>,
+}
+
+#[async_trait]
+impl StateSink for RestorePublicationFault {
+    async fn has_current_assignment(&self, record: &EnvironmentRecord) -> Result<bool> {
+        self.coordinator.has_current_assignment(record).await
+    }
+
+    async fn prepare_execution(
+        &self,
+        record: &EnvironmentRecord,
+        previous: &str,
+    ) -> Result<EnvironmentSpec> {
+        self.coordinator.prepare_execution(record, previous).await
+    }
+
+    async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
+        self.commit_releasing(record, &[]).await
+    }
+
+    async fn commit_releasing(
+        &self,
+        record: &EnvironmentRecord,
+        stopped: &[String],
+    ) -> Result<Durability> {
+        if record.state == adx_core::EnvironmentState::Paused
+            && !record.execution_artifacts.is_empty()
+        {
+            let lost_ack = self
+                .backend
+                .restore_input_publication
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(commit_first) = lost_ack {
+                if commit_first {
+                    self.coordinator.commit_releasing(record, stopped).await?;
+                }
+                return Ok(Durability::Journaled);
+            }
+        }
+        let durability = self.coordinator.commit_releasing(record, stopped).await?;
+        if record.state == adx_core::EnvironmentState::Running
+            && record.last_operation.as_ref().is_some_and(|op| {
+                op.kind == adx_core::LifecycleKind::Resume && op.id.starts_with("task:")
+            })
+            && self
+                .backend
+                .lose_restore_result_ack
+                .swap(false, Ordering::SeqCst)
+        {
+            return Ok(Durability::Journaled);
+        }
+        Ok(durability)
+    }
+
+    async fn commit_deleted(
+        &self,
+        record: &EnvironmentRecord,
+        cleanup: &[adx_core::CheckpointArtifact],
+        stopped: &[String],
+    ) -> Result<Durability> {
+        self.coordinator
+            .commit_deleted(record, cleanup, stopped)
+            .await
+    }
+}
+
 struct Worker {
     store: Arc<ObjectCheckpointStore>,
     sink: CoordinatorStateSink,
@@ -299,7 +385,10 @@ async fn worker(
             backend.clone(),
             backend.clone(),
             backend.clone(),
-            Arc::new(sink.clone()),
+            Arc::new(RestorePublicationFault {
+                coordinator: sink.clone(),
+                backend: backend.clone(),
+            }),
         )
         .with_checkpointing(store.clone(), backend.clone())
         .unwrap()
@@ -602,6 +691,81 @@ async fn upgrade_response(
 }
 
 const MIGRATE_PATH: &str = "tasks/planned-migration/migrate";
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn drain_abort_settles_an_accepted_resume_before_fencing_the_source() {
+    use serde_json::json;
+
+    let rig = Rig::new(Duration::from_secs(2)).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(adx_coordinator::autoscaling::serve(
+        listener,
+        rig.rpc.clone(),
+    ));
+    let source = &rig.source.report;
+    let binding = json!({
+        "node_id": source.node_id, "node_session_id": source.session_id, "pod_uid": "source-pod"
+    });
+    post_upgrade(
+        address,
+        "tasks",
+        json!({"task_id":"drain", "epoch":1, "namespace":"test", "daemonset_uid":"daemonset",
+               "target_image":format!("image@sha256:{}", "d".repeat(64)), "nodes":[binding]}),
+    )
+    .await;
+    post_upgrade(
+        address,
+        "tasks/drain/drain-node",
+        json!({"task_id":"drain", "epoch":1, "operation_id":"prepare", "node_id":source.node_id,
+               "node_session_id":source.session_id, "pod_uid":"source-pod"}),
+    )
+    .await;
+    let accepted = rig.session.request_resume("sleep", 0).await.unwrap();
+    assert!(accepted.resume.is_some());
+
+    let freeze = json!({"task_id":"drain", "epoch":1, "operation_id":"freeze", "stage":"freeze"});
+    let (status, body) =
+        upgrade_response(address, "POST", "tasks/drain/abort", freeze.to_string()).await;
+    assert_eq!(status, 409, "{body}");
+    let task = upgrade_request(address, "GET", "tasks/drain", String::new()).await;
+    assert_eq!(task["phase"], "Aborting");
+    assert_eq!(task["nodes"]["a"]["phase"], "draining");
+
+    rig.resume(false).await.unwrap();
+    let resumed = rig.session.get("sleep").await.unwrap();
+    assert_eq!(resumed.assignment, accepted.assignment);
+    assert_eq!(
+        resumed.result.unwrap().state,
+        adx_core::EnvironmentState::Running
+    );
+    assert!(resumed.resume.is_none());
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        rig.session.request_resume("sleep", 0).await,
+        Err(adx_core::Error::Unavailable(_))
+    ));
+    let frozen = post_upgrade(address, "tasks/drain/abort", freeze).await;
+    assert_eq!(frozen["nodes"]["a"]["phase"], "evacuating");
+    post_upgrade(
+        address,
+        "tasks/drain/abort",
+        json!({"task_id":"drain", "epoch":1, "operation_id":"restore", "stage":"restore-original",
+               "node_id":source.node_id, "node_session_id":source.session_id, "pod_uid":"source-pod"}),
+    )
+    .await;
+    let aborted = post_upgrade(
+        address,
+        "tasks/drain/abort",
+        json!({"task_id":"drain", "epoch":1, "operation_id":"finalize", "stage":"finalize", "template_restored":true}),
+    )
+    .await;
+    assert_eq!(aborted["phase"], "Aborted");
+    assert!(rig.source.manager.accepting_allocations());
+    server.abort();
+}
 
 async fn prepare_migration(
     rig: &Rig,

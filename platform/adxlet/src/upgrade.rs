@@ -180,7 +180,10 @@ impl UpgradeGate {
         if task.is_none() && matches!(phase, "verified" | "released") {
             return true;
         }
-        if !matches!(phase, "verified" | "evacuating") {
+        if task.is_none() && phase == "draining" {
+            return action != "create";
+        }
+        if !matches!(phase, "verified" | "evacuating" | "draining") {
             return false;
         }
         if task
@@ -191,7 +194,8 @@ impl UpgradeGate {
         control.grants.iter().any(|grant| {
             grant.environment_id == id
                 && grant.assignment_generation == generation
-                && (grant.actions.iter().any(|a| a == action)
+                && ((!(action == "resume" && phase == "evacuating" && task.is_none())
+                    && grant.actions.iter().any(|a| a == action))
                     || task.is_none()
                         && phase != "verified"
                         && matches!(action, "resume" | "adopt")
@@ -227,7 +231,7 @@ impl UpgradeGate {
     /// Persist ambiguity before creating a Controller, hold, or backend action.
     pub(crate) fn record_action(&self, id: &str, generation: u64, action: &str) -> Result<()> {
         let mut state = self.lock()?;
-        self.record_action_locked(&mut state, id, generation, action)
+        self.record_action_locked(&mut state, id, generation, action, None)
     }
 
     /// Terminal records may be adopted for query/deletion, without opening execution.
@@ -251,8 +255,9 @@ impl UpgradeGate {
         id: &str,
         generation: u64,
         action: &str,
+        task: Option<&str>,
     ) -> Result<()> {
-        if !self.allowed(state, id, generation, action, None) {
+        if !self.allowed(state, id, generation, action, task) {
             return Err(Error::Unavailable(
                 "node upgrade execution admission is closed".into(),
             ));
@@ -278,8 +283,18 @@ impl UpgradeGate {
 
     /// The lease spans the actual side effect, so Quiescing can await accepted work.
     pub async fn enter(&self, id: &str, generation: u64, action: &str) -> Result<ExecutionLease> {
+        self.enter_scoped(id, generation, action, None)
+    }
+
+    pub(crate) fn enter_scoped(
+        &self,
+        id: &str,
+        generation: u64,
+        action: &str,
+        task: Option<&str>,
+    ) -> Result<ExecutionLease> {
         let mut state = self.lock()?;
-        self.record_action_locked(&mut state, id, generation, action)?;
+        self.record_action_locked(&mut state, id, generation, action, task)?;
         *self
             .activity
             .by_id
@@ -293,7 +308,7 @@ impl UpgradeGate {
     pub async fn apply(&self, control: NodeControl) -> Result<()> {
         let _transition = self.transitions.lock().await;
         validate(&control, &self.session)?;
-        let open = matches!(control.phase.as_str(), "verified" | "released");
+        let open = matches!(control.phase.as_str(), "verified" | "released" | "draining");
         {
             let mut state = self.lock()?;
             let unchanged = state.control.as_ref() == Some(&control) && !state.bootstrap_isolated;
@@ -364,10 +379,12 @@ fn validate(control: &NodeControl, session: &str) -> Result<()> {
         || session.is_empty()
         || !matches!(
             control.phase.as_str(),
-            "isolated" | "evacuating" | "quiescing" | "verified" | "released"
+            "isolated" | "evacuating" | "draining" | "quiescing" | "verified" | "released"
         )
-        || (!matches!(control.phase.as_str(), "evacuating" | "verified")
-            && !control.grants.is_empty())
+        || (!matches!(
+            control.phase.as_str(),
+            "evacuating" | "verified" | "draining"
+        ) && !control.grants.is_empty())
     {
         return Err(Error::Invalid(
             "invalid node upgrade control identity or phase".into(),
@@ -526,6 +543,7 @@ impl crate::Adxlet {
             .unwrap_or_default();
         Ok(adx_protocol::control::NodeUpgradeInspection {
             protocol_version: 3,
+            guarded_resume: true,
             runtime_rootfs_sha256: rootfs.sha256,
             runtime_rootfs_path: rootfs.path,
             task_id: control.task_id,

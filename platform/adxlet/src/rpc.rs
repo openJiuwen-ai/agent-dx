@@ -339,14 +339,19 @@ impl pb::node_service_server::NodeService for NodeRpc {
             .ok_or_else(|| Status::invalid_argument("assignment required"))?
             .try_into()
             .map_err(status)?;
-        let (_, owner, handle) = self
+        let controller = self
             .manager
             .environments
             .lock()
             .map_err(|_| Status::internal("environment registry unavailable"))?
             .get(&assignment.environment_id)
-            .cloned()
-            .ok_or_else(|| Status::not_found("environment not managed"))?;
+            .cloned();
+        let (_, owner, handle) = controller.ok_or_else(|| {
+            // The Coordinator owns existence and assignment. A restarted
+            // adxlet may not have adopted that assignment into its local catalog.
+            self.manager.reconciliation_requested.notify_one();
+            Status::unavailable("environment controller awaiting reconciliation")
+        })?;
         if owner != assignment {
             return Err(Status::failed_precondition("assignment changed"));
         }
@@ -357,9 +362,19 @@ impl pb::node_service_server::NodeService for NodeRpc {
             return Err(Status::unavailable("node is reconciling or draining"));
         }
         let controller_started = Instant::now();
-        let result = handle
-            .ensure_running_with_timeout(r.operation_id, r.run_timeout_seconds)
-            .await;
+        let result = if let Some(expected_revision) = r.expected_revision {
+            handle
+                .resume(crate::checkpoint::ResumeRequest {
+                    operation_id: r.operation_id,
+                    expected_revision,
+                    run_timeout_seconds: r.run_timeout_seconds,
+                })
+                .await
+        } else {
+            handle
+                .ensure_running_with_timeout(r.operation_id, r.run_timeout_seconds)
+                .await
+        };
         adx_observability::info!(
             event = "node_ensure_running_stages", environment_id = %assignment.environment_id,
             gate_wait_ms, controller_ms = controller_started.elapsed().as_secs_f64() * 1_000.0,
@@ -698,6 +713,8 @@ impl pb::node_service_server::NodeService for NodeRpc {
                             &r.operation_id,
                         )
                         .map_err(status)?;
+                } else if r.operation_id.starts_with("task:") {
+                    return Err(Status::permission_denied("Coordinator identity required"));
                 }
                 let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
                 response(
@@ -739,6 +756,9 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     return Err(Status::unavailable("node is reconciling"));
                 }
                 let r = request.into_inner();
+                if r.operation_id.starts_with("task:") {
+                    return Err(Status::permission_denied("Coordinator identity required"));
+                }
                 let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
                 response(
                     handle
