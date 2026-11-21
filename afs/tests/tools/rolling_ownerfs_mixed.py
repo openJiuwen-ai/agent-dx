@@ -136,21 +136,27 @@ def observe_adoption(cluster):
 def await_old_view(cluster, path):
     """Bound lookup propagation before allowing a single legacy mutation."""
     deadline = time.monotonic() + 30
+    transient = {}
     while time.monotonic() < deadline:
         result = cluster.python(
             "A",
             'try:\n with open(sys.argv[1],"rb") as stream: data=stream.read()\n'
-            'except FileNotFoundError: print("null")\n'
+            'except OSError as error:\n'
+            ' if error.errno not in (errno.ENOENT,errno.ESTALE,errno.EAGAIN,errno.EBUSY,'
+            'errno.EHOSTUNREACH,errno.ETIMEDOUT): raise\n'
+            ' print(json.dumps({"errno":error.errno}))\n'
             'else: print(json.dumps({"bytes":len(data),"sha256":hashlib.sha256(data).hexdigest()}))',
             path,
         )
         actual = json.loads(result["stdout"])
-        if actual is not None:
+        if "errno" not in actual:
             if actual != checksum(SEED_BODY):
                 raise AssertionError(f"old Node returned the wrong adopted contents: {actual}")
-            return actual
+            return {"file": actual, "transient_errno_counts": transient}
+        error = actual["errno"]
+        transient[error] = transient.get(error, 0) + 1
         time.sleep(0.2)
-    raise AssertionError("old Node never exposed the newly adopted workspace")
+    raise AssertionError(f"old Node never exposed the newly adopted workspace: {transient}")
 
 
 def grpc_writes(cluster, role, side):
