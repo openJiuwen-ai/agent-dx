@@ -474,6 +474,10 @@ OwnerFs 继续通过 `RemoteFiles` 和 `OwnerPeerClient` 访问 Home。读窗口
 报告未提交、已完成或未知。未知结果触发隔离，并按原读取票据通知 Home 保留导出槽。停止等待的读
 仍由后台任务处理完成和释放。
 
+每条 HIXL lane 的 ACL owner 线程在启动时为接收槽和导出槽分配普通 Host 内存。节点选择优先使用 NPU 的 PCI NUMA 节点。只有无法确定 PCI 节点时，才在实际分配槽的 owner 线程上用 `sched_getaffinity` 读取该线程允许使用的 CPU；仅当掩码非空且其中每个 CPU 都能确认属于同一个 NUMA 节点时，才用该节点。
+
+选出节点且线程使用默认内存策略时，在 `aclrtMallocHost` 和首次触页期间临时设置 `MPOL_PREFERRED`，随后恢复原策略，再注册内存。未选出节点、线程已有非默认策略或无法设置优先策略时，沿用原策略。该机制不自动绑定 CPU、不新增 TOML 配置，也不保证物理页落在优先节点。启动日志 `AFS_HIXL_NUMA` 中，`source=pci|worker_cpu|unknown` 表示节点来源，`policy=preferred|inherited` 表示首个接收槽分配时的策略。
+
 Node 停机在退场广播前冻结 Home HIXL 新协商和新 Prepare，gRPC 继续处理已认证的 Release 和
 Prepare 携带的 `prior_release`。Home 等待已发布的导出槽归还，并确认在途 Prepare 完成或回滚。
 Home 排空超时后隔离 runtime 并保留未确认槽，返回 `NODE_TRANSFER_DRAIN_INCOMPLETE`。

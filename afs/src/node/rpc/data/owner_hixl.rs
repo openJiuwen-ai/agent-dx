@@ -36,8 +36,10 @@ use crate::node::data_plane::hixl::SlotChecksum;
 use crate::node::rpc::OwnerRpcMetrics;
 use crate::node::rpc::hixl::{HIXL_PROTOCOL_VERSION, HixlMetrics, Operation};
 use crate::node::vfs::ownerfs::files::RemoteFile;
-use crate::node::vfs::ownerfs::root::PresentedRootAccess;
-use crate::node::vfs::ownerfs::{OwnerFsPeerExecutor, PeerBatchDirectory, PeerBatchFile};
+use crate::node::vfs::ownerfs::root::{PresentedRootAccess, RootId};
+use crate::node::vfs::ownerfs::{
+    OwnerFsPeerExecutor, PeerBatchDirectory, PeerBatchDirectoryVersion, PeerBatchFile,
+};
 
 const MAX_OWNER_HIXL_SESSIONS: usize = 64;
 const MAX_OWNER_HIXL_RELEASE_TOMBSTONES: usize = 256;
@@ -53,6 +55,10 @@ const MAX_OWNER_HIXL_BATCH_FILES: usize = 1024;
 pub(crate) const MAX_OWNER_HIXL_BATCH_SCAN: usize = 4096;
 /// Longest parent path or anchor name a batch prepare accepts (Linux PATH_MAX).
 const MAX_OWNER_HIXL_BATCH_PATH_BYTES: usize = 4096;
+/// Snapshots retained by one service (shared by its clones).
+const MAX_OWNER_HIXL_BATCH_SNAPSHOTS: usize = 8;
+/// Sum of name vector and per-name allocations per retained snapshot.
+const MAX_OWNER_HIXL_BATCH_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
 /// The Home file boundary used by prepare. Production delegates to the
 /// OwnerFs peer executor so authorization stays identical to `Read`.
@@ -104,6 +110,8 @@ pub(crate) struct BatchEntry {
 
 /// One Home directory of a batch prepare.
 pub(crate) trait OwnerBatchDirectory: Send + Sync {
+    /// Identity and change timestamps of the open directory.
+    fn version(&self) -> afs_error::Result<PeerBatchDirectoryVersion>;
     /// Entry names in byte order.
     fn names(&self) -> afs_error::Result<Vec<OsString>>;
     /// The entry without following a final symlink; `None` unless it is a
@@ -172,6 +180,10 @@ fn wire_entry(entry: &crate::node::vfs::ownerfs::PeerBatchEntry) -> BatchEntry {
 }
 
 impl OwnerBatchDirectory for PeerBatchDirectory {
+    fn version(&self) -> afs_error::Result<PeerBatchDirectoryVersion> {
+        PeerBatchDirectory::version(self)
+    }
+
     fn names(&self) -> afs_error::Result<Vec<OsString>> {
         PeerBatchDirectory::names(self)
     }
@@ -210,6 +222,7 @@ pub struct OwnerHixlService {
     provider: Arc<dyn ExportProvider>,
     source: Arc<dyn OwnerWindowSource>,
     reads: Arc<HomeReads>,
+    batch_snapshots: Arc<Mutex<VecDeque<BatchDirectorySnapshot>>>,
     metrics: Option<HixlMetrics>,
     owner_metrics: Option<OwnerRpcMetrics>,
     /// Slot algorithms each reader offered, in negotiation order.
@@ -221,6 +234,29 @@ pub struct OwnerHixlService {
 struct HomeReads {
     registry: Mutex<Registry>,
     preparing: AtomicUsize,
+}
+
+struct BatchDirectorySnapshot {
+    root: RootId,
+    parent: OsString,
+    epoch: u64,
+    generation: u64,
+    home_session: String,
+    version: PeerBatchDirectoryVersion,
+    names: Arc<Vec<OsString>>,
+}
+
+impl BatchDirectorySnapshot {
+    fn belongs_to(&self, access: &PresentedRootAccess, parent: &OsStr) -> bool {
+        self.root == access.id && self.parent.as_os_str() == parent
+    }
+
+    fn matches(&self, access: &PresentedRootAccess, version: PeerBatchDirectoryVersion) -> bool {
+        self.epoch == access.epoch
+            && self.generation == access.access_generation
+            && self.home_session == access.home_session_id
+            && self.version == version
+    }
 }
 
 struct PreparingRead<'a>(&'a AtomicUsize);
@@ -245,6 +281,7 @@ impl OwnerHixlService {
             provider,
             source,
             reads: Arc::new(HomeReads::default()),
+            batch_snapshots: Arc::new(Mutex::new(VecDeque::new())),
             metrics: None,
             owner_metrics: None,
             #[cfg(test)]
@@ -659,27 +696,31 @@ impl OwnerHixlService {
         rollback_failed: &'a Cell<bool>,
     ) -> Result<Vec<PendingExport<'a>>, Status> {
         let deadline = Instant::now() + OWNER_HIXL_EXPORT_DEADLINE;
-        let mut pending = Vec::with_capacity(capacities.len());
-        for capacity in capacities {
-            let reservation = self
-                .provider
-                .reserve_export(lane_id, capacity, deadline)
-                .map_err(runtime_status)?;
-            let window = reservation.window();
-            let consistent =
-                window.length == capacity && window.address != 0 && window.generation != 0;
-            pending.push(PendingExport::new(
-                self.provider.as_ref(),
-                lane_id,
-                reservation,
-                rollback_failed,
+        let capacities: Vec<_> = capacities.collect();
+        let reservations = self
+            .provider
+            .reserve_exports(lane_id, &capacities, deadline)
+            .map_err(|error| {
+                if error.kind == afs_transport::hixl::HixlErrorKind::EnginePoisoned {
+                    rollback_failed.set(true);
+                }
+                runtime_status(error)
+            })?;
+        // Arm every guard before validating: even an inconsistent result must roll back the full group.
+        let pending: Vec<_> = reservations
+            .into_iter()
+            .map(|slot| PendingExport::new(self.provider.as_ref(), lane_id, slot, rollback_failed))
+            .collect();
+        if pending.len() != capacities.len()
+            || pending.iter().zip(capacities).any(|(slot, capacity)| {
+                let window = slot.window();
+                window.length != capacity || window.address == 0 || window.generation == 0
+            })
+        {
+            return Err(coded_status(
+                afs_error::NODE_TRANSFER_INTERNAL,
+                "HIXL export returned an inconsistent window",
             ));
-            if !consistent {
-                return Err(coded_status(
-                    afs_error::NODE_TRANSFER_INTERNAL,
-                    "HIXL export returned an inconsistent window",
-                ));
-            }
         }
         Ok(pending)
     }
@@ -906,15 +947,19 @@ impl OwnerHixlService {
         };
 
         let directory = self.batch_directory(peer, &access, &parent)?;
+        let names = self
+            .batch_directory_names(directory.as_ref(), &access, &parent)
+            .map_err(error_to_status)?;
         let plan = plan_batch(
             directory.as_ref(),
+            &names,
             &request.anchor_name,
             request.min_file_bytes,
             request.max_file_bytes,
             slot_bytes,
             max_slots,
-        )
-        .map_err(error_to_status)?;
+        );
+        drop(names);
         if plan.slots.is_empty() {
             return Ok(OwnerPrepareBatchHixlReply {
                 session_id: request.session_id,
@@ -940,6 +985,58 @@ impl OwnerHixlService {
             self.quarantine_pending(&mut registry, true)?;
         }
         reply
+    }
+
+    fn batch_directory_names(
+        &self,
+        directory: &dyn OwnerBatchDirectory,
+        access: &PresentedRootAccess,
+        parent: &OsStr,
+    ) -> afs_error::Result<Arc<Vec<OsString>>> {
+        // Bound key allocations too. The caller already bounds the parent path.
+        if access.id.0.len() > MAX_OWNER_HIXL_BATCH_PATH_BYTES
+            || access.home_session_id.len() > MAX_OWNER_HIXL_BATCH_PATH_BYTES
+        {
+            return Ok(Arc::new(directory.names()?));
+        }
+        // The caller has reopened the directory under a current read grant.
+        // All filesystem work stays outside the snapshot lock.
+        let version = directory.version().ok();
+        if let Ok(mut snapshots) = self.batch_snapshots.lock()
+            && let Some(index) = snapshots
+                .iter()
+                .position(|item| item.belongs_to(access, parent))
+            && let Some(snapshot) = snapshots.remove(index)
+            && version.is_some_and(|version| snapshot.matches(access, version))
+        {
+            let names = snapshot.names.clone();
+            snapshots.push_back(snapshot);
+            return Ok(names);
+        }
+
+        let names = Arc::new(directory.names()?);
+        // Never publish a snapshot from a failed stamp check, a concurrent
+        // mutation during enumeration, or a directory over the memory budget.
+        if let Some(version) = version
+            && batch_snapshot_fits(&names, names.capacity())
+            && directory.version().ok() == Some(version)
+            && let Ok(mut snapshots) = self.batch_snapshots.lock()
+        {
+            snapshots.retain(|item| !item.belongs_to(access, parent));
+            if snapshots.len() == MAX_OWNER_HIXL_BATCH_SNAPSHOTS {
+                snapshots.pop_front();
+            }
+            snapshots.push_back(BatchDirectorySnapshot {
+                root: access.id.clone(),
+                parent: parent.to_owned(),
+                epoch: access.epoch,
+                generation: access.access_generation,
+                home_session: access.home_session_id.clone(),
+                version,
+                names: names.clone(),
+            });
+        }
+        Ok(names)
     }
 
     fn batch_directory(
@@ -1213,23 +1310,17 @@ impl OwnerHixlService {
                     OwnerReleaseHixlReadReply::default()
                 } else {
                     let lane_id = record.lane_id;
-                    let slots = record.admitted.slots().to_vec();
-                    for slot in &slots {
-                        // SAFETY: publication consumed the writable guard.
-                        // The authenticated session and read generation
-                        // match, and the reader reports a terminal outcome.
-                        let result = unsafe {
-                            self.provider.release_export(
-                                lane_id,
-                                slot.slot_id,
-                                slot.slot_generation,
-                            )
-                        };
-                        if let Err(error) = result {
-                            release_error = Some(runtime_status(error));
-                            pinned = true;
-                            break;
-                        }
+                    let slots = record
+                        .admitted
+                        .slots()
+                        .iter()
+                        .map(|slot| (slot.slot_id, slot.slot_generation))
+                        .collect();
+                    // SAFETY: publication consumed all writable guards; the authenticated reader
+                    // identified this read generation and confirmed a terminal outcome for the group.
+                    if let Err(error) = unsafe { self.provider.release_exports(lane_id, slots) } {
+                        release_error = Some(runtime_status(error));
+                        pinned = true;
                     }
                     if release_error.is_none() {
                         session.reads.remove(&request.read_id);
@@ -1314,18 +1405,32 @@ struct PlannedFile {
     length: usize,
 }
 
+fn batch_snapshot_fits(names: &[OsString], capacity: usize) -> bool {
+    let vector_bytes = capacity.saturating_mul(std::mem::size_of::<OsString>());
+    let Some(mut remaining) = MAX_OWNER_HIXL_BATCH_SNAPSHOT_BYTES.checked_sub(vector_bytes) else {
+        return false;
+    };
+    for name in names {
+        let Some(left) = remaining.checked_sub(name.capacity()) else {
+            return false;
+        };
+        remaining = left;
+    }
+    true
+}
+
 /// Packs eligible regular files in name order from the anchor, whole files
 /// only and never across a slot. Stops when no slot is left for the next
 /// file, at the file limit or at the scan limit; that entry becomes `next`.
 fn plan_batch(
     directory: &dyn OwnerBatchDirectory,
+    names: &[OsString],
     anchor: &[u8],
     min_file_bytes: u64,
     max_file_bytes: u64,
     slot_bytes: usize,
     max_slots: usize,
-) -> afs_error::Result<BatchPlan> {
-    let names = directory.names()?;
+) -> BatchPlan {
     let start = names.partition_point(|name| name.as_bytes() < anchor);
     let mut plan = BatchPlan::default();
     let mut files = 0_usize;
@@ -1369,7 +1474,7 @@ fn plan_batch(
         slot.used += length;
         files += 1;
     }
-    Ok(plan)
+    plan
 }
 
 /// Fills every planned slot on the Home source pool and digests its used

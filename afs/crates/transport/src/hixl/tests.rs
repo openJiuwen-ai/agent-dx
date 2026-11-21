@@ -517,6 +517,24 @@ fn lost_owner_reply_does_not_prove_a_read_was_never_submitted() {
 }
 
 #[test]
+fn export_batch_rolls_back_partial_allocation_and_rejects_stale_release() {
+    let mut opts = options();
+    opts.export_slots = 2;
+    let mut core = RuntimeCore::new(FakeBackend::default(), opts).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let error = core.reserve_exports(&[1, 0], deadline).unwrap_err();
+    assert_eq!(error.kind, HixlErrorKind::InvalidArgument);
+    assert_eq!(core.status().export_slots_in_use, 0);
+    let pair = core.reserve_exports(&[3, 2], deadline).unwrap();
+    assert_eq!((pair[0].length, pair[1].length), (3, 2));
+    let ids: Vec<_> = pair.iter().map(|s| (s.slot_id, s.generation)).collect();
+    core.release_exports(&ids).unwrap();
+    let _new = core.reserve_exports(&[1, 1], deadline).unwrap();
+    assert!(core.release_exports(&ids).is_err());
+    assert_eq!(core.status().export_slots_in_use, 2);
+}
+
+#[test]
 fn export_pool_capacity_and_generation_prevent_stale_release() {
     let mut core = RuntimeCore::new(FakeBackend::default(), options()).unwrap();
     let first = core
@@ -730,7 +748,6 @@ fn batch_read_submits_100_and_128_mib_in_one_native_call_each() {
             assert_eq!(window.slot_id, index as u64);
             assert_eq!(window.remote_addr, windows[index].0);
             assert_eq!(window.len, 4 * MIB);
-            assert_eq!(window.local_offset, index * 4 * MIB);
         }
         assert_eq!(core.status().receive_slots_in_use, count);
         core.release_receives(&outcome.slot_ids()).unwrap();

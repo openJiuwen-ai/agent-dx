@@ -433,6 +433,36 @@ pub struct PeerBatchDirectory {
     _root_use: root::RootUse,
 }
 
+/// Change stamp of the directory descriptor opened for a batch prepare.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PeerBatchDirectoryVersion {
+    device: u64,
+    inode: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl PeerBatchDirectoryVersion {
+    #[cfg(test)]
+    pub(crate) fn for_test(version: usize) -> Self {
+        Self {
+            device: 0,
+            inode: version as u64,
+            mtime: (0, 0),
+            ctime: (0, 0),
+        }
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
 /// Identity and version of a regular file a batch packs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerBatchEntry {
@@ -458,6 +488,12 @@ impl PeerBatchEntry {
 }
 
 impl PeerBatchDirectory {
+    /// Read the stamp from the same descriptor used for listing and opening children.
+    pub(crate) fn version(&self) -> Result<PeerBatchDirectoryVersion> {
+        let metadata = self.directory.metadata().map_err(Error::from)?;
+        Ok(PeerBatchDirectoryVersion::from_metadata(&metadata))
+    }
+
     /// Entry names in byte order, without `.` and `..`.
     pub fn names(&self) -> Result<Vec<OsString>> {
         self.directory.read_dir().map_err(Error::from)
@@ -12630,7 +12666,9 @@ mod tests {
         let directory = local
             .peer_batch_directory("node-b", &access, OsStr::new(""))
             .unwrap();
+        let first_version = directory.version().unwrap();
         let names = directory.names().unwrap();
+        assert_eq!(directory.version().unwrap(), first_version);
         assert_eq!(names, ["a", "b", "link", "sub"]);
         assert_eq!(directory.stat(OsStr::new("sub")).unwrap(), None);
         assert_eq!(directory.stat(OsStr::new("link")).unwrap(), None);
@@ -12642,6 +12680,24 @@ mod tests {
         let mut out = vec![0; 300];
         assert_eq!(file.read_at(0, &mut out).unwrap(), 300);
         assert!(out.iter().all(|byte| *byte == b'b'));
+        // Metadata comes from the opened directory and reflects name changes.
+        fs.mkdir(&ctx, workspace.inode, OsStr::new("new-sub"), 0o755)
+            .unwrap();
+        // Pin a distinct mtime so the assertion is independent of the backing
+        // filesystem timestamp granularity.
+        let physical = directory._root_use.data_dir();
+        local
+            .disk
+            .set_times(physical, None, Some(UNIX_EPOCH))
+            .unwrap();
+        assert_ne!(directory.version().unwrap(), first_version);
+        assert!(
+            directory
+                .names()
+                .unwrap()
+                .iter()
+                .any(|name| name == "new-sub")
+        );
         // The grant is validated for this peer, like any peer OPEN.
         assert!(
             local

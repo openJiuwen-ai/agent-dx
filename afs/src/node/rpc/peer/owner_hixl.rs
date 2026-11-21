@@ -566,46 +566,32 @@ impl OwnerHixlReader {
             slot_bytes: slot_bytes as u64,
             prior_release: lease.prior_release(),
         };
-        let started = Instant::now();
-        let prepared = prepare_with_retry(
-            &lease.session.client,
-            &prepare,
-            deadline,
-            |mut client, command| async move { client.prepare_read_hixl(command).await },
-        )
-        .await;
-        self.observe(Operation::Prepare, started.elapsed(), prepared.is_ok());
-        if prepared.is_err() {
-            lease.restore_prior_release(prepare.prior_release.as_ref());
-        }
-        let reply = match prepared {
+        let reply = match self
+            .prepare(
+                &mut lease,
+                &prepare,
+                prepare.prior_release.as_ref(),
+                deadline,
+                |mut client, command| async move { client.prepare_read_hixl(command).await },
+            )
+            .await
+        {
             Ok(reply) => reply,
             Err(error) if is_unsupported(&error) => {
                 lease.session.poisoned.store(true, Ordering::Release);
                 return Ok(Fetched::Fallback);
             }
-            Err(error) => {
-                if fences_session(&error) {
-                    lease.session.poisoned.store(true, Ordering::Release);
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let checksum = SlotChecksum::from_reply(lease.session.reply.slot_checksum_algorithm)
             .ok_or_else(|| protocol_error("OwnerFs HIXL slot checksum is not negotiated"))?;
         if let Err(error) = validate_prepare(&prepare, &reply, &remote, slot_bytes, slots, checksum)
         {
-            lease.session.poisoned.store(true, Ordering::Release);
-            if !reply.slots.is_empty() {
-                let _ = self
-                    .release(
-                        &lease.session,
-                        &(&reply).into(),
-                        HixlReleaseOutcome::NotSubmitted,
-                        false,
-                    )
-                    .await;
-            }
+            self.reject_prepare(
+                &lease.session,
+                (!reply.slots.is_empty()).then(|| (&reply).into()),
+            )
+            .await;
             return Err(error);
         }
         if reply.read == 0 {
@@ -685,6 +671,40 @@ impl OwnerHixlReader {
                 self.release_detached(lease, ticket, outcome, false);
                 Err(failure.error)
             }
+        }
+    }
+
+    async fn prepare<Req: Clone, Reply, SendReply>(
+        &self,
+        lease: &mut HomeLease,
+        request: &Req,
+        prior_release: Option<&OwnerReleaseHixlReadRequest>,
+        deadline: Instant,
+        send: impl Fn(OwnerFilesClient<Channel>, tonic::Request<Req>) -> SendReply,
+    ) -> afs_error::Result<Reply>
+    where
+        SendReply: std::future::Future<Output = Result<tonic::Response<Reply>, tonic::Status>>,
+    {
+        let started = Instant::now();
+        let result = prepare_with_retry(&lease.session.client, request, deadline, send).await;
+        self.observe(Operation::Prepare, started.elapsed(), result.is_ok());
+        if let Err(error) = &result {
+            lease.restore_prior_release(prior_release);
+            if fences_session(error) {
+                lease.session.poisoned.store(true, Ordering::Release);
+            }
+        }
+        result
+    }
+
+    /// Fences a session that returned an invalid reply and releases any
+    /// advertised slots without submitting a native read.
+    async fn reject_prepare(&self, session: &HomeSession, ticket: Option<ReadTicket>) {
+        session.poisoned.store(true, Ordering::Release);
+        if let Some(ticket) = ticket {
+            let _ = self
+                .release(session, &ticket, HixlReleaseOutcome::NotSubmitted, false)
+                .await;
         }
     }
 

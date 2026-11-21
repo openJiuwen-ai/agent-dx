@@ -29,7 +29,7 @@ const HIXL_TIMEOUT: u32 = 103_901;
 const HIXL_UNSUPPORTED: u32 = 103_905;
 const HIXL_RESOURCE_EXHAUSTED: u32 = 203_900;
 const MAX_WINDOW_BYTES: usize = 4 * 1024 * 1024;
-/// Relay HBM budget: `buffer_pool_count × buffer_pool_size_mib × 2 MiB`.
+/// Relay HBM budget: `buffer_pool_count 脳 buffer_pool_size_mib 脳 2 MiB`.
 const MAX_POOL_BYTES: usize = 512 * 1024 * 1024;
 /// One Host slot pool per device lane: 128 receive + 128 export slots of 4 MiB
 /// windows. The configuration bounds the sum over all lanes.
@@ -149,7 +149,7 @@ pub struct ExportWindow {
 ///
 /// The slot may contain bytes from a previous reservation. Publish only the
 /// prefix filled by this reservation, and release it through
-/// [`HixlRuntime::release_export`] whether or not it was published.
+/// [`HixlRuntime::release_exports`] whether or not it was published.
 #[derive(Debug)]
 pub struct ReservedExport {
     window: ExportWindow,
@@ -432,7 +432,6 @@ struct NativeReadWindow {
     slot_id: u64,
     remote_addr: u64,
     len: usize,
-    local_offset: usize,
 }
 
 #[cfg(any(feature = "hixl", test))]
@@ -659,6 +658,42 @@ impl<B: NativeBackend> RuntimeCore<B> {
         self.finish_export(slot_id, generation, length, native)
     }
 
+    fn reserve_exports(
+        &mut self,
+        lengths: &[usize],
+        deadline: Instant,
+    ) -> Result<Vec<ExportWindow>, HixlError> {
+        if lengths.is_empty() || lengths.len() > MAX_BATCH_WINDOWS {
+            return Err(HixlError::new(
+                HixlPhase::PrepareExport,
+                HixlErrorKind::InvalidArgument,
+                None,
+                "invalid export batch size",
+            ));
+        }
+        let mut windows = Vec::with_capacity(lengths.len());
+        for &length in lengths {
+            match self.reserve_export_slot(length, deadline) {
+                Ok(window) => windows.push(window),
+                Err(error) => {
+                    // Nothing was published. If rollback fails, release_export fences the lane.
+                    for window in windows {
+                        self.release_export(window.slot_id, window.generation)?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(windows)
+    }
+
+    fn release_exports(&mut self, slots: &[(u64, u64)]) -> Result<(), HixlError> {
+        for &(slot, generation) in slots {
+            self.release_export(slot, generation)?;
+        }
+        Ok(())
+    }
+
     fn claim_export_slot(
         &mut self,
         length: usize,
@@ -715,14 +750,14 @@ impl<B: NativeBackend> RuntimeCore<B> {
         native: Result<u64, NativeCallError>,
     ) -> Result<ExportWindow, HixlError> {
         let address = match native {
-            Ok(address) if address != 0 => address,
+            Ok(address) if address != 0 && usize::try_from(address).is_ok() => address,
             Ok(_) => {
                 self.quarantine_slot(false, slot_id);
                 return Err(HixlError::new(
                     HixlPhase::PrepareExport,
                     HixlErrorKind::EnginePoisoned,
                     None,
-                    "native export returned an empty address",
+                    "native export returned an unusable address",
                 ));
             }
             Err(error) => {
@@ -889,19 +924,13 @@ impl<B: NativeBackend> RuntimeCore<B> {
             self.receives[slot_id].state = SlotState::Active;
             slots.push(slot_id);
         }
-        let mut local_offset = 0_usize;
         let native_windows = windows
             .iter()
             .zip(&slots)
-            .map(|((remote_addr, len), slot_id)| {
-                let window = NativeReadWindow {
-                    slot_id: *slot_id as u64,
-                    remote_addr: *remote_addr,
-                    len: *len,
-                    local_offset,
-                };
-                local_offset += *len;
-                window
+            .map(|((remote_addr, len), slot_id)| NativeReadWindow {
+                slot_id: *slot_id as u64,
+                remote_addr: *remote_addr,
+                len: *len,
             })
             .collect::<Vec<_>>();
         let mut addresses = vec![0_u64; native_windows.len()];
@@ -1315,14 +1344,13 @@ enum Command {
         deadline: Instant,
         reply: SyncSender<Result<(), HixlError>>,
     },
-    ReserveExport {
-        length: usize,
+    ReserveExports {
+        lengths: Vec<usize>,
         deadline: Instant,
-        reply: SyncSender<Result<ExportWindow, HixlError>>,
+        reply: SyncSender<Result<Vec<ExportWindow>, HixlError>>,
     },
-    ReleaseExport {
-        slot_id: u64,
-        generation: u64,
+    ReleaseExports {
+        slots: Vec<(u64, u64)>,
         reply: SyncSender<Result<(), HixlError>>,
     },
     ReadBatch {
@@ -1500,17 +1528,16 @@ impl HixlRuntime {
         }
     }
 
-    /// Pins one export slot of `length` bytes for the caller to fill in place,
-    /// so the window never passes through a private copy. Release it through
-    /// [`Self::release_export`] whether or not it was published.
-    pub fn reserve_export(
+    /// Pins a batch of slots in one owner-thread command. On failure, unpublished
+    /// slots are returned to the pool or fenced if native cleanup is uncertain.
+    pub fn reserve_exports(
         &self,
-        length: usize,
+        lengths: Vec<usize>,
         deadline: Instant,
-    ) -> Result<ReservedExport, HixlError> {
+    ) -> Result<Vec<ReservedExport>, HixlError> {
         #[cfg(not(feature = "hixl"))]
         {
-            let _ = (length, deadline);
+            let _ = (lengths, deadline);
             Err(HixlError::unsupported(
                 HixlPhase::PrepareExport,
                 "afs-transport was built without the hixl feature",
@@ -1520,50 +1547,49 @@ impl HixlRuntime {
         {
             let (reply, receiver) = mpsc::sync_channel(1);
             self.send(
-                Command::ReserveExport {
-                    length,
+                Command::ReserveExports {
+                    lengths,
                     deadline,
                     reply,
                 },
                 HixlPhase::PrepareExport,
             )?;
-            let window = recv_reply(receiver, HixlPhase::PrepareExport)?;
-            let address = usize::try_from(window.address).map_err(|_| {
-                HixlError::new(
-                    HixlPhase::PrepareExport,
-                    HixlErrorKind::Internal,
-                    None,
-                    "native export address does not fit this process",
-                )
-            })?;
-            // SAFETY: the export pool is initialized at startup. Native has
-            // pinned this allocation of at least `length` bytes to this
-            // reservation, and shutdown and quarantine retain pinned slots.
-            Ok(unsafe {
-                ReservedExport::from_raw(window, std::ptr::with_exposed_provenance_mut(address))
-            })
+            let windows = recv_reply(receiver, HixlPhase::PrepareExport)?;
+            Ok(windows
+                .into_iter()
+                .map(|window| {
+                    // finish_export validated that this native address fits a pointer.
+                    let address = window.address as usize;
+                    // SAFETY: the owner pinned exclusive initialized memory for each
+                    // reservation and retains it through shutdown until it is released.
+                    unsafe {
+                        ReservedExport::from_raw(
+                            window,
+                            std::ptr::with_exposed_provenance_mut(address),
+                        )
+                    }
+                })
+                .collect())
         }
     }
 
-    /// Returns the export slot to the pool for reuse.
+    /// Returns a batch of slot generations to the pool in one owner command.
+    /// A failed release stops the batch; callers must fence uncertain slots.
     ///
     /// # Safety
-    ///
-    /// Every Rust borrow of the slot must have ended and no reservation may
-    /// access the slot again. If the descriptor was published, the caller
-    /// must also have established that no native READ can still access it.
+    /// All Rust borrows must have ended, reservations may no longer be used,
+    /// and no native READ may still access any of these slots.
     ///
     /// ```compile_fail,E0133
     /// use afs_transport::hixl::HixlRuntime;
-    ///
     /// fn release_by_id(runtime: &HixlRuntime, slot_id: u64, generation: u64) {
-    ///     runtime.release_export(slot_id, generation).unwrap();
+    ///     runtime.release_exports(vec![(slot_id, generation)]).unwrap();
     /// }
     /// ```
-    pub unsafe fn release_export(&self, slot_id: u64, generation: u64) -> Result<(), HixlError> {
+    pub unsafe fn release_exports(&self, slots: Vec<(u64, u64)>) -> Result<(), HixlError> {
         #[cfg(not(feature = "hixl"))]
         {
-            let _ = (slot_id, generation);
+            let _ = slots;
             Err(HixlError::unsupported(
                 HixlPhase::ReleaseExport,
                 "afs-transport was built without the hixl feature",
@@ -1573,11 +1599,7 @@ impl HixlRuntime {
         {
             let (reply, receiver) = mpsc::sync_channel(1);
             self.send(
-                Command::ReleaseExport {
-                    slot_id,
-                    generation,
-                    reply,
-                },
+                Command::ReleaseExports { slots, reply },
                 HixlPhase::ReleaseExport,
             )?;
             recv_reply(receiver, HixlPhase::ReleaseExport)
@@ -1802,22 +1824,18 @@ fn owner_loop<B: NativeBackend>(
                 let _ = reply.send(result);
                 false
             }
-            Command::ReserveExport {
-                length,
+            Command::ReserveExports {
+                lengths,
                 deadline,
                 reply,
             } => {
-                let result = core.reserve_export_slot(length, deadline);
+                let result = core.reserve_exports(&lengths, deadline);
                 update_status(&status, core.status());
                 let _ = reply.send(result);
                 false
             }
-            Command::ReleaseExport {
-                slot_id,
-                generation,
-                reply,
-            } => {
-                let result = core.release_export(slot_id, generation);
+            Command::ReleaseExports { slots, reply } => {
+                let result = core.release_exports(&slots);
                 update_status(&status, core.status());
                 let _ = reply.send(result);
                 false
@@ -1895,7 +1913,6 @@ mod ffi {
         pub slot_id: u64,
         pub remote_address: u64,
         pub length: u64,
-        pub local_offset: u64,
     }
 
     // SAFETY: these declarations mirror native/hixl.h. Rust keeps every
@@ -2541,11 +2558,6 @@ fn batch_descriptors(
                 length: u64::try_from(window.len).map_err(|_| NativeCallError {
                     status: None,
                     message: "native HIXL batch READ length does not fit the ABI".to_owned(),
-                    accepted: false,
-                })?,
-                local_offset: u64::try_from(window.local_offset).map_err(|_| NativeCallError {
-                    status: None,
-                    message: "native HIXL batch READ local offset does not fit the ABI".to_owned(),
                     accepted: false,
                 })?,
             })

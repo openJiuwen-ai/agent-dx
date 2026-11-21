@@ -23,14 +23,12 @@ typedef struct afs_hixl_window {
     uint64_t length;
 } afs_hixl_window_t;
 
-/* One read range submitted through the batch ABI.  `local_offset` is the
- * destination offset inside the caller's output buffer; ranges must not
- * overlap and every slot must be free for the whole call. */
+/* One remote read range and its destination receive slot. Each batch must use
+ * distinct free slots. Returned addresses follow descriptor order. */
 typedef struct afs_hixl_batch_window {
     uint64_t slot_id;
     uint64_t remote_address;
     uint64_t length;
-    uint64_t local_offset;
 } afs_hixl_batch_window_t;
 
 #define AFS_HIXL_MAX_BATCH_WINDOWS 64U

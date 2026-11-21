@@ -1129,6 +1129,116 @@ fn batch_prepare_packs_whole_files_in_name_order_from_the_anchor() {
 }
 
 #[test]
+fn consecutive_batch_pages_reuse_names_but_revalidate_the_grant_and_files() {
+    let (service, exports, source) = batch_fixture(8);
+    let session_id = session(&service);
+    let first = service
+        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "", 1))
+        .unwrap();
+    assert_eq!(first.next_name, b"e");
+
+    let mut denied = batch_request(session_id, "denied", "e", 1);
+    denied.access.as_mut().unwrap().fencing_token = "revoked".to_owned();
+    assert!(service.prepare_batch_blocking("node-b", denied).is_err());
+    assert_eq!(source.tree.listings.load(Ordering::SeqCst), 1);
+
+    // Content edits leave the names valid. The next page must use the current
+    // stat, then omit a file that changes between stat and open.
+    let updated = vec![71; 2048];
+    source.tree.write("d/e", updated.clone());
+    source.tree.rewrite_on_open("d/f");
+    let second = service
+        .prepare_batch_blocking("node-b", batch_request(session_id, "b2", "e", 1))
+        .unwrap();
+    assert_eq!(second.next_name, b"f");
+    assert_eq!(batch_files(&exports, &second), [("e".to_owned(), updated)]);
+    let third = service
+        .prepare_batch_blocking("node-b", batch_request(session_id, "b3", "f", 1))
+        .unwrap();
+    assert!(third.files.is_empty(), "f changed after its fresh stat");
+    assert_eq!(source.tree.listings.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn batch_name_snapshot_refreshes_after_membership_and_access_generation_changes() {
+    let (service, exports, source) = batch_fixture(8);
+    let session_id = session(&service);
+    let first = service
+        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "", 1))
+        .unwrap();
+    assert_eq!(first.next_name, b"e");
+
+    let added = vec![42; 600];
+    source.tree.insert("d/ea", added.clone());
+    let second = service
+        .prepare_batch_blocking("node-b", batch_request(session_id, "b2", "e", 1))
+        .unwrap();
+    assert_eq!(batch_files(&exports, &second)[1], ("ea".to_owned(), added));
+    assert_eq!(second.next_name, b"f");
+    assert_eq!(source.tree.listings.load(Ordering::SeqCst), 2);
+
+    let mut third = batch_request(session_id, "b3", "f", 1);
+    third.access.as_mut().unwrap().access_generation += 1;
+    let third = service.prepare_batch_blocking("node-b", third).unwrap();
+    assert_eq!(third.files[0].name, b"f");
+    assert_eq!(source.tree.listings.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn oversized_batch_name_snapshot_bypasses_reuse_without_truncating_pages() {
+    let (service, _exports, source) = batch_fixture(8);
+    let session_id = session(&service);
+    let suffix = "x".repeat(240);
+    let filler_count = MAX_OWNER_HIXL_BATCH_SNAPSHOT_BYTES / suffix.len() + 1;
+    for index in 0..filler_count {
+        source
+            .tree
+            .insert_directory(&format!("d/x{index:06}{suffix}"));
+    }
+    source.tree.insert("d/z", vec![1; 601]);
+    let first = service
+        .prepare_batch_blocking("node-b", batch_request(session_id, "b1", "x", 1))
+        .unwrap();
+    assert!(first.files.is_empty());
+    assert!(first.next_name.starts_with(b"x"));
+
+    let continuation = std::str::from_utf8(&first.next_name).unwrap();
+    let second = service
+        .prepare_batch_blocking("node-b", batch_request(session_id, "b2", continuation, 1))
+        .unwrap();
+    assert_eq!(second.files[0].name, b"z");
+    assert!(second.next_name.is_empty());
+    assert_eq!(source.tree.listings.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn batch_name_snapshot_evicts_old_directories_at_the_service_limit() {
+    let (service, _exports, source) = batch_fixture(8);
+    let session_id = session(&service);
+    for index in 0..=MAX_OWNER_HIXL_BATCH_SNAPSHOTS {
+        let parent = format!("other-{index}");
+        source.tree.insert_directory(&parent);
+    }
+    for index in 0..=MAX_OWNER_HIXL_BATCH_SNAPSHOTS {
+        let mut request = batch_request(session_id, &format!("b{index}"), "", 1);
+        request.parent_path = format!("other-{index}").into_bytes();
+        service.prepare_batch_blocking("node-b", request).unwrap();
+    }
+    for parent in [
+        format!("other-{MAX_OWNER_HIXL_BATCH_SNAPSHOTS}"),
+        "other-0".to_owned(),
+    ] {
+        let mut request = batch_request(session_id, &parent, "", 1);
+        request.parent_path = parent.into_bytes();
+        service.prepare_batch_blocking("node-b", request).unwrap();
+    }
+    assert_eq!(
+        source.tree.listings.load(Ordering::SeqCst),
+        MAX_OWNER_HIXL_BATCH_SNAPSHOTS + 2
+    );
+}
+
+#[test]
 fn batch_prepare_shares_slots_and_reports_the_end_of_the_directory() {
     let (service, exports, _) = batch_fixture(8);
     let session_id = session(&service);

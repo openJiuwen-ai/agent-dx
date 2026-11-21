@@ -97,12 +97,54 @@ impl ExportProvider for MemoryExports {
         self.slots
     }
 
-    fn reserve_export(
+    fn reserve_exports(
         &self,
         _lane: usize,
-        length: usize,
+        lengths: &[usize],
         _deadline: Instant,
-    ) -> Result<ReservedExport, HixlError> {
+    ) -> Result<Vec<ReservedExport>, HixlError> {
+        let mut group = Vec::with_capacity(lengths.len());
+        for &length in lengths {
+            match self.reserve_one(length) {
+                Ok(slot) => group.push(slot),
+                Err(error) => {
+                    for slot in group {
+                        let window = slot.window();
+                        self.release_one(window.slot_id, window.generation)?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(group)
+    }
+
+    unsafe fn release_exports(
+        &self,
+        _lane: usize,
+        slots: Vec<(u64, u64)>,
+    ) -> Result<(), HixlError> {
+        for (id, generation) in slots {
+            self.release_one(id, generation)?;
+        }
+        Ok(())
+    }
+
+    fn quarantine(&self) -> Result<(), HixlError> {
+        self.quarantines.fetch_add(1, Ordering::SeqCst);
+        if self.fail_quarantine.swap(false, Ordering::SeqCst) {
+            return Err(native_error(
+                HixlPhase::Quarantine,
+                HixlErrorKind::ResourceExhausted,
+                "injected quarantine failure",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl MemoryExports {
+    fn reserve_one(&self, length: usize) -> Result<ReservedExport, HixlError> {
         let ordinal = self.exports.fetch_add(1, Ordering::SeqCst) + 1;
         if self.fail_export_unsupported_at.load(Ordering::SeqCst) == ordinal {
             return Err(native_error(
@@ -160,16 +202,11 @@ impl ExportProvider for MemoryExports {
         Ok(reservation)
     }
 
-    unsafe fn release_export(
-        &self,
-        _lane: usize,
-        slot_id: u64,
-        generation: u64,
-    ) -> Result<(), HixlError> {
+    fn release_one(&self, slot_id: u64, generation: u64) -> Result<(), HixlError> {
         if self.fail_release.load(Ordering::SeqCst) {
             return Err(native_error(
                 HixlPhase::ReleaseExport,
-                HixlErrorKind::NativeFailure,
+                HixlErrorKind::EnginePoisoned,
                 "injected release failure",
             ));
         }
@@ -187,18 +224,6 @@ impl ExportProvider for MemoryExports {
                 "slot generation is not active",
             )),
         }
-    }
-
-    fn quarantine(&self) -> Result<(), HixlError> {
-        self.quarantines.fetch_add(1, Ordering::SeqCst);
-        if self.fail_quarantine.swap(false, Ordering::SeqCst) {
-            return Err(native_error(
-                HixlPhase::Quarantine,
-                HixlErrorKind::ResourceExhausted,
-                "injected quarantine failure",
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -246,12 +271,14 @@ pub(crate) struct MemoryTree {
     /// These paths are rewritten between the batch stat and its open.
     rewrite_on_open: Mutex<HashSet<Vec<u8>>>,
     pub(crate) listings: AtomicUsize,
+    directory_version: AtomicUsize,
     pub(crate) batch_opens: AtomicUsize,
 }
 
 impl MemoryTree {
     /// Adds a regular file whose identity is derived from its path.
     pub(crate) fn insert(&self, path: &str, data: Vec<u8>) {
+        self.directory_version.fetch_add(1, Ordering::SeqCst);
         self.entries.lock().unwrap().insert(
             path.as_bytes().to_vec(),
             MemoryEntry {
@@ -264,6 +291,7 @@ impl MemoryTree {
     }
 
     pub(crate) fn insert_directory(&self, path: &str) {
+        self.directory_version.fetch_add(1, Ordering::SeqCst);
         self.entries.lock().unwrap().insert(
             path.as_bytes().to_vec(),
             MemoryEntry {
@@ -323,6 +351,12 @@ struct MemoryDirectory {
 }
 
 impl OwnerBatchDirectory for MemoryDirectory {
+    fn version(&self) -> afs_error::Result<super::PeerBatchDirectoryVersion> {
+        Ok(super::PeerBatchDirectoryVersion::for_test(
+            self.tree.directory_version.load(Ordering::SeqCst),
+        ))
+    }
+
     fn names(&self) -> afs_error::Result<Vec<OsString>> {
         self.tree.listings.fetch_add(1, Ordering::SeqCst);
         let prefix = child_path(&self.parent, b"");
@@ -545,6 +579,12 @@ impl OwnerWindowSource for MemorySource {
         parent: &OsStr,
     ) -> afs_error::Result<Box<dyn OwnerBatchDirectory>> {
         self.authorize_transport(peer, access)?;
+        if access.fencing_token == "revoked" {
+            return Err(afs_error::Error::coded(
+                afs_error::NODE_OWNER_INVALID_GRANT,
+                "revoked batch grant",
+            ));
+        }
         let parent = parent.as_bytes().to_vec();
         if !parent.is_empty() && self.tree.get(&parent).is_none_or(|entry| entry.regular) {
             return Err(afs_error::Error::coded(

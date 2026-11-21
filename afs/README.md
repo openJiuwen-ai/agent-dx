@@ -92,10 +92,19 @@ HIXL/ACL 头文件及共享库的 Linux 环境中，可运行
 DFS 读写使用各自装配的 RDMA 或 gRPC 路径。
 `[hixl].transport` 默认 `"roce"`，A3 同 super-pod 域可用 `"hccs-buffer-pool"`，
 `[[hixl.additional_devices]]` 最多配置 16 个逻辑设备。
+每条 lane 分配普通 Host 接收槽和导出槽时，优先选择 NPU 的 PCI NUMA 节点。无法确定 PCI 节点时，才用 `sched_getaffinity` 读取实际分配槽的 owner 线程允许使用的 CPU；只有非空掩码中的每个 CPU 都能确认属于同一个 NUMA 节点时，才用该节点。没有可信节点、已有非默认内存策略或无法设置优先策略时，沿用原策略。
+
+`AFS_HIXL_NUMA` 启动日志报告 `source=pci|worker_cpu|unknown` 和 `policy=preferred|inherited`。节点偏好不保证物理页落点，不需要新增 TOML 配置，也不会自动绑核。
 
 配置键、并发建议与 A3 双机读测量见
 [部署文档](../docs/deployment/afs.md#ownerfs-hixl-预读窗口与目录批量)，协议与失败语义见
 [架构说明](../docs/architecture/afs.md)。A2 RoCE、多设备吞吐、并发 reader 与故障恢复尚未验收。
+
+### 后续计划：HIXL Fabric 内存
+
+AFS 计划支持 Fabric 内存。Mooncake 的 Ascend Fabric 物理内存分配路径使用 `(physical_dev_id / 4) * 2` 选择 `ACL_MEM_LOCATION_TYPE_HOST_NUMA` 的节点。该公式假设每四个物理设备对应一个 Fabric NUMA 节点，节点编号依次为 0、2、4、6。实现 AFS Fabric 分配时，需要按目标机型核对物理设备号与 Fabric 节点的映射。上述 PCI 和 owner 线程 CPU 回退规则仅适用于普通 Host 槽池。
+
+源码依据为 Mooncake 提交 `e1ea5d31bb5e46ff2df9f90e7c2fbaf52fcdee8c` 中的 `mooncake-transfer-engine/src/transport/ascend_transport/ascend_allocator.cpp`，函数 `allocate_physical_memory`。
 
 ## 当前能力边界
 

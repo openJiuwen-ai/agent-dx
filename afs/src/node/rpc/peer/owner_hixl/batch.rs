@@ -8,22 +8,18 @@
 //! not written the file since the batch was requested. An open claims its
 //! file's slice once and keeps it until release, like a window.
 
-use super::{
-    BudgetLease, OwnerHixlReader, ReadTicket, WindowBudget, fences_session, prepare_with_retry,
-    protocol_error,
-};
+use super::{BudgetLease, OwnerHixlReader, ReadTicket, WindowBudget, protocol_error};
 use crate::node::data_plane::hixl::{SlotChecksum, checked_slot_length};
-use crate::node::rpc::hixl::{Operation, is_unsupported};
+use crate::node::rpc::hixl::is_unsupported;
 use crate::node::vfs::ownerfs::OPEN_PREFETCH_LIMIT;
 use afs_protocol::node_data::{
-    HixlLane, HixlReleaseOutcome, OwnerPrepareBatchHixlReply, OwnerPrepareBatchHixlRequest,
-    RootAccess, owner_files_client::OwnerFilesClient,
+    HixlLane, OwnerPrepareBatchHixlReply, OwnerPrepareBatchHixlRequest, RootAccess,
+    owner_files_client::OwnerFilesClient,
 };
 use prost::bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tonic::transport::Channel;
@@ -575,27 +571,19 @@ impl OwnerHixlReader {
             max_file_bytes,
             prior_release: lease.prior_release(),
         };
-        let started = Instant::now();
-        let prepared = prepare_with_retry(
-            &lease.session.client,
-            &prepare,
-            deadline,
-            |mut client, command| async move { client.prepare_batch_hixl(command).await },
-        )
-        .await;
-        self.observe(Operation::Prepare, started.elapsed(), prepared.is_ok());
-        if prepared.is_err() {
-            lease.restore_prior_release(prepare.prior_release.as_ref());
-        }
-        let reply = match prepared {
+        let reply = match self
+            .prepare(
+                &mut lease,
+                &prepare,
+                prepare.prior_release.as_ref(),
+                deadline,
+                |mut client, command| async move { client.prepare_batch_hixl(command).await },
+            )
+            .await
+        {
             Ok(reply) => reply,
             Err(error) if is_unsupported(&error) => return Ok(BatchFetched::Unavailable),
-            Err(error) => {
-                if fences_session(&error) {
-                    lease.session.poisoned.store(true, Ordering::Release);
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let checksum = SlotChecksum::from_reply(lease.session.reply.slot_checksum_algorithm)
             .ok_or_else(|| protocol_error("OwnerFs HIXL slot checksum is not negotiated"))?;
@@ -603,17 +591,11 @@ impl OwnerHixlReader {
             match validate_batch_prepare(&prepare, &reply, &remote, slot_bytes, slots, checksum) {
                 Ok(files) => files,
                 Err(error) => {
-                    lease.session.poisoned.store(true, Ordering::Release);
-                    if !reply.slots.is_empty() {
-                        let _ = self
-                            .release(
-                                &lease.session,
-                                &(&reply).into(),
-                                HixlReleaseOutcome::NotSubmitted,
-                                false,
-                            )
-                            .await;
-                    }
+                    self.reject_prepare(
+                        &lease.session,
+                        (!reply.slots.is_empty()).then(|| (&reply).into()),
+                    )
+                    .await;
                     return Err(error);
                 }
             };

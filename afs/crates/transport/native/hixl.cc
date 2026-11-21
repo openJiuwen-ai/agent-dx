@@ -3,6 +3,7 @@
  * plane owns authorization and this layer owns only ACL/HIXL resources.
  */
 #include "hixl.h"
+#include "hixl_numa.h"
 
 #include <acl/acl_rt.h>
 #include <hixl/hixl.h>
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <exception>
@@ -44,15 +46,9 @@ struct HostSlot {
     bool quarantined = false;
 };
 
-struct RequestEntry {
-    size_t slot_id = 0;
-    size_t length = 0;
-    size_t local_offset = 0;
-};
-
 struct Request {
     hixl::TransferReq handle = nullptr;
-    std::vector<RequestEntry> entries;
+    std::vector<size_t> slot_ids;
     std::chrono::steady_clock::time_point dispatched_at{};
     bool active = false;
 };
@@ -60,7 +56,6 @@ struct Request {
 struct BatchPlan {
     std::vector<size_t> slot_ids;
     std::vector<hixl::TransferOpDesc> descriptors;
-    std::vector<RequestEntry> entries;
 };
 
 struct Runtime {
@@ -289,19 +284,27 @@ uint32_t initialize_acl(Runtime *runtime, char *error, size_t error_len) {
 uint32_t register_pool(Runtime *runtime,
                        std::vector<HostSlot> &pool,
                        bool for_export,
+                       afs_hixl_numa::HostNode numa_node,
                        char *error,
                        size_t error_len) {
     for (HostSlot &slot : pool) {
-        aclError status = aclrtMallocHost(&slot.address, runtime->window_bytes);
-        if (status != ACL_SUCCESS) {
-            return acl_status(status, error, error_len, "aclrtMallocHost");
+        afs_hixl_numa::ScopedPreference preference(numa_node.id);
+        const aclError status = aclrtMallocHost(&slot.address, runtime->window_bytes);
+        if (status == ACL_SUCCESS) {
+            slot.length = runtime->window_bytes;
+            // First-touch receive pages under the preference too. Exports must
+            // always be initialized before Rust borrows them as a byte slice.
+            if (for_export || preference.applied()) { std::memset(slot.address, 0, slot.length); }
         }
-        slot.length = runtime->window_bytes;
-        if (for_export) {
-            // Rust borrows the whole export slot as a writable byte slice.
-            // Initialize it once before handing out any such reservation.
-            std::memset(slot.address, 0, slot.length);
+        if (&slot == &pool.front() && !for_export) {
+            std::fprintf(stderr, "AFS_HIXL_NUMA device=%d node=%d policy=%s source=%s\n", runtime->device_id,
+                         numa_node.id, preference.applied() ? "preferred" : "inherited", numa_node.source);
         }
+        if (!preference.restore()) {
+            write_error(error, error_len, "failed to restore HIXL owner thread memory policy");
+            return kFailed;
+        }
+        if (status != ACL_SUCCESS) { return acl_status(status, error, error_len, "aclrtMallocHost"); }
         if (runtime->hccs_relay) {
             // Unregistered Host addresses select the SDK's BufferPool relay
             // path. Registering these would accidentally select direct H2H.
@@ -345,16 +348,20 @@ Request *find_free_request(Runtime *runtime) {
     return nullptr;
 }
 
-void quarantine_request(Runtime *runtime, Request &request) {
-    for (const RequestEntry &entry : request.entries) {
-        if (entry.slot_id < runtime->receive.size()) {
-            HostSlot &slot = runtime->receive[entry.slot_id];
+void quarantine_slots(Runtime *runtime, const std::vector<size_t> &slot_ids) {
+    for (size_t slot_id : slot_ids) {
+        if (slot_id < runtime->receive.size()) {
+            HostSlot &slot = runtime->receive[slot_id];
             slot.in_use = true;
             slot.quarantined = true;
         }
     }
-    request.active = false;
     runtime->poisoned = true;
+}
+
+void quarantine_request(Runtime *runtime, Request &request) {
+    quarantine_slots(runtime, request.slot_ids);
+    request.active = false;
 }
 
 uint32_t plan_batch(Runtime *runtime,
@@ -369,11 +376,8 @@ uint32_t plan_batch(Runtime *runtime,
         return kParamInvalid;
     }
     std::set<size_t> used_slots;
-    std::vector<std::pair<size_t, size_t>> local_ranges;
-    local_ranges.reserve(count);
     plan.slot_ids.reserve(count);
     plan.descriptors.reserve(count);
-    plan.entries.reserve(count);
     for (size_t index = 0; index < count; ++index) {
         const afs_hixl_batch_window_t &window = windows[index];
         if (window.slot_id >= runtime->receive.size()) {
@@ -401,29 +405,9 @@ uint32_t plan_batch(Runtime *runtime,
             write_error(error, error_len, "HIXL batch remote range is invalid");
             return kParamInvalid;
         }
-        if (window.local_offset > std::numeric_limits<size_t>::max() - window.length) {
-            write_error(error, error_len, "HIXL batch local range overflows");
-            return kParamInvalid;
-        }
-        local_ranges.emplace_back(static_cast<size_t>(window.local_offset),
-                                  static_cast<size_t>(window.local_offset + window.length));
-    }
-    std::sort(local_ranges.begin(), local_ranges.end());
-    for (size_t index = 1; index < local_ranges.size(); ++index) {
-        if (local_ranges[index].first < local_ranges[index - 1].second) {
-            write_error(error, error_len, "HIXL batch local ranges overlap");
-            return kParamInvalid;
-        }
-    }
-    for (size_t index = 0; index < count; ++index) {
-        const afs_hixl_batch_window_t &window = windows[index];
-        const size_t slot_id = static_cast<size_t>(window.slot_id);
-        HostSlot &slot = runtime->receive[slot_id];
         plan.slot_ids.push_back(slot_id);
         plan.descriptors.push_back(hixl::TransferOpDesc{
             reinterpret_cast<uintptr_t>(slot.address), window.remote_address, window.length});
-        plan.entries.push_back(RequestEntry{
-            slot_id, static_cast<size_t>(window.length), static_cast<size_t>(window.local_offset)});
     }
     return kSuccess;
 }
@@ -452,9 +436,9 @@ void fail_before_dispatch_for_test() {
 }
 #endif
 
-void pinned_addresses(const Runtime *runtime, const Request &request, uint64_t *slot_addresses) {
-    for (size_t index = 0; index < request.entries.size(); ++index) {
-        const HostSlot &slot = runtime->receive[request.entries[index].slot_id];
+void pinned_addresses(const Runtime *runtime, const std::vector<size_t> &slot_ids, uint64_t *slot_addresses) {
+    for (size_t index = 0; index < slot_ids.size(); ++index) {
+        const HostSlot &slot = runtime->receive[slot_ids[index]];
         slot_addresses[index] = reinterpret_cast<uint64_t>(slot.address);
     }
 }
@@ -590,9 +574,10 @@ extern "C" uint32_t afs_hixl_start(int32_t device_id,
             return status;
         }
         runtime->engine_initialized = true;
-        status = register_pool(runtime, runtime->receive, false, error, error_len);
+        const auto numa_node = afs_hixl_numa::preferred_node(device_id);
+        status = register_pool(runtime, runtime->receive, false, numa_node, error, error_len);
         if (status == kSuccess) {
-            status = register_pool(runtime, runtime->exports, true, error, error_len);
+            status = register_pool(runtime, runtime->exports, true, numa_node, error, error_len);
         }
         if (status != kSuccess) {
             cleanup_failed_start(holder, out_runtime);
@@ -787,7 +772,7 @@ extern "C" uint32_t afs_hixl_submit_read_batch(void *opaque,
 #ifdef AFS_HIXL_TEST_FAULT_INJECTION
         fail_before_dispatch_for_test();
 #endif
-        request->entries = plan.entries;
+        request->slot_ids.swap(plan.slot_ids);
         request->active = true;
         *dispatch_started = 1;
         invoked = true;
@@ -834,7 +819,6 @@ extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
     auto *runtime = static_cast<Runtime *>(opaque);
     bool invoked = false;
     bool reserved = false;
-    Request request;
     BatchPlan plan;
     if (dispatch_started == nullptr || sdk_transfer_ns == nullptr) {
         write_error(error, error_len, "missing HIXL batch read timing output");
@@ -862,8 +846,6 @@ extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
 #ifdef AFS_HIXL_TEST_FAULT_INJECTION
         fail_before_dispatch_for_test();
 #endif
-        request.entries = plan.entries;
-        request.active = true;
         // A non-successful synchronous call is still an uncertain submission.
         // Do not finalize the engine/HBM pools or free any Host window.
         *dispatch_started = 1;
@@ -874,16 +856,16 @@ extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
                                                           static_cast<int32_t>(timeout_ms));
         const auto sdk_end = std::chrono::steady_clock::now();
         if (status != kSuccess) {
-            quarantine_request(runtime, request);
+            quarantine_slots(runtime, plan.slot_ids);
             write_error(error, error_len, "HCCS relay batch READ outcome is uncertain; Host windows, HBM and engine retained");
             return status;
         }
         *sdk_transfer_ns = elapsed_nanoseconds(sdk_start, sdk_end);
-        pinned_addresses(runtime, request, slot_addresses);
+        pinned_addresses(runtime, plan.slot_ids, slot_addresses);
         return kSuccess;
     } catch (const std::exception &exception) {
         if (invoked) {
-            quarantine_request(runtime, request);
+            quarantine_slots(runtime, plan.slot_ids);
         } else if (reserved) {
             release_reservation(runtime, plan);
         }
@@ -891,7 +873,7 @@ extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
         return kFailed;
     } catch (...) {
         if (invoked) {
-            quarantine_request(runtime, request);
+            quarantine_slots(runtime, plan.slot_ids);
         } else if (reserved) {
             release_reservation(runtime, plan);
         }
@@ -976,16 +958,16 @@ extern "C" uint32_t afs_hixl_poll_read(void *opaque,
             return kSuccess;
         }
         if (transfer_status == hixl::TransferStatus::COMPLETED) {
-            if (slot_addresses == nullptr || slot_count != request->entries.size()) {
+            if (slot_addresses == nullptr || slot_count != request->slot_ids.size()) {
                 quarantine_request(runtime, *request);
                 write_error(error, error_len, "HIXL READ completion has the wrong slot count");
                 return kFailed;
             }
             *sdk_transfer_ns = elapsed_nanoseconds(request->dispatched_at,
                                                    std::chrono::steady_clock::now());
-            pinned_addresses(runtime, *request, slot_addresses);
+            pinned_addresses(runtime, request->slot_ids, slot_addresses);
             request->active = false;
-            request->entries.clear();
+            request->slot_ids.clear();
             *out_state = AFS_HIXL_POLL_COMPLETED;
             return kSuccess;
         }

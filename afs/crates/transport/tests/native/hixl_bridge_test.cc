@@ -4,14 +4,23 @@
 #include <acl/acl_rt.h>
 #include <hixl/hixl.h>
 #include <cassert>
+#include <cerrno>
+#include <climits>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <linux/mempolicy.h>
+#include <sched.h>
+#include <set>
 #include <string>
 #include <stdexcept>
 #include <sys/resource.h>
 #include <thread>
 #include <vector>
+
+static_assert(sizeof(afs_hixl_batch_window_t) == 3 * sizeof(uint64_t),
+              "batch ABI carries only slot, remote address and length");
 
 namespace {
 size_t allocations = 0;
@@ -41,6 +50,87 @@ const char *soc_name = "Ascend910_9391";
 bool fail_domain = false;
 int64_t domain_id = 7;
 uint32_t expected_listen_port = 0;
+
+const char *numa_pci_root = nullptr;
+const char *numa_cpu_root = nullptr;
+cpu_set_t numa_owner_mask;
+bool numa_owner_mask_available = false;
+size_t owner_cpus_calls = 0;
+constexpr int32_t numa_user_id = 2;
+constexpr int32_t numa_logic_id = 11;
+unsigned expected_numa_node = 3;
+size_t user_to_logic_calls = 0;
+size_t pci_address_calls = 0;
+size_t preferred_attempts = 0;
+size_t default_restores = 0;
+size_t fail_host_alloc_at = 0;
+bool reject_preferred = false;
+thread_local int current_policy = MPOL_DEFAULT;
+int initial_policy = MPOL_DEFAULT;
+std::vector<int> host_alloc_policies;
+}
+
+namespace afs_hixl_numa {
+const char *pci_root() { return numa_pci_root; }
+const char *cpu_root() { return numa_cpu_root; }
+
+bool owner_cpus(cpu_set_t &mask) {
+    ++owner_cpus_calls;
+    if (!numa_owner_mask_available) { return false; }
+    mask = numa_owner_mask;
+    return true;
+}
+
+bool pci_address(int32_t logic_id, unsigned &bus, unsigned &device, unsigned &function) {
+    assert(numa_pci_root != nullptr);
+    assert(logic_id == numa_logic_id);
+    ++pci_address_calls;
+    bus = 0x3a;
+    device = 0x0b;
+    function = 2;
+    return true;
+}
+
+long get_policy(int *mode) {
+    assert(numa_pci_root != nullptr);
+    *mode = current_policy;
+    return 0;
+}
+
+long set_policy(int mode, const unsigned long *mask, unsigned long maxnode) {
+    assert(numa_pci_root != nullptr);
+    if (mode == MPOL_PREFERRED) {
+        assert(current_policy == MPOL_DEFAULT);
+        assert(mask != nullptr && maxnode > expected_numa_node);
+        constexpr unsigned long word_bits = CHAR_BIT * sizeof(unsigned long);
+        const unsigned long words = 1 + (maxnode - 1) / word_bits;
+        for (unsigned long i = 0; i < words; ++i) {
+            const unsigned long expected = i == expected_numa_node / word_bits
+                ? 1UL << (expected_numa_node % word_bits) : 0;
+            assert(mask[i] == expected);
+        }
+        ++preferred_attempts;
+        if (reject_preferred) {
+            errno = EPERM;
+            return -1;
+        }
+    } else {
+        assert(mode == MPOL_DEFAULT && mask == nullptr && maxnode == 0);
+        assert(current_policy == MPOL_PREFERRED);
+        ++default_restores;
+    }
+    current_policy = mode;
+    return 0;
+}
+} // namespace afs_hixl_numa
+
+extern "C" aclError aclrtGetLogicDevIdByUserDevId(int32_t user_id, int32_t *logic_id) {
+    // All existing non-NUMA scenarios simulate unavailable topology.
+    if (numa_pci_root == nullptr) { return 1; }
+    assert(user_id == numa_user_id);
+    ++user_to_logic_calls;
+    *logic_id = numa_logic_id;
+    return ACL_SUCCESS;
 }
 
 extern "C" aclError aclInit(const char *) {
@@ -68,6 +158,13 @@ extern "C" aclError aclrtGetDeviceInfo(uint32_t, aclrtDevAttr attr, int64_t *val
     *value = domain_id; return ACL_SUCCESS;
 }
 extern "C" aclError aclrtMallocHost(void **address, size_t length) {
+    if (numa_pci_root != nullptr) {
+        host_alloc_policies.push_back(current_policy);
+        if (host_alloc_policies.size() == fail_host_alloc_at) {
+            *address = nullptr;
+            return 1;
+        }
+    }
     *address = std::malloc(length);
     assert(*address != nullptr);
     std::memset(*address, 0xa5, length);
@@ -111,6 +208,7 @@ Status Hixl::Initialize(const AscendString &, const std::map<AscendString, Ascen
 }
 void Hixl::Finalize() { ++finalizations; }
 Status Hixl::RegisterMem(const MemDesc &desc, MemType type, MemHandle &handle) {
+    assert(current_policy == initial_policy && "HIXL RegisterMem must not inherit the slot allocation policy");
     ++registrations;
     assert(!relay_mode);
     if (retain_failed_start && registrations == 2) { return UNSUPPORTED; }
@@ -164,7 +262,7 @@ Status Hixl::GetTransferStatus(const TransferReq &, TransferStatus &status) {
 
 static uint32_t submit_one(void *runtime, uint64_t slot_id, const char *peer, uint64_t remote_addr, size_t len,
                            void **out_request, uint32_t *dispatch_started, char *error, size_t error_len) {
-    afs_hixl_batch_window_t window{slot_id, remote_addr, len, 0};
+    afs_hixl_batch_window_t window{slot_id, remote_addr, len};
     return afs_hixl_submit_read_batch(runtime, peer, &window, 1, out_request, dispatch_started, error, error_len);
 }
 
@@ -175,12 +273,15 @@ static void copy_and_release(void *runtime, const afs_hixl_batch_window_t *windo
                              uint64_t *output_copy_ns, char *error, size_t error_len) {
     const auto copy_start = std::chrono::steady_clock::now();
     std::vector<uint64_t> slot_ids(count);
+    size_t copied_bytes = 0;
     for (size_t index = 0; index < count; ++index) {
-        assert(windows[index].local_offset + windows[index].length <= output_len);
-        std::memcpy(output + windows[index].local_offset,
+        assert(windows[index].length <= output_len - copied_bytes);
+        std::memcpy(output + copied_bytes,
                     reinterpret_cast<const void *>(static_cast<uintptr_t>(addresses[index])), windows[index].length);
+        copied_bytes += windows[index].length;
         slot_ids[index] = windows[index].slot_id;
     }
+    assert(copied_bytes == output_len);
     const auto copied = std::chrono::steady_clock::now() - copy_start;
     *output_copy_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(copied).count());
     assert(afs_hixl_release_receives(runtime, slot_ids.data(), count, error, error_len) == 0);
@@ -202,7 +303,7 @@ static uint32_t read_sync_into(void *runtime, const char *peer, const afs_hixl_b
 static uint32_t read_sync_one(void *runtime, uint64_t slot_id, const char *peer, uint64_t remote_addr, uint8_t *output,
                               size_t output_len, uint32_t timeout_ms, uint32_t *dispatch_started,
                               uint64_t *sdk_transfer_ns, uint64_t *output_copy_ns, char *error, size_t error_len) {
-    afs_hixl_batch_window_t window{slot_id, remote_addr, output_len, 0};
+    afs_hixl_batch_window_t window{slot_id, remote_addr, output_len};
     return read_sync_into(runtime, peer, &window, 1, output, output_len, timeout_ms, dispatch_started,
                           sdk_transfer_ns, output_copy_ns, error, error_len);
 }
@@ -222,13 +323,13 @@ static uint32_t poll_into(void *runtime, void *request, const afs_hixl_batch_win
 
 static uint32_t poll_one(void *runtime, void *request, uint8_t *output, size_t output_len, uint32_t *state,
                          uint64_t *sdk_transfer_ns, uint64_t *output_copy_ns, char *error, size_t error_len) {
-    afs_hixl_batch_window_t window{0, 0, output_len, 0};
+    afs_hixl_batch_window_t window{0, 0, output_len};
     return poll_into(runtime, request, &window, 1, output, output_len, state, sdk_transfer_ns, output_copy_ns,
                      error, error_len);
 }
 
 int main(int argc, char **argv) {
-    assert(argc == 2);
+    assert(argc >= 2);
     rlimit no_core{0, 0}; assert(setrlimit(RLIMIT_CORE, &no_core) == 0);
     // Each fake-boundary scenario owns its HCCL inputs independently of the
     // machine's real transport settings. Conflict scenarios set them below.
@@ -238,7 +339,63 @@ int main(int argc, char **argv) {
     void *runtime = nullptr;
     uint64_t actual_domain = 0;
     const std::string scenario(argv[1]);
-    relay_mode = scenario.find("hccs-") == 0;
+    relay_mode = scenario.find("hccs-") == 0 || scenario == "numa-relay";
+    if (scenario.find("numa-") == 0) {
+        assert(argc >= 5);
+        numa_pci_root = argv[2];
+        numa_cpu_root = argv[3];
+        numa_owner_mask_available = std::strcmp(argv[4], "mask") == 0;
+        assert(numa_owner_mask_available || (std::strcmp(argv[4], "failure") == 0 && argc == 5));
+        CPU_ZERO(&numa_owner_mask);
+        for (int i = 5; i < argc; ++i) {
+            const int cpu = std::stoi(argv[i]);
+            assert(cpu >= 0 && cpu < CPU_SETSIZE);
+            CPU_SET(cpu, &numa_owner_mask);
+        }
+
+        const bool pci_known = scenario == "numa-roce" || scenario == "numa-relay" ||
+            scenario == "numa-non-default" || scenario == "numa-set-rejected" || scenario == "numa-alloc-failure";
+        const bool worker_node_known = scenario == "numa-worker" || scenario == "numa-worker-non-default";
+        if (worker_node_known) { expected_numa_node = 4; }
+        reject_preferred = scenario == "numa-set-rejected";
+        if (scenario == "numa-non-default" || scenario == "numa-worker-non-default") { initial_policy = MPOL_BIND; }
+        const bool prefer = (pci_known || worker_node_known) && initial_policy == MPOL_DEFAULT && !reject_preferred;
+        current_policy = initial_policy;
+        if (scenario == "numa-alloc-failure") { fail_host_alloc_at = 2; }
+
+        const auto status = afs_hixl_start(numa_user_id, "127.0.0.1:7920", 0, 4, 1, 1,
+            relay_mode ? AFS_HIXL_TRANSPORT_HCCS_BUFFER_POOL : AFS_HIXL_TRANSPORT_ROCE,
+            relay_mode ? 4 : 0, relay_mode ? 8 : 0, &actual_domain, &runtime, error, sizeof(error));
+        if (fail_host_alloc_at != 0) {
+            assert(status != 0 && runtime == nullptr && allocations == 0);
+            assert(std::strstr(error, "aclrtMallocHost") != nullptr);
+        } else {
+            assert(status == 0 && runtime != nullptr && allocations == 2);
+        }
+        // Startup allocates one receive and one export slot. Even the failed
+        // allocation must observe the desired policy and restore it afterward.
+        const int expected = prefer ? MPOL_PREFERRED : initial_policy;
+        assert((host_alloc_policies == std::vector<int>{expected, expected}) &&
+               "both receive and export allocations must observe the expected policy");
+        assert(current_policy == initial_policy);
+        assert(user_to_logic_calls == 1 && pci_address_calls == 1);
+        assert(owner_cpus_calls == (pci_known ? 0U : 1U) &&
+               "only an unknown PCI node may trigger an owner CPU mask query");
+        if (prefer) {
+            assert(preferred_attempts == 2 && default_restores == 2);
+        } else if (reject_preferred) {
+            assert(preferred_attempts > 0 && default_restores == 0);
+        } else {
+            assert(preferred_attempts == 0 && default_restores == 0);
+        }
+        if (runtime != nullptr) {
+            assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == 0);
+            afs_hixl_destroy(runtime);
+            assert(allocations == 0);
+        }
+        return 0;
+    }
+    assert(argc == 2);
     if (scenario == "roce-listen-port" || scenario == "hccs-listen-port") { expected_listen_port = 27666; }
     if (scenario == "roce-max-listen-port") { expected_listen_port = 65535; }
     if (scenario == "roce-invalid-listen-port" || scenario == "hccs-invalid-listen-port") { expected_listen_port = 65536; }
@@ -382,11 +539,10 @@ int main(int argc, char **argv) {
         }
         std::vector<afs_hixl_batch_window_t> windows(window_count);
         for (size_t index = 0; index < window_count; ++index) {
-            windows[index].slot_id = index;
+            windows[index].slot_id = window_count - 1 - index;
             windows[index].remote_address =
                 reinterpret_cast<uintptr_t>(source_bytes.data() + index * window_bytes);
             windows[index].length = window_bytes;
-            windows[index].local_offset = index * window_bytes;
         }
         std::vector<uint8_t> output(total_bytes, 0);
         char rejection[512] = {};
@@ -415,9 +571,15 @@ int main(int argc, char **argv) {
         auto duplicate = windows;
         duplicate[1].slot_id = duplicate[0].slot_id;
         rejects(duplicate);
-        auto overlap = windows;
-        overlap[1].local_offset = 0;
-        rejects(overlap);
+        auto empty = windows;
+        empty[0].length = 0;
+        rejects(empty);
+        auto null_remote = windows;
+        null_remote[0].remote_address = 0;
+        rejects(null_remote);
+        auto overflowing_remote = windows;
+        overflowing_remote[0].remote_address = std::numeric_limits<uintptr_t>::max();
+        rejects(overflowing_remote);
         auto outside = windows;
         outside[0].slot_id = window_count;
         rejects(outside);
@@ -522,7 +684,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (scenario == "hccs-pinned-read") {
-        afs_hixl_batch_window_t window{0, reinterpret_cast<uintptr_t>(source), 4, 0};
+        afs_hixl_batch_window_t window{0, reinterpret_cast<uintptr_t>(source), 4};
         uint64_t address = 0;
         uint64_t sdk_ns = 0;
         sync_status = hixl::SUCCESS;

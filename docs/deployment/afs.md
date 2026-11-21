@@ -1213,10 +1213,16 @@ ownerfs_batch_max_file_bytes = 4194304
   可用的导出槽按比例减少，因此组大小必须满足上面的槽位约束。
 - `session_idle_ms`：reader 复用空闲会话的期限，默认 20000，范围 1..=20000。Home 会话过期仍为 30 秒。
 - `ownerfs_batch_read`：默认 `true`，把只读打开的小文件按目录批量取回；`ownerfs_batch_max_file_bytes`
-  是单文件上限（4097..=4194304，默认 4 MiB），文件不跨槽。
+  是单文件上限（4097..=4194304，默认 4 MiB），文件不跨槽。连续翻页可复用有序文件名；Home 最多保留 8 个目录快照，每个快照的名字分配不超过 1 MiB。超限目录仍可翻页，但每次重新枚举。每页重新验证读授权，每个文件仍检查当前身份和版本。
 - 其余 HIXL runtime 设置包括`transport`（`"roce"` 或 `"hccs-buffer-pool"`）、`device_id`、`engine_id`、
   `device_listen_port`、`[[hixl.additional_devices]]`（最多 16 个逻辑设备）、`window_bytes`
   （1..=4 MiB）和 buffer pool 参数。
+
+单卡部署仍使用原有的 `device_id`，无需新增 TOML 配置，也不会自动绑核。每条 lane 在启动时把 ACL 可见设备号转换成驱动逻辑号，通过 Host 驱动的 DSMI 查询 PCI 总线、设备和功能号，优先从 sysfs 中唯一匹配的 PCI 设备读取 `numa_node`。
+
+如果无法确定 PCI NUMA 节点（例如驱动未提供拓扑、PCI 地址跨域重名或 `numa_node` 未知），就在实际分配接收槽和导出槽的 owner 线程上调用 `sched_getaffinity`。只有 CPU 掩码非空，且其中所有允许 CPU 都能确认属于同一个 NUMA 节点时，才用该节点作为回退。若没有可信节点、线程已有非默认内存策略或内核拒绝设置优先策略，则沿用原策略；否则仅在 `aclrtMallocHost` 和首次触页期间使用 Linux `MPOL_PREFERRED`，随后恢复原策略。优先节点内存不足时 Linux 可从其他节点分配，因此不保证页落点。
+
+启动日志 `AFS_HIXL_NUMA` 的 `device` 是 ACL 可见设备号。`source=pci` 表示选用 PCI 节点，`source=worker_cpu` 表示选用 owner 线程允许 CPU 共同所属的节点，`source=unknown` 和 `node=-1` 表示未选出节点。独立的 `policy=preferred|inherited` 记录首个接收槽分配时是采用临时优先策略还是沿用原策略；节点来源不代表策略已应用，也不代表实际页落点。
 
 Home 在窗口和目录批量 Prepare 时，使用普通缓冲定位读，按文件偏移经页缓存填充导出槽。
 reader 仍通过 HIXL 拉取导出槽中的数据并校验槽摘要。

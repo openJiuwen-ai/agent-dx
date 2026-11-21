@@ -1378,3 +1378,16 @@ cargo test --locked -p afs --test config_contract --test node_health_contract
 ```
 
 RoCE、HCCS、多 lane、FUSE 真挂载和吞吐对比各需相应的 Linux 运行证据。组件测试范围限于软件契约。
+
+用 `cargo test --locked -p afs-transport --features hixl --test hixl_native_bridge` 做组件验证。对接收槽和导出槽核对这些契约：PCI 节点可用时优先使用 PCI；PCI 节点不可用时，`sched_getaffinity` 读取的是实际分配槽的 owner 线程，且只有非空掩码中的每个允许 CPU 都能确认属于同一个 NUMA 节点时才采用 CPU 回退；没有可信节点、已有非默认策略或无法设置优先策略时沿用原策略。还应核对临时策略在分配及首次触页后恢复，包括分配失败的路径。
+
+单卡真机验收时，用 `npu-smi info` 核对所选 NPU 的 PCI 地址，并用对应的 `numa_node` 核对 `AFS_HIXL_NUMA` 的 `source=pci`。核对 `source=worker_cpu` 时，确认 PCI 节点不可用，并检查实际分配槽的 owner 线程（`/proc/<pid>/task/<tid>/status` 的 `Cpus_allowed_list`）允许的全部 CPU 是否同属日志所示节点；无可信节点时预期 `source=unknown node=-1`。另核对 `policy=preferred|inherited`。无需修改 TOML，AFS 也不会自动绑核。
+
+日志报告节点来源和首个接收槽的分配策略，不保证实际页落点。另用槽地址对应的 `/proc/<pid>/numa_maps` 核对页数；若 `/dev/davinci_manager` 映射未报告页数且 `move_pages` 查询返回 `-EFAULT`，将实际落点记为未知。吞吐对比使用相同窗口、槽数和工作负载，并记录两组实际生效的策略。
+
+**RoCE 遗留事项（待双机真机验证）**
+
+- 断链恢复和停机：建连后中断链路，等待 SDK 心跳摘除 peer，再分别验证同端点重新协商后的首次读，以及不重连直接停机时的资源释放。检查本地已连接记录是否掩盖 SDK 的 `NOT_CONNECTED`。涉及未确认完成的读仍须隔离槽位。
+- 同 lane 并发：固定读组大小和缓存状态，用 1、2、4 个并发 reader 记录吞吐、读延迟 p99、`afs_hixl_reader_owner_queue_seconds` 与 `afs_hixl_reader_sdk_transfer_seconds`。据此判断 `WAITING` 后的 1 ms 轮询及 owner 排队是否需要调整。
+
+以上是未完成的 RoCE 验证；HCCS 组件基准不能替代这两项结果。

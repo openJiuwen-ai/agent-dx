@@ -181,5 +181,10 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # ownerfs_read_group_bytes = 33554432 # default; up to 128 MiB
 # session_idle_ms = 20000 # reader session reuse limit, 1..=20000
 # transport = "hccs-buffer-pool" # default "roce"; peers must match
-# device_id = 0
+# Host slots prefer the NPU PCI NUMA node. If unavailable, sched_getaffinity
+# reads the allocating owner thread's allowed CPUs; all must map to one NUMA node.
+# No candidate or an existing non-default policy means the original policy is inherited.
+# AFS_HIXL_NUMA reports source=pci|worker_cpu|unknown and policy=preferred|inherited.
+# This is a memory preference, not a page-placement guarantee. No extra key or CPU pinning.
+# device_id = 0  # ACL-visible NPU ID.
 # engine_id = "192.0.2.10:7920" # replace with this node's reachable IP:port

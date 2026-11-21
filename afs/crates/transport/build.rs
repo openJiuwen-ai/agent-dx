@@ -6,6 +6,8 @@ fn main() {
     println!("cargo:rerun-if-changed=native/rdma.h");
     println!("cargo:rerun-if-changed=native/hixl.cc");
     println!("cargo:rerun-if-changed=native/hixl.h");
+    println!("cargo:rerun-if-changed=native/hixl_numa.cc");
+    println!("cargo:rerun-if-changed=native/hixl_numa.h");
     println!("cargo:rerun-if-env-changed=ADX_CANN_PATH");
 
     if std::env::var_os("CARGO_FEATURE_RDMA").is_some() {
@@ -68,6 +70,7 @@ fn build_hixl() -> Result<(), String> {
         .cpp(true)
         .std("c++17")
         .file("native/hixl.cc")
+        .file("native/hixl_numa.cc")
         .include(&include)
         .compile("afs_transport_hixl");
     println!("cargo:rustc-env=AFS_HIXL_SDK_PATH={}", sdk.display());
@@ -84,6 +87,7 @@ fn build_hixl() -> Result<(), String> {
     }
     println!("cargo:rustc-link-lib=dylib=cann_hixl");
     println!("cargo:rustc-link-lib=dylib=ascendcl");
+    println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=metadef");
     println!("cargo:rustc-link-lib=dylib=graph");
     println!("cargo:rustc-link-lib=dylib=stdc++");

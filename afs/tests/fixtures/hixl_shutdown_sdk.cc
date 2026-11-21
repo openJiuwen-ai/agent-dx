@@ -42,6 +42,7 @@ aclError aclFinalize() {
     return ACL_SUCCESS;
 }
 
+aclError aclrtGetLogicDevIdByUserDevId(int32_t, int32_t *) { return ACL_ERROR_FEATURE_UNSUPPORTED; }
 aclError aclrtSetDevice(int32_t) { return ACL_SUCCESS; }
 aclError aclrtResetDevice(int32_t) { return ACL_SUCCESS; }
 aclError aclrtSetCurrentContext(aclrtContext) { return ACL_SUCCESS; }

@@ -21,24 +21,18 @@ pub(crate) trait ExportProvider: Send + Sync {
         vec![self.info()]
     }
     fn export_slots(&self, lane: usize) -> usize;
-    /// Pins one export slot for the caller to fill in place. Roll it back with
-    /// `release_export` like any prepared export.
-    fn reserve_export(
+    /// Reserves one group in descriptor order. On failure no slot is published;
+    /// failure to roll back a partial reservation fences the engine.
+    fn reserve_exports(
         &self,
         lane: usize,
-        length: usize,
+        lengths: &[usize],
         deadline: Instant,
-    ) -> Result<ReservedExport, HixlError>;
+    ) -> Result<Vec<ReservedExport>, HixlError>;
     /// # Safety
-    ///
-    /// Follow [`afs_transport::hixl::HixlRuntime::release_export`]: no Rust
-    /// borrow or native read may use this slot after release.
-    unsafe fn release_export(
-        &self,
-        lane: usize,
-        slot_id: u64,
-        generation: u64,
-    ) -> Result<(), HixlError>;
+    /// Follow [`afs_transport::hixl::HixlRuntime::release_exports`]: no Rust
+    /// borrow or native read may use these slots after release.
+    unsafe fn release_exports(&self, lane: usize, slots: Vec<(u64, u64)>) -> Result<(), HixlError>;
     fn quarantine(&self) -> Result<(), HixlError>;
 }
 
@@ -90,7 +84,7 @@ impl Drop for PendingExport<'_> {
         // never reached the reader; publication consumes the guard first.
         let result = unsafe {
             self.provider
-                .release_export(self.lane_id, window.slot_id, window.generation)
+                .release_exports(self.lane_id, vec![(window.slot_id, window.generation)])
         };
         if result.is_err() {
             self.rollback_failed.set(true);
@@ -122,28 +116,22 @@ impl ExportProvider for RuntimeExportProvider {
             .map_or(0, |runtime| runtime.status().export_slots)
     }
 
-    fn reserve_export(
+    fn reserve_exports(
         &self,
         lane: usize,
-        length: usize,
+        lengths: &[usize],
         deadline: Instant,
-    ) -> Result<ReservedExport, HixlError> {
+    ) -> Result<Vec<ReservedExport>, HixlError> {
         self.runtime
             .lane(lane)
             .ok_or_else(invalid_runtime_lane)?
-            .reserve_export(length, deadline)
+            .reserve_exports(lengths.to_vec(), deadline)
     }
 
-    unsafe fn release_export(
-        &self,
-        lane: usize,
-        slot_id: u64,
-        generation: u64,
-    ) -> Result<(), HixlError> {
+    unsafe fn release_exports(&self, lane: usize, slots: Vec<(u64, u64)>) -> Result<(), HixlError> {
         let runtime = self.runtime.lane(lane).ok_or_else(invalid_runtime_lane)?;
-        // SAFETY: the caller of this adapter guarantees local and native
-        // users of this generation have finished.
-        unsafe { runtime.release_export(slot_id, generation) }
+        // SAFETY: the caller established that every local and native user of these generations has finished.
+        unsafe { runtime.release_exports(slots) }
     }
 
     fn quarantine(&self) -> Result<(), HixlError> {

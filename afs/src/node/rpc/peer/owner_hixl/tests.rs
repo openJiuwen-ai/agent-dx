@@ -748,6 +748,17 @@ async fn auto_fills_only_the_tail_after_an_unsupported_prepare() {
         assert_eq!(data, content()[4000..5000]);
         assert_eq!(fixture.native.batches.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.handler.grpc_reads.load(Ordering::SeqCst), 1);
+        let pool = fixture.reader.home_pool("node-a").unwrap();
+        assert!(
+            pool.slots[0]
+                .lock()
+                .await
+                .session
+                .as_ref()
+                .unwrap()
+                .poisoned
+                .load(Ordering::Acquire)
+        );
         fixture.wait_released().await;
     }
 }
@@ -1415,6 +1426,56 @@ fn read_file(client: &OwnerPeerClient, path: &str) -> Vec<u8> {
         }
         all.extend_from_slice(&chunk);
     }
+}
+
+#[tokio::test]
+async fn unsupported_batch_leaves_the_session_available_for_a_window() {
+    let fixture = batch_fixture(batch_policy(DataMode::Auto), true).await;
+    fixture
+        .exports
+        .fail_export_unsupported_at
+        .store(1, Ordering::SeqCst);
+    let rpc = fixture.client.cloned_client().unwrap();
+    let result = fixture
+        .reader
+        .clone()
+        .fetch_batch(batch::BatchRequest {
+            home: "node-a".to_owned(),
+            client: rpc.clone(),
+            access: root_access(&grant()),
+            parent_path: b"d".to_vec(),
+            anchor: b"f00".to_vec(),
+            max_file_bytes: BATCH_SLOT as u64,
+            deadline: Instant::now() + Duration::from_secs(5),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(result, batch::BatchFetched::Unavailable));
+
+    let client = fixture.client.clone();
+    let file = blocking(move || open(&client, libc::O_RDONLY)).await;
+    let result = fixture
+        .reader
+        .clone()
+        .fetch(
+            FetchRequest {
+                home: "node-a".to_owned(),
+                client: rpc,
+                access: root_access(&grant()),
+                handle: file.handle,
+                offset: 0,
+                size: SLOT,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let Fetched::Window(window) = result else {
+        panic!("the existing session should still serve a window");
+    };
+    assert_eq!(window.bytes.as_ref(), &content()[..SLOT]);
+    assert_eq!(fixture.negotiations(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
