@@ -1,5 +1,7 @@
 """Verify a DFS write acknowledged while its replica is offline during rollout."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from hashlib import sha256
 import json
