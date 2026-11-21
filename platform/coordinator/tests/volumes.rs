@@ -635,6 +635,62 @@ fn starting(
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn long_named_environment_keeps_volume_authorization_across_execution_revisions() {
+    use adx_core::{EnvironmentState, MAX_RUNTIME_ID_BYTES};
+    let rig = common::Redis::new().await;
+    let session = store(&rig).await.begin(1).await.unwrap();
+    let candidate = claimant(&session, "node-a").await;
+    let mut definition = volume("workspace", "workspaces/tenant/user");
+    definition.access_mode = AccessMode::Exclusive;
+    session.ensure_volume(definition, &domains()).await.unwrap();
+    let id = format!("default-{}", "n".repeat(256));
+    let spec = environment(&id, "workspace");
+    let claimed = session.claim(spec.clone(), &candidate).await.unwrap();
+    let initial = session
+        .get_volume("tenant", "workspace")
+        .await
+        .unwrap()
+        .occupancy
+        .unwrap()
+        .runtime_id;
+    assert!(initial.len() <= MAX_RUNTIME_ID_BYTES);
+    let mut record = starting(spec, claimed.record().assignment.clone());
+    record.runtime.id = initial.clone();
+    session
+        .authorize_volumes(&record, &initial, &candidate.node_session_id)
+        .await
+        .unwrap();
+    record.state = EnvironmentState::Running;
+    record.revision = 2;
+    record.runtime.ip = Some("10.0.0.1".parse().unwrap());
+    session.commit(record.clone()).await.unwrap();
+    record.state = EnvironmentState::Starting;
+    record.revision = 3;
+    record.runtime.id = format!("{initial}-r3");
+    record.runtime.ip = None;
+    session
+        .authorize_volumes(&record, &initial, &candidate.node_session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .get_volume("tenant", "workspace")
+            .await
+            .unwrap()
+            .occupancy
+            .unwrap()
+            .runtime_id,
+        record.runtime.id
+    );
+    record.revision = 4;
+    assert!(session
+        .authorize_volumes(&record, &initial, &candidate.node_session_id)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn node_loss_releases_reserved_and_current_authorized_volumes_with_the_failed_assignment() {
     use adx_core::EnvironmentState;
     let mut rig = common::Redis::new().await;

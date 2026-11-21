@@ -23,19 +23,11 @@ impl RuntimeIdentity {
             return Ok(());
         }
         let version = |identity: &Self| -> Option<u64> {
-            let base = format!(
-                "{}-{}",
-                identity.environment_id, identity.ownership_generation
-            );
-            if identity.runtime_id == base {
-                Some(0)
-            } else {
-                identity
-                    .runtime_id
-                    .strip_prefix(&format!("{base}-r"))
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .filter(|n| *n > 0)
-            }
+            crate::runtime_revision(
+                &identity.environment_id,
+                identity.ownership_generation,
+                &identity.runtime_id,
+            )
         };
         match (version(previous), version(self)) {
             (Some(a), Some(b)) if b > a => Ok(()),

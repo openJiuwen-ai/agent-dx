@@ -400,7 +400,7 @@ impl StoredEnvironment {
             restart_attempts: 0,
             restart_pending: false,
             runtime: adx_core::Runtime {
-                id: format!("{}-{}", self.spec.id, self.assignment.generation),
+                id: adx_core::runtime_id(&self.spec.id, self.assignment.generation),
                 ip: None,
             },
             spec: self.spec.clone(),

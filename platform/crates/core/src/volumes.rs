@@ -254,7 +254,14 @@ impl Occupancy {
     /// Reject an incomplete owner or a runtime from a different execution generation.
     pub fn validate(&self) -> Result<()> {
         identifier(&self.volume_uid)?;
-        identifier(&self.assignment.environment_id)?;
+        // A qualified Environment ID joins a 256-byte namespace and name.
+        let environment = &self.assignment.environment_id;
+        if environment.trim().is_empty()
+            || environment.len() > 256 + 1 + 256
+            || environment.chars().any(char::is_control)
+        {
+            return Err(Error::Invalid("invalid volume Environment identity".into()));
+        }
         identifier(&self.assignment.node_id)?;
         identifier(&self.node_session_id)?;
         if self.assignment.generation == 0

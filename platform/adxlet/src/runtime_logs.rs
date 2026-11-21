@@ -58,7 +58,7 @@ impl RuntimeLogPolicy {
     pub fn paths(&self, runtime_id: &str) -> io::Result<(String, String)> {
         self.validate()?;
         if runtime_id.is_empty()
-            || runtime_id.len() > 240
+            || runtime_id.len() > adx_core::MAX_RUNTIME_ID_BYTES
             || matches!(runtime_id, "." | "..")
             || runtime_id
                 .chars()

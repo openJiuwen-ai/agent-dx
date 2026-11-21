@@ -708,9 +708,10 @@ impl Controller {
         // rollback after new execution grants have been revoked.
         let previous_runtime_id = self.record.runtime.id.clone();
         let next_revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        let runtime_id = format!(
-            "{}-{}-r{}",
-            self.record.spec.id, self.record.assignment.generation, next_revision
+        let runtime_id = adx_core::runtime_id_for_revision(
+            &self.record.spec.id,
+            self.record.assignment.generation,
+            next_revision,
         );
         self.services
             .admission

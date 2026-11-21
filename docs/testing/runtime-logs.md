@@ -1,6 +1,8 @@
 # Runtime stdout/stderr 日志
 
-Adxlet 在 sandboxd `StartRequest` 中设置宿主机重定向路径。Jiuwenbox Supervisor 使用同一节点日志策略，通过创建请求顶层的 `stdout` / `stderr` 传递宿主路径。Jiuwenbox 在降权前打开文件，daemon、后台 Execd 和 workload 继承输出描述符，无需挂载日志目录。每个执行代次使用独立的 `<runtime-id>.out` 和 `<runtime-id>.err`；`runtime-id` 是 ADX 的执行 ID，包含 Environment ID、generation，以及重启时的 `-rN` 后缀，不使用 sandboxd 生成的后端 ID。SDK 命令调用返回的 stdout/stderr 是另一条通道。
+Adxlet 在 sandboxd `StartRequest` 中设置宿主机重定向路径。Jiuwenbox Supervisor 使用同一节点日志策略，通过创建请求顶层的 `stdout` / `stderr` 传递宿主路径。Jiuwenbox 在降权前打开文件，daemon、后台 Execd 和 workload 继承输出描述符，无需挂载日志目录。每个执行代次使用独立的 `<runtime-id>.out` 和 `<runtime-id>.err`；`runtime-id` 是 ADX 的执行 ID，不使用 sandboxd 生成的后端 ID。SDK 命令调用返回的 stdout/stderr 是另一条通道。
+
+执行 ID 通常为 `<environment-id>-<generation>`，重启或恢复时追加 `-rN`。完整 ID（包括代次后缀）超过 240 字节时，主体使用 `rt_<environment-id的SHA256>_<generation>`，重启或恢复时仍追加 `-rN`，使执行 ID 保持在日志文件名上限内。公开的 Environment ID、name 和 namespace 保留原值。创建、资源预留、恢复及身份校验使用同一规则；已有记录和检查点中的原始执行 ID 仍可校验。日志文件名、回收清单和 Collector 的 `runtime_id` 都使用记录中的真实执行 ID。
 
 节点部署配置中的 `services[].config.runtime_logs` 控制此目录和已终止日志的回收：
 
