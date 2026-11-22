@@ -175,6 +175,13 @@ def state_identity(cluster):
     }
 
 
+def config_identity(cluster):
+    return {
+        role: cluster.channel(role).call("hash", path=remote_join(cluster.role_dir(role), "config.toml"))
+        for role in cluster.roles
+    }
+
+
 def prepare_catalog_case(cluster):
     cluster.write("A", "seed", SEED)
     cluster.python("A", "os.chmod(sys.argv[1],0o640)", remote_join(cluster.workspace("A"), "seed"))
@@ -195,12 +202,11 @@ def catalog_fingerprint(cluster, path):
     return {**digest, "metadata": metadata}
 
 
-def enable_catalog_adoption(cluster, enabled):
+def enable_catalog_adoption(cluster):
     cluster.python(
         "A", "from pathlib import Path\n"
-        "path=Path(sys.argv[1]);option='ownerfs_adopt_on_startup = true\\n';text=path.read_text()\n"
-        "path.write_text(text.removesuffix(option) + (option if sys.argv[2]=='yes' else ''))",
-        remote_join(cluster.role_dir("A"), "config.toml"), "yes" if enabled else "no", owner=False,
+        "with Path(sys.argv[1]).open('a') as config:config.write('ownerfs_adopt_on_startup = true\\n')",
+        remote_join(cluster.role_dir("A"), "config.toml"), owner=False,
     )
 
 
@@ -208,6 +214,7 @@ def catalog_recovery(cluster, old_inputs, new_inputs, old, new, phases):
     expected, location = prepare_catalog_case(cluster)
     recovery_point(cluster)
     original_state = cluster.record("state.initial", state_identity(cluster))
+    original_config = cluster.record("config.initial", config_identity(cluster))
     record = catalog_record(cluster, location["root_id"])
     original_record = cluster.channel("A").call("hash", path=record)
     original_wire = json.loads(cluster.command("A", ["cat", record])["stdout"])
@@ -216,12 +223,8 @@ def catalog_recovery(cluster, old_inputs, new_inputs, old, new, phases):
 
     def upgrade():
         install(cluster, new_inputs, new)
-        enable_catalog_adoption(cluster, True)
         start_all(cluster, new)
         check_seed(cluster, expected, location)
-        if original_wire["data_dir"] != "workspace":
-            cluster.python("A", "assert not os.path.lexists(sys.argv[1])",
-                           remote_join(cluster.mount("A"), original_wire["data_dir"]), owner=False)
         cluster.write("B", "after-upgrade", AFTER)
         wait_read(cluster, "A", "after-upgrade", AFTER)
         if "adopted" in original_wire:
@@ -241,10 +244,10 @@ def catalog_recovery(cluster, old_inputs, new_inputs, old, new, phases):
 
     def binary_rollback():
         quiesce(cluster)
-        enable_catalog_adoption(cluster, False)
         install(cluster, old_inputs, old)
         start_all(cluster, old)
         assert cluster.record("state.binary_rollback", state_identity(cluster)) == original_state
+        assert cluster.record("config.binary_rollback", config_identity(cluster)) == original_config
         assert cluster.channel("A").call("hash", path=record) == original_record
         check_seed(cluster, expected, location)
         wait_read(cluster, "A", "after-upgrade", AFTER)
@@ -288,7 +291,8 @@ def catalog_recovery(cluster, old_inputs, new_inputs, old, new, phases):
 def catalog_rejections(cluster, new_inputs, new, phases):
     _, location = prepare_catalog_case(cluster)
     record = catalog_record(cluster, location["root_id"])
-    original = json.loads(cluster.command("A", ["cat", record])["stdout"])
+    original_raw = cluster.command("A", ["cat", record])["stdout"]
+    original = json.loads(original_raw)
     storage = remote_join(cluster.role_dir("A"), "state/ownerfs")
     seed = remote_join(storage, original["data_dir"], "seed")
     unrelated = remote_join(storage, "adoption-canary")
@@ -297,15 +301,18 @@ def catalog_rejections(cluster, new_inputs, new, phases):
     paths = (seed, remote_join(unrelated, "file"))
     original_data = [catalog_fingerprint(cluster, path) for path in paths]
     install(cluster, new_inputs, new)
-    enable_catalog_adoption(cluster, True)
+    enable_catalog_adoption(cluster)
     start_role(cluster, "M", new)
     initial = json.loads(cluster.health("M", "/v1/store"))["entities"].get("root", 0)
 
-    def refuse(name, wire, diagnostic):
+    def write_test_record(raw):
         cluster.python(
             "A", "from pathlib import Path\nPath(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",
-            record, owner=False, stdin=json.dumps(wire, indent=2),
+            record, owner=False, stdin=raw,
         )
+
+    def refuse(name, wire, diagnostic):
+        write_test_record(json.dumps(wire, indent=2))
         before = catalog_fingerprint(cluster, record)
         log = remote_join(cluster.root("A"), "A.log")
         cluster.command("A", ["truncate", "-s", "0", log])
@@ -349,6 +356,20 @@ def catalog_rejections(cluster, new_inputs, new, phases):
     )
     for name, wire, diagnostic in samples:
         run_phase(phases, name, partial(refuse, name, wire, diagnostic))
+
+    if "adopted" not in original:
+        def recover_with_adoption_enabled():
+            write_test_record(original_raw)
+            start_role(cluster, "A", new)
+            start_role(cluster, "B", new)
+            cluster.topology()
+            wait_read(cluster, "B", "seed", SEED)
+            assert owner_identity(cluster) == location
+            cluster.python("A", "assert not os.path.lexists(sys.argv[1])",
+                           remote_join(cluster.mount("A"), original["data_dir"]), owner=False)
+            assert root_location(cluster, "adoption-canary")["status"] == "serving"
+
+        run_phase(phases, "legacy_directory_keeps_its_owner", recover_with_adoption_enabled)
 
 
 def command_counts(cluster, label):
