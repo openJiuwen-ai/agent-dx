@@ -165,7 +165,7 @@ def validate(config, cases):
 
 
 class Cluster:
-    def __init__(self, config, binary_dir, output, case, root_token):
+    def __init__(self, config, binary_dir, output, case, root_token, *, owner_bind_backing="workspace"):
         self.config = config
         self.binary_dir = Path(binary_dir)
         self.output = Path(output)
@@ -188,6 +188,7 @@ class Cluster:
         self.uid = config["uid"]
         self.gid = config["gid"]
         self.bind = False
+        self.owner_bind_backing = owner_bind_backing
         self.helpers = {}
         self.effective = {}
         self.memory_mounts = {}
@@ -425,7 +426,7 @@ class Cluster:
             raise Blocked("staged artifact could not be placed: " + name + ": " + copied["stderr"][-300:])
         return channel.call("hash", path=destination)["sha256"]
 
-    def prepare(self):
+    def prepare(self, *, ownerfs_bind=True, start_peers=True):
         infos = self.connect()
         identity = self.inputs(infos)
         binaries = list(identity["binaries"])
@@ -469,11 +470,13 @@ class Cluster:
                 self.gid,
                 owner=False,
             )
-            self.stop("A")
-            self.bind = True
-            self._configs()
-            self.start("A")
-            self.start("B")
+            if ownerfs_bind:
+                self.stop("A")
+                self.bind = True
+                self._configs()
+                self.start("A")
+            if start_peers:
+                self.start("B")
         else:
             self.python(
                 "A",
@@ -483,9 +486,13 @@ class Cluster:
                 self.gid,
                 owner=False,
             )
-            for role in self.roles[2:]:
-                self.start(role)
-        self.topology()
+            if start_peers:
+                for role in self.roles[2:]:
+                    self.start(role)
+        if start_peers:
+            self.topology()
+        else:
+            self.topology(roles=("A",))
         self.started = True
 
     def _tls(self):
@@ -694,14 +701,15 @@ class Cluster:
         for role in roles:
             self.start(role)
 
-    def topology(self):
-        for role in self.roles[1:]:
-            path = self.workspace(role) if role == "A" and self.mode == "ownerfs" else self.mount(role)
+    def topology(self, *, roles=None):
+        for role in self.roles[1:] if roles is None else roles:
+            owner_bind = role == "A" and self.mode == "ownerfs" and self.bind
+            path = self.workspace(role) if owner_bind else self.mount(role)
             try:
                 value = self.command(role, ["findmnt", "-J", "--mountpoint", path, "-o",
                                             "TARGET,SOURCE,FSTYPE,ID,OPTIONS,PROPAGATION"])
             except AssertionError:
-                if role == 'A' and self.mode == 'ownerfs':
+                if owner_bind:
                     try:
                         diagnostic = self.python(role, (HERE / 'bind_probe.py').read_text(), self.root(role),
                                                  self.token, owner=False, check=False)
@@ -710,21 +718,23 @@ class Cluster:
                         self.record('ownerfs.bind_diagnostic', {'diagnostic_error': str(error)})
                 raise
             mount = json.loads(value["stdout"])["filesystems"][0]
-            if role == "A" and self.mode == "ownerfs":
+            if owner_bind:
                 assert mount["fstype"] == "ext4", mount
                 options = set(mount.get('options', '').split(','))
                 assert {'nosuid', 'nodev'} <= options and mount.get('propagation') == 'private', (
                     'owner bind policy', mount
                 )
-                value = self.python(
+                self.python(
                     role,
                     (
                         "from pathlib import Path\np=Path(sys.argv[1]);a=os.stat(sys.argv[2]);"
-                        'b=(p/"workspace").stat();assert '
+                        "sources=list(p.glob(sys.argv[3]));assert len(sources)==1,sources;"
+                        "b=sources[0].stat();assert "
                         "(a.st_dev,a.st_ino)==(b.st_dev,b.st_ino)"
                     ),
                     self.role_dir(role) + "/state/ownerfs",
                     path,
+                    self.owner_bind_backing,
                     owner=False,
                 )
             else:

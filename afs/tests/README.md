@@ -398,6 +398,7 @@ Home/Meta重启允许有界30秒会话/缓存收敛，记录全部暂态错误�
 [五步总规范](../../docs/testing/test-strategy.md)。当前23项是第二/三步的**基础集合**，不是AFS全量覆盖。
 `--all`仅表示全部已登记case，不能据此宣称功能、兼容性、故障、长稳和性能均已覆盖。
 当前列表以`python3 afs/tests/run.py list`为准，覆盖缺口和优先级记入总规范，不另建一份平行清单。
+按同一用例 ID 查询业务断言、短 Prompt、选集和实跑证据见 [AFS 测试用例与编写 Prompt](../../docs/testing/afs-case-prompts.md)。
 改动 AFS 的阶段门禁除 `local-basic`、`s0-semantics` 外至少加跑 `local-resources`，并跑全部 9 个 AFS crate 的 Cargo 测试（不只主 crate）；只跑基础集合曾让两处失败漏过两个开发阶段。
 
 ### 目录各负责什么

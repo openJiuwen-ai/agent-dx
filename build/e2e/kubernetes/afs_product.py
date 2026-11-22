@@ -91,6 +91,10 @@ class Product:
         self.run.kube('-n', self.run.id, 'cp', node + ':' + source,
                       str(destination), '-c', 'platform', timeout=timeout)
 
+    def copy_to(self, node, source, destination, timeout=60):
+        self.run.kube('-n', self.run.id, 'cp', str(source),
+                      node + ':' + destination, '-c', 'platform', timeout=timeout)
+
     def sdk(self, config, destination):
         run = self.run
         run.execute('node1', 'python3', '-c',
@@ -106,6 +110,13 @@ class Product:
         return report
 
     def scenarios(self, checks):
+        import afs_sdk_compat
+
+        if afs_sdk_compat.requested():
+            if self.full:
+                raise ValueError('SDK compatibility requires the afs-sdk target')
+            afs_sdk_compat.scenarios(self, checks)
+            return
         run = self.run
         # Populate the runtime image cache before the AFS worker takes its mount baseline.
         self.sdk({'mode': 'warm'}, run.output / 'afs-sdk-warm.json')
