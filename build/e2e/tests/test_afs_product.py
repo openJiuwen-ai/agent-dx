@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from posixpath import join as remote_join
 import subprocess
 import tempfile
 import unittest
@@ -94,7 +95,7 @@ class ProductContracts(unittest.TestCase):
             env = {compat.DIRECTORY_ENV: directory, compat.BUILD_ENV: build, compat.COMMIT_ENV: commit}
             with patch.dict(os.environ, env), patch.dict(compat.CANDIDATES, {commit: (version, digest)}):
                 self.assertEqual(compat.install_wheel(product)['sha256'], digest)
-                product.copy_to.assert_called_once_with('node1', wheel.resolve(), '/tmp/' + wheel_name)
+                product.copy_to.assert_called_once_with('node1', wheel.resolve(), remote_join('/tmp', wheel_name))
                 wheel.write_bytes(b'new bytes under the same name')
                 with self.assertRaisesRegex(ValueError, 'SDK artifact digest mismatch'):
                     compat.install_wheel(product)

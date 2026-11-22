@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from posixpath import join as remote_join
 import re
 import shutil
 import subprocess
@@ -73,7 +74,7 @@ def install_wheel(product):
         if (manifest['build_id'] != build or manifest['version'] != version
                 or manifest['files'][wheel_name] != digest):
             raise ValueError('SDK manifest does not match the frozen wheel')
-        remote = '/tmp/' + wheel_name
+        remote = remote_join('/tmp', wheel_name)
         product.copy_to('node1', wheel, remote)
         try:
             if run.execute('node1', 'sha256sum', remote).split()[0] != digest:
@@ -128,25 +129,29 @@ def exercise(product, identity, cluster, output, record):
               'explicit_mkdir': identity['version'] == '0.1.0rc12'}
     if cluster.mode == 'ownerfs':
         home = owner_identity(cluster)
-        assert home['home_node_id'] == 'node-a', home
+        if home['home_node_id'] != 'node-a':
+            raise AssertionError(home)
         before = {op: owner_payload(cluster, 'B', 'client', op) for op in ('read', 'write')}
     else:
         config['replica_seed'] = REPLICA_SEED
     report = execute_probe(run, identity, config, output / 'sdk-result.json')
     if cluster.mode == 'ownerfs':
-        assert owner_identity(cluster) == home, home
+        if owner_identity(cluster) != home:
+            raise AssertionError(home)
         cluster.record('sdk.ownerfs.home', home)
         for op, old in before.items():
             current = owner_payload(cluster, 'B', 'client', op)
             cluster.record('sdk.ownerfs.grpc.' + op, {'before': old, 'after': current})
-            assert current - old >= report['cross_node']['bytes_each_way'], (op, old, current)
+            if current - old < report['cross_node']['bytes_each_way']:
+                raise AssertionError((op, old, current))
     else:
         body = REPLICA_SEED.encode() * 2048
         placement(cluster, body, ('node-a', 'node-b'), timeout=30)
         cluster.stop('A')
         stopped = cluster.channel('A').call('snapshot')
-        assert 'A' not in stopped['processes'] and not any(
-            line.split()[4] == cluster.mount('A') for line in stopped['mounts']), stopped
+        writer_mounted = any(line.split()[4] == cluster.mount('A') for line in stopped['mounts'])
+        if 'A' in stopped['processes'] or writer_mounted:
+            raise AssertionError(stopped)
         cluster.record('sdk.replica.writer_stopped', 'A')
         execute_probe(run, identity, {**config, 'phase': 'replica', 'replica_sha256': hashlib.sha256(body).hexdigest()},
                       output / 'sdk-replica.json')
@@ -161,7 +166,9 @@ def scenarios(product, checks):
     run = product.run
     identity = install_wheel(product)
     current = str(ROOT / 'afs/tests')
-    sys.path.insert(0, current)
+    path_added = current not in sys.path
+    if path_added:
+        sys.path.append(current)
     failures = []
     # #280 still puts the workspace in a per-root-generation directory.
     old_backing = 'root-' + 'workspace'.encode().hex() + '-e*'
@@ -218,5 +225,6 @@ def scenarios(product, checks):
         if failures:
             raise ValueError('; '.join(failures))
     finally:
-        sys.path.remove(current)
+        if path_added:
+            sys.path.remove(current)
         run.execute('node1', 'rm', '-rf', INSTALL_DIR)

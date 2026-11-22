@@ -52,7 +52,7 @@ def reject_b(cluster, healthy, incompatible):
                                           'node_protocol': incoming, 'meta_protocol': expected})
     try:
         cluster.start('B')
-    except RuntimeError:
+    except RuntimeError as exc:
         state = verify_b_unmounted(cluster)
         if state is None or state['returncode'] in (None, 0):
             raise
@@ -65,7 +65,7 @@ def reject_b(cluster, healthy, incompatible):
         reason = next((line for line in log.splitlines() if all(marker in line for marker in markers)), '')
         cluster.record('admission.rejection.B', {'exit': state, 'reason': reason, 'mounted': False})
         if not reason:
-            raise AssertionError(f'Node B failed without the expected native protocol refusal: {log[-1500:]}')
+            raise AssertionError(f'Node B failed without the expected native protocol refusal: {log[-1500:]}') from exc
         sessions(cluster, 1)
         try:
             cluster.stop('B')
@@ -73,7 +73,7 @@ def reject_b(cluster, healthy, incompatible):
             if verify_b_unmounted(cluster) is not None:
                 raise
         if verify_b_unmounted(cluster) is not None:
-            raise AssertionError('rejected Node B was not reaped')
+            raise AssertionError('rejected Node B was not reaped') from exc
     else:
         raise AssertionError('incompatible Node B reached readiness')
 

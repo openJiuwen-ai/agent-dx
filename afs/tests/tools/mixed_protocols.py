@@ -79,7 +79,8 @@ class MixedCluster(Cluster):
 def registration_status(cluster, role):
     body = json.loads(cluster.health(role))
     status = body['checks']['node_registration']
-    if body['id'] != NAMES[role] or not status['required'] or not status['ready'] or not status['session_id']:
+    ready = status['required'] and status['ready'] and status['session_id']
+    if body['id'] != NAMES[role] or not ready:
         raise AssertionError(f'Node-Meta registration not ready for {role}: {body}')
     return status
 
@@ -204,14 +205,20 @@ def exercise(config, old_inputs, new_inputs, output, selection, *, admission=Non
         profile = None
         if operation == 'replica':
             profile = DfsProfile(copies=2, replica_failure='degrade' if admission else 'strict')
-        case = Case(name, ('cluster-protocol',), mode, (), workloads[operation], profile=profile)
+        workload = workloads.get(operation)
+        if workload is None:
+            raise ValueError(f'unknown mixed-protocol operation: {operation}')
+        case = Case(name, ('cluster-protocol',), mode, (), workload, profile=profile)
         validate(config, [case])
         cluster = MixedCluster(config, case_output, case, inputs, identities, layout)
         record = {'id': name, 'status': 'failed', 'phases': {}, 'versions': cluster.role_versions}
         entries.append(record)
         phases = record['phases']
-        cluster.record('protocol.versions',
-                       {role: identities[version] for role, version in cluster.role_versions.items()})
+        try:
+            role_identities = {role: identities[version] for role, version in cluster.role_versions.items()}
+        except KeyError as exc:
+            raise ValueError(f'unknown mixed-protocol artifact identity: {exc}') from exc
+        cluster.record('protocol.versions', role_identities)
         signal.alarm(240)
         try:
             if admission:
