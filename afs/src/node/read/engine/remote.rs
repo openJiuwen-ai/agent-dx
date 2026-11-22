@@ -23,6 +23,9 @@ struct PeerRangeProgress {
     candidates: Vec<Vec<SourceCandidate>>,
     /// Operations whose candidates were already refreshed once.
     refreshed: Vec<bool>,
+    /// Operations whose sources were re-authorized after a cache holder
+    /// refused its grant (!297 P1), at most once each.
+    reauthorized: Vec<bool>,
     next: Vec<usize>,
     pending: Vec<usize>,
     last_error: Option<Error>,
@@ -32,6 +35,10 @@ struct PeerRangeProgress {
 
 /// Least time left in a read for a busy-refresh lookup to be worth it.
 const MIN_REFRESH_BUDGET: Duration = Duration::from_millis(50);
+/// Longest wait for one in-read source lookup (busy refresh or
+/// re-authorization); never more than half of the read's time left, so the
+/// read keeps time to retry the copies it already has (!297).
+const MAX_REFRESH_WAIT: Duration = Duration::from_millis(250);
 
 /// Backpressure retries mirror the replica sender (R71b): 5ms doubling to 200ms.
 const BUSY_BACKOFF_START: Duration = Duration::from_millis(5);
@@ -77,6 +84,7 @@ impl DfsReadEngine {
         let mut progress = PeerRangeProgress {
             candidates,
             refreshed: vec![false; batch.ops.len()],
+            reauthorized: vec![false; batch.ops.len()],
             next: vec![0; batch.ops.len()],
             pending: (0..batch.ops.len()).collect(),
             last_error: None,
@@ -221,7 +229,17 @@ impl DfsReadEngine {
             Err(error) => {
                 self.invalidate_native_batch_on_error(batch, &error);
                 if crate::node::fault::classify::read_authority_rejected(&error) {
-                    return Err(error);
+                    // A cache holder refuses a grant once its copy is retired
+                    // (Deleting at Meta). Ask Meta again for this version and
+                    // layout: a valid caller gets current sources and grants;
+                    // an invalid one is refused there too, and the read ends
+                    // with the denial as before (!297 P1).
+                    let error = self
+                        .retry_after_denial(round, group, &attempt, progress, error)
+                        .await?;
+                    progress.last_error = Some(error);
+                    progress.pending.extend_from_slice(group);
+                    return Ok(());
                 }
                 self.capture_native_read_authority()?;
                 // A full holder is backpressure, not a bad copy. When it is the
@@ -339,10 +357,7 @@ impl DfsReadEngine {
         // gate: concurrent refreshes here wait for one Meta query and reuse
         // its reply. The waiter is bounded by the read deadline.
         self.drop_unrefreshed_sources(&refresh, progress, &indices);
-        let fresh = match self
-            .sources_for_attempt_async(&refresh, true, round.deadline, Arc::new(()))
-            .await
-        {
+        let fresh = match self.lookup_in_read(round, &refresh).await {
             Ok(fresh) => fresh,
             Err(error) => {
                 afs_logging::debug!("dfs.read_busy_refresh_failed"; "error" => error.to_string());
@@ -376,6 +391,121 @@ impl DfsReadEngine {
             self.local.record_read_cache_event("busy_refreshed");
         }
         grew
+    }
+
+    /// One source lookup inside a read, bounded by its own short deadline
+    /// ([`MAX_REFRESH_WAIT`], at most half the time left) instead of the
+    /// read's deadline: a slow Meta cannot use up the time the read
+    /// needs to retry the copies it already has.
+    async fn lookup_in_read(
+        &self,
+        round: &PeerRangeRound<'_>,
+        refresh: &ReadBatch,
+    ) -> Result<Vec<ChunkSources>> {
+        let left = round.deadline.saturating_duration_since(Instant::now());
+        let deadline = Instant::now() + MAX_REFRESH_WAIT.min(left / 2);
+        self.sources_for_attempt_async(refresh, true, deadline, Arc::new(()))
+            .await
+    }
+
+    /// After an authority denial: `Ok(error)` when the operations got fresh
+    /// sources and grants and should be read again; `Err` ends the read with
+    /// the denial, or with Meta's own refusal of the caller.
+    async fn retry_after_denial(
+        &self,
+        round: &PeerRangeRound<'_>,
+        group: &[usize],
+        attempt: &PeerReadBatch,
+        progress: &mut PeerRangeProgress,
+        error: Error,
+    ) -> Result<Error> {
+        match self
+            .reauthorize_after_cache_denial(round, group, attempt, progress)
+            .await
+        {
+            Ok(true) => Ok(error),
+            Ok(false) => Err(error),
+            Err(lookup) if crate::node::fault::classify::read_authority_rejected(&lookup) => {
+                Err(lookup)
+            }
+            Err(_) => Err(error),
+        }
+    }
+
+    /// !297 P1: a cache holder answered PermissionDenied (its copy was
+    /// retired after this read's lookup). Re-acquire sources and grants for
+    /// the same version and layout, once per operation and within the read
+    /// deadline, without the refused copies. `Ok(false)`: nothing to retry
+    /// (no cache copy involved, no time, or no other copy); `Err`: Meta
+    /// refused the lookup (for example the caller itself is no longer valid).
+    async fn reauthorize_after_cache_denial(
+        &self,
+        round: &PeerRangeRound<'_>,
+        group: &[usize],
+        attempt: &PeerReadBatch,
+        progress: &mut PeerRangeProgress,
+    ) -> Result<bool> {
+        let refused: BTreeSet<&crate::dfs::CopyId> = attempt
+            .operations
+            .iter()
+            .filter(|item| item.source.role == CopyRole::VerifiedCache)
+            .map(|item| &item.source.copy_id)
+            .collect();
+        if refused.is_empty() {
+            return Ok(false);
+        }
+        for item in &attempt.operations {
+            self.demote_cache_copy(&item.source);
+        }
+        let indices: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|&index| !progress.reauthorized[index])
+            .collect();
+        if indices.is_empty()
+            || round.deadline.saturating_duration_since(Instant::now()) < MIN_REFRESH_BUDGET
+        {
+            return Ok(false);
+        }
+        for &index in &indices {
+            progress.reauthorized[index] = true;
+        }
+        let refresh = ReadBatch {
+            file_version_id: Some(round.version.clone()),
+            layout_root_id: round.batch.layout_root_id.clone(),
+            ops: indices
+                .iter()
+                .map(|&index| round.batch.ops[index].clone())
+                .collect(),
+            lookahead: Vec::new(),
+        };
+        let fresh = self.lookup_in_read(round, &refresh).await?;
+        let mut replaced = Vec::new();
+        for &index in &indices {
+            let chunk = &round.batch.ops[index].chunk_id;
+            let Some(mut set) = fresh.iter().find(|set| &set.chunk_id == chunk).cloned() else {
+                return Ok(false);
+            };
+            set.sources.retain(|s| self.source_matches(round.batch, s));
+            self.order_candidates(round.batch, &mut set);
+            let candidates: Vec<SourceCandidate> = set
+                .sources
+                .into_iter()
+                .filter(|source| {
+                    self.is_remote_candidate(source) && !refused.contains(&source.copy_id)
+                })
+                .collect();
+            if candidates.is_empty() {
+                return Ok(false);
+            }
+            replaced.push((index, candidates));
+        }
+        for (index, candidates) in replaced {
+            progress.candidates[index] = candidates;
+            progress.next[index] = 0;
+        }
+        self.local.record_read_cache_event("denied_reauthorized");
+        Ok(true)
     }
 
     /// Removes cached sources of the refreshed Chunks whose cached copy set
@@ -530,7 +660,13 @@ impl DfsReadEngine {
                     Err(error) => {
                         self.invalidate_native_batch_on_error(batch, &error);
                         if crate::node::fault::classify::read_authority_rejected(&error) {
-                            return Err(error);
+                            // Same rule as a batch denial (!297 P1).
+                            let error = self
+                                .retry_after_denial(round, &[index], &single_batch, progress, error)
+                                .await?;
+                            progress.last_error = Some(error);
+                            progress.pending.push(index);
+                            continue;
                         }
                         self.capture_native_read_authority()?;
                         self.note_suspect_copy(&error, item);

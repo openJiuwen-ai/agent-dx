@@ -519,7 +519,8 @@ pub(super) struct ReadCacheRuntime {
     /// every intent is fully verified again (CPU fix 1).
     fresh_installs: Mutex<HashMap<ChunkId, ReadCacheIntent>>,
     /// Reusable segment buffers (CPU fix 3), at most [`SEGMENT_POOL_BYTES`].
-    segment_pool: Mutex<Vec<Vec<u8>>>,
+    /// Each idle buffer keeps the segment-budget charge for its capacity.
+    segment_pool: Mutex<Vec<(Vec<u8>, StageCharge)>>,
     #[cfg(test)]
     pub(super) zero_fill_bytes: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -582,8 +583,12 @@ const MAX_FRESH_INSTALLS: usize = 1024;
 
 impl PartialCopy {
     /// Takes a first segment (offset 0) as the body without copying it.
-    fn adopt(&mut self, data: Vec<u8>) -> bool {
+    fn adopt(&mut self, mut data: Vec<u8>) -> bool {
         let end = data.len();
+        let length = self.job.chunk.length as usize;
+        // Grow (or trim) to exactly one Chunk, the partial budget's charge.
+        data.reserve_exact(length.saturating_sub(data.len()));
+        data.shrink_to(length);
         self.job.body = data;
         self.coverage = vec![Range { start: 0, end }];
         end as u64 == self.job.chunk.length
@@ -731,24 +736,37 @@ impl ReadCacheRuntime {
         self.take_fresh_install(intent)
     }
 
-    /// FUSE path: an empty buffer of at least `capacity`, from the pool when
-    /// one is free (never waits for the pool lock).
-    fn segment_buffer(&self, capacity: usize) -> Vec<u8> {
+    /// FUSE path: an empty buffer for `len` bytes together with the segment
+    /// budget charge for its whole capacity (!297 P2). A pooled buffer brings
+    /// its own charge; a new one is allocated at exactly `len` after the
+    /// charge succeeds. Never waits: `None` is a counted drop.
+    fn segment_buffer(&self, len: usize) -> Option<(Vec<u8>, StageCharge)> {
         if let Ok(mut pool) = self.segment_pool.try_lock()
-            && let Some(index) = pool.iter().position(|buffer| buffer.capacity() >= capacity)
+            && let Some(index) = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, (buffer, _))| buffer.capacity() >= len)
+                .min_by_key(|(_, (buffer, _))| buffer.capacity())
+                .map(|(index, _)| index)
         {
-            return pool.swap_remove(index);
+            return Some(pool.swap_remove(index));
         }
-        Vec::with_capacity(capacity)
+        let charge = self.segment_budget.try_charge(len as u64)?;
+        Some((Vec::with_capacity(len), charge))
     }
 
-    /// Assembler: return a consumed segment buffer for reuse.
-    fn recycle_segment(&self, mut buffer: Vec<u8>) {
+    /// Assembler: return a consumed segment buffer and its charge for reuse;
+    /// the pool holds at most a quarter of the segment budget.
+    fn recycle_segment(&self, mut buffer: Vec<u8>, charge: StageCharge) {
         buffer.clear();
+        if charge.bytes != buffer.capacity() as u64 {
+            return;
+        }
         if let Ok(mut pool) = self.segment_pool.lock() {
-            let held: usize = pool.iter().map(Vec::capacity).sum();
-            if held + buffer.capacity() <= SEGMENT_POOL_BYTES {
-                pool.push(buffer);
+            let held: u64 = pool.iter().map(|(_, charge)| charge.bytes).sum();
+            let cap = (SEGMENT_POOL_BYTES as u64).min(self.segment_budget.limit / 4);
+            if held + charge.bytes <= cap {
+                pool.push((buffer, charge));
             }
         }
     }
@@ -829,18 +847,13 @@ impl ReadCacheRuntime {
             local.record_read_cache_event("dropped_partial");
             return;
         }
-        let Some(charge) = self.segment_budget.try_charge(data.len() as u64) else {
+        // The queued buffer is charged for its whole capacity, which is only
+        // the segment's length (the assembler grows a first segment into the
+        // body itself, under the partial budget).
+        let Some((mut copy, charge)) = self.segment_buffer(data.len()) else {
             local.record_read_cache_event("dropped_segment_full");
             return;
         };
-        // The first segment is copied into a buffer the size of the whole
-        // Chunk, so the assembler can adopt it as the body without copying.
-        let wanted = if offset == 0 {
-            chunk.length as usize
-        } else {
-            data.len()
-        };
-        let mut copy = self.segment_buffer(wanted);
         copy.extend_from_slice(data);
         let segment = Segment {
             table,
@@ -918,23 +931,30 @@ impl ReadCacheRuntime {
         if copy.job.table.is_none() {
             copy.job.table = segment.table.clone();
         }
-        let Segment { offset, data, .. } = segment;
-        let complete =
-            if copy.coverage.is_empty() && offset == 0 && data.capacity() >= length as usize {
-                #[cfg(test)]
-                self.adopted_bodies
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                copy.adopt(data)
-            } else {
-                let done = copy.copy_range(offset, &data);
-                #[cfg(test)]
-                self.zero_fill_bytes.fetch_add(
-                    copy.last_zero_fill as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                self.recycle_segment(data);
-                done
-            };
+        let Segment {
+            offset,
+            data,
+            _charge: segment_charge,
+            ..
+        } = segment;
+        let complete = if copy.coverage.is_empty() && offset == 0 {
+            #[cfg(test)]
+            self.adopted_bodies
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The body is charged to the partial budget for the whole
+            // Chunk; the segment charge ends with the segment.
+            drop(segment_charge);
+            copy.adopt(data)
+        } else {
+            let done = copy.copy_range(offset, &data);
+            #[cfg(test)]
+            self.zero_fill_bytes.fetch_add(
+                copy.last_zero_fill as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.recycle_segment(data, segment_charge);
+            done
+        };
         if complete {
             // A complete body is never parked again: no later range would
             // ever resend it, so a full queue is a counted drop.
@@ -993,6 +1013,14 @@ impl ReadCacheRuntime {
     #[cfg(test)]
     pub(super) fn pooled_segments_for_test(&self) -> usize {
         self.segment_pool.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn pooled_segment_bytes_for_test(&self) -> u64 {
+        let pool = self.segment_pool.lock().unwrap();
+        pool.iter()
+            .map(|(buffer, _)| buffer.capacity() as u64)
+            .sum()
     }
 
     #[cfg(test)]
@@ -1345,6 +1373,108 @@ impl CacheJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h2_pr297_segment_budget_counts_allocated_capacity() {
+        const MIB: usize = 1024 * 1024;
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let cache =
+            ReadCacheRuntime::new("session".into(), 1 << 30, ReadCacheBudgets::default(), None);
+        let version = FileVersionId::new("version");
+        let batch = ReadBatch {
+            file_version_id: Some(version.clone()),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: Vec::new(),
+            lookahead: Vec::new(),
+        };
+        for seed in 0..32 {
+            let chunk = crate::node::chunk::StagedChunk::new(
+                crate::dfs::OperationId::new("segments"),
+                vec![seed; 4 * MIB],
+            )
+            .chunk;
+            cache.stage(
+                &local,
+                &batch,
+                &version,
+                &chunk,
+                1,
+                0,
+                &[seed; 128 * 1024],
+                None,
+            );
+        }
+        let mut receiver = cache.segment_receive.lock().unwrap().take().unwrap();
+        let segments: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        let allocated: usize = segments.iter().map(|segment| segment.data.capacity()).sum();
+        let charged = cache
+            .segment_budget
+            .used
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            allocated as u64 <= cache.segment_budget.limit,
+            "allocated={allocated} charged={charged} limit={}",
+            cache.segment_budget.limit
+        );
+        // The charge covers every byte of capacity the queued buffers hold.
+        assert!(
+            allocated as u64 <= charged,
+            "allocated={allocated} charged={charged}"
+        );
+    }
+
+    /// !297 P2: pooled segment buffers keep their charge while idle and hand
+    /// it on when reused, so the pool never holds uncharged capacity.
+    #[test]
+    fn h2_pr297_pooled_segment_buffers_stay_charged() {
+        const MIB: usize = 1024 * 1024;
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let cache =
+            ReadCacheRuntime::new("session".into(), 1 << 30, ReadCacheBudgets::default(), None);
+        let version = FileVersionId::new("version");
+        let batch = ReadBatch {
+            file_version_id: Some(version.clone()),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: Vec::new(),
+            lookahead: Vec::new(),
+        };
+        let chunk = crate::node::chunk::StagedChunk::new(
+            crate::dfs::OperationId::new("pool"),
+            vec![3; 4 * MIB],
+        )
+        .chunk;
+        for part in 0..4 {
+            cache.stage(
+                &local,
+                &batch,
+                &version,
+                &chunk,
+                1,
+                part * MIB,
+                &[3; MIB],
+                None,
+            );
+        }
+        cache.assemble_pending(&local);
+        let pooled: u64 = cache
+            .segment_pool
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(buffer, _)| buffer.capacity() as u64)
+            .sum();
+        assert!(pooled > 0);
+        let charged = cache
+            .segment_budget
+            .used
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            charged, pooled,
+            "idle pooled buffers are exactly what is charged"
+        );
+    }
 
     #[test]
     fn management_prefetch_shares_install_outcome_and_reopens_after_failure() {

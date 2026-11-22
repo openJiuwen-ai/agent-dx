@@ -47,6 +47,8 @@ struct MetaStub {
     fail_publish: Mutex<BTreeSet<ChunkId>>,
     /// Added to every source lookup from now on.
     lookup_delay_ms: std::sync::atomic::AtomicU64,
+    /// Lookups after this many are refused as an invalid caller (0 = never).
+    deny_after: AtomicUsize,
 }
 
 impl MetaStub {
@@ -60,7 +62,15 @@ impl MetaStub {
 
 impl ReadSourceProvider for MetaStub {
     fn sources_for(&self, request: DfsChunkSourcesRequest) -> Result<DfsChunkSourcesReply> {
-        self.lookups.fetch_add(1, Ordering::SeqCst);
+        let seen = self.lookups.fetch_add(1, Ordering::SeqCst);
+        let deny_after = self.deny_after.load(Ordering::SeqCst);
+        if deny_after != 0 && seen >= deny_after {
+            return Err(Error::new(
+                afs_error::CLIENT_REMOTE_STATUS,
+                afs_error::ErrorKind::PermissionDenied,
+                "DFS read source request requires a live caller session",
+            ));
+        }
         let mut reply = self.reply.lock().unwrap().clone();
         reply
             .chunks
@@ -112,6 +122,12 @@ impl ReadSourceProvider for MetaStub {
 #[derive(Default)]
 struct NodeTransfer {
     busy: Vec<String>,
+    /// With `Some(n)`, the busy nodes answer busy n times, then serve.
+    busy_answers: Option<AtomicUsize>,
+    retired: Vec<String>,
+    /// Nodes that fail every multi-operation batch with a transport error
+    /// (single operations go on to the checks below).
+    batch_unavailable: Vec<String>,
     /// Nodes that answer as if the copy were gone.
     missing: Vec<String>,
     attempts: Mutex<Vec<String>>,
@@ -120,15 +136,33 @@ struct NodeTransfer {
 
 impl ChunkTransfer for NodeTransfer {
     fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+        if let [first, _, ..] = batch.operations.as_slice()
+            && let CopyLocation::Node { node_id, .. } = &first.source.location
+            && self.batch_unavailable.contains(node_id)
+        {
+            self.attempts.lock().unwrap().push(node_id.clone());
+            return Err(unavailable("injected: batch transport failure"));
+        }
         for item in &batch.operations {
             let CopyLocation::Node { node_id, .. } = &item.source.location else {
                 return Err(invalid("node source expected"));
             };
             self.attempts.lock().unwrap().push(node_id.clone());
+            if self.retired.contains(node_id) {
+                return Err(Error::new(
+                    afs_error::CLIENT_REMOTE_STATUS,
+                    afs_error::ErrorKind::PermissionDenied,
+                    "read grant copy is not Ready",
+                ));
+            }
             if self.missing.contains(node_id) {
                 return Err(unavailable("injected: cache copy no longer present"));
             }
-            if self.busy.contains(node_id) {
+            let still_busy = self.busy_answers.as_ref().is_none_or(|left| {
+                left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            });
+            if self.busy.contains(node_id) && still_busy {
                 return Err(Error::new(
                     afs_error::CLIENT_REMOTE_STATUS,
                     afs_error::ErrorKind::ResourceExhausted,
@@ -1147,6 +1181,185 @@ fn h2_review_all_stale_candidates_are_kept_for_reauthorization() {
     assert_eq!(ordered[0].sources.len(), 2);
 }
 
+fn retired_cache_fixture(
+    fixture: &Fixture,
+) -> (DfsReadEngine, Arc<MetaStub>, Arc<NodeTransfer>, ChunkId) {
+    let chunk = ChunkId::new("retired-holder");
+    let meta = Arc::new(MetaStub::new(sources_reply(vec![(
+        chunk.clone(),
+        vec![
+            candidate("w", &chunk, "node-b", CopyRole::DurableReplica),
+            candidate("c", &chunk, "node-c", CopyRole::VerifiedCache),
+        ],
+    )])));
+    // The holder retired its copy after the reader's lookup: its first check
+    // of the old grant at Meta answers PermissionDenied (copy not Ready).
+    let transfer = Arc::new(NodeTransfer {
+        retired: vec!["node-c".into()],
+        ..Default::default()
+    });
+    let engine = fixture.engine(meta.clone(), transfer.clone(), DfsReadConfig::default());
+    (engine, meta, transfer, chunk)
+}
+
+/// !297 P1: a cache copy retired between source lookup and the holder's
+/// grant check does not fail a read that has a healthy durable copy: the
+/// read asks Meta again (same version and layout, inside its deadline) and
+/// reads the durable copy.
+#[test]
+fn h2_pr297_retired_cache_does_not_fail_the_read() {
+    let fixture = Fixture::new();
+    let (engine, meta, transfer, chunk) = retired_cache_fixture(&fixture);
+    let mut out = [0; 4];
+    let result = engine.read_batch(&read_op(chunk, 4), &mut out);
+    assert!(
+        result.is_ok(),
+        "{result:?}; attempts: {:?}",
+        transfer.attempts.lock().unwrap()
+    );
+    assert_eq!(out, [7; 4]);
+    assert_eq!(
+        *transfer.attempts.lock().unwrap(),
+        vec!["node-c".to_owned(), "node-b".to_owned()]
+    );
+    assert_eq!(
+        meta.lookups.load(Ordering::SeqCst),
+        2,
+        "sources were authorized again"
+    );
+}
+
+/// !297 P1 control: when Meta also refuses the caller (its own session or
+/// grant is no longer valid), the read still ends with the denial and no
+/// other copy is read on the old grants.
+#[test]
+fn h2_pr297_invalid_caller_is_still_denied() {
+    let fixture = Fixture::new();
+    let (engine, meta, transfer, chunk) = retired_cache_fixture(&fixture);
+    meta.deny_after.store(1, Ordering::SeqCst);
+    let error = engine
+        .read_batch(&read_op(chunk, 4), &mut [0; 4])
+        .unwrap_err();
+    assert_eq!(error.kind(), afs_error::ErrorKind::PermissionDenied);
+    assert_eq!(
+        *transfer.attempts.lock().unwrap(),
+        vec!["node-c".to_owned()]
+    );
+    assert_eq!(meta.lookups.load(Ordering::SeqCst), 2);
+}
+
+/// Two Chunks whose only cache holder (node-c) fails their shared batch
+/// with a transport error and then refuses each single retry because its
+/// copies were retired; node-b holds the durable copies.
+fn retired_cache_singly_fixture(
+    fixture: &Fixture,
+) -> (DfsReadEngine, Arc<MetaStub>, Arc<NodeTransfer>, ReadBatch) {
+    let chunks = [ChunkId::new("retired-1"), ChunkId::new("retired-2")];
+    let meta = Arc::new(MetaStub::new(sources_reply(
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(n, chunk)| {
+                (
+                    chunk.clone(),
+                    vec![
+                        candidate(&format!("w{n}"), chunk, "node-b", CopyRole::DurableReplica),
+                        candidate(&format!("c{n}"), chunk, "node-c", CopyRole::VerifiedCache),
+                    ],
+                )
+            })
+            .collect(),
+    )));
+    let transfer = Arc::new(NodeTransfer {
+        retired: vec!["node-c".into()],
+        batch_unavailable: vec!["node-c".into()],
+        ..Default::default()
+    });
+    let engine = fixture.engine(meta.clone(), transfer.clone(), DfsReadConfig::default());
+    let mut batch = read_op(chunks[0].clone(), 4);
+    let mut second = batch.ops[0].clone();
+    second.chunk_id = chunks[1].clone();
+    second.output_offset = 4;
+    batch.ops.push(second);
+    (engine, meta, transfer, batch)
+}
+
+/// !297 P1 on the single-retry path: after a batch error, a cache holder
+/// that refuses the single retry (copy retired) does not fail the read; the
+/// sources are authorized again and the durable copies are read.
+#[test]
+fn h2_pr297_retired_cache_on_single_retry_does_not_fail_the_read() {
+    let fixture = Fixture::new();
+    let (engine, meta, transfer, batch) = retired_cache_singly_fixture(&fixture);
+    let mut out = [0; 8];
+    let result = engine.read_batch(&batch, &mut out);
+    let attempts = transfer.attempts.lock().unwrap().clone();
+    assert!(result.is_ok(), "{result:?}; attempts: {attempts:?}");
+    assert_eq!(out, [7; 8]);
+    assert_eq!(attempts[..2], ["node-c".to_owned(), "node-c".to_owned()]);
+    assert_eq!(
+        *transfer.served.lock().unwrap(),
+        vec!["node-b".to_owned(), "node-b".to_owned()]
+    );
+    assert!(meta.lookups.load(Ordering::SeqCst) >= 2);
+}
+
+/// Control for the single-retry path: when Meta refuses the caller too, the
+/// read still ends with the denial and nothing is read on the old grants.
+#[test]
+fn h2_pr297_invalid_caller_on_single_retry_is_still_denied() {
+    let fixture = Fixture::new();
+    let (engine, meta, transfer, batch) = retired_cache_singly_fixture(&fixture);
+    meta.deny_after.store(1, Ordering::SeqCst);
+    let error = engine.read_batch(&batch, &mut [0; 8]).unwrap_err();
+    assert_eq!(error.kind(), afs_error::ErrorKind::PermissionDenied);
+    assert!(transfer.served.lock().unwrap().is_empty());
+    assert_eq!(meta.lookups.load(Ordering::SeqCst), 2);
+}
+
+/// !297 P2: a slow Meta cannot spend the whole read on a busy refresh. The
+/// writer answers busy twice and then recovers while Meta stays slow: the
+/// refresh gives up on its own short deadline and the read completes from
+/// the writer.
+#[test]
+fn h2_pr297_slow_refresh_leaves_time_to_retry_the_writer() {
+    let fixture = Fixture::new();
+    let chunk = ChunkId::new("busy-then-ok");
+    let meta = Arc::new(MetaStub::new(sources_reply(vec![(
+        chunk.clone(),
+        vec![candidate("w", &chunk, "node-b", CopyRole::DurableReplica)],
+    )])));
+    let transfer = Arc::new(NodeTransfer {
+        busy: vec!["node-b".into()],
+        busy_answers: Some(AtomicUsize::new(2)),
+        ..Default::default()
+    });
+    let engine = fixture
+        .engine(meta.clone(), transfer.clone(), DfsReadConfig::default())
+        .with_distributed_cache("session".into(), 1 << 30);
+    let sources = engine.sources_for(&read_op(chunk.clone(), 4)).unwrap();
+    meta.lookup_delay_ms.store(10_000, Ordering::SeqCst);
+    let mut out = [0; 4];
+    let started = Instant::now();
+    engine
+        .transfer
+        .block_on_read(Box::pin(engine.read_remote_ranges_async(
+            &read_op(chunk, 4),
+            &sources,
+            &mut out,
+            true,
+            Some(Instant::now() + Duration::from_secs(2)),
+        )))
+        .unwrap();
+    assert_eq!(out, [7; 4]);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(*transfer.served.lock().unwrap(), vec!["node-b".to_owned()]);
+}
+
 /// The installer keeps draining while a publication is in progress
 /// (installation and publication run in separate tasks).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1246,7 +1459,11 @@ fn h2_partial_concurrent_completions_do_not_lose_segments() {
     assert_eq!(fixture.metric(&cache_event("dropped_partial")), 0);
     assert_eq!(fixture.metric(&cache_event("dropped_segment_full")), 0);
     assert_eq!(fixture.metric(&resource("partial_bytes")), 0);
-    assert_eq!(fixture.metric(&resource("segment_bytes")), 0);
+    // Only idle pooled buffers stay charged to the segment budget (!297 P2).
+    assert_eq!(
+        fixture.metric(&resource("segment_bytes")),
+        cache.pooled_segment_bytes_for_test()
+    );
 }
 
 /// A partial body that lost a segment is released after `PARTIAL_MAX_AGE`

@@ -303,6 +303,7 @@ pub(crate) const READ_CACHE_EVENTS: &[&str] = &[
     "publish_verify_skipped",
     "crc_table_reused",
     "crc_table_built",
+    "denied_reauthorized",
 ];
 /// Where a native read's bytes came from: this Node, a durable replica, or
 /// another reader's verified cache copy.
