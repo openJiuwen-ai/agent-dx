@@ -59,8 +59,8 @@ def install_wheel(product):
         raise ValueError(BUILD_ENV + ' must be a Buildkite build UUID')
     if commit not in CANDIDATES:
         raise ValueError(COMMIT_ENV + ' must identify the frozen #280 or #294 wheel')
-    product = run.harness['product_commit']
-    if product not in CANDIDATES:
+    server_commit = run.harness['product_commit']
+    if server_commit not in CANDIDATES:
         raise ValueError('SDK matrix requires a frozen #280 or #294 server')
     version, digest = CANDIDATES[commit]
     wheel_name = 'adx_environment-' + version + '-py3-none-any.whl'
@@ -83,7 +83,7 @@ def install_wheel(product):
         finally:
             run.execute('node1', 'rm', '-f', remote)
     identity = {'build': build, 'commit': commit, 'version': version, 'wheel': wheel_name,
-                'sha256': digest, 'install_dir': INSTALL_DIR, 'server_commit': product}
+                'sha256': digest, 'install_dir': INSTALL_DIR, 'server_commit': server_commit}
     (run.output / 'afs-sdk-compat-identity.json').write_text(json.dumps(identity, indent=2) + '\n')
     return identity
 
