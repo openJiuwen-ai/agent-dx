@@ -69,6 +69,7 @@ impl GrpcChunkTransfer {
     ) -> afs_error::Result<()> {
         self.runtime
             .block_on(self.read_crc32c_attempt_async(batch, chunk, out, None))
+            .map(|_| ())
     }
 
     pub(super) async fn read_crc32c_attempt_async(
@@ -77,7 +78,7 @@ impl GrpcChunkTransfer {
         chunk: &ChunkObject,
         out: &mut [u8],
         deadline: Option<std::time::Instant>,
-    ) -> afs_error::Result<()> {
+    ) -> afs_error::Result<Option<CrcTable>> {
         batch.validate(out.len())?;
         if !chunk.is_segment_crc32c()
             || !chunk.valid_immutable_identity()
@@ -176,8 +177,7 @@ impl GrpcChunkTransfer {
             while let Some(frame) = stream.message().await.map_err(peer_status_error)? {
                 decoder.accept(frame)?;
             }
-            decoder.finish()?;
-            Ok(())
+            decoder.finish()
         })
         .await
         .map_err(|_| {
@@ -385,11 +385,13 @@ impl<'a> CrcRangeDecoder<'a> {
         }
         Ok(())
     }
-    pub(super) fn finish(self) -> afs_error::Result<()> {
+    /// The descriptor table this stream was verified against (its digest
+    /// equals the trusted Meta identity, checked in the header).
+    pub(super) fn finish(self) -> afs_error::Result<Option<CrcTable>> {
         if !self.complete {
             return Err(dfs_protocol_error("CRC stream omitted completion"));
         }
-        Ok(())
+        Ok(self.table)
     }
 }
 

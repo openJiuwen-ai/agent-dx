@@ -424,6 +424,22 @@ pub trait ChunkTransfer: Send + Sync {
         })
     }
 
+    /// [`Self::read_crc32c_range_async`] that also returns the segment table
+    /// the bytes were verified against, when the transport has one; its
+    /// digest is the trusted Meta identity. Default: no table.
+    fn read_crc32c_range_table_async<'a>(
+        &'a self,
+        batch: &'a PeerReadBatch,
+        chunk: &'a ChunkObject,
+        out: &'a mut [u8],
+    ) -> super::admission::ReadFuture<'a, Option<crate::node::chunk_crc32c::CrcTable>> {
+        Box::pin(async move {
+            self.read_crc32c_range_async(batch, chunk, out)
+                .await
+                .map(|()| None)
+        })
+    }
+
     /// Ask a copy's holder to re-verify it; whether the holder found it invalid.
     fn review_suspect_chunk_async<'a>(
         &'a self,
