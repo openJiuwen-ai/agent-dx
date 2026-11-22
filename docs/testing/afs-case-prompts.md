@@ -264,6 +264,8 @@ python3 -B build/e2e/run.py --profile standalone --case afs-sdk \
 
 对齐时逐组合比较 `case-results.json`、两模式的 `sdk-result.json`、DFS 的 `sdk-replica.json` 和各层清理。观察 AFS 与 SDK 摘要、阶段状态、正文／副本摘要和新增参数的实际副作用。Docker 同宿主与 K8s worker 的拓扑证据分别保留。已知 rc12→#280 的参数用例应保留原始失败结果。
 
+2026-11-22 使用测试提交 `87ce77f2` 验证上述入口。独立 Linux x86_64/Docker 与 Buildkite 的四组 SDK 结果一致，共有操作 8/8 通过，rc12→#280 在两种文件系统的新增参数均报红。另用同一 #294 制品直接运行组件冒烟和可靠性，共 10 项与 Buildkite 一致，清理通过。 [rc8 接新版 #179](https://buildkite.com/agent-dx/agent-dx-full-test/builds/179) · [rc12 接旧端 #178](https://buildkite.com/agent-dx/agent-dx-full-test/builds/178) · [组件冒烟 #183](https://buildkite.com/agent-dx/agent-dx-full-test/builds/183) · [可靠性 #182](https://buildkite.com/agent-dx/agent-dx-full-test/builds/182)
+
 ## 固定包的其他验收入口
 
 | 用例或能力 | 编写测试的短 Prompt | 运行范围 |
