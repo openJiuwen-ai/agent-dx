@@ -781,7 +781,7 @@ pub struct Config {
     pub dfs_read_parallelism: usize,
     pub dfs_read_stripe_bytes: usize,
     pub dfs_read_cache_bytes: u64,
-    /// Read cache bodies staged for install (default 32 MiB, 4MiB..=1GiB).
+    /// Read cache bodies staged for install (default 256 MiB, 4MiB..=1GiB).
     /// The FUSE read path never waits for it: a full queue drops the body.
     pub dfs_read_cache_queue_bytes: u64,
     /// Partial read cache bodies being assembled (default 32 MiB; 0 or
@@ -994,10 +994,8 @@ impl Config {
             dfs_read_parallelism: file.dfs_read_parallelism.unwrap_or(1),
             dfs_read_stripe_bytes: file.dfs_read_stripe_bytes.unwrap_or(256 * 1024),
             dfs_read_cache_bytes: file.dfs_read_cache_bytes.unwrap_or(0),
-            dfs_read_cache_queue_bytes: file.dfs_read_cache_queue_bytes.unwrap_or(32 * 1024 * 1024),
-            dfs_read_cache_partial_bytes: file
-                .dfs_read_cache_partial_bytes
-                .unwrap_or(32 * 1024 * 1024),
+            dfs_read_cache_queue_bytes: read.dfs_read_cache_queue_bytes,
+            dfs_read_cache_partial_bytes: read.dfs_read_cache_partial_bytes,
             meta_store: meta.meta_store,
             meta_redis_url: meta.meta_redis_url,
             meta_etcd_endpoints: meta.meta_etcd_endpoints,
@@ -1165,6 +1163,38 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod certificate_tests {
     use super::*;
+
+    /// Read cache staging budgets: queue 256 MiB and partial 32 MiB by default
+    /// (report 14 D: 256 MiB drops nothing on the disk backend); values are
+    /// range-checked when the configuration is resolved.
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn dfs_read_cache_budgets_default_and_are_range_checked() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let resolve = |text: &str| {
+            std::fs::write(path, text).unwrap();
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--config", path]))
+        };
+        let config = resolve("fs = 'dfs'\n").unwrap();
+        assert_eq!(config.dfs_read_cache_queue_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.dfs_read_cache_partial_bytes, 32 * 1024 * 1024);
+        let config = resolve(
+            "fs = 'dfs'\ndfs_read_cache_queue_bytes = 4194304\ndfs_read_cache_partial_bytes = 0\n",
+        )
+        .unwrap();
+        assert_eq!(config.dfs_read_cache_queue_bytes, 4 * 1024 * 1024);
+        assert_eq!(config.dfs_read_cache_partial_bytes, 0);
+        for bad in [
+            "dfs_read_cache_queue_bytes = 4194303",
+            "dfs_read_cache_queue_bytes = 1073741825",
+            "dfs_read_cache_partial_bytes = 1",
+            "dfs_read_cache_partial_bytes = 1073741825",
+        ] {
+            let error = resolve(&format!("fs = 'dfs'\n{bad}\n")).unwrap_err();
+            assert!(error.to_string().contains("read cache"), "{bad}: {error}");
+        }
+    }
 
     #[cfg(feature = "dfs")]
     #[test]

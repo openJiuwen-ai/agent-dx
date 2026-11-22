@@ -877,7 +877,7 @@ fn h2_d16_budgets_are_validated() {
         );
     }
     assert!(ReadCacheBudgets::default().validate().is_ok());
-    assert_eq!(ReadCacheBudgets::default().queue_bytes, 32 * MIB);
+    assert_eq!(ReadCacheBudgets::default().queue_bytes, 256 * MIB);
     assert_eq!(ReadCacheBudgets::default().partial_bytes, 32 * MIB);
 }
 

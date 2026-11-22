@@ -354,8 +354,10 @@ impl Default for ReadCacheBudgets {
     }
 }
 
-/// Eight 4 MiB Chunks: about 32 ms of a 1 GiB/s reader ahead of the installer.
-pub(crate) const DEFAULT_READ_CACHE_QUEUE_BYTES: u64 = 32 * 1024 * 1024;
+/// 64 four-MiB Chunks. With 32 MiB a disk-backed reader dropped 37-47 % of
+/// its bodies (the installer writes at disk speed); 256 MiB dropped none and
+/// peaked at 192 MiB (report 14 D).
+pub(crate) const DEFAULT_READ_CACHE_QUEUE_BYTES: u64 = 256 * 1024 * 1024;
 /// Eight partial 4 MiB Chunks: four interleaved reader threads, each with a
 /// Chunk boundary in flight.
 pub(crate) const DEFAULT_READ_CACHE_PARTIAL_BYTES: u64 = 32 * 1024 * 1024;
