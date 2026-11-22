@@ -100,6 +100,7 @@ pub(super) struct DfsReadBudget {
     pub(super) dfs_read_max_ops_per_batch: usize,
     pub(super) dfs_read_max_inflight_bytes: u64,
     pub(super) dfs_source_cache_max_ms: u64,
+    pub(super) dfs_source_single_ttl_ms: u64,
     pub(super) dfs_source_lookahead_chunks: usize,
     pub(super) dfs_source_cache_bytes: usize,
 }
@@ -117,6 +118,10 @@ pub(super) fn resolve_read_budget(cli: &Cli, file: &FileConfig) -> Result<DfsRea
         .dfs_source_cache_max_ms
         .or(file.dfs_source_cache_max_ms)
         .unwrap_or(5000);
+    let dfs_source_single_ttl_ms = cli
+        .dfs_source_single_ttl_ms
+        .or(file.dfs_source_single_ttl_ms)
+        .unwrap_or(500);
     let dfs_source_lookahead_chunks = cli
         .dfs_source_lookahead_chunks
         .or(file.dfs_source_lookahead_chunks)
@@ -133,15 +138,17 @@ pub(super) fn resolve_read_budget(cli: &Cli, file: &FileConfig) -> Result<DfsRea
     if dfs_read_max_ops_per_batch == 0
         || dfs_read_max_inflight_bytes == 0
         || dfs_source_cache_max_ms > 60_000
+        || dfs_source_single_ttl_ms > 60_000
     {
         return Err(invalid(
-            "DFS read budgets must be non-zero and source cache TTL must be <= 60000 ms",
+            "DFS read budgets must be non-zero and source cache TTLs must be <= 60000 ms",
         ));
     }
     Ok(DfsReadBudget {
         dfs_read_max_ops_per_batch,
         dfs_read_max_inflight_bytes,
         dfs_source_cache_max_ms,
+        dfs_source_single_ttl_ms,
         dfs_source_lookahead_chunks,
         dfs_source_cache_bytes,
     })

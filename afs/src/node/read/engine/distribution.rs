@@ -37,30 +37,81 @@ impl ReadDistributionConfig {
 }
 
 impl DfsReadEngine {
-    /// Rotate equal-load peers, spreading requests and stripes without retaining
-    /// an unbounded per-peer history. Node salt avoids identical reader schedules.
+    /// D3: the one candidate order of every native remote read, at any
+    /// `parallelism`. Cache holders first and durable copies as the fallback
+    /// when a verified cache copy is offered (the writer's egress is the only
+    /// source nobody can replace); then the advertised load; then a
+    /// rendezvous hash of (version, Chunk, holder) so each Chunk has one
+    /// stable first choice and different Chunks spread over the holders.
+    /// Only the order changes: candidates, grants and versions do not.
     pub(super) fn distributed_sources(
         &self,
         batch: &ReadBatch,
         sources: &[ChunkSources],
     ) -> Vec<ChunkSources> {
         let mut result = sources.to_vec();
-        let turn = self
-            .source_turn
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let salt = self
-            .local_node_id
-            .bytes()
-            .fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b as usize));
-        for (index, set) in result.iter_mut().enumerate() {
-            set.sources.retain(|s| self.source_matches(batch, s));
-            if !set.sources.is_empty() {
-                let offset = turn.wrapping_add(salt).wrapping_add(index) % set.sources.len();
-                set.sources.rotate_left(offset);
-                set.sources.sort_by_key(|s| s.load_hint);
+        for set in &mut result {
+            // Keep an all-stale list as it was: the holder's refusal then takes
+            // the usual reauthorization path instead of "no readable copy".
+            if set.sources.iter().any(|s| self.source_matches(batch, s)) {
+                set.sources.retain(|s| self.source_matches(batch, s));
             }
+            self.order_candidates(batch, set);
         }
         result
+    }
+
+    /// Orders one Chunk's candidates in place; see [`Self::distributed_sources`].
+    pub(super) fn order_candidates(&self, batch: &ReadBatch, set: &mut ChunkSources) {
+        let demoted = self.demoted_now();
+        let is_demoted = |s: &SourceCandidate| demoted.contains(&s.copy_id);
+        let cached = set.sources.iter().any(|s| {
+            self.is_remote_candidate(s) && s.role == CopyRole::VerifiedCache && !is_demoted(s)
+        });
+        let version = batch
+            .file_version_id
+            .as_ref()
+            .map_or("", |version| version.0.as_str());
+        set.sources.sort_by_cached_key(|source| {
+            let remote = self.is_remote_candidate(source);
+            let fallback = cached && source.role != CopyRole::VerifiedCache;
+            let node = match &source.location {
+                CopyLocation::Node { node_id, .. } => node_id.as_str(),
+                CopyLocation::External { .. } => "",
+            };
+            (
+                !remote,
+                is_demoted(source),
+                fallback,
+                source.load_hint,
+                std::cmp::Reverse(rendezvous_weight(version, &set.chunk_id, node)),
+            )
+        });
+    }
+
+    /// Remote Nodes that striping may use for one Chunk: the cache holders
+    /// when any is offered, otherwise every remote holder (D3-1).
+    fn striping_nodes<'s>(&self, batch: &ReadBatch, set: &'s ChunkSources) -> BTreeSet<&'s String> {
+        let demoted = self.demoted_now();
+        let usable = |s: &&SourceCandidate| {
+            self.is_remote_candidate(s)
+                && self.source_matches(batch, s)
+                && !demoted.contains(&s.copy_id)
+        };
+        let cached = set
+            .sources
+            .iter()
+            .filter(usable)
+            .any(|s| s.role == CopyRole::VerifiedCache);
+        set.sources
+            .iter()
+            .filter(usable)
+            .filter(|s| !cached || s.role == CopyRole::VerifiedCache)
+            .filter_map(|s| match &s.location {
+                CopyLocation::Node { node_id, .. } => Some(node_id),
+                CopyLocation::External { .. } => None,
+            })
+            .collect()
     }
 
     /// The caller owns unpublished output. Disjoint slices avoid another body
@@ -85,19 +136,7 @@ impl DfsReadEngine {
             let Some(set) = sources.iter().find(|s| s.chunk_id == op.chunk_id) else {
                 return Ok(false);
             };
-            let peers: BTreeSet<_> = set
-                .sources
-                .iter()
-                .filter(|s| self.is_remote_candidate(s) && self.source_matches(batch, s))
-                .filter_map(|s| match &s.location {
-                    CopyLocation::Node { node_id, .. }
-                        if node_id != &self.local_node_id && s.state.is_readable() =>
-                    {
-                        Some(node_id)
-                    }
-                    _ => None,
-                })
-                .collect();
+            let peers = self.striping_nodes(batch, set);
             let stripe = if peers.len() > 1 {
                 self.distribution.stripe_bytes as u64
             } else {
@@ -174,14 +213,11 @@ impl DfsReadEngine {
             children.push(async move {
                 // Clone only an admitted child's metadata, not every queued stripe.
                 let mut candidates = candidates.clone();
-                let nodes: BTreeSet<_> = candidates.sources.iter().filter_map(|source| {
-                    match &source.location {
-                        CopyLocation::Node { node_id, .. } if self.is_remote_candidate(source) => {
-                            Some(node_id.clone())
-                        }
-                        _ => None,
-                    }
-                }).collect();
+                let nodes: BTreeSet<String> = self
+                    .striping_nodes(&child, &candidates)
+                    .into_iter()
+                    .cloned()
+                    .collect();
                 if nodes.len() > 1
                     && let Some(node) = nodes.iter().nth(index % nodes.len())
                 {
@@ -213,4 +249,49 @@ impl DfsReadEngine {
         self.check_native_read_authority(&authority)?;
         Ok(true)
     }
+}
+
+/// How long a cache copy that failed a read here is ordered last.
+pub(super) const DEMOTE_FOR: Duration = Duration::from_secs(5);
+const MAX_DEMOTED: usize = 1024;
+
+impl DfsReadEngine {
+    /// Cache copies currently demoted; expired ones are dropped.
+    pub(super) fn demoted_now(&self) -> BTreeSet<crate::dfs::CopyId> {
+        let Ok(mut demoted) = self.demoted_copies.lock() else {
+            return BTreeSet::new();
+        };
+        let now = Instant::now();
+        demoted.retain(|_, until| *until > now);
+        demoted.keys().cloned().collect()
+    }
+
+    /// A cache copy failed a read (not backpressure, not a denial): order
+    /// it last for [`DEMOTE_FOR`]. Durable copies are never demoted.
+    pub(super) fn demote_cache_copy(&self, source: &SourceCandidate) {
+        if source.role != CopyRole::VerifiedCache {
+            return;
+        }
+        let Ok(mut demoted) = self.demoted_copies.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        demoted.retain(|_, until| *until > now);
+        if demoted.len() < MAX_DEMOTED || demoted.contains_key(&source.copy_id) {
+            demoted.insert(source.copy_id.clone(), now + DEMOTE_FOR);
+            self.local.record_read_cache_event("holder_demoted");
+        }
+    }
+}
+
+/// Highest-random-weight score of one holder for one Chunk of one version.
+pub(super) fn rendezvous_weight(version: &str, chunk: &ChunkId, node: &str) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    for part in [version.as_bytes(), chunk.0.as_bytes(), node.as_bytes()] {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    let mut weight = [0_u8; 8];
+    weight.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(weight)
 }

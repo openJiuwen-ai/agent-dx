@@ -305,6 +305,7 @@ impl DfsAssembly {
             max_ops_per_batch: cfg.dfs_read_max_ops_per_batch,
             max_inflight_bytes: cfg.dfs_read_max_inflight_bytes,
             source_cache_ttl: std::time::Duration::from_millis(cfg.dfs_source_cache_max_ms),
+            source_single_ttl: std::time::Duration::from_millis(cfg.dfs_source_single_ttl_ms),
             source_lookahead_chunks: cfg.dfs_source_lookahead_chunks,
             source_cache_bytes: cfg.dfs_source_cache_bytes,
             readahead_max_bytes: cfg.dfs_readahead_max_bytes,
@@ -339,7 +340,14 @@ impl DfsAssembly {
                     "dfs_read_cache_bytes requires native DFS without dfs_peer_cache".into(),
                 );
             }
-            read_engine.with_distributed_cache(session_id.clone(), cfg.dfs_read_cache_bytes)
+            read_engine.with_distributed_cache_budgets(
+                session_id.clone(),
+                cfg.dfs_read_cache_bytes,
+                read::engine::ReadCacheBudgets {
+                    queue_bytes: cfg.dfs_read_cache_queue_bytes,
+                    partial_bytes: cfg.dfs_read_cache_partial_bytes,
+                },
+            )?
         } else if let Some(cache) = &cfg.dfs_peer_cache {
             let cache = open_peer_cache(cfg, cache, &namespace, &self.storage).await?;
             self.peer_cache = Some(cache.clone());

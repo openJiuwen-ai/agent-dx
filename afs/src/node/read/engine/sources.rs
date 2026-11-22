@@ -476,6 +476,37 @@ impl DfsReadEngine {
         }
     }
 
+    /// D1: how long a reply stays cached. While this Node runs the native
+    /// read cache, a Chunk whose candidates name fewer than two remote Nodes
+    /// (in practice: only the writer) is kept for `source_single_ttl`, so a
+    /// reader's freshly published cache copy is seen within that bound,
+    /// including for lookahead Chunks fetched with it. Grants are unchanged.
+    pub(super) fn source_expiry(
+        &self,
+        sources: &ChunkSources,
+        sent: Instant,
+        sent_wall: u64,
+    ) -> Option<Instant> {
+        let deadline = self.source_deadline(sources, sent, sent_wall)?;
+        let single = self.config.source_single_ttl;
+        if self.distributed_cache.is_none() || single.is_zero() {
+            return Some(deadline);
+        }
+        let nodes: BTreeSet<&String> = sources
+            .sources
+            .iter()
+            .filter(|source| self.is_remote_candidate(source))
+            .filter_map(|source| match &source.location {
+                CopyLocation::Node { node_id, .. } => Some(node_id),
+                CopyLocation::External { .. } => None,
+            })
+            .collect();
+        if nodes.len() >= 2 {
+            return Some(deadline);
+        }
+        Some(deadline.min(sent.checked_add(single)?))
+    }
+
     pub(super) fn sources_for(&self, batch: &ReadBatch) -> Result<Vec<ChunkSources>> {
         self.sources_for_attempt(batch, true)
     }
@@ -573,7 +604,7 @@ impl DfsReadEngine {
             .map_err(|e| unavailable(e.to_string()))?
     }
 
-    async fn sources_for_attempt_async_unshared(
+    pub(super) async fn sources_for_attempt_async_unshared(
         &self,
         batch: &ReadBatch,
         allow_generation_retry: bool,
@@ -846,7 +877,7 @@ impl DfsReadEngine {
             }
             let now = Instant::now();
             for set in &fresh {
-                if let Some(expires_at) = self.source_deadline(set, sent, sent_wall)
+                if let Some(expires_at) = self.source_expiry(set, sent, sent_wall)
                     && expires_at > now
                 {
                     cache.insert(

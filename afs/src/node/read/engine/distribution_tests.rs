@@ -241,8 +241,10 @@ async fn distribution_deadline_drains_children_and_never_fetches_other_versions(
     );
 }
 
+/// D3-2: small reads of one Chunk keep one first choice (rendezvous order)
+/// instead of rotating per call; spreading happens across Chunks.
 #[test]
-fn distribution_rotates_small_reads_and_bounds_configuration() {
+fn distribution_orders_small_reads_stably_and_bounds_configuration() {
     let (_temp, engine, batch, sources) = striped_fixture(Arc::new(ConcurrentTransfer::new()));
     let chosen: BTreeSet<_> = (0..3)
         .map(|_| {
@@ -251,7 +253,7 @@ fn distribution_rotates_small_reads_and_bounds_configuration() {
                 .clone()
         })
         .collect();
-    assert_eq!(chosen.len(), 3);
+    assert_eq!(chosen.len(), 1);
     for parallelism in [0, 9, usize::MAX] {
         assert!(
             ReadDistributionConfig {
@@ -272,4 +274,47 @@ fn distribution_rotates_small_reads_and_bounds_configuration() {
             .is_err()
         );
     }
+}
+
+/// D3-1: with two cache holders offered, stripes go to the holders only;
+/// the durable copy (the writer) is not striped.
+#[tokio::test]
+async fn distribution_stripes_over_cache_holders_and_keeps_the_writer_as_fallback() {
+    let transfer = Arc::new(ConcurrentTransfer::new());
+    let (_temp, engine, batch, mut sources) = striped_fixture(transfer.clone());
+    sources[0].sources[1].role = CopyRole::VerifiedCache;
+    sources[0].sources[2].role = CopyRole::VerifiedCache;
+    let mut out = vec![0; 1024 * 1024];
+    assert!(
+        engine
+            .read_distributed_ranges(&batch, &sources, &mut out, None)
+            .await
+            .unwrap()
+    );
+    let calls = transfer.calls.lock().unwrap();
+    let nodes: BTreeSet<_> = calls.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(nodes, BTreeSet::from(["peer-1", "peer-2"]));
+    for (index, value) in out.iter().enumerate() {
+        assert_eq!(*value, ((index + 17) % 251) as u8);
+    }
+}
+
+/// D3-1: one cache holder and the writer: no striping across the writer;
+/// the read goes to the holder through the ordered range source.
+#[tokio::test]
+async fn distribution_single_cache_holder_is_not_striped_with_the_writer() {
+    let transfer = Arc::new(ConcurrentTransfer::new());
+    let (_temp, engine, batch, mut sources) = striped_fixture(transfer.clone());
+    sources[0].sources.truncate(2);
+    sources[0].sources[1].role = CopyRole::VerifiedCache;
+    let mut out = vec![0; 1024 * 1024];
+    assert!(
+        !engine
+            .read_distributed_ranges(&batch, &sources, &mut out, None)
+            .await
+            .unwrap()
+    );
+    let ordered = engine.distributed_sources(&batch, &sources);
+    assert_eq!(ordered[0].sources[0].role, CopyRole::VerifiedCache);
+    assert_eq!(ordered[0].sources[1].role, CopyRole::DurableReplica);
 }

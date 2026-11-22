@@ -50,11 +50,14 @@ mod distribution;
 mod distribution_tests;
 mod external;
 mod fanout;
+#[cfg(test)]
+mod h2_tests;
 mod local;
 mod peer_cache_source;
 mod prefetch;
 mod recovery;
 mod remote;
+pub(crate) use cache_reconcile::ReadCacheBudgets;
 pub(crate) use distribution::ReadDistributionConfig;
 mod route;
 mod sources;
@@ -80,6 +83,8 @@ pub(crate) const MAX_EXTERNAL_AUTHORITY_AHEAD: usize = 16;
 const MAX_EXTERNAL_AUTH_CACHE_BYTES: usize = 1024 * 1024;
 const MAX_SOURCE_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const SOURCE_GRANT_SAFETY_MS: u64 = 1_000;
+/// Remembered verified CRC tables (each about 0.5 KiB for a 4 MiB Chunk).
+pub(super) const MAX_TRUSTED_CRC_TABLES: usize = 256;
 pub(in crate::node) const MAX_SOURCE_LOOKAHEAD_ID_BYTES: usize = 512;
 
 #[derive(Clone, Debug)]
@@ -87,6 +92,10 @@ pub struct DfsReadConfig {
     pub max_ops_per_batch: usize,
     pub max_inflight_bytes: u64,
     pub source_cache_ttl: Duration,
+    /// With the native read cache on: lifetime of a Chunk's sources while they
+    /// name only one remote Node, so a new cache holder is seen soon. Zero
+    /// keeps `source_cache_ttl`; never longer than it.
+    pub source_single_ttl: Duration,
     pub source_lookahead_chunks: usize,
     pub source_cache_bytes: usize,
     /// Object scheduling distance, not additional resident or transport bytes.
@@ -99,6 +108,7 @@ impl Default for DfsReadConfig {
             max_ops_per_batch: MAX_DFS_READ_OPS,
             max_inflight_bytes: MAX_DFS_READ_BYTES,
             source_cache_ttl: Duration::from_millis(5_000),
+            source_single_ttl: Duration::from_millis(500),
             source_lookahead_chunks: 64,
             source_cache_bytes: MAX_SOURCE_CACHE_BYTES,
             readahead_max_bytes: 0,
@@ -117,6 +127,7 @@ impl DfsReadConfig {
             || self.source_cache_bytes > MAX_SOURCE_CACHE_BYTES
             || self.readahead_max_bytes > 32 * 1024 * 1024
             || self.source_cache_ttl > Duration::from_millis(60_000)
+            || self.source_single_ttl > Duration::from_millis(60_000)
         {
             return Err(invalid(format!(
                 "DFS read configuration requires 1..={MAX_DFS_READ_OPS} operations, 1..={MAX_DFS_READ_BYTES} bytes, lookahead <= {MAX_DFS_READ_OPS}, source cache <= {MAX_SOURCE_CACHE_BYTES} bytes and maximum TTL <= 60000 ms"
@@ -643,7 +654,6 @@ fn range_covered(ranges: &[(u64, u64)], requested_start: u64, requested_len: u64
 pub struct DfsReadEngine {
     namespace_id: crate::dfs::NamespaceId,
     distribution: ReadDistributionConfig,
-    source_turn: Arc<std::sync::atomic::AtomicUsize>,
     distributed_cache: Option<Arc<cache_reconcile::ReadCacheRuntime>>,
     reply_buffer_pool: Arc<super::buffer::ReadBufferPool>,
     read_pipeline_limits: super::admission::ReadPipelineLimits,
@@ -655,6 +665,14 @@ pub struct DfsReadEngine {
     source_provider: Arc<dyn ReadSourceProvider>,
     transfer: Arc<dyn ChunkTransfer>,
     suspect_copies: Arc<crate::node::fault::suspect::SuspectQueue>,
+    /// Segment tables that remote CRC reads were verified against, by Chunk
+    /// (bounded). The read cache installs with them instead of recomputing.
+    pub(super) trusted_crc_tables:
+        Arc<Mutex<BoundedLru<ChunkId, Arc<crate::node::chunk_crc32c::CrcTable>>>>,
+    /// Cache copies that just failed a read here, ordered last until the
+    /// instant (review MEDIUM: an evicted, not yet retired holder must not
+    /// stay first for the whole source-cache lifetime).
+    demoted_copies: Arc<Mutex<HashMap<crate::dfs::CopyId, Instant>>>,
     config: DfsReadConfig,
     external_backend: Option<ExternalReadBackend>,
     peer_cache: Option<Arc<DiskPeerCache>>,
@@ -767,7 +785,6 @@ impl DfsReadEngine {
         source_cache.record(&local);
         Self {
             distribution: ReadDistributionConfig::default(),
-            source_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             distributed_cache: None,
             reply_buffer_pool: super::buffer::ReadBufferPool::new("reply"),
             read_pipeline_limits: Default::default(),
@@ -780,6 +797,8 @@ impl DfsReadEngine {
             source_provider,
             transfer,
             suspect_copies: Default::default(),
+            trusted_crc_tables: Arc::new(Mutex::new(BoundedLru::new(MAX_TRUSTED_CRC_TABLES))),
+            demoted_copies: Default::default(),
             config,
             external_backend: None,
             peer_cache: None,
@@ -843,7 +862,6 @@ impl DfsReadEngine {
     fn task_reader(&self) -> Self {
         Self {
             distribution: self.distribution,
-            source_turn: self.source_turn.clone(),
             distributed_cache: self.distributed_cache.clone(),
             reply_buffer_pool: self.reply_buffer_pool.clone(),
             read_pipeline_limits: self.read_pipeline_limits,
@@ -856,6 +874,8 @@ impl DfsReadEngine {
             source_provider: self.source_provider.clone(),
             transfer: self.transfer.clone(),
             suspect_copies: self.suspect_copies.clone(),
+            trusted_crc_tables: self.trusted_crc_tables.clone(),
+            demoted_copies: self.demoted_copies.clone(),
             config: self.config.clone(),
             external_backend: None,
             peer_cache: self.peer_cache.clone(),

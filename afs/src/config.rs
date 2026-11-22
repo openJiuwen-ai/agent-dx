@@ -571,6 +571,11 @@ pub struct Cli {
     pub dfs_read_max_inflight_bytes: Option<u64>,
     #[arg(long)]
     pub dfs_source_cache_max_ms: Option<u64>,
+    /// Shorter source-metadata lifetime for a Chunk whose candidates hold one
+    /// remote Node, while this Node runs the native read cache (default 500;
+    /// 0 keeps `dfs_source_cache_max_ms`). New cache holders become visible sooner.
+    #[arg(long)]
+    pub dfs_source_single_ttl_ms: Option<u64>,
     #[arg(long)]
     pub dfs_source_lookahead_chunks: Option<usize>,
     #[arg(long)]
@@ -630,6 +635,8 @@ struct FileConfig {
     dfs_read_parallelism: Option<usize>,
     dfs_read_stripe_bytes: Option<usize>,
     dfs_read_cache_bytes: Option<u64>,
+    dfs_read_cache_queue_bytes: Option<u64>,
+    dfs_read_cache_partial_bytes: Option<u64>,
     id: Option<String>,
     grpc_listen: Option<SocketAddr>,
     rest_listen: Option<SocketAddr>,
@@ -727,6 +734,7 @@ struct FileConfig {
     dfs_read_max_ops_per_batch: Option<usize>,
     dfs_read_max_inflight_bytes: Option<u64>,
     dfs_source_cache_max_ms: Option<u64>,
+    dfs_source_single_ttl_ms: Option<u64>,
     dfs_source_lookahead_chunks: Option<usize>,
     dfs_source_cache_bytes: Option<usize>,
     dfs_read_diagnostics_enabled: Option<bool>,
@@ -773,6 +781,12 @@ pub struct Config {
     pub dfs_read_parallelism: usize,
     pub dfs_read_stripe_bytes: usize,
     pub dfs_read_cache_bytes: u64,
+    /// Read cache bodies staged for install (default 32 MiB, 4MiB..=1GiB).
+    /// The FUSE read path never waits for it: a full queue drops the body.
+    pub dfs_read_cache_queue_bytes: u64,
+    /// Partial read cache bodies being assembled (default 32 MiB; 0 or
+    /// 4MiB..=1GiB, 0 disables assembling bodies from separate reads).
+    pub dfs_read_cache_partial_bytes: u64,
     pub id: String,
     pub grpc_listen: SocketAddr,
     pub rest_listen: SocketAddr,
@@ -870,6 +884,7 @@ pub struct Config {
     pub dfs_read_max_ops_per_batch: usize,
     pub dfs_read_max_inflight_bytes: u64,
     pub dfs_source_cache_max_ms: u64,
+    pub dfs_source_single_ttl_ms: u64,
     pub dfs_source_lookahead_chunks: usize,
     pub dfs_source_cache_bytes: usize,
     pub dfs_read_diagnostics_enabled: bool,
@@ -979,6 +994,10 @@ impl Config {
             dfs_read_parallelism: file.dfs_read_parallelism.unwrap_or(1),
             dfs_read_stripe_bytes: file.dfs_read_stripe_bytes.unwrap_or(256 * 1024),
             dfs_read_cache_bytes: file.dfs_read_cache_bytes.unwrap_or(0),
+            dfs_read_cache_queue_bytes: file.dfs_read_cache_queue_bytes.unwrap_or(32 * 1024 * 1024),
+            dfs_read_cache_partial_bytes: file
+                .dfs_read_cache_partial_bytes
+                .unwrap_or(32 * 1024 * 1024),
             meta_store: meta.meta_store,
             meta_redis_url: meta.meta_redis_url,
             meta_etcd_endpoints: meta.meta_etcd_endpoints,
@@ -1095,6 +1114,7 @@ impl Config {
             dfs_read_max_ops_per_batch: read.dfs_read_max_ops_per_batch,
             dfs_read_max_inflight_bytes: read.dfs_read_max_inflight_bytes,
             dfs_source_cache_max_ms: read.dfs_source_cache_max_ms,
+            dfs_source_single_ttl_ms: read.dfs_source_single_ttl_ms,
             dfs_source_lookahead_chunks: read.dfs_source_lookahead_chunks,
             dfs_source_cache_bytes: read.dfs_source_cache_bytes,
             dfs_read_crc_mode,

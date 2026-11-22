@@ -104,6 +104,10 @@ Registry proxy 可将 manifest 的 HEAD／GET、blob 的 HEAD／GET Range 交给
 普通文件和懒文件均可使用。临时副本不计入写入持久化确认。
 该配置与 `dfs_peer_cache` 分别选择，避免为同一正文保留两份磁盘缓存。
 
+远端候选的顺序在任何 `dfs_read_parallelism` 下都相同：有读缓存供数副本时，持久副本排在它们之后作兜底，条带也只分到这些读缓存副本；其余按 (版本, chunk, 节点) 的 rendezvous hash 排序，同一 chunk 的首选固定，不同 chunk 分散到各副本。多副本文件在并行度 1 时也会分散到各副本读；排序前先去掉授权已过期的候选（全部过期时保留原列表，由持有方拒绝后重新授权）。某个读缓存副本在本 Node 读失败（非繁忙、非拒绝）后，5 s 内排在所有候选之后。
+开启 `dfs_read_cache_bytes` 时：读到的完整 chunk 正文按 `dfs_read_cache_queue_bytes`（默认 32 MiB）排队等待安装，多次读拼装中的部分 chunk 受 `dfs_read_cache_partial_bytes`（默认 32 MiB）约束：FUSE 读只把读到的段拷一份交给后台拼装任务（在途段另受该值一半的字节上限约束），不取任何锁、从不等待，超出即丢弃并计数；超过 2 s 仍未拼完的部分 chunk 被释放。安装与发布分属两个后台任务，安装成功即触发发布；未确认的副本优先发布，最多 4 个并发，每轮最多 128 个，有进展且有剩余时立刻进入下一轮；发布失败的副本单独退避（1 s 起翻倍，最长 30 s），不挡住其他副本；已确认的副本每秒复核 16 个。候选只有一个远端 Node 的 chunk 按 `dfs_source_single_ttl_ms`（默认 500 ms）缓存来源；唯一候选繁忙时，若本次读剩余时间不少于 50 ms，就在读期限内向 Meta 重查一次来源（同一 Node 上的并发重查共享一次查询），查到新的读缓存副本就改读该副本。
+`afs_dfs_read_cache_events_total{event}` 记录暂存、丢弃（队列满、部分块被挤出）、安装、发布、退役及繁忙重查次数；`afs_dfs_read_source_bytes_total{role="local|durable|verified_cache"}` 记录本 Node 读到的正文按来源角色的字节数。
+
 来源恢复仅重新安装与已提交 chunk 相同的字节。校验或身份冲突时返回读取错误。
 
 ## OverlayBD 本机块设备

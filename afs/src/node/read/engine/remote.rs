@@ -10,7 +10,6 @@ use super::*;
 struct PeerRangeRound<'r> {
     batch: &'r ReadBatch,
     sources: &'r [ChunkSources],
-    candidates: &'r [Vec<SourceCandidate>],
     version: &'r FileVersionId,
     final_owned: bool,
     deadline: Instant,
@@ -19,12 +18,20 @@ struct PeerRangeRound<'r> {
 /// Rotation state: next candidate per operation, operations still to read
 /// in the next pass, and the error returned once a list is exhausted.
 struct PeerRangeProgress {
+    /// Remote candidates per operation, in source order; a busy-refresh may
+    /// replace one operation's list with Meta's current one (D1).
+    candidates: Vec<Vec<SourceCandidate>>,
+    /// Operations whose candidates were already refreshed once.
+    refreshed: Vec<bool>,
     next: Vec<usize>,
     pending: Vec<usize>,
     last_error: Option<Error>,
     /// Wait before re-asking a holder that answered with backpressure.
     busy_backoff: Duration,
 }
+
+/// Least time left in a read for a busy-refresh lookup to be worth it.
+const MIN_REFRESH_BUDGET: Duration = Duration::from_millis(50);
 
 /// Backpressure retries mirror the replica sender (R71b): 5ms doubling to 200ms.
 const BUSY_BACKOFF_START: Duration = Duration::from_millis(5);
@@ -63,12 +70,13 @@ impl DfsReadEngine {
         let round = PeerRangeRound {
             batch,
             sources,
-            candidates: &candidates,
             version: &version,
             final_owned,
             deadline: deadline.unwrap_or_else(|| Instant::now() + self.read_pipeline_timeout()),
         };
         let mut progress = PeerRangeProgress {
+            candidates,
+            refreshed: vec![false; batch.ops.len()],
             next: vec![0; batch.ops.len()],
             pending: (0..batch.ops.len()).collect(),
             last_error: None,
@@ -91,7 +99,7 @@ impl DfsReadEngine {
         round: &PeerRangeRound<'_>,
         progress: &mut PeerRangeProgress,
     ) -> Result<Vec<Vec<usize>>> {
-        let (batch, candidates, next) = (round.batch, round.candidates, &progress.next);
+        let (batch, candidates, next) = (round.batch, &progress.candidates, &progress.next);
         let mut groups: Vec<Vec<usize>> = Vec::new();
         for &index in &progress.pending {
             let Some(source) = candidates[index].get(next[index]) else {
@@ -137,7 +145,7 @@ impl DfsReadEngine {
                 length += op.length as usize; // validated by ReadBatch
                 ResolvedReadOp {
                     op,
-                    source: round.candidates[index][progress.next[index]].clone(),
+                    source: progress.candidates[index][progress.next[index]].clone(),
                 }
             })
             .collect();
@@ -164,16 +172,21 @@ impl DfsReadEngine {
         let target = if direct { &mut *out } else { &mut scratch };
         let fetch = async {
             if let Some(chunk) = integrity {
-                self.transfer
-                    .read_crc32c_range_async(&attempt, chunk, target)
-                    .await
+                let table = self
+                    .transfer
+                    .read_crc32c_range_table_async(&attempt, chunk, target)
+                    .await?;
+                if let Some(table) = table {
+                    self.remember_trusted_crc_table(chunk, table);
+                }
+                Ok(())
             } else {
                 self.transfer.read_ranges_async(&attempt, target).await
             }
         };
         let choices = group
             .iter()
-            .map(|&i| round.candidates[i].len() - progress.next[i])
+            .map(|&i| progress.candidates[i].len() - progress.next[i])
             .min()
             .unwrap_or(1);
         let result = self.try_peer_before(round.deadline, choices, fetch).await;
@@ -187,6 +200,9 @@ impl DfsReadEngine {
                     return Err(external_denied(
                         "native peer read authority expired before publication",
                     ));
+                }
+                for item in &attempt.operations {
+                    self.record_source_bytes(&item.source, item.op.length);
                 }
                 if direct {
                     return Ok(());
@@ -213,6 +229,13 @@ impl DfsReadEngine {
                 // again within the read deadline instead of ending the read with
                 // EAGAIN; with other candidates left, move on as before.
                 if crate::node::fault::classify::retryable_backpressure(&error) && choices <= 1 {
+                    if self.refresh_busy_candidates(round, group, progress).await {
+                        // A holder published since the lookup: try it now
+                        // instead of backing off on the busy writer.
+                        progress.last_error = Some(error);
+                        progress.pending.extend_from_slice(group);
+                        return Ok(());
+                    }
                     if Instant::now() + progress.busy_backoff >= round.deadline {
                         // No other copy and no time left: the read timed out.
                         return Err(Error::coded(
@@ -232,6 +255,7 @@ impl DfsReadEngine {
                 // A batch error does not say which copy failed; a lone one does.
                 if let [item] = attempt.operations.as_slice() {
                     self.note_suspect_copy(&error, item);
+                    self.demote_cache_copy(&item.source);
                 }
                 if self.distribution.parallelism > 1
                     && error.kind() == afs_error::ErrorKind::DeadlineExceeded
@@ -267,6 +291,173 @@ impl DfsReadEngine {
                 "peer attempt exhausted its share of the read deadline",
             )
         })?
+    }
+
+    /// D1: the last candidate of some operation answered busy. While this
+    /// Node runs the native read cache, ask Meta once per operation for its
+    /// current sources, bypassing the cached reply: a cache copy published
+    /// after the lookup becomes a new first choice. Returns whether any
+    /// operation gained a candidate. A failed refresh is not a read error;
+    /// the caller keeps its busy backoff.
+    async fn refresh_busy_candidates(
+        &self,
+        round: &PeerRangeRound<'_>,
+        group: &[usize],
+        progress: &mut PeerRangeProgress,
+    ) -> bool {
+        if self.distributed_cache.is_none() {
+            return false;
+        }
+        // Never spend the read's own deadline on metadata: with too little
+        // time left keep the busy backoff (review MEDIUM).
+        if round.deadline.saturating_duration_since(Instant::now()) < MIN_REFRESH_BUDGET {
+            return false;
+        }
+        let indices: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|&index| !progress.refreshed[index])
+            .collect();
+        if indices.is_empty() {
+            return false;
+        }
+        let ops: Vec<ChunkReadOp> = indices
+            .iter()
+            .map(|&index| round.batch.ops[index].clone())
+            .collect();
+        for &index in &indices {
+            progress.refreshed[index] = true;
+        }
+        let refresh = ReadBatch {
+            file_version_id: Some(round.version.clone()),
+            layout_root_id: round.batch.layout_root_id.clone(),
+            ops,
+            lookahead: Vec::new(),
+        };
+        // Drop this read's cached entries unless another read on this Node
+        // already refreshed them, then look up through the shared per-version
+        // gate: concurrent refreshes here wait for one Meta query and reuse
+        // its reply. The waiter is bounded by the read deadline.
+        self.drop_unrefreshed_sources(&refresh, progress, &indices);
+        let fresh = match self
+            .sources_for_attempt_async(&refresh, true, round.deadline, Arc::new(()))
+            .await
+        {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                afs_logging::debug!("dfs.read_busy_refresh_failed"; "error" => error.to_string());
+                return false;
+            }
+        };
+        let mut grew = false;
+        for &index in &indices {
+            let chunk = &round.batch.ops[index].chunk_id;
+            let Some(mut set) = fresh.iter().find(|set| &set.chunk_id == chunk).cloned() else {
+                continue;
+            };
+            set.sources.retain(|s| self.source_matches(round.batch, s));
+            self.order_candidates(round.batch, &mut set);
+            let current = &progress.candidates[index];
+            let candidates: Vec<SourceCandidate> = set
+                .sources
+                .into_iter()
+                .filter(|source| self.is_remote_candidate(source))
+                .collect();
+            let gained = candidates
+                .iter()
+                .any(|new| !current.iter().any(|old| old.copy_id == new.copy_id));
+            if gained {
+                progress.candidates[index] = candidates;
+                progress.next[index] = 0;
+                grew = true;
+            }
+        }
+        if grew {
+            self.local.record_read_cache_event("busy_refreshed");
+        }
+        grew
+    }
+
+    /// Removes cached sources of the refreshed Chunks whose cached copy set
+    /// is still the one this read started with.
+    fn drop_unrefreshed_sources(
+        &self,
+        refresh: &ReadBatch,
+        progress: &PeerRangeProgress,
+        indices: &[usize],
+    ) {
+        let Some(version) = refresh.file_version_id.as_ref() else {
+            return;
+        };
+        let Ok(mut cache) = self.source_cache.lock() else {
+            return;
+        };
+        let mut stale = BTreeSet::new();
+        for (op, index) in refresh.ops.iter().zip(indices) {
+            let key = (
+                version.clone(),
+                refresh.layout_root_id.clone(),
+                op.chunk_id.clone(),
+            );
+            let refreshed = cache.get(&key).is_some_and(|cached| {
+                cached
+                    .sources
+                    .sources
+                    .iter()
+                    .filter(|s| self.is_remote_candidate(s))
+                    .any(|s| {
+                        !progress.candidates[*index]
+                            .iter()
+                            .any(|old| old.copy_id == s.copy_id)
+                    })
+            });
+            if !refreshed {
+                stale.insert(op.chunk_id.clone());
+            }
+        }
+        cache.retain(|key, _| {
+            &key.0 != version || key.1 != refresh.layout_root_id || !stale.contains(&key.2)
+        });
+        cache.record(&self.local);
+    }
+
+    /// Keeps a table whose digest is this Chunk's trusted Meta identity.
+    pub(super) fn remember_trusted_crc_table(
+        &self,
+        chunk: &ChunkObject,
+        table: crate::node::chunk_crc32c::CrcTable,
+    ) {
+        // With CRC checking off the bytes were not verified: never reuse.
+        if self.distributed_cache.is_none()
+            || self.local.peer_read_crc_mode() == crate::config::DfsReadCrcMode::Off
+            || !table.valid_shape(chunk.length)
+            || table.descriptor_digest() != chunk.content_digest
+        {
+            return;
+        }
+        if let Ok(mut tables) = self.trusted_crc_tables.lock()
+            && tables.get(&chunk.id).is_none()
+        {
+            tables.insert(chunk.id.clone(), Arc::new(table));
+        }
+    }
+
+    /// The remembered trusted table of a Chunk, if any.
+    pub(super) fn trusted_crc_table(
+        &self,
+        chunk: &ChunkId,
+    ) -> Option<Arc<crate::node::chunk_crc32c::CrcTable>> {
+        self.trusted_crc_tables.lock().ok()?.get(chunk).cloned()
+    }
+
+    /// D0: reader-side payload by the role of the copy that served it, so a
+    /// fan-out shows who supplied whom without inferring it from senders.
+    pub(super) fn record_source_bytes(&self, source: &SourceCandidate, bytes: u64) {
+        let role = match source.role {
+            CopyRole::VerifiedCache => "verified_cache",
+            _ => "durable",
+        };
+        self.local.record_read_source_bytes(role, bytes);
     }
 
     /// Queues the copy for its holder's review when its bytes failed this
@@ -317,7 +508,7 @@ impl DfsReadEngine {
                     operations: vec![single],
                 };
                 let mut single_scratch = vec![0; item.op.length as usize];
-                let choices = round.candidates[index].len() - progress.next[index];
+                let choices = progress.candidates[index].len() - progress.next[index];
                 let fetch = self
                     .transfer
                     .read_ranges_async(&single_batch, &mut single_scratch);
@@ -329,6 +520,7 @@ impl DfsReadEngine {
                             ));
                         }
                         let original = &batch.ops[index];
+                        self.record_source_bytes(&item.source, original.length);
                         self.local
                             .record_read_copy("attempt_to_staging", original.length);
                         out[original.output_offset..original.output_offset + single_scratch.len()]
@@ -342,6 +534,9 @@ impl DfsReadEngine {
                         }
                         self.capture_native_read_authority()?;
                         self.note_suspect_copy(&error, item);
+                        if !crate::node::fault::classify::retryable_backpressure(&error) {
+                            self.demote_cache_copy(&item.source);
+                        }
                         progress.last_error = Some(error);
                     }
                 }
