@@ -45,6 +45,40 @@ impl StagedChunk {
         Ok(staged)
     }
 
+    /// [`Self::from_replica`] with the segment table the body was already
+    /// verified against on receive (CPU fix 2): the table is accepted only if
+    /// its descriptor digest is `expected`'s trusted identity, and then no
+    /// CRC is recomputed. Any other case falls back to `from_replica`.
+    #[cfg(any(feature = "dfs", test))]
+    pub(crate) fn from_replica_with_table(
+        operation_id: OperationId,
+        expected: &ChunkObject,
+        bytes: Vec<u8>,
+        table: Option<&Arc<super::super::chunk_crc32c::CrcTable>>,
+    ) -> Result<(Self, bool)> {
+        let Some(table) = table.filter(|table| {
+            expected.is_segment_crc32c()
+                && expected.length == bytes.len() as u64
+                && table.valid_shape(expected.length)
+                && table.descriptor_digest() == expected.content_digest
+        }) else {
+            return Self::from_replica(operation_id, expected, bytes).map(|staged| (staged, false));
+        };
+        let staged = Self {
+            operation_id,
+            #[cfg(feature = "dfs")]
+            sealed_chunk: expected.clone(),
+            chunk: expected.clone(),
+            bytes: SharedChunkBytes::from_buffer(ChunkBuffer::unpooled(bytes)),
+            outboard: None,
+            segment_crc: Some(table.clone()),
+        };
+        if !staged.chunk.valid_immutable_identity() {
+            return Err(invalid("invalid CRC32C object identity"));
+        }
+        Ok((staged, true))
+    }
+
     pub fn new(operation_id: OperationId, bytes: Vec<u8>) -> Self {
         Self::from_shared(
             operation_id,

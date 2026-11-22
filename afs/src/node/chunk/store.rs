@@ -309,6 +309,36 @@ impl LocalChunkStore {
         }
     }
 
+    /// One native read cache stage for one Chunk (`afs_dfs_read_cache_events_total`).
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_read_cache_event(&self, event: &'static str) {
+        if let Some(metrics) = &self.read_work {
+            metrics.read_cache_event(event);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_read_cache_resource(&self, resource: &'static str, value: u64) {
+        if let Some(metrics) = &self.read_work {
+            metrics.read_cache_resource(resource, value);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_read_cache_work(&self, stage: &'static str, elapsed: std::time::Duration) {
+        if let Some(metrics) = &self.read_work {
+            metrics.read_cache_work(stage, elapsed);
+        }
+    }
+
+    /// Payload delivered to a reader by the role of the copy that served it.
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_read_source_bytes(&self, role: &'static str, bytes: u64) {
+        if let Some(metrics) = &self.read_work {
+            metrics.read_source_bytes(role, bytes);
+        }
+    }
+
     #[cfg(feature = "dfs")]
     pub(crate) fn record_peer_read_event(&self, event: &'static str) {
         if let Some(metrics) = &self.read_work {

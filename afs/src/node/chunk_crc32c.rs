@@ -34,7 +34,7 @@ unsafe fn crc_arm(mut bytes: &[u8]) -> u32 {
 /// `AFS-CRC32C-SEGMENTS-v1` belongs to it.
 const FORMAT: u32 = crate::format::version::NODE_CRC_SEGMENT_TABLE;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct CrcTable {
+pub struct CrcTable {
     pub(crate) format: u32,
     pub(crate) length: u64,
     pub(crate) segment_bytes: u32,

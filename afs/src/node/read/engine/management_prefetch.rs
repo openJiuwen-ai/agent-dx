@@ -150,7 +150,7 @@ impl DfsReadEngine {
         if length == 0 || length > crate::node::chunk::MAX_STAGED_CHUNK_BYTES {
             return Err(invalid("prefetch Chunk length outside supported bounds"));
         }
-        let permit = cache.enqueue_prefetch(deadline).await?;
+        let charge = cache.enqueue_prefetch(object.length, deadline).await?;
         if crate::node::bridge::local_io(|| self.local.open_for_range_reads(&object.id)).is_ok() {
             return Ok(());
         }
@@ -186,7 +186,7 @@ impl DfsReadEngine {
         let (job, completed) =
             CacheJob::new(object, body, version, batch.layout_root_id, authority.epoch)
                 .explicit(deadline);
-        permit.send(job);
+        cache.submit(job, charge)?;
         // The shared flight ends with the actual install, even if its waiters time out.
         completed
             .await

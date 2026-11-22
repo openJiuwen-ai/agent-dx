@@ -641,6 +641,16 @@ cargo test --locked -p afs --lib --all-features node::dfs_fetch::tests::
 cargo test --locked -p afs --test config_contract --all-features
 ```
 
+读者共享测量采集`afs_dfs_read_cache_events_total{event}`（staged、dropped_queue_full、
+dropped_partial、installed、install_skipped、install_failed、published、publish_failed、
+retired、retire_failed、busy_refreshed、denied_reauthorized、holder_demoted、dropped_segment_full、dropped_partial_expired、
+dropped_partial_ranges，单位是chunk或段的事件次数；dropped_partial只表示部分块被预算挤出）与
+`afs_dfs_read_source_bytes_total{role}`（local、durable、verified_cache、object；object是BLAKE3整对象路径，不区分副本；单位是交付给本Node
+读者的正文字节），以及`afs_dfs_read_cache_resources{resource}`（queue／partial／segment的当前、峰值、上限字节，按实际持有的缓冲区容量计，segment含空闲复用缓冲；计入读者内存）和
+`afs_dfs_read_cache_work_nanoseconds_total{stage}`／`afs_dfs_read_cache_work_total{stage}`（queue_wait、install、reconcile）。
+判读：`dropped_queue_full`>0且install耗时之和接近窗口时长，为安装能力不足；install耗时低而queue_wait均值高并与reconcile时段重叠，为安装被阻塞。只有写者持有持久副本时，各读者verified_cache字节之和应等于各读者
+送出的`afs_dfs_payload_bytes_total{direction="send",operation="read"}`之和；不一致时该轮证据不全。
+
 正常测量采集`afs_dfs_fetch_events_total{event}`的scheduled、skip_disabled、skip_budget、
 skip_grant、skip_busy、joined、cancelled、failed，单位是事件次数；
 `afs_dfs_fetch_resources{resource}`的jobs／job_limit是数量，metadata_bytes／

@@ -100,6 +100,9 @@ pub(super) struct DfsReadBudget {
     pub(super) dfs_read_max_ops_per_batch: usize,
     pub(super) dfs_read_max_inflight_bytes: u64,
     pub(super) dfs_source_cache_max_ms: u64,
+    pub(super) dfs_source_single_ttl_ms: u64,
+    pub(super) dfs_read_cache_queue_bytes: u64,
+    pub(super) dfs_read_cache_partial_bytes: u64,
     pub(super) dfs_source_lookahead_chunks: usize,
     pub(super) dfs_source_cache_bytes: usize,
 }
@@ -117,6 +120,10 @@ pub(super) fn resolve_read_budget(cli: &Cli, file: &FileConfig) -> Result<DfsRea
         .dfs_source_cache_max_ms
         .or(file.dfs_source_cache_max_ms)
         .unwrap_or(5000);
+    let dfs_source_single_ttl_ms = cli
+        .dfs_source_single_ttl_ms
+        .or(file.dfs_source_single_ttl_ms)
+        .unwrap_or(500);
     let dfs_source_lookahead_chunks = cli
         .dfs_source_lookahead_chunks
         .or(file.dfs_source_lookahead_chunks)
@@ -125,6 +132,19 @@ pub(super) fn resolve_read_budget(cli: &Cli, file: &FileConfig) -> Result<DfsRea
         .dfs_source_cache_bytes
         .or(file.dfs_source_cache_bytes)
         .unwrap_or(4 * 1024 * 1024);
+    // Read cache staging (only used with dfs_read_cache_bytes): queue 256 MiB
+    // so a disk-backed reader drops no body (report 14 D), partial 32 MiB.
+    const MIB: u64 = 1024 * 1024;
+    let dfs_read_cache_queue_bytes = file.dfs_read_cache_queue_bytes.unwrap_or(256 * MIB);
+    let dfs_read_cache_partial_bytes = file.dfs_read_cache_partial_bytes.unwrap_or(32 * MIB);
+    if !(4 * MIB..=1024 * MIB).contains(&dfs_read_cache_queue_bytes)
+        || dfs_read_cache_partial_bytes > 1024 * MIB
+        || (dfs_read_cache_partial_bytes != 0 && dfs_read_cache_partial_bytes < 4 * MIB)
+    {
+        return Err(invalid(
+            "DFS read cache budgets require queue 4MiB..=1GiB and partial 0 or 4MiB..=1GiB",
+        ));
+    }
     if dfs_source_lookahead_chunks > 128 || dfs_source_cache_bytes > 4 * 1024 * 1024 {
         return Err(invalid(
             "DFS source metadata requires lookahead <= 128 chunks and cache <= 4194304 bytes",
@@ -133,15 +153,19 @@ pub(super) fn resolve_read_budget(cli: &Cli, file: &FileConfig) -> Result<DfsRea
     if dfs_read_max_ops_per_batch == 0
         || dfs_read_max_inflight_bytes == 0
         || dfs_source_cache_max_ms > 60_000
+        || dfs_source_single_ttl_ms > 60_000
     {
         return Err(invalid(
-            "DFS read budgets must be non-zero and source cache TTL must be <= 60000 ms",
+            "DFS read budgets must be non-zero and source cache TTLs must be <= 60000 ms",
         ));
     }
     Ok(DfsReadBudget {
         dfs_read_max_ops_per_batch,
         dfs_read_max_inflight_bytes,
         dfs_source_cache_max_ms,
+        dfs_source_single_ttl_ms,
+        dfs_read_cache_queue_bytes,
+        dfs_read_cache_partial_bytes,
         dfs_source_lookahead_chunks,
         dfs_source_cache_bytes,
     })
