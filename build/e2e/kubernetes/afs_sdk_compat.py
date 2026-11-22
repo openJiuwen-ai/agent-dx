@@ -26,6 +26,7 @@ CANDIDATES = {
     'be16d72463bb30ae355178795fb4476adacf4c6d': (
         '0.1.0rc12', '2fc551baaf684b37c8283b9337ba5c550fa16382ee4b5d07795b2cb8c5bf6b77'),
 }
+OLD_SERVER = '18f9c673812dbc988185136011023ea28bdd38f7'
 
 
 def requested():
@@ -57,7 +58,8 @@ def install_wheel(run):
         sdk = Path(temp) / 'out/buildkite/sdk'
         wheel = sdk / wheel_name
         manifest = prepare.verify_sdk(wheel, sdk / 'sdk-candidate.json', commit)
-        if manifest['version'] != version or manifest['files'][wheel_name] != digest:
+        if (manifest['build_id'] != build or manifest['version'] != version
+                or manifest['files'][wheel_name] != digest):
             raise ValueError('SDK manifest does not match the frozen wheel')
         remote = '/tmp/' + wheel_name
         run.kube('-n', run.id, 'cp', str(wheel), 'node1:' + remote, '-c', 'platform', timeout=60)
@@ -83,10 +85,10 @@ def execute_probe(run, identity, config, destination):
                 '/opt/adx/e2e/afs_sdk_compat_probe.py', '--input', input_path, '--output', output_path, timeout=600)
     report = json.loads(run.execute('node1', 'cat', output_path))
     destination.write_text(json.dumps(report, indent=2) + '\n')
-    if report['status'] != 'passed' or report['cleanup_errors']:
-        raise ValueError('SDK probe failed; see ' + str(destination))
     for node in run.nodes:
         run.helper(node, 'empty', node)
+    if report['status'] != 'passed' or report['cleanup_errors']:
+        raise ValueError('SDK probe failed; see ' + str(destination))
     return report
 
 
@@ -149,6 +151,10 @@ def scenarios(product, checks):
     current = str(ROOT / 'afs/tests')
     sys.path.insert(0, current)
     failures = []
+    # #280 still puts the workspace in a per-root-generation directory.
+    old_backing = 'root-' + 'workspace'.encode().hex() + '-e*'
+    backing = old_backing if identity['server_commit'] == OLD_SERVER else 'workspace'
+    retired = False
     try:
         from fixtures.common import Case, DfsProfile
         from fixtures.multivm import Cluster
@@ -166,7 +172,8 @@ def scenarios(product, checks):
                 output.mkdir(parents=True)
                 profile = DfsProfile(copies=2, replica_failure='strict') if mode == 'dfs' else None
                 case = Case('afs.sdk.compat.' + mode, ('cluster-sdk',), mode, (), None, profile=profile)
-                cluster = Cluster(product.config, inputs, output, case, 'afs-test-' + uuid.uuid4().hex)
+                cluster = Cluster(product.config, inputs, output, case, 'afs-test-' + uuid.uuid4().hex,
+                                  owner_bind_backing=backing)
                 product.active = cluster
                 try:
                     with run.case('afs-sdk-' + mode, checks) as record:
@@ -175,9 +182,13 @@ def scenarios(product, checks):
                         except Exception:
                             for node in reversed(run.nodes):
                                 try:
-                                    run.helper(node, 'cleanup', node, timeout=180)
-                                except Exception as exc:
-                                    product.cleanup_errors.append('runtime cleanup: ' + str(exc))
+                                    run.helper(node, 'empty', node)
+                                except Exception:
+                                    retired = True
+                                    try:
+                                        run.helper(node, 'cleanup', node, timeout=180)
+                                    except Exception as exc:
+                                        product.cleanup_errors.append('runtime cleanup: ' + str(exc))
                             raise
                         finally:
                             cleanup = cluster.cleanup()
@@ -190,7 +201,7 @@ def scenarios(product, checks):
                             raise ValueError('SDK recursive=False contract failed; see sdk-result.json')
                 except Exception as exc:
                     failures.append(f'{mode}: {exc}')
-                    if product.cleanup_errors:
+                    if retired or product.cleanup_errors:
                         break
         if failures:
             raise ValueError('; '.join(failures))

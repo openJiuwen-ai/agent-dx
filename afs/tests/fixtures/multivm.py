@@ -165,7 +165,7 @@ def validate(config, cases):
 
 
 class Cluster:
-    def __init__(self, config, binary_dir, output, case, root_token):
+    def __init__(self, config, binary_dir, output, case, root_token, *, owner_bind_backing="workspace"):
         self.config = config
         self.binary_dir = Path(binary_dir)
         self.output = Path(output)
@@ -188,6 +188,7 @@ class Cluster:
         self.uid = config["uid"]
         self.gid = config["gid"]
         self.bind = False
+        self.owner_bind_backing = owner_bind_backing
         self.helpers = {}
         self.effective = {}
         self.memory_mounts = {}
@@ -723,15 +724,17 @@ class Cluster:
                 assert {'nosuid', 'nodev'} <= options and mount.get('propagation') == 'private', (
                     'owner bind policy', mount
                 )
-                value = self.python(
+                self.python(
                     role,
                     (
                         "from pathlib import Path\np=Path(sys.argv[1]);a=os.stat(sys.argv[2]);"
-                        'b=(p/"workspace").stat();assert '
+                        "sources=list(p.glob(sys.argv[3]));assert len(sources)==1,sources;"
+                        "b=sources[0].stat();assert "
                         "(a.st_dev,a.st_ino)==(b.st_dev,b.st_ino)"
                     ),
                     self.role_dir(role) + "/state/ownerfs",
                     path,
+                    self.owner_bind_backing,
                     owner=False,
                 )
             else:
