@@ -10,7 +10,7 @@ import uuid
 from fixtures.common import Blocked, Case, DfsProfile, write_json
 from fixtures.multivm import Cluster, NAMES, validate
 from suites.operations import peer_counter, permissions, wait_read
-from tools.protocol_admission import exercise_admission_lane
+from tools.protocol_admission import exercise_admission_lane, protocol_versions
 from tools.version_switch import artifact_pair, install, owner_identity, run_phase, running_identity
 
 
@@ -191,7 +191,8 @@ def exercise_lane(cluster, operation, phases):
             run_phase(phases, 'permissions', lambda: permissions(cluster))
 
 
-def exercise(config, old_inputs, new_inputs, output, selection, *, admission=None):
+def exercise(config, old_inputs, new_inputs, output, selection, *, admission=None, admission_versions=None):
+    protocols = protocol_versions(admission_versions) if admission else None
     output.mkdir()
     old, new = artifact_pair(old_inputs, new_inputs)
     identities = {'old': old, 'new': new}
@@ -221,8 +222,8 @@ def exercise(config, old_inputs, new_inputs, output, selection, *, admission=Non
         cluster.record('protocol.versions', role_identities)
         signal.alarm(240)
         try:
-            if admission:
-                exercise_admission_lane(cluster, phases)
+            if protocols:
+                exercise_admission_lane(cluster, phases, protocols)
             else:
                 exercise_lane(cluster, operation, phases)
             if all(p['status'] == 'passed' for p in phases.values()):

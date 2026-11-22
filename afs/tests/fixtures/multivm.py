@@ -724,19 +724,23 @@ class Cluster:
                 assert {'nosuid', 'nodev'} <= options and mount.get('propagation') == 'private', (
                     'owner bind policy', mount
                 )
-                self.python(
+                backing = self.python(
                     role,
                     (
                         "from pathlib import Path\np=Path(sys.argv[1]);a=os.stat(sys.argv[2]);"
-                        "sources=list(p.glob(sys.argv[3]));assert len(sources)==1,sources;"
+                        "sources=list(p.glob(sys.argv[3])) if sys.argv[3] else "
+                        "[d for d in p.iterdir() if d.is_dir() and not d.is_symlink() and d.samefile(sys.argv[2])];"
+                        "assert len(sources)==1,sources;"
                         "b=sources[0].stat();assert "
-                        "(a.st_dev,a.st_ino)==(b.st_dev,b.st_ino)"
+                        "(a.st_dev,a.st_ino)==(b.st_dev,b.st_ino);print(sources[0])"
                     ),
                     self.role_dir(role) + "/state/ownerfs",
                     path,
-                    self.owner_bind_backing,
+                    self.owner_bind_backing or '',
                     owner=False,
                 )
+                if self.owner_bind_backing is None:
+                    self.record('ownerfs.bind_backing.' + role, backing['stdout'].strip())
             else:
                 assert mount["source"] == "afs-" + self.mode, mount
             self.record("topology." + role, mount)

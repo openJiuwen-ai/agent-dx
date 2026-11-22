@@ -4,6 +4,7 @@ import argparse
 from dataclasses import asdict
 from hashlib import sha256
 import importlib.metadata
+from inspect import signature
 import json
 import os
 from pathlib import Path
@@ -60,6 +61,22 @@ def mkdir_capability(handle):
     return result
 
 
+def check_mkdir_capability(handle, evidence, *, required):
+    supported = 'recursive' in signature(handle.files.make_dir).parameters
+    evidence['sdk_capabilities'] = {'recursive_false': supported}
+    if not supported:
+        if required:
+            evidence['recursive_false'] = {
+                'status': 'failed',
+                'error': 'required SDK capability recursive-false is missing from Files.make_dir',
+            }
+        return
+    try:
+        evidence['recursive_false'] = mkdir_capability(handle)
+    except Exception:
+        evidence['recursive_false'] = {'status': 'failed', 'error': traceback.format_exc()}
+
+
 def files(left, right, connection, config, evidence):
     from adx_environment import Environment
 
@@ -88,11 +105,7 @@ def files(left, right, connection, config, evidence):
     evidence['file_api'] = {'write_read_sha256': sha256(payload).hexdigest(), 'removed_errno': 2}
     if config.get('replica_seed'):
         write_synced(left, '/afs/sdk-compat-replica', config['replica_seed'].encode() * 2048)
-    if config.get('explicit_mkdir'):
-        try:
-            evidence['recursive_false'] = mkdir_capability(left)
-        except Exception:
-            evidence['recursive_false'] = {'status': 'failed', 'error': traceback.format_exc()}
+    check_mkdir_capability(left, evidence, required='recursive-false' in config.get('required_capabilities', ()))
 
 
 def probe(config, report):
