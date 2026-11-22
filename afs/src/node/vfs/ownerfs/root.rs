@@ -2185,9 +2185,9 @@ impl RootManager {
         // a live backing directory. Meta validates its exact prepare ID when
         // issuing the replacement grant. Preserve any unproven record in place.
         for record in records.values().filter(|record| record.has_legacy_layout()) {
-            if !active
+            if active
                 .get(&record.id)
-                .is_some_and(|location| location.epoch == record.epoch)
+                .is_none_or(|location| location.epoch != record.epoch)
                 || self.placement(record)? != Placement::Live
             {
                 return Err(invalid_grant(

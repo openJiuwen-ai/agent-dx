@@ -328,7 +328,7 @@ mod tests {
         let locked = catalog.lock_and_open().unwrap();
         let name = "bench-private-v10";
         let id = RootId(format!("root-{}", hex(name.as_bytes())));
-        let data_dir = StoragePath::new(&name).unwrap();
+        let data_dir = StoragePath::new(name).unwrap();
         disk.mkdir(&data_dir, 0o700).unwrap();
         let session = "12345678-1234-1234-1234-123456789abc";
         let record = LocalRootRecord {
