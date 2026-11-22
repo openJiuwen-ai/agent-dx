@@ -329,7 +329,7 @@ def catalog_rejections(cluster, new_inputs, new, phases):
                 start_role(cluster, "A", new)
             except RuntimeError as exc:
                 if "product exited before ready" not in str(exc):
-                    raise AssertionError(exc)
+                    raise AssertionError(exc) from exc
             else:
                 raise AssertionError("Home unexpectedly started with " + name)
             exit_status = channel.call("status")["A"]["returncode"]
