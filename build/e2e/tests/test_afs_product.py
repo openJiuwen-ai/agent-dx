@@ -78,8 +78,8 @@ class ProductContracts(unittest.TestCase):
         old_sdk = SimpleNamespace(files=SimpleNamespace(make_dir=lambda path: bool(path)))
         missing = {}
         probe.check_mkdir_capability(old_sdk, missing, required=True)
-        self.assertEqual(missing['sdk_capabilities'], {'recursive_false': False})
-        self.assertEqual(missing['recursive_false']['status'], 'failed')
+        self.assertEqual(missing.get('sdk_capabilities'), {'recursive_false': False})
+        self.assertEqual(missing.get('recursive_false', {}).get('status'), 'failed')
         optional = {}
         probe.check_mkdir_capability(old_sdk, optional, required=False)
         self.assertNotIn('recursive_false', optional)
