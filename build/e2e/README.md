@@ -164,6 +164,19 @@ version-switch phase on its own. This phase uses isolated local-file Meta state
 and switches binaries after stopping the processes. Rollback restores the
 pre-upgrade Meta and Node data with the baseline binaries.
 
+`ADX_E2E_TARGET_CASE=afs-component-mixed-protocols` uses the same baseline
+and candidate artifact parameters. To check rejection of an incompatible Node,
+choose `AFS_E2E_PROTOCOL_ADMISSION=old-meta` or `new-meta` and supply
+`AFS_E2E_PROTOCOL_VERSIONS=<baseline>,<candidate>` from the selected
+artifacts' protocol versions. Both directions use the same value order.
+
+For a separately built Python SDK, use `ADX_E2E_TARGET_CASE=afs-sdk`.
+`ADX_E2E_ARTIFACT_BUILD` and `ADX_E2E_ARTIFACT_COMMIT` pin the server.
+`AFS_E2E_SDK_COMPAT_BUILD` and `AFS_E2E_SDK_COMPAT_COMMIT` pin the SDK's
+Buildkite build UUID and full SHA. The selected `sdk-package` manifest supplies
+the wheel version and SHA256. See the [AFS compatibility case catalog](../../docs/testing/afs-case-prompts.md#version-posix-sdk)
+for the Docker equivalent and the assertions.
+
 The SDK restart case keeps one real Environment on each AFS data role. An
 SDK-launched background workload performs checked, synced file I/O while the
 second Adxlet is paused; the fixture then resumes it, restarts both Adxlets

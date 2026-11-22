@@ -74,8 +74,9 @@ class ProductContracts(unittest.TestCase):
 
     def test_frozen_sdk_local_input_uses_transport_and_rejects_changed_bytes(self):
         compat = load('afs_sdk_compat_test', HERE / 'kubernetes/afs_sdk_compat.py')
-        commit = next(iter(compat.CANDIDATES))
-        version, _ = compat.CANDIDATES[commit]
+        commit = 'a' * 40
+        server = 'b' * 40
+        version = '3.2.1rc7'
         build = '01000000-0000-0000-0000-000000000001'
         wheel_name = f'adx_environment-{version}-py3-none-any.whl'
         content = b'frozen SDK artifact'
@@ -84,17 +85,27 @@ class ProductContracts(unittest.TestCase):
             root = Path(directory)
             wheel = root / wheel_name
             wheel.write_bytes(content)
-            (root / 'sdk-candidate.json').write_text(json.dumps({
-                'schema_version': 1, 'commit': commit, 'build_id': build,
+            manifest = root / 'sdk-candidate.json'
+            candidate = {
+                'schema_version': 1, 'name': 'adx-environment', 'commit': commit, 'build_id': build,
                 'version': version, 'files': {wheel_name: digest},
-            }))
+            }
             product = Mock()
-            product.run.harness = {'product_commit': commit}
+            product.run.harness = {'product_commit': server}
             product.run.output = root
             product.run.execute.return_value = digest
             env = {compat.DIRECTORY_ENV: directory, compat.BUILD_ENV: build, compat.COMMIT_ENV: commit}
-            with patch.dict(os.environ, env), patch.dict(compat.CANDIDATES, {commit: (version, digest)}):
-                self.assertEqual(compat.install_wheel(product)['sha256'], digest)
+            with patch.dict(os.environ, env):
+                for wrong in ({'commit': server}, {'build_id': 'other'}, {'version': 'other'},
+                              {'files': {'../' + wheel_name: digest}}, {'name': 'other-sdk'}):
+                    manifest.write_text(json.dumps({**candidate, **wrong}))
+                    with self.assertRaises(ValueError):
+                        compat.install_wheel(product)
+                product.copy_to.assert_not_called()
+                manifest.write_text(json.dumps(candidate))
+                identity = compat.install_wheel(product)
+                self.assertEqual((identity['sha256'], identity['version'], identity['server_commit']),
+                                 (digest, version, server))
                 product.copy_to.assert_called_once_with('node1', wheel.resolve(), remote_join('/tmp', wheel_name))
                 wheel.write_bytes(b'new bytes under the same name')
                 with self.assertRaisesRegex(ValueError, 'SDK artifact digest mismatch'):

@@ -3,19 +3,25 @@
 from hashlib import sha256
 import json
 from posixpath import join as remote_join
+import re
 import time
 
 from fixtures.common import Blocked
 from suites.operations import wait_read
 from tools.version_switch import install, running_identity, run_phase
 
-FROZEN_PROTOCOLS = {
-    '18f9c673812dbc988185136011023ea28bdd38f7': 7,
-    'be16d72463bb30ae355178795fb4476adacf4c6d': 10,
-}
 REJECTION_CODE = 'ErrorCode(50659329)'
 SEED = b'acknowledged before incompatible B starts\n' * 2048
 DURING = b'acknowledged after Meta rejected B\n' * 2048
+
+
+def protocol_versions(value):
+    if not re.fullmatch(r'[1-9][0-9]{0,9},[1-9][0-9]{0,9}', value or ''):
+        raise ValueError('admission requires protocol numbers as <baseline>,<candidate>')
+    old, new = map(int, value.split(','))
+    if old == new or max(old, new) > 0xFFFFFFFF:
+        raise ValueError('admission requires two distinct u32 protocol numbers')
+    return {'old': old, 'new': new}
 
 
 def sessions(cluster, expected):
@@ -36,11 +42,10 @@ def verify_b_unmounted(cluster):
     return worker['processes'].get('B')
 
 
-def reject_b(cluster, healthy, incompatible):
+def reject_b(cluster, healthy, incompatible, protocols):
     identities = cluster.version_identities
-    local = identities[healthy]
     peer = identities[incompatible]
-    expected, incoming = (FROZEN_PROTOCOLS[item['commit']] for item in (local, peer))
+    expected, incoming = protocols[healthy], protocols[incompatible]
     if verify_b_unmounted(cluster) is not None:
         raise AssertionError('incompatible admission probe requires a fresh, stopped B')
     install(cluster, cluster.version_inputs[incompatible], peer, roles=('B',))
@@ -152,18 +157,16 @@ def recover(cluster, healthy, replica_data):
         cluster.case.function(cluster)
 
 
-def exercise_admission_lane(cluster, phases):
+def exercise_admission_lane(cluster, phases, protocols):
     if cluster.meta_store_toml != 'meta_store = "local-file"\n':
         raise Blocked('protocol admission probes require a fresh private Meta store')
     healthy = cluster.role_versions['M']
     incompatible = 'new' if healthy == 'old' else 'old'
-    if set(identity['commit'] for identity in cluster.version_identities.values()) != set(FROZEN_PROTOCOLS):
-        raise ValueError('protocol admission probes require the exact #280 and #294 artifacts')
     run_phase(phases, 'same_protocol_baseline', lambda: setup(cluster))
     if phases['same_protocol_baseline']['status'] != 'passed':
         return
     a_pid = cluster.channel('A').call('status')['A']['pid']
-    run_phase(phases, 'reject_incompatible_b', lambda: reject_b(cluster, healthy, incompatible))
+    run_phase(phases, 'reject_incompatible_b', lambda: reject_b(cluster, healthy, incompatible, protocols))
     if phases['reject_incompatible_b']['status'] != 'passed':
         return
     run_phase(phases, 'healthy_a_read_write', lambda: continued_service(cluster, a_pid))

@@ -230,9 +230,11 @@
 | `ownerfs.protocol.files.<layout>` | 确认 B 注册且 A 是 workspace Home。B 读 A 的文件后写入，由 A 回读。双方读取、写入 gRPC 字节计数应增足正文长度，任意一个字节错误应报红。 | [混跑 #123](https://buildkite.com/agent-dx/agent-dx-full-test/builds/123) · [改坏正文 #146](https://buildkite.com/agent-dx/agent-dx-full-test/builds/146) |
 | `dfs.protocol.peer-read.<layout>` | 用单副本让 A、B 各写一份独立文件，由另一端第一次打开。同时验 SHA256 和 reader 的远端读计数。核对注册、会话与可适用的心跳，普通读写后重启 B 得到新会话。 | [混跑 #123](https://buildkite.com/agent-dx/agent-dx-full-test/builds/123) · [注入注册失败 #145](https://buildkite.com/agent-dx/agent-dx-full-test/builds/145) |
 | `dfs.protocol.replica.<layout>` | 严格双副本，A 写入并 `fsync` 后停止 A，再从 B 第一次打开文件并验证正文。B 没有实际可用副本应报红。 | [混跑 #123](https://buildkite.com/agent-dx/agent-dx-full-test/builds/123) |
-| `{ownerfs,dfs}.protocol.admission.{old-meta,new-meta}` | 只启动 M 和 A。换入异协议 B，核对 `50659329`（`FailedPrecondition`）、未挂载、无会话和无 DFS 副本落点。DFS 使用两副本且允许一份确认的降级策略。A 保持 PID，读回旧文件和 `fsync` 后的新文件。换回同协议 B 并确认就绪，再验证 OwnerFs gRPC 双向和停止 A 后的 DFS 三笔 B 副本冷读。 | `AFS_E2E_PROTOCOL_ADMISSION=old-meta\|new-meta`，[#163](https://buildkite.com/agent-dx/agent-dx-full-test/builds/163) · [#164](https://buildkite.com/agent-dx/agent-dx-full-test/builds/164) |
+| `{ownerfs,dfs}.protocol.admission.{old-meta,new-meta}` | 只启动 M 和 A。换入异协议 B，核对 `50659329`（`FailedPrecondition`）和指定的两个协议号，同时验证未挂载、无会话和无 DFS 副本落点。DFS 使用两副本且允许一份确认的降级策略。A 保持 PID，读回旧文件和 `fsync` 后的新文件。换回同协议 B 并确认就绪，再验证 OwnerFs gRPC 双向和停止 A 后的 DFS 三笔 B 副本冷读。 | `AFS_E2E_PROTOCOL_ADMISSION=old-meta\|new-meta`，配合 `AFS_E2E_PROTOCOL_VERSIONS`。[#163](https://buildkite.com/agent-dx/agent-dx-full-test/builds/163) · [#164](https://buildkite.com/agent-dx/agent-dx-full-test/builds/164) |
 
 `<layout>` 的六个后缀为 `all-old`、`all-new`、`new-meta`、`old-meta`、`old-source`、`new-source`。18 项实跑配对是 #288 和 #294，同为协议号 10，覆盖 gRPC。#280／#294 的协议号是 7／10，实跑覆盖准入拒绝和恢复。带新能力的混合请求、RDMA 的版本扩展字段须另作验收。
+
+准入专项由执行者为两份制品提供协议号，顺序固定为基线、候选。比如复跑 #280／#294 时填 `AFS_E2E_PROTOCOL_VERSIONS=7,10`。切换 `old-meta`／`new-meta` 方向时保留这个顺序。用例对照实际失败日志中的两侧协议号。
 
 <a id="version-posix-sdk"></a>
 ### POSIX 与独立 Python SDK
@@ -240,14 +242,14 @@
 | 用例 ID 或选集 | 编写测试的短 Prompt | 入口与证据 |
 | --- | --- | --- |
 | `{ownerfs,dfs}.version.posix` | 在旧版、换新版和回到旧版三阶段执行同一组真实 FUSE 操作。验 rename 后旧名消失、截短精确、新打开权限错误 EACCES、unlink 和复用文件名后旧 FD 仍读旧字节。故意忽略截断应只在指定版本阶段报红。 | 历史隔离测试补丁 `AFS_E2E_VERSION_POSIX=1`，[对照 #125](https://buildkite.com/agent-dx/agent-dx-full-test/builds/125) · [实版本 #131](https://buildkite.com/agent-dx/agent-dx-full-test/builds/131) · [故障 #134](https://buildkite.com/agent-dx/agent-dx-full-test/builds/134) |
-| `afs-sdk-{ownerfs,dfs}` 的 `common-sdk-and-afs` | 分别装固定 rc8、rc12 wheel，对冻结 #280、#294 服务做四组配对。核对 wheel 摘要和实际导入目录，验证 Environment create/get/reattach/delete、挂载身份、跨节点 `fsync` 后读回及 Files API。OwnerFs 查 Home/gRPC，DFS 停 A 后读 B 的独立副本。 | [共享兼容探针](../../build/e2e/afs_sdk_compat_probe.py)，`afs-sdk` 定向，[#170](https://buildkite.com/agent-dx/agent-dx-full-test/builds/170) 至 [#173](https://buildkite.com/agent-dx/agent-dx-full-test/builds/173) |
-| `afs-sdk-{ownerfs,dfs}` 的 `recursive-false` | 在父目录缺失时发送 rc12 的 `recursive=False`。要求明确的不支持错误或非递归的 ENOENT，父、子目录均应不存在。超时、权限错误、意外成功或目录副作用都报红。原默认递归仍须工作。 | [新版对照 #173](https://buildkite.com/agent-dx/agent-dx-full-test/builds/173) · [旧端实际报红 #172](https://buildkite.com/agent-dx/agent-dx-full-test/builds/172) |
+| `afs-sdk-{ownerfs,dfs}` 的 `common-sdk-and-afs` | 分别安装选定版本的 SDK wheel，与两份服务端制品交叉配对。核对 wheel 摘要和实际导入目录，验证 Environment create/get/reattach/delete、挂载身份、跨节点 `fsync` 后读回及 Files API。OwnerFs 查 Home/gRPC，DFS 停 A 后读 B 的独立副本。 | [共享兼容探针](../../build/e2e/afs_sdk_compat_probe.py)，`afs-sdk` 定向，[#170](https://buildkite.com/agent-dx/agent-dx-full-test/builds/170) 至 [#173](https://buildkite.com/agent-dx/agent-dx-full-test/builds/173) |
+| `afs-sdk-{ownerfs,dfs}` 的 `recursive-false` | SDK 的 `make_dir` 暴露 `recursive` 参数时，在父目录缺失时发送 `recursive=False`。要求明确的不支持错误或非递归的 ENOENT，父、子目录均应不存在。超时、权限错误、意外成功或目录副作用都报红。原默认递归仍须工作。SDK 无此参数时记录能力缺失。 | [新版对照 #173](https://buildkite.com/agent-dx/agent-dx-full-test/builds/173) · [旧端实际报红 #172](https://buildkite.com/agent-dx/agent-dx-full-test/builds/172) |
 
 隔离分支和产品的提交独立保存。旧端明确拒绝、夹具缺条件、产品断言失败和清理错误分别记录。OwnerFs 的部分 POSIX 版本场景受旧 catalog 打开失败阻挡，不能用同版对照替代两版验证。
 
 #### SDK 兼容用例复跑
 
-选择一对已冻结的服务端与 SDK 构建。当前兼容试点允许 #280／#294 的四个组合。其他版本对接时明确记录制品、旧布局和可用能力。校验服务端 bundle、registry manifest 和对应镜像。SDK wheel 与 `sdk-candidate.json` 来自 SDK 构建，由该清单和固定摘要共同校验。
+由执行者选两份 AFS-on Base 构建。要测同一个 MR，可分别用目标分支的固定基线和合入该 MR 的对应提交。每次指定一份作服务端、一份供 SDK wheel，互换两端再跑，同版本组合可做对照。使用现有流程校验服务端 bundle、registry manifest 和镜像。SDK 始终先读指定 `sdk-package` 的 `sdk-candidate.json`，核对构建 UUID、提交、包名及版本，再校验清单所列 wheel 的 SHA256、传输摘要、实际安装版本和导入路径。
 
 - Buildkite 使用 `agent-dx-full-test` 的 `ADX_E2E_TARGET_CASE=afs-sdk` 和 `ADX_WITH_AFS=1`。`ADX_E2E_ARTIFACT_BUILD`／`ADX_E2E_ARTIFACT_COMMIT` 指向服务端，`AFS_E2E_SDK_COMPAT_BUILD`／`AFS_E2E_SDK_COMPAT_COMMIT` 指向 SDK。Build 参数传 Buildkite 构建 UUID。
 - Linux 直跑使用现有 Docker 固定包入口。SDK 目录只需对应的 wheel 和候选清单，服务端镜像归档用 [镜像导出工具](../../build/e2e/export_images.py) 生成并验原 registry digest 和 image ID。执行卷需要 Linux FUSE、ext4 和已有 Docker／cgroup 前置能力。输入以对应架构的冻结包为准。

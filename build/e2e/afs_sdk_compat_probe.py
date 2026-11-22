@@ -4,6 +4,7 @@ import argparse
 from dataclasses import asdict
 from hashlib import sha256
 import importlib.metadata
+from inspect import signature
 import json
 import os
 from pathlib import Path
@@ -88,7 +89,9 @@ def files(left, right, connection, config, evidence):
     evidence['file_api'] = {'write_read_sha256': sha256(payload).hexdigest(), 'removed_errno': 2}
     if config.get('replica_seed'):
         write_synced(left, '/afs/sdk-compat-replica', config['replica_seed'].encode() * 2048)
-    if config.get('explicit_mkdir'):
+    supports_recursive = 'recursive' in signature(left.files.make_dir).parameters
+    evidence['sdk_capabilities'] = {'recursive_false': supports_recursive}
+    if supports_recursive:
         try:
             evidence['recursive_false'] = mkdir_capability(left)
         except Exception:

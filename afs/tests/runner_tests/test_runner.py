@@ -49,6 +49,16 @@ class SelectionTests(unittest.TestCase):
             self.assertGreaterEqual(groups, {f"{prefix}{i:02}" for i in range(1, count + 1)})
 
 
+class AdmissionProtocolTests(unittest.TestCase):
+    def test_expectations_are_supplied_in_baseline_then_candidate_order(self):
+        from tools.protocol_admission import protocol_versions
+
+        self.assertEqual(protocol_versions('73,41'), {'old': 73, 'new': 41})
+        for invalid in (None, '', '7', '7,7', '0,7', '7,4294967296', '7,10,11', '7,garbage'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                protocol_versions(invalid)
+
+
 class WorkerProtocolTests(unittest.TestCase):
     def test_child_exit_status_is_retained_and_not_inferred_from_pid(self):
         from fixtures.worker import Worker
