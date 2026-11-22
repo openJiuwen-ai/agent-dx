@@ -140,8 +140,7 @@ def exercise(product, identity, cluster, output, record):
     feature = report.get('recursive_false')
     if feature:
         record['subcases'].append({'id': 'recursive-false', **feature})
-        if feature['status'] != 'passed':
-            raise ValueError('SDK recursive=False contract failed; see sdk-result.json')
+    return feature
 
 
 def scenarios(product, checks):
@@ -172,7 +171,7 @@ def scenarios(product, checks):
                 try:
                     with run.case('afs-sdk-' + mode, checks) as record:
                         try:
-                            exercise(product, identity, cluster, output, record)
+                            feature = exercise(product, identity, cluster, output, record)
                         except Exception:
                             for node in reversed(run.nodes):
                                 try:
@@ -187,6 +186,8 @@ def scenarios(product, checks):
                                 product.cleanup_errors.extend(cleanup['errors'] or ['AFS cleanup unconfirmed'])
                             if product.cleanup_errors:
                                 raise ValueError('; '.join(product.cleanup_errors))
+                        if feature and feature['status'] != 'passed':
+                            raise ValueError('SDK recursive=False contract failed; see sdk-result.json')
                 except Exception as exc:
                     failures.append(f'{mode}: {exc}')
                     if product.cleanup_errors:
