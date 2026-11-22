@@ -232,23 +232,29 @@ def catalog_recovery(cluster, old_inputs, new_inputs, old, new, phases):
             root_id = root_location(cluster, new_root)["root_id"]
             new_record = catalog_record(cluster, root_id)
             written = json.loads(cluster.command("A", ["cat", new_record])["stdout"])
-            assert written.keys() == original_wire.keys(), written
-            assert written["version"] == original_wire["version"] and written["adopted"] is False, written
+            if written.keys() != original_wire.keys():
+                raise AssertionError(written)
+            if written["version"] != original_wire["version"] or written["adopted"] is not False:
+                raise AssertionError(written)
             cluster.record("catalog.new_record", written)
         quiesce(cluster)
         start_all(cluster, new)
         check_seed(cluster, expected, location)
         wait_read(cluster, "A", "after-upgrade", AFTER)
         wait_read(cluster, "B", "after-upgrade", AFTER)
-        assert cluster.channel("A").call("hash", path=record) == original_record
+        if cluster.channel("A").call("hash", path=record) != original_record:
+            raise AssertionError()
 
     def binary_rollback():
         quiesce(cluster)
         install(cluster, old_inputs, old)
         start_all(cluster, old)
-        assert cluster.record("state.binary_rollback", state_identity(cluster)) == original_state
-        assert cluster.record("config.binary_rollback", config_identity(cluster)) == original_config
-        assert cluster.channel("A").call("hash", path=record) == original_record
+        if cluster.record("state.binary_rollback", state_identity(cluster)) != original_state:
+            raise AssertionError()
+        if cluster.record("config.binary_rollback", config_identity(cluster)) != original_config:
+            raise AssertionError()
+        if cluster.channel("A").call("hash", path=record) != original_record:
+            raise AssertionError()
         check_seed(cluster, expected, location)
         wait_read(cluster, "A", "after-upgrade", AFTER)
         wait_read(cluster, "B", "after-upgrade", AFTER)
@@ -261,7 +267,8 @@ def catalog_recovery(cluster, old_inputs, new_inputs, old, new, phases):
         quiesce(cluster)
         archived = remote_join(cluster.role_dir("A"), "state-after-upgrade", "ownerfs")
         recovery_point(cluster, restore=True)
-        assert cluster.record("state.snapshot_rollback", state_identity(cluster)) != original_state
+        if cluster.record("state.snapshot_rollback", state_identity(cluster)) == original_state:
+            raise AssertionError()
         install(cluster, old_inputs, old)
         start_all(cluster, old)
         check_seed(cluster, expected, location)
@@ -321,21 +328,30 @@ def catalog_rejections(cluster, new_inputs, new, phases):
             try:
                 start_role(cluster, "A", new)
             except RuntimeError as exc:
-                assert "product exited before ready" in str(exc), exc
+                if "product exited before ready" not in str(exc):
+                    raise AssertionError(exc)
             else:
                 raise AssertionError("Home unexpectedly started with " + name)
             exit_status = channel.call("status")["A"]["returncode"]
-            assert exit_status == 1, exit_status
-            assert not channel.call("snapshot")["mounts"], "Home mounted a filesystem after rejecting catalog"
+            if exit_status != 1:
+                raise AssertionError(exit_status)
+            if channel.call("snapshot")["mounts"]:
+                raise AssertionError("Home mounted a filesystem after rejecting catalog")
             failed_log = cluster.command("A", ["cat", log])["stdout"]
             (cluster.output / (name + ".log")).write_text(failed_log)
-            assert diagnostic in failed_log, failed_log[-4000:]
-            assert "ownerfs.adopt.adopted" not in failed_log, failed_log[-4000:]
-            assert catalog_fingerprint(cluster, record) == before
-            assert [catalog_fingerprint(cluster, path) for path in paths] == original_data
+            if diagnostic not in failed_log:
+                raise AssertionError(failed_log[-4000:])
+            if "ownerfs.adopt.adopted" in failed_log:
+                raise AssertionError(failed_log[-4000:])
+            if catalog_fingerprint(cluster, record) != before:
+                raise AssertionError()
+            if [catalog_fingerprint(cluster, path) for path in paths] != original_data:
+                raise AssertionError()
             root = root_location(cluster, "workspace")
-            assert all(root[key] == value for key, value in location.items()), root
-            assert json.loads(cluster.health("M", "/v1/store"))["entities"].get("root", 0) == initial
+            if not all(root[key] == value for key, value in location.items()):
+                raise AssertionError(root)
+            if json.loads(cluster.health("M", "/v1/store"))["entities"].get("root", 0) != initial:
+                raise AssertionError()
             cluster.record(name, {"diagnostic": diagnostic, "exit": exit_status, "mounts": [], "record": before,
                                   "data": original_data, "identity": location, "meta_roots": initial})
         finally:
@@ -364,10 +380,12 @@ def catalog_rejections(cluster, new_inputs, new, phases):
             start_role(cluster, "B", new)
             cluster.topology()
             wait_read(cluster, "B", "seed", SEED)
-            assert owner_identity(cluster) == location
+            if owner_identity(cluster) != location:
+                raise AssertionError()
             cluster.python("A", "assert not os.path.lexists(sys.argv[1])",
                            remote_join(cluster.mount("A"), original["data_dir"]), owner=False)
-            assert root_location(cluster, "adoption-canary")["status"] == "serving"
+            if root_location(cluster, "adoption-canary")["status"] != "serving":
+                raise AssertionError()
 
         run_phase(phases, "legacy_directory_keeps_its_owner", recover_with_adoption_enabled)
 
