@@ -1,7 +1,9 @@
 """AFS SDK fixtures and required gate contracts, without product execution."""
 
+from hashlib import sha256
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -68,6 +70,35 @@ class ProductContracts(unittest.TestCase):
                     dict(report, cleanup_errors=['environment still running'])):
             with self.assertRaises(ValueError):
                 product.validate_sdk_result(bad, 'dfs')
+
+    def test_frozen_sdk_local_input_uses_transport_and_rejects_changed_bytes(self):
+        compat = load('afs_sdk_compat_test', HERE / 'kubernetes/afs_sdk_compat.py')
+        commit = next(iter(compat.CANDIDATES))
+        version, _ = compat.CANDIDATES[commit]
+        build = '01000000-0000-0000-0000-000000000001'
+        wheel_name = f'adx_environment-{version}-py3-none-any.whl'
+        content = b'frozen SDK artifact'
+        digest = sha256(content).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = root / wheel_name
+            wheel.write_bytes(content)
+            (root / 'sdk-candidate.json').write_text(json.dumps({
+                'schema_version': 1, 'commit': commit, 'build_id': build,
+                'version': version, 'files': {wheel_name: digest},
+            }))
+            product = Mock()
+            product.run.harness = {'product_commit': commit}
+            product.run.output = root
+            product.run.execute.return_value = digest
+            env = {compat.DIRECTORY_ENV: directory, compat.BUILD_ENV: build, compat.COMMIT_ENV: commit}
+            with patch.dict(os.environ, env), patch.dict(compat.CANDIDATES, {commit: (version, digest)}):
+                self.assertEqual(compat.install_wheel(product)['sha256'], digest)
+                product.copy_to.assert_called_once_with('node1', wheel.resolve(), '/tmp/' + wheel_name)
+                wheel.write_bytes(b'new bytes under the same name')
+                with self.assertRaisesRegex(ValueError, 'SDK artifact digest mismatch'):
+                    compat.install_wheel(product)
+                self.assertEqual(product.copy_to.call_count, 1)
 
     def test_default_afs_gate_cannot_pass_from_zero_exit_or_missing_sdk_results(self):
         gate = load('afs_gate_test', HERE / 'kubernetes/afs_gate.py')

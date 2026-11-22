@@ -89,3 +89,6 @@ class Product(product_core.Product):
 
     def copy_from(self, node, source, destination, timeout=120):
         self.run.copy_from(node, source, destination, timeout)
+
+    def copy_to(self, node, source, destination, timeout=60):
+        self.run.docker('cp', str(source), self.run.owned[node] + ':' + destination, timeout=timeout)
