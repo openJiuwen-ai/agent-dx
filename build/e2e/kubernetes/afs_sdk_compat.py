@@ -1,6 +1,7 @@
 """Optional frozen-wheel matrix for the existing AFS SDK target."""
 
 import hashlib
+from contextlib import contextmanager
 import importlib.util
 import json
 import os
@@ -17,6 +18,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 BUILD_ENV = 'AFS_E2E_SDK_COMPAT_BUILD'
 COMMIT_ENV = 'AFS_E2E_SDK_COMPAT_COMMIT'
+DIRECTORY_ENV = 'AFS_E2E_SDK_COMPAT_DIR'
 INSTALL_DIR = '/opt/adx/client/afs-compat'
 PYTHON = '/opt/adx/client/bin/python'
 REPLICA_SEED = 'isolated SDK replica'
@@ -30,10 +32,27 @@ OLD_SERVER = '18f9c673812dbc988185136011023ea28bdd38f7'
 
 
 def requested():
-    return bool(os.getenv(BUILD_ENV) or os.getenv(COMMIT_ENV))
+    return bool(os.getenv(BUILD_ENV) or os.getenv(COMMIT_ENV) or os.getenv(DIRECTORY_ENV))
 
 
-def install_wheel(run):
+@contextmanager
+def wheel_inputs(build, wheel_name):
+    directory = os.getenv(DIRECTORY_ENV)
+    if directory:
+        yield Path(directory).resolve(strict=True)
+        return
+    agent = shutil.which('buildkite-agent')
+    if not agent:
+        raise ValueError('provide a frozen wheel directory with ' + DIRECTORY_ENV + ' or use buildkite-agent')
+    with tempfile.TemporaryDirectory(prefix='afs-sdk-compat-') as temp:
+        for name in (wheel_name, 'sdk-candidate.json'):
+            subprocess.run([str(Path(agent).resolve()), 'artifact', 'download', 'out/buildkite/sdk/' + name,
+                            '.', '--step', 'sdk-package', '--build', build], cwd=temp, timeout=120, check=True)
+        yield Path(temp) / 'out/buildkite/sdk'
+
+
+def install_wheel(product):
+    run = product.run
     build = os.environ.get(BUILD_ENV, '')
     commit = os.environ.get(COMMIT_ENV, '')
     if not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', build):
@@ -48,21 +67,14 @@ def install_wheel(run):
     script = importlib.util.spec_from_file_location('afs_sdk_prepare', HERE.parent / 'prepare.py')
     prepare = importlib.util.module_from_spec(script)
     script.loader.exec_module(prepare)
-    agent = shutil.which('buildkite-agent')
-    if not agent:
-        raise ValueError('SDK compatibility requires buildkite-agent')
-    with tempfile.TemporaryDirectory(prefix='afs-sdk-compat-') as temp:
-        for name in (wheel_name, 'sdk-candidate.json'):
-            subprocess.run([str(Path(agent).resolve()), 'artifact', 'download', 'out/buildkite/sdk/' + name,
-                            '.', '--step', 'sdk-package', '--build', build], cwd=temp, timeout=120, check=True)
-        sdk = Path(temp) / 'out/buildkite/sdk'
+    with wheel_inputs(build, wheel_name) as sdk:
         wheel = sdk / wheel_name
         manifest = prepare.verify_sdk(wheel, sdk / 'sdk-candidate.json', commit)
         if (manifest['build_id'] != build or manifest['version'] != version
                 or manifest['files'][wheel_name] != digest):
             raise ValueError('SDK manifest does not match the frozen wheel')
         remote = '/tmp/' + wheel_name
-        run.kube('-n', run.id, 'cp', str(wheel), 'node1:' + remote, '-c', 'platform', timeout=60)
+        product.copy_to('node1', wheel, remote)
         try:
             if run.execute('node1', 'sha256sum', remote).split()[0] != digest:
                 raise ValueError('SDK wheel changed in transit')
@@ -147,7 +159,7 @@ def exercise(product, identity, cluster, output, record):
 
 def scenarios(product, checks):
     run = product.run
-    identity = install_wheel(run)
+    identity = install_wheel(product)
     current = str(ROOT / 'afs/tests')
     sys.path.insert(0, current)
     failures = []

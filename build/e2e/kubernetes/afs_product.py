@@ -91,6 +91,10 @@ class Product:
         self.run.kube('-n', self.run.id, 'cp', node + ':' + source,
                       str(destination), '-c', 'platform', timeout=timeout)
 
+    def copy_to(self, node, source, destination, timeout=60):
+        self.run.kube('-n', self.run.id, 'cp', str(source),
+                      node + ':' + destination, '-c', 'platform', timeout=timeout)
+
     def sdk(self, config, destination):
         run = self.run
         run.execute('node1', 'python3', '-c',
