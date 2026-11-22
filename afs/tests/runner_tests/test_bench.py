@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import platform
+from posixpath import join
 import sys
 import tempfile
 import unittest
@@ -248,7 +249,7 @@ class EvictBackendsTests(unittest.TestCase):
     """At most one documented re-evict + re-measure; both attempts are kept as evidence."""
 
     @staticmethod
-    def run_with(results, file_bytes=64 * MIB, source="A"):
+    def run_with(results, file_bytes=64 * MIB, source="A", baseline=None):
         from unittest.mock import patch
 
         suite = load_suite()
@@ -266,7 +267,8 @@ class EvictBackendsTests(unittest.TestCase):
 
         with patch.object(suite, "probe", side_effect=probe):
             try:
-                return suite.evict_backends(Cluster(), list(results), file_bytes, source), calls, None
+                evidence = suite.evict_backends(Cluster(), list(results), file_bytes, source, baseline=baseline)
+                return evidence, calls, None
             except AssertionError as error:
                 return None, calls, error
 
@@ -306,6 +308,90 @@ class EvictBackendsTests(unittest.TestCase):
         flat = measured(("/r/A/state/data.bin", 64 * MIB, 0))
         _, _, error = self.run_with({"A": [flat]})
         self.assertIn("payload", str(error))
+
+    @staticmethod
+    def vanished(measurement, *paths):
+        """A probe result whose listed files vanished (node GC) before they could be opened."""
+        return dict(measurement, errors=[{"path": p, "errno": 2, "error": "No such file or directory"} for p in paths])
+
+    def test_files_reclaimed_between_listing_and_open_count_as_absent(self):
+        from unittest.mock import patch
+
+        suite = load_suite()
+        gone = "/r/A/state/dfs/chunks/old"
+
+        def probe(_c, role, action, *_paths):
+            if action == "evict":
+                return self.vanished({"files": 1, "bytes": 64 * MIB}, gone)
+            return self.vanished(self.source(), gone)
+
+        class Cluster:
+            @staticmethod
+            def role_dir(role):
+                return join("/r", role)
+
+        with patch.object(suite, "probe", side_effect=probe):
+            evidence, cold = suite.evict_backends(Cluster(), ["A"], 64 * MIB, "A")
+        self.assertTrue(cold)
+        self.assertEqual(evidence["A"]["enoent"], {"evict": 1, "resident": 1})
+        self.assertEqual(evidence["A"]["payload"]["resident_bytes"], 0)
+
+    def test_other_probe_errors_still_fail(self):
+        from unittest.mock import patch
+
+        suite = load_suite()
+
+        def probe(_c, role, action, *_paths):
+            result = {"files": 0, "bytes": 0} if action == "evict" else self.source()
+            return dict(result, errors=[{"path": "/r/A/state/x", "errno": 13, "error": "Permission denied"}])
+
+        class Cluster:
+            @staticmethod
+            def role_dir(role):
+                return join("/r", role)
+
+        with patch.object(suite, "probe", side_effect=probe), self.assertRaises(AssertionError) as raised:
+            suite.evict_backends(Cluster(), ["A"], 64 * MIB, "A")
+        self.assertIn("evidence incomplete", str(raised.exception))
+
+    def test_default_evidence_is_unchanged_without_vanished_files(self):
+        (evidence, _), _, _ = self.run_with({"A": [self.source()]})
+        self.assertEqual(set(evidence), {"A"})
+        self.assertEqual(set(evidence["A"]), {"payload", "metadata", "attempts"})
+
+    @staticmethod
+    def stripe(role, size, resident=0):
+        return measured(("/r/%s/state/dfs/chunks/%s" % (role, role.lower()), size, resident))
+
+    def test_striped_payload_is_judged_across_every_node(self):
+        holdings = {"A": 13 * MIB, "B": 17 * MIB, "C": 16 * MIB, "D": 9 * MIB, "E": 9 * MIB}
+        (evidence, cold), calls, error = self.run_with({r: [self.stripe(r, b)] for r, b in holdings.items()},
+                                                       baseline={r: {} for r in holdings})
+        self.assertIsNone(error)
+        self.assertTrue(cold)
+        self.assertEqual(evidence["placement"], {"source": "A", "coverage": "verified", "chunks": 5,
+                                                 "distinct_bytes": 64 * MIB, "replica_bytes": 0,
+                                                 "by_role": holdings, "stale_by_role": {}})
+        # Every Node evicts and measures its own share.
+        self.assertEqual(sorted({r for r, a in calls if a == "evict"}), sorted(holdings))
+
+    def test_a_cached_stripe_on_any_node_makes_the_round_unverified(self):
+        results = {"A": [self.stripe("A", 32 * MIB)], "B": [self.stripe("B", 32 * MIB, 8 * MIB)] * 2}
+        (_, cold), _, error = self.run_with(results, baseline={"A": {}, "B": {}})
+        self.assertIsNone(error)
+        self.assertFalse(cold)
+
+    def test_stripes_short_of_the_file_are_an_unverified_coverage(self):
+        stripes = {"A": [self.stripe("A", 16 * MIB)], "B": [self.stripe("B", 16 * MIB)]}
+        (evidence, cold), _, error = self.run_with(stripes, baseline={"A": {}, "B": {}})
+        self.assertIsNone(error)
+        self.assertFalse(cold)
+        self.assertEqual((evidence["placement"]["coverage"], evidence["placement"]["distinct_bytes"]),
+                         ("unverified", 32 * MIB))
+
+    def test_no_new_chunks_anywhere_is_layout_drift(self):
+        _, _, error = self.run_with({"A": [self.stripe("A", 64 * MIB)]}, baseline={"A": {"a": 64 * MIB}})
+        self.assertIn("payload layout not recognised", str(error))
 
 
 class FanoutTopologyTests(unittest.TestCase):
