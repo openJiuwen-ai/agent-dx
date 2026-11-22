@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source_build=${AFS_E2E_EXPORT_BUILD:?supply the frozen Buildkite build UUID}
+[[ $source_build =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]]
+source_commit=${AFS_E2E_EXPORT_COMMIT:?supply the frozen product Git SHA}
+[[ $source_commit =~ ^[0-9a-f]{40}$ ]]
 mkdir -p out/buildkite/logs
-buildkite-agent artifact download 'out/buildkite/bundle/*.json' . --step platform-images --build 01a195f3-ed61-4ad7-8a86-c612f7701be1
+buildkite-agent artifact download 'out/buildkite/bundle/*.json' . --step platform-images --build "$source_build"
+python3 -c 'import json,sys; m=json.load(open("out/buildkite/bundle/bundle.json")); assert m["package"]["commit"]==sys.argv[1] and m["package"]["with_afs"] is True' "$source_commit"
 daemon_pid=''
 cleanup() {
   if [[ -n "$daemon_pid" ]]; then kill -TERM "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true; fi

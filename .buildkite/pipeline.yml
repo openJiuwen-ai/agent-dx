@@ -1,5 +1,5 @@
 steps:
-- label: 'Export fixed Base236 images; no product compilation or deployment'
+- label: 'Export fixed AFS test images for developer-direct validation'
   key: export-images
   agents: {queue: default, os: linux, arch: amd64}
   command: bash .buildkite/export-pk1-assets.sh
