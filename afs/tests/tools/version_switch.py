@@ -235,15 +235,25 @@ def artifact_pair(old_inputs, new_inputs):
     return old, new
 
 
-def exercise(config, old_inputs, new_inputs, output):
-    """Run all scenarios, retaining an independent result and cleanup per fixture."""
+DEFAULT_CASES = (("ownerfs", "upgrade_rollback"), ("dfs", "upgrade_rollback"))
+
+
+def selected_cases(requested):
+    if requested is None:
+        return DEFAULT_CASES
+    if requested == "ownerfs.version.old_root_command":
+        return (("ownerfs", "old_root_command"),)
+    raise ValueError("expected ownerfs.version.old_root_command or an unset upgrade case selector")
+
+
+def exercise(config, old_inputs, new_inputs, output, *, selection=DEFAULT_CASES):
+    """Run selected scenarios with independent results and cleanup."""
     output.mkdir()
     old, new = artifact_pair(old_inputs, new_inputs)
     write_json(output / "versions.json", {"old": old, "new": new})
     entries = []
     cleanup_errors = []
-    for mode, suffix in (("ownerfs", "upgrade_rollback"), ("dfs", "upgrade_rollback"),
-                         ("ownerfs", "old_root_command")):
+    for mode, suffix in selection:
         case = Case(f"{mode}.version.{suffix}", (), mode, (), None, observe_cache=(mode == "dfs"))
         case_output = output / case.id
         case_output.mkdir()

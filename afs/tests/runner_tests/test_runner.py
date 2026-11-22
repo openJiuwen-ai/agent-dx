@@ -58,6 +58,28 @@ class AdmissionProtocolTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 protocol_versions(invalid)
 
+    def test_rejection_matches_complete_protocol_numbers_in_the_right_order(self):
+        from tools.protocol_admission import rejection_reason
+
+        def log(incoming, expected):
+            return (f'ErrorCode(50659329) Node-Meta protocol from node "node-b": unsupported format version '
+                    f'{incoming}, this binary supports version {expected}; deploy matching binaries')
+
+        correct = log(7, 10)
+        self.assertEqual(rejection_reason(log(70, 100) + '\n' + correct, 7, 10), correct)
+        self.assertEqual(rejection_reason(log(70, 100), 7, 10), '')
+        self.assertEqual(rejection_reason(log(10, 7), 7, 10), '')
+
+
+class UpgradeSelectionTests(unittest.TestCase):
+    def test_legacy_root_command_is_separate_from_default_upgrade_and_rollback(self):
+        from tools.version_switch import selected_cases
+
+        self.assertEqual(selected_cases(None), (('ownerfs', 'upgrade_rollback'), ('dfs', 'upgrade_rollback')))
+        self.assertEqual(selected_cases('ownerfs.version.old_root_command'), (('ownerfs', 'old_root_command'),))
+        with self.assertRaises(ValueError):
+            selected_cases('unknown')
+
 
 class WorkerProtocolTests(unittest.TestCase):
     def test_child_exit_status_is_retained_and_not_inferred_from_pid(self):

@@ -11,6 +11,7 @@ from suites.operations import wait_read
 from tools.version_switch import install, running_identity, run_phase
 
 REJECTION_CODE = 'ErrorCode(50659329)'
+REJECTION_VERSIONS = re.compile(r'unsupported format version ([0-9]+), this binary supports version ([0-9]+)\b')
 SEED = b'acknowledged before incompatible B starts\n' * 2048
 DURING = b'acknowledged after Meta rejected B\n' * 2048
 
@@ -22,6 +23,17 @@ def protocol_versions(value):
     if old == new or max(old, new) > 0xFFFFFFFF:
         raise ValueError('admission requires two distinct u32 protocol numbers')
     return {'old': old, 'new': new}
+
+
+def rejection_reason(log, incoming, expected):
+    markers = (REJECTION_CODE, 'Node-Meta protocol', 'node-b')
+    for line in log.splitlines():
+        if not all(marker in line for marker in markers):
+            continue
+        versions = REJECTION_VERSIONS.search(line)
+        if versions and tuple(map(int, versions.groups())) == (incoming, expected):
+            return line
+    return ''
 
 
 def sessions(cluster, expected):
@@ -65,9 +77,7 @@ def reject_b(cluster, healthy, incompatible, protocols):
             'B', 'from pathlib import Path\nprint(Path(sys.argv[1]).read_text())',
             remote_join(cluster.root('B'), 'B.log'), owner=False,
         )['stdout']
-        markers = (REJECTION_CODE, 'Node-Meta protocol', 'node-b',
-                   f'unsupported format version {incoming}', f'supports version {expected}')
-        reason = next((line for line in log.splitlines() if all(marker in line for marker in markers)), '')
+        reason = rejection_reason(log, incoming, expected)
         cluster.record('admission.rejection.B', {'exit': state, 'reason': reason, 'mounted': False})
         if not reason:
             raise AssertionError(f'Node B failed without the expected native protocol refusal: {log[-1500:]}') from exc

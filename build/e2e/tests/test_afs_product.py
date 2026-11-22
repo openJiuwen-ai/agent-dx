@@ -72,6 +72,27 @@ class ProductContracts(unittest.TestCase):
             with self.assertRaises(ValueError):
                 product.validate_sdk_result(bad, 'dfs')
 
+    def test_sdk_explicitly_required_capability_cannot_disappear_from_results(self):
+        with patch.object(sys, 'path', [str(HERE), *sys.path]):
+            probe = load('afs_sdk_capability_test', HERE / 'afs_sdk_compat_probe.py')
+        old_sdk = SimpleNamespace(files=SimpleNamespace(make_dir=lambda path: bool(path)))
+        missing = {}
+        probe.check_mkdir_capability(old_sdk, missing, required=True)
+        self.assertEqual(missing['sdk_capabilities'], {'recursive_false': False})
+        self.assertEqual(missing['recursive_false']['status'], 'failed')
+        optional = {}
+        probe.check_mkdir_capability(old_sdk, optional, required=False)
+        self.assertNotIn('recursive_false', optional)
+
+    def test_sdk_required_capabilities_rejects_unknown_or_repeated_ids(self):
+        compat = load('afs_sdk_required_test', HERE / 'kubernetes/afs_sdk_compat.py')
+        env = 'AFS_E2E_SDK_REQUIRED_CAPABILITIES'
+        with patch.dict(os.environ, {env: 'recursive-false'}):
+            self.assertEqual(compat.required_capabilities(), ('recursive-false',))
+        for invalid in ('unknown', 'recursive-false,recursive-false'):
+            with patch.dict(os.environ, {env: invalid}), self.assertRaises(ValueError):
+                compat.required_capabilities()
+
     def test_frozen_sdk_local_input_uses_transport_and_rejects_changed_bytes(self):
         compat = load('afs_sdk_compat_test', HERE / 'kubernetes/afs_sdk_compat.py')
         commit = 'a' * 40

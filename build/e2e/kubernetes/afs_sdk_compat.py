@@ -20,6 +20,8 @@ ROOT = HERE.parents[2]
 BUILD_ENV = 'AFS_E2E_SDK_COMPAT_BUILD'
 COMMIT_ENV = 'AFS_E2E_SDK_COMPAT_COMMIT'
 DIRECTORY_ENV = 'AFS_E2E_SDK_COMPAT_DIR'
+REQUIRED_CAPABILITIES_ENV = 'AFS_E2E_SDK_REQUIRED_CAPABILITIES'
+SDK_CAPABILITIES = ('recursive-false',)
 INSTALL_DIR = '/opt/adx/client/afs-compat'
 PYTHON = '/opt/adx/client/bin/python'
 REPLICA_SEED = 'isolated SDK replica'
@@ -27,7 +29,17 @@ SDK_MANIFEST = 'sdk-candidate.json'
 
 
 def requested():
-    return bool(os.getenv(BUILD_ENV) or os.getenv(COMMIT_ENV) or os.getenv(DIRECTORY_ENV))
+    return any(os.getenv(name) for name in (BUILD_ENV, COMMIT_ENV, DIRECTORY_ENV, REQUIRED_CAPABILITIES_ENV))
+
+
+def required_capabilities():
+    value = os.getenv(REQUIRED_CAPABILITIES_ENV)
+    if not value:
+        return ()
+    names = tuple(item.strip() for item in value.split(','))
+    if len(set(names)) != len(names) or set(names) - set(SDK_CAPABILITIES):
+        raise ValueError(f'{REQUIRED_CAPABILITIES_ENV} expects distinct IDs from {", ".join(SDK_CAPABILITIES)}')
+    return names
 
 
 @contextmanager
@@ -130,14 +142,14 @@ def mount_config(cluster):
     return {'paths': {role: cluster.workspace(role) for role in identities}, 'identities': identities}
 
 
-def exercise(product, identity, cluster, output, record):
+def exercise(product, identity, cluster, output, record, *, required):
     from tools.mixed_protocols import owner_payload
     from tools.protocol_admission import placement
     from tools.version_switch import owner_identity
 
     run = product.run
     cluster.prepare()
-    config = {'mode': cluster.mode, 'phase': 'files', **mount_config(cluster)}
+    config = {'mode': cluster.mode, 'phase': 'files', 'required_capabilities': required, **mount_config(cluster)}
     if cluster.mode == 'ownerfs':
         home = owner_identity(cluster)
         if home['home_node_id'] != 'node-a':
@@ -175,6 +187,7 @@ def exercise(product, identity, cluster, output, record):
 
 def scenarios(product, checks):
     run = product.run
+    required = required_capabilities()
     identity = install_wheel(product)
     current = str(ROOT / 'afs/tests')
     path_added = current not in sys.path
@@ -205,7 +218,7 @@ def scenarios(product, checks):
                 try:
                     with run.case('afs-sdk-' + mode, checks) as record:
                         try:
-                            feature = exercise(product, identity, cluster, output, record)
+                            feature = exercise(product, identity, cluster, output, record, required=required)
                         except Exception:
                             for node in reversed(run.nodes):
                                 try:

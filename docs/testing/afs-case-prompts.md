@@ -214,7 +214,7 @@
 | 用例 ID | 编写测试的短 Prompt | 入口与证据 |
 | --- | --- | --- |
 | `{ownerfs,dfs}.version.upgrade_rollback` | 旧版生成并 `fsync` 独特正文，记录 SHA256、长度、属主和 mode，停写并正常停止 M/A/B 后冻结恢复点。启动新版读旧数据、写新区，再回退到旧快照。验证旧正文原样可读、快照后的写入消失、旧版还能再写。错用当前数据目录必须在恢复判定报红。 | [版本切换](../../afs/tests/tools/version_switch.py)，`afs-component-upgrade-rollback` 定向。[DFS 对照 #142](https://buildkite.com/agent-dx/agent-dx-full-test/builds/142) · [OwnerFs 对照 #143](https://buildkite.com/agent-dx/agent-dx-full-test/builds/143) · [错用当前目录 #121](https://buildkite.com/agent-dx/agent-dx-full-test/builds/121)／[#122](https://buildkite.com/agent-dx/agent-dx-full-test/builds/122) |
-| `ownerfs.version.old_root_command` | 用旧版删除 workspace 留下一条未确认命令。换新版，用同名 workspace 连续建删三轮并核对 epoch 单调增加。重启新版 Meta 后检查旧命令残留。 | [版本切换](../../afs/tests/tools/version_switch.py)，[实跑 #110](https://buildkite.com/agent-dx/agent-dx-full-test/builds/110) 仍读到一条旧命令 |
+| `ownerfs.version.old_root_command` | 用能产生历史残留的基线删除 workspace，留下一条未确认命令。换新版，用同名 workspace 连续建删三轮并核对 epoch 单调增加。重启新版 Meta 后检查旧命令残留。 | [版本切换](../../afs/tests/tools/version_switch.py) 定向设置 `AFS_E2E_UPGRADE_CASE=ownerfs.version.old_root_command`，[实跑 #110](https://buildkite.com/agent-dx/agent-dx-full-test/builds/110) 仍读到一条旧命令 |
 | `dfs.version.rolling_e2e_preserve` | A 持续作为同一会话写入。M 已切新版、B 离线时，覆盖原 inode 并 `fsync`。新版 B 恢复副本后停 A，B 从新挂载冷读校验。完成滚动，再原地回退且保留已确认写入。 | 隔离测试分支 `test/afs-live-upgrade-e2e-20261122`，[#157](https://buildkite.com/agent-dx/agent-dx-full-test/builds/157) 通过 |
 | `ownerfs.version.rolling_e2e_full_snapshot` | 新 B 纳管目录，旧 A 走 gRPC 写入并 `fsync`，核对 Home、epoch 和本地文件。换已有 workspace 的旧 Home A，验证 catalog 启动及持续业务。恢复旧快照后核对既有数据和快照后文件去向。 | 同上，[#158](https://buildkite.com/agent-dx/agent-dx-full-test/builds/158) 带业务混跑及快照恢复通过，完整滚动在旧 catalog 解码处失败 |
 | `dfs.version.midway_preserve` | M、B 已换新版且离线期间已有确认覆盖写时中止。保留当前落盘状态，只回退 M、B 二进制。逐文件核对已确认正文，再写入和跨节点读回一笔新数据。 | 隔离测试分支 `test/afs-midway-rollback-e2e-20261122`，[#160](https://buildkite.com/agent-dx/agent-dx-full-test/builds/160) 通过 |
@@ -243,7 +243,7 @@
 | --- | --- | --- |
 | `{ownerfs,dfs}.version.posix` | 在旧版、换新版和回到旧版三阶段执行同一组真实 FUSE 操作。验 rename 后旧名消失、截短精确、新打开权限错误 EACCES、unlink 和复用文件名后旧 FD 仍读旧字节。故意忽略截断应只在指定版本阶段报红。 | 历史隔离测试补丁 `AFS_E2E_VERSION_POSIX=1`，[对照 #125](https://buildkite.com/agent-dx/agent-dx-full-test/builds/125) · [实版本 #131](https://buildkite.com/agent-dx/agent-dx-full-test/builds/131) · [故障 #134](https://buildkite.com/agent-dx/agent-dx-full-test/builds/134) |
 | `afs-sdk-{ownerfs,dfs}` 的 `common-sdk-and-afs` | 分别安装选定版本的 SDK wheel，与两份服务端制品交叉配对。核对 wheel 摘要和实际导入目录，验证 Environment create/get/reattach/delete、挂载身份、跨节点 `fsync` 后读回及 Files API。OwnerFs 查 Home/gRPC，DFS 停 A 后读 B 的独立副本。 | [共享兼容探针](../../build/e2e/afs_sdk_compat_probe.py)，`afs-sdk` 定向，[#170](https://buildkite.com/agent-dx/agent-dx-full-test/builds/170) 至 [#173](https://buildkite.com/agent-dx/agent-dx-full-test/builds/173) |
-| `afs-sdk-{ownerfs,dfs}` 的 `recursive-false` | SDK 的 `make_dir` 暴露 `recursive` 参数时，在父目录缺失时发送 `recursive=False`。要求明确的不支持错误或非递归的 ENOENT，父、子目录均应不存在。超时、权限错误、意外成功或目录副作用都报红。原默认递归仍须工作。SDK 无此参数时记录能力缺失。 | [新版对照 #173](https://buildkite.com/agent-dx/agent-dx-full-test/builds/173) · [旧端实际报红 #172](https://buildkite.com/agent-dx/agent-dx-full-test/builds/172) |
+| `afs-sdk-{ownerfs,dfs}` 的 `recursive-false` | SDK 的 `make_dir` 暴露 `recursive` 参数时，在父目录缺失时发送 `recursive=False`。要求明确的不支持错误或非递归的 ENOENT，父、子目录均应不存在。超时、权限错误、意外成功或目录副作用都报红。原默认递归仍须工作。执行者将该能力设为必测时，SDK 缺少参数也报红。 | [新版对照 #173](https://buildkite.com/agent-dx/agent-dx-full-test/builds/173) · [旧端实际报红 #172](https://buildkite.com/agent-dx/agent-dx-full-test/builds/172) |
 
 隔离分支和产品的提交独立保存。旧端明确拒绝、夹具缺条件、产品断言失败和清理错误分别记录。OwnerFs 的部分 POSIX 版本场景受旧 catalog 打开失败阻挡，不能用同版对照替代两版验证。
 
@@ -253,6 +253,7 @@
 
 - Buildkite 使用 `agent-dx-full-test` 的 `ADX_E2E_TARGET_CASE=afs-sdk` 和 `ADX_WITH_AFS=1`。`ADX_E2E_ARTIFACT_BUILD`／`ADX_E2E_ARTIFACT_COMMIT` 指向服务端，`AFS_E2E_SDK_COMPAT_BUILD`／`AFS_E2E_SDK_COMPAT_COMMIT` 指向 SDK。Build 参数传 Buildkite 构建 UUID。
 - Linux 直跑使用现有 Docker 固定包入口。SDK 目录只需对应的 wheel 和候选清单，服务端镜像归档用 [镜像导出工具](../../build/e2e/export_images.py) 生成并验原 registry digest 和 image ID。执行卷需要 Linux FUSE、ext4 和已有 Docker／cgroup 前置能力。输入以对应架构的冻结包为准。
+- 两边均可通过 `AFS_E2E_SDK_REQUIRED_CAPABILITIES=recursive-false` 要求所选 SDK 必须支持该能力。若选的是历史 SDK，可按测试目标省略此设置。被测 SDK 暴露参数时，仍会执行该行为断言。
 
 ```bash
 AFS_E2E_SDK_COMPAT_BUILD="$sdk_build_uuid" \

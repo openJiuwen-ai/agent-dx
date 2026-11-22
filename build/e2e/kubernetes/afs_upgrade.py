@@ -17,6 +17,7 @@ ROOT = HERE.parents[2]
 BUILD_ENV = 'AFS_E2E_BASELINE_BUILD'
 COMMIT_ENV = 'AFS_E2E_BASELINE_COMMIT'
 TARGET = 'afs-component-upgrade-rollback'
+UPGRADE_CASE_ENV = 'AFS_E2E_UPGRADE_CASE'
 PROTOCOL_TARGET = 'afs-component-mixed-protocols'
 PROTOCOL_CASES_ENV = 'AFS_E2E_PROTOCOL_CASES'
 PROTOCOL_ADMISSION_ENV = 'AFS_E2E_PROTOCOL_ADMISSION'
@@ -133,8 +134,11 @@ def scenarios(component, checks):
                     admission=admission, admission_versions=versions,
                 )
             else:
-                expected = 3
-                entries, cleanup_errors = runner.exercise(component.config, old_inputs, new_inputs, output)
+                selection = runner.selected_cases(os.getenv(UPGRADE_CASE_ENV))
+                expected = len(selection)
+                entries, cleanup_errors = runner.exercise(
+                    component.config, old_inputs, new_inputs, output, selection=selection,
+                )
         finally:
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
