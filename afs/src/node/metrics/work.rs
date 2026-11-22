@@ -280,6 +280,55 @@ const FETCH_EVENTS: &[&str] = &[
 ];
 #[cfg(feature = "dfs")]
 const FETCH_RESOURCES: &[&str] = &["jobs", "metadata_bytes", "metadata_peak_bytes", "job_limit"];
+/// Native read cache stages, from a verified body being staged to its Meta
+/// advertisement being retired. Drops are separate so loss is never silent.
+#[cfg(feature = "dfs")]
+pub(crate) const READ_CACHE_EVENTS: &[&str] = &[
+    "staged",
+    "dropped_queue_full",
+    "dropped_partial",
+    "installed",
+    "install_skipped",
+    "install_failed",
+    "published",
+    "publish_failed",
+    "retired",
+    "retire_failed",
+    "busy_refreshed",
+    "holder_demoted",
+    "dropped_segment_full",
+    "dropped_partial_expired",
+    "dropped_partial_ranges",
+    "publish_verify_full",
+    "publish_verify_skipped",
+    "crc_table_reused",
+    "crc_table_built",
+];
+/// Where a native read's bytes came from: this Node, a durable replica, or
+/// another reader's verified cache copy.
+#[cfg(feature = "dfs")]
+/// `object`: BLAKE3 whole-object paths (fan-out fills and the peer disk
+/// cache), which do not report which copy served them; never CRC objects.
+pub(crate) const READ_SOURCE_ROLES: &[&str] = &["local", "durable", "verified_cache", "object"];
+/// Read cache body bytes held off the FUSE path (D1-6): staged for install,
+/// and partial Chunks being assembled, each with its peak and its limit.
+#[cfg(feature = "dfs")]
+pub(crate) const READ_CACHE_RESOURCES: &[&str] = &[
+    "queue_bytes",
+    "queue_peak_bytes",
+    "queue_limit_bytes",
+    "partial_bytes",
+    "partial_peak_bytes",
+    "partial_limit_bytes",
+    "segment_bytes",
+    "segment_peak_bytes",
+    "segment_limit_bytes",
+];
+/// Background read cache work: time a staged body waited before install,
+/// install itself, and one publication pass. Separates "the installer could
+/// not keep up" from "installs waited behind something else".
+#[cfg(feature = "dfs")]
+pub(crate) const READ_CACHE_WORK: &[&str] = &["queue_wait", "install", "reconcile"];
 const OUTBOARD_EVENTS: &[&str] = &[
     "reserve_total_failed",
     "reserve_resident_failed",
@@ -372,6 +421,16 @@ struct ReadCoreMetrics {
     fetch_events: afs_metrics::IntCounterVec,
     #[cfg(feature = "dfs")]
     fetch_resources: afs_metrics::IntGaugeVec,
+    #[cfg(feature = "dfs")]
+    read_cache_events: afs_metrics::IntCounterVec,
+    #[cfg(feature = "dfs")]
+    read_source_bytes: afs_metrics::IntCounterVec,
+    #[cfg(feature = "dfs")]
+    read_cache_resources: afs_metrics::IntGaugeVec,
+    #[cfg(feature = "dfs")]
+    read_cache_work_ns: afs_metrics::IntCounterVec,
+    #[cfg(feature = "dfs")]
+    read_cache_work_calls: afs_metrics::IntCounterVec,
 }
 
 impl ReadCoreMetrics {
@@ -488,6 +547,46 @@ impl ReadCoreMetrics {
                 "Fetch tasks and actual metadata charges in the existing proof ledger; no body quota.",
                 &["resource"],
                 FETCH_RESOURCES,
+            )?,
+            #[cfg(feature = "dfs")]
+            read_cache_events: counter_vec(
+                registry,
+                "afs_dfs_read_cache_events_total",
+                "Native read cache Chunks by stage: staged, dropped, installed, published or retired; one count per Chunk event.",
+                &["event"],
+                READ_CACHE_EVENTS,
+            )?,
+            #[cfg(feature = "dfs")]
+            read_source_bytes: counter_vec(
+                registry,
+                "afs_dfs_read_source_bytes_total",
+                "Native read payload bytes delivered to this Node's readers, by the role of the copy that served them.",
+                &["role"],
+                READ_SOURCE_ROLES,
+            )?,
+            #[cfg(feature = "dfs")]
+            read_cache_resources: gauge_vec(
+                registry,
+                "afs_dfs_read_cache_resources",
+                "Read cache body bytes staged for install or held as partial Chunks, with peaks and configured limits; part of the reading Node's memory.",
+                &["resource"],
+                READ_CACHE_RESOURCES,
+            )?,
+            #[cfg(feature = "dfs")]
+            read_cache_work_ns: counter_vec(
+                registry,
+                "afs_dfs_read_cache_work_nanoseconds_total",
+                "Background read cache wall time: staged body queue wait, install, publication pass.",
+                &["stage"],
+                READ_CACHE_WORK,
+            )?,
+            #[cfg(feature = "dfs")]
+            read_cache_work_calls: counter_vec(
+                registry,
+                "afs_dfs_read_cache_work_total",
+                "Background read cache observations matching afs_dfs_read_cache_work_nanoseconds_total.",
+                &["stage"],
+                READ_CACHE_WORK,
             )?,
         })
     }
@@ -989,6 +1088,53 @@ impl ReadWorkMetrics {
                 | "failed"
         ) {
             self.core.fetch_events.with_label_values(&[event]).inc();
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn read_cache_event(&self, event: &'static str) {
+        if READ_CACHE_EVENTS.contains(&event) {
+            self.core
+                .read_cache_events
+                .with_label_values(&[event])
+                .inc();
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn read_cache_resource(&self, resource: &'static str, value: u64) {
+        if READ_CACHE_RESOURCES.contains(&resource)
+            && let Ok(value) = i64::try_from(value)
+        {
+            self.core
+                .read_cache_resources
+                .with_label_values(&[resource])
+                .set(value);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn read_cache_work(&self, stage: &'static str, elapsed: std::time::Duration) {
+        if READ_CACHE_WORK.contains(&stage) {
+            let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+            self.core
+                .read_cache_work_ns
+                .with_label_values(&[stage])
+                .inc_by(ns);
+            self.core
+                .read_cache_work_calls
+                .with_label_values(&[stage])
+                .inc();
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn read_source_bytes(&self, role: &'static str, bytes: u64) {
+        if READ_SOURCE_ROLES.contains(&role) {
+            self.core
+                .read_source_bytes
+                .with_label_values(&[role])
+                .inc_by(bytes);
         }
     }
 
@@ -1681,12 +1827,17 @@ mod tests {
         "afs_dfs_peer_disk_cache_resources",
         "afs_dfs_read_authorization_calls_total",
         "afs_dfs_read_authorization_nanoseconds_total",
+        "afs_dfs_read_cache_events_total",
+        "afs_dfs_read_cache_resources",
+        "afs_dfs_read_cache_work_nanoseconds_total",
+        "afs_dfs_read_cache_work_total",
         "afs_dfs_read_pipeline_active",
         "afs_dfs_read_pipeline_bytes",
         "afs_dfs_read_pipeline_calls_total",
         "afs_dfs_read_pipeline_nanoseconds_total",
         "afs_dfs_read_pipeline_peak",
         "afs_dfs_read_pipeline_peak_bytes",
+        "afs_dfs_read_source_bytes_total",
         "afs_dfs_source_cache_resources",
     ];
 
@@ -1711,6 +1862,38 @@ mod tests {
                 .all(|family| !family.help().is_empty()),
             "every family keeps its help text"
         );
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn read_cache_and_source_role_counters_are_fixed_and_shared() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let same = ReadWorkMetrics::register(&registry).unwrap();
+        let text = || afs_metrics::encode_text(&registry).unwrap();
+        // Every stage and role is exported at zero before any read happens.
+        for event in super::READ_CACHE_EVENTS {
+            assert!(text().contains(&format!(
+                "afs_dfs_read_cache_events_total{{event=\"{event}\"}} 0\n"
+            )));
+        }
+        for role in super::READ_SOURCE_ROLES {
+            assert!(text().contains(&format!(
+                "afs_dfs_read_source_bytes_total{{role=\"{role}\"}} 0\n"
+            )));
+        }
+        metrics.read_cache_event("dropped_queue_full");
+        same.read_cache_event("dropped_queue_full");
+        metrics.read_cache_event("not_a_stage");
+        metrics.read_source_bytes("verified_cache", 4096);
+        same.read_source_bytes("durable", 7);
+        metrics.read_source_bytes("not_a_role", 1);
+        let text = text();
+        assert!(text.contains("afs_dfs_read_cache_events_total{event=\"dropped_queue_full\"} 2\n"));
+        assert!(!text.contains("not_a_stage"));
+        assert!(text.contains("afs_dfs_read_source_bytes_total{role=\"verified_cache\"} 4096\n"));
+        assert!(text.contains("afs_dfs_read_source_bytes_total{role=\"durable\"} 7\n"));
+        assert!(!text.contains("not_a_role"));
     }
 
     #[test]
