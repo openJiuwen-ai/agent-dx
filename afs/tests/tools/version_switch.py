@@ -189,6 +189,12 @@ def catalog_record(cluster, root_id):
     return remote_join(cluster.role_dir("A"), "state/ownerfs/.ownerfs-roots", root_id + ".json")
 
 
+def catalog_fingerprint(cluster, path):
+    digest = cluster.channel("A").call("hash", path=path)
+    metadata = cluster.command("A", ["stat", "-c", "%d:%i:%f:%u:%g:%s:%y", path])["stdout"].strip()
+    return {**digest, "metadata": metadata}
+
+
 def enable_catalog_adoption(cluster, enabled):
     cluster.python(
         "A", "from pathlib import Path\n"
@@ -215,11 +221,11 @@ def catalog_recovery(cluster, old_inputs, new_inputs, old, new, phases):
         check_seed(cluster, expected, location)
         if original_wire["data_dir"] != "workspace":
             cluster.python("A", "assert not os.path.lexists(sys.argv[1])",
-                           remote_join(cluster.mount("A"), original_wire["data_dir"]))
+                           remote_join(cluster.mount("A"), original_wire["data_dir"]), owner=False)
         cluster.write("B", "after-upgrade", AFTER)
         wait_read(cluster, "A", "after-upgrade", AFTER)
         if "adopted" in original_wire:
-            cluster.python("A", "os.mkdir(sys.argv[1])", new_root_path)
+            cluster.python("A", "os.mkdir(sys.argv[1])", new_root_path, owner=False)
             root_id = root_location(cluster, new_root)["root_id"]
             new_record = catalog_record(cluster, root_id)
             written = json.loads(cluster.command("A", ["cat", new_record])["stdout"])
@@ -289,7 +295,7 @@ def catalog_rejections(cluster, new_inputs, new, phases):
     cluster.python("A", "from pathlib import Path\np=Path(sys.argv[1]);p.mkdir();(p/'file').write_bytes(b'canary')",
                    unrelated, owner=False)
     paths = (seed, remote_join(unrelated, "file"))
-    original_data = [cluster.channel("A").call("hash", path=path) for path in paths]
+    original_data = [catalog_fingerprint(cluster, path) for path in paths]
     install(cluster, new_inputs, new)
     enable_catalog_adoption(cluster, True)
     start_role(cluster, "M", new)
@@ -300,35 +306,38 @@ def catalog_rejections(cluster, new_inputs, new, phases):
             "A", "from pathlib import Path\nPath(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",
             record, owner=False, stdin=json.dumps(wire, indent=2),
         )
-        before = cluster.channel("A").call("hash", path=record)
+        before = catalog_fingerprint(cluster, record)
         log = remote_join(cluster.root("A"), "A.log")
         cluster.command("A", ["truncate", "-s", "0", log])
-        try:
-            start_role(cluster, "A", new)
-        except RuntimeError as exc:
-            assert "product exited before ready" in str(exc), exc
-        else:
-            raise AssertionError("Home unexpectedly started with " + name)
         channel = cluster.channel("A")
-        exit_status = channel.call("status")["A"]["returncode"]
-        assert exit_status == 1, exit_status
-        assert not channel.call("snapshot")["mounts"], "Home mounted a filesystem after rejecting catalog"
-        failed_log = cluster.command("A", ["cat", log])["stdout"]
-        (cluster.output / (name + ".log")).write_text(failed_log)
-        assert diagnostic in failed_log, failed_log[-4000:]
-        assert "ownerfs.adopt.adopted" not in failed_log, failed_log[-4000:]
-        assert channel.call("hash", path=record) == before
-        assert [channel.call("hash", path=path) for path in paths] == original_data
-        root = root_location(cluster, "workspace")
-        assert all(root[key] == value for key, value in location.items()), root
-        assert json.loads(cluster.health("M", "/v1/store"))["entities"].get("root", 0) == initial
-        cluster.record(name, {"diagnostic": diagnostic, "exit": exit_status, "mounts": [], "record": before,
-                              "data": original_data, "identity": location, "meta_roots": initial})
         try:
-            cluster.stop("A")
-        except RuntimeError:
+            try:
+                start_role(cluster, "A", new)
+            except RuntimeError as exc:
+                assert "product exited before ready" in str(exc), exc
+            else:
+                raise AssertionError("Home unexpectedly started with " + name)
+            exit_status = channel.call("status")["A"]["returncode"]
+            assert exit_status == 1, exit_status
+            assert not channel.call("snapshot")["mounts"], "Home mounted a filesystem after rejecting catalog"
+            failed_log = cluster.command("A", ["cat", log])["stdout"]
+            (cluster.output / (name + ".log")).write_text(failed_log)
+            assert diagnostic in failed_log, failed_log[-4000:]
+            assert "ownerfs.adopt.adopted" not in failed_log, failed_log[-4000:]
+            assert catalog_fingerprint(cluster, record) == before
+            assert [catalog_fingerprint(cluster, path) for path in paths] == original_data
+            root = root_location(cluster, "workspace")
+            assert all(root[key] == value for key, value in location.items()), root
+            assert json.loads(cluster.health("M", "/v1/store"))["entities"].get("root", 0) == initial
+            cluster.record(name, {"diagnostic": diagnostic, "exit": exit_status, "mounts": [], "record": before,
+                                  "data": original_data, "identity": location, "meta_roots": initial})
+        finally:
             if "A" in channel.call("status"):
-                raise
+                try:
+                    cluster.stop("A")
+                except RuntimeError:
+                    if "A" in channel.call("status"):
+                        raise
 
     unknown = {key: value for key, value in original.items() if key != "adopted"}
     unknown["data_dir"] = "workspace"
