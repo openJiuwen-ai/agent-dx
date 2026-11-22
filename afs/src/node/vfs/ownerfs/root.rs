@@ -933,6 +933,9 @@ impl RootManager {
                 "name" => String::from_utf8_lossy(bytes).into_owned());
             return Ok(false);
         }
+        if self.legacy_catalog_owns(&StoragePath::new(name)?)? {
+            return Ok(false);
+        }
         let id = root_id_from_name(name)?;
         if self.catalog.lookup_root(&id)?.is_some() {
             return Ok(false);
@@ -986,6 +989,29 @@ impl RootManager {
             "root_id" => ?id,
             "epoch" => reservation.epoch);
         Ok(true)
+    }
+
+    /// A historical physical directory must never be reused as a different
+    /// workspace whose logical name happens to match the generated path.
+    fn legacy_catalog_owns(&self, path: &StoragePath) -> Result<bool> {
+        let Some((id, epoch)) = path
+            .as_path()
+            .to_str()
+            .and_then(|path| path.rsplit_once("-e"))
+        else {
+            return Ok(false);
+        };
+        let Ok(epoch) = epoch.parse::<u64>() else {
+            return Ok(false);
+        };
+        let id = RootId(id.into());
+        if !trash_name(&id, epoch).is_ok_and(|canonical| canonical == *path) {
+            return Ok(false);
+        }
+        Ok(self
+            .catalog
+            .lookup_root(&id)?
+            .is_some_and(|record| record.has_legacy_layout() && record.data_dir == *path))
     }
 
     fn workspace_lock(&self, id: &RootId) -> Result<Arc<Mutex<()>>> {
@@ -1138,6 +1164,15 @@ impl RootManager {
         let local_prepare_id = format!("{}:{}", reservation.prepare_token, self.session_id);
         let adopted = matches!(mode, PrepareMode::Adopt);
         let mut local_record = self.catalog.lookup_root(&reservation.id)?;
+        if local_record
+            .as_ref()
+            .is_some_and(LocalRootRecord::has_legacy_layout)
+            || self.legacy_catalog_owns(&data_dir)?
+        {
+            return Err(invalid_grant(
+                "workspace path is owned by a legacy OwnerFs catalog record",
+            ));
+        }
         // Native names map every generation of one workspace to the same
         // directory, so a same-name create may find its predecessor on disk.
         // Only a predecessor recorded by an earlier Create preparation proves
@@ -1414,7 +1449,8 @@ impl RootManager {
             || record.epoch != epoch
             || epoch == 0
             || root_id_from_name(&record.name)? != record.id
-            || root_data_dir(&record.name, record.epoch)? != record.data_dir
+            || (!record.has_legacy_layout()
+                && root_data_dir(&record.name, record.epoch)? != record.data_dir)
             || record.local_prepare_id.is_empty()
         {
             return Err(invalid_grant(
@@ -2110,13 +2146,20 @@ impl RootManager {
     /// Rebuild the active root cache from durable local records and Meta grants.
     pub fn reconcile_on_startup(&self) -> Result<()> {
         let mut records = HashMap::new();
+        let mut paths = HashSet::new();
         for record in self.catalog.scan_roots()? {
+            let legacy = record.has_legacy_layout();
             if record.epoch == 0
                 || root_id_from_name(&record.name)? != record.id
-                || root_data_dir(&record.name, record.epoch)? != record.data_dir
+                || (!legacy && root_data_dir(&record.name, record.epoch)? != record.data_dir)
             {
                 return Err(invalid_grant(
                     "local root catalog identity is not canonical",
+                ));
+            }
+            if !paths.insert(record.data_dir.clone()) {
+                return Err(invalid_grant(
+                    "local root catalog records share a data directory",
                 ));
             }
             if records.insert(record.id.clone(), record).is_some() {
@@ -2137,6 +2180,30 @@ impl RootManager {
             return Err(invalid_grant(
                 "Meta has an active Home root without local catalog evidence",
             ));
+        }
+        // The legacy layout is only recovered with an active Home identity and
+        // a live backing directory. Meta validates its exact prepare ID when
+        // issuing the replacement grant. Preserve any unproven record in place.
+        for record in records.values().filter(|record| record.has_legacy_layout()) {
+            if !active
+                .get(&record.id)
+                .is_some_and(|location| location.epoch == record.epoch)
+                || self.placement(record)? != Placement::Live
+            {
+                return Err(invalid_grant(
+                    "cannot prove active Home for legacy OwnerFs catalog record",
+                ));
+            }
+            let native_path = root_data_dir(&record.name, record.epoch)?;
+            match self.disk.metadata(&native_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => {
+                    return Err(invalid_grant(
+                        "legacy OwnerFs catalog has competing data directories",
+                    ));
+                }
+            }
         }
 
         // The catalog alone cannot see a crash between Reserve and catalog
