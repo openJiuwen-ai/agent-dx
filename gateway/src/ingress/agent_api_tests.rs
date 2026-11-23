@@ -882,11 +882,6 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
         )
     );
     for (path, token, status) in [
-        (
-            "/agent/http?instance=x&target=urn:adx:template:demo:1",
-            "tenant",
-            StatusCode::BAD_REQUEST,
-        ),
         ("/agent/http?instance=x", "tenant", StatusCode::BAD_REQUEST),
         (
             "/agent/http?target=urn:adx:template:demo:1",
@@ -1064,7 +1059,9 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
         let mut req = Request::builder()
             .method("POST")
-            .uri(format!("/agent/http/chat?{selector}&port={port}&q=a&q=b"))
+            .uri(format!(
+                "/agent/http/chat?{selector}&port={port}&instance=app&token=t%2fu&q=a%20b&q&flag"
+            ))
             .header("host", "public.example")
             .header("x-business", "keep")
             .header("x-adx-auth", "tenant")
@@ -1091,7 +1088,7 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
             Bytes::from_static(b"business-result")
         );
         let (uri, headers) = seen.recv().await.unwrap();
-        assert_eq!(uri, "/chat?q=a&q=b");
+        assert_eq!(uri, "/chat?instance=app&token=t%2fu&q=a%20b&q&flag");
         assert_eq!(headers["host"], "public.example");
         assert_eq!(headers["x-business"], "keep");
         assert_eq!(headers["authorization"], "Bearer sandbox-business");
@@ -1103,7 +1100,9 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
 
         let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
         let mut req = Request::builder()
-            .uri(format!("/agent/ws?{selector}&port={port}"))
+            .uri(format!(
+                "/agent/ws?{selector}&port={port}&instance=app&token=t%2fu&room=1"
+            ))
             .header("host", "public.example")
             .header("connection", "upgrade")
             .header("upgrade", "websocket")
@@ -1133,7 +1132,7 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         upgraded.read_exact(&mut echoed).await.unwrap();
         assert_eq!(&echoed, b"\x82\x03abc");
         let (uri, headers) = seen.recv().await.unwrap();
-        assert_eq!(uri, "/");
+        assert_eq!(uri, "/?instance=app&token=t%2fu&room=1");
         assert_eq!(headers["sec-websocket-protocol"], "chat");
         assert_eq!(headers["authorization"], "Bearer sandbox-business");
         assert!(!headers.contains_key("x-adx-auth"));

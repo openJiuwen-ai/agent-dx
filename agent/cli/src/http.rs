@@ -53,13 +53,10 @@ impl HttpArgs {
                 "path 必须是 Harness 的绝对路径，可带业务 query".into(),
             ));
         }
-        if url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| {
-            matches!(
-                key.as_ref(),
-                "instance" | "target" | "port" | "token" | "tenant_id"
-            )
-        }) {
-            return Err(Error::Invalid("业务 query 不能覆盖路由或认证参数".into()));
+        if url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, _)| matches!(key.as_ref(), "target" | "port"))
+        {
+            return Err(Error::Invalid("业务 query 不能覆盖 target 或 port".into()));
         }
         let mut url = endpoint.clone();
         url.set_path(&format!("/agent/http{path}"));

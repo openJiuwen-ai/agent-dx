@@ -1965,19 +1965,7 @@ impl Ingress {
                         return error_response(error);
                     }
                 };
-                let query = backend_uri
-                    .query()
-                    .map(strip_token_query)
-                    .unwrap_or_default();
-                let uri = if query.is_empty() {
-                    backend_uri.path().to_owned()
-                } else {
-                    format!("{}?{query}", backend_uri.path())
-                };
-                let Ok(uri) = uri.parse() else {
-                    return response_text(StatusCode::BAD_REQUEST, "invalid backend URI");
-                };
-                *request.uri_mut() = uri;
+                *request.uri_mut() = backend_uri;
                 for name in [
                     H_INSTANCE_ID,
                     H_WORKLOAD_ID,
@@ -2079,11 +2067,23 @@ impl Ingress {
                 Err(error) => return Ok(plain(error.status(), &error.to_string())),
             }
         };
-        let query = request
-            .uri()
-            .query()
-            .map(strip_token_query)
-            .unwrap_or_default();
+        #[cfg(feature = "agent-api")]
+        let agent_request = request
+            .extensions()
+            .get::<super::agent_access::BindingNotice>()
+            .is_some()
+            || request
+                .extensions()
+                .get::<super::agent_access::InstanceAccess>()
+                .is_some();
+        #[cfg(not(feature = "agent-api"))]
+        let agent_request = false;
+        let query = request.uri().query().unwrap_or_default();
+        let query = if agent_request {
+            query.to_owned()
+        } else {
+            strip_token_query(query)
+        };
         let query = if query.is_empty() {
             String::new()
         } else {
@@ -2099,17 +2099,6 @@ impl Ingress {
             request.headers_mut().remove(H_TARGET_IP);
             request.headers_mut().remove(H_TARGET_PORT);
             request.headers_mut().remove("x-auth");
-            #[cfg(feature = "agent-api")]
-            let agent_request = request
-                .extensions()
-                .get::<super::agent_access::BindingNotice>()
-                .is_some()
-                || request
-                    .extensions()
-                    .get::<super::agent_access::InstanceAccess>()
-                    .is_some();
-            #[cfg(not(feature = "agent-api"))]
-            let agent_request = false;
             if !agent_request {
                 request.headers_mut().remove(header::AUTHORIZATION);
             }

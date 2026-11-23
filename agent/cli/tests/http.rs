@@ -88,7 +88,7 @@ fn http_validates_business_paths_and_preserves_explicit_binding() {
         "/../api/agent",
         "/%2e%2e/api",
         "/?target=other",
-        "/?instance=other",
+        "/?port=8080",
     ] {
         let cli = Cli::try_parse_from([
             "adx",
@@ -115,6 +115,8 @@ fn http_validates_business_paths_and_preserves_explicit_binding() {
         "1",
         "--binding-id",
         "existing",
+        "--path",
+        "/echo?instance=app&token=t%2fu&flag",
         "--port",
         "8080",
     ])
@@ -127,6 +129,7 @@ fn http_validates_business_paths_and_preserves_explicit_binding() {
         .query_pairs()
         .any(|(k, v)| k == "target" && v == "urn:adx:template:demo:1"));
     assert!(url.query_pairs().any(|(k, v)| k == "port" && v == "8080"));
+    assert!(url.as_str().contains("instance=app&token=t%2fu&flag&"));
 }
 
 async fn assert_invalid_binding_notice_preserves_response(status: axum::http::StatusCode) {
