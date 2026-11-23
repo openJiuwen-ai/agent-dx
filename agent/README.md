@@ -90,6 +90,8 @@ Paused/Pausing/Resuming 保留原 AgentBinding generation 和 Sandbox ID；Activ
 
 HTTP 和 WS 的 query 中，AgentV2 使用 `target` 和 `port` 选路。其余参数（包括 `instance` 和 `token`）保留在发往业务端的请求中。租户凭据通过 `X-ADX-AUTH` 传递。
 
+首次创建 Environment 或经数据面唤醒时，HTTP 和 WS 在原请求期限内重试尚未监听的业务端口。已运行的 Environment 遇到端口拒绝连接时立即返回连接错误。重试只发生在发送业务数据之前，并检查 Ingress 就绪状态和路由版本。
+
 Template 的 `mounts[].host_path`、`mounts[].volume_id`、Volume 定义和 `env` 值支持 `${name}` 渲染。挂载参数按相对子目录校验，环境变量参数允许普通字符串；不执行 Shell 展开或递归展开。参数仅能替换模板声明的占位符。参数当前明文保存并出现在 Binding 元数据中；模型 Key 的后续加解密由业务 Gateway/AgentServer 管理，ADX 不提供模型专用私有启动配置。参数 Header 由 Ingress 消费，不转发到业务服务。
 
 ```yaml

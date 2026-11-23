@@ -1,5 +1,4 @@
 //! Shared managed target selection and authorized, unsent service connection.
-use super::resolver::AccessKind;
 use super::server::{Ingress, IngressOpenError, IngressStream};
 use adx_agent_api::{managed::ManagedService, request::RequestContext, Error};
 use adx_agent_core::{BindingPhase, Protocol, Scope};
@@ -30,6 +29,7 @@ pub struct ServiceSelection {
     requested_port: Option<u16>,
     environment_id: String,
     generation: String,
+    pub(super) created_environment: bool,
     retried: bool,
     parameters: Option<Vec<u8>>,
 }
@@ -80,7 +80,7 @@ impl AgentV2Access {
         selector: ServiceSelector,
         parameters: Option<&[u8]>,
     ) -> Result<ServiceSelection, Error> {
-        let (target, port) = context
+        let resolved = context
             .run(self.managed.resolve_with_parameters(
                 &context,
                 &scope,
@@ -90,11 +90,13 @@ impl AgentV2Access {
                 false,
             ))
             .await?;
+        let target = resolved.target;
         Ok(ServiceSelection {
             context,
             scope,
             protocol: selector.protocol,
-            port,
+            port: resolved.port,
+            created_environment: resolved.created_environment,
             requested_port: selector.port,
             environment_id: target.binding.current.environment_id,
             generation: target.binding.generation,
@@ -120,7 +122,7 @@ impl AgentV2Access {
                 &selection.generation,
             ))
             .await;
-        let (target, port) = match resolved {
+        let resolved = match resolved {
             Err(error @ Error::Conflict(_)) if selection.protocol == Protocol::Ws => {
                 let changed = match selection
                     .context
@@ -154,9 +156,11 @@ impl AgentV2Access {
             }
             result => result?,
         };
+        let target = resolved.target;
+        selection.created_environment = resolved.created_environment;
         selection.environment_id = target.binding.current.environment_id;
         selection.generation = target.binding.generation;
-        selection.port = port;
+        selection.port = resolved.port;
         Ok(true)
     }
 
@@ -170,57 +174,20 @@ impl AgentV2Access {
         ingress: &Ingress,
         selection: ServiceSelection,
     ) -> Result<IngressStream, ServiceAccessError> {
-        self.connect_service_inner(ingress, selection, false).await
-    }
-
-    /// Jiuwen cold starts can publish a runtime before its business port listens.
-    /// Wait only for TCP refusal, before sending any application bytes, using the
-    /// original admission deadline. Handshake failures are never replayed.
-    pub(crate) async fn connect_service_when_ready(
-        &self,
-        ingress: &Ingress,
-        selection: ServiceSelection,
-    ) -> Result<IngressStream, ServiceAccessError> {
-        self.connect_service_inner(ingress, selection, true).await
-    }
-
-    async fn connect_service_inner(
-        &self,
-        ingress: &Ingress,
-        mut selection: ServiceSelection,
-        wait_for_listener: bool,
-    ) -> Result<IngressStream, ServiceAccessError> {
+        let mut selection = selection;
         loop {
             let result = selection
                 .context
                 .run(async {
-                    let attempt = async {
-                        let route = ingress
-                            .resolve_route(
-                                &selection.environment_id,
-                                selection.port,
-                                AccessKind::Direct,
-                                String::new(),
-                            )
-                            .await?;
-                        loop {
-                            let opened = ingress
-                                .open_resolved_stream(route.clone(), &selection.scope.tenant)
-                                .await;
-                            if wait_for_listener
-                                && matches!(&opened, Err(IngressOpenError::Connect(error))
-                                    if error.kind() == std::io::ErrorKind::ConnectionRefused)
-                            {
-                                // No route refresh or activation for a port that is merely
-                                // starting. The surrounding context also bounds this sleep.
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                continue;
-                            }
-                            return opened;
-                        }
-                    }
-                    .await;
-                    Ok(attempt)
+                    Ok(ingress
+                        .open_selected_service(
+                            &selection.environment_id,
+                            selection.port,
+                            &selection.scope.tenant,
+                            selection.created_environment,
+                            selection.deadline(),
+                        )
+                        .await)
                 })
                 .await?;
             match result {

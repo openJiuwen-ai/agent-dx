@@ -367,8 +367,7 @@ impl AgentState {
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
-        self.commit_binding(scope, parameters, false, None, None)
-            .await
+        self.commit_binding(scope, parameters, None, None).await
     }
 
     /// Fix the version checked by the caller together with the Environment startup decision.
@@ -376,25 +375,17 @@ impl AgentState {
         &self,
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
-        reuse_subject_binding: bool,
         version: &str,
         checked_snapshot: Option<&str>,
     ) -> Result<AgentBinding> {
-        self.commit_binding(
-            scope,
-            parameters,
-            reuse_subject_binding,
-            Some(version),
-            checked_snapshot,
-        )
-        .await
+        self.commit_binding(scope, parameters, Some(version), checked_snapshot)
+            .await
     }
 
     async fn commit_binding(
         &self,
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
-        reuse_subject_binding: bool,
         selected_version: Option<&str>,
         checked_snapshot: Option<&str>,
     ) -> Result<AgentBinding> {
@@ -403,7 +394,6 @@ impl AgentState {
                 .create_binding_with_decision(
                     scope.clone(),
                     parameters,
-                    reuse_subject_binding,
                     selected_version,
                     checked_snapshot,
                 )
@@ -423,27 +413,10 @@ impl AgentState {
         &self,
         scope: Scope,
         parameters: &adx_agent_core::mounts::Parameters,
-        reuse_subject_binding: bool,
         selected_version: Option<&str>,
         checked_snapshot: Option<&str>,
     ) -> Result<Option<AgentBinding>> {
         let key = binding_key(&scope)?;
-        let history = crate::prewarm::history_key(&scope)?;
-        let previous_history = self.store.get(&history).await?;
-        // The caller already resolved historical records before choosing a version.
-        // Recheck a current pointer here to catch a concurrent commit under another Alias.
-        if reuse_subject_binding {
-            if let Some(binding) = self
-                .binding_from_history(&scope, previous_history.as_ref())
-                .await?
-            {
-                return if binding.phase == BindingPhase::Active {
-                    Ok(Some(binding))
-                } else {
-                    Err(Error::Conflict("binding is deleting".into()))
-                };
-            }
-        }
         let (version, alias_check) = self.desired_version(&scope).await?;
         if selected_version.is_some_and(|selected| selected != version) {
             return Err(Error::Conflict(
@@ -459,26 +432,11 @@ impl AgentState {
         let generation = uuid::Uuid::new_v4().to_string();
         let mut current =
             adx_agent_core::EnvironmentRef::new(version.clone(), format!("adx-{generation}"));
-        let mut extra_checks = Vec::new();
-        let mut extra_puts = Vec::new();
         let template_golden = adx_agent_core::prewarm::template_golden(&template);
         if let Some(recipe) = template_golden {
             current.pending_snapshot_id = checked_snapshot
                 .filter(|id| *id == recipe.snapshot_id)
                 .map(str::to_owned);
-        }
-        let history_empty = previous_history
-            .as_ref()
-            .map(Record::decode::<Option<Scope>>)
-            .transpose()?
-            .flatten()
-            .is_none();
-        extra_checks.push(Check {
-            key: history.clone(),
-            expected: previous_history.map(|record| record.revision),
-        });
-        if reuse_subject_binding || history_empty {
-            extra_puts.push(put(&history, &Some(&scope))?);
         }
         let value = AgentBinding {
             scope,
@@ -495,9 +453,7 @@ impl AgentState {
             expected: None,
         }];
         checks.extend(alias_check);
-        checks.extend(extra_checks);
-        let mut writes = vec![put(&key, &value)?];
-        writes.extend(extra_puts);
+        let writes = vec![put(&key, &value)?];
         if self
             .store
             .commit(&Transaction::new(checks, writes)?)
@@ -565,19 +521,13 @@ impl AgentState {
         {
             return Err(Error::Conflict("binding deletion identity mismatch".into()));
         }
-        let mut checks = vec![check(&key, &record)];
-        let mut writes = Vec::new();
-        let history = crate::prewarm::history_key(&binding.scope)?;
-        if let Some(record) = self.store.get(&history).await? {
-            if record.decode::<Option<Scope>>()?.as_ref() == Some(&binding.scope) {
-                checks.push(check(&history, &record));
-                writes.push(put(&history, &Option::<Scope>::None)?);
-            }
-        }
-        let deletes = vec![key];
         if self
             .store
-            .commit(&Transaction::with_deletes(checks, writes, deletes)?)
+            .commit(&Transaction::with_deletes(
+                vec![check(&key, &record)],
+                vec![],
+                vec![key],
+            )?)
             .await?
         {
             Ok(())

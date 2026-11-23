@@ -39,21 +39,6 @@ impl Default for CacheSettings {
         }
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum BindingCacheKey {
-    Scoped(Scope),
-    Subject { tenant: String, binding_id: String },
-}
-
-impl BindingCacheKey {
-    fn subject(scope: &Scope) -> Self {
-        Self::Subject {
-            tenant: scope.tenant.clone(),
-            binding_id: scope.binding_id.clone(),
-        }
-    }
-}
-
 struct Binding {
     target: Option<Target>,
     attempt: Arc<()>,
@@ -64,7 +49,7 @@ pub struct Activator {
     state: AgentState,
     image_resolver: Option<image_resolution::ImageResolver>,
     environment: Arc<dyn Environment>,
-    bindings: Mutex<LinkedHashMap<BindingCacheKey, Binding>>,
+    bindings: Mutex<LinkedHashMap<Scope, Binding>>,
     cache: CacheSettings,
     subscription_ready: std::sync::atomic::AtomicBool,
 }
@@ -129,9 +114,7 @@ impl Activator {
         })
     }
     async fn invalidate(&self, scope: &Scope) {
-        let mut bindings = self.bindings.lock().await;
-        bindings.remove(&BindingCacheKey::Scoped(scope.clone()));
-        bindings.remove(&BindingCacheKey::subject(scope));
+        self.bindings.lock().await.remove(scope);
     }
     async fn invalidate_all(&self) {
         self.bindings.lock().await.clear();
@@ -256,7 +239,7 @@ impl Activator {
                 "candidate retired during activation".into(),
             ));
         }
-        let observed = observed?;
+        let (observed, _) = observed?;
         Self::validate_observation(&binding, &secondary.environment, &observed)?;
         match observed.phase {
             EnvironmentPhase::Running if observed.ready => {
@@ -616,14 +599,18 @@ impl Activator {
         deadline: u64,
     ) -> Result<adx_agent_core::activator::ResolvedTarget> {
         let activation = &request.activation;
-        let target = self
+        let (target, created_environment) = self
             .activate_selected(activation, deadline, Some(request.service))
             .await?;
         let port = request
             .service
             .select(&target.service)
             .map_err(Error::Invalid)?;
-        Ok(adx_agent_core::activator::ResolvedTarget { target, port })
+        Ok(adx_agent_core::activator::ResolvedTarget {
+            target,
+            port,
+            created_environment,
+        })
     }
     pub async fn binding(&self, scope: &Scope) -> Result<AgentBinding> {
         self.state.binding(scope).await?.ok_or(Error::NotFound)
@@ -702,27 +689,22 @@ impl Activator {
                 expected_generation: expected_generation.map(str::to_owned),
                 bypass_cache,
                 parameters: parameters.map(<[u8]>::to_vec),
-                reuse_subject_binding: false,
             },
             deadline_unix_ms,
             None,
         )
         .await
+        .map(|(target, _)| target)
     }
     async fn activate_selected(
         &self,
         request: &ActivationRequest,
         deadline_unix_ms: u64,
         service: Option<adx_agent_core::activator::ServiceSelector>,
-    ) -> Result<Target> {
+    ) -> Result<(Target, bool)> {
         let scope = &request.scope;
         let expected_generation = request.expected_generation.as_deref();
         scope.validate().map_err(Error::Invalid)?;
-        let cache_key = if request.reuse_subject_binding {
-            BindingCacheKey::subject(scope)
-        } else {
-            BindingCacheKey::Scoped(scope.clone())
-        };
         let attempt = {
             let mut bindings = self.bindings.lock().await;
             let subscription_ready = self
@@ -730,10 +712,9 @@ impl Activator {
                 .load(std::sync::atomic::Ordering::Acquire);
             if !request.bypass_cache
                 && (subscription_ready
-                    || (!request.reuse_subject_binding
-                        && matches!(scope.template_ref, adx_agent_core::TemplateRef::Version(_))))
+                    || matches!(scope.template_ref, adx_agent_core::TemplateRef::Version(_)))
             {
-                if let Some(binding) = bindings.to_back(&cache_key) {
+                if let Some(binding) = bindings.to_back(scope) {
                     if binding.touched.elapsed() < Duration::from_secs(self.cache.idle_seconds) {
                         if let Some(target) = &binding.target {
                             if let Some(service) = service {
@@ -745,7 +726,7 @@ impl Activator {
                                 ));
                             }
                             binding.touched = Instant::now();
-                            return Ok(target.clone());
+                            return Ok((target.clone(), false));
                         }
                     }
                 }
@@ -754,7 +735,7 @@ impl Activator {
             let attempt = Arc::new(());
             if self.cache.capacity > 0 {
                 bindings.insert(
-                    cache_key.clone(),
+                    scope.clone(),
                     Binding {
                         target: None,
                         attempt: attempt.clone(),
@@ -767,11 +748,7 @@ impl Activator {
             }
             attempt
         };
-        let existing = if request.reuse_subject_binding {
-            self.state.subject_binding(scope).await?
-        } else {
-            self.state.binding(scope).await?
-        };
+        let existing = self.state.binding(scope).await?;
         let binding = match existing {
             Some(binding) => binding,
             None if expected_generation.is_some() => {
@@ -808,7 +785,6 @@ impl Activator {
                     .create_binding_for_version(
                         scope.clone(),
                         &parameters,
-                        request.reuse_subject_binding,
                         &version,
                         chosen.as_deref(),
                     )
@@ -850,11 +826,7 @@ impl Activator {
             .await;
         // Compensate a late activation using its saved identity. Never delete
         // the Environment belonging to a replacement Binding lifecycle.
-        let existing = if request.reuse_subject_binding {
-            self.state.subject_binding(scope).await?
-        } else {
-            self.state.binding(scope).await?
-        };
+        let existing = self.state.binding(scope).await?;
         let binding = match existing {
             Some(latest)
                 if latest.generation == binding.generation
@@ -868,7 +840,7 @@ impl Activator {
                 return Err(Error::Conflict("binding changed during activation".into()));
             }
         };
-        let observed = observed?;
+        let (observed, created_environment) = observed?;
         Self::validate_observation(&binding, &binding.current, &observed)?;
         // A target is a stable identity, not proof of a live execution. Only the
         // authorized Gateway data path requests Platform EnsureRunning.
@@ -896,13 +868,13 @@ impl Activator {
             service: published.template.service,
         };
         let mut bindings = self.bindings.lock().await;
-        if let Some(cached) = bindings.get_mut(&cache_key) {
+        if let Some(cached) = bindings.get_mut(&request.scope) {
             if Arc::ptr_eq(&cached.attempt, &attempt) {
                 cached.target = Some(target.clone());
                 cached.touched = Instant::now();
             }
         }
-        Ok(target)
+        Ok((target, created_environment))
     }
 
     pub async fn delete_binding(&self, scope: &Scope) -> Result<()> {

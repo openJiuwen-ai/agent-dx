@@ -560,6 +560,64 @@ impl Ingress {
         Ok(ready)
     }
 
+    #[cfg(feature = "agent-api")]
+    pub(super) async fn open_selected_service(
+        &self,
+        environment: &str,
+        port: u16,
+        tenant: &str,
+        created: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<IngressStream, IngressOpenError> {
+        let route = self
+            .resolve_route(environment, port, AccessKind::Direct, String::new())
+            .await?;
+        let starting = created || route.needs_resume;
+        let route = self.prepare_route(route, tenant).await?;
+        let revision = self
+            .resolver
+            .current_route_revision(&route)
+            .ok_or(IngressOpenError::RouteChanged)?;
+        self.open_service_listener(&route, revision, starting.then_some(deadline))
+            .await
+            .map_err(IngressOpenError::Connect)
+    }
+
+    fn check_service_route(&self, route: &RouteHandle, revision: u64) -> io::Result<()> {
+        if !self.ready() || self.resolver.current_route_revision(route) != Some(revision) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                IngressOpenError::RouteChanged,
+            ));
+        }
+        Ok(())
+    }
+
+    /// A newly created or resumed Environment may publish its route before the service listens.
+    /// Retry refused connections only before sending any application bytes.
+    async fn open_service_listener(
+        &self,
+        route: &RouteHandle,
+        revision: u64,
+        startup_deadline: Option<tokio::time::Instant>,
+    ) -> io::Result<IngressStream> {
+        loop {
+            self.check_service_route(route, revision)?;
+            let error = match self.open_authorized_stream(route.clone()).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => error,
+            };
+            let Some(deadline) = startup_deadline else {
+                return Err(error);
+            };
+            let next = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+            if error.kind() != io::ErrorKind::ConnectionRefused || next >= deadline {
+                return Err(error);
+            }
+            tokio::time::sleep_until(next).await;
+        }
+    }
+
     pub(super) async fn open_authorized_stream(
         &self,
         route: RouteHandle,
@@ -1952,11 +2010,7 @@ impl Ingress {
     ) -> Response<ProxyBody> {
         if request.headers().contains_key(header::UPGRADE) {
             if let Some((selection, backend_uri)) = api.take_service_selection(&mut request) {
-                let stream = match api
-                    .service_access()
-                    .connect_service_when_ready(self, selection)
-                    .await
-                {
+                let stream = match api.service_access().connect_service(self, selection).await {
                     Ok(stream) => stream,
                     Err(super::agent_service::ServiceAccessError::Agent(error)) => {
                         return super::agent_response::error_response(error, None);
@@ -2163,6 +2217,14 @@ impl Ingress {
         if let Err(error) = self.authorize(&route, &tenant_id) {
             return Ok(error_response(error));
         }
+        #[cfg(feature = "agent-api")]
+        let service_deadline = request
+            .extensions()
+            .get::<super::agent_api::ServiceDeadline>()
+            .filter(|value| value.created_environment || route.needs_resume)
+            .map(|value| value.deadline);
+        #[cfg(not(feature = "agent-api"))]
+        let service_deadline: Option<tokio::time::Instant> = None;
         let mut route = match self.prepare_route(route, &tenant_id).await {
             Ok(route) => route,
             Err(error) => {
@@ -2171,13 +2233,6 @@ impl Ingress {
             }
         };
         strip_hop_by_hop_headers(request.headers_mut());
-        #[cfg(feature = "agent-api")]
-        let service_deadline = request
-            .extensions()
-            .get::<super::agent_api::ServiceDeadline>()
-            .map(|value| value.0);
-        #[cfg(not(feature = "agent-api"))]
-        let service_deadline: Option<tokio::time::Instant> = None;
         let mut retried = false;
         loop {
             let Some(route_revision) = self.resolver.current_route_revision(&route) else {
@@ -2196,31 +2251,8 @@ impl Ingress {
                 .send_recoverable(
                     key,
                     request,
-                    || async {
-                        loop {
-                            let result = self.open_authorized_stream(route.clone()).await;
-                            if !matches!(&result, Err(error) if error.kind() == io::ErrorKind::ConnectionRefused) {
-                                return result;
-                            }
-                            let Some(deadline) = service_deadline else { return result; };
-                            if tokio::time::Instant::now() >= deadline || !self.ready()
-                                || self.resolver.current_route_revision(&route) != Some(route_revision) {
-                                return result;
-                            }
-                            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(250))).await;
-                        }
-                    },
-                    || {
-                        if !self.ready()
-                            || self.resolver.current_route_revision(&route) != Some(route_revision)
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::NotConnected,
-                                IngressOpenError::RouteChanged,
-                            ));
-                        }
-                        Ok(())
-                    },
+                    || self.open_service_listener(&route, route_revision, service_deadline),
+                    || self.check_service_route(&route, route_revision),
                 )
                 .await
             {

@@ -315,6 +315,9 @@ impl AgentApi {
             return Ok(false);
         }
         selection.rewrite_request(request, &retry.backend_uri)?;
+        request
+            .extensions_mut()
+            .insert(ServiceDeadline::from(&selection));
         Ok(true)
     }
     pub(super) async fn prepare_data<B>(
@@ -366,7 +369,7 @@ impl AgentApi {
         selection.rewrite_request(request, &access.backend_uri)?;
         request
             .extensions_mut()
-            .insert(ServiceDeadline(selection.deadline()));
+            .insert(ServiceDeadline::from(&selection));
         request.extensions_mut().insert(SelectionRetry {
             selection,
             backend_uri: access.backend_uri,
@@ -392,7 +395,18 @@ async fn read_body(body: hyper::body::Incoming) -> Result<Bytes, Error> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct ServiceDeadline(pub tokio::time::Instant);
+pub(super) struct ServiceDeadline {
+    pub deadline: tokio::time::Instant,
+    pub created_environment: bool,
+}
+impl From<&super::agent_service::ServiceSelection> for ServiceDeadline {
+    fn from(selection: &super::agent_service::ServiceSelection) -> Self {
+        Self {
+            deadline: selection.deadline(),
+            created_environment: selection.created_environment,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct SelectionRetry {

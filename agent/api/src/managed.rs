@@ -12,7 +12,6 @@ struct ActivationInput<'a> {
     generation: Option<&'a str>,
     bypass_cache: bool,
     parameters: Option<&'a [u8]>,
-    reuse_subject_binding: bool,
 }
 
 pub struct ManagedService {
@@ -242,6 +241,7 @@ impl ManagedService {
             },
         )
         .await
+        .map(|resolved| (resolved.target, resolved.port))
     }
     /// A retry of the same incoming request must not start a new lifecycle after deletion.
     pub async fn retry_resolve(
@@ -251,7 +251,7 @@ impl ManagedService {
         protocol: Protocol,
         port: Option<u16>,
         generation: &str,
-    ) -> Result<(Target, u16)> {
+    ) -> Result<activator::ResolvedTarget> {
         self.resolve_generation(
             ctx,
             scope,
@@ -261,7 +261,6 @@ impl ManagedService {
                 generation: Some(generation),
                 bypass_cache: true,
                 parameters: None,
-                reuse_subject_binding: false,
             },
         )
         .await
@@ -274,7 +273,7 @@ impl ManagedService {
         port: Option<u16>,
         parameters: Option<&[u8]>,
         bypass_cache: bool,
-    ) -> Result<(Target, u16)> {
+    ) -> Result<activator::ResolvedTarget> {
         self.resolve_generation(
             ctx,
             scope,
@@ -288,27 +287,6 @@ impl ManagedService {
         )
         .await
     }
-    /// Internal business ingress: the authenticated product subject remains stable across aliases.
-    pub async fn resolve_product(
-        &self,
-        ctx: &RequestContext,
-        scope: &Scope,
-        service: activator::ServiceSelector,
-        parameters: Option<&[u8]>,
-    ) -> Result<(Target, u16)> {
-        self.resolve_generation(
-            ctx,
-            scope,
-            service.protocol,
-            service.port,
-            ActivationInput {
-                parameters,
-                reuse_subject_binding: true,
-                ..Default::default()
-            },
-        )
-        .await
-    }
     async fn resolve_generation(
         &self,
         ctx: &RequestContext,
@@ -316,7 +294,7 @@ impl ManagedService {
         protocol: Protocol,
         port: Option<u16>,
         input: ActivationInput<'_>,
-    ) -> Result<(Target, u16)> {
+    ) -> Result<activator::ResolvedTarget> {
         scope.validate().map_err(Error::Invalid)?;
         let request = activator::ResolveRequest {
             activation: activator::ActivationRequest {
@@ -324,25 +302,19 @@ impl ManagedService {
                 expected_generation: input.generation.map(str::to_owned),
                 bypass_cache: input.bypass_cache,
                 parameters: input.parameters.map(<[u8]>::to_vec),
-                reuse_subject_binding: input.reuse_subject_binding,
             },
             service: activator::ServiceSelector { protocol, port },
         };
         let resolved = ctx.run(self.control.resolve(ctx, &request)).await?;
-        let target = resolved.target;
+        let target = &resolved.target;
         let selected_port = resolved.port;
-        if !input.reuse_subject_binding
-            && matches!(&scope.template_ref, TemplateRef::Version(version) if version != &target.binding.current.version)
+        if matches!(&scope.template_ref, TemplateRef::Version(version) if version != &target.binding.current.version)
         {
             return Err(Error::Unavailable(
                 "Activator returned another template version".into(),
             ));
         }
-        let same_subject = target.binding.scope == *scope
-            || (input.reuse_subject_binding
-                && target.binding.scope.tenant == scope.tenant
-                && target.binding.scope.binding_id == scope.binding_id);
-        if !same_subject
+        if target.binding.scope != *scope
             || target.binding.phase != BindingPhase::Active
             || target.binding.generation.is_empty()
             || target.binding.current.environment_id.is_empty()
@@ -356,6 +328,6 @@ impl ManagedService {
                 "Activator target identity or service mismatch".into(),
             ));
         }
-        Ok((target, selected_port))
+        Ok(resolved)
     }
 }

@@ -1,14 +1,9 @@
-//! Golden retirement protection and durable subject Binding pointers.
+//! Golden snapshot decisions.
 use crate::{
     state::{check, put},
     *,
 };
-use adx_agent_core::{AgentBinding, Scope};
-
-pub(crate) fn history_key(scope: &Scope) -> Result<Key> {
-    scope.validate().map_err(Error::Invalid)?;
-    Key::new("binding-history", &[&scope.tenant, &scope.binding_id])
-}
+use adx_agent_core::AgentBinding;
 
 impl AgentState {
     /// Finalize the exact allocation whose owner was registered in Catalog. A retry observes
@@ -70,32 +65,5 @@ impl AgentState {
             }
         }
         Err(Error::Conflict("snapshot decision contention".into()))
-    }
-    /// Resolve the durable subject pointer with bounded point reads.
-    pub async fn subject_binding(&self, scope: &Scope) -> Result<Option<AgentBinding>> {
-        let history = self.store.get(&history_key(scope)?).await?;
-        self.binding_from_history(scope, history.as_ref()).await
-    }
-
-    pub(crate) async fn binding_from_history(
-        &self,
-        scope: &Scope,
-        history: Option<&Record>,
-    ) -> Result<Option<AgentBinding>> {
-        let prior = history
-            .map(Record::decode::<Option<Scope>>)
-            .transpose()?
-            .flatten();
-        if let Some(prior) = prior {
-            if prior.tenant != scope.tenant || prior.binding_id != scope.binding_id {
-                return Err(Error::Corrupt("binding history identity mismatch".into()));
-            }
-            if prior != *scope {
-                if let Some(binding) = self.binding(&prior).await? {
-                    return Ok(Some(binding));
-                }
-            }
-        }
-        self.binding(scope).await
     }
 }

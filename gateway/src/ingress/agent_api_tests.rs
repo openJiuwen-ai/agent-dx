@@ -934,10 +934,20 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
 async fn unified_access_forwards_payloads_and_returns_binding_headers() {
     use crate::{common::protocol::GatewayPolicy, node::Relay};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    // Reserve a different port without listening so pooled HTTP connections cannot serve it.
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    let start_backend = Arc::new(tokio::sync::Notify::new());
+    let start = start_backend.clone();
     let (seen_tx, mut seen) = mpsc::unbounded_channel();
     let backend_task = tokio::spawn(async move {
+        start.notified().await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let listener = socket.listen(16).unwrap();
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let seen_tx = seen_tx.clone();
@@ -1008,7 +1018,7 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
     };
     let (gateway, _, routes) = fixture_with_routes().await;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":port},{"protocol":"ws","port":port}]})).unwrap();
+    let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":port},{"protocol":"ws","port":port},{"protocol":"http","port":closed_port},{"protocol":"ws","port":closed_port}]})).unwrap();
     state
         .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
         .await
@@ -1053,7 +1063,7 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         vec![StaticRoute::Prefix("/api".into())],
     ));
     for (gateway, selector, binding_headers) in [
-        (gateway, "target=urn:adx:template:demo:1", true),
+        (gateway.clone(), "target=urn:adx:template:demo:1", true),
         (fixed, "target=urn:adx:instance:api", false),
     ] {
         let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
@@ -1073,6 +1083,9 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         let req = req
             .body(Full::new(Bytes::from_static(b"business-body")))
             .unwrap();
+        if binding_headers {
+            start_backend.notify_one();
+        }
         let response = sender.send_request(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(response.headers()["x-business"], "kept");
@@ -1166,6 +1179,30 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         }
     }
     backend_task.abort();
+    for protocol in ["http", "ws"] {
+        let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
+        let mut request = Request::builder()
+            .uri(format!(
+                "/agent/{protocol}?target=urn:adx:template:demo:1&port={closed_port}"
+            ))
+            .header("x-adx-auth", "tenant")
+            .header("x-adx-binding-id", "user%3Aa%2F%E4%B8%AD%E6%96%87%252F");
+        if protocol == "ws" {
+            request = request
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket");
+        }
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sender.send_request(request.body(Full::new(Bytes::new())).unwrap()),
+        )
+        .await
+        .expect("a warm service with a closed port must fail promptly")
+        .unwrap();
+        assert!(response.status().is_server_error());
+        client.abort();
+        server.abort();
+    }
     node_task.abort();
 }
 

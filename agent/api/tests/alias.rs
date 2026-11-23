@@ -131,7 +131,7 @@ async fn alias_service_validation_uses_current_version_and_prewrite_retry_uses_n
         .reconcile_binding(&scope, context.deadline_unix_ms())
         .await
         .unwrap();
-    let (new, port) = managed
+    let resolved = managed
         .retry_resolve(
             &context,
             &scope,
@@ -141,7 +141,8 @@ async fn alias_service_validation_uses_current_version_and_prewrite_retry_uses_n
         )
         .await
         .unwrap();
-    assert_eq!(port, 9090);
+    let new = resolved.target;
+    assert_eq!(resolved.port, 9090);
     assert_eq!(new.binding.current.version, "2");
     assert_eq!(new.binding.generation, old.binding.generation);
     assert_ne!(

@@ -80,7 +80,7 @@ current 与 secondary 保存在同一记录中并通过 CAS 更新，最多保�
 
 首次 current 的 EnvID 沿用 `adx-<generation>` 生成方式，候选使用新保存的 `adx-<UUID>`。激活、切换、恢复与删除均使用持久化 Env 引用，不根据 binding_id 反推 EnvID 或所有权，避免新增对 ID 算法的依赖。
 
-DigitalMate 业务入口在租户内按认证主体的稳定 Binding ID 复用跨 Alias 或版本引用的已有 Binding。Agent Store 通过已有的 `binding-history` scope 指针将新 Binding 提交与主体身份放入同一 CAS 事务。并发首绑使用事务胜者的 scope、generation 与 current 决议，后续请求从已保存的 Binding 继续。DigitalMate 首绑与 Alias 升级都按模板版本选择自动 Golden。
+Binding 按租户、模板、版本或 Alias 以及 Binding ID 选择。不同 Alias 独立建绑，同一 scope 内并发首绑复用事务提交的 Binding。
 
 ## 5 访问解析与文件操作
 
