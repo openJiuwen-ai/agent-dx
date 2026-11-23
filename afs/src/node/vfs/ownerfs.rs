@@ -153,7 +153,11 @@ impl OwnerFs {
     }
 
     /// Attributes of a workspace root on this Home.
-    pub(crate) fn workspace_attributes(&self, id: &RootId, epoch: u64) -> Result<FileAttributes> {
+    pub(crate) fn workspace_attributes(
+        &self,
+        id: &RootId,
+        epoch: u64,
+    ) -> Result<(FileAttributes, bool)> {
         self.require_local()?.workspace_attributes(id, epoch)
     }
 
@@ -462,8 +466,44 @@ impl OwnerFsPeerExecutor {
 
     /// Workspace root attributes for an authenticated API node. Unlike file
     /// access, this neither admits the peer to the root nor needs a Meta grant.
-    pub(crate) fn workspace_attributes(&self, id: &RootId, epoch: u64) -> Result<FileAttributes> {
+    pub(crate) fn workspace_attributes(
+        &self,
+        id: &RootId,
+        epoch: u64,
+    ) -> Result<(FileAttributes, bool)> {
         self.local.workspace_attributes(id, epoch)
+    }
+
+    pub(crate) fn workspace_outlet_layouts(
+        &self,
+        request: afs_protocol::node_control::WorkspaceOutletLayoutsRequest,
+    ) -> Result<afs_protocol::node_control::WorkspaceOutletLayoutsReply> {
+        if !self
+            .local
+            .roots
+            .outlet_session_matches(&request.home_session_id)
+        {
+            return Err(stale("outlet lookup targeted a stale Home session"));
+        }
+        let mut layouts = Vec::new();
+        for root in request.roots {
+            let id = RootId(root.root_id);
+            if let Some(legacy_layout) = self.local.roots.outlet_root_layout(&id, root.epoch)? {
+                layouts.push(afs_protocol::node_control::WorkspaceOutletLayout {
+                    root_id: id.0,
+                    epoch: root.epoch,
+                    legacy_layout,
+                });
+            }
+        }
+        if !self
+            .local
+            .roots
+            .outlet_session_matches(&request.home_session_id)
+        {
+            return Err(stale("outlet Home session changed during lookup"));
+        }
+        Ok(afs_protocol::node_control::WorkspaceOutletLayoutsReply { roots: layouts })
     }
 
     /// Prepare and activate a reserved workspace on this Home, then request
@@ -1601,7 +1641,7 @@ fn owner_peer_lock_scope(peer: &str, access: &PresentedRootAccess, raw: &str) ->
 }
 
 impl LocalOwnerFs {
-    fn workspace_attributes(&self, id: &RootId, epoch: u64) -> Result<FileAttributes> {
+    fn workspace_attributes(&self, id: &RootId, epoch: u64) -> Result<(FileAttributes, bool)> {
         if id.0.is_empty() || epoch == 0 {
             return Err(Error::coded(
                 afs_error::CLIENT_ARGUMENT_INVALID,
@@ -1612,7 +1652,14 @@ impl LocalOwnerFs {
         let _access = self.roots.enter_root(id, RootRight::Lookup)?;
         match self.roots.local_root_data_dir(id)? {
             Some((path, current)) if current == epoch => {
-                attributes_from_metadata(self.disk.metadata(&path)?)
+                let layout = self
+                    .roots
+                    .outlet_root_layout(id, epoch)?
+                    .ok_or_else(|| stale("workspace is offline on Home"))?;
+                Ok((
+                    attributes_from_metadata(self.disk.metadata(&path)?)?,
+                    layout,
+                ))
             }
             Some(_) => Err(stale("workspace epoch changed")),
             None => Err(stale("workspace is offline on Home")),

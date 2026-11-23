@@ -200,6 +200,7 @@ pub(super) async fn assemble(
         }
         outlet_control = Some(super::outlet::OutletControl {
             meta: root_meta.clone(),
+            peers: peer_connections.clone(),
         });
         if cfg.experimental_ownerfs_workspace_bind {
             workspace_bind_root_control = Some((root_meta, roots.clone()));

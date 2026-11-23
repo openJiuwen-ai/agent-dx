@@ -38,7 +38,7 @@ Node完整CPU/内存、设备IO和公平性采样、交错基线及统计准入�
 `AFS_E2E_UPGRADE_CASE=ownerfs.version.catalog_compatibility`。基线和候选各使用执行者提供的制品 UUID 与完整提交 SHA。
 专项检查真实原目录升级、只退二进制、停机快照回退，以及 catalog 损坏时的安全拒绝。相同提交和制品摘要可用来跑恢复流程对照。
 Linux 可用同一个 `tools.version_switch.exercise`，传入既有 role 配置和两个包含 `artifact-identity.json` 的二进制目录。
-旧式目录仅在现有 workspace 恢复和文件读写场景验证；原生目录还验证候选创建的新 workspace 能被原二进制打开。
+旧式目录覆盖现有 workspace 的恢复、读写、无目录的删除残留、以及身份冲突时的单工作区隔离。原生目录还验证候选创建的新 workspace 能被原二进制打开。outlet 的跨节点访问需要单独的真实 NFS 环境。
 
 ## 资产去向
 

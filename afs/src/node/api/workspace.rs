@@ -52,14 +52,16 @@ struct Ownership {
     uid: u32,
     gid: u32,
     mode: u32,
+    legacy_layout: bool,
 }
 
-impl From<FileAttributes> for Ownership {
-    fn from(attributes: FileAttributes) -> Self {
+impl From<(FileAttributes, bool)> for Ownership {
+    fn from((attributes, legacy_layout): (FileAttributes, bool)) -> Self {
         Self {
             uid: attributes.uid,
             gid: attributes.gid,
             mode: attributes.mode,
+            legacy_layout,
         }
     }
 }
@@ -493,6 +495,7 @@ impl WorkspaceApi {
             uid: reply.uid,
             gid: reply.gid,
             mode: reply.mode,
+            legacy_layout: reply.legacy_layout,
         })
     }
 
@@ -851,10 +854,13 @@ impl WorkspaceApi {
             .ok_or_else(|| std::io::Error::other("outlet is disabled"))?;
         let name = crate::node::vfs::ownerfs::root::root_name_from_id(&location.id)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let expected = PathBuf::from(mirror::target_path(
+        let expected = PathBuf::from(mirror::target_path_with_layout(
             &outlet.import_root.to_string_lossy(),
             &location.home_node_id,
             &name.to_string_lossy(),
+            &location.id,
+            location.epoch,
+            attributes.legacy_layout,
         ));
         if std::fs::read_link(self.public_path(owner))? != expected {
             return Err(std::io::Error::other(

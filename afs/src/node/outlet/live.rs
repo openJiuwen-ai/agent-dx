@@ -15,9 +15,18 @@ use std::{
 };
 
 use afs_error::{Error, Result};
+use afs_protocol::node_control::{
+    WorkspaceAttributesRequest, WorkspaceOutletLayoutsRequest,
+    owner_control_client::OwnerControlClient,
+};
+use futures_util::{StreamExt, stream};
 
-use super::mirror::{self, Action, LstatKind, PresentEntry};
-use crate::node::vfs::ownerfs::root::{ActiveOutletRoots, OutletRoot, RootMeta};
+use super::mirror::{self, Action, LstatKind, PresentEntry, RootLayouts};
+use crate::node::{
+    bridge,
+    rpc::{meta::GrpcRootMeta, peer::PeerConnectionPool},
+    vfs::ownerfs::root::{ActiveOutletRoots, OutletRoot, RootId, RootMeta},
+};
 
 /// Private staging and quarantine directories inside the public root.
 const STAGING_DIR: &str = ".pub";
@@ -249,6 +258,114 @@ pub struct ImportExecutor {
     advertised: std::collections::BTreeMap<String, String>,
     mounter: Arc<dyn super::mount::ImportMounter>,
     table: super::imports::ImportTable,
+    layouts: Option<OutletLayouts>,
+}
+
+pub(crate) struct OutletLayouts {
+    pub meta: Arc<GrpcRootMeta>,
+    pub peers: Arc<PeerConnectionPool>,
+    pub runtime: tokio::runtime::Handle,
+}
+
+impl OutletLayouts {
+    async fn for_home(
+        &self,
+        home: &str,
+        roots: &[WorkspaceAttributesRequest],
+    ) -> std::result::Result<Option<RootLayouts>, tonic::Status> {
+        let info = self.meta.workspace_node_response(home).await?.into_inner();
+        let node = info
+            .node
+            .filter(|_| info.found)
+            .ok_or_else(|| tonic::Status::unavailable("Home has no registered session"))?;
+        let endpoint = node
+            .endpoint
+            .ok_or_else(|| tonic::Status::unavailable("Home has no gRPC endpoint"))?;
+        let channel = self
+            .peers
+            .channel(home, info.lease_epoch, &endpoint.grpc_addr)
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        let mut client = OwnerControlClient::new(channel);
+        let mut paths = RootLayouts::new();
+        for batch in roots.chunks(128) {
+            let reply = match client
+                .workspace_outlet_layouts(WorkspaceOutletLayoutsRequest {
+                    home_session_id: node.session_id.clone(),
+                    roots: batch.to_vec(),
+                })
+                .await
+            {
+                Ok(reply) => reply.into_inner(),
+                Err(status) if status.code() == tonic::Code::Unimplemented => return Ok(None),
+                Err(status) => return Err(status),
+            };
+            for row in reply.roots {
+                if !batch
+                    .iter()
+                    .any(|root| root.root_id == row.root_id && root.epoch == row.epoch)
+                    || paths
+                        .insert((RootId(row.root_id), row.epoch), row.legacy_layout)
+                        .is_some()
+                {
+                    return Err(tonic::Status::data_loss(
+                        "invalid outlet layout in Home response",
+                    ));
+                }
+            }
+        }
+        Ok(Some(paths))
+    }
+
+    fn verified(
+        &self,
+        active: &[OutletRoot],
+        ready: &mut std::collections::BTreeSet<String>,
+    ) -> Result<BTreeMap<String, RootLayouts>> {
+        let mut homes = BTreeMap::<String, Vec<WorkspaceAttributesRequest>>::new();
+        for root in active
+            .iter()
+            .filter(|root| ready.contains(&root.home_node_id))
+        {
+            homes
+                .entry(root.home_node_id.clone())
+                .or_default()
+                .push(WorkspaceAttributesRequest {
+                    root_id: root.root_id.0.clone(),
+                    epoch: root.root_epoch,
+                });
+        }
+        let checked: Vec<_> = bridge::block_on(&self.runtime, async {
+            Ok::<_, Error>(
+                stream::iter(homes)
+                    .map(|(home, roots)| async move {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(1),
+                            self.for_home(&home, &roots),
+                        )
+                        .await;
+                        (home, result)
+                    })
+                    .buffer_unordered(16)
+                    .collect()
+                    .await,
+            )
+        })?;
+        let mut layouts = BTreeMap::new();
+        for (home, result) in checked {
+            match result {
+                Ok(Ok(Some(paths))) => {
+                    layouts.insert(home, paths);
+                }
+                Ok(Ok(None)) => {}
+                _ => {
+                    // A transport failure does not prove the root was removed.
+                    ready.remove(&home);
+                }
+            }
+        }
+        Ok(layouts)
+    }
 }
 
 impl ImportExecutor {
@@ -268,7 +385,13 @@ impl ImportExecutor {
             advertised: std::collections::BTreeMap::new(),
             mounter,
             table: super::imports::ImportTable::new(),
+            layouts: None,
         }
+    }
+
+    pub(crate) fn with_layouts(mut self, layouts: OutletLayouts) -> Self {
+        self.layouts = Some(layouts);
+        self
     }
 
     #[must_use]
@@ -709,8 +832,15 @@ pub fn converge_round(
     //
     // 未就绪的 home 只是不发新名——已在 /public 的条目原样保留（spec H7：
     // 一次失败不得清空已发布的名字，否则下游容器会在对端抖动时集体 bind 失败）。
-    let ready = imports.ready_homes();
-    let actions = mirror::plan(&config.import_root, &active, &ready, &present);
+    let mut ready = imports.ready_homes();
+    let layouts = imports
+        .layouts
+        .as_ref()
+        .map(|resolver| resolver.verified(&active, &mut ready))
+        .transpose()?
+        .unwrap_or_default();
+    let actions =
+        mirror::plan_with_layouts(&config.import_root, &active, &ready, &present, &layouts);
     let mut applied = 0;
     // 发布时访问失败是"挂载挂了但不通"的唯一发现途径（设计 §4）：不做主动
     // 探测，因为那会变成每轮对每个 peer 的持续 NFS 压力。

@@ -7,7 +7,7 @@ use super::ownerfs::OwnerFsAssembly;
 use crate::{
     config::Config,
     node::outlet::{
-        live::{self, ImportExecutor, MirrorConfig},
+        live::{self, ImportExecutor, MirrorConfig, OutletLayouts},
         mount::{self, KernelMounter},
     },
     node::vfs::ownerfs::root::RootMeta,
@@ -71,7 +71,12 @@ pub(super) fn start_mirror(
         outlet.mount_options.clone(),
         cfg.id.clone(),
         Arc::new(KernelMounter),
-    );
+    )
+    .with_layouts(OutletLayouts {
+        meta: control.meta.clone(),
+        peers: control.peers.clone(),
+        runtime: tokio::runtime::Handle::current(),
+    });
     afs_logging::info!(
         "outlet.mirror.starting";
         "public_root" => outlet.public_root.display().to_string(),
@@ -103,4 +108,5 @@ pub(super) fn start_mirror(
 /// site because `OwnerFs` itself does not expose it.
 pub(super) struct OutletControl {
     pub(super) meta: Arc<crate::node::rpc::meta::GrpcRootMeta>,
+    pub(super) peers: Arc<crate::node::rpc::peer::PeerConnectionPool>,
 }

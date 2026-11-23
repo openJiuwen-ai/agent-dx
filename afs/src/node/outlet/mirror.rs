@@ -10,7 +10,7 @@ use std::{
     ffi::{OsStr, OsString},
 };
 
-use crate::node::vfs::ownerfs::root::{OutletRoot, RESERVED_ROOT_NAMES, root_name_from_id};
+use crate::node::vfs::ownerfs::root::{OutletRoot, RESERVED_ROOT_NAMES, RootId, root_name_from_id};
 
 /// One filesystem action the mirror must perform.
 ///
@@ -62,6 +62,24 @@ pub fn target_path(import_root: &str, home_node_id: &str, name: &str) -> String 
     )
 }
 
+pub(crate) fn target_path_with_layout(
+    import_root: &str,
+    home: &str,
+    name: &str,
+    root_id: &RootId,
+    epoch: u64,
+    legacy: bool,
+) -> String {
+    if legacy {
+        let import = import_root.trim_end_matches('/');
+        format!("{import}/{home}/users/{}-e{epoch}", root_id.0)
+    } else {
+        target_path(import_root, home, name)
+    }
+}
+
+pub(crate) type RootLayouts = std::collections::HashMap<(RootId, u64), bool>;
+
 /// Names the mirror reserves for its own bookkeeping and never publishes.
 ///
 /// Defined by OwnerFs because the same set is rejected at workspace creation:
@@ -97,11 +115,22 @@ fn is_reserved(name: &OsStr) -> bool {
 /// Withdrawing an already published name would instead make downstream
 /// containers fail to bind during a transient outage (spec H7). So: never
 /// publish into a hole, never retract a name that worked.
+#[cfg(test)]
 pub fn plan(
     import_root: &str,
     active: &[OutletRoot],
     ready_homes: &BTreeSet<String>,
     present: &BTreeMap<OsString, PresentEntry>,
+) -> Vec<Action> {
+    plan_with_layouts(import_root, active, ready_homes, present, &BTreeMap::new())
+}
+
+pub(crate) fn plan_with_layouts(
+    import_root: &str,
+    active: &[OutletRoot],
+    ready_homes: &BTreeSet<String>,
+    present: &BTreeMap<OsString, PresentEntry>,
+    layouts: &BTreeMap<String, RootLayouts>,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
 
@@ -149,7 +178,31 @@ pub fn plan(
                 "root_id" => ?root.root_id.0);
             continue;
         };
-        let target = target_path(import_root, &root.home_node_id, name_text);
+        // A reachable Home can omit a root that it did not admit. Withdraw
+        // only a link managed by the mirror, and leave foreign entries alone.
+        let legacy = match layouts.get(&root.home_node_id) {
+            Some(home) => match home.get(&(root.root_id.clone(), root.root_epoch)) {
+                Some(legacy) => *legacy,
+                None => {
+                    if publishable
+                        && matches!(present.get(name), Some(PresentEntry::Symlink { .. }))
+                    {
+                        actions.push(Action::Remove { name: name.clone() });
+                    }
+                    continue;
+                }
+            },
+            // A peer that predates the layout RPC uses the existing native path.
+            None => false,
+        };
+        let target = target_path_with_layout(
+            import_root,
+            &root.home_node_id,
+            name_text,
+            &root.root_id,
+            root.root_epoch,
+            legacy,
+        );
         match present.get(name) {
             Some(PresentEntry::Symlink { target: current }) if current == &target => {}
             // A wrong target is republished in place: stale after a generation
@@ -362,6 +415,46 @@ mod tests {
                 target: "/imports/node-a/users/a".into(),
             }],
             "ready home republishes with the current generation"
+        );
+    }
+
+    #[test]
+    fn legacy_outlet_follows_home_layout_and_withdraws_unadmitted_root() {
+        let root = root("root-61", 7, "node-a");
+        let ready = all_ready(&["node-a"]);
+        let target = "/imports/node-a/users/root-61-e7";
+        let mut layouts = BTreeMap::from([(
+            "node-a".into(),
+            RootLayouts::from([((root.root_id.clone(), 7), true)]),
+        )]);
+        assert_eq!(
+            plan_with_layouts(
+                "/imports",
+                std::slice::from_ref(&root),
+                &ready,
+                &present(&[]),
+                &layouts
+            ),
+            vec![Action::Publish {
+                name: "a".into(),
+                target: target.into()
+            }],
+        );
+        let published = present(&[("a", symlink(target))]);
+        assert!(
+            plan_with_layouts(
+                "/imports",
+                std::slice::from_ref(&root),
+                &ready,
+                &published,
+                &layouts
+            )
+            .is_empty()
+        );
+        layouts.get_mut("node-a").unwrap().clear();
+        assert_eq!(
+            plan_with_layouts("/imports", &[root], &ready, &published, &layouts),
+            vec![Action::Remove { name: "a".into() }],
         );
     }
 

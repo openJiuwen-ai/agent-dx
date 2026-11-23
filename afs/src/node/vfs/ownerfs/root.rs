@@ -591,6 +591,7 @@ pub struct RootManager {
     catalog: Box<dyn LockedLocalRootCatalog>,
     control_valid: AtomicBool,
     roots: RwLock<HashMap<RootId, Arc<LocalRoot>>>,
+    quarantined_legacy_roots: RwLock<HashSet<(RootId, u64)>>,
     workspace_locks: Mutex<HashMap<RootId, Weak<Mutex<()>>>>,
     /// Last cleanup error per trash entry, so a permanent failure warns once.
     trash_failures: Mutex<HashMap<(RootId, u64), String>>,
@@ -740,6 +741,9 @@ impl RootManager {
             if record.epoch != epoch || self.placement(&record)? != Placement::Isolated {
                 continue;
             }
+            if self.check_legacy_path(&record).is_err() {
+                continue;
+            }
             match self
                 .finish_isolated(&record)
                 .and_then(|()| retire(&id, epoch))
@@ -831,6 +835,7 @@ impl RootManager {
             catalog,
             control_valid: AtomicBool::new(true),
             roots: RwLock::new(HashMap::new()),
+            quarantined_legacy_roots: RwLock::new(HashSet::new()),
             workspace_locks: Mutex::new(HashMap::new()),
             trash_failures: Mutex::new(HashMap::new()),
         };
@@ -1457,6 +1462,7 @@ impl RootManager {
                 "local root catalog does not match requested epoch",
             ));
         }
+        self.check_legacy_path(&record)?;
         match self.placement(&record)? {
             Placement::Live => {}
             Placement::Isolated | Placement::Conflict => return Err(isolated()),
@@ -1891,6 +1897,33 @@ impl RootManager {
             .map(|root| (root.data_dir.clone(), root.epoch)))
     }
 
+    /// The outlet can publish only folders that this Home has admitted.
+    pub(crate) fn outlet_root_layout(&self, id: &RootId, epoch: u64) -> Result<Option<bool>> {
+        let roots = self
+            .roots
+            .read()
+            .map_err(|_| invalid_grant("root cache lock poisoned"))?;
+        let Some(root) = roots.get(id).filter(|root| root.epoch == epoch) else {
+            return Ok(None);
+        };
+        let state = root
+            .state
+            .lock()
+            .map_err(|_| invalid_grant("root grant lock poisoned"))?;
+        if !self.control_valid.load(Ordering::Acquire)
+            || !matches!(state.phase, GrantPhase::Active(_))
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            root.data_dir != root_data_dir(&root.name, root.epoch)?,
+        ))
+    }
+
+    pub(crate) fn outlet_session_matches(&self, session_id: &str) -> bool {
+        self.session_id == session_id && self.control_valid.load(Ordering::Acquire)
+    }
+
     /// 执行步骤见 [`RootManager::delete_root`] 文档；每步成功后记录 info，
     /// 任一步失败时提前返回（Meta 下线之后的本地收尾除外），统一由外层
     /// `delete_root` 记录结果日志。
@@ -2052,12 +2085,14 @@ impl RootManager {
             };
         };
         if root_id_from_name(&record.name)? != record.id
-            || root_data_dir(&record.name, record.epoch)? != record.data_dir
+            || (!record.has_legacy_layout()
+                && root_data_dir(&record.name, record.epoch)? != record.data_dir)
         {
             return Err(invalid_grant(
                 "local root catalog identity is not canonical",
             ));
         }
+        self.check_legacy_path(&record)?;
         match self.placement(&record)? {
             Placement::Live => {
                 if !self.meta.lookup_root(id)?.is_some_and(|location| {
@@ -2181,35 +2216,11 @@ impl RootManager {
                 "Meta has an active Home root without local catalog evidence",
             ));
         }
-        // The legacy layout is only recovered with an active Home identity and
-        // a live backing directory. Meta validates its exact prepare ID when
-        // issuing the replacement grant. Preserve any unproven record in place.
-        for record in records.values().filter(|record| record.has_legacy_layout()) {
-            if active
-                .get(&record.id)
-                .is_none_or(|location| location.epoch != record.epoch)
-                || self.placement(record)? != Placement::Live
-            {
-                return Err(invalid_grant(
-                    "cannot prove active Home for legacy OwnerFs catalog record",
-                ));
-            }
-            let native_path = root_data_dir(&record.name, record.epoch)?;
-            match self.disk.metadata(&native_path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-                Ok(_) => {
-                    return Err(invalid_grant(
-                        "legacy OwnerFs catalog has competing data directories",
-                    ));
-                }
-            }
-        }
-
         // The catalog alone cannot see a crash between Reserve and catalog
         // fsync. A pending reservation is never a grant. Cancel it with a
         // reservation CAS before deleting any local evidence; if the process
         // crashes mid-cleanup, the next startup repeats the remaining steps.
+        let mut legacy_pending = HashSet::new();
         for reservation in inventory.pending {
             if reservation.home_node_id != self.local_node_id || reservation.epoch == 0 {
                 return Err(invalid_grant("Meta returned a foreign pending root"));
@@ -2220,6 +2231,10 @@ impl RootManager {
                 ));
             }
             if let Some(record) = records.get(&reservation.id) {
+                if record.has_legacy_layout() {
+                    legacy_pending.insert(record.id.clone());
+                    continue;
+                }
                 let expected_dir = root_data_dir(&record.name, reservation.epoch)?;
                 let expected_prepare_id =
                     format!("{}:{}", reservation.prepare_token, reservation.session_id);
@@ -2255,6 +2270,14 @@ impl RootManager {
         }
 
         for record in records.into_values() {
+            if record.has_legacy_layout() {
+                self.reconcile_legacy_root(
+                    &record,
+                    active.get(&record.id),
+                    legacy_pending.contains(&record.id),
+                )?;
+                continue;
+            }
             let Some(location) = active.get(&record.id) else {
                 // Meta no longer exposes this generation. Never rmdir the
                 // native-named directory: it may hold user data or already be
@@ -2311,6 +2334,91 @@ impl RootManager {
             }
             let grant = self.meta.recover_root(&record, &self.session_id)?;
             self.cache_local_root(&record, grant)?;
+        }
+        Ok(())
+    }
+
+    fn legacy_has_competing_path(&self, record: &LocalRootRecord) -> Result<bool> {
+        let native = root_data_dir(&record.name, record.epoch)?;
+        match std::fs::symlink_metadata(self.disk.root_path().join(native.as_path())) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn check_legacy_path(&self, record: &LocalRootRecord) -> Result<()> {
+        if record.has_legacy_layout()
+            && (self
+                .quarantined_legacy_roots
+                .read()
+                .map_err(|_| invalid_grant("legacy root quarantine lock poisoned"))?
+                .contains(&(record.id.clone(), record.epoch))
+                || self.legacy_has_competing_path(record)?)
+        {
+            return Err(Error::coded(
+                afs_error::META_OWNER_ROOT_BUSY,
+                "legacy OwnerFs workspace is quarantined",
+            ));
+        }
+        Ok(())
+    }
+
+    fn quarantine_legacy_root(&self, record: &LocalRootRecord, reason: &str) -> Result<()> {
+        self.quarantined_legacy_roots
+            .write()
+            .map_err(|_| invalid_grant("legacy root quarantine lock poisoned"))?
+            .insert((record.id.clone(), record.epoch));
+        afs_logging::warn!(
+            "ownerfs.legacy_root_quarantined";
+            "root_id" => ?record.id,
+            "epoch" => record.epoch,
+            "data_dir" => ?record.data_dir,
+            "reason" => reason
+        );
+        Ok(())
+    }
+
+    fn reconcile_legacy_root(
+        &self,
+        record: &LocalRootRecord,
+        active: Option<&RootLocation>,
+        pending: bool,
+    ) -> Result<()> {
+        if pending
+            || active.is_some_and(|location| location.epoch != record.epoch)
+            || self.legacy_has_competing_path(record)?
+        {
+            return self.quarantine_legacy_root(record, "competing directory or Meta identity");
+        }
+        let cleanup = match (self.placement(record)?, active) {
+            (Placement::Live, Some(_)) => {
+                return match self.meta.recover_root(record, &self.session_id) {
+                    Ok(grant) => self.cache_local_root(record, grant),
+                    Err(error)
+                        if matches!(
+                            error.code(),
+                            afs_error::META_CATALOG_INVALID_REQUEST
+                                | afs_error::NODE_OWNER_INVALID_GRANT
+                        ) =>
+                    {
+                        self.quarantine_legacy_root(record, &error.to_string())
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+            // A live path without an active identity may still hold customer
+            // data. A conflict never authorizes moving or removing either path.
+            (Placement::Live, None) | (Placement::Conflict, _) => {
+                return self.quarantine_legacy_root(record, "unproven local placement");
+            }
+            (Placement::Missing, None) => self.catalog.remove_prepared_root(record),
+            (Placement::Missing, Some(_)) | (Placement::Isolated, _) => {
+                self.finish_isolated(record)
+            }
+        };
+        if let Err(error) = cleanup {
+            self.quarantine_legacy_root(record, &error.to_string())?;
         }
         Ok(())
     }
@@ -5079,6 +5187,125 @@ mod tests {
         assert_eq!(error.code(), afs_error::NODE_OWNER_GRANT_UNAVAILABLE);
         assert!(meta.0.lock().unwrap().active.is_some());
         assert!(temp.path().join(data_dir.as_path()).exists());
+    }
+
+    fn write_legacy_record(disk: &LocalFs, name: &str) -> (RootId, StoragePath, String) {
+        let id = root_id_from_name(OsStr::new(name)).unwrap();
+        let path = trash_name(&id, 1).unwrap();
+        let prepare_id = "prepare-1:session-a".to_owned();
+        let catalog = disk.root_path().join(".ownerfs-roots");
+        std::fs::create_dir_all(&catalog).unwrap();
+        let record = serde_json::json!({
+            "version": crate::format::version::OWNERFS_ROOT_RECORD,
+            "root_id": id.0,
+            "name_hex": &id.0["root-".len()..],
+            "epoch": 1,
+            "data_dir": path.as_path(),
+            "local_prepare_id": prepare_id,
+        });
+        std::fs::write(catalog.join(format!("{}.json", id.0)), record.to_string()).unwrap();
+        (id, path, prepare_id)
+    }
+
+    #[test]
+    fn legacy_workspace_recursive_delete_uses_original_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let (id, path, prepare_id) = write_legacy_record(&disk, "workspace");
+        disk.mkdir(&path, 0o700).unwrap();
+        let payload = temp.path().join(path.as_path()).join("payload");
+        std::fs::write(&payload, b"old payload").unwrap();
+        {
+            let mut state = meta.0.lock().unwrap();
+            state.active = Some(RootLocation {
+                id: id.clone(),
+                epoch: 1,
+                home_node_id: "node-a".into(),
+                home_session_id: "session-a".into(),
+            });
+            state.active_prepare_id = Some(prepare_id);
+        }
+        let manager =
+            RootManager::open("node-a".into(), "session-b".into(), meta.clone(), disk).unwrap();
+        manager
+            .delete_root_with(&id, Some(1), true, || Ok(()), || Ok(()))
+            .unwrap();
+        assert!(!payload.exists());
+        assert_eq!(
+            std::fs::read(manager.trash_path().join(path.as_path()).join("payload")).unwrap(),
+            b"old payload"
+        );
+        assert!(meta.lookup_root(&id).unwrap().is_none());
+        assert!(manager.catalog.lookup_root(&id).unwrap().is_none());
+        let reservation = RootReservation {
+            id: id.clone(),
+            epoch: 2,
+            home_node_id: "node-a".into(),
+            session_id: "session-b".into(),
+            create_intent_id: "new intent".into(),
+            prepare_token: "prepare-2".into(),
+            requester_node_id: "node-a".into(),
+            requester_session_id: "session-b".into(),
+        };
+        let params = RootCreateParams {
+            name: b"workspace".to_vec(),
+            uid: std::fs::metadata(temp.path()).unwrap().uid(),
+            gid: std::fs::metadata(temp.path()).unwrap().gid(),
+            mode: 0o700,
+        };
+        let prepared = manager
+            .prepare_local_root(&reservation, PrepareMode::Create(&params))
+            .unwrap();
+        assert_eq!(
+            prepared.data_dir().as_path(),
+            std::path::Path::new("workspace")
+        );
+        let error = manager
+            .delete_root_with(&id, Some(1), true, || Ok(()), || Ok(()))
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert!(temp.path().join("workspace").is_dir());
+    }
+
+    #[test]
+    fn legacy_workspace_residue_does_not_block_healthy_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let (deleted, _, _) = write_legacy_record(&disk, "deleted");
+        let (orphan, orphan_dir, _) = write_legacy_record(&disk, "orphan");
+        disk.mkdir(&orphan_dir, 0o700).unwrap();
+        let canary = temp.path().join(orphan_dir.as_path()).join("payload");
+        std::fs::write(&canary, b"retain ambiguous data").unwrap();
+        let (healthy, healthy_dir, prepare_id) = write_legacy_record(&disk, "healthy");
+        disk.mkdir(&healthy_dir, 0o700).unwrap();
+        {
+            let mut state = meta.0.lock().unwrap();
+            state.active = Some(RootLocation {
+                id: healthy.clone(),
+                epoch: 1,
+                home_node_id: "node-a".into(),
+                home_session_id: "session-a".into(),
+            });
+            state.active_prepare_id = Some(prepare_id);
+        }
+        let manager = RootManager::open("node-a".into(), "session-b".into(), meta, disk).unwrap();
+        assert!(manager.has_active_local_root(&healthy));
+        assert_eq!(manager.outlet_root_layout(&healthy, 1).unwrap(), Some(true));
+        assert!(manager.catalog.lookup_root(&deleted).unwrap().is_none());
+        assert!(manager.catalog.lookup_root(&orphan).unwrap().is_some());
+        assert!(manager.recover_local_root(&orphan, 1).is_err());
+        assert_eq!(manager.outlet_root_layout(&orphan, 1).unwrap(), None);
+        assert!(
+            !manager
+                .adopt_entry(
+                    orphan_dir.as_path().as_os_str(),
+                    std::fs::metadata(&canary).unwrap().dev()
+                )
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(canary).unwrap(), b"retain ambiguous data");
     }
 
     /// 物理目录删除成功、Meta 下线失败：数据已删，不回滚，保持 catalog 与缓存，

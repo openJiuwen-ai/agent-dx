@@ -370,10 +370,52 @@ def catalog_rejections(cluster, new_inputs, new, phases):
         ("identity_conflict", identity_conflict, "recover request does not match durable root"),
         ("unsupported_format", dict(original, version=65535), "unsupported local root record version"),
     )
+    legacy = "adopted" not in original
     for name, wire, diagnostic in samples:
-        run_phase(phases, name, partial(refuse, name, wire, diagnostic))
+        if name != "identity_conflict" or not legacy:
+            run_phase(phases, name, partial(refuse, name, wire, diagnostic))
 
-    if "adopted" not in original:
+    if legacy:
+        def quarantine_conflicting_identity():
+            write_test_record(json.dumps(identity_conflict, indent=2))
+            before = catalog_fingerprint(cluster, record)
+            retired_hex = b"retired".hex()
+            retired_id = "root-" + retired_hex
+            retired_record = catalog_record(cluster, retired_id)
+            retired = dict(original, root_id=retired_id, name_hex=retired_hex,
+                           data_dir=f"{retired_id}-e{original['epoch']}")
+            cluster.python("A", "from pathlib import Path\nPath(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",
+                           retired_record, owner=False, stdin=json.dumps(retired, indent=2))
+            start_role(cluster, "A", new)
+            log = cluster.command("A", ["cat", remote_join(cluster.root("A"), "A.log")])["stdout"]
+            (cluster.output / "identity_conflict.log").write_text(log)
+            if "ownerfs.legacy_root_quarantined" not in log:
+                raise AssertionError(log[-4000:])
+            cluster.python(
+                "A", "try:open(sys.argv[1],'rb').close()\nexcept OSError:pass\n"
+                "else:raise AssertionError('quarantined workspace is readable')",
+                remote_join(cluster.workspace("A"), "seed"),
+            )
+            cluster.python(
+                "A", "if os.path.lexists(sys.argv[1]):raise AssertionError('retired catalog is still present')",
+                retired_record, owner=False,
+            )
+            ready = cluster.command("A", ["cat", remote_join(cluster.mount("A"), "adoption-canary/file")])
+            if ready["stdout"] != "canary":
+                raise AssertionError("unaffected workspace is unreadable")
+            if catalog_fingerprint(cluster, record) != before:
+                raise AssertionError("quarantine rewrote the legacy record")
+            if [catalog_fingerprint(cluster, path) for path in paths] != original_data:
+                raise AssertionError("quarantine modified file data")
+            cluster.record("identity_conflict", {"diagnostic": "ownerfs.legacy_root_quarantined",
+                                                "record": before, "data": original_data,
+                                                "healthy_workspace": "adoption-canary"})
+            cluster.stop("A")
+
+        run_phase(phases, "identity_conflict", quarantine_conflicting_identity)
+        if phases["identity_conflict"]["status"] != "passed":
+            return
+
         def recover_with_adoption_enabled():
             write_test_record(original_raw)
             start_role(cluster, "A", new)

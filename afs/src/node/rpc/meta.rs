@@ -181,17 +181,23 @@ impl GrpcRootMeta {
         node_id: &str,
         timeout: Duration,
     ) -> Result<afs_protocol::meta::LookupNodeReply> {
-        let mut client = MetaClient::new(self.channel.clone());
         let reply = self
-            .run_with_timeout(
-                timeout,
-                client.lookup_node(LookupNodeRequest {
-                    request_id: self.request_id(),
-                    node_id: node_id.to_owned(),
-                }),
-            )?
+            .run_with_timeout(timeout, self.workspace_node_response(node_id))?
             .into_inner();
         Ok(reply)
+    }
+
+    pub(crate) async fn workspace_node_response(
+        &self,
+        node_id: &str,
+    ) -> std::result::Result<tonic::Response<afs_protocol::meta::LookupNodeReply>, tonic::Status>
+    {
+        MetaClient::new(self.channel.clone())
+            .lookup_node(LookupNodeRequest {
+                request_id: self.request_id(),
+                node_id: node_id.to_owned(),
+            })
+            .await
     }
 
     pub(crate) fn force_deactivate_workspace(&self, location: &RootLocation) -> Result<()> {
