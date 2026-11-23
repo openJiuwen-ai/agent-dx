@@ -294,6 +294,42 @@ paths:
           $ref: "#/components/responses/Error"
         default:
           $ref: "#/components/responses/Error"
+  /api/environment/v1/constrained-environments:
+    post:
+      tags: [Environments]
+      operationId: createConstrainedEnvironment
+      summary: Create an Environment on a worker with required runtime capabilities
+      description: |
+        Provide an explicit runtime through `runtime` or `rootfs.runtime`. The worker must advertise every required capability for that runtime in its current registration. The existing scheduling timeout bounds the wait for compatible capacity. Retries use this endpoint and the original `X-Request-Id` and body.
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - name: Accept
+          in: header
+          schema: {type: string, enum: [application/json, text/event-stream]}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConstrainedEnvironmentRequest"
+      responses:
+        "200":
+          description: Created, or an SSE stream whose final event reports the outcome.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - $ref: "#/components/schemas/CreateEnvironmentEnvelopeData"
+            text/event-stream:
+              schema: {type: string}
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
   /api/instances:
     get:
       tags: [Environments]
@@ -955,6 +991,7 @@ components:
         Unknown top-level fields are accepted and ignored for caller compatibility;
         they are not forwarded to the runtime. Declared fields retain their types
         and validation rules. Nested objects follow their own schemas.
+        Send `requiredNodeCapabilities` to the constrained creation endpoint.
       properties:
         name:
           type: string
@@ -1107,6 +1144,24 @@ components:
           type: string
           description: GPU/NPU whole-device request encoded by the compatibility API.
         tunnel: {$ref: "#/components/schemas/TunnelRequest"}
+    ConstrainedEnvironmentRequest:
+      allOf:
+        - $ref: "#/components/schemas/CreateEnvironmentRequest"
+        - type: object
+          required: [requiredNodeCapabilities]
+          properties:
+            requiredNodeCapabilities:
+              type: array
+              minItems: 1
+              maxItems: 32
+              uniqueItems: true
+              items: {type: string, enum: [checkpoint-restore.v1]}
+          anyOf:
+            - required: [runtime]
+            - required: [rootfs]
+              properties:
+                rootfs: {type: object, required: [runtime]}
+          not: {required: [snapshotId]}
     WorkloadProcess:
       type: object
       additionalProperties: false

@@ -28,6 +28,140 @@ use tonic::{Request, Response, Status};
 include!("support/create_fixture.rs");
 
 #[tokio::test]
+async fn node_capabilities_require_the_constrained_create_route_and_a_fresh_explicit_runtime() {
+    let fixture = Fixture::new().await;
+    let headers = [
+        ("Authorization", format!("Bearer {}", "k".repeat(32))),
+        ("Content-Type", "application/json".into()),
+    ];
+    for (route, body) in [
+        (
+            "environments",
+            json!({"runtime":"runsc", "requiredNodeCapabilities":[]}),
+        ),
+        ("constrained-environments", json!({"runtime":"runsc"})),
+        (
+            "constrained-environments",
+            json!({"requiredNodeCapabilities":["checkpoint-restore.v1"]}),
+        ),
+        (
+            "constrained-environments",
+            json!({"runtime":"runsc", "requiredNodeCapabilities":["unknown.v1"]}),
+        ),
+        (
+            "constrained-environments",
+            json!({"runtime":"runsc", "requiredNodeCapabilities":["checkpoint-restore.v1", "checkpoint-restore.v1"]}),
+        ),
+        (
+            "constrained-environments",
+            json!({"runtime":"runsc", "snapshotId":"snapshot", "requiredNodeCapabilities":["checkpoint-restore.v1"]}),
+        ),
+        (
+            "constrained-environments",
+            json!({"runtime":"bad/runtime", "requiredNodeCapabilities":["checkpoint-restore.v1"]}),
+        ),
+    ] {
+        let mut body = body;
+        body["image"] = json!("tools:1");
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            &format!("/api/environment/v1/{route}"),
+            &headers,
+            &body.to_string(),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 400, "{route}: {body}");
+        let response: Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(response["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(response["error"]["outcome"], "not_started");
+    }
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn constrained_create_replay_requires_current_session_proof_without_resubmission() {
+    let fixture = Fixture::new().await;
+    let key = "adx.internal/node-capability/runsc/checkpoint-restore.v1";
+    *fixture.state.entry_node.lock().unwrap() = Some(pb::NodeEndpoint {
+        node_id: "capable-node".into(),
+        session_id: "original-session".into(),
+        labels: [(key.into(), "true".into())].into(),
+        ..Default::default()
+    });
+    let body = json!({"name":"example", "image":"image", "runtime":"runsc",
+        "requiredNodeCapabilities":["checkpoint-restore.v1"]});
+    let send = |request_id: &'static str, accept: &'static str, node: Option<&'static str>| {
+        let api = fixture.api.clone();
+        let mut body = body.clone();
+        if let Some(node) = node {
+            body["scheduleAffinities"] = json!([{"kind":0, "affinity":2, "labelOps":[
+                {"type":0, "labelKey":"NODE_ID", "labelValues":[node]}
+            ]}]);
+        }
+        async move {
+            http::request(
+                api,
+                "POST",
+                "/api/environment/v1/constrained-environments",
+                &[
+                    ("Authorization", format!("Bearer {}", "k".repeat(32))),
+                    ("Content-Type", "application/json".into()),
+                    ("X-Request-Id", request_id.into()),
+                    ("Accept", accept.into()),
+                ],
+                &body.to_string(),
+            )
+            .await
+        }
+    };
+    let first = send("create-with-capabilities", "text/event-stream", None).await;
+    assert_eq!(first.status(), 200);
+    assert_eq!(first.headers()["content-type"], "text/event-stream");
+    let stream = String::from_utf8_lossy(first.body());
+    assert!(
+        stream.contains("event: final") && stream.contains("\"newlyCreated\":true"),
+        "{stream}"
+    );
+    let old_coordinator = send("create-with-capabilities", "application/json", None).await;
+    assert!(old_coordinator.status().is_client_error());
+    assert!(String::from_utf8_lossy(old_coordinator.body())
+        .contains("did not verify node capabilities"));
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 1);
+
+    *fixture.state.verified_node_session.lock().unwrap() = Some("original-session".into());
+    let valid_replay = send("create-with-capabilities", "application/json", None).await;
+    assert_eq!(valid_replay.status(), 200);
+
+    fixture
+        .state
+        .entry_node
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .session_id = "replacement-session".into();
+    let replaced = send("create-with-capabilities", "application/json", None).await;
+    assert!(replaced.status().is_client_error());
+    assert!(String::from_utf8_lossy(replaced.body())
+        .contains("capability session is no longer current"));
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 1);
+
+    let pinned = send(
+        "create-pinned-to-another-node",
+        "application/json",
+        Some("different-node"),
+    )
+    .await;
+    assert!(pinned.status().is_client_error());
+    assert!(String::from_utf8_lossy(pinned.body())
+        .contains("does not satisfy required node capability placement"));
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn unsupported_runtime_create_options_return_not_started_without_submission() {
     let fixture = Fixture::new().await;
     let headers = [

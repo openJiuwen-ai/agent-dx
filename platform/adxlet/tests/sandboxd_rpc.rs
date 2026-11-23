@@ -40,6 +40,7 @@ struct Server {
     start_timeout: Option<String>,
     list_unavailable: Arc<std::sync::atomic::AtomicBool>,
     wait_pending: bool,
+    available_runtimes: Arc<Mutex<Option<ListAvailableRuntimesResponse>>>,
 }
 impl Default for Server {
     fn default() -> Self {
@@ -67,6 +68,7 @@ impl Default for Server {
             start_timeout: None,
             list_unavailable: Arc::default(),
             wait_pending: false,
+            available_runtimes: Arc::default(),
         }
     }
 }
@@ -245,6 +247,9 @@ impl sandbox_service_server::SandboxService for Server {
         {
             return Err(Status::unavailable("environment service not ready"));
         }
+        if let Some(response) = self.available_runtimes.lock().unwrap().as_ref() {
+            return Ok(Response::new(response.clone()));
+        }
         Ok(Response::new(ListAvailableRuntimesResponse {
             runtime_classes: vec!["runsc".into()],
             runtimes: vec![RuntimeInfo {
@@ -318,6 +323,101 @@ async fn discovers_runtime_classes_from_sandboxd_uds() {
         adapter.available_runtime_classes().await.unwrap(),
         ["runsc"]
     );
+}
+
+#[tokio::test]
+async fn qualifies_only_complete_checkpoint_restore_runtime_details() {
+    let detail = |runtime: &str, supported, checkpoint: &str, restore: &str| RuntimeInfo {
+        runtime_class: runtime.into(),
+        supports_checkpoint_restore: supported,
+        checkpoint_handoff_path: checkpoint.into(),
+        restore_env_path: restore.into(),
+    };
+    let (adapter, _server) = connect(Server {
+        available_runtimes: Arc::new(Mutex::new(Some(ListAvailableRuntimesResponse {
+            runtime_classes: vec!["legacy".into()],
+            runtimes: vec![
+                detail("runsc", true, "/checkpoint", "/restore"),
+                detail("no-restore", true, "/checkpoint", ""),
+                detail("no-checkpoint", true, "", "/restore"),
+                detail("unsupported", false, "/checkpoint", "/restore"),
+                detail("invalid/runtime", true, "/checkpoint", "/restore"),
+            ],
+        }))),
+        ..Default::default()
+    })
+    .await;
+    let inventory = adapter.runtime_inventory().await.unwrap();
+    assert_eq!(
+        inventory.classes,
+        [
+            "invalid/runtime",
+            "legacy",
+            "no-checkpoint",
+            "no-restore",
+            "runsc",
+            "unsupported",
+        ]
+    );
+    assert_eq!(
+        inventory.capabilities,
+        BTreeMap::from([(
+            "runsc".into(),
+            [adx_core::scheduling::CHECKPOINT_RESTORE_V1.into()].into(),
+        )])
+    );
+}
+
+#[tokio::test]
+async fn rechecks_current_node_capability_before_submitting_runtime_start() {
+    use adx_core::scheduling::{
+        node_capability_label, LabelSelector, CHECKPOINT_RESTORE_V1, NODE_CAPABILITY_LABEL_VALUE,
+    };
+    use adxlet::runtime_router::RuntimeRouter;
+
+    let server = Server::default();
+    let starts = server.starts.clone();
+    let available_runtimes = server.available_runtimes.clone();
+    let (adapter, _server) = connect(server).await;
+    let router = RuntimeRouter::new(Some(adapter), None).unwrap();
+    assert!(router
+        .runtime_inventory()
+        .await
+        .unwrap()
+        .capabilities
+        .contains_key("runsc"));
+
+    let mut constrained = spec();
+    constrained.runtime_class = "runsc".into();
+    constrained.scheduling.required_node = vec![LabelSelector {
+        match_labels: [(
+            node_capability_label("runsc", CHECKPOINT_RESTORE_V1),
+            NODE_CAPABILITY_LABEL_VALUE.into(),
+        )]
+        .into(),
+        ..Default::default()
+    }];
+    // An older replacement sandboxd can still accept runsc starts but no
+    // longer supplies the detailed qualification seen by the Coordinator.
+    *available_runtimes.lock().unwrap() = Some(ListAvailableRuntimesResponse {
+        runtime_classes: vec!["runsc".into()],
+        runtimes: vec![],
+    });
+    let error = router
+        .start_with_deadline(
+            &constrained,
+            "withdrawn",
+            1,
+            &[],
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        adx_core::Error::UnsupportedCapability(adx_core::UnsupportedCapability::CheckpointRestore)
+    );
+    assert!(starts.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -896,6 +996,48 @@ fn lifecycle_assignment() -> Assignment {
         generation: 1,
         devices: vec![],
     }
+}
+
+#[tokio::test]
+async fn checkpoint_capability_requires_configured_worker_storage() {
+    use adx_core::scheduling::{
+        node_capability_label, LabelSelector, CHECKPOINT_RESTORE_V1, NODE_CAPABILITY_LABEL_VALUE,
+    };
+
+    let server = Server::default();
+    let starts = server.starts.clone();
+    let (adapter, _server) = connect(server).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter.clone(), &hooks);
+    assert!(node.checkpoint_capability_storage_ready().await.is_err());
+
+    let mut constrained = spec();
+    constrained.runtime_class = "runsc".into();
+    constrained.scheduling.required_node = vec![LabelSelector {
+        match_labels: [(
+            node_capability_label("runsc", CHECKPOINT_RESTORE_V1),
+            NODE_CAPABILITY_LABEL_VALUE.into(),
+        )]
+        .into(),
+        ..Default::default()
+    }];
+    let handle = node
+        .environment(constrained, lifecycle_assignment())
+        .unwrap();
+    assert_eq!(
+        handle.create().await.unwrap_err(),
+        adx_core::Error::UnsupportedCapability(adx_core::UnsupportedCapability::CheckpointRestore)
+    );
+    assert!(starts.lock().unwrap().is_empty());
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = adxlet::checkpoint::LocalCheckpointStore::new(directory.path().into()).unwrap();
+    let control =
+        adxlet::runtime_control::RuntimeControlClient::new(50090, Duration::from_secs(1)).unwrap();
+    let node = lifecycle_node(adapter, &hooks)
+        .with_checkpointing(Arc::new(store), Arc::new(control))
+        .unwrap();
+    node.checkpoint_capability_storage_ready().await.unwrap();
 }
 
 #[tokio::test]

@@ -4,12 +4,25 @@ use crate::{
     RuntimeStatus,
 };
 use adx_core::{
-    execution::NetworkPolicy, scheduling::DeviceAllocation, EnvironmentRecord, EnvironmentSpec,
-    Error, Result,
+    execution::NetworkPolicy,
+    scheduling::{node_capability_label, DeviceAllocation, CHECKPOINT_RESTORE_V1},
+    EnvironmentRecord, EnvironmentSpec, Error, Result,
 };
 use async_trait::async_trait;
-use std::{net::IpAddr, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+    path::Path,
+    time::Duration,
+};
 use tokio::time::Instant;
+
+/// Available runtimes and positively qualified capabilities from one observation.
+#[derive(Default)]
+pub struct RuntimeInventory {
+    pub classes: Vec<String>,
+    pub capabilities: BTreeMap<String, BTreeSet<String>>,
+}
 
 pub struct RuntimeRouter {
     sandboxd: Option<Sandboxd>,
@@ -43,17 +56,23 @@ impl RuntimeRouter {
             .check_health()
             .await
     }
-    pub async fn available_runtime_classes(&self) -> Result<Vec<String>> {
-        let mut classes = vec![];
-        if let Some(runtime) = &self.sandboxd {
-            classes.extend(runtime.available_runtime_classes().await?);
-        }
+    pub async fn runtime_inventory(&self) -> Result<RuntimeInventory> {
+        let mut inventory = match &self.sandboxd {
+            Some(runtime) => runtime.runtime_inventory().await?,
+            None => RuntimeInventory::default(),
+        };
+        // These classes route exclusively to Jiuwenbox, so sandboxd's
+        // observation cannot qualify them.
+        inventory.capabilities.remove("supervisor");
+        inventory.capabilities.remove("conch");
         if let Some(runtime) = &self.jiuwenbox {
-            classes.extend(runtime.available_runtime_classes().await?);
+            inventory
+                .classes
+                .extend(runtime.available_runtime_classes().await?);
         }
-        classes.sort();
-        classes.dedup();
-        Ok(classes)
+        inventory.classes.sort();
+        inventory.classes.dedup();
+        Ok(inventory)
     }
     fn class(&self, class: &str) -> Result<&dyn RuntimeDriver> {
         if matches!(class, "supervisor" | "conch") {
@@ -78,6 +97,33 @@ impl RuntimeRouter {
             .as_ref()
             .map(|r| r as &dyn RuntimeDriver)
             .ok_or(Error::NotFound)
+    }
+}
+
+async fn check_launch_capabilities(
+    driver: &dyn RuntimeDriver,
+    spec: &EnvironmentSpec,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    let mut required = spec.scheduling.required_node_capability_labels();
+    let Some(first) = required.next() else {
+        return Ok(());
+    };
+    let checkpoint_restore = node_capability_label(&spec.runtime_class, CHECKPOINT_RESTORE_V1);
+    if first != checkpoint_restore || required.any(|key| key != checkpoint_restore) {
+        return Err(Error::Invalid(
+            "invalid runtime node capability constraint".into(),
+        ));
+    }
+    let check = driver.checkpoint_supported(&spec.runtime_class);
+    if let Some(deadline) = deadline {
+        tokio::time::timeout_at(deadline, check)
+            .await
+            .map_err(|_| {
+                Error::DeadlineExceeded("runtime node capability observation timed out".into())
+            })?
+    } else {
+        check.await
     }
 }
 
@@ -111,9 +157,9 @@ impl RuntimeDriver for RuntimeRouter {
         generation: u64,
         devices: &[DeviceAllocation],
     ) -> Result<IpAddr> {
-        self.class(&spec.runtime_class)?
-            .start(spec, id, generation, devices)
-            .await
+        let driver = self.class(&spec.runtime_class)?;
+        check_launch_capabilities(driver, spec, None).await?;
+        driver.start(spec, id, generation, devices).await
     }
     async fn start_with_deadline(
         &self,
@@ -130,9 +176,13 @@ impl RuntimeDriver for RuntimeRouter {
         trace
             .run(async {
                 let driver = self.class(&spec.runtime_class)?;
-                let result = driver
-                    .start_with_deadline(spec, id, generation, devices, deadline)
-                    .await;
+                let result = async {
+                    check_launch_capabilities(driver, spec, Some(deadline)).await?;
+                    driver
+                        .start_with_deadline(spec, id, generation, devices, deadline)
+                        .await
+                }
+                .await;
                 match &result {
                     Ok(_) => {
                         adx_observability::trace::attribute("result", "success".into());
@@ -261,9 +311,9 @@ impl RuntimeDriver for RuntimeRouter {
         devices: &[DeviceAllocation],
         path: &Path,
     ) -> Result<IpAddr> {
-        self.class(&spec.runtime_class)?
-            .restore(spec, id, generation, devices, path)
-            .await
+        let driver = self.class(&spec.runtime_class)?;
+        check_launch_capabilities(driver, spec, None).await?;
+        driver.restore(spec, id, generation, devices, path).await
     }
     async fn restore_from(
         &self,
@@ -274,7 +324,9 @@ impl RuntimeDriver for RuntimeRouter {
         path: &Path,
         origin: Option<&adx_core::runtime::RuntimeIdentity>,
     ) -> Result<IpAddr> {
-        self.class(&spec.runtime_class)?
+        let driver = self.class(&spec.runtime_class)?;
+        check_launch_capabilities(driver, spec, None).await?;
+        driver
             .restore_from(spec, id, generation, devices, path, origin)
             .await
     }
@@ -287,7 +339,9 @@ impl RuntimeDriver for RuntimeRouter {
         source: RestoreSource<'_>,
         deadline: Instant,
     ) -> Result<IpAddr> {
-        self.class(&spec.runtime_class)?
+        let driver = self.class(&spec.runtime_class)?;
+        check_launch_capabilities(driver, spec, Some(deadline)).await?;
+        driver
             .restore_from_with_deadline(spec, id, generation, devices, source, deadline)
             .await
     }

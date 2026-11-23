@@ -6,6 +6,25 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Reserved registration label for the machine identity reported by adxlet.
 pub const NODE_HOST_UUID_LABEL: &str = "ADX_NODE_HOST_UUID";
 
+/// Node labels in this namespace are derived from authenticated runtime observations.
+pub const NODE_CAPABILITY_LABEL_PREFIX: &str = "adx.internal/node-capability/";
+pub const NODE_CAPABILITY_LABEL_VALUE: &str = "true";
+pub const CHECKPOINT_RESTORE_V1: &str = "checkpoint-restore.v1";
+
+/// Runtime names used in capability labels must fit in one key component.
+pub fn valid_node_capability_runtime(runtime: &str) -> bool {
+    !runtime.is_empty()
+        && runtime.len() <= 128
+        && runtime
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Builds a hard-affinity label from a validated runtime and capability identifier.
+pub fn node_capability_label(runtime: &str, capability: &str) -> String {
+    format!("{NODE_CAPABILITY_LABEL_PREFIX}{runtime}/{capability}")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceKind {
@@ -219,6 +238,23 @@ pub struct SchedulingPolicy {
     pub placement_groups: Vec<PlacementGroup>,
 }
 impl SchedulingPolicy {
+    /// Reserved runtime capability labels referenced by hard node constraints.
+    pub fn required_node_capability_labels(&self) -> impl Iterator<Item = &str> {
+        self.required_node.iter().flat_map(|selector| {
+            selector
+                .match_labels
+                .keys()
+                .chain(
+                    selector
+                        .expressions
+                        .iter()
+                        .map(|expression| &expression.key),
+                )
+                .map(String::as_str)
+                .filter(|key| key.starts_with(NODE_CAPABILITY_LABEL_PREFIX))
+        })
+    }
+
     pub fn matches_node(&self, labels: &BTreeMap<String, String>) -> bool {
         self.required_node.is_empty() || self.required_node.iter().any(|s| s.matches(labels))
     }

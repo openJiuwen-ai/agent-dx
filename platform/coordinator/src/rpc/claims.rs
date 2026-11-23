@@ -138,6 +138,45 @@ impl State {
         }
         Ok(())
     }
+    pub(super) fn node_has_current_capabilities(
+        &self,
+        requested: &SchedulingPolicy,
+        node: &StoredNode,
+        timeout: Duration,
+    ) -> bool {
+        !capability_constraints::required(requested)
+            || (capability_constraints::supported(requested, &node.node.labels)
+                && node.session.as_ref().is_some_and(|session| {
+                    self.live_claimant(&node.node.id, &session.id, timeout)
+                        .is_ok()
+                }))
+    }
+    pub(super) fn check_capability_replay(
+        &self,
+        requested: &SchedulingPolicy,
+        stored: &StoredEnvironment,
+        timeout: Duration,
+    ) -> std::result::Result<(), &'static str> {
+        if !capability_constraints::required(requested) {
+            return Ok(());
+        }
+        if !capability_constraints::retained(requested, &stored.spec.scheduling) {
+            return Err("existing Environment did not retain the required node capabilities");
+        }
+        if stored.invalidated
+            || stored
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.pending)
+            || self
+                .nodes
+                .get(&stored.assignment.node_id)
+                .is_none_or(|node| !self.node_has_current_capabilities(requested, node, timeout))
+        {
+            return Err("existing Environment's current worker session does not have the required node capabilities");
+        }
+        Ok(())
+    }
     pub(super) fn environment_response(
         &self,
         stored: &StoredEnvironment,
@@ -268,6 +307,8 @@ impl CoordinatorRpc {
             },
         };
         if let Some(stored) = published {
+            self.verify_capability_replay(&spec.scheduling, &stored)
+                .await?;
             let record = stored.effective_record();
             let stored = if record.state == EnvironmentState::Running {
                 session
@@ -278,6 +319,9 @@ impl CoordinatorRpc {
                 stored
             };
             let state = self.0.state.lock().await;
+            state
+                .check_capability_replay(&spec.scheduling, &stored, self.0.heartbeat_timeout)
+                .map_err(Status::failed_precondition)?;
             let owner = state
                 .nodes
                 .get(&stored.assignment.node_id)
@@ -328,6 +372,9 @@ impl CoordinatorRpc {
             if record.spec != spec {
                 return Err(Status::already_exists("environment specification conflict"));
             }
+            state
+                .check_capability_replay(&spec.scheduling, record, self.0.heartbeat_timeout)
+                .map_err(Status::failed_precondition)?;
         } else {
             let domains = self.volume_domains(&state).map_err(status)?;
             state
@@ -489,6 +536,9 @@ impl CoordinatorRpc {
         state
             .live_claimant(&node, &candidate.node_session_id, self.0.heartbeat_timeout)
             .map_err(status)?;
+        state
+            .check_capability_replay(&spec.scheduling, &record, self.0.heartbeat_timeout)
+            .map_err(Status::failed_precondition)?;
         if matches!(outcome, ClaimOutcome::Owned(_)) {
             adx_observability::info!(event="local_environment_claim", environment_id=%record.spec.id,
                 node_id=%record.assignment.node_id, generation=record.assignment.generation,

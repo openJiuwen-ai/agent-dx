@@ -4,6 +4,7 @@ const BUILD_ID: &str = "550e8400-e29b-41d4-a716-446655440011";
 #[derive(Default)]
 struct State {
     entry_node: Mutex<Option<pb::NodeEndpoint>>,
+    verified_node_session: Mutex<Option<String>>,
     local_persistence: Mutex<Vec<bool>>,
     owners: Mutex<HashMap<String, pb::GetEnvironmentResponse>>,
     receipts: Mutex<HashMap<(String, String), String>>,
@@ -128,7 +129,13 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         self.0.lookups.fetch_add(1, Ordering::SeqCst);
         let owner = self.0.owners.lock().unwrap().get(&request.get_ref().environment_id).cloned()
             .ok_or_else(|| Status::not_found("environment not found"))?;
-        Ok(Response::new(owner))
+        let mut response = Response::new(owner);
+        if request.metadata().get("x-adx-verify-node-capabilities").is_some() {
+            if let Some(session) = self.0.verified_node_session.lock().unwrap().as_ref() {
+                response.metadata_mut().insert("x-adx-verified-node-session", session.parse().unwrap());
+            }
+        }
+        Ok(response)
     }
     async fn create_environment(&self, request: Request<pb::CreateEnvironmentRequest>) -> Result<Response<pb::EnvironmentResult>, Status> {
         let _trace = adx_observability::trace::Trace::rpc("test.coordinator.create_environment", &request);

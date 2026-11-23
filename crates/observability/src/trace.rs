@@ -602,6 +602,9 @@ pub fn http_route(path: &str) -> &'static str {
         "/control/v1/status" => return "/control/v1/status",
         "/api/environment/create" => return "/api/environment/create",
         "/api/environment/v1/environments" => return "/api/environment/v1/environments",
+        "/api/environment/v1/constrained-environments" => {
+            return "/api/environment/v1/constrained-environments"
+        }
         "/api/environment/v1/snapshots" => return "/api/environment/v1/snapshots",
         "/api/instances" => return "/api/instances",
         "/api/admin/v1/keys" => return "/api/admin/v1/keys",

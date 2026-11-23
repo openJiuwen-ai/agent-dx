@@ -842,6 +842,8 @@ when combined with alternatives. See [placement rules](https://gitcode.com/openJ
 for the matching, ranking and label contracts. Caller-provided option lists are
 copied before the SDK adds a node constraint.
 
+For a fresh Environment, `Environment(runtime="runsc", required_node_capabilities=["checkpoint-restore.v1"])` makes worker capability a hard placement constraint alongside `node_id`, runtime and resources. Every named capability must be advertised for the selected runtime. An empty list uses ordinary creation. A server without the constrained endpoint rejects the request before scheduling. The SDK preserves the operation identity if an earlier constrained attempt has an unknown outcome.
+
 
 ## Tool execution identity
 

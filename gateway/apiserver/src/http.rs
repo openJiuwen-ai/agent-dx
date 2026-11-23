@@ -33,6 +33,17 @@ use tonic::{Code, Status};
 type Error = Box<dyn std::error::Error + Send + Sync>;
 const DEFAULT_INSTANCE_PAGE_SIZE: usize = 100;
 const MAX_INSTANCE_PAGE_SIZE: usize = 1000;
+const ENVIRONMENT_CREATE: &str = "/api/environment/v1/environments";
+const CONSTRAINED_ENVIRONMENT_CREATE: &str = "/api/environment/v1/constrained-environments";
+const LEGACY_ENVIRONMENT_CREATE: &str = "/api/environment/create";
+
+fn is_create_path(path: &str) -> bool {
+    matches!(
+        path,
+        ENVIRONMENT_CREATE | CONSTRAINED_ENVIRONMENT_CREATE | LEGACY_ENVIRONMENT_CREATE
+    )
+}
+
 pub type Body = UnsyncBoxBody<Bytes, Error>;
 pub struct Api {
     pub clients: Arc<Clients>,
@@ -68,12 +79,7 @@ impl Api {
         if request.method() == hyper::Method::POST
             && percent_encoding::percent_decode_str(request.uri().path())
                 .decode_utf8()
-                .is_ok_and(|path| {
-                    matches!(
-                        path.trim_end_matches('/'),
-                        "/api/environment/v1/environments" | "/api/environment/create"
-                    )
-                })
+                .is_ok_and(|path| is_create_path(path.trim_end_matches('/')))
         {
             self.environment_service.creation_metrics.http_request();
         }
@@ -148,12 +154,7 @@ impl Api {
         let create_route = request.method() == hyper::Method::POST
             && percent_encoding::percent_decode_str(request.uri().path())
                 .decode_utf8()
-                .is_ok_and(|path| {
-                    matches!(
-                        path.trim_end_matches('/'),
-                        "/api/environment/v1/environments" | "/api/environment/create"
-                    )
-                });
+                .is_ok_and(|path| is_create_path(path.trim_end_matches('/')));
         let mut rejection = self
             .environment_service
             .creation_metrics
@@ -497,10 +498,35 @@ impl Api {
             Ok(v) => v,
             Err(error) => return error_response(error, &request_id, None, None, false),
         };
-        if method == "POST"
-            && (path == "/api/environment/v1/environments" || path == "/api/environment/create")
-        {
-            if path == "/api/environment/create"
+        if method == "POST" && is_create_path(&path) {
+            let capabilities = input.get("requiredNodeCapabilities");
+            if path == CONSTRAINED_ENVIRONMENT_CREATE {
+                if capabilities
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+                {
+                    return error_response(
+                        Status::invalid_argument(
+                            "requiredNodeCapabilities must be a nonempty list",
+                        ),
+                        &request_id,
+                        None,
+                        None,
+                        false,
+                    );
+                }
+            } else if capabilities.is_some() {
+                return error_response(
+                    Status::invalid_argument(
+                        "requiredNodeCapabilities require the constrained-environments route",
+                    ),
+                    &request_id,
+                    None,
+                    None,
+                    false,
+                );
+            }
+            if path == LEGACY_ENVIRONMENT_CREATE
                 && input
                     .get("runtime")
                     .and_then(Value::as_str)
@@ -519,7 +545,7 @@ impl Api {
                 Err(error) => return error_response(error, &request_id, None, None, false),
             };
             rejection.accepted();
-            if stream && path.ends_with("environments") {
+            if stream && path != LEGACY_ENVIRONMENT_CREATE {
                 return self.clone().create_stream(spec, input, request_id, caller);
             }
             let environment_id = spec.id.clone();
@@ -530,7 +556,7 @@ impl Api {
                 )
                 .await;
             return response(
-                if path == "/api/environment/create" {
+                if path == LEGACY_ENVIRONMENT_CREATE {
                     result.map(|v| json!({"instance_id":v["environmentId"]}))
                 } else {
                     result

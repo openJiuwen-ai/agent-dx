@@ -129,7 +129,12 @@ message RegisterNodeRequest {
   // Node-level pressure disposal state; see NodePressureDisposition.
   // v1: never set by adxlet, never read by the coordinator.
   NodePressureDisposition pressure_disposition = 15;
+  // Complete qualified capability view for the runtime classes in this report.
+  // Missing entries confer no capability for this worker session.
+  map<string, RuntimeCapabilities> runtime_capabilities = 16;
 }
+
+message RuntimeCapabilities { repeated string capability_ids = 1; }
 
 // Node-local resource pressure snapshot from local hysteresis. The level is
 // authoritative state; percent is the observation that derived it. The

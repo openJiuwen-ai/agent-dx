@@ -412,6 +412,7 @@ fn v1_heartbeat_bytes_never_carry_the_disposition_field() {
         session_id: "session-a".into(),
         heartbeat_sequence: 7,
         reconciling: false,
+        runtime_capabilities: Default::default(),
         runtime_classes: vec!["runsc".into()],
         accepting_allocations: true,
         capacity: Some(adx_protocol::control::Resources {

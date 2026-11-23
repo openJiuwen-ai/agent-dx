@@ -1,4 +1,8 @@
 //! Public JSON contract converted directly to typed Environment RPC payloads.
+use adx_core::scheduling::{
+    node_capability_label, valid_node_capability_runtime, CHECKPOINT_RESTORE_V1,
+    NODE_CAPABILITY_LABEL_PREFIX, NODE_CAPABILITY_LABEL_VALUE,
+};
 use adx_protocol::control as pb;
 use serde::Deserialize;
 use serde_json::Value;
@@ -38,6 +42,8 @@ struct Create {
     restart: Option<Restart>,
     #[serde(rename = "scheduleAffinities")]
     affinities: Vec<Affinity>,
+    #[serde(rename = "requiredNodeCapabilities")]
+    required_node_capabilities: Vec<String>,
     #[serde(rename = "createTimeoutSeconds")]
     create_timeout: i64,
     #[serde(rename = "scheduleTimeoutSeconds")]
@@ -674,6 +680,34 @@ pub fn create_spec_with_environment(
         root.r#type = "image".into();
     }
     let snapshot = (!r.snapshot_id.trim().is_empty()).then(|| r.snapshot_id.trim().to_string());
+    if !r.required_node_capabilities.is_empty() {
+        if !valid_node_capability_runtime(&root.runtime) {
+            return Err(invalid(
+                "requiredNodeCapabilities require an explicit valid runtime",
+            ));
+        }
+        if snapshot.is_some() {
+            return Err(invalid(
+                "requiredNodeCapabilities are only supported for fresh create",
+            ));
+        }
+        if r.required_node_capabilities.len() > 32 {
+            return Err(invalid("too many requiredNodeCapabilities"));
+        }
+        if r.required_node_capabilities
+            .iter()
+            .any(|id| id != CHECKPOINT_RESTORE_V1)
+        {
+            return Err(invalid("unsupported requiredNodeCapabilities identifier"));
+        }
+        r.required_node_capabilities.sort_unstable();
+        if r.required_node_capabilities
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            return Err(invalid("duplicate requiredNodeCapabilities identifier"));
+        }
+    }
     // Match the native SDK: this option starts a fresh image workload. Restore
     // resumes captured processes and inherits their metadata from the snapshot.
     if snapshot.is_some() && r.inherit {
@@ -894,6 +928,23 @@ pub fn create_spec_with_environment(
         ));
     }
     let mut policy = policy;
+    if !r.required_node_capabilities.is_empty() {
+        let requirements: Vec<_> = r
+            .required_node_capabilities
+            .into_iter()
+            .map(|id| pb::LabelRequirement {
+                key: node_capability_label(&root.runtime, &id),
+                op: pb::SelectorOp::In as i32,
+                values: vec![NODE_CAPABILITY_LABEL_VALUE.into()],
+            })
+            .collect();
+        if policy.required_node.is_empty() {
+            policy.required_node.push(pb::LabelSelector::default());
+        }
+        for selector in &mut policy.required_node {
+            selector.expressions.extend(requirements.iter().cloned());
+        }
+    }
     if r.pause
         .as_ref()
         .is_some_and(|p| p.storage == adx_core::lifecycle::CheckpointStorage::Shared)
@@ -1073,6 +1124,9 @@ fn affinities(
         }
         let mut requirements = Vec::new();
         for op in a.label_ops {
+            if op.label_key.starts_with(NODE_CAPABILITY_LABEL_PREFIX) {
+                return Err(invalid("node capability affinity keys are reserved"));
+            }
             if op.label_key.trim().is_empty()
                 || !(0..=3).contains(&op.r#type)
                 || (op.r#type < 2 && op.label_values.is_empty())

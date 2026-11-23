@@ -9,7 +9,7 @@ import logging
 import os
 import random
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
@@ -388,6 +388,7 @@ class Environment:
         rootfs_readonly: Optional[bool] = None,
         labels: Optional[Dict[str, str]] = None,
         schedule_affinities: Optional[List[Dict[str, Any]]] = None,
+        required_node_capabilities: Optional[Sequence[str]] = None,
         snapshot_id: Optional[str] = None,
         restart_policy: Optional[RestartPolicy] = None,
         idle_action: IdleAction = IdleAction.DELETE,
@@ -454,6 +455,9 @@ class Environment:
                 ``proxy_port - 1``. Defaults to 8766.
             tunnel_connect_timeout: Seconds to wait for the tunnel WebSocket.
             detached: If True, ``kill()`` / context-manager exit skips teardown.
+            required_node_capabilities: Versioned capabilities all required on
+                the selected worker. Requires an explicit runtime and a fresh
+                create. ``checkpoint-restore.v1`` is currently supported.
             xpu: Optional whole-device XPU request in ``type:model:count``
                 format. Leave ``model`` empty to accept any model. The first
                 version supports one ``gpu`` or ``npu`` request.
@@ -503,6 +507,25 @@ class Environment:
             raise TypeError("rootfs_readonly must be a boolean or None")
         if snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id.strip()):
             raise ValueError("snapshot_id must be a non-empty string")
+        capabilities = []
+        if required_node_capabilities is not None:
+            if not isinstance(required_node_capabilities, Sequence) or isinstance(
+                required_node_capabilities, (str, bytes, bytearray)
+            ):
+                raise TypeError("required_node_capabilities must be a sequence of capability identifiers")
+            if len(required_node_capabilities) > 32:
+                raise ValueError("required_node_capabilities must contain at most 32 entries")
+            for capability in required_node_capabilities:
+                if not isinstance(capability, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,127}", capability):
+                    raise ValueError(f"invalid node capability identifier: {capability!r}")
+                if capability in capabilities:
+                    raise ValueError(f"duplicate node capability: {capability!r}")
+                capabilities.append(capability)
+        if capabilities:
+            if not isinstance(runtime, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", runtime):
+                raise ValueError("required_node_capabilities require an explicit valid runtime")
+            if snapshot_id is not None:
+                raise ValueError("required_node_capabilities are only supported for fresh create")
         if isinstance(rootfs, LocalRootfs) and snapshot_id is not None:
             raise ValueError("rootfs cannot be combined with snapshot_id")
         if (user is None) != (group is None):
@@ -700,6 +723,8 @@ class Environment:
         placement = encode_affinities(schedule_affinities, node_id)
         if placement:
             body["scheduleAffinities"] = placement
+        if capabilities:
+            body["requiredNodeCapabilities"] = capabilities
         if labels is not None:
             body["labels"] = instance_labels(labels)
         if mount_list:

@@ -7,6 +7,7 @@ use crate::{
     ownership::Cache,
     workspace_affinity,
 };
+use adx_core::scheduling::{SchedulingPolicy, NODE_CAPABILITY_LABEL_PREFIX};
 use adx_protocol::control as pb;
 use adx_transport::deadline::Deadline;
 use serde_json::{json, Value};
@@ -21,6 +22,63 @@ use tokio::sync::Mutex;
 use tonic::{Code, Status};
 
 type CreateKey = (String, String);
+
+#[derive(PartialEq)]
+struct RequiredNodeCapabilities {
+    environment_id: String,
+    runtime: String,
+    required_node: Vec<pb::LabelSelector>,
+    placement: Vec<pb::PlacementGroup>,
+}
+
+impl RequiredNodeCapabilities {
+    fn from_spec(spec: &pb::EnvironmentSpec) -> Option<Self> {
+        let policy = spec.scheduling.as_ref()?;
+        let has_capabilities = policy
+            .required_node
+            .first()?
+            .expressions
+            .iter()
+            .any(|requirement| requirement.key.starts_with(NODE_CAPABILITY_LABEL_PREFIX));
+        if !has_capabilities {
+            return None;
+        }
+        Some(Self {
+            environment_id: spec.id.clone(),
+            runtime: spec.runtime_class.clone(),
+            required_node: policy.required_node.clone(),
+            placement: policy
+                .placement_groups
+                .iter()
+                .filter(|group| group.required)
+                .cloned()
+                .collect(),
+        })
+    }
+
+    fn verify_record<'a>(
+        &self,
+        record: &'a pb::EnvironmentRecord,
+    ) -> Result<&'a pb::SchedulingPolicy, Status> {
+        record
+            .spec
+            .as_ref()
+            .filter(|spec| spec.id == self.environment_id && spec.runtime_class == self.runtime)
+            .and_then(|spec| spec.scheduling.as_ref())
+            .filter(|policy| {
+                policy.required_node == self.required_node
+                    && self
+                        .placement
+                        .iter()
+                        .all(|group| policy.placement_groups.contains(group))
+            })
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "retained environment does not satisfy required node capability placement",
+                )
+            })
+    }
+}
 
 struct CreateOperation {
     spec: pb::EnvironmentSpec,
@@ -394,6 +452,7 @@ impl EnvironmentService {
                 "request ID must contain 1 to 256 bytes",
             ));
         }
+        let requested_capabilities = RequiredNodeCapabilities::from_spec(&spec);
         let create_key = (caller.tenant_id.clone(), request_id.to_string());
         let (operation, retry_pending) = {
             let mut creates = self.creates.lock().await;
@@ -419,6 +478,12 @@ impl EnvironmentService {
             }
         };
         let mut operation = operation.lock_owned().await;
+        let operation_capabilities = RequiredNodeCapabilities::from_spec(&operation.spec);
+        if requested_capabilities != operation_capabilities {
+            return Err(Status::failed_precondition(
+                "create request ID has different required node capability placement",
+            ));
+        }
         if let Some(result) = &operation.result {
             if result.as_ref().is_err_and(|error| {
                 error.code() != Code::FailedPrecondition
@@ -435,20 +500,25 @@ impl EnvironmentService {
                 .map_or(operation.spec.id.as_str(), |assignment| {
                     assignment.environment_id.as_str()
                 });
-            let owner = self
-                .clients
-                .owner(id, caller, false)
-                .await
-                .map_err(|error| {
-                    if error.code() == Code::NotFound {
-                        Status::failed_precondition(adx_error::CREATE_TERMINAL_MESSAGE)
-                    } else {
-                        error
-                    }
-                })?;
-            let record = owner
-                .record
-                .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
+            let record = if let Some(capabilities) = &operation_capabilities {
+                Box::pin(self.verify_retained_capability_owner(capabilities, id, caller)).await
+            } else {
+                self.clients
+                    .owner(id, caller, false)
+                    .await
+                    .and_then(|owner| {
+                        owner.record.ok_or_else(|| {
+                            Status::data_loss("environment directory returned no record")
+                        })
+                    })
+            }
+            .map_err(|error| {
+                if error.code() == Code::NotFound {
+                    Status::failed_precondition(adx_error::CREATE_TERMINAL_MESSAGE)
+                } else {
+                    error
+                }
+            })?;
             let mut response = existing_running_response(&input, &record)?;
             if let Ok(previous) = result {
                 response["newlyCreated"] = Value::Bool(
@@ -595,12 +665,23 @@ impl EnvironmentService {
         ))
         .await?;
         authorize(caller, result.record.as_ref())?;
-        let record = result
+        let mut record = result
             .record
             .clone()
             .ok_or_else(|| Status::unavailable("create returned no environment record"))?;
         if result.durability != pb::Durability::Published as i32 {
             return Err(Status::unavailable("create is not durably confirmed"));
+        }
+        if let Some(capabilities) = RequiredNodeCapabilities::from_spec(spec) {
+            capabilities.verify_record(&record)?;
+            if !result.newly_created {
+                record = Box::pin(self.verify_retained_capability_owner(
+                    &capabilities,
+                    &spec.id,
+                    caller,
+                ))
+                .await?;
+            }
         }
         let source = if retry_pending { "replay" } else { source };
         write_create_target(&record, source);
@@ -644,6 +725,26 @@ impl EnvironmentService {
             attempt.successful_create(attempt.elapsed());
         }
         Ok(response)
+    }
+
+    async fn verify_retained_capability_owner(
+        &self,
+        capabilities: &RequiredNodeCapabilities,
+        id: &str,
+        caller: &pb::CallerContext,
+    ) -> Result<pb::EnvironmentRecord, Status> {
+        let (record, node) = self.clients.verify_capability_owner(id, caller).await?;
+        let policy: SchedulingPolicy = capabilities
+            .verify_record(&record)?
+            .clone()
+            .try_into()
+            .map_err(adx_protocol::status)?;
+        if !crate::directory::matches_node_placement(&policy, &node) {
+            return Err(Status::failed_precondition(
+                "assigned node no longer satisfies required capability placement",
+            ));
+        }
+        Ok(record)
     }
 }
 

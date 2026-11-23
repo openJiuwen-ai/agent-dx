@@ -506,6 +506,7 @@ async fn lifecycle_rpc_scenario() {
         pressure_disposition: Default::default(),
         checkpoint_scopes: vec![],
         storage_mounts: Default::default(),
+        runtime_capabilities: Default::default(),
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -1600,6 +1601,10 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
 #[tokio::test]
 #[ignore = "requires isolated Redis and mTLS certificates; run control-rpc suite"]
 async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint() {
+    use adx_core::scheduling::{
+        node_capability_label, CHECKPOINT_RESTORE_V1, NODE_CAPABILITY_LABEL_VALUE,
+    };
+
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(1).await.unwrap();
     let coordinator = CoordinatorRpc::new(
@@ -1694,6 +1699,13 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
         reconciling: true,
         ..Default::default()
     };
+    let capability_key = node_capability_label("runc", CHECKPOINT_RESTORE_V1);
+    let qualified = pb::RuntimeCapabilities {
+        capability_ids: vec![CHECKPOINT_RESTORE_V1.into()],
+    };
+    report
+        .runtime_capabilities
+        .insert("runc".into(), qualified.clone());
     node_coordinator
         .register_node(report.clone())
         .await
@@ -1712,6 +1724,10 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
         .register_node(report.clone())
         .await
         .unwrap();
+    assert_eq!(
+        session.snapshot().await.unwrap().nodes["node"].node.labels[&capability_key],
+        NODE_CAPABILITY_LABEL_VALUE
+    );
     let mut frontend = pb::coordinator_service_client::CoordinatorServiceClient::new(
         channel(ma, "apiserver").await,
     );
@@ -1727,6 +1743,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     report.heartbeat_sequence = 1;
     report.reconciling = true;
     report.accepting_allocations = false;
+    report.runtime_capabilities.clear();
     // A second process claiming the live endpoint cannot replace its actual owner.
     assert_eq!(
         node_coordinator
@@ -1818,7 +1835,31 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     report.heartbeat_sequence = 2;
     report.reconciling = false;
     report.accepting_allocations = true;
+    node_coordinator
+        .register_node(report.clone())
+        .await
+        .unwrap();
+    assert!(!session.snapshot().await.unwrap().nodes["node"]
+        .node
+        .labels
+        .contains_key(&capability_key));
+    report.heartbeat_sequence = 3;
+    report.runtime_capabilities.insert("runc".into(), qualified);
+    node_coordinator
+        .register_node(report.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        session.snapshot().await.unwrap().nodes["node"].node.labels[&capability_key],
+        NODE_CAPABILITY_LABEL_VALUE
+    );
+    report.heartbeat_sequence = 4;
+    report.runtime_capabilities.clear();
     node_coordinator.register_node(report).await.unwrap();
+    assert!(!session.snapshot().await.unwrap().nodes["node"]
+        .node
+        .labels
+        .contains_key(&capability_key));
     assert_eq!(session.snapshot().await.unwrap().routes().unwrap().len(), 1);
     assert!(!session.get("held").await.unwrap().invalidated);
     assert_eq!(backend.started.load(Ordering::SeqCst), 1);
@@ -3025,6 +3066,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         pressure_disposition: Default::default(),
         checkpoint_scopes: vec![],
         storage_mounts: Default::default(),
+        runtime_capabilities: Default::default(),
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),

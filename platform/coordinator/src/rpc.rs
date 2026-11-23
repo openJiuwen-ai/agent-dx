@@ -11,6 +11,7 @@ mod cloning;
 mod collection;
 mod environment_control;
 mod metrics;
+mod node_capabilities;
 mod node_retirement;
 mod observation;
 mod recovery;
@@ -19,11 +20,15 @@ mod snapshot_preparation;
 mod snapshots;
 mod upgrade;
 mod volumes;
+#[cfg(test)]
+use crate::Node;
 use crate::{
+    capability_constraints,
     storage::{ClaimOutcome, LocalClaim, NodeSession, Session, StoredEnvironment, StoredNode},
-    Coordinator, Node, Placement,
+    Coordinator, Placement,
 };
-use adx_core::{EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Result};
+use adx_core::scheduling::{SchedulingPolicy, NODE_CAPABILITY_LABEL_PREFIX};
+use adx_core::{Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Result};
 use adx_protocol::{
     auth::{tenant, Peers, Principal},
     control as pb, status,
@@ -71,6 +76,18 @@ fn confirmed_create_failure(status: &Status) -> bool {
                 .get(*key)
                 .is_some_and(|value| value == "true")
         })
+}
+
+fn check_expected_create_assignment(
+    expected: Option<&Assignment>,
+    current: Option<&Assignment>,
+) -> std::result::Result<(), &'static str> {
+    if expected.is_some() && expected != current {
+        return Err(
+            "expected Environment assignment changed before capability-constrained create replay",
+        );
+    }
+    Ok(())
 }
 
 struct State {
@@ -909,6 +926,21 @@ impl CoordinatorRpc {
     async fn create_guard(&self, key: String) -> tokio::sync::OwnedMutexGuard<()> {
         self.create_lock(key).lock_owned().await
     }
+    async fn verify_capability_replay(
+        &self,
+        requested: &SchedulingPolicy,
+        stored: &StoredEnvironment,
+    ) -> std::result::Result<(), Status> {
+        if capability_constraints::required(requested) {
+            self.0
+                .state
+                .lock()
+                .await
+                .check_capability_replay(requested, stored, self.0.heartbeat_timeout)
+                .map_err(Status::failed_precondition)?;
+        }
+        Ok(())
+    }
     async fn create_from_request(
         &self,
         r: pb::CreateEnvironmentRequest,
@@ -930,6 +962,30 @@ impl CoordinatorRpc {
             .spec
             .ok_or_else(|| Status::invalid_argument("spec required"))?;
         tenant(r.caller.as_ref(), &raw.tenant_id)?;
+        let scheduling = raw
+            .scheduling
+            .as_ref()
+            .filter(|policy| {
+                policy.required_node.iter().any(|selector| {
+                    selector
+                        .match_labels
+                        .keys()
+                        .chain(
+                            selector
+                                .expressions
+                                .iter()
+                                .map(|expression| &expression.key),
+                        )
+                        .any(|key| key.starts_with(NODE_CAPABILITY_LABEL_PREFIX))
+                })
+            })
+            .cloned()
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(status)?
+            .unwrap_or_default();
+        let expected_assignment =
+            expected_assignment.filter(|_| capability_constraints::required(&scheduling));
         let session = {
             let mut state = self.0.state.lock().await;
             state.recover_authoritative_state().await.map_err(status)?;
@@ -941,6 +997,12 @@ impl CoordinatorRpc {
             .await
             .map_err(status)?
         {
+            check_expected_create_assignment(
+                expected_assignment.as_ref(),
+                Some(&record.assignment),
+            )
+            .map_err(Status::failed_precondition)?;
+            self.verify_capability_replay(&scheduling, &record).await?;
             return Ok(Response::new(pb::EnvironmentResult {
                 newly_created: false,
                 record: Some((&record).try_into().map_err(status)?),
@@ -953,6 +1015,12 @@ impl CoordinatorRpc {
                 return Err(Status::not_found("environment not found"));
             }
             Ok(stored) if stored.result.is_some() => {
+                check_expected_create_assignment(
+                    expected_assignment.as_ref(),
+                    Some(&stored.assignment),
+                )
+                .map_err(Status::failed_precondition)?;
+                self.verify_capability_replay(&scheduling, &stored).await?;
                 let record = stored
                     .result
                     .clone()
@@ -965,6 +1033,12 @@ impl CoordinatorRpc {
                 } else {
                     stored
                 };
+                check_expected_create_assignment(
+                    expected_assignment.as_ref(),
+                    Some(&stored.assignment),
+                )
+                .map_err(Status::failed_precondition)?;
+                self.verify_capability_replay(&scheduling, &stored).await?;
                 return Ok(Response::new(pb::EnvironmentResult {
                     newly_created: false,
                     record: Some((&stored).try_into().map_err(status)?),
@@ -1022,7 +1096,7 @@ impl CoordinatorRpc {
         spec: EnvironmentSpec,
         schedule_timeout: Duration,
         create_deadline: adx_transport::deadline::Deadline,
-        _expected_assignment: Option<adx_core::Assignment>,
+        expected_assignment: Option<Assignment>,
         request_id: String,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
         // Lock identities before selecting an execution. No scheduler lock is
@@ -1052,6 +1126,7 @@ impl CoordinatorRpc {
                 spec.clone(),
                 schedule_timeout,
                 create_deadline,
+                expected_assignment,
                 request_id,
             )),
         )
@@ -1131,6 +1206,7 @@ impl CoordinatorRpc {
         spec: EnvironmentSpec,
         schedule_timeout: Duration,
         create_deadline: adx_transport::deadline::Deadline,
+        expected_assignment: Option<Assignment>,
         request_id: String,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
         let stats = Arc::new(ScheduleStats::default());
@@ -1142,6 +1218,7 @@ impl CoordinatorRpc {
                 spec,
                 schedule_timeout,
                 create_deadline,
+                expected_assignment,
                 request_id,
                 Arc::clone(&stats),
             ))
@@ -1196,6 +1273,7 @@ impl CoordinatorRpc {
         spec: EnvironmentSpec,
         schedule_timeout: Duration,
         create_deadline: adx_transport::deadline::Deadline,
+        expected_assignment: Option<Assignment>,
         request_id: String,
         stats: Arc<ScheduleStats>,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
@@ -1206,6 +1284,13 @@ impl CoordinatorRpc {
             .await
             .map_err(status)?
         {
+            check_expected_create_assignment(
+                expected_assignment.as_ref(),
+                Some(&record.assignment),
+            )
+            .map_err(Status::failed_precondition)?;
+            self.verify_capability_replay(&spec.scheduling, &record)
+                .await?;
             return Ok(pb::EnvironmentResult {
                 newly_created: false,
                 record: Some((&record).try_into().map_err(status)?),
@@ -1218,6 +1303,13 @@ impl CoordinatorRpc {
                 return Err(Status::not_found("environment not found"))
             }
             Ok(stored) if stored.result.is_some() => {
+                check_expected_create_assignment(
+                    expected_assignment.as_ref(),
+                    Some(&stored.assignment),
+                )
+                .map_err(Status::failed_precondition)?;
+                self.verify_capability_replay(&spec.scheduling, &stored)
+                    .await?;
                 let record = stored
                     .result
                     .clone()
@@ -1229,6 +1321,13 @@ impl CoordinatorRpc {
                 } else {
                     stored
                 };
+                check_expected_create_assignment(
+                    expected_assignment.as_ref(),
+                    Some(&stored.assignment),
+                )
+                .map_err(Status::failed_precondition)?;
+                self.verify_capability_replay(&spec.scheduling, &stored)
+                    .await?;
                 return Ok(pb::EnvironmentResult {
                     newly_created: false,
                     record: Some((&stored).try_into().map_err(status)?),
@@ -1316,6 +1415,14 @@ impl CoordinatorRpc {
                     })?;
                 continue;
             }
+            check_expected_create_assignment(
+                expected_assignment.as_ref(),
+                state
+                    .environments
+                    .get(&spec.id)
+                    .map(|record| &record.assignment),
+            )
+            .map_err(Status::failed_precondition)?;
             if schedule_deadline.is_some_and(|deadline| {
                 tokio::time::Instant::now() >= deadline && !state.specs.contains_key(&spec.id)
             }) {
@@ -1329,15 +1436,18 @@ impl CoordinatorRpc {
                         "environment ID has a different specification",
                     ));
                 }
-                schedule_deadline.get_or_insert_with(|| {
-                    *state
-                        .scheduling_deadlines
-                        .entry(spec.id.clone())
-                        .or_insert_with(|| {
+                let deadline = *state
+                    .scheduling_deadlines
+                    .entry(spec.id.clone())
+                    .or_insert_with(|| {
+                        let retained = schedule_deadline
+                            .filter(|_| capability_constraints::required(&spec.scheduling));
+                        retained.unwrap_or_else(|| {
                             (tokio::time::Instant::now() + schedule_timeout)
                                 .min(create_deadline.instant())
                         })
-                });
+                    });
+                schedule_deadline.get_or_insert(deadline);
             } else {
                 let domains = self.volume_domains(&state).map_err(status)?;
                 state
@@ -1387,6 +1497,13 @@ impl CoordinatorRpc {
                             "environment already completed; query its result",
                         ));
                     }
+                    state
+                        .check_capability_replay(
+                            &spec.scheduling,
+                            &stored,
+                            self.0.heartbeat_timeout,
+                        )
+                        .map_err(Status::failed_precondition)?;
                     return Ok(pb::EnvironmentResult {
                         newly_created: false,
                         record: Some((&stored).try_into().map_err(status)?),
@@ -1399,15 +1516,26 @@ impl CoordinatorRpc {
                     .get(&stored.assignment.node_id)
                     .ok_or_else(|| Status::unavailable("owner node unavailable"))?
                     .clone();
+                let has_current_capabilities = state.node_has_current_capabilities(
+                    &spec.scheduling,
+                    &node,
+                    self.0.heartbeat_timeout,
+                );
                 if !node.node.available
                     || state.live.get(&node.node.id).is_none_or(|n| {
                         n.last_seen.elapsed() >= self.0.heartbeat_timeout || !n.inspected
                     })
+                    || !has_current_capabilities
                 {
                     drop(state);
                     stats.retry(
                         i32::from(tonic::Code::Unavailable).to_string(),
-                        "owner node not ready".into(),
+                        if has_current_capabilities {
+                            "owner node not ready"
+                        } else {
+                            "owner node session lacks required node capabilities"
+                        }
+                        .into(),
                     );
                     self.retry_initial(&spec.id, &stored.assignment).await?;
                     tokio::time::timeout_at(create_deadline.instant(), changed)
@@ -2352,7 +2480,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         for mount in r.storage_mounts.values() {
             adx_core::volumes::StorageMount::try_from(mount.clone()).map_err(status)?;
         }
-        let node = Node::try_from(r.clone()).map_err(status)?;
+        let node = node_capabilities::registered_node(&r).map_err(status)?;
         for address in [&r.node_address, &r.proxy_address] {
             if address.trim().is_empty() || address.contains(['/', '@', '?', '#']) {
                 return Err(Status::invalid_argument(
@@ -2563,6 +2691,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         trace
             .run_result(async {
                 let principal = self.0.peers.authenticate(&request)?;
+                let verify_capabilities = request
+                    .metadata()
+                    .get("x-adx-verify-node-capabilities")
+                    .is_some_and(|value| value == "true");
+                if verify_capabilities && principal != Principal::ApiServer {
+                    return Err(Status::permission_denied("API Server required"));
+                }
                 let r = request.into_inner();
                 let (session, cached) = {
                     let state = self.0.state.lock().await;
@@ -2592,11 +2727,49 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .nodes
                     .get(&stored.assignment.node_id)
                     .ok_or_else(|| Status::unavailable("owner node missing"))?;
-                Ok(Response::new(pb::GetEnvironmentResponse {
+                let mut response = Response::new(pb::GetEnvironmentResponse {
                     record: Some((&stored).try_into().map_err(status)?),
                     node_address: node.address.clone(),
                     relay_address: node.proxy_address.clone(),
-                }))
+                });
+                if verify_capabilities {
+                    // Receipt replay must observe a confirmed, current owner.
+                    // The durable read above may have raced deletion or recovery.
+                    state.healthy().map_err(status)?;
+                    let scheduling = &stored.spec.scheduling;
+                    let published = |record: &StoredEnvironment| {
+                        record
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result.state == EnvironmentState::Running)
+                    };
+                    if !capability_constraints::required(scheduling) || !published(&stored) {
+                        return Err(Status::failed_precondition(
+                            "Environment has no current published capability-constrained owner",
+                        ));
+                    }
+                    let current = state
+                        .environments
+                        .get(&stored.spec.id)
+                        .filter(|current| {
+                            current.assignment == stored.assignment && published(current)
+                        })
+                        .ok_or_else(|| Status::failed_precondition("Environment owner changed"))?;
+                    state
+                        .check_capability_replay(scheduling, current, self.0.heartbeat_timeout)
+                        .map_err(Status::failed_precondition)?;
+                    let session = node
+                        .session
+                        .as_ref()
+                        .ok_or_else(|| Status::failed_precondition("owner node session missing"))?;
+                    response.metadata_mut().insert(
+                        "x-adx-verified-node-session",
+                        session.id.parse().map_err(|_| {
+                            Status::failed_precondition("invalid owner node session identity")
+                        })?,
+                    );
+                }
+                Ok(response)
             })
             .await
     }

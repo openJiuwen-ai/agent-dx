@@ -1,7 +1,8 @@
 //! sandboxd PR #56 adapter. The RPC task outlives a canceled caller so cleanup
 //! cannot race its client task. Failed starts are terminal; ambiguous outcomes
 //! retain targeted cleanup retries until their backend can be removed.
-use crate::RuntimeDriver;
+use crate::{runtime_router::RuntimeInventory, RuntimeDriver};
+use adx_core::scheduling::{valid_node_capability_runtime, CHECKPOINT_RESTORE_V1};
 use adx_core::{EnvironmentSpec, Error, Result, UnsupportedCapability};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
@@ -24,6 +25,12 @@ pub mod proto {
     tonic::include_proto!("runtime.v1");
 }
 use proto::sandbox_service_client::SandboxServiceClient;
+
+fn supports_checkpoint_restore(info: &proto::RuntimeInfo) -> bool {
+    info.supports_checkpoint_restore
+        && !info.checkpoint_handoff_path.is_empty()
+        && !info.restore_env_path.is_empty()
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -226,8 +233,13 @@ impl Sandboxd {
         labels
     }
 
-    /// Discover live execution backends through sandboxd's Unix socket.
+    /// Discover live execution classes through sandboxd's Unix socket.
     pub async fn available_runtime_classes(&self) -> Result<Vec<String>> {
+        Ok(self.runtime_inventory().await?.classes)
+    }
+
+    /// Discover and qualify live execution backends through sandboxd's Unix socket.
+    pub async fn runtime_inventory(&self) -> Result<RuntimeInventory> {
         let response = self
             .client
             .clone()
@@ -236,16 +248,22 @@ impl Sandboxd {
             .map_err(unavailable)?
             .into_inner();
         let mut classes = response.runtime_classes;
-        classes.extend(
-            response
-                .runtimes
-                .into_iter()
-                .map(|runtime| runtime.runtime_class),
-        );
+        let mut capabilities = BTreeMap::new();
+        for detail in response.runtimes {
+            classes.push(detail.runtime_class.clone());
+            if valid_node_capability_runtime(&detail.runtime_class)
+                && supports_checkpoint_restore(&detail)
+            {
+                capabilities.insert(detail.runtime_class, [CHECKPOINT_RESTORE_V1.into()].into());
+            }
+        }
         classes.retain(|class| !class.trim().is_empty());
         classes.sort();
         classes.dedup();
-        Ok(classes)
+        Ok(RuntimeInventory {
+            classes,
+            capabilities,
+        })
     }
 
     pub async fn connect(path: PathBuf, config: Config) -> Result<Self> {
@@ -1481,17 +1499,17 @@ impl RuntimeDriver for Sandboxd {
         })
     }
     async fn checkpoint_supported(&self, runtime: &str) -> Result<()> {
-        match self.capabilities(runtime).await? {
-            Some(info)
-                if info.supports_checkpoint_restore
-                    && !info.checkpoint_handoff_path.is_empty()
-                    && !info.restore_env_path.is_empty() =>
-            {
-                Ok(())
-            }
-            _ => Err(Error::UnsupportedCapability(
+        if self
+            .capabilities(runtime)
+            .await?
+            .as_ref()
+            .is_some_and(supports_checkpoint_restore)
+        {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedCapability(
                 UnsupportedCapability::CheckpointRestore,
-            )),
+            ))
         }
     }
     async fn checkpoint(&self, runtime_id: &str, path: &Path, duration: Duration) -> Result<()> {

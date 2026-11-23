@@ -200,6 +200,7 @@ async fn inspection_reports_latest_authorized_volume_execution() {
         heartbeat_sequence: 2,
         reconciling: true,
         accepting_allocations: false,
+        runtime_capabilities: Default::default(),
         runtime_classes: vec!["runc".into()],
         capacity: Some(
             Resources {

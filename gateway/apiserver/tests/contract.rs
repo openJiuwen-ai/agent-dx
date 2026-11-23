@@ -7,6 +7,42 @@ fn caller() -> pb::CallerContext {
         administrator: false,
     }
 }
+
+#[test]
+fn required_node_capabilities_combine_with_hard_placement() {
+    let key = "adx.internal/node-capability/runsc/checkpoint-restore.v1";
+    let selector = |node| {
+        json!({"kind":0,"affinity":2,"labelOps":[
+            {"type":0,"labelKey":"NODE_ID","labelValues":[node]}
+        ]})
+    };
+    let input = json!({"image":"image", "rootfs":{"runtime":"runsc"},
+        "requiredNodeCapabilities":["checkpoint-restore.v1"],
+        "scheduleAffinities":[selector("node-a"), selector("node-b")],
+        "pauseOptions":{"storage":"shared"}});
+    let spec = create_spec(input, &caller()).unwrap();
+    let policy = spec.scheduling.unwrap();
+    assert_eq!(policy.required_node.len(), 1);
+    let requirements = &policy.required_node[0].expressions;
+    assert!(requirements.iter().any(|req| {
+        req.key == key && req.op == pb::SelectorOp::In as i32 && req.values == ["true"]
+    }));
+    assert!(requirements
+        .iter()
+        .any(|req| req.key == "ADX_CHECKPOINT_STORAGE"));
+    assert_eq!(policy.placement_groups.len(), 1);
+    let group = &policy.placement_groups[0];
+    assert!(group.required);
+    assert_eq!(group.terms.len(), 2);
+    assert!(create_spec(
+        json!({"image":"image", "scheduleAffinities":[{
+            "kind":0,"affinity":2,"labelOps":[{"type":0,"labelKey":key,"labelValues":["true"]}]
+        }]}),
+        &caller()
+    )
+    .is_err());
+}
+
 #[test]
 fn explicit_forever_pause_retention_is_accepted() {
     let result = create_spec(

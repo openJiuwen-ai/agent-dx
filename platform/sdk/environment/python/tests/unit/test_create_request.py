@@ -8,6 +8,7 @@ from unittest.mock import patch
 import httpx
 from adx_environment import (
     ConnectionConfig,
+    EnvironmentError as SDKEnvironmentError,
     DNSPolicy,
     DNSRule,
     NetworkPolicy,
@@ -17,6 +18,8 @@ from adx_environment import (
     LocalRootfs,
     TrafficPolicy,
 )
+
+_CONSTRAINED_CREATE = "/api/environment/v1/constrained-environments"
 
 
 class CreateRequestTests(unittest.TestCase):
@@ -68,6 +71,7 @@ class CreateRequestTests(unittest.TestCase):
 
     def setUp(self):
         self.exchanges = []
+        self.constrained_failures = []
         self.http_clients = []
         self.connection = ConnectionConfig(server_address="create.adx.test:7443", token="fixture-token")
         self.pool_patch = patch(
@@ -89,7 +93,14 @@ class CreateRequestTests(unittest.TestCase):
 
     def answer_gateway_request(self, request):
         self.exchanges.append(request)
-        if request.method == "POST" and request.url.path == "/api/environment/v1/environments":
+        if request.url.path == _CONSTRAINED_CREATE and self.constrained_failures:
+            failure = self.constrained_failures.pop(0)
+            if failure is None:
+                raise httpx.ReadTimeout("response was lost", request=request)
+            return httpx.Response(failure, json={"error": {"code": "NOT_FOUND"}})
+        if request.method == "POST" and request.url.path in (
+            "/api/environment/v1/environments", _CONSTRAINED_CREATE,
+        ):
             final_event = json.dumps({"environmentId": "create-contract", "status": "running"})
             return httpx.Response(
                 200,
@@ -117,6 +128,59 @@ class CreateRequestTests(unittest.TestCase):
     def assert_no_transport_setup(self):
         self.pool_factory.assert_not_called()
         self.assertEqual(self.exchanges, [])
+
+    def test_node_capabilities_use_only_the_constrained_create_endpoint(self):
+        with Environment(
+            image="tools:1", runtime="runsc", required_node_capabilities=("checkpoint-restore.v1",),
+            detached=True, connection=self.connection,
+        ):
+            pass
+        self.assertEqual(len(self.exchanges), 1)
+        self.assertEqual(self.exchanges[0].url.path, _CONSTRAINED_CREATE)
+        body = json.loads(self.exchanges[0].content)
+        self.assertEqual(body["requiredNodeCapabilities"], ["checkpoint-restore.v1"])
+        self.assertNotIn("requiredNodeCapabilities", self.capture_create(required_node_capabilities=[]))
+
+    def test_future_identifier_is_forwarded_for_server_validation(self):
+        with Environment(image="tools:1", runtime="runsc", required_node_capabilities=["future.v2"],
+                         detached=True, connection=self.connection):
+            pass
+        self.assertEqual(self.exchanges[0].url.path, _CONSTRAINED_CREATE)
+        self.assertEqual(json.loads(self.exchanges[0].content)["requiredNodeCapabilities"], ["future.v2"])
+
+    def test_invalid_node_capability_constraints_fail_before_transport(self):
+        for options in (
+            {"required_node_capabilities": "checkpoint-restore.v1"},
+            {"required_node_capabilities": ["checkpoint-restore.v1"]},
+            {"required_node_capabilities": ["not a token"], "runtime": "runsc"},
+            {"required_node_capabilities": ["duplicate.v1", "duplicate.v1"], "runtime": "runsc"},
+            {"required_node_capabilities": ["checkpoint-restore.v1"], "runtime": "invalid/runtime"},
+            {"required_node_capabilities": ["checkpoint-restore.v1"], "runtime": "runsc", "snapshot_id": "snap"},
+        ):
+            with self.subTest(options=options), self.assertRaises((TypeError, ValueError)):
+                Environment(image="tools:1", connection=self.connection, **options)
+        self.assert_no_transport_setup()
+
+    def test_old_server_rejection_never_falls_back_to_unconstrained_create(self):
+        self.constrained_failures = [404]
+        with self.assertRaises(SDKEnvironmentError) as raised:
+            Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore.v1"],
+                        connection=self.connection)
+        self.assertEqual((raised.exception.code, raised.exception.outcome), ("UNSUPPORTED", "not_started"))
+        self.assertEqual([request.url.path for request in self.exchanges], [_CONSTRAINED_CREATE])
+
+    def test_old_server_after_lost_response_preserves_the_same_operation(self):
+        self.constrained_failures = [None, 404]
+        with patch("adx_environment._transport.time.sleep"), self.assertRaises(SDKEnvironmentError) as raised:
+            Environment(image="tools:1", runtime="runsc", required_node_capabilities=["checkpoint-restore.v1"],
+                        connection=self.connection)
+        error = raised.exception
+        self.assertEqual((error.code, error.retry, error.outcome), ("OUTCOME_UNKNOWN", "same_operation", "unknown"))
+        self.assertIsInstance(error.first_error, httpx.ReadTimeout)
+        self.assertEqual(len(self.exchanges), 2)
+        self.assertEqual({request.url.path for request in self.exchanges}, {_CONSTRAINED_CREATE})
+        self.assertEqual({request.headers["X-Request-Id"] for request in self.exchanges}, {error.request_id})
+        self.assertEqual(self.exchanges[0].content, self.exchanges[1].content)
 
     def test_tool_identity_reaches_create_and_is_optional(self):
         body = self.capture_create(runtime="conch", user="1001", group="1002")

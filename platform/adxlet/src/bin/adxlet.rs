@@ -1,4 +1,4 @@
-use adx_core::scheduling::NODE_HOST_UUID_LABEL;
+use adx_core::scheduling::{NODE_CAPABILITY_LABEL_PREFIX, NODE_HOST_UUID_LABEL};
 use adx_process::{read_config, shutdown};
 use adx_protocol::control as pb;
 use adx_transport::rpc::{RpcChannel, RpcClient};
@@ -476,7 +476,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut labels = config.labels;
-    labels.retain(|key, _| !key.starts_with("ADX_RECOVERY_") && key != "ADX_CHECKPOINT_SCOPE");
+    labels.retain(|key, _| {
+        !key.starts_with("ADX_RECOVERY_")
+            && key != "ADX_CHECKPOINT_SCOPE"
+            && !key.starts_with(NODE_CAPABILITY_LABEL_PREFIX)
+    });
     labels.extend(runtime.recovery_labels());
     if let Some(scope) = checkpoint_scopes.first() {
         labels.insert("ADX_CHECKPOINT_SCOPE".into(), scope.clone());
@@ -509,6 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_sequence: 0,
         reconciling: true,
         runtime_classes: vec![],
+        runtime_capabilities: Default::default(),
         checkpoint_scopes,
         pressure: None,
         pressure_disposition: Default::default(),
@@ -570,12 +575,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut r = last.clone();
             // Observe storage and runtime capabilities concurrently so storage
             // does not add another timeout period to the heartbeat path.
-            let (mounts, classes) = tokio::join!(
+            let (mounts, inventory, checkpoint_storage) = tokio::join!(
                 tokio::time::timeout(
                     sample_timeout,
                     adxlet::managed_mounts::mounted_storage(config.storage_mounts.clone()),
                 ),
-                tokio::time::timeout(sample_timeout, runtime.available_runtime_classes()),
+                tokio::time::timeout(sample_timeout, runtime.runtime_inventory()),
+                tokio::time::timeout(
+                    sample_timeout,
+                    manager.checkpoint_capability_storage_ready()
+                ),
             );
             // A failed storage observation withdraws only volume eligibility.
             r.storage_mounts = match mounts {
@@ -587,10 +596,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             // A failed runtime observation closes new admission, while accepted
             // executions and heartbeats continue through reconciliation.
-            r.runtime_classes = match classes {
-                Ok(Ok(classes)) => classes,
-                _ => vec![],
-            };
+            let mut inventory = inventory.ok().and_then(Result::ok).unwrap_or_default();
+            if !matches!(checkpoint_storage, Ok(Ok(()))) {
+                // Checkpoint/restore qualification requires a usable configured
+                // store. The base runtime classes remain eligible.
+                inventory.capabilities.clear();
+            }
+            r.runtime_classes = inventory.classes;
+            r.runtime_capabilities = inventory
+                .capabilities
+                .into_iter()
+                .map(|(class, capabilities)| {
+                    (
+                        class,
+                        pb::RuntimeCapabilities {
+                            capability_ids: capabilities.into_iter().collect(),
+                        },
+                    )
+                })
+                .collect();
             manager.update_runtime_classes(r.runtime_classes.clone())?;
             if let Ok((o, valid)) = sample(&source, &runtime, sample_timeout).await {
                 valid_until = tokio::time::Instant::now() + valid;

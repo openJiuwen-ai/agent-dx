@@ -171,6 +171,9 @@ impl ShardScheduler {
                     prepared: Some(&prepared),
                 },
             )?;
+            if !crate::capability_constraints::supported(&spec.scheduling, &state.node.labels) {
+                reasons.push("node_capability".into());
+            }
             if let Some(placement) = placement {
                 if placement.waiting_for.is_some() {
                     reasons.push("waiting_for_volume".into());

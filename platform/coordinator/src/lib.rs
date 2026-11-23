@@ -7,6 +7,7 @@ extern crate self as adx_coordinator;
 pub use adx_core::snapshots;
 pub mod auth;
 pub mod autoscaling;
+mod capability_constraints;
 mod journal;
 pub mod metrics;
 mod queue;
@@ -301,11 +302,12 @@ impl Coordinator {
                 Err(Error::Conflict)
             };
         }
-        let preferred = if spec.snapshot_id.is_some() {
-            self.candidate_shard(&spec, &BTreeSet::new(), None)?
-        } else {
-            None
-        };
+        let preferred =
+            if spec.snapshot_id.is_some() || capability_constraints::required(&spec.scheduling) {
+                self.candidate_shard(&spec, &BTreeSet::new(), None)?
+            } else {
+                None
+            };
         let shard = preferred.unwrap_or_else(|| {
             // Affinity-selected requests do not advance ordinary shard rotation.
             let shard = self.next_shard;
@@ -369,6 +371,7 @@ impl Coordinator {
 
     fn defer_or_transfer(&mut self, shard: usize, entry: queue::Entry) -> Result<()> {
         if entry.spec.snapshot_id.is_none()
+            && !capability_constraints::required(&entry.spec.scheduling)
             && !self.volume_placement.contains_key(&entry.spec.id)
             && !self.recovery_requests.contains(&entry.spec.id)
         {

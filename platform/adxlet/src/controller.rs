@@ -1697,6 +1697,16 @@ impl Controller {
                     "create deadline exceeded during {stage}"
                 )));
             }
+            if self
+                .record
+                .spec
+                .scheduling
+                .required_node_capability_labels()
+                .next()
+                .is_some()
+            {
+                self.services.checkpoint_capability_storage_ready().await?;
+            }
             if self.record.spec.lifecycle.idle_action == adx_core::lifecycle::IdleAction::Pause {
                 self.services
                     .runtime

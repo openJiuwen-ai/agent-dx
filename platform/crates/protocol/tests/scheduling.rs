@@ -173,6 +173,7 @@ fn registration_preserves_inventory_and_labels() {
         checkpoint_scopes: vec![],
         pressure: None,
         storage_mounts: Default::default(),
+        runtime_capabilities: Default::default(),
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),

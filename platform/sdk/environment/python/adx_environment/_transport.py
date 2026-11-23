@@ -330,7 +330,7 @@ class EnvironmentClient:
         return payload
 
     def create_info(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /environments and return the confirmed-running final SSE result."""
+        """Submit a create and return the confirmed-running final SSE result."""
         logical_timeout = int(body.get("createTimeoutSeconds") or _DEFAULT_CREATE_LOGICAL_TIMEOUT)
         request_timeout = logical_timeout + self._connection.communication_margin_seconds
         # A UUIDv4 identifies this logical create across transport retries.
@@ -381,6 +381,16 @@ class EnvironmentClient:
             except EnvironmentError as exc:
                 # Preserve the authoritative final contract. A terminal replay
                 # response must not erase the first failed create attempt.
+                if first_error is not None and exc.code == "UNSUPPORTED" and "requiredNodeCapabilities" in request_body:
+                    raise EnvironmentError(
+                        "a prior constrained create attempt may have reached a compatible server",
+                        request_id=request_id,
+                        code="OUTCOME_UNKNOWN",
+                        retry="same_operation",
+                        outcome="unknown",
+                        environment_id=request_name,
+                        first_error=first_error,
+                    ) from exc
                 exc.first_error = first_error
                 raise
 
@@ -425,10 +435,12 @@ class EnvironmentClient:
         request_timeout: float,
     ) -> Dict[str, Any]:
         """Execute one transport attempt for a logical environment create."""
+        constrained = "requiredNodeCapabilities" in body
+        route = "constrained-environments" if constrained else "environments"
         final: Optional[Dict[str, Any]] = None
         with self._http.stream(
             "POST",
-            f"{self._base}/environments",
+            f"{self._base}/{route}",
             json=body,
             headers={
                 "Accept": "text/event-stream",
@@ -436,6 +448,15 @@ class EnvironmentClient:
             },
             timeout=request_timeout,
         ) as resp:
+            if constrained and resp.status_code in (404, 405, 501):
+                raise EnvironmentError(
+                    "server does not support constrained environment creation",
+                    request_id=request_id,
+                    code="UNSUPPORTED",
+                    retry="never",
+                    outcome="not_started",
+                    request_forwarded=False,
+                )
             if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
                 resp.read()
                 error = self._http_error(resp, request_id=request_id)

@@ -81,26 +81,7 @@ impl Directory {
             .nodes
             .iter()
             .filter(|node| node.accepting_allocations)
-            .filter(|node| {
-                let mut labels: BTreeMap<_, _> = node.labels.clone().into_iter().collect();
-                labels.insert("NODE_ID".into(), node.node_id.clone());
-                policy.matches_node(&labels)
-                    && policy
-                        .placement_groups
-                        .iter()
-                        .filter(|group| group.required && group.target == PlacementTarget::Node)
-                        .all(|group| {
-                            let matched = group
-                                .terms
-                                .iter()
-                                .any(|term| term.selector.matches(&labels));
-                            if group.anti {
-                                !matched
-                            } else {
-                                matched
-                            }
-                        })
-            })
+            .filter(|node| matches_node_placement(&policy, node))
             .cloned()
             .collect::<Vec<_>>();
         if matches.is_empty() {
@@ -118,6 +99,24 @@ impl Directory {
         Some(self.nodes.clone())
     }
 }
+
+pub(crate) fn matches_node_placement(policy: &SchedulingPolicy, node: &pb::NodeEndpoint) -> bool {
+    let mut labels: BTreeMap<_, _> = node.labels.clone().into_iter().collect();
+    labels.insert("NODE_ID".into(), node.node_id.clone());
+    policy.matches_node(&labels)
+        && policy
+            .placement_groups
+            .iter()
+            .filter(|group| group.required && group.target == PlacementTarget::Node)
+            .all(|group| {
+                let matched = group
+                    .terms
+                    .iter()
+                    .any(|term| term.selector.matches(&labels));
+                matched != group.anti
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

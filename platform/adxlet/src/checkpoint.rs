@@ -182,6 +182,29 @@ impl CheckpointCooperation for crate::runtime_control::RuntimeControlClient {
 pub(crate) struct CheckpointServices {
     pub store: std::sync::Arc<dyn CheckpointAccess>,
     pub cooperation: std::sync::Arc<dyn CheckpointCooperation>,
+    pub qualification_probe: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl CheckpointServices {
+    pub(crate) async fn validate_qualification(&self) -> Result<()> {
+        let permit = self
+            .qualification_probe
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| {
+                Error::Unavailable(format!("checkpoint storage observation: {error}"))
+            })?;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            // A timed-out caller must not start another blocking storage check
+            // until the previous one actually finishes.
+            let _permit = permit;
+            store.validate_policy(adx_core::lifecycle::CheckpointStorage::Configured)
+        })
+        .await
+        .map_err(|error| Error::Unavailable(format!("checkpoint storage observation: {error}")))?
+    }
 }
 
 #[cfg(test)]

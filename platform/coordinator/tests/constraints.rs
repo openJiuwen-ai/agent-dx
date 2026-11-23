@@ -171,6 +171,76 @@ fn central_scheduler_places_only_on_reported_runtime_class() {
     );
 }
 
+fn require_checkpoint_restore(request: &mut EnvironmentSpec) {
+    request.scheduling.required_node = vec![selector(
+        "adx.internal/node-capability/runsc/checkpoint-restore.v1",
+        "true",
+    )];
+}
+
+#[test]
+fn capability_constrained_creates_use_eligible_shards_and_local_candidates() {
+    let mut coordinator = Coordinator::new(2, Placement::Pack).unwrap();
+    let ordinary = node("ordinary", "z");
+    assert_eq!(coordinator.register(ordinary).unwrap(), 0);
+    let mut capable = node("capable", "z");
+    let mut constrained = spec("constrained");
+    require_checkpoint_restore(&mut constrained);
+    capable
+        .labels
+        .extend(constrained.scheduling.required_node[0].match_labels.clone());
+    assert_eq!(coordinator.register(capable).unwrap(), 1);
+    assert!(!coordinator
+        .local_candidate(&constrained, "ordinary", &[])
+        .unwrap());
+    assert!(coordinator
+        .local_candidate(&constrained, "capable", &[])
+        .unwrap());
+    assert_eq!(coordinator.submit(constrained).unwrap(), 1);
+    assert_eq!(coordinator.schedule(1).unwrap().unwrap().node_id, "capable");
+
+    assert_eq!(coordinator.submit(spec("ordinary-request")).unwrap(), 0);
+    assert_eq!(
+        coordinator.schedule(0).unwrap().unwrap().node_id,
+        "ordinary"
+    );
+}
+
+#[test]
+fn queued_capability_request_waits_for_compatible_capacity_on_another_shard() {
+    let mut coordinator = Coordinator::new(2, Placement::Pack).unwrap();
+    coordinator.register(node("ordinary", "z")).unwrap();
+    let mut constrained = spec("constrained");
+    require_checkpoint_restore(&mut constrained);
+    assert_eq!(coordinator.submit(constrained.clone()).unwrap(), 0);
+    assert!(coordinator.schedule(0).unwrap().is_none());
+    assert_eq!(coordinator.pending(0).unwrap(), 1);
+
+    let mut replacement = node("replacement", "z");
+    replacement.runtime_classes = vec!["runc".into()];
+    replacement.labels.insert(
+        "adx.internal/node-capability/runc/checkpoint-restore.v1".into(),
+        "true".into(),
+    );
+    assert_eq!(coordinator.register(replacement.clone()).unwrap(), 1);
+    assert!(coordinator.schedule(0).unwrap().is_none());
+    let failure = coordinator.scheduling_failure(&constrained).unwrap();
+    assert_eq!(failure.eligible_nodes, 0);
+    assert_eq!(failure.rejections["node_capability"], 2);
+
+    replacement.runtime_classes.push("runsc".into());
+    replacement
+        .labels
+        .extend(constrained.scheduling.required_node[0].match_labels.clone());
+    coordinator.register(replacement).unwrap();
+    assert!(coordinator.schedule(0).unwrap().is_none());
+    assert_eq!(coordinator.pending(0).unwrap(), 0);
+    assert_eq!(
+        coordinator.schedule(1).unwrap().unwrap().node_id,
+        "replacement"
+    );
+}
+
 #[test]
 fn whole_cards_are_model_selected_reserved_and_released() {
     let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();

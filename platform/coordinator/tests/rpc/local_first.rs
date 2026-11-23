@@ -48,6 +48,144 @@ async fn live_inspection_accepts_open_admission_but_requires_a_current_session()
 
 #[tokio::test]
 #[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn constrained_named_replay_requires_the_current_worker_capability_report() {
+    use adx_core::scheduling::{
+        node_capability_label, LabelSelector, CHECKPOINT_RESTORE_V1, NODE_CAPABILITY_LABEL_VALUE,
+    };
+
+    let checkpoint_root = tempfile::tempdir().unwrap();
+    let mut rig = Rig::new_with_shards_and_checkpoint(2, Some(checkpoint_root.path())).await;
+    let checkpoint = pb::RuntimeCapabilities {
+        capability_ids: vec![CHECKPOINT_RESTORE_V1.into()],
+    };
+    let report = &mut rig.registrations[1];
+    report.heartbeat_sequence += 1;
+    report
+        .runtime_capabilities
+        .insert("runc".into(), checkpoint.clone());
+    rig.claimants[1]
+        .register_node(report.clone())
+        .await
+        .unwrap();
+
+    let constrained = |id: &str| {
+        let mut spec = spec(id);
+        spec.scheduling.required_node.push(LabelSelector {
+            match_labels: [(
+                node_capability_label("runc", CHECKPOINT_RESTORE_V1),
+                NODE_CAPABILITY_LABEL_VALUE.into(),
+            )]
+            .into(),
+            ..Default::default()
+        });
+        pb::CreateEnvironmentRequest {
+            spec: Some(spec.into()),
+            ..create(id)
+        }
+    };
+
+    let ordinary = rig.nodes[0]
+        .create_local_environment(Rig::request("ordinary", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(
+        rig.coordinator
+            .create_environment(constrained("ordinary"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    rig.delete(&ordinary).await;
+
+    let request = constrained("capable");
+    let result = rig.nodes[0]
+        .create_local_environment(pb::LocalEnvironmentCreateRequest {
+            create: Some(request.clone()),
+            ..Rig::request("capable", 0)
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(result.assignment.as_ref().unwrap().node_id, "b");
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.backends[1].started.load(Ordering::SeqCst), 1);
+
+    let proof_request = || {
+        let mut request = Request::new(pb::GetEnvironmentRequest {
+            environment_id: "capable".into(),
+            caller: caller(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-adx-verify-node-capabilities", "true".parse().unwrap());
+        request
+    };
+    let proof = rig
+        .coordinator
+        .get_environment(proof_request())
+        .await
+        .unwrap();
+    assert_eq!(
+        proof.metadata().get("x-adx-verified-node-session").unwrap(),
+        "boot-b"
+    );
+
+    let report = &mut rig.registrations[1];
+    report.heartbeat_sequence += 1;
+    report.runtime_capabilities.clear();
+    rig.claimants[1]
+        .register_node(report.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.coordinator
+            .get_environment(proof_request())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        rig.coordinator
+            .create_environment(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    rig.delete(&result).await;
+
+    let report = &mut rig.registrations[1];
+    report.heartbeat_sequence += 1;
+    report
+        .runtime_capabilities
+        .insert("runc".into(), checkpoint);
+    rig.claimants[1]
+        .register_node(report.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.coordinator
+            .create_environment(pb::CreateEnvironmentRequest {
+                expected_assignment: result.assignment,
+                ..request
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(rig.backends[1].started.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
 async fn live_catalog_keeps_a_durable_claim_pending_until_the_create_rpc() {
     let mut rig = Rig::new().await;
     rig.managers[0].reconcile(vec![]).await.unwrap();
@@ -79,6 +217,7 @@ async fn live_catalog_keeps_a_durable_claim_pending_until_the_create_rpc() {
         heartbeat_sequence: 3,
         reconciling: false,
         accepting_allocations: true,
+        runtime_capabilities: Default::default(),
         runtime_classes: vec!["r".into(), "runc".into(), "runsc".into()],
         labels: Default::default(),
         devices: vec![],
@@ -168,6 +307,12 @@ impl Rig {
         Self::new_with_shards(1).await
     }
     async fn new_with_shards(shards: usize) -> Self {
+        Self::new_with_shards_and_checkpoint(shards, None).await
+    }
+    async fn new_with_shards_and_checkpoint(
+        shards: usize,
+        checkpoint_root: Option<&std::path::Path>,
+    ) -> Self {
         let redis = common::Redis::new().await;
         let session = redis.store().await.begin(shards).await.unwrap();
         let rpc = CoordinatorRpc::with_heartbeat_timeout(
@@ -228,11 +373,16 @@ impl Rig {
             node_creation_identity: Arc::default(),
         };
         for (id, cert) in [("a", "node"), ("b", "ingress")] {
-            rig.add_node(id, cert).await;
+            rig.add_node(id, cert, checkpoint_root).await;
         }
         rig
     }
-    async fn add_node(&mut self, id: &str, cert: &'static str) {
+    async fn add_node(
+        &mut self,
+        id: &str,
+        cert: &'static str,
+        checkpoint_root: Option<&std::path::Path>,
+    ) {
         let client = channel(self.address, cert).await;
         let sink = Arc::new(
             CoordinatorStateSink::new(client.clone(), Duration::from_secs(2))
@@ -246,13 +396,22 @@ impl Rig {
             removed: AtomicUsize::new(0),
             running: Mutex::default(),
         });
-        let manager = Arc::new(Adxlet::new(
+        let manager = Adxlet::new(
             id.into(),
             backend.clone(),
             Arc::new(LocalChecks),
             Arc::new(LocalChecks),
             sink.clone(),
-        ));
+        );
+        let manager = if let Some(root) = checkpoint_root {
+            let store = adx_checkpoint_storage::LocalCheckpointStore::new(root.join(id)).unwrap();
+            manager
+                .with_checkpointing(Arc::new(store), Arc::new(LocalChecks))
+                .unwrap()
+        } else {
+            manager
+        };
+        let manager = Arc::new(manager);
         manager
             .update_capacity(spec("x").resources, Duration::from_secs(60))
             .unwrap();
@@ -281,6 +440,7 @@ impl Rig {
             pressure_disposition: Default::default(),
             checkpoint_scopes: vec![],
             storage_mounts: Default::default(),
+            runtime_capabilities: Default::default(),
             runtime_classes: vec![
                 "runsc".into(),
                 "runc".into(),
@@ -577,6 +737,7 @@ async fn heartbeat_expiry_wakes_only_the_volume_wait_and_allows_takeover_before_
             pressure_disposition: Default::default(),
             checkpoint_scopes: vec![],
             storage_mounts: Default::default(),
+            runtime_capabilities: Default::default(),
             runtime_classes: b.node.runtime_classes.clone(),
             node_id: "b".into(),
             node_address: b.address.clone(),
@@ -924,6 +1085,7 @@ async fn redis_restart_recovers_scheduler_after_failed_node_heartbeat() {
         pressure_disposition: Default::default(),
         checkpoint_scopes: vec![],
         storage_mounts: Default::default(),
+        runtime_capabilities: Default::default(),
         runtime_classes: vec!["runsc".into(), "runc".into()],
         node_id: "a".into(),
         node_address: node.address.clone(),
@@ -1314,6 +1476,7 @@ async fn environment_directory_increment_does_not_rescan_control_history() {
             pressure_disposition: Default::default(),
             checkpoint_scopes: vec![],
             storage_mounts: Default::default(),
+            runtime_capabilities: Default::default(),
             runtime_classes: stored.node.runtime_classes,
             node_id: stored.node.id,
             node_address: stored.address,
@@ -1847,6 +2010,7 @@ async fn prepare_http(rig: &mut Rig) {
                 pressure_disposition: Default::default(),
                 checkpoint_scopes: vec![],
                 storage_mounts: Default::default(),
+                runtime_capabilities: Default::default(),
                 runtime_classes: vec![
                     "runsc".into(),
                     "runc".into(),
@@ -2128,6 +2292,7 @@ async fn ordinary_heartbeats_do_not_write_redis() {
                 accepting_allocations: true,
                 heartbeat_sequence: sequence,
                 reconciling: false,
+                runtime_capabilities: Default::default(),
                 runtime_classes: saved.node.runtime_classes.clone(),
                 labels: Default::default(),
                 devices: vec![],
@@ -2336,6 +2501,7 @@ async fn coordinator_restart_reclaims_unconfirmed_runtime_before_reassignment() 
             reconciling: true,
             accepting_allocations: false,
             capacity: Some(node.node.capacity.into()),
+            runtime_capabilities: Default::default(),
             runtime_classes: node.node.runtime_classes.clone(),
             labels: Default::default(),
             devices: vec![],
@@ -2849,7 +3015,7 @@ async fn dynamic_storage_refreshes_waiting_topology_and_withdraws_without_restar
         let request = managed_request("waiting", &volume);
         let waiting = tokio::spawn(async move { api.create_environment(request).await });
         wait_for_queued(&mut rig, "waiting").await;
-        rig.add_node("c", "unknown").await;
+        rig.add_node("c", "unknown", None).await;
         assert!(
             !waiting.is_finished(),
             "unreported storage entered topology"
@@ -3001,7 +3167,7 @@ async fn dynamic_storage_refresh_keeps_exclusive_wait_until_release() {
     let mut api = rig.coordinator.clone();
     let waiting = tokio::spawn(async move { api.create_environment(request).await });
     wait_for_queued(&mut rig, "exclusive-wait").await;
-    rig.add_node("c", "unknown").await;
+    rig.add_node("c", "unknown", None).await;
     rig.report_mounts(
         2,
         BTreeMap::from([(

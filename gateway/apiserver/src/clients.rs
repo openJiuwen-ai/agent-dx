@@ -145,6 +145,70 @@ impl Clients {
             self.directory.lock().await.update(frame)?;
         }
     }
+
+    /// Validate a retained Environment against a fresh Coordinator node session.
+    pub(crate) async fn verify_capability_owner(
+        &self,
+        id: &str,
+        caller: &pb::CallerContext,
+    ) -> Result<(pb::EnvironmentRecord, pb::NodeEndpoint), Status> {
+        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            self.coordinator().await?,
+        );
+        let mut request = trace::inject(pb::GetEnvironmentRequest {
+            environment_id: id.into(),
+            caller: Some(caller.clone()),
+        });
+        request.metadata_mut().insert(
+            "x-adx-verify-node-capabilities",
+            tonic::metadata::MetadataValue::from_static("true"),
+        );
+        let (owner, session) = self
+            .rpc("apiserver.verify_capability_owner", async {
+                let reply = client.get_environment(request).await?;
+                let session = reply
+                    .metadata()
+                    .get("x-adx-verified-node-session")
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        Status::failed_precondition("Coordinator did not verify node capabilities")
+                    })?
+                    .to_owned();
+                Ok(tonic::Response::new((reply.into_inner(), session)))
+            })
+            .await?;
+        authorize(caller, owner.record.as_ref())?;
+        let record = owner
+            .record
+            .filter(|record| record.spec.as_ref().is_some_and(|spec| spec.id == id))
+            .ok_or_else(|| Status::data_loss("incomplete capability owner response"))?;
+        let assignment = record
+            .assignment
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("capability owner assignment missing"))?;
+        let mut stream = self
+            .rpc(
+                "apiserver.verify_capability_watch_nodes",
+                client.watch_nodes(pb::WatchNodesRequest {}),
+            )
+            .await?;
+        let node = tokio::time::timeout(self.config.timeout(), stream.message())
+            .await
+            .map_err(|_| Status::unavailable("node capability verification timed out"))??
+            .filter(|frame| frame.valid_for_millis > 0)
+            .and_then(|frame| {
+                frame
+                    .nodes
+                    .into_iter()
+                    .find(|node| node.node_id == assignment.node_id && node.session_id == session)
+            })
+            .ok_or_else(|| {
+                Status::failed_precondition("assigned node capability session is no longer current")
+            })?;
+        Ok((record, node))
+    }
+
     pub async fn create_environment(
         &self,
         request: pb::CreateEnvironmentRequest,

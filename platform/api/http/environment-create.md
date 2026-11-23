@@ -20,6 +20,10 @@ JSON inside the normal response envelope, or as the final SSE event:
 {"environmentId":"tenant-worker","status":"running","requestId":"create-request","newlyCreated":true}
 ```
 
+Use `POST /api/environment/v1/constrained-environments` for fresh creation with required node capabilities. Supply `requiredNodeCapabilities` as a nonempty list of up to 32 distinct supported identifiers and explicitly select `runtime` or `rootfs.runtime`. The first supported identifier is `checkpoint-restore.v1`. Snapshot restore requests and capability fields on the ordinary create route return InvalidArgument.
+
+Constrained creation uses the same authentication, JSON/SSE response and request identity as ordinary creation. The scheduler requires every capability for the selected runtime together with the existing placement and resource constraints. An older API server rejects the dedicated route before scheduling. A named or replayed creation can return a retained Environment only when its stored placement and the assigned worker's current session satisfy the request.
+
 `requestId` identifies the request that created the **current Env**. If R1 created
 an Env, CREATE with R2 returns the existing Env with `requestId: R1`. If the Env
 is deleted and recreated by R3, replaying R1 returns the current Env with
