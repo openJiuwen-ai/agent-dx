@@ -4,6 +4,8 @@ The suite measures with industry tools (fio, elbencho, iperf3) and reads their o
 reports. Everything here is deterministic so it can be pinned by runner_tests.
 """
 
+import csv
+import io
 import json
 import re
 import statistics
@@ -45,6 +47,7 @@ EXCLUSIVE_OVERRIDES = ("dfs_read_cache_bytes", "dfs_peer_cache.")
 LOCAL_COPY = ("required", "preferred", "none")
 REPLICATION_KEYS = ("dfs_desired_copies", "dfs_sync_required_copies", "dfs_local_copy")
 ARRIVAL_GAP_MAX_MS = 600_000
+PROGRESS_INTERVAL_MS = (100, 2000)
 # Node log lines counted every round (substring per line); bench.log_events adds more.
 LOG_EVENTS = ("dfs.read_cache_install_failed", "dfs.read_cache_reconcile_retry",
               "DFS peer read admission deadline exceeded", "peer stayed busy")
@@ -65,6 +68,7 @@ class BenchParameters:
     replication: dict = field(default_factory=dict)
     arrival: dict = field(default_factory=lambda: {"mode": "together"})
     log_events: tuple[str, ...] = LOG_EVENTS
+    progress_interval_ms: int = 0
 
     @property
     def reader_roles(self):
@@ -247,6 +251,15 @@ def _log_event_inputs(values):
     return tuple(dict.fromkeys(LOG_EVENTS + tuple(extra)))
 
 
+def _progress_input(values):
+    """Optional elbencho live progress sampling interval (ms); 0 (absent) records no progress."""
+    interval = values.get("progress_interval_ms", 0)
+    if "progress_interval_ms" in values and (not is_integer(interval) or not
+                                             PROGRESS_INTERVAL_MS[0] <= interval <= PROGRESS_INTERVAL_MS[1]):
+        raise Blocked("bench progress_interval_ms must be %d..%d" % PROGRESS_INTERVAL_MS)
+    return interval
+
+
 def _variant_inputs(values, present=NODE_ROLES):
     """Optional verification inputs; absent keys keep the disk-backed default configuration."""
     backend = values.get("backend", "disk")
@@ -286,6 +299,7 @@ def _variant_inputs(values, present=NODE_ROLES):
         "replication": replication,
         "arrival": _arrival_inputs(values, readers),
         "log_events": _log_event_inputs(values),
+        "progress_interval_ms": _progress_input(values),
     }
 
 
@@ -416,6 +430,86 @@ def reader_local_reads(windows, file_bytes):
     return value
 
 
+SOURCE_FAMILY = "afs_dfs_read_source_bytes_total"
+# Source roles a reader does not receive from another reader: its own disk, the durable copies (the writer's,
+# when it holds the only copy) and the whole-object path, which does not say who served it.
+NON_PEER_SOURCES = ("local", "durable", "object")
+
+
+def labelled_counter_window(before, after, family, label):
+    """One counter family between two scrapes, kept per value of `label` (same verdicts as counter_window).
+
+    Every sample of the family must carry the label; a different sample set is `missing`, never zero.
+    """
+    wanted = re.compile(r'^%s\{(?:.*,)?%s="([^"]*)"' % (re.escape(family), re.escape(label)))
+
+    def pick(text):
+        selected = {}
+        for name, value in _samples(text).items():
+            if wanted.match(name):
+                selected[name] = value
+        return selected
+
+    first, second = pick(before), pick(after)
+    if not first or not second or set(first) != set(second):
+        return {"status": "missing", "samples": sorted(set(first) ^ set(second)) or [family]}
+    reset = sorted(n for n in second if second[n] < first[n])
+    if reset:
+        return {"status": "reset", "samples": reset}
+    by = {}
+    for name, value in second.items():
+        key = wanted.match(name).group(1)
+        by[key] = by.get(key, 0) + int(value - first[name])
+    return {"status": "complete", "by": by}
+
+
+def source_supply(windows, sent, *, writer, file_bytes, applies):
+    """Who supplied the readers in one read window: received bytes per reader and source role
+    (`windows`, labelled_counter_window of SOURCE_FAMILY per reader) against the bytes each Node sent.
+
+    `writer_share` is the writer's sent bytes over N*S (R_A). Peer supply is every source role but
+    NON_PEER_SOURCES, so a new reader-to-reader role counts without a framework change. When the writer
+    holds the only copy (`applies`), durable bytes received must equal the writer's sent bytes and peer
+    bytes received must equal what the other Nodes sent (`ok`). Incomplete counters, a missing writer
+    window or whole-object bytes (`unattributed`) leave `ok` None; nothing is raised.
+    """
+    issues, by_reader, by_role = {}, {}, {}
+    for role, window in windows.items():
+        if window["status"] != "complete":
+            issues[role] = window["status"]
+            continue
+        by_reader[role] = dict(window["by"])
+        for source, value in window["by"].items():
+            by_role[source] = by_role.get(source, 0) + value
+    peer_received = 0
+    for source, value in by_role.items():
+        if source not in NON_PEER_SOURCES:
+            peer_received += value
+    writer_sent = sent.get(writer)
+    readers_sent = sum(value for role, value in sent.items() if role != writer)
+    expected = len(windows) * file_bytes
+    supply = {"status": "complete" if not issues else ("reset" if "reset" in issues.values() else "missing"),
+              "received_by_reader": by_reader, "received_by_role": by_role, "peer_received": peer_received,
+              "writer_sent": writer_sent, "readers_sent": readers_sent,
+              "writer_share": None if writer_sent is None or not expected else writer_sent / expected, "ok": None}
+    if issues:
+        supply["issues"] = issues
+    if by_role.get("object", 0):
+        supply["unattributed"] = "object"
+    judged = applies and not issues and writer_sent is not None
+    if judged and "unattributed" not in supply:
+        supply["ok"] = by_role.get("durable", 0) == writer_sent and peer_received == readers_sent
+    return supply
+
+
+def kernel_groups(kernels):
+    """Roles grouped by the kernel they run on (`kernels`: role -> boot id), without the boot ids."""
+    groups = {}
+    for role, kernel in kernels.items():
+        groups.setdefault(kernel, []).append(role)
+    return sorted(sorted(roles) for roles in groups.values())
+
+
 LOCAL_REPLICA_SUFFIX = "_local_replica"
 UNATTRIBUTED_SUFFIX = "_unattributed"
 
@@ -534,11 +628,17 @@ def diskstats_delta(before, after):
     return delta
 
 
-def elbencho_read_argv(elbencho, hosts, path, *, block, file_bytes, threads, result):
-    """Every service host reads the whole file (`--nosvcshare`); the master only coordinates."""
+def elbencho_read_argv(elbencho, hosts, path, *, block, file_bytes, threads, result, live_csv=None,
+                       live_interval_ms=0):
+    """Every service host reads the whole file (`--nosvcshare`); the master only coordinates.
+
+    `--svcelapsed` adds the completion time of every service to the console results. With `live_csv`,
+    per-service progress is sampled every `live_interval_ms` into that CSV (`--livecsvex`).
+    """
+    live = ["--livecsv", live_csv, "--livecsvex", "--liveint", str(live_interval_ms)] if live_csv else []
     return [
         elbencho, "--hosts", ",".join(hosts), "--nosvcshare", "-r", "-b", str(block), "-s", str(file_bytes),
-        "-t", str(threads), "--nolive", "--jsonfile", result, path,
+        "-t", str(threads), "--nolive", "--svcelapsed", *live, "--jsonfile", result, path,
     ]
 
 
@@ -576,6 +676,84 @@ def parse_elbencho(text, phase_type):
     return {"tool_version": phase["config"].get("version"), "hosts": int(phase["config"].get("hosts", 1)),
             "bytes": data, "seconds": seconds, "mib_per_s": data / seconds / MIB,
             "tool_bytes_per_s": int(done.get("bytes/s", 0))}
+
+
+ELAPSED_PART = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
+ELAPSED_UNITS_MS = {"h": 3_600_000, "m": 60_000, "s": 1000, "ms": 1}
+SVC_COMPLETION_ROW = "Svc compl. time"
+
+
+def elbencho_elapsed_ms(text):
+    """elbencho's human elapsed time ("529ms", "1.204s", "2m3.004s", "1h2m3s") in milliseconds."""
+    parts = ELAPSED_PART.findall(text)
+    if not parts or "".join(number + unit for number, unit in parts) != text:
+        raise ValueError("not an elbencho elapsed time: %r" % text)
+    return round(sum(float(number) * ELAPSED_UNITS_MS[unit] for number, unit in parts))
+
+
+def _spread(by_reader):
+    values = sorted(by_reader.values())
+    return {"by_reader": by_reader, "first_ms": values[0], "median_ms": statistics.median(values),
+            "last_ms": values[-1], "spread_ms": values[-1] - values[0]}
+
+
+def elbencho_service_completion(console, services):
+    """Completion time of every reader from elbencho's `--svcelapsed` console row.
+
+    `services` maps each elbencho service ("host:port") to its reader role; every service must appear once.
+    """
+    rows = [line for line in console.splitlines() if SVC_COMPLETION_ROW in line]
+    if len(rows) != 1 or "[" not in rows[0] or "]" not in rows[0]:
+        raise ValueError("elbencho console must contain exactly one %r row" % SVC_COMPLETION_ROW)
+    by_reader = {}
+    for token in rows[0][rows[0].index("[") + 1:rows[0].rindex("]")].split():
+        service, _, elapsed = token.rpartition("=")
+        if service not in services or services[service] in by_reader:
+            raise ValueError("unexpected or repeated elbencho service in completion row: %r" % token)
+        by_reader[services[service]] = elbencho_elapsed_ms(elapsed)
+    if len(by_reader) != len(services):
+        raise ValueError("elbencho completion row lacks services: %r" % sorted(set(services) - set(by_reader)))
+    return _spread(by_reader)
+
+
+def elbencho_progress(text, services, file_bytes, phase="READ"):
+    """Per-reader progress from elbencho's extended live CSV (`--livecsv --livecsvex`).
+
+    Service rows carry the bytes each service has read so far at the master's RuntimeMS. Reported per
+    reader: the first sample with progress, the first sample at the whole file (None if no sample shows
+    it) and the sample count; for the readers together, the largest lead in bytes between the fastest
+    and the slowest reader at one sample, when it happened and its fraction of the file, and the spread
+    of the first-progress times. Resolution is the sampling interval.
+    """
+    rows = list(csv.DictReader(io.StringIO(text)))
+    samples = {}
+    for row in rows:
+        if row.get("Phase") != phase or row.get("Service") not in services:
+            continue
+        runtime, done = int(row["RuntimeMS"]), int(row["DoneBytes"])
+        samples.setdefault(runtime, {})[services[row["Service"]]] = done
+    seen = set()
+    for values in samples.values():
+        seen.update(values)
+    if seen != set(services.values()):
+        raise ValueError("elbencho live report lacks readers: %r" % sorted(set(services.values()) - seen))
+    by_reader = {role: {"first_progress_ms": None, "done_ms": None, "samples": 0} for role in seen}
+    lead, lead_at = 0, None
+    for runtime in sorted(samples):
+        values = samples[runtime]
+        for role, done in values.items():
+            entry = by_reader[role]
+            entry["samples"] += 1
+            if done > 0 and entry["first_progress_ms"] is None:
+                entry["first_progress_ms"] = runtime
+            if done >= file_bytes and entry["done_ms"] is None:
+                entry["done_ms"] = runtime
+        if len(values) == len(seen) and max(values.values()) - min(values.values()) > lead:
+            lead, lead_at = max(values.values()) - min(values.values()), runtime
+    first = [entry["first_progress_ms"] for entry in by_reader.values() if entry["first_progress_ms"] is not None]
+    return {"by_reader": by_reader, "max_lead_bytes": lead, "max_lead_at_ms": lead_at,
+            "max_lead_fraction": lead / file_bytes if file_bytes else None,
+            "first_progress_spread_ms": max(first) - min(first) if len(first) == len(seen) else None}
 
 
 def parse_iperf3(text):
