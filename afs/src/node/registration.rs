@@ -82,7 +82,7 @@ where
         };
         match result {
             Ok(value) => return Ok(value),
-            Err(error) if initial_registration_error_is_retryable(&error) => {
+            Err(error) if meta_transport_error_is_retryable(&error) => {
                 afs_logging::warn!(
                     "node.initial_registration_retry";
                     "error" => error.to_string(),
@@ -113,19 +113,19 @@ where
 
 /// Successful heartbeat cadence.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-/// Cadence after a retryable heartbeat failure.
-const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-/// A retryable failure stays tolerable only this long after the last success,
-/// inside the Meta lease window.
-const HEARTBEAT_FAIL_CLOSED_AFTER: Duration = Duration::from_secs(25);
+/// Cadence after a retryable Meta failure, shared with the workspace-bind loop.
+pub(crate) const META_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a retryable Meta failure stays tolerable after the last success,
+/// inside the Meta lease window; shared with the workspace-bind loop.
+pub(crate) const META_FAIL_CLOSED_AFTER: Duration = Duration::from_secs(25);
 
 /// T2 `MetaHeartbeat`: re-registers the Node with Meta every
-/// [`HEARTBEAT_INTERVAL`], every [`HEARTBEAT_RETRY_INTERVAL`] after a
+/// [`HEARTBEAT_INTERVAL`], every [`META_RETRY_INTERVAL`] after a
 /// retryable failure.
 ///
 /// Fatal class: a changed lease epoch, a non-retryable error, a refresh of the
 /// running DFS read authority that fails while serving, or no success within
-/// [`HEARTBEAT_FAIL_CLOSED_AFTER`] stops the read authority and returns `Err`,
+/// [`META_FAIL_CLOSED_AFTER`] stops the read authority and returns `Err`,
 /// which shuts the whole Node down. A retryable error inside that window is
 /// logged (`node.meta_heartbeat_retry`) and retried. Stop: `services.stop`
 /// ends it with `Ok`, checked between heartbeats; a late refresh during normal
@@ -212,7 +212,7 @@ impl MetaHeartbeat {
                             Err(error) => {
                                 readiness.note_registration_failure(error.to_string());
                                 if !heartbeat_error_is_retryable(&error)
-                                    || last_success.elapsed() >= HEARTBEAT_FAIL_CLOSED_AFTER
+                                    || last_success.elapsed() >= META_FAIL_CLOSED_AFTER
                                 {
                                     #[cfg(feature = "dfs")]
                                     if let Some(authority) = &read_authority {
@@ -221,7 +221,7 @@ impl MetaHeartbeat {
                                     return Err(error.into());
                                 }
                                 afs_logging::warn!("node.meta_heartbeat_retry"; "error" => error.to_string());
-                                next_delay = HEARTBEAT_RETRY_INTERVAL;
+                                next_delay = META_RETRY_INTERVAL;
                             }
                         }
                     }
@@ -246,14 +246,27 @@ fn heartbeat_error_is_retryable(error: &afs_error::Error) -> bool {
     )
 }
 
-fn initial_registration_error_is_retryable(error: &afs_error::Error) -> bool {
+/// Whether a Meta RPC failure is a transient transport/availability error.
+///
+/// Besides the transport kinds, a Meta that drops an in-flight call answers
+/// with a framework-level status that has no AFS detail (`CLIENT_REMOTE_STATUS`)
+/// and a kind taken from the h2 reason (`Internal`/`Cancelled`/`Unknown`).
+/// Locally produced decode errors keep their own codes and stay fatal.
+pub(crate) fn meta_transport_error_is_retryable(error: &afs_error::Error) -> bool {
+    let kind = error.kind();
     matches!(
-        error.kind(),
+        kind,
         afs_error::ErrorKind::Unavailable
             | afs_error::ErrorKind::DeadlineExceeded
             | afs_error::ErrorKind::ResourceExhausted
             | afs_error::ErrorKind::Aborted
-    )
+    ) || (error.code() == afs_error::CLIENT_REMOTE_STATUS
+        && matches!(
+            kind,
+            afs_error::ErrorKind::Cancelled
+                | afs_error::ErrorKind::Unknown
+                | afs_error::ErrorKind::Internal
+        ))
 }
 
 #[cfg(feature = "dfs")]
@@ -307,34 +320,26 @@ mod tests {
         );
         assert_eq!(over_the_wire.code(), afs_error::META_NODE_PROTOCOL_VERSION);
         assert!(!super::heartbeat_error_is_retryable(&over_the_wire));
-        assert!(super::heartbeat_error_is_retryable(
-            &afs_error::Error::coded(
-                afs_error::META_OWNER_ROOT_BUSY,
-                "other FailedPrecondition-class errors keep their retry",
-            )
-        ));
+        assert!(super::heartbeat_error_is_retryable(&afs_error::Error::coded(
+            afs_error::META_OWNER_ROOT_BUSY,
+            "other FailedPrecondition-class errors keep their retry",
+        )));
     }
 
     #[test]
     fn heartbeat_retries_transport_failure_but_stops_expired_session() {
-        assert!(super::heartbeat_error_is_retryable(
-            &afs_error::Error::coded(
-                afs_error::CLIENT_CONNECTION_UNAVAILABLE,
-                "temporary transport outage",
-            )
-        ));
-        assert!(!super::heartbeat_error_is_retryable(
-            &afs_error::Error::coded(
-                afs_error::CLIENT_ARGUMENT_INVALID,
-                "expired node session cannot be renewed; start a new session_id",
-            )
-        ));
-        assert!(!super::heartbeat_error_is_retryable(
-            &afs_error::Error::coded(
-                afs_error::IO_PERMISSION_DENIED,
-                "registration authority rejected",
-            )
-        ));
+        assert!(super::heartbeat_error_is_retryable(&afs_error::Error::coded(
+            afs_error::CLIENT_CONNECTION_UNAVAILABLE,
+            "temporary transport outage",
+        )));
+        assert!(!super::heartbeat_error_is_retryable(&afs_error::Error::coded(
+            afs_error::CLIENT_ARGUMENT_INVALID,
+            "expired node session cannot be renewed; start a new session_id",
+        )));
+        assert!(!super::heartbeat_error_is_retryable(&afs_error::Error::coded(
+            afs_error::IO_PERMISSION_DENIED,
+            "registration authority rejected",
+        )));
     }
 
     #[tokio::test]
