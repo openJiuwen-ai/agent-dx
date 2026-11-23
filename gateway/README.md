@@ -121,6 +121,21 @@ Requests already sent are never replayed. Delayed revocations invalidate only
 older pool revisions. Planned node upgrades wait for natural stream inactivity,
 then close admission against the observed activity revision before checkpointing.
 
+Before sending ordinary HTTP requests, Ingress can wait through a Relay's physical
+TCP connection refusal or explicit CONNECT 503 during process replacement. Pool
+preparation, recovery waits and authorization rechecks share one fixed budget,
+bounded by the existing Relay connect timeout and the request's original deadline.
+Route revocation or changed authorization stops this wait. TLS/authentication
+failures and other CONNECT errors, including backend-connect 502, are not eligible
+for this Relay-replacement wait.
+When Relay rejects a stale execution binding, an unsent Direct HTTP request can
+wait for the authorized replacement route within its original processing
+deadline. It releases the old pool permit during that wait and admits the body
+at most once, under the new binding's connect budget.
+The connect budget ends before sending business HTTP; application responses keep
+their existing processing deadline. This behavior is covered by local component
+tests and does not establish uninterrupted traffic during a cluster rollout.
+
 The pool defaults to 64 concurrent connections per endpoint, 64 idle
 connections per endpoint, 1024 idle connections globally, a 3 second acquire
 timeout, and a 5 second idle lifetime. An idle pooled HTTP connection is still
@@ -586,11 +601,18 @@ keys. Embedded Ingress receives `EnvironmentService` directly and rejects HTTP d
 configuration. Both require the requested Environment to belong to the tenant and be
 Running or a resumable Pausing/Paused/Resuming state. Authorized transfers use the
 shared Gateway EnsureRunning path before opening Execd; directory reads alone never wake.
+The standalone directory retries the read at most twice for transport errors, HTTP
+502/503/504 or a matching Environment still pending or starting. Both retries share a
+one-second window within the original directory timeout. Tenant denial, missing
+records and invalid responses fail immediately. Neither retries nor errors replay an
+Execd operation. Ingress logs the request ID and the final lookup error if Direct
+admission returns 502.
 Each frontend upload/download request owns one `Files` context: its first
 backend operation queries the directory, and the result is reused for all metadata,
 secret/registration reads, body chunks, and upload/commit operations in that request.
 A multipart request also shares admission across its files. A new frontend request
-must query again; failed admission is not repeatedly queried within the same context.
+must query again. Once the directory has returned its admission result, the context
+keeps that result for the transfer.
 Neither lookup activates an Environment or returns credentials.
 
 The context pins the admitted runtime route. Each operation checks local route

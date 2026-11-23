@@ -34,6 +34,28 @@ impl Drop for PressurePauseFlight {
             .release(&self.env_id);
     }
 }
+
+impl LifecycleEvents {
+    pub(super) fn seal_pending(&self) -> bool {
+        self.workload.is_some() || self.reopen_idle || self.retry.is_some()
+    }
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+
+    #[test]
+    fn reopening_idle_blocks_seal_even_without_pending_capture() {
+        let mut events = LifecycleEvents::default();
+        assert!(!events.seal_pending());
+        events.reopen_idle = true;
+        assert!(events.seal_pending());
+        events.reopen_idle = false;
+        events.retry = Some(Deadline::now());
+        assert!(events.seal_pending());
+    }
+}
 #[derive(Default)]
 pub(super) struct Observers {
     identity: Option<RuntimeIdentity>,

@@ -259,7 +259,10 @@ impl Controller {
         {
             return Ok(false);
         }
-        if self.record.revision != revision {
+        // The authorized upgrade Pause uses the current controller state.
+        // Its inventory revision stays fixed as part of the replay identity.
+        let planned_pause = kind == LifecycleKind::Pause && id.starts_with("task:");
+        if revision > self.record.revision || (!planned_pause && self.record.revision != revision) {
             return Err(Error::Conflict);
         }
         Ok(false)
@@ -326,7 +329,8 @@ impl Controller {
         result
     }
     async fn pause_inner(&mut self, request: PauseRequest) -> Result<OperationResult> {
-        if request.operation_id.starts_with("task:") {
+        let planned = request.operation_id.starts_with("task:");
+        if planned {
             self.services.upgrade.management_grant(
                 &self.record.spec.id,
                 self.record.assignment.generation,
@@ -351,10 +355,13 @@ impl Controller {
                 "positive checkpoint TTL and timeout (at most 3600 seconds) required".into(),
             ));
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(request.timeout_seconds);
-        let planned = request.operation_id.starts_with("task:");
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(request.timeout_seconds);
         let idle_revision = if planned {
-            match self.wait_upgrade_idle(deadline).await {
+            // Yield the controller between publisher retries so management requests
+            // can run while existing traffic prevents a checkpoint.
+            let idle_deadline = deadline.min(started + Duration::from_secs(1));
+            match self.wait_upgrade_idle(idle_deadline).await {
                 Ok(revision) => Some(revision),
                 Err(error) => {
                     self.services.reopen_route(&self.record).await?;

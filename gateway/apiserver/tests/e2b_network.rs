@@ -17,6 +17,7 @@ struct State {
     lookups: usize,
     node_calls: usize,
     fail_node: bool,
+    transient_network_failures: usize,
     unsupported_pause: bool,
     unsupported_snapshot: bool,
     bump_on_lookup: Option<usize>,
@@ -167,6 +168,12 @@ service_impl!(pb::node_service_server::NodeService, {
         if state.fail_node {
             return Err(Status::unavailable("injected node failure"));
         }
+        if state.transient_network_failures > 0 {
+            state.transient_network_failures -= 1;
+            assert_eq!(request.operation_id, "network-handoff");
+            assert_eq!(request.expected_revision, 9);
+            return Err(Status::unavailable("node is reconciling"));
+        }
         let record = {
             let record = state.owner.record.as_mut().unwrap();
             assert_eq!(request.assignment, record.assignment);
@@ -227,6 +234,7 @@ impl Fixture {
             lookups: 0,
             node_calls: 0,
             fail_node: false,
+            transient_network_failures: 0,
             unsupported_pause: false,
             unsupported_snapshot: false,
             bump_on_lookup: None,
@@ -389,6 +397,33 @@ async fn native_network_update_keeps_typed_policy_and_operation_fence() {
 }
 
 #[tokio::test]
+async fn native_network_update_waits_for_reconciling_node() {
+    let fixture = Fixture::new().await;
+    fixture.state.lock().unwrap().transient_network_failures = 2;
+    let response = fixture
+        .api
+        .environment_service
+        .execute(
+            adx_apiserver::operations::Kind::Network,
+            "sandbox",
+            "network-handoff",
+            json!({}),
+            &pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(response, json!({"success": true}));
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.node_calls, 3);
+    let request = state.last_request.as_ref().unwrap();
+    assert_eq!(request.operation_id, "network-handoff");
+    assert_eq!(request.expected_revision, 9);
+}
+
+#[tokio::test]
 async fn typed_network_retry_rejects_changed_policy_with_the_same_operation_id() {
     let fixture = Fixture::new().await;
     let mut policy: adx_core::execution::NetworkPolicy = {
@@ -427,6 +462,7 @@ async fn typed_network_retry_rejects_changed_policy_with_the_same_operation_id()
         .await
         .unwrap_err();
     assert_eq!(first.code(), tonic::Code::Unavailable);
+    let node_calls = fixture.state.lock().unwrap().node_calls;
     policy.traffic.as_mut().unwrap().egress_default_action =
         adx_core::execution::NetworkAction::Allow;
     let changed = service
@@ -440,7 +476,7 @@ async fn typed_network_retry_rejects_changed_policy_with_the_same_operation_id()
         .await
         .unwrap_err();
     assert_eq!(changed.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(fixture.state.lock().unwrap().node_calls, 2);
+    assert_eq!(fixture.state.lock().unwrap().node_calls, node_calls);
 }
 
 #[tokio::test]
@@ -614,10 +650,11 @@ async fn unsupported_network_forms_do_not_reach_node() {
 async fn node_failure_is_not_reported_as_no_content() {
     let fixture = Fixture::new().await;
     fixture.state.lock().unwrap().fail_node = true;
-    assert_ne!(fixture.put("{}").await.0, 204);
-    // Native operation replay retries one unavailable response with the same
-    // fenced operation; neither failure is converted to an HTTP success.
-    assert_eq!(fixture.state.lock().unwrap().node_calls, 2);
+    let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(4), fixture.put("{}"))
+        .await
+        .expect("network retries must stop within the configured 2 second RPC budget");
+    assert_eq!(status, 503);
+    assert!(fixture.state.lock().unwrap().node_calls > 2);
 }
 
 #[tokio::test]

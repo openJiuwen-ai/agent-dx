@@ -124,6 +124,17 @@ impl Adxlet {
     }
 
     fn completed_comparisons(&self) -> (Option<Error>, bool, bool) {
+        // Seal owns completion consumption once its durable fence is visible.
+        // Ordinary comparison retries must not erase failed/unknown receipts.
+        if self.process_sealing() {
+            return (
+                Some(Error::Unavailable(
+                    "process seal owns authority receipts".into(),
+                )),
+                false,
+                false,
+            );
+        }
         let mut failure = None;
         let mut stale = false;
         let mut orphan_failed = false;
@@ -195,7 +206,7 @@ impl Adxlet {
             }
         }
 
-        if self.is_draining() {
+        if self.is_draining() || self.process_sealing() {
             return Err(Error::Unavailable("node is draining".into()));
         }
         // Reopen after a previous session/transport fence only with fresh authority.
@@ -435,6 +446,22 @@ impl Adxlet {
         record: &EnvironmentRecord,
         recover: bool,
     ) -> Result<Option<EnvironmentHandle>> {
+        self.adopt_comparison_record_inner(record, false, recover)
+    }
+
+    pub(crate) fn adopt_successor_record(
+        &self,
+        record: &EnvironmentRecord,
+    ) -> Result<Option<EnvironmentHandle>> {
+        self.adopt_comparison_record_inner(record, true, true)
+    }
+
+    fn adopt_comparison_record_inner(
+        &self,
+        record: &EnvironmentRecord,
+        successor: bool,
+        recover: bool,
+    ) -> Result<Option<EnvironmentHandle>> {
         let retired = self
             .retired_environments
             .lock()
@@ -443,7 +470,14 @@ impl Adxlet {
             .environments
             .lock()
             .expect("shared state lock poisoned");
-        if controllers.contains_key(&record.spec.id) {
+        if let Some((_, _, handle)) = controllers.get(&record.spec.id) {
+            if successor {
+                return if handle.view().0 == *record {
+                    Ok(Some(handle.clone()))
+                } else {
+                    Err(Error::Conflict)
+                };
+            }
             // This controller arrived after the basis was captured. Its own next
             // comparison will decide ownership, including accepted creates.
             return Ok(None);
@@ -464,11 +498,26 @@ impl Adxlet {
         if !recover && controller::unstarted(record) {
             return Ok(None);
         }
-        if !recover && record.resources_held {
+        if successor
+            && !matches!(
+                record.state,
+                EnvironmentState::Running | EnvironmentState::Paused
+            )
+        {
+            return Err(Error::Conflict);
+        }
+        if (successor || !recover) && record.resources_held {
+            // An unheld record leaves the tentative reservation with its claim.
             self.adopt_local(&record.spec, &record.assignment)?;
             self.restore_execution(record, &record.runtime.id)?;
         }
-        let handle = self.restore_controller(record, None)?;
+        let handle = if successor {
+            // This inspected successor adopts an existing execution while normal
+            // lifecycle admission is still fenced by the process upgrade.
+            controller::spawn_comparison(record.clone(), self.services.clone())
+        } else {
+            self.restore_controller(record, None)?
+        };
         controllers.insert(
             record.spec.id.clone(),
             (

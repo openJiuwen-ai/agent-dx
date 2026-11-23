@@ -5,7 +5,12 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+use tokio::time::{sleep_until, timeout_at, Instant};
 use tonic::{Code, Status};
+
+const NETWORK_RETRY_WINDOW: Duration = Duration::from_secs(15);
+const NETWORK_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const NETWORK_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -328,7 +333,20 @@ impl Operations {
                 "operation target or arguments changed",
             ));
         }
-        for attempt in 0..2 {
+        let mut network_deadline = if kind == Kind::Network {
+            Some(
+                Instant::now()
+                    .checked_add(clients.config.timeout())
+                    .ok_or_else(|| {
+                        Status::unavailable("network policy RPC timeout is too large")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let mut retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+        let mut retried = false;
+        loop {
             let mut node = pb::node_service_client::NodeServiceClient::new(
                 clients.channel(&owner.node_address).await?,
             );
@@ -398,9 +416,18 @@ impl Operations {
                     Err(error) => Err(error),
                 },
                 Kind::Network => {
+                    let timeout = network_deadline.map_or(clients.config.timeout(), |deadline| {
+                        deadline.saturating_duration_since(Instant::now())
+                    });
+                    if timeout.is_zero() {
+                        return Err(Status::deadline_exceeded(
+                            "network policy RPC deadline exceeded",
+                        ));
+                    }
                     clients
-                        .rpc(
+                        .rpc_with_timeout(
                             "apiserver.update_network_policy",
+                            timeout,
                             node.update_network_policy(trace::inject(
                                 pb::UpdateNetworkPolicyRequest {
                                     assignment,
@@ -534,10 +561,31 @@ impl Operations {
                         self.pending.lock().await.remove(&key);
                         return Err(error);
                     }
-                    if attempt == 1 {
-                        return Err(error);
-                    }
-                    owner = clients.owner(id, caller, true).await?;
+                    owner = if let Some(deadline) = &mut network_deadline {
+                        let now = Instant::now();
+                        if !retried {
+                            *deadline = (*deadline).min(now + NETWORK_RETRY_WINDOW);
+                        }
+                        let next = now + retry_delay;
+                        if next >= *deadline {
+                            return Err(error);
+                        }
+                        retry_delay = (retry_delay * 2).min(NETWORK_RETRY_MAX_DELAY);
+                        match timeout_at(*deadline, async {
+                            sleep_until(next).await;
+                            clients.owner(id, caller, true).await
+                        })
+                        .await
+                        {
+                            Ok(owner) => owner?,
+                            Err(_) => return Err(error),
+                        }
+                    } else {
+                        if retried {
+                            return Err(error);
+                        }
+                        clients.owner(id, caller, true).await?
+                    };
                     if owner
                         .record
                         .as_ref()
@@ -549,10 +597,10 @@ impl Operations {
                             "ownership changed; original operation cannot be replayed",
                         ));
                     }
+                    retried = true;
                 }
             }
         }
-        unreachable!()
     }
 }
 pub fn number(value: &Value, key: &str, default: u64, max: u64) -> Result<u64, Status> {

@@ -3,6 +3,12 @@ use std::io;
 const DEFAULT_NOFILE_SOFT_LIMIT: libc::rlim_t = 65_536;
 const NOFILE_ENV: &str = "ADX_NOFILE_SOFT_LIMIT";
 
+/// Only locally generated environment-parse errors are configuration failures.
+/// OS EINVAL remains a runtime resource error even though its kind is InvalidInput.
+pub fn is_configuration_error(error: &io::Error) -> bool {
+    error.raw_os_error().is_none() && error.kind() == io::ErrorKind::InvalidInput
+}
+
 /// Raise the inherited soft FD limit before resource budgets are calculated.
 /// Lower hard limits are respected, and an already higher soft limit is never
 /// reduced.
@@ -15,7 +21,12 @@ pub fn raise_nofile_soft_limit_from_env() -> io::Result<libc::rlim_t> {
             )
         })?,
         Err(std::env::VarError::NotPresent) => DEFAULT_NOFILE_SOFT_LIMIT,
-        Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid FD limit environment",
+            ))
+        }
     };
 
     let mut limit = libc::rlimit {
@@ -37,4 +48,20 @@ pub fn raise_nofile_soft_limit_from_env() -> io::Result<libc::rlim_t> {
         }
     }
     Ok(limit.rlim_cur)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn os_invalid_input_is_not_environment_syntax() {
+        assert!(!is_configuration_error(&io::Error::from_raw_os_error(
+            libc::EINVAL
+        )));
+        assert!(is_configuration_error(&io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid FD limit"
+        )));
+    }
 }

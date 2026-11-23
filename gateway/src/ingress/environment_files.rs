@@ -24,6 +24,10 @@ use tokio::sync::{broadcast, OnceCell};
 use tokio::time::Instant;
 
 const MAX_READ_BYTES: usize = 64 * 1024;
+const DIRECTORY_TIMEOUT: Duration = Duration::from_secs(30);
+const DIRECTORY_RETRY_WINDOW: Duration = Duration::from_secs(1);
+const DIRECTORY_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(50), Duration::from_millis(150)];
 
 /// Deliberately excludes upstream text, file contents and runtime credentials.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -40,6 +44,14 @@ pub enum ReadError {
     NotFound,
     #[error("Environment runtime unavailable")]
     Runtime,
+    #[error("Environment directory transport failed")]
+    DirectoryTransport,
+    #[error("Environment directory returned HTTP {0}")]
+    DirectoryStatus(StatusCode),
+    #[error("Environment directory reports a pending or starting execution")]
+    DirectoryStarting,
+    #[error("Environment directory reports an ineligible execution")]
+    DirectoryState,
     #[error("Environment runtime route unavailable")]
     Route,
     #[error("Environment route revoked")]
@@ -184,7 +196,7 @@ impl HttpDirectory {
         }
         let mut builder = reqwest::Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(30))
+            .timeout(DIRECTORY_TIMEOUT)
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none());
         if let Some(path) = config.ca_file {
@@ -199,7 +211,57 @@ impl HttpDirectory {
             keys,
         })
     }
+
+    async fn authorize_once(
+        &self,
+        url: url::Url,
+        key: &str,
+        environment_id: &str,
+    ) -> Result<(), ReadError> {
+        let mut headers = http::HeaderMap::new();
+        adx_observability::trace::inject_headers(&mut headers);
+        let mut response = self
+            .client
+            .get(url)
+            .headers(headers)
+            .bearer_auth(key)
+            .send()
+            .await
+            .map_err(|_| ReadError::DirectoryTransport)?;
+        match response.status() {
+            StatusCode::OK => (),
+            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => return Err(ReadError::NotFound),
+            status => return Err(ReadError::DirectoryStatus(status)),
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| ReadError::DirectoryTransport)?
+        {
+            if chunk.len() > MAX_READ_BYTES.saturating_sub(bytes.len()) {
+                return Err(ReadError::TooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        // The existing filtered API returns a one-element array, not an object.
+        let instances: Vec<Value> =
+            serde_json::from_slice(&bytes).map_err(|_| ReadError::Protocol)?;
+        let [value] = instances.as_slice() else {
+            return Err(ReadError::Protocol);
+        };
+        if value["id"].as_str() != Some(environment_id) {
+            return Err(ReadError::Protocol);
+        }
+        match value["status"].as_str() {
+            Some("running" | "pausing" | "paused" | "resuming") => Ok(()),
+            Some("pending" | "starting") => Err(ReadError::DirectoryStarting),
+            Some(_) => Err(ReadError::DirectoryState),
+            None => Err(ReadError::Protocol),
+        }
+    }
 }
+
 #[async_trait::async_trait]
 impl EnvironmentDirectory for HttpDirectory {
     async fn authorize(&self, tenant: &str, environment_id: &str) -> Result<(), ReadError> {
@@ -213,40 +275,32 @@ impl EnvironmentDirectory for HttpDirectory {
             .map_err(|_| ReadError::Runtime)?;
         url.query_pairs_mut()
             .append_pair("instance_id", environment_id);
-        let mut response = self
-            .client
-            .get(url)
-            .bearer_auth(key)
-            .send()
-            .await
-            .map_err(|_| ReadError::Runtime)?;
-        match response.status().as_u16() {
-            200 => (),
-            403 | 404 => return Err(ReadError::NotFound),
-            _ => return Err(ReadError::Runtime),
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| ReadError::Runtime)? {
-            if chunk.len() > MAX_READ_BYTES.saturating_sub(bytes.len()) {
-                return Err(ReadError::TooLarge);
+        let deadline = Instant::now() + DIRECTORY_TIMEOUT;
+        let mut result = self.authorize_once(url.clone(), key, environment_id).await;
+        let retry_deadline = deadline.min(Instant::now() + DIRECTORY_RETRY_WINDOW);
+        // Directory reads happen before Execd admission. Retrying them never replays the operation.
+        for delay in DIRECTORY_RETRY_DELAYS {
+            if !matches!(
+                &result,
+                Err(ReadError::DirectoryTransport | ReadError::DirectoryStarting)
+                    | Err(ReadError::DirectoryStatus(
+                        StatusCode::BAD_GATEWAY
+                            | StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::GATEWAY_TIMEOUT
+                    ))
+            ) {
+                break;
             }
-            bytes.extend_from_slice(&chunk);
+            let retry = async {
+                tokio::time::sleep(delay).await;
+                self.authorize_once(url.clone(), key, environment_id).await
+            };
+            match tokio::time::timeout_at(retry_deadline, retry).await {
+                Ok(outcome) => result = outcome,
+                Err(_) => break,
+            }
         }
-        // The existing filtered API returns a one-element array, not an object.
-        let instances: Vec<Value> =
-            serde_json::from_slice(&bytes).map_err(|_| ReadError::Protocol)?;
-        let [value] = instances.as_slice() else {
-            return Err(ReadError::Runtime);
-        };
-        if value["id"].as_str() != Some(environment_id)
-            || !matches!(
-                value["status"].as_str(),
-                Some("running" | "pausing" | "paused" | "resuming")
-            )
-        {
-            return Err(ReadError::Runtime);
-        }
-        Ok(())
+        result
     }
 }
 
@@ -596,4 +650,91 @@ fn absolute_path(path: &str) -> Result<String, ReadError> {
             .collect::<Vec<_>>()
             .join("/")
     ))
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+    use axum::routing::get;
+    use axum::Router;
+    use std::sync::atomic::AtomicUsize;
+
+    const RUNNING: &str = r#"[{"id":"env-a","status":"running"}]"#;
+    const STARTING: &str = r#"[{"id":"env-a","status":"starting"}]"#;
+
+    async fn scripted_directory(
+        responses: Vec<(StatusCode, &'static str)>,
+    ) -> (HttpDirectory, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let app = Router::new().route(
+            "/api/instances",
+            get(move || {
+                let index = handler_calls.fetch_add(1, Ordering::Relaxed);
+                let response = responses
+                    .get(index)
+                    .copied()
+                    .unwrap_or((StatusCode::OK, RUNNING));
+                async move { response }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory = HttpDirectory::new(
+            DirectoryConfig {
+                url,
+                allow_http: true,
+                ca_file: None,
+            },
+            BTreeMap::from([("tenant-a".into(), "test-key".into())]),
+        )
+        .unwrap();
+        (directory, calls, server)
+    }
+
+    #[tokio::test]
+    async fn directory_retries_unavailable_and_starting_owner_before_authorizing() {
+        let (directory, calls, server) = scripted_directory(vec![
+            (StatusCode::SERVICE_UNAVAILABLE, ""),
+            (StatusCode::OK, STARTING),
+            (StatusCode::OK, RUNNING),
+        ])
+        .await;
+        let result = directory.authorize("tenant-a", "env-a").await;
+        server.abort();
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn directory_persists_denial_and_rejects_mismatched_identity_without_retry() {
+        for response in [
+            (StatusCode::FORBIDDEN, ""),
+            (StatusCode::NOT_FOUND, ""),
+            (
+                StatusCode::OK,
+                r#"[{"id":"another-env","status":"running"}]"#,
+            ),
+        ] {
+            let (directory, calls, server) = scripted_directory(vec![response]).await;
+            let result = directory.authorize("tenant-a", "env-a").await;
+            server.abort();
+
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_stops_after_three_transient_failures() {
+        let (directory, calls, server) =
+            scripted_directory(vec![(StatusCode::BAD_GATEWAY, ""); 3]).await;
+        let result = directory.authorize("tenant-a", "env-a").await;
+        server.abort();
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
 }

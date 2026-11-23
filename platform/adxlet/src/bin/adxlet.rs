@@ -235,6 +235,45 @@ async fn sample_capabilities(
     )
 }
 
+async fn successor_bootstrap(
+    parent: libc::pid_t,
+) -> Result<Option<adx_protocol::process_bootstrap::ProcessBootstrap>, Box<dyn std::error::Error>> {
+    use tokio::io::AsyncReadExt;
+    let Some(path) = std::env::var_os("ADX_SUPERVISOR_PROCESS_BOOTSTRAP_SOCKET") else {
+        return Ok(None);
+    };
+    let socket = tokio::net::UnixStream::connect(PathBuf::from(path)).await?;
+    let peer = socket.peer_cred()?;
+    // SAFETY: geteuid takes no pointers and only reads the kernel's effective user identity.
+    let uid = unsafe { libc::geteuid() };
+    // SAFETY: getppid takes no pointers and only reads the kernel's current parent identity.
+    let current_parent = unsafe { libc::getppid() };
+    if !adx_process::launch_parent_matches(parent, current_parent, peer.pid()) || peer.uid() != uid
+    {
+        return Err("bootstrap must be served by launch parent".into());
+    }
+    let mut bytes = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        socket.take(4097).read_to_end(&mut bytes),
+    )
+    .await??;
+    if bytes.len() > 4096 {
+        return Err("bootstrap identity too large".into());
+    }
+    let bootstrap: adx_protocol::process_bootstrap::ProcessBootstrap =
+        serde_json::from_slice(&bytes)?;
+    if bootstrap.owner.epoch == 0
+        || bootstrap.owner.node_id.is_empty()
+        || bootstrap.owner.local_task_id.is_empty()
+        || bootstrap.node_session.is_empty()
+        || bootstrap.deadline_unix_millis <= adx_core::observation::now_millis()?
+    {
+        return Err("invalid or expired handoff bootstrap".into());
+    }
+    Ok(Some(bootstrap))
+}
+
 fn coordinator_channel(
     transport: &RpcClient,
     address: &str,
@@ -251,55 +290,159 @@ fn coordinator_channel(
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config: Config = read_config()?;
-    let mut preserve =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
-    if let Some(baseline) = &config.network_baseline {
-        baseline.validate()?;
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            let configuration = error.is::<adx_process::ConfigurationError>();
+            eprintln!("Adxlet initialization failed: {error}");
+            std::process::ExitCode::from(if configuration {
+                adx_process::CONFIGURATION_EXIT_CODE
+            } else {
+                1
+            })
+        }
     }
-    adxlet::network_baseline::validate_peer_aliases(&config.network_peer_aliases)?;
+}
+
+fn validate_config(
+    config: &Config,
+) -> Result<(ResourceSource, Option<PressureGate>), adx_process::ConfigurationError> {
+    use adx_process::ConfigurationError;
+    if let Some(baseline) = &config.network_baseline {
+        baseline
+            .validate()
+            .map_err(|_| ConfigurationError("invalid network baseline configuration"))?;
+    }
+    adxlet::network_baseline::validate_peer_aliases(&config.network_peer_aliases)
+        .map_err(|_| ConfigurationError("invalid network peer aliases"))?;
     if config
         .platform_ingress_sources
         .as_ref()
         .is_some_and(|sources| sources.is_empty())
     {
-        return Err("platform_ingress_sources must not be empty".into());
+        return Err(ConfigurationError(
+            "platform_ingress_sources must not be empty",
+        ));
     }
     if config.sandboxd_socket.is_none() && config.jiuwenbox.is_none() {
-        return Err("configure sandboxd_socket and/or jiuwenbox".into());
+        return Err(ConfigurationError(
+            "configure sandboxd_socket and/or jiuwenbox",
+        ));
     }
     if config.runtime_control.is_none() {
-        return Err("runtime_control is required for event-driven lifecycle observations".into());
+        return Err(ConfigurationError(
+            "runtime_control is required for event-driven lifecycle observations",
+        ));
     }
     for mount in config.storage_mounts.values() {
-        mount.validate()?;
+        mount
+            .validate()
+            .map_err(|_| ConfigurationError("invalid storage mount configuration"))?;
     }
-    let mut sandboxd_health = observations::SandboxdHealth::new(
-        config.sandboxd_health_failure_threshold,
-        Duration::from_secs(config.sandboxd_health_failure_seconds),
-    )?;
-    let runtime_logs = RuntimeLogs::new(config.runtime_logs.clone())?;
-    // Embedded Proxy and Adxlet share this process-wide subscriber and
-    // tracer provider; standalone Proxy initializes the same library itself.
-    let _logging_guard = adx_observability::logging::init("adxlet", false)?;
+    config
+        .runtime_logs
+        .validate()
+        .map_err(|_| ConfigurationError("invalid runtime log policy"))?;
     if config.node_id.is_empty()
         || config.report_interval_seconds == 0
         || config.metrics_interval_seconds == 0
         || config.rpc_timeout_seconds == 0
         || config.runtime_ready_timeout_seconds == 0
     {
-        return Err("node identity and positive intervals required".into());
+        return Err(ConfigurationError(
+            "node identity and positive intervals required",
+        ));
+    }
+    if !matches!(
+        (&config.coordinator_address, &config.discovery),
+        (Some(_), None) | (None, Some(_))
+    ) {
+        return Err(ConfigurationError(
+            "configure exactly one of coordinator_address and discovery",
+        ));
+    }
+    if config.checkpoint_dir.is_some() && config.checkpoint_storage.is_some() {
+        return Err(ConfigurationError(
+            "checkpoint_dir and checkpoint_storage are mutually exclusive",
+        ));
+    }
+    if config.checkpoint_dir.is_none()
+        && config.checkpoint_storage.is_none()
+        && config
+            .execd_env
+            .get("ADX_EXECD_CONTROL_SOCKET_PATH")
+            .is_some_and(|value| !value.is_empty())
+    {
+        return Err(ConfigurationError(
+            "checkpoint socket requires checkpoint storage",
+        ));
     }
     let source = match (config.capacity_file.clone(), config.resource_source.clone()) {
         (Some(path), None) => ResourceSource::File { path },
         (None, Some(source)) => source,
-        _ => return Err("configure exactly one of capacity_file and resource_source".into()),
+        _ => {
+            return Err(ConfigurationError(
+                "configure exactly one of capacity_file and resource_source",
+            ))
+        }
     };
-    let mut pressure_gate = match &config.pressure {
-        Some(pressure) => pressure.gate()?,
+    let gate = match &config.pressure {
+        Some(pressure) => pressure
+            .gate()
+            .map_err(|_| ConfigurationError("invalid pressure thresholds"))?,
         None => None,
     };
+    Ok((source, gate))
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Capture before discovery/reconciliation can wait or the parent can exit.
+    // SAFETY: getppid has no pointer arguments or side effects.
+    let launch_parent_pid = unsafe { libc::getppid() };
+    let config: Config = read_config()?;
+    let (source, mut pressure_gate) = validate_config(&config)?;
+    let mut sandboxd_health = observations::SandboxdHealth::new(
+        config.sandboxd_health_failure_threshold,
+        Duration::from_secs(config.sandboxd_health_failure_seconds),
+    )
+    .map_err(|_| adx_process::ConfigurationError("invalid sandboxd health thresholds"))?;
+    let embedded_relay_config = if config.proxy_mode == adxlet::proxy::ProxyMode::Embedded {
+        adx_process::resource::raise_nofile_soft_limit_from_env().map_err(
+            |error| -> Box<dyn std::error::Error> {
+                if adx_process::resource::is_configuration_error(&error) {
+                    adx_process::ConfigurationError("invalid embedded Relay FD limit configuration")
+                        .into()
+                } else {
+                    error.into()
+                }
+            },
+        )?;
+        Some(data_plane_gateway::config::RelayConfig::from_env().map_err(
+            |error| -> Box<dyn std::error::Error> {
+                if error.is_configuration_error() {
+                    adx_process::ConfigurationError(
+                        "invalid embedded Relay environment configuration",
+                    )
+                    .into()
+                } else {
+                    error.into()
+                }
+            },
+        )?)
+    } else {
+        None
+    };
+    let successor = successor_bootstrap(launch_parent_pid).await?;
+    if successor.is_some() && config.proxy_mode != adxlet::proxy::ProxyMode::Standalone {
+        return Err("process successor requires standalone Relay".into());
+    }
+    let mut preserve =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    let runtime_logs = RuntimeLogs::new(config.runtime_logs.clone())?;
+    // Embedded Proxy and Adxlet share this process-wide subscriber and
+    // tracer provider; standalone Proxy initializes the same library itself.
+    let _logging_guard = adx_observability::logging::init("adxlet", false)?;
     let (server_tls, client_tls, peers) = config
         .tls
         .load_rpc(adx_protocol::auth::Principal::Node(config.node_id.clone()))?;
@@ -334,7 +477,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let channel = coordinator_channel(&client_tls, &endpoint, timeout)?;
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = successor
+        .as_ref()
+        .map(|bootstrap| bootstrap.node_session.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if successor
+        .as_ref()
+        .is_some_and(|bootstrap| bootstrap.owner.node_id != config.node_id)
+    {
+        return Err("handoff owner node differs from configuration".into());
+    }
     // Leave part of the operation deadline for a durable fallback after RPC timeout.
     let commit_timeout = if config.degradation_journal.is_some() {
         timeout / 2
@@ -436,11 +588,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeout,
         timeout,
     )?;
+    // Only the route client follows a supervisor-selected generation. Stable
+    // upgrade-control, activity and admin anchors remain in the original config.
+    let route_target = std::env::var_os("ADX_SUPERVISOR_ACTIVE_RELAY_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.proxy_socket.clone());
+    let routes = Arc::new(UdsRoutes::new(route_target, timeout)?);
     let mut manager = Adxlet::new(
         config.node_id.clone(),
         runtime.clone(),
         Arc::new(readiness),
-        Arc::new(UdsRoutes::new(config.proxy_socket.clone(), timeout)?),
+        routes.clone(),
         state_sink,
     )
     .with_runtime_control(control.clone())?
@@ -470,7 +628,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager.mark_pressure_configured(pressure.resources());
     }
     let manager = Arc::new(manager);
-    if std::env::var("ADX_NODE_UPGRADE_ISOLATED").as_deref() == Ok("true") {
+    if successor.is_some() || std::env::var("ADX_NODE_UPGRADE_ISOLATED").as_deref() == Ok("true") {
         manager.isolate_upgrade_bootstrap()?;
     }
     manager.pause_lifecycle().await;
@@ -489,10 +647,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     manager.update_capacity(o.capacity, valid)?;
     manager.update_devices(o.devices.clone(), valid)?;
     let embedded = if config.proxy_mode == adxlet::proxy::ProxyMode::Embedded {
-        adx_process::resource::raise_nofile_soft_limit_from_env()?;
         Some(
             adxlet::proxy::EmbeddedProxy::start(
-                data_plane_gateway::config::RelayConfig::from_env()?,
+                embedded_relay_config.ok_or("embedded Relay configuration missing")?,
                 &config.proxy_socket,
             )
             .await?,
@@ -541,13 +698,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bind before registration so dispatch cannot race an unbound address.
     let node_rpc = NodeRpc::new(manager.clone(), peers, session_id.clone())
         .with_local_creation((*sink).clone());
+    let successor_ready = std::sync::atomic::AtomicBool::new(successor.is_none());
     let claim_retries = async {
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            node_rpc.retry_local_claims().await;
+            if successor_ready.load(std::sync::atomic::Ordering::Acquire)
+                && !manager.process_sealing()
+            {
+                node_rpc.retry_local_claims().await;
+            }
         }
     };
     let mut builder = tonic::transport::Server::builder();
@@ -560,9 +722,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener));
     tokio::pin!(server);
+    let process_channel = coordinator_channel(&client_tls, &endpoint, timeout)?;
+    let (process_channels, current_process_channel) =
+        tokio::sync::watch::channel(process_channel.clone());
     let admin = async {
+        while !successor_ready.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         if let Some(path) = &config.admin_socket {
-            adxlet::admin::serve(manager.clone(), path).await?;
+            adxlet::admin::serve_with_handoff(
+                manager.clone(),
+                path,
+                routes.clone(),
+                config.proxy_mode,
+                launch_parent_pid,
+                current_process_channel.clone(),
+            )
+            .await?;
         } else {
             std::future::pending::<()>().await;
         }
@@ -664,12 +840,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut last = registration.clone();
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
+        let mut maintenance_completed = successor.is_none();
+        let successor_deadline = match &successor {
+            Some(bootstrap) => Some(
+                tokio::time::Instant::now()
+                    + Duration::from_millis(
+                        bootstrap
+                            .deadline_unix_millis
+                            .saturating_sub(adx_core::observation::now_millis()?),
+                    ),
+            ),
+            None => None,
+        };
         loop {
             manager.wait_for_reconciliation(&mut interval).await;
             if let Some(discovery) = &discovery {
                 match discovery.lookup().await {
                     Ok(found) if found.address != endpoint => {
                         let channel = coordinator_channel(&client_tls, &found.address, timeout)?;
+                        process_channels.send_replace(channel.clone());
                         sink.reconnect(channel.clone())?;
                         coordinator =
                             pb::coordinator_service_client::CoordinatorServiceClient::new(channel);
@@ -681,6 +870,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Read only published values; no resource observation is awaited here.
             latest.borrow().apply(&mut last);
+            if !maintenance_completed {
+                if let Some(bootstrap) = &successor {
+                    let identity = adx_protocol::relay::AdxletProcessRequest {
+                        rollout_id: bootstrap.owner.rollout_id.clone(),
+                        local_task_id: bootstrap.owner.local_task_id.clone(),
+                        epoch: bootstrap.owner.epoch,
+                        ..Default::default()
+                    };
+                    if !successor_ready.load(std::sync::atomic::Ordering::Acquire)
+                        && adx_core::observation::now_millis()? >= bootstrap.deadline_unix_millis
+                    {
+                        continue;
+                    }
+                    let query = pb::MaintenanceReleaseRequest {
+                        owner: Some(bootstrap.owner.clone()),
+                        node_session: last.session_id.clone(),
+                    };
+                    let channel = current_process_channel.borrow().clone();
+                    let result = tokio::time::timeout(
+                        timeout,
+                        pb::node_handoff_service_client::NodeHandoffServiceClient::new(channel)
+                            .query_release(query),
+                    )
+                    .await;
+                    if successor_ready.load(std::sync::atomic::Ordering::Acquire) {
+                        if let Ok(Ok(response)) = result {
+                            let receipt = response.into_inner();
+                            if receipt.owner.as_ref() == Some(&bootstrap.owner)
+                                && manager
+                                    .complete_successor_maintenance(&identity, &receipt)
+                                    .await
+                                    .is_ok()
+                            {
+                                maintenance_completed = true;
+                                // Do not reuse this period's pre-release capacity report.
+                                continue;
+                            }
+                        }
+                    }
+                    let cycle_deadline =
+                        if successor_ready.load(std::sync::atomic::Ordering::Acquire) {
+                            tokio::time::Instant::now() + timeout
+                        } else {
+                            successor_deadline.ok_or("successor deadline absent")?
+                        };
+                    match tokio::time::timeout_at(
+                        cycle_deadline,
+                        adxlet::node_reconciliation::reconcile_successor(
+                            &mut coordinator,
+                            &mut last,
+                            &manager,
+                            &routes,
+                            &identity,
+                            timeout,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            successor_ready.store(true, std::sync::atomic::Ordering::Release)
+                        }
+                        Ok(Err(error)) => {
+                            adx_observability::warn!(
+                                node_id = %last.node_id,
+                                node_session = %last.session_id,
+                                rollout = %identity.rollout_id,
+                                local_task = %identity.local_task_id,
+                                epoch = identity.epoch,
+                                %error,
+                                "protected successor handshake will retry"
+                            );
+                        }
+                        Err(_) => {
+                            adx_observability::warn!("protected successor observation timed out; retaining handshake state");
+                        }
+                    }
+                    continue;
+                }
+            }
+            if manager.process_sealing() {
+                last.accepting_allocations = false;
+                last.heartbeat_sequence = last
+                    .heartbeat_sequence
+                    .checked_add(1)
+                    .ok_or("heartbeat sequence exhausted")?;
+                if let Err(error) = coordinator.register_node(last.clone()).await {
+                    adx_observability::warn!(%error, "sealed node heartbeat unavailable");
+                }
+                continue;
+            }
             // Startup and every reporting period use the same complete authority
             // cycle for every configured runtime. The cycle publishes readiness
             // immediately after success, before waiting for the next report tick.
@@ -717,6 +996,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            if !successor_ready.load(std::sync::atomic::Ordering::Acquire)
+                || manager.process_sealing()
+            {
+                continue;
+            }
             if let Err(error) = manager.sample_metrics().await {
                 adx_observability::warn!("environment observation incomplete: {error}");
             }
@@ -728,6 +1012,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            if !successor_ready.load(std::sync::atomic::Ordering::Acquire)
+                || manager.process_sealing()
+            {
+                continue;
+            }
             let Some(active) = manager.retained_runtime_ids() else {
                 continue;
             };

@@ -230,6 +230,12 @@ uses the same timeout code with `outcome=unknown` / `retry=same_operation`;
 disconnections and lost replies retain `OUTCOME_UNKNOWN`. User commands use the
 separate EXECD HTTP data path.
 
+Network policy replacement retries transient node RPC failures for up to 15 seconds
+from the first retryable error, within the original API Server RPC deadline.
+The API Server waits 250 ms, 500 ms, then up to one second between retries. It
+refreshes ownership before replaying the same operation ID and expected revision,
+and stops if the assignment changes. The success response still requires publication.
+
 For snapshot creation, omitted/zero resource values inherit the source. Positive CPU/memory/disk values must equal its resource geometry; restoring with larger limits or resizing is rejected. This applies to the new Rust resolver even though the HTTP handler can encode positive overrides.
 
 Public resume and authenticated Ingress demand call Coordinator EnsureRunning. It persists one intent, prefers original-node admission, and transfers a shared checkpoint only after definitive NoCapacity or owner invalidation. An ambiguous RPC retains the owner. Paused objects stay dormant on node loss. `failover=true` enables same-node recovery from the latest unexpired checkpoint after an unexpected backend exit; no checkpoint means Failed and no cold start. Reload explicitly replaces a Running backend from that same latest recovery point.

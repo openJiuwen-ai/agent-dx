@@ -149,6 +149,15 @@ impl RuntimeDriver for Backend {
             failure: self.observed_failure.lock().unwrap().clone(),
         })
     }
+    async fn set_network_policy(
+        &self,
+        _: &str,
+        _: Option<&adx_core::execution::NetworkPolicy>,
+        _: &[u16],
+        _: Option<u16>,
+    ) -> Result<()> {
+        Ok(())
+    }
     async fn remove(&self, id: &str) -> Result<()> {
         self.event("remove");
         if *self.fail_remove.lock().unwrap() {

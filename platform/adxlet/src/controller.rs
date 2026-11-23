@@ -62,6 +62,8 @@ pub(super) fn protects_execution(record: &EnvironmentRecord, runtime_id: &str) -
 }
 
 enum Command {
+    PrepareSuccessor,
+    ReleaseSuccessor(String),
     RunControl(oneshot::Sender<Result<adx_core::environment_control::EnvironmentControlRecord>>),
     RunTimeout(
         u64,
@@ -99,6 +101,7 @@ enum Command {
         Vec<adx_core::CheckpointArtifact>,
         oneshot::Sender<Result<bool>>,
     ),
+    Seal,
     CheckAuthority(
         Box<AuthorityCheck>,
         oneshot::Sender<Result<AuthorityResult>>,
@@ -409,6 +412,15 @@ impl EnvironmentHandle {
     pub async fn sync(&self) -> Result<OperationResult> {
         self.send(Command::Sync).await
     }
+    pub(crate) async fn seal(&self) -> Result<OperationResult> {
+        self.send(Command::Seal).await
+    }
+    pub(crate) async fn release_successor(&self, session: &str) -> Result<OperationResult> {
+        self.send(Command::ReleaseSuccessor(session.into())).await
+    }
+    pub(crate) async fn prepare_successor(&self) -> Result<OperationResult> {
+        self.send(Command::PrepareSuccessor).await
+    }
 }
 
 pub(crate) fn spawn(
@@ -533,15 +545,70 @@ fn spawn_controller(
         let mut observers = events::Observers::default();
         let mut commands_open = true;
         let mut deletes_open = true;
+        let mut sealed = false;
+        let mut seal_receipt: Option<OperationResult> = None;
+        let mut successor_prepared: Option<EnvironmentRecord> = None;
+        let mut successor_release: Option<String> = None;
         loop {
+            if sealed {
+                // Keep Controller and RestoreAccess pins alive without timers,
+                // backend observers, deletion or authority side effects.
+                let envelope = tokio::select! {
+                    command = rx.recv(), if commands_open => {
+                        if command.is_none() {
+                            commands_open = false;
+                        }
+                        command
+                    },
+                    command = delete_rx.recv(), if deletes_open => {
+                        if command.is_none() {
+                            deletes_open = false;
+                        }
+                        command
+                    },
+                    else => std::future::pending::<Option<Envelope>>().await,
+                };
+                let Some(envelope) = envelope else {
+                    continue;
+                };
+                if matches!(&envelope.command, Command::Delete) {
+                    controller.submissions.reject_delete();
+                }
+                let result = if matches!(&envelope.command, Command::Seal) {
+                    if let Some(receipt) = &seal_receipt {
+                        Ok(receipt.clone())
+                    } else if controller.services.upgrade.process_remaining().is_ok() {
+                        let result = controller.seal_published().await;
+                        if let Ok(receipt) = &result {
+                            seal_receipt = Some(receipt.clone());
+                        }
+                        result
+                    } else {
+                        Err(Error::Conflict)
+                    }
+                } else {
+                    Err(Error::Conflict)
+                };
+                let _ = envelope.reply.send(result);
+                continue;
+            }
             if !commands_open && !deletes_open {
                 break;
             }
             controller.publish_view();
             observers.refresh(&mut controller);
             controller.reconcile_run_timer();
-            let run_deadline = controller.run_deadline();
-            let deadline = controller.lifecycle_deadline();
+            let successor_pending = successor_prepared.is_some() && successor_release.is_none();
+            let run_deadline = if successor_pending {
+                None
+            } else {
+                controller.run_deadline()
+            };
+            let deadline = if successor_pending {
+                None
+            } else {
+                controller.lifecycle_deadline()
+            };
             let record = controller.record.clone();
             let routes = controller.services.routes.clone();
             let proxy_stamp = controller.proxy_stamp();
@@ -694,6 +761,121 @@ fn spawn_controller(
                 reply,
                 trace,
             } = envelope;
+            if matches!(&command, Command::PrepareSuccessor) {
+                let result = async {
+                    if successor_prepared.as_ref() == Some(&controller.record) {
+                        return Ok(OperationResult {
+                            record: controller.record.clone(),
+                            durability: Durability::Published,
+                            newly_created: false,
+                        });
+                    }
+                    if !controller.authority_fenced || controller.retired {
+                        return Err(Error::Conflict);
+                    }
+                    let mut recovery_files = None;
+                    let mut execution_files = Vec::new();
+                    if let Some(cp) = &controller.record.checkpoint {
+                        let services = controller
+                            .services
+                            .checkpoint
+                            .as_ref()
+                            .ok_or(Error::Conflict)?;
+                        recovery_files = Some(ExecutionInput {
+                            artifact: cp.artifact.clone(),
+                            files: services.store.prepare_restore(&cp.artifact).await?,
+                        });
+                    } else if controller.record.state == EnvironmentState::Paused {
+                        return Err(Error::Conflict);
+                    }
+                    for artifact in &controller.record.execution_artifacts {
+                        let services = controller
+                            .services
+                            .checkpoint
+                            .as_ref()
+                            .ok_or(Error::Conflict)?;
+                        execution_files.push(ExecutionInput {
+                            artifact: artifact.clone(),
+                            files: services.store.prepare_restore(artifact).await?,
+                        });
+                    }
+                    controller.recovery_files = recovery_files;
+                    controller.execution_files = execution_files;
+                    successor_prepared = Some(controller.record.clone());
+                    Ok(OperationResult {
+                        record: controller.record.clone(),
+                        durability: Durability::Published,
+                        newly_created: false,
+                    })
+                }
+                .await;
+                let _ = reply.send(result);
+                continue;
+            }
+            if let Command::ReleaseSuccessor(session) = &command {
+                let result = if (controller.authority_fenced || successor_release.is_some())
+                    && !controller.retired
+                    && successor_release
+                        .as_ref()
+                        .is_none_or(|previous| previous == session)
+                    && session == controller.services.upgrade.session()
+                    && successor_prepared.as_ref().is_some_and(|prepared| {
+                        prepared.assignment == controller.record.assignment
+                            && prepared.runtime.id == controller.record.runtime.id
+                            && prepared.spec.id == controller.record.spec.id
+                    })
+                    && matches!(
+                        controller.record.state,
+                        EnvironmentState::Running | EnvironmentState::Paused
+                    ) {
+                    successor_release = Some(session.clone());
+                    controller.authority_fenced = false;
+                    controller.publish_view();
+                    Ok(OperationResult {
+                        record: controller.record.clone(),
+                        durability: Durability::Published,
+                        newly_created: false,
+                    })
+                } else {
+                    Err(Error::Conflict)
+                };
+                let _ = reply.send(result);
+                continue;
+            }
+            if successor_prepared.is_some() && successor_release.is_none() {
+                // Even internal authority/cleanup commands cannot release a
+                // prepared successor before its durable-ready notification.
+                match command {
+                    Command::Delete => controller.submissions.reject_delete(),
+                    Command::CheckAuthority(_, ack) => {
+                        let _ = ack.send(Err(Error::Conflict));
+                    }
+                    Command::Fence(ack)
+                    | Command::ReapOrphan(_, ack)
+                    | Command::RuntimeEvent(_, ack) => {
+                        let _ = ack.send(Err(Error::Conflict));
+                    }
+                    Command::PrepareRecovery(_, ack) => {
+                        let _ = ack.send(Err(Error::Conflict));
+                    }
+                    Command::Tick(ack) | Command::Expire(_, ack) => {
+                        let _ = ack.send(Err(Error::Conflict));
+                    }
+                    _ => (),
+                }
+                let _ = reply.send(Err(Error::Conflict));
+                continue;
+            }
+            if matches!(&command, Command::Seal) {
+                let result = controller.seal_published().await;
+                if let Ok(receipt) = &result {
+                    seal_receipt = Some(receipt.clone());
+                }
+                // Even an unknown publication outcome is a one-way park.
+                sealed = true;
+                let _ = reply.send(result);
+                continue;
+            }
             let trace = match &command {
                 Command::CheckAuthority(check, _) => controller.authority_trace(check),
                 _ => trace,
@@ -746,6 +928,28 @@ fn spawn_controller(
 }
 
 impl Controller {
+    async fn seal_published(&mut self) -> Result<OperationResult> {
+        if self.capture_preparation.is_some()
+            || self.snapshot_publication.is_some()
+            || self.intent_retry.is_some()
+            || self.events.seal_pending()
+            || !self.obsolete_checkpoints.is_empty()
+            || self.record.restart_pending
+            || self.retired
+            || self.authority_fenced
+            || !matches!(
+                self.record.state,
+                EnvironmentState::Running | EnvironmentState::Paused
+            )
+        {
+            return Err(Error::Conflict);
+        }
+        let result = self.sync().await?;
+        if result.durability != Durability::Published || result.record != self.record {
+            return Err(Error::Conflict);
+        }
+        Ok(result)
+    }
     async fn dispatch(&mut self, command: Command, reply: Reply) {
         let command = match command {
             Command::Fence(ack) => {
@@ -979,6 +1183,9 @@ impl Controller {
             Command::DeleteAt(_) => "delete_expired",
             Command::CollectFailed(_) => "collect_failed",
             Command::Sync => "sync",
+            Command::Seal => "seal",
+            Command::ReleaseSuccessor(_) => "release_successor",
+            Command::PrepareSuccessor => "prepare_successor",
             _ => unreachable!(),
         };
         if matches!(&command, Command::Delete) {
@@ -1067,6 +1274,9 @@ impl Controller {
                 }
             }
             Command::Sync => self.sync().await,
+            Command::Seal => Err(Error::Conflict),
+            Command::ReleaseSuccessor(_) => Err(Error::Conflict),
+            Command::PrepareSuccessor => Err(Error::Conflict),
         };
         if let Err(error) = &result {
             adx_observability::trace::error();

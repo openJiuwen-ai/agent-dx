@@ -6,6 +6,34 @@ use pb::claim_environment_response::Outcome;
 
 impl State {
     pub(super) async fn recover_authoritative_state(&mut self) -> Result<()> {
+        // Do not let an inspection-ready cache retain authority revoked by a
+        // durable process fence. Preparation with the original token stays live.
+        let sessions: Vec<_> = self
+            .live
+            .iter()
+            .map(|(id, live)| (id.clone(), live.session.clone()))
+            .collect();
+        let mut process_fenced = BTreeSet::new();
+        for (id, session) in sessions {
+            if let Err(error) = self.session.guard_process_registration(&id, &session).await {
+                self.needs_recovery = true;
+                self.live.remove(&id);
+                self.recovering.remove(&id);
+                if let Some(node) = self.nodes.get_mut(&id) {
+                    node.node.available = false;
+                    if let Some(session) = &mut node.session {
+                        session.routable = false;
+                    }
+                    self.scheduler.register(node.node.clone())?;
+                }
+                if matches!(error, Error::Conflict) {
+                    process_fenced.insert((id.clone(), session.clone()));
+                    self.retired_sessions.insert((id, session));
+                } else {
+                    return Err(error);
+                }
+            }
+        }
         if !self.needs_recovery && self.session.inspection_ready().await {
             return Ok(());
         }
@@ -14,6 +42,36 @@ impl State {
         // loading their authoritative outcomes; lifecycle objects are independent.
         self.session.claim_barrier().await?;
         let mut saved = self.session.snapshot().await?;
+        // A revoked process token can leave the durable registration intact.
+        // Do not restore its routable flag merely because it remains in snapshot.
+        for (id, node) in &mut saved.nodes {
+            if let Some(session) = &node.session {
+                if let Err(error) = self
+                    .session
+                    .guard_process_registration(id, &session.id)
+                    .await
+                {
+                    if !matches!(error, Error::Conflict) {
+                        return Err(error);
+                    }
+                    process_fenced.insert((id.clone(), session.id.clone()));
+                    self.live.remove(id);
+                    self.recovering.remove(id);
+                    self.retired_sessions
+                        .insert((id.clone(), session.id.clone()));
+                }
+            }
+            if node
+                .session
+                .as_ref()
+                .is_some_and(|session| process_fenced.contains(&(id.clone(), session.id.clone())))
+            {
+                node.node.available = false;
+                if let Some(session) = &mut node.session {
+                    session.routable = false;
+                }
+            }
+        }
         self.session.refresh_inspection_inventory().await?;
         // Both local and central assignments may already be executing before
         // first-result publication. Preserve them during in-process repair;

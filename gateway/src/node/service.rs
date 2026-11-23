@@ -24,6 +24,20 @@ impl RelayService {
     /// Bind every listener before the owner advertises readiness. Bindings start
     /// unavailable and only the Adxlet's complete sync opens admission.
     pub async fn bind(config: RelayConfig) -> Result<Self, ServiceError> {
+        Self::bind_standalone(config, None).await
+    }
+    /// Bind an optional generation-specific control socket without changing the
+    /// activity publisher endpoint. Explicit paths must be new absolute paths;
+    /// their cleanup belongs to the caller after this generation has exited.
+    pub async fn bind_standalone(
+        config: RelayConfig,
+        route_socket: Option<&std::path::Path>,
+    ) -> Result<Self, ServiceError> {
+        if let Some(path) = route_socket {
+            if !path.is_absolute() {
+                return Err("Relay route socket must be an absolute nonempty path".into());
+            }
+        }
         adx_transport::install_crypto_provider();
         let dir = config
             .activity_uds_dir
@@ -44,13 +58,18 @@ impl RelayService {
         };
         let listener = TcpListener::bind(config.bind).await?;
         let health = TcpListener::bind(config.health_bind).await?;
-        let route = bind_route_control(
-            std::path::Path::new(dir)
-                .join("route.sock")
-                .to_str()
-                .ok_or("invalid route path")?,
-        )
-        .await?;
+        let route = match route_socket {
+            Some(path) => super::route_control::bind_generation_route_control(path).await?,
+            None => {
+                bind_route_control(
+                    std::path::Path::new(dir)
+                        .join("route.sock")
+                        .to_str()
+                        .ok_or("invalid route path")?,
+                )
+                .await?
+            }
+        };
         let tracker = Arc::new(ActivityTracker::new(config.gateway_epoch.clone()));
         let gateway = Arc::new(
             Relay::new(GatewayPolicy::new(config.allowed_target_networks.clone()))
@@ -72,9 +91,26 @@ impl RelayService {
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
     }
+    pub fn health_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.health.local_addr()
+    }
     pub async fn serve(
         self,
         shutdown: impl Future<Output = ()> + Send,
+    ) -> Result<(), ServiceError> {
+        self.serve_inner(shutdown, false).await
+    }
+    /// Standalone process lifecycle; embedded owners deliberately use `serve`.
+    pub async fn serve_standalone(
+        self,
+        shutdown: impl Future<Output = ()> + Send,
+    ) -> Result<(), ServiceError> {
+        self.serve_inner(shutdown, true).await
+    }
+    async fn serve_inner(
+        self,
+        shutdown: impl Future<Output = ()> + Send,
+        standalone: bool,
     ) -> Result<(), ServiceError> {
         let Self {
             config,
@@ -87,20 +123,34 @@ impl RelayService {
         } = self;
         let (stop, stopped) = watch::channel(false);
         let mut services = JoinSet::<Result<(), ServiceError>>::new();
-        let route_gateway = gateway.clone();
+        let bindings = Arc::new(super::route_control::BindingService::new(gateway.clone()));
+        let upgrade = standalone.then(|| super::upgrade::UpgradeService::new(bindings.clone()));
+        let mut accepted = upgrade.as_ref().map(|service| service.subscribe());
         let mut route_stop = stopped.clone();
+        let route_upgrade = upgrade.clone();
         services.spawn(async move {
-            super::route_control::serve_route_control_until(route_gateway, route, async move {
+            let shutdown = async move {
                 let _ = route_stop.changed().await;
-            })
-            .await?;
+            };
+            if let Some(route_upgrade) = route_upgrade {
+                super::route_control::serve_standalone_control_until(
+                    bindings,
+                    route_upgrade,
+                    route,
+                    shutdown,
+                )
+                .await?;
+            } else {
+                super::route_control::serve_binding_control_until(bindings, route, shutdown)
+                    .await?;
+            }
             Ok(())
         });
         let health_gateway = gateway.clone();
-        services.spawn(async move {
-            serve_health(health_gateway, health, stopped).await?;
-            Ok(())
-        });
+        let (health_stop, health_stopped) = watch::channel(false);
+        let mut health_task =
+            tokio::spawn(async move { serve_health(health_gateway, health, health_stopped).await });
+        let mut health_joined = false;
         let path = std::path::Path::new(config.activity_uds_dir.as_ref().unwrap())
             .join("adxlet.sock")
             .to_string_lossy()
@@ -113,9 +163,24 @@ impl RelayService {
         let mut connections = JoinSet::new();
         tokio::pin!(shutdown);
         tracing::info!(bind=%listener.local_addr()?,health=%config.health_bind,"Relay serving");
-        let failure = loop {
+        let mut upgrading = false;
+        let mut shutdown_completed = false;
+        let mut failure = loop {
             tokio::select! {
-                _=&mut shutdown=>break None,
+                _=&mut shutdown=>{shutdown_completed=true;break None;},
+                result=&mut health_task=>{
+                    health_joined = true;
+                    break Some(format!("Relay health service stopped: {result:?}"));
+                },
+                _=async {
+                    match accepted.as_mut() {
+                        Some(accepted) => { let _ = accepted.changed().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                }=>{
+                    upgrading = true;
+                    break None;
+                },
                 ended=services.join_next()=>break Some(format!("Relay background service stopped: {ended:?}")),
                 // Reap finished connection tasks while the service is running.
                 _=connections.join_next(),if !connections.is_empty()=>{},
@@ -139,25 +204,105 @@ impl RelayService {
                 }
             }
         };
-        gateway.start_drain();
-        let deadline = tokio::time::Instant::now() + config.drain_timeout;
-        while gateway.active_streams() > 0 && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Serialize shutdown with Begin: no accepted task may be left unconsumed.
+        if let Some(upgrade) = &upgrade {
+            let has_task = upgrade.close_admission().await;
+            if has_task && !upgrading {
+                failure
+                    .get_or_insert_with(|| "Relay upgrade interrupted by service shutdown".into());
+            }
+            upgrading = has_task;
         }
+        gateway.start_drain();
+        // This owner drops the TCP listener; an RPC acknowledgement is not release evidence.
+        drop(listener);
+        let mut deadline = tokio::time::Instant::now() + config.drain_timeout;
+        if upgrading {
+            let _ = health_stop.send(true);
+            match tokio::time::timeout(std::time::Duration::from_secs(1), &mut health_task).await {
+                Ok(Ok(Ok(()))) => {
+                    health_joined = true;
+                    deadline = tokio::time::Instant::now() + super::upgrade::DRAIN_LIMIT;
+                    let unix_deadline = std::time::SystemTime::now()
+                        .checked_add(super::upgrade::DRAIN_LIMIT)
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+                    if let Some(unix_deadline) = unix_deadline {
+                        if let Some(upgrade) = &upgrade {
+                            upgrade.released(unix_deadline).await;
+                        }
+                    } else {
+                        failure = Some("Relay drain deadline is not representable".into());
+                    }
+                }
+                Ok(result) => {
+                    health_joined = true;
+                    failure = Some(format!("Relay health release failed: {result:?}"));
+                }
+                Err(error) => {
+                    failure = Some(format!("Relay health release timed out: {error}"));
+                }
+            }
+        }
+        let mut interrupted = upgrading && shutdown_completed;
+        while !interrupted && gateway.active_streams() > 0 && tokio::time::Instant::now() < deadline
+        {
+            tokio::select! {
+                _=tokio::time::sleep(std::time::Duration::from_millis(50))=>{},
+                _=&mut shutdown, if upgrading && !shutdown_completed=>{interrupted=true;break;},
+                ended=services.join_next()=>{
+                    failure=Some(format!("Relay background service stopped during drain: {ended:?}"));
+                    break;
+                },
+            }
+        }
+        let forced = gateway.active_streams() > 0;
         connections.shutdown().await;
+        if upgrading {
+            let phase = if failure.is_some() {
+                "failed"
+            } else if interrupted {
+                "interrupted"
+            } else if forced {
+                "forced"
+            } else {
+                "completed"
+            };
+            if let Some(upgrade) = &upgrade {
+                upgrade.finish(phase).await;
+            }
+            tracing::info!(phase, "Relay upgrade stream drain ended");
+            if failure.is_none() && (interrupted || forced) {
+                failure = Some(format!(
+                    "Relay upgrade drain {phase}; not natural completion"
+                ));
+            }
+        }
+        let _ = health_stop.send(true);
         let _ = stop.send(true);
         let joined = async {
+            if !health_joined {
+                (&mut health_task).await??;
+            }
             while let Some(result) = services.join_next().await {
                 result??;
             }
             Ok::<(), ServiceError>(())
         };
         // A stuck local RPC must not keep its owning process alive indefinitely.
-        tokio::time::timeout(
-            config.drain_timeout.max(std::time::Duration::from_secs(1)),
+        let cleanup = tokio::time::timeout(
+            if upgrading {
+                std::time::Duration::from_secs(1)
+            } else {
+                config.drain_timeout.max(std::time::Duration::from_secs(1))
+            },
             joined,
         )
-        .await??;
+        .await;
+        // Dropping/aborting the owner also closes persistent control streams.
+        health_task.abort();
+        services.abort_all();
+        cleanup??;
         if let Some(error) = failure {
             return Err(error.into());
         }

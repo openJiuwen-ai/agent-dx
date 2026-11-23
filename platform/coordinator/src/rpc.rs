@@ -13,6 +13,7 @@ mod environment_control;
 mod metrics;
 mod node_retirement;
 mod observation;
+mod process_upgrade;
 mod recovery;
 mod resume;
 mod snapshot_preparation;
@@ -60,6 +61,11 @@ struct LiveNode {
     last_seen: tokio::time::Instant,
     inspected: bool,
     report: pb::RegisterNodeRequest,
+}
+impl LiveNode {
+    fn fresh(&self, session: &str, timeout: Duration) -> bool {
+        !self.expired && self.session == session && self.last_seen.elapsed() < timeout
+    }
 }
 
 fn confirmed_create_failure(status: &Status) -> bool {
@@ -230,6 +236,9 @@ impl State {
         self.invalidate_node_with_departure(id, false).await
     }
     async fn invalidate_node_with_departure(&mut self, id: &str, departed: bool) -> Result<()> {
+        if self.session.process_node_protected(id).await? {
+            return Err(Error::Conflict);
+        }
         let mut node = self.nodes.get(id).ok_or(Error::Conflict)?.clone();
         let session_id = node.session.as_ref().ok_or(Error::Conflict)?.id.clone();
         node.node.available = false;
@@ -477,6 +486,12 @@ async fn current_registration_control(
     let Some(owner) = &node.upgrade_pause else {
         return Ok(None);
     };
+    if session.process_node_protected(&request.node_id).await? {
+        session
+            .guard_process_registration(&request.node_id, &request.session_id)
+            .await?;
+        return Ok(None);
+    }
     let task = session.upgrade_task().await?;
     let Some(task) = task.filter(|task| task.active()) else {
         return Ok(None);
@@ -642,6 +657,7 @@ impl CoordinatorRpc {
             }
         }
         // Persist unreachability before exposing a recovered routing snapshot.
+        let mut process_fenced = BTreeSet::new();
         for node in saved.nodes.values_mut() {
             node.node.available = false;
             node.session
@@ -652,6 +668,12 @@ impl CoordinatorRpc {
                 })
                 .routable = false;
             if node.retirement.as_ref().is_some_and(|r| r.unregistered) {
+                continue;
+            }
+            // Yield deliberately retains the registration and Environments, but
+            // ordinary recovery must never recreate its revoked session token.
+            if session.process_node_protected(&node.node.id).await? {
+                process_fenced.insert(node.node.id.clone());
                 continue;
             }
             *node = session
@@ -674,7 +696,12 @@ impl CoordinatorRpc {
         // Monotonic heartbeat timestamps cannot survive a process restart. Give
         // recovered nodes one bounded registration grace, with routes kept closed.
         let now = tokio::time::Instant::now();
-        let recovering = saved.nodes.keys().map(|id| (id.clone(), now)).collect();
+        let recovering = saved
+            .nodes
+            .keys()
+            .filter(|id| !process_fenced.contains(*id))
+            .map(|id| (id.clone(), now))
+            .collect();
         let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
         let volume_changes = session.committed_changes();
@@ -792,14 +819,19 @@ impl CoordinatorRpc {
             .filter(|id| state.overdue(id, self.0.heartbeat_timeout))
             .cloned()
             .collect();
+        let mut expired = 0;
         for id in &ids {
+            if state.session.process_node_protected(id).await? {
+                continue;
+            }
             let result = state.invalidate_node(id).await;
             self.0.changed.notify_waiters();
             result?;
+            expired += 1;
         }
         drop(state);
         self.expire_local_reservations().await?;
-        Ok(ids.len())
+        Ok(expired)
     }
 
     async fn expire_local_reservations(&self) -> Result<()> {
@@ -874,20 +906,28 @@ impl CoordinatorRpc {
             }
             live.session.clone()
         };
-        let endpoint = self
-            .0
-            .node_tls
-            .endpoint(&r.node_address)
-            .ok()?
-            .connect_timeout(self.0.timeout)
-            .timeout(self.0.timeout);
-        let channel = endpoint.connect().await.ok()?;
-        let actual = pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
-            .get_session(pb::GetNodeSessionRequest {})
-            .await
-            .ok()?
-            .into_inner();
-        (actual.node_id == r.node_id && actual.session_id == r.session_id).then_some(predecessor)
+        self.proves_node_session(r).await.then_some(predecessor)
+    }
+
+    async fn proves_node_session(&self, r: &pb::RegisterNodeRequest) -> bool {
+        let probe = async {
+            let endpoint = self
+                .0
+                .node_tls
+                .endpoint(&r.node_address)
+                .ok()?
+                .connect_timeout(self.0.timeout)
+                .timeout(self.0.timeout);
+            let channel = endpoint.connect().await.ok()?;
+            let actual =
+                pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
+                    .get_session(pb::GetNodeSessionRequest {})
+                    .await
+                    .ok()?
+                    .into_inner();
+            Some(actual.node_id == r.node_id && actual.session_id == r.session_id)
+        };
+        probe.await.unwrap_or(false)
     }
 
     fn create_lock(&self, key: String) -> Arc<Mutex<()>> {
@@ -1215,7 +1255,7 @@ impl CoordinatorRpc {
         }
         match session.get(&spec.id).await {
             Ok(stored) if stored.spec.tenant_id != spec.tenant_id => {
-                return Err(Status::not_found("environment not found"))
+                return Err(Status::not_found("environment not found"));
             }
             Ok(stored) if stored.result.is_some() => {
                 let record = stored
@@ -2218,12 +2258,10 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             let mut state = self.0.state.lock().await;
             state.recover_authoritative_state().await.map_err(status)?;
             state.healthy().map_err(status)?;
-            let live = state.live.get(&r.node_id).ok_or_else(|| {
-                Status::failed_precondition("register node before reconciliation")
-            })?;
-            if live.session != r.session_id
-                || live.expired
-                || live.last_seen.elapsed() >= self.0.heartbeat_timeout
+            if state
+                .live
+                .get(&r.node_id)
+                .is_none_or(|live| !live.fresh(&r.session_id, self.0.heartbeat_timeout))
             {
                 return Err(Status::failed_precondition(
                     "live node session required for inspection",
@@ -2237,13 +2275,11 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 .map_err(status)?;
             let mut state = self.0.state.lock().await;
             state.healthy().map_err(status)?;
-            let live = state.live.get(&r.node_id).ok_or_else(|| {
-                Status::failed_precondition("node session changed during inspection")
-            })?;
             if state.session.epoch() != session.epoch()
-                || live.session != r.session_id
-                || live.expired
-                || live.last_seen.elapsed() >= self.0.heartbeat_timeout
+                || state
+                    .live
+                    .get(&r.node_id)
+                    .is_none_or(|live| !live.fresh(&r.session_id, self.0.heartbeat_timeout))
             {
                 return Err(Status::failed_precondition(
                     "node session changed during inspection",
@@ -2364,23 +2400,95 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         }
         let service = self.clone();
         tokio::spawn(async move {
-            let predecessor = service.replacement_predecessor(&r).await;
+            let protected_predecessor = service
+                .process_registration_predecessor(&r)
+                .await
+                .map_err(status)?;
+            let predecessor = match &protected_predecessor {
+                Some((_, actual)) => Some(actual.clone()),
+                None => service.replacement_predecessor(&r).await,
+            };
             let mut state = service.0.state.lock().await;
             state.recover_authoritative_state().await.map_err(status)?;
             state.healthy().map_err(status)?;
-            if state.nodes.get(&r.node_id).is_some_and(|n| {
-                n.retirement.as_ref().is_some_and(|r| r.unregistered)
-                    && n.session.as_ref().is_some_and(|s| s.id == r.session_id)
-            }) {
-                return Err(Status::failed_precondition("unregistered node session"));
-            }
             if state
                 .retired_sessions
                 .contains(&(r.node_id.clone(), r.session_id.clone()))
             {
                 return Err(Status::failed_precondition("retired node session"));
             }
-            if state.overdue(&r.node_id, service.0.heartbeat_timeout) {
+            if let Some((marker, actual)) = protected_predecessor {
+                // A probe grants no authority if another registration or task
+                // advanced while the scheduler lock was released.
+                if state
+                    .session
+                    .process_upgrade(&r.node_id)
+                    .await
+                    .map_err(status)?
+                    .as_ref()
+                    != Some(&marker)
+                    || state.nodes.get(&r.node_id).is_none_or(|saved| {
+                        saved
+                            .session
+                            .as_ref()
+                            .is_none_or(|saved| saved.id != actual)
+                            || saved.address != r.node_address
+                            || saved.proxy_address != r.proxy_address
+                    })
+                {
+                    return Err(Status::failed_precondition(
+                        "process handoff changed during identity probe",
+                    ));
+                }
+                if marker.current_session != r.session_id {
+                    state.needs_recovery = true;
+                    state
+                        .session
+                        .replace_node_session(
+                            marker.owner,
+                            crate::storage::SessionReplacement {
+                                expected_session: marker.current_session,
+                                next_session: r.session_id.clone(),
+                            },
+                        )
+                        .await
+                        .map_err(status)?;
+                    state.recover_authoritative_state().await.map_err(status)?;
+                    service.0.changed.notify_waiters();
+                }
+            }
+            let process_protected = match state
+                .session
+                .guard_process_registration(&r.node_id, &r.session_id)
+                .await
+            {
+                Ok(protected) => protected,
+                Err(error) => {
+                    // A durable revoked token must not survive as live authority.
+                    if state
+                        .live
+                        .get(&r.node_id)
+                        .is_some_and(|live| live.session == r.session_id)
+                    {
+                        state.live.remove(&r.node_id);
+                        if let Some(saved) = state.nodes.get_mut(&r.node_id) {
+                            saved.node.available = false;
+                            if let Some(session) = &mut saved.session {
+                                session.routable = false;
+                            }
+                        }
+                    }
+                    state.needs_recovery = true;
+                    return Err(status(error));
+                }
+            };
+            if state.nodes.get(&r.node_id).is_some_and(|n| {
+                n.retirement.as_ref().is_some_and(|r| r.unregistered)
+                    && n.session.as_ref().is_some_and(|s| s.id == r.session_id)
+            }) {
+                return Err(Status::failed_precondition("unregistered node session"));
+            }
+            if !process_protected && state.overdue(&r.node_id, service.0.heartbeat_timeout) {
                 let result = state.invalidate_node(&r.node_id).await;
                 service.0.changed.notify_waiters();
                 result.map_err(status)?;
@@ -2412,7 +2520,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                             upgrade_control,
                         }));
                     }
-                    inspected =
+                    inspected |=
                         live.inspected && live.last_seen.elapsed() < service.0.heartbeat_timeout;
                 } else if live.last_seen.elapsed() < service.0.heartbeat_timeout
                     && (predecessor.as_ref() != Some(&live.session)
@@ -2585,7 +2693,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     _ => {
                         return Err(Status::permission_denied(
                             "caller may not read this environment",
-                        ))
+                        ));
                     }
                 }
                 let node = state

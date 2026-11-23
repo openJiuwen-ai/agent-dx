@@ -20,6 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={}", proto.join(file).display());
     }
     tonic_build::configure()
+        .type_attribute(".adx.control.v1.MaintenanceOwner", "#[derive(serde::Serialize, serde::Deserialize, Eq)] #[serde(deny_unknown_fields)]")
+        .type_attribute(".adx.control.v1.MaintenanceReleaseReceipt", "#[derive(serde::Serialize, serde::Deserialize, Eq)] #[serde(deny_unknown_fields)]")
         .type_attribute(".adx.control.v1.NodeUpgradeControl", "#[derive(serde::Serialize, serde::Deserialize, Eq)] #[serde(deny_unknown_fields)]")
         .type_attribute(".adx.control.v1.NodeUpgradeGrant", "#[derive(serde::Serialize, serde::Deserialize, Eq)] #[serde(deny_unknown_fields)]")
         // Optional workload metadata must not inflate every nested RPC future.
@@ -37,6 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         proto.join("node.proto").display()
     );
     tonic_build::configure()
+        .type_attribute(
+            ".adx.node.v1.AdxletProcessRequest",
+            "#[derive(serde::Serialize, serde::Deserialize, Eq)]",
+        )
         .compile_protos(&[proto.join("node.proto")], std::slice::from_ref(&proto))?;
     println!(
         "cargo:rerun-if-changed={}",
