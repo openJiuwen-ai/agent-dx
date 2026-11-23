@@ -24,7 +24,7 @@ async fn upgrade_authority_fences_scope_revision_session_and_accepted_work() {
     granted.grants.push(ExecutionGrant {
         environment_id: "business".into(),
         assignment_generation: 2,
-        actions: vec!["pause".into()],
+        actions: vec!["pause".into(), "resume".into()],
     });
     let mut unversioned = granted.clone();
     unversioned.grants[0].assignment_generation = 0;
@@ -32,6 +32,7 @@ async fn upgrade_authority_fences_scope_revision_session_and_accepted_work() {
     gate.apply(granted.clone()).await.unwrap();
     for (id, generation, action) in [
         ("business", 2, "create"),
+        ("business", 2, "resume"),
         ("business", 1, "pause"),
         ("other", 2, "pause"),
     ] {
@@ -53,4 +54,18 @@ async fn upgrade_authority_fences_scope_revision_session_and_accepted_work() {
         .apply(control("first", 3, "verified"))
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn draining_preserves_existing_execution_until_quiescing() {
+    let directory = tempfile::tempdir().unwrap();
+    let gate = UpgradeGate::open(directory.path().join("upgrade.json"), "first".into()).unwrap();
+    gate.apply(control("first", 1, "draining")).await.unwrap();
+    assert!(!gate.accepting_allocations());
+    assert!(gate.check("business", 2, "create").is_err());
+    for action in ["route", "resume"] {
+        assert!(gate.check("business", 2, action).is_ok());
+    }
+    gate.apply(control("first", 2, "quiescing")).await.unwrap();
+    assert!(gate.check("business", 2, "resume").is_err());
 }

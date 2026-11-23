@@ -53,6 +53,7 @@ separate failure cases; this protocol does not promise transparent stream migrat
 | `POST /tasks` | Begin or replay a durable task. |
 | `GET /tasks/{task_id}` | Persisted task, node bindings and operation progress without waiting for a write operation. |
 | `GET /nodes/{node_id}/inspect` | Current session and local inventory; errors never mean empty. |
+| `POST /tasks/{task_id}/drain-node` | Stop new placement on the source while retaining current execution and same-owner Resume. |
 | `POST /tasks/{task_id}/prepare-node` | Stop admission and fence execution on the source. |
 | `POST /tasks/{task_id}/migrate` | Pause, transfer ownership by CAS, adopt/restore at the target. |
 | `POST /tasks/{task_id}/quiesce` | Revoke grants, settle local work, issue an empty-node permit. |
@@ -76,6 +77,11 @@ For an automatic operation the recorded selection policy takes precedence over
 any target hint sent on retry. The ownership CAS fixes the target.
 Executors must treat an automatic Prepared target as provisional and read the
 durable receipt again after retrying the same operation.
+For a `drain-node` source, both automatic and explicit targets must be
+compatible, remain `pending` in the task and match the registered session.
+A source prepared with `prepare-node` can transfer to an already verified,
+schedulable node if its runtime, rootfs and checkpoint storage are compatible.
+The Coordinator does not prefer a node simply because it has been upgraded.
 Existing Prepared operations without a recorded selection policy keep their
 stored target. Optional `expected_source_generation` and
 `expected_source_revision` fence the initial intent before any Prepared record or
@@ -83,15 +89,31 @@ Pause call; explicit zero is checked, not treated as absent. They do not replace
 the stored identity when continuing an existing operation ID.
 
 `register_source:true` explicitly adds a late source with its current Pod UID and
-process session. It is accepted by Active `prepare-node`, or by Aborting
+process session. It is accepted by Active `prepare-node` or `drain-node`, or by Aborting
 `abort` with `stage:restore-original` for release only. A matching pending peer
 can acquire its original source identity once; an existing original identity is
 never overwritten. The executor must first prove the Pod belongs to this task's
 DaemonSet and still runs the original image. Task isolation is recorded
 separately from administrator pause intent; releasing it preserves manual pauses.
 
+The `drain` capability requires Coordinator and adxlet builds supporting the
+`draining` gate and revision-guarded Resume. Check `guarded_resume:true` in
+management capabilities and in every source node's inspection before starting
+the task. The Coordinator also checks each source before pausing its scheduling.
+The task pause excludes the source from new placements.
+Existing operations and same-session Resume continue unless an administrator
+paused the node or the Sandbox has an unsettled migration. Optional migration
+selects a compatible, pending node registered with the same upgrade task.
+When abort starts, new Resume intents are blocked on draining sources. An
+already accepted same-session Resume can settle before evacuation closes the
+node gate. If the freeze conflicts with an outstanding Resume, retry the same
+abort after it settles.
+Quiesce still requires strict emptiness before Pod deletion.
+
 Before accepting a migration, the source request Pod UID and process session must
 match the task binding and the current live node.
+Accepting a new migration also checks the source owner, revision, execution
+state and both registered node sessions in the durable write that records `Prepared`.
 Before ownership transfer, the operation checks both sessions and records the
 source's authenticated, per-Environment stop inspection for the published Paused
 revision. The ownership CAS checks that exact revision and both stored sessions.
@@ -141,23 +163,31 @@ authority work, runtime executions or ledger allocations, and a current
 authoritative inventory. Isolated replacement sessions can report this evidence
 before binding to the task. Only Quiescing issues a delete permit, which binds
 task, epoch, process session, Pod UID and control revision. Before
-DELETE, the executor persists intent and sends the current Pod RV. A later
-release cannot bypass an unresolved delete: either that UID is gone or the
+DELETE, the executor persists intent and sends the current Pod RV. The same
+permit and RV can be confirmed again. While an intent is unresolved,
+confirmation with another RV and another quiesce for the same Pod are rejected.
+Release requires either that UID to be gone or the
 executor first CAS-patches it and submits the new RV to `revoke-delete`, together
 with `expected_delete_resource_version` containing its original persisted DELETE
 RV. The current intent must match that expected RV, and the new RV must differ.
 A same-task/Pod/session replay after the intent was cleared succeeds without
 changing admission or any newer permit; an old revoke cannot clear a newer DELETE
-intent. Both normal and rollback paths save UID/RV intent before asking the
-Coordinator to confirm its delete permit, so lost replies remain reconcilable.
+intent. If the process restarts in the same original Pod or in the same
+Quiescing rollback Pod, the caller can revoke the old intent using the current
+session once it is isolated for this task. Revocation leaves the binding
+unchanged. Both paths save UID/RV intent before confirming the permit so they
+can reconcile lost replies.
 
-After a process restart in the same original Pod, `quiesce` can bind the new
-session once the task's operations on that node have settled. The caller supplies
-the same Pod UID and current session. The replacement process must already be
-isolated for this task and report strict empty, with no durable Environment
-assignments or outstanding delete intent. Quiesce issues a fresh permit for the
-new session. During abort, use `rollback:true`, verify the rebound session, then
-finalize with the restored template.
+After a process restart in the same Pod, `quiesce` can bind the new session
+once the task's operations on that node have settled. This applies to the
+original Pod and to a Quiescing replacement during abort with `rollback:true`.
+That rollback path also accepts a strictly empty original Pod still recorded as
+`pending`, such as a late old-image Pod registered before its first release.
+The caller supplies the same Pod UID and current session. The replacement
+process must already be isolated for this task and report strict empty, with no
+durable Environment assignments or outstanding delete intent. Quiesce issues a
+fresh permit for the new session. Verify the restored Pod during abort before
+finalizing with the restored template.
 
 New sessions receive isolated control in their registration response before
 catalog adoption. The response derives control after the session CAS from the
@@ -184,9 +214,47 @@ deletion receipt. It is historical progress, not a guarantee that the user has
 kept the Environment running afterward. A successful migrate response still
 requires the expected target execution state.
 
+If capacity runs out after Pause and the original source still owns the
+Environment, `Deferring` fences further transfer. Retry that same
+operation if source recovery is pending. Once a task-paused Environment has
+published Running on the original owner, or an existing user Pause is
+confirmed unchanged, the operation records `Deferred`. The migrate response
+is HTTP 200 with `outcome:"deferred"`, `completed:false`, and the source
+`environment_id`, `node_id` and `generation`. Drain leaves the Environment on
+that node to finish naturally. For a `prepare-node` source, send
+`defer_on_capacity:true` when the Coordinator advertises `migrate_deferral:true`
+and the source supports `guarded_resume`. Once the attempt is `Deferred`, recheck
+capacity and use a new operation ID and the current source generation/revision
+within the same task. Replaying the old ID returns its historical receipt.
+Clients that do not opt in retain the 429 and replay contract. Pod deletion still
+requires strict emptiness. If ownership already moved, settle the original transfer.
+
+If the source process restarts before `Deferred`, verify that the original Pod
+UID still identifies the current, non-terminating Pod. Retry the same migration
+operation with that UID and the freshly inspected session. The Coordinator
+requires isolation for the same task, the durable original ownership generation,
+and evidence of the task checkpoint or the already published restore before
+binding the new session. The source controller must reconcile any surviving
+backend before another restore. The migration receipt keeps the original session.
+Retry a 503 while the new session reconciles. If Abort freeze
+has entered `Aborting`, supply `rollback:true` in that replay, then retry freeze.
+
+If the same original Pod restarts again after `Deferred`, replay the settled
+operation with `rebind_source:true`, its original Pod UID and the freshly
+inspected session. The Coordinator rebinds the isolated source to the same task
+only when no unsettled operation involves that node. It builds grants from
+current authoritative ownership and leaves the historical operation and its
+receipt intact. Omit the flag to read the historical receipt without rebinding.
+
 `Cancelled` is an abort-only receipt for a Prepared operation whose ownership
 never left its original source generation/session. Freeze removes new Pause
 grants while preserving business routes and waits for already admitted work.
+If the migration already published its Pause on the original source, abort may
+restore the Sandbox there under a task-scoped grant for that assignment. It uses
+the same rollback operation ID on retry and records `Cancelled` after the source
+has published Running. A Sandbox that was already Paused remains Paused. If a
+user Pause wins before the task's Pause, forward migration waits for abort; abort
+can cancel the operation while preserving the proven user checkpoint.
 If the CAS already moved ownership, retry the same migrate action with
 `rollback:true` to settle the existing transfer while the task is Aborting.
 Cancellation requires matching Coordinator and node-local Published
@@ -208,9 +276,18 @@ Terminal persistence checks all bound sessions and remaining task pause markers
 in the same Header CAS; a concurrent registration keeps the task active.
 
 Abort first freezes new forward work. Rollback actions carry `rollback:true`.
-An unchanged original Pod can be reopened only after its original UID/session,
-finished operations and revoked delete intent are confirmed. Replacements need
-strict empty evidence, current session and registered recovery capability checks.
+An original Pod can be reopened after confirming its UID, settled operations
+and absence of a delete intent. After a lost release reply and a process restart
+in that Pod, replay `restore-original` with the same UID and the current session.
+The persisted `RestoredOriginal` phase records the release intent. An original
+Pod already recorded as `verified` during abort can use the same replay after
+a process restart. The Coordinator verifies that the new session is isolated
+for the task and keeps scheduling paused until that session acknowledges release.
+Existing Sandbox assignments stay in place.
+If explicit Resume or traffic-triggered Resume arrives before adxlet has
+recreated the local controller, the same resume intent waits for reconciliation
+within the caller's timeout. Replacements need strict empty evidence, current
+session and registered recovery capability checks.
 Finalization also requires the
 executor's confirmed old template and fresh owner inventory. No-Inspect rollback
 is deliberately unavailable: an unreachable replacement remains isolated.

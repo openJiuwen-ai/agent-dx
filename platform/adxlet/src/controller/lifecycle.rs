@@ -902,8 +902,19 @@ impl Controller {
 
     async fn resume_attempt(
         &mut self,
-        request: ResumeRequest,
+        mut request: ResumeRequest,
     ) -> std::result::Result<OperationResult, ResumeFailure> {
+        // Pinning a restore input advances the record before publication. A
+        // retry may confirm that revision while the same resume is still pending.
+        if request.operation_id.starts_with("task:")
+            && request.expected_revision == self.record.revision
+        {
+            if let Some((op, _)) = &self.capture_preparation {
+                if op.kind == LifecycleKind::Resume && op.id == request.operation_id {
+                    request.expected_revision = op.expected_revision;
+                }
+            }
+        }
         if self.replay_operation(
             &request.operation_id,
             request.expected_revision,
@@ -922,7 +933,16 @@ impl Controller {
             policy.timeout_seconds = seconds;
             policy.validate()?;
         }
-        let execution = self.services.execution(&self.record, "resume").await?;
+        let task = request
+            .operation_id
+            .starts_with("task:")
+            .then_some(request.operation_id.as_str());
+        let execution = self.services.upgrade.enter_scoped(
+            &self.record.spec.id,
+            self.record.assignment.generation,
+            "resume",
+            task,
+        )?;
         let cp = self
             .record
             .checkpoint

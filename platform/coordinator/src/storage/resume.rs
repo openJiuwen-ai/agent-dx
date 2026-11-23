@@ -76,6 +76,26 @@ impl Session {
                 .as_ref()
                 .is_some_and(|task| task.blocks_resume(&stored))
             {
+                // A settled deferral has already published the original
+                // owner Running. Give stale Ingress bindings that route without
+                // admitting a Resume or changing the run timeout.
+                if !stored.invalidated
+                    && stored.resume.is_none()
+                    && run_timeout_seconds.is_none()
+                    && stored.result.as_ref().is_some_and(|record| {
+                        record.state == EnvironmentState::Running
+                            && record.resources_held
+                            && record.runtime.ip.is_some()
+                            && !record.restart_pending
+                            && (expected_runtime_id.is_empty()
+                                || record.runtime.id != expected_runtime_id)
+                    })
+                    && upgrade
+                        .as_ref()
+                        .is_some_and(|task| task.allows_deferred_route(&stored))
+                {
+                    return Ok(ResumeAdmission::Running(stored));
+                }
                 return Ok(ResumeAdmission::Upgrading);
             }
             if let Some(seconds) = run_timeout_seconds {
