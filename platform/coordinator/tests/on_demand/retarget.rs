@@ -385,7 +385,22 @@ async fn evacuation_capacity_loss(automatic: bool) {
         .contains_key("migrate-retry"));
     assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 2);
 
-    let period = Duration::from_secs(60);
+    retry_after_capacity(&mut rig, address, migrate, Duration::from_secs(60)).await;
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        post_upgrade(address, MIGRATE_PATH, previous).await,
+        deferred
+    );
+    server.abort();
+}
+
+async fn retry_after_capacity(
+    rig: &mut Rig,
+    address: std::net::SocketAddr,
+    migrate: serde_json::Value,
+    period: Duration,
+) {
     let capacity = Resources {
         cpu_millis: 200,
         memory_bytes: 256,
@@ -420,13 +435,6 @@ async fn evacuation_capacity_loss(automatic: bool) {
     assert_eq!(status, 200, "{completed}");
     assert_eq!(completed["outcome"], "completed");
     assert_eq!(completed["node_id"], "b");
-    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 2);
-    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        post_upgrade(address, MIGRATE_PATH, previous).await,
-        deferred
-    );
-    server.abort();
 }
 
 #[tokio::test]
@@ -459,7 +467,7 @@ async fn drain_deferral_accepts_a_later_user_operation_after_published_restore()
 #[ignore = "requires dedicated real Redis"]
 async fn deferral_replays_after_source_session_restart() {
     for drain in [false, true] {
-        deferral_with_source_restart(drain, false, RestartDeferralFault::InputAck).await;
+        deferral_with_source_restart(drain, false, RestartDeferralFault::InputAck, false).await;
     }
 }
 
@@ -467,7 +475,7 @@ async fn deferral_replays_after_source_session_restart() {
 #[ignore = "requires dedicated real Redis"]
 async fn deferral_replays_after_source_session_restart_during_abort() {
     for drain in [false, true] {
-        deferral_with_source_restart(drain, true, RestartDeferralFault::InputAck).await;
+        deferral_with_source_restart(drain, true, RestartDeferralFault::InputAck, false).await;
     }
 }
 
@@ -475,8 +483,29 @@ async fn deferral_replays_after_source_session_restart_during_abort() {
 #[ignore = "requires dedicated real Redis"]
 async fn deferral_replays_after_source_session_restart_with_a_surviving_backend() {
     for committed in [false, true] {
-        deferral_with_source_restart(false, false, RestartDeferralFault::Running { committed })
-            .await;
+        deferral_with_source_restart(
+            false,
+            false,
+            RestartDeferralFault::Running { committed },
+            false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn settled_deferral_rebinds_after_another_source_session_restart() {
+    for drain in [false, true] {
+        deferral_with_source_restart(drain, false, RestartDeferralFault::InputAck, true).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn settled_deferral_rebinds_after_another_source_session_restart_during_abort() {
+    for drain in [false, true] {
+        deferral_with_source_restart(drain, true, RestartDeferralFault::InputAck, true).await;
     }
 }
 
@@ -486,7 +515,12 @@ enum RestartDeferralFault {
     Running { committed: bool },
 }
 
-async fn deferral_with_source_restart(drain: bool, abort: bool, fault: RestartDeferralFault) {
+async fn deferral_with_source_restart(
+    drain: bool,
+    abort: bool,
+    fault: RestartDeferralFault,
+    restart_again: bool,
+) {
     let mut rig = Rig::new(Duration::from_secs(4)).await;
     let running = rig.resume(false).await.unwrap().record.unwrap();
     let original: adx_core::Assignment = running.assignment.clone().unwrap().try_into().unwrap();
@@ -568,7 +602,7 @@ async fn deferral_with_source_restart(drain: bool, abort: bool, fault: RestartDe
         preserve_runtime,
     )
     .await;
-    let current_session = rig.source.report.session_id.clone();
+    let mut current_session = rig.source.report.session_id.clone();
     assert_ne!(current_session, previous_session);
     assert!(!rig.source.manager.accepting_allocations());
     assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
@@ -576,7 +610,7 @@ async fn deferral_with_source_restart(drain: bool, abort: bool, fault: RestartDe
     let abort_path = "tasks/planned-migration/abort";
     let freeze = json!({"task_id":"planned-migration", "epoch":1,
         "operation_id":"freeze", "stage":"freeze"});
-    if abort {
+    if abort && !restart_again {
         let (status, body) =
             upgrade_response(address, "POST", abort_path, freeze.to_string()).await;
         assert_eq!(status, 409, "{body}");
@@ -618,7 +652,10 @@ async fn deferral_with_source_restart(drain: bool, abort: bool, fault: RestartDe
         receipt
     );
     migrate["node_session_id"] = json!(previous_session);
-    assert_eq!(post_upgrade(address, MIGRATE_PATH, migrate).await, receipt);
+    assert_eq!(
+        post_upgrade(address, MIGRATE_PATH, migrate.clone()).await,
+        receipt
+    );
     let settled = rig.session.upgrade_task().await.unwrap().unwrap();
     assert_eq!(settled.nodes["a"].node_session_id, current_session);
     assert_eq!(settled.nodes["a"].original_session_id, previous_session);
@@ -646,6 +683,84 @@ async fn deferral_with_source_restart(drain: bool, abort: bool, fault: RestartDe
     }
     assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
 
+    if restart_again {
+        rig.source.task.abort();
+        let _ = (&mut rig.source.task).await;
+        let _ =
+            super::source_session::restart_source_report_with_runtime(&mut rig, period, true).await;
+        let intermediate_session = current_session;
+        current_session = rig.source.report.session_id.clone();
+        assert_ne!(current_session, intermediate_session);
+        assert!(!rig.source.manager.accepting_allocations());
+        assert!(rig
+            .source
+            .backend
+            .running
+            .lock()
+            .unwrap()
+            .contains_key(&restored.runtime.id));
+        if abort {
+            let (status, body) =
+                upgrade_response(address, "POST", abort_path, freeze.to_string()).await;
+            assert_eq!(status, 409, "{body}");
+            let task = rig.session.upgrade_task().await.unwrap().unwrap();
+            assert_eq!(task.phase, "Aborting");
+            migrate["rollback"] = json!(true);
+        }
+        // Historical receipt lookup is read-only, including on a stale session.
+        assert_eq!(
+            post_upgrade(address, MIGRATE_PATH, migrate.clone()).await,
+            receipt
+        );
+        let mut rebind = migrate.clone();
+        rebind["rebind_source"] = json!(true);
+        rebind["rollback"] = json!(abort);
+        rebind["node_session_id"] = json!(intermediate_session);
+        let (stale_status, stale_reply) =
+            upgrade_response(address, "POST", MIGRATE_PATH, rebind.to_string()).await;
+        assert_eq!(
+            rig.session.upgrade_task().await.unwrap().unwrap().nodes["a"].node_session_id,
+            intermediate_session
+        );
+        rebind["node_session_id"] = json!(current_session);
+        let mut wrong_pod = rebind.clone();
+        wrong_pod["pod_uid"] = json!("other-pod");
+        let (status, body) =
+            upgrade_response(address, "POST", MIGRATE_PATH, wrong_pod.to_string()).await;
+        assert_eq!(status, 409, "{body}");
+        let rebound = post_upgrade(address, MIGRATE_PATH, rebind.clone()).await;
+        assert_eq!(rebound, receipt);
+        assert_eq!(stale_status, 409, "{stale_reply}");
+        assert_eq!(post_upgrade(address, MIGRATE_PATH, rebind).await, receipt);
+        report(&mut rig.source, &rig.address, period).await.unwrap();
+        let rebound_task = rig.session.upgrade_task().await.unwrap().unwrap();
+        assert_eq!(rebound_task.nodes["a"].node_session_id, current_session);
+        assert_eq!(
+            rebound_task.nodes["a"].original_session_id,
+            previous_session
+        );
+        assert_eq!(
+            rebound_task.operations["migrate"],
+            settled.operations["migrate"]
+        );
+        let current = rig.session.get("sleep").await.unwrap();
+        assert_eq!(current.assignment, original);
+        let current = current.result.unwrap();
+        assert_eq!(current.state, adx_core::EnvironmentState::Running);
+        assert_eq!(current.runtime.id, restored.runtime.id);
+        assert_eq!(rig.source.backend.running.lock().unwrap().len(), 1);
+        assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
+        assert!(!rig.source.manager.accepting_allocations());
+        if !abort {
+            migrate["operation_id"] = json!("migrate-after-rebind");
+            migrate["node_session_id"] = json!(current_session);
+            migrate["expected_source_revision"] = json!(current.revision);
+            retry_after_capacity(&mut rig, address, migrate, period).await;
+            assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
+            assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 1);
+        }
+    }
+
     if abort {
         post_upgrade(address, abort_path, freeze).await;
         let release = post_upgrade(
@@ -667,7 +782,10 @@ async fn deferral_with_source_restart(drain: bool, abort: bool, fault: RestartDe
         assert_eq!(finalized["phase"], "Aborted");
         assert!(rig.source.manager.accepting_allocations());
         assert_eq!(rig.session.get("sleep").await.unwrap().assignment, original);
-        assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rig.source.backend.restored.load(Ordering::SeqCst),
+            usize::from(!restart_again)
+        );
     }
     server.abort();
 }

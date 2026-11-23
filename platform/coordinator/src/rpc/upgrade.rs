@@ -28,6 +28,7 @@ struct Action {
     expected_target_control_revision: Option<u64>,
     target_node_id: String,
     defer_on_capacity: bool,
+    rebind_source: bool,
     permit_id: String,
     delete_intent: bool,
     rollback: bool,
@@ -1613,29 +1614,6 @@ impl CoordinatorRpc {
         view: &pb::NodeUpgradeInspection,
         operation_id: &str,
     ) -> Result<()> {
-        let id = &op.source_node_id;
-        let binding = task.nodes.get(id).ok_or(Error::Conflict)?;
-        let fresh = binding.node_session_id != view.node_session_id;
-        if view.unknown
-            || !view.guarded_resume
-            || view.phase != "isolated"
-            || view.task_id != task.task_id
-            || view.epoch != task.epoch
-            || (fresh && view.revision <= binding.control_revision)
-            || !view.grants.is_empty()
-            || !node.scheduling_paused
-            || node
-                .upgrade_pause
-                .as_ref()
-                .is_none_or(|owner| owner.task_id != task.task_id || owner.epoch != task.epoch)
-            || task.operations.values().any(|other| {
-                !other.settled()
-                    && ((other.source_node_id == *id && other.phase != "Deferring")
-                        || other.target_node_id == *id)
-            })
-        {
-            return Err(Error::Conflict);
-        }
         let record = stored.result.as_ref().ok_or(Error::Conflict)?;
         // Isolation blocks controller adoption. Prove the durable source
         // state before granting adoption; inspect the controller again after.
@@ -1665,6 +1643,41 @@ impl CoordinatorRpc {
                 receipt.id == operation_id && receipt.kind == adx_core::LifecycleKind::Resume
             });
         if record.assignment != stored.assignment || record.restart_pending || !(paused || restored)
+        {
+            return Err(Error::Conflict);
+        }
+        self.apply_deferral_source_rebind(task, op, node, view)
+            .await
+    }
+
+    async fn apply_deferral_source_rebind(
+        &self,
+        task: &mut UpgradeTask,
+        op: &UpgradeOperation,
+        node: &StoredNode,
+        view: &pb::NodeUpgradeInspection,
+    ) -> Result<()> {
+        let id = &op.source_node_id;
+        let binding = task.nodes.get(id).ok_or(Error::Conflict)?;
+        let fresh = binding.node_session_id != view.node_session_id;
+        if view.unknown
+            || !view.guarded_resume
+            || view.phase != "isolated"
+            || view.task_id != task.task_id
+            || view.epoch != task.epoch
+            || (fresh && view.revision <= binding.control_revision)
+            || !view.grants.is_empty()
+            || !node.scheduling_paused
+            || node
+                .upgrade_pause
+                .as_ref()
+                .is_none_or(|owner| owner.task_id != task.task_id || owner.epoch != task.epoch)
+            || task.operations.values().any(|other| {
+                !other.settled()
+                    && ((other.source_node_id == *id
+                        && (op.settled() || other.phase != "Deferring"))
+                        || other.target_node_id == *id)
+            })
         {
             return Err(Error::Conflict);
         }
@@ -1706,6 +1719,48 @@ impl CoordinatorRpc {
         Ok(())
     }
 
+    async fn rebind_settled_deferral_source(
+        &self,
+        task: &mut UpgradeTask,
+        op: &UpgradeOperation,
+        request: &Action,
+    ) -> Result<()> {
+        let binding = task.nodes.get(&op.source_node_id).ok_or(Error::Conflict)?;
+        let node = self.upgrade_node(&op.source_node_id).await?;
+        let session = node.session.as_ref().ok_or(Error::Conflict)?;
+        if binding.pod_uid != binding.original_pod_uid
+            || !matches!(binding.phase.as_str(), "draining" | "evacuating")
+            || binding.permit_id.is_some()
+            || binding.delete_resource_version.is_some()
+            || !session.routable
+            || request.node_session_id != session.id
+        {
+            return Err(Error::Conflict);
+        }
+        let (mut client, view) = self.checked_node(&node, "").await?;
+        if view.phase == "isolated" {
+            self.apply_deferral_source_rebind(task, op, &node, &view)
+                .await?;
+        } else if view.unknown
+            || !view.guarded_resume
+            || view.node_session_id != binding.node_session_id
+            || view.task_id != task.task_id
+            || view.epoch != task.epoch
+            || view.phase != binding.phase
+            || view.revision != binding.control_revision
+        {
+            return Err(Error::Conflict);
+        }
+        wake_reconciliation(
+            &mut client,
+            &session.id,
+            false,
+            tokio::time::Instant::now() + self.0.timeout.min(Duration::from_millis(250)),
+        )
+        .await;
+        Ok(())
+    }
+
     fn migrate_upgrade(&self, mut task: UpgradeTask, r: Action) -> RpcFuture<'_, Value> {
         Box::pin(async move {
             if r.environment_id.is_empty() {
@@ -1723,7 +1778,8 @@ impl CoordinatorRpc {
                 if op.environment_id != r.environment_id
                     || op.source_node_id != r.node_id
                     || r.pod_uid != binding.original_pod_uid
-                    || (r.node_session_id != op.source_session_id
+                    || (!r.rebind_source
+                        && r.node_session_id != op.source_session_id
                         && r.node_session_id != binding.node_session_id)
                     || (!op.automatic_target
                         && !r.target_node_id.is_empty()
@@ -1731,7 +1787,16 @@ impl CoordinatorRpc {
                 {
                     return Err(Error::Conflict);
                 }
-                return Ok(deferred_receipt(op));
+                let receipt = deferred_receipt(op);
+                if r.rebind_source {
+                    let op = op.clone();
+                    self.rebind_settled_deferral_source(&mut task, &op, &r)
+                        .await?;
+                }
+                return Ok(receipt);
+            }
+            if r.rebind_source {
+                return Err(Error::Conflict);
             }
             let mut stored = session.get(&r.environment_id).await?;
             let replaying = task.operations.contains_key(&r.operation_id);

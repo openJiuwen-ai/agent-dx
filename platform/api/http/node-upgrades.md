@@ -239,6 +239,13 @@ backend before another restore. The migration receipt keeps the original session
 Retry a 503 while the new session reconciles. If Abort freeze
 has entered `Aborting`, supply `rollback:true` in that replay, then retry freeze.
 
+If the same original Pod restarts again after `Deferred`, replay the settled
+operation with `rebind_source:true`, its original Pod UID and the freshly
+inspected session. The Coordinator rebinds the isolated source to the same task
+only when no unsettled operation involves that node. It builds grants from
+current authoritative ownership and leaves the historical operation and its
+receipt intact. Omit the flag to read the historical receipt without rebinding.
+
 `Cancelled` is an abort-only receipt for a Prepared operation whose ownership
 never left its original source generation/session. Freeze removes new Pause
 grants while preserving business routes and waits for already admitted work.
