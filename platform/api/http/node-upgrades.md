@@ -77,6 +77,11 @@ For an automatic operation the recorded selection policy takes precedence over
 any target hint sent on retry. The ownership CAS fixes the target.
 Executors must treat an automatic Prepared target as provisional and read the
 durable receipt again after retrying the same operation.
+For a `drain-node` source, both automatic and explicit targets must be
+compatible, remain `pending` in the task and match the registered session.
+A source prepared with `prepare-node` can transfer to an already verified,
+schedulable node if its runtime, rootfs and checkpoint storage are compatible.
+The Coordinator does not prefer a node simply because it has been upgraded.
 Existing Prepared operations without a recorded selection policy keep their
 stored target. Optional `expected_source_generation` and
 `expected_source_revision` fence the initial intent before any Prepared record or
@@ -218,6 +223,9 @@ is HTTP 200 with `outcome:"deferred"`, `completed:false`, and the source
 `environment_id`, `node_id` and `generation`. Leave the Environment on that
 node and continue draining in the same task. Pod deletion still requires strict
 emptiness. If ownership already moved, continue settling the original transfer.
+For a `prepare-node` source, post-Pause capacity loss instead returns 429 and
+keeps the accepted migration pending for replay when capacity returns or for
+explicit Abort.
 
 `Cancelled` is an abort-only receipt for a Prepared operation whose ownership
 never left its original source generation/session. Freeze removes new Pause

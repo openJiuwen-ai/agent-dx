@@ -498,6 +498,47 @@ mod drain_tests {
     use super::*;
 
     #[test]
+    fn drain_resume_requires_the_current_task_owned_source_session() {
+        let node: StoredNode = serde_json::from_value(serde_json::json!({
+            "node": {"id": "a", "capacity": {"cpu_millis": 100, "memory_bytes": 128, "disk_bytes": 0},
+                "available": false, "labels": {}, "devices": [], "runtime_classes": ["runsc"]},
+            "shard_id": 0, "address": "a:1", "proxy_address": "a:2",
+            "session": {"id": "source", "sequence": 1, "routable": true},
+            "scheduling_paused": true,
+            "upgrade_pause": {"task_id": "upgrade", "epoch": 1, "original_paused": false}
+        })).unwrap();
+        for (phase, session, original_paused, allowed) in [
+            ("draining", "source", false, true),
+            ("evacuating", "source", false, false),
+            ("draining", "predecessor", false, false),
+            ("draining", "source", true, false),
+        ] {
+            let task = UpgradeTask {
+                task_id: "upgrade".into(),
+                epoch: 1,
+                phase: "Active".into(),
+                nodes: [(
+                    "a".into(),
+                    UpgradeNode {
+                        phase: phase.into(),
+                        node_session_id: session.into(),
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let mut node = node.clone();
+            node.upgrade_pause.as_mut().unwrap().original_paused = original_paused;
+            assert_eq!(
+                task.allows_drain_resume(&node),
+                allowed,
+                "{phase} {session} {original_paused}"
+            );
+        }
+    }
+
+    #[test]
     fn drain_migration_fences_target_phase_and_session_at_transfer() {
         let source = Assignment {
             environment_id: "env".into(),
