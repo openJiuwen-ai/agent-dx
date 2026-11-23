@@ -36,7 +36,11 @@ pub(super) enum AuthorityComparison {
 pub(super) fn unstarted(record: &EnvironmentRecord) -> bool {
     record.state == EnvironmentState::Pending
         && record.revision == 0
-        && record.runtime.id == format!("{}-{}", record.spec.id, record.assignment.generation)
+        && adx_core::runtime_revision(
+            &record.spec.id,
+            record.assignment.generation,
+            &record.runtime.id,
+        ) == Some(0)
         && record.runtime.ip.is_none()
         && record.checkpoint.is_none()
         && record.snapshot_source.is_none()
@@ -413,7 +417,7 @@ pub(crate) fn spawn(
     services: Arc<Services>,
     held: bool,
 ) -> EnvironmentHandle {
-    let runtime_id = format!("{}-{}", spec.id, assignment.generation);
+    let runtime_id = adx_core::runtime_id(&spec.id, assignment.generation);
     spawn_restored(
         EnvironmentRecord {
             observation: None,
@@ -1638,11 +1642,10 @@ impl Controller {
         };
         let _execution = self.services.execution(&self.record, action).await?;
         let runtime_id = if restart {
-            format!(
-                "{}-{}-r{}",
-                self.record.spec.id,
+            adx_core::runtime_id_for_revision(
+                &self.record.spec.id,
                 self.record.assignment.generation,
-                self.record.revision.checked_add(1).ok_or(Error::Conflict)?
+                self.record.revision.checked_add(1).ok_or(Error::Conflict)?,
             )
         } else {
             self.record.runtime.id.clone()

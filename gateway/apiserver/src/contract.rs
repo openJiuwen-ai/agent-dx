@@ -881,6 +881,18 @@ pub fn create_spec_with_environment(
             disk_bytes: disk,
         })
         .map_err(|error| invalid(&error.to_string()))?;
+    if matches!(root.runtime.as_str(), "supervisor" | "conch")
+        && !environment.extra_config.is_empty()
+    {
+        return Err(invalid(
+            "extra_config is not supported by Jiuwenbox Supervisor or Conch",
+        ));
+    }
+    if environment.user.is_some() && root.runtime != "conch" {
+        return Err(invalid(
+            "tool identity override currently requires the Conch runtime",
+        ));
+    }
     let mut policy = policy;
     if r.pause
         .as_ref()

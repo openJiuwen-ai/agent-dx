@@ -105,6 +105,14 @@ paths:
       tags: [Files]
       operationId: uploadFile
       summary: Upload a file or tar stream, optionally in resumable chunks
+      description: |
+        Direct streaming uploads have no ADX-imposed file-size limit, including
+        the cumulative size of resumable uploads. The reverse-tunnel HTTP body
+        limit is a separate transport setting. Upload does not accept mode;
+        newly created regular files follow the runtime umask, while overwriting
+        an existing regular file preserves its permissions. Use process.exec
+        with chmod when explicit permissions are needed. Tar uploads follow
+        archive extraction semantics.
       parameters:
         - $ref: "#/components/parameters/InstanceId"
         - $ref: "#/components/parameters/ProcessingTimeout"
@@ -631,6 +639,7 @@ components:
       additionalProperties: false
     FileWriteArgs:
       type: object
+      description: Writes file contents with filesystem-default creation permissions subject to the runtime umask; existing file permissions are preserved. Use process.exec with chmod to set permissions.
       properties:
         path:
           type: string
@@ -701,7 +710,7 @@ components:
           minimum: 1
           maximum: 64
           default: 1
-          description: Listing levels including the root listing. Explicit invalid values are rejected, not clamped.
+          description: Listing levels including the root listing. Depth 1 lists only direct children; larger values descend into subdirectories up to that many levels. Explicit invalid values are rejected, not clamped.
       required:
       - path
       additionalProperties: false

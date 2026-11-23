@@ -78,9 +78,10 @@ uses the 600-second default. See the [runtime control contract](../../api/http/r
 
 ## Workload probes
 
-Adxlet injects validated `ADX_WORKLOAD_PROBES` configuration for image creates
-with `inherit_entrypoint`. Execd keeps a one-time readiness gate in transient
-RuntimeStatus `initializing`; first success reports `running`, and budget expiry
+Adxlet injects validated `ADX_WORKLOAD_PROBES` configuration for creates
+with an explicit workload process or `inherit_entrypoint`. Execd keeps a one-time
+readiness gate in transient RuntimeStatus `initializing`; first success reports
+`running`, and budget expiry
 reports `failed` with a structured `failure`. Healthcheck starts after readiness
 and reports a sticky failure at its consecutive-failure threshold. Execd does
 not choose restart policy; Adxlet owns cleanup, routes and committed lifecycle.

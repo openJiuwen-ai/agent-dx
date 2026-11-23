@@ -658,6 +658,35 @@ fn tool_identity_is_preserved_and_invalid_pairs_are_rejected() {
 }
 
 #[test]
+fn unsupported_runtime_create_options_are_rejected_before_rpc() {
+    for runtime in ["supervisor", "conch"] {
+        for selection in [
+            json!({"image":"tools:1", "runtime":runtime}),
+            json!({"rootfs":{"type":"image", "imageurl":"tools:1", "runtime":runtime}}),
+        ] {
+            let mut body = selection.clone();
+            body["extra_config"] = json!({"networkStack":"netstack"});
+            let error = create_spec(body, &caller()).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("extra_config"), "{error}");
+
+            let mut body = selection;
+            body["extra_config"] = json!({});
+            assert!(create_spec(body, &caller()).is_ok());
+        }
+    }
+    for runtime in ["supervisor", "runsc"] {
+        let error = create_spec(
+            json!({"image":"tools:1", "runtime":runtime, "user":"1001", "group":"1002"}),
+            &caller(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("Conch"), "{error}");
+    }
+}
+
+#[test]
 fn volume_mounts_are_exclusive_with_inline_sources_and_keep_fixed_uid() {
     let mut input = json!({"namespace":"test","name":"vol","image":"app","runtime":"runc","cpu":1000,"memory":128,
         "mounts":[{"type":"bind","target":"/workspace","volume_id":"workspace","volume_uid":"fixed-uid","options":["rw"]}]});

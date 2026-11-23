@@ -6,8 +6,8 @@ pub mod runtime_profile;
 pub mod snapshot_preparation;
 pub mod snapshots;
 pub use checkpoint::{
-    valid_runtime_id, CheckpointArtifact, CheckpointCleanup, CompletedOperation, LifecycleKind,
-    RestorePoint,
+    runtime_id, runtime_id_for_revision, runtime_revision, valid_runtime_id, CheckpointArtifact,
+    CheckpointCleanup, CompletedOperation, LifecycleKind, RestorePoint, MAX_RUNTIME_ID_BYTES,
 };
 pub mod envd;
 pub mod environment_control;
