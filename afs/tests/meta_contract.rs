@@ -1687,6 +1687,7 @@ fn owner_root_messages_keep_location_reservation_and_access_separate() {
         home_node_id: "node-a".into(),
         home_session_id: "session-a".into(),
         home_nfs_addr: String::new(),
+        local_prepare_id: String::new(),
     };
     let lookup = LookupRootReply {
         location: Some(location),

@@ -96,6 +96,13 @@ pub struct OwnerRootInventory {
     pub pending: Vec<RootReservation>,
     /// Deleted generations whose data this Home must reclaim, never adopt.
     pub tombstones: Vec<RootTombstoneState>,
+    /// Durable prepare identity per active root, as Meta holds it.
+    ///
+    /// Kept beside `active` instead of inside `RootLocation` because the
+    /// location is a general-purpose query result; only startup reconciliation
+    /// needs the prepare identity, and that is exactly where a lost local
+    /// catalog record has to be re-materialised from Meta's copy.
+    pub prepare_ids: HashMap<RootId, String>,
 }
 
 /// A Meta tombstone as the Home reconciles it.
@@ -2574,10 +2581,73 @@ impl RootManager {
                 return Err(invalid_grant("Meta returned a duplicate active root"));
             }
         }
-        if active.keys().any(|id| !records.contains_key(id)) {
-            return Err(invalid_grant(
-                "Meta has an active Home root without local catalog evidence",
-            ));
+        // A local catalog record can be lost independently of the data it
+        // describes — a wiped `.ownerfs-roots` directory, a restored `.users`
+        // tree, a node re-provisioned under the same identity. Meta still holds
+        // the authoritative epoch and prepare identity, and the workspace
+        // directory is the actual business data, so refusing to start only
+        // converts one missing 300-byte record into a cluster-wide outage.
+        //
+        // Re-materialise the record from Meta's copy when the data directory is
+        // still there. `persist_prepared_root` rejects a non-directory target and
+        // refuses to move an epoch backwards, so this cannot overwrite a newer
+        // generation. When the directory is gone too the original refusal stands:
+        // that is a genuine mismatch, not recoverable evidence.
+        let missing: Vec<RootId> = active
+            .keys()
+            .filter(|id| !records.contains_key(*id))
+            .cloned()
+            .collect();
+        for id in missing {
+            let location = &active[&id];
+            let name = root_name_from_id(&id)?;
+            let data_dir = root_data_dir(&name, location.epoch)?;
+            let present = self
+                .disk
+                .metadata(&data_dir)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+            let prepare_id = inventory.prepare_ids.get(&id).cloned().unwrap_or_default();
+            if !present || prepare_id.is_empty() {
+                afs_logging::error!("root.reconcile.catalog_missing";
+                    "root_id" => ?id,
+                    "epoch" => location.epoch,
+                    "data_dir" => ?data_dir,
+                    "data_dir_present" => present,
+                    "prepare_id_present" => !prepare_id.is_empty(),
+                );
+                return Err(invalid_grant(
+                    "Meta has an active Home root without local catalog evidence",
+                ));
+            }
+            // Meta does not record the preparation origin, and it cannot be
+            // inferred from what Meta does keep: a root AFS created normally
+            // and a root adopted from pre-existing data look identical here
+            // (both carry an active Root entity, both completed activation).
+            // The two differ only in this local flag.
+            //
+            // Claim `adopted`: it is the fail-closed side. If the value is ever
+            // consulted, `adopted` refuses a same-name create from reusing the
+            // directory in place, while `false` would let a create take live
+            // data over. In practice neither happens for a rebuilt record:
+            // reading the flag requires a successful reserve, and `reserve_root`
+            // refuses any root whose entity already exists, so a same-name
+            // create is rejected before it reaches the catalog.
+            let record = LocalRootRecord {
+                id: id.clone(),
+                name,
+                epoch: location.epoch,
+                data_dir: data_dir.clone(),
+                local_prepare_id: prepare_id,
+                adopted: true,
+            };
+            self.catalog.persist_prepared_root(&record)?;
+            afs_logging::warn!("root.reconcile.catalog_rebuilt";
+                "root_id" => ?id,
+                "epoch" => location.epoch,
+                "data_dir" => ?data_dir,
+            );
+            records.insert(id, record);
         }
 
         // Tombstones first, while a deleted generation's own catalog record —
@@ -4211,6 +4281,9 @@ mod tests {
                     .into_iter()
                     .collect(),
                 tombstones: state.tombstones.clone(),
+                // These mocks model Meta without a durable prepare identity, so
+                // startup keeps refusing a missing catalog record.
+                prepare_ids: Default::default(),
             })
         }
 

@@ -227,6 +227,9 @@ fn wire_location(root: super::store::RootRecord) -> RootLocation {
         home_node_id: root.home_node_id,
         home_session_id: root.home_session_id,
         home_nfs_addr: root.nfs_addr,
+        // Lets a home rebuild a local catalog record that was lost while the
+        // workspace directory survived. Not an authorization token.
+        local_prepare_id: root.local_prepare_id,
     }
 }
 

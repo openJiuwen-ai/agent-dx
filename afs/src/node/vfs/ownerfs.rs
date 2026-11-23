@@ -8567,6 +8567,9 @@ mod tests {
         active: Mutex<HashMap<RootId, root::RootLocation>>,
         pending: Mutex<HashMap<RootId, RootReservation>>,
         rights: Vec<RootRight>,
+        /// Durable prepare identity Meta would return per active root. Empty by
+        /// default so mocks keep the pre-existing "no evidence, refuse" behaviour.
+        prepare_ids: Mutex<HashMap<RootId, String>>,
     }
 
     impl RootMeta for LocalMeta {
@@ -8677,6 +8680,7 @@ mod tests {
                     .cloned()
                     .collect(),
                 tombstones: Vec::new(),
+                prepare_ids: self.prepare_ids.lock().unwrap().clone(),
             })
         }
 
@@ -9880,6 +9884,7 @@ mod tests {
             active: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             rights,
+            prepare_ids: Mutex::new(HashMap::new()),
         });
         let roots = Arc::new(RootManager::new(
             "node-a".into(),
@@ -9906,6 +9911,7 @@ mod tests {
             active: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             rights: all_local_rights(),
+            prepare_ids: Mutex::new(HashMap::new()),
         });
         let roots = Arc::new(
             RootManager::open_with_catalog(
@@ -14532,6 +14538,7 @@ mod tests {
             active: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             rights: all_local_rights(),
+            prepare_ids: Mutex::new(HashMap::new()),
         });
         let roots = Arc::new(RootManager::new(
             "node-a".into(),
@@ -15180,6 +15187,7 @@ mod tests {
             active: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             rights: all_local_rights(),
+            prepare_ids: Mutex::new(HashMap::new()),
         });
         let ctx = test_context_for_path(temp.path());
         let root = BackendInode {
@@ -15208,6 +15216,215 @@ mod tests {
         let entry = recovered.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
         assert_eq!(entry.attributes.kind, FileKind::Directory);
         assert_eq!(*meta.recover_calls.lock().unwrap(), 1);
+    }
+
+    /// Minimal view of the durable catalog record, for tests that must read it
+    /// without taking the catalog's exclusive lock (a live RootManager holds it).
+    struct CatalogRecordView {
+        epoch: u64,
+        local_prepare_id: String,
+        data_dir: String,
+        adopted: bool,
+    }
+
+    fn read_catalog_record(path: &std::path::Path) -> CatalogRecordView {
+        let bytes = std::fs::read(path).expect("catalog record must exist");
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("catalog record must be JSON");
+        CatalogRecordView {
+            epoch: value["epoch"].as_u64().expect("epoch"),
+            local_prepare_id: value["local_prepare_id"]
+                .as_str()
+                .expect("local_prepare_id")
+                .to_owned(),
+            data_dir: value["data_dir"].as_str().expect("data_dir").to_owned(),
+            adopted: value["adopted"].as_bool().expect("adopted"),
+        }
+    }
+
+    /// A lost local catalog record must be rebuilt from Meta's durable prepare
+    /// identity when the workspace directory itself survived. Without this the
+    /// node refuses to start and one missing 300-byte file takes the cluster down.
+    #[test]
+    fn startup_rebuilds_lost_catalog_record_from_meta_prepare_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta = Arc::new(LocalMeta {
+            node_id: "node-a".into(),
+            session_id: "session-a".into(),
+            next_epoch: Mutex::new(1),
+            recover_calls: Mutex::new(0),
+            active: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            rights: all_local_rights(),
+            prepare_ids: Mutex::new(HashMap::new()),
+        });
+        let ctx = test_context_for_path(temp.path());
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+
+        // Create the workspace, then record Meta's copy of the prepare identity
+        // exactly as the real Meta caller would surface it.
+        let epoch;
+        let id;
+        let prepare_id;
+        {
+            let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+            let roots = Arc::new(RootManager::new(
+                "node-a".into(),
+                "session-a".into(),
+                meta.clone(),
+                disk.clone(),
+            ));
+            let fs = OwnerFs::new_local(roots, disk.clone());
+            fs.mkdir(&ctx, root, OsStr::new("job-77"), 0o755).unwrap();
+
+            id = root::root_id_from_name(OsStr::new("job-77")).unwrap();
+            // Read the durable record straight from disk: the catalog
+            // holds an exclusive lock while a RootManager is live.
+            let stored = read_catalog_record(&
+                disk.root_path().join(".ownerfs-roots").join(format!("{}.json", id.0)),
+            );
+            epoch = stored.epoch;
+            prepare_id = stored.local_prepare_id.clone();
+            assert!(!prepare_id.is_empty());
+
+            // Drop the local catalog record; the data directory stays.
+            let record = disk
+                .root_path()
+                .join(".ownerfs-roots")
+                .join(format!("{}.json", id.0));
+            std::fs::remove_file(&record).unwrap();
+            let data_dir = disk.root_path().join("job-77");
+            assert!(data_dir.is_dir(), "workspace directory must survive");
+        }
+
+        // Meta still knows the root and its prepare identity.
+        {
+            let mut active = meta.active.lock().unwrap();
+            active.insert(
+                id.clone(),
+                root::RootLocation {
+                    id: id.clone(),
+                    epoch,
+                    home_node_id: "node-a".into(),
+                    home_session_id: "session-a".into(),
+                },
+            );
+            meta.prepare_ids
+                .lock()
+                .unwrap()
+                .insert(id.clone(), prepare_id.clone());
+        }
+
+        // Startup must rebuild the record rather than refuse to run.
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let roots = Arc::new(RootManager::new(
+            "node-a".into(),
+            "session-b".into(),
+            meta.clone(),
+            disk.clone(),
+        ));
+        let fs = OwnerFs::new_local(roots, disk.clone());
+
+        // The rebuilt record keeps Meta's epoch and prepare identity.
+        // Read the durable record straight from disk: the catalog
+        // holds an exclusive lock while a RootManager is live.
+        let stored = read_catalog_record(&
+            disk.root_path().join(".ownerfs-roots").join(format!("{}.json", id.0)),
+        );
+        assert_eq!(stored.epoch, epoch, "epoch must not be re-assigned");
+        assert_eq!(stored.local_prepare_id, prepare_id);
+        assert_eq!(stored.data_dir, "job-77");
+        // Meta cannot tell a normally created root from an adopted one, so the
+        // rebuild fails closed and records `adopted`. On a real host a create
+        // made by AFS itself reports `false` before the record is lost, so this
+        // value does change; it is the safe side, not a recovered one.
+        assert!(
+            stored.adopted,
+            "a rebuilt record must fail closed rather than reuse live data"
+        );
+
+        // And the workspace is usable again.
+        let entry = fs.lookup(&ctx, root, OsStr::new("job-77")).unwrap();
+        assert_eq!(entry.attributes.kind, FileKind::Directory);
+    }
+
+    /// Without Meta's prepare identity the node must keep refusing: that case is
+    /// a genuine mismatch, not recoverable evidence.
+    #[test]
+    fn startup_still_refuses_when_meta_has_no_prepare_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta = Arc::new(LocalMeta {
+            node_id: "node-a".into(),
+            session_id: "session-a".into(),
+            next_epoch: Mutex::new(1),
+            recover_calls: Mutex::new(0),
+            active: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            rights: all_local_rights(),
+            prepare_ids: Mutex::new(HashMap::new()),
+        });
+        let ctx = test_context_for_path(temp.path());
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+
+        let epoch;
+        let id;
+        {
+            let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+            let roots = Arc::new(RootManager::new(
+                "node-a".into(),
+                "session-a".into(),
+                meta.clone(),
+                disk.clone(),
+            ));
+            let fs = OwnerFs::new_local(roots, disk.clone());
+            fs.mkdir(&ctx, root, OsStr::new("job-88"), 0o755).unwrap();
+
+            id = root::root_id_from_name(OsStr::new("job-88")).unwrap();
+            // Read the durable record straight from disk: the catalog
+            // holds an exclusive lock while a RootManager is live.
+            let stored = read_catalog_record(&
+                disk.root_path().join(".ownerfs-roots").join(format!("{}.json", id.0)),
+            );
+            epoch = stored.epoch;
+            let record = disk
+                .root_path()
+                .join(".ownerfs-roots")
+                .join(format!("{}.json", id.0));
+            std::fs::remove_file(&record).unwrap();
+        }
+
+        // Meta knows the root but carries no prepare identity.
+        meta.active.lock().unwrap().insert(
+            id.clone(),
+            root::RootLocation {
+                id,
+                epoch,
+                home_node_id: "node-a".into(),
+                home_session_id: "session-a".into(),
+            },
+        );
+
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let error = match RootManager::open(
+            "node-a".into(),
+            "session-b".into(),
+            meta,
+            disk,
+        ) {
+            Ok(_) => panic!("startup must refuse without Meta prepare identity"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .message()
+                .contains("without local catalog evidence"),
+            "unexpected error: {}",
+            error.message()
+        );
     }
 
     #[test]
