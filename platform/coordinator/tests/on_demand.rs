@@ -89,6 +89,8 @@ struct Backend {
     fail_after_gate: AtomicBool,
     restore_input_publication: Mutex<Option<bool>>,
     lose_restore_result_ack: AtomicBool,
+    lose_restore_result_publication: AtomicBool,
+    forbid_overlapping_restore: AtomicBool,
 }
 #[async_trait]
 impl RuntimeDriver for Backend {
@@ -172,6 +174,14 @@ impl RuntimeDriver for Backend {
             std::fs::read(path.join("memory")).unwrap(),
             b"continued-state:42"
         );
+        if self.forbid_overlapping_restore.load(Ordering::SeqCst) {
+            assert!(
+                !self.running.lock().unwrap().values().any(|observation| {
+                    observation.environment_id == spec.id && observation.running
+                }),
+                "source restore started before the surviving backend stopped"
+            );
+        }
         self.restored.fetch_add(1, Ordering::SeqCst);
         let ip = self.start(spec, runtime, generation, devices).await?;
         self.restore_entered.notify_one();
@@ -303,19 +313,28 @@ impl StateSink for RestorePublicationFault {
                 return Ok(Durability::Journaled);
             }
         }
-        let durability = self.coordinator.commit_releasing(record, stopped).await?;
         if record.state == adx_core::EnvironmentState::Running
             && record.last_operation.as_ref().is_some_and(|op| {
                 op.kind == adx_core::LifecycleKind::Resume && op.id.starts_with("task:")
             })
-            && self
+        {
+            if self
+                .backend
+                .lose_restore_result_publication
+                .load(Ordering::SeqCst)
+            {
+                return Ok(Durability::Journaled);
+            }
+            if self
                 .backend
                 .lose_restore_result_ack
                 .swap(false, Ordering::SeqCst)
-        {
-            return Ok(Durability::Journaled);
+            {
+                self.coordinator.commit_releasing(record, stopped).await?;
+                return Ok(Durability::Journaled);
+            }
         }
-        Ok(durability)
+        self.coordinator.commit_releasing(record, stopped).await
     }
 
     async fn commit_deleted(

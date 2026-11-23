@@ -455,6 +455,223 @@ async fn drain_deferral_accepts_a_later_user_operation_after_published_restore()
     drain_capacity_loss(DrainCapacityLoss::ResultAck).await;
 }
 
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn deferral_replays_after_source_session_restart() {
+    for drain in [false, true] {
+        deferral_with_source_restart(drain, false, RestartDeferralFault::InputAck).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn deferral_replays_after_source_session_restart_during_abort() {
+    for drain in [false, true] {
+        deferral_with_source_restart(drain, true, RestartDeferralFault::InputAck).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn deferral_replays_after_source_session_restart_with_a_surviving_backend() {
+    for committed in [false, true] {
+        deferral_with_source_restart(false, false, RestartDeferralFault::Running { committed })
+            .await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RestartDeferralFault {
+    InputAck,
+    Running { committed: bool },
+}
+
+async fn deferral_with_source_restart(drain: bool, abort: bool, fault: RestartDeferralFault) {
+    let mut rig = Rig::new(Duration::from_secs(4)).await;
+    let running = rig.resume(false).await.unwrap().record.unwrap();
+    let original: adx_core::Assignment = running.assignment.clone().unwrap().try_into().unwrap();
+    let previous_session = rig.source.report.session_id.clone();
+    let (address, server, mut migrate) = if drain {
+        let (address, server, _, _) = prepare_review_drain(&rig).await;
+        let migrate = json!({
+            "task_id":"planned-migration", "epoch":1, "operation_id":"migrate",
+            "node_id":"a", "node_session_id":previous_session, "pod_uid":"source-pod",
+            "environment_id":"sleep", "expected_source_generation":original.generation,
+            "expected_source_revision":running.revision, "checkpoint_storage_alias":"obs"
+        });
+        (address, server, migrate)
+    } else {
+        let (address, server, mut migrate) = prepare_migration(&rig, running).await;
+        migrate["defer_on_capacity"] = json!(true);
+        (address, server, migrate)
+    };
+    let old_backend = rig.source.backend.clone();
+    let checkpoint = Arc::new(Notify::new());
+    *old_backend.checkpoint_gate.lock().unwrap() = Some(checkpoint.clone());
+    let body = migrate.to_string();
+    let migration =
+        tokio::spawn(async move { upgrade_response(address, "POST", MIGRATE_PATH, body).await });
+    timeout(
+        Duration::from_secs(3),
+        old_backend.checkpoint_entered.notified(),
+    )
+    .await
+    .unwrap();
+    take_target_capacity(&rig).await;
+    match fault {
+        RestartDeferralFault::InputAck => {
+            *old_backend.restore_input_publication.lock().unwrap() = Some(true);
+        }
+        RestartDeferralFault::Running { committed: false } => {
+            old_backend
+                .lose_restore_result_publication
+                .store(true, Ordering::SeqCst);
+        }
+        RestartDeferralFault::Running { committed: true } => {
+            old_backend
+                .lose_restore_result_ack
+                .store(true, Ordering::SeqCst);
+        }
+    }
+    checkpoint.notify_one();
+    let (status, body) = migration.await.unwrap();
+    assert_eq!(status, 503, "{body}");
+    let task = rig.session.upgrade_task().await.unwrap().unwrap();
+    assert_eq!(task.operations["migrate"].phase, "Deferring");
+    let before = rig.session.get("sleep").await.unwrap();
+    let record = before.result.as_ref().unwrap();
+    let preserve_runtime = matches!(fault, RestartDeferralFault::Running { .. });
+    let committed = matches!(fault, RestartDeferralFault::Running { committed: true });
+    assert_eq!(before.assignment, original);
+    if committed {
+        assert_eq!(record.state, adx_core::EnvironmentState::Running);
+    } else {
+        assert_eq!(record.state, adx_core::EnvironmentState::Paused);
+        assert_eq!(
+            record.revision,
+            task.operations["migrate"].source_stopped_revision.unwrap() + 1
+        );
+    }
+    assert_eq!(
+        old_backend.restored.load(Ordering::SeqCst),
+        1 + usize::from(preserve_runtime)
+    );
+    let surviving_runtime = old_backend.running.lock().unwrap().keys().next().cloned();
+    assert_eq!(surviving_runtime.is_some(), preserve_runtime);
+
+    rig.source.task.abort();
+    let _ = (&mut rig.source.task).await;
+    let period = Duration::from_secs(60);
+    let _ = super::source_session::restart_source_report_with_runtime(
+        &mut rig,
+        period,
+        preserve_runtime,
+    )
+    .await;
+    let current_session = rig.source.report.session_id.clone();
+    assert_ne!(current_session, previous_session);
+    assert!(!rig.source.manager.accepting_allocations());
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
+
+    let abort_path = "tasks/planned-migration/abort";
+    let freeze = json!({"task_id":"planned-migration", "epoch":1,
+        "operation_id":"freeze", "stage":"freeze"});
+    if abort {
+        let (status, body) =
+            upgrade_response(address, "POST", abort_path, freeze.to_string()).await;
+        assert_eq!(status, 409, "{body}");
+        let task = rig.session.upgrade_task().await.unwrap().unwrap();
+        assert_eq!(task.phase, "Aborting");
+        migrate["rollback"] = json!(true);
+    }
+    let (status, body) = upgrade_response(address, "POST", MIGRATE_PATH, migrate.to_string()).await;
+    assert_eq!(status, 409, "{body}");
+    migrate["node_session_id"] = json!(current_session);
+    let mut wrong_pod = migrate.clone();
+    wrong_pod["pod_uid"] = json!("other-pod");
+    let (status, body) =
+        upgrade_response(address, "POST", MIGRATE_PATH, wrong_pod.to_string()).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(rig.session.get("sleep").await.unwrap(), before);
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
+
+    let (status, reply) =
+        upgrade_response(address, "POST", MIGRATE_PATH, migrate.to_string()).await;
+    let receipt = if status == 503 {
+        // The test worker has no periodic loop. Drive the real authoritative
+        // adoption after the new session is authorized, then replay the same ID.
+        let rebound = rig.session.upgrade_task().await.unwrap().unwrap();
+        assert_eq!(rebound.nodes["a"].node_session_id, current_session);
+        assert_eq!(rebound.operations["migrate"].phase, "Deferring");
+        assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
+        report(&mut rig.source, &rig.address, period).await.unwrap();
+        post_upgrade(address, MIGRATE_PATH, migrate.clone()).await
+    } else {
+        assert_eq!(status, 200, "{reply}");
+        reply
+    };
+    assert_eq!(receipt["outcome"], "deferred");
+    assert_eq!(receipt["node_id"], "a");
+    assert_eq!(receipt["generation"], original.generation);
+    assert_eq!(
+        post_upgrade(address, MIGRATE_PATH, migrate.clone()).await,
+        receipt
+    );
+    migrate["node_session_id"] = json!(previous_session);
+    assert_eq!(post_upgrade(address, MIGRATE_PATH, migrate).await, receipt);
+    let settled = rig.session.upgrade_task().await.unwrap().unwrap();
+    assert_eq!(settled.nodes["a"].node_session_id, current_session);
+    assert_eq!(settled.nodes["a"].original_session_id, previous_session);
+    assert_eq!(
+        settled.operations["migrate"].source_session_id,
+        previous_session
+    );
+    assert_eq!(settled.operations["migrate"].phase, "Deferred");
+    assert!(!rig.source.manager.accepting_allocations());
+    let restored = rig.session.get("sleep").await.unwrap();
+    assert_eq!(restored.assignment, original);
+    let restored = restored.result.unwrap();
+    assert_eq!(restored.state, adx_core::EnvironmentState::Running);
+    assert_eq!(
+        rig.source.backend.restored.load(Ordering::SeqCst),
+        usize::from(!committed)
+    );
+    {
+        let active = rig.source.backend.running.lock().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active.contains_key(&restored.runtime.id));
+        if let Some(survivor) = surviving_runtime {
+            assert_eq!(active.contains_key(&survivor), committed);
+        }
+    }
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
+
+    if abort {
+        post_upgrade(address, abort_path, freeze).await;
+        let release = post_upgrade(
+            address,
+            abort_path,
+            json!({"task_id":"planned-migration",
+            "epoch":1, "operation_id":"restore", "stage":"restore-original", "node_id":"a",
+            "node_session_id":current_session, "pod_uid":"source-pod", "rollback":true}),
+        )
+        .await;
+        assert_eq!(release["restored_original"], true);
+        let finalized = post_upgrade(
+            address,
+            abort_path,
+            json!({"task_id":"planned-migration",
+            "epoch":1, "operation_id":"finalize", "stage":"finalize", "template_restored":true}),
+        )
+        .await;
+        assert_eq!(finalized["phase"], "Aborted");
+        assert!(rig.source.manager.accepting_allocations());
+        assert_eq!(rig.session.get("sleep").await.unwrap().assignment, original);
+        assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+    }
+    server.abort();
+}
+
 enum DrainCapacityLoss {
     Pinned,
     LocalCapacity,

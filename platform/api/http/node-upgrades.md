@@ -229,6 +229,16 @@ within the same task. Replaying the old ID returns its historical receipt.
 Clients that do not opt in retain the 429 and replay contract. Pod deletion still
 requires strict emptiness. If ownership already moved, settle the original transfer.
 
+If the source process restarts before `Deferred`, verify that the original Pod
+UID still identifies the current, non-terminating Pod. Retry the same migration
+operation with that UID and the freshly inspected session. The Coordinator
+requires isolation for the same task, the durable original ownership generation,
+and evidence of the task checkpoint or the already published restore before
+binding the new session. The source controller must reconcile any surviving
+backend before another restore. The migration receipt keeps the original session.
+Retry a 503 while the new session reconciles. If Abort freeze
+has entered `Aborting`, supply `rollback:true` in that replay, then retry freeze.
+
 `Cancelled` is an abort-only receipt for a Prepared operation whose ownership
 never left its original source generation/session. Freeze removes new Pause
 grants while preserving business routes and waits for already admitted work.

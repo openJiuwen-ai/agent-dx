@@ -683,9 +683,17 @@ async fn restart_source(rig: &mut Rig, period: Duration) {
     restart_source_report(rig, period).await.unwrap();
 }
 
-async fn restart_source_report(
+pub(super) async fn restart_source_report(
     rig: &mut Rig,
     period: Duration,
+) -> std::result::Result<(), tonic::Status> {
+    restart_source_report_with_runtime(rig, period, false).await
+}
+
+pub(super) async fn restart_source_report_with_runtime(
+    rig: &mut Rig,
+    period: Duration,
+    preserve_runtime: bool,
 ) -> std::result::Result<(), tonic::Status> {
     // A same-Pod restart proves predecessor replacement at the same endpoint.
     let mut replacement = worker(
@@ -695,6 +703,15 @@ async fn restart_source_report(
         Some(&rig.source.report.node_address),
     )
     .await;
+    if preserve_runtime {
+        // The adxlet process restarts while the runtime remains alive in the Pod.
+        *replacement.backend.running.lock().unwrap() =
+            rig.source.backend.running.lock().unwrap().clone();
+        replacement
+            .backend
+            .forbid_overlapping_restore
+            .store(true, Ordering::SeqCst);
+    }
     let report = report(&mut replacement, &rig.address, period).await;
     rig.source = replacement;
     report

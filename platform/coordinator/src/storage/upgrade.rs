@@ -159,6 +159,18 @@ impl UpgradeTask {
             .get(node_id)
             .is_some_and(|entry| entry.phase == "pending" && entry.node_session_id == session_id)
     }
+    pub(crate) fn has_deferral_rebind(&self, id: &str) -> bool {
+        self.nodes.get(id).is_some_and(|node| {
+            node.pod_uid == node.original_pod_uid
+                && node.node_session_id != node.original_session_id
+                && matches!(node.phase.as_str(), "draining" | "evacuating")
+                && self.operations.values().any(|op| {
+                    op.source_node_id == id
+                        && op.source_session_id != node.node_session_id
+                        && matches!(op.phase.as_str(), "Deferring" | "Deferred")
+                })
+        })
+    }
     /// An upgrade-owned pause can still drive accepted resumes on the same session.
     pub(crate) fn allows_drain_resume(&self, node: &StoredNode) -> bool {
         matches!(self.phase.as_str(), "Active" | "Aborting")
@@ -334,12 +346,21 @@ impl Session {
                         .await?;
                     let source: StoredEnvironment =
                         decode(value.as_deref().ok_or(Error::Conflict)?)?;
+                    let source_session = if finishes_deferral {
+                        &task
+                            .nodes
+                            .get(&operation.source_node_id)
+                            .ok_or(Error::Conflict)?
+                            .node_session_id
+                    } else {
+                        &operation.source_session_id
+                    };
                     if source.assignment.node_id != operation.source_node_id
                         || source.assignment.generation != operation.source_generation
                         || source.invalidated
                         || source.resume.is_some()
                         || source.recovery.as_ref().is_some_and(|r| r.pending)
-                        || token.as_deref() != Some(operation.source_session_id.as_str())
+                        || token.as_deref() != Some(source_session.as_str())
                         || starts_deferral
                             && source.result.as_ref().is_none_or(|r| {
                                 r.state != EnvironmentState::Paused
@@ -366,11 +387,14 @@ impl Session {
                             old.node_session_id != node.node_session_id
                                 || old.control_revision != node.control_revision
                         });
-                    if !confirms_delete && !restores_original {
+                    let rebinds_deferral = previous
+                        .is_some_and(|old| old.node_session_id != node.node_session_id)
+                        && task.has_deferral_rebind(id);
+                    if !confirms_delete && !restores_original && !rebinds_deferral {
                         continue;
                     }
-                    // Registration does not update this task. Fence both DELETE
-                    // confirmation and original-Pod release against that race.
+                    // Registration does not update this task. Fence DELETE,
+                    // original-Pod release and deferral rebind against that race.
                     let field = format!("node-session:{id}");
                     let [token] = self.store.fields([field.clone()]).await?;
                     if token.as_deref() != Some(node.node_session_id.as_str()) {
