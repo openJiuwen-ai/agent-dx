@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+import zlib
 
 SPEC = importlib.util.spec_from_file_location("runtime_rootfs", Path(__file__).parents[1] / "rootfs.py")
 ROOTFS = importlib.util.module_from_spec(SPEC)
@@ -85,18 +86,20 @@ class RuntimeRootfsTests(unittest.TestCase):
                     tar.add(component, arcname='.')
 
             guest = {'adx-execd': binary.read_bytes(), 'envd': envd_binary.read_bytes()}
+            guest_modes = {'adx-execd': 0o755, 'envd': 0o755}
 
             def run(command, **kwargs):
                 if command[0] == str(mkfs):
                     formatter_runs.append(command)
                     Path(command[-2]).write_bytes(f'EROFS {len(formatter_runs)}'.encode())
                 elif command[0] == str(root / 'fsck.erofs'):
-                    if command[1] == '--no-preserve':
+                    if command[-2].startswith('--extract='):
                         extract_runs.append(command)
-                        guest_bin = Path(command[2].split('=', 1)[1]) / 'usr/local/bin'
+                        guest_bin = Path(command[-2].split('=', 1)[1]) / 'usr/local/bin'
                         guest_bin.mkdir(parents=True)
                         for name, contents in guest.items():
                             (guest_bin / name).write_bytes(contents)
+                            (guest_bin / name).chmod(guest_modes[name])
                 elif command[0] == str(root / 'curl'):
                     self.assertEqual(kwargs.get('timeout'), 120)
                     if candidate_timeout:
@@ -132,6 +135,19 @@ class RuntimeRootfsTests(unittest.TestCase):
                 self.assertNotIn('reused_from', metadata)
                 candidate_timeout = False
 
+                valid_archive = candidate.read_bytes()
+                malformed_tar = io.BytesIO()
+                with tarfile.open(fileobj=malformed_tar, mode='w') as tar:
+                    entry = tarfile.TarInfo('adx-execd')
+                    entry.size = 40960
+                    tar.addfile(entry, io.BytesIO(b'x' * entry.size))
+                compressor = zlib.compressobj(level=0, wbits=31)
+                prefix = compressor.compress(malformed_tar.getvalue()[:20480])
+                # A valid gzip prefix opens successfully, then an invalid deflate block fails during extraction.
+                candidate.write_bytes(prefix + compressor.flush(zlib.Z_SYNC_FLUSH) + b'\x07')
+                self.assertNotIn('reused_from', build_image('corrupt-deflate', ROOTFS.sha256(candidate))[1])
+                candidate.write_bytes(valid_archive)
+
                 for name, path in (('execd', binary), ('envd', envd_binary), ('recipe', mkfs)):
                     with self.subTest(changed=name):
                         old = path.read_bytes()
@@ -155,6 +171,11 @@ class RuntimeRootfsTests(unittest.TestCase):
                 guest['envd'] = b'different embedded envd'
                 self.assertNotIn('reused_from', build_image('bad-guest', digest)[1])
                 guest['envd'] = envd_binary.read_bytes()
+                for name in guest_modes:
+                    with self.subTest(non_executable=name):
+                        guest_modes[name] = 0o644
+                        self.assertNotIn('reused_from', build_image(f'wrong-mode-{name}', digest)[1])
+                        guest_modes[name] = 0o755
 
                 shutil.copyfile(reused, first)
                 reused.with_suffix('.json').rename(release)

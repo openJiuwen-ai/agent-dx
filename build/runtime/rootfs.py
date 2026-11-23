@@ -12,11 +12,13 @@ from pathlib import Path, PurePosixPath
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 from urllib.parse import urlsplit
+import zlib
 
 LOG = logging.getLogger(__name__)
 REPO = Path(__file__).resolve().parents[2]
@@ -91,7 +93,8 @@ def reuse_image(stage, url, digest, expected):
 
     image = component / 'adx-runtime-rootfs.img'
     guest = stage / 'previous-rootfs'
-    subprocess.run([_executable('fsck.erofs'), '--no-preserve', f'--extract={guest}', str(image)],
+    subprocess.run([_executable('fsck.erofs'), '--no-preserve-owner', '--preserve-perms',
+                    f'--extract={guest}', str(image)],
                    check=True, timeout=300)
     guest_bin = guest / 'usr/local/bin'
     if any(path.is_symlink() for path in (guest, guest / 'usr', guest / 'usr/local', guest_bin)):
@@ -100,6 +103,8 @@ def reuse_image(stage, url, digest, expected):
         binary = guest_bin / name
         if binary.is_symlink() or not binary.is_file() or sha256(binary) != expected[key]:
             raise ValueError(f'previous EROFS contains a different {name}')
+        if stat.S_IMODE(binary.stat().st_mode) != 0o755:
+            raise ValueError(f'previous EROFS has unexpected executable permissions for {name}')
     return image, metadata['rootfs_sha256'], commit
 
 
@@ -248,7 +253,8 @@ def build(binary, output, *, base_archive=None, target=None, envd=None, reuse_ur
             with tempfile.TemporaryDirectory(dir=stage) as candidate:
                 try:
                     image, digest, commit = reuse_image(Path(candidate), reuse_url, reuse_sha256, metadata | provenance)
-                except (OSError, ValueError, EOFError, tarfile.TarError, subprocess.SubprocessError) as error:
+                except (OSError, ValueError, EOFError, tarfile.TarError, zlib.error,
+                        subprocess.SubprocessError) as error:
                     LOG.warning('EROFS reuse skipped: %s', error)
                 else:
                     shutil.copyfile(image, output)

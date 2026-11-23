@@ -74,8 +74,9 @@ On the default bucket, the first AMD64 lookup with no record tries the pinned
 `4104c42e7783` archive. It predates reuse fingerprints, so the build creates a
 fresh image. Unavailable or incompatible candidates also trigger a fresh build.
 Downloading a previous archive has a separate two-minute total budget.
-The Execd build verifies the archive and the binaries inside the disk, and copies
-the image byte-for-byte when Execd, envd, base filesystem and recipe match.
+The Execd build verifies the archive, the binaries inside the disk and their
+executable permissions, then copies the image byte-for-byte when Execd, envd,
+base filesystem and recipe match.
 Both release archives are packaged and verified against the current ADX commit.
 Set `ADX_ROOTFS_REUSE_URL_AMD64` and `ADX_ROOTFS_REUSE_SHA256_AMD64` together to
 override the automatic lookup, or use the corresponding `_ARM64` variables.
