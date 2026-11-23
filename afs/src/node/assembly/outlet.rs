@@ -11,7 +11,7 @@ use crate::{
         live::{self, ImportExecutor, MirrorConfig, OutletLayouts},
         mount::{self, KernelMounter},
     },
-    node::vfs::ownerfs::root::RootMeta,
+    node::vfs::ownerfs::{OwnerFs, root::RootMeta},
     runtime::{BoxError, Services, cancelled},
 };
 use std::sync::Arc;
@@ -24,11 +24,8 @@ pub(super) fn start_mirror(
     ownerfs: &OwnerFsAssembly,
     services: &mut Services,
 ) -> Result<(), BoxError> {
-    let (Some(outlet), Some(control), Some(owner)) = (
-        cfg.outlet.as_ref(),
-        ownerfs.outlet_control.as_ref(),
-        ownerfs.instance.as_ref(),
-    ) else {
+    let (Some(outlet), Some(control)) = (cfg.outlet.as_ref(), ownerfs.outlet_control.as_ref())
+    else {
         return Ok(());
     };
     let mountinfo = std::fs::read("/proc/self/mountinfo").map_err(|error| {
@@ -83,7 +80,7 @@ pub(super) fn start_mirror(
             peers: control.peers.clone(),
             runtime: tokio::runtime::Handle::current(),
         },
-        owner.clone(),
+        control.owner.clone(),
         FuseMountOptions::from(cfg).exec,
     );
     afs_logging::info!(
@@ -118,4 +115,5 @@ pub(super) fn start_mirror(
 pub(super) struct OutletControl {
     pub(super) meta: Arc<crate::node::rpc::meta::GrpcRootMeta>,
     pub(super) peers: Arc<crate::node::rpc::peer::PeerConnectionPool>,
+    pub(super) owner: Arc<OwnerFs>,
 }
