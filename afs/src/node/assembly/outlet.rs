@@ -61,6 +61,7 @@ pub(super) fn start_mirror(
             ),
         )));
     }
+    mount::recover_legacy_outlet_mount(&outlet.import_root)?;
     live::withdraw_direct_legacy_links(&outlet.public_root, &outlet.import_root)?;
     afs_logging::info!(
         "outlet.import.enabled";
