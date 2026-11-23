@@ -612,6 +612,12 @@ components:
       additionalProperties: false
     FileMkdirArgs:
       type: object
+      description: >-
+        Creates directories using filesystem-default permissions subject to the
+        runtime process umask. Only path and recursive are accepted; mode is
+        unsupported and returns HTTP 400 with error_code=INVALID_ARGUMENT before
+        filesystem access. Existing directory permissions are preserved.
+        Use process.exec with chmod to set permissions explicitly.
       properties:
         path:
           type: string

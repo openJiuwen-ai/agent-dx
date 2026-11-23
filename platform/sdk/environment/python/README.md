@@ -921,6 +921,13 @@ Existing directories return `False`, new directories return `True`, and a
 regular file at the target remains an error. Concurrent requests report only
 the actual creator as `True`. Runtime validation also covers direct HTTP callers.
 
+Directory creation accepts only `path` and `recursive`; `mode` is unsupported.
+Direct HTTP calls that supply `mode` return HTTP 400 with
+`error_code=INVALID_ARGUMENT` before filesystem access. New directory permissions
+follow the runtime process umask, and existing directory permissions are preserved.
+To set permissions explicitly, run `chmod` through `env.commands.run()`, for example
+`env.commands.run("chmod 700 /work/parents/leaf")`.
+
 ## Portable workspace mounts
 
 For a runsc workspace backed by a host or Volume bind, callers may explicitly use
