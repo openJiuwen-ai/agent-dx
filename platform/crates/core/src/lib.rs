@@ -227,6 +227,8 @@ impl EnvironmentSpec {
         self.lifecycle.validate()?;
         self.resources.validate()?;
         self.scheduling.validate()?;
+        self.scheduling
+            .validate_node_capability_runtime(&self.runtime_class)?;
         self.execution.validate(&self.resources)
     }
 }

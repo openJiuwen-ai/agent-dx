@@ -85,7 +85,14 @@ impl Directory {
             .cloned()
             .collect::<Vec<_>>();
         if matches.is_empty() {
-            return self.select();
+            // A capability-constrained request without a suitable entry node
+            // belongs in the central queue, where a compatible node can arrive
+            // before the scheduling deadline.
+            return if policy.required_node_capability_labels().next().is_some() {
+                None
+            } else {
+                self.select()
+            };
         }
         self.next %= matches.len();
         let node = matches.get(self.next).cloned();
@@ -100,21 +107,10 @@ impl Directory {
     }
 }
 
-pub(crate) fn matches_node_placement(policy: &SchedulingPolicy, node: &pb::NodeEndpoint) -> bool {
+fn matches_node_placement(policy: &SchedulingPolicy, node: &pb::NodeEndpoint) -> bool {
     let mut labels: BTreeMap<_, _> = node.labels.clone().into_iter().collect();
     labels.insert("NODE_ID".into(), node.node_id.clone());
-    policy.matches_node(&labels)
-        && policy
-            .placement_groups
-            .iter()
-            .filter(|group| group.required && group.target == PlacementTarget::Node)
-            .all(|group| {
-                let matched = group
-                    .terms
-                    .iter()
-                    .any(|term| term.selector.matches(&labels));
-                matched != group.anti
-            })
+    policy.matches_node_placement(&labels)
 }
 
 #[cfg(test)]
@@ -240,6 +236,44 @@ mod tests {
         };
 
         assert_eq!(d.select_for(&spec).unwrap().node_id, "b");
+    }
+
+    #[test]
+    fn capability_constraints_with_no_matching_entry_use_central_scheduling() {
+        let mut directory = Directory::default();
+        directory
+            .update(pb::NodeDirectory {
+                epoch: 1,
+                nodes: vec![pb::NodeEndpoint {
+                    node_id: "available".into(),
+                    address: "available:9000".into(),
+                    relay_address: "available:9443".into(),
+                    session_id: "boot".into(),
+                    accepting_allocations: true,
+                    ..Default::default()
+                }],
+                valid_for_millis: 1000,
+            })
+            .unwrap();
+        let spec = pb::EnvironmentSpec {
+            scheduling: Some(pb::SchedulingPolicy {
+                required_node: vec![pb::LabelSelector {
+                    expressions: vec![pb::LabelRequirement {
+                        key: adx_core::scheduling::node_capability_label(
+                            "runsc",
+                            adx_core::scheduling::CHECKPOINT_RESTORE_V1,
+                        ),
+                        op: pb::SelectorOp::In as i32,
+                        values: vec!["true".into()],
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(directory.select_for(&spec).is_none());
     }
 
     #[test]

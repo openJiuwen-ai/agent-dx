@@ -962,7 +962,7 @@ impl CoordinatorRpc {
             .spec
             .ok_or_else(|| Status::invalid_argument("spec required"))?;
         tenant(r.caller.as_ref(), &raw.tenant_id)?;
-        let scheduling = raw
+        let scheduling: SchedulingPolicy = raw
             .scheduling
             .as_ref()
             .filter(|policy| {
@@ -984,6 +984,9 @@ impl CoordinatorRpc {
             .transpose()
             .map_err(status)?
             .unwrap_or_default();
+        scheduling
+            .validate_node_capability_runtime(&raw.runtime_class)
+            .map_err(status)?;
         let expected_assignment =
             expected_assignment.filter(|_| capability_constraints::required(&scheduling));
         let session = {
@@ -1273,7 +1276,7 @@ impl CoordinatorRpc {
         spec: EnvironmentSpec,
         schedule_timeout: Duration,
         create_deadline: adx_transport::deadline::Deadline,
-        expected_assignment: Option<Assignment>,
+        mut expected_assignment: Option<Assignment>,
         request_id: String,
         stats: Arc<ScheduleStats>,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
@@ -1537,7 +1540,9 @@ impl CoordinatorRpc {
                         }
                         .into(),
                     );
-                    self.retry_initial(&spec.id, &stored.assignment).await?;
+                    if self.retry_initial(&spec.id, &stored.assignment).await? {
+                        expected_assignment = None;
+                    }
                     tokio::time::timeout_at(create_deadline.instant(), changed)
                         .await
                         .map_err(|_| {
@@ -1565,7 +1570,9 @@ impl CoordinatorRpc {
                             i32::from(tonic::Code::Unavailable).to_string(),
                             "node channel connect failed".into(),
                         );
-                        self.retry_initial(&spec.id, &stored.assignment).await?;
+                        if self.retry_initial(&spec.id, &stored.assignment).await? {
+                            expected_assignment = None;
+                        }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
@@ -1634,7 +1641,9 @@ impl CoordinatorRpc {
                             i32::from(error.code()).to_string(),
                             error.message().to_owned(),
                         );
-                        self.retry_initial(&spec.id, &stored.assignment).await?;
+                        if self.retry_initial(&spec.id, &stored.assignment).await? {
+                            expected_assignment = None;
+                        }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
@@ -1691,11 +1700,13 @@ impl CoordinatorRpc {
         }
     }
 
+    // A pending expected assignment fences the initial owner. Only a retry
+    // that actually abandons that owner may select a replacement assignment.
     async fn retry_initial(
         &self,
         id: &str,
         assignment: &adx_core::Assignment,
-    ) -> std::result::Result<(), Status> {
+    ) -> std::result::Result<bool, Status> {
         let _publication = self.create_guard(format!("publication:{id}")).await;
         let mut state = self.0.state.lock().await;
         state.recover_authoritative_state().await.map_err(status)?;
@@ -1705,7 +1716,7 @@ impl CoordinatorRpc {
             Ok(stored) if stored.result.is_some() => {
                 state.accept_stored_claim(stored).map_err(status)?;
                 self.0.changed.notify_waiters();
-                return Ok(());
+                return Ok(false);
             }
             Ok(stored) => {
                 if stored.assignment != *assignment
@@ -1714,7 +1725,7 @@ impl CoordinatorRpc {
                 {
                     state.accept_stored_claim(stored).map_err(status)?;
                     self.0.changed.notify_waiters();
-                    return Ok(());
+                    return Ok(false);
                 }
                 // Only the optional path has a durable pending owner. Retire its
                 // exact opaque record before selecting a replacement execution.
@@ -1726,7 +1737,7 @@ impl CoordinatorRpc {
                     Ok(current) => {
                         state.accept_stored_claim(current).map_err(status)?;
                         self.0.changed.notify_waiters();
-                        return Ok(());
+                        return Ok(false);
                     }
                     Err(Error::NotFound) => (),
                     Err(error) => {
@@ -1747,8 +1758,9 @@ impl CoordinatorRpc {
             state.environments.remove(id);
             state.local_reservation_deadlines.remove(id);
             self.0.changed.notify_waiters();
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
     async fn expire_pending(
         &self,
@@ -2758,6 +2770,16 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     state
                         .check_capability_replay(scheduling, current, self.0.heartbeat_timeout)
                         .map_err(Status::failed_precondition)?;
+                    // RegisterNode binds NODE_ID to the authenticated worker.
+                    let labels = &node.node.labels;
+                    if labels.get("NODE_ID") != Some(&stored.assignment.node_id)
+                        || !scheduling.matches_node_placement(labels)
+                        || !current.spec.scheduling.matches_node_placement(labels)
+                    {
+                        return Err(Status::failed_precondition(
+                            "Environment's current worker session does not satisfy its node placement constraints",
+                        ));
+                    }
                     let session = node
                         .session
                         .as_ref()

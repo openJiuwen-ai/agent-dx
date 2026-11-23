@@ -152,6 +152,24 @@ class _InvokeResult(dict):
         self.request_id = request_id
 
 
+class _UnsupportedConstrainedCreateRoute(EnvironmentError):
+    """The request matched a known legacy route rejection."""
+
+
+def _is_missing_constrained_create_route(error: EnvironmentHTTPError) -> bool:
+    if error.status_code != 404 or error.request_forwarded is True:
+        return False
+    if error.environment_id is not None or error.operation_id is not None:
+        return False
+    message = error.payload.get("message")
+    if not isinstance(message, str) or message.strip() != "route not found":
+        return False
+    return (error.code, error.retry, error.outcome) in (
+        (None, None, None),
+        ("NOT_FOUND", "never", "terminal"),
+    )
+
+
 class _RetryableHTTPStatus(EnvironmentHTTPError):
     """Transient gateway response whose create/delete outcome may be unknown."""
 
@@ -215,6 +233,14 @@ _DELETE_MAX_ATTEMPTS = 3
 _DELETE_RETRY_BACKOFF_SECONDS = 0.1
 _LIFECYCLE_MAX_ATTEMPTS = 3
 _LIFECYCLE_RETRY_BACKOFF_SECONDS = 0.1
+
+
+def _constrained_environment_id(body: Dict[str, Any]) -> Optional[str]:
+    """Qualify a submitted name like the constrained create API does."""
+    name = body.get("name")
+    if not name:
+        return None
+    return f"{body.get('namespace') or 'default'}-{name}"
 
 
 class EnvironmentClient:
@@ -339,9 +365,12 @@ class EnvironmentClient:
         request_body = dict(body)
         request_name = request_body.get("name") or f"environment-{operation_id}"
         request_body["name"] = request_name
+        constrained = "requiredNodeCapabilities" in request_body
+        constrained_environment_id = _constrained_environment_id(request_body) if constrained else None
         deadline = time.monotonic() + request_timeout
         last_error: Optional[BaseException] = None
         first_error: Optional[BaseException] = None
+        known_operation_id: Optional[str] = None
         attempts = 0
 
         for attempt in range(1, _CREATE_MAX_ATTEMPTS + 1):
@@ -359,6 +388,9 @@ class EnvironmentClient:
                 last_error = exc
                 if first_error is None:
                     first_error = exc
+                if constrained and isinstance(exc, _RetryableHTTPStatus):
+                    constrained_environment_id = exc.environment_id or constrained_environment_id
+                    known_operation_id = exc.operation_id or known_operation_id
                 if attempt >= _CREATE_MAX_ATTEMPTS:
                     break
                 remaining = deadline - time.monotonic()
@@ -381,14 +413,15 @@ class EnvironmentClient:
             except EnvironmentError as exc:
                 # Preserve the authoritative final contract. A terminal replay
                 # response must not erase the first failed create attempt.
-                if first_error is not None and exc.code == "UNSUPPORTED" and "requiredNodeCapabilities" in request_body:
+                if first_error is not None and isinstance(exc, _UnsupportedConstrainedCreateRoute):
                     raise EnvironmentError(
                         "a prior constrained create attempt may have reached a compatible server",
                         request_id=request_id,
                         code="OUTCOME_UNKNOWN",
                         retry="same_operation",
                         outcome="unknown",
-                        environment_id=request_name,
+                        operation_id=known_operation_id,
+                        environment_id=constrained_environment_id,
                         first_error=first_error,
                     ) from exc
                 exc.first_error = first_error
@@ -405,8 +438,8 @@ class EnvironmentClient:
                 f"environment create service failed after {attempts} attempts: {last_error}",
                 request_id=last_error.request_id, code=last_error.code,
                 retry=last_error.retry, outcome=last_error.outcome,
-                operation_id=last_error.operation_id,
-                environment_id=last_error.environment_id,
+                operation_id=last_error.operation_id or known_operation_id,
+                environment_id=last_error.environment_id or constrained_environment_id,
                 scheduling_failure=last_error.scheduling_failure,
                 probe_failure=last_error.probe_failure,
                 request_forwarded=last_error.request_forwarded,
@@ -422,8 +455,10 @@ class EnvironmentClient:
             code=(contract_error.code if contract_error else None) or "OUTCOME_UNKNOWN",
             retry=(contract_error.retry if contract_error else None) or "same_operation",
             outcome=(contract_error.outcome if contract_error else None) or "unknown",
-            operation_id=contract_error.operation_id if contract_error else None,
-            environment_id=(contract_error.environment_id if contract_error else None) or request_name,
+            operation_id=(contract_error.operation_id if contract_error else None) or known_operation_id,
+            environment_id=constrained_environment_id
+            or (contract_error.environment_id if contract_error else None)
+            or request_name,
             first_error=first_error,
         ) from last_error
 
@@ -449,14 +484,18 @@ class EnvironmentClient:
             timeout=request_timeout,
         ) as resp:
             if constrained and resp.status_code in (404, 405, 501):
-                raise EnvironmentError(
+                resp.read()
+                error = self._http_error(resp, request_id=request_id)
+                if not _is_missing_constrained_create_route(error):
+                    raise error
+                raise _UnsupportedConstrainedCreateRoute(
                     "server does not support constrained environment creation",
                     request_id=request_id,
                     code="UNSUPPORTED",
                     retry="never",
                     outcome="not_started",
                     request_forwarded=False,
-                )
+                ) from error
             if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
                 resp.read()
                 error = self._http_error(resp, request_id=request_id)
@@ -501,14 +540,16 @@ class EnvironmentClient:
                 code="OUTCOME_UNKNOWN",
                 retry="same_operation",
                 outcome="unknown",
-                environment_id=str(body.get("name") or "") or None,
+                environment_id=(
+                    _constrained_environment_id(body) if constrained else str(body.get("name") or "") or None
+                ),
             )
         if final.get("status") != "running":
             status = final.get("status") or "unknown"
             code = final.get("errorCode")
             message = final.get("message") or "environment did not reach running state"
             response_request_id = final.get("requestId") or request_id
-            environment_id = final.get("environmentId") or "unknown"
+            environment_id = final.get("environmentId") or (None if constrained else "unknown")
             detail = final.get("error")
             if isinstance(detail, dict):
                 error = EnvironmentHTTPError(

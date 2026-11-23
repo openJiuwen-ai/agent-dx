@@ -131,6 +131,10 @@ async fn constrained_create_replay_requires_current_session_proof_without_resubm
     assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 1);
 
     *fixture.state.verified_node_session.lock().unwrap() = Some("original-session".into());
+    fixture
+        .state
+        .node_watch_unavailable
+        .store(true, Ordering::SeqCst);
     let valid_replay = send("create-with-capabilities", "application/json", None).await;
     assert_eq!(valid_replay.status(), 200);
 

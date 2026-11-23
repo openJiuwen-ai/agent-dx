@@ -145,7 +145,7 @@ impl State {
         timeout: Duration,
     ) -> bool {
         !capability_constraints::required(requested)
-            || (capability_constraints::supported(requested, &node.node.labels)
+            || (requested.matches_node_capabilities(&node.node.labels)
                 && node.session.as_ref().is_some_and(|session| {
                     self.live_claimant(&node.node.id, &session.id, timeout)
                         .is_ok()

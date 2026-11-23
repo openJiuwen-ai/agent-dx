@@ -7,7 +7,7 @@ use crate::{
     ownership::Cache,
     workspace_affinity,
 };
-use adx_core::scheduling::{SchedulingPolicy, NODE_CAPABILITY_LABEL_PREFIX};
+use adx_core::scheduling::NODE_CAPABILITY_LABEL_PREFIX;
 use adx_protocol::control as pb;
 use adx_transport::deadline::Deadline;
 use serde_json::{json, Value};
@@ -34,12 +34,18 @@ struct RequiredNodeCapabilities {
 impl RequiredNodeCapabilities {
     fn from_spec(spec: &pb::EnvironmentSpec) -> Option<Self> {
         let policy = spec.scheduling.as_ref()?;
-        let has_capabilities = policy
-            .required_node
-            .first()?
-            .expressions
-            .iter()
-            .any(|requirement| requirement.key.starts_with(NODE_CAPABILITY_LABEL_PREFIX));
+        let has_capabilities = policy.required_node.iter().any(|selector| {
+            selector
+                .match_labels
+                .keys()
+                .chain(
+                    selector
+                        .expressions
+                        .iter()
+                        .map(|requirement| &requirement.key),
+                )
+                .any(|key| key.starts_with(NODE_CAPABILITY_LABEL_PREFIX))
+        });
         if !has_capabilities {
             return None;
         }
@@ -56,10 +62,7 @@ impl RequiredNodeCapabilities {
         })
     }
 
-    fn verify_record<'a>(
-        &self,
-        record: &'a pb::EnvironmentRecord,
-    ) -> Result<&'a pb::SchedulingPolicy, Status> {
+    fn verify_record(&self, record: &pb::EnvironmentRecord) -> Result<(), Status> {
         record
             .spec
             .as_ref()
@@ -72,6 +75,7 @@ impl RequiredNodeCapabilities {
                         .iter()
                         .all(|group| policy.placement_groups.contains(group))
             })
+            .map(|_| ())
             .ok_or_else(|| {
                 Status::failed_precondition(
                     "retained environment does not satisfy required node capability placement",
@@ -733,17 +737,8 @@ impl EnvironmentService {
         id: &str,
         caller: &pb::CallerContext,
     ) -> Result<pb::EnvironmentRecord, Status> {
-        let (record, node) = self.clients.verify_capability_owner(id, caller).await?;
-        let policy: SchedulingPolicy = capabilities
-            .verify_record(&record)?
-            .clone()
-            .try_into()
-            .map_err(adx_protocol::status)?;
-        if !crate::directory::matches_node_placement(&policy, &node) {
-            return Err(Status::failed_precondition(
-                "assigned node no longer satisfies required capability placement",
-            ));
-        }
+        let record = self.clients.verify_capability_owner(id, caller).await?;
+        capabilities.verify_record(&record)?;
         Ok(record)
     }
 }
@@ -1175,6 +1170,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response["tunnel"]["path"], "/tunnel/tenant-worker/18765");
+    }
+
+    #[test]
+    fn replay_detects_capabilities_in_all_required_node_selectors() {
+        let key = adx_core::scheduling::node_capability_label(
+            "runsc",
+            adx_core::scheduling::CHECKPOINT_RESTORE_V1,
+        );
+        let spec = pb::EnvironmentSpec {
+            scheduling: Some(pb::SchedulingPolicy {
+                required_node: vec![
+                    pb::LabelSelector::default(),
+                    pb::LabelSelector {
+                        match_labels: [(key, "true".into())].into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(RequiredNodeCapabilities::from_spec(&spec).is_some());
     }
 
     #[test]

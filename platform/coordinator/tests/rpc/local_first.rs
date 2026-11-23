@@ -49,40 +49,12 @@ async fn live_inspection_accepts_open_admission_but_requires_a_current_session()
 #[tokio::test]
 #[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
 async fn constrained_named_replay_requires_the_current_worker_capability_report() {
-    use adx_core::scheduling::{
-        node_capability_label, LabelSelector, CHECKPOINT_RESTORE_V1, NODE_CAPABILITY_LABEL_VALUE,
-    };
-
     let checkpoint_root = tempfile::tempdir().unwrap();
     let mut rig = Rig::new_with_shards_and_checkpoint(2, Some(checkpoint_root.path())).await;
-    let checkpoint = pb::RuntimeCapabilities {
-        capability_ids: vec![CHECKPOINT_RESTORE_V1.into()],
-    };
-    let report = &mut rig.registrations[1];
-    report.heartbeat_sequence += 1;
-    report
-        .runtime_capabilities
-        .insert("runc".into(), checkpoint.clone());
-    rig.claimants[1]
-        .register_node(report.clone())
-        .await
-        .unwrap();
-
-    let constrained = |id: &str| {
-        let mut spec = spec(id);
-        spec.scheduling.required_node.push(LabelSelector {
-            match_labels: [(
-                node_capability_label("runc", CHECKPOINT_RESTORE_V1),
-                NODE_CAPABILITY_LABEL_VALUE.into(),
-            )]
-            .into(),
-            ..Default::default()
-        });
-        pb::CreateEnvironmentRequest {
-            spec: Some(spec.into()),
-            ..create(id)
-        }
-    };
+    rig.registrations[1]
+        .labels
+        .insert("pool".into(), "checkpoint".into());
+    rig.report_checkpoint_capability(1, true).await;
 
     let ordinary = rig.nodes[0]
         .create_local_environment(Rig::request("ordinary", 0))
@@ -93,7 +65,7 @@ async fn constrained_named_replay_requires_the_current_worker_capability_report(
         .unwrap();
     assert_eq!(
         rig.coordinator
-            .create_environment(constrained("ordinary"))
+            .create_environment(checkpoint_constrained_create("ordinary"))
             .await
             .unwrap_err()
             .code(),
@@ -101,7 +73,17 @@ async fn constrained_named_replay_requires_the_current_worker_capability_report(
     );
     rig.delete(&ordinary).await;
 
-    let request = constrained("capable");
+    let mut request = checkpoint_constrained_create("capable");
+    request
+        .spec
+        .as_mut()
+        .unwrap()
+        .scheduling
+        .as_mut()
+        .unwrap()
+        .required_node[0]
+        .match_labels
+        .insert("pool".into(), "checkpoint".into());
     let result = rig.nodes[0]
         .create_local_environment(pb::LocalEnvironmentCreateRequest {
             create: Some(request.clone()),
@@ -136,13 +118,22 @@ async fn constrained_named_replay_requires_the_current_worker_capability_report(
         "boot-b"
     );
 
-    let report = &mut rig.registrations[1];
-    report.heartbeat_sequence += 1;
-    report.runtime_capabilities.clear();
-    rig.claimants[1]
-        .register_node(report.clone())
-        .await
-        .unwrap();
+    rig.registrations[1]
+        .labels
+        .insert("pool".into(), "ordinary".into());
+    rig.report_checkpoint_capability(1, true).await;
+    assert_eq!(
+        rig.coordinator
+            .get_environment(proof_request())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    rig.registrations[1]
+        .labels
+        .insert("pool".into(), "checkpoint".into());
+    rig.report_checkpoint_capability(1, false).await;
     assert_eq!(
         rig.coordinator
             .get_environment(proof_request())
@@ -161,15 +152,7 @@ async fn constrained_named_replay_requires_the_current_worker_capability_report(
     );
     rig.delete(&result).await;
 
-    let report = &mut rig.registrations[1];
-    report.heartbeat_sequence += 1;
-    report
-        .runtime_capabilities
-        .insert("runc".into(), checkpoint);
-    rig.claimants[1]
-        .register_node(report.clone())
-        .await
-        .unwrap();
+    rig.report_checkpoint_capability(1, true).await;
     assert_eq!(
         rig.coordinator
             .create_environment(pb::CreateEnvironmentRequest {
@@ -182,6 +165,82 @@ async fn constrained_named_replay_requires_the_current_worker_capability_report(
         tonic::Code::FailedPrecondition
     );
     assert_eq!(rig.backends[1].started.load(Ordering::SeqCst), 1);
+
+    rig.managers[1]
+        .checkpoint_capability_storage_ready()
+        .await
+        .unwrap();
+    // A successful qualification removes its private staging directory.
+    std::fs::remove_dir(checkpoint_root.path().join("b")).unwrap();
+    assert!(rig.managers[1]
+        .checkpoint_capability_storage_ready()
+        .await
+        .is_err());
+}
+
+fn checkpoint_constrained_create(id: &str) -> pb::CreateEnvironmentRequest {
+    use adx_core::scheduling::{
+        node_capability_label, LabelSelector, CHECKPOINT_RESTORE_V1, NODE_CAPABILITY_LABEL_VALUE,
+    };
+    let mut spec = spec(id);
+    spec.scheduling.required_node.push(LabelSelector {
+        match_labels: [(
+            node_capability_label("runc", CHECKPOINT_RESTORE_V1),
+            NODE_CAPABILITY_LABEL_VALUE.into(),
+        )]
+        .into(),
+        ..Default::default()
+    });
+    pb::CreateEnvironmentRequest {
+        spec: Some(spec.into()),
+        ..create(id)
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn capability_create_can_reassign_after_retiring_its_expected_pending_owner() {
+    let checkpoint_root = tempfile::tempdir().unwrap();
+    let mut rig = Rig::new_with_shards_and_checkpoint(2, Some(checkpoint_root.path())).await;
+    rig.report_checkpoint_capability(0, true).await;
+    rig.report_checkpoint_capability(1, true).await;
+    let mut create = checkpoint_constrained_create("retry-capable");
+    create.request_id = "retry-capable-request".into();
+    let claim = rig.claimants[0]
+        .claim_environment(pb::ClaimEnvironmentRequest {
+            create_deadline_unix_millis: 0,
+            request_id: create.request_id.clone(),
+            spec: create.spec.clone(),
+            caller: caller(),
+            node_session_id: "boot-a".into(),
+            devices: vec![],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(pb::claim_environment_response::Outcome::Owned(owner)) = claim.outcome else {
+        panic!("expected an initial pending owner");
+    };
+    let original = owner.assignment.unwrap();
+    assert_eq!(original.node_id, "a");
+    rig.report_checkpoint_capability(0, false).await;
+    create.expected_assignment = Some(original.clone());
+
+    let record = rig
+        .coordinator
+        .create_environment(create)
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let assigned = record.assignment.as_ref().unwrap();
+    assert_eq!(assigned.node_id, "b");
+    assert_ne!(assigned.generation, original.generation);
+    assert_eq!(record.creation_request_id, "retry-capable-request");
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.backends[1].started.load(Ordering::SeqCst), 1);
+    rig.delete(&record).await;
 }
 
 #[tokio::test]
@@ -495,6 +554,23 @@ impl Rig {
             .into_iter()
             .map(|(id, mount)| (id, mount.into()))
             .collect();
+        self.claimants[index]
+            .register_node(report.clone())
+            .await
+            .unwrap();
+    }
+    async fn report_checkpoint_capability(&mut self, index: usize, available: bool) {
+        let report = &mut self.registrations[index];
+        report.heartbeat_sequence += 1;
+        report.runtime_capabilities.clear();
+        if available {
+            report.runtime_capabilities.insert(
+                "runc".into(),
+                pb::RuntimeCapabilities {
+                    capability_ids: vec![adx_core::scheduling::CHECKPOINT_RESTORE_V1.into()],
+                },
+            );
+        }
         self.claimants[index]
             .register_node(report.clone())
             .await

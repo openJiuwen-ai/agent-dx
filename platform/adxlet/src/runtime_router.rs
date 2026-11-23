@@ -4,9 +4,8 @@ use crate::{
     RuntimeStatus,
 };
 use adx_core::{
-    execution::NetworkPolicy,
-    scheduling::{node_capability_label, DeviceAllocation, CHECKPOINT_RESTORE_V1},
-    EnvironmentRecord, EnvironmentSpec, Error, Result,
+    execution::NetworkPolicy, scheduling::DeviceAllocation, EnvironmentRecord, EnvironmentSpec,
+    Error, Result,
 };
 use async_trait::async_trait;
 use std::{
@@ -105,16 +104,16 @@ async fn check_launch_capabilities(
     spec: &EnvironmentSpec,
     deadline: Option<Instant>,
 ) -> Result<()> {
-    let mut required = spec.scheduling.required_node_capability_labels();
-    let Some(first) = required.next() else {
+    if spec
+        .scheduling
+        .required_node_capability_labels()
+        .next()
+        .is_none()
+    {
         return Ok(());
-    };
-    let checkpoint_restore = node_capability_label(&spec.runtime_class, CHECKPOINT_RESTORE_V1);
-    if first != checkpoint_restore || required.any(|key| key != checkpoint_restore) {
-        return Err(Error::Invalid(
-            "invalid runtime node capability constraint".into(),
-        ));
     }
+    spec.scheduling
+        .validate_node_capability_runtime(&spec.runtime_class)?;
     let check = driver.checkpoint_supported(&spec.runtime_class);
     if let Some(deadline) = deadline {
         tokio::time::timeout_at(deadline, check)

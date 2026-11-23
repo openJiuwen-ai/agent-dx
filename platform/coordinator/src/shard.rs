@@ -171,7 +171,10 @@ impl ShardScheduler {
                     prepared: Some(&prepared),
                 },
             )?;
-            if !crate::capability_constraints::supported(&spec.scheduling, &state.node.labels) {
+            if !spec
+                .scheduling
+                .matches_node_capabilities(&state.node.labels)
+            {
                 reasons.push("node_capability".into());
             }
             if let Some(placement) = placement {

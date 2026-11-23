@@ -5,6 +5,7 @@ const BUILD_ID: &str = "550e8400-e29b-41d4-a716-446655440011";
 struct State {
     entry_node: Mutex<Option<pb::NodeEndpoint>>,
     verified_node_session: Mutex<Option<String>>,
+    node_watch_unavailable: AtomicBool,
     local_persistence: Mutex<Vec<bool>>,
     owners: Mutex<HashMap<String, pb::GetEnvironmentResponse>>,
     receipts: Mutex<HashMap<(String, String), String>>,
@@ -120,6 +121,9 @@ macro_rules! service_impl {
 service_impl!(pb::coordinator_service_server::CoordinatorService, {
     type WatchNodesStream = std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<pb::NodeDirectory, Status>> + Send>>;
     async fn watch_nodes(&self, _: Request<pb::WatchNodesRequest>) -> Result<Response<Self::WatchNodesStream>, Status> {
+        if self.0.node_watch_unavailable.load(Ordering::SeqCst) {
+            return Err(Status::unavailable("node watch unavailable"));
+        }
         let node = self.0.entry_node.lock().unwrap().clone().ok_or_else(|| Status::unimplemented("central create fixture"))?;
         Ok(Response::new(Box::pin(futures_util::stream::once(async move {
             Ok(pb::NodeDirectory { epoch: 1, valid_for_millis: 5000, nodes: vec![node] })
@@ -132,6 +136,9 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         let mut response = Response::new(owner);
         if request.metadata().get("x-adx-verify-node-capabilities").is_some() {
             if let Some(session) = self.0.verified_node_session.lock().unwrap().as_ref() {
+                if self.0.entry_node.lock().unwrap().as_ref().is_none_or(|node| &node.session_id != session) {
+                    return Err(Status::failed_precondition("assigned node capability session is no longer current"));
+                }
                 response.metadata_mut().insert("x-adx-verified-node-session", session.parse().unwrap());
             }
         }

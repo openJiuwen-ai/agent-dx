@@ -196,11 +196,20 @@ impl CheckpointServices {
                 Error::Unavailable(format!("checkpoint storage observation: {error}"))
             })?;
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
-            // A timed-out caller must not start another blocking storage check
-            // until the previous one actually finishes.
+        tokio::spawn(async move {
+            // Keep the permit and finish owned staging cleanup if the caller
+            // times out while filesystem operations are still running.
             let _permit = permit;
-            store.validate_policy(adx_core::lifecycle::CheckpointStorage::Configured)
+            let policy_store = store.clone();
+            tokio::task::spawn_blocking(move || {
+                policy_store.validate_policy(adx_core::lifecycle::CheckpointStorage::Configured)
+            })
+            .await
+            .map_err(|error| {
+                Error::Unavailable(format!("checkpoint storage observation: {error}"))
+            })??;
+            let staged = store.begin_capture().await?;
+            store.discard_staged(&staged).await
         })
         .await
         .map_err(|error| Error::Unavailable(format!("checkpoint storage observation: {error}")))?

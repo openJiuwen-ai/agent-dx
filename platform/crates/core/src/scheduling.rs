@@ -103,6 +103,31 @@ pub struct LabelSelector {
     pub expressions: Vec<LabelRequirement>,
 }
 impl LabelSelector {
+    fn node_capability_labels(&self) -> impl Iterator<Item = &str> {
+        self.match_labels
+            .keys()
+            .chain(self.expressions.iter().map(|expression| &expression.key))
+            .map(String::as_str)
+            .filter(|key| key.starts_with(NODE_CAPABILITY_LABEL_PREFIX))
+    }
+
+    fn validate_node_capability_labels(&self) -> Result<()> {
+        let invalid_exact = self.match_labels.iter().any(|(key, value)| {
+            key.starts_with(NODE_CAPABILITY_LABEL_PREFIX) && value != NODE_CAPABILITY_LABEL_VALUE
+        });
+        let invalid_expression = self.expressions.iter().any(|expression| {
+            expression.key.starts_with(NODE_CAPABILITY_LABEL_PREFIX)
+                && (expression.op != SelectorOp::In
+                    || expression.values.as_slice() != [NODE_CAPABILITY_LABEL_VALUE])
+        });
+        if invalid_exact || invalid_expression {
+            return Err(Error::Invalid(
+                "required node capability labels must match true".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
         self.match_labels
             .iter()
@@ -240,24 +265,56 @@ pub struct SchedulingPolicy {
 impl SchedulingPolicy {
     /// Reserved runtime capability labels referenced by hard node constraints.
     pub fn required_node_capability_labels(&self) -> impl Iterator<Item = &str> {
-        self.required_node.iter().flat_map(|selector| {
-            selector
-                .match_labels
-                .keys()
-                .chain(
-                    selector
-                        .expressions
-                        .iter()
-                        .map(|expression| &expression.key),
-                )
-                .map(String::as_str)
-                .filter(|key| key.starts_with(NODE_CAPABILITY_LABEL_PREFIX))
+        self.required_node
+            .iter()
+            .flat_map(LabelSelector::node_capability_labels)
+    }
+
+    /// All required runtime capabilities must be present on the node.
+    pub fn matches_node_capabilities(&self, labels: &BTreeMap<String, String>) -> bool {
+        self.required_node_capability_labels().all(|key| {
+            labels
+                .get(key)
+                .is_some_and(|value| value == NODE_CAPABILITY_LABEL_VALUE)
         })
     }
 
     pub fn matches_node(&self, labels: &BTreeMap<String, String>) -> bool {
-        self.required_node.is_empty() || self.required_node.iter().any(|s| s.matches(labels))
+        self.matches_node_capabilities(labels)
+            && (self.required_node.is_empty()
+                || self.required_node.iter().any(|s| s.matches(labels)))
     }
+
+    /// Match hard placement rules that depend only on a node's labels.
+    pub fn matches_node_placement(&self, labels: &BTreeMap<String, String>) -> bool {
+        self.matches_node(labels)
+            && self
+                .placement_groups
+                .iter()
+                .filter(|group| group.required && group.target == PlacementTarget::Node)
+                .all(|group| {
+                    group.terms.iter().any(|term| term.selector.matches(labels)) != group.anti
+                })
+    }
+
+    /// Check that every required capability belongs to the selected runtime.
+    pub fn validate_node_capability_runtime(&self, runtime: &str) -> Result<()> {
+        let mut labels = self.required_node_capability_labels();
+        let Some(first) = labels.next() else {
+            return Ok(());
+        };
+        let checkpoint = node_capability_label(runtime, CHECKPOINT_RESTORE_V1);
+        if !valid_node_capability_runtime(runtime)
+            || first != checkpoint
+            || labels.any(|key| key != checkpoint)
+        {
+            return Err(Error::Invalid(
+                "invalid required node capability for the selected runtime".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.placement_groups.len() > 8 {
             return Err(Error::Invalid("at most 8 placement groups".into()));
@@ -269,6 +326,21 @@ impl SchedulingPolicy {
         validate_requests(&self.devices)?;
         for s in &self.required_node {
             s.validate()?;
+            s.validate_node_capability_labels()?;
+        }
+        if self.required_node_capability_labels().next().is_some() {
+            let mut capability_sets = self
+                .required_node
+                .iter()
+                .map(|selector| selector.node_capability_labels().collect::<BTreeSet<_>>());
+            if let Some(first) = capability_sets.next() {
+                if capability_sets.any(|set| set != first) {
+                    return Err(Error::Invalid(
+                        "required node capabilities must appear in every selector alternative"
+                            .into(),
+                    ));
+                }
+            }
         }
         for s in &self.preferred_node {
             s.selector.validate()?;
@@ -527,6 +599,86 @@ mod tests {
             selector.validate().unwrap();
             assert_eq!(selector.matches(&labels), expected);
         }
+    }
+    #[test]
+    fn reserved_capability_labels_require_positive_predicates_in_every_alternative() {
+        let key = node_capability_label("runsc", CHECKPOINT_RESTORE_V1);
+        for (op, values, valid) in [
+            (SelectorOp::In, vec!["true"], true),
+            (SelectorOp::In, vec!["false"], false),
+            (SelectorOp::In, vec!["true", "false"], false),
+            (SelectorOp::NotIn, vec!["true"], false),
+            (SelectorOp::Exists, vec![], false),
+            (SelectorOp::DoesNotExist, vec![], false),
+        ] {
+            let policy = SchedulingPolicy {
+                required_node: vec![LabelSelector {
+                    expressions: vec![LabelRequirement {
+                        key: key.clone(),
+                        op,
+                        values: values.into_iter().map(str::to_owned).collect(),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert_eq!(policy.validate().is_ok(), valid, "{op:?}");
+        }
+
+        let mut policy = SchedulingPolicy {
+            required_node: vec![
+                LabelSelector {
+                    match_labels: [(key.clone(), "true".into())].into(),
+                    ..Default::default()
+                },
+                LabelSelector {
+                    match_labels: [("zone".into(), "a".into())].into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(policy.validate().is_err());
+        assert!(!policy.matches_node(&[("zone".into(), "a".into())].into()));
+        policy.required_node[1]
+            .match_labels
+            .insert(key, "true".into());
+        assert!(policy.validate().is_ok());
+        assert!(policy.validate_node_capability_runtime("runsc").is_ok());
+        assert!(policy.validate_node_capability_runtime("runc").is_err());
+    }
+
+    #[test]
+    fn static_node_placement_checks_required_positive_and_negative_groups() {
+        let group = |key: &str, value: &str, anti, required, target| PlacementGroup {
+            target,
+            terms: vec![WeightedSelector {
+                selector: LabelSelector {
+                    match_labels: [(key.into(), value.into())].into(),
+                    ..Default::default()
+                },
+                weight: 1,
+            }],
+            required,
+            anti,
+            ordered: false,
+        };
+        let policy = SchedulingPolicy {
+            placement_groups: vec![
+                group("zone", "a", false, true, PlacementTarget::Node),
+                group("pool", "draining", true, true, PlacementTarget::Node),
+                group("preferred", "yes", false, false, PlacementTarget::Node),
+                group("peer", "worker", false, true, PlacementTarget::Environment),
+            ],
+            ..Default::default()
+        };
+        let mut labels = BTreeMap::from([("zone".into(), "a".into())]);
+        assert!(policy.matches_node_placement(&labels));
+        labels.insert("pool".into(), "draining".into());
+        assert!(!policy.matches_node_placement(&labels));
+        labels.remove("pool");
+        labels.insert("zone".into(), "b".into());
+        assert!(!policy.matches_node_placement(&labels));
     }
     #[test]
     fn failed_device_reservation_is_atomic_and_inventory_refresh_preserves_busy_cards() {

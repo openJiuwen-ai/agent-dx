@@ -3,6 +3,28 @@ use adx_protocol::control as wire;
 use prost::Message;
 
 #[test]
+fn protobuf_rejects_weakening_a_reserved_capability_predicate() {
+    let selector = wire::LabelSelector {
+        expressions: vec![wire::LabelRequirement {
+            key: node_capability_label("runsc", CHECKPOINT_RESTORE_V1),
+            op: wire::SelectorOp::In as i32,
+            values: vec![NODE_CAPABILITY_LABEL_VALUE.into()],
+        }],
+        ..Default::default()
+    };
+    let mut policy = wire::SchedulingPolicy {
+        required_node: vec![selector.clone(), selector],
+        ..Default::default()
+    };
+    assert!(SchedulingPolicy::try_from(policy.clone()).is_ok());
+    policy.required_node[1].expressions.clear();
+    assert!(SchedulingPolicy::try_from(policy.clone()).is_err());
+    policy.required_node.remove(1);
+    policy.required_node[0].expressions[0].op = wire::SelectorOp::NotIn as i32;
+    assert!(SchedulingPolicy::try_from(policy).is_err());
+}
+
+#[test]
 fn node_reports_preserve_zero_capacity_without_weakening_resource_requests() {
     for (cpu_millis, memory_bytes) in [(0, 1024), (1000, 0), (0, 0)] {
         let report = wire::RegisterNodeRequest {
