@@ -666,7 +666,7 @@ impl CoordinatorRpc {
             && task
                 .nodes
                 .get(id)
-                .is_none_or(|node| node.phase != "RestoredOriginal")
+                .is_none_or(|node| !matches!(node.phase.as_str(), "verified" | "RestoredOriginal"))
         {
             self.register_upgrade_source(&mut task, request, true)
                 .await?;
@@ -674,11 +674,11 @@ impl CoordinatorRpc {
         let current = self.upgrade_node(id).await?;
         let session = current.session.as_ref().ok_or(Error::Conflict)?;
         let node = task.nodes.get_mut(id).ok_or(Error::Conflict)?;
+        let release_recorded = matches!(node.phase.as_str(), "verified" | "RestoredOriginal");
         if node.pod_uid != request.pod_uid
             || node.pod_uid != node.original_pod_uid
             || (!request.node_session_id.is_empty() && request.node_session_id != session.id)
-            || (node.node_session_id != node.original_session_id
-                && node.phase != "RestoredOriginal")
+            || (node.node_session_id != node.original_session_id && !release_recorded)
             || node.delete_resource_version.is_some()
             || task
                 .operations
@@ -691,7 +691,7 @@ impl CoordinatorRpc {
             // The existing Pod may still own Sandboxes. Prove current isolation
             // and reconciliation before replaying release on its new session.
             let view = self.node_view(&current, "").await?;
-            if node.phase != "RestoredOriginal"
+            if !release_recorded
                 || request.node_session_id != session.id
                 || !session.routable
                 || !current.scheduling_paused
@@ -710,6 +710,9 @@ impl CoordinatorRpc {
             }
             node.node_session_id.clone_from(&session.id);
             node.control_revision = view.revision;
+            // Persist the release intent and fence the new binding against registration
+            // before contacting the node. It might restart again before acknowledging.
+            node.phase = "RestoredOriginal".into();
             task = self.save_task(task).await?;
         }
         self.control_with_phase(&mut task, id, "released", "RestoredOriginal", vec![])

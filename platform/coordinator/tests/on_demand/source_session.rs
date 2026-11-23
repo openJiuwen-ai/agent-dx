@@ -5,6 +5,16 @@ use tokio::time::{interval_at, timeout, Instant};
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn abort_rebinds_an_empty_late_original_pod_before_release() {
+    abort_rebinds_late_original(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn abort_replays_late_original_after_verification_and_another_restart() {
+    abort_rebinds_late_original(true).await;
+}
+
+async fn abort_rebinds_late_original(restart_after_verify: bool) {
     let rig = Rig::new(Duration::from_secs(2)).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -86,13 +96,74 @@ async fn abort_rebinds_an_empty_late_original_pod_before_release() {
     request["operation_id"] = json!("verify-late");
     request["permit_id"] = permit["permit_id"].clone();
     post_upgrade(address, "tasks/planned-migration/verify-node", request).await;
-    let aborted = post_upgrade(
-        address,
-        abort,
-        json!({"task_id": "planned-migration", "epoch": 1, "operation_id": "finalize",
-            "stage": "finalize", "template_restored": true}),
-    )
-    .await;
+    let finalize = json!({"task_id": "planned-migration", "epoch": 1, "operation_id": "finalize",
+        "stage": "finalize", "template_restored": true});
+    if restart_after_verify {
+        let verified_session = replacement.report.session_id.clone();
+        let (assignment, mut coordinator) =
+            create_paused_on_late_original(&rig, &replacement).await;
+        replacement.task.abort();
+        let _ = (&mut replacement.task).await;
+        let mut restarted = worker(
+            "c",
+            &rig.address,
+            rig.remote.clone(),
+            Some(&replacement.report.node_address),
+        )
+        .await;
+        // The new session cannot adopt a paused controller before release.
+        assert_eq!(
+            report(&mut restarted, &rig.address, period)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        assert!(!restarted.manager.accepting_allocations());
+        let (status, error) = upgrade_response(address, "POST", abort, finalize.to_string()).await;
+        assert_eq!(status, 409, "{error}");
+        let mut restore = json!({
+            "task_id": "planned-migration", "epoch": 1, "operation_id": "restore-verified-original",
+            "stage": "restore-original", "rollback": true, "node_id": "c",
+            "pod_uid": "late-old-pod", "node_session_id": verified_session,
+        });
+        let (status, error) = upgrade_response(address, "POST", abort, restore.to_string()).await;
+        assert_eq!(status, 409, "{error}");
+        restore["node_session_id"] = json!(restarted.report.session_id);
+        let mut wrong_pod = restore.clone();
+        wrong_pod["pod_uid"] = json!("recreated-pod");
+        let (status, error) = upgrade_response(address, "POST", abort, wrong_pod.to_string()).await;
+        assert_eq!(status, 409, "{error}");
+        assert!(!restarted.manager.accepting_allocations());
+        let restored = post_upgrade(address, abort, restore.clone()).await;
+        assert_eq!(restored["restored_original"], true);
+        assert_eq!(post_upgrade(address, abort, restore).await, restored);
+        let paused = rig.session.get("late-sandbox").await.unwrap();
+        assert_eq!(paused.assignment, assignment.clone().try_into().unwrap());
+        assert_eq!(
+            paused.result.unwrap().state,
+            adx_core::EnvironmentState::Paused
+        );
+        assert_eq!(restarted.backend.restored.load(Ordering::SeqCst), 0);
+        report(&mut restarted, &rig.address, period).await.unwrap();
+        let running = coordinator
+            .ensure_running(pb::EnsureRunningRequest {
+                environment_id: "late-sandbox".into(),
+                caller: caller(),
+                timeout_seconds: 3,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap();
+        assert_eq!(running.assignment.unwrap(), assignment);
+        assert_eq!(running.state, pb::EnvironmentState::Running as i32);
+        assert_eq!(restarted.backend.restored.load(Ordering::SeqCst), 1);
+        replacement = restarted;
+    }
+    let aborted = post_upgrade(address, abort, finalize).await;
     assert_eq!(aborted["phase"], "Aborted");
     assert_eq!(
         aborted["nodes"]["c"]["original_session_id"],
@@ -104,6 +175,59 @@ async fn abort_rebinds_an_empty_late_original_pod_before_release() {
     );
     assert!(replacement.manager.accepting_allocations());
     server.abort();
+}
+
+async fn create_paused_on_late_original(
+    rig: &Rig,
+    worker: &Worker,
+) -> (
+    pb::Assignment,
+    pb::coordinator_service_client::CoordinatorServiceClient<RpcChannel>,
+) {
+    use adx_core::scheduling::LabelSelector;
+
+    let mut load = spec();
+    load.id = "late-sandbox".into();
+    load.scheduling.required_node.push(LabelSelector {
+        match_labels: BTreeMap::from([("NODE_ID".into(), worker.report.node_id.clone())]),
+        ..Default::default()
+    });
+    let mut coordinator = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(&rig.address, Principal::ApiServer).await,
+    );
+    let created = coordinator
+        .create_environment(pb::CreateEnvironmentRequest {
+            spec: Some(load.into()),
+            caller: caller(),
+            schedule_timeout_seconds: 3,
+            create_timeout_seconds: 3,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let assignment = created.assignment.unwrap();
+    assert_eq!(assignment.node_id, worker.report.node_id);
+    let mut node = pb::node_service_client::NodeServiceClient::new(
+        channel(&worker.report.node_address, Principal::ApiServer).await,
+    );
+    let paused = node
+        .pause_environment(pb::PauseEnvironmentRequest {
+            assignment: Some(assignment.clone()),
+            caller: caller(),
+            operation_id: "late-user-pause".into(),
+            expected_revision: created.revision,
+            timeout_seconds: 3,
+            retention: Some(adx_core::lifecycle::RetentionPolicy::Forever.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(paused.durability, pb::Durability::Published as i32);
+    (assignment, coordinator)
 }
 
 #[tokio::test]

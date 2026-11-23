@@ -252,9 +252,11 @@ Abort first freezes new forward work. Rollback actions carry `rollback:true`.
 An original Pod can be reopened after confirming its UID, settled operations
 and absence of a delete intent. After a lost release reply and a process restart
 in that Pod, replay `restore-original` with the same UID and the current session.
-The persisted `RestoredOriginal` phase records the release intent. The Coordinator
-verifies the new session is isolated for the task and keeps scheduling paused
-until that session acknowledges release. Existing Sandbox assignments stay in place.
+The persisted `RestoredOriginal` phase records the release intent. An original
+Pod already recorded as `verified` during abort can use the same replay after
+a process restart. The Coordinator verifies that the new session is isolated
+for the task and keeps scheduling paused until that session acknowledges release.
+Existing Sandbox assignments stay in place.
 If explicit Resume or traffic-triggered Resume arrives before adxlet has
 recreated the local controller, the same resume intent waits for reconciliation
 within the caller's timeout. Replacements need strict empty evidence, current
