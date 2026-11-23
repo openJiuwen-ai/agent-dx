@@ -126,6 +126,20 @@ fn cstring_path(path: &Path) -> io::Result<CString> {
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
 }
 
+/// Disconnect the owned legacy outlet even if consumers still hold binds of
+/// its FUSE tree. The private mount at this path is removed without lazy detach.
+#[allow(unsafe_code)]
+pub(super) fn unmount_legacy_fuse(path: &Path) -> afs_error::Result<()> {
+    let target = cstring_path(path).map_err(afs_error::Error::from)?;
+    // SAFETY: the CString is live and the caller has verified the mount ID.
+    // Linux FUSE aborts the connection on MNT_FORCE, waking its receiver so
+    // the daemon can join the callbacks even if a consumer still has a bind.
+    if unsafe { libc::umount2(target.as_ptr(), libc::MNT_FORCE) } != 0 {
+        return Err(afs_error::Error::from(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 /// Run a mount helper with a deadline, killing it if the deadline passes.
 ///
 /// A hung `mount.nfs` holds the convergence thread; killing the helper leaves

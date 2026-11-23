@@ -26,6 +26,10 @@ impl FuseMountPolicy for OutletFusePolicy {
     fn label(&self) -> &'static str {
         OUTLET_FUSE_LABEL
     }
+
+    fn resends_denied_with_groups(&self) -> bool {
+        true
+    }
 }
 
 /// Public legacy names need every fresh path lookup to pass OwnerFs admission.
@@ -127,6 +131,11 @@ fn mount_ownerfs_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outlet_namespace_retries_with_caller_groups() {
+        assert!(OutletFusePolicy.resends_denied_with_groups());
+    }
 
     #[test]
     fn ownerfs_mount_ignores_invalid_dfs_only_options() {

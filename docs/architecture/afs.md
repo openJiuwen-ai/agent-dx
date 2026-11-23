@@ -1149,6 +1149,9 @@ Home 节点的本地盘上，不做复制。各节点从同一份 Meta 快照取
 目录布局，`/public/<name>` 指向 `<import_root>/<home>/users/<name>`。对历史
 布局，指向 `<import_root>/.ownerfs-outlet/<name>`。首次发布历史工作区时启动
 这个不启用私有缓存的 OwnerFs FUSE 挂载，由 Home 按逻辑工作区身份核验新访问。
+目录写权限仅来自附加组时，出口会核实调用进程的附加组后重试权限检查。
+Node 停机时主动断开该 FUSE 会话并等待回调收尾。消费者保留的旧 bind mount
+会断开，Node 重启后重新绑定 `/public/<name>` 可访问当前挂载。
 节点启动时撤下以前直接指向历史落盘目录的链接。Workspace API 就绪检查核对
 Home 返回的布局及对应挂载。Home 明确未准入某工作区时，镜像撤下该软链。
 Home 会话或网络暂时不可达时保留已发布的名字，历史目标仍走 OwnerFs 准入。

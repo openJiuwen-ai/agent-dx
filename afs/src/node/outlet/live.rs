@@ -1009,7 +1009,9 @@ pub async fn run(
         tokio::select! {
             _ = &mut shutdown => {
                 if let Some(mounted) = imports.take().and_then(|imports| imports.legacy?.mounted) {
-                    tokio::task::spawn_blocking(move || mounted.join())
+                    tokio::task::spawn_blocking(move || {
+                        mounted.join_with_unmount(super::mount::unmount_legacy_fuse)
+                    })
                         .await
                         .map_err(|error| Error::from(io::Error::other(error)))??;
                 }

@@ -2652,10 +2652,9 @@ fn with_cached_view_size(
 
 /// One create on behalf of the kernel caller. The backend checks the caller
 /// against the parent directory, and a FUSE header carries only uid and
-/// primary gid. Only the DFS mount policy enables a retry after permission
-/// denial, when Meta has left nothing behind to undo. Resolving supplementary
-/// groups reads /proc, so it is paid only then. Other mounts keep the first
-/// backend result without resolving groups or retrying.
+/// primary gid. The mount policy can opt in to a retry after permission
+/// denial, before any mutation. Resolving groups reads /proc, so it is paid
+/// only then. Mounts that leave this disabled keep the first backend result.
 #[allow(clippy::too_many_arguments)]
 fn create_resolving_groups(
     policy: &dyn FuseMountPolicy,
