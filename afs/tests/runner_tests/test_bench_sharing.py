@@ -120,10 +120,79 @@ class ReadCacheBudgetKeyTests(unittest.TestCase):
             c = ClusterRenderingTests().cluster(d, {"dfs_read_cache_queue_bytes": 64 * MIB, "dfs_read_cache_bytes": 0},
                                                 variant="Vq",
                                                 node_overrides={"B": {"dfs_read_cache_queue_bytes": 64 * MIB}})
-            c._configs()
+            c.write_configs()
             records = {e["check"]: e["value"] for e in c.evidence if e["check"].startswith("bench.node_overrides.")}
             self.assertEqual(records["bench.node_overrides.B"]["inert"], ["dfs_read_cache_queue_bytes"])
             self.assertNotIn("inert", records["bench.node_overrides.A"])
+
+
+class SummaryAttributionTests(unittest.TestCase):
+    """bench.summary attributes a variant only to settings that take effect on a started Node."""
+
+    QUEUE, PARTIAL, TTL = "dfs_read_cache_queue_bytes", "dfs_read_cache_partial_bytes", "dfs_source_single_ttl_ms"
+
+    def summary(self, roles, **extra):
+        suite = load_suite()
+        recorded = {}
+
+        class Cluster:
+            config = bench(**extra)
+
+            def record(self, name, value):
+                recorded[name] = value
+                return value
+
+        cluster = Cluster()
+        cluster.roles = list(roles)
+        suite.summaries(cluster, [{"op": "read", "layer": "hot", "tool": "fio", "block_bytes": MIB, "threads": 1,
+                                   "result": {"mib_per_s": 10.0}}] * 3)
+        return recorded["bench.summary"]
+
+    def test_only_inert_keys_are_no_variant(self):
+        row = self.summary("MABC", variant="Vq", node_overrides={
+            "*": {self.QUEUE: 64 * MIB, self.TTL: 100}, "B": {self.PARTIAL: 0}})
+        self.assertEqual(row["node_overrides"], {})
+        self.assertFalse(row["variant_applied"])
+        # Only the read-cache-only keys are filtered: an explicit dfs_read_cache_bytes = 0 is still declared.
+        row = self.summary("MABC", variant="Vq",
+                           node_overrides={"B": {"dfs_read_cache_bytes": 0, self.QUEUE: 64 * MIB}})
+        self.assertEqual(row["node_overrides"], {"B": {"dfs_read_cache_bytes": 0}})
+        # The same effectiveness rule admits such a declaration under the V0 label.
+        self.assertEqual(benchlib.parameters(bench(node_overrides={"*": {self.QUEUE: 64 * MIB}})).variant, "V0")
+
+    def test_wildcard_keys_count_only_on_nodes_with_the_read_cache(self):
+        row = self.summary("MABC", variant="VR", node_overrides={
+            "*": {self.QUEUE: 64 * MIB, self.TTL: 100},
+            "A": {"dfs_read_parallelism": 4}, "B": {"dfs_read_cache_bytes": 64 * MIB}})
+        self.assertEqual(row["node_overrides"], {
+            "A": {"dfs_read_parallelism": 4},
+            "B": {"dfs_read_cache_bytes": 64 * MIB, self.QUEUE: 64 * MIB, self.TTL: 100}})
+        self.assertTrue(row["variant_applied"])
+
+    def test_overrides_for_roles_not_started_are_no_variant(self):
+        row = self.summary("MAB", variant="Vx", node_overrides={"D": {"dfs_read_parallelism": 4}})
+        self.assertEqual((row["node_overrides"], row["variant_applied"]), ({}, False))
+
+    def test_replica_settings_keep_the_variant_applied(self):
+        row = self.summary("MABC", variant="P3", dfs_desired_copies=3, dfs_sync_required_copies=1,
+                           node_overrides={"*": {self.QUEUE: 64 * MIB}})
+        self.assertEqual(row["node_overrides"], {})
+        self.assertTrue(row["variant_applied"])
+
+    def test_node_evidence_keeps_every_declared_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = ClusterRenderingTests().cluster(d, {self.QUEUE: 64 * MIB, "dfs_read_cache_bytes": 0},
+                                                node_overrides={"B": {self.QUEUE: 64 * MIB}})
+            c.write_configs()
+            record = {e["check"]: e["value"] for e in c.evidence}["bench.node_overrides.B"]
+            self.assertEqual(record, {"declared": {self.QUEUE: 64 * MIB}, "mismatches": [], "inert": [self.QUEUE]})
+
+    def test_binary_without_the_new_field_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = ClusterRenderingTests().cluster(d, {"dfs_read_cache_bytes": 0},
+                                                node_overrides={"B": {self.QUEUE: 64 * MIB}})
+            with self.assertRaises(AssertionError):
+                c.write_configs()
 
 
 class AbsentRoleTests(unittest.TestCase):

@@ -74,14 +74,17 @@ class BenchParameters:
 
     def inert_overrides(self, role):
         """Declared settings the product ignores on this role because its read cache is off."""
-        merged = self.overrides_for(role)
-        if merged.get("dfs_read_cache_bytes", 0):
-            return []
-        return sorted(k for k in merged if k in READ_CACHE_ONLY)
+        return inert_keys(self.overrides_for(role))
+
+    def effective_overrides(self, role):
+        """The role's merged settings without the ones it ignores at run time (inert_overrides)."""
+        return effective_settings(self.overrides_for(role))
 
     def applied_overrides(self, roles):
-        """Overrides that reach the given Node roles; roles outside the cluster contribute nothing."""
-        return {role: self.overrides_for(role) for role in roles if role in NODE_ROLES and self.overrides_for(role)}
+        """Effective overrides of the given Node roles; roles outside the cluster or left with no
+        effective setting contribute nothing."""
+        return {role: self.effective_overrides(role) for role in roles
+                if role in NODE_ROLES and self.effective_overrides(role)}
 
     def tool(self, name):
         """Return (absolute path, extra environment) for a declared tool."""
@@ -130,6 +133,18 @@ def parameters(config):
         else NODE_ROLES
     return BenchParameters(size, tuple(blocks), tuple(threads), rounds, dict(tools),
                            **_variant_inputs(values, present))
+
+
+def inert_keys(merged):
+    """Read-cache-only keys of one role's merged settings while its read cache is off (absent or 0)."""
+    if merged.get("dfs_read_cache_bytes", 0):
+        return []
+    return sorted(k for k in merged if k in READ_CACHE_ONLY)
+
+
+def effective_settings(merged):
+    inert = inert_keys(merged)
+    return {k: v for k, v in merged.items() if k not in inert}
 
 
 def _override_value(key, value):
@@ -246,7 +261,7 @@ def _variant_inputs(values, present=NODE_ROLES):
     variant = values.get("variant", "V0")
     if not isinstance(variant, str) or not 1 <= len(variant) <= 32:
         raise Blocked("bench variant must be a label of 1..32 characters")
-    applied = any({**overrides.get("*", {}), **overrides.get(r, {})} for r in present)
+    applied = any(effective_settings({**overrides.get("*", {}), **overrides.get(r, {})}) for r in present)
     if (applied or replication) and variant == "V0":
         raise Blocked("bench node overrides and replica settings need a variant label other than V0")
     readers = values.get("readers", 2)
