@@ -227,10 +227,23 @@ fn wire_location(root: super::store::RootRecord) -> RootLocation {
         home_node_id: root.home_node_id,
         home_session_id: root.home_session_id,
         home_nfs_addr: root.nfs_addr,
-        // Lets a home rebuild a local catalog record that was lost while the
-        // workspace directory survived. Not an authorization token.
-        local_prepare_id: root.local_prepare_id,
+        // `local_prepare_id` is the home's private recovery evidence. Only
+        // `list_owner_roots` fills it, because that RPC is bound to the
+        // authenticated home node; every other consumer of RootLocation
+        // (lookup_root, outlet snapshots) is an arbitrary authenticated node
+        // and must not receive it.
+        local_prepare_id: String::new(),
     }
+}
+
+/// Wire a root location for the one caller that may carry the prepare
+/// identity: ListOwnerRoots is authenticated as the same node as
+/// `home_node_id`, so only the home itself can read the value.
+fn wire_home_location(mut root: super::store::RootRecord) -> RootLocation {
+    let local_prepare_id = std::mem::take(&mut root.local_prepare_id);
+    let mut location = wire_location(root);
+    location.local_prepare_id = local_prepare_id;
+    location
 }
 
 fn wire_node(session: super::store::NodeSession) -> NodeDescriptor {
@@ -645,7 +658,11 @@ impl OwnerRootsService for OwnerRootsRpc {
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(ListOwnerRootsReply {
-            active_roots: output.active_roots.into_iter().map(wire_location).collect(),
+            active_roots: output
+                .active_roots
+                .into_iter()
+                .map(wire_home_location)
+                .collect(),
             pending_reservations: output
                 .pending_reservations
                 .into_iter()

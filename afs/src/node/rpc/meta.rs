@@ -16,8 +16,6 @@ use crate::node::vfs::ownerfs::{
 };
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
 use afs_error::CLIENT_PROTOCOL_VIOLATION;
-#[cfg(feature = "ownerfs")]
-use std::collections::HashMap;
 use afs_error::{
     CLIENT_ARGUMENT_INVALID, CLIENT_CONNECTION_UNAVAILABLE, CLIENT_DEADLINE_EXCEEDED, Error, Result,
 };
@@ -33,6 +31,8 @@ use afs_protocol::meta::{
     meta_client::MetaClient,
 };
 use afs_transport::grpc::{GrpcConfig, SecurityManager, TlsConfig};
+#[cfg(feature = "ownerfs")]
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "dfs")]

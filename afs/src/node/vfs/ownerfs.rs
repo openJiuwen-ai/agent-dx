@@ -15282,8 +15282,11 @@ mod tests {
             id = root::root_id_from_name(OsStr::new("job-77")).unwrap();
             // Read the durable record straight from disk: the catalog
             // holds an exclusive lock while a RootManager is live.
-            let stored = read_catalog_record(&
-                disk.root_path().join(".ownerfs-roots").join(format!("{}.json", id.0)),
+            let stored = read_catalog_record(
+                &disk
+                    .root_path()
+                    .join(".ownerfs-roots")
+                    .join(format!("{}.json", id.0)),
             );
             epoch = stored.epoch;
             prepare_id = stored.local_prepare_id.clone();
@@ -15330,8 +15333,11 @@ mod tests {
         // The rebuilt record keeps Meta's epoch and prepare identity.
         // Read the durable record straight from disk: the catalog
         // holds an exclusive lock while a RootManager is live.
-        let stored = read_catalog_record(&
-            disk.root_path().join(".ownerfs-roots").join(format!("{}.json", id.0)),
+        let stored = read_catalog_record(
+            &disk
+                .root_path()
+                .join(".ownerfs-roots")
+                .join(format!("{}.json", id.0)),
         );
         assert_eq!(stored.epoch, epoch, "epoch must not be re-assigned");
         assert_eq!(stored.local_prepare_id, prepare_id);
@@ -15386,8 +15392,11 @@ mod tests {
             id = root::root_id_from_name(OsStr::new("job-88")).unwrap();
             // Read the durable record straight from disk: the catalog
             // holds an exclusive lock while a RootManager is live.
-            let stored = read_catalog_record(&
-                disk.root_path().join(".ownerfs-roots").join(format!("{}.json", id.0)),
+            let stored = read_catalog_record(
+                &disk
+                    .root_path()
+                    .join(".ownerfs-roots")
+                    .join(format!("{}.json", id.0)),
             );
             epoch = stored.epoch;
             let record = disk
@@ -15409,19 +15418,12 @@ mod tests {
         );
 
         let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
-        let error = match RootManager::open(
-            "node-a".into(),
-            "session-b".into(),
-            meta,
-            disk,
-        ) {
+        let error = match RootManager::open("node-a".into(), "session-b".into(), meta, disk) {
             Ok(_) => panic!("startup must refuse without Meta prepare identity"),
             Err(error) => error,
         };
         assert!(
-            error
-                .message()
-                .contains("without local catalog evidence"),
+            error.message().contains("without local catalog evidence"),
             "unexpected error: {}",
             error.message()
         );
