@@ -7,6 +7,7 @@ use tokio::time::Instant;
 pub struct RequestContext {
     deadline: Instant,
     progress: RequestProgress,
+    publication_id: Option<String>,
 }
 impl RequestContext {
     /// Construct a deadline from a validated entrypoint budget.
@@ -18,7 +19,15 @@ impl RequestContext {
         Self {
             deadline: Instant::now() + timeout,
             progress: RequestProgress::default(),
+            publication_id: None,
         }
+    }
+    pub fn with_publication_id(mut self, id: Option<String>) -> Self {
+        self.publication_id = id;
+        self
+    }
+    pub fn publication_id(&self) -> Option<&str> {
+        self.publication_id.as_deref()
     }
     pub fn deadline(&self) -> Instant {
         self.deadline

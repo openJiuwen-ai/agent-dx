@@ -17,7 +17,7 @@ Activator 通过 Environment 能力接口访问生命周期：独立部署使用
 
 ## 2 数字版本与统一引用
 
-`POST /api/agent/v2/templates` 接收不含 version 的 TemplateDraft。服务端在 tenant/template 范围内，通过同一 CAS 事务推进持久化序列并保存不可变模板快照。每次成功发布分配一个新版本，包括重复内容的发布；结果未知时不自动重放发布。
+`POST /api/agent/v2/templates` 接收不含 version 的 TemplateDraft。服务端在 tenant/template 范围内，通过同一 CAS 事务推进持久化序列并保存不可变模板快照。没有 `Idempotency-Key` 的每次成功发布都分配新版本；同租户同键同内容重放返回已有版本。启用 `auto_prepare_snapshot` 时，Activator 根据该不可变模板版本构造匿名制备任务，复用启动规格和探针并挂载专用临时目录卷。任务和结果按 tenant/template/version 隔离，获得 Platform 保护后回填独立配方。首次 Binding 和 Alias 候选均按实际版本选择可用、兼容且受保护的配方。最终决议与 Environment ID 一起提交，重试沿用保存的启动方式。制备过程不修改 Alias 或已有 Binding。
 
 版本采用规范的正 u64 十进制字符串，拒绝 0、前导零和溢出。外部引用中的纯数字只能解释为版本，其他合法引用解释为 Alias；Alias 名不能为纯数字。不提供隐式 latest、版本查询失败后的 Alias 回退或单独的 alias-binding 类型。
 
@@ -79,6 +79,8 @@ AgentBinding 代表长期存在的逻辑实例，使用同一模型承载数字�
 current 与 secondary 保存在同一记录中并通过 CAS 更新，最多保留两个 Env 引用。AliasConfig 只有最新目标分布，不保存 target_version、执行进度或操作流水；执行进度由 Binding 自身承载，不引入 AliasBinding、BindingRouteState 或 Rollout 对象。
 
 首次 current 的 EnvID 沿用 `adx-<generation>` 生成方式，候选使用新保存的 `adx-<UUID>`。激活、切换、恢复与删除均使用持久化 Env 引用，不根据 binding_id 反推 EnvID 或所有权，避免新增对 ID 算法的依赖。
+
+DigitalMate 业务入口在租户内按认证主体的稳定 Binding ID 复用跨 Alias 或版本引用的已有 Binding。Agent Store 通过已有的 `binding-history` scope 指针将新 Binding 提交与主体身份放入同一 CAS 事务。并发首绑使用事务胜者的 scope、generation 与 current 决议，后续请求从已保存的 Binding 继续。DigitalMate 首绑与 Alias 升级都按模板版本选择自动 Golden。
 
 ## 5 访问解析与文件操作
 

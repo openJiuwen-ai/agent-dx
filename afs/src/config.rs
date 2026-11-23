@@ -409,6 +409,9 @@ pub struct Cli {
     pub data_mode: Option<DataMode>,
     #[arg(long)]
     pub rdma_device: Option<String>,
+    /// Reject DFS RDMA sessions without a server generation (default false).
+    #[arg(long)]
+    pub dfs_rdma_require_server_generation: Option<bool>,
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
     /// OwnerFs storage root: holds workspace directories plus the private
@@ -568,6 +571,11 @@ pub struct Cli {
     pub dfs_read_max_inflight_bytes: Option<u64>,
     #[arg(long)]
     pub dfs_source_cache_max_ms: Option<u64>,
+    /// Shorter source-metadata lifetime for a Chunk whose candidates hold one
+    /// remote Node, while this Node runs the native read cache (default 500;
+    /// 0 keeps `dfs_source_cache_max_ms`). New cache holders become visible sooner.
+    #[arg(long)]
+    pub dfs_source_single_ttl_ms: Option<u64>,
     #[arg(long)]
     pub dfs_source_lookahead_chunks: Option<usize>,
     #[arg(long)]
@@ -627,6 +635,8 @@ struct FileConfig {
     dfs_read_parallelism: Option<usize>,
     dfs_read_stripe_bytes: Option<usize>,
     dfs_read_cache_bytes: Option<u64>,
+    dfs_read_cache_queue_bytes: Option<u64>,
+    dfs_read_cache_partial_bytes: Option<u64>,
     id: Option<String>,
     grpc_listen: Option<SocketAddr>,
     rest_listen: Option<SocketAddr>,
@@ -664,6 +674,7 @@ struct FileConfig {
     fs: Option<String>,
     data_mode: Option<DataMode>,
     rdma_device: Option<String>,
+    dfs_rdma_require_server_generation: Option<bool>,
     data_dir: Option<PathBuf>,
     ownerfs_data_dir: Option<PathBuf>,
     uds_path: Option<PathBuf>,
@@ -723,6 +734,7 @@ struct FileConfig {
     dfs_read_max_ops_per_batch: Option<usize>,
     dfs_read_max_inflight_bytes: Option<u64>,
     dfs_source_cache_max_ms: Option<u64>,
+    dfs_source_single_ttl_ms: Option<u64>,
     dfs_source_lookahead_chunks: Option<usize>,
     dfs_source_cache_bytes: Option<usize>,
     dfs_read_diagnostics_enabled: Option<bool>,
@@ -769,6 +781,12 @@ pub struct Config {
     pub dfs_read_parallelism: usize,
     pub dfs_read_stripe_bytes: usize,
     pub dfs_read_cache_bytes: u64,
+    /// Read cache bodies staged for install (default 256 MiB, 4MiB..=1GiB).
+    /// The FUSE read path never waits for it: a full queue drops the body.
+    pub dfs_read_cache_queue_bytes: u64,
+    /// Partial read cache bodies being assembled (default 32 MiB; 0 or
+    /// 4MiB..=1GiB, 0 disables assembling bodies from separate reads).
+    pub dfs_read_cache_partial_bytes: u64,
     pub id: String,
     pub grpc_listen: SocketAddr,
     pub rest_listen: SocketAddr,
@@ -808,6 +826,7 @@ pub struct Config {
     pub dfs: bool,
     pub data_mode: DataMode,
     pub rdma_device: Option<String>,
+    pub dfs_rdma_require_server_generation: bool,
     pub data_dir: PathBuf,
     pub ownerfs_data_dir: PathBuf,
     pub uds_path: PathBuf,
@@ -865,6 +884,7 @@ pub struct Config {
     pub dfs_read_max_ops_per_batch: usize,
     pub dfs_read_max_inflight_bytes: u64,
     pub dfs_source_cache_max_ms: u64,
+    pub dfs_source_single_ttl_ms: u64,
     pub dfs_source_lookahead_chunks: usize,
     pub dfs_source_cache_bytes: usize,
     pub dfs_read_diagnostics_enabled: bool,
@@ -974,6 +994,8 @@ impl Config {
             dfs_read_parallelism: file.dfs_read_parallelism.unwrap_or(1),
             dfs_read_stripe_bytes: file.dfs_read_stripe_bytes.unwrap_or(256 * 1024),
             dfs_read_cache_bytes: file.dfs_read_cache_bytes.unwrap_or(0),
+            dfs_read_cache_queue_bytes: read.dfs_read_cache_queue_bytes,
+            dfs_read_cache_partial_bytes: read.dfs_read_cache_partial_bytes,
             meta_store: meta.meta_store,
             meta_redis_url: meta.meta_redis_url,
             meta_etcd_endpoints: meta.meta_etcd_endpoints,
@@ -1024,6 +1046,10 @@ impl Config {
             dfs,
             data_mode,
             rdma_device: cli.rdma_device.or(file.rdma_device),
+            dfs_rdma_require_server_generation: cli
+                .dfs_rdma_require_server_generation
+                .or(file.dfs_rdma_require_server_generation)
+                .unwrap_or(false),
             ownerfs_mount: cli.ownerfs_mount.or(file.ownerfs_mount),
             experimental_ownerfs_workspace_bind: cli
                 .experimental_ownerfs_workspace_bind
@@ -1086,6 +1112,7 @@ impl Config {
             dfs_read_max_ops_per_batch: read.dfs_read_max_ops_per_batch,
             dfs_read_max_inflight_bytes: read.dfs_read_max_inflight_bytes,
             dfs_source_cache_max_ms: read.dfs_source_cache_max_ms,
+            dfs_source_single_ttl_ms: read.dfs_source_single_ttl_ms,
             dfs_source_lookahead_chunks: read.dfs_source_lookahead_chunks,
             dfs_source_cache_bytes: read.dfs_source_cache_bytes,
             dfs_read_crc_mode,
@@ -1136,6 +1163,69 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod certificate_tests {
     use super::*;
+
+    /// Read cache staging budgets: queue 256 MiB and partial 32 MiB by default
+    /// (report 14 D: 256 MiB drops nothing on the disk backend); values are
+    /// range-checked when the configuration is resolved.
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn dfs_read_cache_budgets_default_and_are_range_checked() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let resolve = |text: &str| {
+            std::fs::write(path, text).unwrap();
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--config", path]))
+        };
+        let config = resolve("fs = 'dfs'\n").unwrap();
+        assert_eq!(config.dfs_read_cache_queue_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.dfs_read_cache_partial_bytes, 32 * 1024 * 1024);
+        let config = resolve(
+            "fs = 'dfs'\ndfs_read_cache_queue_bytes = 4194304\ndfs_read_cache_partial_bytes = 0\n",
+        )
+        .unwrap();
+        assert_eq!(config.dfs_read_cache_queue_bytes, 4 * 1024 * 1024);
+        assert_eq!(config.dfs_read_cache_partial_bytes, 0);
+        for bad in [
+            "dfs_read_cache_queue_bytes = 4194303",
+            "dfs_read_cache_queue_bytes = 1073741825",
+            "dfs_read_cache_partial_bytes = 1",
+            "dfs_read_cache_partial_bytes = 1073741825",
+        ] {
+            let error = resolve(&format!("fs = 'dfs'\n{bad}\n")).unwrap_err();
+            assert!(error.to_string().contains("read cache"), "{bad}: {error}");
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn dfs_rdma_generation_requirement_defaults_to_compatible_and_accepts_overrides() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        std::fs::write(path, "fs = 'dfs'\n").unwrap();
+        let config =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--config", path])).unwrap();
+        assert!(!config.dfs_rdma_require_server_generation);
+        std::fs::write(
+            path,
+            "fs = 'dfs'\ndfs_rdma_require_server_generation = true\n",
+        )
+        .unwrap();
+        let config =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--config", path])).unwrap();
+        assert!(config.dfs_rdma_require_server_generation);
+        let cli = Cli::parse_from([
+            "afs-node",
+            "--config",
+            path,
+            "--dfs-rdma-require-server-generation",
+            "false",
+        ]);
+        assert!(
+            !Config::resolve(Role::Node, cli)
+                .unwrap()
+                .dfs_rdma_require_server_generation
+        );
+    }
 
     #[cfg(feature = "dfs")]
     #[test]

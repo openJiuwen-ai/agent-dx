@@ -95,7 +95,7 @@ use tonic::transport::{Channel, Endpoint};
 use tokio::sync::Mutex;
 
 #[cfg(feature = "rdma")]
-use super::control::RDMA_HANDSHAKE_VERSION;
+use super::{RdmaEndpointLease, control::RDMA_HANDSHAKE_VERSION};
 #[cfg(feature = "rdma")]
 use afs_transport::rdma::{CAPACITY, RdmaEndpoint};
 
@@ -103,7 +103,10 @@ use afs_transport::rdma::{CAPACITY, RdmaEndpoint};
 use crate::node::vfs::{
     ownerfs::{
         files::{FileIdentity, OwnerEntry, RemoteDirectory, RemoteFile},
-        remote::{RemoteCreatedFile, RemoteDirectoryEntry, RemoteFiles},
+        remote::{
+            RemoteCreatedFile, RemoteDirectoryEntry, RemoteFiles,
+            write_status_requires_execution_evidence, write_was_not_executed,
+        },
         root::RootGrant,
     },
     types::{
@@ -472,13 +475,9 @@ impl OwnerPeerClient {
                 )
             })?;
         let (resource, info, capacity) = crate::node::bridge::spawn_blocking(move || {
-            let mut endpoint = RdmaEndpoint::open(&device)?;
-            let info = endpoint.info()?.to_vec();
-            let capacity = endpoint.capacity();
-            let resource = OwnerRdmaEndpointResource {
-                endpoint,
-                _permit: permit,
-            };
+            let mut resource = RdmaEndpointLease::open(&device, CAPACITY, permit)?;
+            let info = resource.info()?.to_vec();
+            let capacity = resource.capacity();
             Ok::<_, afs_transport::rdma::RdmaError>((resource, info, capacity))
         })
         .await
@@ -530,8 +529,8 @@ impl OwnerPeerClient {
         let server_info = reply.server_info;
         let resource = crate::node::bridge::spawn_blocking(move || {
             let mut resource = resource;
-            resource.endpoint.connect(&server_info)?;
-            resource.endpoint.send_probe(5000)?;
+            resource.connect(&server_info)?;
+            resource.send_probe(5000)?;
             Ok::<_, afs_transport::rdma::RdmaError>(resource)
         })
         .await
@@ -592,7 +591,7 @@ impl OwnerPeerClient {
         let len = reply.read as usize;
         let (resource_guard, bytes) = crate::node::bridge::spawn_blocking(move || {
             let mut resource = resource;
-            let bytes = resource.endpoint.get_local(len)?;
+            let bytes = resource.get_local(len)?;
             Ok::<_, afs_transport::rdma::RdmaError>((resource, bytes))
         })
         .await
@@ -647,12 +646,19 @@ impl OwnerPeerClient {
             let payload = payload.clone();
             move || {
                 let mut resource = resource;
-                resource.endpoint.put_local(&payload)?;
+                resource.put_local(&payload)?;
                 Ok::<_, afs_transport::rdma::RdmaError>(resource)
             }
         })
         .await
-        .map_err(|error| PeerError::coded(afs_error::CLIENT_WORKER_FAILED, error.to_string()))?
+        .map_err(|error| {
+            let code = if error.is_cancelled() {
+                afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED
+            } else {
+                afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_IO
+            };
+            PeerError::coded(code, error.to_string())
+        })?
         .map_err(owner_rdma_error)?;
         let mut client = self.cloned_client()?;
         let mut request = request_with_current_context(OwnerWriteRequest {
@@ -666,10 +672,14 @@ impl OwnerPeerClient {
             data_checksum: checksum,
         });
         request.set_timeout(self.timeout);
-        let reply = client.write(request).await?.into_inner();
+        let reply = client
+            .write(request)
+            .await
+            .map_err(owner_dispatched_write_status)?
+            .into_inner();
         if reply.written as usize > payload.len() {
             return Err(PeerError::coded(
-                afs_error::CLIENT_PROTOCOL_VIOLATION,
+                afs_error::NODE_OWNER_WRITE_UNKNOWN,
                 "OwnerFiles RDMA write count exceeds request length",
             ));
         }
@@ -699,17 +709,11 @@ impl OwnerPeerClient {
 #[cfg(feature = "ownerfs")]
 struct OwnerRdmaWindow {
     #[cfg(feature = "rdma")]
-    resource: OwnerRdmaEndpointResource,
+    resource: RdmaEndpointLease,
     #[cfg(feature = "rdma")]
     session_id: u64,
     #[cfg(feature = "rdma")]
     close: OwnerRdmaCloseGuard,
-}
-
-#[cfg(all(feature = "ownerfs", feature = "rdma"))]
-struct OwnerRdmaEndpointResource {
-    endpoint: RdmaEndpoint,
-    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[cfg(all(feature = "ownerfs", feature = "rdma"))]
@@ -754,6 +758,21 @@ impl Drop for OwnerRdmaCloseGuard {
             });
         }
     }
+}
+
+#[cfg(feature = "ownerfs")]
+fn owner_dispatched_write_status(status: tonic::Status) -> PeerError {
+    // Apply this only to the business RPC result. A local worker or
+    // negotiation failure before calling Write does not imply a mutation.
+    let received = PeerError::from(status);
+    if !write_was_not_executed(&received.0) && write_status_requires_execution_evidence(&received.0)
+    {
+        return PeerError::coded(
+            afs_error::NODE_OWNER_WRITE_UNKNOWN,
+            format!("OwnerFiles write outcome is unknown: {received}"),
+        );
+    }
+    received
 }
 
 #[cfg(feature = "ownerfs")]
@@ -1596,12 +1615,12 @@ impl RemoteFiles for OwnerPeerClient {
                         },
                     }))
                     .await
-                    .map_err(PeerError::from)
+                    .map_err(owner_dispatched_write_status)
                     .map(|reply| reply.into_inner())
             })?;
             if reply.written as usize > len {
                 return Err(PeerError::coded(
-                    afs_error::CLIENT_PROTOCOL_VIOLATION,
+                    afs_error::NODE_OWNER_WRITE_UNKNOWN,
                     "OwnerWriteReply count exceeds request length",
                 ));
             }

@@ -290,6 +290,68 @@ impl Api {
             };
             return response(result, &request_id, None, None, method == "DELETE");
         }
+        if let Some(id) = path.strip_prefix("/api/environment/v1/snapshot-references/") {
+            let result = async {
+                if method != "PUT" {
+                    return Err(Status::unimplemented(
+                        "unsupported snapshot reference method",
+                    ));
+                }
+                let authorized = std::env::var("ADX_ACTIVATOR_SERVICE_TOKEN")
+                    .ok()
+                    .and_then(|token| adx_agent_core::transport::ServiceAuth::new(&token).ok())
+                    .is_some_and(|auth| {
+                        auth.accepts(header(&request, "x-adx-agent-authorization"))
+                    });
+                if !authorized {
+                    return Err(Status::permission_denied(
+                        "Activator service identity required",
+                    ));
+                }
+                let change = serde_json::from_value(body(request.into_body(), 4096).await?)
+                    .map_err(|_| Status::invalid_argument("invalid snapshot reference change"))?;
+                self.environment_service
+                    .update_snapshot_reference(&caller, id, &change)
+                    .await?;
+                Ok(json!({}))
+            }
+            .await;
+            let stale = result
+                .as_ref()
+                .is_err_and(crate::snapshot_preparation::snapshot_admission_stale);
+            let mut response = response(result, &request_id, None, None, true);
+            if stale {
+                response.headers_mut().insert(
+                    adx_core::snapshots::ADMISSION_STALE_HEADER,
+                    hyper::header::HeaderValue::from_static("true"),
+                );
+            }
+            return response;
+        }
+        if method == "PUT" {
+            if let Some(id) = path.strip_prefix("/api/environment/v1/snapshot-preparations/") {
+                let input = match body(request.into_body(), 1_048_576).await {
+                    Ok(value) => value,
+                    Err(error) => return error_response(error, &request_id, None, None, false),
+                };
+                return response(
+                    Box::pin(
+                        self.environment_service
+                            .prepare_snapshot(id, input, &caller),
+                    )
+                    .await
+                    .and_then(|result| {
+                        serde_json::to_value(result).map_err(|_| {
+                            Status::internal("snapshot preparation response encoding failed")
+                        })
+                    }),
+                    &request_id,
+                    None,
+                    None,
+                    true,
+                );
+            }
+        }
         if method == "GET" && path == "/api/environment/v1/capabilities" {
             return plain(200, json!({"capabilities": ["workload-probes-v1"]}));
         }

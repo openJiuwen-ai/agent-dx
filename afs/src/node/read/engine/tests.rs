@@ -2504,6 +2504,20 @@ impl ChunkTransfer for RotationTransfer {
     }
 }
 
+/// A Chunk ID whose rendezvous order (D3-2) over `nodes` is exactly `nodes`,
+/// so rotation tests keep a known candidate order.
+pub(super) fn chunk_ordered(prefix: &str, nodes: &[&str]) -> ChunkId {
+    (0..10_000)
+        .map(|index| ChunkId::new(format!("{prefix}-{index}")))
+        .find(|chunk| {
+            nodes.windows(2).all(|pair| {
+                super::distribution::rendezvous_weight("version", chunk, pair[0])
+                    > super::distribution::rendezvous_weight("version", chunk, pair[1])
+            })
+        })
+        .expect("a Chunk ID with the requested order")
+}
+
 fn rotation_source(copy: &str, chunk_id: &ChunkId, node: &str, role: CopyRole) -> SourceCandidate {
     let mut candidate = source(copy, chunk_id, node);
     candidate.role = role;
@@ -2577,7 +2591,7 @@ fn rotation_read_reviewing(
 /// 传输错误不请复核。
 #[test]
 fn a_content_mismatch_asks_the_holder_to_review_once_and_a_transport_error_does_not() {
-    let chunk = ChunkId::new("suspect");
+    let chunk = chunk_ordered("suspect", &["node-b", "node-c", "node-d"]);
     let transfer = RotationTransfer::with_corrupt(&["flaky-b"], &[], &["bad-c"]);
     let mut out = [0; 4];
     rotation_read_reviewing(
@@ -2629,9 +2643,11 @@ fn a_batch_failure_is_attributed_only_by_the_single_retry() {
     assert_eq!(reviews[0].chunk_id, second);
 }
 
+/// D3-1: with cache holders offered, durable copies come after every cache
+/// holder whatever their Meta position; holders are tried in rendezvous order.
 #[test]
-fn characterize_read_rotation_follows_meta_order_without_preferring_durable_over_cache() {
-    let chunk = ChunkId::new("rotation");
+fn characterize_read_rotation_prefers_cache_holders_and_keeps_durable_copies_as_fallback() {
+    let chunk = chunk_ordered("rotation", &["node-b", "node-d"]);
     let transfer = RotationTransfer::new(&["cache-b", "durable-c"], &[]);
     let mut out = [0; 4];
     rotation_read(
@@ -2649,10 +2665,7 @@ fn characterize_read_rotation_follows_meta_order_without_preferring_durable_over
     )
     .unwrap();
     assert_eq!(out, [b'r'; 4]);
-    assert_eq!(
-        transfer.attempts(),
-        vec![vec!["cache-b"], vec!["durable-c"], vec!["cache-d"]]
-    );
+    assert_eq!(transfer.attempts(), vec![vec!["cache-b"], vec!["cache-d"]]);
 }
 
 #[test]
@@ -2681,7 +2694,7 @@ fn characterize_read_rotation_skips_unreadable_local_and_external_candidates() {
 
 #[test]
 fn characterize_read_rotation_tries_each_copy_once_and_returns_last_error_when_exhausted() {
-    let chunk = ChunkId::new("rotation-exhausted");
+    let chunk = chunk_ordered("rotation-exhausted", &["node-b", "node-c"]);
     let transfer = RotationTransfer::new(&["copy-b", "copy-c"], &[]);
     let mut out = [9; 4];
     let error = rotation_read(
@@ -2703,7 +2716,7 @@ fn characterize_read_rotation_tries_each_copy_once_and_returns_last_error_when_e
 
 #[test]
 fn characterize_read_rotation_stops_at_first_denial() {
-    let chunk = ChunkId::new("rotation-denied");
+    let chunk = chunk_ordered("rotation-denied", &["node-b", "node-c"]);
     let transfer = RotationTransfer::new(&[], &["copy-b"]);
     let mut out = [9; 4];
     let error = rotation_read(
@@ -2725,8 +2738,8 @@ fn characterize_read_rotation_stops_at_first_denial() {
 
 #[test]
 fn characterize_read_rotation_retries_batch_singly_on_same_copy_before_advancing() {
-    let first = ChunkId::new("rotation-first");
-    let second = ChunkId::new("rotation-second");
+    let first = chunk_ordered("rotation-first", &["node-b", "node-c"]);
+    let second = chunk_ordered("rotation-second", &["node-b", "node-c"]);
     let transfer = RotationTransfer::new(&["b1", "b2"], &[]);
     let mut out = [0; 8];
     rotation_read(

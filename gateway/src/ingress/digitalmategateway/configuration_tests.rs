@@ -52,3 +52,68 @@ fn valid_model_configuration_names_need_no_runtime_resources() {
         model_name_config(name).validate().unwrap();
     }
 }
+
+#[tokio::test]
+async fn push_without_composio_validates_its_own_startup_dependencies() {
+    let mut config: DigitalMateGatewayConfig =
+        serde_json::from_str(include_str!("../../../examples/digitalmategateway.json")).unwrap();
+    assert!(config.composio.is_none());
+    config.validate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let settings = config.push.as_mut().unwrap();
+    settings.service_account_file = dir.path().join("missing.json");
+    assert!(matches!(
+        settings.prepare().await,
+        Err(super::super::composio::Error::NotConfigured)
+    ));
+    write_push_account(&settings.service_account_file);
+    settings.database.database_url_env = "ADX_PUSH_TEST_MISSING_DATABASE".into();
+    assert!(matches!(
+        settings.prepare().await,
+        Err(super::super::composio::Error::NotConfigured)
+    ));
+    config.privacy = None;
+    assert!(config.validate().is_err());
+}
+
+fn write_push_account(path: &std::path::Path) {
+    let account = json!({
+        "project_id":"123", "key_id":"fixture", "sub_account":"fixture",
+        "private_key": include_str!("../../../tests/fixtures/huawei-test-key.pem")
+    });
+    std::fs::write(path, account.to_string()).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires an empty, task-owned PostgreSQL database"]
+async fn push_only_startup_requires_the_shared_schema() {
+    const ENV: &str = "ADX_PUSH_TEST_DATABASE_URL";
+    let url = std::env::var(ENV).expect("explicit test database URL required");
+    let pg: tokio_postgres::Config = url.parse().unwrap();
+    assert!(pg.get_dbname().unwrap_or("").starts_with("dm_push_test_"));
+    let config: DigitalMateGatewayConfig =
+        serde_json::from_str(include_str!("../../../examples/digitalmategateway.json")).unwrap();
+    assert!(config.composio.is_none());
+    let mut settings = config.push.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    settings.service_account_file = dir.path().join("account.json");
+    write_push_account(&settings.service_account_file);
+    settings.database.database_url_env = ENV.into();
+    settings.database.database_allow_plaintext = true;
+    let pool = settings.database.open().await.unwrap();
+    let db = pool.get().await.unwrap();
+    let existing: bool = db
+        .query_one(
+            "SELECT to_regnamespace('digitalmate_composio_budget') IS NOT NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!existing, "use a fresh task-owned database");
+    assert!(settings.prepare().await.is_err());
+    db.batch_execute(include_str!("composio/budget.sql"))
+        .await
+        .unwrap();
+    assert!(settings.prepare().await.is_ok());
+}

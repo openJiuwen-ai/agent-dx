@@ -1,4 +1,4 @@
-"""Targeted component resource regressions, independent of default CI selections."""
+"""AFS component resource regressions."""
 
 from fixtures.common import Case, DfsProfile
 from suites.dfs.fd_budget import run

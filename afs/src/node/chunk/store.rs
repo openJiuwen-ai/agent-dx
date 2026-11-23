@@ -309,6 +309,36 @@ impl LocalChunkStore {
         }
     }
 
+    /// One native read cache stage for one Chunk (`afs_dfs_read_cache_events_total`).
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_read_cache_event(&self, event: &'static str) {
+        if let Some(metrics) = &self.read_work {
+            metrics.read_cache_event(event);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_read_cache_resource(&self, resource: &'static str, value: u64) {
+        if let Some(metrics) = &self.read_work {
+            metrics.read_cache_resource(resource, value);
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_read_cache_work(&self, stage: &'static str, elapsed: std::time::Duration) {
+        if let Some(metrics) = &self.read_work {
+            metrics.read_cache_work(stage, elapsed);
+        }
+    }
+
+    /// Payload delivered to a reader by the role of the copy that served it.
+    #[cfg(feature = "dfs")]
+    pub(crate) fn record_read_source_bytes(&self, role: &'static str, bytes: u64) {
+        if let Some(metrics) = &self.read_work {
+            metrics.read_source_bytes(role, bytes);
+        }
+    }
+
     #[cfg(feature = "dfs")]
     pub(crate) fn record_peer_read_event(&self, event: &'static str) {
         if let Some(metrics) = &self.read_work {
@@ -752,9 +782,9 @@ impl LocalChunkStore {
             })
     }
 
-    /// Fill a caller-owned, unpublished range with one complete integrity scan.
-    /// The output may be dirtied on failure and must not be returned to a peer
-    /// until this operation succeeds. No verified reader or cache is retained.
+    /// Fill a caller-owned, unpublished range after verifying its integrity.
+    /// BLAKE3 requires a full scan; CRC32C checks the covering storage segments.
+    /// No verified reader or cache is retained, and failure may dirty the output.
     #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
     pub(crate) fn read_range_at_uncommitted(
         &self,
@@ -763,18 +793,23 @@ impl LocalChunkStore {
         out: &mut [u8],
     ) -> Result<usize> {
         let reader = self.open_cataloged(chunk_id)?;
-        let result = verified_ranges_into(
-            &reader.file,
-            &reader.chunk,
-            &[VerifiedRangeCopy {
-                chunk_offset: offset,
-                length: out.len(),
-                output_offset: 0,
-            }],
-            out,
-            true,
-            self.read_work.as_ref(),
-        );
+        let ranges = [VerifiedRangeCopy {
+            chunk_offset: offset,
+            length: out.len(),
+            output_offset: 0,
+        }];
+        let result = if reader.chunk.is_segment_crc32c() {
+            reader.crc_ranges(&ranges, out)
+        } else {
+            verified_ranges_into(
+                &reader.file,
+                &reader.chunk,
+                &ranges,
+                out,
+                true,
+                self.read_work.as_ref(),
+            )
+        };
         result.map(|counts| counts[0]).inspect_err(|error| {
             if verified_copy_is_invalid(error) {
                 self.lifecycle()

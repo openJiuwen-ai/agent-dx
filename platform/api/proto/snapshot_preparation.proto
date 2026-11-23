@@ -26,12 +26,18 @@ message RegisterSnapshotPreparationRequest {
   CallerContext caller = 1;
   string name = 2;
   Resources resources = 4;
+  // Native callers reuse this fixed UUID for both family and preparation.
+  optional string fixed_id = 5;
+  // Prevents first registration after the Agent job's deadline. Existing work is still replayable.
+  optional uint64 registration_deadline_unix_ms = 6;
 }
 message StartSnapshotPreparationRequest {
   CallerContext caller = 1;
   string template_id = 2;
   string preparation_id = 3;
   EnvironmentSpec spec = 4;
+  // Agent-only seed definition. Coordinator persists it before ensuring the Volume.
+  VolumeSpec seed_volume = 5;
 }
 message GetSnapshotPreparationRequest {
   CallerContext caller = 1;

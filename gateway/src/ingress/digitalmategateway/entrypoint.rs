@@ -60,6 +60,9 @@ pub struct DigitalMateGatewayConfig {
     #[cfg(unix)]
     #[serde(default)]
     pub(crate) composio: Option<super::composio::ComposioConfig>,
+    #[cfg(unix)]
+    #[serde(default)]
+    pub(crate) push: Option<super::push::PushConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -366,7 +369,28 @@ impl DigitalMateGatewayApi {
         self.webhook = Some(webhook);
         self
     }
+    #[cfg(unix)]
+    async fn push_request<B>(&self, request: Request<B>) -> Response<ProxyBody>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let (parts, body) = request.into_parts();
+        let authenticate = async {
+            let identity = self.connector_workload_identity(&parts.headers).await?;
+            super::composio::Scope::from_connector_identity(identity)
+                .map_err(|_| accounts::Error::Forbidden)
+        };
+        super::push::http::handle(self.runtime.push.as_ref(), &parts, body, authenticate)
+            .await
+            .map(|value| value.map_err(|never| match never {}).boxed_unsync())
+    }
+
     pub fn matches(path: &str) -> bool {
+        #[cfg(unix)]
+        if path == super::push::http::SEND_PATH {
+            return true;
+        }
         path == super::ingestion::WEBHOOK_PATH
             || super::composio::http::matches(path)
             || path == super::composio::http::CALLBACK_PATH
@@ -389,6 +413,10 @@ impl DigitalMateGatewayApi {
         mut request: Request<Incoming>,
         ingress: Arc<Ingress>,
     ) -> Response<ProxyBody> {
+        #[cfg(unix)]
+        if request.uri().path() == super::push::http::SEND_PATH {
+            return self.push_request(request).await;
+        }
         if request.uri().path() == super::ingestion::WEBHOOK_PATH {
             return match self.webhook.clone() {
                 Some(webhook) => webhook.handle(request).await,

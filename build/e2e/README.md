@@ -106,7 +106,7 @@ python3 build/e2e/afs_gate.py \
 ```
 
 Use `--case afs-component-full` with the first runner command for an explicitly
-targeted component Full. It reuses the registered 24 cases and frozen Rust
+targeted component Full. It reuses the declared `ci-full` cases and frozen Rust
 test ELF already delivered in the fixed image; it never runs Cargo. No case
 flag on the native `standalone` runner still selects only the public eleven
 groups; the gate is required to include all three parts. A targeted SDK or
@@ -146,6 +146,44 @@ strategy. Other candidates and environments require their own runs.
 normal restart, DFS bounded-sync progress through the declared 64 MiB queue
 profile, required-replica recovery, and failed-close retirement. It uses the
 same Meta/Node binaries and normal process/mount cleanup as Full.
+
+On Kubernetes, run these same five cases through the existing Buildkite Full
+pipeline with `ADX_E2E_TARGET_CASE=reliability`, `ADX_WITH_AFS=1`, and the
+fixed candidate image build and commit. The Kubernetes runner collects the
+phases registered by ADX and AFS and runs each in its own deployment. The
+aggregate report lists results by phase and requires every phase to pass and
+confirm cleanup. The process restart and write recovery phase uses the M/A/B
+fixture with A and B on separate workers. Use
+`ADX_E2E_TARGET_CASE=afs-ownerfs-restart` for the same OwnerFs restart case alone.
+With `AFS_E2E_BASELINE_BUILD` (an old AFS-on Base build UUID) and
+`AFS_E2E_BASELINE_COMMIT` (its full SHA), reliability also runs the offline
+OwnerFs and DFS upgrade/rollback phase. The current candidate is still selected
+by the regular `ADX_E2E_ARTIFACT_BUILD` and `ADX_E2E_ARTIFACT_COMMIT` settings.
+Use `ADX_E2E_TARGET_CASE=afs-component-upgrade-rollback` to reproduce the
+version-switch phase on its own. By default it runs the OwnerFs and DFS
+upgrade and rollback cases. For a baseline that can still leave a legacy
+RootCommand, set `AFS_E2E_UPGRADE_CASE=ownerfs.version.old_root_command` to
+run that scenario alone. The phase uses isolated local-file Meta state and
+switches binaries after stopping the processes. Rollback restores the
+pre-upgrade Meta and Node data with the baseline binaries.
+
+`ADX_E2E_TARGET_CASE=afs-component-mixed-protocols` uses the same baseline
+and candidate artifact parameters. To check rejection of an incompatible Node,
+choose `AFS_E2E_PROTOCOL_ADMISSION=old-meta` or `new-meta` and supply
+`AFS_E2E_PROTOCOL_VERSIONS=<baseline>,<candidate>` from the selected
+artifacts' protocol versions. Both directions use the same value order.
+The test compares the complete protocol numbers reported by the rejecting node.
+
+For a separately built Python SDK, use `ADX_E2E_TARGET_CASE=afs-sdk`.
+`ADX_E2E_ARTIFACT_BUILD` and `ADX_E2E_ARTIFACT_COMMIT` pin the server.
+`AFS_E2E_SDK_COMPAT_BUILD` and `AFS_E2E_SDK_COMPAT_COMMIT` pin the SDK's
+Buildkite build UUID and full SHA. The selected `sdk-package` manifest supplies
+the wheel version and SHA256. Set `AFS_E2E_SDK_REQUIRED_CAPABILITIES=recursive-false`
+when the selected client must expose that capability. The harness records a
+failure if the SDK lacks the parameter. Without this setting a client that
+exposes the capability still runs its contract test.
+See the [AFS compatibility case catalog](../../docs/testing/afs-case-prompts.md#version-posix-sdk)
+for the Docker equivalent and the assertions.
 
 The SDK restart case keeps one real Environment on each AFS data role. An
 SDK-launched background workload performs checked, synced file I/O while the

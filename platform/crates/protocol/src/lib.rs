@@ -428,6 +428,14 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
             tonic::Code::ResourceExhausted, "waiting for Volume",
             serde_json::json!({"code":"WAITING_FOR_VOLUME", "volume_uid":uid}).to_string().into_bytes().into(),
         ),
+        Error::SnapshotAdmissionStale => {
+            let mut status = tonic::Status::unavailable("snapshot admission revision changed");
+            status.metadata_mut().insert(
+                adx_core::snapshots::ADMISSION_STALE_HEADER,
+                tonic::metadata::MetadataValue::from_static("true"),
+            );
+            status
+        }
         Error::Unavailable(message) => tonic::Status::unavailable(message),
         Error::ResponseTimeout(message) => tonic::Status::deadline_exceeded(message),
         Error::DeadlineExceeded(message) => {

@@ -4,10 +4,10 @@ The suite measures with industry tools (fio, elbencho, iperf3) and reads their o
 reports. Everything here is deterministic so it can be pinned by runner_tests.
 """
 
-from dataclasses import dataclass, field
 import json
 import re
 import statistics
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
 from fixtures.common import Blocked, is_integer
@@ -19,14 +19,27 @@ FIO_OPERATIONS = ("read", "write")
 READER_ROLES = ("B", "C", "D", "E")
 NODE_ROLES = ("A",) + READER_ROLES
 BACKENDS = ("disk", "memory")
-# Whitelisted Node settings a bench variant may change: key -> (kind, lower, upper) or allowed strings.
+KIB = 1024
+# Whitelisted Node settings a bench variant may change, within the product's own limits:
+# key -> ("int", lower, upper), ("choice", allowed), ("step", unit, lower, upper) or ("zero_or", lower, upper).
 OVERRIDE_KEYS = {
-    "dfs_read_parallelism": ("int", 1, 64),
+    "dfs_read_parallelism": ("int", 1, 8),
     "dfs_readahead_max_bytes": ("int", 0, 32 * MIB),
     "dfs_read_crc_mode": ("choice", ("receiver", "off")),
-    "dfs_read_pipeline.max_rpcs": ("int", 1, 256),
+    "dfs_read_pipeline.max_rpcs": ("int", 1, 128),
     "dfs_peer_cache.capacity_bytes": ("int", MIB, 1024**4),
+    "dfs_read_cache_bytes": ("zero_or", 4 * MIB + 4 * KIB, 1024**4),
+    "dfs_read_stripe_bytes": ("step", 64 * KIB, 64 * KIB, 8 * MIB),
+    "dfs_source_cache_max_ms": ("int", 0, 60_000),
 }
+# The serveable read cache and the private peer cache are exclusive on one Node (the product refuses both).
+EXCLUSIVE_OVERRIDES = ("dfs_read_cache_bytes", "dfs_peer_cache.")
+LOCAL_COPY = ("required", "preferred", "none")
+REPLICATION_KEYS = ("dfs_desired_copies", "dfs_sync_required_copies", "dfs_local_copy")
+ARRIVAL_GAP_MAX_MS = 600_000
+# Node log lines counted every round (substring per line); bench.log_events adds more.
+LOG_EVENTS = ("dfs.read_cache_install_failed", "dfs.read_cache_reconcile_retry",
+              "DFS peer read admission deadline exceeded", "peer stayed busy")
 
 
 @dataclass(frozen=True)
@@ -41,6 +54,9 @@ class BenchParameters:
     variant: str = "V0"
     node_overrides: dict = field(default_factory=dict)
     readers: int = 2
+    replication: dict = field(default_factory=dict)
+    arrival: dict = field(default_factory=lambda: {"mode": "together"})
+    log_events: tuple[str, ...] = LOG_EVENTS
 
     @property
     def reader_roles(self):
@@ -49,6 +65,10 @@ class BenchParameters:
     def overrides_for(self, role):
         """Effective overrides for one Node role: the "*" entries, then the role's own."""
         return {**self.node_overrides.get("*", {}), **self.node_overrides.get(role, {})}
+
+    def applied_overrides(self, roles):
+        """Overrides that reach the given Node roles; roles outside the cluster contribute nothing."""
+        return {role: self.overrides_for(role) for role in roles if role in NODE_ROLES and self.overrides_for(role)}
 
     def tool(self, name):
         """Return (absolute path, extra environment) for a declared tool."""
@@ -93,7 +113,10 @@ def parameters(config):
         raise Blocked("bench tools must declare absolute tool paths")
     for name, entry in tools.items():
         _tool_entry(name, entry)
-    return BenchParameters(size, tuple(blocks), tuple(threads), rounds, dict(tools), *_variant_inputs(values))
+    present = tuple(r for r in NODE_ROLES if r in config["roles"]) if isinstance(config.get("roles"), dict) \
+        else NODE_ROLES
+    return BenchParameters(size, tuple(blocks), tuple(threads), rounds, dict(tools),
+                           **_variant_inputs(values, present))
 
 
 def _override_value(key, value):
@@ -103,11 +126,90 @@ def _override_value(key, value):
     if spec[0] == "choice":
         if value not in spec[1]:
             raise Blocked("bench node override %s must be one of %s" % (key, ",".join(spec[1])))
+    elif spec[0] == "step":
+        if not is_integer(value) or not spec[2] <= value <= spec[3] or value % spec[1]:
+            raise Blocked("bench node override %s must be a multiple of %d in %d..%d" % (key, *spec[1:]))
+    elif spec[0] == "zero_or":
+        if not is_integer(value) or value != 0 and not spec[1] <= value <= spec[2]:
+            raise Blocked("bench node override %s must be 0 or %d..%d" % (key, spec[1], spec[2]))
     elif not is_integer(value) or not spec[1] <= value <= spec[2]:
         raise Blocked("bench node override %s must be an integer %d..%d" % (key, spec[1], spec[2]))
 
 
-def _variant_inputs(values):
+def _replication_inputs(values):
+    """Topology-level replica settings (Meta and every Node); absent keys keep the fixture default."""
+    declared = {k: values[k] for k in REPLICATION_KEYS if k in values}
+    desired = declared.get("dfs_desired_copies", 1)
+    if not is_integer(desired) or not 1 <= desired <= len(NODE_ROLES):
+        raise Blocked("bench dfs_desired_copies must be 1..%d" % len(NODE_ROLES))
+    sync = declared.get("dfs_sync_required_copies", desired)
+    if not is_integer(sync) or not 1 <= sync <= desired:
+        raise Blocked("bench dfs_sync_required_copies must be 1..dfs_desired_copies")
+    if declared.get("dfs_local_copy", "required") not in LOCAL_COPY:
+        raise Blocked("bench dfs_local_copy must be one of " + ",".join(LOCAL_COPY))
+    return declared
+
+
+def replication_settings(declared):
+    """Full Meta/Node replica settings for declared bench replication; None keeps the fixture default.
+
+    Sync copies default to the desired count and every copy needs its own Node, as in the fixture.
+    """
+    if not declared:
+        return None
+    desired = declared.get("dfs_desired_copies", 1)
+    return {"dfs_desired_copies": desired,
+            "dfs_sync_required_copies": declared.get("dfs_sync_required_copies", desired),
+            "dfs_min_distinct_nodes": desired, "dfs_min_distinct_failure_domains": 1,
+            "dfs_local_copy": declared.get("dfs_local_copy", "required")}
+
+
+def replication_toml(settings):
+    return "".join("%s = %s\n" % (k, json.dumps(v)) for k, v in settings.items())
+
+
+def single_writer_copy(declared):
+    """True when the writer A holds the only replica, so every reader byte must cross the network."""
+    settings = replication_settings(declared) or {"dfs_desired_copies": 1, "dfs_local_copy": "required"}
+    return settings["dfs_desired_copies"] == 1 and settings["dfs_local_copy"] == "required"
+
+
+def _arrival_inputs(values, readers):
+    arrival = values.get("fanout_arrival", {"mode": "together"})
+    if not isinstance(arrival, dict):
+        raise Blocked("bench fanout_arrival must be an object with a mode")
+    if arrival.get("mode") == "together" and set(arrival) == {"mode"}:
+        return {"mode": "together"}
+    if arrival.get("mode") != "stagger" or set(arrival) != {"mode", "seed", "gap_ms"}:
+        raise Blocked("bench fanout_arrival is {mode: together} or {mode: stagger, seed, gap_ms}")
+    if readers < 2 or arrival["seed"] not in READER_ROLES[:readers]:
+        raise Blocked("staggered fan-out needs at least two readers and a seed among them")
+    gap = arrival["gap_ms"]
+    if not is_integer(gap) or not 0 <= gap <= ARRIVAL_GAP_MAX_MS:
+        raise Blocked("bench fanout_arrival gap_ms must be 0..%d" % ARRIVAL_GAP_MAX_MS)
+    return dict(arrival)
+
+
+def arrival_phases(arrival, readers):
+    """Reader groups in start order: stagger runs the seed alone, then the others together."""
+    if arrival["mode"] == "together":
+        return [("all", tuple(readers))]
+    seed = arrival["seed"]
+    return [("seed", (seed,)), ("followers", tuple(r for r in readers if r != seed))]
+
+
+def _log_event_inputs(values):
+    extra = values.get("log_events", [])
+    error = "bench log_events must list 1..200 character single-line strings"
+    if not isinstance(extra, list):
+        raise Blocked(error)
+    for event in extra:
+        if not isinstance(event, str) or not 1 <= len(event) <= 200 or "\n" in event:
+            raise Blocked(error)
+    return tuple(dict.fromkeys(LOG_EVENTS + tuple(extra)))
+
+
+def _variant_inputs(values, present=NODE_ROLES):
     """Optional verification inputs; absent keys keep the disk-backed default configuration."""
     backend = values.get("backend", "disk")
     if backend not in BACKENDS:
@@ -123,15 +225,30 @@ def _variant_inputs(values):
             raise Blocked("bench node_overrides roles are *, A, B, C, D or E with a settings object")
         for key, value in settings.items():
             _override_value(key, value)
+    for role in NODE_ROLES:
+        merged = {**overrides.get("*", {}), **overrides.get(role, {})}
+        if EXCLUSIVE_OVERRIDES[0] in merged and any(k.startswith(EXCLUSIVE_OVERRIDES[1]) for k in merged):
+            raise Blocked("bench node %s cannot use dfs_read_cache_bytes together with dfs_peer_cache" % role)
+    replication = _replication_inputs(values)
     variant = values.get("variant", "V0")
     if not isinstance(variant, str) or not 1 <= len(variant) <= 32:
         raise Blocked("bench variant must be a label of 1..32 characters")
-    if overrides and variant == "V0":
-        raise Blocked("bench node overrides need a variant label other than V0")
+    applied = any({**overrides.get("*", {}), **overrides.get(r, {})} for r in present)
+    if (applied or replication) and variant == "V0":
+        raise Blocked("bench node overrides and replica settings need a variant label other than V0")
     readers = values.get("readers", 2)
     if not is_integer(readers) or not 1 <= readers <= len(READER_ROLES):
         raise Blocked("bench readers must be 1..4")
-    return backend, memory if backend == "memory" else 0, variant, dict(overrides), readers
+    return {
+        "backend": backend,
+        "memory_backend_bytes": memory if backend == "memory" else 0,
+        "variant": variant,
+        "node_overrides": dict(overrides),
+        "readers": readers,
+        "replication": replication,
+        "arrival": _arrival_inputs(values, readers),
+        "log_events": _log_event_inputs(values),
+    }
 
 
 def node_overrides_toml(overrides, peer_cache_directory):
@@ -162,27 +279,165 @@ def effective_mismatches(effective, overrides):
     return mismatches
 
 
+def _samples(text):
+    table = {}
+    for line in text.splitlines():
+        if line and not line.startswith("#"):
+            name, _, value = line.rpartition(" ")
+            try:
+                table[name] = float(value)
+            except ValueError:
+                continue
+    return table
+
+
 def metrics_delta(before, after, pattern):
     """Prometheus samples (name+labels) matching `pattern` whose value changed between two scrapes."""
-
-    def samples(text):
-        table = {}
-        for line in text.splitlines():
-            if line and not line.startswith("#"):
-                name, _, value = line.rpartition(" ")
-                try:
-                    table[name] = float(value)
-                except ValueError:
-                    continue
-        return table
-
-    first, second, wanted = samples(before), samples(after), re.compile(pattern)
+    first, second, wanted = _samples(before), _samples(after), re.compile(pattern)
     delta = {}
     for name, value in second.items():
         change = value - first.get(name, 0.0)
         if change and wanted.search(name):
             delta[name] = change
     return delta
+
+
+# Counter families a reconciliation depends on: (family, labels every sample must carry, any-of labels).
+# Sent read payload of a Node, every transport.
+SEND_SERIES = ("afs_dfs_payload_bytes_total", ('direction="send"', 'operation="read"'), ())
+# Payload a reader received from peers (CRC-checked receive stages), the reader-side remote evidence.
+RECEIVE_SERIES = ("afs_dfs_crc32c_read_bytes_total", (), ('stage="range_receive"', 'stage="trusted_segments_receive"'))
+
+
+def counter_window(before, after, series):
+    """One counter family between two scrapes: `complete` (same samples in both, none decreased),
+    `missing` (absent from either scrape or a different sample set) or `reset` (a sample decreased).
+    Only a complete window has a delta; a missing sample is never read as zero.
+    """
+    family, required, any_of = series
+
+    def pick(text):
+        selected = {}
+        for name, value in _samples(text).items():
+            if not name.startswith(family + "{") or not all(label in name for label in required):
+                continue
+            if any_of and not any(label in name for label in any_of):
+                continue
+            selected[name] = value
+        return selected
+
+    first, second = pick(before), pick(after)
+    if not first or not second or set(first) != set(second):
+        return {"status": "missing", "samples": sorted(set(first) ^ set(second)) or [family]}
+    reset = sorted(n for n in second if second[n] < first[n])
+    if reset:
+        return {"status": "reset", "samples": reset}
+    return {"status": "complete", "delta": int(sum(second[n] - first[n] for n in second))}
+
+
+def counter_windows(before, after, roles, series):
+    return {role: counter_window(before[role], after[role], series) for role in roles}
+
+
+def send_reconciliation(windows, *, readers, file_bytes, tool_bytes, applies):
+    """Sum of read payload sent by every Node (from complete SEND_SERIES windows) against N*S and the tool.
+
+    `applies` is False when readers may hold local replicas (they read without any Node sending);
+    the sums are then recorded but not judged (ok=None). With any Node's window missing or reset,
+    `metrics` names the problem, the sums cannot be trusted and nothing is judged (ok=None).
+    """
+    issues = {role: w["status"] for role, w in windows.items() if w["status"] != "complete"}
+    sent = {role: w["delta"] for role, w in windows.items() if w["status"] == "complete"}
+    expected = readers * file_bytes
+    total = sum(sent.values())
+    metrics = "complete" if not issues else ("reset" if "reset" in issues.values() else "missing")
+    check = {"sent_by_role": sent, "sent_total": total, "expected": expected, "tool_bytes": tool_bytes,
+             "applies": applies, "metrics": metrics,
+             "ok": (total == expected == tool_bytes) if applies and not issues else None}
+    if issues:
+        check["metrics_issues"] = issues
+    return check
+
+
+def reader_local_reads(windows, file_bytes):
+    """Bytes each reader did not receive from peers while reading the whole file once (RECEIVE_SERIES).
+
+    `status` is complete only when every reader's window is complete; local bytes never go below 0.
+    """
+    issues, by_reader = {}, {}
+    for role, window in windows.items():
+        if window["status"] != "complete":
+            issues[role] = window["status"]
+            continue
+        received = window["delta"]
+        by_reader[role] = {"received_bytes": received, "local_bytes": max(0, file_bytes - received)}
+    value = {"status": "complete" if not issues else ("reset" if "reset" in issues.values() else "missing"),
+             "by_reader": by_reader, "local_total": sum(r["local_bytes"] for r in by_reader.values())}
+    if issues:
+        value["issues"] = issues
+    return value
+
+
+LOCAL_REPLICA_SUFFIX = "_local_replica"
+UNATTRIBUTED_SUFFIX = "_unattributed"
+
+
+def replica_layer(layer, check, local):
+    """Layer name of one read window after its send check and reader-side evidence.
+
+    Unchanged when the check is judged (the writer holds the only copy), or when complete counters show
+    the Nodes sent at least N*S. With reader replicas, a shortfall is `_local_replica` only when every
+    send and reader receive window is complete and readers did read bytes they never received;
+    otherwise (counters missing or reset, or a shortfall no reader accounts for) `_unattributed`.
+    Neither is ever pooled with remote reads.
+    """
+    if check["applies"]:
+        return layer
+    if check["metrics"] == "complete" and check["sent_total"] >= check["expected"]:
+        return layer
+    if check["metrics"] == "complete" and local["status"] == "complete" and local["local_total"] > 0:
+        return layer + LOCAL_REPLICA_SUFFIX
+    return layer + UNATTRIBUTED_SUFFIX
+
+
+def placement_coverage(files_by_role, baseline, file_bytes):
+    """Whether this round's file is covered by the chunk bodies written for it.
+
+    Chunk bodies already listed before the write on any Node (`baseline`, role -> {chunk id: bytes}) are
+    residue of earlier files and are recorded as stale, never counted. The remaining chunk ids are this
+    round's; each counts once (`distinct_bytes`), further copies count as `replica_bytes`. Coverage is
+    `verified` only when the distinct chunks add up exactly to the file and every copy of a chunk has
+    the same size; anything else is `unverified`. The product exposes no per-file layout, so logical
+    ranges are not checked: a round's chunks are disjoint by construction (fresh ids per write).
+    """
+    old = {cid for ids in baseline.values() for cid in ids}
+    distinct, by_role, stale, consistent = {}, {}, {}, True
+    for role, files in files_by_role.items():
+        for f in files:
+            if PAYLOAD_MARKER not in f["path"]:
+                continue
+            cid = PurePosixPath(f["path"]).name
+            if cid in old:
+                stale[role] = stale.get(role, 0) + f["bytes"]
+                continue
+            by_role[role] = by_role.get(role, 0) + f["bytes"]
+            consistent &= distinct.setdefault(cid, f["bytes"]) == f["bytes"]
+    total = sum(distinct.values())
+    return {"coverage": "verified" if consistent and total == file_bytes else "unverified",
+            "chunks": len(distinct), "distinct_bytes": total, "replica_bytes": sum(by_role.values()) - total,
+            "by_role": by_role, "stale_by_role": stale}
+
+
+# Runs on a Node host as root: counts lines containing each event after a byte offset of one log.
+# A log shorter than the offset was truncated or replaced and is counted from its start.
+LOG_EVENTS_SCRIPT = (
+    "path,offset,events=sys.argv[1],int(sys.argv[2]),json.loads(sys.argv[3])\n"
+    "try:\n f=open(path,'rb')\nexcept OSError:\n print(json.dumps(None));sys.exit(0)\n"
+    "with f:\n"
+    " size=f.seek(0,2);rotated=size<offset;f.seek(0 if rotated else offset);lines=f.read().splitlines()\n"
+    "counts={e:sum(1 for l in lines if e.encode() in l) for e in events}\n"
+    "print(json.dumps({'size':size,'rotated':rotated,'counts':counts}))"
+)
 
 
 def parse_kernel_memory(vmstat, meminfo):

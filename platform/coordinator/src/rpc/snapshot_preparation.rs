@@ -124,6 +124,7 @@ async fn successful_view(
         resources: snapshot.template.resources,
         state: PreparationState::Ready,
         spec: None,
+        seed_volume: None,
         snapshot_id: Some(snapshot.id.clone()),
         expected_revision: None,
         error: None,
@@ -335,6 +336,69 @@ impl CoordinatorRpc {
         Ok(())
     }
 
+    async fn release_preparation_seed(
+        &self,
+        session: &Session,
+        spec: &EnvironmentSpec,
+        template: &SnapshotTemplate,
+    ) -> Result<()> {
+        self.preparation_delete_seed(spec).await?;
+        // Agent publishes a fixed preparation UUID and a single seed-owned Volume.
+        let id = &template.preparation.id;
+        if template.is_agent_managed() && spec.id == format!("golden-{id}") {
+            session
+                .release_volume_owner(&spec.tenant_id, &spec.id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_preparation_seed_volume(
+        &self,
+        session: &Session,
+        template: &SnapshotTemplate,
+        mut spec: EnvironmentSpec,
+    ) -> Result<EnvironmentSpec> {
+        let Some(seed) = &template.preparation.seed_volume else {
+            return Ok(spec);
+        };
+        let domains = self
+            .0
+            .volume_domains
+            .read()
+            .map_err(|_| Error::Unavailable("volume domain configuration unavailable".into()))?
+            .clone();
+        let volume = session
+            .ensure_volume_for_owner(seed.clone(), &domains, &spec.id)
+            .await
+            .map_err(|error| match error {
+                Error::Conflict => Error::Invalid("seed Volume storage allocation conflict".into()),
+                error => error,
+            })?;
+        if volume.spec != *seed {
+            return Err(Error::Invalid("seed Volume definition changed".into()));
+        }
+        for mount in &mut spec.execution.mounts {
+            if let adx_core::execution::MountSource::Volume(reference) = &mut mount.source {
+                reference.uid = Some(volume.uid.clone());
+            }
+        }
+        session
+            .update_snapshot_template(&template.id, |record| {
+                let current = preparation_mut(record, &template.preparation.id)?;
+                if current.state != PreparationState::Creating
+                    || current.seed_volume.as_ref() != Some(seed)
+                {
+                    return Err(Error::Conflict);
+                }
+                current.spec = Some(spec.clone());
+                current.seed_volume = None;
+                Ok(())
+            })
+            .await?;
+        Ok(spec)
+    }
+
     async fn preparation_capture(
         &self,
         session: &Session,
@@ -436,6 +500,22 @@ impl CoordinatorRpc {
             return Ok(());
         }
         let Some(spec) = build.spec.clone() else {
+            if build.state == PreparationState::Failed
+                && build.cleanup_pending
+                && template.is_agent_managed()
+            {
+                session
+                    .release_volume_owner(&tenant_id, &format!("golden-{build_id}"))
+                    .await?;
+                session
+                    .update_snapshot_template(&template_id, |record| {
+                        let current = preparation_mut(record, &build_id)?;
+                        current.cleanup_pending = false;
+                        Ok(())
+                    })
+                    .await?;
+                return Ok(());
+            }
             if matches!(
                 build.state,
                 PreparationState::Creating
@@ -459,7 +539,8 @@ impl CoordinatorRpc {
             && build.state != PreparationState::Snapshotting
         {
             if build.cleanup_pending {
-                self.preparation_delete_seed(&spec).await?;
+                self.release_preparation_seed(&session, &spec, &template)
+                    .await?;
                 session
                     .update_snapshot_template(&template_id, |record| {
                         let current = preparation_mut(record, &build_id)?;
@@ -468,6 +549,7 @@ impl CoordinatorRpc {
                             current.state = PreparationState::Failed;
                         }
                         current.spec = None;
+                        current.seed_volume = None;
                         Ok(())
                     })
                     .await?;
@@ -477,6 +559,9 @@ impl CoordinatorRpc {
         // Registration time is not the start time. Individual lifecycle RPCs are
         // bounded, while uncertain accepted work keeps its durable fixed identity.
         let outcome: Result<()> = async {
+            let spec = self
+                .ensure_preparation_seed_volume(&session, &template, spec)
+                .await?;
             if build.state == PreparationState::Creating {
                 let existing = match session.get(&spec.id).await {
                     Ok(stored) => Some(stored),
@@ -606,7 +691,8 @@ impl CoordinatorRpc {
             })?;
             let snapshot = session.get_snapshot(snapshot_id).await?;
             validate_preparation_snapshot(&snapshot, &spec, snapshot_id, &saved.name)?;
-            self.preparation_delete_seed(&spec).await?;
+            self.release_preparation_seed(&session, &spec, &template)
+                .await?;
             session
                 .update_snapshot_template(&template_id, |record| {
                     let current = preparation_mut(record, &build_id)?;
@@ -662,14 +748,42 @@ impl CoordinatorRpc {
         let templates = session.retained_snapshot_templates().await?;
         let mut work = Vec::new();
         let mut first_error = None;
-        for template in templates {
-            if template.deleted {
-                if let Err(error) = session
-                    .remove_finished_snapshot_template(&template.id)
+        let now = adx_core::observation::now_millis()?;
+        for mut template in templates {
+            if template.is_agent_managed()
+                && !template.deleted
+                && template.preparation.state == PreparationState::Registered
+                && template
+                    .registration_deadline_unix_ms
+                    .is_some_and(|deadline| now >= deadline)
+            {
+                match session
+                    .update_snapshot_template(&template.id, |record| {
+                        if record.preparation != template.preparation
+                            || record.registration_deadline_unix_ms
+                                != template.registration_deadline_unix_ms
+                            || record.deleted
+                        {
+                            return Err(Error::Conflict);
+                        }
+                        record.preparation.state = PreparationState::Failed;
+                        record.preparation.cleanup_pending = true;
+                        record.preparation.error =
+                            Some("snapshot preparation expired before start".into());
+                        Ok(())
+                    })
                     .await
                 {
-                    first_error.get_or_insert(error);
+                    Ok(expired) => template = expired,
+                    Err(Error::Conflict | Error::NotFound) => continue,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
                 }
+            }
+            if let Err(error) = session.collect_snapshot_template(&template, now).await {
+                first_error.get_or_insert(error);
             }
             let build = template.preparation;
             if matches!(
@@ -738,7 +852,13 @@ impl SnapshotPreparationService for CoordinatorRpc {
         };
         let session = self.preparation_session().await.map_err(status)?;
         let (template, build) = session
-            .register_snapshot_preparation(&caller.tenant_id, &request.name, resources)
+            .register_snapshot_preparation_with_id(
+                &caller.tenant_id,
+                &request.name,
+                resources,
+                request.fixed_id.as_deref(),
+                request.registration_deadline_unix_ms,
+            )
             .await
             .map_err(status)?;
         Ok(Response::new(view(&template, &build, None)))
@@ -773,6 +893,28 @@ impl SnapshotPreparationService for CoordinatorRpc {
         spec.snapshot_id = None;
         spec.resources = build.resources;
         spec.validate().map_err(status)?;
+        let seed_volume = request
+            .seed_volume
+            .map(adx_core::volumes::VolumeSpec::try_from)
+            .transpose()
+            .map_err(status)?;
+        if let Some(volume) = &seed_volume {
+            use adx_core::{execution::MountSource, volumes::AccessMode};
+            let valid_mount = matches!(spec.execution.mounts.as_slice(), [mount]
+                if matches!(&mount.source, MountSource::Volume(reference)
+                    if reference.id == volume.id && reference.uid.is_none()));
+            if !template.is_agent_managed()
+                || volume.tenant_id != spec.tenant_id
+                || volume.id != format!("adx-agent-seed-{}", build.id)
+                || volume.access_mode != AccessMode::Exclusive
+                || !volume.create_if_missing
+                || !valid_mount
+            {
+                return Err(Status::invalid_argument(
+                    "invalid snapshot preparation seed Volume",
+                ));
+            }
+        }
         if build.state != PreparationState::Registered {
             return Err(Status::invalid_argument(
                 "snapshot preparation has already started",
@@ -789,6 +931,7 @@ impl SnapshotPreparationService for CoordinatorRpc {
                 }
                 current.state = PreparationState::Creating;
                 current.spec = Some(spec.clone());
+                current.seed_volume = seed_volume.clone();
                 current.cleanup_pending = true;
                 Ok(())
             })
@@ -1114,6 +1257,7 @@ mod tests {
             resources: spec.resources,
             state: PreparationState::Failed,
             spec: Some(spec),
+            seed_volume: None,
             snapshot_id: None,
             expected_revision: None,
             error: Some("image preparation failed".into()),
@@ -1132,6 +1276,7 @@ mod tests {
             revision: 1,
             deleted: false,
             preparation: build.clone(),
+            registration_deadline_unix_ms: None,
             latest_successful: None,
         };
         let result = view(&template, &build, None);
@@ -1180,6 +1325,277 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn unknown_seed_volume_domain_fails_and_reclaims_agent_family() {
+        failed_seed_volume_reclaims_agent_family(false, "unknown volume storage domain").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn conflicting_seed_volume_path_fails_and_reclaims_agent_family() {
+        failed_seed_volume_reclaims_agent_family(true, "seed Volume storage allocation conflict")
+            .await;
+    }
+
+    async fn failed_seed_volume_reclaims_agent_family(conflicting_path: bool, error: &str) {
+        let redis = cancellation_test_redis::Redis::new().await;
+        let store = crate::storage::RedisStore::connect(&redis.url, "test", Duration::from_secs(5))
+            .await
+            .unwrap();
+        let session = store.begin(1).await.unwrap();
+        let mut worker = rpc(session.clone()).await;
+        let id = "00000000-0000-4000-8000-000000000003";
+        let name = format!("adx-agent-{id}-{}", "b".repeat(64));
+        let deadline = adx_core::observation::now_millis().unwrap() + 1600;
+        session
+            .register_snapshot_preparation_with_id(
+                "tenant",
+                &name,
+                source().resources,
+                Some(id),
+                Some(deadline),
+            )
+            .await
+            .unwrap();
+        let volume_id = format!("adx-agent-seed-{id}");
+        let volume: adx_core::volumes::VolumeSpec = serde_json::from_value(serde_json::json!({
+            "id":volume_id,"tenant_id":"tenant","access_mode":"exclusive","create_if_missing":true,
+            "source":{"type":"directory","storage_domain":"test","path":"test/workspaces/seed"}
+        }))
+        .unwrap();
+        if conflicting_path {
+            let domains = [(
+                "test".into(),
+                adx_core::volumes::StorageDomain {
+                    backend_id: "test-backend".into(),
+                    dynamic_nodes: true,
+                    node_roots: Default::default(),
+                    tenant_paths: [("tenant".into(), "test/workspaces".into())].into(),
+                },
+            )]
+            .into();
+            let mut existing = volume.clone();
+            existing.id = "existing-volume".into();
+            session
+                .ensure_volume_for_owner(existing, &domains, "existing-environment")
+                .await
+                .unwrap();
+            worker = worker.with_volume_domains(domains).unwrap();
+        }
+        let mut spec = source();
+        spec.execution.mounts.push(adx_core::execution::Mount {
+            kind: "bind".into(),
+            target: "/data/state".into(),
+            options: vec!["rw".into()],
+            source: adx_core::execution::MountSource::Volume(adx_core::volumes::VolumeRef {
+                id: volume_id.clone(),
+                uid: None,
+            }),
+            create_if_missing: false,
+            create_options: None,
+        });
+        let mut request = Request::new(pb::StartSnapshotPreparationRequest {
+            caller: Some(pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            }),
+            template_id: id.into(),
+            preparation_id: id.into(),
+            spec: Some(spec.into()),
+            seed_volume: Some(volume.into()),
+        });
+        request
+            .metadata_mut()
+            .insert("adx-component", "apiserver".parse().unwrap());
+        let started = worker
+            .start_snapshot_preparation(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(started.phase, pb::SnapshotPreparationPhase::Creating as i32);
+        let failed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                worker.reconcile_snapshot_preparations().await.unwrap();
+                let record = session.get_snapshot_template("tenant", id).await.unwrap();
+                if record.preparation.state == PreparationState::Failed
+                    && !record.preparation.cleanup_pending
+                {
+                    break record;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(failed.preparation.error.unwrap().contains(error));
+        assert!(matches!(
+            session.get_volume("tenant", &volume_id).await,
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            session.get(&format!("golden-{id}")).await,
+            Err(Error::NotFound)
+        ));
+        assert!(session.get_snapshot_template("tenant", id).await.is_ok());
+        tokio::time::sleep(Duration::from_millis(1650)).await;
+        worker.reconcile_snapshot_preparations().await.unwrap();
+        assert!(matches!(
+            session.get_snapshot_template("tenant", id).await,
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            session.get_snapshot_template("tenant", &name).await,
+            Err(Error::NotFound)
+        ));
+        if conflicting_path {
+            let existing = session
+                .get_volume("tenant", "existing-volume")
+                .await
+                .unwrap();
+            assert_eq!(existing.owner_ids, ["existing-environment".into()].into());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn expired_agent_registration_reclaims_unstarted_family() {
+        let redis = cancellation_test_redis::Redis::new().await;
+        let store = crate::storage::RedisStore::connect(&redis.url, "test", Duration::from_secs(5))
+            .await
+            .unwrap();
+        let session = store.begin(1).await.unwrap();
+        let worker = rpc(session.clone()).await;
+        let id = "00000000-0000-4000-8000-000000000001";
+        let name = format!("adx-agent-{id}-{}", "a".repeat(64));
+        let deadline = adx_core::observation::now_millis().unwrap() + 900;
+        let (family, build) = session
+            .register_snapshot_preparation_with_id(
+                "tenant",
+                &name,
+                source().resources,
+                Some(id),
+                Some(deadline),
+            )
+            .await
+            .unwrap();
+        assert_eq!(build.state, PreparationState::Registered);
+        assert!(!build.cleanup_pending);
+        assert!(session
+            .get_snapshot_template("tenant", &family.id)
+            .await
+            .is_ok());
+        tokio::time::sleep(Duration::from_millis(950)).await;
+        for _ in 0..3 {
+            worker.reconcile_snapshot_preparations().await.unwrap();
+        }
+        assert!(matches!(
+            session.get_snapshot_template("tenant", id).await,
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            session
+                .register_snapshot_preparation_with_id(
+                    "tenant",
+                    &name,
+                    source().resources,
+                    Some(id),
+                    Some(deadline)
+                )
+                .await,
+            Err(Error::NotFound)
+        ));
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn collection_removes_only_finished_agent_families() {
+        let redis = cancellation_test_redis::Redis::new().await;
+        let store = crate::storage::RedisStore::connect(&redis.url, "test", Duration::from_secs(5))
+            .await
+            .unwrap();
+        let session = store.begin(1).await.unwrap();
+        let worker = rpc(session.clone()).await;
+        let expired = "00000000-0000-4000-8000-000000000001";
+        let name = format!("adx-agent-{expired}-{}", "a".repeat(64));
+        let resources = source().resources;
+        assert!(matches!(
+            session
+                .register_snapshot_preparation_with_id(
+                    "tenant",
+                    &name,
+                    resources,
+                    Some(expired),
+                    Some(1)
+                )
+                .await,
+            Err(Error::NotFound)
+        ));
+        let id = "00000000-0000-4000-8000-000000000002";
+        let name = format!("adx-agent-{id}-{}", "b".repeat(64));
+        let (family, _) = session
+            .register_snapshot_preparation_with_id("tenant", &name, resources, Some(id), None)
+            .await
+            .unwrap();
+        let (native, _) = session
+            .register_snapshot_preparation("tenant", "native", resources)
+            .await
+            .unwrap();
+        for template in [family, native.clone()] {
+            let spec = source();
+            let snapshot_id = if template.is_agent_managed() {
+                snapshot_id(
+                    "tenant",
+                    &format!("golden-{}", template.id),
+                    &format!("snapshot-{}", template.id),
+                )
+                .unwrap()
+            } else {
+                format!("snapshot-{}", template.id)
+            };
+            let mut saved = capture(&spec, snapshot_id.clone());
+            saved.names = vec![template.name.clone()];
+            saved.artifact.location = template.id.clone();
+            session.publish_snapshot(saved).await.unwrap();
+            session
+                .update_snapshot_template(&template.id, |record| {
+                    record.preparation.spec = Some(spec.clone());
+                    record.preparation.snapshot_id = Some(snapshot_id.clone());
+                    record.preparation.state = PreparationState::Ready;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let deleted = session
+                .delete_snapshot(&snapshot_id, "tenant")
+                .await
+                .unwrap();
+            worker.reconcile_snapshot_preparations().await.unwrap();
+            assert!(session
+                .get_snapshot_template("tenant", &template.id)
+                .await
+                .is_ok());
+            session
+                .finish_snapshot_deletion(&snapshot_id, deleted.revision)
+                .await
+                .unwrap();
+        }
+        worker.reconcile_snapshot_preparations().await.unwrap();
+        assert!(matches!(
+            session.get_snapshot_template("tenant", id).await,
+            Err(Error::NotFound)
+        ));
+        assert!(session
+            .get_snapshot_template("tenant", &native.id)
+            .await
+            .is_ok());
+        assert!(matches!(
+            session
+                .register_snapshot_preparation_with_id("tenant", &name, resources, Some(id), None)
+                .await,
+            Err(Error::NotFound)
+        ));
     }
     #[tokio::test]
     #[ignore = "requires isolated Redis; set ADX_TEST_REDIS_SERVER"]

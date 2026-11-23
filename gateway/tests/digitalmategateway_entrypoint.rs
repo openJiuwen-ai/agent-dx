@@ -76,6 +76,7 @@ fn workspace_is_stable_across_versions_but_isolates_users_tenants_and_templates(
 fn checked_in_application_examples_load_and_validate() {
     for source in [
         include_str!("../examples/jiuwen.json"),
+        #[cfg(unix)]
         include_str!("../examples/digitalmategateway.json"),
     ] {
         let config: DigitalMateGatewayConfig = serde_json::from_str(source).unwrap();
@@ -85,19 +86,23 @@ fn checked_in_application_examples_load_and_validate() {
 
 #[test]
 fn each_application_validates_its_own_timeout() {
-    let source = include_str!("../examples/digitalmategateway.json");
+    let mut apps: Value =
+        serde_json::from_str(include_str!("../examples/digitalmategateway.json")).unwrap();
+    // Exercise portable application settings independently of Unix services.
+    apps.as_object_mut().unwrap().remove("privacy");
+    apps.as_object_mut().unwrap().remove("push");
     for app in ["jiuwen", "orbit"] {
         for (field, value) in [
             ("request_timeout_seconds", json!(0)),
             ("request_timeout_seconds", json!(86401)),
         ] {
-            let mut config: Value = serde_json::from_str(source).unwrap();
+            let mut config = apps.clone();
             config[app][field] = value;
             let config: DigitalMateGatewayConfig = serde_json::from_value(config).unwrap();
             assert!(config.validate().is_err(), "{app}.{field}");
         }
     }
-    let mut config: Value = serde_json::from_str(source).unwrap();
+    let mut config = apps.clone();
     config["orbit"]["tenant"] = json!("other");
     assert!(serde_json::from_value::<DigitalMateGatewayConfig>(config).is_err());
 }

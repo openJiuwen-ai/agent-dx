@@ -300,6 +300,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `fs` | 产品差异 | 两者 | 全部已编译后端 | `ownerfs`、`dfs` 或 `all`；`--print-config` 把它展开成 `ownerfs`、`dfs` 两个布尔值 |
 | `data_mode` | 产品差异 | Node | `grpc` | Node 间数据通道：`grpc`、`rdma` 或 `auto`；`rdma` 需要编译 `rdma` feature |
 | `rdma_device` | 产品差异 | Node | 无 | RDMA 设备名；OwnerFs 的 `rdma` 模式必填 |
+| `dfs_rdma_require_server_generation` | 产品差异 | Node | `false` | DFS RDMA 强围栏。开启后拒绝旧客户端请求和旧服务端返回的空代际会话。滚动升级期间允许兼容会话时，留意服务端重启后的旧会话 ID 复用风险及 `afs_dfs_rdma_unbound_sessions`、`afs_dfs_rdma_unbound_server_replies_total` |
 | `data_dir` | 产品差异 | 两者 | `/tmp/afs-<id>/data` | 数据目录，必须是绝对路径；默认值只适合临时运行 |
 | `ownerfs_data_dir` | 产品差异 | Node | `<data_dir>/ownerfs` | OwnerFs 存储根：workspace 数据目录、catalog 与 trash 都在这一层。必须是绝对路径；纳管既有数据时指向这些目录的父目录；非 Node 或未启用 OwnerFs 时写在配置里会启动失败 |
 | `uds_path` | 产品差异 | Node | `/tmp/afs-<id>/local.sock` | Local SDK 的 Unix socket 路径 |
@@ -367,6 +368,9 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_read_max_ops_per_batch` | 调优 | Node | `128` | native 单批读操作数上限。S3 读仍受读取字节和 RPC 消息大小约束，缺失的版本授权通过一次请求取得 |
 | `dfs_read_max_inflight_bytes` | 调优 | Node | `8388608` | 读在途字节上限；也决定 Peer 缓存走流式填充还是整块填充 |
 | `dfs_source_cache_max_ms` | 调优 | Node | `5000` | 副本来源缓存时长，不超过 60000；0 表示不保留 |
+| `dfs_read_cache_queue_bytes` | 调优 | Node | `268435456` | 仅开启 `dfs_read_cache_bytes` 时生效：等待安装的读缓存正文字节上限，`4194304..=1073741824`；计入读者内存（见下方内存说明）。FUSE 读从不等待，满了丢弃并计 `dropped_queue_full` |
+| `dfs_read_cache_partial_bytes` | 调优 | Node | `33554432` | 仅开启 `dfs_read_cache_bytes` 时生效：由多次读拼装中的部分 chunk 正文字节上限，`0` 或 `4194304..=1073741824`；0 不拼装；计入读者内存，满了先挤出最旧的部分块 |
+| `dfs_source_single_ttl_ms` | 调优 | Node | `500` | 仅在本 Node 开启 `dfs_read_cache_bytes` 时生效：某 chunk 的候选只有一个远端 Node 时，来源缓存时长取此值与 `dfs_source_cache_max_ms` 的较小者，不超过 60000；0 表示沿用 `dfs_source_cache_max_ms` |
 | `dfs_source_lookahead_chunks` | 调优 | Node | `64` | 来源元数据前瞻 chunk 数，不超过 128 |
 | `dfs_source_cache_bytes` | 调优 | Node | `4194304` | 来源元数据缓存字节上限，不超过 4 MiB |
 | `allow_volatile_meta` | 测试专用 | Node | `false` | 允许 Node 在 Meta 为 `memory` 时报告就绪；不在 `--help` 中显示，启用时打 WARN |
@@ -593,6 +597,9 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `dfs_peer_serve_payload_bytes` | `16777216`（16MiB） | `4194304..=67108864`，A端驻留、填充、退役pin及packed/RDMA共用的实际正文capacity上限 |
 | `dfs_peer_serve_wait_ms` | `20` | `0..=50`，native gRPC 单入口准入等待期限；0不等待，不增正文或窗口额度 |
 | `dfs_source_cache_max_ms` | `5000` | `0..=60000`，源元数据缓存的最长保留时间，另受grant安全截止约束；0不保留且不前瞻 |
+| `dfs_read_cache_queue_bytes` | `268435456`（256MiB） | `4194304..=1073741824`；读缓存等待安装的正文上限，FUSE读路径只尝试占用、不等待，满则丢弃计数；管理面预取在后台按自身期限等待。开启`dfs_read_cache_bytes`的读者最坏多占约 256MiB（队列）+32MiB（部分块）+16MiB（在途段）=304MiB；盘后端实测队列峰值192MiB。未开启读缓存时为0 |
+| `dfs_read_cache_partial_bytes` | `33554432`（32MiB） | `0`或`4194304..=1073741824`；拼装中的部分chunk正文上限，0不拼装；FUSE交给后台拼装的在途段另以其一半为上限；2 s未拼完的部分chunk被释放 |
+| `dfs_source_single_ttl_ms` | `500` | `0..=60000`；仅开启`dfs_read_cache_bytes`的Node生效：候选只含一个远端Node的chunk（含前瞻chunk）按此时长缓存，使他人新发布的读缓存副本在此时限内可见；0沿用`dfs_source_cache_max_ms` |
 | `dfs_source_lookahead_chunks` | `64` | `0..=128`，仅后续源元数据；与mandatory合并请求至多128项；0仅关闭前瞻 |
 | `dfs_source_cache_bytes` | `4194304`（4MiB） | `0..=4194304`，最多1024条源元数据的保留估算上限；0不保留且不前瞻 |
 | `dfs_readahead_max_bytes` | `0` | `0..=33554432`；0不创建后台fetch任务；product可显式设8388608。这是对象调度距离，未新增正文、proof、连接或磁盘额度 |

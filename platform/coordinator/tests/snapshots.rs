@@ -1,6 +1,6 @@
 mod common;
 use adx_coordinator::snapshots::{Reference, Snapshot, SnapshotState};
-use adx_core::{CheckpointArtifact, EnvironmentSpec, Resources};
+use adx_core::{CheckpointArtifact, EnvironmentSpec, Error, Resources};
 
 fn snapshot() -> Snapshot {
     Snapshot::new(
@@ -330,4 +330,139 @@ async fn committed_snapshot_changes_update_inspection_cache() {
     let (snapshots, holds) = session.inspection_inventory().await.unwrap();
     assert_eq!(snapshots, vec![updated]);
     assert!(holds.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn agent_owners_survive_restart_and_race_retirement() {
+    use adx_core::snapshots::SnapshotKind;
+    let mut rig = common::Redis::new().await;
+    let store = rig.store().await;
+    let first = store.begin(1).await.unwrap();
+    let mut golden = snapshot();
+    golden.kind = SnapshotKind::Golden;
+    let id = &golden.id;
+    let binding = Reference::AgentBinding {
+        binding_id: "binding".into(),
+        environment_id: "uncreated".into(),
+    };
+    first.publish_snapshot(golden.clone()).await.unwrap();
+    let cancelled = Reference::AgentBinding {
+        binding_id: "another".into(),
+        environment_id: "cancelled".into(),
+    };
+    let observed = first.get_snapshot(id).await.unwrap().revision;
+    first
+        .cancel_pending_binding(id, cancelled.clone(), observed)
+        .await
+        .unwrap();
+    assert!(matches!(
+        first
+            .acquire_agent_binding(id, "tenant", cancelled, observed)
+            .await,
+        Err(Error::SnapshotAdmissionStale)
+    ));
+    let revision = first.get_snapshot(id).await.unwrap().revision;
+    let registered = first
+        .acquire_agent_binding(id, "tenant", binding.clone(), revision)
+        .await
+        .unwrap();
+    rig.crash();
+    rig.start().await;
+    let current = rig.store().await.begin(1).await.unwrap();
+    let retry = current
+        .acquire_agent_binding(id, "tenant", binding.clone(), revision)
+        .await
+        .unwrap();
+    assert_eq!(registered.revision, retry.revision);
+    assert!(matches!(
+        current.delete_snapshot(id, "tenant").await,
+        Err(Error::SnapshotInUse { .. })
+    ));
+    let candidate = Reference::AgentBinding {
+        binding_id: "binding".into(),
+        environment_id: "candidate".into(),
+    };
+    let (acquired, retired) = tokio::join!(
+        current.acquire_agent_binding(id, "tenant", candidate.clone(), registered.revision),
+        current.begin_agent_retirement(id, "tenant")
+    );
+    retired.unwrap();
+    let held = current.get_snapshot(id).await.unwrap();
+    assert!(held.agent_retiring);
+    assert_eq!(held.references.contains(&candidate), acquired.is_ok());
+    if let Err(error) = acquired {
+        assert!(matches!(error, Error::Conflict));
+    }
+    current.release_snapshot(id, candidate).await.unwrap();
+    current.release_snapshot(id, binding.clone()).await.unwrap();
+    current.release_snapshot(id, binding).await.unwrap();
+    let deleted = current.get_snapshot(id).await.unwrap();
+    assert!(deleted.collectable());
+    assert_eq!(
+        current
+            .finish_snapshot_deletion(id, deleted.revision)
+            .await
+            .unwrap()
+            .state,
+        SnapshotState::Deleted
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn unrelated_catalog_owners_can_share_an_observed_revision() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    let mut saved = snapshot();
+    saved.kind = adx_core::snapshots::SnapshotKind::Golden;
+    session.publish_snapshot(saved.clone()).await.unwrap();
+    let owner = |id: &str| Reference::AgentBinding {
+        binding_id: id.into(),
+        environment_id: format!("env-{id}"),
+    };
+    let (left, right) = tokio::join!(
+        session.acquire_agent_binding(&saved.id, "tenant", owner("left"), saved.revision),
+        session.acquire_agent_binding(&saved.id, "tenant", owner("right"), saved.revision)
+    );
+    left.unwrap();
+    right.unwrap();
+    let persisted = session.get_snapshot(&saved.id).await.unwrap();
+    assert!(persisted.references.contains(&owner("left")));
+    assert!(persisted.references.contains(&owner("right")));
+    let before_cancel = persisted.revision;
+    session
+        .acquire_agent_binding(&saved.id, "tenant", owner("third"), before_cancel)
+        .await
+        .unwrap();
+    session
+        .cancel_pending_binding(&saved.id, owner("cancelled"), before_cancel)
+        .await
+        .unwrap();
+    assert!(session
+        .acquire_agent_binding(&saved.id, "tenant", owner("cancelled"), before_cancel)
+        .await
+        .is_err());
+    let before_release = session.get_snapshot(&saved.id).await.unwrap().revision;
+    session
+        .release_snapshot(&saved.id, owner("left"))
+        .await
+        .unwrap();
+    let newcomer = owner("newcomer");
+    assert!(matches!(
+        session
+            .acquire_agent_binding(&saved.id, "tenant", newcomer.clone(), before_release)
+            .await,
+        Err(Error::SnapshotAdmissionStale)
+    ));
+    let fresh = session.get_snapshot(&saved.id).await.unwrap().revision;
+    let updated = session
+        .acquire_agent_binding(&saved.id, "tenant", newcomer.clone(), fresh)
+        .await
+        .unwrap();
+    assert!(updated.references.contains(&newcomer));
+    assert!(session
+        .acquire_agent_binding(&saved.id, "tenant", owner("left"), before_release)
+        .await
+        .is_err());
 }

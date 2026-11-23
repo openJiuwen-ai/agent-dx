@@ -340,10 +340,12 @@ impl crate::node::replication::ReplicaDataPlane for RdmaReplicaDataPlane {
                             return Ok(RdmaReplicaResult::FallbackToGrpc);
                         }
                     };
-                    let cancel_guard = CancelPoisonGuard::new(lease.session.poisoned.clone());
+                    let poisoned = lease.session.poisoned.clone();
                     let worker_op = op.clone();
                     let staged = staged.clone();
                     let task = tokio::spawn(async move {
+                        let lease = lease;
+                        let worker_guard = CancelPoisonGuard::new(lease.session.poisoned.clone());
                         validate_open(false, &lease.session.poisoned).map_err(|error| error.0)?;
                         let endpoint = lease.session.endpoint.clone();
                         let payload = staged.clone();
@@ -362,6 +364,7 @@ impl crate::node::replication::ReplicaDataPlane for RdmaReplicaDataPlane {
                                 length: staged.chunk.length,
                                 chunk_offset: 0,
                                 staging_id: staged.operation_id.0.clone(),
+                                server_generation: lease.session.server_generation.clone(),
                             },
                         );
                         request.set_timeout(lease.session.timeout);
@@ -377,13 +380,13 @@ impl crate::node::replication::ReplicaDataPlane for RdmaReplicaDataPlane {
                             .collect::<afs_error::Result<Vec<_>>>()?;
                         crate::node::replication::validate_peer_acks(&worker_op, &staged, &acks)?;
                         validate_open(false, &lease.session.poisoned).map_err(|error| error.0)?;
-                        Ok::<_, afs_error::Error>(RdmaReplicaResult::Acks(acks))
+                        worker_guard.disarm();
+                        Ok::<_, afs_error::Error>((lease, acks))
                     });
-                    let result = task.await.map_err(dfs_rdma_join_error)?;
-                    if result.is_ok() {
-                        cancel_guard.disarm();
-                    }
-                    result
+                    let cancel_guard = CancelPoisonGuard::new(poisoned);
+                    let (_lease, acks) = task.await.map_err(dfs_rdma_join_error)??;
+                    cancel_guard.disarm();
+                    Ok::<_, afs_error::Error>(RdmaReplicaResult::Acks(acks))
                 })
                 .await
                 .map_err(|_| {
@@ -435,6 +438,7 @@ pub(super) fn dfs_rdma_canonical_unsupported(reply: &DfsNegotiateRdmaReply) -> b
     !reply.rdma_supported
         && reply.session_id == 0
         && reply.server_info.is_empty()
+        && reply.server_generation.is_empty()
         && reply.capacity == 0
         && reply.handshake_version == RDMA_HANDSHAKE_VERSION
 }
@@ -444,12 +448,17 @@ pub struct DfsRdmaPool {
     pub(super) peers: Arc<PeerConnectionPool>,
     #[cfg(feature = "rdma")]
     device: String,
+    #[cfg(feature = "rdma")]
+    require_server_generation: bool,
     pub(super) timeout: Duration,
     #[cfg(feature = "rdma")]
     slots: tokio::sync::Mutex<std::collections::HashMap<DfsRdmaKey, DfsRdmaSlot>>,
     #[cfg(feature = "rdma")]
     permits: Arc<tokio::sync::Semaphore>,
 }
+
+#[cfg(all(feature = "dfs", feature = "rdma"))]
+static UNBOUND_SERVER_REPLIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(feature = "dfs", feature = "rdma"))]
 pub(super) struct DfsRdmaSlot {
@@ -459,13 +468,13 @@ pub(super) struct DfsRdmaSlot {
 
 #[cfg(all(feature = "dfs", feature = "rdma"))]
 pub(super) struct DfsRdmaSession {
-    pub(super) endpoint: Arc<tokio::sync::Mutex<RdmaEndpoint>>,
+    pub(super) endpoint: Arc<tokio::sync::Mutex<RdmaEndpointLease>>,
     pub(super) poisoned: Arc<AtomicBool>,
     pub(super) session_id: u64,
+    pub(super) server_generation: Vec<u8>,
     caller_epoch: u64,
     pub(super) client: DfsChunksClient<Channel>,
     pub(super) timeout: Duration,
-    pub(super) _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[cfg(all(feature = "dfs", feature = "rdma"))]
@@ -482,12 +491,21 @@ impl DfsRdmaPool {
         device: String,
         timeout: Duration,
     ) -> afs_error::Result<Self> {
+        Self::new_with_generation_requirement(peers, device, timeout, false)
+    }
+
+    pub(crate) fn new_with_generation_requirement(
+        peers: Arc<PeerConnectionPool>,
+        device: String,
+        timeout: Duration,
+        require_server_generation: bool,
+    ) -> afs_error::Result<Self> {
         if device.is_empty() || timeout.is_zero() {
             return Err(dfs_protocol_error("DFS RDMA device/timeout is required"));
         }
         #[cfg(not(feature = "rdma"))]
         {
-            let _ = peers;
+            let _ = (peers, require_server_generation);
             Err(afs_error::Error::coded(
                 afs_error::NODE_TRANSFER_UNSUPPORTED,
                 "DFS RDMA is not compiled",
@@ -504,11 +522,17 @@ impl DfsRdmaPool {
             Ok(Self {
                 peers,
                 device,
+                require_server_generation,
                 timeout,
                 slots: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                 permits: Arc::new(tokio::sync::Semaphore::new(16)),
             })
         }
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn unbound_server_replies() -> u64 {
+        UNBOUND_SERVER_REPLIES.load(Ordering::Relaxed)
     }
 
     #[cfg(feature = "rdma")]
@@ -556,20 +580,20 @@ impl DfsRdmaPool {
             *guard = None;
         }
         if guard.is_none() {
-            let permit = self.permits.clone().try_acquire_owned().map_err(|_| {
-                afs_error::Error::coded(
-                    afs_error::NODE_RDMA_CAPACITY,
-                    "DFS RDMA registered memory budget is full",
-                )
+            // Retirement returns the permit only after native teardown. Read and
+            // replica callers bound this wait with their overall deadline.
+            let permit = self.permits.clone().acquire_owned().await.map_err(|_| {
+                afs_error::Error::coded(afs_error::NODE_RDMA_CAPACITY, "DFS RDMA admission closed")
             })?;
             let device = self.device.clone();
-            let (endpoint, info, permit) = crate::node::bridge::spawn_blocking(move || {
-                let mut endpoint = RdmaEndpoint::open_with_capacity(
+            let (endpoint, info) = crate::node::bridge::spawn_blocking(move || {
+                let mut endpoint = RdmaEndpointLease::open(
                     &device,
                     crate::node::chunk::MAX_STAGED_CHUNK_BYTES,
+                    permit,
                 )?;
                 let info = endpoint.info()?;
-                Ok::<_, afs_transport::rdma::RdmaError>((endpoint, info, permit))
+                Ok::<_, afs_transport::rdma::RdmaError>((endpoint, info))
             })
             .await
             .map_err(dfs_rdma_join_error)?
@@ -581,6 +605,7 @@ impl DfsRdmaPool {
                     capacity: crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u32,
                     handshake_version: RDMA_HANDSHAKE_VERSION,
                     authority: Some(authority),
+                    bind_server_generation: true,
                 });
             request.set_timeout(self.timeout);
             let reply = client
@@ -591,6 +616,7 @@ impl DfsRdmaPool {
             let mut remote_cleanup = DfsRdmaRemoteClose {
                 client: client.clone(),
                 session_id: reply.session_id,
+                server_generation: reply.server_generation.clone(),
                 caller_epoch,
                 timeout: self.timeout,
                 armed: true,
@@ -606,17 +632,23 @@ impl DfsRdmaPool {
             if reply.session_id == 0
                 || reply.capacity as usize != endpoint.capacity()
                 || reply.handshake_version != RDMA_HANDSHAKE_VERSION
+                || (!reply.server_generation.is_empty() && reply.server_generation.len() != 16)
             {
                 return Err(dfs_protocol_error(
                     "DFS RDMA negotiation identity/capacity is invalid",
                 ));
             }
+            check_dfs_rdma_server_generation(
+                &reply.server_generation,
+                self.require_server_generation,
+                node_id,
+            )?;
             let server_info = reply.server_info;
-            let (endpoint, permit) = crate::node::bridge::spawn_blocking(move || {
+            let endpoint = crate::node::bridge::spawn_blocking(move || {
                 let mut endpoint = endpoint;
                 endpoint.connect(&server_info)?;
                 endpoint.send_probe(5000)?;
-                Ok::<_, afs_transport::rdma::RdmaError>((endpoint, permit))
+                Ok::<_, afs_transport::rdma::RdmaError>(endpoint)
             })
             .await
             .map_err(dfs_rdma_join_error)?
@@ -626,21 +658,200 @@ impl DfsRdmaPool {
                 endpoint: Arc::new(tokio::sync::Mutex::new(endpoint)),
                 poisoned: Arc::new(AtomicBool::new(false)),
                 session_id: reply.session_id,
+                server_generation: reply.server_generation,
                 caller_epoch,
                 client,
                 timeout: self.timeout,
-                _permit: permit,
             }));
         }
         let session = guard
             .as_ref()
             .ok_or_else(|| dfs_protocol_error("DFS RDMA session publication failed"))?
             .clone();
+        if session.server_generation.is_empty() {
+            // Old peers can still serve one operation, but their session IDs
+            // cannot fence a restart, so do not publish them for reuse.
+            *guard = None;
+        }
         Ok(DfsRdmaAcquire::Lease(DfsRdmaLease {
             session,
             _guard: guard,
         }))
     }
+}
+
+#[cfg(all(feature = "dfs", feature = "rdma"))]
+fn check_dfs_rdma_server_generation(
+    generation: &[u8],
+    required: bool,
+    node_id: &str,
+) -> afs_error::Result<()> {
+    if generation.is_empty() {
+        let total = UNBOUND_SERVER_REPLIES.fetch_add(1, Ordering::Relaxed) + 1;
+        // A legacy peer can negotiate on each command. Record every reply
+        // while keeping its warning rate bounded during a rolling upgrade.
+        if total.is_power_of_two() {
+            afs_logging::warn!(
+                "dfs.rdma_server_generation_absent";
+                "peer" => node_id,
+                "rejected" => required,
+                "total" => total
+            );
+        }
+        if required {
+            return Err(afs_error::Error::coded(
+                afs_error::NODE_RDMA_HANDSHAKE_VERSION,
+                "DFS RDMA peer did not return the required server generation",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "dfs", feature = "rdma"))]
+#[test]
+fn dfs_rdma_empty_server_generation_obeys_compatibility_policy() {
+    let before = DfsRdmaPool::unbound_server_replies();
+    check_dfs_rdma_server_generation(&[], false, "old-peer").unwrap();
+    let status = check_dfs_rdma_server_generation(&[], true, "old-peer").unwrap_err();
+    assert_eq!(status.code(), afs_error::NODE_RDMA_HANDSHAKE_VERSION);
+    check_dfs_rdma_server_generation(&[1; 16], true, "new-peer").unwrap();
+    assert!(DfsRdmaPool::unbound_server_replies() >= before + 2);
+}
+
+#[cfg(all(test, feature = "dfs", feature = "rdma"))]
+#[test]
+#[ignore = "requires AFS_TEST_RDMA_DEVICE with a working Linux RXE/RDMA device"]
+fn dfs_rdma_full_pool_waits_for_evicted_endpoint() {
+    use crate::node::rpc::{
+        control::RdmaSessionRegistry,
+        data::{
+            DenyDfsReplicaAuthorizer, DfsChunkTransportResources, DfsReadAuthorizer,
+            PeerAuthenticator, make_dfs_chunks_server_with_transport,
+        },
+    };
+    use afs_protocol::node_data::{
+        DfsChunkReadOp, DfsReadGrant, dfs_negotiate_rdma_request::Authority,
+    };
+    use std::{future::poll_fn, task::Poll};
+
+    struct TestPeer;
+    impl PeerAuthenticator for TestPeer {
+        fn authenticate(
+            &self,
+            _: &tonic::metadata::MetadataMap,
+            _: Option<std::net::SocketAddr>,
+            _: Option<&[u8]>,
+        ) -> afs_error::Result<String> {
+            Ok("reader".into())
+        }
+    }
+    impl DfsReadAuthorizer for TestPeer {
+        fn authorize(&self, _: &str, _: &DfsReadRangesRequest) -> afs_error::Result<()> {
+            Ok(())
+        }
+    }
+
+    let device = std::env::var("AFS_TEST_RDMA_DEVICE").expect("set the Linux RXE device");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let timeout = Duration::from_secs(5);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(make_dfs_chunks_server_with_transport(
+                        None,
+                        Arc::new(TestPeer),
+                        Arc::new(TestPeer),
+                        Arc::new(DenyDfsReplicaAuthorizer),
+                        None,
+                        timeout,
+                        DfsChunkTransportResources {
+                            rdma_sessions: RdmaSessionRegistry::new(Some(device.clone())),
+                            payload_metrics: None,
+                        },
+                    ))
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            );
+            let peers = Arc::new(
+                PeerConnectionPool::new(
+                    afs_transport::GrpcConfig::default(),
+                    afs_transport::TlsConfig::Disabled,
+                    32,
+                )
+                .unwrap(),
+            );
+            let pool = DfsRdmaPool::new(peers, device, timeout).unwrap();
+            let authority = Authority::ReadRequest(DfsReadRangesRequest {
+                read_id: "read".into(),
+                attempt_id: "attempt".into(),
+                file_version_id: "version".into(),
+                layout_root_id: "layout".into(),
+                operations: vec![DfsChunkReadOp {
+                    chunk_id: "chunk".into(),
+                    length: 4096,
+                    source_copy_id: "copy".into(),
+                    grant: Some(DfsReadGrant {
+                        namespace_id: "namespace".into(),
+                        file_version_id: "version".into(),
+                        layout_root_id: "layout".into(),
+                        caller_node_id: "reader".into(),
+                        caller_node_epoch: 1,
+                        expires_at_unix_ms: u64::MAX,
+                        token: "fixture-grant".into(),
+                        fence: 1,
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let capacity = pool.permits.available_permits();
+            for index in 0..capacity {
+                let acquired = pool
+                    .acquire(&format!("peer-{index}"), 1, &address, authority.clone(), 1)
+                    .await
+                    .unwrap();
+                assert!(matches!(acquired, DfsRdmaAcquire::Lease(_)));
+            }
+            assert_eq!(pool.slots.lock().await.len(), capacity);
+            assert_eq!(pool.permits.available_permits(), 0);
+
+            // Occupy the only blocking worker so the evicted endpoint still owns
+            // its permit when the replacement reaches admission.
+            let (started, busy) = tokio::sync::oneshot::channel();
+            let (resume, blocked) = std::sync::mpsc::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = blocked.recv();
+            });
+            busy.await.unwrap();
+            let replacement = pool.acquire("new-peer", 1, &address, authority, 1);
+            tokio::pin!(replacement);
+            let first_poll = poll_fn(|cx| Poll::Ready(replacement.as_mut().poll(cx))).await;
+            assert!(
+                pool.slots
+                    .try_lock()
+                    .expect("replacing a session must release the pool lock before waiting")
+                    .contains_key(&("new-peer".into(), 1, address.clone()))
+            );
+            assert_eq!(pool.permits.available_permits(), 0);
+            resume.send(()).unwrap();
+            worker.await.unwrap();
+
+            let result = match first_poll {
+                Poll::Ready(result) => result,
+                Poll::Pending => tokio::time::timeout(timeout, replacement).await.unwrap(),
+            };
+            let acquired = result.expect("replacement must reuse the permit after retirement");
+            assert!(matches!(acquired, DfsRdmaAcquire::Lease(_)));
+            assert_eq!(pool.slots.lock().await.len(), capacity);
+            server.abort();
+        });
 }
 
 #[cfg(all(feature = "dfs", feature = "rdma"))]
@@ -651,12 +862,14 @@ impl Drop for DfsRdmaSession {
             let mut client = self.client.clone();
             let session_id = self.session_id;
             let epoch = self.caller_epoch;
+            let server_generation = self.server_generation.clone();
             let timeout = self.timeout;
             handle.spawn(async move {
                 let mut request =
                     request_with_current_context(afs_protocol::node_data::DfsCloseRdmaRequest {
                         session_id,
                         peer_node_epoch: epoch,
+                        server_generation,
                     });
                 request.set_timeout(timeout);
                 let _ = client.close_rdma(request).await;
@@ -679,6 +892,7 @@ pub(super) fn dfs_rdma_join_error(error: tokio::task::JoinError) -> afs_error::E
 struct DfsRdmaRemoteClose {
     pub(super) client: DfsChunksClient<Channel>,
     pub(super) session_id: u64,
+    server_generation: Vec<u8>,
     caller_epoch: u64,
     pub(super) timeout: Duration,
     armed: bool,
@@ -694,12 +908,14 @@ impl Drop for DfsRdmaRemoteClose {
             let mut client = self.client.clone();
             let session_id = self.session_id;
             let peer_node_epoch = self.caller_epoch;
+            let server_generation = self.server_generation.clone();
             let timeout = self.timeout;
             handle.spawn(async move {
                 let mut request =
                     request_with_current_context(afs_protocol::node_data::DfsCloseRdmaRequest {
                         session_id,
                         peer_node_epoch,
+                        server_generation,
                     });
                 request.set_timeout(timeout);
                 let _ = client.close_rdma(request).await;

@@ -901,6 +901,22 @@ impl crate::node::read::engine::ChunkTransfer for GrpcChunkTransfer {
             let deadline = crate::node::read::admission::current_read_scope().map(|s| s.deadline);
             self.read_crc32c_attempt_async(batch, chunk, out, deadline)
                 .await
+                .map(|_| ())
+        })
+    }
+
+    fn read_crc32c_range_table_async<'a>(
+        &'a self,
+        batch: &'a crate::node::read::engine::PeerReadBatch,
+        chunk: &'a ChunkObject,
+        out: &'a mut [u8],
+    ) -> crate::node::read::admission::ReadFuture<'a, Option<crate::node::chunk_crc32c::CrcTable>>
+    {
+        Box::pin(async move {
+            let _read_owner = self.admit_borrowed_read().await?;
+            let deadline = crate::node::read::admission::current_read_scope().map(|s| s.deadline);
+            self.read_crc32c_attempt_async(batch, chunk, out, deadline)
+                .await
         })
     }
 

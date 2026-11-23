@@ -1735,7 +1735,15 @@ impl Controller {
                                 .as_ref()
                                 .ok_or(Error::Conflict)?
                                 .store;
+                            let artifact_started = Instant::now();
                             let path = store.prepare_restore(&cp.artifact).await?;
+                            adx_observability::info!(
+                                event = "environment_restore_artifact",
+                                environment_id = %self.record.spec.id, runtime_id = %self.record.runtime.id,
+                                snapshot_id = %cp.id, storage = %cp.artifact.storage,
+                                artifact_ms = artifact_started.elapsed().as_secs_f64() * 1_000.0,
+                                "checkpoint artifact ready for restore"
+                            );
                             // Retain through the RPC, including ambiguous failure.
                             self.hold_artifact(cp.artifact.clone(), path);
                             let result = self
@@ -1950,7 +1958,7 @@ impl Controller {
         } else {
             self.sync().await
         };
-        adx_observability::info!(
+        adx_observability::debug!(
             event = "environment_start_stages",
             environment_id = %self.record.spec.id,
             runtime_id = %self.record.runtime.id,

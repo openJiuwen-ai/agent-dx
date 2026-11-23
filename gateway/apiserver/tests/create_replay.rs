@@ -59,6 +59,89 @@ async fn unsupported_runtime_create_options_return_not_started_without_submissio
 }
 
 #[tokio::test]
+async fn native_preparation_forwards_seed_volume_and_reads_the_same_job_until_ready() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let fixture = Fixture::new().await;
+    let id = "8ae5d16d-545e-4a25-9773-2f51464003b5";
+    let path = format!("/api/environment/v1/snapshot-preparations/{id}");
+    let volume_id = format!("adx-agent-seed-{id}");
+    let input = json!({
+        "environment": {"namespace":"adx", "name":id, "image":"repo/dm:1", "runtime":"runsc",
+            "cpu":2000,"memory":4096,"inheritEntrypoint":true,"ports":["18092"],
+            "env":{"DIGITALMATE_GOLDEN_PHASE":"seed"},
+            "readinessProbe":{"httpGet":{"path":"/health/ready","port":18092}},
+            "mounts":[{"type":"bind","volume_id":volume_id,"target":"/data/state","options":["rw"]}]},
+        "volume": {"id":volume_id,"source":{"type":"directory","storage_domain":"sfs","path":"test/workspaces/golden-seeds/a"},
+            "access_mode":"exclusive","create_if_missing":true,"create_options":{"uid":10001,"gid":10001,"mode":"0700"}}
+    });
+    let send = |body: String| {
+        let api = fixture.api.clone();
+        let path = path.clone();
+        async move {
+            http::request(
+                api,
+                "PUT",
+                &path,
+                &[
+                    ("authorization", format!("Bearer {}", "seed-test".repeat(4))),
+                    ("content-type", "application/json".into()),
+                ],
+                &body,
+            )
+            .await
+        }
+    };
+    let decode = |response: hyper::Response<Vec<u8>>| -> Value {
+        let value: Value = serde_json::from_slice(response.body()).unwrap();
+        serde_json::from_slice(&STANDARD.decode(value["data"].as_str().unwrap()).unwrap()).unwrap()
+    };
+    for _ in 0..2 {
+        let response = send(input.to_string()).await;
+        assert_eq!(
+            response.status(),
+            200,
+            "{}",
+            String::from_utf8_lossy(response.body())
+        );
+        assert_eq!(decode(response)["status"], "pending");
+    }
+    {
+        let requests = fixture.state.native_starts.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.preparation_id, id);
+        let spec: adx_core::EnvironmentSpec = request.spec.clone().unwrap().try_into().unwrap();
+        let adx_core::execution::MountSource::Volume(target) = &spec.execution.mounts[0].source
+        else {
+            panic!("expected a managed volume");
+        };
+        assert_eq!(target.id, volume_id);
+        assert!(target.uid.is_none());
+        let seed: adx_core::volumes::VolumeSpec =
+            request.seed_volume.clone().unwrap().try_into().unwrap();
+        assert_eq!(seed.id, volume_id);
+        assert_eq!(seed.tenant_id, spec.tenant_id);
+    }
+    {
+        let mut guard = fixture.state.native_preparation.lock().unwrap();
+        let view = guard.as_mut().unwrap();
+        view.phase = pb::SnapshotPreparationPhase::Ready as i32;
+        view.snapshot_available = true;
+        view.snapshot_id = "snapshot-ready".into();
+    }
+    let response = send(input.to_string()).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        decode(response),
+        json!({"status":"ready","snapshot_id":"snapshot-ready"})
+    );
+    let mut changed = input;
+    changed["environment"]["image"] = json!("repo/dm:2");
+    assert_eq!(send(changed.to_string()).await.status(), 409);
+    assert_eq!(fixture.state.native_starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
     let fixture = Fixture::with_mode(600, true).await;
     tokio::time::timeout(Duration::from_secs(2), async {

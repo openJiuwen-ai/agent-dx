@@ -24,7 +24,14 @@ class FullTests(unittest.TestCase):
     def test_full_registry_is_complete_functional_and_includes_smoke(self):
         component = load('full_selection_component', 'build/e2e/kubernetes/afs_component.py')
         cases = select(discover(), suite='ci-full')
-        self.assertEqual(len(cases), 24)
+        self.assertEqual(len(cases), 29)
+        self.assertTrue({
+            'ownerfs.basic.remote_dir_close_fd',
+            'dfs.resources.reader_fd_budget',
+            'dfs.semantics.atomic_save_cross_node',
+            'dfs.semantics.write_then_rename_before_close',
+            'dfs.semantics.unlink_open_file',
+        } <= {c.id for c in cases})
         self.assertEqual({c.id for c in cases}, set(component.FULL_CASES))
         self.assertTrue(set(component.CASES) <= set(component.FULL_CASES))
         self.assertTrue(all(c.purpose == 'functional' for c in cases))

@@ -2,6 +2,7 @@
 
     bench_probe.py evict PATH...     fdatasync + POSIX_FADV_DONTNEED every regular file (recursively)
     bench_probe.py resident PATH...  measured resident bytes via mmap + mincore (like util-linux fincore)
+    bench_probe.py list PATH...      regular files and their sizes only (no open, no page-cache effect)
 
 Output is one JSON document. Eviction is advisory: callers must check `resident`
 afterwards instead of trusting that eviction happened. Files that cannot be mapped
@@ -91,10 +92,21 @@ def resident(paths):
             "resident_bytes": sum(f["resident_bytes"] for f in files), "errors": errors, "page_size": PAGE}
 
 
+def listing(paths):
+    files, errors = [], []
+    for path in regular_files(paths):
+        try:
+            files.append({"path": path, "bytes": os.lstat(path).st_size})
+        except OSError as error:
+            errors.append({"path": path, "errno": error.errno, "error": error.strerror})
+    return {"files": files, "errors": errors}
+
+
 def main(argv):
-    if len(argv) < 2 or argv[0] not in ("evict", "resident"):
-        raise SystemExit("usage: bench_probe.py evict|resident PATH...")
-    result = evict(argv[1:]) if argv[0] == "evict" else resident(argv[1:])
+    actions = {"evict": evict, "resident": resident, "list": listing}
+    if len(argv) < 2 or argv[0] not in actions:
+        raise SystemExit("usage: bench_probe.py evict|resident|list PATH...")
+    result = actions[argv[0]](argv[1:])
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     logging.info("%s", json.dumps(result))
 

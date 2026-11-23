@@ -27,6 +27,17 @@ impl RemoteMask {
         !self.0.contains(&true)
     }
 
+    /// Bytes of the operations the local source served itself.
+    pub(super) fn local_bytes(&self, batch: &ReadBatch) -> u64 {
+        batch
+            .ops
+            .iter()
+            .zip(&self.0)
+            .filter(|(_, remote)| !**remote)
+            .map(|(op, _)| op.length)
+            .sum()
+    }
+
     /// The marked operations, in batch order, as their own remote batch.
     fn remote_batch(&self, batch: &ReadBatch) -> ReadBatch {
         let ops = batch
@@ -161,8 +172,16 @@ impl ReplicatedSources<'_> {
     ) -> Result<()> {
         let remote = match LocalSource(self.engine).read(batch, out)? {
             SourceOutcome::Partial(remote) => remote,
-            SourceOutcome::Done | SourceOutcome::NotApplicable => return Ok(()),
+            SourceOutcome::Done => {
+                let bytes = batch.ops.iter().map(|op| op.length).sum();
+                self.engine.local.record_read_source_bytes("local", bytes);
+                return Ok(());
+            }
+            SourceOutcome::NotApplicable => return Ok(()),
         };
+        self.engine
+            .local
+            .record_read_source_bytes("local", remote.local_bytes(batch));
         let remote_batch = remote.remote_batch(batch);
         let deadline =
             deadline.unwrap_or_else(|| Instant::now() + self.engine.read_pipeline_timeout());
@@ -210,12 +229,16 @@ impl ReplicatedSources<'_> {
         final_owned: bool,
         deadline: Option<Instant>,
     ) -> Result<()> {
+        let object_bytes = || batch.ops.iter().map(|op| op.length).sum::<u64>();
         if final_owned
             && FanoutSource(self.engine)
                 .read(batch, sources, out, deadline)
                 .await?
                 .is_done()
         {
+            self.engine
+                .local
+                .record_read_source_bytes("object", object_bytes());
             return Ok(());
         }
         if PeerCacheSource(self.engine)
@@ -223,6 +246,9 @@ impl ReplicatedSources<'_> {
             .await?
             .is_done()
         {
+            self.engine
+                .local
+                .record_read_source_bytes("object", object_bytes());
             return Ok(());
         }
         if final_owned
@@ -233,16 +259,12 @@ impl ReplicatedSources<'_> {
         {
             return Ok(());
         }
-        let ordered = (self.engine.distribution.parallelism > 1)
-            .then(|| self.engine.distributed_sources(batch, sources));
+        // D3-5: the candidate order applies at any parallelism, so one
+        // reader with parallelism 1 still prefers cache holders and spreads
+        // its Chunks over replicas instead of always asking Meta's first copy.
+        let ordered = self.engine.distributed_sources(batch, sources);
         PeerRangeSource(self.engine)
-            .read(
-                batch,
-                ordered.as_deref().unwrap_or(sources),
-                out,
-                final_owned,
-                deadline,
-            )
+            .read(batch, &ordered, out, final_owned, deadline)
             .await
     }
 }

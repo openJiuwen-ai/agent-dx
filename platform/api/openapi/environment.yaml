@@ -510,6 +510,151 @@ paths:
           $ref: "#/components/responses/Error"
         default:
           $ref: "#/components/responses/Error"
+  /api/environment/v1/snapshot-references/{snapshotId}:
+    put:
+      tags: [Snapshots]
+      operationId: updateAgentSnapshotReference
+      summary: Register or release a Catalog owner or retire a Golden
+      parameters:
+        - {name: snapshotId, in: path, required: true, schema: {type: string}}
+        - {name: x-adx-agent-authorization, in: header, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  additionalProperties: false
+                  required: [operation, owner]
+                  properties:
+                    operation: {type: string, enum: [release]}
+                    owner:
+                      oneOf:
+                        - type: object
+                          additionalProperties: false
+                          required: [kind, name, version]
+                          properties:
+                            kind: {type: string, enum: [template]}
+                            name: {type: string}
+                            version: {type: string}
+                        - type: object
+                          additionalProperties: false
+                          required: [kind, binding_id, environment_id]
+                          properties:
+                            kind: {type: string, enum: [binding]}
+                            binding_id: {type: string}
+                            environment_id: {type: string}
+                - type: object
+                  additionalProperties: false
+                  required: [operation, owner]
+                  properties:
+                    operation: {type: string, enum: [acquire]}
+                    owner:
+                      type: object
+                      additionalProperties: false
+                      required: [kind, name, version]
+                      properties:
+                        kind: {type: string, enum: [template]}
+                        name: {type: string}
+                        version: {type: string}
+                - type: object
+                  required: [operation, owner, revision]
+                  additionalProperties: false
+                  properties:
+                    operation: {type: string, enum: [acquire_binding, cancel_pending]}
+                    revision: {type: integer, format: int64, minimum: 1}
+                    owner:
+                      type: object
+                      required: [kind, binding_id, environment_id]
+                      additionalProperties: false
+                      properties:
+                        kind: {type: string, enum: [binding]}
+                        binding_id: {type: string}
+                        environment_id: {type: string}
+                - type: object
+                  additionalProperties: false
+                  required: [operation]
+                  properties:
+                    operation: {type: string, enum: [retire]}
+      responses:
+        "200": {description: Reference operation applied}
+        "409": {$ref: "#/components/responses/Error"}
+        default: {$ref: "#/components/responses/Error"}
+  /api/environment/v1/snapshot-preparations/{preparationId}:
+    put:
+      tags: [Snapshots]
+      operationId: prepareSnapshot
+      summary: Ensure a fixed asynchronous Golden preparation
+      description: Replay the same UUID and input after transport ambiguity. The caller supplies an anonymous seed.
+      parameters:
+        - name: preparationId
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [environment, volume]
+              properties:
+                registration_deadline_unix_ms:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                  description: "Unix milliseconds. Rejects first registration at or after this time. Existing registrations can be reconciled."
+                environment: {$ref: "#/components/schemas/CreateEnvironmentRequest"}
+                volume:
+                  type: object
+                  additionalProperties: false
+                  required: [id, source, access_mode, create_if_missing]
+                  properties:
+                    id: {type: string, description: "Must be adx-agent-seed-{preparationId}."}
+                    source:
+                      type: object
+                      additionalProperties: false
+                      required: [type, storage_domain, path]
+                      properties:
+                        type: {const: directory}
+                        storage_domain: {type: string}
+                        path: {type: string}
+                    access_mode: {const: exclusive}
+                    create_if_missing: {const: true}
+                    create_options:
+                      type: object
+                      additionalProperties: false
+                      required: [uid, gid, mode]
+                      properties:
+                        uid: {type: integer, minimum: 0}
+                        gid: {type: integer, minimum: 0}
+                        mode: {type: string, pattern: '^0[0-7]{3}$'}
+      responses:
+        "200":
+          description: Current preparation state; pending is not an available snapshot.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: string
+                        contentEncoding: base64
+                        contentMediaType: application/json
+                        contentSchema:
+                          type: object
+                          required: [status]
+                          properties:
+                            status: {type: string, enum: [pending, ready, failed]}
+                            snapshot_id: {type: string, description: Present when ready.}
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
   /api/environment/v1/snapshots:
     get:
       tags: [Snapshots]
@@ -1403,6 +1548,12 @@ components:
       required: [snapshotId, names]
       properties:
         snapshotId: {type: string}
+        revision: {type: integer, format: int64, minimum: 1}
+        kind: {type: string, enum: [regular, golden]}
+        state: {type: string, enum: [ready, deleting, deleted]}
+        createdAt: {type: string, format: date-time}
+        image: {type: string}
+        runtime: {type: string}
         names:
           type: array
           items: {type: string}

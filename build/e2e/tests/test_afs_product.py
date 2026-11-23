@@ -1,8 +1,11 @@
 """AFS SDK fixtures and required gate contracts, without product execution."""
 
+from hashlib import sha256
 import importlib.util
 import json
+import os
 from pathlib import Path
+from posixpath import join as remote_join
 import subprocess
 import tempfile
 import unittest
@@ -68,6 +71,67 @@ class ProductContracts(unittest.TestCase):
                     dict(report, cleanup_errors=['environment still running'])):
             with self.assertRaises(ValueError):
                 product.validate_sdk_result(bad, 'dfs')
+
+    def test_sdk_explicitly_required_capability_cannot_disappear_from_results(self):
+        with patch.object(sys, 'path', [str(HERE), *sys.path]):
+            probe = load('afs_sdk_capability_test', HERE / 'afs_sdk_compat_probe.py')
+        old_sdk = SimpleNamespace(files=SimpleNamespace(make_dir=lambda path: bool(path)))
+        missing = {}
+        probe.check_mkdir_capability(old_sdk, missing, required=True)
+        self.assertEqual(missing.get('sdk_capabilities'), {'recursive_false': False})
+        self.assertEqual(missing.get('recursive_false', {}).get('status'), 'failed')
+        optional = {}
+        probe.check_mkdir_capability(old_sdk, optional, required=False)
+        self.assertNotIn('recursive_false', optional)
+
+    def test_sdk_required_capabilities_rejects_unknown_or_repeated_ids(self):
+        compat = load('afs_sdk_required_test', HERE / 'kubernetes/afs_sdk_compat.py')
+        env = 'AFS_E2E_SDK_REQUIRED_CAPABILITIES'
+        with patch.dict(os.environ, {env: 'recursive-false'}):
+            self.assertEqual(compat.required_capabilities(), ('recursive-false',))
+        for invalid in ('unknown', 'recursive-false,recursive-false'):
+            with patch.dict(os.environ, {env: invalid}), self.assertRaises(ValueError):
+                compat.required_capabilities()
+
+    def test_frozen_sdk_local_input_uses_transport_and_rejects_changed_bytes(self):
+        compat = load('afs_sdk_compat_test', HERE / 'kubernetes/afs_sdk_compat.py')
+        commit = 'a' * 40
+        server = 'b' * 40
+        version = '3.2.1rc7'
+        build = '01000000-0000-0000-0000-000000000001'
+        wheel_name = f'adx_environment-{version}-py3-none-any.whl'
+        content = b'frozen SDK artifact'
+        digest = sha256(content).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = root / wheel_name
+            wheel.write_bytes(content)
+            manifest = root / 'sdk-candidate.json'
+            candidate = {
+                'schema_version': 1, 'name': 'adx-environment', 'commit': commit, 'build_id': build,
+                'version': version, 'files': {wheel_name: digest},
+            }
+            product = Mock()
+            product.run.harness = {'product_commit': server}
+            product.run.output = root
+            product.run.execute.return_value = digest
+            env = {compat.DIRECTORY_ENV: directory, compat.BUILD_ENV: build, compat.COMMIT_ENV: commit}
+            with patch.dict(os.environ, env):
+                for wrong in ({'commit': server}, {'build_id': 'other'}, {'version': 'other'},
+                              {'files': {'../' + wheel_name: digest}}, {'name': 'other-sdk'}):
+                    manifest.write_text(json.dumps({**candidate, **wrong}))
+                    with self.assertRaises(ValueError):
+                        compat.install_wheel(product)
+                product.copy_to.assert_not_called()
+                manifest.write_text(json.dumps(candidate))
+                identity = compat.install_wheel(product)
+                self.assertEqual((identity['sha256'], identity['version'], identity['server_commit']),
+                                 (digest, version, server))
+                product.copy_to.assert_called_once_with('node1', wheel.resolve(), remote_join('/tmp', wheel_name))
+                wheel.write_bytes(b'new bytes under the same name')
+                with self.assertRaisesRegex(ValueError, 'SDK artifact digest mismatch'):
+                    compat.install_wheel(product)
+                self.assertEqual(product.copy_to.call_count, 1)
 
     def test_default_afs_gate_cannot_pass_from_zero_exit_or_missing_sdk_results(self):
         gate = load('afs_gate_test', HERE / 'kubernetes/afs_gate.py')

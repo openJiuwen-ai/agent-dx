@@ -30,6 +30,9 @@ impl From<crate::environment::EnvironmentError> for Error {
             E::Conflict(s) => Self::Conflict(s),
             E::Unavailable(s) => Self::Unavailable(s),
             E::OutcomeUnknown(s) => Self::OutcomeUnknown(s),
+            E::SnapshotAdmissionStale => {
+                Self::Unavailable("snapshot admission revision changed".into())
+            }
             E::SchedulingCancelled(failure) => Self::SchedulingCancelled(failure),
         }
     }

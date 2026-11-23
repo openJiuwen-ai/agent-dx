@@ -242,6 +242,54 @@ subsystem = "OwnerFs"
 description = "远端文件或目录句柄由已退出的 Home 进程签发，需要重新打开"
 
 [[error]]
+name = "NODE_OWNER_WRITE_UNKNOWN"
+value = "0x020b0006"
+kind = "Internal"
+component = "Node"
+subsystem = "OwnerFs"
+description = "已提交的远端文件写入结果未知，同一打开句柄须清理，不得自动重放"
+
+[[error]]
+name = "NODE_OWNER_WRITE_NOT_EXECUTED"
+value = "0x020b0007"
+kind = "Aborted"
+component = "Node"
+subsystem = "OwnerFs"
+description = "有明确证据表明远端文件写入未进入文件修改阶段"
+
+[[error]]
+name = "NODE_OWNER_WRITE_NOT_EXECUTED_TIMEOUT"
+value = "0x020b0008"
+kind = "DeadlineExceeded"
+component = "Node"
+subsystem = "OwnerFs"
+description = "远端文件尚未修改，写入准备或授权超时"
+
+[[error]]
+name = "NODE_OWNER_WRITE_NOT_EXECUTED_UNAVAILABLE"
+value = "0x020b0009"
+kind = "Unavailable"
+component = "Node"
+subsystem = "OwnerFs"
+description = "远端文件尚未修改，写入准备阶段不可达"
+
+[[error]]
+name = "NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED"
+value = "0x020b000a"
+kind = "Cancelled"
+component = "Node"
+subsystem = "OwnerFs"
+description = "远端文件尚未修改，写入准备阶段被取消或中断"
+
+[[error]]
+name = "NODE_OWNER_WRITE_NOT_EXECUTED_IO"
+value = "0x020b000b"
+kind = "Internal"
+component = "Node"
+subsystem = "OwnerFs"
+description = "远端文件尚未修改，写入准备阶段遇到内部错误"
+
+[[error]]
 name = "NODE_DFS_STALE_HANDLE"
 value = "0x020c0001"
 kind = "FailedPrecondition"
@@ -728,6 +776,22 @@ kind = "ResourceExhausted"
 component = "Runtime"
 subsystem = "Io"
 description = "文件锁或等待记录达到容量上限"
+
+[[error]]
+name = "IO_QUOTA_EXCEEDED"
+value = "0x04030019"
+kind = "ResourceExhausted"
+component = "Runtime"
+subsystem = "Io"
+description = "磁盘配额已用尽"
+
+[[error]]
+name = "IO_BAD_ADDRESS"
+value = "0x0403001a"
+kind = "InvalidArgument"
+component = "Runtime"
+subsystem = "Io"
+description = "系统调用访问无效的用户地址"
 
 [[error]]
 name = "NODE_VFS_RANGE"

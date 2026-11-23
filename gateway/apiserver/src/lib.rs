@@ -21,4 +21,5 @@ pub mod workspace_affinity;
 mod directory;
 mod environment_directory;
 
+mod snapshot_preparation;
 mod volumes;

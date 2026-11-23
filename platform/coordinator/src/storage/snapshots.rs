@@ -166,6 +166,8 @@ impl Session {
         if record.state != SnapshotState::Ready
             || record.revision != 1
             || !record.references.is_empty()
+            || record.agent_retiring
+            || record.agent_admission_revision != 0
         {
             return Err(Error::Invalid(
                 "new snapshot must be ready and unreferenced".into(),
@@ -323,6 +325,27 @@ impl Session {
         self.mutate_snapshot(id, |s| s.acquire(tenant, reference.clone()))
             .await
     }
+    pub async fn acquire_agent_binding(
+        &self,
+        id: &str,
+        tenant: &str,
+        owner: Reference,
+        revision: u64,
+    ) -> Result<Snapshot> {
+        self.mutate_snapshot(id, |s| {
+            s.acquire_agent_binding(tenant, owner.clone(), revision)
+        })
+        .await
+    }
+    pub async fn cancel_pending_binding(
+        &self,
+        id: &str,
+        owner: Reference,
+        revision: u64,
+    ) -> Result<Snapshot> {
+        self.mutate_snapshot(id, |s| s.cancel_pending(&owner, revision))
+            .await
+    }
     pub async fn release_snapshot(&self, id: &str, reference: Reference) -> Result<Snapshot> {
         self.mutate_snapshot(id, |s| s.release(&reference)).await
     }
@@ -393,6 +416,10 @@ impl Session {
     }
     pub async fn delete_snapshot(&self, id: &str, tenant: &str) -> Result<Snapshot> {
         self.mutate_snapshot(id, |s| s.delete(tenant)).await
+    }
+    pub async fn begin_agent_retirement(&self, id: &str, tenant: &str) -> Result<Snapshot> {
+        self.mutate_snapshot(id, |s| s.begin_agent_retirement(tenant))
+            .await
     }
     /// Call only after the storage backend confirms physical deletion.
     pub async fn finish_snapshot_deletion(&self, id: &str, revision: u64) -> Result<Snapshot> {

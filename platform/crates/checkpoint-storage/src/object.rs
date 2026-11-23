@@ -536,6 +536,10 @@ impl CheckpointAccess for ObjectCheckpointStore {
                 && Self::valid_cached(&files, &record.manifest, CacheValidation::Metadata).await?
                     == Some(true)
             {
+                adx_observability::debug!(
+                    event = "checkpoint_restore_cache", artifact = %artifact.location,
+                    cache_hit = true, size_bytes = artifact.size_bytes, "checkpoint cache hit"
+                );
                 return Ok(files);
             }
             let exists = files.exists();
@@ -547,6 +551,10 @@ impl CheckpointAccess for ObjectCheckpointStore {
                 self.discard_cached(&artifact.location).await?;
             }
         }
+        adx_observability::debug!(
+            event = "checkpoint_restore_cache", artifact = %artifact.location,
+            cache_hit = false, size_bytes = artifact.size_bytes, "checkpoint cache miss"
+        );
         let _materialization = self.materialization_slot().await?;
         let manifest = self.manifest(artifact).await?;
         let path = self.cache_root.join(&artifact.location);

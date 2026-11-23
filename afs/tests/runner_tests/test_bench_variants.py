@@ -174,7 +174,7 @@ class ClusterConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             c = self.cluster(d, {"dfs_read_pipeline": {"max_rpcs": 16}}, variant="V1",
                              node_overrides={"B": {"dfs_read_pipeline.max_rpcs": 16}})
-            c._configs()
+            c.write_configs()
             self.assertIn("max_rpcs = 16", (Path(d) / "config-B.toml").read_text())
             self.assertNotIn("max_rpcs", (Path(d) / "config-A.toml").read_text())
 
@@ -185,14 +185,14 @@ class ClusterConfigTests(unittest.TestCase):
             c = self.cluster(d, {"dfs_read_pipeline": {"max_rpcs": 4}}, variant="V1",
                              node_overrides={"B": {"dfs_read_pipeline.max_rpcs": 16}})
             with self.assertRaises(AssertionError):
-                c._configs()
+                c.write_configs()
 
     def test_memory_backend_mounts_tmpfs_on_node_state_and_cleanup_unmounts_it(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as d:
             c = self.cluster(d, {}, backend="memory", memory_backend_bytes=1024 * MIB)
-            c._configs()
+            c.write_configs()
             mounts = [(role, req["argv"]) for role in "AB" for action, req in c.channel(role).calls
                       if action == "command" and req["argv"][0] == "mount"]
             self.assertEqual([r for r, _ in mounts], ["A", "B"])
@@ -246,8 +246,7 @@ class SuiteMemoryBackendTests(unittest.TestCase):
 
     def test_oom_kill_during_a_round_fails_it(self):
         suite = load_suite()
-        ok = {"A": {"oom_kill_delta": 0}, "B": {"oom_kill_delta": None}}
-        suite.require_no_oom(ok)
+        suite.require_no_oom({"A": {"oom_kill_delta": 0}, "B": {"oom_kill_delta": 0}})
         with self.assertRaises(AssertionError):
             suite.require_no_oom({"A": {"oom_kill_delta": 1}})
 
@@ -258,6 +257,7 @@ class SuiteMemoryBackendTests(unittest.TestCase):
         class Cluster:
             config = bench(variant="V2", backend="memory", memory_backend_bytes=1024 * MIB,
                            node_overrides={"B": {"dfs_read_parallelism": 4}})
+            roles = ["M", "A", "B"]
 
             def record(self, name, value):
                 recorded[name] = value

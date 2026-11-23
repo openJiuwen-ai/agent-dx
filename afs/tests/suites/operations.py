@@ -415,20 +415,26 @@ def owner_namespace(c):
         "root_create_race_outcome",
         {"results": winners, "scope": "single Home election; loser errno is observed, not POSIX-certified"},
     )
+    nodes = {"A": "node-a", "B": "node-b"}
     location = json.loads(c.health("M", "/v1/roots/root-" + root.encode().hex()))
-    assert location["home_node_id"] in ("node-a", "node-b") and location["status"] == "serving", location
+    assert location["home_node_id"] in nodes.values() and location["status"] == "serving", location
     c.record("single_home", location)
-    count = 0
-    for role in ("A", "B"):
+    # The active directory uses the workspace name. Epochs are tracked in the catalog.
+    native_paths = {}
+    for role, node in nodes.items():
         result = c.python(
             role,
-            "from pathlib import Path\nprint(len(list(Path(sys.argv[1]).glob(sys.argv[2]))))",
-            c.role_dir(role) + "/state/ownerfs",
-            "root-" + root.encode().hex() + "-e*",
+            "try:mode=os.lstat(sys.argv[1]).st_mode\nexcept FileNotFoundError:mode=None\nprint(json.dumps(mode))",
+            posixpath.join(c.role_dir(role), "state", "ownerfs", root),
             owner=False,
         )
-        count += int(result["stdout"])
-    assert count == 1, count
+        native_paths[node] = json.loads(result["stdout"])
+    c.record("native_home_paths", native_paths)
+    for node, mode in native_paths.items():
+        if node == location["home_node_id"]:
+            assert mode is not None and stat.S_ISDIR(mode), native_paths
+        else:
+            assert mode is None, native_paths
     c.python("B", "os.mkdir(sys.argv[1])", c.mount("B") + "/second", owner=False)
     c.write("A", "cross-root", b"x")
     c.python(

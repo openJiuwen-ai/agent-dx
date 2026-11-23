@@ -24,6 +24,7 @@ impl LocalControl {
         let reconciliation = config
             .start_reconciliation(activator.clone(), store)
             .await?;
+        activator.start_snapshot_preparations();
         Ok(Self {
             activator,
             _reconciliation: reconciliation,
@@ -40,6 +41,16 @@ impl LocalControl {
 
 #[async_trait]
 impl Control for LocalControl {
+    async fn retire_golden(
+        &self,
+        ctx: &RequestContext,
+        request: &adx_agent_core::prewarm::GoldenRetirement,
+    ) -> Result<()> {
+        ctx.start_write();
+        self.activator
+            .retire_golden(&request.tenant, &request.snapshot_id)
+            .await
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,
@@ -79,7 +90,9 @@ impl Control for LocalControl {
         template: &adx_agent_core::TemplateDraft,
     ) -> Result<TemplateVersion> {
         ctx.start_write();
-        self.activator.publish(tenant, template).await
+        self.activator
+            .publish_with_id(tenant, template, ctx.publication_id())
+            .await
     }
     async fn template(
         &self,

@@ -6,12 +6,42 @@
 
 use std::ffi::{OsStr, OsString};
 
-use afs_error::{Error, Result};
+use afs_error::{Error, ErrorKind, Result};
 
 use super::{
     files::{FileIdentity, OwnerEntry, RemoteDirectory, RemoteFile},
     root::RootGrant,
 };
+
+/// Older peers and transport failures can return these statuses without
+/// proving whether Write entered the file mutation stage.
+pub(crate) fn write_status_requires_execution_evidence(error: &Error) -> bool {
+    match error.code() {
+        afs_error::NODE_OWNER_GRANT_UNAVAILABLE => false,
+        afs_error::CLIENT_PROTOCOL_INVALID_ERROR_DETAIL | afs_error::CLIENT_WORKER_FAILED => true,
+        code => {
+            matches!(
+                error.kind(),
+                ErrorKind::Unavailable
+                    | ErrorKind::DeadlineExceeded
+                    | ErrorKind::Cancelled
+                    | ErrorKind::Unknown
+            ) || (code == afs_error::CLIENT_REMOTE_STATUS
+                && matches!(error.kind(), ErrorKind::Internal | ErrorKind::DataLoss))
+        }
+    }
+}
+
+pub(crate) fn write_was_not_executed(error: &Error) -> bool {
+    matches!(
+        error.code(),
+        afs_error::NODE_OWNER_WRITE_NOT_EXECUTED
+            | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_TIMEOUT
+            | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_UNAVAILABLE
+            | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_INTERRUPTED
+            | afs_error::NODE_OWNER_WRITE_NOT_EXECUTED_IO
+    )
+}
 
 use crate::node::vfs::locks::{LockRequest, LockWaiterId, LockWaiterOutcome};
 use crate::node::vfs::types::{
@@ -319,6 +349,9 @@ pub trait RemoteFiles: Send + Sync {
         offset: u64,
         out: &mut [u8],
     ) -> Result<usize>;
+    /// A dispatched write with no conclusive reply reports
+    /// `NODE_OWNER_WRITE_UNKNOWN`. The open handle retains the error across
+    /// writes, flush and fsync. Release still cleans up the remote handle.
     fn write(
         &self,
         grant: &RootGrant,

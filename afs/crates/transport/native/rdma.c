@@ -23,6 +23,13 @@
 #define AFS_RDMA_WR_PROBE_RECV 0xAF500002ULL
 #define AFS_RDMA_PROBE_MAGIC 0xAF5A1001U
 #define AFS_RDMA_MAX_CAPACITY (4U*1024U*1024U)
+#define AFS_RDMA_DRAIN_TIMEOUT_MS 100U
+
+enum pending_wr {
+    AFS_RDMA_PENDING_DATA = 1U << 0,
+    AFS_RDMA_PENDING_PROBE_SEND = 1U << 1,
+    AFS_RDMA_PENDING_PROBE_RECV = 1U << 2,
+};
 
 /* One endpoint owns the verbs lifecycle for a single AFS RDMA session:
  * context -> PD -> CQ -> QP -> MR(buffer). The remote_* fields are filled after
@@ -43,6 +50,8 @@ struct endpoint {
     uint32_t remote_key, remote_capacity;
     bool connected, poisoned;
     bool probe_recv_posted, probe_sent, probe_received;
+    bool accepting_remote, qp_stopped, cq_untrusted;
+    unsigned pending_wr;
 };
 
 static int error(char *out, size_t size, const char *message) {
@@ -56,6 +65,54 @@ static uint64_t monotonic_ms(void) {
     return (uint64_t)ts.tv_sec*1000U + (uint64_t)ts.tv_nsec/1000000U;
 }
 static void poison(struct endpoint *e);
+
+static int stop_qp(struct endpoint *e) {
+    e->poisoned = true;
+    if (e->qp_stopped) return 0;
+    struct ibv_qp_attr attr = {.qp_state = IBV_QPS_ERR};
+    int status = ibv_modify_qp(e->qp, &attr, IBV_QP_STATE);
+    if (!status) e->qp_stopped = true;
+    return status;
+}
+
+/* Each successfully posted WR is signaled (including the probe receive).
+ * Unsuccessful completions still retire a WR. Match only fields defined by
+ * verbs for error completions. The CQ and QP are private to this endpoint. */
+static int poll_completion(struct endpoint *e, struct ibv_wc *wc) {
+    int count = ibv_poll_cq(e->cq, 1, wc);
+    if (!count) return 0;
+    unsigned pending = 0;
+    if (count == 1 && wc->qp_num == e->qp->qp_num) {
+        switch (wc->wr_id) {
+        case AFS_RDMA_WR_DATA: pending = AFS_RDMA_PENDING_DATA; break;
+        case AFS_RDMA_WR_PROBE_SEND: pending = AFS_RDMA_PENDING_PROBE_SEND; break;
+        case AFS_RDMA_WR_PROBE_RECV: pending = AFS_RDMA_PENDING_PROBE_RECV; break;
+        }
+    }
+    if (!(e->pending_wr & pending)) {
+        e->cq_untrusted = true;
+        return -1;
+    }
+    e->pending_wr &= ~pending;
+    return 1;
+}
+
+static bool drain_qp(struct endpoint *e) {
+    // An unpublished QP that never reached RTR and has no posts cannot DMA.
+    if (!e->accepting_remote && !e->pending_wr && !e->cq_untrusted) return true;
+    if (stop_qp(e) || e->cq_untrusted) return false;
+    uint64_t deadline = monotonic_ms() + AFS_RDMA_DRAIN_TIMEOUT_MS;
+    while (e->pending_wr) {
+        struct ibv_wc wc = {0};
+        if (poll_completion(e, &wc) < 0) return false;
+        if (e->pending_wr) {
+            if (monotonic_ms() >= deadline) return false;
+            usleep(50);
+        }
+    }
+    struct ibv_wc wc = {0};
+    return poll_completion(e, &wc) == 0;
+}
 
 /* GID indices are local device state, not a universal constant. RoCE on an
  * IPv4 cluster must advertise the IPv4-mapped GID and use that same index in
@@ -86,28 +143,48 @@ static int select_gid(struct endpoint *e, int table_length) {
     return 0;
 }
 
-void afs_rdma_close(void *opaque) {
+int afs_rdma_close(void *opaque, size_t *retained_registered_bytes) {
     struct endpoint *e=opaque;
-    if (!e) return;
-    /* QP must stop accessing MR before the MR/buffer can be released. */
+    *retained_registered_bytes=0;
+    if (!e) return AFS_RDMA_RELEASED;
+    if (e->qp && !drain_qp(e)) {
+        if (e->mr) *retained_registered_bytes = e->capacity;
+        return e->cq_untrusted ? AFS_RDMA_RETAINED_CQ : AFS_RDMA_RETAINED_DRAIN;
+    }
+    /* Local CQ accounting covers this QP's WRs. Destroy the isolated QP
+     * before deregistering the MR: successful inbound one-sided accesses do
+     * not produce a completion in the target's CQ. */
     if (e->qp && ibv_destroy_qp(e->qp)) {
-        fprintf(stderr,"AFS_RDMA_TEARDOWN failed destroy_qp; retaining memory\n");
-        return; /* A leak on exceptional teardown is safer than DMA into freed memory. */
+        if (e->mr) *retained_registered_bytes=e->capacity;
+        return AFS_RDMA_RETAINED_QP;
     }
+    e->qp=NULL;
     if (e->mr && ibv_dereg_mr(e->mr)) {
-        fprintf(stderr,"AFS_RDMA_TEARDOWN failed dereg_mr; retaining memory\n");
-        return;
+        *retained_registered_bytes=e->capacity;
+        return AFS_RDMA_RETAINED_MR;
     }
-    if (e->cq) ibv_destroy_cq(e->cq);
-    if (e->pd) ibv_dealloc_pd(e->pd);
-    if (e->context) ibv_close_device(e->context);
-    free(e->buffer); free(e);
+    e->mr=NULL;
+    free(e->buffer);
+    e->buffer=NULL;
+    if (e->cq && ibv_destroy_cq(e->cq)) return AFS_RDMA_RETAINED_CQ;
+    e->cq=NULL;
+    if (e->pd && ibv_dealloc_pd(e->pd)) return AFS_RDMA_RETAINED_PD;
+    e->pd=NULL;
+    if (e->context && ibv_close_device(e->context)) return AFS_RDMA_RETAINED_CONTEXT;
+    free(e);
+    return AFS_RDMA_RELEASED;
 }
 
-void *afs_rdma_open(const char *device, uint32_t capacity, char *err, size_t errlen) {
-    if (!capacity || capacity>AFS_RDMA_MAX_CAPACITY) { error(err,errlen,"capacity must be 1..4MiB"); return NULL; }
+int afs_rdma_open(const char *device, uint32_t capacity, void **owned,
+                  size_t *registered_bytes,
+                  char *err, size_t errlen) {
+    *owned=NULL;
+    *registered_bytes=0;
+    if (!capacity || capacity>AFS_RDMA_MAX_CAPACITY) return error(err,errlen,"capacity must be 1..4MiB");
     struct endpoint *e=calloc(1,sizeof(*e));
-    if (!e) { error(err,errlen,"endpoint allocation"); return NULL; }
+    if (!e) return error(err,errlen,"endpoint allocation");
+    /* Rust owns retirement on both success and partial allocation failure. */
+    *owned=e;
     int count=0;
     struct ibv_device **devices=ibv_get_device_list(&count);
     if (!devices) goto failed;
@@ -132,6 +209,7 @@ void *afs_rdma_open(const char *device, uint32_t capacity, char *err, size_t err
     e->mr=ibv_reg_mr(e->pd,e->buffer,capacity,
         IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_READ|IBV_ACCESS_REMOTE_WRITE);
     if (!e->mr) goto failed;
+    *registered_bytes=capacity;
     struct ibv_qp_init_attr init={
         .send_cq=e->cq,.recv_cq=e->cq,.qp_type=IBV_QPT_RC,
         .cap={.max_send_wr=4,.max_recv_wr=1,.max_send_sge=1,.max_recv_sge=1},
@@ -144,10 +222,9 @@ void *afs_rdma_open(const char *device, uint32_t capacity, char *err, size_t err
     };
     if (ibv_modify_qp(e->qp,&attr,IBV_QP_STATE|IBV_QP_PKEY_INDEX|
         IBV_QP_PORT|IBV_QP_ACCESS_FLAGS)) goto failed;
-    return e;
+    return 0;
 failed:
-    error(err,errlen,"open RDMA endpoint failed (device/port/resources)");
-    afs_rdma_close(e); return NULL;
+    return error(err,errlen,"open RDMA endpoint failed (device/port/resources)");
 }
 
 int afs_rdma_info(void *opaque,uint8_t *out,uint32_t len,char *err,size_t errlen) {
@@ -186,6 +263,7 @@ int afs_rdma_connect(void *opaque,const uint8_t *peer,uint32_t len,char *err,siz
     attr.ah_attr.grh.hop_limit=1; attr.ah_attr.grh.sgid_index=e->gid_index;
     if (ibv_modify_qp(e->qp,&attr,IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|
         IBV_QP_DEST_QPN|IBV_QP_RQ_PSN|IBV_QP_MAX_DEST_RD_ATOMIC|IBV_QP_MIN_RNR_TIMER)) goto failed;
+    e->accepting_remote = true;
     memset(&attr,0,sizeof(attr));
     attr.qp_state=IBV_QPS_RTS; attr.timeout=10; attr.retry_cnt=2;
     attr.rnr_retry=2; attr.max_rd_atomic=1;
@@ -213,6 +291,7 @@ int afs_rdma_prepare_probe(void *opaque,char *err,size_t errlen) {
         .num_sge=0,
     },*bad;
     if (ibv_post_recv(e->qp,&wr,&bad)) { poison(e); return error(err,errlen,"post RDMA probe receive"); }
+    e->pending_wr |= AFS_RDMA_PENDING_PROBE_RECV;
     e->probe_recv_posted=true;
     return 0;
 }
@@ -237,10 +316,11 @@ int afs_rdma_send_probe(void *opaque,uint32_t timeout_ms,char *err,size_t errlen
         .imm_data=htonl(AFS_RDMA_PROBE_MAGIC),
     },*bad;
     if (ibv_post_send(e->qp,&wr,&bad)) { poison(e); return error(err,errlen,"post RDMA probe send"); }
+    e->pending_wr |= AFS_RDMA_PENDING_PROBE_SEND;
     uint64_t deadline=monotonic_ms()+timeout_ms;
     for (;;) {
         struct ibv_wc wc={0};
-        int n=ibv_poll_cq(e->cq,1,&wc);
+        int n=poll_completion(e,&wc);
         if (n<0) { poison(e); return error(err,errlen,"poll probe send CQ"); }
         if (n) {
             if (wc.status!=IBV_WC_SUCCESS || wc.wr_id!=AFS_RDMA_WR_PROBE_SEND ||
@@ -273,7 +353,7 @@ int afs_rdma_wait_probe(void *opaque,uint32_t timeout_ms,char *err,size_t errlen
     uint64_t deadline=monotonic_ms()+timeout_ms;
     for (;;) {
         struct ibv_wc wc={0};
-        int n=ibv_poll_cq(e->cq,1,&wc);
+        int n=poll_completion(e,&wc);
         if (n<0) { poison(e); return error(err,errlen,"poll probe receive CQ"); }
         if (n) {
             uint32_t imm=ntohl(wc.imm_data);
@@ -309,9 +389,7 @@ int afs_rdma_get_local(void *opaque,uint8_t *data,uint32_t len,char *err,size_t 
     return 0;
 }
 static void poison(struct endpoint *e) {
-    e->poisoned=true;
-    struct ibv_qp_attr attr={.qp_state=IBV_QPS_ERR};
-    if (ibv_modify_qp(e->qp,&attr,IBV_QP_STATE))
+    if (stop_qp(e))
         fprintf(stderr,"AFS_RDMA_ERROR QP ERR transition failed\n");
 }
 
@@ -336,10 +414,11 @@ int afs_rdma_transfer(void *opaque,int operation,uint32_t len,uint32_t timeout_m
         .wr.rdma={.remote_addr=e->remote_address,.rkey=e->remote_key},
     },*bad;
     if (ibv_post_send(e->qp,&wr,&bad)) { poison(e); return error(err,errlen,"post one-sided operation"); }
+    e->pending_wr |= AFS_RDMA_PENDING_DATA;
     uint64_t deadline=monotonic_ms()+timeout_ms;
     for (;;) {
         struct ibv_wc wc={0};
-        int n=ibv_poll_cq(e->cq,1,&wc);
+        int n=poll_completion(e,&wc);
         if (n<0) { poison(e); return error(err,errlen,"poll CQ"); }
         if (n) {
             if (wc.status!=IBV_WC_SUCCESS || wc.wr_id!=AFS_RDMA_WR_DATA) {

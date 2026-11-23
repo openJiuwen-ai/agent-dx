@@ -6,16 +6,18 @@ mod image_resolution;
 pub mod local_environment;
 pub mod reconciliation;
 pub mod server;
+pub mod snapshot_preparation;
 pub mod transport;
 use adx_agent_core::environment::{
-    Environment, EnvironmentError, EnvironmentObservation, EnvironmentPhase,
+    Environment, EnvironmentError, EnvironmentObservation, EnvironmentPhase, SnapshotChange,
+    SnapshotOwner,
 };
 pub use adx_agent_core::error::{Error, Result};
 use adx_agent_core::{
-    activator::Target, AgentBinding, BindingPhase, EnvironmentRef, Scope, SecondaryIntent,
-    TemplateVersion,
+    activator::{ActivationRequest, Target},
+    AgentBinding, BindingPhase, EnvironmentRef, Scope, SecondaryIntent, TemplateVersion,
 };
-use adx_agent_store::{AgentState, PreparedTemplate};
+use adx_agent_store::{AgentState, PreparedTemplate, PublishedTemplate};
 use hashlink::LinkedHashMap;
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
@@ -37,6 +39,21 @@ impl Default for CacheSettings {
         }
     }
 }
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum BindingCacheKey {
+    Scoped(Scope),
+    Subject { tenant: String, binding_id: String },
+}
+
+impl BindingCacheKey {
+    fn subject(scope: &Scope) -> Self {
+        Self::Subject {
+            tenant: scope.tenant.clone(),
+            binding_id: scope.binding_id.clone(),
+        }
+    }
+}
+
 struct Binding {
     target: Option<Target>,
     attempt: Arc<()>,
@@ -47,7 +64,7 @@ pub struct Activator {
     state: AgentState,
     image_resolver: Option<image_resolution::ImageResolver>,
     environment: Arc<dyn Environment>,
-    bindings: Mutex<LinkedHashMap<Scope, Binding>>,
+    bindings: Mutex<LinkedHashMap<BindingCacheKey, Binding>>,
     cache: CacheSettings,
     subscription_ready: std::sync::atomic::AtomicBool,
 }
@@ -112,10 +129,9 @@ impl Activator {
         })
     }
     async fn invalidate(&self, scope: &Scope) {
-        if let Some(binding) = self.bindings.lock().await.get_mut(scope) {
-            binding.target = None;
-            binding.attempt = Arc::new(());
-        }
+        let mut bindings = self.bindings.lock().await;
+        bindings.remove(&BindingCacheKey::Scoped(scope.clone()));
+        bindings.remove(&BindingCacheKey::subject(scope));
     }
     async fn invalidate_all(&self) {
         self.bindings.lock().await.clear();
@@ -143,10 +159,40 @@ impl Activator {
     /// Advance a single declarative version change. False means more work remains.
     /// Platform owns readiness and deletion; no Environment health recovery runs here.
     pub async fn reconcile_binding(&self, scope: &Scope, deadline: u64) -> Result<bool> {
-        if self.state.binding(scope).await?.is_none() {
+        let Some(existing) = self.state.binding(scope).await? else {
             return Ok(true);
-        }
-        let binding = self.state.prepare_binding(scope).await?;
+        };
+        let selected = if existing.phase == BindingPhase::Active && existing.secondary.is_none() {
+            let version = self.state.selected_version(scope).await?;
+            if version == existing.current.version {
+                None
+            } else {
+                let template = self
+                    .template(&scope.tenant, &scope.template, &version)
+                    .await?;
+                let snapshot = self
+                    .select_template_golden(
+                        &scope.tenant,
+                        &template,
+                        &existing.parameters,
+                        deadline,
+                    )
+                    .await?;
+                Some((version, snapshot))
+            }
+        } else {
+            None
+        };
+        let binding = self
+            .state
+            .prepare_binding_with_snapshot(
+                scope,
+                selected
+                    .as_ref()
+                    .map(|(version, snapshot)| (version.as_str(), snapshot.as_deref())),
+            )
+            .await?;
+        let binding = self.settle_snapshot(binding, true, deadline).await?;
         if binding.phase == BindingPhase::Deleting {
             self.delete_binding(scope).await?;
             return Ok(true);
@@ -186,16 +232,11 @@ impl Activator {
                 )));
             }
         };
-        let mut execution = published.execution();
-        let template = published.template;
-        execution.mounts = template
-            .render_mounts(&binding.parameters)
-            .map_err(Error::Invalid)?;
-        execution.env = template
-            .render_env(&binding.parameters)
-            .map_err(Error::Invalid)?;
+        let execution =
+            Self::binding_execution(&published, &binding.parameters, &secondary.environment)?;
         self.environment.validate_execution(&execution)?;
-        let volumes = creation::definitions(&template, &binding.parameters, &execution.mounts)?;
+        let volumes =
+            creation::definitions(&published.template, &binding.parameters, &execution.mounts)?;
         let observed = self
             .activate_environment(
                 &binding,
@@ -300,19 +341,214 @@ impl Activator {
         tenant: &str,
         template: &adx_agent_core::TemplateDraft,
     ) -> Result<TemplateVersion> {
+        self.publish_with_id(tenant, template, None).await
+    }
+    pub async fn publish_with_id(
+        &self,
+        tenant: &str,
+        template: &adx_agent_core::TemplateDraft,
+        publication_id: Option<&str>,
+    ) -> Result<TemplateVersion> {
         let prepared = PreparedTemplate::new(tenant, template)?;
+        if let Some(id) = publication_id {
+            if let Some(existing) = self.state.publication(&prepared, id).await? {
+                return Ok(existing);
+            }
+        }
         let mut execution = adx_agent_core::environment::ExecutionSpec::from(prepared.template());
         // Mount syntax is checked at publication; concrete paths require Binding parameters.
         execution.mounts.clear();
         self.environment.validate_execution(&execution)?;
+        let job = template
+            .auto_prepare_snapshot
+            .then(|| self.seed_job(tenant, prepared.template()))
+            .transpose()?;
         let image = match &self.image_resolver {
             Some(resolver) => resolver.resolve(&template.image).await,
             None => None,
         };
         self.state
-            .publish_prepared(prepared, image.as_deref())
+            .publish_with_preparation(prepared, image.as_deref(), job.as_ref(), publication_id)
             .await
             .map_err(Into::into)
+    }
+    async fn settle_snapshot(
+        &self,
+        binding: AgentBinding,
+        candidate: bool,
+        deadline: u64,
+    ) -> Result<AgentBinding> {
+        let target = if candidate {
+            binding
+                .secondary
+                .as_ref()
+                .filter(|s| s.intent == SecondaryIntent::Preparing)
+                .map(|s| &s.environment)
+        } else {
+            Some(&binding.current)
+        };
+        let Some((target, snapshot)) =
+            target.and_then(|r| r.pending_snapshot_id.as_deref().map(|id| (r, id)))
+        else {
+            return Ok(binding);
+        };
+        if binding.phase != BindingPhase::Active {
+            return Ok(binding);
+        }
+        tokio::time::timeout(
+            adx_agent_core::transport::remaining_time(deadline),
+            self.acquire_pending_snapshot(&binding, target, snapshot),
+        )
+        .await
+        .map_err(|_| {
+            Error::OutcomeUnknown(
+                "snapshot admission deadline exceeded; retry the same allocation".into(),
+            )
+        })?
+    }
+
+    // Recheck the same allocation after every revision read. Cleanup can fence a
+    // delayed acquire between these reads and the write, even across Activators.
+    async fn acquire_pending_snapshot(
+        &self,
+        binding: &AgentBinding,
+        target: &EnvironmentRef,
+        snapshot: &str,
+    ) -> Result<AgentBinding> {
+        let tenant = &binding.scope.tenant;
+        for _ in 0..adx_agent_core::limits::CAS_ATTEMPTS {
+            let revision = match self.environment.snapshot_revision(tenant, snapshot).await {
+                Ok(revision) => revision,
+                Err(EnvironmentError::NotFound) => {
+                    return self
+                        .state
+                        .finish_snapshot_decision(binding, &target.environment_id, snapshot, false)
+                        .await
+                        .map_err(Into::into)
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let current = self
+                .state
+                .binding(&binding.scope)
+                .await?
+                .filter(|current| {
+                    current.generation == binding.generation
+                        && current.phase == BindingPhase::Active
+                })
+                .ok_or_else(|| {
+                    Error::Conflict("allocation retired before Catalog admission".into())
+                })?;
+            let allocation = if current.current.environment_id == target.environment_id {
+                Some(&current.current)
+            } else {
+                current
+                    .secondary
+                    .as_ref()
+                    .filter(|secondary| {
+                        secondary.intent == SecondaryIntent::Preparing
+                            && secondary.environment.environment_id == target.environment_id
+                    })
+                    .map(|secondary| &secondary.environment)
+            };
+            match allocation {
+                Some(allocation) if allocation.pending_snapshot_id.is_none() => return Ok(current),
+                Some(allocation) if allocation == target => {}
+                _ => {
+                    return Err(Error::Conflict(
+                        "allocation changed before Catalog admission".into(),
+                    ))
+                }
+            }
+            let change = SnapshotChange::AcquireBinding {
+                revision,
+                owner: Self::snapshot_owner(binding, target),
+            };
+            let acquired = match self
+                .environment
+                .update_snapshot_reference(tenant, snapshot, &change)
+                .await
+            {
+                Ok(()) => true,
+                Err(EnvironmentError::Conflict(_) | EnvironmentError::NotFound) => false,
+                Err(EnvironmentError::SnapshotAdmissionStale) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            return self
+                .state
+                .finish_snapshot_decision(binding, &target.environment_id, snapshot, acquired)
+                .await
+                .map_err(Into::into);
+        }
+        Err(EnvironmentError::SnapshotAdmissionStale.into())
+    }
+
+    fn snapshot_owner(binding: &AgentBinding, environment: &EnvironmentRef) -> SnapshotOwner {
+        SnapshotOwner::Binding {
+            binding_id: binding.scope.binding_id.clone(),
+            environment_id: environment.environment_id.clone(),
+        }
+    }
+
+    async fn select_template_golden(
+        &self,
+        tenant: &str,
+        template: &TemplateVersion,
+        parameters: &adx_agent_core::mounts::Parameters,
+        deadline: u64,
+    ) -> Result<Option<String>> {
+        if template.auto_prepare_snapshot && snapshot_preparation::reserved_workspace(parameters) {
+            return Err(Error::Invalid(
+                "workspace name is reserved for anonymous Golden preparation".into(),
+            ));
+        }
+        let Some(recipe) = adx_agent_core::prewarm::template_golden(template) else {
+            return Ok(None);
+        };
+        if recipe.restore_profile_digest != snapshot_preparation::restore_digest(template)? {
+            return Ok(None);
+        }
+        let checked = tokio::time::timeout(
+            Duration::from_millis(500).min(adx_agent_core::transport::remaining_time(deadline)),
+            self.environment.golden_available(
+                tenant,
+                &recipe.snapshot_id,
+                &template.image,
+                &template.isolation_runtime,
+            ),
+        )
+        .await;
+        Ok(matches!(checked, Ok(Ok(true))).then(|| recipe.snapshot_id.clone()))
+    }
+
+    fn binding_execution(
+        published: &PublishedTemplate,
+        parameters: &adx_agent_core::mounts::Parameters,
+        environment: &EnvironmentRef,
+    ) -> Result<adx_agent_core::environment::ExecutionSpec> {
+        let template = &published.template;
+        let mut execution = published.execution();
+        execution.mounts = template.render_mounts(parameters).map_err(Error::Invalid)?;
+        execution.env = template.render_env(parameters).map_err(Error::Invalid)?;
+        if let Some(id) = &environment.snapshot_id {
+            let recipe = template
+                .prewarm_recipe
+                .as_ref()
+                .filter(|recipe| &recipe.snapshot_id == id)
+                .ok_or_else(|| {
+                    Error::Conflict("committed Golden recipe no longer matches template".into())
+                })?;
+            execution.snapshot_id = Some(id.clone());
+            execution.env.extend(recipe.restore_env.clone());
+        }
+        Ok(execution)
+    }
+
+    pub async fn retire_golden(&self, tenant: &str, snapshot: &str) -> Result<()> {
+        self.environment
+            .update_snapshot_reference(tenant, snapshot, &SnapshotChange::Retire)
+            .await?;
+        Ok(())
     }
     pub async fn alias_config(
         &self,
@@ -381,14 +617,7 @@ impl Activator {
     ) -> Result<adx_agent_core::activator::ResolvedTarget> {
         let activation = &request.activation;
         let target = self
-            .activate_selected(
-                &activation.scope,
-                activation.expected_generation.as_deref(),
-                deadline,
-                activation.bypass_cache,
-                activation.parameters.as_deref(),
-                Some(request.service),
-            )
+            .activate_selected(activation, deadline, Some(request.service))
             .await?;
         let port = request
             .service
@@ -468,35 +697,43 @@ impl Activator {
         parameters: Option<&[u8]>,
     ) -> Result<Target> {
         self.activate_selected(
-            scope,
-            expected_generation,
+            &ActivationRequest {
+                scope: scope.clone(),
+                expected_generation: expected_generation.map(str::to_owned),
+                bypass_cache,
+                parameters: parameters.map(<[u8]>::to_vec),
+                reuse_subject_binding: false,
+            },
             deadline_unix_ms,
-            bypass_cache,
-            parameters,
             None,
         )
         .await
     }
     async fn activate_selected(
         &self,
-        scope: &Scope,
-        expected_generation: Option<&str>,
+        request: &ActivationRequest,
         deadline_unix_ms: u64,
-        bypass_cache: bool,
-        parameters: Option<&[u8]>,
         service: Option<adx_agent_core::activator::ServiceSelector>,
     ) -> Result<Target> {
+        let scope = &request.scope;
+        let expected_generation = request.expected_generation.as_deref();
         scope.validate().map_err(Error::Invalid)?;
+        let cache_key = if request.reuse_subject_binding {
+            BindingCacheKey::subject(scope)
+        } else {
+            BindingCacheKey::Scoped(scope.clone())
+        };
         let attempt = {
             let mut bindings = self.bindings.lock().await;
             let subscription_ready = self
                 .subscription_ready
                 .load(std::sync::atomic::Ordering::Acquire);
-            if !bypass_cache
+            if !request.bypass_cache
                 && (subscription_ready
-                    || matches!(scope.template_ref, adx_agent_core::TemplateRef::Version(_)))
+                    || (!request.reuse_subject_binding
+                        && matches!(scope.template_ref, adx_agent_core::TemplateRef::Version(_))))
             {
-                if let Some(binding) = bindings.to_back(scope) {
+                if let Some(binding) = bindings.to_back(&cache_key) {
                     if binding.touched.elapsed() < Duration::from_secs(self.cache.idle_seconds) {
                         if let Some(target) = &binding.target {
                             if let Some(service) = service {
@@ -517,7 +754,7 @@ impl Activator {
             let attempt = Arc::new(());
             if self.cache.capacity > 0 {
                 bindings.insert(
-                    scope.clone(),
+                    cache_key.clone(),
                     Binding {
                         target: None,
                         attempt: attempt.clone(),
@@ -530,7 +767,12 @@ impl Activator {
             }
             attempt
         };
-        let binding = match self.state.binding(scope).await? {
+        let existing = if request.reuse_subject_binding {
+            self.state.subject_binding(scope).await?
+        } else {
+            self.state.binding(scope).await?
+        };
+        let binding = match existing {
             Some(binding) => binding,
             None if expected_generation.is_some() => {
                 return Err(Error::Conflict(
@@ -549,19 +791,34 @@ impl Activator {
                 if let Some(service) = service {
                     service.select(&template.service).map_err(Error::Invalid)?;
                 }
-                let parameters = adx_agent_core::parameters::parse(parameters.unwrap_or_default())
-                    .map_err(Error::Invalid)?;
+                let parameters = adx_agent_core::parameters::parse(
+                    request.parameters.as_deref().unwrap_or_default(),
+                )
+                .map_err(Error::Invalid)?;
                 execution.mounts = template
                     .render_mounts(&parameters)
                     .map_err(Error::Invalid)?;
                 execution.env = template.render_env(&parameters).map_err(Error::Invalid)?;
                 creation::definitions(&template, &parameters, &execution.mounts)?;
                 self.environment.validate_execution(&execution)?;
+                let chosen = self
+                    .select_template_golden(&scope.tenant, &template, &parameters, deadline_unix_ms)
+                    .await?;
                 self.state
-                    .create_binding_with_parameters(scope.clone(), &parameters)
+                    .create_binding_for_version(
+                        scope.clone(),
+                        &parameters,
+                        request.reuse_subject_binding,
+                        &version,
+                        chosen.as_deref(),
+                    )
                     .await?
             }
         };
+        let binding = self
+            .settle_snapshot(binding, false, deadline_unix_ms)
+            .await?;
+        let scope = &binding.scope;
         if expected_generation.is_some_and(|generation| generation != binding.generation) {
             return Err(Error::Conflict(
                 "selected AgentBinding lifecycle changed".into(),
@@ -575,19 +832,13 @@ impl Activator {
             .published_template(&scope.tenant, &scope.template, &binding.current.version)
             .await?
             .ok_or(Error::NotFound)?;
-        let mut execution = published.execution();
-        let template = published.template;
+        let template = &published.template;
         if let Some(service) = service {
             service.select(&template.service).map_err(Error::Invalid)?;
         }
-        execution.mounts = template
-            .render_mounts(&binding.parameters)
-            .map_err(Error::Invalid)?;
-        execution.env = template
-            .render_env(&binding.parameters)
-            .map_err(Error::Invalid)?;
+        let execution = Self::binding_execution(&published, &binding.parameters, &binding.current)?;
         self.environment.validate_execution(&execution)?;
-        let volumes = creation::definitions(&template, &binding.parameters, &execution.mounts)?;
+        let volumes = creation::definitions(template, &binding.parameters, &execution.mounts)?;
         let observed = self
             .activate_environment(
                 &binding,
@@ -599,7 +850,12 @@ impl Activator {
             .await;
         // Compensate a late activation using its saved identity. Never delete
         // the Environment belonging to a replacement Binding lifecycle.
-        let binding = match self.state.binding(scope).await? {
+        let existing = if request.reuse_subject_binding {
+            self.state.subject_binding(scope).await?
+        } else {
+            self.state.binding(scope).await?
+        };
+        let binding = match existing {
             Some(latest)
                 if latest.generation == binding.generation
                     && latest.phase == BindingPhase::Active
@@ -637,10 +893,10 @@ impl Activator {
         }
         let target = Target {
             binding,
-            service: template.service,
+            service: published.template.service,
         };
         let mut bindings = self.bindings.lock().await;
-        if let Some(cached) = bindings.get_mut(scope) {
+        if let Some(cached) = bindings.get_mut(&cache_key) {
             if Arc::ptr_eq(&cached.attempt, &attempt) {
                 cached.target = Some(target.clone());
                 cached.touched = Instant::now();
@@ -689,6 +945,35 @@ impl Activator {
         self.environment
             .release_volumes(&binding.scope.tenant, &environment.environment_id)
             .await?;
+        if let Some(snapshot) = environment
+            .snapshot_id
+            .as_ref()
+            .or(environment.pending_snapshot_id.as_ref())
+        {
+            let owner = Self::snapshot_owner(binding, environment);
+            let change = if environment.pending_snapshot_id.is_some() {
+                let revision = match self
+                    .environment
+                    .snapshot_revision(&binding.scope.tenant, snapshot)
+                    .await
+                {
+                    Ok(revision) => revision,
+                    Err(EnvironmentError::NotFound) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                };
+                SnapshotChange::CancelPending { owner, revision }
+            } else {
+                SnapshotChange::Release { owner }
+            };
+            match self
+                .environment
+                .update_snapshot_reference(&binding.scope.tenant, snapshot, &change)
+                .await
+            {
+                Ok(()) | Err(EnvironmentError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         Ok(())
     }
 }

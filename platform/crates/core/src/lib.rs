@@ -36,6 +36,8 @@ pub enum Error {
     },
     #[error("insufficient resources or node admission closed")]
     NoCapacity,
+    #[error("snapshot admission revision changed")]
+    SnapshotAdmissionStale,
     #[error("waiting for Volume {0}")]
     VolumeBusy(String),
     #[error("record not found")]

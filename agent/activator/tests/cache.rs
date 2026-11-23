@@ -14,12 +14,16 @@ use std::{
 struct Store {
     inner: MemoryRepository,
     reads: AtomicUsize,
+    template_reads: AtomicUsize,
     unavailable: AtomicBool,
 }
 #[async_trait::async_trait]
 impl Repository for Store {
     async fn get(&self, key: &Key) -> adx_agent_store::Result<Option<Record>> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        if key.as_str().starts_with("template:") {
+            self.template_reads.fetch_add(1, Ordering::SeqCst);
+        }
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(adx_agent_store::Error::Unavailable(
                 "test repository unavailable".into(),
@@ -155,7 +159,7 @@ async fn immutable_templates_share_cached_reads_without_caching_absence() {
         .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
         .await
         .unwrap();
-    store.reads.store(0, Ordering::SeqCst);
+    store.template_reads.store(0, Ordering::SeqCst);
     let (a, b) = tokio::join!(
         state.template("tenant", "app", "1"),
         state.template("tenant", "app", "1")
@@ -163,18 +167,18 @@ async fn immutable_templates_share_cached_reads_without_caching_absence() {
     assert_eq!(a.unwrap(), Some(template()));
     assert_eq!(b.unwrap(), Some(template()));
     assert_eq!(
-        store.reads.load(Ordering::SeqCst),
+        store.template_reads.load(Ordering::SeqCst),
         1,
         "concurrent template misses share one load"
     );
-    store.reads.store(0, Ordering::SeqCst);
+    store.template_reads.store(0, Ordering::SeqCst);
     assert_eq!(
         state.template("tenant", "app", "1").await.unwrap(),
         Some(template())
     );
     state.create_binding(scope()).await.unwrap();
     assert_eq!(
-        store.reads.load(Ordering::SeqCst),
+        store.template_reads.load(Ordering::SeqCst),
         0,
         "create reuses the immutable template too"
     );

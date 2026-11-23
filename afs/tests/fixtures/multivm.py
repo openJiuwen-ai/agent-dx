@@ -73,6 +73,25 @@ def bench_fanout_readers(case, config):
     return None
 
 
+def case_node_count(case, config):
+    """Nodes a case cluster starts (Cluster.roles without Meta)."""
+    readers = bench_fanout_readers(case, config)
+    if readers is not None:
+        return 1 + len(readers)
+    three = needs_reader_c(case, config["kind"], config.get("topology")) or (
+        case.profile is not None and case.profile.node_count == 3)
+    return 3 if three else 2
+
+
+def require_replica_nodes(case, config):
+    """Declared bench replica copies must each find a distinct Node in this case's cluster."""
+    settings = benchlib.replication_settings(benchlib.parameters(config).replication)
+    nodes = case_node_count(case, config)
+    if settings and settings["dfs_desired_copies"] > nodes:
+        raise Blocked("%s starts %d Nodes; bench dfs_desired_copies=%d needs as many distinct Nodes" % (
+            case.id, nodes, settings["dfs_desired_copies"]))
+
+
 def validate(config, cases):
     if config.get("kind") not in ("singlevm", "multivm", "namespaces", "hybrid", "kubernetes", "docker"):
         raise ValueError("kind must be singlevm, namespaces, multivm, hybrid, kubernetes or docker")
@@ -99,7 +118,7 @@ def validate(config, cases):
             raise ValueError("unknown case purpose")
         if case.purpose == "performance":
             if is_bench(case):
-                benchlib.parameters(config)
+                require_replica_nodes(case, config)
             else:
                 performance_parameters(config)
         if case.profile is not None and case.profile.node_count == 3:
@@ -165,7 +184,7 @@ def validate(config, cases):
 
 
 class Cluster:
-    def __init__(self, config, binary_dir, output, case, root_token):
+    def __init__(self, config, binary_dir, output, case, root_token, *, owner_bind_backing="workspace"):
         self.config = config
         self.binary_dir = Path(binary_dir)
         self.output = Path(output)
@@ -188,6 +207,7 @@ class Cluster:
         self.uid = config["uid"]
         self.gid = config["gid"]
         self.bind = False
+        self.owner_bind_backing = owner_bind_backing
         self.helpers = {}
         self.effective = {}
         self.memory_mounts = {}
@@ -425,7 +445,7 @@ class Cluster:
             raise Blocked("staged artifact could not be placed: " + name + ": " + copied["stderr"][-300:])
         return channel.call("hash", path=destination)["sha256"]
 
-    def prepare(self):
+    def prepare(self, *, ownerfs_bind=True, start_peers=True):
         infos = self.connect()
         identity = self.inputs(infos)
         binaries = list(identity["binaries"])
@@ -469,11 +489,13 @@ class Cluster:
                 self.gid,
                 owner=False,
             )
-            self.stop("A")
-            self.bind = True
-            self._configs()
-            self.start("A")
-            self.start("B")
+            if ownerfs_bind:
+                self.stop("A")
+                self.bind = True
+                self._configs()
+                self.start("A")
+            if start_peers:
+                self.start("B")
         else:
             self.python(
                 "A",
@@ -483,9 +505,13 @@ class Cluster:
                 self.gid,
                 owner=False,
             )
-            for role in self.roles[2:]:
-                self.start(role)
-        self.topology()
+            if start_peers:
+                for role in self.roles[2:]:
+                    self.start(role)
+        if start_peers:
+            self.topology()
+        else:
+            self.topology(roles=("A",))
         self.started = True
 
     def _tls(self):
@@ -556,6 +582,7 @@ class Cluster:
                     ch.upload(p, self.roots[host] + "/tls/" + p.name, 0o600 if p.suffix == ".key" else 0o644)
 
     def _configs(self):
+        """Write each role's configuration and record the effective settings."""
         log_level = "info" if self.case.observe_cache else "warn"
         for role in self.roles:
             root = self.root(role)
@@ -572,9 +599,12 @@ class Cluster:
                 NAMES[r] + " = " + json.dumps(root + "/tls/" + NAMES[r] + ".pem") for r in self.roles if r != "M"
             )
             common += "trusted_node_certs = {" + trusted + "}\n"
+            replication = (benchlib.replication_settings(benchlib.parameters(self.config).replication)
+                           if is_bench(self.case) else None)
             if role == "M":
                 policy = self.case.profile or DfsProfile()
-                config = 'id = "meta-ctl"\nfs = "all"\n' + self.meta_store_toml + policy.meta_config() + common
+                placement = benchlib.replication_toml(replication) if replication else policy.meta_config()
+                config = 'id = "meta-ctl"\nfs = "all"\n' + self.meta_store_toml + placement + common
             else:
                 config = (
                     f'id = "{NAMES[role]}"\nfs = "{self.mode}"\n'
@@ -584,6 +614,8 @@ class Cluster:
                 )
                 if self.case.profile is not None:
                     config += self.case.profile.node_config()
+                if replication:
+                    config += benchlib.replication_toml(replication)
                 if is_bench(self.case):
                     config += benchlib.node_overrides_toml(
                         benchlib.parameters(self.config).overrides_for(role), remote_join(data, "peer-cache"))
@@ -611,6 +643,11 @@ class Cluster:
                 role, [root + "/bin/afs-" + ("meta" if role == "M" else "node"), "--config", path, "--print-config"]
             )
             self.effective[role] = self.record("config.effective." + role, json.loads(effective["stdout"]))
+            if replication:
+                mismatches = benchlib.effective_mismatches(self.effective[role], replication)
+                self.record("bench.replication." + role, {"declared": replication, "mismatches": mismatches})
+                if mismatches:
+                    raise AssertionError("bench replica settings not in effect on %s: %r" % (role, mismatches))
             if role != "M" and is_bench(self.case):
                 declared = benchlib.parameters(self.config).overrides_for(role)
                 mismatches = benchlib.effective_mismatches(self.effective[role], declared)
@@ -618,37 +655,49 @@ class Cluster:
                 if mismatches:
                     raise AssertionError("bench node overrides not in effect on %s: %r" % (role, mismatches))
 
+    # Configuration-only entry point for runner tests.
+    write_configs = _configs
+
     def prepare_bench_node(self, role, data):
         """Peer-cache directory for declared overrides; memory backend tmpfs on the Node's state dir.
 
-        The tmpfs lives in the worker's private mount namespace and is charged to the role's cgroup;
-        it is unmounted after the Nodes stop (unmount_memory_backends) and before worker cleanup.
+        With a memory backend the peer cache follows it onto its own tmpfs (capacity plus 64 MiB for
+        its catalog), so cached peer bodies are not on ext4 while chunks are in memory. The tmpfs mounts
+        live in the worker's private mount namespace and are charged to the role's cgroup; they are
+        unmounted after the Nodes stop (unmount_memory_backends) and before worker cleanup.
         """
         params = benchlib.parameters(self.config)
-        if any(k.startswith("dfs_peer_cache.") for k in params.overrides_for(role)):
-            self.python(role, "os.makedirs(sys.argv[1],0o700,exist_ok=True)", remote_join(data, "peer-cache"),
-                        owner=False)
-        if params.backend != "memory" or role in self.memory_mounts:
+        overrides = params.overrides_for(role)
+        if any(k.startswith("dfs_peer_cache.") for k in overrides):
+            peer_cache = remote_join(data, "peer-cache")
+            self.python(role, "os.makedirs(sys.argv[1],0o700,exist_ok=True)", peer_cache, owner=False)
+            if params.backend == "memory":
+                self.mount_memory(role, peer_cache, overrides["dfs_peer_cache.capacity_bytes"] + 64 * 1024**2,
+                                  "afs-bench-peer-cache")
+        if params.backend == "memory":
+            self.mount_memory(role, remote_join(data, "state"), params.memory_backend_bytes, "afs-bench-memory")
+
+    def mount_memory(self, role, path, size, source):
+        if path in self.memory_mounts:
             return
-        state = remote_join(data, "state")
-        self.command(role, ["mount", "-t", "tmpfs", "-o", "size=%d,mode=0700" % params.memory_backend_bytes,
-                            "afs-bench-memory", state])
-        self.memory_mounts[role] = state
-        fstype = self.command(role, ["findmnt", "-n", "-o", "FSTYPE", "--mountpoint", state])["stdout"].strip()
+        self.command(role, ["mount", "-t", "tmpfs", "-o", "size=%d,mode=0700" % size, source, path])
+        self.memory_mounts[path] = role
+        fstype = self.command(role, ["findmnt", "-n", "-o", "FSTYPE", "--mountpoint", path])["stdout"].strip()
         if fstype != "tmpfs":
             raise AssertionError("memory backend is not tmpfs on %s: %r" % (role, fstype))
-        self.record("bench.memory_backend." + role, {"path": state, "fstype": fstype,
-                                                     "size_bytes": params.memory_backend_bytes})
+        leaf = path.rsplit("/", 1)[-1]
+        self.record("bench.memory_backend." + role + ("" if leaf == "state" else "." + leaf),
+                    {"path": path, "fstype": fstype, "size_bytes": size})
 
     def unmount_memory_backends(self, errors):
-        for role, state in list(self.memory_mounts.items()):
+        for path, role in list(self.memory_mounts.items()):
             try:
-                value = self.channel(role).call("command", argv=["umount", state], uid=None, gid=None, env={},
+                value = self.channel(role).call("command", argv=["umount", path], uid=None, gid=None, env={},
                                                 timeout=30, stdin=None)
                 if value["returncode"] != 0:
                     errors.append("%s: memory backend unmount failed: %s" % (role, value["stderr"][-300:]))
                     continue
-                del self.memory_mounts[role]
+                del self.memory_mounts[path]
             except Exception as exc:
                 errors.append("%s: memory backend unmount unconfirmed: %s" % (role, exc))
 
@@ -694,14 +743,15 @@ class Cluster:
         for role in roles:
             self.start(role)
 
-    def topology(self):
-        for role in self.roles[1:]:
-            path = self.workspace(role) if role == "A" and self.mode == "ownerfs" else self.mount(role)
+    def topology(self, *, roles=None):
+        for role in self.roles[1:] if roles is None else roles:
+            owner_bind = role == "A" and self.mode == "ownerfs" and self.bind
+            path = self.workspace(role) if owner_bind else self.mount(role)
             try:
                 value = self.command(role, ["findmnt", "-J", "--mountpoint", path, "-o",
                                             "TARGET,SOURCE,FSTYPE,ID,OPTIONS,PROPAGATION"])
             except AssertionError:
-                if role == 'A' and self.mode == 'ownerfs':
+                if owner_bind:
                     try:
                         diagnostic = self.python(role, (HERE / 'bind_probe.py').read_text(), self.root(role),
                                                  self.token, owner=False, check=False)
@@ -710,23 +760,29 @@ class Cluster:
                         self.record('ownerfs.bind_diagnostic', {'diagnostic_error': str(error)})
                 raise
             mount = json.loads(value["stdout"])["filesystems"][0]
-            if role == "A" and self.mode == "ownerfs":
+            if owner_bind:
                 assert mount["fstype"] == "ext4", mount
                 options = set(mount.get('options', '').split(','))
                 assert {'nosuid', 'nodev'} <= options and mount.get('propagation') == 'private', (
                     'owner bind policy', mount
                 )
-                value = self.python(
+                backing = self.python(
                     role,
                     (
                         "from pathlib import Path\np=Path(sys.argv[1]);a=os.stat(sys.argv[2]);"
-                        'b=(p/"workspace").stat();assert '
-                        "(a.st_dev,a.st_ino)==(b.st_dev,b.st_ino)"
+                        "sources=list(p.glob(sys.argv[3])) if sys.argv[3] else "
+                        "[d for d in p.iterdir() if d.is_dir() and not d.is_symlink() and d.samefile(sys.argv[2])];"
+                        "assert len(sources)==1,sources;"
+                        "b=sources[0].stat();assert "
+                        "(a.st_dev,a.st_ino)==(b.st_dev,b.st_ino);print(sources[0])"
                     ),
                     self.role_dir(role) + "/state/ownerfs",
                     path,
+                    self.owner_bind_backing or '',
                     owner=False,
                 )
+                if self.owner_bind_backing is None:
+                    self.record('ownerfs.bind_backing.' + role, backing['stdout'].strip())
             else:
                 assert mount["source"] == "afs-" + self.mode, mount
             self.record("topology." + role, mount)
