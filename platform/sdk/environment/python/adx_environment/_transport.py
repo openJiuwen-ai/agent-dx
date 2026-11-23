@@ -832,12 +832,14 @@ class EnvironmentClient:
         args: Optional[Dict[str, Any]] = None,
         *,
         timeout: Optional[int] = None,
+        _deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         """POST /environments/{id}/invoke with ``{action, args}``.
 
         Returns the decoded JSON ``args``/result object. The HTTP timeout is
         derived from the logical *timeout* with a small network buffer, so a slow
-        primitive does not trip the client first.
+        primitive does not trip the client first. An internal absolute deadline
+        caps both budgets across attempts, including their backoff.
         """
         logical_timeout = ADX_GET_DEFAULT_TIMEOUT if timeout is None else timeout
         if (
@@ -853,6 +855,9 @@ class EnvironmentClient:
         deadline = (
             None if processing_deadline is None else processing_deadline + self._connection.communication_margin_seconds
         )
+        if _deadline is not None:
+            processing_deadline = _deadline if processing_deadline is None else min(processing_deadline, _deadline)
+            deadline = _deadline if deadline is None else min(deadline, _deadline)
 
         # Current gateways expose operations only on /direct. A missing
         # Environment route is not evidence that control-plane invoke exists.
@@ -865,11 +870,11 @@ class EnvironmentClient:
                 request_id,
                 deadline,
                 processing_deadline,
-                None if logical_timeout < 0 else logical_timeout,
+                logical_timeout if _deadline is None and logical_timeout >= 0 else None,
             )
             if not fell_back:
                 return _InvokeResult(result, request_id)
-            if logical_timeout >= 0:
+            if _deadline is None and logical_timeout >= 0:
                 processing_deadline = time.monotonic() + logical_timeout
                 deadline = processing_deadline + self._connection.communication_margin_seconds
 
@@ -905,7 +910,7 @@ class EnvironmentClient:
         request_id: str,
         deadline: Optional[float],
         processing_deadline: Optional[float] = None,
-        processing_timeout: Optional[float] = None,
+        retry_processing_timeout: Optional[float] = None,
     ) -> "tuple[Dict[str, Any], bool]":
         """Try the /direct path. Successful calls return ``(result, False)``.
 
@@ -1055,6 +1060,8 @@ class EnvironmentClient:
                 backoff += random.uniform(0, 0.1)
             if backoff <= 0:
                 break
+            if retry_processing_timeout is None and deadline is not None and backoff >= deadline - time.monotonic():
+                break
             logger.warning(
                 "direct invoke transport error; retrying request_id=%s action=%s attempt=%d/%d error=%s",
                 request_id,
@@ -1064,10 +1071,10 @@ class EnvironmentClient:
                 last_error,
             )
             time.sleep(backoff)
-            if processing_timeout is not None:
+            if retry_processing_timeout is not None:
                 # Every permitted retry is a new HTTP attempt with the same
                 # configured timeout, margin and operation identity.
-                processing_deadline = time.monotonic() + processing_timeout
+                processing_deadline = time.monotonic() + retry_processing_timeout
                 deadline = processing_deadline + self._connection.communication_margin_seconds
 
         if pending_resume is not None and not outcome_unknown and terminal_route_error is None:

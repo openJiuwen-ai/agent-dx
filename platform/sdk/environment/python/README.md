@@ -372,8 +372,9 @@ forwarding, Ingress returns HTTP 503 with `X-ADX-Error-Code: ENV_RESUMING`,
 `Retry-After: 1`, and a JSON `error` containing `code: ENV_RESUMING`,
 `retry: same_operation`, `outcome: not_started`, `requestForwarded: false`,
 `requestId`, and `environmentId`. The durable restore continues independently.
-SDK retries retain the request ID and body; **each allowed retry gets the same
-configured timeout plus communication margin**. Retry count is configurable via
+SDK retries retain the request ID and body. An ordinary invoke gives each
+allowed retry the configured timeout plus communication margin. Reads during a
+bounded command wait use the remaining wait budget. Retry count is configurable via
 `ConnectionConfig.request_max_attempts` / `ADX_REQUEST_MAX_ATTEMPTS` (default 3,
 including the first data-path attempt). Connection failures and absent direct
 routes never trigger an implicit control-plane invoke: the current API Server
@@ -814,12 +815,16 @@ killing the command.
 These short reads do not mark the background command itself as an active HTTP
 request or change checkpoint admission. An explicit checkpoint can still capture
 the running command; automatic idle checkpointing waits for client activity to end.
-Retryable registry-read failures during a checkpoint or transport interruption
-are retried for up to 30 seconds, bounded by the caller's overall wait deadline.
-Terminal errors and exhausted retries retain their original exception metadata.
-When the wait deadline expires, they
-return `CommandResult(status=RUNNING, error_code="WAIT_TIMEOUT")`; the remote
-command remains active and the handle can wait again. A client restart also
+For watch-backed waits with a positive `timeout`, the initial registry read,
+watch intervals, subsequent reads and transport retries share the same deadline.
+HTTP request timeouts are enforced per network phase. Retryable failures in
+periodic reads during a checkpoint or transport interruption keep their
+30-second retry ceiling within the caller's remaining budget. Terminal errors
+and exhausted retries preserve their exception metadata. If the command was
+last observed running and the watch budget expires, the wait returns
+`CommandResult(status=RUNNING, error_code="WAIT_TIMEOUT")`. The handle can wait
+again. `wait(0)` and `wait_async(0)` query the registry without opening a watch.
+A client restart also
 does not terminate the remote command. `CommandHandle.kill()` and
 `environment.commands.kill()` return `False` when the command is absent or already
 finished, and still raise on other execution or transport failures.
