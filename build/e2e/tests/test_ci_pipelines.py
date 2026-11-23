@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -13,6 +14,37 @@ BASH = shutil.which("bash")
 
 
 class IndependentPipelineTests(unittest.TestCase):
+    def test_master_nightly_schedule_rejects_other_branches_and_obs_staging(self):
+        schedule = json.loads((ROOT / ".buildkite/master-nightly.json").read_text())
+        self.assertEqual(schedule["branch"], "master")
+        self.assertEqual(schedule["commit"], "HEAD")
+        self.assertEqual(schedule["cronline"], "0 2 * * * Asia/Shanghai")
+        self.assertFalse(schedule["enabled"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "buildkite-agent"
+            agent.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$UPLOAD_ARGUMENTS"\n')
+            agent.chmod(0o755)
+            arguments = root / "arguments"
+            env = {key: value for key, value in os.environ.items() if not key.startswith(("ADX_", "BUILDKITE_"))}
+            env.update(schedule["env"])
+            env.update(BUILDKITE_BRANCH="master", BUILDKITE_PIPELINE_SLUG="agent-dx",
+                       PATH=str(root) + os.pathsep + os.environ["PATH"], UPLOAD_ARGUMENTS=str(arguments))
+            cases = [({}, 0), ({"BUILDKITE_BRANCH": "feature/example"}, 2),
+                     ({"ADX_ARTIFACT_TRANSPORT": "obs"}, 2),
+                     ({"BUILDKITE_PIPELINE_SLUG": "agent-dx-python-sdk"}, 2)]
+            for overrides, status in cases:
+                with self.subTest(overrides=overrides):
+                    arguments.unlink(missing_ok=True)
+                    result = subprocess.run([BASH, str(ROOT / ".buildkite/select-pipeline.sh")],
+                                            cwd=ROOT, env=dict(env, **overrides), capture_output=True, text=True)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    if status == 0:
+                        self.assertEqual(arguments.read_text().splitlines(),
+                                         ["pipeline", "upload", ".buildkite/pipeline-package.yml"])
+                    else:
+                        self.assertFalse(arguments.exists())
+
     def test_base_defaults_to_afs_without_expanding_the_smoke_profile(self):
         base = yaml.safe_load((ROOT / ".buildkite/pipeline-package.yml").read_text())
         self.assertEqual(base["env"]["ADX_WITH_AFS"], "${ADX_WITH_AFS:-1}")
