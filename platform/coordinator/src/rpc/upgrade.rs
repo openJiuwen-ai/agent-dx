@@ -1028,13 +1028,16 @@ impl CoordinatorRpc {
             return Ok(false);
         }
         let original_pod = previous.pod_uid == previous.original_pod_uid;
-        let rollback_replacement =
-            task.phase == "Aborting" && request.rollback && previous.phase == "quiescing";
-        if !(original_pod || rollback_replacement)
-            || !matches!(
-                previous.phase.as_str(),
-                "evacuating" | "draining" | "quiescing"
-            )
+        let rollback = task.phase == "Aborting" && request.rollback;
+        // A late original source can be registered before its first release.
+        // If it restarts in that window, require the same strict-empty proof.
+        let eligible = match previous.phase.as_str() {
+            "pending" => rollback && original_pod,
+            "evacuating" | "draining" => original_pod,
+            "quiescing" => original_pod || rollback,
+            _ => false,
+        };
+        if !eligible
             || request.delete_intent
             || previous.delete_resource_version.is_some()
             || request.node_session_id != session.id

@@ -176,6 +176,8 @@ can reconcile lost replies.
 After a process restart in the same Pod, `quiesce` can bind the new session
 once the task's operations on that node have settled. This applies to the
 original Pod and to a Quiescing replacement during abort with `rollback:true`.
+That rollback path also accepts a strictly empty original Pod still recorded as
+`pending`, such as a late old-image Pod registered before its first release.
 The caller supplies the same Pod UID and current session. The replacement
 process must already be isolated for this task and report strict empty, with no
 durable Environment assignments or outstanding delete intent. Quiesce issues a

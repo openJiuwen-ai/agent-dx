@@ -4,6 +4,110 @@ use tokio::time::{interval_at, timeout, Instant};
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
+async fn abort_rebinds_an_empty_late_original_pod_before_release() {
+    let rig = Rig::new(Duration::from_secs(2)).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(adx_coordinator::autoscaling::serve(
+        listener,
+        rig.rpc.clone(),
+    ));
+    let abort = "tasks/planned-migration/abort";
+    post_upgrade(
+        address,
+        "tasks",
+        json!({
+            "task_id": "planned-migration", "epoch": 1, "namespace": "test",
+            "daemonset_uid": "daemonset", "target_image": format!("image@sha256:{}", "d".repeat(64)),
+            "nodes": [{"node_id": "a", "pod_uid": "source-pod", "node_session_id": rig.source.report.session_id}]
+        }),
+    )
+    .await;
+    post_upgrade(
+        address,
+        abort,
+        json!({"task_id": "planned-migration", "epoch": 1, "operation_id": "freeze", "stage": "freeze"}),
+    )
+    .await;
+    let period = Duration::from_secs(60);
+    let mut late = worker("c", &rig.address, rig.remote.clone(), None).await;
+    report(&mut late, &rig.address, period).await.unwrap();
+    let previous_session = late.report.session_id.clone();
+    let inspection = late.manager.inspect_upgrade().await.unwrap();
+    assert_eq!(inspection.phase, "isolated");
+    assert!(inspection.strict_empty);
+
+    // A restart between registration and the first release leaves this durable binding.
+    let mut task = rig.session.upgrade_task().await.unwrap().unwrap();
+    let revision = task.revision;
+    task.nodes.insert(
+        "c".into(),
+        adx_coordinator::storage::UpgradeNode {
+            node_id: "c".into(),
+            pod_uid: "late-old-pod".into(),
+            original_pod_uid: "late-old-pod".into(),
+            node_session_id: previous_session.clone(),
+            original_session_id: previous_session.clone(),
+            control_revision: inspection.revision,
+            phase: "pending".into(),
+            ..Default::default()
+        },
+    );
+    rig.session
+        .save_upgrade(task, Some(revision))
+        .await
+        .unwrap();
+    late.task.abort();
+    let _ = (&mut late.task).await;
+    let mut replacement = worker(
+        "c",
+        &rig.address,
+        rig.remote.clone(),
+        Some(&late.report.node_address),
+    )
+    .await;
+    report(&mut replacement, &rig.address, period)
+        .await
+        .unwrap();
+
+    let quiesce = "tasks/planned-migration/quiesce";
+    let mut request = json!({"task_id": "planned-migration", "epoch": 1, "operation_id": "late-rebind",
+        "node_id": "c", "pod_uid": "late-old-pod", "node_session_id": replacement.report.session_id,
+        "rollback": true});
+    let mut stale = request.clone();
+    stale["node_session_id"] = json!(previous_session);
+    let (status, error) = upgrade_response(address, "POST", quiesce, stale.to_string()).await;
+    assert_eq!(status, 409, "{error}");
+    assert!(!replacement.manager.accepting_allocations());
+    let permit = post_upgrade(address, quiesce, request.clone()).await;
+    assert_eq!(permit["strict_empty"], true);
+    assert_eq!(permit["pod_uid"], "late-old-pod");
+    assert_eq!(permit["node_session_id"], replacement.report.session_id);
+    request["operation_id"] = json!("verify-late");
+    request["permit_id"] = permit["permit_id"].clone();
+    post_upgrade(address, "tasks/planned-migration/verify-node", request).await;
+    let aborted = post_upgrade(
+        address,
+        abort,
+        json!({"task_id": "planned-migration", "epoch": 1, "operation_id": "finalize",
+            "stage": "finalize", "template_restored": true}),
+    )
+    .await;
+    assert_eq!(aborted["phase"], "Aborted");
+    assert_eq!(
+        aborted["nodes"]["c"]["original_session_id"],
+        previous_session
+    );
+    assert_eq!(
+        aborted["nodes"]["c"]["node_session_id"],
+        replacement.report.session_id
+    );
+    assert!(replacement.manager.accepting_allocations());
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
 async fn retries_abort_after_lost_original_release_and_process_restart() {
     for keep_paused in [false, true] {
         abort_after_lost_original_release(keep_paused).await;
