@@ -1,5 +1,4 @@
 //! Shared managed target selection and authorized, unsent service connection.
-use super::resolver::AccessKind;
 use super::server::{Ingress, IngressOpenError, IngressStream};
 use adx_agent_api::{managed::ManagedService, request::RequestContext, Error};
 use adx_agent_core::{BindingPhase, Protocol, Scope};
@@ -30,40 +29,27 @@ pub struct ServiceSelection {
     requested_port: Option<u16>,
     environment_id: String,
     generation: String,
+    pub(super) created_environment: bool,
     retried: bool,
     parameters: Option<Vec<u8>>,
-    product_selected: bool,
-    workspace: Option<String>,
 }
 impl ServiceSelection {
-    pub(crate) fn binding_scope(&self) -> &Scope {
-        &self.scope
-    }
-    pub(crate) fn workspace(&self) -> Option<&str> {
-        self.workspace.as_deref()
-    }
     pub(crate) fn deadline(&self) -> tokio::time::Instant {
         self.context.deadline()
     }
 
-    pub(crate) fn websocket_port(&self) -> Result<u16, Error> {
-        if self.protocol != Protocol::Ws {
-            return Err(Error::Invalid("selected service is not WebSocket".into()));
-        }
-        Ok(self.port)
+    pub(crate) fn forwarding_path(&self, backend_uri: &http::Uri) -> String {
+        format!("/{}/{}{}", self.environment_id, self.port, backend_uri)
     }
 
-    pub(crate) fn forwarding_uri(&self, backend_uri: &http::Uri) -> Result<http::Uri, Error> {
-        format!("/{}/{}{}", self.environment_id, self.port, backend_uri)
-            .parse()
+    pub(crate) fn rewrite_request<B>(
+        &self,
+        request: &mut http::Request<B>,
+        backend_uri: &http::Uri,
+    ) -> Result<(), Error> {
+        super::server::replace_request_path(request, &self.forwarding_path(backend_uri))
             .map_err(|_| Error::Unavailable("invalid resolved forwarding path".into()))
     }
-}
-
-/// Preserve a business initializer's authentication errors without coupling shared activation to it.
-pub enum InitializationError<E> {
-    Agent(Error),
-    Source(E),
 }
 
 #[derive(Clone)]
@@ -94,7 +80,7 @@ impl AgentV2Access {
         selector: ServiceSelector,
         parameters: Option<&[u8]>,
     ) -> Result<ServiceSelection, Error> {
-        let (target, port) = context
+        let resolved = context
             .run(self.managed.resolve_with_parameters(
                 &context,
                 &scope,
@@ -104,92 +90,19 @@ impl AgentV2Access {
                 false,
             ))
             .await?;
+        let target = resolved.target;
         Ok(ServiceSelection {
             context,
             scope,
             protocol: selector.protocol,
-            port,
+            port: resolved.port,
+            created_environment: resolved.created_environment,
             requested_port: selector.port,
             environment_id: target.binding.current.environment_id,
             generation: target.binding.generation,
             retried: false,
             parameters: parameters.map(<[u8]>::to_vec),
-            product_selected: false,
-            workspace: target.binding.parameters.get("workspace").cloned(),
         })
-    }
-
-    /// Business adapters provide parameters lazily; Binding decisions stay in the shared flow.
-    pub async fn select_with_initializer<F, E>(
-        &self,
-        context: Arc<RequestContext>,
-        scope: Scope,
-        selector: ServiceSelector,
-        initializer: F,
-    ) -> Result<ServiceSelection, InitializationError<E>>
-    where
-        F: std::future::Future<Output = Result<adx_agent_core::mounts::Parameters, E>>,
-    {
-        self.select_initialized(context, scope, selector, false, initializer)
-            .await
-    }
-
-    pub(crate) async fn select_initialized<F, E>(
-        &self,
-        context: Arc<RequestContext>,
-        scope: Scope,
-        selector: ServiceSelector,
-        reuse_subject_binding: bool,
-        initializer: F,
-    ) -> Result<ServiceSelection, InitializationError<E>>
-    where
-        F: std::future::Future<Output = Result<adx_agent_core::mounts::Parameters, E>>,
-    {
-        let parameters = match context.run(self.managed.binding(&context, &scope)).await {
-            Ok(_) => None,
-            Err(Error::NotFound) => {
-                let values = tokio::time::timeout_at(context.deadline(), initializer)
-                    .await
-                    .map_err(|_| {
-                        InitializationError::Agent(Error::Unavailable(
-                            "initialization deadline exceeded".into(),
-                        ))
-                    })?
-                    .map_err(InitializationError::Source)?;
-                Some(adx_agent_core::parameters::encode(&values))
-            }
-            Err(error) => return Err(InitializationError::Agent(error)),
-        };
-        if reuse_subject_binding {
-            let (target, port) = context
-                .run(self.managed.resolve_product(
-                    &context,
-                    &scope,
-                    adx_agent_core::activator::ServiceSelector {
-                        protocol: selector.protocol,
-                        port: selector.port,
-                    },
-                    parameters.as_deref(),
-                ))
-                .await
-                .map_err(InitializationError::Agent)?;
-            return Ok(ServiceSelection {
-                context,
-                scope: target.binding.scope,
-                protocol: selector.protocol,
-                port,
-                requested_port: selector.port,
-                environment_id: target.binding.current.environment_id,
-                generation: target.binding.generation,
-                retried: false,
-                parameters,
-                product_selected: true,
-                workspace: target.binding.parameters.get("workspace").cloned(),
-            });
-        }
-        self.select_with_parameters(context, scope, selector, parameters.as_deref())
-            .await
-            .map_err(InitializationError::Agent)
     }
 
     /// Refresh once before writes. WS admission may reselect a deleted/rebuilt Binding;
@@ -209,10 +122,8 @@ impl AgentV2Access {
                 &selection.generation,
             ))
             .await;
-        let (target, port) = match resolved {
-            Err(error @ Error::Conflict(_))
-                if selection.protocol == Protocol::Ws && !selection.product_selected =>
-            {
+        let resolved = match resolved {
+            Err(error @ Error::Conflict(_)) if selection.protocol == Protocol::Ws => {
                 let changed = match selection
                     .context
                     .run(self.managed.binding(&selection.context, &selection.scope))
@@ -245,9 +156,11 @@ impl AgentV2Access {
             }
             result => result?,
         };
+        let target = resolved.target;
+        selection.created_environment = resolved.created_environment;
         selection.environment_id = target.binding.current.environment_id;
         selection.generation = target.binding.generation;
-        selection.port = port;
+        selection.port = resolved.port;
         Ok(true)
     }
 
@@ -261,57 +174,20 @@ impl AgentV2Access {
         ingress: &Ingress,
         selection: ServiceSelection,
     ) -> Result<IngressStream, ServiceAccessError> {
-        self.connect_service_inner(ingress, selection, false).await
-    }
-
-    /// Jiuwen cold starts can publish a runtime before its business port listens.
-    /// Wait only for TCP refusal, before sending any application bytes, using the
-    /// original admission deadline. Handshake failures are never replayed.
-    pub(crate) async fn connect_service_when_ready(
-        &self,
-        ingress: &Ingress,
-        selection: ServiceSelection,
-    ) -> Result<IngressStream, ServiceAccessError> {
-        self.connect_service_inner(ingress, selection, true).await
-    }
-
-    async fn connect_service_inner(
-        &self,
-        ingress: &Ingress,
-        mut selection: ServiceSelection,
-        wait_for_listener: bool,
-    ) -> Result<IngressStream, ServiceAccessError> {
+        let mut selection = selection;
         loop {
             let result = selection
                 .context
                 .run(async {
-                    let attempt = async {
-                        let route = ingress
-                            .resolve_route(
-                                &selection.environment_id,
-                                selection.port,
-                                AccessKind::Direct,
-                                String::new(),
-                            )
-                            .await?;
-                        loop {
-                            let opened = ingress
-                                .open_resolved_stream(route.clone(), &selection.scope.tenant)
-                                .await;
-                            if wait_for_listener
-                                && matches!(&opened, Err(IngressOpenError::Connect(error))
-                                    if error.kind() == std::io::ErrorKind::ConnectionRefused)
-                            {
-                                // No route refresh or activation for a port that is merely
-                                // starting. The surrounding context also bounds this sleep.
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                continue;
-                            }
-                            return opened;
-                        }
-                    }
-                    .await;
-                    Ok(attempt)
+                    Ok(ingress
+                        .open_selected_service(
+                            &selection.environment_id,
+                            selection.port,
+                            &selection.scope.tenant,
+                            selection.created_environment,
+                            selection.deadline(),
+                        )
+                        .await)
                 })
                 .await?;
             match result {

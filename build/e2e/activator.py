@@ -3,6 +3,7 @@
 
 import concurrent.futures
 import json
+import logging
 import os
 import shutil
 import ssl
@@ -20,7 +21,6 @@ CASES = (
     'concurrent-first-traffic',
     'persisted-single-execution',
     'execd-command-and-files',
-    'resolve-and-refresh',
     'restart-preserves-execution',
     'delete-and-recreate',
     'physical-and-metadata-cleanup',
@@ -78,15 +78,18 @@ class Acceptance:
     def passed(self, name, **details):
         self.result['cases'].append({'id': name, 'status': 'passed', **details})
         self.save()
-        print('[ACTIVATOR PASS]', name, flush=True)
+        logging.info('[ACTIVATOR PASS] %s', name)
 
     def request(self, endpoint, path, method='GET', payload=None, token=None):
+        credential = self.token if token is None else token
+        agent = path.startswith(('/api/agent/v2/', '/agent/'))
+        auth = {'X-ADX-AUTH': credential} if agent else {'Authorization': 'Bearer ' + credential}
         request = urllib.request.Request(
             endpoint + path,
             method=method,
             data=None if payload is None else json.dumps(payload).encode(),
             headers={
-                'Authorization': 'Bearer ' + (self.token if token is None else token),
+                **auth,
                 'Content-Type': 'application/json',
             },
         )
@@ -247,13 +250,6 @@ class Acceptance:
         finally:
             handle.close()
         self.passed('execd-command-and-files', bytes=len(payload))
-        for endpoint in self.endpoints:
-            for refresh in (False, True):
-                resolved = self.success(
-                    endpoint, self.binding + '/resolve', 'POST', {'protocol': 'http', 'bypasscache': refresh}
-                )[1]
-                if resolved['environment_id'] != identity or resolved['port'] != 18092:
-                    raise AssertionError('resolve changed the binding identity')
         if self.mode == 'standalone':
             scope = {
                 'tenant': 'e2e',
@@ -271,7 +267,6 @@ class Acceptance:
                 )
                 if code != 200 or target['binding'] != self.result['original']['binding']:
                     raise AssertionError('independent Activators disagree')
-        self.passed('resolve-and-refresh')
 
     def recover(self):
         bodies = self.concurrent()
@@ -330,10 +325,13 @@ class Acceptance:
         self.result['status'] = 'passed'
         self.passed('physical-and-metadata-cleanup', inventories=rows)
         verify(self.result)
-        print(json.dumps(self.result), flush=True)
+        json.dump(self.result, sys.stdout)
+        sys.stdout.write('\n')
+        sys.stdout.flush()
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
     mode, phase = sys.argv[1:3]
     acceptance = Acceptance(mode)
     try:

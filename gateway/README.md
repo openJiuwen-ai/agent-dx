@@ -28,9 +28,7 @@ and remain outside that typed API.
 
 The default `activity-client` feature builds the managed Ingress and Relay entrypoints. Embedded and standalone Ingress both use `ingress::IngressService`; only the owning process changes. Standalone Ingress requires `ADX_INGRESS_CONTROL_CONFIG` pointing to [ingress-control.json](../build/config/examples/ingress-control.json). Coordinator must map the Ingress client certificate to the `ingress` role. Public listener TLS and Ingress-to-Node security remain separate settings. The optional `etcd-watch` library and legacy test fixtures are retained separately; the managed Ingress entrypoint uses the new Coordinator route service.
 
-DigitalMate 业务配置中心的部署、身份续期与回收边界见[中文部署说明](../docs/deployment/digitalmate-privacy.md)。
-配置中心与 Composio/摄取的数据库版本、凭证用途和发布切换步骤见 DigitalMate 仓库的
-[连接器配套部署说明](https://github.com/openJiuwen-ai/DigitalMate/blob/main/docs/guides/operations/connectors-cutover-and-database.md)。
+业务网关如何使用 Agent v2 可参见[最小示例](examples/business-gateway/README.md)。
 
 The gateway is a member of the root Cargo workspace. Run from repository root:
 
@@ -448,13 +446,12 @@ removed.
 
 A Gateway built with `agent-api` also accepts
 `/agent/http[/business/path]?target=urn:adx:instance:<environment-id>&port=<port>`
-and `/agent/ws` with the same query. Instance access requires an explicit nonzero
+and `/agent/ws` with the same query. Agent v2 authenticates exclusively with X-ADX-AUTH. HTTP and WS forwarding consume that header and preserve application Authorization. Instance access requires an explicit nonzero
 port, HTTPS and a tenant API Key authorized for the existing Environment.
 URN components are percent-encoded before URL query encoding. HTTP rejects
 WebSocket Upgrade; WS requires GET and WebSocket Upgrade.
 
-This path does not need `ADX_AGENT_CONFIG`, a Template, Binding, Activator or the
-Jiuwen module. The caller first creates the Environment through the public
+This path does not need `ADX_AGENT_CONFIG`, a Template, Binding or Activator. The caller first creates the Environment through the public
 Environment API. Ingress reuses the normal authorized port-forwarding route,
 including route publication and traffic-triggered resume. It strips platform
 credentials, initialization headers and routing query parameters before
@@ -473,9 +470,6 @@ headers and binding headers on instance targets are rejected. Gateway consumes
 the request header and returns the selected `X-ADX-Binding-Id`, overriding backend
 values and removing the obsolete `X-ADX-Binding-Urn` response header. See the
 [Agent access contract](../agent/README.md#统一-httpws-访问).
-DigitalMate's application routes continue deriving the binding from the verified
-user; a client-supplied Binding header cannot override that selection and is
-stripped before application WS forwarding.
 The long-lived Binding scope stores an explicit version or alias reference; its
 current Environment carries the actual immutable template version and ID. Service
 validation and Alias version selection run inside Activator before Binding/Environment creation. Gateway forwards the scope/protocol/port and uses the returned target/port; a hot resolve requires one RPC for both numeric and Alias scopes. An unsent refresh can observe a newer current
@@ -483,7 +477,7 @@ without changing Binding generation; an implicit port is selected again from the
 new version, while an explicit port remains a caller constraint. No request or
 handshake is replayed after bytes are sent.
 
-Management GET/DELETE/resolve and list operations also accept
+Management GET/DELETE and list operations also accept
 `/api/agent/v2/templates/<template>/aliases/<alias>/bindings[/<binding_id>]`.
 Alias configuration uses tenant-authenticated `GET/PUT /api/agent/v2/templates/<template>/aliases/<alias>` in both modes. PUT accepts `{seed, versions, expected_revision?}` and returns `{alias:{config,revision}}`; template/alias come from the URL and tenant comes from the verified key. The private aliases/put endpoint is an internal service RPC;
 see [alias setup](../agent/activator/README.md#别名收敛配置).
@@ -499,79 +493,7 @@ scope and declared service, retaining the request deadline and binding generatio
 generation once after an unsent route/connection failure. Before any backend WS handshake or business bytes are sent, WS admission may refresh once when authoritative metadata confirms that the Binding was deleted or rebuilt, retaining its original deadline and initialization input. HTTP/SSH remain generation-fenced. Authorization failures do
 not reactivate the target. Returned streams never replay application writes.
 
-Mail callers use the same `select_with_initializer` and
-`connect_service_when_ready`, supplying only Scope and the configured selector.
-Their initializer refuses a missing Binding. Existing-Binding initialization
-uses the Agent owner's retry resolve to avoid creating a replacement after a
-concurrent deletion. Selected-route checks and pre-write retry belong to the
-ordinary shared path, not to a mail-specific generation admission. Identity
-owners independently fence the original authorization, represented in mail
-persistence by an actual existing random grant reference. See the
-[wire-v2/cutover contract](https://github.com/openJiuwen-ai/DigitalMate/blob/main/docs/implementations/contracts/ingestion-delivery-contract.md).
-Ordinary managed WS uses shared selection/connection; managed HTTP shares selection/retry while retaining the
-backend HTTP pool. The Jiuwen codecs, bounded session/request state and E2A socket
-driver are implemented. Its internal connection adapter uses the shared authorized
-Relay stream, bounds the WS handshake by the original admission deadline, and
-observes route revocation during both handshake and streaming. The driver never
-reconnects or replays business writes. Each frontend owns one independent E2A
-connection and reuses it for its requests. Multiple frontends may connect to the
-same binding, including while another handshake is pending. The gateway does not
-arbitrate per-binding connection concurrency; the business service owns concurrent
-session semantics. Dropping a connection releases only its own Relay stream.
-Authentication, route revocation and the existing transport resource limits still
-apply to each connection. Each Jiuwen frontend has separate bounded request and
-output queues (`queue_capacity`, default 64). When the output queue fills, the
-backend driver waits up to `output_queue_timeout_seconds` (default 5) for space;
-a longer stall closes that WebSocket with code 1011. This wait is independent of
-`write_timeout_seconds`, which bounds writes to the frontend socket.
-
-The backend handshake uses `/`, Host `127.0.0.1:<service-port>` and Origin
-`http://127.0.0.1:<service-port>` on the selected stream; it does not dial that URL
-or forward frontend credentials. If AgentServer Origin checks are enabled, its
-allowlist must include `127.0.0.1`. Local Relay/mock-backend component tests cover
-authorized WS reuse, handshake timeout and route revocation. The embedded stack
-uses a 2 MiB worker-stack regression fixture. See the
-[design](../docs/development/jiuwenswarm-adx-gateway-design.md) for the contract and
-remaining validation boundaries.
-
-Jiuwen download settings are decoded from the selected `TemplateVersion.env` by
-`digitalmategateway::download_config::DownloadConfig::from_template`. Upload/download obtain Binding identity and its actual template together from Activator's read-only bindings/view, without creating a Binding or Environment. Gateway does not choose a version from Alias weights.
-The same env is already passed to AgentServer through ExecutionSpec. Templates
-must explicitly set absolute `JIUWENSWARM_WORKSPACE` and
-`JIUWENSWARM_DOWNLOAD_ASSET_ROOT` paths. A nonempty
-`JIUWENSWARM_FILE_DOWNLOAD_SECRET` takes precedence and must contain at least 32
-characters; it is kept verbatim and redacted in Debug. If absent or empty, the
-adapter selects `<workspace>/config/.file_download_secret` in the authorized
-Environment. No second Ingress configuration or process-environment probing is used.
-Public identity and binding routing use authenticated business sessions.
-
-`digitalmategateway::download_token` implements HMAC verification over the original Base64URL
-text, claim/expiry checks, and verified registration/file-metadata comparisons.
-`SignedDownload::check_file` requires active matching registration and actual file
-type/size for verified assets before returning `CheckedDownload`. Digest matching
-uses the registration; it does not hash the entire download. Verification input
-limits are 16 KiB for a token and 64 KiB each for secret/registration contents.
-`digitalmategateway::download_runtime::Reader::authorize` combines these checks with bounded
-reads from the common `environment_files::Files` capability. The common data plane
-checks Environment ownership/state through the API Server and supplies Execd
-credentials internally; Jiuwen never receives them. It reads a key file only when needed, a registration only for verified
-assets, and path metadata before admission. The original deadline covers lookup,
-connect and body reads; revocation or caller cancellation drops the owned HTTP
-connection immediately. Errors do not echo upstream bodies or credentials.
-`digitalmategateway::download_http::Download::respond` implements internal GET/HEAD attachment
-responses. Verified assets support single byte ranges (206/416) and inline;
-ordinary attachments retain full 200 responses and ignore Range/inline. Both
-use no-store, encoded UTF-8 filenames and extension-based MIME detection.
-Execd reads are pulled in chunks of at most 64 KiB, each with fresh business
-signature/registration admission, expiry checks and exact upstream range/length
-validation. API Server ownership/state admission is shared by the entire HTTP
-transfer, including metadata reads and all chunks. Buffered first bytes
-are admitted again when consumed; backpressure does not start background reads.
-The caller's deadline covers the whole transfer. Errors before headers produce
-bounded JSON responses; later errors abort the body without a successful truncation.
-Local Relay/simulated-Execd tests cover these paths; real Environment validation and
-production account integration remains subject to the validation below. CheckedDownload is a
-point-in-time result, not a reusable authorization credential.
+Managed HTTP keeps the backend connection pool. When a cold service refuses a connection before receiving any request bytes, Ingress waits for the listener within the original deadline.
 
 ### Common Environment file access
 
@@ -598,11 +520,10 @@ currency and retained route-change events; a target change, removal, or lost eve
 history ends the transfer, even if the old route is subsequently restored. In-flight
 I/O retains the existing cancellation checks. File connections do not follow a
 replacement execution, and failed operations are not automatically replayed. All
-operations share the original deadline; business session and download signature/
-registration checks remain active throughout the transfer.
+operations share the original deadline.
 
 `Files` owns bounded reads, metadata, upload and commit over shared authorized
-Relay streams. Jiuwen owns its business protocol and signature/workspace checks.
+Relay streams.
 Public `/direct` requests targeting the configured Execd port use the same
 `ExecdAccess` authorization and server-owned credential; clients do not supply
 Execd tokens. Files never pass through API Server.
@@ -614,422 +535,6 @@ credential. Different per-node credentials and one-sided rotation are unsupporte
 There is no old `spec.env` credential fallback; all participating processes must
 use the new configuration before using this binary.
 
-## DigitalMateGateway authenticated entrypoints
-
-The [Composio mail entry](https://github.com/openJiuwen-ai/DigitalMate/blob/main/docs/implementations/contracts/composio-gmail-trusted-entry.md) implements
-fixed Gmail/Outlook authorization, account validation, mail reads and subscription
-synchronization outside user sandboxes. Trusted `composio` configuration prepares
-the encrypted project Key, shared PostgreSQL budget and actual M44 owner adapter.
-The [ingestion coordinator](https://github.com/openJiuwen-ai/DigitalMate/blob/main/docs/implementations/contracts/connector-ingestion-gateway.md) in the same
-process verifies signed Webhooks, persists bounded queues and delivers fixed
-batches through existing Ingress/Relay. The DigitalMate module owns dispatch and
-worker supervision; shared service code only spawns its background future and
-supplies shutdown. No additional server, lifecycle owner or common forwarding
-branch is introduced. Live OAuth/mailbox and consumer deployment remain separate
-acceptance checks; implemented routes are not a claim of live acceptance.
-
-With a configured DigitalMate privacy owner, business WS admission issues one
-`dm-privacy-v1` workload credential in `Authorization`. Normal connector calls
-reuse this credential, existing grant and `/v1/identity/renew`. Gateway still strips
-caller-provided internal identity headers; no extra connector header is injected.
-Identity alone does not authorize mail reads: M44 retains current connection and
-task/intent permission checks. Delivery bootstrap credentials remain separately
-bounded and cannot renew or read configuration secrets.
-
-### Huawei Push Kit
-
-On Unix the optional `push` configuration enables Huawei delivery on the main
-DigitalMateGateway business entry. Configure the service account file, database,
-organization and per-minute limits as in the [gateway example](examples/digitalmategateway.json).
-Push uses the existing workload identity service and the PostgreSQL budget schema
-even when Composio is disabled.
-
-`POST /api/digitalmate/push/v1/send` accepts a `dm-privacy-v1` bearer and a
-single-device JSON notification. Omit `x-adx-processing-timeout-ms`. Push owns its
-20-second deadline and rejects a caller-supplied deadline before dispatch with
-HTTP 400 and non-retryable `not_sent`. HTTP 200 reports `accepted` or `rejected`.
-Huawei HTTP 400 with code `80100003` is a definitive message rejection.
-Only `not_sent` with `retryable: true` permits retry (429 includes
-`Retry-After`). HTTP 409 `unknown` requires reconciliation. See the
-[deployment and request contract](../docs/deployment/digitalmate-push-egress.md)
-for prerequisites, identity boundaries and timeout behavior.
-
-### Transparent business WebSocket
-
-The `digitalmategateway` business module loads `ADX_JIUWEN_CONFIG` with a
-shared top-level `tenant` and peer application blocks. The required `jiuwen` block configures `/ws` and file routes; the optional
-`orbit` block enables `GET /orbit/ws`, and optional `digitalmate` enables
-`GET /digitalmate/ws`. Each block owns its target and request timeout:
-
-```json
-{
-  "tenant": "your-tenant",
-  "jiuwen": {
-    "agent_type": "assistant",
-    "template": "jiuwen",
-    "version": "1"
-  },
-  "orbit": {
-    "template": "orbit",
-    "template_ref": "production",
-    "backend_path": "/ws",
-    "service_port": 18092
-  },
-  "digitalmate": {
-    "template": "digitalmate",
-    "template_ref": "production",
-    "backend_path": "/digitalmate/ws",
-    "service_port": 18092,
-    "request_timeout_seconds": 180
-  }
-}
-```
-
-All applications use the same `ADX_ACCOUNT_CONFIG`, Huawei/AGC login and
-business Bearer sessions. The gateway owns one fixed Platform tenant; accounts
-and sessions have no tenant field. They share account identities; the token
-is not bound to an application. Business and shared account routes do not
-restrict admission by Host or Origin. Deployment routing controls the public
-domains and paths; business routes still require a valid session.
-
-Each application’s `request_timeout_seconds` defaults
-to 60 seconds (valid range 1–86400); Jiuwen's remaining queue and protocol timeout
-settings also live inside `jiuwen`. Environment direct-port host routing retains
-its existing precedence. Without the corresponding optional block, `/orbit/ws` or `/digitalmate/ws` returns 404.
-Apply the configuration with its matching Ingress build. Existing Jiuwen
-binding IDs and workspace parameters stay unchanged.
-
-All business applications support TLS termination at an external load balancer.
-Generic `/agent/http` and `/agent/ws` remain tenant API Key routes requiring the
-Ingress TLS listener; business sessions do not authorize them.
-
-Use `/orbit/ws` or `/digitalmate/ws` and `Authorization: Bearer <business-token>`.
-The binding is fixed per verified user: its internal ID is `orbit-` or `digitalmate-`, respectively, plus the
-full hexadecimal SHA-256 of compact JSON `[tenant,user_id]`. Template and
-`template_ref` remain separate scope fields. Each transparent application uses the shared
-reference parser: a canonical positive numeric string selects a version, and a
-non-numeric string selects an Alias; for example `"12"` or `"production"`.
-An Alias must exist before admission and its reconciliation requires configured
-Activator registration and Redis notifications; registration automatically starts reconciliation. Reconnects reuse the same scope; different users
-are isolated. There is no client-selected binding ID or binding ID response
-header, ownership field, or mapping table.
-
-The target is selected solely from the gateway configuration and verified session.
-Query parameters do not participate in gateway target or binding selection, even
-when named `target`, `template`, `port`, `user_id` or `binding_id`. Only the path is
-replaced by the configured backend path; the query string is forwarded unchanged,
-without parsing, re-encoding, name filtering or an application-specific length limit.
-This includes `token` and `authorization`: URL parameters never authenticate the
-gateway and may have application-defined meaning. Each application interprets its own query
-parameters. General HTTP request limits still apply.
-Authentication credentials (including Cookie), `X-User-Id` and `X-ADX-*`
-headers are removed before forwarding. The original Host and Origin headers are
-preserved; backend origin checks remain the application's responsibility. The
-backend connection address and port come from the fixed service configuration.
-WebSocket subprotocol negotiation and business frames remain opaque.
-
-The entrypoint uses shared Agent activation, declared-service validation,
-cold-start readiness and Gateway HTTP Upgrade/byte forwarding. It does not
-implement a separate Relay client or translate application messages. Only
-unsent connection admission may retry; sent requests and frames are not replayed.
-For a missing binding it obtains `model_api_key` and `model_api_base` from the
-same account model service as Jiuwen, and injects `workspace` using the shared
-Jiuwen rule: `w-` plus the full SHA-256 of compact JSON `[tenant,template,user_id]`,
-using the selected application's configured template. The value is stable across template versions
-and distinct from a different user's or template's workspace. The
-[Orbit template example](../agent/activator/examples/orbit-sfs-template.json)
-omits the server-assigned version from its publish input and retains the same
-application image, using a shared managed
-Volume `orbit-workspace-${workspace}` in domain `sfs`, relative path
-`workspaces/${workspace}`, mounted at `/data/state`. With domain root `/mnt/sfs`,
-this preserves the existing workspace directory. Model parameters remain in the
-environment and existing binding parameters remain unchanged. Volume initialization
-declares `create_if_missing: true` and UID/GID 10001, mode `0700`; existing directory
-ownership and permissions are retained. Coordinator storage-domain authorization,
-node storage mounts and the SFS parent must be configured before activation.
-Shared Volume access does not provide application write isolation. The old direct
-bind Env does not acquire managed occupancy retroactively.
-
-Changing a fixed-version scope to an Alias scope changes its storage key. Deploy
-the matching `template_ref` configuration with this binary; the old `orbit.version`
-field is not accepted. Existing string template versions become same-name Aliases
-through an explicitly reviewed offline migration, with no automatic data migration.
-Preserve the existing Binding and data during that maintenance operation; changing
-the config alone can cause first traffic to create another Binding.
-Local tests cover typed references, authenticated Alias forwarding and managed
-Volume activation with a simulated Platform. Real Orbit/SFS deployment and the
-manual metadata migration remain operational acceptance work.
-
-Agent activation, connection, the post-connect session recheck and HTTP Upgrade
-share the original Orbit admission deadline; the recheck cannot add its separate
-account I/O timeout to the budget. The same session watcher remains active across
-these stages, with route cancellation watched once the backend stream exists.
-Admission expiry returns 504 and does not limit an established WebSocket's lifetime.
-
-Missing/invalid/revoked sessions return 401. Before Upgrade, session invalidation
-returns 401 and route
-revocation returns `502 ROUTE_REVOKED`; backend admission failure returns
-`502 AGENT_SERVER_UNAVAILABLE` and deadline expiry returns 504. After Upgrade,
-session invalidation or route revocation closes the shared forwarding stream.
-Account expiry/revocation checks use the existing session guard (at most a
-30-second polling interval for revocation).
-
-### Foreground connector identity
-
-`DigitalMateGatewayApi::foreground_admission()` exposes an account-session
-admission handle for foreground connector callers. Its `authenticate(&HeaderMap)`
-returns `ForegroundIdentity` with `tenant()`, `user_id()`, `workspace()` and
-`binding_scope()` getters. `check().await` rechecks the actual account/session
-owner before subsequent operations. Neither type accepts JSON identity fields.
-
-Admission uses only the configured `digitalmate` application, the existing
-business bearer/session checks and the existing workspace derivation. An existing
-Binding must be active and have the same workspace. Missing DigitalMate config
-does not fall back to Jiuwen or Orbit. The call reads Binding metadata without
-initializing a Binding/Environment or requesting model credentials. It supplies
-no background, arbitrary-tool or model permission; connector handlers retain
-their own operation and connection checks.
-
-On Unix, `DigitalMateGatewayApi::authorization_owner()` exposes the fixed M44
-authorization-owner issuer when the existing privacy HTTPS service is configured
-for the DigitalMate template. `foreground_headers(&ForegroundIdentity,
-OwnerOperation, raw_body)` rechecks the actual business session and current
-Binding. `connector_workload_identity(&HeaderMap)` instead verifies the existing
-privacy workload grant (or bounded delivery bootstrap), independently of phone sessions. Its
-`workload_headers(&ConnectorWorkloadIdentity, OwnerOperation, raw_body)` permits
-only `connection`, `metadata`, `intent` and `read` owner queries; actual connection permission,
-enabled intent and connection generation/revision remain the caller's checks.
-
-The `read` operation authenticates a query for current read proof. Its consumer
-must call the real M44 task/consent owner; issuer tests do not implement or
-validate that permission adapter. It binds the caller and exact owner request,
-without granting provider mail reads. Foreground permission must come from the actual running
-task/execution epoch, sources and account consent, bound to the exact mail request
-digest and connection generation/revision. Gateway callers must recheck that proof
-before and after physical reads, including after budget waits. Background reads
-still require actual enabled intent/revision. JSON task IDs or modes and the
-connector namespace alone do not establish permission. The existing v1 purpose,
-signer, logical admission and 30-second limit remain unchanged.
-
-Both issuers reuse the existing signer and grant/session owners. A credential
-expires within 30 seconds and fixes the actor, operation, SHA-256 of the raw HTTP
-entity bytes, scope, workspace and Binding generation. Environment identity and
-service port are absent from both signed owner claims and public owner proofs.
-The identity owner retains the original operation in `OwnerAuthorization`.
-The caller selects and connects using its logical Scope and configured selector,
-then refreshes that same authorization after readiness before sending its headers
-to `POST /internal/digitalmate/connectors/v1/authorization-owner`. A sent owner
-write is never retried on another route. The existing HTTPS listener verifies it at
-`POST /v1/connector/authorization-owner` with JSON
-`{"operation":"current","body_sha256":"<lowercase SHA-256 hex>"}` and rechecks
-the current session/grant and Binding before returning the verified fields.
-This purpose cannot decrypt privacy settings or authorize provider mail reads.
-Malformed requests return the existing account error envelope; invalid or revoked
-credentials fail closed, and unavailable identity owners return service unavailable.
-
-`/v1/connector/identity` reports `renewable`, `recovery_expires_at` and
-`bootstrap_until`, derived from verified claims and the current grant/Binding.
-The shared `/v1/identity/renew` response remains exactly `token` and `expires_at`.
-The retired normal connector credential and `/v1/connector/renew` are rejected;
-paired Gateway/consumer cutover is required. Ordinary privacy workload
-credentials report `renewable: true` and `bootstrap_until: null`;
-their recovery deadline is that credential's signed window, subject to the
-existing server-side renewal and revocation policy. Delivery-derived credentials
-report `renewable: false` with both deadlines equal to access expiry, and renewal
-is refused. Consumers must verify these responses through the actual authority;
-client-side token decoding or a local file is not an authorization fact.
-
-The existing identity HTTPS listener also accepts `POST /v1/ingestion/bootstrap`
-with a valid delivery bearer and exactly `{}`. It rechecks the persisted current
-batch, enabled subscription, existing grant and complete current Binding. The
-response contains only `purpose: "ingestion.connector-bootstrap"`, `target`
-(tenant, user, workspace, template/ref, Binding ID/generation: seven logical
-fields), `connector_token` and `expires_at`. The target must match the
-configured DigitalMate application and the persisted batch's original authority.
-Binding generation is resolved privately by the identity owner; receiver port is
-separate trusted startup configuration, never a batch identity field.
-
-The connector token reuses that grant and signing root, expires no later than the
-delivery credential, and has a signed bootstrap deadline. It cannot renew, obtain
-a privacy bearer, decrypt settings or grant task/model execution permission.
-An expired consumer must bootstrap again with a still-current delivery credential.
-Bootstrap must occur before delivery is acknowledged and completed: only a ready
-persisted batch is admitted. This exchange alone does not provide durable mail-read
-recovery after receipt when the process or short-lived credential is lost.
-Connection intent, generation/revision and `read_history` must still be checked
-by their actual owners on each receiver/read operation. Missing owner runtime
-configuration returns service unavailable; no scope is accepted from JSON.
-
-### Existing Jiuwen protocol and accounts
-
-Build with `--features agent-api`. Configure `ADX_JIUWEN_CONFIG` using
-[jiuwen.json](examples/jiuwen.json), and `ADX_ACCOUNT_CONFIG` using
-[accounts.json](examples/accounts.json). Both standalone and embedded Ingress
-require Agent configuration and `ADX_ENVIRONMENT_FILES_CONFIG` as described above. Fixed-user `local_fixed` mode
-has been removed; Jiuwen requires business session tokens independently of the
-listener transport. It neither checks TLS state nor trusts `X-Forwarded-Proto`
-for authorization. Both HTTP and HTTPS listeners use the same business checks.
-Origin is not checked.
-
-For TLS termination at an external load balancer, bind the existing HTTP listener
-with `ADX_DATA_PLANE_INGRESS_PLAIN_BIND=0.0.0.0:8080`, route the business Service
-port 80 to port 8080 using HTTP, and retain HTTPS/WSS at the public listener.
-Restrict the HTTP port to the deployment's internal network and configure public
-domains and paths at the load balancer. This does not change native/Agent TLS-only management routes or Ingress-to-Node
-mTLS; the explicit E2B HTTP opt-in is documented separately below.
-
-`POST /api/v1/auth/huawei/login` exchanges an Account Kit authorization code and returns
-an opaque business token. `POST /api/v1/auth/agc/login` accepts
-`{"agcAccessToken":"...","agreementVersion":"1"}` and exchanges a current AGC Auth
-user access token for the same kind of business session. First registration through
-either provider requires `agreementVersion`; clients never submit an external UID,
-phone number, ADX user ID, tenant, or project.
-
-When `privacy.model_config_name` is enabled, both login endpoints register the
-current account model configuration after authentication and before returning the
-business token. Authentication and registration share the 45-second login deadline.
-Registration failures do not return a successful login or token; Gateway attempts
-to revoke the newly created, undisclosed business session within five seconds.
-A timed-out registration may have committed; a new login retries idempotently.
-WebSocket connections, reconnects and session checks do not register model
-configuration. New Binding initialization continues to supply `model_api_key`,
-`model_api_base` and `workspace` even when login registration is enabled; existing
-Bindings skip that lazy initialization on reconnect. Keep the old injection template
-until operations have backfilled and verified all required existing users, then switch
-to a new template that reads configuration. Model names do not impose separate read/write
-permissions: scoped privacy HTTP transactions can update them like other secrets.
-DigitalMate still loads the configuration only on its first identity initialization;
-this does not implement live key rotation. See the
-[privacy configuration contract](../docs/deployment/digitalmate-privacy.md#可选模型配置注册).
-
-AGC verification is enabled by the optional `accounts.agc` block. The checked-in example
-uses the Jiuwen CN project and reads the API client secret from
-`ADX_AGC_API_CLIENT_SECRET`. `api_client_id` and that secret are server REST credentials,
-not a user token. Ingress obtains a short-lived service credential from the fixed CN AGC
-endpoint and calls the official `verify-token` API for every login, so revoked user tokens
-are not accepted. It also requires the returned `productId` and the remotely verified JWT
-`iss`, `aud`, `sub`, and `exp` to agree with the configured project and UID. The JWT
-`agc.sign_in_provider` value is not used as an account-type decision because it is not the
-client SDK's anonymous-account flag. Invalid, expired, revoked, and wrong-project credentials
-return `401 INVALID_AGC_ACCESS_TOKEN`; AGC/API-client/network failures return
-`503 AUTH_UNAVAILABLE`. The service credential is cached until shortly before expiry;
-user access tokens and verification results are not cached. Each failed verification emits one
-sanitized warning with its stage, failure reason, and available upstream HTTP status/return code;
-the user token, UID, profile data, and credentials are never logged.
-
-The actual Ingress route includes the version prefix:
-`/api/v1/auth/agc/login`. With a public `authBaseUrl` ending in `/api/v1`, the client
-appends `/auth/agc/login`. There is no separate unversioned `/auth/agc/login` route in
-the current Gateway implementation.
-
-`POST /api/v1/auth/logout` revokes that session only. `GET /api/v1/auth/quota`
-requires the business Bearer token and returns the same quota payload as
-Jiuwenswarm: `{"ok":true,"available":true,"quota":{"total":30,"balance":22.5,
-"used":7.5,"low_balance":false,"exhausted":false,"reset_period":"",
-"reset_at":""}}`. `litellm.points_per_budget_unit` scales LiteLLM key
-`max_budget`, `spend`, and their remaining balance into displayed points. It
-defaults to `1.0` and must be finite and positive. With the [account example](examples/accounts.json),
-`max_budget: 15.0` and `points_per_budget_unit: 2.0`, a LiteLLM budget of 15
-displays as 30 points; spending 3.75 displays 7.5 used and 22.5 remaining.
-Remaining points are clamped to zero: spending 20 against a budget of 15
-displays 40 used and zero remaining, with `exhausted: true`.
-When model prices use RMB, this means one point represents RMB 0.50. This
-conversion does not change LiteLLM prices, spend, key budgets, rate limits,
-or reset schedules. Missing total or used values remain `-1`; when either
-is unknown, remaining points are zero without marking the budget exhausted.
-Unrepresentable converted
-amounts return `503 AUTH_UNAVAILABLE`. Low-balance and exhaustion flags retain
-their budget semantics. Concurrent model calls may overshoot the budget.
-The multiplier is read at Ingress startup; restarting with a new value changes
-subsequent quota responses for both new and existing keys.
-`budget_duration: null` gives a one-time key budget;
-a configured duration enables resets. Existing keys retain their LiteLLM
-budget policy; changes to `max_budget` and `budget_duration` apply to newly issued keys. The query
-creates or reconciles the user's persisted key if needed, without creating a Sandbox. It does not
-accept query parameters and returns `Cache-Control: no-store`.
-`/ws`, `GET/HEAD
-/file-api/download?token=...`, and `POST /file-api/upload` require
-`Authorization: Bearer <business token>`.
-User identity comes only from the session. On `/ws`, the optional `user_id`
-query parameter is ignored, including empty or repeated values; it cannot select
-another user or binding. Other query parameters and query strings over 1024 bytes
-return `400 INVALID_QUERY`. Download retains its own file-token validation.
-Upload accepts `multipart/form-data` with one or more `file` parts, optional
-`dir`, `session_id`, `user_id`, and `agent_type` fields, and at most 64 MiB
-of total request body (up to 20 files). The optional upload query parameter
-`token` is ignored; it does not authorize the request or select the target.
-`session_id` is accepted for client compatibility but does not change the
-selected binding. The `user_id` field and `X-User-Id` header, if present, must match the
-authenticated user. Upload paths are relative to the immutable template's
-`JIUWENSWARM_WORKSPACE` and written to that user's bound Environment through
-Relay and Execd. The response has Jiuwen's
-`{"ok":true,"files":[{"filename":"...","path":"...","mime_type":"...","size_bytes":0}],"errors":[]}`
-shape. Upload does not open another AgentServer WS connection.
-ADX management and service credentials
-remain separate. Use a Jiuwen hostname outside the direct-port host domain.
-
-Accounts, hashed sessions and encrypted per-user LiteLLM credentials use a shared
-PostgreSQL schema without tenant columns. Apply [schema.sql](src/ingress/accounts/schema.sql)
-for a fresh database.
-The schema version remains 1. Runtime SQL has no old-column detection or fallback.
-The gateway's unchanged configured tenant is only a fixed identity namespace for
-Agent scopes, workspace hashes, LiteLLM owners and encrypted-key associated data.
-Keep that value and the credential encryption key unchanged to reuse existing data.
-
-The first WS for a missing binding, or a quota query, provisions/reconciles
-an account model key. The shared activation path obtains ordinary rendering parameters
-from the business adapter only for a missing Binding. Jiuwen supplies `workspace`,
-`model_api_key` and `model_api_base`; its Template declares `API_KEY: "${model_api_key}"`
-and `API_BASE: "${model_api_base}"`. Activator renders the Template using persisted
-parameters instead of overlaying a second private launch configuration. Parameters are
-currently plaintext metadata; future application encryption belongs to the business
-Gateway and AgentServer. Warm access does not fetch new model credentials. Model names
-and `JIUWEN_PLATFORM_MODELS` remain deployment Template values, interpreted by the image.
-
-User keys are created with `models: ["all-proxy-models"]`, covering current and
-future LiteLLM proxy models. Initializing a Binding or querying quota also reconciles
-an existing owner's key through `/key/update`, changing only model access and the display alias. Key
-identity, spend, budget and rate limits remain unchanged. Ownership mismatch or a
-blocked key is rejected before an update; failed or lost responses are retried with
-the same key. Warm binding access does not call LiteLLM management: existing warm
-users acquire expanded access on a quota query, new Binding initialization, or an
-explicit reconciliation. The template's list controls the models shown
-in Jiuwen, not the LiteLLM key's authorization boundary.
-
-Huawei login reads the optional `display_name` from the verified ID token when
-the authorization includes `profile`. The nickname is persisted and refreshed on
-login; an absent or invalid nickname does not erase an existing one. Client-supplied
-nicknames are not accepted. Key aliases use `huawei-<nickname>-<first 8 user-ID chars>`
-with a bounded, sanitized nickname, or `huawei-<first 8 user-ID chars>` when unavailable.
-AGC accounts currently do not import a display name and use
-`agc-<first 8 user-ID chars>`.
-Quota queries and new-binding preparation synchronize aliases for existing keys,
-including requests with older valid sessions. Historical users need a new Huawei
-login to populate a nickname that was never stored. Alias changes alone do not
-change LiteLLM's native client error text; that requires a LiteLLM error callback.
-
-Downloads resolve existing bindings without provisioning keys or creating Environments.
-
-WS authenticates before upgrade and checks sessions every 30 seconds while connected;
-messages do not query the account database. Logout immediately rejects new connections,
-while existing WS connections close on their next periodic check or absolute expiry.
-Download streams also stop on expiry/revocation. Multiple independent WS connections may
-use the same binding; business concurrency is owned by AgentServer.
-Platform-wide target connection limits remain deferred, as does
-Execd's path/open race. Ordinary and verified download token/registry checks remain.
-
-At the normal INFO filter, Jiuwen WebSocket logs include `connection_id`, client/
-backend request mapping, response parse/projection errors, terminal handling and
-socket-write results. The select winner and safe error category are logged before
-connection cleanup; backend EOF/close records include the last response's request
-ID, sequence and final flag. These diagnostics do not change forwarding or close
-behavior and do not print message bodies, tool arguments, credentials or peer
-close reasons. A completed socket write is not a peer delivery acknowledgement.
-
-The two authentication boundaries, client requirements and verification limits are documented in the
-[Jiuwen gateway design](../docs/development/jiuwenswarm-adx-gateway-design.md).
-
-
 ### Network policy for embedded template sandboxes
 
 Both Activator deployment modes read platform ACL from `egress_isolation`. Put the
@@ -1037,32 +542,6 @@ shared settings under `embedded` in `ADX_AGENT_CONFIG` for embedded deployment o
 at the root of `ADX_ACTIVATOR_CONFIG` for standalone deployment. Both combine
 platform policy and template egress rules in the Environment create request. See the
 [Activator network configuration](../agent/activator/README.md#模板沙箱网络隔离).
-
-### Jiuwen persistent workspace parameters
-
-Jiuwen prepares each new AgentBinding with `parameters.workspace = "w-" + SHA256(JSON([tenant, template, user_id]))`, using the authenticated internal user ID and the full hexadecimal digest. The directory identity excludes template version, agent_type, Binding generation and Sandbox ID. Activator receives a generic parameter map; it does not receive a new user/owner identity. Existing Bindings reuse their stored parameters.
-
-Use the [Jiuwen SFS template example](../agent/activator/examples/jiuwen-sfs-template.json) to render a node-visible Local source into `/home/jiuwen`. Different template versions can refer to the same directory, but this mapping does not enforce exclusive access. Until workspace admission is implemented, the caller must stop the previous Sandbox completely before starting another with the same directory. The source directories must already exist; this code does not provision storage or migrate existing user data.
-
-`jiuwen.workspace_identity` in `ADX_JIUWEN_CONFIG` defaults to `scoped` (the existing tenant/template/user
-hash). AgentOS deployments can explicitly set `user` to reuse
-`/home/agentos/users/${workspace}` in a template. In this mode an authenticated user
-must be a safe single directory component; template/version/agent type changes
-keep the same user directory while each binding retains its execution identity.
-Configure a tenant-specific mount root when user IDs are not globally unique.
-
-
-`GET /api/v1/auth/session` requires a valid business Bearer session and returns
-its `userId` without starting an Environment. It follows DigitalMateGateway's
-business authentication; management API keys remain separate from business sessions.
-
-An authenticated DigitalMate WebSocket supplies the account registration time
-from account storage to Activator's product start selection. User HTTP or
-WebSocket input cannot choose the registration time or a snapshot. When named
-Privacy model configuration is configured for this entry, DigitalMate reads
-its own model credentials through Privacy; the gateway does not copy model
-keys into the Binding initializer. Fixed Golden enablement remains an explicit,
-tenant-scoped Agent management action.
 
 命令状态订阅 `/api/environment/v1/commands/watch` 在已配置 Execd access 时，会在后端 WebSocket 握手前检查 Environment 归属并注入服务端 Execd 令牌；调用方的业务凭据不会转发给 Execd。该认证与 `/direct` HTTP 路径共用同一配置。
 

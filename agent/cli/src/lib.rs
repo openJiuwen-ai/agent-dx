@@ -371,7 +371,7 @@ pub async fn execute(command: &Command, config: &Configuration) -> Result<Comman
     let mut request = config
         .client()?
         .request(method, url)
-        .bearer_auth(config.token());
+        .header("x-adx-auth", config.token());
     if let Some(body) = body {
         request = request.json(&body);
     }

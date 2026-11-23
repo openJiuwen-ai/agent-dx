@@ -68,6 +68,8 @@ The installer verifies the manifest, file digests, and host architecture. It ins
 
 ## 🔧 Quick start
 
+[Build a minimal HTTP and WebSocket business gateway](gateway/examples/business-gateway/README.md)
+
 The default `standalone` profile starts managed Redis, Coordinator, adxlet with embedded Relay, and API Server with embedded Ingress on one host. Prepare sandboxd, networking, certificates, and the initial administrator key first.
 
 ```sh

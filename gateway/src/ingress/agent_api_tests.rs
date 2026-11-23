@@ -185,7 +185,7 @@ fn request(
         .method(method)
         .uri(path)
         .header("x-trace-id", trace)
-        .header("authorization", format!("Bearer {token}"));
+        .header("x-adx-auth", token);
     builder
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap()
@@ -514,7 +514,7 @@ async fn managed_binding_management_and_protocol_forwarding() {
     let mut traffic = Request::builder()
         .uri("/agent/http/path?target=urn:adx:template:demo:1&port=8080")
         .header("x-adx-binding-id", "env")
-        .header("authorization", "Bearer tenant")
+        .header("x-adx-auth", "tenant")
         .body(())
         .unwrap();
     gateway
@@ -568,61 +568,13 @@ async fn managed_binding_management_and_protocol_forwarding() {
         json(response).await;
     }
     let id = binding["current"]["environment_id"].as_str().unwrap();
-    let response = sender
-        .send_request(request(
-            "POST",
-            &format!("{path}/resolve"),
-            "tenant",
-            "ssh",
-            serde_json::json!({"protocol":"ssh"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let resolved = json(response).await;
-    assert_eq!(resolved["environment_id"], id);
-    assert_eq!(resolved["port"], 22);
-    assert_eq!(
-        backend.1.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "default resolve reuses successful activation"
-    );
-    let response = sender
-        .send_request(request(
-            "POST",
-            &format!("{path}/resolve"),
-            "tenant",
-            "refresh",
-            serde_json::json!({"protocol":"http", "bypasscache":true}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json(response).await["environment_id"], id);
-    assert_eq!(
-        backend.1.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "public bypasscache reaches Environment GET"
-    );
-    let response = sender
-        .send_request(request(
-            "POST",
-            &format!("{path}/resolve"),
-            "tenant",
-            "invalid-refresh",
-            serde_json::json!({"protocol":"http", "bypasscache":"true"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    json(response).await;
     for protocol in ["http", "ws"] {
         let mut builder = Request::builder()
             .uri(format!(
-                "/agent/{protocol}/path?target=urn:adx:template:demo:1&port=8080&q=1"
+                "https://gateway.example/agent/{protocol}/path?target=urn:adx:template:demo:1&port=8080&q=1"
             ))
             .header("x-adx-binding-id", "env")
-            .header("authorization", "Bearer tenant");
+            .header("x-adx-auth", "tenant");
         if protocol == "ws" {
             builder = builder.header("upgrade", "websocket");
         }
@@ -631,9 +583,13 @@ async fn managed_binding_management_and_protocol_forwarding() {
             .prepare_agent_data(&mut data, IngressSecurity::Tls)
             .await
             .unwrap();
-        assert_eq!(data.uri().to_string(), format!("/{id}/8080/path?q=1"));
+        assert_eq!(
+            data.uri().to_string(),
+            format!("https://gateway.example/{id}/8080/path?q=1")
+        );
         let before = backend.1.load(std::sync::atomic::Ordering::SeqCst);
         assert!(api.retry_data(&mut data).await.unwrap());
+        assert_eq!(data.uri().authority().unwrap().as_str(), "gateway.example");
         assert_eq!(
             backend.1.load(std::sync::atomic::Ordering::SeqCst),
             before + 1,
@@ -644,7 +600,7 @@ async fn managed_binding_management_and_protocol_forwarding() {
     let mut pending = Request::builder()
         .uri("/agent/http/path?target=urn:adx:template:demo:1&port=8080")
         .header("x-adx-binding-id", "env")
-        .header("authorization", "Bearer tenant")
+        .header("x-adx-auth", "tenant")
         .body(())
         .unwrap();
     gateway
@@ -818,7 +774,7 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
     let mut request = Request::builder()
         .uri("/agent/http/?target=urn:adx:template:test:1&port=8080")
         .header("x-adx-binding-id", "env")
-        .header("authorization", "Bearer tenant")
+        .header("x-adx-auth", "tenant")
         .body(())
         .unwrap();
     gateway
@@ -838,7 +794,7 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
     let mut wrong = Request::builder()
         .uri("/agent/http/?target=urn:adx:template:test:1&port=8080")
         .header("x-adx-binding-id", "env")
-        .header("authorization", "Bearer other")
+        .header("x-adx-auth", "other")
         .body(())
         .unwrap();
     let error = gateway
@@ -888,9 +844,21 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
         request_timeout: adx_agent_core::limits::AGENT_REQUEST_TIMEOUT,
     });
     let gateway = Arc::try_unwrap(gateway).ok().unwrap().with_agent_api(api);
+    for keys in [vec![], vec!["tenant", "tenant"]] {
+        let mut request = Request::get("/agent/http?target=urn:adx:template:demo:1")
+            .header("authorization", "Bearer tenant");
+        for key in keys {
+            request = request.header("x-adx-auth", key);
+        }
+        let mut request = request.body(()).unwrap();
+        assert!(gateway
+            .prepare_agent_data(&mut request, IngressSecurity::Tls)
+            .await
+            .is_err());
+    }
     let mut managed = Request::builder()
         .uri("/agent/http/chat?target=urn:adx:template:demo:1&q=one")
-        .header("authorization", "Bearer tenant")
+        .header("x-adx-auth", "tenant")
         .body(())
         .unwrap();
     gateway
@@ -914,11 +882,6 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
         )
     );
     for (path, token, status) in [
-        (
-            "/agent/http?instance=x&target=urn:adx:template:demo:1",
-            "tenant",
-            StatusCode::BAD_REQUEST,
-        ),
         ("/agent/http?instance=x", "tenant", StatusCode::BAD_REQUEST),
         (
             "/agent/http?target=urn:adx:template:demo:1",
@@ -928,7 +891,7 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
     ] {
         let mut req = Request::builder()
             .uri(path)
-            .header("authorization", format!("Bearer {token}"))
+            .header("x-adx-auth", token)
             .body(())
             .unwrap();
         assert_eq!(
@@ -945,7 +908,7 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
         .send_request(
             Request::builder()
                 .uri("/agent/http?target=urn:adx:template:demo:1")
-                .header("authorization", "Bearer tenant")
+                .header("x-adx-auth", "tenant")
                 .body(Full::new(Bytes::new()))
                 .unwrap(),
         )
@@ -971,10 +934,20 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
 async fn unified_access_forwards_payloads_and_returns_binding_headers() {
     use crate::{common::protocol::GatewayPolicy, node::Relay};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    // Reserve a different port without listening so pooled HTTP connections cannot serve it.
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    let start_backend = Arc::new(tokio::sync::Notify::new());
+    let start = start_backend.clone();
     let (seen_tx, mut seen) = mpsc::unbounded_channel();
     let backend_task = tokio::spawn(async move {
+        start.notified().await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let listener = socket.listen(16).unwrap();
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let seen_tx = seen_tx.clone();
@@ -1045,7 +1018,7 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
     };
     let (gateway, _, routes) = fixture_with_routes().await;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":port},{"protocol":"ws","port":port}]})).unwrap();
+    let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":port},{"protocol":"ws","port":port},{"protocol":"http","port":closed_port},{"protocol":"ws","port":closed_port}]})).unwrap();
     state
         .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
         .await
@@ -1090,16 +1063,19 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         vec![StaticRoute::Prefix("/api".into())],
     ));
     for (gateway, selector, binding_headers) in [
-        (gateway, "target=urn:adx:template:demo:1", true),
+        (gateway.clone(), "target=urn:adx:template:demo:1", true),
         (fixed, "target=urn:adx:instance:api", false),
     ] {
         let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
         let mut req = Request::builder()
             .method("POST")
-            .uri(format!("/agent/http/chat?{selector}&port={port}&q=a&q=b"))
+            .uri(format!(
+                "/agent/http/chat?{selector}&port={port}&instance=app&token=t%2fu&q=a%20b&q&flag"
+            ))
             .header("host", "public.example")
             .header("x-business", "keep")
-            .header("authorization", "Bearer tenant")
+            .header("x-adx-auth", "tenant")
+            .header("authorization", "Bearer sandbox-business")
             .header("x-adx-parameters", "%malformed");
         if binding_headers {
             req = req.header("x-adx-binding-id", "user%3Aa%2F%E4%B8%AD%E6%96%87%252F");
@@ -1107,6 +1083,9 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         let req = req
             .body(Full::new(Bytes::from_static(b"business-body")))
             .unwrap();
+        if binding_headers {
+            start_backend.notify_one();
+        }
         let response = sender.send_request(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(response.headers()["x-business"], "kept");
@@ -1122,10 +1101,11 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
             Bytes::from_static(b"business-result")
         );
         let (uri, headers) = seen.recv().await.unwrap();
-        assert_eq!(uri, "/chat?q=a&q=b");
+        assert_eq!(uri, "/chat?instance=app&token=t%2fu&q=a%20b&q&flag");
         assert_eq!(headers["host"], "public.example");
         assert_eq!(headers["x-business"], "keep");
-        assert!(!headers.contains_key("authorization"));
+        assert_eq!(headers["authorization"], "Bearer sandbox-business");
+        assert!(!headers.contains_key("x-adx-auth"));
         assert!(!headers.contains_key("x-adx-parameters"));
         assert!(!headers.contains_key("x-adx-binding-id"));
         client.abort();
@@ -1133,13 +1113,17 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
 
         let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
         let mut req = Request::builder()
-            .uri(format!("/agent/ws?{selector}&port={port}"))
+            .uri(format!(
+                "/agent/ws?{selector}&port={port}&instance=app&token=t%2fu&room=1"
+            ))
             .header("host", "public.example")
             .header("connection", "upgrade")
             .header("upgrade", "websocket")
             .header("sec-websocket-protocol", "chat");
         {
-            req = req.header("authorization", "Bearer tenant");
+            req = req
+                .header("x-adx-auth", "tenant")
+                .header("authorization", "Bearer sandbox-business");
         }
         if binding_headers {
             req = req.header("x-adx-binding-id", "user%3Aa%2F%E4%B8%AD%E6%96%87%252F");
@@ -1161,8 +1145,10 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         upgraded.read_exact(&mut echoed).await.unwrap();
         assert_eq!(&echoed, b"\x82\x03abc");
         let (uri, headers) = seen.recv().await.unwrap();
-        assert_eq!(uri, "/");
+        assert_eq!(uri, "/?instance=app&token=t%2fu&room=1");
         assert_eq!(headers["sec-websocket-protocol"], "chat");
+        assert_eq!(headers["authorization"], "Bearer sandbox-business");
+        assert!(!headers.contains_key("x-adx-auth"));
         assert!(!headers.contains_key("x-adx-binding-id"));
         client.abort();
         server.abort();
@@ -1193,6 +1179,30 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         }
     }
     backend_task.abort();
+    for protocol in ["http", "ws"] {
+        let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
+        let mut request = Request::builder()
+            .uri(format!(
+                "/agent/{protocol}?target=urn:adx:template:demo:1&port={closed_port}"
+            ))
+            .header("x-adx-auth", "tenant")
+            .header("x-adx-binding-id", "user%3Aa%2F%E4%B8%AD%E6%96%87%252F");
+        if protocol == "ws" {
+            request = request
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket");
+        }
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sender.send_request(request.body(Full::new(Bytes::new())).unwrap()),
+        )
+        .await
+        .expect("a warm service with a closed port must fail promptly")
+        .unwrap();
+        assert!(response.status().is_server_error());
+        client.abort();
+        server.abort();
+    }
     node_task.abort();
 }
 
@@ -1478,591 +1488,6 @@ async fn shared_service_access_retries_only_unsent_generation_and_checks_tenant(
     ));
 }
 
-#[cfg(feature = "mock-e2e")]
-#[tokio::test]
-async fn jiuwen_cold_start_waits_for_backend_listener_before_ws_handshake() {
-    use crate::ingress::{
-        agent_service::ServiceSelector, digitalmategateway::connection::Connection,
-    };
-    use crate::{common::protocol::GatewayPolicy, node::Relay};
-    use adx_agent_api::request::RequestContext;
-    use adx_agent_core::{Protocol, Scope};
-    use std::time::Duration;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let node = Arc::new(
-        Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
-            .parse()
-            .unwrap()]))
-        .with_route_enforcement(),
-    );
-    let node_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = node_listener.local_addr().unwrap();
-    let node_task = {
-        let node = node.clone();
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = node_listener.accept().await.unwrap();
-                let node = node.clone();
-                tokio::spawn(async move {
-                    let _ = node.serve_h2(stream).await;
-                });
-            }
-        })
-    };
-    let (gateway, _, routes) = fixture_with_routes().await;
-    let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":port}]})).unwrap();
-    state
-        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
-        .await
-        .unwrap();
-    let scope = Scope {
-        tenant: "tenant".into(),
-        template: "demo".into(),
-        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
-        binding_id: "jiuwen".into(),
-    };
-    let binding = state.create_binding(scope.clone()).await.unwrap();
-    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":binding.current.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-jiuwen","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
-    node.activate_route(
-        route.instance_id.clone(),
-        route.environment_id.clone(),
-        route.environment_ip.parse().unwrap(),
-    )
-    .await;
-    routes.put(route.clone());
-    let reconcile = tokio::spawn(gateway.clone().run_route_reconciler(routes.subscribe()));
-    let access = super::super::agent_service::AgentV2Access::new(Arc::new(
-        adx_agent_api::managed::ManagedService::new(Arc::new(
-            remote_control(adx_activator::Activator::new(
-                state,
-                Arc::new(Backend::default()),
-            ))
-            .await,
-        )),
-    ));
-    let selector = ServiceSelector {
-        protocol: Protocol::Ws,
-        port: None,
-    };
-    let selection = access
-        .select(
-            Arc::new(RequestContext::new(Duration::from_secs(3))),
-            scope.clone(),
-            selector,
-        )
-        .await
-        .unwrap();
-    let connecting = {
-        let access = access.clone();
-        let gateway = gateway.clone();
-        tokio::spawn(async move { Connection::connect(&gateway, &access, selection).await })
-    };
-    tokio::time::sleep(Duration::from_millis(350)).await;
-    assert!(
-        !connecting.is_finished(),
-        "a refused cold-start port must wait within the admission deadline"
-    );
-    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    let backend = tokio_tungstenite::accept_async(stream).await.unwrap();
-    let connection = connecting.await.unwrap().unwrap();
-    drop(connection);
-    drop(backend);
-    drop(listener);
-    let selection = access
-        .select(
-            Arc::new(RequestContext::new(Duration::from_millis(150))),
-            scope,
-            selector,
-        )
-        .await
-        .unwrap();
-    let started = tokio::time::Instant::now();
-    let result = tokio::time::timeout(
-        Duration::from_secs(1),
-        Connection::connect(&gateway, &access, selection),
-    )
-    .await
-    .expect("refused port must not outlive the admission deadline");
-    assert!(result.is_err());
-    assert!(started.elapsed() >= Duration::from_millis(100));
-    reconcile.abort();
-    node_task.abort();
-}
-
-#[cfg(feature = "mock-e2e")]
-#[tokio::test]
-async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() {
-    use crate::ingress::{
-        agent_service::ServiceSelector,
-        digitalmategateway::{
-            connection::{Connection, ConnectionError},
-            driver::DriverConfig,
-            session::SessionLimits,
-        },
-    };
-    use crate::{common::protocol::GatewayPolicy, node::Relay};
-    use adx_agent_api::request::RequestContext;
-    use adx_agent_core::{Protocol, Scope};
-    use futures_util::{SinkExt, StreamExt};
-    use std::time::Duration;
-    use tokio_tungstenite::tungstenite::Message;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let node = Arc::new(
-        Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
-            .parse()
-            .unwrap()]))
-        .with_route_enforcement(),
-    );
-    let node_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = node_listener.local_addr().unwrap();
-    let node_task = {
-        let node = node.clone();
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = node_listener.accept().await.unwrap();
-                let node = node.clone();
-                tokio::spawn(async move {
-                    let _ = node.serve_h2(stream).await;
-                });
-            }
-        })
-    };
-    let (gateway, _, routes) = fixture_with_routes().await;
-    let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":port}]})).unwrap();
-    state
-        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
-        .await
-        .unwrap();
-    let scope = Scope {
-        tenant: "tenant".into(),
-        template: "demo".into(),
-        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
-        binding_id: "jiuwen".into(),
-    };
-    let binding = state.create_binding(scope.clone()).await.unwrap();
-    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":binding.current.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-jiuwen","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
-    node.activate_route(
-        route.instance_id.clone(),
-        route.environment_id.clone(),
-        route.environment_ip.parse().unwrap(),
-    )
-    .await;
-    routes.put(route.clone());
-    let reconcile = tokio::spawn(gateway.clone().run_route_reconciler(routes.subscribe()));
-    let access = super::super::agent_service::AgentV2Access::new(Arc::new(
-        adx_agent_api::managed::ManagedService::new(Arc::new(
-            remote_control(adx_activator::Activator::new(
-                state,
-                Arc::new(Backend::default()),
-            ))
-            .await,
-        )),
-    ));
-    let selector = ServiceSelector {
-        protocol: Protocol::Ws,
-        port: None,
-    };
-    let selection = access
-        .select(
-            Arc::new(RequestContext::new(Duration::from_secs(3))),
-            scope.clone(),
-            selector,
-        )
-        .await
-        .unwrap();
-    let duplicate = selection.clone();
-    let connecting = {
-        let access = access.clone();
-        let gateway = gateway.clone();
-        tokio::spawn(async move { Connection::connect(&gateway, &access, selection).await })
-    };
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    // A second frontend can finish its handshake while the first is pending.
-    let second_connecting = {
-        let access = access.clone();
-        let gateway = gateway.clone();
-        let selection = duplicate.clone();
-        tokio::spawn(async move { Connection::connect(&gateway, &access, selection).await })
-    };
-    let (second_stream, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
-        .await
-        .expect("same binding must admit a second backend stream")
-        .unwrap();
-    let mut second_backend = tokio_tungstenite::accept_async(second_stream)
-        .await
-        .unwrap();
-    let second_connection = second_connecting.await.unwrap().unwrap();
-    // tungstenite's Callback API requires an unboxed HTTP error response.
-    #[allow(clippy::result_large_err)]
-    let inspect_handshake =
-        |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
-            assert_eq!(request.uri().path(), "/");
-            assert!(request.headers().get("authorization").is_none());
-            assert!(request.headers().get("x-auth").is_none());
-            assert_eq!(
-                request.headers()["origin"],
-                format!("http://127.0.0.1:{port}")
-            );
-            Ok(response)
-        };
-    let mut backend = tokio_tungstenite::accept_hdr_async(stream, inspect_handshake)
-        .await
-        .unwrap();
-    let connection = connecting.await.unwrap().unwrap();
-    let (send, requests) = mpsc::channel(2);
-    let (output, mut frames) = mpsc::channel(4);
-    let running = tokio::spawn(connection.run(
-        "user".into(),
-        DriverConfig {
-            limits: SessionLimits {
-                pending: 4,
-                recent: 4,
-                busy: 4,
-            },
-            write_timeout: Duration::from_secs(1),
-            output_queue_timeout: Duration::from_secs(1),
-            idle_timeout: Duration::from_secs(5),
-            ping_interval: Duration::from_secs(1),
-            request_timeout: Duration::from_secs(1),
-        },
-        requests,
-        output,
-    ));
-    backend.send(Message::Text(serde_json::json!({"type":"event","event":"connection.ack","payload":{"readiness":"WARMING"}}).to_string())).await.unwrap();
-    assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
-    let (second_send, second_requests) = mpsc::channel(2);
-    let (second_output, mut second_frames) = mpsc::channel(4);
-    let second_running = tokio::spawn(second_connection.run(
-        "user".into(),
-        DriverConfig {
-            limits: SessionLimits {
-                pending: 4,
-                recent: 4,
-                busy: 4,
-            },
-            write_timeout: Duration::from_secs(1),
-            output_queue_timeout: Duration::from_secs(1),
-            idle_timeout: Duration::from_secs(5),
-            ping_interval: Duration::from_secs(1),
-            request_timeout: Duration::from_secs(1),
-        },
-        second_requests,
-        second_output,
-    ));
-    second_backend.send(Message::Text(serde_json::json!({"type":"event","event":"connection.ack","payload":{"readiness":"WARMING"}}).to_string())).await.unwrap();
-    assert_eq!(
-        second_frames.recv().await.unwrap()["event"],
-        "connection.ack"
-    );
-    assert!(frames.try_recv().is_err(), "ACK must stay on its frontend");
-    second_send
-        .send(
-            crate::ingress::digitalmategateway::protocol::Request::parse(
-                br#"{"type":"req","id":"first","method":"session.list","params":{}}"#,
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    let message = second_backend
-        .next()
-        .await
-        .unwrap()
-        .unwrap()
-        .into_text()
-        .unwrap();
-    let envelope: serde_json::Value = serde_json::from_str(&message).unwrap();
-    assert_eq!(envelope["user_id"], "user");
-    assert_eq!(envelope["method"], "session.list");
-    assert_eq!(gateway.active_sessions(), 2);
-
-    // A third connection is admitted while both drivers are running. Dropping it
-    // closes only its own Relay stream; existing frontends continue independently.
-    let third_connecting = {
-        let access = access.clone();
-        let gateway = gateway.clone();
-        tokio::spawn(async move { Connection::connect(&gateway, &access, duplicate).await })
-    };
-    let (third_stream, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    let third_backend = tokio_tungstenite::accept_async(third_stream).await.unwrap();
-    let third_connection = third_connecting.await.unwrap().unwrap();
-    assert_eq!(gateway.active_sessions(), 3);
-    drop(third_connection);
-    drop(third_backend);
-    assert_eq!(gateway.active_sessions(), 2);
-    second_running.abort();
-    assert!(second_running.await.unwrap_err().is_cancelled());
-    drop(second_backend);
-    assert!(second_frames.recv().await.is_none());
-    assert_eq!(gateway.active_sessions(), 1);
-    // The same request ID on the surviving frontend has independent state.
-    for id in ["first", "second"] {
-        send.send(
-            crate::ingress::digitalmategateway::protocol::Request::parse(
-                serde_json::json!({"type":"req","id":id,"method":"session.list","params":{}})
-                    .to_string()
-                    .as_bytes(),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        let message = backend.next().await.unwrap().unwrap().into_text().unwrap();
-        let envelope: serde_json::Value = serde_json::from_str(&message).unwrap();
-        assert_eq!(envelope["user_id"], "user");
-        assert_eq!(envelope["method"], "session.list");
-    }
-    assert_eq!(gateway.active_sessions(), 1);
-    routes.delete(&binding.current.environment_id);
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), running)
-            .await
-            .unwrap()
-            .unwrap(),
-        Err(ConnectionError::Revoked)
-    ));
-    assert!(frames.recv().await.is_none());
-    assert_eq!(gateway.active_sessions(), 0);
-    assert!(send
-        .send(
-            crate::ingress::digitalmategateway::protocol::Request::parse(
-                br#"{"type":"req","id":"late","method":"session.list","params":{}}"#
-            )
-            .unwrap()
-        )
-        .await
-        .is_err());
-    drop(backend);
-    // A stalled HTTP upgrade consumes the original admission budget and is not retried.
-    routes.put(route.clone());
-    let selection = access
-        .select(
-            Arc::new(RequestContext::new(Duration::from_millis(200))),
-            scope.clone(),
-            selector,
-        )
-        .await
-        .unwrap();
-    let connecting = {
-        let access = access.clone();
-        let gateway = gateway.clone();
-        tokio::spawn(async move { Connection::connect(&gateway, &access, selection).await })
-    };
-    let (_stalled, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        connecting.await.unwrap(),
-        Err(ConnectionError::HandshakeTimeout)
-    ));
-    assert_eq!(gateway.active_sessions(), 0);
-    // Every exit path must release its own stream.
-    for exit in [
-        "cancel-handshake",
-        "bad-handshake",
-        "drop",
-        "cancel-driver",
-        "close-driver",
-        "drop",
-    ] {
-        let selection = access
-            .select(
-                Arc::new(RequestContext::new(Duration::from_secs(3))),
-                scope.clone(),
-                selector,
-            )
-            .await
-            .unwrap();
-        let connecting = {
-            let access = access.clone();
-            let gateway = gateway.clone();
-            tokio::spawn(async move { Connection::connect(&gateway, &access, selection).await })
-        };
-        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-            .await
-            .unwrap()
-            .unwrap();
-        if exit == "cancel-handshake" {
-            connecting.abort();
-            assert!(matches!(connecting.await, Err(error) if error.is_cancelled()));
-        } else if exit == "bad-handshake" {
-            use tokio::io::AsyncWriteExt;
-            stream
-                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-            assert!(matches!(
-                connecting.await.unwrap(),
-                Err(ConnectionError::Driver(_))
-            ));
-        } else {
-            let mut backend = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let connection = connecting.await.unwrap().unwrap();
-            if exit == "drop" {
-                drop(connection);
-            } else {
-                let (_send, requests) = mpsc::channel(2);
-                let (output, mut frames) = mpsc::channel(4);
-                let running = tokio::spawn(connection.run(
-                    "user".into(),
-                    DriverConfig {
-                        limits: SessionLimits {
-                            pending: 4,
-                            recent: 4,
-                            busy: 4,
-                        },
-                        write_timeout: Duration::from_secs(1),
-                        output_queue_timeout: Duration::from_secs(1),
-                        idle_timeout: Duration::from_secs(5),
-                        ping_interval: Duration::from_secs(1),
-                        request_timeout: Duration::from_secs(1),
-                    },
-                    requests,
-                    output,
-                ));
-                backend.send(Message::Text(serde_json::json!({"type":"event","event":"connection.ack","payload":{"readiness":"WARMING"}}).to_string())).await.unwrap();
-                assert_eq!(frames.recv().await.unwrap()["event"], "connection.ack");
-                if exit == "cancel-driver" {
-                    running.abort();
-                    assert!(running.await.unwrap_err().is_cancelled());
-                } else {
-                    backend.close(None).await.unwrap();
-                    assert!(tokio::time::timeout(Duration::from_secs(2), running)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .is_err());
-                }
-            }
-        }
-        assert_eq!(gateway.active_sessions(), 0, "{exit} leaked its stream");
-    }
-    // A published route belonging to another tenant never reaches the backend.
-    let mut foreign = route;
-    foreign.tenant_id = "other".into();
-    routes.put(foreign);
-    let selection = access
-        .select(
-            Arc::new(RequestContext::new(Duration::from_secs(1))),
-            scope,
-            selector,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        Connection::connect(&gateway, &access, selection).await,
-        Err(ConnectionError::Access(
-            super::super::agent_service::ServiceAccessError::Ingress(IngressOpenError::Forbidden)
-        ))
-    ));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), listener.accept())
-            .await
-            .is_err()
-    );
-    reconcile.abort();
-    node_task.abort();
-}
-
-#[tokio::test]
-async fn jiuwen_download_config_reads_the_scoped_template_without_activation() {
-    use crate::ingress::digitalmategateway::download_config::DownloadConfig;
-    use adx_agent_api::{managed::ManagedService, request::RequestContext};
-    use adx_agent_core::Scope;
-    let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let backend = Arc::new(Backend::default());
-    let managed = ManagedService::new(Arc::new(
-        remote_control(adx_activator::Activator::new(
-            state.clone(),
-            backend.clone(),
-        ))
-        .await,
-    ));
-    let mut template:adx_agent_core::TemplateVersion=serde_json::from_value(serde_json::json!({"name":"jiuwen","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"env":{"JIUWENSWARM_WORKSPACE":"/tenant-one/v1","JIUWENSWARM_DOWNLOAD_ASSET_ROOT":"/assets"}})).unwrap();
-    state
-        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
-        .await
-        .unwrap();
-    template.version = "2".into();
-    template
-        .env
-        .insert("JIUWENSWARM_WORKSPACE".into(), "/tenant-one/v2".into());
-    state
-        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
-        .await
-        .unwrap();
-    template.version = "1".into();
-    template
-        .env
-        .insert("JIUWENSWARM_WORKSPACE".into(), "/tenant-two/v1".into());
-    state
-        .publish("other", &adx_agent_core::TemplateDraft::from(&template))
-        .await
-        .unwrap();
-    let context = RequestContext::new(std::time::Duration::from_secs(2));
-    for (tenant, version, workspace) in [
-        ("tenant", "1", "/tenant-one/v1"),
-        ("tenant", "2", "/tenant-one/v2"),
-        ("other", "1", "/tenant-two/v1"),
-    ] {
-        let scope = Scope {
-            tenant: tenant.into(),
-            template: "jiuwen".into(),
-            template_ref: adx_agent_core::TemplateRef::Version(version.into()),
-            binding_id: "not-created".into(),
-        };
-        let config = DownloadConfig::load(&managed, &context, &scope)
-            .await
-            .unwrap();
-        assert_eq!(config.workspace(), workspace);
-        assert!(state.binding(&scope).await.unwrap().is_none());
-    }
-    assert_eq!(backend.1.load(Ordering::SeqCst), 0);
-    assert!(backend.0.lock().unwrap().is_empty());
-    let expired = RequestContext::new(std::time::Duration::from_millis(1));
-    tokio::time::sleep_until(expired.deadline()).await;
-    let scope = Scope {
-        tenant: "tenant".into(),
-        template: "jiuwen".into(),
-        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
-        binding_id: "not-created".into(),
-    };
-    assert!(
-        DownloadConfig::load(&managed, &expired, &scope)
-            .await
-            .is_err(),
-        "cached config still obeys the caller deadline"
-    );
-}
-
-#[cfg(feature = "mock-e2e")]
-#[path = "digitalmategateway_download_tests.rs"]
-mod digitalmategateway_download_tests;
-
-#[cfg(feature = "mock-e2e")]
-#[path = "digitalmategateway_http_tests.rs"]
-mod digitalmategateway_http_tests;
-
-#[cfg(feature = "mock-e2e")]
-#[path = "digitalmategateway_entrypoint_tests.rs"]
-mod digitalmategateway_entrypoint_tests;
-
 #[tokio::test]
 async fn managed_ws_consumes_parameters_only_for_the_first_activation() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
@@ -2206,9 +1631,7 @@ async fn websocket_retry_refreshes_deleted_or_rebuilt_binding_before_writes() {
                 .await
                 .unwrap();
             assert!(selected
-                .forwarding_uri(&"/".parse().unwrap())
-                .unwrap()
-                .path()
+                .forwarding_path(&"/".parse().unwrap())
                 .contains(&old.current.environment_id));
             let result = access.retry(&mut selected).await;
             if protocol == Protocol::Http {
@@ -2223,9 +1646,7 @@ async fn websocket_retry_refreshes_deleted_or_rebuilt_binding_before_writes() {
                 if rebuilt { "other" } else { "new" }
             );
             assert!(selected
-                .forwarding_uri(&"/".parse().unwrap())
-                .unwrap()
-                .path()
+                .forwarding_path(&"/".parse().unwrap())
                 .contains(&current.current.environment_id));
             assert!(!access.retry(&mut selected).await.unwrap());
         }
@@ -2241,7 +1662,7 @@ async fn instance_access_authenticates_without_activator_and_keeps_fixed_target(
     for path in ["/agent/http/chat", "/agent/ws/chat"] {
         let builder = Request::builder()
             .uri(format!("{path}?target=urn:adx:instance:api&port=18092&q=1"))
-            .header("authorization", "Bearer tenant")
+            .header("x-adx-auth", "tenant")
             .header("x-adx-parameters", "%malformed");
         let builder = if path.starts_with("/agent/ws") {
             builder.header("upgrade", "websocket")
@@ -2282,7 +1703,7 @@ async fn instance_access_authenticates_without_activator_and_keeps_fixed_target(
     ] {
         let mut request = Request::builder()
             .uri("/agent/http?target=urn:adx:instance:api&port=18092")
-            .header("authorization", format!("Bearer {token}"))
+            .header("x-adx-auth", token)
             .body(())
             .unwrap();
         let response = gateway
@@ -2341,7 +1762,7 @@ async fn unified_reference_traffic_reuses_the_requested_version_or_alias_scope()
                     "/agent/http?target=urn:adx:template:orbit:{reference}"
                 ))
                 .header("x-adx-binding-id", "user")
-                .header("authorization", "Bearer tenant")
+                .header("x-adx-auth", "tenant")
                 .body(Full::new(Bytes::new()))
                 .unwrap(),
             )
@@ -2465,7 +1886,7 @@ async fn instance_access_preserves_http2_authority_for_shared_e2b_forwarding() {
     let (gateway, _) = fixture().await;
     let mut request = Request::builder()
         .uri("https://gateway.example.test/agent/http/files?target=urn:adx:instance:api&port=49983&path=%2Ftmp%2Fdata")
-        .header("authorization", "Bearer tenant")
+        .header("x-adx-auth", "tenant")
         .body(())
         .unwrap();
     gateway

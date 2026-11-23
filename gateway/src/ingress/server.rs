@@ -346,9 +346,6 @@ pub struct Ingress {
     pub(super) execd_access: Option<Arc<super::environment_files::ExecdAccess>>,
     #[cfg(feature = "agent-api")]
     pub(super) agent_api: Option<Arc<super::agent_api::AgentApi>>,
-    #[cfg(feature = "agent-api")]
-    digitalmategateway_api:
-        Option<Arc<super::digitalmategateway::entrypoint::DigitalMateGatewayApi>>,
     resolver: Arc<IngressRouteResolver>,
     connector: DataPlaneL4Connector,
     http_pool: BackendHttpPool,
@@ -389,8 +386,6 @@ impl Ingress {
             execd_access: None,
             #[cfg(feature = "agent-api")]
             agent_api: None,
-            #[cfg(feature = "agent-api")]
-            digitalmategateway_api: None,
             resolver,
             connector,
             http_pool: BackendHttpPool::new(BackendHttpPoolConfig::default()),
@@ -415,15 +410,6 @@ impl Ingress {
             command_watch_metrics: Arc::new(CommandWatchMetrics::default()),
             request_metrics: Arc::new(IngressRequestMetrics::default()),
         }
-    }
-
-    #[cfg(feature = "agent-api")]
-    pub fn with_digitalmategateway_api(
-        mut self,
-        api: Arc<super::digitalmategateway::entrypoint::DigitalMateGatewayApi>,
-    ) -> Self {
-        self.digitalmategateway_api = Some(api);
-        self
     }
 
     #[cfg(feature = "agent-api")]
@@ -572,6 +558,64 @@ impl Ingress {
             return Err(IngressOpenError::Forbidden);
         }
         Ok(ready)
+    }
+
+    #[cfg(feature = "agent-api")]
+    pub(super) async fn open_selected_service(
+        &self,
+        environment: &str,
+        port: u16,
+        tenant: &str,
+        created: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<IngressStream, IngressOpenError> {
+        let route = self
+            .resolve_route(environment, port, AccessKind::Direct, String::new())
+            .await?;
+        let starting = created || route.needs_resume;
+        let route = self.prepare_route(route, tenant).await?;
+        let revision = self
+            .resolver
+            .current_route_revision(&route)
+            .ok_or(IngressOpenError::RouteChanged)?;
+        self.open_service_listener(&route, revision, starting.then_some(deadline))
+            .await
+            .map_err(IngressOpenError::Connect)
+    }
+
+    fn check_service_route(&self, route: &RouteHandle, revision: u64) -> io::Result<()> {
+        if !self.ready() || self.resolver.current_route_revision(route) != Some(revision) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                IngressOpenError::RouteChanged,
+            ));
+        }
+        Ok(())
+    }
+
+    /// A newly created or resumed Environment may publish its route before the service listens.
+    /// Retry refused connections only before sending any application bytes.
+    async fn open_service_listener(
+        &self,
+        route: &RouteHandle,
+        revision: u64,
+        startup_deadline: Option<tokio::time::Instant>,
+    ) -> io::Result<IngressStream> {
+        loop {
+            self.check_service_route(route, revision)?;
+            let error = match self.open_authorized_stream(route.clone()).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => error,
+            };
+            let Some(deadline) = startup_deadline else {
+                return Err(error);
+            };
+            let next = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+            if error.kind() != io::ErrorKind::ConnectionRefused || next >= deadline {
+                return Err(error);
+            }
+            tokio::time::sleep_until(next).await;
+        }
     }
 
     pub(super) async fn open_authorized_stream(
@@ -1200,12 +1244,21 @@ impl Ingress {
                 .is_some();
         #[cfg(not(feature = "agent-api"))]
         let agent_forward = false;
+        #[cfg(feature = "agent-api")]
+        let agent_management =
+            !host_route && self.agent_api.is_some() && super::agent_api::AgentApi::matches(&path);
+        #[cfg(not(feature = "agent-api"))]
+        let agent_management = false;
+        if !agent_management {
+            request.headers_mut().remove("x-adx-auth");
+        }
         let response = if let Some(response) = agent_data_error {
             response
         } else if let Some(target) = match self.e2b_target(&request) {
             Ok(target) => target,
             Err(_) => return Ok(plain(StatusCode::BAD_REQUEST, "invalid E2B sandbox target")),
         } {
+            request.headers_mut().remove("x-adx-auth");
             self.proxy_e2b(request, ingress_security, target).await
         } else if host_route || agent_forward {
             // A selected Environment is already a data-plane target. Its ID must never
@@ -1214,37 +1267,18 @@ impl Ingress {
         } else {
             match request.uri().path() {
                 #[cfg(feature = "agent-api")]
-                path if super::digitalmategateway::entrypoint::DigitalMateGatewayApi::matches(
-                    path,
-                ) && self.digitalmategateway_api.is_some() =>
-                {
-                    self.digitalmategateway_api
-                        .as_ref()
-                        .expect("configured DigitalMateGateway API")
-                        .handle(request, self.clone())
-                        .await
-                }
-                #[cfg(feature = "agent-api")]
                 path if super::agent_api::AgentApi::matches(path) && self.agent_api.is_some() => {
                     if ingress_security == IngressSecurity::Plaintext {
                         tls_required()
                     } else {
-                        match self
-                            .authenticator
-                            .authenticate_request_with_policy(&request, true)
-                            .await
-                        {
-                            Ok(tenant) if !tenant.is_empty() => {
+                        match self.authenticator.authenticate_agent(&request).await {
+                            Ok(identity) => {
                                 self.agent_api
                                     .as_ref()
                                     .expect("configured Agent API")
-                                    .management(request, &tenant)
+                                    .management(request, &identity.tenant_id)
                                     .await
                             }
-                            Ok(_) => response_text(
-                                StatusCode::UNAUTHORIZED,
-                                "tenant authentication required",
-                            ),
                             Err(error) => response_text(error.status(), &error.to_string()),
                         }
                     }
@@ -1344,15 +1378,10 @@ impl Ingress {
         }
         let identity = self
             .authenticator
-            .authenticate_request_identity_with_policy(request, true)
+            .authenticate_agent(request)
             .await
             .map_err(|error| response_text(error.status(), &error.to_string()))?;
-        if identity.tenant_id.is_empty() {
-            return Err(response_text(
-                StatusCode::UNAUTHORIZED,
-                "tenant authentication required",
-            ));
-        }
+        request.headers_mut().remove("x-adx-auth");
         let tenant = identity.tenant_id.clone();
         request.extensions_mut().insert(identity);
         if let adx_agent_core::target::Target::Instance(id) = &access.target {
@@ -1990,26 +2019,13 @@ impl Ingress {
                         return error_response(error);
                     }
                 };
-                let query = backend_uri
-                    .query()
-                    .map(strip_token_query)
-                    .unwrap_or_default();
-                let uri = if query.is_empty() {
-                    backend_uri.path().to_owned()
-                } else {
-                    format!("{}?{query}", backend_uri.path())
-                };
-                let Ok(uri) = uri.parse() else {
-                    return response_text(StatusCode::BAD_REQUEST, "invalid backend URI");
-                };
-                *request.uri_mut() = uri;
+                *request.uri_mut() = backend_uri;
                 for name in [
                     H_INSTANCE_ID,
                     H_WORKLOAD_ID,
                     H_TARGET_IP,
                     H_TARGET_PORT,
                     "x-auth",
-                    "authorization",
                 ] {
                     request.headers_mut().remove(name);
                 }
@@ -2105,27 +2121,41 @@ impl Ingress {
                 Err(error) => return Ok(plain(error.status(), &error.to_string())),
             }
         };
-        let query = request
-            .uri()
-            .query()
-            .map(strip_token_query)
-            .unwrap_or_default();
+        #[cfg(feature = "agent-api")]
+        let agent_request = request
+            .extensions()
+            .get::<super::agent_access::BindingNotice>()
+            .is_some()
+            || request
+                .extensions()
+                .get::<super::agent_access::InstanceAccess>()
+                .is_some();
+        #[cfg(not(feature = "agent-api"))]
+        let agent_request = false;
+        let query = request.uri().query().unwrap_or_default();
+        let query = if agent_request {
+            query.to_owned()
+        } else {
+            strip_token_query(query)
+        };
         let query = if query.is_empty() {
             String::new()
         } else {
             format!("?{query}")
         };
-        let uri = format!("{}{query}", parsed.stripped_path)
-            .parse()
-            .expect("stripped route path is a valid origin-form URI");
-        *request.uri_mut() = uri;
+        if replace_request_path(&mut request, &format!("{}{query}", parsed.stripped_path)).is_err()
+        {
+            return Ok(plain(StatusCode::BAD_REQUEST, "invalid backend URI"));
+        }
         {
             request.headers_mut().remove(H_INSTANCE_ID);
             request.headers_mut().remove(H_WORKLOAD_ID);
             request.headers_mut().remove(H_TARGET_IP);
             request.headers_mut().remove(H_TARGET_PORT);
             request.headers_mut().remove("x-auth");
-            request.headers_mut().remove(header::AUTHORIZATION);
+            if !agent_request {
+                request.headers_mut().remove(header::AUTHORIZATION);
+            }
         }
         if route.e2b.is_some() {
             strip_service_credentials(&mut request, route.target.target_port);
@@ -2187,6 +2217,14 @@ impl Ingress {
         if let Err(error) = self.authorize(&route, &tenant_id) {
             return Ok(error_response(error));
         }
+        #[cfg(feature = "agent-api")]
+        let service_deadline = request
+            .extensions()
+            .get::<super::agent_api::ServiceDeadline>()
+            .filter(|value| value.created_environment || route.needs_resume)
+            .map(|value| value.deadline);
+        #[cfg(not(feature = "agent-api"))]
+        let service_deadline: Option<tokio::time::Instant> = None;
         let mut route = match self.prepare_route(route, &tenant_id).await {
             Ok(route) => route,
             Err(error) => {
@@ -2213,18 +2251,8 @@ impl Ingress {
                 .send_recoverable(
                     key,
                     request,
-                    || self.open_authorized_stream(route.clone()),
-                    || {
-                        if !self.ready()
-                            || self.resolver.current_route_revision(&route) != Some(route_revision)
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::NotConnected,
-                                IngressOpenError::RouteChanged,
-                            ));
-                        }
-                        Ok(())
-                    },
+                    || self.open_service_listener(&route, route_revision, service_deadline),
+                    || self.check_service_route(&route, route_revision),
                 )
                 .await
             {
@@ -2447,7 +2475,10 @@ fn strip_gateway_envd_credentials<B>(request: &mut Request<B>) -> Result<(), htt
     Ok(())
 }
 
-fn replace_request_path<B>(request: &mut Request<B>, path: &str) -> Result<(), http::Error> {
+pub(super) fn replace_request_path<B>(
+    request: &mut Request<B>,
+    path: &str,
+) -> Result<(), http::Error> {
     // HTTP/2 carries Host in :authority. Path and credential rewrites must
     // preserve the original scheme and authority before shared forwarding.
     let mut parts = request.uri().clone().into_parts();

@@ -499,7 +499,6 @@ impl ActivatorClient {
                 expected_generation: expected_generation.map(str::to_owned),
                 bypass_cache,
                 parameters: parameters.map(<[u8]>::to_vec),
-                reuse_subject_binding: false,
             },
             true,
             Some(scope),

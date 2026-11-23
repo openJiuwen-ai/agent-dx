@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate isolated short-lived test certificates, never deployment credentials."""
 
+import logging
 import os
 import pathlib
 import shutil
@@ -44,6 +45,10 @@ run(
     '2',
     '-subj',
     '/CN=ADX RPC test CA',
+    '-addext',
+    'basicConstraints=critical,CA:TRUE',
+    '-addext',
+    'keyUsage=critical,keyCertSign,cRLSign',
 )
 (out / 'extensions.cnf').write_text(
     (
@@ -85,4 +90,5 @@ for name in ['coordinator', 'node', 'apiserver', 'ingress', 'unknown']:
     run('x509', '-in', out / f'{name}.pem', '-outform', 'DER', '-out', out / f'{name}.der')
     (out / f'{name}.key').chmod(0o600)
 (out / 'ca.key').chmod(0o600)
-print('Generated isolated RPC test certificates')
+logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
+logging.info('Generated isolated RPC test certificates')

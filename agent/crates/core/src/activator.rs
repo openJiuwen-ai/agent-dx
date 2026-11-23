@@ -21,9 +21,6 @@ pub struct ActivationRequest {
     /// Raw form-encoded initialization. Parsed only when this Binding is absent.
     #[serde(default)]
     pub parameters: Option<Vec<u8>>,
-    /// From a trusted business gateway, never from the public Binding resolve body.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reuse_subject_binding: bool,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +53,8 @@ pub struct ResolveRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedTarget {
+    /// This activation created the selected Environment. A cache hit or observation is warm.
+    pub created_environment: bool,
     pub target: Target,
     pub port: u16,
 }

@@ -8,7 +8,7 @@ async fn http_routes_body_and_reports_binding_before_streaming_output() {
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let app = axum::Router::new().fallback(|request: axum::extract::Request| async {
         assert_eq!(request.method(), "POST");
-        assert_eq!(request.headers()["authorization"], "Bearer tenant-key");
+        assert_eq!(request.headers()["x-adx-auth"], "tenant-key");
         assert_eq!(request.headers()["content-type"], "application/json");
         assert_eq!(
             request.headers()["x-adx-binding-id"],
@@ -88,7 +88,7 @@ fn http_validates_business_paths_and_preserves_explicit_binding() {
         "/../api/agent",
         "/%2e%2e/api",
         "/?target=other",
-        "/?instance=other",
+        "/?port=8080",
     ] {
         let cli = Cli::try_parse_from([
             "adx",
@@ -115,6 +115,8 @@ fn http_validates_business_paths_and_preserves_explicit_binding() {
         "1",
         "--binding-id",
         "existing",
+        "--path",
+        "/echo?instance=app&token=t%2fu&flag",
         "--port",
         "8080",
     ])
@@ -127,6 +129,7 @@ fn http_validates_business_paths_and_preserves_explicit_binding() {
         .query_pairs()
         .any(|(k, v)| k == "target" && v == "urn:adx:template:demo:1"));
     assert!(url.query_pairs().any(|(k, v)| k == "port" && v == "8080"));
+    assert!(url.as_str().contains("instance=app&token=t%2fu&flag&"));
 }
 
 async fn assert_invalid_binding_notice_preserves_response(status: axum::http::StatusCode) {

@@ -22,7 +22,6 @@ type PreparationCall = (String, String, SeedExecution);
 struct DigitalMateRepository {
     inner: Arc<dyn Repository>,
     wait_for_concurrent_commits: AtomicUsize,
-    forbid_store_reads: AtomicBool,
     commits: Barrier,
 }
 
@@ -33,10 +32,6 @@ impl Repository for DigitalMateRepository {
             !key.as_str().starts_with("prewarm-policy:")
                 && !key.as_str().starts_with("first-assignment:"),
             "DigitalMate accessed a legacy eligibility record"
-        );
-        assert!(
-            !self.forbid_store_reads.load(Ordering::Relaxed),
-            "cached subject activation reached storage"
         );
         self.inner.get(key).await
     }
@@ -646,7 +641,6 @@ fn digitalmate_request(scope: Scope) -> ResolveRequest {
             expected_generation: None,
             bypass_cache: true,
             parameters: Some(b"workspace=w-actor".to_vec()),
-            reuse_subject_binding: true,
         },
         service: ServiceSelector {
             protocol: adx_agent_core::Protocol::Ws,
@@ -675,7 +669,6 @@ async fn digitalmate_first_binding(inner: Arc<dyn Repository>) {
     let repo = Arc::new(DigitalMateRepository {
         inner: inner.clone(),
         wait_for_concurrent_commits: AtomicUsize::new(0),
-        forbid_store_reads: AtomicBool::new(false),
         commits: Barrier::new(2),
     });
     let state = AgentState::new(repo.clone());
@@ -723,98 +716,31 @@ async fn digitalmate_first_binding(inner: Arc<dyn Repository>) {
 
     let left_binding = state.binding(&scopes[0]).await.unwrap();
     let right_binding = state.binding(&scopes[1]).await.unwrap();
-    assert_ne!(left_binding.is_some(), right_binding.is_some());
-    let committed = left_binding.or(right_binding).unwrap();
-    assert_eq!(
-        committed.current.snapshot_id.as_deref(),
-        Some("snapshot-ready")
-    );
+    let bindings = [left_binding.unwrap(), right_binding.unwrap()];
+    assert_ne!(bindings[0].generation, bindings[1].generation);
+    for committed in &bindings {
+        assert_eq!(
+            committed.current.snapshot_id.as_deref(),
+            Some("snapshot-ready")
+        );
+    }
     for (mut alias, revision) in aliases {
         alias.versions[0].version = "2".into();
         state.put_alias(&alias, Some(&revision)).await.unwrap();
     }
     platform.block_creation.store(false, Ordering::Relaxed);
     platform.unavailable.store(true, Ordering::Relaxed);
-    for request in [&left, &right] {
+    for (request, committed) in [&left, &right].into_iter().zip(&bindings) {
         let result = b.resolve(request, deadline).await.unwrap().target.binding;
         assert_eq!(result.generation, committed.generation);
         assert_eq!(result.current, committed.current);
     }
     let creations = platform.creations.lock().await;
     assert!(!creations.is_empty());
-    assert!(creations
+    assert!(creations.iter().all(|request| bindings
         .iter()
-        .all(|request| request.id == committed.current.environment_id
-            && request.execution.snapshot_id == committed.current.snapshot_id));
-}
-
-#[tokio::test]
-async fn digitalmate_reuses_live_binding_with_subject_pointer() {
-    digitalmate_binding_history(Arc::new(MemoryRepository::default())).await;
-}
-
-#[tokio::test]
-#[ignore = "Requires dedicated local Redis; set ADX_TEST_REDIS_URL"]
-async fn redis_digitalmate_reuses_live_binding_with_subject_pointer() {
-    let url = std::env::var("ADX_TEST_REDIS_URL").expect("set URL to dedicated local Redis");
-    let namespace = format!("digitalmate-history-{}", uuid::Uuid::new_v4());
-    let repo = RedisRepository::connect(&url, &namespace, std::time::Duration::from_secs(3))
-        .await
-        .unwrap();
-    digitalmate_binding_history(Arc::new(repo)).await;
-}
-
-async fn digitalmate_binding_history(inner: Arc<dyn Repository>) {
-    let repo = Arc::new(DigitalMateRepository {
-        inner,
-        wait_for_concurrent_commits: AtomicUsize::new(0),
-        forbid_store_reads: AtomicBool::new(false),
-        commits: Barrier::new(2),
-    });
-    let state = AgentState::new(repo.clone());
-    let activator = Activator::new(state.clone(), Arc::new(Platform::default()));
-    for _ in 0..3 {
-        activator.publish("tenant", &draft(false)).await.unwrap();
-    }
-    let first = scope("actor", TemplateRef::Version("1".into()));
-    let second = scope("actor", TemplateRef::Version("2".into()));
-    let third = scope("actor", TemplateRef::Version("3".into()));
-    let params = [("workspace".into(), "w-actor".into())].into();
-    activator.publish("other", &draft(false)).await.unwrap();
-    state
-        .create_binding_with_parameters(
-            Scope {
-                tenant: "other".into(),
-                ..first.clone()
-            },
-            &params,
-        )
-        .await
-        .unwrap();
-    state
-        .create_binding_with_parameters(first.clone(), &params)
-        .await
-        .unwrap();
-    let deleted = state.begin_delete(&first).await.unwrap();
-    state.finish_delete(&deleted).await.unwrap();
-    let existing = state
-        .create_binding_with_parameters(second, &params)
-        .await
-        .unwrap();
-
-    let mut request = digitalmate_request(third.clone());
-    request.activation.bypass_cache = false;
-    let deadline = adx_agent_core::unix_time_millis() + 30_000;
-    let target = activator.resolve(&request, deadline).await.unwrap().target;
-    assert_eq!(target.binding.current, existing.current);
-    assert_eq!(target.binding.scope, existing.scope);
-    assert!(state.binding(&third).await.unwrap().is_none());
-
-    repo.forbid_store_reads.store(true, Ordering::Relaxed);
-    request.activation.scope = first;
-    let cached = activator.resolve(&request, deadline).await.unwrap().target;
-    assert_eq!(cached.binding, target.binding);
-    repo.forbid_store_reads.store(false, Ordering::Relaxed);
+        .any(|binding| request.id == binding.current.environment_id
+            && request.execution.snapshot_id == binding.current.snapshot_id)));
 }
 
 async fn activate(

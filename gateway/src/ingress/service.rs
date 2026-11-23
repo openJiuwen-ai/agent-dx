@@ -34,8 +34,6 @@ pub struct IngressService {
     route_changes: broadcast::Receiver<RouteChange>,
     #[cfg(feature = "agent-api")]
     ssh: Option<super::ssh::SshListener>,
-    #[cfg(all(feature = "agent-api", unix))]
-    digitalmate_background: Option<super::digitalmategateway::ingestion::IngestionRuntime>,
 }
 
 impl IngressService {
@@ -70,10 +68,9 @@ impl IngressService {
         if std::env::var_os("ADX_ENVIRONMENT_FILES_CONFIG").is_some()
             || std::env::var_os("ADX_AGENT_CONFIG").is_some()
             || std::env::var_os("ADX_SSH_CONFIG").is_some()
-            || std::env::var_os("ADX_JIUWEN_CONFIG").is_some()
         {
             return Err(
-                "Environment, Agent, Jiuwen and SSH configuration require a Gateway built with --features agent-api".into(),
+                "Environment, Agent and SSH configuration require a Gateway built with --features agent-api".into(),
             );
         }
         let options = config.listener_options();
@@ -132,33 +129,6 @@ impl IngressService {
         } else {
             None
         };
-        #[cfg(feature = "agent-api")]
-        let digitalmategateway_api = if let Ok(path) = std::env::var("ADX_JIUWEN_CONFIG") {
-            use super::digitalmategateway::entrypoint::{
-                DigitalMateGatewayApi, DigitalMateGatewayConfig,
-            };
-            let settings: DigitalMateGatewayConfig = serde_json::from_slice(&std::fs::read(path)?)
-                .map_err(|_| "invalid DigitalMateGateway configuration")?;
-            let agent = agent_api
-                .as_ref()
-                .ok_or("DigitalMateGateway requires ADX_AGENT_CONFIG")?;
-            if file_access.is_none() {
-                return Err("DigitalMateGateway requires ADX_ENVIRONMENT_FILES_CONFIG".into());
-            }
-            let account_path = std::env::var("ADX_ACCOUNT_CONFIG")
-                .map_err(|_| "DigitalMateGateway requires ADX_ACCOUNT_CONFIG")?;
-            let account_config: super::accounts::AccountConfig =
-                serde_json::from_slice(&std::fs::read(account_path)?)
-                    .map_err(|_| "invalid account configuration")?;
-            let auth = Arc::new(
-                super::accounts::AccountService::connect(account_config, &settings.tenant).await?,
-            );
-            Some(Arc::new(
-                DigitalMateGatewayApi::build(settings, agent.managed.clone(), auth).await?,
-            ))
-        } else {
-            None
-        };
         let gateway = Ingress::new(
             resolver,
             connector,
@@ -195,18 +165,7 @@ impl IngressService {
         } else {
             gateway
         };
-        #[cfg(feature = "agent-api")]
-        let gateway = if let Some(api) = &digitalmategateway_api {
-            gateway.with_digitalmategateway_api(api.clone())
-        } else {
-            gateway
-        };
         let gateway = Arc::new(gateway);
-        #[cfg(all(feature = "agent-api", unix))]
-        let digitalmate_background = match &digitalmategateway_api {
-            Some(api) => api.background_service(gateway.clone())?,
-            None => None,
-        };
         #[cfg(feature = "agent-api")]
         let ssh = if let Ok(path) = std::env::var("ADX_SSH_CONFIG") {
             let settings = serde_json::from_slice(&std::fs::read(path)?)
@@ -218,8 +177,6 @@ impl IngressService {
         Ok(Self {
             #[cfg(feature = "agent-api")]
             ssh,
-            #[cfg(all(feature = "agent-api", unix))]
-            digitalmate_background,
             config,
             public_listeners,
             health_listener,
@@ -257,24 +214,12 @@ impl IngressService {
             route_changes,
             #[cfg(feature = "agent-api")]
             ssh,
-            #[cfg(all(feature = "agent-api", unix))]
-            digitalmate_background,
         } = self;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let watcher_task = tokio::spawn(watcher.run(store));
         let route_reconciler_task =
             tokio::spawn(gateway.clone().run_route_reconciler(route_changes));
         let mut listeners = JoinSet::new();
-        #[cfg(all(feature = "agent-api", unix))]
-        if let Some(background) = digitalmate_background {
-            let shutdown = shutdown_rx.clone();
-            listeners.spawn(async move {
-                background
-                    .serve(shutdown)
-                    .await
-                    .map_err(|error| Box::new(error) as ServiceError)
-            });
-        }
         #[cfg(feature = "agent-api")]
         if let Some(ssh) = ssh {
             let shutdown = shutdown_rx.clone();
@@ -364,10 +309,6 @@ fn listener_failure(result: Option<Result<Result<(), ServiceError>, JoinError>>)
         None => "Ingress listener set stopped unexpectedly".into(),
     }
 }
-
-#[cfg(all(test, unix, feature = "agent-api"))]
-#[path = "digitalmategateway_startup_tests.rs"]
-mod digitalmategateway_startup_tests;
 
 #[cfg(test)]
 mod tests {

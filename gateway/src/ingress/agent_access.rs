@@ -58,20 +58,20 @@ impl AccessRequest {
         let mut target = None;
         let mut port = None;
         let mut seen = std::collections::BTreeSet::new();
-        let pairs: Vec<_> =
-            url::form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes()).collect();
-        for (name, value) in &pairs {
-            if matches!(name.as_ref(), "instance" | "target" | "port")
-                && !seen.insert(name.as_ref())
-            {
+        let mut business_query = Vec::new();
+        for field in request.uri().query().unwrap_or("").split('&') {
+            let Some((name, value)) = url::form_urlencoded::parse(field.as_bytes()).next() else {
+                business_query.push(field);
+                continue;
+            };
+            if !matches!(name.as_ref(), "target" | "port") {
+                business_query.push(field);
+                continue;
+            }
+            if !seen.insert(name.clone()) {
                 return Err(Error::Invalid("duplicate target or port parameter".into()));
             }
             match name.as_ref() {
-                "instance" => {
-                    return Err(Error::Invalid(
-                        "managed access requires a template target".into(),
-                    ))
-                }
                 "target" => target = Some(value.parse::<Target>().map_err(Error::Invalid)?),
                 "port" if !value.trim().is_empty() => {
                     port = Some(
@@ -118,14 +118,7 @@ impl AccessRequest {
             ));
         }
         let backend_uri = {
-            let mut query = url::form_urlencoded::Serializer::new(String::new());
-            for (name, value) in pairs {
-                if matches!(name.as_ref(), "instance" | "target" | "port") {
-                    continue;
-                }
-                query.append_pair(&name, &value);
-            }
-            let query = query.finish();
+            let query = business_query.join("&");
             let tail = if tail.is_empty() { "/" } else { tail };
             if query.is_empty() {
                 tail.to_owned()

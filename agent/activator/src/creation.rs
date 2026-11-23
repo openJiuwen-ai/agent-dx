@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 enum CreationStep {
     Observed(EnvironmentObservation),
+    Created(EnvironmentObservation),
     Deferred(u64),
     PreviousEnvironmentActive,
 }
@@ -40,7 +41,7 @@ impl Activator {
         environment: &EnvironmentRef,
         attempt: &adx_agent_core::CreationAttempt,
         advance_attempt: bool,
-    ) -> Result<EnvironmentObservation> {
+    ) -> Result<(EnvironmentObservation, bool)> {
         let saved = self
             .state
             .defer_creation(
@@ -68,7 +69,7 @@ impl Activator {
         mut execution: ExecutionSpec,
         volumes: &[VolumeSpec],
         deadline: u64,
-    ) -> Result<EnvironmentObservation> {
+    ) -> Result<(EnvironmentObservation, bool)> {
         let deadline_at = Instant::now()
             .checked_add(Duration::from_millis(
                 deadline.saturating_sub(adx_agent_core::unix_time_millis()),
@@ -186,7 +187,7 @@ impl Activator {
                         creation_attempt: attempt.number,
                     })
                     .await
-                    .map(CreationStep::Observed)
+                    .map(CreationStep::Created)
             })
             .await
             .map_err(|_| {
@@ -195,7 +196,8 @@ impl Activator {
                 )
             })?;
             match result {
-                Ok(CreationStep::Observed(observed)) => return Ok(observed),
+                Ok(CreationStep::Observed(observed)) => return Ok((observed, false)),
+                Ok(CreationStep::Created(observed)) => return Ok((observed, true)),
                 Ok(CreationStep::Deferred(retry_after_unix_ms)) => {
                     return Err(Error::CreationDeferred {
                         retry_after_unix_ms,

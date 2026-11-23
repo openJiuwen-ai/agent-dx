@@ -201,27 +201,26 @@ async fn digitalmate_uses_cold_start_when_golden_is_disabled() {
             expected_generation: None,
             bypass_cache: false,
             parameters: Some(format!("workspace=w-{}", "a".repeat(64)).into_bytes()),
-            reuse_subject_binding: true,
         },
         service: ServiceSelector {
             protocol: Protocol::Ws,
             port: Some(18092),
         },
     };
-    let binding = service
-        .resolve(&request, unix_time_millis() + 30_000)
-        .await
-        .unwrap()
-        .target
-        .binding;
-    assert!(binding.current.snapshot_id.is_none());
+    let deadline = unix_time_millis() + 30_000;
+    let first = service.resolve(&request, deadline).await.unwrap();
+    assert!(first.created_environment);
+    assert!(first.target.binding.current.snapshot_id.is_none());
+    let cached = service.resolve(&request, deadline).await.unwrap();
+    assert!(!cached.created_environment);
+    assert_eq!(cached.target, first.target);
     let requests = platform.0.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].execution.snapshot_id.is_none());
 }
 
 #[tokio::test]
-async fn allocation_from_the_normal_entry_tracks_a_digitalmate_subject_across_scopes() {
+async fn deleting_one_scope_preserves_the_other_scope_with_the_same_binding_id() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let service = Activator::new(state.clone(), Arc::new(Capture::default()));
     let draft = TemplateDraft::from(&template());
@@ -244,23 +243,16 @@ async fn allocation_from_the_normal_entry_tracks_a_digitalmate_subject_across_sc
         template_ref: TemplateRef::Version("2".into()),
         ..first.clone()
     };
-    assert_eq!(
-        state
-            .create_binding_for_version(next.clone(), &params, true, "2", None)
-            .await
-            .unwrap(),
-        assigned
-    );
-    service.delete_binding(&first).await.unwrap();
-    assert_eq!(state.subject_binding(&next).await.unwrap(), None);
-    let rebound = state
-        .create_binding_for_version(next.clone(), &params, true, "2", None)
+    let other = state
+        .create_binding_for_version(next.clone(), &params, "2", None)
         .await
         .unwrap();
-    assert_eq!(rebound.scope, next);
+    assert_eq!(other.scope, next);
     assert_ne!(
-        rebound.current.environment_id,
+        other.current.environment_id,
         assigned.current.environment_id
     );
-    assert_eq!(state.subject_binding(&first).await.unwrap(), Some(rebound));
+    service.delete_binding(&first).await.unwrap();
+    assert_eq!(state.binding(&next).await.unwrap(), Some(other));
+    assert!(state.binding(&first).await.unwrap().is_none());
 }

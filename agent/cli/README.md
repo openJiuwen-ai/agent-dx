@@ -19,7 +19,7 @@ adx --token-file /run/secrets/adx-token env get demo --template assistant --vers
 adx --token-file /run/secrets/adx-token env delete demo --template assistant --version 1
 ```
 
-`template.json` 使用 [Agent Template](../README.md) 的 `name/image/isolation_runtime/env/resources/service` 配置。发布文件不填写 version，响应返回服务端分配的递增数字版本，发布的模板版本不可变；查询和列举 AgentBinding 不激活 Environment，删除会调用服务端删除流程。指定 ID 的 AgentBinding 创建由 HTTP/WS/SSH 访问流量或 resolve 请求触发，CLI 不提供显式创建命令。
+`template.json` 使用 [Agent Template](../README.md) 的 `name/image/isolation_runtime/env/resources/service` 配置。发布文件不填写 version，响应返回服务端分配的递增数字版本，发布的模板版本不可变；查询和列举 AgentBinding 不激活 Environment，删除会调用服务端删除流程。指定 ID 的 AgentBinding 创建由 HTTP/WS/SSH 访问流量触发，CLI 不提供显式创建命令。
 
 `--version` 接受数字版本或非数字 Alias，HTTP/SSH 和管理查询采用相同解析规则；例如 `--version production`。
 
@@ -36,7 +36,7 @@ adx http --template assistant --version 1 --binding-id demo --port 8080 \
 adx http --template assistant --version 1 --binding-id demo --path /health
 ```
 
-CLI 使用 `/agent/http` 和管理命令相同的租户 API Key。target 始终为 template URN；`--binding-id` 经百分号编码后写入 `X-ADX-Binding-Id`，省略时由服务端生成 ID。`--path` 为 Harness 路径，可带业务 query；不能覆盖 target、instance、port 或认证 query。`--header` 可重复，凭据、`X-ADX-Binding-Id`、Host 和传输控制 Header 由 CLI 管理，不能通过 `--header` 覆盖；`--data` 与 `--data-file` 二选一。文件及 stdin 请求体流式读取，HTTP/SSE 响应逐块写入 stdout。
+CLI 使用 `/agent/http` 和管理命令相同的租户 API Key。target 始终为 template URN；`--binding-id` 经百分号编码后写入 `X-ADX-Binding-Id`，省略时由服务端生成 ID。`--path` 为 Harness 路径，可带业务 query；仅保留 target 和 port 用于路由，instance 和 token 等业务参数传给沙箱。`--header` 可重复，凭据、`X-ADX-Binding-Id`、Host 和传输控制 Header 由 CLI 管理，不能通过 `--header` 覆盖；`--data` 与 `--data-file` 二选一。文件及 stdin 请求体流式读取，HTTP/SSE 响应逐块写入 stdout。
 
 服务端返回有效的 `X-ADX-Binding-Id` 时，CLI 解码后先在 stdout 打印 `AgentBinding: ...`，随后输出原始响应体。响应头无法解码或 ID 无效时仅跳过身份提示，继续输出正文并按 HTTP 状态处理结果，不因此重试请求。该通知也可能出现在失败响应前，表示身份已确定，不表示创建成功。需要纯二进制内容时应直接使用 HTTP 客户端读取响应头和正文；CLI 的 stdout 包含身份提示。
 
@@ -84,7 +84,7 @@ adx ssh --template assistant --version 1 --binding-id demo --port 22
 
 当前冷启动可能先返回创建结果未知，或在平台报告 Running 后短暂遇到路由尚未发布。收到 ID 后连接失败时，使用 `adx binding get` 查询，并在再次连接时显式传入 `--binding-id <返回的ID>`；不要再次省略 `--binding-id`，否则会生成另一个 AgentBinding。CLI 不自动重试 SSH 连接。
 
-仅提供交互式 shell，stdin 必须是终端；不接收远程命令，不提供 SFTP、inline 或 port-forward 命令。CLI 构造路由用户名后直接启动 OpenSSH，保留终端输入、窗口调整和后端退出码，不先发送 HTTP resolve，也不做连接复用或自动重连。`--output json` 只控制管理命令输出；HTTP 凭据和超时参数用于管理及 HTTP 请求，不改变 SSH 终端。
+仅提供交互式 shell，stdin 必须是终端；不接收远程命令，不提供 SFTP、inline 或 port-forward 命令。CLI 构造路由用户名后直接启动 OpenSSH，保留终端输入、窗口调整和后端退出码，不做连接复用或自动重连。`--output json` 只控制管理命令输出；HTTP 凭据和超时参数用于管理及 HTTP 请求，不改变 SSH 终端。
 
 ## 验证范围
 
