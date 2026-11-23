@@ -50,7 +50,10 @@ fn decode_hex(data: &str) -> Result<Vec<u8>, String> {
     (0..data.len())
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(&data[i..i + 2], 16).map_err(|e| format!("invalid hex data: {e}"))
+            let pair = data
+                .get(i..i + 2)
+                .ok_or_else(|| "invalid hex data".to_string())?;
+            u8::from_str_radix(pair, 16).map_err(|e| format!("invalid hex data: {e}"))
         })
         .collect()
 }
@@ -131,24 +134,63 @@ pub fn fs_read(kw: &BTreeMap<String, Value>) -> Value {
     }
 }
 
-/// fs_write → {path, name, type, size, error}。
+/// fs_write → {path, name, type, size, error}.
 pub fn fs_write(kw: &BTreeMap<String, Value>) -> Value {
-    let path = kw_str(kw, "path").unwrap_or_default();
-    let binary = kw.get("binary").and_then(|v| v.as_bool()).unwrap_or(false);
-    let data = kw_str(kw, "data").unwrap_or_default();
-    let bytes: Vec<u8> = if binary {
-        (0..data.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(data.get(i..i + 2)?, 16).ok())
-            .collect()
+    let path = match file_arguments(
+        kw,
+        &["path", "data", "binary", "append", "create_if_missing"],
+    ) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let Some(data) = kw_str(kw, "data") else {
+        return invalid_argument("data must be a string");
+    };
+    let flag = |key: &str, default| match kw.get(key) {
+        None => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| invalid_argument(format!("{key} must be a boolean"))),
+    };
+    let binary = match flag("binary", false) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let append = match flag("append", false) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let create_if_missing = match flag("create_if_missing", true) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let bytes = if binary {
+        match decode_hex(&data) {
+            Ok(bytes) => bytes,
+            Err(message) => return invalid_argument(message),
+        }
     } else {
         data.into_bytes()
     };
-    if let Some(parent) = Path::new(&path).parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    match fs::write(&path, &bytes) {
-        Ok(_) => {
+
+    let result = (|| {
+        if let Some(parent) = Path::new(&path)
+            .parent()
+            .filter(|parent| create_if_missing && !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let mut options = OpenOptions::new();
+        options.create(create_if_missing);
+        if append {
+            options.append(true);
+        } else {
+            options.write(true).truncate(true);
+        }
+        options.open(&path)?.write_all(&bytes)
+    })();
+    match result {
+        Ok(()) => {
             let mut f = entry_fields(&path);
             f.retain(|(k, _)| matches!(*k, "name" | "path" | "type" | "size"));
             f.push(("error", nil()));

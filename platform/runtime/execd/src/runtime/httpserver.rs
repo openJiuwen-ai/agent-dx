@@ -2342,6 +2342,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_file_write_append_preserves_contents_and_write_still_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sub/file.bin");
+        let result = invoke_over_http(
+            "file.write",
+            serde_json::json!({"path":path,"data":"first","append":true}),
+        )
+        .await;
+        assert!(result["error"].is_null(), "{result}");
+
+        let result = invoke_over_http(
+            "file.write",
+            serde_json::json!({"path":path,"data":"000aff80","binary":true,"append":true,"create_if_missing":false}),
+        )
+        .await;
+        assert!(result["error"].is_null(), "{result}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\x00\x0a\xff\x80");
+
+        let result = invoke_over_http(
+            "file.write",
+            serde_json::json!({"path":path,"data":"replacement"}),
+        )
+        .await;
+        assert!(result["error"].is_null(), "{result}");
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[tokio::test]
+    async fn http_file_write_append_respects_existing_only_and_rejects_invalid_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sub/file.bin");
+        let result = invoke_over_http_status(
+            "file.write",
+            serde_json::json!({"path":path,"data":"new","append":true,"create_if_missing":false}),
+            400,
+        )
+        .await;
+        assert!(result["error"].is_string(), "{result}");
+        assert!(!path.parent().unwrap().exists());
+
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"old").unwrap();
+        let result = invoke_over_http_status(
+            "file.write",
+            serde_json::json!({"path":path,"binary":true,"data":"x你","append":true}),
+            400,
+        )
+        .await;
+        assert_eq!(result["error_code"], "INVALID_ARGUMENT");
+        let result = invoke_over_http_status(
+            "file.write",
+            serde_json::json!({"path":path,"data":"never written","append":"true"}),
+            400,
+        )
+        .await;
+        assert_eq!(result["error_code"], "INVALID_ARGUMENT");
+        assert_eq!(std::fs::read(path).unwrap(), b"old");
+    }
+
+    #[tokio::test]
     async fn http_native_file_search_matches_names_paths_and_exclusions() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();

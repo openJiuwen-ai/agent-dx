@@ -651,6 +651,14 @@ components:
           type: boolean
           default: false
           description: True selects hex bytes; false writes UTF-8 text.
+        append:
+          type: boolean
+          default: false
+          description: Append at end of file when true. Otherwise truncate and write.
+        create_if_missing:
+          type: boolean
+          default: true
+          description: Create the file and missing parents when true.
       required:
       - path
       - data
