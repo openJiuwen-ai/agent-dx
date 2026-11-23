@@ -61,7 +61,7 @@ impl RootMeta for Meta {
         Ok(())
     }
 
-    fn deactivate_root(&self, _: &RootId, _: u64, _: &str, _: &str) -> Result<()> {
+    fn deactivate_root(&self, _: &RootId, _: u64, _: &str, _: &str, _: bool) -> Result<()> {
         Err(invalid_grant("not used by creation tests"))
     }
     fn lookup_root(&self, _: &RootId) -> Result<Option<RootLocation>> {
@@ -89,6 +89,7 @@ impl RootMeta for Meta {
                 .filter(|root| root.home_node_id == home)
                 .into_iter()
                 .collect(),
+            tombstones: Vec::new(),
         })
     }
     fn acquire_root(&self, _: &RootId, _: RootRight) -> Result<RootGrant> {

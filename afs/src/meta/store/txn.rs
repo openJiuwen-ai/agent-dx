@@ -214,6 +214,10 @@ pub enum StoreOperation {
     DfsPublishReadCache,
     DfsRetireReadCache,
     DfsEnsureReplicaPlacement,
+    /// Appended last: earlier variant indexes are on disk.
+    ClearRootTombstones,
+    /// Appended last: earlier variant indexes are on disk.
+    MarkRootTombstonesIsolated,
 }
 
 impl StoreOperation {
@@ -246,6 +250,8 @@ impl StoreOperation {
             Self::DfsPublishReadCache => "dfs_publish_read_cache",
             Self::DfsRetireReadCache => "dfs_retire_read_cache",
             Self::DfsEnsureReplicaPlacement => "dfs_ensure_replica_placement",
+            Self::ClearRootTombstones => "clear_root_tombstones",
+            Self::MarkRootTombstonesIsolated => "mark_root_tombstones_isolated",
             Self::DfsSetXattr => "dfs_set_xattr",
             Self::DfsRemoveXattr => "dfs_remove_xattr",
             Self::DfsAcquireWriteLease => "dfs_acquire_write_lease",

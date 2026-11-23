@@ -102,6 +102,11 @@ service OwnerRoots {
   rpc AbortRoot(AbortRootRequest) returns (AbortRootReply);
   rpc DeactivateRoot(DeactivateRootRequest) returns (DeactivateRootReply);
   rpc ForceDeactivateRoot(ForceDeactivateRootRequest) returns (DeactivateRootReply);
+  // Home 把某代数据移出 live 路径后标记 isolated；之后不再触碰该代的 live 路径。
+  rpc MarkRootTombstonesIsolated(RootTombstonesRequest) returns (RootTombstonesReply);
+  // Home 确认某代数据已不存在后清除其 tombstone；未 isolated 的 tombstone 拒绝清除。
+  // 两者只有该 Home 的当前会话可调用。
+  rpc ClearRootTombstones(RootTombstonesRequest) returns (RootTombstonesReply);
   rpc LookupRoot(LookupRootRequest) returns (LookupRootReply);
   rpc ListOwnerRoots(ListOwnerRootsRequest) returns (ListOwnerRootsReply);
   // 只读：返回全局 Active root 快照，供各节点 outlet 镜像 worker 使用。
@@ -237,9 +242,38 @@ message DeactivateRootRequest {
   string home_node_id = 4;
   string home_session_id = 5;
   string reason = 6;
+  // Home 已把该代数据隔离进 trash、尚未回收：Meta 在同一事务写 tombstone。
+  // ForceDeactivateRoot 总是写 tombstone，忽略本字段。
+  bool retain_tombstone = 7;
 }
 
 message DeactivateRootReply {}
+
+// 已删除归属、但数据尚未确认回收的一代 workspace。isolated 为假时数据可能仍在 live 路径，
+// Home 启动时据此隔离数据而不是纳管；物理回收确认后用 ClearRootTombstones 清除。
+message RootTombstone {
+  string root_id = 1;
+  uint64 root_epoch = 2;
+  string home_node_id = 3;
+  string requester_node_id = 4;
+  uint64 deleted_at_unix_ms = 5;
+  bool isolated = 6;
+}
+
+message RootTombstoneRef {
+  string root_id = 1;
+  uint64 root_epoch = 2;
+}
+
+// 至多 256 条；已不存在的条目视为成功。
+message RootTombstonesRequest {
+  string request_id = 1;
+  string home_node_id = 2;
+  string home_session_id = 3;
+  repeated RootTombstoneRef tombstones = 4;
+}
+
+message RootTombstonesReply {}
 
 message ForceDeactivateRootRequest {
   DeactivateRootRequest root = 1;
@@ -267,6 +301,7 @@ message ListOwnerRootsReply {
   repeated RootLocation active_roots = 1;
   repeated RootReservation pending_reservations = 2;
   uint64 authority_revision = 3;
+  repeated RootTombstone tombstones = 4;
 }
 
 // ListActiveOutletRoots 是 outlet 镜像面的唯一输入：全局 Active root 全量快照。

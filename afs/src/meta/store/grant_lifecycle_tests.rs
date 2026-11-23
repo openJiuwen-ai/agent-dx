@@ -87,6 +87,7 @@ fn deactivate(epoch: u64) -> DeactivateRootInput {
         home_session_id: "s".into(),
         reason: "finished".into(),
         authenticated_home_node_id: Some("home".into()),
+        retain_tombstone: false,
     }
 }
 
@@ -686,4 +687,214 @@ async fn restarted_home_aborts_old_reservation_without_reviving_its_session() {
             .await
             .is_err()
     );
+}
+
+async fn tombstones(authority: &StoreOwnerRootAuthority) -> Vec<RootTombstoneRecord> {
+    authority
+        .list_owner_roots(ListOwnerRootsInput {
+            home_node_id: "home".into(),
+        })
+        .await
+        .unwrap()
+        .tombstones
+}
+
+fn clear(session: &str, authenticated: &str, epoch: u64) -> RootTombstonesInput {
+    RootTombstonesInput {
+        request_id: format!("clear-{session}-{authenticated}-{epoch}"),
+        home_node_id: "home".into(),
+        home_session_id: session.into(),
+        tombstones: vec![RootTombstoneRef {
+            root_id: "workspace".into(),
+            root_epoch: epoch,
+        }],
+        authenticated_home_node_id: Some(authenticated.into()),
+    }
+}
+
+/// #142: a forced deactivation leaves the Home a durable reclaim record.
+#[tokio::test]
+async fn force_deactivation_records_a_tombstone_for_the_home() {
+    let (store, _, authority) = fixture().await;
+    store
+        .register_node_session(
+            RequestKey::new("entry", "register"),
+            NodeSessionLease {
+                node_id: "entry".into(),
+                session_id: "entry-session".into(),
+                grpc_addr: "g".into(),
+                data_addr: "d".into(),
+                rest_addr: "r".into(),
+                nfs_addr: String::new(),
+                ownerfs_enabled: true,
+                storage_devices: Vec::new(),
+                lease_ttl: Duration::from_secs(300),
+            },
+        )
+        .await
+        .unwrap();
+    let reservation = reserve(&authority, "force").await;
+    activate(&authority, &reservation).await;
+    store
+        .register_node_session(
+            RequestKey::new("home", "expire"),
+            NodeSessionLease {
+                node_id: "home".into(),
+                session_id: "s".into(),
+                grpc_addr: "g".into(),
+                data_addr: "d".into(),
+                rest_addr: "r".into(),
+                nfs_addr: String::new(),
+                ownerfs_enabled: true,
+                storage_devices: Vec::new(),
+                lease_ttl: Duration::from_millis(1),
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let force = || ForceDeactivateRootInput {
+        root: DeactivateRootInput {
+            authenticated_home_node_id: Some("entry".into()),
+            ..deactivate(reservation.root_epoch)
+        },
+        requester_node_id: "entry".into(),
+        requester_session_id: "entry-session".into(),
+    };
+    authority.force_deactivate_root(force()).await.unwrap();
+    authority.force_deactivate_root(force()).await.unwrap();
+    let recorded = tombstones(&authority).await;
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].root_id, "workspace");
+    assert_eq!(recorded[0].root_epoch, reservation.root_epoch);
+    assert_eq!(recorded[0].home_node_id, "home");
+    assert_eq!(recorded[0].requester_node_id, "entry");
+    assert!(recorded[0].deleted_at_unix_ms > 0);
+    assert!(!recorded[0].isolated, "the Home never saw this deletion");
+
+    // The restarted Home may clear only after it isolated the data.
+    store
+        .register_node_session(
+            RequestKey::new("home", "restart"),
+            NodeSessionLease {
+                node_id: "home".into(),
+                session_id: "s2".into(),
+                grpc_addr: "g".into(),
+                data_addr: "d".into(),
+                rest_addr: "r".into(),
+                nfs_addr: String::new(),
+                ownerfs_enabled: true,
+                storage_devices: Vec::new(),
+                lease_ttl: Duration::from_secs(300),
+            },
+        )
+        .await
+        .unwrap();
+    let epoch = reservation.root_epoch;
+    let error = authority
+        .clear_root_tombstones(clear("s2", "home", epoch))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::META_OWNER_ROOT_BUSY);
+    assert_eq!(tombstones(&authority).await.len(), 1);
+    assert!(
+        authority
+            .mark_root_tombstones_isolated(clear("s", "home", epoch))
+            .await
+            .is_err(),
+        "a stale Home session cannot mark"
+    );
+    for request in ["mark", "mark-again"] {
+        authority
+            .mark_root_tombstones_isolated(RootTombstonesInput {
+                request_id: request.into(),
+                ..clear("s2", "home", epoch)
+            })
+            .await
+            .unwrap();
+    }
+    assert!(tombstones(&authority).await[0].isolated);
+    authority
+        .clear_root_tombstones(clear("s2", "home", epoch))
+        .await
+        .unwrap();
+    assert!(tombstones(&authority).await.is_empty());
+}
+
+/// A Home deactivation records a tombstone only when its data is still in trash.
+#[tokio::test]
+async fn home_deactivation_records_a_tombstone_only_on_request() {
+    let (_, _, authority) = fixture().await;
+    let first = reserve(&authority, "plain").await;
+    activate(&authority, &first).await;
+    authority
+        .deactivate_root(DeactivateRootInput {
+            request_id: "plain".into(),
+            ..deactivate(first.root_epoch)
+        })
+        .await
+        .unwrap();
+    assert!(tombstones(&authority).await.is_empty());
+
+    let second = reserve(&authority, "trash").await;
+    activate(&authority, &second).await;
+    authority
+        .deactivate_root(DeactivateRootInput {
+            request_id: "trash".into(),
+            retain_tombstone: true,
+            ..deactivate(second.root_epoch)
+        })
+        .await
+        .unwrap();
+    let recorded = tombstones(&authority).await;
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].root_epoch, second.root_epoch);
+    assert_eq!(recorded[0].requester_node_id, "home");
+    assert!(recorded[0].isolated, "the Home deactivates after isolating");
+}
+
+/// Only the current Home session clears its tombstones; clearing is idempotent.
+#[tokio::test]
+async fn tombstone_clear_requires_the_current_home_session() {
+    let (_, _, authority) = fixture().await;
+    let reservation = reserve(&authority, "clear").await;
+    activate(&authority, &reservation).await;
+    authority
+        .deactivate_root(DeactivateRootInput {
+            retain_tombstone: true,
+            ..deactivate(reservation.root_epoch)
+        })
+        .await
+        .unwrap();
+    let epoch = reservation.root_epoch;
+    assert!(
+        authority
+            .clear_root_tombstones(clear("stale", "home", epoch))
+            .await
+            .is_err()
+    );
+    assert!(
+        authority
+            .clear_root_tombstones(clear("s", "entry", epoch))
+            .await
+            .is_err()
+    );
+    // Another generation's tombstone is not touched.
+    authority
+        .clear_root_tombstones(clear("s", "home", epoch + 1))
+        .await
+        .unwrap();
+    assert_eq!(tombstones(&authority).await.len(), 1);
+    authority
+        .clear_root_tombstones(clear("s", "home", epoch))
+        .await
+        .unwrap();
+    assert!(tombstones(&authority).await.is_empty());
+    authority
+        .clear_root_tombstones(RootTombstonesInput {
+            request_id: "again".into(),
+            ..clear("s", "home", epoch)
+        })
+        .await
+        .unwrap();
 }

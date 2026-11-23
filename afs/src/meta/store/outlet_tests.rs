@@ -164,6 +164,7 @@ mod outlet_active_roots_tests {
                 home_session_id: "s".into(),
                 reason: "finished".into(),
                 authenticated_home_node_id: Some("home".into()),
+                retain_tombstone: false,
             })
             .await
             .unwrap();
@@ -341,6 +342,7 @@ mod outlet_digest_tests {
                 home_session_id: "s".into(),
                 reason: "finished".into(),
                 authenticated_home_node_id: Some("home".into()),
+                retain_tombstone: false,
             })
             .await
             .unwrap();

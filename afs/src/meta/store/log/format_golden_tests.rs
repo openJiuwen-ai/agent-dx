@@ -143,6 +143,16 @@ fn meta_store_enum_variant_indices_are_pinned() {
         20: MetaEntity::DfsReplicaFailureConfig(_) => MetaEntity::DfsReplicaFailureConfig(
             crate::dfs::ReplicaFailureConfig::default(),
         ),
+        21: MetaEntity::RootTombstone(_) => MetaEntity::RootTombstone(
+            crate::meta::store::RootTombstoneRecord {
+                root_id: "r".into(),
+                root_epoch: 1,
+                home_node_id: "a".into(),
+                requester_node_id: "b".into(),
+                deleted_at_unix_ms: 42,
+                isolated: false,
+            },
+        ),
     });
     pin_variants!(MetaKey {
         0: MetaKey::NodeSession { .. } => MetaKey::NodeSession {
@@ -192,6 +202,11 @@ fn meta_store_enum_variant_indices_are_pinned() {
         },
         22: MetaKey::DfsGc => MetaKey::DfsGc,
         23: MetaKey::DfsReplicaFailureConfig => MetaKey::DfsReplicaFailureConfig,
+        24: MetaKey::RootTombstone { .. } => MetaKey::RootTombstone {
+            home_node_id: "a".into(),
+            root_id: "r".into(),
+            root_epoch: 1,
+        },
     });
     pin_variants!(StoreOperation {
         0: StoreOperation::RegisterNode => StoreOperation::RegisterNode,
@@ -235,6 +250,8 @@ fn meta_store_enum_variant_indices_are_pinned() {
         38: StoreOperation::DfsPublishReadCache => StoreOperation::DfsPublishReadCache,
         39: StoreOperation::DfsRetireReadCache => StoreOperation::DfsRetireReadCache,
         40: StoreOperation::DfsEnsureReplicaPlacement => StoreOperation::DfsEnsureReplicaPlacement,
+        41: StoreOperation::ClearRootTombstones => StoreOperation::ClearRootTombstones,
+        42: StoreOperation::MarkRootTombstonesIsolated => StoreOperation::MarkRootTombstonesIsolated,
     });
 }
 
@@ -569,11 +586,11 @@ const GOLDEN: &[(&str, &str)] = &[
     ("entity.dfs_gc", "1302010163010161"),
     (
         "record.create",
-        "0003016101720a0001b96000020006016e01700200ff01690007016e016900a403010201030405010176000104303066660200ff06020009016e01700200ff00000a01690101016101720a0105050505050505050505050505050505050505050505050505050505050505050601000101610100",
+        "0004016101720a0001b96000020006016e01700200ff01690007016e016900a403010201030405010176000104303066660200ff06020009016e01700200ff00000a01690101016101720a0105050505050505050505050505050505050505050505050505050505050505050601000101610100",
     ),
     ("record.history", "01032a010200"),
     (
         "state_image.create",
-        "41465343040100000101b960020006016e01700200ff01690007016e016900a403010201030405010176000104303066660200ff060209016e01700200ff01000a0169010101016101720a0105050505050505050505050505050505050505050505050505050505050505050601b960010201000009016e01700200ff000101000a01690101016101",
+        "41465343050100000101b960020006016e01700200ff01690007016e016900a403010201030405010176000104303066660200ff060209016e01700200ff01000a0169010101016101720a0105050505050505050505050505050505050505050505050505050505050505050601b960010201000009016e01700200ff000101000a01690101016101",
     ),
 ];

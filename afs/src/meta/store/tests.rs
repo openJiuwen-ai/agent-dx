@@ -3176,6 +3176,7 @@ async fn p3_root_deactivation_accepts_accumulated_grants_below_byte_budget() {
             home_session_id: "s".into(),
             reason: "finished".into(),
             authenticated_home_node_id: Some("a".into()),
+            retain_tombstone: false,
         })
         .await;
     if let Err(error) = &result {

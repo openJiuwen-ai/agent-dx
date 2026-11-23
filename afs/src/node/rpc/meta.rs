@@ -11,6 +11,7 @@ use crate::node::vfs::ownerfs::{
     root::{
         ActiveOutletRoots, OutletRoot, OwnerRootInventory, PreparedRoot, PresentedRootAccess,
         RootGrant, RootId, RootLocation, RootLookupState, RootMeta, RootReservation, RootRight,
+        RootTombstone, RootTombstoneState,
     },
 };
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
@@ -211,6 +212,8 @@ impl GrpcRootMeta {
                     home_node_id: location.home_node_id.clone(),
                     home_session_id: location.home_session_id.clone(),
                     reason: "workspace Home unavailable".into(),
+                    // Meta always records a tombstone for a forced deactivation.
+                    retain_tombstone: false,
                 }),
                 requester_node_id: self.node_id.clone(),
                 requester_session_id: self.session_id.clone(),
@@ -253,6 +256,27 @@ fn required<T>(value: Option<T>, field: &str) -> Result<T> {
             format!("Meta reply missing {field}"),
         )
     })
+}
+
+#[cfg(feature = "ownerfs")]
+fn tombstones_request(
+    request_id: String,
+    home_node_id: &str,
+    session_id: &str,
+    tombstones: &[RootTombstone],
+) -> afs_protocol::meta::RootTombstonesRequest {
+    afs_protocol::meta::RootTombstonesRequest {
+        request_id,
+        home_node_id: home_node_id.to_owned(),
+        home_session_id: session_id.to_owned(),
+        tombstones: tombstones
+            .iter()
+            .map(|tombstone| afs_protocol::meta::RootTombstoneRef {
+                root_id: tombstone.id.0.clone(),
+                root_epoch: tombstone.epoch,
+            })
+            .collect(),
+    }
 }
 
 #[cfg(feature = "ownerfs")]
@@ -414,6 +438,7 @@ impl RootMeta for GrpcRootMeta {
         epoch: u64,
         home_node_id: &str,
         session_id: &str,
+        retain_tombstone: bool,
     ) -> Result<()> {
         let mut client = self.client();
         self.run(client.deactivate_root(DeactivateRootRequest {
@@ -423,7 +448,40 @@ impl RootMeta for GrpcRootMeta {
             home_node_id: home_node_id.to_owned(),
             home_session_id: session_id.to_owned(),
             reason: "root directory deleted".into(),
+            retain_tombstone,
         }))?;
+        Ok(())
+    }
+
+    fn mark_root_tombstones_isolated(
+        &self,
+        home_node_id: &str,
+        session_id: &str,
+        tombstones: &[RootTombstone],
+    ) -> Result<()> {
+        let mut client = self.client();
+        self.run(client.mark_root_tombstones_isolated(tombstones_request(
+            self.request_id(),
+            home_node_id,
+            session_id,
+            tombstones,
+        )))?;
+        Ok(())
+    }
+
+    fn clear_root_tombstones(
+        &self,
+        home_node_id: &str,
+        session_id: &str,
+        tombstones: &[RootTombstone],
+    ) -> Result<()> {
+        let mut client = self.client();
+        self.run(client.clear_root_tombstones(tombstones_request(
+            self.request_id(),
+            home_node_id,
+            session_id,
+            tombstones,
+        )))?;
         Ok(())
     }
 
@@ -496,6 +554,25 @@ impl RootMeta for GrpcRootMeta {
                 .pending_reservations
                 .into_iter()
                 .map(reservation_from_wire)
+                .collect::<Result<Vec<_>>>()?,
+            tombstones: reply
+                .tombstones
+                .into_iter()
+                .map(|value| {
+                    if value.root_id.is_empty() || value.root_epoch == 0 {
+                        return Err(Error::coded(
+                            CLIENT_PROTOCOL_VIOLATION,
+                            "Meta returned an incomplete root tombstone",
+                        ));
+                    }
+                    Ok(RootTombstoneState {
+                        tombstone: RootTombstone {
+                            id: RootId(value.root_id),
+                            epoch: value.root_epoch,
+                        },
+                        isolated: value.isolated,
+                    })
+                })
                 .collect::<Result<Vec<_>>>()?,
         })
     }

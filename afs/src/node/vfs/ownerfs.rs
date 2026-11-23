@@ -167,6 +167,9 @@ impl OwnerFs {
         local
             .roots
             .finish_isolated_roots(|id, epoch| local.retire_root_state(id, Some(epoch), None))?;
+        // Isolate tombstoned data that startup could not move, then reclaim
+        // trash and clear the tombstones of generations confirmed gone.
+        local.roots.retry_pending_tombstones()?;
         local.roots.collect_trash()?;
         Ok(())
     }
@@ -8632,7 +8635,14 @@ mod tests {
             Ok(())
         }
 
-        fn deactivate_root(&self, root_id: &RootId, _: u64, _: &str, _: &str) -> Result<()> {
+        fn deactivate_root(
+            &self,
+            root_id: &RootId,
+            _: u64,
+            _: &str,
+            _: &str,
+            _: bool,
+        ) -> Result<()> {
             self.active.lock().unwrap().remove(root_id);
             Ok(())
         }
@@ -8666,6 +8676,7 @@ mod tests {
                     .filter(|reservation| reservation.home_node_id == home_node_id)
                     .cloned()
                     .collect(),
+                tombstones: Vec::new(),
             })
         }
 
@@ -8774,7 +8785,7 @@ mod tests {
             Ok(())
         }
 
-        fn deactivate_root(&self, _: &RootId, _: u64, _: &str, _: &str) -> Result<()> {
+        fn deactivate_root(&self, _: &RootId, _: u64, _: &str, _: &str, _: bool) -> Result<()> {
             Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
         }
 

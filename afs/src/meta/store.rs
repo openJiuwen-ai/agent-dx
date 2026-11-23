@@ -80,7 +80,8 @@ pub use model::{
     BackendPersistence, BackendReadiness, MetaEntity, MetaKey, MetaRead, MetaSnapshot, NodeSession,
     NodeSessionLease, OwnerRootScan, RecoveryCursor, RecoveryReason, RecoveryScan, RequestKey,
     RootAccessGrant, RootCommandAck, RootCommandRecord, RootCommandType, RootRecord,
-    RootReservationRecord, RootRight, StoreRevision, WatchBatch, WatchChange, WatchEvent,
+    RootReservationRecord, RootRight, RootTombstoneRecord, StoreRevision, WatchBatch, WatchChange,
+    WatchEvent,
 };
 pub(crate) use model::{
     WATCH_RESPONSE_BASE_BYTES, WATCH_RESPONSE_MAX_BYTES, WATCH_RESPONSE_MAX_EVENTS,

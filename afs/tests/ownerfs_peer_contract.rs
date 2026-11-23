@@ -279,6 +279,7 @@ impl RootMeta for ContractMeta {
         _epoch: u64,
         _home_node_id: &str,
         _session_id: &str,
+        _retain_tombstone: bool,
     ) -> afs_error::Result<()> {
         *self.active.lock().unwrap() = None;
         Ok(())
@@ -343,6 +344,7 @@ impl RootMeta for ContractMeta {
                 .filter(|reservation| reservation.home_node_id == home_node_id)
                 .into_iter()
                 .collect(),
+            tombstones: Vec::new(),
         })
     }
 

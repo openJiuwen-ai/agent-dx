@@ -504,7 +504,7 @@ Bao sidecar、Peer cache 条目与目录标记、外部对象 key 前缀、Owner
   停机升级后所有 Node 都是新 session，旧记录不会再被重放比对。
 - **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
 - **协议**：`RegisterNodeRequest.protocol_version` 是集群线协议代际（Node↔Meta 注册、Node↔Node service
-  布局），当前为 10（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本，8 为元数据复合操作：setattr 可不带客户端 revision、create 并入首个写代引用、复合打开，9 为 OwnerFs Workspace API RPCs，10 为 workspace 准备携带调用者身份、请求内 `uid`/`gid` 仅 root 可作为不同属主），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
+  布局），当前为 11（5 为 `ReadDir` 分页，6 为降级写策略，7 为代理同步回执携带代理句柄的已提交版本，8 为元数据复合操作：setattr 可不带客户端 revision、create 并入首个写代引用、复合打开，9 为 OwnerFs Workspace API RPCs，10 为 workspace 准备携带调用者身份、请求内 `uid`/`gid` 仅 root 可作为不同属主，11 为 workspace 删除 tombstone：`ListOwnerRoots` 返回 tombstone、新增 `MarkRootTombstonesIsolated` 与 `ClearRootTombstones`，同时覆盖 Node 间新增的 `OwnerControl.WorkspaceOutletLayouts`），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局或节点间消息语义变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
@@ -1164,6 +1164,25 @@ Workspace API 的递归删除将对应代次先原子移入 trash，再下线 Me
 退役目录交给后台回收，同名新工作区使用新的 epoch。启动时已知历史记录若可确认
 只是删除残留，补完收尾。暂时清理失败时交给后台重试，包括目录已经缺失的记录。
 目录或归属存在冲突时保留该记录和数据，且不准入该工作区，其余工作区照常恢复。
+
+回收证据是 Meta 的 `RootTombstone`（键为 Home、root id、epoch），与删除 Root 同一事务写入，
+并带 `isolated` 标记：Workspace API 递归删除在 Home 把该代目录移入 `.ownerfs-trash` 后注销，
+写入时即为 isolated；Home 不可达的 force 停用写入未 isolated 的 tombstone。空目录 rmdir 与
+zombie 清理注销前目录已不存在，不写 tombstone。
+
+各代 workspace 共用同一个不带 epoch 的活路径，所以活目录本身不能证明它属于哪一代。reconcile
+在取消 pending 预留与丢弃过期 catalog 记录之前处理本 Home 的 tombstone：已 isolated 的代次
+永不触碰活路径；未 isolated 的代次，若同名更新代次占用了路径或活路径为空，即证明数据已离开
+活路径；否则只有该代自己的 catalog 记录能证明活目录是它的数据，此时把目录 rename 进 trash。
+随后 Home 以 `MarkRootTombstonesIsolated` 记录隔离，再丢弃该 catalog 记录。没有 catalog 证据
+的活目录可能是新业务数据，活目录与同 epoch trash 条目同时存在时两者都可能是被删数据，这两种
+情况都保留并告警，等待人工处理。标记之前该名字的纳管与同名创建都被
+拒绝，`collect_trash` 也保留其 trash 条目（它是"已隔离"的唯一本地证据）；失败由后台维护重试，
+不阻止挂载。因此 force 删除后 Home 重启不会复活 workspace，也不会移走同名的新目录。
+
+`collect_trash` 删除 trash 条目后，或确认已 isolated 的代次已无 trash 时，Home 以
+`ClearRootTombstones` 清除；Meta 拒绝清除未 isolated 的 tombstone。清除失败留在内存队列下一轮
+重试，进程重启后由 reconcile 重新发现。tombstone 随状态 image 5、记录决策 4 引入。
 
 `/public` 下的 `.pub`（原子发布的暂存目录）与 `.quarantine`（消费方违约时的
 隔离区）归镜像所有，不能作为 workspace 名：创建时即拒（`EINVAL`）。快照里若

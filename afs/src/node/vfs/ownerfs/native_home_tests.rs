@@ -112,7 +112,7 @@ impl RootMeta for NativeHomeMeta {
         Ok(())
     }
 
-    fn deactivate_root(&self, root_id: &RootId, _: u64, _: &str, _: &str) -> Result<()> {
+    fn deactivate_root(&self, root_id: &RootId, _: u64, _: &str, _: &str, _: bool) -> Result<()> {
         if self.fail_deactivate.load(Ordering::SeqCst) {
             return Err(Error::coded(
                 afs_error::NODE_VFS_UNAVAILABLE,
@@ -155,6 +155,7 @@ impl RootMeta for NativeHomeMeta {
                 .filter(|reservation| reservation.home_node_id == home_node_id)
                 .cloned()
                 .collect(),
+            tombstones: Vec::new(),
         })
     }
 

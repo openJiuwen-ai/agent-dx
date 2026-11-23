@@ -103,6 +103,15 @@ impl State {
                     root_id: root_id.clone(),
                 })
             }
+            MetaRead::RootTombstone {
+                home_node_id,
+                root_id,
+                root_epoch,
+            } => state.entities.get(&MetaKey::RootTombstone {
+                home_node_id: home_node_id.clone(),
+                root_id: root_id.clone(),
+                root_epoch: *root_epoch,
+            }),
             MetaRead::RootGrantByHolder {
                 root_id,
                 holder_node_id,
@@ -548,6 +557,7 @@ impl State {
         let state = self;
         let mut roots = Vec::new();
         let mut reservations = Vec::new();
+        let mut tombstones = Vec::new();
         for versioned in state.entities.values() {
             match &versioned.entity {
                 MetaEntity::Root(root) if root.home_node_id == home_node_id => {
@@ -558,6 +568,9 @@ impl State {
                 {
                     reservations.push(reservation.clone());
                 }
+                MetaEntity::RootTombstone(tombstone) if tombstone.home_node_id == home_node_id => {
+                    tombstones.push(tombstone.clone());
+                }
                 _ => {}
             }
         }
@@ -566,6 +579,7 @@ impl State {
             home_node_id: home_node_id.to_owned(),
             roots,
             reservations,
+            tombstones,
         })
     }
 }

@@ -1445,16 +1445,15 @@ fn image_and_decision_versions_are_identified_before_the_full_decode() {
     // postcard: four magic bytes, then the schema varint.
     assert_eq!(image[..4], super::IMAGE_MAGIC);
     assert_eq!(u16::from(image[4]), super::IMAGE_SCHEMA);
-    // Image 3 is the pre-outlet-nfs-address checkpoint (the session carried
-    // no dedicated NFS address field): refused, never read as "protects
-    // nothing".
-    image[4] = 3;
+    // Image 4 is the pre-tombstone checkpoint: an older Meta could not
+    // decode a tombstone, so the previous version is refused outright.
+    image[4] = 4;
     image.truncate(5);
     assert_incompatible(
         super::StateImage::validate_encoded(&image, LIMIT).unwrap_err(),
         "Meta checkpoint state image",
-        "version 3",
-        "supports version 4",
+        "version 4",
+        "supports version 5",
     );
 
     let entity = root_entity();
@@ -1468,7 +1467,7 @@ fn image_and_decision_versions_are_identified_before_the_full_decode() {
         RecordDecision::decode(&bytes, LIMIT).unwrap_err(),
         "Meta WAL record decision",
         "version 1",
-        "supports version 3",
+        "supports version 4",
     );
     let mut framed = postcard::to_allocvec(&super::Record::from(record)).unwrap();
     assert_eq!((framed[0], u16::from(framed[1])), (0, super::SCHEMA));
@@ -1477,7 +1476,7 @@ fn image_and_decision_versions_are_identified_before_the_full_decode() {
         super::Record::check_schema(&framed).unwrap_err(),
         "Meta WAL record decision",
         "version 1",
-        "supports version 3",
+        "supports version 4",
     );
     super::Record::check_schema(&postcard::to_allocvec(&1u32).unwrap()).unwrap();
 }
