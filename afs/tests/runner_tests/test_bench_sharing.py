@@ -133,20 +133,21 @@ class SummaryAttributionTests(unittest.TestCase):
 
     def summary(self, roles, **extra):
         suite = load_suite()
-        recorded = {}
 
         class Cluster:
-            config = bench(**extra)
+            def __init__(self):
+                self.config = bench(**extra)
+                self.roles = list(roles)
+                self.recorded = {}
 
             def record(self, name, value):
-                recorded[name] = value
+                self.recorded[name] = value
                 return value
 
         cluster = Cluster()
-        cluster.roles = list(roles)
         suite.summaries(cluster, [{"op": "read", "layer": "hot", "tool": "fio", "block_bytes": MIB, "threads": 1,
                                    "result": {"mib_per_s": 10.0}}] * 3)
-        return recorded["bench.summary"]
+        return cluster.recorded["bench.summary"]
 
     def test_only_inert_keys_are_no_variant(self):
         row = self.summary("MABC", variant="Vq", node_overrides={

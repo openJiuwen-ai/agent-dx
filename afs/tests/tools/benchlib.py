@@ -83,8 +83,7 @@ class BenchParameters:
         return effective_settings(self.overrides_for(role))
 
     def applied_overrides(self, roles):
-        """Effective overrides of the given Node roles; roles outside the cluster or left with no
-        effective setting contribute nothing."""
+        """Return nonempty effective overrides for the given Node roles."""
         return {role: self.effective_overrides(role) for role in roles
                 if role in NODE_ROLES and self.effective_overrides(role)}
 
