@@ -72,6 +72,186 @@ class ReadCacheKeyTests(unittest.TestCase):
                                              "dfs_read_stripe_bytes = %d" % MIB, "dfs_source_cache_max_ms = 0"])
 
 
+class ReadCacheBudgetKeyTests(unittest.TestCase):
+    """H2 step 1 keys: staging/partial budgets and the single-source TTL, within product limits."""
+
+    def test_budget_and_single_ttl_keys_are_accepted_at_product_bounds(self):
+        for settings in ({"dfs_read_cache_queue_bytes": 4 * MIB}, {"dfs_read_cache_queue_bytes": 1024 * MIB},
+                         {"dfs_read_cache_partial_bytes": 0}, {"dfs_read_cache_partial_bytes": 4 * MIB},
+                         {"dfs_read_cache_partial_bytes": 1024 * MIB}, {"dfs_source_single_ttl_ms": 0},
+                         {"dfs_source_single_ttl_ms": 60000}):
+            with self.subTest(settings=settings):
+                p = benchlib.parameters(bench(variant="VR", node_overrides={
+                    "B": dict(settings, dfs_read_cache_bytes=64 * MIB)}))
+                self.assertEqual(p.inert_overrides("B"), [])
+
+    def test_out_of_range_values_are_blocked(self):
+        for bad in ({"dfs_read_cache_queue_bytes": 0}, {"dfs_read_cache_queue_bytes": 4 * MIB - 1},
+                    {"dfs_read_cache_queue_bytes": 1024 * MIB + 1}, {"dfs_read_cache_partial_bytes": 1},
+                    {"dfs_read_cache_partial_bytes": 4 * MIB - 1}, {"dfs_read_cache_partial_bytes": 1024 * MIB + 1},
+                    {"dfs_source_single_ttl_ms": 60001}, {"dfs_source_single_ttl_ms": -1},
+                    {"dfs_source_single_ttl_ms": True}):
+            with self.subTest(bad=bad):
+                blocked(self, variant="Vx", node_overrides={"B": dict(bad, dfs_read_cache_bytes=64 * MIB)})
+
+    def test_keys_without_the_read_cache_are_accepted_and_reported_inert(self):
+        # The product range-checks these on every Node but uses them only when dfs_read_cache_bytes is
+        # non-zero, so the bench records them as having no effect instead of refusing.
+        p = benchlib.parameters(bench(variant="Vx", node_overrides={
+            "*": {"dfs_read_cache_queue_bytes": 64 * MIB, "dfs_source_single_ttl_ms": 100},
+            "B": {"dfs_read_cache_bytes": 64 * MIB}, "C": {"dfs_read_cache_bytes": 0,
+                                                          "dfs_read_cache_partial_bytes": 0}}))
+        self.assertEqual(p.inert_overrides("B"), [])
+        self.assertEqual(p.inert_overrides("A"), ["dfs_read_cache_queue_bytes", "dfs_source_single_ttl_ms"])
+        self.assertEqual(p.inert_overrides("C"), ["dfs_read_cache_partial_bytes", "dfs_read_cache_queue_bytes",
+                                                  "dfs_source_single_ttl_ms"])
+
+    def test_keys_render_as_top_level_settings(self):
+        toml = benchlib.node_overrides_toml({"dfs_read_cache_bytes": 64 * MIB, "dfs_read_cache_queue_bytes": 8 * MIB,
+                                             "dfs_read_cache_partial_bytes": 0, "dfs_source_single_ttl_ms": 250},
+                                            "/unused")
+        self.assertEqual(toml.splitlines(), ["dfs_read_cache_bytes = %d" % (64 * MIB),
+                                             "dfs_read_cache_partial_bytes = 0",
+                                             "dfs_read_cache_queue_bytes = %d" % (8 * MIB),
+                                             "dfs_source_single_ttl_ms = 250"])
+
+    def test_cluster_records_inert_keys_only_when_present(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = ClusterRenderingTests().cluster(d, {"dfs_read_cache_queue_bytes": 64 * MIB, "dfs_read_cache_bytes": 0},
+                                                variant="Vq",
+                                                node_overrides={"B": {"dfs_read_cache_queue_bytes": 64 * MIB}})
+            c.write_configs()
+            records = {e["check"]: e["value"] for e in c.evidence if e["check"].startswith("bench.node_overrides.")}
+            self.assertEqual(records["bench.node_overrides.B"]["inert"], ["dfs_read_cache_queue_bytes"])
+            self.assertNotIn("inert", records["bench.node_overrides.A"])
+
+
+class SummaryAttributionTests(unittest.TestCase):
+    """bench.summary attributes a variant only to settings that take effect on a started Node."""
+
+    QUEUE, PARTIAL, TTL = "dfs_read_cache_queue_bytes", "dfs_read_cache_partial_bytes", "dfs_source_single_ttl_ms"
+
+    def summary(self, roles, **extra):
+        suite = load_suite()
+
+        class Cluster:
+            def __init__(self):
+                self.config = bench(**extra)
+                self.roles = list(roles)
+                self.recorded = {}
+
+            def record(self, name, value):
+                self.recorded[name] = value
+                return value
+
+        cluster = Cluster()
+        suite.summaries(cluster, [{"op": "read", "layer": "hot", "tool": "fio", "block_bytes": MIB, "threads": 1,
+                                   "result": {"mib_per_s": 10.0}}] * 3)
+        return cluster.recorded["bench.summary"]
+
+    def test_only_inert_keys_are_no_variant(self):
+        row = self.summary("MABC", variant="Vq", node_overrides={
+            "*": {self.QUEUE: 64 * MIB, self.TTL: 100}, "B": {self.PARTIAL: 0}})
+        self.assertEqual(row["node_overrides"], {})
+        self.assertFalse(row["variant_applied"])
+        # Only the read-cache-only keys are filtered: an explicit dfs_read_cache_bytes = 0 is still declared.
+        row = self.summary("MABC", variant="Vq",
+                           node_overrides={"B": {"dfs_read_cache_bytes": 0, self.QUEUE: 64 * MIB}})
+        self.assertEqual(row["node_overrides"], {"B": {"dfs_read_cache_bytes": 0}})
+        # The same effectiveness rule admits such a declaration under the V0 label.
+        self.assertEqual(benchlib.parameters(bench(node_overrides={"*": {self.QUEUE: 64 * MIB}})).variant, "V0")
+
+    def test_wildcard_keys_count_only_on_nodes_with_the_read_cache(self):
+        row = self.summary("MABC", variant="VR", node_overrides={
+            "*": {self.QUEUE: 64 * MIB, self.TTL: 100},
+            "A": {"dfs_read_parallelism": 4}, "B": {"dfs_read_cache_bytes": 64 * MIB}})
+        self.assertEqual(row["node_overrides"], {
+            "A": {"dfs_read_parallelism": 4},
+            "B": {"dfs_read_cache_bytes": 64 * MIB, self.QUEUE: 64 * MIB, self.TTL: 100}})
+        self.assertTrue(row["variant_applied"])
+
+    def test_overrides_for_roles_not_started_are_no_variant(self):
+        row = self.summary("MAB", variant="Vx", node_overrides={"D": {"dfs_read_parallelism": 4}})
+        self.assertEqual((row["node_overrides"], row["variant_applied"]), ({}, False))
+
+    def test_replica_settings_keep_the_variant_applied(self):
+        row = self.summary("MABC", variant="P3", dfs_desired_copies=3, dfs_sync_required_copies=1,
+                           node_overrides={"*": {self.QUEUE: 64 * MIB}})
+        self.assertEqual(row["node_overrides"], {})
+        self.assertTrue(row["variant_applied"])
+
+    def test_node_evidence_keeps_every_declared_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = ClusterRenderingTests().cluster(d, {self.QUEUE: 64 * MIB, "dfs_read_cache_bytes": 0},
+                                                node_overrides={"B": {self.QUEUE: 64 * MIB}})
+            c.write_configs()
+            record = {e["check"]: e["value"] for e in c.evidence}["bench.node_overrides.B"]
+            self.assertEqual(record, {"declared": {self.QUEUE: 64 * MIB}, "mismatches": [], "inert": [self.QUEUE]})
+
+    def test_binary_without_the_new_field_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = ClusterRenderingTests().cluster(d, {"dfs_read_cache_bytes": 0},
+                                                node_overrides={"B": {self.QUEUE: 64 * MIB}})
+            with self.assertRaises(AssertionError):
+                c.write_configs()
+
+
+class SingleTtlAttributionTests(unittest.TestCase):
+    """The single-source TTL only acts while the read cache runs and the ordinary source TTL is non-zero."""
+
+    QUEUE, TTL = SummaryAttributionTests.QUEUE, SummaryAttributionTests.TTL
+    CACHE, NORMAL = "dfs_read_cache_bytes", "dfs_source_cache_max_ms"
+    summary = SummaryAttributionTests.summary
+
+    def test_zero_ordinary_ttl_makes_any_single_ttl_inert(self):
+        rows = [self.summary("MABC", variant="VR", node_overrides={
+            "*": {self.NORMAL: 0}, "B": {self.CACHE: 64 * MIB, self.TTL: ttl}}) for ttl in (100, 250)]
+        self.assertEqual(rows[0]["node_overrides"], rows[1]["node_overrides"])
+        self.assertNotIn(self.TTL, rows[0]["node_overrides"]["B"])
+        p = benchlib.parameters(bench(variant="VR", node_overrides={
+            "*": {self.NORMAL: 0}, "B": {self.CACHE: 64 * MIB, self.TTL: 100}}))
+        self.assertEqual(p.inert_overrides("B"), [self.TTL])
+
+    def test_wildcard_and_role_settings_are_merged_before_judging(self):
+        overrides = {"*": {self.NORMAL: 0, self.TTL: 100, self.QUEUE: 64 * MIB},
+                     "B": {self.CACHE: 64 * MIB}, "C": {self.CACHE: 64 * MIB, self.NORMAL: 1000}}
+        p = benchlib.parameters(bench(variant="VR", node_overrides=overrides))
+        self.assertEqual(p.inert_overrides("B"), [self.TTL])
+        self.assertEqual(p.inert_overrides("C"), [])
+        self.assertEqual(p.inert_overrides("A"), [self.QUEUE, self.TTL])
+        row = self.summary("MABC", variant="VR", node_overrides=overrides)
+        self.assertEqual(row["node_overrides"], {
+            "A": {self.NORMAL: 0},
+            "B": {self.NORMAL: 0, self.QUEUE: 64 * MIB, self.CACHE: 64 * MIB},
+            "C": {self.NORMAL: 1000, self.TTL: 100, self.QUEUE: 64 * MIB, self.CACHE: 64 * MIB}})
+        self.assertTrue(row["variant_applied"])
+
+    def test_explicit_zero_single_ttl_keeps_the_ordinary_deadline_and_counts(self):
+        # Ordinary TTL left at its product default (non-zero): single TTL 0 means "use the ordinary deadline".
+        row = self.summary("MAB", variant="VR", node_overrides={"B": {self.CACHE: 64 * MIB, self.TTL: 0}})
+        self.assertEqual(row["node_overrides"], {"B": {self.CACHE: 64 * MIB, self.TTL: 0}})
+
+    def test_only_an_inert_single_ttl_besides_the_variant_settings(self):
+        # B's remaining settings still form a variant even though its single TTL is dropped.
+        row = self.summary("MAB", variant="VR", node_overrides={
+            "B": {self.CACHE: 64 * MIB, self.NORMAL: 0, self.TTL: 100}})
+        self.assertEqual(row["node_overrides"], {"B": {self.CACHE: 64 * MIB, self.NORMAL: 0}})
+        self.assertTrue(row["variant_applied"])
+
+    def test_node_evidence_lists_the_single_ttl_as_inert_and_still_checks_it(self):
+        declared = {self.CACHE: 64 * MIB, self.NORMAL: 0, self.TTL: 100}
+        with tempfile.TemporaryDirectory() as d:
+            c = ClusterRenderingTests().cluster(d, dict(declared), variant="VR", node_overrides={"B": declared})
+            c.write_configs()
+            record = {e["check"]: e["value"] for e in c.evidence}["bench.node_overrides.B"]
+            self.assertEqual(record, {"declared": declared, "mismatches": [], "inert": [self.TTL]})
+        with tempfile.TemporaryDirectory() as d:
+            effective = {self.CACHE: 64 * MIB, self.NORMAL: 0}
+            c = ClusterRenderingTests().cluster(d, effective, variant="VR", node_overrides={"B": declared})
+            with self.assertRaises(AssertionError):
+                c.write_configs()
+
+
 class AbsentRoleTests(unittest.TestCase):
     @staticmethod
     def topology(roles, **extra):

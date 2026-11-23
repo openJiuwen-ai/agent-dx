@@ -31,7 +31,15 @@ OVERRIDE_KEYS = {
     "dfs_read_cache_bytes": ("zero_or", 4 * MIB + 4 * KIB, 1024**4),
     "dfs_read_stripe_bytes": ("step", 64 * KIB, 64 * KIB, 8 * MIB),
     "dfs_source_cache_max_ms": ("int", 0, 60_000),
+    "dfs_read_cache_queue_bytes": ("int", 4 * MIB, 1024 * MIB),
+    "dfs_read_cache_partial_bytes": ("zero_or", 4 * MIB, 1024 * MIB),
+    "dfs_source_single_ttl_ms": ("int", 0, 60_000),
 }
+# Settings the product range-checks on every Node but uses only while the native read cache runs
+# (dfs_read_cache_bytes non-zero): accepted without it, but recorded as inert instead of effective.
+READ_CACHE_ONLY = ("dfs_read_cache_queue_bytes", "dfs_read_cache_partial_bytes", "dfs_source_single_ttl_ms")
+# Product default of dfs_source_cache_max_ms (config/dfs.rs resolve_read_budget) when a role leaves it unset.
+SOURCE_CACHE_MAX_MS_DEFAULT = 5000
 # The serveable read cache and the private peer cache are exclusive on one Node (the product refuses both).
 EXCLUSIVE_OVERRIDES = ("dfs_read_cache_bytes", "dfs_peer_cache.")
 LOCAL_COPY = ("required", "preferred", "none")
@@ -66,9 +74,18 @@ class BenchParameters:
         """Effective overrides for one Node role: the "*" entries, then the role's own."""
         return {**self.node_overrides.get("*", {}), **self.node_overrides.get(role, {})}
 
+    def inert_overrides(self, role):
+        """Declared settings the product ignores on this role because its read cache is off."""
+        return inert_keys(self.overrides_for(role))
+
+    def effective_overrides(self, role):
+        """The role's merged settings without the ones it ignores at run time (inert_overrides)."""
+        return effective_settings(self.overrides_for(role))
+
     def applied_overrides(self, roles):
-        """Overrides that reach the given Node roles; roles outside the cluster contribute nothing."""
-        return {role: self.overrides_for(role) for role in roles if role in NODE_ROLES and self.overrides_for(role)}
+        """Return nonempty effective overrides for the given Node roles."""
+        return {role: self.effective_overrides(role) for role in roles
+                if role in NODE_ROLES and self.effective_overrides(role)}
 
     def tool(self, name):
         """Return (absolute path, extra environment) for a declared tool."""
@@ -117,6 +134,27 @@ def parameters(config):
         else NODE_ROLES
     return BenchParameters(size, tuple(blocks), tuple(threads), rounds, dict(tools),
                            **_variant_inputs(values, present))
+
+
+def inert_keys(merged):
+    """Declared settings one role's Node ignores at run time, judged on its merged ("*" + role) settings.
+
+    With the read cache off (dfs_read_cache_bytes absent or 0) every READ_CACHE_ONLY key is inert. With it
+    on, the single-source TTL is still inert while the ordinary source TTL is 0: the Node then caches no
+    source metadata at all (sources.rs source_deadline yields no deadline, so source_expiry none). An
+    explicit single TTL of 0 under a non-zero ordinary TTL keeps the ordinary deadline and is not inert.
+    """
+    if not merged.get("dfs_read_cache_bytes", 0):
+        return sorted(k for k in merged if k in READ_CACHE_ONLY)
+    if "dfs_source_single_ttl_ms" in merged and not merged.get("dfs_source_cache_max_ms",
+                                                               SOURCE_CACHE_MAX_MS_DEFAULT):
+        return ["dfs_source_single_ttl_ms"]
+    return []
+
+
+def effective_settings(merged):
+    inert = inert_keys(merged)
+    return {k: v for k, v in merged.items() if k not in inert}
 
 
 def _override_value(key, value):
@@ -233,7 +271,7 @@ def _variant_inputs(values, present=NODE_ROLES):
     variant = values.get("variant", "V0")
     if not isinstance(variant, str) or not 1 <= len(variant) <= 32:
         raise Blocked("bench variant must be a label of 1..32 characters")
-    applied = any({**overrides.get("*", {}), **overrides.get(r, {})} for r in present)
+    applied = any(effective_settings({**overrides.get("*", {}), **overrides.get(r, {})}) for r in present)
     if (applied or replication) and variant == "V0":
         raise Blocked("bench node overrides and replica settings need a variant label other than V0")
     readers = values.get("readers", 2)
