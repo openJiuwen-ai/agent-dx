@@ -31,6 +31,17 @@ def _without_afs_environment():
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def _test_suites_stub(repo):
+    for directory in (
+        "build/e2e/tests", "build/release/tests", "build/runtime/tests", "build/e2b",
+    ):
+        target = repo / directory
+        target.mkdir(parents=True)
+        (target / "test_stub.py").write_text(
+            "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
+        )
+
+
 def _api_gate_stub(repo):
     (repo / '.buildkite/api-contract-gate.sh').write_text(
         '#!/usr/bin/env bash\n'
@@ -210,18 +221,7 @@ class PipelineContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             (repo / ".buildkite").mkdir()
-            (repo / "build/e2e/tests").mkdir(parents=True)
-            (repo / "build/e2b").mkdir(parents=True)
-            (repo / "build/release/tests").mkdir(parents=True)
-            (repo / "build/e2e/tests/test_stub.py").write_text(
-                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
-            )
-            (repo / "build/release/tests/test_stub.py").write_text(
-                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
-            )
-            (repo / "build/e2b/test_stub.py").write_text(
-                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
-            )
+            _test_suites_stub(repo)
             (repo / ".gitignore").write_text("gate-ran\nout/\n__pycache__/\n")
             (repo / ".buildkite/source-gate.sh").write_text((ROOT / ".buildkite/source-gate.sh").read_text())
             (repo / ".buildkite/bootstrap-build.sh").write_text("#!/usr/bin/env bash\n")
@@ -275,18 +275,7 @@ class PipelineContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             (repo / ".buildkite").mkdir()
-            (repo / "build/e2e/tests").mkdir(parents=True)
-            (repo / "build/e2b").mkdir(parents=True)
-            (repo / "build/release/tests").mkdir(parents=True)
-            (repo / "build/e2e/tests/test_stub.py").write_text(
-                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
-            )
-            (repo / "build/release/tests/test_stub.py").write_text(
-                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
-            )
-            (repo / "build/e2b/test_stub.py").write_text(
-                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
-            )
+            _test_suites_stub(repo)
             (repo / ".gitignore").write_text("bootstrap-ran\nout/\n__pycache__/\n")
             (repo / ".buildkite/source-gate.sh").write_text((ROOT / ".buildkite/source-gate.sh").read_text())
             (repo / ".buildkite/bootstrap-build.sh").write_text("echo bootstrap-ran > bootstrap-ran\n")
@@ -312,18 +301,7 @@ class PipelineContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             (repo / ".buildkite").mkdir()
-            (repo / "build/e2e/tests").mkdir(parents=True)
-            (repo / "build/e2b").mkdir(parents=True)
-            (repo / "build/release/tests").mkdir(parents=True)
-            (repo / "build/e2e/tests/test_stub.py").write_text(
-                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
-            )
-            (repo / "build/release/tests/test_stub.py").write_text(
-                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
-            )
-            (repo / "build/e2b/test_stub.py").write_text(
-                "import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
-            )
+            _test_suites_stub(repo)
             (repo / ".gitignore").write_text("gate-ran\nout/\n__pycache__/\n")
             (repo / ".buildkite/source-gate.sh").write_text((ROOT / ".buildkite/source-gate.sh").read_text())
             (repo / ".buildkite/bootstrap-build.sh").write_text("#!/usr/bin/env bash\n")
