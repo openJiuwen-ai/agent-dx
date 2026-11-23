@@ -83,7 +83,7 @@ class FirecrackerEvidenceTests(unittest.TestCase):
         images = []
 
         def capture_rootfs(command, **_kwargs):
-            if command[0] != '/mock/mkfs.erofs':
+            if Path(command[0]).name != 'mkfs.erofs':
                 return None
             root = Path(command[-1])
             manifest = root / 'etc/adx-envd-manifest.json'
@@ -109,9 +109,11 @@ class FirecrackerEvidenceTests(unittest.TestCase):
             source, archive, execd = fixture_module.fixture(base)
             envd_binary = base / 'envd'
             envd_binary.write_bytes(b'envd')
+            for tool_name in ('mkfs.erofs', 'fsck.erofs'):
+                (base / tool_name).write_text(f'fixture {tool_name}\n')
             with (
                 mock.patch.object(module, 'SOURCE', source),
-                mock.patch.object(module, '_executable', side_effect=lambda name: str(Path('/mock') / name)),
+                mock.patch.object(module, '_executable', side_effect=lambda name: str(base / name)),
                 mock.patch.object(module, 'static_executable'),
                 mock.patch.object(module.os, 'chown') as chown,
                 mock.patch.object(module.subprocess, 'run', side_effect=capture_rootfs),
