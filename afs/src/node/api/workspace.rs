@@ -37,6 +37,7 @@ use crate::node::{
     vfs::{
         ownerfs::{
             OwnerFs,
+            fuse_policy::OUTLET_FUSE_LABEL,
             root::{
                 RootCreateParams, RootLocation, RootMeta, RootReservation, root_id_from_name,
                 root_name_from_id,
@@ -854,27 +855,40 @@ impl WorkspaceApi {
             .ok_or_else(|| std::io::Error::other("outlet is disabled"))?;
         let name = crate::node::vfs::ownerfs::root::root_name_from_id(&location.id)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let expected = PathBuf::from(mirror::target_path_with_layout(
-            &outlet.import_root.to_string_lossy(),
-            &location.home_node_id,
-            &name.to_string_lossy(),
-            &location.id,
-            location.epoch,
-            attributes.legacy_layout,
-        ));
+        let expected = if attributes.legacy_layout {
+            mirror::legacy_target_path(&outlet.import_root, &name.to_string_lossy())
+        } else {
+            PathBuf::from(mirror::target_path(
+                &outlet.import_root.to_string_lossy(),
+                &location.home_node_id,
+                &name.to_string_lossy(),
+            ))
+        };
         if std::fs::read_link(self.public_path(owner))? != expected {
             return Err(std::io::Error::other(
                 "outlet points at a different workspace path",
             ));
         }
         let mounts = topology::parse(&std::fs::read("/proc/self/mountinfo")?);
-        let point = imports::mount_point(&outlet.import_root, &location.home_node_id);
+        let point = if attributes.legacy_layout {
+            outlet.import_root.join(mirror::LEGACY_MOUNT_DIR)
+        } else {
+            imports::mount_point(&outlet.import_root, &location.home_node_id)
+        };
         let mount = mounts
             .iter()
             .rev()
             .find(|mount| mount.mount_point == point.as_os_str().as_bytes())
             .ok_or_else(|| std::io::Error::other("outlet import is not mounted"))?;
-        if location.home_node_id == self.node.config.id {
+        if attributes.legacy_layout {
+            if !(mount.fs_type == "fuse" || mount.fs_type.starts_with("fuse."))
+                || mount.source.strip_prefix("afs-") != Some(OUTLET_FUSE_LABEL)
+            {
+                return Err(std::io::Error::other(
+                    "legacy outlet is not mounted by OwnerFs",
+                ));
+            }
+        } else if location.home_node_id == self.node.config.id {
             let a = std::fs::metadata(&point)?;
             let b = std::fs::metadata(&self.node.config.ownerfs_data_dir)?;
             if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
@@ -906,8 +920,8 @@ impl WorkspaceApi {
                 ));
             }
         }
-        // Only stat the generation directory: that needs search permission on the
-        // export root alone, so it also works when NFS squashes the daemon's root.
+        // Stat just the workspace directory. Native imports need only search permission
+        // on the export root, so this also works when NFS squashes the daemon's root.
         // Whether a caller may write depends on the caller's own uid/gid.
         let metadata = std::fs::symlink_metadata(&expected)?;
         if !metadata.is_dir()

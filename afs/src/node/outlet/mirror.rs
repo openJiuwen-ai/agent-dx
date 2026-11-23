@@ -8,9 +8,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
 };
 
-use crate::node::vfs::ownerfs::root::{OutletRoot, RESERVED_ROOT_NAMES, RootId, root_name_from_id};
+use crate::node::vfs::ownerfs::root::{
+    OutletRoot, RESERVED_ROOT_NAMES, RootId, root_id_from_name, root_name_from_id,
+};
 
 /// One filesystem action the mirror must perform.
 ///
@@ -62,20 +65,34 @@ pub fn target_path(import_root: &str, home_node_id: &str, name: &str) -> String 
     )
 }
 
-pub(crate) fn target_path_with_layout(
-    import_root: &str,
-    home: &str,
-    name: &str,
-    root_id: &RootId,
-    epoch: u64,
-    legacy: bool,
-) -> String {
-    if legacy {
-        let import = import_root.trim_end_matches('/');
-        format!("{import}/{home}/users/{}-e{epoch}", root_id.0)
-    } else {
-        target_path(import_root, home, name)
+pub(crate) const LEGACY_MOUNT_DIR: &str = ".ownerfs-outlet";
+
+pub(crate) fn legacy_target_path(import_root: &Path, name: &str) -> PathBuf {
+    import_root.join(LEGACY_MOUNT_DIR).join(name)
+}
+
+/// Links from earlier binaries to a legacy backing directory must not survive
+/// into the guarded outlet, even before the first successful Meta round.
+pub(crate) fn is_direct_legacy_target(import_root: &Path, name: &OsStr, target: &Path) -> bool {
+    let Ok(path) = target.strip_prefix(import_root) else {
+        return false;
+    };
+    let mut parts = path.iter();
+    let (Some(home), Some(users), Some(dir), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if users != "users" || !home.to_str().is_some_and(crate::config::is_safe_node_id) {
+        return false;
     }
+    let (Ok(id), Some((owner, epoch))) = (
+        root_id_from_name(name),
+        dir.to_str().and_then(|dir| dir.rsplit_once("-e")),
+    ) else {
+        return false;
+    };
+    owner == id.0 && epoch.parse::<u64>().is_ok_and(|epoch| epoch != 0)
 }
 
 pub(crate) type RootLayouts = std::collections::HashMap<(RootId, u64), bool>;
@@ -195,14 +212,13 @@ pub(crate) fn plan_with_layouts(
             // A peer that predates the layout RPC uses the existing native path.
             None => false,
         };
-        let target = target_path_with_layout(
-            import_root,
-            &root.home_node_id,
-            name_text,
-            &root.root_id,
-            root.root_epoch,
-            legacy,
-        );
+        let target = if legacy {
+            legacy_target_path(Path::new(import_root), name_text)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            target_path(import_root, &root.home_node_id, name_text)
+        };
         match present.get(name) {
             Some(PresentEntry::Symlink { target: current }) if current == &target => {}
             // A wrong target is republished in place: stale after a generation
@@ -422,7 +438,7 @@ mod tests {
     fn legacy_outlet_follows_home_layout_and_withdraws_unadmitted_root() {
         let root = root("root-61", 7, "node-a");
         let ready = all_ready(&["node-a"]);
-        let target = "/imports/node-a/users/root-61-e7";
+        let target = "/imports/.ownerfs-outlet/a";
         let mut layouts = BTreeMap::from([(
             "node-a".into(),
             RootLayouts::from([((root.root_id.clone(), 7), true)]),
@@ -456,6 +472,23 @@ mod tests {
             plan_with_layouts("/imports", &[root], &ready, &published, &layouts),
             vec![Action::Remove { name: "a".into() }],
         );
+    }
+
+    #[test]
+    fn detects_preexisting_direct_legacy_links_without_matching_native_names() {
+        let import = Path::new("/imports");
+        let old = Path::new("/imports/node-a/users/root-61-e7");
+        assert!(is_direct_legacy_target(import, OsStr::new("a"), old));
+        assert!(!is_direct_legacy_target(
+            import,
+            OsStr::new("root-61-e7"),
+            old
+        ));
+        assert!(!is_direct_legacy_target(
+            import,
+            OsStr::new("a"),
+            &legacy_target_path(import, "a"),
+        ));
     }
 
     #[test]

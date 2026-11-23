@@ -6,6 +6,7 @@
 use super::ownerfs::OwnerFsAssembly;
 use crate::{
     config::Config,
+    node::fuse::FuseMountOptions,
     node::outlet::{
         live::{self, ImportExecutor, MirrorConfig, OutletLayouts},
         mount::{self, KernelMounter},
@@ -23,8 +24,11 @@ pub(super) fn start_mirror(
     ownerfs: &OwnerFsAssembly,
     services: &mut Services,
 ) -> Result<(), BoxError> {
-    let (Some(outlet), Some(control)) = (cfg.outlet.as_ref(), ownerfs.outlet_control.as_ref())
-    else {
+    let (Some(outlet), Some(control), Some(owner)) = (
+        cfg.outlet.as_ref(),
+        ownerfs.outlet_control.as_ref(),
+        ownerfs.instance.as_ref(),
+    ) else {
         return Ok(());
     };
     let mountinfo = std::fs::read("/proc/self/mountinfo").map_err(|error| {
@@ -60,6 +64,7 @@ pub(super) fn start_mirror(
             ),
         )));
     }
+    live::withdraw_direct_legacy_links(&outlet.public_root, &outlet.import_root)?;
     afs_logging::info!(
         "outlet.import.enabled";
         "users_root" => outlet.users_root.display().to_string(),
@@ -72,11 +77,15 @@ pub(super) fn start_mirror(
         cfg.id.clone(),
         Arc::new(KernelMounter),
     )
-    .with_layouts(OutletLayouts {
-        meta: control.meta.clone(),
-        peers: control.peers.clone(),
-        runtime: tokio::runtime::Handle::current(),
-    });
+    .with_layouts(
+        OutletLayouts {
+            meta: control.meta.clone(),
+            peers: control.peers.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        },
+        owner.clone(),
+        FuseMountOptions::from(cfg).exec,
+    );
     afs_logging::info!(
         "outlet.mirror.starting";
         "public_root" => outlet.public_root.display().to_string(),
@@ -89,7 +98,7 @@ pub(super) fn start_mirror(
     services.spawn(async move {
         let shutdown = cancelled(stop);
         tokio::pin!(shutdown);
-        live::run(mirror_config, meta, shutdown, import_executor).await;
+        live::run(mirror_config, meta, shutdown, import_executor).await?;
         Ok(())
     });
     // Read-only topology diagnosis. A separate task so a slow mount scan can

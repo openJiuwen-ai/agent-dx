@@ -18,6 +18,35 @@ use crate::node::fuse::{
 };
 use crate::node::vfs::types::BackendInode;
 
+pub(crate) const OUTLET_FUSE_LABEL: &str = "ownerfs-outlet";
+
+struct OutletFusePolicy;
+
+impl FuseMountPolicy for OutletFusePolicy {
+    fn label(&self) -> &'static str {
+        OUTLET_FUSE_LABEL
+    }
+}
+
+/// Public legacy names need every fresh path lookup to pass OwnerFs admission.
+/// Leave the normal mount's private cache and notifier attached to that mount.
+pub(crate) fn mount_legacy_outlet(
+    ownerfs: Arc<OwnerFs>,
+    path: &Path,
+    exec: FuseExecOptions,
+) -> Result<MountedFuse> {
+    mount_with_policy(
+        ownerfs,
+        path,
+        Arc::new(OutletFusePolicy),
+        FuseMountFeatures::default(),
+        exec,
+        None,
+        #[cfg(any(feature = "dfs", test))]
+        None,
+    )
+}
+
 pub(crate) struct OwnerFsFusePolicy(pub(crate) Arc<OwnerFs>);
 
 impl FuseMountPolicy for OwnerFsFusePolicy {

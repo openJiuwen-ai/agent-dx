@@ -592,6 +592,7 @@ pub struct RootManager {
     control_valid: AtomicBool,
     roots: RwLock<HashMap<RootId, Arc<LocalRoot>>>,
     quarantined_legacy_roots: RwLock<HashSet<(RootId, u64)>>,
+    pending_legacy_cleanup: Mutex<HashSet<(RootId, u64)>>,
     workspace_locks: Mutex<HashMap<RootId, Weak<Mutex<()>>>>,
     /// Last cleanup error per trash entry, so a permanent failure warns once.
     trash_failures: Mutex<HashMap<(RootId, u64), String>>,
@@ -729,32 +730,81 @@ impl RootManager {
         &self,
         retire: impl Fn(&RootId, u64) -> Result<()>,
     ) -> Result<Vec<(RootId, u64)>> {
+        let pending = self
+            .pending_legacy_cleanup
+            .lock()
+            .map_err(|_| invalid_grant("legacy cleanup lock poisoned"))?
+            .clone();
+        let mut candidates = pending.clone();
+        candidates.extend(
+            self.trash_entries()?
+                .into_iter()
+                .map(|(id, epoch, _)| (id, epoch)),
+        );
         let mut completed = Vec::new();
-        for (id, epoch, _) in self.trash_entries()? {
-            let lock = self.workspace_lock(&id)?;
+        for key in candidates {
+            let (id, epoch) = &key;
+            let from_startup = pending.contains(&key);
+            let lock = self.workspace_lock(id)?;
             let _guard = lock
                 .lock()
                 .map_err(|_| invalid_grant("workspace lock poisoned"))?;
-            let Some(record) = self.catalog.lookup_root(&id)? else {
+            let Some(record) = self
+                .catalog
+                .lookup_root(id)?
+                .filter(|record| record.epoch == *epoch)
+            else {
+                if from_startup {
+                    self.forget_legacy_cleanup(&key)?;
+                }
                 continue;
             };
-            if record.epoch != epoch || self.placement(&record)? != Placement::Isolated {
-                continue;
-            }
             if self.check_legacy_path(&record).is_err() {
                 continue;
             }
-            match self
-                .finish_isolated(&record)
-                .and_then(|()| retire(&id, epoch))
+            let placement = self.placement(&record)?;
+            if placement != Placement::Isolated
+                && !(placement == Placement::Missing && from_startup)
             {
-                Ok(()) => completed.push((id, epoch)),
+                continue;
+            }
+            let cleanup = (|| {
+                if from_startup && self.meta.lookup_root_state(id)?.reservation.is_some() {
+                    return Err(isolated());
+                }
+                self.finish_isolated(&record)?;
+                if from_startup {
+                    self.forget_legacy_cleanup(&key)?;
+                }
+                retire(id, *epoch)
+            })();
+            match cleanup {
+                Ok(()) => completed.push(key),
                 Err(error) => {
                     afs_logging::warn!("ownerfs.delete_retry_failed"; "root_id" => ?id, "epoch" => epoch, "error" => error.to_string());
                 }
             }
         }
         Ok(completed)
+    }
+
+    fn forget_legacy_cleanup(&self, key: &(RootId, u64)) -> Result<()> {
+        self.pending_legacy_cleanup
+            .lock()
+            .map_err(|_| invalid_grant("legacy cleanup lock poisoned"))?
+            .remove(key);
+        Ok(())
+    }
+
+    fn legacy_cleanup_pending(&self, record: &LocalRootRecord) -> Result<bool> {
+        if !record.has_legacy_layout() {
+            return Ok(false);
+        }
+        Ok(self
+            .pending_legacy_cleanup
+            .lock()
+            .map_err(|_| invalid_grant("legacy cleanup lock poisoned"))?
+            .contains(&(record.id.clone(), record.epoch)))
     }
 
     /// 递归清理 Meta 已不再持有该 epoch、且 catalog 已不引用的 trash 目录。
@@ -836,6 +886,7 @@ impl RootManager {
             control_valid: AtomicBool::new(true),
             roots: RwLock::new(HashMap::new()),
             quarantined_legacy_roots: RwLock::new(HashSet::new()),
+            pending_legacy_cleanup: Mutex::new(HashSet::new()),
             workspace_locks: Mutex::new(HashMap::new()),
             trash_failures: Mutex::new(HashMap::new()),
         };
@@ -1463,6 +1514,9 @@ impl RootManager {
             ));
         }
         self.check_legacy_path(&record)?;
+        if self.legacy_cleanup_pending(&record)? {
+            return Err(isolated());
+        }
         match self.placement(&record)? {
             Placement::Live => {}
             Placement::Isolated | Placement::Conflict => return Err(isolated()),
@@ -2095,6 +2149,9 @@ impl RootManager {
         self.check_legacy_path(&record)?;
         match self.placement(&record)? {
             Placement::Live => {
+                if self.legacy_cleanup_pending(&record)? {
+                    return Err(isolated());
+                }
                 if !self.meta.lookup_root(id)?.is_some_and(|location| {
                     location.epoch == record.epoch
                         && location.home_node_id == self.local_node_id
@@ -2418,7 +2475,18 @@ impl RootManager {
             }
         };
         if let Err(error) = cleanup {
-            self.quarantine_legacy_root(record, &error.to_string())?;
+            if matches!(
+                error.code(),
+                afs_error::META_CATALOG_INVALID_REQUEST | afs_error::NODE_OWNER_INVALID_GRANT
+            ) {
+                self.quarantine_legacy_root(record, &error.to_string())?;
+            } else {
+                self.pending_legacy_cleanup
+                    .lock()
+                    .map_err(|_| invalid_grant("legacy cleanup lock poisoned"))?
+                    .insert((record.id.clone(), record.epoch));
+                afs_logging::warn!("ownerfs.delete_recovery_pending"; "root_id" => ?record.id, "error" => error.to_string());
+            }
         }
         Ok(())
     }
@@ -3606,6 +3674,7 @@ mod tests {
         active_prepare_id: Option<String>,
         lose_activate_reply: bool,
         fail_deactivate: bool,
+        timeout_deactivate: bool,
         lose_deactivate_reply: bool,
         fail_reserve: Option<RootId>,
         /// `pin_home` of every `reserve_root` call, in order.
@@ -3699,6 +3768,12 @@ mod tests {
             let mut state = self.0.lock().unwrap();
             if std::mem::take(&mut state.fail_deactivate) {
                 return Err(invalid_grant("injected deactivation failure"));
+            }
+            if std::mem::take(&mut state.timeout_deactivate) {
+                return Err(Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "injected deactivation timeout",
+                ));
             }
             if state.active.as_ref().is_some_and(|location| {
                 location.id == *root_id
@@ -5306,6 +5381,43 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(std::fs::read(canary).unwrap(), b"retain ambiguous data");
+    }
+
+    #[test]
+    fn legacy_startup_cleanup_retries_isolated_and_missing_roots() {
+        for isolated in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+            let meta = Arc::new(RecoveryMeta::default());
+            let (id, path, prepare_id) = write_legacy_record(&disk, "workspace");
+            if isolated {
+                std::fs::create_dir_all(temp.path().join(TRASH_DIR).join(path.as_path())).unwrap();
+            }
+            {
+                let mut state = meta.0.lock().unwrap();
+                state.active = Some(RootLocation {
+                    id: id.clone(),
+                    epoch: 1,
+                    home_node_id: "node-a".into(),
+                    home_session_id: "session-a".into(),
+                });
+                state.active_prepare_id = Some(prepare_id);
+                state.timeout_deactivate = true;
+            }
+            let manager =
+                RootManager::open("node-a".into(), "session-b".into(), meta.clone(), disk).unwrap();
+
+            assert!(meta.lookup_root(&id).unwrap().is_some());
+            assert!(manager.catalog.lookup_root(&id).unwrap().is_some());
+            assert_eq!(manager.outlet_root_layout(&id, 1).unwrap(), None);
+            assert!(manager.recover_local_root(&id, 1).is_err());
+            assert_eq!(
+                manager.finish_isolated_roots(|_, _| Ok(())).unwrap(),
+                vec![(id.clone(), 1)],
+            );
+            assert!(meta.lookup_root(&id).unwrap().is_none());
+            assert!(manager.catalog.lookup_root(&id).unwrap().is_none());
+        }
     }
 
     /// 物理目录删除成功、Meta 下线失败：数据已删，不回滚，保持 catalog 与缓存，

@@ -9,6 +9,7 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     io,
+    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -24,8 +25,13 @@ use futures_util::{StreamExt, stream};
 use super::mirror::{self, Action, LstatKind, PresentEntry, RootLayouts};
 use crate::node::{
     bridge,
+    fuse::{FuseExecOptions, MountedFuse},
     rpc::{meta::GrpcRootMeta, peer::PeerConnectionPool},
-    vfs::ownerfs::root::{ActiveOutletRoots, OutletRoot, RootId, RootMeta},
+    vfs::ownerfs::{
+        OwnerFs,
+        fuse_policy::mount_legacy_outlet,
+        root::{ActiveOutletRoots, OutletRoot, RootId, RootMeta},
+    },
 };
 
 /// Private staging and quarantine directories inside the public root.
@@ -227,6 +233,17 @@ pub fn prepare(root: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn withdraw_direct_legacy_links(public_root: &Path, import_root: &Path) -> Result<()> {
+    for (name, entry) in scan_public(public_root)? {
+        if let PresentEntry::Symlink { target } = entry
+            && mirror::is_direct_legacy_target(import_root, &name, Path::new(&target))
+        {
+            apply(public_root, &Action::Remove { name })?;
+        }
+    }
+    Ok(())
+}
+
 /// One convergence round. Returns the number of actions executed.
 ///
 /// Concurrency: a round loads the current directory once, plans against it, and
@@ -259,6 +276,37 @@ pub struct ImportExecutor {
     mounter: Arc<dyn super::mount::ImportMounter>,
     table: super::imports::ImportTable,
     layouts: Option<OutletLayouts>,
+    legacy: Option<LegacyOutlet>,
+}
+
+struct LegacyOutlet {
+    owner: Arc<OwnerFs>,
+    exec: FuseExecOptions,
+    mounted: Option<MountedFuse>,
+}
+
+impl LegacyOutlet {
+    fn ensure_mounted(&mut self, import_root: &Path) -> Result<()> {
+        if self.mounted.is_some() {
+            return Ok(());
+        }
+        let path = import_root.join(mirror::LEGACY_MOUNT_DIR);
+        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !std::fs::symlink_metadata(&path)?.is_dir()
+                    || std::fs::read_dir(&path)?.next().is_some()
+                {
+                    return Err(Error::from(io::Error::other(
+                        "legacy outlet mount point must be an empty directory",
+                    )));
+                }
+            }
+            Err(error) => return Err(Error::from(error)),
+        }
+        self.mounted = Some(mount_legacy_outlet(self.owner.clone(), &path, self.exec)?);
+        Ok(())
+    }
 }
 
 pub(crate) struct OutletLayouts {
@@ -386,11 +434,22 @@ impl ImportExecutor {
             mounter,
             table: super::imports::ImportTable::new(),
             layouts: None,
+            legacy: None,
         }
     }
 
-    pub(crate) fn with_layouts(mut self, layouts: OutletLayouts) -> Self {
+    pub(crate) fn with_layouts(
+        mut self,
+        layouts: OutletLayouts,
+        owner: Arc<OwnerFs>,
+        exec: FuseExecOptions,
+    ) -> Self {
         self.layouts = Some(layouts);
+        self.legacy = Some(LegacyOutlet {
+            owner,
+            exec,
+            mounted: None,
+        });
         self
     }
 
@@ -833,12 +892,23 @@ pub fn converge_round(
     // 未就绪的 home 只是不发新名——已在 /public 的条目原样保留（spec H7：
     // 一次失败不得清空已发布的名字，否则下游容器会在对端抖动时集体 bind 失败）。
     let mut ready = imports.ready_homes();
-    let layouts = imports
+    let mut layouts = imports
         .layouts
         .as_ref()
         .map(|resolver| resolver.verified(&active, &mut ready))
         .transpose()?
         .unwrap_or_default();
+    if let Some(legacy) = imports.legacy.as_mut()
+        && layouts
+            .values()
+            .any(|roots| roots.values().any(|&legacy| legacy))
+        && let Err(error) = legacy.ensure_mounted(&imports.import_root)
+    {
+        afs_logging::warn!("outlet.legacy_mount_failed"; "error" => error.to_string());
+        for roots in layouts.values_mut() {
+            roots.retain(|_, layout| !*layout);
+        }
+    }
     let actions =
         mirror::plan_with_layouts(&config.import_root, &active, &ready, &present, &layouts);
     let mut applied = 0;
@@ -927,7 +997,7 @@ pub async fn run(
     meta: Arc<dyn RootMeta>,
     mut shutdown: impl std::future::Future<Output = ()> + Unpin,
     imports: ImportExecutor,
-) {
+) -> Result<()> {
     let mut cached_digest: Option<String> = None;
     let mut cached_roots: Vec<OutletRoot> = Vec::new();
     let mut tick = tokio::time::interval(config.interval);
@@ -937,7 +1007,14 @@ pub async fn run(
     let mut imports = Some(imports);
     loop {
         tokio::select! {
-            _ = &mut shutdown => return,
+            _ = &mut shutdown => {
+                if let Some(mounted) = imports.take().and_then(|imports| imports.legacy?.mounted) {
+                    tokio::task::spawn_blocking(move || mounted.join())
+                        .await
+                        .map_err(|error| Error::from(io::Error::other(error)))??;
+                }
+                return Ok(());
+            }
             _ = tick.tick() => {
                 let config = config.clone();
                 let meta = meta.clone();
@@ -1161,6 +1238,7 @@ fn homes_under(import_root: &str) -> Vec<String> {
         .flatten()
         .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
         .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|home| home != mirror::LEGACY_MOUNT_DIR)
         .collect();
     homes.sort();
     homes
@@ -2294,6 +2372,33 @@ mod tests {
                 .unwrap()
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn startup_withdraws_only_links_to_direct_legacy_data_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = "/imports/node-a/users/root-61-e7";
+        let guarded = "/imports/.ownerfs-outlet/b";
+        std::os::unix::fs::symlink(native, dir.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(native, dir.path().join("root-61-e7")).unwrap();
+        std::os::unix::fs::symlink(guarded, dir.path().join("b")).unwrap();
+
+        withdraw_direct_legacy_links(dir.path(), Path::new("/imports")).unwrap();
+
+        assert_eq!(
+            std::fs::symlink_metadata(dir.path().join("a"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound,
+        );
+        assert_eq!(
+            std::fs::read_link(dir.path().join("root-61-e7")).unwrap(),
+            Path::new(native),
+        );
+        assert_eq!(
+            std::fs::read_link(dir.path().join("b")).unwrap(),
+            Path::new(guarded),
         );
     }
 

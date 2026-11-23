@@ -1147,15 +1147,18 @@ Home 节点的本地盘上，不做复制。各节点从同一份 Meta 快照取
 **节点侧**：镜像 worker 维护远端 NFS 及本机 bind 的 import 挂载。Home 的
 `WorkspaceOutletLayouts` 只返回当前会话已恢复或激活且代次匹配的工作区。对原生
 目录布局，`/public/<name>` 指向 `<import_root>/<home>/users/<name>`。对历史
-布局，指向同一导出下的 `<root_id>-e<epoch>`。Workspace API 就绪检查按 Home
-返回的布局检查相同目标。Home 明确未准入某工作区时，镜像撤下该软链。Home
-会话或网络暂时不可达时保留已发布的名字。旧 Home 不支持布局 RPC 时沿用原生
-目录目标。独立 tmpfs、宿主 mount namespace 和 `mount(2)` 权限在启动时校验。
+布局，指向 `<import_root>/.ownerfs-outlet/<name>`。首次发布历史工作区时启动
+这个不启用私有缓存的 OwnerFs FUSE 挂载，由 Home 按逻辑工作区身份核验新访问。
+节点启动时撤下以前直接指向历史落盘目录的链接。Workspace API 就绪检查核对
+Home 返回的布局及对应挂载。Home 明确未准入某工作区时，镜像撤下该软链。
+Home 会话或网络暂时不可达时保留已发布的名字，历史目标仍走 OwnerFs 准入。
+旧 Home 不支持布局 RPC 时沿用原生目录目标。独立 tmpfs、宿主 mount namespace
+和 `mount(2)` 权限在启动时校验。
 
 Workspace API 的递归删除将对应代次先原子移入 trash，再下线 Meta 及清理 catalog。
 退役目录交给后台回收，同名新工作区使用新的 epoch。启动时已知历史记录若可确认
-只是删除残留，补完收尾。目录或归属存在冲突时保留该记录和数据，且不准入该
-工作区，其余工作区照常恢复。
+只是删除残留，补完收尾。暂时清理失败时交给后台重试，包括目录已经缺失的记录。
+目录或归属存在冲突时保留该记录和数据，且不准入该工作区，其余工作区照常恢复。
 
 `/public` 下的 `.pub`（原子发布的暂存目录）与 `.quarantine`（消费方违约时的
 隔离区）归镜像所有，不能作为 workspace 名：创建时即拒（`EINVAL`）。快照里若
