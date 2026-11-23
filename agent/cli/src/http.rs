@@ -81,7 +81,7 @@ impl HttpArgs {
                 .map_err(|_| Error::Invalid("无效 HTTP header 名".into()))?;
             if matches!(
                 key.as_str(),
-                "authorization"
+                "x-adx-auth"
                     | "x-auth"
                     | BINDING_ID_HEADER
                     | "host"
@@ -126,7 +126,7 @@ pub async fn execute(
         .client_with_timeout(false)?
         .request(method, args.url(&config.endpoint)?)
         .headers(args.header_map()?)
-        .bearer_auth(config.token());
+        .header("x-adx-auth", config.token());
     if let Some(data) = &args.data {
         request = request.body(data.clone());
     }

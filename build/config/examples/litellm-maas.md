@@ -24,7 +24,7 @@ All newly added models must use the same rates to preserve this quota policy.
 For this uniform-token-quota example, set `litellm.max_budget: 5.0`,
 `litellm.points_per_budget_unit: 1.0`, and `litellm.budget_duration: "1d"`
 in Ingress's `ADX_ACCOUNT_CONFIG`. These override the currency-to-points
-values in [`accounts.json`](../../../gateway/examples/accounts.json).
+values in the DigitalMate Gateway account configuration.
 That account example uses a 15-unit currency budget and two displayed points
 per budget unit; it requires model prices expressed in the same currency.
 Restart Ingress

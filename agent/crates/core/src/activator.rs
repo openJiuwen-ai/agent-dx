@@ -21,7 +21,7 @@ pub struct ActivationRequest {
     /// Raw form-encoded initialization. Parsed only when this Binding is absent.
     #[serde(default)]
     pub parameters: Option<Vec<u8>>,
-    /// From a trusted business gateway, never from the public Binding resolve body.
+    /// Internal subject lookup option. Public Agent v2 traffic selects its exact scope.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reuse_subject_binding: bool,
 }

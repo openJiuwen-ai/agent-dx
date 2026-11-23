@@ -103,6 +103,24 @@ impl IngressAuthenticator {
         Self::new(false, false, "", Duration::ZERO).expect("disabled auth is valid")
     }
 
+    #[cfg(feature = "agent-api")]
+    pub(super) async fn authenticate_agent<B>(
+        &self,
+        request: &Request<B>,
+    ) -> Result<AuthenticatedIdentity, AuthError> {
+        let token = unique_header(request, "x-adx-auth", "X-ADX-AUTH")?
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(AuthError::Missing)?;
+        let identity = self
+            .authenticate_token_identity(token, request_id(request), true)
+            .await?;
+        if identity.tenant_id.is_empty() {
+            return Err(AuthError::Missing);
+        }
+        Ok(identity)
+    }
+
     pub async fn authenticate_request<B>(&self, request: &Request<B>) -> Result<String, AuthError> {
         self.authenticate_request_with_policy(request, true).await
     }

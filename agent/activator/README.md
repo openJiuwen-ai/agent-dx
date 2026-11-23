@@ -164,7 +164,7 @@ Alias 配置统一通过 Ingress 的公开 Agent 管理 API 写入，独立和�
 
 ```sh
 curl --fail-with-body -X PUT "$ADX_SERVER_ADDRESS/api/agent/v2/templates/app/aliases/production" \
-  -H "Authorization: Bearer $ADX_TOKEN" \
+  -H "X-ADX-AUTH: $ADX_TOKEN" \
   -H 'Content-Type: application/json' \
   --data-binary '{"seed":"stable","versions":[{"version":"1","weight":9},{"version":"2","weight":1}],"expected_revision":null}'
 ```

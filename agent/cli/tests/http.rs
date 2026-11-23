@@ -8,7 +8,7 @@ async fn http_routes_body_and_reports_binding_before_streaming_output() {
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let app = axum::Router::new().fallback(|request: axum::extract::Request| async {
         assert_eq!(request.method(), "POST");
-        assert_eq!(request.headers()["authorization"], "Bearer tenant-key");
+        assert_eq!(request.headers()["x-adx-auth"], "tenant-key");
         assert_eq!(request.headers()["content-type"], "application/json");
         assert_eq!(
             request.headers()["x-adx-binding-id"],

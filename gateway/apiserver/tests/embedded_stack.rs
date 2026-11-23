@@ -153,11 +153,12 @@ fn embedded_create_returns_rpc_failure_on_normal_worker_stack() {
             let client_io = connector.connect("localhost".try_into().unwrap(), tcp).await.unwrap();
             let (mut sender, connection) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(client_io)).await.unwrap();
             let client = tokio::spawn(connection);
-            let request = hyper::Request::post("/api/agent/v2/templates/app/versions/1/bindings/embedded-stack/resolve")
+            let request = hyper::Request::get("/agent/ws?target=urn:adx:template:app:1&port=18092")
                 .header("Host", "localhost")
-                .header("Authorization", "Bearer test-user")
-                .header("Content-Type", "application/json")
-                .body(http_body_util::Full::new(bytes::Bytes::from_static(br#"{"protocol":"ws"}"#))).unwrap();
+                .header("x-adx-auth", "test-user")
+                .header("x-adx-binding-id", "embedded-stack")
+                .header("upgrade", "websocket")
+                .body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
             let response = tokio::time::timeout(std::time::Duration::from_secs(5), sender.send_request(request)).await.expect("HTTP create must remain bounded").unwrap();
             // The directory is synchronized, but this fixture deliberately has no create RPC.
             assert_eq!(response.status(), hyper::StatusCode::NOT_IMPLEMENTED);

@@ -64,6 +64,8 @@ sudo ./adx-release/install.sh
 
 ## 🔧 快速开始
 
+[开发最小 HTTP 和 WebSocket 业务网关](gateway/examples/business-gateway/README.md)
+
 默认 `standalone` profile 在一台主机启动托管 Redis、Coordinator、内嵌 Relay 的 adxlet，以及内嵌 Ingress 的 API Server。开始前先准备 sandboxd、网络、证书和初始管理员密钥。
 
 ```sh

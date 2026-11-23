@@ -197,15 +197,7 @@ Alias 的公开管理入口为 `GET/PUT /api/agent/v2/templates/{name}/aliases/{
 
 SSH 使用同一 Activator resolve 结果校验服务、连接目标 Env；文件入口从 Activator 的只读 Binding/模板联合结果读取实际版本配置与 EnvID，不重新根据 Alias 选择模板，也不因查询元数据创建 Env。业务会话鉴权、下载令牌与文件范围检查仍由 Ingress 负责。
 
-受管接口使用 `/api/agent/v2/templates/{name}/versions/{version}/bindings/{binding_id}`，GET/DELETE 对应查询和删除；AgentBinding 由访问流量触发创建。`POST .../{id}/resolve` 接受 `{protocol, port?, bypasscache?}`；`bypasscache` 为布尔值，默认 false。true 强制当前 Activator 读取 Redis AgentBinding 并查询 Environment，跳过 AgentBinding 成功绑定，不绕过不可变模板缓存、租户/service 校验或 generation 隔离。平台刷新失败、不就绪或请求被取消后，本次绑定不作为成功缓存保留；较早的在途响应不能覆盖更新的刷新结果。启用别名收敛时，各 Activator 订阅 Binding 更新并失效已有缓存；传播是异步的，目标失效仍通过 Gateway 发送前 bypass 重试修正。未启用监听时保留请求触发刷新语义。HTTP/SSH 重试固定原 generation；WS 仅在尚未发送后端握手或业务字节时允许一次删除/换代刷新，复用原始 deadline 和初始化参数。
-
-例如强制刷新 HTTP 目标：
-
-```json
-{"protocol": "http", "port": 8080, "bypasscache": true}
-```
-
-该参数仅属于 resolve 的 JSON 请求和内部激活请求，不作为 `/agent/http`、`/agent/ws` 的路由 query 参数。HTTP/WS 在业务请求尚未发送时的既有一次目标重试自动携带 bypasscache=true；不会重放结果未知的业务请求。HTTP/WS 通过下面的统一入口触发激活；共享转发使用真实 Environment ID。
+受管接口使用 `/api/agent/v2/templates/{name}/versions/{version}/bindings/{binding_id}`，GET/DELETE 对应查询和删除；AgentBinding 由访问流量触发创建。管理和数据入口通过 X-ADX-AUTH 验证租户身份。流量访问在发送前可刷新一次目标，已发送的业务请求不会重放。
 
 `GET /api/agent/v2/templates/{name}/versions/{version}/bindings` 返回 `bindings` 和 `next_page_token`。可传 `page_size`（默认 50，范围 1–100）和 `page_token`；token 绑定认证租户、模板与版本。列表仅返回产品元数据，包含删除中的记录，不查询平台健康状态；并发创建/删除期间不保证分页快照。模板不存在时返回 404。
 
@@ -223,7 +215,7 @@ Scope 使用 `template_ref: {"version":"1"}` 或 `template_ref: {"alias":"produc
 
 切换后直接调用既有 Environment delete；Activator 不感知存量连接。删除未知时保留引用，确认删除及卷关联释放后清空。**Platform 优雅退出尚缺失，本次不实现；当前实际删除会清理运行时，不能保证旧连接不中断。** 新 Env 先建立卷 owner，旧 Env 删除确认后释放旧 owner；独享卷仍可能等待旧执行释放，无强制抢占或零空窗承诺。
 
-启用方式、Redis 通知配置及受控 curl 配置入口见 [Activator 别名收敛](activator/README.md#别名收敛配置)，完整方案见 [Agent 别名目标态与灰度升级方案](../docs/development/agent-alias-rollout-design.md)。管理页不在首期范围。公开 GET/DELETE/resolve 和分页路径也接受 `/api/agent/v2/templates/{name}/aliases/{alias}/bindings[/<binding_id>]`；读取 Alias 使用 `GET /api/agent/v2/templates/{name}/aliases/{alias}`，创建或更新使用同路径 PUT。公开入口的租户始终来自认证，两种 Activator 模式均支持通过 Ingress 写入配置。
+启用方式、Redis 通知配置及受控 curl 配置入口见 [Activator 别名收敛](activator/README.md#别名收敛配置)，完整方案见 [Agent 别名目标态与灰度升级方案](../docs/development/agent-alias-rollout-design.md)。管理页不在首期范围。公开 GET/DELETE 和分页路径也接受 `/api/agent/v2/templates/{name}/aliases/{alias}/bindings[/<binding_id>]`；读取 Alias 使用 `GET /api/agent/v2/templates/{name}/aliases/{alias}`，创建或更新使用同路径 PUT。公开入口的租户始终来自认证，两种 Activator 模式均支持通过 Ingress 写入配置。
 
 ## 统一 HTTP/WS 访问
 
@@ -238,7 +230,7 @@ URN 各段按 UTF-8 百分号编码；作为 query 参数时还需要经过 URL 
 
 ```sh
 curl --get 'https://gateway.example/agent/http/chat' \
-  -H "Authorization: Bearer $ADX_TOKEN" \
+  -H "X-ADX-AUTH: $ADX_TOKEN" \
   -H 'X-ADX-Binding-Id: demo' \
   --data-urlencode 'target=urn:adx:template:assistant:1'
 ```

@@ -16,7 +16,7 @@ async fn public_management_routes_credentials_and_json_output() {
         let uri = request.uri().to_string();
         let auth = request
             .headers()
-            .get("authorization")
+            .get("x-adx-auth")
             .unwrap()
             .to_str()
             .unwrap()
@@ -88,7 +88,7 @@ async fn public_management_routes_credentials_and_json_output() {
             (
                 expected_method.into(),
                 expected_path.into(),
-                "Bearer tenant-key".into()
+                "tenant-key".into()
             )
         );
     }

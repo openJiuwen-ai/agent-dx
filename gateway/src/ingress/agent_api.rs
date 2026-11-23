@@ -8,7 +8,7 @@ use adx_agent_api::{
 };
 use adx_agent_core::environment::Environment;
 use adx_agent_core::limits;
-use adx_agent_core::{Protocol, Scope};
+use adx_agent_core::Scope;
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::BodyExt;
@@ -139,14 +139,6 @@ impl AgentApi {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResolveInput {
-    protocol: Protocol,
-    port: Option<u16>,
-    #[serde(default, rename = "bypasscache")]
-    bypass_cache: bool,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AliasInput {
     seed: String,
     versions: Vec<adx_agent_core::alias::VersionWeight>,
@@ -274,7 +266,7 @@ impl AgentApi {
                 ),
             };
         }
-        let ["bindings", binding, action @ ..] = rest else {
+        let ["bindings", binding] = rest else {
             return Err(Error::NotFound);
         };
         let scope = Scope {
@@ -284,23 +276,13 @@ impl AgentApi {
             binding_id: segment(binding)?,
         };
         scope.validate().map_err(Error::Invalid)?;
-        match (parts.method, action) {
-            (http::Method::GET, []) => {
+        match parts.method {
+            http::Method::GET => {
                 Ok(serde_json::json!({"binding":managed.binding(ctx, &scope).await?}))
             }
-            (http::Method::DELETE, []) => {
+            http::Method::DELETE => {
                 managed.delete_binding(ctx, &scope).await?;
                 Ok(serde_json::json!({"status":"deleted"}))
-            }
-            (http::Method::POST, ["resolve"]) => {
-                let input: ResolveInput = decode_body(body).await?;
-
-                let (target, port) = managed
-                    .resolve_with_cache(ctx, &scope, input.protocol, input.port, input.bypass_cache)
-                    .await?;
-                Ok(
-                    serde_json::json!({"environment_id":target.binding.current.environment_id,"port":port,"protocol":input.protocol}),
-                )
             }
             _ => Err(Error::NotFound),
         }
@@ -320,7 +302,6 @@ impl AgentApi {
     }
 
     /// Rewrite a managed HTTP/WS request into the existing fixed Environment forwarding path.
-    /// SSH clients use the resolve endpoint then the existing Environment-ID CONNECT/tunnel interface.
     pub fn can_retry_data<B>(&self, request: &Request<B>) -> bool {
         request.extensions().get::<SelectionRetry>().is_some()
     }
@@ -333,7 +314,7 @@ impl AgentApi {
         if !self.service_access().retry(&mut selection).await? {
             return Ok(false);
         }
-        *request.uri_mut() = selection.forwarding_uri(&retry.backend_uri)?;
+        selection.rewrite_request(request, &retry.backend_uri)?;
         Ok(true)
     }
     pub(super) async fn prepare_data<B>(
@@ -382,7 +363,10 @@ impl AgentApi {
                 },
             )
             .await?;
-        *request.uri_mut() = selection.forwarding_uri(&access.backend_uri)?;
+        selection.rewrite_request(request, &access.backend_uri)?;
+        request
+            .extensions_mut()
+            .insert(ServiceDeadline(selection.deadline()));
         request.extensions_mut().insert(SelectionRetry {
             selection,
             backend_uri: access.backend_uri,
@@ -406,6 +390,9 @@ async fn read_body(body: hyper::body::Incoming) -> Result<Bytes, Error> {
         .to_bytes();
     Ok(bytes)
 }
+
+#[derive(Clone, Copy)]
+pub(super) struct ServiceDeadline(pub tokio::time::Instant);
 
 #[derive(Clone)]
 struct SelectionRetry {

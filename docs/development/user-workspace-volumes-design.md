@@ -336,7 +336,7 @@ prepare_runtime_workspace 会补齐和迁移配置并清理旧 team 文件，平
 
 - [Agent 核心模型](../../agent/crates/core/src/lib.rs)与[准备和激活契约](../../agent/crates/core/src/activator.rs)：已新增 mounts 和 parameters，保持 Scope 和执行生命周期分离。
 - [Agent 存储](../../agent/crates/store/src/state.rs)：模板不可变、绑定条件创建及 generation 约束。
-- [Jiuwen 入口](../../gateway/src/ingress/digitalmategateway/entrypoint.rs)：可信 Principal、binding_id 和 Scope 的现有映射。
+- 早期验证使用内嵌 Jiuwen 入口。当前业务网关可按[开发示例](../../gateway/examples/business-gateway/README.md)从已认证的用户身份派生 Binding ID。
 - [Agent Environment 请求转换](../../agent/activator/src/environment_request.rs)：统一公共请求生成，已传递渲染后的 mounts。
 - [公共 Environment 挂载校验](../../gateway/apiserver/src/contract.rs)、[平台 Mount 模型](../../platform/crates/core/src/execution.rs)、[adxlet 挂载转换](../../platform/adxlet/src/sandboxd.rs)：公共入口将 host_path 转 Local，经现有节点转换传给 sandboxd。
 - [sandboxd 锁定版本](../../third_party/sandboxd/source.json)与[运行时协议](../../third_party/sandboxd/sandbox-api.proto)：协议已有 HostPath。
